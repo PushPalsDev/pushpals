@@ -3,8 +3,14 @@
   "private": true,
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
+    "server": "bun --cwd apps/server dev",
     "client": "bun --cwd apps/client start",
     "web": "bun --cwd apps/client web",
-    "lint": "bun --cwd apps/client lint"
+    "ios": "bun --cwd apps/client ios",
+    "android": "bun --cwd apps/client android",
+    "lint": "bun --cwd apps/client lint",
+    "test": "bun --cwd packages/protocol test",
+    "protocol:build": "bun --cwd packages/protocol build",
+    "protocol:typecheck": "bun --cwd packages/protocol typecheck"
   }
 }

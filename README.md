@@ -124,3 +124,95 @@ Push Pals treats a repo like production equipment:
 Early-stage / under active development.
 
 If you’re interested in contributing, feel free to open a PR. Or get in touch via `push.pals.dev@gmail.com`
+
+---
+
+### Overview
+
+We've introduced a **shared, versioned protocol** to enable robust client-server communication:
+
+- **`packages/protocol`**: Centralized schema definitions, TypeScript types, and validators (Ajv)
+- **`apps/server`**: Bun-based server streaming events over SSE (web) and WebSocket (mobile/desktop)
+- **`apps/client`**: Expo client with automatic transport selection
+- **A2A Scaffolding**: Placeholder interfaces for future Agent-to-Agent support
+
+### Architecture
+
+```
+┌─────────────────────────────────────┐
+│   Shared Protocol (packages/protocol)│
+│  - JSON Schemas (envelope, events)   │
+│  - TypeScript types                  │
+│  - Ajv validators                    │
+│  - Protocol v0.1.0                   │
+└─────────────────────────────────────┘
+           ▲            ▲
+           │            │
+    ┌──────┴─┐   ┌─────┴──────┐
+    │ Server  │   │  Client    │
+    │ (Bun)   │   │ (Expo)     │
+    └─┬──────┬┘   │            │
+      │      │    │            │
+    SSE   WebSocket  Auto-select
+      │      │    │  (SSE/WS)  │
+    Web   Mobile  │            │
+      │           └────────────┘
+      │
+   EventEnvelope (validated)
+      │
+   { type, payload, ts, sessionId, ... }
+```
+
+### Key Features
+
+**Unified Protocol**: Both SSE and WebSocket emit identical `EventEnvelope` messages  
+**Validation**: All events/requests validated at send + receive (Ajv)  
+**Type Safety**: Shared TypeScript types across client and server  
+**Transport Agnostic**: Event bus decoupled from transport logic  
+**Local Development**: Runs on Windows with Bun + Expo  
+**Future-Ready**: A2A adapter scaffolding for agent-to-agent workflows  
+
+
+## Prerequisites
+
+- **Bun** (`curl -fsSL https://bun.sh/install | bash`)
+- **Node.js** (optional, for development tools)
+- **Expo CLI** (`bun add -g expo-cli`)
+
+### Quick Start
+
+```bash
+# Install dependencies
+bun install
+
+# Terminal 1: Run server
+bun run server
+
+# Terminal 2: Run web client
+bun web
+
+# Terminal 3: (Optional) Run mobile
+bun ios
+# or
+bun android
+```
+
+### Event Types
+
+- `log` - Debug/info/warn/error logging
+- `scan_result` - Repository analysis
+- `suggestions` - Actionable improvement ideas
+- `diff_ready` - Unified diff + statistics
+- `approval_required` - Awaiting user approval
+- `approved` / `denied` - Approval decisions
+- `committed` - Git commit result
+- `error` - System error
+- `done` - Workflow completion
+
+### Protocol Documentation
+
+- [Protocol README](packages/protocol/README.md) - Full schema reference
+- [Server README](apps/server/README.md) - Event bus & endpoints
+- [Client README](apps/client/README.md) - API & transport selection
+- [A2A Scaffolding](packages/protocol/src/a2a/README.md) - Future integration notes
+

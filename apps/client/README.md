@@ -1,50 +1,91 @@
-# Welcome to your Expo app 👋
+# PushPals Client
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Expo-based client for iOS, Android, and web.
 
-## Get started
-
-1. Install dependencies
-
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+## Quick Start
 
 ```bash
-npm run reset-project
+# Install dependencies (from repo root)
+bun install
+
+# Run web version
+bun web
+
+# Run on iOS
+bun ios
+
+# Run on Android
+bun android
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+## Architecture
 
-## Learn more
+### Transport Selection
 
-To learn more about developing your project with Expo, look at the following resources:
+The client automatically selects the best transport:
+- **Web**: SSE via `EventSource`
+- **Native / Desktop**: WebSocket
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+### Event Subscription
 
-## Join the community
+Use the `usePushPalsSession` hook:
 
-Join our community of developers creating universal apps.
+```typescript
+import { usePushPalsSession } from "./lib/usePushPalsSession";
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+export function MyComponent() {
+  const { sessionId, events, isConnected, send } = usePushPalsSession(
+    "http://localhost:3001"
+  );
+
+  return (
+    // Display events and allow sending messages
+  );
+}
+```
+
+Or use the lower-level API:
+
+```typescript
+import {
+  subscribeEvents,
+  createSession,
+  sendMessage,
+  submitApprovalDecision,
+} from "./lib/pushpalsApi";
+
+const sessionId = await createSession("http://localhost:3001");
+const unsubscribe = subscribeEvents(
+  "http://localhost:3001",
+  sessionId,
+  (event) => {
+    console.log(event);
+  }
+);
+
+await sendMessage("http://localhost:3001", sessionId, "Hello");
+await submitApprovalDecision("http://localhost:3001", approvalId, "approve");
+
+unsubscribe();
+```
+
+## Protocol
+
+The client uses shared `EventEnvelope` types and validators from `packages/protocol`.
+
+- Validates all incoming events
+- Emits `_error` pseudo-events for validation failures
+- Handles both SSE and WebSocket errors
+
+## Components
+
+- `lib/pushpalsApi.ts` - Low-level API (subscribe, send, approve)
+- `lib/usePushPalsSession.ts` - React hook for session management
+- `lib/PushPalsDemo.tsx` - Demo component
+
+## Future
+
+- Display suggestions in native UI
+- Real approval flow (currently streams mock events)
+- Syntax highlighting for diffs
+- File explorer for scan results

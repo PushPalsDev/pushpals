@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HTTPContracts",
+  "definitions": {
+    "CreateSessionResponse": {
+      "type": "object",
+      "required": ["sessionId", "protocolVersion"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "protocolVersion": { "type": "string", "const": "0.1.0" }
+      },
+      "additionalProperties": false
+    },
+    "MessageRequest": {
+      "type": "object",
+      "required": ["text"],
+      "properties": {
+        "text": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "MessageResponse": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "ApprovalDecisionRequest": {
+      "type": "object",
+      "required": ["decision"],
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": ["approve", "deny"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ApprovalDecisionResponse": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

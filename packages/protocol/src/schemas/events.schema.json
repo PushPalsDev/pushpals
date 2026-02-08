@@ -1,0 +1,196 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EventTypePayloads",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "log" },
+        "payload": {
+          "type": "object",
+          "required": ["level", "message"],
+          "properties": {
+            "level": {
+              "type": "string",
+              "enum": ["debug", "info", "warn", "error"]
+            },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "scan_result" },
+        "payload": {
+          "type": "object",
+          "required": ["summary", "filesRead", "gitStatusPorcelain", "gitDiff"],
+          "properties": {
+            "summary": { "type": "string" },
+            "filesRead": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "gitStatusPorcelain": { "type": "string" },
+            "gitDiff": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "suggestions" },
+        "payload": {
+          "type": "object",
+          "required": ["items"],
+          "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "title", "detail", "effort"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "title": { "type": "string" },
+                  "detail": { "type": "string" },
+                  "effort": {
+                    "type": "string",
+                    "enum": ["S", "M", "L"]
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "diff_ready" },
+        "payload": {
+          "type": "object",
+          "required": ["unifiedDiff", "diffStat", "branch"],
+          "properties": {
+            "unifiedDiff": { "type": "string" },
+            "diffStat": { "type": "string" },
+            "branch": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "approval_required" },
+        "payload": {
+          "type": "object",
+          "required": ["approvalId", "action", "summary", "details"],
+          "properties": {
+            "approvalId": { "type": "string" },
+            "action": {
+              "type": "string",
+              "enum": ["git.commit", "git.push", "other"]
+            },
+            "summary": { "type": "string" },
+            "details": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "approved" },
+        "payload": {
+          "type": "object",
+          "required": ["approvalId"],
+          "properties": {
+            "approvalId": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "denied" },
+        "payload": {
+          "type": "object",
+          "required": ["approvalId"],
+          "properties": {
+            "approvalId": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "committed" },
+        "payload": {
+          "type": "object",
+          "required": ["branch", "commitHash", "message"],
+          "properties": {
+            "branch": { "type": "string" },
+            "commitHash": { "type": "string" },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "error" },
+        "payload": {
+          "type": "object",
+          "required": ["message"],
+          "properties": {
+            "message": { "type": "string" },
+            "detail": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "done" },
+        "payload": {
+          "type": "object",
+          "required": ["ok"],
+          "properties": {
+            "ok": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
