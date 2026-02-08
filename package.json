@@ -1,0 +1,10 @@
+{
+  "name": "pushpals",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "client": "bun --cwd apps/client start",
+    "web": "bun --cwd apps/client web",
+    "lint": "bun --cwd apps/client lint"
+  }
+}
