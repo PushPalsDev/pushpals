@@ -1,0 +1,8 @@
+**/node_modules/**
+**/dist/**
+**/.expo/**
+**/.next/**
+**/build/**
+**/coverage/**
+**/.turbo/**
+**/.bun/**

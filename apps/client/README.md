@@ -23,6 +23,7 @@ bun android
 ### Transport Selection
 
 The client automatically selects the best transport:
+
 - **Web**: SSE via `EventSource`
 - **Native / Desktop**: WebSocket
 
@@ -55,13 +56,9 @@ import {
 } from "./lib/pushpalsApi";
 
 const sessionId = await createSession("http://localhost:3001");
-const unsubscribe = subscribeEvents(
-  "http://localhost:3001",
-  sessionId,
-  (event) => {
-    console.log(event);
-  }
-);
+const unsubscribe = subscribeEvents("http://localhost:3001", sessionId, (event) => {
+  console.log(event);
+});
 
 await sendMessage("http://localhost:3001", sessionId, "Hello");
 await submitApprovalDecision("http://localhost:3001", approvalId, "approve");

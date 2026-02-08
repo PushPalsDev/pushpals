@@ -17,7 +17,9 @@ bun --cwd apps/server dev
 ## Architecture
 
 ### Event Bus
+
 Each session has an internal `SessionEventBus` that:
+
 - Manages subscriptions (in-memory)
 - Validates events against JSON Schema before emitting
 - Notifies all SSE and WebSocket subscribers simultaneously
@@ -31,7 +33,9 @@ Each session has an internal `SessionEventBus` that:
 - `POST /approvals/:id` - Submit approval decision
 
 ### Session Manager
+
 Global `SessionManager` handles:
+
 - Session creation and lifecycle
 - Event emission
 - Approval workflows
@@ -44,7 +48,7 @@ Global `SessionManager` handles:
 ✅ Same event bus for both transports  
 ✅ In-memory approvals and sessions  
 ✅ Keepalive pings on SSE (15 seconds)  
-✅ 100% local; no external dependencies  
+✅ 100% local; no external dependencies
 
 ## Files
 

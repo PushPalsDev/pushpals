@@ -11,7 +11,9 @@ export interface EventTypePayloadMap {
     gitStatusPorcelain: string;
     gitDiff: string;
   };
-  suggestions: { items: Array<{ id: string; title: string; detail: string; effort: "S" | "M" | "L" }> };
+  suggestions: {
+    items: Array<{ id: string; title: string; detail: string; effort: "S" | "M" | "L" }>;
+  };
   diff_ready: { unifiedDiff: string; diffStat: string; branch: string };
   approval_required: {
     approvalId: string;

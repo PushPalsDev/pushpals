@@ -5,6 +5,7 @@ A shared, versioned protocol package for PushPals event streaming over both SSE 
 ## Overview
 
 The protocol defines:
+
 - **JSON Schemas** for all events and HTTP contracts
 - **TypeScript types** generated from/validated against schemas
 - **Runtime validators** (AJV-based) for both server and client
@@ -58,11 +59,7 @@ All events conform to `EventEnvelope`:
 ### In Server (apps/server)
 
 ```typescript
-import {
-  EventEnvelope,
-  validateEventEnvelope,
-  PROTOCOL_VERSION,
-} from "protocol";
+import { EventEnvelope, validateEventEnvelope, PROTOCOL_VERSION } from "protocol";
 
 const envelope: EventEnvelope = {
   protocolVersion: PROTOCOL_VERSION,
@@ -97,39 +94,52 @@ subscribeEvents("http://localhost:3001", sessionId, (event) => {
 ## HTTP Contracts
 
 ### POST /sessions
+
 **Response:**
+
 ```json
 { "sessionId": "uuid", "protocolVersion": "0.1.0" }
 ```
 
 ### POST /sessions/:id/message
+
 **Request:**
+
 ```json
 { "text": "user input" }
 ```
+
 **Response:**
+
 ```json
 { "ok": true }
 ```
 
 ### POST /approvals/:approvalId
+
 **Request:**
+
 ```json
 { "decision": "approve" | "deny" }
 ```
+
 **Response:**
+
 ```json
 { "ok": true }
 ```
 
 ### GET /sessions/:id/events (SSE)
+
 Content-Type: `text/event-stream`
+
 ```
 event: message
 data: <JSON EventEnvelope>
 ```
 
 ### GET /sessions/:id/ws (WebSocket)
+
 Sends EventEnvelope as JSON messages.
 
 ## Validation

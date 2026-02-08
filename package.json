@@ -1,16 +1,30 @@
 {
   "name": "pushpals",
   "private": true,
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "server": "bun --cwd apps/server dev",
-    "client": "bun --cwd apps/client start",
-    "web": "bun --cwd apps/client web",
-    "ios": "bun --cwd apps/client ios",
-    "android": "bun --cwd apps/client android",
-    "lint": "bun --cwd apps/client lint",
-    "test": "bun --cwd packages/protocol test",
     "protocol:build": "bun --cwd packages/protocol build",
-    "protocol:typecheck": "bun --cwd packages/protocol typecheck"
+    "protocol:typecheck": "bun --cwd packages/protocol typecheck",
+    "server:only": "bun --cwd apps/server dev",
+    "client:only": "bun --cwd apps/client start",
+    "web:only": "bun --cwd apps/client web",
+    "ios:only": "bun --cwd apps/client ios",
+    "android:only": "bun --cwd apps/client android",
+    "server": "bun run protocol:build && bun run server:only",
+    "client": "bun run protocol:build && bun run client:only",
+    "web": "bun run protocol:build && bun run web:only",
+    "ios": "bun run protocol:build && bun run ios:only",
+    "android": "bun run protocol:build && bun run android:only",
+    "dev": "bun run protocol:build && bun --parallel server:only client:only",
+    "lint": "bun --cwd apps/client lint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "bun --cwd packages/protocol test"
+  },
+  "devDependencies": {
+    "prettier": "^3.8.1"
   }
 }

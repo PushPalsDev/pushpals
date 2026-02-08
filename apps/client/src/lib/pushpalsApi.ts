@@ -1,4 +1,5 @@
-import { EventEnvelope, validateEventEnvelope } from "protocol";
+import type { EventEnvelope } from "protocol/browser";
+import { validateEventEnvelope } from "protocol/browser";
 
 type TransportType = "auto" | "sse" | "ws";
 type EventCallback = (event: EventEnvelope | { type: "_error"; message: string }) => void;
@@ -10,8 +11,7 @@ function selectTransport(transport: TransportType): "sse" | "ws" {
   if (transport !== "auto") return transport;
 
   // Check if we're in a browser with EventSource support
-  const isBrowser =
-    typeof window !== "undefined" && typeof EventSource !== "undefined";
+  const isBrowser = typeof window !== "undefined" && typeof EventSource !== "undefined";
 
   // For Expo web, prefer SSE
   if (isBrowser) {
@@ -25,14 +25,8 @@ function selectTransport(transport: TransportType): "sse" | "ws" {
 /**
  * Subscribe to session events over SSE
  */
-function subscribeSSE(
-  baseUrl: string,
-  sessionId: string,
-  onEvent: EventCallback
-): () => void {
-  const eventSource = new EventSource(
-    `${baseUrl}/sessions/${sessionId}/events`
-  );
+function subscribeSSE(baseUrl: string, sessionId: string, onEvent: EventCallback): () => void {
+  const eventSource = new EventSource(`${baseUrl}/sessions/${sessionId}/events`);
 
   eventSource.addEventListener("message", (event) => {
     try {
@@ -75,7 +69,7 @@ function subscribeSSE(
 function subscribeWebSocket(
   baseUrl: string,
   sessionId: string,
-  onEvent: EventCallback
+  onEvent: EventCallback,
 ): () => void {
   const protocol = baseUrl.startsWith("https") ? "wss" : "ws";
   const host = baseUrl.replace(/^https?:\/\//, "");
@@ -140,7 +134,7 @@ export function subscribeEvents(
   baseUrl: string,
   sessionId: string,
   onEvent: EventCallback,
-  transport: TransportType = "auto"
+  transport: TransportType = "auto",
 ): () => void {
   const selectedTransport = selectTransport(transport);
 
@@ -182,7 +176,7 @@ export async function createSession(baseUrl: string): Promise<string | null> {
 export async function sendMessage(
   baseUrl: string,
   sessionId: string,
-  text: string
+  text: string,
 ): Promise<boolean> {
   try {
     const response = await fetch(`${baseUrl}/sessions/${sessionId}/message`, {
@@ -204,7 +198,7 @@ export async function sendMessage(
 export async function submitApprovalDecision(
   baseUrl: string,
   approvalId: string,
-  decision: "approve" | "deny"
+  decision: "approve" | "deny",
 ): Promise<boolean> {
   try {
     const response = await fetch(`${baseUrl}/approvals/${approvalId}`, {

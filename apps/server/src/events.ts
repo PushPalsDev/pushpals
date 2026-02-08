@@ -118,7 +118,7 @@ export class SessionManager {
     sessionId: string,
     action: string,
     summary: string,
-    details: Record<string, unknown>
+    details: Record<string, unknown>,
   ): string {
     const approvalId = randomUUID();
     this.approvals.set(approvalId, { sessionId, action, summary, details });
@@ -145,7 +145,7 @@ export class SessionManager {
 
   handleApprovalDecision(
     approvalId: string,
-    decision: "approve" | "deny"
+    decision: "approve" | "deny",
   ): { ok: boolean; message?: string } {
     const approval = this.approvals.get(approvalId);
     if (!approval) {

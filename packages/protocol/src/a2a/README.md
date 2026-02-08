@@ -11,12 +11,14 @@ This directory contains placeholders and design notes for how PushPals events an
 ### EventEnvelope → A2A Message
 
 PushPals `EventEnvelope` and A2A message envelopes share similar concerns:
+
 - Versioning
 - Tracing (id, traceId)
 - Timestamps
 - Payload discrimination by type
 
 **Planned mapping:**
+
 - `EventEnvelope.id` ↔ A2A `message.id`
 - `EventEnvelope.ts` ↔ A2A `message.timestamp`
 - `EventEnvelope.type` ↔ A2A `message.type`
@@ -25,10 +27,12 @@ PushPals `EventEnvelope` and A2A message envelopes share similar concerns:
 ### Approvals as Tool Results
 
 A2A supports "tools" and tool invocations with results. Approvals in PushPals map naturally:
+
 - `approval_required` event → Tool invocation awaiting result
 - `approved` / `denied` events → Tool result (success/failure)
 
 **Planned mapping:**
+
 - `approval_required.approvalId` ↔ A2A `tool.invocationId`
 - `approval_required.action` ↔ A2A `tool.name`
 - `approved.approvalId` ↔ A2A `result.invocationId` with `status: "success"`

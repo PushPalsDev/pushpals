@@ -37,20 +37,45 @@ function loadSchema(filename: string): Record<string, unknown> {
     try {
       return JSON.parse(readFileSync(srcSchemasPath, "utf-8"));
     } catch (_e2) {
+      // Bundler-friendly fallback: some bundlers (Metro/webpack) will
+      // resolve JSON files via `require` during module analysis. Try a
+      // synchronous `require` fallback — use `eval("require")` so the
+      // symbol isn't statically analyzed by bundlers that run in ESM mode.
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-implied-eval
+        const req: any = eval("require");
+        if (typeof req === "function") {
+          // require the JSON from source path so bundlers include it.
+          const mod = req(join(__dirname, "..", "src", "schemas", filename));
+          return mod && mod.default ? mod.default : mod;
+        }
+      } catch (_e3) {
+        // fall through to throw below
+      }
+
       throw new Error(
-        `Failed to load schema ${filename}. Expected at dist/schemas (build) or src/schemas (dev).`
+        `Failed to load schema ${filename}. Expected at dist/schemas (build) or src/schemas (dev).`,
       );
     }
   }
 }
 
-// Load and compile schemas
+// Load schemas
 const envelopeSchema = loadSchema("envelope.schema.json");
 const eventsSchema = loadSchema("events.schema.json");
 
+// Register schemas with AJV (helps with $ref resolution across files)
+try {
+  ajv.addSchema(envelopeSchema as object, "envelope.schema.json");
+  ajv.addSchema(eventsSchema as object, "events.schema.json");
+} catch (_e) {
+  // addSchema may throw in strict modes for malformed schemas; compilation below
+  // will still attempt to compile standalone validators.
+}
+
 // Compile validators
-const validateEnvelopeBase = ajv.compile(envelopeSchema);
-const validateEventPayload = ajv.compile(eventsSchema);
+const validateEnvelopeBase = ajv.compile(envelopeSchema as object);
+const validateEventPayload = ajv.compile(eventsSchema as object);
 const validateMessageRequestSchema = ajv.compile({
   type: "object",
   required: ["text"],
@@ -98,18 +123,18 @@ export interface ValidationResult {
 export function validateEventEnvelope(data: unknown): ValidationResult {
   const baseValid = validateEnvelopeBase(data);
   if (!baseValid) {
-    return {
-      ok: false,
-      errors: ajv.errorsText(validateEnvelopeBase.errors).split(", "),
-    };
+    const errors = (validateEnvelopeBase.errors ?? []).map((e) =>
+      `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),
+    );
+    return { ok: false, errors };
   }
 
   const payloadValid = validateEventPayload(data);
   if (!payloadValid) {
-    return {
-      ok: false,
-      errors: ajv.errorsText(validateEventPayload.errors).split(", "),
-    };
+    const errors = (validateEventPayload.errors ?? []).map((e) =>
+      `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),
+    );
+    return { ok: false, errors };
   }
 
   return { ok: true };
@@ -135,7 +160,9 @@ export function validateApprovalDecisionRequest(data: unknown): ValidationResult
   const valid = validateApprovalDecisionRequestSchema(data);
   return {
     ok: valid,
-    errors: valid ? undefined : ajv.errorsText(validateApprovalDecisionRequestSchema.errors).split(", "),
+    errors: valid
+      ? undefined
+      : ajv.errorsText(validateApprovalDecisionRequestSchema.errors).split(", "),
   };
 }
 
@@ -143,6 +170,8 @@ export function validateApprovalDecisionResponse(data: unknown): ValidationResul
   const valid = validateApprovalDecisionResponseSchema(data);
   return {
     ok: valid,
-    errors: valid ? undefined : ajv.errorsText(validateApprovalDecisionResponseSchema.errors).split(", "),
+    errors: valid
+      ? undefined
+      : ajv.errorsText(validateApprovalDecisionResponseSchema.errors).split(", "),
   };
 }

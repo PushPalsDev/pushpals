@@ -105,7 +105,7 @@ export function createRequestHandler() {
           headers: {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            Connection: "keep-alive",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
             "Access-Control-Allow-Headers": "content-type, authorization",
@@ -155,7 +155,7 @@ export function createRequestHandler() {
 
         const result = sessionManager.handleApprovalDecision(
           approvalId,
-          decision as "approve" | "deny"
+          decision as "approve" | "deny",
         );
         return makeJson(result, result.ok ? 200 : 400);
       }

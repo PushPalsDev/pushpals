@@ -3,9 +3,9 @@
  * Integration test suite for PushPals protocol and server
  */
 
-import { 
-  EventEnvelope, 
-  PROTOCOL_VERSION, 
+import {
+  EventEnvelope,
+  PROTOCOL_VERSION,
   validateEventEnvelope,
   validateMessageRequest,
   validateApprovalDecisionRequest,

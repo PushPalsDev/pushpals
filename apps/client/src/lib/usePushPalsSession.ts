@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { EventEnvelope } from "protocol";
-import { subscribeEvents, createSession, sendMessage } from "./pushpalsApi.js";
+import type { EventEnvelope } from "protocol/browser";
+import { subscribeEvents, createSession, sendMessage } from "./pushpalsApi";
 
 export interface PushPalsSession {
   sessionId: string | null;
@@ -72,7 +72,7 @@ export function usePushPalsSession(baseUrl: string = "http://localhost:3001") {
       if (!session.sessionId) return false;
       return sendMessage(baseUrl, session.sessionId, text);
     },
-    [session.sessionId, baseUrl]
+    [session.sessionId, baseUrl],
   );
 
   return { ...session, send };
