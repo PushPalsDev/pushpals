@@ -1,0 +1,13 @@
+{
+  "repoPath": ".",
+  "remote": "origin",
+  "mainBranch": "main",
+  "branchPrefix": "agent/",
+  "pollIntervalSeconds": 10,
+  "checks": [],
+  "stateDir": "./state",
+  "port": 3002,
+  "deleteAfterMerge": false,
+  "maxAttempts": 3,
+  "mergeStrategy": "no-ff"
+}
