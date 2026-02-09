@@ -223,13 +223,24 @@ export class GitOps {
   /**
    * Reset any in-progress merge/rebase and return to main.
    * Does NOT run git clean (to avoid nuking untracked files in shared repos).
+   * Throws a clear error if the remote-tracking ref does not exist.
    */
   async resetToClean(): Promise<void> {
     // Abort any in-progress operations (these may fail if nothing is in progress — that's fine)
     await git(this.repoPath, ["rebase", "--abort"]);
     await git(this.repoPath, ["merge", "--abort"]);
     await git(this.repoPath, ["checkout", this.mainBranch, "--force", "--quiet"]);
-    await git(this.repoPath, ["reset", "--hard", `${this.remote}/${this.mainBranch}`, "--quiet"]);
+
+    // Verify remote-tracking ref exists before hard reset
+    const remoteRef = `${this.remote}/${this.mainBranch}`;
+    const remoteSha = await this.revParse(remoteRef);
+    if (!remoteSha) {
+      throw new Error(
+        `Remote-tracking ref ${remoteRef} not found. Run: git fetch ${this.remote} ${this.mainBranch}`,
+      );
+    }
+
+    await git(this.repoPath, ["reset", "--hard", remoteRef, "--quiet"]);
   }
 
   /**
@@ -271,11 +282,13 @@ export class GitOps {
 
   /**
    * Check if a remote agent branch has already been merged into main.
-   * Compares against the remote-tracking main ref for accuracy.
+   * Returns true when every commit on the branch is reachable from main,
+   * i.e. the branch tip is an ancestor of (or equal to) the main tip.
    */
   async isMerged(branch: string): Promise<boolean> {
-    const remoteBranch = `${this.remote}/${branch}`;
-    const remoteMain = `${this.remote}/${this.mainBranch}`;
-    return this.isAncestor(remoteBranch, remoteMain);
+    const branchTip = `${this.remote}/${branch}`;
+    const mainTip = `${this.remote}/${this.mainBranch}`;
+    // ancestor=branchTip, descendant=mainTip  →  "is branch an ancestor of main?"
+    return this.isAncestor(branchTip, mainTip);
   }
 }

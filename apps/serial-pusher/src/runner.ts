@@ -78,7 +78,9 @@ export class JobRunner {
    *  10. Clean up temp branch
    *
    * Failure modes:
-   *   - Merge conflict: requeue if under maxAttempts, skip otherwise
+   *   - Merge conflict: markFailed if deterministic (main unchanged);
+   *                      requeue if main advanced (may resolve on new base);
+   *                      markSkipped if maxAttempts exceeded
    *   - Check failure:  requeue if under maxAttempts, skip otherwise
    *   - Push rejected:  requeue (main advanced mid-run)
    */
@@ -179,15 +181,18 @@ export class JobRunner {
         const mainAdvanced = currentMainSha !== originMainSha;
 
         if (job.attempts >= this.config.maxAttempts) {
-          db.markSkipped(job.id, `Max attempts (${this.config.maxAttempts}) reached: ${msg}`);
-          return { status: "skipped", message: msg };
+          const skipMsg = `Max attempts (${job.attempts}/${this.config.maxAttempts}) reached: ${msg}`;
+          log(job.id, skipMsg);
+          db.markSkipped(job.id, skipMsg);
+          return { status: "skipped", message: skipMsg };
         }
         if (mainAdvanced) {
-          log(job.id, "Main advanced since step 2; requeuing (conflict may resolve)");
+          log(job.id, `Main advanced since step 2; requeuing (attempt ${job.attempts}/${this.config.maxAttempts}, conflict may resolve)`);
           db.requeue(job.id);
           return { status: "requeued", message: msg };
         }
-        // Deterministic conflict — skip immediately, don't burn retries
+        // Deterministic conflict (main unchanged) — mark failed, no point retrying
+        log(job.id, `Deterministic merge conflict (attempt ${job.attempts}/${this.config.maxAttempts}), marking failed`);
         db.markFailed(job.id, msg);
         return { status: "failed", message: msg };
       }
@@ -209,9 +214,12 @@ export class JobRunner {
           await this._cleanupTempBranch(tempBranch);
 
           if (job.attempts >= this.config.maxAttempts) {
-            db.markSkipped(job.id, `Max attempts (${this.config.maxAttempts}) reached: ${msg}`);
-            return { status: "skipped", message: msg };
+            const skipMsg = `Max attempts (${job.attempts}/${this.config.maxAttempts}) reached: ${msg}`;
+            log(job.id, skipMsg);
+            db.markSkipped(job.id, skipMsg);
+            return { status: "skipped", message: skipMsg };
           }
+          log(job.id, `Check failed (attempt ${job.attempts}/${this.config.maxAttempts}), requeuing`);
           db.requeue(job.id);
           return { status: "requeued", message: msg };
         }
@@ -241,14 +249,16 @@ export class JobRunner {
         await this.gitOps.checkoutMain();
         await this.gitOps.pullMainFF();
 
-        // Verify temp is still a descendant of main (safety invariant)
+        // Verify main is an ancestor of temp (required for FF to succeed).
+        // Resolve both to SHAs for unambiguous comparison.
         const mainSha = await this.gitOps.revParse(this.config.mainBranch);
-        const isDescendant = mainSha
-          ? await this.gitOps.isAncestor(mainSha, tempBranch)
+        const tempSha2 = await this.gitOps.revParse(tempBranch);
+        const mainIsAncestorOfTemp = (mainSha && tempSha2)
+          ? await this.gitOps.isAncestor(mainSha, tempSha2)
           : false;
 
-        if (!isDescendant) {
-          const msg = `Invariant violation: main (${mainSha?.slice(0, 8)}) is not an ancestor of temp (${tempSha?.slice(0, 8)}). Cannot FF.`;
+        if (!mainIsAncestorOfTemp) {
+          const msg = `Invariant violation: main (${mainSha?.slice(0, 8)}) is not an ancestor of temp (${tempSha2?.slice(0, 8)}). Cannot FF.`;
           logErr(job.id, msg);
           db.addLog(job.id, msg, "error");
           db.markFailed(job.id, msg);
@@ -288,18 +298,18 @@ export class JobRunner {
           const localMain = await this.gitOps.revParse(this.config.mainBranch);
           const remoteMain = await this.gitOps.revParse(`${this.config.remote}/${this.config.mainBranch}`);
           if (localMain && remoteMain && localMain !== remoteMain) {
-            // If remoteMain is an ancestor-or-equal of localMain, the remote
-            // is simply behind (normal after a failed push that didn't update it).
-            // If NOT, the remote has commits we don't have → someone pushed.
-            const remoteBehindOrEqual = await this.gitOps.isAncestor(remoteMain, localMain);
-            remoteAdvanced = !remoteBehindOrEqual;
+            // Check: is remoteMain an ancestor-or-equal of localMain?
+            // If yes, the remote is simply behind us (push failed for non-advancing reasons).
+            // If no, remote has commits we don't have → someone else pushed.
+            const remoteIsAncestorOfLocal = await this.gitOps.isAncestor(remoteMain, localMain);
+            remoteAdvanced = !remoteIsAncestorOfLocal;
           }
         } catch {
           // If fetch fails too, treat as true failure
         }
 
         if (remoteAdvanced) {
-          const msg = "Push rejected: main advanced during processing, requeuing";
+          const msg = `Push rejected: main advanced during processing, requeuing (attempt ${job.attempts}/${this.config.maxAttempts})`;
           log(job.id, msg);
           db.addLog(job.id, `${msg} (output: ${truncate(pushOutput, 200)})`, "warn");
           db.requeue(job.id);

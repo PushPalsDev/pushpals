@@ -304,10 +304,11 @@ export class MergeQueueDB {
       .run(jobId, new Date().toISOString(), level, message);
   }
 
-  getJobLogs(jobId: number): Array<{ ts: string; level: string; message: string }> {
+  getJobLogs(jobId: number, limit = 500): Array<{ ts: string; level: string; message: string }> {
+    const safeLimit = Math.max(1, Math.min(limit, 2001));
     return this.db
-      .prepare(`SELECT ts, level, message FROM job_logs WHERE job_id = ? ORDER BY id ASC`)
-      .all(jobId) as Array<{ ts: string; level: string; message: string }>;
+      .prepare(`SELECT ts, level, message FROM job_logs WHERE job_id = ? ORDER BY id ASC LIMIT ?`)
+      .all(jobId, safeLimit) as Array<{ ts: string; level: string; message: string }>;
   }
 
   // ── Recovery ────────────────────────────────────────────────────────────

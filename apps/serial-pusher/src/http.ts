@@ -63,8 +63,16 @@ export function createStatusServer(
           );
         }
 
-        const logs = db.getJobLogs(jobId);
-        return Response.json({ job, logs }, { headers });
+        // Clamp log count to prevent unbounded response size
+        const logLimitParam = url.searchParams.get("logLimit");
+        const rawLogLimit = logLimitParam ? parseInt(logLimitParam, 10) : 500;
+        const logLimit = Number.isFinite(rawLogLimit) && rawLogLimit > 0 ? Math.min(rawLogLimit, 2000) : 500;
+
+        // Fetch one extra row to detect truncation without a COUNT query
+        const rawLogs = db.getJobLogs(jobId, logLimit + 1);
+        const logsClamped = rawLogs.length > logLimit;
+        const logs = logsClamped ? rawLogs.slice(0, logLimit) : rawLogs;
+        return Response.json({ job, logs, logsClamped }, { headers });
       }
 
       // ── GET /stats ────────────────────────────────────────────────────
