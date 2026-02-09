@@ -1,10 +1,6 @@
 import React, { useState } from "react";
 import { View, Text, ScrollView, TextInput, Button, TouchableOpacity } from "react-native";
-import {
-  usePushPalsSession,
-  isEnvelope,
-  type SessionEvent,
-} from "./usePushPalsSession.js";
+import { usePushPalsSession, isEnvelope, type SessionEvent } from "./usePushPalsSession.js";
 import type { EventEnvelope } from "protocol/browser";
 
 /**
@@ -24,7 +20,10 @@ export function PushPalsDemo() {
   const renderEvent = (event: SessionEvent, idx: number) => {
     if (!isEnvelope(event)) {
       return (
-        <View key={`err-${idx}`} style={{ marginBottom: 8, paddingBottom: 8, borderBottomWidth: 1 }}>
+        <View
+          key={`err-${idx}`}
+          style={{ marginBottom: 8, paddingBottom: 8, borderBottomWidth: 1 }}
+        >
           <Text style={{ color: "red", fontSize: 12 }}>Warning: {(event as any).message}</Text>
         </View>
       );
@@ -38,12 +37,28 @@ export function PushPalsDemo() {
         <View style={{ flexDirection: "row", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
           <Text style={{ fontWeight: "bold", color: "#333" }}>{event.type}</Text>
           {event.from && (
-            <Text style={{ fontSize: 10, color: "#0369a1", backgroundColor: "#e0f2fe", paddingHorizontal: 4, borderRadius: 3 }}>
+            <Text
+              style={{
+                fontSize: 10,
+                color: "#0369a1",
+                backgroundColor: "#e0f2fe",
+                paddingHorizontal: 4,
+                borderRadius: 3,
+              }}
+            >
               {event.from}
             </Text>
           )}
           {event.to && event.to !== "broadcast" && (
-            <Text style={{ fontSize: 10, color: "#be185d", backgroundColor: "#fce7f3", paddingHorizontal: 4, borderRadius: 3 }}>
+            <Text
+              style={{
+                fontSize: 10,
+                color: "#be185d",
+                backgroundColor: "#fce7f3",
+                paddingHorizontal: 4,
+                borderRadius: 3,
+              }}
+            >
               {"->"} {event.to}
             </Text>
           )}
@@ -67,27 +82,42 @@ export function PushPalsDemo() {
         )}
 
         {(event.type === "task_completed" || event.type === "task_failed") && (
-          <Text style={{
-            marginTop: 4, fontSize: 12,
-            color: event.type === "task_completed" ? "#16a34a" : "#dc2626",
-          }}>
+          <Text
+            style={{
+              marginTop: 4,
+              fontSize: 12,
+              color: event.type === "task_completed" ? "#16a34a" : "#dc2626",
+            }}
+          >
             {p.summary ?? p.message}
           </Text>
         )}
 
         {event.type === "tool_call" && (
           <View style={{ marginTop: 4 }}>
-            <Text style={{ fontSize: 12, fontWeight: "600", color: "#92400e" }}>[tool] {p.tool}</Text>
+            <Text style={{ fontSize: 12, fontWeight: "600", color: "#92400e" }}>
+              [tool] {p.tool}
+            </Text>
             {p.requiresApproval && (
               <View style={{ flexDirection: "row", gap: 8, marginTop: 4 }}>
                 <TouchableOpacity
-                  style={{ backgroundColor: "#dcfce7", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 4 }}
+                  style={{
+                    backgroundColor: "#dcfce7",
+                    paddingHorizontal: 10,
+                    paddingVertical: 4,
+                    borderRadius: 4,
+                  }}
                   onPress={() => session.approve(p.toolCallId)}
                 >
                   <Text style={{ color: "#16a34a", fontWeight: "600", fontSize: 12 }}>Approve</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
-                  style={{ backgroundColor: "#fee2e2", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 4 }}
+                  style={{
+                    backgroundColor: "#fee2e2",
+                    paddingHorizontal: 10,
+                    paddingVertical: 4,
+                    borderRadius: 4,
+                  }}
                   onPress={() => session.deny(p.toolCallId)}
                 >
                   <Text style={{ color: "#dc2626", fontWeight: "600", fontSize: 12 }}>Deny</Text>
@@ -99,7 +129,8 @@ export function PushPalsDemo() {
 
         {event.type === "tool_result" && (
           <Text style={{ fontSize: 11, color: p.ok ? "#16a34a" : "#dc2626", marginTop: 4 }}>
-            {p.ok ? "OK" : "FAILED"}{p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ""}
+            {p.ok ? "OK" : "FAILED"}
+            {p.exitCode !== undefined ? ` (exit ${p.exitCode})` : ""}
           </Text>
         )}
 
@@ -108,13 +139,23 @@ export function PushPalsDemo() {
             <Text style={{ fontSize: 12 }}>{p.summary}</Text>
             <View style={{ flexDirection: "row", gap: 8, marginTop: 4 }}>
               <TouchableOpacity
-                style={{ backgroundColor: "#dcfce7", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 4 }}
+                style={{
+                  backgroundColor: "#dcfce7",
+                  paddingHorizontal: 10,
+                  paddingVertical: 4,
+                  borderRadius: 4,
+                }}
                 onPress={() => session.approve(p.approvalId)}
               >
                 <Text style={{ color: "#16a34a", fontWeight: "600", fontSize: 12 }}>Approve</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={{ backgroundColor: "#fee2e2", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 4 }}
+                style={{
+                  backgroundColor: "#fee2e2",
+                  paddingHorizontal: 10,
+                  paddingVertical: 4,
+                  borderRadius: 4,
+                }}
                 onPress={() => session.deny(p.approvalId)}
               >
                 <Text style={{ color: "#dc2626", fontWeight: "600", fontSize: 12 }}>Deny</Text>
@@ -133,8 +174,16 @@ export function PushPalsDemo() {
         )}
 
         {/* Fallback for unhandled types */}
-        {!["assistant_message", "task_created", "task_completed", "task_failed",
-          "tool_call", "tool_result", "approval_required", "diff_ready"].includes(event.type) && (
+        {![
+          "assistant_message",
+          "task_created",
+          "task_completed",
+          "task_failed",
+          "tool_call",
+          "tool_result",
+          "approval_required",
+          "diff_ready",
+        ].includes(event.type) && (
           <Text style={{ fontSize: 11, color: "#999", marginTop: 4 }}>
             {JSON.stringify(p, null, 2).substring(0, 120)}…
           </Text>
@@ -163,14 +212,19 @@ export function PushPalsDemo() {
           </Text>
           {session.tasks.map((t) => (
             <Text key={t.taskId} style={{ fontSize: 12, color: "#555" }}>
-              {t.status === "completed" ? "[ok]" : t.status === "failed" ? "[err]" : "[...]"} {t.title}
+              {t.status === "completed" ? "[ok]" : t.status === "failed" ? "[err]" : "[...]"}{" "}
+              {t.title}
             </Text>
           ))}
         </View>
       )}
 
       <Text style={{ fontSize: 16, fontWeight: "bold", marginBottom: 8 }}>
-        Events ({session.filteredEvents.length}{session.filteredEvents.length !== session.events.length ? ` / ${session.events.length}` : ""})
+        Events ({session.filteredEvents.length}
+        {session.filteredEvents.length !== session.events.length
+          ? ` / ${session.events.length}`
+          : ""}
+        )
       </Text>
 
       <ScrollView style={{ flex: 1, marginBottom: 16, backgroundColor: "#f5f5f5", padding: 8 }}>

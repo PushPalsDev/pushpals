@@ -100,14 +100,11 @@ class LocalAgent {
     };
 
     try {
-      const res = await fetch(
-        `${this.server}/sessions/${this.sessionId}/command`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-        },
-      );
+      const res = await fetch(`${this.server}/sessions/${this.sessionId}/command`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
 
       if (!res.ok) {
         const err = await res.text();
@@ -201,7 +198,12 @@ class LocalAgent {
     });
   }
 
-  private async emitJobEnqueued(jobId: string, taskId: string, kind: string, params: Record<string, unknown>) {
+  private async emitJobEnqueued(
+    jobId: string,
+    taskId: string,
+    kind: string,
+    params: Record<string, unknown>,
+  ) {
     await this.sendCommand({
       type: "job_enqueued",
       payload: { jobId, taskId, kind, params },
@@ -265,12 +267,15 @@ class LocalAgent {
       this.pendingApprovals.set(toolCallId, resolve);
 
       // Timeout after 5 minutes
-      setTimeout(() => {
-        if (this.pendingApprovals.has(toolCallId)) {
-          this.pendingApprovals.delete(toolCallId);
-          resolve(false);
-        }
-      }, 5 * 60 * 1000);
+      setTimeout(
+        () => {
+          if (this.pendingApprovals.has(toolCallId)) {
+            this.pendingApprovals.delete(toolCallId);
+            resolve(false);
+          }
+        },
+        5 * 60 * 1000,
+      );
     });
   }
 

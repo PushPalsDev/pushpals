@@ -101,10 +101,10 @@ function ApprovalActions({
 
   if (decided) {
     return (
-      <View style={[styles.decisionBadge, decided === "approve" ? styles.approvedBg : styles.deniedBg]}>
-        <Text style={styles.decisionText}>
-          {decided === "approve" ? "Approved" : "Denied"}
-        </Text>
+      <View
+        style={[styles.decisionBadge, decided === "approve" ? styles.approvedBg : styles.deniedBg]}
+      >
+        <Text style={styles.decisionText}>{decided === "approve" ? "Approved" : "Denied"}</Text>
       </View>
     );
   }
@@ -113,13 +113,19 @@ function ApprovalActions({
     <View style={styles.approvalRow}>
       <TouchableOpacity
         style={[styles.approvalBtn, styles.approveBtn]}
-        onPress={() => { setDecided("approve"); onApprove(approvalId); }}
+        onPress={() => {
+          setDecided("approve");
+          onApprove(approvalId);
+        }}
       >
         <Text style={styles.approveBtnText}>Approve</Text>
       </TouchableOpacity>
       <TouchableOpacity
         style={[styles.approvalBtn, styles.denyBtn]}
-        onPress={() => { setDecided("deny"); onDeny(approvalId); }}
+        onPress={() => {
+          setDecided("deny");
+          onDeny(approvalId);
+        }}
       >
         <Text style={styles.denyBtnText}>Deny</Text>
       </TouchableOpacity>
@@ -177,11 +183,18 @@ function EventCard({
       case "agent_status":
         return (
           <View style={styles.statusRow}>
-            <View style={[styles.statusDot, {
-              backgroundColor: p.status === "idle" ? "#22c55e" : p.status === "busy" ? "#f59e0b" : "#ef4444",
-            }]} />
+            <View
+              style={[
+                styles.statusDot,
+                {
+                  backgroundColor:
+                    p.status === "idle" ? "#22c55e" : p.status === "busy" ? "#f59e0b" : "#ef4444",
+                },
+              ]}
+            />
             <Text style={styles.statusText}>
-              {p.agentId}: {p.status}{p.message ? ` — ${p.message}` : ""}
+              {p.agentId}: {p.status}
+              {p.message ? ` — ${p.message}` : ""}
             </Text>
           </View>
         );
@@ -213,7 +226,8 @@ function EventCard({
             <Text style={styles.successText}>{p.summary}</Text>
             {p.artifacts?.map((a: any, i: number) => (
               <Text key={i} style={styles.artifactText}>
-                [{a.kind}]{a.uri ? `: ${a.uri}` : ""}{a.text ? ` -- ${a.text.substring(0, 80)}...` : ""}
+                [{a.kind}]{a.uri ? `: ${a.uri}` : ""}
+                {a.text ? ` -- ${a.text.substring(0, 80)}...` : ""}
               </Text>
             ))}
           </View>
@@ -233,11 +247,7 @@ function EventCard({
             <Text style={styles.toolName}>[tool] {p.tool}</Text>
             <Text style={styles.toolArgs}>{JSON.stringify(p.args, null, 2)}</Text>
             {p.requiresApproval && (
-              <ApprovalActions
-                approvalId={p.toolCallId}
-                onApprove={onApprove}
-                onDeny={onDeny}
-              />
+              <ApprovalActions approvalId={p.toolCallId} onApprove={onApprove} onDeny={onDeny} />
             )}
           </View>
         );
@@ -257,9 +267,7 @@ function EventCard({
                 <Text style={styles.outputText}>{p.stdout.substring(0, 500)}</Text>
               </ScrollView>
             )}
-            {p.stderr && (
-              <Text style={styles.stderrText}>{p.stderr.substring(0, 200)}</Text>
-            )}
+            {p.stderr && <Text style={styles.stderrText}>{p.stderr.substring(0, 200)}</Text>}
           </View>
         );
 
@@ -295,11 +303,7 @@ function EventCard({
         );
 
       case "job_claimed":
-        return (
-          <Text style={styles.infoText}>
-            Job claimed by worker {p.workerId}
-          </Text>
-        );
+        return <Text style={styles.infoText}>Job claimed by worker {p.workerId}</Text>;
 
       case "job_completed":
         return (
@@ -337,11 +341,7 @@ function EventCard({
         );
 
       default:
-        return (
-          <Text style={styles.metaText}>
-            {JSON.stringify(p, null, 2).substring(0, 200)}
-          </Text>
-        );
+        return <Text style={styles.metaText}>{JSON.stringify(p, null, 2).substring(0, 200)}</Text>;
     }
   };
 
@@ -374,17 +374,13 @@ function FilterBar({
   setFilters: (f: EventFilters) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const hasFilters = filters.agentFrom || filters.taskId || filters.turnId || (filters.eventTypes?.length ?? 0) > 0;
+  const hasFilters =
+    filters.agentFrom || filters.taskId || filters.turnId || (filters.eventTypes?.length ?? 0) > 0;
 
   return (
     <View style={styles.filterContainer}>
-      <TouchableOpacity
-        style={styles.filterToggle}
-        onPress={() => setExpanded(!expanded)}
-      >
-        <Text style={styles.filterToggleText}>
-          Filters{hasFilters ? " (active)" : ""}
-        </Text>
+      <TouchableOpacity style={styles.filterToggle} onPress={() => setExpanded(!expanded)}>
+        <Text style={styles.filterToggleText}>Filters{hasFilters ? " (active)" : ""}</Text>
         {hasFilters && (
           <TouchableOpacity onPress={() => setFilters({})}>
             <Text style={styles.clearFilterText}>Clear</Text>
@@ -432,7 +428,10 @@ function FilterBar({
                 {tasks.map((t) => (
                   <TouchableOpacity
                     key={t.taskId}
-                    style={[styles.filterChip, filters.taskId === t.taskId && styles.filterChipActive]}
+                    style={[
+                      styles.filterChip,
+                      filters.taskId === t.taskId && styles.filterChipActive,
+                    ]}
                     onPress={() => setFilters({ ...filters, taskId: t.taskId })}
                   >
                     <Text style={styles.filterChipText}>
@@ -506,8 +505,18 @@ export default function ChatScreen() {
     }
   };
 
-  const handleApprove = useCallback((id: string) => { session.approve(id); }, [session.approve]);
-  const handleDeny = useCallback((id: string) => { session.deny(id); }, [session.deny]);
+  const handleApprove = useCallback(
+    (id: string) => {
+      session.approve(id);
+    },
+    [session.approve],
+  );
+  const handleDeny = useCallback(
+    (id: string) => {
+      session.deny(id);
+    },
+    [session.deny],
+  );
 
   useEffect(() => {
     flatRef.current?.scrollToEnd({ animated: true });
@@ -535,9 +544,14 @@ export default function ChatScreen() {
         <Text style={styles.headerTitle}>PushPals</Text>
         <View style={styles.headerRight}>
           <Text style={styles.eventCount}>{session.events.length} events</Text>
-          <View style={[styles.connDot, {
-            backgroundColor: session.isConnected ? "#22c55e" : "#ef4444",
-          }]} />
+          <View
+            style={[
+              styles.connDot,
+              {
+                backgroundColor: session.isConnected ? "#22c55e" : "#ef4444",
+              },
+            ]}
+          />
         </View>
       </View>
 
@@ -561,12 +575,12 @@ export default function ChatScreen() {
 
       {/* Event list */}
       <FlatList
-        ref={(r) => { flatRef.current = r; }}
+        ref={(r) => {
+          flatRef.current = r;
+        }}
         data={session.filteredEvents}
         renderItem={renderItem}
-        keyExtractor={(item, idx) =>
-          isEnvelope(item) ? item.id : `err-${idx}`
-        }
+        keyExtractor={(item, idx) => (isEnvelope(item) ? item.id : `err-${idx}`)}
         contentContainerStyle={styles.listContent}
       />
 
@@ -720,7 +734,11 @@ const styles = StyleSheet.create({
   successText: { fontSize: 13, color: "#16a34a", fontWeight: "500" },
   errorText: { fontSize: 13, color: "#dc2626" },
   detailText: { fontSize: 12, color: "#94a3b8", marginTop: 2 },
-  logText: { fontSize: 12, color: "#64748b", fontFamily: Platform.OS === "web" ? "monospace" : undefined },
+  logText: {
+    fontSize: 12,
+    color: "#64748b",
+    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
+  },
   metaText: { fontSize: 11, color: "#94a3b8" },
 
   // Task
@@ -752,7 +770,13 @@ const styles = StyleSheet.create({
   approveBtnText: { color: "#16a34a", fontWeight: "600", fontSize: 13 },
   denyBtnText: { color: "#dc2626", fontWeight: "600", fontSize: 13 },
   approvalSummary: { fontSize: 13, color: "#1e293b", fontWeight: "500" },
-  decisionBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, marginTop: 6, alignSelf: "flex-start" },
+  decisionBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    marginTop: 6,
+    alignSelf: "flex-start",
+  },
   approvedBg: { backgroundColor: "#dcfce7" },
   deniedBg: { backgroundColor: "#fee2e2" },
   decisionText: { fontSize: 12, fontWeight: "600" },

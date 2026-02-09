@@ -291,10 +291,7 @@ export class SessionManager {
     };
 
     // If it's a tool_call with requiresApproval, auto-create pending approval
-    if (
-      cmd.type === "tool_call" &&
-      (cmd.payload as any).requiresApproval === true
-    ) {
+    if (cmd.type === "tool_call" && (cmd.payload as any).requiresApproval === true) {
       const toolCallId = (cmd.payload as any).toolCallId as string;
       this._createApprovalFromToolCall(sessionId, toolCallId, cmd.payload);
     }

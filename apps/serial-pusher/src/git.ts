@@ -81,9 +81,7 @@ export class GitOps {
    * Fetch all refs from the remote, pruning deleted branches.
    */
   async fetchPrune(): Promise<void> {
-    const result = await git(this.repoPath, [
-      "fetch", this.remote, "--prune", "--quiet",
-    ]);
+    const result = await git(this.repoPath, ["fetch", this.remote, "--prune", "--quiet"]);
     assertOk(result, "fetch --prune");
   }
 
@@ -139,7 +137,11 @@ export class GitOps {
    */
   async pullMainFF(): Promise<void> {
     const result = await git(this.repoPath, [
-      "pull", this.remote, this.mainBranch, "--ff-only", "--quiet",
+      "pull",
+      this.remote,
+      this.mainBranch,
+      "--ff-only",
+      "--quiet",
     ]);
     assertOk(result, "pull --ff-only main");
   }
@@ -152,7 +154,11 @@ export class GitOps {
    */
   async createTempBranch(name: string): Promise<void> {
     const result = await git(this.repoPath, [
-      "checkout", "-B", name, `${this.remote}/${this.mainBranch}`, "--quiet",
+      "checkout",
+      "-B",
+      name,
+      `${this.remote}/${this.mainBranch}`,
+      "--quiet",
     ]);
     assertOk(result, `checkout -B ${name}`);
   }
@@ -161,14 +167,9 @@ export class GitOps {
    * Merge agent branch into main using --no-ff (creates merge commit).
    * Returns the result for conflict detection.
    */
-  async mergeNoFF(
-    agentBranch: string,
-    message: string,
-  ): Promise<GitResult> {
+  async mergeNoFF(agentBranch: string, message: string): Promise<GitResult> {
     const remoteBranch = `${this.remote}/${agentBranch}`;
-    return git(this.repoPath, [
-      "merge", remoteBranch, "--no-ff", "-m", message,
-    ]);
+    return git(this.repoPath, ["merge", remoteBranch, "--no-ff", "-m", message]);
   }
 
   /**
@@ -176,9 +177,7 @@ export class GitOps {
    */
   async mergeFFOnly(agentBranch: string): Promise<GitResult> {
     const remoteBranch = `${this.remote}/${agentBranch}`;
-    return git(this.repoPath, [
-      "merge", remoteBranch, "--ff-only",
-    ]);
+    return git(this.repoPath, ["merge", remoteBranch, "--ff-only"]);
   }
 
   /**
@@ -186,9 +185,7 @@ export class GitOps {
    * Unlike mergeFFOnly(), this does NOT prepend the remote prefix.
    */
   async mergeFFOnlyRef(ref: string): Promise<GitResult> {
-    return git(this.repoPath, [
-      "merge", ref, "--ff-only",
-    ]);
+    return git(this.repoPath, ["merge", ref, "--ff-only"]);
   }
 
   // ── Push ──────────────────────────────────────────────────────────────
@@ -197,9 +194,7 @@ export class GitOps {
    * Push main to the remote. Uses --atomic for safety.
    */
   async pushMain(): Promise<GitResult> {
-    return git(this.repoPath, [
-      "push", this.remote, this.mainBranch, "--atomic",
-    ]);
+    return git(this.repoPath, ["push", this.remote, this.mainBranch, "--atomic"]);
   }
 
   // ── Cleanup ───────────────────────────────────────────────────────────
@@ -215,9 +210,7 @@ export class GitOps {
    * Delete a remote branch after successful merge.
    */
   async deleteRemoteBranch(branch: string): Promise<void> {
-    await git(this.repoPath, [
-      "push", this.remote, "--delete", branch,
-    ]);
+    await git(this.repoPath, ["push", this.remote, "--delete", branch]);
   }
 
   /**
@@ -264,9 +257,7 @@ export class GitOps {
    * Check if `ancestor` is an ancestor of `descendant`.
    */
   async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
-    const result = await git(this.repoPath, [
-      "merge-base", "--is-ancestor", ancestor, descendant,
-    ]);
+    const result = await git(this.repoPath, ["merge-base", "--is-ancestor", ancestor, descendant]);
     return result.ok;
   }
 
@@ -274,9 +265,7 @@ export class GitOps {
    * Get the short log for a commit range (for merge commit messages).
    */
   async shortLog(from: string, to: string): Promise<string> {
-    const result = await git(this.repoPath, [
-      "log", "--oneline", `${from}..${to}`,
-    ]);
+    const result = await git(this.repoPath, ["log", "--oneline", `${from}..${to}`]);
     return result.ok ? result.stdout : "";
   }
 

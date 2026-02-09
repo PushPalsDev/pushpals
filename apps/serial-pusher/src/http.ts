@@ -4,10 +4,7 @@ import type { MergeQueueDB, MergeJobStatus } from "./db";
  * Small HTTP status server for the serial pusher.
  * Provides read-only access to job status for monitoring and dashboards.
  */
-export function createStatusServer(
-  db: MergeQueueDB,
-  port: number,
-): ReturnType<typeof Bun.serve> {
+export function createStatusServer(db: MergeQueueDB, port: number): ReturnType<typeof Bun.serve> {
   return Bun.serve({
     port,
     hostname: "127.0.0.1",
@@ -38,7 +35,9 @@ export function createStatusServer(
         const validStatuses = new Set(["queued", "running", "success", "failed", "skipped"]);
         if (statusFilter && !validStatuses.has(statusFilter)) {
           return Response.json(
-            { error: `Invalid status: ${statusFilter}. Valid values: ${[...validStatuses].join(", ")}` },
+            {
+              error: `Invalid status: ${statusFilter}. Valid values: ${[...validStatuses].join(", ")}`,
+            },
             { status: 400, headers },
           );
         }
@@ -57,16 +56,14 @@ export function createStatusServer(
         const job = db.getJob(jobId);
 
         if (!job) {
-          return Response.json(
-            { error: "Job not found" },
-            { status: 404, headers },
-          );
+          return Response.json({ error: "Job not found" }, { status: 404, headers });
         }
 
         // Clamp log count to prevent unbounded response size
         const logLimitParam = url.searchParams.get("logLimit");
         const rawLogLimit = logLimitParam ? parseInt(logLimitParam, 10) : 500;
-        const logLimit = Number.isFinite(rawLogLimit) && rawLogLimit > 0 ? Math.min(rawLogLimit, 2000) : 500;
+        const logLimit =
+          Number.isFinite(rawLogLimit) && rawLogLimit > 0 ? Math.min(rawLogLimit, 2000) : 500;
 
         // Fetch one extra row to detect truncation without a COUNT query
         const rawLogs = db.getJobLogs(jobId, logLimit + 1);
@@ -92,10 +89,7 @@ export function createStatusServer(
       }
 
       // ── 404 ───────────────────────────────────────────────────────────
-      return Response.json(
-        { error: "Not found" },
-        { status: 404, headers },
-      );
+      return Response.json({ error: "Not found" }, { status: 404, headers });
     },
   });
 }

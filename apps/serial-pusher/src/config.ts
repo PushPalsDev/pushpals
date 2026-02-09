@@ -91,17 +91,36 @@ export function applyCliOverrides(
  * Call once at startup to catch misconfigurations early.
  */
 export function validateConfig(config: SerialPusherConfig): void {
-  if (typeof config.port !== "number" || !Number.isFinite(config.port) || config.port < 1 || config.port > 65535) {
+  if (
+    typeof config.port !== "number" ||
+    !Number.isFinite(config.port) ||
+    config.port < 1 ||
+    config.port > 65535
+  ) {
     throw new Error(`Invalid config: port must be 1-65535, got ${JSON.stringify(config.port)}`);
   }
-  if (typeof config.pollIntervalSeconds !== "number" || !Number.isFinite(config.pollIntervalSeconds) || config.pollIntervalSeconds < 1) {
-    throw new Error(`Invalid config: pollIntervalSeconds must be >= 1, got ${JSON.stringify(config.pollIntervalSeconds)}`);
+  if (
+    typeof config.pollIntervalSeconds !== "number" ||
+    !Number.isFinite(config.pollIntervalSeconds) ||
+    config.pollIntervalSeconds < 1
+  ) {
+    throw new Error(
+      `Invalid config: pollIntervalSeconds must be >= 1, got ${JSON.stringify(config.pollIntervalSeconds)}`,
+    );
   }
-  if (typeof config.maxAttempts !== "number" || !Number.isFinite(config.maxAttempts) || config.maxAttempts < 1) {
-    throw new Error(`Invalid config: maxAttempts must be >= 1, got ${JSON.stringify(config.maxAttempts)}`);
+  if (
+    typeof config.maxAttempts !== "number" ||
+    !Number.isFinite(config.maxAttempts) ||
+    config.maxAttempts < 1
+  ) {
+    throw new Error(
+      `Invalid config: maxAttempts must be >= 1, got ${JSON.stringify(config.maxAttempts)}`,
+    );
   }
   if (config.mergeStrategy !== "no-ff" && config.mergeStrategy !== "ff-only") {
-    throw new Error(`Invalid config: mergeStrategy must be "no-ff" or "ff-only", got ${JSON.stringify(config.mergeStrategy)}`);
+    throw new Error(
+      `Invalid config: mergeStrategy must be "no-ff" or "ff-only", got ${JSON.stringify(config.mergeStrategy)}`,
+    );
   }
   if (typeof config.repoPath !== "string" || config.repoPath.length === 0) {
     throw new Error(`Invalid config: repoPath must be a non-empty string`);

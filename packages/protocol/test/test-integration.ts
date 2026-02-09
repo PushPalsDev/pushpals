@@ -566,19 +566,23 @@ test("Event type 'job_failed' validates", () => {
 // ── validateCommandRequest ──────────────────────────────────────────────────
 
 test("validateCommandRequest accepts valid command", () => {
-  return validateCommandRequest({
-    type: "agent_status",
-    payload: { agentId: "local1", status: "busy" },
-    from: "agent:local1",
-    turnId: randomUUID(),
-  }).ok === true;
+  return (
+    validateCommandRequest({
+      type: "agent_status",
+      payload: { agentId: "local1", status: "busy" },
+      from: "agent:local1",
+      turnId: randomUUID(),
+    }).ok === true
+  );
 });
 
 test("validateCommandRequest rejects unknown type", () => {
-  return validateCommandRequest({
-    type: "unknown_event",
-    payload: {},
-  }).ok === false;
+  return (
+    validateCommandRequest({
+      type: "unknown_event",
+      payload: {},
+    }).ok === false
+  );
 });
 
 test("validateCommandRequest rejects missing payload", () => {

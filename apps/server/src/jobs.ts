@@ -114,9 +114,7 @@ export class JobQueue {
       if (!row) return null;
 
       this.db
-        .prepare(
-          `UPDATE jobs SET status = 'claimed', workerId = ?, updatedAt = ? WHERE id = ?`,
-        )
+        .prepare(`UPDATE jobs SET status = 'claimed', workerId = ?, updatedAt = ? WHERE id = ?`)
         .run(workerId, now, row.id);
 
       return { ...row, status: "claimed" as JobStatus, workerId, updatedAt: now };
@@ -129,10 +127,7 @@ export class JobQueue {
 
   // ── Complete ────────────────────────────────────────────────────────────
 
-  complete(
-    jobId: string,
-    body: Record<string, unknown>,
-  ): { ok: boolean; message?: string } {
+  complete(jobId: string, body: Record<string, unknown>): { ok: boolean; message?: string } {
     const now = new Date().toISOString();
     const summary = (body.summary as string) ?? null;
     const artifacts = body.artifacts ? JSON.stringify(body.artifacts) : null;
@@ -152,10 +147,7 @@ export class JobQueue {
 
   // ── Fail ────────────────────────────────────────────────────────────────
 
-  fail(
-    jobId: string,
-    body: Record<string, unknown>,
-  ): { ok: boolean; message?: string } {
+  fail(jobId: string, body: Record<string, unknown>): { ok: boolean; message?: string } {
     const now = new Date().toISOString();
     const message = (body.message as string) ?? "Unknown error";
     const detail = (body.detail as string) ?? null;

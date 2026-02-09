@@ -106,9 +106,7 @@ export class MergeQueueDB {
   }
 
   removeSeen(remote: string, branch: string): void {
-    this.db
-      .prepare(`DELETE FROM seen WHERE remote = ? AND branch = ?`)
-      .run(remote, branch);
+    this.db.prepare(`DELETE FROM seen WHERE remote = ? AND branch = ?`).run(remote, branch);
   }
 
   /**
@@ -137,12 +135,7 @@ export class MergeQueueDB {
    * Enqueue a branch for merge processing.
    * Returns the job ID, or null if the exact (remote, branch, head_sha) already exists.
    */
-  enqueue(
-    remote: string,
-    branch: string,
-    headSha: string,
-    priority = 0,
-  ): number | null {
+  enqueue(remote: string, branch: string, headSha: string, priority = 0): number | null {
     const now = new Date().toISOString();
     try {
       const info = this.db
@@ -212,9 +205,7 @@ export class MergeQueueDB {
   markSuccess(jobId: number): void {
     const now = new Date().toISOString();
     this.db
-      .prepare(
-        `UPDATE jobs SET status = 'success', finished_at = ?, updated_at = ? WHERE id = ?`,
-      )
+      .prepare(`UPDATE jobs SET status = 'success', finished_at = ?, updated_at = ? WHERE id = ?`)
       .run(now, now, jobId);
   }
 
@@ -253,15 +244,15 @@ export class MergeQueueDB {
   // ── Query ───────────────────────────────────────────────────────────────
 
   getJob(jobId: number): MergeJob | null {
-    return (
-      (this.db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(jobId) as MergeJob) ?? null
-    );
+    return (this.db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(jobId) as MergeJob) ?? null;
   }
 
   getJobsByStatus(status: MergeJobStatus, limit?: number): MergeJob[] {
     if (limit != null && limit > 0) {
       return this.db
-        .prepare(`SELECT * FROM jobs WHERE status = ? ORDER BY priority DESC, created_at ASC LIMIT ?`)
+        .prepare(
+          `SELECT * FROM jobs WHERE status = ? ORDER BY priority DESC, created_at ASC LIMIT ?`,
+        )
         .all(status, limit) as MergeJob[];
     }
     return this.db

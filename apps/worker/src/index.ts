@@ -183,9 +183,7 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
                   payload: {
                     jobId: job.id,
                     summary: result.summary,
-                    artifacts: result.stdout
-                      ? [{ kind: "log", text: result.stdout }]
-                      : undefined,
+                    artifacts: result.stdout ? [{ kind: "log", text: result.stdout }] : undefined,
                   },
                   from: `worker:${opts.workerId}`,
                 }
@@ -199,14 +197,11 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
                   from: `worker:${opts.workerId}`,
                 };
 
-            await fetch(
-              `${opts.server}/sessions/${job.sessionId}/command`,
-              {
-                method: "POST",
-                headers,
-                body: JSON.stringify(eventPayload),
-              },
-            ).catch(() => {}); // Best-effort event emission
+            await fetch(`${opts.server}/sessions/${job.sessionId}/command`, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(eventPayload),
+            }).catch(() => {}); // Best-effort event emission
           }
         }
       }

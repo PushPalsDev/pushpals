@@ -101,10 +101,18 @@ export class JobRunner {
       await this.gitOps.pullMainFF();
 
       // Log SHAs for debugging
-      const originMainSha = await this.gitOps.revParse(`${this.config.remote}/${this.config.mainBranch}`);
+      const originMainSha = await this.gitOps.revParse(
+        `${this.config.remote}/${this.config.mainBranch}`,
+      );
       const originBranchSha = await this.gitOps.revParse(`${this.config.remote}/${job.branch}`);
-      log(job.id, `SHAs: origin/main=${originMainSha?.slice(0, 8)}, origin/${job.branch}=${originBranchSha?.slice(0, 8)}, job.head_sha=${job.head_sha.slice(0, 8)}`);
-      db.addLog(job.id, `origin/main=${originMainSha?.slice(0, 8)} origin/${job.branch}=${originBranchSha?.slice(0, 8)} job.head_sha=${job.head_sha.slice(0, 8)}`);
+      log(
+        job.id,
+        `SHAs: origin/main=${originMainSha?.slice(0, 8)}, origin/${job.branch}=${originBranchSha?.slice(0, 8)}, job.head_sha=${job.head_sha.slice(0, 8)}`,
+      );
+      db.addLog(
+        job.id,
+        `origin/main=${originMainSha?.slice(0, 8)} origin/${job.branch}=${originBranchSha?.slice(0, 8)} job.head_sha=${job.head_sha.slice(0, 8)}`,
+      );
 
       // ── Step 2.5: Validate job SHA matches current branch HEAD ────────
       // If the remote branch was deleted, skip immediately.
@@ -161,9 +169,10 @@ export class JobRunner {
         }
       }
 
-      const mergeResult = this.config.mergeStrategy === "ff-only"
-        ? await this.gitOps.mergeFFOnly(job.branch)
-        : await this.gitOps.mergeNoFF(job.branch, mergeMsg);
+      const mergeResult =
+        this.config.mergeStrategy === "ff-only"
+          ? await this.gitOps.mergeFFOnly(job.branch)
+          : await this.gitOps.mergeNoFF(job.branch, mergeMsg);
 
       if (!mergeResult.ok) {
         const msg = `Merge conflict: ${mergeResult.stderr}`;
@@ -177,7 +186,9 @@ export class JobRunner {
         // Only requeue merge conflicts if main advanced since step 2
         // (the new base might resolve the conflict). Otherwise the conflict
         // is deterministic and retrying just burns cycles.
-        const currentMainSha = await this.gitOps.revParse(`${this.config.remote}/${this.config.mainBranch}`);
+        const currentMainSha = await this.gitOps.revParse(
+          `${this.config.remote}/${this.config.mainBranch}`,
+        );
         const mainAdvanced = currentMainSha !== originMainSha;
 
         if (job.attempts >= this.config.maxAttempts) {
@@ -187,12 +198,18 @@ export class JobRunner {
           return { status: "skipped", message: skipMsg };
         }
         if (mainAdvanced) {
-          log(job.id, `Main advanced since step 2; requeuing (attempt ${job.attempts}/${this.config.maxAttempts}, conflict may resolve)`);
+          log(
+            job.id,
+            `Main advanced since step 2; requeuing (attempt ${job.attempts}/${this.config.maxAttempts}, conflict may resolve)`,
+          );
           db.requeue(job.id);
           return { status: "requeued", message: msg };
         }
         // Deterministic conflict (main unchanged) — mark failed, no point retrying
-        log(job.id, `Deterministic merge conflict (attempt ${job.attempts}/${this.config.maxAttempts}), marking failed`);
+        log(
+          job.id,
+          `Deterministic merge conflict (attempt ${job.attempts}/${this.config.maxAttempts}), marking failed`,
+        );
         db.markFailed(job.id, msg);
         return { status: "failed", message: msg };
       }
@@ -219,7 +236,10 @@ export class JobRunner {
             db.markSkipped(job.id, skipMsg);
             return { status: "skipped", message: skipMsg };
           }
-          log(job.id, `Check failed (attempt ${job.attempts}/${this.config.maxAttempts}), requeuing`);
+          log(
+            job.id,
+            `Check failed (attempt ${job.attempts}/${this.config.maxAttempts}), requeuing`,
+          );
           db.requeue(job.id);
           return { status: "requeued", message: msg };
         }
@@ -242,7 +262,11 @@ export class JobRunner {
         // FF failed — this is unexpected. Instead of hard-resetting (which could
         // clobber state), re-sync from remote and retry once.
         logErr(job.id, `FF merge failed: ${ffResult.stderr}`);
-        db.addLog(job.id, `FF merge failed (stderr: ${truncate(ffResult.stderr, 300)}), re-syncing and retrying`, "warn");
+        db.addLog(
+          job.id,
+          `FF merge failed (stderr: ${truncate(ffResult.stderr, 300)}), re-syncing and retrying`,
+          "warn",
+        );
 
         // Re-sync: reset main to remote/main and try FF again
         await this.gitOps.resetToClean();
@@ -253,9 +277,8 @@ export class JobRunner {
         // Resolve both to SHAs for unambiguous comparison.
         const mainSha = await this.gitOps.revParse(this.config.mainBranch);
         const tempSha2 = await this.gitOps.revParse(tempBranch);
-        const mainIsAncestorOfTemp = (mainSha && tempSha2)
-          ? await this.gitOps.isAncestor(mainSha, tempSha2)
-          : false;
+        const mainIsAncestorOfTemp =
+          mainSha && tempSha2 ? await this.gitOps.isAncestor(mainSha, tempSha2) : false;
 
         if (!mainIsAncestorOfTemp) {
           const msg = `Invariant violation: main (${mainSha?.slice(0, 8)}) is not an ancestor of temp (${tempSha2?.slice(0, 8)}). Cannot FF.`;
@@ -296,7 +319,9 @@ export class JobRunner {
         try {
           await this.gitOps.fetchPrune();
           const localMain = await this.gitOps.revParse(this.config.mainBranch);
-          const remoteMain = await this.gitOps.revParse(`${this.config.remote}/${this.config.mainBranch}`);
+          const remoteMain = await this.gitOps.revParse(
+            `${this.config.remote}/${this.config.mainBranch}`,
+          );
           if (localMain && remoteMain && localMain !== remoteMain) {
             // Check: is remoteMain an ancestor-or-equal of localMain?
             // If yes, the remote is simply behind us (push failed for non-advancing reasons).

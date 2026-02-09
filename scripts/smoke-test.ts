@@ -108,9 +108,7 @@ while (Date.now() < deadline) {
   const allRequired = REQUIRED_TYPES.every((t) => seenTypes.has(t));
   // Also wait for some terminal event
   const hasTerminal =
-    seenTypes.has("task_completed") ||
-    seenTypes.has("task_failed") ||
-    seenTypes.has("done");
+    seenTypes.has("task_completed") || seenTypes.has("task_failed") || seenTypes.has("done");
 
   if (allRequired && hasTerminal) break;
   await new Promise((r) => setTimeout(r, 500));

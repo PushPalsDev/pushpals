@@ -53,9 +53,8 @@ Options:
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
-const configPath = args.config && typeof args.config === "string"
-  ? resolve(args.config)
-  : undefined;
+const configPath =
+  args.config && typeof args.config === "string" ? resolve(args.config) : undefined;
 
 // Search for config: explicit path > cwd > app-local default
 function resolveConfigPath(): string | undefined {
@@ -78,7 +77,10 @@ if (typeof args.repo === "string") cliOverrides.repoPath = resolve(args.repo);
 if (typeof args.port === "string") {
   const n = parseInt(args.port, 10);
   if (Number.isFinite(n) && n > 0) cliOverrides.port = n;
-  else { console.error(`Invalid --port value: ${args.port}`); process.exit(1); }
+  else {
+    console.error(`Invalid --port value: ${args.port}`);
+    process.exit(1);
+  }
 }
 if (typeof args.remote === "string") cliOverrides.remote = args.remote;
 if (typeof args.branch === "string") cliOverrides.mainBranch = args.branch;
@@ -86,7 +88,10 @@ if (typeof args.prefix === "string") cliOverrides.branchPrefix = args.prefix;
 if (typeof args.interval === "string") {
   const n = parseInt(args.interval, 10);
   if (Number.isFinite(n) && n > 0) cliOverrides.pollIntervalSeconds = n;
-  else { console.error(`Invalid --interval value: ${args.interval}`); process.exit(1); }
+  else {
+    console.error(`Invalid --interval value: ${args.interval}`);
+    process.exit(1);
+  }
 }
 if (typeof args["state-dir"] === "string") cliOverrides.stateDir = resolve(args["state-dir"]);
 if (args["delete-after-merge"]) cliOverrides.deleteAfterMerge = true;
@@ -126,9 +131,7 @@ mkdirSync(config.stateDir, { recursive: true });
 
 const lock = new FileLock(config.stateDir);
 if (!lock.acquire()) {
-  console.error(
-    `[${ts()}] Another serial-pusher instance is already running. Exiting.`,
-  );
+  console.error(`[${ts()}] Another serial-pusher instance is already running. Exiting.`);
   process.exit(1);
 }
 console.log(`[${ts()}] Lock acquired`);
@@ -174,9 +177,7 @@ async function tick(): Promise<void> {
       const jobId = db.enqueue(config.remote, branch, sha);
       if (jobId !== null) {
         enqueued++;
-        console.log(
-          `[${ts()}] Enqueued: ${branch} (sha: ${sha.slice(0, 8)}) -> job #${jobId}`,
-        );
+        console.log(`[${ts()}] Enqueued: ${branch} (sha: ${sha.slice(0, 8)}) -> job #${jobId}`);
         db.updateSeen(config.remote, branch, sha);
       } else {
         // UNIQUE constraint hit — job already existed for this sha.
@@ -201,15 +202,11 @@ async function tick(): Promise<void> {
 
     let job = db.claimNext();
     while (job) {
-      console.log(
-        `[${ts()}] Processing job #${job.id}: ${job.branch} (attempt ${job.attempts})`,
-      );
+      console.log(`[${ts()}] Processing job #${job.id}: ${job.branch} (attempt ${job.attempts})`);
 
       const result = await runner.processJob(job, db);
 
-      console.log(
-        `[${ts()}] Job #${job.id} result: ${result.status} — ${result.message}`,
-      );
+      console.log(`[${ts()}] Job #${job.id} result: ${result.status} — ${result.message}`);
 
       // Claim next immediately (still serial — one at a time)
       job = db.claimNext();
@@ -244,12 +241,8 @@ async function main(): Promise<void> {
     console.error(
       `[${ts()}] ERROR: Repository at ${config.repoPath} has uncommitted or untracked changes.`,
     );
-    console.error(
-      `[${ts()}] The serial-pusher requires a dedicated clean clone. Exiting.`,
-    );
-    console.error(
-      `[${ts()}] WARNING: Do not run this daemon in a developer working copy.`,
-    );
+    console.error(`[${ts()}] The serial-pusher requires a dedicated clean clone. Exiting.`);
+    console.error(`[${ts()}] WARNING: Do not run this daemon in a developer working copy.`);
     shutdown();
     process.exit(1);
   }

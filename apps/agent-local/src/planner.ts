@@ -124,12 +124,15 @@ export class RemotePlanner implements PlannerModel {
   private apiKey: string | null;
   private model: string;
 
-  constructor(opts: {
-    endpoint?: string;
-    apiKey?: string;
-    model?: string;
-  } = {}) {
-    this.endpoint = opts.endpoint ?? process.env.PLANNER_ENDPOINT ?? "http://localhost:11434/api/chat";
+  constructor(
+    opts: {
+      endpoint?: string;
+      apiKey?: string;
+      model?: string;
+    } = {},
+  ) {
+    this.endpoint =
+      opts.endpoint ?? process.env.PLANNER_ENDPOINT ?? "http://localhost:11434/api/chat";
     this.apiKey = opts.apiKey ?? process.env.PLANNER_API_KEY ?? null;
     this.model = opts.model ?? process.env.PLANNER_MODEL ?? "llama3";
   }
