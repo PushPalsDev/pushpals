@@ -2,7 +2,7 @@
 
 **Multi-agent coding orchestration with observability and security in mind.**
 
-Push Pals is a self-hostable “coding team” that lives alongside your repo. You talk to it from any device (including your phone), and it coordinates multiple code-capable agents on a remote server to plan, implement, test, and propose changes—without silently doing risky operations.
+Push Pals™ is a self-hostable “coding team” that lives alongside your repo. You talk to it from any device (including your phone), and it coordinates multiple code-capable agents on a remote server to plan, implement, test, and propose changes—without silently doing risky operations.
 
 Instead of one monolithic agent doing everything, Push Pals acts like a tiny engineering org:
 
@@ -187,13 +187,13 @@ We've introduced a **shared, versioned protocol** to enable robust client-server
 
 ### Components
 
-| Component | Location | Role |
-|-----------|----------|------|
-| **Protocol** | `packages/protocol` | Shared types, schemas, validators |
-| **Server** | `apps/server` | Event hub, session state, job queue (SQLite), auth |
-| **Agent-local** | `apps/agent-local` | Tool execution, planning, approval gating |
-| **Worker** | `apps/worker` | Background heavy tasks (tests, lint) |
-| **Client** | `apps/client` | Expo React Native + web UI |
+| Component       | Location            | Role                                               |
+| --------------- | ------------------- | -------------------------------------------------- |
+| **Protocol**    | `packages/protocol` | Shared types, schemas, validators                  |
+| **Server**      | `apps/server`       | Event hub, session state, job queue (SQLite), auth |
+| **Agent-local** | `apps/agent-local`  | Tool execution, planning, approval gating          |
+| **Worker**      | `apps/worker`       | Background heavy tasks (tests, lint)               |
+| **Client**      | `apps/client`       | Expo React Native + web UI                         |
 
 ### Key Features
 
@@ -222,19 +222,7 @@ cd packages/protocol && bun run build && cd ../..
 # Set auth token (used by server, agent-local, worker)
 export PUSHPALS_AUTH_TOKEN=my-secret-token
 
-# Terminal 1: Run server
-bun run server
-
-# Terminal 2: Run agent-local daemon (connects to server, runs tools)
-bun run agent-local
-
-# Terminal 3: Run worker (polls job queue for heavy tasks)
-bun run worker
-
-# Terminal 4: Run web client
-bun web
-
-# Or run everything at once:
+# Terminal 1: Run everything
 bun run dev:full
 ```
 
@@ -263,16 +251,16 @@ PUSHPALS_AUTH_TOKEN=my-secret-token bun run scripts/smoke-test.ts
 
 ### Event Types
 
-| Category | Types |
-|----------|-------|
-| **Chat** | `assistant_message`, `log`, `error`, `done` |
-| **Repo** | `scan_result`, `suggestions`, `diff_ready`, `committed` |
-| **Approvals** | `approval_required`, `approved`, `denied` |
-| **Agent** | `agent_status` |
-| **Tasks** | `task_created`, `task_started`, `task_progress`, `task_completed`, `task_failed` |
-| **Tools** | `tool_call`, `tool_result` |
-| **Delegation** | `delegate_request`, `delegate_response` |
-| **Jobs** | `job_enqueued`, `job_claimed`, `job_completed`, `job_failed` |
+| Category       | Types                                                                            |
+| -------------- | -------------------------------------------------------------------------------- |
+| **Chat**       | `assistant_message`, `log`, `error`, `done`                                      |
+| **Repo**       | `scan_result`, `suggestions`, `diff_ready`, `committed`                          |
+| **Approvals**  | `approval_required`, `approved`, `denied`                                        |
+| **Agent**      | `agent_status`                                                                   |
+| **Tasks**      | `task_created`, `task_started`, `task_progress`, `task_completed`, `task_failed` |
+| **Tools**      | `tool_call`, `tool_result`                                                       |
+| **Delegation** | `delegate_request`, `delegate_response`                                          |
+| **Jobs**       | `job_enqueued`, `job_claimed`, `job_completed`, `job_failed`                     |
 
 ### Protocol Documentation
 
@@ -280,3 +268,9 @@ PUSHPALS_AUTH_TOKEN=my-secret-token bun run scripts/smoke-test.ts
 - [Server README](apps/server/README.md) - Event bus & endpoints
 - [Client README](apps/client/README.md) - API & transport selection
 - [A2A Scaffolding](packages/protocol/src/a2a/README.md) - Future integration notes
+
+## Trademark and Licensing
+
+**Push Pals™** and the Push Pals logo are trademarks of the project authors.
+
+While the source code of this project is licensed under the **MIT License**, the "Push Pals" name and branding are not included in that license. If you fork this project or use the code in your own product, please use a distinct name to avoid user confusion.

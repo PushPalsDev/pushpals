@@ -14,8 +14,9 @@ export function createRequestHandler() {
   return Bun.serve({
     port: 3001,
     hostname: "0.0.0.0",
+    idleTimeout: 180, // 3 minutes — SSE/WS connections are long-lived
 
-    async fetch(req: Request): Promise<Response> {
+    async fetch(req: Request, server): Promise<Response> {
       const url = new URL(req.url);
       const pathname = url.pathname;
       const method = req.method;
@@ -40,7 +41,13 @@ export function createRequestHandler() {
         });
       }
 
-      console.log(`[${method}] ${pathname}`);
+      // Noisy poll endpoints — only log at debug level
+      const isNoisyPoll = pathname === "/jobs/claim";
+      if (isNoisyPoll) {
+        if (process.env.DEBUG) console.log(`[${method}] ${pathname}`);
+      } else {
+        console.log(`[${method}] ${pathname}`);
+      }
 
       // ── Auth helper ──────────────────────────────────────────────────────
       const requireAuth = (): Response | null => {
@@ -135,8 +142,7 @@ export function createRequestHandler() {
       if (wsMatch && method === "GET") {
         const sessionId = wsMatch[1];
 
-        // @ts-ignore - Bun.upgrade is available at runtime
-        const success = Bun.upgrade(req, {
+        const success = server.upgrade(req, {
           data: { sessionId },
         });
 

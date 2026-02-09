@@ -26,40 +26,55 @@ function selectTransport(transport: TransportType): "sse" | "ws" {
  * Subscribe to session events over SSE
  */
 function subscribeSSE(baseUrl: string, sessionId: string, onEvent: EventCallback): () => void {
-  const eventSource = new EventSource(`${baseUrl}/sessions/${sessionId}/events`);
+  let disposed = false;
+  let es: EventSource | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  eventSource.addEventListener("message", (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      const validation = validateEventEnvelope(data);
+  function connect() {
+    if (disposed) return;
+    es = new EventSource(`${baseUrl}/sessions/${sessionId}/events`);
 
-      if (!validation.ok) {
+    es.addEventListener("message", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const validation = validateEventEnvelope(data);
+
+        if (!validation.ok) {
+          onEvent({
+            type: "_error",
+            message: `[Protocol error] ${validation.errors?.join("; ")}`,
+          });
+          return;
+        }
+
+        onEvent(data);
+      } catch (err) {
         onEvent({
           type: "_error",
-          message: `[Protocol error] ${validation.errors?.join("; ")}`,
+          message: `[Parse error] Failed to parse event: ${String(err)}`,
         });
-        return;
       }
+    });
 
-      onEvent(data);
-    } catch (err) {
+    es.onerror = () => {
       onEvent({
         type: "_error",
-        message: `[Parse error] Failed to parse event: ${String(err)}`,
+        message: "[SSE] Connection lost, reconnecting…",
       });
-    }
-  });
+      es?.close();
+      es = null;
+      if (!disposed) {
+        reconnectTimer = setTimeout(connect, 3000);
+      }
+    };
+  }
 
-  eventSource.onerror = () => {
-    onEvent({
-      type: "_error",
-      message: "[SSE error] Connection lost",
-    });
-    eventSource.close();
-  };
+  connect();
 
   return () => {
-    eventSource.close();
+    disposed = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    es?.close();
   };
 }
 
@@ -71,50 +86,65 @@ function subscribeWebSocket(
   sessionId: string,
   onEvent: EventCallback,
 ): () => void {
-  const protocol = baseUrl.startsWith("https") ? "wss" : "ws";
-  const host = baseUrl.replace(/^https?:\/\//, "");
-  const wsUrl = `${protocol}://${host}/sessions/${sessionId}/ws`;
+  let disposed = false;
+  let ws: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const ws = new WebSocket(wsUrl);
+  function connect() {
+    if (disposed) return;
+    const protocol = baseUrl.startsWith("https") ? "wss" : "ws";
+    const host = baseUrl.replace(/^https?:\/\//, "");
+    const wsUrl = `${protocol}://${host}/sessions/${sessionId}/ws`;
 
-  ws.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      const validation = validateEventEnvelope(data);
+    ws = new WebSocket(wsUrl);
 
-      if (!validation.ok) {
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const validation = validateEventEnvelope(data);
+
+        if (!validation.ok) {
+          onEvent({
+            type: "_error",
+            message: `[Protocol error] ${validation.errors?.join("; ")}`,
+          });
+          return;
+        }
+
+        onEvent(data);
+      } catch (err) {
         onEvent({
           type: "_error",
-          message: `[Protocol error] ${validation.errors?.join("; ")}`,
+          message: `[Parse error] Failed to parse event: ${String(err)}`,
         });
-        return;
       }
+    };
 
-      onEvent(data);
-    } catch (err) {
+    ws.onerror = () => {
       onEvent({
         type: "_error",
-        message: `[Parse error] Failed to parse event: ${String(err)}`,
+        message: "[WebSocket] Connection error",
       });
-    }
-  };
+    };
 
-  ws.onerror = () => {
-    onEvent({
-      type: "_error",
-      message: "[WebSocket error] Connection failed",
-    });
-  };
+    ws.onclose = () => {
+      ws = null;
+      if (!disposed) {
+        onEvent({
+          type: "_error",
+          message: "[WebSocket] Connection lost, reconnecting…",
+        });
+        reconnectTimer = setTimeout(connect, 3000);
+      }
+    };
+  }
 
-  ws.onclose = () => {
-    onEvent({
-      type: "_error",
-      message: "[WebSocket] Connection closed",
-    });
-  };
+  connect();
 
   return () => {
-    if (ws.readyState === WebSocket.OPEN) {
+    disposed = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (ws && ws.readyState === WebSocket.OPEN) {
       ws.close();
     }
   };

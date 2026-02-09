@@ -24,8 +24,8 @@
     "agent-local": "bun run protocol:build && bun run agent-local:only",
     "worker": "bun run protocol:build && bun run worker:only",
     "serial-pusher": "bun run protocol:build && bun run serial-pusher:only",
-    "dev": "bun run protocol:build && bun --parallel server:only client:only",
-    "dev:full": "bun run protocol:build && bun --parallel server:only agent-local:only worker:only serial-pusher:only client:only",
+    "dev": "bun run protocol:build && concurrently -n server,client -c blue,green \"bun run server:only\" \"bun run client:only\"",
+    "dev:full": "bun run protocol:build && concurrently -n server,agent,worker,pusher,client -c blue,magenta,yellow,cyan,green \"bun run server:only\" \"bun run agent-local:only\" \"bun run worker:only\" \"bun run serial-pusher:only\" \"bun run client:only\"",
     "lint": "bun --cwd apps/client lint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -33,6 +33,7 @@
     "smoke": "bun run scripts/smoke-test.ts"
   },
   "devDependencies": {
+    "concurrently": "^9.2.1",
     "prettier": "^3.8.1"
   }
 }

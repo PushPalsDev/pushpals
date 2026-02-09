@@ -409,6 +409,31 @@ class LocalAgent {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+async function connectWithRetry(
+  server: string,
+  maxRetries = Infinity,
+  baseDelay = 2000,
+  maxDelay = 30000,
+): Promise<string> {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    try {
+      const res = await fetch(`${server}/sessions`, { method: "POST" });
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const data = (await res.json()) as { sessionId: string };
+      return data.sessionId;
+    } catch (err: any) {
+      if (attempt >= maxRetries) throw err;
+      const delay = Math.min(baseDelay * 2 ** (attempt - 1), maxDelay);
+      console.log(
+        `[Agent] Server unavailable (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
+      );
+      await Bun.sleep(delay);
+    }
+  }
+}
+
 async function main() {
   const opts = parseArgs();
 
@@ -417,14 +442,12 @@ async function main() {
   console.log(`[Agent] Repo: ${opts.repo}`);
   console.log(`[Agent] Planner: ${opts.planner}`);
 
-  // Create or join a session
+  // Create or join a session (with retry — server may not be up yet)
   let sessionId = opts.sessionId;
 
   if (!sessionId) {
     console.log(`[Agent] No sessionId provided, creating new session…`);
-    const res = await fetch(`${opts.server}/sessions`, { method: "POST" });
-    const data = (await res.json()) as { sessionId: string };
-    sessionId = data.sessionId;
+    sessionId = await connectWithRetry(opts.server);
     console.log(`[Agent] Created session: ${sessionId}`);
   }
 

@@ -223,7 +223,23 @@ async function main(): Promise<void> {
   // ── Startup safety check ──────────────────────────────────────────────
   // Ensure the repo is clean before we start. We don't run git clean -fd
   // during normal operation, so a dirty repo is a sign of misconfiguration.
-  const clean = await gitOps.isRepoClean();
+  // Retry if `git status` itself fails (e.g. transient I/O error), but
+  // always crash if the repo is genuinely dirty.
+  let clean: boolean | undefined;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      clean = await gitOps.isRepoClean();
+      break;
+    } catch (err: any) {
+      if (attempt >= 10) throw err; // give up after 10 tries
+      const delay = Math.min(2000 * 2 ** (attempt - 1), 30_000);
+      console.error(
+        `[${ts()}] git status failed (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
+      );
+      await Bun.sleep(delay);
+    }
+  }
+
   if (!clean) {
     console.error(
       `[${ts()}] ERROR: Repository at ${config.repoPath} has uncommitted or untracked changes.`,
@@ -239,8 +255,20 @@ async function main(): Promise<void> {
   }
   console.log(`[${ts()}] Repo is clean`);
 
-  // Initial tick
-  await tick();
+  // Initial tick — retry on transient errors (e.g. remote unreachable)
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await tick();
+      break;
+    } catch (err: any) {
+      if (attempt >= 10) throw err;
+      const delay = Math.min(2000 * 2 ** (attempt - 1), 30_000);
+      console.error(
+        `[${ts()}] Initial tick failed (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
+      );
+      await Bun.sleep(delay);
+    }
+  }
 
   // Polling loop
   while (running) {
