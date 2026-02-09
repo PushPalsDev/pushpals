@@ -158,6 +158,19 @@ test("Event type 'done' validates", () => {
   return validateEventEnvelope(event).ok === true;
 });
 
+// Test 11: assistant_message validates
+test("Event type 'assistant_message' validates", () => {
+  const event: EventEnvelope = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "assistant_message",
+    payload: { text: "Got it — I'm going to plan tasks..." } as any,
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
 // Test 11: Protocol version constant is correct
 test("Protocol version is 0.1.0", () => {
   return PROTOCOL_VERSION === "0.1.0";

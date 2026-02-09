@@ -30,29 +30,12 @@ addFormats(ajv);
 function loadSchema(filename: string): Record<string, unknown> {
   const distSchemasPath = join(__dirname, "schemas", filename); // dist/schemas when compiled
   const srcSchemasPath = join(__dirname, "..", "src", "schemas", filename); // src/schemas during development
-
   try {
     return JSON.parse(readFileSync(distSchemasPath, "utf-8"));
   } catch (_e1) {
     try {
       return JSON.parse(readFileSync(srcSchemasPath, "utf-8"));
     } catch (_e2) {
-      // Bundler-friendly fallback: some bundlers (Metro/webpack) will
-      // resolve JSON files via `require` during module analysis. Try a
-      // synchronous `require` fallback — use `eval("require")` so the
-      // symbol isn't statically analyzed by bundlers that run in ESM mode.
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-implied-eval
-        const req: any = eval("require");
-        if (typeof req === "function") {
-          // require the JSON from source path so bundlers include it.
-          const mod = req(join(__dirname, "..", "src", "schemas", filename));
-          return mod && mod.default ? mod.default : mod;
-        }
-      } catch (_e3) {
-        // fall through to throw below
-      }
-
       throw new Error(
         `Failed to load schema ${filename}. Expected at dist/schemas (build) or src/schemas (dev).`,
       );
@@ -81,6 +64,7 @@ const validateMessageRequestSchema = ajv.compile({
   required: ["text"],
   properties: {
     text: { type: "string" },
+    intent: { type: "object", additionalProperties: true },
   },
   additionalProperties: false,
 });
@@ -129,7 +113,13 @@ export function validateEventEnvelope(data: unknown): ValidationResult {
     return { ok: false, errors };
   }
 
-  const payloadValid = validateEventPayload(data);
+  // Validate only the `{ type, payload }` pairing against the events schema.
+  // This ensures branch validation focuses on the event discriminant and
+  // its payload shape, while envelope-level fields are handled above.
+  const maybe = data as any;
+  const pair = { type: maybe?.type, payload: maybe?.payload };
+
+  const payloadValid = validateEventPayload(pair);
   if (!payloadValid) {
     const errors = (validateEventPayload.errors ?? []).map((e) =>
       `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),

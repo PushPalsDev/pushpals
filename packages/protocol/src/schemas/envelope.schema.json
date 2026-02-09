@@ -33,6 +33,7 @@
         "approved",
         "denied",
         "committed",
+        "assistant_message",
         "error",
         "done"
       ],

@@ -24,6 +24,7 @@ export interface EventTypePayloadMap {
   approved: { approvalId: string };
   denied: { approvalId: string };
   committed: { branch: string; commitHash: string; message: string };
+  assistant_message: { text: string };
   error: { message: string; detail?: string };
   done: { ok: boolean };
 }
@@ -63,6 +64,7 @@ export interface CreateSessionResponse {
 
 export interface MessageRequest {
   text: string;
+  intent?: Record<string, unknown>;
 }
 
 export interface MessageResponse {

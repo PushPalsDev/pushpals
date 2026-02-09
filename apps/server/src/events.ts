@@ -80,11 +80,11 @@ export class SessionManager {
     return this.sessions.get(sessionId) || null;
   }
 
-  handleMessage(sessionId: string, text: string): void {
+  handleMessage(sessionId: string, body: unknown): void {
     const session = this.getSession(sessionId);
     if (!session) return;
 
-    const validation = validateMessageRequest({ text });
+    const validation = validateMessageRequest(body);
     if (!validation.ok) {
       session.emit({
         protocolVersion: PROTOCOL_VERSION,
@@ -96,9 +96,11 @@ export class SessionManager {
           message: "Invalid message request",
           detail: validation.errors?.join("; "),
         },
-      });
+      } as unknown as EventEnvelope);
       return;
     }
+
+    const text = (body as Record<string, unknown>).text as string;
 
     // Emit a log event
     session.emit({
@@ -112,6 +114,39 @@ export class SessionManager {
         message: `Received message: ${text}`,
       },
     });
+
+    // Emit an assistant_message to acknowledge receipt and indicate planning
+    const assistantEnv: EventEnvelope<"assistant_message"> = {
+      protocolVersion: PROTOCOL_VERSION,
+      id: randomUUID(),
+      ts: new Date().toISOString(),
+      sessionId,
+      type: "assistant_message",
+      payload: {
+        text: "Got it — I'm going to plan tasks...",
+      },
+    };
+    session.emit(assistantEnv);
+
+    // Emit a suggestions event stub (simple single suggestion) to simulate planning
+    const suggestionsEnv: EventEnvelope<"suggestions"> = {
+      protocolVersion: PROTOCOL_VERSION,
+      id: randomUUID(),
+      ts: new Date().toISOString(),
+      sessionId,
+      type: "suggestions",
+      payload: {
+        items: [
+          {
+            id: randomUUID(),
+            title: "Create unit tests",
+            detail: "Add unit tests for the new companion flow",
+            effort: "M",
+          },
+        ],
+      },
+    };
+    session.emit(suggestionsEnv);
   }
 
   createApproval(

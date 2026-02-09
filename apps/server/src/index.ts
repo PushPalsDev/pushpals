@@ -137,7 +137,7 @@ export function createRequestHandler() {
       if (msgMatch && method === "POST") {
         const sessionId = msgMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        sessionManager.handleMessage(sessionId, (body.text as string) || "");
+        sessionManager.handleMessage(sessionId, body);
         return makeJson({ ok: true });
       }
 
@@ -172,14 +172,14 @@ export function createRequestHandler() {
         const session = sessionManager.getSession(sessionId);
         if (!session) {
           try {
-            const envelope: EventEnvelope = {
+            const envelope: EventEnvelope<"error"> = {
               protocolVersion: PROTOCOL_VERSION,
               id: randomUUID(),
               ts: new Date().toISOString(),
               sessionId: sessionId,
               type: "error",
               payload: { message: "Session not found" },
-            } as unknown as EventEnvelope;
+            };
             ws.send(JSON.stringify(envelope));
           } catch (_e) {}
           try {

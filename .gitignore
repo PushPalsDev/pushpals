@@ -137,3 +137,10 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Ignore local patches and debug scripts
+*.patch
+tmp_*.mjs
+
+# Ignore compiled protocol runtime artifacts
+packages/protocol/dist/

@@ -20,7 +20,7 @@ const validateEventPayload = ajv.compile(eventsSchema as unknown as object);
 const validateMessageRequestSchema = ajv.compile({
   type: "object",
   required: ["text"],
-  properties: { text: { type: "string" } },
+  properties: { text: { type: "string" }, intent: { type: "object", additionalProperties: true } },
   additionalProperties: false,
 });
 
@@ -59,7 +59,11 @@ export function validateEventEnvelope(data: unknown): ValidationResult {
     return { ok: false, errors };
   }
 
-  const payloadValid = validateEventPayload(data);
+  // Validate only the `{ type, payload }` pairing against the events schema.
+  const maybe = data as any;
+  const pair = { type: maybe?.type, payload: maybe?.payload };
+
+  const payloadValid = validateEventPayload(pair);
   if (!payloadValid) {
     const errors = (validateEventPayload.errors ?? []).map((e) =>
       `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),

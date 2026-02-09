@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import type { EventEnvelope } from "protocol/browser";
+import { CompanionModel, RemoteCompanionModel } from "./companion";
 import { subscribeEvents, createSession, sendMessage } from "./pushpalsApi";
 
 export interface PushPalsSession {
@@ -70,9 +71,18 @@ export function usePushPalsSession(baseUrl: string = "http://localhost:3001") {
   const send = useCallback(
     async (text: string) => {
       if (!session.sessionId) return false;
-      return sendMessage(baseUrl, session.sessionId, text);
+
+      // Use companion to generate intent before sending
+      const companion: CompanionModel = new RemoteCompanionModel();
+      try {
+        const intent = await companion.summarizeAndPlan({ userText: text, history: session.events });
+        return sendMessage(baseUrl, session.sessionId, text, intent as any);
+      } catch (_err) {
+        // Fallback: send without intent
+        return sendMessage(baseUrl, session.sessionId, text);
+      }
     },
-    [session.sessionId, baseUrl],
+    [session.sessionId, baseUrl]
   );
 
   return { ...session, send };

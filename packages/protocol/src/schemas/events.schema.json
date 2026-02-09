@@ -11,15 +11,13 @@
           "type": "object",
           "required": ["level", "message"],
           "properties": {
-            "level": {
-              "type": "string",
-              "enum": ["debug", "info", "warn", "error"]
-            },
+            "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
             "message": { "type": "string" }
           },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -31,16 +29,14 @@
           "required": ["summary", "filesRead", "gitStatusPorcelain", "gitDiff"],
           "properties": {
             "summary": { "type": "string" },
-            "filesRead": {
-              "type": "array",
-              "items": { "type": "string" }
-            },
+            "filesRead": { "type": "array", "items": { "type": "string" } },
             "gitStatusPorcelain": { "type": "string" },
             "gitDiff": { "type": "string" }
           },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -60,10 +56,7 @@
                   "id": { "type": "string" },
                   "title": { "type": "string" },
                   "detail": { "type": "string" },
-                  "effort": {
-                    "type": "string",
-                    "enum": ["S", "M", "L"]
-                  }
+                  "effort": { "type": "string", "enum": ["S", "M", "L"] }
                 },
                 "additionalProperties": false
               }
@@ -71,7 +64,22 @@
           },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "assistant_message" },
+        "payload": {
+          "type": "object",
+          "required": ["text"],
+          "properties": { "text": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -88,7 +96,8 @@
           },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -100,19 +109,14 @@
           "required": ["approvalId", "action", "summary", "details"],
           "properties": {
             "approvalId": { "type": "string" },
-            "action": {
-              "type": "string",
-              "enum": ["git.commit", "git.push", "other"]
-            },
+            "action": { "type": "string", "enum": ["git.commit", "git.push", "other"] },
             "summary": { "type": "string" },
-            "details": {
-              "type": "object",
-              "additionalProperties": true
-            }
+            "details": { "type": "object", "additionalProperties": true }
           },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -122,12 +126,11 @@
         "payload": {
           "type": "object",
           "required": ["approvalId"],
-          "properties": {
-            "approvalId": { "type": "string" }
-          },
+          "properties": { "approvalId": { "type": "string" } },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -137,12 +140,11 @@
         "payload": {
           "type": "object",
           "required": ["approvalId"],
-          "properties": {
-            "approvalId": { "type": "string" }
-          },
+          "properties": { "approvalId": { "type": "string" } },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -159,7 +161,8 @@
           },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -169,13 +172,11 @@
         "payload": {
           "type": "object",
           "required": ["message"],
-          "properties": {
-            "message": { "type": "string" },
-            "detail": { "type": "string" }
-          },
+          "properties": { "message": { "type": "string" }, "detail": { "type": "string" } },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
       "type": "object",
@@ -185,12 +186,11 @@
         "payload": {
           "type": "object",
           "required": ["ok"],
-          "properties": {
-            "ok": { "type": "boolean" }
-          },
+          "properties": { "ok": { "type": "boolean" } },
           "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
     }
   ]
 }

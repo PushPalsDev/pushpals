@@ -177,12 +177,16 @@ export async function sendMessage(
   baseUrl: string,
   sessionId: string,
   text: string,
+  intent?: Record<string, unknown>
 ): Promise<boolean> {
   try {
+    const body: Record<string, unknown> = { text };
+    if (intent) body.intent = intent;
+
     const response = await fetch(`${baseUrl}/sessions/${sessionId}/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(body),
     });
 
     return response.ok;
