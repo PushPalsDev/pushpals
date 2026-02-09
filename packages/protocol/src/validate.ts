@@ -193,6 +193,9 @@ const allEventTypes = [
   "job_claimed",
   "job_completed",
   "job_failed",
+  "message",
+  "job_log",
+  "status",
 ];
 
 const validateCommandRequestSchema = ajv.compile({

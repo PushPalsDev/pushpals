@@ -470,6 +470,60 @@
         }
       },
       "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "message" },
+        "payload": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": { "type": "string" },
+            "intent": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_log" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId", "stream", "line"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "stream": { "type": "string", "enum": ["stdout", "stderr"] },
+            "line": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "status" },
+        "payload": {
+          "type": "object",
+          "required": ["agentId", "state"],
+          "properties": {
+            "agentId": { "type": "string" },
+            "state": { "type": "string", "enum": ["idle", "busy", "error", "shutting_down"] },
+            "uptimeMs": { "type": "number" },
+            "detail": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   ]
 }

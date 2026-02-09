@@ -3,7 +3,7 @@ import { SessionManager } from "./events.js";
 import { JobQueue } from "./jobs.js";
 import { randomUUID } from "crypto";
 
-const sessionManager = new SessionManager();
+const sessionManager = new SessionManager(process.env.PUSHPALS_DB_PATH ?? "pushpals.db");
 const jobQueue = new JobQueue();
 
 /**
@@ -69,7 +69,7 @@ export function createRequestHandler() {
         return makeJson({ sessionId, protocolVersion: PROTOCOL_VERSION }, 201);
       }
 
-      // GET /sessions/:id/events - SSE endpoint
+      // GET /sessions/:id/events - SSE endpoint (supports ?after=<cursor> for replay)
       const sseMatch = pathname.match(/^\/sessions\/([^/]+)\/events$/);
       if (sseMatch && method === "GET") {
         const sessionId = sseMatch[1];
@@ -77,6 +77,10 @@ export function createRequestHandler() {
         if (!session) {
           return makeJson({ ok: false, message: "Session not found" }, 404);
         }
+
+        // Parse cursor from query string
+        const afterParam = url.searchParams.get("after");
+        const afterEventId = afterParam ? parseInt(afterParam, 10) || 0 : 0;
 
         const encoder = new TextEncoder();
         let unsubscribe: (() => void) | null = null;
@@ -87,17 +91,17 @@ export function createRequestHandler() {
             // Send initial keepalive
             controller.enqueue(encoder.encode(": keepalive\n\n"));
 
-            // Replay history to the new subscriber
-            session.replayHistory((envelope: EventEnvelope) => {
-              const eventData = `event: message\ndata: ${JSON.stringify(envelope)}\n\n`;
+            // Replay history from SQLite (cursor-based)
+            session.replayHistory((envelope: EventEnvelope, eventId: number) => {
+              const eventData = `id: ${eventId}\nevent: ${envelope.type}\ndata: ${JSON.stringify(envelope)}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
               } catch (_e) {}
-            });
+            }, afterEventId);
 
             // Subscribe to live events
-            unsubscribe = session.subscribe((envelope: EventEnvelope) => {
-              const eventData = `event: message\ndata: ${JSON.stringify(envelope)}\n\n`;
+            unsubscribe = session.subscribe((envelope: EventEnvelope, eventId: number) => {
+              const eventData = `id: ${eventId}\nevent: ${envelope.type}\ndata: ${JSON.stringify(envelope)}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
               } catch (err) {
@@ -137,13 +141,17 @@ export function createRequestHandler() {
         });
       }
 
-      // GET /sessions/:id/ws - WebSocket endpoint
+      // GET /sessions/:id/ws - WebSocket endpoint (supports ?after=<cursor>)
       const wsMatch = pathname.match(/^\/sessions\/([^/]+)\/ws$/);
       if (wsMatch && method === "GET") {
         const sessionId = wsMatch[1];
 
+        // Parse cursor from query string
+        const afterParam = url.searchParams.get("after");
+        const afterEventId = afterParam ? parseInt(afterParam, 10) || 0 : 0;
+
         const success = server.upgrade(req, {
-          data: { sessionId },
+          data: { sessionId, afterEventId } as any,
         });
 
         if (success) {
@@ -248,8 +256,8 @@ export function createRequestHandler() {
 
     websocket: {
       open(ws: any) {
-        const { sessionId } = ws.data || {};
-        console.log(`[WS] Session ${sessionId} connected`);
+        const { sessionId, afterEventId = 0 } = ws.data || {};
+        console.log(`[WS] Session ${sessionId} connected (after=${afterEventId})`);
 
         const session = sessionManager.getSession(sessionId);
         if (!session) {
@@ -270,17 +278,17 @@ export function createRequestHandler() {
           return;
         }
 
-        // Replay history to the new WebSocket subscriber
-        session.replayHistory((envelope: EventEnvelope) => {
+        // Replay history from SQLite (cursor-based)
+        session.replayHistory((envelope: EventEnvelope, eventId: number) => {
           try {
-            ws.send(JSON.stringify(envelope));
+            ws.send(JSON.stringify({ envelope, cursor: eventId }));
           } catch (_e) {}
-        });
+        }, afterEventId);
 
         // Subscribe to live events and send to this WebSocket
-        const unsubscribe = session.subscribe((envelope: EventEnvelope) => {
+        const unsubscribe = session.subscribe((envelope: EventEnvelope, eventId: number) => {
           try {
-            ws.send(JSON.stringify(envelope));
+            ws.send(JSON.stringify({ envelope, cursor: eventId }));
           } catch (_err) {
             try {
               unsubscribe();

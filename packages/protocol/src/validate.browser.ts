@@ -121,6 +121,9 @@ export function validateCommandRequest(data: unknown): ValidationResult {
     "job_claimed",
     "job_completed",
     "job_failed",
+    "message",
+    "job_log",
+    "status",
   ];
   const d = data as any;
   if (!d || typeof d !== "object") return { ok: false, errors: ["Expected object"] };

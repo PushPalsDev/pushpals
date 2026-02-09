@@ -106,6 +106,24 @@ export interface EventTypePayloadMap {
     artifacts?: Artifact[];
   };
   job_failed: { jobId: string; message: string; detail?: string };
+  // ── Streaming / lifecycle events ──────────────────────────────────────
+  /** User-facing chat message (from client to server) */
+  message: { text: string; intent?: Record<string, unknown> };
+
+  /** Streaming log line from a worker executing a job */
+  job_log: {
+    jobId: string;
+    stream: "stdout" | "stderr";
+    line: string;
+  };
+
+  /** System heartbeat / status beacon */
+  status: {
+    agentId: string;
+    state: "idle" | "busy" | "error" | "shutting_down";
+    uptimeMs?: number;
+    detail?: string;
+  };
 }
 
 /**

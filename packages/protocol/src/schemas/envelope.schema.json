@@ -49,7 +49,10 @@
         "job_enqueued",
         "job_claimed",
         "job_completed",
-        "job_failed"
+        "job_failed",
+        "message",
+        "job_log",
+        "status"
       ],
       "description": "Event type discriminator"
     },

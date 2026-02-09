@@ -9,30 +9,7 @@ import {
 } from "protocol";
 import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
-
-// ─── Ring buffer for bounded history ────────────────────────────────────────
-
-class RingBuffer<T> {
-  private buf: T[] = [];
-  private maxSize: number;
-
-  constructor(maxSize = 200) {
-    this.maxSize = maxSize;
-  }
-
-  push(item: T): void {
-    if (this.buf.length >= this.maxSize) this.buf.shift();
-    this.buf.push(item);
-  }
-
-  toArray(): T[] {
-    return [...this.buf];
-  }
-
-  get length(): number {
-    return this.buf.length;
-  }
-}
+import { EventStore } from "./db.js";
 
 // ─── Task record stored per session ─────────────────────────────────────────
 
@@ -62,35 +39,43 @@ export interface PendingApproval {
 /**
  * Internal event bus for a session.
  * Both SSE and WebSocket subscribers share the same stream.
- * Now also stores event history, tasks, and approvals.
+ *
+ * Persist-first architecture:
+ *   emit() → insertEvent (SQLite) → broadcast to subscribers
+ *
+ * Replay uses cursor-based queries instead of in-memory ring buffer.
  */
 export class SessionEventBus {
   sessionId: string;
-  private subscribers: Set<(envelope: EventEnvelope) => void> = new Set();
+  private subscribers: Set<(envelope: EventEnvelope, eventId: number) => void> = new Set();
 
-  /** Bounded event history (ring buffer, last N events) */
-  readonly history: RingBuffer<EventEnvelope>;
+  /** Shared event store (injected from SessionManager) */
+  private store: EventStore;
 
   /** Active tasks map: taskId → TaskRecord */
   readonly tasks: Map<string, TaskRecord> = new Map();
 
-  constructor(sessionId: string, historySize = 200) {
+  constructor(sessionId: string, store: EventStore) {
     this.sessionId = sessionId;
-    this.history = new RingBuffer<EventEnvelope>(historySize);
+    this.store = store;
   }
 
-  subscribe(callback: (envelope: EventEnvelope) => void): () => void {
+  subscribe(callback: (envelope: EventEnvelope, eventId: number) => void): () => void {
     this.subscribers.add(callback);
     return () => {
       this.subscribers.delete(callback);
     };
   }
 
-  emit(envelope: EventEnvelope): void {
-    // Validate before emitting
+  /**
+   * Persist THEN broadcast.
+   * Returns the cursor (event_id) of the persisted event.
+   */
+  emit(envelope: EventEnvelope): number {
+    // Validate before persisting
     const validation = validateEventEnvelope(envelope);
     if (!validation.ok) {
-      // Emit error event instead
+      // Persist + broadcast error event instead
       const errorEnvelope: EventEnvelope = {
         protocolVersion: PROTOCOL_VERSION,
         id: randomUUID(),
@@ -102,23 +87,50 @@ export class SessionEventBus {
           detail: validation.errors?.join("; "),
         },
       };
-      this.history.push(errorEnvelope);
-      this.subscribers.forEach((cb) => cb(errorEnvelope));
-      return;
+      const cursor = this.store.insertEvent(errorEnvelope);
+      this.subscribers.forEach((cb) => cb(errorEnvelope, cursor));
+      return cursor;
     }
 
     // Track task lifecycle in the tasks map
     this._trackTask(envelope);
 
-    this.history.push(envelope);
-    this.subscribers.forEach((cb) => cb(envelope));
+    // 1. Persist to SQLite (crash-safe)
+    const cursor = this.store.insertEvent(envelope);
+
+    // 2. Broadcast to live subscribers
+    this.subscribers.forEach((cb) => cb(envelope, cursor));
+
+    return cursor;
   }
 
-  /** Replay stored history to a subscriber */
-  replayHistory(callback: (envelope: EventEnvelope) => void): void {
-    for (const envelope of this.history.toArray()) {
-      callback(envelope);
+  /**
+   * Replay stored history to a subscriber.
+   * @param callback  receives each envelope + its cursor
+   * @param afterEventId  only replay events with event_id > afterEventId (0 = full replay)
+   */
+  replayHistory(
+    callback: (envelope: EventEnvelope, eventId: number) => void,
+    afterEventId: number = 0,
+  ): void {
+    const rows = this.store.getEventsAfter(this.sessionId, afterEventId);
+    for (const row of rows) {
+      try {
+        const envelope = JSON.parse(row.envelope) as EventEnvelope;
+        callback(envelope, row.eventId);
+      } catch (err) {
+        // Skip corrupted rows — log but don't break the entire replay
+        console.error(
+          `[replay] Failed to parse event ${row.eventId} in session ${this.sessionId}:`,
+          err,
+        );
+      }
     }
+  }
+
+  /** Get the latest cursor for this session */
+  getLatestCursor(): number {
+    return this.store.getLatestCursor(this.sessionId);
   }
 
   getSubscriberCount(): number {
@@ -170,7 +182,9 @@ export class SessionEventBus {
 }
 
 /**
- * Global session manager with full state management
+ * Global session manager with full state management.
+ *
+ * Owns a shared EventStore instance that all SessionEventBus instances write to.
  */
 export class SessionManager {
   private sessions: Map<string, SessionEventBus> = new Map();
@@ -181,9 +195,17 @@ export class SessionManager {
   /** Static auth token for agent endpoints (configurable) */
   authToken: string | null = process.env.PUSHPALS_AUTH_TOKEN ?? null;
 
+  /** Shared durable event store */
+  readonly store: EventStore;
+
+  constructor(dbPath?: string) {
+    this.store = new EventStore(dbPath);
+  }
+
   createSession(): string {
     const sessionId = randomUUID();
-    this.sessions.set(sessionId, new SessionEventBus(sessionId));
+    this.store.createSession(sessionId);
+    this.sessions.set(sessionId, new SessionEventBus(sessionId, this.store));
     return sessionId;
   }
 
