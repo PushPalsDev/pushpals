@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo, useReducer } from "react";
 import type { EventEnvelope, EventType } from "protocol/browser";
 import { CompanionModel, RemoteCompanionModel } from "./companion";
 import {
@@ -8,6 +8,15 @@ import {
   submitApprovalDecision,
   sendCommand,
 } from "./pushpalsApi";
+import {
+  eventReducer,
+  initialState,
+  type SessionState,
+  type Task,
+  type Job,
+  type LogLine,
+  type ChatMessage,
+} from "./eventReducer";
 
 // ─── Extended event type that may include local errors ──────────────────────
 export type SessionEvent = EventEnvelope | { type: "_error"; message: string };
@@ -16,7 +25,10 @@ export function isEnvelope(e: SessionEvent): e is EventEnvelope {
   return (e as any).id !== undefined;
 }
 
-// ─── Task grouping ──────────────────────────────────────────────────────────
+// ─── Re-export reducer types for consumers ──────────────────────────────────
+export type { Task, Job, LogLine, ChatMessage, SessionState };
+
+// ─── Task grouping (legacy compat, now derived from reducer) ────────────────
 export interface TaskGroup {
   taskId: string;
   title: string;
@@ -51,7 +63,7 @@ export interface PushPalsSessionActions {
   approve: (approvalId: string) => Promise<boolean>;
   deny: (approvalId: string) => Promise<boolean>;
 
-  // Computed
+  // Computed (legacy)
   tasks: TaskGroup[];
   agents: string[];
   turnIds: string[];
@@ -59,10 +71,43 @@ export interface PushPalsSessionActions {
   // Filter
   filters: EventFilters;
   setFilters: (f: EventFilters) => void;
+
+  // PR4: structured state from reducer
+  state: SessionState;
+}
+
+// ─── Cursor persistence helpers ─────────────────────────────────────────────
+function loadCursor(sessionId: string): number {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const raw = window.localStorage.getItem(`pushpals:cursor:${sessionId}`);
+      return raw ? Number(raw) || 0 : 0;
+    }
+  } catch (_) {
+    /* SSR or RN without localStorage – ignore */
+  }
+  return 0;
+}
+
+function saveCursor(sessionId: string, cursor: number): void {
+  if (cursor < 1) return; // never persist 0 or negative cursors (#1)
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const key = `pushpals:cursor:${sessionId}`;
+      const prev = Number(window.localStorage.getItem(key)) || 0;
+      if (cursor > prev) {
+        window.localStorage.setItem(key, String(cursor));
+      }
+    }
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 /**
- * Hook to manage a PushPals session with grouping, filtering, and approval actions
+ * Hook to manage a PushPals session with grouping, filtering, and approval actions.
+ * Uses an event reducer for structured state (tasks, jobs, logs) and persists the
+ * last cursor so reconnections replay only new events.
  */
 export function usePushPalsSession(
   baseUrl: string = "http://localhost:3001",
@@ -73,6 +118,8 @@ export function usePushPalsSession(
     isConnected: false,
     error: null,
   });
+
+  const [state, dispatch] = useReducer(eventReducer, initialState());
 
   const [filters, setFilters] = useState<EventFilters>({});
 
@@ -97,13 +144,29 @@ export function usePushPalsSession(
           isConnected: true,
         }));
 
-        // Subscribe to events
-        const unsubscribe = subscribeEvents(baseUrl, sessionId, (event) => {
-          setSession((s) => ({
-            ...s,
-            events: [...s.events, event],
-          }));
-        });
+        // Restore cursor for reconnect / replay
+        const afterCursor = loadCursor(sessionId);
+
+        // Subscribe to events with cursor-aware callback
+        const unsubscribe = subscribeEvents(
+          baseUrl,
+          sessionId,
+          (event, cursor) => {
+            // Feed legacy flat event list
+            setSession((s) => ({
+              ...s,
+              events: [...s.events, event],
+            }));
+
+            // Feed structured reducer (skip error sentinels)
+            if ("id" in event) {
+              dispatch({ type: "event", envelope: event as EventEnvelope, cursor });
+              saveCursor(sessionId, cursor);
+            }
+          },
+          undefined, // transport
+          afterCursor,
+        );
 
         unsubscribeRef.current = unsubscribe;
       } catch (err) {
@@ -234,5 +297,6 @@ export function usePushPalsSession(
     turnIds,
     filters,
     setFilters,
+    state,
   };
 }

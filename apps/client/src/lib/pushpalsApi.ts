@@ -4,6 +4,12 @@ import { validateEventEnvelope } from "protocol/browser";
 type TransportType = "auto" | "sse" | "ws";
 type EventCallback = (event: EventEnvelope | { type: "_error"; message: string }) => void;
 
+/** Extended callback that also receives the server cursor for each event */
+export type CursorEventCallback = (
+  event: EventEnvelope | { type: "_error"; message: string },
+  cursor: number,
+) => void;
+
 /**
  * Determine which transport to use based on platform
  */
@@ -25,14 +31,21 @@ function selectTransport(transport: TransportType): "sse" | "ws" {
 /**
  * Subscribe to session events over SSE
  */
-function subscribeSSE(baseUrl: string, sessionId: string, onEvent: EventCallback): () => void {
+function subscribeSSE(
+  baseUrl: string,
+  sessionId: string,
+  onEvent: CursorEventCallback,
+  afterCursor: number = 0,
+): () => void {
   let disposed = false;
   let es: EventSource | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let latestCursor = afterCursor;
 
   function connect() {
     if (disposed) return;
-    es = new EventSource(`${baseUrl}/sessions/${sessionId}/events`);
+    const afterParam = latestCursor > 0 ? `?after=${latestCursor}` : "";
+    es = new EventSource(`${baseUrl}/sessions/${sessionId}/events${afterParam}`);
 
     es.addEventListener("message", (event) => {
       try {
@@ -40,27 +53,27 @@ function subscribeSSE(baseUrl: string, sessionId: string, onEvent: EventCallback
         const validation = validateEventEnvelope(data);
 
         if (!validation.ok) {
-          onEvent({
-            type: "_error",
-            message: `[Protocol error] ${validation.errors?.join("; ")}`,
-          });
+          onEvent(
+            { type: "_error", message: `[Protocol error] ${validation.errors?.join("; ")}` },
+            0,
+          );
           return;
         }
 
-        onEvent(data);
+        // SSE sends `id: <cursor>` — available via event.lastEventId
+        const cursor = parseInt(event.lastEventId, 10) || 0;
+        if (cursor > latestCursor) latestCursor = cursor;
+        onEvent(data, cursor);
       } catch (err) {
-        onEvent({
-          type: "_error",
-          message: `[Parse error] Failed to parse event: ${String(err)}`,
-        });
+        onEvent(
+          { type: "_error", message: `[Parse error] Failed to parse event: ${String(err)}` },
+          0,
+        );
       }
     });
 
     es.onerror = () => {
-      onEvent({
-        type: "_error",
-        message: "[SSE] Connection lost, reconnecting…",
-      });
+      onEvent({ type: "_error", message: "[SSE] Connection lost, reconnecting\u2026" }, 0);
       es?.close();
       es = null;
       if (!disposed) {
@@ -84,56 +97,58 @@ function subscribeSSE(baseUrl: string, sessionId: string, onEvent: EventCallback
 function subscribeWebSocket(
   baseUrl: string,
   sessionId: string,
-  onEvent: EventCallback,
+  onEvent: CursorEventCallback,
+  afterCursor: number = 0,
 ): () => void {
   let disposed = false;
   let ws: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let latestCursor = afterCursor;
 
   function connect() {
     if (disposed) return;
     const protocol = baseUrl.startsWith("https") ? "wss" : "ws";
     const host = baseUrl.replace(/^https?:\/\//, "");
-    const wsUrl = `${protocol}://${host}/sessions/${sessionId}/ws`;
+    const afterParam = latestCursor > 0 ? `?after=${latestCursor}` : "";
+    const wsUrl = `${protocol}://${host}/sessions/${sessionId}/ws${afterParam}`;
 
     ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data);
-        const validation = validateEventEnvelope(data);
+        const raw = JSON.parse(event.data);
 
+        // Server sends { envelope, cursor } wrapper
+        const envelope = raw.envelope ?? raw;
+        const cursor: number = typeof raw.cursor === "number" ? raw.cursor : 0;
+
+        const validation = validateEventEnvelope(envelope);
         if (!validation.ok) {
-          onEvent({
-            type: "_error",
-            message: `[Protocol error] ${validation.errors?.join("; ")}`,
-          });
+          onEvent(
+            { type: "_error", message: `[Protocol error] ${validation.errors?.join("; ")}` },
+            0,
+          );
           return;
         }
 
-        onEvent(data);
+        if (cursor > latestCursor) latestCursor = cursor;
+        onEvent(envelope, cursor);
       } catch (err) {
-        onEvent({
-          type: "_error",
-          message: `[Parse error] Failed to parse event: ${String(err)}`,
-        });
+        onEvent(
+          { type: "_error", message: `[Parse error] Failed to parse event: ${String(err)}` },
+          0,
+        );
       }
     };
 
     ws.onerror = () => {
-      onEvent({
-        type: "_error",
-        message: "[WebSocket] Connection error",
-      });
+      onEvent({ type: "_error", message: "[WebSocket] Connection error" }, 0);
     };
 
     ws.onclose = () => {
       ws = null;
       if (!disposed) {
-        onEvent({
-          type: "_error",
-          message: "[WebSocket] Connection lost, reconnecting…",
-        });
+        onEvent({ type: "_error", message: "[WebSocket] Connection lost, reconnecting\u2026" }, 0);
         reconnectTimer = setTimeout(connect, 3000);
       }
     };
@@ -156,24 +171,28 @@ function subscribeWebSocket(
  *
  * @param baseUrl Base URL of the server (e.g., http://localhost:3001)
  * @param sessionId Session ID
- * @param onEvent Callback for each event (or error)
+ * @param onEvent Callback for each event + cursor (or error with cursor=0)
  * @param transport Transport selection: "auto", "sse", or "ws" (default: "auto")
+ * @param afterCursor Resume from this cursor (default: 0 = from beginning)
  * @returns Unsubscribe function
  */
 export function subscribeEvents(
   baseUrl: string,
   sessionId: string,
-  onEvent: EventCallback,
+  onEvent: CursorEventCallback,
   transport: TransportType = "auto",
+  afterCursor: number = 0,
 ): () => void {
   const selectedTransport = selectTransport(transport);
 
-  console.log(`[PushPals] Subscribing to session ${sessionId} via ${selectedTransport}`);
+  console.log(
+    `[PushPals] Subscribing to session ${sessionId} via ${selectedTransport} (after=${afterCursor})`,
+  );
 
   if (selectedTransport === "sse") {
-    return subscribeSSE(baseUrl, sessionId, onEvent);
+    return subscribeSSE(baseUrl, sessionId, onEvent, afterCursor);
   } else {
-    return subscribeWebSocket(baseUrl, sessionId, onEvent);
+    return subscribeWebSocket(baseUrl, sessionId, onEvent, afterCursor);
   }
 }
 

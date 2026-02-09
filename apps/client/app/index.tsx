@@ -16,6 +16,7 @@ import {
   type SessionEvent,
   type EventFilters,
 } from "../src/lib/usePushPalsSession";
+import { TasksJobsLogs } from "../src/lib/TasksJobsLogs";
 import type { EventEnvelope, EventType } from "protocol/browser";
 
 const uuidv4 = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -492,6 +493,7 @@ function TaskStrip({ tasks }: { tasks: { taskId: string; title: string; status: 
 export default function ChatScreen() {
   const session = usePushPalsSession(DEFAULT_BASE);
   const [input, setInput] = useState("");
+  const [activeTab, setActiveTab] = useState<"events" | "tasks">("events");
   const flatRef = useRef<FlatList<SessionEvent> | null>(null);
 
   const handleSend = async () => {
@@ -573,16 +575,41 @@ export default function ChatScreen() {
         setFilters={session.setFilters}
       />
 
-      {/* Event list */}
-      <FlatList
-        ref={(r) => {
-          flatRef.current = r;
-        }}
-        data={session.filteredEvents}
-        renderItem={renderItem}
-        keyExtractor={(item, idx) => (isEnvelope(item) ? item.id : `err-${idx}`)}
-        contentContainerStyle={styles.listContent}
-      />
+      {/* Tab switcher */}
+      <View style={styles.tabBar}>
+        <TouchableOpacity
+          style={[styles.tab, activeTab === "events" && styles.tabActive]}
+          onPress={() => setActiveTab("events")}
+        >
+          <Text style={[styles.tabText, activeTab === "events" && styles.tabTextActive]}>
+            Events
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tab, activeTab === "tasks" && styles.tabActive]}
+          onPress={() => setActiveTab("tasks")}
+        >
+          <Text style={[styles.tabText, activeTab === "tasks" && styles.tabTextActive]}>
+            Tasks & Jobs
+            {session.state.tasks.size > 0 ? ` (${session.state.tasks.size})` : ""}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Content: Events list or Tasks+Jobs+Logs panel */}
+      {activeTab === "events" ? (
+        <FlatList
+          ref={(r) => {
+            flatRef.current = r;
+          }}
+          data={session.filteredEvents}
+          renderItem={renderItem}
+          keyExtractor={(item, idx) => (isEnvelope(item) ? item.id : `err-${idx}`)}
+          contentContainerStyle={styles.listContent}
+        />
+      ) : (
+        <TasksJobsLogs state={session.state} />
+      )}
 
       {/* Composer */}
       <View style={styles.composerRow}>
@@ -685,6 +712,33 @@ const styles = StyleSheet.create({
     borderColor: "#3b82f6",
   },
   filterChipText: { fontSize: 11, color: "#334155" },
+
+  // Tab bar
+  tabBar: {
+    flexDirection: "row",
+    borderBottomWidth: 1,
+    borderBottomColor: "#e2e8f0",
+    backgroundColor: "#fff",
+  },
+  tab: {
+    flex: 1,
+    paddingVertical: 8,
+    alignItems: "center",
+    borderBottomWidth: 2,
+    borderBottomColor: "transparent",
+  },
+  tabActive: {
+    borderBottomColor: "#3b82f6",
+  },
+  tabText: {
+    fontSize: 13,
+    fontWeight: "500",
+    color: "#94a3b8",
+  },
+  tabTextActive: {
+    color: "#3b82f6",
+    fontWeight: "600",
+  },
 
   // List
   listContent: { padding: 12, paddingBottom: 8 },
