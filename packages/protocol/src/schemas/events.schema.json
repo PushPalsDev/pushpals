@@ -495,10 +495,11 @@
         "type": { "const": "job_log" },
         "payload": {
           "type": "object",
-          "required": ["jobId", "stream", "line"],
+          "required": ["jobId", "stream", "seq", "line"],
           "properties": {
             "jobId": { "type": "string" },
             "stream": { "type": "string", "enum": ["stdout", "stderr"] },
+            "seq": { "type": "integer", "minimum": 1 },
             "line": { "type": "string" }
           },
           "additionalProperties": false

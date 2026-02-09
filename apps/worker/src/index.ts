@@ -6,9 +6,11 @@
  *   bun run worker --server http://localhost:3001 [--poll 2000] [--repo <path>]
  *
  * Polls the server job queue, claims jobs, executes them, and reports results.
- * Initial job kinds: bun.test, bun.lint
+ * Streams stdout/stderr as `job_log` events with seq numbers.
+ * Job kinds: bun.test, bun.lint, git.status
  */
 
+import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
@@ -70,6 +72,7 @@ async function executeJob(
   kind: string,
   params: Record<string, unknown>,
   repo: string,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<JobResult> {
   let cmd: string[];
 
@@ -81,6 +84,10 @@ async function executeJob(
     }
     case "bun.lint": {
       cmd = ["bun", "run", "lint"];
+      break;
+    }
+    case "git.status": {
+      cmd = ["git", "status", "--porcelain"];
       break;
     }
     default:
@@ -101,8 +108,8 @@ async function executeJob(
     }, 60_000); // 60s timeout
 
     const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+      onLog ? streamLines(proc.stdout, "stdout", onLog) : new Response(proc.stdout).text(),
+      onLog ? streamLines(proc.stderr, "stderr", onLog) : new Response(proc.stderr).text(),
     ]);
 
     clearTimeout(timer);
@@ -118,6 +125,66 @@ async function executeJob(
   } catch (err) {
     return { ok: false, summary: `Error executing ${kind}: ${err}` };
   }
+}
+
+// ─── Streaming utilities ────────────────────────────────────────────────────
+
+/**
+ * Read a process stream line-by-line, calling onLine for each.
+ * Returns the full concatenated output.
+ */
+async function streamLines(
+  readable: ReadableStream<Uint8Array>,
+  streamName: "stdout" | "stderr",
+  onLine: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  const reader = readable.getReader();
+  let full = "";
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    full += chunk;
+    buffer += chunk;
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const clean = line.endsWith("\r") ? line.slice(0, -1) : line;
+      onLine(streamName, clean);
+    }
+  }
+
+  // Flush remaining buffer
+  if (buffer.length > 0) {
+    const clean = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+    onLine(streamName, clean);
+  }
+
+  return full;
+}
+
+// ─── Command helper ─────────────────────────────────────────────────────────
+
+function sendCommand(
+  server: string,
+  sessionId: string,
+  headers: Record<string, string>,
+  cmd: CommandRequest,
+): Promise<void> {
+  return fetch(`${server}/sessions/${sessionId}/command`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(cmd),
+  })
+    .then((res) => {
+      if (!res.ok) console.error(`[Worker] Command ${cmd.type} failed: ${res.status}`);
+    })
+    .catch((err) => console.error(`[Worker] Command ${cmd.type} error:`, err));
 }
 
 // ─── Worker loop ────────────────────────────────────────────────────────────
@@ -144,12 +211,41 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
         if (job) {
           console.log(`[Worker] Claimed job ${job.id} (${job.kind})`);
 
-          // Execute the job
-          const params = typeof job.params === "string" ? JSON.parse(job.params) : job.params;
-          const result = await executeJob(job.kind, params, opts.repo);
+          // 1. Emit job_claimed event
+          if (job.sessionId) {
+            await sendCommand(opts.server, job.sessionId, headers, {
+              type: "job_claimed",
+              payload: { jobId: job.id, workerId: opts.workerId },
+              from: `worker:${opts.workerId}`,
+            });
+          }
 
+          // 2. Execute with streaming logs
+          let stdoutSeq = 0;
+          let stderrSeq = 0;
+          let logChain: Promise<void> = Promise.resolve();
+
+          const onLog = job.sessionId
+            ? (stream: "stdout" | "stderr", line: string) => {
+                const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
+                logChain = logChain.then(() =>
+                  sendCommand(opts.server, job.sessionId, headers, {
+                    type: "job_log",
+                    payload: { jobId: job.id, stream, seq, line },
+                    from: `worker:${opts.workerId}`,
+                  }),
+                );
+              }
+            : undefined;
+
+          const params = typeof job.params === "string" ? JSON.parse(job.params) : job.params;
+          const result = await executeJob(job.kind, params, opts.repo, onLog);
+
+          // 3. Wait for chained log sends to complete
+          await logChain;
+
+          // 4. Report job result to queue
           if (result.ok) {
-            // Report completion
             await fetch(`${opts.server}/jobs/${job.id}/complete`, {
               method: "POST",
               headers,
@@ -163,7 +259,6 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
             });
             console.log(`[Worker] Job ${job.id} completed: ${result.summary}`);
           } else {
-            // Report failure
             await fetch(`${opts.server}/jobs/${job.id}/fail`, {
               method: "POST",
               headers,
@@ -175,20 +270,22 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
             console.log(`[Worker] Job ${job.id} failed: ${result.summary}`);
           }
 
-          // Also emit events to the session if we have sessionId
+          // 5. Emit job_completed / job_failed event to session
           if (job.sessionId) {
-            const eventPayload = result.ok
+            const eventCmd = result.ok
               ? {
-                  type: "job_completed",
+                  type: "job_completed" as const,
                   payload: {
                     jobId: job.id,
                     summary: result.summary,
-                    artifacts: result.stdout ? [{ kind: "log", text: result.stdout }] : undefined,
+                    artifacts: result.stdout
+                      ? [{ kind: "log" as const, text: result.stdout }]
+                      : undefined,
                   },
                   from: `worker:${opts.workerId}`,
                 }
               : {
-                  type: "job_failed",
+                  type: "job_failed" as const,
                   payload: {
                     jobId: job.id,
                     message: result.summary,
@@ -197,11 +294,7 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
                   from: `worker:${opts.workerId}`,
                 };
 
-            await fetch(`${opts.server}/sessions/${job.sessionId}/command`, {
-              method: "POST",
-              headers,
-              body: JSON.stringify(eventPayload),
-            }).catch(() => {}); // Best-effort event emission
+            await sendCommand(opts.server, job.sessionId, headers, eventCmd);
           }
         }
       }

@@ -563,6 +563,32 @@ test("Event type 'job_failed' validates", () => {
   return validateEventEnvelope(event).ok === true;
 });
 
+// ── job_log ─────────────────────────────────────────────────────────────────
+
+test("Event type 'job_log' validates", () => {
+  const event: EventEnvelope<"job_log"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "job_log",
+    payload: { jobId: randomUUID(), stream: "stdout", seq: 1, line: "PASS src/index.test.ts" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Event type 'job_log' rejects missing seq", () => {
+  const event = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "job_log",
+    payload: { jobId: randomUUID(), stream: "stdout", line: "no seq field" },
+  };
+  return validateEventEnvelope(event as any).ok === false;
+});
+
 // ── validateCommandRequest ──────────────────────────────────────────────────
 
 test("validateCommandRequest accepts valid command", () => {

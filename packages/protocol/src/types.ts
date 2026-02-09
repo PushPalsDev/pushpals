@@ -114,6 +114,7 @@ export interface EventTypePayloadMap {
   job_log: {
     jobId: string;
     stream: "stdout" | "stderr";
+    seq: number;
     line: string;
   };
 
