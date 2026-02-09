@@ -1,6 +1,18 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "EventTypePayloads",
+  "definitions": {
+    "artifact": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string" },
+        "uri": { "type": "string" },
+        "text": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
   "oneOf": [
     {
       "type": "object",
@@ -187,6 +199,273 @@
           "type": "object",
           "required": ["ok"],
           "properties": { "ok": { "type": "boolean" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "agent_status" },
+        "payload": {
+          "type": "object",
+          "required": ["agentId", "status"],
+          "properties": {
+            "agentId": { "type": "string" },
+            "status": { "type": "string", "enum": ["idle", "busy", "error"] },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_created" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "title", "description", "createdBy"],
+          "properties": {
+            "taskId": { "type": "string" },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "createdBy": { "type": "string" },
+            "priority": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_started" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId"],
+          "properties": { "taskId": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_progress" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "message"],
+          "properties": {
+            "taskId": { "type": "string" },
+            "message": { "type": "string" },
+            "percent": { "type": "number", "minimum": 0, "maximum": 100 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_completed" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "summary"],
+          "properties": {
+            "taskId": { "type": "string" },
+            "summary": { "type": "string" },
+            "artifacts": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/artifact" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_failed" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "message"],
+          "properties": {
+            "taskId": { "type": "string" },
+            "message": { "type": "string" },
+            "detail": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "tool_call" },
+        "payload": {
+          "type": "object",
+          "required": ["toolCallId", "tool", "args"],
+          "properties": {
+            "toolCallId": { "type": "string" },
+            "taskId": { "type": "string" },
+            "tool": { "type": "string" },
+            "args": { "type": "object", "additionalProperties": true },
+            "requiresApproval": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "tool_result" },
+        "payload": {
+          "type": "object",
+          "required": ["toolCallId", "ok"],
+          "properties": {
+            "toolCallId": { "type": "string" },
+            "taskId": { "type": "string" },
+            "ok": { "type": "boolean" },
+            "stdout": { "type": "string" },
+            "stderr": { "type": "string" },
+            "exitCode": { "type": "integer" },
+            "artifacts": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/artifact" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "delegate_request" },
+        "payload": {
+          "type": "object",
+          "required": ["requestId", "toAgentId", "input"],
+          "properties": {
+            "requestId": { "type": "string" },
+            "toAgentId": { "type": "string" },
+            "input": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "delegate_response" },
+        "payload": {
+          "type": "object",
+          "required": ["requestId", "ok"],
+          "properties": {
+            "requestId": { "type": "string" },
+            "ok": { "type": "boolean" },
+            "output": { "type": "object", "additionalProperties": true },
+            "error": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_enqueued" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId", "taskId", "kind", "params"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "taskId": { "type": "string" },
+            "kind": { "type": "string" },
+            "params": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_claimed" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId", "workerId"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "workerId": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_completed" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "summary": { "type": "string" },
+            "artifacts": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/artifact" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_failed" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId", "message"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "message": { "type": "string" },
+            "detail": { "type": "string" }
+          },
           "additionalProperties": false
         }
       },

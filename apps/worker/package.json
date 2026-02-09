@@ -1,0 +1,17 @@
+{
+  "name": "worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2",
+    "@types/bun": "latest"
+  },
+  "private": true
+}

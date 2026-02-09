@@ -1,8 +1,10 @@
 import { EventEnvelope, PROTOCOL_VERSION } from "protocol";
 import { SessionManager } from "./events.js";
+import { JobQueue } from "./jobs.js";
 import { randomUUID } from "crypto";
 
 const sessionManager = new SessionManager();
+const jobQueue = new JobQueue();
 
 /**
  * HTTP Middleware & Routes
@@ -40,6 +42,15 @@ export function createRequestHandler() {
 
       console.log(`[${method}] ${pathname}`);
 
+      // ── Auth helper ──────────────────────────────────────────────────────
+      const requireAuth = (): Response | null => {
+        const authHeader = req.headers.get("authorization");
+        if (!sessionManager.validateAuth(authHeader)) {
+          return makeJson({ ok: false, message: "Unauthorized" }, 401);
+        }
+        return null;
+      };
+
       // GET /healthz
       if (pathname === "/healthz" && method === "GET") {
         return makeJson({ ok: true, protocolVersion: PROTOCOL_VERSION });
@@ -69,13 +80,20 @@ export function createRequestHandler() {
             // Send initial keepalive
             controller.enqueue(encoder.encode(": keepalive\n\n"));
 
-            // Subscribe to events
+            // Replay history to the new subscriber
+            session.replayHistory((envelope: EventEnvelope) => {
+              const eventData = `event: message\ndata: ${JSON.stringify(envelope)}\n\n`;
+              try {
+                controller.enqueue(encoder.encode(eventData));
+              } catch (_e) {}
+            });
+
+            // Subscribe to live events
             unsubscribe = session.subscribe((envelope: EventEnvelope) => {
               const eventData = `event: message\ndata: ${JSON.stringify(envelope)}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
               } catch (err) {
-                // On enqueue failure, clear interval, unsubscribe, and close stream
                 if (pingInterval) clearInterval(pingInterval);
                 if (unsubscribe) unsubscribe();
                 try {
@@ -89,7 +107,6 @@ export function createRequestHandler() {
               try {
                 controller.enqueue(encoder.encode(": keepalive\n\n"));
               } catch (_err) {
-                // Stream closed or enqueue failed: clear interval and unsubscribe
                 if (pingInterval) clearInterval(pingInterval);
                 if (unsubscribe) unsubscribe();
               }
@@ -118,8 +135,6 @@ export function createRequestHandler() {
       if (wsMatch && method === "GET") {
         const sessionId = wsMatch[1];
 
-        // Bun.upgrade upgrades the request to WebSocket
-        // Only pass the sessionId in ws.data to avoid sharing session object
         // @ts-ignore - Bun.upgrade is available at runtime
         const success = Bun.upgrade(req, {
           data: { sessionId },
@@ -132,7 +147,7 @@ export function createRequestHandler() {
         return makeJson({ ok: false, message: "WebSocket upgrade failed" }, 400);
       }
 
-      // POST /sessions/:id/message
+      // POST /sessions/:id/message  (UI convenience)
       const msgMatch = pathname.match(/^\/sessions\/([^/]+)\/message$/);
       if (msgMatch && method === "POST") {
         const sessionId = msgMatch[1];
@@ -141,14 +156,28 @@ export function createRequestHandler() {
         return makeJson({ ok: true });
       }
 
-      // POST /approvals/:approvalId
+      // POST /sessions/:id/command  (agent-friendly ingest — auth protected)
+      const cmdMatch = pathname.match(/^\/sessions\/([^/]+)\/command$/);
+      if (cmdMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const sessionId = cmdMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = sessionManager.handleCommand(sessionId, body);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // POST /approvals/:approvalId  (auth protected)
       const approvalMatch = pathname.match(/^\/approvals\/([^/]+)$/);
       if (approvalMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
         const approvalId = approvalMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const decision = body.decision as string;
 
-        // Validate decision is one of the allowed values
         if (decision !== "approve" && decision !== "deny") {
           return makeJson({ ok: false, message: "Invalid decision value" }, 400);
         }
@@ -157,6 +186,53 @@ export function createRequestHandler() {
           approvalId,
           decision as "approve" | "deny",
         );
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // ── Job queue endpoints (auth protected) ────────────────────────────
+
+      // POST /jobs/enqueue
+      if (pathname === "/jobs/enqueue" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = jobQueue.enqueue(body);
+        return makeJson(result, result.ok ? 201 : 400);
+      }
+
+      // POST /jobs/claim
+      if (pathname === "/jobs/claim" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const workerId = (body.workerId as string) || "unknown";
+        const result = jobQueue.claim(workerId);
+        return makeJson(result, result.ok ? 200 : 404);
+      }
+
+      // POST /jobs/:id/complete
+      const jobCompleteMatch = pathname.match(/^\/jobs\/([^/]+)\/complete$/);
+      if (jobCompleteMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobCompleteMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = jobQueue.complete(jobId, body);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // POST /jobs/:id/fail
+      const jobFailMatch = pathname.match(/^\/jobs\/([^/]+)\/fail$/);
+      if (jobFailMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobFailMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = jobQueue.fail(jobId, body);
         return makeJson(result, result.ok ? 200 : 400);
       }
 
@@ -188,19 +264,24 @@ export function createRequestHandler() {
           return;
         }
 
-        // Subscribe to session events and send to this WebSocket
+        // Replay history to the new WebSocket subscriber
+        session.replayHistory((envelope: EventEnvelope) => {
+          try {
+            ws.send(JSON.stringify(envelope));
+          } catch (_e) {}
+        });
+
+        // Subscribe to live events and send to this WebSocket
         const unsubscribe = session.subscribe((envelope: EventEnvelope) => {
           try {
             ws.send(JSON.stringify(envelope));
           } catch (_err) {
-            // WebSocket closed
             try {
               unsubscribe();
             } catch (_e) {}
           }
         });
 
-        // Store unsubscribe function for cleanup
         ws.data = { sessionId, unsubscribe };
       },
       close(ws: any) {
@@ -214,17 +295,15 @@ export function createRequestHandler() {
       },
       message(ws: any, message: any) {
         const { sessionId } = ws.data || {};
-        // Handle incoming messages (optional for MVP)
         console.log(`[WS] Session ${sessionId} message:`, message);
       },
     },
   });
 }
 
-export { sessionManager };
+export { sessionManager, jobQueue };
 
 // If this file is executed directly, start the server.
 if (import.meta.main) {
-  // Start the Bun server
   createRequestHandler();
 }

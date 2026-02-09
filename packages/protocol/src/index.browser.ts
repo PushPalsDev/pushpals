@@ -1,5 +1,6 @@
 export { PROTOCOL_VERSION } from "./version.js";
 export type {
+  Artifact,
   EventEnvelope,
   AnyEventEnvelope,
   EventType,
@@ -10,6 +11,8 @@ export type {
   MessageResponse,
   ApprovalDecisionRequest,
   ApprovalDecisionResponse,
+  CommandRequest,
+  CommandResponse,
 } from "./types.js";
 export {
   validateEventEnvelope,
@@ -17,5 +20,6 @@ export {
   validateMessageResponse,
   validateApprovalDecisionRequest,
   validateApprovalDecisionResponse,
+  validateCommandRequest,
   type ValidationResult,
 } from "./validate.browser";

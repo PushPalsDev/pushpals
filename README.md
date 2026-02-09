@@ -154,43 +154,55 @@ We've introduced a **shared, versioned protocol** to enable robust client-server
 - **`packages/protocol`**: Centralized schema definitions, TypeScript types, and validators (Ajv)
 - **`apps/server`**: Bun-based server streaming events over SSE (web) and WebSocket (mobile/desktop)
 - **`apps/client`**: Expo client with automatic transport selection
+- **`apps/agent-local`**: Local agent daemon — runs tools, orchestrates tasks, gates approvals
+- **`apps/worker`**: Worker daemon — polls job queue, runs heavy tasks (test, lint)
 - **A2A Scaffolding**: Placeholder interfaces for future Agent-to-Agent support
 
 ### Architecture
 
 ```
-┌─────────────────────────────────────┐
-│   Shared Protocol (packages/protocol)│
-│  - JSON Schemas (envelope, events)   │
-│  - TypeScript types                  │
-│  - Ajv validators                    │
-│  - Protocol v0.1.0                   │
-└─────────────────────────────────────┘
-           ▲            ▲
-           │            │
-    ┌──────┴─┐   ┌─────┴──────┐
-    │ Server  │   │  Client    │
-    │ (Bun)   │   │ (Expo)     │
-    └─┬──────┬┘   │            │
-      │      │    │            │
-    SSE   WebSocket  Auto-select
-      │      │    │  (SSE/WS)  │
-    Web   Mobile  │            │
-      │           └────────────┘
-      │
-   EventEnvelope (validated)
-      │
-   { type, payload, ts, sessionId, ... }
+┌────────────────────────────────────────────────────────────────┐
+│                Shared Protocol (packages/protocol)             │
+│  - JSON Schemas (envelope, events) — 27 event types            │
+│  - Routing fields: from, to, correlationId, parentId, turnId   │
+│  - TypeScript types · Ajv validators · v0.1.0                  │
+└────────────────────────────────────────────────────────────────┘
+           ▲              ▲              ▲
+           │              │              │
+    ┌──────┴──┐    ┌──────┴──────┐   ┌───┴────────┐
+    │ Server  │◄──►│ Agent-local │──►│  Worker(s) │
+    │ (Bun)   │    │  daemon     │   │  (polling) │
+    └─┬───┬───┘    │             │   └────────────┘
+      │   │        │ Tools:      │         │
+    SSE  WS       │ git.*       │    bun.test
+      │   │        │ file.*      │    bun.lint
+      │   │        │ bun.*       │    (heavy work)
+    ┌─┴───┴─┐      │             │
+    │ Client │     │ Planner:    │
+    │ (Expo) │     │ local/LLM   │
+    └────────┘     └─────────────┘
+
+    Flow: Client → Server → Agent-local → Tools/Workers → Server → Client
 ```
+
+### Components
+
+| Component | Location | Role |
+|-----------|----------|------|
+| **Protocol** | `packages/protocol` | Shared types, schemas, validators |
+| **Server** | `apps/server` | Event hub, session state, job queue (SQLite), auth |
+| **Agent-local** | `apps/agent-local` | Tool execution, planning, approval gating |
+| **Worker** | `apps/worker` | Background heavy tasks (tests, lint) |
+| **Client** | `apps/client` | Expo React Native + web UI |
 
 ### Key Features
 
-**Unified Protocol**: Both SSE and WebSocket emit identical `EventEnvelope` messages  
-**Validation**: All events/requests validated at send + receive (Ajv)  
-**Type Safety**: Shared TypeScript types across client and server  
-**Transport Agnostic**: Event bus decoupled from transport logic  
-**Local Development**: Runs on Windows with Bun + Expo  
-**Future-Ready**: A2A adapter scaffolding for agent-to-agent workflows
+**27 Event Types**: Full multi-agent lifecycle — tasks, tools, approvals, jobs, delegation
+**Rich Routing**: `from`/`to` agent attribution, `turnId` grouping, `correlationId` threading
+**Safety**: Tool approval gating, path sanitization, output truncation, timeout enforcement
+**SQLite Job Queue**: Atomic claim, job logs, artifact tracking (in-memory by default)
+**Planner Interface**: Swap between local heuristic and remote LLM (Ollama/OpenAI compatible)
+**Client UI**: Event cards by type, approval buttons, task progress, diff preview, agent filters
 
 ## Prerequisites
 
@@ -204,29 +216,63 @@ We've introduced a **shared, versioned protocol** to enable robust client-server
 # Install dependencies
 bun install
 
+# Build protocol (required first time)
+cd packages/protocol && bun run build && cd ../..
+
+# Set auth token (used by server, agent-local, worker)
+export PUSHPALS_AUTH_TOKEN=my-secret-token
+
 # Terminal 1: Run server
 bun run server
 
-# Terminal 2: Run web client
+# Terminal 2: Run agent-local daemon (connects to server, runs tools)
+bun run agent-local
+
+# Terminal 3: Run worker (polls job queue for heavy tasks)
+bun run worker
+
+# Terminal 4: Run web client
 bun web
 
-# Terminal 3: (Optional) Run mobile
-bun ios
-# or
-bun android
+# Or run everything at once:
+bun run dev:full
+```
+
+### Dogfood Scenario
+
+The "definition of done" — use PushPals to change PushPals:
+
+1. **Start the stack**: `bun run dev:full`
+2. **Open the UI** at `http://localhost:8081`
+3. **Send a message**: "Run git status on this repo"
+4. **Watch the trace** in the UI:
+   - `task_created` — agent plans the work
+   - `agent_status` busy → `task_started`
+   - `tool_call` (git.status) → `tool_result`
+   - `task_completed` with summary
+   - `agent_status` idle
+5. **Try an approval flow**: "Apply a patch to fix the README"
+   - `tool_call` (git.applyPatch, `requiresApproval=true`)
+   - UI shows **Approve / Deny** buttons
+   - Click Approve → `approved` event → tool runs
+
+```bash
+# Run automated smoke test (requires server + agent-local running)
+PUSHPALS_AUTH_TOKEN=my-secret-token bun run scripts/smoke-test.ts
 ```
 
 ### Event Types
 
-- `log` - Debug/info/warn/error logging
-- `scan_result` - Repository analysis
-- `suggestions` - Actionable improvement ideas
-- `diff_ready` - Unified diff + statistics
-- `approval_required` - Awaiting user approval
-- `approved` / `denied` - Approval decisions
-- `committed` - Git commit result
-- `error` - System error
-- `done` - Workflow completion
+| Category | Types |
+|----------|-------|
+| **Chat** | `assistant_message`, `log`, `error`, `done` |
+| **Repo** | `scan_result`, `suggestions`, `diff_ready`, `committed` |
+| **Approvals** | `approval_required`, `approved`, `denied` |
+| **Agent** | `agent_status` |
+| **Tasks** | `task_created`, `task_started`, `task_progress`, `task_completed`, `task_failed` |
+| **Tools** | `tool_call`, `tool_result` |
+| **Delegation** | `delegate_request`, `delegate_response` |
+| **Jobs** | `job_enqueued`, `job_claimed`, `job_completed`, `job_failed` |
 
 ### Protocol Documentation
 

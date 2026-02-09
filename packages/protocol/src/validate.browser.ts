@@ -94,6 +94,23 @@ export function validateMessageResponse(data: unknown): ValidationResult {
   return { ok: valid, errors };
 }
 
+export function validateCommandRequest(data: unknown): ValidationResult {
+  const allEventTypes = [
+    "log", "scan_result", "suggestions", "diff_ready",
+    "approval_required", "approved", "denied", "committed",
+    "assistant_message", "error", "done",
+    "agent_status", "task_created", "task_started", "task_progress",
+    "task_completed", "task_failed", "tool_call", "tool_result",
+    "delegate_request", "delegate_response",
+    "job_enqueued", "job_claimed", "job_completed", "job_failed",
+  ];
+  const d = data as any;
+  if (!d || typeof d !== "object") return { ok: false, errors: ["Expected object"] };
+  if (!d.type || !allEventTypes.includes(d.type)) return { ok: false, errors: ["Invalid type"] };
+  if (!d.payload || typeof d.payload !== "object") return { ok: false, errors: ["Invalid payload"] };
+  return { ok: true };
+}
+
 export function validateApprovalDecisionRequest(data: unknown): ValidationResult {
   const valid = validateApprovalDecisionRequestSchema(data);
   const errors = valid

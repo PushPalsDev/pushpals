@@ -217,3 +217,39 @@ export async function submitApprovalDecision(
     return false;
   }
 }
+
+/**
+ * Send a command to the session (agent-friendly ingest endpoint).
+ * Requires auth token.
+ */
+export async function sendCommand(
+  baseUrl: string,
+  sessionId: string,
+  command: {
+    type: string;
+    payload: Record<string, unknown>;
+    from?: string;
+    to?: string;
+    correlationId?: string;
+    turnId?: string;
+    parentId?: string;
+  },
+  authToken?: string,
+): Promise<{ ok: boolean; eventId?: string }> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+
+    const response = await fetch(`${baseUrl}/sessions/${sessionId}/command`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(command),
+    });
+
+    if (!response.ok) return { ok: false };
+    return await response.json();
+  } catch (err) {
+    console.error("Error sending command:", err);
+    return { ok: false };
+  }
+}

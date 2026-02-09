@@ -35,13 +35,47 @@
         "committed",
         "assistant_message",
         "error",
-        "done"
+        "done",
+        "agent_status",
+        "task_created",
+        "task_started",
+        "task_progress",
+        "task_completed",
+        "task_failed",
+        "tool_call",
+        "tool_result",
+        "delegate_request",
+        "delegate_response",
+        "job_enqueued",
+        "job_claimed",
+        "job_completed",
+        "job_failed"
       ],
       "description": "Event type discriminator"
     },
     "traceId": {
       "type": "string",
       "description": "Optional trace ID for debugging"
+    },
+    "from": {
+      "type": "string",
+      "description": "Originator identifier (e.g. client, agent:local1, worker:lint)"
+    },
+    "to": {
+      "type": "string",
+      "description": "Destination identifier (e.g. broadcast, agent:local1, worker:queue:default)"
+    },
+    "correlationId": {
+      "type": "string",
+      "description": "Threads a whole conversation turn together"
+    },
+    "parentId": {
+      "type": "string",
+      "description": "Links tool calls/results under their parent task event"
+    },
+    "turnId": {
+      "type": "string",
+      "description": "One per user message; groups all downstream events"
     },
     "payload": {
       "type": "object",

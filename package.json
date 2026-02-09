@@ -13,16 +13,22 @@
     "web:only": "bun --cwd apps/client web",
     "ios:only": "bun --cwd apps/client ios",
     "android:only": "bun --cwd apps/client android",
+    "agent-local:only": "bun --cwd apps/agent-local dev",
+    "worker:only": "bun --cwd apps/worker dev",
     "server": "bun run protocol:build && bun run server:only",
     "client": "bun run protocol:build && bun run client:only",
     "web": "bun run protocol:build && bun run web:only",
     "ios": "bun run protocol:build && bun run ios:only",
     "android": "bun run protocol:build && bun run android:only",
+    "agent-local": "bun run protocol:build && bun run agent-local:only",
+    "worker": "bun run protocol:build && bun run worker:only",
     "dev": "bun run protocol:build && bun --parallel server:only client:only",
+    "dev:full": "bun run protocol:build && bun --parallel server:only agent-local:only worker:only client:only",
     "lint": "bun --cwd apps/client lint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "bun --cwd packages/protocol test"
+    "test": "bun --cwd packages/protocol test",
+    "smoke": "bun run scripts/smoke-test.ts"
   },
   "devDependencies": {
     "prettier": "^3.8.1"

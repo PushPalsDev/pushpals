@@ -9,6 +9,7 @@ import {
   validateEventEnvelope,
   validateMessageRequest,
   validateApprovalDecisionRequest,
+  validateCommandRequest,
   AnyEventEnvelope,
 } from "protocol";
 import { randomUUID } from "crypto";
@@ -182,6 +183,406 @@ test("Denial decision strictly checked", () => {
   const bad = validateApprovalDecisionRequest({ decision: "den" } as any);
   const good = validateApprovalDecisionRequest({ decision: "deny" });
   return bad.ok === false && good.ok === true;
+});
+
+// ── Routing / meta fields ───────────────────────────────────────────────────
+
+test("Envelope with routing fields (from, to, turnId, correlationId, parentId) validates", () => {
+  const event: EventEnvelope<"log"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "log",
+    from: "agent:local1",
+    to: "broadcast",
+    correlationId: randomUUID(),
+    parentId: randomUUID(),
+    turnId: randomUUID(),
+    payload: { level: "info", message: "routed" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Envelope with only some routing fields validates", () => {
+  const event: EventEnvelope<"log"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "log",
+    from: "client",
+    payload: { level: "info", message: "partial routing" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── agent_status ────────────────────────────────────────────────────────────
+
+test("Event type 'agent_status' validates (idle)", () => {
+  const event: EventEnvelope<"agent_status"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "agent_status",
+    from: "agent:local1",
+    payload: { agentId: "local1", status: "idle" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Event type 'agent_status' validates (busy with message)", () => {
+  const event: EventEnvelope<"agent_status"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "agent_status",
+    payload: { agentId: "local1", status: "busy", message: "Processing task" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Event type 'agent_status' rejects invalid status", () => {
+  const event = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "agent_status",
+    payload: { agentId: "local1", status: "sleeping" },
+  };
+  return validateEventEnvelope(event).ok === false;
+});
+
+// ── task_created ────────────────────────────────────────────────────────────
+
+test("Event type 'task_created' validates (minimal)", () => {
+  const event: EventEnvelope<"task_created"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "task_created",
+    payload: {
+      taskId: randomUUID(),
+      title: "Add tests",
+      description: "Add unit tests for the companion module",
+      createdBy: "agent:local1",
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Event type 'task_created' validates (with priority & tags)", () => {
+  const event: EventEnvelope<"task_created"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "task_created",
+    turnId: randomUUID(),
+    payload: {
+      taskId: randomUUID(),
+      title: "Fix lint",
+      description: "Run lint and fix errors",
+      createdBy: "planner",
+      priority: "high",
+      tags: ["lint", "ci"],
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── task_started ────────────────────────────────────────────────────────────
+
+test("Event type 'task_started' validates", () => {
+  const event: EventEnvelope<"task_started"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "task_started",
+    payload: { taskId: randomUUID() },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── task_progress ───────────────────────────────────────────────────────────
+
+test("Event type 'task_progress' validates (with percent)", () => {
+  const event: EventEnvelope<"task_progress"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "task_progress",
+    payload: { taskId: randomUUID(), message: "Running tests…", percent: 42 },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Event type 'task_progress' validates (no percent)", () => {
+  const event: EventEnvelope<"task_progress"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "task_progress",
+    payload: { taskId: randomUUID(), message: "Still going" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── task_completed ──────────────────────────────────────────────────────────
+
+test("Event type 'task_completed' validates (with artifacts)", () => {
+  const event: EventEnvelope<"task_completed"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "task_completed",
+    payload: {
+      taskId: randomUUID(),
+      summary: "All tests pass",
+      artifacts: [
+        { kind: "log", text: "3 passed, 0 failed" },
+        { kind: "file", uri: "coverage/lcov.info" },
+      ],
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── task_failed ─────────────────────────────────────────────────────────────
+
+test("Event type 'task_failed' validates", () => {
+  const event: EventEnvelope<"task_failed"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "task_failed",
+    payload: { taskId: randomUUID(), message: "Lint detected 3 errors", detail: "src/foo.ts:12" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── tool_call ───────────────────────────────────────────────────────────────
+
+test("Event type 'tool_call' validates (requiresApproval=true)", () => {
+  const event: EventEnvelope<"tool_call"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "tool_call",
+    from: "agent:local1",
+    payload: {
+      toolCallId: randomUUID(),
+      taskId: randomUUID(),
+      tool: "git.applyPatch",
+      args: { patch: "diff --git …" },
+      requiresApproval: true,
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Event type 'tool_call' validates (no approval)", () => {
+  const event: EventEnvelope<"tool_call"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "tool_call",
+    payload: {
+      toolCallId: randomUUID(),
+      tool: "git.status",
+      args: {},
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── tool_result ─────────────────────────────────────────────────────────────
+
+test("Event type 'tool_result' validates (ok=true)", () => {
+  const event: EventEnvelope<"tool_result"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "tool_result",
+    payload: {
+      toolCallId: randomUUID(),
+      ok: true,
+      stdout: "M src/index.ts",
+      exitCode: 0,
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Event type 'tool_result' validates (ok=false with stderr)", () => {
+  const event: EventEnvelope<"tool_result"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "tool_result",
+    payload: {
+      toolCallId: randomUUID(),
+      taskId: randomUUID(),
+      ok: false,
+      stderr: "error: patch does not apply",
+      exitCode: 1,
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── delegate_request ────────────────────────────────────────────────────────
+
+test("Event type 'delegate_request' validates", () => {
+  const event: EventEnvelope<"delegate_request"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "delegate_request",
+    from: "agent:local1",
+    to: "agent:remote2",
+    payload: {
+      requestId: randomUUID(),
+      toAgentId: "remote2",
+      input: { userText: "Describe the repo" },
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── delegate_response ───────────────────────────────────────────────────────
+
+test("Event type 'delegate_response' validates (ok)", () => {
+  const event: EventEnvelope<"delegate_response"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "delegate_response",
+    payload: {
+      requestId: randomUUID(),
+      ok: true,
+      output: { tasks: [] },
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+test("Event type 'delegate_response' validates (error)", () => {
+  const event: EventEnvelope<"delegate_response"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "delegate_response",
+    payload: {
+      requestId: randomUUID(),
+      ok: false,
+      error: "Agent unreachable",
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── job_enqueued ────────────────────────────────────────────────────────────
+
+test("Event type 'job_enqueued' validates", () => {
+  const event: EventEnvelope<"job_enqueued"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "job_enqueued",
+    payload: {
+      jobId: randomUUID(),
+      taskId: randomUUID(),
+      kind: "bun.test",
+      params: { cwd: "." },
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── job_claimed ─────────────────────────────────────────────────────────────
+
+test("Event type 'job_claimed' validates", () => {
+  const event: EventEnvelope<"job_claimed"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "job_claimed",
+    payload: { jobId: randomUUID(), workerId: "worker-1" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── job_completed ───────────────────────────────────────────────────────────
+
+test("Event type 'job_completed' validates", () => {
+  const event: EventEnvelope<"job_completed"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "job_completed",
+    payload: {
+      jobId: randomUUID(),
+      summary: "All 12 tests passed",
+      artifacts: [{ kind: "log", text: "output…" }],
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── job_failed ──────────────────────────────────────────────────────────────
+
+test("Event type 'job_failed' validates", () => {
+  const event: EventEnvelope<"job_failed"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "job_failed",
+    payload: { jobId: randomUUID(), message: "Timeout after 30s" },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
+// ── validateCommandRequest ──────────────────────────────────────────────────
+
+test("validateCommandRequest accepts valid command", () => {
+  return validateCommandRequest({
+    type: "agent_status",
+    payload: { agentId: "local1", status: "busy" },
+    from: "agent:local1",
+    turnId: randomUUID(),
+  }).ok === true;
+});
+
+test("validateCommandRequest rejects unknown type", () => {
+  return validateCommandRequest({
+    type: "unknown_event",
+    payload: {},
+  }).ok === false;
+});
+
+test("validateCommandRequest rejects missing payload", () => {
+  return validateCommandRequest({ type: "log" }).ok === false;
 });
 
 // Summary

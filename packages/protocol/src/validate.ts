@@ -165,3 +165,39 @@ export function validateApprovalDecisionResponse(data: unknown): ValidationResul
       : ajv.errorsText(validateApprovalDecisionResponseSchema.errors).split(", "),
   };
 }
+
+// Command request schema (agent-friendly ingest)
+const allEventTypes = [
+  "log", "scan_result", "suggestions", "diff_ready",
+  "approval_required", "approved", "denied", "committed",
+  "assistant_message", "error", "done",
+  "agent_status", "task_created", "task_started", "task_progress",
+  "task_completed", "task_failed", "tool_call", "tool_result",
+  "delegate_request", "delegate_response",
+  "job_enqueued", "job_claimed", "job_completed", "job_failed",
+];
+
+const validateCommandRequestSchema = ajv.compile({
+  type: "object",
+  required: ["type", "payload"],
+  properties: {
+    type: { type: "string", enum: allEventTypes },
+    payload: { type: "object", additionalProperties: true },
+    from: { type: "string" },
+    to: { type: "string" },
+    correlationId: { type: "string" },
+    turnId: { type: "string" },
+    parentId: { type: "string" },
+  },
+  additionalProperties: false,
+});
+
+export function validateCommandRequest(data: unknown): ValidationResult {
+  const valid = validateCommandRequestSchema(data);
+  return {
+    ok: valid,
+    errors: valid
+      ? undefined
+      : ajv.errorsText(validateCommandRequestSchema.errors).split(", "),
+  };
+}
