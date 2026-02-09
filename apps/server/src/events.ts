@@ -244,41 +244,24 @@ export class SessionManager {
     }
 
     const text = (body as Record<string, unknown>).text as string;
+    const intent = (body as Record<string, unknown>).intent as Record<string, unknown> | undefined;
     const turnId = randomUUID();
 
-    // Emit assistant_message to acknowledge receipt and indicate planning
-    const assistantEnv: EventEnvelope<"assistant_message"> = {
+    // Emit a `message` event — agents (remote / local) handle orchestration
+    const messageEnv: EventEnvelope<"message"> = {
       protocolVersion: PROTOCOL_VERSION,
       id: randomUUID(),
       ts: new Date().toISOString(),
       sessionId,
-      type: "assistant_message",
-      from: "server",
-      turnId,
-      payload: {
-        text: "Got it — I'm going to plan tasks...",
-      },
-    };
-    session.emit(assistantEnv);
-
-    // Translate incoming message to a task_created event
-    const taskId = randomUUID();
-    const taskEnv: EventEnvelope<"task_created"> = {
-      protocolVersion: PROTOCOL_VERSION,
-      id: randomUUID(),
-      ts: new Date().toISOString(),
-      sessionId,
-      type: "task_created",
+      type: "message",
       from: "client",
       turnId,
       payload: {
-        taskId,
-        title: text.length > 80 ? text.substring(0, 80) + "…" : text,
-        description: text,
-        createdBy: "client",
+        text,
+        ...(intent ? { intent } : {}),
       },
     };
-    session.emit(taskEnv);
+    session.emit(messageEnv);
   }
 
   // ── handleCommand (agent-friendly ingest) ───────────────────────────────
