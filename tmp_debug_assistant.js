@@ -1,13 +1,13 @@
-import { validateEventEnvelope, PROTOCOL_VERSION } from 'protocol';
-import { randomUUID } from 'crypto';
+import { validateEventEnvelope, PROTOCOL_VERSION } from "protocol";
+import { randomUUID } from "crypto";
 
 const event = {
   protocolVersion: PROTOCOL_VERSION,
   id: randomUUID(),
   ts: new Date().toISOString(),
   sessionId: randomUUID(),
-  type: 'assistant_message',
-  payload: { text: 'Got it — I\'m going to plan tasks...' },
+  type: "assistant_message",
+  payload: { text: "Got it — I'm going to plan tasks..." },
 };
 
 const res = validateEventEnvelope(event);

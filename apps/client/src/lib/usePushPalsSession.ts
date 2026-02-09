@@ -75,14 +75,17 @@ export function usePushPalsSession(baseUrl: string = "http://localhost:3001") {
       // Use companion to generate intent before sending
       const companion: CompanionModel = new RemoteCompanionModel();
       try {
-        const intent = await companion.summarizeAndPlan({ userText: text, history: session.events });
+        const intent = await companion.summarizeAndPlan({
+          userText: text,
+          history: session.events,
+        });
         return sendMessage(baseUrl, session.sessionId, text, intent as any);
       } catch (_err) {
         // Fallback: send without intent
         return sendMessage(baseUrl, session.sessionId, text);
       }
     },
-    [session.sessionId, baseUrl]
+    [session.sessionId, baseUrl],
   );
 
   return { ...session, send };

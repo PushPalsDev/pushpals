@@ -8,9 +8,10 @@ export type UserIntent = {
 };
 
 export interface CompanionModel {
-  summarizeAndPlan(
-    input: { userText: string; history: Array<EventEnvelope | { type: "_error"; message: string }> },
-  ): Promise<UserIntent>;
+  summarizeAndPlan(input: {
+    userText: string;
+    history: Array<EventEnvelope | { type: "_error"; message: string }>;
+  }): Promise<UserIntent>;
 }
 
 /**
@@ -18,9 +19,10 @@ export interface CompanionModel {
  * For now it returns a simple heuristic-based intent.
  */
 export class RemoteCompanionModel implements CompanionModel {
-  async summarizeAndPlan(
-    input: { userText: string; history: Array<EventEnvelope | { type: "_error"; message: string }> },
-  ): Promise<UserIntent> {
+  async summarizeAndPlan(input: {
+    userText: string;
+    history: Array<EventEnvelope | { type: "_error"; message: string }>;
+  }): Promise<UserIntent> {
     // Simple heuristic stub: echo the user text as summary and create one task
     return {
       summary: input.userText.slice(0, 140),

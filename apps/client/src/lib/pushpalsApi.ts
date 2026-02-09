@@ -177,7 +177,7 @@ export async function sendMessage(
   baseUrl: string,
   sessionId: string,
   text: string,
-  intent?: Record<string, unknown>
+  intent?: Record<string, unknown>,
 ): Promise<boolean> {
   try {
     const body: Record<string, unknown> = { text };
