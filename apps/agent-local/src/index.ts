@@ -76,6 +76,10 @@ class LocalAgent {
   private lastCursor = 0;
   /** Serialise event handling for ordering */
   private chain: Promise<void> = Promise.resolve();
+  /** Periodic repo awareness timer */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Last snapshot of git status for change-detection */
+  private lastStatusSnapshot = "";
 
   constructor(opts: {
     server: string;
@@ -292,9 +296,18 @@ class LocalAgent {
     switch (envelope.type) {
       case "task_created": {
         const payload = envelope.payload as any;
-        // Only act on tasks created by "client" (user messages)
+        // Only act on tasks created by the client (user messages).
+        // Remote agent tasks already have jobs enqueued for the worker —
+        // remote→local delegation uses delegate_request instead.
         if (payload.createdBy !== "client") return;
         await this.handleNewTask(payload, envelope.turnId);
+        break;
+      }
+
+      case "delegate_request": {
+        // Remote agent explicitly delegates work to us
+        const payload = envelope.payload as any;
+        await this.handleDelegateRequest(payload, envelope);
         break;
       }
 
@@ -380,6 +393,111 @@ class LocalAgent {
     await this.emitAgentStatus("idle");
   }
 
+  // ── Delegate request handler ──────────────────────────────────────────
+
+  /**
+   * Handle an explicit delegate_request from the remote agent.
+   * Executes the requested tool(s) directly and responds with delegate_response.
+   */
+  private async handleDelegateRequest(
+    payload: {
+      delegateId: string;
+      tool?: string;
+      tools?: string[];
+      args?: Record<string, unknown>;
+      description?: string;
+    },
+    envelope: EventEnvelope,
+  ): Promise<void> {
+    const { delegateId } = payload;
+    const toolNames = payload.tools ?? (payload.tool ? [payload.tool] : []);
+
+    if (toolNames.length === 0) {
+      // No specific tools — try the planner
+      console.log(`[Agent] Delegate ${delegateId}: no tools specified, using planner`);
+      await this.handleNewTask(
+        {
+          taskId: delegateId,
+          title: payload.description ?? "Delegated work",
+          description: payload.description ?? "",
+        },
+        envelope.turnId,
+      );
+      return;
+    }
+
+    await this.emitAgentStatus("busy", `Delegate: ${toolNames.join(", ")}`);
+
+    const results: Array<{ tool: string; ok: boolean; stdout?: string; stderr?: string }> = [];
+
+    for (const toolName of toolNames) {
+      const result = await this.executeTool(toolName, payload.args ?? {}, delegateId);
+      results.push({ tool: toolName, ok: result.ok, stdout: result.stdout, stderr: result.stderr });
+    }
+
+    // Respond with delegate_response
+    const allOk = results.every((r) => r.ok);
+    await this.sendCommand({
+      type: "delegate_response",
+      payload: {
+        delegateId,
+        ok: allOk,
+        results,
+      },
+      turnId: envelope.turnId,
+    });
+
+    await this.emitAgentStatus("idle");
+  }
+
+  // ── Periodic repo awareness ────────────────────────────────────────────
+
+  /** Poll git status every interval and emit a summary if changes detected */
+  startRepoHeartbeat(intervalMs = 30_000): void {
+    if (this.heartbeatTimer) return; // already running
+
+    console.log(`[Agent] Repo heartbeat every ${intervalMs / 1000}s`);
+
+    const tick = async () => {
+      try {
+        const statusTool = this.tools.get("git.status");
+        if (!statusTool) return;
+
+        const statusResult = await statusTool.execute({}, { repoRoot: this.repo });
+        const snapshot = statusResult.stdout?.trim() ?? "";
+
+        // Only emit if something changed since last check
+        if (snapshot === this.lastStatusSnapshot) return;
+        this.lastStatusSnapshot = snapshot;
+
+        // Compose a short awareness context
+        const branchTool = this.tools.get("git.branch");
+        let branch = "";
+        if (branchTool) {
+          const br = await branchTool.execute({}, { repoRoot: this.repo });
+          // Extract current branch (line starting with *)
+          const currentLine = br.stdout?.split("\n").find((l: string) => l.startsWith("*"));
+          branch = currentLine?.replace(/^\*\s*/, "").trim() ?? "";
+        }
+
+        const lines = snapshot.split("\n").filter(Boolean);
+        const summary =
+          lines.length === 0
+            ? "Working tree is clean"
+            : `${lines.length} change(s) on ${branch || "unknown branch"}`;
+
+        await this.emitAgentStatus("idle", `[heartbeat] ${summary}`);
+      } catch (err) {
+        // Heartbeat errors are non-fatal
+        console.error("[Agent] Heartbeat error:", err);
+      }
+    };
+
+    // Initial tick after a short delay (let WS connect first)
+    setTimeout(() => tick(), 5000);
+    this.heartbeatTimer = setInterval(tick, intervalMs);
+  }
+
   // ── Connect to server via WebSocket ───────────────────────────────────
 
   connect(): void {
@@ -395,6 +513,7 @@ class LocalAgent {
     this.ws.onopen = () => {
       console.log(`[Agent] Connected to session ${this.sessionId}`);
       this.emitAgentStatus("idle", "Agent started");
+      this.startRepoHeartbeat();
     };
 
     this.ws.onmessage = (event) => {

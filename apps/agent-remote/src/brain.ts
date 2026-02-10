@@ -16,7 +16,58 @@ const MAX_JOBS_PER_TASK = 5;
 const MAX_TITLE_LEN = 80;
 const MAX_DESC_LEN = 500;
 const MAX_ASSISTANT_MSG_LEN = 4000;
-const ALLOWED_JOB_KINDS = new Set(["bun.test", "bun.lint", "git.status"]);
+const ALLOWED_JOB_KINDS = new Set([
+  "bun.test",
+  "bun.lint",
+  "git.status",
+  "git.diff",
+  "git.log",
+  "git.branch",
+  "file.read",
+  "file.search",
+  "file.list",
+  "ci.status",
+  "project.summary",
+]);
+
+/** Best-effort normalization for LLM outputs that are close but not exact */
+function normalizeJobKind(raw: string): string | null {
+  // Exact match first
+  if (ALLOWED_JOB_KINDS.has(raw)) return raw;
+
+  // Case-insensitive exact match
+  const lower = raw.toLowerCase().trim();
+  for (const k of ALLOWED_JOB_KINDS) {
+    if (k === lower) return k;
+  }
+
+  // Common LLM mistakes: "Git" → "git.status", "git_status" → "git.status",
+  // "gitStatus" → "git.status", "test" → "bun.test", etc.
+  const normalized = lower.replace(/[_\s]/g, ".");
+  if (ALLOWED_JOB_KINDS.has(normalized)) return normalized;
+
+  // Keyword heuristic for single-word outputs
+  const KEYWORD_MAP: Record<string, string> = {
+    git: "git.status",
+    status: "git.status",
+    diff: "git.diff",
+    log: "git.log",
+    branch: "git.branch",
+    test: "bun.test",
+    tests: "bun.test",
+    lint: "bun.lint",
+    read: "file.read",
+    search: "file.search",
+    list: "file.list",
+    files: "file.list",
+    ci: "ci.status",
+    summary: "project.summary",
+    overview: "project.summary",
+  };
+  if (KEYWORD_MAP[lower]) return KEYWORD_MAP[lower];
+
+  return null;
+}
 
 // ─── Output types ───────────────────────────────────────────────────────────
 
@@ -40,6 +91,7 @@ export interface BrainOutput {
 // ─── System prompt ──────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are PushPals agent-remote — an AI assistant embedded in a developer workflow system.
+The local agent specializes in repo-level work: git operations, testing, CI/CD, code reading, and project-management style status reporting.
 
 You receive the user's message and optional recent session context.
 
@@ -52,16 +104,32 @@ You MUST respond with a JSON object matching this schema:
       "title": "string — short task title",
       "description": "string — what the task does",
       "jobs": [
-        { "kind": "string — job kind (bun.test, bun.lint, git.status)", "params": {} }
+        { "kind": "string — one of the available job kinds", "params": {} }
       ]
     }
   ]
 }
 
+The ONLY valid job kind values are (use these EXACT strings):
+  "git.status"
+  "git.diff"
+  "git.log"
+  "git.branch"
+  "bun.test"
+  "bun.lint"
+  "file.read"  (params: {"path": "relative/path"})
+  "file.search" (params: {"pattern": "search term"})
+  "file.list"
+  "ci.status"
+  "project.summary"
+
 Guidelines:
 - For simple greetings or questions, respond with just assistant_message (no tasks).
-- For actionable requests like "run tests", "lint the code", "check git status", create appropriate tasks with jobs.
-- Available job kinds: bun.test, bun.lint, git.status
+- For actionable requests like "run tests", "lint the code", "check git status", create tasks with jobs using the EXACT kind strings above.
+- For status/overview requests, use "project.summary" or combine "git.log" + "git.status".
+- For branch management questions, use "git.branch".
+- For CI/CD inquiries, use "ci.status".
+- The kind field MUST be one of the exact strings listed above. Do NOT use category names like "Git" or "Quality".
 - Generate short unique taskId values like "t-abc123".
 - Keep assistant_message concise and helpful.
 - Always respond with valid JSON. No markdown, no code fences.`;
@@ -126,11 +194,15 @@ export class AgentBrain {
 
           const jobs: ActionJobSpec[] = [];
           for (const j of (t.jobs ?? []).slice(0, MAX_JOBS_PER_TASK)) {
-            if (!ALLOWED_JOB_KINDS.has(j.kind)) {
+            const resolved = normalizeJobKind(j.kind);
+            if (!resolved) {
               console.warn(`[Brain] Ignoring unknown job kind: ${j.kind}`);
               continue;
             }
-            jobs.push({ kind: j.kind, params: j.params ?? {} });
+            if (resolved !== j.kind) {
+              console.log(`[Brain] Normalized job kind: "${j.kind}" → "${resolved}"`);
+            }
+            jobs.push({ kind: resolved, params: j.params ?? {} });
           }
 
           if (jobs.length === 0) continue; // no valid jobs → skip task

@@ -19,6 +19,10 @@ import {
 import { TasksJobsLogs } from "../src/lib/TasksJobsLogs";
 import type { EventEnvelope, EventType } from "protocol/browser";
 
+// ─── "Show more" threshold ──────────────────────────────────────────────────
+/** Messages with a `---` separator get collapsed; otherwise fall back to char limit */
+const COLLAPSE_CHAR_THRESHOLD = 200;
+
 const uuidv4 = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 
 const DEFAULT_BASE = process.env.EXPO_PUBLIC_PUSHPALS_URL ?? "http://localhost:3001";
@@ -151,6 +155,104 @@ function DiffPreview({ diff, stat }: { diff: string; stat: string }) {
         </ScrollView>
       )}
     </View>
+  );
+}
+
+// ─── Collapsible agent message ───────────────────────────────────────────────
+/**
+ * If the text contains a `---` separator (produced by formatJobResult), shows
+ * only the summary header and a "Show more" toggle to reveal the full output.
+ * Otherwise, if the text exceeds COLLAPSE_CHAR_THRESHOLD, shows the first few
+ * lines as preview.
+ */
+function CollapsibleText({ text, isUser }: { text: string; isUser: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+
+  // Check for the `---` separator from formatJobResult
+  const separatorIdx = text.indexOf("\n---\n");
+
+  if (separatorIdx !== -1) {
+    const summary = text.substring(0, separatorIdx).trim();
+    const body = text.substring(separatorIdx + 5).trim(); // skip \n---\n
+
+    return (
+      <View>
+        {/* Summary — render bold parts via simple **text** parsing */}
+        <MessageTextBlock
+          text={summary}
+          style={[styles.chatText, isUser ? styles.chatTextUser : styles.chatTextAgent]}
+        />
+        {body.length > 0 && (
+          <>
+            <TouchableOpacity onPress={() => setExpanded(!expanded)} style={styles.showMoreBtn}>
+              <Text style={styles.showMoreText}>{expanded ? "Show less" : "Show more"}</Text>
+            </TouchableOpacity>
+            {expanded && (
+              <View style={styles.expandedBody}>
+                <Text
+                  style={[
+                    styles.chatText,
+                    isUser ? styles.chatTextUser : styles.chatTextAgent,
+                    styles.monoText,
+                  ]}
+                >
+                  {body}
+                </Text>
+              </View>
+            )}
+          </>
+        )}
+      </View>
+    );
+  }
+
+  // Fallback: plain long text
+  if (text.length > COLLAPSE_CHAR_THRESHOLD) {
+    const previewLines = text.split("\n").slice(0, 3).join("\n");
+    const preview =
+      previewLines.length < text.length
+        ? previewLines + "\u2026"
+        : text.substring(0, COLLAPSE_CHAR_THRESHOLD) + "\u2026";
+
+    return (
+      <View>
+        <Text style={[styles.chatText, isUser ? styles.chatTextUser : styles.chatTextAgent]}>
+          {expanded ? text : preview}
+        </Text>
+        <TouchableOpacity onPress={() => setExpanded(!expanded)} style={styles.showMoreBtn}>
+          <Text style={styles.showMoreText}>{expanded ? "Show less" : "Show more"}</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // Short message — render inline
+  return (
+    <Text style={[styles.chatText, isUser ? styles.chatTextUser : styles.chatTextAgent]}>
+      {text}
+    </Text>
+  );
+}
+
+/**
+ * Render text with very minimal **bold** support.
+ * Splits on `**...**` markers and renders bold spans.
+ */
+function MessageTextBlock({ text, style }: { text: string; style: any }) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/);
+  return (
+    <Text style={style}>
+      {parts.map((part, i) => {
+        if (part.startsWith("**") && part.endsWith("**")) {
+          return (
+            <Text key={i} style={{ fontWeight: "700" }}>
+              {part.slice(2, -2)}
+            </Text>
+          );
+        }
+        return <Text key={i}>{part}</Text>;
+      })}
+    </Text>
   );
 }
 
@@ -657,11 +759,7 @@ export default function ChatScreen() {
                 style={[styles.chatBubble, isUser ? styles.chatBubbleUser : styles.chatBubbleAgent]}
               >
                 {!isUser && msg.from && <Text style={styles.chatFrom}>{msg.from}</Text>}
-                <Text
-                  style={[styles.chatText, isUser ? styles.chatTextUser : styles.chatTextAgent]}
-                >
-                  {msg.text}
-                </Text>
+                <CollapsibleText text={msg.text} isUser={isUser} />
                 <Text style={styles.chatTs}>{new Date(msg.ts).toLocaleTimeString()}</Text>
               </View>
             );
@@ -1032,5 +1130,27 @@ const styles = StyleSheet.create({
     color: "#94a3b8",
     marginTop: 4,
     alignSelf: "flex-end",
+  },
+
+  // Show more / collapsible
+  showMoreBtn: {
+    marginTop: 6,
+    paddingVertical: 2,
+  },
+  showMoreText: {
+    fontSize: 12,
+    color: "#3b82f6",
+    fontWeight: "600",
+  },
+  expandedBody: {
+    marginTop: 6,
+    backgroundColor: "rgba(0,0,0,0.04)",
+    borderRadius: 6,
+    padding: 8,
+  },
+  monoText: {
+    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
+    fontSize: 12,
+    lineHeight: 18,
   },
 });

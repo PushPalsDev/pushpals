@@ -90,6 +90,53 @@ async function executeJob(
       cmd = ["git", "status", "--porcelain"];
       break;
     }
+    case "git.log": {
+      const count = Math.min(Number(params.count) || 20, 100);
+      cmd = ["git", "log", "--oneline", `--format=%h %s (%an, %ar)`, `-n`, String(count)];
+      if (params.branch) cmd.push(params.branch as string);
+      break;
+    }
+    case "git.branch": {
+      cmd = params.all === true ? ["git", "branch", "-a", "-v"] : ["git", "branch", "-v"];
+      break;
+    }
+    case "git.diff": {
+      cmd = ["git", "diff"];
+      break;
+    }
+    case "file.read": {
+      const filePath = params.path as string;
+      if (!filePath) return { ok: false, summary: "file.read requires a 'path' param" };
+      cmd = ["cat", filePath];
+      break;
+    }
+    case "file.search": {
+      const pattern = params.pattern as string;
+      if (!pattern) return { ok: false, summary: "file.search requires a 'pattern' param" };
+      cmd = ["grep", "-rn", pattern, "."];
+      break;
+    }
+    case "file.list": {
+      cmd = ["git", "ls-tree", "--name-only", "-r", "HEAD"];
+      break;
+    }
+    case "ci.status": {
+      cmd = [
+        "gh",
+        "run",
+        "list",
+        "--limit",
+        "5",
+        "--json",
+        "status,conclusion,name,headBranch,createdAt,url",
+      ];
+      break;
+    }
+    case "project.summary": {
+      // For project.summary, chain a few commands
+      cmd = ["git", "log", "--oneline", "-n", "5"];
+      break;
+    }
     default:
       return { ok: false, summary: `Unknown job kind: ${kind}` };
   }

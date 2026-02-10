@@ -99,12 +99,78 @@ export class LocalHeuristicPlanner implements PlannerModel {
       });
     }
 
+    // ── New repo-awareness heuristics ──
+
+    if (text.includes("log") || text.includes("history") || text.includes("commit")) {
+      tasks.push({
+        title: "View commit history",
+        description: "Show recent commit log",
+        toolsNeeded: ["git.log"],
+        confidence: 0.7,
+      });
+    }
+
+    if (text.includes("branch") || text.includes("branches")) {
+      tasks.push({
+        title: "List branches",
+        description: "Show all branches and current branch",
+        toolsNeeded: ["git.branch"],
+        confidence: 0.8,
+      });
+    }
+
+    if (
+      text.includes("list") ||
+      text.includes("tree") ||
+      text.includes("files") ||
+      text.includes("structure") ||
+      text.includes("directory")
+    ) {
+      tasks.push({
+        title: "List files",
+        description: "Show project file structure",
+        toolsNeeded: ["file.list"],
+        confidence: 0.6,
+      });
+    }
+
+    if (
+      text.includes("ci") ||
+      text.includes("pipeline") ||
+      text.includes("actions") ||
+      text.includes("workflow") ||
+      text.includes("build status") ||
+      text.includes("checks")
+    ) {
+      tasks.push({
+        title: "Check CI status",
+        description: "Check CI/CD pipeline status (GitHub Actions)",
+        toolsNeeded: ["ci.status"],
+        confidence: 0.8,
+      });
+    }
+
+    if (
+      text.includes("summary") ||
+      text.includes("overview") ||
+      text.includes("status report") ||
+      text.includes("project status") ||
+      text.includes("standup")
+    ) {
+      tasks.push({
+        title: "Project summary",
+        description: "Generate a high-level project overview",
+        toolsNeeded: ["project.summary"],
+        confidence: 0.9,
+      });
+    }
+
     // Default: at least scan the repo
     if (tasks.length === 0) {
       tasks.push({
         title: "Analyze request",
         description: `Understand user request: "${input.userText}"`,
-        toolsNeeded: ["git.status", "git.diff"],
+        toolsNeeded: ["git.status", "project.summary"],
         confidence: 0.4,
       });
     }
@@ -138,9 +204,16 @@ export class RemotePlanner implements PlannerModel {
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {
-    const systemPrompt = `You are a task planner for a coding agent. Given the user's request, break it down into concrete tasks that a tool-using agent can execute.
+    const systemPrompt = `You are a task planner for a repo-specialist coding agent. Given the user's request, break it down into concrete tasks that a tool-using agent can execute.
 
-Available tools: git.status, git.diff, git.applyPatch (needs approval), bun.test, bun.lint, file.read, file.search
+The agent specializes in repo-level work: git operations, testing, CI/CD, code reading, and project-management style status reporting.
+
+Available tools:
+  Git:     git.status, git.diff, git.log, git.branch, git.applyPatch (needs approval)
+  Quality: bun.test, bun.lint
+  Files:   file.read, file.search, file.list
+  DevOps:  ci.status
+  Meta:    project.summary
 
 Respond with a JSON object: { "tasks": [{ "title": string, "description": string, "toolsNeeded": string[], "confidence": number }] }`;
 

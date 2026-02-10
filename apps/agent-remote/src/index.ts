@@ -23,6 +23,81 @@ import { IdempotencyStore } from "./idempotency.js";
 import { resolve, join } from "path";
 import { mkdirSync } from "fs";
 
+// ─── Job result formatting ──────────────────────────────────────────────────
+
+/**
+ * Produce a structured result string from a job's raw output.
+ * Returns a one-line summary header followed by `\n---\n` and the full output.
+ * The client splits on the `---` separator to power "Show more".
+ */
+function formatJobResult(kind: string, output: string, ok: boolean): string {
+  const trimmed = output.trim();
+  if (!ok) return `**${kind}** — failed\n---\n${trimmed}`;
+  if (!trimmed) return `**${kind}** — completed (no output)`;
+
+  const lines = trimmed.split("\n");
+
+  let summaryLine: string;
+  switch (kind) {
+    case "git.status": {
+      const modified = lines.filter((l) => /^\s*M\s/.test(l)).length;
+      const untracked = lines.filter((l) => /^\s*\?\?/.test(l)).length;
+      const added = lines.filter((l) => /^\s*A\s/.test(l)).length;
+      const parts: string[] = [];
+      if (modified) parts.push(`${modified} modified`);
+      if (added) parts.push(`${added} added`);
+      if (untracked) parts.push(`${untracked} untracked`);
+      summaryLine = parts.length ? parts.join(", ") : `${lines.length} entries`;
+      break;
+    }
+    case "git.diff": {
+      const statLine = lines.find((l) => /files? changed/.test(l));
+      summaryLine = statLine?.trim() ?? `${lines.length} lines of diff`;
+      break;
+    }
+    case "git.log":
+      summaryLine = `${lines.filter((l) => l.trim().length > 0).length} log lines`;
+      break;
+    case "git.branch": {
+      const branches = lines.filter((l) => l.trim().length > 0);
+      const current = branches
+        .find((l) => l.startsWith("*"))
+        ?.replace(/^\*\s*/, "")
+        .trim();
+      summaryLine = `${branches.length} branch(es)${current ? ` — current: ${current}` : ""}`;
+      break;
+    }
+    case "bun.test": {
+      // Last non-empty line often has pass/fail summary
+      const last = lines.filter((l) => l.trim()).pop();
+      summaryLine = last ?? "tests complete";
+      break;
+    }
+    case "bun.lint": {
+      const issueCount = lines.filter((l) => l.trim().length > 0).length;
+      summaryLine = issueCount <= 1 ? "No lint issues" : `${issueCount} lines of output`;
+      break;
+    }
+    case "file.list":
+      summaryLine = `${lines.length} entries`;
+      break;
+    case "file.read":
+      summaryLine = `${lines.length} lines`;
+      break;
+    case "ci.status":
+      summaryLine = lines[0] ?? "CI status retrieved";
+      break;
+    case "project.summary":
+      summaryLine = "Project overview";
+      break;
+    default:
+      summaryLine = `${kind} completed`;
+      break;
+  }
+
+  return `**${kind}** — ${summaryLine}\n---\n${trimmed}`;
+}
+
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 function parseArgs(): {
@@ -72,6 +147,12 @@ class RemoteOrchestrator {
   private taskJobs = new Map<string, Set<string>>();
   /** jobId → taskId */
   private jobToTask = new Map<string, string>();
+  /** taskId → turnId (for sending assistant_message on completion) */
+  private taskTurnId = new Map<string, string>();
+  /** taskId → collected job results */
+  private taskResults = new Map<string, Array<{ kind: string; ok: boolean; output: string }>>();
+  /** jobId → job kind */
+  private jobKind = new Map<string, string>();
 
   /** AI brain — produces assistant messages + optional action plans */
   private brain: AgentBrain;
@@ -231,6 +312,7 @@ class RemoteOrchestrator {
 
           jobIds.add(jobId);
           this.jobToTask.set(jobId, taskId);
+          this.jobKind.set(jobId, jobSpec.kind);
 
           await this.sendCommand({
             type: "job_enqueued",
@@ -247,6 +329,8 @@ class RemoteOrchestrator {
           });
         } else {
           this.taskJobs.set(taskId, jobIds);
+          this.taskTurnId.set(taskId, turnId);
+          this.taskResults.set(taskId, []);
           console.log(
             `[Orchestrator] Task ${taskId}: enqueued ${jobIds.size} job(s) — ${actionTask.jobs.map((j) => j.kind).join(", ")}`,
           );
@@ -259,11 +343,23 @@ class RemoteOrchestrator {
 
   /** A job finished successfully */
   private async handleJobCompleted(envelope: EventEnvelope): Promise<void> {
-    const { jobId, summary } = envelope.payload as { jobId: string; summary?: string };
+    const { jobId, summary, artifacts } = envelope.payload as {
+      jobId: string;
+      summary?: string;
+      artifacts?: Array<{ kind: string; text?: string }>;
+    };
     const taskId = this.jobToTask.get(jobId);
     if (!taskId) return; // not our job
 
+    const kind = this.jobKind.get(jobId) ?? "unknown";
     this.jobToTask.delete(jobId);
+    this.jobKind.delete(jobId);
+
+    // Collect result output — format with summary header
+    const rawOutput = artifacts?.find((a) => a.kind === "log")?.text ?? summary ?? "";
+    const formatted = formatJobResult(kind, rawOutput, true);
+    this.taskResults.get(taskId)?.push({ kind, ok: true, output: formatted });
+
     const pending = this.taskJobs.get(taskId);
     if (!pending) return;
 
@@ -281,8 +377,13 @@ class RemoteOrchestrator {
       return;
     }
 
-    // All jobs for this task are done
+    // All jobs for this task are done — send results back to user
     this.taskJobs.delete(taskId);
+    const turnId = this.taskTurnId.get(taskId);
+    this.taskTurnId.delete(taskId);
+    const results = this.taskResults.get(taskId) ?? [];
+    this.taskResults.delete(taskId);
+
     await this.sendCommand({
       type: "task_completed",
       payload: {
@@ -290,24 +391,51 @@ class RemoteOrchestrator {
         summary: summary ?? "All jobs completed successfully.",
       },
     });
-    console.log(`[Orchestrator] Task ${taskId} completed.`);
+
+    // Compose an assistant_message with the collected formatted output
+    const resultText = results
+      .map((r) => r.output.trim() || `**${r.kind}** — (no output)`)
+      .join("\n\n");
+
+    const msg = resultText || "Tasks completed with no output.";
+    await this.sendCommand({
+      type: "assistant_message",
+      payload: { text: msg },
+      turnId,
+    });
+    this.pushContext(`[assistant] ${msg}`);
+
+    console.log(`[Orchestrator] Task ${taskId} completed — results sent to user.`);
   }
 
   /** A job failed */
   private async handleJobFailed(envelope: EventEnvelope): Promise<void> {
-    const { jobId, message: errMsg } = envelope.payload as {
+    const {
+      jobId,
+      message: errMsg,
+      detail,
+    } = envelope.payload as {
       jobId: string;
       message: string;
+      detail?: string;
     };
     const taskId = this.jobToTask.get(jobId);
     if (!taskId) return;
 
+    const kind = this.jobKind.get(jobId) ?? "unknown";
+    const turnId = this.taskTurnId.get(taskId);
+
     // Clean up all remaining jobs for this task
     const pending = this.taskJobs.get(taskId);
     if (pending) {
-      for (const jid of pending) this.jobToTask.delete(jid);
+      for (const jid of pending) {
+        this.jobToTask.delete(jid);
+        this.jobKind.delete(jid);
+      }
       this.taskJobs.delete(taskId);
     }
+    this.taskTurnId.delete(taskId);
+    this.taskResults.delete(taskId);
 
     await this.sendCommand({
       type: "task_failed",
@@ -316,6 +444,16 @@ class RemoteOrchestrator {
         message: errMsg ?? `Job ${jobId} failed`,
       },
     });
+
+    // Send failure as assistant_message so the user sees it
+    const failMsg = formatJobResult(kind, `${errMsg}${detail ? `\n${detail}` : ""}`, false);
+    await this.sendCommand({
+      type: "assistant_message",
+      payload: { text: failMsg },
+      turnId,
+    });
+    this.pushContext(`[assistant] ${failMsg}`);
+
     console.log(`[Orchestrator] Task ${taskId} failed (job ${jobId}).`);
   }
 

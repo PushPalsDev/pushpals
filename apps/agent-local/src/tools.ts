@@ -196,6 +196,205 @@ const fileSearch: ToolDefinition = {
   },
 };
 
+// ─── New repo-awareness tools ───────────────────────────────────────────────
+
+const gitLog: ToolDefinition = {
+  name: "git.log",
+  description: "Show recent commit history",
+  requiresApproval: false,
+  timeout: 10_000,
+  async execute(args, ctx) {
+    const count = Math.min(Number(args.count) || 20, 100);
+    const format = (args.format as string) || "%h %s (%an, %ar)";
+    const cmd = ["git", "log", `--oneline`, `--format=${format}`, `-n`, String(count)];
+    if (args.branch) cmd.push(args.branch as string);
+    const r = await safeExec(cmd, ctx.repoRoot, this.timeout);
+    return { ok: r.exitCode === 0, stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode };
+  },
+};
+
+const gitBranch: ToolDefinition = {
+  name: "git.branch",
+  description: "List branches and show current branch",
+  requiresApproval: false,
+  timeout: 10_000,
+  async execute(args, ctx) {
+    const showAll = args.all === true;
+    const cmd = showAll ? ["git", "branch", "-a", "-v"] : ["git", "branch", "-v"];
+    const r = await safeExec(cmd, ctx.repoRoot, this.timeout);
+    return { ok: r.exitCode === 0, stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode };
+  },
+};
+
+const fileList: ToolDefinition = {
+  name: "file.list",
+  description: "List files/directories at a path (defaults to repo root)",
+  requiresApproval: false,
+  timeout: 10_000,
+  async execute(args, ctx) {
+    const targetPath = args.path as string | undefined;
+    const dir = targetPath ? sanitizePath(ctx.repoRoot, targetPath) : ctx.repoRoot;
+    const maxDepth = Math.min(Number(args.depth) || 2, 5);
+
+    // Use git ls-tree for tracked files, or fall back to find
+    try {
+      const treeish = targetPath ? `HEAD:${targetPath}` : "HEAD";
+      const cmd = ["git", "ls-tree", "--name-only", "-r", treeish];
+      const r = await safeExec(cmd, ctx.repoRoot, this.timeout);
+      if (r.exitCode === 0) {
+        // Limit output lines
+        const lines = r.stdout.split("\n").filter(Boolean);
+        const limited = lines.slice(0, 200);
+        const output =
+          limited.join("\n") + (lines.length > 200 ? `\n… (${lines.length - 200} more)` : "");
+        return { ok: true, stdout: output, exitCode: 0 };
+      }
+    } catch (_e) {}
+
+    // Fallback: simple directory listing
+    const { readdirSync, statSync } = await import("fs");
+    const { join, relative } = await import("path");
+
+    function walk(d: string, depth: number): string[] {
+      if (depth <= 0) return [];
+      const entries: string[] = [];
+      try {
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+          if (e.name.startsWith(".") || e.name === "node_modules") continue;
+          const full = join(d, e.name);
+          const rel = relative(ctx.repoRoot, full);
+          if (e.isDirectory()) {
+            entries.push(rel + "/");
+            entries.push(...walk(full, depth - 1));
+          } else {
+            entries.push(rel);
+          }
+        }
+      } catch (_e) {}
+      return entries;
+    }
+
+    const files = walk(dir, maxDepth).slice(0, 300);
+    return {
+      ok: true,
+      stdout: files.join("\n") + (files.length >= 300 ? "\n… (truncated)" : ""),
+      exitCode: 0,
+    };
+  },
+};
+
+const ciStatus: ToolDefinition = {
+  name: "ci.status",
+  description: "Check GitHub Actions CI status for the current branch or a commit",
+  requiresApproval: false,
+  timeout: 15_000,
+  async execute(args, ctx) {
+    // Try `gh` CLI first (GitHub CLI)
+    const ref = (args.ref as string) || "HEAD";
+    try {
+      const cmd = [
+        "gh",
+        "run",
+        "list",
+        "--limit",
+        "5",
+        "--json",
+        "status,conclusion,name,headBranch,createdAt,url",
+      ];
+      const r = await safeExec(cmd, ctx.repoRoot, this.timeout);
+      if (r.exitCode === 0) {
+        return { ok: true, stdout: r.stdout, exitCode: 0 };
+      }
+    } catch (_e) {}
+
+    // Fallback: try gh api for check runs on ref
+    try {
+      const cmd = [
+        "gh",
+        "api",
+        `repos/{owner}/{repo}/commits/${ref}/check-runs`,
+        "--jq",
+        ".check_runs[] | {name, status, conclusion, started_at}",
+      ];
+      const r = await safeExec(cmd, ctx.repoRoot, this.timeout);
+      if (r.exitCode === 0) {
+        return { ok: true, stdout: r.stdout || "(no check runs found)", exitCode: 0 };
+      }
+      return {
+        ok: false,
+        stderr: r.stderr || "gh CLI not available or not authenticated",
+        exitCode: r.exitCode,
+      };
+    } catch (_e) {
+      return {
+        ok: false,
+        stderr:
+          "GitHub CLI (gh) not installed or not authenticated. Install from https://cli.github.com",
+        exitCode: 1,
+      };
+    }
+  },
+};
+
+const projectSummary: ToolDefinition = {
+  name: "project.summary",
+  description: "Generate a high-level project overview: languages, structure, recent activity",
+  requiresApproval: false,
+  timeout: 20_000,
+  async execute(_args, ctx) {
+    const sections: string[] = [];
+
+    // 1. Current branch
+    const branch = await safeExec(["git", "rev-parse", "--abbrev-ref", "HEAD"], ctx.repoRoot, 5000);
+    if (branch.exitCode === 0) sections.push(`Branch: ${branch.stdout.trim()}`);
+
+    // 2. Recent commits (last 5)
+    const log = await safeExec(
+      ["git", "log", "--oneline", "-n", "5", "--format=%h %s (%ar)"],
+      ctx.repoRoot,
+      5000,
+    );
+    if (log.exitCode === 0) sections.push(`Recent commits:\n${log.stdout.trim()}`);
+
+    // 3. Working tree status
+    const status = await safeExec(["git", "status", "--porcelain"], ctx.repoRoot, 5000);
+    if (status.exitCode === 0) {
+      const lines = status.stdout.trim().split("\n").filter(Boolean);
+      sections.push(
+        lines.length === 0
+          ? "Working tree: clean"
+          : `Working tree: ${lines.length} changed file(s)\n${lines.slice(0, 10).join("\n")}${lines.length > 10 ? "\n…" : ""}`,
+      );
+    }
+
+    // 4. Package info (if package.json exists)
+    try {
+      const { readFileSync } = await import("fs");
+      const pkg = JSON.parse(readFileSync(resolve(ctx.repoRoot, "package.json"), "utf-8"));
+      const info = [`Name: ${pkg.name ?? "(unnamed)"}`, `Version: ${pkg.version ?? "?"}`];
+      if (pkg.workspaces) info.push(`Workspaces: ${JSON.stringify(pkg.workspaces)}`);
+      const depCount = Object.keys(pkg.dependencies ?? {}).length;
+      const devDepCount = Object.keys(pkg.devDependencies ?? {}).length;
+      info.push(`Dependencies: ${depCount} prod, ${devDepCount} dev`);
+      sections.push(info.join("\n"));
+    } catch (_e) {
+      sections.push("(no package.json found)");
+    }
+
+    // 5. Top-level directory structure
+    try {
+      const { readdirSync } = await import("fs");
+      const entries = readdirSync(ctx.repoRoot, { withFileTypes: true })
+        .filter((e) => !e.name.startsWith(".") && e.name !== "node_modules")
+        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+        .slice(0, 30);
+      sections.push(`Structure:\n${entries.join("\n")}`);
+    } catch (_e) {}
+
+    return { ok: true, stdout: sections.join("\n\n"), exitCode: 0 };
+  },
+};
+
 // ─── Tool registry ──────────────────────────────────────────────────────────
 
 export class ToolRegistry {
@@ -203,7 +402,20 @@ export class ToolRegistry {
 
   constructor() {
     // Register default tools
-    for (const t of [gitStatus, gitDiff, gitApplyPatch, bunTest, bunLint, fileRead, fileSearch]) {
+    for (const t of [
+      gitStatus,
+      gitDiff,
+      gitApplyPatch,
+      gitLog,
+      gitBranch,
+      bunTest,
+      bunLint,
+      fileRead,
+      fileSearch,
+      fileList,
+      ciStatus,
+      projectSummary,
+    ]) {
       this.tools.set(t.name, t);
     }
   }
