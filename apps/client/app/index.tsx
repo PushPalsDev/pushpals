@@ -493,8 +493,11 @@ function TaskStrip({ tasks }: { tasks: { taskId: string; title: string; status: 
 export default function ChatScreen() {
   const session = usePushPalsSession(DEFAULT_BASE);
   const [input, setInput] = useState("");
-  const [activeTab, setActiveTab] = useState<"events" | "tasks">("events");
+  const [activeTab, setActiveTab] = useState<"messages" | "events" | "tasks">("messages");
   const flatRef = useRef<FlatList<SessionEvent> | null>(null);
+  const messagesEndRef = useRef<ScrollView | null>(null);
+  const inputRef = useRef<TextInput | null>(null);
+  const handleSendRef = useRef<() => void>(() => {});
 
   const handleSend = async () => {
     const text = input.trim();
@@ -506,6 +509,7 @@ export default function ChatScreen() {
       // error events will arrive via the stream
     }
   };
+  handleSendRef.current = handleSend;
 
   const handleApprove = useCallback(
     (id: string) => {
@@ -521,8 +525,34 @@ export default function ChatScreen() {
   );
 
   useEffect(() => {
-    flatRef.current?.scrollToEnd({ animated: true });
-  }, [session.filteredEvents.length]);
+    if (activeTab === "events") {
+      flatRef.current?.scrollToEnd({ animated: true });
+    }
+  }, [session.filteredEvents.length, activeTab]);
+
+  // Auto-scroll messages tab
+  useEffect(() => {
+    if (activeTab === "messages") {
+      messagesEndRef.current?.scrollToEnd({ animated: true });
+    }
+  }, [session.state.messages.length, activeTab]);
+
+  // Keyboard shortcut: Alt+Enter (Win/Linux) or Cmd+Enter (Mac)
+  // Attached directly to the input element so it works while focused.
+  useEffect(() => {
+    if (Platform.OS !== "web") return;
+    const el = (inputRef.current as any)?._node ?? (inputRef.current as any);
+    const dom: HTMLElement | null = el instanceof HTMLElement ? el : (el?.getHostNode?.() ?? null);
+    if (!dom) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && (e.altKey || e.metaKey)) {
+        e.preventDefault();
+        handleSendRef.current();
+      }
+    };
+    dom.addEventListener("keydown", onKeyDown);
+    return () => dom.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const renderItem = ({ item }: { item: SessionEvent }) => {
     if (!isEnvelope(item)) {
@@ -578,6 +608,15 @@ export default function ChatScreen() {
       {/* Tab switcher */}
       <View style={styles.tabBar}>
         <TouchableOpacity
+          style={[styles.tab, activeTab === "messages" && styles.tabActive]}
+          onPress={() => setActiveTab("messages")}
+        >
+          <Text style={[styles.tabText, activeTab === "messages" && styles.tabTextActive]}>
+            Messages
+            {session.state.messages.length > 0 ? ` (${session.state.messages.length})` : ""}
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
           style={[styles.tab, activeTab === "events" && styles.tabActive]}
           onPress={() => setActiveTab("events")}
         >
@@ -596,8 +635,39 @@ export default function ChatScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* Content: Events list or Tasks+Jobs+Logs panel */}
-      {activeTab === "events" ? (
+      {/* Content */}
+      {activeTab === "messages" ? (
+        <ScrollView
+          ref={(r) => {
+            messagesEndRef.current = r;
+          }}
+          style={styles.chatScroll}
+          contentContainerStyle={styles.chatContent}
+        >
+          {session.state.messages.length === 0 && (
+            <View style={styles.emptyChat}>
+              <Text style={styles.emptyChatText}>No messages yet. Say something!</Text>
+            </View>
+          )}
+          {session.state.messages.map((msg) => {
+            const isUser = msg.from === "client";
+            return (
+              <View
+                key={msg.id}
+                style={[styles.chatBubble, isUser ? styles.chatBubbleUser : styles.chatBubbleAgent]}
+              >
+                {!isUser && msg.from && <Text style={styles.chatFrom}>{msg.from}</Text>}
+                <Text
+                  style={[styles.chatText, isUser ? styles.chatTextUser : styles.chatTextAgent]}
+                >
+                  {msg.text}
+                </Text>
+                <Text style={styles.chatTs}>{new Date(msg.ts).toLocaleTimeString()}</Text>
+              </View>
+            );
+          })}
+        </ScrollView>
+      ) : activeTab === "events" ? (
         <FlatList
           ref={(r) => {
             flatRef.current = r;
@@ -614,6 +684,7 @@ export default function ChatScreen() {
       {/* Composer */}
       <View style={styles.composerRow}>
         <TextInput
+          ref={inputRef}
           style={styles.input}
           placeholder="Type a message..."
           value={input}
@@ -919,4 +990,47 @@ const styles = StyleSheet.create({
   },
   sendDisabled: { opacity: 0.4 },
   sendText: { color: "#fff", fontWeight: "600" },
+
+  // Chat messages tab
+  chatScroll: { flex: 1, backgroundColor: "#f8fafc" },
+  chatContent: { padding: 12, paddingBottom: 8 },
+  emptyChat: { flex: 1, alignItems: "center", justifyContent: "center", paddingTop: 80 },
+  emptyChatText: { fontSize: 14, color: "#94a3b8" },
+  chatBubble: {
+    maxWidth: "75%",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 16,
+    marginBottom: 8,
+  },
+  chatBubbleUser: {
+    alignSelf: "flex-end",
+    backgroundColor: "#3b82f6",
+    borderBottomRightRadius: 4,
+  },
+  chatBubbleAgent: {
+    alignSelf: "flex-start",
+    backgroundColor: "#fff",
+    borderBottomLeftRadius: 4,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  chatFrom: {
+    fontSize: 10,
+    color: "#64748b",
+    fontWeight: "600",
+    marginBottom: 2,
+  },
+  chatText: {
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  chatTextUser: { color: "#fff" },
+  chatTextAgent: { color: "#1e293b" },
+  chatTs: {
+    fontSize: 10,
+    color: "#94a3b8",
+    marginTop: 4,
+    alignSelf: "flex-end",
+  },
 });

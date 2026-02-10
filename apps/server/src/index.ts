@@ -119,7 +119,7 @@ export function createRequestHandler() {
 
             // Replay history from SQLite (cursor-based)
             session.replayHistory((envelope: EventEnvelope, eventId: number) => {
-              const eventData = `id: ${eventId}\nevent: ${envelope.type}\ndata: ${JSON.stringify(envelope)}\n\n`;
+              const eventData = `id: ${eventId}\ndata: ${JSON.stringify(envelope)}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
               } catch (_e) {}
@@ -127,7 +127,7 @@ export function createRequestHandler() {
 
             // Subscribe to live events
             unsubscribe = session.subscribe((envelope: EventEnvelope, eventId: number) => {
-              const eventData = `id: ${eventId}\nevent: ${envelope.type}\ndata: ${JSON.stringify(envelope)}\n\n`;
+              const eventData = `id: ${eventId}\ndata: ${JSON.stringify(envelope)}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
               } catch (err) {

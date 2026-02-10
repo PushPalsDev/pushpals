@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "fs";
+import { resolve, join } from "path";
 
 /**
  * Check configuration — a command to run and its timeout.
@@ -47,7 +48,9 @@ const DEFAULTS: SerialPusherConfig = {
   branchPrefix: "agent/",
   pollIntervalSeconds: 10,
   checks: [],
-  stateDir: "./state",
+  stateDir: process.env.PUSHPALS_DATA_DIR
+    ? join(process.env.PUSHPALS_DATA_DIR, "serial-pusher")
+    : join(resolve(import.meta.dir, "..", "..", ".."), "outputs", "data", "serial-pusher"),
   port: 3002,
   deleteAfterMerge: false,
   maxAttempts: 3,

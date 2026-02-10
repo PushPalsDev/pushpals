@@ -44,7 +44,7 @@ Options:
   -b, --branch <name>       Main branch name (default: main)
       --prefix <prefix>     Agent branch prefix (default: agent/)
   -i, --interval <seconds>  Poll interval in seconds (default: 10)
-      --state-dir <path>    State directory for DB & lock (default: ./state)
+      --state-dir <path>    State directory for DB & lock (default: $PUSHPALS_DATA_DIR/serial-pusher)
       --delete-after-merge  Delete remote branch after merge
       --dry-run             Discover and enqueue only, do not process
       --skip-clean-check    Skip the clean-repo guard (for dev working copies)
@@ -169,8 +169,19 @@ const runner = new JobRunner(config);
 
 // ── HTTP server ─────────────────────────────────────────────────────────────
 
-const server = createStatusServer(db, config.port);
-console.log(`[${ts()}] Status server listening on http://127.0.0.1:${config.port}`);
+let server: ReturnType<typeof createStatusServer> | undefined;
+try {
+  server = createStatusServer(db, config.port);
+  console.log(`[${ts()}] Status server listening on http://127.0.0.1:${config.port}`);
+} catch (err: unknown) {
+  const code = err instanceof Error && "code" in err ? (err as { code: string }).code : undefined;
+  if (code === "EADDRINUSE") {
+    console.error(`[${ts()}] Port ${config.port} already in use — status server disabled.`);
+    console.error(`  TIP: kill the old process or use --port <N> / config "port" to pick another.`);
+  } else {
+    throw err;
+  }
+}
 
 // ─── Poll loop ──────────────────────────────────────────────────────────────
 
@@ -294,7 +305,7 @@ function shutdown(): void {
   if (!running) return;
   running = false;
   console.log(`\n[${ts()}] Shutting down...`);
-  server.stop();
+  server?.stop();
   db.close();
   lock.release();
   console.log(`[${ts()}] Goodbye.`);

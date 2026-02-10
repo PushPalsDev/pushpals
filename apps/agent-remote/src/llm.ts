@@ -159,20 +159,24 @@ export class AnthropicClient implements LLMClient {
 
 export class GenericOpenAIClient extends OpenAIClient {
   private readonly resolvedEndpoint: string;
+  private readonly resolvedModel: string;
 
   constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
     const endpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? "http://localhost:11434";
+    const model = opts?.model ?? process.env.LLM_MODEL ?? "llama3";
     super({
       endpoint,
       apiKey: opts?.apiKey ?? process.env.LLM_API_KEY ?? "ollama",
-      model: opts?.model ?? process.env.LLM_MODEL ?? "llama3",
+      model,
     });
     this.resolvedEndpoint = endpoint;
+    this.resolvedModel = model;
   }
 
-  /** Log resolved endpoint on first use for debuggability */
+  /** Log resolved endpoint + model on first use for debuggability */
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
     console.log(`[LLM] Endpoint: ${this.resolvedEndpoint}/v1/chat/completions`);
+    console.log(`[LLM] Model: ${this.resolvedModel}`);
     // Replace generate with super after first call to avoid repeated logs
     this.generate = super.generate.bind(this);
     return super.generate(input);
