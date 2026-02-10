@@ -20,6 +20,8 @@ import { randomUUID } from "crypto";
 import { createLLMClient } from "./llm.js";
 import { AgentBrain } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
+import { resolve, join } from "path";
+import { mkdirSync } from "fs";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -441,8 +443,12 @@ async function main() {
   const brain = new AgentBrain(llm, { actionsEnabled: true });
 
   // ── Initialise idempotency store ──
-  const idempotency = new IdempotencyStore();
-  console.log("[Orchestrator] Idempotency store initialised");
+  const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
+  const dataDir = process.env.PUSHPALS_DATA_DIR ?? join(PROJECT_ROOT, "outputs", "data");
+  mkdirSync(dataDir, { recursive: true });
+  const dbPath = process.env.AGENT_REMOTE_DB_PATH ?? join(dataDir, "agent-remote-state.db");
+  const idempotency = new IdempotencyStore(dbPath);
+  console.log(`[Orchestrator] Idempotency store: ${dbPath}`);
 
   let sessionId = opts.sessionId;
   if (!sessionId) {

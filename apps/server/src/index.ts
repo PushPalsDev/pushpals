@@ -2,8 +2,17 @@ import { EventEnvelope, PROTOCOL_VERSION } from "protocol";
 import { SessionManager } from "./events.js";
 import { JobQueue } from "./jobs.js";
 import { randomUUID } from "crypto";
+import { resolve, join } from "path";
+import { mkdirSync } from "fs";
 
-const sessionManager = new SessionManager(process.env.PUSHPALS_DB_PATH ?? "pushpals.db");
+// ─── Data directory ─────────────────────────────────────────────────────────
+const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
+const dataDir = process.env.PUSHPALS_DATA_DIR ?? join(PROJECT_ROOT, "outputs", "data");
+mkdirSync(dataDir, { recursive: true });
+
+const sessionManager = new SessionManager(
+  process.env.PUSHPALS_DB_PATH ?? join(dataDir, "pushpals.db"),
+);
 const jobQueue = new JobQueue();
 
 /**
