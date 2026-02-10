@@ -2,17 +2,24 @@
 /**
  * PushPals Remote Orchestrator
  *
- * Lightweight orchestrator (no DB) that maintains in-memory task/job state
- * and uses cursor replay for reconnects. Listens for user `message` events,
- * creates tasks, enqueues jobs (`bun.test`, `bun.lint`) for workers, and
- * closes out tasks when job results arrive.
+ * AI-powered orchestrator that:
+ *   1) Listens for user `message` events via cursor-based WS stream
+ *   2) Runs them through an LLM brain (OpenAI / Anthropic / Ollama)
+ *   3) Emits assistant_message and optionally creates tasks + enqueues jobs
+ *   4) Tracks job lifecycle and closes out tasks when all jobs complete
+ *
+ * Replay-safe: uses IdempotencyStore to avoid re-processing messages on reconnect.
  *
  * Usage:
  *   bun run src/index.ts --server http://localhost:3001 [--sessionId <id>] [--token <auth>]
+ *   Environment: OPENAI_API_KEY | ANTHROPIC_API_KEY | LLM_ENDPOINT (see llm.ts)
  */
 
 import type { EventEnvelope, CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
+import { createLLMClient } from "./llm.js";
+import { AgentBrain } from "./brain.js";
+import { IdempotencyStore } from "./idempotency.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -43,13 +50,6 @@ function parseArgs(): {
   return { server, sessionId, authToken };
 }
 
-// ─── Job-kind descriptor ────────────────────────────────────────────────────
-
-interface JobSpec {
-  kind: string;
-  params: Record<string, unknown>;
-}
-
 // ─── Remote Orchestrator ────────────────────────────────────────────────────
 
 class RemoteOrchestrator {
@@ -71,10 +71,29 @@ class RemoteOrchestrator {
   /** jobId → taskId */
   private jobToTask = new Map<string, string>();
 
-  constructor(opts: { server: string; sessionId: string; authToken: string | null }) {
+  /** AI brain — produces assistant messages + optional action plans */
+  private brain: AgentBrain;
+  /** Durable idempotency store — prevents replay-induced duplicates */
+  private idempotency: IdempotencyStore;
+  /** Recent session context for LLM (bounded ring buffer) */
+  private recentContext: string[] = [];
+  private static readonly MAX_CONTEXT = 20;
+
+  constructor(opts: {
+    server: string;
+    sessionId: string;
+    authToken: string | null;
+    brain: AgentBrain;
+    idempotency: IdempotencyStore;
+  }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
+    this.brain = opts.brain;
+    this.idempotency = opts.idempotency;
+
+    // Restore cursor from durable store
+    this.lastCursor = this.idempotency.getLastCursor(this.sessionId);
   }
 
   // ── HTTP helpers ──────────────────────────────────────────────────────
@@ -135,102 +154,104 @@ class RemoteOrchestrator {
     }
   }
 
-  // ── Keyword parser ────────────────────────────────────────────────────
+  // ── Context tracking ───────────────────────────────────────────────────
 
-  private parseJobSpecs(text: string): JobSpec[] {
-    const lower = text.toLowerCase();
-    const specs: JobSpec[] = [];
-
-    if (lower.includes("test") || lower.includes("spec")) {
-      specs.push({ kind: "bun.test", params: {} });
+  private pushContext(text: string): void {
+    this.recentContext.push(text);
+    if (this.recentContext.length > RemoteOrchestrator.MAX_CONTEXT) {
+      this.recentContext.shift();
     }
-    if (lower.includes("lint") || lower.includes("format") || lower.includes("check")) {
-      specs.push({ kind: "bun.lint", params: {} });
-    }
-
-    return specs;
   }
 
   // ── Event handlers ────────────────────────────────────────────────────
 
-  /** React to a user message: create task, enqueue jobs */
+  /** React to a user message: call brain, emit response + optional tasks/jobs */
   private async handleMessage(envelope: EventEnvelope): Promise<void> {
+    const eventId = envelope.id;
+
+    // ── Idempotency check: skip already-processed messages ──
+    if (this.idempotency.hasHandled(this.sessionId, eventId)) {
+      console.log(`[Orchestrator] Skipping already-handled message ${eventId}`);
+      return;
+    }
+
     const { text } = envelope.payload as { text: string };
     const turnId = envelope.turnId ?? randomUUID();
 
-    const specs = this.parseJobSpecs(text);
+    this.pushContext(`[user] ${text}`);
 
-    if (specs.length === 0) {
-      await this.sendCommand({
-        type: "assistant_message",
-        payload: {
-          text: `I didn't recognise a command in "${text}". Try "run tests" or "lint the code".`,
-        },
-        turnId,
-      });
-      return;
-    }
+    // ── Call the AI brain ──
+    console.log(`[Orchestrator] Thinking about: "${text.substring(0, 80)}"`);
+    const output = await this.brain.think(text, this.recentContext);
 
-    // 1. Acknowledge
+    // 1. Always emit assistant message
     await this.sendCommand({
       type: "assistant_message",
-      payload: { text: `Got it — planning ${specs.map((s) => s.kind).join(", ")}...` },
+      payload: { text: output.assistantMessage },
       turnId,
     });
+    this.pushContext(`[assistant] ${output.assistantMessage}`);
 
-    // 2. Create task
-    const taskId = randomUUID();
-    await this.sendCommand({
-      type: "task_created",
-      payload: {
-        taskId,
-        title: text.length > 80 ? text.substring(0, 80) + "..." : text,
-        description: text,
-        createdBy: `agent:${this.agentId}`,
-      },
-      turnId,
-    });
+    // 2. If brain produced tasks, create them + enqueue their jobs
+    if (output.tasks && output.tasks.length > 0) {
+      for (const actionTask of output.tasks) {
+        const taskId = actionTask.taskId || randomUUID();
 
-    // 3. Mark running
-    await this.sendCommand({
-      type: "task_started",
-      payload: { taskId },
-      turnId,
-    });
+        await this.sendCommand({
+          type: "task_created",
+          payload: {
+            taskId,
+            title: actionTask.title,
+            description: actionTask.description,
+            createdBy: `agent:${this.agentId}`,
+          },
+          turnId,
+        });
 
-    // 4. Enqueue jobs — use server-returned jobId for tracking
-    const jobIds = new Set<string>();
+        await this.sendCommand({
+          type: "task_started",
+          payload: { taskId },
+          turnId,
+        });
 
-    for (const spec of specs) {
-      const jobId = await this.enqueueJob(taskId, spec.kind, spec.params);
-      if (!jobId) {
-        console.error(`[Orchestrator] Failed to enqueue ${spec.kind}, skipping`);
-        continue;
+        // Enqueue each job
+        const jobIds = new Set<string>();
+
+        for (const jobSpec of actionTask.jobs) {
+          const jobId = await this.enqueueJob(taskId, jobSpec.kind, jobSpec.params);
+          if (!jobId) {
+            console.error(`[Orchestrator] Failed to enqueue ${jobSpec.kind}, skipping`);
+            continue;
+          }
+
+          jobIds.add(jobId);
+          this.jobToTask.set(jobId, taskId);
+
+          await this.sendCommand({
+            type: "job_enqueued",
+            payload: { jobId, taskId, kind: jobSpec.kind, params: jobSpec.params },
+            turnId,
+          });
+        }
+
+        if (jobIds.size === 0) {
+          await this.sendCommand({
+            type: "task_failed",
+            payload: { taskId, message: "All job enqueues failed" },
+            turnId,
+          });
+        } else {
+          this.taskJobs.set(taskId, jobIds);
+          console.log(
+            `[Orchestrator] Task ${taskId}: enqueued ${jobIds.size} job(s) — ${actionTask.jobs.map((j) => j.kind).join(", ")}`,
+          );
+        }
       }
-
-      jobIds.add(jobId);
-      this.jobToTask.set(jobId, taskId);
-
-      await this.sendCommand({
-        type: "job_enqueued",
-        payload: { jobId, taskId, kind: spec.kind, params: spec.params },
-        turnId,
-      });
     }
 
-    if (jobIds.size === 0) {
-      await this.sendCommand({
-        type: "task_failed",
-        payload: { taskId, message: "All job enqueues failed" },
-        turnId,
-      });
-      return;
-    }
-
-    this.taskJobs.set(taskId, jobIds);
-    console.log(
-      `[Orchestrator] Task ${taskId}: enqueued ${jobIds.size} job(s) — ${specs.map((s) => s.kind).join(", ")}`,
-    );
+    // ── Mark handled AFTER all commands succeed ──
+    this.idempotency.markHandled(this.sessionId, eventId);
+    console.log(`[Orchestrator] Handled message ${eventId}`);
   }
 
   /** A job finished successfully */
@@ -297,9 +318,12 @@ class RemoteOrchestrator {
 
   // ── Dispatch ──────────────────────────────────────────────────────────
 
-  private async onEvent(envelope: EventEnvelope): Promise<void> {
+  private async onEvent(envelope: EventEnvelope, cursor: number): Promise<void> {
     // Ignore own events to avoid loops
     if (envelope.from === `agent:${this.agentId}`) return;
+
+    // Persist cursor (max-wins)
+    this.idempotency.updateCursor(this.sessionId, cursor);
 
     switch (envelope.type) {
       case "message":
@@ -347,7 +371,7 @@ class RemoteOrchestrator {
         this.lastCursor = Math.max(this.lastCursor, data.cursor);
         // Serialise handling to preserve event ordering
         this.chain = this.chain
-          .then(() => this.onEvent(data.envelope))
+          .then(() => this.onEvent(data.envelope, data.cursor))
           .catch((err) => console.error("[Orchestrator] Handler error:", err));
       } catch (err) {
         console.error("[Orchestrator] Failed to parse WS message:", err);
@@ -410,6 +434,14 @@ async function main() {
   console.log("[Orchestrator] PushPals Remote Orchestrator");
   console.log(`[Orchestrator] Server: ${opts.server}`);
 
+  // ── Initialise LLM + brain ──
+  const llm = createLLMClient();
+  const brain = new AgentBrain(llm, { actionsEnabled: true });
+
+  // ── Initialise idempotency store ──
+  const idempotency = new IdempotencyStore();
+  console.log("[Orchestrator] Idempotency store initialised");
+
   let sessionId = opts.sessionId;
   if (!sessionId) {
     console.log("[Orchestrator] No sessionId provided — creating new session...");
@@ -421,6 +453,8 @@ async function main() {
     server: opts.server,
     sessionId,
     authToken: opts.authToken,
+    brain,
+    idempotency,
   });
 
   orchestrator.connect();

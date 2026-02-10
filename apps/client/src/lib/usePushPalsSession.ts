@@ -17,6 +17,7 @@ import {
   type LogLine,
   type ChatMessage,
 } from "./eventReducer";
+import { getItem, setItem } from "./storage";
 
 // ─── Extended event type that may include local errors ──────────────────────
 export type SessionEvent = EventEnvelope | { type: "_error"; message: string };
@@ -76,32 +77,10 @@ export interface PushPalsSessionActions {
   state: SessionState;
 }
 
-// ─── Cursor persistence helpers ─────────────────────────────────────────────
-function loadCursor(sessionId: string): number {
-  try {
-    if (typeof window !== "undefined" && window.localStorage) {
-      const raw = window.localStorage.getItem(`pushpals:cursor:${sessionId}`);
-      return raw ? Number(raw) || 0 : 0;
-    }
-  } catch (_) {
-    /* SSR or RN without localStorage – ignore */
-  }
-  return 0;
-}
-
-function saveCursor(sessionId: string, cursor: number): void {
-  if (cursor < 1) return; // never persist 0 or negative cursors (#1)
-  try {
-    if (typeof window !== "undefined" && window.localStorage) {
-      const key = `pushpals:cursor:${sessionId}`;
-      const prev = Number(window.localStorage.getItem(key)) || 0;
-      if (cursor > prev) {
-        window.localStorage.setItem(key, String(cursor));
-      }
-    }
-  } catch (_) {
-    /* ignore */
-  }
+// ─── Cursor persistence helpers (web: localStorage, native: AsyncStorage) ───
+async function loadCursor(sessionId: string): Promise<number> {
+  const raw = await getItem(`pushpals:cursor:${sessionId}`);
+  return raw ? Number(raw) || 0 : 0;
 }
 
 /**
@@ -124,6 +103,8 @@ export function usePushPalsSession(
   const [filters, setFilters] = useState<EventFilters>({});
 
   const unsubscribeRef = useRef<(() => void) | null>(null);
+  /** In-memory max-wins guard — authoritative during runtime, avoids async read races */
+  const persistedCursorRef = useRef(0);
 
   // Initialize session on mount
   useEffect(() => {
@@ -145,7 +126,8 @@ export function usePushPalsSession(
         }));
 
         // Restore cursor for reconnect / replay
-        const afterCursor = loadCursor(sessionId);
+        const afterCursor = await loadCursor(sessionId);
+        persistedCursorRef.current = afterCursor;
 
         // Subscribe to events with cursor-aware callback
         const unsubscribe = subscribeEvents(
@@ -161,7 +143,11 @@ export function usePushPalsSession(
             // Feed structured reducer (skip error sentinels)
             if ("id" in event) {
               dispatch({ type: "event", envelope: event as EventEnvelope, cursor });
-              saveCursor(sessionId, cursor);
+              // In-memory max-wins guard — no async storage read per event
+              if (cursor > persistedCursorRef.current) {
+                persistedCursorRef.current = cursor;
+                void setItem(`pushpals:cursor:${sessionId}`, String(cursor));
+              }
             }
           },
           undefined, // transport

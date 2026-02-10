@@ -72,6 +72,10 @@ class LocalAgent {
   private planner: PlannerModel;
   private ws: WebSocket | null = null;
   private pendingApprovals: Map<string, (approved: boolean) => void> = new Map();
+  /** Highest cursor seen — for ?after= reconnect */
+  private lastCursor = 0;
+  /** Serialise event handling for ordering */
+  private chain: Promise<void> = Promise.resolve();
 
   constructor(opts: {
     server: string;
@@ -381,9 +385,10 @@ class LocalAgent {
   connect(): void {
     const protocol = this.server.startsWith("https") ? "wss" : "ws";
     const host = this.server.replace(/^https?:\/\//, "");
-    const wsUrl = `${protocol}://${host}/sessions/${this.sessionId}/ws`;
+    const afterParam = this.lastCursor > 0 ? `?after=${this.lastCursor}` : "";
+    const wsUrl = `${protocol}://${host}/sessions/${this.sessionId}/ws${afterParam}`;
 
-    console.log(`[Agent] Connecting to ${wsUrl}`);
+    console.log(`[Agent] Connecting to ${wsUrl} (cursor=${this.lastCursor})`);
 
     this.ws = new WebSocket(wsUrl);
 
@@ -394,8 +399,15 @@ class LocalAgent {
 
     this.ws.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data as string) as EventEnvelope;
-        this.onEvent(data);
+        // Server sends { envelope, cursor } per PR1 wire format
+        const raw = JSON.parse(event.data as string) as {
+          envelope: EventEnvelope;
+          cursor: number;
+        };
+        this.lastCursor = Math.max(this.lastCursor, raw.cursor);
+        this.chain = this.chain
+          .then(() => this.onEvent(raw.envelope))
+          .catch((err) => console.error("[Agent] Handler error:", err));
       } catch (err) {
         console.error("[Agent] Failed to parse event:", err);
       }

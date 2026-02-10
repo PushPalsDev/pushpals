@@ -77,6 +77,7 @@ export type ReducerAction =
 // ─── Initial state ──────────────────────────────────────────────────────────
 
 const MAX_SEEN_IDS = 5000;
+const MAX_LOG_LINES_PER_JOB = 2000;
 
 export function initialState(): SessionState {
   return {
@@ -151,6 +152,7 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
         const mergedJobIds = Array.from(new Set([...existing.jobIds, ...backfilledJobIds]));
         tasks.set(taskId, {
           ...existing,
+          // "Don't overwrite" — keep existing title unless empty/missing (|| catches "" and undefined)
           title: existing.title || ((p.title as string) ?? taskId),
           description: existing.description ?? (p.description as string | undefined),
           createdBy: existing.createdBy ?? (p.createdBy as string | undefined),
@@ -277,7 +279,10 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
           summary: (p.summary as string) ?? undefined,
         });
       }
-      return { ...state, jobs, lastCursor, seenIds };
+      // Terminal status — free dedup memory (no more logs expected)
+      const logSeenKeys = new Map(state.logSeenKeys);
+      logSeenKeys.delete(jobId);
+      return { ...state, jobs, logSeenKeys, lastCursor, seenIds };
     }
 
     case "job_failed": {
@@ -292,7 +297,10 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
           message: (p.message as string) ?? undefined,
         });
       }
-      return { ...state, jobs, lastCursor, seenIds };
+      // Terminal status — free dedup memory (no more logs expected)
+      const logSeenKeys = new Map(state.logSeenKeys);
+      logSeenKeys.delete(jobId);
+      return { ...state, jobs, logSeenKeys, lastCursor, seenIds };
     }
 
     // ── Streaming logs ────────────────────────────────────────────────────
@@ -322,11 +330,21 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
       };
 
       const logs = new Map(state.logs);
-      logs.set(jobId, [...(logs.get(jobId) ?? []), logLine]);
+      const jobLogs = [...(logs.get(jobId) ?? []), logLine];
 
-      const newJobSeen = new Set(jobSeen);
-      newJobSeen.add(dedupKey);
-      logSeenKeys.set(jobId, newJobSeen);
+      // Cap per-job log lines — drop oldest, rebuild seen keys from survivors
+      if (jobLogs.length > MAX_LOG_LINES_PER_JOB) {
+        const trimmed = jobLogs.slice(-MAX_LOG_LINES_PER_JOB);
+        logs.set(jobId, trimmed);
+        const rebuiltSeen = new Set<string>();
+        for (const l of trimmed) rebuiltSeen.add(`${l.stream}:${l.seq}`);
+        logSeenKeys.set(jobId, rebuiltSeen);
+      } else {
+        logs.set(jobId, jobLogs);
+        const newJobSeen = new Set(jobSeen);
+        newJobSeen.add(dedupKey);
+        logSeenKeys.set(jobId, newJobSeen);
+      }
 
       return { ...state, logs, logSeenKeys, lastCursor, seenIds };
     }
