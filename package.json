@@ -30,6 +30,7 @@
     "agent-remote": "bun run protocol:build && bun run agent-remote:only",
     "dev": "bun run protocol:build && concurrently -n server,client -c blue,green \"bun run server:only\" \"bun run client:only\"",
     "dev:full": "bun run protocol:build && concurrently -n server,agent-local,agent-remote,worker,pusher,client -c blue,magenta,red,yellow,cyan,green \"bun run server:only\" \"bun run agent-local:only\" \"bun run agent-remote:only\" \"bun run worker:only\" \"bun run serial-pusher:only:dev\" \"bun run client:only:offline\"",
+    "start": "bun run dev:full",
     "lint": "bun --cwd apps/client lint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

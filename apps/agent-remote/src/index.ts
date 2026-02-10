@@ -90,6 +90,38 @@ function formatJobResult(kind: string, output: string, ok: boolean): string {
     case "project.summary":
       summaryLine = "Project overview";
       break;
+    case "shell.exec":
+      summaryLine = `${lines.length} lines of output`;
+      break;
+    case "file.write":
+      summaryLine = lines[0] ?? "File written";
+      break;
+    case "file.patch":
+      summaryLine = lines[0] ?? "File patched";
+      break;
+    case "file.rename":
+      summaryLine = lines[0] ?? "File renamed";
+      break;
+    case "file.delete":
+      summaryLine = lines[0] ?? "File deleted";
+      break;
+    case "file.copy":
+      summaryLine = lines[0] ?? "File copied";
+      break;
+    case "file.append":
+      summaryLine = lines[0] ?? "Text appended";
+      break;
+    case "file.mkdir":
+      summaryLine = lines[0] ?? "Directory created";
+      break;
+    case "web.fetch":
+      summaryLine = `Fetched (${trimmed.length} chars)`;
+      break;
+    case "web.search": {
+      const resultCount = lines.filter((l) => /^\d+\./.test(l.trim())).length;
+      summaryLine = resultCount > 0 ? `${resultCount} results` : "Search complete";
+      break;
+    }
     default:
       summaryLine = `${kind} completed`;
       break;

@@ -1,4 +1,16 @@
-import { resolve, normalize, relative } from "path";
+import { resolve, normalize, relative, dirname, join } from "path";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  renameSync,
+  unlinkSync,
+  rmSync,
+  copyFileSync,
+  statSync,
+  appendFileSync,
+} from "fs";
 
 // ─── Tool definition ────────────────────────────────────────────────────────
 
@@ -395,6 +407,316 @@ const projectSummary: ToolDefinition = {
   },
 };
 
+// ─── General-purpose tools ──────────────────────────────────────────────────
+
+const shellExec: ToolDefinition = {
+  name: "shell.exec",
+  description:
+    "Run any shell command in the repo root. Use for anything not covered by other tools.",
+  requiresApproval: true, // ← destructive by default, requires user approval
+  timeout: 60_000,
+  async execute(args, ctx) {
+    const command = args.command as string;
+    if (!command) return { ok: false, stderr: "Missing 'command' argument", exitCode: 1 };
+
+    // Split into shell invocation so pipes, redirects, etc. work
+    const isWindows = process.platform === "win32";
+    const shell = isWindows ? ["cmd", "/c", command] : ["bash", "-c", command];
+    const cwd = (args.cwd as string)
+      ? sanitizePath(ctx.repoRoot, args.cwd as string)
+      : ctx.repoRoot;
+
+    const r = await safeExec(shell, cwd, this.timeout);
+    return { ok: r.exitCode === 0, stdout: r.stdout, stderr: r.stderr, exitCode: r.exitCode };
+  },
+};
+
+const fileWrite: ToolDefinition = {
+  name: "file.write",
+  description: "Create or overwrite a file relative to repo root",
+  requiresApproval: true, // ← destructive, requires approval
+  timeout: 5_000,
+  async execute(args, ctx) {
+    const filePath = args.path as string;
+    const content = args.content as string;
+    if (!filePath) return { ok: false, stderr: "Missing 'path' argument", exitCode: 1 };
+    if (content === undefined || content === null)
+      return { ok: false, stderr: "Missing 'content' argument", exitCode: 1 };
+
+    try {
+      const resolved = sanitizePath(ctx.repoRoot, filePath);
+      // Ensure parent directory exists
+      mkdirSync(dirname(resolved), { recursive: true });
+      writeFileSync(resolved, content, "utf-8");
+      return {
+        ok: true,
+        stdout: `Wrote ${content.length} bytes to ${filePath}`,
+        exitCode: 0,
+      };
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
+const filePatch: ToolDefinition = {
+  name: "file.patch",
+  description: "Apply a text replacement to a file: replace 'oldText' with 'newText'",
+  requiresApproval: true,
+  timeout: 5_000,
+  async execute(args, ctx) {
+    const filePath = args.path as string;
+    const oldText = args.oldText as string;
+    const newText = args.newText as string;
+    if (!filePath) return { ok: false, stderr: "Missing 'path' argument", exitCode: 1 };
+    if (oldText === undefined)
+      return { ok: false, stderr: "Missing 'oldText' argument", exitCode: 1 };
+    if (newText === undefined)
+      return { ok: false, stderr: "Missing 'newText' argument", exitCode: 1 };
+
+    try {
+      const resolved = sanitizePath(ctx.repoRoot, filePath);
+      const current = readFileSync(resolved, "utf-8");
+      if (!current.includes(oldText)) {
+        return { ok: false, stderr: `oldText not found in ${filePath}`, exitCode: 1 };
+      }
+      const updated = current.replace(oldText, newText);
+      writeFileSync(resolved, updated, "utf-8");
+      return {
+        ok: true,
+        stdout: `Patched ${filePath}: replaced ${oldText.length} chars with ${newText.length} chars`,
+        exitCode: 0,
+      };
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
+const fileRename: ToolDefinition = {
+  name: "file.rename",
+  description: "Rename or move a file/directory relative to repo root",
+  requiresApproval: true,
+  timeout: 5_000,
+  async execute(args, ctx) {
+    const from = args.from as string;
+    const to = args.to as string;
+    if (!from) return { ok: false, stderr: "Missing 'from' argument", exitCode: 1 };
+    if (!to) return { ok: false, stderr: "Missing 'to' argument", exitCode: 1 };
+
+    try {
+      const resolvedFrom = sanitizePath(ctx.repoRoot, from);
+      const resolvedTo = sanitizePath(ctx.repoRoot, to);
+      mkdirSync(dirname(resolvedTo), { recursive: true });
+      renameSync(resolvedFrom, resolvedTo);
+      return { ok: true, stdout: `Renamed ${from} → ${to}`, exitCode: 0 };
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
+const fileDelete: ToolDefinition = {
+  name: "file.delete",
+  description: "Delete a file or directory (recursive) relative to repo root",
+  requiresApproval: true,
+  timeout: 5_000,
+  async execute(args, ctx) {
+    const filePath = args.path as string;
+    if (!filePath) return { ok: false, stderr: "Missing 'path' argument", exitCode: 1 };
+
+    try {
+      const resolved = sanitizePath(ctx.repoRoot, filePath);
+      const stat = statSync(resolved);
+      if (stat.isDirectory()) {
+        rmSync(resolved, { recursive: true });
+        return { ok: true, stdout: `Deleted directory ${filePath}`, exitCode: 0 };
+      } else {
+        unlinkSync(resolved);
+        return { ok: true, stdout: `Deleted ${filePath}`, exitCode: 0 };
+      }
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
+const fileCopy: ToolDefinition = {
+  name: "file.copy",
+  description: "Copy a file relative to repo root",
+  requiresApproval: true,
+  timeout: 5_000,
+  async execute(args, ctx) {
+    const from = args.from as string;
+    const to = args.to as string;
+    if (!from) return { ok: false, stderr: "Missing 'from' argument", exitCode: 1 };
+    if (!to) return { ok: false, stderr: "Missing 'to' argument", exitCode: 1 };
+
+    try {
+      const resolvedFrom = sanitizePath(ctx.repoRoot, from);
+      const resolvedTo = sanitizePath(ctx.repoRoot, to);
+      mkdirSync(dirname(resolvedTo), { recursive: true });
+      copyFileSync(resolvedFrom, resolvedTo);
+      return { ok: true, stdout: `Copied ${from} → ${to}`, exitCode: 0 };
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
+const fileAppend: ToolDefinition = {
+  name: "file.append",
+  description: "Append text to the end of a file",
+  requiresApproval: true,
+  timeout: 5_000,
+  async execute(args, ctx) {
+    const filePath = args.path as string;
+    const content = args.content as string;
+    if (!filePath) return { ok: false, stderr: "Missing 'path' argument", exitCode: 1 };
+    if (content === undefined || content === null)
+      return { ok: false, stderr: "Missing 'content' argument", exitCode: 1 };
+
+    try {
+      const resolved = sanitizePath(ctx.repoRoot, filePath);
+      mkdirSync(dirname(resolved), { recursive: true });
+      appendFileSync(resolved, content, "utf-8");
+      return { ok: true, stdout: `Appended ${content.length} bytes to ${filePath}`, exitCode: 0 };
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
+const fileMkdir: ToolDefinition = {
+  name: "file.mkdir",
+  description: "Create a directory (and all parent directories) relative to repo root",
+  requiresApproval: true,
+  timeout: 5_000,
+  async execute(args, ctx) {
+    const dirPath = args.path as string;
+    if (!dirPath) return { ok: false, stderr: "Missing 'path' argument", exitCode: 1 };
+
+    try {
+      const resolved = sanitizePath(ctx.repoRoot, dirPath);
+      mkdirSync(resolved, { recursive: true });
+      return { ok: true, stdout: `Created directory ${dirPath}`, exitCode: 0 };
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
+const webFetch: ToolDefinition = {
+  name: "web.fetch",
+  description: "Fetch the content of a URL and return the response body (text/HTML/JSON)",
+  requiresApproval: false,
+  timeout: 30_000,
+  async execute(args, _ctx) {
+    const url = args.url as string;
+    if (!url) return { ok: false, stderr: "Missing 'url' argument", exitCode: 1 };
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 25_000);
+      const res = await fetch(url, {
+        headers: { "User-Agent": "PushPals/1.0" },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      const contentType = res.headers.get("content-type") ?? "";
+      const body = await res.text();
+
+      // For HTML, strip tags to extract readable text
+      let output: string;
+      if (contentType.includes("html")) {
+        output = body
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+      } else {
+        output = body;
+      }
+
+      return {
+        ok: res.ok,
+        stdout: truncate(output),
+        stderr: res.ok ? undefined : `HTTP ${res.status} ${res.statusText}`,
+        exitCode: res.ok ? 0 : 1,
+      };
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
+const webSearch: ToolDefinition = {
+  name: "web.search",
+  description: "Search the web using DuckDuckGo Lite and return results",
+  requiresApproval: false,
+  timeout: 20_000,
+  async execute(args, _ctx) {
+    const query = args.query as string;
+    if (!query) return { ok: false, stderr: "Missing 'query' argument", exitCode: 1 };
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15_000);
+      const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+      const res = await fetch(url, {
+        headers: { "User-Agent": "PushPals/1.0" },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      const html = await res.text();
+
+      // Extract search result links and snippets from DDG Lite HTML
+      const results: string[] = [];
+      const linkRegex = /<a[^>]+class="result-link"[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>/gi;
+      const snippetRegex = /<td class="result-snippet">([^<]+)<\/td>/gi;
+
+      const links: { url: string; title: string }[] = [];
+      let match;
+      while ((match = linkRegex.exec(html)) !== null) {
+        links.push({ url: match[1], title: match[2].trim() });
+      }
+
+      const snippets: string[] = [];
+      while ((match = snippetRegex.exec(html)) !== null) {
+        snippets.push(match[1].trim());
+      }
+
+      for (let i = 0; i < Math.min(links.length, 10); i++) {
+        const snippet = snippets[i] ? `\n  ${snippets[i]}` : "";
+        results.push(`${i + 1}. ${links[i].title}\n  ${links[i].url}${snippet}`);
+      }
+
+      if (results.length === 0) {
+        // Fallback: extract any links from the page
+        const anyLink = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
+        const fallback: string[] = [];
+        while ((match = anyLink.exec(html)) !== null && fallback.length < 10) {
+          if (!match[1].includes("duckduckgo.com")) {
+            fallback.push(`- ${match[2].trim()}: ${match[1]}`);
+          }
+        }
+        return {
+          ok: true,
+          stdout: fallback.length > 0 ? fallback.join("\n") : "No results found.",
+          exitCode: 0,
+        };
+      }
+
+      return { ok: true, stdout: results.join("\n\n"), exitCode: 0 };
+    } catch (err) {
+      return { ok: false, stderr: String(err), exitCode: 1 };
+    }
+  },
+};
+
 // ─── Tool registry ──────────────────────────────────────────────────────────
 
 export class ToolRegistry {
@@ -413,8 +735,18 @@ export class ToolRegistry {
       fileRead,
       fileSearch,
       fileList,
+      fileWrite,
+      filePatch,
+      fileRename,
+      fileDelete,
+      fileCopy,
+      fileAppend,
+      fileMkdir,
       ciStatus,
       projectSummary,
+      shellExec,
+      webFetch,
+      webSearch,
     ]) {
       this.tools.set(t.name, t);
     }
@@ -434,6 +766,6 @@ export class ToolRegistry {
 
   /** Tools that should be dispatched to the worker queue instead of run locally */
   isHeavy(name: string): boolean {
-    return name === "bun.test" || name === "bun.lint";
+    return name === "bun.test" || name === "bun.lint" || name === "shell.exec";
   }
 }

@@ -165,6 +165,135 @@ export class LocalHeuristicPlanner implements PlannerModel {
       });
     }
 
+    if (
+      text.includes("write") ||
+      text.includes("create file") ||
+      text.includes("new file") ||
+      text.includes("save file")
+    ) {
+      tasks.push({
+        title: "Write file",
+        description: "Create or overwrite a file",
+        toolsNeeded: ["file.write"],
+        confidence: 0.7,
+      });
+    }
+
+    if (
+      text.includes("edit") ||
+      text.includes("modify") ||
+      text.includes("update file") ||
+      text.includes("replace") ||
+      text.includes("patch")
+    ) {
+      tasks.push({
+        title: "Edit file",
+        description: "Apply a targeted text edit to a file",
+        toolsNeeded: ["file.patch"],
+        confidence: 0.7,
+      });
+    }
+
+    if (
+      text.includes("run") ||
+      text.includes("exec") ||
+      text.includes("shell") ||
+      text.includes("command") ||
+      text.includes("install") ||
+      text.includes("npm") ||
+      text.includes("pip") ||
+      text.includes("apt")
+    ) {
+      tasks.push({
+        title: "Run command",
+        description: "Execute a shell command",
+        toolsNeeded: ["shell.exec"],
+        confidence: 0.6,
+      });
+    }
+
+    if (
+      text.includes("fetch") ||
+      text.includes("url") ||
+      text.includes("download") ||
+      text.includes("http") ||
+      text.includes("website") ||
+      text.includes("api")
+    ) {
+      tasks.push({
+        title: "Fetch URL",
+        description: "Fetch content from a URL",
+        toolsNeeded: ["web.fetch"],
+        confidence: 0.7,
+      });
+    }
+
+    if (
+      text.includes("search the web") ||
+      text.includes("look up") ||
+      text.includes("google") ||
+      text.includes("web search") ||
+      text.includes("search online")
+    ) {
+      tasks.push({
+        title: "Web search",
+        description: "Search the web for information",
+        toolsNeeded: ["web.search"],
+        confidence: 0.8,
+      });
+    }
+
+    if (text.includes("rename") || text.includes("move file") || text.includes("mv ")) {
+      tasks.push({
+        title: "Rename / move file",
+        description: "Rename or move a file",
+        toolsNeeded: ["file.rename"],
+        confidence: 0.85,
+      });
+    }
+
+    if (text.includes("delete") || text.includes("remove file") || text.includes("rm ")) {
+      tasks.push({
+        title: "Delete file",
+        description: "Delete a file or directory",
+        toolsNeeded: ["file.delete"],
+        confidence: 0.85,
+      });
+    }
+
+    if (text.includes("copy file") || text.includes("cp ") || text.includes("duplicate")) {
+      tasks.push({
+        title: "Copy file",
+        description: "Copy a file",
+        toolsNeeded: ["file.copy"],
+        confidence: 0.85,
+      });
+    }
+
+    if (text.includes("append")) {
+      tasks.push({
+        title: "Append to file",
+        description: "Append text to a file",
+        toolsNeeded: ["file.append"],
+        confidence: 0.85,
+      });
+    }
+
+    if (
+      text.includes("mkdir") ||
+      text.includes("create dir") ||
+      text.includes("create folder") ||
+      text.includes("new folder") ||
+      text.includes("make dir")
+    ) {
+      tasks.push({
+        title: "Create directory",
+        description: "Create a new directory",
+        toolsNeeded: ["file.mkdir"],
+        confidence: 0.85,
+      });
+    }
+
     // Default: at least scan the repo
     if (tasks.length === 0) {
       tasks.push({
@@ -204,14 +333,16 @@ export class RemotePlanner implements PlannerModel {
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {
-    const systemPrompt = `You are a task planner for a repo-specialist coding agent. Given the user's request, break it down into concrete tasks that a tool-using agent can execute.
+    const systemPrompt = `You are a task planner for a powerful coding agent. Given the user's request, break it down into concrete tasks that a tool-using agent can execute.
 
-The agent specializes in repo-level work: git operations, testing, CI/CD, code reading, and project-management style status reporting.
+The agent can do ANYTHING: run shell commands, read/write/edit files, search the web, manage git, run tests, and more.
 
 Available tools:
   Git:     git.status, git.diff, git.log, git.branch, git.applyPatch (needs approval)
   Quality: bun.test, bun.lint
-  Files:   file.read, file.search, file.list
+  Files:   file.read, file.search, file.list, file.write (needs approval), file.patch (needs approval)
+  Shell:   shell.exec (needs approval) — run ANY command
+  Web:     web.fetch, web.search
   DevOps:  ci.status
   Meta:    project.summary
 

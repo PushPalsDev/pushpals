@@ -137,6 +137,227 @@ async function executeJob(
       cmd = ["git", "log", "--oneline", "-n", "5"];
       break;
     }
+    case "shell.exec": {
+      const command = params.command as string;
+      if (!command) return { ok: false, summary: "shell.exec requires a 'command' param" };
+      const isWindows = process.platform === "win32";
+      cmd = isWindows ? ["cmd", "/c", command] : ["bash", "-c", command];
+      break;
+    }
+    case "file.write": {
+      const filePath = params.path as string;
+      const content = params.content as string;
+      if (!filePath) return { ok: false, summary: "file.write requires a 'path' param" };
+      if (content === undefined)
+        return { ok: false, summary: "file.write requires a 'content' param" };
+      try {
+        const { mkdirSync, writeFileSync } = await import("fs");
+        const { dirname, resolve } = await import("path");
+        const resolved = resolve(repo, filePath);
+        mkdirSync(dirname(resolved), { recursive: true });
+        writeFileSync(resolved, content, "utf-8");
+        return {
+          ok: true,
+          summary: `Wrote ${content.length} bytes to ${filePath}`,
+          stdout: `Wrote ${content.length} bytes to ${filePath}`,
+        };
+      } catch (err) {
+        return { ok: false, summary: `file.write error: ${err}` };
+      }
+    }
+    case "file.patch": {
+      const filePath = params.path as string;
+      const oldText = params.oldText as string;
+      const newText = params.newText as string;
+      if (!filePath) return { ok: false, summary: "file.patch requires a 'path' param" };
+      if (oldText === undefined)
+        return { ok: false, summary: "file.patch requires an 'oldText' param" };
+      if (newText === undefined)
+        return { ok: false, summary: "file.patch requires a 'newText' param" };
+      try {
+        const { readFileSync, writeFileSync } = await import("fs");
+        const { resolve } = await import("path");
+        const resolved = resolve(repo, filePath);
+        const current = readFileSync(resolved, "utf-8");
+        if (!current.includes(oldText)) {
+          return { ok: false, summary: `oldText not found in ${filePath}` };
+        }
+        const updated = current.replace(oldText, newText);
+        writeFileSync(resolved, updated, "utf-8");
+        return {
+          ok: true,
+          summary: `Patched ${filePath}`,
+          stdout: `Replaced ${oldText.length} chars with ${newText.length} chars in ${filePath}`,
+        };
+      } catch (err) {
+        return { ok: false, summary: `file.patch error: ${err}` };
+      }
+    }
+    case "file.rename": {
+      const from = params.from as string;
+      const to = params.to as string;
+      if (!from) return { ok: false, summary: "file.rename requires a 'from' param" };
+      if (!to) return { ok: false, summary: "file.rename requires a 'to' param" };
+      try {
+        const { renameSync, mkdirSync } = await import("fs");
+        const { resolve, dirname } = await import("path");
+        const resolvedFrom = resolve(repo, from);
+        const resolvedTo = resolve(repo, to);
+        mkdirSync(dirname(resolvedTo), { recursive: true });
+        renameSync(resolvedFrom, resolvedTo);
+        return {
+          ok: true,
+          summary: `Renamed ${from} \u2192 ${to}`,
+          stdout: `Renamed ${from} \u2192 ${to}`,
+        };
+      } catch (err) {
+        return { ok: false, summary: `file.rename error: ${err}` };
+      }
+    }
+    case "file.delete": {
+      const filePath = params.path as string;
+      if (!filePath) return { ok: false, summary: "file.delete requires a 'path' param" };
+      try {
+        const { statSync, unlinkSync, rmSync } = await import("fs");
+        const { resolve } = await import("path");
+        const resolved = resolve(repo, filePath);
+        const stat = statSync(resolved);
+        if (stat.isDirectory()) {
+          rmSync(resolved, { recursive: true });
+          return {
+            ok: true,
+            summary: `Deleted directory ${filePath}`,
+            stdout: `Deleted directory ${filePath}`,
+          };
+        } else {
+          unlinkSync(resolved);
+          return { ok: true, summary: `Deleted ${filePath}`, stdout: `Deleted ${filePath}` };
+        }
+      } catch (err) {
+        return { ok: false, summary: `file.delete error: ${err}` };
+      }
+    }
+    case "file.copy": {
+      const from = params.from as string;
+      const to = params.to as string;
+      if (!from) return { ok: false, summary: "file.copy requires a 'from' param" };
+      if (!to) return { ok: false, summary: "file.copy requires a 'to' param" };
+      try {
+        const { copyFileSync, mkdirSync } = await import("fs");
+        const { resolve, dirname } = await import("path");
+        const resolvedFrom = resolve(repo, from);
+        const resolvedTo = resolve(repo, to);
+        mkdirSync(dirname(resolvedTo), { recursive: true });
+        copyFileSync(resolvedFrom, resolvedTo);
+        return {
+          ok: true,
+          summary: `Copied ${from} \u2192 ${to}`,
+          stdout: `Copied ${from} \u2192 ${to}`,
+        };
+      } catch (err) {
+        return { ok: false, summary: `file.copy error: ${err}` };
+      }
+    }
+    case "file.append": {
+      const filePath = params.path as string;
+      const content = params.content as string;
+      if (!filePath) return { ok: false, summary: "file.append requires a 'path' param" };
+      if (content === undefined)
+        return { ok: false, summary: "file.append requires a 'content' param" };
+      try {
+        const { appendFileSync, mkdirSync } = await import("fs");
+        const { resolve, dirname } = await import("path");
+        const resolved = resolve(repo, filePath);
+        mkdirSync(dirname(resolved), { recursive: true });
+        appendFileSync(resolved, content, "utf-8");
+        return {
+          ok: true,
+          summary: `Appended ${content.length} bytes to ${filePath}`,
+          stdout: `Appended ${content.length} bytes to ${filePath}`,
+        };
+      } catch (err) {
+        return { ok: false, summary: `file.append error: ${err}` };
+      }
+    }
+    case "file.mkdir": {
+      const dirPath = params.path as string;
+      if (!dirPath) return { ok: false, summary: "file.mkdir requires a 'path' param" };
+      try {
+        const { mkdirSync } = await import("fs");
+        const { resolve } = await import("path");
+        const resolved = resolve(repo, dirPath);
+        mkdirSync(resolved, { recursive: true });
+        return {
+          ok: true,
+          summary: `Created directory ${dirPath}`,
+          stdout: `Created directory ${dirPath}`,
+        };
+      } catch (err) {
+        return { ok: false, summary: `file.mkdir error: ${err}` };
+      }
+    }
+    case "web.fetch": {
+      const url = params.url as string;
+      if (!url) return { ok: false, summary: "web.fetch requires a 'url' param" };
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 25_000);
+        const res = await fetch(url, {
+          headers: { "User-Agent": "PushPals/1.0" },
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        const body = await res.text();
+        const contentType = res.headers.get("content-type") ?? "";
+        let output = body;
+        if (contentType.includes("html")) {
+          output = body
+            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+        }
+        return {
+          ok: res.ok,
+          summary: res.ok ? `Fetched ${url} (${output.length} chars)` : `HTTP ${res.status}`,
+          stdout: truncate(output),
+        };
+      } catch (err) {
+        return { ok: false, summary: `web.fetch error: ${err}` };
+      }
+    }
+    case "web.search": {
+      const query = params.query as string;
+      if (!query) return { ok: false, summary: "web.search requires a 'query' param" };
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15_000);
+        const searchUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+        const res = await fetch(searchUrl, {
+          headers: { "User-Agent": "PushPals/1.0" },
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        const html = await res.text();
+        // Extract links
+        const linkRegex = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
+        const results: string[] = [];
+        let match;
+        while ((match = linkRegex.exec(html)) !== null && results.length < 10) {
+          if (!match[1].includes("duckduckgo.com")) {
+            results.push(`${results.length + 1}. ${match[2].trim()}\n  ${match[1]}`);
+          }
+        }
+        return {
+          ok: true,
+          summary: `${results.length} search results for "${query}"`,
+          stdout: results.length > 0 ? results.join("\n\n") : "No results found.",
+        };
+      } catch (err) {
+        return { ok: false, summary: `web.search error: ${err}` };
+      }
+    }
     default:
       return { ok: false, summary: `Unknown job kind: ${kind}` };
   }

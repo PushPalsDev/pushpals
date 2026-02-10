@@ -26,8 +26,18 @@ const ALLOWED_JOB_KINDS = new Set([
   "file.read",
   "file.search",
   "file.list",
+  "file.write",
+  "file.patch",
+  "file.rename",
+  "file.delete",
+  "file.copy",
+  "file.append",
+  "file.mkdir",
   "ci.status",
   "project.summary",
+  "shell.exec",
+  "web.fetch",
+  "web.search",
 ]);
 
 /** Best-effort normalization for LLM outputs that are close but not exact */
@@ -60,9 +70,37 @@ function normalizeJobKind(raw: string): string | null {
     search: "file.search",
     list: "file.list",
     files: "file.list",
+    write: "file.write",
+    create: "file.write",
+    patch: "file.patch",
+    edit: "file.patch",
+    modify: "file.patch",
+    rename: "file.rename",
+    move: "file.rename",
+    mv: "file.rename",
+    delete: "file.delete",
+    remove: "file.delete",
+    rm: "file.delete",
+    copy: "file.copy",
+    cp: "file.copy",
+    duplicate: "file.copy",
+    append: "file.append",
+    mkdir: "file.mkdir",
+    directory: "file.mkdir",
     ci: "ci.status",
     summary: "project.summary",
     overview: "project.summary",
+    shell: "shell.exec",
+    exec: "shell.exec",
+    run: "shell.exec",
+    command: "shell.exec",
+    cmd: "shell.exec",
+    fetch: "web.fetch",
+    url: "web.fetch",
+    download: "web.fetch",
+    websearch: "web.search",
+    google: "web.search",
+    lookup: "web.search",
   };
   if (KEYWORD_MAP[lower]) return KEYWORD_MAP[lower];
 
@@ -91,7 +129,7 @@ export interface BrainOutput {
 // ─── System prompt ──────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are PushPals agent-remote — an AI assistant embedded in a developer workflow system.
-The local agent specializes in repo-level work: git operations, testing, CI/CD, code reading, and project-management style status reporting.
+You have full access to the local machine through the local agent. You can run shell commands, read and write files, search the web, and perform any development task the user requests.
 
 You receive the user's message and optional recent session context.
 
@@ -111,25 +149,36 @@ You MUST respond with a JSON object matching this schema:
 }
 
 The ONLY valid job kind values are (use these EXACT strings):
-  "git.status"
-  "git.diff"
-  "git.log"
-  "git.branch"
-  "bun.test"
-  "bun.lint"
-  "file.read"  (params: {"path": "relative/path"})
-  "file.search" (params: {"pattern": "search term"})
-  "file.list"
-  "ci.status"
-  "project.summary"
+  "git.status"                              — show working-tree status
+  "git.diff"                                — show uncommitted diffs
+  "git.log"    (params: {"count": N})       — show recent commits
+  "git.branch"                              — list branches
+  "bun.test"   (params: {"filter": "..."})  — run tests
+  "bun.lint"                                — run linter
+  "file.read"  (params: {"path": "..."})    — read a file
+  "file.search" (params: {"pattern": "..."}) — search code for a pattern
+  "file.list"  (params: {"path": "..."})    — list directory contents
+  "file.write"  (params: {"path": "...", "content": "..."}) — create/overwrite a file
+  "file.patch"  (params: {"path": "...", "oldText": "...", "newText": "..."}) — edit a file
+  "file.rename" (params: {"from": "...", "to": "..."}) — rename or move a file
+  "file.delete" (params: {"path": "..."}) — delete a file or directory
+  "file.copy"   (params: {"from": "...", "to": "..."}) — copy a file
+  "file.append" (params: {"path": "...", "content": "..."}) — append text to a file
+  "file.mkdir"  (params: {"path": "..."}) — create a directory
+  "ci.status"                               — check CI/CD pipeline status
+  "project.summary"                         — generate project overview
+  "shell.exec" (params: {"command": "..."}) — run any shell command
+  "web.fetch"  (params: {"url": "..."})     — fetch content from a URL
+  "web.search" (params: {"query": "..."})   — search the web
 
 Guidelines:
 - For simple greetings or questions, respond with just assistant_message (no tasks).
-- For actionable requests like "run tests", "lint the code", "check git status", create tasks with jobs using the EXACT kind strings above.
-- For status/overview requests, use "project.summary" or combine "git.log" + "git.status".
-- For branch management questions, use "git.branch".
-- For CI/CD inquiries, use "ci.status".
-- The kind field MUST be one of the exact strings listed above. Do NOT use category names like "Git" or "Quality".
+- For actionable requests, create tasks with the appropriate job kinds.
+- You can do ANYTHING the user asks: modify files, run commands, search the web, install packages, etc.
+- For file modifications, prefer "file.write" (whole file) or "file.patch" (targeted edit) over "shell.exec".
+- For complex or multi-step operations, use "shell.exec" with the full command.
+- For web lookups, use "web.search" for queries or "web.fetch" for specific URLs.
+- The kind field MUST be one of the exact strings listed above. Do NOT use category names like "Git" or "Files".
 - Generate short unique taskId values like "t-abc123".
 - Keep assistant_message concise and helpful.
 - Always respond with valid JSON. No markdown, no code fences.`;
