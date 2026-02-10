@@ -2,26 +2,28 @@
 
 **Multi-device, autonomous always-on multi-agent coding — with observability and safety.**
 
-Push Pals™ is a self-hostable "coding team" that lives alongside your repo. You can talk to it from any device (including your phone). It coordinates multiple code-capable agents on a remote server to plan, implement, test, and land changes — **and it keeps working even if your laptop sleeps**.
+Push Pals™ is a self-hostable "coding team" that lives alongside your repo. You can talk to it from any device (including your phone). It coordinates multiple code-capable agents on a server to plan, implement, test, and land changes — **and it keeps working even if your laptop sleeps**.
 
 Instead of one monolithic agent doing everything, Push Pals acts like a tiny engineering org:
 
-- a **Local Buddy** (phone/desktop) that relays chat instantly and keeps you in the loop
-- a **Remote Buddy** (server-side, always-on) that decides what to do next and orchestrates work
-- **Workers** that execute scoped tasks (OpenHands or other tooling)
-- a **serial-pusher** daemon that merges approved work into `main` safely and serially
+- **Client** (mobile/web/desktop) for chat, diffs, logs, artifacts, approvals
+- **Server** (remote) as the event hub + persistence + job queue (SQLite)
+- **Remote Buddy** (`agent-remote`) as the always-on orchestrator
+- **Workers** (`worker`) that execute scoped jobs from the queue
+- **serial-pusher** daemon that merges approved work into `main` safely and serially
+- **Local Buddy** (`agent-local`, optional) that can run local-only tools if you want a "near-repo" agent
 
 ---
 
-## The core idea: Local Buddy never blocks
+## The core idea: chat never blocks
 
-Push Pals is not "turn-based chat."
+Push Pals is not "turn-based chat".
 
-When you send a message, **Local Buddy immediately acknowledges** and forwards it to Remote Buddy. Remote Buddy streams decisions and progress back as events. This makes conversations **multi-speaker, interruptible, and always responsive**.
+When you send a message, the **Client posts it immediately to the Server**. Agents subscribe to the session event stream and respond asynchronously. This makes conversations **multi-speaker, interruptible, and always responsive**.
 
 - chat feels instant
 - you can keep talking while jobs run
-- your laptop can sleep and the system keeps progressing server-side
+- clients can disconnect/reconnect; server history persists
 
 ---
 
@@ -36,18 +38,17 @@ Tell Push Pals what you want:
 - "Refactor the combat module"
 - "Make the build faster"
 
-Push Pals will:
+Typical loop:
 
-1. **Remote Buddy** builds a candidate list of next actions (from repo + runtime signals)
-2. Remote Buddy picks one (or a small batch)
-3. Remote Buddy dispatches scoped work to workers with budgets + stop conditions
-4. Workers implement and run checks
-5. Results come back as **reviewable diffs and artifacts**
-6. If allowed, Remote Buddy lands via **serial-pusher** (or requests approval first)
+1. **Remote Buddy** reads the session + repo/runtime signals
+2. Remote Buddy picks next action(s) and enqueues **scoped jobs**
+3. **Workers** claim jobs and execute (tools, edits, tests)
+4. Results come back as **reviewable diffs + artifacts**
+5. If allowed, Remote Buddy lands via **serial-pusher** (or requests approval first)
 
 ### Improve your codebase continuously
 
-Push Pals can proactively propose improvements based on repo signals:
+Push Pals can proactively propose improvements based on signals:
 
 - failing tests / flaky tests
 - lint/typecheck errors
@@ -65,26 +66,26 @@ You stay in control — changes become reviewable diffs and merge-queued commits
 ### 1) Always-on orchestration (multi-device, sleep-proof)
 
 - Remote Buddy runs server-side and continues work even if your laptop sleeps
-- Server persists sessions, event history, and job state
-- Local Buddy can reconnect from any device and resume instantly
+- Server persists sessions, event history, and job state in SQLite
+- Client can reconnect from any device and resume instantly
 
 ### 2) No "agent thrash"
 
 Only **Remote Buddy** chooses what's next globally.
 
-- **Remote Buddy**: decides priorities and dispatches jobs
-- **Local Buddy**: relays chat + can propose candidate next actions
-- **Workers**: execute assigned tasks only (no global decision-making)
+- Remote Buddy: decides priorities and dispatches jobs
+- Workers: execute assigned jobs only (no global decision-making)
+- Local Buddy (optional): can execute local-only work when explicitly used
 
 ### 3) Security first (no "agent chaos")
 
 Push Pals is built around capabilities and approvals:
 
-- workers run in isolated workspaces/sandboxes
-- commands are allowlisted by default
+- work happens in branches/workspaces/sandboxes
+- commands can be allowlisted
 - secrets are never committed
 - network access can be restricted
-- anything risky triggers a clear approval request
+- risky actions can trigger explicit approval
 
 ### 4) Observability by default
 
@@ -102,97 +103,81 @@ Every run produces an audit trail:
 ## Architecture
 
 ```
-     LOCAL (near you)                          REMOTE (remote & always-on)
-┌─────────────────────────┐               ┌─────────────────────────┐
-│       Client            │               │       Server            │
-│                         │               │                         │
-│                   WS/SSE events + chat + approvals                │
-│                         │◄─────────────►│                         │
-│ (mobile/desktop/web)    │               │ (auth + sessions + hub) │
-│ - chat UI               │               │ - routes events         │
-│ - diffs/logs/artifacts  │               │ - persists session state│
-│ - approvals             │               └───────────┬─────────────┘
-└───────────┬─────────────┘                           │
-            │ (optional local hop)                    │
-            v                                         v
-┌──────────────────────────┐               ┌───────────────────────────┐
-│     Local Buddy (AI)     │               │     Remote Buddy (AI)     │
-│                          │               │                           │
-│                     proposals / status / questions                   │
-│                          │◄─────────────►│                           │
-│ (fast companion daemon)  │               │ (global scheduler/planner)│
-│ - immediate ACK to client│               │ - picks "what's next"     │
-│ - local-only tools       │               │ - dispatches work         │
-│ - proposes next-actions  │               │ - evaluates outcomes      │
-│ - executes assigned work │               │ - retries/abandons        │
-└──────────────────────────┘               └───────────┬───────────────┘
-                                                       │ dispatch tasks
-                                                       v
-                                          ┌─────────────────────────┐
-                                          │       Workers           │
-                                          │ (OpenHands/tool runners)│
-                                          │ - execute scoped tasks  │
-                                          │ - produce branches/diffs│
-                                          │ - report results        │
-                                          └───────────┬─────────────┘
-                                                      │ land changes
-                                                      v
-                                          ┌─────────────────────────┐
-                                          │    serial-pusher        │
-                                          │  (merge queue daemon)   │
-                                          │ - watches agent branches│
-                                          │ - merges serially → main│
-                                          │ - runs checks → pushes  │
-                                          └─────────────────────────┘
+             (mobile/web/desktop)
+
+
+┌────────────────────────────────────────┐
+│                 Client                 │
+│          - chat UI                     │
+│          - diffs/logs/artifacts        │
+│          - approvals                   │
+└───────────────┬────────────────────────┘
+                │ HTTP (post message/commands)
+                │ SSE (subscribe events)
+                v
+┌────────────────────────────────────────┐
+│                 Server                 │
+│          - auth + sessions             │
+│          - event hub (durable history) │
+│          - job queue (SQLite)          │
+└───────────────┬────────────────────────┘
+                │ subscribe session events
+                │
+    ┌──────────┴───────────┐
+    v                      v
+┌─────────────────┐  ┌───────────────────┐
+│  Remote Buddy   │  │   Local Buddy     │
+│ (agent-remote)  │  │ (agent-local, opt)│
+│ - global planner│  │ - local-only tools│
+│ - enqueue jobs  │  │ - optional assist │
+└─────────┬───────┘  └───────────────────┘
+          │ enqueue
+          v
+┌────────────────────────────────────────┐
+│               Workers                  │
+│ (worker; many replicas supported)      │
+│ - claim jobs atomically from SQLite    │
+│ - run tools / edits / tests            │
+│ - report results                       │
+└───────────────┬────────────────────────┘
+                │ land changes
+                v
+┌────────────────────────────────────────┐
+│            serial-pusher               │
+│         (merge queue daemon)           │
+│ - watches agent branches               │
+│ - merges serially → main               │
+│ - runs checks → pushes                 │
+└────────────────────────────────────────┘
 ```
 
-### Responsibilities
+---
 
-**Local Buddy (local client-side AI)**
+## Shared session IDs (important)
 
-- Runs near the client (phone/desktop/laptop)
-- Chat UI + intent shaping
-- Immediate ACK + forward to the Server/Remote Buddy
-- Streams remote events back to the client UI
-- May execute _assigned_ work locally (optional), but does not choose global tasks
+By default, all apps join the same dev session:
 
-**Server (remote event hub + persistence)**
+- `PUSHPALS_SESSION_ID=dev` (agents)
+- `EXPO_PUBLIC_PUSHPALS_SESSION_ID=dev` (Expo client)
 
-- Session state + multi-device message history
-- Durable queues (jobs, outbox/events)
-- Authentication and policy enforcement plumbing
-- Transport: SSE (web) + WebSocket (mobile/desktop)
+`POST /sessions` is **create-or-join**:
 
-**Remote Buddy (remote AI always-on brain)**
+- returns **201** if the session was newly created in SQLite
+- returns **200** if it already existed
+- returns **400** if `sessionId` contains invalid characters or is not 1–64 chars
 
-- Reads repo + runtime signals
-- Builds "candidate next actions"
-- Picks next work item(s) and dispatches to workers
-- Evaluates results (checks + heuristics)
-- If good: lands via serial-pusher (or requests approval)
-
-**Workers (remote AI dedicated workers) **
-
-- Code-capable agents (e.g., OpenHands) and/or tooling
-- Receive a scoped task, produce artifacts, run checks
-- Never push to `main` directly
-
-**serial-pusher (remote git merge queue daemon)**
-
-- Watches for agent branches and merges them serially into `main`
-- Runs configurable checks and safely pushes the result
-- Pins jobs to SHAs to avoid stale merges
+Allowed session IDs: only `[a-zA-Z0-9._-]`, length 1–64.
 
 ---
 
 ## Repo layout (current)
 
-- **`packages/protocol`**: Shared schema definitions, TypeScript types, Ajv validators
-- **`apps/server`**: Bun server — event hub + session state + job queue (SQLite)
-- **`apps/client`**: Expo client (web + mobile) with automatic transport selection
-- **`apps/agent-local`**: Local Buddy daemon — instant relay, optional local execution, approvals UI bridge
-- **`apps/worker`**: Worker daemon — polls job queue, executes heavy tasks
-- **`apps/serial-pusher`**: SQLite-backed merge-queue daemon for safe merges to `main`
+- `apps/server` — Bun server: session hub + event history + job queue (SQLite)
+- `apps/client` — Expo client (web + mobile) using HTTP + SSE
+- `apps/agent-remote` — Remote Buddy: always-on orchestrator
+- `apps/agent-local` — Local Buddy (optional): local execution + helper agent
+- `apps/worker` — Worker daemon: polls job queue, executes tasks
+- `apps/serial-pusher` — merge queue daemon: lands changes safely/serially
 
 ---
 
@@ -200,37 +185,28 @@ Every run produces an audit trail:
 
 ### Chat / coordination (fast path)
 
-1. Client sends a message to Local Buddy
-2. Local Buddy immediately ACKs and forwards it to the Server/Remote Buddy
-3. Remote Buddy emits streaming events (questions, status, decisions)
-4. Local Buddy relays events to the client UI
+1. Client creates or joins a session (`POST /sessions` with optional `sessionId`)
+2. Client subscribes to events (`GET /sessions/:id/events` via SSE)
+3. Client posts messages (`POST /sessions/:id/message`)
+4. Agents observe and emit events/commands back into the session stream
 
 ### Work execution (slow path)
 
-1. Remote Buddy enqueues a job to the Server queue
-2. A Worker claims the job and executes (tool calls, code changes, tests)
-3. Worker publishes artifacts and diffs back through the Server
-4. Remote Buddy evaluates
+1. Remote Buddy enqueues a job (`POST /jobs/enqueue`)
+2. One of many Workers claims the next pending job (`POST /jobs/claim`)
+3. Worker executes work and reports completion (`POST /jobs/:id/complete` or `/fail`)
+4. Remote Buddy evaluates results
 5. If approved: changes land via serial-pusher
 
----
-
-## Safety model (high level)
-
-Push Pals treats a repo like production equipment:
-
-- changes happen on branches/workspaces
-- results come back as diffs + proposed commits
-- push/commit/PR creation can require explicit approval
-- unapproved commands don't run
+> Note: claims are atomic and multi-worker-safe today. There is not yet a "lease/heartbeat" reclaim for stuck claimed jobs.
 
 ---
 
 ## Prerequisites
 
-- **Bun** (`curl -fsSL https://bun.sh/install | bash`)
-- **Node.js** (optional, for dev tools)
-- **Expo CLI** (`bun add -g expo-cli`)
+- Bun
+- Node.js (optional for some tooling)
+- Expo CLI
 
 ---
 
@@ -239,63 +215,37 @@ Push Pals treats a repo like production equipment:
 ```bash
 bun install
 
-# Build protocol (required first time)
-cd packages/protocol && bun run build && cd ../..
-
-# Auth token (used by server, agent-local, worker)
-export PUSHPALS_AUTH_TOKEN=my-secret-token
-
-# Run full stack
+# Run full stack (dev session defaults to "dev")
 bun run dev:full
 ```
 
----
-
-## Dogfood scenario (definition of done)
-
-Use Push Pals to change Push Pals:
-
-1. **Start the stack**: `bun run dev:full`
-2. **Open the UI** at `http://localhost:8081`
-3. **Send a message**: "Run git status on this repo"
-4. **Watch the trace** in the UI:
-   - Local Buddy **ACKs instantly**
-   - Remote Buddy streams `task_created` → `task_started`
-   - `tool_call` (git.status) → `tool_result`
-   - `task_completed` with summary
-   - `agent_status` returns to idle
-5. **Try an approval flow**: "Apply a patch to fix the README"
-   - UI shows **Approve / Deny**
-   - Approve → `approved` event → tool runs → `diff_ready`
-6. **Try the "always-on" path**:
-   - Start a longer task (e.g. "Run tests and fix failures")
-   - Close your laptop / disconnect the client
-   - Reopen later from another device and confirm:
-     - the session history is still there
-     - jobs continued running server-side
-     - results and artifacts are available
-
-Smoke test:
+If you need a custom session:
 
 ```bash
-# Requires server + agent-local running
-PUSHPALS_AUTH_TOKEN=my-secret-token bun run scripts/smoke-test.ts
+export PUSHPALS_SESSION_ID=my-session
+export EXPO_PUBLIC_PUSHPALS_SESSION_ID=my-session
+bun run dev:full
 ```
+
+### Dev scripts notes
+
+- `client:only` = normal Expo startup (online)
+- `client:only:offline` = Expo --offline (used by dev:full)
+- `serial-pusher:only` = strict (requires clean clone)
+- `serial-pusher:only:dev` = runs with --skip-clean-check (used by dev:full)
 
 ---
 
 ## Event types (protocol)
 
-| Category       | Types                                                                            |
-| -------------- | -------------------------------------------------------------------------------- |
-| **Chat**       | `assistant_message`, `log`, `error`, `done`                                      |
-| **Repo**       | `scan_result`, `suggestions`, `diff_ready`, `committed`                          |
-| **Approvals**  | `approval_required`, `approved`, `denied`                                        |
-| **Agent**      | `agent_status`                                                                   |
-| **Tasks**      | `task_created`, `task_started`, `task_progress`, `task_completed`, `task_failed` |
-| **Tools**      | `tool_call`, `tool_result`                                                       |
-| **Delegation** | `delegate_request`, `delegate_response`                                          |
-| **Jobs**       | `job_enqueued`, `job_claimed`, `job_completed`, `job_failed`                     |
+| Category         | Types                                                                            |
+| ---------------- | -------------------------------------------------------------------------------- |
+| **Chat**         | `message`, `assistant_message`, `log`, `error`, `done`                           |
+| **Tasks**        | `task_created`, `task_started`, `task_progress`, `task_completed`, `task_failed` |
+| **Tools**        | `tool_call`, `tool_result`                                                       |
+| **Jobs**         | `job_enqueued`, `job_claimed`, `job_completed`, `job_failed`                     |
+| **Approvals**    | `approval_required`, `approved`, `denied`                                        |
+| **Agent status** | `agent_status`                                                                   |
 
 ---
 
@@ -303,7 +253,7 @@ PUSHPALS_AUTH_TOKEN=my-secret-token bun run scripts/smoke-test.ts
 
 Early-stage / under active development.
 
-If you're interested in contributing, feel free to open a PR. Or get in touch via `push.pals.dev@gmail.com`
+If you're interested in contributing, open a PR or reach out via push.pals.dev@gmail.com.
 
 ---
 
@@ -311,4 +261,4 @@ If you're interested in contributing, feel free to open a PR. Or get in touch vi
 
 **Push Pals™** and the Push Pals logo are trademarks of the project authors.
 
-While the source code of this project is licensed under the **MIT License**, the "Push Pals" name and branding are not included in that license. If you fork this project or use the code in your own product, please use a distinct name to avoid user confusion.
+The source code is licensed under the **MIT License**, but the "Push Pals" name and branding are not included in that license. If you fork this project, please use a distinct name to avoid user confusion.
