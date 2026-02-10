@@ -111,8 +111,9 @@ export class AgentBrain {
       };
 
       const output: BrainOutput = {
-        assistantMessage:
-          (parsed.assistant_message ?? "I received your message but couldn't formulate a response.").slice(0, MAX_ASSISTANT_MSG_LEN),
+        assistantMessage: (
+          parsed.assistant_message ?? "I received your message but couldn't formulate a response."
+        ).slice(0, MAX_ASSISTANT_MSG_LEN),
       };
 
       // Only include tasks if actions are enabled and the model produced them

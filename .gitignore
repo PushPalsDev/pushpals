@@ -147,3 +147,5 @@ packages/protocol/dist/
 
 # api keys
 .env
+.env.*
+!.env.example

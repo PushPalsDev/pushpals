@@ -11,8 +11,10 @@ const jobQueue = new JobQueue();
  */
 
 export function createRequestHandler() {
+  const envPort = parseInt(process.env.PUSHPALS_PORT ?? "", 10);
+  const port = Number.isFinite(envPort) && envPort > 0 ? envPort : 3001;
   return Bun.serve({
-    port: 3001,
+    port,
     hostname: "0.0.0.0",
     idleTimeout: 180, // 3 minutes — SSE/WS connections are long-lived
 
@@ -319,5 +321,6 @@ export { sessionManager, jobQueue };
 
 // If this file is executed directly, start the server.
 if (import.meta.main) {
-  createRequestHandler();
+  const server = createRequestHandler();
+  console.log(`[Server] PushPals listening on ${server.url}`);
 }
