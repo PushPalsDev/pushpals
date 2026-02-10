@@ -202,11 +202,23 @@ export class SessionManager {
     this.store = new EventStore(dbPath);
   }
 
-  createSession(): string {
-    const sessionId = randomUUID();
-    this.store.createSession(sessionId);
-    this.sessions.set(sessionId, new SessionEventBus(sessionId, this.store));
-    return sessionId;
+  private static readonly SESSION_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/;
+
+  /**
+   * Create or join a session.
+   * Returns `{ id, created }` so callers can distinguish 201 vs 200.
+   * Returns `null` id when the caller-supplied sessionId fails validation.
+   */
+  createSession(sessionId?: string): { id: string | null; created: boolean } {
+    if (sessionId && !SessionManager.SESSION_ID_RE.test(sessionId)) {
+      return { id: null, created: false };
+    }
+    const id = sessionId ?? randomUUID();
+    const created = this.store.createSession(id);
+    if (!this.sessions.has(id)) {
+      this.sessions.set(id, new SessionEventBus(id, this.store));
+    }
+    return { id, created };
   }
 
   getSession(sessionId: string): SessionEventBus | null {

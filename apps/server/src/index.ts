@@ -74,10 +74,22 @@ export function createRequestHandler() {
         return makeJson({ ok: true, protocolVersion: PROTOCOL_VERSION });
       }
 
-      // POST /sessions - Create a new session
+      // POST /sessions - Create (or join) a session
       if (pathname === "/sessions" && method === "POST") {
-        const sessionId = sessionManager.createSession();
-        return makeJson({ sessionId, protocolVersion: PROTOCOL_VERSION }, 201);
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const raw = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+        const requestedId = raw.length > 0 ? raw : undefined;
+        const result = sessionManager.createSession(requestedId);
+        if (result.id === null) {
+          return makeJson(
+            { ok: false, message: "Invalid sessionId: must contain only [a-zA-Z0-9._-] and be 1\u201364 chars" },
+            400,
+          );
+        }
+        return makeJson(
+          { sessionId: result.id, protocolVersion: PROTOCOL_VERSION },
+          result.created ? 201 : 200,
+        );
       }
 
       // GET /sessions/:id/events - SSE endpoint (supports ?after=<cursor> for replay)

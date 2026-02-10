@@ -19,6 +19,10 @@ import {
 } from "./eventReducer";
 import { getItem, setItem } from "./storage";
 
+// Metro compile-time replaces EXPO_PUBLIC_* — falls back to "dev" so all apps
+// share the same session out of the box with zero config.
+const DEFAULT_SESSION_ID = process.env.EXPO_PUBLIC_PUSHPALS_SESSION_ID ?? "dev";
+
 // ─── Extended event type that may include local errors ──────────────────────
 export type SessionEvent = EventEnvelope | { type: "_error"; message: string };
 
@@ -110,7 +114,7 @@ export function usePushPalsSession(
   useEffect(() => {
     const init = async () => {
       try {
-        const sessionId = await createSession(baseUrl);
+        const sessionId = await createSession(baseUrl, DEFAULT_SESSION_ID);
         if (!sessionId) {
           setSession((s) => ({
             ...s,

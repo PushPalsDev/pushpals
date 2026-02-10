@@ -32,7 +32,7 @@ function parseArgs(): {
 } {
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
-  let sessionId: string | null = null;
+  let sessionId: string | null = process.env.PUSHPALS_SESSION_ID ?? "dev";
   let repo = process.cwd();
   let planner: "local" | "remote" = "local";
   let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
@@ -428,6 +428,7 @@ class LocalAgent {
 
 async function connectWithRetry(
   server: string,
+  sessionId?: string,
   maxRetries = Infinity,
   baseDelay = 2000,
   maxDelay = 30000,
@@ -436,7 +437,11 @@ async function connectWithRetry(
   while (true) {
     attempt++;
     try {
-      const res = await fetch(`${server}/sessions`, { method: "POST" });
+      const res = await fetch(`${server}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(sessionId ? { sessionId } : {}),
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
       const data = (await res.json()) as { sessionId: string };
       return data.sessionId;
@@ -461,12 +466,9 @@ async function main() {
 
   // Create or join a session (with retry — server may not be up yet)
   let sessionId = opts.sessionId;
-
-  if (!sessionId) {
-    console.log(`[Agent] No sessionId provided, creating new session…`);
-    sessionId = await connectWithRetry(opts.server);
-    console.log(`[Agent] Created session: ${sessionId}`);
-  }
+  console.log(`[Agent] Ensuring session "${sessionId}" exists on server…`);
+  sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
+  console.log(`[Agent] Using session: ${sessionId}`);
 
   // Choose planner
   const planner: PlannerModel =

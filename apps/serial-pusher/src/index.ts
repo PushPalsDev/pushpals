@@ -23,6 +23,7 @@ const { values: args } = parseArgs({
     "state-dir": { type: "string" },
     "delete-after-merge": { type: "boolean" },
     "dry-run": { type: "boolean" },
+    "skip-clean-check": { type: "boolean" },
     help: { type: "boolean", short: "h" },
   },
   strict: false,
@@ -46,6 +47,7 @@ Options:
       --state-dir <path>    State directory for DB & lock (default: ./state)
       --delete-after-merge  Delete remote branch after merge
       --dry-run             Discover and enqueue only, do not process
+      --skip-clean-check    Skip the clean-repo guard (for dev working copies)
   -h, --help                Show this help
 `);
   process.exit(0);
@@ -107,6 +109,12 @@ try {
 }
 
 const dryRun = args["dry-run"] === true;
+const TRUTHY = new Set(["1", "true", "yes", "on"]);
+const skipCleanCheckFlag = args["skip-clean-check"] === true;
+const skipCleanCheckEnv = TRUTHY.has(
+  (process.env.SERIAL_PUSHER_SKIP_CLEAN_CHECK ?? "").toLowerCase(),
+);
+const skipCleanCheck = skipCleanCheckFlag || skipCleanCheckEnv;
 
 // ─── Bootstrap ──────────────────────────────────────────────────────────────
 
@@ -123,6 +131,10 @@ console.log(`[${ts()}]   state:    ${config.stateDir}`);
 console.log(`[${ts()}]   port:     ${config.port}`);
 console.log(`[${ts()}]   checks:   ${config.checks.length}`);
 if (dryRun) console.log(`[${ts()}]   mode:     DRY RUN`);
+if (skipCleanCheck) {
+  const source = skipCleanCheckFlag ? "--skip-clean-check flag" : "SERIAL_PUSHER_SKIP_CLEAN_CHECK env";
+  console.log(`[${ts()}]   mode:     SKIP CLEAN CHECK (${source})`);
+}
 
 // Ensure state directory exists
 mkdirSync(config.stateDir, { recursive: true });
@@ -218,35 +230,39 @@ async function tick(): Promise<void> {
 
 async function main(): Promise<void> {
   // ── Startup safety check ──────────────────────────────────────────────
-  // Ensure the repo is clean before we start. We don't run git clean -fd
-  // during normal operation, so a dirty repo is a sign of misconfiguration.
-  // Retry if `git status` itself fails (e.g. transient I/O error), but
-  // always crash if the repo is genuinely dirty.
-  let clean: boolean | undefined;
-  for (let attempt = 1; ; attempt++) {
-    try {
-      clean = await gitOps.isRepoClean();
-      break;
-    } catch (err: any) {
-      if (attempt >= 10) throw err; // give up after 10 tries
-      const delay = Math.min(2000 * 2 ** (attempt - 1), 30_000);
-      console.error(
-        `[${ts()}] git status failed (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
-      );
-      await Bun.sleep(delay);
+  // Skip source is already logged in the boot banner (mode: SKIP CLEAN CHECK).
+  if (!skipCleanCheck) {
+    // Ensure the repo is clean before we start. We don't run git clean -fd
+    // during normal operation, so a dirty repo is a sign of misconfiguration.
+    // Retry if `git status` itself fails (e.g. transient I/O error), but
+    // always crash if the repo is genuinely dirty.
+    let clean: boolean | undefined;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        clean = await gitOps.isRepoClean();
+        break;
+      } catch (err: any) {
+        if (attempt >= 10) throw err; // give up after 10 tries
+        const delay = Math.min(2000 * 2 ** (attempt - 1), 30_000);
+        console.error(
+          `[${ts()}] git status failed (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
+        );
+        await Bun.sleep(delay);
+      }
     }
-  }
 
-  if (!clean) {
-    console.error(
-      `[${ts()}] ERROR: Repository at ${config.repoPath} has uncommitted or untracked changes.`,
-    );
-    console.error(`[${ts()}] The serial-pusher requires a dedicated clean clone. Exiting.`);
-    console.error(`[${ts()}] WARNING: Do not run this daemon in a developer working copy.`);
-    shutdown();
-    process.exit(1);
+    if (!clean) {
+      console.error(
+        `[${ts()}] ERROR: Repository at ${config.repoPath} has uncommitted or untracked changes.`,
+      );
+      console.error(`[${ts()}] The serial-pusher requires a dedicated clean clone. Exiting.`);
+      console.error(`[${ts()}] WARNING: Do not run this daemon in a developer working copy.`);
+      console.error(`[${ts()}] TIP: Pass --skip-clean-check to bypass this guard in dev.`);
+      shutdown();
+      process.exit(1);
+    }
+    console.log(`[${ts()}] Repo is clean`);
   }
-  console.log(`[${ts()}] Repo is clean`);
 
   // Initial tick — retry on transient errors (e.g. remote unreachable)
   for (let attempt = 1; ; attempt++) {

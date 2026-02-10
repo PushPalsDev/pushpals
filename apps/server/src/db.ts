@@ -120,12 +120,13 @@ export class EventStore {
 
   // ─── Session operations ─────────────────────────────────────────────────
 
-  createSession(sessionId: string, label?: string): void {
-    this.insertSessionStmt.run({
+  createSession(sessionId: string, label?: string): boolean {
+    const res = this.insertSessionStmt.run({
       $sessionId: sessionId,
       $createdAt: new Date().toISOString(),
       $label: label ?? null,
     });
+    return res.changes === 1;
   }
 
   getSession(sessionId: string): SessionRecord | null {
