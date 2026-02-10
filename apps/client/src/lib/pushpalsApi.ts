@@ -221,25 +221,69 @@ export async function createSession(baseUrl: string, sessionId?: string): Promis
 }
 
 /**
- * Send a message to a session
+ * Send a message to the Local Agent with streaming status updates
+ *
+ * In the new architecture, messages are sent to the Local Agent (not directly to server).
+ * The Local Agent enhances the prompt with repo context and enqueues it to the Request Queue,
+ * streaming status updates back to the client via SSE.
  */
 export async function sendMessage(
-  baseUrl: string,
-  sessionId: string,
+  localAgentUrl: string,
+  _sessionId: string, // No longer used, but kept for API compatibility
   text: string,
-  intent?: Record<string, unknown>,
+  _intent?: Record<string, unknown>, // No longer used, but kept for API compatibility
 ): Promise<boolean> {
   try {
-    const body: Record<string, unknown> = { text };
-    if (intent) body.intent = intent;
-
-    const response = await fetch(`${baseUrl}/sessions/${sessionId}/message`, {
+    const response = await fetch(`${localAgentUrl}/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ text }),
     });
 
-    return response.ok;
+    if (!response.ok) {
+      console.error(`Error sending message: ${response.status} ${response.statusText}`);
+      return false;
+    }
+
+    // Handle SSE stream response
+    const reader = response.body?.getReader();
+    if (!reader) {
+      console.error("No response body");
+      return false;
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let success = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.trim() || !line.startsWith("data: ")) continue;
+
+        try {
+          const data = JSON.parse(line.slice(6));
+          console.log(`[LocalAgent] ${data.type}: ${data.message}`);
+
+          if (data.type === "complete") {
+            success = true;
+          } else if (data.type === "error") {
+            console.error(`[LocalAgent] Error: ${data.message}`);
+            success = false;
+          }
+        } catch (err) {
+          console.error("Failed to parse SSE message:", line, err);
+        }
+      }
+    }
+
+    return success;
   } catch (err) {
     console.error("Error sending message:", err);
     return false;

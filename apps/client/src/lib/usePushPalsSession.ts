@@ -23,6 +23,9 @@ import { getItem, setItem } from "./storage";
 // share the same session out of the box with zero config.
 const DEFAULT_SESSION_ID = process.env.EXPO_PUBLIC_PUSHPALS_SESSION_ID ?? "dev";
 
+// Local Agent URL for sending messages (new architecture)
+const LOCAL_AGENT_URL = process.env.EXPO_PUBLIC_LOCAL_AGENT_URL ?? "http://localhost:3003";
+
 // ─── Extended event type that may include local errors ──────────────────────
 export type SessionEvent = EventEnvelope | { type: "_error"; message: string };
 
@@ -177,6 +180,7 @@ export function usePushPalsSession(
   }, [baseUrl]);
 
   // ─── Send message (with companion intent) ──────────────────────────────
+  // Note: Messages now go to Local Agent (not directly to server)
   const send = useCallback(
     async (text: string) => {
       if (!session.sessionId) return false;
@@ -186,12 +190,12 @@ export function usePushPalsSession(
           userText: text,
           history: session.events,
         });
-        return sendMessage(baseUrl, session.sessionId, text, intent as any);
+        return sendMessage(LOCAL_AGENT_URL, session.sessionId, text, intent as any);
       } catch (_err) {
-        return sendMessage(baseUrl, session.sessionId, text);
+        return sendMessage(LOCAL_AGENT_URL, session.sessionId, text);
       }
     },
-    [session.sessionId, baseUrl, session.events],
+    [session.sessionId, session.events],
   );
 
   // ─── Approve / Deny ────────────────────────────────────────────────────

@@ -4,9 +4,14 @@ import { mkdirSync, existsSync } from "fs";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { GitOps } from "./git";
-import { JobRunner } from "./runner";
 import { createStatusServer } from "./http";
-import { loadConfig, applyCliOverrides, validateConfig, type SerialPusherConfig } from "./config";
+import {
+  loadConfig,
+  applyCliOverrides,
+  validateConfig,
+  type SerialPusherConfig,
+  type CheckConfig,
+} from "./config";
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -15,6 +20,7 @@ const { values: args } = parseArgs({
   options: {
     config: { type: "string", short: "c" },
     repo: { type: "string", short: "r" },
+    server: { type: "string", short: "s" },
     port: { type: "string", short: "p" },
     remote: { type: "string" },
     branch: { type: "string", short: "b" },
@@ -39,6 +45,7 @@ Usage:
 Options:
   -c, --config <path>       Config file path (default: serial-pusher.config.json)
   -r, --repo <path>         Git repository path (default: cwd)
+  -s, --server <url>        PushPals server URL (default: http://localhost:3001)
   -p, --port <number>       HTTP status server port (default: 3002)
       --remote <name>       Git remote (default: origin)
   -b, --branch <name>       Main branch name (default: main)
@@ -76,6 +83,7 @@ let config = loadConfig(resolvedConfig);
 
 const cliOverrides: Partial<SerialPusherConfig> = {};
 if (typeof args.repo === "string") cliOverrides.repoPath = resolve(args.repo);
+if (typeof args.server === "string") cliOverrides.serverUrl = args.server;
 if (typeof args.port === "string") {
   const n = parseInt(args.port, 10);
   if (Number.isFinite(n) && n > 0) cliOverrides.port = n;
@@ -162,10 +170,9 @@ if (recovered > 0) {
   console.log(`[${ts()}] Recovered ${recovered} stuck running job(s) -> queued`);
 }
 
-// ── Git + Runner ────────────────────────────────────────────────────────────
+// ── Git Operations ─────────────────────────────────────────────────────────
 
 const gitOps = new GitOps(config);
-const runner = new JobRunner(config);
 
 // ── HTTP server ─────────────────────────────────────────────────────────────
 
@@ -189,56 +196,173 @@ let running = true;
 
 async function tick(): Promise<void> {
   try {
-    // ── Fetch & discover ──────────────────────────────────────────────
-    await gitOps.fetchPrune();
-    const branches = await gitOps.discoverAgentBranches();
+    // ── Poll Completion Queue ──────────────────────────────────────────
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (config.authToken) {
+      headers["Authorization"] = `Bearer ${config.authToken}`;
+    }
 
-    // ── Enqueue new branches ──────────────────────────────────────────
-    let enqueued = 0;
-    for (const { branch, sha } of branches) {
-      const lastSeen = db.getSeenSha(config.remote, branch);
-      if (lastSeen === sha) continue; // No new commits
+    const pusherId = `pusher-${Math.random().toString(36).substring(2, 10)}`;
 
-      const jobId = db.enqueue(config.remote, branch, sha);
-      if (jobId !== null) {
-        enqueued++;
-        console.log(`[${ts()}] Enqueued: ${branch} (sha: ${sha.slice(0, 8)}) -> job #${jobId}`);
-        db.updateSeen(config.remote, branch, sha);
-      } else {
-        // UNIQUE constraint hit — job already existed for this sha.
-        // Still update seen so we don't re-attempt enqueue next tick.
-        db.updateSeen(config.remote, branch, sha);
+    const response = await fetch(`${config.serverUrl}/completions/claim`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ pusherId }),
+    });
+
+    if (!response.ok) {
+      if (response.status !== 404) {
+        console.error(`[${ts()}] Failed to claim completion: ${response.status}`);
       }
+      return;
     }
 
-    if (enqueued > 0) {
-      console.log(`[${ts()}] Enqueued ${enqueued} new job(s)`);
+    const data = (await response.json()) as {
+      ok: boolean;
+      completion?: {
+        id: string;
+        jobId: string;
+        sessionId: string;
+        commitSha: string;
+        branch: string;
+        message: string;
+        status: string;
+        pusherId: string;
+        createdAt: string;
+        updatedAt: string;
+      };
+      message?: string;
+    };
+
+    if (!data.ok || !data.completion) {
+      return; // No completions available
     }
 
-    // Prune seen rows for branches that no longer exist on the remote
-    const activeBranchSet = new Set(branches.map((b) => b.branch));
-    const pruned = db.pruneSeenBranches(config.remote, activeBranchSet);
-    if (pruned > 0) {
-      console.log(`[${ts()}] Pruned ${pruned} stale seen branch(es)`);
+    const completion = data.completion;
+    console.log(
+      `[${ts()}] Claimed completion ${completion.id}: ${completion.branch} (${completion.commitSha.slice(0, 8)})`,
+    );
+
+    if (dryRun) {
+      console.log(`[${ts()}] Dry run mode — skipping processing`);
+      return;
     }
 
-    // ── Process queue (drain all available jobs in this tick) ─────────
-    if (dryRun) return;
+    // ── Process completion ─────────────────────────────────────────────
+    try {
+      // 1. Fetch branch from remote
+      console.log(`[${ts()}] Fetching branch ${completion.branch}...`);
+      await gitOps.fetchPrune();
 
-    let job = db.claimNext();
-    while (job) {
-      console.log(`[${ts()}] Processing job #${job.id}: ${job.branch} (attempt ${job.attempts})`);
+      // 2. Create temp branch and merge
+      const tempBranch = `_serial-pusher/${completion.id}`;
+      console.log(`[${ts()}] Creating temp branch ${tempBranch}...`);
 
-      const result = await runner.processJob(job, db);
+      await gitOps.resetToClean();
+      await gitOps.checkoutMain();
+      await gitOps.pullMainFF();
+      await gitOps.createTempBranch(tempBranch);
 
-      console.log(`[${ts()}] Job #${job.id} result: ${result.status} — ${result.message}`);
+      console.log(`[${ts()}] Merging ${completion.branch} into ${tempBranch}...`);
+      const mergeResult =
+        config.mergeStrategy === "no-ff"
+          ? await gitOps.mergeNoFF(completion.branch, `Merge ${completion.branch}`)
+          : await gitOps.mergeFFOnly(completion.branch);
 
-      // Claim next immediately (still serial — one at a time)
-      job = db.claimNext();
+      if (!mergeResult.ok) {
+        throw new Error(`Merge failed: ${mergeResult.stderr || mergeResult.stdout}`);
+      }
+
+      // 4. Run checks
+      console.log(`[${ts()}] Running checks...`);
+      for (const check of config.checks) {
+        console.log(`[${ts()}]   - Running check: ${check.name}`);
+        const checkResult = await runCheck(config.repoPath, check);
+
+        if (!checkResult.ok) {
+          throw new Error(`Check "${check.name}" failed: ${checkResult.output}`);
+        }
+
+        console.log(`[${ts()}]   ✓ Check passed: ${check.name}`);
+      }
+
+      // 5. Merge to main (NO push - user does manually)
+      console.log(`[${ts()}] Merging ${tempBranch} to ${config.mainBranch}...`);
+      await gitOps.checkoutMain();
+      const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
+
+      if (!ffResult.ok) {
+        throw new Error(`FF merge to main failed: ${ffResult.stderr || ffResult.stdout}`);
+      }
+
+      console.log(`[${ts()}] ✓ Successfully merged ${completion.branch} to ${config.mainBranch}`);
+      console.log(`[${ts()}] NOTE: Changes merged locally. Run 'git push' to push to remote.`);
+
+      // 6. Clean up temp branch
+      await gitOps.deleteTempBranch(tempBranch);
+
+      // 7. Mark completion as processed
+      const markResponse = await fetch(
+        `${config.serverUrl}/completions/${completion.id}/processed`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({}),
+        },
+      );
+
+      if (!markResponse.ok) {
+        console.error(`[${ts()}] Failed to mark completion processed: ${markResponse.status}`);
+      } else {
+        console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
+      }
+    } catch (err: any) {
+      console.error(`[${ts()}] Failed to process completion ${completion.id}: ${err.message}`);
+
+      // Mark completion as failed
+      const failResponse = await fetch(`${config.serverUrl}/completions/${completion.id}/fail`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ error: err.message }),
+      });
+
+      if (!failResponse.ok) {
+        console.error(`[${ts()}] Failed to mark completion failed: ${failResponse.status}`);
+      }
     }
   } catch (err: any) {
     console.error(`[${ts()}] Poll error: ${err.message}`);
   }
+}
+
+// Helper function to run a check
+async function runCheck(
+  repoPath: string,
+  check: CheckConfig,
+): Promise<{ ok: boolean; output: string }> {
+  const timeoutMs = check.timeoutMs ?? 300_000;
+  const isWindows = process.platform === "win32";
+  const shell = isWindows ? ["cmd", "/c"] : ["sh", "-c"];
+
+  const proc = Bun.spawn([...shell, check.command], {
+    cwd: repoPath,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env },
+  });
+
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+
+  const exitCode = await proc.exited;
+  clearTimeout(timer);
+
+  const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+  return { ok: exitCode === 0, output };
 }
 
 async function main(): Promise<void> {

@@ -1,40 +1,30 @@
 #!/usr/bin/env bun
 /**
- * PushPals Local Agent Daemon
+ * PushPals Local Agent - HTTP Server
  *
  * Usage:
- *   bun run agent-local --server http://localhost:3001 [--sessionId <id>] [--repo <path>] [--planner local|remote]
+ *   bun run agent-local --server http://localhost:3001 [--port 3003] [--sessionId <id>]
  *
- * Connects to the PushPals server via WebSocket, listens for user messages /
- * task events, plans work via the planner, executes tools, and emits lifecycle
- * events back through the protocol.
+ * Accepts messages from clients via HTTP, enhances them with LLM + repo context,
+ * and enqueues to the server's Request Queue for Remote Agent processing.
  */
 
-import { EventEnvelope, PROTOCOL_VERSION } from "protocol";
-import type { EventType, CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
-import { ToolRegistry, type ToolOutput } from "./tools.js";
-import {
-  LocalHeuristicPlanner,
-  RemotePlanner,
-  type PlannerModel,
-  type PlannerTask,
-} from "./planner.js";
+import { detectRepoRoot, getRepoContext } from "shared";
+import { createLLMClient, type LLMClient } from "../../agent-remote/src/llm.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 function parseArgs(): {
   server: string;
-  sessionId: string | null;
-  repo: string;
-  planner: "local" | "remote";
+  port: number;
+  sessionId: string;
   authToken: string | null;
 } {
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
-  let sessionId: string | null = process.env.PUSHPALS_SESSION_ID ?? "dev";
-  let repo = process.cwd();
-  let planner: "local" | "remote" = "local";
+  let port = parseInt(process.env.LOCAL_AGENT_PORT ?? "3003", 10);
+  let sessionId = process.env.PUSHPALS_SESSION_ID ?? "dev";
   let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
 
   for (let i = 0; i < args.length; i++) {
@@ -42,14 +32,11 @@ function parseArgs(): {
       case "--server":
         server = args[++i];
         break;
+      case "--port":
+        port = parseInt(args[++i], 10);
+        break;
       case "--sessionId":
         sessionId = args[++i];
-        break;
-      case "--repo":
-        repo = args[++i];
-        break;
-      case "--planner":
-        planner = args[++i] as "local" | "remote";
         break;
       case "--token":
         authToken = args[++i];
@@ -57,498 +44,245 @@ function parseArgs(): {
     }
   }
 
-  return { server, sessionId, repo, planner, authToken };
+  return { server, port, sessionId, authToken };
 }
 
-// ─── Agent class ────────────────────────────────────────────────────────────
+// ─── Local Agent HTTP Server ────────────────────────────────────────────────
 
-class LocalAgent {
-  private agentId = "local1";
+class LocalAgentServer {
+  private agentId = "local-agent-1";
   private server: string;
   private sessionId: string;
   private repo: string;
   private authToken: string | null;
-  private tools: ToolRegistry;
-  private planner: PlannerModel;
-  private ws: WebSocket | null = null;
-  private pendingApprovals: Map<string, (approved: boolean) => void> = new Map();
-  /** Highest cursor seen — for ?after= reconnect */
-  private lastCursor = 0;
-  /** Serialise event handling for ordering */
-  private chain: Promise<void> = Promise.resolve();
-  /** Periodic repo awareness timer */
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  /** Last snapshot of git status for change-detection */
-  private lastStatusSnapshot = "";
+  private llm: LLMClient;
 
-  constructor(opts: {
-    server: string;
-    sessionId: string;
-    repo: string;
-    planner: PlannerModel;
-    authToken: string | null;
-  }) {
+  constructor(opts: { server: string; sessionId: string; authToken: string | null }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
-    this.repo = opts.repo;
-    this.planner = opts.planner;
     this.authToken = opts.authToken;
-    this.tools = new ToolRegistry();
+
+    // Detect repo root from current working directory
+    this.repo = detectRepoRoot(process.cwd());
+    console.log(`[LocalAgent] Detected repo root: ${this.repo}`);
+
+    // Initialize LLM client for prompt enhancement
+    this.llm = createLLMClient();
+    console.log(`[LocalAgent] LLM client initialized`);
   }
-
-  // ── Send a command to the server via HTTP ──────────────────────────────
-
-  private async sendCommand(cmd: Omit<CommandRequest, "from">): Promise<void> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (this.authToken) headers["Authorization"] = `Bearer ${this.authToken}`;
-
-    const body: CommandRequest = {
-      ...cmd,
-      from: `agent:${this.agentId}`,
-    };
-
-    try {
-      const res = await fetch(`${this.server}/sessions/${this.sessionId}/command`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        const err = await res.text();
-        console.error(`[Agent] Command failed: ${res.status} ${err}`);
-      }
-    } catch (err) {
-      console.error(`[Agent] Command error:`, err);
-    }
-  }
-
-  // ── Convenience emitters ───────────────────────────────────────────────
-
-  private async emitAgentStatus(status: "idle" | "busy" | "error", message?: string) {
-    await this.sendCommand({
-      type: "agent_status",
-      payload: { agentId: this.agentId, status, message },
-    });
-  }
-
-  private async emitTaskCreated(task: PlannerTask, turnId?: string): Promise<string> {
-    const taskId = randomUUID();
-    await this.sendCommand({
-      type: "task_created",
-      payload: {
-        taskId,
-        title: task.title,
-        description: task.description,
-        createdBy: `agent:${this.agentId}`,
-      },
-      turnId,
-    });
-    return taskId;
-  }
-
-  private async emitTaskStarted(taskId: string, turnId?: string) {
-    await this.sendCommand({ type: "task_started", payload: { taskId }, turnId });
-  }
-
-  private async emitTaskProgress(taskId: string, message: string, percent?: number) {
-    await this.sendCommand({
-      type: "task_progress",
-      payload: { taskId, message, ...(percent !== undefined ? { percent } : {}) },
-    });
-  }
-
-  private async emitTaskCompleted(taskId: string, summary: string, artifacts?: any[]) {
-    await this.sendCommand({
-      type: "task_completed",
-      payload: { taskId, summary, ...(artifacts ? { artifacts } : {}) },
-    });
-  }
-
-  private async emitTaskFailed(taskId: string, message: string, detail?: string) {
-    await this.sendCommand({
-      type: "task_failed",
-      payload: { taskId, message, ...(detail ? { detail } : {}) },
-    });
-  }
-
-  private async emitToolCall(
-    toolCallId: string,
-    tool: string,
-    args: Record<string, unknown>,
-    taskId?: string,
-    requiresApproval?: boolean,
-  ) {
-    await this.sendCommand({
-      type: "tool_call",
-      payload: {
-        toolCallId,
-        tool,
-        args,
-        ...(taskId ? { taskId } : {}),
-        ...(requiresApproval ? { requiresApproval } : {}),
-      },
-    });
-  }
-
-  private async emitToolResult(toolCallId: string, output: ToolOutput, taskId?: string) {
-    await this.sendCommand({
-      type: "tool_result",
-      payload: {
-        toolCallId,
-        ok: output.ok,
-        ...(taskId ? { taskId } : {}),
-        ...(output.stdout ? { stdout: output.stdout } : {}),
-        ...(output.stderr ? { stderr: output.stderr } : {}),
-        ...(output.exitCode !== undefined ? { exitCode: output.exitCode } : {}),
-        ...(output.artifacts ? { artifacts: output.artifacts } : {}),
-      },
-    });
-  }
-
-  private async emitJobEnqueued(
-    jobId: string,
-    taskId: string,
-    kind: string,
-    params: Record<string, unknown>,
-  ) {
-    await this.sendCommand({
-      type: "job_enqueued",
-      payload: { jobId, taskId, kind, params },
-    });
-  }
-
-  // ── Execute a single tool (with approval gating) ──────────────────────
-
-  private async executeTool(
-    toolName: string,
-    args: Record<string, unknown>,
-    taskId: string,
-  ): Promise<ToolOutput> {
-    const tool = this.tools.get(toolName);
-    if (!tool) {
-      return { ok: false, stderr: `Unknown tool: ${toolName}`, exitCode: 127 };
-    }
-
-    const toolCallId = randomUUID();
-
-    // Heavy tools → enqueue to worker queue instead of running locally
-    if (this.tools.isHeavy(toolName)) {
-      const jobId = randomUUID();
-      await this.emitToolCall(toolCallId, toolName, args, taskId, false);
-      await this.emitJobEnqueued(jobId, taskId, toolName, args);
-      // Return a placeholder — the worker will emit the real result
-      return { ok: true, stdout: `Job ${jobId} enqueued for ${toolName}` };
-    }
-
-    // Approval gating
-    if (tool.requiresApproval) {
-      await this.emitToolCall(toolCallId, toolName, args, taskId, true);
-
-      const approved = await this.waitForApproval(toolCallId);
-      if (!approved) {
-        const output: ToolOutput = { ok: false, stderr: "Denied by user", exitCode: 1 };
-        await this.emitToolResult(toolCallId, output, taskId);
-        return output;
-      }
-    } else {
-      await this.emitToolCall(toolCallId, toolName, args, taskId, false);
-    }
-
-    // Execute
-    try {
-      const output = await tool.execute(args, { repoRoot: this.repo });
-      await this.emitToolResult(toolCallId, output, taskId);
-      return output;
-    } catch (err) {
-      const output: ToolOutput = { ok: false, stderr: String(err), exitCode: 1 };
-      await this.emitToolResult(toolCallId, output, taskId);
-      return output;
-    }
-  }
-
-  // ── Approval wait ─────────────────────────────────────────────────────
-
-  private waitForApproval(toolCallId: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      // Store resolver; onEvent will call it when approved/denied arrives
-      this.pendingApprovals.set(toolCallId, resolve);
-
-      // Timeout after 5 minutes
-      setTimeout(
-        () => {
-          if (this.pendingApprovals.has(toolCallId)) {
-            this.pendingApprovals.delete(toolCallId);
-            resolve(false);
-          }
-        },
-        5 * 60 * 1000,
-      );
-    });
-  }
-
-  // ── Handle an incoming event ──────────────────────────────────────────
-
-  private async onEvent(envelope: EventEnvelope): Promise<void> {
-    // Ignore events from ourselves to avoid loops
-    if (envelope.from === `agent:${this.agentId}`) return;
-
-    switch (envelope.type) {
-      case "task_created": {
-        const payload = envelope.payload as any;
-        // Only act on tasks created by the client (user messages).
-        // Remote agent tasks already have jobs enqueued for the worker —
-        // remote→local delegation uses delegate_request instead.
-        if (payload.createdBy !== "client") return;
-        await this.handleNewTask(payload, envelope.turnId);
-        break;
-      }
-
-      case "delegate_request": {
-        // Remote agent explicitly delegates work to us
-        const payload = envelope.payload as any;
-        await this.handleDelegateRequest(payload, envelope);
-        break;
-      }
-
-      case "approved": {
-        const { approvalId } = envelope.payload as any;
-        const resolver = this.pendingApprovals.get(approvalId);
-        if (resolver) {
-          this.pendingApprovals.delete(approvalId);
-          resolver(true);
-        }
-        break;
-      }
-
-      case "denied": {
-        const { approvalId } = envelope.payload as any;
-        const resolver = this.pendingApprovals.get(approvalId);
-        if (resolver) {
-          this.pendingApprovals.delete(approvalId);
-          resolver(false);
-        }
-        break;
-      }
-    }
-  }
-
-  // ── Main task handler ─────────────────────────────────────────────────
-
-  private async handleNewTask(
-    payload: { taskId: string; title: string; description: string },
-    turnId?: string,
-  ): Promise<void> {
-    await this.emitAgentStatus("busy", `Processing: ${payload.title}`);
-
-    try {
-      // 1) Emit assistant_message to tell the user we're planning
-      await this.sendCommand({
-        type: "assistant_message",
-        payload: { text: "Planning tasks…" },
-        turnId,
-      });
-
-      // 2) Call planner
-      const planOutput = await this.planner.plan({
-        userText: payload.description,
-        history: [],
-      });
-
-      // 3) Create tasks from planner output
-      for (const task of planOutput.tasks) {
-        const taskId = await this.emitTaskCreated(task, turnId);
-        await this.emitTaskStarted(taskId, turnId);
-
-        // Execute each tool the task needs
-        const toolsNeeded = task.toolsNeeded ?? [];
-        let allOk = true;
-
-        for (let i = 0; i < toolsNeeded.length; i++) {
-          const toolName = toolsNeeded[i];
-          await this.emitTaskProgress(
-            taskId,
-            `Running ${toolName}…`,
-            Math.round(((i + 1) / toolsNeeded.length) * 100),
-          );
-
-          const result = await this.executeTool(toolName, {}, taskId);
-          if (!result.ok) {
-            allOk = false;
-            await this.emitTaskFailed(taskId, `Tool ${toolName} failed`, result.stderr);
-            break;
-          }
-        }
-
-        if (allOk) {
-          await this.emitTaskCompleted(taskId, `Completed: ${task.title}`);
-        }
-      }
-    } catch (err) {
-      console.error(`[Agent] Error handling task:`, err);
-      await this.emitAgentStatus("error", String(err));
-      return;
-    }
-
-    await this.emitAgentStatus("idle");
-  }
-
-  // ── Delegate request handler ──────────────────────────────────────────
 
   /**
-   * Handle an explicit delegate_request from the remote agent.
-   * Executes the requested tool(s) directly and responds with delegate_response.
+   * Enhance user prompt with repository context and LLM analysis.
+   * Accepts pre-fetched context to avoid duplicate git calls.
    */
-  private async handleDelegateRequest(
-    payload: {
-      delegateId: string;
-      tool?: string;
-      tools?: string[];
-      args?: Record<string, unknown>;
-      description?: string;
-    },
-    envelope: EventEnvelope,
-  ): Promise<void> {
-    const { delegateId } = payload;
-    const toolNames = payload.tools ?? (payload.tool ? [payload.tool] : []);
+  private async enhancePrompt(
+    originalPrompt: string,
+    context: { branch: string; status: string; recentCommits: string },
+  ): Promise<string> {
+    try {
+      // Build system prompt with repo context
+      const systemPrompt = `You are a code assistant with access to a git repository.
 
-    if (toolNames.length === 0) {
-      // No specific tools — try the planner
-      console.log(`[Agent] Delegate ${delegateId}: no tools specified, using planner`);
-      await this.handleNewTask(
-        {
-          taskId: delegateId,
-          title: payload.description ?? "Delegated work",
-          description: payload.description ?? "",
-        },
-        envelope.turnId,
-      );
-      return;
+Current repository context:
+- Branch: ${context.branch}
+- Working tree status:
+${context.status.split("\n").slice(0, 20).join("\n") || "(clean)"}
+
+Recent commits:
+${context.recentCommits}
+
+- Repo root: ${this.repo}
+
+Your job is to enhance the user's request with relevant context about the repository state, branch, and any changes.
+Output the enhanced prompt as plain text that provides full context for a code execution agent.
+Be concise but include all relevant information the execution agent needs.`;
+
+      const output = await this.llm.generate({
+        system: systemPrompt,
+        messages: [{ role: "user", content: originalPrompt }],
+        maxTokens: 1024,
+        temperature: 0.3,
+      });
+
+      return output.text.trim();
+    } catch (err) {
+      console.error(`[LocalAgent] LLM enhancement failed:`, err);
+      // Fallback: return original prompt with basic context
+      return `[Branch: ${context.branch}]\n\n${originalPrompt}`;
     }
-
-    await this.emitAgentStatus("busy", `Delegate: ${toolNames.join(", ")}`);
-
-    const results: Array<{ tool: string; ok: boolean; stdout?: string; stderr?: string }> = [];
-
-    for (const toolName of toolNames) {
-      const result = await this.executeTool(toolName, payload.args ?? {}, delegateId);
-      results.push({ tool: toolName, ok: result.ok, stdout: result.stdout, stderr: result.stderr });
-    }
-
-    // Respond with delegate_response
-    const allOk = results.every((r) => r.ok);
-    await this.sendCommand({
-      type: "delegate_response",
-      payload: {
-        delegateId,
-        ok: allOk,
-        results,
-      },
-      turnId: envelope.turnId,
-    });
-
-    await this.emitAgentStatus("idle");
   }
 
-  // ── Periodic repo awareness ────────────────────────────────────────────
+  /**
+   * Start the HTTP server
+   */
+  startServer(port: number): void {
+    // Capture `this` context for use in fetch handler
+    const agentId = this.agentId;
+    const repo = this.repo;
+    const sessionId = this.sessionId;
+    const serverUrl = this.server;
+    const authToken = this.authToken;
+    const enhancePrompt = this.enhancePrompt.bind(this);
 
-  /** Poll git status every interval and emit a summary if changes detected */
-  startRepoHeartbeat(intervalMs = 30_000): void {
-    if (this.heartbeatTimer) return; // already running
+    Bun.serve({
+      port,
+      hostname: "0.0.0.0",
 
-    console.log(`[Agent] Repo heartbeat every ${intervalMs / 1000}s`);
+      async fetch(req: Request): Promise<Response> {
+        const url = new URL(req.url);
+        const pathname = url.pathname;
+        const method = req.method;
 
-    const tick = async () => {
-      try {
-        const statusTool = this.tools.get("git.status");
-        if (!statusTool) return;
+        const jsonHeaders = {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+          "Access-Control-Allow-Headers": "content-type, authorization",
+        };
 
-        const statusResult = await statusTool.execute({}, { repoRoot: this.repo });
-        const snapshot = statusResult.stdout?.trim() ?? "";
+        const makeJson = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), { status, headers: jsonHeaders });
 
-        // Only emit if something changed since last check
-        if (snapshot === this.lastStatusSnapshot) return;
-        this.lastStatusSnapshot = snapshot;
-
-        // Compose a short awareness context
-        const branchTool = this.tools.get("git.branch");
-        let branch = "";
-        if (branchTool) {
-          const br = await branchTool.execute({}, { repoRoot: this.repo });
-          // Extract current branch (line starting with *)
-          const currentLine = br.stdout?.split("\n").find((l: string) => l.startsWith("*"));
-          branch = currentLine?.replace(/^\*\s*/, "").trim() ?? "";
+        // Handle CORS preflight
+        if (method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: jsonHeaders });
         }
 
-        const lines = snapshot.split("\n").filter(Boolean);
-        const summary =
-          lines.length === 0
-            ? "Working tree is clean"
-            : `${lines.length} change(s) on ${branch || "unknown branch"}`;
+        // POST /message - Main endpoint for client messages with streaming status
+        if (pathname === "/message" && method === "POST") {
+          try {
+            const body = (await req.json()) as { text: string };
+            const originalPrompt = body.text;
 
-        await this.emitAgentStatus("idle", `[heartbeat] ${summary}`);
-      } catch (err) {
-        // Heartbeat errors are non-fatal
-        console.error("[Agent] Heartbeat error:", err);
-      }
-    };
+            if (!originalPrompt) {
+              return makeJson({ ok: false, message: "text is required" }, 400);
+            }
 
-    // Initial tick after a short delay (let WS connect first)
-    setTimeout(() => tick(), 5000);
-    this.heartbeatTimer = setInterval(tick, intervalMs);
-  }
+            console.log(
+              `[LocalAgent] Received message: ${originalPrompt.substring(0, 80)}${originalPrompt.length > 80 ? "..." : ""}`,
+            );
 
-  // ── Connect to server via WebSocket ───────────────────────────────────
+            // Create a streaming response using Server-Sent Events
+            const stream = new ReadableStream({
+              async start(controller) {
+                const send = (data: { type: string; message: string; data?: any }) => {
+                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`));
+                };
 
-  connect(): void {
-    const protocol = this.server.startsWith("https") ? "wss" : "ws";
-    const host = this.server.replace(/^https?:\/\//, "");
-    const afterParam = this.lastCursor > 0 ? `?after=${this.lastCursor}` : "";
-    const wsUrl = `${protocol}://${host}/sessions/${this.sessionId}/ws${afterParam}`;
+                try {
+                  // Step 1: Report repo detection
+                  send({ type: "status", message: `Detected repo: ${repo}` });
 
-    console.log(`[Agent] Connecting to ${wsUrl} (cursor=${this.lastCursor})`);
+                  // Step 2: Read git context
+                  send({ type: "status", message: "Reading git status, branch, and commits..." });
+                  const context = await getRepoContext(repo);
+                  send({
+                    type: "status",
+                    message: `Current branch: ${context.branch}`,
+                    data: { branch: context.branch },
+                  });
 
-    this.ws = new WebSocket(wsUrl);
+                  // Step 3: Enhance prompt with LLM
+                  send({ type: "status", message: "Enhancing prompt with LLM..." });
+                  const enhancedPrompt = await enhancePrompt(originalPrompt, context);
+                  send({
+                    type: "status",
+                    message: `Enhanced prompt (${enhancedPrompt.length} chars)`,
+                  });
 
-    this.ws.onopen = () => {
-      console.log(`[Agent] Connected to session ${this.sessionId}`);
-      this.emitAgentStatus("idle", "Agent started");
-      this.startRepoHeartbeat();
-    };
+                  // Step 4: Enqueue to Request Queue
+                  send({ type: "status", message: "Enqueuing to Request Queue..." });
+                  const headers: Record<string, string> = { "Content-Type": "application/json" };
+                  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
 
-    this.ws.onmessage = (event) => {
-      try {
-        // Server sends { envelope, cursor } per PR1 wire format
-        const raw = JSON.parse(event.data as string) as {
-          envelope: EventEnvelope;
-          cursor: number;
-        };
-        this.lastCursor = Math.max(this.lastCursor, raw.cursor);
-        this.chain = this.chain
-          .then(() => this.onEvent(raw.envelope))
-          .catch((err) => console.error("[Agent] Handler error:", err));
-      } catch (err) {
-        console.error("[Agent] Failed to parse event:", err);
-      }
-    };
+                  const res = await fetch(`${serverUrl}/requests/enqueue`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({
+                      sessionId,
+                      originalPrompt,
+                      enhancedPrompt,
+                    }),
+                  });
 
-    this.ws.onclose = () => {
-      console.log("[Agent] WebSocket closed, reconnecting in 3s…");
-      setTimeout(() => this.connect(), 3000);
-    };
+                  if (!res.ok) {
+                    const err = await res.text();
+                    console.error(`[LocalAgent] Failed to enqueue request: ${err}`);
+                    send({ type: "error", message: `Failed to enqueue: ${err}` });
+                    controller.close();
+                    return;
+                  }
 
-    this.ws.onerror = (err) => {
-      console.error("[Agent] WebSocket error:", err);
-    };
+                  const data = (await res.json()) as { ok: boolean; requestId?: string };
+                  console.log(`[LocalAgent] Enqueued request: ${data.requestId}`);
+
+                  // Final success message
+                  send({
+                    type: "complete",
+                    message: "Request enqueued successfully",
+                    data: { requestId: data.requestId, sessionId },
+                  });
+
+                  controller.close();
+                } catch (err) {
+                  console.error(`[LocalAgent] Error processing message:`, err);
+                  send({ type: "error", message: String(err) });
+                  controller.close();
+                }
+              },
+            });
+
+            return new Response(stream, {
+              headers: {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                Connection: "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+              },
+            });
+          } catch (err) {
+            console.error(`[LocalAgent] Error processing message:`, err);
+            return makeJson({ ok: false, message: String(err) }, 500);
+          }
+        }
+
+        // GET /healthz - Health check endpoint
+        if (pathname === "/healthz" && method === "GET") {
+          return makeJson({
+            ok: true,
+            agentId,
+            repo,
+            sessionId,
+          });
+        }
+
+        // GET / - Info endpoint
+        if (pathname === "/" && method === "GET") {
+          return makeJson({
+            name: "PushPals Local Agent",
+            version: "0.1.0",
+            endpoints: {
+              "POST /message": "Send a message to be processed",
+              "GET /healthz": "Health check",
+            },
+          });
+        }
+
+        return makeJson({ ok: false, message: "Not found" }, 404);
+      },
+    });
+
+    console.log(`[LocalAgent] HTTP server listening on http://0.0.0.0:${port}`);
+    console.log(`[LocalAgent] Ready to receive messages at POST http://localhost:${port}/message`);
   }
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+// ─── Session creation helper ────────────────────────────────────────────────
 
 async function connectWithRetry(
   server: string,
-  sessionId?: string,
-  maxRetries = Infinity,
+  sessionId: string,
+  maxRetries = 10,
   baseDelay = 2000,
   maxDelay = 30000,
 ): Promise<string> {
@@ -559,7 +293,7 @@ async function connectWithRetry(
       const res = await fetch(`${server}/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(sessionId ? { sessionId } : {}),
+        body: JSON.stringify({ sessionId }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
       const data = (await res.json()) as { sessionId: string };
@@ -568,44 +302,38 @@ async function connectWithRetry(
       if (attempt >= maxRetries) throw err;
       const delay = Math.min(baseDelay * 2 ** (attempt - 1), maxDelay);
       console.log(
-        `[Agent] Server unavailable (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
+        `[LocalAgent] Server unavailable (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
       );
       await Bun.sleep(delay);
     }
   }
 }
 
+// ─── Main ───────────────────────────────────────────────────────────────────
+
 async function main() {
   const opts = parseArgs();
 
-  console.log(`[Agent] PushPals Local Agent Daemon`);
-  console.log(`[Agent] Server: ${opts.server}`);
-  console.log(`[Agent] Repo: ${opts.repo}`);
-  console.log(`[Agent] Planner: ${opts.planner}`);
+  console.log(`[LocalAgent] PushPals Local Agent - HTTP Server`);
+  console.log(`[LocalAgent] Server: ${opts.server}`);
+  console.log(`[LocalAgent] Port: ${opts.port}`);
 
-  // Create or join a session (with retry — server may not be up yet)
-  let sessionId = opts.sessionId;
-  console.log(`[Agent] Ensuring session "${sessionId}" exists on server…`);
-  sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
-  console.log(`[Agent] Using session: ${sessionId}`);
+  // Create or join session (with retry - server may not be up yet)
+  console.log(`[LocalAgent] Ensuring session "${opts.sessionId}" exists on server…`);
+  const sessionId = await connectWithRetry(opts.server, opts.sessionId);
+  console.log(`[LocalAgent] Using session: ${sessionId}`);
 
-  // Choose planner
-  const planner: PlannerModel =
-    opts.planner === "remote" ? new RemotePlanner() : new LocalHeuristicPlanner();
-
-  // Start agent
-  const agent = new LocalAgent({
+  // Start Local Agent HTTP server
+  const agent = new LocalAgentServer({
     server: opts.server,
     sessionId,
-    repo: opts.repo,
-    planner,
     authToken: opts.authToken,
   });
 
-  agent.connect();
+  agent.startServer(opts.port);
 }
 
 main().catch((err) => {
-  console.error("[Agent] Fatal:", err);
+  console.error("[LocalAgent] Fatal:", err);
   process.exit(1);
 });

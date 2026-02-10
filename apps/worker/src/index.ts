@@ -13,6 +13,106 @@
 import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 
+// ─── Git helpers ────────────────────────────────────────────────────────────
+
+/** Job kinds that modify files and should trigger commits */
+const FILE_MODIFYING_JOBS = new Set([
+  "file.write",
+  "file.patch",
+  "file.delete",
+  "file.rename",
+  "file.copy",
+  "file.append",
+  "file.mkdir",
+]);
+
+function shouldCommit(kind: string): boolean {
+  return FILE_MODIFYING_JOBS.has(kind);
+}
+
+/** Execute a git command and return stdout */
+async function git(
+  cwd: string,
+  args: string[],
+): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  try {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim() };
+  } catch (err) {
+    return { ok: false, stdout: "", stderr: String(err) };
+  }
+}
+
+/** Create commit for job result and return commit info */
+async function createJobCommit(
+  repo: string,
+  workerId: string,
+  job: { id: string; taskId: string; kind: string },
+): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
+  const branchName = `agent/${workerId}/${job.id}`;
+  const commitMsg = `${job.kind}: ${job.taskId}\n\nJob: ${job.id}\nWorker: ${workerId}`;
+
+  try {
+    // Create and checkout branch
+    let result = await git(repo, ["checkout", "-b", branchName]);
+    if (!result.ok) {
+      return { ok: false, error: `Failed to create branch: ${result.stderr}` };
+    }
+
+    // Stage all changes
+    result = await git(repo, ["add", "-A"]);
+    if (!result.ok) {
+      return { ok: false, error: `Failed to stage changes: ${result.stderr}` };
+    }
+
+    // Check if there are changes to commit
+    result = await git(repo, ["diff", "--cached", "--quiet"]);
+    if (result.ok) {
+      // No changes to commit (diff exited 0)
+      console.log(`[Worker] No changes to commit for job ${job.id}`);
+      // Clean up branch
+      await git(repo, ["checkout", "-"]);
+      await git(repo, ["branch", "-D", branchName]);
+      return { ok: true, branch: branchName, sha: "no-changes" };
+    }
+
+    // Commit changes
+    result = await git(repo, ["commit", "-m", commitMsg]);
+    if (!result.ok) {
+      return { ok: false, error: `Failed to commit: ${result.stderr}` };
+    }
+
+    // Get commit SHA
+    result = await git(repo, ["rev-parse", "HEAD"]);
+    if (!result.ok) {
+      return { ok: false, error: `Failed to get commit SHA: ${result.stderr}` };
+    }
+    const sha = result.stdout;
+
+    // Push branch to origin
+    result = await git(repo, ["push", "origin", branchName]);
+    if (!result.ok) {
+      return { ok: false, error: `Failed to push branch: ${result.stderr}` };
+    }
+
+    console.log(`[Worker] Created commit ${sha} on branch ${branchName}`);
+    return { ok: true, branch: branchName, sha };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 function parseArgs(): {
@@ -511,6 +611,47 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
 
           // 3. Wait for chained log sends to complete
           await logChain;
+
+          // 3.5. Create git commit for file-modifying jobs
+          if (result.ok && shouldCommit(job.kind)) {
+            console.log(`[Worker] Job ${job.id} modified files, creating commit...`);
+            const commitResult = await createJobCommit(opts.repo, opts.workerId, {
+              id: job.id,
+              taskId: job.taskId,
+              kind: job.kind,
+            });
+
+            if (commitResult.ok && commitResult.sha && commitResult.sha !== "no-changes") {
+              // Enqueue to Completion Queue
+              try {
+                const response = await fetch(`${opts.server}/completions/enqueue`, {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify({
+                    jobId: job.id,
+                    sessionId: job.sessionId,
+                    commitSha: commitResult.sha,
+                    branch: commitResult.branch,
+                    message: `${job.kind}: ${job.taskId}`,
+                  }),
+                });
+
+                if (response.ok) {
+                  console.log(
+                    `[Worker] Enqueued completion for job ${job.id} (commit ${commitResult.sha})`,
+                  );
+                } else {
+                  console.error(
+                    `[Worker] Failed to enqueue completion: ${response.status} ${await response.text()}`,
+                  );
+                }
+              } catch (err) {
+                console.error(`[Worker] Failed to enqueue completion:`, err);
+              }
+            } else if (commitResult.error) {
+              console.error(`[Worker] Failed to create commit: ${commitResult.error}`);
+            }
+          }
 
           // 4. Report job result to queue
           if (result.ok) {

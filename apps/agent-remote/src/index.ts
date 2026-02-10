@@ -15,120 +15,14 @@
  *   Environment: OPENAI_API_KEY | ANTHROPIC_API_KEY | LLM_ENDPOINT (see llm.ts)
  */
 
-import type { EventEnvelope, CommandRequest } from "protocol";
+import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { createLLMClient } from "./llm.js";
 import { AgentBrain } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
+import { detectRepoRoot } from "shared";
 import { resolve, join } from "path";
 import { mkdirSync } from "fs";
-
-// ─── Job result formatting ──────────────────────────────────────────────────
-
-/**
- * Produce a structured result string from a job's raw output.
- * Returns a one-line summary header followed by `\n---\n` and the full output.
- * The client splits on the `---` separator to power "Show more".
- */
-function formatJobResult(kind: string, output: string, ok: boolean): string {
-  const trimmed = output.trim();
-  if (!ok) return `**${kind}** — failed\n---\n${trimmed}`;
-  if (!trimmed) return `**${kind}** — completed (no output)`;
-
-  const lines = trimmed.split("\n");
-
-  let summaryLine: string;
-  switch (kind) {
-    case "git.status": {
-      const modified = lines.filter((l) => /^\s*M\s/.test(l)).length;
-      const untracked = lines.filter((l) => /^\s*\?\?/.test(l)).length;
-      const added = lines.filter((l) => /^\s*A\s/.test(l)).length;
-      const parts: string[] = [];
-      if (modified) parts.push(`${modified} modified`);
-      if (added) parts.push(`${added} added`);
-      if (untracked) parts.push(`${untracked} untracked`);
-      summaryLine = parts.length ? parts.join(", ") : `${lines.length} entries`;
-      break;
-    }
-    case "git.diff": {
-      const statLine = lines.find((l) => /files? changed/.test(l));
-      summaryLine = statLine?.trim() ?? `${lines.length} lines of diff`;
-      break;
-    }
-    case "git.log":
-      summaryLine = `${lines.filter((l) => l.trim().length > 0).length} log lines`;
-      break;
-    case "git.branch": {
-      const branches = lines.filter((l) => l.trim().length > 0);
-      const current = branches
-        .find((l) => l.startsWith("*"))
-        ?.replace(/^\*\s*/, "")
-        .trim();
-      summaryLine = `${branches.length} branch(es)${current ? ` — current: ${current}` : ""}`;
-      break;
-    }
-    case "bun.test": {
-      // Last non-empty line often has pass/fail summary
-      const last = lines.filter((l) => l.trim()).pop();
-      summaryLine = last ?? "tests complete";
-      break;
-    }
-    case "bun.lint": {
-      const issueCount = lines.filter((l) => l.trim().length > 0).length;
-      summaryLine = issueCount <= 1 ? "No lint issues" : `${issueCount} lines of output`;
-      break;
-    }
-    case "file.list":
-      summaryLine = `${lines.length} entries`;
-      break;
-    case "file.read":
-      summaryLine = `${lines.length} lines`;
-      break;
-    case "ci.status":
-      summaryLine = lines[0] ?? "CI status retrieved";
-      break;
-    case "project.summary":
-      summaryLine = "Project overview";
-      break;
-    case "shell.exec":
-      summaryLine = `${lines.length} lines of output`;
-      break;
-    case "file.write":
-      summaryLine = lines[0] ?? "File written";
-      break;
-    case "file.patch":
-      summaryLine = lines[0] ?? "File patched";
-      break;
-    case "file.rename":
-      summaryLine = lines[0] ?? "File renamed";
-      break;
-    case "file.delete":
-      summaryLine = lines[0] ?? "File deleted";
-      break;
-    case "file.copy":
-      summaryLine = lines[0] ?? "File copied";
-      break;
-    case "file.append":
-      summaryLine = lines[0] ?? "Text appended";
-      break;
-    case "file.mkdir":
-      summaryLine = lines[0] ?? "Directory created";
-      break;
-    case "web.fetch":
-      summaryLine = `Fetched (${trimmed.length} chars)`;
-      break;
-    case "web.search": {
-      const resultCount = lines.filter((l) => /^\d+\./.test(l.trim())).length;
-      summaryLine = resultCount > 0 ? `${resultCount} results` : "Search complete";
-      break;
-    }
-    default:
-      summaryLine = `${kind} completed`;
-      break;
-  }
-
-  return `**${kind}** — ${summaryLine}\n---\n${trimmed}`;
-}
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -166,25 +60,11 @@ class RemoteOrchestrator {
   private readonly server: string;
   private readonly sessionId: string;
   private readonly authToken: string | null;
-  private ws: WebSocket | null = null;
+  private readonly repo: string;
   private disposed = false;
 
-  /** Highest cursor seen — used for ?after= on reconnect */
-  private lastCursor = 0;
-
-  /** Serialises async event handling to preserve ordering */
+  /** Serialises async request handling to preserve ordering */
   private chain: Promise<void> = Promise.resolve();
-
-  /** taskId → set of pending jobIds */
-  private taskJobs = new Map<string, Set<string>>();
-  /** jobId → taskId */
-  private jobToTask = new Map<string, string>();
-  /** taskId → turnId (for sending assistant_message on completion) */
-  private taskTurnId = new Map<string, string>();
-  /** taskId → collected job results */
-  private taskResults = new Map<string, Array<{ kind: string; ok: boolean; output: string }>>();
-  /** jobId → job kind */
-  private jobKind = new Map<string, string>();
 
   /** AI brain — produces assistant messages + optional action plans */
   private brain: AgentBrain;
@@ -207,8 +87,9 @@ class RemoteOrchestrator {
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
 
-    // Restore cursor from durable store
-    this.lastCursor = this.idempotency.getLastCursor(this.sessionId);
+    // Detect repo root from current working directory
+    this.repo = detectRepoRoot(process.cwd());
+    console.log(`[Orchestrator] Detected repo root: ${this.repo}`);
   }
 
   // ── HTTP helpers ──────────────────────────────────────────────────────
@@ -278,49 +159,52 @@ class RemoteOrchestrator {
     }
   }
 
-  // ── Event handlers ────────────────────────────────────────────────────
+  // In this architecture, Remote Agent only creates tasks/jobs via polling
+  // Job completion tracking is no longer part of Remote Agent responsibility
+  // ── Dispatch, Polling for Request Queue ────────────────────────────────────────
 
-  /** React to a user message: call brain, emit response + optional tasks/jobs */
-  private async handleMessage(envelope: EventEnvelope): Promise<void> {
-    const eventId = envelope.id;
+  /** Process a request from the Request Queue (replaces handleMessage) */
+  private async processRequest(request: any): Promise<void> {
+    const requestId = request.id;
 
-    // ── Idempotency check: skip already-processed messages ──
-    if (this.idempotency.hasHandled(this.sessionId, eventId)) {
-      console.log(`[Orchestrator] Skipping already-handled message ${eventId}`);
+    // Idempotency check
+    if (this.idempotency.hasHandled(this.sessionId, requestId)) {
+      console.log(`[Orchestrator] Skipping already-handled request ${requestId}`);
       return;
     }
 
-    // ── Mark handled immediately — prefer lost work over duplicated jobs ──
-    this.idempotency.markHandled(this.sessionId, eventId);
+    this.idempotency.markHandled(this.sessionId, requestId);
 
-    const { text } = envelope.payload as { text: string };
-    const turnId = envelope.turnId ?? randomUUID();
+    const enhancedPrompt = request.enhancedPrompt;
+    const turnId = randomUUID();
 
-    this.pushContext(`[user] ${text}`);
+    this.pushContext(`[user] ${request.originalPrompt}`);
+    this.pushContext(`[enhanced] ${enhancedPrompt}`);
 
-    // ── Call the AI brain ──
-    console.log(`[Orchestrator] Thinking about: "${text.substring(0, 80)}"`);
-    const output = await this.brain.think(text, this.recentContext);
+    // Call brain with enhanced prompt
+    console.log(`[Orchestrator] Thinking about: "${enhancedPrompt.substring(0, 80)}"`);
+    const output = await this.brain.think(enhancedPrompt, this.recentContext);
 
-    // 1. Always emit assistant message
+    this.pushContext(`[assistant] ${output.assistantMessage}`);
+
+    // Emit assistant message
     await this.sendCommand({
       type: "assistant_message",
       payload: { text: output.assistantMessage },
       turnId,
     });
-    this.pushContext(`[assistant] ${output.assistantMessage}`);
 
-    // 2. If brain produced tasks, create them + enqueue their jobs
+    // Create tasks and enqueue jobs if actions are present
     if (output.tasks && output.tasks.length > 0) {
-      for (const actionTask of output.tasks) {
-        const taskId = actionTask.taskId || randomUUID();
+      for (const task of output.tasks) {
+        const taskId = randomUUID();
 
         await this.sendCommand({
           type: "task_created",
           payload: {
             taskId,
-            title: actionTask.title,
-            description: actionTask.description,
+            title: task.title,
+            description: task.description,
             createdBy: `agent:${this.agentId}`,
           },
           turnId,
@@ -332,244 +216,65 @@ class RemoteOrchestrator {
           turnId,
         });
 
-        // Enqueue each job
-        const jobIds = new Set<string>();
-
-        for (const jobSpec of actionTask.jobs) {
-          const jobId = await this.enqueueJob(taskId, jobSpec.kind, jobSpec.params);
-          if (!jobId) {
-            console.error(`[Orchestrator] Failed to enqueue ${jobSpec.kind}, skipping`);
-            continue;
+        // Enqueue jobs for this task
+        for (const job of task.jobs) {
+          const jobId = await this.enqueueJob(taskId, job.kind, job.params ?? {});
+          if (jobId) {
+            await this.sendCommand({
+              type: "job_enqueued",
+              payload: { jobId, taskId, kind: job.kind },
+              turnId,
+            });
           }
-
-          jobIds.add(jobId);
-          this.jobToTask.set(jobId, taskId);
-          this.jobKind.set(jobId, jobSpec.kind);
-
-          await this.sendCommand({
-            type: "job_enqueued",
-            payload: { jobId, taskId, kind: jobSpec.kind, params: jobSpec.params },
-            turnId,
-          });
-        }
-
-        if (jobIds.size === 0) {
-          await this.sendCommand({
-            type: "task_failed",
-            payload: { taskId, message: "All job enqueues failed" },
-            turnId,
-          });
-        } else {
-          this.taskJobs.set(taskId, jobIds);
-          this.taskTurnId.set(taskId, turnId);
-          this.taskResults.set(taskId, []);
-          console.log(
-            `[Orchestrator] Task ${taskId}: enqueued ${jobIds.size} job(s) — ${actionTask.jobs.map((j) => j.kind).join(", ")}`,
-          );
         }
       }
     }
 
-    console.log(`[Orchestrator] Handled message ${eventId}`);
-  }
-
-  /** A job finished successfully */
-  private async handleJobCompleted(envelope: EventEnvelope): Promise<void> {
-    const { jobId, summary, artifacts } = envelope.payload as {
-      jobId: string;
-      summary?: string;
-      artifacts?: Array<{ kind: string; text?: string }>;
-    };
-    const taskId = this.jobToTask.get(jobId);
-    if (!taskId) return; // not our job
-
-    const kind = this.jobKind.get(jobId) ?? "unknown";
-    this.jobToTask.delete(jobId);
-    this.jobKind.delete(jobId);
-
-    // Collect result output — format with summary header
-    const rawOutput = artifacts?.find((a) => a.kind === "log")?.text ?? summary ?? "";
-    const formatted = formatJobResult(kind, rawOutput, true);
-    this.taskResults.get(taskId)?.push({ kind, ok: true, output: formatted });
-
-    const pending = this.taskJobs.get(taskId);
-    if (!pending) return;
-
-    pending.delete(jobId);
-
-    // Progress update if more jobs remain
-    if (pending.size > 0) {
-      await this.sendCommand({
-        type: "task_progress",
-        payload: {
-          taskId,
-          message: `Job ${jobId} done. ${pending.size} job(s) remaining.`,
-        },
+    // Mark request complete
+    try {
+      await fetch(`${this.server}/requests/${requestId}/complete`, {
+        method: "POST",
+        headers: this.authHeaders(),
+        body: JSON.stringify({ result: { tasksCreated: output.tasks?.length ?? 0 } }),
       });
-      return;
-    }
-
-    // All jobs for this task are done — send results back to user
-    this.taskJobs.delete(taskId);
-    const turnId = this.taskTurnId.get(taskId);
-    this.taskTurnId.delete(taskId);
-    const results = this.taskResults.get(taskId) ?? [];
-    this.taskResults.delete(taskId);
-
-    await this.sendCommand({
-      type: "task_completed",
-      payload: {
-        taskId,
-        summary: summary ?? "All jobs completed successfully.",
-      },
-    });
-
-    // Compose an assistant_message with the collected formatted output
-    const resultText = results
-      .map((r) => r.output.trim() || `**${r.kind}** — (no output)`)
-      .join("\n\n");
-
-    const msg = resultText || "Tasks completed with no output.";
-    await this.sendCommand({
-      type: "assistant_message",
-      payload: { text: msg },
-      turnId,
-    });
-    this.pushContext(`[assistant] ${msg}`);
-
-    console.log(`[Orchestrator] Task ${taskId} completed — results sent to user.`);
-  }
-
-  /** A job failed */
-  private async handleJobFailed(envelope: EventEnvelope): Promise<void> {
-    const {
-      jobId,
-      message: errMsg,
-      detail,
-    } = envelope.payload as {
-      jobId: string;
-      message: string;
-      detail?: string;
-    };
-    const taskId = this.jobToTask.get(jobId);
-    if (!taskId) return;
-
-    const kind = this.jobKind.get(jobId) ?? "unknown";
-    const turnId = this.taskTurnId.get(taskId);
-
-    // Clean up all remaining jobs for this task
-    const pending = this.taskJobs.get(taskId);
-    if (pending) {
-      for (const jid of pending) {
-        this.jobToTask.delete(jid);
-        this.jobKind.delete(jid);
-      }
-      this.taskJobs.delete(taskId);
-    }
-    this.taskTurnId.delete(taskId);
-    this.taskResults.delete(taskId);
-
-    await this.sendCommand({
-      type: "task_failed",
-      payload: {
-        taskId,
-        message: errMsg ?? `Job ${jobId} failed`,
-      },
-    });
-
-    // Send failure as assistant_message so the user sees it
-    const failMsg = formatJobResult(kind, `${errMsg}${detail ? `\n${detail}` : ""}`, false);
-    await this.sendCommand({
-      type: "assistant_message",
-      payload: { text: failMsg },
-      turnId,
-    });
-    this.pushContext(`[assistant] ${failMsg}`);
-
-    console.log(`[Orchestrator] Task ${taskId} failed (job ${jobId}).`);
-  }
-
-  // ── Dispatch ──────────────────────────────────────────────────────────
-
-  private async onEvent(envelope: EventEnvelope, cursor: number): Promise<void> {
-    // Ignore own events to avoid loops
-    if (envelope.from === `agent:${this.agentId}`) return;
-
-    // Persist cursor (max-wins) — in-memory + durable store
-    this.lastCursor = Math.max(this.lastCursor, cursor);
-    this.idempotency.updateCursor(this.sessionId, cursor);
-
-    switch (envelope.type) {
-      case "message":
-        // Only react to messages originating from a client
-        if (envelope.from === "client") {
-          await this.handleMessage(envelope);
-        }
-        break;
-      case "job_completed":
-        await this.handleJobCompleted(envelope);
-        break;
-      case "job_failed":
-        await this.handleJobFailed(envelope);
-        break;
+    } catch (err) {
+      console.error(`[Orchestrator] Failed to mark request complete:`, err);
     }
   }
 
-  // ── WebSocket connection ──────────────────────────────────────────────
+  /** Start polling the Request Queue */
+  async startPolling(pollMs: number = 2000): Promise<void> {
+    console.log(`[Orchestrator] Starting polling loop (every ${pollMs}ms)`);
 
-  connect(): void {
-    if (this.disposed) return;
-
-    const protocol = this.server.startsWith("https") ? "wss" : "ws";
-    const host = this.server.replace(/^https?:\/\//, "");
-    const wsUrl = `${protocol}://${host}/sessions/${this.sessionId}/ws?after=${this.lastCursor}`;
-
-    console.log(`[Orchestrator] Connecting to ${wsUrl} (cursor=${this.lastCursor})`);
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.onopen = () => {
-      console.log(`[Orchestrator] Connected — session ${this.sessionId}`);
-      this.sendCommand({
-        type: "agent_status",
-        payload: { agentId: this.agentId, status: "idle", message: "Orchestrator online" },
-      });
-    };
-
-    this.ws.onmessage = (event) => {
+    while (!this.disposed) {
       try {
-        // Server sends { envelope, cursor } per PR1 wire format
-        const data = JSON.parse(event.data as string) as {
-          envelope: EventEnvelope;
-          cursor: number;
-        };
-        this.lastCursor = Math.max(this.lastCursor, data.cursor);
-        // Serialise handling to preserve event ordering
-        this.chain = this.chain
-          .then(() => this.onEvent(data.envelope, data.cursor))
-          .catch((err) => console.error("[Orchestrator] Handler error:", err));
+        const res = await fetch(`${this.server}/requests/claim`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          body: JSON.stringify({ agentId: this.agentId }),
+        });
+
+        if (res.ok) {
+          const data = (await res.json()) as { ok: boolean; request?: any };
+
+          if (data.ok && data.request) {
+            console.log(`[Orchestrator] Claimed request ${data.request.id}`);
+            // Serialize processing
+            this.chain = this.chain
+              .then(() => this.processRequest(data.request))
+              .catch((err) => console.error("[Orchestrator] Process error:", err));
+          }
+        }
       } catch (err) {
-        console.error("[Orchestrator] Failed to parse WS message:", err);
+        console.error(`[Orchestrator] Poll error:`, err);
       }
-    };
 
-    this.ws.onclose = () => {
-      if (this.disposed) return;
-      console.log("[Orchestrator] WS closed, reconnecting in 3 s...");
-      setTimeout(() => this.connect(), 3000);
-    };
-
-    this.ws.onerror = (err) => {
-      console.error("[Orchestrator] WS error:", err);
-    };
+      await Bun.sleep(pollMs);
+    }
   }
 
   dispose(): void {
     this.disposed = true;
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch (_e) {}
-    }
   }
 }
 
@@ -638,7 +343,9 @@ async function main() {
     idempotency,
   });
 
-  orchestrator.connect();
+  // Start polling for requests from the Request Queue
+  const pollMs = parseInt(process.env.REMOTE_AGENT_POLL_MS ?? "2000", 10);
+  orchestrator.startPolling(pollMs);
 }
 
 main().catch((err) => {

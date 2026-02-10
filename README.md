@@ -102,54 +102,248 @@ Every run produces an audit trail:
 
 ## Architecture
 
-```
-             (mobile/web/desktop)
+Push Pals is a **queue-based polling architecture** rather than a WebSocket-based event system, for improved reliability, scalability, and clarity.
 
-
-┌────────────────────────────────────────┐
-│                 Client                 │
-│          - chat UI                     │
-│          - diffs/logs/artifacts        │
-│          - approvals                   │
-└───────────────┬────────────────────────┘
-                │ HTTP (post message/commands)
-                │ SSE (subscribe events)
-                v
-┌────────────────────────────────────────┐
-│                 Server                 │
-│          - auth + sessions             │
-│          - event hub (durable history) │
-│          - job queue (SQLite)          │
-└───────────────┬────────────────────────┘
-                │ subscribe session events
-                │
-    ┌──────────┴───────────┐
-    v                      v
-┌─────────────────┐  ┌───────────────────┐
-│  Remote Buddy   │  │   Local Buddy     │
-│ (agent-remote)  │  │ (agent-local, opt)│
-│ - global planner│  │ - local-only tools│
-│ - enqueue jobs  │  │ - optional assist │
-└─────────┬───────┘  └───────────────────┘
-          │ enqueue
-          v
-┌────────────────────────────────────────┐
-│               Workers                  │
-│ (worker; many replicas supported)      │
-│ - claim jobs atomically from SQLite    │
-│ - run tools / edits / tests            │
-│ - report results                       │
-└───────────────┬────────────────────────┘
-                │ land changes
-                v
-┌────────────────────────────────────────┐
-│            serial-pusher               │
-│         (merge queue daemon)           │
-│ - watches agent branches               │
-│ - merges serially → main               │
-│ - runs checks → pushes                 │
-└────────────────────────────────────────┘
 ```
+Client (HTTP POST)
+        ↓
+Local Agent HTTP Server
+        ├─ Detects repo root from cwd
+        ├─ Reads git status, branch, commits
+        ├─ Enhances prompt with LLM + repo context
+        └─ Streams status updates back to client (SSE)
+        └─ POST /requests/enqueue
+        ↓
+Request Queue (SQLite: pushpals.db)
+        ├─ Status: pending → claimed → completed/failed
+        └─ Atomic claiming via transactions
+        ↓
+Remote Agent (polls every 2s)
+        ├─ POST /requests/claim
+        ├─ Detects repo root from cwd
+        ├─ Processes with LLM brain
+        ├─ Creates tasks and enqueues jobs
+        └─ POST /requests/:id/complete
+        ↓
+Job Queue (SQLite: pushpals.db)
+        ↓
+Worker (polls every 2s)
+        ├─ Executes job
+        ├─ Creates git commit on branch: agent/{workerId}/{jobId}
+        ├─ Pushes branch to origin
+        └─ POST /completions/enqueue
+        ↓
+Completion Queue (SQLite: pushpals.db)
+        ├─ Status: pending → claimed → processed/failed
+        └─ Contains commit SHA + branch info
+        ↓
+Serial Pusher (polls every 10s)
+        ├─ POST /completions/claim
+        ├─ Fetches branch from remote
+        ├─ Creates temp branch and merges
+        ├─ Runs checks: bun run format, bun run test
+        ├─ If pass: FF merge to main (NO automatic push)
+        └─ POST /completions/:id/processed
+        ↓
+User manually runs: git push origin main
+```
+
+## Key Components
+
+### 1. **Request Queue** (`apps/server/src/requests.ts`)
+
+- **Purpose**: Stores enhanced prompts from Local Agent for Remote Agent
+- **Schema**: `id, sessionId, originalPrompt, enhancedPrompt, status, agentId, result, error`
+- **Endpoints**:
+  - `POST /requests/enqueue` - Local Agent enqueues enhanced prompts
+  - `POST /requests/claim` - Remote Agent claims requests
+  - `POST /requests/:id/complete` - Mark request done
+  - `POST /requests/:id/fail` - Mark request failed
+
+### 2. **Completion Queue** (`apps/server/src/completions.ts`)
+
+- **Purpose**: Stores completed work with commit info for Serial Pusher
+- **Schema**: `id, jobId, sessionId, commitSha, branch, message, status, pusherId`
+- **Endpoints**:
+  - `POST /completions/enqueue` - Worker enqueues completed work
+  - `POST /completions/claim` - Serial Pusher claims completions
+  - `POST /completions/:id/processed` - Mark completion processed
+  - `POST /completions/:id/fail` - Mark completion failed
+
+### 3. **Local Agent** (`apps/agent-local`)
+
+- **Type**: HTTP Server (port 3003)
+- **Detects**: Repo root from `process.cwd()`
+- **Functionality**:
+  - Receives client messages via `POST /message`
+  - Reads git status, branch, recent commits
+  - Enhances prompt with LLM + repo context
+  - Streams status updates to client via SSE
+  - Enqueues to Request Queue
+- **Status Updates** (SSE):
+  ```
+  data: {"type":"status","message":"Detected repo: /path/to/repo"}
+  data: {"type":"status","message":"Reading git status, branch, and commits..."}
+  data: {"type":"status","message":"Current branch: main","data":{"branch":"main"}}
+  data: {"type":"status","message":"Enhancing prompt with LLM..."}
+  data: {"type":"status","message":"Enhanced prompt (542 chars)"}
+  data: {"type":"status","message":"Enqueuing to Request Queue..."}
+  data: {"type":"complete","message":"Request enqueued successfully","data":{"requestId":"...","sessionId":"..."}}
+  ```
+
+### 4. **Remote Agent** (`apps/agent-remote`)
+
+- **Type**: Polling Daemon
+- **Detects**: Repo root from `process.cwd()`
+- **Functionality**:
+  - Polls `/requests/claim` every 2 seconds
+  - Processes enhanced prompts with LLM brain
+  - Creates tasks and enqueues jobs to Job Queue
+  - Marks request complete
+- **No longer**: WebSocket subscriptions, job completion tracking
+
+### 5. **Worker** (`apps/worker`)
+
+- **Type**: Polling Daemon
+- **Functionality**:
+  - Polls Job Queue for work
+  - Executes jobs (file operations, git, tests, etc.)
+  - Creates git commit on new branch
+  - Pushes branch to origin
+  - Enqueues to Completion Queue
+- **Git Workflow**:
+  ```bash
+  git checkout -b agent/{workerId}/{jobId}
+  git add -A
+  git commit -m "{kind}: {taskId}\n\nJob: {jobId}\nWorker: {workerId}"
+  git push origin agent/{workerId}/{jobId}
+  ```
+
+### 6. **Serial Pusher** (`apps/serial-pusher`)
+
+- **Type**: Polling Daemon
+- **Functionality**:
+  - Polls `/completions/claim` every 10 seconds
+  - Fetches branch from remote
+  - Creates temp branch: `_serial-pusher/{completionId}`
+  - Merges agent branch into temp
+  - Runs checks: `bun run format`, `bun run test`
+  - If checks pass: FF merges to main
+  - **Does NOT push** to remote (user pushes manually)
+  - Marks completion as processed/failed
+
+### 7. **Client** (`apps/client`)
+
+- **Type**: React Native/Web App
+- **Functionality**:
+  - Sends messages to Local Agent at `http://localhost:3003/message`
+  - Receives SSE status updates during processing
+  - Subscribes to Server for events (assistant messages, task updates)
+- **Environment**: `EXPO_PUBLIC_LOCAL_AGENT_URL=http://localhost:3003`
+
+## Running the System
+
+### Prerequisites
+
+- **Bun** runtime installed
+- **Git** repository with remote configured
+- **LLM API Key** (OpenAI, Anthropic, or Ollama endpoint)
+
+### Environment Variables
+
+Create `.env` file in root:
+
+```bash
+# Server
+PUSHPALS_SERVER_URL=http://localhost:3001
+PUSHPALS_DATA_DIR=./outputs/data
+
+# Local Agent
+LOCAL_AGENT_PORT=3003
+PUSHPALS_SESSION_ID=dev
+
+# Remote Agent
+REMOTE_AGENT_POLL_MS=2000
+OPENAI_API_KEY=sk-...
+# or
+ANTHROPIC_API_KEY=sk-ant-...
+# or
+LLM_ENDPOINT=http://localhost:11434/v1  # Ollama
+
+# Worker
+WORKER_POLL_MS=2000
+
+# Serial Pusher
+SERIAL_PUSHER_POLL_MS=10000
+SERIAL_PUSHER_SERVER_URL=http://localhost:3001
+
+# Client
+EXPO_PUBLIC_LOCAL_AGENT_URL=http://localhost:3003
+EXPO_PUBLIC_PUSHPALS_SESSION_ID=dev
+```
+
+## Flow
+
+| Aspect                   | Polling                    |
+| ------------------------ | -------------------------- |
+| **Client → Server**      | Via Local Agent            |
+| **Request Distribution** | Request Queue polling      |
+| **Prompt Enhancement**   | Local Agent enhances first |
+| **Job Completion**       | Completion Queue           |
+| **Merge Process**        | Completion Queue polling   |
+| **Status Updates**       | SSE from Local Agent       |
+| **Repo Detection**       | Auto-detect from cwd       |
+| **Push to Remote**       | Manual (user controlled)   |
+
+## Database Schema
+
+All queues use the same SQLite database: `pushpals.db`
+
+**requests table:**
+
+```sql
+CREATE TABLE requests (
+    id             TEXT PRIMARY KEY,
+    sessionId      TEXT NOT NULL,
+    originalPrompt TEXT NOT NULL,
+    enhancedPrompt TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    agentId        TEXT,
+    result         TEXT,
+    error          TEXT,
+    createdAt      TEXT NOT NULL,
+    updatedAt      TEXT NOT NULL
+);
+CREATE INDEX idx_requests_status ON requests(status);
+```
+
+**completions table:**
+
+```sql
+CREATE TABLE completions (
+    id        TEXT PRIMARY KEY,
+    jobId     TEXT NOT NULL,
+    sessionId TEXT NOT NULL,
+    commitSha TEXT,
+    branch    TEXT,
+    message   TEXT NOT NULL,
+    status    TEXT NOT NULL DEFAULT 'pending',
+    pusherId  TEXT,
+    error     TEXT,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL
+);
+CREATE INDEX idx_completions_status ON completions(status);
+```
+
+## Security Notes
+
+- Local Agent runs with **full repo access** (started from repo root)
+- Remote Agent runs with **full repo access** (started from repo root)
+- Worker creates **branches and commits** (pushes to origin)
+- Serial Pusher **merges to main locally** (no automatic push)
+- **User reviews** git log before pushing: `git log --oneline -10`
+- **User controls** when changes go to remote: `git push origin main`
 
 ---
 

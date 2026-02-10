@@ -13,6 +13,7 @@
       "version": "1.0.0",
       "dependencies": {
         "protocol": "workspace:*",
+        "shared": "workspace:*",
       },
       "devDependencies": {
         "@types/bun": "latest",
@@ -24,6 +25,7 @@
       "version": "1.0.0",
       "dependencies": {
         "protocol": "workspace:*",
+        "shared": "workspace:*",
       },
       "devDependencies": {
         "@types/bun": "latest",
@@ -112,6 +114,14 @@
       "devDependencies": {
         "@types/node": "^20.0.0",
         "json-schema-to-ts": "^3.1.0",
+        "typescript": "~5.9.2",
+      },
+    },
+    "packages/shared": {
+      "name": "shared",
+      "version": "0.1.0",
+      "devDependencies": {
+        "@types/bun": "latest",
         "typescript": "~5.9.2",
       },
     },
@@ -1562,6 +1572,8 @@
     "sf-symbols-typescript": ["sf-symbols-typescript@2.2.0", "", {}, "sha512-TPbeg0b7ylrswdGCji8FRGFAKuqbpQlLbL8SOle3j1iHSs5Ob5mhvMAxWN2UItOjgALAB5Zp3fmMfj8mbWvXKw=="],
 
     "shallowequal": ["shallowequal@1.1.0", "", {}, "sha512-y0m1JoUZSlPAjXVtPPW70aZWfIL/dSP7AFkRnniLCrK/8MDKog3TySTBmckD+RObVxH0v4Tox67+F14PdED2oQ=="],
+
+    "shared": ["shared@workspace:packages/shared"],
 
     "shebang-command": ["shebang-command@2.0.0", "", { "dependencies": { "shebang-regex": "^3.0.0" } }, "sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA=="],
 

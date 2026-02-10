@@ -19,6 +19,8 @@ export interface CheckConfig {
 export interface SerialPusherConfig {
   /** Absolute path to the git repository to manage. */
   repoPath: string;
+  /** PushPals server URL. Default: "http://localhost:3001". */
+  serverUrl: string;
   /** Git remote name. Default: "origin". */
   remote: string;
   /** The main branch to merge into. Default: "main". */
@@ -39,10 +41,13 @@ export interface SerialPusherConfig {
   maxAttempts: number;
   /** Merge strategy: "no-ff" for merge commits, "ff-only" for linear. Default: "no-ff". */
   mergeStrategy: "no-ff" | "ff-only";
+  /** Authentication token for server API calls. */
+  authToken?: string;
 }
 
 const DEFAULTS: SerialPusherConfig = {
   repoPath: process.cwd(),
+  serverUrl: process.env.PUSHPALS_SERVER_URL ?? "http://localhost:3001",
   remote: "origin",
   mainBranch: "main",
   branchPrefix: "agent/",
@@ -55,6 +60,7 @@ const DEFAULTS: SerialPusherConfig = {
   deleteAfterMerge: false,
   maxAttempts: 3,
   mergeStrategy: "no-ff",
+  authToken: process.env.PUSHPALS_AUTH_TOKEN,
 };
 
 /**

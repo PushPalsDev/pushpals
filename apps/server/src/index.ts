@@ -1,6 +1,8 @@
 import { EventEnvelope, PROTOCOL_VERSION } from "protocol";
 import { SessionManager } from "./events.js";
 import { JobQueue } from "./jobs.js";
+import { RequestQueue } from "./requests.js";
+import { CompletionQueue } from "./completions.js";
 import { randomUUID } from "crypto";
 import { resolve, join } from "path";
 import { mkdirSync } from "fs";
@@ -14,6 +16,8 @@ const sessionManager = new SessionManager(
   process.env.PUSHPALS_DB_PATH ?? join(dataDir, "pushpals.db"),
 );
 const jobQueue = new JobQueue();
+const requestQueue = new RequestQueue(join(dataDir, "pushpals.db"));
+const completionQueue = new CompletionQueue(join(dataDir, "pushpals.db"));
 
 /**
  * HTTP Middleware & Routes
@@ -273,6 +277,100 @@ export function createRequestHandler() {
         const jobId = jobFailMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = jobQueue.fail(jobId, body);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // ── Request queue endpoints (auth protected) ────────────────────────────
+
+      // POST /requests/enqueue
+      if (pathname === "/requests/enqueue" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = requestQueue.enqueue(body);
+        return makeJson(result, result.ok ? 201 : 400);
+      }
+
+      // POST /requests/claim
+      if (pathname === "/requests/claim" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const agentId = (body.agentId as string) || "unknown";
+        const result = requestQueue.claim(agentId);
+        return makeJson(result, result.ok ? 200 : 404);
+      }
+
+      // POST /requests/:id/complete
+      const reqCompleteMatch = pathname.match(/^\/requests\/([^/]+)\/complete$/);
+      if (reqCompleteMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const requestId = reqCompleteMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = requestQueue.complete(requestId, body);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // POST /requests/:id/fail
+      const reqFailMatch = pathname.match(/^\/requests\/([^/]+)\/fail$/);
+      if (reqFailMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const requestId = reqFailMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = requestQueue.fail(requestId, body);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // ── Completion queue endpoints (auth protected) ─────────────────────────
+
+      // POST /completions/enqueue
+      if (pathname === "/completions/enqueue" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = completionQueue.enqueue(body);
+        return makeJson(result, result.ok ? 201 : 400);
+      }
+
+      // POST /completions/claim
+      if (pathname === "/completions/claim" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const pusherId = (body.pusherId as string) || "unknown";
+        const result = completionQueue.claim(pusherId);
+        return makeJson(result, result.ok ? 200 : 404);
+      }
+
+      // POST /completions/:id/processed
+      const compProcMatch = pathname.match(/^\/completions\/([^/]+)\/processed$/);
+      if (compProcMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const completionId = compProcMatch[1];
+        const result = completionQueue.markProcessed(completionId);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // POST /completions/:id/fail
+      const compFailMatch = pathname.match(/^\/completions\/([^/]+)\/fail$/);
+      if (compFailMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const completionId = compFailMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const error = (body.error as string) ?? "Unknown error";
+        const result = completionQueue.markFailed(completionId, error);
         return makeJson(result, result.ok ? 200 : 400);
       }
 
