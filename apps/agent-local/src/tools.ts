@@ -416,10 +416,9 @@ const shellExec: ToolDefinition = {
   requiresApproval: true, // ← destructive by default, requires user approval
   timeout: 60_000,
   async execute(args, ctx) {
-    const command = args.command as string;
+    let command = args.command as string;
     if (!command) return { ok: false, stderr: "Missing 'command' argument", exitCode: 1 };
 
-    // Split into shell invocation so pipes, redirects, etc. work
     const isWindows = process.platform === "win32";
     const shell = isWindows ? ["cmd", "/c", command] : ["bash", "-c", command];
     const cwd = (args.cwd as string)

@@ -138,7 +138,7 @@ async function executeJob(
       break;
     }
     case "shell.exec": {
-      const command = params.command as string;
+      let command = params.command as string;
       if (!command) return { ok: false, summary: "shell.exec requires a 'command' param" };
       const isWindows = process.platform === "win32";
       cmd = isWindows ? ["cmd", "/c", command] : ["bash", "-c", command];
