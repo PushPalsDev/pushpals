@@ -82,7 +82,10 @@ export function createRequestHandler() {
         const result = sessionManager.createSession(requestedId);
         if (result.id === null) {
           return makeJson(
-            { ok: false, message: "Invalid sessionId: must contain only [a-zA-Z0-9._-] and be 1\u201364 chars" },
+            {
+              ok: false,
+              message: "Invalid sessionId: must contain only [a-zA-Z0-9._-] and be 1\u201364 chars",
+            },
             400,
           );
         }

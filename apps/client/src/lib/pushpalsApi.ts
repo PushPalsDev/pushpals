@@ -199,10 +199,7 @@ export function subscribeEvents(
 /**
  * Create a new session on the server
  */
-export async function createSession(
-  baseUrl: string,
-  sessionId?: string,
-): Promise<string | null> {
+export async function createSession(baseUrl: string, sessionId?: string): Promise<string | null> {
   try {
     const response = await fetch(`${baseUrl}/sessions`, {
       method: "POST",

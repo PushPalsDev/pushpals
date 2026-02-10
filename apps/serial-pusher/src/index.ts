@@ -132,7 +132,9 @@ console.log(`[${ts()}]   port:     ${config.port}`);
 console.log(`[${ts()}]   checks:   ${config.checks.length}`);
 if (dryRun) console.log(`[${ts()}]   mode:     DRY RUN`);
 if (skipCleanCheck) {
-  const source = skipCleanCheckFlag ? "--skip-clean-check flag" : "SERIAL_PUSHER_SKIP_CLEAN_CHECK env";
+  const source = skipCleanCheckFlag
+    ? "--skip-clean-check flag"
+    : "SERIAL_PUSHER_SKIP_CLEAN_CHECK env";
   console.log(`[${ts()}]   mode:     SKIP CLEAN CHECK (${source})`);
 }
 
