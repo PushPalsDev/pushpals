@@ -4,7 +4,9 @@
  * Web:    synchronous localStorage (wrapped as async for uniform API).
  * Native: @react-native-async-storage/async-storage (truly async).
  *
- * All errors are swallowed — cursor persistence is best-effort.
+ * Errors are swallowed in getItem/setItem — cursor persistence is
+ * best-effort.  A console.warn is emitted once if the native storage
+ * module is missing so the failure is diagnosable.
  */
 import { Platform } from "react-native";
 
@@ -16,20 +18,31 @@ type NativeStorage = {
 };
 
 let _native: NativeStorage | null | undefined; // undefined = not yet tried
+let _warned = false;
 
-function nativeStorage(): NativeStorage {
+function nativeStorage(): NativeStorage | null {
   if (_native) return _native;
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const mod = require("@react-native-async-storage/async-storage");
-  const store = (mod.default ?? mod) as NativeStorage;
-  if (!store?.getItem || !store?.setItem) {
-    throw new Error(
-      "[PushPals] @react-native-async-storage/async-storage is required for cursor persistence on native. " +
-        "Run: bun add @react-native-async-storage/async-storage",
-    );
+  if (_native === null) return null; // already failed
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require("@react-native-async-storage/async-storage");
+    const store = (mod.default ?? mod) as NativeStorage;
+    if (!store?.getItem || !store?.setItem) {
+      throw new Error("module loaded but getItem/setItem missing");
+    }
+    _native = store;
+    return _native;
+  } catch {
+    _native = null;
+    if (!_warned) {
+      _warned = true;
+      console.warn(
+        "[PushPals] @react-native-async-storage/async-storage is not available. " +
+          "Cursor persistence disabled on native. Install with: bun add @react-native-async-storage/async-storage",
+      );
+    }
+    return null;
   }
-  _native = store;
-  return _native;
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────

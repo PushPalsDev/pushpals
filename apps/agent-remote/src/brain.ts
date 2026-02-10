@@ -9,6 +9,15 @@
 
 import type { LLMClient, LLMMessage } from "./llm.js";
 
+// ─── Validation limits ─────────────────────────────────────────────────────────────
+
+const MAX_TASKS = 3;
+const MAX_JOBS_PER_TASK = 5;
+const MAX_TITLE_LEN = 80;
+const MAX_DESC_LEN = 500;
+const MAX_ASSISTANT_MSG_LEN = 4000;
+const ALLOWED_JOB_KINDS = new Set(["bun.test", "bun.lint", "git.status"]);
+
 // ─── Output types ───────────────────────────────────────────────────────────
 
 export interface ActionJobSpec {
@@ -103,20 +112,39 @@ export class AgentBrain {
 
       const output: BrainOutput = {
         assistantMessage:
-          parsed.assistant_message ?? "I received your message but couldn't formulate a response.",
+          (parsed.assistant_message ?? "I received your message but couldn't formulate a response.").slice(0, MAX_ASSISTANT_MSG_LEN),
       };
 
       // Only include tasks if actions are enabled and the model produced them
-      if (this.actionsEnabled && parsed.tasks && parsed.tasks.length > 0) {
-        output.tasks = parsed.tasks.map((t) => ({
-          taskId: t.taskId,
-          title: t.title,
-          description: t.description,
-          jobs: (t.jobs ?? []).map((j) => ({
-            kind: j.kind,
-            params: j.params ?? {},
-          })),
-        }));
+      if (this.actionsEnabled && Array.isArray(parsed.tasks) && parsed.tasks.length > 0) {
+        const validated: ActionTask[] = [];
+
+        for (const t of parsed.tasks.slice(0, MAX_TASKS)) {
+          // Skip if missing required fields
+          if (!t.taskId || !t.title) continue;
+
+          const jobs: ActionJobSpec[] = [];
+          for (const j of (t.jobs ?? []).slice(0, MAX_JOBS_PER_TASK)) {
+            if (!ALLOWED_JOB_KINDS.has(j.kind)) {
+              console.warn(`[Brain] Ignoring unknown job kind: ${j.kind}`);
+              continue;
+            }
+            jobs.push({ kind: j.kind, params: j.params ?? {} });
+          }
+
+          if (jobs.length === 0) continue; // no valid jobs → skip task
+
+          validated.push({
+            taskId: t.taskId.slice(0, 64),
+            title: t.title.slice(0, MAX_TITLE_LEN),
+            description: (t.description ?? "").slice(0, MAX_DESC_LEN),
+            jobs,
+          });
+        }
+
+        if (validated.length > 0) {
+          output.tasks = validated;
+        }
       }
 
       if (result.usage) {

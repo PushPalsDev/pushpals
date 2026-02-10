@@ -175,6 +175,9 @@ class RemoteOrchestrator {
       return;
     }
 
+    // ── Mark handled immediately — prefer lost work over duplicated jobs ──
+    this.idempotency.markHandled(this.sessionId, eventId);
+
     const { text } = envelope.payload as { text: string };
     const turnId = envelope.turnId ?? randomUUID();
 
@@ -249,8 +252,6 @@ class RemoteOrchestrator {
       }
     }
 
-    // ── Mark handled AFTER all commands succeed ──
-    this.idempotency.markHandled(this.sessionId, eventId);
     console.log(`[Orchestrator] Handled message ${eventId}`);
   }
 
@@ -322,7 +323,8 @@ class RemoteOrchestrator {
     // Ignore own events to avoid loops
     if (envelope.from === `agent:${this.agentId}`) return;
 
-    // Persist cursor (max-wins)
+    // Persist cursor (max-wins) — in-memory + durable store
+    this.lastCursor = Math.max(this.lastCursor, cursor);
     this.idempotency.updateCursor(this.sessionId, cursor);
 
     switch (envelope.type) {

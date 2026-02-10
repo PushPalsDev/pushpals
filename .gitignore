@@ -144,3 +144,6 @@ tmp_*.mjs
 
 # Ignore compiled protocol runtime artifacts
 packages/protocol/dist/
+
+# api keys
+.env

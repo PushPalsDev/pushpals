@@ -108,10 +108,12 @@ export class AnthropicClient implements LLMClient {
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
-    const messages = input.messages.map((m) => ({
-      role: m.role as "user" | "assistant",
-      content: m.content,
-    }));
+    const messages = input.messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      }));
 
     const res = await fetch(`${this.endpoint}/v1/messages`, {
       method: "POST",
@@ -156,12 +158,24 @@ export class AnthropicClient implements LLMClient {
 // ─── Generic OpenAI-compatible client (Ollama, vLLM, LM Studio) ────────────
 
 export class GenericOpenAIClient extends OpenAIClient {
+  private readonly resolvedEndpoint: string;
+
   constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
+    const endpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? "http://localhost:11434";
     super({
-      endpoint: opts?.endpoint ?? process.env.LLM_ENDPOINT ?? "http://localhost:11434",
+      endpoint,
       apiKey: opts?.apiKey ?? process.env.LLM_API_KEY ?? "ollama",
       model: opts?.model ?? process.env.LLM_MODEL ?? "llama3",
     });
+    this.resolvedEndpoint = endpoint;
+  }
+
+  /** Log resolved endpoint on first use for debuggability */
+  async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+    console.log(`[LLM] Endpoint: ${this.resolvedEndpoint}/v1/chat/completions`);
+    // Replace generate with super after first call to avoid repeated logs
+    this.generate = super.generate.bind(this);
+    return super.generate(input);
   }
 }
 

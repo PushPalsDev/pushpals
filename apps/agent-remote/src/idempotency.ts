@@ -81,26 +81,17 @@ export class IdempotencyStore {
   }
 
   private _prune(sessionId: string): void {
-    const count = (
-      this.db
-        .prepare("SELECT COUNT(*) as cnt FROM handled_messages WHERE sessionId = ?")
-        .get(sessionId) as { cnt: number }
-    ).cnt;
-
-    if (count > MAX_HANDLED_IDS) {
-      const excess = count - MAX_HANDLED_IDS;
-      this.db
-        .prepare(
-          `DELETE FROM handled_messages
-           WHERE rowid IN (
-             SELECT rowid FROM handled_messages
-             WHERE sessionId = ?
-             ORDER BY handledAt ASC
-             LIMIT ?
-           )`,
-        )
-        .run(sessionId, excess);
-    }
+    this.db
+      .prepare(
+        `DELETE FROM handled_messages
+         WHERE rowid IN (
+           SELECT rowid FROM handled_messages
+           WHERE sessionId = ?
+           ORDER BY handledAt ASC
+           LIMIT MAX(0, (SELECT COUNT(*) FROM handled_messages WHERE sessionId = ?) - ?)
+         )`,
+      )
+      .run(sessionId, sessionId, MAX_HANDLED_IDS);
   }
 
   close(): void {
