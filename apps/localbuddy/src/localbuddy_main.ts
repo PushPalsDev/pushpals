@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from "crypto";
-import { CommunicationManager, detectRepoRoot, getRepoContext } from "shared";
+import { CommunicationManager, detectRepoRoot, getRepoContext, loadPromptTemplate } from "shared";
 import { createLLMClient, type LLMClient } from "../../remotebuddy/src/llm.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
@@ -80,22 +80,13 @@ class LocalBuddyServer {
     context: { branch: string; status: string; recentCommits: string },
   ): Promise<string> {
     try {
-      // Build system prompt with repo context
-      const systemPrompt = `You are a code assistant with access to a git repository.
-
-Current repository context:
-- Branch: ${context.branch}
-- Working tree status:
-${context.status.split("\n").slice(0, 20).join("\n") || "(clean)"}
-
-Recent commits:
-${context.recentCommits}
-
-- Repo root: ${this.repo}
-
-Your job is to enhance the user's request with relevant context about the repository state, branch, and any changes.
-Output the enhanced prompt as plain text that provides full context for a code execution agent.
-Be concise but include all relevant information the execution agent needs.`;
+      const status = context.status.split("\n").slice(0, 20).join("\n") || "(clean)";
+      const systemPrompt = loadPromptTemplate("localbuddy/enhance_prompt.txt", {
+        branch: context.branch,
+        status,
+        recent_commits: context.recentCommits || "(none)",
+        repo_root: this.repo,
+      });
 
       const output = await this.llm.generate({
         system: systemPrompt,

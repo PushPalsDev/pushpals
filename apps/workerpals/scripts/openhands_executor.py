@@ -22,10 +22,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
 RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ "
+PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+_PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
 
 
 class ManagedLocalAgentServer:
@@ -203,6 +206,38 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
     return model, api_key, base_url
 
 
+def _repo_root_for_prompt_loading() -> Path:
+    explicit = (os.environ.get("PUSHPALS_REPO_PATH") or "").strip()
+    if explicit:
+        return Path(explicit)
+    return Path(__file__).resolve().parents[3]
+
+
+def _load_prompt_template(
+    relative_path: str, replacements: Optional[Dict[str, str]] = None
+) -> str:
+    prompt_path = _repo_root_for_prompt_loading() / "prompts" / relative_path
+    prompt_key = str(prompt_path)
+
+    template = _PROMPT_TEMPLATE_CACHE.get(prompt_key)
+    if template is None:
+        if not prompt_path.exists():
+            raise FileNotFoundError(f"Prompt template not found: {prompt_path}")
+        template = prompt_path.read_text(encoding="utf-8")
+        _PROMPT_TEMPLATE_CACHE[prompt_key] = template
+
+    if not replacements:
+        return template
+
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in replacements:
+            raise KeyError(f"Missing prompt replacement '{{{{{key}}}}}' for {prompt_path}")
+        return replacements[key]
+
+    return PROMPT_TOKEN_REGEX.sub(_replace, template)
+
+
 def _summarize_git_changes(repo: str) -> List[str]:
     try:
         proc = subprocess.run(
@@ -284,12 +319,8 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         agent = Agent(llm=llm, tools=tools)
         conversation = Conversation(agent=agent, workspace=repo)
 
-        system_prompt = (
-            "You are an autonomous coding worker operating inside a git repository. "
-            "Apply the requested code changes directly in files. "
-            "Do not return architecture summaries unless explicitly requested. "
-            "Prefer precise edits over broad rewrites. "
-            "After editing, run minimal validation commands relevant to your changes."
+        system_prompt = _load_prompt_template(
+            "workerpals/openhands_task_execute_system_prompt.txt"
         )
         conversation.send_message(f"{system_prompt}\n\nTask:\n{instruction}")
 
