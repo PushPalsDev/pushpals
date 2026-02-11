@@ -163,3 +163,6 @@ apps/worker/.dockerbuild/
 .worktrees/
 
 
+/__pycache__
+/__pycache__/
+apps/worker/scripts/__pycache__

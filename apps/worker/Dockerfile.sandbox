@@ -12,7 +12,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     grep \
     jq \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# OpenHands worker runtime (SDK + local agent server + workspace adapters)
+RUN pip3 install --no-cache-dir \
+    openhands-sdk \
+    openhands-agent-server \
+    openhands-workspace \
+    openhands-tools
 
 # Configure git for the worker
 RUN git config --global user.name "PushPals Worker" \

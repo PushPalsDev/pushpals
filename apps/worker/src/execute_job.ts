@@ -3,6 +3,9 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
+import { existsSync } from "fs";
+import { resolve } from "path";
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 /** Job kinds that modify files and should trigger commits */
@@ -17,6 +20,7 @@ export const FILE_MODIFYING_JOBS = new Set([
 ]);
 
 const MAX_OUTPUT = 256 * 1024;
+const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -26,6 +30,121 @@ export function shouldCommit(kind: string): boolean {
 
 export function truncate(s: string): string {
   return s.length > MAX_OUTPUT ? s.substring(0, MAX_OUTPUT) + "\n… (truncated)" : s;
+}
+
+function useOpenHandsExecutor(): boolean {
+  const executor = (process.env.WORKER_EXECUTOR ?? "openhands").trim().toLowerCase();
+  return !(executor === "native" || executor === "builtin" || executor === "legacy");
+}
+
+async function executeWithOpenHands(
+  kind: string,
+  params: Record<string, unknown>,
+  repo: string,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<JobResult> {
+  const pythonBin = process.env.WORKER_OPENHANDS_PYTHON ?? "python";
+  const scriptPath = resolve(import.meta.dir, "..", "scripts", "openhands_executor.py");
+  if (!existsSync(scriptPath)) {
+    return {
+      ok: false,
+      summary: `OpenHands wrapper script not found: ${scriptPath}`,
+      exitCode: 1,
+    };
+  }
+
+  const timeoutMs = Math.max(
+    10_000,
+    parseInt(process.env.WORKER_OPENHANDS_TIMEOUT_MS ?? "120000", 10) || 120_000,
+  );
+  const payload = Buffer.from(
+    JSON.stringify({
+      kind,
+      params,
+      repo,
+      timeoutMs,
+    }),
+    "utf-8",
+  ).toString("base64");
+
+  try {
+    const proc = Bun.spawn([pythonBin, scriptPath, payload], {
+      cwd: repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const timer = setTimeout(() => {
+      try {
+        proc.kill();
+      } catch (_e) {}
+    }, timeoutMs);
+
+    const [stdout, stderr] = await Promise.all([
+      onLog ? streamLines(proc.stdout, "stdout", onLog) : new Response(proc.stdout).text(),
+      onLog ? streamLines(proc.stderr, "stderr", onLog) : new Response(proc.stderr).text(),
+    ]);
+    clearTimeout(timer);
+    const exitCode = await proc.exited;
+
+    const lines = stdout.split(/\r?\n/);
+    let parsed: Record<string, unknown> | null = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line.startsWith(OPENHANDS_RESULT_PREFIX)) continue;
+      const raw = line.slice(OPENHANDS_RESULT_PREFIX.length).trim();
+      if (!raw) continue;
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch (_e) {
+        parsed = null;
+      }
+      break;
+    }
+
+    const filteredStdout = lines
+      .filter((line) => !line.trim().startsWith(OPENHANDS_RESULT_PREFIX))
+      .join("\n")
+      .trim();
+
+    if (!parsed) {
+      return {
+        ok: false,
+        summary: `OpenHands wrapper did not return a structured result for ${kind}`,
+        stdout: truncate(filteredStdout),
+        stderr: truncate(stderr),
+        exitCode,
+      };
+    }
+
+    const summary =
+      typeof parsed.summary === "string"
+        ? parsed.summary
+        : exitCode === 0
+          ? `${kind} passed via OpenHands`
+          : `${kind} failed via OpenHands (exit ${exitCode})`;
+    const parsedStdout = typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout;
+    const parsedStderr = typeof parsed.stderr === "string" ? parsed.stderr : stderr;
+    const parsedExitCode =
+      typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
+        ? parsed.exitCode
+        : exitCode;
+    const parsedOk = typeof parsed.ok === "boolean" ? parsed.ok : parsedExitCode === 0;
+
+    return {
+      ok: parsedOk,
+      summary,
+      stdout: truncate(parsedStdout ?? ""),
+      stderr: truncate(parsedStderr ?? ""),
+      exitCode: parsedExitCode,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      summary: `OpenHands wrapper execution error for ${kind}: ${String(err)}`,
+      exitCode: 1,
+    };
+  }
 }
 
 /** Execute a git command and return stdout */
@@ -105,8 +224,8 @@ export async function createJobCommit(
   const commitMsg = `${job.kind}: ${job.taskId}\n\nJob: ${job.id}\nWorker: ${workerId}`;
 
   try {
-    // Create and checkout branch
-    let result = await git(repo, ["checkout", "-b", branchName]);
+    // Create/reset and checkout branch in this workspace
+    let result = await git(repo, ["checkout", "-B", branchName]);
     if (!result.ok) {
       return { ok: false, error: `Failed to create branch: ${result.stderr}` };
     }
@@ -122,9 +241,18 @@ export async function createJobCommit(
     if (result.ok) {
       // No changes to commit (diff exited 0)
       console.log(`[Worker] No changes to commit for job ${job.id}`);
-      // Clean up branch
-      await git(repo, ["checkout", "-"]);
-      await git(repo, ["branch", "-D", branchName]);
+      // Clean up branch in detached state (safe for worktrees and direct checkouts)
+      const detachResult = await git(repo, ["checkout", "--detach"]);
+      if (!detachResult.ok) {
+        return {
+          ok: false,
+          error: `No changes found, but failed to detach before branch cleanup: ${detachResult.stderr}`,
+        };
+      }
+      const deleteResult = await git(repo, ["branch", "-D", branchName]);
+      if (!deleteResult.ok) {
+        return { ok: false, error: `Failed to delete empty branch: ${deleteResult.stderr}` };
+      }
       return { ok: true, branch: branchName, sha: "no-changes" };
     }
 
@@ -170,6 +298,10 @@ export async function executeJob(
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<JobResult> {
+  if (useOpenHandsExecutor()) {
+    return executeWithOpenHands(kind, params, repo, onLog);
+  }
+
   let cmd: string[];
 
   switch (kind) {

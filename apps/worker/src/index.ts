@@ -7,27 +7,28 @@
  *
  * Polls the server job queue, claims jobs, executes them, and reports results.
  * Streams stdout/stderr as `job_log` events with seq numbers.
- * 
- * Job execution modes:
- *   - Direct mode (default): Jobs run directly on the host
- *   - Docker mode (--docker): Jobs run in isolated Docker containers
  *
- * Job kinds: bun.test, bun.lint, git.status, file.write, shell.exec, etc.
+ * Job execution modes:
+ *   - Direct mode (default): jobs run on host in isolated git worktrees
+ *   - Docker mode (--docker): jobs run in isolated Docker containers
  */
 
 import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
-import {
-  executeJob,
-  shouldCommit,
-  createJobCommit,
-  streamLines,
-  truncate,
-  type JobResult,
-} from "./execute_job.js";
+import { mkdirSync } from "fs";
+import { resolve } from "path";
+import { detectRepoRoot } from "shared";
+import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
 import { DockerExecutor } from "./docker_executor.js";
 
-// ─── CLI args ───────────────────────────────────────────────────────────────
+type CommitRef = {
+  branch: string;
+  sha: string;
+};
+
+type WorkerJobResult = JobResult & {
+  commit?: CommitRef;
+};
 
 function parseArgs(): {
   server: string;
@@ -36,20 +37,23 @@ function parseArgs(): {
   workerId: string;
   authToken: string | null;
   docker: boolean;
+  requireDocker: boolean;
   dockerImage: string;
   gitToken: string | null;
   dockerTimeout: number;
 } {
+  const truthy = new Set(["1", "true", "yes", "on"]);
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
-  let pollMs = 2000;
-  let repo = process.cwd();
+  let pollMs = parseInt(process.env.WORKER_POLL_MS ?? "2000", 10);
+  let repo = detectRepoRoot(process.cwd());
   let workerId = `worker-${randomUUID().substring(0, 8)}`;
   let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
   let docker = false;
-  let dockerImage = "pushpals-worker-sandbox:latest";
+  let requireDocker = truthy.has((process.env.WORKER_REQUIRE_DOCKER ?? "").toLowerCase());
+  let dockerImage = process.env.WORKER_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
   let gitToken = process.env.PUSHPALS_GIT_TOKEN ?? null;
-  let dockerTimeout = 60000;
+  let dockerTimeout = parseInt(process.env.WORKER_DOCKER_TIMEOUT_MS ?? "60000", 10);
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -60,7 +64,7 @@ function parseArgs(): {
         pollMs = parseInt(args[++i], 10);
         break;
       case "--repo":
-        repo = args[++i];
+        repo = detectRepoRoot(args[++i]);
         break;
       case "--workerId":
         workerId = args[++i];
@@ -70,6 +74,9 @@ function parseArgs(): {
         break;
       case "--docker":
         docker = true;
+        break;
+      case "--require-docker":
+        requireDocker = true;
         break;
       case "--docker-image":
         dockerImage = args[++i];
@@ -83,17 +90,32 @@ function parseArgs(): {
     }
   }
 
-  return { server, pollMs, repo, workerId, authToken, docker, dockerImage, gitToken, dockerTimeout };
+  return {
+    server,
+    pollMs,
+    repo,
+    workerId,
+    authToken,
+    docker,
+    requireDocker,
+    dockerImage,
+    gitToken,
+    dockerTimeout,
+  };
 }
 
-// ─── Job execution wrapper ──────────────────────────────────────────────────
-
 async function runJob(
-  job: { id: string; taskId: string; kind: string; params: Record<string, unknown>; sessionId: string },
+  job: {
+    id: string;
+    taskId: string;
+    kind: string;
+    params: Record<string, unknown>;
+    sessionId: string;
+  },
   repo: string,
   dockerExecutor: DockerExecutor | null,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
-): Promise<JobResult> {
+): Promise<WorkerJobResult> {
   if (dockerExecutor) {
     const result = await dockerExecutor.execute(job, onLog);
     return {
@@ -102,12 +124,69 @@ async function runJob(
       stdout: result.stdout,
       stderr: result.stderr,
       exitCode: result.exitCode,
+      commit: result.commit,
     };
   }
   return executeJob(job.kind, job.params, repo, onLog);
 }
 
-// ─── Command helper ─────────────────────────────────────────────────────────
+async function createIsolatedWorktree(repo: string, jobId: string): Promise<string> {
+  const worktreeRoot = resolve(repo, ".worktrees");
+  mkdirSync(worktreeRoot, { recursive: true });
+
+  const worktreePath = resolve(
+    worktreeRoot,
+    `host-job-${jobId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+
+  const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, "HEAD"]);
+  if (!addResult.ok) {
+    throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
+  }
+
+  return worktreePath;
+}
+
+async function removeIsolatedWorktree(repo: string, worktreePath: string): Promise<void> {
+  const removeResult = await git(repo, ["worktree", "remove", "--force", worktreePath]);
+  if (!removeResult.ok) {
+    console.error(
+      `[Worker] Worktree cleanup warning (${worktreePath}): ${removeResult.stderr || removeResult.stdout}`,
+    );
+  }
+  await git(repo, ["worktree", "prune"]);
+}
+
+async function enqueueCompletion(
+  server: string,
+  headers: Record<string, string>,
+  job: { id: string; taskId: string; kind: string; sessionId: string },
+  commit: CommitRef,
+): Promise<void> {
+  try {
+    const response = await fetch(`${server}/completions/enqueue`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jobId: job.id,
+        sessionId: job.sessionId,
+        commitSha: commit.sha,
+        branch: commit.branch,
+        message: `${job.kind}: ${job.taskId}`,
+      }),
+    });
+
+    if (response.ok) {
+      console.log(`[Worker] Enqueued completion for job ${job.id} (commit ${commit.sha})`);
+    } else {
+      console.error(
+        `[Worker] Failed to enqueue completion: ${response.status} ${await response.text()}`,
+      );
+    }
+  } catch (err) {
+    console.error(`[Worker] Failed to enqueue completion:`, err);
+  }
+}
 
 function sendCommand(
   server: string,
@@ -126,8 +205,6 @@ function sendCommand(
     .catch((err) => console.error(`[Worker] Command ${cmd.type} error:`, err));
 }
 
-// ─── Worker loop ────────────────────────────────────────────────────────────
-
 async function workerLoop(
   opts: ReturnType<typeof parseArgs>,
   dockerExecutor: DockerExecutor | null,
@@ -138,11 +215,15 @@ async function workerLoop(
   console.log(`[Worker ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
   if (dockerExecutor) {
     console.log(`[Worker ${opts.workerId}] Docker mode enabled (${opts.dockerImage})`);
+  } else {
+    console.log(`[Worker ${opts.workerId}] Direct mode with isolated worktrees enabled`);
   }
+  console.log(
+    `[Worker ${opts.workerId}] Executor backend: ${(process.env.WORKER_EXECUTOR ?? "openhands").toLowerCase()}`,
+  );
 
   while (true) {
     try {
-      // Try to claim a job
       const claimRes = await fetch(`${opts.server}/jobs/claim`, {
         method: "POST",
         headers,
@@ -156,7 +237,6 @@ async function workerLoop(
         if (job) {
           console.log(`[Worker] Claimed job ${job.id} (${job.kind})`);
 
-          // 1. Emit job_claimed event
           if (job.sessionId) {
             await sendCommand(opts.server, job.sessionId, headers, {
               type: "job_claimed",
@@ -165,7 +245,6 @@ async function workerLoop(
             });
           }
 
-          // 2. Execute with streaming logs
           let stdoutSeq = 0;
           let stderrSeq = 0;
           let logChain: Promise<void> = Promise.resolve();
@@ -183,110 +262,137 @@ async function workerLoop(
               }
             : undefined;
 
-          const jobData = {
-            id: job.id,
-            taskId: job.taskId,
-            kind: job.kind,
-            params: typeof job.params === "string" ? JSON.parse(job.params) : job.params,
-            sessionId: job.sessionId,
-          };
-          const result = await runJob(jobData, opts.repo, dockerExecutor, onLog);
+          let directWorktreePath: string | null = null;
+          let executionRepo = opts.repo;
 
-          // 3. Wait for chained log sends to complete
-          await logChain;
+          try {
+            if (!dockerExecutor) {
+              directWorktreePath = await createIsolatedWorktree(opts.repo, job.id);
+              executionRepo = directWorktreePath;
+            }
 
-          // 3.5. Create git commit for file-modifying jobs (only in direct mode)
-          if (result.ok && shouldCommit(job.kind) && !dockerExecutor) {
-            console.log(`[Worker] Job ${job.id} modified files, creating commit...`);
-            const commitResult = await createJobCommit(opts.repo, opts.workerId, {
+            const parsedParams =
+              typeof job.params === "string"
+                ? (JSON.parse(job.params) as Record<string, unknown>)
+                : job.params;
+
+            const jobData = {
               id: job.id,
               taskId: job.taskId,
               kind: job.kind,
-            });
+              params: parsedParams,
+              sessionId: job.sessionId,
+            };
 
-            if (commitResult.ok && commitResult.sha && commitResult.sha !== "no-changes") {
-              // Enqueue to Completion Queue
-              try {
-                const response = await fetch(`${opts.server}/completions/enqueue`, {
-                  method: "POST",
-                  headers,
-                  body: JSON.stringify({
-                    jobId: job.id,
-                    sessionId: job.sessionId,
-                    commitSha: commitResult.sha,
-                    branch: commitResult.branch,
-                    message: `${job.kind}: ${job.taskId}`,
-                  }),
+            let result: WorkerJobResult;
+            try {
+              result = await runJob(jobData, executionRepo, dockerExecutor, onLog);
+            } catch (err) {
+              result = {
+                ok: false,
+                summary: "Job execution failed before completion",
+                stderr: String(err),
+              };
+            }
+
+            await logChain;
+
+            let completionCommit: CommitRef | null = null;
+            if (result.ok && shouldCommit(job.kind)) {
+              if (result.commit) {
+                completionCommit = result.commit;
+              } else if (dockerExecutor) {
+                result = {
+                  ok: false,
+                  summary: `Docker job ${job.id} completed without commit metadata for ${job.kind}`,
+                  stderr: [
+                    result.stderr,
+                    "Refusing unsafe host-side commit fallback while Docker mode is active.",
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                };
+              } else {
+                console.log(`[Worker] Job ${job.id} modified files, creating commit...`);
+                const commitResult = await createJobCommit(executionRepo, opts.workerId, {
+                  id: job.id,
+                  taskId: job.taskId,
+                  kind: job.kind,
                 });
 
-                if (response.ok) {
-                  console.log(
-                    `[Worker] Enqueued completion for job ${job.id} (commit ${commitResult.sha})`,
-                  );
-                } else {
-                  console.error(
-                    `[Worker] Failed to enqueue completion: ${response.status} ${await response.text()}`,
-                  );
+                if (commitResult.ok && commitResult.sha && commitResult.branch) {
+                  if (commitResult.sha !== "no-changes") {
+                    completionCommit = {
+                      branch: commitResult.branch,
+                      sha: commitResult.sha,
+                    };
+                  }
+                } else if (commitResult.error) {
+                  console.error(`[Worker] Failed to create commit: ${commitResult.error}`);
                 }
-              } catch (err) {
-                console.error(`[Worker] Failed to enqueue completion:`, err);
               }
-            } else if (commitResult.error) {
-              console.error(`[Worker] Failed to create commit: ${commitResult.error}`);
             }
-          }
 
-          // 4. Report job result to queue
-          if (result.ok) {
-            await fetch(`${opts.server}/jobs/${job.id}/complete`, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({
-                summary: result.summary,
-                artifacts: [
-                  ...(result.stdout ? [{ kind: "stdout", text: result.stdout }] : []),
-                  ...(result.stderr ? [{ kind: "stderr", text: result.stderr }] : []),
-                ],
-              }),
-            });
-            console.log(`[Worker] Job ${job.id} completed: ${result.summary}`);
-          } else {
-            await fetch(`${opts.server}/jobs/${job.id}/fail`, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({
-                message: result.summary,
-                detail: result.stderr,
-              }),
-            });
-            console.log(`[Worker] Job ${job.id} failed: ${result.summary}`);
-          }
+            if (completionCommit) {
+              await enqueueCompletion(opts.server, headers, job, completionCommit);
+            }
 
-          // 5. Emit job_completed / job_failed event to session
-          if (job.sessionId) {
-            const eventCmd = result.ok
-              ? {
-                  type: "job_completed" as const,
-                  payload: {
-                    jobId: job.id,
-                    summary: result.summary,
-                    artifacts: result.stdout
-                      ? [{ kind: "log" as const, text: result.stdout }]
-                      : undefined,
-                  },
-                  from: `worker:${opts.workerId}`,
-                }
-              : {
-                  type: "job_failed" as const,
-                  payload: {
-                    jobId: job.id,
-                    message: result.summary,
-                    detail: result.stderr,
-                  },
-                  from: `worker:${opts.workerId}`,
-                };
+            if (result.ok) {
+              await fetch(`${opts.server}/jobs/${job.id}/complete`, {
+                method: "POST",
+                headers,
+                body: JSON.stringify({
+                  summary: result.summary,
+                  artifacts: [
+                    ...(result.stdout ? [{ kind: "stdout", text: result.stdout }] : []),
+                    ...(result.stderr ? [{ kind: "stderr", text: result.stderr }] : []),
+                  ],
+                }),
+              });
+              console.log(`[Worker] Job ${job.id} completed: ${result.summary}`);
+            } else {
+              await fetch(`${opts.server}/jobs/${job.id}/fail`, {
+                method: "POST",
+                headers,
+                body: JSON.stringify({
+                  message: result.summary,
+                  detail: result.stderr,
+                }),
+              });
+              console.log(`[Worker] Job ${job.id} failed: ${result.summary}`);
+            }
 
-            await sendCommand(opts.server, job.sessionId, headers, eventCmd);
+            if (job.sessionId) {
+              const eventCmd = result.ok
+                ? {
+                    type: "job_completed" as const,
+                    payload: {
+                      jobId: job.id,
+                      summary: result.summary,
+                      artifacts: result.stdout
+                        ? [{ kind: "log" as const, text: result.stdout }]
+                        : undefined,
+                    },
+                    from: `worker:${opts.workerId}`,
+                  }
+                : {
+                    type: "job_failed" as const,
+                    payload: {
+                      jobId: job.id,
+                      message: result.summary,
+                      detail: result.stderr,
+                    },
+                    from: `worker:${opts.workerId}`,
+                  };
+
+              await sendCommand(opts.server, job.sessionId, headers, eventCmd);
+            }
+          } finally {
+            if (directWorktreePath) {
+              await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
+                console.error(`[Worker] Failed to remove isolated worktree: ${String(err)}`);
+              });
+            }
           }
         }
       }
@@ -294,12 +400,9 @@ async function workerLoop(
       console.error(`[Worker] Poll error:`, err);
     }
 
-    // Wait before next poll
-    await new Promise((resolve) => setTimeout(resolve, opts.pollMs));
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, opts.pollMs));
   }
 }
-
-// ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   const opts = parseArgs();
@@ -311,11 +414,17 @@ async function main(): Promise<void> {
   let dockerExecutor: DockerExecutor | null = null;
 
   if (opts.docker) {
-    // Check if Docker is available
     const dockerAvailable = await DockerExecutor.isDockerAvailable();
     if (!dockerAvailable) {
-      console.error("[Worker] Docker is not available. Make sure Docker is installed and running.");
-      console.error("[Worker] Falling back to direct mode...");
+      const message =
+        "[Worker] Docker is not available. Make sure Docker is installed and running.";
+      if (opts.requireDocker) {
+        console.error(message);
+        console.error("[Worker] Exiting because --require-docker is enabled.");
+        process.exit(1);
+      }
+      console.error(message);
+      console.error("[Worker] Falling back to direct mode (isolated worktrees)...");
     } else {
       dockerExecutor = new DockerExecutor({
         imageName: opts.dockerImage,
@@ -325,17 +434,22 @@ async function main(): Promise<void> {
         timeoutMs: opts.dockerTimeout,
       });
 
-      // Clean up orphaned worktrees from previous runs
       await dockerExecutor.cleanupOrphanedWorktrees();
 
-      // Pull the image
-      const pulled = await dockerExecutor.pullImage();
-      if (!pulled) {
-        console.error(`[Worker] Failed to pull Docker image: ${opts.dockerImage}`);
-        console.error("[Worker] Falling back to direct mode...");
+      const imageReady = await dockerExecutor.pullImage();
+      if (!imageReady) {
+        console.error(`[Worker] Failed to prepare Docker image: ${opts.dockerImage}`);
+        if (opts.requireDocker) {
+          console.error("[Worker] Exiting because --require-docker is enabled.");
+          process.exit(1);
+        }
+        console.error("[Worker] Falling back to direct mode (isolated worktrees)...");
         dockerExecutor = null;
       }
     }
+  } else if (opts.requireDocker) {
+    console.error("[Worker] --require-docker was provided without --docker.");
+    process.exit(1);
   }
 
   workerLoop(opts, dockerExecutor).catch((err) => {

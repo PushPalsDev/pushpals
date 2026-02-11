@@ -110,14 +110,11 @@ export class DockerExecutor {
    */
   private async createWorktree(worktreePath: string): Promise<void> {
     // Create worktree from HEAD (detached)
-    const proc = Bun.spawn(
-      ["git", "worktree", "add", "--detach", worktreePath, "HEAD"],
-      {
-        cwd: this.options.repo,
-        stdout: "pipe",
-        stderr: "pipe",
-      },
-    );
+    const proc = Bun.spawn(["git", "worktree", "add", "--detach", worktreePath, "HEAD"], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     const exitCode = await proc.exited;
 
@@ -134,14 +131,11 @@ export class DockerExecutor {
    */
   private async removeWorktree(worktreePath: string): Promise<void> {
     // Remove worktree
-    const proc = Bun.spawn(
-      ["git", "worktree", "remove", "--force", worktreePath],
-      {
-        cwd: this.options.repo,
-        stdout: "pipe",
-        stderr: "pipe",
-      },
-    );
+    const proc = Bun.spawn(["git", "worktree", "remove", "--force", worktreePath], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     const exitCode = await proc.exited;
 

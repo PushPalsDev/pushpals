@@ -24,6 +24,15 @@ const completionQueue = new CompletionQueue(join(dataDir, "pushpals.db"));
  */
 
 export function createRequestHandler() {
+  const isDebugEnabled = (value: string | undefined): boolean => {
+    const normalized = (value ?? "").trim().toLowerCase();
+    return (
+      normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on"
+    );
+  };
+  const debugHttpLogs =
+    isDebugEnabled(process.env.PUSHPALS_DEBUG_HTTP) || isDebugEnabled(process.env.DEBUG);
+
   const envPort = parseInt(process.env.PUSHPALS_PORT ?? "", 10);
   const port = Number.isFinite(envPort) && envPort > 0 ? envPort : 3001;
   return Bun.serve({
@@ -56,10 +65,11 @@ export function createRequestHandler() {
         });
       }
 
-      // Noisy poll endpoints — only log at debug level
-      const isNoisyPoll = pathname === "/jobs/claim";
+      // Noisy poll endpoints: only log these at debug level.
+      const isNoisyPoll =
+        method === "POST" && /^\/+((jobs|requests|completions)\/claim)\/?$/.test(pathname);
       if (isNoisyPoll) {
-        if (process.env.DEBUG) console.log(`[${method}] ${pathname}`);
+        if (debugHttpLogs) console.log(`[${method}] ${pathname}`);
       } else {
         console.log(`[${method}] ${pathname}`);
       }

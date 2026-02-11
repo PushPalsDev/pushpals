@@ -207,13 +207,15 @@ User manually runs: git push origin main
 - **Type**: Polling Daemon
 - **Functionality**:
   - Polls Job Queue for work
-  - Executes jobs (file operations, git, tests, etc.)
+  - Executes jobs through an **OpenHands SDK wrapper** (workspace API)
+  - Uses isolated git worktrees so your active workspace branch is not switched
   - Creates git commit on new branch
   - Pushes branch to origin
   - Enqueues to Completion Queue
 - **Git Workflow**:
   ```bash
-  git checkout -b agent/{workerId}/{jobId}
+  # in an isolated worktree (host) or isolated container worktree (docker)
+  git checkout -B agent/{workerId}/{jobId}
   git add -A
   git commit -m "{kind}: {taskId}\n\nJob: {jobId}\nWorker: {workerId}"
   git push origin agent/{workerId}/{jobId}
@@ -272,6 +274,16 @@ LLM_ENDPOINT=http://localhost:11434/v1  # Ollama
 
 # Worker
 WORKER_POLL_MS=2000
+# Executor backend: "openhands" (default) or "native" (legacy fallback)
+WORKER_EXECUTOR=openhands
+# Optional python binary for wrapper process
+WORKER_OPENHANDS_PYTHON=python
+# Optional workspace-side python binary used by OpenHands commands
+WORKER_OPENHANDS_WORKSPACE_PYTHON=python3
+# Max time per OpenHands job execution
+WORKER_OPENHANDS_TIMEOUT_MS=120000
+# Require Docker isolation when running --docker
+WORKER_REQUIRE_DOCKER=1
 
 # Serial Pusher
 SERIAL_PUSHER_POLL_MS=10000
@@ -411,6 +423,9 @@ bun install
 
 # Run full stack (dev session defaults to "dev")
 bun run dev:full
+# or use the stable wrapper:
+# bun run start
+# `start` preflights Docker and auto-builds the worker image if missing.
 ```
 
 If you need a custom session:
@@ -425,6 +440,8 @@ bun run dev:full
 
 - `client:only` = normal Expo startup (online)
 - `client:only:offline` = Expo --offline (used by dev:full)
+- `worker:only:docker` = strict Docker worker mode (`--docker --require-docker`) using OpenHands wrapper execution
+- `worker:only` = host mode worker (still OpenHands-backed by default)
 - `serial-pusher:only` = strict (requires clean clone)
 - `serial-pusher:only:dev` = runs with --skip-clean-check (used by dev:full)
 
