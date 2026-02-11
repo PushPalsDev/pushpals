@@ -355,7 +355,9 @@ function buildStageCommand(kind: string, params?: Record<string, unknown>): stri
 }
 
 function sanitizeCommitValue(value: unknown, max = 140): string {
-  const s = String(value ?? "").replace(/\s+/g, " ").trim();
+  const s = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!s) return "";
   return s.length > max ? `${s.slice(0, max - 3)}...` : s;
 }
@@ -407,10 +409,7 @@ function buildWorkerCommitMessage(
 ): string {
   const action = summarizeJobAction(job.kind, job.params);
   const shortJob = sanitizeCommitValue(job.id, 12);
-  const subject = sanitizeCommitValue(
-    `worker(${workerId}): ${action} [job ${shortJob}]`,
-    72,
-  );
+  const subject = sanitizeCommitValue(`worker(${workerId}): ${action} [job ${shortJob}]`, 72);
 
   const lines = [
     subject || `worker(${workerId}): ${job.kind}`,

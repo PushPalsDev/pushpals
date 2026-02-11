@@ -20,8 +20,7 @@ const INTEGRATION_BRANCH =
 const INTEGRATION_REMOTE_REF = `origin/${INTEGRATION_BRANCH}`;
 const DEFAULT_INTEGRATION_BASE_BRANCH = "main";
 const INTEGRATION_BASE_BRANCH =
-  (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() ||
-  DEFAULT_INTEGRATION_BASE_BRANCH;
+  (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BASE_BRANCH;
 const INTEGRATION_BASE_REMOTE_REF = `origin/${INTEGRATION_BASE_BRANCH}`;
 const workerImage = process.env.WORKER_DOCKER_IMAGE ?? DEFAULT_IMAGE;
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -280,7 +279,9 @@ async function ensureIntegrationBranch(): Promise<void> {
 
 async function ensureSerialPusherWorktree(): Promise<void> {
   const configuredPath = (process.env.SERIAL_PUSHER_REPO_PATH ?? "").trim();
-  const repoPath = configuredPath ? resolve(repoRoot, configuredPath) : DEFAULT_SERIAL_PUSHER_WORKTREE;
+  const repoPath = configuredPath
+    ? resolve(repoRoot, configuredPath)
+    : DEFAULT_SERIAL_PUSHER_WORKTREE;
 
   if (repoPath === repoRoot) {
     console.error(
@@ -292,7 +293,10 @@ async function ensureSerialPusherWorktree(): Promise<void> {
     process.exit(1);
   }
 
-  const isGitRepo = await runCapture(["git", "-C", repoPath, "rev-parse", "--is-inside-work-tree"], repoRoot);
+  const isGitRepo = await runCapture(
+    ["git", "-C", repoPath, "rev-parse", "--is-inside-work-tree"],
+    repoRoot,
+  );
   if (!isGitRepo.ok) {
     mkdirSync(resolve(repoPath, ".."), { recursive: true });
 
@@ -303,7 +307,12 @@ async function ensureSerialPusherWorktree(): Promise<void> {
       );
     }
 
-    const seedCandidates = [INTEGRATION_REMOTE_REF, INTEGRATION_BRANCH, INTEGRATION_BASE_REMOTE_REF, "HEAD"];
+    const seedCandidates = [
+      INTEGRATION_REMOTE_REF,
+      INTEGRATION_BRANCH,
+      INTEGRATION_BASE_REMOTE_REF,
+      "HEAD",
+    ];
     let seedRef = "HEAD";
     for (const ref of seedCandidates) {
       const exists = await git(["rev-parse", "--verify", "--quiet", ref]);

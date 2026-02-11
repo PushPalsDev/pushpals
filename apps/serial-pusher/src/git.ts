@@ -322,7 +322,9 @@ export class GitOps {
 
     const mergeResult = await git(this.repoPath, ["merge", baseRef, "--no-edit"]);
     if (!mergeResult.ok) {
-      throw new Error(`Failed to sync ${this.mainBranch} with ${baseRef}: ${mergeResult.stderr || mergeResult.stdout}`);
+      throw new Error(
+        `Failed to sync ${this.mainBranch} with ${baseRef}: ${mergeResult.stderr || mergeResult.stdout}`,
+      );
     }
   }
 
@@ -336,13 +338,7 @@ export class GitOps {
     const baseRef = (await this.revParse(this.localMainBranch))
       ? this.localMainBranch
       : await this.resolveMainBaseRef();
-    const result = await git(this.repoPath, [
-      "checkout",
-      "-B",
-      name,
-      baseRef,
-      "--quiet",
-    ]);
+    const result = await git(this.repoPath, ["checkout", "-B", name, baseRef, "--quiet"]);
     assertOk(result, `checkout -B ${name}`);
   }
 

@@ -150,7 +150,12 @@ async function runJob(
 async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promise<string> {
   const integrationBranch = integrationBranchName();
   const integrationRemoteRef = `origin/${integrationBranch}`;
-  const candidates = new Set<string>([requestedRef, integrationRemoteRef, integrationBranch, "HEAD"]);
+  const candidates = new Set<string>([
+    requestedRef,
+    integrationRemoteRef,
+    integrationBranch,
+    "HEAD",
+  ]);
   if (requestedRef.startsWith("origin/")) {
     const branch = requestedRef.slice("origin/".length);
     const fetchResult = await git(repo, ["fetch", "origin", branch, "--quiet"]);
@@ -172,7 +177,11 @@ async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promi
   return "HEAD";
 }
 
-async function createIsolatedWorktree(repo: string, jobId: string, baseRef: string): Promise<string> {
+async function createIsolatedWorktree(
+  repo: string,
+  jobId: string,
+  baseRef: string,
+): Promise<string> {
   const worktreeRoot = resolve(repo, ".worktrees");
   mkdirSync(worktreeRoot, { recursive: true });
 

@@ -135,9 +135,9 @@ export class DockerExecutor {
     const proc = Bun.spawn(
       ["git", "worktree", "add", "--detach", worktreePath, this.options.baseRef],
       {
-      cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
+        cwd: this.options.repo,
+        stdout: "pipe",
+        stderr: "pipe",
       },
     );
 
