@@ -333,9 +333,9 @@ export class RemotePlanner implements PlannerModel {
     } = {},
   ) {
     this.endpoint =
-      opts.endpoint ?? process.env.PLANNER_ENDPOINT ?? "http://localhost:11434/api/chat";
+      opts.endpoint ?? process.env.PLANNER_ENDPOINT ?? "http://localhost:18123/v1/chat/completions";
     this.apiKey = opts.apiKey ?? process.env.PLANNER_API_KEY ?? null;
-    this.model = opts.model ?? process.env.PLANNER_MODEL ?? "llama3";
+    this.model = opts.model ?? process.env.PLANNER_MODEL ?? "zai-org/GLM-4.7-Flash";
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {
@@ -346,19 +346,23 @@ ${input.repoContext?.gitDiff ? `\nGit diff (truncated):\n${input.repoContext.git
     try {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
+      const isOllamaChatApi = this.endpoint.includes("/api/chat");
+      const body: Record<string, unknown> = {
+        model: this.model,
+        messages: [
+          { role: "system", content: REMOTE_PLANNER_SYSTEM_PROMPT },
+          { role: "user", content: userPrompt },
+        ],
+        stream: false,
+      };
+      if (isOllamaChatApi) {
+        body.format = "json";
+      }
 
       const response = await fetch(this.endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify({
-          model: this.model,
-          messages: [
-            { role: "system", content: REMOTE_PLANNER_SYSTEM_PROMPT },
-            { role: "user", content: userPrompt },
-          ],
-          stream: false,
-          format: "json",
-        }),
+        body: JSON.stringify(body),
       });
 
       if (!response.ok) {

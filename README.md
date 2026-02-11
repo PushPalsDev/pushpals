@@ -100,6 +100,12 @@ See `.env.example` for full details. Most important:
 - `WORKERPALS_DOCKER_IMAGE`
 - `WORKERPALS_REQUIRE_DOCKER`
 
+LLM defaults:
+
+- Generic OpenAI-compatible mode defaults to vLLM (`LLM_ENDPOINT=http://localhost:18123`)
+- Default model is `zai-org/GLM-4.7-Flash` (override with `LLM_MODEL`)
+- WorkerPals OpenHands agent mode reuses `LLM_*`/`OPENAI_*` vars unless `WORKERPALS_OPENHANDS_*` is set
+
 ## Repo Layout
 
 - `apps/server`: HTTP API, sessions, queues, worker heartbeats

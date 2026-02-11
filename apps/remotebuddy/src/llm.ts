@@ -162,11 +162,11 @@ export class GenericOpenAIClient extends OpenAIClient {
   private readonly resolvedModel: string;
 
   constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
-    const endpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? "http://localhost:11434";
-    const model = opts?.model ?? process.env.LLM_MODEL ?? "llama3";
+    const endpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? "http://localhost:18123";
+    const model = opts?.model ?? process.env.LLM_MODEL ?? "zai-org/GLM-4.7-Flash";
     super({
       endpoint,
-      apiKey: opts?.apiKey ?? process.env.LLM_API_KEY ?? "ollama",
+      apiKey: opts?.apiKey ?? process.env.LLM_API_KEY ?? "vllm",
       model,
     });
     this.resolvedEndpoint = endpoint;
@@ -198,7 +198,7 @@ export function createLLMClient(): LLMClient {
     console.log("[LLM] Using generic OpenAI-compatible provider");
     return new GenericOpenAIClient();
   }
-  // Default: try Ollama at localhost
-  console.log("[LLM] No API key found — defaulting to Ollama at localhost:11434");
+  // Default: try vLLM OpenAI-compatible server on localhost.
+  console.log("[LLM] No provider keys found - defaulting to vLLM at localhost:18123");
   return new GenericOpenAIClient();
 }
