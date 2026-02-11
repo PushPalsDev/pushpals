@@ -17,6 +17,7 @@
 
 import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
+import { Database } from "bun:sqlite";
 import { createLLMClient } from "./llm.js";
 import { AgentBrain } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
@@ -55,12 +56,83 @@ function parseArgs(): {
 
 // ─── Remote Orchestrator ────────────────────────────────────────────────────
 
+function isLikelyChitChat(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return true;
+  const short = t.length <= 40;
+  return short && /^(hi|hello|hey|thanks|thank you|ok|okay|cool|nice|yo)[!. ]*$/.test(t);
+}
+
+function extractTargetPath(text: string): string | null {
+  const patterns = [
+    /file\s+(?:called|named)\s+["'`]?([^"'`\s]+)["'`]?/i,
+    /create\s+(?:a\s+)?file\s+["'`]?([^"'`\s]+)["'`]?/i,
+    /write\s+(?:to|into)\s+["'`]?([^"'`\s]+)["'`]?/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const value = (match[1] ?? "").trim().replace(/[.,!?;:]+$/, "");
+    if (!value) continue;
+    if (value.includes("/") || value.includes("\\") || value.includes(".")) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function toSingleLine(value: unknown, max = 220): string {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function envTruthy(name: string, fallback = false): boolean {
+  const raw = process.env[name];
+  if (raw == null) return fallback;
+  const text = raw.trim().toLowerCase();
+  return text === "1" || text === "true" || text === "yes" || text === "on";
+}
+
+function envInt(name: string, fallback: number): number {
+  const raw = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(raw) ? raw : fallback;
+}
+
+interface WorkerSnapshot {
+  workerId: string;
+  status: "idle" | "busy" | "error" | "offline";
+  currentJobId: string | null;
+  pollMs: number | null;
+  capabilities: Record<string, unknown>;
+  details: Record<string, unknown>;
+  lastHeartbeat: string;
+  createdAt: string;
+  updatedAt: string;
+  activeJobCount: number;
+  isOnline: boolean;
+}
+
 class RemoteOrchestrator {
   private readonly agentId = "remote-orchestrator";
   private readonly server: string;
   private readonly sessionId: string;
   private readonly authToken: string | null;
   private readonly repo: string;
+  private readonly jobsDbPath: string;
+  private readonly workerOnlineTtlMs: number;
+  private readonly waitForWorkerMs: number;
+  private readonly autoSpawnWorkers: boolean;
+  private readonly maxWorkers: number;
+  private readonly workerStartupTimeoutMs: number;
+  private readonly spawnWorkerDocker: boolean;
+  private readonly spawnWorkerRequireDocker: boolean;
+  private readonly spawnWorkerImage: string | null;
+  private readonly spawnWorkerPollMs: number | null;
+  private readonly spawnWorkerHeartbeatMs: number | null;
+  private readonly spawnWorkerLabels: string[];
+  private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
+  private jobsDb: Database | null = null;
   private disposed = false;
 
   /** Serialises async request handling to preserve ordering */
@@ -80,16 +152,44 @@ class RemoteOrchestrator {
     authToken: string | null;
     brain: AgentBrain;
     idempotency: IdempotencyStore;
+    jobsDbPath: string;
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
+    this.jobsDbPath = opts.jobsDbPath;
+    this.workerOnlineTtlMs = Math.max(1_000, envInt("REMOTE_AGENT_WORKER_ONLINE_TTL_MS", 15_000));
+    this.waitForWorkerMs = Math.max(0, envInt("REMOTE_AGENT_WAIT_FOR_WORKER_MS", 15_000));
+    this.autoSpawnWorkers = envTruthy("REMOTE_AGENT_AUTO_SPAWN_WORKERS", true);
+    this.maxWorkers = Math.max(1, envInt("REMOTE_AGENT_MAX_WORKERS", 1));
+    this.workerStartupTimeoutMs = Math.max(
+      1_000,
+      envInt("REMOTE_AGENT_WORKER_STARTUP_TIMEOUT_MS", 10_000),
+    );
+    this.spawnWorkerDocker = envTruthy("REMOTE_AGENT_WORKER_DOCKER", true);
+    this.spawnWorkerRequireDocker = envTruthy("REMOTE_AGENT_WORKER_REQUIRE_DOCKER", true);
+    this.spawnWorkerImage = (process.env.REMOTE_AGENT_WORKER_IMAGE ?? "").trim() || null;
+    this.spawnWorkerPollMs = (() => {
+      const value = envInt("REMOTE_AGENT_WORKER_POLL_MS", NaN);
+      return Number.isFinite(value) && value > 0 ? value : null;
+    })();
+    this.spawnWorkerHeartbeatMs = (() => {
+      const value = envInt("REMOTE_AGENT_WORKER_HEARTBEAT_MS", NaN);
+      return Number.isFinite(value) && value > 0 ? value : null;
+    })();
+    this.spawnWorkerLabels = (process.env.REMOTE_AGENT_WORKER_LABELS ?? "")
+      .split(",")
+      .map((label) => label.trim())
+      .filter(Boolean);
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
     console.log(`[Orchestrator] Detected repo root: ${this.repo}`);
+    console.log(
+      `[Orchestrator] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
+    );
   }
 
   // ── HTTP helpers ──────────────────────────────────────────────────────
@@ -126,12 +226,21 @@ class RemoteOrchestrator {
     taskId: string,
     kind: string,
     params: Record<string, unknown>,
+    targetWorkerId: string | null = null,
   ): Promise<string | null> {
     try {
+      const payload: Record<string, unknown> = {
+        taskId,
+        sessionId: this.sessionId,
+        kind,
+        params,
+      };
+      if (targetWorkerId) payload.targetWorkerId = targetWorkerId;
+
       const res = await fetch(`${this.server}/jobs/enqueue`, {
         method: "POST",
         headers: this.authHeaders(),
-        body: JSON.stringify({ taskId, sessionId: this.sessionId, kind, params }),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) {
         const err = await res.text();
@@ -157,6 +266,194 @@ class RemoteOrchestrator {
     if (this.recentContext.length > RemoteOrchestrator.MAX_CONTEXT) {
       this.recentContext.shift();
     }
+  }
+
+  private getRecentJobContext(limit: number = 12): Array<Record<string, unknown>> {
+    try {
+      if (!this.jobsDb) {
+        this.jobsDb = new Database(this.jobsDbPath);
+      }
+      const rows = this.jobsDb
+        .prepare(
+          `SELECT id, taskId, kind, status, workerId, result, error, updatedAt
+           FROM jobs
+           WHERE sessionId = ?
+           ORDER BY updatedAt DESC
+           LIMIT ?`,
+        )
+        .all(this.sessionId, Math.max(1, Math.min(limit, 50))) as Array<{
+        id: string;
+        taskId: string;
+        kind: string;
+        status: string;
+        workerId: string | null;
+        result: string | null;
+        error: string | null;
+        updatedAt: string;
+      }>;
+
+      return rows.map((row) => {
+        let summary = "";
+        let errorMessage = "";
+        try {
+          if (row.result) {
+            const parsed = JSON.parse(row.result) as { summary?: string };
+            summary = toSingleLine(parsed.summary ?? "");
+          }
+        } catch {
+          summary = "";
+        }
+        try {
+          if (row.error) {
+            const parsed = JSON.parse(row.error) as { message?: string; detail?: string };
+            errorMessage = toSingleLine(parsed.message ?? parsed.detail ?? "");
+          }
+        } catch {
+          errorMessage = toSingleLine(row.error ?? "");
+        }
+        return {
+          jobId: row.id,
+          taskId: row.taskId,
+          kind: row.kind,
+          status: row.status,
+          workerId: row.workerId,
+          summary,
+          error: errorMessage,
+          updatedAt: row.updatedAt,
+        };
+      });
+    } catch (err) {
+      console.warn("[Orchestrator] Could not read recent job context:", err);
+      return [];
+    }
+  }
+
+  private async fetchWorkers(): Promise<WorkerSnapshot[]> {
+    try {
+      const res = await fetch(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
+        method: "GET",
+        headers: this.authHeaders(),
+      });
+      if (!res.ok) return [];
+      const data = (await res.json()) as { ok: boolean; workers?: WorkerSnapshot[] };
+      return data.ok ? (data.workers ?? []) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private pickIdleWorker(workers: WorkerSnapshot[]): WorkerSnapshot | null {
+    const idle = workers
+      .filter((worker) => worker.isOnline && worker.status !== "offline" && worker.activeJobCount === 0)
+      .sort((a, b) => Date.parse(b.lastHeartbeat) - Date.parse(a.lastHeartbeat));
+    return idle[0] ?? null;
+  }
+
+  private async waitForIdleWorker(
+    timeoutMs: number,
+    preferredWorkerId?: string,
+  ): Promise<WorkerSnapshot | null> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (true) {
+      const workers = await this.fetchWorkers();
+      if (preferredWorkerId) {
+        const preferred = workers.find(
+          (worker) =>
+            worker.workerId === preferredWorkerId &&
+            worker.isOnline &&
+            worker.status !== "offline" &&
+            worker.activeJobCount === 0,
+        );
+        if (preferred) return preferred;
+      }
+
+      const idle = this.pickIdleWorker(workers);
+      if (idle) return idle;
+      if (Date.now() >= deadline) return null;
+      await Bun.sleep(500);
+    }
+  }
+
+  private buildWorkerSpawnCommand(workerId: string): string[] {
+    const args = [
+      "bun",
+      "--cwd",
+      "apps/worker",
+      "--env-file",
+      "../../.env",
+      "run",
+      "src/index.ts",
+      "--server",
+      this.server,
+      "--workerId",
+      workerId,
+    ];
+    if (this.spawnWorkerPollMs) {
+      args.push("--poll", String(this.spawnWorkerPollMs));
+    }
+    if (this.spawnWorkerHeartbeatMs) {
+      args.push("--heartbeat", String(this.spawnWorkerHeartbeatMs));
+    }
+    if (this.spawnWorkerLabels.length > 0) {
+      args.push("--labels", this.spawnWorkerLabels.join(","));
+    }
+    if (this.spawnWorkerDocker) {
+      args.push("--docker");
+      if (this.spawnWorkerRequireDocker) args.push("--require-docker");
+      if (this.spawnWorkerImage) {
+        args.push("--docker-image", this.spawnWorkerImage);
+      }
+    }
+    return args;
+  }
+
+  private async spawnWorker(): Promise<string | null> {
+    if (this.managedWorkers.size >= this.maxWorkers) {
+      return null;
+    }
+    const workerId = `worker-${randomUUID().substring(0, 8)}`;
+    const cmd = this.buildWorkerSpawnCommand(workerId);
+    console.log(
+      `[Orchestrator] Spawning worker ${workerId} (${this.managedWorkers.size + 1}/${this.maxWorkers})`,
+    );
+    try {
+      const child = Bun.spawn(cmd, {
+        cwd: this.repo,
+        stdin: "ignore",
+        stdout: "inherit",
+        stderr: "inherit",
+      });
+      this.managedWorkers.set(workerId, child);
+      child.exited.then((code) => {
+        this.managedWorkers.delete(workerId);
+        console.warn(`[Orchestrator] Worker process ${workerId} exited with code ${code}`);
+      });
+
+      const ready = await this.waitForIdleWorker(this.workerStartupTimeoutMs, workerId);
+      if (ready) return ready.workerId;
+      console.warn(`[Orchestrator] Worker ${workerId} did not report ready within timeout`);
+      return null;
+    } catch (err) {
+      console.error(`[Orchestrator] Failed to spawn worker ${workerId}:`, err);
+      return null;
+    }
+  }
+
+  private async selectTargetWorkerForJob(): Promise<string | null> {
+    const workers = await this.fetchWorkers();
+    const idleNow = this.pickIdleWorker(workers);
+    if (idleNow) {
+      return idleNow.workerId;
+    }
+
+    const onlineWorkers = workers.filter((worker) => worker.isOnline && worker.status !== "offline");
+    if (this.autoSpawnWorkers && onlineWorkers.length < this.maxWorkers) {
+      const spawned = await this.spawnWorker();
+      if (spawned) return spawned;
+    }
+
+    const waited = await this.waitForIdleWorker(this.waitForWorkerMs);
+    return waited?.workerId ?? null;
   }
 
   // In this architecture, Remote Agent only creates tasks/jobs via polling
@@ -194,39 +491,61 @@ class RemoteOrchestrator {
       turnId,
     });
 
-    // Create tasks and enqueue jobs if actions are present
-    if (output.tasks && output.tasks.length > 0) {
-      for (const task of output.tasks) {
-        const taskId = randomUUID();
+    const actionable = !isLikelyChitChat(request.originalPrompt ?? "");
+    let tasksCreated = 0;
+    if (actionable) {
+      const taskId = randomUUID();
+      const targetWorkerId = await this.selectTargetWorkerForJob();
+      const targetPath =
+        extractTargetPath(request.originalPrompt ?? "") ?? extractTargetPath(enhancedPrompt ?? "");
+      const params: Record<string, unknown> = {
+        requestId,
+        sessionId: this.sessionId,
+        instruction: request.originalPrompt,
+        enhancedPrompt,
+        targetWorkerId,
+        targetPath,
+        repoRoot: this.repo,
+        recentContext: this.recentContext.slice(-RemoteOrchestrator.MAX_CONTEXT),
+        recentJobs: this.getRecentJobContext(),
+      };
 
+      await this.sendCommand({
+        type: "task_created",
+        payload: {
+          taskId,
+          title: `Execute request: ${toSingleLine(request.originalPrompt, 64) || "user request"}`,
+          description: "Worker-owned execution plan from shared context",
+          createdBy: `agent:${this.agentId}`,
+        },
+        turnId,
+      });
+
+      await this.sendCommand({
+        type: "task_started",
+        payload: { taskId },
+        turnId,
+      });
+
+      await this.sendCommand({
+        type: "task_progress",
+        payload: {
+          taskId,
+          message: targetWorkerId
+            ? `Assigned to worker ${targetWorkerId}`
+            : "No idle worker available; queued for first available worker",
+        },
+        turnId,
+      });
+
+      const jobId = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
+      if (jobId) {
         await this.sendCommand({
-          type: "task_created",
-          payload: {
-            taskId,
-            title: task.title,
-            description: task.description,
-            createdBy: `agent:${this.agentId}`,
-          },
+          type: "job_enqueued",
+          payload: { jobId, taskId, kind: "task.execute", params },
           turnId,
         });
-
-        await this.sendCommand({
-          type: "task_started",
-          payload: { taskId },
-          turnId,
-        });
-
-        // Enqueue jobs for this task
-        for (const job of task.jobs) {
-          const jobId = await this.enqueueJob(taskId, job.kind, job.params ?? {});
-          if (jobId) {
-            await this.sendCommand({
-              type: "job_enqueued",
-              payload: { jobId, taskId, kind: job.kind, params: job.params ?? {} },
-              turnId,
-            });
-          }
-        }
+        tasksCreated = 1;
       }
     }
 
@@ -235,7 +554,7 @@ class RemoteOrchestrator {
       await fetch(`${this.server}/requests/${requestId}/complete`, {
         method: "POST",
         headers: this.authHeaders(),
-        body: JSON.stringify({ result: { tasksCreated: output.tasks?.length ?? 0 } }),
+        body: JSON.stringify({ result: { tasksCreated } }),
       });
     } catch (err) {
       console.error(`[Orchestrator] Failed to mark request complete:`, err);
@@ -275,6 +594,22 @@ class RemoteOrchestrator {
 
   dispose(): void {
     this.disposed = true;
+    for (const [workerId, proc] of this.managedWorkers.entries()) {
+      try {
+        proc.kill();
+      } catch {
+        // ignore process kill failures during shutdown
+      }
+      this.managedWorkers.delete(workerId);
+    }
+    if (this.jobsDb) {
+      try {
+        this.jobsDb.close();
+      } catch {
+        // ignore close errors on shutdown
+      }
+      this.jobsDb = null;
+    }
   }
 }
 
@@ -320,12 +655,13 @@ async function main() {
 
   // ── Initialise LLM + brain ──
   const llm = createLLMClient();
-  const brain = new AgentBrain(llm, { actionsEnabled: true });
+  const brain = new AgentBrain(llm, { actionsEnabled: false });
 
   // ── Initialise idempotency store ──
   const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
   const dataDir = process.env.PUSHPALS_DATA_DIR ?? join(PROJECT_ROOT, "outputs", "data");
   mkdirSync(dataDir, { recursive: true });
+  const sharedDbPath = process.env.PUSHPALS_DB_PATH ?? join(dataDir, "pushpals.db");
   const dbPath = process.env.AGENT_REMOTE_DB_PATH ?? join(dataDir, "agent-remote-state.db");
   const idempotency = new IdempotencyStore(dbPath);
   console.log(`[Orchestrator] Idempotency store: ${dbPath}`);
@@ -341,6 +677,7 @@ async function main() {
     authToken: opts.authToken,
     brain,
     idempotency,
+    jobsDbPath: sharedDbPath,
   });
 
   // Start polling for requests from the Request Queue

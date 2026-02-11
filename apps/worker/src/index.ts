@@ -44,6 +44,7 @@ function integrationBranchName(): string {
 function parseArgs(): {
   server: string;
   pollMs: number;
+  heartbeatMs: number;
   repo: string;
   workerId: string;
   authToken: string | null;
@@ -53,10 +54,12 @@ function parseArgs(): {
   gitToken: string | null;
   dockerTimeout: number;
   worktreeBaseRef: string;
+  labels: string[];
 } {
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
   let pollMs = parseInt(process.env.WORKER_POLL_MS ?? "2000", 10);
+  let heartbeatMs = parseInt(process.env.WORKER_HEARTBEAT_MS ?? "5000", 10);
   let repo = detectRepoRoot(process.cwd());
   let workerId = `worker-${randomUUID().substring(0, 8)}`;
   let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
@@ -67,6 +70,10 @@ function parseArgs(): {
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
   let dockerTimeout = parseInt(process.env.WORKER_DOCKER_TIMEOUT_MS ?? "60000", 10);
   let worktreeBaseRef = process.env.WORKER_BASE_REF ?? `origin/${integrationBranchName()}`;
+  let labels = (process.env.WORKER_LABELS ?? "")
+    .split(",")
+    .map((label) => label.trim())
+    .filter(Boolean);
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -75,6 +82,9 @@ function parseArgs(): {
         break;
       case "--poll":
         pollMs = parseInt(args[++i], 10);
+        break;
+      case "--heartbeat":
+        heartbeatMs = parseInt(args[++i], 10);
         break;
       case "--repo":
         repo = detectRepoRoot(args[++i]);
@@ -103,12 +113,19 @@ function parseArgs(): {
       case "--base-ref":
         worktreeBaseRef = args[++i];
         break;
+      case "--labels":
+        labels = args[++i]
+          .split(",")
+          .map((label) => label.trim())
+          .filter(Boolean);
+        break;
     }
   }
 
   return {
     server,
     pollMs,
+    heartbeatMs: Number.isFinite(heartbeatMs) && heartbeatMs > 0 ? heartbeatMs : pollMs,
     repo,
     workerId,
     authToken,
@@ -118,6 +135,7 @@ function parseArgs(): {
     gitToken,
     dockerTimeout,
     worktreeBaseRef,
+    labels,
   };
 }
 
@@ -256,6 +274,41 @@ function sendCommand(
     .catch((err) => console.error(`[Worker] Command ${cmd.type} error:`, err));
 }
 
+type WorkerHeartbeatStatus = "idle" | "busy" | "error" | "offline";
+
+async function sendWorkerHeartbeat(
+  opts: ReturnType<typeof parseArgs>,
+  headers: Record<string, string>,
+  status: WorkerHeartbeatStatus,
+  currentJobId: string | null = null,
+): Promise<void> {
+  try {
+    await fetch(`${opts.server}/workers/heartbeat`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        workerId: opts.workerId,
+        status,
+        currentJobId,
+        pollMs: opts.pollMs,
+        capabilities: {
+          docker: opts.docker,
+          labels: opts.labels,
+          executor: (process.env.WORKER_EXECUTOR ?? "openhands").toLowerCase(),
+          requireDocker: opts.requireDocker,
+        },
+        details: {
+          repo: opts.repo,
+          baseRef: opts.worktreeBaseRef,
+          dockerImage: opts.docker ? opts.dockerImage : null,
+        },
+      }),
+    });
+  } catch (err) {
+    console.error(`[Worker] Heartbeat error:`, err);
+  }
+}
+
 async function workerLoop(
   opts: ReturnType<typeof parseArgs>,
   dockerExecutor: DockerExecutor | null,
@@ -272,9 +325,25 @@ async function workerLoop(
   console.log(
     `[Worker ${opts.workerId}] Executor backend: ${(process.env.WORKER_EXECUTOR ?? "openhands").toLowerCase()}`,
   );
+  const heartbeatEveryMs = Math.max(1000, opts.heartbeatMs);
+  let lastHeartbeatAt = 0;
+
+  const maybeHeartbeat = async (
+    status: WorkerHeartbeatStatus,
+    currentJobId: string | null = null,
+    force = false,
+  ) => {
+    const now = Date.now();
+    if (!force && now - lastHeartbeatAt < heartbeatEveryMs) return;
+    await sendWorkerHeartbeat(opts, headers, status, currentJobId);
+    lastHeartbeatAt = now;
+  };
+
+  await maybeHeartbeat("idle", null, true);
 
   while (true) {
     try {
+      await maybeHeartbeat("idle");
       const claimRes = await fetch(`${opts.server}/jobs/claim`, {
         method: "POST",
         headers,
@@ -287,6 +356,11 @@ async function workerLoop(
 
         if (job) {
           console.log(`[Worker] Claimed job ${job.id} (${job.kind})`);
+          await maybeHeartbeat("busy", job.id, true);
+
+          const busyHeartbeat = setInterval(() => {
+            void sendWorkerHeartbeat(opts, headers, "busy", job.id);
+          }, heartbeatEveryMs);
 
           if (job.sessionId) {
             await sendCommand(opts.server, job.sessionId, headers, {
@@ -450,6 +524,8 @@ async function workerLoop(
               await sendCommand(opts.server, job.sessionId, headers, eventCmd);
             }
           } finally {
+            clearInterval(busyHeartbeat);
+            await maybeHeartbeat("idle", null, true);
             if (directWorktreePath) {
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                 console.error(`[Worker] Failed to remove isolated worktree: ${String(err)}`);
@@ -460,6 +536,7 @@ async function workerLoop(
       }
     } catch (err) {
       console.error(`[Worker] Poll error:`, err);
+      await maybeHeartbeat("error", null, true);
     }
 
     await new Promise((resolvePromise) => setTimeout(resolvePromise, opts.pollMs));

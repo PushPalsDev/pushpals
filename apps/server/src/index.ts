@@ -12,12 +12,11 @@ const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
 const dataDir = process.env.PUSHPALS_DATA_DIR ?? join(PROJECT_ROOT, "outputs", "data");
 mkdirSync(dataDir, { recursive: true });
 
-const sessionManager = new SessionManager(
-  process.env.PUSHPALS_DB_PATH ?? join(dataDir, "pushpals.db"),
-);
-const jobQueue = new JobQueue();
-const requestQueue = new RequestQueue(join(dataDir, "pushpals.db"));
-const completionQueue = new CompletionQueue(join(dataDir, "pushpals.db"));
+const sharedDbPath = process.env.PUSHPALS_DB_PATH ?? join(dataDir, "pushpals.db");
+const sessionManager = new SessionManager(sharedDbPath);
+const jobQueue = new JobQueue(sharedDbPath);
+const requestQueue = new RequestQueue(sharedDbPath);
+const completionQueue = new CompletionQueue(sharedDbPath);
 
 /**
  * HTTP Middleware & Routes
@@ -67,7 +66,9 @@ export function createRequestHandler() {
 
       // Noisy poll endpoints: only log these at debug level.
       const isNoisyPoll =
-        method === "POST" && /^\/+((jobs|requests|completions)\/claim)\/?$/.test(pathname);
+        (method === "POST" &&
+          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat)\/?$/.test(pathname)) ||
+        (method === "GET" && /^\/+workers\/?$/.test(pathname));
       if (isNoisyPoll) {
         if (debugHttpLogs) console.log(`[${method}] ${pathname}`);
       } else {
@@ -264,6 +265,27 @@ export function createRequestHandler() {
         const workerId = (body.workerId as string) || "unknown";
         const result = jobQueue.claim(workerId);
         return makeJson(result, result.ok ? 200 : 404);
+      }
+
+      // POST /workers/heartbeat
+      if (pathname === "/workers/heartbeat" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = jobQueue.heartbeat(body);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // GET /workers
+      if (pathname === "/workers" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const ttlMsRaw = parseInt(url.searchParams.get("ttlMs") ?? "", 10);
+        const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
+        const workers = jobQueue.listWorkers(ttlMs);
+        return makeJson({ ok: true, workers });
       }
 
       // POST /jobs/:id/complete
