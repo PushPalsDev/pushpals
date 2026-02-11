@@ -323,6 +323,9 @@ async function workerLoop(
                   id: job.id,
                   taskId: job.taskId,
                   kind: job.kind,
+                  params: parsedParams,
+                  sessionId: job.sessionId,
+                  context: "host",
                 });
 
                 if (commitResult.ok && commitResult.sha && commitResult.branch) {

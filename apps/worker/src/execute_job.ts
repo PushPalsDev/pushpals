@@ -218,14 +218,21 @@ export async function streamLines(
 export async function createJobCommit(
   repo: string,
   workerId: string,
-  job: { id: string; taskId: string; kind: string },
+  job: {
+    id: string;
+    taskId: string;
+    kind: string;
+    params?: Record<string, unknown>;
+    sessionId?: string;
+    context?: "host" | "docker";
+  },
 ): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
   const truthy = new Set(["1", "true", "yes", "on"]);
   const requirePush = truthy.has((process.env.WORKER_REQUIRE_PUSH ?? "").toLowerCase());
   const pushAgentBranch =
     requirePush || truthy.has((process.env.WORKER_PUSH_AGENT_BRANCH ?? "").toLowerCase());
   const branchName = `agent/${workerId}/${job.id}`;
-  const commitMsg = `${job.kind}: ${job.taskId}\n\nJob: ${job.id}\nWorker: ${workerId}`;
+  const commitMsg = buildWorkerCommitMessage(workerId, job);
 
   try {
     // Create/reset and checkout branch in this workspace
@@ -297,6 +304,84 @@ export async function createJobCommit(
   } catch (err) {
     return { ok: false, error: String(err) };
   }
+}
+
+function sanitizeCommitValue(value: unknown, max = 140): string {
+  const s = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  return s.length > max ? `${s.slice(0, max - 3)}...` : s;
+}
+
+function summarizeJobAction(kind: string, params?: Record<string, unknown>): string {
+  const p = params ?? {};
+  const get = (key: string): string => sanitizeCommitValue(p[key]);
+
+  switch (kind) {
+    case "file.write":
+      return `write ${get("path") || "<path>"}`;
+    case "file.patch":
+      return `patch ${get("path") || "<path>"}`;
+    case "file.append":
+      return `append ${get("path") || "<path>"}`;
+    case "file.rename":
+      return `rename ${get("from") || "<from>"} -> ${get("to") || "<to>"}`;
+    case "file.copy":
+      return `copy ${get("from") || "<from>"} -> ${get("to") || "<to>"}`;
+    case "file.delete":
+      return `delete ${get("path") || "<path>"}`;
+    case "file.mkdir":
+      return `mkdir ${get("path") || "<path>"}`;
+    case "shell.exec":
+      return `exec ${get("command") || "<command>"}`;
+    case "bun.test":
+      return get("filter") ? `test filter=${get("filter")}` : "run bun test";
+    case "bun.lint":
+      return "run bun lint";
+    case "web.fetch":
+      return `fetch ${get("url") || "<url>"}`;
+    case "web.search":
+      return `search ${get("query") || "<query>"}`;
+    default:
+      return kind;
+  }
+}
+
+function buildWorkerCommitMessage(
+  workerId: string,
+  job: {
+    id: string;
+    taskId: string;
+    kind: string;
+    params?: Record<string, unknown>;
+    sessionId?: string;
+    context?: "host" | "docker";
+  },
+): string {
+  const action = summarizeJobAction(job.kind, job.params);
+  const shortJob = sanitizeCommitValue(job.id, 12);
+  const subject = sanitizeCommitValue(
+    `worker(${workerId}): ${action} [job ${shortJob}]`,
+    72,
+  );
+
+  const lines = [
+    subject || `worker(${workerId}): ${job.kind}`,
+    "",
+    `Agent: worker:${sanitizeCommitValue(workerId, 64)}`,
+    `Task: ${sanitizeCommitValue(job.taskId, 128)}`,
+    `Job: ${sanitizeCommitValue(job.id, 128)}`,
+    `Kind: ${sanitizeCommitValue(job.kind, 64)}`,
+    `Action: ${sanitizeCommitValue(action, 180)}`,
+  ];
+
+  if (job.context) {
+    lines.push(`Context: ${sanitizeCommitValue(job.context, 16)}`);
+  }
+  if (job.sessionId) {
+    lines.push(`Session: ${sanitizeCommitValue(job.sessionId, 128)}`);
+  }
+
+  return lines.join("\n");
 }
 
 // ─── Job execution ───────────────────────────────────────────────────────────

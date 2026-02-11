@@ -138,6 +138,8 @@ async function main(): Promise<void> {
       id: spec.jobId,
       taskId: spec.taskId,
       kind: spec.kind,
+      params: spec.params,
+      context: "docker",
     });
 
     if (commitResult.ok && commitResult.sha && commitResult.branch) {
