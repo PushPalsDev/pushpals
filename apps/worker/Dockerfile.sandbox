@@ -13,15 +13,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     grep \
     jq \
     python3 \
+    python3-venv \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # OpenHands worker runtime (SDK + local agent server + workspace adapters)
-RUN pip3 install --no-cache-dir \
-    openhands-sdk \
-    openhands-agent-server \
-    openhands-workspace \
-    openhands-tools
+# Install into an isolated venv (PEP 668-compliant on Debian Bookworm/Trixie).
+RUN python3 -m venv /opt/openhands-venv \
+    && /opt/openhands-venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/openhands-venv/bin/pip install --no-cache-dir \
+        openhands-sdk \
+        openhands-agent-server \
+        openhands-workspace \
+        openhands-tools
+
+ENV PATH="/opt/openhands-venv/bin:${PATH}"
+ENV WORKER_OPENHANDS_PYTHON="/opt/openhands-venv/bin/python"
+ENV WORKER_OPENHANDS_WORKSPACE_PYTHON="/opt/openhands-venv/bin/python3"
 
 # Configure git for the worker
 RUN git config --global user.name "PushPals Worker" \
@@ -35,8 +43,8 @@ WORKDIR /workspace
 # Copy entire repository (build context should be repo root)
 COPY . .
 
-# Install dependencies for the entire workspace
-RUN bun install --production
+# Install workspace dependencies (including devDeps needed for protocol build)
+RUN bun install
 
 # Build protocol package (needed by worker)
 RUN cd packages/protocol && bun run build

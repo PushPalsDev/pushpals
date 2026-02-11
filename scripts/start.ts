@@ -9,8 +9,13 @@
  * It also ensures the worker Docker image exists before launching the stack.
  */
 
+import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
+
 const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
 const workerImage = process.env.WORKER_DOCKER_IMAGE ?? DEFAULT_IMAGE;
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, "..");
 
 async function runQuiet(cmd: string[]): Promise<number> {
   const proc = Bun.spawn(cmd, {
@@ -20,8 +25,9 @@ async function runQuiet(cmd: string[]): Promise<number> {
   return proc.exited;
 }
 
-async function runInherited(cmd: string[]): Promise<number> {
+async function runInherited(cmd: string[], cwd?: string): Promise<number> {
   const proc = Bun.spawn(cmd, {
+    cwd,
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",
@@ -42,21 +48,10 @@ async function ensureDockerImage(): Promise<void> {
   console.log(`[start] Worker image not found: ${workerImage}`);
   console.log("[start] Building worker image...");
 
-  let buildExitCode: number;
-  if (workerImage === DEFAULT_IMAGE) {
-    // Keep this exact command path so local workflow matches docs.
-    buildExitCode = await runInherited(["bun", "--cwd", "apps/worker", "run", "docker:build"]);
-  } else {
-    buildExitCode = await runInherited([
-      "docker",
-      "build",
-      "-f",
-      "apps/worker/Dockerfile.sandbox",
-      "-t",
-      workerImage,
-      ".",
-    ]);
-  }
+  const buildExitCode = await runInherited(
+    ["docker", "build", "-f", "apps/worker/Dockerfile.sandbox", "-t", workerImage, "."],
+    repoRoot,
+  );
 
   if (buildExitCode !== 0) {
     console.error(`[start] Failed to build worker image (${workerImage}).`);

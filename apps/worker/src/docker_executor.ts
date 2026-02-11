@@ -359,22 +359,47 @@ export class DockerExecutor {
    * Pull the Docker image
    */
   async pullImage(): Promise<boolean> {
-    console.log(`[DockerExecutor] Pulling image: ${this.options.imageName}`);
+    if (await this.imageExists()) {
+      console.log(`[DockerExecutor] Using local image: ${this.options.imageName}`);
+      return true;
+    }
+
+    console.log(`[DockerExecutor] Local image not found. Pulling: ${this.options.imageName}`);
     const proc = Bun.spawn(["docker", "pull", this.options.imageName], {
       stdout: "pipe",
       stderr: "pipe",
     });
 
     const exitCode = await proc.exited;
-
-    if (exitCode !== 0) {
-      const stderr = await new Response(proc.stderr).text();
-      console.error(`[DockerExecutor] Failed to pull image: ${stderr}`);
-      return false;
+    if (exitCode === 0) {
+      console.log(`[DockerExecutor] Image pulled successfully`);
+      return true;
     }
 
-    console.log(`[DockerExecutor] Image pulled successfully`);
-    return true;
+    const stderr = (await new Response(proc.stderr).text()).trim();
+    console.error(`[DockerExecutor] Failed to pull image: ${stderr}`);
+
+    // Another process may have built/pulled the image while this pull was running.
+    if (await this.imageExists()) {
+      console.warn(
+        `[DockerExecutor] Pull failed but local image is now available: ${this.options.imageName}`,
+      );
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Check if the Docker image exists locally
+   */
+  private async imageExists(): Promise<boolean> {
+    const proc = Bun.spawn(["docker", "image", "inspect", this.options.imageName], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const exitCode = await proc.exited;
+    return exitCode === 0;
   }
 
   /**
