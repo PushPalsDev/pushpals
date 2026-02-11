@@ -5,6 +5,7 @@
 
 import { existsSync } from "fs";
 import { resolve } from "path";
+import { loadPromptTemplate } from "shared";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -511,6 +512,98 @@ function sanitizeCommitValue(value: unknown, max = 140): string {
   return s.length > max ? `${s.slice(0, max - 3)}...` : s;
 }
 
+function normalizeCommitType(kind: string, params?: Record<string, unknown>): string {
+  const raw = String(params?.commitType ?? params?.changeType ?? params?.type ?? "")
+    .trim()
+    .toLowerCase();
+
+  const mapped =
+    raw === "bugfix" || raw === "bug" || raw === "fix"
+      ? "fix"
+      : raw === "feature" || raw === "feat" || raw === "new"
+        ? "feat"
+        : raw === "docs" || raw === "doc"
+          ? "docs"
+          : raw === "refactor"
+            ? "refactor"
+            : raw === "chore"
+              ? "chore"
+              : "";
+  if (mapped) return mapped;
+
+  switch (kind) {
+    case "file.patch":
+      return "fix";
+    case "file.delete":
+    case "file.rename":
+    case "file.copy":
+    case "file.append":
+    case "file.mkdir":
+      return "refactor";
+    default:
+      return "feat";
+  }
+}
+
+function normalizeCommitArea(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/-+/g, "_")
+    .replace(/[^a-z0-9_]/g, "");
+  return cleaned || "worker";
+}
+
+function inferCommitArea(kind: string, params?: Record<string, unknown>): string {
+  const explicit = String(params?.area ?? params?.scope ?? params?.component ?? "").trim();
+  if (explicit) return normalizeCommitArea(explicit);
+
+  const targets = buildStageTargets(kind, params);
+  const pick = (prefix: string): boolean =>
+    targets.some((path) => path.toLowerCase().startsWith(prefix.toLowerCase()));
+
+  if (pick("scripts/start.ts") || pick(".env") || pick(".env.example")) return "startup";
+  if (pick("apps/remotebuddy/")) return "remote_agent";
+  if (pick("apps/localbuddy/")) return "local_agent";
+  if (pick("apps/workerpals/")) return "worker";
+  if (pick("apps/source_control_manager/")) return "source_control_manager";
+  if (pick("apps/client/")) return "client";
+  if (pick("apps/server/")) return "server";
+  if (pick("README.md") || pick("docs/")) return "docs";
+  return "worker";
+}
+
+function summarizeScope(kind: string, params?: Record<string, unknown>): string {
+  const targets = buildStageTargets(kind, params);
+  if (targets.length === 0) return "repository-level changes";
+  const visible = targets.slice(0, 3).join(", ");
+  return targets.length > 3 ? `${visible}, +${targets.length - 3} more` : visible;
+}
+
+function deriveSummary(action: string, params?: Record<string, unknown>): string {
+  const explicit = sanitizeCommitValue(params?.commitSummary, 72);
+  if (explicit) return explicit;
+  const raw = sanitizeCommitValue(action, 72);
+  if (!raw) return "apply requested repository update";
+  return raw;
+}
+
+function buildImplementationPoints(kind: string, params?: Record<string, unknown>): string {
+  const targets = buildStageTargets(kind, params);
+  const lines: string[] = [];
+  if (targets.length === 0) return "";
+
+  for (const target of targets.slice(0, 5)) {
+    lines.push(`- Updated path: ${sanitizeCommitValue(target, 220)}.`);
+  }
+  if (targets.length > 5) {
+    lines.push(`- Updated path: +${targets.length - 5} additional file(s).`);
+  }
+
+  return lines.join("\n");
+}
+
 function summarizeJobAction(kind: string, params?: Record<string, unknown>): string {
   const p = params ?? {};
   const get = (key: string): string => sanitizeCommitValue(p[key]);
@@ -559,27 +652,41 @@ function buildWorkerCommitMessage(
   },
 ): string {
   const action = summarizeJobAction(job.kind, job.params);
-  const shortJob = sanitizeCommitValue(job.id, 12);
-  const subject = sanitizeCommitValue(`workerpals(${workerId}): ${action} [job ${shortJob}]`, 72);
+  const type = normalizeCommitType(job.kind, job.params);
+  const area = inferCommitArea(job.kind, job.params);
+  const summary = deriveSummary(action, job.params);
+  const contextValue = sanitizeCommitValue(job.context ?? "host", 32);
+  const sessionValue = sanitizeCommitValue(job.sessionId ?? "", 128);
+  const replacements = {
+    type: sanitizeCommitValue(type, 16),
+    area: sanitizeCommitValue(area, 48),
+    summary: sanitizeCommitValue(summary, 72),
+    worker_id: sanitizeCommitValue(workerId, 64),
+    task_id: sanitizeCommitValue(job.taskId, 128),
+    job_id: sanitizeCommitValue(job.id, 128),
+    job_kind: sanitizeCommitValue(job.kind, 64),
+    action: sanitizeCommitValue(action, 180),
+    scope: sanitizeCommitValue(summarizeScope(job.kind, job.params), 220),
+    context: contextValue || "host",
+    session_line: sessionValue ? `- Session: ${sessionValue}.` : "",
+    implementation_points: buildImplementationPoints(job.kind, job.params),
+  };
 
-  const lines = [
-    subject || `workerpals(${workerId}): ${job.kind}`,
-    "",
-    `Agent: worker:${sanitizeCommitValue(workerId, 64)}`,
-    `Task: ${sanitizeCommitValue(job.taskId, 128)}`,
-    `Job: ${sanitizeCommitValue(job.id, 128)}`,
-    `Kind: ${sanitizeCommitValue(job.kind, 64)}`,
-    `Action: ${sanitizeCommitValue(action, 180)}`,
-  ];
-
-  if (job.context) {
-    lines.push(`Context: ${sanitizeCommitValue(job.context, 16)}`);
+  try {
+    return loadPromptTemplate("workerpals/commit_message_prompt.txt", replacements).trim();
+  } catch (err) {
+    console.warn(`[WorkerPals] Failed to load commit message prompt template: ${String(err)}`);
+    const fallbackLines = [
+      `${replacements.type}(${replacements.area}): ${replacements.summary}`,
+      "",
+      `- Implementation: ${replacements.action}.`,
+      `- Scope: ${sanitizeCommitValue(summarizeScope(job.kind, job.params), 220)}.`,
+      `- Traceability: worker:${replacements.worker_id}, task ${replacements.task_id}, job ${replacements.job_id}.`,
+      `- Execution context: ${replacements.context}.`,
+    ];
+    if (replacements.session_line) fallbackLines.push(replacements.session_line);
+    return fallbackLines.join("\n");
   }
-  if (job.sessionId) {
-    lines.push(`Session: ${sanitizeCommitValue(job.sessionId, 128)}`);
-  }
-
-  return lines.join("\n");
 }
 
 // ─── Job execution ───────────────────────────────────────────────────────────
