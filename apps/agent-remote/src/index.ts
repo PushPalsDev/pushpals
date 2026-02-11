@@ -222,7 +222,7 @@ class RemoteOrchestrator {
           if (jobId) {
             await this.sendCommand({
               type: "job_enqueued",
-              payload: { jobId, taskId, kind: job.kind },
+              payload: { jobId, taskId, kind: job.kind, params: job.params ?? {} },
               turnId,
             });
           }
