@@ -42,10 +42,17 @@ export interface Job {
   jobId: string;
   taskId: string;
   kind: string;
+  params?: Record<string, unknown>;
   status: JobStatus;
   workerId?: string;
   summary?: string;
   message?: string; // failure message
+  detail?: string; // failure detail
+  artifacts?: Array<{
+    kind: string;
+    uri?: string;
+    text?: string;
+  }>;
   ts: string;
 }
 
@@ -238,6 +245,10 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
         jobId,
         taskId,
         kind: (p.kind as string) ?? "unknown",
+        params:
+          p.params && typeof p.params === "object"
+            ? (p.params as Record<string, unknown>)
+            : undefined,
         status: "enqueued",
         ts: envelope.ts,
       });
@@ -273,10 +284,20 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
       const jobs = new Map(state.jobs);
       const existing = jobs.get(jobId);
       if (existing) {
+        const artifacts = Array.isArray(p.artifacts)
+          ? p.artifacts
+              .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
+              .map((a) => ({
+                kind: String(a.kind ?? "artifact"),
+                uri: typeof a.uri === "string" ? a.uri : undefined,
+                text: typeof a.text === "string" ? a.text : undefined,
+              }))
+          : undefined;
         jobs.set(jobId, {
           ...existing,
           status: "completed",
           summary: (p.summary as string) ?? undefined,
+          artifacts,
         });
       }
       // Terminal status — free dedup memory (no more logs expected)
@@ -295,6 +316,7 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
           ...existing,
           status: "failed",
           message: (p.message as string) ?? undefined,
+          detail: (p.detail as string) ?? undefined,
         });
       }
       // Terminal status — free dedup memory (no more logs expected)
