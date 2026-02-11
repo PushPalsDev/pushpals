@@ -162,11 +162,45 @@ Be concise but include all relevant information the execution agent needs.`;
               `[LocalAgent] Received message: ${originalPrompt.substring(0, 80)}${originalPrompt.length > 80 ? "..." : ""}`,
             );
 
-            // Create a streaming response using Server-Sent Events
+            // ── Step 0: Emit user message to server session so it appears in UI ──
+            const cmdHeaders: Record<string, string> = { "Content-Type": "application/json" };
+            if (authToken) cmdHeaders["Authorization"] = `Bearer ${authToken}`;
+
+            fetch(`${serverUrl}/sessions/${sessionId}/command`, {
+              method: "POST",
+              headers: cmdHeaders,
+              body: JSON.stringify({
+                type: "message",
+                payload: { text: originalPrompt },
+                from: "client",
+              }),
+            }).catch((err) =>
+              console.error(`[LocalAgent] Failed to emit user message to session:`, err),
+            );
+
+            // ── Process and stream status back via SSE ──
+            let closed = false;
             const stream = new ReadableStream({
               async start(controller) {
                 const send = (data: { type: string; message: string; data?: any }) => {
-                  controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`));
+                  if (closed) return;
+                  try {
+                    controller.enqueue(
+                      new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`),
+                    );
+                  } catch {
+                    closed = true;
+                  }
+                };
+
+                const close = () => {
+                  if (closed) return;
+                  closed = true;
+                  try {
+                    controller.close();
+                  } catch {
+                    /* already closed */
+                  }
                 };
 
                 try {
@@ -192,12 +226,10 @@ Be concise but include all relevant information the execution agent needs.`;
 
                   // Step 4: Enqueue to Request Queue
                   send({ type: "status", message: "Enqueuing to Request Queue..." });
-                  const headers: Record<string, string> = { "Content-Type": "application/json" };
-                  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
 
                   const res = await fetch(`${serverUrl}/requests/enqueue`, {
                     method: "POST",
-                    headers,
+                    headers: cmdHeaders,
                     body: JSON.stringify({
                       sessionId,
                       originalPrompt,
@@ -209,7 +241,7 @@ Be concise but include all relevant information the execution agent needs.`;
                     const err = await res.text();
                     console.error(`[LocalAgent] Failed to enqueue request: ${err}`);
                     send({ type: "error", message: `Failed to enqueue: ${err}` });
-                    controller.close();
+                    close();
                     return;
                   }
 
@@ -223,11 +255,11 @@ Be concise but include all relevant information the execution agent needs.`;
                     data: { requestId: data.requestId, sessionId },
                   });
 
-                  controller.close();
+                  close();
                 } catch (err) {
                   console.error(`[LocalAgent] Error processing message:`, err);
                   send({ type: "error", message: String(err) });
-                  controller.close();
+                  close();
                 }
               },
             });
