@@ -39,8 +39,14 @@ export interface SerialPusherConfig {
   deleteAfterMerge: boolean;
   /** Max consecutive failures before a branch is skipped. Default: 3. */
   maxAttempts: number;
-  /** Merge strategy: "no-ff" for merge commits, "ff-only" for linear. Default: "no-ff". */
-  mergeStrategy: "no-ff" | "ff-only";
+  /**
+   * Integration strategy:
+   * - "cherry-pick": apply worker commit(s) onto integration branch (linear history, no merge commits)
+   * - "no-ff": merge commit
+   * - "ff-only": fast-forward only
+   * Default: "cherry-pick".
+   */
+  mergeStrategy: "cherry-pick" | "no-ff" | "ff-only";
   /** Push integration branch to remote after successful merge/checks. Default: true. */
   pushMainAfterMerge: boolean;
   /** Authentication token for server API calls. */
@@ -70,7 +76,7 @@ const DEFAULTS: SerialPusherConfig = {
   port: 3002,
   deleteAfterMerge: false,
   maxAttempts: 3,
-  mergeStrategy: "no-ff",
+  mergeStrategy: "cherry-pick",
   pushMainAfterMerge: !TRUTHY.has((process.env.SERIAL_PUSHER_NO_PUSH ?? "").toLowerCase()),
   authToken: process.env.PUSHPALS_AUTH_TOKEN,
 };
@@ -138,9 +144,13 @@ export function validateConfig(config: SerialPusherConfig): void {
       `Invalid config: maxAttempts must be >= 1, got ${JSON.stringify(config.maxAttempts)}`,
     );
   }
-  if (config.mergeStrategy !== "no-ff" && config.mergeStrategy !== "ff-only") {
+  if (
+    config.mergeStrategy !== "cherry-pick" &&
+    config.mergeStrategy !== "no-ff" &&
+    config.mergeStrategy !== "ff-only"
+  ) {
     throw new Error(
-      `Invalid config: mergeStrategy must be "no-ff" or "ff-only", got ${JSON.stringify(config.mergeStrategy)}`,
+      `Invalid config: mergeStrategy must be "cherry-pick", "no-ff", or "ff-only", got ${JSON.stringify(config.mergeStrategy)}`,
     );
   }
   if (typeof config.repoPath !== "string" || config.repoPath.length === 0) {

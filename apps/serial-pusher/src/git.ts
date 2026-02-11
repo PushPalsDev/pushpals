@@ -371,6 +371,14 @@ export class GitOps {
     return git(this.repoPath, ["merge", ref, "--ff-only"]);
   }
 
+  /**
+   * Cherry-pick a specific commit/ref onto the current branch.
+   * Keeps integration history linear and avoids merge commits.
+   */
+  async cherryPickRef(ref: string): Promise<GitResult> {
+    return git(this.repoPath, ["cherry-pick", ref]);
+  }
+
   // ── Push ──────────────────────────────────────────────────────────────
 
   /**
@@ -413,6 +421,7 @@ export class GitOps {
     // Abort any in-progress operations (these may fail if nothing is in progress — that's fine)
     await git(this.repoPath, ["rebase", "--abort"]);
     await git(this.repoPath, ["merge", "--abort"]);
+    await git(this.repoPath, ["cherry-pick", "--abort"]);
     const baseRef = await this.resolveMainBaseRef();
     const checkoutResult = await git(this.repoPath, [
       "checkout",

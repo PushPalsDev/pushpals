@@ -271,7 +271,7 @@ async function tick(): Promise<void> {
       console.log(`[${ts()}] Fetching branch ${completion.branch}...`);
       await gitOps.fetchPrune();
 
-      // 2. Create temp branch and merge
+      // 2. Create temp branch and apply worker completion
       const tempBranch = `_serial-pusher/${completion.id}`;
       console.log(`[${ts()}] Creating temp branch ${tempBranch}...`);
 
@@ -281,14 +281,23 @@ async function tick(): Promise<void> {
       await gitOps.syncMainWithBaseBranch();
       await gitOps.createTempBranch(tempBranch);
 
-      console.log(`[${ts()}] Merging ${completion.branch} into ${tempBranch}...`);
-      const mergeResult =
-        config.mergeStrategy === "no-ff"
-          ? await gitOps.mergeNoFF(completion.branch, `Merge ${completion.branch}`)
-          : await gitOps.mergeFFOnly(completion.branch);
+      const applyResult =
+        config.mergeStrategy === "cherry-pick"
+          ? await (async () => {
+              console.log(
+                `[${ts()}] Cherry-picking ${completion.commitSha.slice(0, 8)} onto ${tempBranch}...`,
+              );
+              return gitOps.cherryPickRef(completion.commitSha);
+            })()
+          : await (async () => {
+              console.log(`[${ts()}] Merging ${completion.branch} into ${tempBranch}...`);
+              return config.mergeStrategy === "no-ff"
+                ? gitOps.mergeNoFF(completion.branch, `Merge ${completion.branch}`)
+                : gitOps.mergeFFOnly(completion.branch);
+            })();
 
-      if (!mergeResult.ok) {
-        throw new Error(`Merge failed: ${mergeResult.stderr || mergeResult.stdout}`);
+      if (!applyResult.ok) {
+        throw new Error(`Apply failed: ${applyResult.stderr || applyResult.stdout}`);
       }
 
       // 4. Run checks

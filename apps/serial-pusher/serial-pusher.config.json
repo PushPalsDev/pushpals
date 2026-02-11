@@ -8,5 +8,5 @@
   "port": 3002,
   "deleteAfterMerge": false,
   "maxAttempts": 3,
-  "mergeStrategy": "no-ff"
+  "mergeStrategy": "cherry-pick"
 }

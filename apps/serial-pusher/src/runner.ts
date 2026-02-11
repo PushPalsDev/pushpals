@@ -70,7 +70,7 @@ export class JobRunner {
    *   2. Update integration branch (fetch + checkout + pull ff-only)
    *   3. Check if already merged (skip if so)
    *   4. Create temp branch from remote integration-branch HEAD
-   *   5. Merge remote agent branch into temp (no-ff or ff-only)
+   *   5. Apply worker changes onto temp (cherry-pick/no-ff/ff-only)
    *   6. Run configured checks on temp branch
    *   7. Checkout integration branch, ff-only merge local temp branch
    *   8. Push integration branch to remote (--atomic)
@@ -148,13 +148,13 @@ export class JobRunner {
       log(job.id, `Creating temp branch: ${tempBranch}`);
       await this.gitOps.createTempBranch(tempBranch);
 
-      // ── Step 5: Merge agent branch ────────────────────────────────────
-      log(job.id, "Merging agent branch into temp");
-      db.addLog(job.id, "Merging agent branch");
+      // ── Step 5: Apply worker changes ────────────────────────────────────
+      log(job.id, "Applying agent changes into temp");
+      db.addLog(job.id, "Applying agent changes");
 
       // Build merge commit message — include shortlog for readability
       let mergeMsg = `merge: ${job.branch}\n\nSerial-pusher job #${job.id}`;
-      if (this.config.mergeStrategy !== "ff-only") {
+      if (this.config.mergeStrategy === "no-ff") {
         try {
           const shortlog = await this.gitOps.shortLog(
             `${this.config.remote}/${this.config.mainBranch}`,
@@ -170,13 +170,15 @@ export class JobRunner {
         }
       }
 
-      const mergeResult =
-        this.config.mergeStrategy === "ff-only"
-          ? await this.gitOps.mergeFFOnly(job.branch)
-          : await this.gitOps.mergeNoFF(job.branch, mergeMsg);
+      const applyResult =
+        this.config.mergeStrategy === "cherry-pick"
+          ? await this.gitOps.cherryPickRef(job.head_sha)
+          : this.config.mergeStrategy === "ff-only"
+            ? await this.gitOps.mergeFFOnly(job.branch)
+            : await this.gitOps.mergeNoFF(job.branch, mergeMsg);
 
-      if (!mergeResult.ok) {
-        const msg = `Merge conflict: ${mergeResult.stderr}`;
+      if (!applyResult.ok) {
+        const msg = `Apply failed: ${applyResult.stderr}`;
         logErr(job.id, msg);
         db.addLog(job.id, msg, "error");
 

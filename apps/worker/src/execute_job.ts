@@ -241,8 +241,16 @@ export async function createJobCommit(
       return { ok: false, error: `Failed to create branch: ${result.stderr}` };
     }
 
-    // Stage all changes
-    result = await git(repo, ["add", "-A"]);
+    // Stage only the paths implied by this job. This prevents runtime metadata
+    // (e.g. workspace/bash_events/*) from being accidentally committed.
+    const stageArgs = buildStageCommand(job.kind, job.params);
+    if (!stageArgs) {
+      return {
+        ok: false,
+        error: `Unable to determine files to stage for job kind: ${job.kind}`,
+      };
+    }
+    result = await git(repo, stageArgs);
     if (!result.ok) {
       return { ok: false, error: `Failed to stage changes: ${result.stderr}` };
     }
@@ -304,6 +312,46 @@ export async function createJobCommit(
   } catch (err) {
     return { ok: false, error: String(err) };
   }
+}
+
+function toPath(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function dedupePaths(paths: Array<string | null>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const path of paths) {
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+  }
+  return out;
+}
+
+function buildStageTargets(kind: string, params?: Record<string, unknown>): string[] {
+  const p = params ?? {};
+  switch (kind) {
+    case "file.write":
+    case "file.patch":
+    case "file.append":
+    case "file.delete":
+    case "file.mkdir":
+      return dedupePaths([toPath(p.path)]);
+    case "file.rename":
+    case "file.copy":
+      return dedupePaths([toPath(p.from), toPath(p.to)]);
+    default:
+      return [];
+  }
+}
+
+function buildStageCommand(kind: string, params?: Record<string, unknown>): string[] | null {
+  const targets = buildStageTargets(kind, params);
+  if (targets.length === 0) return null;
+  return ["add", "-A", "--", ...targets];
 }
 
 function sanitizeCommitValue(value: unknown, max = 140): string {
