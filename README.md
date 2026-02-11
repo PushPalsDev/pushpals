@@ -69,6 +69,8 @@ bun run start
 
 `scripts/start.ts` preflights:
 
+- LLM endpoint reachability (fails fast with clear error if model server is down)
+- optional local vLLM auto-start when vLLM mode is configured
 - integration branch existence/bootstrapping
 - git auth requirements for push flows
 - SourceControlManager dedicated worktree
@@ -105,6 +107,7 @@ LLM defaults:
 - Generic OpenAI-compatible mode defaults to vLLM (`LLM_ENDPOINT=http://localhost:18123`)
 - Default model is `zai-org/GLM-4.7-Flash` (override with `LLM_MODEL`)
 - WorkerPals OpenHands agent mode reuses `LLM_*`/`OPENAI_*` vars unless `WORKERPALS_OPENHANDS_*` is set
+- `bun run start` preflights LLM connectivity and can auto-start local vLLM when configured
 
 ## Repo Layout
 

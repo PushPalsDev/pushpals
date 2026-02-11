@@ -6,7 +6,10 @@
  * from shell wrappers. This wrapper intentionally ignores forwarded args and
  * always launches `dev:full` with the canonical script options.
  *
- * It also ensures the worker Docker image exists before launching the stack.
+ * It also performs startup preflights:
+ * - LLM endpoint reachability (and optional local vLLM auto-start)
+ * - integration branch/worktree safety
+ * - worker Docker image existence
  */
 
 import { mkdirSync } from "fs";
@@ -14,6 +17,9 @@ import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
 const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
+const DEFAULT_LLM_ENDPOINT = "http://localhost:18123";
+const DEFAULT_PLANNER_ENDPOINT = "http://localhost:18123/v1/chat/completions";
+const DEFAULT_LLM_MODEL = "zai-org/GLM-4.7-Flash";
 const DEFAULT_INTEGRATION_BRANCH = "main_agents";
 const INTEGRATION_BRANCH =
   (process.env.PUSHPALS_INTEGRATION_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BRANCH;
@@ -31,9 +37,348 @@ const DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE = resolve(
   "source_control_manager",
 );
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
+const managedVllmLogTail: string[] = [];
+let managedVllmProc: ReturnType<typeof Bun.spawn> | null = null;
 
 function envTruthy(name: string): boolean {
   return TRUTHY.has((process.env[name] ?? "").toLowerCase());
+}
+
+function appendVllmLogTail(line: string): void {
+  managedVllmLogTail.push(line);
+  if (managedVllmLogTail.length > 120) {
+    managedVllmLogTail.splice(0, managedVllmLogTail.length - 120);
+  }
+}
+
+function normalizeCompletionEndpoint(raw: string, fallback: string): string {
+  const source = (raw.trim() || fallback).replace(/\/+$/, "");
+  if (source.includes("/chat/completions")) return source;
+  if (source.endsWith("/api/chat")) return source;
+  if (source.endsWith("/v1")) return `${source}/chat/completions`;
+  return `${source}/v1/chat/completions`;
+}
+
+function parseUrl(value: string): URL | null {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function normalizeVllmFlag(value: string | null | undefined): string {
+  return (value ?? "").trim().toLowerCase();
+}
+
+function vllmModeConfigured(): boolean {
+  const provider = normalizeVllmFlag(process.env.PUSHPALS_LLM_PROVIDER);
+  if (provider === "vllm") return true;
+
+  const keys = [
+    process.env.LLM_API_KEY,
+    process.env.PLANNER_API_KEY,
+    process.env.WORKERPALS_OPENHANDS_API_KEY,
+  ];
+  return keys.some((value) => normalizeVllmFlag(value) === "vllm");
+}
+
+function shouldAutoStartVllm(primaryEndpoint: string): boolean {
+  const explicit = process.env.PUSHPALS_AUTO_START_VLLM;
+  const enabled = explicit == null || explicit.trim() === "" ? vllmModeConfigured() : envTruthy("PUSHPALS_AUTO_START_VLLM");
+  if (!enabled) return false;
+
+  const parsed = parseUrl(primaryEndpoint);
+  return parsed ? isLoopbackHost(parsed.hostname) : false;
+}
+
+function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: string[] }> {
+  const out: Array<{ name: string; endpoint: string; probes: string[] }> = [];
+  const seenEndpoints = new Set<string>();
+
+  const addTarget = (name: string, endpoint: string) => {
+    const normalized = endpoint.trim();
+    if (!normalized || seenEndpoints.has(normalized)) return;
+    seenEndpoints.add(normalized);
+
+    const probes: string[] = [];
+    const parsed = parseUrl(normalized);
+    if (normalized.includes("/v1/chat/completions")) {
+      probes.push(normalized.replace(/\/v1\/chat\/completions$/, "/v1/models"));
+    } else if (normalized.endsWith("/api/chat")) {
+      probes.push(normalized.replace(/\/api\/chat$/, "/api/tags"));
+    } else if (normalized.includes("/chat/completions")) {
+      probes.push(normalized.replace(/\/chat\/completions$/, "/models"));
+    }
+    probes.push(normalized);
+    if (parsed) {
+      probes.push(`${parsed.origin}/health`);
+      probes.push(parsed.origin);
+    }
+
+    const dedupedProbes = Array.from(new Set(probes));
+    out.push({ name, endpoint: normalized, probes: dedupedProbes });
+  };
+
+  addTarget(
+    "RemoteBuddy LLM",
+    normalizeCompletionEndpoint(process.env.LLM_ENDPOINT ?? "", DEFAULT_LLM_ENDPOINT),
+  );
+  addTarget(
+    "LocalBuddy Planner",
+    normalizeCompletionEndpoint(process.env.PLANNER_ENDPOINT ?? "", DEFAULT_PLANNER_ENDPOINT),
+  );
+
+  return out;
+}
+
+async function probeHttpReachable(
+  url: string,
+  timeoutMs = 2500,
+): Promise<{ ok: boolean; status?: number; error?: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort("timeout"), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: { Accept: "application/json, text/plain, */*" },
+    });
+    // Any HTTP response means endpoint is reachable (even 404/401).
+    return { ok: true, status: response.status };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function checkTargetReachable(
+  target: { name: string; endpoint: string; probes: string[] },
+): Promise<{ ok: boolean; url?: string; status?: number; error?: string }> {
+  let lastError = "unknown error";
+  for (const probe of target.probes) {
+    const result = await probeHttpReachable(probe);
+    if (result.ok) return { ok: true, url: probe, status: result.status };
+    lastError = `${probe}: ${result.error ?? "connection failed"}`;
+  }
+  return { ok: false, error: lastError };
+}
+
+function streamVllmOutput(stream: ReadableStream<Uint8Array>, prefix: string): void {
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
+  void (async () => {
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const clean = line.replace(/\r$/, "");
+        if (!clean.trim()) continue;
+        appendVllmLogTail(clean);
+        console.log(`${prefix}${clean}`);
+      }
+    }
+    const tail = buffer.trim();
+    if (tail) {
+      appendVllmLogTail(tail);
+      console.log(`${prefix}${tail}`);
+    }
+  })();
+}
+
+function vllmModuleMissingFromLogs(): boolean {
+  const haystack = managedVllmLogTail.join("\n").toLowerCase();
+  return (
+    haystack.includes("modulenotfounderror") &&
+    (haystack.includes("no module named 'vllm'") ||
+      haystack.includes('no module named "vllm"') ||
+      haystack.includes("module specification for 'vllm"))
+  );
+}
+
+function printVllmAutoStartHelp(primaryEndpoint: string): void {
+  const endpoint = parseUrl(primaryEndpoint);
+  const host = endpoint?.hostname ?? "localhost";
+  const port = endpoint?.port || "18123";
+
+  if (vllmModuleMissingFromLogs()) {
+    console.error("[start] vLLM Python package was not found.");
+    console.error("[start] Next steps:");
+    console.error(
+      `[start] 1) Install vLLM in a Python env: "python -m pip install vllm" (or use the interpreter that already has it).`,
+    );
+    console.error(
+      "[start] 2) Point startup at that interpreter: set PUSHPALS_VLLM_PYTHON=<path-to-python>.",
+    );
+    console.error(
+      `[start] 3) Retry "bun run start". Expected endpoint: http://${host}:${port}/v1/chat/completions`,
+    );
+    console.error(
+      "[start] 4) If you do not want auto-start, set PUSHPALS_AUTO_START_VLLM=0 and run your own LLM server.",
+    );
+    return;
+  }
+
+  console.error("[start] Could not auto-start vLLM.");
+  console.error("[start] Verify:");
+  console.error("[start] - vLLM is installed in the Python interpreter being used");
+  console.error("[start] - your selected model is available and valid");
+  console.error("[start] - host/port are free and reachable");
+  console.error(
+    "[start] Optional: set PUSHPALS_AUTO_START_VLLM=0 and point LLM_ENDPOINT/PLANNER_ENDPOINT to an already-running server.",
+  );
+}
+
+function vllmStartArgs(endpoint: string): string[][] {
+  const parsed = parseUrl(endpoint);
+  const endpointHost = parsed?.hostname || "127.0.0.1";
+  const endpointPort = parsed?.port ? Number.parseInt(parsed.port, 10) : 18123;
+
+  const host = (process.env.PUSHPALS_VLLM_HOST ?? endpointHost).trim() || "127.0.0.1";
+  const portRaw = (process.env.PUSHPALS_VLLM_PORT ?? "").trim();
+  const port = Number.isFinite(Number.parseInt(portRaw, 10))
+    ? Number.parseInt(portRaw, 10)
+    : Number.isFinite(endpointPort)
+      ? endpointPort
+      : 18123;
+  const model =
+    (process.env.PUSHPALS_VLLM_MODEL ?? process.env.LLM_MODEL ?? DEFAULT_LLM_MODEL).trim() ||
+    DEFAULT_LLM_MODEL;
+
+  const override = (process.env.PUSHPALS_VLLM_PYTHON ?? "").trim();
+  const pythonCandidates = Array.from(new Set([override, "python", "python3"].filter(Boolean)));
+
+  return pythonCandidates.map((pythonBin) => [
+    pythonBin,
+    "-m",
+    "vllm.entrypoints.openai.api_server",
+    "--host",
+    host,
+    "--port",
+    String(port),
+    "--model",
+    model,
+  ]);
+}
+
+async function startManagedVllm(primaryEndpoint: string): Promise<void> {
+  if (managedVllmProc) return;
+  const commandCandidates = vllmStartArgs(primaryEndpoint);
+
+  let lastFailure = "unknown failure";
+  for (const cmd of commandCandidates) {
+    try {
+      console.log(`[start] Launching local vLLM: ${cmd.join(" ")}`);
+      const proc = Bun.spawn(cmd, {
+        cwd: repoRoot,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      managedVllmProc = proc;
+
+      streamVllmOutput(proc.stdout, "[vllm] ");
+      streamVllmOutput(proc.stderr, "[vllm] ");
+
+      const early = await Promise.race([
+        proc.exited.then((code) => ({ exited: true, code })),
+        new Promise<{ exited: false; code: null }>((resolveRace) =>
+          setTimeout(() => resolveRace({ exited: false, code: null }), 900),
+        ),
+      ]);
+
+      if (early.exited) {
+        managedVllmProc = null;
+        lastFailure = `${cmd[0]} exited immediately with code ${early.code}`;
+        continue;
+      }
+
+      return;
+    } catch (err) {
+      managedVllmProc = null;
+      lastFailure = `${cmd[0]} failed to start: ${String(err)}`;
+    }
+  }
+
+  throw new Error(
+    `${lastFailure}. Install vLLM in Python env, or disable auto-start with PUSHPALS_AUTO_START_VLLM=0.`,
+  );
+}
+
+async function stopManagedVllm(): Promise<void> {
+  if (!managedVllmProc) return;
+  try {
+    managedVllmProc.kill();
+  } catch {}
+  try {
+    await Promise.race([
+      managedVllmProc.exited,
+      new Promise((resolveWait) => setTimeout(resolveWait, 2500)),
+    ]);
+  } catch {}
+  managedVllmProc = null;
+}
+
+async function ensureLlmPreflight(): Promise<void> {
+  if (envTruthy("PUSHPALS_SKIP_LLM_PREFLIGHT")) return;
+
+  const targets = llmPreflightTargets();
+  if (targets.length === 0) return;
+
+  const primary = targets[0];
+  let primaryReachable = await checkTargetReachable(primary);
+
+  if (!primaryReachable.ok && shouldAutoStartVllm(primary.endpoint)) {
+    try {
+      await startManagedVllm(primary.endpoint);
+      console.log("[start] Waiting for local vLLM to become reachable...");
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        primaryReachable = await checkTargetReachable(primary);
+        if (primaryReachable.ok) break;
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 1200));
+      }
+    } catch (err) {
+      console.error(`[start] Failed to auto-start vLLM: ${String(err)}`);
+      if (managedVllmLogTail.length > 0) {
+        console.error("[start] vLLM recent logs:");
+        for (const line of managedVllmLogTail.slice(-25)) {
+          console.error(`[vllm] ${line}`);
+        }
+      }
+      printVllmAutoStartHelp(primary.endpoint);
+      process.exit(1);
+    }
+  }
+
+  for (const target of targets) {
+    const check = target === primary ? primaryReachable : await checkTargetReachable(target);
+    if (check.ok) continue;
+
+    console.error(`[start] LLM preflight failed for ${target.name}.`);
+    console.error(`[start] Endpoint: ${target.endpoint}`);
+    console.error(`[start] Probes: ${target.probes.join(", ")}`);
+    console.error(`[start] Last error: ${check.error ?? "connection failed"}`);
+    console.error(
+      "[start] Start your model server or set PUSHPALS_SKIP_LLM_PREFLIGHT=1 to bypass this check.",
+    );
+    if (vllmModeConfigured()) {
+      console.error(
+        "[start] vLLM mode is configured. Auto-start can be enabled with PUSHPALS_AUTO_START_VLLM=1.",
+      );
+    }
+    process.exit(1);
+  }
 }
 
 async function runQuiet(cmd: string[]): Promise<number> {
@@ -369,6 +714,7 @@ async function ensureDockerImage(): Promise<void> {
   }
 }
 
+await ensureLlmPreflight();
 await ensureIntegrationBranch();
 await ensureGitHubAuth();
 await ensureSourceControlManagerWorktree();
@@ -380,5 +726,24 @@ const proc = Bun.spawn(["bun", "run", "dev:full"], {
   stderr: "inherit",
 });
 
+let shuttingDown = false;
+const shutdown = async (code: number) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    proc.kill();
+  } catch {}
+  await stopManagedVllm();
+  process.exit(code);
+};
+
+process.on("SIGINT", () => {
+  void shutdown(130);
+});
+process.on("SIGTERM", () => {
+  void shutdown(143);
+});
+
 const exitCode = await proc.exited;
+await stopManagedVllm();
 process.exit(exitCode);
