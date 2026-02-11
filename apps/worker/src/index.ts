@@ -499,6 +499,31 @@ async function workerLoop(
             }
 
             if (job.sessionId) {
+              const responseMode = String(parsedParams.responseMode ?? "")
+                .trim()
+                .toLowerCase();
+              if (responseMode === "assistant_message") {
+                const maxResponseCharsRaw = Number(parsedParams.maxResponseChars ?? 8000);
+                const maxResponseChars =
+                  Number.isFinite(maxResponseCharsRaw) && maxResponseCharsRaw >= 256
+                    ? Math.min(maxResponseCharsRaw, 20_000)
+                    : 8000;
+                const rawText = result.ok
+                  ? String(result.stdout ?? result.summary ?? "").trim()
+                  : `Worker failed to complete request: ${String(result.summary ?? "unknown error").trim()}`;
+                const assistantText =
+                  rawText.length > maxResponseChars
+                    ? `${rawText.slice(0, maxResponseChars - 3)}...`
+                    : rawText;
+                if (assistantText) {
+                  await sendCommand(opts.server, job.sessionId, headers, {
+                    type: "assistant_message",
+                    payload: { text: assistantText },
+                    from: `worker:${opts.workerId}`,
+                  });
+                }
+              }
+
               const eventCmd = result.ok
                 ? {
                     type: "job_completed" as const,

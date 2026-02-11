@@ -91,15 +91,16 @@ function isExecutionIntent(text: string, targetPath: string | null): boolean {
   const t = text.trim().toLowerCase();
   if (!t || isLikelyChitChat(t)) return false;
   if (targetPath) return true;
-  const actionVerb =
-    /\b(create|write|add|append|edit|update|modify|delete|remove|rename|implement|fix|refactor|generate)\b/.test(
+  const executionVerb =
+    /\b(create|write|add|append|edit|update|modify|delete|remove|rename|implement|fix|refactor|generate|explain|understand|analyze|review|summarize|document|describe)\b/.test(
       t,
     );
-  const artifactHint =
-    /\b(file|folder|directory|readme|markdown|md|txt|json|yaml|yml|toml|ts|tsx|js|jsx|py|go|rs|sql|config|test|component|screen|endpoint|api)\b/.test(
+  const repoHint =
+    /\b(repo|repository|project|architecture|structure|module|component|workflow|pipeline|branch|worker|orchestrator|server|client|docker|git|code|file|readme)\b/.test(
       t,
     );
-  return actionVerb && artifactHint;
+  if (executionVerb && (repoHint || t.length >= 12)) return true;
+  return t.length > 80;
 }
 
 function toSingleLine(value: unknown, max = 220): string {
@@ -503,51 +504,63 @@ class RemoteOrchestrator {
 
     this.idempotency.markHandled(this.sessionId, requestId);
 
-    const enhancedPrompt = request.enhancedPrompt;
-    const turnId = randomUUID();
-
-    this.pushContext(`[user] ${request.originalPrompt}`);
-    this.pushContext(`[enhanced] ${enhancedPrompt}`);
-
-    // Call brain with enhanced prompt
-    console.log(`[Orchestrator] Thinking about: "${enhancedPrompt.substring(0, 80)}"`);
-    const output = await this.brain.think(enhancedPrompt, this.recentContext);
-
-    this.pushContext(`[assistant] ${output.assistantMessage}`);
-
-    // Emit assistant message
-    await this.sendCommand({
-      type: "assistant_message",
-      payload: { text: output.assistantMessage },
-      turnId,
-    });
-
+    const enhancedPrompt = String(request.enhancedPrompt ?? "");
     const originalPrompt = String(request.originalPrompt ?? "").trim();
     const promptForIntent = originalPrompt || enhancedPrompt || "";
-    const targetPath = extractTargetPath(originalPrompt) ?? extractTargetPath(enhancedPrompt ?? "");
-    const actionable = isExecutionIntent(promptForIntent, targetPath) && Boolean(targetPath);
+    const targetPath = extractTargetPath(originalPrompt) ?? extractTargetPath(enhancedPrompt);
+    const actionable = isExecutionIntent(promptForIntent, targetPath);
+    const turnId = randomUUID();
+
+    this.pushContext(`[user] ${originalPrompt}`);
+    this.pushContext(`[enhanced] ${enhancedPrompt}`);
+
     let tasksCreated = 0;
-    if (actionable) {
+    if (!actionable) {
+      // Lightweight-only responses stay in the orchestrator.
+      console.log(`[Orchestrator] Thinking about: "${enhancedPrompt.substring(0, 80)}"`);
+      const output = await this.brain.think(enhancedPrompt, this.recentContext);
+      this.pushContext(`[assistant] ${output.assistantMessage}`);
+      await this.sendCommand({
+        type: "assistant_message",
+        payload: { text: output.assistantMessage },
+        turnId,
+      });
+    } else {
+      // Any non-trivial request is worker-owned.
+      await this.comm.assistantMessage(
+        "Understood. I am delegating this to a worker now.",
+        { turnId, correlationId: requestId },
+      );
+
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
+      const jobKind = targetPath ? "task.execute" : "project.summary";
       const params: Record<string, unknown> = {
         requestId,
         sessionId: this.sessionId,
-        instruction: originalPrompt,
+        instruction: originalPrompt || enhancedPrompt,
         enhancedPrompt,
         targetWorkerId,
-        targetPath,
         repoRoot: this.repo,
         recentContext: this.recentContext.slice(-RemoteOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
       };
+      if (targetPath) {
+        params.targetPath = targetPath;
+      } else {
+        params.responseMode = "assistant_message";
+        params.maxResponseChars = 8000;
+      }
 
       await this.sendCommand({
         type: "task_created",
         payload: {
           taskId,
-          title: `Execute request: ${toSingleLine(originalPrompt, 64) || "user request"}`,
-          description: "Worker-owned execution plan from shared context",
+          title: `${jobKind === "task.execute" ? "Execute request" : "Analyze request"}: ${toSingleLine(originalPrompt, 64) || "user request"}`,
+          description:
+            jobKind === "task.execute"
+              ? "Worker-owned execution plan from shared context"
+              : "Worker-generated explanation from repository context",
           createdBy: `agent:${this.agentId}`,
         },
         turnId,
@@ -574,14 +587,14 @@ class RemoteOrchestrator {
         targetWorkerId
           ? `Assigned this request to worker ${targetWorkerId}.`
           : "No idle worker right now; request is queued and waiting for the next available worker.",
-        { turnId },
+        { turnId, correlationId: requestId },
       );
 
-      const jobId = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
+      const jobId = await this.enqueueJob(taskId, jobKind, params, targetWorkerId);
       if (jobId) {
         await this.sendCommand({
           type: "job_enqueued",
-          payload: { jobId, taskId, kind: "task.execute", params },
+          payload: { jobId, taskId, kind: jobKind, params },
           turnId,
         });
         tasksCreated = 1;

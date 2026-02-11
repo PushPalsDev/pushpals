@@ -656,8 +656,15 @@ export async function executeJob(
       break;
     }
     case "project.summary": {
-      cmd = ["git", "log", "--oneline", "-n", "5"];
-      break;
+      const instruction =
+        String(params.instruction ?? params.enhancedPrompt ?? "").trim() ||
+        "Summarize repository architecture and key components.";
+      const content = await buildArchitectureDocument(repo, instruction, params.recentJobs);
+      return {
+        ok: true,
+        summary: "Generated repository architecture summary",
+        stdout: truncate(content),
+      };
     }
     case "shell.exec": {
       let command = params.command as string;
