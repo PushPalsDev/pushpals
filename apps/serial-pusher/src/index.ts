@@ -1,6 +1,7 @@
 import { parseArgs } from "util";
 import { isAbsolute, join, relative, resolve } from "path";
 import { mkdirSync, existsSync } from "fs";
+import { CommunicationManager } from "../../../packages/shared/src/communication.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { GitOps } from "./git";
@@ -211,6 +212,26 @@ try {
 
 let running = true;
 
+function createSessionComm(sessionId: string): CommunicationManager {
+  return new CommunicationManager({
+    serverUrl: config.serverUrl,
+    sessionId,
+    authToken: config.authToken,
+    from: "agent:serial-pusher",
+  });
+}
+
+async function emitPusherMessage(
+  comm: CommunicationManager,
+  text: string,
+  correlationId: string,
+): Promise<void> {
+  const ok = await comm.assistantMessage(text, { correlationId });
+  if (!ok) {
+    console.error(`[${ts()}] Failed to emit serial-pusher message: ${text}`);
+  }
+}
+
 async function tick(): Promise<void> {
   try {
     // ── Poll Completion Queue ──────────────────────────────────────────
@@ -256,12 +277,23 @@ async function tick(): Promise<void> {
     }
 
     const completion = data.completion;
+    const comm = createSessionComm(completion.sessionId);
     console.log(
       `[${ts()}] Claimed completion ${completion.id}: ${completion.branch} (${completion.commitSha.slice(0, 8)})`,
+    );
+    await emitPusherMessage(
+      comm,
+      `Serial pusher claimed worker completion ${completion.id.slice(0, 8)} from ${completion.branch}.`,
+      completion.id,
     );
 
     if (dryRun) {
       console.log(`[${ts()}] Dry run mode — skipping processing`);
+      await emitPusherMessage(
+        comm,
+        `Serial pusher is in dry-run mode, so completion ${completion.id.slice(0, 8)} was not applied.`,
+        completion.id,
+      );
       return;
     }
 
@@ -351,6 +383,10 @@ async function tick(): Promise<void> {
         console.error(`[${ts()}] Failed to mark completion processed: ${markResponse.status}`);
       } else {
         console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
+        const pushMessage = config.pushMainAfterMerge
+          ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.`
+          : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
+        await emitPusherMessage(comm, pushMessage, completion.id);
       }
     } catch (err: any) {
       console.error(`[${ts()}] Failed to process completion ${completion.id}: ${err.message}`);
@@ -365,6 +401,11 @@ async function tick(): Promise<void> {
       if (!failResponse.ok) {
         console.error(`[${ts()}] Failed to mark completion failed: ${failResponse.status}`);
       }
+      await emitPusherMessage(
+        comm,
+        `Failed to apply completion ${completion.id.slice(0, 8)} from ${completion.branch}: ${err.message}`,
+        completion.id,
+      );
     }
   } catch (err: any) {
     console.error(`[${ts()}] Poll error: ${err.message}`);

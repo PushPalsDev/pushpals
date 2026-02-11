@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from "crypto";
-import { detectRepoRoot, getRepoContext } from "shared";
+import { CommunicationManager, detectRepoRoot, getRepoContext } from "shared";
 import { createLLMClient, type LLMClient } from "../../agent-remote/src/llm.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
@@ -123,6 +123,12 @@ Be concise but include all relevant information the execution agent needs.`;
     const serverUrl = this.server;
     const authToken = this.authToken;
     const enhancePrompt = this.enhancePrompt.bind(this);
+    const comm = new CommunicationManager({
+      serverUrl,
+      sessionId,
+      authToken,
+      from: `agent:${agentId}`,
+    });
 
     Bun.serve({
       port,
@@ -166,17 +172,16 @@ Be concise but include all relevant information the execution agent needs.`;
             const cmdHeaders: Record<string, string> = { "Content-Type": "application/json" };
             if (authToken) cmdHeaders["Authorization"] = `Bearer ${authToken}`;
 
-            fetch(`${serverUrl}/sessions/${sessionId}/command`, {
-              method: "POST",
-              headers: cmdHeaders,
-              body: JSON.stringify({
-                type: "message",
-                payload: { text: originalPrompt },
-                from: "client",
-              }),
-            }).catch((err) =>
-              console.error(`[LocalAgent] Failed to emit user message to session:`, err),
-            );
+            void comm
+              .userMessage(originalPrompt)
+              .then((ok) => {
+                if (!ok) {
+                  console.error(`[LocalAgent] Failed to emit user message to session`);
+                }
+              })
+              .catch((err) =>
+                console.error(`[LocalAgent] Failed to emit user message to session:`, err),
+              );
 
             // ── Process and stream status back via SSE ──
             let closed = false;
@@ -247,6 +252,11 @@ Be concise but include all relevant information the execution agent needs.`;
 
                   const data = (await res.json()) as { ok: boolean; requestId?: string };
                   console.log(`[LocalAgent] Enqueued request: ${data.requestId}`);
+
+                  const requestSuffix = data.requestId ? ` (${data.requestId.slice(0, 8)})` : "";
+                  await comm.assistantMessage(
+                    `Request queued${requestSuffix}. Remote orchestrator is planning and will assign a worker.`,
+                  );
 
                   // Final success message
                   send({

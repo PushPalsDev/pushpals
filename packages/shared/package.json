@@ -7,6 +7,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "protocol": "workspace:*"
+  },
   "devDependencies": {
     "typescript": "~5.9.2",
     "@types/bun": "latest"

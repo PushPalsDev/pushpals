@@ -21,7 +21,7 @@ import { Database } from "bun:sqlite";
 import { createLLMClient } from "./llm.js";
 import { AgentBrain } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
-import { detectRepoRoot } from "shared";
+import { CommunicationManager, detectRepoRoot } from "shared";
 import { resolve, join } from "path";
 import { mkdirSync } from "fs";
 
@@ -153,6 +153,7 @@ class RemoteOrchestrator {
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
+  private readonly comm: CommunicationManager;
   private jobsDb: Database | null = null;
   private disposed = false;
 
@@ -207,6 +208,12 @@ class RemoteOrchestrator {
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
+    this.comm = new CommunicationManager({
+      serverUrl: this.server,
+      sessionId: this.sessionId,
+      authToken: this.authToken,
+      from: `agent:${this.agentId}`,
+    });
     console.log(`[Orchestrator] Detected repo root: ${this.repo}`);
     console.log(
       `[Orchestrator] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
@@ -223,17 +230,14 @@ class RemoteOrchestrator {
 
   /** Send a command event through the server */
   private async sendCommand(cmd: Omit<CommandRequest, "from">): Promise<void> {
-    const body: CommandRequest = { ...cmd, from: `agent:${this.agentId}` };
     try {
-      const res = await fetch(`${this.server}/sessions/${this.sessionId}/command`, {
-        method: "POST",
-        headers: this.authHeaders(),
-        body: JSON.stringify(body),
+      const ok = await this.comm.emit(cmd.type, cmd.payload as any, {
+        to: cmd.to,
+        correlationId: cmd.correlationId,
+        turnId: cmd.turnId,
+        parentId: cmd.parentId,
       });
-      if (!res.ok) {
-        const err = await res.text();
-        console.error(`[Orchestrator] Command ${cmd.type} failed: ${res.status} ${err}`);
-      }
+      if (!ok) console.error(`[Orchestrator] Command ${cmd.type} failed`);
     } catch (err) {
       console.error(`[Orchestrator] Command ${cmd.type} error:`, err);
     }
@@ -559,6 +563,13 @@ class RemoteOrchestrator {
         },
         turnId,
       });
+
+      await this.comm.assistantMessage(
+        targetWorkerId
+          ? `Assigned this request to worker ${targetWorkerId}.`
+          : "No idle worker right now; request is queued and waiting for the next available worker.",
+        { turnId },
+      );
 
       const jobId = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
       if (jobId) {
