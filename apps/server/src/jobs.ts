@@ -230,9 +230,13 @@ export class JobQueue {
         ? body.currentJobId.trim()
         : null;
     const pollMs =
-      typeof body.pollMs === "number" && Number.isFinite(body.pollMs) ? Math.max(0, body.pollMs) : null;
+      typeof body.pollMs === "number" && Number.isFinite(body.pollMs)
+        ? Math.max(0, body.pollMs)
+        : null;
     const capabilities = JSON.stringify(
-      body.capabilities && typeof body.capabilities === "object" && !Array.isArray(body.capabilities)
+      body.capabilities &&
+        typeof body.capabilities === "object" &&
+        !Array.isArray(body.capabilities)
         ? body.capabilities
         : {},
     );

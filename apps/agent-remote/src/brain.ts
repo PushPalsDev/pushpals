@@ -54,9 +54,8 @@ function hasFileWriteIntent(text: string): boolean {
   const explicitWrite =
     /\b(create|write|add|generate|make|update|edit)\b/.test(t) &&
     /\b(file|doc|document|readme)\b/.test(t);
-  const hasFileLikeToken = /\b[\w./-]+\.(md|txt|json|yaml|yml|ts|tsx|js|jsx|py|java|go|rs|c|cpp)\b/i.test(
-    text,
-  );
+  const hasFileLikeToken =
+    /\b[\w./-]+\.(md|txt|json|yaml|yml|ts|tsx|js|jsx|py|java|go|rs|c|cpp)\b/i.test(text);
   return explicitWrite || hasFileLikeToken;
 }
 
@@ -359,7 +358,11 @@ export class AgentBrain {
       if (this.actionsEnabled && requestedPath && wantsFileWrite && !hasMutatingTask) {
         let fallbackContent = "";
         try {
-          fallbackContent = await this.generateFallbackFileContent(userText, requestedPath, context);
+          fallbackContent = await this.generateFallbackFileContent(
+            userText,
+            requestedPath,
+            context,
+          );
         } catch (err) {
           console.warn("[Brain] Fallback file-content generation failed:", err);
         }

@@ -65,8 +65,12 @@ function summarizeRecentJobsForDoc(value: unknown, limit = 6): string[] {
     const job = row as Record<string, unknown>;
     const kind = String(job.kind ?? "").trim();
     const status = String(job.status ?? "").trim();
-    const summary = String(job.summary ?? "").replace(/\s+/g, " ").trim();
-    const error = String(job.error ?? "").replace(/\s+/g, " ").trim();
+    const summary = String(job.summary ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const error = String(job.error ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
     if (!kind && !status && !summary && !error) continue;
     const tail = summary || error;
     const entry = tail ? `- ${kind} [${status}]: ${tail}` : `- ${kind} [${status}]`;
@@ -487,14 +491,7 @@ function buildStageCommand(kind: string, params?: Record<string, unknown>): stri
   const targets = buildStageTargets(kind, params);
   if (targets.length === 0) {
     if (kind === "task.execute") {
-      return [
-        "add",
-        "-A",
-        "--",
-        ".",
-        ":(exclude)workspace/**",
-        ":(exclude)outputs/**",
-      ];
+      return ["add", "-A", "--", ".", ":(exclude)workspace/**", ":(exclude)outputs/**"];
     }
     return null;
   }
@@ -681,7 +678,8 @@ export async function executeJob(
       if (!targetPath) {
         return {
           ok: false,
-          summary: "task.execute could not determine output path. Provide targetPath or mention file name.",
+          summary:
+            "task.execute could not determine output path. Provide targetPath or mention file name.",
         };
       }
 

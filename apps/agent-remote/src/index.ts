@@ -103,7 +103,9 @@ function isExecutionIntent(text: string, targetPath: string | null): boolean {
 }
 
 function toSingleLine(value: unknown, max = 220): string {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  const text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!text) return "";
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
@@ -369,7 +371,9 @@ class RemoteOrchestrator {
 
   private pickIdleWorker(workers: WorkerSnapshot[]): WorkerSnapshot | null {
     const idle = workers
-      .filter((worker) => worker.isOnline && worker.status !== "offline" && worker.activeJobCount === 0)
+      .filter(
+        (worker) => worker.isOnline && worker.status !== "offline" && worker.activeJobCount === 0,
+      )
       .sort((a, b) => Date.parse(b.lastHeartbeat) - Date.parse(a.lastHeartbeat));
     return idle[0] ?? null;
   }
@@ -471,7 +475,9 @@ class RemoteOrchestrator {
       return idleNow.workerId;
     }
 
-    const onlineWorkers = workers.filter((worker) => worker.isOnline && worker.status !== "offline");
+    const onlineWorkers = workers.filter(
+      (worker) => worker.isOnline && worker.status !== "offline",
+    );
     if (this.autoSpawnWorkers && onlineWorkers.length < this.maxWorkers) {
       const spawned = await this.spawnWorker();
       if (spawned) return spawned;
