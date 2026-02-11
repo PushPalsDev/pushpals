@@ -296,6 +296,13 @@ async function ensureSerialPusherWorktree(): Promise<void> {
   if (!isGitRepo.ok) {
     mkdirSync(resolve(repoPath, ".."), { recursive: true });
 
+    const pruneResult = await git(["worktree", "prune"]);
+    if (!pruneResult.ok) {
+      console.warn(
+        `[start] Could not prune stale worktree metadata before creating ${repoPath}: ${pruneResult.stderr || pruneResult.stdout}`,
+      );
+    }
+
     const seedCandidates = [INTEGRATION_REMOTE_REF, INTEGRATION_BRANCH, INTEGRATION_BASE_REMOTE_REF, "HEAD"];
     let seedRef = "HEAD";
     for (const ref of seedCandidates) {
@@ -306,7 +313,15 @@ async function ensureSerialPusherWorktree(): Promise<void> {
       }
     }
 
-    const addResult = await git(["worktree", "add", "--detach", repoPath, seedRef]);
+    let addResult = await git(["worktree", "add", "--detach", repoPath, seedRef]);
+    if (!addResult.ok) {
+      const detail = `${addResult.stderr}\n${addResult.stdout}`.toLowerCase();
+      if (detail.includes("already registered worktree")) {
+        await git(["worktree", "prune"]);
+        addResult = await git(["worktree", "add", "--force", "--detach", repoPath, seedRef]);
+      }
+    }
+
     if (!addResult.ok) {
       console.error(
         `[start] Failed to create serial-pusher worktree at ${repoPath} from ${seedRef}: ${addResult.stderr || addResult.stdout}`,

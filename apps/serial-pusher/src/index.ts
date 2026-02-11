@@ -445,6 +445,7 @@ async function ensureDefaultSerialPusherWorktree(): Promise<void> {
   if (probe.ok) return;
 
   mkdirSync(resolve(config.repoPath, ".."), { recursive: true });
+  await runGitCapture(["worktree", "prune"]);
 
   const seedCandidates = [
     `${config.remote}/${config.mainBranch}`,
@@ -461,7 +462,22 @@ async function ensureDefaultSerialPusherWorktree(): Promise<void> {
     }
   }
 
-  const addResult = await runGitCapture(["worktree", "add", "--detach", config.repoPath, seedRef]);
+  let addResult = await runGitCapture(["worktree", "add", "--detach", config.repoPath, seedRef]);
+  if (!addResult.ok) {
+    const detail = `${addResult.stderr}\n${addResult.stdout}`.toLowerCase();
+    if (detail.includes("already registered worktree")) {
+      await runGitCapture(["worktree", "prune"]);
+      addResult = await runGitCapture([
+        "worktree",
+        "add",
+        "--force",
+        "--detach",
+        config.repoPath,
+        seedRef,
+      ]);
+    }
+  }
+
   if (!addResult.ok) {
     throw new Error(
       `Failed to create default serial-pusher worktree (${config.repoPath}) from ${seedRef}: ${
