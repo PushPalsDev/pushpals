@@ -121,6 +121,9 @@
     "packages/shared": {
       "name": "shared",
       "version": "0.1.0",
+      "dependencies": {
+        "protocol": "workspace:*",
+      },
       "devDependencies": {
         "@types/bun": "latest",
         "typescript": "~5.9.2",
