@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "bun --watch src/index.ts",
+    "dev": "bun --watch --no-clear-screen src/index.ts",
     "build": "tsc",
     "start": "bun run src/index.ts"
   },

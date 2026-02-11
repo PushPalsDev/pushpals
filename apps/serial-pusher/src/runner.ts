@@ -67,22 +67,22 @@ export class JobRunner {
   /**
    * Process a single merge job through the full pipeline:
    *   1. Reset to clean state
-   *   2. Update main (fetch + checkout + pull ff-only)
+   *   2. Update integration branch (fetch + checkout + pull ff-only)
    *   3. Check if already merged (skip if so)
-   *   4. Create temp branch from remote main HEAD
+   *   4. Create temp branch from remote integration-branch HEAD
    *   5. Merge remote agent branch into temp (no-ff or ff-only)
    *   6. Run configured checks on temp branch
-   *   7. Checkout main, ff-only merge local temp branch
-   *   8. Push main to remote (--atomic)
+   *   7. Checkout integration branch, ff-only merge local temp branch
+   *   8. Push integration branch to remote (--atomic)
    *   9. Optionally delete remote agent branch
    *  10. Clean up temp branch
    *
    * Failure modes:
-   *   - Merge conflict: markFailed if deterministic (main unchanged);
-   *                      requeue if main advanced (may resolve on new base);
+   *   - Merge conflict: markFailed if deterministic (integration branch unchanged);
+   *                      requeue if integration branch advanced (may resolve on new base);
    *                      markSkipped if maxAttempts exceeded
    *   - Check failure:  requeue if under maxAttempts, skip otherwise
-   *   - Push rejected:  requeue (main advanced mid-run)
+   *   - Push rejected:  requeue (integration branch advanced mid-run)
    */
   async processJob(job: MergeJob, db: MergeQueueDB): Promise<RunResult> {
     const tempBranch = `_serial-pusher/${job.id}`;
@@ -107,11 +107,11 @@ export class JobRunner {
       const originBranchSha = await this.gitOps.revParse(`${this.config.remote}/${job.branch}`);
       log(
         job.id,
-        `SHAs: origin/main=${originMainSha?.slice(0, 8)}, origin/${job.branch}=${originBranchSha?.slice(0, 8)}, job.head_sha=${job.head_sha.slice(0, 8)}`,
+        `SHAs: ${this.config.remote}/${this.config.mainBranch}=${originMainSha?.slice(0, 8)}, ${this.config.remote}/${job.branch}=${originBranchSha?.slice(0, 8)}, job.head_sha=${job.head_sha.slice(0, 8)}`,
       );
       db.addLog(
         job.id,
-        `origin/main=${originMainSha?.slice(0, 8)} origin/${job.branch}=${originBranchSha?.slice(0, 8)} job.head_sha=${job.head_sha.slice(0, 8)}`,
+        `${this.config.remote}/${this.config.mainBranch}=${originMainSha?.slice(0, 8)} ${this.config.remote}/${job.branch}=${originBranchSha?.slice(0, 8)} job.head_sha=${job.head_sha.slice(0, 8)}`,
       );
 
       // ── Step 2.5: Validate job SHA matches current branch HEAD ────────

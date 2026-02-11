@@ -48,7 +48,7 @@ Options:
   -s, --server <url>        PushPals server URL (default: http://localhost:3001)
   -p, --port <number>       HTTP status server port (default: 3002)
       --remote <name>       Git remote (default: origin)
-  -b, --branch <name>       Main branch name (default: main)
+  -b, --branch <name>       Integration branch name (default: $PUSHPALS_INTEGRATION_BRANCH or main_agents)
       --prefix <prefix>     Agent branch prefix (default: agent/)
   -i, --interval <seconds>  Poll interval in seconds (default: 10)
       --state-dir <path>    State directory for DB & lock (default: $PUSHPALS_DATA_DIR/serial-pusher)
@@ -107,6 +107,8 @@ if (typeof args["state-dir"] === "string") cliOverrides.stateDir = resolve(args[
 if (args["delete-after-merge"]) cliOverrides.deleteAfterMerge = true;
 
 config = applyCliOverrides(config, cliOverrides);
+const integrationBaseBranch = (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || "main";
+const integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
 
 // Validate config before proceeding
 try {
@@ -374,6 +376,57 @@ async function runCheck(
   return { ok: exitCode === 0, output };
 }
 
+async function promptYesNo(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+
+  const readline = await import("readline");
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const answer = await new Promise<string>((resolveAnswer) => {
+    rl.question(`${question} [y/N]: `, (value) => resolveAnswer(value));
+  });
+  rl.close();
+
+  const normalized = answer.trim().toLowerCase();
+  return normalized === "y" || normalized === "yes";
+}
+
+async function ensureIntegrationBranchExists(): Promise<void> {
+  const remoteRef = `${config.remote}/${config.mainBranch}`;
+  if (await gitOps.revParse(remoteRef)) return;
+
+  console.warn(`[${ts()}] Integration branch ${remoteRef} does not exist.`);
+
+  const autoCreate = TRUTHY.has(
+    (process.env.SERIAL_PUSHER_AUTO_CREATE_MAIN_BRANCH ?? "").toLowerCase(),
+  );
+
+  let approved = autoCreate;
+  if (!approved) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new Error(
+        `Missing ${remoteRef}. Re-run interactively to approve creation, or set SERIAL_PUSHER_AUTO_CREATE_MAIN_BRANCH=1.`,
+      );
+    }
+
+    approved = await promptYesNo(
+      `Create ${config.mainBranch} from ${integrationBaseRef}, set upstream to ${integrationBaseRef}, and push ${config.mainBranch} to ${config.remote}?`,
+    );
+  }
+
+  if (!approved) {
+    throw new Error(`User declined creation of ${remoteRef}.`);
+  }
+
+  await gitOps.bootstrapMainBranchFromBase();
+  console.log(
+    `[${ts()}] Created ${remoteRef}; local ${config.mainBranch} is set to track ${integrationBaseRef}.`,
+  );
+}
+
 async function main(): Promise<void> {
   // ── Startup safety check ──────────────────────────────────────────────
   // Skip source is already logged in the boot banner (mode: SKIP CLEAN CHECK).
@@ -409,6 +462,8 @@ async function main(): Promise<void> {
     }
     console.log(`[${ts()}] Repo is clean`);
   }
+
+  await ensureIntegrationBranchExists();
 
   // Initial tick — retry on transient errors (e.g. remote unreachable)
   for (let attempt = 1; ; attempt++) {

@@ -27,6 +27,8 @@ export interface DockerExecutorOptions {
   gitToken?: string;
   /** Timeout in milliseconds */
   timeoutMs?: number;
+  /** Git ref used as the base for per-job worktrees */
+  baseRef?: string;
 }
 
 export interface DockerJobResult {
@@ -57,6 +59,7 @@ export class DockerExecutor {
     this.options = {
       gitToken: "",
       timeoutMs: 60000,
+      baseRef: "HEAD",
       ...options,
     };
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
@@ -128,18 +131,21 @@ export class DockerExecutor {
    * Create a git worktree for isolated job execution
    */
   private async createWorktree(worktreePath: string): Promise<void> {
-    // Create worktree from HEAD (detached)
-    const proc = Bun.spawn(["git", "worktree", "add", "--detach", worktreePath, "HEAD"], {
+    // Create worktree from configured base ref (detached)
+    const proc = Bun.spawn(
+      ["git", "worktree", "add", "--detach", worktreePath, this.options.baseRef],
+      {
       cwd: this.options.repo,
       stdout: "pipe",
       stderr: "pipe",
-    });
+      },
+    );
 
     const exitCode = await proc.exited;
 
     if (exitCode !== 0) {
       const stderr = await new Response(proc.stderr).text();
-      throw new Error(`Failed to create worktree: ${stderr}`);
+      throw new Error(`Failed to create worktree from ${this.options.baseRef}: ${stderr}`);
     }
 
     this.rewriteWorktreeGitdirToRelative(worktreePath);

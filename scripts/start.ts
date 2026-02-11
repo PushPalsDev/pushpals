@@ -13,6 +13,15 @@ import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
 const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
+const DEFAULT_INTEGRATION_BRANCH = "main_agents";
+const INTEGRATION_BRANCH =
+  (process.env.PUSHPALS_INTEGRATION_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BRANCH;
+const INTEGRATION_REMOTE_REF = `origin/${INTEGRATION_BRANCH}`;
+const DEFAULT_INTEGRATION_BASE_BRANCH = "main";
+const INTEGRATION_BASE_BRANCH =
+  (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() ||
+  DEFAULT_INTEGRATION_BASE_BRANCH;
+const INTEGRATION_BASE_REMOTE_REF = `origin/${INTEGRATION_BASE_BRANCH}`;
 const workerImage = process.env.WORKER_DOCKER_IMAGE ?? DEFAULT_IMAGE;
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -48,10 +57,61 @@ async function runInherited(cmd: string[], cwd?: string): Promise<number> {
   }
 }
 
-async function ensureGitHubAuth(): Promise<void> {
+type CmdResult = {
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+};
+
+async function runCapture(cmd: string[], cwd = repoRoot): Promise<CmdResult> {
+  try {
+    const proc = Bun.spawn(cmd, {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      ok: exitCode === 0,
+      exitCode,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      exitCode: 127,
+      stdout: "",
+      stderr: String(err),
+    };
+  }
+}
+
+async function git(args: string[]): Promise<CmdResult> {
+  return runCapture(["git", ...args], repoRoot);
+}
+
+async function promptYesNo(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+  const readline = await import("readline");
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string>((resolveAnswer) => {
+    rl.question(`${question} [y/N]: `, (value) => resolveAnswer(value));
+  });
+  rl.close();
+  const normalized = answer.trim().toLowerCase();
+  return normalized === "y" || normalized === "yes";
+}
+
+async function ensureGitHubAuth(force = false): Promise<void> {
   const skipCheck = envTruthy("PUSHPALS_SKIP_GH_AUTH_CHECK");
   const serialPusherPushDisabled = envTruthy("SERIAL_PUSHER_NO_PUSH");
-  if (skipCheck || serialPusherPushDisabled) {
+  if (!force && (skipCheck || serialPusherPushDisabled)) {
     return;
   }
 
@@ -91,6 +151,100 @@ async function ensureGitHubAuth(): Promise<void> {
   process.exit(1);
 }
 
+async function ensureIntegrationBranch(): Promise<void> {
+  const fetchResult = await git(["fetch", "origin", "--prune", "--quiet"]);
+  if (!fetchResult.ok) {
+    console.error("[start] Failed to fetch remote refs before integration-branch precheck.");
+    console.error(fetchResult.stderr || fetchResult.stdout);
+    process.exit(fetchResult.exitCode || 1);
+  }
+
+  const remoteExists = await git([
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `refs/remotes/${INTEGRATION_REMOTE_REF}`,
+  ]);
+  if (remoteExists.ok) {
+    process.env.WORKER_BASE_REF = process.env.WORKER_BASE_REF ?? INTEGRATION_REMOTE_REF;
+    return;
+  }
+
+  console.warn(`[start] Required branch ${INTEGRATION_REMOTE_REF} does not exist on remote.`);
+  const autoCreate =
+    envTruthy("PUSHPALS_AUTO_CREATE_INTEGRATION_BRANCH") ||
+    envTruthy("PUSHPALS_AUTO_CREATE_MAIN_AGENTS");
+
+  let approved = autoCreate;
+  if (!approved) {
+    approved = await promptYesNo(
+      `Create ${INTEGRATION_BRANCH} from ${INTEGRATION_BASE_REMOTE_REF} and push it to origin now?`,
+    );
+  }
+
+  if (!approved) {
+    console.error(
+      `[start] Cannot continue without ${INTEGRATION_REMOTE_REF}. Create it on the remote repo, then rerun.`,
+    );
+    process.exit(1);
+  }
+
+  // Branch creation requires push credentials regardless of SERIAL_PUSHER_NO_PUSH mode.
+  await ensureGitHubAuth(true);
+
+  const ensureLocalBranch = await git([
+    "branch",
+    "-f",
+    INTEGRATION_BRANCH,
+    INTEGRATION_BASE_REMOTE_REF,
+  ]);
+  if (!ensureLocalBranch.ok) {
+    console.error(
+      `[start] Failed to create local ${INTEGRATION_BRANCH} from ${INTEGRATION_BASE_REMOTE_REF}.`,
+    );
+    console.error(ensureLocalBranch.stderr || ensureLocalBranch.stdout);
+    process.exit(ensureLocalBranch.exitCode || 1);
+  }
+
+  const setUpstream = await git([
+    "branch",
+    "--set-upstream-to",
+    INTEGRATION_BASE_REMOTE_REF,
+    INTEGRATION_BRANCH,
+  ]);
+  if (!setUpstream.ok) {
+    console.error(
+      `[start] Failed to set upstream for ${INTEGRATION_BRANCH} to ${INTEGRATION_BASE_REMOTE_REF}.`,
+    );
+    console.error(setUpstream.stderr || setUpstream.stdout);
+    process.exit(setUpstream.exitCode || 1);
+  }
+
+  const pushResult = await git([
+    "push",
+    "origin",
+    `refs/heads/${INTEGRATION_BRANCH}:refs/heads/${INTEGRATION_BRANCH}`,
+  ]);
+  if (!pushResult.ok) {
+    console.error(`[start] Failed to push ${INTEGRATION_BRANCH} to origin.`);
+    console.error(pushResult.stderr || pushResult.stdout);
+    console.error(
+      `[start] Cannot continue unless ${INTEGRATION_REMOTE_REF} exists on the remote repository.`,
+    );
+    process.exit(pushResult.exitCode || 1);
+  }
+
+  const refresh = await git(["fetch", "origin", INTEGRATION_BRANCH, "--quiet"]);
+  if (!refresh.ok) {
+    console.warn(
+      `[start] Created ${INTEGRATION_BRANCH}, but refresh fetch failed: ${refresh.stderr || refresh.stdout}`,
+    );
+  }
+
+  process.env.WORKER_BASE_REF = process.env.WORKER_BASE_REF ?? INTEGRATION_REMOTE_REF;
+  console.log(`[start] Ready: ${INTEGRATION_REMOTE_REF} exists and workers will base from it.`);
+}
+
 async function ensureDockerImage(): Promise<void> {
   const dockerAvailable = (await runQuiet(["docker", "version"])) === 0;
   if (!dockerAvailable) {
@@ -115,6 +269,7 @@ async function ensureDockerImage(): Promise<void> {
   }
 }
 
+await ensureIntegrationBranch();
 await ensureGitHubAuth();
 await ensureDockerImage();
 

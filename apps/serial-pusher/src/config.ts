@@ -23,7 +23,7 @@ export interface SerialPusherConfig {
   serverUrl: string;
   /** Git remote name. Default: "origin". */
   remote: string;
-  /** The main branch to merge into. Default: "main". */
+  /** The integration branch to merge into. Default: "main_agents". */
   mainBranch: string;
   /** Prefix for agent branches to discover. Default: "agent/". */
   branchPrefix: string;
@@ -41,7 +41,7 @@ export interface SerialPusherConfig {
   maxAttempts: number;
   /** Merge strategy: "no-ff" for merge commits, "ff-only" for linear. Default: "no-ff". */
   mergeStrategy: "no-ff" | "ff-only";
-  /** Push main branch to remote after successful merge/checks. Default: true. */
+  /** Push integration branch to remote after successful merge/checks. Default: true. */
   pushMainAfterMerge: boolean;
   /** Authentication token for server API calls. */
   authToken?: string;
@@ -53,7 +53,10 @@ const DEFAULTS: SerialPusherConfig = {
   repoPath: process.cwd(),
   serverUrl: process.env.PUSHPALS_SERVER_URL ?? "http://localhost:3001",
   remote: "origin",
-  mainBranch: "main",
+  mainBranch:
+    process.env.SERIAL_PUSHER_MAIN_BRANCH ??
+    process.env.PUSHPALS_INTEGRATION_BRANCH ??
+    "main_agents",
   branchPrefix: "agent/",
   pollIntervalSeconds: 10,
   checks: [],

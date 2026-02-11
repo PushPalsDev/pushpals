@@ -79,6 +79,7 @@ export class GitOps {
   private repoPath: string;
   private remote: string;
   private mainBranch: string;
+  private integrationBaseBranch: string;
   private branchPrefix: string;
   private githubToken: string | null;
 
@@ -86,9 +87,48 @@ export class GitOps {
     this.repoPath = config.repoPath;
     this.remote = config.remote;
     this.mainBranch = config.mainBranch;
+    this.integrationBaseBranch =
+      (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || "main";
     this.branchPrefix = config.branchPrefix;
     this.githubToken =
       process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
+  }
+
+  private remoteMainRef(): string {
+    return `${this.remote}/${this.mainBranch}`;
+  }
+
+  private integrationBaseRef(): string {
+    return `${this.remote}/${this.integrationBaseBranch}`;
+  }
+
+  /**
+   * Resolve the best available base ref for main-branch operations.
+   *
+   * Preference order:
+   * 1) remote/main (normal steady-state)
+   * 2) local main (already initialized locally)
+   * 3) remote/HEAD (bootstrap main branch from remote default branch)
+   * 4) HEAD (last-resort bootstrap)
+   */
+  private async resolveMainBaseRef(): Promise<string> {
+    const remoteMain = this.remoteMainRef();
+    if (await this.revParse(remoteMain)) return remoteMain;
+
+    if (await this.revParse(this.mainBranch)) return this.mainBranch;
+
+    const remoteHead = `${this.remote}/HEAD`;
+    if (await this.revParse(remoteHead)) {
+      console.warn(
+        `[serial-pusher] ${remoteMain} not found; bootstrapping ${this.mainBranch} from ${remoteHead}.`,
+      );
+      return remoteHead;
+    }
+
+    console.warn(
+      `[serial-pusher] ${remoteMain} and ${this.mainBranch} not found; bootstrapping from HEAD.`,
+    );
+    return "HEAD";
   }
 
   private async resolveAgentMergeRef(agentBranch: string): Promise<string> {
@@ -118,6 +158,63 @@ export class GitOps {
       this.githubToken ? { githubToken: this.githubToken } : undefined,
     );
     assertOk(result, "fetch --prune");
+  }
+
+  /**
+   * Bootstrap the integration branch when it doesn't yet exist on remote.
+   *
+   * Creates/resets local `<mainBranch>` from `origin/<integration-base-branch>`,
+   * sets upstream to that base ref, then pushes
+   * `<mainBranch>` to `origin`.
+   */
+  async bootstrapMainBranchFromBase(): Promise<void> {
+    await this.fetchPrune();
+
+    const baseRef = this.integrationBaseRef();
+    const baseSha = await this.revParse(baseRef);
+    if (!baseSha) {
+      throw new Error(`Cannot bootstrap ${this.mainBranch}: base ref ${baseRef} not found.`);
+    }
+
+    const checkoutResult = await git(this.repoPath, [
+      "checkout",
+      "-B",
+      this.mainBranch,
+      baseRef,
+      "--quiet",
+    ]);
+    assertOk(checkoutResult, `checkout -B ${this.mainBranch} ${baseRef}`);
+
+    const trackResult = await git(this.repoPath, [
+      "branch",
+      "--set-upstream-to",
+      baseRef,
+      this.mainBranch,
+    ]);
+    if (!trackResult.ok) {
+      throw new Error(
+        `Failed to set upstream for ${this.mainBranch} to ${baseRef}: ${trackResult.stderr || trackResult.stdout}`,
+      );
+    }
+
+    const pushResult = await git(
+      this.repoPath,
+      ["push", this.remote, this.mainBranch],
+      this.githubToken ? { githubToken: this.githubToken } : undefined,
+    );
+    if (!pushResult.ok) {
+      // Branch may have been created concurrently by another process.
+      await this.fetchPrune();
+      if (await this.revParse(this.remoteMainRef())) {
+        console.warn(
+          `[serial-pusher] Push failed while bootstrapping ${this.mainBranch}, but remote branch now exists.`,
+        );
+        return;
+      }
+      throw new Error(
+        `Failed to push bootstrap branch ${this.mainBranch}: ${pushResult.stderr || pushResult.stdout}`,
+      );
+    }
   }
 
   // ── Branch discovery ──────────────────────────────────────────────────
@@ -163,7 +260,16 @@ export class GitOps {
    * Checkout the main branch.
    */
   async checkoutMain(): Promise<void> {
-    const result = await git(this.repoPath, ["checkout", this.mainBranch, "--quiet"]);
+    const localMainExists = await this.revParse(this.mainBranch);
+    const result = localMainExists
+      ? await git(this.repoPath, ["checkout", this.mainBranch, "--quiet"])
+      : await git(this.repoPath, [
+          "checkout",
+          "-B",
+          this.mainBranch,
+          await this.resolveMainBaseRef(),
+          "--quiet",
+        ]);
     assertOk(result, "checkout main");
   }
 
@@ -171,6 +277,14 @@ export class GitOps {
    * Pull main with fast-forward only. Fails if main has diverged.
    */
   async pullMainFF(): Promise<void> {
+    const remoteMain = this.remoteMainRef();
+    if (!(await this.revParse(remoteMain))) {
+      console.warn(
+        `[serial-pusher] Skipping pull: remote branch ${remoteMain} does not exist yet.`,
+      );
+      return;
+    }
+
     const result = await git(
       this.repoPath,
       ["pull", this.remote, this.mainBranch, "--ff-only", "--quiet"],
@@ -186,11 +300,12 @@ export class GitOps {
    * Used for the merge->check->ff workflow.
    */
   async createTempBranch(name: string): Promise<void> {
+    const baseRef = await this.resolveMainBaseRef();
     const result = await git(this.repoPath, [
       "checkout",
       "-B",
       name,
-      `${this.remote}/${this.mainBranch}`,
+      baseRef,
       "--quiet",
     ]);
     assertOk(result, `checkout -B ${name}`);
@@ -263,18 +378,28 @@ export class GitOps {
     // Abort any in-progress operations (these may fail if nothing is in progress — that's fine)
     await git(this.repoPath, ["rebase", "--abort"]);
     await git(this.repoPath, ["merge", "--abort"]);
-    await git(this.repoPath, ["checkout", this.mainBranch, "--force", "--quiet"]);
+    const baseRef = await this.resolveMainBaseRef();
+    const checkoutResult = await git(this.repoPath, [
+      "checkout",
+      "-B",
+      this.mainBranch,
+      baseRef,
+      "--quiet",
+    ]);
+    assertOk(checkoutResult, `checkout -B ${this.mainBranch}`);
 
-    // Verify remote-tracking ref exists before hard reset
-    const remoteRef = `${this.remote}/${this.mainBranch}`;
+    // Prefer hard reset to remote/main when available.
+    const remoteRef = this.remoteMainRef();
     const remoteSha = await this.revParse(remoteRef);
+    const resetTarget = remoteSha ? remoteRef : this.mainBranch;
     if (!remoteSha) {
-      throw new Error(
-        `Remote-tracking ref ${remoteRef} not found. Run: git fetch ${this.remote} ${this.mainBranch}`,
+      console.warn(
+        `[serial-pusher] Remote-tracking ref ${remoteRef} not found; using local ${this.mainBranch}.`,
       );
     }
 
-    await git(this.repoPath, ["reset", "--hard", remoteRef, "--quiet"]);
+    const resetResult = await git(this.repoPath, ["reset", "--hard", resetTarget, "--quiet"]);
+    assertOk(resetResult, `reset --hard ${resetTarget}`);
   }
 
   /**

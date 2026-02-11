@@ -36,6 +36,11 @@ function envTruthy(name: string): boolean {
   return TRUTHY.has((process.env[name] ?? "").toLowerCase());
 }
 
+function integrationBranchName(): string {
+  const configured = (process.env.PUSHPALS_INTEGRATION_BRANCH ?? "").trim();
+  return configured || "main_agents";
+}
+
 function parseArgs(): {
   server: string;
   pollMs: number;
@@ -47,6 +52,7 @@ function parseArgs(): {
   dockerImage: string;
   gitToken: string | null;
   dockerTimeout: number;
+  worktreeBaseRef: string;
 } {
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
@@ -60,6 +66,7 @@ function parseArgs(): {
   let gitToken =
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
   let dockerTimeout = parseInt(process.env.WORKER_DOCKER_TIMEOUT_MS ?? "60000", 10);
+  let worktreeBaseRef = process.env.WORKER_BASE_REF ?? `origin/${integrationBranchName()}`;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -93,6 +100,9 @@ function parseArgs(): {
       case "--docker-timeout":
         dockerTimeout = parseInt(args[++i], 10);
         break;
+      case "--base-ref":
+        worktreeBaseRef = args[++i];
+        break;
     }
   }
 
@@ -107,6 +117,7 @@ function parseArgs(): {
     dockerImage,
     gitToken,
     dockerTimeout,
+    worktreeBaseRef,
   };
 }
 
@@ -136,7 +147,32 @@ async function runJob(
   return executeJob(job.kind, job.params, repo, onLog);
 }
 
-async function createIsolatedWorktree(repo: string, jobId: string): Promise<string> {
+async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promise<string> {
+  const integrationBranch = integrationBranchName();
+  const integrationRemoteRef = `origin/${integrationBranch}`;
+  const candidates = new Set<string>([requestedRef, integrationRemoteRef, integrationBranch, "HEAD"]);
+  if (requestedRef.startsWith("origin/")) {
+    const branch = requestedRef.slice("origin/".length);
+    const fetchResult = await git(repo, ["fetch", "origin", branch, "--quiet"]);
+    if (!fetchResult.ok) {
+      console.warn(
+        `[Worker] Could not refresh ${requestedRef}; continuing with local refs (${fetchResult.stderr || fetchResult.stdout})`,
+      );
+    }
+    candidates.add(branch);
+  } else if (requestedRef !== "HEAD") {
+    candidates.add(`origin/${requestedRef}`);
+  }
+
+  for (const ref of candidates) {
+    const parsed = await git(repo, ["rev-parse", "--verify", "--quiet", ref]);
+    if (parsed.ok) return ref;
+  }
+
+  return "HEAD";
+}
+
+async function createIsolatedWorktree(repo: string, jobId: string, baseRef: string): Promise<string> {
   const worktreeRoot = resolve(repo, ".worktrees");
   mkdirSync(worktreeRoot, { recursive: true });
 
@@ -145,7 +181,7 @@ async function createIsolatedWorktree(repo: string, jobId: string): Promise<stri
     `host-job-${jobId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
   );
 
-  const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, "HEAD"]);
+  const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
   if (!addResult.ok) {
     throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
   }
@@ -273,7 +309,11 @@ async function workerLoop(
 
           try {
             if (!dockerExecutor) {
-              directWorktreePath = await createIsolatedWorktree(opts.repo, job.id);
+              directWorktreePath = await createIsolatedWorktree(
+                opts.repo,
+                job.id,
+                opts.worktreeBaseRef,
+              );
               executionRepo = directWorktreePath;
             }
 
@@ -423,6 +463,8 @@ async function main(): Promise<void> {
   console.log(`[Worker] PushPals Worker Daemon (${opts.workerId})`);
   console.log(`[Worker] Server: ${opts.server}`);
   console.log(`[Worker] Repo: ${opts.repo}`);
+  opts.worktreeBaseRef = await resolveWorktreeBaseRef(opts.repo, opts.worktreeBaseRef);
+  console.log(`[Worker] Worktree base ref: ${opts.worktreeBaseRef}`);
 
   let dockerExecutor: DockerExecutor | null = null;
 
@@ -445,6 +487,7 @@ async function main(): Promise<void> {
         workerId: opts.workerId,
         gitToken: opts.gitToken ?? undefined,
         timeoutMs: opts.dockerTimeout,
+        baseRef: opts.worktreeBaseRef,
       });
 
       await dockerExecutor.cleanupOrphanedWorktrees();
