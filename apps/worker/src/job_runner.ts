@@ -140,14 +140,25 @@ async function main(): Promise<void> {
       kind: spec.kind,
     });
 
-    if (commitResult.ok && commitResult.sha && commitResult.sha !== "no-changes") {
+    if (commitResult.ok && commitResult.sha && commitResult.branch) {
       jobResult.commit = {
         branch: commitResult.branch!,
         sha: commitResult.sha,
       };
-      log("stdout", `[JobRunner] Created commit ${commitResult.sha} on ${commitResult.branch}`);
-    } else if (commitResult.error) {
-      log("stderr", `[JobRunner] Failed to create commit: ${commitResult.error}`);
+      if (commitResult.sha === "no-changes") {
+        log("stdout", `[JobRunner] No changes to commit for ${spec.jobId}`);
+      } else {
+        log("stdout", `[JobRunner] Created commit ${commitResult.sha} on ${commitResult.branch}`);
+      }
+    } else {
+      const commitError =
+        commitResult.error ??
+        `Commit metadata missing for ${spec.kind} (${spec.jobId}) while running in Docker mode`;
+      jobResult.ok = false;
+      jobResult.summary = `Failed to create commit for ${spec.kind}`;
+      jobResult.stderr = [jobResult.stderr, commitError].filter(Boolean).join("\n");
+      jobResult.exitCode = jobResult.exitCode && jobResult.exitCode !== 0 ? jobResult.exitCode : 1;
+      log("stderr", `[JobRunner] Failed to create commit: ${commitError}`);
     }
   }
 
@@ -157,7 +168,7 @@ async function main(): Promise<void> {
   console.log(`___RESULT___ ${resultJson}`);
 
   // Exit with appropriate code
-  process.exit(result.exitCode ?? (result.ok ? 0 : 1));
+  process.exit(jobResult.exitCode ?? (jobResult.ok ? 0 : 1));
 }
 
 main().catch((err) => {

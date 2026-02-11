@@ -286,7 +286,7 @@ async function tick(): Promise<void> {
         console.log(`[${ts()}]   ✓ Check passed: ${check.name}`);
       }
 
-      // 5. Merge to main (NO push - user does manually)
+      // 5. Merge to main
       console.log(`[${ts()}] Merging ${tempBranch} to ${config.mainBranch}...`);
       await gitOps.checkoutMain();
       const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
@@ -296,7 +296,16 @@ async function tick(): Promise<void> {
       }
 
       console.log(`[${ts()}] ✓ Successfully merged ${completion.branch} to ${config.mainBranch}`);
-      console.log(`[${ts()}] NOTE: Changes merged locally. Run 'git push' to push to remote.`);
+      if (config.pushMainAfterMerge) {
+        console.log(`[${ts()}] Pushing ${config.mainBranch} to ${config.remote}...`);
+        const pushResult = await gitOps.pushMain();
+        if (!pushResult.ok) {
+          throw new Error(`Push failed: ${pushResult.stderr || pushResult.stdout}`);
+        }
+        console.log(`[${ts()}] Push succeeded for ${config.mainBranch}`);
+      } else {
+        console.log(`[${ts()}] pushMainAfterMerge=false - skipping push`);
+      }
 
       // 6. Clean up temp branch
       await gitOps.deleteTempBranch(tempBranch);

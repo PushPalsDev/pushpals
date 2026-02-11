@@ -220,6 +220,10 @@ export async function createJobCommit(
   workerId: string,
   job: { id: string; taskId: string; kind: string },
 ): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
+  const truthy = new Set(["1", "true", "yes", "on"]);
+  const requirePush = truthy.has((process.env.WORKER_REQUIRE_PUSH ?? "").toLowerCase());
+  const pushAgentBranch =
+    requirePush || truthy.has((process.env.WORKER_PUSH_AGENT_BRANCH ?? "").toLowerCase());
   const branchName = `agent/${workerId}/${job.id}`;
   const commitMsg = `${job.kind}: ${job.taskId}\n\nJob: ${job.id}\nWorker: ${workerId}`;
 
@@ -269,10 +273,23 @@ export async function createJobCommit(
     }
     const sha = result.stdout;
 
-    // Push branch to origin
-    result = await git(repo, ["push", "origin", branchName]);
-    if (!result.ok) {
-      return { ok: false, error: `Failed to push branch: ${result.stderr}` };
+    // Push branch to origin (optional; disabled by default for shared-.git workflows)
+    if (pushAgentBranch) {
+      result = await git(repo, ["push", "origin", branchName]);
+      if (!result.ok) {
+        const pushError = `Failed to push branch: ${result.stderr || result.stdout}`;
+        if (requirePush) {
+          return { ok: false, error: pushError };
+        }
+        console.warn(
+          `[Worker] ${pushError}. Continuing with local branch only (set WORKER_REQUIRE_PUSH=1 to enforce push).`,
+        );
+        return { ok: true, branch: branchName, sha };
+      }
+    } else {
+      console.log(
+        `[Worker] Skipping push for ${branchName} (WORKER_PUSH_AGENT_BRANCH is disabled).`,
+      );
     }
 
     console.log(`[Worker] Created commit ${sha} on branch ${branchName}`);

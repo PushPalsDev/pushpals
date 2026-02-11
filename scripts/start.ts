@@ -16,6 +16,11 @@ const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
 const workerImage = process.env.WORKER_DOCKER_IMAGE ?? DEFAULT_IMAGE;
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
+const TRUTHY = new Set(["1", "true", "yes", "on"]);
+
+function envTruthy(name: string): boolean {
+  return TRUTHY.has((process.env[name] ?? "").toLowerCase());
+}
 
 async function runQuiet(cmd: string[]): Promise<number> {
   const proc = Bun.spawn(cmd, {
@@ -33,6 +38,40 @@ async function runInherited(cmd: string[], cwd?: string): Promise<number> {
     stderr: "inherit",
   });
   return proc.exited;
+}
+
+async function ensureGitHubAuth(): Promise<void> {
+  const skipCheck = envTruthy("PUSHPALS_SKIP_GH_AUTH_CHECK");
+  const serialPusherPushDisabled = envTruthy("SERIAL_PUSHER_NO_PUSH");
+  if (skipCheck || serialPusherPushDisabled) {
+    return;
+  }
+
+  const ghAvailable = (await runQuiet(["gh", "--version"])) === 0;
+  if (!ghAvailable) {
+    console.error("[start] GitHub CLI (`gh`) is required before startup.");
+    console.error("[start] Serial pusher is configured to push to GitHub.");
+    console.error(
+      "[start] Install `gh` and authenticate (`gh auth login`), or set SERIAL_PUSHER_NO_PUSH=1 / PUSHPALS_SKIP_GH_AUTH_CHECK=1.",
+    );
+    process.exit(1);
+  }
+
+  const ghAuthed = (await runQuiet(["gh", "auth", "status"])) === 0;
+  if (ghAuthed) return;
+
+  console.log("[start] GitHub CLI is not authenticated. Starting `gh auth login`...");
+  const loginExitCode = await runInherited(["gh", "auth", "login"]);
+  if (loginExitCode !== 0) {
+    console.error("[start] `gh auth login` failed.");
+    process.exit(loginExitCode);
+  }
+
+  const ghAuthedAfterLogin = (await runQuiet(["gh", "auth", "status"])) === 0;
+  if (!ghAuthedAfterLogin) {
+    console.error("[start] GitHub CLI is still not authenticated after login.");
+    process.exit(1);
+  }
 }
 
 async function ensureDockerImage(): Promise<void> {
@@ -59,6 +98,7 @@ async function ensureDockerImage(): Promise<void> {
   }
 }
 
+await ensureGitHubAuth();
 await ensureDockerImage();
 
 const proc = Bun.spawn(["bun", "run", "dev:full"], {

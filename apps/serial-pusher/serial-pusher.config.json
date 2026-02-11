@@ -1,7 +1,7 @@
 {
   "repoPath": ".",
   "remote": "origin",
-  "mainBranch": "main",
+  "mainBranch": "main_agents",
   "branchPrefix": "agent/",
   "pollIntervalSeconds": 10,
   "checks": [],

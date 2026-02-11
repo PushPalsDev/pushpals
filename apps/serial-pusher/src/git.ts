@@ -75,6 +75,21 @@ export class GitOps {
     this.branchPrefix = config.branchPrefix;
   }
 
+  private async resolveAgentMergeRef(agentBranch: string): Promise<string> {
+    const localRef = `refs/heads/${agentBranch}`;
+    const remoteRef = `refs/remotes/${this.remote}/${agentBranch}`;
+
+    const localExists = await this.revParse(localRef);
+    if (localExists) return agentBranch;
+
+    const remoteExists = await this.revParse(remoteRef);
+    if (remoteExists) return `${this.remote}/${agentBranch}`;
+
+    throw new Error(
+      `Branch not found locally or on ${this.remote}: ${agentBranch} (checked ${localRef} and ${remoteRef})`,
+    );
+  }
+
   // ── Fetch ─────────────────────────────────────────────────────────────
 
   /**
@@ -168,16 +183,16 @@ export class GitOps {
    * Returns the result for conflict detection.
    */
   async mergeNoFF(agentBranch: string, message: string): Promise<GitResult> {
-    const remoteBranch = `${this.remote}/${agentBranch}`;
-    return git(this.repoPath, ["merge", remoteBranch, "--no-ff", "-m", message]);
+    const mergeRef = await this.resolveAgentMergeRef(agentBranch);
+    return git(this.repoPath, ["merge", mergeRef, "--no-ff", "-m", message]);
   }
 
   /**
    * Merge a remote agent branch with fast-forward only.
    */
   async mergeFFOnly(agentBranch: string): Promise<GitResult> {
-    const remoteBranch = `${this.remote}/${agentBranch}`;
-    return git(this.repoPath, ["merge", remoteBranch, "--ff-only"]);
+    const mergeRef = await this.resolveAgentMergeRef(agentBranch);
+    return git(this.repoPath, ["merge", mergeRef, "--ff-only"]);
   }
 
   /**

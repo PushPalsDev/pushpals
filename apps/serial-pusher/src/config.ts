@@ -41,9 +41,13 @@ export interface SerialPusherConfig {
   maxAttempts: number;
   /** Merge strategy: "no-ff" for merge commits, "ff-only" for linear. Default: "no-ff". */
   mergeStrategy: "no-ff" | "ff-only";
+  /** Push main branch to remote after successful merge/checks. Default: true. */
+  pushMainAfterMerge: boolean;
   /** Authentication token for server API calls. */
   authToken?: string;
 }
+
+const TRUTHY = new Set(["1", "true", "yes", "on"]);
 
 const DEFAULTS: SerialPusherConfig = {
   repoPath: process.cwd(),
@@ -60,6 +64,7 @@ const DEFAULTS: SerialPusherConfig = {
   deleteAfterMerge: false,
   maxAttempts: 3,
   mergeStrategy: "no-ff",
+  pushMainAfterMerge: !TRUTHY.has((process.env.SERIAL_PUSHER_NO_PUSH ?? "").toLowerCase()),
   authToken: process.env.PUSHPALS_AUTH_TOKEN,
 };
 

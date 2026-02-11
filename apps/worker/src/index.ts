@@ -52,7 +52,8 @@ function parseArgs(): {
   let docker = false;
   let requireDocker = truthy.has((process.env.WORKER_REQUIRE_DOCKER ?? "").toLowerCase());
   let dockerImage = process.env.WORKER_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
-  let gitToken = process.env.PUSHPALS_GIT_TOKEN ?? null;
+  let gitToken =
+    process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
   let dockerTimeout = parseInt(process.env.WORKER_DOCKER_TIMEOUT_MS ?? "60000", 10);
 
   for (let i = 0; i < args.length; i++) {
@@ -300,7 +301,11 @@ async function workerLoop(
             let completionCommit: CommitRef | null = null;
             if (result.ok && shouldCommit(job.kind)) {
               if (result.commit) {
-                completionCommit = result.commit;
+                if (result.commit.sha !== "no-changes") {
+                  completionCommit = result.commit;
+                } else {
+                  console.log(`[Worker] Job ${job.id} produced no file changes to commit.`);
+                }
               } else if (dockerExecutor) {
                 result = {
                   ok: false,
