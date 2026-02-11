@@ -168,6 +168,37 @@ async function ensureIntegrationBranch(): Promise<void> {
     `refs/remotes/${INTEGRATION_REMOTE_REF}`,
   ]);
   if (remoteExists.ok) {
+    const localExists = await git([
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `refs/heads/${INTEGRATION_BRANCH}`,
+    ]);
+    if (!localExists.ok) {
+      const createLocal = await git(["branch", "-f", INTEGRATION_BRANCH, INTEGRATION_REMOTE_REF]);
+      if (!createLocal.ok) {
+        console.error(
+          `[start] Failed to create local ${INTEGRATION_BRANCH} from ${INTEGRATION_REMOTE_REF}.`,
+        );
+        console.error(createLocal.stderr || createLocal.stdout);
+        process.exit(createLocal.exitCode || 1);
+      }
+    }
+
+    const setUpstream = await git([
+      "branch",
+      "--set-upstream-to",
+      INTEGRATION_BASE_REMOTE_REF,
+      INTEGRATION_BRANCH,
+    ]);
+    if (!setUpstream.ok) {
+      console.error(
+        `[start] Failed to set upstream for ${INTEGRATION_BRANCH} to ${INTEGRATION_BASE_REMOTE_REF}.`,
+      );
+      console.error(setUpstream.stderr || setUpstream.stdout);
+      process.exit(setUpstream.exitCode || 1);
+    }
+
     process.env.WORKER_BASE_REF = process.env.WORKER_BASE_REF ?? INTEGRATION_REMOTE_REF;
     return;
   }
