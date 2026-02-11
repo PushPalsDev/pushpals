@@ -59,11 +59,17 @@ function parseArgs(): {
 function isLikelyChitChat(text: string): boolean {
   const t = text.trim().toLowerCase();
   if (!t) return true;
-  const short = t.length <= 40;
-  return short && /^(hi|hello|hey|thanks|thank you|ok|okay|cool|nice|yo)[!. ]*$/.test(t);
+  const short = t.length <= 64;
+  return (
+    short &&
+    /^(hi|hello|hey|hi there|hello there|thanks|thank you|ok|okay|cool|nice|yo|sup|what's up|whats up)[!. ]*$/.test(
+      t,
+    )
+  );
 }
 
 function extractTargetPath(text: string): string | null {
+  const stopWords = new Set(["a", "an", "the", "it", "this", "that", "there", "here", "file"]);
   const patterns = [
     /file\s+(?:called|named)\s+["'`]?([^"'`\s]+)["'`]?/i,
     /create\s+(?:a\s+)?file\s+["'`]?([^"'`\s]+)["'`]?/i,
@@ -74,11 +80,26 @@ function extractTargetPath(text: string): string | null {
     if (!match) continue;
     const value = (match[1] ?? "").trim().replace(/[.,!?;:]+$/, "");
     if (!value) continue;
-    if (value.includes("/") || value.includes("\\") || value.includes(".")) {
-      return value;
-    }
+    if (!/^[A-Za-z0-9._/\-\\]+$/.test(value)) continue;
+    if (stopWords.has(value.toLowerCase())) continue;
+    return value;
   }
   return null;
+}
+
+function isExecutionIntent(text: string, targetPath: string | null): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t || isLikelyChitChat(t)) return false;
+  if (targetPath) return true;
+  const actionVerb =
+    /\b(create|write|add|append|edit|update|modify|delete|remove|rename|implement|fix|refactor|generate)\b/.test(
+      t,
+    );
+  const artifactHint =
+    /\b(file|folder|directory|readme|markdown|md|txt|json|yaml|yml|toml|ts|tsx|js|jsx|py|go|rs|sql|config|test|component|screen|endpoint|api)\b/.test(
+      t,
+    );
+  return actionVerb && artifactHint;
 }
 
 function toSingleLine(value: unknown, max = 220): string {
@@ -491,17 +512,18 @@ class RemoteOrchestrator {
       turnId,
     });
 
-    const actionable = !isLikelyChitChat(request.originalPrompt ?? "");
+    const originalPrompt = String(request.originalPrompt ?? "").trim();
+    const promptForIntent = originalPrompt || enhancedPrompt || "";
+    const targetPath = extractTargetPath(originalPrompt) ?? extractTargetPath(enhancedPrompt ?? "");
+    const actionable = isExecutionIntent(promptForIntent, targetPath) && Boolean(targetPath);
     let tasksCreated = 0;
     if (actionable) {
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
-      const targetPath =
-        extractTargetPath(request.originalPrompt ?? "") ?? extractTargetPath(enhancedPrompt ?? "");
       const params: Record<string, unknown> = {
         requestId,
         sessionId: this.sessionId,
-        instruction: request.originalPrompt,
+        instruction: originalPrompt,
         enhancedPrompt,
         targetWorkerId,
         targetPath,
@@ -514,7 +536,7 @@ class RemoteOrchestrator {
         type: "task_created",
         payload: {
           taskId,
-          title: `Execute request: ${toSingleLine(request.originalPrompt, 64) || "user request"}`,
+          title: `Execute request: ${toSingleLine(originalPrompt, 64) || "user request"}`,
           description: "Worker-owned execution plan from shared context",
           createdBy: `agent:${this.agentId}`,
         },
