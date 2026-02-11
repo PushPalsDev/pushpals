@@ -23,21 +23,29 @@ function envTruthy(name: string): boolean {
 }
 
 async function runQuiet(cmd: string[]): Promise<number> {
-  const proc = Bun.spawn(cmd, {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  return proc.exited;
+  try {
+    const proc = Bun.spawn(cmd, {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return proc.exited;
+  } catch {
+    return 127;
+  }
 }
 
 async function runInherited(cmd: string[], cwd?: string): Promise<number> {
-  const proc = Bun.spawn(cmd, {
-    cwd,
-    stdin: "inherit",
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-  return proc.exited;
+  try {
+    const proc = Bun.spawn(cmd, {
+      cwd,
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    return proc.exited;
+  } catch {
+    return 127;
+  }
 }
 
 async function ensureGitHubAuth(): Promise<void> {
@@ -47,31 +55,40 @@ async function ensureGitHubAuth(): Promise<void> {
     return;
   }
 
+  const gitToken =
+    process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
+  if (gitToken) {
+    // Token auth is enough for serial-pusher git push; no `gh` required.
+    process.env.PUSHPALS_GIT_TOKEN = gitToken;
+    return;
+  }
+
   const ghAvailable = (await runQuiet(["gh", "--version"])) === 0;
-  if (!ghAvailable) {
-    console.error("[start] GitHub CLI (`gh`) is required before startup.");
-    console.error("[start] Serial pusher is configured to push to GitHub.");
-    console.error(
-      "[start] Install `gh` and authenticate (`gh auth login`), or set SERIAL_PUSHER_NO_PUSH=1 / PUSHPALS_SKIP_GH_AUTH_CHECK=1.",
-    );
-    process.exit(1);
+  if (ghAvailable) {
+    const ghAuthed = (await runQuiet(["gh", "auth", "status"])) === 0;
+    if (ghAuthed) return;
+
+    console.log("[start] GitHub CLI is not authenticated. Starting `gh auth login`...");
+    const loginExitCode = await runInherited(["gh", "auth", "login"]);
+    if (loginExitCode !== 0) {
+      console.error("[start] `gh auth login` failed.");
+      process.exit(loginExitCode);
+    }
+
+    const ghAuthedAfterLogin = (await runQuiet(["gh", "auth", "status"])) === 0;
+    if (!ghAuthedAfterLogin) {
+      console.error("[start] GitHub CLI is still not authenticated after login.");
+      process.exit(1);
+    }
+    return;
   }
 
-  const ghAuthed = (await runQuiet(["gh", "auth", "status"])) === 0;
-  if (ghAuthed) return;
-
-  console.log("[start] GitHub CLI is not authenticated. Starting `gh auth login`...");
-  const loginExitCode = await runInherited(["gh", "auth", "login"]);
-  if (loginExitCode !== 0) {
-    console.error("[start] `gh auth login` failed.");
-    process.exit(loginExitCode);
-  }
-
-  const ghAuthedAfterLogin = (await runQuiet(["gh", "auth", "status"])) === 0;
-  if (!ghAuthedAfterLogin) {
-    console.error("[start] GitHub CLI is still not authenticated after login.");
-    process.exit(1);
-  }
+  console.error("[start] Serial pusher push is enabled but no GitHub auth is configured.");
+  console.error("[start] Provide one of: PUSHPALS_GIT_TOKEN, GITHUB_TOKEN, GH_TOKEN.");
+  console.error(
+    "[start] Or install GitHub CLI (`gh`) for interactive login, or disable push via SERIAL_PUSHER_NO_PUSH=1.",
+  );
+  process.exit(1);
 }
 
 async function ensureDockerImage(): Promise<void> {

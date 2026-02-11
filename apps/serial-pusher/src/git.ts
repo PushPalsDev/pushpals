@@ -23,9 +23,22 @@ export interface DiscoveredBranch {
 async function git(
   repoPath: string,
   args: string[],
-  opts?: { timeout?: number },
+  opts?: { timeout?: number; githubToken?: string },
 ): Promise<GitResult> {
-  const proc = Bun.spawn(["git", ...args], {
+  const gitArgs =
+    opts?.githubToken && opts.githubToken.length > 0
+      ? [
+          "git",
+          "-c",
+          `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(
+            `x-access-token:${opts.githubToken}`,
+            "utf-8",
+          ).toString("base64")}`,
+          ...args,
+        ]
+      : ["git", ...args];
+
+  const proc = Bun.spawn(gitArgs, {
     cwd: repoPath,
     stdout: "pipe",
     stderr: "pipe",
@@ -67,12 +80,15 @@ export class GitOps {
   private remote: string;
   private mainBranch: string;
   private branchPrefix: string;
+  private githubToken: string | null;
 
   constructor(config: SerialPusherConfig) {
     this.repoPath = config.repoPath;
     this.remote = config.remote;
     this.mainBranch = config.mainBranch;
     this.branchPrefix = config.branchPrefix;
+    this.githubToken =
+      process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
   }
 
   private async resolveAgentMergeRef(agentBranch: string): Promise<string> {
@@ -96,7 +112,11 @@ export class GitOps {
    * Fetch all refs from the remote, pruning deleted branches.
    */
   async fetchPrune(): Promise<void> {
-    const result = await git(this.repoPath, ["fetch", this.remote, "--prune", "--quiet"]);
+    const result = await git(
+      this.repoPath,
+      ["fetch", this.remote, "--prune", "--quiet"],
+      this.githubToken ? { githubToken: this.githubToken } : undefined,
+    );
     assertOk(result, "fetch --prune");
   }
 
@@ -151,13 +171,11 @@ export class GitOps {
    * Pull main with fast-forward only. Fails if main has diverged.
    */
   async pullMainFF(): Promise<void> {
-    const result = await git(this.repoPath, [
-      "pull",
-      this.remote,
-      this.mainBranch,
-      "--ff-only",
-      "--quiet",
-    ]);
+    const result = await git(
+      this.repoPath,
+      ["pull", this.remote, this.mainBranch, "--ff-only", "--quiet"],
+      this.githubToken ? { githubToken: this.githubToken } : undefined,
+    );
     assertOk(result, "pull --ff-only main");
   }
 
@@ -209,7 +227,11 @@ export class GitOps {
    * Push main to the remote. Uses --atomic for safety.
    */
   async pushMain(): Promise<GitResult> {
-    return git(this.repoPath, ["push", this.remote, this.mainBranch, "--atomic"]);
+    return git(
+      this.repoPath,
+      ["push", this.remote, this.mainBranch, "--atomic"],
+      this.githubToken ? { githubToken: this.githubToken } : undefined,
+    );
   }
 
   // ── Cleanup ───────────────────────────────────────────────────────────
@@ -225,7 +247,11 @@ export class GitOps {
    * Delete a remote branch after successful merge.
    */
   async deleteRemoteBranch(branch: string): Promise<void> {
-    await git(this.repoPath, ["push", this.remote, "--delete", branch]);
+    await git(
+      this.repoPath,
+      ["push", this.remote, "--delete", branch],
+      this.githubToken ? { githubToken: this.githubToken } : undefined,
+    );
   }
 
   /**
