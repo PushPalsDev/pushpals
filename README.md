@@ -116,7 +116,7 @@ LLM defaults:
   - `PUSHPALS_VLLM_DOCKER_IMAGE` (default `vllm/vllm-openai:latest`)
   - `PUSHPALS_VLLM_DOCKER_CONTAINER_NAME` (optional)
   - `PUSHPALS_VLLM_DOCKER_CONTAINER_PORT` (default `8000`)
-- Readiness timeout for auto-started vLLM: `PUSHPALS_VLLM_READY_TIMEOUT_MS` (default `180000`)
+- Readiness timeout for auto-started vLLM: `PUSHPALS_VLLM_READY_TIMEOUT_MS` (default `600000`)
 
 ## Repo Layout
 

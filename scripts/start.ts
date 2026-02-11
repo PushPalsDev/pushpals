@@ -22,7 +22,7 @@ const DEFAULT_PLANNER_ENDPOINT = "http://localhost:18123/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "zai-org/GLM-4.7-Flash";
 const DEFAULT_VLLM_DOCKER_IMAGE = "vllm/vllm-openai:latest";
 const DEFAULT_VLLM_DOCKER_CONTAINER_PORT = 8000;
-const DEFAULT_VLLM_READY_TIMEOUT_MS = 180_000;
+const DEFAULT_VLLM_READY_TIMEOUT_MS = 600_000;
 const DEFAULT_INTEGRATION_BRANCH = "main_agents";
 const INTEGRATION_BRANCH =
   (process.env.PUSHPALS_INTEGRATION_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BRANCH;
@@ -322,7 +322,79 @@ async function dockerContainerExists(name: string): Promise<boolean> {
   return result.ok && result.stdout.length > 0;
 }
 
-function streamVllmOutput(stream: ReadableStream<Uint8Array>, prefix: string): void {
+async function ensureVllmDockerImage(image: string): Promise<void> {
+  const imageExists = (await runQuiet(["docker", "image", "inspect", image])) === 0;
+  if (imageExists) return;
+
+  console.log(`[start] vLLM image not found locally: ${image}`);
+  console.log("[start] Pulling vLLM image (first run may take a few minutes)...");
+
+  const proc = Bun.spawn(["docker", "pull", image], {
+    cwd: repoRoot,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const recent: string[] = [];
+  const captureRecent = (line: string) => {
+    if (!line.trim()) return;
+    recent.push(line.trim());
+    if (recent.length > 30) {
+      recent.splice(0, recent.length - 30);
+    }
+  };
+
+  const consume = async (stream: ReadableStream<Uint8Array>) => {
+    const decoder = new TextDecoder();
+    const reader = stream.getReader();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const raw of lines) captureRecent(raw.replace(/\r$/, ""));
+    }
+    if (buffer.trim()) captureRecent(buffer.replace(/\r$/, ""));
+  };
+
+  const startedAt = Date.now();
+  let ticker: ReturnType<typeof setInterval> | null = null;
+  ticker = setInterval(() => {
+    const elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r[start] Pulling vLLM image... ${elapsedSec}s elapsed`);
+    } else {
+      console.log(`[start] Pulling vLLM image... ${elapsedSec}s elapsed`);
+    }
+  }, 5000);
+
+  const exitCode = await Promise.all([consume(proc.stdout), consume(proc.stderr), proc.exited]).then(
+    ([, , code]) => code,
+  );
+
+  if (ticker) {
+    clearInterval(ticker);
+    if (process.stdout.isTTY) {
+      process.stdout.write("\r");
+    }
+  }
+
+  if (exitCode !== 0) {
+    const detail = recent.length > 0 ? recent.slice(-8).join("\n") : "no docker pull output captured";
+    throw new Error(`docker pull failed for ${image} (exit ${exitCode})\n${detail}`);
+  }
+
+  console.log("[start] vLLM image pull complete.");
+}
+
+function streamVllmOutput(
+  stream: ReadableStream<Uint8Array>,
+  prefix: string,
+  emitToConsole = true,
+): void {
   const decoder = new TextDecoder();
   const reader = stream.getReader();
   void (async () => {
@@ -337,13 +409,17 @@ function streamVllmOutput(stream: ReadableStream<Uint8Array>, prefix: string): v
         const clean = line.replace(/\r$/, "");
         if (!clean.trim()) continue;
         appendVllmLogTail(clean);
-        console.log(`${prefix}${clean}`);
+        if (emitToConsole) {
+          console.log(`${prefix}${clean}`);
+        }
       }
     }
     const tail = buffer.trim();
     if (tail) {
       appendVllmLogTail(tail);
-      console.log(`${prefix}${tail}`);
+      if (emitToConsole) {
+        console.log(`${prefix}${tail}`);
+      }
     }
   })();
 }
@@ -520,6 +596,8 @@ async function startManagedVllmDocker(primaryEndpoint: string): Promise<void> {
   }
 
   const launch = vllmDockerStartArgs(primaryEndpoint);
+  await ensureVllmDockerImage(launch.image);
+
   const alreadyRunning = await dockerContainerRunning(launch.containerName);
   if (alreadyRunning) {
     managedVllmRuntime = "docker";
@@ -551,8 +629,9 @@ async function startManagedVllmDocker(primaryEndpoint: string): Promise<void> {
   managedVllmDockerContainerName = launch.containerName;
   managedVllmDockerOwned = true;
 
-  streamVllmOutput(proc.stdout, "[vllm] ");
-  streamVllmOutput(proc.stderr, "[vllm] ");
+  // Keep logs buffered for failure diagnostics, but avoid noisy startup output.
+  streamVllmOutput(proc.stdout, "[vllm] ", false);
+  streamVllmOutput(proc.stderr, "[vllm] ", false);
 
   const early = await Promise.race([
     proc.exited.then((code) => ({ exited: true, code })),
@@ -629,10 +708,13 @@ async function ensureLlmPreflight(): Promise<void> {
   if (targets.length === 0) return;
 
   const primary = targets[0];
+  const autoStartEligible = shouldAutoStartVllm(primary.endpoint);
+  let autoStartAttempted = false;
   let primaryReachable = await checkTargetReachable(primary);
 
-  if (!primaryReachable.ok && shouldAutoStartVllm(primary.endpoint)) {
+  if (!primaryReachable.ok && autoStartEligible) {
     try {
+      autoStartAttempted = true;
       await startManagedVllm(primary.endpoint);
       const readyTimeoutMs = vllmReadyTimeoutMs();
       console.log(`[start] Waiting for local vLLM to become reachable (timeout ${readyTimeoutMs}ms)...`);
@@ -667,9 +749,13 @@ async function ensureLlmPreflight(): Promise<void> {
       "[start] Start your model server or set PUSHPALS_SKIP_LLM_PREFLIGHT=1 to bypass this check.",
     );
     if (vllmModeConfigured()) {
-      console.error(
-        "[start] vLLM mode is configured. Auto-start can be enabled with PUSHPALS_AUTO_START_VLLM=1.",
-      );
+      if (autoStartAttempted && target === primary) {
+        console.error("[start] vLLM auto-start was attempted but endpoint stayed unreachable.");
+      } else if (!autoStartEligible && target === primary) {
+        console.error(
+          "[start] vLLM mode is configured. Auto-start is disabled; set PUSHPALS_AUTO_START_VLLM=1 to enable it.",
+        );
+      }
     }
     process.exit(1);
   }
