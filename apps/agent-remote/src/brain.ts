@@ -39,6 +39,49 @@ const ALLOWED_JOB_KINDS = new Set([
   "web.fetch",
   "web.search",
 ]);
+const FILE_MODIFYING_JOB_KINDS = new Set([
+  "file.write",
+  "file.patch",
+  "file.rename",
+  "file.delete",
+  "file.copy",
+  "file.append",
+  "file.mkdir",
+]);
+
+function hasFileWriteIntent(text: string): boolean {
+  const t = text.toLowerCase();
+  const explicitWrite =
+    /\b(create|write|add|generate|make|update|edit)\b/.test(t) &&
+    /\b(file|doc|document|readme)\b/.test(t);
+  const hasFileLikeToken = /\b[\w./-]+\.(md|txt|json|yaml|yml|ts|tsx|js|jsx|py|java|go|rs|c|cpp)\b/i.test(
+    text,
+  );
+  return explicitWrite || hasFileLikeToken;
+}
+
+function extractRequestedPath(text: string): string | null {
+  const patterns = [
+    /file\s+(?:called|named)\s+["'`]?([^"'`\s]+)["'`]?/i,
+    /create\s+(?:a\s+)?file\s+["'`]?([^"'`\s]+)["'`]?/i,
+    /write\s+(?:to|into)\s+["'`]?([^"'`\s]+)["'`]?/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const raw = match[1]?.trim();
+    if (!raw) continue;
+    const cleaned = raw.replace(/[.,!?;:]+$/, "");
+    if (cleaned.includes("/") || cleaned.includes("\\") || cleaned.includes(".")) {
+      return cleaned;
+    }
+  }
+  return null;
+}
+
+function hasMutatingJobs(tasks: ActionTask[]): boolean {
+  return tasks.some((task) => task.jobs.some((job) => FILE_MODIFYING_JOB_KINDS.has(job.kind)));
+}
 
 /** Best-effort normalization for LLM outputs that are close but not exact */
 function normalizeJobKind(raw: string): string | null {
@@ -183,6 +226,8 @@ Guidelines:
 - For actionable requests, create tasks with the appropriate job kinds.
 - You can do ANYTHING the user asks: modify files, run commands, search the web, install packages, etc.
 - For file modifications, prefer "file.write" (whole file) or "file.patch" (targeted edit) over "shell.exec".
+- For "create/write/update file" requests, ALWAYS include a mutating job ("file.write"/"file.patch"/etc.) in this response.
+- Do NOT return only reconnaissance jobs (like only "file.list") for a write request.
 - For complex or multi-step operations, use "shell.exec" with the full command.
 - For web lookups, use "web.search" for queries or "web.fetch" for specific URLs.
 - The kind field MUST be one of the exact strings listed above. Do NOT use category names like "Git" or "Files".
@@ -200,6 +245,35 @@ export class AgentBrain {
   constructor(llm: LLMClient, opts?: { actionsEnabled?: boolean }) {
     this.llm = llm;
     this.actionsEnabled = opts?.actionsEnabled ?? true;
+  }
+
+  private async generateFallbackFileContent(
+    userText: string,
+    targetPath: string,
+    context?: string[],
+  ): Promise<string> {
+    const contextBlock =
+      context && context.length > 0
+        ? `\nRecent context:\n${context.slice(-10).join("\n")}\n`
+        : "\n";
+    const result = await this.llm.generate({
+      system:
+        "You generate file contents only. Return plain file content with no markdown fences and no explanation.",
+      messages: [
+        {
+          role: "user",
+          content:
+            `Create the complete content for file "${targetPath}" based on this user request.\n` +
+            `User request: ${userText}\n` +
+            `${contextBlock}` +
+            "Output only the final file text.",
+        },
+      ],
+      json: false,
+      maxTokens: 2500,
+      temperature: 0.3,
+    });
+    return result.text.trim();
   }
 
   async think(userText: string, context?: string[]): Promise<BrainOutput> {
@@ -274,6 +348,37 @@ export class AgentBrain {
         if (validated.length > 0) {
           output.tasks = validated;
         }
+      }
+
+      const requestedPath = extractRequestedPath(userText);
+      const wantsFileWrite = hasFileWriteIntent(userText);
+      const hasMutatingTask = output.tasks ? hasMutatingJobs(output.tasks) : false;
+
+      // Safety net: this orchestrator is currently single-pass, so pure discovery jobs
+      // (e.g. only file.list) can dead-end. Ensure write intents emit a file.write job.
+      if (this.actionsEnabled && requestedPath && wantsFileWrite && !hasMutatingTask) {
+        let fallbackContent = "";
+        try {
+          fallbackContent = await this.generateFallbackFileContent(userText, requestedPath, context);
+        } catch (err) {
+          console.warn("[Brain] Fallback file-content generation failed:", err);
+        }
+        if (!fallbackContent) {
+          fallbackContent = output.assistantMessage;
+        }
+
+        const fallbackTask: ActionTask = {
+          taskId: `t-write-${Date.now().toString(36).slice(-6)}`,
+          title: `Write ${requestedPath}`,
+          description: `Create/update ${requestedPath} from user request`,
+          jobs: [{ kind: "file.write", params: { path: requestedPath, content: fallbackContent } }],
+        };
+
+        const existing = output.tasks ?? [];
+        output.tasks =
+          existing.length < MAX_TASKS
+            ? [...existing, fallbackTask]
+            : [...existing.slice(0, MAX_TASKS - 1), fallbackTask];
       }
 
       if (result.usage) {
