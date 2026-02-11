@@ -20,6 +20,9 @@ const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
 const DEFAULT_LLM_ENDPOINT = "http://localhost:18123";
 const DEFAULT_PLANNER_ENDPOINT = "http://localhost:18123/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "zai-org/GLM-4.7-Flash";
+const DEFAULT_VLLM_DOCKER_IMAGE = "vllm/vllm-openai:latest";
+const DEFAULT_VLLM_DOCKER_CONTAINER_PORT = 8000;
+const DEFAULT_VLLM_READY_TIMEOUT_MS = 180_000;
 const DEFAULT_INTEGRATION_BRANCH = "main_agents";
 const INTEGRATION_BRANCH =
   (process.env.PUSHPALS_INTEGRATION_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BRANCH;
@@ -39,9 +42,20 @@ const DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE = resolve(
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const managedVllmLogTail: string[] = [];
 let managedVllmProc: ReturnType<typeof Bun.spawn> | null = null;
+let managedVllmRuntime: "python" | "docker" | null = null;
+let managedVllmDockerContainerName: string | null = null;
+let managedVllmDockerOwned = false;
 
 function envTruthy(name: string): boolean {
   return TRUTHY.has((process.env[name] ?? "").toLowerCase());
+}
+
+function parsePositiveInt(value: string | null | undefined): number | null {
+  const normalized = (value ?? "").trim();
+  if (!normalized) return null;
+  const parsed = Number.parseInt(normalized, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
 }
 
 function appendVllmLogTail(line: string): void {
@@ -67,6 +81,28 @@ function parseUrl(value: string): URL | null {
   }
 }
 
+function pythonAliasOrder(): string[] {
+  // Windows commonly has `python`; Linux often has only `python3`.
+  return process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+}
+
+function detectedPythonAliases(): string[] {
+  const detected: string[] = [];
+  for (const alias of pythonAliasOrder()) {
+    try {
+      if (Bun.which(alias)) detected.push(alias);
+    } catch {
+      // ignore and fallback below
+    }
+  }
+  return detected;
+}
+
+function preferredPythonAlias(): string {
+  const detected = detectedPythonAliases();
+  return detected[0] ?? pythonAliasOrder()[0] ?? "python3";
+}
+
 function isLoopbackHost(host: string): boolean {
   const normalized = host.trim().toLowerCase();
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
@@ -74,6 +110,21 @@ function isLoopbackHost(host: string): boolean {
 
 function normalizeVllmFlag(value: string | null | undefined): string {
   return (value ?? "").trim().toLowerCase();
+}
+
+function configuredVllmRuntime(): "auto" | "docker" | "python" {
+  const raw = normalizeVllmFlag(process.env.PUSHPALS_VLLM_RUNTIME);
+  if (raw === "docker" || raw === "python" || raw === "auto") {
+    return raw;
+  }
+  return "docker";
+}
+
+function preferredVllmRuntimeOrder(): Array<"docker" | "python"> {
+  const configured = configuredVllmRuntime();
+  if (configured === "docker") return ["docker"];
+  if (configured === "python") return ["python"];
+  return process.platform === "win32" ? ["docker", "python"] : ["python", "docker"];
 }
 
 function vllmModeConfigured(): boolean {
@@ -170,6 +221,107 @@ async function checkTargetReachable(
   return { ok: false, error: lastError };
 }
 
+type VllmLaunchConfig = {
+  host: string;
+  port: number;
+  model: string;
+};
+
+function resolveVllmLaunchConfig(endpoint: string): VllmLaunchConfig {
+  const parsed = parseUrl(endpoint);
+  const endpointHost = parsed?.hostname || "127.0.0.1";
+  const endpointPort = parsed?.port ? Number.parseInt(parsed.port, 10) : 18123;
+
+  const host = (process.env.PUSHPALS_VLLM_HOST ?? endpointHost).trim() || "127.0.0.1";
+  const port =
+    parsePositiveInt(process.env.PUSHPALS_VLLM_PORT) ??
+    (Number.isFinite(endpointPort) ? endpointPort : 18123);
+  const model =
+    (process.env.PUSHPALS_VLLM_MODEL ?? process.env.LLM_MODEL ?? DEFAULT_LLM_MODEL).trim() ||
+    DEFAULT_LLM_MODEL;
+
+  return { host, port, model };
+}
+
+function vllmReadyTimeoutMs(): number {
+  return parsePositiveInt(process.env.PUSHPALS_VLLM_READY_TIMEOUT_MS) ?? DEFAULT_VLLM_READY_TIMEOUT_MS;
+}
+
+function sanitizeContainerName(raw: string): string {
+  const normalized = raw.trim().replace(/[^a-zA-Z0-9_.-]/g, "-");
+  const compact = normalized.replace(/-+/g, "-").replace(/^[-._]+|[-._]+$/g, "");
+  return compact || "pushpals-vllm";
+}
+
+function defaultVllmContainerName(port: number): string {
+  return sanitizeContainerName(`pushpals-vllm-${port}`);
+}
+
+type VllmDockerLaunch = {
+  args: string[];
+  image: string;
+  containerName: string;
+  hostPort: number;
+  containerPort: number;
+  model: string;
+};
+
+function vllmDockerStartArgs(endpoint: string): VllmDockerLaunch {
+  const launch = resolveVllmLaunchConfig(endpoint);
+  const image =
+    (process.env.PUSHPALS_VLLM_DOCKER_IMAGE ?? DEFAULT_VLLM_DOCKER_IMAGE).trim() ||
+    DEFAULT_VLLM_DOCKER_IMAGE;
+  const containerPort =
+    parsePositiveInt(process.env.PUSHPALS_VLLM_DOCKER_CONTAINER_PORT) ??
+    DEFAULT_VLLM_DOCKER_CONTAINER_PORT;
+  const containerName = sanitizeContainerName(
+    process.env.PUSHPALS_VLLM_DOCKER_CONTAINER_NAME ?? defaultVllmContainerName(launch.port),
+  );
+
+  const args = [
+    "docker",
+    "run",
+    "--rm",
+    "--name",
+    containerName,
+    "-p",
+    `${launch.port}:${containerPort}`,
+  ];
+
+  const hfToken = (process.env.HUGGING_FACE_HUB_TOKEN ?? process.env.HF_TOKEN ?? "").trim();
+  if (hfToken) {
+    args.push("-e", `HUGGING_FACE_HUB_TOKEN=${hfToken}`, "-e", `HF_TOKEN=${hfToken}`);
+  }
+
+  args.push(
+    image,
+    "--host",
+    "0.0.0.0",
+    "--port",
+    String(containerPort),
+    "--model",
+    launch.model,
+  );
+
+  return { args, image, containerName, hostPort: launch.port, containerPort, model: launch.model };
+}
+
+async function dockerContainerRunning(name: string): Promise<boolean> {
+  const result = await runCapture(
+    ["docker", "ps", "--filter", `name=^/${name}$`, "--format", "{{.ID}}"],
+    repoRoot,
+  );
+  return result.ok && result.stdout.length > 0;
+}
+
+async function dockerContainerExists(name: string): Promise<boolean> {
+  const result = await runCapture(
+    ["docker", "ps", "-a", "--filter", `name=^/${name}$`, "--format", "{{.ID}}"],
+    repoRoot,
+  );
+  return result.ok && result.stdout.length > 0;
+}
+
 function streamVllmOutput(stream: ReadableStream<Uint8Array>, prefix: string): void {
   const decoder = new TextDecoder();
   const reader = stream.getReader();
@@ -206,20 +358,40 @@ function vllmModuleMissingFromLogs(): boolean {
   );
 }
 
+function vllmUvloopMissingFromLogs(): boolean {
+  const haystack = managedVllmLogTail.join("\n").toLowerCase();
+  return haystack.includes("modulenotfounderror") && haystack.includes("no module named 'uvloop'");
+}
+
+function dockerCommandMissingFromLogs(): boolean {
+  const haystack = managedVllmLogTail.join("\n").toLowerCase();
+  return haystack.includes("docker") && (haystack.includes("not found") || haystack.includes("enoent"));
+}
+
 function printVllmAutoStartHelp(primaryEndpoint: string): void {
   const endpoint = parseUrl(primaryEndpoint);
   const host = endpoint?.hostname ?? "localhost";
   const port = endpoint?.port || "18123";
+  const installPython = preferredPythonAlias();
+  const detectedAliases = detectedPythonAliases();
+  const runtimePreference = configuredVllmRuntime();
 
   if (vllmModuleMissingFromLogs()) {
     console.error("[start] vLLM Python package was not found.");
     console.error("[start] Next steps:");
     console.error(
-      `[start] 1) Install vLLM in a Python env: "python -m pip install vllm" (or use the interpreter that already has it).`,
+      `[start] 1) Install vLLM in a Python env: "${installPython} -m pip install vllm" (or use the interpreter that already has it).`,
     );
     console.error(
       "[start] 2) Point startup at that interpreter: set PUSHPALS_VLLM_PYTHON=<path-to-python>.",
     );
+    if (detectedAliases.length > 0) {
+      console.error(`[start]    Detected aliases on this machine: ${detectedAliases.join(", ")}`);
+    } else {
+      console.error(
+        "[start]    No python/python3 alias detected in PATH. Install Python or set PUSHPALS_VLLM_PYTHON explicitly.",
+      );
+    }
     console.error(
       `[start] 3) Retry "bun run start". Expected endpoint: http://${host}:${port}/v1/chat/completions`,
     );
@@ -229,56 +401,81 @@ function printVllmAutoStartHelp(primaryEndpoint: string): void {
     return;
   }
 
+  if (vllmUvloopMissingFromLogs()) {
+    console.error("[start] vLLM Python startup failed because `uvloop` is unavailable.");
+    console.error("[start] Native Windows Python cannot install uvloop.");
+    console.error("[start] Next steps:");
+    console.error("[start] 1) Use Docker runtime (recommended on Windows): set PUSHPALS_VLLM_RUNTIME=docker");
+    console.error(
+      "[start] 2) Ensure Docker Desktop is running and retry `bun run start` (startup will launch a Linux vLLM container).",
+    );
+    console.error(
+      "[start] 3) Or run from Linux/WSL with a compatible Python env and keep PUSHPALS_VLLM_RUNTIME=python.",
+    );
+    return;
+  }
+
+  if (dockerCommandMissingFromLogs()) {
+    console.error("[start] Docker runtime was selected for vLLM, but Docker CLI was not available.");
+    console.error("[start] Install/start Docker Desktop or switch to Python runtime:");
+    console.error("[start] - PUSHPALS_VLLM_RUNTIME=python");
+    console.error("[start] - PUSHPALS_AUTO_START_VLLM=0 (if running your own endpoint)");
+    return;
+  }
+
   console.error("[start] Could not auto-start vLLM.");
   console.error("[start] Verify:");
-  console.error("[start] - vLLM is installed in the Python interpreter being used");
-  console.error("[start] - your selected model is available and valid");
-  console.error("[start] - host/port are free and reachable");
+  if (runtimePreference === "docker" || (runtimePreference === "auto" && process.platform === "win32")) {
+    const dockerLaunch = vllmDockerStartArgs(primaryEndpoint);
+    console.error("[start] - Docker Desktop is running and the Docker daemon is reachable");
+    console.error(`[start] - image exists or can be pulled: ${dockerLaunch.image}`);
+    console.error(
+      `[start] - host port ${dockerLaunch.hostPort} is free and maps to container port ${dockerLaunch.containerPort}`,
+    );
+    console.error(`[start] - model name is valid: ${dockerLaunch.model}`);
+  } else {
+    console.error("[start] - vLLM is installed in the Python interpreter being used");
+    console.error("[start] - your selected model is available and valid");
+    console.error("[start] - host/port are free and reachable");
+  }
   console.error(
     "[start] Optional: set PUSHPALS_AUTO_START_VLLM=0 and point LLM_ENDPOINT/PLANNER_ENDPOINT to an already-running server.",
   );
 }
 
-function vllmStartArgs(endpoint: string): string[][] {
-  const parsed = parseUrl(endpoint);
-  const endpointHost = parsed?.hostname || "127.0.0.1";
-  const endpointPort = parsed?.port ? Number.parseInt(parsed.port, 10) : 18123;
-
-  const host = (process.env.PUSHPALS_VLLM_HOST ?? endpointHost).trim() || "127.0.0.1";
-  const portRaw = (process.env.PUSHPALS_VLLM_PORT ?? "").trim();
-  const port = Number.isFinite(Number.parseInt(portRaw, 10))
-    ? Number.parseInt(portRaw, 10)
-    : Number.isFinite(endpointPort)
-      ? endpointPort
-      : 18123;
-  const model =
-    (process.env.PUSHPALS_VLLM_MODEL ?? process.env.LLM_MODEL ?? DEFAULT_LLM_MODEL).trim() ||
-    DEFAULT_LLM_MODEL;
-
+function vllmPythonStartArgs(endpoint: string): string[][] {
+  const launch = resolveVllmLaunchConfig(endpoint);
   const override = (process.env.PUSHPALS_VLLM_PYTHON ?? "").trim();
-  const pythonCandidates = Array.from(new Set([override, "python", "python3"].filter(Boolean)));
+  const pythonCandidates = Array.from(
+    new Set([
+      override,
+      ...detectedPythonAliases(),
+      ...pythonAliasOrder(),
+      "python3",
+      "python",
+    ]).values(),
+  ).filter(Boolean);
 
   return pythonCandidates.map((pythonBin) => [
     pythonBin,
     "-m",
     "vllm.entrypoints.openai.api_server",
     "--host",
-    host,
+    launch.host,
     "--port",
-    String(port),
+    String(launch.port),
     "--model",
-    model,
+    launch.model,
   ]);
 }
 
-async function startManagedVllm(primaryEndpoint: string): Promise<void> {
-  if (managedVllmProc) return;
-  const commandCandidates = vllmStartArgs(primaryEndpoint);
-
+async function startManagedVllmPython(primaryEndpoint: string): Promise<void> {
+  const commandCandidates = vllmPythonStartArgs(primaryEndpoint);
   let lastFailure = "unknown failure";
+
   for (const cmd of commandCandidates) {
     try {
-      console.log(`[start] Launching local vLLM: ${cmd.join(" ")}`);
+      console.log(`[start] Launching local vLLM (python): ${cmd.join(" ")}`);
       const proc = Bun.spawn(cmd, {
         cwd: repoRoot,
         stdin: "ignore",
@@ -286,6 +483,7 @@ async function startManagedVllm(primaryEndpoint: string): Promise<void> {
         stderr: "pipe",
       });
       managedVllmProc = proc;
+      managedVllmRuntime = "python";
 
       streamVllmOutput(proc.stdout, "[vllm] ");
       streamVllmOutput(proc.stderr, "[vllm] ");
@@ -299,6 +497,7 @@ async function startManagedVllm(primaryEndpoint: string): Promise<void> {
 
       if (early.exited) {
         managedVllmProc = null;
+        managedVllmRuntime = null;
         lastFailure = `${cmd[0]} exited immediately with code ${early.code}`;
         continue;
       }
@@ -306,27 +505,121 @@ async function startManagedVllm(primaryEndpoint: string): Promise<void> {
       return;
     } catch (err) {
       managedVllmProc = null;
+      managedVllmRuntime = null;
       lastFailure = `${cmd[0]} failed to start: ${String(err)}`;
     }
   }
 
+  throw new Error(lastFailure);
+}
+
+async function startManagedVllmDocker(primaryEndpoint: string): Promise<void> {
+  const dockerAvailable = (await runQuiet(["docker", "version"])) === 0;
+  if (!dockerAvailable) {
+    throw new Error("Docker daemon is unavailable");
+  }
+
+  const launch = vllmDockerStartArgs(primaryEndpoint);
+  const alreadyRunning = await dockerContainerRunning(launch.containerName);
+  if (alreadyRunning) {
+    managedVllmRuntime = "docker";
+    managedVllmDockerContainerName = launch.containerName;
+    managedVllmDockerOwned = false;
+    console.log(`[start] Reusing existing vLLM container: ${launch.containerName}`);
+    return;
+  }
+
+  if (await dockerContainerExists(launch.containerName)) {
+    const removeExit = await runQuiet(["docker", "rm", "-f", launch.containerName]);
+    if (removeExit !== 0) {
+      throw new Error(`could not remove stale container ${launch.containerName}`);
+    }
+  }
+
+  console.log(
+    `[start] Launching local vLLM (docker): image=${launch.image}, model=${launch.model}, port=${launch.hostPort}`,
+  );
+
+  const proc = Bun.spawn(launch.args, {
+    cwd: repoRoot,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  managedVllmProc = proc;
+  managedVllmRuntime = "docker";
+  managedVllmDockerContainerName = launch.containerName;
+  managedVllmDockerOwned = true;
+
+  streamVllmOutput(proc.stdout, "[vllm] ");
+  streamVllmOutput(proc.stderr, "[vllm] ");
+
+  const early = await Promise.race([
+    proc.exited.then((code) => ({ exited: true, code })),
+    new Promise<{ exited: false; code: null }>((resolveRace) =>
+      setTimeout(() => resolveRace({ exited: false, code: null }), 1200),
+    ),
+  ]);
+
+  if (early.exited) {
+    managedVllmProc = null;
+    managedVllmRuntime = null;
+    managedVllmDockerContainerName = null;
+    managedVllmDockerOwned = false;
+    throw new Error(`docker run exited immediately with code ${early.code}`);
+  }
+}
+
+async function startManagedVllm(primaryEndpoint: string): Promise<void> {
+  if (managedVllmProc || managedVllmDockerContainerName) return;
+  managedVllmLogTail.length = 0;
+
+  let lastFailure = "unknown failure";
+  for (const runtime of preferredVllmRuntimeOrder()) {
+    try {
+      if (runtime === "docker") {
+        await startManagedVllmDocker(primaryEndpoint);
+      } else {
+        await startManagedVllmPython(primaryEndpoint);
+      }
+      return;
+    } catch (err) {
+      lastFailure = `${runtime} runtime failed: ${String(err)}`;
+      managedVllmProc = null;
+      managedVllmRuntime = null;
+      managedVllmDockerContainerName = null;
+      managedVllmDockerOwned = false;
+    }
+  }
+
   throw new Error(
-    `${lastFailure}. Install vLLM in Python env, or disable auto-start with PUSHPALS_AUTO_START_VLLM=0.`,
+    `${lastFailure}. Set PUSHPALS_VLLM_RUNTIME to docker/python, or disable auto-start with PUSHPALS_AUTO_START_VLLM=0.`,
   );
 }
 
 async function stopManagedVllm(): Promise<void> {
-  if (!managedVllmProc) return;
-  try {
-    managedVllmProc.kill();
-  } catch {}
-  try {
-    await Promise.race([
-      managedVllmProc.exited,
-      new Promise((resolveWait) => setTimeout(resolveWait, 2500)),
-    ]);
-  } catch {}
+  const proc = managedVllmProc;
+  const runtime = managedVllmRuntime;
+  const containerName = managedVllmDockerContainerName;
+  const containerOwned = managedVllmDockerOwned;
+
   managedVllmProc = null;
+  managedVllmRuntime = null;
+  managedVllmDockerContainerName = null;
+  managedVllmDockerOwned = false;
+
+  if (proc) {
+    try {
+      proc.kill();
+    } catch {}
+    try {
+      await Promise.race([proc.exited, new Promise((resolveWait) => setTimeout(resolveWait, 2500))]);
+    } catch {}
+  }
+
+  if (runtime === "docker" && containerOwned && containerName) {
+    await runQuiet(["docker", "stop", "-t", "5", containerName]);
+  }
 }
 
 async function ensureLlmPreflight(): Promise<void> {
@@ -341,8 +634,9 @@ async function ensureLlmPreflight(): Promise<void> {
   if (!primaryReachable.ok && shouldAutoStartVllm(primary.endpoint)) {
     try {
       await startManagedVllm(primary.endpoint);
-      console.log("[start] Waiting for local vLLM to become reachable...");
-      const deadline = Date.now() + 90_000;
+      const readyTimeoutMs = vllmReadyTimeoutMs();
+      console.log(`[start] Waiting for local vLLM to become reachable (timeout ${readyTimeoutMs}ms)...`);
+      const deadline = Date.now() + readyTimeoutMs;
       while (Date.now() < deadline) {
         primaryReachable = await checkTargetReachable(primary);
         if (primaryReachable.ok) break;

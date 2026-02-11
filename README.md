@@ -108,6 +108,15 @@ LLM defaults:
 - Default model is `zai-org/GLM-4.7-Flash` (override with `LLM_MODEL`)
 - WorkerPals OpenHands agent mode reuses `LLM_*`/`OPENAI_*` vars unless `WORKERPALS_OPENHANDS_*` is set
 - `bun run start` preflights LLM connectivity and can auto-start local vLLM when configured
+- vLLM auto-start runtime is configurable via `PUSHPALS_VLLM_RUNTIME`:
+  - `docker` (default): run Linux vLLM container (recommended on Windows)
+  - `python`: run local `python -m vllm.entrypoints.openai.api_server`
+  - `auto`: Windows prefers Docker; non-Windows prefers Python
+- Docker runtime settings:
+  - `PUSHPALS_VLLM_DOCKER_IMAGE` (default `vllm/vllm-openai:latest`)
+  - `PUSHPALS_VLLM_DOCKER_CONTAINER_NAME` (optional)
+  - `PUSHPALS_VLLM_DOCKER_CONTAINER_PORT` (default `8000`)
+- Readiness timeout for auto-started vLLM: `PUSHPALS_VLLM_READY_TIMEOUT_MS` (default `180000`)
 
 ## Repo Layout
 
