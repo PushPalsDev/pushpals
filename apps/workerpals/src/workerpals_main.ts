@@ -53,6 +53,7 @@ function parseArgs(): {
   dockerImage: string;
   gitToken: string | null;
   dockerTimeout: number;
+  dockerIdleTimeout: number;
   worktreeBaseRef: string;
   labels: string[];
 } {
@@ -69,6 +70,7 @@ function parseArgs(): {
   let gitToken =
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
   let dockerTimeout = parseInt(process.env.WORKERPALS_DOCKER_TIMEOUT_MS ?? "60000", 10);
+  let dockerIdleTimeout = parseInt(process.env.WORKERPALS_DOCKER_IDLE_TIMEOUT_MS ?? "600000", 10);
   let worktreeBaseRef = process.env.WORKERPALS_BASE_REF ?? `origin/${integrationBranchName()}`;
   let labels = (process.env.WORKERPALS_LABELS ?? "")
     .split(",")
@@ -110,6 +112,9 @@ function parseArgs(): {
       case "--docker-timeout":
         dockerTimeout = parseInt(args[++i], 10);
         break;
+      case "--docker-idle-timeout":
+        dockerIdleTimeout = parseInt(args[++i], 10);
+        break;
       case "--base-ref":
         worktreeBaseRef = args[++i];
         break;
@@ -133,7 +138,9 @@ function parseArgs(): {
     requireDocker,
     dockerImage,
     gitToken,
-    dockerTimeout,
+    dockerTimeout: Number.isFinite(dockerTimeout) && dockerTimeout > 0 ? dockerTimeout : 60000,
+    dockerIdleTimeout:
+      Number.isFinite(dockerIdleTimeout) && dockerIdleTimeout >= 0 ? dockerIdleTimeout : 600000,
     worktreeBaseRef,
     labels,
   };
@@ -596,6 +603,7 @@ async function main(): Promise<void> {
         workerId: opts.workerId,
         gitToken: opts.gitToken ?? undefined,
         timeoutMs: opts.dockerTimeout,
+        idleTimeoutMs: opts.dockerIdleTimeout,
         baseRef: opts.worktreeBaseRef,
       });
 
@@ -630,6 +638,23 @@ async function main(): Promise<void> {
   } else if (opts.requireDocker) {
     console.error("[WorkerPals] --require-docker was provided without --docker.");
     process.exit(1);
+  }
+
+  if (dockerExecutor) {
+    const cleanup = async () => {
+      await dockerExecutor.shutdown().catch((err) => {
+        console.error(`[WorkerPals] Docker shutdown cleanup failed: ${String(err)}`);
+      });
+    };
+    process.on("SIGINT", () => {
+      void cleanup().finally(() => process.exit(130));
+    });
+    process.on("SIGTERM", () => {
+      void cleanup().finally(() => process.exit(143));
+    });
+    process.on("exit", () => {
+      void cleanup();
+    });
   }
 
   workerLoop(opts, dockerExecutor).catch((err) => {

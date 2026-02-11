@@ -3,12 +3,12 @@
  *
  * This executor:
  * 1. Creates isolated git worktrees for each job
- * 2. Runs ephemeral Docker containers mounting the worktree
+ * 2. Runs jobs in a warm Docker container mounting the repo root
  * 3. Parses structured output from the container
  * 4. Cleans up worktrees after execution
  *
  * Architecture:
- *   HOST: Worker daemon → git worktree add → docker run → git worktree remove
+ *   HOST: Worker daemon → git worktree add → docker exec (warm container) → git worktree remove
  *   CONTAINER: job_runner.ts → executeJob → git commit/push → ___RESULT___
  */
 
@@ -27,6 +27,8 @@ export interface DockerExecutorOptions {
   gitToken?: string;
   /** Timeout in milliseconds */
   timeoutMs?: number;
+  /** Idle shutdown timeout for the warm container in milliseconds */
+  idleTimeoutMs?: number;
   /** Git ref used as the base for per-job worktrees */
   baseRef?: string;
 }
@@ -54,15 +56,21 @@ export interface Job {
 export class DockerExecutor {
   private options: Required<DockerExecutorOptions>;
   private worktreeDir: string;
+  private warmContainerName: string;
+  private warmAgentPort = 39231;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeJobs = 0;
 
   constructor(options: DockerExecutorOptions) {
     this.options = {
       gitToken: "",
       timeoutMs: 60000,
+      idleTimeoutMs: 10 * 60 * 1000,
       baseRef: "HEAD",
       ...options,
     };
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
+    this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
 
     // Ensure worktrees directory exists
     try {
@@ -79,6 +87,8 @@ export class DockerExecutor {
     job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<DockerJobResult> {
+    this.activeJobs += 1;
+    this.clearIdleTimer();
     const worktreeName = `job-${job.id}`;
     const worktreePath = resolve(this.worktreeDir, worktreeName);
 
@@ -97,14 +107,16 @@ export class DockerExecutor {
       const base64Spec = Buffer.from(JSON.stringify(jobSpec)).toString("base64");
 
       // Step 3: Run Docker container with the worktree mounted
-      const result = await this.runContainer(worktreePath, base64Spec, onLog);
+      const result = await this.runInWarmContainer(worktreePath, base64Spec, onLog);
 
       return result;
     } finally {
+      this.activeJobs = Math.max(0, this.activeJobs - 1);
       // Step 4: Clean up worktree (always cleanup)
       await this.removeWorktree(worktreePath).catch((err) => {
         console.error(`[DockerExecutor] Failed to remove worktree: ${err}`);
       });
+      this.scheduleIdleShutdown();
     }
   }
 
@@ -211,24 +223,60 @@ export class DockerExecutor {
   /**
    * Run the Docker container and parse output
    */
-  private async runContainer(
-    worktreePath: string,
-    base64Spec: string,
-    onLog?: (stream: "stdout" | "stderr", line: string) => void,
-  ): Promise<DockerJobResult> {
-    const containerName = `pushpals-${this.options.workerId}-${Date.now()}`;
+  private collectContainerEnv(): string[] {
+    const allowlist = [
+      "LLM_MODEL",
+      "LLM_API_KEY",
+      "LLM_BASE_URL",
+      "LLM_ENDPOINT",
+      "OPENAI_MODEL",
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL",
+      "WORKERPALS_OPENHANDS_MODEL",
+      "WORKERPALS_OPENHANDS_API_KEY",
+      "WORKERPALS_OPENHANDS_BASE_URL",
+      "WORKERPALS_OPENHANDS_AGENT_MAX_STEPS",
+      "WORKERPALS_OPENHANDS_TIMEOUT_MS",
+      "WORKERPALS_OPENHANDS_PYTHON",
+      "WORKERPALS_OPENHANDS_WORKSPACE_PYTHON",
+      "PUSHPALS_REPO_PATH",
+    ];
 
-    // Mount repo root (not just the worktree path) so gitdir indirections
-    // from worktrees can resolve to .git/worktrees/... inside the container.
+    const pairs: string[] = [];
+    for (const key of allowlist) {
+      const value = process.env[key];
+      if (!value) continue;
+      pairs.push("-e", `${key}=${value}`);
+    }
+    return pairs;
+  }
+
+  private clearIdleTimer(): void {
+    if (!this.idleTimer) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+  }
+
+  private scheduleIdleShutdown(): void {
+    if (this.options.idleTimeoutMs <= 0) return;
+    if (this.activeJobs > 0) return;
+
+    this.clearIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      if (this.activeJobs > 0) return;
+      void this.stopWarmContainer("idle timeout");
+    }, this.options.idleTimeoutMs);
+  }
+
+  private async startWarmContainer(): Promise<void> {
+    await this.stopWarmContainer("pre-start cleanup", true);
     const dockerRepoPath = this.toDockerPath(this.options.repo);
-    const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
-    const containerWorktreePath = `/repo/${worktreeRelPath}`;
-
+    const envArgs = this.collectContainerEnv();
     const args: string[] = [
       "run",
-      "--rm",
+      "-d",
       "--name",
-      containerName,
+      this.warmContainerName,
       "--memory",
       "512m",
       "--cpus",
@@ -238,20 +286,91 @@ export class DockerExecutor {
       "-v",
       `${dockerRepoPath}:/repo`,
       "-w",
-      containerWorktreePath,
-      "--stop-timeout",
-      String(Math.floor(this.options.timeoutMs / 1000)),
+      "/repo",
+      ...envArgs,
     ];
 
-    // Add git token if provided
     if (this.options.gitToken) {
       args.push("-e", `GIT_TOKEN=${this.options.gitToken}`);
     }
+    args.push(
+      "-e",
+      `WORKERPALS_OPENHANDS_AGENT_SERVER_URL=http://127.0.0.1:${this.warmAgentPort}`,
+    );
 
-    // Add the image and base64 spec
-    args.push(this.options.imageName, base64Spec);
+    args.push(
+      "--entrypoint",
+      "/bin/sh",
+      this.options.imageName,
+      "-lc",
+      `python -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
+        `for i in $(seq 1 100); do curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1 && break; sleep 0.1; done; ` +
+        "tail -f /dev/null",
+    );
 
-    console.log(`[DockerExecutor] Starting container: ${containerName}`);
+    const proc = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) {
+      const stderr = await new Response(proc.stderr).text();
+      throw new Error(`Failed to start warm container: ${stderr}`);
+    }
+    console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
+  }
+
+  private async ensureWarmContainer(): Promise<void> {
+    const inspect = Bun.spawn(
+      ["docker", "inspect", "-f", "{{.State.Running}}", this.warmContainerName],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [exitCode, stdout] = await Promise.all([inspect.exited, new Response(inspect.stdout).text()]);
+    if (exitCode === 0 && stdout.trim() === "true") return;
+    await this.startWarmContainer();
+  }
+
+  private async stopWarmContainer(reason: string, quiet = false): Promise<void> {
+    this.clearIdleTimer();
+    const stopProc = Bun.spawn(
+      ["docker", "rm", "-f", this.warmContainerName],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const exitCode = await stopProc.exited;
+    if (exitCode === 0) {
+      if (!quiet) console.log(`[DockerExecutor] Warm container stopped (${reason}): ${this.warmContainerName}`);
+      return;
+    }
+    const stderr = (await new Response(stopProc.stderr).text()).trim();
+    const notFound = /No such container/i.test(stderr);
+    if (!quiet && !notFound) {
+      console.error(`[DockerExecutor] Failed to stop warm container: ${stderr}`);
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    await this.stopWarmContainer("worker shutdown", true);
+  }
+
+  private async runInWarmContainer(
+    worktreePath: string,
+    base64Spec: string,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<DockerJobResult> {
+    await this.ensureWarmContainer();
+
+    const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
+    const containerWorktreePath = `/repo/${worktreeRelPath}`;
+
+    const args: string[] = [
+      "exec",
+      "-w",
+      containerWorktreePath,
+      this.warmContainerName,
+      "bun",
+      "run",
+      "/repo/apps/workerpals/src/job_runner.ts",
+      base64Spec,
+    ];
+
+    console.log(`[DockerExecutor] Running job in warm container: ${this.warmContainerName}`);
 
     const proc = Bun.spawn(["docker", ...args], {
       stdout: "pipe",
@@ -260,11 +379,11 @@ export class DockerExecutor {
 
     // Set up timeout
     const timer = setTimeout(() => {
-      console.log(`[DockerExecutor] Job timeout, killing container: ${containerName}`);
+      console.log(`[DockerExecutor] Job timeout in warm container: ${this.warmContainerName}`);
       try {
         proc.kill();
-        // Also try to kill the container directly
-        Bun.spawn(["docker", "kill", containerName]);
+        // Reset the warm container to clear any stuck in-container process.
+        Bun.spawn(["docker", "restart", "-t", "1", this.warmContainerName]);
       } catch {
         // Ignore kill errors
       }

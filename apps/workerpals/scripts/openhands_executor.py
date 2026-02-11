@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -179,6 +180,10 @@ def _looks_local_base_url(base_url: str) -> bool:
         or "127.0.0.1" in lowered
         or "host.docker.internal" in lowered
     )
+
+
+def _resolve_agent_server_url() -> str:
+    return (os.environ.get("WORKERPALS_OPENHANDS_AGENT_SERVER_URL") or "").strip()
 
 
 def _resolve_llm_config() -> Tuple[str, str, str]:
@@ -834,8 +839,11 @@ def main() -> int:
         return _fail(f"Unknown job kind: {kind}", exit_code=2)
 
     try:
-        with ManagedLocalAgentServer() as server:
-            with Workspace(host=server.base_url, working_dir=repo) as workspace:
+        reusable_server = _resolve_agent_server_url()
+        server_ctx = nullcontext(reusable_server) if reusable_server else ManagedLocalAgentServer()
+        with server_ctx as server:
+            server_url = reusable_server or server.base_url
+            with Workspace(host=server_url, working_dir=repo) as workspace:
                 raw_result = workspace.execute_command(cmd)
                 exit_code, stdout, stderr = _parse_workspace_result(raw_result)
     except Exception as exc:
