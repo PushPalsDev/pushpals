@@ -30,6 +30,12 @@ type WorkerJobResult = JobResult & {
   commit?: CommitRef;
 };
 
+const TRUTHY = new Set(["1", "true", "yes", "on"]);
+
+function envTruthy(name: string): boolean {
+  return TRUTHY.has((process.env[name] ?? "").toLowerCase());
+}
+
 function parseArgs(): {
   server: string;
   pollMs: number;
@@ -42,7 +48,6 @@ function parseArgs(): {
   gitToken: string | null;
   dockerTimeout: number;
 } {
-  const truthy = new Set(["1", "true", "yes", "on"]);
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
   let pollMs = parseInt(process.env.WORKER_POLL_MS ?? "2000", 10);
@@ -50,7 +55,7 @@ function parseArgs(): {
   let workerId = `worker-${randomUUID().substring(0, 8)}`;
   let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
   let docker = false;
-  let requireDocker = truthy.has((process.env.WORKER_REQUIRE_DOCKER ?? "").toLowerCase());
+  let requireDocker = envTruthy("WORKER_REQUIRE_DOCKER");
   let dockerImage = process.env.WORKER_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
   let gitToken =
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
@@ -453,6 +458,21 @@ async function main(): Promise<void> {
         }
         console.error("[Worker] Falling back to direct mode (isolated worktrees)...");
         dockerExecutor = null;
+      } else if (!envTruthy("WORKER_SKIP_DOCKER_SELF_CHECK")) {
+        console.log("[Worker] Running Docker startup self-check (git/worktree in container)...");
+        try {
+          await dockerExecutor.validateWorktreeGitInterop();
+        } catch (err) {
+          console.error(
+            `[Worker] Docker startup self-check failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          if (opts.requireDocker) {
+            console.error("[Worker] Exiting because --require-docker is enabled.");
+            process.exit(1);
+          }
+          console.error("[Worker] Falling back to direct mode (isolated worktrees)...");
+          dockerExecutor = null;
+        }
       }
     }
   } else if (opts.requireDocker) {

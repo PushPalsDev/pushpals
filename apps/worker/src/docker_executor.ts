@@ -13,8 +13,8 @@
  */
 
 import { randomUUID } from "crypto";
-import { mkdirSync, rmSync } from "fs";
-import { resolve } from "path";
+import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { isAbsolute, relative, resolve } from "path";
 
 export interface DockerExecutorOptions {
   /** Path to the git repository on the host */
@@ -106,6 +106,25 @@ export class DockerExecutor {
   }
 
   /**
+   * Validate that a host-created worktree is usable by git inside the Linux
+   * worker container. This catches host/container path mapping issues early.
+   */
+  async validateWorktreeGitInterop(): Promise<void> {
+    const worktreeName = `selfcheck-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+    const worktreePath = resolve(this.worktreeDir, worktreeName);
+
+    try {
+      await this.createWorktree(worktreePath);
+      await this.runGitSelfCheckContainer(worktreePath);
+      console.log(`[DockerExecutor] Startup self-check passed (git/worktree in container).`);
+    } finally {
+      await this.removeWorktree(worktreePath).catch(() => {
+        // Ignore cleanup failures for startup self-check artifacts.
+      });
+    }
+  }
+
+  /**
    * Create a git worktree for isolated job execution
    */
   private async createWorktree(worktreePath: string): Promise<void> {
@@ -123,7 +142,40 @@ export class DockerExecutor {
       throw new Error(`Failed to create worktree: ${stderr}`);
     }
 
+    this.rewriteWorktreeGitdirToRelative(worktreePath);
+
     console.log(`[DockerExecutor] Created worktree: ${worktreePath}`);
+  }
+
+  /**
+   * On Windows hosts, git worktree writes an absolute Windows path into
+   * `<worktree>/.git` (e.g. `C:/.../.git/worktrees/...`). That path is not
+   * valid inside Linux containers. Rewrite to a relative gitdir so both host
+   * and container can resolve it.
+   */
+  private rewriteWorktreeGitdirToRelative(worktreePath: string): void {
+    try {
+      const gitFilePath = resolve(worktreePath, ".git");
+      const raw = readFileSync(gitFilePath, "utf-8").trim();
+      const match = raw.match(/^gitdir:\s*(.+)$/i);
+      if (!match) return;
+
+      const gitdirRaw = match[1].trim();
+      const hasWindowsDrive = /^[a-zA-Z]:[\\/]/.test(gitdirRaw);
+      if (!hasWindowsDrive && !isAbsolute(gitdirRaw)) {
+        return;
+      }
+
+      const rel = relative(worktreePath, gitdirRaw).replace(/\\/g, "/");
+      if (!rel || rel.startsWith("..") === false) {
+        return;
+      }
+
+      writeFileSync(gitFilePath, `gitdir: ${rel}\n`, "utf-8");
+    } catch {
+      // Best-effort normalization; if this fails, git commands will surface
+      // a concrete error during execution.
+    }
   }
 
   /**
@@ -160,8 +212,11 @@ export class DockerExecutor {
   ): Promise<DockerJobResult> {
     const containerName = `pushpals-${this.options.workerId}-${Date.now()}`;
 
-    // Convert Windows path to Docker path if needed
-    const dockerWorktreePath = this.toDockerPath(worktreePath);
+    // Mount repo root (not just the worktree path) so gitdir indirections
+    // from worktrees can resolve to .git/worktrees/... inside the container.
+    const dockerRepoPath = this.toDockerPath(this.options.repo);
+    const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
+    const containerWorktreePath = `/repo/${worktreeRelPath}`;
 
     const args: string[] = [
       "run",
@@ -175,9 +230,9 @@ export class DockerExecutor {
       "--network",
       "none",
       "-v",
-      `${dockerWorktreePath}:/workspace`,
+      `${dockerRepoPath}:/repo`,
       "-w",
-      "/workspace",
+      containerWorktreePath,
       "--stop-timeout",
       String(Math.floor(this.options.timeoutMs / 1000)),
     ];
@@ -225,6 +280,49 @@ export class DockerExecutor {
     const result = this.parseResult(stdoutLines, stderrLines, exitCode);
 
     return result;
+  }
+
+  private async runGitSelfCheckContainer(worktreePath: string): Promise<void> {
+    const containerName = `pushpals-${this.options.workerId}-selfcheck-${Date.now()}`;
+    const dockerRepoPath = this.toDockerPath(this.options.repo);
+    const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
+    const containerWorktreePath = `/repo/${worktreeRelPath}`;
+
+    const proc = Bun.spawn(
+      [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        containerName,
+        "--network",
+        "none",
+        "-v",
+        `${dockerRepoPath}:/repo`,
+        "-w",
+        containerWorktreePath,
+        "--entrypoint",
+        "/bin/sh",
+        this.options.imageName,
+        "-lc",
+        "git rev-parse --is-inside-work-tree && git rev-parse --git-dir && git status --porcelain",
+      ],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    if (exitCode !== 0) {
+      const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+      throw new Error(`Docker git/worktree startup self-check failed: ${detail}`);
+    }
   }
 
   /**
