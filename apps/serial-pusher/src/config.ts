@@ -48,9 +48,13 @@ export interface SerialPusherConfig {
 }
 
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
+const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..");
+const DEFAULT_SERIAL_PUSHER_REPO_PATH = join(REPO_ROOT, ".worktrees", "serial-pusher");
 
 const DEFAULTS: SerialPusherConfig = {
-  repoPath: process.cwd(),
+  repoPath: process.env.SERIAL_PUSHER_REPO_PATH
+    ? resolve(process.env.SERIAL_PUSHER_REPO_PATH)
+    : DEFAULT_SERIAL_PUSHER_REPO_PATH,
   serverUrl: process.env.PUSHPALS_SERVER_URL ?? "http://localhost:3001",
   remote: "origin",
   mainBranch:
@@ -62,7 +66,7 @@ const DEFAULTS: SerialPusherConfig = {
   checks: [],
   stateDir: process.env.PUSHPALS_DATA_DIR
     ? join(process.env.PUSHPALS_DATA_DIR, "serial-pusher")
-    : join(resolve(import.meta.dir, "..", "..", ".."), "outputs", "data", "serial-pusher"),
+    : join(REPO_ROOT, "outputs", "data", "serial-pusher"),
   port: 3002,
   deleteAfterMerge: false,
   maxAttempts: 3,

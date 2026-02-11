@@ -117,8 +117,9 @@ async function main(): Promise<void> {
   // Setup git credentials for pushing
   setupGitCredentials();
 
-  // Execute the job
-  const result = await executeJob(spec.kind, spec.params, "/workspace", (stream, line) => {
+  // Execute inside the mounted job worktree (docker -w), not the baked image copy.
+  const jobRepo = process.cwd();
+  const result = await executeJob(spec.kind, spec.params, jobRepo, (stream, line) => {
     log(stream, line);
   });
 
@@ -134,7 +135,7 @@ async function main(): Promise<void> {
   // Create commit for file-modifying jobs
   if (result.ok && shouldCommit(spec.kind)) {
     log("stdout", `[JobRunner] Job modified files, creating commit...`);
-    const commitResult = await createJobCommit("/workspace", spec.workerId, {
+    const commitResult = await createJobCommit(jobRepo, spec.workerId, {
       id: spec.jobId,
       taskId: spec.taskId,
       kind: spec.kind,

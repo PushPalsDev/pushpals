@@ -9,6 +9,7 @@
  * It also ensures the worker Docker image exists before launching the stack.
  */
 
+import { mkdirSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
@@ -25,6 +26,7 @@ const INTEGRATION_BASE_REMOTE_REF = `origin/${INTEGRATION_BASE_BRANCH}`;
 const workerImage = process.env.WORKER_DOCKER_IMAGE ?? DEFAULT_IMAGE;
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
+const DEFAULT_SERIAL_PUSHER_WORKTREE = resolve(repoRoot, ".worktrees", "serial-pusher");
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 
 function envTruthy(name: string): boolean {
@@ -245,6 +247,47 @@ async function ensureIntegrationBranch(): Promise<void> {
   console.log(`[start] Ready: ${INTEGRATION_REMOTE_REF} exists and workers will base from it.`);
 }
 
+async function ensureSerialPusherWorktree(): Promise<void> {
+  const configuredPath = (process.env.SERIAL_PUSHER_REPO_PATH ?? "").trim();
+  const repoPath = configuredPath ? resolve(repoRoot, configuredPath) : DEFAULT_SERIAL_PUSHER_WORKTREE;
+
+  if (repoPath === repoRoot) {
+    console.error(
+      "[start] SERIAL_PUSHER_REPO_PATH points to the primary workspace. Refusing to run serial-pusher in-place.",
+    );
+    console.error(
+      "[start] Set SERIAL_PUSHER_REPO_PATH to a dedicated worktree path, or unset it to use the default.",
+    );
+    process.exit(1);
+  }
+
+  const isGitRepo = await runCapture(["git", "-C", repoPath, "rev-parse", "--is-inside-work-tree"], repoRoot);
+  if (!isGitRepo.ok) {
+    mkdirSync(resolve(repoPath, ".."), { recursive: true });
+
+    const seedCandidates = [INTEGRATION_REMOTE_REF, INTEGRATION_BRANCH, INTEGRATION_BASE_REMOTE_REF, "HEAD"];
+    let seedRef = "HEAD";
+    for (const ref of seedCandidates) {
+      const exists = await git(["rev-parse", "--verify", "--quiet", ref]);
+      if (exists.ok) {
+        seedRef = ref;
+        break;
+      }
+    }
+
+    const addResult = await git(["worktree", "add", "--detach", repoPath, seedRef]);
+    if (!addResult.ok) {
+      console.error(
+        `[start] Failed to create serial-pusher worktree at ${repoPath} from ${seedRef}: ${addResult.stderr || addResult.stdout}`,
+      );
+      process.exit(addResult.exitCode || 1);
+    }
+    console.log(`[start] Created serial-pusher worktree: ${repoPath}`);
+  }
+
+  process.env.SERIAL_PUSHER_REPO_PATH = repoPath;
+}
+
 async function ensureDockerImage(): Promise<void> {
   const dockerAvailable = (await runQuiet(["docker", "version"])) === 0;
   if (!dockerAvailable) {
@@ -271,6 +314,7 @@ async function ensureDockerImage(): Promise<void> {
 
 await ensureIntegrationBranch();
 await ensureGitHubAuth();
+await ensureSerialPusherWorktree();
 await ensureDockerImage();
 
 const proc = Bun.spawn(["bun", "run", "dev:full"], {

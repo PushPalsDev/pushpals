@@ -99,6 +99,7 @@ export class JobRunner {
       await this.gitOps.fetchPrune();
       await this.gitOps.checkoutMain();
       await this.gitOps.pullMainFF();
+      await this.gitOps.syncMainWithBaseBranch();
 
       // Log SHAs for debugging
       const originMainSha = await this.gitOps.revParse(

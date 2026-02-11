@@ -13,6 +13,16 @@ import {
   type CheckConfig,
 } from "./config";
 
+type GitCmdResult = {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+};
+
+const repoRoot = resolve(import.meta.dir, "..", "..", "..");
+const defaultSerialPusherRepoPath = join(repoRoot, ".worktrees", "serial-pusher");
+
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
 const { values: args } = parseArgs({
@@ -44,7 +54,7 @@ Usage:
 
 Options:
   -c, --config <path>       Config file path (default: serial-pusher.config.json)
-  -r, --repo <path>         Git repository path (default: cwd)
+  -r, --repo <path>         Git repository path (default: $SERIAL_PUSHER_REPO_PATH or <repo>/.worktrees/serial-pusher)
   -s, --server <url>        PushPals server URL (default: http://localhost:3001)
   -p, --port <number>       HTTP status server port (default: 3002)
       --remote <name>       Git remote (default: origin)
@@ -109,6 +119,10 @@ if (args["delete-after-merge"]) cliOverrides.deleteAfterMerge = true;
 config = applyCliOverrides(config, cliOverrides);
 const integrationBaseBranch = (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || "main";
 const integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
+const hasRepoPathOverride =
+  typeof args.repo === "string" || (process.env.SERIAL_PUSHER_REPO_PATH ?? "").trim().length > 0;
+const usingDefaultRepoPath =
+  !hasRepoPathOverride && resolve(config.repoPath) === resolve(defaultSerialPusherRepoPath);
 
 // Validate config before proceeding
 try {
@@ -263,6 +277,7 @@ async function tick(): Promise<void> {
       await gitOps.resetToClean();
       await gitOps.checkoutMain();
       await gitOps.pullMainFF();
+      await gitOps.syncMainWithBaseBranch();
       await gitOps.createTempBranch(tempBranch);
 
       console.log(`[${ts()}] Merging ${completion.branch} into ${tempBranch}...`);
@@ -394,6 +409,71 @@ async function promptYesNo(question: string): Promise<boolean> {
   return normalized === "y" || normalized === "yes";
 }
 
+async function runGitCapture(args: string[], cwd = repoRoot): Promise<GitCmdResult> {
+  try {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      ok: exitCode === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: String(err),
+      exitCode: 127,
+    };
+  }
+}
+
+async function ensureDefaultSerialPusherWorktree(): Promise<void> {
+  if (!usingDefaultRepoPath) return;
+
+  const probe = await runGitCapture(["-C", config.repoPath, "rev-parse", "--is-inside-work-tree"]);
+  if (probe.ok) return;
+
+  mkdirSync(resolve(config.repoPath, ".."), { recursive: true });
+
+  const seedCandidates = [
+    `${config.remote}/${config.mainBranch}`,
+    config.mainBranch,
+    integrationBaseRef,
+    "HEAD",
+  ];
+  let seedRef = "HEAD";
+  for (const ref of seedCandidates) {
+    const exists = await runGitCapture(["rev-parse", "--verify", "--quiet", ref]);
+    if (exists.ok) {
+      seedRef = ref;
+      break;
+    }
+  }
+
+  const addResult = await runGitCapture(["worktree", "add", "--detach", config.repoPath, seedRef]);
+  if (!addResult.ok) {
+    throw new Error(
+      `Failed to create default serial-pusher worktree (${config.repoPath}) from ${seedRef}: ${
+        addResult.stderr || addResult.stdout
+      }`,
+    );
+  }
+
+  console.log(
+    `[${ts()}] Created default serial-pusher worktree: ${config.repoPath} (seed: ${seedRef})`,
+  );
+}
+
 async function ensureIntegrationBranchExists(): Promise<void> {
   const remoteRef = `${config.remote}/${config.mainBranch}`;
   if (await gitOps.revParse(remoteRef)) return;
@@ -413,7 +493,7 @@ async function ensureIntegrationBranchExists(): Promise<void> {
     }
 
     approved = await promptYesNo(
-      `Create ${config.mainBranch} from ${integrationBaseRef}, set upstream to ${integrationBaseRef}, and push ${config.mainBranch} to ${config.remote}?`,
+      `Create ${config.mainBranch} from ${integrationBaseRef} and push ${config.mainBranch} to ${config.remote}?`,
     );
   }
 
@@ -423,11 +503,12 @@ async function ensureIntegrationBranchExists(): Promise<void> {
 
   await gitOps.bootstrapMainBranchFromBase();
   console.log(
-    `[${ts()}] Created ${remoteRef}; local ${config.mainBranch} is set to track ${integrationBaseRef}.`,
+    `[${ts()}] Created ${remoteRef}; serial-pusher local integration branch is based on ${integrationBaseRef}.`,
   );
 }
 
 async function main(): Promise<void> {
+  await ensureDefaultSerialPusherWorktree();
   // ── Startup safety check ──────────────────────────────────────────────
   // Skip source is already logged in the boot banner (mode: SKIP CLEAN CHECK).
   if (!skipCleanCheck) {
