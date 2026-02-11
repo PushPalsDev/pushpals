@@ -1,5 +1,5 @@
 import { parseArgs } from "util";
-import { resolve, join } from "path";
+import { isAbsolute, join, relative, resolve } from "path";
 import { mkdirSync, existsSync } from "fs";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
@@ -117,6 +117,7 @@ if (typeof args["state-dir"] === "string") cliOverrides.stateDir = resolve(args[
 if (args["delete-after-merge"]) cliOverrides.deleteAfterMerge = true;
 
 config = applyCliOverrides(config, cliOverrides);
+config.repoPath = resolve(config.repoPath);
 const integrationBaseBranch = (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || "main";
 const integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
 const hasRepoPathOverride =
@@ -474,6 +475,17 @@ async function ensureDefaultSerialPusherWorktree(): Promise<void> {
   );
 }
 
+function ensureRepoPathIsIsolatedWorktree(): void {
+  const rel = relative(repoRoot, config.repoPath).replace(/\\/g, "/");
+  const insideRepoRoot = rel === "" || (!rel.startsWith("../") && !isAbsolute(rel));
+  const insideWorktrees = rel === ".worktrees" || rel.startsWith(".worktrees/");
+  if (insideRepoRoot && !insideWorktrees) {
+    throw new Error(
+      `Unsafe serial-pusher repoPath (${config.repoPath}). Use a dedicated worktree path (recommended: ${defaultSerialPusherRepoPath}) so your active workspace branch is never switched.`,
+    );
+  }
+}
+
 async function ensureIntegrationBranchExists(): Promise<void> {
   const remoteRef = `${config.remote}/${config.mainBranch}`;
   if (await gitOps.revParse(remoteRef)) return;
@@ -509,6 +521,7 @@ async function ensureIntegrationBranchExists(): Promise<void> {
 
 async function main(): Promise<void> {
   await ensureDefaultSerialPusherWorktree();
+  ensureRepoPathIsIsolatedWorktree();
   // ── Startup safety check ──────────────────────────────────────────────
   // Skip source is already logged in the boot banner (mode: SKIP CLEAN CHECK).
   if (!skipCleanCheck) {
