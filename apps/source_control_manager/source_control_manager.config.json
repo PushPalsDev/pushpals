@@ -1,5 +1,5 @@
 {
-  "repoPath": "../../.worktrees/serial-pusher",
+  "repoPath": "../../.worktrees/source_control_manager",
   "remote": "origin",
   "mainBranch": "main_agents",
   "branchPrefix": "agent/",

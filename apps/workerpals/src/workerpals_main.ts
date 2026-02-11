@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * PushPals Worker Daemon
+ * PushPals WorkerPals Daemon
  *
  * Usage:
- *   bun run worker --server http://localhost:3001 [--poll 2000] [--repo <path>] [--docker]
+ *   bun run workerpals --server http://localhost:3001 [--poll 2000] [--repo <path>] [--docker]
  *
  * Polls the server job queue, claims jobs, executes them, and reports results.
  * Streams stdout/stderr as `job_log` events with seq numbers.
@@ -58,19 +58,19 @@ function parseArgs(): {
 } {
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
-  let pollMs = parseInt(process.env.WORKER_POLL_MS ?? "2000", 10);
-  let heartbeatMs = parseInt(process.env.WORKER_HEARTBEAT_MS ?? "5000", 10);
+  let pollMs = parseInt(process.env.WORKERPALS_POLL_MS ?? "2000", 10);
+  let heartbeatMs = parseInt(process.env.WORKERPALS_HEARTBEAT_MS ?? "5000", 10);
   let repo = detectRepoRoot(process.cwd());
-  let workerId = `worker-${randomUUID().substring(0, 8)}`;
+  let workerId = `workerpal-${randomUUID().substring(0, 8)}`;
   let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
   let docker = false;
-  let requireDocker = envTruthy("WORKER_REQUIRE_DOCKER");
-  let dockerImage = process.env.WORKER_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
+  let requireDocker = envTruthy("WORKERPALS_REQUIRE_DOCKER");
+  let dockerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
   let gitToken =
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
-  let dockerTimeout = parseInt(process.env.WORKER_DOCKER_TIMEOUT_MS ?? "60000", 10);
-  let worktreeBaseRef = process.env.WORKER_BASE_REF ?? `origin/${integrationBranchName()}`;
-  let labels = (process.env.WORKER_LABELS ?? "")
+  let dockerTimeout = parseInt(process.env.WORKERPALS_DOCKER_TIMEOUT_MS ?? "60000", 10);
+  let worktreeBaseRef = process.env.WORKERPALS_BASE_REF ?? `origin/${integrationBranchName()}`;
+  let labels = (process.env.WORKERPALS_LABELS ?? "")
     .split(",")
     .map((label) => label.trim())
     .filter(Boolean);
@@ -179,7 +179,7 @@ async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promi
     const fetchResult = await git(repo, ["fetch", "origin", branch, "--quiet"]);
     if (!fetchResult.ok) {
       console.warn(
-        `[Worker] Could not refresh ${requestedRef}; continuing with local refs (${fetchResult.stderr || fetchResult.stdout})`,
+        `[WorkerPals] Could not refresh ${requestedRef}; continuing with local refs (${fetchResult.stderr || fetchResult.stdout})`,
       );
     }
     candidates.add(branch);
@@ -220,7 +220,7 @@ async function removeIsolatedWorktree(repo: string, worktreePath: string): Promi
   const removeResult = await git(repo, ["worktree", "remove", "--force", worktreePath]);
   if (!removeResult.ok) {
     console.error(
-      `[Worker] Worktree cleanup warning (${worktreePath}): ${removeResult.stderr || removeResult.stdout}`,
+      `[WorkerPals] Worktree cleanup warning (${worktreePath}): ${removeResult.stderr || removeResult.stdout}`,
     );
   }
   await git(repo, ["worktree", "prune"]);
@@ -246,14 +246,14 @@ async function enqueueCompletion(
     });
 
     if (response.ok) {
-      console.log(`[Worker] Enqueued completion for job ${job.id} (commit ${commit.sha})`);
+      console.log(`[WorkerPals] Enqueued completion for job ${job.id} (commit ${commit.sha})`);
     } else {
       console.error(
-        `[Worker] Failed to enqueue completion: ${response.status} ${await response.text()}`,
+        `[WorkerPals] Failed to enqueue completion: ${response.status} ${await response.text()}`,
       );
     }
   } catch (err) {
-    console.error(`[Worker] Failed to enqueue completion:`, err);
+    console.error(`[WorkerPals] Failed to enqueue completion:`, err);
   }
 }
 
@@ -269,9 +269,9 @@ function sendCommand(
     body: JSON.stringify(cmd),
   })
     .then((res) => {
-      if (!res.ok) console.error(`[Worker] Command ${cmd.type} failed: ${res.status}`);
+      if (!res.ok) console.error(`[WorkerPals] Command ${cmd.type} failed: ${res.status}`);
     })
-    .catch((err) => console.error(`[Worker] Command ${cmd.type} error:`, err));
+    .catch((err) => console.error(`[WorkerPals] Command ${cmd.type} error:`, err));
 }
 
 type WorkerHeartbeatStatus = "idle" | "busy" | "error" | "offline";
@@ -294,7 +294,7 @@ async function sendWorkerHeartbeat(
         capabilities: {
           docker: opts.docker,
           labels: opts.labels,
-          executor: (process.env.WORKER_EXECUTOR ?? "openhands").toLowerCase(),
+          executor: "openhands",
           requireDocker: opts.requireDocker,
         },
         details: {
@@ -305,7 +305,7 @@ async function sendWorkerHeartbeat(
       }),
     });
   } catch (err) {
-    console.error(`[Worker] Heartbeat error:`, err);
+    console.error(`[WorkerPals] Heartbeat error:`, err);
   }
 }
 
@@ -316,15 +316,13 @@ async function workerLoop(
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (opts.authToken) headers["Authorization"] = `Bearer ${opts.authToken}`;
 
-  console.log(`[Worker ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
+  console.log(`[WorkerPals ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
   if (dockerExecutor) {
-    console.log(`[Worker ${opts.workerId}] Docker mode enabled (${opts.dockerImage})`);
+    console.log(`[WorkerPals ${opts.workerId}] Docker mode enabled (${opts.dockerImage})`);
   } else {
-    console.log(`[Worker ${opts.workerId}] Direct mode with isolated worktrees enabled`);
+    console.log(`[WorkerPals ${opts.workerId}] Direct mode with isolated worktrees enabled`);
   }
-  console.log(
-    `[Worker ${opts.workerId}] Executor backend: ${(process.env.WORKER_EXECUTOR ?? "openhands").toLowerCase()}`,
-  );
+  console.log(`[WorkerPals ${opts.workerId}] Executor backend: openhands`);
   const heartbeatEveryMs = Math.max(1000, opts.heartbeatMs);
   let lastHeartbeatAt = 0;
 
@@ -355,7 +353,7 @@ async function workerLoop(
         const job = data.job;
 
         if (job) {
-          console.log(`[Worker] Claimed job ${job.id} (${job.kind})`);
+          console.log(`[WorkerPals] Claimed job ${job.id} (${job.kind})`);
           await maybeHeartbeat("busy", job.id, true);
 
           const busyHeartbeat = setInterval(() => {
@@ -432,7 +430,7 @@ async function workerLoop(
                 if (result.commit.sha !== "no-changes") {
                   completionCommit = result.commit;
                 } else {
-                  console.log(`[Worker] Job ${job.id} produced no file changes to commit.`);
+                  console.log(`[WorkerPals] Job ${job.id} produced no file changes to commit.`);
                 }
               } else if (dockerExecutor) {
                 result = {
@@ -446,7 +444,7 @@ async function workerLoop(
                     .join("\n"),
                 };
               } else {
-                console.log(`[Worker] Job ${job.id} modified files, creating commit...`);
+                console.log(`[WorkerPals] Job ${job.id} modified files, creating commit...`);
                 const commitResult = await createJobCommit(executionRepo, opts.workerId, {
                   id: job.id,
                   taskId: job.taskId,
@@ -464,7 +462,7 @@ async function workerLoop(
                     };
                   }
                 } else if (commitResult.error) {
-                  console.error(`[Worker] Failed to create commit: ${commitResult.error}`);
+                  console.error(`[WorkerPals] Failed to create commit: ${commitResult.error}`);
                 }
               }
             }
@@ -485,7 +483,7 @@ async function workerLoop(
                   ],
                 }),
               });
-              console.log(`[Worker] Job ${job.id} completed: ${result.summary}`);
+              console.log(`[WorkerPals] Job ${job.id} completed: ${result.summary}`);
             } else {
               await fetch(`${opts.server}/jobs/${job.id}/fail`, {
                 method: "POST",
@@ -495,7 +493,7 @@ async function workerLoop(
                   detail: result.stderr,
                 }),
               });
-              console.log(`[Worker] Job ${job.id} failed: ${result.summary}`);
+              console.log(`[WorkerPals] Job ${job.id} failed: ${result.summary}`);
             }
 
             if (job.sessionId) {
@@ -553,14 +551,14 @@ async function workerLoop(
             await maybeHeartbeat("idle", null, true);
             if (directWorktreePath) {
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
-                console.error(`[Worker] Failed to remove isolated worktree: ${String(err)}`);
+                console.error(`[WorkerPals] Failed to remove isolated worktree: ${String(err)}`);
               });
             }
           }
         }
       }
     } catch (err) {
-      console.error(`[Worker] Poll error:`, err);
+      console.error(`[WorkerPals] Poll error:`, err);
       await maybeHeartbeat("error", null, true);
     }
 
@@ -571,11 +569,11 @@ async function workerLoop(
 async function main(): Promise<void> {
   const opts = parseArgs();
 
-  console.log(`[Worker] PushPals Worker Daemon (${opts.workerId})`);
-  console.log(`[Worker] Server: ${opts.server}`);
-  console.log(`[Worker] Repo: ${opts.repo}`);
+  console.log(`[WorkerPals] PushPals WorkerPals Daemon (${opts.workerId})`);
+  console.log(`[WorkerPals] Server: ${opts.server}`);
+  console.log(`[WorkerPals] Repo: ${opts.repo}`);
   opts.worktreeBaseRef = await resolveWorktreeBaseRef(opts.repo, opts.worktreeBaseRef);
-  console.log(`[Worker] Worktree base ref: ${opts.worktreeBaseRef}`);
+  console.log(`[WorkerPals] Worktree base ref: ${opts.worktreeBaseRef}`);
 
   let dockerExecutor: DockerExecutor | null = null;
 
@@ -583,14 +581,14 @@ async function main(): Promise<void> {
     const dockerAvailable = await DockerExecutor.isDockerAvailable();
     if (!dockerAvailable) {
       const message =
-        "[Worker] Docker is not available. Make sure Docker is installed and running.";
+        "[WorkerPals] Docker is not available. Make sure Docker is installed and running.";
       if (opts.requireDocker) {
         console.error(message);
-        console.error("[Worker] Exiting because --require-docker is enabled.");
+        console.error("[WorkerPals] Exiting because --require-docker is enabled.");
         process.exit(1);
       }
       console.error(message);
-      console.error("[Worker] Falling back to direct mode (isolated worktrees)...");
+      console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
     } else {
       dockerExecutor = new DockerExecutor({
         imageName: opts.dockerImage,
@@ -605,37 +603,37 @@ async function main(): Promise<void> {
 
       const imageReady = await dockerExecutor.pullImage();
       if (!imageReady) {
-        console.error(`[Worker] Failed to prepare Docker image: ${opts.dockerImage}`);
+        console.error(`[WorkerPals] Failed to prepare Docker image: ${opts.dockerImage}`);
         if (opts.requireDocker) {
-          console.error("[Worker] Exiting because --require-docker is enabled.");
+          console.error("[WorkerPals] Exiting because --require-docker is enabled.");
           process.exit(1);
         }
-        console.error("[Worker] Falling back to direct mode (isolated worktrees)...");
+        console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
         dockerExecutor = null;
-      } else if (!envTruthy("WORKER_SKIP_DOCKER_SELF_CHECK")) {
-        console.log("[Worker] Running Docker startup self-check (git/worktree in container)...");
+      } else if (!envTruthy("WORKERPALS_SKIP_DOCKER_SELF_CHECK")) {
+        console.log("[WorkerPals] Running Docker startup self-check (git/worktree in container)...");
         try {
           await dockerExecutor.validateWorktreeGitInterop();
         } catch (err) {
           console.error(
-            `[Worker] Docker startup self-check failed: ${err instanceof Error ? err.message : String(err)}`,
+            `[WorkerPals] Docker startup self-check failed: ${err instanceof Error ? err.message : String(err)}`,
           );
           if (opts.requireDocker) {
-            console.error("[Worker] Exiting because --require-docker is enabled.");
+            console.error("[WorkerPals] Exiting because --require-docker is enabled.");
             process.exit(1);
           }
-          console.error("[Worker] Falling back to direct mode (isolated worktrees)...");
+          console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
           dockerExecutor = null;
         }
       }
     }
   } else if (opts.requireDocker) {
-    console.error("[Worker] --require-docker was provided without --docker.");
+    console.error("[WorkerPals] --require-docker was provided without --docker.");
     process.exit(1);
   }
 
   workerLoop(opts, dockerExecutor).catch((err) => {
-    console.error("[Worker] Fatal:", err);
+    console.error("[WorkerPals] Fatal:", err);
     process.exit(1);
   });
 }

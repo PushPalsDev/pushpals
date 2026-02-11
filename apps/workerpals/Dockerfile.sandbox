@@ -28,8 +28,8 @@ RUN python3 -m venv /opt/openhands-venv \
         openhands-tools
 
 ENV PATH="/opt/openhands-venv/bin:${PATH}"
-ENV WORKER_OPENHANDS_PYTHON="/opt/openhands-venv/bin/python"
-ENV WORKER_OPENHANDS_WORKSPACE_PYTHON="/opt/openhands-venv/bin/python3"
+ENV WORKERPALS_OPENHANDS_PYTHON="/opt/openhands-venv/bin/python"
+ENV WORKERPALS_OPENHANDS_WORKSPACE_PYTHON="/opt/openhands-venv/bin/python3"
 
 # Configure git for the worker
 RUN git config --global user.name "PushPals Worker" \
@@ -53,4 +53,4 @@ RUN cd packages/protocol && bun run build
 WORKDIR /workspace
 
 # Default entrypoint runs the job runner with base64-encoded job spec
-ENTRYPOINT ["bun", "run", "/workspace/apps/worker/src/job_runner.ts"]
+ENTRYPOINT ["bun", "run", "/workspace/apps/workerpals/src/job_runner.ts"]

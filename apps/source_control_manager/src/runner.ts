@@ -1,5 +1,5 @@
 import type { MergeJob, MergeQueueDB } from "./db";
-import type { CheckConfig, SerialPusherConfig } from "./config";
+import type { CheckConfig, SourceControlManagerConfig } from "./config";
 import { GitOps } from "./git";
 
 /**
@@ -57,9 +57,9 @@ async function runCheck(
 
 export class JobRunner {
   private gitOps: GitOps;
-  private config: SerialPusherConfig;
+  private config: SourceControlManagerConfig;
 
-  constructor(config: SerialPusherConfig) {
+  constructor(config: SourceControlManagerConfig) {
     this.config = config;
     this.gitOps = new GitOps(config);
   }
@@ -85,7 +85,7 @@ export class JobRunner {
    *   - Push rejected:  requeue (integration branch advanced mid-run)
    */
   async processJob(job: MergeJob, db: MergeQueueDB): Promise<RunResult> {
-    const tempBranch = `_serial-pusher/${job.id}`;
+    const tempBranch = `_source_control_manager/${job.id}`;
     const mainBefore = await this._safeGetMainSha();
 
     try {
@@ -94,8 +94,8 @@ export class JobRunner {
       db.addLog(job.id, `Starting processing of ${job.branch}`);
       await this.gitOps.resetToClean();
 
-      // ── Step 2: Update main ───────────────────────────────────────────
-      log(job.id, "Updating main branch");
+      // ── Step 2: Update integration branch ─────────────────────────────
+      log(job.id, "Updating integration branch");
       await this.gitOps.fetchPrune();
       await this.gitOps.checkoutMain();
       await this.gitOps.pullMainFF();
@@ -138,10 +138,10 @@ export class JobRunner {
       // ── Step 3: Already merged? ───────────────────────────────────────
       const alreadyMerged = await this.gitOps.isMerged(job.branch);
       if (alreadyMerged) {
-        log(job.id, "Branch already merged into main, skipping");
-        db.addLog(job.id, "Branch already merged into main");
-        db.markSkipped(job.id, "Already merged into main");
-        return { status: "skipped", message: "Already merged into main" };
+        log(job.id, `Branch already merged into ${this.config.mainBranch}, skipping`);
+        db.addLog(job.id, `Branch already merged into ${this.config.mainBranch}`);
+        db.markSkipped(job.id, `Already merged into ${this.config.mainBranch}`);
+        return { status: "skipped", message: `Already merged into ${this.config.mainBranch}` };
       }
 
       // ── Step 4: Create temp branch ────────────────────────────────────
@@ -153,7 +153,7 @@ export class JobRunner {
       db.addLog(job.id, "Applying agent changes");
 
       // Build merge commit message — include shortlog for readability
-      let mergeMsg = `merge: ${job.branch}\n\nSerial-pusher job #${job.id}`;
+      let mergeMsg = `merge: ${job.branch}\n\nSourceControlManager job #${job.id}`;
       if (this.config.mergeStrategy === "no-ff") {
         try {
           const shortlog = await this.gitOps.shortLog(
@@ -250,16 +250,16 @@ export class JobRunner {
         db.addLog(job.id, `Check "${check.name}" passed`);
       }
 
-      // ── Step 7: Move merge to main ────────────────────────────────────
-      log(job.id, "Updating main with merged result");
+      // ── Step 7: Move merge to integration branch ──────────────────────
+      log(job.id, `Updating ${this.config.mainBranch} with merged result`);
       await this.gitOps.checkoutMain();
 
       // Log temp branch head for debugging
       const tempSha = await this.gitOps.revParse(tempBranch);
       log(job.id, `Temp branch head: ${tempSha?.slice(0, 8)}`);
 
-      // Fast-forward main to the local temp branch head (which contains the merge).
-      // This should always succeed because temp was created from main HEAD.
+      // Fast-forward integration branch to the local temp branch head.
+      // This should always succeed because temp was created from integration HEAD.
       const ffResult = await this.gitOps.mergeFFOnlyRef(tempBranch);
       if (!ffResult.ok) {
         // FF failed — this is unexpected. Instead of hard-resetting (which could
@@ -271,12 +271,12 @@ export class JobRunner {
           "warn",
         );
 
-        // Re-sync: reset main to remote/main and try FF again
+        // Re-sync: reset integration branch to remote and try FF again.
         await this.gitOps.resetToClean();
         await this.gitOps.checkoutMain();
         await this.gitOps.pullMainFF();
 
-        // Verify main is an ancestor of temp (required for FF to succeed).
+        // Verify integration branch is an ancestor of temp (required for FF to succeed).
         // Resolve both to SHAs for unambiguous comparison.
         const mainSha = await this.gitOps.revParse(this.config.mainBranch);
         const tempSha2 = await this.gitOps.revParse(tempBranch);
@@ -284,7 +284,7 @@ export class JobRunner {
           mainSha && tempSha2 ? await this.gitOps.isAncestor(mainSha, tempSha2) : false;
 
         if (!mainIsAncestorOfTemp) {
-          const msg = `Invariant violation: main (${mainSha?.slice(0, 8)}) is not an ancestor of temp (${tempSha2?.slice(0, 8)}). Cannot FF.`;
+          const msg = `Invariant violation: ${this.config.mainBranch} (${mainSha?.slice(0, 8)}) is not an ancestor of temp (${tempSha2?.slice(0, 8)}). Cannot FF.`;
           logErr(job.id, msg);
           db.addLog(job.id, msg, "error");
           db.markFailed(job.id, msg);
@@ -305,9 +305,9 @@ export class JobRunner {
         }
       }
 
-      // ── Step 8: Push main ─────────────────────────────────────────────
-      log(job.id, "Pushing main to remote");
-      db.addLog(job.id, "Pushing main");
+      // ── Step 8: Push integration branch ───────────────────────────────
+      log(job.id, `Pushing ${this.config.mainBranch} to remote`);
+      db.addLog(job.id, `Pushing ${this.config.mainBranch}`);
 
       const pushResult = await this.gitOps.pushMain();
       if (!pushResult.ok) {
@@ -337,7 +337,7 @@ export class JobRunner {
         }
 
         if (remoteAdvanced) {
-          const msg = `Push rejected: main advanced during processing, requeuing (attempt ${job.attempts}/${this.config.maxAttempts})`;
+          const msg = `Push rejected: ${this.config.mainBranch} advanced during processing, requeuing (attempt ${job.attempts}/${this.config.maxAttempts})`;
           log(job.id, msg);
           db.addLog(job.id, `${msg} (output: ${truncate(pushOutput, 200)})`, "warn");
           db.requeue(job.id);
@@ -371,8 +371,11 @@ export class JobRunner {
 
       // ── Done ──────────────────────────────────────────────────────────
       const mainAfter = await this._safeGetMainSha();
-      log(job.id, `Success: main ${mainBefore?.slice(0, 8)}..${mainAfter?.slice(0, 8)}`);
-      db.addLog(job.id, `Merged successfully. main: ${mainAfter?.slice(0, 8)}`);
+      log(
+        job.id,
+        `Success: ${this.config.mainBranch} ${mainBefore?.slice(0, 8)}..${mainAfter?.slice(0, 8)}`,
+      );
+      db.addLog(job.id, `Merged successfully. ${this.config.mainBranch}: ${mainAfter?.slice(0, 8)}`);
       db.markSuccess(job.id);
 
       return { status: "success", message: `Merged ${job.branch} into ${this.config.mainBranch}` };

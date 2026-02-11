@@ -1,10 +1,10 @@
 {
-  "name": "agent-remote",
+  "name": "remotebuddy",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "bun --watch --no-clear-screen src/index.ts",
-    "start": "bun run src/index.ts"
+    "dev": "bun --watch --no-clear-screen src/remotebuddy_main.ts",
+    "start": "bun run src/remotebuddy_main.ts"
   },
   "dependencies": {
     "protocol": "workspace:*",

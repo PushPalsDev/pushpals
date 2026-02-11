@@ -3,12 +3,12 @@
  * End-to-end smoke test for PushPals multi-agent system.
  *
  * Exercises the full pipeline:
- *   Client -> Server -> Agent-local -> Tools/Workers -> Server -> Client
+ *   Client -> Server -> LocalBuddy -> Tools/WorkerPals -> Server -> Client
  *
  * Prerequisites:
  *   1. bun run server        (port 3001)
- *   2. bun run agent-local   (connects to server)
- *   3. bun run worker        (polls job queue)
+ *   2. bun run localbuddy    (connects to server)
+ *   3. bun run workerpals    (polls job queue)
  *
  * Usage:
  *   PUSHPALS_AUTH_TOKEN=<token> bun run scripts/smoke-test.ts

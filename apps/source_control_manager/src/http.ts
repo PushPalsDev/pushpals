@@ -1,7 +1,7 @@
 import type { MergeQueueDB, MergeJobStatus } from "./db";
 
 /**
- * Small HTTP status server for the serial pusher.
+ * Small HTTP status server for SourceControlManager.
  * Provides read-only access to job status for monitoring and dashboards.
  */
 export function createStatusServer(db: MergeQueueDB, port: number): ReturnType<typeof Bun.serve> {

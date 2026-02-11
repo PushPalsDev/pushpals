@@ -1,11 +1,11 @@
 /**
- * Request Queue for enhanced prompts from Local Agent → Remote Agent
+ * Request Queue for enhanced prompts from LocalBuddy -> RemoteBuddy
  *
  * Flow:
- *   1. Local Agent enhances user message with LLM + repo context
- *   2. Local Agent enqueues to this queue
- *   3. Remote Agent polls and claims requests
- *   4. Remote Agent processes and marks complete/failed
+ *   1. LocalBuddy enhances user message with LLM + repo context
+ *   2. LocalBuddy enqueues to this queue
+ *   3. RemoteBuddy polls and claims requests
+ *   4. RemoteBuddy processes and marks complete/failed
  */
 
 import { Database } from "bun:sqlite";
@@ -56,7 +56,7 @@ export class RequestQueue {
   }
 
   /**
-   * Enqueue a new request from Local Agent
+   * Enqueue a new request from LocalBuddy
    */
   enqueue(body: Record<string, unknown>): { ok: boolean; requestId?: string; message?: string } {
     const sessionId = body.sessionId as string;

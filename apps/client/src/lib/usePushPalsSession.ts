@@ -1,12 +1,10 @@
 import { useEffect, useState, useCallback, useRef, useMemo, useReducer } from "react";
 import type { EventEnvelope, EventType } from "protocol/browser";
-import { CompanionModel, RemoteCompanionModel } from "./companion";
 import {
   subscribeEvents,
   createSession,
   sendMessage,
   submitApprovalDecision,
-  sendCommand,
 } from "./pushpalsApi";
 import {
   eventReducer,
@@ -23,7 +21,7 @@ import { getItem, setItem } from "./storage";
 // share the same session out of the box with zero config.
 const DEFAULT_SESSION_ID = process.env.EXPO_PUBLIC_PUSHPALS_SESSION_ID ?? "dev";
 
-// Local Agent URL for sending messages (new architecture)
+// LocalBuddy URL for sending messages (new architecture)
 const LOCAL_AGENT_URL = process.env.EXPO_PUBLIC_LOCAL_AGENT_URL ?? "http://localhost:3003";
 
 // ─── Extended event type that may include local errors ──────────────────────
@@ -36,7 +34,7 @@ export function isEnvelope(e: SessionEvent): e is EventEnvelope {
 // ─── Re-export reducer types for consumers ──────────────────────────────────
 export type { Task, Job, LogLine, ChatMessage, SessionState };
 
-// ─── Task grouping (legacy compat, now derived from reducer) ────────────────
+// ─── Task grouping derived from reducer/event stream ────────────────
 export interface TaskGroup {
   taskId: string;
   title: string;
@@ -71,7 +69,7 @@ export interface PushPalsSessionActions {
   approve: (approvalId: string) => Promise<boolean>;
   deny: (approvalId: string) => Promise<boolean>;
 
-  // Computed (legacy)
+  // Computed convenience values
   tasks: TaskGroup[];
   agents: string[];
   turnIds: string[];
@@ -141,7 +139,7 @@ export function usePushPalsSession(
           baseUrl,
           sessionId,
           (event, cursor) => {
-            // Feed legacy flat event list
+            // Feed flat event list for chat timeline rendering
             setSession((s) => ({
               ...s,
               events: [...s.events, event],
@@ -179,23 +177,14 @@ export function usePushPalsSession(
     };
   }, [baseUrl]);
 
-  // ─── Send message (with companion intent) ──────────────────────────────
-  // Note: Messages now go to Local Agent (not directly to server)
+  // ─── Send message via LocalBuddy ──────────────────────────────
+  // Note: Messages now go to LocalBuddy (not directly to server)
   const send = useCallback(
     async (text: string) => {
       if (!session.sessionId) return false;
-      const companion: CompanionModel = new RemoteCompanionModel();
-      try {
-        const intent = await companion.summarizeAndPlan({
-          userText: text,
-          history: session.events,
-        });
-        return sendMessage(LOCAL_AGENT_URL, session.sessionId, text, intent as any);
-      } catch (_err) {
-        return sendMessage(LOCAL_AGENT_URL, session.sessionId, text);
-      }
+      return sendMessage(LOCAL_AGENT_URL, text);
     },
-    [session.sessionId, session.events],
+    [session.sessionId],
   );
 
   // ─── Approve / Deny ────────────────────────────────────────────────────

@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "bun --watch --no-clear-screen src/index.ts",
+    "dev": "bun --watch --no-clear-screen src/server_main.ts",
     "build": "tsc",
-    "start": "bun run src/index.ts"
+    "start": "bun run src/server_main.ts"
   },
   "dependencies": {
     "protocol": "workspace:*"

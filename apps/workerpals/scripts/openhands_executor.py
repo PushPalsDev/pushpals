@@ -22,7 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ "
@@ -122,7 +122,7 @@ def _to_int(value: Any, default: int) -> int:
 def _python_cmd(script: str) -> str:
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     python_bin = shlex.quote(
-        str((os.environ.get("WORKER_OPENHANDS_WORKSPACE_PYTHON") or "python3"))
+        str((os.environ.get("WORKERPALS_OPENHANDS_WORKSPACE_PYTHON") or "python3"))
     )
     return (
         f"{python_bin} - <<'PY'\n"
@@ -143,6 +143,189 @@ def _parse_workspace_result(result: Any) -> Tuple[int, str, str]:
     stdout = str(getattr(result, "stdout", "") or "")
     stderr = str(getattr(result, "stderr", "") or "")
     return exit_code, stdout, stderr
+
+
+def _extract_target_path_from_instruction(instruction: str) -> str:
+    target_path = ""
+    m = re.search(
+        r"(?:file\s+(?:called|named)|create\s+(?:a\s+)?file|write\s+(?:to|into))\s+[\"'`]?(?P<path>[^\"'`\s]+)",
+        instruction,
+        flags=re.I,
+    )
+    if m:
+        target_path = str(m.group("path") or "").strip().rstrip(".,!?;:")
+    return target_path
+
+
+def _normalize_base_url(raw: str) -> str:
+    base = raw.strip()
+    if not base:
+        return ""
+    base = base.rstrip("/")
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
+    return base
+
+
+def _looks_local_base_url(base_url: str) -> bool:
+    if not base_url:
+        return False
+    lowered = base_url.lower()
+    return (
+        "localhost" in lowered
+        or "127.0.0.1" in lowered
+        or "host.docker.internal" in lowered
+    )
+
+
+def _resolve_llm_config() -> Tuple[str, str, str]:
+    model = (
+        os.environ.get("WORKERPALS_OPENHANDS_MODEL")
+        or os.environ.get("LLM_MODEL")
+        or os.environ.get("OPENAI_MODEL")
+        or ""
+    ).strip()
+    api_key = (
+        os.environ.get("WORKERPALS_OPENHANDS_API_KEY")
+        or os.environ.get("LLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or ""
+    ).strip()
+    base_url = _normalize_base_url(
+        (
+            os.environ.get("WORKERPALS_OPENHANDS_BASE_URL")
+            or os.environ.get("LLM_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("LLM_ENDPOINT")
+            or ""
+        )
+    )
+    return model, api_key, base_url
+
+
+def _summarize_git_changes(repo: str) -> List[str]:
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return []
+        paths: List[str] = []
+        for line in proc.stdout.splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            path = clean[3:] if len(clean) > 3 else clean
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            if path:
+                paths.append(path)
+        return paths
+    except Exception:
+        return []
+
+
+def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
+    try:
+        from openhands.sdk import Agent, Conversation, LLM, Tool
+        from openhands.tools.file_editor import FileEditorTool
+        from openhands.tools.task_tracker import TaskTrackerTool
+        from openhands.tools.terminal import TerminalTool
+    except Exception as exc:
+        return {
+            "ok": False,
+            "summary": "OpenHands agent mode unavailable in worker runtime",
+            "stderr": str(exc),
+            "exitCode": 3,
+        }
+
+    model, api_key, base_url = _resolve_llm_config()
+    if not model:
+        return {
+            "ok": False,
+            "summary": (
+                "task.execute requires an LLM model for agentic execution. "
+                "Set WORKERPALS_OPENHANDS_MODEL or LLM_MODEL."
+            ),
+            "stderr": "",
+            "exitCode": 2,
+        }
+
+    if not api_key:
+        if _looks_local_base_url(base_url):
+            api_key = "local"
+        else:
+            return {
+                "ok": False,
+                "summary": (
+                    "task.execute agent mode requires an API key. "
+                    "Set WORKERPALS_OPENHANDS_API_KEY / LLM_API_KEY / OPENAI_API_KEY."
+                ),
+                "stderr": "",
+                "exitCode": 2,
+            }
+
+    llm_kwargs: Dict[str, Any] = {"model": model, "api_key": api_key}
+    if base_url:
+        llm_kwargs["base_url"] = base_url
+
+    try:
+        llm = LLM(**llm_kwargs)
+        tools = [
+            Tool(name=TerminalTool.name),
+            Tool(name=FileEditorTool.name),
+            Tool(name=TaskTrackerTool.name),
+        ]
+        agent = Agent(llm=llm, tools=tools)
+        conversation = Conversation(agent=agent, workspace=repo)
+
+        system_prompt = (
+            "You are an autonomous coding worker operating inside a git repository. "
+            "Apply the requested code changes directly in files. "
+            "Do not return architecture summaries unless explicitly requested. "
+            "Prefer precise edits over broad rewrites. "
+            "After editing, run minimal validation commands relevant to your changes."
+        )
+        conversation.send_message(f"{system_prompt}\n\nTask:\n{instruction}")
+
+        max_steps = max(1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_AGENT_MAX_STEPS"), 30))
+        try:
+            conversation.run(max_steps=max_steps)
+        except TypeError:
+            # SDK versions differ; fall back to default run() signature.
+            conversation.run()
+
+        changed_paths = _summarize_git_changes(repo)
+        if changed_paths:
+            listed = "\n".join(f"- {path}" for path in changed_paths[:40])
+            if len(changed_paths) > 40:
+                listed += "\n- ..."
+            return {
+                "ok": True,
+                "summary": f"Executed task and modified {len(changed_paths)} file(s)",
+                "stdout": f"Changed files:\n{listed}",
+                "stderr": "",
+                "exitCode": 0,
+            }
+        return {
+            "ok": True,
+            "summary": "Executed task via OpenHands agent (no file changes detected)",
+            "stdout": "No modified files were detected after execution.",
+            "stderr": "",
+            "exitCode": 0,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "summary": "OpenHands agent task execution failed",
+            "stderr": str(exc),
+            "exitCode": 1,
+        }
 
 
 def _job_to_command(kind: str, params: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
@@ -304,13 +487,7 @@ print("\\n".join(lines).strip() + "\\n")
         instruction = str(req("instruction"))
         target_path = str(params.get("targetPath") or params.get("path") or "").strip()
         if not target_path:
-            m = re.search(
-                r"(?:file\s+(?:called|named)|create\s+(?:a\s+)?file|write\s+(?:to|into))\s+[\"'`]?(?P<path>[^\"'`\s]+)",
-                instruction,
-                flags=re.I,
-            )
-            if m:
-                target_path = str(m.group("path") or "").strip().rstrip(".,!?;:")
+            target_path = _extract_target_path_from_instruction(instruction)
         if not target_path:
             raise ValueError("task.execute requires targetPath (or a file name in instruction)")
 
@@ -591,6 +768,20 @@ def main() -> int:
         return _fail("Invalid payload: 'params' must be an object", exit_code=2)
     if not isinstance(repo, str) or not repo:
         return _fail("Invalid payload: missing 'repo'", exit_code=2)
+
+    if kind == "task.execute":
+        instruction = str(
+            params.get("instruction") or params.get("enhancedPrompt") or ""
+        ).strip()
+        if not instruction:
+            return _fail("task.execute requires 'instruction'", exit_code=2)
+        target_path = str(params.get("targetPath") or params.get("path") or "").strip()
+        if not target_path:
+            target_path = _extract_target_path_from_instruction(instruction)
+        if not target_path:
+            result = _run_agentic_task_execute(repo, instruction)
+            _emit(result)
+            return 0 if bool(result.get("ok")) else _to_int(result.get("exitCode"), 1)
 
     try:
         from openhands.sdk import Workspace

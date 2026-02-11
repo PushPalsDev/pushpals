@@ -3,7 +3,7 @@ import Database from "bun:sqlite";
 import { ShellManager } from "./shell_manager";
 
 const db = new Database("./test_shell_sessions.db");
-const workerId = "worker-test-123";
+const workerId = "workerpal-test-123";
 const shellMgr = new ShellManager(db, workerId);
 
 const sessionId = "session-test-abc";

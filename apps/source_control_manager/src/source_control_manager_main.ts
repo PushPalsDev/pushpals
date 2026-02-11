@@ -10,7 +10,7 @@ import {
   loadConfig,
   applyCliOverrides,
   validateConfig,
-  type SerialPusherConfig,
+  type SourceControlManagerConfig,
   type CheckConfig,
 } from "./config";
 
@@ -22,7 +22,11 @@ type GitCmdResult = {
 };
 
 const repoRoot = resolve(import.meta.dir, "..", "..", "..");
-const defaultSerialPusherRepoPath = join(repoRoot, ".worktrees", "serial-pusher");
+const defaultSourceControlManagerRepoPath = join(
+  repoRoot,
+  ".worktrees",
+  "source_control_manager",
+);
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -48,21 +52,21 @@ const { values: args } = parseArgs({
 
 if (args.help) {
   console.log(`
-serial-pusher — Git merge queue daemon
+source_control_manager — SourceControlManager merge queue daemon
 
 Usage:
-  bun run apps/serial-pusher/src/index.ts [options]
+  bun run apps/source_control_manager/src/source_control_manager_main.ts [options]
 
 Options:
-  -c, --config <path>       Config file path (default: serial-pusher.config.json)
-  -r, --repo <path>         Git repository path (default: $SERIAL_PUSHER_REPO_PATH or <repo>/.worktrees/serial-pusher)
+  -c, --config <path>       Config file path (default: source_control_manager.config.json)
+  -r, --repo <path>         Git repository path (default: $SOURCE_CONTROL_MANAGER_REPO_PATH or <repo>/.worktrees/source_control_manager)
   -s, --server <url>        PushPals server URL (default: http://localhost:3001)
   -p, --port <number>       HTTP status server port (default: 3002)
       --remote <name>       Git remote (default: origin)
   -b, --branch <name>       Integration branch name (default: $PUSHPALS_INTEGRATION_BRANCH or main_agents)
       --prefix <prefix>     Agent branch prefix (default: agent/)
   -i, --interval <seconds>  Poll interval in seconds (default: 10)
-      --state-dir <path>    State directory for DB & lock (default: $PUSHPALS_DATA_DIR/serial-pusher)
+      --state-dir <path>    State directory for DB & lock (default: $PUSHPALS_DATA_DIR/source_control_manager)
       --delete-after-merge  Delete remote branch after merge
       --dry-run             Discover and enqueue only, do not process
       --skip-clean-check    Skip the clean-repo guard (for dev working copies)
@@ -80,8 +84,8 @@ const configPath =
 function resolveConfigPath(): string | undefined {
   if (configPath) return configPath;
   const candidates = [
-    resolve("serial-pusher.config.json"),
-    resolve("apps/serial-pusher/serial-pusher.config.json"),
+    resolve("source_control_manager.config.json"),
+    resolve("apps/source_control_manager/source_control_manager.config.json"),
   ];
   for (const c of candidates) {
     if (existsSync(c)) return c;
@@ -92,7 +96,7 @@ function resolveConfigPath(): string | undefined {
 const resolvedConfig = resolveConfigPath();
 let config = loadConfig(resolvedConfig);
 
-const cliOverrides: Partial<SerialPusherConfig> = {};
+const cliOverrides: Partial<SourceControlManagerConfig> = {};
 if (typeof args.repo === "string") cliOverrides.repoPath = resolve(args.repo);
 if (typeof args.server === "string") cliOverrides.serverUrl = args.server;
 if (typeof args.port === "string") {
@@ -122,9 +126,11 @@ config.repoPath = resolve(config.repoPath);
 const integrationBaseBranch = (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || "main";
 const integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
 const hasRepoPathOverride =
-  typeof args.repo === "string" || (process.env.SERIAL_PUSHER_REPO_PATH ?? "").trim().length > 0;
+  typeof args.repo === "string" ||
+  (process.env.SOURCE_CONTROL_MANAGER_REPO_PATH ?? "").trim().length > 0;
 const usingDefaultRepoPath =
-  !hasRepoPathOverride && resolve(config.repoPath) === resolve(defaultSerialPusherRepoPath);
+  !hasRepoPathOverride &&
+  resolve(config.repoPath) === resolve(defaultSourceControlManagerRepoPath);
 
 // Validate config before proceeding
 try {
@@ -138,7 +144,7 @@ const dryRun = args["dry-run"] === true;
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const skipCleanCheckFlag = args["skip-clean-check"] === true;
 const skipCleanCheckEnv = TRUTHY.has(
-  (process.env.SERIAL_PUSHER_SKIP_CLEAN_CHECK ?? "").toLowerCase(),
+  (process.env.SOURCE_CONTROL_MANAGER_SKIP_CLEAN_CHECK ?? "").toLowerCase(),
 );
 const skipCleanCheck = skipCleanCheckFlag || skipCleanCheckEnv;
 
@@ -146,7 +152,7 @@ const skipCleanCheck = skipCleanCheckFlag || skipCleanCheckEnv;
 
 const ts = () => new Date().toISOString();
 
-console.log(`[${ts()}] serial-pusher starting`);
+console.log(`[${ts()}] source_control_manager starting`);
 console.log(`[${ts()}]   config:   ${resolvedConfig ?? "(defaults)"}`);
 console.log(`[${ts()}]   repo:     ${config.repoPath}`);
 console.log(`[${ts()}]   remote:   ${config.remote}`);
@@ -160,7 +166,7 @@ if (dryRun) console.log(`[${ts()}]   mode:     DRY RUN`);
 if (skipCleanCheck) {
   const source = skipCleanCheckFlag
     ? "--skip-clean-check flag"
-    : "SERIAL_PUSHER_SKIP_CLEAN_CHECK env";
+    : "SOURCE_CONTROL_MANAGER_SKIP_CLEAN_CHECK env";
   console.log(`[${ts()}]   mode:     SKIP CLEAN CHECK (${source})`);
 }
 
@@ -171,7 +177,7 @@ mkdirSync(config.stateDir, { recursive: true });
 
 const lock = new FileLock(config.stateDir);
 if (!lock.acquire()) {
-  console.error(`[${ts()}] Another serial-pusher instance is already running. Exiting.`);
+  console.error(`[${ts()}] Another source_control_manager instance is already running. Exiting.`);
   process.exit(1);
 }
 console.log(`[${ts()}] Lock acquired`);
@@ -217,7 +223,7 @@ function createSessionComm(sessionId: string): CommunicationManager {
     serverUrl: config.serverUrl,
     sessionId,
     authToken: config.authToken,
-    from: "agent:serial-pusher",
+    from: "agent:source_control_manager",
   });
 }
 
@@ -228,7 +234,7 @@ async function emitPusherMessage(
 ): Promise<void> {
   const ok = await comm.assistantMessage(text, { correlationId });
   if (!ok) {
-    console.error(`[${ts()}] Failed to emit serial-pusher message: ${text}`);
+    console.error(`[${ts()}] Failed to emit source_control_manager message: ${text}`);
   }
 }
 
@@ -240,7 +246,7 @@ async function tick(): Promise<void> {
       headers["Authorization"] = `Bearer ${config.authToken}`;
     }
 
-    const pusherId = `pusher-${Math.random().toString(36).substring(2, 10)}`;
+    const pusherId = `source_control_manager-${Math.random().toString(36).substring(2, 10)}`;
 
     const response = await fetch(`${config.serverUrl}/completions/claim`, {
       method: "POST",
@@ -283,7 +289,7 @@ async function tick(): Promise<void> {
     );
     await emitPusherMessage(
       comm,
-      `Serial pusher claimed worker completion ${completion.id.slice(0, 8)} from ${completion.branch}.`,
+      `SourceControlManager claimed WorkerPal completion ${completion.id.slice(0, 8)} from ${completion.branch}.`,
       completion.id,
     );
 
@@ -291,7 +297,7 @@ async function tick(): Promise<void> {
       console.log(`[${ts()}] Dry run mode — skipping processing`);
       await emitPusherMessage(
         comm,
-        `Serial pusher is in dry-run mode, so completion ${completion.id.slice(0, 8)} was not applied.`,
+        `SourceControlManager is in dry-run mode, so completion ${completion.id.slice(0, 8)} was not applied.`,
         completion.id,
       );
       return;
@@ -304,7 +310,7 @@ async function tick(): Promise<void> {
       await gitOps.fetchPrune();
 
       // 2. Create temp branch and apply worker completion
-      const tempBranch = `_serial-pusher/${completion.id}`;
+      const tempBranch = `_source_control_manager/${completion.id}`;
       console.log(`[${ts()}] Creating temp branch ${tempBranch}...`);
 
       await gitOps.resetToClean();
@@ -488,7 +494,7 @@ async function runGitCapture(args: string[], cwd = repoRoot): Promise<GitCmdResu
   }
 }
 
-async function ensureDefaultSerialPusherWorktree(): Promise<void> {
+async function ensureDefaultSourceControlManagerWorktree(): Promise<void> {
   if (!usingDefaultRepoPath) return;
 
   const probe = await runGitCapture(["-C", config.repoPath, "rev-parse", "--is-inside-work-tree"]);
@@ -530,14 +536,14 @@ async function ensureDefaultSerialPusherWorktree(): Promise<void> {
 
   if (!addResult.ok) {
     throw new Error(
-      `Failed to create default serial-pusher worktree (${config.repoPath}) from ${seedRef}: ${
+      `Failed to create default source_control_manager worktree (${config.repoPath}) from ${seedRef}: ${
         addResult.stderr || addResult.stdout
       }`,
     );
   }
 
   console.log(
-    `[${ts()}] Created default serial-pusher worktree: ${config.repoPath} (seed: ${seedRef})`,
+    `[${ts()}] Created default source_control_manager worktree: ${config.repoPath} (seed: ${seedRef})`,
   );
 }
 
@@ -547,7 +553,7 @@ function ensureRepoPathIsIsolatedWorktree(): void {
   const insideWorktrees = rel === ".worktrees" || rel.startsWith(".worktrees/");
   if (insideRepoRoot && !insideWorktrees) {
     throw new Error(
-      `Unsafe serial-pusher repoPath (${config.repoPath}). Use a dedicated worktree path (recommended: ${defaultSerialPusherRepoPath}) so your active workspace branch is never switched.`,
+      `Unsafe source_control_manager repoPath (${config.repoPath}). Use a dedicated worktree path (recommended: ${defaultSourceControlManagerRepoPath}) so your active workspace branch is never switched.`,
     );
   }
 }
@@ -559,14 +565,14 @@ async function ensureIntegrationBranchExists(): Promise<void> {
   console.warn(`[${ts()}] Integration branch ${remoteRef} does not exist.`);
 
   const autoCreate = TRUTHY.has(
-    (process.env.SERIAL_PUSHER_AUTO_CREATE_MAIN_BRANCH ?? "").toLowerCase(),
+    (process.env.SOURCE_CONTROL_MANAGER_AUTO_CREATE_MAIN_BRANCH ?? "").toLowerCase(),
   );
 
   let approved = autoCreate;
   if (!approved) {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
       throw new Error(
-        `Missing ${remoteRef}. Re-run interactively to approve creation, or set SERIAL_PUSHER_AUTO_CREATE_MAIN_BRANCH=1.`,
+        `Missing ${remoteRef}. Re-run interactively to approve creation, or set SOURCE_CONTROL_MANAGER_AUTO_CREATE_MAIN_BRANCH=1.`,
       );
     }
 
@@ -581,12 +587,12 @@ async function ensureIntegrationBranchExists(): Promise<void> {
 
   await gitOps.bootstrapMainBranchFromBase();
   console.log(
-    `[${ts()}] Created ${remoteRef}; serial-pusher local integration branch is based on ${integrationBaseRef}.`,
+    `[${ts()}] Created ${remoteRef}; source_control_manager local integration branch is based on ${integrationBaseRef}.`,
   );
 }
 
 async function main(): Promise<void> {
-  await ensureDefaultSerialPusherWorktree();
+  await ensureDefaultSourceControlManagerWorktree();
   ensureRepoPathIsIsolatedWorktree();
   // ── Startup safety check ──────────────────────────────────────────────
   // Skip source is already logged in the boot banner (mode: SKIP CLEAN CHECK).
@@ -614,7 +620,7 @@ async function main(): Promise<void> {
       console.error(
         `[${ts()}] ERROR: Repository at ${config.repoPath} has uncommitted or untracked changes.`,
       );
-      console.error(`[${ts()}] The serial-pusher requires a dedicated clean clone. Exiting.`);
+      console.error(`[${ts()}] SourceControlManager requires a dedicated clean clone. Exiting.`);
       console.error(`[${ts()}] WARNING: Do not run this daemon in a developer working copy.`);
       console.error(`[${ts()}] TIP: Pass --skip-clean-check to bypass this guard in dev.`);
       shutdown();

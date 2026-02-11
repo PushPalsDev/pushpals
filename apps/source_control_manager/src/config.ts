@@ -14,9 +14,9 @@ export interface CheckConfig {
 }
 
 /**
- * Serial pusher configuration.
+ * SourceControlManager configuration.
  */
-export interface SerialPusherConfig {
+export interface SourceControlManagerConfig {
   /** Absolute path to the git repository to manage. */
   repoPath: string;
   /** PushPals server URL. Default: "http://localhost:3001". */
@@ -55,41 +55,45 @@ export interface SerialPusherConfig {
 
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..");
-const DEFAULT_SERIAL_PUSHER_REPO_PATH = join(REPO_ROOT, ".worktrees", "serial-pusher");
+const DEFAULT_SOURCE_CONTROL_MANAGER_REPO_PATH = join(
+  REPO_ROOT,
+  ".worktrees",
+  "source_control_manager",
+);
 
-const DEFAULTS: SerialPusherConfig = {
-  repoPath: process.env.SERIAL_PUSHER_REPO_PATH
-    ? resolve(process.env.SERIAL_PUSHER_REPO_PATH)
-    : DEFAULT_SERIAL_PUSHER_REPO_PATH,
+const DEFAULTS: SourceControlManagerConfig = {
+  repoPath: process.env.SOURCE_CONTROL_MANAGER_REPO_PATH
+    ? resolve(process.env.SOURCE_CONTROL_MANAGER_REPO_PATH)
+    : DEFAULT_SOURCE_CONTROL_MANAGER_REPO_PATH,
   serverUrl: process.env.PUSHPALS_SERVER_URL ?? "http://localhost:3001",
   remote: "origin",
   mainBranch:
-    process.env.SERIAL_PUSHER_MAIN_BRANCH ??
+    process.env.SOURCE_CONTROL_MANAGER_MAIN_BRANCH ??
     process.env.PUSHPALS_INTEGRATION_BRANCH ??
     "main_agents",
   branchPrefix: "agent/",
   pollIntervalSeconds: 10,
   checks: [],
   stateDir: process.env.PUSHPALS_DATA_DIR
-    ? join(process.env.PUSHPALS_DATA_DIR, "serial-pusher")
-    : join(REPO_ROOT, "outputs", "data", "serial-pusher"),
+    ? join(process.env.PUSHPALS_DATA_DIR, "source_control_manager")
+    : join(REPO_ROOT, "outputs", "data", "source_control_manager"),
   port: 3002,
   deleteAfterMerge: false,
   maxAttempts: 3,
   mergeStrategy: "cherry-pick",
-  pushMainAfterMerge: !TRUTHY.has((process.env.SERIAL_PUSHER_NO_PUSH ?? "").toLowerCase()),
+  pushMainAfterMerge: !TRUTHY.has((process.env.SOURCE_CONTROL_MANAGER_NO_PUSH ?? "").toLowerCase()),
   authToken: process.env.PUSHPALS_AUTH_TOKEN,
 };
 
 /**
  * Load config from a JSON file, merging with defaults.
  */
-export function loadConfig(configPath?: string): SerialPusherConfig {
-  let fileConfig: Partial<SerialPusherConfig> = {};
+export function loadConfig(configPath?: string): SourceControlManagerConfig {
+  let fileConfig: Partial<SourceControlManagerConfig> = {};
 
   if (configPath && existsSync(configPath)) {
     const raw = readFileSync(configPath, "utf-8");
-    fileConfig = JSON.parse(raw) as Partial<SerialPusherConfig>;
+    fileConfig = JSON.parse(raw) as Partial<SourceControlManagerConfig>;
   }
 
   return { ...DEFAULTS, ...fileConfig };
@@ -99,9 +103,9 @@ export function loadConfig(configPath?: string): SerialPusherConfig {
  * Apply CLI overrides on top of loaded config.
  */
 export function applyCliOverrides(
-  config: SerialPusherConfig,
-  overrides: Partial<SerialPusherConfig>,
-): SerialPusherConfig {
+  config: SourceControlManagerConfig,
+  overrides: Partial<SourceControlManagerConfig>,
+): SourceControlManagerConfig {
   const merged = { ...config };
 
   for (const [key, value] of Object.entries(overrides)) {
@@ -117,7 +121,7 @@ export function applyCliOverrides(
  * Validate critical config fields. Throws on invalid values.
  * Call once at startup to catch misconfigurations early.
  */
-export function validateConfig(config: SerialPusherConfig): void {
+export function validateConfig(config: SourceControlManagerConfig): void {
   if (
     typeof config.port !== "number" ||
     !Number.isFinite(config.port) ||

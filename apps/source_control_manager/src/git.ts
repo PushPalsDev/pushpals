@@ -1,4 +1,4 @@
-import type { SerialPusherConfig } from "./config";
+import type { SourceControlManagerConfig } from "./config";
 
 /**
  * Result from a spawned git command.
@@ -93,11 +93,11 @@ export class GitOps {
   private branchPrefix: string;
   private githubToken: string | null;
 
-  constructor(config: SerialPusherConfig) {
+  constructor(config: SourceControlManagerConfig) {
     this.repoPath = config.repoPath;
     this.remote = config.remote;
     this.mainBranch = config.mainBranch;
-    this.localMainBranch = `_serial-pusher/local/${sanitizeBranchComponent(config.mainBranch)}`;
+    this.localMainBranch = `_source_control_manager/local/${sanitizeBranchComponent(config.mainBranch)}`;
     this.integrationBaseBranch =
       (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || "main";
     this.branchPrefix = config.branchPrefix;
@@ -118,7 +118,7 @@ export class GitOps {
    *
    * Preference order:
    * 1) remote integration branch (normal steady-state)
-   * 2) local serial-pusher integration branch
+   * 2) local SourceControlManager integration branch
    * 3) remote/HEAD (bootstrap integration branch from remote default branch)
    * 4) HEAD (last-resort bootstrap)
    */
@@ -131,13 +131,13 @@ export class GitOps {
     const remoteHead = `${this.remote}/HEAD`;
     if (await this.revParse(remoteHead)) {
       console.warn(
-        `[serial-pusher] ${remoteMain} not found; bootstrapping ${this.mainBranch} from ${remoteHead}.`,
+        `[source_control_manager] ${remoteMain} not found; bootstrapping ${this.mainBranch} from ${remoteHead}.`,
       );
       return remoteHead;
     }
 
     console.warn(
-      `[serial-pusher] ${remoteMain} and ${this.localMainBranch} not found; bootstrapping from HEAD.`,
+      `[source_control_manager] ${remoteMain} and ${this.localMainBranch} not found; bootstrapping from HEAD.`,
     );
     return "HEAD";
   }
@@ -174,7 +174,7 @@ export class GitOps {
   /**
    * Bootstrap the integration branch when it doesn't yet exist on remote.
    *
-   * Creates/resets local serial-pusher branch from `origin/<integration-base-branch>`,
+   * Creates/resets local SourceControlManager branch from `origin/<integration-base-branch>`,
    * sets upstream to that base ref, then pushes it to remote `<mainBranch>`.
    */
   async bootstrapMainBranchFromBase(): Promise<void> {
@@ -217,7 +217,7 @@ export class GitOps {
       await this.fetchPrune();
       if (await this.revParse(this.remoteMainRef())) {
         console.warn(
-          `[serial-pusher] Push failed while bootstrapping ${this.mainBranch}, but remote branch now exists.`,
+          `[source_control_manager] Push failed while bootstrapping ${this.mainBranch}, but remote branch now exists.`,
         );
         return;
       }
@@ -290,7 +290,7 @@ export class GitOps {
     const remoteMain = this.remoteMainRef();
     if (!(await this.revParse(remoteMain))) {
       console.warn(
-        `[serial-pusher] Skipping pull: remote branch ${remoteMain} does not exist yet.`,
+        `[source_control_manager] Skipping pull: remote branch ${remoteMain} does not exist yet.`,
       );
       return;
     }
@@ -306,13 +306,13 @@ export class GitOps {
   async syncMainWithBaseBranch(): Promise<void> {
     const baseRef = this.integrationBaseRef();
     if (!(await this.revParse(baseRef))) {
-      console.warn(`[serial-pusher] Skipping base sync: ${baseRef} does not exist.`);
+      console.warn(`[source_control_manager] Skipping base sync: ${baseRef} does not exist.`);
       return;
     }
 
     if (!(await this.revParse(this.localMainBranch))) {
       console.warn(
-        `[serial-pusher] Skipping base sync: local integration branch ${this.localMainBranch} is missing.`,
+        `[source_control_manager] Skipping base sync: local integration branch ${this.localMainBranch} is missing.`,
       );
       return;
     }
@@ -434,7 +434,7 @@ export class GitOps {
     const resetTarget = remoteSha ? remoteRef : this.localMainBranch;
     if (!remoteSha) {
       console.warn(
-        `[serial-pusher] Remote-tracking ref ${remoteRef} not found; using local ${this.localMainBranch}.`,
+        `[source_control_manager] Remote-tracking ref ${remoteRef} not found; using local ${this.localMainBranch}.`,
       );
     }
 

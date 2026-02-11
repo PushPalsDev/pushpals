@@ -3,7 +3,7 @@
  * Stable start entrypoint.
  *
  * `bun run start` can be invoked with accidental extra CLI flags (e.g. `-c`)
- * from shells/aliases. This wrapper intentionally ignores forwarded args and
+ * from shell wrappers. This wrapper intentionally ignores forwarded args and
  * always launches `dev:full` with the canonical script options.
  *
  * It also ensures the worker Docker image exists before launching the stack.
@@ -22,10 +22,14 @@ const DEFAULT_INTEGRATION_BASE_BRANCH = "main";
 const INTEGRATION_BASE_BRANCH =
   (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BASE_BRANCH;
 const INTEGRATION_BASE_REMOTE_REF = `origin/${INTEGRATION_BASE_BRANCH}`;
-const workerImage = process.env.WORKER_DOCKER_IMAGE ?? DEFAULT_IMAGE;
+const workerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? DEFAULT_IMAGE;
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
-const DEFAULT_SERIAL_PUSHER_WORKTREE = resolve(repoRoot, ".worktrees", "serial-pusher");
+const DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE = resolve(
+  repoRoot,
+  ".worktrees",
+  "source_control_manager",
+);
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 
 function envTruthy(name: string): boolean {
@@ -111,15 +115,15 @@ async function promptYesNo(question: string): Promise<boolean> {
 
 async function ensureGitHubAuth(force = false): Promise<void> {
   const skipCheck = envTruthy("PUSHPALS_SKIP_GH_AUTH_CHECK");
-  const serialPusherPushDisabled = envTruthy("SERIAL_PUSHER_NO_PUSH");
-  if (!force && (skipCheck || serialPusherPushDisabled)) {
+  const sourceControlManagerPushDisabled = envTruthy("SOURCE_CONTROL_MANAGER_NO_PUSH");
+  if (!force && (skipCheck || sourceControlManagerPushDisabled)) {
     return;
   }
 
   const gitToken =
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
   if (gitToken) {
-    // Token auth is enough for serial-pusher git push; no `gh` required.
+    // Token auth is enough for SourceControlManager git push; no `gh` required.
     process.env.PUSHPALS_GIT_TOKEN = gitToken;
     return;
   }
@@ -144,10 +148,10 @@ async function ensureGitHubAuth(force = false): Promise<void> {
     return;
   }
 
-  console.error("[start] Serial pusher push is enabled but no GitHub auth is configured.");
+  console.error("[start] SourceControlManager push is enabled but no GitHub auth is configured.");
   console.error("[start] Provide one of: PUSHPALS_GIT_TOKEN, GITHUB_TOKEN, GH_TOKEN.");
   console.error(
-    "[start] Or install GitHub CLI (`gh`) for interactive login, or disable push via SERIAL_PUSHER_NO_PUSH=1.",
+    "[start] Or install GitHub CLI (`gh`) for interactive login, or disable push via SOURCE_CONTROL_MANAGER_NO_PUSH=1.",
   );
   process.exit(1);
 }
@@ -198,14 +202,12 @@ async function ensureIntegrationBranch(): Promise<void> {
       process.exit(setUpstream.exitCode || 1);
     }
 
-    process.env.WORKER_BASE_REF = process.env.WORKER_BASE_REF ?? INTEGRATION_REMOTE_REF;
+    process.env.WORKERPALS_BASE_REF = process.env.WORKERPALS_BASE_REF ?? INTEGRATION_REMOTE_REF;
     return;
   }
 
   console.warn(`[start] Required branch ${INTEGRATION_REMOTE_REF} does not exist on remote.`);
-  const autoCreate =
-    envTruthy("PUSHPALS_AUTO_CREATE_INTEGRATION_BRANCH") ||
-    envTruthy("PUSHPALS_AUTO_CREATE_MAIN_AGENTS");
+  const autoCreate = envTruthy("PUSHPALS_AUTO_CREATE_INTEGRATION_BRANCH");
 
   let approved = autoCreate;
   if (!approved) {
@@ -221,7 +223,7 @@ async function ensureIntegrationBranch(): Promise<void> {
     process.exit(1);
   }
 
-  // Branch creation requires push credentials regardless of SERIAL_PUSHER_NO_PUSH mode.
+  // Branch creation requires push credentials regardless of SOURCE_CONTROL_MANAGER_NO_PUSH mode.
   await ensureGitHubAuth(true);
 
   const ensureLocalBranch = await git([
@@ -273,22 +275,22 @@ async function ensureIntegrationBranch(): Promise<void> {
     );
   }
 
-  process.env.WORKER_BASE_REF = process.env.WORKER_BASE_REF ?? INTEGRATION_REMOTE_REF;
+  process.env.WORKERPALS_BASE_REF = process.env.WORKERPALS_BASE_REF ?? INTEGRATION_REMOTE_REF;
   console.log(`[start] Ready: ${INTEGRATION_REMOTE_REF} exists and workers will base from it.`);
 }
 
-async function ensureSerialPusherWorktree(): Promise<void> {
-  const configuredPath = (process.env.SERIAL_PUSHER_REPO_PATH ?? "").trim();
+async function ensureSourceControlManagerWorktree(): Promise<void> {
+  const configuredPath = (process.env.SOURCE_CONTROL_MANAGER_REPO_PATH ?? "").trim();
   const repoPath = configuredPath
     ? resolve(repoRoot, configuredPath)
-    : DEFAULT_SERIAL_PUSHER_WORKTREE;
+    : DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE;
 
   if (repoPath === repoRoot) {
     console.error(
-      "[start] SERIAL_PUSHER_REPO_PATH points to the primary workspace. Refusing to run serial-pusher in-place.",
+      "[start] SOURCE_CONTROL_MANAGER_REPO_PATH points to the primary workspace. Refusing to run SourceControlManager in-place.",
     );
     console.error(
-      "[start] Set SERIAL_PUSHER_REPO_PATH to a dedicated worktree path, or unset it to use the default.",
+      "[start] Set SOURCE_CONTROL_MANAGER_REPO_PATH to a dedicated worktree path, or unset it to use the default.",
     );
     process.exit(1);
   }
@@ -333,14 +335,14 @@ async function ensureSerialPusherWorktree(): Promise<void> {
 
     if (!addResult.ok) {
       console.error(
-        `[start] Failed to create serial-pusher worktree at ${repoPath} from ${seedRef}: ${addResult.stderr || addResult.stdout}`,
+        `[start] Failed to create SourceControlManager worktree at ${repoPath} from ${seedRef}: ${addResult.stderr || addResult.stdout}`,
       );
       process.exit(addResult.exitCode || 1);
     }
-    console.log(`[start] Created serial-pusher worktree: ${repoPath}`);
+    console.log(`[start] Created SourceControlManager worktree: ${repoPath}`);
   }
 
-  process.env.SERIAL_PUSHER_REPO_PATH = repoPath;
+  process.env.SOURCE_CONTROL_MANAGER_REPO_PATH = repoPath;
 }
 
 async function ensureDockerImage(): Promise<void> {
@@ -357,7 +359,7 @@ async function ensureDockerImage(): Promise<void> {
   console.log("[start] Building worker image...");
 
   const buildExitCode = await runInherited(
-    ["docker", "build", "-f", "apps/worker/Dockerfile.sandbox", "-t", workerImage, "."],
+    ["docker", "build", "-f", "apps/workerpals/Dockerfile.sandbox", "-t", workerImage, "."],
     repoRoot,
   );
 
@@ -369,7 +371,7 @@ async function ensureDockerImage(): Promise<void> {
 
 await ensureIntegrationBranch();
 await ensureGitHubAuth();
-await ensureSerialPusherWorktree();
+await ensureSourceControlManagerWorktree();
 await ensureDockerImage();
 
 const proc = Bun.spawn(["bun", "run", "dev:full"], {

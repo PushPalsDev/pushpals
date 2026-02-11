@@ -52,7 +52,7 @@ Global `SessionManager` handles:
 
 ## Files
 
-- `src/index.ts` - HTTP server and route handlers
+- `src/server_main.ts` - HTTP server and route handlers
 - `src/events.ts` - SessionEventBus and SessionManager
 
 ## Protocol

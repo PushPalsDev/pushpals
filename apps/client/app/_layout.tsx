@@ -7,7 +7,7 @@ import "react-native-reanimated";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 
 // Suppress noisy deprecation warning from third-party libs using the
-// legacy pointerEvents prop. Nothing we can fix — upstream dependency issue.
+// pointerEvents prop warning comes from upstream dependency.
 LogBox.ignoreLogs(["props.pointerEvents is deprecated"]);
 
 export default function RootLayout() {

@@ -60,7 +60,7 @@ const unsubscribe = subscribeEvents("http://localhost:3001", sessionId, (event) 
   console.log(event);
 });
 
-await sendMessage("http://localhost:3001", sessionId, "Hello");
+await sendMessage("http://localhost:3003", "Hello");
 await submitApprovalDecision("http://localhost:3001", approvalId, "approve");
 
 unsubscribe();

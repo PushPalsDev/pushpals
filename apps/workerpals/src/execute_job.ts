@@ -163,8 +163,13 @@ async function buildArchitectureDocument(
 }
 
 function useOpenHandsExecutor(): boolean {
-  const executor = (process.env.WORKER_EXECUTOR ?? "openhands").trim().toLowerCase();
-  return !(executor === "native" || executor === "builtin" || executor === "legacy");
+  const executor = (process.env.WORKERPALS_EXECUTOR ?? "openhands").trim().toLowerCase();
+  if (executor !== "openhands") {
+    console.warn(
+      `[WorkerPals] Unsupported WORKERPALS_EXECUTOR="${executor}". Only "openhands" is supported.`,
+    );
+  }
+  return true;
 }
 
 async function executeWithOpenHands(
@@ -173,7 +178,7 @@ async function executeWithOpenHands(
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<JobResult> {
-  const pythonBin = process.env.WORKER_OPENHANDS_PYTHON ?? "python";
+  const pythonBin = process.env.WORKERPALS_OPENHANDS_PYTHON ?? "python";
   const scriptPath = resolve(import.meta.dir, "..", "scripts", "openhands_executor.py");
   if (!existsSync(scriptPath)) {
     return {
@@ -185,7 +190,7 @@ async function executeWithOpenHands(
 
   const timeoutMs = Math.max(
     10_000,
-    parseInt(process.env.WORKER_OPENHANDS_TIMEOUT_MS ?? "120000", 10) || 120_000,
+    parseInt(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS ?? "120000", 10) || 120_000,
   );
   const payload = Buffer.from(
     JSON.stringify({
@@ -358,9 +363,9 @@ export async function createJobCommit(
   },
 ): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
   const truthy = new Set(["1", "true", "yes", "on"]);
-  const requirePush = truthy.has((process.env.WORKER_REQUIRE_PUSH ?? "").toLowerCase());
+  const requirePush = truthy.has((process.env.WORKERPALS_REQUIRE_PUSH ?? "").toLowerCase());
   const pushAgentBranch =
-    requirePush || truthy.has((process.env.WORKER_PUSH_AGENT_BRANCH ?? "").toLowerCase());
+    requirePush || truthy.has((process.env.WORKERPALS_PUSH_AGENT_BRANCH ?? "").toLowerCase());
   const branchName = `agent/${workerId}/${job.id}`;
   const commitMsg = buildWorkerCommitMessage(workerId, job);
 
@@ -389,7 +394,7 @@ export async function createJobCommit(
     result = await git(repo, ["diff", "--cached", "--quiet"]);
     if (result.ok) {
       // No changes to commit (diff exited 0)
-      console.log(`[Worker] No changes to commit for job ${job.id}`);
+      console.log(`[WorkerPals] No changes to commit for job ${job.id}`);
       // Clean up branch in detached state (safe for worktrees and direct checkouts)
       const detachResult = await git(repo, ["checkout", "--detach"]);
       if (!detachResult.ok) {
@@ -427,17 +432,17 @@ export async function createJobCommit(
           return { ok: false, error: pushError };
         }
         console.warn(
-          `[Worker] ${pushError}. Continuing with local branch only (set WORKER_REQUIRE_PUSH=1 to enforce push).`,
+          `[WorkerPals] ${pushError}. Continuing with local branch only (set WORKERPALS_REQUIRE_PUSH=1 to enforce push).`,
         );
         return { ok: true, branch: branchName, sha };
       }
     } else {
       console.log(
-        `[Worker] Skipping push for ${branchName} (WORKER_PUSH_AGENT_BRANCH is disabled).`,
+        `[WorkerPals] Skipping push for ${branchName} (WORKERPALS_PUSH_AGENT_BRANCH is disabled).`,
       );
     }
 
-    console.log(`[Worker] Created commit ${sha} on branch ${branchName}`);
+    console.log(`[WorkerPals] Created commit ${sha} on branch ${branchName}`);
     return { ok: true, branch: branchName, sha };
   } catch (err) {
     return { ok: false, error: String(err) };
@@ -555,10 +560,10 @@ function buildWorkerCommitMessage(
 ): string {
   const action = summarizeJobAction(job.kind, job.params);
   const shortJob = sanitizeCommitValue(job.id, 12);
-  const subject = sanitizeCommitValue(`worker(${workerId}): ${action} [job ${shortJob}]`, 72);
+  const subject = sanitizeCommitValue(`workerpals(${workerId}): ${action} [job ${shortJob}]`, 72);
 
   const lines = [
-    subject || `worker(${workerId}): ${job.kind}`,
+    subject || `workerpals(${workerId}): ${job.kind}`,
     "",
     `Agent: worker:${sanitizeCommitValue(workerId, 64)}`,
     `Task: ${sanitizeCommitValue(job.taskId, 128)}`,
@@ -686,7 +691,7 @@ export async function executeJob(
         return {
           ok: false,
           summary:
-            "task.execute could not determine output path. Provide targetPath or mention file name.",
+            "task.execute could not determine output path. Provide targetPath, or run with OpenHands agent mode for instruction-only refactors.",
         };
       }
 

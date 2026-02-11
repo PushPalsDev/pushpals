@@ -221,17 +221,15 @@ export async function createSession(baseUrl: string, sessionId?: string): Promis
 }
 
 /**
- * Send a message to the Local Agent with streaming status updates
+ * Send a message to LocalBuddy with streaming status updates
  *
- * In the new architecture, messages are sent to the Local Agent (not directly to server).
- * The Local Agent enhances the prompt with repo context and enqueues it to the Request Queue,
+ * In the new architecture, messages are sent to LocalBuddy (not directly to server).
+ * LocalBuddy enhances the prompt with repo context and enqueues it to the Request Queue,
  * streaming status updates back to the client via SSE.
  */
 export async function sendMessage(
   localAgentUrl: string,
-  _sessionId: string, // No longer used, but kept for API compatibility
   text: string,
-  _intent?: Record<string, unknown>, // No longer used, but kept for API compatibility
 ): Promise<boolean> {
   try {
     const response = await fetch(`${localAgentUrl}/message`, {
@@ -269,12 +267,12 @@ export async function sendMessage(
 
         try {
           const data = JSON.parse(line.slice(6));
-          console.log(`[LocalAgent] ${data.type}: ${data.message}`);
+          console.log(`[LocalBuddy] ${data.type}: ${data.message}`);
 
           if (data.type === "complete") {
             success = true;
           } else if (data.type === "error") {
-            console.error(`[LocalAgent] Error: ${data.message}`);
+            console.error(`[LocalBuddy] Error: ${data.message}`);
             success = false;
           }
         } catch (err) {

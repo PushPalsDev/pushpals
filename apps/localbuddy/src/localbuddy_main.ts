@@ -1,17 +1,17 @@
 #!/usr/bin/env bun
 /**
- * PushPals Local Agent - HTTP Server
+ * PushPals LocalBuddy - HTTP Server
  *
  * Usage:
- *   bun run agent-local --server http://localhost:3001 [--port 3003] [--sessionId <id>]
+ *   bun run localbuddy --server http://localhost:3001 [--port 3003] [--sessionId <id>]
  *
  * Accepts messages from clients via HTTP, enhances them with LLM + repo context,
- * and enqueues to the server's Request Queue for Remote Agent processing.
+ * and enqueues to the server's Request Queue for RemoteBuddy processing.
  */
 
 import { randomUUID } from "crypto";
 import { CommunicationManager, detectRepoRoot, getRepoContext } from "shared";
-import { createLLMClient, type LLMClient } from "../../agent-remote/src/llm.js";
+import { createLLMClient, type LLMClient } from "../../remotebuddy/src/llm.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -47,10 +47,10 @@ function parseArgs(): {
   return { server, port, sessionId, authToken };
 }
 
-// ─── Local Agent HTTP Server ────────────────────────────────────────────────
+// ─── LocalBuddy HTTP Server ─────────────────────────────────────────────────
 
-class LocalAgentServer {
-  private agentId = "local-agent-1";
+class LocalBuddyServer {
+  private agentId = "localbuddy-1";
   private server: string;
   private sessionId: string;
   private repo: string;
@@ -64,11 +64,11 @@ class LocalAgentServer {
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
-    console.log(`[LocalAgent] Detected repo root: ${this.repo}`);
+    console.log(`[LocalBuddy] Detected repo root: ${this.repo}`);
 
     // Initialize LLM client for prompt enhancement
     this.llm = createLLMClient();
-    console.log(`[LocalAgent] LLM client initialized`);
+    console.log(`[LocalBuddy] LLM client initialized`);
   }
 
   /**
@@ -106,7 +106,7 @@ Be concise but include all relevant information the execution agent needs.`;
 
       return output.text.trim();
     } catch (err) {
-      console.error(`[LocalAgent] LLM enhancement failed:`, err);
+      console.error(`[LocalBuddy] LLM enhancement failed:`, err);
       // Fallback: return original prompt with basic context
       return `[Branch: ${context.branch}]\n\n${originalPrompt}`;
     }
@@ -133,6 +133,7 @@ Be concise but include all relevant information the execution agent needs.`;
     Bun.serve({
       port,
       hostname: "0.0.0.0",
+      idleTimeout: 120,
 
       async fetch(req: Request): Promise<Response> {
         const url = new URL(req.url);
@@ -165,7 +166,7 @@ Be concise but include all relevant information the execution agent needs.`;
             }
 
             console.log(
-              `[LocalAgent] Received message: ${originalPrompt.substring(0, 80)}${originalPrompt.length > 80 ? "..." : ""}`,
+              `[LocalBuddy] Received message: ${originalPrompt.substring(0, 80)}${originalPrompt.length > 80 ? "..." : ""}`,
             );
 
             // ── Step 0: Emit user message to server session so it appears in UI ──
@@ -176,11 +177,11 @@ Be concise but include all relevant information the execution agent needs.`;
               .userMessage(originalPrompt)
               .then((ok) => {
                 if (!ok) {
-                  console.error(`[LocalAgent] Failed to emit user message to session`);
+                  console.error(`[LocalBuddy] Failed to emit user message to session`);
                 }
               })
               .catch((err) =>
-                console.error(`[LocalAgent] Failed to emit user message to session:`, err),
+                console.error(`[LocalBuddy] Failed to emit user message to session:`, err),
               );
 
             // ── Process and stream status back via SSE ──
@@ -244,18 +245,18 @@ Be concise but include all relevant information the execution agent needs.`;
 
                   if (!res.ok) {
                     const err = await res.text();
-                    console.error(`[LocalAgent] Failed to enqueue request: ${err}`);
+                    console.error(`[LocalBuddy] Failed to enqueue request: ${err}`);
                     send({ type: "error", message: `Failed to enqueue: ${err}` });
                     close();
                     return;
                   }
 
                   const data = (await res.json()) as { ok: boolean; requestId?: string };
-                  console.log(`[LocalAgent] Enqueued request: ${data.requestId}`);
+                  console.log(`[LocalBuddy] Enqueued request: ${data.requestId}`);
 
                   const requestSuffix = data.requestId ? ` (${data.requestId.slice(0, 8)})` : "";
                   await comm.assistantMessage(
-                    `Request queued${requestSuffix}. Remote orchestrator is planning and will assign a worker.`,
+                    `Request queued${requestSuffix}. RemoteBuddy is planning and will assign a WorkerPal.`,
                   );
 
                   // Final success message
@@ -267,7 +268,7 @@ Be concise but include all relevant information the execution agent needs.`;
 
                   close();
                 } catch (err) {
-                  console.error(`[LocalAgent] Error processing message:`, err);
+                  console.error(`[LocalBuddy] Error processing message:`, err);
                   send({ type: "error", message: String(err) });
                   close();
                 }
@@ -283,7 +284,7 @@ Be concise but include all relevant information the execution agent needs.`;
               },
             });
           } catch (err) {
-            console.error(`[LocalAgent] Error processing message:`, err);
+            console.error(`[LocalBuddy] Error processing message:`, err);
             return makeJson({ ok: false, message: String(err) }, 500);
           }
         }
@@ -301,7 +302,7 @@ Be concise but include all relevant information the execution agent needs.`;
         // GET / - Info endpoint
         if (pathname === "/" && method === "GET") {
           return makeJson({
-            name: "PushPals Local Agent",
+            name: "PushPals LocalBuddy",
             version: "0.1.0",
             endpoints: {
               "POST /message": "Send a message to be processed",
@@ -314,8 +315,8 @@ Be concise but include all relevant information the execution agent needs.`;
       },
     });
 
-    console.log(`[LocalAgent] HTTP server listening on http://0.0.0.0:${port}`);
-    console.log(`[LocalAgent] Ready to receive messages at POST http://localhost:${port}/message`);
+    console.log(`[LocalBuddy] HTTP server listening on http://0.0.0.0:${port}`);
+    console.log(`[LocalBuddy] Ready to receive messages at POST http://localhost:${port}/message`);
   }
 }
 
@@ -344,7 +345,7 @@ async function connectWithRetry(
       if (attempt >= maxRetries) throw err;
       const delay = Math.min(baseDelay * 2 ** (attempt - 1), maxDelay);
       console.log(
-        `[LocalAgent] Server unavailable (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
+        `[LocalBuddy] Server unavailable (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
       );
       await Bun.sleep(delay);
     }
@@ -356,17 +357,17 @@ async function connectWithRetry(
 async function main() {
   const opts = parseArgs();
 
-  console.log(`[LocalAgent] PushPals Local Agent - HTTP Server`);
-  console.log(`[LocalAgent] Server: ${opts.server}`);
-  console.log(`[LocalAgent] Port: ${opts.port}`);
+  console.log(`[LocalBuddy] PushPals LocalBuddy - HTTP Server`);
+  console.log(`[LocalBuddy] Server: ${opts.server}`);
+  console.log(`[LocalBuddy] Port: ${opts.port}`);
 
   // Create or join session (with retry - server may not be up yet)
-  console.log(`[LocalAgent] Ensuring session "${opts.sessionId}" exists on server…`);
+  console.log(`[LocalBuddy] Ensuring session "${opts.sessionId}" exists on server…`);
   const sessionId = await connectWithRetry(opts.server, opts.sessionId);
-  console.log(`[LocalAgent] Using session: ${sessionId}`);
+  console.log(`[LocalBuddy] Using session: ${sessionId}`);
 
-  // Start Local Agent HTTP server
-  const agent = new LocalAgentServer({
+  // Start LocalBuddy HTTP server
+  const agent = new LocalBuddyServer({
     server: opts.server,
     sessionId,
     authToken: opts.authToken,
@@ -376,6 +377,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[LocalAgent] Fatal:", err);
+  console.error("[LocalBuddy] Fatal:", err);
   process.exit(1);
 });

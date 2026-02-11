@@ -2,9 +2,9 @@ import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from "
 import { join } from "path";
 
 /**
- * File-based exclusive lock for the serial pusher.
+ * File-based exclusive lock for SourceControlManager.
  *
- * Ensures only one instance of the serial pusher operates on a repo at a time.
+ * Ensures only one SourceControlManager instance operates on a repo at a time.
  * The lock file contains the PID and start time of the holder.
  * Acquire on startup, hold for process lifetime, release on exit.
  */
@@ -58,7 +58,7 @@ export class FileLock {
       this.held = true;
       // Register only the 'exit' hook for last-resort cleanup.
       // Signal handling (SIGINT/SIGTERM) is owned by the daemon entry point
-      // (index.ts) which calls lock.release() during its shutdown sequence.
+      // (source_control_manager_main.ts) which calls lock.release() during shutdown.
       process.on("exit", () => this.release());
       return true;
     } catch {

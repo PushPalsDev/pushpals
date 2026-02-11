@@ -15,7 +15,7 @@ const MAX_HANDLED_IDS = 5000;
 export class IdempotencyStore {
   private db: Database;
 
-  constructor(dbPath: string = "agent-remote-state.db") {
+  constructor(dbPath: string = "remotebuddy-state.db") {
     this.db = new Database(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this._migrate();

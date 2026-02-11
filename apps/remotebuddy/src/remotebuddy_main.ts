@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * PushPals Remote Orchestrator
+ * PushPals RemoteBuddy Orchestrator
  *
  * AI-powered orchestrator that:
  *   1) Listens for user `message` events via cursor-based WS stream
@@ -11,7 +11,7 @@
  * Replay-safe: uses IdempotencyStore to avoid re-processing messages on reconnect.
  *
  * Usage:
- *   bun run src/index.ts --server http://localhost:3001 [--sessionId <id>] [--token <auth>]
+ *   bun run src/remotebuddy_main.ts --server http://localhost:3001 [--sessionId <id>] [--token <auth>]
  *   Environment: OPENAI_API_KEY | ANTHROPIC_API_KEY | LLM_ENDPOINT (see llm.ts)
  */
 
@@ -54,7 +54,7 @@ function parseArgs(): {
   return { server, sessionId, authToken };
 }
 
-// ─── Remote Orchestrator ────────────────────────────────────────────────────
+// ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
 
 function isLikelyChitChat(text: string): boolean {
   const t = text.trim().toLowerCase();
@@ -103,6 +103,20 @@ function isExecutionIntent(text: string, targetPath: string | null): boolean {
   return t.length > 80;
 }
 
+function isArchitectureIntent(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return false;
+  const architectureCue =
+    /\b(architecture|repo architecture|repository architecture|system design|high[- ]level|overview|describe the architecture|how .* works|explain .* architecture)\b/.test(
+      t,
+    );
+  const codeChangeCue =
+    /\b(refactor|rename|change|modify|edit|update|implement|fix|add|remove|delete|create|write|patch)\b/.test(
+      t,
+    );
+  return architectureCue && !codeChangeCue;
+}
+
 function toSingleLine(value: unknown, max = 220): string {
   const text = String(value ?? "")
     .replace(/\s+/g, " ")
@@ -137,8 +151,8 @@ interface WorkerSnapshot {
   isOnline: boolean;
 }
 
-class RemoteOrchestrator {
-  private readonly agentId = "remote-orchestrator";
+class RemoteBuddyOrchestrator {
+  private readonly agentId = "remotebuddy-orchestrator";
   private readonly server: string;
   private readonly sessionId: string;
   private readonly authToken: string | null;
@@ -185,26 +199,26 @@ class RemoteOrchestrator {
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
     this.jobsDbPath = opts.jobsDbPath;
-    this.workerOnlineTtlMs = Math.max(1_000, envInt("REMOTE_AGENT_WORKER_ONLINE_TTL_MS", 15_000));
-    this.waitForWorkerMs = Math.max(0, envInt("REMOTE_AGENT_WAIT_FOR_WORKER_MS", 15_000));
-    this.autoSpawnWorkers = envTruthy("REMOTE_AGENT_AUTO_SPAWN_WORKERS", true);
-    this.maxWorkers = Math.max(1, envInt("REMOTE_AGENT_MAX_WORKERS", 1));
+    this.workerOnlineTtlMs = Math.max(1_000, envInt("REMOTEBUDDY_WORKERPAL_ONLINE_TTL_MS", 15_000));
+    this.waitForWorkerMs = Math.max(0, envInt("REMOTEBUDDY_WAIT_FOR_WORKERPAL_MS", 15_000));
+    this.autoSpawnWorkers = envTruthy("REMOTEBUDDY_AUTO_SPAWN_WORKERPALS", true);
+    this.maxWorkers = Math.max(1, envInt("REMOTEBUDDY_MAX_WORKERPALS", 1));
     this.workerStartupTimeoutMs = Math.max(
       1_000,
-      envInt("REMOTE_AGENT_WORKER_STARTUP_TIMEOUT_MS", 10_000),
+      envInt("REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS", 10_000),
     );
-    this.spawnWorkerDocker = envTruthy("REMOTE_AGENT_WORKER_DOCKER", true);
-    this.spawnWorkerRequireDocker = envTruthy("REMOTE_AGENT_WORKER_REQUIRE_DOCKER", true);
-    this.spawnWorkerImage = (process.env.REMOTE_AGENT_WORKER_IMAGE ?? "").trim() || null;
+    this.spawnWorkerDocker = envTruthy("REMOTEBUDDY_WORKERPAL_DOCKER", true);
+    this.spawnWorkerRequireDocker = envTruthy("REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER", true);
+    this.spawnWorkerImage = (process.env.REMOTEBUDDY_WORKERPAL_IMAGE ?? "").trim() || null;
     this.spawnWorkerPollMs = (() => {
-      const value = envInt("REMOTE_AGENT_WORKER_POLL_MS", NaN);
+      const value = envInt("REMOTEBUDDY_WORKERPAL_POLL_MS", NaN);
       return Number.isFinite(value) && value > 0 ? value : null;
     })();
     this.spawnWorkerHeartbeatMs = (() => {
-      const value = envInt("REMOTE_AGENT_WORKER_HEARTBEAT_MS", NaN);
+      const value = envInt("REMOTEBUDDY_WORKERPAL_HEARTBEAT_MS", NaN);
       return Number.isFinite(value) && value > 0 ? value : null;
     })();
-    this.spawnWorkerLabels = (process.env.REMOTE_AGENT_WORKER_LABELS ?? "")
+    this.spawnWorkerLabels = (process.env.REMOTEBUDDY_WORKERPAL_LABELS ?? "")
       .split(",")
       .map((label) => label.trim())
       .filter(Boolean);
@@ -217,9 +231,9 @@ class RemoteOrchestrator {
       authToken: this.authToken,
       from: `agent:${this.agentId}`,
     });
-    console.log(`[Orchestrator] Detected repo root: ${this.repo}`);
+    console.log(`[RemoteBuddy] Detected repo root: ${this.repo}`);
     console.log(
-      `[Orchestrator] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
+      `[RemoteBuddy] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
     );
   }
 
@@ -240,9 +254,9 @@ class RemoteOrchestrator {
         turnId: cmd.turnId,
         parentId: cmd.parentId,
       });
-      if (!ok) console.error(`[Orchestrator] Command ${cmd.type} failed`);
+      if (!ok) console.error(`[RemoteBuddy] Command ${cmd.type} failed`);
     } catch (err) {
-      console.error(`[Orchestrator] Command ${cmd.type} error:`, err);
+      console.error(`[RemoteBuddy] Command ${cmd.type} error:`, err);
     }
   }
 
@@ -272,17 +286,17 @@ class RemoteOrchestrator {
       });
       if (!res.ok) {
         const err = await res.text();
-        console.error(`[Orchestrator] Enqueue failed: ${res.status} ${err}`);
+        console.error(`[RemoteBuddy] Enqueue failed: ${res.status} ${err}`);
         return null;
       }
       const data = (await res.json()) as { ok: boolean; jobId?: string };
       if (!data.ok || !data.jobId) {
-        console.error(`[Orchestrator] Enqueue response missing jobId:`, data);
+        console.error(`[RemoteBuddy] Enqueue response missing jobId:`, data);
         return null;
       }
       return data.jobId;
     } catch (err) {
-      console.error(`[Orchestrator] Enqueue error:`, err);
+      console.error(`[RemoteBuddy] Enqueue error:`, err);
       return null;
     }
   }
@@ -291,7 +305,7 @@ class RemoteOrchestrator {
 
   private pushContext(text: string): void {
     this.recentContext.push(text);
-    if (this.recentContext.length > RemoteOrchestrator.MAX_CONTEXT) {
+    if (this.recentContext.length > RemoteBuddyOrchestrator.MAX_CONTEXT) {
       this.recentContext.shift();
     }
   }
@@ -351,7 +365,7 @@ class RemoteOrchestrator {
         };
       });
     } catch (err) {
-      console.warn("[Orchestrator] Could not read recent job context:", err);
+      console.warn("[RemoteBuddy] Could not read recent job context:", err);
       return [];
     }
   }
@@ -408,11 +422,11 @@ class RemoteOrchestrator {
     const args = [
       "bun",
       "--cwd",
-      "apps/worker",
+      "apps/workerpals",
       "--env-file",
       "../../.env",
       "run",
-      "src/index.ts",
+      "src/workerpals_main.ts",
       "--server",
       this.server,
       "--workerId",
@@ -441,10 +455,10 @@ class RemoteOrchestrator {
     if (this.managedWorkers.size >= this.maxWorkers) {
       return null;
     }
-    const workerId = `worker-${randomUUID().substring(0, 8)}`;
+    const workerId = `workerpal-${randomUUID().substring(0, 8)}`;
     const cmd = this.buildWorkerSpawnCommand(workerId);
     console.log(
-      `[Orchestrator] Spawning worker ${workerId} (${this.managedWorkers.size + 1}/${this.maxWorkers})`,
+      `[RemoteBuddy] Spawning WorkerPal ${workerId} (${this.managedWorkers.size + 1}/${this.maxWorkers})`,
     );
     try {
       const child = Bun.spawn(cmd, {
@@ -456,15 +470,15 @@ class RemoteOrchestrator {
       this.managedWorkers.set(workerId, child);
       child.exited.then((code) => {
         this.managedWorkers.delete(workerId);
-        console.warn(`[Orchestrator] Worker process ${workerId} exited with code ${code}`);
+        console.warn(`[RemoteBuddy] WorkerPal process ${workerId} exited with code ${code}`);
       });
 
       const ready = await this.waitForIdleWorker(this.workerStartupTimeoutMs, workerId);
       if (ready) return ready.workerId;
-      console.warn(`[Orchestrator] Worker ${workerId} did not report ready within timeout`);
+      console.warn(`[RemoteBuddy] WorkerPal ${workerId} did not report ready within timeout`);
       return null;
     } catch (err) {
-      console.error(`[Orchestrator] Failed to spawn worker ${workerId}:`, err);
+      console.error(`[RemoteBuddy] Failed to spawn WorkerPal ${workerId}:`, err);
       return null;
     }
   }
@@ -488,8 +502,8 @@ class RemoteOrchestrator {
     return waited?.workerId ?? null;
   }
 
-  // In this architecture, Remote Agent only creates tasks/jobs via polling
-  // Job completion tracking is no longer part of Remote Agent responsibility
+  // In this architecture, RemoteBuddy only creates tasks/jobs via polling.
+  // Job completion tracking is handled by the server event stream and workers.
   // ── Dispatch, Polling for Request Queue ────────────────────────────────────────
 
   /** Process a request from the Request Queue (replaces handleMessage) */
@@ -498,7 +512,7 @@ class RemoteOrchestrator {
 
     // Idempotency check
     if (this.idempotency.hasHandled(this.sessionId, requestId)) {
-      console.log(`[Orchestrator] Skipping already-handled request ${requestId}`);
+      console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
       return;
     }
 
@@ -517,7 +531,7 @@ class RemoteOrchestrator {
     let tasksCreated = 0;
     if (!actionable) {
       // Lightweight-only responses stay in the orchestrator.
-      console.log(`[Orchestrator] Thinking about: "${enhancedPrompt.substring(0, 80)}"`);
+      console.log(`[RemoteBuddy] Thinking about: "${enhancedPrompt.substring(0, 80)}"`);
       const output = await this.brain.think(enhancedPrompt, this.recentContext);
       this.pushContext(`[assistant] ${output.assistantMessage}`);
       await this.sendCommand({
@@ -526,15 +540,16 @@ class RemoteOrchestrator {
         turnId,
       });
     } else {
-      // Any non-trivial request is worker-owned.
+      // Any non-trivial request is WorkerPal-owned.
       await this.comm.assistantMessage(
-        "Understood. I am delegating this to a worker now.",
+        "Understood. I am delegating this to a WorkerPal now.",
         { turnId, correlationId: requestId },
       );
 
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
-      const jobKind = targetPath ? "task.execute" : "project.summary";
+      const architectureIntent = isArchitectureIntent(promptForIntent);
+      const jobKind = architectureIntent ? "project.summary" : "task.execute";
       const params: Record<string, unknown> = {
         requestId,
         sessionId: this.sessionId,
@@ -542,12 +557,13 @@ class RemoteOrchestrator {
         enhancedPrompt,
         targetWorkerId,
         repoRoot: this.repo,
-        recentContext: this.recentContext.slice(-RemoteOrchestrator.MAX_CONTEXT),
+        recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
       };
-      if (targetPath) {
+      if (jobKind === "task.execute" && targetPath) {
         params.targetPath = targetPath;
-      } else {
+      }
+      if (jobKind === "project.summary") {
         params.responseMode = "assistant_message";
         params.maxResponseChars = 8000;
       }
@@ -577,16 +593,16 @@ class RemoteOrchestrator {
         payload: {
           taskId,
           message: targetWorkerId
-            ? `Assigned to worker ${targetWorkerId}`
-            : "No idle worker available; queued for first available worker",
+             ? `Assigned to WorkerPal ${targetWorkerId}`
+             : "No idle WorkerPal available; queued for first available WorkerPal",
         },
         turnId,
       });
 
       await this.comm.assistantMessage(
         targetWorkerId
-          ? `Assigned this request to worker ${targetWorkerId}.`
-          : "No idle worker right now; request is queued and waiting for the next available worker.",
+          ? `Assigned this request to WorkerPal ${targetWorkerId}.`
+          : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.",
         { turnId, correlationId: requestId },
       );
 
@@ -609,13 +625,13 @@ class RemoteOrchestrator {
         body: JSON.stringify({ result: { tasksCreated } }),
       });
     } catch (err) {
-      console.error(`[Orchestrator] Failed to mark request complete:`, err);
+      console.error(`[RemoteBuddy] Failed to mark request complete:`, err);
     }
   }
 
   /** Start polling the Request Queue */
   async startPolling(pollMs: number = 2000): Promise<void> {
-    console.log(`[Orchestrator] Starting polling loop (every ${pollMs}ms)`);
+    console.log(`[RemoteBuddy] Starting polling loop (every ${pollMs}ms)`);
 
     while (!this.disposed) {
       try {
@@ -629,15 +645,15 @@ class RemoteOrchestrator {
           const data = (await res.json()) as { ok: boolean; request?: any };
 
           if (data.ok && data.request) {
-            console.log(`[Orchestrator] Claimed request ${data.request.id}`);
+            console.log(`[RemoteBuddy] Claimed request ${data.request.id}`);
             // Serialize processing
             this.chain = this.chain
               .then(() => this.processRequest(data.request))
-              .catch((err) => console.error("[Orchestrator] Process error:", err));
+              .catch((err) => console.error("[RemoteBuddy] Process error:", err));
           }
         }
       } catch (err) {
-        console.error(`[Orchestrator] Poll error:`, err);
+        console.error(`[RemoteBuddy] Poll error:`, err);
       }
 
       await Bun.sleep(pollMs);
@@ -690,7 +706,7 @@ async function connectWithRetry(
       if (attempt >= maxRetries) throw err;
       const delay = Math.min(baseDelay * 2 ** (attempt - 1), maxDelay);
       console.log(
-        `[Orchestrator] Server unavailable (${err.message}), retrying in ${(delay / 1000).toFixed(1)} s... (attempt ${attempt})`,
+        `[RemoteBuddy] Server unavailable (${err.message}), retrying in ${(delay / 1000).toFixed(1)} s... (attempt ${attempt})`,
       );
       await Bun.sleep(delay);
     }
@@ -702,8 +718,8 @@ async function connectWithRetry(
 async function main() {
   const opts = parseArgs();
 
-  console.log("[Orchestrator] PushPals Remote Orchestrator");
-  console.log(`[Orchestrator] Server: ${opts.server}`);
+  console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
+  console.log(`[RemoteBuddy] Server: ${opts.server}`);
 
   // ── Initialise LLM + brain ──
   const llm = createLLMClient();
@@ -714,16 +730,16 @@ async function main() {
   const dataDir = process.env.PUSHPALS_DATA_DIR ?? join(PROJECT_ROOT, "outputs", "data");
   mkdirSync(dataDir, { recursive: true });
   const sharedDbPath = process.env.PUSHPALS_DB_PATH ?? join(dataDir, "pushpals.db");
-  const dbPath = process.env.AGENT_REMOTE_DB_PATH ?? join(dataDir, "agent-remote-state.db");
+  const dbPath = process.env.REMOTEBUDDY_DB_PATH ?? join(dataDir, "remotebuddy-state.db");
   const idempotency = new IdempotencyStore(dbPath);
-  console.log(`[Orchestrator] Idempotency store: ${dbPath}`);
+  console.log(`[RemoteBuddy] Idempotency store: ${dbPath}`);
 
   let sessionId = opts.sessionId;
-  console.log(`[Orchestrator] Ensuring session "${sessionId}" exists on server...`);
+  console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
   sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
-  console.log(`[Orchestrator] Using session: ${sessionId}`);
+  console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
-  const orchestrator = new RemoteOrchestrator({
+  const orchestrator = new RemoteBuddyOrchestrator({
     server: opts.server,
     sessionId,
     authToken: opts.authToken,
@@ -733,11 +749,11 @@ async function main() {
   });
 
   // Start polling for requests from the Request Queue
-  const pollMs = parseInt(process.env.REMOTE_AGENT_POLL_MS ?? "2000", 10);
+  const pollMs = parseInt(process.env.REMOTEBUDDY_POLL_MS ?? "2000", 10);
   orchestrator.startPolling(pollMs);
 }
 
 main().catch((err) => {
-  console.error("[Orchestrator] Fatal:", err);
+  console.error("[RemoteBuddy] Fatal:", err);
   process.exit(1);
 });

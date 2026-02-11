@@ -1,12 +1,12 @@
 /**
- * Completion Queue for finished work from Worker → Serial Pusher
+ * Completion Queue for finished work from WorkerPals -> SourceControlManager
  *
  * Flow:
- *   1. Worker completes job and creates git commit
- *   2. Worker enqueues completion with commit SHA + branch
- *   3. Serial Pusher polls and claims completions
- *   4. Serial Pusher runs format/test checks
- *   5. If pass: merge to main and mark processed
+ *   1. WorkerPal completes job and creates git commit
+ *   2. WorkerPal enqueues completion with commit SHA + branch
+ *   3. SourceControlManager polls and claims completions
+ *   4. SourceControlManager runs format/test checks
+ *   5. If pass: merge to integration branch and mark processed
  *   6. If fail: mark failed with error
  */
 
@@ -60,7 +60,7 @@ export class CompletionQueue {
   }
 
   /**
-   * Enqueue a new completion from Worker
+   * Enqueue a new completion from WorkerPal
    */
   enqueue(body: Record<string, unknown>): { ok: boolean; completionId?: string; message?: string } {
     const jobId = body.jobId as string;
@@ -116,7 +116,7 @@ export class CompletionQueue {
   }
 
   /**
-   * Mark a completion as processed (checks passed, merged to main)
+   * Mark a completion as processed (checks passed, merged to integration branch)
    */
   markProcessed(completionId: string): { ok: boolean; message?: string } {
     const now = new Date().toISOString();
