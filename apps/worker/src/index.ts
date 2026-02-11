@@ -3,115 +3,29 @@
  * PushPals Worker Daemon
  *
  * Usage:
- *   bun run worker --server http://localhost:3001 [--poll 2000] [--repo <path>]
+ *   bun run worker --server http://localhost:3001 [--poll 2000] [--repo <path>] [--docker]
  *
  * Polls the server job queue, claims jobs, executes them, and reports results.
  * Streams stdout/stderr as `job_log` events with seq numbers.
- * Job kinds: bun.test, bun.lint, git.status
+ * 
+ * Job execution modes:
+ *   - Direct mode (default): Jobs run directly on the host
+ *   - Docker mode (--docker): Jobs run in isolated Docker containers
+ *
+ * Job kinds: bun.test, bun.lint, git.status, file.write, shell.exec, etc.
  */
 
 import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
-
-// ─── Git helpers ────────────────────────────────────────────────────────────
-
-/** Job kinds that modify files and should trigger commits */
-const FILE_MODIFYING_JOBS = new Set([
-  "file.write",
-  "file.patch",
-  "file.delete",
-  "file.rename",
-  "file.copy",
-  "file.append",
-  "file.mkdir",
-]);
-
-function shouldCommit(kind: string): boolean {
-  return FILE_MODIFYING_JOBS.has(kind);
-}
-
-/** Execute a git command and return stdout */
-async function git(
-  cwd: string,
-  args: string[],
-): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  try {
-    const proc = Bun.spawn(["git", ...args], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-
-    return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim() };
-  } catch (err) {
-    return { ok: false, stdout: "", stderr: String(err) };
-  }
-}
-
-/** Create commit for job result and return commit info */
-async function createJobCommit(
-  repo: string,
-  workerId: string,
-  job: { id: string; taskId: string; kind: string },
-): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
-  const branchName = `agent/${workerId}/${job.id}`;
-  const commitMsg = `${job.kind}: ${job.taskId}\n\nJob: ${job.id}\nWorker: ${workerId}`;
-
-  try {
-    // Create and checkout branch
-    let result = await git(repo, ["checkout", "-b", branchName]);
-    if (!result.ok) {
-      return { ok: false, error: `Failed to create branch: ${result.stderr}` };
-    }
-
-    // Stage all changes
-    result = await git(repo, ["add", "-A"]);
-    if (!result.ok) {
-      return { ok: false, error: `Failed to stage changes: ${result.stderr}` };
-    }
-
-    // Check if there are changes to commit
-    result = await git(repo, ["diff", "--cached", "--quiet"]);
-    if (result.ok) {
-      // No changes to commit (diff exited 0)
-      console.log(`[Worker] No changes to commit for job ${job.id}`);
-      // Clean up branch
-      await git(repo, ["checkout", "-"]);
-      await git(repo, ["branch", "-D", branchName]);
-      return { ok: true, branch: branchName, sha: "no-changes" };
-    }
-
-    // Commit changes
-    result = await git(repo, ["commit", "-m", commitMsg]);
-    if (!result.ok) {
-      return { ok: false, error: `Failed to commit: ${result.stderr}` };
-    }
-
-    // Get commit SHA
-    result = await git(repo, ["rev-parse", "HEAD"]);
-    if (!result.ok) {
-      return { ok: false, error: `Failed to get commit SHA: ${result.stderr}` };
-    }
-    const sha = result.stdout;
-
-    // Push branch to origin
-    result = await git(repo, ["push", "origin", branchName]);
-    if (!result.ok) {
-      return { ok: false, error: `Failed to push branch: ${result.stderr}` };
-    }
-
-    console.log(`[Worker] Created commit ${sha} on branch ${branchName}`);
-    return { ok: true, branch: branchName, sha };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
-}
+import {
+  executeJob,
+  shouldCommit,
+  createJobCommit,
+  streamLines,
+  truncate,
+  type JobResult,
+} from "./execute_job.js";
+import { DockerExecutor } from "./docker_executor.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -121,6 +35,10 @@ function parseArgs(): {
   repo: string;
   workerId: string;
   authToken: string | null;
+  docker: boolean;
+  dockerImage: string;
+  gitToken: string | null;
+  dockerTimeout: number;
 } {
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
@@ -128,6 +46,10 @@ function parseArgs(): {
   let repo = process.cwd();
   let workerId = `worker-${randomUUID().substring(0, 8)}`;
   let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
+  let docker = false;
+  let dockerImage = "pushpals-worker-sandbox:latest";
+  let gitToken = process.env.PUSHPALS_GIT_TOKEN ?? null;
+  let dockerTimeout = 60000;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -146,394 +68,43 @@ function parseArgs(): {
       case "--token":
         authToken = args[++i];
         break;
+      case "--docker":
+        docker = true;
+        break;
+      case "--docker-image":
+        dockerImage = args[++i];
+        break;
+      case "--git-token":
+        gitToken = args[++i];
+        break;
+      case "--docker-timeout":
+        dockerTimeout = parseInt(args[++i], 10);
+        break;
     }
   }
 
-  return { server, pollMs, repo, workerId, authToken };
+  return { server, pollMs, repo, workerId, authToken, docker, dockerImage, gitToken, dockerTimeout };
 }
 
-// ─── Job execution ──────────────────────────────────────────────────────────
+// ─── Job execution wrapper ──────────────────────────────────────────────────
 
-const MAX_OUTPUT = 256 * 1024;
-
-function truncate(s: string): string {
-  return s.length > MAX_OUTPUT ? s.substring(0, MAX_OUTPUT) + "\n… (truncated)" : s;
-}
-
-interface JobResult {
-  ok: boolean;
-  summary: string;
-  stdout?: string;
-  stderr?: string;
-  exitCode?: number;
-}
-
-async function executeJob(
-  kind: string,
-  params: Record<string, unknown>,
+async function runJob(
+  job: { id: string; taskId: string; kind: string; params: Record<string, unknown>; sessionId: string },
   repo: string,
+  dockerExecutor: DockerExecutor | null,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<JobResult> {
-  let cmd: string[];
-
-  switch (kind) {
-    case "bun.test": {
-      cmd = ["bun", "test"];
-      if (params.filter) cmd.push("--filter", params.filter as string);
-      break;
-    }
-    case "bun.lint": {
-      cmd = ["bun", "run", "lint"];
-      break;
-    }
-    case "git.status": {
-      cmd = ["git", "status", "--porcelain"];
-      break;
-    }
-    case "git.log": {
-      const count = Math.min(Number(params.count) || 20, 100);
-      cmd = ["git", "log", "--oneline", `--format=%h %s (%an, %ar)`, `-n`, String(count)];
-      if (params.branch) cmd.push(params.branch as string);
-      break;
-    }
-    case "git.branch": {
-      cmd = params.all === true ? ["git", "branch", "-a", "-v"] : ["git", "branch", "-v"];
-      break;
-    }
-    case "git.diff": {
-      cmd = ["git", "diff"];
-      break;
-    }
-    case "file.read": {
-      const filePath = params.path as string;
-      if (!filePath) return { ok: false, summary: "file.read requires a 'path' param" };
-      cmd = ["cat", filePath];
-      break;
-    }
-    case "file.search": {
-      const pattern = params.pattern as string;
-      if (!pattern) return { ok: false, summary: "file.search requires a 'pattern' param" };
-      cmd = ["grep", "-rn", pattern, "."];
-      break;
-    }
-    case "file.list": {
-      cmd = ["git", "ls-tree", "--name-only", "-r", "HEAD"];
-      break;
-    }
-    case "ci.status": {
-      cmd = [
-        "gh",
-        "run",
-        "list",
-        "--limit",
-        "5",
-        "--json",
-        "status,conclusion,name,headBranch,createdAt,url",
-      ];
-      break;
-    }
-    case "project.summary": {
-      // For project.summary, chain a few commands
-      cmd = ["git", "log", "--oneline", "-n", "5"];
-      break;
-    }
-    case "shell.exec": {
-      let command = params.command as string;
-      if (!command) return { ok: false, summary: "shell.exec requires a 'command' param" };
-      const isWindows = process.platform === "win32";
-      cmd = isWindows ? ["cmd", "/c", command] : ["bash", "-c", command];
-      break;
-    }
-    case "file.write": {
-      const filePath = params.path as string;
-      const content = params.content as string;
-      if (!filePath) return { ok: false, summary: "file.write requires a 'path' param" };
-      if (content === undefined)
-        return { ok: false, summary: "file.write requires a 'content' param" };
-      try {
-        const { mkdirSync, writeFileSync } = await import("fs");
-        const { dirname, resolve } = await import("path");
-        const resolved = resolve(repo, filePath);
-        mkdirSync(dirname(resolved), { recursive: true });
-        writeFileSync(resolved, content, "utf-8");
-        return {
-          ok: true,
-          summary: `Wrote ${content.length} bytes to ${filePath}`,
-          stdout: `Wrote ${content.length} bytes to ${filePath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.write error: ${err}` };
-      }
-    }
-    case "file.patch": {
-      const filePath = params.path as string;
-      const oldText = params.oldText as string;
-      const newText = params.newText as string;
-      if (!filePath) return { ok: false, summary: "file.patch requires a 'path' param" };
-      if (oldText === undefined)
-        return { ok: false, summary: "file.patch requires an 'oldText' param" };
-      if (newText === undefined)
-        return { ok: false, summary: "file.patch requires a 'newText' param" };
-      try {
-        const { readFileSync, writeFileSync } = await import("fs");
-        const { resolve } = await import("path");
-        const resolved = resolve(repo, filePath);
-        const current = readFileSync(resolved, "utf-8");
-        if (!current.includes(oldText)) {
-          return { ok: false, summary: `oldText not found in ${filePath}` };
-        }
-        const updated = current.replace(oldText, newText);
-        writeFileSync(resolved, updated, "utf-8");
-        return {
-          ok: true,
-          summary: `Patched ${filePath}`,
-          stdout: `Replaced ${oldText.length} chars with ${newText.length} chars in ${filePath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.patch error: ${err}` };
-      }
-    }
-    case "file.rename": {
-      const from = params.from as string;
-      const to = params.to as string;
-      if (!from) return { ok: false, summary: "file.rename requires a 'from' param" };
-      if (!to) return { ok: false, summary: "file.rename requires a 'to' param" };
-      try {
-        const { renameSync, mkdirSync } = await import("fs");
-        const { resolve, dirname } = await import("path");
-        const resolvedFrom = resolve(repo, from);
-        const resolvedTo = resolve(repo, to);
-        mkdirSync(dirname(resolvedTo), { recursive: true });
-        renameSync(resolvedFrom, resolvedTo);
-        return {
-          ok: true,
-          summary: `Renamed ${from} \u2192 ${to}`,
-          stdout: `Renamed ${from} \u2192 ${to}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.rename error: ${err}` };
-      }
-    }
-    case "file.delete": {
-      const filePath = params.path as string;
-      if (!filePath) return { ok: false, summary: "file.delete requires a 'path' param" };
-      try {
-        const { statSync, unlinkSync, rmSync } = await import("fs");
-        const { resolve } = await import("path");
-        const resolved = resolve(repo, filePath);
-        const stat = statSync(resolved);
-        if (stat.isDirectory()) {
-          rmSync(resolved, { recursive: true });
-          return {
-            ok: true,
-            summary: `Deleted directory ${filePath}`,
-            stdout: `Deleted directory ${filePath}`,
-          };
-        } else {
-          unlinkSync(resolved);
-          return { ok: true, summary: `Deleted ${filePath}`, stdout: `Deleted ${filePath}` };
-        }
-      } catch (err) {
-        return { ok: false, summary: `file.delete error: ${err}` };
-      }
-    }
-    case "file.copy": {
-      const from = params.from as string;
-      const to = params.to as string;
-      if (!from) return { ok: false, summary: "file.copy requires a 'from' param" };
-      if (!to) return { ok: false, summary: "file.copy requires a 'to' param" };
-      try {
-        const { copyFileSync, mkdirSync } = await import("fs");
-        const { resolve, dirname } = await import("path");
-        const resolvedFrom = resolve(repo, from);
-        const resolvedTo = resolve(repo, to);
-        mkdirSync(dirname(resolvedTo), { recursive: true });
-        copyFileSync(resolvedFrom, resolvedTo);
-        return {
-          ok: true,
-          summary: `Copied ${from} \u2192 ${to}`,
-          stdout: `Copied ${from} \u2192 ${to}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.copy error: ${err}` };
-      }
-    }
-    case "file.append": {
-      const filePath = params.path as string;
-      const content = params.content as string;
-      if (!filePath) return { ok: false, summary: "file.append requires a 'path' param" };
-      if (content === undefined)
-        return { ok: false, summary: "file.append requires a 'content' param" };
-      try {
-        const { appendFileSync, mkdirSync } = await import("fs");
-        const { resolve, dirname } = await import("path");
-        const resolved = resolve(repo, filePath);
-        mkdirSync(dirname(resolved), { recursive: true });
-        appendFileSync(resolved, content, "utf-8");
-        return {
-          ok: true,
-          summary: `Appended ${content.length} bytes to ${filePath}`,
-          stdout: `Appended ${content.length} bytes to ${filePath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.append error: ${err}` };
-      }
-    }
-    case "file.mkdir": {
-      const dirPath = params.path as string;
-      if (!dirPath) return { ok: false, summary: "file.mkdir requires a 'path' param" };
-      try {
-        const { mkdirSync } = await import("fs");
-        const { resolve } = await import("path");
-        const resolved = resolve(repo, dirPath);
-        mkdirSync(resolved, { recursive: true });
-        return {
-          ok: true,
-          summary: `Created directory ${dirPath}`,
-          stdout: `Created directory ${dirPath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.mkdir error: ${err}` };
-      }
-    }
-    case "web.fetch": {
-      const url = params.url as string;
-      if (!url) return { ok: false, summary: "web.fetch requires a 'url' param" };
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 25_000);
-        const res = await fetch(url, {
-          headers: { "User-Agent": "PushPals/1.0" },
-          signal: controller.signal,
-        });
-        clearTimeout(timer);
-        const body = await res.text();
-        const contentType = res.headers.get("content-type") ?? "";
-        let output = body;
-        if (contentType.includes("html")) {
-          output = body
-            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-            .replace(/<[^>]+>/g, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-        }
-        return {
-          ok: res.ok,
-          summary: res.ok ? `Fetched ${url} (${output.length} chars)` : `HTTP ${res.status}`,
-          stdout: truncate(output),
-        };
-      } catch (err) {
-        return { ok: false, summary: `web.fetch error: ${err}` };
-      }
-    }
-    case "web.search": {
-      const query = params.query as string;
-      if (!query) return { ok: false, summary: "web.search requires a 'query' param" };
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 15_000);
-        const searchUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-        const res = await fetch(searchUrl, {
-          headers: { "User-Agent": "PushPals/1.0" },
-          signal: controller.signal,
-        });
-        clearTimeout(timer);
-        const html = await res.text();
-        // Extract links
-        const linkRegex = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
-        const results: string[] = [];
-        let match;
-        while ((match = linkRegex.exec(html)) !== null && results.length < 10) {
-          if (!match[1].includes("duckduckgo.com")) {
-            results.push(`${results.length + 1}. ${match[2].trim()}\n  ${match[1]}`);
-          }
-        }
-        return {
-          ok: true,
-          summary: `${results.length} search results for "${query}"`,
-          stdout: results.length > 0 ? results.join("\n\n") : "No results found.",
-        };
-      } catch (err) {
-        return { ok: false, summary: `web.search error: ${err}` };
-      }
-    }
-    default:
-      return { ok: false, summary: `Unknown job kind: ${kind}` };
-  }
-
-  try {
-    const proc = Bun.spawn(cmd, {
-      cwd: repo,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-
-    const timer = setTimeout(() => {
-      try {
-        proc.kill();
-      } catch (_e) {}
-    }, 60_000); // 60s timeout
-
-    const [stdout, stderr] = await Promise.all([
-      onLog ? streamLines(proc.stdout, "stdout", onLog) : new Response(proc.stdout).text(),
-      onLog ? streamLines(proc.stderr, "stderr", onLog) : new Response(proc.stderr).text(),
-    ]);
-
-    clearTimeout(timer);
-    const exitCode = await proc.exited;
-
+  if (dockerExecutor) {
+    const result = await dockerExecutor.execute(job, onLog);
     return {
-      ok: exitCode === 0,
-      summary: exitCode === 0 ? `${kind} passed` : `${kind} failed (exit ${exitCode})`,
-      stdout: truncate(stdout),
-      stderr: truncate(stderr),
-      exitCode,
+      ok: result.ok,
+      summary: result.summary,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
     };
-  } catch (err) {
-    return { ok: false, summary: `Error executing ${kind}: ${err}` };
   }
-}
-
-// ─── Streaming utilities ────────────────────────────────────────────────────
-
-/**
- * Read a process stream line-by-line, calling onLine for each.
- * Returns the full concatenated output.
- */
-async function streamLines(
-  readable: ReadableStream<Uint8Array>,
-  streamName: "stdout" | "stderr",
-  onLine: (stream: "stdout" | "stderr", line: string) => void,
-): Promise<string> {
-  const decoder = new TextDecoder();
-  const reader = readable.getReader();
-  let full = "";
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const chunk = decoder.decode(value, { stream: true });
-    full += chunk;
-    buffer += chunk;
-
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      const clean = line.endsWith("\r") ? line.slice(0, -1) : line;
-      onLine(streamName, clean);
-    }
-  }
-
-  // Flush remaining buffer
-  if (buffer.length > 0) {
-    const clean = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
-    onLine(streamName, clean);
-  }
-
-  return full;
+  return executeJob(job.kind, job.params, repo, onLog);
 }
 
 // ─── Command helper ─────────────────────────────────────────────────────────
@@ -557,11 +128,17 @@ function sendCommand(
 
 // ─── Worker loop ────────────────────────────────────────────────────────────
 
-async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
+async function workerLoop(
+  opts: ReturnType<typeof parseArgs>,
+  dockerExecutor: DockerExecutor | null,
+): Promise<void> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (opts.authToken) headers["Authorization"] = `Bearer ${opts.authToken}`;
 
   console.log(`[Worker ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
+  if (dockerExecutor) {
+    console.log(`[Worker ${opts.workerId}] Docker mode enabled (${opts.dockerImage})`);
+  }
 
   while (true) {
     try {
@@ -606,14 +183,20 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
               }
             : undefined;
 
-          const params = typeof job.params === "string" ? JSON.parse(job.params) : job.params;
-          const result = await executeJob(job.kind, params, opts.repo, onLog);
+          const jobData = {
+            id: job.id,
+            taskId: job.taskId,
+            kind: job.kind,
+            params: typeof job.params === "string" ? JSON.parse(job.params) : job.params,
+            sessionId: job.sessionId,
+          };
+          const result = await runJob(jobData, opts.repo, dockerExecutor, onLog);
 
           // 3. Wait for chained log sends to complete
           await logChain;
 
-          // 3.5. Create git commit for file-modifying jobs
-          if (result.ok && shouldCommit(job.kind)) {
+          // 3.5. Create git commit for file-modifying jobs (only in direct mode)
+          if (result.ok && shouldCommit(job.kind) && !dockerExecutor) {
             console.log(`[Worker] Job ${job.id} modified files, creating commit...`);
             const commitResult = await createJobCommit(opts.repo, opts.workerId, {
               id: job.id,
@@ -718,12 +301,47 @@ async function workerLoop(opts: ReturnType<typeof parseArgs>): Promise<void> {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-const opts = parseArgs();
-console.log(`[Worker] PushPals Worker Daemon (${opts.workerId})`);
-console.log(`[Worker] Server: ${opts.server}`);
-console.log(`[Worker] Repo: ${opts.repo}`);
+async function main(): Promise<void> {
+  const opts = parseArgs();
 
-workerLoop(opts).catch((err) => {
-  console.error("[Worker] Fatal:", err);
-  process.exit(1);
-});
+  console.log(`[Worker] PushPals Worker Daemon (${opts.workerId})`);
+  console.log(`[Worker] Server: ${opts.server}`);
+  console.log(`[Worker] Repo: ${opts.repo}`);
+
+  let dockerExecutor: DockerExecutor | null = null;
+
+  if (opts.docker) {
+    // Check if Docker is available
+    const dockerAvailable = await DockerExecutor.isDockerAvailable();
+    if (!dockerAvailable) {
+      console.error("[Worker] Docker is not available. Make sure Docker is installed and running.");
+      console.error("[Worker] Falling back to direct mode...");
+    } else {
+      dockerExecutor = new DockerExecutor({
+        imageName: opts.dockerImage,
+        repo: opts.repo,
+        workerId: opts.workerId,
+        gitToken: opts.gitToken ?? undefined,
+        timeoutMs: opts.dockerTimeout,
+      });
+
+      // Clean up orphaned worktrees from previous runs
+      await dockerExecutor.cleanupOrphanedWorktrees();
+
+      // Pull the image
+      const pulled = await dockerExecutor.pullImage();
+      if (!pulled) {
+        console.error(`[Worker] Failed to pull Docker image: ${opts.dockerImage}`);
+        console.error("[Worker] Falling back to direct mode...");
+        dockerExecutor = null;
+      }
+    }
+  }
+
+  workerLoop(opts, dockerExecutor).catch((err) => {
+    console.error("[Worker] Fatal:", err);
+    process.exit(1);
+  });
+}
+
+main();

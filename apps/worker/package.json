@@ -4,10 +4,18 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/index.ts",
-    "start": "bun run src/index.ts"
+    "start": "bun run src/index.ts",
+    "build:sandbox": "docker build -f Dockerfile.sandbox -t pushpals-worker-sandbox:latest ../..",
+    "docker:build": "docker build -f Dockerfile.sandbox -t pushpals-worker-sandbox:latest ../..",
+    "docker:build:local": "docker build -f Dockerfile.sandbox -t pushpals-worker-sandbox:local ../..",
+    "docker:run": "docker run --rm -it pushpals-worker-sandbox:latest",
+    "dev:docker": "bun run src/index.ts --docker",
+    "worker:docker": "bun run src/index.ts --docker",
+    "worker:docker:local": "bun run src/index.ts --docker --docker-image pushpals-worker-sandbox:local"
   },
   "dependencies": {
-    "protocol": "workspace:*"
+    "protocol": "workspace:*",
+    "shared": "workspace:*"
   },
   "devDependencies": {
     "typescript": "~5.9.2",

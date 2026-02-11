@@ -1,0 +1,39 @@
+# PushPals Worker Sandbox Dockerfile
+# This image provides an isolated environment for job execution
+# The entire monorepo is available in the container for job execution
+
+FROM oven/bun:1-debian AS base
+
+# Install git and other essential tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    ca-certificates \
+    openssh-client \
+    grep \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure git for the worker
+RUN git config --global user.name "PushPals Worker" \
+    && git config --global user.email "worker@pushpals.local" \
+    && git config --global safe.directory '*' \
+    && git config --global core.autocrlf input
+
+# Set up the full monorepo structure
+WORKDIR /workspace
+
+# Copy entire repository (build context should be repo root)
+COPY . .
+
+# Install dependencies for the entire workspace
+RUN bun install --production
+
+# Build protocol package (needed by worker)
+RUN cd packages/protocol && bun run build
+
+# Set working directory for job execution
+WORKDIR /workspace
+
+# Default entrypoint runs the job runner with base64-encoded job spec
+ENTRYPOINT ["bun", "run", "/workspace/apps/worker/src/job_runner.ts"]

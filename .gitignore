@@ -154,3 +154,12 @@ packages/protocol/dist/
 .env
 .env.*
 !.env.example
+
+# Docker worker sandbox build artifacts
+apps/worker/.dockerbuild/
+*.docker.tar.gz
+
+# Git worktrees for isolated job execution
+.worktrees/
+
+
