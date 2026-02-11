@@ -13,13 +13,79 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import shlex
+import socket
+import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
 
 RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ "
+
+
+class ManagedLocalAgentServer:
+    """Minimal local OpenHands agent-server lifecycle manager."""
+
+    def __init__(self, host: str = "127.0.0.1") -> None:
+        self.host = host
+        self.port = _find_free_port()
+        self.base_url = f"http://{self.host}:{self.port}"
+        self.process: Optional[subprocess.Popen[str]] = None
+
+    def __enter__(self) -> "ManagedLocalAgentServer":
+        self.process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "openhands.agent_server",
+                "--port",
+                str(self.port),
+                "--host",
+                self.host,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env={"LOG_JSON": "true", **os.environ},
+        )
+
+        deadline = time.time() + 30.0
+        health_url = f"{self.base_url}/health"
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError("OpenHands agent server exited before becoming ready")
+            try:
+                with urllib.request.urlopen(health_url, timeout=1.0) as res:
+                    if res.status == 200:
+                        return self
+            except (urllib.error.URLError, TimeoutError, OSError):
+                time.sleep(0.2)
+
+        raise RuntimeError("Timed out waiting for OpenHands agent server health check")
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if not self.process:
+            return
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=5)
+        except Exception:
+            try:
+                self.process.kill()
+                self.process.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
 
 
 def _emit(result: Dict[str, Any]) -> None:
@@ -56,12 +122,7 @@ def _to_int(value: Any, default: int) -> int:
 def _python_cmd(script: str) -> str:
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     python_bin = shlex.quote(
-        str(
-            (
-                __import__("os").environ.get("WORKER_OPENHANDS_WORKSPACE_PYTHON")
-                or "python3"
-            )
-        )
+        str((os.environ.get("WORKER_OPENHANDS_WORKSPACE_PYTHON") or "python3"))
     )
     return (
         f"{python_bin} - <<'PY'\n"
@@ -331,11 +392,12 @@ def main() -> int:
         return _fail("Invalid payload: missing 'repo'", exit_code=2)
 
     try:
-        from openhands.sdk import LocalAgentServer, Workspace
+        from openhands.sdk import Workspace
     except Exception as exc:
         return _fail(
             "OpenHands SDK is not available in worker runtime. "
-            "Install openhands-sdk/openhands-agent-server/openhands-workspace.",
+            "Install openhands-sdk/openhands-agent-server/openhands-workspace "
+            "and ensure imports are compatible.",
             stderr=str(exc),
             exit_code=3,
         )
@@ -349,7 +411,7 @@ def main() -> int:
         return _fail(f"Unknown job kind: {kind}", exit_code=2)
 
     try:
-        with LocalAgentServer() as server:
+        with ManagedLocalAgentServer() as server:
             with Workspace(host=server.base_url, working_dir=repo) as workspace:
                 raw_result = workspace.execute_command(cmd)
                 exit_code, stdout, stderr = _parse_workspace_result(raw_result)
