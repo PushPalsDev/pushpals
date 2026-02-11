@@ -1,11 +1,6 @@
 import { useEffect, useState, useCallback, useRef, useMemo, useReducer } from "react";
 import type { EventEnvelope, EventType } from "protocol/browser";
-import {
-  subscribeEvents,
-  createSession,
-  sendMessage,
-  submitApprovalDecision,
-} from "./pushpalsApi";
+import { subscribeEvents, createSession, sendMessage, submitApprovalDecision } from "./pushpalsApi";
 import {
   eventReducer,
   initialState,

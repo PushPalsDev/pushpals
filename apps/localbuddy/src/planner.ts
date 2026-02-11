@@ -339,7 +339,6 @@ export class RemotePlanner implements PlannerModel {
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {
-
     const userPrompt = `User request: "${input.userText}"
 ${input.repoContext?.gitStatus ? `\nGit status:\n${input.repoContext.gitStatus}` : ""}
 ${input.repoContext?.gitDiff ? `\nGit diff (truncated):\n${input.repoContext.gitDiff.substring(0, 2000)}` : ""}`;

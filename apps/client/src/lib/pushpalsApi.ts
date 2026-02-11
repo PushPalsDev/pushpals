@@ -227,10 +227,7 @@ export async function createSession(baseUrl: string, sessionId?: string): Promis
  * LocalBuddy enhances the prompt with repo context and enqueues it to the Request Queue,
  * streaming status updates back to the client via SSE.
  */
-export async function sendMessage(
-  localAgentUrl: string,
-  text: string,
-): Promise<boolean> {
+export async function sendMessage(localAgentUrl: string, text: string): Promise<boolean> {
   try {
     const response = await fetch(`${localAgentUrl}/message`, {
       method: "POST",

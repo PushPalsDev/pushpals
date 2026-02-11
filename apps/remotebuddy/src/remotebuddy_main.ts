@@ -541,10 +541,10 @@ class RemoteBuddyOrchestrator {
       });
     } else {
       // Any non-trivial request is WorkerPal-owned.
-      await this.comm.assistantMessage(
-        "Understood. I am delegating this to a WorkerPal now.",
-        { turnId, correlationId: requestId },
-      );
+      await this.comm.assistantMessage("Understood. I am delegating this to a WorkerPal now.", {
+        turnId,
+        correlationId: requestId,
+      });
 
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
@@ -593,8 +593,8 @@ class RemoteBuddyOrchestrator {
         payload: {
           taskId,
           message: targetWorkerId
-             ? `Assigned to WorkerPal ${targetWorkerId}`
-             : "No idle WorkerPal available; queued for first available WorkerPal",
+            ? `Assigned to WorkerPal ${targetWorkerId}`
+            : "No idle WorkerPal available; queued for first available WorkerPal",
         },
         turnId,
       });

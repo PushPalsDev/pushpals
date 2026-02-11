@@ -375,7 +375,10 @@ export class JobRunner {
         job.id,
         `Success: ${this.config.mainBranch} ${mainBefore?.slice(0, 8)}..${mainAfter?.slice(0, 8)}`,
       );
-      db.addLog(job.id, `Merged successfully. ${this.config.mainBranch}: ${mainAfter?.slice(0, 8)}`);
+      db.addLog(
+        job.id,
+        `Merged successfully. ${this.config.mainBranch}: ${mainAfter?.slice(0, 8)}`,
+      );
       db.markSuccess(job.id);
 
       return { status: "success", message: `Merged ${job.branch} into ${this.config.mainBranch}` };

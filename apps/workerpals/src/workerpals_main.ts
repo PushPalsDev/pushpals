@@ -619,7 +619,9 @@ async function main(): Promise<void> {
         console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
         dockerExecutor = null;
       } else if (!envTruthy("WORKERPALS_SKIP_DOCKER_SELF_CHECK")) {
-        console.log("[WorkerPals] Running Docker startup self-check (git/worktree in container)...");
+        console.log(
+          "[WorkerPals] Running Docker startup self-check (git/worktree in container)...",
+        );
         try {
           await dockerExecutor.validateWorktreeGitInterop();
         } catch (err) {

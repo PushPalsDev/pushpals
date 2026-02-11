@@ -22,11 +22,7 @@ type GitCmdResult = {
 };
 
 const repoRoot = resolve(import.meta.dir, "..", "..", "..");
-const defaultSourceControlManagerRepoPath = join(
-  repoRoot,
-  ".worktrees",
-  "source_control_manager",
-);
+const defaultSourceControlManagerRepoPath = join(repoRoot, ".worktrees", "source_control_manager");
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -129,8 +125,7 @@ const hasRepoPathOverride =
   typeof args.repo === "string" ||
   (process.env.SOURCE_CONTROL_MANAGER_REPO_PATH ?? "").trim().length > 0;
 const usingDefaultRepoPath =
-  !hasRepoPathOverride &&
-  resolve(config.repoPath) === resolve(defaultSourceControlManagerRepoPath);
+  !hasRepoPathOverride && resolve(config.repoPath) === resolve(defaultSourceControlManagerRepoPath);
 
 // Validate config before proceeding
 try {

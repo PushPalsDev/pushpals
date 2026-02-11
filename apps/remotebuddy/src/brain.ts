@@ -197,7 +197,8 @@ export class AgentBrain {
     targetPath: string,
     context?: string[],
   ): Promise<string> {
-    const contextBlock = context && context.length > 0 ? `Recent context:\n${context.slice(-10).join("\n")}` : "";
+    const contextBlock =
+      context && context.length > 0 ? `Recent context:\n${context.slice(-10).join("\n")}` : "";
     const userPrompt = loadPromptTemplate("remotebuddy/fallback_file_user_prompt.txt", {
       target_path: targetPath,
       user_request: userText,

@@ -293,10 +293,7 @@ export class DockerExecutor {
     if (this.options.gitToken) {
       args.push("-e", `GIT_TOKEN=${this.options.gitToken}`);
     }
-    args.push(
-      "-e",
-      `WORKERPALS_OPENHANDS_AGENT_SERVER_URL=http://127.0.0.1:${this.warmAgentPort}`,
-    );
+    args.push("-e", `WORKERPALS_OPENHANDS_AGENT_SERVER_URL=http://127.0.0.1:${this.warmAgentPort}`);
 
     args.push(
       "--entrypoint",
@@ -322,20 +319,26 @@ export class DockerExecutor {
       ["docker", "inspect", "-f", "{{.State.Running}}", this.warmContainerName],
       { stdout: "pipe", stderr: "pipe" },
     );
-    const [exitCode, stdout] = await Promise.all([inspect.exited, new Response(inspect.stdout).text()]);
+    const [exitCode, stdout] = await Promise.all([
+      inspect.exited,
+      new Response(inspect.stdout).text(),
+    ]);
     if (exitCode === 0 && stdout.trim() === "true") return;
     await this.startWarmContainer();
   }
 
   private async stopWarmContainer(reason: string, quiet = false): Promise<void> {
     this.clearIdleTimer();
-    const stopProc = Bun.spawn(
-      ["docker", "rm", "-f", this.warmContainerName],
-      { stdout: "pipe", stderr: "pipe" },
-    );
+    const stopProc = Bun.spawn(["docker", "rm", "-f", this.warmContainerName], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     const exitCode = await stopProc.exited;
     if (exitCode === 0) {
-      if (!quiet) console.log(`[DockerExecutor] Warm container stopped (${reason}): ${this.warmContainerName}`);
+      if (!quiet)
+        console.log(
+          `[DockerExecutor] Warm container stopped (${reason}): ${this.warmContainerName}`,
+        );
       return;
     }
     const stderr = (await new Response(stopProc.stderr).text()).trim();
