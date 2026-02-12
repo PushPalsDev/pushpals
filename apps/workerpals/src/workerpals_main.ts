@@ -660,18 +660,25 @@ async function main(): Promise<void> {
   }
 
   if (dockerExecutor) {
+    let cleanupTriggered = false;
     const cleanup = async () => {
       await dockerExecutor.shutdown().catch((err) => {
         console.error(`[WorkerPals] Docker shutdown cleanup failed: ${String(err)}`);
       });
     };
-    process.on("SIGINT", () => {
-      void cleanup().finally(() => process.exit(130));
-    });
-    process.on("SIGTERM", () => {
-      void cleanup().finally(() => process.exit(143));
-    });
-    process.on("exit", () => {
+    const cleanupAndExit = (code: number) => {
+      if (cleanupTriggered) return;
+      cleanupTriggered = true;
+      void cleanup().finally(() => process.exit(code));
+    };
+    process.once("SIGINT", () => cleanupAndExit(130));
+    process.once("SIGTERM", () => cleanupAndExit(143));
+    if (process.platform === "win32") {
+      process.once("SIGBREAK", () => cleanupAndExit(131));
+    }
+    process.once("exit", () => {
+      if (cleanupTriggered) return;
+      cleanupTriggered = true;
       void cleanup();
     });
   }

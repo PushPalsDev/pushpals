@@ -788,6 +788,99 @@ async function runCapture(cmd: string[], cwd = repoRoot): Promise<CmdResult> {
   }
 }
 
+function parseDockerIdList(raw: string): string[] {
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+function normalizePathForCompare(pathValue: string): string {
+  return pathValue.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+async function collectWorkerWarmContainersForRepo(): Promise<string[]> {
+  const candidateIds = new Set<string>();
+  const repoNeedle = normalizePathForCompare(repoRoot);
+
+  const labeled = await runCapture([
+    "docker",
+    "ps",
+    "-aq",
+    "--filter",
+    "label=pushpals.component=workerpals-warm",
+  ]);
+  if (labeled.ok) {
+    for (const id of parseDockerIdList(labeled.stdout)) {
+      candidateIds.add(id);
+    }
+  }
+
+  const byName = await runCapture(["docker", "ps", "-aq", "--filter", "name=pushpals-workerpal-"]);
+  if (byName.ok) {
+    for (const id of parseDockerIdList(byName.stdout)) {
+      candidateIds.add(id);
+    }
+  }
+
+  const matchedIds = new Set<string>();
+  for (const id of candidateIds) {
+    const inspected = await runCapture([
+      "docker",
+      "inspect",
+      "-f",
+      "{{.Name}}||{{index .Config.Labels \"pushpals.repo\"}}||{{range .Mounts}}{{.Source}};;{{end}}",
+      id,
+    ]);
+    if (!inspected.ok) continue;
+
+    const [namePart, labeledRepo = "", mountsPart = ""] = inspected.stdout.split("||", 3);
+    const containerName = namePart.trim().replace(/^\//, "");
+    if (!containerName.startsWith("pushpals-workerpal-") || !containerName.endsWith("-warm")) {
+      continue;
+    }
+
+    const normalizedLabeledRepo = normalizePathForCompare(labeledRepo.trim());
+    if (normalizedLabeledRepo && normalizedLabeledRepo === repoNeedle) {
+      matchedIds.add(id);
+      continue;
+    }
+
+    const hasRepoMount = mountsPart
+      .split(";;")
+      .map((source) => normalizePathForCompare(source.trim()))
+      .filter(Boolean)
+      .some((source) => source === repoNeedle || source.startsWith(`${repoNeedle}/`));
+    if (hasRepoMount) {
+      matchedIds.add(id);
+    }
+  }
+
+  return Array.from(matchedIds);
+}
+
+async function cleanupWorkerWarmContainers(reason: string): Promise<void> {
+  const ids = await collectWorkerWarmContainersForRepo();
+  if (ids.length === 0) return;
+
+  let removed = 0;
+  for (const id of ids) {
+    if ((await runQuiet(["docker", "rm", "-f", id])) === 0) {
+      removed += 1;
+    }
+  }
+
+  if (removed > 0) {
+    console.log(`[start] Removed ${removed} WorkerPals warm container(s) (${reason}).`);
+  }
+  const failed = ids.length - removed;
+  if (failed > 0) {
+    console.warn(
+      `[start] Failed to remove ${failed} WorkerPals warm container(s) during ${reason}.`,
+    );
+  }
+}
+
 async function git(args: string[]): Promise<CmdResult> {
   return runCapture(["git", ...args], repoRoot);
 }
@@ -1099,6 +1192,7 @@ const shutdown = async (code: number) => {
   try {
     proc?.kill();
   } catch {}
+  await cleanupWorkerWarmContainers("shutdown");
   await stopManagedLmStudio();
   process.exit(code);
 };
@@ -1113,6 +1207,7 @@ process.on("SIGTERM", () => {
 try {
   cleanRuntimeStateIfRequested();
   sanitizeWindowsWatcherPaths();
+  await cleanupWorkerWarmContainers("startup preflight");
   await ensureLlmPreflight();
   await ensureIntegrationBranch();
   await cleanLegacyLocalBranchesIfRequested();
@@ -1120,6 +1215,7 @@ try {
   await ensureSourceControlManagerWorktree();
   await ensureDockerImage();
 } catch (err) {
+  await cleanupWorkerWarmContainers("startup failure");
   await stopManagedLmStudio();
   if (err instanceof StartAbort) {
     process.exit(err.exitCode);
@@ -1135,5 +1231,6 @@ proc = Bun.spawn(["bun", "run", "dev:full"], {
 });
 
 const exitCode = await proc.exited;
+await cleanupWorkerWarmContainers("dev:full exit");
 await stopManagedLmStudio();
 process.exit(exitCode);
