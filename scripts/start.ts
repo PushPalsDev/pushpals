@@ -6,14 +6,18 @@
  * from shell wrappers. This wrapper intentionally ignores forwarded args and
  * always launches `dev:full` with the canonical script options.
  *
+ * Supported flags:
+ * - `-c` / `--clean`: wipe runtime data dir (`PUSHPALS_DATA_DIR`, default `outputs/data`)
+ *   before bootstrapping services.
+ *
  * It also performs startup preflights:
  * - LLM endpoint reachability (and optional LM Studio headless auto-start)
  * - integration branch/worktree safety
  * - worker Docker image existence
  */
 
-import { mkdirSync } from "fs";
-import { dirname, resolve } from "path";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, unlinkSync } from "fs";
+import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 
 const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
@@ -39,6 +43,10 @@ const DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE = resolve(
 );
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 
+type StartOptions = {
+  clean: boolean;
+};
+
 let managedLmStudioProc: ReturnType<typeof Bun.spawn> | null = null;
 let managedLmStudioExitCode: number | null = null;
 let managedLmStudioCommand: string[] | null = null;
@@ -57,6 +65,23 @@ class StartAbort extends Error {
   }
 }
 
+function parseStartOptions(argv: string[]): StartOptions {
+  let clean = false;
+
+  for (const arg of argv) {
+    if (arg === "-c" || arg === "--clean") {
+      clean = true;
+      continue;
+    }
+    if (arg === "--") break;
+    console.warn(`[start] Ignoring unknown start flag: ${arg}`);
+  }
+
+  return { clean };
+}
+
+const startOptions = parseStartOptions(process.argv.slice(2));
+
 type SupportedLlmBackend = "lmstudio" | "ollama";
 
 function abortStart(exitCode: number): never {
@@ -65,6 +90,86 @@ function abortStart(exitCode: number): never {
 
 function envTruthy(name: string): boolean {
   return TRUTHY.has((process.env[name] ?? "").toLowerCase());
+}
+
+function resolveFromRepo(pathValue: string): string {
+  return isAbsolute(pathValue) ? pathValue : resolve(repoRoot, pathValue);
+}
+
+function isWithinRepo(pathValue: string): boolean {
+  const rel = relative(repoRoot, pathValue);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function dataDirPath(): string {
+  const configured = (process.env.PUSHPALS_DATA_DIR ?? "").trim();
+  return configured ? resolveFromRepo(configured) : resolve(repoRoot, "outputs", "data");
+}
+
+function cleanRuntimeStateIfRequested(): void {
+  if (!startOptions.clean) return;
+
+  const dataDir = dataDirPath();
+  const allowExternalClean = envTruthy("PUSHPALS_ALLOW_EXTERNAL_CLEAN");
+  if (!isWithinRepo(dataDir) && !allowExternalClean) {
+    console.warn(
+      `[start] Refusing to clean data dir outside repo without PUSHPALS_ALLOW_EXTERNAL_CLEAN=1: ${dataDir}`,
+    );
+    return;
+  }
+
+  if (!existsSync(dataDir)) {
+    console.log(`[start] Clean run: no runtime data directory found at ${dataDir} (nothing to delete).`);
+    return;
+  }
+
+  rmSync(dataDir, { recursive: true, force: true });
+  console.log(`[start] Clean run: removed runtime state at ${dataDir}`);
+}
+
+function sanitizeBinDir(binDir: string): number {
+  if (!existsSync(binDir)) return 0;
+  let removed = 0;
+  for (const entry of readdirSync(binDir)) {
+    const fullPath = resolve(binDir, entry);
+    try {
+      lstatSync(fullPath);
+    } catch (err: any) {
+      const code = typeof err?.code === "string" ? err.code : "";
+      if (code === "EACCES" || code === "EPERM" || code === "UNKNOWN") {
+        try {
+          unlinkSync(fullPath);
+          removed += 1;
+          console.warn(`[start] Removed inaccessible bin entry: ${fullPath}`);
+        } catch {
+          // keep startup resilient; if we cannot remove it, client may still fail and show the path
+        }
+      }
+    }
+  }
+  return removed;
+}
+
+function sanitizeInaccessibleBinEntries(): void {
+  if (process.platform !== "win32") return;
+
+  const candidateDirs = [resolve(repoRoot, "node_modules", ".bin")];
+  for (const group of ["apps", "packages"]) {
+    const groupPath = resolve(repoRoot, group);
+    if (!existsSync(groupPath)) continue;
+    for (const entry of readdirSync(groupPath, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      candidateDirs.push(resolve(groupPath, entry.name, "node_modules", ".bin"));
+    }
+  }
+
+  let removedTotal = 0;
+  for (const dir of candidateDirs) {
+    removedTotal += sanitizeBinDir(dir);
+  }
+  if (removedTotal > 0) {
+    console.log(`[start] Cleaned ${removedTotal} inaccessible node_modules/.bin entries for Windows watcher compatibility.`);
+  }
 }
 
 function parsePositiveInt(value: string | null | undefined): number | null {
@@ -867,6 +972,8 @@ process.on("SIGTERM", () => {
 });
 
 try {
+  cleanRuntimeStateIfRequested();
+  sanitizeInaccessibleBinEntries();
   await ensureLlmPreflight();
   await ensureIntegrationBranch();
   await ensureGitHubAuth();

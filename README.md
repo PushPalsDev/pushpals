@@ -67,6 +67,14 @@ Use:
 bun run start
 ```
 
+Optional clean run:
+
+```bash
+bun run start -c
+```
+
+`-c`/`--clean` removes runtime state from `PUSHPALS_DATA_DIR` (default `outputs/data`) before startup.
+
 `scripts/start.ts` preflights:
 
 - LLM endpoint reachability (fails fast with clear error if model server is down)
