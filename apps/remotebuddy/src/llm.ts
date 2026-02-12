@@ -34,6 +34,43 @@ type LlmBackend = "lmstudio" | "ollama";
 const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_MODEL = "local-model";
+const REMOTEBUDDY_JSON_RESPONSE_SCHEMA: Record<string, unknown> = {
+  name: "remotebuddy_response",
+  strict: false,
+  schema: {
+    type: "object",
+    properties: {
+      assistant_message: { type: "string" },
+      tasks: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            taskId: { type: "string" },
+            title: { type: "string" },
+            description: { type: "string" },
+            jobs: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  kind: { type: "string" },
+                  params: { type: "object" },
+                },
+                required: ["kind"],
+                additionalProperties: true,
+              },
+            },
+          },
+          required: ["taskId", "title"],
+          additionalProperties: true,
+        },
+      },
+    },
+    required: ["assistant_message"],
+    additionalProperties: true,
+  },
+};
 
 function normalizeBackend(value: string | null | undefined): LlmBackend | null {
   const normalized = (value ?? "").trim().toLowerCase();
@@ -89,40 +126,70 @@ export class LmStudioClient implements LLMClient {
       ...input.messages,
     ];
 
-    const body: Record<string, unknown> = {
+    const baseBody: Record<string, unknown> = {
       model: this.model,
       messages,
       max_tokens: input.maxTokens ?? 2048,
       temperature: input.temperature ?? 0.3,
     };
 
-    if (input.json) {
-      body.response_format = { type: "json_object" };
+    const bodyVariants: Array<Record<string, unknown>> = [];
+    if (!input.json) {
+      bodyVariants.push(baseBody);
+    } else {
+      // LM Studio validates response_format.type and expects json_schema or text.
+      bodyVariants.push({
+        ...baseBody,
+        response_format: {
+          type: "json_schema",
+          json_schema: REMOTEBUDDY_JSON_RESPONSE_SCHEMA,
+        },
+      });
+      // Fallback for providers/configs that reject the schema payload.
+      bodyVariants.push({
+        ...baseBody,
+        response_format: { type: "text" },
+      });
     }
 
-    const res = await fetch(this.endpoint, {
-      method: "POST",
-      headers: lmStudioHeaders(this.apiKey),
-      body: JSON.stringify(body),
-    });
+    let lastStatus = 0;
+    let lastError = "unknown error";
+    for (let i = 0; i < bodyVariants.length; i++) {
+      const body = bodyVariants[i];
+      const res = await fetch(this.endpoint, {
+        method: "POST",
+        headers: lmStudioHeaders(this.apiKey),
+        body: JSON.stringify(body),
+      });
 
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`LM Studio API error ${res.status}: ${err}`);
+      if (!res.ok) {
+        lastStatus = res.status;
+        lastError = await res.text();
+        const hasFallback = i < bodyVariants.length - 1;
+        if (hasFallback && res.status === 400) {
+          console.warn(
+            `[LLM] LM Studio rejected response_format payload, retrying with fallback (${lastStatus}).`,
+          );
+          continue;
+        }
+        throw new Error(`LM Studio API error ${res.status}: ${lastError}`);
+      }
+
+      const data = (await res.json()) as any;
+      const choice = data.choices?.[0];
+
+      return {
+        text: choice?.message?.content ?? "",
+        usage: data.usage
+          ? {
+              promptTokens: data.usage.prompt_tokens,
+              completionTokens: data.usage.completion_tokens,
+            }
+          : undefined,
+      };
     }
 
-    const data = (await res.json()) as any;
-    const choice = data.choices?.[0];
-
-    return {
-      text: choice?.message?.content ?? "",
-      usage: data.usage
-        ? {
-            promptTokens: data.usage.prompt_tokens,
-            completionTokens: data.usage.completion_tokens,
-          }
-        : undefined,
-    };
+    throw new Error(`LM Studio API error ${lastStatus}: ${lastError}`);
   }
 }
 

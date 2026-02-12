@@ -50,6 +50,36 @@ const FILE_MODIFYING_JOB_KINDS = new Set([
   "file.mkdir",
 ]);
 
+function parseStructuredJson(text: string): any {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new Error("empty model response");
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Try fenced JSON block.
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fenced?.[1]) {
+      try {
+        return JSON.parse(fenced[1]);
+      } catch {
+        // fall through
+      }
+    }
+
+    // Last resort: parse the largest object-looking slice.
+    const firstBrace = trimmed.indexOf("{");
+    const lastBrace = trimmed.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    }
+
+    throw new Error("response did not contain parseable JSON");
+  }
+}
+
 function hasFileWriteIntent(text: string): boolean {
   const t = text.toLowerCase();
   const explicitWrite =
@@ -242,7 +272,7 @@ export class AgentBrain {
         temperature: 0.3,
       });
 
-      const parsed = JSON.parse(result.text) as {
+      const parsed = parseStructuredJson(result.text) as {
         assistant_message?: string;
         tasks?: Array<{
           taskId: string;
