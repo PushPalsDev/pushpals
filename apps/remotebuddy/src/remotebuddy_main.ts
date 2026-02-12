@@ -197,6 +197,9 @@ class RemoteBuddyOrchestrator {
   private readonly spawnWorkerLabels: string[];
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
+  private stopSessionEvents: (() => void) | null = null;
+  private readonly seenJobFailures = new Set<string>();
+  private readonly eventMonitorStartedAt = Date.now();
   private jobsDb: Database | null = null;
   private disposed = false;
 
@@ -284,6 +287,39 @@ class RemoteBuddyOrchestrator {
     } catch (err) {
       console.error(`[RemoteBuddy] Command ${cmd.type} error:`, err);
     }
+  }
+
+  startSessionEventMonitor(): void {
+    this.stopSessionEvents = this.comm.subscribeSessionEvents(
+      (envelope) => {
+        if (envelope.type !== "job_failed") return;
+        const tsMs = Date.parse(envelope.ts);
+        if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
+        const payload = envelope.payload as { jobId?: unknown; message?: unknown; detail?: unknown };
+        const jobId = String(payload.jobId ?? "").trim();
+        const message = toSingleLine(payload.message, 220);
+        const detail = toSingleLine(payload.detail, 220);
+        if (!jobId || !message) return;
+
+        const dedupeKey = `${jobId}:${message}`;
+        if (this.seenJobFailures.has(dedupeKey)) return;
+        this.seenJobFailures.add(dedupeKey);
+
+        const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
+        this.pushContext(failureLine);
+        console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
+
+        const summary = `WorkerPal job ${jobId.slice(0, 8)} failed: ${message}${detail ? ` (${detail})` : ""}`;
+        void this.comm.assistantMessage(summary, {
+          correlationId: envelope.correlationId,
+          turnId: envelope.turnId,
+          parentId: envelope.id,
+        });
+      },
+      {
+        onError: (message) => console.warn(`[RemoteBuddy] Session monitor: ${message}`),
+      },
+    );
   }
 
   /**
@@ -699,6 +735,14 @@ class RemoteBuddyOrchestrator {
 
   dispose(): void {
     this.disposed = true;
+    if (this.stopSessionEvents) {
+      try {
+        this.stopSessionEvents();
+      } catch {
+        // ignore unsubscribe errors on shutdown
+      }
+      this.stopSessionEvents = null;
+    }
     for (const [workerId, proc] of this.managedWorkers.entries()) {
       try {
         proc.kill();
@@ -784,6 +828,8 @@ async function main() {
     idempotency,
     jobsDbPath: sharedDbPath,
   });
+
+  orchestrator.startSessionEventMonitor();
 
   // Start polling for requests from the Request Queue
   const pollMs = parseInt(process.env.REMOTEBUDDY_POLL_MS ?? "2000", 10);

@@ -144,6 +144,13 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 def _python_cmd(script: str) -> str:
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     python_bin = shlex.quote(
@@ -311,6 +318,48 @@ def _agent_server_is_healthy(base_url: str, timeout: float = 1.0) -> bool:
         return False
 
 
+def _llm_probe_urls(base_url: str, model: str) -> List[str]:
+    normalized = base_url.rstrip("/")
+    provider = model.split("/", 1)[0].strip().lower() if "/" in model else ""
+
+    if provider == "ollama":
+        return [
+            f"{normalized}/api/tags",
+            f"{normalized}/tags",
+            normalized,
+        ]
+
+    if normalized.endswith("/v1"):
+        return [
+            f"{normalized}/models",
+            f"{normalized}/chat/completions",
+            normalized,
+        ]
+
+    return [
+        f"{normalized}/v1/models",
+        f"{normalized}/models",
+        normalized,
+    ]
+
+
+def _llm_endpoint_reachable(base_url: str, model: str, timeout: float = 2.0) -> Tuple[bool, str]:
+    if not base_url:
+        return True, ""
+
+    last_error = "connection failed"
+    for probe in _llm_probe_urls(base_url, model):
+        try:
+            with urllib.request.urlopen(probe, timeout=timeout) as res:
+                return True, f"{probe} -> {getattr(res, 'status', '?')}"
+        except urllib.error.HTTPError as exc:
+            # HTTP response means endpoint is reachable, even if auth/path differs.
+            return True, f"{probe} -> HTTP {exc.code}"
+        except Exception as exc:
+            last_error = f"{probe}: {exc}"
+    return False, last_error
+
+
 def _resolve_llm_config() -> Tuple[str, str, str]:
     raw_model = (
         os.environ.get("WORKERPALS_OPENHANDS_MODEL")
@@ -443,9 +492,40 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
                 "exitCode": 2,
             }
 
+    reachable, reachability_detail = _llm_endpoint_reachable(base_url, model)
+    if not reachable:
+        return {
+            "ok": False,
+            "summary": "OpenHands LLM endpoint is unreachable from worker runtime",
+            "stderr": (
+                f"Could not reach LLM endpoint for model {model} at {base_url}. "
+                f"Last probe error: {reachability_detail}"
+            ),
+            "exitCode": 2,
+        }
+
     llm_kwargs: Dict[str, Any] = {"model": model, "api_key": api_key}
     if base_url:
         llm_kwargs["base_url"] = base_url
+    if _looks_local_base_url(base_url):
+        # Local model servers should fail fast on connectivity issues instead
+        # of spending long retry windows that hit outer Docker timeouts.
+        llm_kwargs["num_retries"] = max(
+            0, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_NUM_RETRIES"), 2)
+        )
+        llm_kwargs["retry_multiplier"] = max(
+            1.0, _to_float(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MULTIPLIER"), 1.5)
+        )
+        llm_kwargs["retry_min_wait"] = max(
+            1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MIN_WAIT"), 1)
+        )
+        llm_kwargs["retry_max_wait"] = max(
+            llm_kwargs["retry_min_wait"],
+            _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MAX_WAIT"), 4),
+        )
+        llm_kwargs["timeout"] = max(
+            5, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_TIMEOUT_SEC"), 90)
+        )
 
     try:
         llm = LLM(**llm_kwargs)
@@ -489,10 +569,24 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
             "exitCode": 0,
         }
     except Exception as exc:
+        err_text = str(exc)
+        lowered = err_text.lower()
+        if "connection error" in lowered or "connection refused" in lowered:
+            return {
+                "ok": False,
+                "summary": "OpenHands could not connect to the configured local LLM endpoint",
+                "stderr": (
+                    f"{err_text}\n"
+                    f"Model: {model}\n"
+                    f"Base URL: {base_url}\n"
+                    "Verify the host LLM server is running and reachable from Docker."
+                ),
+                "exitCode": 2,
+            }
         return {
             "ok": False,
             "summary": "OpenHands agent task execution failed",
-            "stderr": str(exc),
+            "stderr": err_text,
             "exitCode": 1,
         }
 

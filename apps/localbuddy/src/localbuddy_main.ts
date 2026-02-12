@@ -56,6 +56,7 @@ class LocalBuddyServer {
   private repo: string;
   private authToken: string | null;
   private llm: LLMClient;
+  private readonly recentJobFailures: Array<{ jobId: string; message: string; ts: string }> = [];
 
   constructor(opts: { server: string; sessionId: string; authToken: string | null }) {
     this.server = opts.server;
@@ -88,7 +89,20 @@ class LocalBuddyServer {
         repo_root: this.repo,
       });
       const postSystemPrompt = loadPromptTemplate("shared/post_system_prompt.md");
-      const combinedSystemPrompt = `${systemPrompt}\n\n${postSystemPrompt}`.trim();
+      const failureContext = this.recentJobFailures
+        .slice(-3)
+        .map((failure) => `- ${failure.jobId}: ${failure.message}`)
+        .join("\n");
+      const combinedSystemPrompt = [
+        systemPrompt,
+        postSystemPrompt,
+        failureContext
+          ? `Recent WorkerPal job failures in this session (most recent first):\n${failureContext}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+        .trim();
 
       const output = await this.llm.generate({
         system: combinedSystemPrompt,
@@ -122,6 +136,40 @@ class LocalBuddyServer {
       authToken,
       from: `agent:${agentId}`,
     });
+
+    const monitorStartedAt = Date.now();
+    const stopSessionEvents = comm.subscribeSessionEvents(
+      (envelope) => {
+        if (envelope.type !== "job_failed") return;
+        const tsMs = Date.parse(envelope.ts);
+        if (Number.isFinite(tsMs) && tsMs + 2000 < monitorStartedAt) return;
+        const payload = envelope.payload as { jobId?: unknown; message?: unknown };
+        const jobId = String(payload.jobId ?? "").trim();
+        const message = String(payload.message ?? "").trim();
+        if (!jobId || !message) return;
+        this.recentJobFailures.unshift({ jobId, message, ts: envelope.ts });
+        if (this.recentJobFailures.length > 20) {
+          this.recentJobFailures.length = 20;
+        }
+        console.warn(`[LocalBuddy] Observed WorkerPal job failure ${jobId}: ${message}`);
+      },
+      {
+        onError: (message) => console.warn(`[LocalBuddy] Session monitor: ${message}`),
+      },
+    );
+
+    const stopMonitor = () => {
+      try {
+        stopSessionEvents();
+      } catch {
+        // ignore shutdown errors
+      }
+    };
+    process.once("SIGINT", stopMonitor);
+    process.once("SIGTERM", stopMonitor);
+    if (process.platform === "win32") {
+      process.once("SIGBREAK", stopMonitor);
+    }
 
     Bun.serve({
       port,

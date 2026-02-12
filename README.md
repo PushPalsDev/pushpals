@@ -109,6 +109,7 @@ See `.env.example` for full details. Most important:
 - `WORKERPALS_EXECUTOR` (`openhands` default)
 - `WORKERPALS_DOCKER_IMAGE`
 - `WORKERPALS_REQUIRE_DOCKER`
+- `WORKERPALS_DOCKER_NETWORK_MODE` (default `bridge`; required for containerized access to host LLM endpoints)
 
 LLM defaults:
 

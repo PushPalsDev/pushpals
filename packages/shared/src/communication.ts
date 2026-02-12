@@ -1,4 +1,4 @@
-import type { EventType, EventTypePayloadMap } from "protocol";
+import type { EventEnvelope, EventType, EventTypePayloadMap } from "protocol";
 
 type EventMeta = {
   from?: string;
@@ -6,6 +6,12 @@ type EventMeta = {
   correlationId?: string;
   turnId?: string;
   parentId?: string;
+};
+
+type SessionEventsOptions = {
+  afterCursor?: number;
+  reconnectMs?: number;
+  onError?: (message: string) => void;
 };
 
 export interface CommunicationManagerOptions {
@@ -91,5 +97,81 @@ export class CommunicationManager {
     const payload: EventTypePayloadMap["status"] =
       detail == null ? { agentId, state } : { agentId, state, detail };
     return this.emit("status", payload, meta);
+  }
+
+  subscribeSessionEvents(
+    onEvent: (envelope: EventEnvelope, cursor: number) => void,
+    options: SessionEventsOptions = {},
+  ): () => void {
+    let disposed = false;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let latestCursor = Math.max(0, options.afterCursor ?? 0);
+    const reconnectMs = Math.max(500, options.reconnectMs ?? 3000);
+    const onError =
+      options.onError ??
+      (() => {
+        // no-op
+      });
+
+    const connect = () => {
+      if (disposed) return;
+      try {
+        const url = new URL(this.serverUrl);
+        url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+        url.pathname = `/sessions/${this.sessionId}/ws`;
+        url.search = latestCursor > 0 ? `after=${latestCursor}` : "";
+        ws = new WebSocket(url.toString());
+      } catch (err) {
+        onError(`[SessionEvents] Failed to connect: ${String(err)}`);
+        if (!disposed) {
+          reconnectTimer = setTimeout(connect, reconnectMs);
+        }
+        return;
+      }
+
+      ws.onmessage = (event: MessageEvent) => {
+        try {
+          const raw =
+            typeof event.data === "string"
+              ? (JSON.parse(event.data) as Record<string, unknown>)
+              : null;
+          if (!raw) return;
+          const envelope = (raw.envelope ?? raw) as EventEnvelope;
+          const cursor = typeof raw.cursor === "number" ? raw.cursor : 0;
+          if (cursor > latestCursor) latestCursor = cursor;
+          onEvent(envelope, cursor);
+        } catch (err) {
+          onError(`[SessionEvents] Parse error: ${String(err)}`);
+        }
+      };
+
+      ws.onerror = () => {
+        onError("[SessionEvents] WebSocket error");
+      };
+
+      ws.onclose = () => {
+        ws = null;
+        if (!disposed) {
+          reconnectTimer = setTimeout(connect, reconnectMs);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        try {
+          ws.close();
+        } catch {
+          // ignore close errors
+        }
+      }
+      ws = null;
+    };
   }
 }

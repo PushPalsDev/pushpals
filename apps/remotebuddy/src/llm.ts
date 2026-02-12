@@ -37,6 +37,8 @@ const DEFAULT_MODEL = "local-model";
 const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
 const DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
+const DEFAULT_LMSTUDIO_CONTEXT_MODE = "batch";
+const DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES = 3;
 const REMOTEBUDDY_JSON_RESPONSE_SCHEMA: Record<string, unknown> = {
   name: "remotebuddy_response",
   strict: false,
@@ -137,6 +139,77 @@ function sumEstimatedTokens(messages: Array<{ role: string; content: string }>):
   return messages.reduce((acc, msg) => acc + estimateTokensFromText(msg.content), 0);
 }
 
+function parseContextMode(value: string | null | undefined): "batch" | "truncate" {
+  const normalized = (value ?? "").trim().toLowerCase();
+  return normalized === "truncate" ? "truncate" : "batch";
+}
+
+function chunkByCharBudget(text: string, charBudget: number): string[] {
+  if (!text) return [];
+  const safeBudget = Math.max(256, charBudget);
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const end = Math.min(text.length, i + safeBudget);
+    chunks.push(text.slice(i, end));
+    i = end;
+  }
+  return chunks;
+}
+
+function serializeMessagesForBatch(messages: Array<{ role: string; content: string }>): string {
+  return messages
+    .map(
+      (message, index) =>
+        `[#${index + 1}] role=${message.role}\n<<<BEGIN_CONTENT>>>\n${message.content}\n<<<END_CONTENT>>>`,
+    )
+    .join("\n\n====\n\n");
+}
+
+function trimLmStudioMessagesToBudget(
+  system: string,
+  inputMessages: LLMMessage[],
+  promptTokenBudget: number,
+  systemTokenBudget: number,
+): {
+  messages: Array<{ role: string; content: string }>;
+  promptTokensEstimate: number;
+  trimmed: boolean;
+} {
+  let trimmed = false;
+  let remainingPromptTokens = promptTokenBudget;
+  let systemContent = system;
+  if (estimateTokensFromText(systemContent) > systemTokenBudget) {
+    systemContent = truncateKeepingStart(systemContent, systemTokenBudget * 3);
+    trimmed = true;
+  }
+  remainingPromptTokens = Math.max(64, promptTokenBudget - estimateTokensFromText(systemContent));
+
+  const selectedMessages: Array<{ role: string; content: string }> = [];
+  for (let i = inputMessages.length - 1; i >= 0; i--) {
+    const source = inputMessages[i];
+    let content = source.content ?? "";
+    const estimated = estimateTokensFromText(content);
+    if (estimated <= remainingPromptTokens) {
+      selectedMessages.push({ role: source.role, content });
+      remainingPromptTokens -= estimated;
+      continue;
+    }
+    const charBudget = Math.max(192, remainingPromptTokens * 3);
+    content = truncateKeepingEnd(content, charBudget);
+    selectedMessages.push({ role: source.role, content });
+    trimmed = true;
+    break;
+  }
+
+  const messages: Array<{ role: string; content: string }> = [
+    { role: "system", content: systemContent },
+    ...selectedMessages.reverse(),
+  ];
+  const promptTokensEstimate = sumEstimatedTokens(messages);
+  return { messages, promptTokensEstimate, trimmed };
+}
+
 export class LmStudioClient implements LLMClient {
   private endpoint: string;
   private apiKey: string;
@@ -149,86 +222,21 @@ export class LmStudioClient implements LLMClient {
     this.model = opts?.model ?? process.env.LLM_MODEL ?? DEFAULT_MODEL;
   }
 
-  async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
-    const contextWindow = parsePositiveInt(
-      process.env.PUSHPALS_LMSTUDIO_CONTEXT_WINDOW ?? process.env.LLM_CONTEXT_WINDOW,
-      DEFAULT_LMSTUDIO_CONTEXT_WINDOW,
-    );
-    const minOutputTokens = parsePositiveInt(
-      process.env.PUSHPALS_LMSTUDIO_MIN_OUTPUT_TOKENS,
-      DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS,
-    );
-    const desiredMaxTokens = input.maxTokens ?? 2048;
-    const clampedMinOutput = Math.max(64, Math.min(minOutputTokens, Math.floor(contextWindow / 2)));
-    const promptTokenBudget = Math.max(
-      384,
-      contextWindow - clampedMinOutput - DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
-    );
-    const systemTokenBudget = Math.max(
-      128,
-      Math.min(Math.floor(promptTokenBudget * 0.45), promptTokenBudget - 128),
-    );
-
-    let trimmed = false;
-    let remainingPromptTokens = promptTokenBudget;
-    let systemContent = input.system;
-    if (estimateTokensFromText(systemContent) > systemTokenBudget) {
-      systemContent = truncateKeepingStart(systemContent, systemTokenBudget * 3);
-      trimmed = true;
-    }
-    remainingPromptTokens = Math.max(
-      64,
-      promptTokenBudget - estimateTokensFromText(systemContent),
-    );
-
-    const selectedMessages: Array<{ role: string; content: string }> = [];
-    for (let i = input.messages.length - 1; i >= 0; i--) {
-      const source = input.messages[i];
-      let content = source.content ?? "";
-      const estimated = estimateTokensFromText(content);
-      if (estimated <= remainingPromptTokens) {
-        selectedMessages.push({ role: source.role, content });
-        remainingPromptTokens -= estimated;
-        continue;
-      }
-      const charBudget = Math.max(192, remainingPromptTokens * 3);
-      content = truncateKeepingEnd(content, charBudget);
-      selectedMessages.push({ role: source.role, content });
-      trimmed = true;
-      break;
-    }
-
-    const messages: Array<{ role: string; content: string }> = [
-      { role: "system", content: systemContent },
-      ...selectedMessages.reverse(),
-    ];
-
-    const promptTokensEstimate = sumEstimatedTokens(messages);
-    const safeMaxTokens = Math.max(
-      64,
-      Math.min(
-        desiredMaxTokens,
-        contextWindow - promptTokensEstimate - DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
-      ),
-    );
-    if (trimmed) {
-      console.warn(
-        `[LLM] Trimmed LM Studio prompt context to fit window (~${contextWindow} tokens, est prompt ${promptTokensEstimate}).`,
-      );
-    }
-
+  private async runLmStudioCompletion(
+    messages: Array<{ role: string; content: string }>,
+    opts: { json?: boolean; maxTokens: number; temperature: number },
+  ): Promise<LLMGenerateOutput> {
     const baseBody: Record<string, unknown> = {
       model: this.model,
       messages,
-      max_tokens: safeMaxTokens,
-      temperature: input.temperature ?? 0.3,
+      max_tokens: opts.maxTokens,
+      temperature: opts.temperature,
     };
 
     const bodyVariants: Array<Record<string, unknown>> = [];
-    if (!input.json) {
+    if (!opts.json) {
       bodyVariants.push(baseBody);
     } else {
-      // LM Studio validates response_format.type and expects json_schema or text.
       bodyVariants.push({
         ...baseBody,
         response_format: {
@@ -236,7 +244,6 @@ export class LmStudioClient implements LLMClient {
           json_schema: REMOTEBUDDY_JSON_RESPONSE_SCHEMA,
         },
       });
-      // Fallback for providers/configs that reject the schema payload.
       bodyVariants.push({
         ...baseBody,
         response_format: { type: "text" },
@@ -281,6 +288,171 @@ export class LmStudioClient implements LLMClient {
     }
 
     throw new Error(`LM Studio API error ${lastStatus}: ${lastError}`);
+  }
+
+  private async packContextInBatches(
+    fullMessages: Array<{ role: string; content: string }>,
+    promptTokenBudget: number,
+    contextWindow: number,
+  ): Promise<{ messages: Array<{ role: string; content: string }>; chunkCount: number }> {
+    const chunkTokenBudget = parsePositiveInt(
+      process.env.PUSHPALS_LMSTUDIO_BATCH_CHUNK_TOKENS,
+      Math.max(256, Math.floor(promptTokenBudget * 0.55)),
+    );
+    const chunkCharBudget = chunkTokenBudget * 3;
+    const memoryCharBudget = parsePositiveInt(
+      process.env.PUSHPALS_LMSTUDIO_BATCH_MEMORY_CHARS,
+      Math.max(1200, Math.floor(promptTokenBudget * 3 * 0.75)),
+    );
+    const tailCount = Math.max(
+      1,
+      parsePositiveInt(
+        process.env.PUSHPALS_LMSTUDIO_BATCH_TAIL_MESSAGES,
+        DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES,
+      ),
+    );
+    const packMaxTokens = Math.max(128, Math.min(1024, Math.floor(contextWindow * 0.25)));
+    const serialized = serializeMessagesForBatch(fullMessages);
+    const chunks = chunkByCharBudget(serialized, chunkCharBudget);
+    if (chunks.length <= 1) {
+      return { messages: fullMessages, chunkCount: chunks.length };
+    }
+
+    let memory = "";
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const packPrompt = [
+        `New batch ${i + 1}/${chunks.length}:`,
+        chunk,
+        "",
+        "Current packed memory:",
+        memory || "(empty)",
+        "",
+        `Update the packed memory with maximal fidelity. Requirements:`,
+        "- Preserve concrete instructions, constraints, IDs, file paths, env vars, and error text.",
+        "- Keep conflicting details if present; do not silently discard.",
+        `- Keep output under ${memoryCharBudget} characters.`,
+        "- Output only packed memory plain text.",
+      ].join("\n");
+
+      const packed = await this.runLmStudioCompletion(
+        [
+          {
+            role: "system",
+            content:
+              "You are a high-fidelity context packer. Merge incoming batch context into compact memory without losing critical implementation detail.",
+          },
+          { role: "user", content: packPrompt },
+        ],
+        { json: false, maxTokens: packMaxTokens, temperature: 0.0 },
+      );
+      memory = packed.text.trim() || memory;
+    }
+
+    const tailMessages = fullMessages.slice(-tailCount);
+    const packedMessages: Array<{ role: string; content: string }> = [
+      {
+        role: "system",
+        content:
+          "Prior context was streamed in multiple batches and condensed below. Treat PACKED_CONTEXT as authoritative history for this request.",
+      },
+      {
+        role: "system",
+        content: `PACKED_CONTEXT\n${memory}`,
+      },
+      ...tailMessages,
+    ];
+    return { messages: packedMessages, chunkCount: chunks.length };
+  }
+
+  async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+    const contextWindow = parsePositiveInt(
+      process.env.PUSHPALS_LMSTUDIO_CONTEXT_WINDOW ?? process.env.LLM_CONTEXT_WINDOW,
+      DEFAULT_LMSTUDIO_CONTEXT_WINDOW,
+    );
+    const minOutputTokens = parsePositiveInt(
+      process.env.PUSHPALS_LMSTUDIO_MIN_OUTPUT_TOKENS,
+      DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS,
+    );
+    const desiredMaxTokens = input.maxTokens ?? 2048;
+    const contextMode = parseContextMode(
+      process.env.PUSHPALS_LMSTUDIO_CONTEXT_MODE ?? DEFAULT_LMSTUDIO_CONTEXT_MODE,
+    );
+    const clampedMinOutput = Math.max(64, Math.min(minOutputTokens, Math.floor(contextWindow / 2)));
+    const promptTokenBudget = Math.max(
+      384,
+      contextWindow - clampedMinOutput - DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
+    );
+    const systemTokenBudget = Math.max(
+      128,
+      Math.min(Math.floor(promptTokenBudget * 0.45), promptTokenBudget - 128),
+    );
+
+    const fullMessages: Array<{ role: string; content: string }> = [
+      { role: "system", content: input.system },
+      ...input.messages.map((message) => ({ role: message.role, content: message.content ?? "" })),
+    ];
+
+    let messages = fullMessages;
+    let promptTokensEstimate = sumEstimatedTokens(messages);
+    let trimmed = false;
+    let packedChunkCount = 0;
+
+    if (promptTokensEstimate > promptTokenBudget) {
+      if (contextMode === "batch") {
+        try {
+          const packed = await this.packContextInBatches(fullMessages, promptTokenBudget, contextWindow);
+          messages = packed.messages;
+          packedChunkCount = packed.chunkCount;
+          promptTokensEstimate = sumEstimatedTokens(messages);
+        } catch (err) {
+          console.warn(`[LLM] Failed batch context packing, falling back to truncation: ${String(err)}`);
+          const fallback = trimLmStudioMessagesToBudget(
+            input.system,
+            input.messages,
+            promptTokenBudget,
+            systemTokenBudget,
+          );
+          messages = fallback.messages;
+          promptTokensEstimate = fallback.promptTokensEstimate;
+          trimmed = fallback.trimmed;
+        }
+      } else {
+        const fallback = trimLmStudioMessagesToBudget(
+          input.system,
+          input.messages,
+          promptTokenBudget,
+          systemTokenBudget,
+        );
+        messages = fallback.messages;
+        promptTokensEstimate = fallback.promptTokensEstimate;
+        trimmed = fallback.trimmed;
+      }
+    }
+
+    const safeMaxTokens = Math.max(
+      64,
+      Math.min(
+        desiredMaxTokens,
+        contextWindow - promptTokensEstimate - DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
+      ),
+    );
+
+    if (packedChunkCount > 1) {
+      console.warn(
+        `[LLM] Packed oversized prompt context across ${packedChunkCount} batches (window ~${contextWindow}, est prompt ${promptTokensEstimate}).`,
+      );
+    } else if (trimmed) {
+      console.warn(
+        `[LLM] Trimmed LM Studio prompt context to fit window (~${contextWindow} tokens, est prompt ${promptTokensEstimate}).`,
+      );
+    }
+
+    return this.runLmStudioCompletion(messages, {
+      json: input.json,
+      maxTokens: safeMaxTokens,
+      temperature: input.temperature ?? 0.3,
+    });
   }
 }
 

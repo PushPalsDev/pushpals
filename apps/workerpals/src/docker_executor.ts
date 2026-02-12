@@ -31,6 +31,8 @@ export interface DockerExecutorOptions {
   idleTimeoutMs?: number;
   /** Git ref used as the base for per-job worktrees */
   baseRef?: string;
+  /** Docker network mode for warm container (e.g. bridge, none) */
+  networkMode?: string;
 }
 
 export interface DockerJobResult {
@@ -64,9 +66,10 @@ export class DockerExecutor {
   constructor(options: DockerExecutorOptions) {
     this.options = {
       gitToken: "",
-      timeoutMs: 60000,
+      timeoutMs: 180000,
       idleTimeoutMs: 10 * 60 * 1000,
       baseRef: "HEAD",
+      networkMode: "bridge",
       ...options,
     };
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
@@ -287,7 +290,9 @@ export class DockerExecutor {
       "--cpus",
       "1",
       "--network",
-      "none",
+      this.options.networkMode,
+      "--add-host",
+      "host.docker.internal:host-gateway",
       "-v",
       `${dockerRepoPath}:/repo`,
       "-w",
@@ -330,14 +335,26 @@ export class DockerExecutor {
 
   private async ensureWarmContainer(): Promise<void> {
     const inspect = Bun.spawn(
-      ["docker", "inspect", "-f", "{{.State.Running}}", this.warmContainerName],
+      ["docker", "inspect", "-f", "{{.State.Running}}|{{.HostConfig.NetworkMode}}", this.warmContainerName],
       { stdout: "pipe", stderr: "pipe" },
     );
     const [exitCode, stdout] = await Promise.all([
       inspect.exited,
       new Response(inspect.stdout).text(),
     ]);
-    if (exitCode === 0 && stdout.trim() === "true") return;
+    if (exitCode === 0) {
+      const [runningRaw, networkModeRaw] = stdout.trim().split("|");
+      const running = runningRaw?.trim() === "true";
+      const networkMode = (networkModeRaw ?? "").trim();
+      if (running && networkMode === this.options.networkMode) {
+        return;
+      }
+      if (running && networkMode && networkMode !== this.options.networkMode) {
+        console.warn(
+          `[DockerExecutor] Warm container network mismatch (${networkMode} != ${this.options.networkMode}); recreating...`,
+        );
+      }
+    }
     await this.startWarmContainer();
   }
 

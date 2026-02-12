@@ -54,6 +54,7 @@ function parseArgs(): {
   gitToken: string | null;
   dockerTimeout: number;
   dockerIdleTimeout: number;
+  dockerNetworkMode: string;
   worktreeBaseRef: string;
   labels: string[];
 } {
@@ -69,8 +70,9 @@ function parseArgs(): {
   let dockerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
   let gitToken =
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
-  let dockerTimeout = parseInt(process.env.WORKERPALS_DOCKER_TIMEOUT_MS ?? "60000", 10);
+  let dockerTimeout = parseInt(process.env.WORKERPALS_DOCKER_TIMEOUT_MS ?? "180000", 10);
   let dockerIdleTimeout = parseInt(process.env.WORKERPALS_DOCKER_IDLE_TIMEOUT_MS ?? "600000", 10);
+  let dockerNetworkMode = (process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? "bridge").trim() || "bridge";
   let worktreeBaseRef = process.env.WORKERPALS_BASE_REF ?? `origin/${integrationBranchName()}`;
   let labels = (process.env.WORKERPALS_LABELS ?? "")
     .split(",")
@@ -115,6 +117,9 @@ function parseArgs(): {
       case "--docker-idle-timeout":
         dockerIdleTimeout = parseInt(args[++i], 10);
         break;
+      case "--docker-network":
+        dockerNetworkMode = (args[++i] ?? "").trim() || dockerNetworkMode;
+        break;
       case "--base-ref":
         worktreeBaseRef = args[++i];
         break;
@@ -138,9 +143,10 @@ function parseArgs(): {
     requireDocker,
     dockerImage,
     gitToken,
-    dockerTimeout: Number.isFinite(dockerTimeout) && dockerTimeout > 0 ? dockerTimeout : 60000,
+    dockerTimeout: Number.isFinite(dockerTimeout) && dockerTimeout > 0 ? dockerTimeout : 180000,
     dockerIdleTimeout:
       Number.isFinite(dockerIdleTimeout) && dockerIdleTimeout >= 0 ? dockerIdleTimeout : 600000,
+    dockerNetworkMode,
     worktreeBaseRef,
     labels,
   };
@@ -311,6 +317,7 @@ async function sendWorkerHeartbeat(
           repo: opts.repo,
           baseRef: opts.worktreeBaseRef,
           dockerImage: opts.docker ? opts.dockerImage : null,
+          dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
         },
       }),
     });
@@ -328,7 +335,9 @@ async function workerLoop(
 
   console.log(`[WorkerPals ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
   if (dockerExecutor) {
-    console.log(`[WorkerPals ${opts.workerId}] Docker mode enabled (${opts.dockerImage})`);
+    console.log(
+      `[WorkerPals ${opts.workerId}] Docker mode enabled (${opts.dockerImage}, network=${opts.dockerNetworkMode})`,
+    );
   } else {
     console.log(`[WorkerPals ${opts.workerId}] Direct mode with isolated worktrees enabled`);
   }
@@ -621,6 +630,7 @@ async function main(): Promise<void> {
         gitToken: opts.gitToken ?? undefined,
         timeoutMs: opts.dockerTimeout,
         idleTimeoutMs: opts.dockerIdleTimeout,
+        networkMode: opts.dockerNetworkMode,
         baseRef: opts.worktreeBaseRef,
       });
 
