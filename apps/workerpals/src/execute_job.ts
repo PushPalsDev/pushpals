@@ -388,7 +388,16 @@ export async function createJobCommit(
     }
     result = await git(repo, stageArgs);
     if (!result.ok) {
-      return { ok: false, error: `Failed to stage changes: ${result.stderr}` };
+      const stageErr = result.stderr || result.stdout;
+      if (/pathspec .* did not match any files/i.test(stageErr)) {
+        console.warn(
+          `[WorkerPals] Stage target missing for ${job.kind}; retrying with fallback "git add -A".`,
+        );
+        result = await git(repo, ["add", "-A"]);
+      }
+      if (!result.ok) {
+        return { ok: false, error: `Failed to stage changes: ${result.stderr || result.stdout}` };
+      }
     }
 
     // Check if there are changes to commit

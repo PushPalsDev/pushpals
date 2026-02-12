@@ -375,7 +375,9 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         }
 
 
-def _job_to_command(kind: str, params: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+def _job_to_command(
+    kind: str, params: Dict[str, Any], repo: str
+) -> Tuple[Optional[str], Optional[str]]:
     def req(name: str) -> Any:
         value = params.get(name)
         if value is None or value == "":
@@ -638,15 +640,21 @@ print(f"Wrote {{len(content)}} bytes to {{target}}")
         path = str(req("path"))
         content = str(req("content"))
         payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        repo_payload = json.dumps(str(Path(repo).resolve()))
         script = f"""
 import base64
 from pathlib import Path
 
-path = Path({json.dumps(path)})
+repo_root = Path({repo_payload}).resolve()
+path_in = Path({json.dumps(path)})
+path = (path_in if path_in.is_absolute() else (repo_root / path_in)).resolve()
+if repo_root not in path.parents and path != repo_root:
+    raise SystemExit(f"Refusing to write outside repo: {{path}}")
 path.parent.mkdir(parents=True, exist_ok=True)
 content = base64.b64decode({json.dumps(payload)}).decode("utf-8")
 path.write_text(content, encoding="utf-8")
-print(f"Wrote {{len(content)}} bytes to {path}")
+display = path.relative_to(repo_root) if path != repo_root else Path(".")
+print(f"Wrote {{len(content)}} bytes to {{display}}")
 """
         return _python_cmd(script), f"Wrote {len(content)} bytes to {path}"
 
@@ -842,7 +850,7 @@ def main() -> int:
         )
 
     try:
-        cmd, preferred_summary = _job_to_command(kind, params)
+        cmd, preferred_summary = _job_to_command(kind, params, repo)
     except Exception as exc:
         return _fail(str(exc), exit_code=2)
 
