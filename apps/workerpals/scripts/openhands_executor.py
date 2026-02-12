@@ -186,6 +186,20 @@ def _resolve_agent_server_url() -> str:
     return (os.environ.get("WORKERPALS_OPENHANDS_AGENT_SERVER_URL") or "").strip()
 
 
+def _agent_health_url(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}/health"
+
+
+def _agent_server_is_healthy(base_url: str, timeout: float = 1.0) -> bool:
+    if not base_url:
+        return False
+    try:
+        with urllib.request.urlopen(_agent_health_url(base_url), timeout=timeout) as res:
+            return int(getattr(res, "status", 0)) == 200
+    except Exception:
+        return False
+
+
 def _resolve_llm_config() -> Tuple[str, str, str]:
     model = (
         os.environ.get("WORKERPALS_OPENHANDS_MODEL")
@@ -835,14 +849,39 @@ def main() -> int:
     if not cmd:
         return _fail(f"Unknown job kind: {kind}", exit_code=2)
 
+    reusable_server = _resolve_agent_server_url()
+    prefer_reusable = bool(reusable_server)
+    if reusable_server and not _agent_server_is_healthy(reusable_server):
+        # Warm container agent may have died; fall back to managed per-job server.
+        prefer_reusable = False
+        sys.stderr.write(
+            "[OpenHandsExecutor] Shared agent server is unreachable; falling back to per-job server.\n"
+        )
+        sys.stderr.flush()
+
+    def _execute_with_server(server_url: str) -> Tuple[int, str, str]:
+        with Workspace(host=server_url, working_dir=repo) as workspace:
+            raw = workspace.execute_command(cmd)
+            return _parse_workspace_result(raw)
+
     try:
-        reusable_server = _resolve_agent_server_url()
-        server_ctx = nullcontext(reusable_server) if reusable_server else ManagedLocalAgentServer()
-        with server_ctx as server:
-            server_url = reusable_server or server.base_url
-            with Workspace(host=server_url, working_dir=repo) as workspace:
-                raw_result = workspace.execute_command(cmd)
-                exit_code, stdout, stderr = _parse_workspace_result(raw_result)
+        if prefer_reusable and reusable_server:
+            try:
+                exit_code, stdout, stderr = _execute_with_server(reusable_server)
+            except Exception as first_exc:
+                # Retry with a managed ephemeral server if the shared one races or dies.
+                first_error = str(first_exc)
+                if "Connection refused" not in first_error and "[Errno 111]" not in first_error:
+                    raise
+                sys.stderr.write(
+                    "[OpenHandsExecutor] Shared agent server refused connection; retrying with per-job server.\n"
+                )
+                sys.stderr.flush()
+                with ManagedLocalAgentServer() as server:
+                    exit_code, stdout, stderr = _execute_with_server(server.base_url)
+        else:
+            with ManagedLocalAgentServer() as server:
+                exit_code, stdout, stderr = _execute_with_server(server.base_url)
     except Exception as exc:
         return _fail(
             f"OpenHands execution failed for {kind}",

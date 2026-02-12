@@ -292,13 +292,21 @@ export class DockerExecutor {
     }
     args.push("-e", `WORKERPALS_OPENHANDS_AGENT_SERVER_URL=http://127.0.0.1:${this.warmAgentPort}`);
 
+    const healthCmd = `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1`;
+    const resolvePythonCmd =
+      'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
+      'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
+      '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }';
+
     args.push(
       "--entrypoint",
       "/bin/sh",
       this.options.imageName,
       "-lc",
-      `python -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
-        `for i in $(seq 1 100); do curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1 && break; sleep 0.1; done; ` +
+      `${resolvePythonCmd}; ` +
+        `"$PY" -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
+        `for i in $(seq 1 120); do ${healthCmd} && break; sleep 0.1; done; ` +
+        `${healthCmd} || { tail -n 120 /tmp/openhands-agent.log 2>/dev/null; exit 1; }; ` +
         "tail -f /dev/null",
     );
 
@@ -322,6 +330,55 @@ export class DockerExecutor {
     ]);
     if (exitCode === 0 && stdout.trim() === "true") return;
     await this.startWarmContainer();
+  }
+
+  private async runWarmShell(command: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+    const proc = Bun.spawn(
+      ["docker", "exec", this.warmContainerName, "/bin/sh", "-lc", command],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      ok: exitCode === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+    };
+  }
+
+  private async ensureWarmAgentServer(): Promise<void> {
+    const healthCmd = `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1`;
+    const healthy = await this.runWarmShell(healthCmd);
+    if (healthy.ok) return;
+
+    console.warn(
+      `[DockerExecutor] Warm agent server is unhealthy in ${this.warmContainerName}; restarting it...`,
+    );
+
+    const resolvePythonCmd =
+      'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
+      'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
+      '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }';
+    const restartCmd =
+      "pkill -f 'openhands.agent_server' >/dev/null 2>&1 || true; " +
+      `${resolvePythonCmd}; ` +
+      `"$PY" -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
+      `for i in $(seq 1 120); do ${healthCmd} && break; sleep 0.1; done; ` +
+      healthCmd;
+    const restarted = await this.runWarmShell(restartCmd);
+    if (restarted.ok) {
+      return;
+    }
+
+    const logs = await this.runWarmShell("tail -n 120 /tmp/openhands-agent.log 2>/dev/null || true");
+    throw new Error(
+      `Warm OpenHands agent server could not be started: ${
+        restarted.stderr || restarted.stdout || "unknown error"
+      }\n${logs.stdout || logs.stderr}`,
+    );
   }
 
   private async stopWarmContainer(reason: string, quiet = false): Promise<void> {
@@ -355,6 +412,7 @@ export class DockerExecutor {
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<DockerJobResult> {
     await this.ensureWarmContainer();
+    await this.ensureWarmAgentServer();
 
     const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
