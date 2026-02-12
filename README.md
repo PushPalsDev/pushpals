@@ -127,6 +127,9 @@ LLM defaults:
   - `openai/<model>` for LM Studio/OpenAI-compatible backends
   - `ollama/<model>` for Ollama backends
   - override inference with `WORKERPALS_OPENHANDS_PROVIDER`
+- OpenHands task message shaping defaults to instruction-only to avoid 4k-context overflow:
+  - `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=none` (default)
+  - set `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=compact` to prepend `prompts/workerpals/openhands_task_execute_system_prompt.md`
 - `bun run start` preflights LLM connectivity and can auto-start LM Studio headless mode for localhost endpoints
 - Ollama is supported but is not auto-started by `bun run start`; run Ollama separately
 - LM Studio startup controls:

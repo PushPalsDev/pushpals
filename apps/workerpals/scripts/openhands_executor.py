@@ -452,6 +452,35 @@ def _summarize_git_changes(repo: str) -> List[str]:
         return []
 
 
+def _build_agent_user_message(instruction: str) -> str:
+    """
+    Build the message sent to OpenHands.
+
+    Default behavior is instruction-only to minimize prompt/token overhead for
+    small-context local runtimes (LM Studio/llama.cpp).
+    """
+
+    mode = (os.environ.get("WORKERPALS_OPENHANDS_TASK_PROMPT_MODE") or "none").strip().lower()
+    if mode in {"none", "off", "instruction_only", "instruction-only", "minimal"}:
+        return instruction
+
+    compact_agent_prompt = ""
+    try:
+        compact_agent_prompt = _load_prompt_template(
+            "workerpals/openhands_task_execute_system_prompt.md"
+        ).strip()
+    except Exception:
+        compact_agent_prompt = (
+            "You are PushPals WorkerPal running inside OpenHands.\n"
+            "Focus only on the task below.\n"
+            "If the task asks a question, answer directly and do not edit files.\n"
+            "If the task asks for code/file changes, implement minimal correct changes in-repo.\n"
+            "Avoid unrelated docs or architecture summaries unless explicitly requested."
+        )
+
+    return f"{compact_agent_prompt}\n\nTask:\n{instruction}"
+
+
 def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
     try:
         from openhands.sdk import Agent, Conversation, LLM, Tool
@@ -530,20 +559,6 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         # are cache-pinned. Disable prompt caching for local endpoints.
         llm_kwargs["caching_prompt"] = False
 
-    compact_agent_prompt = ""
-    try:
-        compact_agent_prompt = _load_prompt_template(
-            "workerpals/openhands_task_execute_system_prompt.md"
-        ).strip()
-    except Exception:
-        compact_agent_prompt = (
-            "You are PushPals WorkerPal running inside OpenHands.\n"
-            "Focus only on the task below.\n"
-            "If the task asks a question, answer directly and do not edit files.\n"
-            "If the task asks for code/file changes, implement minimal correct changes in-repo.\n"
-            "Avoid unrelated docs or architecture summaries unless explicitly requested."
-        )
-
     try:
         llm = LLM(**llm_kwargs)
         tools = [
@@ -553,8 +568,8 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         ]
         agent = Agent(llm=llm, tools=tools)
         conversation = Conversation(agent=agent, workspace=repo)
-
-        conversation.send_message(f"{compact_agent_prompt}\n\nTask:\n{instruction}")
+        user_message = _build_agent_user_message(instruction)
+        conversation.send_message(user_message)
 
         max_steps = max(1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_AGENT_MAX_STEPS"), 30))
         try:

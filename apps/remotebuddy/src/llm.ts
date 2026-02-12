@@ -175,8 +175,10 @@ function trimLmStudioMessagesToBudget(
   messages: Array<{ role: string; content: string }>;
   promptTokensEstimate: number;
   trimmed: boolean;
+  latestUserOverflow: boolean;
 } {
   let trimmed = false;
+  let latestUserOverflow = false;
   let remainingPromptTokens = promptTokenBudget;
   let systemContent = system;
   if (estimateTokensFromText(systemContent) > systemTokenBudget) {
@@ -186,6 +188,13 @@ function trimLmStudioMessagesToBudget(
   remainingPromptTokens = Math.max(64, promptTokenBudget - estimateTokensFromText(systemContent));
 
   const selectedMessages: Array<{ role: string; content: string }> = [];
+  const lastUserIndex = (() => {
+    for (let i = inputMessages.length - 1; i >= 0; i--) {
+      if (inputMessages[i]?.role === "user") return i;
+    }
+    return -1;
+  })();
+
   for (let i = inputMessages.length - 1; i >= 0; i--) {
     const source = inputMessages[i];
     let content = source.content ?? "";
@@ -195,6 +204,14 @@ function trimLmStudioMessagesToBudget(
       remainingPromptTokens -= estimated;
       continue;
     }
+
+    // Never silently trim the most recent user instruction.
+    if (i === lastUserIndex) {
+      selectedMessages.push({ role: source.role, content });
+      latestUserOverflow = true;
+      break;
+    }
+
     const charBudget = Math.max(192, remainingPromptTokens * 3);
     content = truncateKeepingEnd(content, charBudget);
     selectedMessages.push({ role: source.role, content });
@@ -207,7 +224,7 @@ function trimLmStudioMessagesToBudget(
     ...selectedMessages.reverse(),
   ];
   const promptTokensEstimate = sumEstimatedTokens(messages);
-  return { messages, promptTokensEstimate, trimmed };
+  return { messages, promptTokensEstimate, trimmed, latestUserOverflow };
 }
 
 export class LmStudioClient implements LLMClient {
@@ -397,6 +414,7 @@ export class LmStudioClient implements LLMClient {
     let promptTokensEstimate = sumEstimatedTokens(messages);
     let trimmed = false;
     let packedChunkCount = 0;
+    let latestUserOverflow = false;
 
     if (promptTokensEstimate > promptTokenBudget) {
       if (contextMode === "batch") {
@@ -416,6 +434,7 @@ export class LmStudioClient implements LLMClient {
           messages = fallback.messages;
           promptTokensEstimate = fallback.promptTokensEstimate;
           trimmed = fallback.trimmed;
+          latestUserOverflow = fallback.latestUserOverflow;
         }
       } else {
         const fallback = trimLmStudioMessagesToBudget(
@@ -427,7 +446,14 @@ export class LmStudioClient implements LLMClient {
         messages = fallback.messages;
         promptTokensEstimate = fallback.promptTokensEstimate;
         trimmed = fallback.trimmed;
+        latestUserOverflow = fallback.latestUserOverflow;
       }
+    }
+
+    if (latestUserOverflow) {
+      throw new Error(
+        "Latest user request exceeds LM Studio context window and cannot be safely truncated. Increase model context window or split the request into smaller messages.",
+      );
     }
 
     const safeMaxTokens = Math.max(
