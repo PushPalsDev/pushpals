@@ -5,6 +5,7 @@ import { CommunicationManager } from "../../../packages/shared/src/communication
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { GitOps } from "./git";
+import { ensureIntegrationPullRequest } from "./github_pr";
 import { createStatusServer } from "./http";
 import {
   loadConfig,
@@ -364,6 +365,20 @@ async function tick(): Promise<void> {
           throw new Error(`Push failed: ${pushResult.stderr || pushResult.stdout}`);
         }
         console.log(`[${ts()}] Push succeeded for ${config.mainBranch}`);
+        if (config.openPrAfterPush) {
+          try {
+            const pr = await ensureMainPullRequest(completion);
+            const prMessage = pr.created
+              ? `Opened PR #${pr.number}: ${pr.htmlUrl}`
+              : `Reused existing PR #${pr.number}: ${pr.htmlUrl}`;
+            console.log(`[${ts()}] ${prMessage}`);
+            await emitPusherMessage(comm, prMessage, completion.id);
+          } catch (prErr: any) {
+            const warning = `Push succeeded, but PR auto-open failed: ${prErr?.message ?? prErr}`;
+            console.error(`[${ts()}] ${warning}`);
+            await emitPusherMessage(comm, warning, completion.id);
+          }
+        }
       } else {
         console.log(`[${ts()}] pushMainAfterMerge=false - skipping push`);
       }
@@ -498,6 +513,103 @@ async function runGitCapture(args: string[], cwd = repoRoot): Promise<GitCmdResu
       exitCode: 127,
     };
   }
+}
+
+async function runCommandCapture(cmd: string[], cwd = repoRoot): Promise<GitCmdResult> {
+  try {
+    const proc = Bun.spawn(cmd, {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      ok: exitCode === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: String(err),
+      exitCode: 127,
+    };
+  }
+}
+
+async function resolveGitHubToken(): Promise<string> {
+  const envToken = (
+    process.env.PUSHPALS_GIT_TOKEN ??
+    process.env.GITHUB_TOKEN ??
+    process.env.GH_TOKEN ??
+    ""
+  ).trim();
+  if (envToken) return envToken;
+
+  // Fall back to GitHub CLI auth if available (e.g. gh auth login already done).
+  const ghToken = await runCommandCapture(["gh", "auth", "token"]);
+  if (ghToken.ok && ghToken.stdout) {
+    process.env.PUSHPALS_GIT_TOKEN = ghToken.stdout;
+    return ghToken.stdout;
+  }
+
+  return "";
+}
+
+async function ensureMainPullRequest(completion: {
+  id: string;
+  commitSha: string;
+  branch: string;
+}) {
+  const token = await resolveGitHubToken();
+  if (!token) {
+    throw new Error(
+      "No GitHub token available for PR creation (set PUSHPALS_GIT_TOKEN, GITHUB_TOKEN, or GH_TOKEN).",
+    );
+  }
+
+  const remoteUrlResult = await runGitCapture(
+    ["-C", config.repoPath, "remote", "get-url", config.remote],
+    repoRoot,
+  );
+  if (!remoteUrlResult.ok || !remoteUrlResult.stdout) {
+    throw new Error(
+      `Unable to resolve git remote URL for ${config.remote}: ${
+        remoteUrlResult.stderr || remoteUrlResult.stdout
+      }`,
+    );
+  }
+
+  const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
+  const prTitle = (config.prTitle ?? "").trim() || `PushPals: merge ${config.mainBranch} into ${prBaseBranch}`;
+  const prBody =
+    (config.prBody ?? "").trim() ||
+    [
+      "Automated PR opened by SourceControlManager.",
+      "",
+      `- Integration branch: \`${config.mainBranch}\``,
+      `- Base branch: \`${prBaseBranch}\``,
+      `- Latest merged completion: \`${completion.id}\``,
+      `- Latest commit: \`${completion.commitSha}\``,
+      "",
+      "Please review and merge manually.",
+    ].join("\n");
+
+  return ensureIntegrationPullRequest({
+    token,
+    remoteUrl: remoteUrlResult.stdout.trim(),
+    headBranch: config.mainBranch,
+    baseBranch: prBaseBranch,
+    title: prTitle,
+    body: prBody,
+    draft: config.prDraft,
+  });
 }
 
 async function ensureDefaultSourceControlManagerWorktree(): Promise<void> {

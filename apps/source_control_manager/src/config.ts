@@ -49,6 +49,16 @@ export interface SourceControlManagerConfig {
   mergeStrategy: "cherry-pick" | "no-ff" | "ff-only";
   /** Push integration branch to remote after successful merge/checks. Default: true. */
   pushMainAfterMerge: boolean;
+  /** Open or reuse a PR from integration branch to base branch after successful push. Default: true. */
+  openPrAfterPush: boolean;
+  /** Base branch for auto-opened PRs. Default: $PUSHPALS_INTEGRATION_BASE_BRANCH or "main". */
+  prBaseBranch: string;
+  /** Optional PR title override for auto-opened PRs. */
+  prTitle?: string;
+  /** Optional PR body override for auto-opened PRs. */
+  prBody?: string;
+  /** Open PR as draft. Default: false. */
+  prDraft: boolean;
   /** Authentication token for server API calls. */
   authToken?: string;
 }
@@ -82,6 +92,16 @@ const DEFAULTS: SourceControlManagerConfig = {
   maxAttempts: 3,
   mergeStrategy: "cherry-pick",
   pushMainAfterMerge: !TRUTHY.has((process.env.SOURCE_CONTROL_MANAGER_NO_PUSH ?? "").toLowerCase()),
+  openPrAfterPush: !TRUTHY.has(
+    (process.env.SOURCE_CONTROL_MANAGER_DISABLE_AUTO_PR ?? "").toLowerCase(),
+  ),
+  prBaseBranch:
+    (process.env.SOURCE_CONTROL_MANAGER_PR_BASE_BRANCH ??
+      process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ??
+      "").trim() || "main",
+  prTitle: (process.env.SOURCE_CONTROL_MANAGER_PR_TITLE ?? "").trim() || undefined,
+  prBody: (process.env.SOURCE_CONTROL_MANAGER_PR_BODY ?? "").trim() || undefined,
+  prDraft: TRUTHY.has((process.env.SOURCE_CONTROL_MANAGER_PR_DRAFT ?? "").toLowerCase()),
   authToken: process.env.PUSHPALS_AUTH_TOKEN,
 };
 
@@ -162,5 +182,8 @@ export function validateConfig(config: SourceControlManagerConfig): void {
   }
   if (typeof config.mainBranch !== "string" || config.mainBranch.length === 0) {
     throw new Error(`Invalid config: mainBranch must be a non-empty string`);
+  }
+  if (typeof config.prBaseBranch !== "string" || config.prBaseBranch.length === 0) {
+    throw new Error(`Invalid config: prBaseBranch must be a non-empty string`);
   }
 }

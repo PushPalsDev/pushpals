@@ -29,7 +29,7 @@ Push Pals runs a small software "team" around your repository:
 2. WorkerPals claim jobs (`/jobs/claim`), execute in isolated worktrees (and Docker when enabled).
 3. For mutating work, WorkerPals create commits on per-job branches: `agent/<workerId>/<jobId>`.
 4. WorkerPals enqueue completions (`/completions/enqueue`).
-5. SourceControlManager claims completions (`/completions/claim`), cherry-picks/merges into integration branch (`main_agents` by default), runs checks, and pushes integration branch.
+5. SourceControlManager claims completions (`/completions/claim`), cherry-picks/merges into integration branch (`main_agents` by default), runs checks, pushes integration branch, and can auto-open/reuse a PR from integration branch to base branch for human review.
 
 ## Communication Model
 
@@ -103,6 +103,10 @@ See `.env.example` for full details. Most important:
 - `PUSHPALS_INTEGRATION_BASE_BRANCH` (default `main`)
 - `SOURCE_CONTROL_MANAGER_MAIN_BRANCH`
 - `SOURCE_CONTROL_MANAGER_REPO_PATH`
+- `SOURCE_CONTROL_MANAGER_DISABLE_AUTO_PR` (set `1` to disable auto-PR)
+- `SOURCE_CONTROL_MANAGER_PR_BASE_BRANCH` (default `main`)
+- `SOURCE_CONTROL_MANAGER_PR_DRAFT`
+- `PUSHPALS_GIT_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` (or authenticated `gh` CLI via `gh auth login` for auto-PR fallback)
 - `REMOTEBUDDY_MAX_WORKERPALS`
 - `REMOTEBUDDY_AUTO_SPAWN_WORKERPALS`
 - `REMOTEBUDDY_WAIT_FOR_WORKERPAL_MS`
