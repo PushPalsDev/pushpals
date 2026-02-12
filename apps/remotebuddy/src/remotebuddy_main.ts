@@ -4,7 +4,7 @@
  *
  * AI-powered orchestrator that:
  *   1) Listens for user `message` events via cursor-based WS stream
- *   2) Runs them through an LLM brain (OpenAI / Anthropic / Ollama)
+ *   2) Runs them through an LLM brain (LM Studio / Ollama)
  *   3) Emits assistant_message and optionally creates tasks + enqueues jobs
  *   4) Tracks job lifecycle and closes out tasks when all jobs complete
  *
@@ -12,7 +12,7 @@
  *
  * Usage:
  *   bun run src/remotebuddy_main.ts --server http://localhost:3001 [--sessionId <id>] [--token <auth>]
- *   Environment: OPENAI_API_KEY | ANTHROPIC_API_KEY | LLM_ENDPOINT (see llm.ts)
+ *   Environment: LLM_ENDPOINT | LLM_MODEL | LLM_API_KEY | PUSHPALS_LLM_BACKEND (see llm.ts)
  */
 
 import type { CommandRequest } from "protocol";

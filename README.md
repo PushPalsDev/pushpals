@@ -70,7 +70,7 @@ bun run start
 `scripts/start.ts` preflights:
 
 - LLM endpoint reachability (fails fast with clear error if model server is down)
-- optional local vLLM auto-start when vLLM mode is configured
+- optional local model-server auto-start (LM Studio headless)
 - integration branch existence/bootstrapping
 - git auth requirements for push flows
 - SourceControlManager dedicated worktree
@@ -104,19 +104,20 @@ See `.env.example` for full details. Most important:
 
 LLM defaults:
 
-- Generic OpenAI-compatible mode defaults to vLLM (`LLM_ENDPOINT=http://localhost:18123`)
-- Default model is `zai-org/GLM-4.7-Flash` (override with `LLM_MODEL`)
-- WorkerPals OpenHands agent mode reuses `LLM_*`/`OPENAI_*` vars unless `WORKERPALS_OPENHANDS_*` is set
-- `bun run start` preflights LLM connectivity and can auto-start local vLLM when configured
-- vLLM auto-start runtime is configurable via `PUSHPALS_VLLM_RUNTIME`:
-  - `docker` (default): run Linux vLLM container (recommended on Windows)
-  - `python`: run local `python -m vllm.entrypoints.openai.api_server`
-  - `auto`: Windows prefers Docker; non-Windows prefers Python
-- Docker runtime settings:
-  - `PUSHPALS_VLLM_DOCKER_IMAGE` (default `vllm/vllm-openai:latest`)
-  - `PUSHPALS_VLLM_DOCKER_CONTAINER_NAME` (optional)
-  - `PUSHPALS_VLLM_DOCKER_CONTAINER_PORT` (default `8000`)
-- Readiness timeout for auto-started vLLM: `PUSHPALS_VLLM_READY_TIMEOUT_MS` (default `600000`)
+- Supported backends are `lmstudio` and `ollama` (`PUSHPALS_LLM_BACKEND`)
+- Default backend is LM Studio (`PUSHPALS_LLM_BACKEND=lmstudio`)
+- LM Studio default endpoint is `LLM_ENDPOINT=http://127.0.0.1:1234`
+- Ollama endpoint should be `LLM_ENDPOINT=http://127.0.0.1:11434/api/chat`
+- Default model is `local-model` (override with `LLM_MODEL`)
+- WorkerPals OpenHands agent mode reuses `LLM_*` vars unless `WORKERPALS_OPENHANDS_*` is set
+- `bun run start` preflights LLM connectivity and can auto-start LM Studio headless mode for localhost endpoints
+- Ollama is supported but is not auto-started by `bun run start`; run Ollama separately
+- LM Studio startup controls:
+  - `PUSHPALS_AUTO_START_LMSTUDIO=1` (default on)
+  - `PUSHPALS_LMSTUDIO_CLI=lms`
+  - `PUSHPALS_LMSTUDIO_PORT` (optional; defaults from `LLM_ENDPOINT`)
+  - `PUSHPALS_LMSTUDIO_START_ARGS` (optional extra args for `lms server start`)
+  - `PUSHPALS_LMSTUDIO_READY_TIMEOUT_MS` (default `120000`)
 
 ## Repo Layout
 

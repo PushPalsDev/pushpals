@@ -190,20 +190,17 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
     model = (
         os.environ.get("WORKERPALS_OPENHANDS_MODEL")
         or os.environ.get("LLM_MODEL")
-        or os.environ.get("OPENAI_MODEL")
         or ""
     ).strip()
     api_key = (
         os.environ.get("WORKERPALS_OPENHANDS_API_KEY")
         or os.environ.get("LLM_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
         or ""
     ).strip()
     base_url = _normalize_base_url(
         (
             os.environ.get("WORKERPALS_OPENHANDS_BASE_URL")
             or os.environ.get("LLM_BASE_URL")
-            or os.environ.get("OPENAI_BASE_URL")
             or os.environ.get("LLM_ENDPOINT")
             or ""
         )
@@ -304,7 +301,7 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
                 "ok": False,
                 "summary": (
                     "task.execute agent mode requires an API key. "
-                    "Set WORKERPALS_OPENHANDS_API_KEY / LLM_API_KEY / OPENAI_API_KEY."
+                    "Set WORKERPALS_OPENHANDS_API_KEY or LLM_API_KEY."
                 ),
                 "stderr": "",
                 "exitCode": 2,

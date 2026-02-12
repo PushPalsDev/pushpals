@@ -1,13 +1,8 @@
 /**
- * LLM Client abstraction — swappable provider interface.
- *
- * Supported backends (pick via env):
- *   OPENAI_API_KEY   → OpenAI (gpt-4o, gpt-4o-mini, etc.)
- *   ANTHROPIC_API_KEY → Anthropic (claude-sonnet-4-20250514, etc.)
- *   LLM_ENDPOINT     → Generic OpenAI-compatible (Ollama, vLLM, LM Studio)
+ * LLM client abstraction with two supported backends:
+ * - LM Studio
+ * - Ollama
  */
-
-// ─── Interface ──────────────────────────────────────────────────────────────
 
 export interface LLMMessage {
   role: "system" | "user" | "assistant";
@@ -17,16 +12,16 @@ export interface LLMMessage {
 export interface LLMGenerateInput {
   system: string;
   messages: LLMMessage[];
-  /** Request JSON output (best-effort — provider must support it) */
+  // Request JSON output when provider supports it.
   json?: boolean;
-  /** Max tokens to generate */
+  // Max tokens to generate.
   maxTokens?: number;
   temperature?: number;
 }
 
 export interface LLMGenerateOutput {
   text: string;
-  /** Usage stats if available */
+  // Usage stats if available.
   usage?: { promptTokens: number; completionTokens: number };
 }
 
@@ -34,17 +29,58 @@ export interface LLMClient {
   generate(input: LLMGenerateInput): Promise<LLMGenerateOutput>;
 }
 
-// ─── OpenAI-compatible client ───────────────────────────────────────────────
+type LlmBackend = "lmstudio" | "ollama";
 
-export class OpenAIClient implements LLMClient {
+const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
+const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
+const DEFAULT_MODEL = "local-model";
+
+function normalizeBackend(value: string | null | undefined): LlmBackend | null {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "lmstudio") return "lmstudio";
+  if (normalized === "ollama") return "ollama";
+  return null;
+}
+
+function configuredBackend(endpoint: string): LlmBackend {
+  const explicit = normalizeBackend(process.env.PUSHPALS_LLM_BACKEND);
+  if (explicit) return explicit;
+  return endpoint.includes("/api/chat") ? "ollama" : "lmstudio";
+}
+
+function normalizeLmStudioEndpoint(endpoint: string): string {
+  const source = (endpoint.trim() || DEFAULT_LMSTUDIO_ENDPOINT).replace(/\/+$/, "");
+  if (source.includes("/chat/completions")) return source;
+  if (source.endsWith("/v1")) return `${source}/chat/completions`;
+  return `${source}/v1/chat/completions`;
+}
+
+function normalizeOllamaEndpoint(endpoint: string): string {
+  const source = (endpoint.trim() || DEFAULT_OLLAMA_ENDPOINT).replace(/\/+$/, "");
+  if (source.endsWith("/api/chat")) return source;
+  return `${source}/api/chat`;
+}
+
+function lmStudioHeaders(apiKey: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (apiKey.trim()) {
+    headers.Authorization = `Bearer ${apiKey.trim()}`;
+  }
+  return headers;
+}
+
+export class LmStudioClient implements LLMClient {
   private endpoint: string;
   private apiKey: string;
   private model: string;
 
   constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
-    this.endpoint = opts?.endpoint ?? process.env.OPENAI_API_ENDPOINT ?? "https://api.openai.com";
-    this.apiKey = opts?.apiKey ?? process.env.OPENAI_API_KEY ?? "";
-    this.model = opts?.model ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+    const rawEndpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? DEFAULT_LMSTUDIO_ENDPOINT;
+    this.endpoint = normalizeLmStudioEndpoint(rawEndpoint);
+    this.apiKey = opts?.apiKey ?? process.env.LLM_API_KEY ?? "lmstudio";
+    this.model = opts?.model ?? process.env.LLM_MODEL ?? DEFAULT_MODEL;
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
@@ -64,18 +100,15 @@ export class OpenAIClient implements LLMClient {
       body.response_format = { type: "json_object" };
     }
 
-    const res = await fetch(`${this.endpoint}/v1/chat/completions`, {
+    const res = await fetch(this.endpoint, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
+      headers: lmStudioHeaders(this.apiKey),
       body: JSON.stringify(body),
     });
 
     if (!res.ok) {
       const err = await res.text();
-      throw new Error(`OpenAI API error ${res.status}: ${err}`);
+      throw new Error(`LM Studio API error ${res.status}: ${err}`);
     }
 
     const data = (await res.json()) as any;
@@ -93,112 +126,62 @@ export class OpenAIClient implements LLMClient {
   }
 }
 
-// ─── Anthropic client ───────────────────────────────────────────────────────
-
-export class AnthropicClient implements LLMClient {
+export class OllamaClient implements LLMClient {
   private endpoint: string;
-  private apiKey: string;
   private model: string;
 
-  constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
-    this.endpoint =
-      opts?.endpoint ?? process.env.ANTHROPIC_API_ENDPOINT ?? "https://api.anthropic.com";
-    this.apiKey = opts?.apiKey ?? process.env.ANTHROPIC_API_KEY ?? "";
-    this.model = opts?.model ?? process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514";
+  constructor(opts?: { endpoint?: string; model?: string }) {
+    const rawEndpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? DEFAULT_OLLAMA_ENDPOINT;
+    this.endpoint = normalizeOllamaEndpoint(rawEndpoint);
+    this.model = opts?.model ?? process.env.LLM_MODEL ?? DEFAULT_MODEL;
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
-    const messages = input.messages
-      .filter((m) => m.role !== "system")
-      .map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      }));
-
-    const res = await fetch(`${this.endpoint}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": this.apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: this.model,
-        system: input.system,
-        messages,
-        max_tokens: input.maxTokens ?? 2048,
+    const body: Record<string, unknown> = {
+      model: this.model,
+      messages: [
+        { role: "system", content: input.system },
+        ...input.messages.map((m) => ({ role: m.role, content: m.content })),
+      ],
+      stream: false,
+      options: {
         temperature: input.temperature ?? 0.3,
-      }),
+      },
+    };
+
+    if (typeof input.maxTokens === "number") {
+      (body.options as Record<string, unknown>).num_predict = input.maxTokens;
+    }
+
+    if (input.json) {
+      body.format = "json";
+    }
+
+    const res = await fetch(this.endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
       const err = await res.text();
-      throw new Error(`Anthropic API error ${res.status}: ${err}`);
+      throw new Error(`Ollama API error ${res.status}: ${err}`);
     }
 
     const data = (await res.json()) as any;
-    const text =
-      data.content
-        ?.filter((c: any) => c.type === "text")
-        .map((c: any) => c.text)
-        .join("") ?? "";
-
-    return {
-      text,
-      usage: data.usage
-        ? {
-            promptTokens: data.usage.input_tokens,
-            completionTokens: data.usage.output_tokens,
-          }
-        : undefined,
-    };
+    return { text: data.message?.content ?? "" };
   }
 }
-
-// ─── Generic OpenAI-compatible client (Ollama, vLLM, LM Studio) ────────────
-
-export class GenericOpenAIClient extends OpenAIClient {
-  private readonly resolvedEndpoint: string;
-  private readonly resolvedModel: string;
-
-  constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
-    const endpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? "http://localhost:18123";
-    const model = opts?.model ?? process.env.LLM_MODEL ?? "zai-org/GLM-4.7-Flash";
-    super({
-      endpoint,
-      apiKey: opts?.apiKey ?? process.env.LLM_API_KEY ?? "vllm",
-      model,
-    });
-    this.resolvedEndpoint = endpoint;
-    this.resolvedModel = model;
-  }
-
-  /** Log resolved endpoint + model on first use for debuggability */
-  async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
-    console.log(`[LLM] Endpoint: ${this.resolvedEndpoint}/v1/chat/completions`);
-    console.log(`[LLM] Model: ${this.resolvedModel}`);
-    // Replace generate with super after first call to avoid repeated logs
-    this.generate = super.generate.bind(this);
-    return super.generate(input);
-  }
-}
-
-// ─── Auto-detect provider ───────────────────────────────────────────────────
 
 export function createLLMClient(): LLMClient {
-  if (process.env.OPENAI_API_KEY) {
-    console.log("[LLM] Using OpenAI provider");
-    return new OpenAIClient();
+  const endpoint = process.env.LLM_ENDPOINT ?? "";
+  const backend = configuredBackend(endpoint);
+
+  if (backend === "ollama") {
+    console.log("[LLM] Using Ollama backend");
+    return new OllamaClient();
   }
-  if (process.env.ANTHROPIC_API_KEY) {
-    console.log("[LLM] Using Anthropic provider");
-    return new AnthropicClient();
-  }
-  if (process.env.LLM_ENDPOINT) {
-    console.log("[LLM] Using generic OpenAI-compatible provider");
-    return new GenericOpenAIClient();
-  }
-  // Default: try vLLM OpenAI-compatible server on localhost.
-  console.log("[LLM] No provider keys found - defaulting to vLLM at localhost:18123");
-  return new GenericOpenAIClient();
+
+  console.log("[LLM] Using LM Studio backend");
+  return new LmStudioClient();
 }

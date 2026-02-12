@@ -318,7 +318,7 @@ export class LocalHeuristicPlanner implements PlannerModel {
 
 /**
  * Calls a remote LLM endpoint to generate tasks.
- * Can point to a local model (e.g. Ollama) or a hosted API.
+ * Can point to a local model server (LM Studio, Ollama) or a hosted API.
  */
 export class RemotePlanner implements PlannerModel {
   private endpoint: string;
@@ -332,10 +332,18 @@ export class RemotePlanner implements PlannerModel {
       model?: string;
     } = {},
   ) {
+    const backend = (process.env.PUSHPALS_LLM_BACKEND ?? "").trim().toLowerCase();
+    const defaultEndpoint =
+      backend === "ollama"
+        ? "http://127.0.0.1:11434/api/chat"
+        : "http://127.0.0.1:1234/v1/chat/completions";
+    const configuredEndpoint = opts.endpoint ?? process.env.PLANNER_ENDPOINT ?? defaultEndpoint;
     this.endpoint =
-      opts.endpoint ?? process.env.PLANNER_ENDPOINT ?? "http://localhost:18123/v1/chat/completions";
+      backend === "ollama" && !configuredEndpoint.includes("/api/chat")
+        ? `${configuredEndpoint.replace(/\/+$/, "")}/api/chat`
+        : configuredEndpoint;
     this.apiKey = opts.apiKey ?? process.env.PLANNER_API_KEY ?? null;
-    this.model = opts.model ?? process.env.PLANNER_MODEL ?? "zai-org/GLM-4.7-Flash";
+    this.model = opts.model ?? process.env.PLANNER_MODEL ?? "local-model";
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {
