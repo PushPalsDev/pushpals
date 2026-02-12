@@ -400,10 +400,41 @@ def _repo_root_for_prompt_loading() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def _resolve_prompt_file(relative_path: str) -> Path:
+    return _repo_root_for_prompt_loading() / "prompts" / relative_path
+
+
+def _resolve_agent_prompt_profile(base_url: str) -> str:
+    raw = (os.environ.get("WORKERPALS_OPENHANDS_PROMPT_PROFILE") or "").strip().lower()
+    if raw in {"default", "full", "standard"}:
+        return "default"
+    if raw in {"minimal", "compact", "small"}:
+        return "minimal"
+    if _looks_local_base_url(base_url):
+        # Local LM Studio/Ollama deployments often have smaller context windows.
+        return "minimal"
+    return "default"
+
+
+def _resolve_agent_prompt_overrides(base_url: str) -> Dict[str, Any]:
+    profile = _resolve_agent_prompt_profile(base_url)
+    if profile != "minimal":
+        return {}
+
+    overrides: Dict[str, Any] = {}
+    system_prompt = _resolve_prompt_file("workerpals/openhands_minimal_system_prompt.j2")
+    security_prompt = _resolve_prompt_file("workerpals/openhands_minimal_security_policy.j2")
+    if system_prompt.exists():
+        overrides["system_prompt_filename"] = str(system_prompt)
+    if security_prompt.exists():
+        overrides["security_policy_filename"] = str(security_prompt)
+    return overrides
+
+
 def _load_prompt_template(
     relative_path: str, replacements: Optional[Dict[str, str]] = None
 ) -> str:
-    prompt_path = _repo_root_for_prompt_loading() / "prompts" / relative_path
+    prompt_path = _resolve_prompt_file(relative_path)
     prompt_key = str(prompt_path)
 
     template = _PROMPT_TEMPLATE_CACHE.get(prompt_key)
@@ -485,7 +516,6 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
     try:
         from openhands.sdk import Agent, Conversation, LLM, Tool
         from openhands.tools.file_editor import FileEditorTool
-        from openhands.tools.task_tracker import TaskTrackerTool
         from openhands.tools.terminal import TerminalTool
     except Exception as exc:
         return {
@@ -564,9 +594,23 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         tools = [
             Tool(name=TerminalTool.name),
             Tool(name=FileEditorTool.name),
-            Tool(name=TaskTrackerTool.name),
         ]
-        agent = Agent(llm=llm, tools=tools)
+        agent_overrides = _resolve_agent_prompt_overrides(base_url)
+        if agent_overrides:
+            sys.stderr.write(
+                "[OpenHandsExecutor] Using minimal OpenHands prompt profile for local context constraints.\n"
+            )
+            sys.stderr.flush()
+        try:
+            agent = Agent(llm=llm, tools=tools, **agent_overrides)
+        except TypeError:
+            # Older SDK versions may not support explicit prompt override kwargs.
+            if agent_overrides:
+                sys.stderr.write(
+                    "[OpenHandsExecutor] Prompt profile overrides unsupported by installed OpenHands SDK; using defaults.\n"
+                )
+                sys.stderr.flush()
+            agent = Agent(llm=llm, tools=tools)
         conversation = Conversation(agent=agent, workspace=repo)
         user_message = _build_agent_user_message(instruction)
         conversation.send_message(user_message)

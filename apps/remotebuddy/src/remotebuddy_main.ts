@@ -68,6 +68,13 @@ function isLikelyChitChat(text: string): boolean {
   );
 }
 
+function isQuestionLike(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return false;
+  if (t.includes("?")) return true;
+  return /^(is|are|can|could|should|would|what|why|how|when|where|which|does|do)\b/.test(t);
+}
+
 function extractTargetPath(text: string): string | null {
   const stopWords = new Set(["a", "an", "the", "it", "this", "that", "there", "here", "file"]);
   const patterns = [
@@ -117,16 +124,28 @@ function isExecutionIntent(text: string, targetPath: string | null): boolean {
   const t = text.trim().toLowerCase();
   if (!t || isLikelyChitChat(t)) return false;
   if (targetPath) return true;
-  const executionVerb =
-    /\b(create|write|add|append|edit|update|modify|delete|remove|rename|implement|fix|refactor|generate|explain|understand|analyze|review|summarize|document|describe)\b/.test(
+
+  if (isArchitectureIntent(t)) return true;
+
+  const mutatingVerb =
+    /\b(create|write|add|append|edit|update|modify|delete|remove|rename|implement|fix|refactor|generate)\b/.test(
       t,
     );
+  const operationalVerb =
+    /\b(run|test|lint|build|compile|search|find|inspect|check|validate|trace|debug)\b/.test(t);
   const repoHint =
     /\b(repo|repository|project|architecture|structure|module|component|workflow|pipeline|branch|worker|orchestrator|server|client|docker|git|code|file|readme)\b/.test(
       t,
     );
-  if (executionVerb && (repoHint || t.length >= 12)) return true;
-  return t.length > 80;
+
+  if (mutatingVerb && (repoHint || t.length >= 12)) return true;
+  if (operationalVerb && repoHint) return true;
+
+  // Keep question-style prompts in chat unless there is a clear execution signal.
+  if (isQuestionLike(t)) return false;
+
+  // Long, imperative prompts without explicit verbs are still likely execution intents.
+  return t.length > 220;
 }
 
 function isArchitectureIntent(text: string): boolean {

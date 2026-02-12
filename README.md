@@ -130,6 +130,9 @@ LLM defaults:
 - OpenHands task message shaping defaults to instruction-only to avoid 4k-context overflow:
   - `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=none` (default)
   - set `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=compact` to prepend `prompts/workerpals/openhands_task_execute_system_prompt.md`
+- OpenHands agent prompt profile can be minimized for local 4k-context models:
+  - `WORKERPALS_OPENHANDS_PROMPT_PROFILE=minimal` (default behavior for local endpoints)
+  - `WORKERPALS_OPENHANDS_PROMPT_PROFILE=default` to use OpenHands built-in templates
 - `bun run start` preflights LLM connectivity and can auto-start LM Studio headless mode for localhost endpoints
 - Ollama is supported but is not auto-started by `bun run start`; run Ollama separately
 - LM Studio startup controls:
