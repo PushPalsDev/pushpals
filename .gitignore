@@ -72,6 +72,7 @@ web_modules/
 
 # PushPals outputs (databases, logs, artifacts — all gitignored)
 outputs/
+workspace/
 apps/server/*.db*
 apps/agent-remote/*.db*
 

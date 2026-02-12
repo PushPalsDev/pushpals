@@ -122,11 +122,16 @@ function cleanRuntimeStateIfRequested(): void {
     console.log(
       `[start] Clean run: no runtime data directory found at ${dataDir} (nothing to delete).`,
     );
-    return;
+  } else {
+    rmSync(dataDir, { recursive: true, force: true });
+    console.log(`[start] Clean run: removed runtime state at ${dataDir}`);
   }
 
-  rmSync(dataDir, { recursive: true, force: true });
-  console.log(`[start] Clean run: removed runtime state at ${dataDir}`);
+  const scratchWorkspaceDir = resolve(repoRoot, "workspace");
+  if (existsSync(scratchWorkspaceDir)) {
+    rmSync(scratchWorkspaceDir, { recursive: true, force: true });
+    console.log(`[start] Clean run: removed runtime scratch dir at ${scratchWorkspaceDir}`);
+  }
 }
 
 function sanitizeInaccessibleEntries(dirPath: string, label: string): number {
@@ -787,6 +792,39 @@ async function git(args: string[]): Promise<CmdResult> {
   return runCapture(["git", ...args], repoRoot);
 }
 
+async function cleanLegacyLocalBranchesIfRequested(): Promise<void> {
+  if (!startOptions.clean) return;
+
+  const patterns = ["refs/heads/agent/workerpal-", "refs/heads/_source_control_manager/local"];
+  const branches = new Set<string>();
+
+  for (const pattern of patterns) {
+    const list = await git(["for-each-ref", "--format=%(refname:short)", pattern]);
+    if (!list.ok || !list.stdout) continue;
+    for (const line of list.stdout.split(/\r?\n/)) {
+      const branch = line.trim();
+      if (branch) branches.add(branch);
+    }
+  }
+
+  if (branches.size === 0) return;
+
+  let removed = 0;
+  for (const branch of branches) {
+    const del = await git(["branch", "-D", branch]);
+    if (del.ok) {
+      removed += 1;
+      continue;
+    }
+    const details = del.stderr || del.stdout;
+    console.warn(`[start] Clean run: could not delete legacy branch ${branch}: ${details}`);
+  }
+
+  if (removed > 0) {
+    console.log(`[start] Clean run: removed ${removed} legacy local PushPals branch(es).`);
+  }
+}
+
 async function promptYesNo(question: string): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
   const readline = await import("readline");
@@ -1077,6 +1115,7 @@ try {
   sanitizeWindowsWatcherPaths();
   await ensureLlmPreflight();
   await ensureIntegrationBranch();
+  await cleanLegacyLocalBranchesIfRequested();
   await ensureGitHubAuth();
   await ensureSourceControlManagerWorktree();
   await ensureDockerImage();

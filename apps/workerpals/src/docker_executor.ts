@@ -283,7 +283,8 @@ export class DockerExecutor {
       "-v",
       `${dockerRepoPath}:/repo`,
       "-w",
-      "/repo",
+      // Keep agent-server runtime artifacts off the host-mounted repo path.
+      "/workspace",
       ...envArgs,
     ];
 

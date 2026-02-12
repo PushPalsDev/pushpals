@@ -279,6 +279,7 @@ async function tick(): Promise<void> {
 
     const completion = data.completion;
     const comm = createSessionComm(completion.sessionId);
+    const cleanupHiddenCompletionRef = completion.branch.startsWith("refs/pushpals/");
     console.log(
       `[${ts()}] Claimed completion ${completion.id}: ${completion.branch} (${completion.commitSha.slice(0, 8)})`,
     );
@@ -300,8 +301,8 @@ async function tick(): Promise<void> {
 
     // ── Process completion ─────────────────────────────────────────────
     try {
-      // 1. Fetch branch from remote
-      console.log(`[${ts()}] Fetching branch ${completion.branch}...`);
+      // 1. Refresh refs before applying completion commit/ref
+      console.log(`[${ts()}] Refreshing refs before applying ${completion.branch}...`);
       await gitOps.fetchPrune();
 
       // 2. Create temp branch and apply worker completion
@@ -407,6 +408,16 @@ async function tick(): Promise<void> {
         `Failed to apply completion ${completion.id.slice(0, 8)} from ${completion.branch}: ${err.message}`,
         completion.id,
       );
+    } finally {
+      if (cleanupHiddenCompletionRef) {
+        try {
+          await gitOps.deleteLocalRef(completion.branch);
+        } catch (err: any) {
+          console.warn(
+            `[${ts()}] Failed to clean local completion ref ${completion.branch}: ${err?.message ?? err}`,
+          );
+        }
+      }
     }
   } catch (err: any) {
     console.error(`[${ts()}] Poll error: ${err.message}`);

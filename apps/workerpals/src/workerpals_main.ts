@@ -238,7 +238,7 @@ async function enqueueCompletion(
   headers: Record<string, string>,
   job: { id: string; taskId: string; kind: string; sessionId: string },
   commit: CommitRef,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const response = await fetch(`${server}/completions/enqueue`, {
       method: "POST",
@@ -254,13 +254,16 @@ async function enqueueCompletion(
 
     if (response.ok) {
       console.log(`[WorkerPals] Enqueued completion for job ${job.id} (commit ${commit.sha})`);
+      return true;
     } else {
       console.error(
         `[WorkerPals] Failed to enqueue completion: ${response.status} ${await response.text()}`,
       );
+      return false;
     }
   } catch (err) {
     console.error(`[WorkerPals] Failed to enqueue completion:`, err);
+    return false;
   }
 }
 
@@ -475,7 +478,21 @@ async function workerLoop(
             }
 
             if (completionCommit) {
-              await enqueueCompletion(opts.server, headers, job, completionCommit);
+              const enqueued = await enqueueCompletion(opts.server, headers, job, completionCommit);
+              if (!enqueued && completionCommit.branch.startsWith("refs/pushpals/")) {
+                const cleanupRef = await git(executionRepo, [
+                  "update-ref",
+                  "-d",
+                  completionCommit.branch,
+                ]);
+                if (!cleanupRef.ok) {
+                  console.warn(
+                    `[WorkerPals] Failed to clean local completion ref ${completionCommit.branch}: ${
+                      cleanupRef.stderr || cleanupRef.stdout
+                    }`,
+                  );
+                }
+              }
             }
 
             if (result.ok) {

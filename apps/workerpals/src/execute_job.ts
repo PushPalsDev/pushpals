@@ -367,15 +367,15 @@ export async function createJobCommit(
   const requirePush = truthy.has((process.env.WORKERPALS_REQUIRE_PUSH ?? "").toLowerCase());
   const pushAgentBranch =
     requirePush || truthy.has((process.env.WORKERPALS_PUSH_AGENT_BRANCH ?? "").toLowerCase());
-  const branchName = `agent/${workerId}/${job.id}`;
+  const publicBranchName = `agent/${workerId}/${job.id}`;
+  // Keep worker refs out of refs/heads so user-visible branch lists stay clean.
+  const hiddenCommitRef = `refs/pushpals/agent/${workerId}/${job.id}`;
   const commitMsg = buildWorkerCommitMessage(workerId, job);
+  let completionRef = hiddenCommitRef;
+  let hiddenRefCreated = false;
 
   try {
-    // Create/reset and checkout branch in this workspace
-    let result = await git(repo, ["checkout", "-B", branchName]);
-    if (!result.ok) {
-      return { ok: false, error: `Failed to create branch: ${result.stderr}` };
-    }
+    let result: { ok: boolean; stdout: string; stderr: string };
 
     // Stage only the paths implied by this job. This prevents runtime metadata
     // (e.g. workspace/bash_events/*) from being accidentally committed.
@@ -393,7 +393,14 @@ export async function createJobCommit(
         console.warn(
           `[WorkerPals] Stage target missing for ${job.kind}; retrying with fallback "git add -A".`,
         );
-        result = await git(repo, ["add", "-A"]);
+        result = await git(repo, [
+          "add",
+          "-A",
+          "--",
+          ".",
+          ":(exclude)workspace/**",
+          ":(exclude)outputs/**",
+        ]);
       }
       if (!result.ok) {
         return { ok: false, error: `Failed to stage changes: ${result.stderr || result.stdout}` };
@@ -405,19 +412,7 @@ export async function createJobCommit(
     if (result.ok) {
       // No changes to commit (diff exited 0)
       console.log(`[WorkerPals] No changes to commit for job ${job.id}`);
-      // Clean up branch in detached state (safe for worktrees and direct checkouts)
-      const detachResult = await git(repo, ["checkout", "--detach"]);
-      if (!detachResult.ok) {
-        return {
-          ok: false,
-          error: `No changes found, but failed to detach before branch cleanup: ${detachResult.stderr}`,
-        };
-      }
-      const deleteResult = await git(repo, ["branch", "-D", branchName]);
-      if (!deleteResult.ok) {
-        return { ok: false, error: `Failed to delete empty branch: ${deleteResult.stderr}` };
-      }
-      return { ok: true, branch: branchName, sha: "no-changes" };
+      return { ok: true, branch: hiddenCommitRef, sha: "no-changes" };
     }
 
     // Commit changes
@@ -433,28 +428,46 @@ export async function createJobCommit(
     }
     const sha = result.stdout;
 
+    // Persist commit under an internal ref so it remains reachable after worktree cleanup.
+    result = await git(repo, ["update-ref", hiddenCommitRef, sha]);
+    if (!result.ok) {
+      return { ok: false, error: `Failed to store worker commit ref: ${result.stderr}` };
+    }
+    hiddenRefCreated = true;
+
     // Push branch to origin (optional; disabled by default for shared-.git workflows)
     if (pushAgentBranch) {
-      result = await git(repo, ["push", "origin", branchName]);
+      result = await git(repo, [
+        "push",
+        "origin",
+        `${hiddenCommitRef}:refs/heads/${publicBranchName}`,
+      ]);
       if (!result.ok) {
         const pushError = `Failed to push branch: ${result.stderr || result.stdout}`;
         if (requirePush) {
+          if (hiddenRefCreated) {
+            await git(repo, ["update-ref", "-d", hiddenCommitRef]);
+          }
           return { ok: false, error: pushError };
         }
         console.warn(
-          `[WorkerPals] ${pushError}. Continuing with local branch only (set WORKERPALS_REQUIRE_PUSH=1 to enforce push).`,
+          `[WorkerPals] ${pushError}. Continuing with local commit ref only (set WORKERPALS_REQUIRE_PUSH=1 to enforce push).`,
         );
-        return { ok: true, branch: branchName, sha };
+        return { ok: true, branch: completionRef, sha };
       }
+      completionRef = publicBranchName;
     } else {
       console.log(
-        `[WorkerPals] Skipping push for ${branchName} (WORKERPALS_PUSH_AGENT_BRANCH is disabled).`,
+        `[WorkerPals] Skipping push for ${publicBranchName} (WORKERPALS_PUSH_AGENT_BRANCH is disabled).`,
       );
     }
 
-    console.log(`[WorkerPals] Created commit ${sha} on branch ${branchName}`);
-    return { ok: true, branch: branchName, sha };
+    console.log(`[WorkerPals] Created commit ${sha} on ref ${completionRef}`);
+    return { ok: true, branch: completionRef, sha };
   } catch (err) {
+    if (hiddenRefCreated) {
+      await git(repo, ["update-ref", "-d", hiddenCommitRef]);
+    }
     return { ok: false, error: String(err) };
   }
 }
