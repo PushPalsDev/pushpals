@@ -1,0 +1,35 @@
+# Dependency directories (host-specific/binary-heavy; install inside image instead)
+node_modules
+**/node_modules
+
+# Git metadata and local worktrees
+.git
+.worktrees
+**/.git
+**/.worktrees
+
+# Local outputs and caches
+outputs
+**/outputs
+.cache
+**/.cache
+.expo
+**/.expo
+
+# Build artifacts
+dist
+**/dist
+build
+**/build
+
+# Logs and temp files
+*.log
+tmp
+**/tmp
+
+# Env files and editor cruft
+.env
+.env.local
+.env.*.local
+.DS_Store
+Thumbs.db
