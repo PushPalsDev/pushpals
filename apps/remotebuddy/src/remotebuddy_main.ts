@@ -87,6 +87,32 @@ function extractTargetPath(text: string): string | null {
   return null;
 }
 
+function extractLiteralFileContent(text: string): string | null {
+  const quotedPatterns = [
+    /\bwith\s+(?:the\s+)?(?:words?|text|content)\s+["'`]([^"'`]+)["'`]/i,
+    /\b(?:that\s+says?|saying|containing)\s+["'`]([^"'`]+)["'`]/i,
+  ];
+  for (const pattern of quotedPatterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const value = (match[1] ?? "").trim();
+    if (value) return value;
+  }
+
+  const unquotedPatterns = [
+    /\bwith\s+(?:the\s+)?(?:words?|text|content)\s+(.+)$/i,
+    /\b(?:that\s+says?|saying|containing)\s+(.+)$/i,
+  ];
+  for (const pattern of unquotedPatterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const value = (match[1] ?? "").trim().replace(/[.]+$/, "");
+    if (value) return value;
+  }
+
+  return null;
+}
+
 function isExecutionIntent(text: string, targetPath: string | null): boolean {
   const t = text.trim().toLowerCase();
   if (!t || isLikelyChitChat(t)) return false;
@@ -522,6 +548,8 @@ class RemoteBuddyOrchestrator {
     const originalPrompt = String(request.originalPrompt ?? "").trim();
     const promptForIntent = originalPrompt || enhancedPrompt || "";
     const targetPath = extractTargetPath(originalPrompt) ?? extractTargetPath(enhancedPrompt);
+    const literalFileContent =
+      extractLiteralFileContent(originalPrompt) ?? extractLiteralFileContent(enhancedPrompt);
     const actionable = isExecutionIntent(promptForIntent, targetPath);
     const turnId = randomUUID();
 
@@ -549,7 +577,12 @@ class RemoteBuddyOrchestrator {
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
       const architectureIntent = isArchitectureIntent(promptForIntent);
-      const jobKind = architectureIntent ? "project.summary" : "task.execute";
+      const canDirectWrite = !!targetPath && typeof literalFileContent === "string";
+      const jobKind = canDirectWrite
+        ? "file.write"
+        : architectureIntent
+          ? "project.summary"
+          : "task.execute";
       const params: Record<string, unknown> = {
         requestId,
         sessionId: this.sessionId,
@@ -560,6 +593,10 @@ class RemoteBuddyOrchestrator {
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
       };
+      if (jobKind === "file.write" && targetPath) {
+        params.path = targetPath;
+        params.content = literalFileContent ?? "";
+      }
       if (jobKind === "task.execute" && targetPath) {
         params.targetPath = targetPath;
       }

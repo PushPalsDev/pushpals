@@ -366,7 +366,7 @@ export class DockerExecutor {
       this.warmContainerName,
       "bun",
       "run",
-      "/repo/apps/workerpals/src/job_runner.ts",
+      "/workspace/apps/workerpals/src/job_runner.ts",
       base64Spec,
     ];
 
