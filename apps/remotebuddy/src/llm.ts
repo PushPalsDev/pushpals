@@ -34,6 +34,9 @@ type LlmBackend = "lmstudio" | "ollama";
 const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_MODEL = "local-model";
+const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
+const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
+const DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
 const REMOTEBUDDY_JSON_RESPONSE_SCHEMA: Record<string, unknown> = {
   name: "remotebuddy_response",
   strict: false,
@@ -108,6 +111,32 @@ function lmStudioHeaders(apiKey: string): Record<string, string> {
   return headers;
 }
 
+function parsePositiveInt(value: string | null | undefined, fallback: number): number {
+  const parsed = Number.parseInt((value ?? "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Conservative estimate to stay safely under provider context limits.
+function estimateTokensFromText(text: string): number {
+  return Math.ceil(text.length / 3);
+}
+
+function truncateKeepingStart(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 12) return text.slice(0, maxChars);
+  return `${text.slice(0, maxChars - 12)}\n...[truncated]`;
+}
+
+function truncateKeepingEnd(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= 12) return text.slice(text.length - maxChars);
+  return `...[truncated]\n${text.slice(text.length - (maxChars - 12))}`;
+}
+
+function sumEstimatedTokens(messages: Array<{ role: string; content: string }>): number {
+  return messages.reduce((acc, msg) => acc + estimateTokensFromText(msg.content), 0);
+}
+
 export class LmStudioClient implements LLMClient {
   private endpoint: string;
   private apiKey: string;
@@ -121,15 +150,77 @@ export class LmStudioClient implements LLMClient {
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+    const contextWindow = parsePositiveInt(
+      process.env.PUSHPALS_LMSTUDIO_CONTEXT_WINDOW ?? process.env.LLM_CONTEXT_WINDOW,
+      DEFAULT_LMSTUDIO_CONTEXT_WINDOW,
+    );
+    const minOutputTokens = parsePositiveInt(
+      process.env.PUSHPALS_LMSTUDIO_MIN_OUTPUT_TOKENS,
+      DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS,
+    );
+    const desiredMaxTokens = input.maxTokens ?? 2048;
+    const clampedMinOutput = Math.max(64, Math.min(minOutputTokens, Math.floor(contextWindow / 2)));
+    const promptTokenBudget = Math.max(
+      384,
+      contextWindow - clampedMinOutput - DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
+    );
+    const systemTokenBudget = Math.max(
+      128,
+      Math.min(Math.floor(promptTokenBudget * 0.45), promptTokenBudget - 128),
+    );
+
+    let trimmed = false;
+    let remainingPromptTokens = promptTokenBudget;
+    let systemContent = input.system;
+    if (estimateTokensFromText(systemContent) > systemTokenBudget) {
+      systemContent = truncateKeepingStart(systemContent, systemTokenBudget * 3);
+      trimmed = true;
+    }
+    remainingPromptTokens = Math.max(
+      64,
+      promptTokenBudget - estimateTokensFromText(systemContent),
+    );
+
+    const selectedMessages: Array<{ role: string; content: string }> = [];
+    for (let i = input.messages.length - 1; i >= 0; i--) {
+      const source = input.messages[i];
+      let content = source.content ?? "";
+      const estimated = estimateTokensFromText(content);
+      if (estimated <= remainingPromptTokens) {
+        selectedMessages.push({ role: source.role, content });
+        remainingPromptTokens -= estimated;
+        continue;
+      }
+      const charBudget = Math.max(192, remainingPromptTokens * 3);
+      content = truncateKeepingEnd(content, charBudget);
+      selectedMessages.push({ role: source.role, content });
+      trimmed = true;
+      break;
+    }
+
     const messages: Array<{ role: string; content: string }> = [
-      { role: "system", content: input.system },
-      ...input.messages,
+      { role: "system", content: systemContent },
+      ...selectedMessages.reverse(),
     ];
+
+    const promptTokensEstimate = sumEstimatedTokens(messages);
+    const safeMaxTokens = Math.max(
+      64,
+      Math.min(
+        desiredMaxTokens,
+        contextWindow - promptTokensEstimate - DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
+      ),
+    );
+    if (trimmed) {
+      console.warn(
+        `[LLM] Trimmed LM Studio prompt context to fit window (~${contextWindow} tokens, est prompt ${promptTokensEstimate}).`,
+      );
+    }
 
     const baseBody: Record<string, unknown> = {
       model: this.model,
       messages,
-      max_tokens: input.maxTokens ?? 2048,
+      max_tokens: safeMaxTokens,
       temperature: input.temperature ?? 0.3,
     };
 
