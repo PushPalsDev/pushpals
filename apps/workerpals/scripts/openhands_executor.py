@@ -526,6 +526,23 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         llm_kwargs["timeout"] = max(
             5, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_TIMEOUT_SEC"), 90)
         )
+        # LM Studio/llama.cpp can fail with n_keep >= n_ctx when large prompts
+        # are cache-pinned. Disable prompt caching for local endpoints.
+        llm_kwargs["caching_prompt"] = False
+
+    compact_agent_prompt = ""
+    try:
+        compact_agent_prompt = _load_prompt_template(
+            "workerpals/openhands_task_execute_system_prompt.md"
+        ).strip()
+    except Exception:
+        compact_agent_prompt = (
+            "You are PushPals WorkerPal running inside OpenHands.\n"
+            "Focus only on the task below.\n"
+            "If the task asks a question, answer directly and do not edit files.\n"
+            "If the task asks for code/file changes, implement minimal correct changes in-repo.\n"
+            "Avoid unrelated docs or architecture summaries unless explicitly requested."
+        )
 
     try:
         llm = LLM(**llm_kwargs)
@@ -537,10 +554,7 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         agent = Agent(llm=llm, tools=tools)
         conversation = Conversation(agent=agent, workspace=repo)
 
-        system_prompt = _load_prompt_template("workerpals/workerpals_system_prompt.md")
-        post_system_prompt = _load_prompt_template("shared/post_system_prompt.md")
-        combined_system_prompt = f"{system_prompt}\n\n{post_system_prompt}".strip()
-        conversation.send_message(f"{combined_system_prompt}\n\nTask:\n{instruction}")
+        conversation.send_message(f"{compact_agent_prompt}\n\nTask:\n{instruction}")
 
         max_steps = max(1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_AGENT_MAX_STEPS"), 30))
         try:
@@ -580,6 +594,17 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
                     f"Model: {model}\n"
                     f"Base URL: {base_url}\n"
                     "Verify the host LLM server is running and reachable from Docker."
+                ),
+                "exitCode": 2,
+            }
+        if "cannot truncate prompt with n_keep" in lowered and "n_ctx" in lowered:
+            return {
+                "ok": False,
+                "summary": "OpenHands prompt exceeded LM Studio context window",
+                "stderr": (
+                    f"{err_text}\n"
+                    "Reduce overall prompt/context size, increase model context window, "
+                    "or use a model/runtime with larger context support."
                 ),
                 "exitCode": 2,
             }
