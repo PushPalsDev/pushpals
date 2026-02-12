@@ -201,14 +201,17 @@ export interface BrainOutput {
 
 // ─── System prompt ──────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/system_prompt.md", {
+const BASE_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/remotebuddy_system_prompt.md", {
   repo_root: process.cwd(),
   platform: process.platform,
 });
+const POST_SYSTEM_PROMPT = loadPromptTemplate("shared/post_system_prompt.md");
+const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}\n\n${POST_SYSTEM_PROMPT}`.trim();
 
-const FALLBACK_FILE_SYSTEM_PROMPT = loadPromptTemplate(
+const BASE_FALLBACK_FILE_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/fallback_file_system_prompt.md",
 );
+const FALLBACK_FILE_SYSTEM_PROMPT = `${BASE_FALLBACK_FILE_SYSTEM_PROMPT}\n\n${POST_SYSTEM_PROMPT}`.trim();
 
 // ─── Brain class ────────────────────────────────────────────────────────────
 

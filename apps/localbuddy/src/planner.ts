@@ -35,9 +35,21 @@ export interface PlannerModel {
   plan(input: PlannerInput): Promise<PlannerOutput>;
 }
 
-const REMOTE_PLANNER_SYSTEM_PROMPT = loadPromptTemplate(
-  "localbuddy/remote_planner_system_prompt.md",
+const BASE_REMOTE_PLANNER_SYSTEM_PROMPT = loadPromptTemplate(
+  "localbuddy/localbuddy_system_prompt.md",
 );
+const POST_SYSTEM_PROMPT = loadPromptTemplate("shared/post_system_prompt.md");
+const REMOTE_PLANNER_SYSTEM_PROMPT =
+  `${BASE_REMOTE_PLANNER_SYSTEM_PROMPT}
+
+${POST_SYSTEM_PROMPT}
+
+Planner-specific output contract:
+- For this response, output STRICT JSON only.
+- JSON shape: { "tasks": [{ "title": string, "description": string, "toolsNeeded": string[], "confidence": number }] }
+- Do not include markdown, prose, or code fences.
+- Keep tasks concrete and executable by available tools.
+`.trim();
 
 // LocalHeuristicPlanner
 

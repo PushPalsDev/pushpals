@@ -335,10 +335,10 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         agent = Agent(llm=llm, tools=tools)
         conversation = Conversation(agent=agent, workspace=repo)
 
-        system_prompt = _load_prompt_template(
-            "workerpals/openhands_task_execute_system_prompt.md"
-        )
-        conversation.send_message(f"{system_prompt}\n\nTask:\n{instruction}")
+        system_prompt = _load_prompt_template("workerpals/workerpals_system_prompt.md")
+        post_system_prompt = _load_prompt_template("shared/post_system_prompt.md")
+        combined_system_prompt = f"{system_prompt}\n\n{post_system_prompt}".strip()
+        conversation.send_message(f"{combined_system_prompt}\n\nTask:\n{instruction}")
 
         max_steps = max(1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_AGENT_MAX_STEPS"), 30))
         try:

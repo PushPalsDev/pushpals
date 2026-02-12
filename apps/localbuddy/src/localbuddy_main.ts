@@ -81,15 +81,17 @@ class LocalBuddyServer {
   ): Promise<string> {
     try {
       const status = context.status.split("\n").slice(0, 20).join("\n") || "(clean)";
-      const systemPrompt = loadPromptTemplate("localbuddy/enhance_prompt.md", {
+      const systemPrompt = loadPromptTemplate("localbuddy/localbuddy_system_prompt.md", {
         branch: context.branch,
         status,
         recent_commits: context.recentCommits || "(none)",
         repo_root: this.repo,
       });
+      const postSystemPrompt = loadPromptTemplate("shared/post_system_prompt.md");
+      const combinedSystemPrompt = `${systemPrompt}\n\n${postSystemPrompt}`.trim();
 
       const output = await this.llm.generate({
-        system: systemPrompt,
+        system: combinedSystemPrompt,
         messages: [{ role: "user", content: originalPrompt }],
         maxTokens: 1024,
         temperature: 0.3,
