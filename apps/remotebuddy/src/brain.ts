@@ -80,6 +80,27 @@ function parseStructuredJson(text: string): any {
   }
 }
 
+function tryParseStructuredJson(text: string): { parsed: any | null; error: string | null } {
+  try {
+    return { parsed: parseStructuredJson(text), error: null };
+  } catch (err) {
+    return { parsed: null, error: String(err) };
+  }
+}
+
+function extractAssistantFallback(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+
+  // If model wrapped plain text in fences, unwrap it.
+  const fenced = trimmed.match(/^```(?:json|text|md|markdown)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+
+  return trimmed;
+}
+
 function hasFileWriteIntent(text: string): boolean {
   const t = text.toLowerCase();
   const explicitWrite =
@@ -275,7 +296,26 @@ export class AgentBrain {
         temperature: 0.3,
       });
 
-      const parsed = parseStructuredJson(result.text) as {
+      const parsedResult = tryParseStructuredJson(result.text);
+      if (!parsedResult.parsed || typeof parsedResult.parsed !== "object") {
+        if (parsedResult.error) {
+          console.warn(
+            `[Brain] Non-JSON LLM response; using text fallback (${parsedResult.error}).`,
+          );
+        }
+        const fallback = extractAssistantFallback(result.text).slice(0, MAX_ASSISTANT_MSG_LEN);
+        if (result.usage) {
+          console.log(
+            `[Brain] Tokens: ${result.usage.promptTokens} in, ${result.usage.completionTokens} out`,
+          );
+        }
+        return {
+          assistantMessage:
+            fallback || "I received your message but couldn't formulate a response.",
+        };
+      }
+
+      const parsed = parsedResult.parsed as {
         assistant_message?: string;
         tasks?: Array<{
           taskId: string;

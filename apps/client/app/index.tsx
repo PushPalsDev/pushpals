@@ -12,6 +12,7 @@ import {
   View,
   useWindowDimensions,
 } from "react-native";
+import type { TextInputKeyPressEventData, NativeSyntheticEvent } from "react-native";
 import type { EventEnvelope } from "protocol/browser";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { TasksJobsLogs } from "../src/lib/TasksJobsLogs";
@@ -357,6 +358,22 @@ function ChatPane({
   connected: boolean;
 }) {
   const scrollRef = useRef<ScrollView | null>(null);
+  const handleComposerKeyPress = useCallback(
+    (event: NativeSyntheticEvent<TextInputKeyPressEventData>) => {
+      const nativeEvent = event.nativeEvent as TextInputKeyPressEventData & {
+        altKey?: boolean;
+        metaKey?: boolean;
+      };
+      const key = (nativeEvent.key ?? "").toLowerCase();
+      const hasShortcutModifier = Boolean(nativeEvent.altKey || nativeEvent.metaKey);
+      if (key === "enter" && hasShortcutModifier) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        onSend();
+      }
+    },
+    [onSend],
+  );
 
   useEffect(() => {
     scrollRef.current?.scrollToEnd({ animated: true });
@@ -433,20 +450,26 @@ function ChatPane({
           placeholder="Ask PushPals anything..."
           placeholderTextColor={theme.textMuted}
           multiline
+          onKeyPress={handleComposerKeyPress}
         />
-        <Pressable
-          onPress={onSend}
-          disabled={!connected || !input.trim()}
-          style={[
-            styles.sendButton,
-            {
-              backgroundColor: theme.accent,
-              opacity: !connected || !input.trim() ? 0.45 : 1,
-            },
-          ]}
-        >
-          <Text style={[styles.sendLabel, { fontFamily: theme.fontSans }]}>Send</Text>
-        </Pressable>
+        <View style={styles.sendWrap}>
+          <Pressable
+            onPress={onSend}
+            disabled={!connected || !input.trim()}
+            style={[
+              styles.sendButton,
+              {
+                backgroundColor: theme.accent,
+                opacity: !connected || !input.trim() ? 0.45 : 1,
+              },
+            ]}
+          >
+            <Text style={[styles.sendLabel, { fontFamily: theme.fontSans }]}>Send</Text>
+          </Pressable>
+          <Text style={[styles.shortcutHint, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            Alt+Enter / Cmd+Enter
+          </Text>
+        </View>
       </View>
     </View>
   );
@@ -1257,17 +1280,25 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   sendButton: {
-    marginLeft: 8,
     height: 44,
     borderRadius: 12,
     paddingHorizontal: 16,
     justifyContent: "center",
     alignItems: "center",
   },
+  sendWrap: {
+    marginLeft: 8,
+    alignItems: "center",
+  },
   sendLabel: {
     color: "#FFFFFF",
     fontWeight: "700",
     fontSize: 13,
+  },
+  shortcutHint: {
+    marginTop: 4,
+    fontSize: 10,
+    fontWeight: "600",
   },
 
   requestCard: {
