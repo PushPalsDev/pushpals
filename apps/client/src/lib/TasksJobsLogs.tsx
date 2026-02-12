@@ -58,9 +58,7 @@ function classifyTraceTone(line: string, stream?: "stdout" | "stderr"): TraceTon
   ) {
     return "error";
   }
-  if (
-    /\b(think|reason|analysis|plan|decide|why|because|approach|strategy)\b/i.test(value)
-  ) {
+  if (/\b(think|reason|analysis|plan|decide|why|because|approach|strategy)\b/i.test(value)) {
     return "reasoning";
   }
   if (
@@ -272,7 +270,11 @@ function JobRow({ job, logs }: { job: Job; logs: LogLine[] }) {
               <Text style={s.streamLabel}>Trace</Text>
               <ScrollView style={s.traceScroll} nestedScrollEnabled>
                 {trace.map((entry) => (
-                  <Text key={entry.key} style={[s.traceLine, traceToneStyle(entry.tone)]} selectable>
+                  <Text
+                    key={entry.key}
+                    style={[s.traceLine, traceToneStyle(entry.tone)]}
+                    selectable
+                  >
                     [{entry.source}] {entry.line}
                   </Text>
                 ))}

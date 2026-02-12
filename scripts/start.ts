@@ -119,7 +119,9 @@ function cleanRuntimeStateIfRequested(): void {
   }
 
   if (!existsSync(dataDir)) {
-    console.log(`[start] Clean run: no runtime data directory found at ${dataDir} (nothing to delete).`);
+    console.log(
+      `[start] Clean run: no runtime data directory found at ${dataDir} (nothing to delete).`,
+    );
     return;
   }
 
@@ -168,7 +170,9 @@ function sanitizeInaccessibleBinEntries(): void {
     removedTotal += sanitizeBinDir(dir);
   }
   if (removedTotal > 0) {
-    console.log(`[start] Cleaned ${removedTotal} inaccessible node_modules/.bin entries for Windows watcher compatibility.`);
+    console.log(
+      `[start] Cleaned ${removedTotal} inaccessible node_modules/.bin entries for Windows watcher compatibility.`,
+    );
   }
 }
 
@@ -234,10 +238,7 @@ function appendLmStudioLogTail(line: string): void {
   }
 }
 
-function streamProcessOutput(
-  stream: ReadableStream<Uint8Array> | null,
-  prefix: string,
-): void {
+function streamProcessOutput(stream: ReadableStream<Uint8Array> | null, prefix: string): void {
   if (!stream) return;
 
   const reader = stream.getReader();
@@ -292,9 +293,11 @@ async function probeHttpReachable(
   }
 }
 
-async function checkTargetReachable(
-  target: { name: string; endpoint: string; probes: string[] },
-): Promise<{ ok: boolean; url?: string; status?: number; error?: string }> {
+async function checkTargetReachable(target: {
+  name: string;
+  endpoint: string;
+  probes: string[];
+}): Promise<{ ok: boolean; url?: string; status?: number; error?: string }> {
   let lastError = "unknown error";
   for (const probe of target.probes) {
     const result = await probeHttpReachable(probe);
@@ -309,7 +312,8 @@ function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: 
   const seenEndpoints = new Set<string>();
   const configuredPrimaryRaw = (process.env.LLM_ENDPOINT ?? "").trim();
   const primaryBackend = configuredLlmBackend(configuredPrimaryRaw || DEFAULT_LLM_ENDPOINT);
-  const primaryFallback = primaryBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LLM_ENDPOINT;
+  const primaryFallback =
+    primaryBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LLM_ENDPOINT;
   const configuredPlannerRaw = (process.env.PLANNER_ENDPOINT ?? "").trim();
   const plannerFallback =
     primaryBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_PLANNER_ENDPOINT;
@@ -351,7 +355,8 @@ function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: 
 
 function lmStudioReadyTimeoutMs(): number {
   return (
-    parsePositiveInt(process.env.PUSHPALS_LMSTUDIO_READY_TIMEOUT_MS) ?? DEFAULT_LMSTUDIO_READY_TIMEOUT_MS
+    parsePositiveInt(process.env.PUSHPALS_LMSTUDIO_READY_TIMEOUT_MS) ??
+    DEFAULT_LMSTUDIO_READY_TIMEOUT_MS
   );
 }
 
@@ -359,7 +364,8 @@ function shouldAutoStartLmStudio(primaryEndpoint: string): boolean {
   if (configuredLlmBackend(primaryEndpoint) !== "lmstudio") return false;
 
   const explicit = process.env.PUSHPALS_AUTO_START_LMSTUDIO;
-  const enabled = explicit == null || explicit.trim() === "" ? true : TRUTHY.has(explicit.toLowerCase());
+  const enabled =
+    explicit == null || explicit.trim() === "" ? true : TRUTHY.has(explicit.toLowerCase());
   if (!enabled) return false;
 
   const parsed = parseUrl(primaryEndpoint);
@@ -512,15 +518,16 @@ async function stopManagedLmStudio(): Promise<void> {
     } catch {}
 
     try {
-      await Promise.race([proc.exited, new Promise((resolveWait) => setTimeout(resolveWait, 2500))]);
+      await Promise.race([
+        proc.exited,
+        new Promise((resolveWait) => setTimeout(resolveWait, 2500)),
+      ]);
     } catch {}
   }
 
   if (startedByUs && daemonized && stopCli) {
     const stopWithPort =
-      stopPort != null
-        ? ["server", "stop", "--port", String(stopPort)]
-        : ["server", "stop"];
+      stopPort != null ? ["server", "stop", "--port", String(stopPort)] : ["server", "stop"];
     let stopExit = await runQuiet([stopCli, ...stopWithPort]);
     if (stopExit !== 0 && stopPort != null) {
       stopExit = await runQuiet([stopCli, "server", "stop"]);
@@ -576,7 +583,9 @@ async function ensureLlmPreflight(): Promise<void> {
     }
 
     const timeoutMs = lmStudioReadyTimeoutMs();
-    console.log(`[start] Waiting for local LM Studio to become reachable (timeout ${timeoutMs}ms)...`);
+    console.log(
+      `[start] Waiting for local LM Studio to become reachable (timeout ${timeoutMs}ms)...`,
+    );
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       primaryReachable = await checkTargetReachable(primary);
