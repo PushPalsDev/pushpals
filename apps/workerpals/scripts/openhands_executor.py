@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import nullcontext
 from pathlib import Path
@@ -239,6 +240,48 @@ def _normalize_base_url_for_provider(base_url: str, provider: str) -> str:
     return normalized
 
 
+def _running_in_container() -> bool:
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
+def _rewrite_localhost_for_container(base_url: str) -> str:
+    normalized = base_url.strip()
+    if not normalized:
+        return normalized
+
+    try:
+        parsed = urllib.parse.urlparse(normalized)
+    except Exception:
+        return normalized
+
+    host = (parsed.hostname or "").lower()
+    if host not in {"localhost", "127.0.0.1", "::1"}:
+        return normalized
+
+    user_info = ""
+    if parsed.username:
+        user_info = parsed.username
+        if parsed.password:
+            user_info += f":{parsed.password}"
+        user_info += "@"
+
+    netloc = f"{user_info}host.docker.internal"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+
+    rewritten = urllib.parse.urlunparse(
+        (
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+    return rewritten or normalized
+
+
 def _looks_local_base_url(base_url: str) -> bool:
     if not base_url:
         return False
@@ -290,6 +333,14 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
     provider = _infer_litellm_provider(raw_base_url)
     model = _normalize_litellm_model(raw_model, provider)
     base_url = _normalize_base_url_for_provider(raw_base_url, provider)
+    if _running_in_container():
+        rewritten = _rewrite_localhost_for_container(base_url)
+        if rewritten != base_url:
+            sys.stderr.write(
+                f"[OpenHandsExecutor] Rewriting local LLM base URL for container networking: {base_url} -> {rewritten}\n"
+            )
+            sys.stderr.flush()
+            base_url = rewritten
     return model, api_key, base_url
 
 

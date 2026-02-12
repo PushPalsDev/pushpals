@@ -67,7 +67,9 @@ export function createRequestHandler() {
       // Noisy poll endpoints: only log these at debug level.
       const isNoisyPoll =
         (method === "POST" &&
-          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat)\/?$/.test(pathname)) ||
+          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command)\/?$/.test(
+            pathname,
+          )) ||
         (method === "GET" && /^\/+workers\/?$/.test(pathname));
       if (isNoisyPoll) {
         if (debugHttpLogs) console.log(`[${method}] ${pathname}`);
