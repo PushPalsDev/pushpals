@@ -16,7 +16,7 @@
  * - worker Docker image existence
  */
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, unlinkSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 
@@ -129,49 +129,141 @@ function cleanRuntimeStateIfRequested(): void {
   console.log(`[start] Clean run: removed runtime state at ${dataDir}`);
 }
 
-function sanitizeBinDir(binDir: string): number {
-  if (!existsSync(binDir)) return 0;
+function sanitizeInaccessibleEntries(dirPath: string, label: string): number {
+  if (!existsSync(dirPath)) return 0;
+
+  const pending: string[] = [dirPath];
   let removed = 0;
-  for (const entry of readdirSync(binDir)) {
-    const fullPath = resolve(binDir, entry);
+
+  while (pending.length > 0) {
+    const currentDir = pending.pop()!;
+    let entries: string[];
     try {
-      lstatSync(fullPath);
+      entries = readdirSync(currentDir);
     } catch (err: any) {
       const code = typeof err?.code === "string" ? err.code : "";
       if (code === "EACCES" || code === "EPERM" || code === "UNKNOWN") {
         try {
-          unlinkSync(fullPath);
-          removed += 1;
-          console.warn(`[start] Removed inaccessible bin entry: ${fullPath}`);
+          // Avoid deleting the root scan dir itself; remove inaccessible children only.
+          if (currentDir !== dirPath) {
+            rmSync(currentDir, { recursive: true, force: true });
+            removed += 1;
+            console.warn(`[start] Removed inaccessible ${label} entry: ${currentDir}`);
+          }
         } catch {
-          // keep startup resilient; if we cannot remove it, client may still fail and show the path
+          // best-effort only; if this fails, downstream watcher will surface path details.
         }
+      }
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = resolve(currentDir, entry);
+      let stat: ReturnType<typeof lstatSync> | null = null;
+      try {
+        stat = lstatSync(fullPath);
+      } catch (err: any) {
+        const code = typeof err?.code === "string" ? err.code : "";
+        if (code === "EACCES" || code === "EPERM" || code === "UNKNOWN") {
+          try {
+            rmSync(fullPath, { recursive: true, force: true });
+            removed += 1;
+            console.warn(`[start] Removed inaccessible ${label} entry: ${fullPath}`);
+          } catch {
+            // best-effort only; if this fails, downstream watcher will surface path details.
+          }
+        }
+        continue;
+      }
+
+      if (stat.isDirectory()) {
+        pending.push(fullPath);
       }
     }
   }
+
   return removed;
 }
 
-function sanitizeInaccessibleBinEntries(): void {
+function removeWindowsIncompatibleBunArtifacts(bunStoreDir: string): number {
+  if (!existsSync(bunStoreDir)) return 0;
+
+  let removed = 0;
+  const queue: string[] = [bunStoreDir];
+
+  while (queue.length > 0) {
+    const current = queue.pop()!;
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(current);
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = resolve(current, entry);
+      let stat: ReturnType<typeof lstatSync> | null = null;
+      try {
+        stat = lstatSync(fullPath);
+      } catch {
+        continue;
+      }
+
+      if (!stat.isDirectory()) continue;
+
+      // Expo/Metro can choke on Linux-targeted optional binaries in Bun's store on Windows.
+      if (/-linux-/i.test(entry)) {
+        try {
+          rmSync(fullPath, { recursive: true, force: true });
+          removed += 1;
+          console.warn(`[start] Removed Windows-incompatible Bun artifact: ${fullPath}`);
+        } catch {
+          // best effort
+        }
+        continue;
+      }
+
+      queue.push(fullPath);
+    }
+  }
+
+  return removed;
+}
+
+function sanitizeWindowsWatcherPaths(): void {
   if (process.platform !== "win32") return;
 
-  const candidateDirs = [resolve(repoRoot, "node_modules", ".bin")];
+  const binDirs = [resolve(repoRoot, "node_modules", ".bin")];
+  const bunStoreDirs = [resolve(repoRoot, "node_modules", ".bun", "node_modules")];
+
   for (const group of ["apps", "packages"]) {
     const groupPath = resolve(repoRoot, group);
     if (!existsSync(groupPath)) continue;
     for (const entry of readdirSync(groupPath, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
-      candidateDirs.push(resolve(groupPath, entry.name, "node_modules", ".bin"));
+      binDirs.push(resolve(groupPath, entry.name, "node_modules", ".bin"));
+      bunStoreDirs.push(resolve(groupPath, entry.name, "node_modules", ".bun", "node_modules"));
     }
   }
 
-  let removedTotal = 0;
-  for (const dir of candidateDirs) {
-    removedTotal += sanitizeBinDir(dir);
+  let removedBin = 0;
+  for (const dir of binDirs) {
+    removedBin += sanitizeInaccessibleEntries(dir, "node_modules/.bin");
   }
-  if (removedTotal > 0) {
+  if (removedBin > 0) {
     console.log(
-      `[start] Cleaned ${removedTotal} inaccessible node_modules/.bin entries for Windows watcher compatibility.`,
+      `[start] Cleaned ${removedBin} inaccessible node_modules/.bin entries for Windows watcher compatibility.`,
+    );
+  }
+
+  let removedBunStore = 0;
+  for (const dir of bunStoreDirs) {
+    removedBunStore += removeWindowsIncompatibleBunArtifacts(dir);
+    removedBunStore += sanitizeInaccessibleEntries(dir, "node_modules/.bun/node_modules");
+  }
+  if (removedBunStore > 0) {
+    console.log(
+      `[start] Cleaned ${removedBunStore} inaccessible node_modules/.bun/node_modules entries for Windows watcher compatibility.`,
     );
   }
 }
@@ -982,7 +1074,7 @@ process.on("SIGTERM", () => {
 
 try {
   cleanRuntimeStateIfRequested();
-  sanitizeInaccessibleBinEntries();
+  sanitizeWindowsWatcherPaths();
   await ensureLlmPreflight();
   await ensureIntegrationBranch();
   await ensureGitHubAuth();
