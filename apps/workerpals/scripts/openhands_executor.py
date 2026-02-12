@@ -336,7 +336,7 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         conversation = Conversation(agent=agent, workspace=repo)
 
         system_prompt = _load_prompt_template(
-            "workerpals/openhands_task_execute_system_prompt.txt"
+            "workerpals/openhands_task_execute_system_prompt.md"
         )
         conversation.send_message(f"{system_prompt}\n\nTask:\n{instruction}")
 

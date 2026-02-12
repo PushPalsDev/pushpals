@@ -36,7 +36,7 @@ export interface PlannerModel {
 }
 
 const REMOTE_PLANNER_SYSTEM_PROMPT = loadPromptTemplate(
-  "localbuddy/remote_planner_system_prompt.txt",
+  "localbuddy/remote_planner_system_prompt.md",
 );
 
 // LocalHeuristicPlanner

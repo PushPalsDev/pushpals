@@ -81,7 +81,7 @@ class LocalBuddyServer {
   ): Promise<string> {
     try {
       const status = context.status.split("\n").slice(0, 20).join("\n") || "(clean)";
-      const systemPrompt = loadPromptTemplate("localbuddy/enhance_prompt.txt", {
+      const systemPrompt = loadPromptTemplate("localbuddy/enhance_prompt.md", {
         branch: context.branch,
         status,
         recent_commits: context.recentCommits || "(none)",

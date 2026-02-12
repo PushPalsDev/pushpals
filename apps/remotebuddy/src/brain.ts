@@ -201,13 +201,13 @@ export interface BrainOutput {
 
 // ─── System prompt ──────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/system_prompt.txt", {
+const SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/system_prompt.md", {
   repo_root: process.cwd(),
   platform: process.platform,
 });
 
 const FALLBACK_FILE_SYSTEM_PROMPT = loadPromptTemplate(
-  "remotebuddy/fallback_file_system_prompt.txt",
+  "remotebuddy/fallback_file_system_prompt.md",
 );
 
 // ─── Brain class ────────────────────────────────────────────────────────────
@@ -229,7 +229,7 @@ export class AgentBrain {
   ): Promise<string> {
     const contextBlock =
       context && context.length > 0 ? `Recent context:\n${context.slice(-10).join("\n")}` : "";
-    const userPrompt = loadPromptTemplate("remotebuddy/fallback_file_user_prompt.txt", {
+    const userPrompt = loadPromptTemplate("remotebuddy/fallback_file_user_prompt.md", {
       target_path: targetPath,
       user_request: userText,
       context_block: contextBlock,

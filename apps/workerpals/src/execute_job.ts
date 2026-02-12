@@ -695,7 +695,7 @@ function buildWorkerCommitMessage(
   };
 
   try {
-    return loadPromptTemplate("workerpals/commit_message_prompt.txt", replacements).trim();
+    return loadPromptTemplate("workerpals/commit_message_prompt.md", replacements).trim();
   } catch (err) {
     console.warn(`[WorkerPals] Failed to load commit message prompt template: ${String(err)}`);
     const fallbackLines = [
