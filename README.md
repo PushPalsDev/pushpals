@@ -118,6 +118,10 @@ LLM defaults:
 - Ollama endpoint should be `LLM_ENDPOINT=http://127.0.0.1:11434/api/chat`
 - Default model is `local-model` (override with `LLM_MODEL`)
 - WorkerPals OpenHands agent mode reuses `LLM_*` vars unless `WORKERPALS_OPENHANDS_*` is set
+- For OpenHands/LiteLLM, WorkerPals auto-qualifies plain model names:
+  - `openai/<model>` for LM Studio/OpenAI-compatible backends
+  - `ollama/<model>` for Ollama backends
+  - override inference with `WORKERPALS_OPENHANDS_PROVIDER`
 - `bun run start` preflights LLM connectivity and can auto-start LM Studio headless mode for localhost endpoints
 - Ollama is supported but is not auto-started by `bun run start`; run Ollama separately
 - LM Studio startup controls:

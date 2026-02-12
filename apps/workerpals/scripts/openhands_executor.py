@@ -24,12 +24,32 @@ import urllib.error
 import urllib.request
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ "
 PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 _PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
+KNOWN_LITELLM_PROVIDER_PREFIXES: Set[str] = {
+    "openai",
+    "azure",
+    "ollama",
+    "openrouter",
+    "anthropic",
+    "google",
+    "gemini",
+    "vertex_ai",
+    "bedrock",
+    "cohere",
+    "groq",
+    "mistral",
+    "huggingface",
+    "replicate",
+    "deepseek",
+    "xai",
+    "together_ai",
+    "fireworks_ai",
+}
 
 
 class ManagedLocalAgentServer:
@@ -166,9 +186,57 @@ def _normalize_base_url(raw: str) -> str:
     if not base:
         return ""
     base = base.rstrip("/")
+    if base.endswith("/api/chat"):
+        base = base[: -len("/api/chat")]
     if base.endswith("/chat/completions"):
         base = base[: -len("/chat/completions")]
     return base
+
+
+def _model_is_provider_qualified(model: str) -> bool:
+    if "/" not in model:
+        return False
+    provider = model.split("/", 1)[0].strip().lower()
+    return provider in KNOWN_LITELLM_PROVIDER_PREFIXES
+
+
+def _infer_litellm_provider(base_url: str) -> str:
+    backend = (
+        os.environ.get("WORKERPALS_OPENHANDS_PROVIDER")
+        or os.environ.get("PUSHPALS_LLM_BACKEND")
+        or ""
+    ).strip().lower()
+    if backend in {"ollama", "ollama_chat"}:
+        return "ollama"
+    if backend in {"lmstudio", "openai", "openai_compatible"}:
+        return "openai"
+
+    lowered = base_url.lower()
+    if "11434" in lowered:
+        return "ollama"
+    return "openai"
+
+
+def _normalize_litellm_model(model: str, provider: str) -> str:
+    normalized = model.strip()
+    if not normalized:
+        return normalized
+    if _model_is_provider_qualified(normalized):
+        return normalized
+    if not provider:
+        return normalized
+    return f"{provider}/{normalized}"
+
+
+def _normalize_base_url_for_provider(base_url: str, provider: str) -> str:
+    normalized = _normalize_base_url(base_url)
+    if not normalized:
+        return normalized
+    if provider != "openai":
+        return normalized
+    if re.match(r"^https?://[^/]+$", normalized, flags=re.I):
+        return f"{normalized}/v1"
+    return normalized
 
 
 def _looks_local_base_url(base_url: str) -> bool:
@@ -201,7 +269,7 @@ def _agent_server_is_healthy(base_url: str, timeout: float = 1.0) -> bool:
 
 
 def _resolve_llm_config() -> Tuple[str, str, str]:
-    model = (
+    raw_model = (
         os.environ.get("WORKERPALS_OPENHANDS_MODEL")
         or os.environ.get("LLM_MODEL")
         or ""
@@ -211,7 +279,7 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
         or os.environ.get("LLM_API_KEY")
         or ""
     ).strip()
-    base_url = _normalize_base_url(
+    raw_base_url = (
         (
             os.environ.get("WORKERPALS_OPENHANDS_BASE_URL")
             or os.environ.get("LLM_BASE_URL")
@@ -219,6 +287,9 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
             or ""
         )
     )
+    provider = _infer_litellm_provider(raw_base_url)
+    model = _normalize_litellm_model(raw_model, provider)
+    base_url = _normalize_base_url_for_provider(raw_base_url, provider)
     return model, api_key, base_url
 
 
