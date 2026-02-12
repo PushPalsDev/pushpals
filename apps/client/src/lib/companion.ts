@@ -2,7 +2,7 @@ import type { EventEnvelope } from "protocol/browser";
 
 export type UserIntent = {
   summary: string;
-  tasks: Array<{ title: string; description: string; confidence: number }>;
+  tasks: { title: string; description: string; confidence: number }[];
   constraints?: string[];
   riskLevel?: "low" | "medium" | "high";
 };
@@ -10,7 +10,7 @@ export type UserIntent = {
 export interface CompanionModel {
   summarizeAndPlan(input: {
     userText: string;
-    history: Array<EventEnvelope | { type: "_error"; message: string }>;
+    history: (EventEnvelope | { type: "_error"; message: string })[];
   }): Promise<UserIntent>;
 }
 
@@ -21,7 +21,7 @@ export interface CompanionModel {
 export class RemoteCompanionModel implements CompanionModel {
   async summarizeAndPlan(input: {
     userText: string;
-    history: Array<EventEnvelope | { type: "_error"; message: string }>;
+    history: (EventEnvelope | { type: "_error"; message: string })[];
   }): Promise<UserIntent> {
     // Simple heuristic stub: echo the user text as summary and create one task
     return {

@@ -55,6 +55,11 @@ export function createRequestHandler() {
 
       const makeJson = (body: unknown, status = 200) =>
         new Response(JSON.stringify(body), { status, headers: jsonHeaders });
+      const parseLimit = (raw: string | null, fallback = 200): number => {
+        const parsed = raw ? parseInt(raw, 10) : NaN;
+        if (!Number.isFinite(parsed)) return fallback;
+        return Math.max(1, Math.min(500, parsed));
+      };
 
       // Handle CORS preflight
       if (method === "OPTIONS") {
@@ -70,7 +75,8 @@ export function createRequestHandler() {
           /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command)\/?$/.test(
             pathname,
           )) ||
-        (method === "GET" && /^\/+workers\/?$/.test(pathname));
+        (method === "GET" &&
+          /^\/+(workers|system\/status|requests|jobs|completions)(\/)?$/.test(pathname));
       if (isNoisyPoll) {
         if (debugHttpLogs) console.log(`[${method}] ${pathname}`);
       } else {
@@ -288,6 +294,103 @@ export function createRequestHandler() {
         const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
         const workers = jobQueue.listWorkers(ttlMs);
         return makeJson({ ok: true, workers });
+      }
+
+      // GET /system/status
+      if (pathname === "/system/status" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const ttlMsRaw = parseInt(url.searchParams.get("ttlMs") ?? "", 10);
+        const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
+        const workers = jobQueue.listWorkers(ttlMs);
+        const onlineWorkers = workers.filter((w) => w.isOnline);
+        const busyWorkers = workers.filter((w) => w.status === "busy").length;
+
+        return makeJson({
+          ok: true,
+          ts: new Date().toISOString(),
+          workers: {
+            total: workers.length,
+            online: onlineWorkers.length,
+            busy: busyWorkers,
+            idle: Math.max(0, onlineWorkers.length - busyWorkers),
+          },
+          queues: {
+            requests: requestQueue.countByStatus(),
+            jobs: jobQueue.countByStatus(),
+            completions: completionQueue.countByStatus(),
+          },
+        });
+      }
+
+      // GET /requests
+      if (pathname === "/requests" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const status = (url.searchParams.get("status") ?? "all").trim().toLowerCase();
+        const limit = parseLimit(url.searchParams.get("limit"));
+        if (!["all", "pending", "claimed", "completed", "failed"].includes(status)) {
+          return makeJson({ ok: false, message: "Invalid status filter" }, 400);
+        }
+
+        const requests = requestQueue.listRequests({
+          status: status as "all" | "pending" | "claimed" | "completed" | "failed",
+          limit,
+        });
+
+        return makeJson({
+          ok: true,
+          requests,
+          counts: requestQueue.countByStatus(),
+        });
+      }
+
+      // GET /jobs
+      if (pathname === "/jobs" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const status = (url.searchParams.get("status") ?? "all").trim().toLowerCase();
+        const limit = parseLimit(url.searchParams.get("limit"));
+        if (!["all", "pending", "claimed", "completed", "failed"].includes(status)) {
+          return makeJson({ ok: false, message: "Invalid status filter" }, 400);
+        }
+
+        const jobs = jobQueue.listJobs({
+          status: status as "all" | "pending" | "claimed" | "completed" | "failed",
+          limit,
+        });
+
+        return makeJson({
+          ok: true,
+          jobs,
+          counts: jobQueue.countByStatus(),
+        });
+      }
+
+      // GET /completions
+      if (pathname === "/completions" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const status = (url.searchParams.get("status") ?? "all").trim().toLowerCase();
+        const limit = parseLimit(url.searchParams.get("limit"));
+        if (!["all", "pending", "claimed", "processed", "failed"].includes(status)) {
+          return makeJson({ ok: false, message: "Invalid status filter" }, 400);
+        }
+
+        const completions = completionQueue.listCompletions({
+          status: status as "all" | "pending" | "claimed" | "processed" | "failed",
+          limit,
+        });
+
+        return makeJson({
+          ok: true,
+          completions,
+          counts: completionQueue.countByStatus(),
+        });
       }
 
       // POST /jobs/:id/complete

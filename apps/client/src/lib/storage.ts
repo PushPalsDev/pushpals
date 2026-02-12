@@ -18,31 +18,38 @@ type NativeStorage = {
 };
 
 let _native: NativeStorage | null | undefined; // undefined = not yet tried
+let _nativeLoad: Promise<NativeStorage | null> | null = null;
 let _warned = false;
 
-function nativeStorage(): NativeStorage | null {
-  if (_native) return _native;
-  if (_native === null) return null; // already failed
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const mod = require("@react-native-async-storage/async-storage");
-    const store = (mod.default ?? mod) as NativeStorage;
-    if (!store?.getItem || !store?.setItem) {
-      throw new Error("module loaded but getItem/setItem missing");
+async function nativeStorage(): Promise<NativeStorage | null> {
+  if (_native !== undefined) return _native;
+  if (_nativeLoad) return _nativeLoad;
+
+  _nativeLoad = (async () => {
+    try {
+      const mod = await import("@react-native-async-storage/async-storage");
+      const store = (mod.default ?? mod) as NativeStorage;
+      if (!store?.getItem || !store?.setItem) {
+        throw new Error("module loaded but getItem/setItem missing");
+      }
+      _native = store;
+      return _native;
+    } catch {
+      _native = null;
+      if (!_warned) {
+        _warned = true;
+        console.warn(
+          "[PushPals] @react-native-async-storage/async-storage is not available. " +
+            "Cursor persistence disabled on native. Install with: bun add @react-native-async-storage/async-storage",
+        );
+      }
+      return null;
+    } finally {
+      _nativeLoad = null;
     }
-    _native = store;
-    return _native;
-  } catch {
-    _native = null;
-    if (!_warned) {
-      _warned = true;
-      console.warn(
-        "[PushPals] @react-native-async-storage/async-storage is not available. " +
-          "Cursor persistence disabled on native. Install with: bun add @react-native-async-storage/async-storage",
-      );
-    }
-    return null;
-  }
+  })();
+
+  return _nativeLoad;
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -56,7 +63,9 @@ export async function getItem(key: string): Promise<string | null> {
     }
   }
   try {
-    return (await nativeStorage()?.getItem(key)) ?? null;
+    const store = await nativeStorage();
+    if (!store) return null;
+    return (await store.getItem(key)) ?? null;
   } catch {
     return null;
   }
@@ -72,7 +81,9 @@ export async function setItem(key: string, value: string): Promise<void> {
     return;
   }
   try {
-    await nativeStorage()?.setItem(key, value);
+    const store = await nativeStorage();
+    if (!store) return;
+    await store.setItem(key, value);
   } catch {
     // ignore
   }

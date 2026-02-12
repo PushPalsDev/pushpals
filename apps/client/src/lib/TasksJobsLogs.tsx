@@ -2,16 +2,6 @@ import React, { useMemo, useState } from "react";
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Platform } from "react-native";
 import type { SessionState, Task, Job, LogLine } from "./eventReducer";
 
-const STATUS_COLOR: Record<string, string> = {
-  created: "#94a3b8",
-  started: "#6366f1",
-  in_progress: "#8b5cf6",
-  completed: "#22c55e",
-  failed: "#ef4444",
-  enqueued: "#a855f7",
-  claimed: "#7c3aed",
-};
-
 const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 const JOB_RUNNER_RESULT_PREFIX = "___RESULT___ ";
 const MAX_TRACE_LINES = 220;
@@ -27,8 +17,96 @@ interface TraceEntry {
   tone: TraceTone;
 }
 
-function statusColor(s: string): string {
-  return STATUS_COLOR[s] ?? "#94a3b8";
+export type TasksJobsLogsThemeMode = "light" | "dark";
+
+export interface TasksJobsLogsTheme {
+  mode?: TasksJobsLogsThemeMode;
+  fontSans?: string;
+  fontMono?: string;
+}
+
+interface TracePalette {
+  bg: string;
+  panel: string;
+  panelAlt: string;
+  border: string;
+  text: string;
+  textMuted: string;
+  accent: string;
+  success: string;
+  warning: string;
+  danger: string;
+  reasoningText: string;
+  reasoningBg: string;
+  actionText: string;
+  actionBg: string;
+  infoText: string;
+  infoBg: string;
+  errorText: string;
+  errorBg: string;
+}
+
+const LIGHT_PALETTE: TracePalette = {
+  bg: "#F4F8FB",
+  panel: "#FFFFFF",
+  panelAlt: "#EEF4F8",
+  border: "#D2E0E8",
+  text: "#112230",
+  textMuted: "#547086",
+  accent: "#007E77",
+  success: "#169A58",
+  warning: "#C7851E",
+  danger: "#D64553",
+  reasoningText: "#1D4E89",
+  reasoningBg: "#EAF4FF",
+  actionText: "#0F6C48",
+  actionBg: "#E9FBF5",
+  infoText: "#334155",
+  infoBg: "#F4F8FB",
+  errorText: "#A22A35",
+  errorBg: "#FEECEF",
+};
+
+const DARK_PALETTE: TracePalette = {
+  bg: "#14212A",
+  panel: "#16222B",
+  panelAlt: "#1B2A35",
+  border: "#284050",
+  text: "#EAF3F6",
+  textMuted: "#97B3C2",
+  accent: "#2FD6C8",
+  success: "#5DDD8B",
+  warning: "#FFB95A",
+  danger: "#FF6B72",
+  reasoningText: "#9BC6FF",
+  reasoningBg: "#1D2A40",
+  actionText: "#8EF5BD",
+  actionBg: "#163628",
+  infoText: "#D2E3ED",
+  infoBg: "#1A2934",
+  errorText: "#FFACB5",
+  errorBg: "#3A1B22",
+};
+
+function paletteForMode(mode: TasksJobsLogsThemeMode): TracePalette {
+  return mode === "dark" ? DARK_PALETTE : LIGHT_PALETTE;
+}
+
+function statusColor(status: string, palette: TracePalette): string {
+  switch (status) {
+    case "completed":
+      return palette.success;
+    case "failed":
+      return palette.danger;
+    case "claimed":
+    case "started":
+    case "in_progress":
+      return palette.warning;
+    case "enqueued":
+    case "created":
+    default:
+      return palette.accent;
+  }
 }
 
 function cleanLine(raw: string): string {
@@ -175,16 +253,231 @@ function extractTrace(job: Job, logs: LogLine[]): TraceEntry[] {
   return entries;
 }
 
-function traceToneStyle(tone: TraceTone) {
+function createStyles(palette: TracePalette, theme?: TasksJobsLogsTheme) {
+  const sans = theme?.fontSans;
+  const mono = theme?.fontMono ?? (Platform.OS === "web" ? "monospace" : undefined);
+
+  return StyleSheet.create({
+    container: { flex: 1, backgroundColor: palette.bg },
+    content: { padding: 12, paddingBottom: 16 },
+    emptyContainer: {
+      flex: 1,
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 24,
+    },
+
+    section: { marginBottom: 16 },
+    sectionTitle: {
+      fontSize: 13,
+      fontWeight: "700",
+      color: palette.textMuted,
+      textTransform: "uppercase",
+      letterSpacing: 0.5,
+      marginBottom: 8,
+      fontFamily: sans,
+    },
+
+    taskCard: {
+      backgroundColor: palette.panel,
+      borderRadius: 8,
+      marginBottom: 8,
+      borderLeftWidth: 3,
+      borderLeftColor: palette.border,
+      ...Platform.select({
+        web: { boxShadow: "0 1px 3px rgba(0,0,0,0.12)" },
+        default: { elevation: 1 },
+      }),
+    },
+    taskHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      padding: 10,
+      gap: 8,
+    },
+    taskTitle: {
+      flex: 1,
+      fontSize: 14,
+      fontWeight: "600",
+      color: palette.text,
+      fontFamily: sans,
+    },
+    taskBody: {
+      paddingHorizontal: 10,
+      paddingBottom: 10,
+    },
+    desc: {
+      fontSize: 12,
+      color: palette.textMuted,
+      marginBottom: 4,
+      fontFamily: sans,
+    },
+    progressMsg: {
+      fontSize: 12,
+      color: palette.warning,
+      fontStyle: "italic",
+      marginBottom: 8,
+      fontFamily: sans,
+    },
+
+    jobCard: {
+      backgroundColor: palette.panelAlt,
+      borderRadius: 6,
+      marginTop: 6,
+      borderWidth: 1,
+      borderColor: palette.border,
+    },
+    jobHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      padding: 8,
+      gap: 6,
+      flexWrap: "wrap",
+    },
+    jobBody: {
+      borderTopWidth: 1,
+      borderTopColor: palette.border,
+      paddingBottom: 8,
+    },
+    jobKind: {
+      fontSize: 13,
+      fontWeight: "500",
+      color: palette.text,
+      fontFamily: sans,
+    },
+    workerId: {
+      fontSize: 11,
+      color: palette.accent,
+      fontFamily: mono,
+    },
+    logCount: {
+      fontSize: 11,
+      color: palette.textMuted,
+      marginLeft: "auto",
+      fontFamily: sans,
+    },
+    jobSummary: {
+      fontSize: 12,
+      color: palette.text,
+      paddingHorizontal: 8,
+      paddingTop: 8,
+      paddingBottom: 4,
+      fontFamily: sans,
+    },
+    jobError: {
+      fontSize: 12,
+      color: palette.danger,
+      paddingHorizontal: 8,
+      paddingTop: 4,
+      fontFamily: sans,
+    },
+    jobErrorDetail: {
+      fontSize: 11,
+      color: palette.danger,
+      paddingHorizontal: 8,
+      paddingTop: 2,
+      fontFamily: mono,
+    },
+
+    traceSection: {
+      marginTop: 4,
+    },
+    traceScroll: {
+      maxHeight: 220,
+    },
+    traceLine: {
+      fontSize: 11,
+      paddingHorizontal: 8,
+      paddingVertical: 2,
+      fontFamily: mono,
+    },
+    traceReasoning: {
+      color: palette.reasoningText,
+      backgroundColor: palette.reasoningBg,
+    },
+    traceAction: {
+      color: palette.actionText,
+      backgroundColor: palette.actionBg,
+    },
+    traceInfo: {
+      color: palette.infoText,
+      backgroundColor: palette.infoBg,
+    },
+    traceError: {
+      color: palette.errorText,
+      backgroundColor: palette.errorBg,
+    },
+
+    rawToggle: {
+      marginTop: 6,
+      marginHorizontal: 8,
+      paddingHorizontal: 8,
+      paddingVertical: 6,
+      borderRadius: 6,
+      borderWidth: 1,
+      borderColor: palette.border,
+      backgroundColor: palette.panel,
+      alignSelf: "flex-start",
+    },
+    rawToggleText: {
+      fontSize: 11,
+      color: palette.text,
+      fontWeight: "600",
+      fontFamily: sans,
+    },
+
+    logSections: {
+      borderTopWidth: 1,
+      borderTopColor: palette.border,
+      marginTop: 6,
+    },
+    streamLabel: {
+      fontSize: 10,
+      fontWeight: "700",
+      color: palette.textMuted,
+      textTransform: "uppercase",
+      paddingHorizontal: 8,
+      paddingTop: 6,
+      letterSpacing: 0.5,
+      fontFamily: sans,
+    },
+    logScroll: {
+      maxHeight: 200,
+    },
+    logLine: {
+      fontSize: 11,
+      paddingHorizontal: 8,
+      paddingVertical: 1,
+      fontFamily: mono,
+    },
+    logStdout: {
+      color: palette.infoText,
+      backgroundColor: palette.actionBg,
+    },
+    logStderr: {
+      color: palette.errorText,
+      backgroundColor: palette.errorBg,
+    },
+
+    dot: { width: 8, height: 8, borderRadius: 4 },
+    statusBadge: { fontSize: 11, fontWeight: "600", fontFamily: sans },
+    chevron: { fontSize: 12, color: palette.textMuted, fontFamily: sans },
+    muted: { fontSize: 12, color: palette.textMuted, fontStyle: "italic", paddingHorizontal: 8, fontFamily: sans },
+  });
+}
+
+type TraceStyles = ReturnType<typeof createStyles>;
+
+function traceToneStyle(tone: TraceTone, styles: TraceStyles) {
   switch (tone) {
     case "reasoning":
-      return s.traceReasoning;
+      return styles.traceReasoning;
     case "action":
-      return s.traceAction;
+      return styles.traceAction;
     case "error":
-      return s.traceError;
+      return styles.traceError;
     default:
-      return s.traceInfo;
+      return styles.traceInfo;
   }
 }
 
@@ -194,33 +487,43 @@ function TaskRow({
   logs,
   expanded,
   onToggle,
+  styles,
+  palette,
 }: {
   task: Task;
   jobs: Job[];
   logs: Map<string, LogLine[]>;
   expanded: boolean;
   onToggle: () => void;
+  styles: TraceStyles;
+  palette: TracePalette;
 }) {
-  const c = statusColor(task.status);
+  const color = statusColor(task.status, palette);
 
   return (
-    <View style={s.taskCard}>
-      <TouchableOpacity onPress={onToggle} style={s.taskHeader}>
-        <View style={[s.dot, { backgroundColor: c }]} />
-        <Text style={s.taskTitle} numberOfLines={1}>
+    <View style={styles.taskCard}>
+      <TouchableOpacity onPress={onToggle} style={styles.taskHeader}>
+        <View style={[styles.dot, { backgroundColor: color }]} />
+        <Text style={styles.taskTitle} numberOfLines={1}>
           {task.title}
         </Text>
-        <Text style={[s.statusBadge, { color: c }]}>{task.status}</Text>
-        <Text style={s.chevron}>{expanded ? "v" : ">"}</Text>
+        <Text style={[styles.statusBadge, { color }]}>{task.status}</Text>
+        <Text style={styles.chevron}>{expanded ? "v" : ">"}</Text>
       </TouchableOpacity>
 
       {expanded && (
-        <View style={s.taskBody}>
-          {task.description ? <Text style={s.desc}>{task.description}</Text> : null}
-          {task.latestProgress ? <Text style={s.progressMsg}>{task.latestProgress}</Text> : null}
-          {jobs.length === 0 && <Text style={s.muted}>No jobs yet</Text>}
+        <View style={styles.taskBody}>
+          {task.description ? <Text style={styles.desc}>{task.description}</Text> : null}
+          {task.latestProgress ? <Text style={styles.progressMsg}>{task.latestProgress}</Text> : null}
+          {jobs.length === 0 && <Text style={styles.muted}>No jobs yet</Text>}
           {jobs.map((job) => (
-            <JobRow key={job.jobId} job={job} logs={logs.get(job.jobId) ?? []} />
+            <JobRow
+              key={job.jobId}
+              job={job}
+              logs={logs.get(job.jobId) ?? []}
+              styles={styles}
+              palette={palette}
+            />
           ))}
         </View>
       )}
@@ -228,51 +531,61 @@ function TaskRow({
   );
 }
 
-function JobRow({ job, logs }: { job: Job; logs: LogLine[] }) {
+function JobRow({
+  job,
+  logs,
+  styles,
+  palette,
+}: {
+  job: Job;
+  logs: LogLine[];
+  styles: TraceStyles;
+  palette: TracePalette;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [showRawLogs, setShowRawLogs] = useState(false);
-  const c = statusColor(job.status);
+  const color = statusColor(job.status, palette);
 
   const stdoutLines = useMemo(
-    () => logs.filter((l) => l.stream === "stdout").sort((a, b) => a.seq - b.seq),
+    () => logs.filter((line) => line.stream === "stdout").sort((a, b) => a.seq - b.seq),
     [logs],
   );
   const stderrLines = useMemo(
-    () => logs.filter((l) => l.stream === "stderr").sort((a, b) => a.seq - b.seq),
+    () => logs.filter((line) => line.stream === "stderr").sort((a, b) => a.seq - b.seq),
     [logs],
   );
   const trace = useMemo(() => extractTrace(job, logs), [job, logs]);
   const totalLines = stdoutLines.length + stderrLines.length;
 
   return (
-    <View style={s.jobCard}>
-      <TouchableOpacity onPress={() => setExpanded(!expanded)} style={s.jobHeader}>
-        <View style={[s.dot, { backgroundColor: c }]} />
-        <Text style={s.jobKind}>{job.kind}</Text>
-        <Text style={[s.statusBadge, { color: c }]}>{job.status}</Text>
-        {job.workerId && <Text style={s.workerId}>@{job.workerId}</Text>}
-        {(trace.length > 0 || totalLines > 0) && (
-          <Text style={s.logCount}>
+    <View style={styles.jobCard}>
+      <TouchableOpacity onPress={() => setExpanded(!expanded)} style={styles.jobHeader}>
+        <View style={[styles.dot, { backgroundColor: color }]} />
+        <Text style={styles.jobKind}>{job.kind}</Text>
+        <Text style={[styles.statusBadge, { color }]}>{job.status}</Text>
+        {job.workerId ? <Text style={styles.workerId}>@{job.workerId}</Text> : null}
+        {trace.length > 0 || totalLines > 0 ? (
+          <Text style={styles.logCount}>
             {trace.length} trace / {totalLines} raw
           </Text>
-        )}
-        <Text style={s.chevron}>{expanded ? "v" : ">"}</Text>
+        ) : null}
+        <Text style={styles.chevron}>{expanded ? "v" : ">"}</Text>
       </TouchableOpacity>
 
       {expanded && (
-        <View style={s.jobBody}>
-          {job.summary ? <Text style={s.jobSummary}>{job.summary}</Text> : null}
-          {job.message ? <Text style={s.jobError}>{job.message}</Text> : null}
-          {job.detail ? <Text style={s.jobErrorDetail}>{job.detail}</Text> : null}
+        <View style={styles.jobBody}>
+          {job.summary ? <Text style={styles.jobSummary}>{job.summary}</Text> : null}
+          {job.message ? <Text style={styles.jobError}>{job.message}</Text> : null}
+          {job.detail ? <Text style={styles.jobErrorDetail}>{job.detail}</Text> : null}
 
           {trace.length > 0 ? (
-            <View style={s.traceSection}>
-              <Text style={s.streamLabel}>Trace</Text>
-              <ScrollView style={s.traceScroll} nestedScrollEnabled>
+            <View style={styles.traceSection}>
+              <Text style={styles.streamLabel}>Trace</Text>
+              <ScrollView style={styles.traceScroll} nestedScrollEnabled>
                 {trace.map((entry) => (
                   <Text
                     key={entry.key}
-                    style={[s.traceLine, traceToneStyle(entry.tone)]}
+                    style={[styles.traceLine, traceToneStyle(entry.tone, styles)]}
                     selectable
                   >
                     [{entry.source}] {entry.line}
@@ -281,45 +594,45 @@ function JobRow({ job, logs }: { job: Job; logs: LogLine[] }) {
               </ScrollView>
             </View>
           ) : (
-            <Text style={s.muted}>No trace output captured for this job.</Text>
+            <Text style={styles.muted}>No trace output captured for this job.</Text>
           )}
 
-          {totalLines > 0 && (
-            <TouchableOpacity style={s.rawToggle} onPress={() => setShowRawLogs(!showRawLogs)}>
-              <Text style={s.rawToggleText}>
+          {totalLines > 0 ? (
+            <TouchableOpacity style={styles.rawToggle} onPress={() => setShowRawLogs(!showRawLogs)}>
+              <Text style={styles.rawToggleText}>
                 {showRawLogs ? "Hide raw logs" : `Show raw logs (${totalLines})`}
               </Text>
             </TouchableOpacity>
-          )}
+          ) : null}
 
-          {showRawLogs && totalLines > 0 && (
-            <View style={s.logSections}>
-              {stdoutLines.length > 0 && (
+          {showRawLogs && totalLines > 0 ? (
+            <View style={styles.logSections}>
+              {stdoutLines.length > 0 ? (
                 <View>
-                  <Text style={s.streamLabel}>STDOUT</Text>
-                  <ScrollView style={s.logScroll} nestedScrollEnabled>
+                  <Text style={styles.streamLabel}>STDOUT</Text>
+                  <ScrollView style={styles.logScroll} nestedScrollEnabled>
                     {stdoutLines.map((line) => (
-                      <Text key={`stdout-${line.seq}`} style={[s.logLine, s.logStdout]} selectable>
+                      <Text key={`stdout-${line.seq}`} style={[styles.logLine, styles.logStdout]} selectable>
                         {line.line}
                       </Text>
                     ))}
                   </ScrollView>
                 </View>
-              )}
-              {stderrLines.length > 0 && (
+              ) : null}
+              {stderrLines.length > 0 ? (
                 <View>
-                  <Text style={s.streamLabel}>STDERR</Text>
-                  <ScrollView style={s.logScroll} nestedScrollEnabled>
+                  <Text style={styles.streamLabel}>STDERR</Text>
+                  <ScrollView style={styles.logScroll} nestedScrollEnabled>
                     {stderrLines.map((line) => (
-                      <Text key={`stderr-${line.seq}`} style={[s.logLine, s.logStderr]} selectable>
+                      <Text key={`stderr-${line.seq}`} style={[styles.logLine, styles.logStderr]} selectable>
                         {line.line}
                       </Text>
                     ))}
                   </ScrollView>
                 </View>
-              )}
+              ) : null}
             </View>
-          )}
+          ) : null}
         </View>
       )}
     </View>
@@ -330,60 +643,73 @@ function OrphanJobs({
   jobs,
   logs,
   taskJobIds,
+  styles,
+  palette,
 }: {
   jobs: Map<string, Job>;
   logs: Map<string, LogLine[]>;
   taskJobIds: Set<string>;
+  styles: TraceStyles;
+  palette: TracePalette;
 }) {
-  const orphans = Array.from(jobs.values())
-    .filter((j) => !taskJobIds.has(j.jobId))
+  const orphanJobs = Array.from(jobs.values())
+    .filter((job) => !taskJobIds.has(job.jobId))
     .sort((a, b) => a.ts.localeCompare(b.ts));
-  if (orphans.length === 0) return null;
+  if (orphanJobs.length === 0) return null;
 
   return (
-    <View style={s.section}>
-      <Text style={s.sectionTitle}>Standalone Jobs</Text>
-      {orphans.map((job) => (
-        <JobRow key={job.jobId} job={job} logs={logs.get(job.jobId) ?? []} />
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Standalone Jobs</Text>
+      {orphanJobs.map((job) => (
+        <JobRow key={job.jobId} job={job} logs={logs.get(job.jobId) ?? []} styles={styles} palette={palette} />
       ))}
     </View>
   );
 }
 
-export function TasksJobsLogs({ state }: { state: SessionState }) {
+export function TasksJobsLogs({
+  state,
+  theme,
+}: {
+  state: SessionState;
+  theme?: TasksJobsLogsTheme;
+}) {
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
+  const mode = theme?.mode ?? "light";
+  const palette = useMemo(() => paletteForMode(mode), [mode]);
+  const styles = useMemo(() => createStyles(palette, theme), [palette, theme]);
 
-  const tasksArr = Array.from(state.tasks.values()).sort((a, b) => a.ts.localeCompare(b.ts));
+  const tasks = Array.from(state.tasks.values()).sort((a, b) => a.ts.localeCompare(b.ts));
   const taskJobIds = new Set<string>();
-  for (const t of tasksArr) {
-    for (const jid of t.jobIds) taskJobIds.add(jid);
+  for (const task of tasks) {
+    for (const jobId of task.jobIds) taskJobIds.add(jobId);
   }
 
-  if (tasksArr.length === 0 && state.jobs.size === 0) {
+  if (tasks.length === 0 && state.jobs.size === 0) {
     return (
-      <View style={s.emptyContainer}>
-        <Text style={s.muted}>No tasks or jobs yet</Text>
+      <View style={styles.emptyContainer}>
+        <Text style={styles.muted}>No tasks or jobs yet</Text>
       </View>
     );
   }
 
   return (
-    <ScrollView style={s.container} contentContainerStyle={s.content}>
-      {tasksArr.length > 0 && (
-        <View style={s.section}>
-          <Text style={s.sectionTitle}>Tasks</Text>
-          {tasksArr.map((task) => {
-            const taskJobs = task.jobIds.map((id) => state.jobs.get(id)).filter(Boolean) as Job[];
-            const JOB_ORDER: Record<string, number> = {
+    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      {tasks.length > 0 ? (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Tasks</Text>
+          {tasks.map((task) => {
+            const taskJobs = task.jobIds.map((jobId) => state.jobs.get(jobId)).filter(Boolean) as Job[];
+            const jobOrder: Record<string, number> = {
               claimed: 0,
               enqueued: 1,
               completed: 2,
               failed: 3,
             };
             taskJobs.sort((a, b) => {
-              const oa = JOB_ORDER[a.status] ?? 9;
-              const ob = JOB_ORDER[b.status] ?? 9;
-              return oa !== ob ? oa - ob : a.ts.localeCompare(b.ts);
+              const orderA = jobOrder[a.status] ?? 9;
+              const orderB = jobOrder[b.status] ?? 9;
+              return orderA !== orderB ? orderA - orderB : a.ts.localeCompare(b.ts);
             });
 
             return (
@@ -393,213 +719,22 @@ export function TasksJobsLogs({ state }: { state: SessionState }) {
                 jobs={taskJobs}
                 logs={state.logs}
                 expanded={expandedTaskId === task.taskId}
-                onToggle={() =>
-                  setExpandedTaskId(expandedTaskId === task.taskId ? null : task.taskId)
-                }
+                onToggle={() => setExpandedTaskId(expandedTaskId === task.taskId ? null : task.taskId)}
+                styles={styles}
+                palette={palette}
               />
             );
           })}
         </View>
-      )}
+      ) : null}
 
-      <OrphanJobs jobs={state.jobs} logs={state.logs} taskJobIds={taskJobIds} />
+      <OrphanJobs
+        jobs={state.jobs}
+        logs={state.logs}
+        taskJobIds={taskJobIds}
+        styles={styles}
+        palette={palette}
+      />
     </ScrollView>
   );
 }
-
-const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#f8fafc" },
-  content: { padding: 12, paddingBottom: 16 },
-  emptyContainer: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    padding: 24,
-  },
-
-  section: { marginBottom: 16 },
-  sectionTitle: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#475569",
-    textTransform: "uppercase",
-    letterSpacing: 0.5,
-    marginBottom: 8,
-  },
-
-  taskCard: {
-    backgroundColor: "#fff",
-    borderRadius: 8,
-    marginBottom: 8,
-    borderLeftWidth: 3,
-    borderLeftColor: "#e2e8f0",
-    ...Platform.select({
-      web: { boxShadow: "0 1px 3px rgba(0,0,0,0.06)" },
-      default: { elevation: 1 },
-    }),
-  },
-  taskHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    padding: 10,
-    gap: 8,
-  },
-  taskTitle: {
-    flex: 1,
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#1e293b",
-  },
-  taskBody: {
-    paddingHorizontal: 10,
-    paddingBottom: 10,
-  },
-  desc: {
-    fontSize: 12,
-    color: "#64748b",
-    marginBottom: 4,
-  },
-  progressMsg: {
-    fontSize: 12,
-    color: "#8b5cf6",
-    fontStyle: "italic",
-    marginBottom: 8,
-  },
-
-  jobCard: {
-    backgroundColor: "#f8fafc",
-    borderRadius: 6,
-    marginTop: 6,
-    borderWidth: 1,
-    borderColor: "#e2e8f0",
-  },
-  jobHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    padding: 8,
-    gap: 6,
-    flexWrap: "wrap",
-  },
-  jobBody: {
-    borderTopWidth: 1,
-    borderTopColor: "#e2e8f0",
-    paddingBottom: 8,
-  },
-  jobKind: {
-    fontSize: 13,
-    fontWeight: "500",
-    color: "#334155",
-  },
-  workerId: {
-    fontSize: 11,
-    color: "#7c3aed",
-    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
-  },
-  logCount: {
-    fontSize: 11,
-    color: "#94a3b8",
-    marginLeft: "auto",
-  },
-  jobSummary: {
-    fontSize: 12,
-    color: "#334155",
-    paddingHorizontal: 8,
-    paddingTop: 8,
-    paddingBottom: 4,
-  },
-  jobError: {
-    fontSize: 12,
-    color: "#dc2626",
-    paddingHorizontal: 8,
-    paddingTop: 4,
-  },
-  jobErrorDetail: {
-    fontSize: 11,
-    color: "#b91c1c",
-    paddingHorizontal: 8,
-    paddingTop: 2,
-  },
-
-  traceSection: {
-    marginTop: 4,
-  },
-  traceScroll: {
-    maxHeight: 220,
-  },
-  traceLine: {
-    fontSize: 11,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
-  },
-  traceReasoning: {
-    color: "#4c1d95",
-    backgroundColor: "#f5f3ff",
-  },
-  traceAction: {
-    color: "#14532d",
-    backgroundColor: "#f0fdf4",
-  },
-  traceInfo: {
-    color: "#334155",
-    backgroundColor: "#f8fafc",
-  },
-  traceError: {
-    color: "#b91c1c",
-    backgroundColor: "#fef2f2",
-  },
-
-  rawToggle: {
-    marginTop: 6,
-    marginHorizontal: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: "#cbd5e1",
-    backgroundColor: "#fff",
-    alignSelf: "flex-start",
-  },
-  rawToggleText: {
-    fontSize: 11,
-    color: "#334155",
-    fontWeight: "600",
-  },
-
-  logSections: {
-    borderTopWidth: 1,
-    borderTopColor: "#e2e8f0",
-    marginTop: 6,
-  },
-  streamLabel: {
-    fontSize: 10,
-    fontWeight: "700",
-    color: "#94a3b8",
-    textTransform: "uppercase",
-    paddingHorizontal: 8,
-    paddingTop: 6,
-    letterSpacing: 0.5,
-  },
-  logScroll: {
-    maxHeight: 200,
-  },
-  logLine: {
-    fontSize: 11,
-    paddingHorizontal: 8,
-    paddingVertical: 1,
-    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
-  },
-  logStdout: {
-    color: "#334155",
-    backgroundColor: "#f0fdf4",
-  },
-  logStderr: {
-    color: "#dc2626",
-    backgroundColor: "#fef2f2",
-  },
-
-  dot: { width: 8, height: 8, borderRadius: 4 },
-  statusBadge: { fontSize: 11, fontWeight: "600" },
-  chevron: { fontSize: 12, color: "#94a3b8" },
-  muted: { fontSize: 12, color: "#94a3b8", fontStyle: "italic", paddingHorizontal: 8 },
-});

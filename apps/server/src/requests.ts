@@ -164,6 +164,47 @@ export class RequestQueue {
       .all() as RequestRow[];
   }
 
+  /**
+   * List requests for observability UI.
+   */
+  listRequests(options?: {
+    status?: RequestStatus | "all";
+    limit?: number;
+  }): RequestRow[] {
+    const status = options?.status ?? "all";
+    const limit =
+      typeof options?.limit === "number" && Number.isFinite(options.limit)
+        ? Math.max(1, Math.min(500, Math.floor(options.limit)))
+        : 200;
+
+    if (status === "all") {
+      return this.db
+        .prepare(`SELECT * FROM requests ORDER BY createdAt DESC LIMIT ?`)
+        .all(limit) as RequestRow[];
+    }
+
+    return this.db
+      .prepare(`SELECT * FROM requests WHERE status = ? ORDER BY createdAt DESC LIMIT ?`)
+      .all(status, limit) as RequestRow[];
+  }
+
+  countByStatus(): Record<RequestStatus, number> {
+    const rows = this.db
+      .prepare(`SELECT status, COUNT(*) AS count FROM requests GROUP BY status`)
+      .all() as Array<{ status: RequestStatus; count: number }>;
+
+    const counts: Record<RequestStatus, number> = {
+      pending: 0,
+      claimed: 0,
+      completed: 0,
+      failed: 0,
+    };
+    for (const row of rows) {
+      if (row.status in counts) counts[row.status] = Number(row.count || 0);
+    }
+    return counts;
+  }
+
   close(): void {
     this.db.close();
   }

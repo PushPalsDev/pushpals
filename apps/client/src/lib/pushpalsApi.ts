@@ -2,7 +2,6 @@ import type { EventEnvelope } from "protocol/browser";
 import { validateEventEnvelope } from "protocol/browser";
 
 type TransportType = "auto" | "sse" | "ws";
-type EventCallback = (event: EventEnvelope | { type: "_error"; message: string }) => void;
 
 /** Extended callback that also receives the server cursor for each event */
 export type CursorEventCallback = (
@@ -304,6 +303,199 @@ export async function submitApprovalDecision(
   } catch (err) {
     console.error("Error submitting approval decision:", err);
     return false;
+  }
+}
+
+export interface WorkerStatusRow {
+  workerId: string;
+  status: "idle" | "busy" | "error" | "offline";
+  currentJobId: string | null;
+  pollMs: number | null;
+  capabilities: Record<string, unknown>;
+  details: Record<string, unknown>;
+  lastHeartbeat: string;
+  createdAt: string;
+  updatedAt: string;
+  activeJobCount: number;
+  isOnline: boolean;
+}
+
+export interface RequestSnapshotRow {
+  id: string;
+  sessionId: string;
+  originalPrompt: string;
+  enhancedPrompt: string;
+  status: "pending" | "claimed" | "completed" | "failed";
+  agentId: string | null;
+  result: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface JobSnapshotRow {
+  id: string;
+  taskId: string;
+  sessionId: string;
+  kind: string;
+  params: string;
+  status: "pending" | "claimed" | "completed" | "failed";
+  workerId: string | null;
+  targetWorkerId: string | null;
+  result: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CompletionSnapshotRow {
+  id: string;
+  jobId: string;
+  sessionId: string;
+  commitSha: string | null;
+  branch: string | null;
+  message: string;
+  status: "pending" | "claimed" | "processed" | "failed";
+  pusherId: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface QueueCounts {
+  [key: string]: number;
+}
+
+function authHeaders(authToken?: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+  return headers;
+}
+
+export async function fetchWorkers(
+  baseUrl: string,
+  authToken?: string,
+): Promise<WorkerStatusRow[]> {
+  try {
+    const response = await fetch(`${baseUrl}/workers`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return [];
+    const payload = (await response.json()) as { ok: boolean; workers?: WorkerStatusRow[] };
+    return Array.isArray(payload.workers) ? payload.workers : [];
+  } catch (err) {
+    console.error("Error fetching workers:", err);
+    return [];
+  }
+}
+
+export async function fetchRequestsSnapshot(
+  baseUrl: string,
+  authToken?: string,
+): Promise<{ requests: RequestSnapshotRow[]; counts: QueueCounts }> {
+  try {
+    const response = await fetch(`${baseUrl}/requests?limit=250`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return { requests: [], counts: {} };
+    const payload = (await response.json()) as {
+      ok: boolean;
+      requests?: RequestSnapshotRow[];
+      counts?: QueueCounts;
+    };
+    return {
+      requests: Array.isArray(payload.requests) ? payload.requests : [],
+      counts: payload.counts ?? {},
+    };
+  } catch (err) {
+    console.error("Error fetching requests snapshot:", err);
+    return { requests: [], counts: {} };
+  }
+}
+
+export async function fetchJobsSnapshot(
+  baseUrl: string,
+  authToken?: string,
+): Promise<{ jobs: JobSnapshotRow[]; counts: QueueCounts }> {
+  try {
+    const response = await fetch(`${baseUrl}/jobs?limit=250`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return { jobs: [], counts: {} };
+    const payload = (await response.json()) as {
+      ok: boolean;
+      jobs?: JobSnapshotRow[];
+      counts?: QueueCounts;
+    };
+    return {
+      jobs: Array.isArray(payload.jobs) ? payload.jobs : [],
+      counts: payload.counts ?? {},
+    };
+  } catch (err) {
+    console.error("Error fetching jobs snapshot:", err);
+    return { jobs: [], counts: {} };
+  }
+}
+
+export async function fetchCompletionsSnapshot(
+  baseUrl: string,
+  authToken?: string,
+): Promise<{ completions: CompletionSnapshotRow[]; counts: QueueCounts }> {
+  try {
+    const response = await fetch(`${baseUrl}/completions?limit=250`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return { completions: [], counts: {} };
+    const payload = (await response.json()) as {
+      ok: boolean;
+      completions?: CompletionSnapshotRow[];
+      counts?: QueueCounts;
+    };
+    return {
+      completions: Array.isArray(payload.completions) ? payload.completions : [],
+      counts: payload.counts ?? {},
+    };
+  } catch (err) {
+    console.error("Error fetching completions snapshot:", err);
+    return { completions: [], counts: {} };
+  }
+}
+
+export async function fetchSystemStatus(
+  baseUrl: string,
+  authToken?: string,
+): Promise<{
+  workers?: { total: number; online: number; busy: number; idle: number };
+  queues?: {
+    requests?: QueueCounts;
+    jobs?: QueueCounts;
+    completions?: QueueCounts;
+  };
+  ts?: string;
+}> {
+  try {
+    const response = await fetch(`${baseUrl}/system/status`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return {};
+    const payload = (await response.json()) as {
+      ok: boolean;
+      workers?: { total: number; online: number; busy: number; idle: number };
+      queues?: {
+        requests?: QueueCounts;
+        jobs?: QueueCounts;
+        completions?: QueueCounts;
+      };
+      ts?: string;
+    };
+    return {
+      workers: payload.workers,
+      queues: payload.queues,
+      ts: payload.ts,
+    };
+  } catch (err) {
+    console.error("Error fetching system status:", err);
+    return {};
   }
 }
 

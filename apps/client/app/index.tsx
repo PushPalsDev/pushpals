@@ -1,1156 +1,1427 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  View,
-  Text,
-  TextInput,
-  TouchableOpacity,
+  Animated,
   FlatList,
   KeyboardAvoidingView,
   Platform,
-  StyleSheet,
+  Pressable,
   ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+  useWindowDimensions,
 } from "react-native";
-import {
-  usePushPalsSession,
-  isEnvelope,
-  type SessionEvent,
-  type EventFilters,
-} from "../src/lib/usePushPalsSession";
+import type { EventEnvelope } from "protocol/browser";
+import { useColorScheme } from "@/hooks/use-color-scheme";
 import { TasksJobsLogs } from "../src/lib/TasksJobsLogs";
-import type { EventEnvelope, EventType } from "protocol/browser";
-
-// ─── "Show more" threshold ──────────────────────────────────────────────────
-/** Messages with a `---` separator get collapsed; otherwise fall back to char limit */
-const COLLAPSE_CHAR_THRESHOLD = 200;
-
-const uuidv4 = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+import { isEnvelope, usePushPalsSession } from "../src/lib/usePushPalsSession";
+import {
+  type CompletionSnapshotRow,
+  type JobSnapshotRow,
+  type QueueCounts,
+  type RequestSnapshotRow,
+  type WorkerStatusRow,
+  fetchCompletionsSnapshot,
+  fetchJobsSnapshot,
+  fetchRequestsSnapshot,
+  fetchSystemStatus,
+  fetchWorkers,
+} from "../src/lib/pushpalsApi";
 
 const DEFAULT_BASE = process.env.EXPO_PUBLIC_PUSHPALS_URL ?? "http://localhost:3001";
+const AUTH_TOKEN = process.env.EXPO_PUBLIC_PUSHPALS_AUTH_TOKEN;
+const POLL_INTERVAL_MS = 4000;
 
-// ─── Color coding by event category ─────────────────────────────────────────
-const EVENT_COLORS: Record<string, string> = {
-  // task lifecycle
-  task_created: "#3b82f6",
-  task_started: "#6366f1",
-  task_progress: "#8b5cf6",
-  task_completed: "#22c55e",
-  task_failed: "#ef4444",
-  // tools
-  tool_call: "#f59e0b",
-  tool_result: "#d97706",
-  // approvals
-  approval_required: "#f97316",
-  approved: "#22c55e",
-  denied: "#ef4444",
-  // agent
-  agent_status: "#06b6d4",
-  assistant_message: "#64748b",
-  // jobs
-  job_enqueued: "#a855f7",
-  job_claimed: "#7c3aed",
-  job_completed: "#22c55e",
-  job_failed: "#ef4444",
-  // other
-  error: "#dc2626",
-  log: "#94a3b8",
-  diff_ready: "#14b8a6",
-};
+type UiTab = "chat" | "requests" | "jobs" | "system";
+type ThemeMode = "auto" | "light" | "dark";
+type ResolvedMode = "light" | "dark";
 
-function getEventColor(type: string): string {
-  return EVENT_COLORS[type] ?? "#94a3b8";
+interface DashboardTheme {
+  mode: ResolvedMode;
+  background: string;
+  shell: string;
+  panel: string;
+  panelAlt: string;
+  border: string;
+  text: string;
+  textMuted: string;
+  accent: string;
+  accentSoft: string;
+  accentText: string;
+  positive: string;
+  warning: string;
+  danger: string;
+  bubbleUser: string;
+  bubbleAgent: string;
+  bubbleAgentBorder: string;
+  inputBg: string;
+  fontSans: string;
+  fontMono: string;
 }
 
-// ─── Agent badge ─────────────────────────────────────────────────────────────
-function AgentBadge({ from, to }: { from?: string; to?: string }) {
-  if (!from && !to) return null;
-  return (
-    <View style={styles.agentBadgeRow}>
-      {from && (
-        <View style={[styles.badge, { backgroundColor: "#e0f2fe" }]}>
-          <Text style={[styles.badgeText, { color: "#0369a1" }]}>{from}</Text>
-        </View>
-      )}
-      {to && to !== "broadcast" && (
-        <>
-          <Text style={styles.arrowText}>{"->"}</Text>
-          <View style={[styles.badge, { backgroundColor: "#fce7f3" }]}>
-            <Text style={[styles.badgeText, { color: "#be185d" }]}>{to}</Text>
-          </View>
-        </>
-      )}
-    </View>
-  );
+function createTheme(mode: ResolvedMode): DashboardTheme {
+  if (mode === "dark") {
+    return {
+      mode,
+      background: "#0E151B",
+      shell: "#121C23",
+      panel: "#16222B",
+      panelAlt: "#1B2A35",
+      border: "#284050",
+      text: "#EAF3F6",
+      textMuted: "#97B3C2",
+      accent: "#2FD6C8",
+      accentSoft: "#173A3A",
+      accentText: "#A6FFF6",
+      positive: "#5DDD8B",
+      warning: "#FFB95A",
+      danger: "#FF6B72",
+      bubbleUser: "#0F8A81",
+      bubbleAgent: "#1B2A35",
+      bubbleAgentBorder: "#32566A",
+      inputBg: "#102029",
+      fontSans: Platform.select({
+        web: "'Space Grotesk', 'Avenir Next', 'Trebuchet MS', sans-serif",
+        ios: "Avenir Next",
+        android: "sans-serif-medium",
+        default: "sans-serif",
+      })!,
+      fontMono: Platform.select({
+        web: "'IBM Plex Mono', 'JetBrains Mono', monospace",
+        ios: "Menlo",
+        android: "monospace",
+        default: "monospace",
+      })!,
+    };
+  }
+
+  return {
+    mode,
+    background: "#ECF2F5",
+    shell: "#F7FAFC",
+    panel: "#FFFFFF",
+    panelAlt: "#F4F8FB",
+    border: "#CFDAE2",
+    text: "#112230",
+    textMuted: "#547086",
+    accent: "#007E77",
+    accentSoft: "#D9F4F1",
+    accentText: "#025C56",
+    positive: "#169A58",
+    warning: "#C7851E",
+    danger: "#D64553",
+    bubbleUser: "#06796F",
+    bubbleAgent: "#FFFFFF",
+    bubbleAgentBorder: "#D2E0E8",
+    inputBg: "#EFF5F8",
+    fontSans: Platform.select({
+      web: "'Space Grotesk', 'Avenir Next', 'Trebuchet MS', sans-serif",
+      ios: "Avenir Next",
+      android: "sans-serif-medium",
+      default: "sans-serif",
+    })!,
+    fontMono: Platform.select({
+      web: "'IBM Plex Mono', 'JetBrains Mono', monospace",
+      ios: "Menlo",
+      android: "monospace",
+      default: "monospace",
+    })!,
+  };
 }
 
-// ─── Progress bar ────────────────────────────────────────────────────────────
-function ProgressBar({ percent }: { percent: number }) {
-  return (
-    <View style={styles.progressTrack}>
-      <View style={[styles.progressFill, { width: `${Math.min(100, percent)}%` }]} />
-      <Text style={styles.progressLabel}>{percent}%</Text>
-    </View>
-  );
+function prettyTs(iso?: string): string {
+  if (!iso) return "--";
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return "--";
+  return new Date(ts).toLocaleTimeString();
 }
 
-// ─── Approval buttons ───────────────────────────────────────────────────────
-function ApprovalActions({
-  approvalId,
-  onApprove,
-  onDeny,
+function relativeMs(iso?: string): string {
+  if (!iso) return "unknown";
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return "unknown";
+  const delta = Date.now() - ts;
+  if (delta < 10_000) return "just now";
+  if (delta < 60_000) return `${Math.floor(delta / 1000)}s ago`;
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+  return `${Math.floor(delta / 3_600_000)}h ago`;
+}
+
+function clip(value: string | undefined | null, limit = 180): string {
+  if (!value) return "";
+  if (value.length <= limit) return value;
+  return `${value.slice(0, Math.max(0, limit - 1))}...`;
+}
+
+function parseJsonText(value: string | null): string {
+  if (!value) return "";
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (typeof parsed === "string") return parsed;
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return value;
+  }
+}
+
+function statusColor(theme: DashboardTheme, status: string): string {
+  const normalized = status.toLowerCase();
+  if (normalized.includes("complete") || normalized.includes("processed")) return theme.positive;
+  if (normalized.includes("fail") || normalized.includes("error") || normalized.includes("offline")) {
+    return theme.danger;
+  }
+  if (normalized.includes("busy") || normalized.includes("claim")) return theme.warning;
+  if (normalized.includes("progress") || normalized.includes("start")) return theme.warning;
+  return theme.accent;
+}
+
+function summarizeEvent(event: EventEnvelope): string {
+  const payload = (event.payload ?? {}) as Record<string, unknown>;
+  const preferredKeys = [
+    "message",
+    "summary",
+    "title",
+    "detail",
+    "error",
+    "status",
+    "kind",
+    "jobId",
+    "taskId",
+    "requestId",
+  ] as const;
+
+  for (const key of preferredKeys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) return clip(value, 140);
+  }
+
+  if (typeof payload === "object" && payload && Object.keys(payload).length > 0) {
+    return clip(JSON.stringify(payload), 140);
+  }
+
+  return "No payload details";
+}
+
+function queueValue(counts: QueueCounts | undefined, key: string): number {
+  return Number(counts?.[key] ?? 0);
+}
+function SegmentedTabs({
+  tabs,
+  active,
+  onSelect,
+  theme,
 }: {
-  approvalId: string;
-  onApprove: (id: string) => void;
-  onDeny: (id: string) => void;
+  tabs: { id: UiTab; label: string; count?: number }[];
+  active: UiTab;
+  onSelect: (tab: UiTab) => void;
+  theme: DashboardTheme;
 }) {
-  const [decided, setDecided] = useState<"approve" | "deny" | null>(null);
-
-  if (decided) {
-    return (
-      <View
-        style={[styles.decisionBadge, decided === "approve" ? styles.approvedBg : styles.deniedBg]}
-      >
-        <Text style={styles.decisionText}>{decided === "approve" ? "Approved" : "Denied"}</Text>
-      </View>
-    );
-  }
-
   return (
-    <View style={styles.approvalRow}>
-      <TouchableOpacity
-        style={[styles.approvalBtn, styles.approveBtn]}
-        onPress={() => {
-          setDecided("approve");
-          onApprove(approvalId);
-        }}
-      >
-        <Text style={styles.approveBtnText}>Approve</Text>
-      </TouchableOpacity>
-      <TouchableOpacity
-        style={[styles.approvalBtn, styles.denyBtn]}
-        onPress={() => {
-          setDecided("deny");
-          onDeny(approvalId);
-        }}
-      >
-        <Text style={styles.denyBtnText}>Deny</Text>
-      </TouchableOpacity>
-    </View>
-  );
-}
-
-// ─── Diff preview ────────────────────────────────────────────────────────────
-function DiffPreview({ diff, stat }: { diff: string; stat: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const preview = diff.substring(0, 300);
-
-  return (
-    <View style={styles.diffContainer}>
-      <Text style={styles.diffStat}>{stat}</Text>
-      <TouchableOpacity onPress={() => setExpanded(!expanded)}>
-        <Text style={styles.diffToggle}>{expanded ? "- Collapse" : "+ Show diff"}</Text>
-      </TouchableOpacity>
-      {expanded && (
-        <ScrollView horizontal style={styles.diffScroll}>
-          <Text style={styles.diffCode}>{diff}</Text>
-        </ScrollView>
-      )}
-    </View>
-  );
-}
-
-// ─── Collapsible agent message ───────────────────────────────────────────────
-/**
- * If the text contains a `---` separator (produced by formatJobResult), shows
- * only the summary header and a "Show more" toggle to reveal the full output.
- * Otherwise, if the text exceeds COLLAPSE_CHAR_THRESHOLD, shows the first few
- * lines as preview.
- */
-function CollapsibleText({ text, isUser }: { text: string; isUser: boolean }) {
-  const [expanded, setExpanded] = useState(false);
-
-  // Check for the `---` separator from formatJobResult
-  const separatorIdx = text.indexOf("\n---\n");
-
-  if (separatorIdx !== -1) {
-    const summary = text.substring(0, separatorIdx).trim();
-    const body = text.substring(separatorIdx + 5).trim(); // skip \n---\n
-
-    return (
-      <View>
-        {/* Summary — render bold parts via simple **text** parsing */}
-        <MessageTextBlock
-          text={summary}
-          style={[styles.chatText, isUser ? styles.chatTextUser : styles.chatTextAgent]}
-        />
-        {body.length > 0 && (
-          <>
-            <TouchableOpacity onPress={() => setExpanded(!expanded)} style={styles.showMoreBtn}>
-              <Text style={styles.showMoreText}>{expanded ? "Show less" : "Show more"}</Text>
-            </TouchableOpacity>
-            {expanded && (
-              <View style={styles.expandedBody}>
-                <Text
-                  style={[
-                    styles.chatText,
-                    isUser ? styles.chatTextUser : styles.chatTextAgent,
-                    styles.monoText,
-                  ]}
-                >
-                  {body}
-                </Text>
-              </View>
-            )}
-          </>
-        )}
-      </View>
-    );
-  }
-
-  // Fallback: plain long text
-  if (text.length > COLLAPSE_CHAR_THRESHOLD) {
-    const previewLines = text.split("\n").slice(0, 3).join("\n");
-    const preview =
-      previewLines.length < text.length
-        ? previewLines + "\u2026"
-        : text.substring(0, COLLAPSE_CHAR_THRESHOLD) + "\u2026";
-
-    return (
-      <View>
-        <Text style={[styles.chatText, isUser ? styles.chatTextUser : styles.chatTextAgent]}>
-          {expanded ? text : preview}
-        </Text>
-        <TouchableOpacity onPress={() => setExpanded(!expanded)} style={styles.showMoreBtn}>
-          <Text style={styles.showMoreText}>{expanded ? "Show less" : "Show more"}</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
-  // Short message — render inline
-  return (
-    <Text style={[styles.chatText, isUser ? styles.chatTextUser : styles.chatTextAgent]}>
-      {text}
-    </Text>
-  );
-}
-
-/**
- * Render text with very minimal **bold** support.
- * Splits on `**...**` markers and renders bold spans.
- */
-function MessageTextBlock({ text, style }: { text: string; style: any }) {
-  const parts = text.split(/(\*\*[^*]+\*\*)/);
-  return (
-    <Text style={style}>
-      {parts.map((part, i) => {
-        if (part.startsWith("**") && part.endsWith("**")) {
-          return (
-            <Text key={i} style={{ fontWeight: "700" }}>
-              {part.slice(2, -2)}
-            </Text>
-          );
-        }
-        return <Text key={i}>{part}</Text>;
-      })}
-    </Text>
-  );
-}
-
-// ─── Task status indicator ───────────────────────────────────────────────────
-const TASK_STATUS_LABEL: Record<string, string> = {
-  created: "[new]",
-  started: "[run]",
-  in_progress: "[...]",
-  completed: "[ok]",
-  failed: "[err]",
-};
-
-// ─── Single event card renderer ──────────────────────────────────────────────
-function EventCard({
-  event,
-  onApprove,
-  onDeny,
-}: {
-  event: EventEnvelope;
-  onApprove: (id: string) => void;
-  onDeny: (id: string) => void;
-}) {
-  const p = event.payload as any;
-  const color = getEventColor(event.type);
-
-  const renderPayload = () => {
-    switch (event.type) {
-      case "assistant_message":
-        return <Text style={styles.messageText}>{p.text}</Text>;
-
-      case "agent_status":
+    <View style={[styles.segmentWrap, { backgroundColor: theme.panelAlt, borderColor: theme.border }]}>
+      {tabs.map((tab) => {
+        const selected = tab.id === active;
         return (
-          <View style={styles.statusRow}>
-            <View
+          <Pressable
+            key={tab.id}
+            onPress={() => onSelect(tab.id)}
+            style={[
+              styles.segmentBtn,
+              selected && { backgroundColor: theme.accent, borderColor: theme.accent },
+            ]}
+          >
+            <Text
               style={[
-                styles.statusDot,
+                styles.segmentText,
                 {
-                  backgroundColor:
-                    p.status === "idle" ? "#22c55e" : p.status === "busy" ? "#f59e0b" : "#ef4444",
+                  color: selected ? "#FFFFFF" : theme.textMuted,
+                  fontFamily: theme.fontSans,
                 },
               ]}
-            />
-            <Text style={styles.statusText}>
-              {p.agentId}: {p.status}
-              {p.message ? ` — ${p.message}` : ""}
+              numberOfLines={1}
+            >
+              {tab.label}
+              {typeof tab.count === "number" ? ` (${tab.count})` : ""}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+function ModeSwitcher({
+  mode,
+  onChange,
+  theme,
+}: {
+  mode: ThemeMode;
+  onChange: (mode: ThemeMode) => void;
+  theme: DashboardTheme;
+}) {
+  const modes: ThemeMode[] = ["auto", "light", "dark"];
+  return (
+    <View style={[styles.modeWrap, { borderColor: theme.border, backgroundColor: theme.panelAlt }]}>
+      {modes.map((item) => {
+        const selected = mode === item;
+        return (
+          <Pressable
+            key={item}
+            style={[styles.modeBtn, selected && { backgroundColor: theme.accentSoft }]}
+            onPress={() => onChange(item)}
+          >
+            <Text
+              style={[
+                styles.modeText,
+                {
+                  color: selected ? theme.accentText : theme.textMuted,
+                  fontFamily: theme.fontSans,
+                },
+              ]}
+            >
+              {item}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+function MetricTile({
+  title,
+  value,
+  detail,
+  theme,
+  tone = "accent",
+}: {
+  title: string;
+  value: string;
+  detail?: string;
+  theme: DashboardTheme;
+  tone?: "accent" | "positive" | "warning" | "danger";
+}) {
+  const color =
+    tone === "positive"
+      ? theme.positive
+      : tone === "warning"
+        ? theme.warning
+        : tone === "danger"
+          ? theme.danger
+          : theme.accent;
+  return (
+    <View style={[styles.metricTile, { borderColor: theme.border, backgroundColor: theme.panelAlt }]}>
+      <Text style={[styles.metricTitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>{title}</Text>
+      <Text style={[styles.metricValue, { color, fontFamily: theme.fontSans }]}>{value}</Text>
+      {detail ? (
+        <Text style={[styles.metricDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          {detail}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+function CollapsibleMessage({ text, theme }: { text: string; theme: DashboardTheme }) {
+  const [expanded, setExpanded] = useState(false);
+  const threshold = 360;
+  const needsCollapse = text.length > threshold;
+  const display = needsCollapse && !expanded ? `${text.slice(0, threshold)}...` : text;
+  return (
+    <View>
+      <Text style={[styles.chatText, { color: theme.text, fontFamily: theme.fontSans }]}>{display}</Text>
+      {needsCollapse ? (
+        <Pressable onPress={() => setExpanded((prev) => !prev)}>
+          <Text style={[styles.showMore, { color: theme.accent, fontFamily: theme.fontSans }]}>
+            {expanded ? "Show less" : "Show more"}
+          </Text>
+        </Pressable>
+      ) : null}
+    </View>
+  );
+}
+
+function ChatPane({
+  theme,
+  messages,
+  input,
+  setInput,
+  onSend,
+  connected,
+}: {
+  theme: DashboardTheme;
+  messages: { id: string; from?: string; text: string; ts: string }[];
+  input: string;
+  setInput: (value: string) => void;
+  onSend: () => void;
+  connected: boolean;
+}) {
+  const scrollRef = useRef<ScrollView | null>(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollToEnd({ animated: true });
+  }, [messages.length]);
+
+  return (
+    <View style={styles.tabFill}>
+      <ScrollView
+        ref={scrollRef}
+        style={styles.tabFill}
+        contentContainerStyle={styles.chatContent}
+        showsVerticalScrollIndicator={false}
+      >
+        {messages.length === 0 ? (
+          <View style={styles.emptyState}>
+            <Text style={[styles.emptyTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+              No conversation yet
+            </Text>
+            <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              Start with a task. LocalBuddy will enqueue and RemoteBuddy will coordinate execution.
             </Text>
           </View>
-        );
-
-      case "task_created":
-        return (
-          <View>
-            <Text style={styles.taskTitle}>{p.title}</Text>
-            <Text style={styles.taskDesc}>{p.description}</Text>
-            {p.priority && <Text style={styles.metaText}>Priority: {p.priority}</Text>}
-            {p.tags?.length > 0 && <Text style={styles.metaText}>Tags: {p.tags.join(", ")}</Text>}
-          </View>
-        );
-
-      case "task_started":
-        return <Text style={styles.infoText}>Task started: {p.taskId?.substring(0, 8)}</Text>;
-
-      case "task_progress":
-        return (
-          <View>
-            <Text style={styles.infoText}>{p.message}</Text>
-            {p.percent !== undefined && <ProgressBar percent={p.percent} />}
-          </View>
-        );
-
-      case "task_completed":
-        return (
-          <View>
-            <Text style={styles.successText}>{p.summary}</Text>
-            {p.artifacts?.map((a: any, i: number) => (
-              <Text key={i} style={styles.artifactText}>
-                [{a.kind}]{a.uri ? `: ${a.uri}` : ""}
-                {a.text ? ` -- ${a.text.substring(0, 80)}...` : ""}
-              </Text>
-            ))}
-          </View>
-        );
-
-      case "task_failed":
-        return (
-          <View>
-            <Text style={styles.errorText}>{p.message}</Text>
-            {p.detail && <Text style={styles.detailText}>{p.detail}</Text>}
-          </View>
-        );
-
-      case "tool_call":
-        return (
-          <View>
-            <Text style={styles.toolName}>[tool] {p.tool}</Text>
-            <Text style={styles.toolArgs}>{JSON.stringify(p.args, null, 2)}</Text>
-            {p.requiresApproval && (
-              <ApprovalActions approvalId={p.toolCallId} onApprove={onApprove} onDeny={onDeny} />
-            )}
-          </View>
-        );
-
-      case "tool_result":
-        return (
-          <View>
-            <View style={styles.statusRow}>
-              <View style={[styles.statusDot, { backgroundColor: p.ok ? "#22c55e" : "#ef4444" }]} />
-              <Text style={styles.statusText}>{p.ok ? "Success" : "Failed"}</Text>
-              {p.exitCode !== undefined && (
-                <Text style={styles.metaText}> (exit: {p.exitCode})</Text>
-              )}
-            </View>
-            {p.stdout && (
-              <ScrollView horizontal style={styles.outputScroll}>
-                <Text style={styles.outputText}>{p.stdout.substring(0, 500)}</Text>
-              </ScrollView>
-            )}
-            {p.stderr && <Text style={styles.stderrText}>{p.stderr.substring(0, 200)}</Text>}
-          </View>
-        );
-
-      case "approval_required":
-        return (
-          <View>
-            <Text style={styles.approvalSummary}>{p.summary}</Text>
-            <Text style={styles.metaText}>Action: {p.action}</Text>
-            <ApprovalActions approvalId={p.approvalId} onApprove={onApprove} onDeny={onDeny} />
-          </View>
-        );
-
-      case "approved":
-        return <Text style={styles.successText}>Approved: {p.approvalId?.substring(0, 8)}</Text>;
-      case "denied":
-        return <Text style={styles.errorText}>Denied: {p.approvalId?.substring(0, 8)}</Text>;
-
-      case "diff_ready":
-        return <DiffPreview diff={p.unifiedDiff} stat={p.diffStat} />;
-
-      case "committed":
-        return (
-          <Text style={styles.successText}>
-            Committed {p.commitHash?.substring(0, 8)} on {p.branch}: {p.message}
-          </Text>
-        );
-
-      case "job_enqueued":
-        return (
-          <Text style={styles.infoText}>
-            Job queued: {p.kind} (task {p.taskId?.substring(0, 8)})
-          </Text>
-        );
-
-      case "job_claimed":
-        return <Text style={styles.infoText}>Job claimed by worker {p.workerId}</Text>;
-
-      case "job_completed":
-        return (
-          <View>
-            <Text style={styles.successText}>Job complete{p.summary ? `: ${p.summary}` : ""}</Text>
-            {p.artifacts?.map((a: any, i: number) => (
-              <Text key={i} style={styles.artifactText}>
-                [{a.kind}]{a.text ? ` -- ${a.text.substring(0, 80)}...` : ""}
-              </Text>
-            ))}
-          </View>
-        );
-
-      case "job_failed":
-        return (
-          <View>
-            <Text style={styles.errorText}>Job failed: {p.message}</Text>
-            {p.detail && <Text style={styles.detailText}>{p.detail}</Text>}
-          </View>
-        );
-
-      case "log":
-        return (
-          <Text style={[styles.logText, p.level === "error" ? styles.errorText : null]}>
-            [{p.level}] {p.message}
-          </Text>
-        );
-
-      case "error":
-        return (
-          <View>
-            <Text style={styles.errorText}>{p.message}</Text>
-            {p.detail && <Text style={styles.detailText}>{p.detail}</Text>}
-          </View>
-        );
-
-      default:
-        return <Text style={styles.metaText}>{JSON.stringify(p, null, 2).substring(0, 200)}</Text>;
-    }
-  };
-
-  return (
-    <View style={[styles.card, { borderLeftColor: color }]}>
-      <View style={styles.cardHeader}>
-        <View style={[styles.eventTypeBadge, { backgroundColor: color + "20" }]}>
-          <Text style={[styles.eventTypeText, { color }]}>{event.type}</Text>
-        </View>
-        <AgentBadge from={event.from} to={event.to} />
-        <Text style={styles.ts}>{new Date(event.ts).toLocaleTimeString()}</Text>
-      </View>
-      <View style={styles.cardBody}>{renderPayload()}</View>
-    </View>
-  );
-}
-
-// ─── Filter bar ──────────────────────────────────────────────────────────────
-function FilterBar({
-  agents,
-  tasks,
-  turnIds,
-  filters,
-  setFilters,
-}: {
-  agents: string[];
-  tasks: { taskId: string; title: string; status: string }[];
-  turnIds: string[];
-  filters: EventFilters;
-  setFilters: (f: EventFilters) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const hasFilters =
-    filters.agentFrom || filters.taskId || filters.turnId || (filters.eventTypes?.length ?? 0) > 0;
-
-  return (
-    <View style={styles.filterContainer}>
-      <TouchableOpacity style={styles.filterToggle} onPress={() => setExpanded(!expanded)}>
-        <Text style={styles.filterToggleText}>Filters{hasFilters ? " (active)" : ""}</Text>
-        {hasFilters && (
-          <TouchableOpacity onPress={() => setFilters({})}>
-            <Text style={styles.clearFilterText}>Clear</Text>
-          </TouchableOpacity>
+        ) : (
+          messages.map((message) => {
+            const isUser = (message.from ?? "").toLowerCase().includes("client");
+            return (
+              <View
+                key={message.id}
+                style={[
+                  styles.chatBubble,
+                  isUser ? styles.chatBubbleUser : styles.chatBubbleAgent,
+                  {
+                    backgroundColor: isUser ? theme.bubbleUser : theme.bubbleAgent,
+                    borderColor: isUser ? theme.bubbleUser : theme.bubbleAgentBorder,
+                  },
+                ]}
+              >
+                {!isUser && message.from ? (
+                  <Text style={[styles.chatFrom, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                    {message.from}
+                  </Text>
+                ) : null}
+                <CollapsibleMessage text={message.text} theme={theme} />
+                <Text
+                  style={[
+                    styles.chatTs,
+                    {
+                      color: isUser ? "rgba(255,255,255,0.8)" : theme.textMuted,
+                      fontFamily: theme.fontSans,
+                    },
+                  ]}
+                >
+                  {prettyTs(message.ts)}
+                </Text>
+              </View>
+            );
+          })
         )}
-      </TouchableOpacity>
+      </ScrollView>
 
-      {expanded && (
-        <View style={styles.filterBody}>
-          {/* Agent filter */}
-          {agents.length > 0 && (
-            <View style={styles.filterRow}>
-              <Text style={styles.filterLabel}>Agent:</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                <TouchableOpacity
-                  style={[styles.filterChip, !filters.agentFrom && styles.filterChipActive]}
-                  onPress={() => setFilters({ ...filters, agentFrom: undefined })}
-                >
-                  <Text style={styles.filterChipText}>All</Text>
-                </TouchableOpacity>
-                {agents.map((a) => (
-                  <TouchableOpacity
-                    key={a}
-                    style={[styles.filterChip, filters.agentFrom === a && styles.filterChipActive]}
-                    onPress={() => setFilters({ ...filters, agentFrom: a })}
-                  >
-                    <Text style={styles.filterChipText}>{a}</Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            </View>
-          )}
-
-          {/* Task filter */}
-          {tasks.length > 0 && (
-            <View style={styles.filterRow}>
-              <Text style={styles.filterLabel}>Task:</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                <TouchableOpacity
-                  style={[styles.filterChip, !filters.taskId && styles.filterChipActive]}
-                  onPress={() => setFilters({ ...filters, taskId: undefined })}
-                >
-                  <Text style={styles.filterChipText}>All</Text>
-                </TouchableOpacity>
-                {tasks.map((t) => (
-                  <TouchableOpacity
-                    key={t.taskId}
-                    style={[
-                      styles.filterChip,
-                      filters.taskId === t.taskId && styles.filterChipActive,
-                    ]}
-                    onPress={() => setFilters({ ...filters, taskId: t.taskId })}
-                  >
-                    <Text style={styles.filterChipText}>
-                      {TASK_STATUS_LABEL[t.status] ?? ""} {t.title.substring(0, 20)}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            </View>
-          )}
-
-          {/* Turn filter */}
-          {turnIds.length > 1 && (
-            <View style={styles.filterRow}>
-              <Text style={styles.filterLabel}>Turn:</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                <TouchableOpacity
-                  style={[styles.filterChip, !filters.turnId && styles.filterChipActive]}
-                  onPress={() => setFilters({ ...filters, turnId: undefined })}
-                >
-                  <Text style={styles.filterChipText}>All</Text>
-                </TouchableOpacity>
-                {turnIds.map((t, i) => (
-                  <TouchableOpacity
-                    key={t}
-                    style={[styles.filterChip, filters.turnId === t && styles.filterChipActive]}
-                    onPress={() => setFilters({ ...filters, turnId: t })}
-                  >
-                    <Text style={styles.filterChipText}>Turn {i + 1}</Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            </View>
-          )}
-        </View>
-      )}
+      <View style={[styles.composer, { borderColor: theme.border, backgroundColor: theme.panel }]}>
+        <TextInput
+          style={[
+            styles.composerInput,
+            {
+              color: theme.text,
+              borderColor: theme.border,
+              backgroundColor: theme.inputBg,
+              fontFamily: theme.fontSans,
+            },
+          ]}
+          value={input}
+          onChangeText={setInput}
+          placeholder="Ask PushPals anything..."
+          placeholderTextColor={theme.textMuted}
+          multiline
+        />
+        <Pressable
+          onPress={onSend}
+          disabled={!connected || !input.trim()}
+          style={[
+            styles.sendButton,
+            {
+              backgroundColor: theme.accent,
+              opacity: !connected || !input.trim() ? 0.45 : 1,
+            },
+          ]}
+        >
+          <Text style={[styles.sendLabel, { fontFamily: theme.fontSans }]}>Send</Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
-
-// ─── Task summary strip ─────────────────────────────────────────────────────
-function TaskStrip({ tasks }: { tasks: { taskId: string; title: string; status: string }[] }) {
-  if (tasks.length === 0) return null;
+function RequestsPane({
+  theme,
+  rows,
+  counts,
+}: {
+  theme: DashboardTheme;
+  rows: RequestSnapshotRow[];
+  counts: QueueCounts;
+}) {
   return (
-    <ScrollView horizontal style={styles.taskStrip} showsHorizontalScrollIndicator={false}>
-      {tasks.map((t) => (
-        <View key={t.taskId} style={styles.taskChip}>
-          <Text style={styles.taskChipText}>
-            {TASK_STATUS_LABEL[t.status] ?? "[?]"} {t.title.substring(0, 24)}
+    <ScrollView style={styles.tabFill} contentContainerStyle={styles.scrollContent}>
+      <View style={styles.metricRow}>
+        <MetricTile title="Pending" value={String(queueValue(counts, "pending"))} tone="warning" theme={theme} />
+        <MetricTile title="Claimed" value={String(queueValue(counts, "claimed"))} tone="accent" theme={theme} />
+        <MetricTile
+          title="Completed"
+          value={String(queueValue(counts, "completed"))}
+          tone="positive"
+          theme={theme}
+        />
+        <MetricTile title="Failed" value={String(queueValue(counts, "failed"))} tone="danger" theme={theme} />
+      </View>
+
+      {rows.length === 0 ? (
+        <View style={styles.emptyState}>
+          <Text style={[styles.emptyTitle, { color: theme.text, fontFamily: theme.fontSans }]}>No requests yet</Text>
+          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            Requests from LocalBuddy will appear here with full lifecycle status.
           </Text>
         </View>
-      ))}
+      ) : (
+        rows.map((request) => {
+          const rowColor = statusColor(theme, request.status);
+          const resultText = parseJsonText(request.result);
+          const errorText = parseJsonText(request.error);
+          return (
+            <View
+              key={request.id}
+              style={[styles.requestCard, { borderColor: theme.border, backgroundColor: theme.panel }]}
+            >
+              <View style={styles.rowBetween}>
+                <Text style={[styles.requestId, { color: theme.text, fontFamily: theme.fontMono }]}>
+                  {request.id.slice(0, 8)}
+                </Text>
+                <View style={[styles.statusPill, { backgroundColor: `${rowColor}22`, borderColor: `${rowColor}66` }]}>
+                  <Text style={[styles.statusPillText, { color: rowColor, fontFamily: theme.fontSans }]}>
+                    {request.status}
+                  </Text>
+                </View>
+              </View>
+              <Text style={[styles.requestPrompt, { color: theme.text, fontFamily: theme.fontSans }]}>
+                {clip(request.originalPrompt, 260)}
+              </Text>
+              <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                agent {request.agentId ?? "--"} · created {prettyTs(request.createdAt)} · updated {relativeMs(request.updatedAt)}
+              </Text>
+              {request.enhancedPrompt ? (
+                <Text style={[styles.requestHint, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                  enhanced: {clip(request.enhancedPrompt, 220)}
+                </Text>
+              ) : null}
+              {resultText ? (
+                <View style={[styles.codeBlock, { borderColor: theme.border, backgroundColor: theme.panelAlt }]}>
+                  <Text style={[styles.codeBlockLabel, { color: theme.positive, fontFamily: theme.fontSans }]}>result</Text>
+                  <Text style={[styles.codeBlockText, { color: theme.text, fontFamily: theme.fontMono }]}>
+                    {clip(resultText, 600)}
+                  </Text>
+                </View>
+              ) : null}
+              {errorText ? (
+                <View style={[styles.codeBlock, { borderColor: `${theme.danger}77`, backgroundColor: `${theme.danger}14` }]}>
+                  <Text style={[styles.codeBlockLabel, { color: theme.danger, fontFamily: theme.fontSans }]}>error</Text>
+                  <Text style={[styles.codeBlockText, { color: theme.text, fontFamily: theme.fontMono }]}>
+                    {clip(errorText, 600)}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          );
+        })
+      )}
     </ScrollView>
   );
 }
 
-// ─── Main screen ─────────────────────────────────────────────────────────────
-export default function ChatScreen() {
-  const session = usePushPalsSession(DEFAULT_BASE);
-  const [input, setInput] = useState("");
-  const [activeTab, setActiveTab] = useState<"messages" | "events" | "tasks">("messages");
-  const flatRef = useRef<FlatList<SessionEvent> | null>(null);
-  const messagesEndRef = useRef<ScrollView | null>(null);
-  const inputRef = useRef<TextInput | null>(null);
-  const handleSendRef = useRef<() => void>(() => {});
+function JobsPane({
+  theme,
+  isWide,
+  jobs,
+  jobCounts,
+  completions,
+  completionCounts,
+  sessionState,
+}: {
+  theme: DashboardTheme;
+  isWide: boolean;
+  jobs: JobSnapshotRow[];
+  jobCounts: QueueCounts;
+  completions: CompletionSnapshotRow[];
+  completionCounts: QueueCounts;
+  sessionState: ReturnType<typeof usePushPalsSession>["state"];
+}) {
+  const recentJobs = jobs.slice(0, 40);
 
-  const handleSend = async () => {
+  return (
+    <View style={styles.tabFill}>
+      <View style={styles.metricRow}>
+        <MetricTile title="Queued Jobs" value={String(queueValue(jobCounts, "pending"))} tone="warning" theme={theme} />
+        <MetricTile title="Running Jobs" value={String(queueValue(jobCounts, "claimed"))} tone="accent" theme={theme} />
+        <MetricTile
+          title="Completions"
+          value={String(queueValue(completionCounts, "processed"))}
+          tone="positive"
+          theme={theme}
+        />
+        <MetricTile title="Failed Jobs" value={String(queueValue(jobCounts, "failed"))} tone="danger" theme={theme} />
+      </View>
+
+      <View style={[styles.jobsLayout, isWide && styles.jobsLayoutWide]}>
+        <View style={[styles.jobsListPane, { borderColor: theme.border, backgroundColor: theme.panel }]}>
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>Queue Activity</Text>
+          {recentJobs.length === 0 ? (
+            <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>No job rows yet.</Text>
+          ) : (
+            <FlatList
+              data={recentJobs}
+              keyExtractor={(item) => item.id}
+              renderItem={({ item }) => {
+                const color = statusColor(theme, item.status);
+                return (
+                  <View style={[styles.jobRow, { borderColor: theme.border }]}>
+                    <View style={[styles.jobDot, { backgroundColor: color }]} />
+                    <View style={styles.jobTextCol}>
+                      <Text style={[styles.jobKind, { color: theme.text, fontFamily: theme.fontSans }]}>{item.kind}</Text>
+                      <Text style={[styles.jobMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                        {item.id.slice(0, 8)} · worker {item.workerId ?? "--"} · {relativeMs(item.updatedAt)}
+                      </Text>
+                    </View>
+                    <Text style={[styles.jobStatus, { color, fontFamily: theme.fontSans }]}>{item.status}</Text>
+                  </View>
+                );
+              }}
+            />
+          )}
+
+          {completions.length > 0 ? (
+            <View style={styles.completionStrip}>
+              <Text style={[styles.subSectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>Recent Completions</Text>
+              {completions.slice(0, 16).map((completion) => {
+                const color = statusColor(theme, completion.status);
+                return (
+                  <View key={completion.id} style={[styles.completionRow, { borderColor: theme.border }]}>
+                    <Text style={[styles.completionMeta, { color: theme.text, fontFamily: theme.fontMono }]}>
+                      {completion.id.slice(0, 8)}
+                    </Text>
+                    <Text style={[styles.completionLine, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                      {clip(completion.message, 110)}
+                    </Text>
+                    <Text style={[styles.completionMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                      {completion.branch ?? "--"} · {completion.commitSha?.slice(0, 8) ?? "--"}
+                    </Text>
+                    <Text style={[styles.completionStatus, { color, fontFamily: theme.fontSans }]}>
+                      {completion.status}
+                    </Text>
+                  </View>
+                );
+              })}
+            </View>
+          ) : null}
+        </View>
+
+        <View style={[styles.jobsTracePane, { borderColor: theme.border, backgroundColor: theme.panel }]}>
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>Tasks and Traces</Text>
+          <View style={styles.tracePanelBody}>
+            <TasksJobsLogs
+              state={sessionState}
+              theme={{
+                mode: theme.mode,
+                fontSans: theme.fontSans,
+                fontMono: theme.fontMono,
+              }}
+            />
+          </View>
+        </View>
+      </View>
+    </View>
+  );
+}
+function SystemPane({
+  theme,
+  events,
+  connected,
+  workers,
+  systemSummary,
+  lastRefresh,
+}: {
+  theme: DashboardTheme;
+  events: ReturnType<typeof usePushPalsSession>["events"][number][];
+  connected: boolean;
+  workers: WorkerStatusRow[];
+  systemSummary: {
+    workers?: { total: number; online: number; busy: number; idle: number };
+    queues?: {
+      requests?: QueueCounts;
+      jobs?: QueueCounts;
+      completions?: QueueCounts;
+    };
+    ts?: string;
+  };
+  lastRefresh: string | null;
+}) {
+  const envelopes = useMemo(() => events.filter(isEnvelope) as EventEnvelope[], [events]);
+
+  const latestEventByComponent = useMemo(() => {
+    const byName: Record<string, string | undefined> = {
+      LocalBuddy: undefined,
+      RemoteBuddy: undefined,
+      WorkerPals: undefined,
+      SourceControlManager: undefined,
+    };
+
+    for (const event of envelopes) {
+      const from = (event.from ?? "").toLowerCase();
+      if (from.includes("localbuddy")) byName.LocalBuddy = event.ts;
+      if (from.includes("remotebuddy")) byName.RemoteBuddy = event.ts;
+      if (from.includes("worker")) byName.WorkerPals = event.ts;
+      if (from.includes("source_control_manager")) byName.SourceControlManager = event.ts;
+    }
+    return byName;
+  }, [envelopes]);
+
+  const onlineWorkers = workers.filter((worker) => worker.isOnline).length;
+  const recentEvents = useMemo(() => envelopes.slice(-40).reverse(), [envelopes]);
+
+  const componentRows = [
+    {
+      name: "Server Stream",
+      status: connected ? "connected" : "disconnected",
+      detail: connected ? "session event stream live" : "not connected",
+      ts: systemSummary.ts,
+    },
+    {
+      name: "LocalBuddy",
+      status: latestEventByComponent.LocalBuddy ? "active" : "unknown",
+      detail: latestEventByComponent.LocalBuddy
+        ? `last event ${relativeMs(latestEventByComponent.LocalBuddy)}`
+        : "no events yet",
+      ts: latestEventByComponent.LocalBuddy,
+    },
+    {
+      name: "RemoteBuddy",
+      status: latestEventByComponent.RemoteBuddy ? "active" : "unknown",
+      detail: latestEventByComponent.RemoteBuddy
+        ? `last event ${relativeMs(latestEventByComponent.RemoteBuddy)}`
+        : "no events yet",
+      ts: latestEventByComponent.RemoteBuddy,
+    },
+    {
+      name: "WorkerPals",
+      status: onlineWorkers > 0 ? "online" : "offline",
+      detail: `${onlineWorkers}/${workers.length} online`,
+      ts: workers[0]?.lastHeartbeat,
+    },
+    {
+      name: "SourceControlManager",
+      status: latestEventByComponent.SourceControlManager ? "active" : "unknown",
+      detail: latestEventByComponent.SourceControlManager
+        ? `last event ${relativeMs(latestEventByComponent.SourceControlManager)}`
+        : "no events yet",
+      ts: latestEventByComponent.SourceControlManager,
+    },
+  ];
+
+  return (
+    <ScrollView style={styles.tabFill} contentContainerStyle={styles.scrollContent}>
+      <View style={styles.metricRow}>
+        <MetricTile
+          title="Online Workers"
+          value={String(systemSummary.workers?.online ?? onlineWorkers)}
+          detail={`${systemSummary.workers?.busy ?? workers.filter((w) => w.status === "busy").length} busy`}
+          tone="accent"
+          theme={theme}
+        />
+        <MetricTile
+          title="Pending Requests"
+          value={String(queueValue(systemSummary.queues?.requests, "pending"))}
+          tone="warning"
+          theme={theme}
+        />
+        <MetricTile
+          title="Pending Completions"
+          value={String(queueValue(systemSummary.queues?.completions, "pending"))}
+          tone="warning"
+          theme={theme}
+        />
+        <MetricTile
+          title="Refresh"
+          value={lastRefresh ? relativeMs(lastRefresh) : "--"}
+          detail={lastRefresh ? prettyTs(lastRefresh) : "no sync"}
+          theme={theme}
+        />
+      </View>
+
+      <View style={styles.systemGrid}>
+        {componentRows.map((row) => {
+          const color = statusColor(theme, row.status);
+          return (
+            <View key={row.name} style={[styles.systemCard, { borderColor: theme.border, backgroundColor: theme.panel }]}>
+              <View style={styles.rowBetween}>
+                <Text style={[styles.systemTitle, { color: theme.text, fontFamily: theme.fontSans }]}>{row.name}</Text>
+                <View style={[styles.statusPill, { backgroundColor: `${color}22`, borderColor: `${color}66` }]}>
+                  <Text style={[styles.statusPillText, { color, fontFamily: theme.fontSans }]}>{row.status}</Text>
+                </View>
+              </View>
+              <Text style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>{row.detail}</Text>
+              <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                {row.ts ? `updated ${prettyTs(row.ts)}` : "no timestamp"}
+              </Text>
+            </View>
+          );
+        })}
+      </View>
+
+      <View style={[styles.workerPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}>
+        <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>Worker Fleet</Text>
+        {workers.length === 0 ? (
+          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>No workers reported yet.</Text>
+        ) : (
+          workers.map((worker) => {
+            const color = statusColor(theme, worker.status);
+            return (
+              <View key={worker.workerId} style={[styles.workerRow, { borderColor: theme.border }]}>
+                <View style={[styles.jobDot, { backgroundColor: color }]} />
+                <View style={styles.workerTextCol}>
+                  <Text style={[styles.workerName, { color: theme.text, fontFamily: theme.fontSans }]}> {worker.workerId}</Text>
+                  <Text style={[styles.workerMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                    {worker.status} · job {worker.currentJobId?.slice(0, 8) ?? "--"} · heartbeat {relativeMs(worker.lastHeartbeat)}
+                  </Text>
+                </View>
+              </View>
+            );
+          })
+        )}
+      </View>
+
+      <View style={[styles.eventPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}>
+        <View style={styles.rowBetween}>
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            Recent Event Stream
+          </Text>
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            {recentEvents.length} latest
+          </Text>
+        </View>
+        {recentEvents.length === 0 ? (
+          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            No events yet.
+          </Text>
+        ) : (
+          recentEvents.map((event) => {
+            const color = statusColor(theme, event.type);
+            return (
+              <View key={event.id} style={[styles.eventRow, { borderColor: theme.border }]}>
+                <View style={styles.eventMain}>
+                  <Text style={[styles.eventMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                    {prettyTs(event.ts)} · {event.from ?? "unknown"}
+                  </Text>
+                  <Text style={[styles.eventSummary, { color: theme.text, fontFamily: theme.fontSans }]}>
+                    {summarizeEvent(event)}
+                  </Text>
+                </View>
+                <View
+                  style={[
+                    styles.statusPill,
+                    {
+                      backgroundColor: `${color}22`,
+                      borderColor: `${color}66`,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.statusPillText,
+                      {
+                        color,
+                        fontFamily: theme.fontSans,
+                      },
+                    ]}
+                  >
+                    {event.type}
+                  </Text>
+                </View>
+              </View>
+            );
+          })
+        )}
+      </View>
+    </ScrollView>
+  );
+}
+
+export default function DashboardScreen() {
+  const session = usePushPalsSession(DEFAULT_BASE);
+  const colorScheme = useColorScheme();
+  const { width } = useWindowDimensions();
+
+  const [mode, setMode] = useState<ThemeMode>("auto");
+  const resolvedMode: ResolvedMode =
+    mode === "auto" ? ((colorScheme ?? "light") as ResolvedMode) : (mode as ResolvedMode);
+  const theme = useMemo(() => createTheme(resolvedMode), [resolvedMode]);
+
+  const [activeTab, setActiveTab] = useState<UiTab>("chat");
+  const [input, setInput] = useState("");
+  const [workers, setWorkers] = useState<WorkerStatusRow[]>([]);
+  const [requests, setRequests] = useState<RequestSnapshotRow[]>([]);
+  const [requestCounts, setRequestCounts] = useState<QueueCounts>({});
+  const [jobs, setJobs] = useState<JobSnapshotRow[]>([]);
+  const [jobCounts, setJobCounts] = useState<QueueCounts>({});
+  const [completions, setCompletions] = useState<CompletionSnapshotRow[]>([]);
+  const [completionCounts, setCompletionCounts] = useState<QueueCounts>({});
+  const [systemSummary, setSystemSummary] = useState<{
+    workers?: { total: number; online: number; busy: number; idle: number };
+    queues?: {
+      requests?: QueueCounts;
+      jobs?: QueueCounts;
+      completions?: QueueCounts;
+    };
+    ts?: string;
+  }>({});
+  const [lastRefresh, setLastRefresh] = useState<string | null>(null);
+
+  const mountAnim = useRef(new Animated.Value(0)).current;
+  const tabAnim = useRef(new Animated.Value(1)).current;
+
+  const isWide = width >= 1060;
+
+  useEffect(() => {
+    Animated.spring(mountAnim, {
+      toValue: 1,
+      friction: 8,
+      tension: 70,
+      useNativeDriver: true,
+    }).start();
+  }, [mountAnim]);
+
+  useEffect(() => {
+    tabAnim.setValue(0.7);
+    Animated.timing(tabAnim, {
+      toValue: 1,
+      duration: 220,
+      useNativeDriver: true,
+    }).start();
+  }, [activeTab, tabAnim]);
+  const refreshObservability = useCallback(async () => {
+    const [workersData, requestData, jobData, completionData, systemData] = await Promise.all([
+      fetchWorkers(DEFAULT_BASE, AUTH_TOKEN),
+      fetchRequestsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
+      fetchJobsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
+      fetchCompletionsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
+      fetchSystemStatus(DEFAULT_BASE, AUTH_TOKEN),
+    ]);
+
+    setWorkers(workersData);
+    setRequests(requestData.requests);
+    setRequestCounts(requestData.counts);
+    setJobs(jobData.jobs);
+    setJobCounts(jobData.counts);
+    setCompletions(completionData.completions);
+    setCompletionCounts(completionData.counts);
+    setSystemSummary(systemData);
+    setLastRefresh(new Date().toISOString());
+  }, []);
+
+  useEffect(() => {
+    refreshObservability();
+    const timer = setInterval(refreshObservability, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [refreshObservability]);
+
+  const sendMessage = useCallback(async () => {
     const text = input.trim();
     if (!text) return;
     setInput("");
-    try {
-      await session.send(text);
-    } catch (_err) {
-      // error events will arrive via the stream
-    }
-  };
-  handleSendRef.current = handleSend;
+    await session.send(text);
+  }, [input, session]);
 
-  const handleApprove = useCallback(
-    (id: string) => {
-      session.approve(id);
-    },
-    [session.approve],
-  );
-  const handleDeny = useCallback(
-    (id: string) => {
-      session.deny(id);
-    },
-    [session.deny],
+  const tabs = useMemo(
+    () => [
+      { id: "chat" as const, label: "Chat", count: session.state.messages.length },
+      { id: "requests" as const, label: "Requests", count: requests.length },
+      { id: "jobs" as const, label: "Jobs & Traces", count: session.state.jobs.size },
+      { id: "system" as const, label: "System", count: workers.length },
+    ],
+    [session.state.messages.length, requests.length, session.state.jobs.size, workers.length],
   );
 
-  useEffect(() => {
-    if (activeTab === "events") {
-      flatRef.current?.scrollToEnd({ animated: true });
-    }
-  }, [session.filteredEvents.length, activeTab]);
-
-  // Auto-scroll messages tab
-  useEffect(() => {
-    if (activeTab === "messages") {
-      messagesEndRef.current?.scrollToEnd({ animated: true });
-    }
-  }, [session.state.messages.length, activeTab]);
-
-  // Keyboard shortcut: Alt+Enter (Win/Linux) or Cmd+Enter (Mac)
-  // Attached directly to the input element so it works while focused.
-  useEffect(() => {
-    if (Platform.OS !== "web") return;
-    const el = (inputRef.current as any)?._node ?? (inputRef.current as any);
-    const dom: HTMLElement | null = el instanceof HTMLElement ? el : (el?.getHostNode?.() ?? null);
-    if (!dom) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Enter" && (e.altKey || e.metaKey)) {
-        e.preventDefault();
-        handleSendRef.current();
-      }
-    };
-    dom.addEventListener("keydown", onKeyDown);
-    return () => dom.removeEventListener("keydown", onKeyDown);
-  }, []);
-
-  const renderItem = ({ item }: { item: SessionEvent }) => {
-    if (!isEnvelope(item)) {
-      // Local error
-      return (
-        <View style={[styles.card, { borderLeftColor: "#dc2626" }]}>
-          <Text style={styles.errorText}>[warn] {(item as any).message}</Text>
-        </View>
-      );
-    }
-    return <EventCard event={item} onApprove={handleApprove} onDeny={handleDeny} />;
-  };
+  const totalEvents = session.events.length;
+  const pendingWork = queueValue(requestCounts, "pending") + queueValue(jobCounts, "pending");
 
   return (
     <KeyboardAvoidingView
-      style={styles.container}
+      style={[styles.root, { backgroundColor: theme.background }]}
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
-      {/* Header */}
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>PushPals</Text>
-        <View style={styles.headerRight}>
-          <Text style={styles.eventCount}>{session.events.length} events</Text>
-          <View
-            style={[
-              styles.connDot,
+      <View style={[styles.backdropBlob, styles.backdropBlobA, { backgroundColor: `${theme.accent}20` }]} />
+      <View style={[styles.backdropBlob, styles.backdropBlobB, { backgroundColor: `${theme.warning}16` }]} />
+      <View style={[styles.backdropBlob, styles.backdropBlobC, { backgroundColor: `${theme.positive}18` }]} />
+
+      <Animated.View
+        style={[
+          styles.shell,
+          {
+            backgroundColor: theme.shell,
+            borderColor: theme.border,
+            opacity: mountAnim,
+            transform: [
               {
-                backgroundColor: session.isConnected ? "#22c55e" : "#ef4444",
+                translateY: mountAnim.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [18, 0],
+                }),
               },
-            ]}
+            ],
+          },
+        ]}
+      >
+        <View style={styles.header}>
+          <View style={styles.headerLeft}>
+            <Text style={[styles.eyebrow, { color: theme.textMuted, fontFamily: theme.fontSans }]}>pushpals operations console</Text>
+            <Text style={[styles.title, { color: theme.text, fontFamily: theme.fontSans }]}>Mission Control</Text>
+            <Text style={[styles.subtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              Real-time chat, orchestration, queue health, and execution trace visibility.
+            </Text>
+          </View>
+          <ModeSwitcher mode={mode} onChange={setMode} theme={theme} />
+        </View>
+
+        {session.error ? (
+          <View style={[styles.banner, { backgroundColor: `${theme.danger}22`, borderColor: `${theme.danger}55` }]}>
+            <Text style={[styles.bannerText, { color: theme.danger, fontFamily: theme.fontSans }]}>{session.error}</Text>
+          </View>
+        ) : null}
+
+        <View style={styles.metricRow}>
+          <MetricTile
+            title="Connection"
+            value={session.isConnected ? "Live" : "Disconnected"}
+            detail={`${totalEvents} events`}
+            tone={session.isConnected ? "positive" : "danger"}
+            theme={theme}
+          />
+          <MetricTile
+            title="Pending Work"
+            value={String(pendingWork)}
+            detail={`${queueValue(requestCounts, "pending")} requests · ${queueValue(jobCounts, "pending")} jobs`}
+            tone={pendingWork > 0 ? "warning" : "positive"}
+            theme={theme}
+          />
+          <MetricTile
+            title="Active Workers"
+            value={String(systemSummary.workers?.online ?? workers.filter((w) => w.isOnline).length)}
+            detail={`${systemSummary.workers?.busy ?? workers.filter((w) => w.status === "busy").length} busy`}
+            theme={theme}
+          />
+          <MetricTile
+            title="Last Sync"
+            value={lastRefresh ? relativeMs(lastRefresh) : "--"}
+            detail={lastRefresh ? prettyTs(lastRefresh) : "waiting"}
+            theme={theme}
           />
         </View>
-      </View>
 
-      {session.error && (
-        <View style={styles.errorBanner}>
-          <Text style={styles.errorBannerText}>{session.error}</Text>
-        </View>
-      )}
+        <SegmentedTabs tabs={tabs} active={activeTab} onSelect={setActiveTab} theme={theme} />
 
-      {/* Task summary strip */}
-      <TaskStrip tasks={session.tasks} />
-
-      {/* Filter bar */}
-      <FilterBar
-        agents={session.agents}
-        tasks={session.tasks}
-        turnIds={session.turnIds}
-        filters={session.filters}
-        setFilters={session.setFilters}
-      />
-
-      {/* Tab switcher */}
-      <View style={styles.tabBar}>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === "messages" && styles.tabActive]}
-          onPress={() => setActiveTab("messages")}
+        <Animated.View
+          style={[
+            styles.tabFill,
+            {
+              opacity: tabAnim,
+              transform: [{ translateY: tabAnim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }) }],
+            },
+          ]}
         >
-          <Text style={[styles.tabText, activeTab === "messages" && styles.tabTextActive]}>
-            Messages
-            {session.state.messages.length > 0 ? ` (${session.state.messages.length})` : ""}
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === "events" && styles.tabActive]}
-          onPress={() => setActiveTab("events")}
-        >
-          <Text style={[styles.tabText, activeTab === "events" && styles.tabTextActive]}>
-            Events
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === "tasks" && styles.tabActive]}
-          onPress={() => setActiveTab("tasks")}
-        >
-          <Text style={[styles.tabText, activeTab === "tasks" && styles.tabTextActive]}>
-            Tasks & Jobs
-            {session.state.tasks.size > 0 ? ` (${session.state.tasks.size})` : ""}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Content */}
-      {activeTab === "messages" ? (
-        <ScrollView
-          ref={(r) => {
-            messagesEndRef.current = r;
-          }}
-          style={styles.chatScroll}
-          contentContainerStyle={styles.chatContent}
-        >
-          {session.state.messages.length === 0 && (
-            <View style={styles.emptyChat}>
-              <Text style={styles.emptyChatText}>No messages yet. Say something!</Text>
-            </View>
-          )}
-          {session.state.messages.map((msg) => {
-            const isUser = msg.from === "client";
-            return (
-              <View
-                key={msg.id}
-                style={[styles.chatBubble, isUser ? styles.chatBubbleUser : styles.chatBubbleAgent]}
-              >
-                {!isUser && msg.from && <Text style={styles.chatFrom}>{msg.from}</Text>}
-                <CollapsibleText text={msg.text} isUser={isUser} />
-                <Text style={styles.chatTs}>{new Date(msg.ts).toLocaleTimeString()}</Text>
-              </View>
-            );
-          })}
-        </ScrollView>
-      ) : activeTab === "events" ? (
-        <FlatList
-          ref={(r) => {
-            flatRef.current = r;
-          }}
-          data={session.filteredEvents}
-          renderItem={renderItem}
-          keyExtractor={(item, idx) => (isEnvelope(item) ? item.id : `err-${idx}`)}
-          contentContainerStyle={styles.listContent}
-        />
-      ) : (
-        <TasksJobsLogs state={session.state} />
-      )}
-
-      {/* Composer */}
-      <View style={styles.composerRow}>
-        <TextInput
-          ref={inputRef}
-          style={styles.input}
-          placeholder="Type a message..."
-          value={input}
-          onChangeText={setInput}
-          multiline
-          onSubmitEditing={handleSend}
-        />
-        <TouchableOpacity
-          style={[styles.sendButton, !input.trim() && styles.sendDisabled]}
-          onPress={handleSend}
-          disabled={!input.trim() || !session.isConnected}
-        >
-          <Text style={styles.sendText}>Send</Text>
-        </TouchableOpacity>
-      </View>
+          {activeTab === "chat" ? (
+            <ChatPane
+              theme={theme}
+              messages={session.state.messages}
+              input={input}
+              setInput={setInput}
+              onSend={sendMessage}
+              connected={session.isConnected}
+            />
+          ) : null}
+          {activeTab === "requests" ? <RequestsPane theme={theme} rows={requests} counts={requestCounts} /> : null}
+          {activeTab === "jobs" ? (
+            <JobsPane
+              theme={theme}
+              isWide={isWide}
+              jobs={jobs}
+              jobCounts={jobCounts}
+              completions={completions}
+              completionCounts={completionCounts}
+              sessionState={session.state}
+            />
+          ) : null}
+          {activeTab === "system" ? (
+            <SystemPane
+              theme={theme}
+              events={session.events}
+              connected={session.isConnected}
+              workers={workers}
+              systemSummary={systemSummary}
+              lastRefresh={lastRefresh}
+            />
+          ) : null}
+        </Animated.View>
+      </Animated.View>
     </KeyboardAvoidingView>
   );
 }
 
-// ─── Styles ──────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#f8fafc" },
-
-  // Header
-  header: {
-    height: 56,
-    paddingHorizontal: 16,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    borderBottomWidth: 1,
-    borderBottomColor: "#e2e8f0",
-    backgroundColor: "#fff",
-  },
-  headerTitle: { fontSize: 18, fontWeight: "700", color: "#0f172a" },
-  headerRight: { flexDirection: "row", alignItems: "center", gap: 8 },
-  eventCount: { fontSize: 12, color: "#64748b" },
-  connDot: { width: 8, height: 8, borderRadius: 4 },
-
-  // Error banner
-  errorBanner: {
-    backgroundColor: "#fef2f2",
-    padding: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: "#fecaca",
-  },
-  errorBannerText: { color: "#dc2626", fontSize: 13 },
-
-  // Task strip
-  taskStrip: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderBottomWidth: 1,
-    borderBottomColor: "#e2e8f0",
-    backgroundColor: "#fff",
-    maxHeight: 40,
-  },
-  taskChip: {
-    backgroundColor: "#f1f5f9",
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 12,
-    marginRight: 6,
-  },
-  taskChipText: { fontSize: 12, color: "#334155" },
-
-  // Filter bar
-  filterContainer: {
-    borderBottomWidth: 1,
-    borderBottomColor: "#e2e8f0",
-    backgroundColor: "#fff",
-  },
-  filterToggle: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  filterToggleText: { fontSize: 13, color: "#475569", fontWeight: "500" },
-  clearFilterText: { fontSize: 12, color: "#3b82f6" },
-  filterBody: { paddingHorizontal: 12, paddingBottom: 8 },
-  filterRow: { flexDirection: "row", alignItems: "center", marginBottom: 4 },
-  filterLabel: { fontSize: 12, color: "#64748b", width: 48 },
-  filterChip: {
-    backgroundColor: "#f1f5f9",
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 10,
-    marginRight: 4,
-    borderWidth: 1,
-    borderColor: "transparent",
-  },
-  filterChipActive: {
-    backgroundColor: "#dbeafe",
-    borderColor: "#3b82f6",
-  },
-  filterChipText: { fontSize: 11, color: "#334155" },
-
-  // Tab bar
-  tabBar: {
-    flexDirection: "row",
-    borderBottomWidth: 1,
-    borderBottomColor: "#e2e8f0",
-    backgroundColor: "#fff",
-  },
-  tab: {
+  root: { flex: 1 },
+  shell: {
     flex: 1,
-    paddingVertical: 8,
-    alignItems: "center",
-    borderBottomWidth: 2,
-    borderBottomColor: "transparent",
+    margin: 12,
+    borderRadius: 22,
+    borderWidth: 1,
+    overflow: "hidden",
   },
-  tabActive: {
-    borderBottomColor: "#3b82f6",
+  backdropBlob: {
+    position: "absolute",
+    borderRadius: 999,
+    transform: [{ scaleX: 1.2 }],
   },
-  tabText: {
-    fontSize: 13,
-    fontWeight: "500",
-    color: "#94a3b8",
-  },
-  tabTextActive: {
-    color: "#3b82f6",
-    fontWeight: "600",
-  },
+  backdropBlobA: { width: 360, height: 360, top: -120, left: -120 },
+  backdropBlobB: { width: 320, height: 320, top: "32%", right: -130 },
+  backdropBlobC: { width: 280, height: 280, bottom: -90, left: "20%" },
 
-  // List
-  listContent: { padding: 12, paddingBottom: 8 },
-
-  // Card
-  card: {
-    backgroundColor: "#fff",
-    borderRadius: 8,
-    borderLeftWidth: 3,
-    borderLeftColor: "#94a3b8",
-    marginBottom: 8,
-    padding: 10,
-    ...Platform.select({
-      web: { boxShadow: "0 1px 3px rgba(0,0,0,0.06)" },
-      default: { elevation: 1 },
-    }),
-  },
-  cardHeader: {
+  header: {
     flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    marginBottom: 6,
-    flexWrap: "wrap",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    paddingHorizontal: 20,
+    paddingTop: 18,
+    paddingBottom: 12,
   },
-  cardBody: {},
-
-  // Event type badge
-  eventTypeBadge: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  eventTypeText: { fontSize: 11, fontWeight: "600" },
-
-  // Agent badge
-  agentBadgeRow: { flexDirection: "row", alignItems: "center", gap: 4 },
-  badge: { paddingHorizontal: 6, paddingVertical: 1, borderRadius: 4 },
-  badgeText: { fontSize: 10, fontWeight: "500" },
-  arrowText: { fontSize: 10, color: "#94a3b8" },
-
-  // Timestamp
-  ts: { fontSize: 10, color: "#94a3b8", marginLeft: "auto" },
-
-  // Content styles
-  messageText: { fontSize: 14, color: "#1e293b", lineHeight: 20 },
-  infoText: { fontSize: 13, color: "#475569" },
-  successText: { fontSize: 13, color: "#16a34a", fontWeight: "500" },
-  errorText: { fontSize: 13, color: "#dc2626" },
-  detailText: { fontSize: 12, color: "#94a3b8", marginTop: 2 },
-  logText: {
-    fontSize: 12,
-    color: "#64748b",
-    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
-  },
-  metaText: { fontSize: 11, color: "#94a3b8" },
-
-  // Task
-  taskTitle: { fontSize: 14, fontWeight: "600", color: "#1e293b" },
-  taskDesc: { fontSize: 13, color: "#475569", marginTop: 2 },
-
-  // Status
-  statusRow: { flexDirection: "row", alignItems: "center", gap: 6 },
-  statusDot: { width: 8, height: 8, borderRadius: 4 },
-  statusText: { fontSize: 13, color: "#475569" },
-
-  // Tool
-  toolName: { fontSize: 13, fontWeight: "600", color: "#92400e" },
-  toolArgs: {
+  headerLeft: { flex: 1, paddingRight: 12 },
+  eyebrow: {
     fontSize: 11,
-    color: "#64748b",
-    backgroundColor: "#f8fafc",
-    padding: 6,
-    borderRadius: 4,
-    marginTop: 4,
-    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
+    letterSpacing: 1.3,
+    textTransform: "uppercase",
+    marginBottom: 4,
   },
-
-  // Approval
-  approvalRow: { flexDirection: "row", gap: 8, marginTop: 8 },
-  approvalBtn: { paddingHorizontal: 14, paddingVertical: 6, borderRadius: 6 },
-  approveBtn: { backgroundColor: "#dcfce7" },
-  denyBtn: { backgroundColor: "#fee2e2" },
-  approveBtnText: { color: "#16a34a", fontWeight: "600", fontSize: 13 },
-  denyBtnText: { color: "#dc2626", fontWeight: "600", fontSize: 13 },
-  approvalSummary: { fontSize: 13, color: "#1e293b", fontWeight: "500" },
-  decisionBadge: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
-    marginTop: 6,
+  title: {
+    fontSize: 30,
+    fontWeight: "700",
+    marginBottom: 2,
+  },
+  subtitle: {
+    fontSize: 13,
+    lineHeight: 19,
+    maxWidth: 640,
+  },
+  modeWrap: {
+    flexDirection: "row",
+    borderWidth: 1,
+    borderRadius: 12,
+    overflow: "hidden",
     alignSelf: "flex-start",
   },
-  approvedBg: { backgroundColor: "#dcfce7" },
-  deniedBg: { backgroundColor: "#fee2e2" },
-  decisionText: { fontSize: 12, fontWeight: "600" },
-
-  // Artifacts
-  artifactText: { fontSize: 12, color: "#6366f1", marginTop: 4 },
-
-  // Diff
-  diffContainer: { marginTop: 4 },
-  diffStat: { fontSize: 12, color: "#475569", fontWeight: "500" },
-  diffToggle: { fontSize: 12, color: "#3b82f6", marginTop: 4 },
-  diffScroll: { maxHeight: 200, marginTop: 4 },
-  diffCode: {
-    fontSize: 11,
-    color: "#334155",
-    backgroundColor: "#f8fafc",
-    padding: 8,
-    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
+  modeBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  modeText: {
+    fontSize: 12,
+    fontWeight: "600",
+    textTransform: "capitalize",
   },
 
-  // Progress
-  progressTrack: {
-    height: 18,
-    backgroundColor: "#e2e8f0",
-    borderRadius: 9,
-    marginTop: 6,
-    overflow: "hidden",
+  banner: {
+    marginHorizontal: 20,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  bannerText: { fontSize: 12, fontWeight: "600" },
+
+  metricRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    paddingHorizontal: 20,
+    paddingBottom: 10,
+  },
+  metricTile: {
+    minWidth: 150,
+    flexGrow: 1,
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginRight: 8,
+    marginBottom: 8,
+  },
+  metricTitle: { fontSize: 11, textTransform: "uppercase", letterSpacing: 0.7 },
+  metricValue: { fontSize: 22, fontWeight: "700", marginTop: 3 },
+  metricDetail: { fontSize: 12, marginTop: 3 },
+
+  segmentWrap: {
+    marginHorizontal: 20,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderRadius: 14,
+    flexDirection: "row",
+    padding: 3,
+  },
+  segmentBtn: {
+    flex: 1,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "transparent",
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    alignItems: "center",
     justifyContent: "center",
   },
-  progressFill: {
-    position: "absolute",
-    left: 0,
-    top: 0,
-    bottom: 0,
-    backgroundColor: "#3b82f6",
-    borderRadius: 9,
-  },
-  progressLabel: { fontSize: 10, color: "#475569", textAlign: "center" },
-
-  // Output
-  outputScroll: { maxHeight: 120, marginTop: 4 },
-  outputText: {
-    fontSize: 11,
-    color: "#334155",
-    backgroundColor: "#f0fdf4",
-    padding: 6,
-    borderRadius: 4,
-    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
-  },
-  stderrText: {
-    fontSize: 11,
-    color: "#dc2626",
-    backgroundColor: "#fef2f2",
-    padding: 6,
-    borderRadius: 4,
-    marginTop: 4,
+  segmentText: {
+    fontSize: 12,
+    fontWeight: "700",
   },
 
-  // Composer
-  composerRow: {
-    flexDirection: "row",
-    padding: 8,
-    borderTopWidth: 1,
-    borderTopColor: "#e2e8f0",
-    alignItems: "flex-end",
-    backgroundColor: "#fff",
+  tabFill: { flex: 1 },
+  scrollContent: {
+    paddingHorizontal: 20,
+    paddingBottom: 18,
   },
-  input: {
-    flex: 1,
-    minHeight: 40,
-    maxHeight: 120,
-    padding: 8,
-    backgroundColor: "#f8fafc",
-    borderRadius: 8,
+  emptyState: {
+    borderRadius: 16,
+    padding: 16,
+    alignItems: "flex-start",
+  },
+  emptyTitle: { fontSize: 18, fontWeight: "700", marginBottom: 4 },
+  emptySubtitle: { fontSize: 13, lineHeight: 19 },
+
+  chatContent: {
+    paddingHorizontal: 20,
+    paddingBottom: 12,
+  },
+  chatBubble: {
+    maxWidth: "78%",
+    borderRadius: 16,
     borderWidth: 1,
-    borderColor: "#e2e8f0",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 9,
+  },
+  chatBubbleUser: {
+    alignSelf: "flex-end",
+    borderBottomRightRadius: 5,
+  },
+  chatBubbleAgent: {
+    alignSelf: "flex-start",
+    borderBottomLeftRadius: 5,
+  },
+  chatFrom: {
+    fontSize: 11,
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    marginBottom: 4,
+  },
+  chatText: {
+    fontSize: 14,
+    lineHeight: 21,
+  },
+  chatTs: {
+    fontSize: 11,
+    marginTop: 6,
+    alignSelf: "flex-end",
+  },
+  showMore: {
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 6,
+  },
+
+  composer: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    borderTopWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  composerInput: {
+    flex: 1,
+    minHeight: 44,
+    maxHeight: 130,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
     fontSize: 14,
   },
   sendButton: {
     marginLeft: 8,
-    backgroundColor: "#3b82f6",
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 8,
+    height: 44,
+    borderRadius: 12,
+    paddingHorizontal: 16,
     justifyContent: "center",
+    alignItems: "center",
   },
-  sendDisabled: { opacity: 0.4 },
-  sendText: { color: "#fff", fontWeight: "600" },
+  sendLabel: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+    fontSize: 13,
+  },
 
-  // Chat messages tab
-  chatScroll: { flex: 1, backgroundColor: "#f8fafc" },
-  chatContent: { padding: 12, paddingBottom: 8 },
-  emptyChat: { flex: 1, alignItems: "center", justifyContent: "center", paddingTop: 80 },
-  emptyChatText: { fontSize: 14, color: "#94a3b8" },
-  chatBubble: {
-    maxWidth: "75%",
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 16,
-    marginBottom: 8,
-  },
-  chatBubbleUser: {
-    alignSelf: "flex-end",
-    backgroundColor: "#3b82f6",
-    borderBottomRightRadius: 4,
-  },
-  chatBubbleAgent: {
-    alignSelf: "flex-start",
-    backgroundColor: "#fff",
-    borderBottomLeftRadius: 4,
+  requestCard: {
     borderWidth: 1,
-    borderColor: "#e2e8f0",
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 10,
   },
-  chatFrom: {
-    fontSize: 10,
-    color: "#64748b",
-    fontWeight: "600",
-    marginBottom: 2,
+  requestId: { fontSize: 12, fontWeight: "700" },
+  requestPrompt: { fontSize: 14, lineHeight: 20, marginTop: 7 },
+  requestSubline: { fontSize: 12, marginTop: 6 },
+  requestHint: { fontSize: 12, lineHeight: 18, marginTop: 6 },
+  rowBetween: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
   },
-  chatText: {
-    fontSize: 14,
-    lineHeight: 20,
+  statusPill: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 3,
   },
-  chatTextUser: { color: "#fff" },
-  chatTextAgent: { color: "#1e293b" },
-  chatTs: {
-    fontSize: 10,
-    color: "#94a3b8",
-    marginTop: 4,
-    alignSelf: "flex-end",
+  statusPillText: {
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
   },
-
-  // Show more / collapsible
-  showMoreBtn: {
-    marginTop: 6,
-    paddingVertical: 2,
-  },
-  showMoreText: {
-    fontSize: 12,
-    color: "#3b82f6",
-    fontWeight: "600",
-  },
-  expandedBody: {
-    marginTop: 6,
-    backgroundColor: "rgba(0,0,0,0.04)",
-    borderRadius: 6,
+  codeBlock: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderRadius: 10,
     padding: 8,
   },
-  monoText: {
-    fontFamily: Platform.OS === "web" ? "monospace" : undefined,
-    fontSize: 12,
-    lineHeight: 18,
+  codeBlockLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    marginBottom: 4,
   },
+  codeBlockText: {
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  jobsLayout: {
+    flex: 1,
+    flexDirection: "column",
+    paddingHorizontal: 20,
+    paddingBottom: 14,
+  },
+  jobsLayoutWide: {
+    flexDirection: "row",
+  },
+  jobsListPane: {
+    flex: 1,
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 10,
+    minHeight: 220,
+  },
+  jobsTracePane: {
+    flex: 1.25,
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    minHeight: 260,
+  },
+  tracePanelBody: { flex: 1, minHeight: 260 },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    marginBottom: 8,
+  },
+  subSectionTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+    marginBottom: 5,
+  },
+  jobRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    paddingVertical: 8,
+  },
+  jobDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 10,
+  },
+  jobTextCol: { flex: 1 },
+  jobKind: { fontSize: 13, fontWeight: "700" },
+  jobMeta: { fontSize: 12, marginTop: 2 },
+  jobStatus: { fontSize: 11, fontWeight: "700", textTransform: "uppercase" },
+  completionStrip: { marginTop: 8 },
+  completionRow: {
+    borderTopWidth: 1,
+    paddingTop: 8,
+    marginTop: 7,
+  },
+  completionLine: { fontSize: 12, marginBottom: 3 },
+  completionMeta: { fontSize: 11, marginBottom: 2 },
+  completionStatus: { fontSize: 11, fontWeight: "700", textTransform: "uppercase" },
+
+  systemGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginBottom: 6,
+  },
+  systemCard: {
+    width: "48%",
+    minWidth: 240,
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 11,
+    marginRight: 8,
+    marginBottom: 8,
+  },
+  systemTitle: { fontSize: 14, fontWeight: "700" },
+  systemDetail: { fontSize: 12, marginTop: 7 },
+  systemMeta: { fontSize: 11, marginTop: 5 },
+
+  workerPanel: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 10,
+  },
+  workerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    paddingVertical: 9,
+  },
+  workerTextCol: { flex: 1 },
+  workerName: { fontSize: 13, fontWeight: "700" },
+  workerMeta: { fontSize: 12, marginTop: 2 },
+  eventPanel: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 10,
+  },
+  eventRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    borderBottomWidth: 1,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  eventMain: { flex: 1 },
+  eventMeta: { fontSize: 11 },
+  eventSummary: { fontSize: 13, marginTop: 2, lineHeight: 18 },
 });
+

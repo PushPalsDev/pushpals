@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { View, Text, ScrollView, TextInput, Button, TouchableOpacity } from "react-native";
 import { usePushPalsSession, isEnvelope, type SessionEvent } from "./usePushPalsSession.js";
-import type { EventEnvelope } from "protocol/browser";
 
 /**
  * Example component demonstrating PushPals API usage with

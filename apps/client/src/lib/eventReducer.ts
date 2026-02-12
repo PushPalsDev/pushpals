@@ -48,11 +48,11 @@ export interface Job {
   summary?: string;
   message?: string; // failure message
   detail?: string; // failure detail
-  artifacts?: Array<{
+  artifacts?: {
     kind: string;
     uri?: string;
     text?: string;
-  }>;
+  }[];
   ts: string;
 }
 

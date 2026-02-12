@@ -173,6 +173,44 @@ export class CompletionQueue {
       .all() as CompletionRow[];
   }
 
+  listCompletions(options?: {
+    status?: CompletionStatus | "all";
+    limit?: number;
+  }): CompletionRow[] {
+    const status = options?.status ?? "all";
+    const limit =
+      typeof options?.limit === "number" && Number.isFinite(options.limit)
+        ? Math.max(1, Math.min(500, Math.floor(options.limit)))
+        : 200;
+
+    if (status === "all") {
+      return this.db
+        .prepare(`SELECT * FROM completions ORDER BY createdAt DESC LIMIT ?`)
+        .all(limit) as CompletionRow[];
+    }
+
+    return this.db
+      .prepare(`SELECT * FROM completions WHERE status = ? ORDER BY createdAt DESC LIMIT ?`)
+      .all(status, limit) as CompletionRow[];
+  }
+
+  countByStatus(): Record<CompletionStatus, number> {
+    const rows = this.db
+      .prepare(`SELECT status, COUNT(*) AS count FROM completions GROUP BY status`)
+      .all() as Array<{ status: CompletionStatus; count: number }>;
+
+    const counts: Record<CompletionStatus, number> = {
+      pending: 0,
+      claimed: 0,
+      processed: 0,
+      failed: 0,
+    };
+    for (const row of rows) {
+      if (row.status in counts) counts[row.status] = Number(row.count || 0);
+    }
+    return counts;
+  }
+
   close(): void {
     this.db.close();
   }
