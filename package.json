@@ -35,7 +35,9 @@
     "lint": "bun --cwd apps/client lint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "bun --cwd packages/protocol test",
+    "test:root": "bun test tests",
+    "test:protocol": "bun run tests/protocol.integration.ts",
+    "test": "bun run test:root && bun run test:protocol",
     "smoke": "bun run scripts/smoke-test.ts"
   },
   "devDependencies": {

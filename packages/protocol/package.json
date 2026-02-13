@@ -20,7 +20,7 @@
   },
   "scripts": {
     "build": "tsc && node scripts/copy-schemas.js",
-    "test": "bun run test/test-integration.ts",
+    "test": "bun run ../../tests/protocol.integration.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

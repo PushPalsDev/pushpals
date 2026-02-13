@@ -11,7 +11,7 @@ import {
   validateApprovalDecisionRequest,
   validateCommandRequest,
   AnyEventEnvelope,
-} from "protocol";
+} from "../packages/protocol/src/index";
 import { randomUUID } from "crypto";
 
 console.log("PushPals Protocol Integration Test\n");

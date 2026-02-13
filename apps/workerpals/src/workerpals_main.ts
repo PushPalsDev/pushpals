@@ -20,6 +20,7 @@ import { resolve } from "path";
 import { detectRepoRoot } from "shared";
 import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
 import { DockerExecutor } from "./docker_executor.js";
+import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 
 type CommitRef = {
   branch: string;
@@ -100,7 +101,7 @@ function parseArgs(): {
   let dockerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
   let gitToken =
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
-  let dockerTimeout = parseInt(process.env.WORKERPALS_DOCKER_TIMEOUT_MS ?? "630000", 10);
+  let dockerTimeout = parseDockerTimeoutMs(process.env.WORKERPALS_DOCKER_TIMEOUT_MS);
   let dockerIdleTimeout = parseInt(process.env.WORKERPALS_DOCKER_IDLE_TIMEOUT_MS ?? "600000", 10);
   let dockerNetworkMode = (process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? "bridge").trim() || "bridge";
   let worktreeBaseRef = process.env.WORKERPALS_BASE_REF ?? `origin/${integrationBranchName()}`;
@@ -142,7 +143,7 @@ function parseArgs(): {
         gitToken = args[++i];
         break;
       case "--docker-timeout":
-        dockerTimeout = parseInt(args[++i], 10);
+        dockerTimeout = parseDockerTimeoutMs(args[++i]);
         break;
       case "--docker-idle-timeout":
         dockerIdleTimeout = parseInt(args[++i], 10);
@@ -173,7 +174,7 @@ function parseArgs(): {
     requireDocker,
     dockerImage,
     gitToken,
-    dockerTimeout: Number.isFinite(dockerTimeout) && dockerTimeout > 0 ? dockerTimeout : 630000,
+    dockerTimeout: Number.isFinite(dockerTimeout) && dockerTimeout > 0 ? dockerTimeout : DEFAULT_DOCKER_TIMEOUT_MS,
     dockerIdleTimeout:
       Number.isFinite(dockerIdleTimeout) && dockerIdleTimeout >= 0 ? dockerIdleTimeout : 600000,
     dockerNetworkMode,

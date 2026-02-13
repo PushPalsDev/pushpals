@@ -6,6 +6,7 @@
 import { existsSync } from "fs";
 import { resolve } from "path";
 import { loadPromptTemplate } from "shared";
+import { computeTimeoutWarningWindow, parseOpenHandsTimeoutMs } from "./timeout_policy.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -189,12 +190,9 @@ async function executeWithOpenHands(
     };
   }
 
-  const timeoutMs = Math.max(
-    10_000,
-    parseInt(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS ?? "600000", 10) || 600_000,
-  );
-  const timeoutWarningLeadMs = Math.min(60_000, Math.max(10_000, timeoutMs - 5_000));
-  const timeoutWarningDelayMs = Math.max(1_000, timeoutMs - timeoutWarningLeadMs);
+  const timeoutMs = parseOpenHandsTimeoutMs(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS);
+  const { leadMs: timeoutWarningLeadMs, delayMs: timeoutWarningDelayMs } =
+    computeTimeoutWarningWindow(timeoutMs);
   const payload = Buffer.from(
     JSON.stringify({
       kind,

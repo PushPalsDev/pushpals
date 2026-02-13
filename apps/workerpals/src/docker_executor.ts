@@ -15,6 +15,7 @@
 import { randomUUID } from "crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { isAbsolute, relative, resolve } from "path";
+import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 
 export interface DockerExecutorOptions {
   /** Path to the git repository on the host */
@@ -68,7 +69,7 @@ export class DockerExecutor {
       gitToken: "",
       // Keep a little headroom above OpenHands inner timeout so wrapper can
       // emit a structured timeout failure before docker hard-kills the job.
-      timeoutMs: 630000,
+      timeoutMs: DEFAULT_DOCKER_TIMEOUT_MS,
       idleTimeoutMs: 10 * 60 * 1000,
       baseRef: "HEAD",
       networkMode: "bridge",
@@ -464,8 +465,9 @@ export class DockerExecutor {
       stderr: "pipe",
     });
 
-    const warningLeadMs = Math.min(60_000, Math.max(10_000, this.options.timeoutMs - 5_000));
-    const warningDelayMs = Math.max(1_000, this.options.timeoutMs - warningLeadMs);
+    const { leadMs: warningLeadMs, delayMs: warningDelayMs } = computeTimeoutWarningWindow(
+      this.options.timeoutMs,
+    );
     const warningTimer = setTimeout(() => {
       const warning = `[DockerExecutor] Job nearing timeout in warm container (${Math.round(
         warningLeadMs / 1000,
