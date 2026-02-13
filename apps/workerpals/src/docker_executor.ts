@@ -66,7 +66,7 @@ export class DockerExecutor {
   constructor(options: DockerExecutorOptions) {
     this.options = {
       gitToken: "",
-      timeoutMs: 180000,
+      timeoutMs: 480000,
       idleTimeoutMs: 10 * 60 * 1000,
       baseRef: "HEAD",
       networkMode: "bridge",

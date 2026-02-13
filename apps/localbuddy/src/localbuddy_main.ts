@@ -138,6 +138,23 @@ function tryParseJsonObject(raw: string): Record<string, unknown> | null {
   return null;
 }
 
+function extractLocalReplyFromObject(value: Record<string, unknown> | null): string {
+  if (!value) return "";
+  const candidates = [
+    value.reply,
+    value.assistant_message,
+    value.message,
+    value.text,
+    value.content,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return "";
+}
+
 function fallbackLocalReply(userPrompt: string): string {
   const text = userPrompt.trim().toLowerCase();
   if (/^(hi|hello|hey)\b/.test(text)) {
@@ -155,6 +172,13 @@ function sanitizeLocalReply(raw: string, userPrompt: string): string {
     .replace(/```$/i, "")
     .trim();
   if (!text) return fallbackLocalReply(userPrompt);
+
+  // Some providers ignore/relax JSON schema and return alternate keys.
+  const parsed = tryParseJsonObject(text);
+  const extracted = extractLocalReplyFromObject(parsed);
+  if (extracted) {
+    text = extracted;
+  }
 
   const lowered = text.toLowerCase();
   const reasoningSignals = [
@@ -325,7 +349,7 @@ Respond in strict JSON with this shape:
         temperature: 0.2,
       });
       const parsed = tryParseJsonObject(output.text);
-      const reply = typeof parsed?.reply === "string" ? parsed.reply : output.text;
+      const reply = extractLocalReplyFromObject(parsed) || output.text;
       const text = sanitizeLocalReply(reply, normalized);
       if (text) return text;
     } catch (err) {

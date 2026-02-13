@@ -191,7 +191,7 @@ async function executeWithOpenHands(
 
   const timeoutMs = Math.max(
     10_000,
-    parseInt(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS ?? "240000", 10) || 240_000,
+    parseInt(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS ?? "420000", 10) || 420_000,
   );
   const payload = Buffer.from(
     JSON.stringify({
