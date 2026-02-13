@@ -87,6 +87,16 @@ function integrationBranchName(): string {
   return configured || "main_agents";
 }
 
+function formatDurationMs(durationMs: number): string {
+  const ms = Math.max(0, Math.floor(durationMs));
+  if (ms < 1_000) return `${ms}ms`;
+  const totalSeconds = Math.floor(ms / 1_000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${totalSeconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+
 function parseArgs(): {
   server: string;
   pollMs: number;
@@ -597,6 +607,7 @@ async function workerLoop(
             };
 
             let result: WorkerJobResult;
+            const jobStartedAtMs = Date.now();
             try {
               result = await runJob(jobData, executionRepo, dockerExecutor, onLog);
             } catch (err) {
@@ -606,6 +617,7 @@ async function workerLoop(
                 stderr: String(err),
               };
             }
+            const jobDurationMs = Math.max(0, Date.now() - jobStartedAtMs);
 
             await logChain;
 
@@ -690,13 +702,16 @@ async function workerLoop(
                 headers,
                 body: JSON.stringify({
                   summary: result.summary,
+                  durationMs: jobDurationMs,
                   artifacts: [
                     ...(result.stdout ? [{ kind: "stdout", text: result.stdout }] : []),
                     ...(result.stderr ? [{ kind: "stderr", text: result.stderr }] : []),
                   ],
                 }),
               });
-              console.log(`[WorkerPals] Job ${job.id} completed: ${result.summary}`);
+              console.log(
+                `[WorkerPals] Job ${job.id} completed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
+              );
             } else {
               await fetch(`${opts.server}/jobs/${job.id}/fail`, {
                 method: "POST",
@@ -704,9 +719,12 @@ async function workerLoop(
                 body: JSON.stringify({
                   message: result.summary,
                   detail: result.stderr,
+                  durationMs: jobDurationMs,
                 }),
               });
-              console.log(`[WorkerPals] Job ${job.id} failed: ${result.summary}`);
+              console.log(
+                `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
+              );
             }
 
             if (job.sessionId) {

@@ -1,5 +1,5 @@
-export const DEFAULT_OPENHANDS_TIMEOUT_MS = 600_000;
-export const DEFAULT_DOCKER_TIMEOUT_MS = 630_000;
+export const DEFAULT_OPENHANDS_TIMEOUT_MS = 1_800_000;
+export const DEFAULT_DOCKER_TIMEOUT_MS = 1_860_000;
 
 export function parseOpenHandsTimeoutMs(raw: string | undefined): number {
   const parsed = parseInt(raw ?? "", 10);

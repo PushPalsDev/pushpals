@@ -15,6 +15,9 @@ export interface JobRow {
   targetWorkerId: string | null;
   result: string | null;
   error: string | null;
+  claimedAt: string | null;
+  completedAt: string | null;
+  durationMs: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -88,20 +91,23 @@ export class JobQueue {
 
   private _migrate(): void {
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS jobs (
-        id             TEXT PRIMARY KEY,
-        taskId         TEXT NOT NULL,
-        sessionId      TEXT NOT NULL DEFAULT '',
-        kind           TEXT NOT NULL,
-        params         TEXT NOT NULL DEFAULT '{}',
-        status         TEXT NOT NULL DEFAULT 'pending',
-        workerId       TEXT,
-        targetWorkerId TEXT,
-        result         TEXT,
-        error          TEXT,
-        createdAt      TEXT NOT NULL,
-        updatedAt      TEXT NOT NULL
-      );
+        CREATE TABLE IF NOT EXISTS jobs (
+          id             TEXT PRIMARY KEY,
+          taskId         TEXT NOT NULL,
+          sessionId      TEXT NOT NULL DEFAULT '',
+          kind           TEXT NOT NULL,
+          params         TEXT NOT NULL DEFAULT '{}',
+          status         TEXT NOT NULL DEFAULT 'pending',
+          workerId       TEXT,
+          targetWorkerId TEXT,
+          result         TEXT,
+          error          TEXT,
+          claimedAt      TEXT,
+          completedAt    TEXT,
+          durationMs     INTEGER,
+          createdAt      TEXT NOT NULL,
+          updatedAt      TEXT NOT NULL
+        );
 
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
       CREATE INDEX IF NOT EXISTS idx_jobs_taskId ON jobs(taskId);
@@ -144,6 +150,15 @@ export class JobQueue {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN targetWorkerId TEXT;`);
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);`);
     }
+    if (!jobColumns.some((col) => col.name === "claimedAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN claimedAt TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "completedAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN completedAt TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "durationMs")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN durationMs INTEGER;`);
+    }
   }
 
   enqueue(body: Record<string, unknown>): { ok: boolean; jobId?: string; message?: string } {
@@ -166,8 +181,11 @@ export class JobQueue {
 
     this.db
       .prepare(
-        `INSERT INTO jobs (id, taskId, sessionId, kind, params, status, workerId, targetWorkerId, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)`,
+        `INSERT INTO jobs (
+          id, taskId, sessionId, kind, params, status, workerId, targetWorkerId,
+          claimedAt, completedAt, durationMs, createdAt, updatedAt
+        )
+         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, NULL, NULL, ?, ?)`,
       )
       .run(jobId, taskId, sessionId, kind, JSON.stringify(params), targetWorkerId, now, now);
 
@@ -210,8 +228,17 @@ export class JobQueue {
       }
 
       this.db
-        .prepare(`UPDATE jobs SET status = 'claimed', workerId = ?, updatedAt = ? WHERE id = ?`)
-        .run(workerId, now, row.id);
+        .prepare(
+          `UPDATE jobs
+           SET status = 'claimed',
+               workerId = ?,
+               claimedAt = ?,
+               completedAt = NULL,
+               durationMs = NULL,
+               updatedAt = ?
+           WHERE id = ?`,
+        )
+        .run(workerId, now, now, row.id);
 
       this.db
         .prepare(
@@ -220,7 +247,15 @@ export class JobQueue {
         )
         .run(row.id, now, now, workerId);
 
-      return { ...row, status: "claimed" as JobStatus, workerId, updatedAt: now };
+      return {
+        ...row,
+        status: "claimed" as JobStatus,
+        workerId,
+        claimedAt: now,
+        completedAt: null,
+        durationMs: null,
+        updatedAt: now,
+      };
     });
 
     const job = tx();
@@ -322,7 +357,10 @@ export class JobQueue {
     });
   }
 
-  complete(jobId: string, body: Record<string, unknown>): { ok: boolean; message?: string } {
+  complete(
+    jobId: string,
+    body: Record<string, unknown>,
+  ): { ok: boolean; message?: string; durationMs?: number; completedAt?: string } {
     const now = new Date().toISOString();
     const summary = (body.summary as string) ?? null;
     const artifacts = body.artifacts ? JSON.stringify(body.artifacts) : null;
@@ -333,19 +371,41 @@ export class JobQueue {
 
     const info = this.db
       .prepare(
-        `UPDATE jobs SET status = 'completed', result = ?, updatedAt = ? WHERE id = ? AND status = 'claimed'`,
+        `UPDATE jobs
+         SET status = 'completed',
+             result = ?,
+             completedAt = ?,
+             durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(claimedAt, createdAt))) * 86400000 AS INTEGER)),
+             updatedAt = ?
+         WHERE id = ? AND status = 'claimed'`,
       )
-      .run(JSON.stringify({ summary, artifacts }), now, jobId);
+      .run(JSON.stringify({ summary, artifacts }), now, now, now, jobId);
 
     if (info.changes === 0) {
       return { ok: false, message: "Job not found or not in claimed state" };
     }
 
+    const completed = this.db
+      .prepare(`SELECT durationMs, completedAt FROM jobs WHERE id = ?`)
+      .get(jobId) as
+      | {
+          durationMs: number | null;
+          completedAt: string | null;
+        }
+      | undefined;
+
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
-    return { ok: true };
+    return {
+      ok: true,
+      durationMs: completed?.durationMs ?? undefined,
+      completedAt: completed?.completedAt ?? undefined,
+    };
   }
 
-  fail(jobId: string, body: Record<string, unknown>): { ok: boolean; message?: string } {
+  fail(
+    jobId: string,
+    body: Record<string, unknown>,
+  ): { ok: boolean; message?: string; durationMs?: number; completedAt?: string } {
     const now = new Date().toISOString();
     const message = (body.message as string) ?? "Unknown error";
     const detail = (body.detail as string) ?? null;
@@ -356,16 +416,35 @@ export class JobQueue {
 
     const info = this.db
       .prepare(
-        `UPDATE jobs SET status = 'failed', error = ?, updatedAt = ? WHERE id = ? AND status = 'claimed'`,
+        `UPDATE jobs
+         SET status = 'failed',
+             error = ?,
+             completedAt = ?,
+             durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(claimedAt, createdAt))) * 86400000 AS INTEGER)),
+             updatedAt = ?
+         WHERE id = ? AND status = 'claimed'`,
       )
-      .run(JSON.stringify({ message, detail }), now, jobId);
+      .run(JSON.stringify({ message, detail }), now, now, now, jobId);
 
     if (info.changes === 0) {
       return { ok: false, message: "Job not found or not in claimed state" };
     }
 
+    const failed = this.db
+      .prepare(`SELECT durationMs, completedAt FROM jobs WHERE id = ?`)
+      .get(jobId) as
+      | {
+          durationMs: number | null;
+          completedAt: string | null;
+        }
+      | undefined;
+
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
-    return { ok: true };
+    return {
+      ok: true,
+      durationMs: failed?.durationMs ?? undefined,
+      completedAt: failed?.completedAt ?? undefined,
+    };
   }
 
   recoverStaleClaimedJobs(staleAfterMs: number, limit = 100): RecoveredStaleJob[] {
@@ -423,13 +502,17 @@ export class JobQueue {
         ];
         const detail = detailParts.join("; ");
 
-        const info = this.db
-          .prepare(
-            `UPDATE jobs
-             SET status = 'failed', error = ?, updatedAt = ?
-             WHERE id = ? AND status = 'claimed'`,
-          )
-          .run(JSON.stringify({ message, detail }), now, row.jobId);
+          const info = this.db
+            .prepare(
+              `UPDATE jobs
+               SET status = 'failed',
+                   error = ?,
+                   completedAt = ?,
+                   durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(claimedAt, createdAt))) * 86400000 AS INTEGER)),
+                   updatedAt = ?
+               WHERE id = ? AND status = 'claimed'`,
+            )
+            .run(JSON.stringify({ message, detail }), now, now, now, row.jobId);
 
         if (info.changes === 0) continue;
 

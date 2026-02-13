@@ -451,6 +451,11 @@ export function createRequestHandler() {
         const jobId = jobCompleteMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = jobQueue.complete(jobId, body);
+        if (result.ok) {
+          const durationText =
+            typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
+          console.log(`[Server] Job ${jobId} completed (${durationText})`);
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
 
@@ -463,6 +468,11 @@ export function createRequestHandler() {
         const jobId = jobFailMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = jobQueue.fail(jobId, body);
+        if (result.ok) {
+          const durationText =
+            typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
+          console.log(`[Server] Job ${jobId} failed (${durationText})`);
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
 

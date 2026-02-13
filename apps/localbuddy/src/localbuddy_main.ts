@@ -20,6 +20,10 @@ import {
   type JobApiRow,
   type RequestApiRow,
 } from "./request_status.js";
+import {
+  answerLocalReadonlyQuery,
+  isLocalReadonlyQueryPrompt,
+} from "./local_readonly.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -251,6 +255,10 @@ function isLikelyLocalOnlyPrompt(input: string): boolean {
   const text = String(input ?? "").trim().toLowerCase();
   if (!text) return true;
 
+  if (isLocalReadonlyQueryPrompt(text)) {
+    return true;
+  }
+
   if (
     /^(hi|hello|hey|yo|sup|thanks|thank you|thx|ok|okay|cool|nice|good morning|good afternoon|good evening)[!. ]*$/.test(
       text,
@@ -305,6 +313,13 @@ class LocalBuddyServer {
 
     const statusReply = await this.answerRequestStatus(normalized);
     if (statusReply) return statusReply;
+
+    const readonlyReply = await answerLocalReadonlyQuery(normalized, {
+      repoRoot: this.repo,
+      serverUrl: this.server,
+      authHeaders: this.authHeaders(),
+    });
+    if (readonlyReply) return readonlyReply;
 
     try {
       const output = await this.llm.generate({

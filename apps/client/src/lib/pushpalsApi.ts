@@ -351,6 +351,9 @@ export interface JobSnapshotRow {
   targetWorkerId: string | null;
   result: string | null;
   error: string | null;
+  claimedAt?: string | null;
+  completedAt?: string | null;
+  durationMs?: number | null;
   createdAt: string;
   updatedAt: string;
 }

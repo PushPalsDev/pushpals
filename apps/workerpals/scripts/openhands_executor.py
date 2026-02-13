@@ -763,7 +763,7 @@ def _large_instruction_threshold() -> int:
 
 def _execution_timeout_ms() -> int:
     raw = (os.environ.get("WORKERPALS_OPENHANDS_TIMEOUT_MS") or "").strip()
-    default_ms = 600000
+    default_ms = 1800000
     if not raw:
         return default_ms
     try:
