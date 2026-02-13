@@ -5,8 +5,10 @@
  * Usage:
  *   bun run localbuddy --server http://localhost:3001 [--port 3003] [--sessionId <id>]
  *
- * Accepts messages from clients via HTTP, enhances them with LLM + repo context,
- * and enqueues to the server's Request Queue for RemoteBuddy processing.
+ * Accepts messages from clients via HTTP.
+ * - Lightweight chat can be answered directly by LocalBuddy.
+ * - Requests can be explicitly routed to RemoteBuddy via `/ask_remote_buddy ...`.
+ * - Routed requests are enhanced with LLM + repo context, then enqueued.
  */
 
 import { randomUUID } from "crypto";
@@ -94,6 +96,69 @@ function summarizeFailureForPrompt(value: unknown): string {
   return `${compact.slice(0, 217)}...`;
 }
 
+const ASK_REMOTE_BUDDY_COMMAND = "/ask_remote_buddy";
+
+const LOCAL_QUICK_REPLY_SYSTEM_PROMPT = `
+You are PushPals LocalBuddy.
+
+Respond directly and briefly for lightweight chat and coordination questions.
+If the user asks for coding/execution work, remind them to use:
+/ask_remote_buddy <request>
+
+Keep replies concise and helpful.
+`.trim();
+
+function parseRemoteBuddyCommand(input: string): {
+  forceRemote: boolean;
+  prompt: string;
+  usageMessage?: string;
+} {
+  const trimmed = String(input ?? "").trim();
+  const command = ASK_REMOTE_BUDDY_COMMAND.toLowerCase();
+  if (!trimmed.toLowerCase().startsWith(command)) {
+    return { forceRemote: false, prompt: trimmed };
+  }
+
+  const rest = trimmed
+    .slice(command.length)
+    .replace(/^[:\-]\s*/, "")
+    .trim();
+  if (!rest) {
+    return {
+      forceRemote: true,
+      prompt: "",
+      usageMessage:
+        "Usage: /ask_remote_buddy <request>. Example: /ask_remote_buddy fix the failing job status in the dashboard.",
+    };
+  }
+  return { forceRemote: true, prompt: rest };
+}
+
+function isLikelyLocalOnlyPrompt(input: string): boolean {
+  const text = String(input ?? "").trim().toLowerCase();
+  if (!text) return true;
+
+  if (
+    /^(hi|hello|hey|yo|sup|thanks|thank you|thx|ok|okay|cool|nice|good morning|good afternoon|good evening)[!. ]*$/.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+
+  if (/^(how are you|what can you do|who are you|are you there|status\??)\b/.test(text)) {
+    return true;
+  }
+
+  const executionCue =
+    /\b(fix|implement|write|create|add|remove|delete|rename|refactor|run|test|lint|build|debug|search|find|edit|update|change)\b/.test(
+      text,
+    );
+  if (executionCue) return false;
+
+  return text.length <= 120;
+}
+
 // ─── LocalBuddy HTTP Server ─────────────────────────────────────────────────
 
 class LocalBuddyServer {
@@ -166,6 +231,31 @@ class LocalBuddyServer {
     }
   }
 
+  private async answerLocally(userPrompt: string): Promise<string> {
+    const normalized = String(userPrompt ?? "").trim();
+    if (!normalized) {
+      return "I didn't receive a request. Try a quick question, or use /ask_remote_buddy <request> to route work to RemoteBuddy.";
+    }
+
+    try {
+      const output = await this.llm.generate({
+        system: LOCAL_QUICK_REPLY_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: normalized }],
+        maxTokens: 300,
+        temperature: 0.2,
+      });
+      const text = output.text.trim();
+      if (text) return text;
+    } catch (err) {
+      console.error("[LocalBuddy] Local reply generation failed:", err);
+    }
+
+    if (/^(hi|hello|hey)\b/i.test(normalized)) {
+      return "Hello. I can answer lightweight questions directly, or route execution work with /ask_remote_buddy <request>.";
+    }
+    return "I can answer lightweight questions directly. For execution or coding work, use /ask_remote_buddy <request>.";
+  }
+
   /**
    * Start the HTTP server
    */
@@ -177,6 +267,7 @@ class LocalBuddyServer {
     const serverUrl = this.server;
     const authToken = this.authToken;
     const enhancePrompt = this.enhancePrompt.bind(this);
+    const answerLocally = this.answerLocally.bind(this);
     const comm = new CommunicationManager({
       serverUrl,
       sessionId,
@@ -219,10 +310,6 @@ class LocalBuddyServer {
       if (!statusOk) {
         statusSessionReady = false;
         console.warn("[LocalBuddy] Failed to emit startup status event");
-      }
-      const msgOk = await comm.assistantMessage("LocalBuddy online and ready.");
-      if (!msgOk) {
-        console.warn("[LocalBuddy] Failed to emit startup welcome message");
       }
     };
     void emitStartupPresence();
@@ -316,22 +403,33 @@ class LocalBuddyServer {
         if (pathname === "/message" && method === "POST") {
           try {
             const body = (await req.json()) as { text: string };
-            const originalPrompt = body.text;
+            const rawPrompt = String(body.text ?? "");
+            const routing = parseRemoteBuddyCommand(rawPrompt);
+            const routedPrompt = routing.prompt;
+            const forceRemote = routing.forceRemote;
+            const localOnly = !forceRemote && isLikelyLocalOnlyPrompt(routedPrompt);
 
-            if (!originalPrompt) {
+            if (!rawPrompt.trim()) {
               return makeJson({ ok: false, message: "text is required" }, 400);
             }
 
             console.log(
-              `[LocalBuddy] Received message: ${originalPrompt.substring(0, 80)}${originalPrompt.length > 80 ? "..." : ""}`,
+              `[LocalBuddy] Received message: ${rawPrompt.substring(0, 80)}${rawPrompt.length > 80 ? "..." : ""}`,
             );
+            if (forceRemote) {
+              console.log("[LocalBuddy] Routing mode: forced RemoteBuddy via /ask_remote_buddy");
+            } else if (localOnly) {
+              console.log("[LocalBuddy] Routing mode: local-only reply");
+            } else {
+              console.log("[LocalBuddy] Routing mode: queue for RemoteBuddy");
+            }
 
             // ── Step 0: Emit user message to server session so it appears in UI ──
             const cmdHeaders: Record<string, string> = { "Content-Type": "application/json" };
             if (authToken) cmdHeaders["Authorization"] = `Bearer ${authToken}`;
 
             void comm
-              .userMessage(originalPrompt)
+              .userMessage(rawPrompt)
               .then((ok) => {
                 if (!ok) {
                   console.error(`[LocalBuddy] Failed to emit user message to session`);
@@ -342,7 +440,13 @@ class LocalBuddyServer {
               );
 
             void comm
-              .assistantMessage("Received your request. Preparing context and queueing it now.")
+              .assistantMessage(
+                forceRemote
+                  ? "Received your request. Routing this to RemoteBuddy now."
+                  : localOnly
+                    ? "Received your request. I can answer this directly as LocalBuddy."
+                    : "Received your request. Preparing context and queueing it now.",
+              )
               .then((ok) => {
                 if (!ok) {
                   console.error(`[LocalBuddy] Failed to emit immediate acknowledgement message`);
@@ -378,6 +482,31 @@ class LocalBuddyServer {
                 };
 
                 try {
+                  if (routing.usageMessage) {
+                    send({ type: "status", message: "Command missing request body." });
+                    await comm.assistantMessage(routing.usageMessage);
+                    send({
+                      type: "complete",
+                      message: "Handled locally",
+                      data: { mode: "local_usage_hint", sessionId },
+                    });
+                    close();
+                    return;
+                  }
+
+                  if (localOnly) {
+                    send({ type: "status", message: "Generating LocalBuddy response..." });
+                    const localReply = await answerLocally(routedPrompt);
+                    await comm.assistantMessage(localReply);
+                    send({
+                      type: "complete",
+                      message: "Responded locally",
+                      data: { mode: "local", sessionId },
+                    });
+                    close();
+                    return;
+                  }
+
                   // Step 1: Report repo detection
                   send({ type: "status", message: `Detected repo: ${repo}` });
 
@@ -392,7 +521,7 @@ class LocalBuddyServer {
 
                   // Step 3: Enhance prompt with LLM
                   send({ type: "status", message: "Enhancing prompt with LLM..." });
-                  const enhancedPrompt = await enhancePrompt(originalPrompt, context);
+                  const enhancedPrompt = await enhancePrompt(routedPrompt, context);
                   send({
                     type: "status",
                     message: `Enhanced prompt (${enhancedPrompt.length} chars)`,
@@ -406,7 +535,7 @@ class LocalBuddyServer {
                     headers: cmdHeaders,
                     body: JSON.stringify({
                       sessionId,
-                      originalPrompt,
+                      originalPrompt: routedPrompt,
                       enhancedPrompt,
                     }),
                   });
@@ -473,7 +602,8 @@ class LocalBuddyServer {
             name: "PushPals LocalBuddy",
             version: "0.1.0",
             endpoints: {
-              "POST /message": "Send a message to be processed",
+              "POST /message":
+                "Send a message to LocalBuddy (use /ask_remote_buddy <request> to force remote routing)",
               "GET /healthz": "Health check",
             },
           });

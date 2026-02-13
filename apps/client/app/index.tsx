@@ -442,6 +442,33 @@ function CollapsibleMessage({ text, theme }: { text: string; theme: DashboardThe
   );
 }
 
+function TypingDots({ theme }: { theme: DashboardTheme }) {
+  const [activeCount, setActiveCount] = useState(1);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setActiveCount((prev) => ((prev % 3) + 1) as 1 | 2 | 3);
+    }, 360);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <View style={styles.typingDotsRow}>
+      {[1, 2, 3].map((dot) => (
+        <View
+          key={dot}
+          style={[
+            styles.typingDot,
+            {
+              backgroundColor: dot <= activeCount ? theme.accent : `${theme.textMuted}55`,
+            },
+          ]}
+        />
+      ))}
+    </View>
+  );
+}
+
 function ChatPane({
   theme,
   messages,
@@ -449,6 +476,7 @@ function ChatPane({
   setInput,
   onSend,
   connected,
+  localBuddyThinking,
 }: {
   theme: DashboardTheme;
   messages: { id: string; from?: string; text: string; ts: string }[];
@@ -456,6 +484,7 @@ function ChatPane({
   setInput: (value: string) => void;
   onSend: () => void;
   connected: boolean;
+  localBuddyThinking: boolean;
 }) {
   const scrollRef = useRef<ScrollView | null>(null);
   const handleComposerKeyPress = useCallback(
@@ -477,7 +506,7 @@ function ChatPane({
 
   useEffect(() => {
     scrollRef.current?.scrollToEnd({ animated: true });
-  }, [messages.length]);
+  }, [messages.length, localBuddyThinking]);
 
   return (
     <View style={styles.tabFill}>
@@ -533,6 +562,26 @@ function ChatPane({
             );
           })
         )}
+        {localBuddyThinking ? (
+          <View
+            style={[
+              styles.chatBubble,
+              styles.chatBubbleAgent,
+              {
+                backgroundColor: theme.bubbleAgent,
+                borderColor: theme.bubbleAgentBorder,
+              },
+            ]}
+          >
+            <Text style={[styles.chatFrom, { color: theme.accent, fontFamily: theme.fontSans }]}>Local Buddy</Text>
+            <View style={styles.typingLine}>
+              <Text style={[styles.typingLabel, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                Thinking
+              </Text>
+              <TypingDots theme={theme} />
+            </View>
+          </View>
+        ) : null}
       </ScrollView>
 
       <View style={[styles.composer, { borderColor: theme.border, backgroundColor: theme.panel }]}>
@@ -1009,6 +1058,7 @@ export default function DashboardScreen() {
 
   const [activeTab, setActiveTab] = useState<UiTab>("chat");
   const [input, setInput] = useState("");
+  const [pendingLocalResponses, setPendingLocalResponses] = useState(0);
   const [workers, setWorkers] = useState<WorkerStatusRow[]>([]);
   const [requests, setRequests] = useState<RequestSnapshotRow[]>([]);
   const [requestCounts, setRequestCounts] = useState<QueueCounts>({});
@@ -1079,7 +1129,12 @@ export default function DashboardScreen() {
     const text = input.trim();
     if (!text) return;
     setInput("");
-    await session.send(text);
+    setPendingLocalResponses((count) => count + 1);
+    try {
+      await session.send(text);
+    } finally {
+      setPendingLocalResponses((count) => Math.max(0, count - 1));
+    }
   }, [input, session]);
 
   const tabs = useMemo(
@@ -1187,6 +1242,7 @@ export default function DashboardScreen() {
               setInput={setInput}
               onSend={sendMessage}
               connected={session.isConnected}
+              localBuddyThinking={pendingLocalResponses > 0}
             />
           ) : null}
           {activeTab === "requests" ? <RequestsPane theme={theme} rows={requests} counts={requestCounts} /> : null}
@@ -1382,6 +1438,26 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700",
     marginTop: 6,
+  },
+  typingLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 2,
+  },
+  typingLabel: {
+    fontSize: 14,
+    lineHeight: 20,
+    marginRight: 8,
+  },
+  typingDotsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  typingDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 999,
+    marginRight: 5,
   },
 
   composer: {
