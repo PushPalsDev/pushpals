@@ -373,6 +373,92 @@ def _providerless_model_name(model: str) -> str:
     return normalized
 
 
+def _is_embedding_model(model: str) -> bool:
+    lowered = _providerless_model_name(model).lower()
+    return (
+        "embedding" in lowered
+        or lowered.startswith("embed-")
+        or "/embed" in lowered
+        or "nomic-embed" in lowered
+    )
+
+
+def _chat_completion_url(base_url: str, provider: str) -> str:
+    normalized = base_url.rstrip("/")
+    if provider == "ollama":
+        if normalized.endswith("/api/chat"):
+            return normalized
+        return f"{normalized}/api/chat"
+
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    if normalized.endswith("/v1"):
+        return f"{normalized}/chat/completions"
+    return f"{normalized}/v1/chat/completions"
+
+
+def _llm_model_chat_preflight(
+    base_url: str,
+    provider: str,
+    api_key: str,
+    model: str,
+    timeout: float = 10.0,
+) -> Tuple[bool, str]:
+    if not base_url:
+        return True, "base URL unset"
+
+    url = _chat_completion_url(base_url, provider)
+    payload_model = _providerless_model_name(model)
+    if provider == "ollama":
+        body = {
+            "model": payload_model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+            "options": {"temperature": 0.0, "num_predict": 1},
+        }
+    else:
+        body = {
+            "model": payload_model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "temperature": 0.0,
+            "max_tokens": 1,
+        }
+
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key and provider == "openai":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            status = int(getattr(res, "status", 0))
+            if 200 <= status < 300:
+                return True, f"{url} -> {status}"
+            return False, f"{url} -> HTTP {status}"
+    except urllib.error.HTTPError as exc:
+        try:
+            body_text = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body_text = ""
+        detail = f"{url} -> HTTP {exc.code}{f' ({body_text[:180].strip()})' if body_text else ''}"
+        if _is_model_load_failure(body_text):
+            return False, detail
+        lowered = body_text.lower()
+        if "model" in lowered and "not found" in lowered:
+            return False, detail
+        if exc.code in {401, 403}:
+            # Endpoint/model path is reachable; auth policy is separate.
+            return True, detail
+        return False, detail
+    except Exception as exc:
+        return False, f"{url}: {exc}"
+
+
 def _model_candidates_url(base_url: str, provider: str) -> List[str]:
     normalized = base_url.rstrip("/")
     if not normalized:
@@ -489,11 +575,15 @@ def _fallback_models_after_load_failure(
 
     for model in available_models:
         normalized = _normalize_litellm_model(model, provider)
-        if normalized and normalized != failed_norm:
+        if normalized and normalized != failed_norm and not _is_embedding_model(normalized):
             candidates.append(normalized)
 
     default_fallback = _normalize_litellm_model(DEFAULT_OPENHANDS_MODEL, provider)
-    if default_fallback and default_fallback != failed_norm:
+    if (
+        default_fallback
+        and default_fallback != failed_norm
+        and not _is_embedding_model(default_fallback)
+    ):
         candidates.append(default_fallback)
 
     return list(dict.fromkeys(candidates)), probe_detail
@@ -823,12 +913,65 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
     models_to_try: List[str] = [model]
     attempted_models: List[str] = []
     last_error_text = ""
+    model_probe_timeout_sec = max(
+        3.0, _to_float(os.environ.get("WORKERPALS_OPENHANDS_MODEL_PROBE_TIMEOUT_SEC"), 10.0)
+    )
 
     while models_to_try:
         active_model = models_to_try.pop(0)
         if active_model in attempted_models:
             continue
         attempted_models.append(active_model)
+
+        if _is_embedding_model(active_model):
+            sys.stderr.write(
+                f"[OpenHandsExecutor] Skipping non-chat embedding model candidate: {active_model}\n"
+            )
+            sys.stderr.flush()
+            continue
+
+        preflight_ok, preflight_detail = _llm_model_chat_preflight(
+            base_url, provider, api_key, active_model, model_probe_timeout_sec
+        )
+        if not preflight_ok:
+            lowered_preflight = preflight_detail.lower()
+            if _is_model_load_failure(preflight_detail) or (
+                "model" in lowered_preflight and "not found" in lowered_preflight
+            ):
+                fallback_models, probe_detail = _fallback_models_after_load_failure(
+                    base_url, provider, api_key, active_model
+                )
+                pending = set(models_to_try)
+                new_candidates = [
+                    m for m in fallback_models if m not in attempted_models and m not in pending
+                ]
+                if new_candidates:
+                    sys.stderr.write(
+                        "[OpenHandsExecutor] Model preflight failed for "
+                        f"{active_model}; retrying with fallback model(s): "
+                        f"{', '.join(new_candidates)}\n"
+                    )
+                    sys.stderr.flush()
+                    models_to_try.extend(new_candidates)
+                    continue
+                return {
+                    "ok": False,
+                    "summary": "OpenHands model preflight failed and no fallback model succeeded",
+                    "stderr": (
+                        f"{preflight_detail}\n"
+                        f"Attempted models: {', '.join(attempted_models)}\n"
+                        f"Model probe detail: {probe_detail}"
+                    ),
+                    "exitCode": 2,
+                }
+
+            # Transient preflight failure: skip this model and continue if alternatives exist.
+            sys.stderr.write(
+                "[OpenHandsExecutor] Model preflight failed; skipping candidate "
+                f"{active_model}: {preflight_detail}\n"
+            )
+            sys.stderr.flush()
+            continue
 
         llm_kwargs = dict(llm_kwargs_base)
         llm_kwargs["model"] = active_model

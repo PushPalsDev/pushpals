@@ -110,6 +110,11 @@ function configuredBackend(endpoint: string): LlmBackend {
   return endpoint.includes("/api/chat") ? "ollama" : "lmstudio";
 }
 
+function configuredModelName(): string {
+  const configured = (process.env.LLM_MODEL ?? "").trim();
+  return configured || DEFAULT_MODEL;
+}
+
 function normalizeLmStudioEndpoint(endpoint: string): string {
   const source = (endpoint.trim() || DEFAULT_LMSTUDIO_ENDPOINT).replace(/\/+$/, "");
   if (source.includes("/chat/completions")) return source;
@@ -391,6 +396,8 @@ export class LmStudioClient implements LLMClient {
           `[LLM] Could not verify configured model "${configuredModel}" via model list (${discovered.detail}); continuing with configured model.`,
         );
       }
+
+      console.log(`[LLM] LM Studio resolved model "${selected.model}" (${selected.source}).`);
 
       return selected.model;
     })();
@@ -720,12 +727,17 @@ export class OllamaClient implements LLMClient {
 export function createLLMClient(): LLMClient {
   const endpoint = process.env.LLM_ENDPOINT ?? "";
   const backend = configuredBackend(endpoint);
+  const model = configuredModelName();
 
   if (backend === "ollama") {
-    console.log("[LLM] Using Ollama backend");
+    console.log(
+      `[LLM] Using Ollama backend (model: ${model}, endpoint: ${normalizeOllamaEndpoint(endpoint)})`,
+    );
     return new OllamaClient();
   }
 
-  console.log("[LLM] Using LM Studio backend");
+  console.log(
+    `[LLM] Using LM Studio backend (model: ${model}, endpoint: ${normalizeLmStudioEndpoint(endpoint)})`,
+  );
   return new LmStudioClient();
 }

@@ -179,6 +179,7 @@ function statusColor(theme: DashboardTheme, status: string): string {
   if (normalized.includes("fail") || normalized.includes("error") || normalized.includes("offline")) {
     return theme.danger;
   }
+  if (normalized.includes("initializing")) return theme.warning;
   if (normalized.includes("busy") || normalized.includes("claim")) return theme.warning;
   if (normalized.includes("progress") || normalized.includes("start")) return theme.warning;
   return theme.accent;
@@ -835,6 +836,20 @@ function SystemPane({
   };
   lastRefresh: string | null;
 }) {
+  const INITIALIZING_GRACE_MS = 90_000;
+  const connectedSinceRef = useRef<number | null>(null);
+  if (connected) {
+    if (connectedSinceRef.current == null) {
+      connectedSinceRef.current = Date.now();
+    }
+  } else {
+    connectedSinceRef.current = null;
+  }
+  const withinInitializingGrace =
+    connected &&
+    connectedSinceRef.current != null &&
+    Date.now() - connectedSinceRef.current < INITIALIZING_GRACE_MS;
+
   const envelopes = useMemo(() => events.filter(isEnvelope) as EventEnvelope[], [events]);
 
   const latestEventByComponent = useMemo(() => {
@@ -888,18 +903,30 @@ function SystemPane({
     },
     {
       name: "LocalBuddy",
-      status: latestEventByComponent.LocalBuddy ? "active" : "unknown",
+      status: latestEventByComponent.LocalBuddy
+        ? "active"
+        : withinInitializingGrace
+          ? "initializing"
+          : "unknown",
       detail: latestEventByComponent.LocalBuddy
         ? `last event ${relativeMs(latestEventByComponent.LocalBuddy)}`
-        : "no events yet",
+        : withinInitializingGrace
+          ? "waiting for first status event"
+          : "no events yet",
       ts: latestEventByComponent.LocalBuddy,
     },
     {
       name: "RemoteBuddy",
-      status: latestEventByComponent.RemoteBuddy ? "active" : "unknown",
+      status: latestEventByComponent.RemoteBuddy
+        ? "active"
+        : withinInitializingGrace
+          ? "initializing"
+          : "unknown",
       detail: latestEventByComponent.RemoteBuddy
         ? `last event ${relativeMs(latestEventByComponent.RemoteBuddy)}`
-        : "no events yet",
+        : withinInitializingGrace
+          ? "waiting for first status event"
+          : "no events yet",
       ts: latestEventByComponent.RemoteBuddy,
     },
     {
@@ -910,10 +937,16 @@ function SystemPane({
     },
     {
       name: "SourceControlManager",
-      status: latestEventByComponent.SourceControlManager ? "active" : "unknown",
+      status: latestEventByComponent.SourceControlManager
+        ? "active"
+        : withinInitializingGrace
+          ? "initializing"
+          : "unknown",
       detail: latestEventByComponent.SourceControlManager
         ? `last event ${relativeMs(latestEventByComponent.SourceControlManager)}`
-        : "no events yet",
+        : withinInitializingGrace
+          ? "waiting for first status event"
+          : "no events yet",
       ts: latestEventByComponent.SourceControlManager,
     },
   ];

@@ -31,9 +31,39 @@ type WorkerJobResult = JobResult & {
 };
 
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
+const DEFAULT_OPENHANDS_MODEL = "local-model";
 
 function envTruthy(name: string): boolean {
   return TRUTHY.has((process.env[name] ?? "").toLowerCase());
+}
+
+function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl: string } {
+  const model = (
+    process.env.WORKERPALS_OPENHANDS_MODEL ??
+    process.env.LLM_MODEL ??
+    DEFAULT_OPENHANDS_MODEL
+  )
+    .trim()
+    .replace(/\s+/g, " ");
+  const provider = (
+    process.env.WORKERPALS_OPENHANDS_PROVIDER ??
+    process.env.PUSHPALS_LLM_BACKEND ??
+    "auto"
+  )
+    .trim()
+    .toLowerCase();
+  const baseUrl = (
+    process.env.WORKERPALS_OPENHANDS_BASE_URL ??
+    process.env.LLM_BASE_URL ??
+    process.env.LLM_ENDPOINT ??
+    ""
+  ).trim();
+
+  return {
+    model: model || DEFAULT_OPENHANDS_MODEL,
+    provider: provider || "auto",
+    baseUrl,
+  };
 }
 
 function integrationBranchName(): string {
@@ -601,10 +631,14 @@ async function workerLoop(
 
 async function main(): Promise<void> {
   const opts = parseArgs();
+  const llmConfig = workerOpenHandsLlmConfig();
 
   console.log(`[WorkerPals] PushPals WorkerPals Daemon (${opts.workerId})`);
   console.log(`[WorkerPals] Server: ${opts.server}`);
   console.log(`[WorkerPals] Repo: ${opts.repo}`);
+  console.log(
+    `[WorkerPals] OpenHands LLM: model=${llmConfig.model} provider=${llmConfig.provider} baseUrl=${llmConfig.baseUrl || "(unset)"}`,
+  );
   opts.worktreeBaseRef = await resolveWorktreeBaseRef(opts.repo, opts.worktreeBaseRef);
   console.log(`[WorkerPals] Worktree base ref: ${opts.worktreeBaseRef}`);
 

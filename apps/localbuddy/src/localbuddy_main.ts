@@ -105,8 +105,79 @@ Respond directly and briefly for lightweight chat and coordination questions.
 If the user asks for coding/execution work, remind them to use:
 /ask_remote_buddy <request>
 
-Keep replies concise and helpful.
+Return ONLY the final user-facing reply. Never reveal internal reasoning, analysis steps, or chain-of-thought.
+Do not include numbered analysis, "identify constraints", "self-correction", or planning text.
+Keep replies concise and helpful (max 2 short sentences).
+If unclear, ask one brief clarifying question.
 `.trim();
+
+function tryParseJsonObject(raw: string): Record<string, unknown> | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // fall through
+  }
+
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try {
+      const parsed = JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // ignore parse failure
+    }
+  }
+  return null;
+}
+
+function fallbackLocalReply(userPrompt: string): string {
+  const text = userPrompt.trim().toLowerCase();
+  if (/^(hi|hello|hey)\b/.test(text)) {
+    return "Hello. I can answer lightweight questions directly, or route execution work with /ask_remote_buddy <request>.";
+  }
+  if (/status|what'?s the status|whats the status/.test(text)) {
+    return "I’m online and ready. For full job/repo status, use /ask_remote_buddy <request>.";
+  }
+  return "I can answer lightweight questions directly. For execution or coding work, use /ask_remote_buddy <request>.";
+}
+
+function sanitizeLocalReply(raw: string, userPrompt: string): string {
+  let text = String(raw ?? "")
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+  if (!text) return fallbackLocalReply(userPrompt);
+
+  const lowered = text.toLowerCase();
+  const reasoningSignals = [
+    "analyze the user's request",
+    "identify the constraints",
+    "self-correction",
+    "step-by-step",
+    "my reasoning",
+    "chain-of-thought",
+  ];
+  if (reasoningSignals.some((signal) => lowered.includes(signal))) {
+    return fallbackLocalReply(userPrompt);
+  }
+
+  // Keep only the first short paragraph/sentence if model rambles.
+  const firstParagraph = text.split(/\n\s*\n/)[0]?.trim() ?? text;
+  text = firstParagraph.length > 320 ? `${firstParagraph.slice(0, 317)}...` : firstParagraph;
+
+  if (/^\d+\.\s+\*\*/.test(text) || /^analysis[:\s]/i.test(text)) {
+    return fallbackLocalReply(userPrompt);
+  }
+  return text || fallbackLocalReply(userPrompt);
+}
 
 function parseRemoteBuddyCommand(input: string): {
   forceRemote: boolean;
@@ -239,21 +310,29 @@ class LocalBuddyServer {
 
     try {
       const output = await this.llm.generate({
-        system: LOCAL_QUICK_REPLY_SYSTEM_PROMPT,
-        messages: [{ role: "user", content: normalized }],
+        system: `${LOCAL_QUICK_REPLY_SYSTEM_PROMPT}
+
+Respond in strict JSON with this shape:
+{"reply":"<final user-facing response>"}`,
+        messages: [
+          {
+            role: "user",
+            content: `User message: ${normalized}\nReturn JSON only.`,
+          },
+        ],
+        json: true,
         maxTokens: 300,
         temperature: 0.2,
       });
-      const text = output.text.trim();
+      const parsed = tryParseJsonObject(output.text);
+      const reply = typeof parsed?.reply === "string" ? parsed.reply : output.text;
+      const text = sanitizeLocalReply(reply, normalized);
       if (text) return text;
     } catch (err) {
       console.error("[LocalBuddy] Local reply generation failed:", err);
     }
 
-    if (/^(hi|hello|hey)\b/i.test(normalized)) {
-      return "Hello. I can answer lightweight questions directly, or route execution work with /ask_remote_buddy <request>.";
-    }
-    return "I can answer lightweight questions directly. For execution or coding work, use /ask_remote_buddy <request>.";
+    return fallbackLocalReply(normalized);
   }
 
   /**
