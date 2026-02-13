@@ -939,6 +939,7 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
     models_to_try: List[str] = [model]
     attempted_models: List[str] = []
     last_error_text = ""
+    preflight_failures: List[str] = []
     model_probe_timeout_sec = max(
         3.0, _to_float(os.environ.get("WORKERPALS_OPENHANDS_MODEL_PROBE_TIMEOUT_SEC"), 10.0)
     )
@@ -960,6 +961,8 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
             base_url, provider, api_key, active_model, model_probe_timeout_sec
         )
         if not preflight_ok:
+            preflight_failures.append(f"{active_model}: {preflight_detail}")
+            last_error_text = f"{active_model}: {preflight_detail}"
             lowered_preflight = preflight_detail.lower()
             if _is_model_load_failure(preflight_detail) or (
                 "model" in lowered_preflight and "not found" in lowered_preflight
@@ -1110,7 +1113,14 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         "summary": "OpenHands model selection exhausted with no successful execution",
         "stderr": (
             f"Attempted models: {', '.join(attempted_models) if attempted_models else '(none)'}\n"
-            f"Last error: {last_error_text}"
+            + (
+                "Preflight failures:\n"
+                + "\n".join(f"- {entry}" for entry in preflight_failures[-5:])
+                + "\n"
+                if preflight_failures
+                else ""
+            )
+            + f"Last error: {last_error_text or '(none captured)'}"
         ),
         "exitCode": 2,
     }

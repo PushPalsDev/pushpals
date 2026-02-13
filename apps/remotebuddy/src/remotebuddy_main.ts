@@ -209,6 +209,56 @@ interface WorkerSnapshot {
   isOnline: boolean;
 }
 
+interface JobLogEntry {
+  id: number;
+  jobId: string;
+  ts: string;
+  message: string;
+}
+
+function explainJobFailureFromLogs(
+  logs: JobLogEntry[],
+  fallbackMessage: string,
+  fallbackDetail: string,
+): string {
+  const lines = logs
+    .map((row) => toSingleLine(row.message, 420))
+    .filter(Boolean);
+  const joined = lines.join("\n").toLowerCase();
+
+  if (joined.includes("model preflight failed") && joined.includes("timed out")) {
+    return "The worker could not reach the local LLM endpoint from Docker in time (model preflight timeout). This is usually LM Studio not responding quickly enough at host.docker.internal:1234.";
+  }
+  if (joined.includes("model selection exhausted")) {
+    return "All candidate models failed preflight/execution, so OpenHands stopped before running the task.";
+  }
+  if (
+    joined.includes("failed to load model")
+    || joined.includes("insufficient system resources")
+    || joined.includes("model loading was stopped")
+  ) {
+    return "The selected model could not be loaded due to local resource constraints, and no fallback model succeeded.";
+  }
+  if (joined.includes("cannot truncate prompt with n_keep")) {
+    return "The prompt exceeded the LM Studio/llama.cpp context constraints (n_keep >= n_ctx), so the request was rejected before execution.";
+  }
+  if (joined.includes("context size has been exceeded")) {
+    return "The model context window was exceeded before execution could start.";
+  }
+  if (joined.includes("connection refused") || joined.includes("connection error")) {
+    return "The worker could not connect to the configured LLM endpoint from the container.";
+  }
+  if (joined.includes("timeout reached for task.execute") || joined.includes("wrapper timed out")) {
+    return "The wrapper hit its execution timeout before OpenHands returned a structured result.";
+  }
+
+  const lastLine = lines[lines.length - 1] ?? "";
+  const fallback = [fallbackMessage, fallbackDetail].filter(Boolean).join(" | ");
+  if (lastLine) return `Latest failure signal: ${lastLine}`;
+  if (fallback) return `Failure signal: ${fallback}`;
+  return "No additional diagnostic signal was found in the current log tail.";
+}
+
 class RemoteBuddyOrchestrator {
   private readonly agentId = "remotebuddy-orchestrator";
   private readonly server: string;
@@ -387,6 +437,63 @@ class RemoteBuddyOrchestrator {
     }
   }
 
+  private async fetchJobLogs(jobId: string, limit = 80): Promise<JobLogEntry[]> {
+    try {
+      const res = await fetch(
+        `${this.server}/jobs/${jobId}/logs?limit=${Math.max(1, Math.min(500, limit))}`,
+        {
+          method: "GET",
+          headers: this.authHeaders(),
+        },
+      );
+      if (!res.ok) return [];
+      const data = (await res.json()) as { ok?: boolean; logs?: JobLogEntry[] };
+      if (!data.ok || !Array.isArray(data.logs)) return [];
+      return data.logs
+        .filter((row) => row && typeof row.message === "string")
+        .slice(-80);
+    } catch {
+      return [];
+    }
+  }
+
+  private async handleObservedJobFailure(
+    envelope: {
+      id?: string;
+      correlationId?: string;
+      turnId?: string;
+    },
+    jobId: string,
+    message: string,
+    detail: string,
+  ): Promise<void> {
+    const shortJob = jobId.slice(0, 8);
+    const fetchMsg = `WorkerPal job ${shortJob} failed: ${message}${detail ? ` (${detail})` : ""} I got an error and I'm fetching logs now to diagnose what happened.`;
+    await this.comm.assistantMessage(fetchMsg, {
+      correlationId: envelope.correlationId,
+      turnId: envelope.turnId,
+      parentId: envelope.id,
+    });
+
+    console.warn(`[RemoteBuddy] Fetching failure logs for job ${jobId}...`);
+    const logs = await this.fetchJobLogs(jobId, 80);
+    const explanation = explainJobFailureFromLogs(logs, message, detail);
+
+    const tail = logs
+      .slice(-6)
+      .map((row) => toSingleLine(row.message, 220))
+      .filter(Boolean);
+    const tailText = tail.length
+      ? `\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\``
+      : "";
+
+    await this.comm.assistantMessage(`Diagnosis for job ${shortJob}: ${explanation}${tailText}`, {
+      correlationId: envelope.correlationId,
+      turnId: envelope.turnId,
+      parentId: envelope.id,
+    });
+  }
+
   startSessionEventMonitor(): void {
     this.stopSessionEvents = this.comm.subscribeSessionEvents(
       (envelope) => {
@@ -406,13 +513,7 @@ class RemoteBuddyOrchestrator {
         const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
         this.pushContext(failureLine);
         console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
-
-        const summary = `WorkerPal job ${jobId.slice(0, 8)} failed: ${message}${detail ? ` (${detail})` : ""}`;
-        void this.comm.assistantMessage(summary, {
-          correlationId: envelope.correlationId,
-          turnId: envelope.turnId,
-          parentId: envelope.id,
-        });
+        void this.handleObservedJobFailure(envelope, jobId, message, detail);
       },
       {
         onError: (message) => console.warn(`[RemoteBuddy] Session monitor: ${message}`),
