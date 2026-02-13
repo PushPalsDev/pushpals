@@ -325,6 +325,14 @@ function parsePositiveInt(value: string | null | undefined): number | null {
   return parsed;
 }
 
+function firstNonEmpty(...values: Array<string | null | undefined>): string {
+  for (const value of values) {
+    const trimmed = (value ?? "").trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
 function normalizeCompletionEndpoint(raw: string, fallback: string): string {
   const source = (raw.trim() || fallback).replace(/\/+$/, "");
   if (source.includes("/chat/completions")) return source;
@@ -345,6 +353,8 @@ function normalizeLlmBackend(value: string | null | undefined): SupportedLlmBack
   const normalized = (value ?? "").trim().toLowerCase();
   if (normalized === "lmstudio") return "lmstudio";
   if (normalized === "ollama") return "ollama";
+  if (normalized === "openai" || normalized === "openai_compatible") return "lmstudio";
+  if (normalized === "ollama_chat") return "ollama";
   return null;
 }
 
@@ -451,13 +461,54 @@ async function checkTargetReachable(target: {
 function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: string[] }> {
   const out: Array<{ name: string; endpoint: string; probes: string[] }> = [];
   const seenEndpoints = new Set<string>();
-  const configuredPrimaryRaw = (process.env.LLM_ENDPOINT ?? "").trim();
-  const primaryBackend = configuredLlmBackend(configuredPrimaryRaw || DEFAULT_LLM_ENDPOINT);
-  const primaryFallback =
-    primaryBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LLM_ENDPOINT;
-  const configuredPlannerRaw = (process.env.PLANNER_ENDPOINT ?? "").trim();
-  const plannerFallback =
-    primaryBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_PLANNER_ENDPOINT;
+  const configuredRemoteRaw = firstNonEmpty(
+    process.env.REMOTEBUDDY_LLM_ENDPOINT,
+    process.env.REMOTEBUDDY_ENDPOINT,
+    process.env.LLM_ENDPOINT,
+  );
+  const configuredLocalRaw = firstNonEmpty(
+    process.env.LOCALBUDDY_LLM_ENDPOINT,
+    process.env.LOCALBUDDY_ENDPOINT,
+    process.env.PLANNER_ENDPOINT,
+    process.env.LLM_ENDPOINT,
+  );
+  const configuredWorkerRaw = firstNonEmpty(
+    process.env.WORKERPALS_LLM_ENDPOINT,
+    process.env.WORKERPALS_ENDPOINT,
+    process.env.WORKERPALS_OPENHANDS_BASE_URL,
+    process.env.LLM_BASE_URL,
+    process.env.LLM_ENDPOINT,
+  );
+
+  const remoteBackend =
+    normalizeLlmBackend(
+      firstNonEmpty(
+        process.env.REMOTEBUDDY_LLM_BACKEND,
+        process.env.REMOTEBUDDY_BACKEND,
+        process.env.PUSHPALS_LLM_BACKEND,
+      ),
+    ) ?? configuredLlmBackend(configuredRemoteRaw || DEFAULT_LLM_ENDPOINT);
+  const localBackend =
+    normalizeLlmBackend(
+      firstNonEmpty(
+        process.env.LOCALBUDDY_LLM_BACKEND,
+        process.env.LOCALBUDDY_BACKEND,
+        process.env.PUSHPALS_LLM_BACKEND,
+      ),
+    ) ?? configuredLlmBackend(configuredLocalRaw || DEFAULT_PLANNER_ENDPOINT);
+  const workerBackend =
+    normalizeLlmBackend(
+      firstNonEmpty(
+        process.env.WORKERPALS_LLM_BACKEND,
+        process.env.WORKERPALS_OPENHANDS_PROVIDER,
+        process.env.PUSHPALS_LLM_BACKEND,
+      ),
+    ) ?? configuredLlmBackend(configuredWorkerRaw || DEFAULT_LLM_ENDPOINT);
+
+  const remoteFallback = remoteBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LLM_ENDPOINT;
+  const localFallback =
+    localBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_PLANNER_ENDPOINT;
+  const workerFallback = workerBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LLM_ENDPOINT;
 
   const addTarget = (name: string, endpoint: string) => {
     const normalized = endpoint.trim();
@@ -482,14 +533,9 @@ function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: 
     out.push({ name, endpoint: normalized, probes: Array.from(new Set(probes)) });
   };
 
-  addTarget(
-    "RemoteBuddy LLM",
-    normalizeEndpointForBackend(configuredPrimaryRaw, primaryFallback, primaryBackend),
-  );
-  addTarget(
-    "LocalBuddy Planner",
-    normalizeEndpointForBackend(configuredPlannerRaw, plannerFallback, primaryBackend),
-  );
+  addTarget("RemoteBuddy LLM", normalizeEndpointForBackend(configuredRemoteRaw, remoteFallback, remoteBackend));
+  addTarget("LocalBuddy LLM", normalizeEndpointForBackend(configuredLocalRaw, localFallback, localBackend));
+  addTarget("WorkerPal LLM", normalizeEndpointForBackend(configuredWorkerRaw, workerFallback, workerBackend));
 
   return out;
 }

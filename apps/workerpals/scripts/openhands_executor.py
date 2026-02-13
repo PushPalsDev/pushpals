@@ -214,6 +214,7 @@ def _model_is_provider_qualified(model: str) -> bool:
 def _infer_litellm_provider(base_url: str) -> str:
     backend = (
         os.environ.get("WORKERPALS_OPENHANDS_PROVIDER")
+        or os.environ.get("WORKERPALS_LLM_BACKEND")
         or os.environ.get("PUSHPALS_LLM_BACKEND")
         or ""
     ).strip().lower()
@@ -591,18 +592,24 @@ def _fallback_models_after_load_failure(
 
 def _resolve_llm_config() -> Tuple[str, str, str]:
     raw_model = (
-        os.environ.get("WORKERPALS_OPENHANDS_MODEL")
+        os.environ.get("WORKERPALS_LLM_MODEL")
+        or os.environ.get("WORKERPALS_MODEL")
+        or os.environ.get("WORKERPALS_OPENHANDS_MODEL")
         or os.environ.get("LLM_MODEL")
         or ""
     ).strip()
     api_key = (
-        os.environ.get("WORKERPALS_OPENHANDS_API_KEY")
+        os.environ.get("WORKERPALS_LLM_API_KEY")
+        or os.environ.get("WORKERPALS_API_KEY")
+        or os.environ.get("WORKERPALS_OPENHANDS_API_KEY")
         or os.environ.get("LLM_API_KEY")
         or ""
     ).strip()
     raw_base_url = (
         (
-            os.environ.get("WORKERPALS_OPENHANDS_BASE_URL")
+            os.environ.get("WORKERPALS_LLM_ENDPOINT")
+            or os.environ.get("WORKERPALS_ENDPOINT")
+            or os.environ.get("WORKERPALS_OPENHANDS_BASE_URL")
             or os.environ.get("LLM_BASE_URL")
             or os.environ.get("LLM_ENDPOINT")
             or ""

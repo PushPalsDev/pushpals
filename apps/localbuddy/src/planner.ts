@@ -344,18 +344,40 @@ export class RemotePlanner implements PlannerModel {
       model?: string;
     } = {},
   ) {
-    const backend = (process.env.PUSHPALS_LLM_BACKEND ?? "").trim().toLowerCase();
+    const backend = (
+      process.env.LOCALBUDDY_LLM_BACKEND ??
+      process.env.LOCALBUDDY_BACKEND ??
+      process.env.PUSHPALS_LLM_BACKEND ??
+      ""
+    )
+      .trim()
+      .toLowerCase();
     const defaultEndpoint =
       backend === "ollama"
         ? "http://127.0.0.1:11434/api/chat"
         : "http://127.0.0.1:1234/v1/chat/completions";
-    const configuredEndpoint = opts.endpoint ?? process.env.PLANNER_ENDPOINT ?? defaultEndpoint;
+    const configuredEndpoint =
+      opts.endpoint ??
+      process.env.LOCALBUDDY_LLM_ENDPOINT ??
+      process.env.LOCALBUDDY_ENDPOINT ??
+      process.env.PLANNER_ENDPOINT ??
+      defaultEndpoint;
     this.endpoint =
       backend === "ollama" && !configuredEndpoint.includes("/api/chat")
         ? `${configuredEndpoint.replace(/\/+$/, "")}/api/chat`
         : configuredEndpoint;
-    this.apiKey = opts.apiKey ?? process.env.PLANNER_API_KEY ?? null;
-    this.model = opts.model ?? process.env.PLANNER_MODEL ?? "local-model";
+    this.apiKey =
+      opts.apiKey ??
+      process.env.LOCALBUDDY_LLM_API_KEY ??
+      process.env.LOCALBUDDY_API_KEY ??
+      process.env.PLANNER_API_KEY ??
+      null;
+    this.model =
+      opts.model ??
+      process.env.LOCALBUDDY_LLM_MODEL ??
+      process.env.LOCALBUDDY_MODEL ??
+      process.env.PLANNER_MODEL ??
+      "local-model";
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {

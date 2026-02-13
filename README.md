@@ -179,14 +179,16 @@ LLM defaults:
 
 - Supported backends are `lmstudio` and `ollama` (`PUSHPALS_LLM_BACKEND`)
 - Default backend is LM Studio (`PUSHPALS_LLM_BACKEND=lmstudio`)
-- LM Studio default endpoint is `LLM_ENDPOINT=http://127.0.0.1:1234`
-- Ollama endpoint should be `LLM_ENDPOINT=http://127.0.0.1:11434/api/chat`
-- Default model is `local-model` (override with `LLM_MODEL`)
-- WorkerPals OpenHands agent mode reuses `LLM_*` vars unless `WORKERPALS_OPENHANDS_*` is set
+- Shared fallback endpoint/model are `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_API_KEY`
+- Service-specific overrides:
+  - LocalBuddy: `LOCALBUDDY_LLM_ENDPOINT`, `LOCALBUDDY_LLM_MODEL`, `LOCALBUDDY_LLM_API_KEY`
+  - RemoteBuddy: `REMOTEBUDDY_LLM_ENDPOINT`, `REMOTEBUDDY_LLM_MODEL`, `REMOTEBUDDY_LLM_API_KEY`
+  - WorkerPal/OpenHands: `WORKERPALS_LLM_ENDPOINT`, `WORKERPALS_LLM_MODEL`, `WORKERPALS_LLM_API_KEY`
+- Legacy aliases are still supported (`PLANNER_*`, `WORKERPALS_OPENHANDS_*`)
 - For OpenHands/LiteLLM, WorkerPals auto-qualifies plain model names:
   - `openai/<model>` for LM Studio/OpenAI-compatible backends
   - `ollama/<model>` for Ollama backends
-  - override inference with `WORKERPALS_OPENHANDS_PROVIDER`
+  - override inference with `WORKERPALS_OPENHANDS_PROVIDER` or `WORKERPALS_LLM_BACKEND`
 - OpenHands task message shaping defaults to instruction-only to avoid 4k-context overflow:
   - `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=none` (default)
   - set `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=compact` to prepend `prompts/workerpals/openhands_task_execute_system_prompt.md`

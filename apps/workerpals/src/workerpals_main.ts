@@ -44,21 +44,31 @@ function envTruthy(name: string): boolean {
 }
 
 function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl: string } {
+  const normalizeProvider = (raw: string): string => {
+    const value = raw.trim().toLowerCase();
+    if (!value) return "auto";
+    if (value === "lmstudio") return "openai";
+    if (value === "openai_compatible") return "openai";
+    if (value === "ollama_chat") return "ollama";
+    return value;
+  };
+
   const model = (
+    process.env.WORKERPALS_LLM_MODEL ??
     process.env.WORKERPALS_OPENHANDS_MODEL ??
     process.env.LLM_MODEL ??
     DEFAULT_OPENHANDS_MODEL
   )
     .trim()
     .replace(/\s+/g, " ");
-  const provider = (
+  const provider = normalizeProvider(
     process.env.WORKERPALS_OPENHANDS_PROVIDER ??
-    process.env.PUSHPALS_LLM_BACKEND ??
-    "auto"
-  )
-    .trim()
-    .toLowerCase();
+      process.env.WORKERPALS_LLM_BACKEND ??
+      process.env.PUSHPALS_LLM_BACKEND ??
+      "auto",
+  );
   const baseUrl = (
+    process.env.WORKERPALS_LLM_ENDPOINT ??
     process.env.WORKERPALS_OPENHANDS_BASE_URL ??
     process.env.LLM_BASE_URL ??
     process.env.LLM_ENDPOINT ??

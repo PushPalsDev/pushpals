@@ -924,7 +924,7 @@ async function main() {
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
 
   // ── Initialise LLM + brain ──
-  const llm = createLLMClient();
+  const llm = createLLMClient({ service: "remotebuddy" });
   const brain = new AgentBrain(llm, { actionsEnabled: false });
 
   // ── Initialise idempotency store ──
