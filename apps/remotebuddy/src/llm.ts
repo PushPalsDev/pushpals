@@ -312,6 +312,21 @@ export class LmStudioClient implements LLMClient {
     promptTokenBudget: number,
     contextWindow: number,
   ): Promise<{ messages: Array<{ role: string; content: string }>; chunkCount: number }> {
+    const tailCount = Math.max(
+      1,
+      parsePositiveInt(
+        process.env.PUSHPALS_LMSTUDIO_BATCH_TAIL_MESSAGES,
+        DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES,
+      ),
+    );
+    const tailMessages = fullMessages.slice(-tailCount);
+    // Reserve budget for tail messages and packed-context wrapper system messages.
+    const reservedTailTokens = sumEstimatedTokens(tailMessages) + 220;
+    const adaptiveMemoryTokenBudget = Math.max(
+      256,
+      Math.min(Math.floor(promptTokenBudget * 0.6), promptTokenBudget - reservedTailTokens),
+    );
+
     const chunkTokenBudget = parsePositiveInt(
       process.env.PUSHPALS_LMSTUDIO_BATCH_CHUNK_TOKENS,
       Math.max(256, Math.floor(promptTokenBudget * 0.55)),
@@ -319,14 +334,7 @@ export class LmStudioClient implements LLMClient {
     const chunkCharBudget = chunkTokenBudget * 3;
     const memoryCharBudget = parsePositiveInt(
       process.env.PUSHPALS_LMSTUDIO_BATCH_MEMORY_CHARS,
-      Math.max(1200, Math.floor(promptTokenBudget * 3 * 0.75)),
-    );
-    const tailCount = Math.max(
-      1,
-      parsePositiveInt(
-        process.env.PUSHPALS_LMSTUDIO_BATCH_TAIL_MESSAGES,
-        DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES,
-      ),
+      Math.max(900, adaptiveMemoryTokenBudget * 3),
     );
     const packMaxTokens = Math.max(128, Math.min(1024, Math.floor(contextWindow * 0.25)));
     const serialized = serializeMessagesForBatch(fullMessages);
@@ -366,7 +374,6 @@ export class LmStudioClient implements LLMClient {
       memory = packed.text.trim() || memory;
     }
 
-    const tailMessages = fullMessages.slice(-tailCount);
     const packedMessages: Array<{ role: string; content: string }> = [
       {
         role: "system",
@@ -423,6 +430,22 @@ export class LmStudioClient implements LLMClient {
           messages = packed.messages;
           packedChunkCount = packed.chunkCount;
           promptTokensEstimate = sumEstimatedTokens(messages);
+          if (promptTokensEstimate > promptTokenBudget && messages.length > 0) {
+            const packedSystem = messages[0]?.content ?? "";
+            const packedInput = messages
+              .slice(1)
+              .map((message) => ({ role: message.role as LLMMessage["role"], content: message.content }));
+            const packedTrimmed = trimLmStudioMessagesToBudget(
+              packedSystem,
+              packedInput,
+              promptTokenBudget,
+              systemTokenBudget,
+            );
+            messages = packedTrimmed.messages;
+            promptTokensEstimate = packedTrimmed.promptTokensEstimate;
+            trimmed = trimmed || packedTrimmed.trimmed;
+            latestUserOverflow = latestUserOverflow || packedTrimmed.latestUserOverflow;
+          }
         } catch (err) {
           console.warn(`[LLM] Failed batch context packing, falling back to truncation: ${String(err)}`);
           const fallback = trimLmStudioMessagesToBudget(

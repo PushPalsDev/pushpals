@@ -143,6 +143,22 @@ const skipCleanCheckEnv = TRUTHY.has(
   (process.env.SOURCE_CONTROL_MANAGER_SKIP_CLEAN_CHECK ?? "").toLowerCase(),
 );
 const skipCleanCheck = skipCleanCheckFlag || skipCleanCheckEnv;
+const statusSessionId = (process.env.PUSHPALS_SESSION_ID ?? "dev").trim() || "dev";
+
+function parseStatusHeartbeatMs(fallbackMs: number): number {
+  const raw = (
+    process.env.SOURCE_CONTROL_MANAGER_STATUS_HEARTBEAT_MS ??
+    process.env.PUSHPALS_STATUS_HEARTBEAT_MS ??
+    ""
+  ).trim();
+  if (!raw) return fallbackMs;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return fallbackMs;
+  if (parsed <= 0) return 0;
+  return Math.max(30_000, parsed);
+}
+
+const statusHeartbeatMs = parseStatusHeartbeatMs(120_000);
 
 // ─── Bootstrap ──────────────────────────────────────────────────────────────
 
@@ -213,6 +229,7 @@ try {
 // ─── Poll loop ──────────────────────────────────────────────────────────────
 
 let running = true;
+let statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 function createSessionComm(sessionId: string): CommunicationManager {
   return new CommunicationManager({
@@ -221,6 +238,60 @@ function createSessionComm(sessionId: string): CommunicationManager {
     authToken: config.authToken,
     from: "agent:source_control_manager",
   });
+}
+
+async function ensureSessionWithRetry(
+  sessionId: string,
+  maxRetries = 10,
+  baseDelayMs = 1000,
+  maxDelayMs = 10000,
+): Promise<boolean> {
+  let attempt = 0;
+  while (running) {
+    attempt += 1;
+    try {
+      const response = await fetch(`${config.serverUrl}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+      if (response.ok) return true;
+      throw new Error(`HTTP ${response.status}`);
+    } catch (err: any) {
+      if (attempt >= maxRetries) {
+        console.warn(
+          `[${ts()}] Could not ensure session "${sessionId}" for source_control_manager status events: ${err?.message ?? err}`,
+        );
+        return false;
+      }
+      const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+      await Bun.sleep(delayMs);
+    }
+  }
+  return false;
+}
+
+async function emitStartupStatus(): Promise<void> {
+  const sessionReady = await ensureSessionWithRetry(statusSessionId);
+  if (!sessionReady) return;
+  const comm = createSessionComm(statusSessionId);
+  const ok = await comm.status(
+    "source_control_manager",
+    "idle",
+    "SourceControlManager online and monitoring completions",
+  );
+  if (!ok) {
+    console.warn(`[${ts()}] Failed to emit source_control_manager startup status event`);
+  }
+}
+
+function startStatusHeartbeat(): void {
+  if (statusHeartbeatMs <= 0 || statusHeartbeatTimer) return;
+  const comm = createSessionComm(statusSessionId);
+  statusHeartbeatTimer = setInterval(() => {
+    if (!running) return;
+    void comm.status("source_control_manager", "idle", "SourceControlManager heartbeat");
+  }, statusHeartbeatMs);
 }
 
 async function emitPusherMessage(
@@ -748,6 +819,8 @@ async function main(): Promise<void> {
   }
 
   await ensureIntegrationBranchExists();
+  await emitStartupStatus();
+  startStatusHeartbeat();
 
   // Initial tick — retry on transient errors (e.g. remote unreachable)
   for (let attempt = 1; ; attempt++) {
@@ -777,6 +850,15 @@ function shutdown(): void {
   if (!running) return;
   running = false;
   console.log(`\n[${ts()}] Shutting down...`);
+  if (statusHeartbeatTimer) {
+    clearInterval(statusHeartbeatTimer);
+    statusHeartbeatTimer = null;
+  }
+  void createSessionComm(statusSessionId).status(
+    "source_control_manager",
+    "shutting_down",
+    "SourceControlManager shutting down",
+  );
   server?.stop();
   db.close();
   lock.release();

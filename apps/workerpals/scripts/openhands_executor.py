@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,6 +32,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ "
 PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 _PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
+DEFAULT_LARGE_INSTRUCTION_CHARS = 1800
 KNOWN_LITELLM_PROVIDER_PREFIXES: Set[str] = {
     "openai",
     "azure",
@@ -483,6 +485,48 @@ def _summarize_git_changes(repo: str) -> List[str]:
         return []
 
 
+def _large_instruction_threshold() -> int:
+    raw = (os.environ.get("WORKERPALS_OPENHANDS_LARGE_INSTRUCTION_CHARS") or "").strip()
+    if not raw:
+        return DEFAULT_LARGE_INSTRUCTION_CHARS
+    try:
+        parsed = int(raw)
+    except Exception:
+        return DEFAULT_LARGE_INSTRUCTION_CHARS
+    if parsed <= 0:
+        return 0
+    return max(512, parsed)
+
+
+def _prepare_instruction_for_agent(repo: str, instruction: str) -> Tuple[str, str]:
+    threshold = _large_instruction_threshold()
+    if threshold <= 0 or len(instruction) <= threshold:
+        return instruction, ""
+
+    repo_root = Path(repo).resolve()
+    handoff_dir = repo_root / "workspace" / "workerpal_requests"
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    handoff_name = (
+        f"instruction-{int(time.time())}-{uuid.uuid4().hex[:8]}.md"
+    )
+    handoff_path = handoff_dir / handoff_name
+    handoff_path.write_text(instruction, encoding="utf-8")
+
+    try:
+        display_path = handoff_path.relative_to(repo_root).as_posix()
+    except Exception:
+        display_path = handoff_path.as_posix()
+
+    handoff_instruction = (
+        "Important: the full user instruction is too large to inline and has been "
+        f"written to `{display_path}`.\n"
+        "Before doing anything else, read that file completely and treat its contents "
+        "as the authoritative task request.\n"
+        "After reading it, execute exactly what it asks."
+    )
+    return handoff_instruction, display_path
+
+
 def _build_agent_user_message(instruction: str) -> str:
     """
     Build the message sent to OpenHands.
@@ -612,7 +656,13 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
                 sys.stderr.flush()
             agent = Agent(llm=llm, tools=tools)
         conversation = Conversation(agent=agent, workspace=repo)
-        user_message = _build_agent_user_message(instruction)
+        prepared_instruction, handoff_path = _prepare_instruction_for_agent(repo, instruction)
+        if handoff_path:
+            sys.stderr.write(
+                f"[OpenHandsExecutor] Large instruction handoff enabled ({len(instruction)} chars): {handoff_path}\n"
+            )
+            sys.stderr.flush()
+        user_message = _build_agent_user_message(prepared_instruction)
         conversation.send_message(user_message)
 
         max_steps = max(1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_AGENT_MAX_STEPS"), 30))

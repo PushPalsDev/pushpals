@@ -47,6 +47,53 @@ function parseArgs(): {
   return { server, port, sessionId, authToken };
 }
 
+function parseStatusHeartbeatMs(serviceEnvName: string, fallbackMs: number): number {
+  const raw = (
+    process.env[serviceEnvName] ??
+    process.env.PUSHPALS_STATUS_HEARTBEAT_MS ??
+    ""
+  ).trim();
+  if (!raw) return fallbackMs;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return fallbackMs;
+  if (parsed <= 0) return 0;
+  return Math.max(30_000, parsed);
+}
+
+function summarizeFailureForPrompt(value: unknown): string {
+  const text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+
+  const lowered = text.toLowerCase();
+  if (
+    lowered.includes("cannot truncate prompt with n_keep") ||
+    lowered.includes("context size has been exceeded") ||
+    (lowered.includes("prompt exceeded") && lowered.includes("context"))
+  ) {
+    return "Prompt/context exceeded the model window.";
+  }
+  if (
+    lowered.includes("connection refused") ||
+    lowered.includes("connection error") ||
+    lowered.includes("econnrefused")
+  ) {
+    return "LLM endpoint connection error.";
+  }
+  if (lowered.includes("timed out") || lowered.includes("job timeout")) {
+    return "Worker job timed out.";
+  }
+  if (lowered.includes("response did not contain parseable json")) {
+    return "Model returned non-JSON output when structured output was expected.";
+  }
+
+  const stackLikeIndex = text.search(/\b(traceback|stack trace| at [A-Za-z0-9_.]+[:(])/i);
+  const compact = stackLikeIndex > 0 ? text.slice(0, stackLikeIndex).trim() : text;
+  if (compact.length <= 220) return compact;
+  return `${compact.slice(0, 217)}...`;
+}
+
 // ─── LocalBuddy HTTP Server ─────────────────────────────────────────────────
 
 class LocalBuddyServer {
@@ -56,7 +103,7 @@ class LocalBuddyServer {
   private repo: string;
   private authToken: string | null;
   private llm: LLMClient;
-  private readonly recentJobFailures: Array<{ jobId: string; message: string; ts: string }> = [];
+  private readonly recentJobFailures: Array<{ jobId: string; summary: string; ts: string }> = [];
 
   constructor(opts: { server: string; sessionId: string; authToken: string | null }) {
     this.server = opts.server;
@@ -91,7 +138,7 @@ class LocalBuddyServer {
       const postSystemPrompt = loadPromptTemplate("shared/post_system_prompt.md");
       const failureContext = this.recentJobFailures
         .slice(-3)
-        .map((failure) => `- ${failure.jobId}: ${failure.message}`)
+        .map((failure) => `- ${failure.jobId}: ${failure.summary}`)
         .join("\n");
       const combinedSystemPrompt = [
         systemPrompt,
@@ -136,6 +183,21 @@ class LocalBuddyServer {
       authToken,
       from: `agent:${agentId}`,
     });
+    void comm
+      .status(agentId, "idle", "LocalBuddy online and ready")
+      .then((ok) => {
+        if (!ok) {
+          console.warn("[LocalBuddy] Failed to emit startup status event");
+        }
+      })
+      .catch((err) => console.warn("[LocalBuddy] Startup status emit error:", err));
+    const statusHeartbeatMs = parseStatusHeartbeatMs("LOCALBUDDY_STATUS_HEARTBEAT_MS", 120_000);
+    const statusHeartbeatTimer =
+      statusHeartbeatMs > 0
+        ? setInterval(() => {
+            void comm.status(agentId, "idle", "LocalBuddy heartbeat");
+          }, statusHeartbeatMs)
+        : null;
 
     const monitorStartedAt = Date.now();
     const stopSessionEvents = comm.subscribeSessionEvents(
@@ -143,15 +205,20 @@ class LocalBuddyServer {
         if (envelope.type !== "job_failed") return;
         const tsMs = Date.parse(envelope.ts);
         if (Number.isFinite(tsMs) && tsMs + 2000 < monitorStartedAt) return;
-        const payload = envelope.payload as { jobId?: unknown; message?: unknown };
+        const payload = envelope.payload as { jobId?: unknown; message?: unknown; detail?: unknown };
         const jobId = String(payload.jobId ?? "").trim();
-        const message = String(payload.message ?? "").trim();
+        const message = summarizeFailureForPrompt(payload.message);
+        const detail = summarizeFailureForPrompt(payload.detail);
         if (!jobId || !message) return;
-        this.recentJobFailures.unshift({ jobId, message, ts: envelope.ts });
+        const summary =
+          detail && detail !== message
+            ? `${message} (detail: ${detail.slice(0, 120)})`
+            : message;
+        this.recentJobFailures.unshift({ jobId, summary, ts: envelope.ts });
         if (this.recentJobFailures.length > 20) {
           this.recentJobFailures.length = 20;
         }
-        console.warn(`[LocalBuddy] Observed WorkerPal job failure ${jobId}: ${message}`);
+        console.warn(`[LocalBuddy] Observed WorkerPal job failure ${jobId}: ${summary}`);
       },
       {
         onError: (message) => console.warn(`[LocalBuddy] Session monitor: ${message}`),
@@ -159,6 +226,10 @@ class LocalBuddyServer {
     );
 
     const stopMonitor = () => {
+      void comm.status(agentId, "shutting_down", "LocalBuddy shutting down");
+      if (statusHeartbeatTimer) {
+        clearInterval(statusHeartbeatTimer);
+      }
       try {
         stopSessionEvents();
       } catch {

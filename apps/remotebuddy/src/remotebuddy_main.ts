@@ -182,6 +182,19 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(raw) ? raw : fallback;
 }
 
+function parseStatusHeartbeatMs(serviceEnvName: string, fallbackMs: number): number {
+  const raw = (
+    process.env[serviceEnvName] ??
+    process.env.PUSHPALS_STATUS_HEARTBEAT_MS ??
+    ""
+  ).trim();
+  if (!raw) return fallbackMs;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return fallbackMs;
+  if (parsed <= 0) return 0;
+  return Math.max(30_000, parsed);
+}
+
 interface WorkerSnapshot {
   workerId: string;
   status: "idle" | "busy" | "error" | "offline";
@@ -214,8 +227,10 @@ class RemoteBuddyOrchestrator {
   private readonly spawnWorkerPollMs: number | null;
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
+  private readonly statusHeartbeatMs: number;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
+  private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private stopSessionEvents: (() => void) | null = null;
   private readonly seenJobFailures = new Set<string>();
   private readonly eventMonitorStartedAt = Date.now();
@@ -232,6 +247,9 @@ class RemoteBuddyOrchestrator {
   /** Recent session context for LLM (bounded ring buffer) */
   private recentContext: string[] = [];
   private static readonly MAX_CONTEXT = 20;
+  private static readonly MAX_CONTEXT_ENTRY_CHARS = 1200;
+  private static readonly CHAT_CONTEXT_MAX = 8;
+  private static readonly CHAT_CONTEXT_ENTRY_CHARS = 420;
 
   constructor(opts: {
     server: string;
@@ -270,6 +288,7 @@ class RemoteBuddyOrchestrator {
       .split(",")
       .map((label) => label.trim())
       .filter(Boolean);
+    this.statusHeartbeatMs = parseStatusHeartbeatMs("REMOTEBUDDY_STATUS_HEARTBEAT_MS", 120_000);
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
@@ -283,6 +302,25 @@ class RemoteBuddyOrchestrator {
     console.log(
       `[RemoteBuddy] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
     );
+  }
+
+  async emitStartupStatus(): Promise<void> {
+    const ok = await this.comm.status(
+      this.agentId,
+      "idle",
+      "RemoteBuddy online and waiting for requests",
+    );
+    if (!ok) {
+      console.warn("[RemoteBuddy] Failed to emit startup status event");
+    }
+  }
+
+  startStatusHeartbeat(): void {
+    if (this.statusHeartbeatMs <= 0 || this.statusHeartbeatTimer) return;
+    this.statusHeartbeatTimer = setInterval(() => {
+      if (this.disposed) return;
+      void this.comm.status(this.agentId, "idle", "RemoteBuddy heartbeat");
+    }, this.statusHeartbeatMs);
   }
 
   // ── HTTP helpers ──────────────────────────────────────────────────────
@@ -385,10 +423,23 @@ class RemoteBuddyOrchestrator {
   // ── Context tracking ───────────────────────────────────────────────────
 
   private pushContext(text: string): void {
-    this.recentContext.push(text);
+    const normalized = String(text ?? "").trim();
+    if (!normalized) return;
+    const capped =
+      normalized.length <= RemoteBuddyOrchestrator.MAX_CONTEXT_ENTRY_CHARS
+        ? normalized
+        : `${normalized.slice(0, RemoteBuddyOrchestrator.MAX_CONTEXT_ENTRY_CHARS - 16)}\n...[truncated]`;
+    this.recentContext.push(capped);
     if (this.recentContext.length > RemoteBuddyOrchestrator.MAX_CONTEXT) {
       this.recentContext.shift();
     }
+  }
+
+  private getChatContextSnapshot(): string[] {
+    const filtered = this.recentContext.filter((entry) => !entry.startsWith("[enhanced]"));
+    return filtered
+      .slice(-RemoteBuddyOrchestrator.CHAT_CONTEXT_MAX)
+      .map((entry) => toSingleLine(entry, RemoteBuddyOrchestrator.CHAT_CONTEXT_ENTRY_CHARS));
   }
 
   private getRecentJobContext(limit: number = 12): Array<Record<string, unknown>> {
@@ -608,21 +659,26 @@ class RemoteBuddyOrchestrator {
     const actionable = isExecutionIntent(promptForIntent, targetPath);
     const turnId = randomUUID();
 
-    this.pushContext(`[user] ${originalPrompt}`);
-    this.pushContext(`[enhanced] ${enhancedPrompt}`);
-
     let tasksCreated = 0;
     if (!actionable) {
       // Lightweight-only responses stay in the orchestrator.
-      console.log(`[RemoteBuddy] Thinking about: "${enhancedPrompt.substring(0, 80)}"`);
-      const output = await this.brain.think(enhancedPrompt, this.recentContext);
-      this.pushContext(`[assistant] ${output.assistantMessage}`);
+      const thinkPrompt = originalPrompt || enhancedPrompt;
+      const chatContext = this.getChatContextSnapshot();
+      console.log(`[RemoteBuddy] Thinking about: "${thinkPrompt.substring(0, 80)}"`);
+      const output = await this.brain.think(thinkPrompt, chatContext);
+      this.pushContext(`[user] ${toSingleLine(thinkPrompt, 700)}`);
+      this.pushContext(`[assistant] ${toSingleLine(output.assistantMessage, 900)}`);
       await this.sendCommand({
         type: "assistant_message",
         payload: { text: output.assistantMessage },
         turnId,
       });
     } else {
+      this.pushContext(`[user] ${toSingleLine(originalPrompt || enhancedPrompt, 900)}`);
+      if (enhancedPrompt && enhancedPrompt !== originalPrompt) {
+        this.pushContext(`[enhanced] ${toSingleLine(enhancedPrompt, 900)}`);
+      }
+
       // Any non-trivial request is WorkerPal-owned.
       await this.comm.assistantMessage("Understood. I am delegating this to a WorkerPal now.", {
         turnId,
@@ -754,6 +810,11 @@ class RemoteBuddyOrchestrator {
 
   dispose(): void {
     this.disposed = true;
+    if (this.statusHeartbeatTimer) {
+      clearInterval(this.statusHeartbeatTimer);
+      this.statusHeartbeatTimer = null;
+    }
+    void this.comm.status(this.agentId, "shutting_down", "RemoteBuddy shutting down");
     if (this.stopSessionEvents) {
       try {
         this.stopSessionEvents();
@@ -848,6 +909,8 @@ async function main() {
     jobsDbPath: sharedDbPath,
   });
 
+  await orchestrator.emitStartupStatus();
+  orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();
 
   // Start polling for requests from the Request Queue

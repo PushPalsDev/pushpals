@@ -16,7 +16,8 @@
  * - worker Docker image existence
  */
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } from "fs";
+import { createHash } from "crypto";
 import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 
@@ -33,7 +34,31 @@ const DEFAULT_INTEGRATION_BASE_BRANCH = "main";
 const INTEGRATION_BASE_BRANCH =
   (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BASE_BRANCH;
 const INTEGRATION_BASE_REMOTE_REF = `origin/${INTEGRATION_BASE_BRANCH}`;
+const START_SYNC_GIT_USER_NAME = "PushPals Start Sync";
+const START_SYNC_GIT_USER_EMAIL = "pushpals-start@local";
 const workerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? DEFAULT_IMAGE;
+const WORKER_IMAGE_INPUTS_HASH_LABEL = "pushpals.worker.inputs_hash";
+const WORKER_IMAGE_INPUT_PATHS = [
+  "apps/workerpals",
+  "packages/protocol",
+  "packages/shared",
+  "prompts/workerpals",
+  "package.json",
+  "bun.lock",
+  "bun.lockb",
+];
+const WORKER_IMAGE_HASH_IGNORE_DIRS = new Set([
+  ".git",
+  "node_modules",
+  ".worktrees",
+  "outputs",
+  "workspace",
+  ".venv",
+  "dist",
+  "build",
+  ".next",
+  ".expo",
+]);
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 const DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE = resolve(
@@ -90,6 +115,25 @@ function abortStart(exitCode: number): never {
 
 function envTruthy(name: string): boolean {
   return TRUTHY.has((process.env[name] ?? "").toLowerCase());
+}
+
+type WorkerImageRebuildMode = "auto" | "always" | "never";
+
+function workerImageRebuildMode(): WorkerImageRebuildMode {
+  const raw = (process.env.PUSHPALS_WORKER_IMAGE_REBUILD ?? "auto").trim().toLowerCase();
+  if (raw === "always" || raw === "1" || raw === "true" || raw === "yes" || raw === "on") {
+    return "always";
+  }
+  if (raw === "never" || raw === "0" || raw === "false" || raw === "no" || raw === "off") {
+    return "never";
+  }
+  return "auto";
+}
+
+function syncIntegrationWithMainEnabled(): boolean {
+  const raw = process.env.PUSHPALS_SYNC_INTEGRATION_WITH_MAIN;
+  if (raw == null || raw.trim() === "") return true;
+  return TRUTHY.has(raw.toLowerCase());
 }
 
 function resolveFromRepo(pathValue: string): string {
@@ -788,6 +832,79 @@ async function runCapture(cmd: string[], cwd = repoRoot): Promise<CmdResult> {
   }
 }
 
+function collectFilesForHash(rootPath: string, out: string[]): void {
+  if (!existsSync(rootPath)) return;
+
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(rootPath);
+  } catch {
+    return;
+  }
+
+  if (stat.isFile()) {
+    out.push(rootPath);
+    return;
+  }
+
+  if (!stat.isDirectory()) {
+    return;
+  }
+
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(rootPath);
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (WORKER_IMAGE_HASH_IGNORE_DIRS.has(entry)) continue;
+    collectFilesForHash(resolve(rootPath, entry), out);
+  }
+}
+
+function computeWorkerImageInputsHash(): string {
+  const files: string[] = [];
+  for (const relPath of WORKER_IMAGE_INPUT_PATHS) {
+    collectFilesForHash(resolve(repoRoot, relPath), files);
+  }
+
+  const normalizedFiles = files
+    .map((filePath) => relative(repoRoot, filePath).replace(/\\/g, "/"))
+    .sort((a, b) => a.localeCompare(b));
+
+  const hash = createHash("sha256");
+  for (const relPath of normalizedFiles) {
+    hash.update(relPath);
+    hash.update("\n");
+    try {
+      hash.update(readFileSync(resolve(repoRoot, relPath)));
+    } catch {
+      // If a file disappears during hashing, include marker and continue.
+      hash.update("__MISSING__");
+    }
+    hash.update("\n");
+  }
+
+  return hash.digest("hex");
+}
+
+async function dockerImageInputsHash(image: string): Promise<string | null> {
+  const inspect = await runCapture([
+    "docker",
+    "image",
+    "inspect",
+    "--format",
+    `{{ index .Config.Labels "${WORKER_IMAGE_INPUTS_HASH_LABEL}" }}`,
+    image,
+  ]);
+  if (!inspect.ok) return null;
+  const value = inspect.stdout.trim();
+  if (!value || value === "<no value>") return null;
+  return value;
+}
+
 function parseDockerIdList(raw: string): string[] {
   return raw
     .split(/\r?\n/)
@@ -1160,6 +1277,156 @@ async function ensureSourceControlManagerWorktree(): Promise<void> {
   process.env.SOURCE_CONTROL_MANAGER_REPO_PATH = repoPath;
 }
 
+async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
+  if (!syncIntegrationWithMainEnabled()) {
+    console.log("[start] Skipping integration-branch sync with main (disabled by env).");
+    return;
+  }
+
+  await ensureGitHubAuth(true);
+
+  const repoPath = (process.env.SOURCE_CONTROL_MANAGER_REPO_PATH ?? "").trim();
+  if (!repoPath) {
+    console.error(
+      "[start] SourceControlManager worktree is not configured; cannot sync integration branch with main.",
+    );
+    abortStart(1);
+  }
+
+  const gitInScm = (args: string[]) => runCapture(["git", ...args], repoPath);
+  const integrationRemoteTrackingRef = `refs/remotes/${INTEGRATION_REMOTE_REF}`;
+  const baseRemoteTrackingRef = `refs/remotes/${INTEGRATION_BASE_REMOTE_REF}`;
+  const syncBranch = `_source_control_manager/start-sync-${Date.now().toString(36)}`;
+  let checkoutCreated = false;
+
+  console.log(
+    `[start] Syncing ${INTEGRATION_REMOTE_REF} with ${INTEGRATION_BASE_REMOTE_REF} before launching RemoteBuddy...`,
+  );
+
+  const status = await gitInScm(["status", "--porcelain"]);
+  if (!status.ok) {
+    console.error("[start] Failed to read SourceControlManager worktree status before branch sync.");
+    console.error(status.stderr || status.stdout);
+    abortStart(status.exitCode || 1);
+  }
+  if (status.stdout) {
+    console.error(
+      `[start] SourceControlManager worktree is not clean (${repoPath}). Resolve local changes before startup.`,
+    );
+    abortStart(1);
+  }
+
+  const fetch = await gitInScm([
+    "fetch",
+    "origin",
+    INTEGRATION_BRANCH,
+    INTEGRATION_BASE_BRANCH,
+    "--prune",
+    "--quiet",
+  ]);
+  if (!fetch.ok) {
+    console.error("[start] Failed to fetch remote refs before integration/main sync.");
+    console.error(fetch.stderr || fetch.stdout);
+    abortStart(fetch.exitCode || 1);
+  }
+
+  for (const ref of [integrationRemoteTrackingRef, baseRemoteTrackingRef]) {
+    const exists = await gitInScm(["rev-parse", "--verify", "--quiet", ref]);
+    if (!exists.ok) {
+      console.error(`[start] Missing required ref for startup sync: ${ref}`);
+      abortStart(1);
+    }
+  }
+
+  const baseAlreadyIncluded = await gitInScm([
+    "merge-base",
+    "--is-ancestor",
+    baseRemoteTrackingRef,
+    integrationRemoteTrackingRef,
+  ]);
+  if (baseAlreadyIncluded.ok) {
+    console.log(
+      `[start] ${INTEGRATION_REMOTE_REF} is already up to date with ${INTEGRATION_BASE_REMOTE_REF}.`,
+    );
+    return;
+  }
+
+  const integrationBehindBase = await gitInScm([
+    "merge-base",
+    "--is-ancestor",
+    integrationRemoteTrackingRef,
+    baseRemoteTrackingRef,
+  ]);
+
+  const checkout = await gitInScm(["checkout", "-B", syncBranch, integrationRemoteTrackingRef]);
+  if (!checkout.ok) {
+    console.error(`[start] Failed to create sync branch ${syncBranch}.`);
+    console.error(checkout.stderr || checkout.stdout);
+    abortStart(checkout.exitCode || 1);
+  }
+  checkoutCreated = true;
+  try {
+    if (integrationBehindBase.ok) {
+      const pullFfOnly = await gitInScm(["pull", "--ff-only", "origin", INTEGRATION_BASE_BRANCH]);
+      if (!pullFfOnly.ok) {
+        console.error(
+          `[start] Failed to fast-forward ${INTEGRATION_BRANCH} from ${INTEGRATION_BASE_REMOTE_REF}.`,
+        );
+        console.error(pullFfOnly.stderr || pullFfOnly.stdout);
+        abortStart(pullFfOnly.exitCode || 1);
+      }
+    } else {
+      const merge = await runCapture(
+        [
+          "git",
+          "-c",
+          `user.name=${START_SYNC_GIT_USER_NAME}`,
+          "-c",
+          `user.email=${START_SYNC_GIT_USER_EMAIL}`,
+          "merge",
+          "--no-ff",
+          "--no-edit",
+          baseRemoteTrackingRef,
+        ],
+        repoPath,
+      );
+      if (!merge.ok) {
+        await gitInScm(["merge", "--abort"]);
+        console.error(
+          `[start] Failed to merge ${INTEGRATION_BASE_REMOTE_REF} into ${INTEGRATION_BRANCH}.`,
+        );
+        console.error(merge.stderr || merge.stdout);
+        abortStart(merge.exitCode || 1);
+      }
+    }
+
+    const push = await gitInScm(["push", "origin", `HEAD:refs/heads/${INTEGRATION_BRANCH}`]);
+    if (!push.ok) {
+      console.error(
+        `[start] Failed to push synced ${INTEGRATION_BRANCH} branch to origin after startup merge/pull.`,
+      );
+      console.error(push.stderr || push.stdout);
+      abortStart(push.exitCode || 1);
+    }
+
+    const refresh = await gitInScm(["fetch", "origin", INTEGRATION_BRANCH, "--quiet"]);
+    if (!refresh.ok) {
+      console.error("[start] Failed to refresh integration branch after startup sync push.");
+      console.error(refresh.stderr || refresh.stdout);
+      abortStart(refresh.exitCode || 1);
+    }
+
+    console.log(
+      `[start] Synced ${INTEGRATION_REMOTE_REF} with ${INTEGRATION_BASE_REMOTE_REF} successfully.`,
+    );
+  } finally {
+    if (checkoutCreated) {
+      await gitInScm(["checkout", "--detach", integrationRemoteTrackingRef]);
+      await gitInScm(["branch", "-D", syncBranch]);
+    }
+  }
+}
+
 async function ensureDockerImage(): Promise<void> {
   const dockerAvailable = (await runQuiet(["docker", "version"])) === 0;
   if (!dockerAvailable) {
@@ -1167,14 +1434,60 @@ async function ensureDockerImage(): Promise<void> {
     abortStart(1);
   }
 
+  const rebuildMode = workerImageRebuildMode();
   const imageExists = (await runQuiet(["docker", "image", "inspect", workerImage])) === 0;
-  if (imageExists) return;
+  if (imageExists && rebuildMode === "never") {
+    console.log(`[start] Worker image rebuild disabled; using ${workerImage} as-is.`);
+    return;
+  }
 
-  console.log(`[start] Worker image not found: ${workerImage}`);
+  let currentInputsHash: string | null = null;
+  const getCurrentInputsHash = (): string => {
+    if (!currentInputsHash) currentInputsHash = computeWorkerImageInputsHash();
+    return currentInputsHash;
+  };
+  const existingInputsHash =
+    imageExists && rebuildMode === "auto" ? await dockerImageInputsHash(workerImage) : null;
+
+  let shouldBuild = !imageExists;
+  let buildReason = "";
+
+  if (!imageExists) {
+    buildReason = `Worker image not found: ${workerImage}`;
+  } else if (rebuildMode === "always") {
+    shouldBuild = true;
+    buildReason = "Worker image rebuild forced by PUSHPALS_WORKER_IMAGE_REBUILD=always";
+  } else if (rebuildMode === "auto") {
+    const currentHash = getCurrentInputsHash();
+    if (!existingInputsHash) {
+      shouldBuild = true;
+      buildReason = "Worker image is missing inputs hash label; rebuilding to enable auto-refresh";
+    } else if (existingInputsHash !== currentHash) {
+      shouldBuild = true;
+      buildReason = `Worker image inputs changed (${existingInputsHash.slice(0, 12)} -> ${currentHash.slice(0, 12)})`;
+    }
+  }
+
+  if (!shouldBuild) {
+    console.log(`[start] Worker image is up to date: ${workerImage}`);
+    return;
+  }
+
+  console.log(`[start] ${buildReason}`);
   console.log("[start] Building worker image...");
 
   const buildExitCode = await runInherited(
-    ["docker", "build", "-f", "apps/workerpals/Dockerfile.sandbox", "-t", workerImage, "."],
+    [
+      "docker",
+      "build",
+      "-f",
+      "apps/workerpals/Dockerfile.sandbox",
+      "--label",
+      `${WORKER_IMAGE_INPUTS_HASH_LABEL}=${getCurrentInputsHash()}`,
+      "-t",
+      workerImage,
+      ".",
+    ],
     repoRoot,
   );
 
@@ -1213,6 +1526,7 @@ try {
   await cleanLegacyLocalBranchesIfRequested();
   await ensureGitHubAuth();
   await ensureSourceControlManagerWorktree();
+  await ensureIntegrationBranchUpToDateWithMain();
   await ensureDockerImage();
 } catch (err) {
   await cleanupWorkerWarmContainers("startup failure");

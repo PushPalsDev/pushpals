@@ -15,6 +15,63 @@ Push Pals runs a small software "team" around your repository:
 
 ## Current Architecture
 
+## Architecture Diagram
+
+### End-to-end system view
+
+```mermaid
+flowchart LR
+  User[User] --> Client[apps/client\nExpo UI]
+  Client -->|POST /message| LocalBuddy[apps/localbuddy\nIngress + Prompt Enrichment]
+  LocalBuddy -->|POST /requests/enqueue| Server[(apps/server\nEvents + Queues + SQLite)]
+  Server -->|SSE / WS session events| Client
+
+  Server -->|POST /requests/claim| RemoteBuddy[apps/remotebuddy\nOrchestrator + Scheduler]
+  RemoteBuddy -->|POST /jobs/enqueue| Server
+  Server -->|POST /jobs/claim| WorkerPals[apps/workerpals\nExecution Daemons]
+
+  WorkerPals -->|job_log / job_completed / job_failed| Server
+  WorkerPals -->|POST /completions/enqueue| Server
+
+  Server -->|POST /completions/claim| SCM[apps/source_control_manager\nMerge + Push + PR]
+  SCM -->|assistant/status events| Server
+  Server -->|SSE / WS session events| Client
+
+  subgraph Git[Git + Branch Flow]
+    WorkerBranch[agent/<worker>/<job>] --> Integration[main_agents]
+    Integration --> Main[main]
+  end
+
+  WorkerPals -->|commit refs| WorkerBranch
+  SCM -->|cherry-pick/merge + push| Integration
+```
+
+### Communication model (event-driven)
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant C as Client
+  participant L as LocalBuddy
+  participant S as Server
+  participant R as RemoteBuddy
+  participant W as WorkerPals
+  participant M as SourceControlManager
+
+  U->>C: Send request
+  C->>L: POST /message
+  L->>S: session message + status events
+  L->>S: POST /requests/enqueue
+  R->>S: POST /requests/claim
+  R->>S: task/job events + POST /jobs/enqueue
+  W->>S: POST /jobs/claim
+  W->>S: job_log + job_completed/job_failed events
+  W->>S: POST /completions/enqueue
+  M->>S: POST /completions/claim
+  M->>S: merge/push outcome events
+  S-->>C: SSE/WS stream (live timeline)
+```
+
 ### Fast path (chat and status)
 
 1. Client sends message to `LocalBuddy` (`POST /message`).
@@ -80,6 +137,7 @@ bun run start -c
 - LLM endpoint reachability (fails fast with clear error if model server is down)
 - optional local model-server auto-start (LM Studio headless)
 - integration branch existence/bootstrapping
+- integration branch sync with base branch (`main_agents` <= `main` by default) before launching RemoteBuddy
 - git auth requirements for push flows
 - SourceControlManager dedicated worktree
 - worker Docker image existence (auto-build if missing)
@@ -101,6 +159,7 @@ See `.env.example` for full details. Most important:
 - `PUSHPALS_AUTH_TOKEN`
 - `PUSHPALS_INTEGRATION_BRANCH` (default `main_agents`)
 - `PUSHPALS_INTEGRATION_BASE_BRANCH` (default `main`)
+- `PUSHPALS_SYNC_INTEGRATION_WITH_MAIN` (default on during `bun run start`)
 - `SOURCE_CONTROL_MANAGER_MAIN_BRANCH`
 - `SOURCE_CONTROL_MANAGER_REPO_PATH`
 - `SOURCE_CONTROL_MANAGER_DISABLE_AUTO_PR` (set `1` to disable auto-PR)
@@ -114,6 +173,7 @@ See `.env.example` for full details. Most important:
 - `WORKERPALS_DOCKER_IMAGE`
 - `WORKERPALS_REQUIRE_DOCKER`
 - `WORKERPALS_DOCKER_NETWORK_MODE` (default `bridge`; required for containerized access to host LLM endpoints)
+- `PUSHPALS_WORKER_IMAGE_REBUILD` (`auto` default; auto rebuild when worker image inputs change)
 
 LLM defaults:
 
@@ -130,6 +190,9 @@ LLM defaults:
 - OpenHands task message shaping defaults to instruction-only to avoid 4k-context overflow:
   - `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=none` (default)
   - set `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=compact` to prepend `prompts/workerpals/openhands_task_execute_system_prompt.md`
+- Large OpenHands instructions can be file-handoffed to keep initial prompts short:
+  - `WORKERPALS_OPENHANDS_LARGE_INSTRUCTION_CHARS=1800` (default)
+  - when exceeded, WorkerPals writes full text to `workspace/workerpal_requests/*` and tells OpenHands to read it first
 - OpenHands agent prompt profile can be minimized for local 4k-context models:
   - `WORKERPALS_OPENHANDS_PROMPT_PROFILE=minimal` (default behavior for local endpoints)
   - `WORKERPALS_OPENHANDS_PROMPT_PROFILE=default` to use OpenHands built-in templates
