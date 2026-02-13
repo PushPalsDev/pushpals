@@ -27,6 +27,11 @@ type CommitRef = {
   sha: string;
 };
 
+type CompletionPrMetadata = {
+  title: string;
+  body: string;
+};
+
 type WorkerJobResult = JobResult & {
   commit?: CommitRef;
 };
@@ -270,13 +275,131 @@ async function removeIsolatedWorktree(repo: string, worktreePath: string): Promi
   await git(repo, ["worktree", "prune"]);
 }
 
+function sanitizePrText(value: unknown, max = 240): string {
+  const text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
+}
+
+function inferPrArea(kind: string): string {
+  if (kind.startsWith("task.")) return "repo";
+  if (kind.startsWith("file.")) return "repo";
+  if (kind.startsWith("bun.test") || kind.startsWith("test.")) return "tests";
+  if (kind.startsWith("bun.lint")) return "repo";
+  if (kind.startsWith("git.")) return "repo";
+  return "infra";
+}
+
+function inferChangedPaths(params: Record<string, unknown> | undefined): string[] {
+  if (!params) return [];
+  const candidates: string[] = [];
+
+  const add = (value: unknown) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    candidates.push(trimmed);
+  };
+
+  add(params.path);
+  add(params.targetPath);
+  add(params.from);
+  add(params.to);
+
+  if (Array.isArray(params.paths)) {
+    for (const value of params.paths) add(value);
+  }
+
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of candidates) {
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    deduped.push(entry);
+    if (deduped.length >= 8) break;
+  }
+  return deduped;
+}
+
+function buildCompletionPrMetadata(args: {
+  workerId: string;
+  integrationBranch: string;
+  job: { id: string; taskId: string; kind: string; params?: Record<string, unknown> };
+  commit: CommitRef;
+  resultSummary: string;
+}): CompletionPrMetadata {
+  const area = inferPrArea(args.job.kind);
+  const summary = sanitizePrText(args.resultSummary, 84) || `${args.job.kind} update`;
+  const title = `chore(${area}): ${summary}`;
+
+  const changedPaths = inferChangedPaths(args.job.params);
+  const changesSection =
+    changedPaths.length > 0
+      ? changedPaths.map((path) => `- Updated \`${sanitizePrText(path, 180)}\``)
+      : [`- Updated worker completion for \`${sanitizePrText(args.job.kind, 80)}\``];
+
+  const risk =
+    args.job.kind.startsWith("task.") || args.job.kind.startsWith("file.") ? "medium" : "low";
+
+  const body = [
+    "### Summary",
+    `- Apply WorkerPal completion \`${sanitizePrText(args.job.id, 64)}\` to \`${sanitizePrText(args.integrationBranch, 64)}\`.`,
+    `- Integrate commit \`${sanitizePrText(args.commit.sha, 64)}\` from \`${sanitizePrText(args.commit.branch, 120)}\`.`,
+    `- Worker: \`${sanitizePrText(args.workerId, 64)}\`.`,
+    "",
+    "### Motivation / Context",
+    "- Preserve and review autonomous worker output before final merge to base branch.",
+    "- Keep integration branch current with queued worker completions.",
+    "",
+    "### Changes",
+    ...changesSection,
+    "",
+    "### Testing / Validation",
+    "- Not run (not provided)",
+    "",
+    "### Impact / Risk",
+    `- Risk level: ${risk} (automated worker-generated change; maintainer review required).`,
+    "- No secrets or credentials are expected in this PR body.",
+    "",
+    "### SourceControlManager Note",
+    "- Use this worker-provided PR title/body when creating the integration PR.",
+    "",
+    "### Checklist",
+    "- [ ] Tests added/updated where appropriate",
+    "- [ ] Validation commands run (or noted as not run)",
+    "- [ ] Docs/comments updated if needed",
+    "- [ ] No sensitive data (secrets/tokens) committed",
+  ].join("\n");
+
+  return { title, body };
+}
+
 async function enqueueCompletion(
   server: string,
   headers: Record<string, string>,
-  job: { id: string; taskId: string; kind: string; sessionId: string },
+  workerId: string,
+  integrationBranch: string,
+  job: {
+    id: string;
+    taskId: string;
+    kind: string;
+    sessionId: string;
+    params?: Record<string, unknown>;
+  },
   commit: CommitRef,
+  resultSummary: string,
 ): Promise<boolean> {
   try {
+    const pr = buildCompletionPrMetadata({
+      workerId,
+      integrationBranch,
+      job,
+      commit,
+      resultSummary,
+    });
+
     const response = await fetch(`${server}/completions/enqueue`, {
       method: "POST",
       headers,
@@ -285,7 +408,9 @@ async function enqueueCompletion(
         sessionId: job.sessionId,
         commitSha: commit.sha,
         branch: commit.branch,
-        message: `${job.kind}: ${job.taskId}`,
+        message: `${job.kind}: ${job.taskId} (worker PR metadata attached)`,
+        prTitle: pr.title,
+        prBody: pr.body,
       }),
     });
 
@@ -518,7 +643,21 @@ async function workerLoop(
             }
 
             if (completionCommit) {
-              const enqueued = await enqueueCompletion(opts.server, headers, job, completionCommit);
+              const enqueued = await enqueueCompletion(
+                opts.server,
+                headers,
+                opts.workerId,
+                integrationBranchName(),
+                {
+                  id: job.id,
+                  taskId: job.taskId,
+                  kind: job.kind,
+                  sessionId: job.sessionId,
+                  params: parsedParams,
+                },
+                completionCommit,
+                result.summary,
+              );
               if (!enqueued && completionCommit.branch.startsWith("refs/pushpals/")) {
                 const cleanupRef = await git(executionRepo, [
                   "update-ref",

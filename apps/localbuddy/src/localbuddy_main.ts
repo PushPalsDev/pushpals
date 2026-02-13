@@ -8,11 +8,11 @@
  * Accepts messages from clients via HTTP.
  * - Lightweight chat can be answered directly by LocalBuddy.
  * - Requests can be explicitly routed to RemoteBuddy via `/ask_remote_buddy ...`.
- * - Routed requests are enhanced with LLM + repo context, then enqueued.
+ * - Routed requests are enqueued immediately; RemoteBuddy handles deeper planning/context.
  */
 
 import { randomUUID } from "crypto";
-import { CommunicationManager, detectRepoRoot, getRepoContext, loadPromptTemplate } from "shared";
+import { CommunicationManager, detectRepoRoot } from "shared";
 import { createLLMClient, type LLMClient } from "../../remotebuddy/src/llm.js";
 import {
   buildRequestStatusReply,
@@ -297,53 +297,6 @@ class LocalBuddyServer {
     console.log(`[LocalBuddy] LLM client initialized`);
   }
 
-  /**
-   * Enhance user prompt with repository context and LLM analysis.
-   * Accepts pre-fetched context to avoid duplicate git calls.
-   */
-  private async enhancePrompt(
-    originalPrompt: string,
-    context: { branch: string; status: string; recentCommits: string },
-  ): Promise<string> {
-    try {
-      const status = context.status.split("\n").slice(0, 20).join("\n") || "(clean)";
-      const systemPrompt = loadPromptTemplate("localbuddy/localbuddy_system_prompt.md", {
-        branch: context.branch,
-        status,
-        recent_commits: context.recentCommits || "(none)",
-        repo_root: this.repo,
-      });
-      const postSystemPrompt = loadPromptTemplate("shared/post_system_prompt.md");
-      const failureContext = this.recentJobFailures
-        .slice(-3)
-        .map((failure) => `- ${failure.jobId}: ${failure.summary}`)
-        .join("\n");
-      const combinedSystemPrompt = [
-        systemPrompt,
-        postSystemPrompt,
-        failureContext
-          ? `Recent WorkerPal job failures in this session (most recent first):\n${failureContext}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n\n")
-        .trim();
-
-      const output = await this.llm.generate({
-        system: combinedSystemPrompt,
-        messages: [{ role: "user", content: originalPrompt }],
-        maxTokens: 1024,
-        temperature: 0.3,
-      });
-
-      return output.text.trim();
-    } catch (err) {
-      console.error(`[LocalBuddy] LLM enhancement failed:`, err);
-      // Fallback: return original prompt with basic context
-      return `[Branch: ${context.branch}]\n\n${originalPrompt}`;
-    }
-  }
-
   private async answerLocally(userPrompt: string): Promise<string> {
     const normalized = String(userPrompt ?? "").trim();
     if (!normalized) {
@@ -432,7 +385,6 @@ Respond in strict JSON with this shape:
     const sessionId = this.sessionId;
     const serverUrl = this.server;
     const authToken = this.authToken;
-    const enhancePrompt = this.enhancePrompt.bind(this);
     const answerLocally = this.answerLocally.bind(this);
     const comm = new CommunicationManager({
       serverUrl,
@@ -614,7 +566,7 @@ Respond in strict JSON with this shape:
                   ? "Received your request. Routing this to RemoteBuddy now."
                   : localOnly
                     ? "Received your request. I can answer this directly as LocalBuddy."
-                    : "Received your request. Preparing context and queueing it now.",
+                    : "Received your request. Queueing this to RemoteBuddy now.",
               )
               .then((ok) => {
                 if (!ok) {
@@ -676,27 +628,7 @@ Respond in strict JSON with this shape:
                     return;
                   }
 
-                  // Step 1: Report repo detection
-                  send({ type: "status", message: `Detected repo: ${repo}` });
-
-                  // Step 2: Read git context
-                  send({ type: "status", message: "Reading git status, branch, and commits..." });
-                  const context = await getRepoContext(repo);
-                  send({
-                    type: "status",
-                    message: `Current branch: ${context.branch}`,
-                    data: { branch: context.branch },
-                  });
-
-                  // Step 3: Enhance prompt with LLM
-                  send({ type: "status", message: "Enhancing prompt with LLM..." });
-                  const enhancedPrompt = await enhancePrompt(routedPrompt, context);
-                  send({
-                    type: "status",
-                    message: `Enhanced prompt (${enhancedPrompt.length} chars)`,
-                  });
-
-                  // Step 4: Enqueue to Request Queue
+                  // Queue immediately; RemoteBuddy handles context/planning.
                   send({ type: "status", message: "Enqueuing to Request Queue..." });
 
                   const res = await fetch(`${serverUrl}/requests/enqueue`, {
@@ -705,7 +637,7 @@ Respond in strict JSON with this shape:
                     body: JSON.stringify({
                       sessionId,
                       originalPrompt: routedPrompt,
-                      enhancedPrompt,
+                      enhancedPrompt: routedPrompt,
                     }),
                   });
 

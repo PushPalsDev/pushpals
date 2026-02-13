@@ -1,10 +1,10 @@
 /**
- * Request Queue for enhanced prompts from LocalBuddy -> RemoteBuddy
+ * Request Queue for routed prompts from LocalBuddy -> RemoteBuddy
  *
  * Flow:
- *   1. LocalBuddy enhances user message with LLM + repo context
- *   2. LocalBuddy enqueues to this queue
- *   3. RemoteBuddy polls and claims requests
+ *   1. LocalBuddy enqueues the routed user request to this queue
+ *   2. RemoteBuddy polls and claims requests
+ *   3. RemoteBuddy handles deeper planning/context as needed
  *   4. RemoteBuddy processes and marks complete/failed
  */
 

@@ -352,6 +352,8 @@ async function tick(): Promise<void> {
         commitSha: string;
         branch: string;
         message: string;
+        prTitle: string | null;
+        prBody: string | null;
         status: string;
         pusherId: string;
         createdAt: string;
@@ -370,6 +372,11 @@ async function tick(): Promise<void> {
     console.log(
       `[${ts()}] Claimed completion ${completion.id}: ${completion.branch} (${completion.commitSha.slice(0, 8)})`,
     );
+    if ((completion.prTitle ?? "").trim() || (completion.prBody ?? "").trim()) {
+      console.log(
+        `[${ts()}] Completion ${completion.id} includes worker-provided PR metadata; SourceControlManager will prefer it for PR creation.`,
+      );
+    }
     await emitPusherMessage(
       comm,
       `SourceControlManager claimed WorkerPal completion ${completion.id.slice(0, 8)} from ${completion.branch}.`,
@@ -652,6 +659,8 @@ async function ensureMainPullRequest(completion: {
   id: string;
   commitSha: string;
   branch: string;
+  prTitle?: string | null;
+  prBody?: string | null;
 }) {
   const token = await resolveGitHubToken();
   if (!token) {
@@ -673,8 +682,14 @@ async function ensureMainPullRequest(completion: {
   }
 
   const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
-  const prTitle = (config.prTitle ?? "").trim() || `PushPals: merge ${config.mainBranch} into ${prBaseBranch}`;
+  const completionPrTitle = (completion.prTitle ?? "").trim();
+  const completionPrBody = (completion.prBody ?? "").trim();
+  const prTitle =
+    completionPrTitle ||
+    (config.prTitle ?? "").trim() ||
+    `PushPals: merge ${config.mainBranch} into ${prBaseBranch}`;
   const prBody =
+    completionPrBody ||
     (config.prBody ?? "").trim() ||
     [
       "Automated PR opened by SourceControlManager.",

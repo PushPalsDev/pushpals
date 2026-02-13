@@ -22,6 +22,8 @@ export interface CompletionRow {
   commitSha: string | null;
   branch: string | null;
   message: string;
+  prTitle: string | null;
+  prBody: string | null;
   status: CompletionStatus;
   pusherId: string | null;
   error: string | null;
@@ -47,6 +49,8 @@ export class CompletionQueue {
         commitSha  TEXT,
         branch     TEXT,
         message    TEXT NOT NULL,
+        prTitle    TEXT,
+        prBody     TEXT,
         status     TEXT NOT NULL DEFAULT 'pending',
         pusherId   TEXT,
         error      TEXT,
@@ -57,6 +61,16 @@ export class CompletionQueue {
       CREATE INDEX IF NOT EXISTS idx_completions_status ON completions(status);
       CREATE INDEX IF NOT EXISTS idx_completions_job ON completions(jobId);
     `);
+
+    const columns = this.db.prepare(`PRAGMA table_info(completions)`).all() as Array<{
+      name: string;
+    }>;
+    if (!columns.some((col) => col.name === "prTitle")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN prTitle TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "prBody")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN prBody TEXT;`);
+    }
   }
 
   /**
@@ -68,6 +82,14 @@ export class CompletionQueue {
     const commitSha = body.commitSha as string | undefined;
     const branch = body.branch as string | undefined;
     const message = body.message as string;
+    const prTitle =
+      typeof body.prTitle === "string" && body.prTitle.trim().length > 0
+        ? body.prTitle.trim()
+        : null;
+    const prBody =
+      typeof body.prBody === "string" && body.prBody.trim().length > 0
+        ? body.prBody.trim()
+        : null;
 
     if (!jobId || !sessionId || !message) {
       return { ok: false, message: "jobId, sessionId, and message are required" };
@@ -78,10 +100,21 @@ export class CompletionQueue {
 
     this.db
       .prepare(
-        `INSERT INTO completions (id, jobId, sessionId, commitSha, branch, message, status, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        `INSERT INTO completions (id, jobId, sessionId, commitSha, branch, message, prTitle, prBody, status, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       )
-      .run(completionId, jobId, sessionId, commitSha ?? null, branch ?? null, message, now, now);
+      .run(
+        completionId,
+        jobId,
+        sessionId,
+        commitSha ?? null,
+        branch ?? null,
+        message,
+        prTitle,
+        prBody,
+        now,
+        now,
+      );
 
     return { ok: true, completionId };
   }

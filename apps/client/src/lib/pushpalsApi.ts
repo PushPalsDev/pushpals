@@ -362,6 +362,8 @@ export interface CompletionSnapshotRow {
   commitSha: string | null;
   branch: string | null;
   message: string;
+  prTitle?: string | null;
+  prBody?: string | null;
   status: "pending" | "claimed" | "processed" | "failed";
   pusherId: string | null;
   error: string | null;

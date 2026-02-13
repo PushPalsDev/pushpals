@@ -4,9 +4,21 @@ import type { SessionState, Task, Job, LogLine } from "./eventReducer";
 
 const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 const JOB_RUNNER_RESULT_PREFIX = "___RESULT___ ";
-const MAX_TRACE_LINES = 220;
+const DEFAULT_TRACE_TAIL_LINES = 100;
+const MIN_TRACE_TAIL_LINES = 20;
+const MAX_TRACE_TAIL_LINES = 500;
 const MAX_TRACE_LINE_LENGTH = 500;
 const ANSI_COLOR_REGEX = /\x1b\[[0-9;]*m/g;
+
+function parseTraceTailLines(raw: string | undefined): number {
+  const parsed = Number.parseInt(String(raw ?? "").trim(), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_TRACE_TAIL_LINES;
+  return Math.max(MIN_TRACE_TAIL_LINES, Math.min(MAX_TRACE_TAIL_LINES, parsed));
+}
+
+const TRACE_TAIL_LINES = parseTraceTailLines(
+  process.env.EXPO_PUBLIC_PUSHPALS_TRACE_TAIL_LINES,
+);
 
 type TraceTone = "reasoning" | "action" | "info" | "error";
 
@@ -177,9 +189,23 @@ function appendTraceFromText(
   tone: TraceTone,
 ): void {
   for (const line of toLines(text)) {
-    if (entries.length >= MAX_TRACE_LINES) return;
     pushTraceEntry(entries, seen, source, line, tone);
   }
+}
+
+function compactTraceEntries(entries: TraceEntry[]): TraceEntry[] {
+  if (entries.length <= TRACE_TAIL_LINES) return entries;
+  const dropped = entries.length - TRACE_TAIL_LINES;
+  const tail = entries.slice(-TRACE_TAIL_LINES);
+  return [
+    {
+      key: `trace:compacted:${entries.length}`,
+      source: "trace",
+      line: `Compacted trace: showing latest ${TRACE_TAIL_LINES} lines (${dropped} older lines hidden).`,
+      tone: "info",
+    },
+    ...tail,
+  ];
 }
 
 function extractTrace(job: Job, logs: LogLine[]): TraceEntry[] {
@@ -207,12 +233,10 @@ function extractTrace(job: Job, logs: LogLine[]): TraceEntry[] {
       const source = `artifact.${artifact.kind || "text"}`;
       const tone = artifact.kind === "stderr" ? "error" : "info";
       appendTraceFromText(entries, seen, source, artifact.text, tone);
-      if (entries.length >= MAX_TRACE_LINES) break;
     }
   }
 
   for (const log of logs) {
-    if (entries.length >= MAX_TRACE_LINES) break;
     const line = cleanLine(log.line || "");
     if (!line) continue;
     if (line.startsWith(JOB_RUNNER_RESULT_PREFIX)) continue;
@@ -246,11 +270,7 @@ function extractTrace(job: Job, logs: LogLine[]): TraceEntry[] {
     );
   }
 
-  if (entries.length >= MAX_TRACE_LINES) {
-    pushTraceEntry(entries, seen, "trace", "...trace truncated...", "info");
-  }
-
-  return entries;
+  return compactTraceEntries(entries);
 }
 
 function createStyles(palette: TracePalette, theme?: TasksJobsLogsTheme) {
