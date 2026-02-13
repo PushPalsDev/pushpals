@@ -571,11 +571,18 @@ async function workerLoop(
             ? (stream: "stdout" | "stderr", line: string) => {
                 const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
                 logChain = logChain.then(() =>
-                  sendCommand(opts.server, job.sessionId, headers, {
-                    type: "job_log",
-                    payload: { jobId: job.id, stream, seq, line },
-                    from: `worker:${opts.workerId}`,
-                  }),
+                  Promise.allSettled([
+                    sendCommand(opts.server, job.sessionId, headers, {
+                      type: "job_log",
+                      payload: { jobId: job.id, stream, seq, line },
+                      from: `worker:${opts.workerId}`,
+                    }),
+                    fetch(`${opts.server}/jobs/${job.id}/log`, {
+                      method: "POST",
+                      headers,
+                      body: JSON.stringify({ stream, seq, message: line }),
+                    }),
+                  ]).then(() => undefined),
                 );
               }
             : undefined;

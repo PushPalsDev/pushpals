@@ -19,8 +19,18 @@ export interface JobApiRow {
   workerId: string | null;
   params: string;
   error: string | null;
+  durationMs?: number | null;
+  claimedAt?: string | null;
+  completedAt?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface JobLogApiRow {
+  id: number;
+  jobId: string;
+  ts: string;
+  message: string;
 }
 
 function tryParseJsonObject(raw: string): Record<string, unknown> | null {
@@ -59,6 +69,36 @@ export function extractReferencedRequestToken(input: string): string | null {
   return null;
 }
 
+export function extractReferencedJobToken(input: string): string | null {
+  const text = String(input ?? "").trim();
+  if (!text) return null;
+
+  const contextualFull = text.match(
+    /\b(?:job|workerpal\s+job|task)(?:\s+id)?\s*(?:is|=|:)?\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i,
+  );
+  if (contextualFull) return contextualFull[1].toLowerCase();
+
+  const contextualShort = text.match(
+    /\b(?:job|workerpal\s+job|task)(?:\s+id)?\s*(?:is|=|:)?\s*([0-9a-f]{8})\b/i,
+  );
+  if (contextualShort) return contextualShort[1].toLowerCase();
+
+  return null;
+}
+
+function isJobStatusPrompt(input: string): boolean {
+  const text = String(input ?? "").trim().toLowerCase();
+  if (!text) return false;
+  if (extractReferencedJobToken(text)) return true;
+
+  const hasEntity = /\b(job|workerpal|task)\b/.test(text);
+  const hasStatusCue =
+    /\b(status|progress|update|check|checking|doing|where|queued|claimed|running|in progress|complete|completed|failed|stuck)\b/.test(
+      text,
+    );
+  return hasEntity && hasStatusCue;
+}
+
 export function isStatusLookupPrompt(input: string): boolean {
   const text = String(input ?? "").trim().toLowerCase();
   if (!text) return false;
@@ -81,6 +121,17 @@ export function formatClockTime(iso: string): string {
   return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
+function formatDuration(durationMs: number | null | undefined): string {
+  if (!Number.isFinite(durationMs as number) || (durationMs as number) < 0) return "";
+  const ms = Math.floor(durationMs as number);
+  if (ms < 1000) return `${ms}ms`;
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${totalSeconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+
 function parseStructuredError(raw: string | null, summarizeFailure: (value: unknown) => string): string {
   if (!raw) return "";
   const parsed = tryParseJsonObject(raw);
@@ -100,6 +151,140 @@ function extractJobRequestId(job: JobApiRow): string | null {
   if (typeof requestId !== "string") return null;
   const normalized = requestId.trim();
   return normalized || null;
+}
+
+function selectRelevantJobForPrompt(args: {
+  userPrompt: string;
+  sessionId: string;
+  jobs: JobApiRow[];
+}): {
+  isJobQuery: boolean;
+  requestedToken: string | null;
+  selectedJob: JobApiRow | null;
+} {
+  const requestedToken = extractReferencedJobToken(args.userPrompt);
+  const isJobQuery = isJobStatusPrompt(args.userPrompt);
+  const jobs = (args.jobs ?? []).filter((row) => row.sessionId === args.sessionId);
+  if (!isJobQuery) {
+    return { isJobQuery: false, requestedToken, selectedJob: null };
+  }
+  if (jobs.length === 0) {
+    return { isJobQuery: true, requestedToken, selectedJob: null };
+  }
+
+  if (requestedToken) {
+    const token = requestedToken.toLowerCase();
+    const exact = jobs.find((row) => row.id.toLowerCase() === token);
+    if (exact) return { isJobQuery: true, requestedToken, selectedJob: exact };
+
+    const prefix = jobs.find((row) => row.id.toLowerCase().startsWith(token));
+    if (prefix) return { isJobQuery: true, requestedToken, selectedJob: prefix };
+
+    return { isJobQuery: true, requestedToken, selectedJob: null };
+  }
+
+  const prioritized =
+    jobs.find((row) => row.status === "claimed") ??
+    jobs.find((row) => row.status === "pending") ??
+    jobs[0] ??
+    null;
+  return { isJobQuery: true, requestedToken, selectedJob: prioritized };
+}
+
+function buildJobLogTail(logs: JobLogApiRow[], maxLines = 8): string {
+  if (!logs.length) return "";
+  const lines = logs
+    .map((row) => String(row.message ?? "").trim())
+    .filter(Boolean)
+    .slice(-Math.max(1, Math.min(10, maxLines)));
+  if (!lines.length) return "";
+  return lines.join("\n");
+}
+
+function extractThinkingHint(logs: JobLogApiRow[]): string {
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const line = String(logs[i]?.message ?? "").trim();
+    if (!line) continue;
+    if (/\b(thinking|thought|analyze|analysis)\b[:\s-]/i.test(line)) {
+      return line.length > 180 ? `${line.slice(0, 177)}...` : line;
+    }
+  }
+  return "";
+}
+
+export function buildJobStatusReply(args: {
+  userPrompt: string;
+  sessionId: string;
+  jobs: JobApiRow[];
+  logs?: JobLogApiRow[];
+  summarizeFailure: (value: unknown) => string;
+  formatTime?: (iso: string) => string;
+}): string | null {
+  const { userPrompt, sessionId, summarizeFailure } = args;
+  const formatTime = args.formatTime ?? formatClockTime;
+  const selection = selectRelevantJobForPrompt({
+    userPrompt,
+    sessionId,
+    jobs: args.jobs,
+  });
+  if (!selection.isJobQuery) return null;
+
+  const jobs = (args.jobs ?? []).filter((row) => row.sessionId === sessionId);
+  if (jobs.length === 0) {
+    return "I don't see any jobs in this session yet.";
+  }
+
+  if (!selection.selectedJob) {
+    if (selection.requestedToken) {
+      const latest = jobs
+        .slice(0, 3)
+        .map((row) => row.id.slice(0, 8))
+        .join(", ");
+      return latest
+        ? `I couldn't find job ${selection.requestedToken}. Recent job IDs: ${latest}.`
+        : `I couldn't find job ${selection.requestedToken}.`;
+    }
+    return "I couldn't resolve which job to check.";
+  }
+
+  const job = selection.selectedJob;
+  const shortId = job.id.slice(0, 8);
+  const updated = formatTime(job.updatedAt);
+  let summary = `Job ${shortId} is ${job.status} (updated ${updated})`;
+  if (job.workerId) summary += ` on ${job.workerId}`;
+  summary += ".";
+
+  if (job.status === "claimed") {
+    summary += " It is currently in progress.";
+  } else if (job.status === "pending") {
+    summary += " It is queued and waiting for a WorkerPal.";
+  }
+
+  if (job.status === "completed" || job.status === "failed") {
+    const durationText = formatDuration(job.durationMs);
+    if (durationText) {
+      summary += ` Runtime: ${durationText}.`;
+    }
+  }
+
+  if (job.status === "failed") {
+    const jobError = parseStructuredError(job.error, summarizeFailure);
+    if (jobError) summary += ` Failure: ${jobError}`;
+  }
+
+  const logs = (args.logs ?? []).filter((row) => row.jobId === job.id);
+  if (logs.length > 0) {
+    const tail = buildJobLogTail(logs, 8);
+    if (tail) {
+      summary += `\nLatest logs:\n\`\`\`\n${tail}\n\`\`\``;
+    }
+    const hint = extractThinkingHint(logs);
+    if (hint) {
+      summary += `\nModel hint: ${hint}`;
+    }
+  }
+
+  return summary;
 }
 
 export function buildRequestStatusReply(args: {

@@ -22,6 +22,13 @@ export interface JobRow {
   updatedAt: string;
 }
 
+export interface JobLogRow {
+  id: number;
+  jobId: string;
+  ts: string;
+  message: string;
+}
+
 interface WorkerDbRow {
   workerId: string;
   status: WorkerStatus;
@@ -120,6 +127,7 @@ export class JobQueue {
         message TEXT NOT NULL,
         FOREIGN KEY (jobId) REFERENCES jobs(id)
       );
+      CREATE INDEX IF NOT EXISTS idx_job_logs_job_id ON job_logs(jobId, id);
 
       CREATE TABLE IF NOT EXISTS job_artifacts (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -458,6 +466,8 @@ export class JobQueue {
       sessionId: string;
       workerId: string | null;
       jobUpdatedAt: string;
+      lastLogTs: string | null;
+      activityAt: string;
       workerLastHeartbeat: string | null;
     };
 
@@ -469,17 +479,37 @@ export class JobQueue {
            j.sessionId AS sessionId,
            j.workerId AS workerId,
            j.updatedAt AS jobUpdatedAt,
+           (
+             SELECT MAX(jl.ts)
+             FROM job_logs jl
+             WHERE jl.jobId = j.id
+           ) AS lastLogTs,
+           COALESCE(
+             (
+               SELECT MAX(jl.ts)
+               FROM job_logs jl
+               WHERE jl.jobId = j.id
+             ),
+             j.updatedAt
+           ) AS activityAt,
            w.lastHeartbeat AS workerLastHeartbeat
          FROM jobs j
          LEFT JOIN workers w ON w.workerId = j.workerId
          WHERE j.status = 'claimed'
-           AND j.updatedAt < ?
+           AND COALESCE(
+             (
+               SELECT MAX(jl.ts)
+               FROM job_logs jl
+               WHERE jl.jobId = j.id
+             ),
+             j.updatedAt
+           ) < ?
            AND (
              j.workerId IS NULL
              OR w.workerId IS NULL
              OR w.lastHeartbeat < ?
            )
-         ORDER BY j.updatedAt ASC
+         ORDER BY activityAt ASC
          LIMIT ?`,
       )
       .all(cutoff, cutoff, maxRows) as StaleCandidate[];
@@ -497,6 +527,8 @@ export class JobQueue {
           row.workerLastHeartbeat
             ? `lastHeartbeat=${row.workerLastHeartbeat}`
             : "lastHeartbeat=missing",
+          row.lastLogTs ? `lastLogTs=${row.lastLogTs}` : "lastLogTs=none",
+          `activityAt=${row.activityAt}`,
           `jobUpdatedAt=${row.jobUpdatedAt}`,
           `staleAfterMs=${ttlMs}`,
         ];
@@ -608,8 +640,29 @@ export class JobQueue {
   }
 
   addLog(jobId: string, message: string): void {
-    this.db
-      .prepare(`INSERT INTO job_logs (jobId, ts, message) VALUES (?, ?, ?)`)
-      .run(jobId, new Date().toISOString(), message);
+    const now = new Date().toISOString();
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`INSERT INTO job_logs (jobId, ts, message) VALUES (?, ?, ?)`).run(jobId, now, message);
+      // Treat new log lines as job activity so stale-claim recovery does not
+      // auto-fail active jobs that are still producing trace output.
+      this.db
+        .prepare(`UPDATE jobs SET updatedAt = ? WHERE id = ? AND status = 'claimed'`)
+        .run(now, jobId);
+    });
+    tx();
+  }
+
+  listJobLogs(jobId: string, limit = 50): JobLogRow[] {
+    const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(500, Math.floor(limit))) : 50;
+    const rows = this.db
+      .prepare(
+        `SELECT id, jobId, ts, message
+         FROM job_logs
+         WHERE jobId = ?
+         ORDER BY id DESC
+         LIMIT ?`,
+      )
+      .all(jobId, maxRows) as JobLogRow[];
+    return rows.reverse();
   }
 }

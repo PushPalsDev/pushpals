@@ -419,6 +419,19 @@ export function createRequestHandler() {
         });
       }
 
+      // GET /jobs/:id/logs
+      const jobLogsMatch = pathname.match(/^\/jobs\/([^/]+)\/logs$/);
+      if (jobLogsMatch && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        maybeRecoverStaleClaims();
+
+        const jobId = jobLogsMatch[1];
+        const limit = parseLimit(url.searchParams.get("limit"), 50);
+        const logs = jobQueue.listJobLogs(jobId, limit);
+        return makeJson({ ok: true, jobId, logs });
+      }
+
       // GET /completions
       if (pathname === "/completions" && method === "GET") {
         const denied = requireAuth();
@@ -474,6 +487,28 @@ export function createRequestHandler() {
           console.log(`[Server] Job ${jobId} failed (${durationText})`);
         }
         return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // POST /jobs/:id/log
+      const jobLogMatch = pathname.match(/^\/jobs\/([^/]+)\/log$/);
+      if (jobLogMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobLogMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const message =
+          typeof body.message === "string"
+            ? body.message
+            : typeof body.line === "string"
+              ? body.line
+              : "";
+        const trimmed = message.trim();
+        if (!trimmed) {
+          return makeJson({ ok: false, message: "message is required" }, 400);
+        }
+        jobQueue.addLog(jobId, trimmed);
+        return makeJson({ ok: true }, 200);
       }
 
       // ── Request queue endpoints (auth protected) ────────────────────────────

@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildJobStatusReply,
   buildRequestStatusReply,
+  extractReferencedJobToken,
   extractReferencedRequestToken,
   isStatusLookupPrompt,
+  type JobLogApiRow,
   type JobApiRow,
   type RequestApiRow,
 } from "../apps/localbuddy/src/request_status";
@@ -44,10 +47,93 @@ describe("localbuddy request status intent", () => {
     ).toBe("e11225b1-1111-4111-8111-111111111111");
   });
 
+  test("extracts short and full job IDs", () => {
+    expect(extractReferencedJobToken("status of job 7c7683fa")).toBe("7c7683fa");
+    expect(
+      extractReferencedJobToken("status of job 7c7683fa-3333-4333-8333-333333333333"),
+    ).toBe("7c7683fa-3333-4333-8333-333333333333");
+  });
+
   test("detects status-like prompts", () => {
     expect(isStatusLookupPrompt("how my request is doing")).toBe(true);
     expect(isStatusLookupPrompt("my request is e11225b1, check it")).toBe(true);
     expect(isStatusLookupPrompt("hello there")).toBe(false);
+  });
+});
+
+describe("buildJobStatusReply", () => {
+  test("reports direct job status with log tail", () => {
+    const job: JobApiRow = {
+      id: "7c7683fa-3333-4333-8333-333333333333",
+      taskId: "task-2",
+      sessionId: "dev",
+      status: "claimed",
+      workerId: "workerpal-5893e8e5",
+      params: "{}",
+      error: null,
+      createdAt: "2026-02-13T03:20:00.000Z",
+      updatedAt: "2026-02-13T03:31:00.000Z",
+    };
+    const logs: JobLogApiRow[] = [
+      {
+        id: 1,
+        jobId: job.id,
+        ts: "2026-02-13T03:30:01.000Z",
+        message: "[JobRunner] Starting job",
+      },
+      {
+        id: 2,
+        jobId: job.id,
+        ts: "2026-02-13T03:30:05.000Z",
+        message: "Thinking: scanning apps/server/src/jobs.ts",
+      },
+      {
+        id: 3,
+        jobId: job.id,
+        ts: "2026-02-13T03:30:08.000Z",
+        message: "Action: file_editor view",
+      },
+    ];
+
+    const reply = buildJobStatusReply({
+      userPrompt: "whats the status of job 7c7683fa ?",
+      sessionId: "dev",
+      jobs: [job],
+      logs,
+      summarizeFailure,
+      formatTime,
+    });
+
+    expect(reply).toContain("Job 7c7683fa is claimed");
+    expect(reply).toContain("currently in progress");
+    expect(reply).toContain("Latest logs:");
+    expect(reply).toContain("Thinking: scanning apps/server/src/jobs.ts");
+  });
+
+  test("returns helpful hint when job id is not found", () => {
+    const job: JobApiRow = {
+      id: "7c7683fa-3333-4333-8333-333333333333",
+      taskId: "task-2",
+      sessionId: "dev",
+      status: "claimed",
+      workerId: "workerpal-5893e8e5",
+      params: "{}",
+      error: null,
+      createdAt: "2026-02-13T03:20:00.000Z",
+      updatedAt: "2026-02-13T03:31:00.000Z",
+    };
+
+    const reply = buildJobStatusReply({
+      userPrompt: "status of job deadbeef",
+      sessionId: "dev",
+      jobs: [job],
+      logs: [],
+      summarizeFailure,
+      formatTime,
+    });
+
+    expect(reply).toContain("I couldn't find job deadbeef");
+    expect(reply).toContain("7c7683fa");
   });
 });
 

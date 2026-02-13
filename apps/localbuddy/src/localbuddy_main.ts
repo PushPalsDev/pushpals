@@ -15,9 +15,12 @@ import { randomUUID } from "crypto";
 import { CommunicationManager, detectRepoRoot } from "shared";
 import { createLLMClient, type LLMClient } from "../../remotebuddy/src/llm.js";
 import {
+  buildJobStatusReply,
   buildRequestStatusReply,
+  extractReferencedJobToken,
   isStatusLookupPrompt,
   type JobApiRow,
+  type JobLogApiRow,
   type RequestApiRow,
 } from "./request_status.js";
 import {
@@ -225,6 +228,12 @@ interface JobListResponse {
   message?: string;
 }
 
+interface JobLogListResponse {
+  ok: boolean;
+  logs?: JobLogApiRow[];
+  message?: string;
+}
+
 function parseRemoteBuddyCommand(input: string): {
   forceRemote: boolean;
   prompt: string;
@@ -377,11 +386,50 @@ Respond in strict JSON with this shape:
 
       const requestsPayload = (await requestData.json()) as RequestListResponse;
       const jobsPayload = (await jobData.json()) as JobListResponse;
+      const sessionJobs = (jobsPayload.jobs ?? []).filter((row) => row.sessionId === this.sessionId);
+
+      let logs: JobLogApiRow[] = [];
+      const requestedJobToken = extractReferencedJobToken(userPrompt);
+      const mightBeJobQuery =
+        Boolean(requestedJobToken) || /\b(job|workerpal|task)\b/i.test(userPrompt);
+      if (mightBeJobQuery && sessionJobs.length > 0) {
+        let selectedJob: JobApiRow | null =
+          sessionJobs.find((row) => row.status === "claimed") ??
+          sessionJobs.find((row) => row.status === "pending") ??
+          sessionJobs[0];
+        if (requestedJobToken) {
+          const token = requestedJobToken.toLowerCase();
+          const matchedJob =
+            sessionJobs.find((row) => row.id.toLowerCase() === token) ??
+            sessionJobs.find((row) => row.id.toLowerCase().startsWith(token)) ??
+            null;
+          selectedJob = matchedJob;
+        }
+        if (selectedJob) {
+          const logsRes = await fetch(`${this.server}/jobs/${selectedJob.id}/logs?limit=10`, {
+            headers: this.authHeaders(),
+          });
+          if (logsRes.ok) {
+            const logsPayload = (await logsRes.json()) as JobLogListResponse;
+            logs = logsPayload.logs ?? [];
+          }
+        }
+      }
+
+      const jobReply = buildJobStatusReply({
+        userPrompt,
+        sessionId: this.sessionId,
+        jobs: jobsPayload.jobs ?? [],
+        logs,
+        summarizeFailure: summarizeFailureForPrompt,
+      });
+      if (jobReply) return jobReply;
+
       return buildRequestStatusReply({
         userPrompt,
         sessionId: this.sessionId,
         requests: requestsPayload.requests ?? [],
-        jobs: jobsPayload.jobs ?? [],
+        jobs: sessionJobs,
         summarizeFailure: summarizeFailureForPrompt,
       });
     } catch (err) {
