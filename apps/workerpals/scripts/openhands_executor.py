@@ -466,6 +466,39 @@ def _pick_configured_or_available_model(
     return DEFAULT_OPENHANDS_MODEL, "default_local_model"
 
 
+def _is_model_load_failure(error_text: str) -> bool:
+    lowered = error_text.lower()
+    return (
+        "failed to load model" in lowered
+        or "model loading was stopped" in lowered
+        or "insufficient system resources" in lowered
+        or "out of memory" in lowered
+        or ("model" in lowered and "not found" in lowered)
+    )
+
+
+def _fallback_models_after_load_failure(
+    base_url: str,
+    provider: str,
+    api_key: str,
+    failed_model: str,
+) -> Tuple[List[str], str]:
+    available_models, probe_detail = _discover_available_models(base_url, provider, api_key)
+    candidates: List[str] = []
+    failed_norm = _normalize_litellm_model(failed_model, provider)
+
+    for model in available_models:
+        normalized = _normalize_litellm_model(model, provider)
+        if normalized and normalized != failed_norm:
+            candidates.append(normalized)
+
+    default_fallback = _normalize_litellm_model(DEFAULT_OPENHANDS_MODEL, provider)
+    if default_fallback and default_fallback != failed_norm:
+        candidates.append(default_fallback)
+
+    return list(dict.fromkeys(candidates)), probe_detail
+
+
 def _resolve_llm_config() -> Tuple[str, str, str]:
     raw_model = (
         os.environ.get("WORKERPALS_OPENHANDS_MODEL")
@@ -740,122 +773,178 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
             "exitCode": 2,
         }
 
-    llm_kwargs: Dict[str, Any] = {"model": model, "api_key": api_key}
+    llm_kwargs_base: Dict[str, Any] = {"api_key": api_key}
     if base_url:
-        llm_kwargs["base_url"] = base_url
+        llm_kwargs_base["base_url"] = base_url
     if _looks_local_base_url(base_url):
         # Local model servers should fail fast on connectivity issues instead
         # of spending long retry windows that hit outer Docker timeouts.
-        llm_kwargs["num_retries"] = max(
+        llm_kwargs_base["num_retries"] = max(
             0, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_NUM_RETRIES"), 2)
         )
-        llm_kwargs["retry_multiplier"] = max(
+        llm_kwargs_base["retry_multiplier"] = max(
             1.0, _to_float(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MULTIPLIER"), 1.5)
         )
-        llm_kwargs["retry_min_wait"] = max(
+        llm_kwargs_base["retry_min_wait"] = max(
             1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MIN_WAIT"), 1)
         )
-        llm_kwargs["retry_max_wait"] = max(
-            llm_kwargs["retry_min_wait"],
+        llm_kwargs_base["retry_max_wait"] = max(
+            llm_kwargs_base["retry_min_wait"],
             _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MAX_WAIT"), 4),
         )
-        llm_kwargs["timeout"] = max(
+        llm_kwargs_base["timeout"] = max(
             5, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_TIMEOUT_SEC"), 90)
         )
         # LM Studio/llama.cpp can fail with n_keep >= n_ctx when large prompts
         # are cache-pinned. Disable prompt caching for local endpoints.
-        llm_kwargs["caching_prompt"] = False
+        llm_kwargs_base["caching_prompt"] = False
 
-    try:
-        llm = LLM(**llm_kwargs)
-        tools = [
-            Tool(name=TerminalTool.name),
-            Tool(name=FileEditorTool.name),
-        ]
-        agent_overrides = _resolve_agent_prompt_overrides(base_url)
-        if agent_overrides:
-            sys.stderr.write(
-                "[OpenHandsExecutor] Using minimal OpenHands prompt profile for local context constraints.\n"
-            )
-            sys.stderr.flush()
+    tools = [
+        Tool(name=TerminalTool.name),
+        Tool(name=FileEditorTool.name),
+    ]
+    agent_overrides = _resolve_agent_prompt_overrides(base_url)
+    if agent_overrides:
+        sys.stderr.write(
+            "[OpenHandsExecutor] Using minimal OpenHands prompt profile for local context constraints.\n"
+        )
+        sys.stderr.flush()
+
+    prepared_instruction, handoff_path = _prepare_instruction_for_agent(repo, instruction)
+    if handoff_path:
+        sys.stderr.write(
+            f"[OpenHandsExecutor] Large instruction handoff enabled ({len(instruction)} chars): {handoff_path}\n"
+        )
+        sys.stderr.flush()
+    user_message = _build_agent_user_message(prepared_instruction)
+    max_steps = max(1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_AGENT_MAX_STEPS"), 30))
+
+    provider = _infer_litellm_provider(base_url)
+    models_to_try: List[str] = [model]
+    attempted_models: List[str] = []
+    last_error_text = ""
+
+    while models_to_try:
+        active_model = models_to_try.pop(0)
+        if active_model in attempted_models:
+            continue
+        attempted_models.append(active_model)
+
+        llm_kwargs = dict(llm_kwargs_base)
+        llm_kwargs["model"] = active_model
+
         try:
-            agent = Agent(llm=llm, tools=tools, **agent_overrides)
-        except TypeError:
-            # Older SDK versions may not support explicit prompt override kwargs.
-            if agent_overrides:
-                sys.stderr.write(
-                    "[OpenHandsExecutor] Prompt profile overrides unsupported by installed OpenHands SDK; using defaults.\n"
-                )
-                sys.stderr.flush()
-            agent = Agent(llm=llm, tools=tools)
-        conversation = Conversation(agent=agent, workspace=repo)
-        prepared_instruction, handoff_path = _prepare_instruction_for_agent(repo, instruction)
-        if handoff_path:
-            sys.stderr.write(
-                f"[OpenHandsExecutor] Large instruction handoff enabled ({len(instruction)} chars): {handoff_path}\n"
-            )
-            sys.stderr.flush()
-        user_message = _build_agent_user_message(prepared_instruction)
-        conversation.send_message(user_message)
+            llm = LLM(**llm_kwargs)
+            try:
+                agent = Agent(llm=llm, tools=tools, **agent_overrides)
+            except TypeError:
+                # Older SDK versions may not support explicit prompt override kwargs.
+                if agent_overrides:
+                    sys.stderr.write(
+                        "[OpenHandsExecutor] Prompt profile overrides unsupported by installed OpenHands SDK; using defaults.\n"
+                    )
+                    sys.stderr.flush()
+                agent = Agent(llm=llm, tools=tools)
 
-        max_steps = max(1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_AGENT_MAX_STEPS"), 30))
-        try:
-            conversation.run(max_steps=max_steps)
-        except TypeError:
-            # SDK versions differ; fall back to default run() signature.
-            conversation.run()
+            conversation = Conversation(agent=agent, workspace=repo)
+            conversation.send_message(user_message)
+            try:
+                conversation.run(max_steps=max_steps)
+            except TypeError:
+                # SDK versions differ; fall back to default run() signature.
+                conversation.run()
 
-        changed_paths = _summarize_git_changes(repo)
-        if changed_paths:
-            listed = "\n".join(f"- {path}" for path in changed_paths[:40])
-            if len(changed_paths) > 40:
-                listed += "\n- ..."
+            changed_paths = _summarize_git_changes(repo)
+            if changed_paths:
+                listed = "\n".join(f"- {path}" for path in changed_paths[:40])
+                if len(changed_paths) > 40:
+                    listed += "\n- ..."
+                return {
+                    "ok": True,
+                    "summary": f"Executed task and modified {len(changed_paths)} file(s)",
+                    "stdout": f"Changed files:\n{listed}",
+                    "stderr": "",
+                    "exitCode": 0,
+                }
             return {
                 "ok": True,
-                "summary": f"Executed task and modified {len(changed_paths)} file(s)",
-                "stdout": f"Changed files:\n{listed}",
+                "summary": "Executed task via OpenHands agent (no file changes detected)",
+                "stdout": "No modified files were detected after execution.",
                 "stderr": "",
                 "exitCode": 0,
             }
-        return {
-            "ok": True,
-            "summary": "Executed task via OpenHands agent (no file changes detected)",
-            "stdout": "No modified files were detected after execution.",
-            "stderr": "",
-            "exitCode": 0,
-        }
-    except Exception as exc:
-        err_text = str(exc)
-        lowered = err_text.lower()
-        if "connection error" in lowered or "connection refused" in lowered:
+        except Exception as exc:
+            err_text = str(exc)
+            last_error_text = err_text
+            lowered = err_text.lower()
+
+            if _is_model_load_failure(err_text):
+                fallback_models, probe_detail = _fallback_models_after_load_failure(
+                    base_url, provider, api_key, active_model
+                )
+                pending = set(models_to_try)
+                new_candidates = [
+                    m for m in fallback_models if m not in attempted_models and m not in pending
+                ]
+                if new_candidates:
+                    sys.stderr.write(
+                        "[OpenHandsExecutor] Model load failure for "
+                        f"{active_model}; retrying with fallback model(s): "
+                        f"{', '.join(new_candidates)}\n"
+                    )
+                    sys.stderr.flush()
+                    models_to_try.extend(new_candidates)
+                    continue
+                return {
+                    "ok": False,
+                    "summary": "OpenHands model failed to load and no fallback model succeeded",
+                    "stderr": (
+                        f"{err_text}\n"
+                        f"Attempted models: {', '.join(attempted_models)}\n"
+                        f"Model probe detail: {probe_detail}"
+                    ),
+                    "exitCode": 2,
+                }
+
+            if "connection error" in lowered or "connection refused" in lowered:
+                return {
+                    "ok": False,
+                    "summary": "OpenHands could not connect to the configured local LLM endpoint",
+                    "stderr": (
+                        f"{err_text}\n"
+                        f"Model: {active_model}\n"
+                        f"Base URL: {base_url}\n"
+                        "Verify the host LLM server is running and reachable from Docker."
+                    ),
+                    "exitCode": 2,
+                }
+            if "cannot truncate prompt with n_keep" in lowered and "n_ctx" in lowered:
+                return {
+                    "ok": False,
+                    "summary": "OpenHands prompt exceeded LM Studio context window",
+                    "stderr": (
+                        f"{err_text}\n"
+                        "Reduce overall prompt/context size, increase model context window, "
+                        "or use a model/runtime with larger context support."
+                    ),
+                    "exitCode": 2,
+                }
             return {
                 "ok": False,
-                "summary": "OpenHands could not connect to the configured local LLM endpoint",
-                "stderr": (
-                    f"{err_text}\n"
-                    f"Model: {model}\n"
-                    f"Base URL: {base_url}\n"
-                    "Verify the host LLM server is running and reachable from Docker."
-                ),
-                "exitCode": 2,
+                "summary": "OpenHands agent task execution failed",
+                "stderr": err_text,
+                "exitCode": 1,
             }
-        if "cannot truncate prompt with n_keep" in lowered and "n_ctx" in lowered:
-            return {
-                "ok": False,
-                "summary": "OpenHands prompt exceeded LM Studio context window",
-                "stderr": (
-                    f"{err_text}\n"
-                    "Reduce overall prompt/context size, increase model context window, "
-                    "or use a model/runtime with larger context support."
-                ),
-                "exitCode": 2,
-            }
-        return {
-            "ok": False,
-            "summary": "OpenHands agent task execution failed",
-            "stderr": err_text,
-            "exitCode": 1,
-        }
+
+    return {
+        "ok": False,
+        "summary": "OpenHands model selection exhausted with no successful execution",
+        "stderr": (
+            f"Attempted models: {', '.join(attempted_models) if attempted_models else '(none)'}\n"
+            f"Last error: {last_error_text}"
+        ),
+        "exitCode": 2,
+    }
 
 
 def _job_to_command(
