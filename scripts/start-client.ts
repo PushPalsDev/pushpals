@@ -104,8 +104,9 @@ if (selectedPort !== basePort) {
   );
 }
 
+const bunBin = process.execPath || "bun";
 const child = Bun.spawn(
-  ["bun", "--cwd", "apps/client", "start", "--", "--port", String(selectedPort), ...forwarded],
+  [bunBin, "--cwd", "apps/client", "start", "--", "--port", String(selectedPort), ...forwarded],
   {
     stdin: "inherit",
     stdout: "inherit",
