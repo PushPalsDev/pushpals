@@ -39,6 +39,26 @@ const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
 const DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
 const DEFAULT_LMSTUDIO_CONTEXT_MODE = "batch";
 const DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES = 3;
+const KNOWN_PROVIDER_PREFIXES = new Set([
+  "openai",
+  "azure",
+  "ollama",
+  "openrouter",
+  "anthropic",
+  "google",
+  "gemini",
+  "vertex_ai",
+  "bedrock",
+  "cohere",
+  "groq",
+  "mistral",
+  "huggingface",
+  "replicate",
+  "deepseek",
+  "xai",
+  "together_ai",
+  "fireworks_ai",
+]);
 const REMOTEBUDDY_JSON_RESPONSE_SCHEMA: Record<string, unknown> = {
   name: "remotebuddy_response",
   strict: false,
@@ -144,6 +164,52 @@ function parseContextMode(value: string | null | undefined): "batch" | "truncate
   return normalized === "truncate" ? "truncate" : "batch";
 }
 
+function providerlessModelName(raw: string): string {
+  const normalized = raw.trim();
+  if (!normalized.includes("/")) return normalized;
+  const [provider, rest] = normalized.split("/", 2);
+  if (KNOWN_PROVIDER_PREFIXES.has(provider.trim().toLowerCase())) {
+    return (rest ?? "").trim();
+  }
+  return normalized;
+}
+
+function uniqueNonEmptyStrings(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function pickConfiguredOrAvailableModel(
+  configuredModel: string,
+  availableModels: string[],
+): { model: string; source: "configured" | "available_fallback" | "available_default" | "configured_unverified" | "default_local_model" } {
+  const configured = configuredModel.trim();
+  if (availableModels.length > 0) {
+    if (configured) {
+      const configuredLower = configured.toLowerCase();
+      const configuredBare = providerlessModelName(configured).toLowerCase();
+      const matched = availableModels.find((candidate) => {
+        const lower = candidate.toLowerCase();
+        return lower === configuredLower || providerlessModelName(candidate).toLowerCase() === configuredBare;
+      });
+      if (matched) return { model: matched, source: "configured" };
+      return { model: availableModels[0], source: "available_fallback" };
+    }
+    return { model: availableModels[0], source: "available_default" };
+  }
+
+  if (configured) return { model: configured, source: "configured_unverified" };
+  return { model: DEFAULT_MODEL, source: "default_local_model" };
+}
+
 function chunkByCharBudget(text: string, charBudget: number): string[] {
   if (!text) return [];
   const safeBudget = Math.max(256, charBudget);
@@ -231,6 +297,8 @@ export class LmStudioClient implements LLMClient {
   private endpoint: string;
   private apiKey: string;
   private model: string;
+  private resolvedModel: string | null = null;
+  private resolveModelPromise: Promise<string> | null = null;
 
   constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
     const rawEndpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? DEFAULT_LMSTUDIO_ENDPOINT;
@@ -239,12 +307,109 @@ export class LmStudioClient implements LLMClient {
     this.model = opts?.model ?? process.env.LLM_MODEL ?? DEFAULT_MODEL;
   }
 
+  private lmStudioModelProbeUrls(): string[] {
+    const trimmed = this.endpoint.replace(/\/+$/, "");
+    if (trimmed.endsWith("/v1/chat/completions")) {
+      const root = trimmed.slice(0, -"/v1/chat/completions".length);
+      return uniqueNonEmptyStrings([`${root}/v1/models`, `${root}/models`]);
+    }
+    if (trimmed.endsWith("/chat/completions")) {
+      const root = trimmed.slice(0, -"/chat/completions".length);
+      if (root.endsWith("/v1")) {
+        const parent = root.slice(0, -"/v1".length).replace(/\/+$/, "");
+        return uniqueNonEmptyStrings([`${root}/models`, `${parent}/models`]);
+      }
+      return uniqueNonEmptyStrings([`${root}/v1/models`, `${root}/models`]);
+    }
+    if (trimmed.endsWith("/v1")) {
+      const parent = trimmed.slice(0, -"/v1".length).replace(/\/+$/, "");
+      return uniqueNonEmptyStrings([`${trimmed}/models`, `${parent}/models`]);
+    }
+    return uniqueNonEmptyStrings([`${trimmed}/v1/models`, `${trimmed}/models`]);
+  }
+
+  private async discoverAvailableModels(): Promise<{ models: string[]; detail: string }> {
+    const probes = this.lmStudioModelProbeUrls();
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (this.apiKey.trim()) {
+      headers.Authorization = `Bearer ${this.apiKey.trim()}`;
+    }
+
+    let lastDetail = "model-list probe failed";
+    for (const url of probes) {
+      try {
+        const res = await fetch(url, { method: "GET", headers });
+        if (!res.ok) {
+          const body = await res.text();
+          const hint = body.trim().slice(0, 120);
+          lastDetail = `${url} -> HTTP ${res.status}${hint ? ` (${hint})` : ""}`;
+          continue;
+        }
+
+        const payload = (await res.json()) as { data?: Array<{ id?: unknown }> };
+        const models = Array.isArray(payload?.data)
+          ? payload.data
+              .map((item) => (typeof item?.id === "string" ? item.id.trim() : ""))
+              .filter((id) => id.length > 0)
+          : [];
+
+        if (models.length > 0) {
+          return { models: uniqueNonEmptyStrings(models), detail: `${url} -> ${res.status}` };
+        }
+        lastDetail = `${url} -> no models in payload`;
+      } catch (err) {
+        lastDetail = `${url}: ${String(err)}`;
+      }
+    }
+
+    return { models: [], detail: lastDetail };
+  }
+
+  private async resolveModelForRequest(): Promise<string> {
+    if (this.resolvedModel) return this.resolvedModel;
+    if (this.resolveModelPromise) return this.resolveModelPromise;
+
+    this.resolveModelPromise = (async () => {
+      const configuredModel = this.model.trim();
+      const discovered = await this.discoverAvailableModels();
+      const selected = pickConfiguredOrAvailableModel(configuredModel, discovered.models);
+
+      if (selected.source === "available_fallback") {
+        console.warn(
+          `[LLM] Configured model "${configuredModel || "(empty)"}" not present in LM Studio model list; using discovered fallback "${selected.model}".`,
+        );
+      } else if (selected.source === "available_default") {
+        console.warn(
+          `[LLM] No model configured; using discovered LM Studio model "${selected.model}".`,
+        );
+      } else if (selected.source === "default_local_model") {
+        console.warn(
+          `[LLM] No configured/discovered LM Studio model available; falling back to default "${DEFAULT_MODEL}".`,
+        );
+      } else if (selected.source === "configured_unverified") {
+        console.warn(
+          `[LLM] Could not verify configured model "${configuredModel}" via model list (${discovered.detail}); continuing with configured model.`,
+        );
+      }
+
+      return selected.model;
+    })();
+
+    try {
+      this.resolvedModel = await this.resolveModelPromise;
+      return this.resolvedModel;
+    } finally {
+      this.resolveModelPromise = null;
+    }
+  }
+
   private async runLmStudioCompletion(
     messages: Array<{ role: string; content: string }>,
     opts: { json?: boolean; maxTokens: number; temperature: number },
   ): Promise<LLMGenerateOutput> {
+    const model = await this.resolveModelForRequest();
     const baseBody: Record<string, unknown> = {
-      model: this.model,
+      model,
       messages,
       max_tokens: opts.maxTokens,
       temperature: opts.temperature,

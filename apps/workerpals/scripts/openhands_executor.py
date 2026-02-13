@@ -33,6 +33,7 @@ RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ "
 PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 _PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
 DEFAULT_LARGE_INSTRUCTION_CHARS = 1800
+DEFAULT_OPENHANDS_MODEL = "local-model"
 KNOWN_LITELLM_PROVIDER_PREFIXES: Set[str] = {
     "openai",
     "azure",
@@ -362,6 +363,109 @@ def _llm_endpoint_reachable(base_url: str, model: str, timeout: float = 2.0) -> 
     return False, last_error
 
 
+def _providerless_model_name(model: str) -> str:
+    normalized = model.strip()
+    if "/" not in normalized:
+        return normalized
+    provider = normalized.split("/", 1)[0].strip().lower()
+    if provider in KNOWN_LITELLM_PROVIDER_PREFIXES:
+        return normalized.split("/", 1)[1].strip()
+    return normalized
+
+
+def _model_candidates_url(base_url: str, provider: str) -> List[str]:
+    normalized = base_url.rstrip("/")
+    if not normalized:
+        return []
+    if provider == "ollama":
+        return [f"{normalized}/api/tags", f"{normalized}/tags"]
+    if normalized.endswith("/v1"):
+        root = normalized[: -len("/v1")].rstrip("/")
+        urls = [f"{normalized}/models"]
+        if root:
+            urls.append(f"{root}/models")
+        return urls
+    return [f"{normalized}/v1/models", f"{normalized}/models"]
+
+
+def _extract_model_ids(payload: Any, provider: str) -> List[str]:
+    ids: List[str] = []
+    if provider == "ollama":
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if isinstance(models, list):
+            for item in models:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("name", "model", "id"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        ids.append(value.strip())
+                        break
+        return list(dict.fromkeys(ids))
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("id")
+            if isinstance(value, str) and value.strip():
+                ids.append(value.strip())
+    return list(dict.fromkeys(ids))
+
+
+def _discover_available_models(
+    base_url: str, provider: str, api_key: str, timeout: float = 2.0
+) -> Tuple[List[str], str]:
+    if not base_url:
+        return [], "base URL is empty"
+
+    headers = {"Accept": "application/json"}
+    if api_key and provider == "openai":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    last_error = "model list probe failed"
+    for url in _model_candidates_url(base_url, provider):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                raw = res.read().decode("utf-8", errors="replace")
+                payload = json.loads(raw)
+                ids = _extract_model_ids(payload, provider)
+                if ids:
+                    return ids, f"{url} -> {getattr(res, 'status', '?')}"
+                last_error = f"{url}: no models found in payload"
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            hint = body[:120].strip() if body else ""
+            last_error = f"{url}: HTTP {exc.code}{f' ({hint})' if hint else ''}"
+        except Exception as exc:
+            last_error = f"{url}: {exc}"
+    return [], last_error
+
+
+def _pick_configured_or_available_model(
+    configured_model: str, available_models: List[str]
+) -> Tuple[str, str]:
+    configured = configured_model.strip()
+    if available_models:
+        if configured:
+            wanted = _providerless_model_name(configured).lower()
+            for candidate in available_models:
+                if _providerless_model_name(candidate).lower() == wanted:
+                    return candidate, "configured"
+            return available_models[0], "available_fallback"
+        return available_models[0], "available_default"
+
+    if configured:
+        return configured, "configured_unverified"
+
+    return DEFAULT_OPENHANDS_MODEL, "default_local_model"
+
+
 def _resolve_llm_config() -> Tuple[str, str, str]:
     raw_model = (
         os.environ.get("WORKERPALS_OPENHANDS_MODEL")
@@ -382,7 +486,7 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
         )
     )
     provider = _infer_litellm_provider(raw_base_url)
-    model = _normalize_litellm_model(raw_model, provider)
+    configured_model = _normalize_litellm_model(raw_model, provider)
     base_url = _normalize_base_url_for_provider(raw_base_url, provider)
     if _running_in_container():
         rewritten = _rewrite_localhost_for_container(base_url)
@@ -392,6 +496,35 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
             )
             sys.stderr.flush()
             base_url = rewritten
+    available_models, probe_detail = _discover_available_models(base_url, provider, api_key)
+    selected_model, selection_reason = _pick_configured_or_available_model(
+        configured_model, available_models
+    )
+    model = _normalize_litellm_model(selected_model, provider)
+    if selection_reason == "available_fallback":
+        sys.stderr.write(
+            "[OpenHandsExecutor] Configured model unavailable in LM Studio model list; "
+            f"using discovered fallback model: {selected_model}\n"
+        )
+        sys.stderr.flush()
+    elif selection_reason == "available_default":
+        sys.stderr.write(
+            "[OpenHandsExecutor] No model configured; using discovered model "
+            f"from endpoint: {selected_model}\n"
+        )
+        sys.stderr.flush()
+    elif selection_reason == "default_local_model":
+        sys.stderr.write(
+            "[OpenHandsExecutor] No configured/discovered model available; "
+            f"falling back to default model: {DEFAULT_OPENHANDS_MODEL}\n"
+        )
+        sys.stderr.flush()
+    elif selection_reason == "configured_unverified":
+        sys.stderr.write(
+            "[OpenHandsExecutor] Could not verify configured model against endpoint model list "
+            f"({probe_detail}); continuing with configured model: {configured_model}\n"
+        )
+        sys.stderr.flush()
     return model, api_key, base_url
 
 
