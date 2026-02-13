@@ -34,6 +34,20 @@ export function createRequestHandler() {
 
   const envPort = parseInt(process.env.PUSHPALS_PORT ?? "", 10);
   const port = Number.isFinite(envPort) && envPort > 0 ? envPort : 3001;
+  const staleClaimTtlMsRaw = parseInt(process.env.PUSHPALS_STALE_CLAIM_TTL_MS ?? "", 10);
+  const staleClaimTtlMs =
+    Number.isFinite(staleClaimTtlMsRaw) && staleClaimTtlMsRaw > 0
+      ? Math.max(5_000, staleClaimTtlMsRaw)
+      : 120_000;
+  const staleClaimSweepIntervalMsRaw = parseInt(
+    process.env.PUSHPALS_STALE_CLAIM_SWEEP_INTERVAL_MS ?? "",
+    10,
+  );
+  const staleClaimSweepIntervalMs =
+    Number.isFinite(staleClaimSweepIntervalMsRaw) && staleClaimSweepIntervalMsRaw > 0
+      ? Math.max(1_000, staleClaimSweepIntervalMsRaw)
+      : 5_000;
+  let lastStaleRecoverySweepAt = 0;
   return Bun.serve({
     port,
     hostname: "0.0.0.0",
@@ -59,6 +73,37 @@ export function createRequestHandler() {
         const parsed = raw ? parseInt(raw, 10) : NaN;
         if (!Number.isFinite(parsed)) return fallback;
         return Math.max(1, Math.min(500, parsed));
+      };
+      const maybeRecoverStaleClaims = (): void => {
+        const nowMs = Date.now();
+        if (nowMs - lastStaleRecoverySweepAt < staleClaimSweepIntervalMs) return;
+        lastStaleRecoverySweepAt = nowMs;
+
+        const recovered = jobQueue.recoverStaleClaimedJobs(staleClaimTtlMs);
+        if (recovered.length === 0) return;
+
+        for (const item of recovered) {
+          console.warn(
+            `[Server] Recovered stale claimed job ${item.jobId} (worker=${item.workerId ?? "unknown"})`,
+          );
+          const session = sessionManager.getSession(item.sessionId);
+          if (!session) continue;
+
+          const envelope: EventEnvelope<"job_failed"> = {
+            protocolVersion: PROTOCOL_VERSION,
+            id: randomUUID(),
+            ts: item.recoveredAt,
+            sessionId: item.sessionId,
+            type: "job_failed",
+            from: "server:stale-claim-recovery",
+            payload: {
+              jobId: item.jobId,
+              message: item.message,
+              detail: item.detail,
+            },
+          };
+          session.emit(envelope);
+        }
       };
 
       // Handle CORS preflight
@@ -268,6 +313,7 @@ export function createRequestHandler() {
       if (pathname === "/jobs/claim" && method === "POST") {
         const denied = requireAuth();
         if (denied) return denied;
+        maybeRecoverStaleClaims();
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const workerId = (body.workerId as string) || "unknown";
@@ -289,6 +335,7 @@ export function createRequestHandler() {
       if (pathname === "/workers" && method === "GET") {
         const denied = requireAuth();
         if (denied) return denied;
+        maybeRecoverStaleClaims();
 
         const ttlMsRaw = parseInt(url.searchParams.get("ttlMs") ?? "", 10);
         const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
@@ -300,6 +347,7 @@ export function createRequestHandler() {
       if (pathname === "/system/status" && method === "GET") {
         const denied = requireAuth();
         if (denied) return denied;
+        maybeRecoverStaleClaims();
 
         const ttlMsRaw = parseInt(url.searchParams.get("ttlMs") ?? "", 10);
         const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
@@ -351,6 +399,7 @@ export function createRequestHandler() {
       if (pathname === "/jobs" && method === "GET") {
         const denied = requireAuth();
         if (denied) return denied;
+        maybeRecoverStaleClaims();
 
         const status = (url.searchParams.get("status") ?? "all").trim().toLowerCase();
         const limit = parseLimit(url.searchParams.get("limit"));

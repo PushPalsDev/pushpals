@@ -210,7 +210,9 @@ async function executeWithOpenHands(
       stderr: "pipe",
     });
 
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       try {
         proc.kill();
       } catch (_e) {}
@@ -244,6 +246,15 @@ async function executeWithOpenHands(
       .trim();
 
     if (!parsed) {
+      if (timedOut) {
+        return {
+          ok: false,
+          summary: `OpenHands wrapper timed out after ${timeoutMs}ms for ${kind}`,
+          stdout: truncate(filteredStdout),
+          stderr: truncate(stderr),
+          exitCode: exitCode === 0 ? 124 : exitCode,
+        };
+      }
       return {
         ok: false,
         summary: `OpenHands wrapper did not return a structured result for ${kind}`,

@@ -183,19 +183,63 @@ class LocalBuddyServer {
       authToken,
       from: `agent:${agentId}`,
     });
-    void comm
-      .status(agentId, "idle", "LocalBuddy online and ready")
-      .then((ok) => {
-        if (!ok) {
-          console.warn("[LocalBuddy] Failed to emit startup status event");
+    let stopping = false;
+    let statusSessionReady = false;
+    const ensureSessionWithRetry = async (
+      maxRetries = 20,
+      baseDelayMs = 500,
+      maxDelayMs = 5000,
+    ): Promise<boolean> => {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+      for (let attempt = 1; attempt <= maxRetries && !stopping; attempt++) {
+        try {
+          const res = await fetch(`${serverUrl}/sessions`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ sessionId }),
+          });
+          if (res.ok) return true;
+        } catch {
+          // retry
         }
-      })
-      .catch((err) => console.warn("[LocalBuddy] Startup status emit error:", err));
+        const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+        await Bun.sleep(delayMs);
+      }
+      return false;
+    };
+    const emitStartupPresence = async (): Promise<void> => {
+      const ready = await ensureSessionWithRetry();
+      if (!ready) {
+        console.warn("[LocalBuddy] Could not ensure session for startup presence events");
+        return;
+      }
+      statusSessionReady = true;
+      const statusOk = await comm.status(agentId, "idle", "LocalBuddy online and ready");
+      if (!statusOk) {
+        statusSessionReady = false;
+        console.warn("[LocalBuddy] Failed to emit startup status event");
+      }
+      const msgOk = await comm.assistantMessage("LocalBuddy online and ready.");
+      if (!msgOk) {
+        console.warn("[LocalBuddy] Failed to emit startup welcome message");
+      }
+    };
+    void emitStartupPresence();
     const statusHeartbeatMs = parseStatusHeartbeatMs("LOCALBUDDY_STATUS_HEARTBEAT_MS", 120_000);
     const statusHeartbeatTimer =
       statusHeartbeatMs > 0
         ? setInterval(() => {
-            void comm.status(agentId, "idle", "LocalBuddy heartbeat");
+            void (async () => {
+              if (stopping) return;
+              if (!statusSessionReady) {
+                statusSessionReady = await ensureSessionWithRetry(3, 400, 2500);
+              }
+              const ok = await comm.status(agentId, "idle", "LocalBuddy heartbeat");
+              if (!ok) {
+                statusSessionReady = false;
+              }
+            })();
           }, statusHeartbeatMs)
         : null;
 
@@ -226,6 +270,7 @@ class LocalBuddyServer {
     );
 
     const stopMonitor = () => {
+      stopping = true;
       void comm.status(agentId, "shutting_down", "LocalBuddy shutting down");
       if (statusHeartbeatTimer) {
         clearInterval(statusHeartbeatTimer);
@@ -294,6 +339,17 @@ class LocalBuddyServer {
               })
               .catch((err) =>
                 console.error(`[LocalBuddy] Failed to emit user message to session:`, err),
+              );
+
+            void comm
+              .assistantMessage("Received your request. Preparing context and queueing it now.")
+              .then((ok) => {
+                if (!ok) {
+                  console.error(`[LocalBuddy] Failed to emit immediate acknowledgement message`);
+                }
+              })
+              .catch((err) =>
+                console.error(`[LocalBuddy] Failed to emit immediate acknowledgement message:`, err),
               );
 
             // ── Process and stream status back via SSE ──

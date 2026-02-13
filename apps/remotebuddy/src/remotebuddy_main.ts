@@ -231,6 +231,7 @@ class RemoteBuddyOrchestrator {
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private statusSessionReady = false;
   private stopSessionEvents: (() => void) | null = null;
   private readonly seenJobFailures = new Set<string>();
   private readonly eventMonitorStartedAt = Date.now();
@@ -305,13 +306,23 @@ class RemoteBuddyOrchestrator {
   }
 
   async emitStartupStatus(): Promise<void> {
+    this.statusSessionReady = await this.ensureSessionWithRetry();
+    if (!this.statusSessionReady) {
+      console.warn("[RemoteBuddy] Could not ensure session for startup presence events");
+      return;
+    }
     const ok = await this.comm.status(
       this.agentId,
       "idle",
       "RemoteBuddy online and waiting for requests",
     );
     if (!ok) {
+      this.statusSessionReady = false;
       console.warn("[RemoteBuddy] Failed to emit startup status event");
+    }
+    const msgOk = await this.comm.assistantMessage("RemoteBuddy online and waiting for requests.");
+    if (!msgOk) {
+      console.warn("[RemoteBuddy] Failed to emit startup welcome message");
     }
   }
 
@@ -319,8 +330,38 @@ class RemoteBuddyOrchestrator {
     if (this.statusHeartbeatMs <= 0 || this.statusHeartbeatTimer) return;
     this.statusHeartbeatTimer = setInterval(() => {
       if (this.disposed) return;
-      void this.comm.status(this.agentId, "idle", "RemoteBuddy heartbeat");
+      void (async () => {
+        if (!this.statusSessionReady) {
+          this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2500);
+        }
+        const ok = await this.comm.status(this.agentId, "idle", "RemoteBuddy heartbeat");
+        if (!ok) {
+          this.statusSessionReady = false;
+        }
+      })();
     }, this.statusHeartbeatMs);
+  }
+
+  private async ensureSessionWithRetry(
+    maxRetries = 20,
+    baseDelayMs = 500,
+    maxDelayMs = 5000,
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= maxRetries && !this.disposed; attempt++) {
+      try {
+        const res = await fetch(`${this.server}/sessions`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          body: JSON.stringify({ sessionId: this.sessionId }),
+        });
+        if (res.ok) return true;
+      } catch {
+        // retry
+      }
+      const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+      await Bun.sleep(delayMs);
+    }
+    return false;
   }
 
   // ── HTTP helpers ──────────────────────────────────────────────────────

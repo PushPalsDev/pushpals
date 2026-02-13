@@ -310,19 +310,35 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
       const jobId = p.jobId as string;
       if (!jobId) return { ...state, lastCursor, seenIds };
       const jobs = new Map(state.jobs);
+      const tasks = new Map(state.tasks);
       const existing = jobs.get(jobId);
       if (existing) {
+        const failedMessage = (p.message as string) ?? undefined;
         jobs.set(jobId, {
           ...existing,
           status: "failed",
-          message: (p.message as string) ?? undefined,
+          message: failedMessage,
           detail: (p.detail as string) ?? undefined,
         });
+
+        const task = tasks.get(existing.taskId);
+        if (task && task.status !== "completed") {
+          const hasActiveSiblingJob = Array.from(jobs.values()).some(
+            (job) => job.taskId === existing.taskId && (job.status === "enqueued" || job.status === "claimed"),
+          );
+          if (!hasActiveSiblingJob) {
+            tasks.set(existing.taskId, {
+              ...task,
+              status: "failed",
+              message: failedMessage ?? task.message,
+            });
+          }
+        }
       }
       // Terminal status — free dedup memory (no more logs expected)
       const logSeenKeys = new Map(state.logSeenKeys);
       logSeenKeys.delete(jobId);
-      return { ...state, jobs, logSeenKeys, lastCursor, seenIds };
+      return { ...state, jobs, tasks, logSeenKeys, lastCursor, seenIds };
     }
 
     // ── Streaming logs ────────────────────────────────────────────────────

@@ -230,6 +230,7 @@ try {
 
 let running = true;
 let statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let statusSessionReady = false;
 
 function createSessionComm(sessionId: string): CommunicationManager {
   return new CommunicationManager({
@@ -274,6 +275,7 @@ async function ensureSessionWithRetry(
 async function emitStartupStatus(): Promise<void> {
   const sessionReady = await ensureSessionWithRetry(statusSessionId);
   if (!sessionReady) return;
+  statusSessionReady = true;
   const comm = createSessionComm(statusSessionId);
   const ok = await comm.status(
     "source_control_manager",
@@ -281,7 +283,12 @@ async function emitStartupStatus(): Promise<void> {
     "SourceControlManager online and monitoring completions",
   );
   if (!ok) {
+    statusSessionReady = false;
     console.warn(`[${ts()}] Failed to emit source_control_manager startup status event`);
+  }
+  const msgOk = await comm.assistantMessage("SourceControlManager online and monitoring completions.");
+  if (!msgOk) {
+    console.warn(`[${ts()}] Failed to emit source_control_manager startup welcome message`);
   }
 }
 
@@ -290,7 +297,15 @@ function startStatusHeartbeat(): void {
   const comm = createSessionComm(statusSessionId);
   statusHeartbeatTimer = setInterval(() => {
     if (!running) return;
-    void comm.status("source_control_manager", "idle", "SourceControlManager heartbeat");
+    void (async () => {
+      if (!statusSessionReady) {
+        statusSessionReady = await ensureSessionWithRetry(statusSessionId, 3, 400, 2500);
+      }
+      const ok = await comm.status("source_control_manager", "idle", "SourceControlManager heartbeat");
+      if (!ok) {
+        statusSessionReady = false;
+      }
+    })();
   }, statusHeartbeatMs);
 }
 

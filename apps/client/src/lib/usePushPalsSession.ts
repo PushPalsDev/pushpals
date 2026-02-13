@@ -218,10 +218,20 @@ export function usePushPalsSession(
   // ─── Computed: task groups ─────────────────────────────────────────────
   const tasks = useMemo(() => {
     const map = new Map<string, TaskGroup>();
+    const jobToTask = new Map<string, string>();
+
     for (const ev of session.events) {
       if (!isEnvelope(ev)) continue;
       const p = ev.payload as any;
-      const taskId: string | undefined = p?.taskId;
+      const payloadTaskId: string | undefined = typeof p?.taskId === "string" ? p.taskId : undefined;
+      const payloadJobId: string | undefined = typeof p?.jobId === "string" ? p.jobId : undefined;
+
+      if (ev.type === "job_enqueued" && payloadTaskId && payloadJobId) {
+        jobToTask.set(payloadJobId, payloadTaskId);
+      }
+
+      const taskId: string | undefined =
+        payloadTaskId ?? (ev.type === "job_failed" && payloadJobId ? jobToTask.get(payloadJobId) : undefined);
       if (!taskId) continue;
 
       if (!map.has(taskId)) {
@@ -234,12 +244,16 @@ export function usePushPalsSession(
       }
       const group = map.get(taskId)!;
       group.events.push(ev);
+      if ((!group.title || group.title === taskId) && typeof p?.title === "string" && p.title.trim()) {
+        group.title = p.title;
+      }
 
       // Update status based on lifecycle events
       if (ev.type === "task_started") group.status = "started";
       else if (ev.type === "task_progress") group.status = "in_progress";
       else if (ev.type === "task_completed") group.status = "completed";
       else if (ev.type === "task_failed") group.status = "failed";
+      else if (ev.type === "job_failed" && group.status !== "completed") group.status = "failed";
     }
     return Array.from(map.values());
   }, [session.events]);

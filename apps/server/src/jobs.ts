@@ -46,6 +46,16 @@ export interface WorkerRow {
   isOnline: boolean;
 }
 
+export interface RecoveredStaleJob {
+  jobId: string;
+  taskId: string;
+  sessionId: string;
+  workerId: string | null;
+  message: string;
+  detail: string;
+  recoveredAt: string;
+}
+
 function parseObjectJson(value: string | null): Record<string, unknown> {
   if (!value) return {};
   try {
@@ -356,6 +366,99 @@ export class JobQueue {
 
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return { ok: true };
+  }
+
+  recoverStaleClaimedJobs(staleAfterMs: number, limit = 100): RecoveredStaleJob[] {
+    const ttlMs = Number.isFinite(staleAfterMs) ? Math.max(5_000, Math.floor(staleAfterMs)) : 120_000;
+    const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(500, Math.floor(limit))) : 100;
+    const cutoff = new Date(Date.now() - ttlMs).toISOString();
+
+    type StaleCandidate = {
+      jobId: string;
+      taskId: string;
+      sessionId: string;
+      workerId: string | null;
+      jobUpdatedAt: string;
+      workerLastHeartbeat: string | null;
+    };
+
+    const candidates = this.db
+      .prepare(
+        `SELECT
+           j.id AS jobId,
+           j.taskId AS taskId,
+           j.sessionId AS sessionId,
+           j.workerId AS workerId,
+           j.updatedAt AS jobUpdatedAt,
+           w.lastHeartbeat AS workerLastHeartbeat
+         FROM jobs j
+         LEFT JOIN workers w ON w.workerId = j.workerId
+         WHERE j.status = 'claimed'
+           AND j.updatedAt < ?
+           AND (
+             j.workerId IS NULL
+             OR w.workerId IS NULL
+             OR w.lastHeartbeat < ?
+           )
+         ORDER BY j.updatedAt ASC
+         LIMIT ?`,
+      )
+      .all(cutoff, cutoff, maxRows) as StaleCandidate[];
+
+    if (candidates.length === 0) return [];
+
+    const now = new Date().toISOString();
+    const recovered: RecoveredStaleJob[] = [];
+
+    const tx = this.db.transaction((rows: StaleCandidate[]) => {
+      for (const row of rows) {
+        const message = "Job auto-failed after stale worker claim";
+        const detailParts = [
+          row.workerId ? `worker=${row.workerId}` : "worker=missing",
+          row.workerLastHeartbeat
+            ? `lastHeartbeat=${row.workerLastHeartbeat}`
+            : "lastHeartbeat=missing",
+          `jobUpdatedAt=${row.jobUpdatedAt}`,
+          `staleAfterMs=${ttlMs}`,
+        ];
+        const detail = detailParts.join("; ");
+
+        const info = this.db
+          .prepare(
+            `UPDATE jobs
+             SET status = 'failed', error = ?, updatedAt = ?
+             WHERE id = ? AND status = 'claimed'`,
+          )
+          .run(JSON.stringify({ message, detail }), now, row.jobId);
+
+        if (info.changes === 0) continue;
+
+        if (row.workerId) {
+          this.db
+            .prepare(
+              `UPDATE workers
+               SET status = 'offline',
+                   currentJobId = CASE WHEN currentJobId = ? THEN NULL ELSE currentJobId END,
+                   updatedAt = ?
+               WHERE workerId = ?`,
+            )
+            .run(row.jobId, now, row.workerId);
+        }
+
+        recovered.push({
+          jobId: row.jobId,
+          taskId: row.taskId,
+          sessionId: row.sessionId,
+          workerId: row.workerId,
+          message,
+          detail,
+          recoveredAt: now,
+        });
+      }
+    });
+
+    tx(candidates);
+    return recovered;
   }
 
   private setWorkerIdleIfNoClaimedJobs(workerId: string | null, now: string): void {
