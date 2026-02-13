@@ -203,6 +203,87 @@ function sanitizeLocalReply(raw: string, userPrompt: string): string {
   return text || fallbackLocalReply(userPrompt);
 }
 
+type QueueStatus = "pending" | "claimed" | "completed" | "failed";
+
+interface RequestApiRow {
+  id: string;
+  sessionId: string;
+  originalPrompt: string;
+  status: QueueStatus;
+  agentId: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface JobApiRow {
+  id: string;
+  taskId: string;
+  sessionId: string;
+  status: QueueStatus;
+  workerId: string | null;
+  params: string;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface RequestListResponse {
+  ok: boolean;
+  requests?: RequestApiRow[];
+  message?: string;
+}
+
+interface JobListResponse {
+  ok: boolean;
+  jobs?: JobApiRow[];
+  message?: string;
+}
+
+function extractReferencedRequestToken(input: string): string | null {
+  const text = String(input ?? "").trim();
+  if (!text) return null;
+
+  const fullId = text.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i);
+  if (fullId) return fullId[0].toLowerCase();
+
+  const contextualShort = text.match(
+    /\b(?:request|req|job)(?:\s+id)?\s*(?:is|=|:)?\s*([0-9a-f]{8})\b/i,
+  );
+  if (contextualShort) return contextualShort[1].toLowerCase();
+
+  const bareShort = text.match(/\b[0-9a-f]{8}\b/i);
+  if (
+    bareShort &&
+    /\b(request|req|job|status|progress|update|check|doing|queue|queued)\b/i.test(text)
+  ) {
+    return bareShort[0].toLowerCase();
+  }
+  return null;
+}
+
+function isStatusLookupPrompt(input: string): boolean {
+  const text = String(input ?? "").trim().toLowerCase();
+  if (!text) return false;
+
+  if (extractReferencedRequestToken(text)) return true;
+
+  const hasEntity = /\b(request|job|workerpal|task)\b/.test(text);
+  const hasStatusCue =
+    /\b(status|progress|update|check|checking|doing|where|queue|queued|claimed|running|complete|completed|failed|stuck)\b/.test(
+      text,
+    );
+  if (hasEntity && hasStatusCue) return true;
+
+  return /\b(how(?:'s| is)?\s+my\s+status|what(?:'s| is)\s+my\s+status)\b/.test(text);
+}
+
+function formatClockTime(iso: string): string {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return "unknown";
+  return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
 function parseRemoteBuddyCommand(input: string): {
   forceRemote: boolean;
   prompt: string;
@@ -332,6 +413,9 @@ class LocalBuddyServer {
       return "I didn't receive a request. Try a quick question, or use /ask_remote_buddy <request> to route work to RemoteBuddy.";
     }
 
+    const statusReply = await this.answerRequestStatus(normalized);
+    if (statusReply) return statusReply;
+
     try {
       const output = await this.llm.generate({
         system: `${LOCAL_QUICK_REPLY_SYSTEM_PROMPT}
@@ -357,6 +441,158 @@ Respond in strict JSON with this shape:
     }
 
     return fallbackLocalReply(normalized);
+  }
+
+  private authHeaders(contentType = false): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (contentType) headers["Content-Type"] = "application/json";
+    if (this.authToken) headers["Authorization"] = `Bearer ${this.authToken}`;
+    return headers;
+  }
+
+  private parseStructuredError(raw: string | null): string {
+    if (!raw) return "";
+    const parsed = tryParseJsonObject(raw);
+    if (parsed) {
+      const message = typeof parsed.message === "string" ? parsed.message : "";
+      const detail = typeof parsed.detail === "string" ? parsed.detail : "";
+      const combined = [message, detail].filter(Boolean).join(" | ");
+      if (combined) return summarizeFailureForPrompt(combined);
+    }
+    return summarizeFailureForPrompt(raw);
+  }
+
+  private extractJobRequestId(job: JobApiRow): string | null {
+    const parsed = tryParseJsonObject(job.params);
+    if (!parsed) return null;
+    const requestId = parsed.requestId;
+    if (typeof requestId !== "string") return null;
+    const normalized = requestId.trim();
+    return normalized || null;
+  }
+
+  private async answerRequestStatus(userPrompt: string): Promise<string | null> {
+    if (!isStatusLookupPrompt(userPrompt)) return null;
+    const requestedToken = extractReferencedRequestToken(userPrompt);
+
+    try {
+      const [requestData, jobData] = await Promise.all([
+        fetch(`${this.server}/requests?status=all&limit=200`, {
+          headers: this.authHeaders(),
+        }),
+        fetch(`${this.server}/jobs?status=all&limit=400`, {
+          headers: this.authHeaders(),
+        }),
+      ]);
+
+      if (!requestData.ok) {
+        return `I couldn't check request status right now (requests API ${requestData.status}).`;
+      }
+      if (!jobData.ok) {
+        return `I couldn't check request status right now (jobs API ${jobData.status}).`;
+      }
+
+      const requestsPayload = (await requestData.json()) as RequestListResponse;
+      const jobsPayload = (await jobData.json()) as JobListResponse;
+
+      const requests = (requestsPayload.requests ?? []).filter(
+        (row) => row.sessionId === this.sessionId,
+      );
+      const jobs = (jobsPayload.jobs ?? []).filter((row) => row.sessionId === this.sessionId);
+
+      if (requests.length === 0) {
+        return "I don't see any requests in this session yet.";
+      }
+
+      let request: RequestApiRow | undefined;
+      if (requestedToken) {
+        const token = requestedToken.toLowerCase();
+        request = requests.find((row) => row.id.toLowerCase() === token);
+        if (!request) {
+          request = requests.find((row) => row.id.toLowerCase().startsWith(token));
+        }
+        if (!request) {
+          const latest = requests
+            .slice(0, 3)
+            .map((row) => row.id.slice(0, 8))
+            .join(", ");
+          return latest
+            ? `I couldn't find request ${requestedToken}. Recent request IDs: ${latest}.`
+            : `I couldn't find request ${requestedToken}.`;
+        }
+      } else {
+        request =
+          requests.find((row) => row.status === "pending" || row.status === "claimed") ?? requests[0];
+      }
+
+      if (!request) {
+        return "I couldn't resolve which request to check.";
+      }
+
+      const requestId = request.id;
+      const relatedJobs = jobs.filter((job) => this.extractJobRequestId(job) === requestId);
+      relatedJobs.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+
+      const requestShort = requestId.slice(0, 8);
+      const requestTime = formatClockTime(request.updatedAt);
+      let summary = `Request ${requestShort} is ${request.status} (updated ${requestTime}).`;
+
+      if (request.status === "claimed" && request.agentId) {
+        summary = `Request ${requestShort} is claimed by ${request.agentId} (updated ${requestTime}).`;
+      }
+      if (request.status === "failed") {
+        const requestError = this.parseStructuredError(request.error);
+        if (requestError) {
+          summary = `${summary} Failure: ${requestError}`;
+        }
+      }
+
+      if (relatedJobs.length === 0) {
+        if (request.status === "pending") {
+          return `${summary} It is waiting for RemoteBuddy to claim it.`;
+        }
+        if (request.status === "claimed") {
+          return `${summary} RemoteBuddy is still planning and has not enqueued a WorkerPal job yet.`;
+        }
+        if (request.status === "completed") {
+          return `${summary} RemoteBuddy finished orchestration; no WorkerPal job is linked yet.`;
+        }
+        return summary;
+      }
+
+      const latestJob = relatedJobs[0];
+      const latestJobShort = latestJob.id.slice(0, 8);
+      const latestJobTime = formatClockTime(latestJob.updatedAt);
+      let jobSummary = `Latest WorkerPal job ${latestJobShort} is ${latestJob.status} (updated ${latestJobTime})`;
+      if (latestJob.workerId) {
+        jobSummary += ` on ${latestJob.workerId}`;
+      }
+      jobSummary += ".";
+
+      if (latestJob.status === "failed") {
+        const jobError = this.parseStructuredError(latestJob.error);
+        if (jobError) {
+          jobSummary += ` Failure: ${jobError}`;
+        }
+      }
+
+      if (relatedJobs.length > 1) {
+        const counts: Record<QueueStatus, number> = {
+          pending: 0,
+          claimed: 0,
+          completed: 0,
+          failed: 0,
+        };
+        for (const row of relatedJobs) counts[row.status] += 1;
+        const countsText = `Jobs: ${relatedJobs.length} total (${counts.pending} pending, ${counts.claimed} claimed, ${counts.completed} completed, ${counts.failed} failed).`;
+        return `${summary} ${jobSummary} ${countsText}`;
+      }
+
+      return `${summary} ${jobSummary}`;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return `I couldn't check request status right now (${summarizeFailureForPrompt(reason)}).`;
+    }
   }
 
   /**
@@ -510,7 +746,8 @@ Respond in strict JSON with this shape:
             const routing = parseRemoteBuddyCommand(rawPrompt);
             const routedPrompt = routing.prompt;
             const forceRemote = routing.forceRemote;
-            const localOnly = !forceRemote && isLikelyLocalOnlyPrompt(routedPrompt);
+            const statusLookupIntent = isStatusLookupPrompt(routedPrompt);
+            const localOnly = !forceRemote && (statusLookupIntent || isLikelyLocalOnlyPrompt(routedPrompt));
 
             if (!rawPrompt.trim()) {
               return makeJson({ ok: false, message: "text is required" }, 400);
@@ -521,6 +758,8 @@ Respond in strict JSON with this shape:
             );
             if (forceRemote) {
               console.log("[LocalBuddy] Routing mode: forced RemoteBuddy via /ask_remote_buddy");
+            } else if (statusLookupIntent) {
+              console.log("[LocalBuddy] Routing mode: local status lookup");
             } else if (localOnly) {
               console.log("[LocalBuddy] Routing mode: local-only reply");
             } else {

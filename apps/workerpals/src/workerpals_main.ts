@@ -100,7 +100,7 @@ function parseArgs(): {
   let dockerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
   let gitToken =
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
-  let dockerTimeout = parseInt(process.env.WORKERPALS_DOCKER_TIMEOUT_MS ?? "480000", 10);
+  let dockerTimeout = parseInt(process.env.WORKERPALS_DOCKER_TIMEOUT_MS ?? "630000", 10);
   let dockerIdleTimeout = parseInt(process.env.WORKERPALS_DOCKER_IDLE_TIMEOUT_MS ?? "600000", 10);
   let dockerNetworkMode = (process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? "bridge").trim() || "bridge";
   let worktreeBaseRef = process.env.WORKERPALS_BASE_REF ?? `origin/${integrationBranchName()}`;
@@ -173,7 +173,7 @@ function parseArgs(): {
     requireDocker,
     dockerImage,
     gitToken,
-    dockerTimeout: Number.isFinite(dockerTimeout) && dockerTimeout > 0 ? dockerTimeout : 480000,
+    dockerTimeout: Number.isFinite(dockerTimeout) && dockerTimeout > 0 ? dockerTimeout : 630000,
     dockerIdleTimeout:
       Number.isFinite(dockerIdleTimeout) && dockerIdleTimeout >= 0 ? dockerIdleTimeout : 600000,
     dockerNetworkMode,

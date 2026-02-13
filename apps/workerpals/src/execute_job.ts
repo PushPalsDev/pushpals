@@ -191,8 +191,10 @@ async function executeWithOpenHands(
 
   const timeoutMs = Math.max(
     10_000,
-    parseInt(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS ?? "420000", 10) || 420_000,
+    parseInt(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS ?? "600000", 10) || 600_000,
   );
+  const timeoutWarningLeadMs = Math.min(60_000, Math.max(10_000, timeoutMs - 5_000));
+  const timeoutWarningDelayMs = Math.max(1_000, timeoutMs - timeoutWarningLeadMs);
   const payload = Buffer.from(
     JSON.stringify({
       kind,
@@ -203,6 +205,9 @@ async function executeWithOpenHands(
     "utf-8",
   ).toString("base64");
 
+  let warningTimer: ReturnType<typeof setTimeout> | null = null;
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+
   try {
     const proc = Bun.spawn([pythonBin, scriptPath, payload], {
       cwd: repo,
@@ -211,8 +216,20 @@ async function executeWithOpenHands(
     });
 
     let timedOut = false;
-    const timer = setTimeout(() => {
+    warningTimer = setTimeout(() => {
+      onLog?.(
+        "stderr",
+        `[OpenHandsExecutor] Timeout approaching for ${kind} (${Math.round(
+          timeoutWarningLeadMs / 1000,
+        )}s remaining). If unfinished, return a concise status/failure update now.`,
+      );
+    }, timeoutWarningDelayMs);
+    timeoutTimer = setTimeout(() => {
       timedOut = true;
+      onLog?.(
+        "stderr",
+        `[OpenHandsExecutor] Timeout reached for ${kind} after ${timeoutMs}ms; terminating wrapper process.`,
+      );
       try {
         proc.kill();
       } catch (_e) {}
@@ -222,7 +239,14 @@ async function executeWithOpenHands(
       onLog ? streamLines(proc.stdout, "stdout", onLog) : new Response(proc.stdout).text(),
       onLog ? streamLines(proc.stderr, "stderr", onLog) : new Response(proc.stderr).text(),
     ]);
-    clearTimeout(timer);
+    if (warningTimer) {
+      clearTimeout(warningTimer);
+      warningTimer = null;
+    }
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+      timeoutTimer = null;
+    }
     const exitCode = await proc.exited;
 
     const lines = stdout.split(/\r?\n/);
@@ -249,7 +273,7 @@ async function executeWithOpenHands(
       if (timedOut) {
         return {
           ok: false,
-          summary: `OpenHands wrapper timed out after ${timeoutMs}ms for ${kind}`,
+          summary: `OpenHands wrapper timed out after ${timeoutMs}ms for ${kind}. Worker returned a timeout failure.`,
           stdout: truncate(filteredStdout),
           stderr: truncate(stderr),
           exitCode: exitCode === 0 ? 124 : exitCode,
@@ -291,6 +315,13 @@ async function executeWithOpenHands(
       summary: `OpenHands wrapper execution error for ${kind}: ${String(err)}`,
       exitCode: 1,
     };
+  } finally {
+    if (warningTimer) {
+      clearTimeout(warningTimer);
+    }
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+    }
   }
 }
 

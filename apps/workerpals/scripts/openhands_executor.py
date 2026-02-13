@@ -754,6 +754,18 @@ def _large_instruction_threshold() -> int:
     return max(512, parsed)
 
 
+def _execution_timeout_ms() -> int:
+    raw = (os.environ.get("WORKERPALS_OPENHANDS_TIMEOUT_MS") or "").strip()
+    default_ms = 600000
+    if not raw:
+        return default_ms
+    try:
+        parsed = int(raw)
+    except Exception:
+        return default_ms
+    return max(10000, parsed)
+
+
 def _prepare_instruction_for_agent(repo: str, instruction: str) -> Tuple[str, str]:
     threshold = _large_instruction_threshold()
     if threshold <= 0 or len(instruction) <= threshold:
@@ -791,9 +803,16 @@ def _build_agent_user_message(instruction: str) -> str:
     small-context local runtimes (LM Studio/llama.cpp).
     """
 
+    timeout_minutes = max(1, round(_execution_timeout_ms() / 60000))
+    timeout_note = (
+        f"Time limit: about {timeout_minutes} minute(s) for this task. "
+        "If you cannot finish in time, stop and provide a concise status of what you checked, "
+        "what remains, and the blocker."
+    )
+
     mode = (os.environ.get("WORKERPALS_OPENHANDS_TASK_PROMPT_MODE") or "none").strip().lower()
     if mode in {"none", "off", "instruction_only", "instruction-only", "minimal"}:
-        return instruction
+        return f"{instruction}\n\n{timeout_note}"
 
     compact_agent_prompt = ""
     try:
@@ -809,7 +828,7 @@ def _build_agent_user_message(instruction: str) -> str:
             "Avoid unrelated docs or architecture summaries unless explicitly requested."
         )
 
-    return f"{compact_agent_prompt}\n\nTask:\n{instruction}"
+    return f"{compact_agent_prompt}\n\nTask:\n{instruction}\n\n{timeout_note}"
 
 
 def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:

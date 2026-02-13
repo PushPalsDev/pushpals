@@ -66,7 +66,9 @@ export class DockerExecutor {
   constructor(options: DockerExecutorOptions) {
     this.options = {
       gitToken: "",
-      timeoutMs: 480000,
+      // Keep a little headroom above OpenHands inner timeout so wrapper can
+      // emit a structured timeout failure before docker hard-kills the job.
+      timeoutMs: 630000,
       idleTimeoutMs: 10 * 60 * 1000,
       baseRef: "HEAD",
       networkMode: "bridge",
@@ -462,9 +464,25 @@ export class DockerExecutor {
       stderr: "pipe",
     });
 
+    const warningLeadMs = Math.min(60_000, Math.max(10_000, this.options.timeoutMs - 5_000));
+    const warningDelayMs = Math.max(1_000, this.options.timeoutMs - warningLeadMs);
+    const warningTimer = setTimeout(() => {
+      const warning = `[DockerExecutor] Job nearing timeout in warm container (${Math.round(
+        warningLeadMs / 1000,
+      )}s remaining): ${this.warmContainerName}`;
+      console.warn(warning);
+      onLog?.("stderr", warning);
+      onLog?.(
+        "stderr",
+        "[DockerExecutor] Worker should finish quickly and return a concise failure/update if task cannot complete in time.",
+      );
+    }, warningDelayMs);
+
     // Set up timeout
     const timer = setTimeout(() => {
-      console.log(`[DockerExecutor] Job timeout in warm container: ${this.warmContainerName}`);
+      const timeoutMsg = `[DockerExecutor] Job timeout in warm container: ${this.warmContainerName}`;
+      console.log(timeoutMsg);
+      onLog?.("stderr", timeoutMsg);
       try {
         proc.kill();
         // Reset the warm container to clear any stuck in-container process.
@@ -483,6 +501,7 @@ export class DockerExecutor {
       this.readStream(proc.stderr, "stderr", onLog, stderrLines),
     ]);
 
+    clearTimeout(warningTimer);
     clearTimeout(timer);
     const exitCode = await proc.exited;
 
@@ -600,6 +619,16 @@ export class DockerExecutor {
     }
 
     // No sentinel found, return generic result
+    if (exitCode === 143 || exitCode === 137) {
+      return {
+        ok: false,
+        summary: `Job timed out in Docker executor after ${this.options.timeoutMs}ms (terminated before structured result).`,
+        stdout: stdoutLines.join("\n"),
+        stderr: stderrLines.join("\n"),
+        exitCode,
+      };
+    }
+
     return {
       ok: exitCode === 0,
       summary: exitCode === 0 ? "Job completed" : `Job failed (exit ${exitCode})`,
