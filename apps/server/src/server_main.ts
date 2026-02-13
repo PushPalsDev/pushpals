@@ -190,7 +190,7 @@ export function createRequestHandler() {
 
             // Replay history from SQLite (cursor-based)
             session.replayHistory((envelope: EventEnvelope, eventId: number) => {
-              const eventData = `id: ${eventId}\ndata: ${JSON.stringify(envelope)}\n\n`;
+              const eventData = `id: ${eventId}\ndata: ${JSON.stringify({ envelope, cursor: eventId })}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
               } catch (_e) {}
@@ -198,7 +198,7 @@ export function createRequestHandler() {
 
             // Subscribe to live events
             unsubscribe = session.subscribe((envelope: EventEnvelope, eventId: number) => {
-              const eventData = `id: ${eventId}\ndata: ${JSON.stringify(envelope)}\n\n`;
+              const eventData = `id: ${eventId}\ndata: ${JSON.stringify({ envelope, cursor: eventId })}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
               } catch (err) {
@@ -628,7 +628,7 @@ export function createRequestHandler() {
               type: "error",
               payload: { message: "Session not found" },
             };
-            ws.send(JSON.stringify(envelope));
+            ws.send(JSON.stringify({ envelope, cursor: 0 }));
           } catch (_e) {}
           try {
             ws.close();

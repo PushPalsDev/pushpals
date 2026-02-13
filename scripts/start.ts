@@ -22,8 +22,7 @@ import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 
 const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
-const DEFAULT_LLM_ENDPOINT = "http://127.0.0.1:1234";
-const DEFAULT_PLANNER_ENDPOINT = "http://127.0.0.1:1234/v1/chat/completions";
+const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_LMSTUDIO_READY_TIMEOUT_MS = 120_000;
 const DEFAULT_INTEGRATION_BRANCH = "main_agents";
@@ -358,8 +357,11 @@ function normalizeLlmBackend(value: string | null | undefined): SupportedLlmBack
   return null;
 }
 
-function configuredLlmBackend(endpoint: string): SupportedLlmBackend {
-  const explicit = normalizeLlmBackend(process.env.PUSHPALS_LLM_BACKEND);
+function configuredLlmBackend(
+  endpoint: string,
+  explicitBackend?: string | null | undefined,
+): SupportedLlmBackend {
+  const explicit = normalizeLlmBackend(explicitBackend);
   if (explicit) return explicit;
   return endpoint.includes("/api/chat") ? "ollama" : "lmstudio";
 }
@@ -461,54 +463,35 @@ async function checkTargetReachable(target: {
 function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: string[] }> {
   const out: Array<{ name: string; endpoint: string; probes: string[] }> = [];
   const seenEndpoints = new Set<string>();
-  const configuredRemoteRaw = firstNonEmpty(
-    process.env.REMOTEBUDDY_LLM_ENDPOINT,
-    process.env.REMOTEBUDDY_ENDPOINT,
-    process.env.LLM_ENDPOINT,
-  );
-  const configuredLocalRaw = firstNonEmpty(
-    process.env.LOCALBUDDY_LLM_ENDPOINT,
-    process.env.LOCALBUDDY_ENDPOINT,
-    process.env.PLANNER_ENDPOINT,
-    process.env.LLM_ENDPOINT,
-  );
-  const configuredWorkerRaw = firstNonEmpty(
-    process.env.WORKERPALS_LLM_ENDPOINT,
-    process.env.WORKERPALS_ENDPOINT,
-    process.env.WORKERPALS_OPENHANDS_BASE_URL,
-    process.env.LLM_BASE_URL,
-    process.env.LLM_ENDPOINT,
-  );
+  const configuredRemoteRaw = firstNonEmpty(process.env.REMOTEBUDDY_LLM_ENDPOINT);
+  const configuredLocalRaw = firstNonEmpty(process.env.LOCALBUDDY_LLM_ENDPOINT);
+  const configuredWorkerRaw = firstNonEmpty(process.env.WORKERPALS_LLM_ENDPOINT);
 
   const remoteBackend =
     normalizeLlmBackend(
       firstNonEmpty(
         process.env.REMOTEBUDDY_LLM_BACKEND,
-        process.env.REMOTEBUDDY_BACKEND,
-        process.env.PUSHPALS_LLM_BACKEND,
       ),
-    ) ?? configuredLlmBackend(configuredRemoteRaw || DEFAULT_LLM_ENDPOINT);
+    ) ?? configuredLlmBackend(configuredRemoteRaw || DEFAULT_LMSTUDIO_ENDPOINT);
   const localBackend =
     normalizeLlmBackend(
       firstNonEmpty(
         process.env.LOCALBUDDY_LLM_BACKEND,
-        process.env.LOCALBUDDY_BACKEND,
-        process.env.PUSHPALS_LLM_BACKEND,
       ),
-    ) ?? configuredLlmBackend(configuredLocalRaw || DEFAULT_PLANNER_ENDPOINT);
+    ) ?? configuredLlmBackend(configuredLocalRaw || DEFAULT_LMSTUDIO_ENDPOINT);
   const workerBackend =
     normalizeLlmBackend(
       firstNonEmpty(
         process.env.WORKERPALS_LLM_BACKEND,
-        process.env.WORKERPALS_OPENHANDS_PROVIDER,
-        process.env.PUSHPALS_LLM_BACKEND,
       ),
-    ) ?? configuredLlmBackend(configuredWorkerRaw || DEFAULT_LLM_ENDPOINT);
+    ) ?? configuredLlmBackend(configuredWorkerRaw || DEFAULT_LMSTUDIO_ENDPOINT);
 
-  const remoteFallback = remoteBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LLM_ENDPOINT;
+  const remoteFallback =
+    remoteBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
   const localFallback =
-    localBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_PLANNER_ENDPOINT;
-  const workerFallback = workerBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LLM_ENDPOINT;
+    localBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
+  const workerFallback =
+    workerBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
 
   const addTarget = (name: string, endpoint: string) => {
     const normalized = endpoint.trim();
@@ -801,7 +784,7 @@ async function ensureLlmPreflight(): Promise<void> {
     } else if (!autoStartEligible && target === primary) {
       if (primaryBackend === "ollama") {
         console.error(
-          "[start] Ollama backend selected. Start Ollama manually and ensure LLM_ENDPOINT points to /api/chat.",
+          `[start] Ollama backend selected. Start Ollama manually and ensure ${primary.name} endpoint points to /api/chat.`,
         );
       } else {
         console.error(

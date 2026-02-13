@@ -1,13 +1,32 @@
 import type { EventEnvelope } from "protocol/browser";
-import { validateEventEnvelope } from "protocol/browser";
+import { PROTOCOL_VERSION, validateEventEnvelope } from "protocol/browser";
 
 type TransportType = "auto" | "sse" | "ws";
 
 /** Extended callback that also receives the server cursor for each event */
 export type CursorEventCallback = (
-  event: EventEnvelope | { type: "_error"; message: string },
+  event: EventEnvelope,
   cursor: number,
 ) => void;
+
+function randomEventId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `client-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function transportErrorEvent(sessionId: string, message: string): EventEnvelope<"error"> {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomEventId(),
+    ts: new Date().toISOString(),
+    sessionId,
+    type: "error",
+    from: "client:transport",
+    payload: { message },
+  };
+}
 
 /**
  * Determine which transport to use based on platform
@@ -48,31 +67,36 @@ function subscribeSSE(
 
     es.addEventListener("message", (event) => {
       try {
-        const data = JSON.parse(event.data);
-        const validation = validateEventEnvelope(data);
+        const raw = JSON.parse(event.data) as { envelope?: unknown; cursor?: unknown };
+        const envelope = raw?.envelope;
+        const validation = validateEventEnvelope(envelope);
 
         if (!validation.ok) {
           onEvent(
-            { type: "_error", message: `[Protocol error] ${validation.errors?.join("; ")}` },
-            0,
+            transportErrorEvent(sessionId, `[Protocol error] ${validation.errors?.join("; ")}`),
+            latestCursor,
           );
           return;
         }
 
         // SSE sends `id: <cursor>` — available via event.lastEventId
-        const cursor = parseInt(event.lastEventId, 10) || 0;
+        const cursor =
+          typeof raw?.cursor === "number" ? raw.cursor : parseInt(event.lastEventId, 10) || 0;
         if (cursor > latestCursor) latestCursor = cursor;
-        onEvent(data, cursor);
+        onEvent(envelope as EventEnvelope, cursor);
       } catch (err) {
         onEvent(
-          { type: "_error", message: `[Parse error] Failed to parse event: ${String(err)}` },
-          0,
+          transportErrorEvent(sessionId, `[Parse error] Failed to parse event: ${String(err)}`),
+          latestCursor,
         );
       }
     });
 
     es.onerror = () => {
-      onEvent({ type: "_error", message: "[SSE] Connection lost, reconnecting\u2026" }, 0);
+      onEvent(
+        transportErrorEvent(sessionId, "[SSE] Connection lost, reconnecting..."),
+        latestCursor,
+      );
       es?.close();
       es = null;
       if (!disposed) {
@@ -115,39 +139,40 @@ function subscribeWebSocket(
 
     ws.onmessage = (event) => {
       try {
-        const raw = JSON.parse(event.data);
-
-        // Server sends { envelope, cursor } wrapper
-        const envelope = raw.envelope ?? raw;
+        const raw = JSON.parse(event.data) as { envelope?: unknown; cursor?: unknown };
+        const envelope = raw?.envelope;
         const cursor: number = typeof raw.cursor === "number" ? raw.cursor : 0;
 
         const validation = validateEventEnvelope(envelope);
         if (!validation.ok) {
           onEvent(
-            { type: "_error", message: `[Protocol error] ${validation.errors?.join("; ")}` },
-            0,
+            transportErrorEvent(sessionId, `[Protocol error] ${validation.errors?.join("; ")}`),
+            latestCursor,
           );
           return;
         }
 
         if (cursor > latestCursor) latestCursor = cursor;
-        onEvent(envelope, cursor);
+        onEvent(envelope as EventEnvelope, cursor);
       } catch (err) {
         onEvent(
-          { type: "_error", message: `[Parse error] Failed to parse event: ${String(err)}` },
-          0,
+          transportErrorEvent(sessionId, `[Parse error] Failed to parse event: ${String(err)}`),
+          latestCursor,
         );
       }
     };
 
     ws.onerror = () => {
-      onEvent({ type: "_error", message: "[WebSocket] Connection error" }, 0);
+      onEvent(transportErrorEvent(sessionId, "[WebSocket] Connection error"), latestCursor);
     };
 
     ws.onclose = () => {
       ws = null;
       if (!disposed) {
-        onEvent({ type: "_error", message: "[WebSocket] Connection lost, reconnecting\u2026" }, 0);
+        onEvent(
+          transportErrorEvent(sessionId, "[WebSocket] Connection lost, reconnecting..."),
+          latestCursor,
+        );
         reconnectTimer = setTimeout(connect, 3000);
       }
     };
@@ -170,7 +195,7 @@ function subscribeWebSocket(
  *
  * @param baseUrl Base URL of the server (e.g., http://localhost:3001)
  * @param sessionId Session ID
- * @param onEvent Callback for each event + cursor (or error with cursor=0)
+ * @param onEvent Callback for each event + cursor
  * @param transport Transport selection: "auto", "sse", or "ws" (default: "auto")
  * @param afterCursor Resume from this cursor (default: 0 = from beginning)
  * @returns Unsubscribe function
@@ -330,8 +355,7 @@ export interface WorkerStatusRow {
 export interface RequestSnapshotRow {
   id: string;
   sessionId: string;
-  originalPrompt: string;
-  enhancedPrompt: string;
+  prompt: string;
   status: "pending" | "claimed" | "completed" | "failed";
   agentId: string | null;
   result: string | null;

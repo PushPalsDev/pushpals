@@ -9,8 +9,8 @@ import {
 
 describe("workerpals timeout policy", () => {
   test("uses expected defaults", () => {
-    expect(DEFAULT_OPENHANDS_TIMEOUT_MS).toBe(600000);
-    expect(DEFAULT_DOCKER_TIMEOUT_MS).toBe(630000);
+    expect(DEFAULT_OPENHANDS_TIMEOUT_MS).toBe(1800000);
+    expect(DEFAULT_DOCKER_TIMEOUT_MS).toBe(1860000);
   });
 
   test("parses and normalizes openhands timeout values", () => {
@@ -30,9 +30,9 @@ describe("workerpals timeout policy", () => {
   });
 
   test("computes warning window with 60s lead for normal timeouts", () => {
-    const result = computeTimeoutWarningWindow(600000);
+    const result = computeTimeoutWarningWindow(1800000);
     expect(result.leadMs).toBe(60000);
-    expect(result.delayMs).toBe(540000);
+    expect(result.delayMs).toBe(1740000);
   });
 
   test("computes warning window for very small timeouts", () => {

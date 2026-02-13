@@ -12,7 +12,7 @@
  *
  * Usage:
  *   bun run src/remotebuddy_main.ts --server http://localhost:3001 [--sessionId <id>] [--token <auth>]
- *   Environment: LLM_ENDPOINT | LLM_MODEL | LLM_API_KEY | PUSHPALS_LLM_BACKEND (see llm.ts)
+ *   Environment: REMOTEBUDDY_LLM_ENDPOINT | REMOTEBUDDY_LLM_MODEL | REMOTEBUDDY_LLM_API_KEY | REMOTEBUDDY_LLM_BACKEND
  */
 
 import type { CommandRequest } from "protocol";
@@ -160,6 +160,35 @@ function isArchitectureIntent(text: string): boolean {
       t,
     );
   return architectureCue && !codeChangeCue;
+}
+
+type TaskExecutionLane = "deterministic" | "openhands";
+
+interface TaskExecuteJobParams {
+  requestId: string;
+  sessionId: string;
+  instruction: string;
+  lane: TaskExecutionLane;
+  targetPath?: string;
+  literalFileContent?: string;
+  responseMode?: "assistant_message";
+  maxResponseChars?: number;
+  recentContext: string[];
+  recentJobs: Array<Record<string, unknown>>;
+}
+
+function chooseTaskExecutionLane(args: {
+  prompt: string;
+  targetPath: string | null;
+  hasLiteralFileContent: boolean;
+}): TaskExecutionLane {
+  const prompt = args.prompt.trim().toLowerCase();
+  if (args.hasLiteralFileContent && args.targetPath) return "deterministic";
+  if (isArchitectureIntent(prompt)) return "deterministic";
+  if (args.targetPath && /\b(create|write|generate|document|readme|summary|overview)\b/.test(prompt)) {
+    return "deterministic";
+  }
+  return "openhands";
 }
 
 function toSingleLine(value: unknown, max = 220): string {
@@ -527,8 +556,8 @@ class RemoteBuddyOrchestrator {
    */
   private async enqueueJob(
     taskId: string,
-    kind: string,
-    params: Record<string, unknown>,
+    kind: "task.execute",
+    params: TaskExecuteJobParams,
     targetWorkerId: string | null = null,
   ): Promise<string | null> {
     try {
@@ -792,19 +821,28 @@ class RemoteBuddyOrchestrator {
 
     this.idempotency.markHandled(this.sessionId, requestId);
 
-    const enhancedPrompt = String(request.enhancedPrompt ?? "");
-    const originalPrompt = String(request.originalPrompt ?? "").trim();
-    const promptForIntent = originalPrompt || enhancedPrompt || "";
-    const targetPath = extractTargetPath(originalPrompt) ?? extractTargetPath(enhancedPrompt);
-    const literalFileContent =
-      extractLiteralFileContent(originalPrompt) ?? extractLiteralFileContent(enhancedPrompt);
+    const prompt = String(request.prompt ?? "").trim();
+    if (!prompt) {
+      console.warn(`[RemoteBuddy] Request ${requestId} missing prompt; marking failed`);
+      await fetch(`${this.server}/requests/${requestId}/fail`, {
+        method: "POST",
+        headers: this.authHeaders(),
+        body: JSON.stringify({ message: "Request missing prompt" }),
+      }).catch(() => {
+        // best effort
+      });
+      return;
+    }
+    const promptForIntent = prompt;
+    const targetPath = extractTargetPath(prompt);
+    const literalFileContent = extractLiteralFileContent(prompt);
     const actionable = isExecutionIntent(promptForIntent, targetPath);
     const turnId = randomUUID();
 
     let tasksCreated = 0;
     if (!actionable) {
       // Lightweight-only responses stay in the orchestrator.
-      const thinkPrompt = originalPrompt || enhancedPrompt;
+      const thinkPrompt = prompt;
       const chatContext = this.getChatContextSnapshot();
       console.log(`[RemoteBuddy] Thinking about: "${thinkPrompt.substring(0, 80)}"`);
       const output = await this.brain.think(thinkPrompt, chatContext);
@@ -816,10 +854,7 @@ class RemoteBuddyOrchestrator {
         turnId,
       });
     } else {
-      this.pushContext(`[user] ${toSingleLine(originalPrompt || enhancedPrompt, 900)}`);
-      if (enhancedPrompt && enhancedPrompt !== originalPrompt) {
-        this.pushContext(`[enhanced] ${toSingleLine(enhancedPrompt, 900)}`);
-      }
+      this.pushContext(`[user] ${toSingleLine(prompt, 900)}`);
 
       // Any non-trivial request is WorkerPal-owned.
       await this.comm.assistantMessage("Understood. I am delegating this to a WorkerPal now.", {
@@ -831,29 +866,27 @@ class RemoteBuddyOrchestrator {
       const targetWorkerId = await this.selectTargetWorkerForJob();
       const architectureIntent = isArchitectureIntent(promptForIntent);
       const canDirectWrite = !!targetPath && typeof literalFileContent === "string";
-      const jobKind = canDirectWrite
-        ? "file.write"
-        : architectureIntent
-          ? "project.summary"
-          : "task.execute";
-      const params: Record<string, unknown> = {
+      const lane = chooseTaskExecutionLane({
+        prompt: promptForIntent,
+        targetPath,
+        hasLiteralFileContent: canDirectWrite,
+      });
+      const jobKind = "task.execute";
+      const params: TaskExecuteJobParams = {
         requestId,
         sessionId: this.sessionId,
-        instruction: originalPrompt || enhancedPrompt,
-        enhancedPrompt,
-        targetWorkerId,
-        repoRoot: this.repo,
+        instruction: prompt,
+        lane,
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
       };
-      if (jobKind === "file.write" && targetPath) {
-        params.path = targetPath;
-        params.content = literalFileContent ?? "";
-      }
-      if (jobKind === "task.execute" && targetPath) {
+      if (targetPath) {
         params.targetPath = targetPath;
       }
-      if (jobKind === "project.summary") {
+      if (canDirectWrite) {
+        params.literalFileContent = literalFileContent ?? "";
+      }
+      if (lane === "deterministic" && architectureIntent) {
         params.responseMode = "assistant_message";
         params.maxResponseChars = 8000;
       }
@@ -862,11 +895,11 @@ class RemoteBuddyOrchestrator {
         type: "task_created",
         payload: {
           taskId,
-          title: `${jobKind === "task.execute" ? "Execute request" : "Analyze request"}: ${toSingleLine(originalPrompt, 64) || "user request"}`,
+          title: `Execute request: ${toSingleLine(prompt, 64) || "user request"}`,
           description:
-            jobKind === "task.execute"
-              ? "Worker-owned execution plan from shared context"
-              : "Worker-generated explanation from repository context",
+            lane === "deterministic"
+              ? "Deterministic execution lane (fast path)"
+              : "Agentic OpenHands execution lane",
           createdBy: `agent:${this.agentId}`,
         },
         turnId,
@@ -883,7 +916,7 @@ class RemoteBuddyOrchestrator {
         payload: {
           taskId,
           message: targetWorkerId
-            ? `Assigned to WorkerPal ${targetWorkerId}`
+            ? `Assigned to WorkerPal ${targetWorkerId} (${lane} lane)`
             : "No idle WorkerPal available; queued for first available WorkerPal",
         },
         turnId,
@@ -891,7 +924,7 @@ class RemoteBuddyOrchestrator {
 
       await this.comm.assistantMessage(
         targetWorkerId
-          ? `Assigned this request to WorkerPal ${targetWorkerId}.`
+          ? `Assigned this request to WorkerPal ${targetWorkerId} (${lane} lane).`
           : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.",
         { turnId, correlationId: requestId },
       );

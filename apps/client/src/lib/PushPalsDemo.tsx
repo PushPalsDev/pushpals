@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { View, Text, ScrollView, TextInput, Button, TouchableOpacity } from "react-native";
-import { usePushPalsSession, isEnvelope, type SessionEvent } from "./usePushPalsSession.js";
+import type { EventEnvelope } from "protocol/browser";
+import { usePushPalsSession } from "./usePushPalsSession.js";
 
 /**
  * Example component demonstrating PushPals API usage with
@@ -16,18 +17,7 @@ export function PushPalsDemo() {
     setMessageText("");
   };
 
-  const renderEvent = (event: SessionEvent, idx: number) => {
-    if (!isEnvelope(event)) {
-      return (
-        <View
-          key={`err-${idx}`}
-          style={{ marginBottom: 8, paddingBottom: 8, borderBottomWidth: 1 }}
-        >
-          <Text style={{ color: "red", fontSize: 12 }}>Warning: {(event as any).message}</Text>
-        </View>
-      );
-    }
-
+  const renderEvent = (event: EventEnvelope) => {
     const p = event.payload as any;
 
     return (
@@ -227,7 +217,7 @@ export function PushPalsDemo() {
       </Text>
 
       <ScrollView style={{ flex: 1, marginBottom: 16, backgroundColor: "#f5f5f5", padding: 8 }}>
-        {session.filteredEvents.map((event, idx) => renderEvent(event, idx))}
+        {session.filteredEvents.map((event) => renderEvent(event))}
       </ScrollView>
 
       <View style={{ flexDirection: "row", gap: 8, marginBottom: 16 }}>

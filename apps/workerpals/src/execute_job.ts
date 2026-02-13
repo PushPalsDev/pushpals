@@ -11,16 +11,7 @@ import { computeTimeoutWarningWindow, parseOpenHandsTimeoutMs } from "./timeout_
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 /** Job kinds that modify files and should trigger commits */
-export const FILE_MODIFYING_JOBS = new Set([
-  "file.write",
-  "file.patch",
-  "file.delete",
-  "file.rename",
-  "file.copy",
-  "file.append",
-  "file.mkdir",
-  "task.execute",
-]);
+export const FILE_MODIFYING_JOBS = new Set(["task.execute"]);
 
 const MAX_OUTPUT = 256 * 1024;
 const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
@@ -103,9 +94,9 @@ async function buildArchitectureDocument(
 
   const list = (dir: string, depth: number, prefix = ""): string[] => {
     if (depth < 0) return [];
-    let entries: ReturnType<typeof readdirSync>;
+    let entries: string[];
     try {
-      entries = readdirSync(dir).sort();
+      entries = readdirSync(dir).sort() as string[];
     } catch {
       return [];
     }
@@ -532,22 +523,13 @@ function dedupePaths(paths: Array<string | null>): string[] {
 function buildStageTargets(kind: string, params?: Record<string, unknown>): string[] {
   const p = params ?? {};
   switch (kind) {
-    case "file.write":
-    case "file.patch":
-    case "file.append":
-    case "file.delete":
-    case "file.mkdir":
-      return dedupePaths([toPath(p.path)]);
-    case "file.rename":
-    case "file.copy":
-      return dedupePaths([toPath(p.from), toPath(p.to)]);
     case "task.execute": {
       const paths = toStringArray(p.paths);
       return dedupePaths([
         ...paths,
         toPath(p.targetPath),
         toPath(p.path),
-        inferTargetPathFromInstruction(String(p.instruction ?? p.enhancedPrompt ?? "")),
+        inferTargetPathFromInstruction(String(p.instruction ?? "")),
       ]);
     }
     default:
@@ -767,365 +749,36 @@ export async function executeJob(
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<JobResult> {
-  if (useOpenHandsExecutor()) {
-    return executeWithOpenHands(kind, params, repo, onLog);
-  }
-
-  let cmd: string[];
-
-  switch (kind) {
-    case "bun.test": {
-      cmd = ["bun", "test"];
-      if (params.filter) cmd.push("--filter", params.filter as string);
-      break;
-    }
-    case "bun.lint": {
-      cmd = ["bun", "run", "lint"];
-      break;
-    }
-    case "git.status": {
-      cmd = ["git", "status", "--porcelain"];
-      break;
-    }
-    case "git.log": {
-      const count = Math.min(Number(params.count) || 20, 100);
-      cmd = ["git", "log", "--oneline", `--format=%h %s (%an, %ar)`, `-n`, String(count)];
-      if (params.branch) cmd.push(params.branch as string);
-      break;
-    }
-    case "git.branch": {
-      cmd = params.all === true ? ["git", "branch", "-a", "-v"] : ["git", "branch", "-v"];
-      break;
-    }
-    case "git.diff": {
-      cmd = ["git", "diff"];
-      break;
-    }
-    case "file.read": {
-      const filePath = params.path as string;
-      if (!filePath) return { ok: false, summary: "file.read requires a 'path' param" };
-      cmd = ["cat", filePath];
-      break;
-    }
-    case "file.search": {
-      const pattern = params.pattern as string;
-      if (!pattern) return { ok: false, summary: "file.search requires a 'pattern' param" };
-      cmd = ["grep", "-rn", pattern, "."];
-      break;
-    }
-    case "file.list": {
-      cmd = ["git", "ls-tree", "--name-only", "-r", "HEAD"];
-      break;
-    }
-    case "ci.status": {
-      cmd = [
-        "gh",
-        "run",
-        "list",
-        "--limit",
-        "5",
-        "--json",
-        "status,conclusion,name,headBranch,createdAt,url",
-      ];
-      break;
-    }
-    case "project.summary": {
-      const instruction =
-        String(params.instruction ?? params.enhancedPrompt ?? "").trim() ||
-        "Summarize repository architecture and key components.";
-      const content = await buildArchitectureDocument(repo, instruction, params.recentJobs);
-      return {
-        ok: true,
-        summary: "Generated repository architecture summary",
-        stdout: truncate(content),
-      };
-    }
-    case "shell.exec": {
-      let command = params.command as string;
-      if (!command) return { ok: false, summary: "shell.exec requires a 'command' param" };
-      const isWindows = process.platform === "win32";
-      cmd = isWindows ? ["cmd", "/c", command] : ["bash", "-c", command];
-      break;
-    }
-    case "task.execute": {
-      const instruction = String(params.instruction ?? params.enhancedPrompt ?? "").trim();
-      if (!instruction) {
-        return { ok: false, summary: "task.execute requires an 'instruction' param" };
-      }
-      const targetPath =
-        (params.targetPath as string | undefined)?.trim() ||
-        (params.path as string | undefined)?.trim() ||
-        inferTargetPathFromInstruction(instruction);
-      if (!targetPath) {
-        return {
-          ok: false,
-          summary:
-            "task.execute could not determine output path. Provide targetPath, or run with OpenHands agent mode for instruction-only refactors.",
-        };
-      }
-
-      const content = await buildArchitectureDocument(repo, instruction, params.recentJobs);
-      try {
-        const { mkdirSync, writeFileSync } = await import("fs");
-        const { dirname, resolve } = await import("path");
-        const resolved = resolve(repo, targetPath);
-        mkdirSync(dirname(resolved), { recursive: true });
-        writeFileSync(resolved, content, "utf-8");
-        return {
-          ok: true,
-          summary: `Executed task and wrote ${targetPath}`,
-          stdout: `Wrote ${content.length} bytes to ${targetPath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `task.execute error: ${err}` };
-      }
-    }
-    case "file.write": {
-      const filePath = params.path as string;
-      const content = params.content as string;
-      if (!filePath) return { ok: false, summary: "file.write requires a 'path' param" };
-      if (content === undefined)
-        return { ok: false, summary: "file.write requires a 'content' param" };
-      try {
-        const { mkdirSync, writeFileSync } = await import("fs");
-        const { dirname, resolve } = await import("path");
-        const resolved = resolve(repo, filePath);
-        mkdirSync(dirname(resolved), { recursive: true });
-        writeFileSync(resolved, content, "utf-8");
-        return {
-          ok: true,
-          summary: `Wrote ${content.length} bytes to ${filePath}`,
-          stdout: `Wrote ${content.length} bytes to ${filePath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.write error: ${err}` };
-      }
-    }
-    case "file.patch": {
-      const filePath = params.path as string;
-      const oldText = params.oldText as string;
-      const newText = params.newText as string;
-      if (!filePath) return { ok: false, summary: "file.patch requires a 'path' param" };
-      if (oldText === undefined)
-        return { ok: false, summary: "file.patch requires an 'oldText' param" };
-      if (newText === undefined)
-        return { ok: false, summary: "file.patch requires a 'newText' param" };
-      try {
-        const { readFileSync, writeFileSync } = await import("fs");
-        const { resolve } = await import("path");
-        const resolved = resolve(repo, filePath);
-        const current = readFileSync(resolved, "utf-8");
-        if (!current.includes(oldText)) {
-          return { ok: false, summary: `oldText not found in ${filePath}` };
-        }
-        const updated = current.replace(oldText, newText);
-        writeFileSync(resolved, updated, "utf-8");
-        return {
-          ok: true,
-          summary: `Patched ${filePath}`,
-          stdout: `Replaced ${oldText.length} chars with ${newText.length} chars in ${filePath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.patch error: ${err}` };
-      }
-    }
-    case "file.rename": {
-      const from = params.from as string;
-      const to = params.to as string;
-      if (!from) return { ok: false, summary: "file.rename requires a 'from' param" };
-      if (!to) return { ok: false, summary: "file.rename requires a 'to' param" };
-      try {
-        const { renameSync, mkdirSync } = await import("fs");
-        const { resolve, dirname } = await import("path");
-        const resolvedFrom = resolve(repo, from);
-        const resolvedTo = resolve(repo, to);
-        mkdirSync(dirname(resolvedTo), { recursive: true });
-        renameSync(resolvedFrom, resolvedTo);
-        return {
-          ok: true,
-          summary: `Renamed ${from} → ${to}`,
-          stdout: `Renamed ${from} → ${to}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.rename error: ${err}` };
-      }
-    }
-    case "file.delete": {
-      const filePath = params.path as string;
-      if (!filePath) return { ok: false, summary: "file.delete requires a 'path' param" };
-      try {
-        const { statSync, unlinkSync, rmSync } = await import("fs");
-        const { resolve } = await import("path");
-        const resolved = resolve(repo, filePath);
-        const stat = statSync(resolved);
-        if (stat.isDirectory()) {
-          rmSync(resolved, { recursive: true });
-          return {
-            ok: true,
-            summary: `Deleted directory ${filePath}`,
-            stdout: `Deleted directory ${filePath}`,
-          };
-        } else {
-          unlinkSync(resolved);
-          return { ok: true, summary: `Deleted ${filePath}`, stdout: `Deleted ${filePath}` };
-        }
-      } catch (err) {
-        return { ok: false, summary: `file.delete error: ${err}` };
-      }
-    }
-    case "file.copy": {
-      const from = params.from as string;
-      const to = params.to as string;
-      if (!from) return { ok: false, summary: "file.copy requires a 'from' param" };
-      if (!to) return { ok: false, summary: "file.copy requires a 'to' param" };
-      try {
-        const { copyFileSync, mkdirSync } = await import("fs");
-        const { resolve, dirname } = await import("path");
-        const resolvedFrom = resolve(repo, from);
-        const resolvedTo = resolve(repo, to);
-        mkdirSync(dirname(resolvedTo), { recursive: true });
-        copyFileSync(resolvedFrom, resolvedTo);
-        return {
-          ok: true,
-          summary: `Copied ${from} → ${to}`,
-          stdout: `Copied ${from} → ${to}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.copy error: ${err}` };
-      }
-    }
-    case "file.append": {
-      const filePath = params.path as string;
-      const content = params.content as string;
-      if (!filePath) return { ok: false, summary: "file.append requires a 'path' param" };
-      if (content === undefined)
-        return { ok: false, summary: "file.append requires a 'content' param" };
-      try {
-        const { appendFileSync, mkdirSync } = await import("fs");
-        const { resolve, dirname } = await import("path");
-        const resolved = resolve(repo, filePath);
-        mkdirSync(dirname(resolved), { recursive: true });
-        appendFileSync(resolved, content, "utf-8");
-        return {
-          ok: true,
-          summary: `Appended ${content.length} bytes to ${filePath}`,
-          stdout: `Appended ${content.length} bytes to ${filePath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.append error: ${err}` };
-      }
-    }
-    case "file.mkdir": {
-      const dirPath = params.path as string;
-      if (!dirPath) return { ok: false, summary: "file.mkdir requires a 'path' param" };
-      try {
-        const { mkdirSync } = await import("fs");
-        const { resolve } = await import("path");
-        const resolved = resolve(repo, dirPath);
-        mkdirSync(resolved, { recursive: true });
-        return {
-          ok: true,
-          summary: `Created directory ${dirPath}`,
-          stdout: `Created directory ${dirPath}`,
-        };
-      } catch (err) {
-        return { ok: false, summary: `file.mkdir error: ${err}` };
-      }
-    }
-    case "web.fetch": {
-      const url = params.url as string;
-      if (!url) return { ok: false, summary: "web.fetch requires a 'url' param" };
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 25_000);
-        const res = await fetch(url, {
-          headers: { "User-Agent": "PushPals/1.0" },
-          signal: controller.signal,
-        });
-        clearTimeout(timer);
-        const body = await res.text();
-        const contentType = res.headers.get("content-type") ?? "";
-        let output = body;
-        if (contentType.includes("html")) {
-          output = body
-            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-            .replace(/<[^>]+>/g, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-        }
-        return {
-          ok: res.ok,
-          summary: res.ok ? `Fetched ${url} (${output.length} chars)` : `HTTP ${res.status}`,
-          stdout: truncate(output),
-        };
-      } catch (err) {
-        return { ok: false, summary: `web.fetch error: ${err}` };
-      }
-    }
-    case "web.search": {
-      const query = params.query as string;
-      if (!query) return { ok: false, summary: "web.search requires a 'query' param" };
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 15_000);
-        const searchUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-        const res = await fetch(searchUrl, {
-          headers: { "User-Agent": "PushPals/1.0" },
-          signal: controller.signal,
-        });
-        clearTimeout(timer);
-        const html = await res.text();
-        const linkRegex = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
-        const results: string[] = [];
-        let match;
-        while ((match = linkRegex.exec(html)) !== null && results.length < 10) {
-          if (!match[1].includes("duckduckgo.com")) {
-            results.push(`${results.length + 1}. ${match[2].trim()}\n  ${match[1]}`);
-          }
-        }
-        return {
-          ok: true,
-          summary: `${results.length} search results for "${query}"`,
-          stdout: results.length > 0 ? results.join("\n\n") : "No results found.",
-        };
-      } catch (err) {
-        return { ok: false, summary: `web.search error: ${err}` };
-      }
-    }
-    default:
-      return { ok: false, summary: `Unknown job kind: ${kind}` };
-  }
-
-  try {
-    const proc = Bun.spawn(cmd, {
-      cwd: repo,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-
-    const timer = setTimeout(() => {
-      try {
-        proc.kill();
-      } catch (_e) {}
-    }, 60_000); // 60s timeout
-
-    const [stdout, stderr] = await Promise.all([
-      onLog ? streamLines(proc.stdout, "stdout", onLog) : new Response(proc.stdout).text(),
-      onLog ? streamLines(proc.stderr, "stderr", onLog) : new Response(proc.stderr).text(),
-    ]);
-
-    clearTimeout(timer);
-    const exitCode = await proc.exited;
-
+  if (kind !== "task.execute") {
     return {
-      ok: exitCode === 0,
-      summary: exitCode === 0 ? `${kind} passed` : `${kind} failed (exit ${exitCode})`,
-      stdout: truncate(stdout),
-      stderr: truncate(stderr),
-      exitCode,
+      ok: false,
+      summary: `Unsupported job kind "${kind}". WorkerPals accepts only task.execute.`,
     };
-  } catch (err) {
-    return { ok: false, summary: `Error executing ${kind}: ${err}` };
   }
+
+  const lane = String(params.lane ?? "openhands")
+    .trim()
+    .toLowerCase();
+  if (lane !== "openhands" && lane !== "deterministic") {
+    return {
+      ok: false,
+      summary:
+        "task.execute requires params.lane to be either 'openhands' or 'deterministic'.",
+    };
+  }
+
+  const instruction = String(params.instruction ?? "").trim();
+  if (!instruction) {
+    return {
+      ok: false,
+      summary: "task.execute requires an 'instruction' param",
+    };
+  }
+
+  const normalizedParams: Record<string, unknown> = {
+    ...params,
+    lane,
+    instruction,
+  };
+  return executeWithOpenHands(kind, normalizedParams, repo, onLog);
 }

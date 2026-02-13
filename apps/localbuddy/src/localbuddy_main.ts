@@ -699,8 +699,7 @@ Respond in strict JSON with this shape:
                     headers: cmdHeaders,
                     body: JSON.stringify({
                       sessionId,
-                      originalPrompt: routedPrompt,
-                      enhancedPrompt: routedPrompt,
+                      prompt: routedPrompt,
                     }),
                   });
 

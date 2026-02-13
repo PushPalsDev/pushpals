@@ -30,7 +30,7 @@ export interface LLMClient {
 }
 
 type LlmBackend = "lmstudio" | "ollama";
-type LlmService = "default" | "localbuddy" | "remotebuddy";
+type LlmService = "localbuddy" | "remotebuddy" | "workerpals";
 
 export interface LLMClientOptions {
   service?: LlmService;
@@ -117,7 +117,7 @@ function configuredBackend(
   endpoint: string,
   explicitBackend?: string | null | undefined,
 ): LlmBackend {
-  const explicit = normalizeBackend(explicitBackend ?? process.env.PUSHPALS_LLM_BACKEND);
+  const explicit = normalizeBackend(explicitBackend);
   if (explicit) return explicit;
   return endpoint.includes("/api/chat") ? "ollama" : "lmstudio";
 }
@@ -136,106 +136,56 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): {
   model: string;
   apiKey: string;
 } {
-  const service = opts.service ?? "default";
+  const service = opts.service ?? "remotebuddy";
 
-  const endpoint = (() => {
-    if (service === "localbuddy") {
-      return firstNonEmpty(
-        opts.endpoint,
-        process.env.LOCALBUDDY_LLM_ENDPOINT,
-        process.env.LOCALBUDDY_ENDPOINT,
-        process.env.PLANNER_ENDPOINT,
-        process.env.LLM_ENDPOINT,
-      );
+  const envKeys = (() => {
+    switch (service) {
+      case "localbuddy":
+        return {
+          endpoint: "LOCALBUDDY_LLM_ENDPOINT",
+          model: "LOCALBUDDY_LLM_MODEL",
+          apiKey: "LOCALBUDDY_LLM_API_KEY",
+          backend: "LOCALBUDDY_LLM_BACKEND",
+        } as const;
+      case "remotebuddy":
+        return {
+          endpoint: "REMOTEBUDDY_LLM_ENDPOINT",
+          model: "REMOTEBUDDY_LLM_MODEL",
+          apiKey: "REMOTEBUDDY_LLM_API_KEY",
+          backend: "REMOTEBUDDY_LLM_BACKEND",
+        } as const;
+      case "workerpals":
+        return {
+          endpoint: "WORKERPALS_LLM_ENDPOINT",
+          model: "WORKERPALS_LLM_MODEL",
+          apiKey: "WORKERPALS_LLM_API_KEY",
+          backend: "WORKERPALS_LLM_BACKEND",
+        } as const;
     }
-    if (service === "remotebuddy") {
-      return firstNonEmpty(
-        opts.endpoint,
-        process.env.REMOTEBUDDY_LLM_ENDPOINT,
-        process.env.REMOTEBUDDY_ENDPOINT,
-        process.env.LLM_ENDPOINT,
-      );
-    }
-    return firstNonEmpty(opts.endpoint, process.env.LLM_ENDPOINT);
   })();
 
-  const backendHint = (() => {
-    if (service === "localbuddy") {
-      return firstNonEmpty(
-        opts.backend,
-        process.env.LOCALBUDDY_LLM_BACKEND,
-        process.env.LOCALBUDDY_BACKEND,
-        process.env.PUSHPALS_LLM_BACKEND,
-      );
-    }
-    if (service === "remotebuddy") {
-      return firstNonEmpty(
-        opts.backend,
-        process.env.REMOTEBUDDY_LLM_BACKEND,
-        process.env.REMOTEBUDDY_BACKEND,
-        process.env.PUSHPALS_LLM_BACKEND,
-      );
-    }
-    return firstNonEmpty(opts.backend, process.env.PUSHPALS_LLM_BACKEND);
-  })();
-
-  const backend = configuredBackend(endpoint ?? "", backendHint);
+  const explicitBackend = normalizeBackend(
+    firstNonEmpty(opts.backend, process.env[envKeys.backend]),
+  );
+  const endpoint = firstNonEmpty(
+    opts.endpoint,
+    process.env[envKeys.endpoint],
+    explicitBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT,
+  );
+  const backend = configuredBackend(endpoint ?? "", explicitBackend);
   const normalizedEndpoint =
     backend === "ollama"
       ? normalizeOllamaEndpoint(endpoint ?? DEFAULT_OLLAMA_ENDPOINT)
       : normalizeLmStudioEndpoint(endpoint ?? DEFAULT_LMSTUDIO_ENDPOINT);
 
   const model =
-    (() => {
-      if (service === "localbuddy") {
-        return firstNonEmpty(
-          opts.model,
-          process.env.LOCALBUDDY_LLM_MODEL,
-          process.env.LOCALBUDDY_MODEL,
-          process.env.PLANNER_MODEL,
-          process.env.LLM_MODEL,
-          DEFAULT_MODEL,
-        );
-      }
-      if (service === "remotebuddy") {
-        return firstNonEmpty(
-          opts.model,
-          process.env.REMOTEBUDDY_LLM_MODEL,
-          process.env.REMOTEBUDDY_MODEL,
-          process.env.LLM_MODEL,
-          DEFAULT_MODEL,
-        );
-      }
-      return firstNonEmpty(opts.model, process.env.LLM_MODEL, DEFAULT_MODEL);
-    })() ?? DEFAULT_MODEL;
-
+    firstNonEmpty(opts.model, process.env[envKeys.model], DEFAULT_MODEL) ?? DEFAULT_MODEL;
   const apiKey =
-    (() => {
-      if (service === "localbuddy") {
-        return firstNonEmpty(
-          opts.apiKey,
-          process.env.LOCALBUDDY_LLM_API_KEY,
-          process.env.LOCALBUDDY_API_KEY,
-          process.env.PLANNER_API_KEY,
-          process.env.LLM_API_KEY,
-          backend === "lmstudio" ? "lmstudio" : "",
-        );
-      }
-      if (service === "remotebuddy") {
-        return firstNonEmpty(
-          opts.apiKey,
-          process.env.REMOTEBUDDY_LLM_API_KEY,
-          process.env.REMOTEBUDDY_API_KEY,
-          process.env.LLM_API_KEY,
-          backend === "lmstudio" ? "lmstudio" : "",
-        );
-      }
-      return firstNonEmpty(
-        opts.apiKey,
-        process.env.LLM_API_KEY,
-        backend === "lmstudio" ? "lmstudio" : "",
-      );
-    })() ?? "";
+    firstNonEmpty(
+      opts.apiKey,
+      process.env[envKeys.apiKey],
+      backend === "lmstudio" ? "lmstudio" : "",
+    ) ?? "";
 
   return { backend, endpoint: normalizedEndpoint, model, apiKey };
 }
@@ -431,10 +381,10 @@ export class LmStudioClient implements LLMClient {
   private resolveModelPromise: Promise<string> | null = null;
 
   constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
-    const rawEndpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? DEFAULT_LMSTUDIO_ENDPOINT;
+    const rawEndpoint = opts?.endpoint ?? DEFAULT_LMSTUDIO_ENDPOINT;
     this.endpoint = normalizeLmStudioEndpoint(rawEndpoint);
-    this.apiKey = opts?.apiKey ?? process.env.LLM_API_KEY ?? "lmstudio";
-    this.model = opts?.model ?? process.env.LLM_MODEL ?? DEFAULT_MODEL;
+    this.apiKey = opts?.apiKey ?? "lmstudio";
+    this.model = opts?.model ?? DEFAULT_MODEL;
   }
 
   private lmStudioModelProbeUrls(): string[] {
@@ -688,7 +638,7 @@ export class LmStudioClient implements LLMClient {
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
     const contextWindow = parsePositiveInt(
-      process.env.PUSHPALS_LMSTUDIO_CONTEXT_WINDOW ?? process.env.LLM_CONTEXT_WINDOW,
+      process.env.PUSHPALS_LMSTUDIO_CONTEXT_WINDOW,
       DEFAULT_LMSTUDIO_CONTEXT_WINDOW,
     );
     const minOutputTokens = parsePositiveInt(
@@ -807,9 +757,9 @@ export class OllamaClient implements LLMClient {
   private model: string;
 
   constructor(opts?: { endpoint?: string; model?: string }) {
-    const rawEndpoint = opts?.endpoint ?? process.env.LLM_ENDPOINT ?? DEFAULT_OLLAMA_ENDPOINT;
+    const rawEndpoint = opts?.endpoint ?? DEFAULT_OLLAMA_ENDPOINT;
     this.endpoint = normalizeOllamaEndpoint(rawEndpoint);
-    this.model = opts?.model ?? process.env.LLM_MODEL ?? DEFAULT_MODEL;
+    this.model = opts?.model ?? DEFAULT_MODEL;
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {

@@ -346,8 +346,6 @@ export class RemotePlanner implements PlannerModel {
   ) {
     const backend = (
       process.env.LOCALBUDDY_LLM_BACKEND ??
-      process.env.LOCALBUDDY_BACKEND ??
-      process.env.PUSHPALS_LLM_BACKEND ??
       ""
     )
       .trim()
@@ -359,8 +357,6 @@ export class RemotePlanner implements PlannerModel {
     const configuredEndpoint =
       opts.endpoint ??
       process.env.LOCALBUDDY_LLM_ENDPOINT ??
-      process.env.LOCALBUDDY_ENDPOINT ??
-      process.env.PLANNER_ENDPOINT ??
       defaultEndpoint;
     this.endpoint =
       backend === "ollama" && !configuredEndpoint.includes("/api/chat")
@@ -369,14 +365,10 @@ export class RemotePlanner implements PlannerModel {
     this.apiKey =
       opts.apiKey ??
       process.env.LOCALBUDDY_LLM_API_KEY ??
-      process.env.LOCALBUDDY_API_KEY ??
-      process.env.PLANNER_API_KEY ??
       null;
     this.model =
       opts.model ??
       process.env.LOCALBUDDY_LLM_MODEL ??
-      process.env.LOCALBUDDY_MODEL ??
-      process.env.PLANNER_MODEL ??
       "local-model";
   }
 

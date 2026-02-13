@@ -19,13 +19,6 @@ const DEFAULT_SESSION_ID = process.env.EXPO_PUBLIC_PUSHPALS_SESSION_ID ?? "dev";
 // LocalBuddy URL for sending messages (new architecture)
 const LOCAL_AGENT_URL = process.env.EXPO_PUBLIC_LOCAL_AGENT_URL ?? "http://localhost:3003";
 
-// ─── Extended event type that may include local errors ──────────────────────
-export type SessionEvent = EventEnvelope | { type: "_error"; message: string };
-
-export function isEnvelope(e: SessionEvent): e is EventEnvelope {
-  return (e as any).id !== undefined;
-}
-
 // ─── Re-export reducer types for consumers ──────────────────────────────────
 export type { Task, Job, LogLine, ChatMessage, SessionState };
 
@@ -47,15 +40,15 @@ export interface EventFilters {
 
 export interface PushPalsSession {
   sessionId: string | null;
-  events: SessionEvent[];
+  events: EventEnvelope[];
   isConnected: boolean;
   error: string | null;
 }
 
 export interface PushPalsSessionActions {
   sessionId: string | null;
-  events: SessionEvent[];
-  filteredEvents: SessionEvent[];
+  events: EventEnvelope[];
+  filteredEvents: EventEnvelope[];
   isConnected: boolean;
   error: string | null;
 
@@ -144,14 +137,12 @@ export function usePushPalsSession(
               events: [...s.events, event],
             }));
 
-            // Feed structured reducer (skip error sentinels)
-            if ("id" in event) {
-              dispatch({ type: "event", envelope: event as EventEnvelope, cursor });
-              // In-memory max-wins guard — no async storage read per event
-              if (cursor > persistedCursorRef.current) {
-                persistedCursorRef.current = cursor;
-                void setItem(`pushpals:cursor:${sessionId}`, String(cursor));
-              }
+            // Feed structured reducer
+            dispatch({ type: "event", envelope: event, cursor });
+            // In-memory max-wins guard - no async storage read per event
+            if (cursor > persistedCursorRef.current) {
+              persistedCursorRef.current = cursor;
+              void setItem(`pushpals:cursor:${sessionId}`, String(cursor));
             }
           },
           undefined, // transport
@@ -205,7 +196,7 @@ export function usePushPalsSession(
   const agents = useMemo(() => {
     const set = new Set<string>();
     for (const ev of session.events) {
-      if (isEnvelope(ev) && ev.from) set.add(ev.from);
+      if (ev.from) set.add(ev.from);
     }
     return Array.from(set).sort();
   }, [session.events]);
@@ -214,7 +205,7 @@ export function usePushPalsSession(
   const turnIds = useMemo(() => {
     const set = new Set<string>();
     for (const ev of session.events) {
-      if (isEnvelope(ev) && ev.turnId) set.add(ev.turnId);
+      if (ev.turnId) set.add(ev.turnId);
     }
     return Array.from(set);
   }, [session.events]);
@@ -225,7 +216,7 @@ export function usePushPalsSession(
     const jobToTask = new Map<string, string>();
 
     for (const ev of session.events) {
-      if (!isEnvelope(ev)) continue;
+      
       const p = ev.payload as any;
       const payloadTaskId: string | undefined = typeof p?.taskId === "string" ? p.taskId : undefined;
       const payloadJobId: string | undefined = typeof p?.jobId === "string" ? p.jobId : undefined;
@@ -265,7 +256,7 @@ export function usePushPalsSession(
   // ─── Filtered events ──────────────────────────────────────────────────
   const filteredEvents = useMemo(() => {
     return session.events.filter((ev) => {
-      if (!isEnvelope(ev)) return true; // always show errors
+      
       if (filters.agentFrom && ev.from !== filters.agentFrom) return false;
       if (filters.turnId && ev.turnId !== filters.turnId) return false;
       if (filters.taskId) {
@@ -296,3 +287,5 @@ export function usePushPalsSession(
     state,
   };
 }
+
+

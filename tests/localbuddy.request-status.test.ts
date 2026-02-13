@@ -20,7 +20,7 @@ const formatTime = () => "10:00 PM";
 const requestA: RequestApiRow = {
   id: "e11225b1-1111-4111-8111-111111111111",
   sessionId: "dev",
-  originalPrompt: "fix bug",
+  prompt: "fix bug",
   status: "claimed",
   agentId: "remotebuddy-orchestrator",
   error: null,
@@ -31,7 +31,7 @@ const requestA: RequestApiRow = {
 const requestB: RequestApiRow = {
   id: "a6f87819-2222-4222-8222-222222222222",
   sessionId: "dev",
-  originalPrompt: "hello",
+  prompt: "hello",
   status: "pending",
   agentId: null,
   error: null,

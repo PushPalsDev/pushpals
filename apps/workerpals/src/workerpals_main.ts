@@ -54,25 +54,15 @@ function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl:
   };
 
   const model = (
-    process.env.WORKERPALS_LLM_MODEL ??
-    process.env.WORKERPALS_OPENHANDS_MODEL ??
-    process.env.LLM_MODEL ??
-    DEFAULT_OPENHANDS_MODEL
+    process.env.WORKERPALS_LLM_MODEL ?? DEFAULT_OPENHANDS_MODEL
   )
     .trim()
     .replace(/\s+/g, " ");
   const provider = normalizeProvider(
-    process.env.WORKERPALS_OPENHANDS_PROVIDER ??
-      process.env.WORKERPALS_LLM_BACKEND ??
-      process.env.PUSHPALS_LLM_BACKEND ??
-      "auto",
+    process.env.WORKERPALS_LLM_BACKEND ?? "auto",
   );
   const baseUrl = (
-    process.env.WORKERPALS_LLM_ENDPOINT ??
-    process.env.WORKERPALS_OPENHANDS_BASE_URL ??
-    process.env.LLM_BASE_URL ??
-    process.env.LLM_ENDPOINT ??
-    ""
+    process.env.WORKERPALS_LLM_ENDPOINT ?? ""
   ).trim();
 
   return {

@@ -177,18 +177,14 @@ See `.env.example` for full details. Most important:
 
 LLM defaults:
 
-- Supported backends are `lmstudio` and `ollama` (`PUSHPALS_LLM_BACKEND`)
-- Default backend is LM Studio (`PUSHPALS_LLM_BACKEND=lmstudio`)
-- Shared fallback endpoint/model are `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_API_KEY`
-- Service-specific overrides:
-  - LocalBuddy: `LOCALBUDDY_LLM_ENDPOINT`, `LOCALBUDDY_LLM_MODEL`, `LOCALBUDDY_LLM_API_KEY`
-  - RemoteBuddy: `REMOTEBUDDY_LLM_ENDPOINT`, `REMOTEBUDDY_LLM_MODEL`, `REMOTEBUDDY_LLM_API_KEY`
-  - WorkerPal/OpenHands: `WORKERPALS_LLM_ENDPOINT`, `WORKERPALS_LLM_MODEL`, `WORKERPALS_LLM_API_KEY`
-- Legacy aliases are still supported (`PLANNER_*`, `WORKERPALS_OPENHANDS_*`)
+- Supported backends are `lmstudio` and `ollama`
+- Canonical per-service LLM config:
+  - LocalBuddy: `LOCALBUDDY_LLM_BACKEND`, `LOCALBUDDY_LLM_ENDPOINT`, `LOCALBUDDY_LLM_MODEL`, `LOCALBUDDY_LLM_API_KEY`
+  - RemoteBuddy: `REMOTEBUDDY_LLM_BACKEND`, `REMOTEBUDDY_LLM_ENDPOINT`, `REMOTEBUDDY_LLM_MODEL`, `REMOTEBUDDY_LLM_API_KEY`
+  - WorkerPal/OpenHands: `WORKERPALS_LLM_BACKEND`, `WORKERPALS_LLM_ENDPOINT`, `WORKERPALS_LLM_MODEL`, `WORKERPALS_LLM_API_KEY`
 - For OpenHands/LiteLLM, WorkerPals auto-qualifies plain model names:
   - `openai/<model>` for LM Studio/OpenAI-compatible backends
   - `ollama/<model>` for Ollama backends
-  - override inference with `WORKERPALS_OPENHANDS_PROVIDER` or `WORKERPALS_LLM_BACKEND`
 - OpenHands task message shaping defaults to instruction-only to avoid 4k-context overflow:
   - `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=none` (default)
   - set `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=compact` to prepend `prompts/workerpals/openhands_task_execute_system_prompt.md`
@@ -203,7 +199,7 @@ LLM defaults:
 - LM Studio startup controls:
   - `PUSHPALS_AUTO_START_LMSTUDIO=1` (default on)
   - `PUSHPALS_LMSTUDIO_CLI=lms`
-  - `PUSHPALS_LMSTUDIO_PORT` (optional; defaults from `LLM_ENDPOINT`)
+  - `PUSHPALS_LMSTUDIO_PORT` (optional; defaults from `REMOTEBUDDY_LLM_ENDPOINT`)
   - `PUSHPALS_LMSTUDIO_START_ARGS` (optional extra args for `lms server start`)
   - `PUSHPALS_LMSTUDIO_READY_TIMEOUT_MS` (default `120000`)
 

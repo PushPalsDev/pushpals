@@ -22,7 +22,7 @@ export class ContextManager {
   get(sessionId: string, key: string): string | null {
     const row = this.db
       .query(`SELECT value FROM session_context WHERE session_id = ? AND key = ?`)
-      .get(sessionId, key);
+      .get(sessionId, key) as { value: string } | null;
     return row ? row.value : null;
   }
 
@@ -37,7 +37,7 @@ export class ContextManager {
   getAll(sessionId: string): Record<string, string> {
     const rows = this.db
       .query(`SELECT key, value FROM session_context WHERE session_id = ?`)
-      .all(sessionId);
+      .all(sessionId) as Array<{ key: string; value: string }>;
     const result: Record<string, string> = {};
     for (const row of rows) result[row.key] = row.value;
     return result;

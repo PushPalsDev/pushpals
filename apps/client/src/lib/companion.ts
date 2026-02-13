@@ -10,7 +10,7 @@ export type UserIntent = {
 export interface CompanionModel {
   summarizeAndPlan(input: {
     userText: string;
-    history: (EventEnvelope | { type: "_error"; message: string })[];
+    history: EventEnvelope[];
   }): Promise<UserIntent>;
 }
 
@@ -21,7 +21,7 @@ export interface CompanionModel {
 export class RemoteCompanionModel implements CompanionModel {
   async summarizeAndPlan(input: {
     userText: string;
-    history: (EventEnvelope | { type: "_error"; message: string })[];
+    history: EventEnvelope[];
   }): Promise<UserIntent> {
     // Simple heuristic stub: echo the user text as summary and create one task
     return {

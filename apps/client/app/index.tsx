@@ -16,7 +16,7 @@ import type { TextInputKeyPressEventData, NativeSyntheticEvent } from "react-nat
 import type { EventEnvelope } from "protocol/browser";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 import { TasksJobsLogs } from "../src/lib/TasksJobsLogs";
-import { isEnvelope, usePushPalsSession } from "../src/lib/usePushPalsSession";
+import { usePushPalsSession } from "../src/lib/usePushPalsSession";
 import {
   type CompletionSnapshotRow,
   type JobSnapshotRow,
@@ -676,16 +676,11 @@ function RequestsPane({
                 </View>
               </View>
               <Text style={[styles.requestPrompt, { color: theme.text, fontFamily: theme.fontSans }]}>
-                {clip(request.originalPrompt, 260)}
+                {clip(request.prompt, 260)}
               </Text>
               <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
                 agent {request.agentId ?? "--"} · created {prettyTs(request.createdAt)} · updated {relativeMs(request.updatedAt)}
               </Text>
-              {request.enhancedPrompt ? (
-                <Text style={[styles.requestHint, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                  enhanced: {clip(request.enhancedPrompt, 220)}
-                </Text>
-              ) : null}
               {resultText ? (
                 <View style={[styles.codeBlock, { borderColor: theme.border, backgroundColor: theme.panelAlt }]}>
                   <Text style={[styles.codeBlockLabel, { color: theme.positive, fontFamily: theme.fontSans }]}>result</Text>
@@ -850,7 +845,7 @@ function SystemPane({
     connectedSinceRef.current != null &&
     Date.now() - connectedSinceRef.current < INITIALIZING_GRACE_MS;
 
-  const envelopes = useMemo(() => events.filter(isEnvelope) as EventEnvelope[], [events]);
+  const envelopes = useMemo(() => events as EventEnvelope[], [events]);
 
   const latestEventByComponent = useMemo(() => {
     const byName: Record<string, string | undefined> = {

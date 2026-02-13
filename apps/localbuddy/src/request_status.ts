@@ -3,7 +3,7 @@ export type QueueStatus = "pending" | "claimed" | "completed" | "failed";
 export interface RequestApiRow {
   id: string;
   sessionId: string;
-  originalPrompt: string;
+  prompt: string;
   status: QueueStatus;
   agentId: string | null;
   error: string | null;

@@ -213,10 +213,7 @@ def _model_is_provider_qualified(model: str) -> bool:
 
 def _infer_litellm_provider(base_url: str) -> str:
     backend = (
-        os.environ.get("WORKERPALS_OPENHANDS_PROVIDER")
-        or os.environ.get("WORKERPALS_LLM_BACKEND")
-        or os.environ.get("PUSHPALS_LLM_BACKEND")
-        or ""
+        os.environ.get("WORKERPALS_LLM_BACKEND") or ""
     ).strip().lower()
     if backend in {"ollama", "ollama_chat"}:
         return "ollama"
@@ -593,25 +590,15 @@ def _fallback_models_after_load_failure(
 def _resolve_llm_config() -> Tuple[str, str, str]:
     raw_model = (
         os.environ.get("WORKERPALS_LLM_MODEL")
-        or os.environ.get("WORKERPALS_MODEL")
-        or os.environ.get("WORKERPALS_OPENHANDS_MODEL")
-        or os.environ.get("LLM_MODEL")
         or ""
     ).strip()
     api_key = (
         os.environ.get("WORKERPALS_LLM_API_KEY")
-        or os.environ.get("WORKERPALS_API_KEY")
-        or os.environ.get("WORKERPALS_OPENHANDS_API_KEY")
-        or os.environ.get("LLM_API_KEY")
         or ""
     ).strip()
     raw_base_url = (
         (
             os.environ.get("WORKERPALS_LLM_ENDPOINT")
-            or os.environ.get("WORKERPALS_ENDPOINT")
-            or os.environ.get("WORKERPALS_OPENHANDS_BASE_URL")
-            or os.environ.get("LLM_BASE_URL")
-            or os.environ.get("LLM_ENDPOINT")
             or ""
         )
     )
@@ -857,7 +844,7 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
             "ok": False,
             "summary": (
                 "task.execute requires an LLM model for agentic execution. "
-                "Set WORKERPALS_OPENHANDS_MODEL or LLM_MODEL."
+                "Set WORKERPALS_LLM_MODEL."
             ),
             "stderr": "",
             "exitCode": 2,
@@ -871,7 +858,7 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
                 "ok": False,
                 "summary": (
                     "task.execute agent mode requires an API key. "
-                    "Set WORKERPALS_OPENHANDS_API_KEY or LLM_API_KEY."
+                    "Set WORKERPALS_LLM_API_KEY."
                 ),
                 "stderr": "",
                 "exitCode": 2,
@@ -1185,7 +1172,6 @@ def _job_to_command(
     if kind == "project.summary":
         instruction = str(
             params.get("instruction")
-            or params.get("enhancedPrompt")
             or "Summarize repository architecture and key components."
         )
         recent_jobs_payload = base64.b64encode(
@@ -1197,6 +1183,7 @@ import json
 from pathlib import Path
 
 instruction = {json.dumps(instruction)}
+lane = {json.dumps(lane)}
 root = Path(".")
 
 ignore = {{
@@ -1285,15 +1272,104 @@ print("\\n".join(lines).strip() + "\\n")
 
     if kind == "task.execute":
         instruction = str(req("instruction"))
+        lane = str(params.get("lane") or "openhands").strip().lower()
         target_path = str(params.get("targetPath") or params.get("path") or "").strip()
         if not target_path:
             target_path = _extract_target_path_from_instruction(instruction)
-        if not target_path:
-            raise ValueError("task.execute requires targetPath (or a file name in instruction)")
 
         recent_jobs_payload = base64.b64encode(
             json.dumps(params.get("recentJobs", []), ensure_ascii=True).encode("utf-8")
         ).decode("ascii")
+        if not target_path:
+            script = f"""
+import base64
+import json
+from pathlib import Path
+
+instruction = {json.dumps(instruction)}
+root = Path(".")
+
+ignore = {{
+    ".git",
+    "node_modules",
+    "outputs",
+    ".worktrees",
+    "workspace",
+    ".venv",
+    "dist",
+    "build",
+}}
+
+def tree(base: Path, depth: int, prefix: str = ""):
+    if depth < 0:
+        return []
+    lines = []
+    try:
+        entries = sorted(base.iterdir(), key=lambda p: p.name.lower())
+    except Exception:
+        return lines
+    for entry in entries:
+        name = entry.name
+        if name.startswith(".") and name != ".env.example":
+            continue
+        if name in ignore:
+            continue
+        suffix = "/" if entry.is_dir() else ""
+        lines.append(f"{{prefix}}- {{name}}{{suffix}}")
+        if entry.is_dir() and depth > 0 and len(lines) < 120:
+            lines.extend(tree(entry, depth - 1, prefix + "  "))
+        if len(lines) >= 120:
+            break
+    return lines
+
+readme_excerpt = ""
+readme = root / "README.md"
+if readme.exists():
+    try:
+        readme_excerpt = readme.read_text(encoding="utf-8")[:2400].strip()
+    except Exception:
+        readme_excerpt = ""
+
+recent_jobs = []
+try:
+    recent_jobs = json.loads(base64.b64decode({json.dumps(recent_jobs_payload)}).decode("utf-8"))
+except Exception:
+    recent_jobs = []
+
+lines = []
+lines.append("# Repository Architecture")
+lines.append("")
+lines.append(f"Requested task: {{instruction}}")
+lines.append("")
+lines.append("## Top-level Structure")
+lines.extend(tree(root, 1))
+if readme_excerpt:
+    lines.append("")
+    lines.append("## README Excerpt")
+    lines.append(readme_excerpt)
+
+if isinstance(recent_jobs, list) and recent_jobs:
+    lines.append("")
+    lines.append("## Recent Worker Job Context")
+    for row in recent_jobs[:6]:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("kind", "")).strip()
+        status = str(row.get("status", "")).strip()
+        summary = str(row.get("summary", "")).replace("\\n", " ").strip()
+        error = str(row.get("error", "")).replace("\\n", " ").strip()
+        tail = summary or error
+        if tail:
+            lines.append(f"- {{kind}} [{{status}}]: {{tail}}"[:220])
+        elif kind or status:
+            lines.append(f"- {{kind}} [{{status}}]")
+
+lines.append("")
+lines.append(f"Generated by worker task.execute (lane={{lane}}) from repository state.")
+print("\\n".join(lines).strip() + "\\n")
+"""
+            return _python_cmd(script), "Executed deterministic task summary (no targetPath provided)"
+
         script = f"""
 import base64
 import json
@@ -1575,19 +1651,25 @@ def main() -> int:
     if not isinstance(repo, str) or not repo:
         return _fail("Invalid payload: missing 'repo'", exit_code=2)
 
-    if kind == "task.execute":
-        instruction = str(
-            params.get("instruction") or params.get("enhancedPrompt") or ""
-        ).strip()
-        if not instruction:
-            return _fail("task.execute requires 'instruction'", exit_code=2)
-        target_path = str(params.get("targetPath") or params.get("path") or "").strip()
-        if not target_path:
-            target_path = _extract_target_path_from_instruction(instruction)
-        if not target_path:
-            result = _run_agentic_task_execute(repo, instruction)
-            _emit(result)
-            return 0 if bool(result.get("ok")) else _to_int(result.get("exitCode"), 1)
+    if kind != "task.execute":
+        return _fail(
+            f"Unsupported job kind '{kind}'. WorkerPal accepts only task.execute.",
+            exit_code=2,
+        )
+
+    instruction = str(params.get("instruction") or "").strip()
+    if not instruction:
+        return _fail("task.execute requires 'instruction'", exit_code=2)
+    lane = str(params.get("lane") or "openhands").strip().lower()
+    if lane not in {"openhands", "deterministic"}:
+        return _fail(
+            "task.execute requires lane='openhands' or lane='deterministic'",
+            exit_code=2,
+        )
+    if lane == "openhands":
+        result = _run_agentic_task_execute(repo, instruction)
+        _emit(result)
+        return 0 if bool(result.get("ok")) else _to_int(result.get("exitCode"), 1)
 
     try:
         from openhands.sdk import Workspace

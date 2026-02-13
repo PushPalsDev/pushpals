@@ -65,7 +65,7 @@ export class ShellManager {
     );
     const row = this.db
       .query(`SELECT worker_id, lease_expiry FROM shell_sessions WHERE session_id = ?`)
-      .get(sessionId);
+      .get(sessionId) as { worker_id: string; lease_expiry: number } | null;
     if (row && (row.worker_id === this.workerId || row.lease_expiry < now)) {
       this.db.run(
         `UPDATE shell_sessions SET worker_id = ?, lease_expiry = ?, last_used_at = ?, status = ? WHERE session_id = ?`,
@@ -121,12 +121,13 @@ export class ShellSessionRuntime {
   private sessionId: string;
   private workerId: string;
   private db: Database;
-  private shellProc: Bun.ChildProcess | null = null;
+  private shellProc: ReturnType<typeof spawn> | null = null;
   private commandQueue: ShellCommand[] = [];
   public lastUsedAt: number = Date.now();
   public cwd: string = process.cwd();
   private running: boolean = false;
   private contextMgr: ContextManager;
+  public onContextRefresh?: (context: Record<string, string>) => void;
 
   constructor(
     sessionId: string,
@@ -172,9 +173,10 @@ export class ShellSessionRuntime {
       startedAt: Date.now(),
     };
     this.commandQueue.push(shellCmd);
+    const startedAt = shellCmd.startedAt ?? Date.now();
     this.db.run(
       `INSERT INTO shell_commands (cmd_id, session_id, command, status, started_at) VALUES (?, ?, ?, ?, ?)`,
-      [cmdId, this.sessionId, command, "pending", shellCmd.startedAt],
+      [cmdId, this.sessionId, command, "pending", startedAt],
     );
     this.processQueue();
     return cmdId;
@@ -190,7 +192,12 @@ export class ShellSessionRuntime {
     }
     // Framing: BEGIN/EXIT/CWD/END
     const framed = `echo BEGIN ${cmd.cmdId}\n${cmd.command}\necho EXIT ${cmd.cmdId} $?\necho CWD ${cmd.cmdId} $(pwd)\necho END ${cmd.cmdId}`;
-    this.shellProc.stdin.write(framed + "\n");
+    const stdin = this.shellProc.stdin;
+    if (!stdin || typeof stdin === "number" || typeof stdin.write !== "function") {
+      this.running = false;
+      return;
+    }
+    stdin.write(framed + "\n");
     // TODO: parse output, update db, handle exit/cwd
     // TODO: renew lease, update last_used_at
     // On command completion, update last_known_cwd in context

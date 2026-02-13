@@ -16,8 +16,7 @@ export type RequestStatus = "pending" | "claimed" | "completed" | "failed";
 export interface RequestRow {
   id: string;
   sessionId: string;
-  originalPrompt: string;
-  enhancedPrompt: string;
+  prompt: string;
   status: RequestStatus;
   agentId: string | null;
   result: string | null;
@@ -28,6 +27,17 @@ export interface RequestRow {
 
 export class RequestQueue {
   private db: Database;
+  private static readonly SELECT_COLUMNS = `
+    id,
+    sessionId,
+    prompt,
+    status,
+    agentId,
+    result,
+    error,
+    createdAt,
+    updatedAt
+  `;
 
   constructor(dbPath: string = ":memory:") {
     this.db = new Database(dbPath);
@@ -40,8 +50,7 @@ export class RequestQueue {
       CREATE TABLE IF NOT EXISTS requests (
         id             TEXT PRIMARY KEY,
         sessionId      TEXT NOT NULL,
-        originalPrompt TEXT NOT NULL,
-        enhancedPrompt TEXT NOT NULL,
+        prompt         TEXT NOT NULL,
         status         TEXT NOT NULL DEFAULT 'pending',
         agentId        TEXT,
         result         TEXT,
@@ -53,6 +62,11 @@ export class RequestQueue {
       CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(sessionId);
     `);
+
+    const columns = this.db.prepare(`PRAGMA table_info(requests)`).all() as Array<{ name: string }>;
+    if (!columns.some((col) => col.name === "prompt")) {
+      this.db.exec(`ALTER TABLE requests ADD COLUMN prompt TEXT NOT NULL DEFAULT '';`);
+    }
   }
 
   /**
@@ -60,11 +74,10 @@ export class RequestQueue {
    */
   enqueue(body: Record<string, unknown>): { ok: boolean; requestId?: string; message?: string } {
     const sessionId = body.sessionId as string;
-    const originalPrompt = body.originalPrompt as string;
-    const enhancedPrompt = body.enhancedPrompt as string;
+    const prompt = body.prompt as string;
 
-    if (!sessionId || !originalPrompt || !enhancedPrompt) {
-      return { ok: false, message: "sessionId, originalPrompt, and enhancedPrompt are required" };
+    if (!sessionId || !prompt) {
+      return { ok: false, message: "sessionId and prompt are required" };
     }
 
     const requestId = randomUUID();
@@ -72,10 +85,10 @@ export class RequestQueue {
 
     this.db
       .prepare(
-        `INSERT INTO requests (id, sessionId, originalPrompt, enhancedPrompt, status, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+        `INSERT INTO requests (id, sessionId, prompt, status, createdAt, updatedAt)
+         VALUES (?, ?, ?, 'pending', ?, ?)`,
       )
-      .run(requestId, sessionId, originalPrompt, enhancedPrompt, now, now);
+      .run(requestId, sessionId, prompt, now, now);
 
     return { ok: true, requestId };
   }
@@ -88,7 +101,13 @@ export class RequestQueue {
 
     const tx = this.db.transaction(() => {
       const row = this.db
-        .prepare(`SELECT * FROM requests WHERE status = 'pending' ORDER BY createdAt ASC LIMIT 1`)
+        .prepare(
+          `SELECT ${RequestQueue.SELECT_COLUMNS}
+           FROM requests
+           WHERE status = 'pending'
+           ORDER BY createdAt ASC
+           LIMIT 1`,
+        )
         .get() as RequestRow | undefined;
 
       if (!row) return null;
@@ -151,7 +170,9 @@ export class RequestQueue {
    */
   getRequest(requestId: string): RequestRow | null {
     return (
-      (this.db.prepare(`SELECT * FROM requests WHERE id = ?`).get(requestId) as RequestRow) ?? null
+      (this.db
+        .prepare(`SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE id = ?`)
+        .get(requestId) as RequestRow) ?? null
     );
   }
 
@@ -160,7 +181,9 @@ export class RequestQueue {
    */
   getPendingRequests(): RequestRow[] {
     return this.db
-      .prepare(`SELECT * FROM requests WHERE status = 'pending' ORDER BY createdAt ASC`)
+      .prepare(
+        `SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE status = 'pending' ORDER BY createdAt ASC`,
+      )
       .all() as RequestRow[];
   }
 
@@ -179,12 +202,14 @@ export class RequestQueue {
 
     if (status === "all") {
       return this.db
-        .prepare(`SELECT * FROM requests ORDER BY createdAt DESC LIMIT ?`)
+        .prepare(`SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests ORDER BY createdAt DESC LIMIT ?`)
         .all(limit) as RequestRow[];
     }
 
     return this.db
-      .prepare(`SELECT * FROM requests WHERE status = ? ORDER BY createdAt DESC LIMIT ?`)
+      .prepare(
+        `SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE status = ? ORDER BY createdAt DESC LIMIT ?`,
+      )
       .all(status, limit) as RequestRow[];
   }
 

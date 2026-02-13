@@ -71,7 +71,7 @@ unsubscribe();
 The client uses shared `EventEnvelope` types and validators from `packages/protocol`.
 
 - Validates all incoming events
-- Emits `_error` pseudo-events for validation failures
+- Emits standard `error` envelopes for validation/transport failures
 - Handles both SSE and WebSocket errors
 
 ## Components
