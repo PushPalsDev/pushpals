@@ -796,12 +796,33 @@ function SystemPane({
       SourceControlManager: undefined,
     };
 
+    const hasAny = (value: string, needles: string[]): boolean => needles.some((needle) => value.includes(needle));
+
     for (const event of envelopes) {
       const from = (event.from ?? "").toLowerCase();
-      if (from.includes("localbuddy")) byName.LocalBuddy = event.ts;
-      if (from.includes("remotebuddy")) byName.RemoteBuddy = event.ts;
-      if (from.includes("worker")) byName.WorkerPals = event.ts;
-      if (from.includes("source_control_manager")) byName.SourceControlManager = event.ts;
+      const payload = event.payload as Record<string, unknown>;
+      const payloadAgentId =
+        typeof payload?.agentId === "string" ? (payload.agentId as string).toLowerCase() : "";
+      const signal = `${from} ${payloadAgentId}`;
+
+      if (hasAny(signal, ["localbuddy", "local_buddy", "local buddy"])) byName.LocalBuddy = event.ts;
+      if (hasAny(signal, ["remotebuddy", "remote_buddy", "remote buddy"])) {
+        byName.RemoteBuddy = event.ts;
+      }
+      if (hasAny(signal, ["workerpal", "workerpals", "worker_pal", "worker pals", "worker"])) {
+        byName.WorkerPals = event.ts;
+      }
+      if (
+        hasAny(signal, [
+          "source_control_manager",
+          "sourcecontrolmanager",
+          "source control manager",
+          "source-control-manager",
+          "scm",
+        ])
+      ) {
+        byName.SourceControlManager = event.ts;
+      }
     }
     return byName;
   }, [envelopes]);

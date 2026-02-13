@@ -110,14 +110,15 @@ export function usePushPalsSession(
   useEffect(() => {
     const init = async () => {
       try {
-        const sessionId = await createSession(baseUrl, DEFAULT_SESSION_ID);
-        if (!sessionId) {
+        const session = await createSession(baseUrl, DEFAULT_SESSION_ID);
+        if (!session) {
           setSession((s) => ({
             ...s,
             error: "Failed to create session",
           }));
           return;
         }
+        const sessionId = session.sessionId;
 
         setSession((s) => ({
           ...s,
@@ -126,8 +127,11 @@ export function usePushPalsSession(
         }));
 
         // Restore cursor for reconnect / replay
-        const afterCursor = await loadCursor(sessionId);
+        const afterCursor = session.created ? 0 : await loadCursor(sessionId);
         persistedCursorRef.current = afterCursor;
+        if (session.created) {
+          void setItem(`pushpals:cursor:${sessionId}`, "0");
+        }
 
         // Subscribe to events with cursor-aware callback
         const unsubscribe = subscribeEvents(

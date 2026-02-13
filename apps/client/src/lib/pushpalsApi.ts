@@ -198,7 +198,10 @@ export function subscribeEvents(
 /**
  * Create a new session on the server
  */
-export async function createSession(baseUrl: string, sessionId?: string): Promise<string | null> {
+export async function createSession(
+  baseUrl: string,
+  sessionId?: string,
+): Promise<{ sessionId: string; created: boolean } | null> {
   try {
     const response = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -211,8 +214,12 @@ export async function createSession(baseUrl: string, sessionId?: string): Promis
       return null;
     }
 
-    const data = await response.json();
-    return data.sessionId;
+    const data = (await response.json()) as { sessionId?: string };
+    const created = response.status === 201;
+    if (!data.sessionId || typeof data.sessionId !== "string") {
+      return null;
+    }
+    return { sessionId: data.sessionId, created };
   } catch (err) {
     console.error("Error creating session:", err);
     return null;
