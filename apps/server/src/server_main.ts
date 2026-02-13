@@ -29,8 +29,9 @@ export function createRequestHandler() {
       normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on"
     );
   };
-  const debugHttpLogs =
-    isDebugEnabled(process.env.PUSHPALS_DEBUG_HTTP) || isDebugEnabled(process.env.DEBUG);
+  // Only explicit PushPals flag enables noisy poll/log endpoint printing.
+  // Avoid inheriting generic DEBUG from shells/tooling, which can spam logs.
+  const debugHttpLogs = isDebugEnabled(process.env.PUSHPALS_DEBUG_HTTP);
 
   const envPort = parseInt(process.env.PUSHPALS_PORT ?? "", 10);
   const port = Number.isFinite(envPort) && envPort > 0 ? envPort : 3001;
@@ -117,11 +118,13 @@ export function createRequestHandler() {
       // Noisy poll endpoints: only log these at debug level.
       const isNoisyPoll =
         (method === "POST" &&
-          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command)\/?$/.test(
+          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/log)\/?$/.test(
             pathname,
           )) ||
         (method === "GET" &&
-          /^\/+(workers|system\/status|requests|jobs|completions)(\/)?$/.test(pathname));
+          /^\/+(workers|system\/status|requests|jobs|completions|jobs\/[^/]+\/logs)(\/)?$/.test(
+            pathname,
+          ));
       if (isNoisyPoll) {
         if (debugHttpLogs) console.log(`[${method}] ${pathname}`);
       } else {
