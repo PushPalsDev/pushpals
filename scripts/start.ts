@@ -141,6 +141,30 @@ function dataDirPath(): string {
   return resolve(CONFIG.paths.dataDir);
 }
 
+function ensureRequiredLocalConfigFiles(): void {
+  const required: Array<{ path: string; hint: string }> = [
+    {
+      path: resolve(repoRoot, ".env"),
+      hint: "Create .env from .env.example and set your local secrets/wiring.",
+    },
+    {
+      path: resolve(repoRoot, "config", "local.toml"),
+      hint: "Create config/local.toml from config/local.example.toml for local overrides.",
+    },
+  ];
+
+  const missing = required.filter((entry) => !existsSync(entry.path));
+  if (missing.length === 0) return;
+
+  console.error("[start] Missing required local config file(s):");
+  for (const entry of missing) {
+    const rel = relative(repoRoot, entry.path).replace(/\\/g, "/");
+    console.error(`[start] - ${rel}`);
+    console.error(`[start]   ${entry.hint}`);
+  }
+  abortStart(1);
+}
+
 function cleanRuntimeStateIfRequested(): void {
   if (!startOptions.clean) return;
 
@@ -443,6 +467,9 @@ async function probeHttpReachable(
 
 type LlmPreflightTarget = {
   name: string;
+  backend: SupportedLlmBackend;
+  configuredModel: string;
+  apiKey: string;
   endpoint: string;
   probes: string[];
 };
@@ -454,6 +481,175 @@ type LlmPreflightEndpointGroup = {
   probes: string[];
   services: string[];
 };
+
+const KNOWN_MODEL_PROVIDER_PREFIXES = new Set([
+  "openai",
+  "ollama",
+  "openrouter",
+  "anthropic",
+  "google",
+  "gemini",
+  "groq",
+  "mistral",
+  "cohere",
+  "vertex_ai",
+  "bedrock",
+  "deepseek",
+  "xai",
+  "together_ai",
+  "fireworks_ai",
+  "huggingface",
+  "replicate",
+]);
+
+function normalizeModelName(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function configuredModelCandidates(configuredModel: string): string[] {
+  const raw = configuredModel.trim();
+  if (!raw) return [];
+  const candidates = new Set<string>();
+  candidates.add(raw);
+  if (raw.includes("/")) {
+    const parts = raw.split("/");
+    const first = parts[0]?.trim().toLowerCase() ?? "";
+    if (parts.length > 1 && KNOWN_MODEL_PROVIDER_PREFIXES.has(first)) {
+      const withoutPrefix = parts.slice(1).join("/").trim();
+      if (withoutPrefix) candidates.add(withoutPrefix);
+    }
+  }
+  return Array.from(candidates);
+}
+
+function configuredModelMatchesAvailable(
+  backend: SupportedLlmBackend,
+  configuredModel: string,
+  availableModel: string,
+): boolean {
+  const availableNorm = normalizeModelName(availableModel);
+  if (!availableNorm) return false;
+  const candidates = configuredModelCandidates(configuredModel);
+  for (const candidateRaw of candidates) {
+    const candidate = normalizeModelName(candidateRaw);
+    if (!candidate) continue;
+    if (candidate === availableNorm) return true;
+    if (backend === "ollama") {
+      if (availableNorm.startsWith(`${candidate}:`)) return true;
+      if (candidate.startsWith(`${availableNorm}:`)) return true;
+    }
+  }
+  return false;
+}
+
+function extractModelIds(payload: any): string[] {
+  const out: string[] = [];
+  const add = (value: unknown) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    out.push(trimmed);
+  };
+
+  const fromArray = (rows: unknown[]) => {
+    for (const row of rows) {
+      if (typeof row === "string") {
+        add(row);
+        continue;
+      }
+      if (row && typeof row === "object") {
+        const item = row as Record<string, unknown>;
+        add(item.id);
+        add(item.model);
+        add(item.name);
+      }
+    }
+  };
+
+  if (Array.isArray(payload?.data)) fromArray(payload.data);
+  if (Array.isArray(payload?.models)) fromArray(payload.models);
+  if (Array.isArray(payload)) fromArray(payload);
+
+  return Array.from(new Set(out));
+}
+
+function modelProbeUrls(target: LlmPreflightTarget): string[] {
+  const normalized = target.endpoint.trim().replace(/\/+$/, "");
+  if (!normalized) return [];
+  if (target.backend === "ollama") {
+    if (normalized.endsWith("/api/chat")) {
+      const root = normalized.slice(0, -"/api/chat".length);
+      return Array.from(new Set([`${root}/api/tags`, `${root}/tags`]));
+    }
+    return Array.from(new Set([`${normalized}/api/tags`, `${normalized}/tags`]));
+  }
+
+  if (normalized.endsWith("/v1/chat/completions")) {
+    const root = normalized.slice(0, -"/v1/chat/completions".length);
+    return Array.from(new Set([`${root}/v1/models`, `${root}/models`]));
+  }
+  if (normalized.endsWith("/chat/completions")) {
+    const root = normalized.slice(0, -"/chat/completions".length);
+    if (root.endsWith("/v1")) {
+      const parent = root.slice(0, -"/v1".length).replace(/\/+$/, "");
+      return Array.from(new Set([`${root}/models`, `${parent}/models`]));
+    }
+    return Array.from(new Set([`${root}/v1/models`, `${root}/models`]));
+  }
+  if (normalized.endsWith("/v1")) {
+    const parent = normalized.slice(0, -"/v1".length).replace(/\/+$/, "");
+    return Array.from(new Set([`${normalized}/models`, `${parent}/models`]));
+  }
+  return Array.from(new Set([`${normalized}/v1/models`, `${normalized}/models`]));
+}
+
+async function discoverModelsForTarget(
+  target: LlmPreflightTarget,
+): Promise<{ models: string[]; detail: string }> {
+  const probes = modelProbeUrls(target);
+  if (probes.length === 0) return { models: [], detail: "no model probes derived from endpoint" };
+
+  const headers: Record<string, string> = { Accept: "application/json, text/plain, */*" };
+  const apiKey = target.apiKey.trim();
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  let lastDetail = "model list probe failed";
+  for (const probe of probes) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort("timeout"), 4_000);
+    try {
+      const response = await fetch(probe, {
+        method: "GET",
+        signal: controller.signal,
+        headers,
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        const hint = text.trim().replace(/\s+/g, " ").slice(0, 180);
+        lastDetail = `${probe} -> HTTP ${response.status}${hint ? ` (${hint})` : ""}`;
+        continue;
+      }
+
+      let payload: any = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        payload = null;
+      }
+      const models = extractModelIds(payload);
+      if (models.length > 0) {
+        return { models, detail: `${probe} -> HTTP ${response.status}` };
+      }
+      lastDetail = `${probe} -> no models in payload`;
+    } catch (err) {
+      lastDetail = `${probe}: ${String(err)}`;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  return { models: [], detail: lastDetail };
+}
 
 async function checkTargetReachable(target: {
   endpoint: string;
@@ -491,7 +687,13 @@ function llmPreflightTargets(): LlmPreflightTarget[] {
   const workerFallback =
     workerBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
 
-  const addTarget = (name: string, endpoint: string): void => {
+  const addTarget = (
+    name: string,
+    backend: SupportedLlmBackend,
+    model: string,
+    apiKey: string,
+    endpoint: string,
+  ): void => {
     const normalized = endpoint.trim();
     if (!normalized) return;
 
@@ -510,19 +712,35 @@ function llmPreflightTargets(): LlmPreflightTarget[] {
       probes.push(parsed.origin);
     }
 
-    out.push({ name, endpoint: normalized, probes: Array.from(new Set(probes)) });
+    out.push({
+      name,
+      backend,
+      configuredModel: model.trim(),
+      apiKey: apiKey.trim(),
+      endpoint: normalized,
+      probes: Array.from(new Set(probes)),
+    });
   };
 
   addTarget(
     "RemoteBuddy LLM",
+    remoteBackend,
+    CONFIG.remotebuddy.llm.model,
+    CONFIG.remotebuddy.llm.apiKey,
     normalizeEndpointForBackend(configuredRemoteRaw, remoteFallback, remoteBackend),
   );
   addTarget(
     "LocalBuddy LLM",
+    localBackend,
+    CONFIG.localbuddy.llm.model,
+    CONFIG.localbuddy.llm.apiKey,
     normalizeEndpointForBackend(configuredLocalRaw, localFallback, localBackend),
   );
   addTarget(
     "WorkerPal LLM",
+    workerBackend,
+    CONFIG.workerpals.llm.model,
+    CONFIG.workerpals.llm.apiKey,
     normalizeEndpointForBackend(configuredWorkerRaw, workerFallback, workerBackend),
   );
 
@@ -842,6 +1060,87 @@ async function ensureLlmPreflight(): Promise<void> {
     console.error(
       "[start] Start your model server or set startup.skip_llm_preflight=true in config to bypass this check.",
     );
+    abortStart(1);
+  }
+
+  const modelFailures: Array<{ target: LlmPreflightTarget; detail: string }> = [];
+  const configuredModelMissingFailures: Array<{
+    target: LlmPreflightTarget;
+    configuredModel: string;
+    discoveredDetail: string;
+    discoveredFallback: string;
+  }> = [];
+  for (const target of serviceTargets) {
+    const discovered = await discoverModelsForTarget(target);
+    if (discovered.models.length === 0) {
+      modelFailures.push({
+        target,
+        detail: discovered.detail,
+      });
+      continue;
+    }
+
+    const configuredModel = target.configuredModel.trim();
+    if (configuredModel) {
+      const matched = discovered.models.some((available) =>
+        configuredModelMatchesAvailable(target.backend, configuredModel, available),
+      );
+      if (matched) {
+        console.log(
+          `[start] LLM model preflight ok for ${target.name}: configured model "${configuredModel}" is available (${discovered.detail}).`,
+        );
+        continue;
+      }
+
+      const fallback = discovered.models[0] ?? "(none)";
+      configuredModelMissingFailures.push({
+        target,
+        configuredModel,
+        discoveredDetail: discovered.detail,
+        discoveredFallback: fallback,
+      });
+      continue;
+    }
+
+    const fallback = discovered.models[0] ?? "(none)";
+    console.log(
+      `[start] LLM model preflight ok for ${target.name}: no configured model set; discovered "${fallback}" (${discovered.detail}).`,
+    );
+  }
+
+  if (configuredModelMissingFailures.length > 0 || modelFailures.length > 0) {
+    for (const failure of configuredModelMissingFailures) {
+      console.error(`[start] LLM model preflight failed for ${failure.target.name}.`);
+      console.error(`[start] Endpoint: ${failure.target.endpoint}`);
+      console.error(`[start] Backend: ${failure.target.backend}`);
+      console.error(`[start] Configured model: ${failure.configuredModel}`);
+      console.error(
+        `[start] Reason: configured model not found in endpoint model list (${failure.discoveredDetail}).`,
+      );
+      console.error(`[start] Discovered fallback model: ${failure.discoveredFallback}`);
+    }
+
+    for (const failure of modelFailures) {
+      console.error(`[start] LLM model preflight failed for ${failure.target.name}.`);
+      console.error(`[start] Endpoint: ${failure.target.endpoint}`);
+      console.error(`[start] Backend: ${failure.target.backend}`);
+      console.error(
+        `[start] Configured model: ${failure.target.configuredModel || "(empty)"}`,
+      );
+      console.error(`[start] Reason: ${failure.detail}`);
+    }
+    if (autoStartAttempted) {
+      await stopManagedLmStudio();
+    }
+    if (configuredModelMissingFailures.length > 0) {
+      console.error(
+        "[start] Startup aborted: configured service model(s) are missing. Update config/*.toml model names or load those exact models in your LLM server.",
+      );
+    } else {
+      console.error(
+        "[start] LLM server is reachable but no models were discovered. Load a model or update service model config.",
+      );
+    }
     abortStart(1);
   }
 }
@@ -1924,6 +2223,7 @@ process.on("SIGTERM", () => {
 try {
   cleanRuntimeStateIfRequested();
   sanitizeWindowsWatcherPaths();
+  ensureRequiredLocalConfigFiles();
   await cleanupWorkerWarmContainers("startup preflight");
   await ensureLlmPreflight();
   await ensureIntegrationBranch();

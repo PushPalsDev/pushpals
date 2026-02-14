@@ -2,11 +2,11 @@
 # Keep secrets in .env (or CI secret store), not in TOML.
 
 [localbuddy.llm]
-model = "zai-org/glm-4.7-flash"
+model = "gpt-5-distill-qwen3-1.7b-instruct"
 endpoint = "http://127.0.0.1:1234"
 
 [remotebuddy.llm]
-model = "zai-org/glm-4.7-flash"
+model = "gpt-5-distill-qwen3-1.7b-instruct"
 endpoint = "http://127.0.0.1:1234"
 
 [workerpals.llm]
@@ -29,7 +29,7 @@ batch_tail_messages = 3
 
 [source_control_manager]
 repo_path = ".worktrees/source_control_manager"
-main_branch = "main_agents"
+pushpals_branch = "main_agents"
 base_branch = "main"
 
 [startup]

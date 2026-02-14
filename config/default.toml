@@ -115,7 +115,7 @@ session_id = "workerpals-dev"
 [source_control_manager]
 repo_path = ".worktrees/source_control_manager"
 remote = "origin"
-main_branch = "main_agents"
+pushpals_branch = "main_agents"
 base_branch = "main"
 branch_prefix = "agent/"
 poll_interval_seconds = 10

@@ -582,7 +582,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const scmMainBranch = firstNonEmpty(
     process.env.SOURCE_CONTROL_MANAGER_MAIN_BRANCH,
     process.env.PUSHPALS_INTEGRATION_BRANCH,
-    asString(scmNode.main_branch, "main_agents"),
+    asString(scmNode.pushpals_branch, "main_agents"),
     "main_agents",
   );
   const scmBaseBranch = firstNonEmpty(
