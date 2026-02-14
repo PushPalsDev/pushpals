@@ -191,6 +191,10 @@ See `.env.example` for full details. Most important:
 - `WORKERPALS_DOCKER_IMAGE`
 - `WORKERPALS_REQUIRE_DOCKER`
 - `WORKERPALS_DOCKER_NETWORK_MODE` (default `bridge`; required for containerized access to host LLM endpoints)
+- `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` / `ALL_PROXY` (optional; forwarded to worker containers for internet/proxy access)
+- `WORKERPALS_OPENHANDS_ENABLE_BROWSER_TOOL` (optional BrowserToolSet via Playwright/browser-use)
+- `WORKERPALS_OPENHANDS_MCP_CONFIG_JSON` (optional full MCP config for external connectors)
+- `WORKERPALS_OPENHANDS_ENABLE_WEB_MCP` + `WORKERPALS_OPENHANDS_WEB_MCP_URL` (optional shortcut for one web/doc MCP connector)
 - `PUSHPALS_WORKER_IMAGE_REBUILD` (`auto` default; auto rebuild when worker image inputs change)
 
 LLM defaults:
@@ -212,6 +216,15 @@ LLM defaults:
 - OpenHands agent prompt profile can be minimized for local 4k-context models:
   - `WORKERPALS_OPENHANDS_PROMPT_PROFILE=minimal` (default behavior for local endpoints)
   - `WORKERPALS_OPENHANDS_PROMPT_PROFILE=default` to use OpenHands built-in templates
+- Optional browser automation toolset for agentic jobs:
+  - `WORKERPALS_OPENHANDS_ENABLE_BROWSER_TOOL=1`
+  - Worker Docker image includes Playwright + Chromium runtime
+- Optional MCP connectors for richer research/doc lookup:
+  - full config via `WORKERPALS_OPENHANDS_MCP_CONFIG_JSON` (FastMCP `mcpServers` schema)
+  - shortcut for one remote web connector:
+    - `WORKERPALS_OPENHANDS_ENABLE_WEB_MCP=1`
+    - `WORKERPALS_OPENHANDS_WEB_MCP_URL=<https://...>`
+    - optional: `WORKERPALS_OPENHANDS_WEB_MCP_NAME`, `WORKERPALS_OPENHANDS_WEB_MCP_TRANSPORT`, `WORKERPALS_OPENHANDS_WEB_MCP_AUTH_TOKEN`, `WORKERPALS_OPENHANDS_WEB_MCP_HEADERS_JSON`
 - `bun run start` preflights LLM connectivity and can auto-start LM Studio headless mode for localhost endpoints
 - Ollama is supported but is not auto-started by `bun run start`; run Ollama separately
 - LM Studio startup controls:

@@ -154,6 +154,26 @@ def _to_float(value: Any, default: float) -> float:
         return default
 
 
+def _is_truthy_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _json_object_from_env(name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None, ""
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        return None, f"{name}: invalid JSON ({exc})"
+    if not isinstance(parsed, dict):
+        return None, f"{name}: expected a JSON object"
+    return parsed, ""
+
+
 def _python_cmd(script: str) -> str:
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     python_bin = shlex.quote(
@@ -683,6 +703,82 @@ def _resolve_agent_prompt_overrides(base_url: str) -> Dict[str, Any]:
     return overrides
 
 
+def _resolve_mcp_config() -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    notes: List[str] = []
+    config, config_error = _json_object_from_env("WORKERPALS_OPENHANDS_MCP_CONFIG_JSON")
+    if config_error:
+        notes.append(
+            "[OpenHandsExecutor] Ignoring WORKERPALS_OPENHANDS_MCP_CONFIG_JSON "
+            f"because it is invalid: {config_error}"
+        )
+        config = None
+
+    if not _is_truthy_env("WORKERPALS_OPENHANDS_ENABLE_WEB_MCP", False):
+        return config, notes
+
+    web_url = (os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_URL") or "").strip()
+    if not web_url:
+        notes.append(
+            "[OpenHandsExecutor] WORKERPALS_OPENHANDS_ENABLE_WEB_MCP=1 but "
+            "WORKERPALS_OPENHANDS_WEB_MCP_URL is empty; skipping web MCP connector."
+        )
+        return config, notes
+
+    server_name = (os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_NAME") or "").strip() or "web-search"
+    transport = (
+        (os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_TRANSPORT") or "").strip().lower()
+        or "streamable-http"
+    )
+    if transport == "streamable_http":
+        transport = "streamable-http"
+    if transport not in {"http", "streamable-http", "sse"}:
+        notes.append(
+            "[OpenHandsExecutor] Unsupported WORKERPALS_OPENHANDS_WEB_MCP_TRANSPORT="
+            f"{transport}; defaulting to streamable-http."
+        )
+        transport = "streamable-http"
+
+    headers, headers_error = _json_object_from_env("WORKERPALS_OPENHANDS_WEB_MCP_HEADERS_JSON")
+    if headers_error:
+        notes.append(
+            "[OpenHandsExecutor] Ignoring WORKERPALS_OPENHANDS_WEB_MCP_HEADERS_JSON "
+            f"because it is invalid: {headers_error}"
+        )
+        headers = None
+
+    auth_token = (os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_AUTH_TOKEN") or "").strip()
+    timeout_sec = _to_int(os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_TIMEOUT_SEC"), 0)
+
+    server_config: Dict[str, Any] = {"url": web_url, "transport": transport}
+    if headers:
+        server_config["headers"] = {
+            str(k): str(v) for k, v in headers.items() if isinstance(k, str) and isinstance(v, (str, int, float, bool))
+        }
+    if auth_token:
+        server_config["auth"] = auth_token
+    if timeout_sec > 0:
+        server_config["timeout"] = timeout_sec
+
+    if config is None:
+        config = {"mcpServers": {}}
+    servers_raw = config.get("mcpServers")
+    if not isinstance(servers_raw, dict):
+        notes.append(
+            "[OpenHandsExecutor] mcp_config did not contain object mcpServers; replacing it."
+        )
+        servers_raw = {}
+        config["mcpServers"] = servers_raw
+    servers_raw[server_name] = server_config
+    notes.append(
+        f"[OpenHandsExecutor] Web MCP connector enabled: {server_name} -> {web_url} ({transport})."
+    )
+    return config, notes
+
+
+def _browser_tool_enabled() -> bool:
+    return _is_truthy_env("WORKERPALS_OPENHANDS_ENABLE_BROWSER_TOOL", False)
+
+
 def _load_prompt_template(
     relative_path: str, replacements: Optional[Dict[str, str]] = None
 ) -> str:
@@ -902,15 +998,33 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         # are cache-pinned. Disable prompt caching for local endpoints.
         llm_kwargs_base["caching_prompt"] = False
 
-    tools = [
-        Tool(name=TerminalTool.name),
-        Tool(name=FileEditorTool.name),
-    ]
+    tools = [Tool(name=TerminalTool.name), Tool(name=FileEditorTool.name)]
+    if _browser_tool_enabled():
+        try:
+            from openhands.tools.browser_use import BrowserToolSet
+
+            tools.append(Tool(name=BrowserToolSet.name))
+            sys.stderr.write(
+                "[OpenHandsExecutor] BrowserToolSet enabled (browser-use/playwright lane).\n"
+            )
+            sys.stderr.flush()
+        except Exception as exc:
+            sys.stderr.write(
+                "[OpenHandsExecutor] Browser tooling requested but unavailable; "
+                f"continuing without browser tools ({exc}).\n"
+            )
+            sys.stderr.flush()
+
     agent_overrides = _resolve_agent_prompt_overrides(base_url)
     if agent_overrides:
         sys.stderr.write(
             "[OpenHandsExecutor] Using minimal OpenHands prompt profile for local context constraints.\n"
         )
+        sys.stderr.flush()
+    mcp_config, mcp_notes = _resolve_mcp_config()
+    for note in mcp_notes:
+        sys.stderr.write(note + "\n")
+    if mcp_notes:
         sys.stderr.flush()
 
     prepared_instruction, handoff_path = _prepare_instruction_for_agent(repo, instruction)
@@ -995,15 +1109,47 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         try:
             llm = LLM(**llm_kwargs)
             try:
-                agent = Agent(llm=llm, tools=tools, **agent_overrides)
+                primary_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
+                if mcp_config:
+                    primary_agent_kwargs["mcp_config"] = mcp_config
+                if agent_overrides:
+                    primary_agent_kwargs.update(agent_overrides)
+                agent = Agent(**primary_agent_kwargs)
             except TypeError:
-                # Older SDK versions may not support explicit prompt override kwargs.
+                # Older SDK versions may not support explicit prompt override kwargs/mcp_config.
+                fallback_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
+                if mcp_config:
+                    fallback_agent_kwargs["mcp_config"] = mcp_config
                 if agent_overrides:
                     sys.stderr.write(
                         "[OpenHandsExecutor] Prompt profile overrides unsupported by installed OpenHands SDK; using defaults.\n"
                     )
                     sys.stderr.flush()
-                agent = Agent(llm=llm, tools=tools)
+                try:
+                    agent = Agent(**fallback_agent_kwargs)
+                except TypeError:
+                    if mcp_config:
+                        sys.stderr.write(
+                            "[OpenHandsExecutor] mcp_config unsupported by installed OpenHands SDK; using tools without MCP.\n"
+                        )
+                        sys.stderr.flush()
+                    agent = Agent(llm=llm, tools=tools)
+            except Exception as agent_exc:
+                lowered_agent_exc = str(agent_exc).lower()
+                if mcp_config and "mcp" in lowered_agent_exc:
+                    sys.stderr.write(
+                        "[OpenHandsExecutor] Invalid mcp_config for current runtime; continuing without MCP.\n"
+                    )
+                    sys.stderr.flush()
+                    fallback_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
+                    if agent_overrides:
+                        fallback_kwargs.update(agent_overrides)
+                    try:
+                        agent = Agent(**fallback_kwargs)
+                    except TypeError:
+                        agent = Agent(llm=llm, tools=tools)
+                else:
+                    raise
 
             conversation = Conversation(agent=agent, workspace=repo)
             conversation.send_message(user_message)

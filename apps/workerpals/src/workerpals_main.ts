@@ -87,6 +87,19 @@ function formatDurationMs(durationMs: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
+function sanitizeJobLogLine(line: string): string {
+  // Strip ANSI escape/control sequences and collapse whitespace.
+  return line
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\r/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isNoisyProgressLine(line: string): boolean {
+  return /^(📦 Installing \[\d+\/\d+\]|🔍 Resolving\.\.\.|🔒 Saving lockfile\.\.\.)$/.test(line);
+}
+
 function parseArgs(): {
   server: string;
   pollMs: number;
@@ -556,21 +569,35 @@ async function workerLoop(
           let stdoutSeq = 0;
           let stderrSeq = 0;
           let logChain: Promise<void> = Promise.resolve();
+          let lastCleanLog = "";
+          let lastCleanLogAt = 0;
 
           const onLog = job.sessionId
             ? (stream: "stdout" | "stderr", line: string) => {
+                const cleaned = sanitizeJobLogLine(line);
+                if (!cleaned) return;
+
+                // Drop high-frequency terminal progress redraw spam; keep meaningful lines.
+                if (isNoisyProgressLine(cleaned)) return;
+
+                // Collapse very noisy duplicate lines emitted in tight loops.
+                const now = Date.now();
+                if (cleaned === lastCleanLog && now - lastCleanLogAt < 1_000) return;
+                lastCleanLog = cleaned;
+                lastCleanLogAt = now;
+
                 const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
                 logChain = logChain.then(() =>
                   Promise.allSettled([
                     sendCommand(opts.server, job.sessionId, headers, {
                       type: "job_log",
-                      payload: { jobId: job.id, stream, seq, line },
+                      payload: { jobId: job.id, stream, seq, line: cleaned },
                       from: `worker:${opts.workerId}`,
                     }),
                     fetch(`${opts.server}/jobs/${job.id}/log`, {
                       method: "POST",
                       headers,
-                      body: JSON.stringify({ stream, seq, message: line }),
+                      body: JSON.stringify({ stream, seq, message: cleaned }),
                     }),
                   ]).then(() => undefined),
                 );

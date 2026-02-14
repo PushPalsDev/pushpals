@@ -180,7 +180,9 @@ function isTimeoutFailureError(errorPayload: string | null): boolean {
   } catch {
     // Keep raw payload fallback.
   }
-  return /\b(timeout|timed out|deadline exceeded)\b/i.test(haystack);
+  return /\b(timeout|timed out|deadline exceeded|stale worker claim|heartbeat stale|watchdog)\b/i.test(
+    haystack,
+  );
 }
 
 function extractPlanningField(params: unknown, key: string): unknown {
@@ -752,12 +754,15 @@ export class JobQueue {
   recoverStaleClaimedJobs(staleAfterMs: number, limit = 100): RecoveredStaleJob[] {
     const ttlMs = Number.isFinite(staleAfterMs) ? Math.max(5_000, Math.floor(staleAfterMs)) : 120_000;
     const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(500, Math.floor(limit))) : 100;
-    const cutoff = new Date(Date.now() - ttlMs).toISOString();
+    const nowMs = Date.now();
+    const cutoff = new Date(nowMs - ttlMs).toISOString();
 
     type StaleCandidate = {
       jobId: string;
       taskId: string;
       sessionId: string;
+      executionBudgetMs: number | null;
+      finalizationBudgetMs: number | null;
       workerId: string | null;
       workerStatus: string | null;
       workerCurrentJobId: string | null;
@@ -773,6 +778,8 @@ export class JobQueue {
            j.id AS jobId,
            j.taskId AS taskId,
            j.sessionId AS sessionId,
+           j.executionBudgetMs AS executionBudgetMs,
+           j.finalizationBudgetMs AS finalizationBudgetMs,
            j.workerId AS workerId,
            w.status AS workerStatus,
            w.currentJobId AS workerCurrentJobId,
@@ -797,29 +804,10 @@ export class JobQueue {
          FROM jobs j
          LEFT JOIN workers w ON w.workerId = j.workerId
          WHERE j.status = 'claimed'
-           AND COALESCE(
-             (
-               SELECT MAX(jl.ts)
-               FROM job_logs jl
-               WHERE jl.jobId = j.id
-             ),
-             j.firstLogAt,
-             j.startedAt,
-             j.claimedAt,
-             j.updatedAt
-           ) < ?
-           AND (
-             j.workerId IS NULL
-             OR w.workerId IS NULL
-             OR w.lastHeartbeat < ?
-             OR w.status <> 'busy'
-             OR w.currentJobId IS NULL
-             OR w.currentJobId <> j.id
-           )
          ORDER BY activityAt ASC
          LIMIT ?`,
       )
-      .all(cutoff, cutoff, maxRows) as StaleCandidate[];
+      .all(maxRows) as StaleCandidate[];
 
     if (candidates.length === 0) return [];
 
@@ -828,6 +816,34 @@ export class JobQueue {
 
     const tx = this.db.transaction((rows: StaleCandidate[]) => {
       for (const row of rows) {
+        const activityMs = parseIsoMs(row.activityAt) ?? parseIsoMs(row.jobUpdatedAt) ?? nowMs;
+        const heartbeatMs = parseIsoMs(row.workerLastHeartbeat);
+        const activityAgeMs = Math.max(0, nowMs - activityMs);
+        const heartbeatAgeMs = heartbeatMs == null ? Number.POSITIVE_INFINITY : Math.max(0, nowMs - heartbeatMs);
+
+        const workerAligned =
+          !!row.workerId &&
+          row.workerStatus === "busy" &&
+          row.workerCurrentJobId === row.jobId;
+
+        const executionBudgetMs =
+          typeof row.executionBudgetMs === "number" && Number.isFinite(row.executionBudgetMs)
+            ? Math.max(5_000, Math.floor(row.executionBudgetMs))
+            : JOB_EXECUTION_BUDGET_MS.normal;
+        const finalizationBudgetMs =
+          typeof row.finalizationBudgetMs === "number" && Number.isFinite(row.finalizationBudgetMs)
+            ? Math.max(5_000, Math.floor(row.finalizationBudgetMs))
+            : JOB_FINALIZATION_BUDGET_MS_DEFAULT;
+        const combinedBudgetMs = executionBudgetMs + finalizationBudgetMs;
+
+        // Busy workers assigned to the current job are given a longer grace window
+        // before stale recovery kicks in, to avoid false positives on long-running tasks
+        // with sparse logs/heartbeats.
+        const alignedGraceMs = Math.max(ttlMs, Math.min(combinedBudgetMs, ttlMs * 5));
+        const effectiveStaleAfterMs = workerAligned ? alignedGraceMs : ttlMs;
+        if (activityAgeMs < effectiveStaleAfterMs) continue;
+        if (workerAligned && heartbeatAgeMs < effectiveStaleAfterMs) continue;
+
         const message = "Job auto-failed after stale worker claim";
         const detailParts = [
           row.workerId ? `worker=${row.workerId}` : "worker=missing",
@@ -841,7 +857,11 @@ export class JobQueue {
           row.lastLogTs ? `lastLogTs=${row.lastLogTs}` : "lastLogTs=none",
           `activityAt=${row.activityAt}`,
           `jobUpdatedAt=${row.jobUpdatedAt}`,
+          `workerAligned=${workerAligned ? "yes" : "no"}`,
+          `activityAgeMs=${activityAgeMs}`,
+          `heartbeatAgeMs=${Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs : -1}`,
           `staleAfterMs=${ttlMs}`,
+          `effectiveStaleAfterMs=${effectiveStaleAfterMs}`,
         ];
         const detail = detailParts.join("; ");
 
@@ -864,8 +884,8 @@ export class JobQueue {
         if (info.changes === 0) continue;
 
         if (row.workerId) {
-          const heartbeatMs = Date.parse(row.workerLastHeartbeat ?? "");
           const staleHeartbeat =
+            heartbeatMs == null ||
             !Number.isFinite(heartbeatMs) ||
             Number.isNaN(heartbeatMs) ||
             heartbeatMs < Date.parse(cutoff);

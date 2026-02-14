@@ -92,6 +92,29 @@ describe("JobQueue stale recovery", () => {
     expect(queue.getJob(jobId)?.status).toBe("failed");
   });
 
+  test("does not recover an aligned busy job before effective grace window", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueAndClaim(queue, "worker-c");
+    const db = (queue as unknown as { db: any }).db as any;
+    const onlyThreeMinutesOld = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
+      onlyThreeMinutesOld,
+      "worker-c",
+    );
+    db.prepare("UPDATE jobs SET updatedAt = ?, startedAt = ?, claimedAt = ? WHERE id = ?").run(
+      onlyThreeMinutesOld,
+      onlyThreeMinutesOld,
+      onlyThreeMinutesOld,
+      jobId,
+    );
+
+    const recovered = queue.recoverStaleClaimedJobs(120_000);
+
+    expect(recovered.length).toBe(0);
+    expect(queue.getJob(jobId)?.status).toBe("claimed");
+  });
+
   test("computes job SLO summary including timeout failures", () => {
     const queue = new JobQueue(":memory:");
 
@@ -133,5 +156,21 @@ describe("JobQueue stale recovery", () => {
     expect(slo.timeoutRate).toBe(0.5);
     expect(slo.durationMs.sampleSize).toBeGreaterThanOrEqual(2);
     expect(slo.queueWaitMs.sampleSize).toBeGreaterThanOrEqual(2);
+  });
+
+  test("counts stale worker watchdog failures in timeout-rate bucket", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueAndClaim(queue, "worker-timeout");
+    const fail = queue.fail(jobId, {
+      message: "Job auto-failed after stale worker claim",
+      detail: "worker heartbeat stale",
+    });
+    expect(fail.ok).toBe(true);
+
+    const slo = queue.sloSummary(24);
+    expect(slo.terminal).toBe(1);
+    expect(slo.failed).toBe(1);
+    expect(slo.timeoutFailures).toBe(1);
+    expect(slo.timeoutRate).toBe(1);
   });
 });
