@@ -63,8 +63,19 @@ export class DockerExecutor {
   private warmAgentPort = 39231;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private activeJobs = 0;
+  private readonly warmAgentStartupTimeoutMs: number;
+  private readonly warmAgentStartupPollMs: number = 200;
 
   constructor(options: DockerExecutorOptions) {
+    const startupTimeoutRaw = Number.parseInt(
+      process.env.WORKERPALS_DOCKER_AGENT_STARTUP_TIMEOUT_MS ?? "",
+      10,
+    );
+    const startupTimeoutMs =
+      Number.isFinite(startupTimeoutRaw) && startupTimeoutRaw > 0
+        ? Math.max(10_000, Math.min(180_000, startupTimeoutRaw))
+        : 45_000;
+
     this.options = {
       gitToken: "",
       // Keep a little headroom above OpenHands inner timeout so wrapper can
@@ -77,6 +88,7 @@ export class DockerExecutor {
     };
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
+    this.warmAgentStartupTimeoutMs = startupTimeoutMs;
 
     // Ensure worktrees directory exists
     try {
@@ -287,6 +299,15 @@ export class DockerExecutor {
     this.idleTimer = null;
   }
 
+  private warmAgentStartupLoop(): { attempts: number; sleepSeconds: string } {
+    const attempts = Math.max(
+      1,
+      Math.ceil(this.warmAgentStartupTimeoutMs / this.warmAgentStartupPollMs),
+    );
+    const sleepSeconds = String(this.warmAgentStartupPollMs / 1000);
+    return { attempts, sleepSeconds };
+  }
+
   private scheduleIdleShutdown(): void {
     if (this.options.idleTimeoutMs <= 0) return;
     if (this.activeJobs > 0) return;
@@ -335,6 +356,7 @@ export class DockerExecutor {
     args.push("-e", `WORKERPALS_OPENHANDS_AGENT_SERVER_URL=http://127.0.0.1:${this.warmAgentPort}`);
 
     const healthCmd = `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1`;
+    const { attempts: startupAttempts, sleepSeconds } = this.warmAgentStartupLoop();
     const resolvePythonCmd =
       'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
       'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
@@ -346,17 +368,30 @@ export class DockerExecutor {
       this.options.imageName,
       "-lc",
       `${resolvePythonCmd}; ` +
+        ": >/tmp/openhands-agent.log; " +
         `"$PY" -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
-        `for i in $(seq 1 120); do ${healthCmd} && break; sleep 0.1; done; ` +
-        `${healthCmd} || { tail -n 120 /tmp/openhands-agent.log 2>/dev/null; exit 1; }; ` +
+        `for i in $(seq 1 ${startupAttempts}); do ${healthCmd} && break; sleep ${sleepSeconds}; done; ` +
+        `${healthCmd} || { ` +
+        'echo "agent server health check failed"; ' +
+        'ps -ef | grep -i "openhands.agent_server" | grep -v grep || true; ' +
+        'ls -l /tmp/openhands-agent.log 2>/dev/null || true; ' +
+        "tail -n 160 /tmp/openhands-agent.log 2>/dev/null; " +
+        "exit 1; }; " +
         "tail -f /dev/null",
     );
 
     const proc = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
-    const exitCode = await proc.exited;
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
     if (exitCode !== 0) {
-      const stderr = await new Response(proc.stderr).text();
-      throw new Error(`Failed to start warm container: ${stderr}`);
+      throw new Error(
+        `Failed to start warm container (exit ${exitCode}): ${
+          stderr.trim() || stdout.trim() || "no docker output"
+        }`,
+      );
     }
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
   }
@@ -386,7 +421,12 @@ export class DockerExecutor {
     await this.startWarmContainer();
   }
 
-  private async runWarmShell(command: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  private async runWarmShell(command: string): Promise<{
+    ok: boolean;
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+  }> {
     const proc = Bun.spawn(
       ["docker", "exec", this.warmContainerName, "/bin/sh", "-lc", command],
       { stdout: "pipe", stderr: "pipe" },
@@ -400,7 +440,91 @@ export class DockerExecutor {
       ok: exitCode === 0,
       stdout: stdout.trim(),
       stderr: stderr.trim(),
+      exitCode,
     };
+  }
+
+  private async inspectWarmContainerState(): Promise<string> {
+    const proc = Bun.spawn(
+      [
+        "docker",
+        "inspect",
+        "-f",
+        "running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}} started={{.State.StartedAt}} finished={{.State.FinishedAt}} oom={{.State.OOMKilled}}",
+        this.warmContainerName,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    const out = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+    return exitCode === 0
+      ? out || "no inspect output"
+      : `docker inspect failed (exit ${exitCode})${out ? `\n${out}` : ""}`;
+  }
+
+  private async readWarmContainerLogs(tail = 160): Promise<string> {
+    const proc = Bun.spawn(["docker", "logs", "--tail", String(tail), this.warmContainerName], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    const out = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+    return exitCode === 0 ? out || "(no docker logs)" : `docker logs failed (exit ${exitCode})${out ? `\n${out}` : ""}`;
+  }
+
+  private async collectWarmAgentDiagnostics(): Promise<string> {
+    const sections: string[] = [];
+    sections.push(`[container] ${await this.inspectWarmContainerState()}`);
+    sections.push(`[container-logs]\n${await this.readWarmContainerLogs(160)}`);
+
+    const shellProbe = await this.runWarmShell("true");
+    if (!shellProbe.ok) {
+      const probeOut = [shellProbe.stdout, shellProbe.stderr].filter(Boolean).join("\n");
+      sections.push(
+        `[container-exec] exit=${shellProbe.exitCode}${probeOut ? `\n${probeOut}` : "\n(no output)"}`,
+      );
+      return sections.join("\n");
+    }
+
+    const checks: Array<{ label: string; command: string }> = [
+      {
+        label: "processes",
+        command: 'ps -ef | grep -i "openhands.agent_server" | grep -v grep || true',
+      },
+      {
+        label: "python",
+        command:
+          'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
+          'echo "configured=$PY"; ' +
+          'if [ -x "$PY" ]; then "$PY" -V 2>&1; else echo "configured python missing"; fi; ' +
+          '(command -v python3 && python3 -V) 2>/dev/null || true',
+      },
+      {
+        label: "agent-log-meta",
+        command: "ls -l /tmp/openhands-agent.log 2>/dev/null || true",
+      },
+      {
+        label: "agent-log-tail",
+        command: "tail -n 160 /tmp/openhands-agent.log 2>/dev/null || true",
+      },
+    ];
+
+    for (const check of checks) {
+      const result = await this.runWarmShell(check.command);
+      const text = [result.stdout, result.stderr].filter(Boolean).join("\n");
+      sections.push(
+        `[${check.label}] exit=${result.exitCode}${text ? `\n${text}` : "\n(no output)"}`,
+      );
+    }
+    return sections.join("\n");
   }
 
   private async ensureWarmAgentServer(): Promise<void> {
@@ -412,6 +536,7 @@ export class DockerExecutor {
       `[DockerExecutor] Warm agent server is unhealthy in ${this.warmContainerName}; restarting it...`,
     );
 
+    const { attempts: startupAttempts, sleepSeconds } = this.warmAgentStartupLoop();
     const resolvePythonCmd =
       'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
       'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
@@ -419,19 +544,44 @@ export class DockerExecutor {
     const restartCmd =
       "pkill -f 'openhands.agent_server' >/dev/null 2>&1 || true; " +
       `${resolvePythonCmd}; ` +
+      ": >/tmp/openhands-agent.log; " +
       `"$PY" -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
-      `for i in $(seq 1 120); do ${healthCmd} && break; sleep 0.1; done; ` +
+      `for i in $(seq 1 ${startupAttempts}); do ${healthCmd} && break; sleep ${sleepSeconds}; done; ` +
       healthCmd;
     const restarted = await this.runWarmShell(restartCmd);
     if (restarted.ok) {
       return;
     }
 
-    const logs = await this.runWarmShell("tail -n 120 /tmp/openhands-agent.log 2>/dev/null || true");
+    let recreateError = "";
+    try {
+      console.warn(
+        `[DockerExecutor] Warm agent restart failed in ${this.warmContainerName}; recreating warm container once...`,
+      );
+      await this.startWarmContainer();
+      const postRecreateHealth = await this.runWarmShell(healthCmd);
+      if (postRecreateHealth.ok) {
+        return;
+      }
+      const postRecreateOutput = [postRecreateHealth.stderr, postRecreateHealth.stdout]
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+      recreateError = `post-recreate health check failed (exit ${postRecreateHealth.exitCode})${
+        postRecreateOutput ? `: ${postRecreateOutput}` : "."
+      }`;
+    } catch (error) {
+      recreateError = `recreate warm container failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+    }
+
+    const restartOutput = [restarted.stderr, restarted.stdout].filter(Boolean).join("\n").trim();
+    const diagnostics = await this.collectWarmAgentDiagnostics();
     throw new Error(
-      `Warm OpenHands agent server could not be started: ${
-        restarted.stderr || restarted.stdout || "unknown error"
-      }\n${logs.stdout || logs.stderr}`,
+      `Warm OpenHands agent server could not be started (exit ${restarted.exitCode})${
+        restartOutput ? `: ${restartOutput}` : "."
+      }${recreateError ? `\n${recreateError}` : ""}\n${diagnostics}`,
     );
   }
 
