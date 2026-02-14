@@ -192,7 +192,20 @@ async function executeWithOpenHands(
     executionBudgetMs != null
       ? Math.min(configuredTimeoutMs, executionBudgetMs)
       : configuredTimeoutMs;
-  if (executionBudgetMs != null && timeoutMs !== executionBudgetMs) {
+  const timeoutLimitSource =
+    executionBudgetMs == null
+      ? `workerpals.openhands_timeout_ms=${configuredTimeoutMs}ms`
+      : executionBudgetMs < configuredTimeoutMs
+        ? `planning executionBudgetMs=${executionBudgetMs}ms (worker cap=${configuredTimeoutMs}ms)`
+        : executionBudgetMs > configuredTimeoutMs
+          ? `workerpals.openhands_timeout_ms=${configuredTimeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms)`
+          : `planning executionBudgetMs=${executionBudgetMs}ms (matches worker cap)`;
+  if (executionBudgetMs != null && executionBudgetMs < configuredTimeoutMs) {
+    onLog?.(
+      "stderr",
+      `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, worker cap=${configuredTimeoutMs}ms).`,
+    );
+  } else if (executionBudgetMs != null && executionBudgetMs > configuredTimeoutMs) {
     onLog?.(
       "stderr",
       `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, configured cap=${configuredTimeoutMs}ms).`,
@@ -239,7 +252,7 @@ async function executeWithOpenHands(
       timedOut = true;
       onLog?.(
         "stderr",
-        `[OpenHandsExecutor] Timeout reached for ${kind} after ${timeoutMs}ms; terminating wrapper process.`,
+        `[OpenHandsExecutor] Timeout reached for ${kind} after ${timeoutMs}ms (effective limit: ${timeoutLimitSource}); terminating wrapper process.`,
       );
       try {
         proc.kill();
@@ -284,7 +297,7 @@ async function executeWithOpenHands(
       if (timedOut) {
         return {
           ok: false,
-          summary: `OpenHands wrapper timed out after ${timeoutMs}ms for ${kind}. Worker returned a timeout failure.`,
+          summary: `OpenHands wrapper timed out after ${timeoutMs}ms for ${kind} (effective limit: ${timeoutLimitSource}). Worker returned a timeout failure.`,
           stdout: truncate(filteredStdout),
           stderr: truncate(stderr),
           exitCode: exitCode === 0 ? 124 : exitCode,
