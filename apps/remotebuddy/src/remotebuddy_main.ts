@@ -257,12 +257,26 @@ function explainJobFailureFromLogs(
   if (joined.includes("timeout reached for task.execute") || joined.includes("wrapper timed out")) {
     return "The wrapper hit its execution timeout before OpenHands returned a structured result.";
   }
+  if (
+    joined.includes("tool preflight returned non-json response") ||
+    joined.includes("preflight must return one valid json object in a single response")
+  ) {
+    return "The worker stopped before running tools because strict tool preflight expected exactly one JSON object and the model returned non-JSON output.";
+  }
 
   const lastLine = lines[lines.length - 1] ?? "";
   const fallback = [fallbackMessage, fallbackDetail].filter(Boolean).join(" | ");
   if (lastLine) return `Latest failure signal: ${lastLine}`;
   if (fallback) return `Failure signal: ${fallback}`;
   return "No additional diagnostic signal was found in the current log tail.";
+}
+
+function isStrictPreflightJsonFailure(message: string, detail: string): boolean {
+  const combined = `${message}\n${detail}`.toLowerCase();
+  return (
+    combined.includes("tool preflight returned non-json response") ||
+    combined.includes("preflight must return one valid json object in a single response")
+  );
 }
 
 class RemoteBuddyOrchestrator {
@@ -503,7 +517,9 @@ class RemoteBuddyOrchestrator {
     detail: string,
   ): Promise<void> {
     const shortJob = jobId.slice(0, 8);
-    const fetchMsg = `WorkerPal job ${shortJob} failed: ${message}${detail ? ` (${detail})` : ""} I got an error and I'm fetching logs now to diagnose what happened.`;
+    const fetchMsg = isStrictPreflightJsonFailure(message, detail)
+      ? `WorkerPal job ${shortJob} stopped before tool execution because strict preflight expected one JSON response and got non-JSON output. I'm fetching logs now to diagnose what happened.`
+      : `WorkerPal job ${shortJob} failed: ${message}${detail ? ` (${detail})` : ""} I got an error and I'm fetching logs now to diagnose what happened.`;
     await this.comm.assistantMessage(fetchMsg, {
       correlationId: envelope.correlationId,
       turnId: envelope.turnId,

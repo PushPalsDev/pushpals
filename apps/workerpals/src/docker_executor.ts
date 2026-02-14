@@ -17,6 +17,8 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { isAbsolute, relative, resolve } from "path";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 
+const DEFAULT_OPENHANDS_MODEL = "local-model";
+
 function parseClampedEnvInt(name: string, defaultValue: number, min: number, max: number): number {
   const raw = Number.parseInt(process.env[name] ?? "", 10);
   if (!Number.isFinite(raw) || raw <= 0) return defaultValue;
@@ -95,6 +97,7 @@ export class DockerExecutor {
   private readonly jobRetryMaxAttempts: number;
   private readonly jobRetryBackoffMs: number;
   private readonly failureCooldownMs: number;
+  private lastLoggedExecutionConfig = "";
 
   constructor(options: DockerExecutorOptions) {
     const startupTimeoutMs = parseClampedEnvInt(
@@ -174,7 +177,8 @@ export class DockerExecutor {
       // Step 3: Run Docker container with the worktree mounted
       for (let attempt = 1; attempt <= this.jobRetryMaxAttempts; attempt++) {
         try {
-          const result = await this.runInWarmContainer(worktreePath, base64Spec, onLog);
+          this.logExecutionConfig(job);
+          const result = await this.runInWarmContainer(worktreePath, base64Spec, job, onLog);
           if (result.ok) return result;
 
           const retryableFailure = this.isRetryableJobFailure(result);
@@ -731,6 +735,7 @@ export class DockerExecutor {
   private async runInWarmContainer(
     worktreePath: string,
     base64Spec: string,
+    job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<DockerJobResult> {
     await this.ensureWarmRuntimeReady(onLog);
@@ -749,7 +754,11 @@ export class DockerExecutor {
       base64Spec,
     ];
 
-    console.log(`[DockerExecutor] Running job in warm container: ${this.warmContainerName}`);
+    console.log(
+      `[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary(
+        job,
+      )})`,
+    );
 
     const proc = Bun.spawn(["docker", ...args], {
       stdout: "pipe",
@@ -802,6 +811,33 @@ export class DockerExecutor {
     const result = this.parseResult(stdoutLines, stderrLines, exitCode);
 
     return result;
+  }
+
+  private normalizeProvider(raw: string): string {
+    const value = raw.trim().toLowerCase();
+    if (!value) return "auto";
+    if (value === "lmstudio" || value === "openai_compatible") return "openai";
+    if (value === "ollama_chat") return "ollama";
+    return value;
+  }
+
+  private executionConfigSummary(job?: Job): string {
+    const backend = (process.env.WORKERPALS_EXECUTOR ?? "openhands").trim().toLowerCase() || "openhands";
+    const model = (process.env.WORKERPALS_LLM_MODEL ?? DEFAULT_OPENHANDS_MODEL).trim() || DEFAULT_OPENHANDS_MODEL;
+    const provider = this.normalizeProvider(process.env.WORKERPALS_LLM_BACKEND ?? "auto");
+    const laneRaw =
+      job?.kind === "task.execute" && typeof job.params?.lane === "string" ? job.params.lane : "";
+    const lane = laneRaw.trim().toLowerCase();
+    return lane
+      ? `backend=${backend} model=${model} provider=${provider} lane=${lane}`
+      : `backend=${backend} model=${model} provider=${provider}`;
+  }
+
+  private logExecutionConfig(job: Job): void {
+    const summary = this.executionConfigSummary(job);
+    if (summary === this.lastLoggedExecutionConfig) return;
+    this.lastLoggedExecutionConfig = summary;
+    console.log(`[DockerExecutor] Execution config: ${summary}`);
   }
 
   private async runGitSelfCheckContainer(worktreePath: string): Promise<void> {

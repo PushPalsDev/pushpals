@@ -190,10 +190,15 @@ def _session_field_rejected(detail: str) -> bool:
     return (
         "session_id" in lowered
         or "conversation_id" in lowered
+        or "id_slot" in lowered
         or "unknown field" in lowered
         or "unknown property" in lowered
         or "additional properties" in lowered
     )
+
+
+def _response_format_rejected(detail: str) -> bool:
+    return "response_format" in (detail or "").lower()
 
 
 def _is_timeout_error(exc: Exception) -> bool:
@@ -217,12 +222,23 @@ def _session_hint_headers(session_user: str) -> Dict[str, str]:
     }
 
 
+def _lmstudio_slot_id() -> Optional[int]:
+    raw = (os.environ.get("WORKERPALS_LMSTUDIO_SLOT_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        slot_id = int(raw)
+    except Exception:
+        return None
+    return slot_id if slot_id >= 0 else None
+
+
 def _session_hint_body_variants(
     body: Dict[str, Any], provider: str, session_user: str
 ) -> List[Dict[str, Any]]:
     if provider != "openai" or not session_user:
         return [body]
-    return [
+    variants: List[Dict[str, Any]] = [
         {
             **body,
             "user": session_user,
@@ -237,6 +253,14 @@ def _session_hint_body_variants(
             **body,
         },
     ]
+    slot_id = _lmstudio_slot_id()
+    if slot_id is None:
+        return variants
+    slotted: List[Dict[str, Any]] = []
+    for variant in variants:
+        slotted.append({**variant, "id_slot": slot_id})
+        slotted.append(variant)
+    return slotted
 
 
 def _json_object_from_env(name: str) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -619,6 +643,10 @@ def _tool_preflight_enabled() -> bool:
     return _is_truthy_env("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_ENABLED", True)
 
 
+def _tool_preflight_require_json() -> bool:
+    return _is_truthy_env("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_REQUIRE_JSON", True)
+
+
 def _tool_preflight_timeout_sec() -> float:
     return max(
         5.0,
@@ -632,7 +660,7 @@ def _tool_preflight_timeout_sec() -> float:
 def _tool_preflight_max_tokens() -> int:
     return max(
         32,
-        _to_int(os.environ.get("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MAX_TOKENS"), 96),
+        _to_int(os.environ.get("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MAX_TOKENS"), 220),
     )
 
 
@@ -651,6 +679,7 @@ def _tool_need_preflight(
             "plan": "",
             "first_command": "",
             "error": "",
+            "hard_fail": False,
         }
 
     url = _chat_completion_url(base_url, provider)
@@ -693,7 +722,20 @@ def _tool_need_preflight(
     if api_key and provider == "openai":
         headers["Authorization"] = f"Bearer {api_key}"
     headers.update(_session_hint_headers(session_user))
-    body_variants = _session_hint_body_variants(body, provider, session_user)
+    base_variants = _session_hint_body_variants(body, provider, session_user)
+    body_variants: List[Dict[str, Any]]
+    if provider == "openai":
+        body_variants = []
+        for base in base_variants:
+            body_variants.append(
+                {
+                    **base,
+                    "response_format": {"type": "json_object"},
+                }
+            )
+            body_variants.append(base)
+    else:
+        body_variants = base_variants
 
     try:
         payload: Dict[str, Any] = {}
@@ -721,7 +763,7 @@ def _tool_need_preflight(
                 if (
                     exc.code == 400
                     and idx < len(body_variants) - 1
-                    and _session_field_rejected(detail)
+                    and (_session_field_rejected(detail) or _response_format_rejected(detail))
                 ):
                     continue
                 return {
@@ -730,6 +772,7 @@ def _tool_need_preflight(
                     "plan": "",
                     "first_command": "",
                     "error": last_err,
+                    "hard_fail": False,
                 }
             except Exception as exc:
                 last_err = str(exc)[:200]
@@ -740,6 +783,7 @@ def _tool_need_preflight(
                         "plan": "",
                         "first_command": "",
                         "error": last_err,
+                        "hard_fail": False,
                     }
                 return {
                     "needs_tools": True,
@@ -747,6 +791,7 @@ def _tool_need_preflight(
                     "plan": "",
                     "first_command": "",
                     "error": last_err,
+                    "hard_fail": False,
                 }
         if not payload:
             return {
@@ -755,6 +800,7 @@ def _tool_need_preflight(
                 "plan": "",
                 "first_command": "",
                 "error": last_err or "no payload returned",
+                "hard_fail": False,
             }
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -768,6 +814,7 @@ def _tool_need_preflight(
             "plan": "",
             "first_command": "",
             "error": detail[:200],
+            "hard_fail": False,
         }
     except Exception as exc:
         return {
@@ -776,22 +823,39 @@ def _tool_need_preflight(
             "plan": "",
             "first_command": "",
             "error": str(exc)[:200],
+            "hard_fail": False,
         }
 
     if provider == "ollama":
         raw_text = str((payload.get("message") or {}).get("content") or "")
+        finish_reason = ""
     else:
-        raw_text = str(((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+        choice = (payload.get("choices") or [{}])[0]
+        raw_text = str((choice.get("message") or {}).get("content") or "")
+        finish_reason = str(choice.get("finish_reason") or "")
 
+    require_strict_json = _tool_preflight_require_json()
     try:
-        parsed = _extract_first_json_object(raw_text)
+        if require_strict_json:
+            parsed_raw = json.loads((raw_text or "").strip())
+            if not isinstance(parsed_raw, dict):
+                raise ValueError("response is not a JSON object")
+            parsed = parsed_raw
+        else:
+            parsed = _extract_first_json_object(raw_text)
     except Exception as exc:
+        detail = f"{str(exc)[:160]} | raw={raw_text.strip()[:240]}"
+        if finish_reason:
+            detail += f" | finish_reason={finish_reason}"
+        if (finish_reason or "").lower() == "length":
+            detail += " | model hit max_tokens before valid JSON (increase WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MAX_TOKENS)"
         return {
             "needs_tools": True,
             "why": "tool preflight response parse failed",
             "plan": "",
             "first_command": "",
-            "error": str(exc)[:200],
+            "error": detail,
+            "hard_fail": bool(require_strict_json),
         }
 
     raw_needs_tools = parsed.get("needs_tools", True)
@@ -810,6 +874,7 @@ def _tool_need_preflight(
         "plan": plan[:600],
         "first_command": first_command[:180],
         "error": "",
+        "hard_fail": False,
     }
 
 
@@ -1476,12 +1541,28 @@ def _run_agentic_task_execute(
                     prepared_instruction,
                     stable_session_user,
                 )
+                preflight_err = str(tool_decision.get("error") or "").strip()
                 sys.stderr.write(
                     "[OpenHandsExecutor] Tool preflight: "
                     f"needs_tools={tool_decision.get('needs_tools')} "
-                    f"why={tool_decision.get('why') or '(none)'}\n"
+                    f"hard_fail={bool(tool_decision.get('hard_fail', False))} "
+                    f"why={tool_decision.get('why') or '(none)'}"
+                    + (f" detail={preflight_err[:220]}" if preflight_err else "")
+                    + "\n"
                 )
                 sys.stderr.flush()
+                if bool(tool_decision.get("hard_fail", False)):
+                    detail = str(tool_decision.get("error") or "").strip()
+                    return {
+                        "ok": False,
+                        "summary": "Tool preflight returned non-JSON response",
+                        "stderr": (
+                            "Preflight must return one valid JSON object in a single response.\n"
+                            f"Reason: {tool_decision.get('why') or 'parse failed'}\n"
+                            f"Detail: {detail or '(none)'}"
+                        ),
+                        "exitCode": 2,
+                    }
                 if not bool(tool_decision.get("needs_tools", True)):
                     plan_lines = []
                     why_text = str(tool_decision.get("why") or "").strip()
