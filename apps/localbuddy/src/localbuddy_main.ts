@@ -593,11 +593,18 @@ Respond in strict JSON with this shape:
         return;
       }
       statusSessionReady = true;
-      const statusOk = await comm.status(agentId, "idle", "LocalBuddy online and ready");
-      if (!statusOk) {
+
+      const startupDeadlineMs = Date.now() + 15_000;
+      while (!stopping) {
+        const statusOk = await comm.status(agentId, "idle", "LocalBuddy online and ready");
+        if (statusOk) return;
+
         statusSessionReady = false;
-        console.warn("[LocalBuddy] Failed to emit startup status event");
+        if (Date.now() >= startupDeadlineMs) break;
+        await Bun.sleep(1_000);
+        statusSessionReady = await ensureSessionWithRetry(3, 400, 2_500);
       }
+      console.warn("[LocalBuddy] Failed to emit startup status event");
     };
     void emitStartupPresence();
     const statusHeartbeatMs = parseStatusHeartbeatMs("LOCALBUDDY_STATUS_HEARTBEAT_MS", 120_000);

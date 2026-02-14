@@ -188,9 +188,19 @@ export function createRequestHandler() {
           return makeJson({ ok: false, message: "Session not found" }, 404);
         }
 
-        // Parse cursor from query string
+        // Parse cursor from query string. If the client cursor is ahead of the
+        // server cursor (for example after local storage survives a DB reset),
+        // reset replay to full history so status cards do not get stuck.
         const afterParam = url.searchParams.get("after");
-        const afterEventId = afterParam ? parseInt(afterParam, 10) || 0 : 0;
+        const requestedAfterEventId = afterParam ? parseInt(afterParam, 10) || 0 : 0;
+        const latestCursor = session.getLatestCursor();
+        const afterEventId =
+          requestedAfterEventId > latestCursor ? 0 : Math.max(0, requestedAfterEventId);
+        if (requestedAfterEventId > latestCursor) {
+          console.warn(
+            `[SSE] Session ${sessionId} requested cursor ${requestedAfterEventId} > latest ${latestCursor}; resetting replay to 0`,
+          );
+        }
 
         const encoder = new TextEncoder();
         let unsubscribe: (() => void) | null = null;
@@ -255,10 +265,22 @@ export function createRequestHandler() {
       const wsMatch = pathname.match(/^\/sessions\/([^/]+)\/ws$/);
       if (wsMatch && method === "GET") {
         const sessionId = wsMatch[1];
+        const session = sessionManager.getSession(sessionId);
+        if (!session) {
+          return makeJson({ ok: false, message: "Session not found" }, 404);
+        }
 
-        // Parse cursor from query string
+        // Same cursor reset behavior as SSE path.
         const afterParam = url.searchParams.get("after");
-        const afterEventId = afterParam ? parseInt(afterParam, 10) || 0 : 0;
+        const requestedAfterEventId = afterParam ? parseInt(afterParam, 10) || 0 : 0;
+        const latestCursor = session.getLatestCursor();
+        const afterEventId =
+          requestedAfterEventId > latestCursor ? 0 : Math.max(0, requestedAfterEventId);
+        if (requestedAfterEventId > latestCursor) {
+          console.warn(
+            `[WS] Session ${sessionId} requested cursor ${requestedAfterEventId} > latest ${latestCursor}; resetting replay to 0`,
+          );
+        }
 
         const success = server.upgrade(req, {
           data: { sessionId, afterEventId } as any,

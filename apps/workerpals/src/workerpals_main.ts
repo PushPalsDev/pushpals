@@ -17,7 +17,7 @@ import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import { resolve } from "path";
-import { detectRepoRoot } from "shared";
+import { detectRepoRoot, loadPromptTemplate } from "shared";
 import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
@@ -361,25 +361,25 @@ function inferChangedPaths(params: Record<string, unknown> | undefined): string[
   return deduped;
 }
 
-function buildCompletionPrMetadata(args: {
+function toBulletList(lines: string[]): string {
+  if (lines.length === 0) return "- None";
+  return lines.map((line) => (line.startsWith("- ") ? line : `- ${line}`)).join("\n");
+}
+
+function buildCompletionPrMetadataFallback(args: {
   workerId: string;
   integrationBranch: string;
   job: { id: string; taskId: string; kind: string; params?: Record<string, unknown> };
   commit: CommitRef;
   resultSummary: string;
+  title: string;
+  changedPaths: string[];
+  risk: "low" | "medium";
 }): CompletionPrMetadata {
-  const area = inferPrArea(args.job.kind);
-  const summary = sanitizePrText(args.resultSummary, 84) || `${args.job.kind} update`;
-  const title = `chore(${area}): ${summary}`;
-
-  const changedPaths = inferChangedPaths(args.job.params);
   const changesSection =
-    changedPaths.length > 0
-      ? changedPaths.map((path) => `- Updated \`${sanitizePrText(path, 180)}\``)
+    args.changedPaths.length > 0
+      ? args.changedPaths.map((path) => `- Updated \`${sanitizePrText(path, 180)}\``)
       : [`- Updated worker completion for \`${sanitizePrText(args.job.kind, 80)}\``];
-
-  const risk =
-    args.job.kind.startsWith("task.") || args.job.kind.startsWith("file.") ? "medium" : "low";
 
   const body = [
     "### Summary",
@@ -398,7 +398,7 @@ function buildCompletionPrMetadata(args: {
     "- Not run (not provided)",
     "",
     "### Impact / Risk",
-    `- Risk level: ${risk} (automated worker-generated change; maintainer review required).`,
+    `- Risk level: ${args.risk} (automated worker-generated change; maintainer review required).`,
     "- No secrets or credentials are expected in this PR body.",
     "",
     "### SourceControlManager Note",
@@ -410,8 +410,83 @@ function buildCompletionPrMetadata(args: {
     "- [ ] Docs/comments updated if needed",
     "- [ ] No sensitive data (secrets/tokens) committed",
   ].join("\n");
+  return { title: args.title, body };
+}
 
-  return { title, body };
+function buildCompletionPrMetadata(args: {
+  workerId: string;
+  integrationBranch: string;
+  job: { id: string; taskId: string; kind: string; params?: Record<string, unknown> };
+  commit: CommitRef;
+  resultSummary: string;
+}): CompletionPrMetadata {
+  const area = inferPrArea(args.job.kind);
+  const summary = sanitizePrText(args.resultSummary, 84) || `${args.job.kind} update`;
+  const title = `chore(${area}): ${summary}`;
+  const changedPaths = inferChangedPaths(args.job.params);
+  const risk =
+    args.job.kind.startsWith("task.") || args.job.kind.startsWith("file.") ? "medium" : "low";
+  const changesLines =
+    changedPaths.length > 0
+      ? changedPaths.map((path) => `Updated \`${sanitizePrText(path, 180)}\``)
+      : [`Updated worker completion for \`${sanitizePrText(args.job.kind, 80)}\``];
+  const motivationLines = [
+    "Preserve and review autonomous worker output before final merge to base branch.",
+    "Keep integration branch current with queued worker completions.",
+  ];
+  const testingLines = ["Not run (not provided)"];
+  const impactLines = [
+    `Risk level: ${risk} (automated worker-generated change; maintainer review required).`,
+    "No secrets or credentials are expected in this PR body.",
+  ];
+
+  const replacements: Record<string, string> = {
+    title,
+    area: sanitizePrText(area, 48),
+    summary: sanitizePrText(summary, 120),
+    completion_id: sanitizePrText(args.job.id, 64),
+    task_id: sanitizePrText(args.job.taskId, 64),
+    job_kind: sanitizePrText(args.job.kind, 64),
+    worker_id: sanitizePrText(args.workerId, 64),
+    integration_branch: sanitizePrText(args.integrationBranch, 64),
+    commit_sha: sanitizePrText(args.commit.sha, 64),
+    commit_branch: sanitizePrText(args.commit.branch, 140),
+    result_summary: sanitizePrText(args.resultSummary, 240),
+    motivation_lines: toBulletList(motivationLines),
+    changes_lines: toBulletList(changesLines),
+    testing_lines: toBulletList(testingLines),
+    impact_lines: toBulletList(impactLines),
+    risk_level: risk,
+  };
+
+  const isInstructionalTemplateOutput = (value: string): boolean => {
+    const text = value.trim().toLowerCase();
+    if (!text) return true;
+    if (text.includes("pr description writer")) return true;
+    if (text.includes("absolute prohibitions")) return true;
+    if (text.includes("required structure")) return true;
+    if (text.includes("{{")) return true;
+    return false;
+  };
+
+  try {
+    const body = loadPromptTemplate("workerpals/pr_description.md", replacements).trim();
+    if (!isInstructionalTemplateOutput(body)) {
+      return { title, body };
+    }
+    console.warn(
+      `[WorkerPals] PR description template appears instructional/unrendered; using deterministic fallback metadata.`,
+    );
+  } catch (err) {
+    console.warn(`[WorkerPals] Failed to load PR description template: ${String(err)}`);
+  }
+
+  return buildCompletionPrMetadataFallback({
+    ...args,
+    title,
+    changedPaths,
+    risk,
+  });
 }
 
 async function enqueueCompletion(

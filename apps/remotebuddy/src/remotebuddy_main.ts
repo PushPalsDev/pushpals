@@ -392,13 +392,21 @@ class RemoteBuddyOrchestrator {
       console.warn("[RemoteBuddy] Could not ensure session for startup presence events");
       return;
     }
-    const ok = await this.comm.status(
-      this.agentId,
-      "idle",
-      "RemoteBuddy online and waiting for requests",
-    );
-    if (!ok) {
+    const startupDeadlineMs = Date.now() + 15_000;
+    let startupStatusOk = false;
+    while (!this.disposed) {
+      startupStatusOk = await this.comm.status(
+        this.agentId,
+        "idle",
+        "RemoteBuddy online and waiting for requests",
+      );
+      if (startupStatusOk) break;
       this.statusSessionReady = false;
+      if (Date.now() >= startupDeadlineMs) break;
+      await Bun.sleep(1_000);
+      this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2_500);
+    }
+    if (!startupStatusOk) {
       console.warn("[RemoteBuddy] Failed to emit startup status event");
     }
     const msgOk = await this.comm.assistantMessage("RemoteBuddy online and waiting for requests.");

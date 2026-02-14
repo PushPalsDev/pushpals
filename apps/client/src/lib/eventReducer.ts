@@ -282,6 +282,7 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
       const jobId = p.jobId as string;
       if (!jobId) return { ...state, lastCursor, seenIds };
       const jobs = new Map(state.jobs);
+      const tasks = new Map(state.tasks);
       const existing = jobs.get(jobId);
       if (existing) {
         const artifacts = Array.isArray(p.artifacts)
@@ -299,11 +300,30 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
           summary: (p.summary as string) ?? undefined,
           artifacts,
         });
+
+        // Promote the parent task to completed when all known sibling jobs are terminal
+        // and none failed. This keeps task cards in sync even if no explicit
+        // task_completed event is emitted.
+        const task = tasks.get(existing.taskId);
+        if (task && task.status !== "failed") {
+          const siblingJobs = Array.from(jobs.values()).filter((job) => job.taskId === existing.taskId);
+          const hasActiveSibling = siblingJobs.some(
+            (job) => job.status === "enqueued" || job.status === "claimed",
+          );
+          const hasFailedSibling = siblingJobs.some((job) => job.status === "failed");
+          if (!hasActiveSibling && !hasFailedSibling) {
+            tasks.set(existing.taskId, {
+              ...task,
+              status: "completed",
+              summary: task.summary ?? ((p.summary as string) || undefined),
+            });
+          }
+        }
       }
       // Terminal status — free dedup memory (no more logs expected)
       const logSeenKeys = new Map(state.logSeenKeys);
       logSeenKeys.delete(jobId);
-      return { ...state, jobs, logSeenKeys, lastCursor, seenIds };
+      return { ...state, jobs, tasks, logSeenKeys, lastCursor, seenIds };
     }
 
     case "job_failed": {
