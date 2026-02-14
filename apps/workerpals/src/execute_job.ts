@@ -213,6 +213,13 @@ async function executeWithOpenHands(
   }
   const { leadMs: timeoutWarningLeadMs, delayMs: timeoutWarningDelayMs } =
     computeTimeoutWarningWindow(timeoutMs);
+  const finalizationBudgetMs =
+    typeof budgets?.finalizationBudgetMs === "number" && Number.isFinite(budgets.finalizationBudgetMs)
+      ? Math.max(10_000, Math.floor(budgets.finalizationBudgetMs))
+      : 0;
+  // Allow one bounded extension when the agent is still actively emitting output.
+  const activityExtensionMs = Math.min(finalizationBudgetMs, 10 * 60_000);
+  const activityWindowMs = 90_000;
   const payload = Buffer.from(
     JSON.stringify({
       kind,
@@ -220,11 +227,7 @@ async function executeWithOpenHands(
       repo,
       timeoutMs,
       executionBudgetMs: executionBudgetMs ?? undefined,
-      finalizationBudgetMs:
-        typeof budgets?.finalizationBudgetMs === "number" &&
-        Number.isFinite(budgets.finalizationBudgetMs)
-          ? Math.max(10_000, Math.floor(budgets.finalizationBudgetMs))
-          : undefined,
+      finalizationBudgetMs: finalizationBudgetMs > 0 ? finalizationBudgetMs : undefined,
     }),
     "utf-8",
   ).toString("base64");
@@ -240,28 +243,77 @@ async function executeWithOpenHands(
     });
 
     let timedOut = false;
-    warningTimer = setTimeout(() => {
-      onLog?.(
-        "stderr",
-        `[OpenHandsExecutor] Timeout approaching for ${kind} (${Math.round(
-          timeoutWarningLeadMs / 1000,
-        )}s remaining). If unfinished, return a concise status/failure update now.`,
-      );
-    }, timeoutWarningDelayMs);
-    timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      onLog?.(
-        "stderr",
-        `[OpenHandsExecutor] Timeout reached for ${kind} after ${timeoutMs}ms (effective limit: ${timeoutLimitSource}); terminating wrapper process.`,
-      );
-      try {
-        proc.kill();
-      } catch (_e) {}
-    }, timeoutMs);
+    const startedAtMs = Date.now();
+    let lastActivityAtMs = startedAtMs;
+    let timeoutDeadlineMs = startedAtMs + timeoutMs;
+    let extendedByActivityMs = 0;
+    let timedOutAfterMs = timeoutMs;
+
+    const onProcessLine = (stream: "stdout" | "stderr", line: string) => {
+      lastActivityAtMs = Date.now();
+      onLog?.(stream, line);
+    };
+
+    const resetWarningTimer = () => {
+      if (warningTimer) {
+        clearTimeout(warningTimer);
+        warningTimer = null;
+      }
+      const msUntilWarn = timeoutDeadlineMs - Date.now() - timeoutWarningLeadMs;
+      if (msUntilWarn <= 0) return;
+      warningTimer = setTimeout(() => {
+        onLog?.(
+          "stderr",
+          `[OpenHandsExecutor] Timeout approaching for ${kind} (${Math.round(
+            timeoutWarningLeadMs / 1000,
+          )}s remaining). If unfinished, return a concise status/failure update now.`,
+        );
+      }, msUntilWarn);
+    };
+
+    const resetTimeoutTimer = () => {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+      const msUntilTimeout = Math.max(1, timeoutDeadlineMs - Date.now());
+      timeoutTimer = setTimeout(() => {
+        const nowMs = Date.now();
+        const quietForMs = nowMs - lastActivityAtMs;
+        if (extendedByActivityMs === 0 && activityExtensionMs > 0 && quietForMs <= activityWindowMs) {
+          extendedByActivityMs = activityExtensionMs;
+          timeoutDeadlineMs = nowMs + activityExtensionMs;
+          onLog?.(
+            "stderr",
+            `[OpenHandsExecutor] Extending timeout by ${activityExtensionMs}ms because the agent is still active (last output ${Math.round(
+              quietForMs / 1000,
+            )}s ago).`,
+          );
+          resetWarningTimer();
+          resetTimeoutTimer();
+          return;
+        }
+
+        timedOut = true;
+        timedOutAfterMs = Math.max(1, nowMs - startedAtMs);
+        onLog?.(
+          "stderr",
+          `[OpenHandsExecutor] Timeout reached for ${kind} after ${timedOutAfterMs}ms (effective limit: ${timeoutLimitSource}${
+            extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
+          }); terminating wrapper process.`,
+        );
+        try {
+          proc.kill();
+        } catch (_e) {}
+      }, msUntilTimeout);
+    };
+
+    resetWarningTimer();
+    resetTimeoutTimer();
 
     const [stdout, stderr] = await Promise.all([
-      onLog ? streamLines(proc.stdout, "stdout", onLog) : new Response(proc.stdout).text(),
-      onLog ? streamLines(proc.stderr, "stderr", onLog) : new Response(proc.stderr).text(),
+      streamLines(proc.stdout, "stdout", onProcessLine),
+      streamLines(proc.stderr, "stderr", onProcessLine),
     ]);
     if (warningTimer) {
       clearTimeout(warningTimer);
@@ -297,7 +349,9 @@ async function executeWithOpenHands(
       if (timedOut) {
         return {
           ok: false,
-          summary: `OpenHands wrapper timed out after ${timeoutMs}ms for ${kind} (effective limit: ${timeoutLimitSource}). Worker returned a timeout failure.`,
+          summary: `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind} (effective limit: ${timeoutLimitSource}${
+            extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
+          }). Worker returned a timeout failure.`,
           stdout: truncate(filteredStdout),
           stderr: truncate(stderr),
           exitCode: exitCode === 0 ? 124 : exitCode,
