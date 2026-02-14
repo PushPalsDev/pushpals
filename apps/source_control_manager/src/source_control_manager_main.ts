@@ -292,6 +292,22 @@ async function emitStartupStatus(): Promise<void> {
   }
 }
 
+async function emitInitializingStatus(): Promise<void> {
+  const sessionReady = await ensureSessionWithRetry(statusSessionId, 3, 300, 1200);
+  if (!sessionReady) return;
+  statusSessionReady = true;
+  const comm = createSessionComm(statusSessionId);
+  const ok = await comm.status(
+    "source_control_manager",
+    "idle",
+    "SourceControlManager initializing startup checks",
+  );
+  if (!ok) {
+    statusSessionReady = false;
+    console.warn(`[${ts()}] Failed to emit source_control_manager initializing status event`);
+  }
+}
+
 function startStatusHeartbeat(): void {
   if (statusHeartbeatMs <= 0 || statusHeartbeatTimer) return;
   const comm = createSessionComm(statusSessionId);
@@ -811,6 +827,9 @@ async function ensureIntegrationBranchExists(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Emit liveness early so UI doesn't stay "initializing" while startup checks run.
+  void emitInitializingStatus();
+
   await ensureDefaultSourceControlManagerWorktree();
   ensureRepoPathIsIsolatedWorktree();
   // ── Startup safety check ──────────────────────────────────────────────

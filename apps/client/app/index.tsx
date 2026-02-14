@@ -164,6 +164,25 @@ function clip(value: string | undefined | null, limit = 180): string {
   return `${value.slice(0, Math.max(0, limit - 1))}...`;
 }
 
+function localBuddyMessageAlreadyRoutedRemote(text: string | undefined): boolean {
+  const normalized = String(text ?? "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return false;
+  if (normalized.includes("/ask_remote_buddy")) return true;
+  if (!normalized.includes("remotebuddy")) return false;
+
+  return (
+    normalized.includes("queueing this to remotebuddy") ||
+    normalized.includes("routing this to remotebuddy") ||
+    normalized.includes("request queued") ||
+    normalized.includes("is planning and will assign a workerpal") ||
+    normalized.includes("delegating this to a workerpal") ||
+    normalized.includes("assigned this request to workerpal") ||
+    normalized.includes("no idle workerpal")
+  );
+}
+
 function parseJsonText(value: string | null): string {
   if (!value) return "";
   try {
@@ -563,6 +582,10 @@ function ChatPane({
                   .reverse()
                   .find((entry) => (entry.from ?? "").toLowerCase().includes("client"))
               : null;
+            const showEscalateButton =
+              isLocalBuddy &&
+              Boolean(priorUserMessage?.text) &&
+              !localBuddyMessageAlreadyRoutedRemote(message.text);
             return (
               <View
                 key={message.id}
@@ -592,7 +615,7 @@ function ChatPane({
                 >
                   {prettyTs(message.ts)}
                 </Text>
-                {isLocalBuddy && priorUserMessage?.text ? (
+                {showEscalateButton ? (
                   <Pressable
                     onPress={() => onEscalate(priorUserMessage.text)}
                     style={[styles.escalateButton, { borderColor: theme.accent }]}
