@@ -368,6 +368,18 @@ export class DockerExecutor {
   /**
    * Run the Docker container and parse output
    */
+  private containerOpenHandsPython(): string {
+    const configured = CONFIG.workerpals.openhandsPython.trim();
+    if (!configured) {
+      return "/opt/openhands-venv/bin/python";
+    }
+    const lowered = configured.toLowerCase();
+    if (lowered === "python" || lowered === "python3") {
+      return "/opt/openhands-venv/bin/python";
+    }
+    return configured;
+  }
+
   private collectContainerEnv(): string[] {
     const containerLlmEndpoint = this.workerLlmEndpointForContainer();
     const fixedEnv: Record<string, string> = {
@@ -377,7 +389,7 @@ export class DockerExecutor {
       WORKERPALS_LLM_BACKEND: CONFIG.workerpals.llm.backend,
       WORKERPALS_LLM_SESSION_ID: CONFIG.workerpals.llm.sessionId,
       WORKERPALS_OPENHANDS_TIMEOUT_MS: String(CONFIG.workerpals.openhandsTimeoutMs),
-      WORKERPALS_OPENHANDS_PYTHON: CONFIG.workerpals.openhandsPython,
+      WORKERPALS_OPENHANDS_PYTHON: this.containerOpenHandsPython(),
     };
     if (CONFIG.workerpals.llm.apiKey.trim()) {
       fixedEnv.WORKERPALS_LLM_API_KEY = CONFIG.workerpals.llm.apiKey;
@@ -733,8 +745,13 @@ export class DockerExecutor {
     const model = CONFIG.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
     const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
     const endpoint = CONFIG.workerpals.llm.endpoint.trim() || "(unset)";
+    const configuredPython = CONFIG.workerpals.openhandsPython.trim() || "(unset)";
+    const containerPython = this.containerOpenHandsPython();
     const containerEndpoint = this.workerLlmEndpointForContainer();
     sections.push(`[llm-config] model=${model} provider=${provider} endpoint=${endpoint}`);
+    sections.push(
+      `[python-config] configured=${configuredPython} resolved_container_python=${containerPython}`,
+    );
     if (endpoint && containerEndpoint && endpoint !== containerEndpoint) {
       sections.push(`[llm-endpoint-rewrite] ${endpoint} -> ${containerEndpoint}`);
     }
@@ -969,12 +986,13 @@ export class DockerExecutor {
     const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
     const warmMemoryMb = CONFIG.workerpals.dockerWarmMemoryMb;
     const warmCpus = CONFIG.workerpals.dockerWarmCpus;
+    const warmPython = this.containerOpenHandsPython();
     const laneRaw =
       job?.kind === "task.execute" && typeof job.params?.lane === "string" ? job.params.lane : "";
     const lane = laneRaw.trim().toLowerCase();
     return lane
-      ? `backend=${backend} model=${model} provider=${provider} lane=${lane} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus}`
-      : `backend=${backend} model=${model} provider=${provider} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus}`;
+      ? `backend=${backend} model=${model} provider=${provider} lane=${lane} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus} warm_python=${warmPython}`
+      : `backend=${backend} model=${model} provider=${provider} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus} warm_python=${warmPython}`;
   }
 
   private logExecutionConfig(job: Job): void {
