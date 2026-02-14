@@ -30,6 +30,8 @@ IGNORE_DIRS = {
     "build",
 }
 
+DEFAULT_TASK_SUMMARY_FILENAME = "task_summary.md"
+
 
 def _decode_payload(raw: str) -> Dict[str, Any]:
     decoded = base64.b64decode(raw).decode("utf-8")
@@ -61,6 +63,20 @@ def _resolve_in_repo(repo_root: Path, raw_path: str) -> Path:
     if repo_root not in path.parents and path != repo_root:
         raise SystemExit(f"Refusing to access outside repo: {path}")
     return path
+
+
+def _resolve_task_summary_target(repo_root: Path, raw_target_path: str) -> Path:
+    target = _resolve_in_repo(repo_root, raw_target_path)
+    raw_trimmed = str(raw_target_path or "").strip()
+    # If the provided path is (or looks like) a directory, write into a stable default file.
+    looks_like_dir = raw_trimmed.endswith("/") or raw_trimmed.endswith("\\")
+    if target.exists() and target.is_dir():
+        return target / DEFAULT_TASK_SUMMARY_FILENAME
+    if looks_like_dir:
+        return target / DEFAULT_TASK_SUMMARY_FILENAME
+    if target.suffix == "":
+        return target / DEFAULT_TASK_SUMMARY_FILENAME
+    return target
 
 
 def _tree(base: Path, depth: int, prefix: str = "") -> List[str]:
@@ -172,7 +188,7 @@ def _op_task_summary(payload: Dict[str, Any]) -> None:
     )
 
     if target_path:
-        target = _resolve_in_repo(repo_root, target_path)
+        target = _resolve_task_summary_target(repo_root, target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         display = target.relative_to(repo_root) if target != repo_root else Path(".")
