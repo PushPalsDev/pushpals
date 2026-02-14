@@ -862,8 +862,32 @@ def _tool_need_preflight(
     base_variants = _session_hint_body_variants(body, provider, session_user)
     body_variants: List[Dict[str, Any]]
     if provider == "openai":
+        preflight_schema = {
+            "name": "workerpals_tool_preflight",
+            "strict": False,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "needs_tools": {"type": "boolean"},
+                    "why": {"type": "string"},
+                    "plan": {"type": "string"},
+                    "first_command": {"type": "string"},
+                },
+                "required": ["needs_tools", "why", "plan", "first_command"],
+                "additionalProperties": False,
+            },
+        }
         body_variants = []
         for base in base_variants:
+            body_variants.append(
+                {
+                    **base,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": preflight_schema,
+                    },
+                }
+            )
             body_variants.append(
                 {
                     **base,
