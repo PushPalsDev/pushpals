@@ -185,6 +185,49 @@ def _stable_llm_session_user(payload: Optional[Dict[str, Any]]) -> str:
     return f"pushpals-{session_id}-{worker_id}-{task_id}"
 
 
+def _session_field_rejected(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return (
+        "session_id" in lowered
+        or "conversation_id" in lowered
+        or "unknown field" in lowered
+        or "unknown property" in lowered
+        or "additional properties" in lowered
+    )
+
+
+def _session_hint_headers(session_user: str) -> Dict[str, str]:
+    if not session_user:
+        return {}
+    return {
+        "X-PushPals-Session-Id": session_user,
+        "X-Session-Id": session_user,
+        "X-Conversation-Id": session_user,
+    }
+
+
+def _session_hint_body_variants(
+    body: Dict[str, Any], provider: str, session_user: str
+) -> List[Dict[str, Any]]:
+    if provider != "openai" or not session_user:
+        return [body]
+    return [
+        {
+            **body,
+            "user": session_user,
+            "session_id": session_user,
+            "conversation_id": session_user,
+        },
+        {
+            **body,
+            "user": session_user,
+        },
+        {
+            **body,
+        },
+    ]
+
+
 def _json_object_from_env(name: str) -> Tuple[Optional[Dict[str, Any]], str]:
     raw = (os.environ.get(name) or "").strip()
     if not raw:
@@ -490,40 +533,54 @@ def _llm_model_chat_preflight(
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if api_key and provider == "openai":
         headers["Authorization"] = f"Bearer {api_key}"
-    if session_user:
-        headers["X-PushPals-Session-Id"] = session_user
+    headers.update(_session_hint_headers(session_user))
 
+    body_variants = _session_hint_body_variants(body, provider, session_user)
+    last_detail = f"{url}: preflight request failed"
     try:
-        if provider == "openai" and session_user:
-            body["user"] = session_user
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            status = int(getattr(res, "status", 0))
-            if 200 <= status < 300:
-                return True, f"{url} -> {status}"
-            return False, f"{url} -> HTTP {status}"
-    except urllib.error.HTTPError as exc:
-        try:
-            body_text = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            body_text = ""
-        detail = f"{url} -> HTTP {exc.code}{f' ({body_text[:180].strip()})' if body_text else ''}"
-        if _is_model_load_failure(body_text):
-            return False, detail
-        lowered = body_text.lower()
-        if "model" in lowered and "not found" in lowered:
-            return False, detail
-        if exc.code in {401, 403}:
-            # Endpoint/model path is reachable; auth policy is separate.
-            return True, detail
-        return False, detail
+        for idx, request_body in enumerate(body_variants):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(request_body).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as res:
+                    status = int(getattr(res, "status", 0))
+                    if 200 <= status < 300:
+                        return True, f"{url} -> {status}"
+                    last_detail = f"{url} -> HTTP {status}"
+            except urllib.error.HTTPError as exc:
+                try:
+                    body_text = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body_text = ""
+                detail = f"{url} -> HTTP {exc.code}{f' ({body_text[:180].strip()})' if body_text else ''}"
+                last_detail = detail
+                if (
+                    exc.code == 400
+                    and idx < len(body_variants) - 1
+                    and _session_field_rejected(body_text)
+                ):
+                    continue
+                if _is_model_load_failure(body_text):
+                    return False, detail
+                lowered = body_text.lower()
+                if "model" in lowered and "not found" in lowered:
+                    return False, detail
+                if exc.code in {401, 403}:
+                    # Endpoint/model path is reachable, even when auth is blocked.
+                    return True, detail
+                return False, detail
+            except Exception as exc:
+                last_detail = f"{url}: {exc}"
+                if idx < len(body_variants) - 1:
+                    continue
+                return False, last_detail
     except Exception as exc:
         return False, f"{url}: {exc}"
+    return False, last_detail
 
 
 def _extract_first_json_object(raw: str) -> Dict[str, Any]:
@@ -602,25 +659,67 @@ def _tool_need_preflight(
             "temperature": 0.0,
             "max_tokens": 220,
         }
-        if session_user:
-            body["user"] = session_user
-
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if api_key and provider == "openai":
         headers["Authorization"] = f"Bearer {api_key}"
-    if session_user:
-        headers["X-PushPals-Session-Id"] = session_user
+    headers.update(_session_hint_headers(session_user))
+    body_variants = _session_hint_body_variants(body, provider, session_user)
 
     try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15.0) as res:
-            raw = res.read().decode("utf-8", errors="replace")
-            payload = json.loads(raw)
+        payload: Dict[str, Any] = {}
+        last_err = ""
+        for idx, request_body in enumerate(body_variants):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(request_body).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15.0) as res:
+                    raw = res.read().decode("utf-8", errors="replace")
+                    payload = json.loads(raw)
+                    last_err = ""
+                    break
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    detail = ""
+                last_err = detail[:200]
+                if (
+                    exc.code == 400
+                    and idx < len(body_variants) - 1
+                    and _session_field_rejected(detail)
+                ):
+                    continue
+                return {
+                    "needs_tools": True,
+                    "why": f"tool preflight HTTP {exc.code}",
+                    "plan": "",
+                    "first_command": "",
+                    "error": last_err,
+                }
+            except Exception as exc:
+                last_err = str(exc)[:200]
+                if idx < len(body_variants) - 1:
+                    continue
+                return {
+                    "needs_tools": True,
+                    "why": "tool preflight request failed",
+                    "plan": "",
+                    "first_command": "",
+                    "error": last_err,
+                }
+        if not payload:
+            return {
+                "needs_tools": True,
+                "why": "tool preflight request failed",
+                "plan": "",
+                "first_command": "",
+                "error": last_err or "no payload returned",
+            }
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -1180,7 +1279,12 @@ def _run_agentic_task_execute(
     if base_url:
         llm_kwargs_base["base_url"] = base_url
     if stable_session_user:
-        llm_kwargs_base["litellm_extra_body"] = {"user": stable_session_user}
+        llm_kwargs_base["litellm_extra_body"] = {
+            "user": stable_session_user,
+            "session_id": stable_session_user,
+            "conversation_id": stable_session_user,
+        }
+        llm_kwargs_base["extra_headers"] = _session_hint_headers(stable_session_user)
     if _looks_local_base_url(base_url):
         # Local model servers should fail fast on connectivity issues instead
         # of spending long retry windows that hit outer Docker timeouts.

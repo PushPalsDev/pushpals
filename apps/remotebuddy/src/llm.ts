@@ -507,18 +507,37 @@ export class LmStudioClient implements LLMClient {
     },
   ): Promise<LLMGenerateOutput> {
     const model = await this.resolveModelForRequest();
-    const baseBody: Record<string, unknown> = {
+    const coreBody: Record<string, unknown> = {
       model,
       messages,
       max_tokens: opts.maxTokens,
       temperature: opts.temperature,
-      user: this.sessionTag,
     };
 
+    const sessionAwareBodyBases: Array<Record<string, unknown>> = this.sessionTag
+      ? [
+          {
+            ...coreBody,
+            user: this.sessionTag,
+            session_id: this.sessionTag,
+            conversation_id: this.sessionTag,
+          },
+          {
+            ...coreBody,
+            user: this.sessionTag,
+          },
+          {
+            ...coreBody,
+          },
+        ]
+      : [coreBody];
+
     const bodyVariants: Array<Record<string, unknown>> = [];
-    if (!opts.json) {
-      bodyVariants.push(baseBody);
-    } else {
+    for (const baseBody of sessionAwareBodyBases) {
+      if (!opts.json) {
+        bodyVariants.push(baseBody);
+        continue;
+      }
       if (opts.jsonSchema) {
         bodyVariants.push({
           ...baseBody,
@@ -541,14 +560,21 @@ export class LmStudioClient implements LLMClient {
 
     let lastStatus = 0;
     let lastError = "unknown error";
+    let loggedSessionFallback = false;
+    let loggedResponseFormatFallback = false;
     for (let i = 0; i < bodyVariants.length; i++) {
       const body = bodyVariants[i];
+      const headers: Record<string, string> = {
+        ...lmStudioHeaders(this.apiKey),
+      };
+      if (this.sessionTag) {
+        headers["X-PushPals-Session-Id"] = this.sessionTag;
+        headers["X-Session-Id"] = this.sessionTag;
+        headers["X-Conversation-Id"] = this.sessionTag;
+      }
       const res = await fetch(this.endpoint, {
         method: "POST",
-        headers: {
-          ...lmStudioHeaders(this.apiKey),
-          "X-PushPals-Session-Id": this.sessionTag,
-        },
+        headers,
         body: JSON.stringify(body),
       });
 
@@ -557,9 +583,25 @@ export class LmStudioClient implements LLMClient {
         lastError = await res.text();
         const hasFallback = i < bodyVariants.length - 1;
         if (hasFallback && res.status === 400) {
-          console.warn(
-            `[LLM] LM Studio rejected response_format payload, retrying with fallback (${lastStatus}).`,
-          );
+          const lowered = lastError.toLowerCase();
+          const sessionFieldRejected =
+            lowered.includes("session_id") ||
+            lowered.includes("conversation_id") ||
+            lowered.includes("unknown field") ||
+            lowered.includes("unknown property") ||
+            lowered.includes("additional properties");
+          const responseFormatRejected = lowered.includes("response_format");
+          if (sessionFieldRejected && !loggedSessionFallback) {
+            loggedSessionFallback = true;
+            console.warn(
+              `[LLM] LM Studio rejected session hint fields, retrying compatibility payload (${lastStatus}).`,
+            );
+          } else if (responseFormatRejected && !loggedResponseFormatFallback) {
+            loggedResponseFormatFallback = true;
+            console.warn(
+              `[LLM] LM Studio rejected response_format payload, retrying with fallback (${lastStatus}).`,
+            );
+          }
           continue;
         }
         throw new Error(`LM Studio API error ${res.status}: ${lastError}`);
