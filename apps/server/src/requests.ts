@@ -162,7 +162,10 @@ export class RequestQueue {
     };
 
     ensureColumn("prompt", `ALTER TABLE requests ADD COLUMN prompt TEXT NOT NULL DEFAULT '';`);
-    ensureColumn("priority", `ALTER TABLE requests ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
+    ensureColumn(
+      "priority",
+      `ALTER TABLE requests ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`,
+    );
     ensureColumn(
       "queueWaitBudgetMs",
       `ALTER TABLE requests ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`,
@@ -174,7 +177,9 @@ export class RequestQueue {
     ensureColumn("durationMs", `ALTER TABLE requests ADD COLUMN durationMs INTEGER;`);
 
     // Column-dependent index is created after legacy column backfills complete.
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_requests_priority_created ON requests(status, priority, createdAt);`);
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_requests_priority_created ON requests(status, priority, createdAt);`,
+    );
 
     this.db.exec(`
       UPDATE requests
@@ -259,7 +264,12 @@ export class RequestQueue {
     const queuePosition = this.queuePosition(requestId);
     const etaMs = this.estimateEtaMs(priority, queuePosition);
 
-    return { ok: true, requestId, queuePosition: queuePosition ?? undefined, etaMs: etaMs ?? undefined };
+    return {
+      ok: true,
+      requestId,
+      queuePosition: queuePosition ?? undefined,
+      etaMs: etaMs ?? undefined,
+    };
   }
 
   /**
@@ -311,9 +321,7 @@ export class RequestQueue {
 
       const queueWaitMs = Math.max(
         0,
-        Math.floor(
-          (Date.parse(now) - Date.parse(row.enqueuedAt || row.createdAt || now)) || 0,
-        ),
+        Math.floor(Date.parse(now) - Date.parse(row.enqueuedAt || row.createdAt || now) || 0),
       );
 
       return {
@@ -417,10 +425,7 @@ export class RequestQueue {
       .all() as RequestRow[];
   }
 
-  listRequests(options?: {
-    status?: RequestStatus | "all";
-    limit?: number;
-  }): RequestRow[] {
+  listRequests(options?: { status?: RequestStatus | "all"; limit?: number }): RequestRow[] {
     const status = options?.status ?? "all";
     const limit =
       typeof options?.limit === "number" && Number.isFinite(options.limit)
@@ -488,12 +493,14 @@ export class RequestQueue {
     return counts;
   }
 
-  nextPendingSnapshot(limit = 10): Array<{ id: string; priority: QueuePriority; position: number; etaMs: number }> {
+  nextPendingSnapshot(
+    limit = 10,
+  ): Array<{ id: string; priority: QueuePriority; position: number; etaMs: number }> {
     const ordered = this.pendingOrderedIds().slice(0, Math.max(1, Math.min(limit, 50)));
     return ordered.map((id, idx) => {
-      const row = this.db
-        .prepare(`SELECT priority FROM requests WHERE id = ?`)
-        .get(id) as { priority: string } | undefined;
+      const row = this.db.prepare(`SELECT priority FROM requests WHERE id = ?`).get(id) as
+        | { priority: string }
+        | undefined;
       const priority = normalizePriority(row?.priority);
       return {
         id,
@@ -506,7 +513,9 @@ export class RequestQueue {
 
   sloSummary(windowHours = 24): RequestSloSummary {
     const boundedWindowHours =
-      Number.isFinite(windowHours) && windowHours > 0 ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours))) : 24;
+      Number.isFinite(windowHours) && windowHours > 0
+        ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours)))
+        : 24;
     const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
     const rows = this.db
       .prepare(
@@ -532,17 +541,15 @@ export class RequestQueue {
     for (const row of rows) {
       if (row.status === "completed") completed += 1;
       if (row.status === "failed") failed += 1;
-      if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) {
+      if (
+        typeof row.durationMs === "number" &&
+        Number.isFinite(row.durationMs) &&
+        row.durationMs >= 0
+      ) {
         durationSamples.push(Math.round(row.durationMs));
       }
-      const queueStart =
-        parseIsoMs(row.enqueuedAt) ??
-        parseIsoMs(row.createdAt) ??
-        null;
-      const queueEnd =
-        parseIsoMs(row.claimedAt) ??
-        parseIsoMs(row.updatedAt) ??
-        null;
+      const queueStart = parseIsoMs(row.enqueuedAt) ?? parseIsoMs(row.createdAt) ?? null;
+      const queueEnd = parseIsoMs(row.claimedAt) ?? parseIsoMs(row.updatedAt) ?? null;
       if (queueStart != null && queueEnd != null && queueEnd >= queueStart) {
         queueWaitSamples.push(queueEnd - queueStart);
       }

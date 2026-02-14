@@ -4,10 +4,7 @@ import { PROTOCOL_VERSION, validateEventEnvelope } from "protocol/browser";
 type TransportType = "auto" | "sse" | "ws";
 
 /** Extended callback that also receives the server cursor for each event */
-export type CursorEventCallback = (
-  event: EventEnvelope,
-  cursor: number,
-) => void;
+export type CursorEventCallback = (event: EventEnvelope, cursor: number) => void;
 
 function randomEventId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {

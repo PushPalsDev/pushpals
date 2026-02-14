@@ -39,8 +39,7 @@ const BASE_REMOTE_PLANNER_SYSTEM_PROMPT = loadPromptTemplate(
   "localbuddy/localbuddy_system_prompt.md",
 );
 const POST_SYSTEM_PROMPT = loadPromptTemplate("shared/post_system_prompt.md");
-const REMOTE_PLANNER_SYSTEM_PROMPT =
-  `${BASE_REMOTE_PLANNER_SYSTEM_PROMPT}
+const REMOTE_PLANNER_SYSTEM_PROMPT = `${BASE_REMOTE_PLANNER_SYSTEM_PROMPT}
 
 ${POST_SYSTEM_PROMPT}
 
@@ -344,32 +343,19 @@ export class RemotePlanner implements PlannerModel {
       model?: string;
     } = {},
   ) {
-    const backend = (
-      process.env.LOCALBUDDY_LLM_BACKEND ??
-      ""
-    )
-      .trim()
-      .toLowerCase();
+    const backend = (process.env.LOCALBUDDY_LLM_BACKEND ?? "").trim().toLowerCase();
     const defaultEndpoint =
       backend === "ollama"
         ? "http://127.0.0.1:11434/api/chat"
         : "http://127.0.0.1:1234/v1/chat/completions";
     const configuredEndpoint =
-      opts.endpoint ??
-      process.env.LOCALBUDDY_LLM_ENDPOINT ??
-      defaultEndpoint;
+      opts.endpoint ?? process.env.LOCALBUDDY_LLM_ENDPOINT ?? defaultEndpoint;
     this.endpoint =
       backend === "ollama" && !configuredEndpoint.includes("/api/chat")
         ? `${configuredEndpoint.replace(/\/+$/, "")}/api/chat`
         : configuredEndpoint;
-    this.apiKey =
-      opts.apiKey ??
-      process.env.LOCALBUDDY_LLM_API_KEY ??
-      null;
-    this.model =
-      opts.model ??
-      process.env.LOCALBUDDY_LLM_MODEL ??
-      "local-model";
+    this.apiKey = opts.apiKey ?? process.env.LOCALBUDDY_LLM_API_KEY ?? null;
+    this.model = opts.model ?? process.env.LOCALBUDDY_LLM_MODEL ?? "local-model";
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {

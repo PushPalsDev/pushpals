@@ -482,7 +482,7 @@ export function createRequestHandler() {
         const limit = parseLimit(url.searchParams.get("limit"), 50);
         const afterId = parseCursor(url.searchParams.get("afterId"));
         const logs = jobQueue.listJobLogs(jobId, limit, afterId ?? undefined);
-        const nextCursor = logs.length > 0 ? logs[logs.length - 1]?.id ?? null : afterId;
+        const nextCursor = logs.length > 0 ? (logs[logs.length - 1]?.id ?? null) : afterId;
         return makeJson({ ok: true, jobId, logs, cursor: nextCursor });
       }
 

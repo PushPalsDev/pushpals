@@ -793,10 +793,7 @@ type TaskExecuteIntent = "chat" | "status" | "code_change" | "analysis" | "other
 type TaskExecuteRisk = "low" | "medium" | "high";
 
 function isStringArray(value: unknown): value is string[] {
-  return (
-    Array.isArray(value) &&
-    value.every((entry) => typeof entry === "string")
-  );
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
 function validateTaskExecutePlanning(
@@ -814,13 +811,7 @@ function validateTaskExecutePlanning(
   const executionBudgetMs = Number(planning.executionBudgetMs);
   const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
 
-  const validIntents: TaskExecuteIntent[] = [
-    "chat",
-    "status",
-    "code_change",
-    "analysis",
-    "other",
-  ];
+  const validIntents: TaskExecuteIntent[] = ["chat", "status", "code_change", "analysis", "other"];
   const validRisks: TaskExecuteRisk[] = ["low", "medium", "high"];
   const validPriorities: TaskExecutePriority[] = ["interactive", "normal", "background"];
 
@@ -898,8 +889,7 @@ export async function executeJob(
   if (lane !== "openhands" && lane !== "deterministic") {
     return {
       ok: false,
-      summary:
-        "task.execute requires params.lane to be either 'openhands' or 'deterministic'.",
+      summary: "task.execute requires params.lane to be either 'openhands' or 'deterministic'.",
     };
   }
 

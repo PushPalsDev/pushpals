@@ -79,7 +79,9 @@ async function runReadOnlyCommand(
 }
 
 export function isGitStatusPrompt(input: string): boolean {
-  const text = String(input ?? "").trim().toLowerCase();
+  const text = String(input ?? "")
+    .trim()
+    .toLowerCase();
   if (!text) return false;
   if (/\bgit\s+status\b/.test(text)) return true;
   if (/\bstatus\b/.test(text) && /\b(repo|repository)\b/.test(text) && /\bgit\b/.test(text)) {
@@ -89,7 +91,9 @@ export function isGitStatusPrompt(input: string): boolean {
 }
 
 export function isSystemStatusPrompt(input: string): boolean {
-  const text = String(input ?? "").trim().toLowerCase();
+  const text = String(input ?? "")
+    .trim()
+    .toLowerCase();
   if (!text) return false;
   const mentionsSystem =
     /\b(system|database|db|queue|worker|workers|request|requests|job|jobs|health)\b/.test(text);

@@ -197,7 +197,11 @@ function parseJsonText(value: string | null): string {
 function statusColor(theme: DashboardTheme, status: string): string {
   const normalized = status.toLowerCase();
   if (normalized.includes("complete") || normalized.includes("processed")) return theme.positive;
-  if (normalized.includes("fail") || normalized.includes("error") || normalized.includes("offline")) {
+  if (
+    normalized.includes("fail") ||
+    normalized.includes("error") ||
+    normalized.includes("offline")
+  ) {
     return theme.danger;
   }
   if (normalized.includes("initializing")) return theme.warning;
@@ -211,7 +215,10 @@ function parseWorkerSuffix(raw: string): string | null {
   return match?.[1] ? match[1].slice(0, 8) : null;
 }
 
-function resolveChatSpeaker(from: string | undefined, theme: DashboardTheme): ChatSpeakerPresentation {
+function resolveChatSpeaker(
+  from: string | undefined,
+  theme: DashboardTheme,
+): ChatSpeakerPresentation {
   const raw = (from ?? "").trim();
   const normalized = raw.toLowerCase();
 
@@ -231,7 +238,11 @@ function resolveChatSpeaker(from: string | undefined, theme: DashboardTheme): Ch
           worker: { bg: "#EAF8EC", border: "#9CD2AE", label: "#1E6C40" },
           scm: { bg: "#FFF4E7", border: "#E1B67A", label: "#8A5D1D" },
           server: { bg: "#F0EDFA", border: "#B8AFE5", label: "#5C4DA5" },
-          agent: { bg: theme.bubbleAgent, border: theme.bubbleAgentBorder, label: theme.accentText },
+          agent: {
+            bg: theme.bubbleAgent,
+            border: theme.bubbleAgentBorder,
+            label: theme.accentText,
+          },
         };
 
   if (normalized.includes("localbuddy")) {
@@ -289,7 +300,10 @@ function resolveChatSpeaker(from: string | undefined, theme: DashboardTheme): Ch
     };
   }
 
-  const simple = raw.replace(/^agent:/i, "").replace(/[-_]+/g, " ").trim();
+  const simple = raw
+    .replace(/^agent:/i, "")
+    .replace(/[-_]+/g, " ")
+    .trim();
   const pretty = simple.replace(/\b\w/g, (ch) => ch.toUpperCase());
   return {
     label: pretty || "Agent",
@@ -364,7 +378,9 @@ function SegmentedTabs({
   theme: DashboardTheme;
 }) {
   return (
-    <View style={[styles.segmentWrap, { backgroundColor: theme.panelAlt, borderColor: theme.border }]}>
+    <View
+      style={[styles.segmentWrap, { backgroundColor: theme.panelAlt, borderColor: theme.border }]}
+    >
       {tabs.map((tab) => {
         const selected = tab.id === active;
         return (
@@ -456,8 +472,12 @@ function MetricTile({
           ? theme.danger
           : theme.accent;
   return (
-    <View style={[styles.metricTile, { borderColor: theme.border, backgroundColor: theme.panelAlt }]}>
-      <Text style={[styles.metricTitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>{title}</Text>
+    <View
+      style={[styles.metricTile, { borderColor: theme.border, backgroundColor: theme.panelAlt }]}
+    >
+      <Text style={[styles.metricTitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+        {title}
+      </Text>
       <Text style={[styles.metricValue, { color, fontFamily: theme.fontSans }]}>{value}</Text>
       {detail ? (
         <Text style={[styles.metricDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
@@ -475,7 +495,9 @@ function CollapsibleMessage({ text, theme }: { text: string; theme: DashboardThe
   const display = needsCollapse && !expanded ? `${text.slice(0, threshold)}...` : text;
   return (
     <View>
-      <Text style={[styles.chatText, { color: theme.text, fontFamily: theme.fontSans }]}>{display}</Text>
+      <Text style={[styles.chatText, { color: theme.text, fontFamily: theme.fontSans }]}>
+        {display}
+      </Text>
       {needsCollapse ? (
         <Pressable onPress={() => setExpanded((prev) => !prev)}>
           <Text style={[styles.showMore, { color: theme.accent, fontFamily: theme.fontSans }]}>
@@ -568,7 +590,9 @@ function ChatPane({
             <Text style={[styles.emptyTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
               No conversation yet
             </Text>
-            <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            <Text
+              style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+            >
               Start with a task. LocalBuddy will enqueue and RemoteBuddy will coordinate execution.
             </Text>
           </View>
@@ -576,7 +600,8 @@ function ChatPane({
           messages.map((message, index) => {
             const isUser = (message.from ?? "").toLowerCase().includes("client");
             const speaker = resolveChatSpeaker(message.from, theme);
-            const isLocalBuddy = !isUser && (message.from ?? "").toLowerCase().includes("localbuddy");
+            const isLocalBuddy =
+              !isUser && (message.from ?? "").toLowerCase().includes("localbuddy");
             const priorUserMessage = isLocalBuddy
               ? [...messages.slice(0, index)]
                   .reverse()
@@ -599,7 +624,12 @@ function ChatPane({
                 ]}
               >
                 {!isUser ? (
-                  <Text style={[styles.chatFrom, { color: speaker.labelColor, fontFamily: theme.fontSans }]}>
+                  <Text
+                    style={[
+                      styles.chatFrom,
+                      { color: speaker.labelColor, fontFamily: theme.fontSans },
+                    ]}
+                  >
                     {speaker.label}
                   </Text>
                 ) : null}
@@ -620,7 +650,12 @@ function ChatPane({
                     onPress={() => onEscalate(priorUserMessage.text)}
                     style={[styles.escalateButton, { borderColor: theme.accent }]}
                   >
-                    <Text style={[styles.escalateButtonLabel, { color: theme.accent, fontFamily: theme.fontSans }]}>
+                    <Text
+                      style={[
+                        styles.escalateButtonLabel,
+                        { color: theme.accent, fontFamily: theme.fontSans },
+                      ]}
+                    >
                       Send This To RemoteBuddy
                     </Text>
                   </Pressable>
@@ -640,9 +675,13 @@ function ChatPane({
               },
             ]}
           >
-            <Text style={[styles.chatFrom, { color: theme.accent, fontFamily: theme.fontSans }]}>Local Buddy</Text>
+            <Text style={[styles.chatFrom, { color: theme.accent, fontFamily: theme.fontSans }]}>
+              Local Buddy
+            </Text>
             <View style={styles.typingLine}>
-              <Text style={[styles.typingLabel, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[styles.typingLabel, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+              >
                 Thinking
               </Text>
               <TypingDots theme={theme} />
@@ -683,7 +722,9 @@ function ChatPane({
           >
             <Text style={[styles.sendLabel, { fontFamily: theme.fontSans }]}>Send</Text>
           </Pressable>
-          <Text style={[styles.shortcutHint, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          <Text
+            style={[styles.shortcutHint, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+          >
             Alt+Enter / Cmd+Enter
           </Text>
         </View>
@@ -710,21 +751,40 @@ function RequestsPane({
   return (
     <ScrollView style={styles.tabFill} contentContainerStyle={styles.scrollContent}>
       <View style={styles.metricRow}>
-        <MetricTile title="Pending" value={String(queueValue(counts, "pending"))} tone="warning" theme={theme} />
-        <MetricTile title="Claimed" value={String(queueValue(counts, "claimed"))} tone="accent" theme={theme} />
+        <MetricTile
+          title="Pending"
+          value={String(queueValue(counts, "pending"))}
+          tone="warning"
+          theme={theme}
+        />
+        <MetricTile
+          title="Claimed"
+          value={String(queueValue(counts, "claimed"))}
+          tone="accent"
+          theme={theme}
+        />
         <MetricTile
           title="Completed"
           value={String(queueValue(counts, "completed"))}
           tone="positive"
           theme={theme}
         />
-        <MetricTile title="Failed" value={String(queueValue(counts, "failed"))} tone="danger" theme={theme} />
+        <MetricTile
+          title="Failed"
+          value={String(queueValue(counts, "failed"))}
+          tone="danger"
+          theme={theme}
+        />
       </View>
 
       {rows.length === 0 ? (
         <View style={styles.emptyState}>
-          <Text style={[styles.emptyTitle, { color: theme.text, fontFamily: theme.fontSans }]}>No requests yet</Text>
-          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          <Text style={[styles.emptyTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            No requests yet
+          </Text>
+          <Text
+            style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+          >
             Requests from LocalBuddy will appear here with full lifecycle status.
           </Text>
         </View>
@@ -751,54 +811,126 @@ function RequestsPane({
           return (
             <View
               key={request.id}
-              style={[styles.requestCard, { borderColor: theme.border, backgroundColor: theme.panel }]}
+              style={[
+                styles.requestCard,
+                { borderColor: theme.border, backgroundColor: theme.panel },
+              ]}
             >
               <View style={styles.rowBetween}>
                 <Text style={[styles.requestId, { color: theme.text, fontFamily: theme.fontMono }]}>
                   {request.id.slice(0, 8)}
                 </Text>
-                <View style={[styles.statusPill, { backgroundColor: `${rowColor}22`, borderColor: `${rowColor}66` }]}>
-                  <Text style={[styles.statusPillText, { color: rowColor, fontFamily: theme.fontSans }]}>
+                <View
+                  style={[
+                    styles.statusPill,
+                    { backgroundColor: `${rowColor}22`, borderColor: `${rowColor}66` },
+                  ]}
+                >
+                  <Text
+                    style={[styles.statusPillText, { color: rowColor, fontFamily: theme.fontSans }]}
+                  >
                     {request.status}
                   </Text>
                 </View>
               </View>
-              <Text style={[styles.requestPrompt, { color: theme.text, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[styles.requestPrompt, { color: theme.text, fontFamily: theme.fontSans }]}
+              >
                 {clip(request.prompt, 260)}
               </Text>
-              <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[
+                  styles.requestSubline,
+                  { color: theme.textMuted, fontFamily: theme.fontSans },
+                ]}
+              >
                 priority {priority} | {lifecycleSummary}
               </Text>
-              <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                agent {request.agentId ?? "--"} | created {prettyTs(request.createdAt)} | updated {relativeMs(request.updatedAt)}
+              <Text
+                style={[
+                  styles.requestSubline,
+                  { color: theme.textMuted, fontFamily: theme.fontSans },
+                ]}
+              >
+                agent {request.agentId ?? "--"} | created {prettyTs(request.createdAt)} | updated{" "}
+                {relativeMs(request.updatedAt)}
               </Text>
               {phaseBits.length > 0 ? (
-                <Text style={[styles.requestPhaseLine, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                <Text
+                  style={[
+                    styles.requestPhaseLine,
+                    { color: theme.textMuted, fontFamily: theme.fontMono },
+                  ]}
+                >
                   {phaseBits.join(" | ")}
                 </Text>
               ) : null}
               {request.queueWaitBudgetMs != null ? (
-                <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                <Text
+                  style={[
+                    styles.requestSubline,
+                    { color: theme.textMuted, fontFamily: theme.fontSans },
+                  ]}
+                >
                   queue budget {formatDuration(request.queueWaitBudgetMs)}
                 </Text>
               ) : null}
               {request.durationMs != null ? (
-                <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                <Text
+                  style={[
+                    styles.requestSubline,
+                    { color: theme.textMuted, fontFamily: theme.fontSans },
+                  ]}
+                >
                   request duration {formatDuration(request.durationMs)}
                 </Text>
               ) : null}
               {resultText ? (
-                <View style={[styles.codeBlock, { borderColor: theme.border, backgroundColor: theme.panelAlt }]}>
-                  <Text style={[styles.codeBlockLabel, { color: theme.positive, fontFamily: theme.fontSans }]}>result</Text>
-                  <Text style={[styles.codeBlockText, { color: theme.text, fontFamily: theme.fontMono }]}>
+                <View
+                  style={[
+                    styles.codeBlock,
+                    { borderColor: theme.border, backgroundColor: theme.panelAlt },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.codeBlockLabel,
+                      { color: theme.positive, fontFamily: theme.fontSans },
+                    ]}
+                  >
+                    result
+                  </Text>
+                  <Text
+                    style={[
+                      styles.codeBlockText,
+                      { color: theme.text, fontFamily: theme.fontMono },
+                    ]}
+                  >
                     {clip(resultText, 600)}
                   </Text>
                 </View>
               ) : null}
               {errorText ? (
-                <View style={[styles.codeBlock, { borderColor: `${theme.danger}77`, backgroundColor: `${theme.danger}14` }]}>
-                  <Text style={[styles.codeBlockLabel, { color: theme.danger, fontFamily: theme.fontSans }]}>error</Text>
-                  <Text style={[styles.codeBlockText, { color: theme.text, fontFamily: theme.fontMono }]}>
+                <View
+                  style={[
+                    styles.codeBlock,
+                    { borderColor: `${theme.danger}77`, backgroundColor: `${theme.danger}14` },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.codeBlockLabel,
+                      { color: theme.danger, fontFamily: theme.fontSans },
+                    ]}
+                  >
+                    error
+                  </Text>
+                  <Text
+                    style={[
+                      styles.codeBlockText,
+                      { color: theme.text, fontFamily: theme.fontMono },
+                    ]}
+                  >
                     {clip(errorText, 600)}
                   </Text>
                 </View>
@@ -839,22 +971,45 @@ function JobsPane({
   return (
     <View style={styles.tabFill}>
       <View style={styles.metricRow}>
-        <MetricTile title="Queued Jobs" value={String(queueValue(jobCounts, "pending"))} tone="warning" theme={theme} />
-        <MetricTile title="Running Jobs" value={String(queueValue(jobCounts, "claimed"))} tone="accent" theme={theme} />
+        <MetricTile
+          title="Queued Jobs"
+          value={String(queueValue(jobCounts, "pending"))}
+          tone="warning"
+          theme={theme}
+        />
+        <MetricTile
+          title="Running Jobs"
+          value={String(queueValue(jobCounts, "claimed"))}
+          tone="accent"
+          theme={theme}
+        />
         <MetricTile
           title="Completions"
           value={String(queueValue(completionCounts, "processed"))}
           tone="positive"
           theme={theme}
         />
-        <MetricTile title="Failed Jobs" value={String(queueValue(jobCounts, "failed"))} tone="danger" theme={theme} />
+        <MetricTile
+          title="Failed Jobs"
+          value={String(queueValue(jobCounts, "failed"))}
+          tone="danger"
+          theme={theme}
+        />
       </View>
 
       <View style={[styles.jobsLayout, isWide && styles.jobsLayoutWide]}>
-        <View style={[styles.jobsListPane, { borderColor: theme.border, backgroundColor: theme.panel }]}>
-          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>Queue Activity</Text>
+        <View
+          style={[styles.jobsListPane, { borderColor: theme.border, backgroundColor: theme.panel }]}
+        >
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            Queue Activity
+          </Text>
           {recentJobs.length === 0 ? (
-            <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>No job rows yet.</Text>
+            <Text
+              style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+            >
+              No job rows yet.
+            </Text>
           ) : (
             <FlatList
               data={recentJobs}
@@ -884,25 +1039,53 @@ function JobsPane({
                   <View style={[styles.jobRow, { borderColor: theme.border }]}>
                     <View style={[styles.jobDot, { backgroundColor: color }]} />
                     <View style={styles.jobTextCol}>
-                      <Text style={[styles.jobKind, { color: theme.text, fontFamily: theme.fontSans }]}>{item.kind}</Text>
-                      <Text style={[styles.jobMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                        {item.id.slice(0, 8)} | worker {item.workerId ?? "--"} | {relativeMs(item.updatedAt)}
+                      <Text
+                        style={[styles.jobKind, { color: theme.text, fontFamily: theme.fontSans }]}
+                      >
+                        {item.kind}
                       </Text>
-                      <Text style={[styles.jobMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                      <Text
+                        style={[
+                          styles.jobMeta,
+                          { color: theme.textMuted, fontFamily: theme.fontSans },
+                        ]}
+                      >
+                        {item.id.slice(0, 8)} | worker {item.workerId ?? "--"} |{" "}
+                        {relativeMs(item.updatedAt)}
+                      </Text>
+                      <Text
+                        style={[
+                          styles.jobMeta,
+                          { color: theme.textMuted, fontFamily: theme.fontSans },
+                        ]}
+                      >
                         priority {priority} | {lifecycleSummary}
                       </Text>
                       {phaseBits.length > 0 ? (
-                        <Text style={[styles.jobPhaseLine, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                        <Text
+                          style={[
+                            styles.jobPhaseLine,
+                            { color: theme.textMuted, fontFamily: theme.fontMono },
+                          ]}
+                        >
                           {phaseBits.join(" | ")}
                         </Text>
                       ) : null}
                       {item.executionBudgetMs != null || item.finalizationBudgetMs != null ? (
-                        <Text style={[styles.jobMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                          budget exec {formatDuration(item.executionBudgetMs)} | finalize {formatDuration(item.finalizationBudgetMs)}
+                        <Text
+                          style={[
+                            styles.jobMeta,
+                            { color: theme.textMuted, fontFamily: theme.fontSans },
+                          ]}
+                        >
+                          budget exec {formatDuration(item.executionBudgetMs)} | finalize{" "}
+                          {formatDuration(item.finalizationBudgetMs)}
                         </Text>
                       ) : null}
                     </View>
-                    <Text style={[styles.jobStatus, { color, fontFamily: theme.fontSans }]}>{item.status}</Text>
+                    <Text style={[styles.jobStatus, { color, fontFamily: theme.fontSans }]}>
+                      {item.status}
+                    </Text>
                   </View>
                 );
               }}
@@ -911,18 +1094,40 @@ function JobsPane({
 
           {completions.length > 0 ? (
             <View style={styles.completionStrip}>
-              <Text style={[styles.subSectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>Recent Completions</Text>
+              <Text
+                style={[styles.subSectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}
+              >
+                Recent Completions
+              </Text>
               {completions.slice(0, 16).map((completion) => {
                 const color = statusColor(theme, completion.status);
                 return (
-                  <View key={completion.id} style={[styles.completionRow, { borderColor: theme.border }]}>
-                    <Text style={[styles.completionMeta, { color: theme.text, fontFamily: theme.fontMono }]}>
+                  <View
+                    key={completion.id}
+                    style={[styles.completionRow, { borderColor: theme.border }]}
+                  >
+                    <Text
+                      style={[
+                        styles.completionMeta,
+                        { color: theme.text, fontFamily: theme.fontMono },
+                      ]}
+                    >
                       {completion.id.slice(0, 8)}
                     </Text>
-                    <Text style={[styles.completionLine, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                    <Text
+                      style={[
+                        styles.completionLine,
+                        { color: theme.textMuted, fontFamily: theme.fontSans },
+                      ]}
+                    >
                       {clip(completion.message, 110)}
                     </Text>
-                    <Text style={[styles.completionMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                    <Text
+                      style={[
+                        styles.completionMeta,
+                        { color: theme.textMuted, fontFamily: theme.fontSans },
+                      ]}
+                    >
                       {completion.branch ?? "--"} | {completion.commitSha?.slice(0, 8) ?? "--"}
                     </Text>
                     <Text style={[styles.completionStatus, { color, fontFamily: theme.fontSans }]}>
@@ -935,8 +1140,15 @@ function JobsPane({
           ) : null}
         </View>
 
-        <View style={[styles.jobsTracePane, { borderColor: theme.border, backgroundColor: theme.panel }]}>
-          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>Tasks and Traces</Text>
+        <View
+          style={[
+            styles.jobsTracePane,
+            { borderColor: theme.border, backgroundColor: theme.panel },
+          ]}
+        >
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            Tasks and Traces
+          </Text>
           <View style={styles.tracePanelBody}>
             <TasksJobsLogs
               state={sessionState}
@@ -991,7 +1203,8 @@ function SystemPane({
       SourceControlManager: undefined,
     };
 
-    const hasAny = (value: string, needles: string[]): boolean => needles.some((needle) => value.includes(needle));
+    const hasAny = (value: string, needles: string[]): boolean =>
+      needles.some((needle) => value.includes(needle));
 
     for (const event of envelopes) {
       const from = (event.from ?? "").toLowerCase();
@@ -1000,7 +1213,8 @@ function SystemPane({
         typeof payload?.agentId === "string" ? (payload.agentId as string).toLowerCase() : "";
       const signal = `${from} ${payloadAgentId}`;
 
-      if (hasAny(signal, ["localbuddy", "local_buddy", "local buddy"])) byName.LocalBuddy = event.ts;
+      if (hasAny(signal, ["localbuddy", "local_buddy", "local buddy"]))
+        byName.LocalBuddy = event.ts;
       if (hasAny(signal, ["remotebuddy", "remote_buddy", "remote buddy"])) {
         byName.RemoteBuddy = event.ts;
       }
@@ -1130,15 +1344,41 @@ function SystemPane({
         {componentRows.map((row) => {
           const color = statusColor(theme, row.status);
           return (
-            <View key={row.name} style={[styles.systemCard, { borderColor: theme.border, backgroundColor: theme.panel }]}>
+            <View
+              key={row.name}
+              style={[
+                styles.systemCard,
+                { borderColor: theme.border, backgroundColor: theme.panel },
+              ]}
+            >
               <View style={styles.rowBetween}>
-                <Text style={[styles.systemTitle, { color: theme.text, fontFamily: theme.fontSans }]}>{row.name}</Text>
-                <View style={[styles.statusPill, { backgroundColor: `${color}22`, borderColor: `${color}66` }]}>
-                  <Text style={[styles.statusPillText, { color, fontFamily: theme.fontSans }]}>{row.status}</Text>
+                <Text
+                  style={[styles.systemTitle, { color: theme.text, fontFamily: theme.fontSans }]}
+                >
+                  {row.name}
+                </Text>
+                <View
+                  style={[
+                    styles.statusPill,
+                    { backgroundColor: `${color}22`, borderColor: `${color}66` },
+                  ]}
+                >
+                  <Text style={[styles.statusPillText, { color, fontFamily: theme.fontSans }]}>
+                    {row.status}
+                  </Text>
                 </View>
               </View>
-              <Text style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>{row.detail}</Text>
-              <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[
+                  styles.systemDetail,
+                  { color: theme.textMuted, fontFamily: theme.fontSans },
+                ]}
+              >
+                {row.detail}
+              </Text>
+              <Text
+                style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+              >
                 {row.ts ? `updated ${prettyTs(row.ts)}` : "no timestamp"}
               </Text>
             </View>
@@ -1146,10 +1386,18 @@ function SystemPane({
         })}
       </View>
 
-      <View style={[styles.workerPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}>
-        <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>Worker Fleet</Text>
+      <View
+        style={[styles.workerPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}
+      >
+        <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+          Worker Fleet
+        </Text>
         {workers.length === 0 ? (
-          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>No workers reported yet.</Text>
+          <Text
+            style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+          >
+            No workers reported yet.
+          </Text>
         ) : (
           workers.map((worker) => {
             const color = statusColor(theme, worker.status);
@@ -1157,9 +1405,20 @@ function SystemPane({
               <View key={worker.workerId} style={[styles.workerRow, { borderColor: theme.border }]}>
                 <View style={[styles.jobDot, { backgroundColor: color }]} />
                 <View style={styles.workerTextCol}>
-                  <Text style={[styles.workerName, { color: theme.text, fontFamily: theme.fontSans }]}> {worker.workerId}</Text>
-                  <Text style={[styles.workerMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                    {worker.status} | job {worker.currentJobId?.slice(0, 8) ?? "--"} | heartbeat {relativeMs(worker.lastHeartbeat)}
+                  <Text
+                    style={[styles.workerName, { color: theme.text, fontFamily: theme.fontSans }]}
+                  >
+                    {" "}
+                    {worker.workerId}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.workerMeta,
+                      { color: theme.textMuted, fontFamily: theme.fontSans },
+                    ]}
+                  >
+                    {worker.status} | job {worker.currentJobId?.slice(0, 8) ?? "--"} | heartbeat{" "}
+                    {relativeMs(worker.lastHeartbeat)}
                   </Text>
                 </View>
               </View>
@@ -1168,7 +1427,9 @@ function SystemPane({
         )}
       </View>
 
-      <View style={[styles.eventPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}>
+      <View
+        style={[styles.eventPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}
+      >
         <View style={styles.rowBetween}>
           <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
             Recent Event Stream
@@ -1178,7 +1439,9 @@ function SystemPane({
           </Text>
         </View>
         {recentEvents.length === 0 ? (
-          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          <Text
+            style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+          >
             No events yet.
           </Text>
         ) : (
@@ -1187,10 +1450,17 @@ function SystemPane({
             return (
               <View key={event.id} style={[styles.eventRow, { borderColor: theme.border }]}>
                 <View style={styles.eventMain}>
-                  <Text style={[styles.eventMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                  <Text
+                    style={[
+                      styles.eventMeta,
+                      { color: theme.textMuted, fontFamily: theme.fontMono },
+                    ]}
+                  >
                     {prettyTs(event.ts)} | {event.from ?? "unknown"}
                   </Text>
-                  <Text style={[styles.eventSummary, { color: theme.text, fontFamily: theme.fontSans }]}>
+                  <Text
+                    style={[styles.eventSummary, { color: theme.text, fontFamily: theme.fontSans }]}
+                  >
                     {summarizeEvent(event)}
                   </Text>
                 </View>
@@ -1343,9 +1613,27 @@ export default function DashboardScreen() {
       style={[styles.root, { backgroundColor: theme.background }]}
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
-      <View style={[styles.backdropBlob, styles.backdropBlobA, { backgroundColor: `${theme.accent}20` }]} />
-      <View style={[styles.backdropBlob, styles.backdropBlobB, { backgroundColor: `${theme.warning}16` }]} />
-      <View style={[styles.backdropBlob, styles.backdropBlobC, { backgroundColor: `${theme.positive}18` }]} />
+      <View
+        style={[
+          styles.backdropBlob,
+          styles.backdropBlobA,
+          { backgroundColor: `${theme.accent}20` },
+        ]}
+      />
+      <View
+        style={[
+          styles.backdropBlob,
+          styles.backdropBlobB,
+          { backgroundColor: `${theme.warning}16` },
+        ]}
+      />
+      <View
+        style={[
+          styles.backdropBlob,
+          styles.backdropBlobC,
+          { backgroundColor: `${theme.positive}18` },
+        ]}
+      />
 
       <Animated.View
         style={[
@@ -1367,8 +1655,12 @@ export default function DashboardScreen() {
       >
         <View style={styles.header}>
           <View style={styles.headerLeft}>
-            <Text style={[styles.eyebrow, { color: theme.textMuted, fontFamily: theme.fontSans }]}>pushpals operations console</Text>
-            <Text style={[styles.title, { color: theme.text, fontFamily: theme.fontSans }]}>Mission Control</Text>
+            <Text style={[styles.eyebrow, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              pushpals operations console
+            </Text>
+            <Text style={[styles.title, { color: theme.text, fontFamily: theme.fontSans }]}>
+              Mission Control
+            </Text>
             <Text style={[styles.subtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
               Real-time chat, orchestration, queue health, and execution trace visibility.
             </Text>
@@ -1377,8 +1669,15 @@ export default function DashboardScreen() {
         </View>
 
         {session.error ? (
-          <View style={[styles.banner, { backgroundColor: `${theme.danger}22`, borderColor: `${theme.danger}55` }]}>
-            <Text style={[styles.bannerText, { color: theme.danger, fontFamily: theme.fontSans }]}>{session.error}</Text>
+          <View
+            style={[
+              styles.banner,
+              { backgroundColor: `${theme.danger}22`, borderColor: `${theme.danger}55` },
+            ]}
+          >
+            <Text style={[styles.bannerText, { color: theme.danger, fontFamily: theme.fontSans }]}>
+              {session.error}
+            </Text>
           </View>
         ) : null}
 
@@ -1399,7 +1698,9 @@ export default function DashboardScreen() {
           />
           <MetricTile
             title="Active Workers"
-            value={String(systemSummary.workers?.online ?? workers.filter((w) => w.isOnline).length)}
+            value={String(
+              systemSummary.workers?.online ?? workers.filter((w) => w.isOnline).length,
+            )}
             detail={`${systemSummary.workers?.busy ?? workers.filter((w) => w.status === "busy").length} busy`}
             theme={theme}
           />
@@ -1418,7 +1719,9 @@ export default function DashboardScreen() {
             styles.tabFill,
             {
               opacity: tabAnim,
-              transform: [{ translateY: tabAnim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }) }],
+              transform: [
+                { translateY: tabAnim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }) },
+              ],
             },
           ]}
         >
@@ -1866,7 +2169,3 @@ const styles = StyleSheet.create({
   eventMeta: { fontSize: 11 },
   eventSummary: { fontSize: 13, marginTop: 2, lineHeight: 18 },
 });
-
-
-
-

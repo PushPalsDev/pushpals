@@ -8,10 +8,7 @@ export type UserIntent = {
 };
 
 export interface CompanionModel {
-  summarizeAndPlan(input: {
-    userText: string;
-    history: EventEnvelope[];
-  }): Promise<UserIntent>;
+  summarizeAndPlan(input: { userText: string; history: EventEnvelope[] }): Promise<UserIntent>;
 }
 
 /**

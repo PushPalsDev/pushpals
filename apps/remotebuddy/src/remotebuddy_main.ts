@@ -229,9 +229,7 @@ function explainJobFailureFromLogs(
   fallbackMessage: string,
   fallbackDetail: string,
 ): string {
-  const lines = logs
-    .map((row) => toSingleLine(row.message, 420))
-    .filter(Boolean);
+  const lines = logs.map((row) => toSingleLine(row.message, 420)).filter(Boolean);
   const joined = lines.join("\n").toLowerCase();
 
   if (joined.includes("model preflight failed") && joined.includes("timed out")) {
@@ -241,9 +239,9 @@ function explainJobFailureFromLogs(
     return "All candidate models failed preflight/execution, so OpenHands stopped before running the task.";
   }
   if (
-    joined.includes("failed to load model")
-    || joined.includes("insufficient system resources")
-    || joined.includes("model loading was stopped")
+    joined.includes("failed to load model") ||
+    joined.includes("insufficient system resources") ||
+    joined.includes("model loading was stopped")
   ) {
     return "The selected model could not be loaded due to local resource constraints, and no fallback model succeeded.";
   }
@@ -488,9 +486,7 @@ class RemoteBuddyOrchestrator {
       if (!res.ok) return [];
       const data = (await res.json()) as { ok?: boolean; logs?: JobLogEntry[] };
       if (!data.ok || !Array.isArray(data.logs)) return [];
-      return data.logs
-        .filter((row) => row && typeof row.message === "string")
-        .slice(-80);
+      return data.logs.filter((row) => row && typeof row.message === "string").slice(-80);
     } catch {
       return [];
     }
@@ -522,9 +518,7 @@ class RemoteBuddyOrchestrator {
       .slice(-6)
       .map((row) => toSingleLine(row.message, 220))
       .filter(Boolean);
-    const tailText = tail.length
-      ? `\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\``
-      : "";
+    const tailText = tail.length ? `\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\`` : "";
 
     await this.comm.assistantMessage(`Diagnosis for job ${shortJob}: ${explanation}${tailText}`, {
       correlationId: envelope.correlationId,
@@ -539,7 +533,11 @@ class RemoteBuddyOrchestrator {
         if (envelope.type !== "job_failed") return;
         const tsMs = Date.parse(envelope.ts);
         if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
-        const payload = envelope.payload as { jobId?: unknown; message?: unknown; detail?: unknown };
+        const payload = envelope.payload as {
+          jobId?: unknown;
+          message?: unknown;
+          detail?: unknown;
+        };
         const jobId = String(payload.jobId ?? "").trim();
         const message = toSingleLine(payload.message, 220);
         const detail = toSingleLine(payload.detail, 220);
@@ -653,7 +651,11 @@ class RemoteBuddyOrchestrator {
     },
   ): TaskExecutionLane {
     if (plan.intent === "status") return "deterministic";
-    if (plan.risk_level === "low" && plan.target_paths.length <= 3 && plan.validation_steps.length <= 4) {
+    if (
+      plan.risk_level === "low" &&
+      plan.target_paths.length <= 3 &&
+      plan.validation_steps.length <= 4
+    ) {
       if (prompt.trim().length <= 800) return "deterministic";
     }
     return plan.lane;

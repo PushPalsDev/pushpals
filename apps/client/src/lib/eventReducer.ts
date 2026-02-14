@@ -306,7 +306,9 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
         // task_completed event is emitted.
         const task = tasks.get(existing.taskId);
         if (task && task.status !== "failed") {
-          const siblingJobs = Array.from(jobs.values()).filter((job) => job.taskId === existing.taskId);
+          const siblingJobs = Array.from(jobs.values()).filter(
+            (job) => job.taskId === existing.taskId,
+          );
           const hasActiveSibling = siblingJobs.some(
             (job) => job.status === "enqueued" || job.status === "claimed",
           );
@@ -344,7 +346,9 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
         const task = tasks.get(existing.taskId);
         if (task && task.status !== "completed") {
           const hasActiveSiblingJob = Array.from(jobs.values()).some(
-            (job) => job.taskId === existing.taskId && (job.status === "enqueued" || job.status === "claimed"),
+            (job) =>
+              job.taskId === existing.taskId &&
+              (job.status === "enqueued" || job.status === "claimed"),
           );
           if (!hasActiveSiblingJob) {
             tasks.set(existing.taskId, {

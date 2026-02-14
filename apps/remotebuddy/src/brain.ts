@@ -34,9 +34,11 @@ const BASE_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/remotebuddy_system_pr
   platform: process.platform,
 });
 const POST_SYSTEM_PROMPT = loadPromptTemplate("shared/post_system_prompt.md");
-const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}\n\n${POST_SYSTEM_PROMPT}\n\nYou are a strict planning function.\nReturn only structured JSON that matches the required schema.`.trim();
+const SYSTEM_PROMPT =
+  `${BASE_SYSTEM_PROMPT}\n\n${POST_SYSTEM_PROMPT}\n\nYou are a strict planning function.\nReturn only structured JSON that matches the required schema.`.trim();
 
-const REPAIR_SYSTEM_PROMPT = `${SYSTEM_PROMPT}\n\nYour previous response was invalid. Repair it to valid schema-compliant JSON only.`.trim();
+const REPAIR_SYSTEM_PROMPT =
+  `${SYSTEM_PROMPT}\n\nYour previous response was invalid. Repair it to valid schema-compliant JSON only.`.trim();
 
 export const REMOTEBUDDY_PLANNER_JSON_SCHEMA: Record<string, unknown> = {
   name: "remotebuddy_planner",
@@ -231,7 +233,9 @@ export class AgentBrain {
       const parsed = parseStructuredJson(primaryRaw);
       return sanitizePlannerOutput(parsed, userText);
     } catch (primaryErr) {
-      console.warn(`[Brain] Invalid planner JSON; attempting strict repair (${String(primaryErr)}).`);
+      console.warn(
+        `[Brain] Invalid planner JSON; attempting strict repair (${String(primaryErr)}).`,
+      );
       const repairMessages: LLMMessage[] = [
         {
           role: "user",
@@ -253,4 +257,3 @@ export class AgentBrain {
     }
   }
 }
-

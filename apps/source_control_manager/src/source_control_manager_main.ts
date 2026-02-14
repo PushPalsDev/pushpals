@@ -286,7 +286,9 @@ async function emitStartupStatus(): Promise<void> {
     statusSessionReady = false;
     console.warn(`[${ts()}] Failed to emit source_control_manager startup status event`);
   }
-  const msgOk = await comm.assistantMessage("SourceControlManager online and monitoring completions.");
+  const msgOk = await comm.assistantMessage(
+    "SourceControlManager online and monitoring completions.",
+  );
   if (!msgOk) {
     console.warn(`[${ts()}] Failed to emit source_control_manager startup welcome message`);
   }
@@ -324,7 +326,11 @@ function startStatusHeartbeat(): void {
       if (!statusSessionReady) {
         statusSessionReady = await ensureSessionWithRetry(statusSessionId, 3, 400, 2500);
       }
-      const ok = await comm.status("source_control_manager", "idle", "SourceControlManager heartbeat");
+      const ok = await comm.status(
+        "source_control_manager",
+        "idle",
+        "SourceControlManager heartbeat",
+      );
       if (!ok) {
         statusSessionReady = false;
       }

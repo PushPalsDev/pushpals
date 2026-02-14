@@ -87,9 +87,7 @@ export class CompletionQueue {
         ? body.prTitle.trim()
         : null;
     const prBody =
-      typeof body.prBody === "string" && body.prBody.trim().length > 0
-        ? body.prBody.trim()
-        : null;
+      typeof body.prBody === "string" && body.prBody.trim().length > 0 ? body.prBody.trim() : null;
 
     if (!jobId || !sessionId || !message) {
       return { ok: false, message: "jobId, sessionId, and message are required" };

@@ -16,9 +16,7 @@ function parseTraceTailLines(raw: string | undefined): number {
   return Math.max(MIN_TRACE_TAIL_LINES, Math.min(MAX_TRACE_TAIL_LINES, parsed));
 }
 
-const TRACE_TAIL_LINES = parseTraceTailLines(
-  process.env.EXPO_PUBLIC_PUSHPALS_TRACE_TAIL_LINES,
-);
+const TRACE_TAIL_LINES = parseTraceTailLines(process.env.EXPO_PUBLIC_PUSHPALS_TRACE_TAIL_LINES);
 
 type TraceTone = "reasoning" | "action" | "info" | "error";
 
@@ -482,7 +480,13 @@ function createStyles(palette: TracePalette, theme?: TasksJobsLogsTheme) {
     dot: { width: 8, height: 8, borderRadius: 4 },
     statusBadge: { fontSize: 11, fontWeight: "600", fontFamily: sans },
     chevron: { fontSize: 12, color: palette.textMuted, fontFamily: sans },
-    muted: { fontSize: 12, color: palette.textMuted, fontStyle: "italic", paddingHorizontal: 8, fontFamily: sans },
+    muted: {
+      fontSize: 12,
+      color: palette.textMuted,
+      fontStyle: "italic",
+      paddingHorizontal: 8,
+      fontFamily: sans,
+    },
   });
 }
 
@@ -534,7 +538,9 @@ function TaskRow({
       {expanded && (
         <View style={styles.taskBody}>
           {task.description ? <Text style={styles.desc}>{task.description}</Text> : null}
-          {task.latestProgress ? <Text style={styles.progressMsg}>{task.latestProgress}</Text> : null}
+          {task.latestProgress ? (
+            <Text style={styles.progressMsg}>{task.latestProgress}</Text>
+          ) : null}
           {jobs.length === 0 && <Text style={styles.muted}>No jobs yet</Text>}
           {jobs.map((job) => (
             <JobRow
@@ -632,7 +638,11 @@ function JobRow({
                   <Text style={styles.streamLabel}>STDOUT</Text>
                   <ScrollView style={styles.logScroll} nestedScrollEnabled>
                     {stdoutLines.map((line) => (
-                      <Text key={`stdout-${line.seq}`} style={[styles.logLine, styles.logStdout]} selectable>
+                      <Text
+                        key={`stdout-${line.seq}`}
+                        style={[styles.logLine, styles.logStdout]}
+                        selectable
+                      >
                         {line.line}
                       </Text>
                     ))}
@@ -644,7 +654,11 @@ function JobRow({
                   <Text style={styles.streamLabel}>STDERR</Text>
                   <ScrollView style={styles.logScroll} nestedScrollEnabled>
                     {stderrLines.map((line) => (
-                      <Text key={`stderr-${line.seq}`} style={[styles.logLine, styles.logStderr]} selectable>
+                      <Text
+                        key={`stderr-${line.seq}`}
+                        style={[styles.logLine, styles.logStderr]}
+                        selectable
+                      >
                         {line.line}
                       </Text>
                     ))}
@@ -681,7 +695,13 @@ function OrphanJobs({
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>Standalone Jobs</Text>
       {orphanJobs.map((job) => (
-        <JobRow key={job.jobId} job={job} logs={logs.get(job.jobId) ?? []} styles={styles} palette={palette} />
+        <JobRow
+          key={job.jobId}
+          job={job}
+          logs={logs.get(job.jobId) ?? []}
+          styles={styles}
+          palette={palette}
+        />
       ))}
     </View>
   );
@@ -719,7 +739,9 @@ export function TasksJobsLogs({
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Tasks</Text>
           {tasks.map((task) => {
-            const taskJobs = task.jobIds.map((jobId) => state.jobs.get(jobId)).filter(Boolean) as Job[];
+            const taskJobs = task.jobIds
+              .map((jobId) => state.jobs.get(jobId))
+              .filter(Boolean) as Job[];
             const jobOrder: Record<string, number> = {
               claimed: 0,
               enqueued: 1,
@@ -739,7 +761,9 @@ export function TasksJobsLogs({
                 jobs={taskJobs}
                 logs={state.logs}
                 expanded={expandedTaskId === task.taskId}
-                onToggle={() => setExpandedTaskId(expandedTaskId === task.taskId ? null : task.taskId)}
+                onToggle={() =>
+                  setExpandedTaskId(expandedTaskId === task.taskId ? null : task.taskId)
+                }
                 styles={styles}
                 palette={palette}
               />

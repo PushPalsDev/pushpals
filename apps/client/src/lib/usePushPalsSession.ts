@@ -216,9 +216,9 @@ export function usePushPalsSession(
     const jobToTask = new Map<string, string>();
 
     for (const ev of session.events) {
-      
       const p = ev.payload as any;
-      const payloadTaskId: string | undefined = typeof p?.taskId === "string" ? p.taskId : undefined;
+      const payloadTaskId: string | undefined =
+        typeof p?.taskId === "string" ? p.taskId : undefined;
       const payloadJobId: string | undefined = typeof p?.jobId === "string" ? p.jobId : undefined;
 
       if (ev.type === "job_enqueued" && payloadTaskId && payloadJobId) {
@@ -226,7 +226,8 @@ export function usePushPalsSession(
       }
 
       const taskId: string | undefined =
-        payloadTaskId ?? (ev.type === "job_failed" && payloadJobId ? jobToTask.get(payloadJobId) : undefined);
+        payloadTaskId ??
+        (ev.type === "job_failed" && payloadJobId ? jobToTask.get(payloadJobId) : undefined);
       if (!taskId) continue;
 
       if (!map.has(taskId)) {
@@ -239,7 +240,11 @@ export function usePushPalsSession(
       }
       const group = map.get(taskId)!;
       group.events.push(ev);
-      if ((!group.title || group.title === taskId) && typeof p?.title === "string" && p.title.trim()) {
+      if (
+        (!group.title || group.title === taskId) &&
+        typeof p?.title === "string" &&
+        p.title.trim()
+      ) {
         group.title = p.title;
       }
 
@@ -256,7 +261,6 @@ export function usePushPalsSession(
   // ─── Filtered events ──────────────────────────────────────────────────
   const filteredEvents = useMemo(() => {
     return session.events.filter((ev) => {
-      
       if (filters.agentFrom && ev.from !== filters.agentFrom) return false;
       if (filters.turnId && ev.turnId !== filters.turnId) return false;
       if (filters.taskId) {
@@ -287,5 +291,3 @@ export function usePushPalsSession(
     state,
   };
 }
-
-

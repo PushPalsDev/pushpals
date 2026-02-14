@@ -23,10 +23,7 @@ import {
   type JobLogApiRow,
   type RequestApiRow,
 } from "./request_status.js";
-import {
-  answerLocalReadonlyQuery,
-  isLocalReadonlyQueryPrompt,
-} from "./local_readonly.js";
+import { answerLocalReadonlyQuery, isLocalReadonlyQueryPrompt } from "./local_readonly.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -238,13 +235,13 @@ interface JobLogListResponse {
 type RequestPriority = "interactive" | "normal" | "background";
 
 function classifyRemoteRequestPriority(input: string): RequestPriority {
-  const text = String(input ?? "").trim().toLowerCase();
+  const text = String(input ?? "")
+    .trim()
+    .toLowerCase();
   if (!text) return "normal";
 
   if (
-    /\b(status|progress|queue|queued|eta|where|hows my job|what'?s my status|check on)\b/.test(
-      text,
-    )
+    /\b(status|progress|queue|queued|eta|where|hows my job|what'?s my status|check on)\b/.test(text)
   ) {
     return "interactive";
   }
@@ -252,7 +249,8 @@ function classifyRemoteRequestPriority(input: string): RequestPriority {
   if (
     /\b(comprehensive|deep dive|full pass|phase\s+\d|architecture|migration|refactor|rewrite|all components|everything)\b/.test(
       text,
-    ) || text.length > 1200
+    ) ||
+    text.length > 1200
   ) {
     return "background";
   }
@@ -309,7 +307,9 @@ function parseRemoteBuddyCommand(input: string): {
 }
 
 function isLikelyLocalOnlyPrompt(input: string): boolean {
-  const text = String(input ?? "").trim().toLowerCase();
+  const text = String(input ?? "")
+    .trim()
+    .toLowerCase();
   if (!text) return true;
 
   if (isLocalReadonlyQueryPrompt(text)) {
@@ -462,8 +462,7 @@ Respond in strict JSON with this shape:
     if (tail.length === 0) return;
 
     const likelyCause = summarizeFailureForPrompt(tail[tail.length - 1] ?? detail ?? message);
-    const diagnosis =
-      `Diagnosis for job ${shortJob}: ${likelyCause}\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\``;
+    const diagnosis = `Diagnosis for job ${shortJob}: ${likelyCause}\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\``;
     const diagnosisOk = await comm.assistantMessage(diagnosis);
     if (!diagnosisOk) {
       console.warn(`[LocalBuddy] Failed to emit proactive failure diagnosis for job ${jobId}`);
@@ -492,7 +491,9 @@ Respond in strict JSON with this shape:
 
       const requestsPayload = (await requestData.json()) as RequestListResponse;
       const jobsPayload = (await jobData.json()) as JobListResponse;
-      const sessionJobs = (jobsPayload.jobs ?? []).filter((row) => row.sessionId === this.sessionId);
+      const sessionJobs = (jobsPayload.jobs ?? []).filter(
+        (row) => row.sessionId === this.sessionId,
+      );
 
       let logs: JobLogApiRow[] = [];
       const requestedJobToken = extractReferencedJobToken(userPrompt);
@@ -631,7 +632,11 @@ Respond in strict JSON with this shape:
         if (stopping) return;
         const tsMs = Date.parse(envelope.ts);
         if (Number.isFinite(tsMs) && tsMs + 2000 < monitorStartedAt) return;
-        const payload = envelope.payload as { jobId?: unknown; message?: unknown; detail?: unknown };
+        const payload = envelope.payload as {
+          jobId?: unknown;
+          message?: unknown;
+          detail?: unknown;
+        };
         const jobId = String(payload.jobId ?? "").trim();
         const message = summarizeFailureForPrompt(payload.message);
         const detail = summarizeFailureForPrompt(payload.detail);
@@ -646,9 +651,7 @@ Respond in strict JSON with this shape:
           }
         }
         const summary =
-          detail && detail !== message
-            ? `${message} (detail: ${detail.slice(0, 120)})`
-            : message;
+          detail && detail !== message ? `${message} (detail: ${detail.slice(0, 120)})` : message;
         this.recentJobFailures.unshift({ jobId, summary, ts: envelope.ts });
         if (this.recentJobFailures.length > 20) {
           this.recentJobFailures.length = 20;
@@ -713,7 +716,8 @@ Respond in strict JSON with this shape:
             const routedPrompt = routing.prompt;
             const forceRemote = routing.forceRemote;
             const statusLookupIntent = isStatusLookupPrompt(routedPrompt);
-            const localOnly = !forceRemote && (statusLookupIntent || isLikelyLocalOnlyPrompt(routedPrompt));
+            const localOnly =
+              !forceRemote && (statusLookupIntent || isLikelyLocalOnlyPrompt(routedPrompt));
 
             if (!rawPrompt.trim()) {
               return makeJson({ ok: false, message: "text is required" }, 400);
@@ -761,7 +765,10 @@ Respond in strict JSON with this shape:
                 }
               })
               .catch((err) =>
-                console.error(`[LocalBuddy] Failed to emit immediate acknowledgement message:`, err),
+                console.error(
+                  `[LocalBuddy] Failed to emit immediate acknowledgement message:`,
+                  err,
+                ),
               );
 
             // ── Process and stream status back via SSE ──
@@ -850,7 +857,8 @@ Respond in strict JSON with this shape:
 
                   const requestSuffix = data.requestId ? ` (${data.requestId.slice(0, 8)})` : "";
                   const queueSuffix =
-                    Number.isFinite(data.queuePosition as number) && (data.queuePosition as number) > 0
+                    Number.isFinite(data.queuePosition as number) &&
+                    (data.queuePosition as number) > 0
                       ? ` Priority ${priority}; queue #${data.queuePosition} (ETA ${formatEtaFromMs(
                           data.etaMs,
                         )}).`

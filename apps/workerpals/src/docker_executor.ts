@@ -17,12 +17,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { isAbsolute, relative, resolve } from "path";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 
-function parseClampedEnvInt(
-  name: string,
-  defaultValue: number,
-  min: number,
-  max: number,
-): number {
+function parseClampedEnvInt(name: string, defaultValue: number, min: number, max: number): number {
   const raw = Number.parseInt(process.env[name] ?? "", 10);
   if (!Number.isFinite(raw) || raw <= 0) return defaultValue;
   return Math.max(min, Math.min(max, raw));
@@ -122,24 +117,14 @@ export class DockerExecutor {
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
-    this.warmSetupMaxAttempts = parseClampedEnvInt(
-      "WORKERPALS_DOCKER_WARM_MAX_ATTEMPTS",
-      3,
-      1,
-      5,
-    );
+    this.warmSetupMaxAttempts = parseClampedEnvInt("WORKERPALS_DOCKER_WARM_MAX_ATTEMPTS", 3, 1, 5);
     this.warmSetupBackoffMs = parseClampedEnvInt(
       "WORKERPALS_DOCKER_WARM_RETRY_BACKOFF_MS",
       2_000,
       250,
       60_000,
     );
-    this.jobRetryMaxAttempts = parseClampedEnvInt(
-      "WORKERPALS_DOCKER_JOB_MAX_ATTEMPTS",
-      2,
-      1,
-      3,
-    );
+    this.jobRetryMaxAttempts = parseClampedEnvInt("WORKERPALS_DOCKER_JOB_MAX_ATTEMPTS", 2, 1, 3);
     this.jobRetryBackoffMs = parseClampedEnvInt(
       "WORKERPALS_DOCKER_JOB_RETRY_BACKOFF_MS",
       3_000,
@@ -194,7 +179,11 @@ export class DockerExecutor {
 
           const retryableFailure = this.isRetryableJobFailure(result);
           if (attempt >= this.jobRetryMaxAttempts || !retryableFailure) {
-            if (retryableFailure && attempt >= this.jobRetryMaxAttempts && this.failureCooldownMs > 0) {
+            if (
+              retryableFailure &&
+              attempt >= this.jobRetryMaxAttempts &&
+              this.failureCooldownMs > 0
+            ) {
               return {
                 ...result,
                 cooldownMs: this.failureCooldownMs,
@@ -491,7 +480,7 @@ export class DockerExecutor {
         `${healthCmd} || { ` +
         'echo "agent server health check failed"; ' +
         'ps -ef | grep -i "openhands.agent_server" | grep -v grep || true; ' +
-        'ls -l /tmp/openhands-agent.log 2>/dev/null || true; ' +
+        "ls -l /tmp/openhands-agent.log 2>/dev/null || true; " +
         "tail -n 160 /tmp/openhands-agent.log 2>/dev/null; " +
         "exit 1; }; " +
         "tail -f /dev/null",
@@ -515,7 +504,13 @@ export class DockerExecutor {
 
   private async ensureWarmContainer(): Promise<void> {
     const inspect = Bun.spawn(
-      ["docker", "inspect", "-f", "{{.State.Running}}|{{.HostConfig.NetworkMode}}", this.warmContainerName],
+      [
+        "docker",
+        "inspect",
+        "-f",
+        "{{.State.Running}}|{{.HostConfig.NetworkMode}}",
+        this.warmContainerName,
+      ],
       { stdout: "pipe", stderr: "pipe" },
     );
     const [exitCode, stdout] = await Promise.all([
@@ -544,10 +539,10 @@ export class DockerExecutor {
     stderr: string;
     exitCode: number;
   }> {
-    const proc = Bun.spawn(
-      ["docker", "exec", this.warmContainerName, "/bin/sh", "-lc", command],
-      { stdout: "pipe", stderr: "pipe" },
-    );
+    const proc = Bun.spawn(["docker", "exec", this.warmContainerName, "/bin/sh", "-lc", command], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -594,7 +589,9 @@ export class DockerExecutor {
       proc.exited,
     ]);
     const out = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-    return exitCode === 0 ? out || "(no docker logs)" : `docker logs failed (exit ${exitCode})${out ? `\n${out}` : ""}`;
+    return exitCode === 0
+      ? out || "(no docker logs)"
+      : `docker logs failed (exit ${exitCode})${out ? `\n${out}` : ""}`;
   }
 
   private async collectWarmAgentDiagnostics(): Promise<string> {
@@ -622,7 +619,7 @@ export class DockerExecutor {
           'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
           'echo "configured=$PY"; ' +
           'if [ -x "$PY" ]; then "$PY" -V 2>&1; else echo "configured python missing"; fi; ' +
-          '(command -v python3 && python3 -V) 2>/dev/null || true',
+          "(command -v python3 && python3 -V) 2>/dev/null || true",
       },
       {
         label: "agent-log-meta",
@@ -659,7 +656,7 @@ export class DockerExecutor {
       'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
       '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }';
     const restartCmd =
-      'OLD_PIDS="$(ps -eo pid,args | awk \'/[o]penhands\\.agent_server/ {print $1}\' | tr \'\\n\' \' \')"; ' +
+      "OLD_PIDS=\"$(ps -eo pid,args | awk '/[o]penhands\\.agent_server/ {print $1}' | tr '\\n' ' ')\"; " +
       'if [ -n "$OLD_PIDS" ]; then kill $OLD_PIDS >/dev/null 2>&1 || true; fi; ' +
       "sleep 0.2; " +
       `${resolvePythonCmd}; ` +

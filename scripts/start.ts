@@ -471,23 +471,14 @@ function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: 
   const configuredWorkerRaw = firstNonEmpty(process.env.WORKERPALS_LLM_ENDPOINT);
 
   const remoteBackend =
-    normalizeLlmBackend(
-      firstNonEmpty(
-        process.env.REMOTEBUDDY_LLM_BACKEND,
-      ),
-    ) ?? configuredLlmBackend(configuredRemoteRaw || DEFAULT_LMSTUDIO_ENDPOINT);
+    normalizeLlmBackend(firstNonEmpty(process.env.REMOTEBUDDY_LLM_BACKEND)) ??
+    configuredLlmBackend(configuredRemoteRaw || DEFAULT_LMSTUDIO_ENDPOINT);
   const localBackend =
-    normalizeLlmBackend(
-      firstNonEmpty(
-        process.env.LOCALBUDDY_LLM_BACKEND,
-      ),
-    ) ?? configuredLlmBackend(configuredLocalRaw || DEFAULT_LMSTUDIO_ENDPOINT);
+    normalizeLlmBackend(firstNonEmpty(process.env.LOCALBUDDY_LLM_BACKEND)) ??
+    configuredLlmBackend(configuredLocalRaw || DEFAULT_LMSTUDIO_ENDPOINT);
   const workerBackend =
-    normalizeLlmBackend(
-      firstNonEmpty(
-        process.env.WORKERPALS_LLM_BACKEND,
-      ),
-    ) ?? configuredLlmBackend(configuredWorkerRaw || DEFAULT_LMSTUDIO_ENDPOINT);
+    normalizeLlmBackend(firstNonEmpty(process.env.WORKERPALS_LLM_BACKEND)) ??
+    configuredLlmBackend(configuredWorkerRaw || DEFAULT_LMSTUDIO_ENDPOINT);
 
   const remoteFallback =
     remoteBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
@@ -519,9 +510,18 @@ function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: 
     out.push({ name, endpoint: normalized, probes: Array.from(new Set(probes)) });
   };
 
-  addTarget("RemoteBuddy LLM", normalizeEndpointForBackend(configuredRemoteRaw, remoteFallback, remoteBackend));
-  addTarget("LocalBuddy LLM", normalizeEndpointForBackend(configuredLocalRaw, localFallback, localBackend));
-  addTarget("WorkerPal LLM", normalizeEndpointForBackend(configuredWorkerRaw, workerFallback, workerBackend));
+  addTarget(
+    "RemoteBuddy LLM",
+    normalizeEndpointForBackend(configuredRemoteRaw, remoteFallback, remoteBackend),
+  );
+  addTarget(
+    "LocalBuddy LLM",
+    normalizeEndpointForBackend(configuredLocalRaw, localFallback, localBackend),
+  );
+  addTarget(
+    "WorkerPal LLM",
+    normalizeEndpointForBackend(configuredWorkerRaw, workerFallback, workerBackend),
+  );
 
   return out;
 }
@@ -931,7 +931,11 @@ async function delay(ms: number): Promise<void> {
   await new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-async function waitForServerHealth(baseUrl: string, deadlineMs: number, pollMs: number): Promise<boolean> {
+async function waitForServerHealth(
+  baseUrl: string,
+  deadlineMs: number,
+  pollMs: number,
+): Promise<boolean> {
   const healthUrl = `${baseUrl}/healthz`;
   while (Date.now() < deadlineMs) {
     const result = await startupFetchJson(healthUrl, { method: "GET" }, 1_500);
@@ -949,11 +953,7 @@ async function waitForOnlineWorker(
 ): Promise<boolean> {
   const workersUrl = `${baseUrl}/workers`;
   while (Date.now() < deadlineMs) {
-    const result = await startupFetchJson(
-      workersUrl,
-      { method: "GET", headers },
-      2_500,
-    );
+    const result = await startupFetchJson(workersUrl, { method: "GET", headers }, 2_500);
     if (result.ok && Array.isArray(result.json?.workers)) {
       const anyOnline = result.json.workers.some((worker: any) => worker?.isOnline === true);
       if (anyOnline) return true;
@@ -994,7 +994,9 @@ async function waitForWarmupJobTerminal(
         (row: any) => row && typeof row === "object" && String(row.id ?? "") === jobId,
       ) as Record<string, unknown> | undefined;
       if (job) {
-        const status = String(job.status ?? "").trim().toLowerCase();
+        const status = String(job.status ?? "")
+          .trim()
+          .toLowerCase();
         if (status === "completed") {
           console.log(`[start] Startup warmup job ${jobId} completed.`);
           return;
@@ -1191,7 +1193,7 @@ async function collectWorkerWarmContainersForRepo(): Promise<string[]> {
       "docker",
       "inspect",
       "-f",
-      "{{.Name}}||{{index .Config.Labels \"pushpals.repo\"}}||{{range .Mounts}}{{.Source}};;{{end}}",
+      '{{.Name}}||{{index .Config.Labels "pushpals.repo"}}||{{range .Mounts}}{{.Source}};;{{end}}',
       id,
     ]);
     if (!inspected.ok) continue;
@@ -1550,7 +1552,9 @@ async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
 
   const status = await gitInScm(["status", "--porcelain"]);
   if (!status.ok) {
-    console.error("[start] Failed to read SourceControlManager worktree status before branch sync.");
+    console.error(
+      "[start] Failed to read SourceControlManager worktree status before branch sync.",
+    );
     console.error(status.stderr || status.stdout);
     abortStart(status.exitCode || 1);
   }

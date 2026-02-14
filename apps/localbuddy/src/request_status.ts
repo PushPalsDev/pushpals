@@ -103,7 +103,9 @@ export function extractReferencedJobToken(input: string): string | null {
 }
 
 function isJobStatusPrompt(input: string): boolean {
-  const text = String(input ?? "").trim().toLowerCase();
+  const text = String(input ?? "")
+    .trim()
+    .toLowerCase();
   if (!text) return false;
   if (extractReferencedJobToken(text)) return true;
 
@@ -116,7 +118,9 @@ function isJobStatusPrompt(input: string): boolean {
 }
 
 export function isStatusLookupPrompt(input: string): boolean {
-  const text = String(input ?? "").trim().toLowerCase();
+  const text = String(input ?? "")
+    .trim()
+    .toLowerCase();
   if (!text) return false;
 
   if (extractReferencedRequestToken(text)) return true;
@@ -164,7 +168,10 @@ function startedIsoForJob(job: JobApiRow): string | null {
   return job.startedAt ?? job.claimedAt ?? job.enqueuedAt ?? job.createdAt ?? null;
 }
 
-function parseStructuredError(raw: string | null, summarizeFailure: (value: unknown) => string): string {
+function parseStructuredError(
+  raw: string | null,
+  summarizeFailure: (value: unknown) => string,
+): string {
   if (!raw) return "";
   const parsed = tryParseJsonObject(raw);
   if (parsed) {
@@ -373,7 +380,8 @@ export function buildRequestStatusReply(args: {
         : `I couldn't find request ${requestedToken}.`;
     }
   } else {
-    request = requests.find((row) => row.status === "pending" || row.status === "claimed") ?? requests[0];
+    request =
+      requests.find((row) => row.status === "pending" || row.status === "claimed") ?? requests[0];
   }
 
   if (!request) {

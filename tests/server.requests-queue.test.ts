@@ -72,14 +72,22 @@ describe("server RequestQueue", () => {
   test("computes request SLO summary for recent terminal requests", () => {
     const queue = new RequestQueue(":memory:");
 
-    const first = queue.enqueue({ sessionId: "dev", prompt: "first request", priority: "interactive" });
+    const first = queue.enqueue({
+      sessionId: "dev",
+      prompt: "first request",
+      priority: "interactive",
+    });
     expect(first.ok).toBe(true);
     const firstClaim = queue.claim("remotebuddy-orchestrator");
     expect(firstClaim.ok).toBe(true);
     const firstComplete = queue.complete(first.requestId!, { result: { ok: true } });
     expect(firstComplete.ok).toBe(true);
 
-    const second = queue.enqueue({ sessionId: "dev", prompt: "second request", priority: "normal" });
+    const second = queue.enqueue({
+      sessionId: "dev",
+      prompt: "second request",
+      priority: "normal",
+    });
     expect(second.ok).toBe(true);
     const secondClaim = queue.claim("remotebuddy-orchestrator");
     expect(secondClaim.ok).toBe(true);

@@ -97,4 +97,3 @@ describe("RemoteBuddy AgentBrain planner", () => {
     expect(plan.worker_instruction).toBe(userText);
   });
 });
-

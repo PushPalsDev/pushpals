@@ -175,7 +175,8 @@ function isTimeoutFailureError(errorPayload: string | null): boolean {
     const parsed = JSON.parse(errorPayload) as unknown;
     if (parsed && typeof parsed === "object") {
       const record = parsed as Record<string, unknown>;
-      haystack = `${String(record.message ?? "")} ${String(record.detail ?? "")}`.trim() || errorPayload;
+      haystack =
+        `${String(record.message ?? "")} ${String(record.detail ?? "")}`.trim() || errorPayload;
     }
   } catch {
     // Keep raw payload fallback.
@@ -202,7 +203,7 @@ export class JobQueue {
   }
 
   private _migrate(): void {
-      this.db.exec(`
+    this.db.exec(`
         CREATE TABLE IF NOT EXISTS jobs (
           id                  TEXT PRIMARY KEY,
           taskId              TEXT NOT NULL,
@@ -274,9 +275,7 @@ export class JobQueue {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
     }
     if (!jobColumns.some((col) => col.name === "queueWaitBudgetMs")) {
-      this.db.exec(
-        `ALTER TABLE jobs ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`,
-      );
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`);
     }
     if (!jobColumns.some((col) => col.name === "executionBudgetMs")) {
       this.db.exec(
@@ -312,7 +311,9 @@ export class JobQueue {
 
     // Column-dependent indexes are created after legacy column backfills complete.
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);`);
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`);
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`,
+    );
 
     this.db.exec(`
       UPDATE jobs
@@ -460,7 +461,12 @@ export class JobQueue {
 
     const queuePosition = this.queuePosition(jobId, targetWorkerId);
     const etaMs = this.estimateEtaMs(priority, queuePosition);
-    return { ok: true, jobId, queuePosition: queuePosition ?? undefined, etaMs: etaMs ?? undefined };
+    return {
+      ok: true,
+      jobId,
+      queuePosition: queuePosition ?? undefined,
+      etaMs: etaMs ?? undefined,
+    };
   }
 
   claim(workerIdRaw: string): {
@@ -535,7 +541,7 @@ export class JobQueue {
 
       const queueWaitMs = Math.max(
         0,
-        Math.floor((Date.parse(now) - Date.parse(row.enqueuedAt || row.createdAt || now)) || 0),
+        Math.floor(Date.parse(now) - Date.parse(row.enqueuedAt || row.createdAt || now) || 0),
       );
 
       return {
@@ -752,7 +758,9 @@ export class JobQueue {
   }
 
   recoverStaleClaimedJobs(staleAfterMs: number, limit = 100): RecoveredStaleJob[] {
-    const ttlMs = Number.isFinite(staleAfterMs) ? Math.max(5_000, Math.floor(staleAfterMs)) : 120_000;
+    const ttlMs = Number.isFinite(staleAfterMs)
+      ? Math.max(5_000, Math.floor(staleAfterMs))
+      : 120_000;
     const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(500, Math.floor(limit))) : 100;
     const nowMs = Date.now();
     const cutoff = new Date(nowMs - ttlMs).toISOString();
@@ -819,12 +827,11 @@ export class JobQueue {
         const activityMs = parseIsoMs(row.activityAt) ?? parseIsoMs(row.jobUpdatedAt) ?? nowMs;
         const heartbeatMs = parseIsoMs(row.workerLastHeartbeat);
         const activityAgeMs = Math.max(0, nowMs - activityMs);
-        const heartbeatAgeMs = heartbeatMs == null ? Number.POSITIVE_INFINITY : Math.max(0, nowMs - heartbeatMs);
+        const heartbeatAgeMs =
+          heartbeatMs == null ? Number.POSITIVE_INFINITY : Math.max(0, nowMs - heartbeatMs);
 
         const workerAligned =
-          !!row.workerId &&
-          row.workerStatus === "busy" &&
-          row.workerCurrentJobId === row.jobId;
+          !!row.workerId && row.workerStatus === "busy" && row.workerCurrentJobId === row.jobId;
 
         const executionBudgetMs =
           typeof row.executionBudgetMs === "number" && Number.isFinite(row.executionBudgetMs)
@@ -953,10 +960,7 @@ export class JobQueue {
       .all() as JobRow[];
   }
 
-  listJobs(options?: {
-    status?: JobStatus | "all";
-    limit?: number;
-  }): JobRow[] {
+  listJobs(options?: { status?: JobStatus | "all"; limit?: number }): JobRow[] {
     const status = options?.status ?? "all";
     const limit =
       typeof options?.limit === "number" && Number.isFinite(options.limit)
@@ -1018,9 +1022,9 @@ export class JobQueue {
   ): Array<{ id: string; priority: JobPriority; position: number; etaMs: number }> {
     const ordered = this.pendingOrderedIds().slice(0, Math.max(1, Math.min(limit, 50)));
     return ordered.map((id, idx) => {
-      const row = this.db
-        .prepare(`SELECT priority FROM jobs WHERE id = ?`)
-        .get(id) as { priority: string } | undefined;
+      const row = this.db.prepare(`SELECT priority FROM jobs WHERE id = ?`).get(id) as
+        | { priority: string }
+        | undefined;
       const priority = normalizeJobPriority(row?.priority);
       return {
         id,
@@ -1033,7 +1037,9 @@ export class JobQueue {
 
   sloSummary(windowHours = 24): JobSloSummary {
     const boundedWindowHours =
-      Number.isFinite(windowHours) && windowHours > 0 ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours))) : 24;
+      Number.isFinite(windowHours) && windowHours > 0
+        ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours)))
+        : 24;
     const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
     const rows = this.db
       .prepare(
@@ -1064,7 +1070,11 @@ export class JobQueue {
         failed += 1;
         if (isTimeoutFailureError(row.error)) timeoutFailures += 1;
       }
-      if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) {
+      if (
+        typeof row.durationMs === "number" &&
+        Number.isFinite(row.durationMs) &&
+        row.durationMs >= 0
+      ) {
         durationSamples.push(Math.round(row.durationMs));
       }
       const queueStart = parseIsoMs(row.enqueuedAt) ?? parseIsoMs(row.createdAt) ?? null;

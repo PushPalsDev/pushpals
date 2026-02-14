@@ -95,7 +95,8 @@ const basePort =
   parsePositiveInt(process.env.EXPO_DEV_SERVER_PORT) ??
   parsePositiveInt(process.env.PUSHPALS_CLIENT_PORT) ??
   DEFAULT_CLIENT_PORT;
-const maxScan = parsePositiveInt(process.env.PUSHPALS_CLIENT_PORT_SCAN_MAX) ?? DEFAULT_MAX_PORT_SCAN;
+const maxScan =
+  parsePositiveInt(process.env.PUSHPALS_CLIENT_PORT_SCAN_MAX) ?? DEFAULT_MAX_PORT_SCAN;
 const selectedPort = (await findAvailablePort(basePort, maxScan)) ?? basePort;
 
 if (selectedPort !== basePort) {

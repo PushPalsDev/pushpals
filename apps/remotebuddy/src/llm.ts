@@ -228,7 +228,10 @@ function uniqueNonEmptyStrings(values: string[]): string[] {
 }
 
 function normalizeSessionTag(value: string): string {
-  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, "-");
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._:-]+/g, "-");
   const collapsed = normalized.replace(/-+/g, "-").replace(/^-|-$/g, "");
   if (!collapsed) return "default";
   return collapsed.length <= 96 ? collapsed : collapsed.slice(0, 96);
@@ -260,7 +263,15 @@ function stableConversationTag(service: LlmService, sessionId?: string): string 
 function pickConfiguredOrAvailableModel(
   configuredModel: string,
   availableModels: string[],
-): { model: string; source: "configured" | "available_fallback" | "available_default" | "configured_unverified" | "default_local_model" } {
+): {
+  model: string;
+  source:
+    | "configured"
+    | "available_fallback"
+    | "available_default"
+    | "configured_unverified"
+    | "default_local_model";
+} {
   const configured = configuredModel.trim();
   if (availableModels.length > 0) {
     if (configured) {
@@ -268,7 +279,10 @@ function pickConfiguredOrAvailableModel(
       const configuredBare = providerlessModelName(configured).toLowerCase();
       const matched = availableModels.find((candidate) => {
         const lower = candidate.toLowerCase();
-        return lower === configuredLower || providerlessModelName(candidate).toLowerCase() === configuredBare;
+        return (
+          lower === configuredLower ||
+          providerlessModelName(candidate).toLowerCase() === configuredBare
+        );
       });
       if (matched) return { model: matched, source: "configured" };
       return { model: availableModels[0], source: "available_fallback" };
@@ -683,7 +697,11 @@ export class LmStudioClient implements LLMClient {
 
     if (promptTokensEstimate > promptTokenBudget) {
       try {
-        const packed = await this.packContextInBatches(fullMessages, promptTokenBudget, contextWindow);
+        const packed = await this.packContextInBatches(
+          fullMessages,
+          promptTokenBudget,
+          contextWindow,
+        );
         messages = packed.messages;
         packedChunkCount = packed.chunkCount;
         promptTokensEstimate = sumEstimatedTokens(messages);
@@ -691,7 +709,10 @@ export class LmStudioClient implements LLMClient {
           const packedSystem = messages[0]?.content ?? "";
           const packedInput = messages
             .slice(1)
-            .map((message) => ({ role: message.role as LLMMessage["role"], content: message.content }));
+            .map((message) => ({
+              role: message.role as LLMMessage["role"],
+              content: message.content,
+            }));
           const packedTrimmed = trimLmStudioMessagesToBudget(
             packedSystem,
             packedInput,

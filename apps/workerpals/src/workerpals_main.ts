@@ -54,17 +54,11 @@ function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl:
     return value;
   };
 
-  const model = (
-    process.env.WORKERPALS_LLM_MODEL ?? DEFAULT_OPENHANDS_MODEL
-  )
+  const model = (process.env.WORKERPALS_LLM_MODEL ?? DEFAULT_OPENHANDS_MODEL)
     .trim()
     .replace(/\s+/g, " ");
-  const provider = normalizeProvider(
-    process.env.WORKERPALS_LLM_BACKEND ?? "auto",
-  );
-  const baseUrl = (
-    process.env.WORKERPALS_LLM_ENDPOINT ?? ""
-  ).trim();
+  const provider = normalizeProvider(process.env.WORKERPALS_LLM_BACKEND ?? "auto");
+  const baseUrl = (process.env.WORKERPALS_LLM_ENDPOINT ?? "").trim();
 
   return {
     model: model || DEFAULT_OPENHANDS_MODEL,
@@ -133,7 +127,8 @@ function parseArgs(): {
     process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
   let dockerTimeout = parseDockerTimeoutMs(process.env.WORKERPALS_DOCKER_TIMEOUT_MS);
   let dockerIdleTimeout = parseInt(process.env.WORKERPALS_DOCKER_IDLE_TIMEOUT_MS ?? "600000", 10);
-  let dockerNetworkMode = (process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? "bridge").trim() || "bridge";
+  let dockerNetworkMode =
+    (process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? "bridge").trim() || "bridge";
   let worktreeBaseRef = process.env.WORKERPALS_BASE_REF ?? `origin/${integrationBranchName()}`;
   let labels = (process.env.WORKERPALS_LABELS ?? "")
     .split(",")
@@ -213,7 +208,10 @@ function parseArgs(): {
     requireDocker,
     dockerImage,
     gitToken,
-    dockerTimeout: Number.isFinite(dockerTimeout) && dockerTimeout > 0 ? dockerTimeout : DEFAULT_DOCKER_TIMEOUT_MS,
+    dockerTimeout:
+      Number.isFinite(dockerTimeout) && dockerTimeout > 0
+        ? dockerTimeout
+        : DEFAULT_DOCKER_TIMEOUT_MS,
     dockerIdleTimeout:
       Number.isFinite(dockerIdleTimeout) && dockerIdleTimeout >= 0 ? dockerIdleTimeout : 600000,
     dockerNetworkMode,

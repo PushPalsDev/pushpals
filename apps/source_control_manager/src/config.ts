@@ -96,9 +96,11 @@ const DEFAULTS: SourceControlManagerConfig = {
     (process.env.SOURCE_CONTROL_MANAGER_DISABLE_AUTO_PR ?? "").toLowerCase(),
   ),
   prBaseBranch:
-    (process.env.SOURCE_CONTROL_MANAGER_PR_BASE_BRANCH ??
+    (
+      process.env.SOURCE_CONTROL_MANAGER_PR_BASE_BRANCH ??
       process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ??
-      "").trim() || "main",
+      ""
+    ).trim() || "main",
   prTitle: (process.env.SOURCE_CONTROL_MANAGER_PR_TITLE ?? "").trim() || undefined,
   prBody: (process.env.SOURCE_CONTROL_MANAGER_PR_BODY ?? "").trim() || undefined,
   prDraft: TRUTHY.has((process.env.SOURCE_CONTROL_MANAGER_PR_DRAFT ?? "").toLowerCase()),

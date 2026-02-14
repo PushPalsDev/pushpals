@@ -42,16 +42,16 @@ const requestB: RequestApiRow = {
 describe("localbuddy request status intent", () => {
   test("extracts short and full request IDs", () => {
     expect(extractReferencedRequestToken("my request is e11225b1")).toBe("e11225b1");
-    expect(
-      extractReferencedRequestToken("check e11225b1-1111-4111-8111-111111111111"),
-    ).toBe("e11225b1-1111-4111-8111-111111111111");
+    expect(extractReferencedRequestToken("check e11225b1-1111-4111-8111-111111111111")).toBe(
+      "e11225b1-1111-4111-8111-111111111111",
+    );
   });
 
   test("extracts short and full job IDs", () => {
     expect(extractReferencedJobToken("status of job 7c7683fa")).toBe("7c7683fa");
-    expect(
-      extractReferencedJobToken("status of job 7c7683fa-3333-4333-8333-333333333333"),
-    ).toBe("7c7683fa-3333-4333-8333-333333333333");
+    expect(extractReferencedJobToken("status of job 7c7683fa-3333-4333-8333-333333333333")).toBe(
+      "7c7683fa-3333-4333-8333-333333333333",
+    );
   });
 
   test("detects status-like prompts", () => {
