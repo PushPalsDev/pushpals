@@ -1162,8 +1162,7 @@ async function main() {
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
 
   // ── Initialise LLM + brain ──
-  const llm = createLLMClient({ service: "remotebuddy", sessionId: opts.sessionId ?? undefined });
-  const brain = new AgentBrain(llm);
+  let brain: AgentBrain;
 
   // ── Initialise idempotency store ──
   const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
@@ -1178,6 +1177,9 @@ async function main() {
   console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
   sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
+
+  const llm = createLLMClient({ service: "remotebuddy", sessionId });
+  brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
     server: opts.server,

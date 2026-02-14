@@ -234,10 +234,22 @@ function normalizeSessionTag(value: string): string {
   return collapsed.length <= 96 ? collapsed : collapsed.slice(0, 96);
 }
 
+function serviceSessionOverride(service: LlmService): string | null {
+  switch (service) {
+    case "localbuddy":
+      return firstNonEmpty(process.env.LOCALBUDDY_LLM_SESSION_ID);
+    case "remotebuddy":
+      return firstNonEmpty(process.env.REMOTEBUDDY_LLM_SESSION_ID);
+    case "workerpals":
+      return firstNonEmpty(process.env.WORKERPALS_LLM_SESSION_ID);
+  }
+}
+
 function stableConversationTag(service: LlmService, sessionId?: string): string {
   const source =
     firstNonEmpty(
       sessionId,
+      serviceSessionOverride(service),
       process.env.PUSHPALS_LLM_SESSION_ID,
       process.env.PUSHPALS_SESSION_ID,
       "default",
