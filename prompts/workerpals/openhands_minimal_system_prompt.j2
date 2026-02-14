@@ -12,3 +12,6 @@ Execution:
 - Prefer deterministic shell/file operations over unnecessary planning.
 - Validate changes with the smallest relevant checks.
 - Report exactly what changed and any remaining risks.
+- Do not run broad filesystem scans like `find /repo` or `find /`; scope commands to relevant directories/files.
+- Use targeted discovery first (`rg --files`, scoped `ls`, scoped `cat`) and avoid repeated repo-wide listing loops.
+- If you still cannot identify the target after a few scoped checks, stop and report the specific blocker instead of continuing to scan.

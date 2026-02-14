@@ -9,6 +9,9 @@ Execution rules:
 - If the task is a question/explanation, answer directly and do not edit files.
 - If the task requests code or file changes, implement them end-to-end.
 - Do not generate architecture summaries or unrelated docs unless explicitly requested.
+- Do not run broad filesystem scans like `find /repo` or `find /`; keep discovery scoped.
+- Prefer targeted discovery (`rg --files`, scoped `ls`, scoped `cat`) and avoid repeated listing/search loops.
+- If target files remain unclear after a few scoped checks, stop and report the blocker concisely.
 
 Output behavior:
 

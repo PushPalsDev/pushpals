@@ -17,6 +17,60 @@ const MAX_OUTPUT = 256 * 1024;
 const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 const CONFIG = loadPushPalsConfig();
 
+function classifyShellCommand(cmd: string): "explore" | "progress" {
+  const trimmed = cmd.trim().toLowerCase();
+  if (!trimmed) return "explore";
+  const token = trimmed.split(/\s+/, 1)[0] ?? "";
+  if (
+    token === "ls" ||
+    token === "find" ||
+    token === "rg" ||
+    token === "grep" ||
+    token === "cat" ||
+    token === "head" ||
+    token === "tail" ||
+    token === "sed" ||
+    token === "awk"
+  ) {
+    return "explore";
+  }
+  if (token === "git") {
+    if (
+      /\bgit\s+(status|log|show|diff|branch|rev-parse|ls-files)\b/.test(trimmed) ||
+      /\bgit\s+grep\b/.test(trimmed)
+    ) {
+      return "explore";
+    }
+  }
+  return "progress";
+}
+
+function classifyFileEditorSummary(line: string): "explore" | "progress" | null {
+  const lowered = line.toLowerCase();
+  if (!lowered.startsWith("summary: file_editor")) return null;
+  if (
+    lowered.includes('"command": "view"') ||
+    lowered.includes('"command":"view"') ||
+    lowered.includes('"command": "list"') ||
+    lowered.includes('"command":"list"')
+  ) {
+    return "explore";
+  }
+  if (
+    lowered.includes('"command": "create"') ||
+    lowered.includes('"command":"create"') ||
+    lowered.includes('"command": "str_replace"') ||
+    lowered.includes('"command":"str_replace"') ||
+    lowered.includes('"command": "insert"') ||
+    lowered.includes('"command":"insert"') ||
+    lowered.includes('"command": "delete"') ||
+    lowered.includes('"command":"delete"')
+  ) {
+    return "progress";
+  }
+  return null;
+}
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 export function shouldCommit(kind: string): boolean {
@@ -248,9 +302,55 @@ async function executeWithOpenHands(
     let timeoutDeadlineMs = startedAtMs + timeoutMs;
     let extendedByActivityMs = 0;
     let timedOutAfterMs = timeoutMs;
+    const stuckGuardEnabled = CONFIG.workerpals.openhandsStuckGuardEnabled;
+    const stuckExploreLimit = CONFIG.workerpals.openhandsStuckGuardExploreLimit;
+    const stuckMinElapsedMs = CONFIG.workerpals.openhandsStuckGuardMinElapsedMs;
+    const stuckBroadScanLimit = CONFIG.workerpals.openhandsStuckGuardBroadScanLimit;
+    let exploreOps = 0;
+    let progressOps = 0;
+    let broadRepoScans = 0;
+    let stuckGuardTriggered = false;
+    let stuckGuardReason = "";
+    let stuckGuardAfterMs = 0;
 
     const onProcessLine = (stream: "stdout" | "stderr", line: string) => {
       lastActivityAtMs = Date.now();
+      const trimmed = line.trim();
+      if (trimmed.startsWith("$ ")) {
+        const commandText = trimmed.slice(2).trim();
+        if (classifyShellCommand(commandText) === "explore") {
+          exploreOps += 1;
+        } else {
+          progressOps += 1;
+        }
+        const lowered = commandText.toLowerCase();
+        if (/\bfind\s+\/repo\b/.test(lowered) || /\bfind\s+\/\b/.test(lowered)) {
+          broadRepoScans += 1;
+        }
+      }
+      const fileEditorClass = classifyFileEditorSummary(trimmed);
+      if (fileEditorClass === "explore") exploreOps += 1;
+      if (fileEditorClass === "progress") progressOps += 1;
+
+      if (!stuckGuardTriggered && stuckGuardEnabled && progressOps === 0) {
+        const elapsedMs = Date.now() - startedAtMs;
+        const tooManyExplores = elapsedMs >= stuckMinElapsedMs && exploreOps >= stuckExploreLimit;
+        const tooManyBroadScans = broadRepoScans >= stuckBroadScanLimit;
+        if (tooManyExplores || tooManyBroadScans) {
+          stuckGuardTriggered = true;
+          stuckGuardAfterMs = elapsedMs;
+          stuckGuardReason = tooManyBroadScans
+            ? `repeated broad filesystem scans (count=${broadRepoScans}) with no edits/tests`
+            : `repeated exploratory actions (count=${exploreOps}) with no edits/tests`;
+          onLog?.(
+            "stderr",
+            `[OpenHandsExecutor] Stuck guard triggered after ${stuckGuardAfterMs}ms: ${stuckGuardReason}. Terminating wrapper process early.`,
+          );
+          try {
+            proc.kill();
+          } catch (_e) {}
+        }
+      }
       onLog?.(stream, line);
     };
 
@@ -346,6 +446,15 @@ async function executeWithOpenHands(
       .trim();
 
     if (!parsed) {
+      if (stuckGuardTriggered) {
+        return {
+          ok: false,
+          summary: `OpenHands execution aborted by stuck guard after ${stuckGuardAfterMs}ms (${stuckGuardReason}).`,
+          stdout: truncate(filteredStdout),
+          stderr: truncate(stderr),
+          exitCode: exitCode === 0 ? 124 : exitCode,
+        };
+      }
       if (timedOut) {
         return {
           ok: false,

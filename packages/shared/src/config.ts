@@ -83,6 +83,10 @@ export interface PushPalsConfig {
     executor: string;
     openhandsPython: string;
     openhandsTimeoutMs: number;
+    openhandsStuckGuardEnabled: boolean;
+    openhandsStuckGuardExploreLimit: number;
+    openhandsStuckGuardMinElapsedMs: number;
+    openhandsStuckGuardBroadScanLimit: number;
     requirePush: boolean;
     pushAgentBranch: boolean;
     requireDocker: boolean;
@@ -498,6 +502,33 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       1_800_000,
     ),
   );
+  const workerOpenHandsStuckGuardEnabled =
+    parseBoolEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_ENABLED") ??
+    asBoolean(workerNode.openhands_stuck_guard_enabled, true);
+  const workerOpenHandsStuckGuardExploreLimit = Math.max(
+    6,
+    asInt(
+      parseIntEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_EXPLORE_LIMIT") ??
+        workerNode.openhands_stuck_guard_explore_limit,
+      18,
+    ),
+  );
+  const workerOpenHandsStuckGuardMinElapsedMs = Math.max(
+    60_000,
+    asInt(
+      parseIntEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_MIN_ELAPSED_MS") ??
+        workerNode.openhands_stuck_guard_min_elapsed_ms,
+      180_000,
+    ),
+  );
+  const workerOpenHandsStuckGuardBroadScanLimit = Math.max(
+    1,
+    asInt(
+      parseIntEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_BROAD_SCAN_LIMIT") ??
+        workerNode.openhands_stuck_guard_broad_scan_limit,
+      2,
+    ),
+  );
   const workerRequirePush =
     parseBoolEnv("WORKERPALS_REQUIRE_PUSH") ?? asBoolean(workerNode.require_push, false);
   const workerPushAgentBranchEnv = parseBoolEnv("WORKERPALS_PUSH_AGENT_BRANCH");
@@ -879,6 +910,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       executor: workerExecutor,
       openhandsPython: workerOpenHandsPython,
       openhandsTimeoutMs: workerOpenHandsTimeoutMs,
+      openhandsStuckGuardEnabled: workerOpenHandsStuckGuardEnabled,
+      openhandsStuckGuardExploreLimit: workerOpenHandsStuckGuardExploreLimit,
+      openhandsStuckGuardMinElapsedMs: workerOpenHandsStuckGuardMinElapsedMs,
+      openhandsStuckGuardBroadScanLimit: workerOpenHandsStuckGuardBroadScanLimit,
       requirePush: workerRequirePush,
       pushAgentBranch: workerPushAgentBranch,
       requireDocker:

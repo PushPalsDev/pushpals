@@ -16,6 +16,10 @@ endpoint = "http://127.0.0.1:1234"
 [workerpals]
 docker_image = "pushpals-worker-sandbox:latest"
 openhands_timeout_ms = 1800000
+openhands_stuck_guard_enabled = true
+openhands_stuck_guard_explore_limit = 18
+openhands_stuck_guard_min_elapsed_ms = 180000
+openhands_stuck_guard_broad_scan_limit = 2
 docker_warm_memory_mb = 2048
 docker_warm_cpus = 2
 
