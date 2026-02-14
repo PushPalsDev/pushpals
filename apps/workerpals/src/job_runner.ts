@@ -16,6 +16,7 @@
  */
 
 import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
+import { loadPushPalsConfig } from "shared";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -50,7 +51,7 @@ function log(stream: "stdout" | "stderr", line: string): void {
 // ─── Git credentials setup ──────────────────────────────────────────────────
 
 function setupGitCredentials(): void {
-  const token = process.env.GIT_TOKEN;
+  const token = loadPushPalsConfig().gitToken ?? process.env.GIT_TOKEN ?? null;
   if (!token) return;
 
   try {

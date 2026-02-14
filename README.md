@@ -169,74 +169,41 @@ Then it starts full dev stack via `dev:full`.
 - `bun run source_control_manager:only`: SourceControlManager daemon
 - `bun run source_control_manager:only:dev`: same, with clean-check bypass
 
-## Core Environment Variables
+## Configuration Model
 
-See `.env.example` for full details. Most important:
+PushPals now uses typed TOML config as the canonical source of defaults.
 
-- `PUSHPALS_SESSION_ID`
-- `PUSHPALS_AUTH_TOKEN`
-- `PUSHPALS_INTEGRATION_BRANCH` (default `main_agents`)
-- `PUSHPALS_INTEGRATION_BASE_BRANCH` (default `main`)
-- `PUSHPALS_SYNC_INTEGRATION_WITH_MAIN` (default on during `bun run start`)
-- `SOURCE_CONTROL_MANAGER_MAIN_BRANCH`
-- `SOURCE_CONTROL_MANAGER_REPO_PATH`
-- `SOURCE_CONTROL_MANAGER_DISABLE_AUTO_PR` (set `1` to disable auto-PR)
-- `SOURCE_CONTROL_MANAGER_PR_BASE_BRANCH` (default `main`)
-- `SOURCE_CONTROL_MANAGER_PR_DRAFT`
-- `PUSHPALS_GIT_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` (or authenticated `gh` CLI via `gh auth login` for auto-PR fallback)
-- `REMOTEBUDDY_MAX_WORKERPALS`
-- `REMOTEBUDDY_AUTO_SPAWN_WORKERPALS`
-- `REMOTEBUDDY_WAIT_FOR_WORKERPAL_MS`
-- `WORKERPALS_EXECUTOR` (`openhands` default)
-- `WORKERPALS_DOCKER_IMAGE`
-- `WORKERPALS_REQUIRE_DOCKER`
-- `WORKERPALS_DOCKER_NETWORK_MODE` (default `bridge`; required for containerized access to host LLM endpoints)
-- `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` / `ALL_PROXY` (optional; forwarded to worker containers for internet/proxy access)
-- `WORKERPALS_OPENHANDS_ENABLE_BROWSER_TOOL` (optional BrowserToolSet via Playwright/browser-use)
-- `WORKERPALS_OPENHANDS_MCP_CONFIG_JSON` (optional full MCP config for external connectors)
-- `WORKERPALS_OPENHANDS_ENABLE_WEB_MCP` + `WORKERPALS_OPENHANDS_WEB_MCP_URL` (optional shortcut for one web/doc MCP connector)
-- `PUSHPALS_WORKER_IMAGE_REBUILD` (`auto` default; auto rebuild when worker image inputs change)
+- `config/default.toml`: committed baseline defaults
+- `config/<profile>.toml`: committed profile overrides (`dev`, `prod`, `ci`, etc.)
+- `config/local.toml`: gitignored machine-local overrides
+- `.env`: small and focused on wiring + secrets
 
-LLM defaults:
+Load order (last wins):
 
-- Supported backends are `lmstudio` and `ollama`
-- Canonical per-service LLM config:
-  - LocalBuddy: `LOCALBUDDY_LLM_BACKEND`, `LOCALBUDDY_LLM_ENDPOINT`, `LOCALBUDDY_LLM_MODEL`, `LOCALBUDDY_LLM_API_KEY`
-  - RemoteBuddy: `REMOTEBUDDY_LLM_BACKEND`, `REMOTEBUDDY_LLM_ENDPOINT`, `REMOTEBUDDY_LLM_MODEL`, `REMOTEBUDDY_LLM_API_KEY`
-  - WorkerPal/OpenHands: `WORKERPALS_LLM_BACKEND`, `WORKERPALS_LLM_ENDPOINT`, `WORKERPALS_LLM_MODEL`, `WORKERPALS_LLM_API_KEY`
-- For OpenHands/LiteLLM, WorkerPals auto-qualifies plain model names:
-  - `openai/<model>` for LM Studio/OpenAI-compatible backends
-  - `ollama/<model>` for Ollama backends
-- OpenHands task message shaping defaults to instruction-only to avoid 4k-context overflow:
-  - `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=none` (default)
-  - set `WORKERPALS_OPENHANDS_TASK_PROMPT_MODE=compact` to prepend `prompts/workerpals/openhands_task_execute_system_prompt.md`
-- Large OpenHands instructions can be file-handoffed to keep initial prompts short:
-  - `WORKERPALS_OPENHANDS_LARGE_INSTRUCTION_CHARS=1800` (default)
-  - when exceeded, WorkerPals writes full text to `workspace/workerpal_requests/*` and tells OpenHands to read it first
-- OpenHands agent prompt profile can be minimized for local 4k-context models:
-  - `WORKERPALS_OPENHANDS_PROMPT_PROFILE=minimal` (default behavior for local endpoints)
-  - `WORKERPALS_OPENHANDS_PROMPT_PROFILE=default` to use OpenHands built-in templates
-- Optional browser automation toolset for agentic jobs:
-  - `WORKERPALS_OPENHANDS_ENABLE_BROWSER_TOOL=1`
-  - Worker Docker image includes Playwright + Chromium runtime
-- Optional MCP connectors for richer research/doc lookup:
-  - full config via `WORKERPALS_OPENHANDS_MCP_CONFIG_JSON` (FastMCP `mcpServers` schema)
-  - shortcut for one remote web connector:
-    - `WORKERPALS_OPENHANDS_ENABLE_WEB_MCP=1`
-    - `WORKERPALS_OPENHANDS_WEB_MCP_URL=<https://...>`
-    - optional: `WORKERPALS_OPENHANDS_WEB_MCP_NAME`, `WORKERPALS_OPENHANDS_WEB_MCP_TRANSPORT`, `WORKERPALS_OPENHANDS_WEB_MCP_AUTH_TOKEN`, `WORKERPALS_OPENHANDS_WEB_MCP_HEADERS_JSON`
-- `bun run start` preflights LLM connectivity and can auto-start LM Studio headless mode for localhost endpoints
-- Ollama is supported but is not auto-started by `bun run start`; run Ollama separately
-- LM Studio startup controls:
-  - `PUSHPALS_AUTO_START_LMSTUDIO=1` (default on)
-  - `PUSHPALS_LMSTUDIO_CLI=lms`
-  - `PUSHPALS_LMSTUDIO_PORT` (optional; defaults from `REMOTEBUDDY_LLM_ENDPOINT`)
-  - `PUSHPALS_LMSTUDIO_START_ARGS` (optional extra args for `lms server start`)
-  - `PUSHPALS_LMSTUDIO_READY_TIMEOUT_MS` (default `120000`)
+1. `config/default.toml`
+2. `config/<PUSHPALS_PROFILE>.toml`
+3. `config/local.toml`
+4. environment variables
+
+Use `.env` mainly for:
+
+- profile + URLs (`PUSHPALS_PROFILE`, `PUSHPALS_SERVER_URL`, Expo public URLs)
+- secrets (`PUSHPALS_AUTH_TOKEN`, `PUSHPALS_GIT_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`)
+- deployment wiring only (repo path/proxy wiring when needed)
+
+Service model settings are defined in TOML and can be overridden by env when needed:
+
+- `localbuddy.llm`
+- `remotebuddy.llm`
+- `workerpals.llm`
+- `workerpals.openhands`
+- `startup`
+
+See `.env.example` for the minimal env surface area.
 
 ## Rollout Guidance
 
-- Use one canonical config path per service (`LOCALBUDDY_*`, `REMOTEBUDDY_*`, `WORKERPALS_*`).
+- Use TOML as canonical config (`config/default.toml` + profiles); reserve env for secrets and deployment wiring.
 - Keep planner/worker contract strict (`schemaVersion: 2`, `lane`, `planning` budgets).
 - Roll out safely by session:
   1. Start with one session and verify LocalBuddy routing, queue ETA, and lifecycle timestamps.
@@ -258,3 +225,4 @@ LLM defaults:
 ## Status
 
 Under active development.
+

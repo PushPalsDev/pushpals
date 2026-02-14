@@ -12,7 +12,7 @@
  *
  * Usage:
  *   bun run src/remotebuddy_main.ts --server http://localhost:3001 [--sessionId <id>] [--token <auth>]
- *   Environment: REMOTEBUDDY_LLM_ENDPOINT | REMOTEBUDDY_LLM_MODEL | REMOTEBUDDY_LLM_API_KEY | REMOTEBUDDY_LLM_BACKEND
+ *   Defaults resolve from config/*.toml via shared config loader.
  */
 
 import type { CommandRequest } from "protocol";
@@ -21,11 +21,12 @@ import { Database } from "bun:sqlite";
 import { createLLMClient } from "./llm.js";
 import { AgentBrain } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
-import { CommunicationManager, detectRepoRoot } from "shared";
-import { resolve, join } from "path";
+import { CommunicationManager, detectRepoRoot, loadPushPalsConfig } from "shared";
 import { mkdirSync } from "fs";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
+
+const CONFIG = loadPushPalsConfig();
 
 function parseArgs(): {
   server: string;
@@ -33,9 +34,9 @@ function parseArgs(): {
   authToken: string | null;
 } {
   const args = process.argv.slice(2);
-  let server = "http://localhost:3001";
-  let sessionId: string | null = process.env.PUSHPALS_SESSION_ID ?? "dev";
-  let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
+  let server = CONFIG.server.url;
+  let sessionId: string | null = CONFIG.sessionId;
+  let authToken = CONFIG.authToken;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -178,31 +179,6 @@ function toSingleLine(value: unknown, max = 220): string {
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
-function envTruthy(name: string, fallback = false): boolean {
-  const raw = process.env[name];
-  if (raw == null) return fallback;
-  const text = raw.trim().toLowerCase();
-  return text === "1" || text === "true" || text === "yes" || text === "on";
-}
-
-function envInt(name: string, fallback: number): number {
-  const raw = parseInt(process.env[name] ?? "", 10);
-  return Number.isFinite(raw) ? raw : fallback;
-}
-
-function parseStatusHeartbeatMs(serviceEnvName: string, fallbackMs: number): number {
-  const raw = (
-    process.env[serviceEnvName] ??
-    process.env.PUSHPALS_STATUS_HEARTBEAT_MS ??
-    ""
-  ).trim();
-  if (!raw) return fallbackMs;
-  const parsed = parseInt(raw, 10);
-  if (!Number.isFinite(parsed)) return fallbackMs;
-  if (parsed <= 0) return 0;
-  return Math.max(30_000, parsed);
-}
-
 interface WorkerSnapshot {
   workerId: string;
   status: "idle" | "busy" | "error" | "offline";
@@ -340,46 +316,29 @@ class RemoteBuddyOrchestrator {
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
     this.jobsDbPath = opts.jobsDbPath;
-    this.workerOnlineTtlMs = Math.max(1_000, envInt("REMOTEBUDDY_WORKERPAL_ONLINE_TTL_MS", 15_000));
-    this.waitForWorkerMs = Math.max(0, envInt("REMOTEBUDDY_WAIT_FOR_WORKERPAL_MS", 15_000));
-    this.autoSpawnWorkers = envTruthy("REMOTEBUDDY_AUTO_SPAWN_WORKERPALS", true);
-    this.maxWorkers = Math.max(1, envInt("REMOTEBUDDY_MAX_WORKERPALS", 1));
-    this.workerStartupTimeoutMs = Math.max(
-      1_000,
-      envInt("REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS", 10_000),
-    );
-    this.spawnWorkerDocker = envTruthy("REMOTEBUDDY_WORKERPAL_DOCKER", true);
-    this.spawnWorkerRequireDocker = envTruthy("REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER", true);
-    this.spawnWorkerImage = (process.env.REMOTEBUDDY_WORKERPAL_IMAGE ?? "").trim() || null;
-    this.spawnWorkerPollMs = (() => {
-      const value = envInt("REMOTEBUDDY_WORKERPAL_POLL_MS", NaN);
-      return Number.isFinite(value) && value > 0 ? value : null;
-    })();
-    this.spawnWorkerHeartbeatMs = (() => {
-      const value = envInt("REMOTEBUDDY_WORKERPAL_HEARTBEAT_MS", NaN);
-      return Number.isFinite(value) && value > 0 ? value : null;
-    })();
-    this.spawnWorkerLabels = (process.env.REMOTEBUDDY_WORKERPAL_LABELS ?? "")
-      .split(",")
-      .map((label) => label.trim())
-      .filter(Boolean);
-    this.statusHeartbeatMs = parseStatusHeartbeatMs("REMOTEBUDDY_STATUS_HEARTBEAT_MS", 120_000);
-    this.executionBudgetInteractiveMs = Math.max(
-      60_000,
-      envInt("REMOTEBUDDY_EXECUTION_BUDGET_INTERACTIVE_MS", 300_000),
-    );
-    this.executionBudgetNormalMs = Math.max(
-      120_000,
-      envInt("REMOTEBUDDY_EXECUTION_BUDGET_NORMAL_MS", 900_000),
-    );
-    this.executionBudgetBackgroundMs = Math.max(
-      180_000,
-      envInt("REMOTEBUDDY_EXECUTION_BUDGET_BACKGROUND_MS", 1_800_000),
-    );
-    this.finalizationBudgetMs = Math.max(
-      30_000,
-      envInt("REMOTEBUDDY_FINALIZATION_BUDGET_MS", 120_000),
-    );
+    const remoteCfg = CONFIG.remotebuddy;
+    this.workerOnlineTtlMs = Math.max(1_000, remoteCfg.workerpalOnlineTtlMs);
+    this.waitForWorkerMs = Math.max(0, remoteCfg.waitForWorkerpalMs);
+    this.autoSpawnWorkers = remoteCfg.autoSpawnWorkerpals;
+    this.maxWorkers = Math.max(1, remoteCfg.maxWorkerpals);
+    this.workerStartupTimeoutMs = Math.max(1_000, remoteCfg.workerpalStartupTimeoutMs);
+    this.spawnWorkerDocker = remoteCfg.workerpalDocker;
+    this.spawnWorkerRequireDocker = remoteCfg.workerpalRequireDocker;
+    this.spawnWorkerImage = remoteCfg.workerpalImage;
+    this.spawnWorkerPollMs =
+      typeof remoteCfg.workerpalPollMs === "number" && remoteCfg.workerpalPollMs > 0
+        ? remoteCfg.workerpalPollMs
+        : null;
+    this.spawnWorkerHeartbeatMs =
+      typeof remoteCfg.workerpalHeartbeatMs === "number" && remoteCfg.workerpalHeartbeatMs > 0
+        ? remoteCfg.workerpalHeartbeatMs
+        : null;
+    this.spawnWorkerLabels = remoteCfg.workerpalLabels;
+    this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
+    this.executionBudgetInteractiveMs = Math.max(60_000, remoteCfg.executionBudgetInteractiveMs);
+    this.executionBudgetNormalMs = Math.max(120_000, remoteCfg.executionBudgetNormalMs);
+    this.executionBudgetBackgroundMs = Math.max(180_000, remoteCfg.executionBudgetBackgroundMs);
+    this.finalizationBudgetMs = Math.max(30_000, remoteCfg.finalizationBudgetMs);
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
@@ -1191,11 +1150,10 @@ async function main() {
   let brain: AgentBrain;
 
   // ── Initialise idempotency store ──
-  const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
-  const dataDir = process.env.PUSHPALS_DATA_DIR ?? join(PROJECT_ROOT, "outputs", "data");
+  const dataDir = CONFIG.paths.dataDir;
   mkdirSync(dataDir, { recursive: true });
-  const sharedDbPath = process.env.PUSHPALS_DB_PATH ?? join(dataDir, "pushpals.db");
-  const dbPath = process.env.REMOTEBUDDY_DB_PATH ?? join(dataDir, "remotebuddy-state.db");
+  const sharedDbPath = CONFIG.paths.sharedDbPath;
+  const dbPath = CONFIG.paths.remotebuddyDbPath;
   const idempotency = new IdempotencyStore(dbPath);
   console.log(`[RemoteBuddy] Idempotency store: ${dbPath}`);
 
@@ -1204,7 +1162,15 @@ async function main() {
   sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
-  const llm = createLLMClient({ service: "remotebuddy", sessionId });
+  const llmCfg = CONFIG.remotebuddy.llm;
+  const llm = createLLMClient({
+    service: "remotebuddy",
+    sessionId,
+    backend: llmCfg.backend,
+    endpoint: llmCfg.endpoint,
+    model: llmCfg.model,
+    apiKey: llmCfg.apiKey,
+  });
   brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
@@ -1221,7 +1187,7 @@ async function main() {
   orchestrator.startSessionEventMonitor();
 
   // Start polling for requests from the Request Queue
-  const pollMs = parseInt(process.env.REMOTEBUDDY_POLL_MS ?? "2000", 10);
+  const pollMs = CONFIG.remotebuddy.pollMs;
   orchestrator.startPolling(pollMs);
 }
 

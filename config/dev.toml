@@ -1,0 +1,2 @@
+[source_control_manager]
+skip_clean_check = true

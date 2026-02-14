@@ -28,6 +28,11 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+try:
+    import tomllib
+except Exception:  # pragma: no cover - python <3.11 fallback
+    tomllib = None  # type: ignore[assignment]
+
 
 RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ "
 PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
@@ -54,6 +59,8 @@ KNOWN_LITELLM_PROVIDER_PREFIXES: Set[str] = {
     "together_ai",
     "fireworks_ai",
 }
+
+_CONFIG_CACHE: Optional[Dict[str, Any]] = None
 
 
 class ManagedLocalAgentServer:
@@ -154,7 +161,118 @@ def _to_float(value: Any, default: float) -> float:
         return default
 
 
-def _is_truthy_env(name: str, default: bool = False) -> bool:
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        existing = out.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            out[key] = _deep_merge(existing, value)
+        else:
+            out[key] = value
+    return out
+
+
+def _repo_root_for_runtime_config() -> Path:
+    explicit = (os.environ.get("PUSHPALS_REPO_PATH") or "").strip()
+    if explicit:
+        return Path(explicit)
+    return Path(__file__).resolve().parents[3]
+
+
+def _parse_toml_file(path: Path) -> Dict[str, Any]:
+    if not path.exists() or not tomllib:
+        return {}
+    try:
+        parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _runtime_config() -> Dict[str, Any]:
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None:
+        return _CONFIG_CACHE
+
+    repo_root = _repo_root_for_runtime_config()
+    config_dir = repo_root / "config"
+    default_cfg = _parse_toml_file(config_dir / "default.toml")
+    profile = (
+        (os.environ.get("PUSHPALS_PROFILE") or "").strip()
+        or str(default_cfg.get("profile") or "").strip()
+        or "dev"
+    )
+    profile_cfg = _parse_toml_file(config_dir / f"{profile}.toml")
+    local_cfg = _parse_toml_file(config_dir / "local.toml")
+    _CONFIG_CACHE = _deep_merge(_deep_merge(default_cfg, profile_cfg), local_cfg)
+    return _CONFIG_CACHE
+
+
+def _config_get(path: str, default: Any = None) -> Any:
+    node: Any = _runtime_config()
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def _setting_str(name: str, config_path: str, default: str = "") -> str:
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        return raw
+    cfg = _config_get(config_path)
+    if cfg is None:
+        return default
+    if isinstance(cfg, str):
+        trimmed = cfg.strip()
+        return trimmed if trimmed else default
+    return str(cfg).strip() or default
+
+
+def _setting_int(name: str, config_path: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        return _to_int(raw, default)
+    cfg = _config_get(config_path, default)
+    return _to_int(cfg, default)
+
+
+def _setting_float(name: str, config_path: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        return _to_float(raw, default)
+    cfg = _config_get(config_path, default)
+    return _to_float(cfg, default)
+
+
+def _setting_bool(name: str, config_path: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is not None:
+        text = raw.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    cfg = _config_get(config_path, default)
+    if isinstance(cfg, bool):
+        return cfg
+    if isinstance(cfg, (int, float)):
+        return bool(cfg)
+    if isinstance(cfg, str):
+        text = cfg.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _is_truthy_env(name: str, default: bool = False, config_path: str = "") -> bool:
+    if config_path:
+        return _setting_bool(name, config_path, default)
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -173,12 +291,12 @@ def _safe_session_component(value: Any, fallback: str = "unknown") -> str:
 
 
 def _stable_llm_session_user(payload: Optional[Dict[str, Any]]) -> str:
-    override = (os.environ.get("WORKERPALS_LLM_SESSION_ID") or "").strip()
+    override = _setting_str("WORKERPALS_LLM_SESSION_ID", "workerpals.llm.session_id", "")
     if override:
         return _safe_session_component(override, "pushpals-worker")
 
     session_id = _safe_session_component(
-        (os.environ.get("PUSHPALS_SESSION_ID") or "").strip(), "session"
+        _setting_str("PUSHPALS_SESSION_ID", "session_id", ""), "session"
     )
     worker_id = _safe_session_component((payload or {}).get("workerId"), "worker")
     task_id = _safe_session_component((payload or {}).get("taskId"), "task")
@@ -223,7 +341,7 @@ def _session_hint_headers(session_user: str) -> Dict[str, str]:
 
 
 def _lmstudio_slot_id() -> Optional[int]:
-    raw = (os.environ.get("WORKERPALS_LMSTUDIO_SLOT_ID") or "").strip()
+    raw = _setting_str("WORKERPALS_LMSTUDIO_SLOT_ID", "workerpals.openhands.lmstudio_slot_id", "")
     if not raw:
         return None
     try:
@@ -279,7 +397,11 @@ def _json_object_from_env(name: str) -> Tuple[Optional[Dict[str, Any]], str]:
 def _python_cmd(script: str) -> str:
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     python_bin = shlex.quote(
-        str((os.environ.get("WORKERPALS_OPENHANDS_WORKSPACE_PYTHON") or "python3"))
+        _setting_str(
+            "WORKERPALS_OPENHANDS_WORKSPACE_PYTHON",
+            "workerpals.openhands.workspace_python",
+            "python3",
+        )
     )
     return (
         f"{python_bin} - <<'PY'\n"
@@ -354,9 +476,7 @@ def _model_is_provider_qualified(model: str) -> bool:
 
 
 def _infer_litellm_provider(base_url: str) -> str:
-    backend = (
-        os.environ.get("WORKERPALS_LLM_BACKEND") or ""
-    ).strip().lower()
+    backend = _setting_str("WORKERPALS_LLM_BACKEND", "workerpals.llm.backend", "").lower()
     if backend in {"ollama", "ollama_chat"}:
         return "ollama"
     if backend in {"lmstudio", "openai", "openai_compatible"}:
@@ -444,7 +564,11 @@ def _looks_local_base_url(base_url: str) -> bool:
 
 
 def _resolve_agent_server_url() -> str:
-    return (os.environ.get("WORKERPALS_OPENHANDS_AGENT_SERVER_URL") or "").strip()
+    return _setting_str(
+        "WORKERPALS_OPENHANDS_AGENT_SERVER_URL",
+        "workerpals.openhands.agent_server_url",
+        "",
+    )
 
 
 def _agent_health_url(base_url: str) -> str:
@@ -640,18 +764,27 @@ def _extract_first_json_object(raw: str) -> Dict[str, Any]:
 
 
 def _tool_preflight_enabled() -> bool:
-    return _is_truthy_env("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_ENABLED", True)
+    return _is_truthy_env(
+        "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_ENABLED",
+        True,
+        "workerpals.openhands.tool_preflight_enabled",
+    )
 
 
 def _tool_preflight_require_json() -> bool:
-    return _is_truthy_env("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_REQUIRE_JSON", True)
+    return _is_truthy_env(
+        "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_REQUIRE_JSON",
+        True,
+        "workerpals.openhands.tool_preflight_require_json",
+    )
 
 
 def _tool_preflight_timeout_sec() -> float:
     return max(
         5.0,
-        _to_float(
-            os.environ.get("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_TIMEOUT_SEC"),
+        _setting_float(
+            "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_TIMEOUT_SEC",
+            "workerpals.openhands.tool_preflight_timeout_sec",
             45.0,
         ),
     )
@@ -660,7 +793,11 @@ def _tool_preflight_timeout_sec() -> float:
 def _tool_preflight_max_tokens() -> int:
     return max(
         32,
-        _to_int(os.environ.get("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MAX_TOKENS"), 220),
+        _setting_int(
+            "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MAX_TOKENS",
+            "workerpals.openhands.tool_preflight_max_tokens",
+            220,
+        ),
     )
 
 
@@ -1009,20 +1146,9 @@ def _fallback_models_after_load_failure(
 
 
 def _resolve_llm_config() -> Tuple[str, str, str]:
-    raw_model = (
-        os.environ.get("WORKERPALS_LLM_MODEL")
-        or ""
-    ).strip()
-    api_key = (
-        os.environ.get("WORKERPALS_LLM_API_KEY")
-        or ""
-    ).strip()
-    raw_base_url = (
-        (
-            os.environ.get("WORKERPALS_LLM_ENDPOINT")
-            or ""
-        )
-    )
+    raw_model = _setting_str("WORKERPALS_LLM_MODEL", "workerpals.llm.model", "")
+    api_key = _setting_str("WORKERPALS_LLM_API_KEY", "workerpals.llm.api_key", "")
+    raw_base_url = _setting_str("WORKERPALS_LLM_ENDPOINT", "workerpals.llm.endpoint", "")
     provider = _infer_litellm_provider(raw_base_url)
     configured_model = _normalize_litellm_model(raw_model, provider)
     base_url = _normalize_base_url_for_provider(raw_base_url, provider)
@@ -1067,10 +1193,7 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
 
 
 def _repo_root_for_prompt_loading() -> Path:
-    explicit = (os.environ.get("PUSHPALS_REPO_PATH") or "").strip()
-    if explicit:
-        return Path(explicit)
-    return Path(__file__).resolve().parents[3]
+    return _repo_root_for_runtime_config()
 
 
 def _resolve_prompt_file(relative_path: str) -> Path:
@@ -1078,7 +1201,11 @@ def _resolve_prompt_file(relative_path: str) -> Path:
 
 
 def _resolve_agent_prompt_profile(base_url: str) -> str:
-    raw = (os.environ.get("WORKERPALS_OPENHANDS_PROMPT_PROFILE") or "").strip().lower()
+    raw = _setting_str(
+        "WORKERPALS_OPENHANDS_PROMPT_PROFILE",
+        "workerpals.openhands.prompt_profile",
+        "",
+    ).lower()
     if raw in {"default", "full", "standard"}:
         return "default"
     if raw in {"minimal", "compact", "small"}:
@@ -1106,7 +1233,21 @@ def _resolve_agent_prompt_overrides(base_url: str) -> Dict[str, Any]:
 
 def _resolve_mcp_config() -> Tuple[Optional[Dict[str, Any]], List[str]]:
     notes: List[str] = []
-    config, config_error = _json_object_from_env("WORKERPALS_OPENHANDS_MCP_CONFIG_JSON")
+    mcp_config_raw = _setting_str(
+        "WORKERPALS_OPENHANDS_MCP_CONFIG_JSON",
+        "workerpals.openhands.mcp_config_json",
+        "",
+    )
+    config, config_error = (None, "")
+    if mcp_config_raw:
+        try:
+            parsed = json.loads(mcp_config_raw)
+            if isinstance(parsed, dict):
+                config = parsed
+            else:
+                config_error = "expected a JSON object"
+        except Exception as exc:
+            config_error = f"invalid JSON ({exc})"
     if config_error:
         notes.append(
             "[OpenHandsExecutor] Ignoring WORKERPALS_OPENHANDS_MCP_CONFIG_JSON "
@@ -1114,10 +1255,18 @@ def _resolve_mcp_config() -> Tuple[Optional[Dict[str, Any]], List[str]]:
         )
         config = None
 
-    if not _is_truthy_env("WORKERPALS_OPENHANDS_ENABLE_WEB_MCP", False):
+    if not _is_truthy_env(
+        "WORKERPALS_OPENHANDS_ENABLE_WEB_MCP",
+        False,
+        "workerpals.openhands.enable_web_mcp",
+    ):
         return config, notes
 
-    web_url = (os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_URL") or "").strip()
+    web_url = _setting_str(
+        "WORKERPALS_OPENHANDS_WEB_MCP_URL",
+        "workerpals.openhands.web_mcp_url",
+        "",
+    )
     if not web_url:
         notes.append(
             "[OpenHandsExecutor] WORKERPALS_OPENHANDS_ENABLE_WEB_MCP=1 but "
@@ -1125,11 +1274,16 @@ def _resolve_mcp_config() -> Tuple[Optional[Dict[str, Any]], List[str]]:
         )
         return config, notes
 
-    server_name = (os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_NAME") or "").strip() or "web-search"
-    transport = (
-        (os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_TRANSPORT") or "").strip().lower()
-        or "streamable-http"
+    server_name = _setting_str(
+        "WORKERPALS_OPENHANDS_WEB_MCP_NAME",
+        "workerpals.openhands.web_mcp_name",
+        "web-search",
     )
+    transport = _setting_str(
+        "WORKERPALS_OPENHANDS_WEB_MCP_TRANSPORT",
+        "workerpals.openhands.web_mcp_transport",
+        "streamable-http",
+    ).lower()
     if transport == "streamable_http":
         transport = "streamable-http"
     if transport not in {"http", "streamable-http", "sse"}:
@@ -1148,7 +1302,11 @@ def _resolve_mcp_config() -> Tuple[Optional[Dict[str, Any]], List[str]]:
         headers = None
 
     auth_token = (os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_AUTH_TOKEN") or "").strip()
-    timeout_sec = _to_int(os.environ.get("WORKERPALS_OPENHANDS_WEB_MCP_TIMEOUT_SEC"), 0)
+    timeout_sec = _setting_int(
+        "WORKERPALS_OPENHANDS_WEB_MCP_TIMEOUT_SEC",
+        "workerpals.openhands.web_mcp_timeout_sec",
+        0,
+    )
 
     server_config: Dict[str, Any] = {"url": web_url, "transport": transport}
     if headers:
@@ -1177,7 +1335,11 @@ def _resolve_mcp_config() -> Tuple[Optional[Dict[str, Any]], List[str]]:
 
 
 def _browser_tool_enabled() -> bool:
-    return _is_truthy_env("WORKERPALS_OPENHANDS_ENABLE_BROWSER_TOOL", False)
+    return _is_truthy_env(
+        "WORKERPALS_OPENHANDS_ENABLE_BROWSER_TOOL",
+        False,
+        "workerpals.openhands.enable_browser_tool",
+    )
 
 
 def _load_prompt_template(
@@ -1233,7 +1395,11 @@ def _summarize_git_changes(repo: str) -> List[str]:
 
 
 def _large_instruction_threshold() -> int:
-    raw = (os.environ.get("WORKERPALS_OPENHANDS_LARGE_INSTRUCTION_CHARS") or "").strip()
+    raw = _setting_str(
+        "WORKERPALS_OPENHANDS_LARGE_INSTRUCTION_CHARS",
+        "workerpals.openhands.large_instruction_chars",
+        "",
+    )
     if not raw:
         return DEFAULT_LARGE_INSTRUCTION_CHARS
     try:
@@ -1246,7 +1412,11 @@ def _large_instruction_threshold() -> int:
 
 
 def _execution_timeout_ms() -> int:
-    raw = (os.environ.get("WORKERPALS_OPENHANDS_TIMEOUT_MS") or "").strip()
+    raw = _setting_str(
+        "WORKERPALS_OPENHANDS_TIMEOUT_MS",
+        "workerpals.openhands_timeout_ms",
+        "",
+    )
     default_ms = 1800000
     if not raw:
         return default_ms
@@ -1301,7 +1471,11 @@ def _build_agent_user_message(instruction: str) -> str:
         "what remains, and the blocker."
     )
 
-    mode = (os.environ.get("WORKERPALS_OPENHANDS_TASK_PROMPT_MODE") or "none").strip().lower()
+    mode = _setting_str(
+        "WORKERPALS_OPENHANDS_TASK_PROMPT_MODE",
+        "workerpals.openhands.task_prompt_mode",
+        "none",
+    ).lower()
     if mode in {"none", "off", "instruction_only", "instruction-only", "minimal"}:
         return f"{instruction}\n\n{timeout_note}"
 
@@ -1390,20 +1564,44 @@ def _run_agentic_task_execute(
         # Local model servers should fail fast on connectivity issues instead
         # of spending long retry windows that hit outer Docker timeouts.
         llm_kwargs_base["num_retries"] = max(
-            0, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_NUM_RETRIES"), 2)
+            0,
+            _setting_int(
+                "WORKERPALS_OPENHANDS_LLM_NUM_RETRIES",
+                "workerpals.openhands.llm_num_retries",
+                2,
+            ),
         )
         llm_kwargs_base["retry_multiplier"] = max(
-            1.0, _to_float(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MULTIPLIER"), 1.5)
+            1.0,
+            _setting_float(
+                "WORKERPALS_OPENHANDS_LLM_RETRY_MULTIPLIER",
+                "workerpals.openhands.llm_retry_multiplier",
+                1.5,
+            ),
         )
         llm_kwargs_base["retry_min_wait"] = max(
-            1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MIN_WAIT"), 1)
+            1,
+            _setting_int(
+                "WORKERPALS_OPENHANDS_LLM_RETRY_MIN_WAIT",
+                "workerpals.openhands.llm_retry_min_wait",
+                1,
+            ),
         )
         llm_kwargs_base["retry_max_wait"] = max(
             llm_kwargs_base["retry_min_wait"],
-            _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_RETRY_MAX_WAIT"), 4),
+            _setting_int(
+                "WORKERPALS_OPENHANDS_LLM_RETRY_MAX_WAIT",
+                "workerpals.openhands.llm_retry_max_wait",
+                4,
+            ),
         )
         llm_kwargs_base["timeout"] = max(
-            5, _to_int(os.environ.get("WORKERPALS_OPENHANDS_LLM_TIMEOUT_SEC"), 90)
+            5,
+            _setting_int(
+                "WORKERPALS_OPENHANDS_LLM_TIMEOUT_SEC",
+                "workerpals.openhands.llm_timeout_sec",
+                90,
+            ),
         )
         # LM Studio/llama.cpp can fail with n_keep >= n_ctx when large prompts
         # are cache-pinned. Disable prompt caching for local endpoints.
@@ -1445,7 +1643,14 @@ def _run_agentic_task_execute(
         )
         sys.stderr.flush()
     user_message = _build_agent_user_message(prepared_instruction)
-    max_steps = max(1, _to_int(os.environ.get("WORKERPALS_OPENHANDS_AGENT_MAX_STEPS"), 30))
+    max_steps = max(
+        1,
+        _setting_int(
+            "WORKERPALS_OPENHANDS_AGENT_MAX_STEPS",
+            "workerpals.openhands.agent_max_steps",
+            30,
+        ),
+    )
 
     provider = _infer_litellm_provider(base_url)
     models_to_try: List[str] = [model]
@@ -1453,7 +1658,12 @@ def _run_agentic_task_execute(
     last_error_text = ""
     preflight_failures: List[str] = []
     model_probe_timeout_sec = max(
-        3.0, _to_float(os.environ.get("WORKERPALS_OPENHANDS_MODEL_PROBE_TIMEOUT_SEC"), 10.0)
+        3.0,
+        _setting_float(
+            "WORKERPALS_OPENHANDS_MODEL_PROBE_TIMEOUT_SEC",
+            "workerpals.openhands.model_probe_timeout_sec",
+            10.0,
+        ),
     )
 
     while models_to_try:
@@ -1526,7 +1736,11 @@ def _run_agentic_task_execute(
             active_user_message = user_message
             if _tool_preflight_enabled():
                 preflight_model_raw = (
-                    os.environ.get("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MODEL") or ""
+                    _setting_str(
+                        "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MODEL",
+                        "workerpals.openhands.tool_preflight_model",
+                        "",
+                    )
                 ).strip()
                 preflight_model = (
                     _normalize_litellm_model(preflight_model_raw, provider)

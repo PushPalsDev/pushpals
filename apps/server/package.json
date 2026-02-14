@@ -8,7 +8,8 @@
     "start": "bun run src/server_main.ts"
   },
   "dependencies": {
-    "protocol": "workspace:*"
+    "protocol": "workspace:*",
+    "shared": "workspace:*"
   },
   "devDependencies": {
     "typescript": "~5.9.2",

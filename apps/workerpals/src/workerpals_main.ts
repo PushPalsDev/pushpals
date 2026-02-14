@@ -17,7 +17,7 @@ import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import { resolve } from "path";
-import { detectRepoRoot, loadPromptTemplate } from "shared";
+import { detectRepoRoot, loadPromptTemplate, loadPushPalsConfig } from "shared";
 import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
@@ -37,12 +37,8 @@ type WorkerJobResult = JobResult & {
   cooldownMs?: number;
 };
 
-const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const DEFAULT_OPENHANDS_MODEL = "local-model";
-
-function envTruthy(name: string): boolean {
-  return TRUTHY.has((process.env[name] ?? "").toLowerCase());
-}
+const CONFIG = loadPushPalsConfig();
 
 function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl: string } {
   const normalizeProvider = (raw: string): string => {
@@ -54,11 +50,9 @@ function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl:
     return value;
   };
 
-  const model = (process.env.WORKERPALS_LLM_MODEL ?? DEFAULT_OPENHANDS_MODEL)
-    .trim()
-    .replace(/\s+/g, " ");
-  const provider = normalizeProvider(process.env.WORKERPALS_LLM_BACKEND ?? "auto");
-  const baseUrl = (process.env.WORKERPALS_LLM_ENDPOINT ?? "").trim();
+  const model = CONFIG.workerpals.llm.model.trim().replace(/\s+/g, " ");
+  const provider = normalizeProvider(CONFIG.workerpals.llm.backend);
+  const baseUrl = CONFIG.workerpals.llm.endpoint.trim();
 
   return {
     model: model || DEFAULT_OPENHANDS_MODEL,
@@ -68,8 +62,9 @@ function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl:
 }
 
 function integrationBranchName(): string {
-  const configured = (process.env.PUSHPALS_INTEGRATION_BRANCH ?? "").trim();
-  return configured || "main_agents";
+  const configuredBaseRef = CONFIG.workerpals.baseRef.trim();
+  if (!configuredBaseRef) return "main_agents";
+  return configuredBaseRef.replace(/^origin\//, "").trim() || "main_agents";
 }
 
 function formatDurationMs(durationMs: number): string {
@@ -114,32 +109,22 @@ function parseArgs(): {
   failureCooldownMs: number;
 } {
   const args = process.argv.slice(2);
-  let server = "http://localhost:3001";
-  let pollMs = parseInt(process.env.WORKERPALS_POLL_MS ?? "2000", 10);
-  let heartbeatMs = parseInt(process.env.WORKERPALS_HEARTBEAT_MS ?? "5000", 10);
+  let server = CONFIG.server.url;
+  let pollMs = CONFIG.workerpals.pollMs;
+  let heartbeatMs = CONFIG.workerpals.heartbeatMs;
   let repo = detectRepoRoot(process.cwd());
   let workerId = `workerpal-${randomUUID().substring(0, 8)}`;
-  let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
+  let authToken = CONFIG.authToken;
   let docker = false;
-  let requireDocker = envTruthy("WORKERPALS_REQUIRE_DOCKER");
-  let dockerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? "pushpals-worker-sandbox:latest";
-  let gitToken =
-    process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
-  let dockerTimeout = parseDockerTimeoutMs(process.env.WORKERPALS_DOCKER_TIMEOUT_MS);
-  let dockerIdleTimeout = parseInt(process.env.WORKERPALS_DOCKER_IDLE_TIMEOUT_MS ?? "600000", 10);
-  let dockerNetworkMode =
-    (process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? "bridge").trim() || "bridge";
-  let worktreeBaseRef = process.env.WORKERPALS_BASE_REF ?? `origin/${integrationBranchName()}`;
-  let labels = (process.env.WORKERPALS_LABELS ?? "")
-    .split(",")
-    .map((label) => label.trim())
-    .filter(Boolean);
-  let failureCooldownMs = parseInt(
-    process.env.WORKERPALS_FAILURE_COOLDOWN_MS ??
-      process.env.WORKERPALS_DOCKER_FAILURE_COOLDOWN_MS ??
-      "20000",
-    10,
-  );
+  let requireDocker = CONFIG.workerpals.requireDocker;
+  let dockerImage = CONFIG.workerpals.dockerImage;
+  let gitToken = CONFIG.gitToken;
+  let dockerTimeout = CONFIG.workerpals.dockerTimeoutMs;
+  let dockerIdleTimeout = CONFIG.workerpals.dockerIdleTimeoutMs;
+  let dockerNetworkMode = CONFIG.workerpals.dockerNetworkMode;
+  let worktreeBaseRef = CONFIG.workerpals.baseRef || `origin/${integrationBranchName()}`;
+  let labels = [...CONFIG.workerpals.labels];
+  let failureCooldownMs = CONFIG.workerpals.failureCooldownMs;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -995,7 +980,7 @@ async function main(): Promise<void> {
         }
         console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
         dockerExecutor = null;
-      } else if (!envTruthy("WORKERPALS_SKIP_DOCKER_SELF_CHECK")) {
+      } else if (!CONFIG.workerpals.skipDockerSelfCheck) {
         console.log(
           "[WorkerPals] Running Docker startup self-check (git/worktree in container)...",
         );

@@ -1,0 +1,153 @@
+profile = "dev"
+session_id = "dev"
+
+[llm.lmstudio]
+context_window = 4096
+min_output_tokens = 256
+token_safety_margin = 64
+batch_tail_messages = 3
+batch_chunk_tokens = 0
+batch_memory_chars = 0
+
+[paths]
+data_dir = "outputs/data"
+shared_db_path = "outputs/data/pushpals.db"
+remotebuddy_db_path = "outputs/data/remotebuddy-state.db"
+
+[server]
+url = "http://localhost:3001"
+host = "0.0.0.0"
+port = 3001
+debug_http = false
+stale_claim_ttl_ms = 120000
+stale_claim_sweep_interval_ms = 5000
+
+[localbuddy]
+port = 3003
+status_heartbeat_ms = 120000
+
+[localbuddy.llm]
+backend = "lmstudio"
+endpoint = "http://127.0.0.1:1234"
+model = "local-model"
+session_id = "localbuddy-dev"
+
+[remotebuddy]
+poll_ms = 2000
+status_heartbeat_ms = 120000
+workerpal_online_ttl_ms = 15000
+wait_for_workerpal_ms = 15000
+auto_spawn_workerpals = true
+max_workerpals = 1
+workerpal_startup_timeout_ms = 10000
+workerpal_docker = true
+workerpal_require_docker = true
+workerpal_image = ""
+workerpal_poll_ms = 0
+workerpal_heartbeat_ms = 0
+workerpal_labels = []
+execution_budget_interactive_ms = 300000
+execution_budget_normal_ms = 900000
+execution_budget_background_ms = 1800000
+finalization_budget_ms = 120000
+
+[remotebuddy.llm]
+backend = "lmstudio"
+endpoint = "http://127.0.0.1:1234"
+model = "local-model"
+session_id = "remotebuddy-dev"
+
+[workerpals]
+poll_ms = 2000
+heartbeat_ms = 5000
+executor = "openhands"
+openhands_python = "python"
+openhands_timeout_ms = 1800000
+require_push = false
+push_agent_branch = false
+require_docker = false
+skip_docker_self_check = false
+docker_image = "pushpals-worker-sandbox:latest"
+docker_timeout_ms = 1800000
+docker_idle_timeout_ms = 600000
+docker_agent_startup_timeout_ms = 45000
+docker_warm_max_attempts = 3
+docker_warm_retry_backoff_ms = 2000
+docker_job_max_attempts = 2
+docker_job_retry_backoff_ms = 3000
+docker_network_mode = "bridge"
+base_ref = "origin/main_agents"
+labels = []
+failure_cooldown_ms = 20000
+
+[workerpals.openhands]
+workspace_python = "python3"
+agent_server_url = ""
+prompt_profile = "auto"
+task_prompt_mode = "none"
+large_instruction_chars = 1800
+tool_preflight_enabled = true
+tool_preflight_require_json = true
+tool_preflight_timeout_sec = 45
+tool_preflight_max_tokens = 220
+tool_preflight_model = ""
+enable_web_mcp = false
+web_mcp_url = ""
+web_mcp_name = "web-search"
+web_mcp_transport = "streamable-http"
+web_mcp_timeout_sec = 0
+enable_browser_tool = false
+lmstudio_slot_id = -1
+llm_num_retries = 2
+llm_retry_multiplier = 1.5
+llm_retry_min_wait = 1
+llm_retry_max_wait = 4
+llm_timeout_sec = 90
+agent_max_steps = 30
+model_probe_timeout_sec = 10.0
+
+[workerpals.llm]
+backend = "lmstudio"
+endpoint = "http://127.0.0.1:1234"
+model = "local-model"
+session_id = "workerpals-dev"
+
+[source_control_manager]
+repo_path = ".worktrees/source_control_manager"
+remote = "origin"
+main_branch = "main_agents"
+base_branch = "main"
+branch_prefix = "agent/"
+poll_interval_seconds = 10
+state_dir = "outputs/data/source_control_manager"
+port = 3002
+delete_after_merge = false
+max_attempts = 3
+merge_strategy = "cherry-pick"
+push_main_after_merge = true
+open_pr_after_push = true
+pr_base_branch = "main"
+pr_title = ""
+pr_body = ""
+pr_draft = false
+status_heartbeat_ms = 120000
+skip_clean_check = false
+auto_create_main_branch = false
+
+[startup]
+worker_image_rebuild = "auto"
+sync_integration_with_main = true
+skip_llm_preflight = false
+auto_start_lmstudio = true
+lmstudio_ready_timeout_ms = 120000
+lmstudio_cli = "lms"
+lmstudio_port = 1234
+lmstudio_start_args = ""
+startup_warmup = true
+startup_warmup_timeout_ms = 120000
+startup_warmup_poll_ms = 1000
+allow_external_clean = false
+
+[client]
+local_agent_url = "http://localhost:3003"
+trace_tail_lines = 100

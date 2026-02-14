@@ -4,15 +4,15 @@ import { JobQueue } from "./jobs.js";
 import { RequestQueue } from "./requests.js";
 import { CompletionQueue } from "./completions.js";
 import { randomUUID } from "crypto";
-import { resolve, join } from "path";
 import { mkdirSync } from "fs";
+import { loadPushPalsConfig } from "shared";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
-const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
-const dataDir = process.env.PUSHPALS_DATA_DIR ?? join(PROJECT_ROOT, "outputs", "data");
+const CONFIG = loadPushPalsConfig();
+const dataDir = CONFIG.paths.dataDir;
 mkdirSync(dataDir, { recursive: true });
 
-const sharedDbPath = process.env.PUSHPALS_DB_PATH ?? join(dataDir, "pushpals.db");
+const sharedDbPath = CONFIG.paths.sharedDbPath;
 const sessionManager = new SessionManager(sharedDbPath);
 const jobQueue = new JobQueue(sharedDbPath);
 const requestQueue = new RequestQueue(sharedDbPath);
@@ -23,35 +23,14 @@ const completionQueue = new CompletionQueue(sharedDbPath);
  */
 
 export function createRequestHandler() {
-  const isDebugEnabled = (value: string | undefined): boolean => {
-    const normalized = (value ?? "").trim().toLowerCase();
-    return (
-      normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on"
-    );
-  };
-  // Only explicit PushPals flag enables noisy poll/log endpoint printing.
-  // Avoid inheriting generic DEBUG from shells/tooling, which can spam logs.
-  const debugHttpLogs = isDebugEnabled(process.env.PUSHPALS_DEBUG_HTTP);
-
-  const envPort = parseInt(process.env.PUSHPALS_PORT ?? "", 10);
-  const port = Number.isFinite(envPort) && envPort > 0 ? envPort : 3001;
-  const staleClaimTtlMsRaw = parseInt(process.env.PUSHPALS_STALE_CLAIM_TTL_MS ?? "", 10);
-  const staleClaimTtlMs =
-    Number.isFinite(staleClaimTtlMsRaw) && staleClaimTtlMsRaw > 0
-      ? Math.max(5_000, staleClaimTtlMsRaw)
-      : 120_000;
-  const staleClaimSweepIntervalMsRaw = parseInt(
-    process.env.PUSHPALS_STALE_CLAIM_SWEEP_INTERVAL_MS ?? "",
-    10,
-  );
-  const staleClaimSweepIntervalMs =
-    Number.isFinite(staleClaimSweepIntervalMsRaw) && staleClaimSweepIntervalMsRaw > 0
-      ? Math.max(1_000, staleClaimSweepIntervalMsRaw)
-      : 5_000;
+  const debugHttpLogs = CONFIG.server.debugHttp;
+  const port = CONFIG.server.port;
+  const staleClaimTtlMs = CONFIG.server.staleClaimTtlMs;
+  const staleClaimSweepIntervalMs = CONFIG.server.staleClaimSweepIntervalMs;
   let lastStaleRecoverySweepAt = 0;
   return Bun.serve({
     port,
-    hostname: "0.0.0.0",
+    hostname: CONFIG.server.host,
     idleTimeout: 180, // 3 minutes — SSE/WS connections are long-lived
 
     async fetch(req: Request, server): Promise<Response> {

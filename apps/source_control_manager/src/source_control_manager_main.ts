@@ -2,6 +2,7 @@ import { parseArgs } from "util";
 import { isAbsolute, join, relative, resolve } from "path";
 import { mkdirSync, existsSync } from "fs";
 import { CommunicationManager } from "../../../packages/shared/src/communication.js";
+import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { GitOps } from "./git";
@@ -23,7 +24,8 @@ type GitCmdResult = {
 };
 
 const repoRoot = resolve(import.meta.dir, "..", "..", "..");
-const defaultSourceControlManagerRepoPath = join(repoRoot, ".worktrees", "source_control_manager");
+const PUSH_CONFIG = loadPushPalsConfig();
+const defaultSourceControlManagerRepoPath = resolve(PUSH_CONFIG.sourceControlManager.repoPath);
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -56,14 +58,14 @@ Usage:
 
 Options:
   -c, --config <path>       Config file path (default: source_control_manager.config.json)
-  -r, --repo <path>         Git repository path (default: $SOURCE_CONTROL_MANAGER_REPO_PATH or <repo>/.worktrees/source_control_manager)
+  -r, --repo <path>         Git repository path (default: config/default.toml source_control_manager.repo_path)
   -s, --server <url>        PushPals server URL (default: http://localhost:3001)
   -p, --port <number>       HTTP status server port (default: 3002)
       --remote <name>       Git remote (default: origin)
-  -b, --branch <name>       Integration branch name (default: $PUSHPALS_INTEGRATION_BRANCH or main_agents)
+  -b, --branch <name>       Integration branch name (default: main_agents)
       --prefix <prefix>     Agent branch prefix (default: agent/)
   -i, --interval <seconds>  Poll interval in seconds (default: 10)
-      --state-dir <path>    State directory for DB & lock (default: $PUSHPALS_DATA_DIR/source_control_manager)
+      --state-dir <path>    State directory for DB & lock (default: outputs/data/source_control_manager)
       --delete-after-merge  Delete remote branch after merge
       --dry-run             Discover and enqueue only, do not process
       --skip-clean-check    Skip the clean-repo guard (for dev working copies)
@@ -120,13 +122,10 @@ if (args["delete-after-merge"]) cliOverrides.deleteAfterMerge = true;
 
 config = applyCliOverrides(config, cliOverrides);
 config.repoPath = resolve(config.repoPath);
-const integrationBaseBranch = (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || "main";
+const integrationBaseBranch = config.integrationBaseBranch;
 const integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
-const hasRepoPathOverride =
-  typeof args.repo === "string" ||
-  (process.env.SOURCE_CONTROL_MANAGER_REPO_PATH ?? "").trim().length > 0;
 const usingDefaultRepoPath =
-  !hasRepoPathOverride && resolve(config.repoPath) === resolve(defaultSourceControlManagerRepoPath);
+  resolve(config.repoPath) === resolve(defaultSourceControlManagerRepoPath);
 
 // Validate config before proceeding
 try {
@@ -137,28 +136,10 @@ try {
 }
 
 const dryRun = args["dry-run"] === true;
-const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const skipCleanCheckFlag = args["skip-clean-check"] === true;
-const skipCleanCheckEnv = TRUTHY.has(
-  (process.env.SOURCE_CONTROL_MANAGER_SKIP_CLEAN_CHECK ?? "").toLowerCase(),
-);
-const skipCleanCheck = skipCleanCheckFlag || skipCleanCheckEnv;
-const statusSessionId = (process.env.PUSHPALS_SESSION_ID ?? "dev").trim() || "dev";
-
-function parseStatusHeartbeatMs(fallbackMs: number): number {
-  const raw = (
-    process.env.SOURCE_CONTROL_MANAGER_STATUS_HEARTBEAT_MS ??
-    process.env.PUSHPALS_STATUS_HEARTBEAT_MS ??
-    ""
-  ).trim();
-  if (!raw) return fallbackMs;
-  const parsed = parseInt(raw, 10);
-  if (!Number.isFinite(parsed)) return fallbackMs;
-  if (parsed <= 0) return 0;
-  return Math.max(30_000, parsed);
-}
-
-const statusHeartbeatMs = parseStatusHeartbeatMs(120_000);
+const skipCleanCheck = skipCleanCheckFlag || config.skipCleanCheck;
+const statusSessionId = PUSH_CONFIG.sessionId.trim() || "dev";
+const statusHeartbeatMs = Math.max(0, config.statusHeartbeatMs);
 
 // ─── Bootstrap ──────────────────────────────────────────────────────────────
 
@@ -176,9 +157,7 @@ console.log(`[${ts()}]   port:     ${config.port}`);
 console.log(`[${ts()}]   checks:   ${config.checks.length}`);
 if (dryRun) console.log(`[${ts()}]   mode:     DRY RUN`);
 if (skipCleanCheck) {
-  const source = skipCleanCheckFlag
-    ? "--skip-clean-check flag"
-    : "SOURCE_CONTROL_MANAGER_SKIP_CLEAN_CHECK env";
+  const source = skipCleanCheckFlag ? "--skip-clean-check flag" : "source_control_manager.skip_clean_check";
   console.log(`[${ts()}]   mode:     SKIP CLEAN CHECK (${source})`);
 }
 
@@ -666,18 +645,12 @@ async function runCommandCapture(cmd: string[], cwd = repoRoot): Promise<GitCmdR
 }
 
 async function resolveGitHubToken(): Promise<string> {
-  const envToken = (
-    process.env.PUSHPALS_GIT_TOKEN ??
-    process.env.GITHUB_TOKEN ??
-    process.env.GH_TOKEN ??
-    ""
-  ).trim();
-  if (envToken) return envToken;
+  const configuredToken = (config.gitToken ?? "").trim();
+  if (configuredToken) return configuredToken;
 
   // Fall back to GitHub CLI auth if available (e.g. gh auth login already done).
   const ghToken = await runCommandCapture(["gh", "auth", "token"]);
   if (ghToken.ok && ghToken.stdout) {
-    process.env.PUSHPALS_GIT_TOKEN = ghToken.stdout;
     return ghToken.stdout;
   }
 
@@ -694,7 +667,7 @@ async function ensureMainPullRequest(completion: {
   const token = await resolveGitHubToken();
   if (!token) {
     throw new Error(
-      "No GitHub token available for PR creation (set PUSHPALS_GIT_TOKEN, GITHUB_TOKEN, or GH_TOKEN).",
+      "No GitHub token available for PR creation (set PUSHPALS_GIT_TOKEN/GITHUB_TOKEN/GH_TOKEN or configure git token in runtime env).",
     );
   }
 
@@ -812,15 +785,13 @@ async function ensureIntegrationBranchExists(): Promise<void> {
 
   console.warn(`[${ts()}] Integration branch ${remoteRef} does not exist.`);
 
-  const autoCreate = TRUTHY.has(
-    (process.env.SOURCE_CONTROL_MANAGER_AUTO_CREATE_MAIN_BRANCH ?? "").toLowerCase(),
-  );
+  const autoCreate = config.autoCreateMainBranch;
 
   let approved = autoCreate;
   if (!approved) {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
       throw new Error(
-        `Missing ${remoteRef}. Re-run interactively to approve creation, or set SOURCE_CONTROL_MANAGER_AUTO_CREATE_MAIN_BRANCH=1.`,
+        `Missing ${remoteRef}. Re-run interactively to approve creation, or set source_control_manager.auto_create_main_branch=true.`,
       );
     }
 

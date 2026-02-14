@@ -15,20 +15,32 @@
 import { randomUUID } from "crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { isAbsolute, relative, resolve } from "path";
+import { loadPushPalsConfig } from "shared";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 
 const DEFAULT_OPENHANDS_MODEL = "local-model";
+const CONFIG = loadPushPalsConfig();
 
-function parseClampedEnvInt(name: string, defaultValue: number, min: number, max: number): number {
-  const raw = Number.parseInt(process.env[name] ?? "", 10);
-  if (!Number.isFinite(raw) || raw <= 0) return defaultValue;
-  return Math.max(min, Math.min(max, raw));
+function parseClampedInt(value: unknown, defaultValue: number, min: number, max: number): number {
+  const parsed =
+    typeof value === "number"
+      ? Math.floor(value)
+      : typeof value === "string"
+        ? Number.parseInt(value, 10)
+        : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
+  return Math.max(min, Math.min(max, parsed));
 }
 
-function parseClampedEnvIntAllowZero(name: string, defaultValue: number, max: number): number {
-  const raw = Number.parseInt(process.env[name] ?? "", 10);
-  if (!Number.isFinite(raw) || raw < 0) return defaultValue;
-  return Math.max(0, Math.min(max, raw));
+function parseClampedIntAllowZero(value: unknown, defaultValue: number, max: number): number {
+  const parsed =
+    typeof value === "number"
+      ? Math.floor(value)
+      : typeof value === "string"
+        ? Number.parseInt(value, 10)
+        : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed < 0) return defaultValue;
+  return Math.max(0, Math.min(max, parsed));
 }
 
 export class DockerExecutionExhaustedError extends Error {
@@ -100,8 +112,8 @@ export class DockerExecutor {
   private lastLoggedExecutionConfig = "";
 
   constructor(options: DockerExecutorOptions) {
-    const startupTimeoutMs = parseClampedEnvInt(
-      "WORKERPALS_DOCKER_AGENT_STARTUP_TIMEOUT_MS",
+    const startupTimeoutMs = parseClampedInt(
+      CONFIG.workerpals.dockerAgentStartupTimeoutMs,
       45_000,
       10_000,
       180_000,
@@ -120,22 +132,22 @@ export class DockerExecutor {
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
-    this.warmSetupMaxAttempts = parseClampedEnvInt("WORKERPALS_DOCKER_WARM_MAX_ATTEMPTS", 3, 1, 5);
-    this.warmSetupBackoffMs = parseClampedEnvInt(
-      "WORKERPALS_DOCKER_WARM_RETRY_BACKOFF_MS",
+    this.warmSetupMaxAttempts = parseClampedInt(CONFIG.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
+    this.warmSetupBackoffMs = parseClampedInt(
+      CONFIG.workerpals.dockerWarmRetryBackoffMs,
       2_000,
       250,
       60_000,
     );
-    this.jobRetryMaxAttempts = parseClampedEnvInt("WORKERPALS_DOCKER_JOB_MAX_ATTEMPTS", 2, 1, 3);
-    this.jobRetryBackoffMs = parseClampedEnvInt(
-      "WORKERPALS_DOCKER_JOB_RETRY_BACKOFF_MS",
+    this.jobRetryMaxAttempts = parseClampedInt(CONFIG.workerpals.dockerJobMaxAttempts, 2, 1, 3);
+    this.jobRetryBackoffMs = parseClampedInt(
+      CONFIG.workerpals.dockerJobRetryBackoffMs,
       3_000,
       250,
       60_000,
     );
-    this.failureCooldownMs = parseClampedEnvIntAllowZero(
-      "WORKERPALS_DOCKER_FAILURE_COOLDOWN_MS",
+    this.failureCooldownMs = parseClampedIntAllowZero(
+      CONFIG.workerpals.failureCooldownMs,
       20_000,
       300_000,
     );
@@ -352,15 +364,22 @@ export class DockerExecutor {
    * Run the Docker container and parse output
    */
   private collectContainerEnv(): string[] {
+    const fixedEnv: Record<string, string> = {
+      WORKERPALS_EXECUTOR: CONFIG.workerpals.executor,
+      WORKERPALS_LLM_MODEL: CONFIG.workerpals.llm.model,
+      WORKERPALS_LLM_ENDPOINT: CONFIG.workerpals.llm.endpoint,
+      WORKERPALS_LLM_BACKEND: CONFIG.workerpals.llm.backend,
+      WORKERPALS_LLM_SESSION_ID: CONFIG.workerpals.llm.sessionId,
+      WORKERPALS_OPENHANDS_TIMEOUT_MS: String(CONFIG.workerpals.openhandsTimeoutMs),
+      WORKERPALS_OPENHANDS_PYTHON: CONFIG.workerpals.openhandsPython,
+    };
+    if (CONFIG.workerpals.llm.apiKey.trim()) {
+      fixedEnv.WORKERPALS_LLM_API_KEY = CONFIG.workerpals.llm.apiKey;
+    }
+
     const allowlist = [
-      "WORKERPALS_LLM_MODEL",
-      "WORKERPALS_LLM_API_KEY",
-      "WORKERPALS_LLM_ENDPOINT",
-      "WORKERPALS_LLM_BACKEND",
       "WORKERPALS_OPENHANDS_PROMPT_PROFILE",
       "WORKERPALS_OPENHANDS_AGENT_MAX_STEPS",
-      "WORKERPALS_OPENHANDS_TIMEOUT_MS",
-      "WORKERPALS_OPENHANDS_PYTHON",
       "WORKERPALS_OPENHANDS_WORKSPACE_PYTHON",
       "WORKERPALS_OPENHANDS_LLM_NUM_RETRIES",
       "WORKERPALS_OPENHANDS_LLM_RETRY_MULTIPLIER",
@@ -395,6 +414,10 @@ export class DockerExecutor {
     ];
 
     const pairs: string[] = [];
+    for (const [key, value] of Object.entries(fixedEnv)) {
+      if (!value) continue;
+      pairs.push("-e", `${key}=${value}`);
+    }
     for (const key of allowlist) {
       const value = process.env[key];
       if (!value) continue;
@@ -822,9 +845,9 @@ export class DockerExecutor {
   }
 
   private executionConfigSummary(job?: Job): string {
-    const backend = (process.env.WORKERPALS_EXECUTOR ?? "openhands").trim().toLowerCase() || "openhands";
-    const model = (process.env.WORKERPALS_LLM_MODEL ?? DEFAULT_OPENHANDS_MODEL).trim() || DEFAULT_OPENHANDS_MODEL;
-    const provider = this.normalizeProvider(process.env.WORKERPALS_LLM_BACKEND ?? "auto");
+    const backend = CONFIG.workerpals.executor.trim().toLowerCase() || "openhands";
+    const model = CONFIG.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
+    const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
     const laneRaw =
       job?.kind === "task.execute" && typeof job.params?.lane === "string" ? job.params.lane : "";
     const lane = laneRaw.trim().toLowerCase();

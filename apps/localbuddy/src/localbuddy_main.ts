@@ -12,7 +12,7 @@
  */
 
 import { randomUUID } from "crypto";
-import { CommunicationManager, detectRepoRoot } from "shared";
+import { CommunicationManager, detectRepoRoot, loadPushPalsConfig } from "shared";
 import { createLLMClient, type LLMClient } from "../../remotebuddy/src/llm.js";
 import {
   buildJobStatusReply,
@@ -27,6 +27,8 @@ import { answerLocalReadonlyQuery, isLocalReadonlyQueryPrompt } from "./local_re
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
+const CONFIG = loadPushPalsConfig();
+
 function parseArgs(): {
   server: string;
   port: number;
@@ -34,10 +36,10 @@ function parseArgs(): {
   authToken: string | null;
 } {
   const args = process.argv.slice(2);
-  let server = "http://localhost:3001";
-  let port = parseInt(process.env.LOCAL_AGENT_PORT ?? "3003", 10);
-  let sessionId = process.env.PUSHPALS_SESSION_ID ?? "dev";
-  let authToken = process.env.PUSHPALS_AUTH_TOKEN ?? null;
+  let server = CONFIG.server.url;
+  let port = CONFIG.localbuddy.port;
+  let sessionId = CONFIG.sessionId;
+  let authToken = CONFIG.authToken;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -59,15 +61,9 @@ function parseArgs(): {
   return { server, port, sessionId, authToken };
 }
 
-function parseStatusHeartbeatMs(serviceEnvName: string, fallbackMs: number): number {
-  const raw = (
-    process.env[serviceEnvName] ??
-    process.env.PUSHPALS_STATUS_HEARTBEAT_MS ??
-    ""
-  ).trim();
-  if (!raw) return fallbackMs;
-  const parsed = parseInt(raw, 10);
-  if (!Number.isFinite(parsed)) return fallbackMs;
+function parseStatusHeartbeatMs(fallbackMs: number): number {
+  const parsed = Math.floor(fallbackMs);
+  if (!Number.isFinite(parsed)) return 120_000;
   if (parsed <= 0) return 0;
   return Math.max(30_000, parsed);
 }
@@ -359,7 +355,15 @@ class LocalBuddyServer {
     console.log(`[LocalBuddy] Detected repo root: ${this.repo}`);
 
     // Initialize LLM client for prompt enhancement
-    this.llm = createLLMClient({ service: "localbuddy", sessionId: this.sessionId });
+    const llmCfg = CONFIG.localbuddy.llm;
+    this.llm = createLLMClient({
+      service: "localbuddy",
+      sessionId: this.sessionId,
+      backend: llmCfg.backend,
+      endpoint: llmCfg.endpoint,
+      model: llmCfg.model,
+      apiKey: llmCfg.apiKey,
+    });
     console.log(`[LocalBuddy] LLM client initialized`);
   }
 
@@ -608,7 +612,7 @@ Respond in strict JSON with this shape:
       console.warn("[LocalBuddy] Failed to emit startup status event");
     };
     void emitStartupPresence();
-    const statusHeartbeatMs = parseStatusHeartbeatMs("LOCALBUDDY_STATUS_HEARTBEAT_MS", 120_000);
+    const statusHeartbeatMs = parseStatusHeartbeatMs(CONFIG.localbuddy.statusHeartbeatMs);
     const statusHeartbeatTimer =
       statusHeartbeatMs > 0
         ? setInterval(() => {

@@ -20,6 +20,11 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } f
 import { createHash } from "crypto";
 import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
+import { loadPushPalsConfig } from "../packages/shared/src/config.js";
+
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, "..");
+const CONFIG = loadPushPalsConfig({ projectRoot: repoRoot });
 
 const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
 const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
@@ -27,18 +32,18 @@ const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_LMSTUDIO_READY_TIMEOUT_MS = 120_000;
 const DEFAULT_INTEGRATION_BRANCH = "main_agents";
 const INTEGRATION_BRANCH =
-  (process.env.PUSHPALS_INTEGRATION_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BRANCH;
+  (CONFIG.sourceControlManager.mainBranch ?? "").trim() || DEFAULT_INTEGRATION_BRANCH;
 const INTEGRATION_REMOTE_REF = `origin/${INTEGRATION_BRANCH}`;
 const DEFAULT_INTEGRATION_BASE_BRANCH = "main";
 const INTEGRATION_BASE_BRANCH =
-  (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || DEFAULT_INTEGRATION_BASE_BRANCH;
+  (CONFIG.sourceControlManager.baseBranch ?? "").trim() || DEFAULT_INTEGRATION_BASE_BRANCH;
 const INTEGRATION_BASE_REMOTE_REF = `origin/${INTEGRATION_BASE_BRANCH}`;
 const START_SYNC_GIT_USER_NAME = "PushPals Start Sync";
 const START_SYNC_GIT_USER_EMAIL = "pushpals-start@local";
-const DEFAULT_PUSHPALS_PORT = 3001;
+const DEFAULT_PUSHPALS_PORT = CONFIG.server.port;
 const DEFAULT_STARTUP_WARMUP_TIMEOUT_MS = 120_000;
 const DEFAULT_STARTUP_WARMUP_POLL_MS = 1_000;
-const workerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? DEFAULT_IMAGE;
+const workerImage = CONFIG.workerpals.dockerImage || DEFAULT_IMAGE;
 const WORKER_IMAGE_INPUTS_HASH_LABEL = "pushpals.worker.inputs_hash";
 const WORKER_IMAGE_INPUT_PATHS = [
   "apps/workerpals",
@@ -61,13 +66,7 @@ const WORKER_IMAGE_HASH_IGNORE_DIRS = new Set([
   ".next",
   ".expo",
 ]);
-const scriptDir = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(scriptDir, "..");
-const DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE = resolve(
-  repoRoot,
-  ".worktrees",
-  "source_control_manager",
-);
+const DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE = resolve(CONFIG.sourceControlManager.repoPath);
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 
 type StartOptions = {
@@ -122,20 +121,11 @@ function envTruthy(name: string): boolean {
 type WorkerImageRebuildMode = "auto" | "always" | "never";
 
 function workerImageRebuildMode(): WorkerImageRebuildMode {
-  const raw = (process.env.PUSHPALS_WORKER_IMAGE_REBUILD ?? "auto").trim().toLowerCase();
-  if (raw === "always" || raw === "1" || raw === "true" || raw === "yes" || raw === "on") {
-    return "always";
-  }
-  if (raw === "never" || raw === "0" || raw === "false" || raw === "no" || raw === "off") {
-    return "never";
-  }
-  return "auto";
+  return CONFIG.startup.workerImageRebuild;
 }
 
 function syncIntegrationWithMainEnabled(): boolean {
-  const raw = process.env.PUSHPALS_SYNC_INTEGRATION_WITH_MAIN;
-  if (raw == null || raw.trim() === "") return true;
-  return TRUTHY.has(raw.toLowerCase());
+  return CONFIG.startup.syncIntegrationWithMain;
 }
 
 function resolveFromRepo(pathValue: string): string {
@@ -148,15 +138,14 @@ function isWithinRepo(pathValue: string): boolean {
 }
 
 function dataDirPath(): string {
-  const configured = (process.env.PUSHPALS_DATA_DIR ?? "").trim();
-  return configured ? resolveFromRepo(configured) : resolve(repoRoot, "outputs", "data");
+  return resolve(CONFIG.paths.dataDir);
 }
 
 function cleanRuntimeStateIfRequested(): void {
   if (!startOptions.clean) return;
 
   const dataDir = dataDirPath();
-  const allowExternalClean = envTruthy("PUSHPALS_ALLOW_EXTERNAL_CLEAN");
+  const allowExternalClean = CONFIG.startup.allowExternalClean;
   if (!isWithinRepo(dataDir) && !allowExternalClean) {
     console.warn(
       `[start] Refusing to clean data dir outside repo without PUSHPALS_ALLOW_EXTERNAL_CLEAN=1: ${dataDir}`,
@@ -466,18 +455,18 @@ async function checkTargetReachable(target: {
 function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: string[] }> {
   const out: Array<{ name: string; endpoint: string; probes: string[] }> = [];
   const seenEndpoints = new Set<string>();
-  const configuredRemoteRaw = firstNonEmpty(process.env.REMOTEBUDDY_LLM_ENDPOINT);
-  const configuredLocalRaw = firstNonEmpty(process.env.LOCALBUDDY_LLM_ENDPOINT);
-  const configuredWorkerRaw = firstNonEmpty(process.env.WORKERPALS_LLM_ENDPOINT);
+  const configuredRemoteRaw = firstNonEmpty(CONFIG.remotebuddy.llm.endpoint);
+  const configuredLocalRaw = firstNonEmpty(CONFIG.localbuddy.llm.endpoint);
+  const configuredWorkerRaw = firstNonEmpty(CONFIG.workerpals.llm.endpoint);
 
   const remoteBackend =
-    normalizeLlmBackend(firstNonEmpty(process.env.REMOTEBUDDY_LLM_BACKEND)) ??
+    normalizeLlmBackend(firstNonEmpty(CONFIG.remotebuddy.llm.backend)) ??
     configuredLlmBackend(configuredRemoteRaw || DEFAULT_LMSTUDIO_ENDPOINT);
   const localBackend =
-    normalizeLlmBackend(firstNonEmpty(process.env.LOCALBUDDY_LLM_BACKEND)) ??
+    normalizeLlmBackend(firstNonEmpty(CONFIG.localbuddy.llm.backend)) ??
     configuredLlmBackend(configuredLocalRaw || DEFAULT_LMSTUDIO_ENDPOINT);
   const workerBackend =
-    normalizeLlmBackend(firstNonEmpty(process.env.WORKERPALS_LLM_BACKEND)) ??
+    normalizeLlmBackend(firstNonEmpty(CONFIG.workerpals.llm.backend)) ??
     configuredLlmBackend(configuredWorkerRaw || DEFAULT_LMSTUDIO_ENDPOINT);
 
   const remoteFallback =
@@ -527,26 +516,20 @@ function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: 
 }
 
 function lmStudioReadyTimeoutMs(): number {
-  return (
-    parsePositiveInt(process.env.PUSHPALS_LMSTUDIO_READY_TIMEOUT_MS) ??
-    DEFAULT_LMSTUDIO_READY_TIMEOUT_MS
-  );
+  return Math.max(1_000, CONFIG.startup.lmStudioReadyTimeoutMs || DEFAULT_LMSTUDIO_READY_TIMEOUT_MS);
 }
 
 function shouldAutoStartLmStudio(primaryEndpoint: string): boolean {
   if (configuredLlmBackend(primaryEndpoint) !== "lmstudio") return false;
 
-  const explicit = process.env.PUSHPALS_AUTO_START_LMSTUDIO;
-  const enabled =
-    explicit == null || explicit.trim() === "" ? true : TRUTHY.has(explicit.toLowerCase());
-  if (!enabled) return false;
+  if (!CONFIG.startup.autoStartLmStudio) return false;
 
   const parsed = parseUrl(primaryEndpoint);
   return parsed ? isLoopbackHost(parsed.hostname) : false;
 }
 
 function lmStudioCliCandidates(): string[] {
-  const explicit = (process.env.PUSHPALS_LMSTUDIO_CLI ?? "").trim();
+  const explicit = (CONFIG.startup.lmStudioCli ?? "").trim();
   const candidates = explicit ? [explicit] : ["lms", "lmstudio"];
   return Array.from(new Set(candidates));
 }
@@ -561,15 +544,15 @@ function splitArgs(raw: string): string[] {
 function resolveLmStudioPort(primaryEndpoint: string): number {
   const parsed = parseUrl(primaryEndpoint);
   const endpointPort = parsed?.port ? Number.parseInt(parsed.port, 10) : 1234;
-  return (
-    parsePositiveInt(process.env.PUSHPALS_LMSTUDIO_PORT) ??
-    (Number.isFinite(endpointPort) ? endpointPort : 1234)
+  return Math.max(
+    1,
+    CONFIG.startup.lmStudioPort || (Number.isFinite(endpointPort) ? endpointPort : 1234),
   );
 }
 
 function lmStudioStartCommands(primaryEndpoint: string): string[][] {
   const port = resolveLmStudioPort(primaryEndpoint);
-  const extraArgs = splitArgs(process.env.PUSHPALS_LMSTUDIO_START_ARGS ?? "");
+  const extraArgs = splitArgs(CONFIG.startup.lmStudioStartArgs ?? "");
 
   const commands: string[][] = [];
   for (const cli of lmStudioCliCandidates()) {
@@ -729,11 +712,11 @@ function printLmStudioAutoStartHelp(primaryEndpoint: string): void {
       console.error(`[lmstudio] ${line}`);
     }
   }
-  console.error("[start] Optional: set PUSHPALS_AUTO_START_LMSTUDIO=0 and run LM Studio yourself.");
+  console.error("[start] Optional: set startup.auto_start_lmstudio=false and run LM Studio yourself.");
 }
 
 async function ensureLlmPreflight(): Promise<void> {
-  if (envTruthy("PUSHPALS_SKIP_LLM_PREFLIGHT")) return;
+  if (CONFIG.startup.skipLlmPreflight) return;
 
   const targets = llmPreflightTargets();
   if (targets.length === 0) return;
@@ -791,13 +774,13 @@ async function ensureLlmPreflight(): Promise<void> {
         );
       } else {
         console.error(
-          "[start] LM Studio auto-start is disabled or endpoint is not local. Set PUSHPALS_AUTO_START_LMSTUDIO=1 to enable auto-start for localhost endpoints.",
+          "[start] LM Studio auto-start is disabled or endpoint is not local. Enable startup.auto_start_lmstudio in config to auto-start localhost endpoints.",
         );
       }
     }
 
     console.error(
-      "[start] Start your model server or set PUSHPALS_SKIP_LLM_PREFLIGHT=1 to bypass this check.",
+      "[start] Start your model server or set startup.skip_llm_preflight=true in config to bypass this check.",
     );
     abortStart(1);
   }
@@ -865,40 +848,35 @@ async function runCapture(cmd: string[], cwd = repoRoot): Promise<CmdResult> {
 }
 
 function startupWarmupEnabled(): boolean {
-  const raw = (process.env.PUSHPALS_STARTUP_WARMUP ?? "").trim().toLowerCase();
-  if (!raw) return true;
-  if (raw === "0" || raw === "false" || raw === "no" || raw === "off") return false;
-  return true;
+  return CONFIG.startup.startupWarmup;
 }
 
 function startupWarmupTimeoutMs(): number {
-  const parsed = parsePositiveInt(process.env.PUSHPALS_STARTUP_WARMUP_TIMEOUT_MS);
-  if (!parsed) return DEFAULT_STARTUP_WARMUP_TIMEOUT_MS;
-  return Math.max(15_000, parsed);
+  const configured = CONFIG.startup.startupWarmupTimeoutMs || DEFAULT_STARTUP_WARMUP_TIMEOUT_MS;
+  return Math.max(15_000, configured);
 }
 
 function startupWarmupPollMs(): number {
-  const parsed = parsePositiveInt(process.env.PUSHPALS_STARTUP_WARMUP_POLL_MS);
-  if (!parsed) return DEFAULT_STARTUP_WARMUP_POLL_MS;
-  return Math.max(250, Math.min(parsed, 5_000));
+  const configured = CONFIG.startup.startupWarmupPollMs || DEFAULT_STARTUP_WARMUP_POLL_MS;
+  return Math.max(250, Math.min(configured, 5_000));
 }
 
 function startupServerUrl(): string {
-  const explicit = (process.env.PUSHPALS_SERVER_URL ?? "").trim();
-  if (explicit) return explicit.replace(/\/+$/, "");
-  const port = parsePositiveInt(process.env.PUSHPALS_PORT) ?? DEFAULT_PUSHPALS_PORT;
+  const configured = CONFIG.server.url.trim();
+  if (configured) return configured.replace(/\/+$/, "");
+  const port = DEFAULT_PUSHPALS_PORT;
   return `http://127.0.0.1:${port}`;
 }
 
 function startupWarmupSessionId(): string {
-  const raw = (process.env.PUSHPALS_SESSION_ID ?? "dev").trim();
+  const raw = (CONFIG.sessionId ?? "dev").trim();
   return raw || "dev";
 }
 
 function startupAuthHeaders(includeContentType: boolean): Record<string, string> {
   const headers: Record<string, string> = {};
   if (includeContentType) headers["Content-Type"] = "application/json";
-  const token = (process.env.PUSHPALS_AUTH_TOKEN ?? "").trim();
+  const token = (CONFIG.authToken ?? "").trim();
   if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
 }
@@ -1018,7 +996,7 @@ async function waitForWarmupJobTerminal(
 
 async function runStartupWarmup(): Promise<void> {
   if (!startupWarmupEnabled()) {
-    console.log("[start] Startup warmup disabled (PUSHPALS_STARTUP_WARMUP=0).");
+    console.log("[start] Startup warmup disabled (startup.startup_warmup=false).");
     return;
   }
 
@@ -1301,8 +1279,7 @@ async function ensureGitHubAuth(force = false): Promise<void> {
     return;
   }
 
-  const gitToken =
-    process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
+  const gitToken = CONFIG.gitToken;
   if (gitToken) {
     process.env.PUSHPALS_GIT_TOKEN = gitToken;
     return;
@@ -1387,7 +1364,9 @@ async function ensureIntegrationBranch(): Promise<void> {
   }
 
   console.warn(`[start] Required branch ${INTEGRATION_REMOTE_REF} does not exist on remote.`);
-  const autoCreate = envTruthy("PUSHPALS_AUTO_CREATE_INTEGRATION_BRANCH");
+  const autoCreate =
+    CONFIG.sourceControlManager.autoCreateMainBranch ||
+    envTruthy("PUSHPALS_AUTO_CREATE_INTEGRATION_BRANCH");
 
   let approved = autoCreate;
   if (!approved) {
@@ -1459,10 +1438,7 @@ async function ensureIntegrationBranch(): Promise<void> {
 }
 
 async function ensureSourceControlManagerWorktree(): Promise<void> {
-  const configuredPath = (process.env.SOURCE_CONTROL_MANAGER_REPO_PATH ?? "").trim();
-  const repoPath = configuredPath
-    ? resolve(repoRoot, configuredPath)
-    : DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE;
+  const repoPath = resolve(CONFIG.sourceControlManager.repoPath);
 
   if (repoPath === repoRoot) {
     console.error(
@@ -1532,7 +1508,7 @@ async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
 
   await ensureGitHubAuth(true);
 
-  const repoPath = (process.env.SOURCE_CONTROL_MANAGER_REPO_PATH ?? "").trim();
+  const repoPath = resolve(CONFIG.sourceControlManager.repoPath);
   if (!repoPath) {
     console.error(
       "[start] SourceControlManager worktree is not configured; cannot sync integration branch with main.",
@@ -1705,7 +1681,7 @@ async function ensureDockerImage(): Promise<void> {
     buildReason = `Worker image not found: ${workerImage}`;
   } else if (rebuildMode === "always") {
     shouldBuild = true;
-    buildReason = "Worker image rebuild forced by PUSHPALS_WORKER_IMAGE_REBUILD=always";
+    buildReason = "Worker image rebuild forced by startup.worker_image_rebuild=always";
   } else if (rebuildMode === "auto") {
     const currentHash = getCurrentInputsHash();
     if (!existingInputsHash) {

@@ -98,11 +98,9 @@ export class GitOps {
     this.remote = config.remote;
     this.mainBranch = config.mainBranch;
     this.localMainRef = `refs/pushpals/source_control_manager/local/${sanitizeBranchComponent(config.mainBranch)}`;
-    this.integrationBaseBranch =
-      (process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ?? "").trim() || "main";
+    this.integrationBaseBranch = config.integrationBaseBranch;
     this.branchPrefix = config.branchPrefix;
-    this.githubToken =
-      process.env.PUSHPALS_GIT_TOKEN ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
+    this.githubToken = config.gitToken ?? null;
   }
 
   private remoteMainRef(): string {

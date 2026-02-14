@@ -8,7 +8,7 @@
 
 // Interfaces
 
-import { loadPromptTemplate } from "shared";
+import { loadPromptTemplate, loadPushPalsConfig } from "shared";
 
 export interface PlannerInput {
   userText: string;
@@ -49,6 +49,8 @@ Planner-specific output contract:
 - Do not include markdown, prose, or code fences.
 - Keep tasks concrete and executable by available tools.
 `.trim();
+
+const CONFIG = loadPushPalsConfig();
 
 // LocalHeuristicPlanner
 
@@ -343,19 +345,16 @@ export class RemotePlanner implements PlannerModel {
       model?: string;
     } = {},
   ) {
-    const backend = (process.env.LOCALBUDDY_LLM_BACKEND ?? "").trim().toLowerCase();
-    const defaultEndpoint =
-      backend === "ollama"
-        ? "http://127.0.0.1:11434/api/chat"
-        : "http://127.0.0.1:1234/v1/chat/completions";
-    const configuredEndpoint =
-      opts.endpoint ?? process.env.LOCALBUDDY_LLM_ENDPOINT ?? defaultEndpoint;
+    const llmCfg = CONFIG.localbuddy.llm;
+    const backend = llmCfg.backend.trim().toLowerCase();
+    const defaultEndpoint = backend === "ollama" ? "http://127.0.0.1:11434/api/chat" : llmCfg.endpoint;
+    const configuredEndpoint = opts.endpoint ?? llmCfg.endpoint ?? defaultEndpoint;
     this.endpoint =
       backend === "ollama" && !configuredEndpoint.includes("/api/chat")
         ? `${configuredEndpoint.replace(/\/+$/, "")}/api/chat`
         : configuredEndpoint;
-    this.apiKey = opts.apiKey ?? process.env.LOCALBUDDY_LLM_API_KEY ?? null;
-    this.model = opts.model ?? process.env.LOCALBUDDY_LLM_MODEL ?? "local-model";
+    this.apiKey = opts.apiKey ?? llmCfg.apiKey ?? null;
+    this.model = opts.model ?? llmCfg.model ?? "local-model";
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {

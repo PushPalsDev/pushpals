@@ -76,6 +76,7 @@
       "version": "1.0.0",
       "dependencies": {
         "protocol": "workspace:*",
+        "shared": "workspace:*",
       },
       "devDependencies": {
         "@types/bun": "latest",

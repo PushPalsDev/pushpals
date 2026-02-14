@@ -5,8 +5,8 @@
 
 import { existsSync } from "fs";
 import { resolve } from "path";
-import { loadPromptTemplate } from "shared";
-import { computeTimeoutWarningWindow, parseOpenHandsTimeoutMs } from "./timeout_policy.js";
+import { loadPromptTemplate, loadPushPalsConfig } from "shared";
+import { computeTimeoutWarningWindow } from "./timeout_policy.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -15,6 +15,7 @@ export const FILE_MODIFYING_JOBS = new Set(["task.execute"]);
 
 const MAX_OUTPUT = 256 * 1024;
 const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
+const CONFIG = loadPushPalsConfig();
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -156,10 +157,10 @@ async function buildArchitectureDocument(
 }
 
 function useOpenHandsExecutor(): boolean {
-  const executor = (process.env.WORKERPALS_EXECUTOR ?? "openhands").trim().toLowerCase();
+  const executor = CONFIG.workerpals.executor.trim().toLowerCase() || "openhands";
   if (executor !== "openhands") {
     console.warn(
-      `[WorkerPals] Unsupported WORKERPALS_EXECUTOR="${executor}". Only "openhands" is supported.`,
+      `[WorkerPals] Unsupported workerpals.executor="${executor}". Only "openhands" is supported.`,
     );
   }
   return true;
@@ -172,7 +173,7 @@ async function executeWithOpenHands(
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
   budgets?: { executionBudgetMs?: number; finalizationBudgetMs?: number },
 ): Promise<JobResult> {
-  const pythonBin = process.env.WORKERPALS_OPENHANDS_PYTHON ?? "python";
+  const pythonBin = CONFIG.workerpals.openhandsPython || "python";
   const scriptPath = resolve(import.meta.dir, "..", "scripts", "openhands_executor.py");
   if (!existsSync(scriptPath)) {
     return {
@@ -182,21 +183,19 @@ async function executeWithOpenHands(
     };
   }
 
-  const envTimeoutMs = parseOpenHandsTimeoutMs(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS);
+  const configuredTimeoutMs = Math.max(10_000, CONFIG.workerpals.openhandsTimeoutMs);
   const executionBudgetMs =
     typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
       ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
       : null;
   const timeoutMs =
     executionBudgetMs != null
-      ? process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS?.trim()
-        ? Math.min(envTimeoutMs, executionBudgetMs)
-        : executionBudgetMs
-      : envTimeoutMs;
+      ? Math.min(configuredTimeoutMs, executionBudgetMs)
+      : configuredTimeoutMs;
   if (executionBudgetMs != null && timeoutMs !== executionBudgetMs) {
     onLog?.(
       "stderr",
-      `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, env cap=${envTimeoutMs}ms).`,
+      `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, configured cap=${configuredTimeoutMs}ms).`,
     );
   }
   const { leadMs: timeoutWarningLeadMs, delayMs: timeoutWarningDelayMs } =
@@ -417,10 +416,8 @@ export async function createJobCommit(
     context?: "host" | "docker";
   },
 ): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
-  const truthy = new Set(["1", "true", "yes", "on"]);
-  const requirePush = truthy.has((process.env.WORKERPALS_REQUIRE_PUSH ?? "").toLowerCase());
-  const pushAgentBranch =
-    requirePush || truthy.has((process.env.WORKERPALS_PUSH_AGENT_BRANCH ?? "").toLowerCase());
+  const requirePush = CONFIG.workerpals.requirePush;
+  const pushAgentBranch = requirePush || CONFIG.workerpals.pushAgentBranch;
   const publicBranchName = `agent/${workerId}/${job.id}`;
   // Keep worker refs out of refs/heads so user-visible branch lists stay clean.
   const hiddenCommitRef = `refs/pushpals/agent/${workerId}/${job.id}`;

@@ -163,6 +163,9 @@ apps/worker/.dockerbuild/
 # Git worktrees for isolated job execution
 .worktrees/
 
+# Local machine config overrides
+config/local.toml
+
 
 /__pycache__
 /__pycache__/

@@ -4,6 +4,8 @@
  * - Ollama
  */
 
+import { loadPushPalsConfig, type PushPalsLmStudioConfig } from "shared";
+
 export interface LLMMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -42,6 +44,15 @@ export interface LLMClientOptions {
   apiKey?: string;
   model?: string;
   backend?: string;
+}
+
+interface ResolvedServiceLlmConfig {
+  backend: LlmBackend;
+  endpoint: string;
+  model: string;
+  apiKey: string;
+  sessionId: string;
+  lmStudio: PushPalsLmStudioConfig;
 }
 
 const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
@@ -95,46 +106,20 @@ function firstNonEmpty(...values: Array<string | null | undefined>): string | nu
   return null;
 }
 
-function resolveServiceLlmConfig(opts: LLMClientOptions = {}): {
-  backend: LlmBackend;
-  endpoint: string;
-  model: string;
-  apiKey: string;
-} {
+function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLlmConfig {
   const service = opts.service ?? "remotebuddy";
+  const config = loadPushPalsConfig();
+  const serviceLlmConfig =
+    service === "localbuddy"
+      ? config.localbuddy.llm
+      : service === "workerpals"
+        ? config.workerpals.llm
+        : config.remotebuddy.llm;
 
-  const envKeys = (() => {
-    switch (service) {
-      case "localbuddy":
-        return {
-          endpoint: "LOCALBUDDY_LLM_ENDPOINT",
-          model: "LOCALBUDDY_LLM_MODEL",
-          apiKey: "LOCALBUDDY_LLM_API_KEY",
-          backend: "LOCALBUDDY_LLM_BACKEND",
-        } as const;
-      case "remotebuddy":
-        return {
-          endpoint: "REMOTEBUDDY_LLM_ENDPOINT",
-          model: "REMOTEBUDDY_LLM_MODEL",
-          apiKey: "REMOTEBUDDY_LLM_API_KEY",
-          backend: "REMOTEBUDDY_LLM_BACKEND",
-        } as const;
-      case "workerpals":
-        return {
-          endpoint: "WORKERPALS_LLM_ENDPOINT",
-          model: "WORKERPALS_LLM_MODEL",
-          apiKey: "WORKERPALS_LLM_API_KEY",
-          backend: "WORKERPALS_LLM_BACKEND",
-        } as const;
-    }
-  })();
-
-  const explicitBackend = normalizeBackend(
-    firstNonEmpty(opts.backend, process.env[envKeys.backend]),
-  );
+  const explicitBackend = normalizeBackend(firstNonEmpty(opts.backend, serviceLlmConfig.backend));
   const endpoint = firstNonEmpty(
     opts.endpoint,
-    process.env[envKeys.endpoint],
+    serviceLlmConfig.endpoint,
     explicitBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT,
   );
   const backend = configuredBackend(endpoint ?? "", explicitBackend);
@@ -143,16 +128,21 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): {
       ? normalizeOllamaEndpoint(endpoint ?? DEFAULT_OLLAMA_ENDPOINT)
       : normalizeLmStudioEndpoint(endpoint ?? DEFAULT_LMSTUDIO_ENDPOINT);
 
-  const model =
-    firstNonEmpty(opts.model, process.env[envKeys.model], DEFAULT_MODEL) ?? DEFAULT_MODEL;
+  const model = firstNonEmpty(opts.model, serviceLlmConfig.model, DEFAULT_MODEL) ?? DEFAULT_MODEL;
   const apiKey =
-    firstNonEmpty(
-      opts.apiKey,
-      process.env[envKeys.apiKey],
-      backend === "lmstudio" ? "lmstudio" : "",
-    ) ?? "";
+    firstNonEmpty(opts.apiKey, serviceLlmConfig.apiKey, backend === "lmstudio" ? "lmstudio" : "") ??
+    "";
+  const sessionId =
+    firstNonEmpty(opts.sessionId, serviceLlmConfig.sessionId, config.sessionId, "default") ?? "default";
 
-  return { backend, endpoint: normalizedEndpoint, model, apiKey };
+  return {
+    backend,
+    endpoint: normalizedEndpoint,
+    model,
+    apiKey,
+    sessionId,
+    lmStudio: config.llm.lmstudio,
+  };
 }
 
 function normalizeLmStudioEndpoint(endpoint: string): string {
@@ -176,11 +166,6 @@ function lmStudioHeaders(apiKey: string): Record<string, string> {
     headers.Authorization = `Bearer ${apiKey.trim()}`;
   }
   return headers;
-}
-
-function parsePositiveInt(value: string | null | undefined, fallback: number): number {
-  const parsed = Number.parseInt((value ?? "").trim(), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 // Conservative estimate to stay safely under provider context limits.
@@ -237,26 +222,8 @@ function normalizeSessionTag(value: string): string {
   return collapsed.length <= 96 ? collapsed : collapsed.slice(0, 96);
 }
 
-function serviceSessionOverride(service: LlmService): string | null {
-  switch (service) {
-    case "localbuddy":
-      return firstNonEmpty(process.env.LOCALBUDDY_LLM_SESSION_ID);
-    case "remotebuddy":
-      return firstNonEmpty(process.env.REMOTEBUDDY_LLM_SESSION_ID);
-    case "workerpals":
-      return firstNonEmpty(process.env.WORKERPALS_LLM_SESSION_ID);
-  }
-}
-
 function stableConversationTag(service: LlmService, sessionId?: string): string {
-  const source =
-    firstNonEmpty(
-      sessionId,
-      serviceSessionOverride(service),
-      process.env.PUSHPALS_LLM_SESSION_ID,
-      process.env.PUSHPALS_SESSION_ID,
-      "default",
-    ) ?? "default";
+  const source = firstNonEmpty(sessionId, "default") ?? "default";
   return `pushpals-${service}-${normalizeSessionTag(source)}`;
 }
 
@@ -382,6 +349,12 @@ export class LmStudioClient implements LLMClient {
   private apiKey: string;
   private model: string;
   private sessionTag: string;
+  private contextWindow: number;
+  private minOutputTokens: number;
+  private tokenSafetyMargin: number;
+  private batchTailMessages: number;
+  private batchChunkTokens: number;
+  private batchMemoryChars: number;
   private resolvedModel: string | null = null;
   private resolveModelPromise: Promise<string> | null = null;
 
@@ -391,12 +364,26 @@ export class LmStudioClient implements LLMClient {
     model?: string;
     service?: LlmService;
     sessionId?: string;
+    lmStudio?: PushPalsLmStudioConfig;
   }) {
     const rawEndpoint = opts?.endpoint ?? DEFAULT_LMSTUDIO_ENDPOINT;
     this.endpoint = normalizeLmStudioEndpoint(rawEndpoint);
     this.apiKey = opts?.apiKey ?? "lmstudio";
     this.model = opts?.model ?? DEFAULT_MODEL;
     this.sessionTag = stableConversationTag(opts?.service ?? "remotebuddy", opts?.sessionId);
+    const lmStudio = opts?.lmStudio;
+    this.contextWindow = Math.max(512, lmStudio?.contextWindow ?? DEFAULT_LMSTUDIO_CONTEXT_WINDOW);
+    this.minOutputTokens = Math.max(64, lmStudio?.minOutputTokens ?? DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS);
+    this.tokenSafetyMargin = Math.max(
+      16,
+      lmStudio?.tokenSafetyMargin ?? DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
+    );
+    this.batchTailMessages = Math.max(
+      1,
+      lmStudio?.batchTailMessages ?? DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES,
+    );
+    this.batchChunkTokens = Math.max(0, lmStudio?.batchChunkTokens ?? 0);
+    this.batchMemoryChars = Math.max(0, lmStudio?.batchMemoryChars ?? 0);
   }
 
   private lmStudioModelProbeUrls(): string[] {
@@ -627,15 +614,8 @@ export class LmStudioClient implements LLMClient {
   private async packContextInBatches(
     fullMessages: Array<{ role: string; content: string }>,
     promptTokenBudget: number,
-    contextWindow: number,
   ): Promise<{ messages: Array<{ role: string; content: string }>; chunkCount: number }> {
-    const tailCount = Math.max(
-      1,
-      parsePositiveInt(
-        process.env.PUSHPALS_LMSTUDIO_BATCH_TAIL_MESSAGES,
-        DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES,
-      ),
-    );
+    const tailCount = this.batchTailMessages;
     const tailMessages = fullMessages.slice(-tailCount);
     // Reserve budget for tail messages and packed-context wrapper system messages.
     const reservedTailTokens = sumEstimatedTokens(tailMessages) + 220;
@@ -644,16 +624,16 @@ export class LmStudioClient implements LLMClient {
       Math.min(Math.floor(promptTokenBudget * 0.6), promptTokenBudget - reservedTailTokens),
     );
 
-    const chunkTokenBudget = parsePositiveInt(
-      process.env.PUSHPALS_LMSTUDIO_BATCH_CHUNK_TOKENS,
-      Math.max(256, Math.floor(promptTokenBudget * 0.55)),
-    );
+    const chunkTokenBudget =
+      this.batchChunkTokens > 0
+        ? this.batchChunkTokens
+        : Math.max(256, Math.floor(promptTokenBudget * 0.55));
     const chunkCharBudget = chunkTokenBudget * 3;
-    const memoryCharBudget = parsePositiveInt(
-      process.env.PUSHPALS_LMSTUDIO_BATCH_MEMORY_CHARS,
-      Math.max(900, adaptiveMemoryTokenBudget * 3),
-    );
-    const packMaxTokens = Math.max(128, Math.min(1024, Math.floor(contextWindow * 0.25)));
+    const memoryCharBudget =
+      this.batchMemoryChars > 0
+        ? this.batchMemoryChars
+        : Math.max(900, adaptiveMemoryTokenBudget * 3);
+    const packMaxTokens = Math.max(128, Math.min(1024, Math.floor(this.contextWindow * 0.25)));
     const serialized = serializeMessagesForBatch(fullMessages);
     const chunks = chunkByCharBudget(serialized, chunkCharBudget);
     if (chunks.length <= 1) {
@@ -707,19 +687,13 @@ export class LmStudioClient implements LLMClient {
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
-    const contextWindow = parsePositiveInt(
-      process.env.PUSHPALS_LMSTUDIO_CONTEXT_WINDOW,
-      DEFAULT_LMSTUDIO_CONTEXT_WINDOW,
-    );
-    const minOutputTokens = parsePositiveInt(
-      process.env.PUSHPALS_LMSTUDIO_MIN_OUTPUT_TOKENS,
-      DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS,
-    );
+    const contextWindow = this.contextWindow;
+    const minOutputTokens = this.minOutputTokens;
     const desiredMaxTokens = input.maxTokens ?? 2048;
     const clampedMinOutput = Math.max(64, Math.min(minOutputTokens, Math.floor(contextWindow / 2)));
     const promptTokenBudget = Math.max(
       384,
-      contextWindow - clampedMinOutput - DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
+      contextWindow - clampedMinOutput - this.tokenSafetyMargin,
     );
     const systemTokenBudget = Math.max(
       128,
@@ -742,7 +716,6 @@ export class LmStudioClient implements LLMClient {
         const packed = await this.packContextInBatches(
           fullMessages,
           promptTokenBudget,
-          contextWindow,
         );
         messages = packed.messages;
         packedChunkCount = packed.chunkCount;
@@ -781,7 +754,7 @@ export class LmStudioClient implements LLMClient {
       64,
       Math.min(
         desiredMaxTokens,
-        contextWindow - promptTokensEstimate - DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
+        contextWindow - promptTokensEstimate - this.tokenSafetyMargin,
       ),
     );
 
@@ -853,6 +826,7 @@ export class OllamaClient implements LLMClient {
 
 export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
   const resolved = resolveServiceLlmConfig(opts);
+  const service = opts.service ?? "remotebuddy";
 
   if (resolved.backend === "ollama") {
     console.log(
@@ -871,7 +845,8 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
     endpoint: resolved.endpoint,
     apiKey: resolved.apiKey,
     model: resolved.model,
-    service: opts.service ?? "remotebuddy",
-    sessionId: opts.sessionId,
+    service,
+    sessionId: resolved.sessionId,
+    lmStudio: resolved.lmStudio,
   });
 }

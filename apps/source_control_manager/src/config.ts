@@ -1,8 +1,9 @@
 import { existsSync, readFileSync } from "fs";
-import { resolve, join } from "path";
+import { resolve } from "path";
+import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 
 /**
- * Check configuration — a command to run and its timeout.
+ * Check configuration - a command to run and its timeout.
  */
 export interface CheckConfig {
   /** A human-readable name for the check. */
@@ -19,92 +20,86 @@ export interface CheckConfig {
 export interface SourceControlManagerConfig {
   /** Absolute path to the git repository to manage. */
   repoPath: string;
-  /** PushPals server URL. Default: "http://localhost:3001". */
+  /** PushPals server URL. */
   serverUrl: string;
-  /** Git remote name. Default: "origin". */
+  /** Git remote name. */
   remote: string;
-  /** The integration branch to merge into. Default: "main_agents". */
+  /** The integration branch to merge into. */
   mainBranch: string;
-  /** Prefix for agent branches to discover. Default: "agent/". */
+  /** Base branch used for integration bootstrap/sync. */
+  integrationBaseBranch: string;
+  /** Prefix for agent branches to discover. */
   branchPrefix: string;
-  /** How often to poll for new branches (seconds). Default: 10. */
+  /** How often to poll for new branches (seconds). */
   pollIntervalSeconds: number;
   /** Ordered list of checks to run on the temp branch after merge, before pushing. */
   checks: CheckConfig[];
-  /** Directory for SQLite DB and lock file. Default: "./state". */
+  /** Directory for SQLite DB and lock file. */
   stateDir: string;
-  /** Port for the HTTP status server. Default: 3002. */
+  /** Port for the HTTP status server. */
   port: number;
-  /** Whether to delete remote agent branches after successful merge. Default: false. */
+  /** Whether to delete remote agent branches after successful merge. */
   deleteAfterMerge: boolean;
-  /** Max consecutive failures before a branch is skipped. Default: 3. */
+  /** Max consecutive failures before a branch is skipped. */
   maxAttempts: number;
   /**
    * Integration strategy:
-   * - "cherry-pick": apply worker commit(s) onto integration branch (linear history, no merge commits)
+   * - "cherry-pick": apply worker commit(s) onto integration branch
    * - "no-ff": merge commit
    * - "ff-only": fast-forward only
-   * Default: "cherry-pick".
    */
   mergeStrategy: "cherry-pick" | "no-ff" | "ff-only";
-  /** Push integration branch to remote after successful merge/checks. Default: true. */
+  /** Push integration branch to remote after successful merge/checks. */
   pushMainAfterMerge: boolean;
-  /** Open or reuse a PR from integration branch to base branch after successful push. Default: true. */
+  /** Open or reuse a PR from integration branch to base branch after successful push. */
   openPrAfterPush: boolean;
-  /** Base branch for auto-opened PRs. Default: $PUSHPALS_INTEGRATION_BASE_BRANCH or "main". */
+  /** Base branch for auto-opened PRs. */
   prBaseBranch: string;
   /** Optional PR title override for auto-opened PRs. */
   prTitle?: string;
   /** Optional PR body override for auto-opened PRs. */
   prBody?: string;
-  /** Open PR as draft. Default: false. */
+  /** Open PR as draft. */
   prDraft: boolean;
   /** Authentication token for server API calls. */
   authToken?: string;
+  /** Git token for authenticated git push/fetch. */
+  gitToken?: string | null;
+  /** Emit SCM status heartbeat interval (ms). */
+  statusHeartbeatMs: number;
+  /** Skip clean-repo guard at startup. */
+  skipCleanCheck: boolean;
+  /** Auto-create missing integration branch without prompt. */
+  autoCreateMainBranch: boolean;
 }
 
-const TRUTHY = new Set(["1", "true", "yes", "on"]);
-const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..");
-const DEFAULT_SOURCE_CONTROL_MANAGER_REPO_PATH = join(
-  REPO_ROOT,
-  ".worktrees",
-  "source_control_manager",
-);
+const PUSH_CONFIG = loadPushPalsConfig();
 
 const DEFAULTS: SourceControlManagerConfig = {
-  repoPath: process.env.SOURCE_CONTROL_MANAGER_REPO_PATH
-    ? resolve(process.env.SOURCE_CONTROL_MANAGER_REPO_PATH)
-    : DEFAULT_SOURCE_CONTROL_MANAGER_REPO_PATH,
-  serverUrl: process.env.PUSHPALS_SERVER_URL ?? "http://localhost:3001",
-  remote: "origin",
-  mainBranch:
-    process.env.SOURCE_CONTROL_MANAGER_MAIN_BRANCH ??
-    process.env.PUSHPALS_INTEGRATION_BRANCH ??
-    "main_agents",
-  branchPrefix: "agent/",
-  pollIntervalSeconds: 10,
+  repoPath: resolve(PUSH_CONFIG.sourceControlManager.repoPath),
+  serverUrl: PUSH_CONFIG.server.url,
+  remote: PUSH_CONFIG.sourceControlManager.remote,
+  mainBranch: PUSH_CONFIG.sourceControlManager.mainBranch,
+  integrationBaseBranch: PUSH_CONFIG.sourceControlManager.baseBranch,
+  branchPrefix: PUSH_CONFIG.sourceControlManager.branchPrefix,
+  pollIntervalSeconds: PUSH_CONFIG.sourceControlManager.pollIntervalSeconds,
   checks: [],
-  stateDir: process.env.PUSHPALS_DATA_DIR
-    ? join(process.env.PUSHPALS_DATA_DIR, "source_control_manager")
-    : join(REPO_ROOT, "outputs", "data", "source_control_manager"),
-  port: 3002,
-  deleteAfterMerge: false,
-  maxAttempts: 3,
-  mergeStrategy: "cherry-pick",
-  pushMainAfterMerge: !TRUTHY.has((process.env.SOURCE_CONTROL_MANAGER_NO_PUSH ?? "").toLowerCase()),
-  openPrAfterPush: !TRUTHY.has(
-    (process.env.SOURCE_CONTROL_MANAGER_DISABLE_AUTO_PR ?? "").toLowerCase(),
-  ),
-  prBaseBranch:
-    (
-      process.env.SOURCE_CONTROL_MANAGER_PR_BASE_BRANCH ??
-      process.env.PUSHPALS_INTEGRATION_BASE_BRANCH ??
-      ""
-    ).trim() || "main",
-  prTitle: (process.env.SOURCE_CONTROL_MANAGER_PR_TITLE ?? "").trim() || undefined,
-  prBody: (process.env.SOURCE_CONTROL_MANAGER_PR_BODY ?? "").trim() || undefined,
-  prDraft: TRUTHY.has((process.env.SOURCE_CONTROL_MANAGER_PR_DRAFT ?? "").toLowerCase()),
-  authToken: process.env.PUSHPALS_AUTH_TOKEN,
+  stateDir: resolve(PUSH_CONFIG.sourceControlManager.stateDir),
+  port: PUSH_CONFIG.sourceControlManager.port,
+  deleteAfterMerge: PUSH_CONFIG.sourceControlManager.deleteAfterMerge,
+  maxAttempts: PUSH_CONFIG.sourceControlManager.maxAttempts,
+  mergeStrategy: PUSH_CONFIG.sourceControlManager.mergeStrategy,
+  pushMainAfterMerge: PUSH_CONFIG.sourceControlManager.pushMainAfterMerge,
+  openPrAfterPush: PUSH_CONFIG.sourceControlManager.openPrAfterPush,
+  prBaseBranch: PUSH_CONFIG.sourceControlManager.prBaseBranch,
+  prTitle: PUSH_CONFIG.sourceControlManager.prTitle ?? undefined,
+  prBody: PUSH_CONFIG.sourceControlManager.prBody ?? undefined,
+  prDraft: PUSH_CONFIG.sourceControlManager.prDraft,
+  authToken: PUSH_CONFIG.authToken ?? undefined,
+  gitToken: PUSH_CONFIG.gitToken,
+  statusHeartbeatMs: PUSH_CONFIG.sourceControlManager.statusHeartbeatMs,
+  skipCleanCheck: PUSH_CONFIG.sourceControlManager.skipCleanCheck,
+  autoCreateMainBranch: PUSH_CONFIG.sourceControlManager.autoCreateMainBranch,
 };
 
 /**
@@ -184,6 +179,12 @@ export function validateConfig(config: SourceControlManagerConfig): void {
   }
   if (typeof config.mainBranch !== "string" || config.mainBranch.length === 0) {
     throw new Error(`Invalid config: mainBranch must be a non-empty string`);
+  }
+  if (
+    typeof config.integrationBaseBranch !== "string" ||
+    config.integrationBaseBranch.length === 0
+  ) {
+    throw new Error(`Invalid config: integrationBaseBranch must be a non-empty string`);
   }
   if (typeof config.prBaseBranch !== "string" || config.prBaseBranch.length === 0) {
     throw new Error(`Invalid config: prBaseBranch must be a non-empty string`);

@@ -1,0 +1,37 @@
+# Copy this file to config/local.toml for machine-specific, non-secret overrides.
+# Keep secrets in .env (or CI secret store), not in TOML.
+
+[localbuddy.llm]
+model = "zai-org/glm-4.7-flash"
+endpoint = "http://127.0.0.1:1234"
+
+[remotebuddy.llm]
+model = "zai-org/glm-4.7-flash"
+endpoint = "http://127.0.0.1:1234"
+
+[workerpals.llm]
+model = "zai-org/glm-4.7-flash"
+endpoint = "http://127.0.0.1:1234"
+
+[workerpals]
+docker_image = "pushpals-worker-sandbox:latest"
+openhands_timeout_ms = 1800000
+
+[workerpals.openhands]
+prompt_profile = "minimal"
+tool_preflight_timeout_sec = 45
+agent_max_steps = 30
+
+[llm.lmstudio]
+context_window = 4096
+min_output_tokens = 256
+batch_tail_messages = 3
+
+[source_control_manager]
+repo_path = ".worktrees/source_control_manager"
+main_branch = "main_agents"
+base_branch = "main"
+
+[startup]
+startup_warmup = true
+lmstudio_ready_timeout_ms = 120000
