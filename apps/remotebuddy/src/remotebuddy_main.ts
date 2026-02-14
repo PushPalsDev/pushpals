@@ -255,6 +255,17 @@ function isStrictPreflightJsonFailure(message: string, detail: string): boolean 
   );
 }
 
+function isNoChangeCompletionSummary(summary: string): boolean {
+  const text = summary.toLowerCase();
+  return (
+    text.includes("no targetpath provided") ||
+    text.includes("no target path provided") ||
+    text.includes("no changes to commit") ||
+    text.includes("no file changes detected") ||
+    text.includes("no modified files were detected")
+  );
+}
+
 class RemoteBuddyOrchestrator {
   private readonly agentId = "remotebuddy-orchestrator";
   private readonly server: string;
@@ -284,6 +295,7 @@ class RemoteBuddyOrchestrator {
   private statusSessionReady = false;
   private stopSessionEvents: (() => void) | null = null;
   private readonly seenJobFailures = new Set<string>();
+  private readonly seenJobCompletions = new Set<string>();
   private readonly eventMonitorStartedAt = Date.now();
   private jobsDb: Database | null = null;
   private disposed = false;
@@ -505,27 +517,52 @@ class RemoteBuddyOrchestrator {
   startSessionEventMonitor(): void {
     this.stopSessionEvents = this.comm.subscribeSessionEvents(
       (envelope) => {
-        if (envelope.type !== "job_failed") return;
+        if (envelope.type !== "job_failed" && envelope.type !== "job_completed") return;
         const tsMs = Date.parse(envelope.ts);
         if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
+        if (envelope.type === "job_failed") {
+          const payload = envelope.payload as {
+            jobId?: unknown;
+            message?: unknown;
+            detail?: unknown;
+          };
+          const jobId = String(payload.jobId ?? "").trim();
+          const message = toSingleLine(payload.message, 220);
+          const detail = toSingleLine(payload.detail, 220);
+          if (!jobId || !message) return;
+
+          const dedupeKey = `${jobId}:${message}`;
+          if (this.seenJobFailures.has(dedupeKey)) return;
+          this.seenJobFailures.add(dedupeKey);
+
+          const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
+          this.pushContext(failureLine);
+          console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
+          void this.handleObservedJobFailure(envelope, jobId, message, detail);
+          return;
+        }
+
         const payload = envelope.payload as {
           jobId?: unknown;
-          message?: unknown;
-          detail?: unknown;
+          summary?: unknown;
         };
         const jobId = String(payload.jobId ?? "").trim();
-        const message = toSingleLine(payload.message, 220);
-        const detail = toSingleLine(payload.detail, 220);
-        if (!jobId || !message) return;
+        const summary = toSingleLine(payload.summary, 240) || "Job completed";
+        if (!jobId) return;
+        if (/startup warmup completed/i.test(summary)) return;
+        if (this.seenJobCompletions.has(jobId)) return;
+        this.seenJobCompletions.add(jobId);
 
-        const dedupeKey = `${jobId}:${message}`;
-        if (this.seenJobFailures.has(dedupeKey)) return;
-        this.seenJobFailures.add(dedupeKey);
-
-        const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
-        this.pushContext(failureLine);
-        console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
-        void this.handleObservedJobFailure(envelope, jobId, message, detail);
+        this.pushContext(`[job_completed ${jobId}] ${summary}`);
+        const shortJob = jobId.slice(0, 8);
+        const note = isNoChangeCompletionSummary(summary)
+          ? `WorkerPal job ${shortJob} completed: ${summary}. No files were changed, so no commit was created.`
+          : `WorkerPal job ${shortJob} completed: ${summary}.`;
+        void this.comm.assistantMessage(note, {
+          correlationId: envelope.correlationId,
+          turnId: envelope.turnId,
+          parentId: envelope.id,
+        });
       },
       {
         onError: (message) => console.warn(`[RemoteBuddy] Session monitor: ${message}`),
@@ -894,7 +931,11 @@ class RemoteBuddyOrchestrator {
       const requiresWorker = this.shouldForceDirectReply(prompt, plan.intent)
         ? false
         : plan.requires_worker;
-      const lane = requiresWorker ? this.chooseExecutionLane(prompt, plan) : "deterministic";
+      const targetPath = plan.target_paths[0] ?? extractTargetPath(prompt) ?? undefined;
+      let lane = requiresWorker ? this.chooseExecutionLane(prompt, plan) : "deterministic";
+      if (requiresWorker && lane === "deterministic" && plan.intent === "code_change" && !targetPath) {
+        lane = "openhands";
+      }
 
       if (queueWaitMs > queueWaitBudgetMs) {
         await this.comm.assistantMessage(
@@ -935,7 +976,6 @@ class RemoteBuddyOrchestrator {
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
       const executionBudgetMs = this.executionBudgetForPriority(priority);
-      const targetPath = plan.target_paths[0] ?? extractTargetPath(prompt) ?? undefined;
       const params: TaskExecuteJobParams = {
         schemaVersion: 2,
         requestId,
