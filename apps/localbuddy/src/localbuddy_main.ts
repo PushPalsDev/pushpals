@@ -359,7 +359,7 @@ class LocalBuddyServer {
     console.log(`[LocalBuddy] Detected repo root: ${this.repo}`);
 
     // Initialize LLM client for prompt enhancement
-    this.llm = createLLMClient({ service: "localbuddy" });
+    this.llm = createLLMClient({ service: "localbuddy", sessionId: this.sessionId });
     console.log(`[LocalBuddy] LLM client initialized`);
   }
 

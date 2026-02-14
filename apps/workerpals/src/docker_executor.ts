@@ -17,6 +17,35 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { isAbsolute, relative, resolve } from "path";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 
+function parseClampedEnvInt(
+  name: string,
+  defaultValue: number,
+  min: number,
+  max: number,
+): number {
+  const raw = Number.parseInt(process.env[name] ?? "", 10);
+  if (!Number.isFinite(raw) || raw <= 0) return defaultValue;
+  return Math.max(min, Math.min(max, raw));
+}
+
+function parseClampedEnvIntAllowZero(name: string, defaultValue: number, max: number): number {
+  const raw = Number.parseInt(process.env[name] ?? "", 10);
+  if (!Number.isFinite(raw) || raw < 0) return defaultValue;
+  return Math.max(0, Math.min(max, raw));
+}
+
+export class DockerExecutionExhaustedError extends Error {
+  readonly cooldownMs: number;
+  readonly category: "warm_setup" | "job_execution";
+
+  constructor(category: "warm_setup" | "job_execution", message: string, cooldownMs: number) {
+    super(message);
+    this.name = "DockerExecutionExhaustedError";
+    this.category = category;
+    this.cooldownMs = Math.max(0, Math.floor(cooldownMs));
+  }
+}
+
 export interface DockerExecutorOptions {
   /** Path to the git repository on the host */
   repo: string;
@@ -42,6 +71,7 @@ export interface DockerJobResult {
   stdout?: string;
   stderr?: string;
   exitCode?: number;
+  cooldownMs?: number;
   commit?: {
     branch: string;
     sha: string;
@@ -65,16 +95,19 @@ export class DockerExecutor {
   private activeJobs = 0;
   private readonly warmAgentStartupTimeoutMs: number;
   private readonly warmAgentStartupPollMs: number = 200;
+  private readonly warmSetupMaxAttempts: number;
+  private readonly warmSetupBackoffMs: number;
+  private readonly jobRetryMaxAttempts: number;
+  private readonly jobRetryBackoffMs: number;
+  private readonly failureCooldownMs: number;
 
   constructor(options: DockerExecutorOptions) {
-    const startupTimeoutRaw = Number.parseInt(
-      process.env.WORKERPALS_DOCKER_AGENT_STARTUP_TIMEOUT_MS ?? "",
-      10,
+    const startupTimeoutMs = parseClampedEnvInt(
+      "WORKERPALS_DOCKER_AGENT_STARTUP_TIMEOUT_MS",
+      45_000,
+      10_000,
+      180_000,
     );
-    const startupTimeoutMs =
-      Number.isFinite(startupTimeoutRaw) && startupTimeoutRaw > 0
-        ? Math.max(10_000, Math.min(180_000, startupTimeoutRaw))
-        : 45_000;
 
     this.options = {
       gitToken: "",
@@ -89,6 +122,35 @@ export class DockerExecutor {
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
+    this.warmSetupMaxAttempts = parseClampedEnvInt(
+      "WORKERPALS_DOCKER_WARM_MAX_ATTEMPTS",
+      3,
+      1,
+      5,
+    );
+    this.warmSetupBackoffMs = parseClampedEnvInt(
+      "WORKERPALS_DOCKER_WARM_RETRY_BACKOFF_MS",
+      2_000,
+      250,
+      60_000,
+    );
+    this.jobRetryMaxAttempts = parseClampedEnvInt(
+      "WORKERPALS_DOCKER_JOB_MAX_ATTEMPTS",
+      2,
+      1,
+      3,
+    );
+    this.jobRetryBackoffMs = parseClampedEnvInt(
+      "WORKERPALS_DOCKER_JOB_RETRY_BACKOFF_MS",
+      3_000,
+      250,
+      60_000,
+    );
+    this.failureCooldownMs = parseClampedEnvIntAllowZero(
+      "WORKERPALS_DOCKER_FAILURE_COOLDOWN_MS",
+      20_000,
+      300_000,
+    );
 
     // Ensure worktrees directory exists
     try {
@@ -125,9 +187,64 @@ export class DockerExecutor {
       const base64Spec = Buffer.from(JSON.stringify(jobSpec)).toString("base64");
 
       // Step 3: Run Docker container with the worktree mounted
-      const result = await this.runInWarmContainer(worktreePath, base64Spec, onLog);
+      for (let attempt = 1; attempt <= this.jobRetryMaxAttempts; attempt++) {
+        try {
+          const result = await this.runInWarmContainer(worktreePath, base64Spec, onLog);
+          if (result.ok) return result;
 
-      return result;
+          const retryableFailure = this.isRetryableJobFailure(result);
+          if (attempt >= this.jobRetryMaxAttempts || !retryableFailure) {
+            if (retryableFailure && attempt >= this.jobRetryMaxAttempts && this.failureCooldownMs > 0) {
+              return {
+                ...result,
+                cooldownMs: this.failureCooldownMs,
+              };
+            }
+            return result;
+          }
+
+          const retryInMs = this.backoffDelayMs(this.jobRetryBackoffMs, attempt);
+          const note = `[DockerExecutor] Transient job failure detected for ${job.id}; retrying attempt ${
+            attempt + 1
+          }/${this.jobRetryMaxAttempts} in ${retryInMs}ms.`;
+          console.warn(note);
+          onLog?.("stderr", note);
+          await this.stopWarmContainer("job retry after transient failure", true);
+          await this.sleep(retryInMs);
+        } catch (err) {
+          const retryableError = this.isRetryableError(err);
+          if (attempt >= this.jobRetryMaxAttempts || !retryableError) {
+            if (
+              retryableError &&
+              attempt >= this.jobRetryMaxAttempts &&
+              !(err instanceof DockerExecutionExhaustedError)
+            ) {
+              throw new DockerExecutionExhaustedError(
+                "job_execution",
+                `Docker execution retries exhausted after ${this.jobRetryMaxAttempts} attempts: ${this.compactError(
+                  err,
+                )}`,
+                this.failureCooldownMs,
+              );
+            }
+            throw err;
+          }
+          const retryInMs = this.backoffDelayMs(this.jobRetryBackoffMs, attempt);
+          const note = `[DockerExecutor] Transient Docker execution error for ${job.id}: ${this.compactError(
+            err,
+          )}. Retrying attempt ${attempt + 1}/${this.jobRetryMaxAttempts} in ${retryInMs}ms.`;
+          console.warn(note);
+          onLog?.("stderr", note);
+          await this.stopWarmContainer("job retry after execution error", true);
+          await this.sleep(retryInMs);
+        }
+      }
+
+      return {
+        ok: false,
+        summary: "Docker job retries exhausted",
+        stderr: `Retries exhausted after ${this.jobRetryMaxAttempts} attempts`,
+      };
     } finally {
       this.activeJobs = Math.max(0, this.activeJobs - 1);
       // Step 4: Clean up worktree (always cleanup)
@@ -542,7 +659,9 @@ export class DockerExecutor {
       'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
       '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }';
     const restartCmd =
-      "pkill -f 'openhands.agent_server' >/dev/null 2>&1 || true; " +
+      'OLD_PIDS="$(ps -eo pid,args | awk \'/[o]penhands\\.agent_server/ {print $1}\' | tr \'\\n\' \' \')"; ' +
+      'if [ -n "$OLD_PIDS" ]; then kill $OLD_PIDS >/dev/null 2>&1 || true; fi; ' +
+      "sleep 0.2; " +
       `${resolvePythonCmd}; ` +
       ": >/tmp/openhands-agent.log; " +
       `"$PY" -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
@@ -559,7 +678,9 @@ export class DockerExecutor {
         `[DockerExecutor] Warm agent restart failed in ${this.warmContainerName}; recreating warm container once...`,
       );
       await this.startWarmContainer();
-      const postRecreateHealth = await this.runWarmShell(healthCmd);
+      const postRecreateHealth = await this.runWarmShell(
+        `for i in $(seq 1 ${startupAttempts}); do ${healthCmd} && exit 0; sleep ${sleepSeconds}; done; exit 1`,
+      );
       if (postRecreateHealth.ok) {
         return;
       }
@@ -615,8 +736,7 @@ export class DockerExecutor {
     base64Spec: string,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<DockerJobResult> {
-    await this.ensureWarmContainer();
-    await this.ensureWarmAgentServer();
+    await this.ensureWarmRuntimeReady(onLog);
 
     const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
@@ -812,6 +932,97 @@ export class DockerExecutor {
       stderr: stderrLines.join("\n"),
       exitCode,
     };
+  }
+
+  private async ensureWarmRuntimeReady(
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= this.warmSetupMaxAttempts; attempt++) {
+      try {
+        await this.ensureWarmContainer();
+        await this.ensureWarmAgentServer();
+        return;
+      } catch (err) {
+        const retryable = this.isRetryableError(err);
+        if (attempt >= this.warmSetupMaxAttempts || !retryable) {
+          if (
+            retryable &&
+            attempt >= this.warmSetupMaxAttempts &&
+            !(err instanceof DockerExecutionExhaustedError)
+          ) {
+            throw new DockerExecutionExhaustedError(
+              "warm_setup",
+              `Warm runtime setup retries exhausted after ${this.warmSetupMaxAttempts} attempts: ${this.compactError(
+                err,
+              )}`,
+              this.failureCooldownMs,
+            );
+          }
+          throw err;
+        }
+        const retryInMs = this.backoffDelayMs(this.warmSetupBackoffMs, attempt);
+        const note = `[DockerExecutor] Warm runtime setup failed (attempt ${attempt}/${this.warmSetupMaxAttempts}): ${this.compactError(
+          err,
+        )}. Retrying in ${retryInMs}ms.`;
+        console.warn(note);
+        onLog?.("stderr", note);
+        await this.stopWarmContainer("warm setup retry", true);
+        await this.sleep(retryInMs);
+      }
+    }
+  }
+
+  private backoffDelayMs(baseMs: number, attempt: number): number {
+    const factor = Math.max(0, attempt - 1);
+    const exponential = baseMs * Math.pow(2, factor);
+    return Math.max(250, Math.min(60_000, Math.floor(exponential)));
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+  }
+
+  private compactError(err: unknown): string {
+    const text = err instanceof Error ? err.message : String(err);
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (normalized.length <= 280) return normalized;
+    return `${normalized.slice(0, 277)}...`;
+  }
+
+  private isRetryableError(err: unknown): boolean {
+    const text = this.compactError(err).toLowerCase();
+    return this.matchesRetryablePattern(text);
+  }
+
+  private isRetryableJobFailure(result: DockerJobResult): boolean {
+    const text = `${result.summary ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
+    return this.matchesRetryablePattern(text);
+  }
+
+  private matchesRetryablePattern(text: string): boolean {
+    const transientPatterns = [
+      "warm openhands agent server",
+      "failed to start warm container",
+      "docker execution error",
+      "cannot connect to the docker daemon",
+      "docker daemon",
+      "agent server health check failed",
+      "connection error",
+      "connection refused",
+      "connection reset",
+      "network is unreachable",
+      "timed out",
+      "timeout",
+      "litellm.timeout",
+      "api timeout",
+      "model preflight failed",
+      "temporary failure",
+      "econnrefused",
+      "econnreset",
+      "eai_again",
+      "tls handshake timeout",
+    ];
+    return transientPatterns.some((pattern) => text.includes(pattern));
   }
 
   /**

@@ -161,6 +161,30 @@ def _is_truthy_env(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _safe_session_component(value: Any, fallback: str = "unknown") -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        text = fallback
+    text = re.sub(r"[^a-z0-9._:-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    if not text:
+        text = fallback
+    return text[:64]
+
+
+def _stable_llm_session_user(payload: Optional[Dict[str, Any]]) -> str:
+    override = (os.environ.get("WORKERPALS_LLM_SESSION_ID") or "").strip()
+    if override:
+        return _safe_session_component(override, "pushpals-worker")
+
+    session_id = _safe_session_component(
+        (os.environ.get("PUSHPALS_SESSION_ID") or "").strip(), "session"
+    )
+    worker_id = _safe_session_component((payload or {}).get("workerId"), "worker")
+    task_id = _safe_session_component((payload or {}).get("taskId"), "task")
+    return f"pushpals-{session_id}-{worker_id}-{task_id}"
+
+
 def _json_object_from_env(name: str) -> Tuple[Optional[Dict[str, Any]], str]:
     raw = (os.environ.get(name) or "").strip()
     if not raw:
@@ -420,6 +444,7 @@ def _llm_model_chat_preflight(
     provider: str,
     api_key: str,
     model: str,
+    session_user: str = "",
     timeout: float = 10.0,
 ) -> Tuple[bool, str]:
     if not base_url:
@@ -445,8 +470,12 @@ def _llm_model_chat_preflight(
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if api_key and provider == "openai":
         headers["Authorization"] = f"Bearer {api_key}"
+    if session_user:
+        headers["X-PushPals-Session-Id"] = session_user
 
     try:
+        if provider == "openai" and session_user:
+            body["user"] = session_user
         req = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -475,6 +504,158 @@ def _llm_model_chat_preflight(
         return False, detail
     except Exception as exc:
         return False, f"{url}: {exc}"
+
+
+def _extract_first_json_object(raw: str) -> Dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty response")
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    first = text.find("{")
+    last = text.rfind("}")
+    if first >= 0 and last > first:
+        sliced = text[first : last + 1]
+        parsed = json.loads(sliced)
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("response did not contain parseable JSON object")
+
+
+def _tool_preflight_enabled() -> bool:
+    return _is_truthy_env("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_ENABLED", True)
+
+
+def _tool_need_preflight(
+    base_url: str,
+    provider: str,
+    api_key: str,
+    model: str,
+    instruction: str,
+    session_user: str = "",
+) -> Dict[str, Any]:
+    if not _tool_preflight_enabled():
+        return {
+            "needs_tools": True,
+            "why": "tool preflight disabled by env",
+            "plan": "",
+            "first_command": "",
+            "error": "",
+        }
+
+    url = _chat_completion_url(base_url, provider)
+    payload_model = _providerless_model_name(model)
+    system_prompt = (
+        "You are a routing preflight for a coding agent. "
+        "Decide whether repository tools are needed. "
+        "Return ONLY JSON with keys: "
+        '{"needs_tools":boolean,"why":string,"plan":string,"first_command":string}. '
+        "Use needs_tools=true when work requires checking files, running commands/tests, "
+        "editing code, validating behavior, or verifying repository state. "
+        "If needs_tools=false, provide a short plan that can be answered directly with no tools. "
+        "When true, provide one safe first command (prefer scoped ls/rg/cat)."
+    )
+    user_prompt = f"Task request:\n{instruction}"
+
+    if provider == "ollama":
+        body: Dict[str, Any] = {
+            "model": payload_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "options": {"temperature": 0.0, "num_predict": 160},
+        }
+    else:
+        body = {
+            "model": payload_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 220,
+        }
+        if session_user:
+            body["user"] = session_user
+
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key and provider == "openai":
+        headers["Authorization"] = f"Bearer {api_key}"
+    if session_user:
+        headers["X-PushPals-Session-Id"] = session_user
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15.0) as res:
+            raw = res.read().decode("utf-8", errors="replace")
+            payload = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        return {
+            "needs_tools": True,
+            "why": f"tool preflight HTTP {exc.code}",
+            "plan": "",
+            "first_command": "",
+            "error": detail[:200],
+        }
+    except Exception as exc:
+        return {
+            "needs_tools": True,
+            "why": "tool preflight request failed",
+            "plan": "",
+            "first_command": "",
+            "error": str(exc)[:200],
+        }
+
+    if provider == "ollama":
+        raw_text = str((payload.get("message") or {}).get("content") or "")
+    else:
+        raw_text = str(((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+
+    try:
+        parsed = _extract_first_json_object(raw_text)
+    except Exception as exc:
+        return {
+            "needs_tools": True,
+            "why": "tool preflight response parse failed",
+            "plan": "",
+            "first_command": "",
+            "error": str(exc)[:200],
+        }
+
+    raw_needs_tools = parsed.get("needs_tools", True)
+    if isinstance(raw_needs_tools, bool):
+        needs_tools = raw_needs_tools
+    else:
+        needs_tools = str(raw_needs_tools).strip().lower() in {"1", "true", "yes", "on"}
+
+    why = str(parsed.get("why") or "").strip()
+    plan = str(parsed.get("plan") or "").strip()
+    first_command = str(parsed.get("first_command") or "").strip()
+
+    return {
+        "needs_tools": needs_tools,
+        "why": why[:240],
+        "plan": plan[:600],
+        "first_command": first_command[:180],
+        "error": "",
+    }
 
 
 def _model_candidates_url(base_url: str, provider: str) -> List[str]:
@@ -921,7 +1102,9 @@ def _build_agent_user_message(instruction: str) -> str:
     return f"{compact_agent_prompt}\n\nTask:\n{instruction}\n\n{timeout_note}"
 
 
-def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
+def _run_agentic_task_execute(
+    repo: str, instruction: str, payload: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     try:
         from openhands.sdk import Agent, Conversation, LLM, Tool
         from openhands.tools.file_editor import FileEditorTool
@@ -935,6 +1118,7 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         }
 
     model, api_key, base_url = _resolve_llm_config()
+    stable_session_user = _stable_llm_session_user(payload)
     if not model:
         return {
             "ok": False,
@@ -975,6 +1159,8 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
     llm_kwargs_base: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         llm_kwargs_base["base_url"] = base_url
+    if stable_session_user:
+        llm_kwargs_base["litellm_extra_body"] = {"user": stable_session_user}
     if _looks_local_base_url(base_url):
         # Local model servers should fail fast on connectivity issues instead
         # of spending long retry windows that hit outer Docker timeouts.
@@ -1059,7 +1245,12 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
             continue
 
         preflight_ok, preflight_detail = _llm_model_chat_preflight(
-            base_url, provider, api_key, active_model, model_probe_timeout_sec
+            base_url,
+            provider,
+            api_key,
+            active_model,
+            stable_session_user,
+            model_probe_timeout_sec,
         )
         if not preflight_ok:
             preflight_failures.append(f"{active_model}: {preflight_detail}")
@@ -1107,6 +1298,54 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
         llm_kwargs["model"] = active_model
 
         try:
+            active_user_message = user_message
+            if _tool_preflight_enabled():
+                preflight_model_raw = (
+                    os.environ.get("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MODEL") or ""
+                ).strip()
+                preflight_model = (
+                    _normalize_litellm_model(preflight_model_raw, provider)
+                    if preflight_model_raw
+                    else active_model
+                )
+                tool_decision = _tool_need_preflight(
+                    base_url,
+                    provider,
+                    api_key,
+                    preflight_model,
+                    prepared_instruction,
+                    stable_session_user,
+                )
+                sys.stderr.write(
+                    "[OpenHandsExecutor] Tool preflight: "
+                    f"needs_tools={tool_decision.get('needs_tools')} "
+                    f"why={tool_decision.get('why') or '(none)'}\n"
+                )
+                sys.stderr.flush()
+                if not bool(tool_decision.get("needs_tools", True)):
+                    plan_lines = []
+                    why_text = str(tool_decision.get("why") or "").strip()
+                    plan_text = str(tool_decision.get("plan") or "").strip()
+                    if why_text:
+                        plan_lines.append(f"Reason: {why_text}")
+                    if plan_text:
+                        plan_lines.append(f"Plan: {plan_text}")
+                    return {
+                        "ok": True,
+                        "summary": "Preflight handled request without repository tools",
+                        "stdout": "\n".join(plan_lines) if plan_lines else "No repository tools required.",
+                        "stderr": "",
+                        "exitCode": 0,
+                    }
+
+                first_command = str(tool_decision.get("first_command") or "").strip()
+                if first_command:
+                    active_user_message = (
+                        f"{user_message}\n\n"
+                        "Preflight hint: start with this first command if it fits the task: "
+                        f"`{first_command}`"
+                    )
+
             llm = LLM(**llm_kwargs)
             try:
                 primary_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
@@ -1152,7 +1391,7 @@ def _run_agentic_task_execute(repo: str, instruction: str) -> Dict[str, Any]:
                     raise
 
             conversation = Conversation(agent=agent, workspace=repo)
-            conversation.send_message(user_message)
+            conversation.send_message(active_user_message)
             try:
                 conversation.run(max_steps=max_steps)
             except TypeError:
@@ -1813,7 +2052,7 @@ def main() -> int:
             exit_code=2,
         )
     if lane == "openhands":
-        result = _run_agentic_task_execute(repo, instruction)
+        result = _run_agentic_task_execute(repo, instruction, payload)
         _emit(result)
         return 0 if bool(result.get("ok")) else _to_int(result.get("exitCode"), 1)
 

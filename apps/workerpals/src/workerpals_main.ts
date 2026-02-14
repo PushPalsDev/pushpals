@@ -19,7 +19,7 @@ import { mkdirSync } from "fs";
 import { resolve } from "path";
 import { detectRepoRoot } from "shared";
 import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
-import { DockerExecutor } from "./docker_executor.js";
+import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 
 type CommitRef = {
@@ -34,6 +34,7 @@ type CompletionPrMetadata = {
 
 type WorkerJobResult = JobResult & {
   commit?: CommitRef;
+  cooldownMs?: number;
 };
 
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
@@ -116,6 +117,7 @@ function parseArgs(): {
   dockerNetworkMode: string;
   worktreeBaseRef: string;
   labels: string[];
+  failureCooldownMs: number;
 } {
   const args = process.argv.slice(2);
   let server = "http://localhost:3001";
@@ -137,6 +139,12 @@ function parseArgs(): {
     .split(",")
     .map((label) => label.trim())
     .filter(Boolean);
+  let failureCooldownMs = parseInt(
+    process.env.WORKERPALS_FAILURE_COOLDOWN_MS ??
+      process.env.WORKERPALS_DOCKER_FAILURE_COOLDOWN_MS ??
+      "20000",
+    10,
+  );
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -188,6 +196,9 @@ function parseArgs(): {
           .map((label) => label.trim())
           .filter(Boolean);
         break;
+      case "--failure-cooldown-ms":
+        failureCooldownMs = parseInt(args[++i], 10);
+        break;
     }
   }
 
@@ -208,6 +219,10 @@ function parseArgs(): {
     dockerNetworkMode,
     worktreeBaseRef,
     labels,
+    failureCooldownMs:
+      Number.isFinite(failureCooldownMs) && failureCooldownMs >= 0
+        ? Math.min(failureCooldownMs, 300_000)
+        : 20_000,
   };
 }
 
@@ -606,6 +621,7 @@ async function workerLoop(
 
           let directWorktreePath: string | null = null;
           let executionRepo = opts.repo;
+          let result: WorkerJobResult | null = null;
 
           try {
             if (!dockerExecutor) {
@@ -630,15 +646,33 @@ async function workerLoop(
               sessionId: job.sessionId,
             };
 
-            let result: WorkerJobResult;
+            let cooldownAfterJobMs = 0;
             const jobStartedAtMs = Date.now();
             try {
               result = await runJob(jobData, executionRepo, dockerExecutor, onLog);
+              cooldownAfterJobMs =
+                Number.isFinite(result.cooldownMs) && (result.cooldownMs ?? 0) > 0
+                  ? Math.floor(result.cooldownMs ?? 0)
+                  : 0;
             } catch (err) {
+              if (err instanceof DockerExecutionExhaustedError) {
+                cooldownAfterJobMs = Math.max(
+                  opts.failureCooldownMs,
+                  Number.isFinite(err.cooldownMs) ? err.cooldownMs : 0,
+                );
+              }
               result = {
                 ok: false,
                 summary: "Job execution failed before completion",
                 stderr: String(err),
+                ...(cooldownAfterJobMs > 0 ? { cooldownMs: cooldownAfterJobMs } : {}),
+              };
+            }
+            if (!result) {
+              result = {
+                ok: false,
+                summary: "Job execution failed before completion",
+                stderr: "Worker result was not produced",
               };
             }
             const jobDurationMs = Math.max(0, Date.now() - jobStartedAtMs);
@@ -803,6 +837,23 @@ async function workerLoop(
             }
           } finally {
             clearInterval(busyHeartbeat);
+            if (job.sessionId && result?.cooldownMs && result.cooldownMs > 0) {
+              await sendCommand(opts.server, job.sessionId, headers, {
+                type: "assistant_message",
+                payload: {
+                  text: `WorkerPal is cooling down for ${formatDurationMs(result.cooldownMs)} after transient infrastructure failures.`,
+                },
+                from: `worker:${opts.workerId}`,
+              });
+            }
+            if (result?.cooldownMs && result.cooldownMs > 0) {
+              const cooldownMs = Math.max(0, Math.floor(result.cooldownMs));
+              console.warn(
+                `[WorkerPals] Entering cooldown for ${formatDurationMs(cooldownMs)} after retry exhaustion.`,
+              );
+              await maybeHeartbeat("offline", job.id, true);
+              await new Promise((resolvePromise) => setTimeout(resolvePromise, cooldownMs));
+            }
             await maybeHeartbeat("idle", null, true);
             if (directWorktreePath) {
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {

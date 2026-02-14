@@ -37,6 +37,7 @@ type LlmService = "localbuddy" | "remotebuddy" | "workerpals";
 
 export interface LLMClientOptions {
   service?: LlmService;
+  sessionId?: string;
   endpoint?: string;
   apiKey?: string;
   model?: string;
@@ -226,6 +227,24 @@ function uniqueNonEmptyStrings(values: string[]): string[] {
   return out;
 }
 
+function normalizeSessionTag(value: string): string {
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, "-");
+  const collapsed = normalized.replace(/-+/g, "-").replace(/^-|-$/g, "");
+  if (!collapsed) return "default";
+  return collapsed.length <= 96 ? collapsed : collapsed.slice(0, 96);
+}
+
+function stableConversationTag(service: LlmService, sessionId?: string): string {
+  const source =
+    firstNonEmpty(
+      sessionId,
+      process.env.PUSHPALS_LLM_SESSION_ID,
+      process.env.PUSHPALS_SESSION_ID,
+      "default",
+    ) ?? "default";
+  return `pushpals-${service}-${normalizeSessionTag(source)}`;
+}
+
 function pickConfiguredOrAvailableModel(
   configuredModel: string,
   availableModels: string[],
@@ -336,14 +355,22 @@ export class LmStudioClient implements LLMClient {
   private endpoint: string;
   private apiKey: string;
   private model: string;
+  private sessionTag: string;
   private resolvedModel: string | null = null;
   private resolveModelPromise: Promise<string> | null = null;
 
-  constructor(opts?: { endpoint?: string; apiKey?: string; model?: string }) {
+  constructor(opts?: {
+    endpoint?: string;
+    apiKey?: string;
+    model?: string;
+    service?: LlmService;
+    sessionId?: string;
+  }) {
     const rawEndpoint = opts?.endpoint ?? DEFAULT_LMSTUDIO_ENDPOINT;
     this.endpoint = normalizeLmStudioEndpoint(rawEndpoint);
     this.apiKey = opts?.apiKey ?? "lmstudio";
     this.model = opts?.model ?? DEFAULT_MODEL;
+    this.sessionTag = stableConversationTag(opts?.service ?? "remotebuddy", opts?.sessionId);
   }
 
   private lmStudioModelProbeUrls(): string[] {
@@ -459,6 +486,7 @@ export class LmStudioClient implements LLMClient {
       messages,
       max_tokens: opts.maxTokens,
       temperature: opts.temperature,
+      user: this.sessionTag,
     };
 
     const bodyVariants: Array<Record<string, unknown>> = [];
@@ -491,7 +519,10 @@ export class LmStudioClient implements LLMClient {
       const body = bodyVariants[i];
       const res = await fetch(this.endpoint, {
         method: "POST",
-        headers: lmStudioHeaders(this.apiKey),
+        headers: {
+          ...lmStudioHeaders(this.apiKey),
+          "X-PushPals-Session-Id": this.sessionTag,
+        },
         body: JSON.stringify(body),
       });
 
@@ -765,5 +796,7 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
     endpoint: resolved.endpoint,
     apiKey: resolved.apiKey,
     model: resolved.model,
+    service: opts.service ?? "remotebuddy",
+    sessionId: opts.sessionId,
   });
 }
