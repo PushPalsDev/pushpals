@@ -494,7 +494,9 @@ export class DockerExecutor {
     }
     args.push("-e", `WORKERPALS_OPENHANDS_AGENT_SERVER_URL=http://127.0.0.1:${this.warmAgentPort}`);
 
-    const healthCmd = `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1`;
+    const healthCmd =
+      `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1 ` +
+      `|| curl -fsS http://127.0.0.1:${this.warmAgentPort}/ >/dev/null 2>&1`;
     const { attempts: startupAttempts, sleepSeconds } = this.warmAgentStartupLoop();
     const resolvePythonCmd =
       'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
@@ -637,12 +639,18 @@ export class DockerExecutor {
       probes.push(normalized.replace(/\/api\/chat$/, "/api/tags"));
     } else if (normalized.includes("/chat/completions")) {
       probes.push(normalized.replace(/\/chat\/completions$/, "/models"));
+    } else if (normalized.endsWith("/v1")) {
+      probes.push(`${normalized}/models`);
+    } else if (/^https?:\/\/[^/]+$/i.test(normalized)) {
+      probes.push(`${normalized}/v1/models`);
+      probes.push(`${normalized}/models`);
     }
-    probes.push(normalized);
+    if (probes.length === 0) {
+      probes.push(normalized);
+    }
     try {
       const parsed = new URL(normalized);
       probes.push(`${parsed.origin}/health`);
-      probes.push(parsed.origin);
     } catch {
       // leave parsed probes empty
     }
@@ -778,7 +786,9 @@ export class DockerExecutor {
   }
 
   private async ensureWarmAgentServer(): Promise<void> {
-    const healthCmd = `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1`;
+    const healthCmd =
+      `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1 ` +
+      `|| curl -fsS http://127.0.0.1:${this.warmAgentPort}/ >/dev/null 2>&1`;
     const healthy = await this.runWarmShell(healthCmd);
     if (healthy.ok) return;
 

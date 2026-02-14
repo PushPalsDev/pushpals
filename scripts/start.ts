@@ -709,7 +709,6 @@ function llmPreflightTargets(): LlmPreflightTarget[] {
     probes.push(normalized);
     if (parsed) {
       probes.push(`${parsed.origin}/health`);
-      probes.push(parsed.origin);
     }
 
     out.push({
@@ -1326,12 +1325,15 @@ type WarmupTerminalResult = {
 
 function isLikelyLlmReachabilityFailure(text: string): boolean {
   const value = text.toLowerCase();
+  const probeSaysReachable = /\bworkerpal llm probe:\s+reachable\b/i.test(value);
+  if (probeSaysReachable) return false;
   return (
     value.includes("could not reach llm endpoint") ||
-    value.includes("llm endpoint") ||
+    value.includes("workerpal llm probe failed") ||
+    value.includes("[llm-probe-container] unreachable") ||
     value.includes("connection refused") ||
-    value.includes("timed out") ||
-    value.includes("host.docker.internal") ||
+    value.includes("name or service not known") ||
+    value.includes("network is unreachable") ||
     value.includes("model preflight failed") ||
     value.includes("api timeout")
   );
@@ -1527,7 +1529,7 @@ async function runStartupWarmup(): Promise<void> {
   const likelyLlmIssue = isLikelyLlmReachabilityFailure(combined);
   const alert = likelyLlmIssue
     ? `${terminal.summary} Likely cause: WorkerPal LLM endpoint is unavailable or timing out. ${llmProbe}`
-    : `${terminal.summary} ${llmProbe}`;
+    : `${terminal.summary} WorkerPal LLM endpoint appears reachable. Likely cause: warm OpenHands agent health checks are failing inside Docker. ${llmProbe}`;
   try {
     await emitStartupWarmupAlert(baseUrl, writeHeaders, startupWarmupSessionId(), alert);
   } catch (err) {
