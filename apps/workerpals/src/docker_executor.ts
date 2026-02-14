@@ -621,8 +621,64 @@ export class DockerExecutor {
       : `docker logs failed (exit ${exitCode})${out ? `\n${out}` : ""}`;
   }
 
+  private workerLlmProbeUrls(endpoint: string): string[] {
+    const normalized = endpoint.trim().replace(/\/+$/, "");
+    if (!normalized) return [];
+    const probes: string[] = [];
+    if (normalized.includes("/v1/chat/completions")) {
+      probes.push(normalized.replace(/\/v1\/chat\/completions$/, "/v1/models"));
+    } else if (normalized.endsWith("/api/chat")) {
+      probes.push(normalized.replace(/\/api\/chat$/, "/api/tags"));
+    } else if (normalized.includes("/chat/completions")) {
+      probes.push(normalized.replace(/\/chat\/completions$/, "/models"));
+    }
+    probes.push(normalized);
+    try {
+      const parsed = new URL(normalized);
+      probes.push(`${parsed.origin}/health`);
+      probes.push(parsed.origin);
+    } catch {
+      // leave parsed probes empty
+    }
+    return Array.from(new Set(probes));
+  }
+
+  private async probeWorkerLlmEndpoint(): Promise<string> {
+    const endpoint = (CONFIG.workerpals.llm.endpoint ?? "").trim();
+    if (!endpoint) return "endpoint not configured";
+    const probes = this.workerLlmProbeUrls(endpoint);
+    if (probes.length === 0) return `endpoint malformed: ${endpoint}`;
+
+    let lastError = "unreachable";
+    for (const probe of probes) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort("timeout"), 2_500);
+      try {
+        const response = await fetch(probe, {
+          method: "GET",
+          signal: controller.signal,
+          headers: { Accept: "application/json, text/plain, */*" },
+        });
+        if (response.status >= 200 && response.status < 500) {
+          return `reachable via ${probe} (HTTP ${response.status})`;
+        }
+        lastError = `${probe}: HTTP ${response.status}`;
+      } catch (err) {
+        lastError = `${probe}: ${String(err)}`;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    return `UNREACHABLE (${lastError})`;
+  }
+
   private async collectWarmAgentDiagnostics(): Promise<string> {
     const sections: string[] = [];
+    const model = CONFIG.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
+    const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
+    const endpoint = CONFIG.workerpals.llm.endpoint.trim() || "(unset)";
+    sections.push(`[llm-config] model=${model} provider=${provider} endpoint=${endpoint}`);
+    sections.push(`[llm-probe] ${await this.probeWorkerLlmEndpoint()}`);
     sections.push(`[container] ${await this.inspectWarmContainerState()}`);
     sections.push(`[container-logs]\n${await this.readWarmContainerLogs(160)}`);
 

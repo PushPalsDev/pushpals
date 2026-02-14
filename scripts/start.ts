@@ -430,7 +430,10 @@ async function probeHttpReachable(
       signal: controller.signal,
       headers: { Accept: "application/json, text/plain, */*" },
     });
-    return { ok: true, status: response.status };
+    if (response.status >= 200 && response.status < 500) {
+      return { ok: true, status: response.status };
+    }
+    return { ok: false, status: response.status, error: `HTTP ${response.status}` };
   } catch (err) {
     return { ok: false, error: String(err) };
   } finally {
@@ -438,11 +441,24 @@ async function probeHttpReachable(
   }
 }
 
-async function checkTargetReachable(target: {
+type LlmPreflightTarget = {
   name: string;
   endpoint: string;
   probes: string[];
-}): Promise<{ ok: boolean; url?: string; status?: number; error?: string }> {
+};
+
+type LlmPreflightCheck = { ok: boolean; url?: string; status?: number; error?: string };
+
+type LlmPreflightEndpointGroup = {
+  endpoint: string;
+  probes: string[];
+  services: string[];
+};
+
+async function checkTargetReachable(target: {
+  endpoint: string;
+  probes: string[];
+}): Promise<LlmPreflightCheck> {
   let lastError = "unknown error";
   for (const probe of target.probes) {
     const result = await probeHttpReachable(probe);
@@ -452,9 +468,8 @@ async function checkTargetReachable(target: {
   return { ok: false, error: lastError };
 }
 
-function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: string[] }> {
-  const out: Array<{ name: string; endpoint: string; probes: string[] }> = [];
-  const seenEndpoints = new Set<string>();
+function llmPreflightTargets(): LlmPreflightTarget[] {
+  const out: LlmPreflightTarget[] = [];
   const configuredRemoteRaw = firstNonEmpty(CONFIG.remotebuddy.llm.endpoint);
   const configuredLocalRaw = firstNonEmpty(CONFIG.localbuddy.llm.endpoint);
   const configuredWorkerRaw = firstNonEmpty(CONFIG.workerpals.llm.endpoint);
@@ -476,10 +491,9 @@ function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: 
   const workerFallback =
     workerBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
 
-  const addTarget = (name: string, endpoint: string) => {
+  const addTarget = (name: string, endpoint: string): void => {
     const normalized = endpoint.trim();
-    if (!normalized || seenEndpoints.has(normalized)) return;
-    seenEndpoints.add(normalized);
+    if (!normalized) return;
 
     const probes: string[] = [];
     const parsed = parseUrl(normalized);
@@ -513,6 +527,27 @@ function llmPreflightTargets(): Array<{ name: string; endpoint: string; probes: 
   );
 
   return out;
+}
+
+function llmPreflightEndpointGroups(targets: LlmPreflightTarget[]): LlmPreflightEndpointGroup[] {
+  const groups = new Map<string, LlmPreflightEndpointGroup>();
+  for (const target of targets) {
+    const key = target.endpoint;
+    const existing = groups.get(key);
+    if (!existing) {
+      groups.set(key, {
+        endpoint: target.endpoint,
+        probes: [...target.probes],
+        services: [target.name],
+      });
+      continue;
+    }
+    existing.services.push(target.name);
+    for (const probe of target.probes) {
+      if (!existing.probes.includes(probe)) existing.probes.push(probe);
+    }
+  }
+  return Array.from(groups.values());
 }
 
 function lmStudioReadyTimeoutMs(): number {
@@ -718,14 +753,18 @@ function printLmStudioAutoStartHelp(primaryEndpoint: string): void {
 async function ensureLlmPreflight(): Promise<void> {
   if (CONFIG.startup.skipLlmPreflight) return;
 
-  const targets = llmPreflightTargets();
-  if (targets.length === 0) return;
+  const serviceTargets = llmPreflightTargets();
+  if (serviceTargets.length === 0) return;
+  const endpointGroups = llmPreflightEndpointGroups(serviceTargets);
+  if (endpointGroups.length === 0) return;
 
-  const primary = targets[0];
+  const primary = endpointGroups[0];
   const primaryBackend = configuredLlmBackend(primary.endpoint);
   const autoStartEligible = shouldAutoStartLmStudio(primary.endpoint);
   let autoStartAttempted = false;
   let primaryReachable = await checkTargetReachable(primary);
+  const checksByEndpoint = new Map<string, LlmPreflightCheck>();
+  checksByEndpoint.set(primary.endpoint, primaryReachable);
 
   if (!primaryReachable.ok && autoStartEligible) {
     autoStartAttempted = true;
@@ -754,23 +793,44 @@ async function ensureLlmPreflight(): Promise<void> {
       await new Promise((resolveSleep) => setTimeout(resolveSleep, 1200));
     }
   }
+  checksByEndpoint.set(primary.endpoint, primaryReachable);
 
-  for (const target of targets) {
-    const check = target === primary ? primaryReachable : await checkTargetReachable(target);
-    if (check.ok) continue;
+  for (const group of endpointGroups) {
+    if (checksByEndpoint.has(group.endpoint)) continue;
+    checksByEndpoint.set(group.endpoint, await checkTargetReachable(group));
+  }
 
-    console.error(`[start] LLM preflight failed for ${target.name}.`);
-    console.error(`[start] Endpoint: ${target.endpoint}`);
-    console.error(`[start] Probes: ${target.probes.join(", ")}`);
-    console.error(`[start] Last error: ${check.error ?? "connection failed"}`);
+  const failures: Array<{ target: LlmPreflightTarget; check: LlmPreflightCheck }> = [];
+  for (const target of serviceTargets) {
+    const check = checksByEndpoint.get(target.endpoint) ?? { ok: false, error: "missing check result" };
+    if (check.ok) {
+      const statusText = typeof check.status === "number" ? `HTTP ${check.status}` : "reachable";
+      console.log(
+        `[start] LLM preflight ok for ${target.name}: ${check.url ?? target.endpoint} (${statusText})`,
+      );
+      continue;
+    }
+    failures.push({ target, check });
+  }
 
-    if (autoStartAttempted && target === primary) {
+  if (failures.length > 0) {
+    for (const failure of failures) {
+      const { target, check } = failure;
+      console.error(`[start] LLM preflight failed for ${target.name}.`);
+      console.error(`[start] Endpoint: ${target.endpoint}`);
+      console.error(`[start] Probes: ${target.probes.join(", ")}`);
+      console.error(`[start] Last error: ${check.error ?? "connection failed"}`);
+    }
+
+    const primaryFailed = failures.some((failure) => failure.target.endpoint === primary.endpoint);
+
+    if (autoStartAttempted && primaryFailed) {
       printLmStudioAutoStartHelp(primary.endpoint);
       await stopManagedLmStudio();
-    } else if (!autoStartEligible && target === primary) {
+    } else if (!autoStartEligible && primaryFailed) {
       if (primaryBackend === "ollama") {
         console.error(
-          `[start] Ollama backend selected. Start Ollama manually and ensure ${primary.name} endpoint points to /api/chat.`,
+          `[start] Ollama backend selected. Start Ollama manually and ensure ${primary.services.join(", ")} endpoint points to /api/chat.`,
         );
       } else {
         console.error(
@@ -957,13 +1017,97 @@ function parseJobFailureSummary(job: Record<string, unknown>): string {
   return rawError.replace(/\s+/g, " ").trim();
 }
 
+type WarmupTerminalState = "completed" | "failed" | "timeout";
+
+type WarmupTerminalResult = {
+  state: WarmupTerminalState;
+  summary: string;
+  logTail: string[];
+};
+
+function isLikelyLlmReachabilityFailure(text: string): boolean {
+  const value = text.toLowerCase();
+  return (
+    value.includes("could not reach llm endpoint") ||
+    value.includes("llm endpoint") ||
+    value.includes("connection refused") ||
+    value.includes("timed out") ||
+    value.includes("host.docker.internal") ||
+    value.includes("model preflight failed") ||
+    value.includes("api timeout")
+  );
+}
+
+async function fetchWarmupJobLogTail(
+  baseUrl: string,
+  headers: Record<string, string>,
+  jobId: string,
+  limit = 60,
+): Promise<string[]> {
+  const url = `${baseUrl}/jobs/${encodeURIComponent(jobId)}/logs?limit=${Math.max(
+    10,
+    Math.min(500, Math.floor(limit)),
+  )}`;
+  const result = await startupFetchJson(url, { method: "GET", headers }, 4_000);
+  if (!result.ok || !Array.isArray(result.json?.logs)) return [];
+  return result.json.logs
+    .map((row: any) => String(row?.message ?? "").trim())
+    .filter((line: string) => line.length > 0);
+}
+
+async function emitStartupWarmupAlert(
+  baseUrl: string,
+  headers: Record<string, string>,
+  sessionId: string,
+  text: string,
+): Promise<void> {
+  const writeHeaders = {
+    ...headers,
+    "Content-Type": "application/json",
+  };
+  await startupFetchJson(
+    `${baseUrl}/sessions`,
+    {
+      method: "POST",
+      headers: writeHeaders,
+      body: JSON.stringify({ sessionId }),
+    },
+    3_000,
+  );
+  await startupFetchJson(
+    `${baseUrl}/sessions/${encodeURIComponent(sessionId)}/command`,
+    {
+      method: "POST",
+      headers: writeHeaders,
+      body: JSON.stringify({
+        type: "assistant_message",
+        from: "start:warmup",
+        payload: { text },
+      }),
+    },
+    4_000,
+  );
+}
+
+async function probeWorkerLlmForWarmup(): Promise<string> {
+  const targets = llmPreflightTargets();
+  const workerTarget = targets.find((target) => target.name === "WorkerPal LLM");
+  if (!workerTarget) return "WorkerPal LLM probe unavailable (no endpoint configured).";
+  const check = await checkTargetReachable(workerTarget);
+  if (check.ok) {
+    const statusText = typeof check.status === "number" ? `HTTP ${check.status}` : "reachable";
+    return `WorkerPal LLM probe: reachable via ${check.url ?? workerTarget.endpoint} (${statusText}).`;
+  }
+  return `WorkerPal LLM probe failed: ${check.error ?? "unreachable endpoint"} (${workerTarget.endpoint}).`;
+}
+
 async function waitForWarmupJobTerminal(
   baseUrl: string,
   headers: Record<string, string>,
   jobId: string,
   deadlineMs: number,
   pollMs: number,
-): Promise<void> {
+): Promise<WarmupTerminalResult> {
   const jobsUrl = `${baseUrl}/jobs?status=all&limit=200`;
   while (Date.now() < deadlineMs) {
     const result = await startupFetchJson(jobsUrl, { method: "GET", headers }, 4_000);
@@ -976,22 +1120,31 @@ async function waitForWarmupJobTerminal(
           .trim()
           .toLowerCase();
         if (status === "completed") {
-          console.log(`[start] Startup warmup job ${jobId} completed.`);
-          return;
+          return {
+            state: "completed",
+            summary: `Startup warmup job ${jobId} completed.`,
+            logTail: [],
+          };
         }
         if (status === "failed") {
-          console.warn(
-            `[start] Startup warmup job ${jobId} failed: ${parseJobFailureSummary(job)}`,
-          );
-          return;
+          const summary = parseJobFailureSummary(job);
+          const logTail = await fetchWarmupJobLogTail(baseUrl, headers, jobId, 80);
+          return {
+            state: "failed",
+            summary: `Startup warmup job ${jobId} failed: ${summary}`,
+            logTail,
+          };
         }
       }
     }
     await delay(pollMs);
   }
-  console.warn(
-    `[start] Startup warmup job did not reach a terminal state before timeout (jobId=${jobId}).`,
-  );
+  const logTail = await fetchWarmupJobLogTail(baseUrl, headers, jobId, 80);
+  return {
+    state: "timeout",
+    summary: `Startup warmup job did not reach a terminal state before timeout (jobId=${jobId}).`,
+    logTail,
+  };
 }
 
 async function runStartupWarmup(): Promise<void> {
@@ -1054,7 +1207,33 @@ async function runStartupWarmup(): Promise<void> {
   }
 
   console.log(`[start] Enqueued startup warmup job ${jobId} (warm path, no commit).`);
-  await waitForWarmupJobTerminal(baseUrl, readHeaders, jobId, deadlineMs, pollMs);
+  const terminal = await waitForWarmupJobTerminal(baseUrl, readHeaders, jobId, deadlineMs, pollMs);
+  if (terminal.state === "completed") {
+    console.log(`[start] ${terminal.summary}`);
+    return;
+  }
+
+  const llmProbe = await probeWorkerLlmForWarmup();
+  console.warn(`[start] ${terminal.summary}`);
+  console.warn(`[start] ${llmProbe}`);
+  if (terminal.logTail.length > 0) {
+    const tail = terminal.logTail.slice(-12);
+    console.warn("[start] Warmup log tail:");
+    for (const line of tail) {
+      console.warn(`[start]   ${line}`);
+    }
+  }
+
+  const combined = `${terminal.summary}\n${llmProbe}\n${terminal.logTail.join("\n")}`.slice(0, 12_000);
+  const likelyLlmIssue = isLikelyLlmReachabilityFailure(combined);
+  const alert = likelyLlmIssue
+    ? `${terminal.summary} Likely cause: WorkerPal LLM endpoint is unavailable or timing out. ${llmProbe}`
+    : `${terminal.summary} ${llmProbe}`;
+  try {
+    await emitStartupWarmupAlert(baseUrl, writeHeaders, startupWarmupSessionId(), alert);
+  } catch (err) {
+    console.warn(`[start] Failed to emit warmup alert to session stream: ${String(err)}`);
+  }
 }
 
 function collectFilesForHash(rootPath: string, out: string[]): void {
