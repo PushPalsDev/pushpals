@@ -196,6 +196,17 @@ def _session_field_rejected(detail: str) -> bool:
     )
 
 
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = str(getattr(exc, "reason", "") or "").lower()
+        if "timed out" in reason or "timeout" in reason:
+            return True
+    lowered = str(exc).lower()
+    return "timed out" in lowered or "timeout" in lowered
+
+
 def _session_hint_headers(session_user: str) -> Dict[str, str]:
     if not session_user:
         return {}
@@ -575,8 +586,8 @@ def _llm_model_chat_preflight(
                 return False, detail
             except Exception as exc:
                 last_detail = f"{url}: {exc}"
-                if idx < len(body_variants) - 1:
-                    continue
+                if _is_timeout_error(exc):
+                    return False, f"{url}: timed out after {timeout:.0f}s"
                 return False, last_detail
     except Exception as exc:
         return False, f"{url}: {exc}"
@@ -608,6 +619,23 @@ def _tool_preflight_enabled() -> bool:
     return _is_truthy_env("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_ENABLED", True)
 
 
+def _tool_preflight_timeout_sec() -> float:
+    return max(
+        5.0,
+        _to_float(
+            os.environ.get("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_TIMEOUT_SEC"),
+            45.0,
+        ),
+    )
+
+
+def _tool_preflight_max_tokens() -> int:
+    return max(
+        32,
+        _to_int(os.environ.get("WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MAX_TOKENS"), 96),
+    )
+
+
 def _tool_need_preflight(
     base_url: str,
     provider: str,
@@ -627,6 +655,8 @@ def _tool_need_preflight(
 
     url = _chat_completion_url(base_url, provider)
     payload_model = _providerless_model_name(model)
+    timeout_sec = _tool_preflight_timeout_sec()
+    max_tokens = _tool_preflight_max_tokens()
     system_prompt = (
         "You are a routing preflight for a coding agent. "
         "Decide whether repository tools are needed. "
@@ -647,7 +677,7 @@ def _tool_need_preflight(
                 {"role": "user", "content": user_prompt},
             ],
             "stream": False,
-            "options": {"temperature": 0.0, "num_predict": 160},
+            "options": {"temperature": 0.0, "num_predict": max_tokens},
         }
     else:
         body = {
@@ -657,7 +687,7 @@ def _tool_need_preflight(
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.0,
-            "max_tokens": 220,
+            "max_tokens": max_tokens,
         }
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if api_key and provider == "openai":
@@ -676,7 +706,7 @@ def _tool_need_preflight(
                     headers=headers,
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=15.0) as res:
+                with urllib.request.urlopen(req, timeout=timeout_sec) as res:
                     raw = res.read().decode("utf-8", errors="replace")
                     payload = json.loads(raw)
                     last_err = ""
@@ -703,8 +733,14 @@ def _tool_need_preflight(
                 }
             except Exception as exc:
                 last_err = str(exc)[:200]
-                if idx < len(body_variants) - 1:
-                    continue
+                if _is_timeout_error(exc):
+                    return {
+                        "needs_tools": True,
+                        "why": f"tool preflight timed out after {timeout_sec:.0f}s",
+                        "plan": "",
+                        "first_command": "",
+                        "error": last_err,
+                    }
                 return {
                     "needs_tools": True,
                     "why": "tool preflight request failed",
