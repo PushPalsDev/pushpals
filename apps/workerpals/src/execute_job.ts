@@ -858,10 +858,19 @@ export async function executeJob(
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<JobResult> {
+  if (kind === "warmup.execute") {
+    return {
+      ok: true,
+      summary: "Startup warmup completed (no-op, no commit).",
+      stdout: "warmup.execute completed",
+      exitCode: 0,
+    };
+  }
+
   if (kind !== "task.execute") {
     return {
       ok: false,
-      summary: `Unsupported job kind "${kind}". WorkerPals accepts only task.execute.`,
+      summary: `Unsupported job kind "${kind}". WorkerPals accepts only task.execute or warmup.execute.`,
     };
   }
 

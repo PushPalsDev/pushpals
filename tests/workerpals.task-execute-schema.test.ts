@@ -13,6 +13,13 @@ const VALID_PLANNING = {
 };
 
 describe("workerpals task.execute strict schema", () => {
+  test("accepts warmup.execute without schema/planning and returns success", async () => {
+    const result = await executeJob("warmup.execute", {}, process.cwd());
+
+    expect(result.ok).toBe(true);
+    expect(result.summary).toContain("Startup warmup completed");
+  });
+
   test("rejects missing schemaVersion", async () => {
     const result = await executeJob(
       "task.execute",

@@ -293,18 +293,25 @@ async function emitStartupStatus(): Promise<void> {
 }
 
 async function emitInitializingStatus(): Promise<void> {
-  const sessionReady = await ensureSessionWithRetry(statusSessionId, 3, 300, 1200);
-  if (!sessionReady) return;
-  statusSessionReady = true;
-  const comm = createSessionComm(statusSessionId);
-  const ok = await comm.status(
-    "source_control_manager",
-    "idle",
-    "SourceControlManager initializing startup checks",
-  );
-  if (!ok) {
+  // Keep retrying in the background so UI gets an initializing signal even if
+  // server/session startup races SourceControlManager boot checks.
+  while (running && !statusSessionReady) {
+    const sessionReady = await ensureSessionWithRetry(statusSessionId, 6, 400, 2_500);
+    if (!sessionReady) {
+      await Bun.sleep(1_000);
+      continue;
+    }
+    statusSessionReady = true;
+    const comm = createSessionComm(statusSessionId);
+    const ok = await comm.status(
+      "source_control_manager",
+      "idle",
+      "SourceControlManager initializing startup checks",
+    );
+    if (ok) return;
     statusSessionReady = false;
     console.warn(`[${ts()}] Failed to emit source_control_manager initializing status event`);
+    await Bun.sleep(1_000);
   }
 }
 

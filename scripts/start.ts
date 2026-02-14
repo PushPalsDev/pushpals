@@ -35,6 +35,9 @@ const INTEGRATION_BASE_BRANCH =
 const INTEGRATION_BASE_REMOTE_REF = `origin/${INTEGRATION_BASE_BRANCH}`;
 const START_SYNC_GIT_USER_NAME = "PushPals Start Sync";
 const START_SYNC_GIT_USER_EMAIL = "pushpals-start@local";
+const DEFAULT_PUSHPALS_PORT = 3001;
+const DEFAULT_STARTUP_WARMUP_TIMEOUT_MS = 120_000;
+const DEFAULT_STARTUP_WARMUP_POLL_MS = 1_000;
 const workerImage = process.env.WORKERPALS_DOCKER_IMAGE ?? DEFAULT_IMAGE;
 const WORKER_IMAGE_INPUTS_HASH_LABEL = "pushpals.worker.inputs_hash";
 const WORKER_IMAGE_INPUT_PATHS = [
@@ -861,6 +864,219 @@ async function runCapture(cmd: string[], cwd = repoRoot): Promise<CmdResult> {
   }
 }
 
+function startupWarmupEnabled(): boolean {
+  const raw = (process.env.PUSHPALS_STARTUP_WARMUP ?? "").trim().toLowerCase();
+  if (!raw) return true;
+  if (raw === "0" || raw === "false" || raw === "no" || raw === "off") return false;
+  return true;
+}
+
+function startupWarmupTimeoutMs(): number {
+  const parsed = parsePositiveInt(process.env.PUSHPALS_STARTUP_WARMUP_TIMEOUT_MS);
+  if (!parsed) return DEFAULT_STARTUP_WARMUP_TIMEOUT_MS;
+  return Math.max(15_000, parsed);
+}
+
+function startupWarmupPollMs(): number {
+  const parsed = parsePositiveInt(process.env.PUSHPALS_STARTUP_WARMUP_POLL_MS);
+  if (!parsed) return DEFAULT_STARTUP_WARMUP_POLL_MS;
+  return Math.max(250, Math.min(parsed, 5_000));
+}
+
+function startupServerUrl(): string {
+  const explicit = (process.env.PUSHPALS_SERVER_URL ?? "").trim();
+  if (explicit) return explicit.replace(/\/+$/, "");
+  const port = parsePositiveInt(process.env.PUSHPALS_PORT) ?? DEFAULT_PUSHPALS_PORT;
+  return `http://127.0.0.1:${port}`;
+}
+
+function startupWarmupSessionId(): string {
+  const raw = (process.env.PUSHPALS_SESSION_ID ?? "dev").trim();
+  return raw || "dev";
+}
+
+function startupAuthHeaders(includeContentType: boolean): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (includeContentType) headers["Content-Type"] = "application/json";
+  const token = (process.env.PUSHPALS_AUTH_TOKEN ?? "").trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+async function startupFetchJson(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<{ ok: boolean; status: number; json: any | null; text: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort("timeout"), timeoutMs);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const text = await response.text();
+    let json: any = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = null;
+    }
+    return { ok: response.ok, status: response.status, json, text };
+  } catch (err) {
+    return { ok: false, status: 0, json: null, text: String(err) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+async function waitForServerHealth(baseUrl: string, deadlineMs: number, pollMs: number): Promise<boolean> {
+  const healthUrl = `${baseUrl}/healthz`;
+  while (Date.now() < deadlineMs) {
+    const result = await startupFetchJson(healthUrl, { method: "GET" }, 1_500);
+    if (result.ok) return true;
+    await delay(pollMs);
+  }
+  return false;
+}
+
+async function waitForOnlineWorker(
+  baseUrl: string,
+  headers: Record<string, string>,
+  deadlineMs: number,
+  pollMs: number,
+): Promise<boolean> {
+  const workersUrl = `${baseUrl}/workers`;
+  while (Date.now() < deadlineMs) {
+    const result = await startupFetchJson(
+      workersUrl,
+      { method: "GET", headers },
+      2_500,
+    );
+    if (result.ok && Array.isArray(result.json?.workers)) {
+      const anyOnline = result.json.workers.some((worker: any) => worker?.isOnline === true);
+      if (anyOnline) return true;
+    }
+    await delay(pollMs);
+  }
+  return false;
+}
+
+function parseJobFailureSummary(job: Record<string, unknown>): string {
+  const rawError = typeof job.error === "string" ? job.error : "";
+  if (!rawError) return "unknown error";
+  try {
+    const parsed = JSON.parse(rawError) as Record<string, unknown>;
+    const message = String(parsed.message ?? "").trim();
+    const detail = String(parsed.detail ?? "").trim();
+    if (message && detail) return `${message}: ${detail}`;
+    if (message) return message;
+    if (detail) return detail;
+  } catch {
+    // Use raw error payload fallback.
+  }
+  return rawError.replace(/\s+/g, " ").trim();
+}
+
+async function waitForWarmupJobTerminal(
+  baseUrl: string,
+  headers: Record<string, string>,
+  jobId: string,
+  deadlineMs: number,
+  pollMs: number,
+): Promise<void> {
+  const jobsUrl = `${baseUrl}/jobs?status=all&limit=200`;
+  while (Date.now() < deadlineMs) {
+    const result = await startupFetchJson(jobsUrl, { method: "GET", headers }, 4_000);
+    if (result.ok && Array.isArray(result.json?.jobs)) {
+      const job = result.json.jobs.find(
+        (row: any) => row && typeof row === "object" && String(row.id ?? "") === jobId,
+      ) as Record<string, unknown> | undefined;
+      if (job) {
+        const status = String(job.status ?? "").trim().toLowerCase();
+        if (status === "completed") {
+          console.log(`[start] Startup warmup job ${jobId} completed.`);
+          return;
+        }
+        if (status === "failed") {
+          console.warn(
+            `[start] Startup warmup job ${jobId} failed: ${parseJobFailureSummary(job)}`,
+          );
+          return;
+        }
+      }
+    }
+    await delay(pollMs);
+  }
+  console.warn(
+    `[start] Startup warmup job did not reach a terminal state before timeout (jobId=${jobId}).`,
+  );
+}
+
+async function runStartupWarmup(): Promise<void> {
+  if (!startupWarmupEnabled()) {
+    console.log("[start] Startup warmup disabled (PUSHPALS_STARTUP_WARMUP=0).");
+    return;
+  }
+
+  const baseUrl = startupServerUrl();
+  const timeoutMs = startupWarmupTimeoutMs();
+  const pollMs = startupWarmupPollMs();
+  const deadlineMs = Date.now() + timeoutMs;
+  const readHeaders = startupAuthHeaders(false);
+  const writeHeaders = startupAuthHeaders(true);
+
+  console.log(`[start] Startup warmup enabled; probing ${baseUrl} (timeout ${timeoutMs}ms)...`);
+
+  const serverReady = await waitForServerHealth(baseUrl, deadlineMs, pollMs);
+  if (!serverReady) {
+    console.warn("[start] Startup warmup skipped: server did not become healthy in time.");
+    return;
+  }
+
+  const workerReady = await waitForOnlineWorker(baseUrl, readHeaders, deadlineMs, pollMs);
+  if (!workerReady) {
+    console.warn("[start] Startup warmup skipped: no online WorkerPal was detected in time.");
+    return;
+  }
+
+  const warmupBody = {
+    taskId: `startup-warmup-${Date.now().toString(36)}`,
+    sessionId: startupWarmupSessionId(),
+    kind: "warmup.execute",
+    priority: "interactive",
+    queueWaitBudgetMs: 20_000,
+    executionBudgetMs: 60_000,
+    finalizationBudgetMs: 15_000,
+    params: {
+      reason: "startup_warmup",
+      startupWarmup: true,
+      commit: false,
+    },
+  };
+
+  const enqueue = await startupFetchJson(
+    `${baseUrl}/jobs/enqueue`,
+    {
+      method: "POST",
+      headers: writeHeaders,
+      body: JSON.stringify(warmupBody),
+    },
+    5_000,
+  );
+
+  const jobId = typeof enqueue.json?.jobId === "string" ? enqueue.json.jobId : "";
+  if (!enqueue.ok || !enqueue.json?.ok || !jobId) {
+    const reason = enqueue.text || enqueue.json?.message || `HTTP ${enqueue.status}`;
+    console.warn(`[start] Startup warmup enqueue failed: ${reason}`);
+    return;
+  }
+
+  console.log(`[start] Enqueued startup warmup job ${jobId} (warm path, no commit).`);
+  await waitForWarmupJobTerminal(baseUrl, readHeaders, jobId, deadlineMs, pollMs);
+}
+
 function collectFilesForHash(rootPath: string, out: string[]): void {
   if (!existsSync(rootPath)) return;
 
@@ -1573,7 +1789,15 @@ proc = Bun.spawn(["bun", "run", "dev:full"], {
   stderr: "inherit",
 });
 
+const startupWarmupPromise = runStartupWarmup().catch((err) => {
+  console.warn(`[start] Startup warmup failed: ${String(err)}`);
+});
+
 const exitCode = await proc.exited;
+await Promise.race([
+  startupWarmupPromise,
+  new Promise((resolveWait) => setTimeout(resolveWait, 500)),
+]);
 await cleanupWorkerWarmContainers("dev:full exit");
 await stopManagedLmStudio();
 process.exit(exitCode);
