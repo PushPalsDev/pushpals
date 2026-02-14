@@ -2,7 +2,7 @@
 
 You are generating a Git commit message for a monorepo.
 You MUST infer the commit message content by inspecting the actual code changes (git diff / changed files).
-Do NOT use placeholders, templates, or generic filler. Do NOT output variables like `{{x}}`.
+Do NOT use placeholders, templates, or generic filler. Do NOT output variables like `<placeholder>`.
 
 Your output MUST be a single commit message in the exact structure below.
 

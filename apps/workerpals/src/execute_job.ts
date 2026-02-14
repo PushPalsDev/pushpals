@@ -739,10 +739,7 @@ function buildWorkerCommitMessage(
     implementation_points: buildImplementationPoints(job.kind, job.params),
   };
 
-  try {
-    return loadPromptTemplate("workerpals/commit_message_prompt.md", replacements).trim();
-  } catch (err) {
-    console.warn(`[WorkerPals] Failed to load commit message prompt template: ${String(err)}`);
+  const deterministicFallback = () => {
     const fallbackLines = [
       `${replacements.type}(${replacements.area}): ${replacements.summary}`,
       "",
@@ -753,6 +750,31 @@ function buildWorkerCommitMessage(
     ];
     if (replacements.session_line) fallbackLines.push(replacements.session_line);
     return fallbackLines.join("\n");
+  };
+
+  const isInstructionalTemplateOutput = (value: string): boolean => {
+    const text = value.trim().toLowerCase();
+    if (!text) return true;
+    if (text.includes("required output structure")) return true;
+    if (text.includes("absolute prohibitions")) return true;
+    if (text.includes("quality checklist")) return true;
+    if (text.startsWith("# commit message writer")) return true;
+    if (text.includes("{{")) return true;
+    return false;
+  };
+
+  try {
+    const rendered = loadPromptTemplate("workerpals/commit_message_prompt.md", replacements).trim();
+    if (isInstructionalTemplateOutput(rendered)) {
+      console.warn(
+        `[WorkerPals] Commit message template appears instructional/unrendered; using deterministic fallback message.`,
+      );
+      return deterministicFallback();
+    }
+    return rendered;
+  } catch (err) {
+    console.warn(`[WorkerPals] Failed to load commit message prompt template: ${String(err)}`);
+    return deterministicFallback();
   }
 }
 

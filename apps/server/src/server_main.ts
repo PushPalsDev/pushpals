@@ -80,6 +80,14 @@ export function createRequestHandler() {
         if (!Number.isFinite(parsed) || parsed <= 0) return null;
         return parsed;
       };
+      const compactText = (value: unknown, maxChars = 500): string => {
+        const text = String(value ?? "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!text) return "";
+        if (text.length <= maxChars) return text;
+        return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+      };
       const maybeRecoverStaleClaims = (): void => {
         const nowMs = Date.now();
         if (nowMs - lastStaleRecoverySweepAt < staleClaimSweepIntervalMs) return;
@@ -509,6 +517,29 @@ export function createRequestHandler() {
           const durationText =
             typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
           console.log(`[Server] Job ${jobId} failed (${durationText})`);
+
+          const job = jobQueue.getJob(jobId);
+          if (job?.sessionId) {
+            const session = sessionManager.getSession(job.sessionId);
+            if (session) {
+              const message = compactText(body.message, 240) || "WorkerPal job failed";
+              const detail = compactText(body.detail, 600);
+              const envelope: EventEnvelope<"job_failed"> = {
+                protocolVersion: PROTOCOL_VERSION,
+                id: randomUUID(),
+                ts: new Date().toISOString(),
+                sessionId: job.sessionId,
+                type: "job_failed",
+                from: "server:job-fail-hook",
+                payload: {
+                  jobId,
+                  message,
+                  ...(detail ? { detail } : {}),
+                },
+              };
+              session.emit(envelope);
+            }
+          }
         }
         return makeJson(result, result.ok ? 200 : 400);
       }

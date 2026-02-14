@@ -123,7 +123,7 @@ export function isStatusLookupPrompt(input: string): boolean {
 
   const hasEntity = /\b(request|job|workerpal|task)\b/.test(text);
   const hasStatusCue =
-    /\b(status|progress|update|check|checking|doing|where|queue|queued|claimed|running|complete|completed|failed|stuck)\b/.test(
+    /\b(status|progress|update|check|checking|doing|where|queue|queued|claimed|running|complete|completed|failed|stuck|happened|happen|why|terminated|termination|killed|outcome|result)\b/.test(
       text,
     );
   if (hasEntity && hasStatusCue) return true;

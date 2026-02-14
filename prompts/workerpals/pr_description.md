@@ -2,7 +2,7 @@
 
 You are generating a Pull Request title + description for a monorepo.
 You MUST infer the PR content by inspecting the actual code changes (git diff / changed files), not by guessing.
-Do NOT use placeholders. Do NOT output variables like `{{x}}`.
+Do NOT use placeholders. Do NOT output variables like `<placeholder>`.
 
 Your output MUST include:
 1) A PR Title (single line)

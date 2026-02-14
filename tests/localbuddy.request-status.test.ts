@@ -57,6 +57,8 @@ describe("localbuddy request status intent", () => {
   test("detects status-like prompts", () => {
     expect(isStatusLookupPrompt("how my request is doing")).toBe(true);
     expect(isStatusLookupPrompt("my request is e11225b1, check it")).toBe(true);
+    expect(isStatusLookupPrompt("what happened to the job?")).toBe(true);
+    expect(isStatusLookupPrompt("why was job 7c7683fa terminated?")).toBe(true);
     expect(isStatusLookupPrompt("hello there")).toBe(false);
   });
 });

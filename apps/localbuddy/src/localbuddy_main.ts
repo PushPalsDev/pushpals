@@ -347,6 +347,7 @@ class LocalBuddyServer {
   private authToken: string | null;
   private llm: LLMClient;
   private readonly recentJobFailures: Array<{ jobId: string; summary: string; ts: string }> = [];
+  private readonly seenJobFailureKeys = new Set<string>();
 
   constructor(opts: { server: string; sessionId: string; authToken: string | null }) {
     this.server = opts.server;
@@ -410,6 +411,63 @@ Respond in strict JSON with this shape:
     if (contentType) headers["Content-Type"] = "application/json";
     if (this.authToken) headers["Authorization"] = `Bearer ${this.authToken}`;
     return headers;
+  }
+
+  private toSingleLine(value: unknown, maxChars = 220): string {
+    const text = String(value ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) return "";
+    if (text.length <= maxChars) return text;
+    return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+  }
+
+  private async fetchJobLogTail(jobId: string, limit = 8): Promise<string[]> {
+    try {
+      const res = await fetch(
+        `${this.server}/jobs/${encodeURIComponent(jobId)}/logs?limit=${Math.max(1, Math.min(20, limit))}`,
+        { headers: this.authHeaders() },
+      );
+      if (!res.ok) return [];
+      const payload = (await res.json()) as JobLogListResponse;
+      if (!payload.ok || !Array.isArray(payload.logs)) return [];
+      return payload.logs
+        .map((row) => this.toSingleLine(row?.message, 220))
+        .filter(Boolean)
+        .slice(-Math.max(1, Math.min(10, limit)));
+    } catch {
+      return [];
+    }
+  }
+
+  private async emitProactiveFailureUpdate(
+    comm: CommunicationManager,
+    jobId: string,
+    message: string,
+    detail: string,
+  ): Promise<void> {
+    const shortJob = jobId.slice(0, 8);
+    const messageText = this.toSingleLine(message, 220) || "WorkerPal job failed.";
+    const detailText = this.toSingleLine(detail, 200);
+    const detailSuffix = detailText && detailText !== messageText ? ` (${detailText})` : "";
+    const intro =
+      `WorkerPal job ${shortJob} failed: ${messageText}${detailSuffix}. ` +
+      "I got the failure and I'm checking recent logs now.";
+    const introOk = await comm.assistantMessage(intro);
+    if (!introOk) {
+      console.warn(`[LocalBuddy] Failed to emit proactive failure intro for job ${jobId}`);
+    }
+
+    const tail = await this.fetchJobLogTail(jobId, 8);
+    if (tail.length === 0) return;
+
+    const likelyCause = summarizeFailureForPrompt(tail[tail.length - 1] ?? detail ?? message);
+    const diagnosis =
+      `Diagnosis for job ${shortJob}: ${likelyCause}\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\``;
+    const diagnosisOk = await comm.assistantMessage(diagnosis);
+    if (!diagnosisOk) {
+      console.warn(`[LocalBuddy] Failed to emit proactive failure diagnosis for job ${jobId}`);
+    }
   }
 
   private async answerRequestStatus(userPrompt: string): Promise<string | null> {
@@ -563,6 +621,7 @@ Respond in strict JSON with this shape:
     const stopSessionEvents = comm.subscribeSessionEvents(
       (envelope) => {
         if (envelope.type !== "job_failed") return;
+        if (stopping) return;
         const tsMs = Date.parse(envelope.ts);
         if (Number.isFinite(tsMs) && tsMs + 2000 < monitorStartedAt) return;
         const payload = envelope.payload as { jobId?: unknown; message?: unknown; detail?: unknown };
@@ -570,6 +629,15 @@ Respond in strict JSON with this shape:
         const message = summarizeFailureForPrompt(payload.message);
         const detail = summarizeFailureForPrompt(payload.detail);
         if (!jobId || !message) return;
+        const dedupeKey = `${jobId}:${message}`;
+        if (this.seenJobFailureKeys.has(dedupeKey)) return;
+        this.seenJobFailureKeys.add(dedupeKey);
+        if (this.seenJobFailureKeys.size > 200) {
+          const oldest = this.seenJobFailureKeys.values().next().value;
+          if (typeof oldest === "string") {
+            this.seenJobFailureKeys.delete(oldest);
+          }
+        }
         const summary =
           detail && detail !== message
             ? `${message} (detail: ${detail.slice(0, 120)})`
@@ -579,6 +647,7 @@ Respond in strict JSON with this shape:
           this.recentJobFailures.length = 20;
         }
         console.warn(`[LocalBuddy] Observed WorkerPal job failure ${jobId}: ${summary}`);
+        void this.emitProactiveFailureUpdate(comm, jobId, message, detail);
       },
       {
         onError: (message) => console.warn(`[LocalBuddy] Session monitor: ${message}`),
