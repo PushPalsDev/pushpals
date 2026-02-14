@@ -231,7 +231,55 @@ interface JobListResponse {
 interface JobLogListResponse {
   ok: boolean;
   logs?: JobLogApiRow[];
+  cursor?: number | null;
   message?: string;
+}
+
+type RequestPriority = "interactive" | "normal" | "background";
+
+function classifyRemoteRequestPriority(input: string): RequestPriority {
+  const text = String(input ?? "").trim().toLowerCase();
+  if (!text) return "normal";
+
+  if (
+    /\b(status|progress|queue|queued|eta|where|hows my job|what'?s my status|check on)\b/.test(
+      text,
+    )
+  ) {
+    return "interactive";
+  }
+
+  if (
+    /\b(comprehensive|deep dive|full pass|phase\s+\d|architecture|migration|refactor|rewrite|all components|everything)\b/.test(
+      text,
+    ) || text.length > 1200
+  ) {
+    return "background";
+  }
+
+  return "normal";
+}
+
+function queueWaitBudgetForPriority(priority: RequestPriority): number {
+  switch (priority) {
+    case "interactive":
+      return 20_000;
+    case "background":
+      return 240_000;
+    default:
+      return 90_000;
+  }
+}
+
+function formatEtaFromMs(ms: number | undefined): string {
+  if (!Number.isFinite(ms as number) || (ms as number) <= 0) return "now";
+  const value = Math.max(0, Math.floor(ms as number));
+  if (value < 1_000) return `${value}ms`;
+  const secs = Math.ceil(value / 1_000);
+  if (secs < 60) return `${secs}s`;
+  const minutes = Math.floor(secs / 60);
+  const remSecs = secs % 60;
+  return remSecs > 0 ? `${minutes}m ${remSecs}s` : `${minutes}m`;
 }
 
 function parseRemoteBuddyCommand(input: string): {
@@ -694,12 +742,17 @@ Respond in strict JSON with this shape:
                   // Queue immediately; RemoteBuddy handles context/planning.
                   send({ type: "status", message: "Enqueuing to Request Queue..." });
 
+                  const priority = classifyRemoteRequestPriority(routedPrompt);
+                  const queueWaitBudgetMs = queueWaitBudgetForPriority(priority);
+
                   const res = await fetch(`${serverUrl}/requests/enqueue`, {
                     method: "POST",
                     headers: cmdHeaders,
                     body: JSON.stringify({
                       sessionId,
                       prompt: routedPrompt,
+                      priority,
+                      queueWaitBudgetMs,
                     }),
                   });
 
@@ -711,19 +764,36 @@ Respond in strict JSON with this shape:
                     return;
                   }
 
-                  const data = (await res.json()) as { ok: boolean; requestId?: string };
+                  const data = (await res.json()) as {
+                    ok: boolean;
+                    requestId?: string;
+                    queuePosition?: number;
+                    etaMs?: number;
+                  };
                   console.log(`[LocalBuddy] Enqueued request: ${data.requestId}`);
 
                   const requestSuffix = data.requestId ? ` (${data.requestId.slice(0, 8)})` : "";
+                  const queueSuffix =
+                    Number.isFinite(data.queuePosition as number) && (data.queuePosition as number) > 0
+                      ? ` Priority ${priority}; queue #${data.queuePosition} (ETA ${formatEtaFromMs(
+                          data.etaMs,
+                        )}).`
+                      : ` Priority ${priority}.`;
                   await comm.assistantMessage(
-                    `Request queued${requestSuffix}. RemoteBuddy is planning and will assign a WorkerPal.`,
+                    `Request queued${requestSuffix}.${queueSuffix} RemoteBuddy is planning and will assign a WorkerPal.`,
                   );
 
                   // Final success message
                   send({
                     type: "complete",
                     message: "Request enqueued successfully",
-                    data: { requestId: data.requestId, sessionId },
+                    data: {
+                      requestId: data.requestId,
+                      sessionId,
+                      priority,
+                      queuePosition: data.queuePosition,
+                      etaMs: data.etaMs,
+                    },
                   });
 
                   close();

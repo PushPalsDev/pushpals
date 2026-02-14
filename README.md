@@ -8,9 +8,9 @@ Push Pals runs a small software "team" around your repository:
 
 - `apps/client`: chat UI (Expo web/mobile)
 - `apps/server`: event hub + persistence + queues (SQLite)
-- `apps/localbuddy`: `LocalBuddy` HTTP ingress + prompt enhancement
-- `apps/remotebuddy`: `RemoteBuddy` orchestrator and scheduler
-- `apps/workerpals`: `WorkerPals` execution daemons (host or Docker/OpenHands)
+- `apps/localbuddy`: `LocalBuddy` HTTP ingress + deterministic local routing
+- `apps/remotebuddy`: `RemoteBuddy` strict planner + orchestrator
+- `apps/workerpals`: `WorkerPals` strict `task.execute` runners (deterministic/OpenHands lanes)
 - `apps/source_control_manager`: `SourceControlManager` merge/push daemon
 
 ## Current Architecture
@@ -75,15 +75,17 @@ sequenceDiagram
 ### Fast path (chat and status)
 
 1. Client sends message to `LocalBuddy` (`POST /message`).
-2. LocalBuddy emits immediate user/session events through `CommunicationManager`.
-3. LocalBuddy enriches prompt with repo context and enqueues request (`/requests/enqueue`).
-4. RemoteBuddy claims request (`/requests/claim`), plans, and emits progress events.
+2. LocalBuddy runs deterministic intent routing:
+   - local-only answer path for quick chat/status/read-only checks
+   - remote path for execution/code work (or forced via `/ask_remote_buddy ...`)
+3. For remote path, LocalBuddy enqueues request immediately (`/requests/enqueue`) with priority + queue budget.
+4. RemoteBuddy claims request (`/requests/claim`), produces strict planner JSON, and either responds directly or enqueues strict `task.execute` work.
 5. Client receives all updates from server event stream (`SSE` or `WS`) and re-renders incrementally.
 
 ### Slow path (execution and integration)
 
-1. RemoteBuddy schedules WorkerPal jobs (`/jobs/enqueue`), optionally targeting an idle WorkerPal.
-2. WorkerPals claim jobs (`/jobs/claim`), execute in isolated worktrees (and Docker when enabled).
+1. RemoteBuddy schedules prioritized WorkerPal jobs (`/jobs/enqueue`) with execution/finalization budgets.
+2. WorkerPals claim jobs (`/jobs/claim`), execute in isolated worktrees (and Docker when enabled), and enforce strict `task.execute` schema v2.
 3. For mutating work, WorkerPals create commits on per-job branches: `agent/<workerId>/<jobId>`.
 4. WorkerPals enqueue completions (`/completions/enqueue`).
 5. SourceControlManager claims completions (`/completions/claim`), cherry-picks/merges into integration branch (`main_agents` by default), runs checks, pushes integration branch, and can auto-open/reuse a PR from integration branch to base branch for human review.
@@ -99,6 +101,22 @@ This keeps session messaging consistent:
 - task lifecycle (`task_created`, `task_started`, `task_progress`, ...)
 - job lifecycle (`job_claimed`, `job_completed`, `job_failed`)
 - integration status (SourceControlManager merge/push success/failure)
+
+## Planner + Worker Contract
+
+- RemoteBuddy planner output is strict JSON with:
+  - `intent`, `requires_worker`, `job_kind`, `lane`, `target_paths`, `validation_steps`, `risk_level`, `assistant_message`, `worker_instruction`
+- Worker contract is strict `task.execute` schema v2:
+  - `schemaVersion: 2`
+  - `lane: deterministic | openhands`
+  - `instruction`
+  - `planning` object with priority + budgets + validation hints
+- Request and job queues are priority aware:
+  - `interactive`, `normal`, `background`
+  - queue position + ETA snapshots are surfaced by server APIs
+- `/system/status` exposes 24h SLO summaries used by Mission Control:
+  - request success rate + queue wait p50/p95
+  - job success rate + timeout rate + runtime p50/p95
 
 ## Branching Model
 
@@ -203,13 +221,23 @@ LLM defaults:
   - `PUSHPALS_LMSTUDIO_START_ARGS` (optional extra args for `lms server start`)
   - `PUSHPALS_LMSTUDIO_READY_TIMEOUT_MS` (default `120000`)
 
+## Rollout Guidance
+
+- Use one canonical config path per service (`LOCALBUDDY_*`, `REMOTEBUDDY_*`, `WORKERPALS_*`).
+- Keep planner/worker contract strict (`schemaVersion: 2`, `lane`, `planning` budgets).
+- Roll out safely by session:
+  1. Start with one session and verify LocalBuddy routing, queue ETA, and lifecycle timestamps.
+  2. Observe request/job SLO metrics in Mission Control (`/system/status`).
+  3. Increase concurrent load (up to `REMOTEBUDDY_MAX_WORKERPALS`) after stability checks.
+  4. Treat failures as terminal with explicit reason; avoid hidden fallback paths.
+
 ## Repo Layout
 
 - `apps/server`: HTTP API, sessions, queues, worker heartbeats
 - `apps/client`: chat UI + event subscription
-- `apps/localbuddy`: LocalBuddy prompt ingestion/enrichment
-- `apps/remotebuddy`: RemoteBuddy planning, scheduling, queue orchestration
-- `apps/workerpals`: WorkerPals execution, commits, completion enqueue
+- `apps/localbuddy`: LocalBuddy ingress, deterministic local routing, status summaries
+- `apps/remotebuddy`: strict planner, scheduling, queue orchestration
+- `apps/workerpals`: strict task execution lanes, commits, completion enqueue
 - `apps/source_control_manager`: SourceControlManager integration pipeline
 - `packages/protocol`: shared event/request/response schema
 - `packages/shared`: shared repo helpers + `CommunicationManager`

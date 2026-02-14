@@ -75,6 +75,11 @@ export function createRequestHandler() {
         if (!Number.isFinite(parsed)) return fallback;
         return Math.max(1, Math.min(500, parsed));
       };
+      const parseCursor = (raw: string | null): number | null => {
+        const parsed = raw ? parseInt(raw, 10) : NaN;
+        if (!Number.isFinite(parsed) || parsed <= 0) return null;
+        return parsed;
+      };
       const maybeRecoverStaleClaims = (): void => {
         const nowMs = Date.now();
         if (nowMs - lastStaleRecoverySweepAt < staleClaimSweepIntervalMs) return;
@@ -369,8 +374,16 @@ export function createRequestHandler() {
           },
           queues: {
             requests: requestQueue.countByStatus(),
+            requestPriorities: requestQueue.countByPriority(),
+            requestPendingSnapshot: requestQueue.nextPendingSnapshot(10),
             jobs: jobQueue.countByStatus(),
+            jobPriorities: jobQueue.countByPriority(),
+            jobPendingSnapshot: jobQueue.nextPendingSnapshot(10),
             completions: completionQueue.countByStatus(),
+          },
+          slo: {
+            requests: requestQueue.sloSummary(24),
+            jobs: jobQueue.sloSummary(24),
           },
         });
       }
@@ -395,6 +408,9 @@ export function createRequestHandler() {
           ok: true,
           requests,
           counts: requestQueue.countByStatus(),
+          priorityCounts: requestQueue.countByPriority(),
+          pendingSnapshot: requestQueue.nextPendingSnapshot(10),
+          slo: requestQueue.sloSummary(24),
         });
       }
 
@@ -419,6 +435,9 @@ export function createRequestHandler() {
           ok: true,
           jobs,
           counts: jobQueue.countByStatus(),
+          priorityCounts: jobQueue.countByPriority(),
+          pendingSnapshot: jobQueue.nextPendingSnapshot(10),
+          slo: jobQueue.sloSummary(24),
         });
       }
 
@@ -431,8 +450,10 @@ export function createRequestHandler() {
 
         const jobId = jobLogsMatch[1];
         const limit = parseLimit(url.searchParams.get("limit"), 50);
-        const logs = jobQueue.listJobLogs(jobId, limit);
-        return makeJson({ ok: true, jobId, logs });
+        const afterId = parseCursor(url.searchParams.get("afterId"));
+        const logs = jobQueue.listJobLogs(jobId, limit, afterId ?? undefined);
+        const nextCursor = logs.length > 0 ? logs[logs.length - 1]?.id ?? null : afterId;
+        return makeJson({ ok: true, jobId, logs, cursor: nextCursor });
       }
 
       // GET /completions
@@ -510,8 +531,8 @@ export function createRequestHandler() {
         if (!trimmed) {
           return makeJson({ ok: false, message: "message is required" }, 400);
         }
-        jobQueue.addLog(jobId, trimmed);
-        return makeJson({ ok: true }, 200);
+        const logId = jobQueue.addLog(jobId, trimmed);
+        return makeJson({ ok: true, jobId, logId }, 200);
       }
 
       // ── Request queue endpoints (auth protected) ────────────────────────────

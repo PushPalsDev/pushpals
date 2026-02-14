@@ -4,9 +4,16 @@ export interface RequestApiRow {
   id: string;
   sessionId: string;
   prompt: string;
+  priority?: "interactive" | "normal" | "background";
+  queueWaitBudgetMs?: number | null;
   status: QueueStatus;
   agentId: string | null;
   error: string | null;
+  enqueuedAt?: string;
+  claimedAt?: string | null;
+  completedAt?: string | null;
+  failedAt?: string | null;
+  durationMs?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -15,12 +22,21 @@ export interface JobApiRow {
   id: string;
   taskId: string;
   sessionId: string;
+  kind?: string;
+  priority?: "interactive" | "normal" | "background";
   status: QueueStatus;
   workerId: string | null;
   params: string;
   error: string | null;
+  queueWaitBudgetMs?: number | null;
+  executionBudgetMs?: number | null;
+  finalizationBudgetMs?: number | null;
+  enqueuedAt?: string;
   durationMs?: number | null;
   claimedAt?: string | null;
+  startedAt?: string | null;
+  firstLogAt?: string | null;
+  failedAt?: string | null;
   completedAt?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -130,6 +146,22 @@ function formatDuration(durationMs: number | null | undefined): string {
   const seconds = totalSeconds % 60;
   if (minutes <= 0) return `${totalSeconds}s`;
   return `${minutes}m ${seconds}s`;
+}
+
+function parseExecutionBudgetMs(job: JobApiRow): number | null {
+  if (Number.isFinite(job.executionBudgetMs as number) && (job.executionBudgetMs as number) > 0) {
+    return Number(job.executionBudgetMs);
+  }
+  const parsed = tryParseJsonObject(job.params);
+  const planning = parsed?.planning;
+  if (!planning || typeof planning !== "object" || Array.isArray(planning)) return null;
+  const value = (planning as Record<string, unknown>).executionBudgetMs;
+  if (!Number.isFinite(value as number) || (value as number) <= 0) return null;
+  return Number(value);
+}
+
+function startedIsoForJob(job: JobApiRow): string | null {
+  return job.startedAt ?? job.claimedAt ?? job.enqueuedAt ?? job.createdAt ?? null;
 }
 
 function parseStructuredError(raw: string | null, summarizeFailure: (value: unknown) => string): string {
@@ -256,8 +288,25 @@ export function buildJobStatusReply(args: {
 
   if (job.status === "claimed") {
     summary += " It is currently in progress.";
+    const startedIso = startedIsoForJob(job);
+    const startedMs = startedIso ? Date.parse(startedIso) : NaN;
+    if (Number.isFinite(startedMs)) {
+      const elapsedMs = Math.max(0, Date.now() - startedMs);
+      const elapsedText = formatDuration(elapsedMs);
+      if (elapsedText) summary += ` Elapsed: ${elapsedText}.`;
+      const budgetMs = parseExecutionBudgetMs(job);
+      if (budgetMs && budgetMs > 0) {
+        const timeoutAt = new Date(startedMs + budgetMs).toISOString();
+        summary += ` Timeout target: ${formatTime(timeoutAt)}.`;
+      }
+    }
   } else if (job.status === "pending") {
     summary += " It is queued and waiting for a WorkerPal.";
+    const enqueuedMs = Date.parse(job.enqueuedAt ?? job.createdAt);
+    if (Number.isFinite(enqueuedMs)) {
+      const queueElapsedText = formatDuration(Date.now() - enqueuedMs);
+      if (queueElapsedText) summary += ` Queue wait so far: ${queueElapsedText}.`;
+    }
   }
 
   if (job.status === "completed" || job.status === "failed") {
@@ -338,9 +387,15 @@ export function buildRequestStatusReply(args: {
   const requestShort = requestId.slice(0, 8);
   const requestTime = formatTime(request.updatedAt);
   let summary = `Request ${requestShort} is ${request.status} (updated ${requestTime}).`;
+  if (request.priority) {
+    summary = `${summary} Priority: ${request.priority}.`;
+  }
 
   if (request.status === "claimed" && request.agentId) {
     summary = `Request ${requestShort} is claimed by ${request.agentId} (updated ${requestTime}).`;
+    if (request.priority) {
+      summary += ` Priority: ${request.priority}.`;
+    }
   }
   if (request.status === "failed") {
     const requestError = parseStructuredError(request.error, summarizeFailure);

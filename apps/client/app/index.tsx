@@ -20,8 +20,10 @@ import { usePushPalsSession } from "../src/lib/usePushPalsSession";
 import {
   type CompletionSnapshotRow,
   type JobSnapshotRow,
+  type PendingQueueSnapshot,
   type QueueCounts,
   type RequestSnapshotRow,
+  type SystemStatusSummary,
   type WorkerStatusRow,
   fetchCompletionsSnapshot,
   fetchJobsSnapshot,
@@ -308,6 +310,29 @@ function summarizeEvent(event: EventEnvelope): string {
 function queueValue(counts: QueueCounts | undefined, key: string): number {
   return Number(counts?.[key] ?? 0);
 }
+
+function formatPercent(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "--";
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatDuration(valueMs: number | null | undefined): string {
+  if (typeof valueMs !== "number" || !Number.isFinite(valueMs) || valueMs < 0) return "--";
+  if (valueMs < 1000) return `${Math.round(valueMs)}ms`;
+  if (valueMs < 60_000) return `${(valueMs / 1000).toFixed(1)}s`;
+  return `${Math.round(valueMs / 1000)}s`;
+}
+
+function formatEtaMs(valueMs: number | null | undefined): string {
+  if (typeof valueMs !== "number" || !Number.isFinite(valueMs) || valueMs <= 0) return "now";
+  if (valueMs < 1_000) return `${Math.round(valueMs)}ms`;
+  const seconds = Math.ceil(valueMs / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remSeconds = seconds % 60;
+  return remSeconds > 0 ? `${minutes}m ${remSeconds}s` : `${minutes}m`;
+}
+
 function SegmentedTabs({
   tabs,
   active,
@@ -476,6 +501,7 @@ function ChatPane({
   input,
   setInput,
   onSend,
+  onEscalate,
   connected,
   localBuddyThinking,
 }: {
@@ -484,6 +510,7 @@ function ChatPane({
   input: string;
   setInput: (value: string) => void;
   onSend: () => void;
+  onEscalate: (text: string) => void;
   connected: boolean;
   localBuddyThinking: boolean;
 }) {
@@ -527,9 +554,15 @@ function ChatPane({
             </Text>
           </View>
         ) : (
-          messages.map((message) => {
+          messages.map((message, index) => {
             const isUser = (message.from ?? "").toLowerCase().includes("client");
             const speaker = resolveChatSpeaker(message.from, theme);
+            const isLocalBuddy = !isUser && (message.from ?? "").toLowerCase().includes("localbuddy");
+            const priorUserMessage = isLocalBuddy
+              ? [...messages.slice(0, index)]
+                  .reverse()
+                  .find((entry) => (entry.from ?? "").toLowerCase().includes("client"))
+              : null;
             return (
               <View
                 key={message.id}
@@ -559,6 +592,16 @@ function ChatPane({
                 >
                   {prettyTs(message.ts)}
                 </Text>
+                {isLocalBuddy && priorUserMessage?.text ? (
+                  <Pressable
+                    onPress={() => onEscalate(priorUserMessage.text)}
+                    style={[styles.escalateButton, { borderColor: theme.accent }]}
+                  >
+                    <Text style={[styles.escalateButtonLabel, { color: theme.accent, fontFamily: theme.fontSans }]}>
+                      Send This To RemoteBuddy
+                    </Text>
+                  </Pressable>
+                ) : null}
               </View>
             );
           })
@@ -629,11 +672,18 @@ function RequestsPane({
   theme,
   rows,
   counts,
+  pendingSnapshot,
 }: {
   theme: DashboardTheme;
   rows: RequestSnapshotRow[];
   counts: QueueCounts;
+  pendingSnapshot: PendingQueueSnapshot[];
 }) {
+  const pendingById = useMemo(
+    () => new Map(pendingSnapshot.map((snapshot) => [snapshot.id, snapshot])),
+    [pendingSnapshot],
+  );
+
   return (
     <ScrollView style={styles.tabFill} contentContainerStyle={styles.scrollContent}>
       <View style={styles.metricRow}>
@@ -660,6 +710,21 @@ function RequestsPane({
           const rowColor = statusColor(theme, request.status);
           const resultText = parseJsonText(request.result);
           const errorText = parseJsonText(request.error);
+          const queueMeta = pendingById.get(request.id);
+          const priority = request.priority ?? "normal";
+          const phaseBits = [
+            request.enqueuedAt ? `enq ${prettyTs(request.enqueuedAt)}` : null,
+            request.claimedAt ? `claim ${prettyTs(request.claimedAt)}` : null,
+            request.completedAt ? `done ${prettyTs(request.completedAt)}` : null,
+            request.failedAt ? `fail ${prettyTs(request.failedAt)}` : null,
+          ].filter(Boolean) as string[];
+          const lifecycleSummary =
+            request.status === "pending" && queueMeta
+              ? `queue #${queueMeta.position} (eta ${formatEtaMs(queueMeta.etaMs)})`
+              : request.durationMs != null
+                ? `elapsed ${formatDuration(request.durationMs)}`
+                : "in progress";
+
           return (
             <View
               key={request.id}
@@ -679,8 +744,26 @@ function RequestsPane({
                 {clip(request.prompt, 260)}
               </Text>
               <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                agent {request.agentId ?? "--"} · created {prettyTs(request.createdAt)} · updated {relativeMs(request.updatedAt)}
+                priority {priority} | {lifecycleSummary}
               </Text>
+              <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                agent {request.agentId ?? "--"} | created {prettyTs(request.createdAt)} | updated {relativeMs(request.updatedAt)}
+              </Text>
+              {phaseBits.length > 0 ? (
+                <Text style={[styles.requestPhaseLine, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                  {phaseBits.join(" | ")}
+                </Text>
+              ) : null}
+              {request.queueWaitBudgetMs != null ? (
+                <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                  queue budget {formatDuration(request.queueWaitBudgetMs)}
+                </Text>
+              ) : null}
+              {request.durationMs != null ? (
+                <Text style={[styles.requestSubline, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                  request duration {formatDuration(request.durationMs)}
+                </Text>
+              ) : null}
               {resultText ? (
                 <View style={[styles.codeBlock, { borderColor: theme.border, backgroundColor: theme.panelAlt }]}>
                   <Text style={[styles.codeBlockLabel, { color: theme.positive, fontFamily: theme.fontSans }]}>result</Text>
@@ -710,6 +793,7 @@ function JobsPane({
   isWide,
   jobs,
   jobCounts,
+  pendingSnapshot,
   completions,
   completionCounts,
   sessionState,
@@ -718,11 +802,16 @@ function JobsPane({
   isWide: boolean;
   jobs: JobSnapshotRow[];
   jobCounts: QueueCounts;
+  pendingSnapshot: PendingQueueSnapshot[];
   completions: CompletionSnapshotRow[];
   completionCounts: QueueCounts;
   sessionState: ReturnType<typeof usePushPalsSession>["state"];
 }) {
   const recentJobs = jobs.slice(0, 40);
+  const pendingById = useMemo(
+    () => new Map(pendingSnapshot.map((snapshot) => [snapshot.id, snapshot])),
+    [pendingSnapshot],
+  );
 
   return (
     <View style={styles.tabFill}>
@@ -749,14 +838,46 @@ function JobsPane({
               keyExtractor={(item) => item.id}
               renderItem={({ item }) => {
                 const color = statusColor(theme, item.status);
+                const queueMeta = pendingById.get(item.id);
+                const priority = item.priority ?? "normal";
+                const phaseBits = [
+                  item.enqueuedAt ? `enq ${prettyTs(item.enqueuedAt)}` : null,
+                  item.claimedAt ? `claim ${prettyTs(item.claimedAt)}` : null,
+                  item.startedAt ? `start ${prettyTs(item.startedAt)}` : null,
+                  item.firstLogAt ? `first-log ${prettyTs(item.firstLogAt)}` : null,
+                  item.completedAt ? `done ${prettyTs(item.completedAt)}` : null,
+                  item.failedAt ? `fail ${prettyTs(item.failedAt)}` : null,
+                ].filter(Boolean) as string[];
+                const lifecycleSummary =
+                  item.status === "pending" && queueMeta
+                    ? `queue #${queueMeta.position} (eta ${formatEtaMs(queueMeta.etaMs)})`
+                    : item.status === "claimed"
+                      ? "running"
+                      : item.durationMs != null
+                        ? `elapsed ${formatDuration(item.durationMs)}`
+                        : "terminal";
+
                 return (
                   <View style={[styles.jobRow, { borderColor: theme.border }]}>
                     <View style={[styles.jobDot, { backgroundColor: color }]} />
                     <View style={styles.jobTextCol}>
                       <Text style={[styles.jobKind, { color: theme.text, fontFamily: theme.fontSans }]}>{item.kind}</Text>
                       <Text style={[styles.jobMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                        {item.id.slice(0, 8)} · worker {item.workerId ?? "--"} · {relativeMs(item.updatedAt)}
+                        {item.id.slice(0, 8)} | worker {item.workerId ?? "--"} | {relativeMs(item.updatedAt)}
                       </Text>
+                      <Text style={[styles.jobMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                        priority {priority} | {lifecycleSummary}
+                      </Text>
+                      {phaseBits.length > 0 ? (
+                        <Text style={[styles.jobPhaseLine, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                          {phaseBits.join(" | ")}
+                        </Text>
+                      ) : null}
+                      {item.executionBudgetMs != null || item.finalizationBudgetMs != null ? (
+                        <Text style={[styles.jobMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                          budget exec {formatDuration(item.executionBudgetMs)} | finalize {formatDuration(item.finalizationBudgetMs)}
+                        </Text>
+                      ) : null}
                     </View>
                     <Text style={[styles.jobStatus, { color, fontFamily: theme.fontSans }]}>{item.status}</Text>
                   </View>
@@ -779,7 +900,7 @@ function JobsPane({
                       {clip(completion.message, 110)}
                     </Text>
                     <Text style={[styles.completionMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                      {completion.branch ?? "--"} · {completion.commitSha?.slice(0, 8) ?? "--"}
+                      {completion.branch ?? "--"} | {completion.commitSha?.slice(0, 8) ?? "--"}
                     </Text>
                     <Text style={[styles.completionStatus, { color, fontFamily: theme.fontSans }]}>
                       {completion.status}
@@ -820,15 +941,7 @@ function SystemPane({
   events: ReturnType<typeof usePushPalsSession>["events"][number][];
   connected: boolean;
   workers: WorkerStatusRow[];
-  systemSummary: {
-    workers?: { total: number; online: number; busy: number; idle: number };
-    queues?: {
-      requests?: QueueCounts;
-      jobs?: QueueCounts;
-      completions?: QueueCounts;
-    };
-    ts?: string;
-  };
+  systemSummary: SystemStatusSummary;
   lastRefresh: string | null;
 }) {
   const INITIALIZING_GRACE_MS = 90_000;
@@ -888,6 +1001,8 @@ function SystemPane({
 
   const onlineWorkers = workers.filter((worker) => worker.isOnline).length;
   const recentEvents = useMemo(() => envelopes.slice(-40).reverse(), [envelopes]);
+  const requestSlo = systemSummary.slo?.requests;
+  const jobSlo = systemSummary.slo?.jobs;
 
   const componentRows = [
     {
@@ -974,6 +1089,18 @@ function SystemPane({
           detail={lastRefresh ? prettyTs(lastRefresh) : "no sync"}
           theme={theme}
         />
+        <MetricTile
+          title="Request SLO (24h)"
+          value={formatPercent(requestSlo?.successRate)}
+          detail={`p95 wait ${formatDuration(requestSlo?.queueWaitMs?.p95)}`}
+          theme={theme}
+        />
+        <MetricTile
+          title="Job SLO (24h)"
+          value={formatPercent(jobSlo?.successRate)}
+          detail={`timeout ${formatPercent(jobSlo?.timeoutRate)} | p95 run ${formatDuration(jobSlo?.durationMs?.p95)}`}
+          theme={theme}
+        />
       </View>
 
       <View style={styles.systemGrid}>
@@ -1009,7 +1136,7 @@ function SystemPane({
                 <View style={styles.workerTextCol}>
                   <Text style={[styles.workerName, { color: theme.text, fontFamily: theme.fontSans }]}> {worker.workerId}</Text>
                   <Text style={[styles.workerMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-                    {worker.status} · job {worker.currentJobId?.slice(0, 8) ?? "--"} · heartbeat {relativeMs(worker.lastHeartbeat)}
+                    {worker.status} | job {worker.currentJobId?.slice(0, 8) ?? "--"} | heartbeat {relativeMs(worker.lastHeartbeat)}
                   </Text>
                 </View>
               </View>
@@ -1038,7 +1165,7 @@ function SystemPane({
               <View key={event.id} style={[styles.eventRow, { borderColor: theme.border }]}>
                 <View style={styles.eventMain}>
                   <Text style={[styles.eventMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
-                    {prettyTs(event.ts)} · {event.from ?? "unknown"}
+                    {prettyTs(event.ts)} | {event.from ?? "unknown"}
                   </Text>
                   <Text style={[styles.eventSummary, { color: theme.text, fontFamily: theme.fontSans }]}>
                     {summarizeEvent(event)}
@@ -1090,19 +1217,13 @@ export default function DashboardScreen() {
   const [workers, setWorkers] = useState<WorkerStatusRow[]>([]);
   const [requests, setRequests] = useState<RequestSnapshotRow[]>([]);
   const [requestCounts, setRequestCounts] = useState<QueueCounts>({});
+  const [requestPendingSnapshot, setRequestPendingSnapshot] = useState<PendingQueueSnapshot[]>([]);
   const [jobs, setJobs] = useState<JobSnapshotRow[]>([]);
   const [jobCounts, setJobCounts] = useState<QueueCounts>({});
+  const [jobPendingSnapshot, setJobPendingSnapshot] = useState<PendingQueueSnapshot[]>([]);
   const [completions, setCompletions] = useState<CompletionSnapshotRow[]>([]);
   const [completionCounts, setCompletionCounts] = useState<QueueCounts>({});
-  const [systemSummary, setSystemSummary] = useState<{
-    workers?: { total: number; online: number; busy: number; idle: number };
-    queues?: {
-      requests?: QueueCounts;
-      jobs?: QueueCounts;
-      completions?: QueueCounts;
-    };
-    ts?: string;
-  }>({});
+  const [systemSummary, setSystemSummary] = useState<SystemStatusSummary>({});
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
 
   const mountAnim = useRef(new Animated.Value(0)).current;
@@ -1139,8 +1260,10 @@ export default function DashboardScreen() {
     setWorkers(workersData);
     setRequests(requestData.requests);
     setRequestCounts(requestData.counts);
+    setRequestPendingSnapshot(requestData.pendingSnapshot);
     setJobs(jobData.jobs);
     setJobCounts(jobData.counts);
+    setJobPendingSnapshot(jobData.pendingSnapshot);
     setCompletions(completionData.completions);
     setCompletionCounts(completionData.counts);
     setSystemSummary(systemData);
@@ -1164,6 +1287,20 @@ export default function DashboardScreen() {
       setPendingLocalResponses((count) => Math.max(0, count - 1));
     }
   }, [input, session]);
+
+  const escalateToRemote = useCallback(
+    async (text: string) => {
+      const trimmed = String(text ?? "").trim();
+      if (!trimmed) return;
+      setPendingLocalResponses((count) => count + 1);
+      try {
+        await session.send(`/ask_remote_buddy ${trimmed}`);
+      } finally {
+        setPendingLocalResponses((count) => Math.max(0, count - 1));
+      }
+    },
+    [session],
+  );
 
   const tabs = useMemo(
     () => [
@@ -1233,7 +1370,7 @@ export default function DashboardScreen() {
           <MetricTile
             title="Pending Work"
             value={String(pendingWork)}
-            detail={`${queueValue(requestCounts, "pending")} requests · ${queueValue(jobCounts, "pending")} jobs`}
+            detail={`${queueValue(requestCounts, "pending")} requests | ${queueValue(jobCounts, "pending")} jobs`}
             tone={pendingWork > 0 ? "warning" : "positive"}
             theme={theme}
           />
@@ -1269,17 +1406,26 @@ export default function DashboardScreen() {
               input={input}
               setInput={setInput}
               onSend={sendMessage}
+              onEscalate={escalateToRemote}
               connected={session.isConnected}
               localBuddyThinking={pendingLocalResponses > 0}
             />
           ) : null}
-          {activeTab === "requests" ? <RequestsPane theme={theme} rows={requests} counts={requestCounts} /> : null}
+          {activeTab === "requests" ? (
+            <RequestsPane
+              theme={theme}
+              rows={requests}
+              counts={requestCounts}
+              pendingSnapshot={requestPendingSnapshot}
+            />
+          ) : null}
           {activeTab === "jobs" ? (
             <JobsPane
               theme={theme}
               isWide={isWide}
               jobs={jobs}
               jobCounts={jobCounts}
+              pendingSnapshot={jobPendingSnapshot}
               completions={completions}
               completionCounts={completionCounts}
               sessionState={session.state}
@@ -1467,6 +1613,20 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginTop: 6,
   },
+  escalateButton: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    alignSelf: "flex-start",
+  },
+  escalateButtonLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.2,
+  },
   typingLine: {
     flexDirection: "row",
     alignItems: "center",
@@ -1536,6 +1696,7 @@ const styles = StyleSheet.create({
   requestId: { fontSize: 12, fontWeight: "700" },
   requestPrompt: { fontSize: 14, lineHeight: 20, marginTop: 7 },
   requestSubline: { fontSize: 12, marginTop: 6 },
+  requestPhaseLine: { fontSize: 11, marginTop: 6 },
   requestHint: { fontSize: 12, lineHeight: 18, marginTop: 6 },
   rowBetween: {
     flexDirection: "row",
@@ -1619,6 +1780,7 @@ const styles = StyleSheet.create({
   jobTextCol: { flex: 1 },
   jobKind: { fontSize: 13, fontWeight: "700" },
   jobMeta: { fontSize: 12, marginTop: 2 },
+  jobPhaseLine: { fontSize: 11, marginTop: 4 },
   jobStatus: { fontSize: 11, fontWeight: "700", textTransform: "uppercase" },
   completionStrip: { marginTop: 8 },
   completionRow: {
@@ -1681,4 +1843,7 @@ const styles = StyleSheet.create({
   eventMeta: { fontSize: 11 },
   eventSummary: { fontSize: 13, marginTop: 2, lineHeight: 18 },
 });
+
+
+
 

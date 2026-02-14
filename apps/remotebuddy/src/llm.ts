@@ -14,6 +14,9 @@ export interface LLMGenerateInput {
   messages: LLMMessage[];
   // Request JSON output when provider supports it.
   json?: boolean;
+  // Optional JSON schema for strict structured responses.
+  // If omitted and json=true, client requests generic JSON object mode.
+  jsonSchema?: Record<string, unknown>;
   // Max tokens to generate.
   maxTokens?: number;
   temperature?: number;
@@ -46,7 +49,6 @@ const DEFAULT_MODEL = "local-model";
 const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
 const DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
-const DEFAULT_LMSTUDIO_CONTEXT_MODE = "batch";
 const DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES = 3;
 const KNOWN_PROVIDER_PREFIXES = new Set([
   "openai",
@@ -68,44 +70,6 @@ const KNOWN_PROVIDER_PREFIXES = new Set([
   "together_ai",
   "fireworks_ai",
 ]);
-const REMOTEBUDDY_JSON_RESPONSE_SCHEMA: Record<string, unknown> = {
-  name: "remotebuddy_response",
-  strict: false,
-  schema: {
-    type: "object",
-    properties: {
-      assistant_message: { type: "string" },
-      tasks: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            taskId: { type: "string" },
-            title: { type: "string" },
-            description: { type: "string" },
-            jobs: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  kind: { type: "string" },
-                  params: { type: "object" },
-                },
-                required: ["kind"],
-                additionalProperties: true,
-              },
-            },
-          },
-          required: ["taskId", "title"],
-          additionalProperties: true,
-        },
-      },
-    },
-    required: ["assistant_message"],
-    additionalProperties: true,
-  },
-};
-
 function normalizeBackend(value: string | null | undefined): LlmBackend | null {
   const normalized = (value ?? "").trim().toLowerCase();
   if (normalized === "lmstudio") return "lmstudio";
@@ -237,11 +201,6 @@ function truncateKeepingEnd(text: string, maxChars: number): string {
 
 function sumEstimatedTokens(messages: Array<{ role: string; content: string }>): number {
   return messages.reduce((acc, msg) => acc + estimateTokensFromText(msg.content), 0);
-}
-
-function parseContextMode(value: string | null | undefined): "batch" | "truncate" {
-  const normalized = (value ?? "").trim().toLowerCase();
-  return normalized === "truncate" ? "truncate" : "batch";
 }
 
 function providerlessModelName(raw: string): string {
@@ -487,7 +446,12 @@ export class LmStudioClient implements LLMClient {
 
   private async runLmStudioCompletion(
     messages: Array<{ role: string; content: string }>,
-    opts: { json?: boolean; maxTokens: number; temperature: number },
+    opts: {
+      json?: boolean;
+      jsonSchema?: Record<string, unknown>;
+      maxTokens: number;
+      temperature: number;
+    },
   ): Promise<LLMGenerateOutput> {
     const model = await this.resolveModelForRequest();
     const baseBody: Record<string, unknown> = {
@@ -501,13 +465,20 @@ export class LmStudioClient implements LLMClient {
     if (!opts.json) {
       bodyVariants.push(baseBody);
     } else {
-      bodyVariants.push({
-        ...baseBody,
-        response_format: {
-          type: "json_schema",
-          json_schema: REMOTEBUDDY_JSON_RESPONSE_SCHEMA,
-        },
-      });
+      if (opts.jsonSchema) {
+        bodyVariants.push({
+          ...baseBody,
+          response_format: {
+            type: "json_schema",
+            json_schema: opts.jsonSchema,
+          },
+        });
+      } else {
+        bodyVariants.push({
+          ...baseBody,
+          response_format: { type: "json_object" },
+        });
+      }
       bodyVariants.push({
         ...baseBody,
         response_format: { type: "text" },
@@ -646,9 +617,6 @@ export class LmStudioClient implements LLMClient {
       DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS,
     );
     const desiredMaxTokens = input.maxTokens ?? 2048;
-    const contextMode = parseContextMode(
-      process.env.PUSHPALS_LMSTUDIO_CONTEXT_MODE ?? DEFAULT_LMSTUDIO_CONTEXT_MODE,
-    );
     const clampedMinOutput = Math.max(64, Math.min(minOutputTokens, Math.floor(contextWindow / 2)));
     const promptTokenBudget = Math.max(
       384,
@@ -671,52 +639,29 @@ export class LmStudioClient implements LLMClient {
     let latestUserOverflow = false;
 
     if (promptTokensEstimate > promptTokenBudget) {
-      if (contextMode === "batch") {
-        try {
-          const packed = await this.packContextInBatches(fullMessages, promptTokenBudget, contextWindow);
-          messages = packed.messages;
-          packedChunkCount = packed.chunkCount;
-          promptTokensEstimate = sumEstimatedTokens(messages);
-          if (promptTokensEstimate > promptTokenBudget && messages.length > 0) {
-            const packedSystem = messages[0]?.content ?? "";
-            const packedInput = messages
-              .slice(1)
-              .map((message) => ({ role: message.role as LLMMessage["role"], content: message.content }));
-            const packedTrimmed = trimLmStudioMessagesToBudget(
-              packedSystem,
-              packedInput,
-              promptTokenBudget,
-              systemTokenBudget,
-            );
-            messages = packedTrimmed.messages;
-            promptTokensEstimate = packedTrimmed.promptTokensEstimate;
-            trimmed = trimmed || packedTrimmed.trimmed;
-            latestUserOverflow = latestUserOverflow || packedTrimmed.latestUserOverflow;
-          }
-        } catch (err) {
-          console.warn(`[LLM] Failed batch context packing, falling back to truncation: ${String(err)}`);
-          const fallback = trimLmStudioMessagesToBudget(
-            input.system,
-            input.messages,
+      try {
+        const packed = await this.packContextInBatches(fullMessages, promptTokenBudget, contextWindow);
+        messages = packed.messages;
+        packedChunkCount = packed.chunkCount;
+        promptTokensEstimate = sumEstimatedTokens(messages);
+        if (promptTokensEstimate > promptTokenBudget && messages.length > 0) {
+          const packedSystem = messages[0]?.content ?? "";
+          const packedInput = messages
+            .slice(1)
+            .map((message) => ({ role: message.role as LLMMessage["role"], content: message.content }));
+          const packedTrimmed = trimLmStudioMessagesToBudget(
+            packedSystem,
+            packedInput,
             promptTokenBudget,
             systemTokenBudget,
           );
-          messages = fallback.messages;
-          promptTokensEstimate = fallback.promptTokensEstimate;
-          trimmed = fallback.trimmed;
-          latestUserOverflow = fallback.latestUserOverflow;
+          messages = packedTrimmed.messages;
+          promptTokensEstimate = packedTrimmed.promptTokensEstimate;
+          trimmed = trimmed || packedTrimmed.trimmed;
+          latestUserOverflow = latestUserOverflow || packedTrimmed.latestUserOverflow;
         }
-      } else {
-        const fallback = trimLmStudioMessagesToBudget(
-          input.system,
-          input.messages,
-          promptTokenBudget,
-          systemTokenBudget,
-        );
-        messages = fallback.messages;
-        promptTokensEstimate = fallback.promptTokensEstimate;
-        trimmed = fallback.trimmed;
-        latestUserOverflow = fallback.latestUserOverflow;
+      } catch (err) {
+        throw new Error(`LM Studio batch context packing failed: ${String(err)}`);
       }
     }
 
@@ -746,6 +691,7 @@ export class LmStudioClient implements LLMClient {
 
     return this.runLmStudioCompletion(messages, {
       json: input.json,
+      jsonSchema: input.jsonSchema,
       maxTokens: safeMaxTokens,
       temperature: input.temperature ?? 0.3,
     });

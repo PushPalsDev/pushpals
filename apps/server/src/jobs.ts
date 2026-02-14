@@ -3,6 +3,20 @@ import { randomUUID } from "crypto";
 
 export type JobStatus = "pending" | "claimed" | "completed" | "failed";
 export type WorkerStatus = "idle" | "busy" | "error" | "offline";
+export type JobPriority = "interactive" | "normal" | "background";
+
+const JOB_PRIORITY_ORDER: JobPriority[] = ["interactive", "normal", "background"];
+const JOB_PRIORITY_QUEUE_SLA_MS: Record<JobPriority, number> = {
+  interactive: 20_000,
+  normal: 90_000,
+  background: 240_000,
+};
+const JOB_EXECUTION_BUDGET_MS: Record<JobPriority, number> = {
+  interactive: 300_000,
+  normal: 900_000,
+  background: 1_800_000,
+};
+const JOB_FINALIZATION_BUDGET_MS_DEFAULT = 120_000;
 
 export interface JobRow {
   id: string;
@@ -10,12 +24,20 @@ export interface JobRow {
   sessionId: string;
   kind: string;
   params: string;
+  priority: JobPriority;
+  queueWaitBudgetMs: number;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
   status: JobStatus;
   workerId: string | null;
   targetWorkerId: string | null;
   result: string | null;
   error: string | null;
+  enqueuedAt: string;
   claimedAt: string | null;
+  startedAt: string | null;
+  firstLogAt: string | null;
+  failedAt: string | null;
   completedAt: string | null;
   durationMs: number | null;
   createdAt: string;
@@ -66,6 +88,25 @@ export interface RecoveredStaleJob {
   recoveredAt: string;
 }
 
+export interface JobSloMetricSummary {
+  p50: number | null;
+  p95: number | null;
+  avg: number | null;
+  sampleSize: number;
+}
+
+export interface JobSloSummary {
+  windowHours: number;
+  terminal: number;
+  completed: number;
+  failed: number;
+  timeoutFailures: number;
+  successRate: number | null;
+  timeoutRate: number | null;
+  durationMs: JobSloMetricSummary;
+  queueWaitMs: JobSloMetricSummary;
+}
+
 function parseObjectJson(value: string | null): Record<string, unknown> {
   if (!value) return {};
   try {
@@ -87,6 +128,68 @@ function normalizeWorkerStatus(value: unknown): WorkerStatus {
   return "idle";
 }
 
+function normalizeJobPriority(value: unknown): JobPriority {
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (text === "interactive" || text === "background") return text;
+  return "normal";
+}
+
+function parseBudgetMs(value: unknown, fallback: number): number {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1_000, parsed);
+}
+
+function parseIsoMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function percentile(values: number[], p: number): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const rank = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+  const value = sorted[rank];
+  return Number.isFinite(value) ? value : null;
+}
+
+function summarizeSamples(samples: number[]): JobSloMetricSummary {
+  const valid = samples.filter((value) => Number.isFinite(value) && value >= 0);
+  if (valid.length === 0) return { p50: null, p95: null, avg: null, sampleSize: 0 };
+  const avg = Math.round(valid.reduce((sum, value) => sum + value, 0) / valid.length);
+  return {
+    p50: percentile(valid, 50),
+    p95: percentile(valid, 95),
+    avg: Number.isFinite(avg) ? avg : null,
+    sampleSize: valid.length,
+  };
+}
+
+function isTimeoutFailureError(errorPayload: string | null): boolean {
+  if (!errorPayload) return false;
+  let haystack = errorPayload;
+  try {
+    const parsed = JSON.parse(errorPayload) as unknown;
+    if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>;
+      haystack = `${String(record.message ?? "")} ${String(record.detail ?? "")}`.trim() || errorPayload;
+    }
+  } catch {
+    // Keep raw payload fallback.
+  }
+  return /\b(timeout|timed out|deadline exceeded)\b/i.test(haystack);
+}
+
+function extractPlanningField(params: unknown, key: string): unknown {
+  if (!params || typeof params !== "object" || Array.isArray(params)) return undefined;
+  const planning = (params as Record<string, unknown>).planning;
+  if (!planning || typeof planning !== "object" || Array.isArray(planning)) return undefined;
+  return (planning as Record<string, unknown>)[key];
+}
+
 export class JobQueue {
   private db: Database;
 
@@ -97,28 +200,36 @@ export class JobQueue {
   }
 
   private _migrate(): void {
-    this.db.exec(`
+      this.db.exec(`
         CREATE TABLE IF NOT EXISTS jobs (
-          id             TEXT PRIMARY KEY,
-          taskId         TEXT NOT NULL,
-          sessionId      TEXT NOT NULL DEFAULT '',
-          kind           TEXT NOT NULL,
-          params         TEXT NOT NULL DEFAULT '{}',
-          status         TEXT NOT NULL DEFAULT 'pending',
-          workerId       TEXT,
-          targetWorkerId TEXT,
-          result         TEXT,
-          error          TEXT,
-          claimedAt      TEXT,
-          completedAt    TEXT,
-          durationMs     INTEGER,
-          createdAt      TEXT NOT NULL,
-          updatedAt      TEXT NOT NULL
+          id                  TEXT PRIMARY KEY,
+          taskId              TEXT NOT NULL,
+          sessionId           TEXT NOT NULL DEFAULT '',
+          kind                TEXT NOT NULL,
+          params              TEXT NOT NULL DEFAULT '{}',
+          priority            TEXT NOT NULL DEFAULT 'normal',
+          queueWaitBudgetMs   INTEGER NOT NULL DEFAULT 90000,
+          executionBudgetMs   INTEGER NOT NULL DEFAULT 900000,
+          finalizationBudgetMs INTEGER NOT NULL DEFAULT 120000,
+          status              TEXT NOT NULL DEFAULT 'pending',
+          workerId            TEXT,
+          targetWorkerId      TEXT,
+          result              TEXT,
+          error               TEXT,
+          enqueuedAt          TEXT,
+          claimedAt           TEXT,
+          startedAt           TEXT,
+          firstLogAt          TEXT,
+          failedAt            TEXT,
+          completedAt         TEXT,
+          durationMs          INTEGER,
+          createdAt           TEXT NOT NULL,
+          updatedAt           TEXT NOT NULL
         );
 
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
       CREATE INDEX IF NOT EXISTS idx_jobs_taskId ON jobs(taskId);
-      CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);
+      CREATE INDEX IF NOT EXISTS idx_jobs_session_created ON jobs(sessionId, createdAt);
 
       CREATE TABLE IF NOT EXISTS job_logs (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,10 +267,39 @@ export class JobQueue {
     const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{ name: string }>;
     if (!jobColumns.some((col) => col.name === "targetWorkerId")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN targetWorkerId TEXT;`);
-      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);`);
+    }
+    if (!jobColumns.some((col) => col.name === "priority")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
+    }
+    if (!jobColumns.some((col) => col.name === "queueWaitBudgetMs")) {
+      this.db.exec(
+        `ALTER TABLE jobs ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`,
+      );
+    }
+    if (!jobColumns.some((col) => col.name === "executionBudgetMs")) {
+      this.db.exec(
+        `ALTER TABLE jobs ADD COLUMN executionBudgetMs INTEGER NOT NULL DEFAULT 900000;`,
+      );
+    }
+    if (!jobColumns.some((col) => col.name === "finalizationBudgetMs")) {
+      this.db.exec(
+        `ALTER TABLE jobs ADD COLUMN finalizationBudgetMs INTEGER NOT NULL DEFAULT 120000;`,
+      );
+    }
+    if (!jobColumns.some((col) => col.name === "enqueuedAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN enqueuedAt TEXT;`);
     }
     if (!jobColumns.some((col) => col.name === "claimedAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN claimedAt TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "startedAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN startedAt TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "firstLogAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN firstLogAt TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "failedAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN failedAt TEXT;`);
     }
     if (!jobColumns.some((col) => col.name === "completedAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN completedAt TEXT;`);
@@ -167,13 +307,93 @@ export class JobQueue {
     if (!jobColumns.some((col) => col.name === "durationMs")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN durationMs INTEGER;`);
     }
+
+    // Column-dependent indexes are created after legacy column backfills complete.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`);
+
+    this.db.exec(`
+      UPDATE jobs
+      SET
+        priority = CASE LOWER(COALESCE(priority, 'normal'))
+          WHEN 'interactive' THEN 'interactive'
+          WHEN 'background' THEN 'background'
+          ELSE 'normal'
+        END,
+        queueWaitBudgetMs = CASE WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90000 ELSE queueWaitBudgetMs END,
+        executionBudgetMs = CASE WHEN executionBudgetMs IS NULL OR executionBudgetMs <= 0 THEN 900000 ELSE executionBudgetMs END,
+        finalizationBudgetMs = CASE WHEN finalizationBudgetMs IS NULL OR finalizationBudgetMs <= 0 THEN 120000 ELSE finalizationBudgetMs END,
+        enqueuedAt = COALESCE(enqueuedAt, createdAt)
+      WHERE 1 = 1;
+    `);
   }
 
-  enqueue(body: Record<string, unknown>): { ok: boolean; jobId?: string; message?: string } {
-    const taskId = body.taskId as string;
-    const kind = body.kind as string;
-    const sessionId = (body.sessionId as string) ?? "";
-    const params = body.params ?? {};
+  private pendingOrderedIds(targetWorkerId: string | null = null): string[] {
+    if (targetWorkerId) {
+      const rows = this.db
+        .prepare(
+          `SELECT id
+           FROM jobs
+           WHERE status = 'pending' AND (targetWorkerId IS NULL OR targetWorkerId = ?)
+           ORDER BY
+             CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
+             CASE LOWER(priority)
+               WHEN 'interactive' THEN 0
+               WHEN 'normal' THEN 1
+               WHEN 'background' THEN 2
+               ELSE 1
+             END ASC,
+             createdAt ASC`,
+        )
+        .all(targetWorkerId, targetWorkerId) as Array<{ id: string }>;
+      return rows.map((row) => row.id);
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT id
+         FROM jobs
+         WHERE status = 'pending'
+         ORDER BY
+           CASE LOWER(priority)
+             WHEN 'interactive' THEN 0
+             WHEN 'normal' THEN 1
+             WHEN 'background' THEN 2
+             ELSE 1
+           END ASC,
+           createdAt ASC`,
+      )
+      .all() as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
+  private queuePosition(jobId: string, targetWorkerId: string | null = null): number | null {
+    const ordered = this.pendingOrderedIds(targetWorkerId);
+    const idx = ordered.indexOf(jobId);
+    if (idx < 0) return null;
+    return idx + 1;
+  }
+
+  estimateEtaMs(priority: JobPriority, position: number | null): number | null {
+    if (!position || position <= 0) return null;
+    const slotMs = JOB_PRIORITY_QUEUE_SLA_MS[priority];
+    return Math.max(0, slotMs * (position - 1));
+  }
+
+  enqueue(body: Record<string, unknown>): {
+    ok: boolean;
+    jobId?: string;
+    queuePosition?: number;
+    etaMs?: number;
+    message?: string;
+  } {
+    const taskId = String(body.taskId ?? "").trim();
+    const kind = String(body.kind ?? "").trim();
+    const sessionId = String(body.sessionId ?? "").trim();
+    const params =
+      body.params && typeof body.params === "object" && !Array.isArray(body.params)
+        ? (body.params as Record<string, unknown>)
+        : {};
     const targetWorkerIdRaw = body.targetWorkerId;
     const targetWorkerId =
       typeof targetWorkerIdRaw === "string" && targetWorkerIdRaw.trim().length > 0
@@ -184,23 +404,69 @@ export class JobQueue {
       return { ok: false, message: "taskId and kind are required" };
     }
 
+    const priority = normalizeJobPriority(
+      body.priority ?? extractPlanningField(params, "queuePriority"),
+    );
+    const queueWaitBudgetMs = parseBudgetMs(
+      body.queueWaitBudgetMs ?? extractPlanningField(params, "queueWaitBudgetMs"),
+      JOB_PRIORITY_QUEUE_SLA_MS[priority],
+    );
+    const executionBudgetMs = parseBudgetMs(
+      body.executionBudgetMs ?? extractPlanningField(params, "executionBudgetMs"),
+      JOB_EXECUTION_BUDGET_MS[priority],
+    );
+    const finalizationBudgetMs = parseBudgetMs(
+      body.finalizationBudgetMs ?? extractPlanningField(params, "finalizationBudgetMs"),
+      JOB_FINALIZATION_BUDGET_MS_DEFAULT,
+    );
+
     const jobId = randomUUID();
     const now = new Date().toISOString();
 
     this.db
       .prepare(
         `INSERT INTO jobs (
-          id, taskId, sessionId, kind, params, status, workerId, targetWorkerId,
-          claimedAt, completedAt, durationMs, createdAt, updatedAt
+          id, taskId, sessionId, kind, params, priority,
+          queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+          status, workerId, targetWorkerId, result, error,
+          enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, completedAt, durationMs,
+          createdAt, updatedAt
         )
-         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, NULL, NULL, ?, ?)`,
+         VALUES (
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?,
+          'pending', NULL, ?, NULL, NULL,
+          ?, NULL, NULL, NULL, NULL, NULL, NULL,
+          ?, ?
+         )`,
       )
-      .run(jobId, taskId, sessionId, kind, JSON.stringify(params), targetWorkerId, now, now);
+      .run(
+        jobId,
+        taskId,
+        sessionId,
+        kind,
+        JSON.stringify(params),
+        priority,
+        queueWaitBudgetMs,
+        executionBudgetMs,
+        finalizationBudgetMs,
+        targetWorkerId,
+        now,
+        now,
+        now,
+      );
 
-    return { ok: true, jobId };
+    const queuePosition = this.queuePosition(jobId, targetWorkerId);
+    const etaMs = this.estimateEtaMs(priority, queuePosition);
+    return { ok: true, jobId, queuePosition: queuePosition ?? undefined, etaMs: etaMs ?? undefined };
   }
 
-  claim(workerIdRaw: string): { ok: boolean; job?: JobRow; message?: string } {
+  claim(workerIdRaw: string): {
+    ok: boolean;
+    job?: JobRow;
+    queueWaitMs?: number;
+    message?: string;
+  } {
     const workerId = workerIdRaw.trim() || "unknown";
     const now = new Date().toISOString();
 
@@ -220,7 +486,15 @@ export class JobQueue {
           `SELECT * FROM jobs
            WHERE status = 'pending'
              AND (targetWorkerId IS NULL OR targetWorkerId = ?)
-           ORDER BY CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END, createdAt ASC
+           ORDER BY
+             CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
+             CASE LOWER(priority)
+               WHEN 'interactive' THEN 0
+               WHEN 'normal' THEN 1
+               WHEN 'background' THEN 2
+               ELSE 1
+             END ASC,
+             createdAt ASC
            LIMIT 1`,
         )
         .get(workerId, workerId) as JobRow | undefined;
@@ -241,12 +515,14 @@ export class JobQueue {
            SET status = 'claimed',
                workerId = ?,
                claimedAt = ?,
+               startedAt = COALESCE(startedAt, ?),
+               failedAt = NULL,
                completedAt = NULL,
                durationMs = NULL,
                updatedAt = ?
-           WHERE id = ?`,
+            WHERE id = ?`,
         )
-        .run(workerId, now, now, row.id);
+        .run(workerId, now, now, now, row.id);
 
       this.db
         .prepare(
@@ -255,20 +531,30 @@ export class JobQueue {
         )
         .run(row.id, now, now, workerId);
 
+      const queueWaitMs = Math.max(
+        0,
+        Math.floor((Date.parse(now) - Date.parse(row.enqueuedAt || row.createdAt || now)) || 0),
+      );
+
       return {
-        ...row,
-        status: "claimed" as JobStatus,
-        workerId,
-        claimedAt: now,
-        completedAt: null,
-        durationMs: null,
-        updatedAt: now,
+        job: {
+          ...row,
+          status: "claimed" as JobStatus,
+          workerId,
+          claimedAt: now,
+          startedAt: row.startedAt || now,
+          failedAt: null,
+          completedAt: null,
+          durationMs: null,
+          updatedAt: now,
+        },
+        queueWaitMs,
       };
     });
 
-    const job = tx();
-    if (!job) return { ok: false, message: "No pending jobs" };
-    return { ok: true, job };
+    const claimed = tx();
+    if (!claimed) return { ok: false, message: "No pending jobs" };
+    return { ok: true, job: claimed.job, queueWaitMs: claimed.queueWaitMs };
   }
 
   heartbeat(body: Record<string, unknown>): { ok: boolean; message?: string } {
@@ -383,7 +669,11 @@ export class JobQueue {
          SET status = 'completed',
              result = ?,
              completedAt = ?,
-             durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(claimedAt, createdAt))) * 86400000 AS INTEGER)),
+             failedAt = NULL,
+             durationMs = MAX(
+               0,
+               CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+             ),
              updatedAt = ?
          WHERE id = ? AND status = 'claimed'`,
       )
@@ -413,10 +703,10 @@ export class JobQueue {
   fail(
     jobId: string,
     body: Record<string, unknown>,
-  ): { ok: boolean; message?: string; durationMs?: number; completedAt?: string } {
+  ): { ok: boolean; message?: string; durationMs?: number; failedAt?: string } {
     const now = new Date().toISOString();
-    const message = (body.message as string) ?? "Unknown error";
-    const detail = (body.detail as string) ?? null;
+    const message = String(body.message ?? "Unknown error");
+    const detail = body.detail == null ? null : String(body.detail);
 
     const jobRow = this.db.prepare(`SELECT workerId FROM jobs WHERE id = ?`).get(jobId) as
       | { workerId: string | null }
@@ -427,8 +717,12 @@ export class JobQueue {
         `UPDATE jobs
          SET status = 'failed',
              error = ?,
-             completedAt = ?,
-             durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(claimedAt, createdAt))) * 86400000 AS INTEGER)),
+             failedAt = ?,
+             completedAt = NULL,
+             durationMs = MAX(
+               0,
+               CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+             ),
              updatedAt = ?
          WHERE id = ? AND status = 'claimed'`,
       )
@@ -439,11 +733,11 @@ export class JobQueue {
     }
 
     const failed = this.db
-      .prepare(`SELECT durationMs, completedAt FROM jobs WHERE id = ?`)
+      .prepare(`SELECT durationMs, failedAt FROM jobs WHERE id = ?`)
       .get(jobId) as
       | {
           durationMs: number | null;
-          completedAt: string | null;
+          failedAt: string | null;
         }
       | undefined;
 
@@ -451,7 +745,7 @@ export class JobQueue {
     return {
       ok: true,
       durationMs: failed?.durationMs ?? undefined,
-      completedAt: failed?.completedAt ?? undefined,
+      failedAt: failed?.failedAt ?? undefined,
     };
   }
 
@@ -465,10 +759,12 @@ export class JobQueue {
       taskId: string;
       sessionId: string;
       workerId: string | null;
+      workerStatus: string | null;
+      workerCurrentJobId: string | null;
+      workerLastHeartbeat: string | null;
       jobUpdatedAt: string;
       lastLogTs: string | null;
       activityAt: string;
-      workerLastHeartbeat: string | null;
     };
 
     const candidates = this.db
@@ -478,6 +774,9 @@ export class JobQueue {
            j.taskId AS taskId,
            j.sessionId AS sessionId,
            j.workerId AS workerId,
+           w.status AS workerStatus,
+           w.currentJobId AS workerCurrentJobId,
+           w.lastHeartbeat AS workerLastHeartbeat,
            j.updatedAt AS jobUpdatedAt,
            (
              SELECT MAX(jl.ts)
@@ -490,9 +789,11 @@ export class JobQueue {
                FROM job_logs jl
                WHERE jl.jobId = j.id
              ),
+             j.firstLogAt,
+             j.startedAt,
+             j.claimedAt,
              j.updatedAt
-           ) AS activityAt,
-           w.lastHeartbeat AS workerLastHeartbeat
+           ) AS activityAt
          FROM jobs j
          LEFT JOIN workers w ON w.workerId = j.workerId
          WHERE j.status = 'claimed'
@@ -502,12 +803,18 @@ export class JobQueue {
                FROM job_logs jl
                WHERE jl.jobId = j.id
              ),
+             j.firstLogAt,
+             j.startedAt,
+             j.claimedAt,
              j.updatedAt
            ) < ?
            AND (
              j.workerId IS NULL
              OR w.workerId IS NULL
              OR w.lastHeartbeat < ?
+             OR w.status <> 'busy'
+             OR w.currentJobId IS NULL
+             OR w.currentJobId <> j.id
            )
          ORDER BY activityAt ASC
          LIMIT ?`,
@@ -524,6 +831,10 @@ export class JobQueue {
         const message = "Job auto-failed after stale worker claim";
         const detailParts = [
           row.workerId ? `worker=${row.workerId}` : "worker=missing",
+          row.workerStatus ? `workerStatus=${row.workerStatus}` : "workerStatus=missing",
+          row.workerCurrentJobId
+            ? `workerCurrentJobId=${row.workerCurrentJobId}`
+            : "workerCurrentJobId=missing",
           row.workerLastHeartbeat
             ? `lastHeartbeat=${row.workerLastHeartbeat}`
             : "lastHeartbeat=missing",
@@ -534,30 +845,40 @@ export class JobQueue {
         ];
         const detail = detailParts.join("; ");
 
-          const info = this.db
-            .prepare(
-              `UPDATE jobs
-               SET status = 'failed',
-                   error = ?,
-                   completedAt = ?,
-                   durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(claimedAt, createdAt))) * 86400000 AS INTEGER)),
-                   updatedAt = ?
-               WHERE id = ? AND status = 'claimed'`,
-            )
-            .run(JSON.stringify({ message, detail }), now, now, now, row.jobId);
+        const info = this.db
+          .prepare(
+            `UPDATE jobs
+             SET status = 'failed',
+                 error = ?,
+                 failedAt = ?,
+                 completedAt = NULL,
+                 durationMs = MAX(
+                   0,
+                   CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+                 ),
+                 updatedAt = ?
+             WHERE id = ? AND status = 'claimed'`,
+          )
+          .run(JSON.stringify({ message, detail }), now, now, now, row.jobId);
 
         if (info.changes === 0) continue;
 
         if (row.workerId) {
+          const heartbeatMs = Date.parse(row.workerLastHeartbeat ?? "");
+          const staleHeartbeat =
+            !Number.isFinite(heartbeatMs) ||
+            Number.isNaN(heartbeatMs) ||
+            heartbeatMs < Date.parse(cutoff);
+          const nextStatus: WorkerStatus = staleHeartbeat ? "offline" : "error";
           this.db
             .prepare(
               `UPDATE workers
-               SET status = 'offline',
+               SET status = ?,
                    currentJobId = CASE WHEN currentJobId = ? THEN NULL ELSE currentJobId END,
                    updatedAt = ?
                WHERE workerId = ?`,
             )
-            .run(row.jobId, now, row.workerId);
+            .run(nextStatus, row.jobId, now, row.workerId);
         }
 
         recovered.push({
@@ -597,7 +918,18 @@ export class JobQueue {
 
   getPendingJobs(): JobRow[] {
     return this.db
-      .prepare(`SELECT * FROM jobs WHERE status = 'pending' ORDER BY createdAt ASC`)
+      .prepare(
+        `SELECT * FROM jobs
+         WHERE status = 'pending'
+         ORDER BY
+           CASE LOWER(priority)
+             WHEN 'interactive' THEN 0
+             WHEN 'normal' THEN 1
+             WHEN 'background' THEN 2
+             ELSE 1
+           END ASC,
+           createdAt ASC`,
+      )
       .all() as JobRow[];
   }
 
@@ -639,21 +971,143 @@ export class JobQueue {
     return counts;
   }
 
-  addLog(jobId: string, message: string): void {
-    const now = new Date().toISOString();
-    const tx = this.db.transaction(() => {
-      this.db.prepare(`INSERT INTO job_logs (jobId, ts, message) VALUES (?, ?, ?)`).run(jobId, now, message);
-      // Treat new log lines as job activity so stale-claim recovery does not
-      // auto-fail active jobs that are still producing trace output.
-      this.db
-        .prepare(`UPDATE jobs SET updatedAt = ? WHERE id = ? AND status = 'claimed'`)
-        .run(now, jobId);
-    });
-    tx();
+  countByPriority(): Record<JobPriority, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT priority, COUNT(*) AS count
+         FROM jobs
+         WHERE status IN ('pending', 'claimed')
+         GROUP BY priority`,
+      )
+      .all() as Array<{ priority: string; count: number }>;
+
+    const counts: Record<JobPriority, number> = {
+      interactive: 0,
+      normal: 0,
+      background: 0,
+    };
+    for (const row of rows) {
+      const priority = normalizeJobPriority(row.priority);
+      counts[priority] = Number(row.count || 0);
+    }
+    return counts;
   }
 
-  listJobLogs(jobId: string, limit = 50): JobLogRow[] {
+  nextPendingSnapshot(
+    limit = 10,
+  ): Array<{ id: string; priority: JobPriority; position: number; etaMs: number }> {
+    const ordered = this.pendingOrderedIds().slice(0, Math.max(1, Math.min(limit, 50)));
+    return ordered.map((id, idx) => {
+      const row = this.db
+        .prepare(`SELECT priority FROM jobs WHERE id = ?`)
+        .get(id) as { priority: string } | undefined;
+      const priority = normalizeJobPriority(row?.priority);
+      return {
+        id,
+        priority,
+        position: idx + 1,
+        etaMs: this.estimateEtaMs(priority, idx + 1) ?? 0,
+      };
+    });
+  }
+
+  sloSummary(windowHours = 24): JobSloSummary {
+    const boundedWindowHours =
+      Number.isFinite(windowHours) && windowHours > 0 ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours))) : 24;
+    const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT status, durationMs, enqueuedAt, claimedAt, createdAt, updatedAt, error
+         FROM jobs
+         WHERE status IN ('completed', 'failed')
+           AND updatedAt >= ?`,
+      )
+      .all(cutoffIso) as Array<{
+      status: JobStatus;
+      durationMs: number | null;
+      enqueuedAt: string | null;
+      claimedAt: string | null;
+      createdAt: string | null;
+      updatedAt: string | null;
+      error: string | null;
+    }>;
+
+    let completed = 0;
+    let failed = 0;
+    let timeoutFailures = 0;
+    const durationSamples: number[] = [];
+    const queueWaitSamples: number[] = [];
+
+    for (const row of rows) {
+      if (row.status === "completed") completed += 1;
+      if (row.status === "failed") {
+        failed += 1;
+        if (isTimeoutFailureError(row.error)) timeoutFailures += 1;
+      }
+      if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) {
+        durationSamples.push(Math.round(row.durationMs));
+      }
+      const queueStart = parseIsoMs(row.enqueuedAt) ?? parseIsoMs(row.createdAt) ?? null;
+      const queueEnd = parseIsoMs(row.claimedAt) ?? parseIsoMs(row.updatedAt) ?? null;
+      if (queueStart != null && queueEnd != null && queueEnd >= queueStart) {
+        queueWaitSamples.push(queueEnd - queueStart);
+      }
+    }
+
+    const terminal = completed + failed;
+    const successRate = terminal > 0 ? Number((completed / terminal).toFixed(4)) : null;
+    const timeoutRate = terminal > 0 ? Number((timeoutFailures / terminal).toFixed(4)) : null;
+
+    return {
+      windowHours: boundedWindowHours,
+      terminal,
+      completed,
+      failed,
+      timeoutFailures,
+      successRate,
+      timeoutRate,
+      durationMs: summarizeSamples(durationSamples),
+      queueWaitMs: summarizeSamples(queueWaitSamples),
+    };
+  }
+
+  addLog(jobId: string, message: string): number | null {
+    const now = new Date().toISOString();
+    let insertedId: number | null = null;
+    const tx = this.db.transaction(() => {
+      const insertInfo = this.db
+        .prepare(`INSERT INTO job_logs (jobId, ts, message) VALUES (?, ?, ?)`)
+        .run(jobId, now, message);
+      const rawId = (insertInfo as { lastInsertRowid?: unknown }).lastInsertRowid;
+      if (typeof rawId === "bigint") insertedId = Number(rawId);
+      else if (typeof rawId === "number" && Number.isFinite(rawId)) insertedId = rawId;
+      this.db
+        .prepare(
+          `UPDATE jobs
+           SET updatedAt = ?,
+               startedAt = COALESCE(startedAt, ?),
+               firstLogAt = COALESCE(firstLogAt, ?)
+           WHERE id = ? AND status = 'claimed'`,
+        )
+        .run(now, now, now, jobId);
+    });
+    tx();
+    return insertedId;
+  }
+
+  listJobLogs(jobId: string, limit = 50, afterId?: number): JobLogRow[] {
     const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(500, Math.floor(limit))) : 50;
+    if (Number.isFinite(afterId as number) && (afterId as number) > 0) {
+      return this.db
+        .prepare(
+          `SELECT id, jobId, ts, message
+           FROM job_logs
+           WHERE jobId = ? AND id > ?
+           ORDER BY id ASC
+           LIMIT ?`,
+        )
+        .all(jobId, Math.floor(afterId as number), maxRows) as JobLogRow[];
+    }
     const rows = this.db
       .prepare(
         `SELECT id, jobId, ts, message

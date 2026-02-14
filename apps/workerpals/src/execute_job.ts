@@ -170,6 +170,7 @@ async function executeWithOpenHands(
   params: Record<string, unknown>,
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  budgets?: { executionBudgetMs?: number; finalizationBudgetMs?: number },
 ): Promise<JobResult> {
   const pythonBin = process.env.WORKERPALS_OPENHANDS_PYTHON ?? "python";
   const scriptPath = resolve(import.meta.dir, "..", "scripts", "openhands_executor.py");
@@ -181,7 +182,23 @@ async function executeWithOpenHands(
     };
   }
 
-  const timeoutMs = parseOpenHandsTimeoutMs(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS);
+  const envTimeoutMs = parseOpenHandsTimeoutMs(process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS);
+  const executionBudgetMs =
+    typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
+      ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
+      : null;
+  const timeoutMs =
+    executionBudgetMs != null
+      ? process.env.WORKERPALS_OPENHANDS_TIMEOUT_MS?.trim()
+        ? Math.min(envTimeoutMs, executionBudgetMs)
+        : executionBudgetMs
+      : envTimeoutMs;
+  if (executionBudgetMs != null && timeoutMs !== executionBudgetMs) {
+    onLog?.(
+      "stderr",
+      `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, env cap=${envTimeoutMs}ms).`,
+    );
+  }
   const { leadMs: timeoutWarningLeadMs, delayMs: timeoutWarningDelayMs } =
     computeTimeoutWarningWindow(timeoutMs);
   const payload = Buffer.from(
@@ -190,6 +207,12 @@ async function executeWithOpenHands(
       params,
       repo,
       timeoutMs,
+      executionBudgetMs: executionBudgetMs ?? undefined,
+      finalizationBudgetMs:
+        typeof budgets?.finalizationBudgetMs === "number" &&
+        Number.isFinite(budgets.finalizationBudgetMs)
+          ? Math.max(10_000, Math.floor(budgets.finalizationBudgetMs))
+          : undefined,
     }),
     "utf-8",
   ).toString("base64");
@@ -743,6 +766,70 @@ export interface JobResult {
   exitCode?: number;
 }
 
+type TaskExecutePriority = "interactive" | "normal" | "background";
+type TaskExecuteIntent = "chat" | "status" | "code_change" | "analysis" | "other";
+type TaskExecuteRisk = "low" | "medium" | "high";
+
+function isStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every((entry) => typeof entry === "string")
+  );
+}
+
+function validateTaskExecutePlanning(
+  value: unknown,
+): { ok: true } | { ok: false; message: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, message: "task.execute requires params.planning object" };
+  }
+  const planning = value as Record<string, unknown>;
+
+  const intent = String(planning.intent ?? "");
+  const riskLevel = String(planning.riskLevel ?? "");
+  const queuePriority = String(planning.queuePriority ?? "");
+  const queueWaitBudgetMs = Number(planning.queueWaitBudgetMs);
+  const executionBudgetMs = Number(planning.executionBudgetMs);
+  const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
+
+  const validIntents: TaskExecuteIntent[] = [
+    "chat",
+    "status",
+    "code_change",
+    "analysis",
+    "other",
+  ];
+  const validRisks: TaskExecuteRisk[] = ["low", "medium", "high"];
+  const validPriorities: TaskExecutePriority[] = ["interactive", "normal", "background"];
+
+  if (!validIntents.includes(intent as TaskExecuteIntent)) {
+    return { ok: false, message: "task.execute planning.intent is invalid" };
+  }
+  if (!validRisks.includes(riskLevel as TaskExecuteRisk)) {
+    return { ok: false, message: "task.execute planning.riskLevel is invalid" };
+  }
+  if (!validPriorities.includes(queuePriority as TaskExecutePriority)) {
+    return { ok: false, message: "task.execute planning.queuePriority is invalid" };
+  }
+  if (!isStringArray(planning.targetPaths)) {
+    return { ok: false, message: "task.execute planning.targetPaths must be a string array" };
+  }
+  if (!isStringArray(planning.validationSteps)) {
+    return { ok: false, message: "task.execute planning.validationSteps must be a string array" };
+  }
+  if (!Number.isFinite(queueWaitBudgetMs) || queueWaitBudgetMs <= 0) {
+    return { ok: false, message: "task.execute planning.queueWaitBudgetMs must be > 0" };
+  }
+  if (!Number.isFinite(executionBudgetMs) || executionBudgetMs <= 0) {
+    return { ok: false, message: "task.execute planning.executionBudgetMs must be > 0" };
+  }
+  if (!Number.isFinite(finalizationBudgetMs) || finalizationBudgetMs <= 0) {
+    return { ok: false, message: "task.execute planning.finalizationBudgetMs must be > 0" };
+  }
+
+  return { ok: true };
+}
+
 export async function executeJob(
   kind: string,
   params: Record<string, unknown>,
@@ -753,6 +840,24 @@ export async function executeJob(
     return {
       ok: false,
       summary: `Unsupported job kind "${kind}". WorkerPals accepts only task.execute.`,
+    };
+  }
+
+  const schemaVersion = Number(params.schemaVersion);
+  if (!Number.isFinite(schemaVersion) || Math.floor(schemaVersion) !== 2) {
+    return {
+      ok: false,
+      summary: "task.execute requires params.schemaVersion=2",
+      exitCode: 2,
+    };
+  }
+
+  const planningValidation = validateTaskExecutePlanning(params.planning);
+  if (!planningValidation.ok) {
+    return {
+      ok: false,
+      summary: planningValidation.message,
+      exitCode: 2,
     };
   }
 
@@ -780,5 +885,11 @@ export async function executeJob(
     lane,
     instruction,
   };
-  return executeWithOpenHands(kind, normalizedParams, repo, onLog);
+  const planning = params.planning as Record<string, unknown>;
+  const executionBudgetMs = Number(planning.executionBudgetMs);
+  const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
+  return executeWithOpenHands(kind, normalizedParams, repo, onLog, {
+    executionBudgetMs,
+    finalizationBudgetMs,
+  });
 }

@@ -356,10 +356,17 @@ export interface RequestSnapshotRow {
   id: string;
   sessionId: string;
   prompt: string;
+  priority?: "interactive" | "normal" | "background";
+  queueWaitBudgetMs?: number | null;
   status: "pending" | "claimed" | "completed" | "failed";
   agentId: string | null;
   result: string | null;
   error: string | null;
+  enqueuedAt?: string | null;
+  claimedAt?: string | null;
+  completedAt?: string | null;
+  failedAt?: string | null;
+  durationMs?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -370,12 +377,20 @@ export interface JobSnapshotRow {
   sessionId: string;
   kind: string;
   params: string;
+  priority?: "interactive" | "normal" | "background";
+  queueWaitBudgetMs?: number | null;
+  executionBudgetMs?: number | null;
+  finalizationBudgetMs?: number | null;
   status: "pending" | "claimed" | "completed" | "failed";
   workerId: string | null;
   targetWorkerId: string | null;
   result: string | null;
   error: string | null;
+  enqueuedAt?: string | null;
   claimedAt?: string | null;
+  startedAt?: string | null;
+  firstLogAt?: string | null;
+  failedAt?: string | null;
   completedAt?: string | null;
   durationMs?: number | null;
   createdAt: string;
@@ -400,6 +415,56 @@ export interface CompletionSnapshotRow {
 
 export interface QueueCounts {
   [key: string]: number;
+}
+
+export interface PendingQueueSnapshot {
+  id: string;
+  priority: "interactive" | "normal" | "background";
+  position: number;
+  etaMs: number;
+}
+
+export interface SloMetricSummary {
+  p50: number | null;
+  p95: number | null;
+  avg: number | null;
+  sampleSize: number;
+}
+
+export interface RequestSloSummary {
+  windowHours: number;
+  terminal: number;
+  completed: number;
+  failed: number;
+  successRate: number | null;
+  durationMs: SloMetricSummary;
+  queueWaitMs: SloMetricSummary;
+}
+
+export interface JobSloSummary {
+  windowHours: number;
+  terminal: number;
+  completed: number;
+  failed: number;
+  timeoutFailures: number;
+  successRate: number | null;
+  timeoutRate: number | null;
+  durationMs: SloMetricSummary;
+  queueWaitMs: SloMetricSummary;
+}
+
+export interface SystemStatusSummary {
+  workers?: { total: number; online: number; busy: number; idle: number };
+  queues?: {
+    requests?: QueueCounts;
+    jobs?: QueueCounts;
+    completions?: QueueCounts;
+  };
+  slo?: {
+    requests?: RequestSloSummary;
+    jobs?: JobSloSummary;
+  };
+  ts?: string;
 }
 
 function authHeaders(authToken?: string): Record<string, string> {
@@ -428,48 +493,72 @@ export async function fetchWorkers(
 export async function fetchRequestsSnapshot(
   baseUrl: string,
   authToken?: string,
-): Promise<{ requests: RequestSnapshotRow[]; counts: QueueCounts }> {
+): Promise<{
+  requests: RequestSnapshotRow[];
+  counts: QueueCounts;
+  priorityCounts: QueueCounts;
+  pendingSnapshot: PendingQueueSnapshot[];
+  slo?: RequestSloSummary;
+}> {
   try {
     const response = await fetch(`${baseUrl}/requests?limit=250`, {
       headers: authHeaders(authToken),
     });
-    if (!response.ok) return { requests: [], counts: {} };
+    if (!response.ok) return { requests: [], counts: {}, priorityCounts: {}, pendingSnapshot: [] };
     const payload = (await response.json()) as {
       ok: boolean;
       requests?: RequestSnapshotRow[];
       counts?: QueueCounts;
+      priorityCounts?: QueueCounts;
+      pendingSnapshot?: PendingQueueSnapshot[];
+      slo?: RequestSloSummary;
     };
     return {
       requests: Array.isArray(payload.requests) ? payload.requests : [],
       counts: payload.counts ?? {},
+      priorityCounts: payload.priorityCounts ?? {},
+      pendingSnapshot: Array.isArray(payload.pendingSnapshot) ? payload.pendingSnapshot : [],
+      slo: payload.slo,
     };
   } catch (err) {
     console.error("Error fetching requests snapshot:", err);
-    return { requests: [], counts: {} };
+    return { requests: [], counts: {}, priorityCounts: {}, pendingSnapshot: [] };
   }
 }
 
 export async function fetchJobsSnapshot(
   baseUrl: string,
   authToken?: string,
-): Promise<{ jobs: JobSnapshotRow[]; counts: QueueCounts }> {
+): Promise<{
+  jobs: JobSnapshotRow[];
+  counts: QueueCounts;
+  priorityCounts: QueueCounts;
+  pendingSnapshot: PendingQueueSnapshot[];
+  slo?: JobSloSummary;
+}> {
   try {
     const response = await fetch(`${baseUrl}/jobs?limit=250`, {
       headers: authHeaders(authToken),
     });
-    if (!response.ok) return { jobs: [], counts: {} };
+    if (!response.ok) return { jobs: [], counts: {}, priorityCounts: {}, pendingSnapshot: [] };
     const payload = (await response.json()) as {
       ok: boolean;
       jobs?: JobSnapshotRow[];
       counts?: QueueCounts;
+      priorityCounts?: QueueCounts;
+      pendingSnapshot?: PendingQueueSnapshot[];
+      slo?: JobSloSummary;
     };
     return {
       jobs: Array.isArray(payload.jobs) ? payload.jobs : [],
       counts: payload.counts ?? {},
+      priorityCounts: payload.priorityCounts ?? {},
+      pendingSnapshot: Array.isArray(payload.pendingSnapshot) ? payload.pendingSnapshot : [],
+      slo: payload.slo,
     };
   } catch (err) {
     console.error("Error fetching jobs snapshot:", err);
-    return { jobs: [], counts: {} };
+    return { jobs: [], counts: {}, priorityCounts: {}, pendingSnapshot: [] };
   }
 }
 
@@ -500,33 +589,17 @@ export async function fetchCompletionsSnapshot(
 export async function fetchSystemStatus(
   baseUrl: string,
   authToken?: string,
-): Promise<{
-  workers?: { total: number; online: number; busy: number; idle: number };
-  queues?: {
-    requests?: QueueCounts;
-    jobs?: QueueCounts;
-    completions?: QueueCounts;
-  };
-  ts?: string;
-}> {
+): Promise<SystemStatusSummary> {
   try {
     const response = await fetch(`${baseUrl}/system/status`, {
       headers: authHeaders(authToken),
     });
     if (!response.ok) return {};
-    const payload = (await response.json()) as {
-      ok: boolean;
-      workers?: { total: number; online: number; busy: number; idle: number };
-      queues?: {
-        requests?: QueueCounts;
-        jobs?: QueueCounts;
-        completions?: QueueCounts;
-      };
-      ts?: string;
-    };
+    const payload = (await response.json()) as { ok: boolean } & SystemStatusSummary;
     return {
       workers: payload.workers,
       queues: payload.queues,
+      slo: payload.slo,
       ts: payload.ts,
     };
   } catch (err) {

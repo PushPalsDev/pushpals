@@ -94,32 +94,6 @@ function extractTargetPath(text: string): string | null {
   return null;
 }
 
-function extractLiteralFileContent(text: string): string | null {
-  const quotedPatterns = [
-    /\bwith\s+(?:the\s+)?(?:words?|text|content)\s+["'`]([^"'`]+)["'`]/i,
-    /\b(?:that\s+says?|saying|containing)\s+["'`]([^"'`]+)["'`]/i,
-  ];
-  for (const pattern of quotedPatterns) {
-    const match = text.match(pattern);
-    if (!match) continue;
-    const value = (match[1] ?? "").trim();
-    if (value) return value;
-  }
-
-  const unquotedPatterns = [
-    /\bwith\s+(?:the\s+)?(?:words?|text|content)\s+(.+)$/i,
-    /\b(?:that\s+says?|saying|containing)\s+(.+)$/i,
-  ];
-  for (const pattern of unquotedPatterns) {
-    const match = text.match(pattern);
-    if (!match) continue;
-    const value = (match[1] ?? "").trim().replace(/[.]+$/, "");
-    if (value) return value;
-  }
-
-  return null;
-}
-
 function isExecutionIntent(text: string, targetPath: string | null): boolean {
   const t = text.trim().toLowerCase();
   if (!t || isLikelyChitChat(t)) return false;
@@ -163,32 +137,37 @@ function isArchitectureIntent(text: string): boolean {
 }
 
 type TaskExecutionLane = "deterministic" | "openhands";
+type RequestPriority = "interactive" | "normal" | "background";
+type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
+type PlannerRisk = "low" | "medium" | "high";
 
 interface TaskExecuteJobParams {
+  schemaVersion: 2;
   requestId: string;
   sessionId: string;
   instruction: string;
   lane: TaskExecutionLane;
+  planning: {
+    intent: PlannerIntent;
+    riskLevel: PlannerRisk;
+    targetPaths: string[];
+    validationSteps: string[];
+    queuePriority: RequestPriority;
+    queueWaitBudgetMs: number;
+    executionBudgetMs: number;
+    finalizationBudgetMs: number;
+  };
   targetPath?: string;
-  literalFileContent?: string;
-  responseMode?: "assistant_message";
-  maxResponseChars?: number;
   recentContext: string[];
   recentJobs: Array<Record<string, unknown>>;
 }
 
-function chooseTaskExecutionLane(args: {
-  prompt: string;
-  targetPath: string | null;
-  hasLiteralFileContent: boolean;
-}): TaskExecutionLane {
-  const prompt = args.prompt.trim().toLowerCase();
-  if (args.hasLiteralFileContent && args.targetPath) return "deterministic";
-  if (isArchitectureIntent(prompt)) return "deterministic";
-  if (args.targetPath && /\b(create|write|generate|document|readme|summary|overview)\b/.test(prompt)) {
-    return "deterministic";
-  }
-  return "openhands";
+function normalizeRequestPriority(value: unknown): RequestPriority {
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (text === "interactive" || text === "background") return text;
+  return "normal";
 }
 
 function toSingleLine(value: unknown, max = 220): string {
@@ -307,6 +286,10 @@ class RemoteBuddyOrchestrator {
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
   private readonly statusHeartbeatMs: number;
+  private readonly executionBudgetInteractiveMs: number;
+  private readonly executionBudgetNormalMs: number;
+  private readonly executionBudgetBackgroundMs: number;
+  private readonly finalizationBudgetMs: number;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -369,6 +352,22 @@ class RemoteBuddyOrchestrator {
       .map((label) => label.trim())
       .filter(Boolean);
     this.statusHeartbeatMs = parseStatusHeartbeatMs("REMOTEBUDDY_STATUS_HEARTBEAT_MS", 120_000);
+    this.executionBudgetInteractiveMs = Math.max(
+      60_000,
+      envInt("REMOTEBUDDY_EXECUTION_BUDGET_INTERACTIVE_MS", 300_000),
+    );
+    this.executionBudgetNormalMs = Math.max(
+      120_000,
+      envInt("REMOTEBUDDY_EXECUTION_BUDGET_NORMAL_MS", 900_000),
+    );
+    this.executionBudgetBackgroundMs = Math.max(
+      180_000,
+      envInt("REMOTEBUDDY_EXECUTION_BUDGET_BACKGROUND_MS", 1_800_000),
+    );
+    this.finalizationBudgetMs = Math.max(
+      30_000,
+      envInt("REMOTEBUDDY_FINALIZATION_BUDGET_MS", 120_000),
+    );
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
@@ -381,6 +380,9 @@ class RemoteBuddyOrchestrator {
     console.log(`[RemoteBuddy] Detected repo root: ${this.repo}`);
     console.log(
       `[RemoteBuddy] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
+    );
+    console.log(
+      `[RemoteBuddy] Budgets: interactive=${this.executionBudgetInteractiveMs}ms normal=${this.executionBudgetNormalMs}ms background=${this.executionBudgetBackgroundMs}ms finalization=${this.finalizationBudgetMs}ms`,
     );
   }
 
@@ -613,6 +615,47 @@ class RemoteBuddyOrchestrator {
       .map((entry) => toSingleLine(entry, RemoteBuddyOrchestrator.CHAT_CONTEXT_ENTRY_CHARS));
   }
 
+  private planningContextSnapshot(priority: RequestPriority): string[] {
+    const filtered = this.recentContext.filter((entry) => !entry.startsWith("[enhanced]"));
+    const limit = priority === "interactive" ? 6 : RemoteBuddyOrchestrator.CHAT_CONTEXT_MAX;
+    return filtered
+      .slice(-limit)
+      .map((entry) => toSingleLine(entry, RemoteBuddyOrchestrator.CHAT_CONTEXT_ENTRY_CHARS));
+  }
+
+  private executionBudgetForPriority(priority: RequestPriority): number {
+    switch (priority) {
+      case "interactive":
+        return this.executionBudgetInteractiveMs;
+      case "background":
+        return this.executionBudgetBackgroundMs;
+      default:
+        return this.executionBudgetNormalMs;
+    }
+  }
+
+  private chooseExecutionLane(
+    prompt: string,
+    plan: {
+      lane: TaskExecutionLane;
+      intent: PlannerIntent;
+      risk_level: PlannerRisk;
+      target_paths: string[];
+      validation_steps: string[];
+    },
+  ): TaskExecutionLane {
+    if (plan.intent === "status") return "deterministic";
+    if (plan.risk_level === "low" && plan.target_paths.length <= 3 && plan.validation_steps.length <= 4) {
+      if (prompt.trim().length <= 800) return "deterministic";
+    }
+    return plan.lane;
+  }
+
+  private shouldForceDirectReply(prompt: string, intent: PlannerIntent): boolean {
+    if (intent !== "chat" && intent !== "status") return false;
+    return !isExecutionIntent(prompt, extractTargetPath(prompt));
+  }
+
   private getRecentJobContext(limit: number = 12): Array<Record<string, unknown>> {
     try {
       if (!this.jobsDb) {
@@ -810,15 +853,22 @@ class RemoteBuddyOrchestrator {
   // ── Dispatch, Polling for Request Queue ────────────────────────────────────────
 
   /** Process a request from the Request Queue (replaces handleMessage) */
-  private async processRequest(request: any): Promise<void> {
-    const requestId = request.id;
+  private async processRequest(
+    request: {
+      id: string;
+      prompt: string;
+      priority?: string;
+      queueWaitBudgetMs?: number;
+    },
+    queueWaitMs = 0,
+  ): Promise<void> {
+    const requestId = String(request.id ?? "").trim();
+    if (!requestId) return;
 
-    // Idempotency check
     if (this.idempotency.hasHandled(this.sessionId, requestId)) {
       console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
       return;
     }
-
     this.idempotency.markHandled(this.sessionId, requestId);
 
     const prompt = String(request.prompt ?? "").trim();
@@ -828,35 +878,70 @@ class RemoteBuddyOrchestrator {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({ message: "Request missing prompt" }),
-      }).catch(() => {
-        // best effort
-      });
+      }).catch(() => {});
       return;
     }
-    const promptForIntent = prompt;
-    const targetPath = extractTargetPath(prompt);
-    const literalFileContent = extractLiteralFileContent(prompt);
-    const actionable = isExecutionIntent(promptForIntent, targetPath);
+
+    const priority = normalizeRequestPriority(request.priority);
+    const queueWaitBudgetMs = Math.max(
+      5_000,
+      Number.isFinite(Number(request.queueWaitBudgetMs))
+        ? Number(request.queueWaitBudgetMs)
+        : priority === "interactive"
+          ? 20_000
+          : priority === "background"
+            ? 240_000
+            : 90_000,
+    );
     const turnId = randomUUID();
+    const planningContext = this.planningContextSnapshot(priority);
 
-    let tasksCreated = 0;
-    if (!actionable) {
-      // Lightweight-only responses stay in the orchestrator.
-      const thinkPrompt = prompt;
-      const chatContext = this.getChatContextSnapshot();
-      console.log(`[RemoteBuddy] Thinking about: "${thinkPrompt.substring(0, 80)}"`);
-      const output = await this.brain.think(thinkPrompt, chatContext);
-      this.pushContext(`[user] ${toSingleLine(thinkPrompt, 700)}`);
-      this.pushContext(`[assistant] ${toSingleLine(output.assistantMessage, 900)}`);
-      await this.sendCommand({
-        type: "assistant_message",
-        payload: { text: output.assistantMessage },
-        turnId,
-      });
-    } else {
-      this.pushContext(`[user] ${toSingleLine(prompt, 900)}`);
+    try {
+      console.log(
+        `[RemoteBuddy] Planning request ${requestId.slice(0, 8)} priority=${priority} queueWait=${Math.max(
+          0,
+          Math.floor(queueWaitMs),
+        )}ms`,
+      );
+      const plan = await this.brain.think(prompt, planningContext);
+      this.pushContext(`[user] ${toSingleLine(prompt, 700)}`);
+      this.pushContext(`[plan] ${toSingleLine(JSON.stringify(plan), 900)}`);
+      const requiresWorker = this.shouldForceDirectReply(prompt, plan.intent)
+        ? false
+        : plan.requires_worker;
+      const lane = requiresWorker ? this.chooseExecutionLane(prompt, plan) : "deterministic";
 
-      // Any non-trivial request is WorkerPal-owned.
+      if (queueWaitMs > queueWaitBudgetMs) {
+        await this.comm.assistantMessage(
+          `Request ${requestId.slice(0, 8)} waited ${Math.floor(
+            queueWaitMs / 1000,
+          )}s in queue (budget ${Math.floor(queueWaitBudgetMs / 1000)}s). Prioritizing execution now.`,
+          { turnId, correlationId: requestId },
+        );
+      }
+
+      if (!requiresWorker) {
+        await this.sendCommand({
+          type: "assistant_message",
+          payload: { text: plan.assistant_message },
+          turnId,
+        });
+        await fetch(`${this.server}/requests/${requestId}/complete`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          body: JSON.stringify({
+            result: {
+              requiresWorker: false,
+              intent: plan.intent,
+              lane: "deterministic",
+              priority,
+              queueWaitMs: Math.max(0, Math.floor(queueWaitMs)),
+            },
+          }),
+        }).catch(() => {});
+        return;
+      }
+
       await this.comm.assistantMessage("Understood. I am delegating this to a WorkerPal now.", {
         turnId,
         correlationId: requestId,
@@ -864,32 +949,28 @@ class RemoteBuddyOrchestrator {
 
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
-      const architectureIntent = isArchitectureIntent(promptForIntent);
-      const canDirectWrite = !!targetPath && typeof literalFileContent === "string";
-      const lane = chooseTaskExecutionLane({
-        prompt: promptForIntent,
-        targetPath,
-        hasLiteralFileContent: canDirectWrite,
-      });
-      const jobKind = "task.execute";
+      const executionBudgetMs = this.executionBudgetForPriority(priority);
+      const targetPath = plan.target_paths[0] ?? extractTargetPath(prompt) ?? undefined;
       const params: TaskExecuteJobParams = {
+        schemaVersion: 2,
         requestId,
         sessionId: this.sessionId,
-        instruction: prompt,
+        instruction: plan.worker_instruction || prompt,
         lane,
+        planning: {
+          intent: plan.intent,
+          riskLevel: plan.risk_level,
+          targetPaths: plan.target_paths,
+          validationSteps: plan.validation_steps,
+          queuePriority: priority,
+          queueWaitBudgetMs,
+          executionBudgetMs,
+          finalizationBudgetMs: this.finalizationBudgetMs,
+        },
+        targetPath,
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
       };
-      if (targetPath) {
-        params.targetPath = targetPath;
-      }
-      if (canDirectWrite) {
-        params.literalFileContent = literalFileContent ?? "";
-      }
-      if (lane === "deterministic" && architectureIntent) {
-        params.responseMode = "assistant_message";
-        params.maxResponseChars = 8000;
-      }
 
       await this.sendCommand({
         type: "task_created",
@@ -901,16 +982,11 @@ class RemoteBuddyOrchestrator {
               ? "Deterministic execution lane (fast path)"
               : "Agentic OpenHands execution lane",
           createdBy: `agent:${this.agentId}`,
+          priority,
         },
         turnId,
       });
-
-      await this.sendCommand({
-        type: "task_started",
-        payload: { taskId },
-        turnId,
-      });
-
+      await this.sendCommand({ type: "task_started", payload: { taskId }, turnId });
       await this.sendCommand({
         type: "task_progress",
         payload: {
@@ -929,26 +1005,45 @@ class RemoteBuddyOrchestrator {
         { turnId, correlationId: requestId },
       );
 
-      const jobId = await this.enqueueJob(taskId, jobKind, params, targetWorkerId);
+      const jobId = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
       if (jobId) {
         await this.sendCommand({
           type: "job_enqueued",
-          payload: { jobId, taskId, kind: jobKind, params },
+          payload: { jobId, taskId, kind: "task.execute", params },
           turnId,
         });
-        tasksCreated = 1;
       }
-    }
 
-    // Mark request complete
-    try {
       await fetch(`${this.server}/requests/${requestId}/complete`, {
         method: "POST",
         headers: this.authHeaders(),
-        body: JSON.stringify({ result: { tasksCreated } }),
-      });
+        body: JSON.stringify({
+          result: {
+            requiresWorker: true,
+            intent: plan.intent,
+            lane,
+            priority,
+            riskLevel: plan.risk_level,
+            queueWaitMs: Math.max(0, Math.floor(queueWaitMs)),
+            executionBudgetMs,
+            finalizationBudgetMs: this.finalizationBudgetMs,
+            targetPaths: plan.target_paths,
+            validationSteps: plan.validation_steps,
+          },
+        }),
+      }).catch(() => {});
     } catch (err) {
-      console.error(`[RemoteBuddy] Failed to mark request complete:`, err);
+      const message = `RemoteBuddy planning failed: ${toSingleLine(err, 220) || "unknown error"}`;
+      console.error(`[RemoteBuddy] ${message}`);
+      await this.comm.assistantMessage(message, { turnId, correlationId: requestId });
+      await fetch(`${this.server}/requests/${requestId}/fail`, {
+        method: "POST",
+        headers: this.authHeaders(),
+        body: JSON.stringify({
+          message: "RemoteBuddy planning failed",
+          detail: String(err),
+        }),
+      }).catch(() => {});
     }
   }
 
@@ -965,13 +1060,22 @@ class RemoteBuddyOrchestrator {
         });
 
         if (res.ok) {
-          const data = (await res.json()) as { ok: boolean; request?: any };
+          const data = (await res.json()) as {
+            ok: boolean;
+            request?: {
+              id: string;
+              prompt: string;
+              priority?: string;
+              queueWaitBudgetMs?: number;
+            };
+            queueWaitMs?: number;
+          };
 
           if (data.ok && data.request) {
             console.log(`[RemoteBuddy] Claimed request ${data.request.id}`);
             // Serialize processing
             this.chain = this.chain
-              .then(() => this.processRequest(data.request))
+              .then(() => this.processRequest(data.request!, Number(data.queueWaitMs ?? 0)))
               .catch((err) => console.error("[RemoteBuddy] Process error:", err));
           }
         }
@@ -1059,7 +1163,7 @@ async function main() {
 
   // ── Initialise LLM + brain ──
   const llm = createLLMClient({ service: "remotebuddy" });
-  const brain = new AgentBrain(llm, { actionsEnabled: false });
+  const brain = new AgentBrain(llm);
 
   // ── Initialise idempotency store ──
   const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
