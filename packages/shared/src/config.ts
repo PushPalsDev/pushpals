@@ -96,6 +96,8 @@ export interface PushPalsConfig {
     dockerJobMaxAttempts: number;
     dockerJobRetryBackoffMs: number;
     dockerNetworkMode: string;
+    dockerWarmMemoryMb: number;
+    dockerWarmCpus: number;
     baseRef: string;
     labels: string[];
     failureCooldownMs: number;
@@ -557,6 +559,23 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       ),
     ),
   );
+  const workerDockerWarmMemoryMb = Math.max(
+    512,
+    Math.min(
+      32_768,
+      asInt(
+        parseIntEnv("WORKERPALS_DOCKER_WARM_MEMORY_MB") ?? workerNode.docker_warm_memory_mb,
+        2_048,
+      ),
+    ),
+  );
+  const workerDockerWarmCpus = Math.max(
+    1,
+    Math.min(
+      16,
+      asInt(parseIntEnv("WORKERPALS_DOCKER_WARM_CPUS") ?? workerNode.docker_warm_cpus, 2),
+    ),
+  );
   const workerLlm = resolveLlmConfig(
     workerNode,
     "WORKERPALS",
@@ -886,6 +905,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       dockerWarmRetryBackoffMs: workerDockerWarmRetryBackoffMs,
       dockerJobMaxAttempts: workerDockerJobMaxAttempts,
       dockerJobRetryBackoffMs: workerDockerJobRetryBackoffMs,
+      dockerWarmMemoryMb: workerDockerWarmMemoryMb,
+      dockerWarmCpus: workerDockerWarmCpus,
       dockerNetworkMode: asString(
         process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? workerNode.docker_network_mode,
         "bridge",

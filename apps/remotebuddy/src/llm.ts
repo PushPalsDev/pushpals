@@ -357,6 +357,8 @@ export class LmStudioClient implements LLMClient {
   private batchMemoryChars: number;
   private resolvedModel: string | null = null;
   private resolveModelPromise: Promise<string> | null = null;
+  private lmStudioSupportsExtendedSessionFields: boolean | null = null;
+  private lmStudioSupportsResponseFormat: boolean | null = null;
 
   constructor(opts?: {
     endpoint?: string;
@@ -503,12 +505,16 @@ export class LmStudioClient implements LLMClient {
 
     const sessionAwareBodyBases: Array<Record<string, unknown>> = this.sessionTag
       ? [
-          {
-            ...coreBody,
-            user: this.sessionTag,
-            session_id: this.sessionTag,
-            conversation_id: this.sessionTag,
-          },
+          ...(this.lmStudioSupportsExtendedSessionFields !== false
+            ? [
+                {
+                  ...coreBody,
+                  user: this.sessionTag,
+                  session_id: this.sessionTag,
+                  conversation_id: this.sessionTag,
+                },
+              ]
+            : []),
           {
             ...coreBody,
             user: this.sessionTag,
@@ -522,6 +528,10 @@ export class LmStudioClient implements LLMClient {
     const bodyVariants: Array<Record<string, unknown>> = [];
     for (const baseBody of sessionAwareBodyBases) {
       if (!opts.json) {
+        bodyVariants.push(baseBody);
+        continue;
+      }
+      if (this.lmStudioSupportsResponseFormat === false) {
         bodyVariants.push(baseBody);
         continue;
       }
@@ -579,11 +589,13 @@ export class LmStudioClient implements LLMClient {
             lowered.includes("additional properties");
           const responseFormatRejected = lowered.includes("response_format");
           if (sessionFieldRejected && !loggedSessionFallback) {
+            this.lmStudioSupportsExtendedSessionFields = false;
             loggedSessionFallback = true;
             console.warn(
               `[LLM] LM Studio rejected session hint fields, retrying compatibility payload (${lastStatus}).`,
             );
           } else if (responseFormatRejected && !loggedResponseFormatFallback) {
+            this.lmStudioSupportsResponseFormat = false;
             loggedResponseFormatFallback = true;
             console.warn(
               `[LLM] LM Studio rejected response_format payload, retrying with fallback (${lastStatus}).`,
@@ -596,6 +608,12 @@ export class LmStudioClient implements LLMClient {
 
       const data = (await res.json()) as any;
       const choice = data.choices?.[0];
+      if ("session_id" in body || "conversation_id" in body) {
+        this.lmStudioSupportsExtendedSessionFields = true;
+      }
+      if ("response_format" in body) {
+        this.lmStudioSupportsResponseFormat = true;
+      }
 
       return {
         text: choice?.message?.content ?? "",

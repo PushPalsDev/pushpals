@@ -118,28 +118,35 @@ If unclear, ask one brief clarifying question.
 `.trim();
 
 function tryParseJsonObject(raw: string): Record<string, unknown> | null {
+  const parseAtDepth = (input: string, depth: number): Record<string, unknown> | null => {
+    if (depth > 2) return null;
+    const trimmed = input.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      if (typeof parsed === "string" && parsed.trim()) {
+        return parseAtDepth(parsed, depth + 1);
+      }
+    } catch {
+      // fall through
+    }
+    return null;
+  };
+
   const trimmed = raw.trim();
   if (!trimmed) return null;
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // fall through
-  }
+  const direct = parseAtDepth(trimmed, 0);
+  if (direct) return direct;
 
   const firstBrace = trimmed.indexOf("{");
   const lastBrace = trimmed.lastIndexOf("}");
   if (firstBrace >= 0 && lastBrace > firstBrace) {
-    try {
-      const parsed = JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
-      }
-    } catch {
-      // ignore parse failure
-    }
+    const sliced = trimmed.slice(firstBrace, lastBrace + 1);
+    const nested = parseAtDepth(sliced, 0);
+    if (nested) return nested;
   }
   return null;
 }
@@ -161,6 +168,21 @@ function extractLocalReplyFromObject(value: Record<string, unknown> | null): str
   return "";
 }
 
+function extractLocalReplyFromJsonLikeText(value: string): string {
+  const keyPattern = "(reply|assistant_message|message|text|content)";
+  const directMatch = value.match(
+    new RegExp(`"${keyPattern}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, "i"),
+  );
+  if (!directMatch?.[2]) return "";
+  const encoded = directMatch[2];
+  try {
+    const decoded = JSON.parse(`"${encoded}"`);
+    return typeof decoded === "string" ? decoded.trim() : "";
+  } catch {
+    return encoded.trim();
+  }
+}
+
 function fallbackLocalReply(userPrompt: string): string {
   const text = userPrompt.trim().toLowerCase();
   if (/^(hi|hello|hey)\b/.test(text)) {
@@ -175,7 +197,7 @@ function fallbackLocalReply(userPrompt: string): string {
 function sanitizeLocalReply(raw: string, userPrompt: string): string {
   let text = String(raw ?? "")
     .replace(/^```(?:json)?\s*/i, "")
-    .replace(/```$/i, "")
+    .replace(/```/g, "")
     .trim();
   if (!text) return fallbackLocalReply(userPrompt);
 
@@ -184,6 +206,11 @@ function sanitizeLocalReply(raw: string, userPrompt: string): string {
   const extracted = extractLocalReplyFromObject(parsed);
   if (extracted) {
     text = extracted;
+  } else {
+    const extractedFromJsonLike = extractLocalReplyFromJsonLikeText(text);
+    if (extractedFromJsonLike) {
+      text = extractedFromJsonLike;
+    }
   }
 
   const lowered = text.toLowerCase();
@@ -206,6 +233,14 @@ function sanitizeLocalReply(raw: string, userPrompt: string): string {
   if (/^\d+\.\s+\*\*/.test(text) || /^analysis[:\s]/i.test(text)) {
     return fallbackLocalReply(userPrompt);
   }
+
+  const stillJsonLike =
+    /^\s*\{[\s\S]*\}\s*$/.test(text) &&
+    /"(reply|assistant_message|message|text|content)"\s*:/.test(text);
+  if (stillJsonLike) {
+    return fallbackLocalReply(userPrompt);
+  }
+
   return text || fallbackLocalReply(userPrompt);
 }
 

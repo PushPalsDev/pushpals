@@ -43,6 +43,10 @@ function parseClampedIntAllowZero(value: unknown, defaultValue: number, max: num
   return Math.max(0, Math.min(max, parsed));
 }
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
 export class DockerExecutionExhaustedError extends Error {
   readonly cooldownMs: number;
   readonly category: "warm_setup" | "job_execution";
@@ -110,6 +114,7 @@ export class DockerExecutor {
   private readonly jobRetryBackoffMs: number;
   private readonly failureCooldownMs: number;
   private lastLoggedExecutionConfig = "";
+  private lastLoggedEndpointRewrite = "";
 
   constructor(options: DockerExecutorOptions) {
     const startupTimeoutMs = parseClampedInt(
@@ -364,10 +369,11 @@ export class DockerExecutor {
    * Run the Docker container and parse output
    */
   private collectContainerEnv(): string[] {
+    const containerLlmEndpoint = this.workerLlmEndpointForContainer();
     const fixedEnv: Record<string, string> = {
       WORKERPALS_EXECUTOR: CONFIG.workerpals.executor,
       WORKERPALS_LLM_MODEL: CONFIG.workerpals.llm.model,
-      WORKERPALS_LLM_ENDPOINT: CONFIG.workerpals.llm.endpoint,
+      WORKERPALS_LLM_ENDPOINT: containerLlmEndpoint,
       WORKERPALS_LLM_BACKEND: CONFIG.workerpals.llm.backend,
       WORKERPALS_LLM_SESSION_ID: CONFIG.workerpals.llm.sessionId,
       WORKERPALS_OPENHANDS_TIMEOUT_MS: String(CONFIG.workerpals.openhandsTimeoutMs),
@@ -468,9 +474,9 @@ export class DockerExecutor {
       "--label",
       `pushpals.worker_id=${this.options.workerId}`,
       "--memory",
-      "512m",
+      `${CONFIG.workerpals.dockerWarmMemoryMb}m`,
       "--cpus",
-      "1",
+      String(CONFIG.workerpals.dockerWarmCpus),
       "--network",
       this.options.networkMode,
       "--add-host",
@@ -672,13 +678,60 @@ export class DockerExecutor {
     return `UNREACHABLE (${lastError})`;
   }
 
+  private workerLlmEndpointForContainer(): string {
+    const raw = (CONFIG.workerpals.llm.endpoint ?? "").trim();
+    if (!raw) return raw;
+    try {
+      const parsed = new URL(raw);
+      const host = (parsed.hostname ?? "").trim().toLowerCase();
+      if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1") {
+        return raw;
+      }
+      parsed.hostname = "host.docker.internal";
+      return parsed.toString();
+    } catch {
+      return raw;
+    }
+  }
+
+  private async probeWorkerLlmEndpointFromContainer(): Promise<string> {
+    const endpoint = this.workerLlmEndpointForContainer();
+    if (!endpoint) return "endpoint not configured";
+    const probes = this.workerLlmProbeUrls(endpoint);
+    if (probes.length === 0) return `endpoint malformed: ${endpoint}`;
+
+    let lastError = "unreachable";
+    for (const probe of probes) {
+      const cmd =
+        `status="$(curl -sS -m 3 -o /dev/null -w "%{http_code}" ${shellSingleQuote(probe)} || true)"; ` +
+        'echo "$status"';
+      const result = await this.runWarmShell(cmd);
+      const status = Number.parseInt(result.stdout.trim(), 10);
+      if (Number.isFinite(status) && status >= 200 && status < 500) {
+        return `reachable via ${probe} (HTTP ${status})`;
+      }
+      if (Number.isFinite(status) && status > 0) {
+        lastError = `${probe}: HTTP ${status}`;
+      } else {
+        const detail = result.stderr ? ` (${result.stderr})` : "";
+        lastError = `${probe}: exit ${result.exitCode}${detail}`;
+      }
+    }
+    return `UNREACHABLE (${lastError})`;
+  }
+
   private async collectWarmAgentDiagnostics(): Promise<string> {
     const sections: string[] = [];
     const model = CONFIG.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
     const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
     const endpoint = CONFIG.workerpals.llm.endpoint.trim() || "(unset)";
+    const containerEndpoint = this.workerLlmEndpointForContainer();
     sections.push(`[llm-config] model=${model} provider=${provider} endpoint=${endpoint}`);
-    sections.push(`[llm-probe] ${await this.probeWorkerLlmEndpoint()}`);
+    if (endpoint && containerEndpoint && endpoint !== containerEndpoint) {
+      sections.push(`[llm-endpoint-rewrite] ${endpoint} -> ${containerEndpoint}`);
+    }
+    sections.push(`[llm-probe-host] ${await this.probeWorkerLlmEndpoint()}`);
+    sections.push(`[llm-probe-container] ${await this.probeWorkerLlmEndpointFromContainer()}`);
     sections.push(`[container] ${await this.inspectWarmContainerState()}`);
     sections.push(`[container-logs]\n${await this.readWarmContainerLogs(160)}`);
 
@@ -904,12 +957,14 @@ export class DockerExecutor {
     const backend = CONFIG.workerpals.executor.trim().toLowerCase() || "openhands";
     const model = CONFIG.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
     const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
+    const warmMemoryMb = CONFIG.workerpals.dockerWarmMemoryMb;
+    const warmCpus = CONFIG.workerpals.dockerWarmCpus;
     const laneRaw =
       job?.kind === "task.execute" && typeof job.params?.lane === "string" ? job.params.lane : "";
     const lane = laneRaw.trim().toLowerCase();
     return lane
-      ? `backend=${backend} model=${model} provider=${provider} lane=${lane}`
-      : `backend=${backend} model=${model} provider=${provider}`;
+      ? `backend=${backend} model=${model} provider=${provider} lane=${lane} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus}`
+      : `backend=${backend} model=${model} provider=${provider} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus}`;
   }
 
   private logExecutionConfig(job: Job): void {
@@ -917,6 +972,17 @@ export class DockerExecutor {
     if (summary === this.lastLoggedExecutionConfig) return;
     this.lastLoggedExecutionConfig = summary;
     console.log(`[DockerExecutor] Execution config: ${summary}`);
+    const configuredEndpoint = CONFIG.workerpals.llm.endpoint.trim();
+    const containerEndpoint = this.workerLlmEndpointForContainer();
+    if (configuredEndpoint && configuredEndpoint !== containerEndpoint) {
+      const rewriteSummary = `${configuredEndpoint} -> ${containerEndpoint}`;
+      if (rewriteSummary !== this.lastLoggedEndpointRewrite) {
+        this.lastLoggedEndpointRewrite = rewriteSummary;
+        console.log(
+          `[DockerExecutor] Rewriting worker LLM endpoint for container networking: ${rewriteSummary}`,
+        );
+      }
+    }
   }
 
   private async runGitSelfCheckContainer(worktreePath: string): Promise<void> {
