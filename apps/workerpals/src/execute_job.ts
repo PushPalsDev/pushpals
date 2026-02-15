@@ -271,12 +271,12 @@ async function executeWithOpenHands(
           : `planning executionBudgetMs=${executionBudgetMs}ms (matches worker cap)`;
   if (executionBudgetMs != null && executionBudgetMs < configuredTimeoutMs) {
     onLog?.(
-      "stderr",
+      "stdout",
       `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, worker cap=${configuredTimeoutMs}ms).`,
     );
   } else if (executionBudgetMs != null && executionBudgetMs > configuredTimeoutMs) {
     onLog?.(
-      "stderr",
+      "stdout",
       `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, configured cap=${configuredTimeoutMs}ms).`,
     );
   }
@@ -353,7 +353,7 @@ async function executeWithOpenHands(
         stuckNudgeTimer = null;
       }
       if (reason && hadActiveTimer) {
-        onLog?.("stderr", `[OpenHandsExecutor] Auto-steering nudges paused: ${reason}.`);
+        onLog?.("stdout", `[OpenHandsExecutor] Auto-steering nudges paused: ${reason}.`);
       }
     };
 
@@ -392,7 +392,7 @@ async function executeWithOpenHands(
         stuckNudgeCount += 1;
         const elapsedMs = Date.now() - startedAtMs;
         onLog?.(
-          "stderr",
+          "stdout",
           `[OpenHandsExecutor] Auto-steering nudge ${stuckNudgeCount}/${stuckNudgeMaxCount} after ${elapsedMs}ms (${stuckGuardReason || "no edit/test progress"}): ${buildSteeringNudge(stuckNudgeCount)}`,
         );
         if (stuckNudgeCount >= stuckNudgeMaxCount) {
@@ -456,7 +456,7 @@ async function executeWithOpenHands(
             stuckGuardReason = `no edit/test progress for ${stuckNoProgressMaxMs}ms`;
           }
           onLog?.(
-            "stderr",
+            "stdout",
             `[OpenHandsExecutor] Stuck guard triggered after ${stuckGuardAfterMs}ms: ${stuckGuardReason}. Steering hint: stop broad exploration, pick a concrete target file, make a minimal edit, then run a focused validation command.`,
           );
           startStuckNudges();
@@ -474,7 +474,7 @@ async function executeWithOpenHands(
       if (msUntilWarn <= 0) return;
       warningTimer = setTimeout(() => {
         onLog?.(
-          "stderr",
+          "stdout",
           `[OpenHandsExecutor] Timeout approaching for ${kind} (${Math.round(
             timeoutWarningLeadMs / 1000,
           )}s remaining). If unfinished, return a concise status/failure update now.`,
@@ -495,7 +495,7 @@ async function executeWithOpenHands(
           extendedByActivityMs = activityExtensionMs;
           timeoutDeadlineMs = nowMs + activityExtensionMs;
           onLog?.(
-            "stderr",
+            "stdout",
             `[OpenHandsExecutor] Extending timeout by ${activityExtensionMs}ms because the agent is still active (last output ${Math.round(
               quietForMs / 1000,
             )}s ago).`,
@@ -508,7 +508,7 @@ async function executeWithOpenHands(
         timedOut = true;
         timedOutAfterMs = Math.max(1, nowMs - startedAtMs);
         onLog?.(
-          "stderr",
+          "stdout",
           `[OpenHandsExecutor] Timeout reached for ${kind} after ${timedOutAfterMs}ms (effective limit: ${timeoutLimitSource}${
             extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
           }); terminating wrapper process.`,

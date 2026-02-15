@@ -25,7 +25,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -127,6 +127,11 @@ def _find_free_port() -> int:
 def _emit(result: Dict[str, Any]) -> None:
     sys.stdout.write(f"{RESULT_PREFIX}{json.dumps(result, ensure_ascii=True)}\n")
     sys.stdout.flush()
+
+
+def _executor_log(message: str) -> None:
+    line = message if message.endswith("\n") else f"{message}\n"
+    sys.stdout.write(line)
 
 
 def _fail(summary: str, stderr: Optional[str] = None, exit_code: int = 1) -> int:
@@ -1180,10 +1185,9 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
     if _running_in_container():
         rewritten = _rewrite_localhost_for_container(base_url)
         if rewritten != base_url:
-            sys.stderr.write(
+            _executor_log(
                 f"[OpenHandsExecutor] Rewriting local LLM base URL for container networking: {base_url} -> {rewritten}\n"
             )
-            sys.stderr.flush()
             base_url = rewritten
     available_models, probe_detail = _discover_available_models(base_url, provider, api_key)
     selected_model, selection_reason = _pick_configured_or_available_model(
@@ -1191,29 +1195,25 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
     )
     model = _normalize_litellm_model(selected_model, provider)
     if selection_reason == "available_fallback":
-        sys.stderr.write(
+        _executor_log(
             "[OpenHandsExecutor] Configured model unavailable in LM Studio model list; "
             f"using discovered fallback model: {selected_model}\n"
         )
-        sys.stderr.flush()
     elif selection_reason == "available_default":
-        sys.stderr.write(
+        _executor_log(
             "[OpenHandsExecutor] No model configured; using discovered model "
             f"from endpoint: {selected_model}\n"
         )
-        sys.stderr.flush()
     elif selection_reason == "default_local_model":
-        sys.stderr.write(
+        _executor_log(
             "[OpenHandsExecutor] No configured/discovered model available; "
             f"falling back to default model: {DEFAULT_OPENHANDS_MODEL}\n"
         )
-        sys.stderr.flush()
     elif selection_reason == "configured_unverified":
-        sys.stderr.write(
+        _executor_log(
             "[OpenHandsExecutor] Could not verify configured model against endpoint model list "
             f"({probe_detail}); continuing with configured model: {configured_model}\n"
         )
-        sys.stderr.flush()
     return model, api_key, base_url
 
 
@@ -1702,35 +1702,29 @@ def _run_agentic_task_execute(
             from openhands.tools.browser_use import BrowserToolSet
 
             tools.append(Tool(name=BrowserToolSet.name))
-            sys.stderr.write(
+            _executor_log(
                 "[OpenHandsExecutor] BrowserToolSet enabled (browser-use/playwright lane).\n"
             )
-            sys.stderr.flush()
         except Exception as exc:
-            sys.stderr.write(
+            _executor_log(
                 "[OpenHandsExecutor] Browser tooling requested but unavailable; "
                 f"continuing without browser tools ({exc}).\n"
             )
-            sys.stderr.flush()
 
     agent_overrides = _resolve_agent_prompt_overrides(base_url)
     if agent_overrides:
-        sys.stderr.write(
+        _executor_log(
             "[OpenHandsExecutor] Using minimal OpenHands prompt profile for local context constraints.\n"
         )
-        sys.stderr.flush()
     mcp_config, mcp_notes = _resolve_mcp_config()
     for note in mcp_notes:
-        sys.stderr.write(note + "\n")
-    if mcp_notes:
-        sys.stderr.flush()
+        _executor_log(note)
 
     prepared_instruction, handoff_path = _prepare_instruction_for_agent(repo, instruction)
     if handoff_path:
-        sys.stderr.write(
+        _executor_log(
             f"[OpenHandsExecutor] Large instruction handoff enabled ({len(instruction)} chars): {handoff_path}\n"
         )
-        sys.stderr.flush()
     user_message = _build_agent_user_message(prepared_instruction)
     max_steps = max(
         1,
@@ -1762,10 +1756,9 @@ def _run_agentic_task_execute(
         attempted_models.append(active_model)
 
         if _is_embedding_model(active_model):
-            sys.stderr.write(
+            _executor_log(
                 f"[OpenHandsExecutor] Skipping non-chat embedding model candidate: {active_model}\n"
             )
-            sys.stderr.flush()
             continue
 
         preflight_ok, preflight_detail = _llm_model_chat_preflight(
@@ -1791,12 +1784,11 @@ def _run_agentic_task_execute(
                     m for m in fallback_models if m not in attempted_models and m not in pending
                 ]
                 if new_candidates:
-                    sys.stderr.write(
+                    _executor_log(
                         "[OpenHandsExecutor] Model preflight failed for "
                         f"{active_model}; retrying with fallback model(s): "
                         f"{', '.join(new_candidates)}\n"
                     )
-                    sys.stderr.flush()
                     models_to_try.extend(new_candidates)
                     continue
                 return {
@@ -1811,11 +1803,10 @@ def _run_agentic_task_execute(
                 }
 
             # Transient preflight failure: skip this model and continue if alternatives exist.
-            sys.stderr.write(
+            _executor_log(
                 "[OpenHandsExecutor] Model preflight failed; skipping candidate "
                 f"{active_model}: {preflight_detail}\n"
             )
-            sys.stderr.flush()
             continue
 
         llm_kwargs = dict(llm_kwargs_base)
@@ -1845,7 +1836,7 @@ def _run_agentic_task_execute(
                     stable_session_user,
                 )
                 preflight_err = str(tool_decision.get("error") or "").strip()
-                sys.stderr.write(
+                _executor_log(
                     "[OpenHandsExecutor] Tool preflight: "
                     f"needs_tools={tool_decision.get('needs_tools')} "
                     f"hard_fail={bool(tool_decision.get('hard_fail', False))} "
@@ -1853,7 +1844,6 @@ def _run_agentic_task_execute(
                     + (f" detail={preflight_err[:220]}" if preflight_err else "")
                     + "\n"
                 )
-                sys.stderr.flush()
                 if bool(tool_decision.get("hard_fail", False)):
                     detail = str(tool_decision.get("error") or "").strip()
                     return {
@@ -1890,52 +1880,56 @@ def _run_agentic_task_execute(
                         f"`{first_command}`"
                     )
 
-            llm = LLM(**llm_kwargs)
+            with redirect_stderr(sys.stdout):
+                llm = LLM(**llm_kwargs)
             try:
                 primary_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
                 if mcp_config:
                     primary_agent_kwargs["mcp_config"] = mcp_config
                 if agent_overrides:
                     primary_agent_kwargs.update(agent_overrides)
-                agent = Agent(**primary_agent_kwargs)
+                with redirect_stderr(sys.stdout):
+                    agent = Agent(**primary_agent_kwargs)
             except TypeError:
                 # Older SDK versions may not support explicit prompt override kwargs/mcp_config.
                 fallback_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
                 if mcp_config:
                     fallback_agent_kwargs["mcp_config"] = mcp_config
                 if agent_overrides:
-                    sys.stderr.write(
+                    _executor_log(
                         "[OpenHandsExecutor] Prompt profile overrides unsupported by installed OpenHands SDK; using defaults.\n"
                     )
-                    sys.stderr.flush()
                 try:
-                    agent = Agent(**fallback_agent_kwargs)
+                    with redirect_stderr(sys.stdout):
+                        agent = Agent(**fallback_agent_kwargs)
                 except TypeError:
                     if mcp_config:
-                        sys.stderr.write(
+                        _executor_log(
                             "[OpenHandsExecutor] mcp_config unsupported by installed OpenHands SDK; using tools without MCP.\n"
                         )
-                        sys.stderr.flush()
-                    agent = Agent(llm=llm, tools=tools)
+                    with redirect_stderr(sys.stdout):
+                        agent = Agent(llm=llm, tools=tools)
             except Exception as agent_exc:
                 lowered_agent_exc = str(agent_exc).lower()
                 if mcp_config and "mcp" in lowered_agent_exc:
-                    sys.stderr.write(
+                    _executor_log(
                         "[OpenHandsExecutor] Invalid mcp_config for current runtime; continuing without MCP.\n"
                     )
-                    sys.stderr.flush()
                     fallback_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
                     if agent_overrides:
                         fallback_kwargs.update(agent_overrides)
                     try:
-                        agent = Agent(**fallback_kwargs)
+                        with redirect_stderr(sys.stdout):
+                            agent = Agent(**fallback_kwargs)
                     except TypeError:
-                        agent = Agent(llm=llm, tools=tools)
+                        with redirect_stderr(sys.stdout):
+                            agent = Agent(llm=llm, tools=tools)
                 else:
                     raise
 
-            conversation = Conversation(agent=agent, workspace=repo)
-            conversation.send_message(active_user_message)
+            with redirect_stderr(sys.stdout):
+                conversation = Conversation(agent=agent, workspace=repo)
+                conversation.send_message(active_user_message)
             auto_steer_enabled = _auto_steer_enabled()
             auto_steer_initial_delay_sec = _auto_steer_initial_delay_sec()
             auto_steer_interval_sec = _auto_steer_interval_sec()
@@ -1953,18 +1947,17 @@ def _run_agentic_task_execute(
                         return
                     message = _build_auto_steer_message(nudge_index, auto_steer_max_nudges)
                     try:
-                        conversation.send_message(message)
-                        sys.stderr.write(
+                        with redirect_stderr(sys.stdout):
+                            conversation.send_message(message)
+                        _executor_log(
                             "[OpenHandsExecutor] Auto-steering nudge sent "
                             f"({nudge_index}/{auto_steer_max_nudges}).\n"
                         )
-                        sys.stderr.flush()
                     except Exception as steer_exc:
-                        sys.stderr.write(
+                        _executor_log(
                             "[OpenHandsExecutor] Auto-steering nudge failed "
                             f"({nudge_index}/{auto_steer_max_nudges}): {steer_exc}\n"
                         )
-                        sys.stderr.flush()
                         return
                     if nudge_index < auto_steer_max_nudges and auto_steer_stop.wait(
                         auto_steer_interval_sec
@@ -1972,12 +1965,11 @@ def _run_agentic_task_execute(
                         return
 
             if auto_steer_enabled and auto_steer_max_nudges > 0:
-                sys.stderr.write(
+                _executor_log(
                     "[OpenHandsExecutor] Auto-steering enabled: "
                     f"initial_delay={auto_steer_initial_delay_sec}s "
                     f"interval={auto_steer_interval_sec}s max_nudges={auto_steer_max_nudges}\n"
                 )
-                sys.stderr.flush()
                 auto_steer_thread = threading.Thread(
                     target=_auto_steer_worker,
                     name="openhands-auto-steer",
@@ -1985,11 +1977,12 @@ def _run_agentic_task_execute(
                 )
                 auto_steer_thread.start()
             try:
-                try:
-                    conversation.run(max_steps=max_steps)
-                except TypeError:
-                    # SDK versions differ; fall back to default run() signature.
-                    conversation.run()
+                with redirect_stderr(sys.stdout):
+                    try:
+                        conversation.run(max_steps=max_steps)
+                    except TypeError:
+                        # SDK versions differ; fall back to default run() signature.
+                        conversation.run()
             finally:
                 auto_steer_stop.set()
                 if auto_steer_thread is not None:
@@ -2028,12 +2021,11 @@ def _run_agentic_task_execute(
                     m for m in fallback_models if m not in attempted_models and m not in pending
                 ]
                 if new_candidates:
-                    sys.stderr.write(
+                    _executor_log(
                         "[OpenHandsExecutor] Model load failure for "
                         f"{active_model}; retrying with fallback model(s): "
                         f"{', '.join(new_candidates)}\n"
                     )
-                    sys.stderr.flush()
                     models_to_try.extend(new_candidates)
                     continue
                 return {
@@ -2320,10 +2312,9 @@ def main() -> int:
         return _fail("task.execute requires 'instruction'", exit_code=2)
     planner_instruction = str(params.get("plannerWorkerInstruction") or "").strip()
     if planner_instruction and planner_instruction != instruction:
-        sys.stderr.write(
+        _executor_log(
             "[OpenHandsExecutor] Planner guidance was provided, but preserving original user instruction as canonical task input.\n"
         )
-        sys.stderr.flush()
     lane = str(params.get("lane") or "openhands").strip().lower()
     if lane not in {"openhands", "deterministic"}:
         return _fail(
@@ -2359,10 +2350,9 @@ def main() -> int:
     if reusable_server and not _agent_server_is_healthy(reusable_server):
         # Warm container agent may have died; fall back to managed per-job server.
         prefer_reusable = False
-        sys.stderr.write(
+        _executor_log(
             "[OpenHandsExecutor] Shared agent server is unreachable; falling back to per-job server.\n"
         )
-        sys.stderr.flush()
 
     def _execute_with_server(server_url: str) -> Tuple[int, str, str]:
         with Workspace(host=server_url, working_dir=repo) as workspace:
@@ -2378,10 +2368,9 @@ def main() -> int:
                 first_error = str(first_exc)
                 if "Connection refused" not in first_error and "[Errno 111]" not in first_error:
                     raise
-                sys.stderr.write(
+                _executor_log(
                     "[OpenHandsExecutor] Shared agent server refused connection; retrying with per-job server.\n"
                 )
-                sys.stderr.flush()
                 with ManagedLocalAgentServer() as server:
                     exit_code, stdout, stderr = _execute_with_server(server.base_url)
         else:
