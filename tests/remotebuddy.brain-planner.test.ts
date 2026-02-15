@@ -29,6 +29,7 @@ describe("RemoteBuddy AgentBrain planner", () => {
         job_kind: "none",
         lane: "openhands",
         target_paths: ["README.md"],
+        acceptance_criteria: [],
         validation_steps: ["none"],
         risk_level: "low",
         assistant_message: "Handled directly.",
@@ -56,6 +57,7 @@ describe("RemoteBuddy AgentBrain planner", () => {
         job_kind: "task.execute",
         lane: "deterministic",
         target_paths: ["apps/server/src/jobs.ts"],
+        acceptance_criteria: ["Queue migration path is fixed with no regressions."],
         validation_steps: ["bun test tests/server.jobs.stale-recovery.test.ts"],
         risk_level: "medium",
         assistant_message: "I will delegate to a WorkerPal.",
@@ -70,6 +72,7 @@ describe("RemoteBuddy AgentBrain planner", () => {
     expect(plan.job_kind).toBe("task.execute");
     expect(plan.lane).toBe("deterministic");
     expect(plan.target_paths).toEqual(["apps/server/src/jobs.ts"]);
+    expect(plan.acceptance_criteria.length).toBeGreaterThan(0);
     expect(llm.calls.length).toBe(2);
     expect(llm.calls[1]?.messages?.[0]?.content).toContain("Invalid planner output to repair");
   });
@@ -82,8 +85,9 @@ describe("RemoteBuddy AgentBrain planner", () => {
         requires_worker: true,
         job_kind: "task.execute",
         lane: "openhands",
-        target_paths: [],
-        validation_steps: [],
+        target_paths: ["apps/workerpals/src/context_manager.ts"],
+        acceptance_criteria: ["A minimal fix is applied without unrelated refactors."],
+        validation_steps: ["bun test tests/workerpals.context-manager.test.ts"],
         risk_level: "high",
         assistant_message: "Delegating for deeper analysis.",
         worker_instruction: "",

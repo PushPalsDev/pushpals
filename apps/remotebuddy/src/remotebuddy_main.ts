@@ -153,6 +153,7 @@ interface TaskExecuteJobParams {
     intent: PlannerIntent;
     riskLevel: PlannerRisk;
     targetPaths: string[];
+    acceptanceCriteria: string[];
     validationSteps: string[];
     queuePriority: RequestPriority;
     queueWaitBudgetMs: number;
@@ -660,6 +661,7 @@ class RemoteBuddyOrchestrator {
       intent: PlannerIntent;
       risk_level: PlannerRisk;
       target_paths: string[];
+      acceptance_criteria: string[];
       validation_steps: string[];
     },
   ): TaskExecutionLane {
@@ -933,6 +935,19 @@ class RemoteBuddyOrchestrator {
       const requiresWorker = this.shouldForceDirectReply(prompt, plan.intent)
         ? false
         : plan.requires_worker;
+      if (requiresWorker) {
+        const missing: string[] = [];
+        if (plan.target_paths.length === 0) missing.push("target_paths");
+        if (plan.acceptance_criteria.length === 0) missing.push("acceptance_criteria");
+        if (plan.validation_steps.length === 0) missing.push("validation_steps");
+        if (missing.length > 0) {
+          throw new Error(
+            `Planner contract incomplete for task.execute: missing ${missing.join(
+              ", ",
+            )}. RemoteBuddy requires explicit target paths, acceptance criteria, and validation steps.`,
+          );
+        }
+      }
       const targetPath = plan.target_paths[0] ?? extractTargetPath(prompt) ?? undefined;
       let lane = requiresWorker ? this.chooseExecutionLane(prompt, plan) : "deterministic";
       if (requiresWorker && lane === "deterministic" && !targetPath) {
@@ -994,6 +1009,7 @@ class RemoteBuddyOrchestrator {
           intent: plan.intent,
           riskLevel: plan.risk_level,
           targetPaths: plan.target_paths,
+          acceptanceCriteria: plan.acceptance_criteria,
           validationSteps: plan.validation_steps,
           queuePriority: priority,
           queueWaitBudgetMs,
@@ -1061,6 +1077,7 @@ class RemoteBuddyOrchestrator {
             executionBudgetMs,
             finalizationBudgetMs: this.finalizationBudgetMs,
             targetPaths: plan.target_paths,
+            acceptanceCriteria: plan.acceptance_criteria,
             validationSteps: plan.validation_steps,
           },
         }),
