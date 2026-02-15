@@ -897,6 +897,7 @@ export class DockerExecutor {
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<DockerJobResult> {
     await this.ensureWarmRuntimeReady(onLog);
+    const startedAtMs = Date.now();
 
     const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
@@ -938,9 +939,12 @@ export class DockerExecutor {
       );
     }, warningDelayMs);
 
+    let timedOutByDocker = false;
     // Set up timeout
     const timer = setTimeout(() => {
-      const timeoutMsg = `[DockerExecutor] Job timeout in warm container: ${this.warmContainerName}`;
+      timedOutByDocker = true;
+      const elapsedMs = Math.max(1, Date.now() - startedAtMs);
+      const timeoutMsg = `[DockerExecutor] Job timeout in warm container after ${elapsedMs}ms (limit ${this.options.timeoutMs}ms): ${this.warmContainerName}`;
       console.log(timeoutMsg);
       onLog?.("stderr", timeoutMsg);
       try {
@@ -956,7 +960,7 @@ export class DockerExecutor {
     const stdoutLines: string[] = [];
     const stderrLines: string[] = [];
 
-    const [stdoutResult, stderrResult] = await Promise.all([
+    await Promise.all([
       this.readStream(proc.stdout, "stdout", onLog, stdoutLines),
       this.readStream(proc.stderr, "stderr", onLog, stderrLines),
     ]);
@@ -964,9 +968,13 @@ export class DockerExecutor {
     clearTimeout(warningTimer);
     clearTimeout(timer);
     const exitCode = await proc.exited;
+    const elapsedMs = Math.max(1, Date.now() - startedAtMs);
 
     // Parse result from stdout (look for ___RESULT___ sentinel)
-    const result = this.parseResult(stdoutLines, stderrLines, exitCode);
+    const result = this.parseResult(stdoutLines, stderrLines, exitCode, {
+      timedOutByDocker,
+      elapsedMs,
+    });
 
     return result;
   }
@@ -1066,35 +1074,45 @@ export class DockerExecutor {
   ): Promise<void> {
     const decoder = new TextDecoder();
     const reader = readable.getReader();
+    let pending = "";
+
+    const forwardLine = (line: string) => {
+      const cleanLine = line.endsWith("\r") ? line.slice(0, -1) : line;
+      if (!cleanLine) return;
+      lines.push(cleanLine);
+
+      // For stderr, try to parse as JSON log line
+      if (streamName === "stderr") {
+        try {
+          const logEntry = JSON.parse(cleanLine);
+          if (logEntry.stream && logEntry.line) {
+            onLog?.(logEntry.stream, logEntry.line);
+            return;
+          }
+        } catch {
+          // Not JSON, forward as-is below.
+        }
+      }
+      onLog?.(streamName, cleanLine);
+    };
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      const chunk = decoder.decode(value);
-      const chunkLines = chunk.split("\n");
-
-      for (const line of chunkLines) {
-        const cleanLine = line.endsWith("\r") ? line.slice(0, -1) : line;
-        if (cleanLine) {
-          lines.push(cleanLine);
-
-          // For stderr, try to parse as JSON log line
-          if (streamName === "stderr") {
-            try {
-              const logEntry = JSON.parse(cleanLine);
-              if (logEntry.stream && logEntry.line) {
-                onLog?.(logEntry.stream, logEntry.line);
-              }
-            } catch {
-              // Not JSON, forward as-is
-              onLog?.(streamName, cleanLine);
-            }
-          } else {
-            onLog?.(streamName, cleanLine);
-          }
-        }
+      pending += decoder.decode(value, { stream: true });
+      let newlineIndex = pending.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = pending.slice(0, newlineIndex);
+        pending = pending.slice(newlineIndex + 1);
+        forwardLine(line);
+        newlineIndex = pending.indexOf("\n");
       }
+    }
+
+    pending += decoder.decode();
+    if (pending) {
+      forwardLine(pending);
     }
   }
 
@@ -1105,36 +1123,70 @@ export class DockerExecutor {
     stdoutLines: string[],
     stderrLines: string[],
     exitCode: number,
+    context: { timedOutByDocker: boolean; elapsedMs: number },
   ): DockerJobResult {
+    let sawSentinel = false;
+    let sentinelParseError = "";
     // Look for ___RESULT___ sentinel
-    for (const line of stdoutLines) {
+    for (let i = stdoutLines.length - 1; i >= 0; i--) {
+      const line = stdoutLines[i];
       const match = line.match(/^___RESULT___ (.+)$/);
       if (match) {
+        sawSentinel = true;
         try {
           const result = JSON.parse(match[1]) as DockerJobResult;
           return result;
         } catch (err) {
-          console.error(`[DockerExecutor] Failed to parse result JSON: ${err}`);
+          sentinelParseError = String(err);
+          console.error(
+            `[DockerExecutor] Failed to parse result JSON (line length=${line.length}): ${sentinelParseError}`,
+          );
         }
       }
     }
 
-    // No sentinel found, return generic result
+    const stdout = stdoutLines.join("\n");
+    const stderr = stderrLines.join("\n");
+    if (sawSentinel) {
+      const details = [`Malformed ___RESULT___ payload: ${sentinelParseError || "unknown parse error"}`];
+      if (stderr) details.push(stderr);
+      return {
+        ok: false,
+        summary: `Worker returned malformed structured result after ${context.elapsedMs}ms`,
+        stdout,
+        stderr: details.join("\n"),
+        exitCode,
+      };
+    }
+
+    // No sentinel found, return generic result.
+    if (context.timedOutByDocker) {
+      return {
+        ok: false,
+        summary: `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${this.options.timeoutMs}ms; terminated before structured result).`,
+        stdout,
+        stderr,
+        exitCode,
+      };
+    }
     if (exitCode === 143 || exitCode === 137) {
       return {
         ok: false,
-        summary: `Job timed out in Docker executor after ${this.options.timeoutMs}ms (terminated before structured result).`,
-        stdout: stdoutLines.join("\n"),
-        stderr: stderrLines.join("\n"),
+        summary: `Job process was terminated (exit ${exitCode}) after ${context.elapsedMs}ms before structured result was produced.`,
+        stdout,
+        stderr,
         exitCode,
       };
     }
 
     return {
       ok: exitCode === 0,
-      summary: exitCode === 0 ? "Job completed" : `Job failed (exit ${exitCode})`,
-      stdout: stdoutLines.join("\n"),
-      stderr: stderrLines.join("\n"),
+      summary:
+        exitCode === 0
+          ? `Job completed in ${context.elapsedMs}ms`
+          : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`,
+      stdout,
+      stderr,
       exitCode,
     };
   }
@@ -1205,29 +1257,26 @@ export class DockerExecutor {
   }
 
   private matchesRetryablePattern(text: string): boolean {
-    const transientPatterns = [
-      "warm openhands agent server",
-      "failed to start warm container",
-      "docker execution error",
-      "cannot connect to the docker daemon",
-      "docker daemon",
-      "agent server health check failed",
-      "connection error",
-      "connection refused",
-      "connection reset",
-      "network is unreachable",
-      "timed out",
-      "timeout",
-      "litellm.timeout",
-      "api timeout",
-      "model preflight failed",
-      "temporary failure",
-      "econnrefused",
-      "econnreset",
-      "eai_again",
-      "tls handshake timeout",
+    const transientPatterns: RegExp[] = [
+      /warm openhands agent server/i,
+      /failed to start warm container/i,
+      /docker execution error/i,
+      /cannot connect to the docker daemon/i,
+      /agent server health check failed/i,
+      /\bconnection (?:error|refused|reset|aborted|closed)\b/i,
+      /\bnetwork is unreachable\b/i,
+      /\b(?:econnrefused|econnreset|eai_again)\b/i,
+      /\blitellm\.timeout\b/i,
+      /\bapitimeouterror\b/i,
+      /\b(?:api|request|connection|health check|startup|model preflight|llm)\s+timed out\b/i,
+      /\bdeadline exceeded\b/i,
+      /\bcontext deadline exceeded\b/i,
+      /\btls handshake timeout\b/i,
+      /\btemporary failure\b/i,
+      /\bopenhands wrapper timed out\b/i,
+      /\bjob timed out in docker executor\b/i,
     ];
-    return transientPatterns.some((pattern) => text.includes(pattern));
+    return transientPatterns.some((pattern) => pattern.test(text));
   }
 
   /**
