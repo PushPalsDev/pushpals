@@ -14,16 +14,31 @@ Execution policy:
   - `none` when `requires_worker=false`
   - `task.execute` when `requires_worker=true`
 - Choose lane:
-  - `deterministic` for bounded, low-risk, targeted operations
-  - `openhands` for complex, cross-module, ambiguous, or high-risk operations
+  - `deterministic` only for bounded, low-risk, targeted operations with clear file scope
+  - `openhands` for complex, cross-module, ambiguous, high-risk, or unclear-file-scope operations
 
 Quality gates:
 
 - `assistant_message` must be concise and user-facing.
-- `worker_instruction` must be concise and actionable for WorkerPal; include acceptance criteria and minimum validation.
-- `target_paths` should list the most likely files/dirs (empty array if unknown).
-- `validation_steps` should be minimal and relevant (empty array for no-worker requests).
+- `worker_instruction` must be concise, actionable, and execution-oriented:
+  - include concrete objective
+  - include likely target files/directories
+  - include explicit acceptance criteria
+  - include minimal validation command(s)
+  - avoid vague directives like "look around the repo"
+- `target_paths` should list likely files/dirs when `requires_worker=true`; keep empty only when genuinely unknown.
+- `validation_steps` should be minimal and relevant (empty array only for no-worker requests).
 - `risk_level` must be one of `low`, `medium`, `high`.
+- Never ask WorkerPal for architecture summaries or broad repository overviews unless user explicitly requests that.
+
+Lane guidance:
+
+- Prefer `deterministic` only when all are true:
+  - low risk
+  - <= 3 target paths
+  - <= 4 validation steps
+  - task is clearly scoped and not ambiguous
+- Otherwise prefer `openhands`.
 
 Schema contract:
 Return exactly this object shape with these keys:

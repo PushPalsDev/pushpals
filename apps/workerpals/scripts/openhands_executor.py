@@ -19,6 +19,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import urllib.error
@@ -1520,6 +1521,70 @@ def _build_agent_user_message(instruction: str) -> str:
     return f"{compact_agent_prompt}\n\nTask:\n{instruction}\n\n{timeout_note}"
 
 
+def _auto_steer_enabled() -> bool:
+    return _setting_bool(
+        "WORKERPALS_OPENHANDS_AUTO_STEER_ENABLED",
+        "workerpals.openhands.auto_steer_enabled",
+        True,
+    )
+
+
+def _auto_steer_initial_delay_sec() -> int:
+    return max(
+        15,
+        _setting_int(
+            "WORKERPALS_OPENHANDS_AUTO_STEER_INITIAL_DELAY_SEC",
+            "workerpals.openhands.auto_steer_initial_delay_sec",
+            90,
+        ),
+    )
+
+
+def _auto_steer_interval_sec() -> int:
+    return max(
+        20,
+        _setting_int(
+            "WORKERPALS_OPENHANDS_AUTO_STEER_INTERVAL_SEC",
+            "workerpals.openhands.auto_steer_interval_sec",
+            60,
+        ),
+    )
+
+
+def _auto_steer_max_nudges() -> int:
+    return max(
+        0,
+        min(
+            8,
+            _setting_int(
+                "WORKERPALS_OPENHANDS_AUTO_STEER_MAX_NUDGES",
+                "workerpals.openhands.auto_steer_max_nudges",
+                4,
+            ),
+        ),
+    )
+
+
+def _build_auto_steer_message(nudge_index: int, max_nudges: int) -> str:
+    if nudge_index <= 1:
+        return (
+            f"Steering reminder {nudge_index}/{max_nudges}: "
+            "Stop broad repository exploration and lock onto one concrete target file now. "
+            "Make the smallest correct edit and run one focused validation command for it."
+        )
+    if nudge_index == 2:
+        return (
+            f"Steering reminder {nudge_index}/{max_nudges}: "
+            "No more discovery loops. Choose the best candidate file, apply a minimal patch, "
+            "then validate with a narrow test/lint command. Avoid repo-wide scans."
+        )
+    return (
+        f"Steering reminder {nudge_index}/{max_nudges}: "
+        "If still blocked, stop scanning and return concise blocker status with the exact next "
+        "command you would run."
+    )
+
+
 def _run_agentic_task_execute(
     repo: str, instruction: str, payload: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -1871,11 +1936,64 @@ def _run_agentic_task_execute(
 
             conversation = Conversation(agent=agent, workspace=repo)
             conversation.send_message(active_user_message)
+            auto_steer_enabled = _auto_steer_enabled()
+            auto_steer_initial_delay_sec = _auto_steer_initial_delay_sec()
+            auto_steer_interval_sec = _auto_steer_interval_sec()
+            auto_steer_max_nudges = _auto_steer_max_nudges()
+            auto_steer_stop = threading.Event()
+            auto_steer_thread: Optional[threading.Thread] = None
+
+            def _auto_steer_worker() -> None:
+                if not auto_steer_enabled or auto_steer_max_nudges <= 0:
+                    return
+                if auto_steer_stop.wait(auto_steer_initial_delay_sec):
+                    return
+                for nudge_index in range(1, auto_steer_max_nudges + 1):
+                    if auto_steer_stop.is_set():
+                        return
+                    message = _build_auto_steer_message(nudge_index, auto_steer_max_nudges)
+                    try:
+                        conversation.send_message(message)
+                        sys.stderr.write(
+                            "[OpenHandsExecutor] Auto-steering nudge sent "
+                            f"({nudge_index}/{auto_steer_max_nudges}).\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception as steer_exc:
+                        sys.stderr.write(
+                            "[OpenHandsExecutor] Auto-steering nudge failed "
+                            f"({nudge_index}/{auto_steer_max_nudges}): {steer_exc}\n"
+                        )
+                        sys.stderr.flush()
+                        return
+                    if nudge_index < auto_steer_max_nudges and auto_steer_stop.wait(
+                        auto_steer_interval_sec
+                    ):
+                        return
+
+            if auto_steer_enabled and auto_steer_max_nudges > 0:
+                sys.stderr.write(
+                    "[OpenHandsExecutor] Auto-steering enabled: "
+                    f"initial_delay={auto_steer_initial_delay_sec}s "
+                    f"interval={auto_steer_interval_sec}s max_nudges={auto_steer_max_nudges}\n"
+                )
+                sys.stderr.flush()
+                auto_steer_thread = threading.Thread(
+                    target=_auto_steer_worker,
+                    name="openhands-auto-steer",
+                    daemon=True,
+                )
+                auto_steer_thread.start()
             try:
-                conversation.run(max_steps=max_steps)
-            except TypeError:
-                # SDK versions differ; fall back to default run() signature.
-                conversation.run()
+                try:
+                    conversation.run(max_steps=max_steps)
+                except TypeError:
+                    # SDK versions differ; fall back to default run() signature.
+                    conversation.run()
+            finally:
+                auto_steer_stop.set()
+                if auto_steer_thread is not None:
+                    auto_steer_thread.join(timeout=1.0)
 
             changed_paths = _summarize_git_changes(repo)
             if changed_paths:

@@ -87,6 +87,11 @@ export interface PushPalsConfig {
     openhandsStuckGuardExploreLimit: number;
     openhandsStuckGuardMinElapsedMs: number;
     openhandsStuckGuardBroadScanLimit: number;
+    openhandsStuckGuardNoProgressMaxMs: number;
+    openhandsAutoSteerEnabled: boolean;
+    openhandsAutoSteerInitialDelaySec: number;
+    openhandsAutoSteerIntervalSec: number;
+    openhandsAutoSteerMaxNudges: number;
     requirePush: boolean;
     pushAgentBranch: boolean;
     requireDocker: boolean;
@@ -480,6 +485,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
 
   const workerNode = getObject(merged, "workerpals");
+  const workerOpenHandsNode = getObject(workerNode, "openhands");
   const workerPollMs = Math.max(200, asInt(parseIntEnv("WORKERPALS_POLL_MS") ?? workerNode.poll_ms, 2_000));
   const workerHeartbeatMs = Math.max(
     200,
@@ -527,6 +533,50 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       parseIntEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_BROAD_SCAN_LIMIT") ??
         workerNode.openhands_stuck_guard_broad_scan_limit,
       2,
+    ),
+  );
+  const workerOpenHandsStuckGuardNoProgressMaxMs = Math.max(
+    60_000,
+    asInt(
+      parseIntEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_NO_PROGRESS_MAX_MS") ??
+        workerNode.openhands_stuck_guard_no_progress_max_ms,
+      300_000,
+    ),
+  );
+  const workerOpenHandsAutoSteerEnabled =
+    parseBoolEnv("WORKERPALS_OPENHANDS_AUTO_STEER_ENABLED") ??
+    asBoolean(workerOpenHandsNode.auto_steer_enabled, true);
+  const workerOpenHandsAutoSteerInitialDelaySec = Math.max(
+    0,
+    Math.min(
+      600,
+      asInt(
+        parseIntEnv("WORKERPALS_OPENHANDS_AUTO_STEER_INITIAL_DELAY_SEC") ??
+          workerOpenHandsNode.auto_steer_initial_delay_sec,
+        90,
+      ),
+    ),
+  );
+  const workerOpenHandsAutoSteerIntervalSec = Math.max(
+    15,
+    Math.min(
+      600,
+      asInt(
+        parseIntEnv("WORKERPALS_OPENHANDS_AUTO_STEER_INTERVAL_SEC") ??
+          workerOpenHandsNode.auto_steer_interval_sec,
+        60,
+      ),
+    ),
+  );
+  const workerOpenHandsAutoSteerMaxNudges = Math.max(
+    0,
+    Math.min(
+      8,
+      asInt(
+        parseIntEnv("WORKERPALS_OPENHANDS_AUTO_STEER_MAX_NUDGES") ??
+          workerOpenHandsNode.auto_steer_max_nudges,
+        4,
+      ),
     ),
   );
   const workerRequirePush =
@@ -914,6 +964,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       openhandsStuckGuardExploreLimit: workerOpenHandsStuckGuardExploreLimit,
       openhandsStuckGuardMinElapsedMs: workerOpenHandsStuckGuardMinElapsedMs,
       openhandsStuckGuardBroadScanLimit: workerOpenHandsStuckGuardBroadScanLimit,
+      openhandsStuckGuardNoProgressMaxMs: workerOpenHandsStuckGuardNoProgressMaxMs,
+      openhandsAutoSteerEnabled: workerOpenHandsAutoSteerEnabled,
+      openhandsAutoSteerInitialDelaySec: workerOpenHandsAutoSteerInitialDelaySec,
+      openhandsAutoSteerIntervalSec: workerOpenHandsAutoSteerIntervalSec,
+      openhandsAutoSteerMaxNudges: workerOpenHandsAutoSteerMaxNudges,
       requirePush: workerRequirePush,
       pushAgentBranch: workerPushAgentBranch,
       requireDocker:

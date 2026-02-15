@@ -67,6 +67,7 @@ openhands_stuck_guard_enabled = true
 openhands_stuck_guard_explore_limit = 18
 openhands_stuck_guard_min_elapsed_ms = 180000
 openhands_stuck_guard_broad_scan_limit = 2
+openhands_stuck_guard_no_progress_max_ms = 300000
 require_push = false
 push_agent_branch = false
 require_docker = false
@@ -111,6 +112,10 @@ llm_retry_max_wait = 4
 llm_timeout_sec = 90
 agent_max_steps = 30
 model_probe_timeout_sec = 10.0
+auto_steer_enabled = true
+auto_steer_initial_delay_sec = 90
+auto_steer_interval_sec = 60
+auto_steer_max_nudges = 4
 
 [workerpals.llm]
 backend = "lmstudio"

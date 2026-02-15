@@ -665,6 +665,7 @@ class RemoteBuddyOrchestrator {
     if (plan.intent === "status") return "deterministic";
     if (
       plan.risk_level === "low" &&
+      plan.target_paths.length >= 1 &&
       plan.target_paths.length <= 3 &&
       plan.validation_steps.length <= 4
     ) {
@@ -933,7 +934,7 @@ class RemoteBuddyOrchestrator {
         : plan.requires_worker;
       const targetPath = plan.target_paths[0] ?? extractTargetPath(prompt) ?? undefined;
       let lane = requiresWorker ? this.chooseExecutionLane(prompt, plan) : "deterministic";
-      if (requiresWorker && lane === "deterministic" && plan.intent === "code_change" && !targetPath) {
+      if (requiresWorker && lane === "deterministic" && !targetPath) {
         lane = "openhands";
       }
 

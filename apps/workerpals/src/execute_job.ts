@@ -303,6 +303,8 @@ async function executeWithOpenHands(
 
   let warningTimer: ReturnType<typeof setTimeout> | null = null;
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  let stuckNudgeStartTimer: ReturnType<typeof setTimeout> | null = null;
+  let stuckNudgeTimer: ReturnType<typeof setInterval> | null = null;
 
   try {
     const proc = Bun.spawn([pythonBin, scriptPath, payload], {
@@ -321,12 +323,100 @@ async function executeWithOpenHands(
     const stuckExploreLimit = CONFIG.workerpals.openhandsStuckGuardExploreLimit;
     const stuckMinElapsedMs = CONFIG.workerpals.openhandsStuckGuardMinElapsedMs;
     const stuckBroadScanLimit = CONFIG.workerpals.openhandsStuckGuardBroadScanLimit;
+    const stuckNoProgressMaxMs = CONFIG.workerpals.openhandsStuckGuardNoProgressMaxMs;
+    const stuckNudgeEnabled = CONFIG.workerpals.openhandsAutoSteerEnabled;
+    const stuckNudgeInitialDelayMs = Math.max(
+      0,
+      Math.floor(CONFIG.workerpals.openhandsAutoSteerInitialDelaySec * 1000),
+    );
+    const stuckNudgeIntervalMs = Math.max(
+      5_000,
+      Math.floor(CONFIG.workerpals.openhandsAutoSteerIntervalSec * 1000),
+    );
+    const stuckNudgeMaxCount = Math.max(0, CONFIG.workerpals.openhandsAutoSteerMaxNudges);
     let exploreOps = 0;
     let progressOps = 0;
     let broadRepoScans = 0;
     let stuckGuardTriggered = false;
     let stuckGuardReason = "";
     let stuckGuardAfterMs = 0;
+    let stuckNudgeCount = 0;
+
+    const stopStuckNudges = (reason?: string) => {
+      const hadActiveTimer = Boolean(stuckNudgeStartTimer || stuckNudgeTimer);
+      if (stuckNudgeStartTimer) {
+        clearTimeout(stuckNudgeStartTimer);
+        stuckNudgeStartTimer = null;
+      }
+      if (stuckNudgeTimer) {
+        clearInterval(stuckNudgeTimer);
+        stuckNudgeTimer = null;
+      }
+      if (reason && hadActiveTimer) {
+        onLog?.("stderr", `[OpenHandsExecutor] Auto-steering nudges paused: ${reason}.`);
+      }
+    };
+
+    const buildSteeringNudge = (nudgeIndex: number): string => {
+      if (nudgeIndex === 1) {
+        return (
+          "Auto-steering nudge 1: stop broad exploration and lock onto one concrete target file. " +
+          "Make one minimal edit and run one focused validation command."
+        );
+      }
+      if (nudgeIndex === 2) {
+        return (
+          "Auto-steering nudge 2: choose the best candidate file now, apply a small correct patch, " +
+          "then run a narrow test/lint command for that change."
+        );
+      }
+      return (
+        "Auto-steering nudge: if still blocked, stop scanning loops and return concise blocker status " +
+        "with the next concrete command you would run."
+      );
+    };
+
+    const startStuckNudges = () => {
+      if (!stuckNudgeEnabled || stuckNudgeMaxCount <= 0) return;
+      if (stuckNudgeStartTimer || stuckNudgeTimer) return;
+
+      const emitNudge = () => {
+        if (timedOut) {
+          stopStuckNudges();
+          return;
+        }
+        if (progressOps > 0) {
+          stopStuckNudges("progress detected");
+          return;
+        }
+        stuckNudgeCount += 1;
+        const elapsedMs = Date.now() - startedAtMs;
+        onLog?.(
+          "stderr",
+          `[OpenHandsExecutor] Auto-steering nudge ${stuckNudgeCount}/${stuckNudgeMaxCount} after ${elapsedMs}ms (${stuckGuardReason || "no edit/test progress"}): ${buildSteeringNudge(stuckNudgeCount)}`,
+        );
+        if (stuckNudgeCount >= stuckNudgeMaxCount) {
+          stopStuckNudges();
+        }
+      };
+
+      const startInterval = () => {
+        if (stuckNudgeTimer || stuckNudgeCount >= stuckNudgeMaxCount) return;
+        stuckNudgeTimer = setInterval(emitNudge, stuckNudgeIntervalMs);
+      };
+
+      if (stuckNudgeInitialDelayMs <= 0) {
+        emitNudge();
+        startInterval();
+        return;
+      }
+
+      stuckNudgeStartTimer = setTimeout(() => {
+        stuckNudgeStartTimer = null;
+        emitNudge();
+        startInterval();
+      }, stuckNudgeInitialDelayMs);
+    };
 
     const onProcessLine = (stream: "stdout" | "stderr", line: string) => {
       lastActivityAtMs = Date.now();
@@ -346,24 +436,30 @@ async function executeWithOpenHands(
       const fileEditorClass = classifyFileEditorSummary(trimmed);
       if (fileEditorClass === "explore") exploreOps += 1;
       if (fileEditorClass === "progress") progressOps += 1;
+      if (stuckGuardTriggered && progressOps > 0) {
+        stopStuckNudges("progress detected");
+      }
 
       if (!stuckGuardTriggered && stuckGuardEnabled && progressOps === 0) {
         const elapsedMs = Date.now() - startedAtMs;
+        const noProgressTooLong = elapsedMs >= stuckNoProgressMaxMs;
         const tooManyExplores = elapsedMs >= stuckMinElapsedMs && exploreOps >= stuckExploreLimit;
         const tooManyBroadScans = broadRepoScans >= stuckBroadScanLimit;
-        if (tooManyExplores || tooManyBroadScans) {
+        if (noProgressTooLong || tooManyExplores || tooManyBroadScans) {
           stuckGuardTriggered = true;
           stuckGuardAfterMs = elapsedMs;
-          stuckGuardReason = tooManyBroadScans
-            ? `repeated broad filesystem scans (count=${broadRepoScans}) with no edits/tests`
-            : `repeated exploratory actions (count=${exploreOps}) with no edits/tests`;
+          if (tooManyBroadScans) {
+            stuckGuardReason = `repeated broad filesystem scans (count=${broadRepoScans}) with no edits/tests`;
+          } else if (tooManyExplores) {
+            stuckGuardReason = `repeated exploratory actions (count=${exploreOps}) with no edits/tests`;
+          } else {
+            stuckGuardReason = `no edit/test progress for ${stuckNoProgressMaxMs}ms`;
+          }
           onLog?.(
             "stderr",
-            `[OpenHandsExecutor] Stuck guard triggered after ${stuckGuardAfterMs}ms: ${stuckGuardReason}. Terminating wrapper process early.`,
+            `[OpenHandsExecutor] Stuck guard triggered after ${stuckGuardAfterMs}ms: ${stuckGuardReason}. Steering hint: stop broad exploration, pick a concrete target file, make a minimal edit, then run a focused validation command.`,
           );
-          try {
-            proc.kill();
-          } catch (_e) {}
+          startStuckNudges();
         }
       }
       onLog?.(stream, line);
@@ -417,6 +513,7 @@ async function executeWithOpenHands(
             extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
           }); terminating wrapper process.`,
         );
+        stopStuckNudges();
         try {
           proc.kill();
         } catch (_e) {}
@@ -438,6 +535,7 @@ async function executeWithOpenHands(
       clearTimeout(timeoutTimer);
       timeoutTimer = null;
     }
+    stopStuckNudges();
     const exitCode = await proc.exited;
 
     const lines = stdout.split(/\r?\n/);
@@ -461,21 +559,15 @@ async function executeWithOpenHands(
       .trim();
 
     if (!parsed) {
-      if (stuckGuardTriggered) {
-        return {
-          ok: false,
-          summary: `OpenHands execution aborted by stuck guard after ${stuckGuardAfterMs}ms (${stuckGuardReason}).`,
-          stdout: truncate(filteredStdout),
-          stderr: truncate(stderr),
-          exitCode: exitCode === 0 ? 124 : exitCode,
-        };
-      }
       if (timedOut) {
+        const stuckNote = stuckGuardTriggered
+          ? ` Stuck guard warning was raised at ${stuckGuardAfterMs}ms (${stuckGuardReason}).`
+          : "";
         return {
           ok: false,
           summary: `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind} (effective limit: ${timeoutLimitSource}${
             extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
-          }). Worker returned a timeout failure.`,
+          }). Worker returned a timeout failure.${stuckNote}`,
           stdout: truncate(filteredStdout),
           stderr: truncate(stderr),
           exitCode: exitCode === 0 ? 124 : exitCode,
@@ -523,6 +615,12 @@ async function executeWithOpenHands(
     }
     if (timeoutTimer) {
       clearTimeout(timeoutTimer);
+    }
+    if (stuckNudgeStartTimer) {
+      clearTimeout(stuckNudgeStartTimer);
+    }
+    if (stuckNudgeTimer) {
+      clearInterval(stuckNudgeTimer);
     }
   }
 }

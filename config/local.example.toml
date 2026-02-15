@@ -20,6 +20,7 @@ openhands_stuck_guard_enabled = true
 openhands_stuck_guard_explore_limit = 18
 openhands_stuck_guard_min_elapsed_ms = 180000
 openhands_stuck_guard_broad_scan_limit = 2
+openhands_stuck_guard_no_progress_max_ms = 300000
 docker_warm_memory_mb = 2048
 docker_warm_cpus = 2
 
@@ -27,6 +28,10 @@ docker_warm_cpus = 2
 prompt_profile = "minimal"
 tool_preflight_timeout_sec = 45
 agent_max_steps = 30
+auto_steer_enabled = true
+auto_steer_initial_delay_sec = 90
+auto_steer_interval_sec = 60
+auto_steer_max_nudges = 4
 
 [llm.lmstudio]
 context_window = 4096
