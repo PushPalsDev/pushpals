@@ -419,10 +419,6 @@ class RemoteBuddyOrchestrator {
     if (!startupStatusOk) {
       console.warn("[RemoteBuddy] Failed to emit startup status event");
     }
-    const msgOk = await this.comm.assistantMessage("RemoteBuddy online and waiting for requests.");
-    if (!msgOk) {
-      console.warn("[RemoteBuddy] Failed to emit startup welcome message");
-    }
   }
 
   startStatusHeartbeat(): void {

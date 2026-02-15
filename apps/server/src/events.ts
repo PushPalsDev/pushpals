@@ -11,6 +11,25 @@ import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { EventStore } from "./db.js";
 
+type StartupReadyKey = "localbuddy" | "remotebuddy" | "source_control_manager";
+
+const STARTUP_READY_MESSAGE = "All systems online, feel free to send messages!";
+
+const STARTUP_READY_KEYS: ReadonlyArray<StartupReadyKey> = [
+  "localbuddy",
+  "remotebuddy",
+  "source_control_manager",
+];
+
+const STARTUP_READY_DETAIL_RE = /\bonline\b/i;
+
+const startupReadyKeyForAgent = (agentId: string): StartupReadyKey | null => {
+  if (agentId === "source_control_manager") return "source_control_manager";
+  if (agentId.startsWith("localbuddy")) return "localbuddy";
+  if (agentId.startsWith("remotebuddy")) return "remotebuddy";
+  return null;
+};
+
 // ─── Task record stored per session ─────────────────────────────────────────
 
 export interface TaskRecord {
@@ -188,6 +207,10 @@ export class SessionEventBus {
  */
 export class SessionManager {
   private sessions: Map<string, SessionEventBus> = new Map();
+  private startupReadyBySession: Map<
+    string,
+    { readyKeys: Set<StartupReadyKey>; announced: boolean }
+  > = new Map();
 
   /** Pending approvals: approvalId → PendingApproval */
   readonly pendingApprovals: Map<string, PendingApproval> = new Map();
@@ -314,7 +337,43 @@ export class SessionManager {
     }
 
     session.emit(envelope);
+    this._maybeEmitStartupReady(sessionId, envelope);
     return { ok: true, eventId };
+  }
+
+  private _maybeEmitStartupReady(sessionId: string, envelope: EventEnvelope): void {
+    if (envelope.type !== "status") return;
+    const payload = envelope.payload as { agentId?: unknown; detail?: unknown };
+    const agentId = typeof payload.agentId === "string" ? payload.agentId : "";
+    if (!agentId) return;
+    const readyKey = startupReadyKeyForAgent(agentId);
+    if (!readyKey) return;
+    const detail = typeof payload.detail === "string" ? payload.detail : "";
+    if (!STARTUP_READY_DETAIL_RE.test(detail)) return;
+
+    const state =
+      this.startupReadyBySession.get(sessionId) ??
+      { readyKeys: new Set<StartupReadyKey>(), announced: false };
+    if (state.announced) return;
+
+    state.readyKeys.add(readyKey);
+    this.startupReadyBySession.set(sessionId, state);
+
+    const allReady = STARTUP_READY_KEYS.every((key) => state.readyKeys.has(key));
+    if (!allReady) return;
+
+    state.announced = true;
+    const session = this.getSession(sessionId);
+    if (!session) return;
+    session.emit({
+      protocolVersion: PROTOCOL_VERSION,
+      id: randomUUID(),
+      ts: new Date().toISOString(),
+      sessionId,
+      type: "assistant_message",
+      from: "system",
+      payload: { text: STARTUP_READY_MESSAGE },
+    });
   }
 
   // ── Approvals ───────────────────────────────────────────────────────────

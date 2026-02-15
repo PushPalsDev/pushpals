@@ -265,12 +265,6 @@ async function emitStartupStatus(): Promise<void> {
     statusSessionReady = false;
     console.warn(`[${ts()}] Failed to emit source_control_manager startup status event`);
   }
-  const msgOk = await comm.assistantMessage(
-    "SourceControlManager online and monitoring completions.",
-  );
-  if (!msgOk) {
-    console.warn(`[${ts()}] Failed to emit source_control_manager startup welcome message`);
-  }
 }
 
 async function emitInitializingStatus(): Promise<void> {
