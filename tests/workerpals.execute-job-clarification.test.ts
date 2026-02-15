@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { extractClarificationQuestionFromOutput } from "../apps/workerpals/src/execute_job";
+import {
+  compactJobOutput,
+  extractClarificationQuestionFromOutput,
+} from "../apps/workerpals/src/execute_job";
 
 describe("workerpals OpenHands clarification detection", () => {
   test("extracts a clarification question from agent output", () => {
@@ -24,5 +27,14 @@ describe("workerpals OpenHands clarification detection", () => {
 `;
 
     expect(extractClarificationQuestionFromOutput(output)).toBeNull();
+  });
+
+  test("compacts oversized output while keeping latest context", () => {
+    const longOutput = Array.from({ length: 1200 }, (_, idx) => `line-${idx}`).join("\n");
+    const compact = compactJobOutput(longOutput);
+
+    expect(compact).toContain("lines omitted");
+    expect(compact).toContain("line-1199");
+    expect(compact).not.toContain("line-650");
   });
 });

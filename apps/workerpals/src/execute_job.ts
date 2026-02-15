@@ -13,7 +13,9 @@ import { computeTimeoutWarningWindow } from "./timeout_policy.js";
 /** Job kinds that modify files and should trigger commits */
 export const FILE_MODIFYING_JOBS = new Set(["task.execute"]);
 
-const MAX_OUTPUT = 256 * 1024;
+const MAX_OUTPUT = 192 * 1024;
+const MAX_OUTPUT_LINES = 600;
+const MAX_OUTPUT_HEAD_LINES = 120;
 const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 const CONFIG = loadPushPalsConfig();
 
@@ -128,8 +130,38 @@ export function shouldCommit(kind: string): boolean {
   return FILE_MODIFYING_JOBS.has(kind);
 }
 
+export function compactJobOutput(text: string): string {
+  if (!text) return "";
+  let compact = text;
+  const lines = compact.split(/\r?\n/);
+  if (lines.length > MAX_OUTPUT_LINES) {
+    const headCount = Math.min(MAX_OUTPUT_HEAD_LINES, MAX_OUTPUT_LINES, lines.length);
+    const tailBudget = Math.max(0, MAX_OUTPUT_LINES - headCount);
+    const tailCount = Math.max(0, Math.min(lines.length - headCount, tailBudget));
+    const omitted = Math.max(0, lines.length - headCount - tailCount);
+    const marker = omitted > 0 ? [`... (${omitted} lines omitted) ...`] : [];
+    const tail = tailCount > 0 ? lines.slice(lines.length - tailCount) : [];
+    compact = [...lines.slice(0, headCount), ...marker, ...tail].join("\n");
+  }
+  if (compact.length > MAX_OUTPUT) {
+    const markerPrefix = "... (";
+    const markerSuffix = " chars omitted) ...\n";
+    const markerBudget = markerPrefix.length + markerSuffix.length + 20;
+    if (markerBudget >= MAX_OUTPUT) {
+      compact = compact.slice(-MAX_OUTPUT);
+    } else {
+      const keepChars = Math.max(0, MAX_OUTPUT - markerBudget);
+      const omittedChars = Math.max(0, compact.length - keepChars);
+      const marker = `${markerPrefix}${omittedChars}${markerSuffix}`;
+      const tail = keepChars > 0 ? compact.slice(-keepChars) : "";
+      compact = `${marker}${tail}`;
+    }
+  }
+  return compact;
+}
+
 export function truncate(s: string): string {
-  return s.length > MAX_OUTPUT ? s.substring(0, MAX_OUTPUT) + "\n… (truncated)" : s;
+  return compactJobOutput(s);
 }
 
 function inferTargetPathFromInstruction(text: string): string | null {

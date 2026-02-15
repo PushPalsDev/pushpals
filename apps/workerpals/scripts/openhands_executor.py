@@ -40,6 +40,9 @@ PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 _PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
 DEFAULT_LARGE_INSTRUCTION_CHARS = 1800
 DEFAULT_OPENHANDS_MODEL = "local-model"
+DEFAULT_LLM_MAX_MESSAGE_CHARS = 12000
+DEFAULT_LLM_TIMEOUT_RECOVERY_ATTEMPTS = 1
+DEFAULT_LLM_TIMEOUT_RECOVERY_BACKOFF_SEC = 2.0
 KNOWN_LITELLM_PROVIDER_PREFIXES: Set[str] = {
     "openai",
     "azure",
@@ -934,6 +937,61 @@ def _auto_steer_max_nudges() -> int:
     )
 
 
+def _llm_max_message_chars() -> int:
+    return max(
+        2000,
+        min(
+            120000,
+            _setting_int(
+                "WORKERPALS_OPENHANDS_LLM_MAX_MESSAGE_CHARS",
+                "workerpals.openhands.llm_max_message_chars",
+                DEFAULT_LLM_MAX_MESSAGE_CHARS,
+            ),
+        ),
+    )
+
+
+def _llm_timeout_recovery_attempts() -> int:
+    return max(
+        0,
+        min(
+            5,
+            _setting_int(
+                "WORKERPALS_OPENHANDS_LLM_TIMEOUT_RECOVERY_ATTEMPTS",
+                "workerpals.openhands.llm_timeout_recovery_attempts",
+                DEFAULT_LLM_TIMEOUT_RECOVERY_ATTEMPTS,
+            ),
+        ),
+    )
+
+
+def _llm_timeout_recovery_backoff_sec() -> float:
+    return max(
+        0.0,
+        min(
+            30.0,
+            _setting_float(
+                "WORKERPALS_OPENHANDS_LLM_TIMEOUT_RECOVERY_BACKOFF_SEC",
+                "workerpals.openhands.llm_timeout_recovery_backoff_sec",
+                DEFAULT_LLM_TIMEOUT_RECOVERY_BACKOFF_SEC,
+            ),
+        ),
+    )
+
+
+def _is_llm_timeout_error(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    signals = (
+        "litellm.timeout",
+        "apitimeouterror",
+        "request timed out",
+        "timeout error",
+        "deadline exceeded",
+        "context deadline exceeded",
+    )
+    return any(signal in lowered for signal in signals)
+
+
 def _build_auto_steer_message(nudge_index: int, max_nudges: int) -> str:
     if nudge_index <= 1:
         return (
@@ -1052,6 +1110,7 @@ def _run_agentic_task_execute(
         # LM Studio/llama.cpp can fail with n_keep >= n_ctx when large prompts
         # are cache-pinned. Disable prompt caching for local endpoints.
         llm_kwargs_base["caching_prompt"] = False
+    llm_kwargs_base["max_message_chars"] = _llm_max_message_chars()
 
     tools = [Tool(name=TerminalTool.name), Tool(name=FileEditorTool.name)]
     if _browser_tool_enabled():
@@ -1149,6 +1208,8 @@ def _run_agentic_task_execute(
         auto_steer_initial_delay_sec = _auto_steer_initial_delay_sec()
         auto_steer_interval_sec = _auto_steer_interval_sec()
         auto_steer_max_nudges = _auto_steer_max_nudges()
+        llm_timeout_recovery_attempts = _llm_timeout_recovery_attempts()
+        llm_timeout_recovery_backoff_sec = _llm_timeout_recovery_backoff_sec()
         auto_steer_stop = threading.Event()
         auto_steer_thread: Optional[threading.Thread] = None
 
@@ -1192,12 +1253,40 @@ def _run_agentic_task_execute(
             )
             auto_steer_thread.start()
         try:
-            with redirect_stderr(sys.stdout):
+            run_attempt = 0
+            while True:
                 try:
-                    conversation.run(max_steps=max_steps)
-                except TypeError:
-                    # SDK versions differ; fall back to default run() signature.
-                    conversation.run()
+                    with redirect_stderr(sys.stdout):
+                        try:
+                            conversation.run(max_steps=max_steps)
+                        except TypeError:
+                            # SDK versions differ; fall back to default run() signature.
+                            conversation.run()
+                    break
+                except Exception as run_exc:
+                    if (
+                        run_attempt >= llm_timeout_recovery_attempts
+                        or not _is_llm_timeout_error(run_exc)
+                    ):
+                        raise
+                    run_attempt += 1
+                    _executor_log(
+                        "[OpenHandsExecutor] LLM endpoint timeout during run; "
+                        f"retrying attempt {run_attempt}/{llm_timeout_recovery_attempts} with compact recovery hint.\n"
+                    )
+                    try:
+                        with redirect_stderr(sys.stdout):
+                            conversation.send_message(
+                                "Recovery hint: last LLM request timed out. Continue from current state with minimal context. "
+                                "Stop broad scans, choose one target file, make the smallest valid edit, run one focused validation command, then finish."
+                            )
+                    except Exception as steer_exc:
+                        _executor_log(
+                            "[OpenHandsExecutor] Timeout recovery hint failed before retry: "
+                            f"{steer_exc}\n"
+                        )
+                    if llm_timeout_recovery_backoff_sec > 0:
+                        time.sleep(llm_timeout_recovery_backoff_sec)
         finally:
             auto_steer_stop.set()
             if auto_steer_thread is not None:
