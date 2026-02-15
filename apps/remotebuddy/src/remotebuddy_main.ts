@@ -937,7 +937,13 @@ class RemoteBuddyOrchestrator {
         : plan.requires_worker;
       if (requiresWorker) {
         const missing: string[] = [];
-        if (plan.target_paths.length === 0) missing.push("target_paths");
+        if (plan.target_paths.length === 0) {
+          if (targetPath) {
+            plan.target_paths = [targetPath];
+          } else {
+            missing.push("target_paths");
+          }
+        }
         if (plan.acceptance_criteria.length === 0) missing.push("acceptance_criteria");
         if (plan.validation_steps.length === 0) missing.push("validation_steps");
         if (missing.length > 0) {
