@@ -18,6 +18,7 @@ export interface PlannerOutput {
   job_kind: "task.execute" | "none";
   lane: PlannerLane;
   target_paths: string[];
+  acceptance_criteria: string[];
   validation_steps: string[];
   risk_level: PlannerRiskLevel;
   assistant_message: string;
@@ -27,6 +28,7 @@ export interface PlannerOutput {
 const MAX_ASSISTANT_CHARS = 4000;
 const MAX_WORKER_INSTRUCTION_CHARS = 12000;
 const MAX_TARGET_PATHS = 16;
+const MAX_ACCEPTANCE_CRITERIA = 16;
 const MAX_VALIDATION_STEPS = 16;
 
 const BASE_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/remotebuddy_system_prompt.md", {
@@ -63,6 +65,10 @@ export const REMOTEBUDDY_PLANNER_JSON_SCHEMA: Record<string, unknown> = {
         type: "array",
         items: { type: "string" },
       },
+      acceptance_criteria: {
+        type: "array",
+        items: { type: "string" },
+      },
       validation_steps: {
         type: "array",
         items: { type: "string" },
@@ -80,6 +86,7 @@ export const REMOTEBUDDY_PLANNER_JSON_SCHEMA: Record<string, unknown> = {
       "job_kind",
       "lane",
       "target_paths",
+      "acceptance_criteria",
       "validation_steps",
       "risk_level",
       "assistant_message",
@@ -156,6 +163,7 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   const lane = asLane(record.lane);
   const riskLevel = asRisk(record.risk_level);
   const targetPaths = dedupeStrings(record.target_paths, MAX_TARGET_PATHS);
+  const acceptanceCriteria = dedupeStrings(record.acceptance_criteria, MAX_ACCEPTANCE_CRITERIA);
   const validationSteps = dedupeStrings(record.validation_steps, MAX_VALIDATION_STEPS);
 
   const assistantMessage = String(record.assistant_message ?? "")
@@ -177,6 +185,7 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
     job_kind,
     lane: requires_worker ? lane : "deterministic",
     target_paths: targetPaths,
+    acceptance_criteria: acceptanceCriteria,
     validation_steps: validationSteps,
     risk_level: riskLevel,
     assistant_message: assistantMessage,

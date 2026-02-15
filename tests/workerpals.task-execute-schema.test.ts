@@ -5,6 +5,7 @@ const VALID_PLANNING = {
   intent: "code_change",
   riskLevel: "low",
   targetPaths: ["apps/server/src/jobs.ts"],
+  acceptanceCriteria: ["Queue jobs are persisted and recovered correctly."],
   validationSteps: ["bun test tests/server.jobs.stale-recovery.test.ts"],
   queuePriority: "normal",
   queueWaitBudgetMs: 90_000,
@@ -48,6 +49,25 @@ describe("workerpals task.execute strict schema", () => {
 
     expect(result.ok).toBe(false);
     expect(result.summary).toContain("params.planning");
+  });
+
+  test("rejects missing acceptanceCriteria in planning", async () => {
+    const planning = { ...VALID_PLANNING } as Record<string, unknown>;
+    delete planning.acceptanceCriteria;
+
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        lane: "deterministic",
+        instruction: "run a bounded task",
+        planning,
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("planning.acceptanceCriteria");
   });
 
   test("rejects invalid lane even with schemaVersion/planning", async () => {

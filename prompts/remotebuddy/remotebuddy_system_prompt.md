@@ -28,6 +28,7 @@ Quality gates:
   - avoid vague directives like "look around the repo"
   - do not rewrite user intent or invent specific filenames/scenarios not implied by the user request
 - `target_paths` should list likely files/dirs when `requires_worker=true`; keep empty only when genuinely unknown.
+- `acceptance_criteria` must be explicit and verifiable when `requires_worker=true`; keep empty only for no-worker requests.
 - `validation_steps` should be minimal and relevant (empty array only for no-worker requests).
 - `risk_level` must be one of `low`, `medium`, `high`.
 - Never ask WorkerPal for architecture summaries or broad repository overviews unless user explicitly requests that.
@@ -49,6 +50,7 @@ Return exactly this object shape with these keys:
 "job_kind": "task.execute|none",
 "lane": "deterministic|openhands",
 "target_paths": ["..."],
+"acceptance_criteria": ["..."],
 "validation_steps": ["..."],
 "risk_level": "low|medium|high",
 "assistant_message": "...",

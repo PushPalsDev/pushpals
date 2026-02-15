@@ -3,7 +3,7 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { resolve } from "path";
 import { loadPromptTemplate, loadPushPalsConfig } from "shared";
 import { computeTimeoutWarningWindow } from "./timeout_policy.js";
@@ -16,8 +16,53 @@ export const FILE_MODIFYING_JOBS = new Set(["task.execute"]);
 const MAX_OUTPUT = 192 * 1024;
 const MAX_OUTPUT_LINES = 600;
 const MAX_OUTPUT_HEAD_LINES = 120;
+const QUALITY_MAX_AUTO_REVISIONS = 1;
+const QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180_000;
+const QUALITY_CRITIC_TIMEOUT_MS = 45_000;
+const QUALITY_CRITIC_MIN_SCORE = 8;
+const QUALITY_CRITIC_MAX_DIFF_CHARS = 16_000;
+const QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8_000;
 const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 const CONFIG = loadPushPalsConfig();
+
+interface TaskExecutePlanning {
+  intent: TaskExecuteIntent;
+  riskLevel: TaskExecuteRisk;
+  targetPaths: string[];
+  acceptanceCriteria: string[];
+  validationSteps: string[];
+  queuePriority: TaskExecutePriority;
+  queueWaitBudgetMs: number;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+}
+
+interface ValidationExecutionResult {
+  step: string;
+  command: string;
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  elapsedMs: number;
+}
+
+interface DeterministicQualityResult {
+  ok: boolean;
+  skipped: boolean;
+  issues: string[];
+  changedPaths: string[];
+  changedTestPaths: string[];
+  validationRuns: ValidationExecutionResult[];
+}
+
+interface CriticReview {
+  score: number;
+  findings: string[];
+  mustFix: string[];
+  revisionGuidance: string;
+  raw: string;
+}
 
 function classifyShellCommand(cmd: string): "explore" | "progress" {
   const trimmed = cmd.trim().toLowerCase();
@@ -162,6 +207,463 @@ export function compactJobOutput(text: string): string {
 
 export function truncate(s: string): string {
   return compactJobOutput(s);
+}
+
+function toSingleLine(value: unknown, max = 240): string {
+  const text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, Math.max(1, max - 3))}...` : text;
+}
+
+function normalizeChatCompletionsEndpoint(endpoint: string): string {
+  const source = endpoint.trim().replace(/\/+$/, "");
+  if (!source) return "http://127.0.0.1:1234/v1/chat/completions";
+  if (source.endsWith("/chat/completions")) return source;
+  if (source.endsWith("/v1")) return `${source}/chat/completions`;
+  return `${source}/v1/chat/completions`;
+}
+
+function parseJsonObjectLoose(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // fall through
+  }
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1];
+  if (fenced) {
+    try {
+      const parsed = JSON.parse(fenced);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // fall through
+    }
+  }
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try {
+      const parsed = JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // fall through
+    }
+  }
+  return null;
+}
+
+function shellCommandForPlatform(command: string): string[] {
+  if (process.platform === "win32") {
+    return ["powershell", "-NoProfile", "-Command", command];
+  }
+  return ["/bin/bash", "-lc", command];
+}
+
+async function runShellValidationCommand(
+  repo: string,
+  command: string,
+  timeoutMs: number,
+): Promise<ValidationExecutionResult> {
+  const startedAt = Date.now();
+  const proc = Bun.spawn(shellCommandForPlatform(command), {
+    cwd: repo,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      proc.kill();
+    } catch {
+      // ignore
+    }
+  }, Math.max(1_000, timeoutMs));
+
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  clearTimeout(timer);
+
+  return {
+    step: command,
+    command,
+    ok: !timedOut && exitCode === 0,
+    exitCode: timedOut ? 124 : exitCode,
+    stdout: compactJobOutput(stdout.trim()),
+    stderr: compactJobOutput(stderr.trim()),
+    elapsedMs: Math.max(1, Date.now() - startedAt),
+  };
+}
+
+function parseChangedPathsFromStatus(statusOutput: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const line of statusOutput.split(/\r?\n/)) {
+    const clean = line.trim();
+    if (!clean) continue;
+    let path = clean.length > 3 ? clean.slice(3) : clean;
+    if (path.includes(" -> ")) {
+      path = path.split(" -> ", 2)[1] ?? path;
+    }
+    path = path.trim();
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+  }
+  return out;
+}
+
+function isLikelyTestPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  return (
+    normalized.includes("/tests/") ||
+    normalized.includes("/test/") ||
+    normalized.includes("__tests__/") ||
+    /\.test\.[a-z0-9]+$/i.test(normalized) ||
+    /\.spec\.[a-z0-9]+$/i.test(normalized)
+  );
+}
+
+function extractRunnableValidationCommand(step: string): string | null {
+  const trimmed = step.trim();
+  if (!trimmed) return null;
+
+  const fenced = trimmed.match(/`([^`]+)`/)?.[1]?.trim();
+  if (fenced) return fenced;
+
+  const lower = trimmed.toLowerCase();
+  const maybeStripped = lower.startsWith("run ")
+    ? trimmed.slice(4).trim()
+    : lower.startsWith("execute ")
+      ? trimmed.slice(8).trim()
+      : trimmed;
+  const firstToken = maybeStripped.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+  const runnable = new Set(["bun", "npm", "pnpm", "yarn", "pytest", "python", "uv", "coverage"]);
+  if (runnable.has(firstToken)) return maybeStripped;
+  return null;
+}
+
+function isTestFocusedTask(
+  instruction: string,
+  planning: TaskExecutePlanning,
+  targetPath?: string,
+): boolean {
+  const lowerInstruction = instruction.toLowerCase();
+  if (/\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/.test(lowerInstruction)) {
+    return true;
+  }
+  if (targetPath && isLikelyTestPath(targetPath)) return true;
+  if (planning.targetPaths.some((entry) => isLikelyTestPath(entry))) return true;
+  if (
+    planning.validationSteps.some((entry) =>
+      /\b(test|tests|coverage|pytest|vitest|jest|bun test)\b/i.test(entry),
+    )
+  ) {
+    return true;
+  }
+  if (
+    planning.acceptanceCriteria.some((entry) =>
+      /\b(test|tests|coverage|unit|integration|negative|invalid|valid)\b/i.test(entry),
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function hasBalancedPositiveNegativeAssertions(paths: string[], repo: string): boolean {
+  const negativeSignal = /\b(invalid|negative|error|throw|reject|null|undefined|non[- ]?existent|toThrow|toBeNull|toBeUndefined|<\s*0|<=\s*0)\b/i;
+  let positiveAssertions = 0;
+  let negativeAssertions = 0;
+
+  for (const rel of paths) {
+    const fullPath = resolve(repo, rel);
+    let content = "";
+    try {
+      content = readFileSync(fullPath, "utf-8");
+    } catch {
+      continue;
+    }
+    for (const line of content.split(/\r?\n/)) {
+      if (!/\b(expect\(|assert\s+)/.test(line)) continue;
+      if (negativeSignal.test(line)) negativeAssertions += 1;
+      else positiveAssertions += 1;
+    }
+  }
+
+  return positiveAssertions > 0 && negativeAssertions > 0;
+}
+
+async function runDeterministicQualityGate(
+  repo: string,
+  params: Record<string, unknown>,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<DeterministicQualityResult> {
+  const instruction = String(params.instruction ?? "");
+  const targetPath = String(params.targetPath ?? params.path ?? "").trim() || undefined;
+  const planning = params.planning as TaskExecutePlanning;
+  const isTestTask = isTestFocusedTask(instruction, planning, targetPath);
+  if (!isTestTask) {
+    return {
+      ok: true,
+      skipped: true,
+      issues: [],
+      changedPaths: [],
+      changedTestPaths: [],
+      validationRuns: [],
+    };
+  }
+
+  const statusResult = await git(repo, ["status", "--porcelain"]);
+  const changedPaths = statusResult.ok ? parseChangedPathsFromStatus(statusResult.stdout) : [];
+  const changedTestPaths = changedPaths.filter((path) => isLikelyTestPath(path));
+  const issues: string[] = [];
+  if (changedTestPaths.length === 0) {
+    issues.push("No relevant test file was modified for this test-focused task.");
+  }
+  if (changedTestPaths.length > 0 && !hasBalancedPositiveNegativeAssertions(changedTestPaths, repo)) {
+    issues.push(
+      "Changed test files do not show both positive and negative assertion coverage (expected both).",
+    );
+  }
+
+  const runnableSteps = planning.validationSteps
+    .map((step) => extractRunnableValidationCommand(step))
+    .filter((entry): entry is string => Boolean(entry))
+    .slice(0, 4);
+  const validationRuns: ValidationExecutionResult[] = [];
+  if (runnableSteps.length === 0) {
+    issues.push(
+      "No runnable validation command was provided in planning.validationSteps (expected at least one test command).",
+    );
+  } else {
+    for (const command of runnableSteps) {
+      onLog?.("stdout", `[OpenHandsExecutor] Quality gate validation: running "${command}"`);
+      const run = await runShellValidationCommand(repo, command, QUALITY_VALIDATION_STEP_TIMEOUT_MS);
+      validationRuns.push(run);
+      const runSummary = `[OpenHandsExecutor] Quality gate validation ${run.ok ? "passed" : "failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
+      onLog?.(run.ok ? "stdout" : "stderr", runSummary);
+    }
+    if (validationRuns.every((run) => !run.ok)) {
+      issues.push("Validation commands were executed but none passed.");
+    }
+    if (!validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))) {
+      issues.push("Validation steps did not execute a recognizable test command.");
+    }
+  }
+
+  return {
+    ok: issues.length === 0,
+    skipped: false,
+    issues,
+    changedPaths,
+    changedTestPaths,
+    validationRuns,
+  };
+}
+
+async function runTaskCriticReview(
+  repo: string,
+  params: Record<string, unknown>,
+  quality: DeterministicQualityResult,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<CriticReview | null> {
+  const endpoint = normalizeChatCompletionsEndpoint(CONFIG.workerpals.llm.endpoint);
+  const model = CONFIG.workerpals.llm.model.trim();
+  if (!endpoint || !model) return null;
+
+  const changedForDiff = quality.changedPaths.slice(0, 8);
+  let diffText = "";
+  if (changedForDiff.length > 0) {
+    const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
+    diffText = diffResult.ok ? diffResult.stdout : diffResult.stderr;
+  }
+  diffText = compactJobOutput(diffText).slice(0, QUALITY_CRITIC_MAX_DIFF_CHARS);
+
+  const validationSummary = quality.validationRuns
+    .map((run) => {
+      const output = [run.stdout, run.stderr]
+        .filter(Boolean)
+        .join("\n")
+        .slice(0, QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS);
+      return [
+        `Command: ${run.command}`,
+        `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
+        output ? `Output:\n${output}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n\n---\n\n");
+
+  const planning = params.planning as TaskExecutePlanning;
+  const instruction = String(params.instruction ?? "").trim();
+  const criticSystem = [
+    "You are a strict code-review critic for worker-generated patches.",
+    "Return exactly one JSON object with keys:",
+    `{"score": <0-10 number>, "findings": [string], "must_fix": [string], "revision_guidance": string}`,
+    "Scoring rubric:",
+    "- 10: complete, correct, and robust with strong validation coverage.",
+    "- 8-9: good quality with minor non-blocking issues.",
+    "- <=7: requires revision before commit.",
+    "must_fix must list blocking issues only.",
+    "Do not include markdown or prose outside JSON.",
+  ].join("\n");
+  const criticUser = [
+    `Instruction:\n${instruction}`,
+    `Acceptance criteria:\n${planning.acceptanceCriteria.map((entry) => `- ${entry}`).join("\n") || "- (none)"}`,
+    `Validation steps:\n${planning.validationSteps.map((entry) => `- ${entry}`).join("\n") || "- (none)"}`,
+    `Changed paths:\n${quality.changedPaths.map((entry) => `- ${entry}`).join("\n") || "- (none)"}`,
+    `Diff excerpt:\n${diffText || "(empty diff excerpt)"}`,
+    `Validation evidence:\n${validationSummary || "(no validation output)"}`,
+  ].join("\n\n");
+
+  const apiKey = CONFIG.workerpals.llm.apiKey.trim() || "local";
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  const bodyBase = {
+    model,
+    messages: [
+      { role: "system", content: criticSystem },
+      { role: "user", content: criticUser },
+    ],
+    temperature: 0,
+    max_tokens: 700,
+  };
+
+  const runCriticRequest = async (responseFormat: Record<string, unknown> | null) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), QUALITY_CRITIC_TIMEOUT_MS);
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(
+          responseFormat ? { ...bodyBase, response_format: responseFormat } : bodyBase,
+        ),
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      return { response, text };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  try {
+    let request = await runCriticRequest({ type: "json_object" });
+    if (!request.response.ok && request.response.status === 400) {
+      const lowered = request.text.toLowerCase();
+      if (lowered.includes("response_format")) {
+        onLog?.(
+          "stdout",
+          "[OpenHandsExecutor] Critic fallback: response_format json_object unsupported; retrying without strict response_format.",
+        );
+        request = await runCriticRequest(null);
+      }
+    }
+    if (!request.response.ok) {
+      onLog?.(
+        "stderr",
+        `[OpenHandsExecutor] Critic review request failed (${request.response.status}): ${toSingleLine(request.text, 240)}`,
+      );
+      return null;
+    }
+
+    const payload = parseJsonObjectLoose(request.text) ?? JSON.parse(request.text);
+    const choices = Array.isArray((payload as Record<string, unknown>).choices)
+      ? ((payload as Record<string, unknown>).choices as Array<Record<string, unknown>>)
+      : [];
+    const content = String(
+      (choices[0]?.message as Record<string, unknown> | undefined)?.content ?? "",
+    ).trim();
+    const reviewObj = parseJsonObjectLoose(content);
+    if (!reviewObj) {
+      onLog?.(
+        "stderr",
+        `[OpenHandsExecutor] Critic produced non-JSON content; skipping critic gate. Raw: ${toSingleLine(
+          content,
+          220,
+        )}`,
+      );
+      return null;
+    }
+
+    const scoreRaw = Number(reviewObj.score);
+    const findings = Array.isArray(reviewObj.findings)
+      ? reviewObj.findings.map((entry) => String(entry).trim()).filter(Boolean)
+      : [];
+    const mustFix = Array.isArray(reviewObj.must_fix)
+      ? reviewObj.must_fix.map((entry) => String(entry).trim()).filter(Boolean)
+      : [];
+    const revisionGuidance = String(reviewObj.revision_guidance ?? "")
+      .trim()
+      .slice(0, 2000);
+    const score = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(10, scoreRaw)) : 0;
+    return {
+      score,
+      findings,
+      mustFix,
+      revisionGuidance,
+      raw: compactJobOutput(content),
+    };
+  } catch (err) {
+    onLog?.(
+      "stderr",
+      `[OpenHandsExecutor] Critic review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`,
+    );
+    return null;
+  }
+}
+
+function buildQualityRevisionHint(
+  issues: string[],
+  critic: CriticReview | null,
+  planning: TaskExecutePlanning,
+): string {
+  const lines: string[] = [];
+  lines.push("Quality revision required before completion.");
+  if (issues.length > 0) {
+    lines.push("Deterministic quality issues:");
+    for (const issue of issues) lines.push(`- ${issue}`);
+  }
+  if (critic) {
+    lines.push(`Critic score: ${critic.score.toFixed(1)} / 10`);
+    if (critic.mustFix.length > 0) {
+      lines.push("Critic must-fix findings:");
+      for (const issue of critic.mustFix) lines.push(`- ${issue}`);
+    }
+    if (critic.revisionGuidance) {
+      lines.push(`Critic revision guidance: ${critic.revisionGuidance}`);
+    }
+  }
+  if (planning.acceptanceCriteria.length > 0) {
+    lines.push("Required acceptance criteria:");
+    for (const criterion of planning.acceptanceCriteria) {
+      lines.push(`- ${criterion}`);
+    }
+  }
+  if (planning.validationSteps.length > 0) {
+    lines.push("Required validation steps:");
+    for (const step of planning.validationSteps) lines.push(`- ${step}`);
+  }
+  lines.push("Apply a minimal corrective patch, run focused validation, then finish.");
+  return lines.join("\n").slice(0, 6000);
 }
 
 function inferTargetPathFromInstruction(text: string): string | null {
@@ -1215,8 +1717,26 @@ function validateTaskExecutePlanning(
   if (!isStringArray(planning.targetPaths)) {
     return { ok: false, message: "task.execute planning.targetPaths must be a string array" };
   }
+  if (!isStringArray(planning.acceptanceCriteria)) {
+    return { ok: false, message: "task.execute planning.acceptanceCriteria must be a string array" };
+  }
   if (!isStringArray(planning.validationSteps)) {
     return { ok: false, message: "task.execute planning.validationSteps must be a string array" };
+  }
+  if ((planning.targetPaths as string[]).length === 0) {
+    return { ok: false, message: "task.execute planning.targetPaths must include at least one target path" };
+  }
+  if ((planning.acceptanceCriteria as string[]).length === 0) {
+    return {
+      ok: false,
+      message: "task.execute planning.acceptanceCriteria must include at least one acceptance criterion",
+    };
+  }
+  if ((planning.validationSteps as string[]).length === 0) {
+    return {
+      ok: false,
+      message: "task.execute planning.validationSteps must include at least one validation step",
+    };
   }
   if (!Number.isFinite(queueWaitBudgetMs) || queueWaitBudgetMs <= 0) {
     return { ok: false, message: "task.execute planning.queueWaitBudgetMs must be > 0" };
@@ -1294,11 +1814,89 @@ export async function executeJob(
     lane,
     instruction,
   };
-  const planning = params.planning as Record<string, unknown>;
+  const planning = params.planning as TaskExecutePlanning;
   const executionBudgetMs = Number(planning.executionBudgetMs);
   const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
-  return executeWithOpenHands(kind, normalizedParams, repo, onLog, {
-    executionBudgetMs,
-    finalizationBudgetMs,
-  });
+
+  let revisionAttempt = 0;
+  let revisionHint = "";
+  while (revisionAttempt <= QUALITY_MAX_AUTO_REVISIONS) {
+    const attemptParams: Record<string, unknown> = { ...normalizedParams };
+    if (revisionHint) {
+      attemptParams.qualityRevisionHint = revisionHint;
+      attemptParams.qualityRevisionAttempt = revisionAttempt;
+    }
+
+    const result = await executeWithOpenHands(kind, attemptParams, repo, onLog, {
+      executionBudgetMs,
+      finalizationBudgetMs,
+    });
+    if (!result.ok) return result;
+
+    const quality = await runDeterministicQualityGate(repo, attemptParams, onLog);
+    const critic = quality.skipped
+      ? null
+      : await runTaskCriticReview(repo, attemptParams, quality, onLog);
+    const criticRequiresRevision = Boolean(
+      critic && (critic.score < QUALITY_CRITIC_MIN_SCORE || critic.mustFix.length > 0),
+    );
+
+    if (quality.ok && !criticRequiresRevision) {
+      if (critic) {
+        onLog?.(
+          "stdout",
+          `[OpenHandsExecutor] Critic review score ${critic.score.toFixed(1)}/10 (threshold ${QUALITY_CRITIC_MIN_SCORE}).`,
+        );
+      }
+      return result;
+    }
+
+    const issues = [...quality.issues];
+    if (criticRequiresRevision && critic) {
+      const scoreIssue = `Critic score ${critic.score.toFixed(1)} is below required threshold ${QUALITY_CRITIC_MIN_SCORE}.`;
+      issues.push(scoreIssue);
+      for (const entry of critic.mustFix.slice(0, 8)) {
+        issues.push(`Critic must-fix: ${entry}`);
+      }
+    }
+    const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
+    if (revisionAttempt >= QUALITY_MAX_AUTO_REVISIONS) {
+      return {
+        ok: false,
+        summary: `Quality gate failed after ${revisionAttempt} auto-revision attempt(s): ${toSingleLine(
+          issueSummary,
+          240,
+        )}`,
+        stdout: result.stdout,
+        stderr: truncate(
+          [
+            result.stderr ?? "",
+            quality.skipped
+              ? ""
+              : `Deterministic issues: ${quality.issues.map((entry) => toSingleLine(entry, 220)).join(" | ")}`,
+            critic ? `Critic raw: ${critic.raw}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        ),
+        exitCode: 4,
+      };
+    }
+
+    revisionAttempt += 1;
+    revisionHint = buildQualityRevisionHint(issues, critic, planning);
+    onLog?.(
+      "stderr",
+      `[OpenHandsExecutor] Quality gate requested revision ${revisionAttempt}/${QUALITY_MAX_AUTO_REVISIONS}: ${toSingleLine(
+        issueSummary,
+        260,
+      )}`,
+    );
+  }
+
+  return {
+    ok: false,
+    summary: "Quality revision loop ended unexpectedly.",
+    exitCode: 4,
+  };
 }

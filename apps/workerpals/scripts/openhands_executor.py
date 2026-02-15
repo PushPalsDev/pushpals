@@ -1013,7 +1013,10 @@ def _build_auto_steer_message(nudge_index: int, max_nudges: int) -> str:
 
 
 def _run_agentic_task_execute(
-    repo: str, instruction: str, payload: Optional[Dict[str, Any]] = None
+    repo: str,
+    instruction: str,
+    payload: Optional[Dict[str, Any]] = None,
+    supplemental_guidance: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     try:
         from openhands.sdk import Agent, Conversation, LLM, Tool
@@ -1204,6 +1207,15 @@ def _run_agentic_task_execute(
         with redirect_stderr(sys.stdout):
             conversation = Conversation(agent=agent, workspace=repo)
             conversation.send_message(user_message)
+            if supplemental_guidance:
+                for guidance in supplemental_guidance:
+                    trimmed = str(guidance or "").strip()
+                    if not trimmed:
+                        continue
+                    conversation.send_message(
+                        "Supplemental execution guidance (do not change canonical user intent):\n"
+                        + trimmed
+                    )
         auto_steer_enabled = _auto_steer_enabled()
         auto_steer_initial_delay_sec = _auto_steer_initial_delay_sec()
         auto_steer_interval_sec = _auto_steer_interval_sec()
@@ -1544,10 +1556,18 @@ def main() -> int:
     if not instruction:
         return _fail("task.execute requires 'instruction'", exit_code=2)
     planner_instruction = str(params.get("plannerWorkerInstruction") or "").strip()
+    quality_revision_hint = str(params.get("qualityRevisionHint") or "").strip()
+    supplemental_guidance: List[str] = []
     if planner_instruction and planner_instruction != instruction:
         _executor_log(
             "[OpenHandsExecutor] Planner guidance was provided, but preserving original user instruction as canonical task input.\n"
         )
+        supplemental_guidance.append(planner_instruction)
+    if quality_revision_hint:
+        _executor_log(
+            "[OpenHandsExecutor] Quality revision guidance provided for this attempt; preserving canonical user instruction and applying additive guidance.\n"
+        )
+        supplemental_guidance.append(quality_revision_hint)
     lane = str(params.get("lane") or "openhands").strip().lower()
     if lane not in {"openhands", "deterministic"}:
         return _fail(
@@ -1555,7 +1575,7 @@ def main() -> int:
             exit_code=2,
         )
     if lane == "openhands":
-        result = _run_agentic_task_execute(repo, instruction, payload)
+        result = _run_agentic_task_execute(repo, instruction, payload, supplemental_guidance)
         _emit(result)
         return 0 if bool(result.get("ok")) else _to_int(result.get("exitCode"), 1)
 
