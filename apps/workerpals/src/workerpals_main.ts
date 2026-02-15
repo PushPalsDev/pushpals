@@ -304,7 +304,22 @@ function sanitizePrText(value: unknown, max = 240): string {
   return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
 }
 
-function inferPrArea(kind: string): string {
+function inferPrArea(kind: string, changedPaths: string[]): string {
+  const looksLikeTests = (path: string): boolean => {
+    const normalized = path.replace(/\\/g, "/").toLowerCase();
+    return (
+      normalized.startsWith("tests/") ||
+      normalized.includes("/tests/") ||
+      normalized.endsWith(".test.ts") ||
+      normalized.endsWith(".test.tsx") ||
+      normalized.endsWith(".spec.ts") ||
+      normalized.endsWith(".spec.tsx") ||
+      normalized.endsWith("_test.py") ||
+      normalized.endsWith("_test.js") ||
+      normalized.endsWith("_test.ts")
+    );
+  };
+  if (changedPaths.some(looksLikeTests)) return "tests";
   if (kind.startsWith("task.")) return "repo";
   if (kind.startsWith("file.")) return "repo";
   if (kind.startsWith("bun.test") || kind.startsWith("test.")) return "tests";
@@ -332,6 +347,12 @@ function inferChangedPaths(params: Record<string, unknown> | undefined): string[
   if (Array.isArray(params.paths)) {
     for (const value of params.paths) add(value);
   }
+  if (params.planning && typeof params.planning === "object") {
+    const planning = params.planning as Record<string, unknown>;
+    if (Array.isArray(planning.targetPaths)) {
+      for (const value of planning.targetPaths) add(value);
+    }
+  }
 
   const deduped: string[] = [];
   const seen = new Set<string>();
@@ -342,6 +363,70 @@ function inferChangedPaths(params: Record<string, unknown> | undefined): string[
     if (deduped.length >= 8) break;
   }
   return deduped;
+}
+
+function inferValidationSteps(params: Record<string, unknown> | undefined): string[] {
+  if (!params || !params.planning || typeof params.planning !== "object") return [];
+  const planning = params.planning as Record<string, unknown>;
+  if (!Array.isArray(planning.validationSteps)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of planning.validationSteps) {
+    if (typeof raw !== "string") continue;
+    const step = sanitizePrText(raw, 200);
+    if (!step || seen.has(step)) continue;
+    seen.add(step);
+    out.push(step);
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+function inferTaskInstruction(params: Record<string, unknown> | undefined): string {
+  if (!params || typeof params.instruction !== "string") return "";
+  return sanitizePrText(params.instruction, 240);
+}
+
+function isLowSignalResultSummary(summary: string): boolean {
+  const text = summary.trim().toLowerCase();
+  if (!text) return true;
+  return (
+    text.includes("executed task and modified") ||
+    text.includes("executed task via openhands") ||
+    text.includes("no file changes detected") ||
+    text.includes("task summary")
+  );
+}
+
+function derivePrSummary(
+  kind: string,
+  params: Record<string, unknown> | undefined,
+  resultSummary: string,
+): string {
+  const workerSummary = sanitizePrText(resultSummary, 96);
+  if (workerSummary && !isLowSignalResultSummary(workerSummary)) {
+    return workerSummary;
+  }
+
+  const instruction = inferTaskInstruction(params);
+  if (instruction) {
+    let normalized = instruction
+      .replace(/^(can you|could you|would you|please)\s+/i, "")
+      .replace(/\?+$/, "")
+      .trim();
+    if (normalized.length > 0) {
+      normalized = normalized[0].toUpperCase() + normalized.slice(1);
+      return sanitizePrText(normalized, 96);
+    }
+  }
+
+  return sanitizePrText(`${kind} update`, 96);
+}
+
+function inferPrTitleType(kind: string, area: string): "test" | "fix" | "chore" {
+  if (area === "tests") return "test";
+  if (kind.startsWith("task.") || kind.startsWith("file.")) return "fix";
+  return "chore";
 }
 
 function toBulletList(lines: string[]): string {
@@ -357,18 +442,25 @@ function buildCompletionPrMetadataFallback(args: {
   resultSummary: string;
   title: string;
   changedPaths: string[];
+  taskInstruction: string;
+  validationSteps: string[];
   risk: "low" | "medium";
 }): CompletionPrMetadata {
   const changesSection =
     args.changedPaths.length > 0
       ? args.changedPaths.map((path) => `- Updated \`${sanitizePrText(path, 180)}\``)
       : [`- Updated worker completion for \`${sanitizePrText(args.job.kind, 80)}\``];
+  const validationSection =
+    args.validationSteps.length > 0
+      ? args.validationSteps.map((step) => `- ${sanitizePrText(step, 200)}`)
+      : ["- Not specified by planner"];
 
   const body = [
     "### Summary",
     `- Apply WorkerPal completion \`${sanitizePrText(args.job.id, 64)}\` to \`${sanitizePrText(args.integrationBranch, 64)}\`.`,
     `- Integrate commit \`${sanitizePrText(args.commit.sha, 64)}\` from \`${sanitizePrText(args.commit.branch, 120)}\`.`,
     `- Worker: \`${sanitizePrText(args.workerId, 64)}\`.`,
+    `- Canonical task request: ${args.taskInstruction ? `\`${sanitizePrText(args.taskInstruction, 220)}\`` : "_(not provided)_"}`,
     "",
     "### Motivation / Context",
     "- Preserve and review autonomous worker output before final merge to base branch.",
@@ -378,7 +470,8 @@ function buildCompletionPrMetadataFallback(args: {
     ...changesSection,
     "",
     "### Testing / Validation",
-    "- Not run (not provided)",
+    ...validationSection,
+    "- Worker did not provide explicit per-command pass/fail logs in completion summary.",
     "",
     "### Impact / Risk",
     `- Risk level: ${args.risk} (automated worker-generated change; maintainer review required).`,
@@ -403,21 +496,31 @@ function buildCompletionPrMetadata(args: {
   commit: CommitRef;
   resultSummary: string;
 }): CompletionPrMetadata {
-  const area = inferPrArea(args.job.kind);
-  const summary = sanitizePrText(args.resultSummary, 84) || `${args.job.kind} update`;
-  const title = `chore(${area}): ${summary}`;
   const changedPaths = inferChangedPaths(args.job.params);
+  const validationSteps = inferValidationSteps(args.job.params);
+  const taskInstruction = inferTaskInstruction(args.job.params);
+  const area = inferPrArea(args.job.kind, changedPaths);
+  const prType = inferPrTitleType(args.job.kind, area);
+  const summary = derivePrSummary(args.job.kind, args.job.params, args.resultSummary);
+  const title = `${prType}(${area}): ${summary}`;
   const risk =
     args.job.kind.startsWith("task.") || args.job.kind.startsWith("file.") ? "medium" : "low";
   const changesLines =
     changedPaths.length > 0
       ? changedPaths.map((path) => `Updated \`${sanitizePrText(path, 180)}\``)
       : [`Updated worker completion for \`${sanitizePrText(args.job.kind, 80)}\``];
+  const validationLines =
+    validationSteps.length > 0
+      ? validationSteps.map((step) => `Planned: ${sanitizePrText(step, 200)}`)
+      : ["No explicit planner validation steps were provided."];
   const motivationLines = [
     "Preserve and review autonomous worker output before final merge to base branch.",
     "Keep integration branch current with queued worker completions.",
   ];
-  const testingLines = ["Not run (not provided)"];
+  const testingLines = [
+    ...validationLines,
+    "Worker completion summary did not include explicit command pass/fail output.",
+  ];
   const impactLines = [
     `Risk level: ${risk} (automated worker-generated change; maintainer review required).`,
     "No secrets or credentials are expected in this PR body.",
@@ -435,7 +538,12 @@ function buildCompletionPrMetadata(args: {
     commit_sha: sanitizePrText(args.commit.sha, 64),
     commit_branch: sanitizePrText(args.commit.branch, 140),
     result_summary: sanitizePrText(args.resultSummary, 240),
+    task_instruction: taskInstruction || "(not provided)",
     motivation_lines: toBulletList(motivationLines),
+    target_paths_lines: toBulletList(
+      changedPaths.length > 0 ? changedPaths.map((path) => `\`${sanitizePrText(path, 180)}\``) : ["None identified"],
+    ),
+    validation_plan_lines: toBulletList(validationLines),
     changes_lines: toBulletList(changesLines),
     testing_lines: toBulletList(testingLines),
     impact_lines: toBulletList(impactLines),
@@ -468,6 +576,8 @@ function buildCompletionPrMetadata(args: {
     ...args,
     title,
     changedPaths,
+    taskInstruction,
+    validationSteps,
     risk,
   });
 }

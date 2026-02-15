@@ -115,7 +115,7 @@ model_probe_timeout_sec = 10.0
 auto_steer_enabled = true
 auto_steer_initial_delay_sec = 90
 auto_steer_interval_sec = 60
-auto_steer_max_nudges = 4
+auto_steer_max_nudges = 30
 
 [workerpals.llm]
 backend = "lmstudio"

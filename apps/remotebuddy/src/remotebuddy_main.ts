@@ -147,6 +147,7 @@ interface TaskExecuteJobParams {
   requestId: string;
   sessionId: string;
   instruction: string;
+  plannerWorkerInstruction?: string;
   lane: TaskExecutionLane;
   planning: {
     intent: PlannerIntent;
@@ -937,6 +938,8 @@ class RemoteBuddyOrchestrator {
       if (requiresWorker && lane === "deterministic" && !targetPath) {
         lane = "openhands";
       }
+      const canonicalInstruction = prompt.trim();
+      const plannerWorkerInstruction = String(plan.worker_instruction ?? "").trim();
 
       if (queueWaitMs > queueWaitBudgetMs) {
         await this.comm.assistantMessage(
@@ -981,7 +984,11 @@ class RemoteBuddyOrchestrator {
         schemaVersion: 2,
         requestId,
         sessionId: this.sessionId,
-        instruction: plan.worker_instruction || prompt,
+        instruction: canonicalInstruction,
+        plannerWorkerInstruction:
+          plannerWorkerInstruction && plannerWorkerInstruction !== canonicalInstruction
+            ? plannerWorkerInstruction
+            : undefined,
         lane,
         planning: {
           intent: plan.intent,

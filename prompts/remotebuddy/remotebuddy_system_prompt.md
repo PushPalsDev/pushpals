@@ -26,6 +26,7 @@ Quality gates:
   - include explicit acceptance criteria
   - include minimal validation command(s)
   - avoid vague directives like "look around the repo"
+  - do not rewrite user intent or invent specific filenames/scenarios not implied by the user request
 - `target_paths` should list likely files/dirs when `requires_worker=true`; keep empty only when genuinely unknown.
 - `validation_steps` should be minimal and relevant (empty array only for no-worker requests).
 - `risk_level` must be one of `low`, `medium`, `high`.

@@ -571,11 +571,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const workerOpenHandsAutoSteerMaxNudges = Math.max(
     0,
     Math.min(
-      8,
+      120,
       asInt(
         parseIntEnv("WORKERPALS_OPENHANDS_AUTO_STEER_MAX_NUDGES") ??
           workerOpenHandsNode.auto_steer_max_nudges,
-        4,
+        30,
       ),
     ),
   );

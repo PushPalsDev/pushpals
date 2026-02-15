@@ -1555,11 +1555,11 @@ def _auto_steer_max_nudges() -> int:
     return max(
         0,
         min(
-            8,
+            120,
             _setting_int(
                 "WORKERPALS_OPENHANDS_AUTO_STEER_MAX_NUDGES",
                 "workerpals.openhands.auto_steer_max_nudges",
-                4,
+                30,
             ),
         ),
     )
@@ -2318,6 +2318,12 @@ def main() -> int:
     instruction = str(params.get("instruction") or "").strip()
     if not instruction:
         return _fail("task.execute requires 'instruction'", exit_code=2)
+    planner_instruction = str(params.get("plannerWorkerInstruction") or "").strip()
+    if planner_instruction and planner_instruction != instruction:
+        sys.stderr.write(
+            "[OpenHandsExecutor] Planner guidance was provided, but preserving original user instruction as canonical task input.\n"
+        )
+        sys.stderr.flush()
     lane = str(params.get("lane") or "openhands").strip().lower()
     if lane not in {"openhands", "deterministic"}:
         return _fail(

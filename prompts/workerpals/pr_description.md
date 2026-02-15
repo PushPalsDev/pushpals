@@ -3,10 +3,19 @@
 - Apply WorkerPal completion `{{completion_id}}` to `{{integration_branch}}`.
 - Integrate commit `{{commit_sha}}` from `{{commit_branch}}`.
 - Worker `{{worker_id}}` reported: {{result_summary}}
+- Canonical task request: `{{task_instruction}}`
 
 ### Motivation / Context
 
 {{motivation_lines}}
+
+### Planned Scope
+
+{{target_paths_lines}}
+
+### Planned Validation
+
+{{validation_plan_lines}}
 
 ### Changes
 
