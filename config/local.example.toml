@@ -2,11 +2,11 @@
 # Keep secrets in .env (or CI secret store), not in TOML.
 
 [localbuddy.llm]
-model = "gpt-5-distill-qwen3-1.7b-instruct"
+model = "llama-3.2-1b-instruct-moe-finetuned"
 endpoint = "http://127.0.0.1:1234"
 
 [remotebuddy.llm]
-model = "gpt-5-distill-qwen3-1.7b-instruct"
+model = "llama-3.2-1b-instruct-moe-finetuned"
 endpoint = "http://127.0.0.1:1234"
 
 [workerpals.llm]

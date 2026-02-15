@@ -97,12 +97,27 @@ function inferTargetPathFromInstruction(text: string): string | null {
   return null;
 }
 
+function normalizeStagePath(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  let path = value.trim();
+  if (!path) return null;
+  path = path.replace(/\\/g, "/");
+
+  // Convert common workspace-absolute prefixes to repo-relative paths.
+  if (path === "/repo" || path === "/workspace") return ".";
+  if (path.startsWith("/repo/")) path = path.slice("/repo/".length);
+  else if (path.startsWith("/workspace/")) path = path.slice("/workspace/".length);
+  else if (path.startsWith("/")) path = path.replace(/^\/+/, "");
+
+  path = path.replace(/^\.\//, "").trim();
+  return path.length > 0 ? path : null;
+}
+
 function toStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
-    .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+    .map((entry) => normalizeStagePath(entry))
+    .filter((entry): entry is string => Boolean(entry));
 }
 
 function summarizeRecentJobsForDoc(value: unknown, limit = 6): string[] {
@@ -616,9 +631,13 @@ export async function createJobCommit(
     result = await git(repo, stageArgs);
     if (!result.ok) {
       const stageErr = result.stderr || result.stdout;
-      if (/pathspec .* did not match any files/i.test(stageErr)) {
+      if (
+        /pathspec .* did not match any files/i.test(stageErr) ||
+        /invalid path/i.test(stageErr) ||
+        /outside repository/i.test(stageErr)
+      ) {
         console.warn(
-          `[WorkerPals] Stage target missing for ${job.kind}; retrying with fallback "git add -A".`,
+          `[WorkerPals] Stage target invalid/missing for ${job.kind}; retrying with fallback "git add -A".`,
         );
         result = await git(repo, [
           "add",
@@ -700,9 +719,7 @@ export async function createJobCommit(
 }
 
 function toPath(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
+  return normalizeStagePath(value);
 }
 
 function dedupePaths(paths: Array<string | null>): string[] {
