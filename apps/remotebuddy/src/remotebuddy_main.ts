@@ -935,6 +935,7 @@ class RemoteBuddyOrchestrator {
       const requiresWorker = this.shouldForceDirectReply(prompt, plan.intent)
         ? false
         : plan.requires_worker;
+      const targetPath = plan.target_paths[0] ?? extractTargetPath(prompt) ?? undefined;
       if (requiresWorker) {
         const missing: string[] = [];
         if (plan.target_paths.length === 0) {
@@ -954,7 +955,6 @@ class RemoteBuddyOrchestrator {
           );
         }
       }
-      const targetPath = plan.target_paths[0] ?? extractTargetPath(prompt) ?? undefined;
       let lane = requiresWorker ? this.chooseExecutionLane(prompt, plan) : "deterministic";
       if (requiresWorker && lane === "deterministic" && !targetPath) {
         lane = "openhands";
