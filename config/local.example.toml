@@ -26,7 +26,6 @@ docker_warm_cpus = 2
 
 [workerpals.openhands]
 prompt_profile = "minimal"
-tool_preflight_timeout_sec = 45
 agent_max_steps = 30
 auto_steer_enabled = true
 auto_steer_initial_delay_sec = 90

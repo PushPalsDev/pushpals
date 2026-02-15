@@ -309,33 +309,6 @@ def _stable_llm_session_user(payload: Optional[Dict[str, Any]]) -> str:
     return f"pushpals-{session_id}-{worker_id}-{task_id}"
 
 
-def _session_field_rejected(detail: str) -> bool:
-    lowered = (detail or "").lower()
-    return (
-        "session_id" in lowered
-        or "conversation_id" in lowered
-        or "id_slot" in lowered
-        or "unknown field" in lowered
-        or "unknown property" in lowered
-        or "additional properties" in lowered
-    )
-
-
-def _response_format_rejected(detail: str) -> bool:
-    return "response_format" in (detail or "").lower()
-
-
-def _is_timeout_error(exc: Exception) -> bool:
-    if isinstance(exc, (socket.timeout, TimeoutError)):
-        return True
-    if isinstance(exc, urllib.error.URLError):
-        reason = str(getattr(exc, "reason", "") or "").lower()
-        if "timed out" in reason or "timeout" in reason:
-            return True
-    lowered = str(exc).lower()
-    return "timed out" in lowered or "timeout" in lowered
-
-
 def _session_hint_headers(session_user: str) -> Dict[str, str]:
     if not session_user:
         return {}
@@ -591,596 +564,12 @@ def _agent_server_is_healthy(base_url: str, timeout: float = 1.0) -> bool:
         return False
 
 
-def _llm_probe_urls(base_url: str, model: str) -> List[str]:
-    normalized = base_url.rstrip("/")
-    provider = model.split("/", 1)[0].strip().lower() if "/" in model else ""
-
-    if provider == "ollama":
-        return [
-            f"{normalized}/api/tags",
-            f"{normalized}/tags",
-            normalized,
-        ]
-
-    if normalized.endswith("/v1"):
-        return [
-            f"{normalized}/models",
-            f"{normalized}/chat/completions",
-            normalized,
-        ]
-
-    return [
-        f"{normalized}/v1/models",
-        f"{normalized}/models",
-        normalized,
-    ]
-
-
-def _llm_endpoint_reachable(base_url: str, model: str, timeout: float = 2.0) -> Tuple[bool, str]:
-    if not base_url:
-        return True, ""
-
-    last_error = "connection failed"
-    for probe in _llm_probe_urls(base_url, model):
-        try:
-            with urllib.request.urlopen(probe, timeout=timeout) as res:
-                return True, f"{probe} -> {getattr(res, 'status', '?')}"
-        except urllib.error.HTTPError as exc:
-            # HTTP response means endpoint is reachable, even if auth/path differs.
-            return True, f"{probe} -> HTTP {exc.code}"
-        except Exception as exc:
-            last_error = f"{probe}: {exc}"
-    return False, last_error
-
-
-def _providerless_model_name(model: str) -> str:
-    normalized = model.strip()
-    if "/" not in normalized:
-        return normalized
-    provider = normalized.split("/", 1)[0].strip().lower()
-    if provider in KNOWN_LITELLM_PROVIDER_PREFIXES:
-        return normalized.split("/", 1)[1].strip()
-    return normalized
-
-
-def _is_embedding_model(model: str) -> bool:
-    lowered = _providerless_model_name(model).lower()
-    return (
-        "embedding" in lowered
-        or lowered.startswith("embed-")
-        or "/embed" in lowered
-        or "nomic-embed" in lowered
-    )
-
-
-def _chat_completion_url(base_url: str, provider: str) -> str:
-    normalized = base_url.rstrip("/")
-    if provider == "ollama":
-        if normalized.endswith("/api/chat"):
-            return normalized
-        return f"{normalized}/api/chat"
-
-    if normalized.endswith("/chat/completions"):
-        return normalized
-    if normalized.endswith("/v1"):
-        return f"{normalized}/chat/completions"
-    return f"{normalized}/v1/chat/completions"
-
-
-def _llm_model_chat_preflight(
-    base_url: str,
-    provider: str,
-    api_key: str,
-    model: str,
-    session_user: str = "",
-    timeout: float = 10.0,
-) -> Tuple[bool, str]:
-    if not base_url:
-        return True, "base URL unset"
-
-    url = _chat_completion_url(base_url, provider)
-    payload_model = _providerless_model_name(model)
-    if provider == "ollama":
-        body = {
-            "model": payload_model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "stream": False,
-            "options": {"temperature": 0.0, "num_predict": 1},
-        }
-    else:
-        body = {
-            "model": payload_model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "temperature": 0.0,
-            "max_tokens": 1,
-        }
-
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if api_key and provider == "openai":
-        headers["Authorization"] = f"Bearer {api_key}"
-    headers.update(_session_hint_headers(session_user))
-
-    body_variants = _session_hint_body_variants(body, provider, session_user)
-    last_detail = f"{url}: preflight request failed"
-    try:
-        for idx, request_body in enumerate(body_variants):
-            try:
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(request_body).encode("utf-8"),
-                    headers=headers,
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=timeout) as res:
-                    status = int(getattr(res, "status", 0))
-                    if 200 <= status < 300:
-                        return True, f"{url} -> {status}"
-                    last_detail = f"{url} -> HTTP {status}"
-            except urllib.error.HTTPError as exc:
-                try:
-                    body_text = exc.read().decode("utf-8", errors="replace")
-                except Exception:
-                    body_text = ""
-                detail = f"{url} -> HTTP {exc.code}{f' ({body_text[:180].strip()})' if body_text else ''}"
-                last_detail = detail
-                if (
-                    exc.code == 400
-                    and idx < len(body_variants) - 1
-                    and _session_field_rejected(body_text)
-                ):
-                    continue
-                if _is_model_load_failure(body_text):
-                    return False, detail
-                lowered = body_text.lower()
-                if "model" in lowered and "not found" in lowered:
-                    return False, detail
-                if exc.code in {401, 403}:
-                    # Endpoint/model path is reachable, even when auth is blocked.
-                    return True, detail
-                return False, detail
-            except Exception as exc:
-                last_detail = f"{url}: {exc}"
-                if _is_timeout_error(exc):
-                    return False, f"{url}: timed out after {timeout:.0f}s"
-                return False, last_detail
-    except Exception as exc:
-        return False, f"{url}: {exc}"
-    return False, last_detail
-
-
-def _extract_first_json_object(raw: str) -> Dict[str, Any]:
-    text = (raw or "").strip()
-    if not text:
-        raise ValueError("empty response")
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-
-    first = text.find("{")
-    last = text.rfind("}")
-    if first >= 0 and last > first:
-        sliced = text[first : last + 1]
-        parsed = json.loads(sliced)
-        if isinstance(parsed, dict):
-            return parsed
-    raise ValueError("response did not contain parseable JSON object")
-
-
-def _tool_preflight_enabled() -> bool:
-    return _is_truthy_env(
-        "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_ENABLED",
-        True,
-        "workerpals.openhands.tool_preflight_enabled",
-    )
-
-
-def _tool_preflight_require_json() -> bool:
-    return _is_truthy_env(
-        "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_REQUIRE_JSON",
-        True,
-        "workerpals.openhands.tool_preflight_require_json",
-    )
-
-
-def _tool_preflight_timeout_sec() -> float:
-    return max(
-        5.0,
-        _setting_float(
-            "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_TIMEOUT_SEC",
-            "workerpals.openhands.tool_preflight_timeout_sec",
-            45.0,
-        ),
-    )
-
-
-def _tool_preflight_max_tokens() -> int:
-    return max(
-        32,
-        _setting_int(
-            "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MAX_TOKENS",
-            "workerpals.openhands.tool_preflight_max_tokens",
-            220,
-        ),
-    )
-
-
-def _tool_need_preflight(
-    base_url: str,
-    provider: str,
-    api_key: str,
-    model: str,
-    instruction: str,
-    session_user: str = "",
-) -> Dict[str, Any]:
-    if not _tool_preflight_enabled():
-        return {
-            "needs_tools": True,
-            "why": "tool preflight disabled by env",
-            "plan": "",
-            "first_command": "",
-            "error": "",
-            "hard_fail": False,
-        }
-
-    url = _chat_completion_url(base_url, provider)
-    payload_model = _providerless_model_name(model)
-    timeout_sec = _tool_preflight_timeout_sec()
-    max_tokens = _tool_preflight_max_tokens()
-    system_prompt = (
-        "You are a routing preflight for a coding agent. "
-        "Decide whether repository tools are needed. "
-        "Return ONLY JSON with keys: "
-        '{"needs_tools":boolean,"why":string,"plan":string,"first_command":string}. '
-        "Use needs_tools=true when work requires checking files, running commands/tests, "
-        "editing code, validating behavior, or verifying repository state. "
-        "If needs_tools=false, provide a short plan that can be answered directly with no tools. "
-        "When true, provide one safe first command (prefer scoped ls/rg/cat)."
-    )
-    user_prompt = f"Task request:\n{instruction}"
-
-    if provider == "ollama":
-        body: Dict[str, Any] = {
-            "model": payload_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "stream": False,
-            "options": {"temperature": 0.0, "num_predict": max_tokens},
-        }
-    else:
-        body = {
-            "model": payload_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.0,
-            "max_tokens": max_tokens,
-        }
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if api_key and provider == "openai":
-        headers["Authorization"] = f"Bearer {api_key}"
-    headers.update(_session_hint_headers(session_user))
-    base_variants = _session_hint_body_variants(body, provider, session_user)
-    body_variants: List[Dict[str, Any]]
-    if provider == "openai":
-        preflight_schema = {
-            "name": "workerpals_tool_preflight",
-            "strict": False,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "needs_tools": {"type": "boolean"},
-                    "why": {"type": "string"},
-                    "plan": {"type": "string"},
-                    "first_command": {"type": "string"},
-                },
-                "required": ["needs_tools", "why", "plan", "first_command"],
-                "additionalProperties": False,
-            },
-        }
-        body_variants = []
-        for base in base_variants:
-            body_variants.append(
-                {
-                    **base,
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": preflight_schema,
-                    },
-                }
-            )
-            body_variants.append(
-                {
-                    **base,
-                    "response_format": {"type": "json_object"},
-                }
-            )
-            body_variants.append(base)
-    else:
-        body_variants = base_variants
-
-    try:
-        payload: Dict[str, Any] = {}
-        last_err = ""
-        for idx, request_body in enumerate(body_variants):
-            try:
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(request_body).encode("utf-8"),
-                    headers=headers,
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=timeout_sec) as res:
-                    raw = res.read().decode("utf-8", errors="replace")
-                    payload = json.loads(raw)
-                    last_err = ""
-                    break
-            except urllib.error.HTTPError as exc:
-                detail = ""
-                try:
-                    detail = exc.read().decode("utf-8", errors="replace")
-                except Exception:
-                    detail = ""
-                last_err = detail[:200]
-                if (
-                    exc.code == 400
-                    and idx < len(body_variants) - 1
-                    and (_session_field_rejected(detail) or _response_format_rejected(detail))
-                ):
-                    continue
-                return {
-                    "needs_tools": True,
-                    "why": f"tool preflight HTTP {exc.code}",
-                    "plan": "",
-                    "first_command": "",
-                    "error": last_err,
-                    "hard_fail": False,
-                }
-            except Exception as exc:
-                last_err = str(exc)[:200]
-                if _is_timeout_error(exc):
-                    return {
-                        "needs_tools": True,
-                        "why": f"tool preflight timed out after {timeout_sec:.0f}s",
-                        "plan": "",
-                        "first_command": "",
-                        "error": last_err,
-                        "hard_fail": False,
-                    }
-                return {
-                    "needs_tools": True,
-                    "why": "tool preflight request failed",
-                    "plan": "",
-                    "first_command": "",
-                    "error": last_err,
-                    "hard_fail": False,
-                }
-        if not payload:
-            return {
-                "needs_tools": True,
-                "why": "tool preflight request failed",
-                "plan": "",
-                "first_command": "",
-                "error": last_err or "no payload returned",
-                "hard_fail": False,
-            }
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = ""
-        return {
-            "needs_tools": True,
-            "why": f"tool preflight HTTP {exc.code}",
-            "plan": "",
-            "first_command": "",
-            "error": detail[:200],
-            "hard_fail": False,
-        }
-    except Exception as exc:
-        return {
-            "needs_tools": True,
-            "why": "tool preflight request failed",
-            "plan": "",
-            "first_command": "",
-            "error": str(exc)[:200],
-            "hard_fail": False,
-        }
-
-    if provider == "ollama":
-        raw_text = str((payload.get("message") or {}).get("content") or "")
-        finish_reason = ""
-    else:
-        choice = (payload.get("choices") or [{}])[0]
-        raw_text = str((choice.get("message") or {}).get("content") or "")
-        finish_reason = str(choice.get("finish_reason") or "")
-
-    require_strict_json = _tool_preflight_require_json()
-    try:
-        if require_strict_json:
-            parsed_raw = json.loads((raw_text or "").strip())
-            if not isinstance(parsed_raw, dict):
-                raise ValueError("response is not a JSON object")
-            parsed = parsed_raw
-        else:
-            parsed = _extract_first_json_object(raw_text)
-    except Exception as exc:
-        detail = f"{str(exc)[:160]} | raw={raw_text.strip()[:240]}"
-        if finish_reason:
-            detail += f" | finish_reason={finish_reason}"
-        if (finish_reason or "").lower() == "length":
-            detail += " | model hit max_tokens before valid JSON (increase WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MAX_TOKENS)"
-        return {
-            "needs_tools": True,
-            "why": "tool preflight response parse failed",
-            "plan": "",
-            "first_command": "",
-            "error": detail,
-            "hard_fail": bool(require_strict_json),
-        }
-
-    raw_needs_tools = parsed.get("needs_tools", True)
-    if isinstance(raw_needs_tools, bool):
-        needs_tools = raw_needs_tools
-    else:
-        needs_tools = str(raw_needs_tools).strip().lower() in {"1", "true", "yes", "on"}
-
-    why = str(parsed.get("why") or "").strip()
-    plan = str(parsed.get("plan") or "").strip()
-    first_command = str(parsed.get("first_command") or "").strip()
-
-    return {
-        "needs_tools": needs_tools,
-        "why": why[:240],
-        "plan": plan[:600],
-        "first_command": first_command[:180],
-        "error": "",
-        "hard_fail": False,
-    }
-
-
-def _model_candidates_url(base_url: str, provider: str) -> List[str]:
-    normalized = base_url.rstrip("/")
-    if not normalized:
-        return []
-    if provider == "ollama":
-        return [f"{normalized}/api/tags", f"{normalized}/tags"]
-    if normalized.endswith("/v1"):
-        root = normalized[: -len("/v1")].rstrip("/")
-        urls = [f"{normalized}/models"]
-        if root:
-            urls.append(f"{root}/models")
-        return urls
-    return [f"{normalized}/v1/models", f"{normalized}/models"]
-
-
-def _extract_model_ids(payload: Any, provider: str) -> List[str]:
-    ids: List[str] = []
-    if provider == "ollama":
-        models = payload.get("models") if isinstance(payload, dict) else None
-        if isinstance(models, list):
-            for item in models:
-                if not isinstance(item, dict):
-                    continue
-                for key in ("name", "model", "id"):
-                    value = item.get(key)
-                    if isinstance(value, str) and value.strip():
-                        ids.append(value.strip())
-                        break
-        return list(dict.fromkeys(ids))
-
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if isinstance(data, list):
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            value = item.get("id")
-            if isinstance(value, str) and value.strip():
-                ids.append(value.strip())
-    return list(dict.fromkeys(ids))
-
-
-def _discover_available_models(
-    base_url: str, provider: str, api_key: str, timeout: float = 2.0
-) -> Tuple[List[str], str]:
-    if not base_url:
-        return [], "base URL is empty"
-
-    headers = {"Accept": "application/json"}
-    if api_key and provider == "openai":
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    last_error = "model list probe failed"
-    for url in _model_candidates_url(base_url, provider):
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as res:
-                raw = res.read().decode("utf-8", errors="replace")
-                payload = json.loads(raw)
-                ids = _extract_model_ids(payload, provider)
-                if ids:
-                    return ids, f"{url} -> {getattr(res, 'status', '?')}"
-                last_error = f"{url}: no models found in payload"
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                body = ""
-            hint = body[:120].strip() if body else ""
-            last_error = f"{url}: HTTP {exc.code}{f' ({hint})' if hint else ''}"
-        except Exception as exc:
-            last_error = f"{url}: {exc}"
-    return [], last_error
-
-
-def _pick_configured_or_available_model(
-    configured_model: str, available_models: List[str]
-) -> Tuple[str, str]:
-    configured = configured_model.strip()
-    if available_models:
-        if configured:
-            wanted = _providerless_model_name(configured).lower()
-            for candidate in available_models:
-                if _providerless_model_name(candidate).lower() == wanted:
-                    return candidate, "configured"
-            return available_models[0], "available_fallback"
-        return available_models[0], "available_default"
-
-    if configured:
-        return configured, "configured_unverified"
-
-    return DEFAULT_OPENHANDS_MODEL, "default_local_model"
-
-
-def _is_model_load_failure(error_text: str) -> bool:
-    lowered = error_text.lower()
-    return (
-        "failed to load model" in lowered
-        or "model loading was stopped" in lowered
-        or "insufficient system resources" in lowered
-        or "out of memory" in lowered
-        or ("model" in lowered and "not found" in lowered)
-    )
-
-
-def _fallback_models_after_load_failure(
-    base_url: str,
-    provider: str,
-    api_key: str,
-    failed_model: str,
-) -> Tuple[List[str], str]:
-    available_models, probe_detail = _discover_available_models(base_url, provider, api_key)
-    candidates: List[str] = []
-    failed_norm = _normalize_litellm_model(failed_model, provider)
-
-    for model in available_models:
-        normalized = _normalize_litellm_model(model, provider)
-        if normalized and normalized != failed_norm and not _is_embedding_model(normalized):
-            candidates.append(normalized)
-
-    default_fallback = _normalize_litellm_model(DEFAULT_OPENHANDS_MODEL, provider)
-    if (
-        default_fallback
-        and default_fallback != failed_norm
-        and not _is_embedding_model(default_fallback)
-    ):
-        candidates.append(default_fallback)
-
-    return list(dict.fromkeys(candidates)), probe_detail
-
-
 def _resolve_llm_config() -> Tuple[str, str, str]:
     raw_model = _setting_str("WORKERPALS_LLM_MODEL", "workerpals.llm.model", "")
     api_key = _setting_str("WORKERPALS_LLM_API_KEY", "workerpals.llm.api_key", "")
     raw_base_url = _setting_str("WORKERPALS_LLM_ENDPOINT", "workerpals.llm.endpoint", "")
     provider = _infer_litellm_provider(raw_base_url)
-    configured_model = _normalize_litellm_model(raw_model, provider)
+    configured_model = _normalize_litellm_model(raw_model or DEFAULT_OPENHANDS_MODEL, provider)
     base_url = _normalize_base_url_for_provider(raw_base_url, provider)
     if _running_in_container():
         rewritten = _rewrite_localhost_for_container(base_url)
@@ -1189,32 +578,12 @@ def _resolve_llm_config() -> Tuple[str, str, str]:
                 f"[OpenHandsExecutor] Rewriting local LLM base URL for container networking: {base_url} -> {rewritten}\n"
             )
             base_url = rewritten
-    available_models, probe_detail = _discover_available_models(base_url, provider, api_key)
-    selected_model, selection_reason = _pick_configured_or_available_model(
-        configured_model, available_models
-    )
-    model = _normalize_litellm_model(selected_model, provider)
-    if selection_reason == "available_fallback":
+    if not raw_model.strip():
         _executor_log(
-            "[OpenHandsExecutor] Configured model unavailable in LM Studio model list; "
-            f"using discovered fallback model: {selected_model}\n"
+            "[OpenHandsExecutor] No explicit model configured; using default model "
+            f"{DEFAULT_OPENHANDS_MODEL}.\n"
         )
-    elif selection_reason == "available_default":
-        _executor_log(
-            "[OpenHandsExecutor] No model configured; using discovered model "
-            f"from endpoint: {selected_model}\n"
-        )
-    elif selection_reason == "default_local_model":
-        _executor_log(
-            "[OpenHandsExecutor] No configured/discovered model available; "
-            f"falling back to default model: {DEFAULT_OPENHANDS_MODEL}\n"
-        )
-    elif selection_reason == "configured_unverified":
-        _executor_log(
-            "[OpenHandsExecutor] Could not verify configured model against endpoint model list "
-            f"({probe_detail}); continuing with configured model: {configured_model}\n"
-        )
-    return model, api_key, base_url
+    return configured_model, api_key, base_url
 
 
 def _repo_root_for_prompt_loading() -> Path:
@@ -1627,18 +996,6 @@ def _run_agentic_task_execute(
                 "exitCode": 2,
             }
 
-    reachable, reachability_detail = _llm_endpoint_reachable(base_url, model)
-    if not reachable:
-        return {
-            "ok": False,
-            "summary": "OpenHands LLM endpoint is unreachable from worker runtime",
-            "stderr": (
-                f"Could not reach LLM endpoint for model {model} at {base_url}. "
-                f"Last probe error: {reachability_detail}"
-            ),
-            "exitCode": 2,
-        }
-
     llm_kwargs_base: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         llm_kwargs_base["base_url"] = base_url
@@ -1734,357 +1091,144 @@ def _run_agentic_task_execute(
             30,
         ),
     )
+    llm_kwargs = dict(llm_kwargs_base)
+    llm_kwargs["model"] = model
 
-    provider = _infer_litellm_provider(base_url)
-    models_to_try: List[str] = [model]
-    attempted_models: List[str] = []
-    last_error_text = ""
-    preflight_failures: List[str] = []
-    model_probe_timeout_sec = max(
-        3.0,
-        _setting_float(
-            "WORKERPALS_OPENHANDS_MODEL_PROBE_TIMEOUT_SEC",
-            "workerpals.openhands.model_probe_timeout_sec",
-            10.0,
-        ),
-    )
-
-    while models_to_try:
-        active_model = models_to_try.pop(0)
-        if active_model in attempted_models:
-            continue
-        attempted_models.append(active_model)
-
-        if _is_embedding_model(active_model):
-            _executor_log(
-                f"[OpenHandsExecutor] Skipping non-chat embedding model candidate: {active_model}\n"
-            )
-            continue
-
-        preflight_ok, preflight_detail = _llm_model_chat_preflight(
-            base_url,
-            provider,
-            api_key,
-            active_model,
-            stable_session_user,
-            model_probe_timeout_sec,
-        )
-        if not preflight_ok:
-            preflight_failures.append(f"{active_model}: {preflight_detail}")
-            last_error_text = f"{active_model}: {preflight_detail}"
-            lowered_preflight = preflight_detail.lower()
-            if _is_model_load_failure(preflight_detail) or (
-                "model" in lowered_preflight and "not found" in lowered_preflight
-            ):
-                fallback_models, probe_detail = _fallback_models_after_load_failure(
-                    base_url, provider, api_key, active_model
-                )
-                pending = set(models_to_try)
-                new_candidates = [
-                    m for m in fallback_models if m not in attempted_models and m not in pending
-                ]
-                if new_candidates:
-                    _executor_log(
-                        "[OpenHandsExecutor] Model preflight failed for "
-                        f"{active_model}; retrying with fallback model(s): "
-                        f"{', '.join(new_candidates)}\n"
-                    )
-                    models_to_try.extend(new_candidates)
-                    continue
-                return {
-                    "ok": False,
-                    "summary": "OpenHands model preflight failed and no fallback model succeeded",
-                    "stderr": (
-                        f"{preflight_detail}\n"
-                        f"Attempted models: {', '.join(attempted_models)}\n"
-                        f"Model probe detail: {probe_detail}"
-                    ),
-                    "exitCode": 2,
-                }
-
-            # Transient preflight failure: skip this model and continue if alternatives exist.
-            _executor_log(
-                "[OpenHandsExecutor] Model preflight failed; skipping candidate "
-                f"{active_model}: {preflight_detail}\n"
-            )
-            continue
-
-        llm_kwargs = dict(llm_kwargs_base)
-        llm_kwargs["model"] = active_model
-
+    try:
+        with redirect_stderr(sys.stdout):
+            llm = LLM(**llm_kwargs)
         try:
-            active_user_message = user_message
-            if _tool_preflight_enabled():
-                preflight_model_raw = (
-                    _setting_str(
-                        "WORKERPALS_OPENHANDS_TOOL_PREFLIGHT_MODEL",
-                        "workerpals.openhands.tool_preflight_model",
-                        "",
-                    )
-                ).strip()
-                preflight_model = (
-                    _normalize_litellm_model(preflight_model_raw, provider)
-                    if preflight_model_raw
-                    else active_model
-                )
-                tool_decision = _tool_need_preflight(
-                    base_url,
-                    provider,
-                    api_key,
-                    preflight_model,
-                    prepared_instruction,
-                    stable_session_user,
-                )
-                preflight_err = str(tool_decision.get("error") or "").strip()
-                _executor_log(
-                    "[OpenHandsExecutor] Tool preflight: "
-                    f"needs_tools={tool_decision.get('needs_tools')} "
-                    f"hard_fail={bool(tool_decision.get('hard_fail', False))} "
-                    f"why={tool_decision.get('why') or '(none)'}"
-                    + (f" detail={preflight_err[:220]}" if preflight_err else "")
-                    + "\n"
-                )
-                if bool(tool_decision.get("hard_fail", False)):
-                    detail = str(tool_decision.get("error") or "").strip()
-                    return {
-                        "ok": False,
-                        "summary": "Tool preflight returned non-JSON response",
-                        "stderr": (
-                            "Preflight must return one valid JSON object in a single response.\n"
-                            f"Reason: {tool_decision.get('why') or 'parse failed'}\n"
-                            f"Detail: {detail or '(none)'}"
-                        ),
-                        "exitCode": 2,
-                    }
-                if not bool(tool_decision.get("needs_tools", True)):
-                    plan_lines = []
-                    why_text = str(tool_decision.get("why") or "").strip()
-                    plan_text = str(tool_decision.get("plan") or "").strip()
-                    if why_text:
-                        plan_lines.append(f"Reason: {why_text}")
-                    if plan_text:
-                        plan_lines.append(f"Plan: {plan_text}")
-                    return {
-                        "ok": True,
-                        "summary": "Preflight handled request without repository tools",
-                        "stdout": "\n".join(plan_lines) if plan_lines else "No repository tools required.",
-                        "stderr": "",
-                        "exitCode": 0,
-                    }
-
-                first_command = str(tool_decision.get("first_command") or "").strip()
-                if first_command:
-                    active_user_message = (
-                        f"{user_message}\n\n"
-                        "Preflight hint: start with this first command if it fits the task: "
-                        f"`{first_command}`"
-                    )
-
+            primary_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
+            if mcp_config:
+                primary_agent_kwargs["mcp_config"] = mcp_config
+            if agent_overrides:
+                primary_agent_kwargs.update(agent_overrides)
             with redirect_stderr(sys.stdout):
-                llm = LLM(**llm_kwargs)
+                agent = Agent(**primary_agent_kwargs)
+        except TypeError:
+            # Older SDK versions may not support explicit prompt override kwargs/mcp_config.
+            fallback_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
+            if mcp_config:
+                fallback_agent_kwargs["mcp_config"] = mcp_config
+            if agent_overrides:
+                _executor_log(
+                    "[OpenHandsExecutor] Prompt profile overrides unsupported by installed OpenHands SDK; using defaults.\n"
+                )
             try:
-                primary_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
-                if mcp_config:
-                    primary_agent_kwargs["mcp_config"] = mcp_config
-                if agent_overrides:
-                    primary_agent_kwargs.update(agent_overrides)
                 with redirect_stderr(sys.stdout):
-                    agent = Agent(**primary_agent_kwargs)
+                    agent = Agent(**fallback_agent_kwargs)
             except TypeError:
-                # Older SDK versions may not support explicit prompt override kwargs/mcp_config.
-                fallback_agent_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
                 if mcp_config:
-                    fallback_agent_kwargs["mcp_config"] = mcp_config
-                if agent_overrides:
                     _executor_log(
-                        "[OpenHandsExecutor] Prompt profile overrides unsupported by installed OpenHands SDK; using defaults.\n"
+                        "[OpenHandsExecutor] mcp_config unsupported by installed OpenHands SDK; using tools without MCP.\n"
                     )
+                with redirect_stderr(sys.stdout):
+                    agent = Agent(llm=llm, tools=tools)
+        except Exception as agent_exc:
+            lowered_agent_exc = str(agent_exc).lower()
+            if mcp_config and "mcp" in lowered_agent_exc:
+                _executor_log(
+                    "[OpenHandsExecutor] Invalid mcp_config for current runtime; continuing without MCP.\n"
+                )
+                fallback_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
+                if agent_overrides:
+                    fallback_kwargs.update(agent_overrides)
                 try:
                     with redirect_stderr(sys.stdout):
-                        agent = Agent(**fallback_agent_kwargs)
+                        agent = Agent(**fallback_kwargs)
                 except TypeError:
-                    if mcp_config:
-                        _executor_log(
-                            "[OpenHandsExecutor] mcp_config unsupported by installed OpenHands SDK; using tools without MCP.\n"
-                        )
                     with redirect_stderr(sys.stdout):
                         agent = Agent(llm=llm, tools=tools)
-            except Exception as agent_exc:
-                lowered_agent_exc = str(agent_exc).lower()
-                if mcp_config and "mcp" in lowered_agent_exc:
+            else:
+                raise
+
+        with redirect_stderr(sys.stdout):
+            conversation = Conversation(agent=agent, workspace=repo)
+            conversation.send_message(user_message)
+        auto_steer_enabled = _auto_steer_enabled()
+        auto_steer_initial_delay_sec = _auto_steer_initial_delay_sec()
+        auto_steer_interval_sec = _auto_steer_interval_sec()
+        auto_steer_max_nudges = _auto_steer_max_nudges()
+        auto_steer_stop = threading.Event()
+        auto_steer_thread: Optional[threading.Thread] = None
+
+        def _auto_steer_worker() -> None:
+            if not auto_steer_enabled or auto_steer_max_nudges <= 0:
+                return
+            if auto_steer_stop.wait(auto_steer_initial_delay_sec):
+                return
+            for nudge_index in range(1, auto_steer_max_nudges + 1):
+                if auto_steer_stop.is_set():
+                    return
+                message = _build_auto_steer_message(nudge_index, auto_steer_max_nudges)
+                try:
+                    with redirect_stderr(sys.stdout):
+                        conversation.send_message(message)
                     _executor_log(
-                        "[OpenHandsExecutor] Invalid mcp_config for current runtime; continuing without MCP.\n"
+                        "[OpenHandsExecutor] Auto-steering nudge sent "
+                        f"({nudge_index}/{auto_steer_max_nudges}).\n"
                     )
-                    fallback_kwargs: Dict[str, Any] = {"llm": llm, "tools": tools}
-                    if agent_overrides:
-                        fallback_kwargs.update(agent_overrides)
-                    try:
-                        with redirect_stderr(sys.stdout):
-                            agent = Agent(**fallback_kwargs)
-                    except TypeError:
-                        with redirect_stderr(sys.stdout):
-                            agent = Agent(llm=llm, tools=tools)
-                else:
-                    raise
+                except Exception as steer_exc:
+                    _executor_log(
+                        "[OpenHandsExecutor] Auto-steering nudge failed "
+                        f"({nudge_index}/{auto_steer_max_nudges}): {steer_exc}\n"
+                    )
+                    return
+                if nudge_index < auto_steer_max_nudges and auto_steer_stop.wait(
+                    auto_steer_interval_sec
+                ):
+                    return
 
+        if auto_steer_enabled and auto_steer_max_nudges > 0:
+            _executor_log(
+                "[OpenHandsExecutor] Auto-steering enabled: "
+                f"initial_delay={auto_steer_initial_delay_sec}s "
+                f"interval={auto_steer_interval_sec}s max_nudges={auto_steer_max_nudges}\n"
+            )
+            auto_steer_thread = threading.Thread(
+                target=_auto_steer_worker,
+                name="openhands-auto-steer",
+                daemon=True,
+            )
+            auto_steer_thread.start()
+        try:
             with redirect_stderr(sys.stdout):
-                conversation = Conversation(agent=agent, workspace=repo)
-                conversation.send_message(active_user_message)
-            auto_steer_enabled = _auto_steer_enabled()
-            auto_steer_initial_delay_sec = _auto_steer_initial_delay_sec()
-            auto_steer_interval_sec = _auto_steer_interval_sec()
-            auto_steer_max_nudges = _auto_steer_max_nudges()
-            auto_steer_stop = threading.Event()
-            auto_steer_thread: Optional[threading.Thread] = None
+                try:
+                    conversation.run(max_steps=max_steps)
+                except TypeError:
+                    # SDK versions differ; fall back to default run() signature.
+                    conversation.run()
+        finally:
+            auto_steer_stop.set()
+            if auto_steer_thread is not None:
+                auto_steer_thread.join(timeout=1.0)
 
-            def _auto_steer_worker() -> None:
-                if not auto_steer_enabled or auto_steer_max_nudges <= 0:
-                    return
-                if auto_steer_stop.wait(auto_steer_initial_delay_sec):
-                    return
-                for nudge_index in range(1, auto_steer_max_nudges + 1):
-                    if auto_steer_stop.is_set():
-                        return
-                    message = _build_auto_steer_message(nudge_index, auto_steer_max_nudges)
-                    try:
-                        with redirect_stderr(sys.stdout):
-                            conversation.send_message(message)
-                        _executor_log(
-                            "[OpenHandsExecutor] Auto-steering nudge sent "
-                            f"({nudge_index}/{auto_steer_max_nudges}).\n"
-                        )
-                    except Exception as steer_exc:
-                        _executor_log(
-                            "[OpenHandsExecutor] Auto-steering nudge failed "
-                            f"({nudge_index}/{auto_steer_max_nudges}): {steer_exc}\n"
-                        )
-                        return
-                    if nudge_index < auto_steer_max_nudges and auto_steer_stop.wait(
-                        auto_steer_interval_sec
-                    ):
-                        return
-
-            if auto_steer_enabled and auto_steer_max_nudges > 0:
-                _executor_log(
-                    "[OpenHandsExecutor] Auto-steering enabled: "
-                    f"initial_delay={auto_steer_initial_delay_sec}s "
-                    f"interval={auto_steer_interval_sec}s max_nudges={auto_steer_max_nudges}\n"
-                )
-                auto_steer_thread = threading.Thread(
-                    target=_auto_steer_worker,
-                    name="openhands-auto-steer",
-                    daemon=True,
-                )
-                auto_steer_thread.start()
-            try:
-                with redirect_stderr(sys.stdout):
-                    try:
-                        conversation.run(max_steps=max_steps)
-                    except TypeError:
-                        # SDK versions differ; fall back to default run() signature.
-                        conversation.run()
-            finally:
-                auto_steer_stop.set()
-                if auto_steer_thread is not None:
-                    auto_steer_thread.join(timeout=1.0)
-
-            changed_paths = _summarize_git_changes(repo)
-            if changed_paths:
-                listed = "\n".join(f"- {path}" for path in changed_paths[:40])
-                if len(changed_paths) > 40:
-                    listed += "\n- ..."
-                return {
-                    "ok": True,
-                    "summary": f"Executed task and modified {len(changed_paths)} file(s)",
-                    "stdout": f"Changed files:\n{listed}",
-                    "stderr": "",
-                    "exitCode": 0,
-                }
+        changed_paths = _summarize_git_changes(repo)
+        if changed_paths:
+            listed = "\n".join(f"- {path}" for path in changed_paths[:40])
+            if len(changed_paths) > 40:
+                listed += "\n- ..."
             return {
                 "ok": True,
-                "summary": "Executed task via OpenHands agent (no file changes detected)",
-                "stdout": "No modified files were detected after execution.",
+                "summary": f"Executed task and modified {len(changed_paths)} file(s)",
+                "stdout": f"Changed files:\n{listed}",
                 "stderr": "",
                 "exitCode": 0,
             }
-        except Exception as exc:
-            err_text = str(exc)
-            last_error_text = err_text
-            lowered = err_text.lower()
-
-            if _is_model_load_failure(err_text):
-                fallback_models, probe_detail = _fallback_models_after_load_failure(
-                    base_url, provider, api_key, active_model
-                )
-                pending = set(models_to_try)
-                new_candidates = [
-                    m for m in fallback_models if m not in attempted_models and m not in pending
-                ]
-                if new_candidates:
-                    _executor_log(
-                        "[OpenHandsExecutor] Model load failure for "
-                        f"{active_model}; retrying with fallback model(s): "
-                        f"{', '.join(new_candidates)}\n"
-                    )
-                    models_to_try.extend(new_candidates)
-                    continue
-                return {
-                    "ok": False,
-                    "summary": "OpenHands model failed to load and no fallback model succeeded",
-                    "stderr": (
-                        f"{err_text}\n"
-                        f"Attempted models: {', '.join(attempted_models)}\n"
-                        f"Model probe detail: {probe_detail}"
-                    ),
-                    "exitCode": 2,
-                }
-
-            if "connection error" in lowered or "connection refused" in lowered:
-                return {
-                    "ok": False,
-                    "summary": "OpenHands could not connect to the configured local LLM endpoint",
-                    "stderr": (
-                        f"{err_text}\n"
-                        f"Model: {active_model}\n"
-                        f"Base URL: {base_url}\n"
-                        "Verify the host LLM server is running and reachable from Docker."
-                    ),
-                    "exitCode": 2,
-                }
-            if "cannot truncate prompt with n_keep" in lowered and "n_ctx" in lowered:
-                return {
-                    "ok": False,
-                    "summary": "OpenHands prompt exceeded LM Studio context window",
-                    "stderr": (
-                        f"{err_text}\n"
-                        "Reduce overall prompt/context size, increase model context window, "
-                        "or use a model/runtime with larger context support."
-                    ),
-                    "exitCode": 2,
-                }
-            return {
-                "ok": False,
-                "summary": "OpenHands agent task execution failed",
-                "stderr": err_text,
-                "exitCode": 1,
-            }
-
-    return {
-        "ok": False,
-        "summary": "OpenHands model selection exhausted with no successful execution",
-        "stderr": (
-            f"Attempted models: {', '.join(attempted_models) if attempted_models else '(none)'}\n"
-            + (
-                "Preflight failures:\n"
-                + "\n".join(f"- {entry}" for entry in preflight_failures[-5:])
-                + "\n"
-                if preflight_failures
-                else ""
-            )
-            + f"Last error: {last_error_text or '(none captured)'}"
-        ),
-        "exitCode": 2,
-    }
+        return {
+            "ok": True,
+            "summary": "Executed task via OpenHands agent (no file changes detected)",
+            "stdout": "No modified files were detected after execution.",
+            "stderr": "",
+            "exitCode": 0,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "summary": "OpenHands agent task execution failed",
+            "stderr": str(exc),
+            "exitCode": 1,
+        }
 
 
 def _job_to_command(

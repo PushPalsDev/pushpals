@@ -71,6 +71,57 @@ function classifyFileEditorSummary(line: string): "explore" | "progress" | null 
   return null;
 }
 
+const OPENHANDS_NO_CHANGE_SIGNAL = [
+  "no file changes detected",
+  "no modified files were detected",
+];
+
+const CLARIFICATION_SIGNAL_REGEX =
+  /\b(clarif(?:y|ication)|need to know which|could you clarify|please clarify|which .* would you like|let me ask for clarification)\b/i;
+
+const NON_AGENT_LOG_LINE_REGEX =
+  /^(message from user|requested task:|tokens:|summary:|observation|tool:|result:|\$ )/i;
+
+function hasOpenHandsNoChangeSignal(text: string): boolean {
+  const lowered = text.toLowerCase();
+  return OPENHANDS_NO_CHANGE_SIGNAL.some((token) => lowered.includes(token));
+}
+
+function normalizeAgentOutputLine(line: string): string {
+  return line
+    .replace(/^\[[^\]]+\]\s*/g, "")
+    .replace(/<\/?think>/gi, " ")
+    .replace(/```+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function extractClarificationQuestionFromOutput(output: string): string | null {
+  if (!output.trim()) return null;
+
+  const rawLines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (rawLines.length === 0) return null;
+
+  const markerIndex = rawLines.findIndex((line) => /message from agent/i.test(line));
+  const scopedLines = markerIndex >= 0 ? rawLines.slice(markerIndex + 1) : rawLines;
+  const lines = scopedLines
+    .map(normalizeAgentOutputLine)
+    .filter((line) => Boolean(line) && !NON_AGENT_LOG_LINE_REGEX.test(line));
+  if (lines.length === 0) return null;
+
+  const joined = lines.join("\n");
+  if (!CLARIFICATION_SIGNAL_REGEX.test(joined)) return null;
+
+  const explicitQuestion = [...lines].reverse().find((line) => line.includes("?"));
+  if (explicitQuestion) return explicitQuestion.slice(0, 280);
+
+  const fallback = [...lines].reverse().find((line) => CLARIFICATION_SIGNAL_REGEX.test(line));
+  return fallback ? fallback.slice(0, 280) : null;
+}
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 export function shouldCommit(kind: string): boolean {
@@ -595,6 +646,23 @@ async function executeWithOpenHands(
         ? parsed.exitCode
         : exitCode;
     const parsedOk = typeof parsed.ok === "boolean" ? parsed.ok : parsedExitCode === 0;
+    const noChangeResult =
+      parsedOk &&
+      (hasOpenHandsNoChangeSignal(summary) ||
+        hasOpenHandsNoChangeSignal(String(parsedStdout ?? "")) ||
+        hasOpenHandsNoChangeSignal(String(parsedStderr ?? "")));
+    if (noChangeResult) {
+      const clarificationQuestion = extractClarificationQuestionFromOutput(filteredStdout);
+      if (clarificationQuestion) {
+        return {
+          ok: false,
+          summary: "OpenHands requested clarification before making file changes",
+          stdout: truncate(filteredStdout || String(parsedStdout ?? "")),
+          stderr: truncate(`Clarification needed: ${clarificationQuestion}`),
+          exitCode: 3,
+        };
+      }
+    }
 
     return {
       ok: parsedOk,
