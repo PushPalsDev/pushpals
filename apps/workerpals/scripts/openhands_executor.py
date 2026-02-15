@@ -43,6 +43,9 @@ DEFAULT_OPENHANDS_MODEL = "local-model"
 DEFAULT_LLM_MAX_MESSAGE_CHARS = 12000
 DEFAULT_LLM_TIMEOUT_RECOVERY_ATTEMPTS = 1
 DEFAULT_LLM_TIMEOUT_RECOVERY_BACKOFF_SEC = 2.0
+DEFAULT_LLM_TIMEOUT_STEP_SEC = 60
+DEFAULT_LLM_TIMEOUT_MAX_SEC = 300
+DEFAULT_LLM_MAX_MESSAGE_SHRINK_FACTOR = 0.8
 KNOWN_LITELLM_PROVIDER_PREFIXES: Set[str] = {
     "openai",
     "azure",
@@ -979,6 +982,50 @@ def _llm_timeout_recovery_backoff_sec() -> float:
     )
 
 
+def _retune_llm_for_retry(
+    llm_factory: Any,
+    agent: Any,
+    llm_kwargs: Dict[str, Any],
+    attempt: int,
+    elapsed_sec: float,
+) -> Dict[str, Any]:
+    base_timeout = int(llm_kwargs.get("timeout") or 0)
+    base_max_chars = int(llm_kwargs.get("max_message_chars") or DEFAULT_LLM_MAX_MESSAGE_CHARS)
+    new_timeout = base_timeout
+    new_max_chars = base_max_chars
+    if base_timeout > 0:
+        new_timeout = min(
+            DEFAULT_LLM_TIMEOUT_MAX_SEC, base_timeout + DEFAULT_LLM_TIMEOUT_STEP_SEC
+        )
+    if base_max_chars > 0:
+        new_max_chars = max(
+            2000, int(base_max_chars * DEFAULT_LLM_MAX_MESSAGE_SHRINK_FACTOR)
+        )
+    if new_timeout == base_timeout and new_max_chars == base_max_chars:
+        return llm_kwargs
+    updated_kwargs = dict(llm_kwargs)
+    if base_timeout > 0:
+        updated_kwargs["timeout"] = new_timeout
+    updated_kwargs["max_message_chars"] = new_max_chars
+    try:
+        with redirect_stderr(sys.stdout):
+            retuned_llm = llm_factory(**updated_kwargs)
+        if hasattr(agent, "llm"):
+            agent.llm = retuned_llm
+        _executor_log(
+            "[OpenHandsExecutor] Retuned LLM for retry "
+            f"{attempt} after {elapsed_sec:.1f}s: timeout={new_timeout}s "
+            f"max_message_chars={new_max_chars}.\n"
+        )
+        return updated_kwargs
+    except Exception as exc:
+        _executor_log(
+            "[OpenHandsExecutor] LLM retune failed; keeping previous settings "
+            f"(retry {attempt} after {elapsed_sec:.1f}s): {exc}\n"
+        )
+        return llm_kwargs
+
+
 def _is_llm_timeout_error(exc: Exception) -> bool:
     lowered = str(exc).lower()
     signals = (
@@ -1266,6 +1313,7 @@ def _run_agentic_task_execute(
             auto_steer_thread.start()
         try:
             run_attempt = 0
+            run_started_at = time.time()
             while True:
                 try:
                     with redirect_stderr(sys.stdout):
@@ -1282,9 +1330,11 @@ def _run_agentic_task_execute(
                     ):
                         raise
                     run_attempt += 1
+                    elapsed_sec = time.time() - run_started_at
                     _executor_log(
                         "[OpenHandsExecutor] LLM endpoint timeout during run; "
-                        f"retrying attempt {run_attempt}/{llm_timeout_recovery_attempts} with compact recovery hint.\n"
+                        f"retrying attempt {run_attempt}/{llm_timeout_recovery_attempts} "
+                        f"after {elapsed_sec:.1f}s with compact recovery hint.\n"
                     )
                     try:
                         with redirect_stderr(sys.stdout):
@@ -1297,6 +1347,9 @@ def _run_agentic_task_execute(
                             "[OpenHandsExecutor] Timeout recovery hint failed before retry: "
                             f"{steer_exc}\n"
                         )
+                    llm_kwargs = _retune_llm_for_retry(
+                        LLM, agent, llm_kwargs, run_attempt, elapsed_sec
+                    )
                     if llm_timeout_recovery_backoff_sec > 0:
                         time.sleep(llm_timeout_recovery_backoff_sec)
         finally:

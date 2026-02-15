@@ -26,10 +26,10 @@ docker_warm_cpus = 2
 
 [workerpals.openhands]
 prompt_profile = "minimal"
-llm_timeout_sec = 120
+llm_timeout_sec = 180
 llm_max_message_chars = 12000
-llm_timeout_recovery_attempts = 1
-llm_timeout_recovery_backoff_sec = 2
+llm_timeout_recovery_attempts = 2
+llm_timeout_recovery_backoff_sec = 5
 agent_max_steps = 30
 auto_steer_enabled = true
 auto_steer_initial_delay_sec = 90

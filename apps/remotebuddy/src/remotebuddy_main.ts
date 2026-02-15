@@ -181,6 +181,31 @@ function toSingleLine(value: unknown, max = 220): string {
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
+function buildExecutionGuidance(
+  plan: {
+    target_paths: string[];
+    acceptance_criteria: string[];
+    validation_steps: string[];
+  },
+  targetPath?: string,
+): string {
+  const lines: string[] = [];
+  const targets = plan.target_paths.length > 0 ? plan.target_paths : targetPath ? [targetPath] : [];
+  if (targets.length > 0) {
+    lines.push("Target paths:");
+    for (const path of targets) lines.push(`- ${path}`);
+  }
+  if (plan.acceptance_criteria.length > 0) {
+    lines.push("Acceptance criteria:");
+    for (const criterion of plan.acceptance_criteria) lines.push(`- ${criterion}`);
+  }
+  if (plan.validation_steps.length > 0) {
+    lines.push("Validation steps:");
+    for (const step of plan.validation_steps) lines.push(`- ${step}`);
+  }
+  return lines.join("\n").trim();
+}
+
 interface WorkerSnapshot {
   workerId: string;
   status: "idle" | "busy" | "error" | "offline";
@@ -960,7 +985,12 @@ class RemoteBuddyOrchestrator {
         lane = "openhands";
       }
       const canonicalInstruction = prompt.trim();
-      const plannerWorkerInstruction = String(plan.worker_instruction ?? "").trim();
+      const rawPlannerInstruction = String(plan.worker_instruction ?? "").trim();
+      const executionGuidance = buildExecutionGuidance(plan, targetPath);
+      const plannerWorkerInstruction = [rawPlannerInstruction, executionGuidance]
+        .filter(Boolean)
+        .join("\n\n")
+        .trim();
 
       if (queueWaitMs > queueWaitBudgetMs) {
         await this.comm.assistantMessage(
