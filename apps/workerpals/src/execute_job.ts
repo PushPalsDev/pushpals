@@ -1288,6 +1288,9 @@ async function executeWithMiniSwe(
       env: {
         ...process.env,
         PUSHPALS_REPO_PATH: repo,
+        // mini-swe-agent prints emoji banners on import; Windows cp1252
+        // encoding chokes on them without explicit UTF-8.
+        PYTHONIOENCODING: "utf-8",
       },
     });
 
