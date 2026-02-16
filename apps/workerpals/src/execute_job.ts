@@ -1239,7 +1239,11 @@ async function executeWithMiniSwe(
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
   budgets?: { executionBudgetMs?: number; finalizationBudgetMs?: number },
 ): Promise<JobResult> {
-  const pythonBin = CONFIG.workerpals.miniswePython || "python";
+  const rawPythonBin = CONFIG.workerpals.miniswePython || "python";
+  // Resolve relative paths against project root so venv paths work
+  const pythonBin = rawPythonBin.includes("/") || rawPythonBin.includes("\\")
+    ? resolve(CONFIG.projectRoot, rawPythonBin)
+    : rawPythonBin;
   const scriptPath = resolve(import.meta.dir, "..", "scripts", "miniswe_executor.py");
   if (!existsSync(scriptPath)) {
     return {
