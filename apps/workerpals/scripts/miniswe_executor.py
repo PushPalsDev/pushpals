@@ -384,20 +384,40 @@ def _run_miniswe_task(
     _executor_log(f"[MiniSweExecutor] Timeout: {timeout_ms}ms ({timeout_minutes}min)")
 
     try:
-        # Configure the LiteLLM model
-        model_kwargs: Dict[str, Any] = {"model_name": model_name}
-        if api_key:
-            model_kwargs["api_key"] = api_key
-        if base_url:
-            model_kwargs["api_base"] = base_url
+        import yaml
+        from minisweagent import package_dir
 
-        model = LitellmModel(**model_kwargs)
+        # Configure the LiteLLM model.
+        # LitellmModel accepts model_name directly and passes extra kwargs
+        # to litellm via model_kwargs dict.
+        litellm_kwargs: Dict[str, Any] = {}
+        if api_key:
+            litellm_kwargs["api_key"] = api_key
+        if base_url:
+            litellm_kwargs["api_base"] = base_url
+
+        model = LitellmModel(model_name=model_name, model_kwargs=litellm_kwargs)
 
         # Create local environment rooted in the repo working directory
         env = LocalEnvironment(cwd=repo)
 
-        # Create and run the agent
-        agent = DefaultAgent(model=model, environment=env)
+        # Load the built-in default agent config which provides the required
+        # system_template and instance_template fields for AgentConfig.
+        config_path = package_dir / "config" / "default.yaml"
+        with open(config_path, "r", encoding="utf-8") as f:
+            builtin_config = yaml.safe_load(f)
+        agent_kwargs = builtin_config.get("agent", {})
+
+        # Override cost/step limits from our config
+        agent_kwargs["cost_limit"] = 0.0  # we manage budget externally
+        agent_kwargs["step_limit"] = _setting_int(
+            "WORKERPALS_OPENHANDS_AGENT_MAX_STEPS",
+            "workerpals.openhands.agent_max_steps",
+            30,
+        )
+
+        # Create and run the agent (positional: model, env; config via kwargs)
+        agent = DefaultAgent(model, env, **agent_kwargs)
 
         _executor_log("[MiniSweExecutor] Agent initialized, running task...")
         agent.run(full_instruction)
