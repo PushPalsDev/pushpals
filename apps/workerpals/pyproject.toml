@@ -1,0 +1,8 @@
+[project]
+name = "workerpals"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "mini-swe-agent>=2.1.0",
+]
