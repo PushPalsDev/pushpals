@@ -83,6 +83,8 @@ export interface PushPalsConfig {
     executor: string;
     openhandsPython: string;
     openhandsTimeoutMs: number;
+    miniswePython: string;
+    minisweTimeoutMs: number;
     openhandsStuckGuardEnabled: boolean;
     openhandsStuckGuardExploreLimit: number;
     openhandsStuckGuardMinElapsedMs: number;
@@ -505,6 +507,18 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     10_000,
     asInt(
       parseIntEnv("WORKERPALS_OPENHANDS_TIMEOUT_MS") ?? workerNode.openhands_timeout_ms,
+      1_800_000,
+    ),
+  );
+  const workerMiniswePython = firstNonEmpty(
+    process.env.WORKERPALS_MINISWE_PYTHON,
+    asString(workerNode.miniswe_python, "python"),
+    "python",
+  );
+  const workerMinisweTimeoutMs = Math.max(
+    10_000,
+    asInt(
+      parseIntEnv("WORKERPALS_MINISWE_TIMEOUT_MS") ?? workerNode.miniswe_timeout_ms,
       1_800_000,
     ),
   );
@@ -960,6 +974,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       executor: workerExecutor,
       openhandsPython: workerOpenHandsPython,
       openhandsTimeoutMs: workerOpenHandsTimeoutMs,
+      miniswePython: workerMiniswePython,
+      minisweTimeoutMs: workerMinisweTimeoutMs,
       openhandsStuckGuardEnabled: workerOpenHandsStuckGuardEnabled,
       openhandsStuckGuardExploreLimit: workerOpenHandsStuckGuardExploreLimit,
       openhandsStuckGuardMinElapsedMs: workerOpenHandsStuckGuardMinElapsedMs,

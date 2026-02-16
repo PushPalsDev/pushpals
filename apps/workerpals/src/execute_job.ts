@@ -22,8 +22,21 @@ const QUALITY_CRITIC_TIMEOUT_MS = 45_000;
 const QUALITY_CRITIC_MIN_SCORE = 8;
 const QUALITY_CRITIC_MAX_DIFF_CHARS = 16_000;
 const QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8_000;
-const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
+const EXECUTOR_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 const CONFIG = loadPushPalsConfig();
+
+// ─── Executor backend resolution ────────────────────────────────────────────
+
+export type ExecutorBackend = "openhands" | "miniswe";
+
+export function resolveExecutor(): ExecutorBackend {
+  const raw = CONFIG.workerpals.executor.trim().toLowerCase() || "miniswe";
+  if (raw === "openhands" || raw === "miniswe") return raw;
+  console.warn(
+    `[WorkerPals] Unknown workerpals.executor="${raw}", falling back to "miniswe".`,
+  );
+  return "miniswe";
+}
 
 interface TaskExecutePlanning {
   intent: TaskExecuteIntent;
@@ -810,15 +823,7 @@ async function buildArchitectureDocument(
   return lines.join("\n").trim() + "\n";
 }
 
-function useOpenHandsExecutor(): boolean {
-  const executor = CONFIG.workerpals.executor.trim().toLowerCase() || "openhands";
-  if (executor !== "openhands") {
-    console.warn(
-      `[WorkerPals] Unsupported workerpals.executor="${executor}". Only "openhands" is supported.`,
-    );
-  }
-  return true;
-}
+// useOpenHandsExecutor() removed — replaced by resolveExecutor() at top of file.
 
 async function executeWithOpenHands(
   kind: string,
@@ -1127,8 +1132,8 @@ async function executeWithOpenHands(
     let parsed: Record<string, unknown> | null = null;
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i].trim();
-      if (!line.startsWith(OPENHANDS_RESULT_PREFIX)) continue;
-      const raw = line.slice(OPENHANDS_RESULT_PREFIX.length).trim();
+      if (!line.startsWith(EXECUTOR_RESULT_PREFIX)) continue;
+      const raw = line.slice(EXECUTOR_RESULT_PREFIX.length).trim();
       if (!raw) continue;
       try {
         parsed = JSON.parse(raw) as Record<string, unknown>;
@@ -1139,7 +1144,7 @@ async function executeWithOpenHands(
     }
 
     const filteredStdout = lines
-      .filter((line) => !line.trim().startsWith(OPENHANDS_RESULT_PREFIX))
+      .filter((line) => !line.trim().startsWith(EXECUTOR_RESULT_PREFIX))
       .join("\n")
       .trim();
 
@@ -1224,6 +1229,163 @@ async function executeWithOpenHands(
     if (stuckNudgeTimer) {
       clearInterval(stuckNudgeTimer);
     }
+  }
+}
+
+async function executeWithMiniSwe(
+  kind: string,
+  params: Record<string, unknown>,
+  repo: string,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  budgets?: { executionBudgetMs?: number; finalizationBudgetMs?: number },
+): Promise<JobResult> {
+  const pythonBin = CONFIG.workerpals.miniswePython || "python";
+  const scriptPath = resolve(import.meta.dir, "..", "scripts", "miniswe_executor.py");
+  if (!existsSync(scriptPath)) {
+    return {
+      ok: false,
+      summary: `mini-swe-agent wrapper script not found: ${scriptPath}`,
+      exitCode: 1,
+    };
+  }
+
+  const configuredTimeoutMs = Math.max(10_000, CONFIG.workerpals.minisweTimeoutMs);
+  const executionBudgetMs =
+    typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
+      ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
+      : null;
+  const timeoutMs =
+    executionBudgetMs != null
+      ? Math.min(configuredTimeoutMs, executionBudgetMs)
+      : configuredTimeoutMs;
+
+  if (executionBudgetMs != null && executionBudgetMs !== configuredTimeoutMs) {
+    onLog?.(
+      "stdout",
+      `[MiniSweExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, worker cap=${configuredTimeoutMs}ms).`,
+    );
+  }
+
+  const payload = {
+    kind,
+    params,
+    repo,
+  };
+  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString("base64");
+  const args = [pythonBin, scriptPath, payloadBase64];
+
+  onLog?.("stdout", `[MiniSweExecutor] Spawning mini-swe-agent executor (timeout=${timeoutMs}ms)`);
+
+  try {
+    const proc = Bun.spawn(args, {
+      cwd: repo,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        PUSHPALS_REPO_PATH: repo,
+      },
+    });
+
+    let timedOut = false;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      onLog?.("stdout", `[MiniSweExecutor] Timeout reached after ${timeoutMs}ms; terminating process.`);
+      proc.kill();
+    }, timeoutMs);
+
+    const [rawStdout, rawStderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    clearTimeout(timeoutTimer);
+
+    const stdout = rawStdout ?? "";
+    const stderr = rawStderr ?? "";
+
+    // Stream lines to onLog
+    for (const line of stdout.split(/\r?\n/)) {
+      if (line.trim() && !line.startsWith(EXECUTOR_RESULT_PREFIX)) {
+        onLog?.("stdout", line);
+      }
+    }
+    for (const line of stderr.split(/\r?\n/)) {
+      if (line.trim()) {
+        onLog?.("stderr", line);
+      }
+    }
+
+    // Parse structured result from sentinel
+    const lines = stdout.split(/\r?\n/);
+    let parsed: Record<string, unknown> | null = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line.startsWith(EXECUTOR_RESULT_PREFIX)) continue;
+      const raw = line.slice(EXECUTOR_RESULT_PREFIX.length).trim();
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        parsed = null;
+      }
+      break;
+    }
+
+    const filteredStdout = lines
+      .filter((l) => !l.trim().startsWith(EXECUTOR_RESULT_PREFIX))
+      .join("\n")
+      .trim();
+
+    const truncate = (s: string) =>
+      s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + "\n...[truncated]" : s;
+
+    if (!parsed) {
+      if (timedOut) {
+        return {
+          ok: false,
+          summary: `mini-swe-agent timed out after ${timeoutMs}ms`,
+          stdout: truncate(filteredStdout),
+          stderr: truncate(stderr),
+          exitCode: exitCode === 0 ? 124 : exitCode,
+        };
+      }
+      return {
+        ok: false,
+        summary: `mini-swe-agent wrapper did not return a structured result for ${kind}`,
+        stdout: truncate(filteredStdout),
+        stderr: truncate(stderr),
+        exitCode,
+      };
+    }
+
+    const summary =
+      typeof parsed.summary === "string"
+        ? parsed.summary
+        : exitCode === 0
+          ? `${kind} passed via mini-swe-agent`
+          : `${kind} failed via mini-swe-agent (exit ${exitCode})`;
+    const parsedStdout = typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout;
+    const parsedStderr = typeof parsed.stderr === "string" ? parsed.stderr : stderr;
+    const parsedExitCode =
+      typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
+        ? parsed.exitCode
+        : exitCode;
+    const parsedOk = typeof parsed.ok === "boolean" ? parsed.ok : parsedExitCode === 0;
+
+    return {
+      ok: parsedOk,
+      summary,
+      stdout: truncate(parsedStdout ?? ""),
+      stderr: truncate(parsedStderr ?? ""),
+      exitCode: parsedExitCode,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      summary: `mini-swe-agent wrapper execution error for ${kind}: ${String(err)}`,
+      exitCode: 1,
+    };
   }
 }
 
@@ -1827,10 +1989,12 @@ export async function executeJob(
       attemptParams.qualityRevisionAttempt = revisionAttempt;
     }
 
-    const result = await executeWithOpenHands(kind, attemptParams, repo, onLog, {
-      executionBudgetMs,
-      finalizationBudgetMs,
-    });
+    const executor = resolveExecutor();
+    const executeBudgets = { executionBudgetMs, finalizationBudgetMs };
+    const result =
+      executor === "openhands"
+        ? await executeWithOpenHands(kind, attemptParams, repo, onLog, executeBudgets)
+        : await executeWithMiniSwe(kind, attemptParams, repo, onLog, executeBudgets);
     if (!result.ok) return result;
 
     const quality = await runDeterministicQualityGate(repo, attemptParams, onLog);

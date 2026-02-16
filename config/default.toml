@@ -60,9 +60,11 @@ session_id = "remotebuddy-dev"
 [workerpals]
 poll_ms = 2000
 heartbeat_ms = 5000
-executor = "openhands"
+executor = "miniswe"
 openhands_python = "python"
 openhands_timeout_ms = 1800000
+miniswe_python = "python"
+miniswe_timeout_ms = 1800000
 openhands_stuck_guard_enabled = true
 openhands_stuck_guard_explore_limit = 18
 openhands_stuck_guard_min_elapsed_ms = 180000

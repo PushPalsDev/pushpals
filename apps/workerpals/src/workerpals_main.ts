@@ -18,7 +18,7 @@ import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import { resolve } from "path";
 import { detectRepoRoot, loadPromptTemplate, loadPushPalsConfig } from "shared";
-import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
+import { executeJob, shouldCommit, createJobCommit, git, resolveExecutor, type JobResult } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 
@@ -672,7 +672,7 @@ async function sendWorkerHeartbeat(
         capabilities: {
           docker: opts.docker,
           labels: opts.labels,
-          executor: "openhands",
+          executor: resolveExecutor(),
           requireDocker: opts.requireDocker,
         },
         details: {

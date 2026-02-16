@@ -170,3 +170,5 @@ config/local.toml
 /__pycache__
 /__pycache__/
 apps/worker/scripts/__pycache__
+
+.claude/

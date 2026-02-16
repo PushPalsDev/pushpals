@@ -17,6 +17,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { isAbsolute, relative, resolve } from "path";
 import { loadPushPalsConfig } from "shared";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
+import { resolveExecutor } from "./execute_job.js";
 
 const DEFAULT_OPENHANDS_MODEL = "local-model";
 const CONFIG = loadPushPalsConfig();
@@ -991,7 +992,7 @@ export class DockerExecutor {
   }
 
   private executionConfigSummary(job?: Job): string {
-    const backend = CONFIG.workerpals.executor.trim().toLowerCase() || "openhands";
+    const backend = resolveExecutor();
     const model = CONFIG.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
     const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
     const warmMemoryMb = CONFIG.workerpals.dockerWarmMemoryMb;
