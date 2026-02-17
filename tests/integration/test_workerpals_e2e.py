@@ -9,7 +9,7 @@ Run from repo root. Requires bun, git, node on PATH.
 Optional: If LM Studio is running and `lms` CLI is on PATH, captures LM Studio logs.
 
 This script is careful to:
-- Avoid EADDRINUSE: if a server is already running at SERVER_URL, reuse it.
+- Keep isolation by default: fail fast if a server is already running at SERVER_URL.
 - Kill processes it started on Ctrl+C / SIGTERM / normal exit (best-effort).
 
 NOTE: This version prints EVERYTHING to stdout/stderr (no per-process log files).
@@ -21,10 +21,10 @@ import atexit
 import importlib
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -33,7 +33,10 @@ from urllib.request import Request, urlopen
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 SERVER_URL = os.environ.get("PUSHPALS_SERVER_URL", "http://127.0.0.1:3001")
-STREAM_LLM_SERVER_LOGS = False
+STREAM_LLM_SERVER_LOGS = (
+    os.environ.get("WORKERPALS_E2E_STREAM_LLM_LOGS", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 SERVER_HEALTH_TIMEOUT_SEC = 60
 WARMUP_TIMEOUT_SEC = 60
 REQUEST_TIMEOUT_SEC = 10 * 60
@@ -44,9 +47,21 @@ REQUEST_PROMPT = os.environ.get(
     "WORKERPALS_E2E_PROMPT",
     "Append exactly one line 'WorkerPals E2E marker' to README.md and keep all other content unchanged.",
 )
+CLARIFICATION_RETRY_SUFFIX = (
+    "\n\nClarification: apply the requested change to README.md in the repository root. "
+    "Do not ask any other follow-up questions."
+)
 
 DEFAULT_PROFILE = os.environ.get("PUSHPALS_PROFILE", "dev")
 DEFAULT_SESSION_ID = os.environ.get("PUSHPALS_SESSION_ID", "dev")
+FAIL_IF_SERVER_RUNNING = (
+    os.environ.get("WORKERPALS_E2E_FAIL_IF_SERVER_RUNNING", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+KILL_SERVER_IF_RUNNING = (
+    os.environ.get("WORKERPALS_E2E_KILL_SERVER_IF_RUNNING", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 # Globals used by cleanup handlers
 server_proc = None
@@ -58,6 +73,56 @@ started_worker = False
 started_remotebuddy = False
 started_scm = False
 _CLEANED_UP = False
+
+
+def _now() -> float:
+    return time.perf_counter()
+
+
+def _fmt_secs(seconds: float) -> str:
+    return f"{max(0.0, seconds):.2f}s"
+
+
+def _print_duration(label: str, started_at: float) -> None:
+    print(f"[TIMER] {label}: {_fmt_secs(_now() - started_at)}")
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m}min {s}s"
+    if m > 0:
+        return f"{m}min {s}s"
+    return f"{s}s"
+
+
+class _ElapsedTicker:
+    def __init__(self, label: str, started_at: float):
+        self.label = label
+        self.started_at = started_at
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        def _run() -> None:
+            while not self._stop.wait(1.0):
+                elapsed = _fmt_elapsed(_now() - self.started_at)
+                sys.stdout.write(f"\r[TIMER] {self.label}: {elapsed}")
+                sys.stdout.flush()
+
+        self._thread = threading.Thread(target=_run, name="e2e-elapsed-ticker", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        elapsed = _fmt_elapsed(_now() - self.started_at)
+        # Pad to clear remnants from longer previous values.
+        sys.stdout.write(f"\r[TIMER] {self.label}: {elapsed}                     \n")
+        sys.stdout.flush()
 
 
 def _is_truthy(value: str) -> bool:
@@ -93,6 +158,31 @@ def _require_docker_available() -> None:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"Docker daemon is unavailable for docker E2E mode: {detail}")
+
+
+def _kill_existing_server_processes() -> None:
+    if sys.platform == "win32":
+        cmd = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { "
+            "  ($_.Name -ieq 'bun.exe' -or $_.Name -ieq 'node.exe') -and "
+            "  ($_.CommandLine -match 'apps[\\\\/]server' -or $_.CommandLine -match 'server:only') "
+            "} | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        subprocess.run(
+            ["pkill", "-f", "apps/server|server:only"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
 
 def _docker_image_exists(image: str) -> bool:
@@ -214,8 +304,7 @@ def _load_local_toml_for_llm(path: Path) -> None:
 # -----------------------------
 def start_lms_log_stream(source: str, extra_args: list[str] | None = None):
     """Starts `lms log stream` and prints output to stdout. Returns proc or None."""
-    if STREAM_LLM_SERVER_LOGS:
-        print(f"[NOTICE] Not starting LM Studio log stream for {source}...")
+    if not STREAM_LLM_SERVER_LOGS:
         return None
 
     from shutil import which
@@ -230,14 +319,14 @@ def start_lms_log_stream(source: str, extra_args: list[str] | None = None):
 
     try:
         if sys.platform == "win32":
-            cmd_str = " ".join(map(str, args))
+            # Use shell=False so proc.pid is the actual lms process.
             proc = subprocess.Popen(
-                cmd_str,
+                args,
                 cwd=str(REPO_ROOT),
                 env=DEFAULT_ENV,
                 stdout=None,  # inherit
                 stderr=None,  # inherit
-                shell=True,
+                shell=False,
                 text=True,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,  # type: ignore[attr-defined]
             )
@@ -263,14 +352,7 @@ def start_lms_log_stream(source: str, extra_args: list[str] | None = None):
 def stop_lms_log_stream(proc):
     if not proc:
         return
-    try:
-        proc.terminate()
-        proc.wait(timeout=3)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+    kill_proc_tree(proc)
 
 
 # -----------------------------
@@ -378,6 +460,44 @@ def get_completion(completion_id: str) -> dict | None:
     return None
 
 
+def list_workers(ttl_ms: int = 30000) -> list[dict]:
+    try:
+        payload = http_get(f"/workers?ttlMs={int(max(1000, ttl_ms))}")
+        workers = payload.get("workers", [])
+        if isinstance(workers, list):
+            return [w for w in workers if isinstance(w, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def wait_for_worker_online(worker_id: str, timeout_sec: float = 25.0) -> dict | None:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        for worker in list_workers():
+            if str(worker.get("workerId") or "") != worker_id:
+                continue
+            if bool(worker.get("isOnline")):
+                return worker
+        time.sleep(0.25)
+    return None
+
+
+def assert_only_worker_online(worker_id: str) -> None:
+    online = [
+        str(w.get("workerId") or "")
+        for w in list_workers()
+        if bool(w.get("isOnline")) and str(w.get("workerId") or "").strip()
+    ]
+    others = [wid for wid in online if wid != worker_id]
+    if others:
+        raise RuntimeError(
+            "Multiple online WorkerPals detected; this test requires exactly one online worker.\n"
+            f"expected={worker_id}\n"
+            f"online={online}"
+        )
+
+
 def find_completion_for_request(request_id: str, task_id: str) -> dict | None:
     try:
         cs = http_get("/completions?status=all&limit=200")
@@ -478,6 +598,26 @@ def extract_text_from_job_result(j: dict) -> str:
         if t.strip():
             return t
     return ""
+
+
+def _contains_clarification_signal(value: object) -> bool:
+    text = str(value or "").lower()
+    return (
+        "clarification" in text
+        or "clarify" in text
+        or "follow-up question" in text
+        or "requested clarification" in text
+    )
+
+
+def _request_failed_due_to_clarification(req: dict | None) -> bool:
+    if not isinstance(req, dict):
+        return False
+    if _contains_clarification_signal(req.get("error")):
+        return True
+    if _contains_clarification_signal(req.get("result")):
+        return True
+    return _contains_clarification_signal(json.dumps(req, ensure_ascii=False))
 
 
 # -----------------------------
@@ -626,12 +766,17 @@ def main():
     global started_server, started_worker, started_remotebuddy, started_scm
 
     install_cleanup_handlers()
+    total_started_at = _now()
 
+    run_session_id = f"{DEFAULT_SESSION_ID}-e2e-{int(time.time())}-{os.getpid()}"
     print("PushPals E2E test: starting server + remotebuddy + workerpals (no SCM)")
+    print(f"[NOTICE] E2E session: {run_session_id}")
     if E2E_USE_DOCKER:
         print("[NOTICE] WorkerPals E2E running in Docker executor mode.")
+        docker_ready_started_at = _now()
         _require_docker_available()
         _ensure_docker_image(E2E_DOCKER_IMAGE_EFFECTIVE)
+        _print_duration("docker readiness (daemon + image)", docker_ready_started_at)
     else:
         print("[NOTICE] WorkerPals E2E running in direct host executor mode.")
 
@@ -647,13 +792,32 @@ def main():
     started_remotebuddy = False
     started_scm = False
 
-    if server_already_running:
-        print(f"[NOTICE] Server already running at {SERVER_URL}; will not start a new server process.")
+    if server_already_running and KILL_SERVER_IF_RUNNING:
+        print(f"[NOTICE] Server already running at {SERVER_URL}; killing existing server processes...")
+        _kill_existing_server_processes()
+        if not wait_for_server_down(8.0):
+            raise RuntimeError(
+                "Tried to kill existing server processes, but server still responds.\n"
+                f"server={SERVER_URL}\n"
+                "Stop the existing stack manually, then rerun the integration test."
+            )
+        server_already_running = False
+
+    if server_already_running and FAIL_IF_SERVER_RUNNING:
+        online_workers = [str(w.get("workerId") or "") for w in list_workers() if bool(w.get("isOnline"))]
+        raise RuntimeError(
+            "Server is already running; refusing to reuse it for integration test isolation.\n"
+            f"server={SERVER_URL}\n"
+            f"online_workers={online_workers}\n"
+            "Stop the existing stack, set WORKERPALS_E2E_KILL_SERVER_IF_RUNNING=1, "
+            "or set WORKERPALS_E2E_FAIL_IF_SERVER_RUNNING=0."
+        )
 
     try:
         # LM Studio logs (optional): stream to stdout
-        lms_server_log_proc = start_lms_log_stream("server", extra_args=["--json"])
-        lms_model_log_proc = start_lms_log_stream("model", extra_args=["--filter", "input,output", "--json"])
+        if STREAM_LLM_SERVER_LOGS:
+            lms_server_log_proc = start_lms_log_stream("server", extra_args=["--json"])
+            lms_model_log_proc = start_lms_log_stream("model", extra_args=["--filter", "input,output", "--json"])
 
         if not server_already_running:
             server_proc = start_process(["bun", "run", "server:only"])
@@ -661,11 +825,12 @@ def main():
 
         # Start RemoteBuddy (SCM intentionally omitted for this test).
         remotebuddy_proc = start_process(
-            ["bun", "run", "remotebuddy:only", "--", "--sessionId", DEFAULT_SESSION_ID],
+            ["bun", "run", "remotebuddy:only", "--", "--sessionId", run_session_id],
         )
         started_remotebuddy = True
 
         print("Waiting for server health...")
+        server_health_started_at = _now()
         deadline = time.time() + SERVER_HEALTH_TIMEOUT_SEC
         while time.time() < deadline:
             if server_proc:
@@ -675,6 +840,7 @@ def main():
                 break
         else:
             raise RuntimeError(f"server start timeout (url={SERVER_URL})")
+        _print_duration("server health wait", server_health_started_at)
 
         if E2E_USE_DOCKER:
             backends_to_try = ["openhands", "miniswe"]
@@ -689,11 +855,13 @@ def main():
         attempted = 0
 
         for backend in backends_to_try:
+            backend_started_at = _now()
             attempted += 1
             print("\n==============================")
             print(f"RUNNING BACKEND: {backend}")
             print("==============================\n")
 
+            worker_id = f"e2e-{backend}-{int(time.time() * 1000) % 100000000:08d}"
             worker_env = {"WORKERPALS_EXECUTOR": backend}
             worker_cmd = [
                 "bun",
@@ -708,6 +876,8 @@ def main():
                 "1000",
                 "--heartbeat",
                 "2000",
+                "--workerId",
+                worker_id,
             ]
             if E2E_USE_DOCKER:
                 worker_cmd.extend(["--docker", "--require-docker"])
@@ -723,11 +893,19 @@ def main():
             started_worker = True
 
             try:
+                worker_online = wait_for_worker_online(worker_id, timeout_sec=25.0)
+                if not worker_online:
+                    raise RuntimeError(f"Worker {worker_id} did not report online in time")
+                assert_only_worker_online(worker_id)
+
+                warmup_started_at = _now()
                 print(f"Server healthy — enqueueing warmup job ({backend})")
                 warmup_body = {
-                    "taskId": f"test-workerpal-e2e-warmup-{backend}",
+                    "taskId": f"test-workerpal-e2e-warmup-{backend}-{worker_id}",
+                    "sessionId": run_session_id,
                     "kind": "warmup.execute",
                     "params": {},
+                    "targetWorkerId": worker_id,
                 }
                 enq = http_post("/jobs/enqueue", warmup_body)
                 if not enq.get("ok") or not enq.get("jobId"):
@@ -737,30 +915,37 @@ def main():
 
                 deadline = time.time() + WARMUP_TIMEOUT_SEC
                 last = None
-                while time.time() < deadline:
-                    if server_proc:
-                        assert_proc_alive(server_proc, "server")
-                    assert_proc_alive(remotebuddy_proc, "remotebuddy")
-                    assert_proc_alive(worker_proc, "workerpals")
+                warmup_ticker = _ElapsedTicker(f"{backend} warmup waiting", warmup_started_at)
+                warmup_ticker.start()
+                try:
+                    while time.time() < deadline:
+                        if server_proc:
+                            assert_proc_alive(server_proc, "server")
+                        assert_proc_alive(remotebuddy_proc, "remotebuddy")
+                        assert_proc_alive(worker_proc, "workerpals")
 
-                    j = get_job(warmup_job_id)
-                    if j:
-                        st = j.get("status")
-                        if st != last:
-                            print(f"  job status: {st}")
-                            last = st
-                        if st == "failed":
-                            raise RuntimeError(f"Warmup job failed ({backend}): {j.get('error') or j}")
-                        if st == "completed":
-                            print("[OK] warmup.execute completed")
-                            break
-                    time.sleep(POLL_INTERVAL_SEC)
-                else:
-                    raise RuntimeError(f"Warmup job did not complete in time ({backend})")
+                        j = get_job(warmup_job_id)
+                        if j:
+                            st = j.get("status")
+                            if st != last:
+                                print(f"  job status: {st}")
+                                last = st
+                            if st == "failed":
+                                raise RuntimeError(f"Warmup job failed ({backend}): {j.get('error') or j}")
+                            if st == "completed":
+                                print("[OK] warmup.execute completed")
+                                _print_duration(f"{backend} warmup.execute", warmup_started_at)
+                                break
+                        time.sleep(POLL_INTERVAL_SEC)
+                    else:
+                        raise RuntimeError(f"Warmup job did not complete in time ({backend})")
+                finally:
+                    warmup_ticker.stop()
 
                 print("\n==============================")
                 print(f"PHASE B: REMOTEBUDDY REQUEST -> COMPLETION INTERCEPT ({backend})")
                 print("==============================\n")
+                phase_b_started_at = _now()
 
                 completions_before = http_get("/completions?status=all&limit=500").get("completions", [])
                 existing_completion_ids = {
@@ -768,7 +953,7 @@ def main():
                 }
 
                 request_body = {
-                    "sessionId": DEFAULT_SESSION_ID,
+                    "sessionId": run_session_id,
                     "prompt": REQUEST_PROMPT,
                     "priority": "normal",
                     "forceWorker": True,
@@ -780,57 +965,89 @@ def main():
                 if not enq_req.get("ok") or not request_id:
                     raise RuntimeError(f"Failed to enqueue request: {enq_req}")
                 print(f"Enqueued request {request_id}")
+                clarification_retried = False
 
                 deadline = time.time() + REQUEST_TIMEOUT_SEC
                 last_request_status = None
                 intercepted_completion: dict | None = None
+                phase_b_ticker = _ElapsedTicker(f"{backend} phase B waiting", phase_b_started_at)
+                phase_b_ticker.start()
 
-                while time.time() < deadline:
-                    if server_proc:
-                        assert_proc_alive(server_proc, "server")
-                    assert_proc_alive(remotebuddy_proc, "remotebuddy")
-                    assert_proc_alive(worker_proc, "workerpals")
+                try:
+                    while time.time() < deadline:
+                        if server_proc:
+                            assert_proc_alive(server_proc, "server")
+                        assert_proc_alive(remotebuddy_proc, "remotebuddy")
+                        assert_proc_alive(worker_proc, "workerpals")
 
-                    req = get_request(str(request_id))
-                    if req:
-                        req_status = req.get("status")
-                        if req_status != last_request_status:
-                            print(f"  request status: {req_status}")
-                            last_request_status = req_status
-                        if req_status == "failed":
-                            raise RuntimeError(f"Request failed ({backend}): {req.get('error') or req}")
+                        req = get_request(str(request_id))
+                        if req:
+                            req_status = req.get("status")
+                            if req_status != last_request_status:
+                                print(f"  request status: {req_status}")
+                                last_request_status = req_status
+                            if req_status == "failed":
+                                if (not clarification_retried) and _request_failed_due_to_clarification(req):
+                                    clarification_retried = True
+                                    clarification_prompt = REQUEST_PROMPT + CLARIFICATION_RETRY_SUFFIX
+                                    retry_body = {
+                                        "sessionId": run_session_id,
+                                        "prompt": clarification_prompt,
+                                        "priority": "normal",
+                                        "forceWorker": True,
+                                        "forceLane": "openhands",
+                                    }
+                                    print(
+                                        "[NOTICE] Clarification requested by worker. "
+                                        "Sending one clarification retry with explicit instruction."
+                                    )
+                                    retry_enq = http_post("/requests/enqueue", retry_body)
+                                    retry_request_id = retry_enq.get("requestId")
+                                    if not retry_enq.get("ok") or not retry_request_id:
+                                        raise RuntimeError(
+                                            f"Clarification retry enqueue failed ({backend}): {retry_enq}"
+                                        )
+                                    request_id = retry_request_id
+                                    last_request_status = None
+                                    print(f"Enqueued clarification retry request {request_id}")
+                                    continue
+                                raise RuntimeError(f"Request failed ({backend}): {req.get('error') or req}")
 
-                    completions = http_get("/completions?status=all&limit=500").get("completions", [])
-                    for c in completions:
-                        if not isinstance(c, dict):
-                            continue
-                        completion_id = str(c.get("id") or "")
-                        if not completion_id or completion_id in existing_completion_ids:
-                            continue
-                        if str(c.get("sessionId") or "") != DEFAULT_SESSION_ID:
-                            continue
-                        intercepted_completion = c
-                        break
+                        completions = http_get("/completions?status=all&limit=500").get("completions", [])
+                        for c in completions:
+                            if not isinstance(c, dict):
+                                continue
+                            completion_id = str(c.get("id") or "")
+                            if not completion_id or completion_id in existing_completion_ids:
+                                continue
+                            if str(c.get("sessionId") or "") != run_session_id:
+                                continue
+                            intercepted_completion = c
+                            break
 
-                    if intercepted_completion:
-                        break
+                        if intercepted_completion:
+                            break
 
-                    time.sleep(POLL_INTERVAL_SEC)
+                        time.sleep(POLL_INTERVAL_SEC)
 
-                if not intercepted_completion:
-                    raise RuntimeError(
-                        "Did not observe a new completion enqueue (SCM-bound payload).\n"
-                        f"backend={backend} request_id={request_id} last_request_status={last_request_status}\n"
-                    )
+                    if not intercepted_completion:
+                        raise RuntimeError(
+                            "Did not observe a new completion enqueue (SCM-bound payload).\n"
+                            f"backend={backend} request_id={request_id} last_request_status={last_request_status}\n"
+                        )
+                finally:
+                    phase_b_ticker.stop()
 
                 print("\n===== INTERCEPTED COMPLETION (to SCM queue) =====")
                 print(json.dumps(intercepted_completion, indent=2, ensure_ascii=False))
                 print(f"[OK] Backend {backend} produced a completion enqueue for SCM.")
+                _print_duration(f"{backend} phase B completion intercept", phase_b_started_at)
 
             except Exception as backend_exc:
                 failures.append(f"{backend}: {backend_exc}")
                 print(f"[FAIL] Backend {backend}: {backend_exc}")
             finally:
+                _print_duration(f"{backend} total runtime", backend_started_at)
                 if worker_proc and started_worker:
                     kill_proc_tree(worker_proc)
                     worker_proc = None
@@ -843,6 +1060,7 @@ def main():
             raise RuntimeError("One or more backend runs failed:\n- " + "\n- ".join(failures))
 
         print("Done — PushPals E2E intercepted SCM-bound completion payload(s)")
+        _print_duration("overall test runtime", total_started_at)
     finally:
         cleanup()
 
