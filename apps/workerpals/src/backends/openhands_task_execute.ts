@@ -486,11 +486,11 @@ export async function executeWithOpenHands(
       const clarificationQuestion = extractClarificationQuestionFromOutput(filteredStdout);
       if (clarificationQuestion) {
         return {
-          ok: false,
-          summary: "OpenHands requested clarification before making file changes",
+          ok: true,
+          summary: `OpenHands needs clarification: ${clarificationQuestion}`,
           stdout: truncate(filteredStdout || String(parsedStdout ?? "")),
           stderr: truncate(`Clarification needed: ${clarificationQuestion}`),
-          exitCode: 3,
+          exitCode: 0,
         };
       }
     }

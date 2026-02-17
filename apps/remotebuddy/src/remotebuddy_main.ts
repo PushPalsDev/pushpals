@@ -380,6 +380,15 @@ function isNoChangeCompletionSummary(summary: string): boolean {
   );
 }
 
+function extractClarificationFromCompletionSummary(summary: string): string | null {
+  const normalized = String(summary ?? "").trim();
+  if (!normalized) return null;
+  const match = normalized.match(/^OpenHands needs clarification:\s*(.+)$/i);
+  if (!match) return null;
+  const question = match[1]?.trim();
+  return question ? question : null;
+}
+
 class RemoteBuddyOrchestrator {
   private readonly agentId = "remotebuddy-orchestrator";
   private readonly server: string;
@@ -665,9 +674,12 @@ class RemoteBuddyOrchestrator {
 
         this.pushContext(`[job_completed ${jobId}] ${summary}`);
         const shortJob = jobId.slice(0, 8);
-        const note = isNoChangeCompletionSummary(summary)
-          ? `WorkerPal job ${shortJob} completed: ${summary}. No files were changed, so no commit was created.`
-          : `WorkerPal job ${shortJob} completed: ${summary}.`;
+        const clarificationQuestion = extractClarificationFromCompletionSummary(summary);
+        const note = clarificationQuestion
+          ? `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationQuestion}\n\nPlease reply with the missing details and I will enqueue a follow-up request.`
+          : isNoChangeCompletionSummary(summary)
+            ? `WorkerPal job ${shortJob} completed: ${summary}. No files were changed, so no commit was created.`
+            : `WorkerPal job ${shortJob} completed: ${summary}.`;
         void this.comm.assistantMessage(note, {
           correlationId: envelope.correlationId,
           turnId: envelope.turnId,
