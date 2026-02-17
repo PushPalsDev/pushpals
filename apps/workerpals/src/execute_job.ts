@@ -17,19 +17,13 @@ import {
 } from "./common/constants.js";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { JobResult } from "./common/types.js";
-import {
-  compactJobOutput,
-  truncate,
-} from "./common/execution_utils.js";
+import { compactJobOutput, truncate } from "./common/execution_utils.js";
 // Re-export shared utilities for backward compatibility with external consumers.
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
-import {
-  getBackendTaskExecutor,
-} from "./backends/task_execute_registry.js";
+import { getBackendTaskExecutor } from "./backends/task_execute_registry.js";
 
 const DEFAULT_CONFIG = loadPushPalsConfig();
-
 
 interface TaskExecutePlanning {
   intent: TaskExecuteIntent;
@@ -81,13 +75,11 @@ interface CriticReview {
   raw: string;
 }
 
-
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 export function shouldCommit(kind: string): boolean {
   return FILE_MODIFYING_JOBS.has(kind);
 }
-
 
 function toSingleLine(value: unknown, max = 240): string {
   const text = String(value ?? "")
@@ -161,14 +153,17 @@ async function runShellValidationCommand(
     stderr: "pipe",
   });
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    try {
-      proc.kill();
-    } catch {
-      // ignore
-    }
-  }, Math.max(1_000, timeoutMs));
+  const timer = setTimeout(
+    () => {
+      timedOut = true;
+      try {
+        proc.kill();
+      } catch {
+        // ignore
+      }
+    },
+    Math.max(1_000, timeoutMs),
+  );
 
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -242,7 +237,9 @@ function isTestFocusedTask(
   targetPath?: string,
 ): boolean {
   const lowerInstruction = instruction.toLowerCase();
-  if (/\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/.test(lowerInstruction)) {
+  if (
+    /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/.test(lowerInstruction)
+  ) {
     return true;
   }
   if (targetPath && isLikelyTestPath(targetPath)) return true;
@@ -269,7 +266,8 @@ function isTestFocusedTask(
 }
 
 function hasBalancedPositiveNegativeAssertions(paths: string[], repo: string): boolean {
-  const negativeSignal = /\b(invalid|negative|error|throw|reject|null|undefined|non[- ]?existent|toThrow|toBeNull|toBeUndefined|<\s*0|<=\s*0)\b/i;
+  const negativeSignal =
+    /\b(invalid|negative|error|throw|reject|null|undefined|non[- ]?existent|toThrow|toBeNull|toBeUndefined|<\s*0|<=\s*0)\b/i;
   let positiveAssertions = 0;
   let negativeAssertions = 0;
 
@@ -318,7 +316,10 @@ async function runDeterministicQualityGate(
   if (changedTestPaths.length === 0) {
     issues.push("No relevant test file was modified for this test-focused task.");
   }
-  if (changedTestPaths.length > 0 && !hasBalancedPositiveNegativeAssertions(changedTestPaths, repo)) {
+  if (
+    changedTestPaths.length > 0 &&
+    !hasBalancedPositiveNegativeAssertions(changedTestPaths, repo)
+  ) {
     issues.push(
       "Changed test files do not show both positive and negative assertion coverage (expected both).",
     );
@@ -336,7 +337,11 @@ async function runDeterministicQualityGate(
   } else {
     for (const command of runnableSteps) {
       onLog?.("stdout", `[QualityGate] Quality gate validation: running "${command}"`);
-      const run = await runShellValidationCommand(repo, command, QUALITY_VALIDATION_STEP_TIMEOUT_MS);
+      const run = await runShellValidationCommand(
+        repo,
+        command,
+        QUALITY_VALIDATION_STEP_TIMEOUT_MS,
+      );
       validationRuns.push(run);
       const runSummary = `[QualityGate] Quality gate validation ${run.ok ? "passed" : "failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
       onLog?.(run.ok ? "stdout" : "stderr", runSummary);
@@ -344,7 +349,9 @@ async function runDeterministicQualityGate(
     if (validationRuns.every((run) => !run.ok)) {
       issues.push("Validation commands were executed but none passed.");
     }
-    if (!validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))) {
+    if (
+      !validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))
+    ) {
       issues.push("Validation steps did not execute a recognizable test command.");
     }
   }
@@ -695,7 +702,6 @@ async function buildArchitectureDocument(
   return lines.join("\n").trim() + "\n";
 }
 
-
 /** Execute a git command and return stdout */
 export async function git(
   cwd: string,
@@ -719,7 +725,6 @@ export async function git(
     return { ok: false, stdout: "", stderr: String(err) };
   }
 }
-
 
 // ─── Git commit creation ─────────────────────────────────────────────────────
 
@@ -1154,7 +1159,10 @@ function validateTaskExecutePlanning(
     return { ok: false, message: "task.execute planning.scope.writeGlobs must be a string array" };
   }
   if (scope.forbiddenGlobs !== undefined && !isStringArray(scope.forbiddenGlobs)) {
-    return { ok: false, message: "task.execute planning.scope.forbiddenGlobs must be a string array" };
+    return {
+      ok: false,
+      message: "task.execute planning.scope.forbiddenGlobs must be a string array",
+    };
   }
   if (
     scope.maxFilesToEdit !== undefined &&
@@ -1164,23 +1172,39 @@ function validateTaskExecutePlanning(
   }
 
   if (planning.discovery !== undefined) {
-    if (!planning.discovery || typeof planning.discovery !== "object" || Array.isArray(planning.discovery)) {
+    if (
+      !planning.discovery ||
+      typeof planning.discovery !== "object" ||
+      Array.isArray(planning.discovery)
+    ) {
       return { ok: false, message: "task.execute planning.discovery must be an object" };
     }
     const discovery = planning.discovery as Record<string, unknown>;
     if (!isStringArray(discovery.ripgrepQueries)) {
-      return { ok: false, message: "task.execute planning.discovery.ripgrepQueries must be a string array" };
+      return {
+        ok: false,
+        message: "task.execute planning.discovery.ripgrepQueries must be a string array",
+      };
     }
     if (discovery.likelyDirs !== undefined && !isStringArray(discovery.likelyDirs)) {
-      return { ok: false, message: "task.execute planning.discovery.likelyDirs must be a string array" };
+      return {
+        ok: false,
+        message: "task.execute planning.discovery.likelyDirs must be a string array",
+      };
     }
     if (discovery.keywords !== undefined && !isStringArray(discovery.keywords)) {
-      return { ok: false, message: "task.execute planning.discovery.keywords must be a string array" };
+      return {
+        ok: false,
+        message: "task.execute planning.discovery.keywords must be a string array",
+      };
     }
   }
 
   if (!isStringArray(planning.acceptanceCriteria)) {
-    return { ok: false, message: "task.execute planning.acceptanceCriteria must be a string array" };
+    return {
+      ok: false,
+      message: "task.execute planning.acceptanceCriteria must be a string array",
+    };
   }
   if (!isStringArray(planning.validationSteps)) {
     return { ok: false, message: "task.execute planning.validationSteps must be a string array" };
@@ -1188,7 +1212,8 @@ function validateTaskExecutePlanning(
   if ((planning.acceptanceCriteria as string[]).length === 0) {
     return {
       ok: false,
-      message: "task.execute planning.acceptanceCriteria must include at least one acceptance criterion",
+      message:
+        "task.execute planning.acceptanceCriteria must include at least one acceptance criterion",
     };
   }
   if ((planning.validationSteps as string[]).length === 0) {

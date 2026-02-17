@@ -10,9 +10,7 @@ import { existsSync } from "fs";
 import { resolve } from "path";
 import type { JobResult } from "../common/types.js";
 import type { WorkerpalsRuntimeConfig } from "../common/executor_backend.js";
-import {
-  EXECUTOR_RESULT_PREFIX,
-} from "../common/constants.js";
+import { EXECUTOR_RESULT_PREFIX } from "../common/constants.js";
 import {
   truncate,
   streamLines,
@@ -81,10 +79,7 @@ function classifyFileEditorSummary(line: string): "explore" | "progress" | null 
   return null;
 }
 
-const OPENHANDS_NO_CHANGE_SIGNAL = [
-  "no file changes detected",
-  "no modified files were detected",
-];
+const OPENHANDS_NO_CHANGE_SIGNAL = ["no file changes detected", "no modified files were detected"];
 
 const CLARIFICATION_SIGNAL_REGEX =
   /\b(clarif(?:y|ication)|need to know which|could you clarify|please clarify|which .* would you like|let me ask for clarification)\b/i;
@@ -183,7 +178,8 @@ export async function executeWithOpenHands(
   const { leadMs: timeoutWarningLeadMs, delayMs: timeoutWarningDelayMs } =
     computeTimeoutWarningWindow(timeoutMs);
   const finalizationBudgetMs =
-    typeof budgets?.finalizationBudgetMs === "number" && Number.isFinite(budgets.finalizationBudgetMs)
+    typeof budgets?.finalizationBudgetMs === "number" &&
+    Number.isFinite(budgets.finalizationBudgetMs)
       ? Math.max(10_000, Math.floor(budgets.finalizationBudgetMs))
       : 0;
   const activityExtensionMs = Math.min(finalizationBudgetMs, 10 * 60_000);
@@ -390,7 +386,11 @@ export async function executeWithOpenHands(
       timeoutTimer = setTimeout(() => {
         const nowMs = Date.now();
         const quietForMs = nowMs - lastActivityAtMs;
-        if (extendedByActivityMs === 0 && activityExtensionMs > 0 && quietForMs <= activityWindowMs) {
+        if (
+          extendedByActivityMs === 0 &&
+          activityExtensionMs > 0 &&
+          quietForMs <= activityWindowMs
+        ) {
           extendedByActivityMs = activityExtensionMs;
           timeoutDeadlineMs = nowMs + activityExtensionMs;
           onLog?.(

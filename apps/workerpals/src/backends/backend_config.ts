@@ -46,9 +46,10 @@ function loadBackendToml(): BackendTomlShape {
 const config = loadBackendToml();
 const backendEntries = Object.entries(config.backends ?? {});
 
-export const BACKEND_EXECUTOR_SCRIPT_SEGMENTS: Record<string, readonly string[]> = Object.fromEntries(
-  backendEntries.map(([name, spec]) => [name, toStrings(spec?.script_segments)]),
-);
+export const BACKEND_EXECUTOR_SCRIPT_SEGMENTS: Record<string, readonly string[]> =
+  Object.fromEntries(
+    backendEntries.map(([name, spec]) => [name, toStrings(spec?.script_segments)]),
+  );
 
 export const EXECUTOR_BACKENDS = Object.keys(BACKEND_EXECUTOR_SCRIPT_SEGMENTS) as ExecutorBackend[];
 
@@ -56,7 +57,7 @@ export const DEFAULT_EXECUTOR = (
   typeof config.default_backend === "string" &&
   EXECUTOR_BACKENDS.includes(config.default_backend as ExecutorBackend)
     ? config.default_backend
-    : EXECUTOR_BACKENDS[0] ?? FALLBACK_DEFAULT_EXECUTOR
+    : (EXECUTOR_BACKENDS[0] ?? FALLBACK_DEFAULT_EXECUTOR)
 ) as ExecutorBackend;
 
 export const SHARED_DOCKER_PASSTHROUGH_ENV = toStrings(config.env?.shared_passthrough);
@@ -97,7 +98,9 @@ for (const backend of DOCKER_BACKENDS) {
   registerBackendTaskExecutor(backend.name, backend.taskExecute);
 }
 
-export function getBackendTaskExecutorFromSpec(name: ExecutorBackend): BackendTaskExecutor | undefined {
+export function getBackendTaskExecutorFromSpec(
+  name: ExecutorBackend,
+): BackendTaskExecutor | undefined {
   const spec = DOCKER_BACKENDS.find((entry) => entry.name === name);
   return spec?.taskExecute ?? undefined;
 }

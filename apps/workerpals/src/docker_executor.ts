@@ -159,14 +159,24 @@ export class DockerExecutor {
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
-    this.warmSetupMaxAttempts = parseClampedInt(this.config.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
+    this.warmSetupMaxAttempts = parseClampedInt(
+      this.config.workerpals.dockerWarmMaxAttempts,
+      3,
+      1,
+      5,
+    );
     this.warmSetupBackoffMs = parseClampedInt(
       this.config.workerpals.dockerWarmRetryBackoffMs,
       2_000,
       250,
       60_000,
     );
-    this.jobRetryMaxAttempts = parseClampedInt(this.config.workerpals.dockerJobMaxAttempts, 2, 1, 3);
+    this.jobRetryMaxAttempts = parseClampedInt(
+      this.config.workerpals.dockerJobMaxAttempts,
+      2,
+      1,
+      3,
+    );
     this.jobRetryBackoffMs = parseClampedInt(
       this.config.workerpals.dockerJobRetryBackoffMs,
       3_000,
@@ -409,7 +419,9 @@ export class DockerExecutor {
       };
       const python = String(workerCfg[keys.pythonKey] ?? "python").trim() || "python";
       const timeoutRaw = Number(workerCfg[keys.timeoutKey]);
-      const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(10_000, Math.floor(timeoutRaw)) : 300_000;
+      const timeoutMs = Number.isFinite(timeoutRaw)
+        ? Math.max(10_000, Math.floor(timeoutRaw))
+        : 300_000;
       runtimeConfig[backend.name] = { python, timeoutMs };
     }
     return runtimeConfig;
@@ -445,7 +457,10 @@ export class DockerExecutor {
     };
     for (const backend of DOCKER_BACKENDS) {
       const name = backend.name.toUpperCase();
-      fixedEnv[`WORKERPALS_${name}_PYTHON`] = this.containerBackendPython(backend.name, runtimeConfig);
+      fixedEnv[`WORKERPALS_${name}_PYTHON`] = this.containerBackendPython(
+        backend.name,
+        runtimeConfig,
+      );
       fixedEnv[`WORKERPALS_${name}_TIMEOUT_MS`] = String(backend.timeoutMs(runtimeConfig));
     }
     if (this.config.workerpals.llm.apiKey.trim()) {
@@ -541,13 +556,7 @@ export class DockerExecutor {
 
     const startupCmd = backendSpec.warmContainerStartupCommand(warmContext);
 
-    args.push(
-      "--entrypoint",
-      "/bin/sh",
-      this.options.imageName,
-      "-lc",
-      startupCmd,
-    );
+    args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
 
     const proc = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
     const [exitCode, stdout, stderr] = await Promise.all([
@@ -849,8 +858,7 @@ export class DockerExecutor {
     ];
 
     console.log(
-      `[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary(
-      )})`,
+      `[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary()})`,
     );
 
     const proc = Bun.spawn(["docker", ...args], {
@@ -1077,7 +1085,9 @@ export class DockerExecutor {
     const stdout = stdoutLines.join("\n");
     const stderr = stderrLines.join("\n");
     if (sawSentinel) {
-      const details = [`Malformed ___RESULT___ payload: ${sentinelParseError || "unknown parse error"}`];
+      const details = [
+        `Malformed ___RESULT___ payload: ${sentinelParseError || "unknown parse error"}`,
+      ];
       if (stderr) details.push(stderr);
       return {
         ok: false,
@@ -1168,7 +1178,8 @@ export class DockerExecutor {
       await spec.ensureWarmRuntime({
         ...warmContext,
         warmContainerName: this.warmContainerName,
-        runWarmShell: (command: string): Promise<DockerWarmShellResult> => this.runWarmShell(command),
+        runWarmShell: (command: string): Promise<DockerWarmShellResult> =>
+          this.runWarmShell(command),
         restartWarmContainer: async () => {
           await this.startWarmContainer();
         },

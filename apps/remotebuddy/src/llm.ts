@@ -133,7 +133,8 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
     firstNonEmpty(opts.apiKey, serviceLlmConfig.apiKey, backend === "lmstudio" ? "lmstudio" : "") ??
     "";
   const sessionId =
-    firstNonEmpty(opts.sessionId, serviceLlmConfig.sessionId, config.sessionId, "default") ?? "default";
+    firstNonEmpty(opts.sessionId, serviceLlmConfig.sessionId, config.sessionId, "default") ??
+    "default";
 
   return {
     backend,
@@ -375,7 +376,10 @@ export class LmStudioClient implements LLMClient {
     this.sessionTag = stableConversationTag(opts?.service ?? "remotebuddy", opts?.sessionId);
     const lmStudio = opts?.lmStudio;
     this.contextWindow = Math.max(512, lmStudio?.contextWindow ?? DEFAULT_LMSTUDIO_CONTEXT_WINDOW);
-    this.minOutputTokens = Math.max(64, lmStudio?.minOutputTokens ?? DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS);
+    this.minOutputTokens = Math.max(
+      64,
+      lmStudio?.minOutputTokens ?? DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS,
+    );
     this.tokenSafetyMargin = Math.max(
       16,
       lmStudio?.tokenSafetyMargin ?? DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN,
@@ -731,21 +735,16 @@ export class LmStudioClient implements LLMClient {
 
     if (promptTokensEstimate > promptTokenBudget) {
       try {
-        const packed = await this.packContextInBatches(
-          fullMessages,
-          promptTokenBudget,
-        );
+        const packed = await this.packContextInBatches(fullMessages, promptTokenBudget);
         messages = packed.messages;
         packedChunkCount = packed.chunkCount;
         promptTokensEstimate = sumEstimatedTokens(messages);
         if (promptTokensEstimate > promptTokenBudget && messages.length > 0) {
           const packedSystem = messages[0]?.content ?? "";
-          const packedInput = messages
-            .slice(1)
-            .map((message) => ({
-              role: message.role as LLMMessage["role"],
-              content: message.content,
-            }));
+          const packedInput = messages.slice(1).map((message) => ({
+            role: message.role as LLMMessage["role"],
+            content: message.content,
+          }));
           const packedTrimmed = trimLmStudioMessagesToBudget(
             packedSystem,
             packedInput,
@@ -770,10 +769,7 @@ export class LmStudioClient implements LLMClient {
 
     const safeMaxTokens = Math.max(
       64,
-      Math.min(
-        desiredMaxTokens,
-        contextWindow - promptTokensEstimate - this.tokenSafetyMargin,
-      ),
+      Math.min(desiredMaxTokens, contextWindow - promptTokensEstimate - this.tokenSafetyMargin),
     );
 
     if (packedChunkCount > 1) {

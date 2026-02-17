@@ -15,20 +15,20 @@ export type PlannerLane = "deterministic" | "openhands";
 export interface PlannerOutput {
   intent: PlannerIntent; // this is the high level goal, e.g. "fix bug with login"
   requires_worker: boolean; // if false, the agent can do it themselves and doesn't need to delegate to a worker
-  job_kind: "task.execute" | "none"; 
+  job_kind: "task.execute" | "none";
   lane: PlannerLane; // if requires_worker is true, this is the type of worker needed, e.g. "openhands"
   // constraints + discovery hints
   scope: {
-    read_anywhere: boolean;          // usually true, default: true
-    write_allowed: boolean;          // often false unless requested, default: true
-    write_globs?: string[];          // if you want to constrain edits, default: true
-    forbidden_globs?: string[];      // never touch, default: none
-    max_files_to_edit?: number;      // blast radius cap, default: unlimited
+    read_anywhere: boolean; // usually true, default: true
+    write_allowed: boolean; // often false unless requested, default: true
+    write_globs?: string[]; // if you want to constrain edits, default: true
+    forbidden_globs?: string[]; // never touch, default: none
+    max_files_to_edit?: number; // blast radius cap, default: unlimited
   };
   discovery?: {
-    ripgrep_queries: string[];       // worker uses these
-    likely_dirs?: string[];          // hints only
-    keywords?: string[];             // helps search
+    ripgrep_queries: string[]; // worker uses these
+    likely_dirs?: string[]; // hints only
+    keywords?: string[]; // helps search
   };
   acceptance_criteria: string[]; // usually in prompt, but can be dynamically updated by the agent based on new info
   validation_steps: string[]; // usually in prompt, but can be dynamically updated by the agent based on new info
@@ -257,7 +257,7 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
       ...(forbiddenGlobs.length > 0 ? { forbidden_globs: forbiddenGlobs } : {}),
       ...(maxFilesToEdit ? { max_files_to_edit: maxFilesToEdit } : {}),
     },
-    ...((ripgrepQueries.length > 0 || likelyDirs.length > 0 || keywords.length > 0)
+    ...(ripgrepQueries.length > 0 || likelyDirs.length > 0 || keywords.length > 0
       ? {
           discovery: {
             ripgrep_queries: ripgrepQueries,
@@ -348,7 +348,11 @@ export class AgentBrain {
     return result.text;
   }
 
-  async think(userText: string, context?: string[], overrides?: PlannerOverrides): Promise<PlannerOutput> {
+  async think(
+    userText: string,
+    context?: string[],
+    overrides?: PlannerOverrides,
+  ): Promise<PlannerOutput> {
     const messages = this.buildMessages(userText, context);
     const primaryRaw = await this.generatePlanRaw(SYSTEM_PROMPT, messages);
 

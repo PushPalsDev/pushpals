@@ -12,8 +12,6 @@ export function registerBackendTaskExecutor(
   specializedTaskExecutors.set(backend, executor);
 }
 
-export function getBackendTaskExecutor(
-  backend: ExecutorBackend,
-): BackendTaskExecutor | undefined {
+export function getBackendTaskExecutor(backend: ExecutorBackend): BackendTaskExecutor | undefined {
   return specializedTaskExecutors.get(backend);
 }

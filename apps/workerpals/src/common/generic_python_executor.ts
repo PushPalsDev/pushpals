@@ -33,11 +33,15 @@ function resolveRuntimeSettings(
       ? resolve(runtimeConfig.projectRoot, rawPython)
       : rawPython;
   const rawTimeout = Number(workerCfg[config.timeoutConfigKey]);
-  const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(10_000, Math.floor(rawTimeout)) : 300_000;
+  const timeoutMs = Number.isFinite(rawTimeout)
+    ? Math.max(10_000, Math.floor(rawTimeout))
+    : 300_000;
   return { pythonBin, timeoutMs };
 }
 
-export function createGenericPythonExecutor(config: GenericPythonExecutorConfig): BackendTaskExecutor {
+export function createGenericPythonExecutor(
+  config: GenericPythonExecutorConfig,
+): BackendTaskExecutor {
   const { backendName, scriptPath } = config;
   const backendLabel = backendName[0].toUpperCase() + backendName.slice(1);
 
@@ -57,7 +61,10 @@ export function createGenericPythonExecutor(config: GenericPythonExecutorConfig)
       };
     }
 
-    const { pythonBin, timeoutMs: configuredTimeoutMs } = resolveRuntimeSettings(config, runtimeConfig);
+    const { pythonBin, timeoutMs: configuredTimeoutMs } = resolveRuntimeSettings(
+      config,
+      runtimeConfig,
+    );
     const executionBudgetMs =
       typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
         ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
@@ -76,7 +83,10 @@ export function createGenericPythonExecutor(config: GenericPythonExecutorConfig)
     ).toString("base64");
     const args = [pythonBin, scriptPath, payloadBase64];
 
-    onLog?.("stdout", `[${backendLabel}Executor] Spawning ${backendName} executor (timeout=${timeoutMs}ms)`);
+    onLog?.(
+      "stdout",
+      `[${backendLabel}Executor] Spawning ${backendName} executor (timeout=${timeoutMs}ms)`,
+    );
 
     try {
       const proc = Bun.spawn(args, {
@@ -93,7 +103,10 @@ export function createGenericPythonExecutor(config: GenericPythonExecutorConfig)
       let timedOut = false;
       const timeoutTimer = setTimeout(() => {
         timedOut = true;
-        onLog?.("stdout", `[${backendLabel}Executor] Timeout reached after ${timeoutMs}ms; terminating process.`);
+        onLog?.(
+          "stdout",
+          `[${backendLabel}Executor] Timeout reached after ${timeoutMs}ms; terminating process.`,
+        );
         proc.kill();
       }, timeoutMs);
 

@@ -157,7 +157,9 @@ console.log(`[${ts()}]   port:     ${config.port}`);
 console.log(`[${ts()}]   checks:   ${config.checks.length}`);
 if (dryRun) console.log(`[${ts()}]   mode:     DRY RUN`);
 if (skipCleanCheck) {
-  const source = skipCleanCheckFlag ? "--skip-clean-check flag" : "source_control_manager.skip_clean_check";
+  const source = skipCleanCheckFlag
+    ? "--skip-clean-check flag"
+    : "source_control_manager.skip_clean_check";
   console.log(`[${ts()}]   mode:     SKIP CLEAN CHECK (${source})`);
 }
 

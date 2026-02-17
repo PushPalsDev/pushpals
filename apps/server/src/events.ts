@@ -351,9 +351,10 @@ export class SessionManager {
     const detail = typeof payload.detail === "string" ? payload.detail : "";
     if (!STARTUP_READY_DETAIL_RE.test(detail)) return;
 
-    const state =
-      this.startupReadyBySession.get(sessionId) ??
-      { readyKeys: new Set<StartupReadyKey>(), announced: false };
+    const state = this.startupReadyBySession.get(sessionId) ?? {
+      readyKeys: new Set<StartupReadyKey>(),
+      announced: false,
+    };
     if (state.announced) return;
 
     state.readyKeys.add(readyKey);

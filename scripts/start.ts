@@ -768,7 +768,10 @@ function llmPreflightEndpointGroups(targets: LlmPreflightTarget[]): LlmPreflight
 }
 
 function lmStudioReadyTimeoutMs(): number {
-  return Math.max(1_000, CONFIG.startup.lmStudioReadyTimeoutMs || DEFAULT_LMSTUDIO_READY_TIMEOUT_MS);
+  return Math.max(
+    1_000,
+    CONFIG.startup.lmStudioReadyTimeoutMs || DEFAULT_LMSTUDIO_READY_TIMEOUT_MS,
+  );
 }
 
 function shouldAutoStartLmStudio(primaryEndpoint: string): boolean {
@@ -964,7 +967,9 @@ function printLmStudioAutoStartHelp(primaryEndpoint: string): void {
       console.error(`[lmstudio] ${line}`);
     }
   }
-  console.error("[start] Optional: set startup.auto_start_lmstudio=false and run LM Studio yourself.");
+  console.error(
+    "[start] Optional: set startup.auto_start_lmstudio=false and run LM Studio yourself.",
+  );
 }
 
 async function ensureLlmPreflight(): Promise<void> {
@@ -1019,7 +1024,10 @@ async function ensureLlmPreflight(): Promise<void> {
 
   const failures: Array<{ target: LlmPreflightTarget; check: LlmPreflightCheck }> = [];
   for (const target of serviceTargets) {
-    const check = checksByEndpoint.get(target.endpoint) ?? { ok: false, error: "missing check result" };
+    const check = checksByEndpoint.get(target.endpoint) ?? {
+      ok: false,
+      error: "missing check result",
+    };
     if (check.ok) {
       const statusText = typeof check.status === "number" ? `HTTP ${check.status}` : "reachable";
       console.log(
@@ -1123,9 +1131,7 @@ async function ensureLlmPreflight(): Promise<void> {
       console.error(`[start] LLM model preflight failed for ${failure.target.name}.`);
       console.error(`[start] Endpoint: ${failure.target.endpoint}`);
       console.error(`[start] Backend: ${failure.target.backend}`);
-      console.error(
-        `[start] Configured model: ${failure.target.configuredModel || "(empty)"}`,
-      );
+      console.error(`[start] Configured model: ${failure.target.configuredModel || "(empty)"}`);
       console.error(`[start] Reason: ${failure.detail}`);
     }
     if (autoStartAttempted) {
@@ -1525,7 +1531,10 @@ async function runStartupWarmup(): Promise<void> {
     }
   }
 
-  const combined = `${terminal.summary}\n${llmProbe}\n${terminal.logTail.join("\n")}`.slice(0, 12_000);
+  const combined = `${terminal.summary}\n${llmProbe}\n${terminal.logTail.join("\n")}`.slice(
+    0,
+    12_000,
+  );
   const likelyLlmIssue = isLikelyLlmReachabilityFailure(combined);
   const alert = likelyLlmIssue
     ? `${terminal.summary} Likely cause: WorkerPal LLM endpoint is unavailable or timing out. ${llmProbe}`

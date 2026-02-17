@@ -169,7 +169,10 @@ export class RequestQueue {
     };
 
     ensureColumn("prompt", `ALTER TABLE requests ADD COLUMN prompt TEXT NOT NULL DEFAULT '';`);
-    ensureColumn("priority", `ALTER TABLE requests ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
+    ensureColumn(
+      "priority",
+      `ALTER TABLE requests ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`,
+    );
     ensureColumn(
       "queueWaitBudgetMs",
       `ALTER TABLE requests ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`,

@@ -11,12 +11,12 @@
  * Job execution modes:
  *   - Direct mode (default): jobs run on host in isolated git worktrees
  *   - Docker mode (--docker): jobs run in isolated Docker containers
- * 
+ *
  * Workerpals_main --> docker_executor (if Docker mode) --> job_runner (inside container if Docker mode)
  * job_runner -> job_runner::executeJob (executes the actual job command) -> job_runner (returns result) -> workerpals_main (handles completion)
- * 
+ *
  * WorkerPals_main handles job claiming, heartbeats, and completion enqueuing.
- * 
+ *
  * JobRunner executes a single job, streams logs, and outputs a final result with a sentinel line.
  */
 

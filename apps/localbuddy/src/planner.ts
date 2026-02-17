@@ -347,7 +347,8 @@ export class RemotePlanner implements PlannerModel {
   ) {
     const llmCfg = CONFIG.localbuddy.llm;
     const backend = llmCfg.backend.trim().toLowerCase();
-    const defaultEndpoint = backend === "ollama" ? "http://127.0.0.1:11434/api/chat" : llmCfg.endpoint;
+    const defaultEndpoint =
+      backend === "ollama" ? "http://127.0.0.1:11434/api/chat" : llmCfg.endpoint;
     const configuredEndpoint = opts.endpoint ?? llmCfg.endpoint ?? defaultEndpoint;
     this.endpoint =
       backend === "ollama" && !configuredEndpoint.includes("/api/chat")

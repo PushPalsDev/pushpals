@@ -254,9 +254,7 @@ function asIntOrNull(value: unknown): number | null {
 
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
-  return value
-    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
-    .filter(Boolean);
+  return value.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
 }
 
 function resolvePathFromRoot(projectRoot: string, value: string): string {
@@ -334,7 +332,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   }
 
   const defaultToml = parseTomlFile(join(configDir, "default.toml"));
-  const preferredProfile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(defaultToml.profile, "dev"), "dev");
+  const preferredProfile = firstNonEmpty(
+    process.env.PUSHPALS_PROFILE,
+    asString(defaultToml.profile, "dev"),
+    "dev",
+  );
   const profileToml = parseTomlFile(join(configDir, `${preferredProfile}.toml`));
   const localToml = parseTomlFile(join(configDir, "local.toml"));
   const merged = mergeDeep(mergeDeep(defaultToml, profileToml), localToml);
@@ -344,16 +346,17 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     asString(merged.profile, preferredProfile),
     preferredProfile,
   );
-  const sessionId = firstNonEmpty(process.env.PUSHPALS_SESSION_ID, asString(merged.session_id, "dev"), "dev");
+  const sessionId = firstNonEmpty(
+    process.env.PUSHPALS_SESSION_ID,
+    asString(merged.session_id, "dev"),
+    "dev",
+  );
 
   const llmNode = getObject(merged, "llm");
   const lmStudioNode = getObject(llmNode, "lmstudio");
   const lmStudioContextWindow = Math.max(
     512,
-    asInt(
-      parseIntEnv("PUSHPALS_LMSTUDIO_CONTEXT_WINDOW") ?? lmStudioNode.context_window,
-      4096,
-    ),
+    asInt(parseIntEnv("PUSHPALS_LMSTUDIO_CONTEXT_WINDOW") ?? lmStudioNode.context_window, 4096),
   );
   const lmStudioMinOutputTokens = Math.max(
     64,
@@ -398,7 +401,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
   const sharedDbPath = resolvePathFromRoot(
     projectRoot,
-    firstNonEmpty(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join(dataDir, "pushpals.db"))),
+    firstNonEmpty(
+      process.env.PUSHPALS_DB_PATH,
+      asString(pathsNode.shared_db_path, join(dataDir, "pushpals.db")),
+    ),
   );
   const remotebuddyDbPath = resolvePathFromRoot(
     projectRoot,
@@ -409,24 +415,17 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
 
   const serverNode = getObject(merged, "server");
-  const serverPort = Math.max(
-    1,
-    asInt(parseIntEnv("PUSHPALS_PORT") ?? serverNode.port, 3001),
-  );
+  const serverPort = Math.max(1, asInt(parseIntEnv("PUSHPALS_PORT") ?? serverNode.port, 3001));
   const serverUrl = firstNonEmpty(
     process.env.PUSHPALS_SERVER_URL,
     asString(serverNode.url, `http://localhost:${serverPort}`),
     `http://localhost:${serverPort}`,
   );
   const serverHost = asString(serverNode.host, "0.0.0.0");
-  const debugHttp =
-    parseBoolEnv("PUSHPALS_DEBUG_HTTP") ?? asBoolean(serverNode.debug_http, false);
+  const debugHttp = parseBoolEnv("PUSHPALS_DEBUG_HTTP") ?? asBoolean(serverNode.debug_http, false);
   const staleClaimTtlMs = Math.max(
     5_000,
-    asInt(
-      parseIntEnv("PUSHPALS_STALE_CLAIM_TTL_MS") ?? serverNode.stale_claim_ttl_ms,
-      120_000,
-    ),
+    asInt(parseIntEnv("PUSHPALS_STALE_CLAIM_TTL_MS") ?? serverNode.stale_claim_ttl_ms, 120_000),
   );
   const staleClaimSweepIntervalMs = Math.max(
     1_000,
@@ -444,7 +443,9 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const localStatusHeartbeatMs = Math.max(
     0,
     asInt(
-      parseIntEnv("LOCALBUDDY_STATUS_HEARTBEAT_MS") ?? globalStatusHeartbeatMs ?? localNode.status_heartbeat_ms,
+      parseIntEnv("LOCALBUDDY_STATUS_HEARTBEAT_MS") ??
+        globalStatusHeartbeatMs ??
+        localNode.status_heartbeat_ms,
       120_000,
     ),
   );
@@ -488,7 +489,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
 
   const workerNode = getObject(merged, "workerpals");
   const workerOpenHandsNode = getObject(workerNode, "openhands");
-  const workerPollMs = Math.max(200, asInt(parseIntEnv("WORKERPALS_POLL_MS") ?? workerNode.poll_ms, 2_000));
+  const workerPollMs = Math.max(
+    200,
+    asInt(parseIntEnv("WORKERPALS_POLL_MS") ?? workerNode.poll_ms, 2_000),
+  );
   const workerHeartbeatMs = Math.max(
     200,
     asInt(parseIntEnv("WORKERPALS_HEARTBEAT_MS") ?? workerNode.heartbeat_ms, 5_000),
@@ -517,10 +521,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
   const workerMinisweTimeoutMs = Math.max(
     10_000,
-    asInt(
-      parseIntEnv("WORKERPALS_MINISWE_TIMEOUT_MS") ?? workerNode.miniswe_timeout_ms,
-      1_800_000,
-    ),
+    asInt(parseIntEnv("WORKERPALS_MINISWE_TIMEOUT_MS") ?? workerNode.miniswe_timeout_ms, 1_800_000),
   );
   const workerOpenHandsStuckGuardEnabled =
     parseBoolEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_ENABLED") ??
@@ -597,7 +598,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     parseBoolEnv("WORKERPALS_REQUIRE_PUSH") ?? asBoolean(workerNode.require_push, false);
   const workerPushAgentBranchEnv = parseBoolEnv("WORKERPALS_PUSH_AGENT_BRANCH");
   const workerPushAgentBranch =
-    workerRequirePush || (workerPushAgentBranchEnv ?? asBoolean(workerNode.push_agent_branch, false));
+    workerRequirePush ||
+    (workerPushAgentBranchEnv ?? asBoolean(workerNode.push_agent_branch, false));
   const workerSkipDockerSelfCheck =
     parseBoolEnv("WORKERPALS_SKIP_DOCKER_SELF_CHECK") ??
     asBoolean(workerNode.skip_docker_self_check, false);
@@ -798,7 +800,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const startupSkipLlmPreflight =
     parseBoolEnv("PUSHPALS_SKIP_LLM_PREFLIGHT") ?? asBoolean(startupNode.skip_llm_preflight, false);
   const startupAutoStartLmStudio =
-    parseBoolEnv("PUSHPALS_AUTO_START_LMSTUDIO") ?? asBoolean(startupNode.auto_start_lmstudio, true);
+    parseBoolEnv("PUSHPALS_AUTO_START_LMSTUDIO") ??
+    asBoolean(startupNode.auto_start_lmstudio, true);
   const startupLmStudioReadyTimeoutMs = Math.max(
     1_000,
     asInt(
@@ -813,7 +816,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
   const startupLmStudioPort = Math.max(
     1,
-    Math.min(65_535, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_PORT") ?? startupNode.lmstudio_port, 1234)),
+    Math.min(
+      65_535,
+      asInt(parseIntEnv("PUSHPALS_LMSTUDIO_PORT") ?? startupNode.lmstudio_port, 1234),
+    ),
   );
   const startupLmStudioStartArgs = firstNonEmpty(
     process.env.PUSHPALS_LMSTUDIO_START_ARGS,
@@ -839,7 +845,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     ),
   );
   const startupAllowExternalClean =
-    parseBoolEnv("PUSHPALS_ALLOW_EXTERNAL_CLEAN") ?? asBoolean(startupNode.allow_external_clean, false);
+    parseBoolEnv("PUSHPALS_ALLOW_EXTERNAL_CLEAN") ??
+    asBoolean(startupNode.allow_external_clean, false);
 
   const clientNode = getObject(merged, "client");
 
@@ -916,13 +923,16 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         ),
       ),
       workerpalDocker:
-        parseBoolEnv("REMOTEBUDDY_WORKERPAL_DOCKER") ?? asBoolean(remoteNode.workerpal_docker, true),
+        parseBoolEnv("REMOTEBUDDY_WORKERPAL_DOCKER") ??
+        asBoolean(remoteNode.workerpal_docker, true),
       workerpalRequireDocker:
         parseBoolEnv("REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER") ??
         asBoolean(remoteNode.workerpal_require_docker, true),
       workerpalImage:
-        firstNonEmpty(process.env.REMOTEBUDDY_WORKERPAL_IMAGE, asString(remoteNode.workerpal_image, "")) ||
-        null,
+        firstNonEmpty(
+          process.env.REMOTEBUDDY_WORKERPAL_IMAGE,
+          asString(remoteNode.workerpal_image, ""),
+        ) || null,
       workerpalPollMs:
         asIntOrNull(parseIntEnv("REMOTEBUDDY_WORKERPAL_POLL_MS")) ??
         asIntOrNull(remoteNode.workerpal_poll_ms),
@@ -997,7 +1007,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       ),
       dockerTimeoutMs: Math.max(
         10_000,
-        asInt(parseIntEnv("WORKERPALS_DOCKER_TIMEOUT_MS") ?? workerNode.docker_timeout_ms, 1_800_000),
+        asInt(
+          parseIntEnv("WORKERPALS_DOCKER_TIMEOUT_MS") ?? workerNode.docker_timeout_ms,
+          1_800_000,
+        ),
       ),
       dockerIdleTimeoutMs: Math.max(
         0,
@@ -1083,7 +1096,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       ),
       traceTailLines: Math.max(
         10,
-        asInt(parseIntEnv("EXPO_PUBLIC_PUSHPALS_TRACE_TAIL_LINES") ?? clientNode.trace_tail_lines, 100),
+        asInt(
+          parseIntEnv("EXPO_PUBLIC_PUSHPALS_TRACE_TAIL_LINES") ?? clientNode.trace_tail_lines,
+          100,
+        ),
       ),
     },
   };

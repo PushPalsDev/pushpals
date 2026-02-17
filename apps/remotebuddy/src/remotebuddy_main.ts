@@ -1020,9 +1020,13 @@ class RemoteBuddyOrchestrator {
 
     const reqAny = request as any;
     const forceWorker = Boolean(reqAny.forceWorker ?? reqAny.force_worker);
-    const laneRaw = String(reqAny.forceLane ?? reqAny.force_lane ?? "").trim().toLowerCase();
+    const laneRaw = String(reqAny.forceLane ?? reqAny.force_lane ?? "")
+      .trim()
+      .toLowerCase();
     const forceLane: TaskExecutionLane | undefined =
-      laneRaw === "deterministic" || laneRaw === "openhands" ? (laneRaw as TaskExecutionLane) : undefined;
+      laneRaw === "deterministic" || laneRaw === "openhands"
+        ? (laneRaw as TaskExecutionLane)
+        : undefined;
 
     const priority = normalizeRequestPriority(request.priority);
     const queueWaitBudgetMs = Math.max(
@@ -1093,7 +1097,9 @@ class RemoteBuddyOrchestrator {
       }
 
       // allow forcing lane (default to openhands for forced worker)
-      let lane = requiresWorker ? this.chooseExecutionLane(prompt, plan, targetPaths.length) : "deterministic";
+      let lane = requiresWorker
+        ? this.chooseExecutionLane(prompt, plan, targetPaths.length)
+        : "deterministic";
       if (requiresWorker && lane === "deterministic" && !targetPath) {
         lane = "openhands";
       }
