@@ -167,8 +167,10 @@ apps/worker/.dockerbuild/
 config/local.toml
 
 
-/__pycache__
-/__pycache__/
-apps/worker/scripts/__pycache__
+# Python bytecode / cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
 
 .claude/

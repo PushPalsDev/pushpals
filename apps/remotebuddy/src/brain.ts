@@ -25,6 +25,15 @@ export interface PlannerOutput {
   worker_instruction: string;
 }
 
+/**
+ * Optional overrides that come from the request queue (LocalBuddy / API client).
+ * These MUST take priority over model output.
+ */
+export interface PlannerOverrides {
+  forceWorker?: boolean;
+  forceLane?: PlannerLane;
+}
+
 const MAX_ASSISTANT_CHARS = 4000;
 const MAX_WORKER_INSTRUCTION_CHARS = 12000;
 const MAX_TARGET_PATHS = 16;
@@ -193,6 +202,38 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   };
 }
 
+function applyOverrides(plan: PlannerOutput, overrides?: PlannerOverrides): PlannerOutput {
+  if (!overrides) return plan;
+
+  const forceWorker = overrides.forceWorker === true;
+  const forceLane =
+    overrides.forceLane === "deterministic" || overrides.forceLane === "openhands"
+      ? overrides.forceLane
+      : null;
+
+  // If forceWorker is on, we *must* require a worker and ensure job_kind matches.
+  if (forceWorker) {
+    const lane = forceLane ?? plan.lane ?? "openhands";
+    return {
+      ...plan,
+      requires_worker: true,
+      job_kind: "task.execute",
+      lane,
+    };
+  }
+
+  // If not forcing a worker, lane only matters if the plan already requires worker.
+  if (forceLane) {
+    if (plan.requires_worker) {
+      return { ...plan, lane: forceLane };
+    }
+    // If no worker is required, lane should remain deterministic.
+    return { ...plan, lane: "deterministic" };
+  }
+
+  return plan;
+}
+
 export class AgentBrain {
   private llm: LLMClient;
 
@@ -234,13 +275,14 @@ export class AgentBrain {
     return result.text;
   }
 
-  async think(userText: string, context?: string[]): Promise<PlannerOutput> {
+  async think(userText: string, context?: string[], overrides?: PlannerOverrides): Promise<PlannerOutput> {
     const messages = this.buildMessages(userText, context);
     const primaryRaw = await this.generatePlanRaw(SYSTEM_PROMPT, messages);
 
     try {
       const parsed = parseStructuredJson(primaryRaw);
-      return sanitizePlannerOutput(parsed, userText);
+      const plan = sanitizePlannerOutput(parsed, userText);
+      return applyOverrides(plan, overrides);
     } catch (primaryErr) {
       console.warn(
         `[Brain] Invalid planner JSON; attempting strict repair (${String(primaryErr)}).`,
@@ -262,7 +304,8 @@ export class AgentBrain {
 
       const repairedRaw = await this.generatePlanRaw(REPAIR_SYSTEM_PROMPT, repairMessages, 1800);
       const repairedParsed = parseStructuredJson(repairedRaw);
-      return sanitizePlannerOutput(repairedParsed, userText);
+      const plan = sanitizePlannerOutput(repairedParsed, userText);
+      return applyOverrides(plan, overrides);
     }
   }
 }

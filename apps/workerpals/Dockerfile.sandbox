@@ -25,21 +25,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# OpenHands worker runtime (SDK + local agent server + workspace adapters)
-# Install into an isolated venv (PEP 668-compliant on Debian Bookworm/Trixie).
-RUN python3 -m venv /opt/openhands-venv \
-    && /opt/openhands-venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/openhands-venv/bin/pip install --no-cache-dir \
+# Worker runtime in one shared venv (uv default layout).
+# Keep the venv at /workspace/.venv so all backends use the same Python runtime.
+RUN mkdir -p /workspace \
+    && python3 -m venv /workspace/.venv \
+    && /workspace/.venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /workspace/.venv/bin/pip install --no-cache-dir \
         openhands-sdk \
         openhands-agent-server \
         openhands-workspace \
         openhands-tools \
+        mini-swe-agent \
         playwright \
-    && /opt/openhands-venv/bin/playwright install --with-deps chromium
+    && /workspace/.venv/bin/playwright install --with-deps chromium
 
-ENV PATH="/opt/openhands-venv/bin:${PATH}"
-ENV WORKERPALS_OPENHANDS_PYTHON="/opt/openhands-venv/bin/python"
-ENV WORKERPALS_OPENHANDS_WORKSPACE_PYTHON="/opt/openhands-venv/bin/python3"
+ENV PATH="/workspace/.venv/bin:${PATH}"
+ENV WORKERPALS_OPENHANDS_PYTHON="/workspace/.venv/bin/python"
+ENV WORKERPALS_OPENHANDS_WORKSPACE_PYTHON="/workspace/.venv/bin/python"
+ENV WORKERPALS_MINISWE_PYTHON="/workspace/.venv/bin/python"
 
 # Configure git for the worker
 RUN git config --global user.name "PushPals Worker" \

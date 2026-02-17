@@ -3,40 +3,33 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { existsSync, readFileSync } from "fs";
+import { readFileSync } from "fs";
 import { resolve } from "path";
 import { loadPromptTemplate, loadPushPalsConfig } from "shared";
-import { computeTimeoutWarningWindow } from "./timeout_policy.js";
+import {
+  FILE_MODIFYING_JOBS,
+  QUALITY_CRITIC_MAX_DIFF_CHARS,
+  QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS,
+  QUALITY_CRITIC_MIN_SCORE,
+  QUALITY_CRITIC_TIMEOUT_MS,
+  QUALITY_MAX_AUTO_REVISIONS,
+  QUALITY_VALIDATION_STEP_TIMEOUT_MS,
+} from "./common/constants.js";
+import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
+import type { JobResult } from "./common/types.js";
+import {
+  compactJobOutput,
+  truncate,
+} from "./common/execution_utils.js";
+// Re-export shared utilities for backward compatibility with external consumers.
+export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
+export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
+import {
+  getBackendTaskExecutor,
+} from "./backends/task_execute_registry.js";
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+const DEFAULT_CONFIG = loadPushPalsConfig();
 
-/** Job kinds that modify files and should trigger commits */
-export const FILE_MODIFYING_JOBS = new Set(["task.execute"]);
-
-const MAX_OUTPUT = 192 * 1024;
-const MAX_OUTPUT_LINES = 600;
-const MAX_OUTPUT_HEAD_LINES = 120;
-const QUALITY_MAX_AUTO_REVISIONS = 1;
-const QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180_000;
-const QUALITY_CRITIC_TIMEOUT_MS = 45_000;
-const QUALITY_CRITIC_MIN_SCORE = 8;
-const QUALITY_CRITIC_MAX_DIFF_CHARS = 16_000;
-const QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8_000;
-const EXECUTOR_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
-const CONFIG = loadPushPalsConfig();
-
-// ─── Executor backend resolution ────────────────────────────────────────────
-
-export type ExecutorBackend = "openhands" | "miniswe";
-
-export function resolveExecutor(): ExecutorBackend {
-  const raw = CONFIG.workerpals.executor.trim().toLowerCase() || "miniswe";
-  if (raw === "openhands" || raw === "miniswe") return raw;
-  console.warn(
-    `[WorkerPals] Unknown workerpals.executor="${raw}", falling back to "miniswe".`,
-  );
-  return "miniswe";
-}
 
 interface TaskExecutePlanning {
   intent: TaskExecuteIntent;
@@ -77,110 +70,6 @@ interface CriticReview {
   raw: string;
 }
 
-function classifyShellCommand(cmd: string): "explore" | "progress" {
-  const trimmed = cmd.trim().toLowerCase();
-  if (!trimmed) return "explore";
-  const token = trimmed.split(/\s+/, 1)[0] ?? "";
-  if (
-    token === "ls" ||
-    token === "find" ||
-    token === "rg" ||
-    token === "grep" ||
-    token === "cat" ||
-    token === "head" ||
-    token === "tail" ||
-    token === "sed" ||
-    token === "awk"
-  ) {
-    return "explore";
-  }
-  if (token === "git") {
-    if (
-      /\bgit\s+(status|log|show|diff|branch|rev-parse|ls-files)\b/.test(trimmed) ||
-      /\bgit\s+grep\b/.test(trimmed)
-    ) {
-      return "explore";
-    }
-  }
-  return "progress";
-}
-
-function classifyFileEditorSummary(line: string): "explore" | "progress" | null {
-  const lowered = line.toLowerCase();
-  if (!lowered.startsWith("summary: file_editor")) return null;
-  if (
-    lowered.includes('"command": "view"') ||
-    lowered.includes('"command":"view"') ||
-    lowered.includes('"command": "list"') ||
-    lowered.includes('"command":"list"')
-  ) {
-    return "explore";
-  }
-  if (
-    lowered.includes('"command": "create"') ||
-    lowered.includes('"command":"create"') ||
-    lowered.includes('"command": "str_replace"') ||
-    lowered.includes('"command":"str_replace"') ||
-    lowered.includes('"command": "insert"') ||
-    lowered.includes('"command":"insert"') ||
-    lowered.includes('"command": "delete"') ||
-    lowered.includes('"command":"delete"')
-  ) {
-    return "progress";
-  }
-  return null;
-}
-
-const OPENHANDS_NO_CHANGE_SIGNAL = [
-  "no file changes detected",
-  "no modified files were detected",
-];
-
-const CLARIFICATION_SIGNAL_REGEX =
-  /\b(clarif(?:y|ication)|need to know which|could you clarify|please clarify|which .* would you like|let me ask for clarification)\b/i;
-
-const NON_AGENT_LOG_LINE_REGEX =
-  /^(message from user|requested task:|tokens:|summary:|observation|tool:|result:|\$ )/i;
-
-function hasOpenHandsNoChangeSignal(text: string): boolean {
-  const lowered = text.toLowerCase();
-  return OPENHANDS_NO_CHANGE_SIGNAL.some((token) => lowered.includes(token));
-}
-
-function normalizeAgentOutputLine(line: string): string {
-  return line
-    .replace(/^\[[^\]]+\]\s*/g, "")
-    .replace(/<\/?think>/gi, " ")
-    .replace(/```+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-export function extractClarificationQuestionFromOutput(output: string): string | null {
-  if (!output.trim()) return null;
-
-  const rawLines = output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (rawLines.length === 0) return null;
-
-  const markerIndex = rawLines.findIndex((line) => /message from agent/i.test(line));
-  const scopedLines = markerIndex >= 0 ? rawLines.slice(markerIndex + 1) : rawLines;
-  const lines = scopedLines
-    .map(normalizeAgentOutputLine)
-    .filter((line) => Boolean(line) && !NON_AGENT_LOG_LINE_REGEX.test(line));
-  if (lines.length === 0) return null;
-
-  const joined = lines.join("\n");
-  if (!CLARIFICATION_SIGNAL_REGEX.test(joined)) return null;
-
-  const explicitQuestion = [...lines].reverse().find((line) => line.includes("?"));
-  if (explicitQuestion) return explicitQuestion.slice(0, 280);
-
-  const fallback = [...lines].reverse().find((line) => CLARIFICATION_SIGNAL_REGEX.test(line));
-  return fallback ? fallback.slice(0, 280) : null;
-}
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -188,39 +77,6 @@ export function shouldCommit(kind: string): boolean {
   return FILE_MODIFYING_JOBS.has(kind);
 }
 
-export function compactJobOutput(text: string): string {
-  if (!text) return "";
-  let compact = text;
-  const lines = compact.split(/\r?\n/);
-  if (lines.length > MAX_OUTPUT_LINES) {
-    const headCount = Math.min(MAX_OUTPUT_HEAD_LINES, MAX_OUTPUT_LINES, lines.length);
-    const tailBudget = Math.max(0, MAX_OUTPUT_LINES - headCount);
-    const tailCount = Math.max(0, Math.min(lines.length - headCount, tailBudget));
-    const omitted = Math.max(0, lines.length - headCount - tailCount);
-    const marker = omitted > 0 ? [`... (${omitted} lines omitted) ...`] : [];
-    const tail = tailCount > 0 ? lines.slice(lines.length - tailCount) : [];
-    compact = [...lines.slice(0, headCount), ...marker, ...tail].join("\n");
-  }
-  if (compact.length > MAX_OUTPUT) {
-    const markerPrefix = "... (";
-    const markerSuffix = " chars omitted) ...\n";
-    const markerBudget = markerPrefix.length + markerSuffix.length + 20;
-    if (markerBudget >= MAX_OUTPUT) {
-      compact = compact.slice(-MAX_OUTPUT);
-    } else {
-      const keepChars = Math.max(0, MAX_OUTPUT - markerBudget);
-      const omittedChars = Math.max(0, compact.length - keepChars);
-      const marker = `${markerPrefix}${omittedChars}${markerSuffix}`;
-      const tail = keepChars > 0 ? compact.slice(-keepChars) : "";
-      compact = `${marker}${tail}`;
-    }
-  }
-  return compact;
-}
-
-export function truncate(s: string): string {
-  return compactJobOutput(s);
-}
 
 function toSingleLine(value: unknown, max = 240): string {
   const text = String(value ?? "")
@@ -464,10 +320,10 @@ async function runDeterministicQualityGate(
     );
   } else {
     for (const command of runnableSteps) {
-      onLog?.("stdout", `[OpenHandsExecutor] Quality gate validation: running "${command}"`);
+      onLog?.("stdout", `[QualityGate] Quality gate validation: running "${command}"`);
       const run = await runShellValidationCommand(repo, command, QUALITY_VALIDATION_STEP_TIMEOUT_MS);
       validationRuns.push(run);
-      const runSummary = `[OpenHandsExecutor] Quality gate validation ${run.ok ? "passed" : "failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
+      const runSummary = `[QualityGate] Quality gate validation ${run.ok ? "passed" : "failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
       onLog?.(run.ok ? "stdout" : "stderr", runSummary);
     }
     if (validationRuns.every((run) => !run.ok)) {
@@ -492,10 +348,11 @@ async function runTaskCriticReview(
   repo: string,
   params: Record<string, unknown>,
   quality: DeterministicQualityResult,
+  runtimeConfig: WorkerpalsRuntimeConfig,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<CriticReview | null> {
-  const endpoint = normalizeChatCompletionsEndpoint(CONFIG.workerpals.llm.endpoint);
-  const model = CONFIG.workerpals.llm.model.trim();
+  const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
+  const model = runtimeConfig.workerpals.llm.model.trim();
   if (!endpoint || !model) return null;
 
   const changedForDiff = quality.changedPaths.slice(0, 8);
@@ -544,7 +401,7 @@ async function runTaskCriticReview(
     `Validation evidence:\n${validationSummary || "(no validation output)"}`,
   ].join("\n\n");
 
-  const apiKey = CONFIG.workerpals.llm.apiKey.trim() || "local";
+  const apiKey = runtimeConfig.workerpals.llm.apiKey.trim() || "local";
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
@@ -585,7 +442,7 @@ async function runTaskCriticReview(
       if (lowered.includes("response_format")) {
         onLog?.(
           "stdout",
-          "[OpenHandsExecutor] Critic fallback: response_format json_object unsupported; retrying without strict response_format.",
+          "[QualityGate] Critic fallback: response_format json_object unsupported; retrying without strict response_format.",
         );
         request = await runCriticRequest(null);
       }
@@ -593,7 +450,7 @@ async function runTaskCriticReview(
     if (!request.response.ok) {
       onLog?.(
         "stderr",
-        `[OpenHandsExecutor] Critic review request failed (${request.response.status}): ${toSingleLine(request.text, 240)}`,
+        `[QualityGate] Critic review request failed (${request.response.status}): ${toSingleLine(request.text, 240)}`,
       );
       return null;
     }
@@ -609,7 +466,7 @@ async function runTaskCriticReview(
     if (!reviewObj) {
       onLog?.(
         "stderr",
-        `[OpenHandsExecutor] Critic produced non-JSON content; skipping critic gate. Raw: ${toSingleLine(
+        `[QualityGate] Critic produced non-JSON content; skipping critic gate. Raw: ${toSingleLine(
           content,
           220,
         )}`,
@@ -638,7 +495,7 @@ async function runTaskCriticReview(
   } catch (err) {
     onLog?.(
       "stderr",
-      `[OpenHandsExecutor] Critic review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`,
+      `[QualityGate] Critic review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`,
     );
     return null;
   }
@@ -823,578 +680,6 @@ async function buildArchitectureDocument(
   return lines.join("\n").trim() + "\n";
 }
 
-// useOpenHandsExecutor() removed — replaced by resolveExecutor() at top of file.
-
-async function executeWithOpenHands(
-  kind: string,
-  params: Record<string, unknown>,
-  repo: string,
-  onLog?: (stream: "stdout" | "stderr", line: string) => void,
-  budgets?: { executionBudgetMs?: number; finalizationBudgetMs?: number },
-): Promise<JobResult> {
-  const pythonBin = CONFIG.workerpals.openhandsPython || "python";
-  const scriptPath = resolve(import.meta.dir, "..", "scripts", "openhands_executor.py");
-  if (!existsSync(scriptPath)) {
-    return {
-      ok: false,
-      summary: `OpenHands wrapper script not found: ${scriptPath}`,
-      exitCode: 1,
-    };
-  }
-
-  const configuredTimeoutMs = Math.max(10_000, CONFIG.workerpals.openhandsTimeoutMs);
-  const executionBudgetMs =
-    typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
-      ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
-      : null;
-  const timeoutMs =
-    executionBudgetMs != null
-      ? Math.min(configuredTimeoutMs, executionBudgetMs)
-      : configuredTimeoutMs;
-  const timeoutLimitSource =
-    executionBudgetMs == null
-      ? `workerpals.openhands_timeout_ms=${configuredTimeoutMs}ms`
-      : executionBudgetMs < configuredTimeoutMs
-        ? `planning executionBudgetMs=${executionBudgetMs}ms (worker cap=${configuredTimeoutMs}ms)`
-        : executionBudgetMs > configuredTimeoutMs
-          ? `workerpals.openhands_timeout_ms=${configuredTimeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms)`
-          : `planning executionBudgetMs=${executionBudgetMs}ms (matches worker cap)`;
-  if (executionBudgetMs != null && executionBudgetMs < configuredTimeoutMs) {
-    onLog?.(
-      "stdout",
-      `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, worker cap=${configuredTimeoutMs}ms).`,
-    );
-  } else if (executionBudgetMs != null && executionBudgetMs > configuredTimeoutMs) {
-    onLog?.(
-      "stdout",
-      `[OpenHandsExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, configured cap=${configuredTimeoutMs}ms).`,
-    );
-  }
-  const { leadMs: timeoutWarningLeadMs, delayMs: timeoutWarningDelayMs } =
-    computeTimeoutWarningWindow(timeoutMs);
-  const finalizationBudgetMs =
-    typeof budgets?.finalizationBudgetMs === "number" && Number.isFinite(budgets.finalizationBudgetMs)
-      ? Math.max(10_000, Math.floor(budgets.finalizationBudgetMs))
-      : 0;
-  // Allow one bounded extension when the agent is still actively emitting output.
-  const activityExtensionMs = Math.min(finalizationBudgetMs, 10 * 60_000);
-  const activityWindowMs = 90_000;
-  const payload = Buffer.from(
-    JSON.stringify({
-      kind,
-      params,
-      repo,
-      timeoutMs,
-      executionBudgetMs: executionBudgetMs ?? undefined,
-      finalizationBudgetMs: finalizationBudgetMs > 0 ? finalizationBudgetMs : undefined,
-    }),
-    "utf-8",
-  ).toString("base64");
-
-  let warningTimer: ReturnType<typeof setTimeout> | null = null;
-  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  let stuckNudgeStartTimer: ReturnType<typeof setTimeout> | null = null;
-  let stuckNudgeTimer: ReturnType<typeof setInterval> | null = null;
-
-  try {
-    const proc = Bun.spawn([pythonBin, scriptPath, payload], {
-      cwd: repo,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-
-    let timedOut = false;
-    const startedAtMs = Date.now();
-    let lastActivityAtMs = startedAtMs;
-    let timeoutDeadlineMs = startedAtMs + timeoutMs;
-    let extendedByActivityMs = 0;
-    let timedOutAfterMs = timeoutMs;
-    const stuckGuardEnabled = CONFIG.workerpals.openhandsStuckGuardEnabled;
-    const stuckExploreLimit = CONFIG.workerpals.openhandsStuckGuardExploreLimit;
-    const stuckMinElapsedMs = CONFIG.workerpals.openhandsStuckGuardMinElapsedMs;
-    const stuckBroadScanLimit = CONFIG.workerpals.openhandsStuckGuardBroadScanLimit;
-    const stuckNoProgressMaxMs = CONFIG.workerpals.openhandsStuckGuardNoProgressMaxMs;
-    const stuckNudgeEnabled = CONFIG.workerpals.openhandsAutoSteerEnabled;
-    const stuckNudgeInitialDelayMs = Math.max(
-      0,
-      Math.floor(CONFIG.workerpals.openhandsAutoSteerInitialDelaySec * 1000),
-    );
-    const stuckNudgeIntervalMs = Math.max(
-      5_000,
-      Math.floor(CONFIG.workerpals.openhandsAutoSteerIntervalSec * 1000),
-    );
-    const stuckNudgeMaxCount = Math.max(0, CONFIG.workerpals.openhandsAutoSteerMaxNudges);
-    let exploreOps = 0;
-    let progressOps = 0;
-    let broadRepoScans = 0;
-    let stuckGuardTriggered = false;
-    let stuckGuardReason = "";
-    let stuckGuardAfterMs = 0;
-    let stuckNudgeCount = 0;
-
-    const stopStuckNudges = (reason?: string) => {
-      const hadActiveTimer = Boolean(stuckNudgeStartTimer || stuckNudgeTimer);
-      if (stuckNudgeStartTimer) {
-        clearTimeout(stuckNudgeStartTimer);
-        stuckNudgeStartTimer = null;
-      }
-      if (stuckNudgeTimer) {
-        clearInterval(stuckNudgeTimer);
-        stuckNudgeTimer = null;
-      }
-      if (reason && hadActiveTimer) {
-        onLog?.("stdout", `[OpenHandsExecutor] Auto-steering nudges paused: ${reason}.`);
-      }
-    };
-
-    const buildSteeringNudge = (nudgeIndex: number): string => {
-      if (nudgeIndex === 1) {
-        return (
-          "Auto-steering nudge 1: stop broad exploration and lock onto one concrete target file. " +
-          "Make one minimal edit and run one focused validation command."
-        );
-      }
-      if (nudgeIndex === 2) {
-        return (
-          "Auto-steering nudge 2: choose the best candidate file now, apply a small correct patch, " +
-          "then run a narrow test/lint command for that change."
-        );
-      }
-      return (
-        "Auto-steering nudge: if still blocked, stop scanning loops and return concise blocker status " +
-        "with the next concrete command you would run."
-      );
-    };
-
-    const startStuckNudges = () => {
-      if (!stuckNudgeEnabled || stuckNudgeMaxCount <= 0) return;
-      if (stuckNudgeStartTimer || stuckNudgeTimer) return;
-
-      const emitNudge = () => {
-        if (timedOut) {
-          stopStuckNudges();
-          return;
-        }
-        if (progressOps > 0) {
-          stopStuckNudges("progress detected");
-          return;
-        }
-        stuckNudgeCount += 1;
-        const elapsedMs = Date.now() - startedAtMs;
-        onLog?.(
-          "stdout",
-          `[OpenHandsExecutor] Auto-steering nudge ${stuckNudgeCount}/${stuckNudgeMaxCount} after ${elapsedMs}ms (${stuckGuardReason || "no edit/test progress"}): ${buildSteeringNudge(stuckNudgeCount)}`,
-        );
-        if (stuckNudgeCount >= stuckNudgeMaxCount) {
-          stopStuckNudges();
-        }
-      };
-
-      const startInterval = () => {
-        if (stuckNudgeTimer || stuckNudgeCount >= stuckNudgeMaxCount) return;
-        stuckNudgeTimer = setInterval(emitNudge, stuckNudgeIntervalMs);
-      };
-
-      if (stuckNudgeInitialDelayMs <= 0) {
-        emitNudge();
-        startInterval();
-        return;
-      }
-
-      stuckNudgeStartTimer = setTimeout(() => {
-        stuckNudgeStartTimer = null;
-        emitNudge();
-        startInterval();
-      }, stuckNudgeInitialDelayMs);
-    };
-
-    const onProcessLine = (stream: "stdout" | "stderr", line: string) => {
-      lastActivityAtMs = Date.now();
-      const trimmed = line.trim();
-      if (trimmed.startsWith("$ ")) {
-        const commandText = trimmed.slice(2).trim();
-        if (classifyShellCommand(commandText) === "explore") {
-          exploreOps += 1;
-        } else {
-          progressOps += 1;
-        }
-        const lowered = commandText.toLowerCase();
-        if (/\bfind\s+\/repo\b/.test(lowered) || /\bfind\s+\/\b/.test(lowered)) {
-          broadRepoScans += 1;
-        }
-      }
-      const fileEditorClass = classifyFileEditorSummary(trimmed);
-      if (fileEditorClass === "explore") exploreOps += 1;
-      if (fileEditorClass === "progress") progressOps += 1;
-      if (stuckGuardTriggered && progressOps > 0) {
-        stopStuckNudges("progress detected");
-      }
-
-      if (!stuckGuardTriggered && stuckGuardEnabled && progressOps === 0) {
-        const elapsedMs = Date.now() - startedAtMs;
-        const noProgressTooLong = elapsedMs >= stuckNoProgressMaxMs;
-        const tooManyExplores = elapsedMs >= stuckMinElapsedMs && exploreOps >= stuckExploreLimit;
-        const tooManyBroadScans = broadRepoScans >= stuckBroadScanLimit;
-        if (noProgressTooLong || tooManyExplores || tooManyBroadScans) {
-          stuckGuardTriggered = true;
-          stuckGuardAfterMs = elapsedMs;
-          if (tooManyBroadScans) {
-            stuckGuardReason = `repeated broad filesystem scans (count=${broadRepoScans}) with no edits/tests`;
-          } else if (tooManyExplores) {
-            stuckGuardReason = `repeated exploratory actions (count=${exploreOps}) with no edits/tests`;
-          } else {
-            stuckGuardReason = `no edit/test progress for ${stuckNoProgressMaxMs}ms`;
-          }
-          onLog?.(
-            "stdout",
-            `[OpenHandsExecutor] Stuck guard triggered after ${stuckGuardAfterMs}ms: ${stuckGuardReason}. Steering hint: stop broad exploration, pick a concrete target file, make a minimal edit, then run a focused validation command.`,
-          );
-          startStuckNudges();
-        }
-      }
-      onLog?.(stream, line);
-    };
-
-    const resetWarningTimer = () => {
-      if (warningTimer) {
-        clearTimeout(warningTimer);
-        warningTimer = null;
-      }
-      const msUntilWarn = timeoutDeadlineMs - Date.now() - timeoutWarningLeadMs;
-      if (msUntilWarn <= 0) return;
-      warningTimer = setTimeout(() => {
-        onLog?.(
-          "stdout",
-          `[OpenHandsExecutor] Timeout approaching for ${kind} (${Math.round(
-            timeoutWarningLeadMs / 1000,
-          )}s remaining). If unfinished, return a concise status/failure update now.`,
-        );
-      }, msUntilWarn);
-    };
-
-    const resetTimeoutTimer = () => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-        timeoutTimer = null;
-      }
-      const msUntilTimeout = Math.max(1, timeoutDeadlineMs - Date.now());
-      timeoutTimer = setTimeout(() => {
-        const nowMs = Date.now();
-        const quietForMs = nowMs - lastActivityAtMs;
-        if (extendedByActivityMs === 0 && activityExtensionMs > 0 && quietForMs <= activityWindowMs) {
-          extendedByActivityMs = activityExtensionMs;
-          timeoutDeadlineMs = nowMs + activityExtensionMs;
-          onLog?.(
-            "stdout",
-            `[OpenHandsExecutor] Extending timeout by ${activityExtensionMs}ms because the agent is still active (last output ${Math.round(
-              quietForMs / 1000,
-            )}s ago).`,
-          );
-          resetWarningTimer();
-          resetTimeoutTimer();
-          return;
-        }
-
-        timedOut = true;
-        timedOutAfterMs = Math.max(1, nowMs - startedAtMs);
-        onLog?.(
-          "stdout",
-          `[OpenHandsExecutor] Timeout reached for ${kind} after ${timedOutAfterMs}ms (effective limit: ${timeoutLimitSource}${
-            extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
-          }); terminating wrapper process.`,
-        );
-        stopStuckNudges();
-        try {
-          proc.kill();
-        } catch (_e) {}
-      }, msUntilTimeout);
-    };
-
-    resetWarningTimer();
-    resetTimeoutTimer();
-
-    const [stdout, stderr] = await Promise.all([
-      streamLines(proc.stdout, "stdout", onProcessLine),
-      streamLines(proc.stderr, "stderr", onProcessLine),
-    ]);
-    if (warningTimer) {
-      clearTimeout(warningTimer);
-      warningTimer = null;
-    }
-    if (timeoutTimer) {
-      clearTimeout(timeoutTimer);
-      timeoutTimer = null;
-    }
-    stopStuckNudges();
-    const exitCode = await proc.exited;
-
-    const lines = stdout.split(/\r?\n/);
-    let parsed: Record<string, unknown> | null = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line.startsWith(EXECUTOR_RESULT_PREFIX)) continue;
-      const raw = line.slice(EXECUTOR_RESULT_PREFIX.length).trim();
-      if (!raw) continue;
-      try {
-        parsed = JSON.parse(raw) as Record<string, unknown>;
-      } catch (_e) {
-        parsed = null;
-      }
-      break;
-    }
-
-    const filteredStdout = lines
-      .filter((line) => !line.trim().startsWith(EXECUTOR_RESULT_PREFIX))
-      .join("\n")
-      .trim();
-
-    if (!parsed) {
-      if (timedOut) {
-        const stuckNote = stuckGuardTriggered
-          ? ` Stuck guard warning was raised at ${stuckGuardAfterMs}ms (${stuckGuardReason}).`
-          : "";
-        return {
-          ok: false,
-          summary: `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind} (effective limit: ${timeoutLimitSource}${
-            extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
-          }). Worker returned a timeout failure.${stuckNote}`,
-          stdout: truncate(filteredStdout),
-          stderr: truncate(stderr),
-          exitCode: exitCode === 0 ? 124 : exitCode,
-        };
-      }
-      return {
-        ok: false,
-        summary: `OpenHands wrapper did not return a structured result for ${kind}`,
-        stdout: truncate(filteredStdout),
-        stderr: truncate(stderr),
-        exitCode,
-      };
-    }
-
-    const summary =
-      typeof parsed.summary === "string"
-        ? parsed.summary
-        : exitCode === 0
-          ? `${kind} passed via OpenHands`
-          : `${kind} failed via OpenHands (exit ${exitCode})`;
-    const parsedStdout = typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout;
-    const parsedStderr = typeof parsed.stderr === "string" ? parsed.stderr : stderr;
-    const parsedExitCode =
-      typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
-        ? parsed.exitCode
-        : exitCode;
-    const parsedOk = typeof parsed.ok === "boolean" ? parsed.ok : parsedExitCode === 0;
-    const noChangeResult =
-      parsedOk &&
-      (hasOpenHandsNoChangeSignal(summary) ||
-        hasOpenHandsNoChangeSignal(String(parsedStdout ?? "")) ||
-        hasOpenHandsNoChangeSignal(String(parsedStderr ?? "")));
-    if (noChangeResult) {
-      const clarificationQuestion = extractClarificationQuestionFromOutput(filteredStdout);
-      if (clarificationQuestion) {
-        return {
-          ok: false,
-          summary: "OpenHands requested clarification before making file changes",
-          stdout: truncate(filteredStdout || String(parsedStdout ?? "")),
-          stderr: truncate(`Clarification needed: ${clarificationQuestion}`),
-          exitCode: 3,
-        };
-      }
-    }
-
-    return {
-      ok: parsedOk,
-      summary,
-      stdout: truncate(parsedStdout ?? ""),
-      stderr: truncate(parsedStderr ?? ""),
-      exitCode: parsedExitCode,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      summary: `OpenHands wrapper execution error for ${kind}: ${String(err)}`,
-      exitCode: 1,
-    };
-  } finally {
-    if (warningTimer) {
-      clearTimeout(warningTimer);
-    }
-    if (timeoutTimer) {
-      clearTimeout(timeoutTimer);
-    }
-    if (stuckNudgeStartTimer) {
-      clearTimeout(stuckNudgeStartTimer);
-    }
-    if (stuckNudgeTimer) {
-      clearInterval(stuckNudgeTimer);
-    }
-  }
-}
-
-async function executeWithMiniSwe(
-  kind: string,
-  params: Record<string, unknown>,
-  repo: string,
-  onLog?: (stream: "stdout" | "stderr", line: string) => void,
-  budgets?: { executionBudgetMs?: number; finalizationBudgetMs?: number },
-): Promise<JobResult> {
-  const rawPythonBin = CONFIG.workerpals.miniswePython || "python";
-  // Resolve relative paths against project root so venv paths work
-  const pythonBin = rawPythonBin.includes("/") || rawPythonBin.includes("\\")
-    ? resolve(CONFIG.projectRoot, rawPythonBin)
-    : rawPythonBin;
-  const scriptPath = resolve(import.meta.dir, "..", "scripts", "miniswe_executor.py");
-  if (!existsSync(scriptPath)) {
-    return {
-      ok: false,
-      summary: `mini-swe-agent wrapper script not found: ${scriptPath}`,
-      exitCode: 1,
-    };
-  }
-
-  const configuredTimeoutMs = Math.max(10_000, CONFIG.workerpals.minisweTimeoutMs);
-  const executionBudgetMs =
-    typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
-      ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
-      : null;
-  const timeoutMs =
-    executionBudgetMs != null
-      ? Math.min(configuredTimeoutMs, executionBudgetMs)
-      : configuredTimeoutMs;
-
-  if (executionBudgetMs != null && executionBudgetMs !== configuredTimeoutMs) {
-    onLog?.(
-      "stdout",
-      `[MiniSweExecutor] Capping execution timeout to ${timeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms, worker cap=${configuredTimeoutMs}ms).`,
-    );
-  }
-
-  const payload = {
-    kind,
-    params,
-    repo,
-  };
-  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString("base64");
-  const args = [pythonBin, scriptPath, payloadBase64];
-
-  onLog?.("stdout", `[MiniSweExecutor] Spawning mini-swe-agent executor (timeout=${timeoutMs}ms)`);
-
-  try {
-    const proc = Bun.spawn(args, {
-      cwd: repo,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...process.env,
-        PUSHPALS_REPO_PATH: repo,
-        // mini-swe-agent prints emoji banners on import; Windows cp1252
-        // encoding chokes on them without explicit UTF-8.
-        PYTHONIOENCODING: "utf-8",
-      },
-    });
-
-    let timedOut = false;
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      onLog?.("stdout", `[MiniSweExecutor] Timeout reached after ${timeoutMs}ms; terminating process.`);
-      proc.kill();
-    }, timeoutMs);
-
-    const [rawStdout, rawStderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-
-    clearTimeout(timeoutTimer);
-
-    const stdout = rawStdout ?? "";
-    const stderr = rawStderr ?? "";
-
-    // Stream lines to onLog
-    for (const line of stdout.split(/\r?\n/)) {
-      if (line.trim() && !line.startsWith(EXECUTOR_RESULT_PREFIX)) {
-        onLog?.("stdout", line);
-      }
-    }
-    for (const line of stderr.split(/\r?\n/)) {
-      if (line.trim()) {
-        onLog?.("stderr", line);
-      }
-    }
-
-    // Parse structured result from sentinel
-    const lines = stdout.split(/\r?\n/);
-    let parsed: Record<string, unknown> | null = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line.startsWith(EXECUTOR_RESULT_PREFIX)) continue;
-      const raw = line.slice(EXECUTOR_RESULT_PREFIX.length).trim();
-      try {
-        parsed = JSON.parse(raw) as Record<string, unknown>;
-      } catch {
-        parsed = null;
-      }
-      break;
-    }
-
-    const filteredStdout = lines
-      .filter((l) => !l.trim().startsWith(EXECUTOR_RESULT_PREFIX))
-      .join("\n")
-      .trim();
-
-    const truncate = (s: string) =>
-      s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + "\n...[truncated]" : s;
-
-    if (!parsed) {
-      if (timedOut) {
-        return {
-          ok: false,
-          summary: `mini-swe-agent timed out after ${timeoutMs}ms`,
-          stdout: truncate(filteredStdout),
-          stderr: truncate(stderr),
-          exitCode: exitCode === 0 ? 124 : exitCode,
-        };
-      }
-      return {
-        ok: false,
-        summary: `mini-swe-agent wrapper did not return a structured result for ${kind}`,
-        stdout: truncate(filteredStdout),
-        stderr: truncate(stderr),
-        exitCode,
-      };
-    }
-
-    const summary =
-      typeof parsed.summary === "string"
-        ? parsed.summary
-        : exitCode === 0
-          ? `${kind} passed via mini-swe-agent`
-          : `${kind} failed via mini-swe-agent (exit ${exitCode})`;
-    const parsedStdout = typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout;
-    const parsedStderr = typeof parsed.stderr === "string" ? parsed.stderr : stderr;
-    const parsedExitCode =
-      typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
-        ? parsed.exitCode
-        : exitCode;
-    const parsedOk = typeof parsed.ok === "boolean" ? parsed.ok : parsedExitCode === 0;
-
-    return {
-      ok: parsedOk,
-      summary,
-      stdout: truncate(parsedStdout ?? ""),
-      stderr: truncate(parsedStderr ?? ""),
-      exitCode: parsedExitCode,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      summary: `mini-swe-agent wrapper execution error for ${kind}: ${String(err)}`,
-      exitCode: 1,
-    };
-  }
-}
 
 /** Execute a git command and return stdout */
 export async function git(
@@ -1420,46 +705,6 @@ export async function git(
   }
 }
 
-// ─── Stream helper ───────────────────────────────────────────────────────────
-
-/**
- * Read a process stream line-by-line, calling onLine for each.
- * Returns the full concatenated output.
- */
-export async function streamLines(
-  readable: ReadableStream<Uint8Array>,
-  streamName: "stdout" | "stderr",
-  onLine: (stream: "stdout" | "stderr", line: string) => void,
-): Promise<string> {
-  const decoder = new TextDecoder();
-  const reader = readable.getReader();
-  let full = "";
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const chunk = decoder.decode(value, { stream: true });
-    full += chunk;
-    buffer += chunk;
-
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      const clean = line.endsWith("\r") ? line.slice(0, -1) : line;
-      onLine(streamName, clean);
-    }
-  }
-
-  // Flush remaining buffer
-  if (buffer.length > 0) {
-    const clean = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
-    onLine(streamName, clean);
-  }
-
-  return full;
-}
 
 // ─── Git commit creation ─────────────────────────────────────────────────────
 
@@ -1475,9 +720,10 @@ export async function createJobCommit(
     sessionId?: string;
     context?: "host" | "docker";
   },
+  runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
 ): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
-  const requirePush = CONFIG.workerpals.requirePush;
-  const pushAgentBranch = requirePush || CONFIG.workerpals.pushAgentBranch;
+  const requirePush = runtimeConfig.workerpals.requirePush;
+  const pushAgentBranch = requirePush || runtimeConfig.workerpals.pushAgentBranch;
   const publicBranchName = `agent/${workerId}/${job.id}`;
   // Keep worker refs out of refs/heads so user-visible branch lists stay clean.
   const hiddenCommitRef = `refs/pushpals/agent/${workerId}/${job.id}`;
@@ -1839,13 +1085,9 @@ function buildWorkerCommitMessage(
 
 // ─── Job execution ───────────────────────────────────────────────────────────
 
-export interface JobResult {
-  ok: boolean;
-  summary: string;
-  stdout?: string;
-  stderr?: string;
-  exitCode?: number;
-}
+export type { JobResult } from "./common/types.js";
+
+const SUPPORTED_JOB_KINDS = new Set(["warmup.execute", "task.execute"]);
 
 type TaskExecutePriority = "interactive" | "normal" | "background";
 type TaskExecuteIntent = "chat" | "status" | "code_change" | "analysis" | "other";
@@ -1925,20 +1167,21 @@ export async function executeJob(
   params: Record<string, unknown>,
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
 ): Promise<JobResult> {
+  if (!SUPPORTED_JOB_KINDS.has(kind)) {
+    return {
+      ok: false,
+      summary: `Unsupported job kind "${kind}". WorkerPals accepts only ${[...SUPPORTED_JOB_KINDS].join(" or ")}.`,
+    };
+  }
+
   if (kind === "warmup.execute") {
     return {
       ok: true,
       summary: "Startup warmup completed (no-op, no commit).",
       stdout: "warmup.execute completed",
       exitCode: 0,
-    };
-  }
-
-  if (kind !== "task.execute") {
-    return {
-      ok: false,
-      summary: `Unsupported job kind "${kind}". WorkerPals accepts only task.execute or warmup.execute.`,
     };
   }
 
@@ -1960,16 +1203,6 @@ export async function executeJob(
     };
   }
 
-  const lane = String(params.lane ?? "openhands")
-    .trim()
-    .toLowerCase();
-  if (lane !== "openhands" && lane !== "deterministic") {
-    return {
-      ok: false,
-      summary: "task.execute requires params.lane to be either 'openhands' or 'deterministic'.",
-    };
-  }
-
   const instruction = String(params.instruction ?? "").trim();
   if (!instruction) {
     return {
@@ -1980,7 +1213,6 @@ export async function executeJob(
 
   const normalizedParams: Record<string, unknown> = {
     ...params,
-    lane,
     instruction,
   };
   const planning = params.planning as TaskExecutePlanning;
@@ -1996,18 +1228,30 @@ export async function executeJob(
       attemptParams.qualityRevisionAttempt = revisionAttempt;
     }
 
-    const executor = resolveExecutor();
+    const executor = resolveExecutor(runtimeConfig);
     const executeBudgets = { executionBudgetMs, finalizationBudgetMs };
-    const result =
-      executor === "openhands"
-        ? await executeWithOpenHands(kind, attemptParams, repo, onLog, executeBudgets)
-        : await executeWithMiniSwe(kind, attemptParams, repo, onLog, executeBudgets);
+    const runExecutor = getBackendTaskExecutor(executor);
+    if (!runExecutor) {
+      return {
+        ok: false,
+        summary: `No task executor registered for backend "${executor}"`,
+        exitCode: 1,
+      };
+    }
+    const result = await runExecutor(
+      kind,
+      attemptParams,
+      repo,
+      runtimeConfig,
+      onLog,
+      executeBudgets,
+    );
     if (!result.ok) return result;
 
     const quality = await runDeterministicQualityGate(repo, attemptParams, onLog);
     const critic = quality.skipped
       ? null
-      : await runTaskCriticReview(repo, attemptParams, quality, onLog);
+      : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
     const criticRequiresRevision = Boolean(
       critic && (critic.score < QUALITY_CRITIC_MIN_SCORE || critic.mustFix.length > 0),
     );
@@ -2016,7 +1260,7 @@ export async function executeJob(
       if (critic) {
         onLog?.(
           "stdout",
-          `[OpenHandsExecutor] Critic review score ${critic.score.toFixed(1)}/10 (threshold ${QUALITY_CRITIC_MIN_SCORE}).`,
+          `[QualityGate] Critic review score ${critic.score.toFixed(1)}/10 (threshold ${QUALITY_CRITIC_MIN_SCORE}).`,
         );
       }
       return result;
@@ -2058,7 +1302,7 @@ export async function executeJob(
     revisionHint = buildQualityRevisionHint(issues, critic, planning);
     onLog?.(
       "stderr",
-      `[OpenHandsExecutor] Quality gate requested revision ${revisionAttempt}/${QUALITY_MAX_AUTO_REVISIONS}: ${toSingleLine(
+      `[QualityGate] Quality gate requested revision ${revisionAttempt}/${QUALITY_MAX_AUTO_REVISIONS}: ${toSingleLine(
         issueSummary,
         260,
       )}`,

@@ -53,30 +53,25 @@ function log(stream: "stdout" | "stderr", line: string): void {
 function setupGitCredentials(): void {
   const token = loadPushPalsConfig().gitToken ?? process.env.GIT_TOKEN ?? null;
   if (!token) return;
-
   try {
     // Get the origin URL and rewrite it with the token
     const proc = Bun.spawn(["git", "remote", "get-url", "origin"], {
       stdout: "pipe",
       stderr: "pipe",
     });
-
     // We need to do this synchronously-ish for setup
     // For now, we'll set up a credential helper
     const helperScript = `#!/bin/sh
 echo "username=oauth2"
 echo "password=${token}"
 `;
-
     // Write credential helper
     const fs = require("fs");
     const path = require("path");
     const helperPath = "/tmp/git-credential-helper";
     fs.writeFileSync(helperPath, helperScript, { mode: 0o755 });
-
     // Configure git to use it
     Bun.spawnSync(["git", "config", "--global", "credential.helper", helperPath]);
-
     // Also set up the URL to use HTTPS with token
     Bun.spawnSync([
       "git",
@@ -112,18 +107,14 @@ async function main(): Promise<void> {
     console.error(`Failed to decode job spec: ${err}`);
     process.exit(1);
   }
-
   log("stdout", `[JobRunner] Starting job ${spec.jobId} (${spec.kind})`);
-
   // Setup git credentials for pushing
   setupGitCredentials();
-
   // Execute inside the mounted job worktree (docker -w), not the baked image copy.
   const jobRepo = process.cwd();
   const result = await executeJob(spec.kind, spec.params, jobRepo, (stream, line) => {
     log(stream, line);
   });
-
   // Build result object
   const jobResult: JobResult = {
     ok: result.ok,
@@ -132,7 +123,6 @@ async function main(): Promise<void> {
     stderr: result.stderr,
     exitCode: result.exitCode,
   };
-
   // Create commit for file-modifying jobs
   if (result.ok && shouldCommit(spec.kind)) {
     log("stdout", `[JobRunner] Job modified files, creating commit...`);

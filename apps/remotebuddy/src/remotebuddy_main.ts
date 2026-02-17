@@ -906,6 +906,8 @@ class RemoteBuddyOrchestrator {
       prompt: string;
       priority?: string;
       queueWaitBudgetMs?: number;
+      forceWorker?: boolean;
+      forceLane?: TaskExecutionLane;
     },
     queueWaitMs = 0,
   ): Promise<void> {
@@ -929,6 +931,12 @@ class RemoteBuddyOrchestrator {
       return;
     }
 
+    const reqAny = request as any;
+    const forceWorker = Boolean(reqAny.forceWorker ?? reqAny.force_worker);
+    const laneRaw = String(reqAny.forceLane ?? reqAny.force_lane ?? "").trim().toLowerCase();
+    const forceLane: TaskExecutionLane | undefined =
+      laneRaw === "deterministic" || laneRaw === "openhands" ? (laneRaw as TaskExecutionLane) : undefined;
+
     const priority = normalizeRequestPriority(request.priority);
     const queueWaitBudgetMs = Math.max(
       5_000,
@@ -948,38 +956,61 @@ class RemoteBuddyOrchestrator {
         `[RemoteBuddy] Planning request ${requestId.slice(0, 8)} priority=${priority} queueWait=${Math.max(
           0,
           Math.floor(queueWaitMs),
-        )}ms`,
+        )}ms${forceWorker ? ` forceWorker=true forceLane=${forceLane ?? "openhands"}` : ""}`,
       );
-      const plan = await this.brain.think(prompt, planningContext);
+
+      const plan = await this.brain.think(prompt, planningContext, { forceWorker, forceLane });
       this.pushContext(`[user] ${toSingleLine(prompt, 700)}`);
       this.pushContext(`[plan] ${toSingleLine(JSON.stringify(plan), 900)}`);
-      const requiresWorker = this.shouldForceDirectReply(prompt, plan.intent)
-        ? false
-        : plan.requires_worker;
-      const targetPath = plan.target_paths[0] ?? extractTargetPath(prompt) ?? undefined;
+      const fallbackTargetPath = extractTargetPath(prompt) ?? "README.md";
+      const targetPaths = Array.isArray(plan.target_paths) && plan.target_paths.length > 0
+          ? plan.target_paths
+          : [fallbackTargetPath];
+      const targetPath = targetPaths[0];
+      // forceWorker overrides "direct reply" short-circuit + planner requires_worker
+      const requiresWorker = forceWorker
+        ? true
+        : this.shouldForceDirectReply(prompt, plan.intent)
+          ? false
+          : plan.requires_worker;
+      console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
+      // when forcing worker, don't fail on "planner contract incomplete" — fill safe defaults.
       if (requiresWorker) {
-        const missing: string[] = [];
         if (plan.target_paths.length === 0) {
-          if (targetPath) {
-            plan.target_paths = [targetPath];
-          } else {
-            missing.push("target_paths");
+          if (targetPath) plan.target_paths = [targetPath];
+        }
+        if (plan.acceptance_criteria.length === 0) {
+          plan.acceptance_criteria = ["Produce a correct and helpful result for the user request."];
+        }
+        if (plan.validation_steps.length === 0) {
+          plan.validation_steps = [];
+        }
+
+        // Keep strictness only for non-forced paths.
+        if (!forceWorker) {
+          const missing: string[] = [];
+          if (plan.target_paths.length === 0) missing.push("target_paths");
+          if (plan.acceptance_criteria.length === 0) missing.push("acceptance_criteria");
+          if (plan.validation_steps.length === 0) missing.push("validation_steps");
+          if (missing.length > 0) {
+            throw new Error(
+              `Planner contract incomplete for task.execute: missing ${missing.join(
+                ", ",
+              )}. RemoteBuddy requires explicit target paths, acceptance criteria, and validation steps.`,
+            );
           }
         }
-        if (plan.acceptance_criteria.length === 0) missing.push("acceptance_criteria");
-        if (plan.validation_steps.length === 0) missing.push("validation_steps");
-        if (missing.length > 0) {
-          throw new Error(
-            `Planner contract incomplete for task.execute: missing ${missing.join(
-              ", ",
-            )}. RemoteBuddy requires explicit target paths, acceptance criteria, and validation steps.`,
-          );
-        }
       }
+
+      // allow forcing lane (default to openhands for forced worker)
       let lane = requiresWorker ? this.chooseExecutionLane(prompt, plan) : "deterministic";
       if (requiresWorker && lane === "deterministic" && !targetPath) {
         lane = "openhands";
       }
+      if (forceWorker) {
+        lane = forceLane ?? "openhands";
+      }
+
       const canonicalInstruction = prompt.trim();
       const rawPlannerInstruction = String(plan.worker_instruction ?? "").trim();
       const executionGuidance = buildExecutionGuidance(plan, targetPath);
@@ -1013,6 +1044,8 @@ class RemoteBuddyOrchestrator {
               lane: "deterministic",
               priority,
               queueWaitMs: Math.max(0, Math.floor(queueWaitMs)),
+              forceWorker,
+              forceLane: forceLane ?? null,
             },
           }),
         }).catch(() => {});
@@ -1111,6 +1144,8 @@ class RemoteBuddyOrchestrator {
             targetPaths: plan.target_paths,
             acceptanceCriteria: plan.acceptance_criteria,
             validationSteps: plan.validation_steps,
+            forceWorker,
+            forceLane: forceLane ?? null,
           },
         }),
       }).catch(() => {});
@@ -1149,12 +1184,18 @@ class RemoteBuddyOrchestrator {
               prompt: string;
               priority?: string;
               queueWaitBudgetMs?: number;
+              forceWorker?: boolean;
+              forceLane?: TaskExecutionLane;
             };
             queueWaitMs?: number;
           };
-
+          console.log("[RemoteBuddy] claim payload:", JSON.stringify(data, null, 2));
           if (data.ok && data.request) {
-            console.log(`[RemoteBuddy] Claimed request ${data.request.id}`);
+            console.log(
+              `[RemoteBuddy] Claimed request ${data.request.id}${
+                data.request.forceWorker ? ` (forceWorker=true)` : ""
+              }`,
+            );
             // Serialize processing
             this.chain = this.chain
               .then(() => this.processRequest(data.request!, Number(data.queueWaitMs ?? 0)))

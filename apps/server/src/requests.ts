@@ -74,6 +74,9 @@ export interface RequestRow {
   prompt: string;
   priority: QueuePriority;
   queueWaitBudgetMs: number;
+  // Overrides / routing hints for RemoteBuddy
+  forceWorker: number; // 0/1 (SQLite INTEGER)
+  forceLane: string | null; // "openhands" | "deterministic" | null
   status: RequestStatus;
   agentId: string | null;
   result: string | null;
@@ -112,6 +115,8 @@ export class RequestQueue {
     prompt,
     priority,
     queueWaitBudgetMs,
+    forceWorker,
+    forceLane,
     status,
     agentId,
     result,
@@ -139,6 +144,8 @@ export class RequestQueue {
         prompt           TEXT NOT NULL,
         priority         TEXT NOT NULL DEFAULT 'normal',
         queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000,
+        forceWorker      INTEGER NOT NULL DEFAULT 0,
+        forceLane        TEXT,
         status           TEXT NOT NULL DEFAULT 'pending',
         agentId          TEXT,
         result           TEXT,
@@ -162,14 +169,18 @@ export class RequestQueue {
     };
 
     ensureColumn("prompt", `ALTER TABLE requests ADD COLUMN prompt TEXT NOT NULL DEFAULT '';`);
-    ensureColumn(
-      "priority",
-      `ALTER TABLE requests ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`,
-    );
+    ensureColumn("priority", `ALTER TABLE requests ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
     ensureColumn(
       "queueWaitBudgetMs",
       `ALTER TABLE requests ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`,
     );
+
+    ensureColumn(
+      "forceWorker",
+      `ALTER TABLE requests ADD COLUMN forceWorker INTEGER NOT NULL DEFAULT 0;`,
+    );
+    ensureColumn("forceLane", `ALTER TABLE requests ADD COLUMN forceLane TEXT;`);
+
     ensureColumn("enqueuedAt", `ALTER TABLE requests ADD COLUMN enqueuedAt TEXT;`);
     ensureColumn("claimedAt", `ALTER TABLE requests ADD COLUMN claimedAt TEXT;`);
     ensureColumn("completedAt", `ALTER TABLE requests ADD COLUMN completedAt TEXT;`);
@@ -189,7 +200,14 @@ export class RequestQueue {
           WHEN 'background' THEN 'background'
           ELSE 'normal'
         END,
-        queueWaitBudgetMs = CASE WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90000 ELSE queueWaitBudgetMs END,
+        queueWaitBudgetMs = CASE
+          WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90000
+          ELSE queueWaitBudgetMs
+        END,
+        forceWorker = CASE
+          WHEN forceWorker IS NULL THEN 0
+          ELSE forceWorker
+        END,
         enqueuedAt = COALESCE(enqueuedAt, createdAt)
       WHERE 1 = 1;
     `);
@@ -244,6 +262,11 @@ export class RequestQueue {
     const priority = normalizePriority(body.priority);
     const queueWaitBudgetMs = parseBudgetMs(body.queueWaitBudgetMs, PRIORITY_SLA_MS[priority]);
 
+    // Optional overrides (for RemoteBuddy)
+    const forceWorker = body.forceWorker === true ? 1 : 0;
+    const rawLane = typeof body.forceLane === "string" ? body.forceLane.trim().toLowerCase() : "";
+    const forceLane = rawLane === "openhands" || rawLane === "deterministic" ? rawLane : null;
+
     if (!sessionId || !prompt) {
       return { ok: false, message: "sessionId and prompt are required" };
     }
@@ -254,12 +277,24 @@ export class RequestQueue {
     this.db
       .prepare(
         `INSERT INTO requests (
-          id, sessionId, prompt, priority, queueWaitBudgetMs, status, agentId, result, error,
+          id, sessionId, prompt, priority, queueWaitBudgetMs, forceWorker, forceLane,
+          status, agentId, result, error,
           enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
         )
-         VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
       )
-      .run(requestId, sessionId, prompt, priority, queueWaitBudgetMs, now, now, now);
+      .run(
+        requestId,
+        sessionId,
+        prompt,
+        priority,
+        queueWaitBudgetMs,
+        forceWorker,
+        forceLane,
+        now,
+        now,
+        now,
+      );
 
     const queuePosition = this.queuePosition(requestId);
     const etaMs = this.estimateEtaMs(priority, queuePosition);

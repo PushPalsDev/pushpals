@@ -116,7 +116,7 @@ const gitDiff: ToolDefinition = {
 const gitApplyPatch: ToolDefinition = {
   name: "git.applyPatch",
   description: "Apply a unified diff patch via `git apply`",
-  requiresApproval: true, // ← Needs user approval
+  requiresApproval: true,
   timeout: 15_000,
   async execute(args, ctx) {
     const patch = args.patch as string;

@@ -37,6 +37,7 @@
     "format:check": "prettier --check .",
     "test:root": "bun test tests",
     "test:protocol": "bun run tests/protocol.integration.ts",
+    "test:integration": "python -u tests/integration/test_workerpals_e2e.py",
     "test": "bun run test:root && bun run test:protocol",
     "smoke": "bun run scripts/smoke-test.ts"
   },

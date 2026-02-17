@@ -11,6 +11,13 @@
  * Job execution modes:
  *   - Direct mode (default): jobs run on host in isolated git worktrees
  *   - Docker mode (--docker): jobs run in isolated Docker containers
+ * 
+ * Workerpals_main --> docker_executor (if Docker mode) --> job_runner (inside container if Docker mode)
+ * job_runner -> job_runner::executeJob (executes the actual job command) -> job_runner (returns result) -> workerpals_main (handles completion)
+ * 
+ * WorkerPals_main handles job claiming, heartbeats, and completion enqueuing.
+ * 
+ * JobRunner executes a single job, streams logs, and outputs a final result with a sentinel line.
  */
 
 import type { CommandRequest } from "protocol";
@@ -18,7 +25,8 @@ import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import { resolve } from "path";
 import { detectRepoRoot, loadPromptTemplate, loadPushPalsConfig } from "shared";
-import { executeJob, shouldCommit, createJobCommit, git, resolveExecutor, type JobResult } from "./execute_job.js";
+import { resolveExecutor } from "./common/executor_backend.js";
+import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 
@@ -37,10 +45,14 @@ type WorkerJobResult = JobResult & {
   cooldownMs?: number;
 };
 
-const DEFAULT_OPENHANDS_MODEL = "local-model";
+const DEFAULT_LLM_MODEL = "local-model";
 const CONFIG = loadPushPalsConfig();
 
-function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl: string } {
+function workerLlmConfig(runtimeConfig: ReturnType<typeof loadPushPalsConfig>): {
+  model: string;
+  provider: string;
+  baseUrl: string;
+} {
   const normalizeProvider = (raw: string): string => {
     const value = raw.trim().toLowerCase();
     if (!value) return "auto";
@@ -50,12 +62,12 @@ function workerOpenHandsLlmConfig(): { model: string; provider: string; baseUrl:
     return value;
   };
 
-  const model = CONFIG.workerpals.llm.model.trim().replace(/\s+/g, " ");
-  const provider = normalizeProvider(CONFIG.workerpals.llm.backend);
-  const baseUrl = CONFIG.workerpals.llm.endpoint.trim();
+  const model = runtimeConfig.workerpals.llm.model.trim().replace(/\s+/g, " ");
+  const provider = normalizeProvider(runtimeConfig.workerpals.llm.backend);
+  const baseUrl = runtimeConfig.workerpals.llm.endpoint.trim();
 
   return {
-    model: model || DEFAULT_OPENHANDS_MODEL,
+    model: model || DEFAULT_LLM_MODEL,
     provider: provider || "auto",
     baseUrl,
   };
@@ -219,6 +231,7 @@ async function runJob(
   },
   repo: string,
   dockerExecutor: DockerExecutor | null,
+  runtimeConfig: ReturnType<typeof loadPushPalsConfig>,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<WorkerJobResult> {
   if (dockerExecutor) {
@@ -232,7 +245,7 @@ async function runJob(
       commit: result.commit,
     };
   }
-  return executeJob(job.kind, job.params, repo, onLog);
+  return executeJob(job.kind, job.params, repo, onLog, runtimeConfig);
 }
 
 async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promise<string> {
@@ -392,7 +405,7 @@ function isLowSignalResultSummary(summary: string): boolean {
   if (!text) return true;
   return (
     text.includes("executed task and modified") ||
-    text.includes("executed task via openhands") ||
+    text.includes("executed task via") ||
     text.includes("no file changes detected") ||
     text.includes("task summary")
   );
@@ -541,7 +554,9 @@ function buildCompletionPrMetadata(args: {
     task_instruction: taskInstruction || "(not provided)",
     motivation_lines: toBulletList(motivationLines),
     target_paths_lines: toBulletList(
-      changedPaths.length > 0 ? changedPaths.map((path) => `\`${sanitizePrText(path, 180)}\``) : ["None identified"],
+      changedPaths.length > 0
+        ? changedPaths.map((path) => `\`${sanitizePrText(path, 180)}\``)
+        : ["None identified"],
     ),
     validation_plan_lines: toBulletList(validationLines),
     changes_lines: toBulletList(changesLines),
@@ -672,7 +687,7 @@ async function sendWorkerHeartbeat(
         capabilities: {
           docker: opts.docker,
           labels: opts.labels,
-          executor: resolveExecutor(),
+          executor: resolveExecutor(CONFIG),
           requireDocker: opts.requireDocker,
         },
         details: {
@@ -703,7 +718,7 @@ async function workerLoop(
   } else {
     console.log(`[WorkerPals ${opts.workerId}] Direct mode with isolated worktrees enabled`);
   }
-  console.log(`[WorkerPals ${opts.workerId}] Executor backend: openhands`);
+  console.log(`[WorkerPals ${opts.workerId}] Executor backend: ${resolveExecutor(CONFIG)}`);
   const heartbeatEveryMs = Math.max(1000, opts.heartbeatMs);
   let lastHeartbeatAt = 0;
 
@@ -817,7 +832,7 @@ async function workerLoop(
             let cooldownAfterJobMs = 0;
             const jobStartedAtMs = Date.now();
             try {
-              result = await runJob(jobData, executionRepo, dockerExecutor, onLog);
+              result = await runJob(jobData, executionRepo, dockerExecutor, CONFIG, onLog);
               cooldownAfterJobMs =
                 Number.isFinite(result.cooldownMs) && (result.cooldownMs ?? 0) > 0
                   ? Math.floor(result.cooldownMs ?? 0)
@@ -868,14 +883,19 @@ async function workerLoop(
                 };
               } else {
                 console.log(`[WorkerPals] Job ${job.id} modified files, creating commit...`);
-                const commitResult = await createJobCommit(executionRepo, opts.workerId, {
-                  id: job.id,
-                  taskId: job.taskId,
-                  kind: job.kind,
-                  params: parsedParams,
-                  sessionId: job.sessionId,
-                  context: "host",
-                });
+                const commitResult = await createJobCommit(
+                  executionRepo,
+                  opts.workerId,
+                  {
+                    id: job.id,
+                    taskId: job.taskId,
+                    kind: job.kind,
+                    params: parsedParams,
+                    sessionId: job.sessionId,
+                    context: "host",
+                  },
+                  CONFIG,
+                );
 
                 if (commitResult.ok && commitResult.sha && commitResult.branch) {
                   if (commitResult.sha !== "no-changes") {
@@ -1042,13 +1062,13 @@ async function workerLoop(
 
 async function main(): Promise<void> {
   const opts = parseArgs();
-  const llmConfig = workerOpenHandsLlmConfig();
+  const llmConfig = workerLlmConfig(CONFIG);
 
   console.log(`[WorkerPals] PushPals WorkerPals Daemon (${opts.workerId})`);
   console.log(`[WorkerPals] Server: ${opts.server}`);
   console.log(`[WorkerPals] Repo: ${opts.repo}`);
   console.log(
-    `[WorkerPals] OpenHands LLM: model=${llmConfig.model} provider=${llmConfig.provider} baseUrl=${llmConfig.baseUrl || "(unset)"}`,
+    `[WorkerPals] Worker LLM: model=${llmConfig.model} provider=${llmConfig.provider} baseUrl=${llmConfig.baseUrl || "(unset)"}`,
   );
   opts.worktreeBaseRef = await resolveWorktreeBaseRef(opts.repo, opts.worktreeBaseRef);
   console.log(`[WorkerPals] Worktree base ref: ${opts.worktreeBaseRef}`);
@@ -1077,6 +1097,7 @@ async function main(): Promise<void> {
         idleTimeoutMs: opts.dockerIdleTimeout,
         networkMode: opts.dockerNetworkMode,
         baseRef: opts.worktreeBaseRef,
+        config: CONFIG,
       });
 
       await dockerExecutor.cleanupOrphanedWorktrees();

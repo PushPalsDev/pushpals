@@ -16,11 +16,26 @@ import { randomUUID } from "crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { isAbsolute, relative, resolve } from "path";
 import { loadPushPalsConfig } from "shared";
+import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
+import type { ExecutorBackend } from "./common/types.js";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
-import { resolveExecutor } from "./execute_job.js";
+import {
+  BACKEND_DOCKER_PASSTHROUGH_ENV,
+  BACKEND_RUNTIME_CONFIG_KEYS,
+  DOCKER_BACKENDS,
+  SHARED_DOCKER_PASSTHROUGH_ENV,
+  getDockerBackendSpec,
+} from "./backends/backend_config.js";
+import type {
+  DockerBackendRuntimeConfig,
+  DockerBackendSpec,
+  DockerWarmShellResult,
+  DockerWarmStartupContext,
+} from "./backends/types.js";
 
 const DEFAULT_OPENHANDS_MODEL = "local-model";
-const CONFIG = loadPushPalsConfig();
+const DEFAULT_CONFIG = loadPushPalsConfig();
+const SHARED_CONTAINER_VENV_PYTHON = "/workspace/.venv/bin/python";
 
 function parseClampedInt(value: unknown, defaultValue: number, min: number, max: number): number {
   const parsed =
@@ -77,6 +92,8 @@ export interface DockerExecutorOptions {
   baseRef?: string;
   /** Docker network mode for warm container (e.g. bridge, none) */
   networkMode?: string;
+  /** Shared runtime config loaded by worker entrypoint */
+  config?: WorkerpalsRuntimeConfig;
 }
 
 export interface DockerJobResult {
@@ -101,7 +118,7 @@ export interface Job {
 }
 
 export class DockerExecutor {
-  private options: Required<DockerExecutorOptions>;
+  private options: Required<Omit<DockerExecutorOptions, "config">>;
   private worktreeDir: string;
   private warmContainerName: string;
   private warmAgentPort = 39231;
@@ -116,10 +133,14 @@ export class DockerExecutor {
   private readonly failureCooldownMs: number;
   private lastLoggedExecutionConfig = "";
   private lastLoggedEndpointRewrite = "";
+  private warmedBackends = new Set<string>();
+  private readonly config: WorkerpalsRuntimeConfig;
 
   constructor(options: DockerExecutorOptions) {
+    const { config, ...optionValues } = options;
+    this.config = config ?? DEFAULT_CONFIG;
     const startupTimeoutMs = parseClampedInt(
-      CONFIG.workerpals.dockerAgentStartupTimeoutMs,
+      this.config.workerpals.dockerAgentStartupTimeoutMs,
       45_000,
       10_000,
       180_000,
@@ -127,33 +148,33 @@ export class DockerExecutor {
 
     this.options = {
       gitToken: "",
-      // Keep a little headroom above OpenHands inner timeout so wrapper can
-      // emit a structured timeout failure before docker hard-kills the job.
+      // Keep headroom above backend wrapper timeout so the wrapper can emit
+      // a structured timeout failure before Docker hard-kills the job.
       timeoutMs: DEFAULT_DOCKER_TIMEOUT_MS,
       idleTimeoutMs: 10 * 60 * 1000,
       baseRef: "HEAD",
       networkMode: "bridge",
-      ...options,
+      ...optionValues,
     };
     this.worktreeDir = resolve(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
-    this.warmSetupMaxAttempts = parseClampedInt(CONFIG.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
+    this.warmSetupMaxAttempts = parseClampedInt(this.config.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
     this.warmSetupBackoffMs = parseClampedInt(
-      CONFIG.workerpals.dockerWarmRetryBackoffMs,
+      this.config.workerpals.dockerWarmRetryBackoffMs,
       2_000,
       250,
       60_000,
     );
-    this.jobRetryMaxAttempts = parseClampedInt(CONFIG.workerpals.dockerJobMaxAttempts, 2, 1, 3);
+    this.jobRetryMaxAttempts = parseClampedInt(this.config.workerpals.dockerJobMaxAttempts, 2, 1, 3);
     this.jobRetryBackoffMs = parseClampedInt(
-      CONFIG.workerpals.dockerJobRetryBackoffMs,
+      this.config.workerpals.dockerJobRetryBackoffMs,
       3_000,
       250,
       60_000,
     );
     this.failureCooldownMs = parseClampedIntAllowZero(
-      CONFIG.workerpals.failureCooldownMs,
+      this.config.workerpals.failureCooldownMs,
       20_000,
       300_000,
     );
@@ -195,7 +216,7 @@ export class DockerExecutor {
       // Step 3: Run Docker container with the worktree mounted
       for (let attempt = 1; attempt <= this.jobRetryMaxAttempts; attempt++) {
         try {
-          this.logExecutionConfig(job);
+          this.logExecutionConfig();
           const result = await this.runInWarmContainer(worktreePath, base64Spec, job, onLog);
           if (result.ok) return result;
 
@@ -369,70 +390,73 @@ export class DockerExecutor {
   /**
    * Run the Docker container and parse output
    */
-  private containerOpenHandsPython(): string {
-    const configured = CONFIG.workerpals.openhandsPython.trim();
-    if (!configured) {
-      return "/opt/openhands-venv/bin/python";
+  private containerBackendPython(
+    backend: ExecutorBackend,
+    runtimeConfig: DockerBackendRuntimeConfig = this.backendRuntimeConfig(),
+  ): string {
+    const spec = getDockerBackendSpec(backend);
+    const configured = spec.configuredPython(runtimeConfig);
+    return spec.normalizeContainerPython(configured, SHARED_CONTAINER_VENV_PYTHON);
+  }
+
+  private backendRuntimeConfig(): DockerBackendRuntimeConfig {
+    const workerCfg = this.config.workerpals as Record<string, unknown>;
+    const runtimeConfig: DockerBackendRuntimeConfig = {};
+    for (const backend of DOCKER_BACKENDS) {
+      const keys = BACKEND_RUNTIME_CONFIG_KEYS[backend.name] ?? {
+        pythonKey: `${backend.name}Python`,
+        timeoutKey: `${backend.name}TimeoutMs`,
+      };
+      const python = String(workerCfg[keys.pythonKey] ?? "python").trim() || "python";
+      const timeoutRaw = Number(workerCfg[keys.timeoutKey]);
+      const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(10_000, Math.floor(timeoutRaw)) : 300_000;
+      runtimeConfig[backend.name] = { python, timeoutMs };
     }
-    const lowered = configured.toLowerCase();
-    if (lowered === "python" || lowered === "python3") {
-      return "/opt/openhands-venv/bin/python";
-    }
-    return configured;
+    return runtimeConfig;
+  }
+
+  private currentBackend(): ExecutorBackend {
+    return resolveExecutor(this.config);
+  }
+
+  private currentBackendSpec(): DockerBackendSpec {
+    return getDockerBackendSpec(this.currentBackend());
+  }
+
+  private warmStartupContext(): DockerWarmStartupContext {
+    const { attempts, sleepSeconds } = this.warmAgentStartupLoop();
+    return {
+      sharedVenvPython: SHARED_CONTAINER_VENV_PYTHON,
+      warmAgentPort: this.warmAgentPort,
+      startupAttempts: attempts,
+      sleepSeconds,
+    };
   }
 
   private collectContainerEnv(): string[] {
     const containerLlmEndpoint = this.workerLlmEndpointForContainer();
+    const runtimeConfig = this.backendRuntimeConfig();
     const fixedEnv: Record<string, string> = {
-      WORKERPALS_EXECUTOR: CONFIG.workerpals.executor,
-      WORKERPALS_LLM_MODEL: CONFIG.workerpals.llm.model,
+      WORKERPALS_EXECUTOR: this.config.workerpals.executor,
+      WORKERPALS_LLM_MODEL: this.config.workerpals.llm.model,
       WORKERPALS_LLM_ENDPOINT: containerLlmEndpoint,
-      WORKERPALS_LLM_BACKEND: CONFIG.workerpals.llm.backend,
-      WORKERPALS_LLM_SESSION_ID: CONFIG.workerpals.llm.sessionId,
-      WORKERPALS_OPENHANDS_TIMEOUT_MS: String(CONFIG.workerpals.openhandsTimeoutMs),
-      WORKERPALS_OPENHANDS_PYTHON: this.containerOpenHandsPython(),
+      WORKERPALS_LLM_BACKEND: this.config.workerpals.llm.backend,
+      WORKERPALS_LLM_SESSION_ID: this.config.workerpals.llm.sessionId,
     };
-    if (CONFIG.workerpals.llm.apiKey.trim()) {
-      fixedEnv.WORKERPALS_LLM_API_KEY = CONFIG.workerpals.llm.apiKey;
+    for (const backend of DOCKER_BACKENDS) {
+      const name = backend.name.toUpperCase();
+      fixedEnv[`WORKERPALS_${name}_PYTHON`] = this.containerBackendPython(backend.name, runtimeConfig);
+      fixedEnv[`WORKERPALS_${name}_TIMEOUT_MS`] = String(backend.timeoutMs(runtimeConfig));
+    }
+    if (this.config.workerpals.llm.apiKey.trim()) {
+      fixedEnv.WORKERPALS_LLM_API_KEY = this.config.workerpals.llm.apiKey;
     }
 
-    const allowlist = [
-      "WORKERPALS_OPENHANDS_PROMPT_PROFILE",
-      "WORKERPALS_OPENHANDS_AGENT_MAX_STEPS",
-      "WORKERPALS_OPENHANDS_WORKSPACE_PYTHON",
-      "WORKERPALS_OPENHANDS_LLM_NUM_RETRIES",
-      "WORKERPALS_OPENHANDS_LLM_RETRY_MULTIPLIER",
-      "WORKERPALS_OPENHANDS_LLM_RETRY_MIN_WAIT",
-      "WORKERPALS_OPENHANDS_LLM_RETRY_MAX_WAIT",
-      "WORKERPALS_OPENHANDS_LLM_TIMEOUT_SEC",
-      "WORKERPALS_OPENHANDS_LLM_MAX_MESSAGE_CHARS",
-      "WORKERPALS_OPENHANDS_LLM_TIMEOUT_RECOVERY_ATTEMPTS",
-      "WORKERPALS_OPENHANDS_LLM_TIMEOUT_RECOVERY_BACKOFF_SEC",
-      "WORKERPALS_OPENHANDS_TASK_PROMPT_MODE",
-      "WORKERPALS_OPENHANDS_LARGE_INSTRUCTION_CHARS",
-      "WORKERPALS_OPENHANDS_ENABLE_BROWSER_TOOL",
-      "WORKERPALS_OPENHANDS_ENABLE_WEB_MCP",
-      "WORKERPALS_OPENHANDS_MCP_CONFIG_JSON",
-      "WORKERPALS_OPENHANDS_WEB_MCP_URL",
-      "WORKERPALS_OPENHANDS_WEB_MCP_NAME",
-      "WORKERPALS_OPENHANDS_WEB_MCP_TRANSPORT",
-      "WORKERPALS_OPENHANDS_WEB_MCP_AUTH_TOKEN",
-      "WORKERPALS_OPENHANDS_WEB_MCP_HEADERS_JSON",
-      "WORKERPALS_OPENHANDS_WEB_MCP_TIMEOUT_SEC",
-      "HTTP_PROXY",
-      "HTTPS_PROXY",
-      "NO_PROXY",
-      "ALL_PROXY",
-      "http_proxy",
-      "https_proxy",
-      "no_proxy",
-      "all_proxy",
-      "PUSHPALS_GIT_TOKEN",
-      "GITHUB_TOKEN",
-      "GH_TOKEN",
-      "GIT_TOKEN",
-      "PUSHPALS_REPO_PATH",
-    ];
+    const allowlist = new Set<string>(SHARED_DOCKER_PASSTHROUGH_ENV);
+    for (const backend of DOCKER_BACKENDS) {
+      const names = BACKEND_DOCKER_PASSTHROUGH_ENV[backend.name] ?? [];
+      for (const name of names) allowlist.add(name);
+    }
 
     const pairs: string[] = [];
     for (const [key, value] of Object.entries(fixedEnv)) {
@@ -475,6 +499,8 @@ export class DockerExecutor {
 
   private async startWarmContainer(): Promise<void> {
     await this.stopWarmContainer("pre-start cleanup", true);
+    const backendSpec = this.currentBackendSpec();
+    const warmContext = this.warmStartupContext();
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const envArgs = this.collectContainerEnv();
     const args: string[] = [
@@ -489,9 +515,9 @@ export class DockerExecutor {
       "--label",
       `pushpals.worker_id=${this.options.workerId}`,
       "--memory",
-      `${CONFIG.workerpals.dockerWarmMemoryMb}m`,
+      `${this.config.workerpals.dockerWarmMemoryMb}m`,
       "--cpus",
-      String(CONFIG.workerpals.dockerWarmCpus),
+      String(this.config.workerpals.dockerWarmCpus),
       "--network",
       this.options.networkMode,
       "--add-host",
@@ -507,33 +533,20 @@ export class DockerExecutor {
     if (this.options.gitToken) {
       args.push("-e", `GIT_TOKEN=${this.options.gitToken}`);
     }
-    args.push("-e", `WORKERPALS_OPENHANDS_AGENT_SERVER_URL=http://127.0.0.1:${this.warmAgentPort}`);
+    const backendEnv = backendSpec.warmContainerEnv?.(warmContext) ?? {};
+    for (const [key, value] of Object.entries(backendEnv)) {
+      if (!value) continue;
+      args.push("-e", `${key}=${value}`);
+    }
 
-    const healthCmd =
-      `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1 ` +
-      `|| curl -fsS http://127.0.0.1:${this.warmAgentPort}/ >/dev/null 2>&1`;
-    const { attempts: startupAttempts, sleepSeconds } = this.warmAgentStartupLoop();
-    const resolvePythonCmd =
-      'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
-      'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
-      '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }';
+    const startupCmd = backendSpec.warmContainerStartupCommand(warmContext);
 
     args.push(
       "--entrypoint",
       "/bin/sh",
       this.options.imageName,
       "-lc",
-      `${resolvePythonCmd}; ` +
-        ": >/tmp/openhands-agent.log; " +
-        `"$PY" -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
-        `for i in $(seq 1 ${startupAttempts}); do ${healthCmd} && break; sleep ${sleepSeconds}; done; ` +
-        `${healthCmd} || { ` +
-        'echo "agent server health check failed"; ' +
-        'ps -ef | grep -i "openhands.agent_server" | grep -v grep || true; ' +
-        "ls -l /tmp/openhands-agent.log 2>/dev/null || true; " +
-        "tail -n 160 /tmp/openhands-agent.log 2>/dev/null; " +
-        "exit 1; }; " +
-        "tail -f /dev/null",
+      startupCmd,
     );
 
     const proc = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
@@ -673,7 +686,7 @@ export class DockerExecutor {
   }
 
   private async probeWorkerLlmEndpoint(): Promise<string> {
-    const endpoint = (CONFIG.workerpals.llm.endpoint ?? "").trim();
+    const endpoint = (this.config.workerpals.llm.endpoint ?? "").trim();
     if (!endpoint) return "endpoint not configured";
     const probes = this.workerLlmProbeUrls(endpoint);
     if (probes.length === 0) return `endpoint malformed: ${endpoint}`;
@@ -702,7 +715,7 @@ export class DockerExecutor {
   }
 
   private workerLlmEndpointForContainer(): string {
-    const raw = (CONFIG.workerpals.llm.endpoint ?? "").trim();
+    const raw = (this.config.workerpals.llm.endpoint ?? "").trim();
     if (!raw) return raw;
     try {
       const parsed = new URL(raw);
@@ -743,14 +756,17 @@ export class DockerExecutor {
     return `UNREACHABLE (${lastError})`;
   }
 
-  private async collectWarmAgentDiagnostics(): Promise<string> {
+  private async collectWarmRuntimeDiagnostics(backend: ExecutorBackend): Promise<string> {
+    const spec = getDockerBackendSpec(backend);
+    const runtimeConfig = this.backendRuntimeConfig();
     const sections: string[] = [];
-    const model = CONFIG.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
-    const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
-    const endpoint = CONFIG.workerpals.llm.endpoint.trim() || "(unset)";
-    const configuredPython = CONFIG.workerpals.openhandsPython.trim() || "(unset)";
-    const containerPython = this.containerOpenHandsPython();
+    const model = this.config.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
+    const provider = this.normalizeProvider(this.config.workerpals.llm.backend);
+    const endpoint = this.config.workerpals.llm.endpoint.trim() || "(unset)";
+    const configuredPython = spec.configuredPython(runtimeConfig).trim() || "(unset)";
+    const containerPython = this.containerBackendPython(backend, runtimeConfig);
     const containerEndpoint = this.workerLlmEndpointForContainer();
+    sections.push(`[backend] ${backend}`);
     sections.push(`[llm-config] model=${model} provider=${provider} endpoint=${endpoint}`);
     sections.push(
       `[python-config] configured=${configuredPython} resolved_container_python=${containerPython}`,
@@ -772,28 +788,7 @@ export class DockerExecutor {
       return sections.join("\n");
     }
 
-    const checks: Array<{ label: string; command: string }> = [
-      {
-        label: "processes",
-        command: 'ps -ef | grep -i "openhands.agent_server" | grep -v grep || true',
-      },
-      {
-        label: "python",
-        command:
-          'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
-          'echo "configured=$PY"; ' +
-          'if [ -x "$PY" ]; then "$PY" -V 2>&1; else echo "configured python missing"; fi; ' +
-          "(command -v python3 && python3 -V) 2>/dev/null || true",
-      },
-      {
-        label: "agent-log-meta",
-        command: "ls -l /tmp/openhands-agent.log 2>/dev/null || true",
-      },
-      {
-        label: "agent-log-tail",
-        command: "tail -n 160 /tmp/openhands-agent.log 2>/dev/null || true",
-      },
-    ];
+    const checks = spec.diagnosticChecks?.(SHARED_CONTAINER_VENV_PYTHON) ?? [];
 
     for (const check of checks) {
       const result = await this.runWarmShell(check.command);
@@ -803,70 +798,6 @@ export class DockerExecutor {
       );
     }
     return sections.join("\n");
-  }
-
-  private async ensureWarmAgentServer(): Promise<void> {
-    const healthCmd =
-      `curl -fsS http://127.0.0.1:${this.warmAgentPort}/health >/dev/null 2>&1 ` +
-      `|| curl -fsS http://127.0.0.1:${this.warmAgentPort}/ >/dev/null 2>&1`;
-    const healthy = await this.runWarmShell(healthCmd);
-    if (healthy.ok) return;
-
-    console.warn(
-      `[DockerExecutor] Warm agent server is unhealthy in ${this.warmContainerName}; restarting it...`,
-    );
-
-    const { attempts: startupAttempts, sleepSeconds } = this.warmAgentStartupLoop();
-    const resolvePythonCmd =
-      'PY="${WORKERPALS_OPENHANDS_PYTHON:-/opt/openhands-venv/bin/python}"; ' +
-      'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
-      '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }';
-    const restartCmd =
-      "OLD_PIDS=\"$(ps -eo pid,args | awk '/[o]penhands\\.agent_server/ {print $1}' | tr '\\n' ' ')\"; " +
-      'if [ -n "$OLD_PIDS" ]; then kill $OLD_PIDS >/dev/null 2>&1 || true; fi; ' +
-      "sleep 0.2; " +
-      `${resolvePythonCmd}; ` +
-      ": >/tmp/openhands-agent.log; " +
-      `"$PY" -m openhands.agent_server --host 127.0.0.1 --port ${this.warmAgentPort} >/tmp/openhands-agent.log 2>&1 & ` +
-      `for i in $(seq 1 ${startupAttempts}); do ${healthCmd} && break; sleep ${sleepSeconds}; done; ` +
-      healthCmd;
-    const restarted = await this.runWarmShell(restartCmd);
-    if (restarted.ok) {
-      return;
-    }
-
-    let recreateError = "";
-    try {
-      console.warn(
-        `[DockerExecutor] Warm agent restart failed in ${this.warmContainerName}; recreating warm container once...`,
-      );
-      await this.startWarmContainer();
-      const postRecreateHealth = await this.runWarmShell(
-        `for i in $(seq 1 ${startupAttempts}); do ${healthCmd} && exit 0; sleep ${sleepSeconds}; done; exit 1`,
-      );
-      if (postRecreateHealth.ok) {
-        return;
-      }
-      const postRecreateOutput = [postRecreateHealth.stderr, postRecreateHealth.stdout]
-        .filter(Boolean)
-        .join("\n")
-        .trim();
-      recreateError = `post-recreate health check failed (exit ${postRecreateHealth.exitCode})${
-        postRecreateOutput ? `: ${postRecreateOutput}` : "."
-      }`;
-    } catch (error) {
-      recreateError = `recreate warm container failed: ${
-        error instanceof Error ? error.message : String(error)
-      }`;
-    }
-
-    const restartOutput = [restarted.stderr, restarted.stdout].filter(Boolean).join("\n").trim();
-    const diagnostics = await this.collectWarmAgentDiagnostics();
-    throw new Error(
-      `Warm OpenHands agent server could not be started (exit ${restarted.exitCode})${
-        restartOutput ? `: ${restartOutput}` : "."
-      }${recreateError ? `\n${recreateError}` : ""}\n${diagnostics}`,
-    );
   }
 
   private async stopWarmContainer(reason: string, quiet = false): Promise<void> {
@@ -900,7 +831,7 @@ export class DockerExecutor {
     job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<DockerJobResult> {
-    await this.ensureWarmRuntimeReady(onLog);
+    await this.ensureWarmRuntimeReady(job, onLog);
     const startedAtMs = Date.now();
 
     const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
@@ -919,7 +850,6 @@ export class DockerExecutor {
 
     console.log(
       `[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary(
-        job,
       )})`,
     );
 
@@ -991,27 +921,22 @@ export class DockerExecutor {
     return value;
   }
 
-  private executionConfigSummary(job?: Job): string {
-    const backend = resolveExecutor();
-    const model = CONFIG.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
-    const provider = this.normalizeProvider(CONFIG.workerpals.llm.backend);
-    const warmMemoryMb = CONFIG.workerpals.dockerWarmMemoryMb;
-    const warmCpus = CONFIG.workerpals.dockerWarmCpus;
-    const warmPython = this.containerOpenHandsPython();
-    const laneRaw =
-      job?.kind === "task.execute" && typeof job.params?.lane === "string" ? job.params.lane : "";
-    const lane = laneRaw.trim().toLowerCase();
-    return lane
-      ? `backend=${backend} model=${model} provider=${provider} lane=${lane} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus} warm_python=${warmPython}`
-      : `backend=${backend} model=${model} provider=${provider} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus} warm_python=${warmPython}`;
+  private executionConfigSummary(): string {
+    const backend = resolveExecutor(this.config);
+    const model = this.config.workerpals.llm.model.trim() || DEFAULT_OPENHANDS_MODEL;
+    const provider = this.normalizeProvider(this.config.workerpals.llm.backend);
+    const warmMemoryMb = this.config.workerpals.dockerWarmMemoryMb;
+    const warmCpus = this.config.workerpals.dockerWarmCpus;
+    const warmPython = this.containerBackendPython(backend);
+    return `backend=${backend} model=${model} provider=${provider} warm_memory_mb=${warmMemoryMb} warm_cpus=${warmCpus} warm_python=${warmPython}`;
   }
 
-  private logExecutionConfig(job: Job): void {
-    const summary = this.executionConfigSummary(job);
+  private logExecutionConfig(): void {
+    const summary = this.executionConfigSummary();
     if (summary === this.lastLoggedExecutionConfig) return;
     this.lastLoggedExecutionConfig = summary;
     console.log(`[DockerExecutor] Execution config: ${summary}`);
-    const configuredEndpoint = CONFIG.workerpals.llm.endpoint.trim();
+    const configuredEndpoint = this.config.workerpals.llm.endpoint.trim();
     const containerEndpoint = this.workerLlmEndpointForContainer();
     if (configuredEndpoint && configuredEndpoint !== containerEndpoint) {
       const rewriteSummary = `${configuredEndpoint} -> ${containerEndpoint}`;
@@ -1196,12 +1121,14 @@ export class DockerExecutor {
   }
 
   private async ensureWarmRuntimeReady(
+    job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<void> {
+    const backend = resolveExecutor(this.config);
     for (let attempt = 1; attempt <= this.warmSetupMaxAttempts; attempt++) {
       try {
         await this.ensureWarmContainer();
-        await this.ensureWarmAgentServer();
+        await this.ensureBackendWarmup(backend);
         return;
       } catch (err) {
         const retryable = this.isRetryableError(err);
@@ -1233,6 +1160,36 @@ export class DockerExecutor {
     }
   }
 
+  private async ensureBackendWarmup(backend: ExecutorBackend): Promise<void> {
+    if (this.warmedBackends.has(backend)) return;
+    const spec = getDockerBackendSpec(backend);
+    const warmContext = this.warmStartupContext();
+    if (spec.ensureWarmRuntime) {
+      await spec.ensureWarmRuntime({
+        ...warmContext,
+        warmContainerName: this.warmContainerName,
+        runWarmShell: (command: string): Promise<DockerWarmShellResult> => this.runWarmShell(command),
+        restartWarmContainer: async () => {
+          await this.startWarmContainer();
+        },
+        collectWarmDiagnostics: async () => this.collectWarmRuntimeDiagnostics(backend),
+      });
+      this.warmedBackends.add(backend);
+      return;
+    }
+    const cmd = spec.warmupProbeCommand?.(SHARED_CONTAINER_VENV_PYTHON);
+    if (cmd) {
+      const result = await this.runWarmShell(cmd);
+      if (!result.ok) {
+        const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+        throw new Error(
+          `${backend} runtime warmup failed (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
+        );
+      }
+    }
+    this.warmedBackends.add(backend);
+  }
+
   private backoffDelayMs(baseMs: number, attempt: number): number {
     const factor = Math.max(0, attempt - 1);
     const exponential = baseMs * Math.pow(2, factor);
@@ -1262,7 +1219,7 @@ export class DockerExecutor {
 
   private matchesRetryablePattern(text: string): boolean {
     const transientPatterns: RegExp[] = [
-      /warm openhands agent server/i,
+      /warm .*runtime/i,
       /failed to start warm container/i,
       /docker execution error/i,
       /cannot connect to the docker daemon/i,
