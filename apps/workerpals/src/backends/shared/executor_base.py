@@ -395,6 +395,74 @@ def summarize_git_changes(repo: str) -> List[str]:
         return []
 
 
+def log_git_status(repo: str, log_prefix: str = "[Executor]") -> None:
+    """Log ``git status --porcelain`` and ``git diff --stat`` for post-execution visibility."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo, capture_output=True, text=True, timeout=10, check=False,
+        )
+        lines = [l for l in (status.stdout or "").splitlines() if l.strip()]
+        if lines:
+            executor_log(f"{log_prefix} Git status after execution:")
+            for line in lines[:30]:
+                executor_log(f"  {line}")
+        else:
+            executor_log(f"{log_prefix} Git status: clean (no changes)")
+    except Exception as exc:
+        executor_log(f"{log_prefix} Git status failed: {exc}")
+
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--stat"],
+            cwd=repo, capture_output=True, text=True, timeout=10, check=False,
+        )
+        diff_lines = [l for l in (diff.stdout or "").splitlines() if l.strip()]
+        if diff_lines:
+            executor_log(f"{log_prefix} Git diff stat:")
+            for line in diff_lines[:20]:
+                executor_log(f"  {line}")
+    except Exception:
+        pass
+
+
+def log_agent_messages(messages: list, log_prefix: str = "[Executor]", max_chars: int = 200) -> None:
+    """Log a summary of agent message history (works with miniswe's message format)."""
+    step = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip()
+        if not role:
+            continue
+
+        step += 1
+        content = str(msg.get("content") or "").strip()
+
+        # Tool calls (assistant requesting a tool)
+        tool_calls = msg.get("tool_calls") or []
+        if tool_calls and isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    name = fn.get("name") or "unknown"
+                    args_raw = str(fn.get("arguments") or "")[:80]
+                    executor_log(f"{log_prefix} Step {step} (tool_call): {name}({args_raw})")
+            continue
+
+        # Tool response
+        if role == "tool":
+            name = str(msg.get("name") or msg.get("tool_call_id") or "tool")
+            excerpt = to_single_line(content, max_chars)
+            executor_log(f"{log_prefix} Step {step} (tool_result/{name}): {excerpt}")
+            continue
+
+        # Assistant or user text
+        excerpt = to_single_line(content, max_chars)
+        if excerpt:
+            executor_log(f"{log_prefix} Step {step} ({role}): {excerpt}")
+
+
 # ─── Payload parsing ────────────────────────────────────────────────────────
 
 @dataclass

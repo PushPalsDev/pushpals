@@ -76,7 +76,7 @@ export interface RequestRow {
   queueWaitBudgetMs: number;
   // Overrides / routing hints for RemoteBuddy
   forceWorker: number; // 0/1 (SQLite INTEGER)
-  forceLane: string | null; // "openhands" | "deterministic" | null
+  forceLane: string | null; // "worker" | "deterministic" | null
   status: RequestStatus;
   agentId: string | null;
   result: string | null;
@@ -268,7 +268,7 @@ export class RequestQueue {
     // Optional overrides (for RemoteBuddy)
     const forceWorker = body.forceWorker === true ? 1 : 0;
     const rawLane = typeof body.forceLane === "string" ? body.forceLane.trim().toLowerCase() : "";
-    const forceLane = rawLane === "openhands" || rawLane === "deterministic" ? rawLane : null;
+    const forceLane = rawLane === "deterministic" || rawLane === "worker" ? rawLane : null;
 
     if (!sessionId || !prompt) {
       return { ok: false, message: "sessionId and prompt are required" };

@@ -137,7 +137,7 @@ function isArchitectureIntent(text: string): boolean {
   return architectureCue && !codeChangeCue;
 }
 
-type TaskExecutionLane = "deterministic" | "openhands";
+type TaskExecutionLane = "deterministic" | "worker";
 type RequestPriority = "interactive" | "normal" | "background";
 type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
 type PlannerRisk = "low" | "medium" | "high";
@@ -255,15 +255,10 @@ function normalizePathHints(values: string[]): string[] {
   return out;
 }
 
-function plannerTargetPaths(plan: PlannerOutput, prompt: string): string[] {
-  const hints = normalizePathHints([
-    ...(plan.scope.write_globs ?? []),
-    ...(plan.discovery?.likely_dirs ?? []),
-  ]);
-  if (hints.length > 0) return hints.slice(0, 8);
-  const inferred = extractTargetPath(prompt);
-  if (inferred) return [inferred];
-  return ["README.md"];
+function plannerTargetPaths(_plan: PlannerOutput, _prompt: string): string[] {
+  // Always use the repo root — the worker operates on the full worktree.
+  // Small LLM planners often hallucinate incorrect targetPaths (e.g. "packages").
+  return ["."];
 }
 
 function normalizeValidationSteps(steps: string[]): string[] {
@@ -1036,7 +1031,7 @@ class RemoteBuddyOrchestrator {
       .trim()
       .toLowerCase();
     const forceLane: TaskExecutionLane | undefined =
-      laneRaw === "deterministic" || laneRaw === "openhands"
+      laneRaw === "deterministic" || laneRaw === "worker"
         ? (laneRaw as TaskExecutionLane)
         : undefined;
 
@@ -1059,7 +1054,7 @@ class RemoteBuddyOrchestrator {
         `[RemoteBuddy] Planning request ${requestId.slice(0, 8)} priority=${priority} queueWait=${Math.max(
           0,
           Math.floor(queueWaitMs),
-        )}ms${forceWorker ? ` forceWorker=true forceLane=${forceLane ?? "openhands"}` : ""}`,
+        )}ms${forceWorker ? ` forceWorker=true forceLane=${forceLane ?? "worker"}` : ""}`,
       );
 
       const plan: PlannerOutput = await this.brain.think(prompt, planningContext, {
@@ -1113,10 +1108,10 @@ class RemoteBuddyOrchestrator {
         ? this.chooseExecutionLane(prompt, plan, targetPaths.length)
         : "deterministic";
       if (requiresWorker && lane === "deterministic" && !targetPath) {
-        lane = "openhands";
+        lane = "worker";
       }
       if (forceWorker) {
-        lane = forceLane ?? "openhands";
+        lane = forceLane ?? "worker";
       }
 
       const canonicalInstruction = prompt.trim();
@@ -1227,7 +1222,7 @@ class RemoteBuddyOrchestrator {
           description:
             lane === "deterministic"
               ? "Deterministic execution lane (fast path)"
-              : "Agentic OpenHands execution lane",
+              : "Agentic worker execution lane",
           createdBy: `agent:${this.agentId}`,
           priority,
         },

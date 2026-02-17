@@ -79,12 +79,8 @@ def _now() -> float:
     return time.perf_counter()
 
 
-def _fmt_secs(seconds: float) -> str:
-    return f"{max(0.0, seconds):.2f}s"
-
-
 def _print_duration(label: str, started_at: float) -> None:
-    print(f"[TIMER] {label}: {_fmt_secs(_now() - started_at)}")
+    print(f"[TIMER] {label}: {_fmt_elapsed(_now() - started_at)}")
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -474,7 +470,7 @@ def list_workers(ttl_ms: int = 30000) -> list[dict]:
 def wait_for_worker_online(worker_id: str, timeout_sec: float = 25.0) -> dict | None:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
-        for worker in list_workers():
+        for worker in list_workers(ttl_ms=_WORKER_ONLINE_TTL_MS):
             if str(worker.get("workerId") or "") != worker_id:
                 continue
             if bool(worker.get("isOnline")):
@@ -483,10 +479,31 @@ def wait_for_worker_online(worker_id: str, timeout_sec: float = 25.0) -> dict | 
     return None
 
 
+# Heartbeat-based online TTL for the E2E test.  Workers send heartbeats every
+# 2 s, so 8 s is generous enough to avoid false negatives while still letting
+# a killed worker drop off quickly.
+_WORKER_ONLINE_TTL_MS = 8_000
+
+
+def wait_for_worker_offline(worker_id: str, timeout_sec: float = 20.0) -> bool:
+    """Poll until a specific worker is no longer listed as online."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        online_ids = [
+            str(w.get("workerId") or "")
+            for w in list_workers(ttl_ms=_WORKER_ONLINE_TTL_MS)
+            if bool(w.get("isOnline"))
+        ]
+        if worker_id not in online_ids:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def assert_only_worker_online(worker_id: str) -> None:
     online = [
         str(w.get("workerId") or "")
-        for w in list_workers()
+        for w in list_workers(ttl_ms=_WORKER_ONLINE_TTL_MS)
         if bool(w.get("isOnline")) and str(w.get("workerId") or "").strip()
     ]
     others = [wid for wid in online if wid != worker_id]
@@ -957,7 +974,7 @@ def main():
                     "prompt": REQUEST_PROMPT,
                     "priority": "normal",
                     "forceWorker": True,
-                    "forceLane": "openhands",
+                    "forceLane": "worker",
                 }
                 print(f"Enqueueing request: {REQUEST_PROMPT!r}")
                 enq_req = http_post("/requests/enqueue", request_body)
@@ -995,7 +1012,7 @@ def main():
                                         "prompt": clarification_prompt,
                                         "priority": "normal",
                                         "forceWorker": True,
-                                        "forceLane": "openhands",
+                                        "forceLane": "worker",
                                     }
                                     print(
                                         "[NOTICE] Clarification requested by worker. "
@@ -1052,7 +1069,10 @@ def main():
                     kill_proc_tree(worker_proc)
                     worker_proc = None
                     started_worker = False
-                    time.sleep(0.5)
+                    # Wait for the server to detect the killed worker as offline
+                    # before starting the next backend (prevents "multiple workers" error).
+                    if not wait_for_worker_offline(worker_id, timeout_sec=20.0):
+                        print(f"[WARN] Worker {worker_id} still appears online after kill; proceeding anyway")
 
         if attempted == 0:
             raise RuntimeError("No executor backends were attempted. Install OpenHands or configure mini-swe.")

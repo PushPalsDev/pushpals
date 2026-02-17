@@ -25,6 +25,7 @@ from executor_base import (
     executor_log,
     is_no_tool_calls_error,
     is_truthy_env,
+    log_git_status,
     looks_local_base_url,
     parse_task_execute_payload,
     repo_root_for_runtime_config,
@@ -345,6 +346,7 @@ def _run_openhands_task(
             agent = Agent(llm=llm, tools=tools)
 
         conversation = Conversation(agent=agent, workspace=repo)
+        executor_log(f"{LOG_PREFIX} Instruction: {to_single_line(instruction, 300)}")
         conversation.send_message(_build_user_message(instruction, timeout_ms))
         if supplemental_guidance:
             for guidance in supplemental_guidance:
@@ -370,6 +372,24 @@ def _run_openhands_task(
                     raise run_exc
             else:
                 raise
+
+        executor_log(f"{LOG_PREFIX} Agent execution completed.")
+        # Log conversation events if the SDK exposes them
+        try:
+            events = getattr(conversation, "events", None) or getattr(conversation, "get_events", lambda: None)()
+            if events:
+                executor_log(f"{LOG_PREFIX} Conversation events ({len(events)}):")
+                for i, event in enumerate(events[:30], 1):
+                    if isinstance(event, dict):
+                        action = event.get("action") or event.get("type") or "unknown"
+                        args = event.get("args") or {}
+                        path = args.get("path") or args.get("command") or ""
+                        executor_log(f"{LOG_PREFIX}   Event {i}: {action} {to_single_line(str(path), 120)}")
+                    else:
+                        executor_log(f"{LOG_PREFIX}   Event {i}: {to_single_line(str(event), 150)}")
+        except Exception:
+            pass
+        log_git_status(repo, LOG_PREFIX)
 
     except Exception as exc:
         if is_no_tool_calls_error(exc):

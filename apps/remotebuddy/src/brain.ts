@@ -10,13 +10,13 @@ import type { LLMClient, LLMMessage } from "./llm.js";
 
 export type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
 export type PlannerRiskLevel = "low" | "medium" | "high";
-export type PlannerLane = "deterministic" | "openhands";
+export type PlannerLane = "deterministic" | "worker";
 
 export interface PlannerOutput {
   intent: PlannerIntent; // this is the high level goal, e.g. "fix bug with login"
   requires_worker: boolean; // if false, the agent can do it themselves and doesn't need to delegate to a worker
   job_kind: "task.execute" | "none";
-  lane: PlannerLane; // if requires_worker is true, this is the type of worker needed, e.g. "openhands"
+  lane: PlannerLane; // "deterministic" (fast path) or "worker" (agentic execution)
   // constraints + discovery hints
   scope: {
     read_anywhere: boolean; // usually true, default: true
@@ -178,7 +178,7 @@ function asLane(value: unknown): PlannerLane {
   const text = String(value ?? "")
     .trim()
     .toLowerCase();
-  return text === "deterministic" ? "deterministic" : "openhands";
+  return text === "deterministic" ? "deterministic" : "worker";
 }
 
 function dedupeStrings(values: unknown, limit: number): string[] {
@@ -211,8 +211,9 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
       : {};
   const readAnywhere =
     typeof scopeRecord.read_anywhere === "boolean" ? scopeRecord.read_anywhere : true;
-  const writeAllowed =
-    typeof scopeRecord.write_allowed === "boolean" ? scopeRecord.write_allowed : true;
+  // Always default to true — only honour an explicit `false` from a trusted source,
+  // never from the LLM planner (small models often hallucinate write_allowed: false).
+  const writeAllowed = true;
   const writeGlobs = dedupeStrings(scopeRecord.write_globs, MAX_SCOPE_GLOBS);
   const forbiddenGlobs = dedupeStrings(scopeRecord.forbidden_globs, MAX_SCOPE_GLOBS);
   const maxFilesRaw = Number(scopeRecord.max_files_to_edit);
@@ -280,13 +281,13 @@ function applyOverrides(plan: PlannerOutput, overrides?: PlannerOverrides): Plan
 
   const forceWorker = overrides.forceWorker === true;
   const forceLane =
-    overrides.forceLane === "deterministic" || overrides.forceLane === "openhands"
+    overrides.forceLane === "deterministic" || overrides.forceLane === "worker"
       ? overrides.forceLane
       : null;
 
   // If forceWorker is on, we *must* require a worker and ensure job_kind matches.
   if (forceWorker) {
-    const lane = forceLane ?? plan.lane ?? "openhands";
+    const lane = forceLane ?? plan.lane ?? "worker";
     return {
       ...plan,
       requires_worker: true,

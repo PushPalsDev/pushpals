@@ -35,6 +35,8 @@ from executor_base import (
     emit,
     executor_log,
     is_no_tool_calls_error,
+    log_agent_messages,
+    log_git_status,
     looks_local_base_url,
     parse_task_execute_payload,
     resolve_llm_config,
@@ -166,6 +168,7 @@ def _run_miniswe_task(
     executor_log(f"{LOG_PREFIX} Starting mini-swe-agent execution in {repo}")
     executor_log(f"{LOG_PREFIX} Model: {model_name}, base_url: {base_url or '(default)'}")
     executor_log(f"{LOG_PREFIX} Timeout: {timeout_ms}ms ({timeout_minutes}min)")
+    executor_log(f"{LOG_PREFIX} Instruction: {to_single_line(instruction, 300)}")
 
     # Pre-run baseline so we can tell whether *anything* changed even if the model/tooling is flaky.
     baseline_changes = set(summarize_git_changes(repo))
@@ -225,6 +228,12 @@ def _run_miniswe_task(
 
                 exit_info = agent.run(_compose_instruction(extra_guidance=extra_guidance))
                 executor_log(f"{LOG_PREFIX} Agent execution completed.")
+
+                # Log what the agent did
+                if hasattr(agent, "messages") and agent.messages:
+                    executor_log(f"{LOG_PREFIX} Agent message history ({len(agent.messages)} messages):")
+                    log_agent_messages(agent.messages, LOG_PREFIX)
+                log_git_status(repo, LOG_PREFIX)
                 last_exc = None
                 break
 
