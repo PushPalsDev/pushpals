@@ -34,7 +34,18 @@ const DEFAULT_CONFIG = loadPushPalsConfig();
 interface TaskExecutePlanning {
   intent: TaskExecuteIntent;
   riskLevel: TaskExecuteRisk;
-  targetPaths: string[];
+  scope: {
+    readAnywhere: boolean;
+    writeAllowed: boolean;
+    writeGlobs?: string[];
+    forbiddenGlobs?: string[];
+    maxFilesToEdit?: number;
+  };
+  discovery?: {
+    ripgrepQueries: string[];
+    likelyDirs?: string[];
+    keywords?: string[];
+  };
   acceptanceCriteria: string[];
   validationSteps: string[];
   queuePriority: TaskExecutePriority;
@@ -235,7 +246,11 @@ function isTestFocusedTask(
     return true;
   }
   if (targetPath && isLikelyTestPath(targetPath)) return true;
-  if (planning.targetPaths.some((entry) => isLikelyTestPath(entry))) return true;
+  const pathHints = [
+    ...(planning.scope.writeGlobs ?? []),
+    ...(planning.discovery?.likelyDirs ?? []),
+  ];
+  if (pathHints.some((entry) => isLikelyTestPath(entry))) return true;
   if (
     planning.validationSteps.some((entry) =>
       /\b(test|tests|coverage|pytest|vitest|jest|bun test)\b/i.test(entry),
@@ -1125,17 +1140,50 @@ function validateTaskExecutePlanning(
   if (!validPriorities.includes(queuePriority as TaskExecutePriority)) {
     return { ok: false, message: "task.execute planning.queuePriority is invalid" };
   }
-  if (!isStringArray(planning.targetPaths)) {
-    return { ok: false, message: "task.execute planning.targetPaths must be a string array" };
+  if (!planning.scope || typeof planning.scope !== "object" || Array.isArray(planning.scope)) {
+    return { ok: false, message: "task.execute planning.scope must be an object" };
   }
+  const scope = planning.scope as Record<string, unknown>;
+  if (typeof scope.readAnywhere !== "boolean") {
+    return { ok: false, message: "task.execute planning.scope.readAnywhere must be boolean" };
+  }
+  if (typeof scope.writeAllowed !== "boolean") {
+    return { ok: false, message: "task.execute planning.scope.writeAllowed must be boolean" };
+  }
+  if (scope.writeGlobs !== undefined && !isStringArray(scope.writeGlobs)) {
+    return { ok: false, message: "task.execute planning.scope.writeGlobs must be a string array" };
+  }
+  if (scope.forbiddenGlobs !== undefined && !isStringArray(scope.forbiddenGlobs)) {
+    return { ok: false, message: "task.execute planning.scope.forbiddenGlobs must be a string array" };
+  }
+  if (
+    scope.maxFilesToEdit !== undefined &&
+    (!Number.isFinite(Number(scope.maxFilesToEdit)) || Number(scope.maxFilesToEdit) <= 0)
+  ) {
+    return { ok: false, message: "task.execute planning.scope.maxFilesToEdit must be > 0" };
+  }
+
+  if (planning.discovery !== undefined) {
+    if (!planning.discovery || typeof planning.discovery !== "object" || Array.isArray(planning.discovery)) {
+      return { ok: false, message: "task.execute planning.discovery must be an object" };
+    }
+    const discovery = planning.discovery as Record<string, unknown>;
+    if (!isStringArray(discovery.ripgrepQueries)) {
+      return { ok: false, message: "task.execute planning.discovery.ripgrepQueries must be a string array" };
+    }
+    if (discovery.likelyDirs !== undefined && !isStringArray(discovery.likelyDirs)) {
+      return { ok: false, message: "task.execute planning.discovery.likelyDirs must be a string array" };
+    }
+    if (discovery.keywords !== undefined && !isStringArray(discovery.keywords)) {
+      return { ok: false, message: "task.execute planning.discovery.keywords must be a string array" };
+    }
+  }
+
   if (!isStringArray(planning.acceptanceCriteria)) {
     return { ok: false, message: "task.execute planning.acceptanceCriteria must be a string array" };
   }
   if (!isStringArray(planning.validationSteps)) {
     return { ok: false, message: "task.execute planning.validationSteps must be a string array" };
-  }
-  if ((planning.targetPaths as string[]).length === 0) {
-    return { ok: false, message: "task.execute planning.targetPaths must include at least one target path" };
   }
   if ((planning.acceptanceCriteria as string[]).length === 0) {
     return {

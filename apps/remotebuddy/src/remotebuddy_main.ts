@@ -19,7 +19,7 @@ import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 import { createLLMClient } from "./llm.js";
-import { AgentBrain } from "./brain.js";
+import { AgentBrain, PlannerOutput } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { CommunicationManager, detectRepoRoot, loadPushPalsConfig } from "shared";
 import { mkdirSync } from "fs";
@@ -152,7 +152,18 @@ interface TaskExecuteJobParams {
   planning: {
     intent: PlannerIntent;
     riskLevel: PlannerRisk;
-    targetPaths: string[];
+    scope: {
+      readAnywhere: boolean;
+      writeAllowed: boolean;
+      writeGlobs?: string[];
+      forbiddenGlobs?: string[];
+      maxFilesToEdit?: number;
+    };
+    discovery?: {
+      ripgrepQueries: string[];
+      likelyDirs?: string[];
+      keywords?: string[];
+    };
     acceptanceCriteria: string[];
     validationSteps: string[];
     queuePriority: RequestPriority;
@@ -181,19 +192,43 @@ function toSingleLine(value: unknown, max = 220): string {
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
-function buildExecutionGuidance(
-  plan: {
-    target_paths: string[];
-    acceptance_criteria: string[];
-    validation_steps: string[];
-  },
-  targetPath?: string,
-): string {
+function buildExecutionGuidance(plan: PlannerOutput): string {
   const lines: string[] = [];
-  const targets = plan.target_paths.length > 0 ? plan.target_paths : targetPath ? [targetPath] : [];
+  const targets = normalizePathHints([
+    ...(plan.scope.write_globs ?? []),
+    ...(plan.discovery?.likely_dirs ?? []),
+  ]);
   if (targets.length > 0) {
     lines.push("Target paths:");
     for (const path of targets) lines.push(`- ${path}`);
+  }
+  lines.push("Scope:");
+  lines.push(`- read_anywhere: ${plan.scope.read_anywhere ? "true" : "false"}`);
+  lines.push(`- write_allowed: ${plan.scope.write_allowed ? "true" : "false"}`);
+  if (plan.scope.max_files_to_edit && plan.scope.max_files_to_edit > 0) {
+    lines.push(`- max_files_to_edit: ${plan.scope.max_files_to_edit}`);
+  }
+  if (Array.isArray(plan.scope.write_globs) && plan.scope.write_globs.length > 0) {
+    lines.push("Write globs:");
+    for (const glob of plan.scope.write_globs) lines.push(`- ${glob}`);
+  }
+  if (Array.isArray(plan.scope.forbidden_globs) && plan.scope.forbidden_globs.length > 0) {
+    lines.push("Forbidden globs:");
+    for (const glob of plan.scope.forbidden_globs) lines.push(`- ${glob}`);
+  }
+  if (plan.discovery) {
+    if (plan.discovery.ripgrep_queries.length > 0) {
+      lines.push("Discovery ripgrep queries:");
+      for (const q of plan.discovery.ripgrep_queries) lines.push(`- ${q}`);
+    }
+    if (Array.isArray(plan.discovery.likely_dirs) && plan.discovery.likely_dirs.length > 0) {
+      lines.push("Likely directories:");
+      for (const d of plan.discovery.likely_dirs) lines.push(`- ${d}`);
+    }
+    if (Array.isArray(plan.discovery.keywords) && plan.discovery.keywords.length > 0) {
+      lines.push("Discovery keywords:");
+      for (const k of plan.discovery.keywords) lines.push(`- ${k}`);
+    }
   }
   if (plan.acceptance_criteria.length > 0) {
     lines.push("Acceptance criteria:");
@@ -204,6 +239,58 @@ function buildExecutionGuidance(
     for (const step of plan.validation_steps) lines.push(`- ${step}`);
   }
   return lines.join("\n").trim();
+}
+
+function normalizePathHints(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of values) {
+    const value = String(raw ?? "").trim();
+    if (!value) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
+}
+
+function plannerTargetPaths(plan: PlannerOutput, prompt: string): string[] {
+  const hints = normalizePathHints([
+    ...(plan.scope.write_globs ?? []),
+    ...(plan.discovery?.likely_dirs ?? []),
+  ]);
+  if (hints.length > 0) return hints.slice(0, 8);
+  const inferred = extractTargetPath(prompt);
+  if (inferred) return [inferred];
+  return ["README.md"];
+}
+
+function normalizeValidationSteps(steps: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of steps) {
+    const value = String(raw ?? "").trim();
+    if (!value) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
+}
+
+function defaultValidationStepsForRequest(prompt: string, targetPath?: string): string[] {
+  const text = prompt.toLowerCase();
+  const target = (targetPath ?? "").toLowerCase();
+  if (/\b(lint|eslint|tsc|typecheck)\b/.test(text)) {
+    return ["bun run lint"];
+  }
+  if (/\b(test|tests|pytest|vitest|jest|coverage)\b/.test(text)) {
+    if (target.endsWith(".py")) return ["uv run pytest"];
+    return ["bun test"];
+  }
+  return ["git status --porcelain"];
 }
 
 interface WorkerSnapshot {
@@ -681,16 +768,16 @@ class RemoteBuddyOrchestrator {
       lane: TaskExecutionLane;
       intent: PlannerIntent;
       risk_level: PlannerRisk;
-      target_paths: string[];
       acceptance_criteria: string[];
       validation_steps: string[];
     },
+    targetPathCount: number,
   ): TaskExecutionLane {
     if (plan.intent === "status") return "deterministic";
     if (
       plan.risk_level === "low" &&
-      plan.target_paths.length >= 1 &&
-      plan.target_paths.length <= 3 &&
+      targetPathCount >= 1 &&
+      targetPathCount <= 3 &&
       plan.validation_steps.length <= 4
     ) {
       if (prompt.trim().length <= 800) return "deterministic";
@@ -959,13 +1046,13 @@ class RemoteBuddyOrchestrator {
         )}ms${forceWorker ? ` forceWorker=true forceLane=${forceLane ?? "openhands"}` : ""}`,
       );
 
-      const plan = await this.brain.think(prompt, planningContext, { forceWorker, forceLane });
+      const plan: PlannerOutput = await this.brain.think(prompt, planningContext, {
+        forceWorker,
+        forceLane,
+      });
       this.pushContext(`[user] ${toSingleLine(prompt, 700)}`);
       this.pushContext(`[plan] ${toSingleLine(JSON.stringify(plan), 900)}`);
-      const fallbackTargetPath = extractTargetPath(prompt) ?? "README.md";
-      const targetPaths = Array.isArray(plan.target_paths) && plan.target_paths.length > 0
-          ? plan.target_paths
-          : [fallbackTargetPath];
+      const targetPaths = plannerTargetPaths(plan, prompt);
       const targetPath = targetPaths[0];
       // forceWorker overrides "direct reply" short-circuit + planner requires_worker
       const requiresWorker = forceWorker
@@ -976,20 +1063,23 @@ class RemoteBuddyOrchestrator {
       console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
       // when forcing worker, don't fail on "planner contract incomplete" — fill safe defaults.
       if (requiresWorker) {
-        if (plan.target_paths.length === 0) {
-          if (targetPath) plan.target_paths = [targetPath];
-        }
         if (plan.acceptance_criteria.length === 0) {
           plan.acceptance_criteria = ["Produce a correct and helpful result for the user request."];
         }
+        plan.validation_steps = normalizeValidationSteps(plan.validation_steps);
         if (plan.validation_steps.length === 0) {
-          plan.validation_steps = [];
+          plan.validation_steps = defaultValidationStepsForRequest(prompt, targetPath);
+          console.warn(
+            `[RemoteBuddy] Planner returned no validation_steps; using fallback: ${plan.validation_steps.join(
+              " | ",
+            )}`,
+          );
         }
 
         // Keep strictness only for non-forced paths.
         if (!forceWorker) {
           const missing: string[] = [];
-          if (plan.target_paths.length === 0) missing.push("target_paths");
+          if (targetPaths.length === 0) missing.push("target_paths");
           if (plan.acceptance_criteria.length === 0) missing.push("acceptance_criteria");
           if (plan.validation_steps.length === 0) missing.push("validation_steps");
           if (missing.length > 0) {
@@ -1003,7 +1093,7 @@ class RemoteBuddyOrchestrator {
       }
 
       // allow forcing lane (default to openhands for forced worker)
-      let lane = requiresWorker ? this.chooseExecutionLane(prompt, plan) : "deterministic";
+      let lane = requiresWorker ? this.chooseExecutionLane(prompt, plan, targetPaths.length) : "deterministic";
       if (requiresWorker && lane === "deterministic" && !targetPath) {
         lane = "openhands";
       }
@@ -1013,7 +1103,7 @@ class RemoteBuddyOrchestrator {
 
       const canonicalInstruction = prompt.trim();
       const rawPlannerInstruction = String(plan.worker_instruction ?? "").trim();
-      const executionGuidance = buildExecutionGuidance(plan, targetPath);
+      const executionGuidance = buildExecutionGuidance(plan);
       const plannerWorkerInstruction = [rawPlannerInstruction, executionGuidance]
         .filter(Boolean)
         .join("\n\n")
@@ -1073,7 +1163,32 @@ class RemoteBuddyOrchestrator {
         planning: {
           intent: plan.intent,
           riskLevel: plan.risk_level,
-          targetPaths: plan.target_paths,
+          scope: {
+            readAnywhere: plan.scope.read_anywhere,
+            writeAllowed: plan.scope.write_allowed,
+            ...(plan.scope.write_globs && plan.scope.write_globs.length > 0
+              ? { writeGlobs: plan.scope.write_globs }
+              : {}),
+            ...(plan.scope.forbidden_globs && plan.scope.forbidden_globs.length > 0
+              ? { forbiddenGlobs: plan.scope.forbidden_globs }
+              : {}),
+            ...(plan.scope.max_files_to_edit && plan.scope.max_files_to_edit > 0
+              ? { maxFilesToEdit: plan.scope.max_files_to_edit }
+              : {}),
+          },
+          ...(plan.discovery
+            ? {
+                discovery: {
+                  ripgrepQueries: plan.discovery.ripgrep_queries,
+                  ...(plan.discovery.likely_dirs && plan.discovery.likely_dirs.length > 0
+                    ? { likelyDirs: plan.discovery.likely_dirs }
+                    : {}),
+                  ...(plan.discovery.keywords && plan.discovery.keywords.length > 0
+                    ? { keywords: plan.discovery.keywords }
+                    : {}),
+                },
+              }
+            : {}),
           acceptanceCriteria: plan.acceptance_criteria,
           validationSteps: plan.validation_steps,
           queuePriority: priority,
@@ -1141,7 +1256,8 @@ class RemoteBuddyOrchestrator {
             queueWaitMs: Math.max(0, Math.floor(queueWaitMs)),
             executionBudgetMs,
             finalizationBudgetMs: this.finalizationBudgetMs,
-            targetPaths: plan.target_paths,
+            scope: plan.scope,
+            discovery: plan.discovery ?? null,
             acceptanceCriteria: plan.acceptance_criteria,
             validationSteps: plan.validation_steps,
             forceWorker,

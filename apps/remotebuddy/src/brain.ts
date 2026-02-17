@@ -13,16 +13,29 @@ export type PlannerRiskLevel = "low" | "medium" | "high";
 export type PlannerLane = "deterministic" | "openhands";
 
 export interface PlannerOutput {
-  intent: PlannerIntent;
-  requires_worker: boolean;
-  job_kind: "task.execute" | "none";
-  lane: PlannerLane;
-  target_paths: string[];
-  acceptance_criteria: string[];
-  validation_steps: string[];
+  intent: PlannerIntent; // this is the high level goal, e.g. "fix bug with login"
+  requires_worker: boolean; // if false, the agent can do it themselves and doesn't need to delegate to a worker
+  job_kind: "task.execute" | "none"; 
+  lane: PlannerLane; // if requires_worker is true, this is the type of worker needed, e.g. "openhands"
+  // constraints + discovery hints
+  scope: {
+    read_anywhere: boolean;          // usually true, default: true
+    write_allowed: boolean;          // often false unless requested, default: true
+    write_globs?: string[];          // if you want to constrain edits, default: true
+    forbidden_globs?: string[];      // never touch, default: none
+    max_files_to_edit?: number;      // blast radius cap, default: unlimited
+  };
+  discovery?: {
+    ripgrep_queries: string[];       // worker uses these
+    likely_dirs?: string[];          // hints only
+    keywords?: string[];             // helps search
+  };
+  acceptance_criteria: string[]; // usually in prompt, but can be dynamically updated by the agent based on new info
+  validation_steps: string[]; // usually in prompt, but can be dynamically updated by the agent based on new info
   risk_level: PlannerRiskLevel;
-  assistant_message: string;
-  worker_instruction: string;
+  assistant_message: string; // what the assistant will say to the user when presenting the plan
+  worker_instruction: string; // instructions for the worker, can be more technical and detailed than assistant_message
+  user_message: string; // what the user said to the assistant to trigger this plan, included for context but not always necessary
 }
 
 /**
@@ -36,7 +49,8 @@ export interface PlannerOverrides {
 
 const MAX_ASSISTANT_CHARS = 4000;
 const MAX_WORKER_INSTRUCTION_CHARS = 12000;
-const MAX_TARGET_PATHS = 16;
+const MAX_SCOPE_GLOBS = 24;
+const MAX_DISCOVERY_ITEMS = 24;
 const MAX_ACCEPTANCE_CRITERIA = 16;
 const MAX_VALIDATION_STEPS = 16;
 
@@ -70,9 +84,27 @@ export const REMOTEBUDDY_PLANNER_JSON_SCHEMA: Record<string, unknown> = {
         type: "string",
         enum: ["deterministic", "openhands"],
       },
-      target_paths: {
-        type: "array",
-        items: { type: "string" },
+      scope: {
+        type: "object",
+        properties: {
+          read_anywhere: { type: "boolean" },
+          write_allowed: { type: "boolean" },
+          write_globs: { type: "array", items: { type: "string" } },
+          forbidden_globs: { type: "array", items: { type: "string" } },
+          max_files_to_edit: { type: "number" },
+        },
+        required: ["read_anywhere", "write_allowed"],
+        additionalProperties: false,
+      },
+      discovery: {
+        type: "object",
+        properties: {
+          ripgrep_queries: { type: "array", items: { type: "string" } },
+          likely_dirs: { type: "array", items: { type: "string" } },
+          keywords: { type: "array", items: { type: "string" } },
+        },
+        required: ["ripgrep_queries"],
+        additionalProperties: false,
       },
       acceptance_criteria: {
         type: "array",
@@ -88,18 +120,20 @@ export const REMOTEBUDDY_PLANNER_JSON_SCHEMA: Record<string, unknown> = {
       },
       assistant_message: { type: "string" },
       worker_instruction: { type: "string" },
+      user_message: { type: "string" },
     },
     required: [
       "intent",
       "requires_worker",
       "job_kind",
       "lane",
-      "target_paths",
+      "scope",
       "acceptance_criteria",
       "validation_steps",
       "risk_level",
       "assistant_message",
       "worker_instruction",
+      "user_message",
     ],
     additionalProperties: false,
   },
@@ -171,7 +205,27 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   const requiresWorker = Boolean(record.requires_worker);
   const lane = asLane(record.lane);
   const riskLevel = asRisk(record.risk_level);
-  const targetPaths = dedupeStrings(record.target_paths, MAX_TARGET_PATHS);
+  const scopeRecord =
+    record.scope && typeof record.scope === "object" && !Array.isArray(record.scope)
+      ? (record.scope as Record<string, unknown>)
+      : {};
+  const readAnywhere =
+    typeof scopeRecord.read_anywhere === "boolean" ? scopeRecord.read_anywhere : true;
+  const writeAllowed =
+    typeof scopeRecord.write_allowed === "boolean" ? scopeRecord.write_allowed : true;
+  const writeGlobs = dedupeStrings(scopeRecord.write_globs, MAX_SCOPE_GLOBS);
+  const forbiddenGlobs = dedupeStrings(scopeRecord.forbidden_globs, MAX_SCOPE_GLOBS);
+  const maxFilesRaw = Number(scopeRecord.max_files_to_edit);
+  const maxFilesToEdit =
+    Number.isFinite(maxFilesRaw) && maxFilesRaw > 0 ? Math.floor(maxFilesRaw) : undefined;
+
+  const discoveryRecord =
+    record.discovery && typeof record.discovery === "object" && !Array.isArray(record.discovery)
+      ? (record.discovery as Record<string, unknown>)
+      : null;
+  const ripgrepQueries = dedupeStrings(discoveryRecord?.ripgrep_queries, MAX_DISCOVERY_ITEMS);
+  const likelyDirs = dedupeStrings(discoveryRecord?.likely_dirs, MAX_DISCOVERY_ITEMS);
+  const keywords = dedupeStrings(discoveryRecord?.keywords, MAX_DISCOVERY_ITEMS);
   const acceptanceCriteria = dedupeStrings(record.acceptance_criteria, MAX_ACCEPTANCE_CRITERIA);
   const validationSteps = dedupeStrings(record.validation_steps, MAX_VALIDATION_STEPS);
 
@@ -184,6 +238,9 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   const workerInstruction = String(record.worker_instruction ?? "")
     .trim()
     .slice(0, MAX_WORKER_INSTRUCTION_CHARS);
+  const userMessage = String(record.user_message ?? userText)
+    .trim()
+    .slice(0, MAX_WORKER_INSTRUCTION_CHARS);
 
   const requires_worker = requiresWorker;
   const job_kind: "task.execute" | "none" = requires_worker ? "task.execute" : "none";
@@ -193,12 +250,28 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
     requires_worker,
     job_kind,
     lane: requires_worker ? lane : "deterministic",
-    target_paths: targetPaths,
+    scope: {
+      read_anywhere: readAnywhere,
+      write_allowed: writeAllowed,
+      ...(writeGlobs.length > 0 ? { write_globs: writeGlobs } : {}),
+      ...(forbiddenGlobs.length > 0 ? { forbidden_globs: forbiddenGlobs } : {}),
+      ...(maxFilesToEdit ? { max_files_to_edit: maxFilesToEdit } : {}),
+    },
+    ...((ripgrepQueries.length > 0 || likelyDirs.length > 0 || keywords.length > 0)
+      ? {
+          discovery: {
+            ripgrep_queries: ripgrepQueries,
+            ...(likelyDirs.length > 0 ? { likely_dirs: likelyDirs } : {}),
+            ...(keywords.length > 0 ? { keywords } : {}),
+          },
+        }
+      : {}),
     acceptance_criteria: acceptanceCriteria,
     validation_steps: validationSteps,
     risk_level: riskLevel,
     assistant_message: assistantMessage,
     worker_instruction: workerInstruction || fallbackWorkerInstruction,
+    user_message: userMessage || userText,
   };
 }
 
