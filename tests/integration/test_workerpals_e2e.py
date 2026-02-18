@@ -901,6 +901,65 @@ def _extract_completion_epoch_seconds(completion: dict) -> float | None:
     return None
 
 
+def _extract_job_epoch_seconds(job: dict) -> float | None:
+    for key in ("enqueuedAt", "createdAt", "updatedAt", "claimedAt", "startedAt"):
+        parsed = _parse_timestamp_to_epoch_seconds(job.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _job_params_object(job: dict) -> dict:
+    params = job.get("params")
+    if isinstance(params, dict):
+        return params
+    if isinstance(params, str):
+        try:
+            parsed = json.loads(params)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _extract_job_request_id(job: dict) -> str:
+    params = _job_params_object(job)
+    for key in ("requestId", "request_id"):
+        value = str(params.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _job_matches_request(
+    job: dict,
+    request_id: str,
+    worker_id: str,
+    enqueue_monotonic: float | None = None,
+) -> bool:
+    rid = str(request_id or "").strip()
+    if not rid:
+        return False
+    if str(job.get("kind") or "").strip() != "task.execute":
+        return False
+
+    explicit_job_request_id = _extract_job_request_id(job)
+    if explicit_job_request_id:
+        return explicit_job_request_id == rid
+
+    job_worker = str(job.get("workerId") or "").strip()
+    target_worker = str(job.get("targetWorkerId") or "").strip()
+    if worker_id and job_worker != worker_id and target_worker != worker_id:
+        return False
+
+    job_epoch = _extract_job_epoch_seconds(job)
+    if job_epoch is None or enqueue_monotonic is None:
+        return True
+    enqueue_epoch = _mono_to_epoch_seconds(enqueue_monotonic)
+    return job_epoch >= (enqueue_epoch - 2.0)
+
+
 def _completion_matches_request(
     completion: dict,
     request_id: str,
@@ -1693,6 +1752,10 @@ def main():
                 existing_completion_ids = {
                     str(c.get("id")) for c in completions_before if isinstance(c, dict) and c.get("id")
                 }
+                jobs_before = http_get(f"/jobs?status=all&limit={LIST_SCAN_LIMIT}").get("jobs", [])
+                existing_job_ids = {
+                    str(j.get("id")) for j in jobs_before if isinstance(j, dict) and j.get("id")
+                }
 
                 request_body = {
                     "sessionId": run_session_id,
@@ -1713,7 +1776,9 @@ def main():
                 deadline = _mono_now() + REQUEST_TIMEOUT_SEC
                 last_request_status = None
                 intercepted_completion: dict | None = None
+                matched_failed_job: dict | None = None
                 next_completion_poll_at = 0.0
+                next_job_poll_at = 0.0
                 phase_b_ticker = _ElapsedTicker(f"{backend} phase B waiting", phase_b_started_at)
                 phase_b_ticker.start()
 
@@ -1762,7 +1827,16 @@ def main():
                                         for c in completions_after_retry
                                         if isinstance(c, dict) and c.get("id")
                                     }
+                                    jobs_after_retry = http_get(
+                                        f"/jobs?status=all&limit={LIST_SCAN_LIMIT}"
+                                    ).get("jobs", [])
+                                    existing_job_ids = {
+                                        str(j.get("id"))
+                                        for j in jobs_after_retry
+                                        if isinstance(j, dict) and j.get("id")
+                                    }
                                     next_completion_poll_at = 0.0
+                                    next_job_poll_at = 0.0
                                     print(f"Enqueued clarification retry request {request_id}")
                                     continue
                                 raise RuntimeError(f"Request failed ({backend}): {req.get('error') or req}")
@@ -1789,6 +1863,38 @@ def main():
                                 intercepted_completion = c
                                 break
                             next_completion_poll_at = now + COMPLETION_POLL_INTERVAL_SEC
+
+                        if now >= next_job_poll_at:
+                            jobs = http_get(f"/jobs?status=all&limit={LIST_SCAN_LIMIT}").get("jobs", [])
+                            for j in jobs:
+                                if not isinstance(j, dict):
+                                    continue
+                                job_id = str(j.get("id") or "")
+                                if not job_id or job_id in existing_job_ids:
+                                    continue
+                                if str(j.get("sessionId") or "") != run_session_id:
+                                    continue
+                                if str(j.get("status") or "").strip().lower() != "failed":
+                                    continue
+                                if not _job_matches_request(
+                                    j,
+                                    str(request_id),
+                                    worker_id=worker_id,
+                                    enqueue_monotonic=request_enqueue_monotonic,
+                                ):
+                                    continue
+                                matched_failed_job = j
+                                break
+                            next_job_poll_at = now + COMPLETION_POLL_INTERVAL_SEC
+
+                        if matched_failed_job:
+                            job_id = str(matched_failed_job.get("id") or "")
+                            job_error = _one_line(matched_failed_job.get("error"), 400)
+                            raise RuntimeError(
+                                "Observed failed worker job before completion interception.\n"
+                                f"backend={backend} request_id={request_id} job_id={job_id}\n"
+                                f"job_error={job_error}"
+                            )
 
                         if intercepted_completion:
                             break
