@@ -774,6 +774,8 @@ async function workerLoop(
             ? (stream: "stdout" | "stderr", line: string) => {
                 const cleaned = sanitizeJobLogLine(line);
                 if (!cleaned) return;
+                // Print executor logs locally so they appear in test/daemon output
+                console.log(`[${stream}] ${cleaned}`);
 
                 // Drop high-frequency terminal progress redraw spam; keep meaningful lines.
                 if (isNoisyProgressLine(cleaned)) return;
