@@ -1149,4 +1149,8 @@ export class JobQueue {
       .all(jobId, maxRows) as JobLogRow[];
     return rows.reverse();
   }
+
+  close(): void {
+    this.db.close();
+  }
 }

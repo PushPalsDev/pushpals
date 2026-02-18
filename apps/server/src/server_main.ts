@@ -28,6 +28,7 @@ export function createRequestHandler() {
   const staleClaimTtlMs = CONFIG.server.staleClaimTtlMs;
   const staleClaimSweepIntervalMs = CONFIG.server.staleClaimSweepIntervalMs;
   let lastStaleRecoverySweepAt = 0;
+  let isShuttingDown = false;
   return Bun.serve({
     port,
     hostname: CONFIG.server.host,
@@ -98,6 +99,25 @@ export function createRequestHandler() {
           session.emit(envelope);
         }
       };
+      const initiateShutdown = (reason: string): void => {
+        if (isShuttingDown) return;
+        isShuttingDown = true;
+        console.warn(`[Server] Shutdown requested: ${reason}`);
+        setTimeout(() => {
+          try {
+            requestQueue.close();
+          } catch (_e) {}
+          try {
+            jobQueue.close();
+          } catch (_e) {}
+          try {
+            completionQueue.close();
+          } catch (_e) {}
+          try {
+            server.stop(true);
+          } catch (_e) {}
+        }, 25);
+      };
 
       // Handle CORS preflight
       if (method === "OPTIONS") {
@@ -135,6 +155,16 @@ export function createRequestHandler() {
       // GET /healthz
       if (pathname === "/healthz" && method === "GET") {
         return makeJson({ ok: true, protocolVersion: PROTOCOL_VERSION });
+      }
+
+      // POST /admin/shutdown (auth protected)
+      if (pathname === "/admin/shutdown" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const reason = compactText(body.reason, 180) || "remote shutdown request";
+        initiateShutdown(reason);
+        return makeJson({ ok: true, shuttingDown: true, reason }, 202);
       }
 
       // POST /sessions - Create (or join) a session

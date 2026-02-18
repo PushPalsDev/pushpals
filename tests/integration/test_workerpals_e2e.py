@@ -181,6 +181,15 @@ def _kill_existing_server_processes() -> None:
         )
 
 
+def _request_server_shutdown(timeout_sec: float = 8.0) -> bool:
+    try:
+        http_post("/admin/shutdown", {"reason": "workerpals e2e preflight reset"})
+    except Exception as exc:
+        print(f"[NOTICE] Graceful shutdown request failed: {exc}")
+        return False
+    return wait_for_server_down(timeout_sec)
+
+
 def _docker_image_exists(image: str) -> bool:
     try:
         proc = subprocess.run(
@@ -810,11 +819,15 @@ def main():
     started_scm = False
 
     if server_already_running and KILL_SERVER_IF_RUNNING:
-        print(f"[NOTICE] Server already running at {SERVER_URL}; killing existing server processes...")
-        _kill_existing_server_processes()
-        if not wait_for_server_down(8.0):
+        print(f"[NOTICE] Server already running at {SERVER_URL}; requesting graceful shutdown...")
+        stopped = _request_server_shutdown(timeout_sec=8.0)
+        if not stopped:
+            print("[NOTICE] Graceful shutdown unavailable or timed out; killing existing server processes...")
+            _kill_existing_server_processes()
+            stopped = wait_for_server_down(8.0)
+        if not stopped:
             raise RuntimeError(
-                "Tried to kill existing server processes, but server still responds.\n"
+                "Tried graceful shutdown and process kill, but server still responds.\n"
                 f"server={SERVER_URL}\n"
                 "Stop the existing stack manually, then rerun the integration test."
             )
