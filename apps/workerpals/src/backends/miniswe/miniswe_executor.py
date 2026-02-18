@@ -188,6 +188,24 @@ def _build_strict_tool_use_guidance(repo: str) -> str:
 
 # ─── Tool Broker Shim ────────────────────────────────────────────────────────
 
+def _messages_indicate_missing_tool_calls(messages: Any) -> bool:
+    if not isinstance(messages, list) or not messages:
+        return False
+    saw_tool_call = False
+    no_tool_call_prompts = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            saw_tool_call = True
+        role = str(msg.get("role") or "").strip().lower()
+        content = str(msg.get("content") or "").strip().lower()
+        if role == "user" and "no tool calls found" in content:
+            no_tool_call_prompts += 1
+    return (not saw_tool_call) and no_tool_call_prompts > 0
+
+
 @dataclass
 class _LLMConfig:
     model: str
@@ -930,6 +948,7 @@ def _run_miniswe_task(
 
     exit_info: Dict[str, Any] = {}
     agent = None
+    agent_messages: List[Dict[str, Any]] = []
 
     try:
         import yaml
@@ -987,6 +1006,7 @@ def _run_miniswe_task(
 
                 # Log what the agent did
                 if hasattr(agent, "messages") and agent.messages:
+                    agent_messages = [msg for msg in agent.messages if isinstance(msg, dict)]
                     log.debug(f"Agent message history ({len(agent.messages)} messages):")
                     log_agent_messages(agent.messages, log)
                 log_git_status(repo, log)
@@ -1047,6 +1067,39 @@ def _run_miniswe_task(
                 "summary": "mini-swe-agent task execution failed",
                 "stderr": str(exc),
                 "exitCode": 1,
+            }
+
+    if _messages_indicate_missing_tool_calls(agent_messages):
+        if _tool_broker_enabled():
+            log.info("mini-swe-agent exited without tool calls; falling back to tool broker shim.")
+            broker_result = _broker_run(
+                repo,
+                instruction=_compose_instruction(),
+                llm=llm_cfg,
+                timeout_ms=timeout_ms,
+                explicit_targets=_extract_explicit_target_paths_from_payload(payload),
+            )
+            if not bool(broker_result.get("ok")):
+                return {
+                    "ok": False,
+                    "summary": str(broker_result.get("summary") or "tool broker fallback failed"),
+                    "stdout": str(broker_result.get("stdout") or ""),
+                    "stderr": str(broker_result.get("stderr") or ""),
+                    "exitCode": to_int(broker_result.get("exitCode"), 3),
+                }
+            exit_info = {"submission": broker_result.get("stdout") or ""}
+        else:
+            return {
+                "ok": False,
+                "summary": "mini-swe-agent could not execute: model did not emit tool calls",
+                "stderr": (
+                    "Agentic execution requires a tool-calling-capable model/runtime. "
+                    "The model output did not include any tool calls.\n"
+                    "Fix options:\n"
+                    "- Enable the tool broker shim: WORKERPALS_MINISWE_TOOL_BROKER=1, or\n"
+                    "- Use a model/runtime with function-calling support."
+                ),
+                "exitCode": 3,
             }
 
     # Extract the agent's conversational output from its message history (or broker transcript).

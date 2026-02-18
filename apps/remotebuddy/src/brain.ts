@@ -82,7 +82,7 @@ export const REMOTEBUDDY_PLANNER_JSON_SCHEMA: Record<string, unknown> = {
       },
       lane: {
         type: "string",
-        enum: ["deterministic", "openhands"],
+        enum: ["deterministic", "worker"],
       },
       scope: {
         type: "object",
@@ -229,18 +229,21 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   const acceptanceCriteria = dedupeStrings(record.acceptance_criteria, MAX_ACCEPTANCE_CRITERIA);
   const validationSteps = dedupeStrings(record.validation_steps, MAX_VALIDATION_STEPS);
 
-  const assistantMessage = String(record.assistant_message ?? "")
-    .trim()
-    .slice(0, MAX_ASSISTANT_CHARS);
-  if (!assistantMessage) throw new Error("assistant_message is required");
-
   const fallbackWorkerInstruction = userText.trim().slice(0, MAX_WORKER_INSTRUCTION_CHARS);
+  const assistantMessageRaw = String(record.assistant_message ?? "").trim();
   const workerInstruction = String(record.worker_instruction ?? "")
     .trim()
     .slice(0, MAX_WORKER_INSTRUCTION_CHARS);
   const userMessage = String(record.user_message ?? userText)
     .trim()
     .slice(0, MAX_WORKER_INSTRUCTION_CHARS);
+  const assistantMessage = (
+    assistantMessageRaw ||
+    userMessage ||
+    workerInstruction ||
+    fallbackWorkerInstruction ||
+    "Understood. I will proceed with this request."
+  ).slice(0, MAX_ASSISTANT_CHARS);
 
   const requires_worker = requiresWorker;
   const job_kind: "task.execute" | "none" = requires_worker ? "task.execute" : "none";

@@ -88,6 +88,12 @@ try:
     )
 except Exception:
     COMPLETION_POLL_INTERVAL_SEC = 1.5
+_requested_backends_env = (os.environ.get("WORKERPALS_E2E_BACKENDS") or "").strip()
+REQUESTED_BACKENDS = [
+    item.strip().lower()
+    for item in _requested_backends_env.split(",")
+    if item.strip()
+]
 
 # Safe default for helper calls that may run before module-level env initialization.
 DEFAULT_ENV = os.environ.copy()
@@ -219,6 +225,28 @@ def _server_port() -> int:
         return 3001
 
 
+def _windows_powershell_exe() -> str:
+    for exe_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        resolved = shutil.which(exe_name)
+        if resolved:
+            return resolved
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    fallback = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if fallback.exists():
+        return str(fallback)
+    raise FileNotFoundError("Unable to locate PowerShell executable on PATH or in SystemRoot")
+
+
+def _run_windows_powershell(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [_windows_powershell_exe(), "-NoProfile", "-Command", command],
+        env=_build_env(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _kill_existing_server_processes() -> None:
     port = _server_port()
     if sys.platform == "win32":
@@ -235,13 +263,7 @@ def _kill_existing_server_processes() -> None:
             "} "
             '$pids -join "," '
         )
-        port_kill = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", port_kill_cmd],
-            env=_build_env(),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        port_kill = _run_windows_powershell(port_kill_cmd)
         _debug(
             "server preflight port kill "
             f"rc={port_kill.returncode} pids={_one_line(port_kill.stdout, 200)} "
@@ -257,13 +279,7 @@ def _kill_existing_server_processes() -> None:
             "} | "
             "ForEach-Object { $_.ProcessId; Stop-Process -Id $_.ProcessId -Force }"
         )
-        fallback_kill = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", fallback_cmd],
-            env=_build_env(),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        fallback_kill = _run_windows_powershell(fallback_cmd)
         _debug(
             "server fallback kill "
             f"rc={fallback_kill.returncode} pids={_one_line(fallback_kill.stdout, 200)} "
@@ -297,13 +313,7 @@ def _list_server_listener_pids() -> list[str]:
             "$pids = $pids | Where-Object { $_ -and $_ -gt 0 } | Sort-Object -Unique; "
             "$pids -join ','"
         )
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd],
-            env=_build_env(),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        out = _run_windows_powershell(cmd)
         raw = (out.stdout or "").strip()
         if not raw:
             return []
@@ -390,13 +400,7 @@ def _kill_existing_sidecar_processes() -> None:
             "} | "
             "ForEach-Object { $_.ProcessId; Stop-Process -Id $_.ProcessId -Force }"
         )
-        killed = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd],
-            env=_build_env(),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        killed = _run_windows_powershell(cmd)
         _debug(
             "sidecar kill "
             f"rc={killed.returncode} pids={_one_line(killed.stdout, 200)} "
@@ -1009,6 +1013,29 @@ def _build_env(overrides: dict | None = None) -> dict[str, str]:
     return env
 
 
+def _resolve_windows_argv(argv: list[str], env: dict[str, str]) -> list[str]:
+    if not argv:
+        raise ValueError("start_process received an empty command")
+    resolved = list(argv)
+    first = resolved[0]
+
+    # Absolute/relative explicit paths can be used as-is.
+    first_path = Path(first)
+    if first_path.is_absolute() or first.startswith(".\\") or first.startswith("..\\"):
+        return resolved
+
+    found = shutil.which(first, path=env.get("PATH"))
+    if found is None and not first_path.suffix:
+        for ext in (".exe", ".cmd", ".bat"):
+            found = shutil.which(first + ext, path=env.get("PATH"))
+            if found:
+                break
+    if found is None:
+        raise FileNotFoundError(f"Command not found on PATH: {first}")
+    resolved[0] = found
+    return resolved
+
+
 def start_process(cmd, cwd=REPO_ROOT, env=None):
     """Start a process inheriting stdout/stderr (prints directly to console)."""
     run_env = _build_env(env)
@@ -1017,6 +1044,7 @@ def start_process(cmd, cwd=REPO_ROOT, env=None):
     popen_cmd = [str(part) for part in cmd]
 
     if sys.platform == "win32":
+        popen_cmd = _resolve_windows_argv(popen_cmd, run_env)
         proc = subprocess.Popen(
             popen_cmd,
             cwd=str(cwd),
@@ -1259,6 +1287,16 @@ def main():
                     "- OpenHands: pip install openhands-ai\n"
                     "- mini-swe-agent: pip install mini-swe-agent"
                 )
+        if REQUESTED_BACKENDS:
+            filtered_backends = [backend for backend in backends_to_try if backend in REQUESTED_BACKENDS]
+            if not filtered_backends:
+                raise RuntimeError(
+                    "WORKERPALS_E2E_BACKENDS did not match available backends.\n"
+                    f"requested={REQUESTED_BACKENDS}\n"
+                    f"available={backends_to_try}"
+                )
+            print(f"[NOTICE] Restricting backends via WORKERPALS_E2E_BACKENDS: {filtered_backends}")
+            backends_to_try = filtered_backends
         attempted = 0
 
         for backend in backends_to_try:
@@ -1270,6 +1308,10 @@ def main():
 
             worker_id = f"e2e-{backend}-{uuid4().hex[:10]}"
             worker_env = {"WORKERPALS_EXECUTOR": backend, "WORKERPALS_DEBUG": "1"}
+            if backend == "miniswe":
+                worker_env["WORKERPALS_MINISWE_TOOL_BROKER"] = os.environ.get(
+                    "WORKERPALS_E2E_MINISWE_TOOL_BROKER", "1"
+                )
             worker_cmd = [
                 "bun",
                 "run",
