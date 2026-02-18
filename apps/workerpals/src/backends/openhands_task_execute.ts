@@ -206,6 +206,12 @@ export async function executeWithOpenHands(
       cwd: repo,
       stdout: "pipe",
       stderr: "pipe",
+      env: {
+        ...process.env,
+        PUSHPALS_REPO_PATH: repo,
+        PUSHPALS_ASSIGNED_REPO_ROOT: repo,
+        PYTHONIOENCODING: "utf-8",
+      },
     });
 
     let timedOut = false;

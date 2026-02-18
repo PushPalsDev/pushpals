@@ -96,6 +96,7 @@ export function createGenericPythonExecutor(
         env: {
           ...process.env,
           PUSHPALS_REPO_PATH: repo,
+          PUSHPALS_ASSIGNED_REPO_ROOT: repo,
           PYTHONIOENCODING: "utf-8",
         },
       });

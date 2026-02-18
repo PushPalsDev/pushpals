@@ -27,13 +27,20 @@ describe("RemoteBuddy AgentBrain planner", () => {
         intent: "chat",
         requires_worker: false,
         job_kind: "none",
-        lane: "openhands",
-        target_paths: ["README.md"],
+        lane: "worker",
+        scope: {
+          read_anywhere: true,
+          write_allowed: false,
+        },
+        discovery: {
+          ripgrep_queries: [],
+        },
         acceptance_criteria: [],
-        validation_steps: ["none"],
+        validation_steps: [],
         risk_level: "low",
         assistant_message: "Handled directly.",
         worker_instruction: "",
+        user_message: "hello",
       }),
     ]);
     const brain = new AgentBrain(llm);
@@ -56,12 +63,21 @@ describe("RemoteBuddy AgentBrain planner", () => {
         requires_worker: true,
         job_kind: "task.execute",
         lane: "deterministic",
-        target_paths: ["apps/server/src/jobs.ts"],
+        scope: {
+          read_anywhere: true,
+          write_allowed: true,
+          write_globs: ["apps/server/src/jobs.ts"],
+        },
+        discovery: {
+          ripgrep_queries: ["jobs stale"],
+          likely_dirs: ["apps/server/src"],
+        },
         acceptance_criteria: ["Queue migration path is fixed with no regressions."],
         validation_steps: ["bun test tests/server.jobs.stale-recovery.test.ts"],
         risk_level: "medium",
         assistant_message: "I will delegate to a WorkerPal.",
         worker_instruction: "Fix the queue migration issue.",
+        user_message: "fix one bug in jobs queue",
       }),
     ]);
     const brain = new AgentBrain(llm);
@@ -71,7 +87,7 @@ describe("RemoteBuddy AgentBrain planner", () => {
     expect(plan.requires_worker).toBe(true);
     expect(plan.job_kind).toBe("task.execute");
     expect(plan.lane).toBe("deterministic");
-    expect(plan.target_paths).toEqual(["apps/server/src/jobs.ts"]);
+    expect(plan.scope.write_globs).toEqual(["apps/server/src/jobs.ts"]);
     expect(plan.acceptance_criteria.length).toBeGreaterThan(0);
     expect(llm.calls.length).toBe(2);
     expect(llm.calls[1]?.messages?.[0]?.content).toContain("Invalid planner output to repair");
@@ -84,13 +100,22 @@ describe("RemoteBuddy AgentBrain planner", () => {
         intent: "analysis",
         requires_worker: true,
         job_kind: "task.execute",
-        lane: "openhands",
-        target_paths: ["apps/workerpals/src/context_manager.ts"],
+        lane: "worker",
+        scope: {
+          read_anywhere: true,
+          write_allowed: true,
+          write_globs: ["apps/workerpals/src/context_manager.ts"],
+        },
+        discovery: {
+          ripgrep_queries: ["context manager"],
+          likely_dirs: ["apps/workerpals/src"],
+        },
         acceptance_criteria: ["A minimal fix is applied without unrelated refactors."],
         validation_steps: ["bun test tests/workerpals.context-manager.test.ts"],
         risk_level: "high",
         assistant_message: "Delegating for deeper analysis.",
         worker_instruction: "",
+        user_message: userText,
       }),
     ]);
     const brain = new AgentBrain(llm);

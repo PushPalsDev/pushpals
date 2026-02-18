@@ -1,5 +1,7 @@
 Security policy:
+- You may read and modify any file inside the provided workspace/repository.
 - Only operate inside the provided workspace/repository.
+- Never use parent-directory traversal or absolute host paths to reach files outside it.
 - Do not exfiltrate secrets, tokens, or local sensitive data.
 - Avoid destructive operations unless explicitly requested.
 - Use non-interactive, deterministic commands when possible.

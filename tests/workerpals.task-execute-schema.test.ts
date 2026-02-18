@@ -4,7 +4,15 @@ import { executeJob } from "../apps/workerpals/src/execute_job";
 const VALID_PLANNING = {
   intent: "code_change",
   riskLevel: "low",
-  targetPaths: ["apps/server/src/jobs.ts"],
+  scope: {
+    readAnywhere: true,
+    writeAllowed: true,
+    writeGlobs: ["apps/server/src/jobs.ts"],
+  },
+  discovery: {
+    ripgrepQueries: ["jobs stale"],
+    likelyDirs: ["apps/server/src"],
+  },
   acceptanceCriteria: ["Queue jobs are persisted and recovered correctly."],
   validationSteps: ["bun test tests/server.jobs.stale-recovery.test.ts"],
   queuePriority: "normal",
@@ -70,19 +78,25 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.summary).toContain("planning.acceptanceCriteria");
   });
 
-  test("rejects invalid lane even with schemaVersion/planning", async () => {
+  test("rejects absolute/path-escape writeGlobs hints", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["../outside.txt", "/etc/passwd"],
+      },
+    };
     const result = await executeJob(
       "task.execute",
       {
         schemaVersion: 2,
-        lane: "invalid-lane",
         instruction: "run a bounded task",
-        planning: VALID_PLANNING,
+        planning,
       },
       process.cwd(),
     );
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toContain("params.lane");
+    expect(result.summary).toContain("writeGlobs");
   });
 });

@@ -584,9 +584,19 @@ function normalizeStagePath(value: unknown): string | null {
   if (path === "/repo" || path === "/workspace") return ".";
   if (path.startsWith("/repo/")) path = path.slice("/repo/".length);
   else if (path.startsWith("/workspace/")) path = path.slice("/workspace/".length);
-  else if (path.startsWith("/")) path = path.replace(/^\/+/, "");
+  else if (path.startsWith("/")) return null;
+  if (/^[A-Za-z]:[\\/]/.test(path)) return null;
 
-  path = path.replace(/^\.\//, "").trim();
+  path = path.replace(/^\.\/+/, "").replace(/\/+/g, "/").trim();
+  if (!path || path === ".") return ".";
+  if (path.startsWith(":(")) return null;
+
+  const segments = path.split("/");
+  for (const segment of segments) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") return null;
+  }
+
   return path.length > 0 ? path : null;
 }
 
@@ -868,16 +878,43 @@ function dedupePaths(paths: Array<string | null>): string[] {
   return out;
 }
 
+function planningPathHints(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const planning = value as Record<string, unknown>;
+  const hints: string[] = [];
+
+  const scope =
+    planning.scope && typeof planning.scope === "object" && !Array.isArray(planning.scope)
+      ? (planning.scope as Record<string, unknown>)
+      : null;
+  if (scope) {
+    hints.push(...toStringArray(scope.writeGlobs));
+  }
+
+  const discovery =
+    planning.discovery && typeof planning.discovery === "object" && !Array.isArray(planning.discovery)
+      ? (planning.discovery as Record<string, unknown>)
+      : null;
+  if (discovery) {
+    hints.push(...toStringArray(discovery.likelyDirs));
+  }
+
+  return hints.slice(0, 12);
+}
+
 function buildStageTargets(kind: string, params?: Record<string, unknown>): string[] {
   const p = params ?? {};
   switch (kind) {
     case "task.execute": {
       const paths = toStringArray(p.paths);
+      const planHints = planningPathHints(p.planning);
+      const inferred = toPath(inferTargetPathFromInstruction(String(p.instruction ?? "")));
       return dedupePaths([
         ...paths,
+        ...planHints,
         toPath(p.targetPath),
         toPath(p.path),
-        inferTargetPathFromInstruction(String(p.instruction ?? "")),
+        inferred,
       ]);
     }
     default:
@@ -1117,6 +1154,10 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
+function hasInvalidRepoPathHint(values: string[]): boolean {
+  return values.some((entry) => normalizeStagePath(entry) === null);
+}
+
 function validateTaskExecutePlanning(
   value: unknown,
 ): { ok: true } | { ok: false; message: string } {
@@ -1158,10 +1199,23 @@ function validateTaskExecutePlanning(
   if (scope.writeGlobs !== undefined && !isStringArray(scope.writeGlobs)) {
     return { ok: false, message: "task.execute planning.scope.writeGlobs must be a string array" };
   }
+  if (isStringArray(scope.writeGlobs) && hasInvalidRepoPathHint(scope.writeGlobs)) {
+    return {
+      ok: false,
+      message: "task.execute planning.scope.writeGlobs must contain repo-relative path hints only",
+    };
+  }
   if (scope.forbiddenGlobs !== undefined && !isStringArray(scope.forbiddenGlobs)) {
     return {
       ok: false,
       message: "task.execute planning.scope.forbiddenGlobs must be a string array",
+    };
+  }
+  if (isStringArray(scope.forbiddenGlobs) && hasInvalidRepoPathHint(scope.forbiddenGlobs)) {
+    return {
+      ok: false,
+      message:
+        "task.execute planning.scope.forbiddenGlobs must contain repo-relative path hints only",
     };
   }
   if (
@@ -1190,6 +1244,12 @@ function validateTaskExecutePlanning(
       return {
         ok: false,
         message: "task.execute planning.discovery.likelyDirs must be a string array",
+      };
+    }
+    if (isStringArray(discovery.likelyDirs) && hasInvalidRepoPathHint(discovery.likelyDirs)) {
+      return {
+        ok: false,
+        message: "task.execute planning.discovery.likelyDirs must be repo-relative path hints",
       };
     }
     if (discovery.keywords !== undefined && !isStringArray(discovery.keywords)) {

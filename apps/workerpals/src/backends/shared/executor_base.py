@@ -122,6 +122,35 @@ def decode_payload(raw: str) -> Dict[str, Any]:
     return payload
 
 
+def resolve_repo_within_assigned_root(repo: str) -> Tuple[Optional[str], Optional[str]]:
+    raw_repo = str(repo or "").strip()
+    if not raw_repo:
+        return None, "Invalid payload: missing 'repo'"
+
+    try:
+        repo_path = Path(raw_repo).resolve()
+    except Exception as exc:
+        return None, f"Invalid payload repo path: {exc}"
+
+    if not repo_path.exists() or not repo_path.is_dir():
+        return None, f"Invalid payload repo path: not a directory ({repo_path})"
+
+    assigned_raw = (os.environ.get("PUSHPALS_ASSIGNED_REPO_ROOT") or "").strip()
+    if assigned_raw:
+        try:
+            assigned_root = Path(assigned_raw).resolve()
+        except Exception as exc:
+            return None, f"Invalid assigned repo root: {exc}"
+        if repo_path != assigned_root and assigned_root not in repo_path.parents:
+            return (
+                None,
+                "Refusing repo path outside assigned root: "
+                f"repo={repo_path} assigned_root={assigned_root}",
+            )
+
+    return str(repo_path), None
+
+
 def to_int(value: Any, default: int) -> int:
     try:
         return int(value)
@@ -527,14 +556,17 @@ def parse_task_execute_payload(
 
     kind = payload.get("kind")
     params = payload.get("params", {})
-    repo = payload.get("repo")
+    repo_raw = payload.get("repo")
 
     if not isinstance(kind, str) or not kind:
         raise SystemExit(fail("Invalid payload: missing 'kind'", exit_code=2))
     if not isinstance(params, dict):
         raise SystemExit(fail("Invalid payload: 'params' must be an object", exit_code=2))
-    if not isinstance(repo, str) or not repo:
+    if not isinstance(repo_raw, str) or not repo_raw:
         raise SystemExit(fail("Invalid payload: missing 'repo'", exit_code=2))
+    repo, repo_error = resolve_repo_within_assigned_root(repo_raw)
+    if repo_error or not repo:
+        raise SystemExit(fail(repo_error or "Invalid payload repo path", exit_code=2))
 
     if kind not in accepted_kinds:
         kinds_str = ", ".join(accepted_kinds)

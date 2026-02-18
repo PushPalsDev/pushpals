@@ -23,6 +23,11 @@ import { AgentBrain, PlannerOutput } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { CommunicationManager, detectRepoRoot, loadPushPalsConfig } from "shared";
 import { mkdirSync } from "fs";
+import {
+  extractExplicitTargetPath,
+  normalizePathHints,
+  plannerTargetPaths,
+} from "./path_targeting.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -74,25 +79,6 @@ function isQuestionLike(text: string): boolean {
   if (!t) return false;
   if (t.includes("?")) return true;
   return /^(is|are|can|could|should|would|what|why|how|when|where|which|does|do)\b/.test(t);
-}
-
-function extractTargetPath(text: string): string | null {
-  const stopWords = new Set(["a", "an", "the", "it", "this", "that", "there", "here", "file"]);
-  const patterns = [
-    /file\s+(?:called|named)\s+["'`]?([^"'`\s]+)["'`]?/i,
-    /create\s+(?:a\s+)?file\s+["'`]?([^"'`\s]+)["'`]?/i,
-    /write\s+(?:to|into)\s+["'`]?([^"'`\s]+)["'`]?/i,
-  ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (!match) continue;
-    const value = (match[1] ?? "").trim().replace(/[.,!?;:]+$/, "");
-    if (!value) continue;
-    if (!/^[A-Za-z0-9._/\-\\]+$/.test(value)) continue;
-    if (stopWords.has(value.toLowerCase())) continue;
-    return value;
-  }
-  return null;
 }
 
 function isExecutionIntent(text: string, targetPath: string | null): boolean {
@@ -149,6 +135,7 @@ interface TaskExecuteJobParams {
   instruction: string;
   plannerWorkerInstruction?: string;
   lane: TaskExecutionLane;
+  paths?: string[];
   planning: {
     intent: PlannerIntent;
     riskLevel: PlannerRisk;
@@ -239,26 +226,6 @@ function buildExecutionGuidance(plan: PlannerOutput): string {
     for (const step of plan.validation_steps) lines.push(`- ${step}`);
   }
   return lines.join("\n").trim();
-}
-
-function normalizePathHints(values: string[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of values) {
-    const value = String(raw ?? "").trim();
-    if (!value) continue;
-    const key = value.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(value);
-  }
-  return out;
-}
-
-function plannerTargetPaths(_plan: PlannerOutput, _prompt: string): string[] {
-  // Always use the repo root — the worker operates on the full worktree.
-  // Small LLM planners often hallucinate incorrect targetPaths (e.g. "packages").
-  return ["."];
 }
 
 function normalizeValidationSteps(steps: string[]): string[] {
@@ -819,7 +786,7 @@ class RemoteBuddyOrchestrator {
 
   private shouldForceDirectReply(prompt: string, intent: PlannerIntent): boolean {
     if (intent !== "chat" && intent !== "status") return false;
-    return !isExecutionIntent(prompt, extractTargetPath(prompt));
+    return !isExecutionIntent(prompt, extractExplicitTargetPath(prompt));
   }
 
   private getRecentJobContext(limit: number = 12): Array<Record<string, unknown>> {
@@ -1132,7 +1099,11 @@ class RemoteBuddyOrchestrator {
       let lane = requiresWorker
         ? this.chooseExecutionLane(prompt, plan, targetPaths.length)
         : "deterministic";
-      if (requiresWorker && lane === "deterministic" && !targetPath) {
+      if (
+        requiresWorker &&
+        lane === "deterministic" &&
+        (!targetPath || targetPath === ".")
+      ) {
         lane = "worker";
       }
       if (forceWorker) {
@@ -1198,6 +1169,7 @@ class RemoteBuddyOrchestrator {
             ? plannerWorkerInstruction
             : undefined,
         lane,
+        ...(targetPaths.length > 0 ? { paths: targetPaths } : {}),
         planning: {
           intent: plan.intent,
           riskLevel: plan.risk_level,
