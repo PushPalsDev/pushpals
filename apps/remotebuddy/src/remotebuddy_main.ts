@@ -123,6 +123,14 @@ function isArchitectureIntent(text: string): boolean {
   return architectureCue && !codeChangeCue;
 }
 
+function parseEnabledFlag(raw: string | undefined | null, defaultValue: boolean): boolean {
+  const text = String(raw ?? "")
+    .trim()
+    .toLowerCase();
+  if (!text) return defaultValue;
+  return !["0", "false", "no", "off"].includes(text);
+}
+
 type TaskExecutionLane = "deterministic" | "worker";
 type RequestPriority = "interactive" | "normal" | "background";
 type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
@@ -374,6 +382,7 @@ class RemoteBuddyOrchestrator {
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
   private readonly statusHeartbeatMs: number;
+  private readonly fetchFailureLogsOnJobFailure: boolean;
   private readonly executionBudgetInteractiveMs: number;
   private readonly executionBudgetNormalMs: number;
   private readonly executionBudgetBackgroundMs: number;
@@ -438,6 +447,10 @@ class RemoteBuddyOrchestrator {
         : null;
     this.spawnWorkerLabels = remoteCfg.workerpalLabels;
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
+    this.fetchFailureLogsOnJobFailure = parseEnabledFlag(
+      process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS,
+      true,
+    );
     this.executionBudgetInteractiveMs = Math.max(60_000, remoteCfg.executionBudgetInteractiveMs);
     this.executionBudgetNormalMs = Math.max(120_000, remoteCfg.executionBudgetNormalMs);
     this.executionBudgetBackgroundMs = Math.max(180_000, remoteCfg.executionBudgetBackgroundMs);
@@ -457,6 +470,9 @@ class RemoteBuddyOrchestrator {
     );
     console.log(
       `[RemoteBuddy] Budgets: interactive=${this.executionBudgetInteractiveMs}ms normal=${this.executionBudgetNormalMs}ms background=${this.executionBudgetBackgroundMs}ms finalization=${this.finalizationBudgetMs}ms`,
+    );
+    console.log(
+      `[RemoteBuddy] Failure log fetch on job failures: ${this.fetchFailureLogsOnJobFailure ? "on" : "off"}`,
     );
   }
 
@@ -575,14 +591,29 @@ class RemoteBuddyOrchestrator {
     detail: string,
   ): Promise<void> {
     const shortJob = jobId.slice(0, 8);
+    const willFetchLogs = this.fetchFailureLogsOnJobFailure;
     const fetchMsg = isStrictPreflightJsonFailure(message, detail)
-      ? `WorkerPal job ${shortJob} stopped before tool execution because strict preflight expected one JSON response and got non-JSON output. I'm fetching logs now to diagnose what happened.`
-      : `WorkerPal job ${shortJob} failed: ${message}${detail ? ` (${detail})` : ""} I got an error and I'm fetching logs now to diagnose what happened.`;
+      ? willFetchLogs
+        ? `WorkerPal job ${shortJob} stopped before tool execution because strict preflight expected one JSON response and got non-JSON output. I'm fetching logs now to diagnose what happened.`
+        : `WorkerPal job ${shortJob} stopped before tool execution because strict preflight expected one JSON response and got non-JSON output.`
+      : willFetchLogs
+        ? `WorkerPal job ${shortJob} failed: ${message}${detail ? ` (${detail})` : ""} I got an error and I'm fetching logs now to diagnose what happened.`
+        : `WorkerPal job ${shortJob} failed: ${message}${detail ? ` (${detail})` : ""}`;
     await this.comm.assistantMessage(fetchMsg, {
       correlationId: envelope.correlationId,
       turnId: envelope.turnId,
       parentId: envelope.id,
     });
+
+    if (!willFetchLogs) {
+      const explanation = explainJobFailureFromLogs([], message, detail);
+      await this.comm.assistantMessage(`Diagnosis for job ${shortJob}: ${explanation}`, {
+        correlationId: envelope.correlationId,
+        turnId: envelope.turnId,
+        parentId: envelope.id,
+      });
+      return;
+    }
 
     console.warn(`[RemoteBuddy] Fetching failure logs for job ${jobId}...`);
     const logs = await this.fetchJobLogs(jobId, 80);

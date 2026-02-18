@@ -115,6 +115,9 @@ REQUESTED_BACKENDS = [
     for item in _requested_backends_env.split(",")
     if item.strip()
 ]
+E2E_REMOTEBUDDY_FETCH_FAILURE_LOGS = (
+    os.environ.get("WORKERPALS_E2E_REMOTEBUDDY_FETCH_FAILURE_LOGS", "0").strip() or "0"
+)
 
 # Safe default for helper calls that may run before module-level env initialization.
 DEFAULT_ENV = os.environ.copy()
@@ -1369,6 +1372,9 @@ def main():
         _print_duration("server health wait", server_health_started_at)
 
         # Start RemoteBuddy only after server health is confirmed.
+        remotebuddy_env = {
+            "REMOTEBUDDY_FETCH_FAILURE_LOGS": E2E_REMOTEBUDDY_FETCH_FAILURE_LOGS,
+        }
         remotebuddy_proc = start_process(
             [
                 "bun",
@@ -1383,6 +1389,7 @@ def main():
                 "--sessionId",
                 run_session_id,
             ],
+            env=remotebuddy_env,
         )
         started_remotebuddy = True
         assert_proc_alive(remotebuddy_proc, "remotebuddy")
