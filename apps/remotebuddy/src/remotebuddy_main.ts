@@ -385,6 +385,10 @@ function extractClarificationFromCompletionSummary(summary: string): string | nu
 }
 
 class RemoteBuddyOrchestrator {
+  private static readonly SESSION_MONITOR_MAX_WS_ERRORS = Math.max(
+    1,
+    Number.parseInt(process.env.REMOTEBUDDY_SESSION_MONITOR_MAX_WS_ERRORS ?? "6", 10) || 6,
+  );
   private readonly agentId = "remotebuddy-orchestrator";
   private readonly server: string;
   private readonly sessionId: string;
@@ -417,6 +421,8 @@ class RemoteBuddyOrchestrator {
   private readonly eventMonitorStartedAt = Date.now();
   private jobsDb: Database | null = null;
   private disposed = false;
+  private sessionMonitorWsErrorCount = 0;
+  private sessionMonitorFatal = false;
 
   /** Serialises async request handling to preserve ordering */
   private chain: Promise<void> = Promise.resolve();
@@ -682,7 +688,26 @@ class RemoteBuddyOrchestrator {
         });
       },
       {
-        onError: (message) => console.warn(`[RemoteBuddy] Session monitor: ${message}`),
+        onOpen: () => {
+          this.sessionMonitorWsErrorCount = 0;
+        },
+        onError: (message) => {
+          console.warn(`[RemoteBuddy] Session monitor: ${message}`);
+          if (!/\[SessionEvents\] (WebSocket error|Failed to connect)/.test(message)) return;
+          this.sessionMonitorWsErrorCount += 1;
+          if (
+            this.sessionMonitorFatal ||
+            this.sessionMonitorWsErrorCount < RemoteBuddyOrchestrator.SESSION_MONITOR_MAX_WS_ERRORS
+          ) {
+            return;
+          }
+          this.sessionMonitorFatal = true;
+          console.error(
+            `[RemoteBuddy] Session monitor exceeded retry budget (${RemoteBuddyOrchestrator.SESSION_MONITOR_MAX_WS_ERRORS} transport errors). Bailing out.`,
+          );
+          this.dispose();
+          setTimeout(() => process.exit(1), 0);
+        },
       },
     );
   }

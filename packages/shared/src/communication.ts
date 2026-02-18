@@ -12,6 +12,7 @@ type SessionEventsOptions = {
   afterCursor?: number;
   reconnectMs?: number;
   onError?: (message: string) => void;
+  onOpen?: () => void;
 };
 
 export interface CommunicationManagerOptions {
@@ -113,6 +114,11 @@ export class CommunicationManager {
       (() => {
         // no-op
       });
+    const onOpen =
+      options.onOpen ??
+      (() => {
+        // no-op
+      });
 
     const connect = () => {
       if (disposed) return;
@@ -144,6 +150,10 @@ export class CommunicationManager {
         } catch (err) {
           onError(`[SessionEvents] Parse error: ${String(err)}`);
         }
+      };
+
+      ws.onopen = () => {
+        onOpen();
       };
 
       ws.onerror = () => {
