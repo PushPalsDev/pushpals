@@ -38,7 +38,28 @@ from uuid import uuid4
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-SERVER_URL = os.environ.get("PUSHPALS_SERVER_URL", "http://127.0.0.1:3001")
+def _canonicalize_server_url(raw_url: str) -> str:
+    source = (raw_url or "").strip() or "http://127.0.0.1:3001"
+    try:
+        parsed = urlparse(source)
+        host = (parsed.hostname or "").strip().lower()
+        if host not in {"localhost", "::1"}:
+            return source
+        auth = ""
+        if parsed.username:
+            auth = parsed.username
+            if parsed.password:
+                auth += f":{parsed.password}"
+            auth += "@"
+        netloc = f"{auth}127.0.0.1"
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        return parsed._replace(netloc=netloc).geturl()
+    except Exception:
+        return source
+
+
+SERVER_URL = _canonicalize_server_url(os.environ.get("PUSHPALS_SERVER_URL", "http://127.0.0.1:3001"))
 STREAM_LLM_SERVER_LOGS = (
     os.environ.get("WORKERPALS_E2E_STREAM_LLM_LOGS", "0").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -464,11 +485,81 @@ def _docker_image_exists(image: str) -> bool:
         return False
 
 
+_DOCKER_IMAGE_MAIN_SHA_LABEL = "pushpals.main_sha"
+
+
+def _git_main_commit_sha() -> str:
+    refs_to_try = ("refs/heads/main", "refs/remotes/origin/main", "HEAD")
+    for ref in refs_to_try:
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--verify", ref],
+                cwd=str(REPO_ROOT),
+                env=_build_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            sha = (proc.stdout or "").strip()
+            if sha:
+                return sha
+    raise RuntimeError("Unable to resolve git commit for main/HEAD when preparing Docker image.")
+
+
+def _docker_image_label(image: str, label: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                f"{{{{ index .Config.Labels \"{label}\" }}}}",
+                image,
+            ],
+            env=_build_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    value = (proc.stdout or "").strip()
+    if not value or value == "<no value>":
+        return None
+    return value
+
+
 def _ensure_docker_image(image: str) -> None:
-    if _docker_image_exists(image):
-        print(f"[NOTICE] Docker image already present: {image}")
+    expected_main_sha = _git_main_commit_sha()
+    image_exists = _docker_image_exists(image)
+    current_label_sha = _docker_image_label(image, _DOCKER_IMAGE_MAIN_SHA_LABEL) if image_exists else None
+    if image_exists and current_label_sha == expected_main_sha:
+        print(f"[NOTICE] Docker image already present and current for main@{expected_main_sha[:12]}: {image}")
         return
-    print(f"[NOTICE] Docker image not found locally; building: {image}")
+    if image_exists:
+        if current_label_sha:
+            print(
+                "[NOTICE] Docker image exists but is stale for main branch; rebuilding.\n"
+                f"  image={image}\n"
+                f"  image_main_sha={current_label_sha[:12]}\n"
+                f"  expected_main_sha={expected_main_sha[:12]}"
+            )
+        else:
+            print(
+                "[NOTICE] Docker image exists without main-sha label; rebuilding.\n"
+                f"  image={image}\n"
+                f"  expected_main_sha={expected_main_sha[:12]}"
+            )
+    else:
+        print(f"[NOTICE] Docker image not found locally; building: {image}")
     proc = subprocess.run(
         [
             "docker",
@@ -477,6 +568,8 @@ def _ensure_docker_image(image: str) -> None:
             "apps/workerpals/Dockerfile.sandbox",
             "-t",
             image,
+            "--label",
+            f"{_DOCKER_IMAGE_MAIN_SHA_LABEL}={expected_main_sha}",
             ".",
         ],
         cwd=str(REPO_ROOT),
@@ -1168,6 +1261,8 @@ _ensure_env_from_example(REPO_ROOT)
 _load_dotenv(REPO_ROOT / ".env")
 _load_dotenv(REPO_ROOT / ".env.local")
 _load_local_toml_for_llm(REPO_ROOT / "config" / "local.toml")
+# Keep all daemons on the exact same server URL/address family during this run.
+os.environ["PUSHPALS_SERVER_URL"] = SERVER_URL
 
 E2E_USE_DOCKER = _is_truthy(os.environ.get("WORKERPALS_E2E_DOCKER", "1"))
 E2E_DOCKER_IMAGE = (os.environ.get("WORKERPALS_E2E_DOCKER_IMAGE") or "").strip()
@@ -1255,7 +1350,10 @@ def main():
             lms_model_log_proc = start_lms_log_stream("model", extra_args=["--filter", "input,output", "--json"])
 
         if not server_already_running:
-            server_proc = start_process(["bun", "run", "server:only"])
+            # Use non-watch startup scripts in integration runs to avoid hot-reload restarts.
+            server_proc = start_process(
+                ["bun", "--cwd", "apps/server", "--env-file", "../../.env", "start"]
+            )
             started_server = True
 
         print("Waiting for server health...")
@@ -1272,7 +1370,19 @@ def main():
 
         # Start RemoteBuddy only after server health is confirmed.
         remotebuddy_proc = start_process(
-            ["bun", "run", "remotebuddy:only", "--", "--sessionId", run_session_id],
+            [
+                "bun",
+                "--cwd",
+                "apps/remotebuddy",
+                "--env-file",
+                "../../.env",
+                "start",
+                "--",
+                "--server",
+                SERVER_URL,
+                "--sessionId",
+                run_session_id,
+            ],
         )
         started_remotebuddy = True
         assert_proc_alive(remotebuddy_proc, "remotebuddy")
@@ -1314,9 +1424,14 @@ def main():
                 )
             worker_cmd = [
                 "bun",
-                "run",
-                "workerpals:only",
+                "--cwd",
+                "apps/workerpals",
+                "--env-file",
+                "../../.env",
+                "start",
                 "--",
+                "--server",
+                SERVER_URL,
                 "--repo",
                 str(repo),
                 "--base-ref",
