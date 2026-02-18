@@ -77,6 +77,19 @@ function extractQuotedPathHints(text: string): string[] {
   return out;
 }
 
+function extractTokenPathHints(text: string): string[] {
+  const out: string[] = [];
+  const tokenRegex = /\b([A-Za-z0-9._/\-\\]+\.[A-Za-z0-9._-]+)\b/g;
+  for (const match of text.matchAll(tokenRegex)) {
+    const candidate = (match[1] ?? "").trim().replace(/[.,!?;:]+$/, "");
+    if (!candidate) continue;
+    if (candidate.includes("://")) continue;
+    out.push(candidate);
+    if (out.length >= MAX_TARGET_PATH_HINTS) break;
+  }
+  return out;
+}
+
 export function normalizePathHints(values: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -98,6 +111,7 @@ export function plannerTargetPaths(plan: PlannerPathHints, prompt: string): stri
   const explicit = extractExplicitTargetPath(prompt);
   const pathHints = normalizePathHints([
     ...(explicit ? [explicit] : []),
+    ...extractTokenPathHints(prompt),
     ...extractQuotedPathHints(prompt),
     ...(plan.scope.write_globs ?? []),
     ...(plan.discovery?.likely_dirs ?? []),

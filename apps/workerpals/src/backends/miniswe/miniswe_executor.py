@@ -34,6 +34,7 @@ import re
 import shlex
 import sys
 import time
+import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -590,8 +591,13 @@ def _extract_explicit_target_paths_from_payload(payload: Optional[Dict[str, Any]
     def add(val: Any) -> None:
         if not isinstance(val, str):
             return
-        token = val.strip()
+        token = val.strip().replace("\\", "/")
+        while token.startswith("./"):
+            token = token[2:]
+        token = token.rstrip("/")
         if not token or token in seen:
+            return
+        if token in {".", "/"}:
             return
         seen.add(token)
         out.append(token)
@@ -610,6 +616,22 @@ def _extract_explicit_target_paths_from_payload(payload: Optional[Dict[str, Any]
                 for item in write_globs:
                     add(item)
     return out
+
+
+def _target_hint_matches_changed_path(target_hint: str, changed_path: str) -> bool:
+    target = str(target_hint or "").strip().replace("\\", "/").rstrip("/")
+    changed = str(changed_path or "").strip().replace("\\", "/").rstrip("/")
+    if not target or not changed:
+        return False
+    if target in {".", "/"}:
+        return True
+    if changed == target:
+        return True
+    if changed.startswith(target + "/"):
+        return True
+    if any(ch in target for ch in "*?[]"):
+        return fnmatch.fnmatchcase(changed, target)
+    return False
 
 
 def _is_git_porcelain_status_command(cmd: str) -> bool:
@@ -845,12 +867,19 @@ def _broker_run(
             "exitCode": 3,
         }
     if expected_targets and changed_paths:
-        changed_set = {str(p).strip() for p in changed_paths}
-        expected_set = {str(p).strip() for p in expected_targets}
+        changed_set = {str(p).strip().replace("\\", "/") for p in changed_paths}
+        expected_set = {str(p).strip().replace("\\", "/") for p in expected_targets}
         strict_target_match = bool(
-            explicit_target_set and not any(any(ch in t for ch in "*?[]") for t in explicit_target_set)
+            explicit_target_set
+            and not any(t in {".", "/"} for t in explicit_target_set)
+            and not any(any(ch in t for ch in "*?[]") for t in explicit_target_set)
         )
-        if expected_set and changed_set.isdisjoint(expected_set):
+        matched = any(
+            _target_hint_matches_changed_path(expected, changed)
+            for expected in expected_set
+            for changed in changed_set
+        )
+        if expected_set and not matched:
             msg = (
                 "Expected one of target paths to change, but observed different files. "
                 f"expected={sorted(expected_set)} observed={sorted(changed_set)}"
