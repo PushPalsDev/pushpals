@@ -21,9 +21,11 @@ import atexit
 import importlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -179,6 +181,24 @@ def _kill_existing_server_processes() -> None:
             capture_output=True,
             text=True,
         )
+
+
+def _create_isolated_worker_repo(source_repo: Path) -> tuple[Path, Path]:
+    """Create an isolated git clone for WorkerPals so E2E edits never touch the source workspace."""
+    temp_root = Path(tempfile.mkdtemp(prefix="pushpals-e2e-worker-repo-"))
+    clone_path = temp_root / "repo"
+    proc = subprocess.run(
+        ["git", "clone", "--local", "--quiet", "--no-hardlinks", str(source_repo), str(clone_path)],
+        cwd=str(source_repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise RuntimeError(f"Failed to create isolated worker repo clone: {detail}")
+    return clone_path, temp_root
 
 
 def _request_server_shutdown(timeout_sec: float = 8.0) -> bool:
@@ -783,6 +803,7 @@ E2E_DOCKER_NETWORK = (os.environ.get("WORKERPALS_E2E_DOCKER_NETWORK") or "").str
 E2E_DOCKER_TIMEOUT_MS = (os.environ.get("WORKERPALS_E2E_DOCKER_TIMEOUT_MS") or "").strip()
 E2E_DOCKER_IDLE_TIMEOUT_MS = (os.environ.get("WORKERPALS_E2E_DOCKER_IDLE_TIMEOUT_MS") or "").strip()
 E2E_DOCKER_IMAGE_EFFECTIVE = E2E_DOCKER_IMAGE or "pushpals-worker-sandbox:latest"
+E2E_ISOLATE_WORKER_REPO = _is_truthy(os.environ.get("WORKERPALS_E2E_ISOLATE_WORKER_REPO", "1"))
 
 DEFAULT_ENV = os.environ.copy()
 
@@ -810,7 +831,14 @@ def main():
 
     lms_server_log_proc = None
     lms_model_log_proc = None
+    isolated_worker_repo_root: Path | None = None
     failures: list[str] = []
+
+    if E2E_ISOLATE_WORKER_REPO:
+        repo, isolated_worker_repo_root = _create_isolated_worker_repo(REPO_ROOT)
+        print(f"[NOTICE] Using isolated worker repo clone: {repo}")
+    else:
+        print("[NOTICE] Worker repo isolation disabled; using current workspace repo directly.")
 
     server_already_running = wait_for_server(2.0)
     started_server = False
@@ -1101,6 +1129,8 @@ def main():
             stop_lms_log_stream(lms_model_log_proc)
         if lms_server_log_proc:
             stop_lms_log_stream(lms_server_log_proc)
+        if isolated_worker_repo_root is not None:
+            shutil.rmtree(isolated_worker_repo_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

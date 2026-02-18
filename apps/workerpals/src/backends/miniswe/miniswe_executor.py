@@ -16,14 +16,28 @@ Production hardening:
   ("No tool calls found", etc.) and retry once with a strict tool-usage hint.
 - If the model still cannot tool-call, return a structured failure that makes
   the root cause obvious to the TS layer (so you can alert / route / fallback).
+
+Tool-broker shim:
+- If mini-swe-agent fails because the model doesn't tool-call, optionally fall back to a
+  "tool broker" loop that does NOT require native tool/function calling.
+- The broker asks the model to emit a strict JSON "plan of actions" (file ops + safe shell),
+  executes them locally, and feeds observations back to the model for a few steps.
+- Enable with: WORKERPALS_MINISWE_TOOL_BROKER=1 (default off to avoid surprises).
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import shlex
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 # Shared executor infrastructure lives in src/backends/shared.
 _SHARED_DIR = Path(__file__).resolve().parents[1] / "shared"
@@ -48,12 +62,67 @@ from executor_base import (
     DEFAULT_TOOLCALL_RETRY_MAX,
 )
 
-
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 DEFAULT_MINISWE_MODEL = "local-model"
 LOG_PREFIX = "[MiniSweExecutor]"
 log = Logger(LOG_PREFIX)
+
+# Tool broker defaults (conservative)
+_BROKER_ENABLED_DEFAULT = "0"  # off by default
+_BROKER_MAX_STEPS_DEFAULT = 8
+_BROKER_MAX_ACTIONS_PER_STEP_DEFAULT = 10
+_BROKER_HTTP_TIMEOUT_SEC = 60
+_BROKER_TEMPERATURE = 0.0
+_BROKER_SHELL_TIMEOUT_SEC_DEFAULT = 120
+_BROKER_OBSERVATION_MAX_CHARS = 8_000
+
+# Safety: very simple denylist for shell commands (can be adjusted)
+_DENY_PATTERNS = [
+    r"\bsudo\b",
+    r"\brm\b\s+-rf\b",
+    r"\bmkfs\b",
+    r"\bdd\b",
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bpoweroff\b",
+    r"\bcurl\b",
+    r"\bwget\b",
+    r"\bnc\b",
+    r"\bnetcat\b",
+    r"\bssh\b",
+    r"\bscp\b",
+    r"\brsync\b",
+    r"\bpython\b\s+-m\s+http\.server\b",
+]
+_ALLOWED_BINARIES = {
+    "git",
+    "cat",
+    "tail",
+    "head",
+    "ls",
+    "find",
+    "rg",
+    "grep",
+    "sed",
+    "awk",
+    "wc",
+    "stat",
+    "printf",
+    "echo",
+    "test",
+}
+_ALLOWED_GIT_SUBCOMMANDS = {
+    "status",
+    "diff",
+    "show",
+    "log",
+    "grep",
+    "rev-parse",
+    "ls-files",
+}
+_SHELL_META_CHARS = set(";|&$`()<>")
+_BROKER_MAX_WRITE_CHARS = 200_000
 
 
 # ─── Mini-swe-specific config ───────────────────────────────────────────────
@@ -80,6 +149,32 @@ def _toolcall_retry_max() -> int:
     return max(0, min(3, to_int(cfg, DEFAULT_TOOLCALL_RETRY_MAX)))
 
 
+def _tool_broker_enabled() -> bool:
+    raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER") or _BROKER_ENABLED_DEFAULT).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _tool_broker_max_steps() -> int:
+    raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER_MAX_STEPS") or "").strip()
+    if raw:
+        return max(1, min(30, to_int(raw, _BROKER_MAX_STEPS_DEFAULT)))
+    return _BROKER_MAX_STEPS_DEFAULT
+
+
+def _tool_broker_max_actions_per_step() -> int:
+    raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER_MAX_ACTIONS_PER_STEP") or "").strip()
+    if raw:
+        return max(1, min(50, to_int(raw, _BROKER_MAX_ACTIONS_PER_STEP_DEFAULT)))
+    return _BROKER_MAX_ACTIONS_PER_STEP_DEFAULT
+
+
+def _tool_broker_shell_timeout_sec() -> int:
+    raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER_SHELL_TIMEOUT_SEC") or "").strip()
+    if raw:
+        return max(5, min(600, to_int(raw, _BROKER_SHELL_TIMEOUT_SEC_DEFAULT)))
+    return _BROKER_SHELL_TIMEOUT_SEC_DEFAULT
+
+
 def _build_strict_tool_use_guidance(repo: str) -> str:
     return (
         "CRITICAL: You must use tools to make progress.\n"
@@ -91,6 +186,662 @@ def _build_strict_tool_use_guidance(repo: str) -> str:
     )
 
 
+# ─── Tool Broker Shim ────────────────────────────────────────────────────────
+
+@dataclass
+class _LLMConfig:
+    model: str
+    api_key: str
+    base_url: str
+
+
+def _normalize_openai_base_url(base_url: str) -> str:
+    """
+    Accept:
+      - http://host:1234
+      - http://host:1234/
+      - http://host:1234/v1
+      - http://host:1234/v1/
+    Return a base that ends with /v1
+    """
+    b = (base_url or "").strip()
+    if not b:
+        return ""
+    b = b.rstrip("/")
+    if b.endswith("/v1"):
+        return b
+    if b.endswith("v1"):
+        # e.g. ".../v1" already covered, but keep safe
+        return b
+    return b + "/v1"
+
+
+def _http_post_json(url: str, payload: Dict[str, Any], api_key: str, timeout_sec: float) -> Dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except HTTPError as e:
+        try:
+            details = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            details = ""
+        raise RuntimeError(f"HTTP {e.code} {e.reason} for POST {url}\n{details}") from e
+    except URLError as e:
+        raise RuntimeError(f"URLError for POST {url}: {e}") from e
+
+
+def _chat_completion(cfg: _LLMConfig, messages: List[Dict[str, str]]) -> str:
+    base = _normalize_openai_base_url(cfg.base_url)
+    if not base:
+        raise RuntimeError("No base_url configured for broker shim (WORKERPALS_LLM_ENDPOINT/BASE_URL).")
+    url = base + "/chat/completions"
+    payload: Dict[str, Any] = {
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": _BROKER_TEMPERATURE,
+        "stream": False,
+    }
+    obj = _http_post_json(url, payload, cfg.api_key, timeout_sec=_BROKER_HTTP_TIMEOUT_SEC)
+    choices = obj.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"LLM returned no choices: {to_single_line(obj, 400)}")
+    msg = choices[0].get("message") or {}
+    content = msg.get("content")
+    if not isinstance(content, str):
+        raise RuntimeError(f"LLM returned non-text content: {to_single_line(obj, 400)}")
+    return content.strip()
+
+
+def _repo_safe_path(repo: str, rel_path: str) -> Path:
+    rel = str(rel_path or "")
+    if not rel.strip():
+        raise RuntimeError("Path is required")
+    if "\x00" in rel:
+        raise RuntimeError("Path contains NUL byte")
+    if Path(rel).is_absolute():
+        raise RuntimeError(f"Absolute paths are not allowed: {rel}")
+    if re.match(r"^[A-Za-z]:[\\/]", rel):
+        raise RuntimeError(f"Drive-letter paths are not allowed: {rel}")
+    root = Path(repo).resolve()
+    p = (root / rel).resolve()
+    # Ensure p is within root
+    if root == p or root in p.parents:
+        return p
+    raise RuntimeError(f"Refusing to access path outside repo: {rel}")
+
+
+def _read_text_file(repo: str, path: str, max_chars: int = 60000) -> str:
+    p = _repo_safe_path(repo, path)
+    if not p.exists():
+        raise RuntimeError(f"File not found: {path}")
+    data = p.read_text(encoding="utf-8", errors="replace")
+    if len(data) > max_chars:
+        return data[:max_chars] + "\n... (truncated)"
+    return data
+
+
+def _write_text_file(repo: str, path: str, content: str) -> None:
+    p = _repo_safe_path(repo, path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+
+
+def _append_line(repo: str, path: str, line: str) -> None:
+    """
+    Append a single line to end of file using append mode (no full-file rewrite).
+    If the file exists and does not end with newline, add one first.
+    """
+    p = _repo_safe_path(repo, path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    needs_prefix_newline = False
+    if p.exists() and p.stat().st_size > 0:
+        try:
+            with open(p, "rb") as rf:
+                rf.seek(-1, os.SEEK_END)
+                needs_prefix_newline = rf.read(1) != b"\n"
+        except Exception:
+            needs_prefix_newline = False
+    with open(p, "a", encoding="utf-8") as wf:
+        if needs_prefix_newline:
+            wf.write("\n")
+        wf.write(f"{line}\n")
+
+
+def _replace_text_once(repo: str, path: str, old: str, new: str) -> int:
+    p = _repo_safe_path(repo, path)
+    data = p.read_text(encoding="utf-8", errors="replace")
+    idx = data.find(old)
+    if idx < 0:
+        return 0
+    updated = data[:idx] + new + data[idx + len(old):]
+    p.write_text(updated, encoding="utf-8")
+    return 1
+
+
+def _parse_and_validate_shell_command(cmd: str) -> Tuple[Optional[List[str]], str]:
+    c = (cmd or "").strip()
+    if not c:
+        return None, "empty command"
+    if any(ord(ch) < 32 for ch in c):
+        return None, "control characters are not allowed"
+    if any(ch in c for ch in _SHELL_META_CHARS):
+        return None, "shell metacharacters are not allowed"
+    try:
+        args = shlex.split(c, posix=True)
+    except Exception as exc:
+        return None, f"failed to parse command: {exc}"
+    if not args:
+        return None, "empty parsed command"
+    binary = args[0].strip().lower()
+    if binary not in _ALLOWED_BINARIES:
+        return None, f"binary not allowed: {binary}"
+    lowered = c.lower()
+    for pat in _DENY_PATTERNS:
+        if re.search(pat, lowered):
+            return None, f"blocked by denylist: {pat}"
+    # Additional guardrails for risky allowlisted binaries.
+    if binary == "find":
+        joined = " ".join(args[1:]).lower()
+        if "-exec" in joined or "-delete" in joined:
+            return None, "find with -exec/-delete is not allowed"
+    if binary == "git" and len(args) >= 2:
+        sub = args[1].strip().lower()
+        if sub not in _ALLOWED_GIT_SUBCOMMANDS:
+            return None, f"git subcommand not allowed: {sub}"
+        for raw_arg in args[2:]:
+            arg = str(raw_arg or "").strip()
+            if not arg:
+                continue
+            lower_arg = arg.lower()
+            if lower_arg in {"-c", "-C"}:
+                return None, f"git option is not allowed: {arg}"
+            if lower_arg.startswith("-c"):
+                return None, f"git option prefix is not allowed: {arg}"
+            if lower_arg.startswith("--git-dir") or lower_arg.startswith("--work-tree"):
+                return None, f"git path/work-tree override is not allowed: {arg}"
+            if lower_arg == "--no-index":
+                return None, "git diff --no-index is not allowed"
+            if arg.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", arg):
+                return None, f"absolute path-like git arg is not allowed: {arg}"
+            normalized = arg.replace("\\", "/")
+            while normalized.startswith("./"):
+                normalized = normalized[2:]
+            if (
+                normalized == ".."
+                or normalized.startswith("../")
+                or "/../" in normalized
+            ):
+                return None, f"path escape git arg is not allowed: {arg}"
+    if binary == "git" and len(args) < 2:
+        return None, "git command requires an explicit allowed subcommand"
+    if binary == "awk":
+        joined = " ".join(args[1:]).lower()
+        if "system(" in joined:
+            return None, "awk system() is not allowed"
+    return args, ""
+
+
+def _run_shell(repo: str, cmd: str, max_output: int = 60000, timeout_sec: Optional[int] = None) -> str:
+    """
+    Run a tokenized command in repo without shell expansion/chaining.
+    Blocks unsafe commands with binary allowlist + additional guardrails.
+    """
+    args, reason = _parse_and_validate_shell_command(cmd)
+    if args is None:
+        raise RuntimeError(f"Shell command rejected: {reason}. cmd={cmd!r}")
+
+    import subprocess
+
+    proc = subprocess.run(
+        args,
+        cwd=str(Path(repo).resolve()),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=(timeout_sec if timeout_sec is not None else _tool_broker_shell_timeout_sec()),
+    )
+    out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+    out = out.strip()
+    if len(out) > max_output:
+        out = out[:max_output] + "\n... (truncated)"
+    return f"(exit={proc.returncode})\n{out}" if out else f"(exit={proc.returncode})"
+
+
+def _shell_exit_code(output: str) -> Optional[int]:
+    m = re.match(r"^\(exit=(\d+)\)", str(output or "").strip())
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Tries to find and parse a single JSON object from the model response.
+    Accepts plain JSON, or JSON inside Markdown fences.
+    """
+    if not text:
+        return None
+    # Strip ```json fences
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    candidate = fenced.group(1).strip() if fenced else text.strip()
+
+    # Fast path: whole string is JSON
+    try:
+        obj = json.loads(candidate)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    # Heuristic: find first {...} block
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        snippet = candidate[start : end + 1]
+        try:
+            obj = json.loads(snippet)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _truncate_observation(text: str, max_chars: int = _BROKER_OBSERVATION_MAX_CHARS) -> str:
+    t = str(text or "").strip()
+    if len(t) <= max_chars:
+        return t
+    head = max_chars // 2
+    tail = max_chars - head
+    return f"{t[:head]}\n...[observation truncated]...\n{t[-tail:]}"
+
+
+def _validate_broker_actions(actions: Any, max_actions: int) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    if actions is None:
+        return True, "", []
+    if not isinstance(actions, list):
+        return False, f"Expected actions to be a list, got: {type(actions).__name__}", []
+    valid: List[Dict[str, Any]] = []
+    for i, act in enumerate(actions[:max_actions], start=1):
+        if not isinstance(act, dict):
+            return False, f"Action {i}: must be an object", []
+        typ = str(act.get("type") or "").strip()
+        if not typ:
+            return False, f"Action {i}: missing type", []
+        if typ == "read_file":
+            if not isinstance(act.get("path"), str) or not str(act.get("path")).strip():
+                return False, f"Action {i} read_file: path is required", []
+            valid.append({"type": typ, "path": str(act.get("path")).strip()})
+            continue
+        if typ == "append_line":
+            if not isinstance(act.get("path"), str) or not str(act.get("path")).strip():
+                return False, f"Action {i} append_line: path is required", []
+            if not isinstance(act.get("line"), str):
+                return False, f"Action {i} append_line: line must be a string", []
+            valid.append(
+                {"type": typ, "path": str(act.get("path")).strip(), "line": str(act.get("line"))}
+            )
+            continue
+        if typ == "replace_text_once":
+            if not isinstance(act.get("path"), str) or not str(act.get("path")).strip():
+                return False, f"Action {i} replace_text_once: path is required", []
+            old = act.get("old")
+            new = act.get("new")
+            if not isinstance(old, str) or not isinstance(new, str):
+                return False, f"Action {i} replace_text_once: old/new must be strings", []
+            if not old:
+                return False, f"Action {i} replace_text_once: old must be non-empty", []
+            valid.append(
+                {"type": typ, "path": str(act.get("path")).strip(), "old": old, "new": new}
+            )
+            continue
+        if typ == "write_file":
+            if not isinstance(act.get("path"), str) or not str(act.get("path")).strip():
+                return False, f"Action {i} write_file: path is required", []
+            content = act.get("content")
+            if not isinstance(content, str):
+                return False, f"Action {i} write_file: content must be a string", []
+            if len(content) > _BROKER_MAX_WRITE_CHARS:
+                return False, f"Action {i} write_file: content too large ({len(content)} chars)", []
+            valid.append({"type": typ, "path": str(act.get("path")).strip(), "content": content})
+            continue
+        if typ == "run_shell":
+            cmd = act.get("command")
+            if not isinstance(cmd, str) or not cmd.strip():
+                return False, f"Action {i} run_shell: command is required", []
+            valid.append({"type": typ, "command": cmd.strip()})
+            continue
+        return False, f"Action {i}: unknown type {typ!r}", []
+    return True, "", valid
+
+
+def _extract_expected_target_paths(instruction: str) -> List[str]:
+    targets: List[str] = []
+    # lightweight heuristic for common file-target asks
+    for m in re.finditer(r"\b([A-Za-z0-9._/\-]+(?:\.[A-Za-z0-9._-]+))\b", instruction or ""):
+        token = m.group(1).strip()
+        if "/" in token or "." in token:
+            lower = token.lower()
+            if lower in {"true", "false", "none"}:
+                continue
+            if token not in targets:
+                targets.append(token)
+        if len(targets) >= 8:
+            break
+    return targets
+
+
+def _extract_explicit_target_paths_from_payload(payload: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(payload, dict):
+        return []
+    out: List[str] = []
+    seen = set()
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return []
+
+    def add(val: Any) -> None:
+        if not isinstance(val, str):
+            return
+        token = val.strip()
+        if not token or token in seen:
+            return
+        seen.add(token)
+        out.append(token)
+
+    add(params.get("targetPath"))
+    planning = params.get("planning")
+    if isinstance(planning, dict):
+        target_paths = planning.get("targetPaths")
+        if isinstance(target_paths, list):
+            for item in target_paths:
+                add(item)
+        scope = planning.get("scope")
+        if isinstance(scope, dict):
+            write_globs = scope.get("writeGlobs")
+            if isinstance(write_globs, list):
+                for item in write_globs:
+                    add(item)
+    return out
+
+
+def _is_git_porcelain_status_command(cmd: str) -> bool:
+    args, reason = _parse_and_validate_shell_command(cmd)
+    if args is None:
+        return False
+    if len(args) < 2 or args[0].lower() != "git" or args[1].lower() != "status":
+        return False
+    return any(a.lower().startswith("--porcelain") for a in args[2:])
+
+
+def _broker_system_prompt(repo: str) -> str:
+    return (
+        "You are a code-changing assistant operating on a local git repository.\n"
+        "You DO NOT have native tool/function calling. Instead, you must output a STRICT JSON object describing actions.\n"
+        "\n"
+        "Repository root: " + repo + "\n"
+        "\n"
+        "Output format (STRICT JSON, no markdown, no extra keys unless specified):\n"
+        "{\n"
+        '  "actions": [\n'
+        "    {\"type\":\"read_file\",\"path\":\"README.md\"},\n"
+        "    {\"type\":\"append_line\",\"path\":\"README.md\",\"line\":\"...\"},\n"
+        "    {\"type\":\"replace_text_once\",\"path\":\"x\",\"old\":\"a\",\"new\":\"b\"},\n"
+        "    {\"type\":\"write_file\",\"path\":\"x\",\"content\":\"...\"},\n"
+        "    {\"type\":\"run_shell\",\"command\":\"git status --porcelain\"}\n"
+        "  ],\n"
+        '  "done": false,\n'
+        '  "note": "short explanation"\n'
+        "}\n"
+        "\n"
+        "Rules:\n"
+        "- Keep actions minimal and directly relevant.\n"
+        "- Paths must be repo-relative.\n"
+        "- Use read_file before edit when unsure.\n"
+        "- After edits, run_shell: \"git status --porcelain\".\n"
+        "- When task is complete, set done=true and keep actions empty or only verification commands.\n"
+    )
+
+
+def _broker_run(
+    repo: str,
+    instruction: str,
+    llm: _LLMConfig,
+    timeout_ms: int,
+    explicit_targets: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Executes a simple plan/act loop where the model emits JSON actions.
+    """
+    started = time.time()
+    deadline = started + max(5, int(timeout_ms / 1000))
+
+    max_steps = _tool_broker_max_steps()
+    max_actions = _tool_broker_max_actions_per_step()
+    shell_timeout_sec = _tool_broker_shell_timeout_sec()
+
+    transcript: List[str] = []
+    obs: str = ""
+    edits_made = False
+    shell_validation_ran = False
+    explicit_target_set = {str(t).strip() for t in (explicit_targets or []) if str(t).strip()}
+    expected_targets = sorted(explicit_target_set) if explicit_target_set else _extract_expected_target_paths(instruction)
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": _broker_system_prompt(repo)},
+        {"role": "user", "content": f"Task:\n{instruction}\n\nStart now. Output STRICT JSON only."},
+    ]
+
+    def _record(line: str) -> None:
+        transcript.append(line)
+        log.info(line)
+
+    step = 0
+    model_done = False
+    while step < max_steps and time.time() < deadline:
+        step += 1
+
+        if obs:
+            messages.append({"role": "user", "content": f"Observation (from executed actions):\n{obs}\n\nNext JSON only."})
+
+        raw = _chat_completion(llm, messages)
+        raw_used = raw
+        _record(f"[Broker] Step {step} model output: {to_single_line(raw, 500)}")
+
+        obj = _extract_first_json_object(raw)
+        if not obj:
+            # one reprompt to force JSON
+            messages.append({"role": "user", "content": "Your last response was not valid JSON. Return ONLY the JSON object."})
+            raw2 = _chat_completion(llm, messages)
+            _record(f"[Broker] Step {step} JSON repair output: {to_single_line(raw2, 500)}")
+            obj = _extract_first_json_object(raw2)
+            if not obj:
+                return {
+                    "ok": False,
+                    "summary": "tool broker failed: model did not produce parsable JSON actions",
+                    "stderr": "Model output could not be parsed as the required JSON action format.",
+                    "exitCode": 3,
+                }
+            raw = raw2
+        allowed_top_keys = {"actions", "done", "note"}
+        extras = [k for k in obj.keys() if str(k) not in allowed_top_keys]
+        if extras:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your JSON had unsupported top-level keys. "
+                        "Return ONLY one JSON object with keys: actions, done, note."
+                    ),
+                }
+            )
+            raw3 = _chat_completion(llm, messages)
+            _record(f"[Broker] Step {step} shape repair output: {to_single_line(raw3, 500)}")
+            obj2 = _extract_first_json_object(raw3)
+            if not isinstance(obj2, dict):
+                return {
+                    "ok": False,
+                    "summary": "tool broker failed: invalid response shape",
+                    "stderr": f"Unexpected top-level keys in broker JSON: {extras}",
+                    "exitCode": 3,
+                }
+            obj = obj2
+            raw_used = raw3
+            extras = [k for k in obj.keys() if str(k) not in allowed_top_keys]
+            if extras:
+                # Recoverable formatting issue: ignore extras rather than hard-fail.
+                obj = {k: obj.get(k) for k in allowed_top_keys}
+                raw_used = json.dumps(obj, ensure_ascii=False)
+
+        actions = obj.get("actions")
+        done = bool(obj.get("done"))
+
+        ok_actions, reason_actions, planned_actions = _validate_broker_actions(actions, max_actions)
+        if not ok_actions:
+            return {
+                "ok": False,
+                "summary": "tool broker failed: invalid actions schema",
+                "stderr": reason_actions,
+                "exitCode": 3,
+            }
+
+        # Execute actions
+        action_logs: List[str] = []
+        for i, act in enumerate(planned_actions, start=1):
+            typ = str(act.get("type") or "").strip()
+            try:
+                if typ == "read_file":
+                    path = str(act.get("path") or "")
+                    content = _read_text_file(repo, path)
+                    preview = _truncate_observation(content, max_chars=2000)
+                    action_logs.append(
+                        f"- read_file {path}: ok ({len(content)} chars total)\n{preview}"
+                    )
+                elif typ == "append_line":
+                    path = str(act.get("path") or "")
+                    line = str(act.get("line") or "")
+                    _append_line(repo, path, line)
+                    edits_made = True
+                    action_logs.append(f"- append_line {path}: ok (appended {line!r})")
+                elif typ == "replace_text_once":
+                    path = str(act.get("path") or "")
+                    old = str(act.get("old") or "")
+                    new = str(act.get("new") or "")
+                    n = _replace_text_once(repo, path, old, new)
+                    edits_made = edits_made or (n > 0)
+                    action_logs.append(f"- replace_text_once {path}: {n} replacement(s)")
+                elif typ == "write_file":
+                    path = str(act.get("path") or "")
+                    content = str(act.get("content") or "")
+                    _write_text_file(repo, path, content)
+                    edits_made = True
+                    action_logs.append(f"- write_file {path}: ok ({len(content)} chars)")
+                elif typ == "run_shell":
+                    cmd = str(act.get("command") or "")
+                    out = _run_shell(repo, cmd, timeout_sec=shell_timeout_sec)
+                    shell_validation_ran = shell_validation_ran or _is_git_porcelain_status_command(cmd)
+                    action_logs.append(f"- run_shell {cmd!r}:\n{out}")
+                else:
+                    action_logs.append(f"- action {i}: unknown type {typ!r} (rejected by schema)")
+            except Exception as exc:
+                action_logs.append(f"- {typ or 'action'} failed: {to_single_line(exc, 400)}")
+
+        obs = _truncate_observation("\n".join(action_logs).strip())
+
+        # Feed the raw JSON back as assistant message (helps the model stay consistent)
+        messages.append({"role": "assistant", "content": raw_used})
+
+        if done:
+            _record("[Broker] Model signaled done=true.")
+            model_done = True
+            break
+
+    # Always include a final git status if possible (and safe)
+    try:
+        final_status = _run_shell(repo, "git status --porcelain", timeout_sec=shell_timeout_sec)
+    except Exception as exc:
+        final_status = f"(git status failed) {to_single_line(exc, 300)}"
+    final_status_exit = _shell_exit_code(final_status)
+
+    transcript_text = "\n".join(transcript).strip()
+    stdout = ""
+    if transcript_text:
+        stdout += "Tool broker transcript:\n" + transcript_text + "\n\n"
+    stdout += "Final verification:\n" + final_status
+
+    if not model_done:
+        return {
+            "ok": False,
+            "summary": "tool broker failed: did not reach done=true before limits",
+            "stdout": stdout,
+            "stderr": (
+                "Model did not return done=true before max steps/timeout. "
+                "Treating broker run as incomplete."
+            ),
+            "exitCode": 3,
+        }
+    if final_status_exit is not None and final_status_exit != 0:
+        return {
+            "ok": False,
+            "summary": "tool broker failed: verification command failed",
+            "stdout": stdout,
+            "stderr": "Final verification command `git status --porcelain` failed.",
+            "exitCode": 3,
+        }
+    changed_paths = summarize_git_changes(repo)
+    if edits_made and not changed_paths:
+        return {
+            "ok": False,
+            "summary": "tool broker failed: model claimed edits but repo has no changes",
+            "stdout": stdout,
+            "stderr": "Broker executed edit actions but git reports no changed files.",
+            "exitCode": 3,
+        }
+    if expected_targets and changed_paths:
+        changed_set = {str(p).strip() for p in changed_paths}
+        expected_set = {str(p).strip() for p in expected_targets}
+        strict_target_match = bool(
+            explicit_target_set and not any(any(ch in t for ch in "*?[]") for t in explicit_target_set)
+        )
+        if expected_set and changed_set.isdisjoint(expected_set):
+            msg = (
+                "Expected one of target paths to change, but observed different files. "
+                f"expected={sorted(expected_set)} observed={sorted(changed_set)}"
+            )
+            if strict_target_match:
+                return {
+                    "ok": False,
+                    "summary": "tool broker failed: changed files do not match explicit target paths",
+                    "stdout": stdout + "\n\nChanged files:\n" + "\n".join(f"- {p}" for p in changed_paths),
+                    "stderr": msg,
+                    "exitCode": 3,
+                }
+            stdout += "\n\nTarget-path mismatch (heuristic, non-fatal):\n" + msg
+    if edits_made and not shell_validation_ran:
+        return {
+            "ok": False,
+            "summary": "tool broker failed: no explicit validation command was executed",
+            "stdout": stdout,
+            "stderr": "Model performed edits but did not run `git status --porcelain` during broker steps.",
+            "exitCode": 3,
+        }
+
+    return {
+        "ok": True,
+        "summary": "Executed task via tool broker shim",
+        "stdout": stdout,
+        "stderr": "",
+        "exitCode": 0,
+    }
+
+
 # ─── mini-swe-agent execution ───────────────────────────────────────────────
 
 def _run_miniswe_task(
@@ -99,7 +850,7 @@ def _run_miniswe_task(
     payload: Optional[Dict[str, Any]] = None,
     supplemental_guidance: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Execute a task using mini-swe-agent's Python SDK."""
+    """Execute a task using mini-swe-agent's Python SDK (and optional broker fallback)."""
 
     try:
         from minisweagent.agents.default import DefaultAgent
@@ -174,6 +925,12 @@ def _run_miniswe_task(
     # Pre-run baseline so we can tell whether *anything* changed even if the model/tooling is flaky.
     baseline_changes = set(summarize_git_changes(repo))
 
+    # Prepare broker config upfront (so we can fall back cleanly)
+    llm_cfg = _LLMConfig(model=model_name, api_key=api_key or "", base_url=base_url or "")
+
+    exit_info: Dict[str, Any] = {}
+    agent = None
+
     try:
         import yaml
         from minisweagent import package_dir
@@ -195,12 +952,12 @@ def _run_miniswe_task(
         config_path = package_dir / "config" / "default.yaml"
         with open(config_path, "r", encoding="utf-8") as f:
             builtin_config = yaml.safe_load(f)
-        agent_kwargs = builtin_config.get("agent", {})
+        agent_kwargs = builtin_config.get("agent", {}) or {}
 
         agent_kwargs["cost_limit"] = 0.0  # we manage budget externally
         agent_kwargs["step_limit"] = setting_int(
-            "WORKERPALS_OPENHANDS_AGENT_MAX_STEPS",
-            "workerpals.openhands.agent_max_steps",
+            "WORKERPALS_MINISWE_AGENT_MAX_STEPS",
+            "workerpals.miniswe.agent_max_steps",
             30,
         )
 
@@ -209,8 +966,6 @@ def _run_miniswe_task(
 
         toolcall_retry_max = _toolcall_retry_max()
         attempt = 0
-        last_exc: Optional[Exception] = None
-
         while True:
             try:
                 attempt += 1
@@ -227,7 +982,7 @@ def _run_miniswe_task(
                         "you must now call tools immediately (read target files, then edit)."
                     )
 
-                exit_info = agent.run(_compose_instruction(extra_guidance=extra_guidance))
+                exit_info = agent.run(_compose_instruction(extra_guidance=extra_guidance)) or {}
                 log.info("Agent execution completed.")
 
                 # Log what the agent did
@@ -235,11 +990,9 @@ def _run_miniswe_task(
                     log.debug(f"Agent message history ({len(agent.messages)} messages):")
                     log_agent_messages(agent.messages, log)
                 log_git_status(repo, log)
-                last_exc = None
                 break
 
             except Exception as exc:
-                last_exc = exc
                 if is_no_tool_calls_error(exc) and (attempt - 1) < toolcall_retry_max:
                     log.info(
                         "Detected tool-call failure from model/runtime: "
@@ -249,32 +1002,58 @@ def _run_miniswe_task(
                 raise
 
     except Exception as exc:
+        # If it's a tool-call failure, optionally fall back to broker shim.
         if is_no_tool_calls_error(exc):
+            if _tool_broker_enabled():
+                log.info("mini-swe-agent failed due to missing tool calls; falling back to tool broker shim.")
+                broker_result = _broker_run(
+                    repo,
+                    instruction=_compose_instruction(),
+                    llm=llm_cfg,
+                    timeout_ms=timeout_ms,
+                    explicit_targets=_extract_explicit_target_paths_from_payload(payload),
+                )
+                if not bool(broker_result.get("ok")):
+                    return {
+                        "ok": False,
+                        "summary": str(broker_result.get("summary") or "tool broker fallback failed"),
+                        "stdout": str(broker_result.get("stdout") or ""),
+                        "stderr": str(broker_result.get("stderr") or ""),
+                        "exitCode": to_int(broker_result.get("exitCode"), 3),
+                    }
+
+                # The broker_result itself doesn't include changed-files list; we add it below in the shared post-run path.
+                # We return broker_result as "exit_info-like" output by mapping it into exit_info and continuing.
+                exit_info = {"submission": broker_result.get("stdout") or ""}
+                # Continue into post-run summary construction (changed files etc.) by not returning early.
+            else:
+                return {
+                    "ok": False,
+                    "summary": "mini-swe-agent could not execute: model did not emit tool calls",
+                    "stderr": (
+                        "Agentic execution requires a tool-calling-capable model/runtime. "
+                        "The model output did not include any tool calls.\n"
+                        f"Error: {to_single_line(exc, 600)}\n"
+                        "Fix options:\n"
+                        "- Use a model/runtime that supports tool calls (function calling), or\n"
+                        "- Enable the tool broker shim: WORKERPALS_MINISWE_TOOL_BROKER=1, or\n"
+                        "- Switch executor backend."
+                    ),
+                    "exitCode": 3,
+                }
+        else:
             return {
                 "ok": False,
-                "summary": "mini-swe-agent could not execute: model did not emit tool calls",
-                "stderr": (
-                    "Agentic execution requires a tool-calling-capable model/runtime. "
-                    "The model output did not include any tool calls.\n"
-                    f"Error: {to_single_line(exc, 600)}\n"
-                    "Fix: use a model/runtime that supports tool calls (function calling), "
-                    "or switch executor backend."
-                ),
-                "exitCode": 3,
+                "summary": "mini-swe-agent task execution failed",
+                "stderr": str(exc),
+                "exitCode": 1,
             }
 
-        return {
-            "ok": False,
-            "summary": "mini-swe-agent task execution failed",
-            "stderr": str(exc),
-            "exitCode": 1,
-        }
-
-    # Extract the agent's conversational output from its message history.
+    # Extract the agent's conversational output from its message history (or broker transcript).
     agent_text = ""
     try:
         agent_text = str(exit_info.get("submission") or "").strip()
-        if not agent_text and hasattr(agent, "messages"):
+        if not agent_text and agent is not None and hasattr(agent, "messages"):
             parts: List[str] = []
             for msg in agent.messages:
                 if msg.get("role") == "assistant":
@@ -291,7 +1070,7 @@ def _run_miniswe_task(
     delta = [p for p in changed_paths if p not in baseline_changes]
     effective = delta if delta else changed_paths
 
-    # Build stdout: include agent text output followed by file change info.
+    # Build stdout: include agent/broker text output followed by file change info.
     stdout_parts: List[str] = []
     if agent_text:
         stdout_parts.append(agent_text)
@@ -317,7 +1096,7 @@ def _run_miniswe_task(
 
     return {
         "ok": True,
-        "summary": "Executed task via mini-swe-agent (no file changes detected)",
+        "summary": "Executed task (no file changes detected)",
         "stdout": "\n\n".join(stdout_parts),
         "stderr": "",
         "exitCode": 0,
