@@ -211,9 +211,8 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
       : {};
   const readAnywhere =
     typeof scopeRecord.read_anywhere === "boolean" ? scopeRecord.read_anywhere : true;
-  // Always default to true — only honour an explicit `false` from a trusted source,
-  // never from the LLM planner (small models often hallucinate write_allowed: false).
-  const writeAllowed = true;
+  const writeAllowed =
+    typeof scopeRecord.write_allowed === "boolean" ? scopeRecord.write_allowed : true;
   const writeGlobs = dedupeStrings(scopeRecord.write_globs, MAX_SCOPE_GLOBS);
   const forbiddenGlobs = dedupeStrings(scopeRecord.forbidden_globs, MAX_SCOPE_GLOBS);
   const maxFilesRaw = Number(scopeRecord.max_files_to_edit);

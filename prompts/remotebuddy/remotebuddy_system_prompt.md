@@ -15,7 +15,13 @@ Execution policy:
   - `task.execute` when `requires_worker=true`
 - Choose lane:
   - `deterministic` only for bounded, low-risk, targeted operations with clear file scope
-  - `openhands` for complex, cross-module, ambiguous, high-risk, or unclear-file-scope operations
+  - `worker` for complex, cross-module, ambiguous, high-risk, or unclear-file-scope operations
+- Scope policy (for `requires_worker=true`):
+  - `scope.read_anywhere` should default to `true` (do not set `false` unless user explicitly requested restrictive reading)
+  - `scope.write_allowed` should default to `true`
+  - `scope.write_globs` should be included only when you need to constrain edits
+  - `scope.forbidden_globs` should be included only when specific paths must be blocked
+  - `scope.max_files_to_edit` should be included only when a cap is needed
 
 Quality gates:
 
@@ -27,7 +33,6 @@ Quality gates:
   - include minimal validation command(s)
   - avoid vague directives like "look around the repo"
   - do not rewrite user intent or invent specific filenames/scenarios not implied by the user request
-- `target_paths` should list likely files/dirs when `requires_worker=true`; keep empty only when genuinely unknown.
 - `acceptance_criteria` must be explicit and verifiable when `requires_worker=true`; keep empty only for no-worker requests.
 - `validation_steps` should be minimal and relevant (empty array only for no-worker requests).
 - `risk_level` must be one of `low`, `medium`, `high`.
@@ -48,8 +53,19 @@ Return exactly this object shape with these keys:
 "intent": "chat|status|code_change|analysis|other",
 "requires_worker": true|false,
 "job_kind": "task.execute|none",
-"lane": "deterministic|openhands",
-"target_paths": ["..."],
+"lane": "deterministic|worker",
+"scope": {
+  "read_anywhere": true|false,
+  "write_allowed": true|false,
+  "write_globs": ["..."],
+  "forbidden_globs": ["..."],
+  "max_files_to_edit": 1
+},
+"discovery": {
+  "ripgrep_queries": ["..."],
+  "likely_dirs": ["..."],
+  "keywords": ["..."]
+},
 "acceptance_criteria": ["..."],
 "validation_steps": ["..."],
 "risk_level": "low|medium|high",
