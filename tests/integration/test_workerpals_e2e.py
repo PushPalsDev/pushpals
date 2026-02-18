@@ -3,7 +3,7 @@
 
 Phase A: warmup.execute (fast, proves WorkerPals can claim + complete jobs)
 Phase B: /requests/enqueue -> RemoteBuddy claims -> /jobs/enqueue -> WorkerPals executes (LLM) ->
-         /jobs/:id/complete -> SourceControlManager processes completion -> final text asserted.
+         /jobs/:id/complete -> completion enqueue observed and asserted.
 
 Run from repo root. Requires bun, git, node on PATH.
 Optional: If LM Studio is running and `lms` CLI is on PATH, captures LM Studio logs.
@@ -21,6 +21,7 @@ import atexit
 import importlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -28,9 +29,12 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,6 +48,14 @@ WARMUP_TIMEOUT_SEC = 60
 REQUEST_TIMEOUT_SEC = 10 * 60
 POLL_INTERVAL_SEC = 0.5
 HTTP_TIMEOUT_SEC = 15
+LIST_SCAN_LIMIT = max(
+    200,
+    int((os.environ.get("WORKERPALS_E2E_LIST_SCAN_LIMIT") or "1000").strip() or "1000"),
+)
+E2E_DEBUG = (
+    os.environ.get("WORKERPALS_E2E_DEBUG", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 REQUEST_PROMPT = os.environ.get(
     "WORKERPALS_E2E_PROMPT",
@@ -54,7 +66,6 @@ CLARIFICATION_RETRY_SUFFIX = (
     "Do not ask any other follow-up questions."
 )
 
-DEFAULT_PROFILE = os.environ.get("PUSHPALS_PROFILE", "dev")
 DEFAULT_SESSION_ID = os.environ.get("PUSHPALS_SESSION_ID", "dev")
 FAIL_IF_SERVER_RUNNING = (
     os.environ.get("WORKERPALS_E2E_FAIL_IF_SERVER_RUNNING", "1").strip().lower()
@@ -64,21 +75,58 @@ KILL_SERVER_IF_RUNNING = (
     os.environ.get("WORKERPALS_E2E_KILL_SERVER_IF_RUNNING", "1").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+_single_worker_env = (os.environ.get("WORKERPALS_E2E_ENFORCE_SINGLE_WORKER") or "").strip().lower()
+ENFORCE_SINGLE_WORKER = (
+    _single_worker_env in {"1", "true", "yes", "on"}
+    if _single_worker_env
+    else KILL_SERVER_IF_RUNNING
+)
+_completion_poll_env = (os.environ.get("WORKERPALS_E2E_COMPLETION_POLL_SEC") or "").strip()
+try:
+    COMPLETION_POLL_INTERVAL_SEC = (
+        max(0.25, float(_completion_poll_env)) if _completion_poll_env else 1.5
+    )
+except Exception:
+    COMPLETION_POLL_INTERVAL_SEC = 1.5
+
+# Safe default for helper calls that may run before module-level env initialization.
+DEFAULT_ENV = os.environ.copy()
 
 # Globals used by cleanup handlers
 server_proc = None
 worker_proc = None
 remotebuddy_proc = None
-scm_proc = None
 started_server = False
 started_worker = False
 started_remotebuddy = False
-started_scm = False
 _CLEANED_UP = False
 
 
 def _now() -> float:
     return time.perf_counter()
+
+
+def _mono_now() -> float:
+    return time.monotonic()
+
+
+_MONO_TO_EPOCH_OFFSET_SEC = time.time() - time.monotonic()
+
+
+def _mono_to_epoch_seconds(mono_seconds: float) -> float:
+    return float(mono_seconds) + _MONO_TO_EPOCH_OFFSET_SEC
+
+
+def _debug(message: str) -> None:
+    if E2E_DEBUG:
+        print(f"[DEBUG] {message}")
+
+
+def _one_line(value: object, max_chars: int = 300) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "..."
 
 
 def _print_duration(label: str, started_at: float) -> None:
@@ -146,6 +194,7 @@ def _require_docker_available() -> None:
     try:
         proc = subprocess.run(
             ["docker", "info"],
+            env=_build_env(),
             capture_output=True,
             text=True,
             check=False,
@@ -158,28 +207,213 @@ def _require_docker_available() -> None:
         raise RuntimeError(f"Docker daemon is unavailable for docker E2E mode: {detail}")
 
 
+def _server_port() -> int:
+    try:
+        parsed = urlparse(SERVER_URL)
+        if parsed.port:
+            return int(parsed.port)
+        if parsed.scheme == "https":
+            return 443
+        return 80
+    except Exception:
+        return 3001
+
+
 def _kill_existing_server_processes() -> None:
+    port = _server_port()
+    if sys.platform == "win32":
+        port_kill_cmd = (
+            f"$port = {port}; "
+            "$pids = @(); "
+            "try { "
+            "  $pids += (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop | "
+            "    Select-Object -ExpandProperty OwningProcess) "
+            "} catch {} "
+            "$pids = $pids | Where-Object { $_ -and $_ -gt 0 } | Sort-Object -Unique; "
+            "foreach ($pid in $pids) { "
+            "  Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue "
+            "} "
+            '$pids -join "," '
+        )
+        port_kill = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", port_kill_cmd],
+            env=_build_env(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        _debug(
+            "server preflight port kill "
+            f"rc={port_kill.returncode} pids={_one_line(port_kill.stdout, 200)} "
+            f"err={_one_line(port_kill.stderr, 200)}"
+        )
+        fallback_cmd = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { "
+            "  ($_.Name -ieq 'bun.exe' -or $_.Name -ieq 'node.exe') -and "
+            "  ($_.CommandLine -match 'apps[\\\\/]server' -or "
+            "   $_.CommandLine -match 'server:only' -or "
+            "   $_.CommandLine -match 'server_main\\.ts') "
+            "} | "
+            "ForEach-Object { $_.ProcessId; Stop-Process -Id $_.ProcessId -Force }"
+        )
+        fallback_kill = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", fallback_cmd],
+            env=_build_env(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        _debug(
+            "server fallback kill "
+            f"rc={fallback_kill.returncode} pids={_one_line(fallback_kill.stdout, 200)} "
+            f"err={_one_line(fallback_kill.stderr, 200)}"
+        )
+    else:
+        pk = subprocess.run(
+            # Broad process-name fallback is intentionally last-resort for leaked local daemons.
+            ["pkill", "-f", "apps/server|server:only|server_main.ts"],
+            env=_build_env(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        _debug(
+            f"server pkill rc={pk.returncode} out={_one_line(pk.stdout, 200)} "
+            f"err={_one_line(pk.stderr, 200)}"
+        )
+
+
+def _list_server_listener_pids() -> list[str]:
+    port = _server_port()
+    if sys.platform == "win32":
+        cmd = (
+            f"$port = {port}; "
+            "$pids = @(); "
+            "try { "
+            "  $pids = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop | "
+            "    Select-Object -ExpandProperty OwningProcess "
+            "} catch {} "
+            "$pids = $pids | Where-Object { $_ -and $_ -gt 0 } | Sort-Object -Unique; "
+            "$pids -join ','"
+        )
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            env=_build_env(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        raw = (out.stdout or "").strip()
+        if not raw:
+            return []
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
+    # Non-Windows fallback order: lsof -> ss -> netstat. Minimal environments may miss one or more.
+    try:
+        out = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            env=_build_env(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        lines = [line.strip() for line in (out.stdout or "").splitlines() if line.strip()]
+        if lines:
+            return lines
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.run(
+            ["ss", "-lptn"],
+            env=_build_env(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        pids = set()
+        for line in (out.stdout or "").splitlines():
+            if "LISTEN" not in line.upper():
+                continue
+            if not re.search(rf":{port}\b", line):
+                continue
+            for pid in re.findall(r"pid=(\d+)", line):
+                if pid:
+                    pids.add(pid.strip())
+        if pids:
+            return sorted(pids)
+    except Exception:
+        pass
+
+    for netstat_cmd in (["netstat", "-lntp"], ["netstat", "-anp", "tcp"]):
+        try:
+            out = subprocess.run(
+                netstat_cmd,
+                env=_build_env(),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            pids = set()
+            for line in (out.stdout or "").splitlines():
+                upper = line.upper()
+                if "LISTEN" not in upper and "LISTENING" not in upper:
+                    continue
+                if not re.search(rf":{port}\b", line):
+                    continue
+                for pid in re.findall(r"\b(\d+)/", line):
+                    if pid:
+                        pids.add(pid.strip())
+            if pids:
+                return sorted(pids)
+        except Exception:
+            pass
+
+    _debug("listener PID probe unavailable or returned no results (lsof/ss/netstat).")
+    return []
+
+
+def _kill_existing_sidecar_processes() -> None:
+    """Best-effort cleanup of leftover daemon processes from prior E2E runs."""
     if sys.platform == "win32":
         cmd = (
             "Get-CimInstance Win32_Process | "
             "Where-Object { "
             "  ($_.Name -ieq 'bun.exe' -or $_.Name -ieq 'node.exe') -and "
-            "  ($_.CommandLine -match 'apps[\\\\/]server' -or $_.CommandLine -match 'server:only') "
+            "  ($_.CommandLine -match 'apps[\\\\/]remotebuddy' -or "
+            "   $_.CommandLine -match 'apps[\\\\/]workerpals' -or "
+            "   $_.CommandLine -match 'apps[\\\\/]source_control_manager' -or "
+            "   $_.CommandLine -match 'remotebuddy:only' -or "
+            "   $_.CommandLine -match 'workerpals:only' -or "
+            "   $_.CommandLine -match 'source_control_manager:only') "
             "} | "
-            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+            "ForEach-Object { $_.ProcessId; Stop-Process -Id $_.ProcessId -Force }"
         )
-        subprocess.run(
+        killed = subprocess.run(
             ["powershell", "-NoProfile", "-Command", cmd],
+            env=_build_env(),
             check=False,
             capture_output=True,
             text=True,
+        )
+        _debug(
+            "sidecar kill "
+            f"rc={killed.returncode} pids={_one_line(killed.stdout, 200)} "
+            f"err={_one_line(killed.stderr, 200)}"
         )
     else:
-        subprocess.run(
-            ["pkill", "-f", "apps/server|server:only"],
+        pk = subprocess.run(
+            # Broad process-name fallback is intentionally last-resort for leaked local daemons.
+            ["pkill", "-f", "apps/remotebuddy|apps/workerpals|apps/source_control_manager|remotebuddy:only|workerpals:only|source_control_manager:only"],
+            env=_build_env(),
             check=False,
             capture_output=True,
             text=True,
+        )
+        _debug(
+            f"sidecar pkill rc={pk.returncode} out={_one_line(pk.stdout, 200)} "
+            f"err={_one_line(pk.stderr, 200)}"
         )
 
 
@@ -190,6 +424,7 @@ def _create_isolated_worker_repo(source_repo: Path) -> tuple[Path, Path]:
     proc = subprocess.run(
         ["git", "clone", "--local", "--quiet", "--no-hardlinks", str(source_repo), str(clone_path)],
         cwd=str(source_repo),
+        env=_build_env(),
         capture_output=True,
         text=True,
         check=False,
@@ -214,6 +449,7 @@ def _docker_image_exists(image: str) -> bool:
     try:
         proc = subprocess.run(
             ["docker", "image", "inspect", image],
+            env=_build_env(),
             capture_output=True,
             text=True,
             check=False,
@@ -240,6 +476,7 @@ def _ensure_docker_image(image: str) -> None:
             ".",
         ],
         cwd=str(REPO_ROOT),
+        env=_build_env(),
         check=False,
     )
     if proc.returncode != 0:
@@ -348,7 +585,7 @@ def start_lms_log_stream(source: str, extra_args: list[str] | None = None):
             proc = subprocess.Popen(
                 args,
                 cwd=str(REPO_ROOT),
-                env=DEFAULT_ENV,
+                env=_build_env(),
                 stdout=None,  # inherit
                 stderr=None,  # inherit
                 shell=False,
@@ -359,7 +596,7 @@ def start_lms_log_stream(source: str, extra_args: list[str] | None = None):
             proc = subprocess.Popen(
                 args,
                 cwd=str(REPO_ROOT),
-                env=DEFAULT_ENV,
+                env=_build_env(),
                 stdout=None,  # inherit
                 stderr=None,  # inherit
                 shell=False,
@@ -426,8 +663,8 @@ def http_get(path: str):
 
 
 def wait_for_server(timeout=2.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = _mono_now() + timeout
+    while _mono_now() < deadline:
         try:
             r = http_get("/healthz")
             if r.get("ok"):
@@ -439,8 +676,8 @@ def wait_for_server(timeout=2.0) -> bool:
 
 
 def wait_for_server_down(timeout=5.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = _mono_now() + timeout
+    while _mono_now() < deadline:
         try:
             http_get("/healthz")
         except Exception:
@@ -449,10 +686,25 @@ def wait_for_server_down(timeout=5.0) -> bool:
     return False
 
 
-def get_job(job_id: str) -> dict | None:
-    # Server doesn't appear to expose GET /jobs/:id; fall back to listing.
+def _http_get_optional(path: str) -> dict | None:
     try:
-        jobs = http_get("/jobs?status=all&limit=200")
+        payload = http_get(path)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def get_job(job_id: str) -> dict | None:
+    # Prefer direct endpoint if available, fall back to listing.
+    direct = _http_get_optional(f"/jobs/{job_id}")
+    if isinstance(direct, dict):
+        item = direct.get("job")
+        if isinstance(item, dict):
+            return item
+        if direct.get("id") == job_id:
+            return direct
+    try:
+        jobs = http_get(f"/jobs?status=all&limit={LIST_SCAN_LIMIT}")
         for j in jobs.get("jobs", []):
             if j.get("id") == job_id:
                 return j
@@ -462,9 +714,16 @@ def get_job(job_id: str) -> dict | None:
 
 
 def get_request(request_id: str) -> dict | None:
-    # Server doesn't appear to expose GET /requests/:id; fall back to listing.
+    # Prefer direct endpoint if available, fall back to listing.
+    direct = _http_get_optional(f"/requests/{request_id}")
+    if isinstance(direct, dict):
+        item = direct.get("request")
+        if isinstance(item, dict):
+            return item
+        if direct.get("id") == request_id:
+            return direct
     try:
-        reqs = http_get("/requests?status=all&limit=200")
+        reqs = http_get(f"/requests?status=all&limit={LIST_SCAN_LIMIT}")
         for r in reqs.get("requests", []):
             if r.get("id") == request_id:
                 return r
@@ -474,15 +733,100 @@ def get_request(request_id: str) -> dict | None:
 
 
 def get_completion(completion_id: str) -> dict | None:
-    # Server doesn't appear to expose GET /completions/:id; fall back to listing.
+    # Prefer direct endpoint if available, fall back to listing.
+    direct = _http_get_optional(f"/completions/{completion_id}")
+    if isinstance(direct, dict):
+        item = direct.get("completion")
+        if isinstance(item, dict):
+            return item
+        if direct.get("id") == completion_id:
+            return direct
     try:
-        cs = http_get("/completions?status=all&limit=200")
+        cs = http_get(f"/completions?status=all&limit={LIST_SCAN_LIMIT}")
         for c in cs.get("completions", []):
             if c.get("id") == completion_id:
                 return c
     except Exception:
         pass
     return None
+
+
+def _normalize_epoch_seconds(value: float) -> float:
+    abs_value = abs(value)
+    if abs_value >= 1e18:
+        return value / 1_000_000_000.0
+    if abs_value >= 1e15:
+        return value / 1_000_000.0
+    if abs_value >= 1e12:
+        return value / 1_000.0
+    return value
+
+
+def _parse_timestamp_to_epoch_seconds(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return _normalize_epoch_seconds(float(value))
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return _normalize_epoch_seconds(float(text))
+    except Exception:
+        pass
+
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _extract_completion_epoch_seconds(completion: dict) -> float | None:
+    for key in ("createdAt", "created_at", "timestamp"):
+        parsed = _parse_timestamp_to_epoch_seconds(completion.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _completion_matches_request(
+    completion: dict,
+    request_id: str,
+    enqueue_monotonic: float | None = None,
+) -> bool:
+    """
+    If completion payload carries request id fields, enforce a match.
+    If request id fields are absent, use completion timestamp correlation when present;
+    otherwise keep backward-compatible fallback behavior.
+    """
+    rid = str(request_id or "").strip()
+    if not rid:
+        return True
+    seen_request_id_field = False
+    for key in ("requestId", "request_id"):
+        value = str(completion.get(key) or "").strip()
+        if not value:
+            continue
+        seen_request_id_field = True
+        if value == rid:
+            return True
+    if seen_request_id_field:
+        return False
+
+    completion_epoch = _extract_completion_epoch_seconds(completion)
+    if completion_epoch is None or enqueue_monotonic is None:
+        return True
+
+    enqueue_epoch = _mono_to_epoch_seconds(enqueue_monotonic)
+    # Allow slight skew for second-precision timestamps and clock drift.
+    return completion_epoch >= (enqueue_epoch - 2.0)
 
 
 def list_workers(ttl_ms: int = 30000) -> list[dict]:
@@ -497,8 +841,8 @@ def list_workers(ttl_ms: int = 30000) -> list[dict]:
 
 
 def wait_for_worker_online(worker_id: str, timeout_sec: float = 25.0) -> dict | None:
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
+    deadline = _mono_now() + timeout_sec
+    while _mono_now() < deadline:
         for worker in list_workers(ttl_ms=_WORKER_ONLINE_TTL_MS):
             if str(worker.get("workerId") or "") != worker_id:
                 continue
@@ -516,8 +860,8 @@ _WORKER_ONLINE_TTL_MS = 8_000
 
 def wait_for_worker_offline(worker_id: str, timeout_sec: float = 20.0) -> bool:
     """Poll until a specific worker is no longer listed as online."""
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
+    deadline = _mono_now() + timeout_sec
+    while _mono_now() < deadline:
         online_ids = [
             str(w.get("workerId") or "")
             for w in list_workers(ttl_ms=_WORKER_ONLINE_TTL_MS)
@@ -544,19 +888,7 @@ def assert_only_worker_online(worker_id: str) -> None:
         )
 
 
-def find_completion_for_request(request_id: str, task_id: str) -> dict | None:
-    try:
-        cs = http_get("/completions?status=all&limit=200")
-        for c in cs.get("completions", []):
-            if c.get("requestId") == request_id or c.get("request_id") == request_id:
-                return c
-            if c.get("taskId") == task_id or c.get("task_id") == task_id:
-                return c
-    except Exception:
-        pass
-    return None
-
-
+# Kept for future content verification paths (not currently asserted in this script).
 def extract_text_from_any(obj) -> str:
     if obj is None:
         return ""
@@ -669,27 +1001,35 @@ def _request_failed_due_to_clarification(req: dict | None) -> bool:
 # -----------------------------
 # Process helpers (kill tree on Windows)
 # -----------------------------
+def _build_env(overrides: dict | None = None) -> dict[str, str]:
+    env = DEFAULT_ENV.copy()
+    if overrides:
+        for key, value in overrides.items():
+            env[str(key)] = str(value)
+    return env
+
+
 def start_process(cmd, cwd=REPO_ROOT, env=None):
     """Start a process inheriting stdout/stderr (prints directly to console)."""
-    run_env = DEFAULT_ENV.copy()
-    if env:
-        run_env.update(env)
+    run_env = _build_env(env)
+    if isinstance(cmd, str):
+        raise TypeError("start_process expects argv list/tuple, not a shell command string")
+    popen_cmd = [str(part) for part in cmd]
 
     if sys.platform == "win32":
-        cmd_str = cmd if isinstance(cmd, str) else " ".join(map(str, cmd))
         proc = subprocess.Popen(
-            cmd_str,
+            popen_cmd,
             cwd=str(cwd),
             env=run_env,
             stdout=None,  # inherit
             stderr=None,  # inherit
-            shell=True,
+            shell=False,
             text=True,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,  # type: ignore[attr-defined]
         )
     else:
         proc = subprocess.Popen(
-            cmd,
+            popen_cmd,
             cwd=str(cwd),
             env=run_env,
             stdout=None,  # inherit
@@ -749,18 +1089,14 @@ def assert_proc_alive(proc, name: str):
 # -----------------------------
 def cleanup():
     global _CLEANED_UP
-    global server_proc, worker_proc, remotebuddy_proc, scm_proc
-    global started_server, started_worker, started_remotebuddy, started_scm
+    global server_proc, worker_proc, remotebuddy_proc
+    global started_server, started_worker, started_remotebuddy
 
     if _CLEANED_UP:
         return
     _CLEANED_UP = True
 
     # Stop in reverse-dependency order.
-    if scm_proc and started_scm:
-        kill_proc_tree(scm_proc)
-        scm_proc = None
-
     if worker_proc and started_worker:
         kill_proc_tree(worker_proc)
         worker_proc = None
@@ -782,8 +1118,16 @@ def _handle_signal(signum, frame):
 
 def install_cleanup_handlers():
     atexit.register(cleanup)
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    try:
+        signal.signal(signal.SIGINT, _handle_signal)
+    except Exception as exc:
+        _debug(f"SIGINT handler registration failed: {_one_line(exc, 200)}")
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        try:
+            signal.signal(sigterm, _handle_signal)
+        except Exception as exc:
+            _debug(f"SIGTERM handler registration failed: {_one_line(exc, 200)}")
 
 
 # -----------------------------
@@ -809,14 +1153,14 @@ DEFAULT_ENV = os.environ.copy()
 
 
 def main():
-    global server_proc, worker_proc, remotebuddy_proc, scm_proc
-    global started_server, started_worker, started_remotebuddy, started_scm
+    global server_proc, worker_proc, remotebuddy_proc
+    global started_server, started_worker, started_remotebuddy
 
     install_cleanup_handlers()
     total_started_at = _now()
 
-    run_session_id = f"{DEFAULT_SESSION_ID}-e2e-{int(time.time())}-{os.getpid()}"
-    print("PushPals E2E test: starting server + remotebuddy + workerpals (no SCM)")
+    run_session_id = f"{DEFAULT_SESSION_ID}-e2e-{uuid4().hex[:12]}"
+    print("PushPals E2E test: starting server + remotebuddy + workerpals")
     print(f"[NOTICE] E2E session: {run_session_id}")
     if E2E_USE_DOCKER:
         print("[NOTICE] WorkerPals E2E running in Docker executor mode.")
@@ -840,11 +1184,13 @@ def main():
     else:
         print("[NOTICE] Worker repo isolation disabled; using current workspace repo directly.")
 
+    print("[NOTICE] Preflight cleanup: stopping any leftover RemoteBuddy/WorkerPals daemons...")
+    _kill_existing_sidecar_processes()
+
     server_already_running = wait_for_server(2.0)
     started_server = False
     started_worker = False
     started_remotebuddy = False
-    started_scm = False
 
     if server_already_running and KILL_SERVER_IF_RUNNING:
         print(f"[NOTICE] Server already running at {SERVER_URL}; requesting graceful shutdown...")
@@ -852,11 +1198,14 @@ def main():
         if not stopped:
             print("[NOTICE] Graceful shutdown unavailable or timed out; killing existing server processes...")
             _kill_existing_server_processes()
+            _kill_existing_sidecar_processes()
             stopped = wait_for_server_down(8.0)
         if not stopped:
+            remaining_pids = _list_server_listener_pids()
             raise RuntimeError(
                 "Tried graceful shutdown and process kill, but server still responds.\n"
                 f"server={SERVER_URL}\n"
+                f"listening_pids={remaining_pids}\n"
                 "Stop the existing stack manually, then rerun the integration test."
             )
         server_already_running = False
@@ -881,24 +1230,24 @@ def main():
             server_proc = start_process(["bun", "run", "server:only"])
             started_server = True
 
-        # Start RemoteBuddy (SCM intentionally omitted for this test).
-        remotebuddy_proc = start_process(
-            ["bun", "run", "remotebuddy:only", "--", "--sessionId", run_session_id],
-        )
-        started_remotebuddy = True
-
         print("Waiting for server health...")
         server_health_started_at = _now()
-        deadline = time.time() + SERVER_HEALTH_TIMEOUT_SEC
-        while time.time() < deadline:
+        deadline = _mono_now() + SERVER_HEALTH_TIMEOUT_SEC
+        while _mono_now() < deadline:
             if server_proc:
                 assert_proc_alive(server_proc, "server")
-            assert_proc_alive(remotebuddy_proc, "remotebuddy")
             if wait_for_server(1.0):
                 break
         else:
             raise RuntimeError(f"server start timeout (url={SERVER_URL})")
         _print_duration("server health wait", server_health_started_at)
+
+        # Start RemoteBuddy only after server health is confirmed.
+        remotebuddy_proc = start_process(
+            ["bun", "run", "remotebuddy:only", "--", "--sessionId", run_session_id],
+        )
+        started_remotebuddy = True
+        assert_proc_alive(remotebuddy_proc, "remotebuddy")
 
         if E2E_USE_DOCKER:
             backends_to_try = ["openhands", "miniswe"]
@@ -919,7 +1268,7 @@ def main():
             print(f"RUNNING BACKEND: {backend}")
             print("==============================\n")
 
-            worker_id = f"e2e-{backend}-{int(time.time() * 1000) % 100000000:08d}"
+            worker_id = f"e2e-{backend}-{uuid4().hex[:10]}"
             worker_env = {"WORKERPALS_EXECUTOR": backend, "WORKERPALS_DEBUG": "1"}
             worker_cmd = [
                 "bun",
@@ -954,7 +1303,21 @@ def main():
                 worker_online = wait_for_worker_online(worker_id, timeout_sec=25.0)
                 if not worker_online:
                     raise RuntimeError(f"Worker {worker_id} did not report online in time")
-                assert_only_worker_online(worker_id)
+                if ENFORCE_SINGLE_WORKER:
+                    assert_only_worker_online(worker_id)
+                else:
+                    online = [
+                        str(w.get("workerId") or "")
+                        for w in list_workers(ttl_ms=_WORKER_ONLINE_TTL_MS)
+                        if bool(w.get("isOnline")) and str(w.get("workerId") or "").strip()
+                    ]
+                    others = [wid for wid in online if wid != worker_id]
+                    if others:
+                        print(
+                            "[NOTICE] Multiple workers online; continuing because "
+                            "WORKERPALS_E2E_ENFORCE_SINGLE_WORKER is disabled."
+                        )
+                        _debug(f"online_workers={online}")
 
                 warmup_started_at = _now()
                 print(f"Server healthy — enqueueing warmup job ({backend})")
@@ -971,12 +1334,12 @@ def main():
                 warmup_job_id = enq["jobId"]
                 print(f"Enqueued job {warmup_job_id}")
 
-                deadline = time.time() + WARMUP_TIMEOUT_SEC
+                deadline = _mono_now() + WARMUP_TIMEOUT_SEC
                 last = None
                 warmup_ticker = _ElapsedTicker(f"{backend} warmup waiting", warmup_started_at)
                 warmup_ticker.start()
                 try:
-                    while time.time() < deadline:
+                    while _mono_now() < deadline:
                         if server_proc:
                             assert_proc_alive(server_proc, "server")
                         assert_proc_alive(remotebuddy_proc, "remotebuddy")
@@ -1005,7 +1368,9 @@ def main():
                 print("==============================\n")
                 phase_b_started_at = _now()
 
-                completions_before = http_get("/completions?status=all&limit=500").get("completions", [])
+                completions_before = http_get(
+                    f"/completions?status=all&limit={LIST_SCAN_LIMIT}"
+                ).get("completions", [])
                 existing_completion_ids = {
                     str(c.get("id")) for c in completions_before if isinstance(c, dict) and c.get("id")
                 }
@@ -1018,6 +1383,7 @@ def main():
                     "forceLane": "worker",
                 }
                 print(f"Enqueueing request: {REQUEST_PROMPT!r}")
+                request_enqueue_monotonic = _mono_now()
                 enq_req = http_post("/requests/enqueue", request_body)
                 request_id = enq_req.get("requestId")
                 if not enq_req.get("ok") or not request_id:
@@ -1025,14 +1391,15 @@ def main():
                 print(f"Enqueued request {request_id}")
                 clarification_retried = False
 
-                deadline = time.time() + REQUEST_TIMEOUT_SEC
+                deadline = _mono_now() + REQUEST_TIMEOUT_SEC
                 last_request_status = None
                 intercepted_completion: dict | None = None
+                next_completion_poll_at = 0.0
                 phase_b_ticker = _ElapsedTicker(f"{backend} phase B waiting", phase_b_started_at)
                 phase_b_ticker.start()
 
                 try:
-                    while time.time() < deadline:
+                    while _mono_now() < deadline:
                         if server_proc:
                             assert_proc_alive(server_proc, "server")
                         assert_proc_alive(remotebuddy_proc, "remotebuddy")
@@ -1059,6 +1426,7 @@ def main():
                                         "[NOTICE] Clarification requested by worker. "
                                         "Sending one clarification retry with explicit instruction."
                                     )
+                                    request_enqueue_monotonic = _mono_now()
                                     retry_enq = http_post("/requests/enqueue", retry_body)
                                     retry_request_id = retry_enq.get("requestId")
                                     if not retry_enq.get("ok") or not retry_request_id:
@@ -1067,21 +1435,41 @@ def main():
                                         )
                                     request_id = retry_request_id
                                     last_request_status = None
+                                    completions_after_retry = http_get(
+                                        f"/completions?status=all&limit={LIST_SCAN_LIMIT}"
+                                    ).get("completions", [])
+                                    existing_completion_ids = {
+                                        str(c.get("id"))
+                                        for c in completions_after_retry
+                                        if isinstance(c, dict) and c.get("id")
+                                    }
+                                    next_completion_poll_at = 0.0
                                     print(f"Enqueued clarification retry request {request_id}")
                                     continue
                                 raise RuntimeError(f"Request failed ({backend}): {req.get('error') or req}")
 
-                        completions = http_get("/completions?status=all&limit=500").get("completions", [])
-                        for c in completions:
-                            if not isinstance(c, dict):
-                                continue
-                            completion_id = str(c.get("id") or "")
-                            if not completion_id or completion_id in existing_completion_ids:
-                                continue
-                            if str(c.get("sessionId") or "") != run_session_id:
-                                continue
-                            intercepted_completion = c
-                            break
+                        now = _mono_now()
+                        if now >= next_completion_poll_at:
+                            completions = http_get(
+                                f"/completions?status=all&limit={LIST_SCAN_LIMIT}"
+                            ).get("completions", [])
+                            for c in completions:
+                                if not isinstance(c, dict):
+                                    continue
+                                completion_id = str(c.get("id") or "")
+                                if not completion_id or completion_id in existing_completion_ids:
+                                    continue
+                                if str(c.get("sessionId") or "") != run_session_id:
+                                    continue
+                                if not _completion_matches_request(
+                                    c,
+                                    str(request_id),
+                                    enqueue_monotonic=request_enqueue_monotonic,
+                                ):
+                                    continue
+                                intercepted_completion = c
+                                break
+                            next_completion_poll_at = now + COMPLETION_POLL_INTERVAL_SEC
 
                         if intercepted_completion:
                             break
@@ -1090,15 +1478,15 @@ def main():
 
                     if not intercepted_completion:
                         raise RuntimeError(
-                            "Did not observe a new completion enqueue (SCM-bound payload).\n"
+                            "Did not observe a new completion enqueue payload.\n"
                             f"backend={backend} request_id={request_id} last_request_status={last_request_status}\n"
                         )
                 finally:
                     phase_b_ticker.stop()
 
-                print("\n===== INTERCEPTED COMPLETION (to SCM queue) =====")
+                print("\n===== INTERCEPTED COMPLETION PAYLOAD =====")
                 print(json.dumps(intercepted_completion, indent=2, ensure_ascii=False))
-                print(f"[OK] Backend {backend} produced a completion enqueue for SCM.")
+                print(f"[OK] Backend {backend} produced a completion enqueue payload.")
                 _print_duration(f"{backend} phase B completion intercept", phase_b_started_at)
 
             except Exception as backend_exc:
@@ -1120,7 +1508,7 @@ def main():
         if failures:
             raise RuntimeError("One or more backend runs failed:\n- " + "\n- ".join(failures))
 
-        print("Done — PushPals E2E intercepted SCM-bound completion payload(s)")
+        print("Done — PushPals E2E intercepted completion enqueue payload(s)")
         _print_duration("overall test runtime", total_started_at)
     finally:
         cleanup()
