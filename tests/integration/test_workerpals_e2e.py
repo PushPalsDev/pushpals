@@ -18,6 +18,7 @@ NOTE: This version prints EVERYTHING to stdout/stderr (no per-process log files)
 from __future__ import annotations
 
 import atexit
+import ctypes
 import importlib
 import json
 import os
@@ -130,6 +131,10 @@ started_server = False
 started_worker = False
 started_remotebuddy = False
 _CLEANED_UP = False
+_INTERRUPTED = False
+
+_WIN_JOB_OBJECT_HANDLE: int | None = None
+_WIN_JOB_OBJECT_INIT_ATTEMPTED = False
 
 
 def _now() -> float:
@@ -1132,6 +1137,127 @@ def _resolve_windows_argv(argv: list[str], env: dict[str, str]) -> list[str]:
     return resolved
 
 
+def _ensure_windows_kill_on_close_job_object() -> int | None:
+    """Create a Windows Job Object that auto-kills assigned child processes on exit."""
+    global _WIN_JOB_OBJECT_HANDLE, _WIN_JOB_OBJECT_INIT_ATTEMPTED
+    if sys.platform != "win32":
+        return None
+    if _WIN_JOB_OBJECT_INIT_ATTEMPTED:
+        return _WIN_JOB_OBJECT_HANDLE
+    _WIN_JOB_OBJECT_INIT_ATTEMPTED = True
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32),
+            ]
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.SetInformationJobObject.restype = ctypes.c_int
+
+        job_object = kernel32.CreateJobObjectW(None, None)
+        if not job_object:
+            raise OSError(f"CreateJobObjectW failed (winerr={ctypes.get_last_error()})")
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        JobObjectExtendedLimitInformation = 9
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(
+            job_object,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            winerr = ctypes.get_last_error()
+            kernel32.CloseHandle(job_object)
+            raise OSError(f"SetInformationJobObject failed (winerr={winerr})")
+
+        _WIN_JOB_OBJECT_HANDLE = int(job_object)
+        _debug("Windows kill-on-close Job Object is active.")
+    except Exception as exc:
+        _WIN_JOB_OBJECT_HANDLE = None
+        _debug(f"Windows Job Object unavailable: {_one_line(exc, 200)}")
+
+    return _WIN_JOB_OBJECT_HANDLE
+
+
+def _assign_process_to_windows_job_object(proc: subprocess.Popen) -> None:
+    if sys.platform != "win32":
+        return
+    job_object = _ensure_windows_kill_on_close_job_object()
+    if not job_object:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        ok = kernel32.AssignProcessToJobObject(
+            ctypes.c_void_p(job_object),
+            ctypes.c_void_p(int(proc._handle)),  # type: ignore[attr-defined]
+        )
+        if not ok:
+            winerr = ctypes.get_last_error()
+            # ERROR_ACCESS_DENIED can occur when nested jobs are disallowed.
+            if winerr != 5:
+                _debug(f"AssignProcessToJobObject failed for pid={proc.pid} (winerr={winerr})")
+    except Exception as exc:
+        _debug(f"AssignProcessToJobObject exception for pid={proc.pid}: {_one_line(exc, 200)}")
+
+
+def _close_windows_kill_on_close_job_object() -> None:
+    global _WIN_JOB_OBJECT_HANDLE
+    if sys.platform != "win32" or _WIN_JOB_OBJECT_HANDLE is None:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.CloseHandle(ctypes.c_void_p(_WIN_JOB_OBJECT_HANDLE))
+    except Exception as exc:
+        _debug(f"CloseHandle(JobObject) failed: {_one_line(exc, 200)}")
+    finally:
+        _WIN_JOB_OBJECT_HANDLE = None
+
+
 def start_process(cmd, cwd=REPO_ROOT, env=None):
     """Start a process inheriting stdout/stderr (prints directly to console)."""
     run_env = _build_env(env)
@@ -1140,6 +1266,7 @@ def start_process(cmd, cwd=REPO_ROOT, env=None):
     popen_cmd = [str(part) for part in cmd]
 
     if sys.platform == "win32":
+        _ensure_windows_kill_on_close_job_object()
         popen_cmd = _resolve_windows_argv(popen_cmd, run_env)
         proc = subprocess.Popen(
             popen_cmd,
@@ -1151,6 +1278,7 @@ def start_process(cmd, cwd=REPO_ROOT, env=None):
             text=True,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,  # type: ignore[attr-defined]
         )
+        _assign_process_to_windows_job_object(proc)
     else:
         proc = subprocess.Popen(
             popen_cmd,
@@ -1213,6 +1341,7 @@ def assert_proc_alive(proc, name: str):
 # -----------------------------
 def cleanup():
     global _CLEANED_UP
+    global _INTERRUPTED
     global server_proc, worker_proc, remotebuddy_proc
     global started_server, started_worker, started_remotebuddy
 
@@ -1221,21 +1350,41 @@ def cleanup():
     _CLEANED_UP = True
 
     # Stop in reverse-dependency order.
-    if worker_proc and started_worker:
+    if worker_proc:
         kill_proc_tree(worker_proc)
         worker_proc = None
 
-    if remotebuddy_proc and started_remotebuddy:
+    if remotebuddy_proc:
         kill_proc_tree(remotebuddy_proc)
         remotebuddy_proc = None
 
-    if server_proc and started_server:
+    if server_proc:
         kill_proc_tree(server_proc)
         server_proc = None
         wait_for_server_down(5.0)
 
+    started_worker = False
+    started_remotebuddy = False
+    started_server = False
+
+    # If interrupted, run an aggressive sweep in case we were stopped mid-start.
+    if _INTERRUPTED:
+        try:
+            _kill_existing_sidecar_processes()
+        except Exception as exc:
+            _debug(f"sidecar interrupt cleanup failed: {_one_line(exc, 200)}")
+        try:
+            _kill_existing_server_processes()
+        except Exception as exc:
+            _debug(f"server interrupt cleanup failed: {_one_line(exc, 200)}")
+        wait_for_server_down(5.0)
+
+    _close_windows_kill_on_close_job_object()
+
 
 def _handle_signal(signum, frame):
+    global _INTERRUPTED
+    _INTERRUPTED = True
     cleanup()
     raise SystemExit(130)
 
@@ -1252,6 +1401,12 @@ def install_cleanup_handlers():
             signal.signal(sigterm, _handle_signal)
         except Exception as exc:
             _debug(f"SIGTERM handler registration failed: {_one_line(exc, 200)}")
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        try:
+            signal.signal(sigbreak, _handle_signal)
+        except Exception as exc:
+            _debug(f"SIGBREAK handler registration failed: {_one_line(exc, 200)}")
 
 
 # -----------------------------
@@ -1688,6 +1843,10 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        _INTERRUPTED = True
+        cleanup()
+        raise SystemExit(130)
     except Exception as e:
         print("Error:", e)
         sys.exit(1)
