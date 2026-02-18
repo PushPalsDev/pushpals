@@ -31,9 +31,9 @@ if str(_SHARED_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_DIR))
 
 from executor_base import (
+    Logger,
     config_get,
     emit,
-    executor_log,
     is_no_tool_calls_error,
     log_agent_messages,
     log_git_status,
@@ -53,6 +53,7 @@ from executor_base import (
 
 DEFAULT_MINISWE_MODEL = "local-model"
 LOG_PREFIX = "[MiniSweExecutor]"
+log = Logger(LOG_PREFIX)
 
 
 # ─── Mini-swe-specific config ───────────────────────────────────────────────
@@ -116,7 +117,7 @@ def _run_miniswe_task(
         }
 
     model_name, api_key, base_url = resolve_llm_config(
-        default_model=DEFAULT_MINISWE_MODEL, log_prefix=LOG_PREFIX,
+        default_model=DEFAULT_MINISWE_MODEL, logger=log,
     )
     if not model_name:
         return {
@@ -165,10 +166,10 @@ def _run_miniswe_task(
         )
         return full
 
-    executor_log(f"{LOG_PREFIX} Starting mini-swe-agent execution in {repo}")
-    executor_log(f"{LOG_PREFIX} Model: {model_name}, base_url: {base_url or '(default)'}")
-    executor_log(f"{LOG_PREFIX} Timeout: {timeout_ms}ms ({timeout_minutes}min)")
-    executor_log(f"{LOG_PREFIX} Instruction: {to_single_line(instruction, 300)}")
+    log.info(f"Starting mini-swe-agent execution in {repo}")
+    log.info(f"Model: {model_name}, base_url: {base_url or '(default)'}")
+    log.info(f"Timeout: {timeout_ms}ms ({timeout_minutes}min)")
+    log.debug(f"Instruction: {to_single_line(instruction, 300)}")
 
     # Pre-run baseline so we can tell whether *anything* changed even if the model/tooling is flaky.
     baseline_changes = set(summarize_git_changes(repo))
@@ -204,7 +205,7 @@ def _run_miniswe_task(
         )
 
         agent = DefaultAgent(model, env, **agent_kwargs)
-        executor_log(f"{LOG_PREFIX} Agent initialized, running task...")
+        log.info("Agent initialized, running task...")
 
         toolcall_retry_max = _toolcall_retry_max()
         attempt = 0
@@ -214,8 +215,8 @@ def _run_miniswe_task(
             try:
                 attempt += 1
                 if attempt > 1:
-                    executor_log(
-                        f"{LOG_PREFIX} Retrying agent run after tool-call failure (attempt {attempt}/{toolcall_retry_max + 1})."
+                    log.info(
+                        f"Retrying agent run after tool-call failure (attempt {attempt}/{toolcall_retry_max + 1})."
                     )
 
                 extra_guidance: List[str] = []
@@ -227,21 +228,21 @@ def _run_miniswe_task(
                     )
 
                 exit_info = agent.run(_compose_instruction(extra_guidance=extra_guidance))
-                executor_log(f"{LOG_PREFIX} Agent execution completed.")
+                log.info("Agent execution completed.")
 
                 # Log what the agent did
                 if hasattr(agent, "messages") and agent.messages:
-                    executor_log(f"{LOG_PREFIX} Agent message history ({len(agent.messages)} messages):")
-                    log_agent_messages(agent.messages, LOG_PREFIX)
-                log_git_status(repo, LOG_PREFIX)
+                    log.debug(f"Agent message history ({len(agent.messages)} messages):")
+                    log_agent_messages(agent.messages, log)
+                log_git_status(repo, log)
                 last_exc = None
                 break
 
             except Exception as exc:
                 last_exc = exc
                 if is_no_tool_calls_error(exc) and (attempt - 1) < toolcall_retry_max:
-                    executor_log(
-                        f"{LOG_PREFIX} Detected tool-call failure from model/runtime: "
+                    log.info(
+                        "Detected tool-call failure from model/runtime: "
                         f"{to_single_line(exc, 220)}"
                     )
                     continue
@@ -326,7 +327,7 @@ def _run_miniswe_task(
 # ─── Main entry point ───────────────────────────────────────────────────────
 
 def main() -> int:
-    task = parse_task_execute_payload(sys.argv, log_prefix=LOG_PREFIX)
+    task = parse_task_execute_payload(sys.argv, logger=log)
     result = _run_miniswe_task(
         task.repo, task.instruction, task.payload, task.supplemental_guidance,
     )

@@ -15,6 +15,7 @@ shared_passthrough = [
   "GH_TOKEN",
   "GIT_TOKEN",
   "PUSHPALS_REPO_PATH",
+  "WORKERPALS_DEBUG",
 ]
 
 [backends.openhands]

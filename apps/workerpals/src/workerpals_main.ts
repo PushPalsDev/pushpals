@@ -26,6 +26,7 @@ import { mkdirSync } from "fs";
 import { resolve } from "path";
 import { detectRepoRoot, loadPromptTemplate, loadPushPalsConfig } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
+import { Logger } from "./common/logger.js";
 import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
@@ -47,6 +48,7 @@ type WorkerJobResult = JobResult & {
 
 const DEFAULT_LLM_MODEL = "local-model";
 const CONFIG = loadPushPalsConfig();
+const LOG = new Logger("WorkerPals");
 
 function workerLlmConfig(runtimeConfig: ReturnType<typeof loadPushPalsConfig>): {
   model: string;
@@ -774,8 +776,8 @@ async function workerLoop(
             ? (stream: "stdout" | "stderr", line: string) => {
                 const cleaned = sanitizeJobLogLine(line);
                 if (!cleaned) return;
-                // Print executor logs locally so they appear in test/daemon output
-                console.log(`[${stream}] ${cleaned}`);
+                // Print executor logs locally only in debug mode.
+                if (LOG.isDebugEnabled()) LOG.debug(`[${stream}] ${cleaned}`);
 
                 // Drop high-frequency terminal progress redraw spam; keep meaningful lines.
                 if (isNoisyProgressLine(cleaned)) return;

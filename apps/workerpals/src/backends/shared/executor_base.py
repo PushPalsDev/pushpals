@@ -83,6 +83,31 @@ def executor_log(message: str) -> None:
     sys.stdout.flush()
 
 
+def _debug_enabled() -> bool:
+    return os.environ.get("WORKERPALS_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+
+
+class Logger:
+    """Simple levelled logger for executor scripts.
+
+    Usage::
+
+        log = Logger("[MiniSweExecutor]")
+        log.info("Starting execution")
+        log.debug("Instruction: ...")   # only when WORKERPALS_DEBUG=1
+    """
+
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+
+    def info(self, message: str) -> None:
+        executor_log(f"{self.prefix} {message}")
+
+    def debug(self, message: str) -> None:
+        if _debug_enabled():
+            executor_log(f"{self.prefix} {message}")
+
+
 def fail(summary: str, stderr: Optional[str] = None, exit_code: int = 1) -> int:
     """Emit a failure result and return the exit code."""
     emit({"ok": False, "summary": summary, "stderr": stderr or "", "exitCode": exit_code})
@@ -343,9 +368,10 @@ def looks_local_base_url(base_url: str) -> bool:
 
 def resolve_llm_config(
     default_model: str = "local-model",
-    log_prefix: str = "[Executor]",
+    logger: Optional[Logger] = None,
 ) -> Tuple[str, str, str]:
     """Returns (model, api_key, base_url) resolved from config + env."""
+    log = logger or Logger("[Executor]")
     raw_model = setting_str("WORKERPALS_LLM_MODEL", "workerpals.llm.model", "")
     api_key = setting_str("WORKERPALS_LLM_API_KEY", "workerpals.llm.api_key", "")
     raw_base_url = setting_str("WORKERPALS_LLM_ENDPOINT", "workerpals.llm.endpoint", "")
@@ -355,14 +381,10 @@ def resolve_llm_config(
     if running_in_container():
         rewritten = rewrite_localhost_for_container(base_url)
         if rewritten != base_url:
-            executor_log(
-                f"{log_prefix} Rewriting local LLM base URL for container networking: {base_url} -> {rewritten}"
-            )
+            log.info(f"Rewriting local LLM base URL for container networking: {base_url} -> {rewritten}")
             base_url = rewritten
     if not raw_model.strip():
-        executor_log(
-            f"{log_prefix} No explicit model configured; using default model {default_model}."
-        )
+        log.info(f"No explicit model configured; using default model {default_model}.")
     return configured_model, api_key, base_url
 
 
@@ -395,8 +417,9 @@ def summarize_git_changes(repo: str) -> List[str]:
         return []
 
 
-def log_git_status(repo: str, log_prefix: str = "[Executor]") -> None:
+def log_git_status(repo: str, logger: Optional[Logger] = None) -> None:
     """Log ``git status --porcelain`` and ``git diff --stat`` for post-execution visibility."""
+    log = logger or Logger("[Executor]")
     try:
         status = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -404,13 +427,13 @@ def log_git_status(repo: str, log_prefix: str = "[Executor]") -> None:
         )
         lines = [l for l in (status.stdout or "").splitlines() if l.strip()]
         if lines:
-            executor_log(f"{log_prefix} Git status after execution:")
+            log.debug("Git status after execution:")
             for line in lines[:30]:
-                executor_log(f"  {line}")
+                log.debug(f"  {line}")
         else:
-            executor_log(f"{log_prefix} Git status: clean (no changes)")
+            log.debug("Git status: clean (no changes)")
     except Exception as exc:
-        executor_log(f"{log_prefix} Git status failed: {exc}")
+        log.debug(f"Git status failed: {exc}")
 
     try:
         diff = subprocess.run(
@@ -419,15 +442,21 @@ def log_git_status(repo: str, log_prefix: str = "[Executor]") -> None:
         )
         diff_lines = [l for l in (diff.stdout or "").splitlines() if l.strip()]
         if diff_lines:
-            executor_log(f"{log_prefix} Git diff stat:")
+            log.debug("Git diff stat:")
             for line in diff_lines[:20]:
-                executor_log(f"  {line}")
+                log.debug(f"  {line}")
     except Exception:
         pass
 
 
-def log_agent_messages(messages: list, log_prefix: str = "[Executor]", max_chars: int = 200) -> None:
-    """Log a summary of agent message history (works with miniswe's message format)."""
+def log_agent_messages(messages: list, logger: Optional[Logger] = None, max_chars: int = 200) -> None:
+    """Log a summary of agent message history (works with miniswe's message format).
+
+    Only emits output when WORKERPALS_DEBUG=1.
+    """
+    if not _debug_enabled():
+        return
+    log = logger or Logger("[Executor]")
     step = 0
     for msg in messages:
         if not isinstance(msg, dict):
@@ -447,20 +476,20 @@ def log_agent_messages(messages: list, log_prefix: str = "[Executor]", max_chars
                     fn = tc.get("function") or {}
                     name = fn.get("name") or "unknown"
                     args_raw = str(fn.get("arguments") or "")[:80]
-                    executor_log(f"{log_prefix} Step {step} (tool_call): {name}({args_raw})")
+                    log.debug(f"Step {step} (tool_call): {name}({args_raw})")
             continue
 
         # Tool response
         if role == "tool":
             name = str(msg.get("name") or msg.get("tool_call_id") or "tool")
             excerpt = to_single_line(content, max_chars)
-            executor_log(f"{log_prefix} Step {step} (tool_result/{name}): {excerpt}")
+            log.debug(f"Step {step} (tool_result/{name}): {excerpt}")
             continue
 
         # Assistant or user text
         excerpt = to_single_line(content, max_chars)
         if excerpt:
-            executor_log(f"{log_prefix} Step {step} ({role}): {excerpt}")
+            log.debug(f"Step {step} ({role}): {excerpt}")
 
 
 # ─── Payload parsing ────────────────────────────────────────────────────────
@@ -480,13 +509,14 @@ def parse_task_execute_payload(
     argv: List[str],
     *,
     accepted_kinds: Tuple[str, ...] = ("task.execute",),
-    log_prefix: str = "[Executor]",
+    logger: Optional[Logger] = None,
 ) -> TaskExecutePayload:
     """Decode argv[1], validate required fields, return structured payload.
 
     Raises ``SystemExit`` via ``fail()`` on validation errors so callers
     don't need to handle them.
     """
+    log = logger or Logger("[Executor]")
     if len(argv) < 2:
         raise SystemExit(fail("Missing base64 job payload", exit_code=2))
 
@@ -521,14 +551,14 @@ def parse_task_execute_payload(
 
     supplemental_guidance: List[str] = []
     if planner_instruction and planner_instruction != instruction:
-        executor_log(
-            f"{log_prefix} Planner guidance was provided, but preserving original "
+        log.info(
+            "Planner guidance was provided, but preserving original "
             "user instruction as canonical task input."
         )
         supplemental_guidance.append(planner_instruction)
     if quality_revision_hint:
-        executor_log(
-            f"{log_prefix} Quality revision guidance provided for this attempt; "
+        log.info(
+            "Quality revision guidance provided for this attempt; "
             "preserving canonical user instruction and applying additive guidance."
         )
         supplemental_guidance.append(quality_revision_hint)

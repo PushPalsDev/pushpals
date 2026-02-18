@@ -21,8 +21,8 @@ if str(_SHARED_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_DIR))
 
 from executor_base import (
+    Logger,
     emit,
-    executor_log,
     is_no_tool_calls_error,
     is_truthy_env,
     log_git_status,
@@ -38,6 +38,7 @@ from executor_base import (
 )
 
 LOG_PREFIX = "[OpenHandsExecutor]"
+log = Logger(LOG_PREFIX)
 DEFAULT_OPENHANDS_MODEL = "local-model"
 PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 _PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
@@ -265,7 +266,7 @@ def _run_openhands_task(
 
     model, api_key, base_url = resolve_llm_config(
         default_model=DEFAULT_OPENHANDS_MODEL,
-        log_prefix=LOG_PREFIX,
+        logger=log,
     )
     if not model:
         return {
@@ -319,7 +320,7 @@ def _run_openhands_task(
 
     mcp_config, mcp_notes = _resolve_mcp_config()
     for note in mcp_notes:
-        executor_log(note)
+        log.info(note.removeprefix(f"{LOG_PREFIX} ").strip())
 
     tools = [Tool(name=TerminalTool.name), Tool(name=FileEditorTool.name)]
     if _browser_tool_enabled():
@@ -327,9 +328,9 @@ def _run_openhands_task(
             from openhands.tools.browser_use import BrowserToolSet
 
             tools.append(Tool(name=BrowserToolSet.name))
-            executor_log(f"{LOG_PREFIX} BrowserToolSet enabled.")
+            log.info("BrowserToolSet enabled.")
         except Exception as exc:
-            executor_log(f"{LOG_PREFIX} Browser tooling unavailable: {to_single_line(exc, 300)}")
+            log.info(f"Browser tooling unavailable: {to_single_line(exc, 300)}")
 
     try:
         llm = LLM(**llm_kwargs)
@@ -346,7 +347,7 @@ def _run_openhands_task(
             agent = Agent(llm=llm, tools=tools)
 
         conversation = Conversation(agent=agent, workspace=repo)
-        executor_log(f"{LOG_PREFIX} Instruction: {to_single_line(instruction, 300)}")
+        log.debug(f"Instruction: {to_single_line(instruction, 300)}")
         conversation.send_message(_build_user_message(instruction, timeout_ms))
         if supplemental_guidance:
             for guidance in supplemental_guidance:
@@ -373,23 +374,23 @@ def _run_openhands_task(
             else:
                 raise
 
-        executor_log(f"{LOG_PREFIX} Agent execution completed.")
+        log.debug("Agent execution completed.")
         # Log conversation events if the SDK exposes them
         try:
             events = getattr(conversation, "events", None) or getattr(conversation, "get_events", lambda: None)()
             if events:
-                executor_log(f"{LOG_PREFIX} Conversation events ({len(events)}):")
+                log.debug(f"Conversation events ({len(events)}):")
                 for i, event in enumerate(events[:30], 1):
                     if isinstance(event, dict):
                         action = event.get("action") or event.get("type") or "unknown"
                         args = event.get("args") or {}
                         path = args.get("path") or args.get("command") or ""
-                        executor_log(f"{LOG_PREFIX}   Event {i}: {action} {to_single_line(str(path), 120)}")
+                        log.debug(f"  Event {i}: {action} {to_single_line(str(path), 120)}")
                     else:
-                        executor_log(f"{LOG_PREFIX}   Event {i}: {to_single_line(str(event), 150)}")
+                        log.debug(f"  Event {i}: {to_single_line(str(event), 150)}")
         except Exception:
             pass
-        log_git_status(repo, LOG_PREFIX)
+        log_git_status(repo, log)
 
     except Exception as exc:
         if is_no_tool_calls_error(exc):
@@ -433,7 +434,7 @@ def _run_openhands_task(
 
 
 def main() -> int:
-    task = parse_task_execute_payload(sys.argv, log_prefix=LOG_PREFIX)
+    task = parse_task_execute_payload(sys.argv, logger=log)
     result = _run_openhands_task(task.repo, task.instruction, task.payload, task.supplemental_guidance)
     emit(result)
     return 0 if bool(result.get("ok")) else to_int(result.get("exitCode"), 1)

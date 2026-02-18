@@ -879,7 +879,7 @@ def main():
             print("==============================\n")
 
             worker_id = f"e2e-{backend}-{int(time.time() * 1000) % 100000000:08d}"
-            worker_env = {"WORKERPALS_EXECUTOR": backend}
+            worker_env = {"WORKERPALS_EXECUTOR": backend, "WORKERPALS_DEBUG": "1"}
             worker_cmd = [
                 "bun",
                 "run",
