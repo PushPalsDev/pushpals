@@ -1158,6 +1158,35 @@ function hasInvalidRepoPathHint(values: string[]): boolean {
   return values.some((entry) => normalizeStagePath(entry) === null);
 }
 
+function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const planning = value as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...planning };
+
+  if (planning.scope && typeof planning.scope === "object" && !Array.isArray(planning.scope)) {
+    const scope = planning.scope as Record<string, unknown>;
+    const normalizedScope: Record<string, unknown> = { ...scope };
+    if (isStringArray(scope.writeGlobs)) {
+      normalizedScope.writeGlobs = toStringArray(scope.writeGlobs);
+    }
+    if (isStringArray(scope.forbiddenGlobs)) {
+      normalizedScope.forbiddenGlobs = toStringArray(scope.forbiddenGlobs);
+    }
+    out.scope = normalizedScope;
+  }
+
+  if (planning.discovery && typeof planning.discovery === "object" && !Array.isArray(planning.discovery)) {
+    const discovery = planning.discovery as Record<string, unknown>;
+    const normalizedDiscovery: Record<string, unknown> = { ...discovery };
+    if (isStringArray(discovery.likelyDirs)) {
+      normalizedDiscovery.likelyDirs = toStringArray(discovery.likelyDirs);
+    }
+    out.discovery = normalizedDiscovery;
+  }
+
+  return out;
+}
+
 function validateTaskExecutePlanning(
   value: unknown,
 ): { ok: true } | { ok: false; message: string } {
@@ -1327,7 +1356,8 @@ export async function executeJob(
     };
   }
 
-  const planningValidation = validateTaskExecutePlanning(params.planning);
+  const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(params.planning);
+  const planningValidation = validateTaskExecutePlanning(sanitizedPlanning);
   if (!planningValidation.ok) {
     return {
       ok: false,
@@ -1346,9 +1376,10 @@ export async function executeJob(
 
   const normalizedParams: Record<string, unknown> = {
     ...params,
+    planning: sanitizedPlanning,
     instruction,
   };
-  const planning = params.planning as TaskExecutePlanning;
+  const planning = sanitizedPlanning as TaskExecutePlanning;
   const executionBudgetMs = Number(planning.executionBudgetMs);
   const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
 

@@ -7,6 +7,7 @@
 
 import { loadPromptTemplate } from "shared";
 import type { LLMClient, LLMMessage } from "./llm.js";
+import { normalizeRepoPathHint } from "./path_targeting.js";
 
 export type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
 export type PlannerRiskLevel = "low" | "medium" | "high";
@@ -196,6 +197,23 @@ function dedupeStrings(values: unknown, limit: number): string[] {
   return out;
 }
 
+function dedupeRepoPathHints(values: unknown, limit: number): string[] {
+  if (!Array.isArray(values)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of values) {
+    if (typeof raw !== "string") continue;
+    const normalized = normalizeRepoPathHint(raw);
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("planner output is not an object");
@@ -211,10 +229,10 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
       : {};
   const readAnywhere =
     typeof scopeRecord.read_anywhere === "boolean" ? scopeRecord.read_anywhere : true;
-  const writeAllowed =
+  const writeAllowedRaw =
     typeof scopeRecord.write_allowed === "boolean" ? scopeRecord.write_allowed : true;
-  const writeGlobs = dedupeStrings(scopeRecord.write_globs, MAX_SCOPE_GLOBS);
-  const forbiddenGlobs = dedupeStrings(scopeRecord.forbidden_globs, MAX_SCOPE_GLOBS);
+  const writeGlobs = dedupeRepoPathHints(scopeRecord.write_globs, MAX_SCOPE_GLOBS);
+  const forbiddenGlobs = dedupeRepoPathHints(scopeRecord.forbidden_globs, MAX_SCOPE_GLOBS);
   const maxFilesRaw = Number(scopeRecord.max_files_to_edit);
   const maxFilesToEdit =
     Number.isFinite(maxFilesRaw) && maxFilesRaw > 0 ? Math.floor(maxFilesRaw) : undefined;
@@ -224,7 +242,7 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
       ? (record.discovery as Record<string, unknown>)
       : null;
   const ripgrepQueries = dedupeStrings(discoveryRecord?.ripgrep_queries, MAX_DISCOVERY_ITEMS);
-  const likelyDirs = dedupeStrings(discoveryRecord?.likely_dirs, MAX_DISCOVERY_ITEMS);
+  const likelyDirs = dedupeRepoPathHints(discoveryRecord?.likely_dirs, MAX_DISCOVERY_ITEMS);
   const keywords = dedupeStrings(discoveryRecord?.keywords, MAX_DISCOVERY_ITEMS);
   const acceptanceCriteria = dedupeStrings(record.acceptance_criteria, MAX_ACCEPTANCE_CRITERIA);
   const validationSteps = dedupeStrings(record.validation_steps, MAX_VALIDATION_STEPS);
@@ -246,6 +264,8 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   ).slice(0, MAX_ASSISTANT_CHARS);
 
   const requires_worker = requiresWorker;
+  const writeAllowed =
+    requires_worker && intent === "code_change" ? true : writeAllowedRaw;
   const job_kind: "task.execute" | "none" = requires_worker ? "task.execute" : "none";
 
   return {
