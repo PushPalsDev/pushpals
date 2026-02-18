@@ -681,7 +681,7 @@ def _broker_run(
 
     def _record(line: str) -> None:
         transcript.append(line)
-        log.info(line)
+        log.debug(line)
 
     step = 0
     model_done = False

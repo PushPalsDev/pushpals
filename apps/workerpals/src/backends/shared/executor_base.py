@@ -432,11 +432,16 @@ def summarize_git_changes(repo: str) -> List[str]:
         if proc.returncode != 0:
             return []
         paths: List[str] = []
-        for line in proc.stdout.splitlines():
-            clean = line.strip()
-            if not clean:
+        for raw_line in proc.stdout.splitlines():
+            line = str(raw_line or "").rstrip("\r\n")
+            if not line.strip():
                 continue
-            path = clean[3:] if len(clean) > 3 else clean
+            # Porcelain format uses two status columns + space prefix.
+            # Do not trim leading whitespace before slicing, otherwise
+            # paths like "README.md" become "EADME.md".
+            if len(line) < 4:
+                continue
+            path = line[3:].strip()
             if " -> " in path:
                 path = path.split(" -> ", 1)[1]
             if path:

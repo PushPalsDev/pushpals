@@ -119,6 +119,9 @@ REQUESTED_BACKENDS = [
 E2E_REMOTEBUDDY_FETCH_FAILURE_LOGS = (
     os.environ.get("WORKERPALS_E2E_REMOTEBUDDY_FETCH_FAILURE_LOGS", "0").strip() or "0"
 )
+E2E_WORKERPALS_DEBUG = (
+    os.environ.get("WORKERPALS_E2E_WORKERPALS_DEBUG", "1").strip() or "0"
+)
 
 # Safe default for helper calls that may run before module-level env initialization.
 DEFAULT_ENV = os.environ.copy()
@@ -1638,7 +1641,10 @@ def main():
             print("==============================\n")
 
             worker_id = f"e2e-{backend}-{uuid4().hex[:10]}"
-            worker_env = {"WORKERPALS_EXECUTOR": backend, "WORKERPALS_DEBUG": "1"}
+            worker_env = {
+                "WORKERPALS_EXECUTOR": backend,
+                "WORKERPALS_DEBUG": E2E_WORKERPALS_DEBUG,
+            }
             if backend == "miniswe":
                 worker_env["WORKERPALS_MINISWE_TOOL_BROKER"] = os.environ.get(
                     "WORKERPALS_E2E_MINISWE_TOOL_BROKER", "1"
