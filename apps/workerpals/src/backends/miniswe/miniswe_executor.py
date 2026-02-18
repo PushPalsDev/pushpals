@@ -18,11 +18,12 @@ Production hardening:
   the root cause obvious to the TS layer (so you can alert / route / fallback).
 
 Tool-broker shim:
-- If mini-swe-agent fails because the model doesn't tool-call, optionally fall back to a
+- If mini-swe-agent fails because the model doesn't tool-call, fall back to a
   "tool broker" loop that does NOT require native tool/function calling.
 - The broker asks the model to emit a strict JSON "plan of actions" (file ops + safe shell),
   executes them locally, and feeds observations back to the model for a few steps.
-- Enable with: WORKERPALS_MINISWE_TOOL_BROKER=1 (default off to avoid surprises).
+- Broker can be forced on/off with WORKERPALS_MINISWE_TOOL_BROKER=1/0.
+  If unset, local endpoints (LM Studio/Ollama-style) default to ON.
 """
 
 from __future__ import annotations
@@ -69,7 +70,8 @@ LOG_PREFIX = "[MiniSweExecutor]"
 log = Logger(LOG_PREFIX)
 
 # Tool broker defaults (conservative)
-_BROKER_ENABLED_DEFAULT = "0"  # off by default
+# Keep explicit default off, but auto-enable when using a local endpoint.
+_BROKER_ENABLED_DEFAULT = "0"
 _BROKER_MAX_STEPS_DEFAULT = 8
 _BROKER_MAX_ACTIONS_PER_STEP_DEFAULT = 10
 _BROKER_HTTP_TIMEOUT_SEC = 60
@@ -149,9 +151,29 @@ def _toolcall_retry_max() -> int:
     return max(0, min(3, to_int(cfg, DEFAULT_TOOLCALL_RETRY_MAX)))
 
 
-def _tool_broker_enabled() -> bool:
-    raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER") or _BROKER_ENABLED_DEFAULT).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+def _parse_boolish(raw: Any) -> Optional[bool]:
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _tool_broker_enabled(base_url: str = "") -> bool:
+    env_setting = _parse_boolish(os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER"))
+    if env_setting is not None:
+        return env_setting
+    cfg_setting = _parse_boolish(config_get("workerpals.miniswe_tool_broker", None))
+    if cfg_setting is not None:
+        return cfg_setting
+    if looks_local_base_url(base_url):
+        return True
+    return _parse_boolish(_BROKER_ENABLED_DEFAULT) is True
 
 
 def _tool_broker_max_steps() -> int:
@@ -1024,7 +1046,7 @@ def _run_miniswe_task(
     except Exception as exc:
         # If it's a tool-call failure, optionally fall back to broker shim.
         if is_no_tool_calls_error(exc):
-            if _tool_broker_enabled():
+            if _tool_broker_enabled(base_url):
                 log.info("mini-swe-agent failed due to missing tool calls; falling back to tool broker shim.")
                 broker_result = _broker_run(
                     repo,
@@ -1070,7 +1092,7 @@ def _run_miniswe_task(
             }
 
     if _messages_indicate_missing_tool_calls(agent_messages):
-        if _tool_broker_enabled():
+        if _tool_broker_enabled(base_url):
             log.info("mini-swe-agent exited without tool calls; falling back to tool broker shim.")
             broker_result = _broker_run(
                 repo,

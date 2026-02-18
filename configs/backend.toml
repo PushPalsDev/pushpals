@@ -51,3 +51,11 @@ passthrough_env = [
 script_segments = ["backends", "miniswe", "miniswe_executor.py"]
 python_config_key = "miniswePython"
 timeout_config_key = "minisweTimeoutMs"
+passthrough_env = [
+  "WORKERPALS_MINISWE_AGENT_MAX_STEPS",
+  "WORKERPALS_MINISWE_TOOLCALL_RETRY_MAX",
+  "WORKERPALS_MINISWE_TOOL_BROKER",
+  "WORKERPALS_MINISWE_TOOL_BROKER_MAX_STEPS",
+  "WORKERPALS_MINISWE_TOOL_BROKER_MAX_ACTIONS_PER_STEP",
+  "WORKERPALS_MINISWE_TOOL_BROKER_SHELL_TIMEOUT_SEC",
+]
