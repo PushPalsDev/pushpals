@@ -377,6 +377,15 @@ function codexApiKeyPresent(): boolean {
   return Boolean(envKey || cfgKey);
 }
 
+function codexEffectiveAuthMode(): CodexAuthMode | null {
+  if (!codexBackendEnabled()) return null;
+  const configured = normalizeCodexAuthMode(process.env.WORKERPALS_OPENAI_CODEX_AUTH_MODE);
+  if (configured === "auto") {
+    return codexApiKeyPresent() ? "api_key" : "chatgpt";
+  }
+  return configured;
+}
+
 function codexHostCommandPrefix(): string[] {
   const override = (process.env.WORKERPALS_OPENAI_CODEX_BIN ?? "").trim();
   if (override) {
@@ -409,9 +418,8 @@ async function ensureCodexCliAuthPreflight(): Promise<void> {
   if (!codexBackendEnabled()) return;
 
   const configuredMode = normalizeCodexAuthMode(process.env.WORKERPALS_OPENAI_CODEX_AUTH_MODE);
+  const effectiveMode = codexEffectiveAuthMode() ?? "chatgpt";
   const hasApiKey = codexApiKeyPresent();
-  const effectiveMode: CodexAuthMode =
-    configuredMode === "auto" ? (hasApiKey ? "api_key" : "chatgpt") : configuredMode;
 
   console.log(
     `[start] openai_codex auth preflight: configured=${configuredMode} effective=${effectiveMode}`,
@@ -879,13 +887,16 @@ function llmPreflightTargets(): LlmPreflightTarget[] {
     CONFIG.localbuddy.llm.apiKey,
     normalizeEndpointForBackend(configuredLocalRaw, localFallback, localBackend),
   );
-  addTarget(
-    "WorkerPal LLM",
-    workerBackend,
-    CONFIG.workerpals.llm.model,
-    CONFIG.workerpals.llm.apiKey,
-    normalizeEndpointForBackend(configuredWorkerRaw, workerFallback, workerBackend),
-  );
+  const skipWorkerLlmTarget = codexBackendEnabled() && codexEffectiveAuthMode() === "chatgpt";
+  if (!skipWorkerLlmTarget) {
+    addTarget(
+      "WorkerPal LLM",
+      workerBackend,
+      CONFIG.workerpals.llm.model,
+      CONFIG.workerpals.llm.apiKey,
+      normalizeEndpointForBackend(configuredWorkerRaw, workerFallback, workerBackend),
+    );
+  }
 
   return out;
 }
@@ -1121,6 +1132,11 @@ async function ensureLlmPreflight(): Promise<void> {
 
   const serviceTargets = llmPreflightTargets();
   if (serviceTargets.length === 0) return;
+  if (codexBackendEnabled() && codexEffectiveAuthMode() === "chatgpt") {
+    console.log(
+      "[start] Skipping WorkerPal LLM endpoint/model preflight (openai_codex chatgpt auth mode).",
+    );
+  }
   const endpointGroups = llmPreflightEndpointGroups(serviceTargets);
   if (endpointGroups.length === 0) return;
 
@@ -1226,6 +1242,16 @@ async function ensureLlmPreflight(): Promise<void> {
     discoveredFallback: string;
   }> = [];
   for (const target of serviceTargets) {
+    if (target.backend === "openai" && !target.apiKey.trim()) {
+      let detail =
+        "OpenAI model preflight requires API-key authentication, but no API key is configured for this service.";
+      if (codexBackendEnabled() && codexEffectiveAuthMode() === "chatgpt") {
+        detail +=
+          " Codex CLI login only applies to WorkerPal openai_codex execution; LocalBuddy/RemoteBuddy OpenAI backends still require OPENAI_API_KEY (or switch them to local LM Studio/Ollama).";
+      }
+      modelFailures.push({ target, detail });
+      continue;
+    }
     const discovered = await discoverModelsForTarget(target);
     if (discovered.models.length === 0) {
       modelFailures.push({
