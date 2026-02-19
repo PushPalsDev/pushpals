@@ -428,6 +428,23 @@ function codexEffectiveAuthMode(): CodexAuthMode | null {
 }
 
 function codexHostCommandPrefix(): string[] {
+  const jsonOverride = firstNonEmpty(
+    process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON,
+    process.env.WORKERPALS_OPENAI_CODEX_BIN_JSON,
+  );
+  if (jsonOverride) {
+    try {
+      const parsed = JSON.parse(jsonOverride);
+      if (Array.isArray(parsed)) {
+        const args = parsed
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter((item) => item.length > 0);
+        if (args.length > 0) return args;
+      }
+    } catch {
+      // fall through to string override parsing
+    }
+  }
   const override = firstNonEmpty(
     process.env.PUSHPALS_OPENAI_CODEX_BIN,
     process.env.WORKERPALS_OPENAI_CODEX_BIN,
@@ -441,31 +458,49 @@ function codexHostCommandPrefix(): string[] {
 
 function persistResolvedCodexCommandPrefix(commandPrefix: string[]): void {
   if (commandPrefix.length === 0) return;
-  process.env.PUSHPALS_OPENAI_CODEX_BIN = commandPrefix.join(" ");
+  const serialized = commandPrefix.join(" ");
+  const json = JSON.stringify(commandPrefix);
+  process.env.PUSHPALS_OPENAI_CODEX_BIN = serialized;
+  process.env.WORKERPALS_OPENAI_CODEX_BIN = serialized;
+  process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON = json;
+  process.env.WORKERPALS_OPENAI_CODEX_BIN_JSON = json;
 }
 
 async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<string[]> {
-  const versionExit = await runQuiet([...commandPrefix, "--version"]);
-  if (versionExit === 0) return commandPrefix;
+  const candidates: string[][] = [];
+  const pushCandidate = (cmd: string[]) => {
+    if (cmd.length === 0) return;
+    const key = cmd.join("\u0000");
+    if (candidates.some((existing) => existing.join("\u0000") === key)) return;
+    candidates.push(cmd);
+  };
 
-  if (commandPrefix.join(" ") !== "bunx --yes @openai/codex") {
-    const bunxExit = await runQuiet(["bunx", "--yes", "@openai/codex", "--version"]);
-    if (bunxExit === 0) return ["bunx", "--yes", "@openai/codex"];
+  pushCandidate(commandPrefix);
+  const execPath = (process.execPath ?? "").trim();
+  if (execPath) {
+    const lower = execPath.toLowerCase();
+    if (lower.endsWith("bun") || lower.endsWith("bun.exe")) {
+      pushCandidate([execPath, "x", "--yes", "@openai/codex"]);
+    }
+  }
+  pushCandidate(["bun", "x", "--yes", "@openai/codex"]);
+  pushCandidate(["bunx", "--yes", "@openai/codex"]);
+  pushCandidate(["codex"]);
+
+  const attempted: string[] = [];
+  for (const candidate of candidates) {
+    const renderedCandidate = candidate.join(" ");
+    attempted.push(`${renderedCandidate} --version`);
+    const versionExit = await runQuiet([...candidate, "--version"]);
+    if (versionExit === 0) return candidate;
   }
 
-  if (commandPrefix[0] !== "codex") {
-    const codexExit = await runQuiet(["codex", "--version"]);
-    if (codexExit === 0) return ["codex"];
-  }
-
-  const rendered = commandPrefix.join(" ");
   console.error("[start] openai_codex backend selected but Codex CLI is unavailable.");
-  console.error(`[start] Tried: ${rendered} --version`);
-  if (commandPrefix.join(" ") !== "bunx --yes @openai/codex") {
-    console.error("[start] Also tried: bunx --yes @openai/codex --version");
-  }
-  if (commandPrefix[0] !== "codex") {
-    console.error("[start] Also tried: codex --version");
+  if (attempted.length > 0) {
+    console.error("[start] Tried:");
+    for (const line of attempted) {
+      console.error(`[start] - ${line}`);
+    }
   }
   console.error("[start] Install/use Codex CLI, then retry start.");
   abortStart(1);
@@ -1103,10 +1138,44 @@ function lmStudioCliCandidates(): string[] {
 }
 
 function splitArgs(raw: string): string[] {
-  return raw
-    .trim()
-    .split(/\s+/)
-    .filter((part) => part.length > 0);
+  const out: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const ch of raw.trim()) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        out.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += "\\";
+  if (current.length > 0) out.push(current);
+  return out;
 }
 
 function resolveLmStudioPort(primaryEndpoint: string): number {
@@ -2588,10 +2657,12 @@ try {
   process.exit(1);
 }
 
-proc = Bun.spawn(["bun", "run", "dev:full"], {
+const bunExecPath = (process.execPath ?? "").trim() || "bun";
+proc = Bun.spawn([bunExecPath, "run", "dev:full"], {
   stdin: "inherit",
   stdout: "inherit",
   stderr: "inherit",
+  env: { ...process.env },
 });
 
 const startupWarmupPromise = runStartupWarmup().catch((err) => {

@@ -103,10 +103,44 @@ type ProcessRunResult = {
 };
 
 function splitArgs(raw: string): string[] {
-  return raw
-    .trim()
-    .split(/\s+/)
-    .filter((part) => part.length > 0);
+  const out: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const ch of raw.trim()) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        out.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += "\\";
+  if (current.length > 0) out.push(current);
+  return out;
 }
 
 function normalizeCodexAuthMode(value: string | null | undefined): CodexAuthMode {
@@ -136,14 +170,32 @@ function codexConfiguredAuthMode(): CodexAuthMode {
   );
 }
 
-function codexCommandOverride(): string {
-  return (
+function codexCommandOverrideParts(): string[] {
+  const jsonOverride = firstNonEmpty(
+    process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON,
+    process.env.WORKERPALS_OPENAI_CODEX_BIN_JSON,
+  );
+  if (jsonOverride) {
+    try {
+      const parsed = JSON.parse(jsonOverride);
+      if (Array.isArray(parsed)) {
+        const args = parsed
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter((item) => item.length > 0);
+        if (args.length > 0) return args;
+      }
+    } catch {
+      // fall through to string override parsing
+    }
+  }
+  const stringOverride =
     firstNonEmpty(
       process.env.PUSHPALS_OPENAI_CODEX_BIN,
       process.env.WORKERPALS_OPENAI_CODEX_BIN,
       "",
-    ) ?? ""
-  );
+    ) ?? "";
+  if (!stringOverride) return [];
+  return splitArgs(stringOverride);
 }
 
 function codexBaseUrlOverride(): string {
@@ -264,19 +316,32 @@ let cachedCodexCommandPrefix: string[] | null = null;
 
 async function resolveCodexCommandPrefix(): Promise<string[]> {
   if (cachedCodexCommandPrefix) return cachedCodexCommandPrefix;
-  const override = codexCommandOverride();
-  const preferred = override ? splitArgs(override) : ["bun", "x", "--yes", "@openai/codex"];
-  const candidates: string[][] = [preferred];
-  if (preferred.join(" ") !== "bunx --yes @openai/codex") {
-    candidates.push(["bunx", "--yes", "@openai/codex"]);
+  const override = codexCommandOverrideParts();
+  const preferred = override.length > 0 ? override : ["bun", "x", "--yes", "@openai/codex"];
+  const candidates: string[][] = [];
+  const pushCandidate = (cmd: string[]) => {
+    if (cmd.length === 0) return;
+    const key = cmd.join("\u0000");
+    if (candidates.some((existing) => existing.join("\u0000") === key)) return;
+    candidates.push(cmd);
+  };
+  pushCandidate(preferred);
+  const execPath = (process.execPath ?? "").trim();
+  if (execPath) {
+    const lower = execPath.toLowerCase();
+    if (lower.endsWith("bun") || lower.endsWith("bun.exe")) {
+      pushCandidate([execPath, "x", "--yes", "@openai/codex"]);
+    }
   }
-  if (preferred[0] !== "codex") {
-    candidates.push(["codex"]);
-  }
+  pushCandidate(["bun", "x", "--yes", "@openai/codex"]);
+  pushCandidate(["bunx", "--yes", "@openai/codex"]);
+  pushCandidate(["codex"]);
   const cwd = process.cwd();
   const env = process.env;
+  const attemptErrors: string[] = [];
   for (const candidate of candidates) {
     if (candidate.length === 0) continue;
+    const rendered = `${candidate.join(" ")} --version`;
     try {
       const probe = await runProcess([...candidate, "--version"], {
         cwd,
@@ -287,12 +352,18 @@ async function resolveCodexCommandPrefix(): Promise<string[]> {
         cachedCodexCommandPrefix = candidate;
         return candidate;
       }
-    } catch {
-      // try next candidate
+      const detail = (probe.stderr || probe.stdout || "").trim();
+      attemptErrors.push(
+        `${rendered} -> exit ${probe.code ?? "unknown"}${detail ? ` (${detail.split(/\r?\n/, 1)[0]})` : ""}`,
+      );
+    } catch (err) {
+      attemptErrors.push(`${rendered} -> ${String(err)}`);
     }
   }
+  const details = attemptErrors.length > 0 ? ` Tried: ${attemptErrors.join("; ")}` : "";
   throw new Error(
-    "OpenAI Codex CLI is unavailable. Install/use Codex CLI (`bunx --yes @openai/codex` or `codex`) and retry.",
+    "OpenAI Codex CLI is unavailable. Install/use Codex CLI (`bun x --yes @openai/codex` or `codex`) and retry." +
+      details,
   );
 }
 function normalizeBackend(value: string | null | undefined): LlmBackend | null {
