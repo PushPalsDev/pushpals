@@ -1,0 +1,45 @@
+[
+  {
+    "instance_id": "pushpals.autonomy.prompt_bundle.hard",
+    "title": "Harden autonomy prompt guidance across scoring + ideation",
+    "problem_statement": "Apply both updates exactly and keep all other content unchanged: 1) In prompts/remotebuddy/autonomy_scoring_system_prompt.md append the bullet line '- Prefer deterministic, evidence-backed scoring rationale with explicit evidence IDs.' 2) In prompts/remotebuddy/autonomy_ideation_system_prompt.md append the bullet line '- Propose ideas only when acceptance criteria are measurable and testable.'",
+    "expected_paths": [
+      "prompts/remotebuddy/autonomy_scoring_system_prompt.md",
+      "prompts/remotebuddy/autonomy_ideation_system_prompt.md"
+    ],
+    "must_contain": {
+      "prompts/remotebuddy/autonomy_scoring_system_prompt.md": "(?m)^- Prefer deterministic, evidence-backed scoring rationale with explicit evidence IDs\\.$",
+      "prompts/remotebuddy/autonomy_ideation_system_prompt.md": "(?m)^- Propose ideas only when acceptance criteria are measurable and testable\\.$"
+    },
+    "max_files_changed": 2,
+    "perf_target_ms": 540000
+  },
+  {
+    "instance_id": "pushpals.autonomy.config_readme_bundle.hard",
+    "title": "Add quality-prioritization notes to config and README",
+    "problem_statement": "Apply both updates exactly and keep all other content unchanged: 1) In config/local.example.toml append the comment line '# Guardrail: keep autonomy write scope narrow, explicit, and auditable.' 2) In README.md append the bullet line '- Eval benchmarks prioritize correctness and code quality over raw speed.'",
+    "expected_paths": [
+      "config/local.example.toml",
+      "README.md"
+    ],
+    "must_contain": {
+      "config/local.example.toml": "(?m)^# Guardrail: keep autonomy write scope narrow, explicit, and auditable\\.$",
+      "README.md": "(?m)^- Eval benchmarks prioritize correctness and code quality over raw speed\\.$"
+    },
+    "max_files_changed": 2,
+    "perf_target_ms": 600000
+  },
+  {
+    "instance_id": "pushpals.autonomy.scoring_clause.medium",
+    "title": "Add explicit performance tradeoff guidance to scoring prompt",
+    "problem_statement": "In prompts/remotebuddy/autonomy_scoring_system_prompt.md append exactly one bullet line '- Penalize latency only lightly when correctness and safety are strong.' and keep all other content unchanged.",
+    "expected_paths": [
+      "prompts/remotebuddy/autonomy_scoring_system_prompt.md"
+    ],
+    "must_contain": {
+      "prompts/remotebuddy/autonomy_scoring_system_prompt.md": "(?m)^- Penalize latency only lightly when correctness and safety are strong\\.$"
+    },
+    "max_files_changed": 1,
+    "perf_target_ms": 480000
+  }
+]

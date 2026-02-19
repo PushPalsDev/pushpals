@@ -195,9 +195,11 @@ function parseChangedPathsFromStatus(statusOutput: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const line of statusOutput.split(/\r?\n/)) {
-    const clean = line.trim();
-    if (!clean) continue;
-    let path = clean.length > 3 ? clean.slice(3) : clean;
+    const raw = line.replace(/\r$/, "");
+    if (!raw.trim()) continue;
+    // git status --porcelain output is "<XY><space><path>".
+    // Do not trim before slicing; leading spaces are significant for X/Y fields.
+    let path = raw.length > 3 ? raw.slice(3) : raw;
     if (path.includes(" -> ")) {
       path = path.split(" -> ", 2)[1] ?? path;
     }

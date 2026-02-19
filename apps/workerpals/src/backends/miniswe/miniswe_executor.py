@@ -34,6 +34,7 @@ import re
 import shlex
 import sys
 import time
+import traceback
 import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,7 +76,8 @@ log = Logger(LOG_PREFIX)
 _BROKER_ENABLED_DEFAULT = "0"
 _BROKER_MAX_STEPS_DEFAULT = 8
 _BROKER_MAX_ACTIONS_PER_STEP_DEFAULT = 10
-_BROKER_HTTP_TIMEOUT_SEC = 60
+_BROKER_HTTP_TIMEOUT_SEC_DEFAULT = 60
+_BROKER_HTTP_RETRY_MAX_DEFAULT = 1
 _BROKER_TEMPERATURE = 0.0
 _BROKER_SHELL_TIMEOUT_SEC_DEFAULT = 120
 _BROKER_OBSERVATION_MAX_CHARS = 8_000
@@ -198,6 +200,26 @@ def _tool_broker_shell_timeout_sec() -> int:
     return _BROKER_SHELL_TIMEOUT_SEC_DEFAULT
 
 
+def _tool_broker_http_timeout_sec() -> int:
+    raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER_HTTP_TIMEOUT_SEC") or "").strip()
+    if raw:
+        return max(10, min(600, to_int(raw, _BROKER_HTTP_TIMEOUT_SEC_DEFAULT)))
+    cfg = config_get("workerpals.miniswe_tool_broker_http_timeout_sec", None)
+    if cfg is None:
+        return _BROKER_HTTP_TIMEOUT_SEC_DEFAULT
+    return max(10, min(600, to_int(cfg, _BROKER_HTTP_TIMEOUT_SEC_DEFAULT)))
+
+
+def _tool_broker_http_retry_max() -> int:
+    raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER_HTTP_RETRY_MAX") or "").strip()
+    if raw:
+        return max(0, min(3, to_int(raw, _BROKER_HTTP_RETRY_MAX_DEFAULT)))
+    cfg = config_get("workerpals.miniswe_tool_broker_http_retry_max", None)
+    if cfg is None:
+        return _BROKER_HTTP_RETRY_MAX_DEFAULT
+    return max(0, min(3, to_int(cfg, _BROKER_HTTP_RETRY_MAX_DEFAULT)))
+
+
 def _build_strict_tool_use_guidance(repo: str) -> str:
     return (
         "CRITICAL: You must use tools to make progress.\n"
@@ -275,9 +297,11 @@ def _http_post_json(url: str, payload: Dict[str, Any], api_key: str, timeout_sec
         raise RuntimeError(f"HTTP {e.code} {e.reason} for POST {url}\n{details}") from e
     except URLError as e:
         raise RuntimeError(f"URLError for POST {url}: {e}") from e
+    except TimeoutError as e:
+        raise RuntimeError(f"TimeoutError for POST {url}: timed out after {timeout_sec}s") from e
 
 
-def _chat_completion(cfg: _LLMConfig, messages: List[Dict[str, str]]) -> str:
+def _chat_completion(cfg: _LLMConfig, messages: List[Dict[str, str]], timeout_sec: int) -> str:
     base = _normalize_openai_base_url(cfg.base_url)
     if not base:
         raise RuntimeError("No base_url configured for broker shim (WORKERPALS_LLM_ENDPOINT/BASE_URL).")
@@ -288,7 +312,7 @@ def _chat_completion(cfg: _LLMConfig, messages: List[Dict[str, str]]) -> str:
         "temperature": _BROKER_TEMPERATURE,
         "stream": False,
     }
-    obj = _http_post_json(url, payload, cfg.api_key, timeout_sec=_BROKER_HTTP_TIMEOUT_SEC)
+    obj = _http_post_json(url, payload, cfg.api_key, timeout_sec=float(timeout_sec))
     choices = obj.get("choices") or []
     if not choices:
         raise RuntimeError(f"LLM returned no choices: {to_single_line(obj, 400)}")
@@ -613,13 +637,20 @@ def _validate_broker_actions(actions: Any, max_actions: int) -> Tuple[bool, str,
                 return False, f"Action {i} read_file: path is required", []
             valid.append({"type": typ, "path": str(act.get("path")).strip()})
             continue
-        if typ == "append_line":
+        if typ in {"append_line", "append_comment"}:
             if not isinstance(act.get("path"), str) or not str(act.get("path")).strip():
-                return False, f"Action {i} append_line: path is required", []
-            if not isinstance(act.get("line"), str):
-                return False, f"Action {i} append_line: line must be a string", []
+                return False, f"Action {i} {typ}: path is required", []
+            line_value = act.get("line")
+            if typ == "append_comment" and not isinstance(line_value, str):
+                line_value = act.get("comment")
+            if not isinstance(line_value, str):
+                return False, f"Action {i} {typ}: line/comment must be a string", []
             valid.append(
-                {"type": typ, "path": str(act.get("path")).strip(), "line": str(act.get("line"))}
+                {
+                    "type": "append_line",
+                    "path": str(act.get("path")).strip(),
+                    "line": str(line_value),
+                }
             )
             continue
         if typ == "replace_text_once":
@@ -781,6 +812,8 @@ def _broker_run(
     max_steps = _tool_broker_max_steps()
     max_actions = _tool_broker_max_actions_per_step()
     shell_timeout_sec = _tool_broker_shell_timeout_sec()
+    http_timeout_sec = _tool_broker_http_timeout_sec()
+    http_retry_max = _tool_broker_http_retry_max()
 
     transcript: List[str] = []
     obs: str = ""
@@ -799,6 +832,43 @@ def _broker_run(
         transcript.append(line)
         log.debug(line)
 
+    def _remaining_http_timeout_sec() -> int:
+        remaining = int(deadline - time.time())
+        if remaining <= 0:
+            return 10
+        return max(10, min(http_timeout_sec, remaining))
+
+    def _broker_llm_call(step_label: str) -> str:
+        attempt = 0
+        while True:
+            attempt += 1
+            timeout_for_call = _remaining_http_timeout_sec()
+            try:
+                return _chat_completion(llm, messages, timeout_sec=timeout_for_call)
+            except Exception as exc:
+                msg = to_single_line(exc, 400)
+                is_timeout = "timeout" in msg.lower() or "timed out" in msg.lower()
+                if (not is_timeout) or attempt > (http_retry_max + 1) or time.time() >= deadline:
+                    raise RuntimeError(
+                        f"{step_label} failed after {attempt} attempt(s): {msg}"
+                    ) from exc
+                _record(
+                    f"[Broker] {step_label} timeout; retry {attempt}/{http_retry_max + 1} "
+                    f"(timeout={timeout_for_call}s): {msg}"
+                )
+                time.sleep(min(2.0, 0.25 * attempt))
+
+    def _broker_fail(summary: str, stderr: str, exit_code: int = 3) -> Dict[str, Any]:
+        transcript_text = "\n".join(transcript).strip()
+        stdout = f"Tool broker transcript:\n{transcript_text}" if transcript_text else ""
+        return {
+            "ok": False,
+            "summary": summary,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exitCode": exit_code,
+        }
+
     step = 0
     model_done = False
     while step < max_steps and time.time() < deadline:
@@ -807,7 +877,13 @@ def _broker_run(
         if obs:
             messages.append({"role": "user", "content": f"Observation (from executed actions):\n{obs}\n\nNext JSON only."})
 
-        raw = _chat_completion(llm, messages)
+        try:
+            raw = _broker_llm_call(f"step {step} initial call")
+        except Exception as exc:
+            return _broker_fail(
+                "tool broker failed: llm request error",
+                f"Broker LLM request failed at step {step}: {to_single_line(exc, 500)}",
+            )
         raw_used = raw
         _record(f"[Broker] Step {step} model output: {to_single_line(raw, 500)}")
 
@@ -815,7 +891,13 @@ def _broker_run(
         if not obj:
             # one reprompt to force JSON
             messages.append({"role": "user", "content": "Your last response was not valid JSON. Return ONLY the JSON object."})
-            raw2 = _chat_completion(llm, messages)
+            try:
+                raw2 = _broker_llm_call(f"step {step} json-repair call")
+            except Exception as exc:
+                return _broker_fail(
+                    "tool broker failed: llm request error",
+                    f"Broker JSON-repair request failed at step {step}: {to_single_line(exc, 500)}",
+                )
             _record(f"[Broker] Step {step} JSON repair output: {to_single_line(raw2, 500)}")
             obj = _extract_first_json_object(raw2)
             if not obj:
@@ -838,7 +920,13 @@ def _broker_run(
                     ),
                 }
             )
-            raw3 = _chat_completion(llm, messages)
+            try:
+                raw3 = _broker_llm_call(f"step {step} shape-repair call")
+            except Exception as exc:
+                return _broker_fail(
+                    "tool broker failed: llm request error",
+                    f"Broker shape-repair request failed at step {step}: {to_single_line(exc, 500)}",
+                )
             _record(f"[Broker] Step {step} shape repair output: {to_single_line(raw3, 500)}")
             obj2 = _extract_first_json_object(raw3)
             if not isinstance(obj2, dict):
@@ -1337,10 +1425,20 @@ def _run_miniswe_task(
 # ─── Main entry point ───────────────────────────────────────────────────────
 
 def main() -> int:
-    task = parse_task_execute_payload(sys.argv, logger=log)
-    result = _run_miniswe_task(
-        task.repo, task.instruction, task.payload, task.supplemental_guidance,
-    )
+    try:
+        task = parse_task_execute_payload(sys.argv, logger=log)
+        result = _run_miniswe_task(
+            task.repo, task.instruction, task.payload, task.supplemental_guidance,
+        )
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "summary": "miniswe wrapper crashed while executing task.execute",
+            "stdout": "",
+            "stderr": traceback.format_exc(),
+            "exitCode": 1,
+            "error": to_single_line(exc, 300),
+        }
     emit(result)
     return 0 if bool(result.get("ok")) else to_int(result.get("exitCode"), 1)
 

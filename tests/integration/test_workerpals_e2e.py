@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """PushPals end-to-end smoke test: start stack, run warmup + real LLM request.
 
 Phase A: warmup.execute (fast, proves WorkerPals can claim + complete jobs)
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import hashlib
 import importlib
 import json
 import os
@@ -38,6 +39,32 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    raw = (os.environ.get(name, default) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except Exception:
+        return default
+
 
 def _canonicalize_server_url(raw_url: str) -> str:
     source = (raw_url or "").strip() or "http://127.0.0.1:3001"
@@ -65,11 +92,26 @@ STREAM_LLM_SERVER_LOGS = (
     os.environ.get("WORKERPALS_E2E_STREAM_LLM_LOGS", "0").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+E2E_EVAL_MODE = _env_flag("WORKERPALS_E2E_EVAL", "0")
 SERVER_HEALTH_TIMEOUT_SEC = 60
 WARMUP_TIMEOUT_SEC = 60
-REQUEST_TIMEOUT_SEC = 10 * 60
+REQUEST_TIMEOUT_SEC = _env_int(
+    "WORKERPALS_E2E_REQUEST_TIMEOUT_SEC",
+    12 * 60 if E2E_EVAL_MODE else 10 * 60,
+)
 POLL_INTERVAL_SEC = 0.5
 HTTP_TIMEOUT_SEC = 15
+E2E_EVAL_TOTAL_BUDGET_SEC = _env_float(
+    "WORKERPALS_E2E_MAX_TOTAL_SEC",
+    15 * 60 if E2E_EVAL_MODE else 0.0,
+)
+E2E_EVAL_BACKEND_BUDGET_SEC = _env_float(
+    "WORKERPALS_E2E_MAX_BACKEND_SEC",
+    20 * 60 if E2E_EVAL_MODE else 0.0,
+)
+E2E_EVAL_OUTPUT = (os.environ.get("WORKERPALS_E2E_EVAL_OUTPUT") or "").strip()
+if E2E_EVAL_MODE and not E2E_EVAL_OUTPUT:
+    E2E_EVAL_OUTPUT = str(REPO_ROOT / "outputs" / "workerpals_backend_eval.json")
 LIST_SCAN_LIMIT = max(
     200,
     int((os.environ.get("WORKERPALS_E2E_LIST_SCAN_LIMIT") or "1000").strip() or "1000"),
@@ -86,6 +128,15 @@ REQUEST_PROMPT = os.environ.get(
 CLARIFICATION_RETRY_SUFFIX = (
     "\n\nClarification: apply the requested change to README.md in the repository root. "
     "Do not ask any other follow-up questions."
+)
+E2E_EVAL_SCENARIO_SUITE = (os.environ.get("WORKERPALS_E2E_EVAL_SCENARIO_SUITE") or "real-lite").strip().lower()
+E2E_EVAL_SCENARIOS_FILE = (os.environ.get("WORKERPALS_E2E_SCENARIOS_FILE") or "").strip()
+E2E_EVAL_SCENARIOS_PER_BACKEND = max(
+    1,
+    _env_int("WORKERPALS_E2E_SCENARIOS_PER_BACKEND", 1),
+)
+E2E_EVAL_SCENARIO_STRATEGY = (
+    (os.environ.get("WORKERPALS_E2E_SCENARIO_STRATEGY") or "same").strip().lower()
 )
 
 DEFAULT_SESSION_ID = os.environ.get("PUSHPALS_SESSION_ID", "dev")
@@ -497,6 +548,7 @@ def _docker_image_exists(image: str) -> bool:
 
 
 _DOCKER_IMAGE_MAIN_SHA_LABEL = "pushpals.main_sha"
+_DOCKER_IMAGE_TREE_STATE_LABEL = "pushpals.tree_state"
 
 
 def _git_main_commit_sha() -> str:
@@ -519,6 +571,38 @@ def _git_main_commit_sha() -> str:
             if sha:
                 return sha
     raise RuntimeError("Unable to resolve git commit for main/HEAD when preparing Docker image.")
+
+
+def _git_tree_state_token() -> str:
+    """Fingerprint relevant local workspace changes so Docker image freshness tracks local edits."""
+    paths = [
+        "apps/workerpals",
+        "apps/remotebuddy",
+        "apps/server",
+        "packages/shared",
+        "packages/protocol",
+        "tests/integration",
+        "package.json",
+    ]
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "--", *paths],
+            cwd=str(REPO_ROOT),
+            env=_build_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except Exception:
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    payload = (proc.stdout or "").strip()
+    if not payload:
+        return "clean"
+    digest = hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"dirty-{digest}"
 
 
 def _docker_image_label(image: str, label: str) -> str | None:
@@ -550,24 +634,36 @@ def _docker_image_label(image: str, label: str) -> str | None:
 
 def _ensure_docker_image(image: str) -> None:
     expected_main_sha = _git_main_commit_sha()
+    expected_tree_state = _git_tree_state_token()
     image_exists = _docker_image_exists(image)
     current_label_sha = _docker_image_label(image, _DOCKER_IMAGE_MAIN_SHA_LABEL) if image_exists else None
-    if image_exists and current_label_sha == expected_main_sha:
-        print(f"[NOTICE] Docker image already present and current for main@{expected_main_sha[:12]}: {image}")
+    current_tree_state = _docker_image_label(image, _DOCKER_IMAGE_TREE_STATE_LABEL) if image_exists else None
+    if (
+        image_exists
+        and current_label_sha == expected_main_sha
+        and current_tree_state == expected_tree_state
+    ):
+        suffix = f" ({expected_tree_state})" if expected_tree_state != "clean" else ""
+        print(
+            f"[NOTICE] Docker image already present and current for main@{expected_main_sha[:12]}{suffix}: {image}"
+        )
         return
     if image_exists:
-        if current_label_sha:
+        if current_label_sha or current_tree_state:
             print(
-                "[NOTICE] Docker image exists but is stale for main branch; rebuilding.\n"
+                "[NOTICE] Docker image exists but is stale for workspace state; rebuilding.\n"
                 f"  image={image}\n"
-                f"  image_main_sha={current_label_sha[:12]}\n"
-                f"  expected_main_sha={expected_main_sha[:12]}"
+                f"  image_main_sha={(current_label_sha or '<none>')[:12]}\n"
+                f"  expected_main_sha={expected_main_sha[:12]}\n"
+                f"  image_tree_state={current_tree_state or '<none>'}\n"
+                f"  expected_tree_state={expected_tree_state}"
             )
         else:
             print(
-                "[NOTICE] Docker image exists without main-sha label; rebuilding.\n"
+                "[NOTICE] Docker image exists without freshness labels; rebuilding.\n"
                 f"  image={image}\n"
-                f"  expected_main_sha={expected_main_sha[:12]}"
+                f"  expected_main_sha={expected_main_sha[:12]}\n"
+                f"  expected_tree_state={expected_tree_state}"
             )
     else:
         print(f"[NOTICE] Docker image not found locally; building: {image}")
@@ -581,6 +677,8 @@ def _ensure_docker_image(image: str) -> None:
             image,
             "--label",
             f"{_DOCKER_IMAGE_MAIN_SHA_LABEL}={expected_main_sha}",
+            "--label",
+            f"{_DOCKER_IMAGE_TREE_STATE_LABEL}={expected_tree_state}",
             ".",
         ],
         cwd=str(REPO_ROOT),
@@ -904,6 +1002,471 @@ def _extract_completion_epoch_seconds(completion: dict) -> float | None:
     return None
 
 
+def _normalize_repo_rel(path: object) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    if text.startswith("./"):
+        text = text[2:]
+    return text.strip("/")
+
+
+def _builtin_eval_scenarios() -> list[dict]:
+    return [
+        {
+            "id": "readme_append_marker",
+            "title": "Append marker to README",
+            "prompt": "Append exactly one line 'WorkerPals E2E marker' to README.md and keep all other content unchanged.",
+            "expected_paths": ["README.md"],
+            "must_contain": {"README.md": r"(?m)^WorkerPals E2E marker$"},
+            "max_files_changed": 1,
+            "perf_target_ms": 360000,
+            "difficulty": "easy",
+        },
+        {
+            "id": "prompt_bundle_scoring_and_ideation",
+            "title": "Harden autonomy prompt guidance across two files",
+            "prompt": (
+                "Apply both updates exactly and keep all other content unchanged: "
+                "1) In prompts/remotebuddy/autonomy_scoring_system_prompt.md append the bullet line "
+                "'- Prefer deterministic, evidence-backed scoring rationale with explicit evidence IDs.' "
+                "2) In prompts/remotebuddy/autonomy_ideation_system_prompt.md append the bullet line "
+                "'- Propose ideas only when acceptance criteria are measurable and testable.'"
+            ),
+            "expected_paths": [
+                "prompts/remotebuddy/autonomy_scoring_system_prompt.md",
+                "prompts/remotebuddy/autonomy_ideation_system_prompt.md",
+            ],
+            "must_contain": {
+                "prompts/remotebuddy/autonomy_scoring_system_prompt.md": (
+                    r"(?m)^- Prefer deterministic, evidence-backed scoring rationale with explicit evidence IDs\.$"
+                ),
+                "prompts/remotebuddy/autonomy_ideation_system_prompt.md": (
+                    r"(?m)^- Propose ideas only when acceptance criteria are measurable and testable\.$"
+                ),
+            },
+            "max_files_changed": 2,
+            "perf_target_ms": 540000,
+            "difficulty": "hard",
+        },
+        {
+            "id": "config_and_readme_quality_note",
+            "title": "Add quality-prioritization notes to config and README",
+            "prompt": (
+                "Apply both updates exactly and keep all other content unchanged: "
+                "1) In config/local.example.toml append the comment line "
+                "'# Guardrail: keep autonomy write scope narrow, explicit, and auditable.' "
+                "2) In README.md append the bullet line "
+                "'- Eval benchmarks prioritize correctness and code quality over raw speed.'"
+            ),
+            "expected_paths": ["config/local.example.toml", "README.md"],
+            "must_contain": {
+                "config/local.example.toml": (
+                    r"(?m)^# Guardrail: keep autonomy write scope narrow, explicit, and auditable\.$"
+                ),
+                "README.md": (
+                    r"(?m)^- Eval benchmarks prioritize correctness and code quality over raw speed\.$"
+                ),
+            },
+            "max_files_changed": 2,
+            "perf_target_ms": 600000,
+            "difficulty": "hard",
+        },
+        {
+            "id": "scoring_prompt_add_performance_clause",
+            "title": "Add explicit performance tradeoff guidance",
+            "prompt": (
+                "In prompts/remotebuddy/autonomy_scoring_system_prompt.md append exactly one bullet line "
+                "'- Penalize latency only lightly when correctness and safety are strong.' and keep all other content unchanged."
+            ),
+            "expected_paths": ["prompts/remotebuddy/autonomy_scoring_system_prompt.md"],
+            "must_contain": {
+                "prompts/remotebuddy/autonomy_scoring_system_prompt.md": (
+                    r"(?m)^- Penalize latency only lightly when correctness and safety are strong\.$"
+                ),
+            },
+            "max_files_changed": 1,
+            "perf_target_ms": 480000,
+            "difficulty": "medium",
+        },
+    ]
+
+
+def _load_eval_scenarios_from_file(path: str) -> list[dict]:
+    if not path:
+        return []
+    file_path = Path(path)
+    if not file_path.is_absolute():
+        file_path = REPO_ROOT / file_path
+    if not file_path.exists():
+        print(f"[WARN] Eval scenarios file not found: {file_path}")
+        return []
+    try:
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[WARN] Failed to parse eval scenarios file ({file_path}): {exc}")
+        return []
+    if not isinstance(payload, list):
+        print(f"[WARN] Eval scenarios file must contain a JSON array: {file_path}")
+        return []
+
+    scenarios: list[dict] = []
+    for index, raw in enumerate(payload):
+        if not isinstance(raw, dict):
+            continue
+        scenario_id = str(raw.get("id") or raw.get("instance_id") or f"custom-{index}").strip()
+        prompt = str(raw.get("prompt") or raw.get("problem_statement") or "").strip()
+        if not scenario_id or not prompt:
+            continue
+        expected_paths_raw = raw.get("expected_paths")
+        expected_paths: list[str] = []
+        if isinstance(expected_paths_raw, list):
+            for path_item in expected_paths_raw:
+                normalized = _normalize_repo_rel(path_item)
+                if normalized:
+                    expected_paths.append(normalized)
+        must_contain_raw = raw.get("must_contain")
+        must_contain: dict[str, str] = {}
+        if isinstance(must_contain_raw, dict):
+            for path_key, pattern in must_contain_raw.items():
+                normalized_path = _normalize_repo_rel(path_key)
+                pattern_text = str(pattern or "").strip()
+                if normalized_path and pattern_text:
+                    must_contain[normalized_path] = pattern_text
+        scenarios.append(
+            {
+                "id": scenario_id,
+                "title": str(raw.get("title") or scenario_id),
+                "prompt": prompt,
+                "expected_paths": expected_paths,
+                "must_contain": must_contain,
+                "max_files_changed": int(raw.get("max_files_changed") or 2),
+                "perf_target_ms": int(raw.get("perf_target_ms") or 420000),
+            }
+        )
+    return scenarios
+
+
+def _select_eval_scenarios(
+    all_scenarios: list[dict],
+    backend_index: int,
+    per_backend: int,
+    strategy: str,
+) -> list[dict]:
+    if not all_scenarios:
+        return []
+    count = max(1, min(per_backend, len(all_scenarios)))
+    if strategy == "round_robin":
+        selected: list[dict] = []
+        for offset in range(count):
+            selected.append(all_scenarios[(backend_index + offset) % len(all_scenarios)])
+        return selected
+    return all_scenarios[:count]
+
+
+def _compose_scenario_bundle(scenarios: list[dict]) -> dict | None:
+    valid = [item for item in scenarios if isinstance(item, dict)]
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return dict(valid[0])
+
+    bundle_id = "+".join(str(item.get("id") or "scenario") for item in valid)
+    bundle_title = " + ".join(str(item.get("title") or item.get("id") or "scenario") for item in valid)
+    prompt_lines = []
+    expected_paths: list[str] = []
+    must_contain: dict[str, str] = {}
+    max_files_changed = 0
+    perf_target_ms = 0
+    for idx, item in enumerate(valid, start=1):
+        prompt = str(item.get("prompt") or "").strip()
+        if prompt:
+            prompt_lines.append(f"{idx}. {prompt}")
+        for path in item.get("expected_paths") or []:
+            norm = _normalize_repo_rel(path)
+            if norm and norm not in expected_paths:
+                expected_paths.append(norm)
+        raw_must_contain = item.get("must_contain") or {}
+        if isinstance(raw_must_contain, dict):
+            for key, pattern in raw_must_contain.items():
+                norm_key = _normalize_repo_rel(key)
+                if norm_key and str(pattern or "").strip():
+                    must_contain[norm_key] = str(pattern)
+        max_files_changed += int(item.get("max_files_changed") or 0)
+        perf_target_ms += int(item.get("perf_target_ms") or 0)
+
+    if max_files_changed <= 0:
+        max_files_changed = max(1, len(expected_paths))
+    if perf_target_ms <= 0:
+        perf_target_ms = 600000
+
+    bundle_prompt = (
+        "Complete all of the following repo updates in one request. "
+        "Preserve formatting and keep unrelated content unchanged:\n"
+        + "\n".join(prompt_lines)
+    )
+    return {
+        "id": f"bundle:{bundle_id}",
+        "title": f"Bundled scenario: {bundle_title}",
+        "prompt": bundle_prompt,
+        "expected_paths": expected_paths,
+        "must_contain": must_contain,
+        "max_files_changed": max_files_changed,
+        "perf_target_ms": perf_target_ms,
+        "difficulty": "hard",
+    }
+
+
+def _git_text(repo: Path, args: list[str]) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(repo),
+            env=_build_env(),
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return int(proc.returncode), str(proc.stdout or ""), str(proc.stderr or "")
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def _collect_commit_artifacts(repo: Path, commit_sha: str) -> dict:
+    commit = str(commit_sha or "").strip()
+    if not commit:
+        return {
+            "commit_exists": False,
+            "changed_files": [],
+            "added_lines": [],
+            "patch_text": "",
+            "lines_added": 0,
+            "lines_deleted": 0,
+        }
+
+    rc_files, out_files, _ = _git_text(repo, ["show", "--pretty=format:", "--name-only", commit])
+    if rc_files != 0:
+        return {
+            "commit_exists": False,
+            "changed_files": [],
+            "added_lines": [],
+            "patch_text": "",
+            "lines_added": 0,
+            "lines_deleted": 0,
+        }
+    changed_files = [
+        _normalize_repo_rel(line)
+        for line in out_files.splitlines()
+        if _normalize_repo_rel(line)
+    ]
+
+    rc_num, out_num, _ = _git_text(repo, ["show", "--pretty=format:", "--numstat", commit])
+    lines_added = 0
+    lines_deleted = 0
+    if rc_num == 0:
+        for line in out_num.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                add_raw = parts[0].strip()
+                del_raw = parts[1].strip()
+                add_count = int(add_raw) if add_raw.isdigit() else 0
+                del_count = int(del_raw) if del_raw.isdigit() else 0
+            except Exception:
+                add_count = 0
+                del_count = 0
+            lines_added += add_count
+            lines_deleted += del_count
+
+    rc_patch, out_patch, _ = _git_text(repo, ["show", "--pretty=format:", "--unified=0", commit])
+    patch_text = out_patch if rc_patch == 0 else ""
+    added_lines: list[str] = []
+    for line in patch_text.splitlines():
+        if not line.startswith("+"):
+            continue
+        if line.startswith("+++ "):
+            continue
+        added_lines.append(line[1:])
+
+    return {
+        "commit_exists": True,
+        "changed_files": changed_files,
+        "added_lines": added_lines,
+        "patch_text": patch_text,
+        "lines_added": lines_added,
+        "lines_deleted": lines_deleted,
+    }
+
+
+def _read_file_at_commit(repo: Path, commit_sha: str, repo_rel_path: str) -> str:
+    commit = str(commit_sha or "").strip()
+    path = _normalize_repo_rel(repo_rel_path)
+    if not commit or not path:
+        return ""
+    rc, out, _ = _git_text(repo, ["show", f"{commit}:{path}"])
+    if rc != 0:
+        return ""
+    return out
+
+
+def _score_from_dimensions(dimensions: dict, total_sec: float, clarification_retried: bool) -> float:
+    correctness = float(dimensions.get("correctness") or 0.0)
+    quality = float(dimensions.get("quality") or 0.0)
+    readability = float(dimensions.get("readability") or 0.0)
+    performance = float(dimensions.get("performance") or 0.0)
+    base = (
+        0.55 * correctness
+        + 0.20 * quality
+        + 0.15 * readability
+        + 0.10 * performance
+    )
+    # Keep time impact intentionally tiny; quality/correctness dominate.
+    time_penalty = min(2.0, max(0.0, total_sec - 180.0) * 0.0025)
+    if clarification_retried:
+        time_penalty += 0.75
+    return round(max(0.0, min(100.0, base - time_penalty)), 2)
+
+
+def _evaluate_backend_quality_dimensions(
+    repo: Path,
+    scenario: dict | None,
+    commit_sha: str,
+    backend_total_sec: float,
+    clarification_retried: bool,
+    job_duration_ms: int | None,
+) -> dict:
+    artifacts = _collect_commit_artifacts(repo, commit_sha)
+    changed_files = [str(p) for p in artifacts.get("changed_files", []) if str(p)]
+    added_lines = [str(line) for line in artifacts.get("added_lines", [])]
+    lines_added = int(artifacts.get("lines_added") or 0)
+    lines_deleted = int(artifacts.get("lines_deleted") or 0)
+    total_line_delta = lines_added + lines_deleted
+
+    expected_paths = []
+    must_contain = {}
+    max_files_changed = 2
+    perf_target_ms = 420000
+    if isinstance(scenario, dict):
+        expected_paths = [
+            _normalize_repo_rel(path)
+            for path in (scenario.get("expected_paths") or [])
+            if _normalize_repo_rel(path)
+        ]
+        raw_must_contain = scenario.get("must_contain") or {}
+        if isinstance(raw_must_contain, dict):
+            for key, pattern in raw_must_contain.items():
+                norm_key = _normalize_repo_rel(key)
+                if norm_key and str(pattern or "").strip():
+                    must_contain[norm_key] = str(pattern)
+        max_files_changed = int(scenario.get("max_files_changed") or max_files_changed)
+        perf_target_ms = int(scenario.get("perf_target_ms") or perf_target_ms)
+
+    touched_expected = 0
+    for expected in expected_paths:
+        if expected in changed_files:
+            touched_expected += 1
+    expected_paths_ok = (not expected_paths) or (touched_expected == len(expected_paths))
+
+    must_contain_passed = 0
+    must_contain_failed: list[str] = []
+    for path_key, pattern in must_contain.items():
+        file_content = _read_file_at_commit(repo, commit_sha, path_key)
+        if file_content and re.search(pattern, file_content):
+            must_contain_passed += 1
+        else:
+            must_contain_failed.append(path_key)
+    must_contain_ok = (not must_contain) or (must_contain_passed == len(must_contain))
+
+    unexpected_files = [
+        path for path in changed_files if expected_paths and path not in set(expected_paths)
+    ]
+    unexpected_count = len(unexpected_files)
+
+    correctness = 0.0
+    if bool(artifacts.get("commit_exists")):
+        correctness += 30.0
+    if expected_paths_ok:
+        correctness += 30.0
+    else:
+        coverage_ratio = (
+            (float(touched_expected) / float(max(1, len(expected_paths)))) if expected_paths else 0.0
+        )
+        correctness += 30.0 * coverage_ratio
+    if must_contain_ok:
+        correctness += 25.0
+    else:
+        regex_ratio = (
+            (float(must_contain_passed) / float(max(1, len(must_contain))))
+            if must_contain
+            else 0.0
+        )
+        correctness += 25.0 * regex_ratio
+    if unexpected_count == 0:
+        correctness += 15.0
+    correctness = round(max(0.0, min(100.0, correctness)), 2)
+
+    quality = 100.0
+    if unexpected_count > 0:
+        quality -= min(60.0, unexpected_count * 20.0)
+    if len(changed_files) > max_files_changed:
+        quality -= min(25.0, (len(changed_files) - max_files_changed) * 10.0)
+    if total_line_delta > 80:
+        quality -= min(20.0, (total_line_delta - 80) * 0.35)
+    quality = round(max(0.0, min(100.0, quality)), 2)
+
+    trailing_ws = 0
+    long_lines = 0
+    tab_lines = 0
+    for line in added_lines:
+        if line.rstrip(" \t") != line:
+            trailing_ws += 1
+        if len(line) > 120:
+            long_lines += 1
+        if "\t" in line:
+            tab_lines += 1
+
+    readability = 100.0
+    readability -= min(30.0, trailing_ws * 10.0)
+    readability -= min(30.0, long_lines * 2.5)
+    readability -= min(20.0, tab_lines * 1.5)
+    readability = round(max(0.0, min(100.0, readability)), 2)
+
+    if job_duration_ms is None:
+        performance = 60.0
+    else:
+        ratio = float(job_duration_ms) / float(max(1, perf_target_ms))
+        if ratio <= 1.0:
+            performance = 100.0
+        elif ratio <= 2.0:
+            performance = 100.0 - (ratio - 1.0) * 40.0
+        else:
+            performance = max(20.0, 60.0 - (ratio - 2.0) * 20.0)
+    performance = round(max(0.0, min(100.0, performance)), 2)
+
+    dimensions = {
+        "correctness": correctness,
+        "quality": quality,
+        "readability": readability,
+        "performance": performance,
+    }
+    final_score = _score_from_dimensions(
+        dimensions=dimensions,
+        total_sec=backend_total_sec,
+        clarification_retried=clarification_retried,
+    )
+    return {
+        "dimensions": dimensions,
+        "score": final_score,
+        "changed_files": changed_files,
+        "unexpected_files": unexpected_files,
+        "must_contain_failed": must_contain_failed,
+        "line_delta": {"added": lines_added, "deleted": lines_deleted},
+    }
+
+
 def _extract_job_epoch_seconds(job: dict) -> float | None:
     for key in ("enqueuedAt", "createdAt", "updatedAt", "claimedAt", "startedAt"):
         parsed = _parse_timestamp_to_epoch_seconds(job.get(key))
@@ -994,6 +1557,208 @@ def _completion_matches_request(
     enqueue_epoch = _mono_to_epoch_seconds(enqueue_monotonic)
     # Allow slight skew for second-precision timestamps and clock drift.
     return completion_epoch >= (enqueue_epoch - 2.0)
+
+
+def _to_int_or_none(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value))
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(round(float(text)))
+    except Exception:
+        return None
+
+
+def _duration_ms_between(start_value: object, end_value: object) -> int | None:
+    start_epoch = _parse_timestamp_to_epoch_seconds(start_value)
+    end_epoch = _parse_timestamp_to_epoch_seconds(end_value)
+    if start_epoch is None or end_epoch is None:
+        return None
+    return max(0, int(round((end_epoch - start_epoch) * 1000.0)))
+
+
+def _extract_request_eval_metrics(request_obj: dict | None) -> dict:
+    if not isinstance(request_obj, dict):
+        return {
+            "request_queue_wait_ms": None,
+            "request_duration_ms": None,
+            "request_claim_to_complete_ms": None,
+        }
+    queue_wait = _duration_ms_between(request_obj.get("enqueuedAt"), request_obj.get("claimedAt"))
+    request_duration = _to_int_or_none(request_obj.get("durationMs"))
+    if request_duration is None:
+        request_duration = _duration_ms_between(
+            request_obj.get("enqueuedAt"),
+            request_obj.get("completedAt") or request_obj.get("failedAt"),
+        )
+    claim_to_complete = _duration_ms_between(
+        request_obj.get("claimedAt"),
+        request_obj.get("completedAt") or request_obj.get("failedAt"),
+    )
+    return {
+        "request_queue_wait_ms": queue_wait,
+        "request_duration_ms": request_duration,
+        "request_claim_to_complete_ms": claim_to_complete,
+    }
+
+
+def _extract_job_eval_metrics(job_obj: dict | None) -> dict:
+    if not isinstance(job_obj, dict):
+        return {
+            "job_duration_ms": None,
+            "job_queue_wait_ms": None,
+            "job_claim_to_finish_ms": None,
+        }
+    job_duration = _to_int_or_none(job_obj.get("durationMs"))
+    if job_duration is None:
+        job_duration = _duration_ms_between(
+            job_obj.get("enqueuedAt"),
+            job_obj.get("completedAt") or job_obj.get("failedAt"),
+        )
+    job_queue_wait = _duration_ms_between(job_obj.get("enqueuedAt"), job_obj.get("claimedAt"))
+    claim_to_finish = _duration_ms_between(
+        job_obj.get("claimedAt"),
+        job_obj.get("completedAt") or job_obj.get("failedAt"),
+    )
+    return {
+        "job_duration_ms": job_duration,
+        "job_queue_wait_ms": job_queue_wait,
+        "job_claim_to_finish_ms": claim_to_finish,
+    }
+
+
+def _completion_planned_scope_is_root(completion: dict | None) -> bool:
+    if not isinstance(completion, dict):
+        return False
+    pr_body = str(completion.get("prBody") or "")
+    if not pr_body:
+        return False
+    pattern = r"### Planned Scope\s*[\r\n]+[\s\S]*?-\s*`\.`"
+    return re.search(pattern, pr_body) is not None
+
+
+def _score_backend_eval_row(row: dict) -> float:
+    if str(row.get("status") or "").strip().lower() != "passed":
+        return 0.0
+    dimensions = row.get("dimensions")
+    if isinstance(dimensions, dict):
+        return _score_from_dimensions(
+            dimensions=dimensions,
+            total_sec=float(row.get("backend_total_sec") or 0.0),
+            clarification_retried=bool(row.get("clarification_retried")),
+        )
+    # Fallback for older rows without dimension fields.
+    checks = row.get("checks")
+    if not isinstance(checks, dict):
+        checks = {}
+    correctness = 100.0 if bool(checks.get("completion_has_commit_sha")) else 60.0
+    quality = 100.0 if bool(checks.get("completion_has_pr_metadata")) else 70.0
+    readability = 95.0 if not bool(checks.get("planned_scope_root_dot")) else 75.0
+    performance = 100.0 if bool(checks.get("job_duration_known")) else 60.0
+    return _score_from_dimensions(
+        dimensions={
+            "correctness": correctness,
+            "quality": quality,
+            "readability": readability,
+            "performance": performance,
+        },
+        total_sec=float(row.get("backend_total_sec") or 0.0),
+        clarification_retried=bool(row.get("clarification_retried")),
+    )
+
+
+def _emit_eval_summary(
+    results: list[dict],
+    total_runtime_sec: float,
+    output_path: str,
+    total_budget_sec: float,
+) -> dict:
+    attempted = len(results)
+    passed = [r for r in results if str(r.get("status") or "").lower() == "passed"]
+    failed = [r for r in results if str(r.get("status") or "").lower() != "passed"]
+    within_budget = total_budget_sec <= 0 or total_runtime_sec <= total_budget_sec
+    avg_score = round(
+        sum(float(r.get("score") or 0.0) for r in results) / float(max(1, attempted)),
+        2,
+    )
+    summary = {
+        "mode": "backend_eval",
+        "attempted_backends": attempted,
+        "passed_backends": len(passed),
+        "failed_backends": len(failed),
+        "all_passed": len(failed) == 0 and attempted > 0,
+        "total_runtime_sec": round(total_runtime_sec, 3),
+        "budget_sec": total_budget_sec,
+        "within_budget": within_budget,
+        "average_score": avg_score,
+        "results": sorted(
+            results,
+            key=lambda r: (
+                -float(r.get("score") or 0.0),
+                float(r.get("backend_total_sec") or 0.0),
+                str(r.get("backend") or ""),
+            ),
+        ),
+    }
+
+    print("\n==============================")
+    print("BACKEND EVAL SUMMARY")
+    print("==============================")
+    print(
+        "attempted={attempted} passed={passed} failed={failed} avg_score={avg_score} "
+        "total={total} budget={budget} backend_budget={backend_budget} within_budget={within_budget}".format(
+            attempted=summary["attempted_backends"],
+            passed=summary["passed_backends"],
+            failed=summary["failed_backends"],
+            avg_score=summary["average_score"],
+            total=_fmt_elapsed(total_runtime_sec),
+            budget=_fmt_elapsed(total_budget_sec) if total_budget_sec > 0 else "unbounded",
+            backend_budget=_fmt_elapsed(E2E_EVAL_BACKEND_BUDGET_SEC)
+            if E2E_EVAL_BACKEND_BUDGET_SEC > 0
+            else "unbounded",
+            within_budget=summary["within_budget"],
+        )
+    )
+    for row in summary["results"]:
+        dims = row.get("dimensions")
+        if not isinstance(dims, dict):
+            dims = {}
+        print(
+            "- {backend}/{scenario}: status={status} score={score} total={total} warmup={warmup} "
+            "phase_b={phase_b} request_ms={request_ms} job_ms={job_ms} "
+            "corr={corr} qual={qual} read={read} perf={perf}".format(
+                backend=row.get("backend"),
+                scenario=row.get("scenario_id") or "default",
+                status=row.get("status"),
+                score=row.get("score"),
+                total=_fmt_elapsed(float(row.get("backend_total_sec") or 0.0)),
+                warmup=_fmt_elapsed(float(row.get("warmup_sec") or 0.0)),
+                phase_b=_fmt_elapsed(float(row.get("phase_b_sec") or 0.0)),
+                request_ms=row.get("request_duration_ms"),
+                job_ms=row.get("job_duration_ms"),
+                corr=dims.get("correctness"),
+                qual=dims.get("quality"),
+                read=dims.get("readability"),
+                perf=dims.get("performance"),
+            )
+        )
+
+    if output_path:
+        try:
+            out_path = Path(output_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            print(f"[NOTICE] Wrote backend eval summary JSON: {out_path}")
+        except Exception as exc:
+            print(f"[WARN] Failed to write backend eval summary JSON: {exc}")
+
+    return summary
 
 
 def list_workers(ttl_ms: int = 30000) -> list[dict]:
@@ -1520,6 +2285,7 @@ def main():
     lms_model_log_proc = None
     isolated_worker_repo_root: Path | None = None
     failures: list[str] = []
+    backend_eval_results: list[dict] = []
 
     if E2E_ISOLATE_WORKER_REPO:
         repo, isolated_worker_repo_root = _create_isolated_worker_repo(REPO_ROOT)
@@ -1631,16 +2397,103 @@ def main():
                 )
             print(f"[NOTICE] Restricting backends via WORKERPALS_E2E_BACKENDS: {filtered_backends}")
             backends_to_try = filtered_backends
+
+        eval_scenarios: list[dict] = []
+        if E2E_EVAL_MODE:
+            if E2E_EVAL_SCENARIOS_FILE:
+                eval_scenarios = _load_eval_scenarios_from_file(E2E_EVAL_SCENARIOS_FILE)
+            if not eval_scenarios:
+                builtin = _builtin_eval_scenarios()
+                if E2E_EVAL_SCENARIO_SUITE == "quick":
+                    eval_scenarios = builtin[:1]
+                elif E2E_EVAL_SCENARIO_SUITE == "real-lite":
+                    eval_scenarios = [
+                        item for item in builtin if str(item.get("difficulty") or "").lower() in {"medium", "hard"}
+                    ] or builtin
+                elif E2E_EVAL_SCENARIO_SUITE in {"real-hard", "hard"}:
+                    eval_scenarios = [
+                        item for item in builtin if str(item.get("difficulty") or "").lower() == "hard"
+                    ] or builtin
+                elif E2E_EVAL_SCENARIO_SUITE in {"real", "default"}:
+                    eval_scenarios = builtin
+                else:
+                    eval_scenarios = builtin
+            print(
+                "[NOTICE] Eval scenarios loaded: "
+                f"{[str(item.get('id')) for item in eval_scenarios]} "
+                f"(suite={E2E_EVAL_SCENARIO_SUITE}, per_backend={E2E_EVAL_SCENARIOS_PER_BACKEND}, "
+                f"strategy={E2E_EVAL_SCENARIO_STRATEGY})"
+            )
         attempted = 0
 
         for backend in backends_to_try:
+            if E2E_EVAL_TOTAL_BUDGET_SEC > 0:
+                elapsed_total = _now() - total_started_at
+                if elapsed_total >= E2E_EVAL_TOTAL_BUDGET_SEC:
+                    failures.append(
+                        "overall: runtime budget exceeded before backend start "
+                        f"(elapsed={_fmt_elapsed(elapsed_total)} budget={_fmt_elapsed(E2E_EVAL_TOTAL_BUDGET_SEC)})"
+                    )
+                    print(
+                        "[FAIL] Skipping remaining backends due to runtime budget exhaustion "
+                        f"(elapsed={_fmt_elapsed(elapsed_total)} budget={_fmt_elapsed(E2E_EVAL_TOTAL_BUDGET_SEC)})"
+                    )
+                    break
+
             backend_started_at = _now()
             attempted += 1
+            worker_id = f"e2e-{backend}-{uuid4().hex[:10]}"
+            selected_scenarios = _select_eval_scenarios(
+                all_scenarios=eval_scenarios,
+                backend_index=attempted - 1,
+                per_backend=E2E_EVAL_SCENARIOS_PER_BACKEND,
+                strategy=E2E_EVAL_SCENARIO_STRATEGY,
+            )
+            active_scenario = _compose_scenario_bundle(selected_scenarios)
+            request_prompt = (
+                str(active_scenario.get("prompt") or REQUEST_PROMPT)
+                if isinstance(active_scenario, dict)
+                else REQUEST_PROMPT
+            )
+
             print("\n==============================")
             print(f"RUNNING BACKEND: {backend}")
             print("==============================\n")
+            if isinstance(active_scenario, dict):
+                print(
+                    "[NOTICE] Active eval scenario: "
+                    f"{active_scenario.get('id')} - {active_scenario.get('title')}"
+                )
 
-            worker_id = f"e2e-{backend}-{uuid4().hex[:10]}"
+            backend_eval: dict = {
+                "backend": backend,
+                "worker_id": worker_id,
+                "scenario_id": (active_scenario or {}).get("id") if isinstance(active_scenario, dict) else None,
+                "scenario_title": (active_scenario or {}).get("title") if isinstance(active_scenario, dict) else None,
+                "prompt_excerpt": _one_line(request_prompt, 180),
+                "status": "failed",
+                "error": None,
+                "request_id": None,
+                "job_id": None,
+                "completion_id": None,
+                "clarification_retried": False,
+                "warmup_sec": None,
+                "phase_b_sec": None,
+                "backend_total_sec": None,
+                "request_queue_wait_ms": None,
+                "request_duration_ms": None,
+                "request_claim_to_complete_ms": None,
+                "job_duration_ms": None,
+                "job_queue_wait_ms": None,
+                "job_claim_to_finish_ms": None,
+                "dimensions": {},
+                "quality_evidence": {},
+                "checks": {},
+                "score": 0.0,
+            }
+            warmup_started_at: float | None = None
+            phase_b_started_at: float | None = None
+
             worker_env = {
                 "WORKERPALS_EXECUTOR": backend,
                 "WORKERPALS_DEBUG": E2E_WORKERPALS_DEBUG,
@@ -1704,7 +2557,7 @@ def main():
                         _debug(f"online_workers={online}")
 
                 warmup_started_at = _now()
-                print(f"Server healthy — enqueueing warmup job ({backend})")
+                print(f"Server healthy â€” enqueueing warmup job ({backend})")
                 warmup_body = {
                     "taskId": f"test-workerpal-e2e-warmup-{backend}-{worker_id}",
                     "sessionId": run_session_id,
@@ -1724,6 +2577,22 @@ def main():
                 warmup_ticker.start()
                 try:
                     while _mono_now() < deadline:
+                        if (
+                            E2E_EVAL_BACKEND_BUDGET_SEC > 0
+                            and (_now() - backend_started_at) >= E2E_EVAL_BACKEND_BUDGET_SEC
+                        ):
+                            raise RuntimeError(
+                                "Per-backend eval budget exceeded during warmup "
+                                f"(budget={_fmt_elapsed(E2E_EVAL_BACKEND_BUDGET_SEC)})"
+                            )
+                        if (
+                            E2E_EVAL_TOTAL_BUDGET_SEC > 0
+                            and (_now() - total_started_at) >= E2E_EVAL_TOTAL_BUDGET_SEC
+                        ):
+                            raise RuntimeError(
+                                "Global eval budget exceeded during warmup "
+                                f"(budget={_fmt_elapsed(E2E_EVAL_TOTAL_BUDGET_SEC)})"
+                            )
                         if server_proc:
                             assert_proc_alive(server_proc, "server")
                         assert_proc_alive(remotebuddy_proc, "remotebuddy")
@@ -1746,6 +2615,7 @@ def main():
                         raise RuntimeError(f"Warmup job did not complete in time ({backend})")
                 finally:
                     warmup_ticker.stop()
+                backend_eval["warmup_sec"] = round(_now() - warmup_started_at, 3)
 
                 print("\n==============================")
                 print(f"PHASE B: REMOTEBUDDY REQUEST -> COMPLETION INTERCEPT ({backend})")
@@ -1765,12 +2635,12 @@ def main():
 
                 request_body = {
                     "sessionId": run_session_id,
-                    "prompt": REQUEST_PROMPT,
+                    "prompt": request_prompt,
                     "priority": "normal",
                     "forceWorker": True,
                     "forceLane": "worker",
                 }
-                print(f"Enqueueing request: {REQUEST_PROMPT!r}")
+                print(f"Enqueueing request: {request_prompt!r}")
                 request_enqueue_monotonic = _mono_now()
                 enq_req = http_post("/requests/enqueue", request_body)
                 request_id = enq_req.get("requestId")
@@ -1790,6 +2660,22 @@ def main():
 
                 try:
                     while _mono_now() < deadline:
+                        if (
+                            E2E_EVAL_BACKEND_BUDGET_SEC > 0
+                            and (_now() - backend_started_at) >= E2E_EVAL_BACKEND_BUDGET_SEC
+                        ):
+                            raise RuntimeError(
+                                "Per-backend eval budget exceeded during request/completion phase "
+                                f"(budget={_fmt_elapsed(E2E_EVAL_BACKEND_BUDGET_SEC)})"
+                            )
+                        if (
+                            E2E_EVAL_TOTAL_BUDGET_SEC > 0
+                            and (_now() - total_started_at) >= E2E_EVAL_TOTAL_BUDGET_SEC
+                        ):
+                            raise RuntimeError(
+                                "Global eval budget exceeded during request/completion phase "
+                                f"(budget={_fmt_elapsed(E2E_EVAL_TOTAL_BUDGET_SEC)})"
+                            )
                         if server_proc:
                             assert_proc_alive(server_proc, "server")
                         assert_proc_alive(remotebuddy_proc, "remotebuddy")
@@ -1804,7 +2690,7 @@ def main():
                             if req_status == "failed":
                                 if (not clarification_retried) and _request_failed_due_to_clarification(req):
                                     clarification_retried = True
-                                    clarification_prompt = REQUEST_PROMPT + CLARIFICATION_RETRY_SUFFIX
+                                    clarification_prompt = request_prompt + CLARIFICATION_RETRY_SUFFIX
                                     retry_body = {
                                         "sessionId": run_session_id,
                                         "prompt": clarification_prompt,
@@ -1919,11 +2805,74 @@ def main():
                 print(json.dumps(intercepted_completion, indent=2, ensure_ascii=False))
                 print(f"[OK] Backend {backend} produced a completion enqueue payload.")
                 _print_duration(f"{backend} phase B completion intercept", phase_b_started_at)
+                backend_eval["phase_b_sec"] = round(_now() - phase_b_started_at, 3)
+                backend_eval["status"] = "passed"
+                backend_eval["clarification_retried"] = clarification_retried
+                backend_eval["request_id"] = str(request_id)
+                backend_eval["completion_id"] = str(intercepted_completion.get("id") or "")
+
+                completion_job_id = str(intercepted_completion.get("jobId") or "")
+                backend_eval["job_id"] = completion_job_id or None
+                completion_commit_sha = str(intercepted_completion.get("commitSha") or "")
+                completion_pr_title = str(intercepted_completion.get("prTitle") or "")
+                completion_pr_body = str(intercepted_completion.get("prBody") or "")
+
+                request_snapshot = get_request(str(request_id))
+                backend_eval.update(_extract_request_eval_metrics(request_snapshot))
+                job_snapshot = get_job(completion_job_id) if completion_job_id else None
+                backend_eval.update(_extract_job_eval_metrics(job_snapshot))
+
+                quality_eval = _evaluate_backend_quality_dimensions(
+                    repo=Path(repo),
+                    scenario=active_scenario if isinstance(active_scenario, dict) else None,
+                    commit_sha=completion_commit_sha,
+                    backend_total_sec=float(_now() - backend_started_at),
+                    clarification_retried=clarification_retried,
+                    job_duration_ms=backend_eval.get("job_duration_ms"),
+                )
+                backend_eval["dimensions"] = quality_eval.get("dimensions", {})
+                backend_eval["quality_evidence"] = {
+                    "changed_files": quality_eval.get("changed_files", []),
+                    "unexpected_files": quality_eval.get("unexpected_files", []),
+                    "must_contain_failed": quality_eval.get("must_contain_failed", []),
+                    "line_delta": quality_eval.get("line_delta", {}),
+                }
+                backend_eval["score"] = quality_eval.get("score", 0.0)
+
+                checks = {
+                    "completion_has_commit_sha": bool(completion_commit_sha),
+                    "completion_has_pr_metadata": bool(completion_pr_title and completion_pr_body),
+                    "planned_scope_root_dot": _completion_planned_scope_is_root(intercepted_completion),
+                    "job_duration_known": backend_eval.get("job_duration_ms") is not None,
+                }
+                backend_eval["checks"] = checks
 
             except Exception as backend_exc:
                 failures.append(f"{backend}: {backend_exc}")
                 print(f"[FAIL] Backend {backend}: {backend_exc}")
+                backend_eval["status"] = "failed"
+                backend_eval["error"] = str(backend_exc)
             finally:
+                backend_eval["backend_total_sec"] = round(_now() - backend_started_at, 3)
+                if (
+                    E2E_EVAL_BACKEND_BUDGET_SEC > 0
+                    and float(backend_eval.get("backend_total_sec") or 0.0) > E2E_EVAL_BACKEND_BUDGET_SEC
+                ):
+                    budget_message = (
+                        f"{backend}: exceeded per-backend budget "
+                        f"(total={_fmt_elapsed(float(backend_eval.get('backend_total_sec') or 0.0))} "
+                        f"budget={_fmt_elapsed(E2E_EVAL_BACKEND_BUDGET_SEC)})"
+                    )
+                    if budget_message not in failures:
+                        failures.append(budget_message)
+                    backend_eval["status"] = "failed"
+                    backend_eval["error"] = str(backend_eval.get("error") or budget_message)
+                if backend_eval.get("warmup_sec") is None and warmup_started_at is not None:
+                    backend_eval["warmup_sec"] = round(max(0.0, _now() - warmup_started_at), 3)
+                if backend_eval.get("phase_b_sec") is None and phase_b_started_at is not None:
+                    backend_eval["phase_b_sec"] = round(max(0.0, _now() - phase_b_started_at), 3)
+                backend_eval["score"] = _score_backend_eval_row(backend_eval)
+                backend_eval_results.append(backend_eval)
                 _print_duration(f"{backend} total runtime", backend_started_at)
                 if worker_proc and started_worker:
                     kill_proc_tree(worker_proc)
@@ -1936,10 +2885,22 @@ def main():
 
         if attempted == 0:
             raise RuntimeError("No executor backends were attempted. Install OpenHands or configure mini-swe.")
+        eval_summary = _emit_eval_summary(
+            backend_eval_results,
+            total_runtime_sec=_now() - total_started_at,
+            output_path=E2E_EVAL_OUTPUT,
+            total_budget_sec=E2E_EVAL_TOTAL_BUDGET_SEC,
+        )
+        if E2E_EVAL_MODE and not bool(eval_summary.get("within_budget")):
+            failures.append(
+                "overall: runtime budget exceeded "
+                f"(total={_fmt_elapsed(float(eval_summary.get('total_runtime_sec') or 0.0))} "
+                f"budget={_fmt_elapsed(E2E_EVAL_TOTAL_BUDGET_SEC)})"
+            )
         if failures:
             raise RuntimeError("One or more backend runs failed:\n- " + "\n- ".join(failures))
 
-        print("Done — PushPals E2E intercepted completion enqueue payload(s)")
+        print("Done - PushPals E2E intercepted completion enqueue payload(s)")
         _print_duration("overall test runtime", total_started_at)
     finally:
         cleanup()
@@ -1962,3 +2923,4 @@ if __name__ == "__main__":
     except Exception as e:
         print("Error:", e)
         sys.exit(1)
+

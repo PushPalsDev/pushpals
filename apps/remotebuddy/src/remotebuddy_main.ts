@@ -25,6 +25,7 @@ import {
   CommunicationManager,
   detectRepoRoot,
   loadPushPalsConfig,
+  matchesGlob,
   normalizeTargetPath,
   normalizeWriteGlob,
 } from "shared";
@@ -283,6 +284,49 @@ function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata |
     targetPaths: normalizeMetadataTargetPaths(payload.targetPaths ?? payload.target_paths),
     writeGlobs: normalizeMetadataWriteGlobs(payload.writeGlobs ?? payload.write_globs),
   };
+}
+
+function ensureWriteGlobsCoverTargetPaths(
+  targetPaths: string[],
+  writeGlobs: string[] | undefined,
+): {
+  normalizedWriteGlobs: string[];
+  uncoveredTargets: string[];
+  addedGlobs: string[];
+} {
+  const normalizedTargets = targetPaths
+    .map((entry) => normalizeTargetPath(entry))
+    .filter((entry): entry is string => Boolean(entry));
+  const normalizedWriteGlobs = normalizeMetadataWriteGlobs(writeGlobs ?? []);
+  const uncoveredTargets = normalizedTargets.filter(
+    (targetPath) => !normalizedWriteGlobs.some((glob) => matchesGlob(targetPath, glob)),
+  );
+  if (uncoveredTargets.length === 0) {
+    return { normalizedWriteGlobs, uncoveredTargets: [], addedGlobs: [] };
+  }
+
+  const addedGlobs: string[] = [];
+  const seen = new Set<string>(normalizedWriteGlobs.map((entry) => entry.toLowerCase()));
+  for (const targetPath of uncoveredTargets) {
+    const exact = normalizeWriteGlob(targetPath);
+    if (exact && !seen.has(exact.toLowerCase())) {
+      seen.add(exact.toLowerCase());
+      normalizedWriteGlobs.push(exact);
+      addedGlobs.push(exact);
+    }
+    const tail = targetPath.split("/").pop() ?? targetPath;
+    const looksDirectory = !tail.includes(".");
+    if (looksDirectory) {
+      const recursive = normalizeWriteGlob(`${targetPath}/**`);
+      if (recursive && !seen.has(recursive.toLowerCase())) {
+        seen.add(recursive.toLowerCase());
+        normalizedWriteGlobs.push(recursive);
+        addedGlobs.push(recursive);
+      }
+    }
+  }
+
+  return { normalizedWriteGlobs, uncoveredTargets, addedGlobs };
 }
 
 function buildExecutionGuidance(plan: PlannerOutput): string {
@@ -1224,6 +1268,30 @@ class RemoteBuddyOrchestrator {
       console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
       // when forcing worker, don't fail on "planner contract incomplete" — fill safe defaults.
       if (requiresWorker) {
+        const scopeCoverage = ensureWriteGlobsCoverTargetPaths(targetPaths, plan.scope.write_globs);
+        if (scopeCoverage.normalizedWriteGlobs.length > 0) {
+          plan.scope.write_globs = scopeCoverage.normalizedWriteGlobs;
+        }
+        if (scopeCoverage.addedGlobs.length > 0) {
+          console.warn(
+            `[RemoteBuddy] Planner write_globs did not cover target paths. Added scope globs: ${scopeCoverage.addedGlobs.join(
+              ", ",
+            )}`,
+          );
+        }
+        if (forceWorker) {
+          const concreteTargetCount = targetPaths.filter((entry) => entry && entry !== ".").length;
+          if (concreteTargetCount > 0) {
+            const currentMax =
+              Number.isFinite(Number(plan.scope.max_files_to_edit)) &&
+              Number(plan.scope.max_files_to_edit) > 0
+                ? Math.floor(Number(plan.scope.max_files_to_edit))
+                : 0;
+            if (currentMax < concreteTargetCount) {
+              plan.scope.max_files_to_edit = concreteTargetCount;
+            }
+          }
+        }
         if (autonomyMetadata && (!plan.scope.write_globs || plan.scope.write_globs.length === 0)) {
           throw new Error(
             "Autonomy-origin request requires non-empty planning.scope.write_globs before task dispatch.",
