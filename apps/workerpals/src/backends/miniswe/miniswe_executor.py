@@ -620,11 +620,35 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
+    def _normalize_common_json_typos(src: str) -> str:
+        """
+        Repair a few common, low-risk key/value separator typos in model output.
+
+        Example:
+          {"line','foo"} -> {"line":'foo"}
+          {"line","foo"} -> {"line":"foo"}
+        """
+        fixed = src
+        # Key was opened with double-quote but closed with single-quote before comma.
+        fixed = re.sub(
+            r'([{\s,])"([A-Za-z_][A-Za-z0-9_]*)\'\s*,\s*(["\'])',
+            r'\1"\2": \3',
+            fixed,
+        )
+        # Key is correctly quoted but comma used instead of colon.
+        fixed = re.sub(
+            r'([{\s,])"([A-Za-z_][A-Za-z0-9_]*)"\s*,\s*(["\'])',
+            r'\1"\2": \3',
+            fixed,
+        )
+        return fixed
+
     def _try_relaxed_json_parse(src: str) -> Optional[Dict[str, Any]]:
         # Common model drift: single-quoted strings, trailing commas, Python booleans.
         working = src.strip()
         if not working:
             return None
+        working = _normalize_common_json_typos(working)
         # Convert single-quoted literals to JSON double-quoted strings when possible.
         working = re.sub(
             r"'([^'\\]*(?:\\.[^'\\]*)*)'",
