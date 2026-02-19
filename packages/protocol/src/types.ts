@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION } from "./version.js";
+import { PROTOCOL_VERSION } from "./version";
 
 // ─── Artifact type (reused across several payloads) ─────────────────────────
 export interface Artifact {

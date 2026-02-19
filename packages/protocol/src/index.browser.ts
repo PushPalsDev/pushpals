@@ -1,4 +1,4 @@
-export { PROTOCOL_VERSION } from "./version.js";
+export { PROTOCOL_VERSION } from "./version";
 export type {
   Artifact,
   EventEnvelope,
@@ -13,7 +13,7 @@ export type {
   ApprovalDecisionResponse,
   CommandRequest,
   CommandResponse,
-} from "./types.js";
+} from "./types";
 export {
   validateEventEnvelope,
   validateMessageRequest,
