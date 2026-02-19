@@ -329,15 +329,17 @@ function ensureWriteGlobsCoverTargetPaths(
   return { normalizedWriteGlobs, uncoveredTargets, addedGlobs };
 }
 
-function buildExecutionGuidance(plan: PlannerOutput): string {
+function buildExecutionGuidance(plan: PlannerOutput, targetPaths: string[]): string {
   const lines: string[] = [];
-  const targets = normalizePathHints([
-    ...(plan.scope.write_globs ?? []),
-    ...(plan.discovery?.likely_dirs ?? []),
-  ]);
+  const targets = normalizePathHints(
+    targetPaths.length > 0 ? targetPaths : (plan.scope.write_globs ?? []),
+  );
   if (targets.length > 0) {
     lines.push("Target paths:");
     for (const path of targets) lines.push(`- ${path}`);
+    lines.push("Path handling:");
+    lines.push("- Treat all target paths as repo-relative to the current working directory.");
+    lines.push("- Do not prepend a leading slash to target paths.");
   }
   lines.push("Scope:");
   lines.push(`- read_anywhere: ${plan.scope.read_anywhere ? "true" : "false"}`);
@@ -1339,7 +1341,7 @@ class RemoteBuddyOrchestrator {
 
       const canonicalInstruction = prompt.trim();
       const rawPlannerInstruction = String(plan.worker_instruction ?? "").trim();
-      const executionGuidance = buildExecutionGuidance(plan);
+      const executionGuidance = buildExecutionGuidance(plan, targetPaths);
       const plannerWorkerInstruction = [rawPlannerInstruction, executionGuidance]
         .filter(Boolean)
         .join("\n\n")

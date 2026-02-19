@@ -191,10 +191,50 @@ async function runShellValidationCommand(
   };
 }
 
+function stripAnsiControlSequences(value: string): string {
+  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
 function parseChangedPathsFromStatus(statusOutput: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const line of statusOutput.split(/\r?\n/)) {
+  const addPath = (rawPath: string) => {
+    let path = rawPath;
+    if (path.includes(" -> ")) {
+      path = path.split(" -> ", 2)[1] ?? path;
+    }
+    path = path.trim();
+    if (!path || seen.has(path)) return;
+    seen.add(path);
+    out.push(path);
+  };
+
+  const normalizedOutput = stripAnsiControlSequences(statusOutput);
+  if (normalizedOutput.includes("\u0000")) {
+    const entries = normalizedOutput.split("\u0000");
+    for (let i = 0; i < entries.length; i++) {
+      const raw = (entries[i] ?? "").replace(/\r$/, "");
+      if (!raw.trim()) continue;
+      const porcelain = raw.match(/^(.{2}) (.*)$/);
+      if (!porcelain) {
+        addPath(raw);
+        continue;
+      }
+      const status = porcelain[1] ?? "";
+      let path = porcelain[2] ?? "";
+      if ((status.includes("R") || status.includes("C")) && i + 1 < entries.length) {
+        const renamedTo = entries[i + 1] ?? "";
+        if (renamedTo) {
+          path = renamedTo;
+          i += 1;
+        }
+      }
+      addPath(path);
+    }
+    return out;
+  }
+
+  for (const line of normalizedOutput.split(/\r?\n/)) {
     const raw = line.replace(/\r$/, "");
     if (!raw.trim()) continue;
     // git status --porcelain output is "<XY><space><path>".
@@ -205,16 +245,14 @@ function parseChangedPathsFromStatus(statusOutput: string): string[] {
       path = porcelain[1];
     } else {
       const degraded = raw.match(/^. (.+)$/);
-      if (degraded?.[1]) path = degraded[1];
-      else path = raw;
+      if (degraded?.[1]) {
+        path = degraded[1];
+      } else {
+        const loose = raw.match(/^[A-Z?]{1,2}\s+(.+)$/i);
+        path = loose?.[1] ?? raw;
+      }
     }
-    if (path.includes(" -> ")) {
-      path = path.split(" -> ", 2)[1] ?? path;
-    }
-    path = path.trim();
-    if (!path || seen.has(path)) continue;
-    seen.add(path);
-    out.push(path);
+    addPath(path);
   }
   return out;
 }

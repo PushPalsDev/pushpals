@@ -41,6 +41,7 @@ LOG_PREFIX = "[OpenHandsExecutor]"
 log = Logger(LOG_PREFIX)
 DEFAULT_OPENHANDS_MODEL = "local-model"
 PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+GLOB_META_REGEX = re.compile(r"[*?\[\]{}()!]")
 _PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
 
 
@@ -246,6 +247,107 @@ def _build_strict_tool_use_message() -> str:
     )
 
 
+def _normalize_repo_relative_path(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    path = value.strip().replace("\\", "/")
+    if not path:
+        return None
+    if path == "/repo" or path == "/workspace":
+        return "."
+    if path.startswith("/repo/"):
+        path = path[len("/repo/") :]
+    elif path.startswith("/workspace/"):
+        path = path[len("/workspace/") :]
+    elif path.startswith("/"):
+        return None
+    if re.match(r"^[A-Za-z]:[\\/]", path):
+        return None
+    while path.startswith("./"):
+        path = path[2:]
+    path = re.sub(r"/+", "/", path).strip("/")
+    if not path:
+        return None
+    segments = path.split("/")
+    out: List[str] = []
+    for segment in segments:
+        segment = segment.strip()
+        if not segment or segment == ".":
+            continue
+        if segment == "..":
+            return None
+        out.append(segment)
+    if not out:
+        return None
+    return "/".join(out)
+
+
+def _add_literal_path(values: List[str], seen: set[str], raw: Any) -> None:
+    normalized = _normalize_repo_relative_path(raw)
+    if not normalized or normalized == ".":
+        return
+    if GLOB_META_REGEX.search(normalized):
+        return
+    key = normalized.lower()
+    if key in seen:
+        return
+    seen.add(key)
+    values.append(normalized)
+
+
+def _extract_target_paths(payload: Optional[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    if not isinstance(payload, dict):
+        return out
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return out
+
+    _add_literal_path(out, seen, params.get("targetPath"))
+    _add_literal_path(out, seen, params.get("path"))
+    paths = params.get("paths")
+    if isinstance(paths, list):
+        for entry in paths:
+            _add_literal_path(out, seen, entry)
+            if len(out) >= 8:
+                return out
+
+    planning = params.get("planning")
+    if not isinstance(planning, dict):
+        return out
+    target_paths = planning.get("targetPaths")
+    if isinstance(target_paths, list):
+        for entry in target_paths:
+            _add_literal_path(out, seen, entry)
+            if len(out) >= 8:
+                return out
+    scope = planning.get("scope")
+    if isinstance(scope, dict):
+        write_globs = scope.get("writeGlobs")
+        if isinstance(write_globs, list):
+            for entry in write_globs:
+                _add_literal_path(out, seen, entry)
+                if len(out) >= 8:
+                    return out
+    return out
+
+
+def _build_path_handling_message(target_paths: List[str]) -> str:
+    if not target_paths:
+        return ""
+    listed = "\n".join(f"- {path}" for path in target_paths[:8])
+    return (
+        "Path handling requirements:\n"
+        "- The current working directory is the repository root.\n"
+        "- Treat listed paths as repo-relative and use them exactly.\n"
+        "- Do not prefix listed paths with a leading '/'.\n"
+        "- Do not run broad filesystem scans when concrete target paths are listed.\n"
+        "Concrete target paths:\n"
+        f"{listed}"
+    )
+
+
 def _run_openhands_task(
     repo: str,
     instruction: str,
@@ -349,6 +451,9 @@ def _run_openhands_task(
         conversation = Conversation(agent=agent, workspace=repo)
         log.debug(f"Instruction: {to_single_line(instruction, 300)}")
         conversation.send_message(_build_user_message(instruction, timeout_ms))
+        path_handling = _build_path_handling_message(_extract_target_paths(payload))
+        if path_handling:
+            conversation.send_message(path_handling)
         if supplemental_guidance:
             for guidance in supplemental_guidance:
                 trimmed = str(guidance or "").strip()

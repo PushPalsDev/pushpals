@@ -112,12 +112,18 @@ export function normalizePathHints(values: string[]): string[] {
 
 export function plannerTargetPaths(plan: PlannerPathHints, prompt: string): string[] {
   const explicit = extractExplicitTargetPath(prompt);
-  const pathHints = normalizePathHints([
+  // Prefer concrete paths explicitly present in the user prompt.
+  // Only fall back to planner hints when the prompt does not name paths.
+  const promptPathHints = normalizePathHints([
     ...(explicit ? [explicit] : []),
     ...extractTokenPathHints(prompt),
     ...extractQuotedPathHints(prompt),
+  ]);
+  if (promptPathHints.length > 0) return promptPathHints;
+
+  const plannerHints = normalizePathHints([
     ...(plan.scope.write_globs ?? []),
     ...(plan.discovery?.likely_dirs ?? []),
   ]);
-  return pathHints.length > 0 ? pathHints : ["."];
+  return plannerHints.length > 0 ? plannerHints : ["."];
 }
