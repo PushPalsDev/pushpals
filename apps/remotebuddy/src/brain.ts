@@ -225,6 +225,23 @@ function dedupeRepoPathHints(values: unknown, limit: number): string[] {
   return out;
 }
 
+function hasActionableWorkerVerbs(text: string): boolean {
+  return /\b(apply|append|add|edit|update|modify|change|replace|write|create|remove|run|verify|check|ensure)\b/i.test(
+    text,
+  );
+}
+
+function looksContradictoryWorkerInstruction(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("no worker instruction needed") ||
+    normalized.includes("no additional instruction needed") ||
+    normalized.includes("purely documentation update") ||
+    normalized.includes("already updated") ||
+    normalized.includes("nothing to do")
+  );
+}
+
 function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("planner output is not an object");
@@ -260,7 +277,7 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
 
   const fallbackWorkerInstruction = userText.trim().slice(0, MAX_WORKER_INSTRUCTION_CHARS);
   const assistantMessageRaw = String(record.assistant_message ?? "").trim();
-  const workerInstruction = String(record.worker_instruction ?? "")
+  const workerInstructionRaw = String(record.worker_instruction ?? "")
     .trim()
     .slice(0, MAX_WORKER_INSTRUCTION_CHARS);
   const userMessage = String(record.user_message ?? userText)
@@ -269,12 +286,19 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   const assistantMessage = (
     assistantMessageRaw ||
     userMessage ||
-    workerInstruction ||
+    workerInstructionRaw ||
     fallbackWorkerInstruction ||
     "Understood. I will proceed with this request."
   ).slice(0, MAX_ASSISTANT_CHARS);
 
   const requires_worker = requiresWorker;
+  const workerInstruction =
+    requires_worker &&
+    workerInstructionRaw &&
+    (!hasActionableWorkerVerbs(workerInstructionRaw) ||
+      looksContradictoryWorkerInstruction(workerInstructionRaw))
+      ? ""
+      : workerInstructionRaw;
   const writeAllowed = requires_worker && intent === "code_change" ? true : writeAllowedRaw;
   const job_kind: "task.execute" | "none" = requires_worker ? "task.execute" : "none";
 

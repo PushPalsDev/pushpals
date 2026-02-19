@@ -380,12 +380,43 @@ function buildExecutionGuidance(plan: PlannerOutput, targetPaths: string[]): str
   return lines.join("\n").trim();
 }
 
-function normalizeValidationSteps(steps: string[]): string[] {
+const VALIDATION_COMMAND_PREFIX = /^(git|bun|npm|pnpm|yarn|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
+const VALIDATION_GENERIC_SAFE = /^(git\s+status\s+--porcelain|git\s+diff\b)/i;
+const PATH_TOKEN_REGEX = /\b([A-Za-z0-9._/\-\\]+\.[A-Za-z0-9._-]+)\b/g;
+
+function isCommandLikeValidationStep(step: string): boolean {
+  return VALIDATION_COMMAND_PREFIX.test(step);
+}
+
+function hasRelevantTargetPath(step: string, targetPaths: string[]): boolean {
+  if (targetPaths.length === 0) return true;
+  const lower = step.toLowerCase();
+  if (VALIDATION_GENERIC_SAFE.test(lower)) return true;
+  for (const target of targetPaths) {
+    if (!target || target === ".") continue;
+    if (lower.includes(target.toLowerCase())) return true;
+  }
+  const explicitPathTokens = [...step.matchAll(PATH_TOKEN_REGEX)].map((match) =>
+    String(match[1] ?? "").replace(/\\/g, "/").toLowerCase(),
+  );
+  if (explicitPathTokens.length === 0) return true;
+  for (const token of explicitPathTokens) {
+    for (const target of targetPaths) {
+      const normalizedTarget = target.toLowerCase();
+      if (token === normalizedTarget || token.startsWith(`${normalizedTarget}/`)) return true;
+    }
+  }
+  return false;
+}
+
+function normalizeValidationSteps(steps: string[], targetPaths: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const raw of steps) {
     const value = String(raw ?? "").trim();
     if (!value) continue;
+    if (!isCommandLikeValidationStep(value)) continue;
+    if (!hasRelevantTargetPath(value, targetPaths)) continue;
     const key = value.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -394,17 +425,46 @@ function normalizeValidationSteps(steps: string[]): string[] {
   return out;
 }
 
-function defaultValidationStepsForRequest(prompt: string, targetPath?: string): string[] {
+function defaultValidationStepsForRequest(prompt: string, targetPaths: string[]): string[] {
   const text = prompt.toLowerCase();
-  const target = (targetPath ?? "").toLowerCase();
+  const concreteTargets = targetPaths
+    .filter((entry) => entry && entry !== ".")
+    .slice(0, 4);
   if (/\b(lint|eslint|tsc|typecheck)\b/.test(text)) {
     return ["bun run lint"];
   }
   if (/\b(test|tests|pytest|vitest|jest|coverage)\b/.test(text)) {
-    if (target.endsWith(".py")) return ["uv run pytest"];
+    const pythonTarget = concreteTargets.some((target) => target.toLowerCase().endsWith(".py"));
+    if (pythonTarget) return ["uv run pytest"];
     return ["bun test"];
   }
+  if (concreteTargets.length > 0) {
+    return [`git diff -- ${concreteTargets.join(" ")}`, "git status --porcelain"];
+  }
   return ["git status --porcelain"];
+}
+
+function sanitizePlannerWorkerInstruction(
+  workerInstruction: string,
+  canonicalInstruction: string,
+): string {
+  const value = String(workerInstruction ?? "").trim();
+  if (!value) return "";
+  if (value === canonicalInstruction) return "";
+  const lower = value.toLowerCase();
+  if (
+    lower.includes("no worker instruction needed") ||
+    lower.includes("no additional instruction needed") ||
+    lower.includes("purely documentation update") ||
+    lower.includes("already updated") ||
+    lower.includes("nothing to do")
+  ) {
+    return "";
+  }
+  if (!/\b(apply|append|add|edit|update|modify|change|replace|write|create|remove|run|verify|check|ensure)\b/i.test(value)) {
+    return "";
+  }
+  return value;
 }
 
 interface WorkerSnapshot {
@@ -1302,9 +1362,9 @@ class RemoteBuddyOrchestrator {
         if (plan.acceptance_criteria.length === 0) {
           plan.acceptance_criteria = ["Produce a correct and helpful result for the user request."];
         }
-        plan.validation_steps = normalizeValidationSteps(plan.validation_steps);
+        plan.validation_steps = normalizeValidationSteps(plan.validation_steps, targetPaths);
         if (plan.validation_steps.length === 0) {
-          plan.validation_steps = defaultValidationStepsForRequest(prompt, targetPath);
+          plan.validation_steps = defaultValidationStepsForRequest(prompt, targetPaths);
           console.warn(
             `[RemoteBuddy] Planner returned no validation_steps; using fallback: ${plan.validation_steps.join(
               " | ",
@@ -1340,7 +1400,10 @@ class RemoteBuddyOrchestrator {
       }
 
       const canonicalInstruction = prompt.trim();
-      const rawPlannerInstruction = String(plan.worker_instruction ?? "").trim();
+      const rawPlannerInstruction = sanitizePlannerWorkerInstruction(
+        String(plan.worker_instruction ?? ""),
+        canonicalInstruction,
+      );
       const executionGuidance = buildExecutionGuidance(plan, targetPaths);
       const plannerWorkerInstruction = [rawPlannerInstruction, executionGuidance]
         .filter(Boolean)

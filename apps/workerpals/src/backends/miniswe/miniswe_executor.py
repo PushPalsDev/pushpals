@@ -916,6 +916,8 @@ def _broker_system_prompt(repo: str) -> str:
         "- Paths must be repo-relative.\n"
         "- Use read_file before edit when unsure.\n"
         "- After edits, run_shell: \"git status --porcelain\".\n"
+        "- If the instruction is a bounded edit over explicit file paths, complete all requested edits in one response when possible.\n"
+        "- Do not stop after partially applying explicit directives; only set done=true after all requested edits are handled.\n"
         "- When task is complete, set done=true and keep actions empty or only verification commands.\n"
     )
 
@@ -948,9 +950,18 @@ def _broker_run(
     allowed_write_globs = [g for g in (write_globs or []) if str(g).strip()]
     expected_targets = sorted(explicit_target_set) if explicit_target_set else _extract_expected_target_paths(instruction)
 
+    task_lines = [f"Task:\n{instruction}"]
+    if expected_targets:
+        targets_block = "\n".join(f"- {target}" for target in expected_targets[:8])
+        task_lines.append("Explicit target paths:\n" + targets_block)
+        task_lines.append(
+            "Completion requirement: handle all requested edits across all explicit target paths "
+            "before setting done=true."
+        )
+    task_lines.append("Start now. Output STRICT JSON only.")
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": _broker_system_prompt(repo)},
-        {"role": "user", "content": f"Task:\n{instruction}\n\nStart now. Output STRICT JSON only."},
+        {"role": "user", "content": "\n\n".join(task_lines)},
     ]
 
     def _record(line: str) -> None:

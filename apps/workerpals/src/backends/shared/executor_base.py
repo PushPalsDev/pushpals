@@ -539,6 +539,20 @@ class TaskExecutePayload:
     payload: Dict[str, Any] = field(default_factory=dict)
 
 
+def _is_non_actionable_planner_guidance(text: str) -> bool:
+    lower = str(text or "").strip().lower()
+    if not lower:
+        return True
+    blocked_markers = (
+        "no worker instruction needed",
+        "no additional instruction needed",
+        "purely documentation update",
+        "already updated",
+        "nothing to do",
+    )
+    return any(marker in lower for marker in blocked_markers)
+
+
 def parse_task_execute_payload(
     argv: List[str],
     *,
@@ -588,11 +602,17 @@ def parse_task_execute_payload(
 
     supplemental_guidance: List[str] = []
     if planner_instruction and planner_instruction != instruction:
-        log.info(
-            "Planner guidance was provided, but preserving original "
-            "user instruction as canonical task input."
-        )
-        supplemental_guidance.append(planner_instruction)
+        if _is_non_actionable_planner_guidance(planner_instruction):
+            log.info(
+                "Planner guidance was provided but ignored due to "
+                "non-actionable placeholder content."
+            )
+        else:
+            log.info(
+                "Planner guidance was provided, but preserving original "
+                "user instruction as canonical task input."
+            )
+            supplemental_guidance.append(planner_instruction)
     if quality_revision_hint:
         log.info(
             "Quality revision guidance provided for this attempt; "

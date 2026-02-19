@@ -38,10 +38,15 @@ Quality gates:
   - include likely target files/directories
   - include explicit acceptance criteria
   - include minimal validation command(s)
+  - use imperative wording (e.g., "apply", "edit", "run")
+  - never claim work is already complete
+  - never return placeholders like "No worker instruction needed"
   - avoid vague directives like "look around the repo"
   - do not rewrite user intent or invent specific filenames/scenarios not implied by the user request
 - `acceptance_criteria` must be explicit and verifiable when `requires_worker=true`; keep empty only for no-worker requests.
-- `validation_steps` should be minimal and relevant (empty array only for no-worker requests).
+- `validation_steps` should be minimal and relevant (empty array only for no-worker requests):
+  - each item must be an executable command, not prose
+  - prefer targeted checks tied to requested file paths
 - `risk_level` must be one of `low`, `medium`, `high`.
 - Never ask WorkerPal for architecture summaries or broad repository overviews unless user explicitly requests that.
 
@@ -77,5 +82,9 @@ Return exactly this object shape with these keys:
 "validation_steps": ["..."],
 "risk_level": "low|medium|high",
 "assistant_message": "...",
-"worker_instruction": "..."
+"worker_instruction": "...",
+"user_message": "..."
 }
+
+All keys above are required.
+Do not add extra keys.

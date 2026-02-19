@@ -333,18 +333,24 @@ def _extract_target_paths(payload: Optional[Dict[str, Any]]) -> List[str]:
     return out
 
 
-def _build_path_handling_message(target_paths: List[str]) -> str:
+def _build_path_handling_message(target_paths: List[str], repo: str) -> str:
     if not target_paths:
         return ""
-    listed = "\n".join(f"- {path}" for path in target_paths[:8])
+    rel_paths = target_paths[:8]
+    listed_rel = "\n".join(f"- {path}" for path in rel_paths)
+    repo_root = str(Path(repo).resolve()).replace("\\", "/").rstrip("/")
+    abs_paths = [f"{repo_root}/{path}" for path in rel_paths]
+    listed_abs = "\n".join(f"- {path}" for path in abs_paths)
     return (
         "Path handling requirements:\n"
         "- The current working directory is the repository root.\n"
-        "- Treat listed paths as repo-relative and use them exactly.\n"
-        "- Do not prefix listed paths with a leading '/'.\n"
+        "- Prefer the repo-relative paths for shell commands.\n"
+        "- If FileEditor rejects a repo-relative path, retry with the matching absolute path.\n"
         "- Do not run broad filesystem scans when concrete target paths are listed.\n"
-        "Concrete target paths:\n"
-        f"{listed}"
+        "Concrete target paths (repo-relative):\n"
+        f"{listed_rel}\n"
+        "Concrete target paths (absolute):\n"
+        f"{listed_abs}"
     )
 
 
@@ -451,7 +457,7 @@ def _run_openhands_task(
         conversation = Conversation(agent=agent, workspace=repo)
         log.debug(f"Instruction: {to_single_line(instruction, 300)}")
         conversation.send_message(_build_user_message(instruction, timeout_ms))
-        path_handling = _build_path_handling_message(_extract_target_paths(payload))
+        path_handling = _build_path_handling_message(_extract_target_paths(payload), repo)
         if path_handling:
             conversation.send_message(path_handling)
         if supplemental_guidance:
