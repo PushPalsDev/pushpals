@@ -37,10 +37,10 @@ RUN mkdir -p /workspace \
         openhands-tools \
         mini-swe-agent \
         playwright \
-    && npm install -g @openai/codex \
+    && bun add -g @openai/codex \
     && /workspace/.venv/bin/playwright install --with-deps chromium
 
-ENV PATH="/workspace/.venv/bin:${PATH}"
+ENV PATH="/workspace/.venv/bin:/root/.bun/bin:${PATH}"
 ENV WORKERPALS_OPENHANDS_PYTHON="/workspace/.venv/bin/python"
 ENV WORKERPALS_OPENHANDS_WORKSPACE_PYTHON="/workspace/.venv/bin/python"
 ENV WORKERPALS_MINISWE_PYTHON="/workspace/.venv/bin/python"
