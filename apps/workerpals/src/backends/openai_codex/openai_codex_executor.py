@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from shutil import which
+import shlex
 import signal
 import subprocess
 import sys
@@ -104,6 +105,26 @@ def _is_git_repo(repo: str) -> bool:
         return (proc.stdout or "").strip().lower() == "true"
     except Exception:
         return False
+
+
+def _resolve_codex_command_prefix() -> List[str]:
+    override = (os.environ.get("WORKERPALS_OPENAI_CODEX_BIN") or "").strip()
+    if override:
+        try:
+            parts = [p for p in shlex.split(override) if p.strip()]
+        except Exception:
+            log.info(
+                "Invalid WORKERPALS_OPENAI_CODEX_BIN value; expected a command string parseable by shlex."
+            )
+            return []
+        return parts
+
+    # Prefer bunx to avoid requiring a separate node runtime in the container.
+    if shutil_which("bunx"):
+        return ["bunx", "--yes", "@openai/codex"]
+    if shutil_which("codex"):
+        return ["codex"]
+    return []
 
 
 def _resolve_communicate_timeout_seconds() -> Optional[int]:
@@ -242,14 +263,15 @@ def _run_codex_task(
             "exitCode": 2,
         }
 
-    codex_bin = (os.environ.get("WORKERPALS_OPENAI_CODEX_BIN") or "codex").strip() or "codex"
-    if not shutil_which(codex_bin):
+    codex_cmd_prefix = _resolve_codex_command_prefix()
+    if not codex_cmd_prefix:
         return {
             "ok": False,
             "summary": "openai_codex CLI is not installed",
             "stderr": (
-                "Could not find `codex` in PATH. Install @openai/codex in the worker runtime "
-                "or set WORKERPALS_OPENAI_CODEX_BIN."
+                "Could not find a runnable Codex command. "
+                "Expected one of: `bunx --yes @openai/codex` or `codex` in PATH. "
+                "You can also set WORKERPALS_OPENAI_CODEX_BIN explicitly."
             ),
             "exitCode": 3,
         }
@@ -283,7 +305,7 @@ def _run_codex_task(
     with tempfile.TemporaryDirectory(prefix="pushpals-codex-") as tmp_dir:
         last_message_path = Path(tmp_dir) / "codex-last-message.txt"
         cmd: List[str] = [
-            codex_bin,
+            *codex_cmd_prefix,
             "-a",
             approval,
             "-s",
@@ -329,6 +351,7 @@ def _run_codex_task(
             env.setdefault("OPENAI_API_BASE", effective_base)
 
         log.info(f"Starting codex exec in {repo}")
+        log.debug(f"Codex command: {' '.join(codex_cmd_prefix)}")
         log.debug(f"Model: {model}")
         log.debug(f"Base URL: {effective_base or existing_openai_base or '<default>'}")
         if communicate_timeout_s:

@@ -25,8 +25,14 @@ function warmupProbeCommand(sharedVenvPython: string): string {
     `PY="\${WORKERPALS_OPENAI_CODEX_PYTHON:-${sharedVenvPython}}"; ` +
     'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
     '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }; ' +
-    'command -v codex >/dev/null 2>&1 || { echo "codex CLI not found in PATH" >&2; exit 1; }; ' +
-    "codex --version"
+    'if command -v bunx >/dev/null 2>&1; then ' +
+    '  bunx --yes @openai/codex --version; ' +
+    'elif command -v codex >/dev/null 2>&1; then ' +
+    '  codex --version; ' +
+    'else ' +
+    '  echo "Neither bunx nor codex was found in PATH" >&2; ' +
+    "  exit 1; " +
+    "fi"
   );
 }
 
