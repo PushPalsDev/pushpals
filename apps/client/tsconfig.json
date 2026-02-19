@@ -2,8 +2,12 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true,
+    "baseUrl": ".",
     "paths": {
-      "@/*": ["./*"]
+      "@/*": ["./*"],
+      "protocol": ["../../packages/protocol/src/index"],
+      "protocol/browser": ["../../packages/protocol/src/index.browser"],
+      "protocol/react-native": ["../../packages/protocol/src/index.browser"]
     }
   },
   "include": ["**/*.ts", "**/*.tsx", ".expo/types/**/*.ts", "expo-env.d.ts"]
