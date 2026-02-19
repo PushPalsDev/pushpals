@@ -265,8 +265,14 @@ let cachedCodexCommandPrefix: string[] | null = null;
 async function resolveCodexCommandPrefix(): Promise<string[]> {
   if (cachedCodexCommandPrefix) return cachedCodexCommandPrefix;
   const override = codexCommandOverride();
-  const preferred = override ? splitArgs(override) : ["bunx", "--yes", "@openai/codex"];
-  const candidates: string[][] = preferred[0] === "codex" ? [preferred] : [preferred, ["codex"]];
+  const preferred = override ? splitArgs(override) : ["bun", "x", "--yes", "@openai/codex"];
+  const candidates: string[][] = [preferred];
+  if (preferred.join(" ") !== "bunx --yes @openai/codex") {
+    candidates.push(["bunx", "--yes", "@openai/codex"]);
+  }
+  if (preferred[0] !== "codex") {
+    candidates.push(["codex"]);
+  }
   const cwd = process.cwd();
   const env = process.env;
   for (const candidate of candidates) {

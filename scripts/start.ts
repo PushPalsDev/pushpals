@@ -436,12 +436,22 @@ function codexHostCommandPrefix(): string[] {
     const parsed = splitArgs(override);
     if (parsed.length > 0) return parsed;
   }
-  return ["bunx", "--yes", "@openai/codex"];
+  return ["bun", "x", "--yes", "@openai/codex"];
+}
+
+function persistResolvedCodexCommandPrefix(commandPrefix: string[]): void {
+  if (commandPrefix.length === 0) return;
+  process.env.PUSHPALS_OPENAI_CODEX_BIN = commandPrefix.join(" ");
 }
 
 async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<string[]> {
   const versionExit = await runQuiet([...commandPrefix, "--version"]);
   if (versionExit === 0) return commandPrefix;
+
+  if (commandPrefix.join(" ") !== "bunx --yes @openai/codex") {
+    const bunxExit = await runQuiet(["bunx", "--yes", "@openai/codex", "--version"]);
+    if (bunxExit === 0) return ["bunx", "--yes", "@openai/codex"];
+  }
 
   if (commandPrefix[0] !== "codex") {
     const codexExit = await runQuiet(["codex", "--version"]);
@@ -451,6 +461,9 @@ async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<s
   const rendered = commandPrefix.join(" ");
   console.error("[start] openai_codex backend selected but Codex CLI is unavailable.");
   console.error(`[start] Tried: ${rendered} --version`);
+  if (commandPrefix.join(" ") !== "bunx --yes @openai/codex") {
+    console.error("[start] Also tried: bunx --yes @openai/codex --version");
+  }
   if (commandPrefix[0] !== "codex") {
     console.error("[start] Also tried: codex --version");
   }
@@ -465,6 +478,7 @@ async function ensureCodexCliAuthPreflight(): Promise<void> {
   const effectiveMode = codexEffectiveAuthMode() ?? "chatgpt";
   const hasApiKey = codexApiKeyPresent();
   const commandPrefix = await resolveHostCodexCommandPrefix(codexHostCommandPrefix());
+  persistResolvedCodexCommandPrefix(commandPrefix);
 
   console.log(
     `[start] openai_codex auth preflight: configured=${configuredMode} effective=${effectiveMode}`,
