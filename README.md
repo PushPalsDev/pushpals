@@ -1,182 +1,402 @@
-# Push Pals
+# PushPals
 
-Multi-device, always-on, multi-agent coding with clear orchestration and auditability.
+PushPals is a human-guided and autonomous AI coding helper that runs as a multi-service local system around your repository. It combines chat-style interaction, strict planning, delegated execution, and controlled git integration with auditability built in.
 
-## Overview
+## Intent
 
-Push Pals runs a small software "team" around your repository:
+PushPals is designed for two modes that can coexist in one runtime:
 
-- `apps/client`: chat UI (Expo web/mobile)
-- `apps/server`: event hub + persistence + queues (SQLite)
-- `apps/localbuddy`: `LocalBuddy` HTTP ingress + deterministic local routing
-- `apps/remotebuddy`: `RemoteBuddy` strict planner + orchestrator
-- `apps/workerpals`: `WorkerPals` strict `task.execute` runners (deterministic/OpenHands lanes)
-- `apps/source_control_manager`: `SourceControlManager` merge/push daemon
+- Human-driven mode: you ask for work in chat, the system plans and executes code changes safely.
+- Autonomous mode: `RemoteBuddy` periodically proposes and dispatches bounded maintenance objectives (when policy and eligibility gates allow).
 
-## Current Architecture
+Both modes flow through the same queues, events, and integration pipeline so behavior is observable and debuggable.
 
-## Architecture Diagram
+## Architecture Visuals
 
-### End-to-end system view
+- Excalidraw source: `docs/architecture.excalidraw`
+- Mermaid runtime flow:
 
 ```mermaid
 flowchart LR
-  User[User] --> Client[apps/client\nExpo UI]
-  Client -->|POST /message| LocalBuddy[apps/localbuddy\nIngress + Prompt Enrichment]
-  LocalBuddy -->|POST /requests/enqueue| Server[(apps/server\nEvents + Queues + SQLite)]
-  Server -->|SSE / WS session events| Client
+  U[User] --> C[apps/client]
+  C -->|POST /message| L[apps/localbuddy]
+  L -->|POST /requests/enqueue| S[(apps/server)]
+  S -->|SSE/WS session events| C
 
-  Server -->|POST /requests/claim| RemoteBuddy[apps/remotebuddy\nOrchestrator + Scheduler]
-  RemoteBuddy -->|POST /jobs/enqueue| Server
-  Server -->|POST /jobs/claim| WorkerPals[apps/workerpals\nExecution Daemons]
+  S -->|POST /requests/claim| R[apps/remotebuddy]
+  R -->|POST /jobs/enqueue| S
+  S -->|POST /jobs/claim| W[apps/workerpals]
+  W -->|POST /jobs/:id/complete or fail| S
+  W -->|POST /completions/enqueue| S
 
-  WorkerPals -->|job_log / job_completed / job_failed| Server
-  WorkerPals -->|POST /completions/enqueue| Server
+  S -->|POST /completions/claim| M[apps/source_control_manager]
+  M -->|merge/push/PR status events| S
 
-  Server -->|POST /completions/claim| SCM[apps/source_control_manager\nMerge + Push + PR]
-  SCM -->|assistant/status events| Server
-  Server -->|SSE / WS session events| Client
-
-  subgraph Git[Git + Branch Flow]
-    WorkerBranch[agent/<worker>/<job>] --> Integration[main_agents]
-    Integration --> Main[main]
-  end
-
-  WorkerPals -->|commit refs| WorkerBranch
-  SCM -->|cherry-pick/merge + push| Integration
+  S --- DB[(outputs/data/pushpals.db)]
+  W -->|agent/<worker>/<job> commits| G[(Git branches)]
+  M -->|integration merge/push| G
 ```
 
-### Communication model (event-driven)
+## Services and Responsibilities
 
-```mermaid
-sequenceDiagram
-  participant U as User
-  participant C as Client
-  participant L as LocalBuddy
-  participant S as Server
-  participant R as RemoteBuddy
-  participant W as WorkerPals
-  participant M as SourceControlManager
+- `apps/client`
+  - Expo mission-control UI (web/iOS/Android).
+  - Subscribes to server event stream and renders live timeline/status.
+- `apps/localbuddy`
+  - User ingress on `POST /message`.
+  - Handles lightweight local responses and status/read-only prompts.
+  - Enqueues delegated requests for remote orchestration.
+- `apps/server`
+  - Central control plane and event hub.
+  - Hosts session/event transport, queue APIs, worker heartbeats, and autonomy APIs.
+  - Persists all state in SQLite (`outputs/data/pushpals.db` by default).
+- `apps/remotebuddy`
+  - Planner/orchestrator.
+  - Claims queued requests, produces strict planning JSON, emits assistant messages, optionally enqueues `task.execute` jobs.
+  - Runs optional autonomy loop for objective ideation/scoring/dispatch.
+- `apps/workerpals`
+  - Job execution daemon (host worktree mode or Docker mode).
+  - Claims jobs, executes backend agent (`miniswe` or `openhands`), streams logs, emits completion records.
+- `apps/source_control_manager`
+  - Completion consumer and integration daemon.
+  - Applies worker output (cherry-pick/no-ff/ff-only), runs checks, pushes integration branch, optionally opens/reuses PR.
 
-  U->>C: Send request
-  C->>L: POST /message
-  L->>S: session message + status events
-  L->>S: POST /requests/enqueue
-  R->>S: POST /requests/claim
-  R->>S: task/job events + POST /jobs/enqueue
-  W->>S: POST /jobs/claim
-  W->>S: job_log + job_completed/job_failed events
-  W->>S: POST /completions/enqueue
-  M->>S: POST /completions/claim
-  M->>S: merge/push outcome events
-  S-->>C: SSE/WS stream (live timeline)
-```
+## Quick Start
 
-### Fast path (chat and status)
+### Prerequisites
 
-1. Client sends message to `LocalBuddy` (`POST /message`).
-2. LocalBuddy runs deterministic intent routing:
-   - local-only answer path for quick chat/status/read-only checks
-   - remote path for execution/code work (or forced via `/ask_remote_buddy ...`)
-3. For remote path, LocalBuddy enqueues request immediately (`/requests/enqueue`) with priority + queue budget.
-4. RemoteBuddy claims request (`/requests/claim`), produces strict planner JSON, and either responds directly or enqueues strict `task.execute` work.
-5. Client receives all updates from server event stream (`SSE` or `WS`) and re-renders incrementally.
+- Bun 1.x
+- Python 3.12+ (for integration/eval harness and Python executor scripts)
+- Docker (recommended; required for default `bun run start` flow)
+- Git + GitHub auth if push/PR automation is enabled
 
-### Slow path (execution and integration)
-
-1. RemoteBuddy schedules prioritized WorkerPal jobs (`/jobs/enqueue`) with execution/finalization budgets.
-2. WorkerPals claim jobs (`/jobs/claim`), execute in isolated worktrees (and Docker when enabled), and enforce strict `task.execute` schema v2.
-3. For mutating work, WorkerPals create commits on per-job branches: `agent/<workerId>/<jobId>`.
-4. WorkerPals enqueue completions (`/completions/enqueue`).
-5. SourceControlManager claims completions (`/completions/claim`), cherry-picks/merges into integration branch (`main_agents` by default), runs checks, pushes integration branch, and can auto-open/reuse a PR from integration branch to base branch for human review.
-
-## Communication Model
-
-`packages/shared/src/communication.ts` provides a shared `CommunicationManager` used by LocalBuddy, RemoteBuddy, and SourceControlManager.
-
-This keeps session messaging consistent:
-
-- user messages
-- assistant messages
-- task lifecycle (`task_created`, `task_started`, `task_progress`, ...)
-- job lifecycle (`job_claimed`, `job_completed`, `job_failed`)
-- integration status (SourceControlManager merge/push success/failure)
-
-## Planner + Worker Contract
-
-- RemoteBuddy planner output is strict JSON with:
-  - `intent`, `requires_worker`, `job_kind`, `lane`, `target_paths`, `validation_steps`, `risk_level`, `assistant_message`, `worker_instruction`
-- Worker contract is strict `task.execute` schema v2:
-  - `schemaVersion: 2`
-  - `lane: deterministic | openhands`
-  - `instruction`
-  - `planning` object with priority + budgets + validation hints
-- Request and job queues are priority aware:
-  - `interactive`, `normal`, `background`
-  - queue position + ETA snapshots are surfaced by server APIs
-- `/system/status` exposes 24h SLO summaries used by Mission Control:
-  - request success rate + queue wait p50/p95
-  - job success rate + timeout rate + runtime p50/p95
-
-## Branching Model
-
-- `main` is the source-of-truth branch.
-- Integration branch defaults to `main_agents` (`PUSHPALS_INTEGRATION_BRANCH`).
-- Integration branch upstream can track `origin/main` (`PUSHPALS_INTEGRATION_BASE_BRANCH=main`).
-- Worker branches are ephemeral and namespaced: `agent/<workerId>/<jobId>`.
-- SourceControlManager serializes integration into `main_agents` and pushes it.
-
-## Isolation Model
-
-- Worker execution uses isolated git worktrees under `.worktrees/`.
-- Docker worker mode isolates runtime and toolchain per job container.
-- SourceControlManager uses a dedicated worktree by default:
-  - `.worktrees/source_control_manager`
-- Startup refuses running SourceControlManager directly in your active workspace.
-
-## Startup
-
-Use:
+### Initial setup
 
 ```bash
-bun run start
+bun install
+cp .env.example .env
+cp config/local.example.toml config/local.toml
 ```
 
-Optional clean run:
+Windows PowerShell:
+
+```powershell
+bun install
+Copy-Item .env.example .env
+Copy-Item config/local.example.toml config/local.toml
+```
+
+## Run commands
+
+### Full stack
+
+- `bun run start`
+  - Preferred startup path.
+  - Runs preflights (config presence, LLM reachability, integration branch/worktree checks, Docker image checks, startup warmup), then launches full stack.
+- `bun run start -c`
+  - Same as above with runtime-state cleanup first.
+- `bun run dev:full`
+  - Direct concurrent launcher without the `start.ts` preflight workflow.
+
+### Individual services
+
+- `bun run server:only`
+- `bun run localbuddy:only`
+- `bun run remotebuddy:only`
+- `bun run workerpals:only`
+- `bun run workerpals:only:docker`
+- `bun run source_control_manager:only`
+- `bun run source_control_manager:only:dev`
+- `bun run client:only`
+- `bun run client:only:offline`
+- `bun run web:only`
+- `bun run ios:only`
+- `bun run android:only`
+
+### Common partial-stack recipes
+
+### Remote agent only (no UI, no LocalBuddy)
+
+Terminal 1:
 
 ```bash
-bun run start -c
+bun run server:only
 ```
 
-`-c`/`--clean` removes runtime state from `PUSHPALS_DATA_DIR` (default `outputs/data`) before startup.
+Terminal 2:
 
-`scripts/start.ts` preflights:
+```bash
+bun run remotebuddy:only
+```
 
-- LLM endpoint reachability (fails fast with clear error if model server is down)
-- optional local model-server auto-start (LM Studio headless)
-- integration branch existence/bootstrapping
-- integration branch sync with base branch (`main_agents` <= `main` by default) before launching RemoteBuddy
-- git auth requirements for push flows
-- SourceControlManager dedicated worktree
-- worker Docker image existence (auto-build if missing)
+To feed it work directly:
 
-Then it starts full dev stack via `dev:full`.
+```bash
+curl -X POST http://localhost:3001/sessions -H "Content-Type: application/json" -d '{"sessionId":"dev"}'
+curl -X POST http://localhost:3001/requests/enqueue -H "Content-Type: application/json" -d '{"sessionId":"dev","prompt":"Summarize current failing tests","priority":"interactive"}'
+```
 
-## Key Scripts
+### Execution path without UI
 
-- `bun run dev:full`: full local stack
-- `bun run workerpals:only:docker`: WorkerPal in strict Docker mode
-- `bun run source_control_manager:only`: SourceControlManager daemon
-- `bun run source_control_manager:only:dev`: same, with clean-check bypass
+Terminal 1: `bun run server:only`  
+Terminal 2: `bun run remotebuddy:only`  
+Terminal 3: `bun run workerpals:only:docker`  
+Terminal 4: `bun run source_control_manager:only:dev`
+
+### Local quick assistant only
+
+Terminal 1: `bun run server:only`  
+Terminal 2: `bun run localbuddy:only`
+
+## Testing and Evaluation
+
+- `bun run test`
+  - Root tests + protocol tests.
+- `bun run test:integration`
+  - End-to-end integration harness (`tests/integration/integration_controller.py --mode integration`).
+- `bun run test:integration:eval`
+  - Backend evaluation mode (`--mode eval`) with scenario/budget controls.
+- `bun run smoke`
+  - Smoke script for startup/stack sanity.
+
+Direct eval wrapper:
+
+```bash
+python -u tests/integration/test_workerpals_backend_eval.py
+```
+
+Useful eval knobs:
+
+- `WORKERPALS_E2E_BACKENDS=miniswe,openhands`
+- `WORKERPALS_E2E_EVAL_SCENARIO_SUITE=quick|real-lite|real-hard`
+- `WORKERPALS_E2E_SCENARIOS_PER_BACKEND=1`
+- `WORKERPALS_E2E_MAX_TOTAL_SEC=900`
+- `WORKERPALS_E2E_MAX_BACKEND_SEC=1200`
+- `WORKERPALS_E2E_EVAL_OUTPUT=outputs/workerpals_backend_eval.json`
+
+## Supported Tech
+
+- Runtime/services: Bun + TypeScript (ESM)
+- Persistence: SQLite (`bun:sqlite`)
+- UI: Expo + React Native + Expo Router
+- Worker runtimes: Python 3.12+, Docker sandbox image
+- Git integration: git CLI, optional GitHub CLI (`gh`) for auth/PR workflows
+- Agent/event protocol: `packages/protocol` JSON schema + TS types
+- Shared config/communication: `packages/shared`
+
+## Supported Worker Backends
+
+Configured in `configs/backend.toml` and resolved by `apps/workerpals/src/backends/backend_config.ts`.
+
+- `miniswe` (default)
+  - Python executor: `apps/workerpals/src/backends/miniswe/miniswe_executor.py`
+  - Uses `mini-swe-agent`.
+- `openhands`
+  - Python executor: `apps/workerpals/src/backends/openhands/openhands_executor.py`
+  - Uses OpenHands SDK / agent-server toolchain.
+
+How to switch:
+
+```toml
+# config/local.toml
+[workerpals]
+executor = "openhands" # or "miniswe"
+```
+
+Or via env override:
+
+```bash
+WORKERPALS_EXECUTOR=openhands bun run workerpals:only:docker
+```
+
+## Supported AI Engines
+
+LocalBuddy, RemoteBuddy, and WorkerPals each have per-service LLM config:
+
+- `LOCALBUDDY_LLM_BACKEND`
+- `REMOTEBUDDY_LLM_BACKEND`
+- `WORKERPALS_LLM_BACKEND`
+
+Supported backend values:
+
+- `lmstudio`
+- `ollama`
+
+Compatibility aliases accepted by config normalizer:
+
+- `openai_compatible` -> `lmstudio`
+- `ollama_chat` -> `ollama`
+
+Related settings per service:
+
+- `*_LLM_ENDPOINT`
+- `*_LLM_MODEL`
+- `*_LLM_API_KEY`
+- `*_LLM_SESSION_ID`
+
+## Low-Level Architecture
+
+### 1) Ingress and routing
+
+- Client sends user text to LocalBuddy: `POST /message`.
+- LocalBuddy chooses:
+  - local reply path for lightweight chat/status/read-only requests, or
+  - remote delegation path by enqueuing to server: `POST /requests/enqueue`.
+- Explicit remote override command supported in chat: `/ask_remote_buddy ...`.
+
+### 2) Server as control plane
+
+Main server route families in `apps/server/src/server_main.ts`:
+
+- Session/event transport:
+  - `POST /sessions`
+  - `GET /sessions/:id/events` (SSE replay via `after` cursor)
+  - `GET /sessions/:id/ws` (WebSocket replay)
+  - `POST /sessions/:id/message`
+  - `POST /sessions/:id/command` (auth protected)
+- Request queue:
+  - `POST /requests/enqueue`
+  - `POST /requests/claim`
+  - `POST /requests/:id/complete`
+  - `POST /requests/:id/fail`
+  - `GET /requests`
+- Job queue and workers:
+  - `POST /jobs/enqueue`
+  - `POST /jobs/claim`
+  - `POST /jobs/:id/complete`
+  - `POST /jobs/:id/fail`
+  - `POST /jobs/:id/log`
+  - `GET /jobs`
+  - `GET /jobs/:id/logs`
+  - `POST /workers/heartbeat`
+  - `GET /workers`
+- Completion queue:
+  - `POST /completions/enqueue`
+  - `POST /completions/claim`
+  - `POST /completions/:id/processed`
+  - `POST /completions/:id/fail`
+  - `GET /completions`
+- Autonomy APIs:
+  - lock lifecycle (`/autonomy/lock/acquire|renew|release`)
+  - snapshot/objective/outcome/eligibility APIs
+  - question lifecycle APIs
+- Status/ops:
+  - `GET /system/status`
+  - `GET /healthz`
+  - `POST /admin/shutdown` (auth protected)
+
+### 3) Queue semantics
+
+Both request and job queues are priority ordered:
+
+- `interactive`
+- `normal`
+- `background`
+
+Queue implementations:
+
+- `apps/server/src/requests.ts`
+- `apps/server/src/jobs.ts`
+- `apps/server/src/completions.ts`
+
+Shared behavior:
+
+- FIFO within each priority band.
+- Claim transitions are atomic.
+- Queue position and ETA snapshots are derived from live pending order.
+- SLO summaries are derived over rolling windows and exposed by `/system/status`.
+
+### 4) Planner and job contract
+
+RemoteBuddy planner output feeds strict execution payloads.
+
+Worker contract (`task.execute` in job params, schema v2) includes:
+
+- `schemaVersion`
+- `lane` (`deterministic` or `worker`)
+- `instruction`
+- `planning.intent`
+- `planning.scope` (read/write bounds)
+- `planning.acceptanceCriteria`
+- `planning.validationSteps`
+- queue/execution/finalization budgets
+
+WorkerPals validates and executes this payload in:
+
+- direct worktree mode, or
+- Docker mode via `apps/workerpals/src/docker_executor.ts` and `apps/workerpals/src/job_runner.ts`.
+
+### 5) Integration pipeline
+
+When WorkerPals finishes mutable work:
+
+- completion record is enqueued with commit/branch metadata.
+- SourceControlManager claims completion.
+- configured merge strategy applies changes into integration branch:
+  - `cherry-pick`
+  - `no-ff`
+  - `ff-only`
+- optional checks run.
+- integration branch push occurs when enabled.
+- optional PR open/reuse is performed when enabled.
+
+SourceControlManager also exposes a localhost status API (`apps/source_control_manager/src/http.ts`):
+
+- `GET /health`
+- `GET /jobs`
+- `GET /jobs/:id`
+- `GET /stats`
+
+### 6) Data model (SQLite)
+
+Main event/session store in `apps/server/src/db.ts`:
+
+- `sessions`
+- `events` (append-only cursor log)
+
+Queue + worker tables:
+
+- `requests`
+- `jobs`
+- `job_logs`
+- `job_artifacts`
+- `workers`
+- `completions`
+
+Autonomy tables in `apps/server/src/autonomy.ts`:
+
+- `autonomy_snapshots`
+- `autonomy_candidates`
+- `autonomy_objectives`
+- `autonomy_outcomes`
+- `autonomy_pattern_stats`
+- `questions_queue`
+- `autonomy_llm_calls`
+- `autonomy_dispatch_lock`
+
+### 7) Branch and isolation model
+
+- Source of truth branch: `main`
+- Integration branch (default): `main_agents`
+- Worker branches: `agent/<workerId>/<jobId>`
+- SourceControlManager worktree default: `.worktrees/source_control_manager`
+- Worker job execution uses isolated worktrees and optionally isolated Docker runtime.
+
+`scripts/start.ts` enforces critical safety checks before full startup, including:
+
+- required local config files (`.env`, `config/local.toml`)
+- LLM endpoint preflight
+- integration branch existence/sync checks
+- dedicated SourceControlManager worktree guard
+- worker sandbox image availability/rebuild policy
 
 ## Configuration Model
 
-PushPals now uses typed TOML config as the canonical source of defaults.
+Canonical config files:
 
-- `config/default.toml`: committed baseline defaults
-- `config/<profile>.toml`: committed profile overrides (`dev`, `prod`, `ci`, etc.)
-- `config/local.toml`: gitignored machine-local overrides
-- `.env`: small and focused on wiring + secrets
+- `config/default.toml`
+- `config/<profile>.toml`
+- `config/local.toml` (local override, typically gitignored)
 
 Load order (last wins):
 
@@ -185,43 +405,34 @@ Load order (last wins):
 3. `config/local.toml`
 4. environment variables
 
-Use `.env` mainly for:
+High-value env overrides:
 
-- profile + URLs (`PUSHPALS_PROFILE`, `PUSHPALS_SERVER_URL`, Expo public URLs)
-- secrets (`PUSHPALS_AUTH_TOKEN`, `PUSHPALS_GIT_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`)
-- deployment wiring only (repo path/proxy wiring when needed)
+- `PUSHPALS_PROFILE`
+- `PUSHPALS_SERVER_URL`
+- `PUSHPALS_DATA_DIR`
+- `LOCALBUDDY_LLM_*`
+- `REMOTEBUDDY_LLM_*`
+- `WORKERPALS_LLM_*`
+- `WORKERPALS_EXECUTOR`
+- `WORKERPALS_REQUIRE_DOCKER`
+- `WORKERPALS_DOCKER_IMAGE`
+- `SOURCE_CONTROL_MANAGER_*`
 
-Service model settings are defined in TOML and can be overridden by env when needed:
+## Repository Layout
 
-- `localbuddy.llm`
-- `remotebuddy.llm`
-- `workerpals.llm`
-- `workerpals.openhands`
-- `startup`
+- `apps/client` - Expo UI
+- `apps/localbuddy` - user ingress and local routing
+- `apps/remotebuddy` - orchestration, planning, autonomy
+- `apps/workerpals` - executor daemon and backend adapters
+- `apps/source_control_manager` - integration daemon
+- `apps/server` - event/queue/autonomy API and persistence
+- `packages/protocol` - protocol schemas, types, validators
+- `packages/shared` - config loader, communication utilities
+- `prompts` - system and planning prompts
+- `tests/integration` - e2e + backend eval harness
 
-See `.env.example` for the minimal env surface area.
+## Operational Notes
 
-## Rollout Guidance
-
-- Use TOML as canonical config (`config/default.toml` + profiles); reserve env for secrets and deployment wiring.
-- Keep planner/worker contract strict (`schemaVersion: 2`, `lane`, `planning` budgets).
-- Roll out safely by session:
-  1. Start with one session and verify LocalBuddy routing, queue ETA, and lifecycle timestamps.
-  2. Observe request/job SLO metrics in Mission Control (`/system/status`).
-  3. Increase concurrent load (up to `REMOTEBUDDY_MAX_WORKERPALS`) after stability checks.
-  4. Treat failures as terminal with explicit reason; avoid hidden fallback paths.
-
-## Repo Layout
-
-- `apps/server`: HTTP API, sessions, queues, worker heartbeats
-- `apps/client`: chat UI + event subscription
-- `apps/localbuddy`: LocalBuddy ingress, deterministic local routing, status summaries
-- `apps/remotebuddy`: strict planner, scheduling, queue orchestration
-- `apps/workerpals`: strict task execution lanes, commits, completion enqueue
-- `apps/source_control_manager`: SourceControlManager integration pipeline
-- `packages/protocol`: shared event/request/response schema
-- `packages/shared`: shared repo helpers + `CommunicationManager`
-
-## Status
-
-Under active development.
+- This repository is under active development.
+- For most local development, use Docker worker mode (`workerpals:only:docker`) to keep toolchains reproducible.
+- If you only need chat ingress, you can run `localbuddy` without worker services, but delegated coding work requires `server + remotebuddy + workerpals` and usually `source_control_manager` for integration completion.
