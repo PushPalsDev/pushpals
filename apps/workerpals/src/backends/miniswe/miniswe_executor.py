@@ -77,11 +77,15 @@ log = Logger(LOG_PREFIX)
 _BROKER_ENABLED_DEFAULT = "0"
 _BROKER_MAX_STEPS_DEFAULT = 8
 _BROKER_MAX_ACTIONS_PER_STEP_DEFAULT = 10
-_BROKER_HTTP_TIMEOUT_SEC_DEFAULT = 60
+_BROKER_HTTP_TIMEOUT_SEC_DEFAULT = 90
+_BROKER_HTTP_TIMEOUT_SEC_LOCAL_DEFAULT = 120
 _BROKER_HTTP_RETRY_MAX_DEFAULT = 1
+_BROKER_HTTP_RETRY_MAX_LOCAL_DEFAULT = 2
+_BROKER_RUN_RETRY_MAX_DEFAULT = 1
 _BROKER_TEMPERATURE = 0.0
 _BROKER_SHELL_TIMEOUT_SEC_DEFAULT = 120
-_BROKER_OBSERVATION_MAX_CHARS = 8_000
+_BROKER_OBSERVATION_MAX_CHARS = 4_000
+_BROKER_READ_PREVIEW_CHARS = 800
 
 # Safety: very simple denylist for shell commands (can be adjusted)
 _DENY_PATTERNS = [
@@ -201,24 +205,38 @@ def _tool_broker_shell_timeout_sec() -> int:
     return _BROKER_SHELL_TIMEOUT_SEC_DEFAULT
 
 
-def _tool_broker_http_timeout_sec() -> int:
+def _tool_broker_http_timeout_sec(base_url: str = "") -> int:
     raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER_HTTP_TIMEOUT_SEC") or "").strip()
     if raw:
         return max(10, min(600, to_int(raw, _BROKER_HTTP_TIMEOUT_SEC_DEFAULT)))
     cfg = config_get("workerpals.miniswe_tool_broker_http_timeout_sec", None)
-    if cfg is None:
-        return _BROKER_HTTP_TIMEOUT_SEC_DEFAULT
-    return max(10, min(600, to_int(cfg, _BROKER_HTTP_TIMEOUT_SEC_DEFAULT)))
+    if cfg is not None:
+        return max(10, min(600, to_int(cfg, _BROKER_HTTP_TIMEOUT_SEC_DEFAULT)))
+    if looks_local_base_url(base_url):
+        return _BROKER_HTTP_TIMEOUT_SEC_LOCAL_DEFAULT
+    return _BROKER_HTTP_TIMEOUT_SEC_DEFAULT
 
 
-def _tool_broker_http_retry_max() -> int:
+def _tool_broker_http_retry_max(base_url: str = "") -> int:
     raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER_HTTP_RETRY_MAX") or "").strip()
     if raw:
         return max(0, min(3, to_int(raw, _BROKER_HTTP_RETRY_MAX_DEFAULT)))
     cfg = config_get("workerpals.miniswe_tool_broker_http_retry_max", None)
+    if cfg is not None:
+        return max(0, min(3, to_int(cfg, _BROKER_HTTP_RETRY_MAX_DEFAULT)))
+    if looks_local_base_url(base_url):
+        return _BROKER_HTTP_RETRY_MAX_LOCAL_DEFAULT
+    return _BROKER_HTTP_RETRY_MAX_DEFAULT
+
+
+def _tool_broker_run_retry_max() -> int:
+    raw = (os.environ.get("WORKERPALS_MINISWE_TOOL_BROKER_RUN_RETRY_MAX") or "").strip()
+    if raw:
+        return max(0, min(3, to_int(raw, _BROKER_RUN_RETRY_MAX_DEFAULT)))
+    cfg = config_get("workerpals.miniswe_tool_broker_run_retry_max", None)
     if cfg is None:
-        return _BROKER_HTTP_RETRY_MAX_DEFAULT
-    return max(0, min(3, to_int(cfg, _BROKER_HTTP_RETRY_MAX_DEFAULT)))
+        return _BROKER_RUN_RETRY_MAX_DEFAULT
+    return max(0, min(3, to_int(cfg, _BROKER_RUN_RETRY_MAX_DEFAULT)))
 
 
 def _build_strict_tool_use_guidance(repo: str) -> str:
@@ -250,6 +268,24 @@ def _messages_indicate_missing_tool_calls(messages: Any) -> bool:
         if role == "user" and "no tool calls found" in content:
             no_tool_call_prompts += 1
     return (not saw_tool_call) and no_tool_call_prompts > 0
+
+
+def _is_timeout_like_error_text(value: object) -> bool:
+    text = str(value or "").strip().lower()
+    return "timeout" in text or "timed out" in text
+
+
+def _is_broker_timeout_failure(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if bool(result.get("ok")):
+        return False
+    summary = str(result.get("summary") or "").lower()
+    stderr = str(result.get("stderr") or "")
+    return (
+        "tool broker failed: llm request error" in summary
+        and _is_timeout_like_error_text(stderr)
+    )
 
 
 @dataclass
@@ -949,8 +985,8 @@ def _broker_run(
     max_steps = _tool_broker_max_steps()
     max_actions = _tool_broker_max_actions_per_step()
     shell_timeout_sec = _tool_broker_shell_timeout_sec()
-    http_timeout_sec = _tool_broker_http_timeout_sec()
-    http_retry_max = _tool_broker_http_retry_max()
+    http_timeout_sec = _tool_broker_http_timeout_sec(llm.base_url)
+    http_retry_max = _tool_broker_http_retry_max(llm.base_url)
 
     transcript: List[str] = []
     obs: str = ""
@@ -984,6 +1020,32 @@ def _broker_run(
             return 10
         return max(10, min(http_timeout_sec, remaining))
 
+    def _compact_messages_for_timeout_retry() -> bool:
+        nonlocal messages
+        if len(messages) <= 8:
+            return False
+        head: List[Dict[str, str]] = []
+        if messages and isinstance(messages[0], dict):
+            head.append(messages[0])
+        if len(messages) > 1 and isinstance(messages[1], dict):
+            head.append(messages[1])
+        tail = [m for m in messages[-6:] if isinstance(m, dict)]
+        compacted: List[Dict[str, str]] = list(head)
+        compacted.append(
+            {
+                "role": "user",
+                "content": (
+                    "Context was compacted after timeout. Continue from the latest observation and "
+                    "current repository state. Return STRICT JSON only."
+                ),
+            }
+        )
+        compacted.extend(tail)
+        if len(compacted) >= len(messages):
+            return False
+        messages = compacted
+        return True
+
     def _broker_llm_call(step_label: str) -> str:
         attempt = 0
         while True:
@@ -998,10 +1060,18 @@ def _broker_run(
                     raise RuntimeError(
                         f"{step_label} failed after {attempt} attempt(s): {msg}"
                     ) from exc
+                compacted = False
+                if attempt >= 2:
+                    compacted = _compact_messages_for_timeout_retry()
                 _record(
                     f"[Broker] {step_label} timeout; retry {attempt}/{http_retry_max + 1} "
                     f"(timeout={timeout_for_call}s): {msg}"
                 )
+                if compacted:
+                    _record(
+                        "[Broker] timeout mitigation: compacted broker message context "
+                        "before retry to reduce token load."
+                    )
                 time.sleep(min(2.0, 0.25 * attempt))
 
     def _broker_fail(summary: str, stderr: str, exit_code: int = 3) -> Dict[str, Any]:
@@ -1292,7 +1362,7 @@ def _broker_run(
                 if typ == "read_file":
                     path = str(act.get("path") or "")
                     content = _read_text_file(repo, path)
-                    preview = _truncate_observation(content, max_chars=2000)
+                    preview = _truncate_observation(content, max_chars=_BROKER_READ_PREVIEW_CHARS)
                     action_logs.append(
                         f"- read_file {path}: ok ({len(content)} chars total)\n{preview}"
                     )
@@ -1509,6 +1579,53 @@ def _run_miniswe_task(
     # Prepare broker config upfront (so we can fall back cleanly)
     llm_cfg = _LLMConfig(model=model_name, api_key=api_key or "", base_url=base_url or "")
 
+    def _run_broker_with_timeout_retry(extra_guidance: Optional[List[str]] = None) -> Dict[str, Any]:
+        broker_result = _broker_run(
+            repo,
+            instruction=_compose_instruction(extra_guidance=extra_guidance),
+            llm=llm_cfg,
+            timeout_ms=timeout_ms,
+            explicit_targets=explicit_targets,
+            write_globs=explicit_write_globs,
+        )
+        retry_max = _tool_broker_run_retry_max()
+        retry_count = 0
+        while retry_count < retry_max and _is_broker_timeout_failure(broker_result):
+            retry_count += 1
+            log.info(
+                "Tool broker timed out while waiting for model output; retrying broker run "
+                f"{retry_count}/{retry_max} with one-pass timeout recovery guidance."
+            )
+            timeout_guidance = [
+                "Timeout recovery mode: complete the task in one pass with minimal actions.",
+                "Prefer at most 3 actions: read target file(s), apply edit(s), run `git status --porcelain`.",
+                "Set done=true in the same response after applying edits.",
+            ]
+            merged_guidance = list(extra_guidance or [])
+            merged_guidance.extend(timeout_guidance)
+            previous = broker_result
+            broker_result = _broker_run(
+                repo,
+                instruction=_compose_instruction(extra_guidance=merged_guidance),
+                llm=llm_cfg,
+                timeout_ms=timeout_ms,
+                explicit_targets=explicit_targets,
+                write_globs=explicit_write_globs,
+            )
+            if not bool(broker_result.get("ok")):
+                prior_detail = to_single_line(
+                    previous.get("stderr") or previous.get("summary") or "",
+                    300,
+                )
+                if prior_detail:
+                    current_stdout = str(broker_result.get("stdout") or "")
+                    broker_result["stdout"] = (
+                        f"Prior timeout attempt detail: {prior_detail}\n\n{current_stdout}"
+                        if current_stdout
+                        else f"Prior timeout attempt detail: {prior_detail}"
+                    )
+        return broker_result
+
     exit_info: Dict[str, Any] = {}
     agent = None
     agent_messages: List[Dict[str, Any]] = []
@@ -1517,14 +1634,7 @@ def _run_miniswe_task(
     ran_primary_broker = False
     if prefer_broker_for_scoped_writes and broker_enabled:
         log.info("Using tool broker shim for strict per-write scope enforcement.")
-        broker_result = _broker_run(
-            repo,
-            instruction=_compose_instruction(),
-            llm=llm_cfg,
-            timeout_ms=timeout_ms,
-            explicit_targets=explicit_targets,
-            write_globs=explicit_write_globs,
-        )
+        broker_result = _run_broker_with_timeout_retry()
         if not bool(broker_result.get("ok")):
             return {
                 "ok": False,
@@ -1618,14 +1728,7 @@ def _run_miniswe_task(
             if is_no_tool_calls_error(exc):
                 if broker_enabled:
                     log.info("mini-swe-agent failed due to missing tool calls; falling back to tool broker shim.")
-                    broker_result = _broker_run(
-                        repo,
-                        instruction=_compose_instruction(),
-                        llm=llm_cfg,
-                        timeout_ms=timeout_ms,
-                        explicit_targets=explicit_targets,
-                        write_globs=explicit_write_globs,
-                    )
+                    broker_result = _run_broker_with_timeout_retry()
                     if not bool(broker_result.get("ok")):
                         return {
                             "ok": False,
@@ -1665,14 +1768,7 @@ def _run_miniswe_task(
         if _messages_indicate_missing_tool_calls(agent_messages):
             if broker_enabled:
                 log.info("mini-swe-agent exited without tool calls; falling back to tool broker shim.")
-                broker_result = _broker_run(
-                    repo,
-                    instruction=_compose_instruction(),
-                    llm=llm_cfg,
-                    timeout_ms=timeout_ms,
-                    explicit_targets=explicit_targets,
-                    write_globs=explicit_write_globs,
-                )
+                broker_result = _run_broker_with_timeout_retry()
                 if not bool(broker_result.get("ok")):
                     return {
                         "ok": False,
