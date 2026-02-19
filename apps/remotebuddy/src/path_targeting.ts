@@ -31,7 +31,10 @@ export function normalizeRepoPathHint(value: unknown): string | null {
 
   if (/^[A-Za-z]:[\\/]/.test(path)) return null;
 
-  path = path.replace(/^\.\/+/, "").replace(/\/+/g, "/").trim();
+  path = path
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/")
+    .trim();
   if (!path || path === ".") return ".";
   if (path.startsWith(":(")) return null;
 

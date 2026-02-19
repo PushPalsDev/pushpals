@@ -264,8 +264,7 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   ).slice(0, MAX_ASSISTANT_CHARS);
 
   const requires_worker = requiresWorker;
-  const writeAllowed =
-    requires_worker && intent === "code_change" ? true : writeAllowedRaw;
+  const writeAllowed = requires_worker && intent === "code_change" ? true : writeAllowedRaw;
   const job_kind: "task.execute" | "none" = requires_worker ? "task.execute" : "none";
 
   return {

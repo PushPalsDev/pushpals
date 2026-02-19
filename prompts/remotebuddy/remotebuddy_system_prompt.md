@@ -62,16 +62,16 @@ Return exactly this object shape with these keys:
 "job_kind": "task.execute|none",
 "lane": "deterministic|worker",
 "scope": {
-  "read_anywhere": true|false,
-  "write_allowed": true|false,
-  "write_globs": ["..."],
-  "forbidden_globs": ["..."],
-  "max_files_to_edit": 1
+"read_anywhere": true|false,
+"write_allowed": true|false,
+"write_globs": ["..."],
+"forbidden_globs": ["..."],
+"max_files_to_edit": 1
 },
 "discovery": {
-  "ripgrep_queries": ["..."],
-  "likely_dirs": ["..."],
-  "keywords": ["..."]
+"ripgrep_queries": ["..."],
+"likely_dirs": ["..."],
+"keywords": ["..."]
 },
 "acceptance_criteria": ["..."],
 "validation_steps": ["..."],

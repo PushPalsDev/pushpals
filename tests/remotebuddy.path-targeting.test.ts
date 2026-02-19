@@ -1,8 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  normalizeRepoPathHint,
-  plannerTargetPaths,
-} from "../apps/remotebuddy/src/path_targeting";
+import { normalizeRepoPathHint, plannerTargetPaths } from "../apps/remotebuddy/src/path_targeting";
 
 describe("remotebuddy path targeting", () => {
   test("normalizes safe repo-relative hints", () => {

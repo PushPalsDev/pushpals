@@ -587,7 +587,10 @@ function normalizeStagePath(value: unknown): string | null {
   else if (path.startsWith("/")) return null;
   if (/^[A-Za-z]:[\\/]/.test(path)) return null;
 
-  path = path.replace(/^\.\/+/, "").replace(/\/+/g, "/").trim();
+  path = path
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/")
+    .trim();
   if (!path || path === ".") return ".";
   if (path.startsWith(":(")) return null;
 
@@ -892,7 +895,9 @@ function planningPathHints(value: unknown): string[] {
   }
 
   const discovery =
-    planning.discovery && typeof planning.discovery === "object" && !Array.isArray(planning.discovery)
+    planning.discovery &&
+    typeof planning.discovery === "object" &&
+    !Array.isArray(planning.discovery)
       ? (planning.discovery as Record<string, unknown>)
       : null;
   if (discovery) {
@@ -909,13 +914,7 @@ function buildStageTargets(kind: string, params?: Record<string, unknown>): stri
       const paths = toStringArray(p.paths);
       const planHints = planningPathHints(p.planning);
       const inferred = toPath(inferTargetPathFromInstruction(String(p.instruction ?? "")));
-      return dedupePaths([
-        ...paths,
-        ...planHints,
-        toPath(p.targetPath),
-        toPath(p.path),
-        inferred,
-      ]);
+      return dedupePaths([...paths, ...planHints, toPath(p.targetPath), toPath(p.path), inferred]);
     }
     default:
       return [];
@@ -1175,7 +1174,11 @@ function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
     out.scope = normalizedScope;
   }
 
-  if (planning.discovery && typeof planning.discovery === "object" && !Array.isArray(planning.discovery)) {
+  if (
+    planning.discovery &&
+    typeof planning.discovery === "object" &&
+    !Array.isArray(planning.discovery)
+  ) {
     const discovery = planning.discovery as Record<string, unknown>;
     const normalizedDiscovery: Record<string, unknown> = { ...discovery };
     if (isStringArray(discovery.likelyDirs)) {

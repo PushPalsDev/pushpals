@@ -1130,11 +1130,7 @@ class RemoteBuddyOrchestrator {
       let lane = requiresWorker
         ? this.chooseExecutionLane(prompt, plan, targetPaths.length)
         : "deterministic";
-      if (
-        requiresWorker &&
-        lane === "deterministic" &&
-        (!targetPath || targetPath === ".")
-      ) {
+      if (requiresWorker && lane === "deterministic" && (!targetPath || targetPath === ".")) {
         lane = "worker";
       }
       if (forceWorker) {
