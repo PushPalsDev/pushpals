@@ -563,6 +563,50 @@ function extractClarificationFromCompletionSummary(summary: string): string | nu
   return question ? question : null;
 }
 
+function isNoProgressBrokerFailure(message: string, detail: string): boolean {
+  const combined = `${message}\n${detail}`.toLowerCase();
+  return (
+    combined.includes("tool broker failed: did not reach done=true before limits") ||
+    combined.includes("model did not return done=true before max steps/timeout") ||
+    combined.includes("tool broker failed: no explicit validation command was executed")
+  );
+}
+
+function extractClarificationFromJobFailure(
+  message: string,
+  detail: string,
+  logs: JobLogEntry[] = [],
+): string | null {
+  if (isNoProgressBrokerFailure(message, detail)) {
+    return (
+      "Please narrow the request to concrete target file(s), the exact test/assertion to add, and a specific validation command. " +
+      "Example: edit `tests/remotebuddy.path-targeting.test.ts`, add one case, then run `bun test tests/remotebuddy.path-targeting.test.ts`."
+    );
+  }
+
+  if (!Array.isArray(logs) || logs.length === 0) return null;
+  const joined = logs
+    .map((row) => String(row?.message ?? ""))
+    .join("\n")
+    .toLowerCase();
+  const hasBrokerSteps = joined.includes("[broker] step");
+  const hasEditAction =
+    joined.includes("append_line") ||
+    joined.includes("replace_text_once") ||
+    joined.includes("write_file");
+  const hasCommandPolicyRejections =
+    joined.includes("shell command rejected") ||
+    joined.includes("shell metacharacters are not allowed") ||
+    joined.includes("binary not allowed");
+  if (hasBrokerSteps && !hasEditAction && hasCommandPolicyRejections) {
+    return (
+      "Please provide a more bounded request with explicit file paths and a simple validation command (no shell pipes/chaining). " +
+      "This helps the worker avoid exploration loops and apply an edit in one pass."
+    );
+  }
+  return null;
+}
+
 class RemoteBuddyOrchestrator {
   private static readonly SESSION_MONITOR_MAX_WS_ERRORS = Math.max(
     1,
@@ -806,6 +850,19 @@ class RemoteBuddyOrchestrator {
     detail: string,
   ): Promise<void> {
     const shortJob = jobId.slice(0, 8);
+    const clarificationQuestion = extractClarificationFromJobFailure(message, detail);
+    if (clarificationQuestion) {
+      const clarificationMsg =
+        `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationQuestion}\n\n` +
+        "Reply with the missing details and I will enqueue a focused follow-up request.";
+      await this.comm.assistantMessage(clarificationMsg, {
+        correlationId: envelope.correlationId,
+        turnId: envelope.turnId,
+        parentId: envelope.id,
+      });
+      return;
+    }
+
     const willFetchLogs = this.fetchFailureLogsOnJobFailure;
     const fetchMsg = isStrictPreflightJsonFailure(message, detail)
       ? willFetchLogs
@@ -832,6 +889,25 @@ class RemoteBuddyOrchestrator {
 
     console.warn(`[RemoteBuddy] Fetching failure logs for job ${jobId}...`);
     const logs = await this.fetchJobLogs(jobId, 80);
+    const clarificationFromLogs = extractClarificationFromJobFailure(message, detail, logs);
+    if (clarificationFromLogs) {
+      const tail = logs
+        .slice(-6)
+        .map((row) => toSingleLine(row.message, 220))
+        .filter(Boolean);
+      const tailText = tail.length ? `\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\`` : "";
+      const clarificationMsg =
+        `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationFromLogs}\n\n` +
+        "Reply with the missing details and I will enqueue a focused follow-up request." +
+        tailText;
+      await this.comm.assistantMessage(clarificationMsg, {
+        correlationId: envelope.correlationId,
+        turnId: envelope.turnId,
+        parentId: envelope.id,
+      });
+      return;
+    }
+
     const explanation = explainJobFailureFromLogs(logs, message, detail);
 
     const tail = logs

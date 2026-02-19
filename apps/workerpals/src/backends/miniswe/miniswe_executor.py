@@ -107,6 +107,8 @@ _DENY_PATTERNS = [
 ]
 _ALLOWED_BINARIES = {
     "git",
+    "bun",
+    "npm",
     "cat",
     "tail",
     "head",
@@ -130,6 +132,10 @@ _ALLOWED_GIT_SUBCOMMANDS = {
     "grep",
     "rev-parse",
     "ls-files",
+}
+_ALLOWED_PACKAGE_RUNNERS = {
+    "bun": {"test", "run", "--version", "-v"},
+    "npm": {"test", "run", "--version", "-v"},
 }
 _SHELL_META_CHARS = set(";|&$`()<>")
 _BROKER_MAX_WRITE_CHARS = 200_000
@@ -286,6 +292,15 @@ def _is_broker_timeout_failure(result: object) -> bool:
         "tool broker failed: llm request error" in summary
         and _is_timeout_like_error_text(stderr)
     )
+
+
+def _is_broker_incomplete_failure(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if bool(result.get("ok")):
+        return False
+    summary = str(result.get("summary") or "").lower()
+    return "tool broker failed: did not reach done=true before limits" in summary
 
 
 @dataclass
@@ -549,6 +564,19 @@ def _parse_and_validate_shell_command(cmd: str) -> Tuple[Optional[List[str]], st
     binary = args[0].strip().lower()
     if binary not in _ALLOWED_BINARIES:
         return None, f"binary not allowed: {binary}"
+    if binary in _ALLOWED_PACKAGE_RUNNERS:
+        if len(args) < 2:
+            return None, f"{binary} command requires a subcommand"
+        sub = args[1].strip().lower()
+        if sub not in _ALLOWED_PACKAGE_RUNNERS[binary]:
+            return None, f"{binary} subcommand not allowed: {sub}"
+        # Allow script runner only for repo scripts with a simple token.
+        if sub == "run":
+            if len(args) < 3:
+                return None, f"{binary} run requires a script name"
+            script_name = str(args[2] or "").strip().lower()
+            if not re.match(r"^[a-z0-9:_\-.]+$", script_name):
+                return None, f"{binary} run script token is not allowed: {script_name!r}"
     lowered = c.lower()
     for pat in _DENY_PATTERNS:
         if re.search(pat, lowered):
@@ -600,6 +628,39 @@ def _parse_and_validate_shell_command(cmd: str) -> Tuple[Optional[List[str]], st
         if "system(" in joined:
             return None, "awk system() is not allowed"
     return args, ""
+
+
+def _attempt_salvage_rejected_shell_command(cmd: str, error_text: str) -> Optional[str]:
+    """
+    Best-effort salvage for common model command issues:
+    - strip piped/redirection suffixes from an otherwise valid command
+    - map common npm test/run invocations to bun equivalents for this repo
+    """
+    raw = str(cmd or "").strip()
+    if not raw:
+        return None
+    lowered_err = str(error_text or "").lower()
+
+    # If metacharacters were rejected, keep the prefix command before first metachar.
+    if "metacharacters" in lowered_err:
+        candidate = re.split(r"[;|&$`()<>]", raw, maxsplit=1)[0].strip()
+        if candidate and candidate != raw:
+            args, _ = _parse_and_validate_shell_command(candidate)
+            if args is not None:
+                return candidate
+
+    # If npm was rejected (or missing), try equivalent bun command.
+    if "binary not allowed: npm" in lowered_err or "no such file or directory" in lowered_err:
+        parts = raw.split()
+        if len(parts) >= 2 and parts[0].lower() == "npm":
+            sub = parts[1].lower()
+            if sub in {"test", "run"}:
+                candidate = "bun " + " ".join(parts[1:])
+                args, _ = _parse_and_validate_shell_command(candidate)
+                if args is not None:
+                    return candidate
+
+    return None
 
 
 def _run_shell(repo: str, cmd: str, max_output: int = 60000, timeout_sec: Optional[int] = None) -> str:
@@ -960,9 +1021,14 @@ def _broker_system_prompt(repo: str) -> str:
         '- JSON syntax must be exact: use ":" between keys and values, never ",".\n'
         "- Use double quotes for all keys and string values.\n"
         "- Paths must be repo-relative.\n"
+        "- run_shell safety: no pipes/redirection/chaining; issue one simple command per action.\n"
+        "- Allowed run_shell binaries: git, bun, npm, cat, tail, head, ls, find, rg, grep, sed, awk, wc, stat, printf, echo, test.\n"
+        "- For this repository, prefer `bun test` / `bun run <script>` over npm.\n"
         "- Use read_file before edit when unsure.\n"
         "- After edits, run_shell: \"git status --porcelain\".\n"
         "- If the instruction is a bounded edit over explicit file paths, complete all requested edits in one response when possible.\n"
+        "- Progress requirement: do not spend more than 2 steps on exploration; then perform an edit action.\n"
+        "- If blocked from editing after exploration, set done=true and explain the blocker in note.\n"
         "- Do not stop after partially applying explicit directives; only set done=true after all requested edits are handled.\n"
         "- When task is complete, set done=true and keep actions empty or only verification commands.\n"
     )
@@ -1221,6 +1287,8 @@ def _broker_run(
 
     step = 0
     model_done = False
+    no_edit_steps = 0
+    no_progress_nudges = 0
     while step < max_steps and time.time() < deadline:
         step += 1
 
@@ -1356,6 +1424,8 @@ def _broker_run(
 
         # Execute actions
         action_logs: List[str] = []
+        step_made_edit = False
+        step_had_shell_rejection = False
         for i, act in enumerate(planned_actions, start=1):
             typ = str(act.get("type") or "").strip()
             try:
@@ -1371,6 +1441,7 @@ def _broker_run(
                     line = str(act.get("line") or "")
                     _append_line(repo, path, line, allowed_write_globs)
                     edits_made = True
+                    step_made_edit = True
                     action_logs.append(f"- append_line {path}: ok (appended {line!r})")
                 elif typ == "replace_text_once":
                     path = str(act.get("path") or "")
@@ -1378,12 +1449,14 @@ def _broker_run(
                     new = str(act.get("new") or "")
                     n = _replace_text_once(repo, path, old, new, allowed_write_globs)
                     edits_made = edits_made or (n > 0)
+                    step_made_edit = step_made_edit or (n > 0)
                     action_logs.append(f"- replace_text_once {path}: {n} replacement(s)")
                 elif typ == "write_file":
                     path = str(act.get("path") or "")
                     content = str(act.get("content") or "")
                     _write_text_file(repo, path, content, allowed_write_globs)
                     edits_made = True
+                    step_made_edit = True
                     action_logs.append(f"- write_file {path}: ok ({len(content)} chars)")
                 elif typ == "run_shell":
                     cmd = str(act.get("command") or "")
@@ -1393,12 +1466,60 @@ def _broker_run(
                 else:
                     action_logs.append(f"- action {i}: unknown type {typ!r} (rejected by schema)")
             except Exception as exc:
-                action_logs.append(f"- {typ or 'action'} failed: {to_single_line(exc, 400)}")
+                err = to_single_line(exc, 400)
+                if typ == "run_shell":
+                    if "Shell command rejected:" in err:
+                        step_had_shell_rejection = True
+                    salvage_cmd = _attempt_salvage_rejected_shell_command(
+                        str(act.get("command") or ""),
+                        err,
+                    )
+                    if salvage_cmd:
+                        try:
+                            salvage_out = _run_shell(repo, salvage_cmd, timeout_sec=shell_timeout_sec)
+                            shell_validation_ran = shell_validation_ran or _is_git_porcelain_status_command(
+                                salvage_cmd,
+                            )
+                            action_logs.append(
+                                f"- run_shell {str(act.get('command') or '')!r}: rejected ({err}); "
+                                f"salvage executed {salvage_cmd!r}:\n{salvage_out}"
+                            )
+                            continue
+                        except Exception as salvage_exc:
+                            err = f"{err}; salvage failed: {to_single_line(salvage_exc, 260)}"
+                action_logs.append(f"- {typ or 'action'} failed: {err}")
 
         obs = _truncate_observation("\n".join(action_logs).strip())
+        if step_made_edit:
+            no_edit_steps = 0
+        else:
+            no_edit_steps += 1
 
         # Feed the raw JSON back as assistant message (helps the model stay consistent)
         messages.append({"role": "assistant", "content": raw_used})
+        if (
+            not done
+            and not step_made_edit
+            and no_edit_steps >= 2
+            and no_progress_nudges < 2
+            and step < max_steps
+        ):
+            no_progress_nudges += 1
+            nudge_lines = [
+                "Progress guard: you have not produced any edit actions yet.",
+                "In your NEXT response, either:",
+                '1) include at least one edit action (`append_line`, `replace_text_once`, or `write_file`) that advances the task, OR',
+                "2) if genuinely blocked, set done=true and explain the blocker in note.",
+                "Do not continue pure exploration.",
+            ]
+            if step_had_shell_rejection:
+                nudge_lines.append(
+                    "Reminder: run_shell forbids pipes/redirection/chaining; use one simple command."
+                )
+            messages.append({"role": "user", "content": "\n".join(nudge_lines)})
+            _record(
+                f"[Broker] progress guard nudge injected (step={step}, no_edit_steps={no_edit_steps})."
+            )
 
         if done:
             _record("[Broker] Model signaled done=true.")
@@ -1417,18 +1538,29 @@ def _broker_run(
     if transcript_text:
         stdout += "Tool broker transcript:\n" + transcript_text + "\n\n"
     stdout += "Final verification:\n" + final_status
+    changed_paths = summarize_git_changes(repo)
 
     if not model_done:
-        return {
-            "ok": False,
-            "summary": "tool broker failed: did not reach done=true before limits",
-            "stdout": stdout,
-            "stderr": (
-                "Model did not return done=true before max steps/timeout. "
-                "Treating broker run as incomplete."
-            ),
-            "exitCode": 3,
-        }
+        if edits_made and changed_paths:
+            _record(
+                "[Broker] model never returned done=true, but edits were observed; "
+                "auto-finalizing based on repository state."
+            )
+            stdout += (
+                "\n\nAuto-finalize: model did not return done=true, "
+                "but repository changes were detected."
+            )
+        else:
+            return {
+                "ok": False,
+                "summary": "tool broker failed: did not reach done=true before limits",
+                "stdout": stdout,
+                "stderr": (
+                    "Model did not return done=true before max steps/timeout. "
+                    "Treating broker run as incomplete."
+                ),
+                "exitCode": 3,
+            }
     if final_status_exit is not None and final_status_exit != 0:
         return {
             "ok": False,
@@ -1437,7 +1569,6 @@ def _broker_run(
             "stderr": "Final verification command `git status --porcelain` failed.",
             "exitCode": 3,
         }
-    changed_paths = summarize_git_changes(repo)
     if edits_made and not changed_paths:
         return {
             "ok": False,
@@ -1474,13 +1605,11 @@ def _broker_run(
                 }
             stdout += "\n\nTarget-path mismatch (heuristic, non-fatal):\n" + msg
     if edits_made and not shell_validation_ran:
-        return {
-            "ok": False,
-            "summary": "tool broker failed: no explicit validation command was executed",
-            "stdout": stdout,
-            "stderr": "Model performed edits but did not run `git status --porcelain` during broker steps.",
-            "exitCode": 3,
-        }
+        stdout += (
+            "\n\nValidation note:\n"
+            "Model did not run `git status --porcelain` during broker steps; "
+            "broker-level final verification was used."
+        )
 
     return {
         "ok": True,
@@ -1579,7 +1708,7 @@ def _run_miniswe_task(
     # Prepare broker config upfront (so we can fall back cleanly)
     llm_cfg = _LLMConfig(model=model_name, api_key=api_key or "", base_url=base_url or "")
 
-    def _run_broker_with_timeout_retry(extra_guidance: Optional[List[str]] = None) -> Dict[str, Any]:
+    def _run_broker_with_recovery(extra_guidance: Optional[List[str]] = None) -> Dict[str, Any]:
         broker_result = _broker_run(
             repo,
             instruction=_compose_instruction(extra_guidance=extra_guidance),
@@ -1590,19 +1719,34 @@ def _run_miniswe_task(
         )
         retry_max = _tool_broker_run_retry_max()
         retry_count = 0
-        while retry_count < retry_max and _is_broker_timeout_failure(broker_result):
+        while retry_count < retry_max and (
+            _is_broker_timeout_failure(broker_result)
+            or _is_broker_incomplete_failure(broker_result)
+        ):
             retry_count += 1
-            log.info(
-                "Tool broker timed out while waiting for model output; retrying broker run "
-                f"{retry_count}/{retry_max} with one-pass timeout recovery guidance."
-            )
-            timeout_guidance = [
-                "Timeout recovery mode: complete the task in one pass with minimal actions.",
+            timeout_like = _is_broker_timeout_failure(broker_result)
+            if timeout_like:
+                log.info(
+                    "Tool broker timed out while waiting for model output; retrying broker run "
+                    f"{retry_count}/{retry_max} with one-pass timeout recovery guidance."
+                )
+            else:
+                log.info(
+                    "Tool broker did not converge before limits; retrying broker run "
+                    f"{retry_count}/{retry_max} with strict completion guidance."
+                )
+            retry_guidance = [
+                "Recovery mode: complete the task in one pass with minimal actions.",
                 "Prefer at most 3 actions: read target file(s), apply edit(s), run `git status --porcelain`.",
+                "Do not perform broad exploration.",
                 "Set done=true in the same response after applying edits.",
             ]
+            if not timeout_like:
+                retry_guidance.append(
+                    "If no edit is possible, set done=true and explain the blocker in note."
+                )
             merged_guidance = list(extra_guidance or [])
-            merged_guidance.extend(timeout_guidance)
+            merged_guidance.extend(retry_guidance)
             previous = broker_result
             broker_result = _broker_run(
                 repo,
@@ -1634,7 +1778,7 @@ def _run_miniswe_task(
     ran_primary_broker = False
     if prefer_broker_for_scoped_writes and broker_enabled:
         log.info("Using tool broker shim for strict per-write scope enforcement.")
-        broker_result = _run_broker_with_timeout_retry()
+        broker_result = _run_broker_with_recovery()
         if not bool(broker_result.get("ok")):
             return {
                 "ok": False,
@@ -1728,7 +1872,7 @@ def _run_miniswe_task(
             if is_no_tool_calls_error(exc):
                 if broker_enabled:
                     log.info("mini-swe-agent failed due to missing tool calls; falling back to tool broker shim.")
-                    broker_result = _run_broker_with_timeout_retry()
+                    broker_result = _run_broker_with_recovery()
                     if not bool(broker_result.get("ok")):
                         return {
                             "ok": False,
@@ -1768,7 +1912,7 @@ def _run_miniswe_task(
         if _messages_indicate_missing_tool_calls(agent_messages):
             if broker_enabled:
                 log.info("mini-swe-agent exited without tool calls; falling back to tool broker shim.")
-                broker_result = _run_broker_with_timeout_retry()
+                broker_result = _run_broker_with_recovery()
                 if not bool(broker_result.get("ok")):
                     return {
                         "ok": False,
