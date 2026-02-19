@@ -3,6 +3,7 @@ import { SessionManager } from "./events.js";
 import { JobQueue } from "./jobs.js";
 import { RequestQueue } from "./requests.js";
 import { CompletionQueue } from "./completions.js";
+import { AutonomyStore } from "./autonomy.js";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import { loadPushPalsConfig } from "shared";
@@ -17,6 +18,7 @@ const sessionManager = new SessionManager(sharedDbPath);
 const jobQueue = new JobQueue(sharedDbPath);
 const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
+const autonomyStore = new AutonomyStore(sharedDbPath);
 
 /**
  * HTTP Middleware & Routes
@@ -60,6 +62,15 @@ export function createRequestHandler() {
         if (!Number.isFinite(parsed) || parsed <= 0) return null;
         return parsed;
       };
+      const parseBool = (raw: string | null, fallback = false): boolean => {
+        const text = String(raw ?? "")
+          .trim()
+          .toLowerCase();
+        if (!text) return fallback;
+        if (["1", "true", "yes", "on"].includes(text)) return true;
+        if (["0", "false", "no", "off"].includes(text)) return false;
+        return fallback;
+      };
       const compactText = (value: unknown, maxChars = 500): string => {
         const text = String(value ?? "")
           .replace(/\s+/g, " ")
@@ -67,6 +78,18 @@ export function createRequestHandler() {
         if (!text) return "";
         if (text.length <= maxChars) return text;
         return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+      };
+      const parseJsonRecord = (value: unknown): Record<string, unknown> => {
+        if (typeof value !== "string" || !value.trim()) return {};
+        try {
+          const parsed = JSON.parse(value) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+          }
+        } catch {
+          // ignore malformed JSON payload
+        }
+        return {};
       };
       const maybeRecoverStaleClaims = (): void => {
         const nowMs = Date.now();
@@ -112,6 +135,9 @@ export function createRequestHandler() {
           } catch (_e) {}
           try {
             completionQueue.close();
+          } catch (_e) {}
+          try {
+            autonomyStore.close();
           } catch (_e) {}
           try {
             server.stop(true);
@@ -453,6 +479,298 @@ export function createRequestHandler() {
         });
       }
 
+      // POST /autonomy/lock/acquire
+      if (pathname === "/autonomy/lock/acquire" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const sessionId = compactText(body.sessionId, 128);
+        const runId = compactText(body.runId, 128);
+        const ttlMs = Number(body.ttlMs);
+        if (!sessionId || !runId) {
+          return makeJson({ ok: false, message: "sessionId and runId are required" }, 400);
+        }
+        const result = autonomyStore.acquireDispatchLock({
+          sessionId,
+          runId,
+          ttlMs: Number.isFinite(ttlMs) ? ttlMs : undefined,
+        });
+        if (!result.ok) return makeJson(result, 409);
+        return makeJson(result, 200);
+      }
+
+      // POST /autonomy/lock/release
+      if (pathname === "/autonomy/lock/release" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const sessionId = compactText(body.sessionId, 128);
+        const runId = compactText(body.runId, 128);
+        if (!sessionId || !runId) {
+          return makeJson({ ok: false, message: "sessionId and runId are required" }, 400);
+        }
+        return makeJson(autonomyStore.releaseDispatchLock({ sessionId, runId }), 200);
+      }
+
+      // POST /autonomy/lock/renew
+      if (pathname === "/autonomy/lock/renew" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const sessionId = compactText(body.sessionId, 128);
+        const runId = compactText(body.runId, 128);
+        const ttlMs = Number(body.ttlMs);
+        if (!sessionId || !runId) {
+          return makeJson({ ok: false, message: "sessionId and runId are required" }, 400);
+        }
+        const result = autonomyStore.renewDispatchLock({
+          sessionId,
+          runId,
+          ttlMs: Number.isFinite(ttlMs) ? ttlMs : undefined,
+        });
+        if (!result.ok) return makeJson(result, 409);
+        return makeJson(result, 200);
+      }
+
+      // GET /autonomy/snapshot
+      if (pathname === "/autonomy/snapshot" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        maybeRecoverStaleClaims();
+
+        const sessionId = (url.searchParams.get("sessionId") ?? "").trim();
+        const runId = (url.searchParams.get("runId") ?? "").trim();
+        if (!sessionId) {
+          return makeJson({ ok: false, message: "sessionId is required" }, 400);
+        }
+        const snapshot = autonomyStore.createSnapshot({
+          sessionId,
+          runId,
+          requestSlo: requestQueue.sloSummary(24),
+          jobSlo: jobQueue.sloSummary(24),
+          repoHealthFlags: {
+            is_worktree_dirty: parseBool(url.searchParams.get("isWorktreeDirty"), false),
+            is_merge_in_progress: parseBool(url.searchParams.get("isMergeInProgress"), false),
+          },
+        });
+        return makeJson({ ok: true, snapshot }, 200);
+      }
+
+      // POST /autonomy/eligibility
+      if (pathname === "/autonomy/eligibility" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.evaluateEligibility(body);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // POST /autonomy/objectives
+      if (pathname === "/autonomy/objectives" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.recordObjectiveDecision(body);
+        if (!result.ok) {
+          return makeJson(result, 400);
+        }
+
+        const objective = body.objective && typeof body.objective === "object" ? body.objective : null;
+        const sessionId = compactText(body.sessionId, 128);
+        const runId = compactText(body.runId, 128);
+        const snapshotId = compactText(body.snapshotId, 128);
+        const candidateRows = Array.isArray(body.candidates)
+          ? (body.candidates.filter((entry) => entry && typeof entry === "object") as Array<
+              Record<string, unknown>
+            >)
+          : [];
+        if (objective && sessionId) {
+          const objectiveRecord = objective as Record<string, unknown>;
+          const objectiveId = compactText(objectiveRecord.id ?? result.objectiveId, 128);
+          const status = compactText(objectiveRecord.status, 64);
+          const requestId = compactText(objectiveRecord.requestId ?? objectiveRecord.request_id, 128);
+          const patternKey = compactText(
+            (objectiveRecord as Record<string, unknown>).patternKey ??
+              (objectiveRecord as Record<string, unknown>).pattern_key,
+            128,
+          );
+          const session = sessionManager.getSession(sessionId);
+          if (session && objectiveId && runId && snapshotId) {
+            if (status === "dispatched" && requestId) {
+              session.emit({
+                protocolVersion: PROTOCOL_VERSION,
+                id: randomUUID(),
+                ts: new Date().toISOString(),
+                sessionId,
+                type: "autonomy_objective_dispatched",
+                from: "server:autonomy",
+                payload: {
+                  runId,
+                  snapshotId,
+                  objectiveId,
+                  requestId,
+                  patternKey: patternKey || "unknown",
+                  origin: "autonomy",
+                },
+              });
+            } else if (status === "blocked") {
+              session.emit({
+                protocolVersion: PROTOCOL_VERSION,
+                id: randomUUID(),
+                ts: new Date().toISOString(),
+                sessionId,
+                type: "autonomy_objective_blocked",
+                from: "server:autonomy",
+                payload: {
+                  runId,
+                  snapshotId,
+                  objectiveId,
+                  reason: compactText(
+                    objectiveRecord.blockReason ?? objectiveRecord.block_reason ?? "blocked",
+                    300,
+                  ),
+                  origin: "autonomy",
+                  ...(result.questionId ? { questionId: result.questionId } : {}),
+                  ...(patternKey ? { patternKey } : {}),
+                },
+              });
+            }
+          }
+          if (session && result.questionId) {
+            const q = body.question && typeof body.question === "object" ? (body.question as Record<string, unknown>) : {};
+            session.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID(),
+              ts: new Date().toISOString(),
+              sessionId,
+              type: "question_asked",
+              from: "server:autonomy",
+              payload: {
+                questionId: result.questionId,
+                objectiveId: objectiveId || "unknown",
+                question: compactText(q.question, 500),
+                questionType: compactText(q.questionType ?? q.question_type, 120) || "unknown",
+              },
+            });
+          }
+        }
+        if (sessionId && runId && snapshotId && candidateRows.length > 0) {
+          const session = sessionManager.getSession(sessionId);
+          if (session) {
+            const topCandidateIds = candidateRows
+              .map((entry) => ({
+                id: compactText(entry.id, 128),
+                selected: Boolean(entry.selected),
+                score: Number(entry.final_score ?? entry.finalScore ?? Number.NEGATIVE_INFINITY),
+              }))
+              .sort((a, b) => {
+                if (a.selected !== b.selected) return a.selected ? -1 : 1;
+                if (a.score !== b.score) return b.score - a.score;
+                return a.id.localeCompare(b.id);
+              })
+              .map((entry) => entry.id)
+              .filter(Boolean)
+              .slice(0, 3);
+            session.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID(),
+              ts: new Date().toISOString(),
+              sessionId,
+              type: "autonomy_candidates_generated",
+              from: "server:autonomy",
+              payload: {
+                runId,
+                snapshotId,
+                candidateCount: candidateRows.length,
+                ...(topCandidateIds.length > 0 ? { topCandidateIds } : {}),
+              },
+            });
+          }
+        }
+        return makeJson(result, 200);
+      }
+
+      // POST /autonomy/outcomes
+      if (pathname === "/autonomy/outcomes" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.recordOutcome(body);
+        if (!result.ok) return makeJson(result, 400);
+
+        const sessionId = compactText(body.sessionId, 128);
+        const session = sessionId ? sessionManager.getSession(sessionId) : null;
+        if (session) {
+          session.emit({
+            protocolVersion: PROTOCOL_VERSION,
+            id: randomUUID(),
+            ts: new Date().toISOString(),
+            sessionId,
+            type: "autonomy_feedback_recorded",
+            from: "server:autonomy",
+            payload: {
+              objectiveId: compactText(body.objectiveId ?? body.objective_id, 128) || "unknown",
+              patternKey: compactText(body.patternKey ?? body.pattern_key, 128) || "unknown",
+              outcome: compactText(body.userAction ?? body.user_action ?? "recorded", 120),
+              success: Boolean(body.success),
+            },
+          });
+        }
+        return makeJson(result, 200);
+      }
+
+      // GET /questions
+      if (pathname === "/questions" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const sessionId = (url.searchParams.get("sessionId") ?? "").trim() || undefined;
+        const status = (url.searchParams.get("status") ?? "").trim() || undefined;
+        const limit = parseLimit(url.searchParams.get("limit"), 100);
+        const questions = autonomyStore.listQuestions({
+          sessionId,
+          status: status as "open" | "answered" | "invalid" | "closed" | undefined,
+          limit,
+        });
+        return makeJson({ ok: true, questions }, 200);
+      }
+
+      // POST /questions/:id/answer
+      const qAnswerMatch = pathname.match(/^\/questions\/([^/]+)\/answer$/);
+      if (qAnswerMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const questionId = qAnswerMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.answerQuestion(questionId, body.answer);
+        if (!result.ok) return makeJson(result, 400);
+
+        const sessionId = compactText(body.sessionId, 128);
+        const session = sessionId ? sessionManager.getSession(sessionId) : null;
+        if (session) {
+          session.emit({
+            protocolVersion: PROTOCOL_VERSION,
+            id: randomUUID(),
+            ts: new Date().toISOString(),
+            sessionId,
+            type: "question_answered",
+            from: "server:autonomy",
+            payload: {
+              questionId,
+              objectiveId: result.objectiveId || "unknown",
+              status: result.status === "valid" ? "valid" : "invalid",
+              ...(result.reason ? { answerSummary: compactText(result.reason, 240) } : {}),
+            },
+          });
+        }
+        return makeJson(result, 200);
+      }
+
       // GET /jobs
       if (pathname === "/jobs" && method === "GET") {
         const denied = requireAuth();
@@ -531,6 +849,24 @@ export function createRequestHandler() {
           const durationText =
             typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
           console.log(`[Server] Job ${jobId} completed (${durationText})`);
+          const job = jobQueue.getJob(jobId);
+          const params = parseJsonRecord(job?.params ?? "");
+          const requestId = compactText(params.requestId, 128);
+          if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
+          const matched = autonomyStore.findObjectiveByJobId(jobId);
+          if (matched) {
+            autonomyStore.recordOutcome({
+              objectiveId: matched.objectiveId,
+              requestId,
+              jobId,
+              patternKey: matched.patternKey,
+              success: true,
+              latencyMs: result.durationMs ?? null,
+              userAction: "applied",
+              reopenedWithin24h: false,
+              regressionFlag: false,
+            });
+          }
         }
         return makeJson(result, result.ok ? 200 : 400);
       }
@@ -550,6 +886,24 @@ export function createRequestHandler() {
           console.log(`[Server] Job ${jobId} failed (${durationText})`);
 
           const job = jobQueue.getJob(jobId);
+          const params = parseJsonRecord(job?.params ?? "");
+          const requestId = compactText(params.requestId, 128);
+          if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
+          const matched = autonomyStore.findObjectiveByJobId(jobId);
+          if (matched) {
+            autonomyStore.recordOutcome({
+              objectiveId: matched.objectiveId,
+              requestId,
+              jobId,
+              patternKey: matched.patternKey,
+              success: false,
+              latencyMs: result.durationMs ?? null,
+              userAction: "failed",
+              reopenedWithin24h: false,
+              regressionFlag: true,
+            });
+          }
+
           if (job?.sessionId) {
             const session = sessionManager.getSession(job.sessionId);
             if (session) {
@@ -629,6 +983,20 @@ export function createRequestHandler() {
         const requestId = reqCompleteMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = requestQueue.complete(requestId, body);
+        if (result.ok) {
+          const matched = autonomyStore.findObjectiveByRequestId(requestId);
+          if (matched) {
+            autonomyStore.recordOutcome({
+              objectiveId: matched.objectiveId,
+              requestId,
+              patternKey: matched.patternKey,
+              success: true,
+              userAction: "accepted",
+              reopenedWithin24h: false,
+              regressionFlag: false,
+            });
+          }
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
 
@@ -641,6 +1009,20 @@ export function createRequestHandler() {
         const requestId = reqFailMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = requestQueue.fail(requestId, body);
+        if (result.ok) {
+          const matched = autonomyStore.findObjectiveByRequestId(requestId);
+          if (matched) {
+            autonomyStore.recordOutcome({
+              objectiveId: matched.objectiveId,
+              requestId,
+              patternKey: matched.patternKey,
+              success: false,
+              userAction: "rejected",
+              reopenedWithin24h: true,
+              regressionFlag: true,
+            });
+          }
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
 
@@ -756,7 +1138,7 @@ export function createRequestHandler() {
   });
 }
 
-export { sessionManager, jobQueue };
+export { sessionManager, jobQueue, autonomyStore };
 
 // If this file is executed directly, start the server.
 if (import.meta.main) {

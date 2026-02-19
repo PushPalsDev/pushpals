@@ -5,7 +5,14 @@
 
 import { readFileSync } from "fs";
 import { resolve } from "path";
-import { loadPromptTemplate, loadPushPalsConfig } from "shared";
+import {
+  loadPromptTemplate,
+  loadPushPalsConfig,
+  matchesGlob,
+  normalizeTargetPath,
+  validateScopeInvariants,
+  type AutonomyComponentArea,
+} from "shared";
 import {
   FILE_MODIFYING_JOBS,
   QUALITY_CRITIC_MAX_DIFF_CHARS,
@@ -28,6 +35,7 @@ const DEFAULT_CONFIG = loadPushPalsConfig();
 interface TaskExecutePlanning {
   intent: TaskExecuteIntent;
   riskLevel: TaskExecuteRisk;
+  targetPaths?: string[];
   scope: {
     readAnywhere: boolean;
     writeAllowed: boolean;
@@ -1157,6 +1165,80 @@ function hasInvalidRepoPathHint(values: string[]): boolean {
   return values.some((entry) => normalizeStagePath(entry) === null);
 }
 
+function inferComponentAreaFromPath(path: string): AutonomyComponentArea | null {
+  const normalized = path.replace(/\\/g, "/");
+  if (normalized.startsWith("apps/server/")) return "apps/server";
+  if (normalized.startsWith("apps/remotebuddy/")) return "apps/remotebuddy";
+  if (normalized.startsWith("apps/workerpals/")) return "apps/workerpals";
+  if (normalized.startsWith("apps/client/")) return "apps/client";
+  if (normalized.startsWith("packages/protocol/")) return "packages/protocol";
+  if (normalized.startsWith("packages/shared/")) return "packages/shared";
+  if (normalized.startsWith("tests/integration/")) return "tests/integration";
+  if (normalized.startsWith("tests/unit/")) return "tests/unit";
+  return null;
+}
+
+function inferComponentAreaFromTargets(targetPaths: string[]): AutonomyComponentArea | null {
+  let area: AutonomyComponentArea | null = null;
+  for (const path of targetPaths) {
+    const inferred = inferComponentAreaFromPath(path);
+    if (!inferred) return null;
+    if (!area) area = inferred;
+    else if (area !== inferred) return null;
+  }
+  return area;
+}
+
+function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user" {
+  const explicit = String(params.origin ?? "")
+    .trim()
+    .toLowerCase();
+  if (explicit === "autonomy") return "autonomy";
+  const autonomy = params.autonomy;
+  if (autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)) {
+    const nested = String((autonomy as Record<string, unknown>).origin ?? "")
+      .trim()
+      .toLowerCase();
+    if (nested === "autonomy") return "autonomy";
+  }
+  return "user";
+}
+
+async function enforceWriteScope(
+  repo: string,
+  planning: TaskExecutePlanning,
+): Promise<{ ok: boolean; message?: string }> {
+  const writeGlobs = toStringArray(planning.scope.writeGlobs ?? []);
+  if (writeGlobs.length === 0) return { ok: true };
+
+  const statusResult = await git(repo, ["status", "--porcelain"]);
+  if (!statusResult.ok) {
+    return { ok: false, message: "Unable to evaluate changed paths for scope enforcement." };
+  }
+
+  const changedPaths = parseChangedPathsFromStatus(statusResult.stdout)
+    .map((entry) => normalizeStagePath(entry))
+    .filter((entry): entry is string => Boolean(entry) && entry !== ".");
+  if (changedPaths.length === 0) return { ok: true };
+
+  const forbidden = toStringArray(planning.scope.forbiddenGlobs ?? []);
+  const outOfScope = changedPaths.filter((path) => !writeGlobs.some((glob) => matchesGlob(path, glob)));
+  if (outOfScope.length > 0) {
+    return {
+      ok: false,
+      message: `Scope violation: modified paths outside writeGlobs: ${outOfScope.join(", ")}`,
+    };
+  }
+  const forbiddenTouched = changedPaths.filter((path) => forbidden.some((glob) => matchesGlob(path, glob)));
+  if (forbiddenTouched.length > 0) {
+    return {
+      ok: false,
+      message: `Scope violation: modified forbidden paths: ${forbiddenTouched.join(", ")}`,
+    };
+  }
+  return { ok: true };
+}
+
 function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const planning = value as Record<string, unknown>;
@@ -1255,6 +1337,40 @@ function validateTaskExecutePlanning(
     (!Number.isFinite(Number(scope.maxFilesToEdit)) || Number(scope.maxFilesToEdit) <= 0)
   ) {
     return { ok: false, message: "task.execute planning.scope.maxFilesToEdit must be > 0" };
+  }
+
+  if (planning.targetPaths !== undefined && !isStringArray(planning.targetPaths)) {
+    return { ok: false, message: "task.execute planning.targetPaths must be a string array" };
+  }
+  if (isStringArray(planning.targetPaths)) {
+    const normalizedTargetPaths = planning.targetPaths
+      .map((entry) => normalizeTargetPath(entry))
+      .filter((entry): entry is string => Boolean(entry));
+    if (normalizedTargetPaths.length !== planning.targetPaths.length) {
+      return {
+        ok: false,
+        message: "task.execute planning.targetPaths must contain literal repo-relative paths",
+      };
+    }
+    const componentArea = inferComponentAreaFromTargets(normalizedTargetPaths);
+    if (!componentArea) {
+      return {
+        ok: false,
+        message: "task.execute planning.targetPaths must map to one supported component area",
+      };
+    }
+    const validatedScope = validateScopeInvariants(
+      componentArea,
+      normalizedTargetPaths,
+      isStringArray(scope.writeGlobs) ? scope.writeGlobs : [],
+      { requireWriteGlobs: true },
+    );
+    if (!validatedScope.ok) {
+      return {
+        ok: false,
+        message: `task.execute scope invariants failed: ${validatedScope.errors.join("; ")}`,
+      };
+    }
   }
 
   if (planning.discovery !== undefined) {
@@ -1359,12 +1475,21 @@ export async function executeJob(
     };
   }
 
-  const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(params.planning);
-  const planningValidation = validateTaskExecutePlanning(sanitizedPlanning);
+  const planningValidation = validateTaskExecutePlanning(params.planning);
   if (!planningValidation.ok) {
     return {
       ok: false,
       summary: planningValidation.message,
+      exitCode: 2,
+    };
+  }
+  const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(params.planning);
+  const planning = sanitizedPlanning as TaskExecutePlanning;
+  const origin = taskExecuteOrigin(params);
+  if (origin === "autonomy" && toStringArray(planning.scope.writeGlobs ?? []).length === 0) {
+    return {
+      ok: false,
+      summary: "autonomy task.execute requires planning.scope.writeGlobs",
       exitCode: 2,
     };
   }
@@ -1382,7 +1507,6 @@ export async function executeJob(
     planning: sanitizedPlanning,
     instruction,
   };
-  const planning = sanitizedPlanning as TaskExecutePlanning;
   const executionBudgetMs = Number(planning.executionBudgetMs);
   const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
 
@@ -1414,6 +1538,17 @@ export async function executeJob(
       executeBudgets,
     );
     if (!result.ok) return result;
+
+    const scopeCheck = await enforceWriteScope(repo, planning);
+    if (!scopeCheck.ok) {
+      return {
+        ok: false,
+        summary: scopeCheck.message ?? "Scope enforcement failed for task.execute changes.",
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: 5,
+      };
+    }
 
     const quality = await runDeterministicQualityGate(repo, attemptParams, onLog);
     const critic = quality.skipped

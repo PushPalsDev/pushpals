@@ -104,4 +104,73 @@ describe("server RequestQueue", () => {
 
     queue.close();
   });
+
+  test("preserves autonomy metadata with scoped writeGlobs", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({
+      sessionId: "dev",
+      prompt: "autonomy background objective",
+      priority: "background",
+      forceWorker: true,
+      forceLane: "worker",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          objectiveId: "obj_123",
+          runId: "run_123",
+          snapshotId: "snap_123",
+          componentArea: "tests/integration",
+          targetPaths: ["tests/integration/test_workerpals_e2e.py"],
+          writeGlobs: ["tests/integration/*.py"],
+        },
+      },
+    });
+    expect(enqueued.ok).toBe(true);
+    const claimed = queue.claim("remotebuddy-orchestrator");
+    expect(claimed.ok).toBe(true);
+    const metadata = (claimed.request?.metadata ?? {}) as Record<string, unknown>;
+    const autonomy = (metadata.autonomy ?? {}) as Record<string, unknown>;
+    expect(metadata.origin).toBe("autonomy");
+    expect(Array.isArray(autonomy.writeGlobs)).toBe(true);
+    expect((autonomy.writeGlobs as string[])[0]).toBe("tests/integration/*.py");
+    queue.close();
+  });
+
+  test("rejects autonomy metadata without writeGlobs", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({
+      sessionId: "dev",
+      prompt: "autonomy background objective",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          objectiveId: "obj_123",
+          componentArea: "apps/server",
+          targetPaths: ["apps/server/src/server_main.ts"],
+        },
+      },
+    });
+    expect(enqueued.ok).toBe(false);
+    expect(String(enqueued.message ?? "")).toContain("write_globs");
+    queue.close();
+  });
+
+  test("rejects autonomy metadata with unsupported glob syntax", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({
+      sessionId: "dev",
+      prompt: "autonomy background objective",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          componentArea: "tests/integration",
+          targetPaths: ["tests/integration/test_workerpals_e2e.py"],
+          writeGlobs: ["tests/integration/[a-z].py"],
+        },
+      },
+    });
+    expect(enqueued.ok).toBe(false);
+    expect(String(enqueued.message ?? "")).toContain("scope invalid");
+    queue.close();
+  });
 });

@@ -57,6 +57,29 @@ endpoint = "http://127.0.0.1:1234"
 model = "local-model"
 session_id = "remotebuddy-dev"
 
+[remotebuddy.autonomy]
+enabled = false
+tick_interval_ms = 300000
+ideation_budget_ms = 20000
+llm_timeout_ms = 12000
+ideation_max_candidates = 20
+top_k = 3
+min_confidence = 0.65
+max_concurrent_objectives = 2
+max_dispatch_per_hour = 6
+max_dispatch_per_hour_by_type = { flaky_test = 4, lint_fix = 3, type_fix = 3, small_refactor = 2, docs = 3, dep_bump = 0 }
+cooldown_fail_streak_threshold = 2
+cooldown_ms = 1800000
+allow_read_anywhere = false
+question_ttl_ms = 259200000
+policy_version = "policy-v3.3"
+impact_model_version = "impact-v1"
+
+[remotebuddy.autonomy.replay]
+store_prompt_payloads = false
+max_runs_with_payloads = 50
+max_payload_bytes = 262144
+
 [workerpals]
 poll_ms = 2000
 heartbeat_ms = 5000

@@ -196,6 +196,13 @@ const allEventTypes = [
   "message",
   "job_log",
   "status",
+  "autonomy_cycle_started",
+  "autonomy_candidates_generated",
+  "autonomy_objective_dispatched",
+  "autonomy_objective_blocked",
+  "autonomy_feedback_recorded",
+  "question_asked",
+  "question_answered",
 ];
 
 const validateCommandRequestSchema = ajv.compile({

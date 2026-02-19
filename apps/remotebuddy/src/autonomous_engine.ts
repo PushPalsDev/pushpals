@@ -1,0 +1,1116 @@
+import { createHash, randomUUID } from "crypto";
+import type { CommunicationManager } from "shared";
+import {
+  makePatternKey,
+  normalizePenalties,
+  penaltyTotal,
+  validateScopeInvariants,
+  type AutonomyComponentArea,
+  type AutonomyObjectiveType,
+} from "shared";
+import type { PushPalsConfig } from "shared";
+import type { LLMClient } from "./llm.js";
+
+type AutonomyCandidate = {
+  id: string;
+  title: string;
+  objective_type: AutonomyObjectiveType;
+  problem_statement: string;
+  trigger_type: "test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal";
+  component_area: AutonomyComponentArea;
+  target_paths: string[];
+  scope: {
+    read_anywhere: boolean;
+    write_globs: string[];
+  };
+  risk_level: "low" | "medium" | "high";
+  expected_validation: string[];
+  estimated_effort: "small" | "medium" | "large";
+  why_now_signal_ids: string[];
+  confidence: number;
+  requires_user_input?: boolean;
+  question_if_blocked?: string;
+  candidate_created_at: string;
+};
+
+type Snapshot = {
+  snapshot_id: string;
+  snapshot_created_at: string;
+  snapshot_ttl_ms: number;
+  impact_model_version: string;
+  top_signals: Array<{ signal_id: string; type: string; value: number; evidence: string }>;
+  feedback_priors: Array<{
+    pattern_key: string;
+    ema_success: number;
+    ema_user_accept: number;
+    fail_streak: number;
+  }>;
+  active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
+  open_objectives: Array<{ objective_id: string; pattern_key: string; status: string }>;
+  repo_health_flags: {
+    is_worktree_dirty: boolean;
+    is_merge_in_progress: boolean;
+    dispatch_lock_held: boolean;
+  };
+  dispatch_budget: {
+    global_count_last_hour: number;
+    by_type_count_last_hour: Record<string, number>;
+  };
+};
+
+type PolicyRule = {
+  maxRisk: "low" | "medium" | "high";
+  maxBreadth: "narrow" | "medium" | "broad";
+  autonomousAllowed: boolean;
+  requireValidation: boolean;
+};
+
+const POLICY: Record<AutonomyObjectiveType, PolicyRule> = {
+  flaky_test: {
+    maxRisk: "low",
+    maxBreadth: "narrow",
+    autonomousAllowed: true,
+    requireValidation: true,
+  },
+  lint_fix: {
+    maxRisk: "low",
+    maxBreadth: "narrow",
+    autonomousAllowed: true,
+    requireValidation: true,
+  },
+  type_fix: {
+    maxRisk: "low",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true,
+  },
+  small_refactor: {
+    maxRisk: "medium",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true,
+  },
+  docs: {
+    maxRisk: "low",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: false,
+  },
+  dep_bump: {
+    maxRisk: "medium",
+    maxBreadth: "narrow",
+    autonomousAllowed: false,
+    requireValidation: true,
+  },
+};
+
+const RISK_ORDER: Record<"low" | "medium" | "high", number> = { low: 0, medium: 1, high: 2 };
+const BREADTH_ORDER: Record<"narrow" | "medium" | "broad", number> = {
+  narrow: 0,
+  medium: 1,
+  broad: 2,
+};
+
+const IDEATION_SYSTEM_PROMPT = `
+You are RemoteBuddyAutonomousEngine ideation planner for a monorepo.
+Generate objective candidates only from provided evidence signals.
+Return strict JSON with this shape:
+{
+  "candidates": [{
+    "id": "cand_...",
+    "title": "...",
+    "objective_type": "flaky_test|lint_fix|type_fix|small_refactor|docs|dep_bump",
+    "problem_statement": "...",
+    "trigger_type": "test_failure|lint_failure|typecheck_failure|queue_health|regret_signal",
+    "component_area": "apps/server|apps/remotebuddy|apps/workerpals|apps/client|packages/protocol|packages/shared|tests/integration|tests/unit",
+    "target_paths": ["repo/relative/path"],
+    "scope": { "read_anywhere": false, "write_globs": ["repo/relative/glob"] },
+    "risk_level": "low|medium|high",
+    "expected_validation": ["command"],
+    "estimated_effort": "small|medium|large",
+    "why_now_signal_ids": ["sig_x"],
+    "confidence": 0.0,
+    "requires_user_input": false,
+    "question_if_blocked": ""
+  }]
+}
+Constraints:
+- target_paths must be literal repo-relative paths.
+- write_globs must be repo-relative globs.
+- do not invent evidence ids.
+`.trim();
+
+const SCORING_SYSTEM_PROMPT = `
+Score each candidate and return top ids.
+Return strict JSON:
+{
+  "scores": [{ "id": "cand_1", "llm_score": 0.0, "rationale": "..." }],
+  "top_candidate_ids": ["cand_1", "cand_2", "cand_3"]
+}
+`.trim();
+
+const PLANNING_SYSTEM_PROMPT = `
+Write objective instruction text for a worker.
+Return strict JSON:
+{ "instruction": "..." }
+Keep it concise, executable, and scoped to target_paths and write_globs only.
+`.trim();
+
+function asObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => asString(entry)).filter(Boolean);
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function asBoolean(value: unknown, fallback = false): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const text = value.trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(text)) return true;
+    if (["0", "false", "no", "off"].includes(text)) return false;
+  }
+  return fallback;
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value <= 0) return 0;
+  if (value >= 1) return 1;
+  return value;
+}
+
+function parseJsonObject(text: string): Record<string, unknown> {
+  const raw = text.trim();
+  if (!raw) return {};
+  try {
+    return asObject(JSON.parse(raw));
+  } catch {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1];
+    if (fenced) {
+      try {
+        return asObject(JSON.parse(fenced));
+      } catch {
+        return {};
+      }
+    }
+    return {};
+  }
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function isRiskLevel(value: string): value is "low" | "medium" | "high" {
+  return value === "low" || value === "medium" || value === "high";
+}
+
+function isTriggerType(
+  value: string,
+): value is "test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal" {
+  return (
+    value === "test_failure" ||
+    value === "lint_failure" ||
+    value === "typecheck_failure" ||
+    value === "queue_health" ||
+    value === "regret_signal"
+  );
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: string): Promise<T> {
+  const timeout = Math.max(1_000, timeoutMs);
+  const timeoutError = new Error(reason);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timed = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(timeoutError), timeout);
+  });
+  try {
+    return await Promise.race([promise, timed]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function gitOutput(repo: string, args: string[]): Promise<string> {
+  const proc = Bun.spawn(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+  const [stdout, _stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) return "";
+  return stdout.trim();
+}
+
+async function repoPreflight(repo: string): Promise<{
+  ok: boolean;
+  isWorktreeDirty: boolean;
+  isMergeInProgress: boolean;
+}> {
+  const porcelain = await gitOutput(repo, ["status", "--porcelain"]);
+  const mergeHead = await gitOutput(repo, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+  return {
+    ok: !porcelain && !mergeHead,
+    isWorktreeDirty: Boolean(porcelain),
+    isMergeInProgress: Boolean(mergeHead),
+  };
+}
+
+export class RemoteBuddyAutonomousEngine {
+  private readonly server: string;
+  private readonly sessionId: string;
+  private readonly authToken: string | null;
+  private readonly repo: string;
+  private readonly llm: LLMClient;
+  private readonly comm: CommunicationManager;
+  private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private inFlight = false;
+
+  constructor(opts: {
+    server: string;
+    sessionId: string;
+    authToken: string | null;
+    repo: string;
+    llm: LLMClient;
+    comm: CommunicationManager;
+    config: PushPalsConfig;
+  }) {
+    this.server = opts.server;
+    this.sessionId = opts.sessionId;
+    this.authToken = opts.authToken;
+    this.repo = opts.repo;
+    this.llm = opts.llm;
+    this.comm = opts.comm;
+    this.cfg = opts.config.remotebuddy.autonomy;
+  }
+
+  private headers(): Record<string, string> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
+    return headers;
+  }
+
+  private lockTtlMs(): number {
+    return Math.max(
+      this.cfg.tickIntervalMs * 3,
+      this.cfg.ideationBudgetMs * 2 + this.cfg.llmTimeoutMs * 6,
+      30_000,
+    );
+  }
+
+  private async fetchSnapshot(
+    runId: string,
+    preflight: {
+      isWorktreeDirty: boolean;
+      isMergeInProgress: boolean;
+    },
+  ): Promise<Snapshot | null> {
+    const qs = new URLSearchParams({
+      sessionId: this.sessionId,
+      runId,
+      isWorktreeDirty: preflight.isWorktreeDirty ? "true" : "false",
+      isMergeInProgress: preflight.isMergeInProgress ? "true" : "false",
+    });
+    const res = await fetch(`${this.server}/autonomy/snapshot?${qs.toString()}`, {
+      method: "GET",
+      headers: this.headers(),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { ok?: boolean; snapshot?: Snapshot };
+    return data.ok ? data.snapshot ?? null : null;
+  }
+
+  private async postObjective(payload: Record<string, unknown>): Promise<boolean> {
+    const res = await fetch(`${this.server}/autonomy/objectives`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(payload),
+    });
+    return res.ok;
+  }
+
+  private async acquireDispatchLock(runId: string): Promise<boolean> {
+    const ttlMs = this.lockTtlMs();
+    const res = await fetch(`${this.server}/autonomy/lock/acquire`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({
+        sessionId: this.sessionId,
+        runId,
+        ttlMs,
+      }),
+    });
+    return res.ok;
+  }
+
+  private async renewDispatchLock(runId: string): Promise<boolean> {
+    const res = await fetch(`${this.server}/autonomy/lock/renew`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({
+        sessionId: this.sessionId,
+        runId,
+        ttlMs: this.lockTtlMs(),
+      }),
+    });
+    return res.ok;
+  }
+
+  private async releaseDispatchLock(runId: string): Promise<void> {
+    await fetch(`${this.server}/autonomy/lock/release`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({
+        sessionId: this.sessionId,
+        runId,
+      }),
+    }).catch(() => {});
+  }
+
+  private async llmPhase(
+    phase: "ideation" | "scoring" | "planning",
+    runId: string,
+    snapshotId: string,
+    input: Parameters<LLMClient["generate"]>[0],
+    objectiveId?: string,
+  ): Promise<{
+    json: Record<string, unknown>;
+    llmCall: Record<string, unknown>;
+  }> {
+    const requestPayload = {
+      phase,
+      system: input.system,
+      messages: input.messages,
+      json: Boolean(input.json),
+      maxTokens: input.maxTokens ?? null,
+      temperature: input.temperature ?? null,
+    };
+    const startedAt = Date.now();
+    const output = await withTimeout(
+      this.llm.generate(input),
+      this.cfg.llmTimeoutMs,
+      `autonomy ${phase} phase timeout`,
+    );
+    const responseJson = parseJsonObject(output.text);
+    const tokenUsage = output.usage ?? null;
+    return {
+      json: responseJson,
+      llmCall: {
+        id: randomUUID(),
+        runId,
+        snapshotId,
+        ...(objectiveId ? { objectiveId } : {}),
+        phase,
+        promptTemplateVersion: "autonomy-v3.3",
+        promptHash: sha256(`${input.system}\n${JSON.stringify(input.messages ?? [])}`),
+        requestPayloadHash: sha256(JSON.stringify(requestPayload)),
+        requestPayload,
+        promptInputs: {
+          system: input.system,
+          messages: input.messages ?? [],
+        },
+        modelId: "configured",
+        temperature: input.temperature ?? null,
+        timeoutMs: this.cfg.llmTimeoutMs,
+        response: responseJson,
+        responseHash: sha256(output.text),
+        tokenUsage,
+        latencyMs: Date.now() - startedAt,
+      },
+    };
+  }
+
+  private async enqueueSyntheticRequest(
+    instruction: string,
+    autonomy: {
+      objectiveId: string;
+      runId: string;
+      snapshotId: string;
+      patternKey: string;
+      componentArea: AutonomyComponentArea;
+      targetPaths: string[];
+      writeGlobs: string[];
+    },
+  ): Promise<string | null> {
+    const res = await fetch(`${this.server}/requests/enqueue`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({
+        sessionId: this.sessionId,
+        prompt: instruction,
+        priority: "background",
+        forceWorker: true,
+        forceLane: "worker",
+        metadata: {
+          origin: "autonomy",
+          autonomy: {
+            objectiveId: autonomy.objectiveId,
+            runId: autonomy.runId,
+            snapshotId: autonomy.snapshotId,
+            patternKey: autonomy.patternKey,
+            componentArea: autonomy.componentArea,
+            targetPaths: autonomy.targetPaths,
+            writeGlobs: autonomy.writeGlobs,
+          },
+        },
+      }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { ok?: boolean; requestId?: string };
+    return data.ok && data.requestId ? data.requestId : null;
+  }
+
+  private isSnapshotExpired(snapshot: Snapshot): boolean {
+    const createdAt = Date.parse(snapshot.snapshot_created_at);
+    if (!Number.isFinite(createdAt)) return true;
+    return Date.now() > createdAt + snapshot.snapshot_ttl_ms;
+  }
+
+  private impactSignalV1(snapshot: Snapshot, candidate: AutonomyCandidate): number {
+    const signalsById = new Map(snapshot.top_signals.map((entry) => [entry.signal_id, entry]));
+    const signalPool =
+      candidate.why_now_signal_ids
+        .map((id) => signalsById.get(id))
+        .filter((entry): entry is { signal_id: string; type: string; value: number; evidence: string } => Boolean(entry))
+        .slice(0, 16) || [];
+    const signals = signalPool.length > 0 ? signalPool : snapshot.top_signals.slice(0, 20);
+    const maxType = (types: string[]) =>
+      clamp01(
+        Math.max(
+          0,
+          ...signals
+            .filter((entry) => types.includes(entry.type))
+            .map((entry) => asNumber(entry.value, 0)),
+        ),
+      );
+    const fTestFailRecurrence = maxType(["test_failure"]);
+    const fLintTypeErrorDensity = maxType(["lint_failure", "typecheck_failure"]);
+    const fFlakeRate = clamp01(
+      Math.max(
+        0,
+        ...signals
+          .filter((entry) => entry.type === "test_failure")
+          .map((entry) => (/flake|flaky/i.test(entry.evidence) ? asNumber(entry.value, 0) : 0)),
+      ),
+    );
+    const fQueueHealthDegradation = maxType(["queue_health"]);
+    const fRegretRate24h = maxType(["regret_signal"]);
+    return clamp01(
+      0.3 * fTestFailRecurrence +
+        0.2 * fLintTypeErrorDensity +
+        0.2 * fFlakeRate +
+        0.15 * fQueueHealthDegradation +
+        0.15 * fRegretRate24h,
+    );
+  }
+
+  private scoreCandidate(snapshot: Snapshot, candidate: AutonomyCandidate, llmScore: number) {
+    const patternKey = makePatternKey(
+      candidate.objective_type,
+      candidate.target_paths,
+      candidate.trigger_type,
+      candidate.component_area,
+    );
+    const prior = snapshot.feedback_priors.find((entry) => entry.pattern_key === patternKey);
+    const penalties: Array<{ kind: any; weight: number; reason: string; evidence_ids: string[] }> = [];
+    if (candidate.confidence < this.cfg.minConfidence) {
+      penalties.push({
+        kind: "low_confidence",
+        weight: 0.15,
+        reason: `candidate confidence ${candidate.confidence.toFixed(2)} < ${this.cfg.minConfidence}`,
+        evidence_ids: candidate.why_now_signal_ids,
+      });
+    }
+    const normalizedPenalties = normalizePenalties(penalties);
+    const impactSignal = this.impactSignalV1(snapshot, candidate);
+    const finalScore =
+      0.55 * clamp01(llmScore) +
+      0.2 * clamp01(impactSignal) +
+      0.15 * clamp01(asNumber(prior?.ema_success, 0)) +
+      0.1 * clamp01(asNumber(prior?.ema_user_accept, 0)) -
+      penaltyTotal(normalizedPenalties);
+    return {
+      patternKey,
+      impactSignal,
+      penalties: normalizedPenalties,
+      finalScore,
+      emaSuccess: clamp01(asNumber(prior?.ema_success, 0)),
+      emaUserAccept: clamp01(asNumber(prior?.ema_user_accept, 0)),
+    };
+  }
+
+  private async fetchEligibility(
+    runId: string,
+    snapshotId: string,
+    candidates: Array<{
+      id: string;
+      objective_type: AutonomyObjectiveType;
+      pattern_key: string;
+      confidence: number;
+    }>,
+  ): Promise<Map<string, { ok: boolean; reason?: string }>> {
+    const out = new Map<string, { ok: boolean; reason?: string }>();
+    const res = await fetch(`${this.server}/autonomy/eligibility`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({
+        sessionId: this.sessionId,
+        runId,
+        snapshotId,
+        candidates,
+      }),
+    });
+    if (!res.ok) {
+      for (const candidate of candidates) {
+        out.set(candidate.id, { ok: false, reason: "eligibility_unavailable" });
+      }
+      return out;
+    }
+    const data = (await res.json()) as {
+      ok?: boolean;
+      results?: Array<{ candidate_id?: string; candidateId?: string; ok?: boolean; reason?: string }>;
+    };
+    if (!data.ok || !Array.isArray(data.results)) {
+      for (const candidate of candidates) {
+        out.set(candidate.id, { ok: false, reason: "eligibility_unavailable" });
+      }
+      return out;
+    }
+    for (const row of data.results) {
+      const candidateId = asString(row.candidate_id ?? row.candidateId);
+      if (!candidateId) continue;
+      out.set(candidateId, {
+        ok: Boolean(row.ok),
+        ...(row.reason ? { reason: asString(row.reason) } : {}),
+      });
+    }
+    for (const candidate of candidates) {
+      if (!out.has(candidate.id)) {
+        out.set(candidate.id, { ok: false, reason: "eligibility_unavailable" });
+      }
+    }
+    return out;
+  }
+
+  private async recordSnapshotExpired(
+    runId: string,
+    snapshotId: string,
+    llmCalls: Record<string, unknown>[],
+    candidates: Array<Record<string, unknown>>,
+    topCandidate?: Record<string, unknown>,
+  ): Promise<void> {
+    await this.postObjective({
+      runId,
+      snapshotId,
+      sessionId: this.sessionId,
+      candidates: candidates.map((entry) => ({
+        ...entry,
+        selected: Boolean(topCandidate && entry.id === topCandidate.id),
+        rejection_reason: "snapshot_expired",
+        gate_decision: "rejected",
+        gate_reasons: ["snapshot_expired"],
+      })),
+      ...(topCandidate
+        ? {
+            objective: {
+              id: `obj_${randomUUID().slice(0, 8)}`,
+              candidate_id: topCandidate.id,
+              title: topCandidate.title,
+              instruction: topCandidate.problem_statement ?? topCandidate.title,
+              objective_type: topCandidate.objective_type,
+              component_area: topCandidate.component_area,
+              trigger_type: topCandidate.trigger_type,
+              target_paths: topCandidate.target_paths,
+              scope: topCandidate.scope,
+              confidence: topCandidate.confidence,
+              risk_level: topCandidate.risk_level,
+              status: "stale",
+              block_reason: "snapshot_expired",
+            },
+          }
+        : {}),
+      llmCalls,
+    });
+  }
+
+  async tick(): Promise<void> {
+    if (!this.cfg.enabled || this.inFlight) return;
+    this.inFlight = true;
+    const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
+    const cycleDeadline = Date.now() + Math.max(this.cfg.ideationBudgetMs, this.cfg.llmTimeoutMs);
+    let lockAcquired = false;
+    try {
+      lockAcquired = await this.acquireDispatchLock(runId);
+      if (!lockAcquired) return;
+
+      const preflight = await repoPreflight(this.repo);
+      if (!preflight.ok) return;
+
+      const snapshot = await this.fetchSnapshot(runId, preflight);
+      if (!snapshot) return;
+
+      const llmCalls: Record<string, unknown>[] = [];
+      let candidatesPayload: Array<Record<string, unknown>> = [];
+      let selectedCandidatePayload: Record<string, unknown> | undefined;
+      if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        return;
+      }
+
+      await this.comm.emit("autonomy_cycle_started", {
+        runId,
+        snapshotId: snapshot.snapshot_id,
+        phase: "ideation",
+      });
+      if (!(await this.renewDispatchLock(runId))) return;
+
+      const ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, {
+        system: IDEATION_SYSTEM_PROMPT,
+        json: true,
+        maxTokens: 2800,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "user",
+            content: JSON.stringify(
+              {
+                snapshot: {
+                  snapshot_id: snapshot.snapshot_id,
+                  top_signals: snapshot.top_signals.slice(0, 16),
+                  feedback_priors: snapshot.feedback_priors.slice(0, 20),
+                  open_objectives: snapshot.open_objectives.slice(0, 20),
+                  active_cooldowns: snapshot.active_cooldowns.slice(0, 20),
+                },
+                limits: {
+                  ideation_max_candidates: this.cfg.ideationMaxCandidates,
+                  min_confidence: this.cfg.minConfidence,
+                },
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      });
+      llmCalls.push(ideationPhase.llmCall);
+      const ideationJson = ideationPhase.json;
+      if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        return;
+      }
+      const rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
+      const normalizedCandidates: AutonomyCandidate[] = [];
+      const candidateCreatedBaseMs = Date.now();
+      for (const [candidateIndex, rawCandidate] of rawCandidates
+        .slice(0, this.cfg.ideationMaxCandidates)
+        .entries()) {
+        const c = asObject(rawCandidate);
+        const triggerType = asString(c.trigger_type);
+        if (!isTriggerType(triggerType)) continue;
+        const candidate: AutonomyCandidate = {
+          id: asString(c.id) || `cand_${randomUUID().slice(0, 8)}`,
+          title: asString(c.title),
+          objective_type: asString(c.objective_type) as AutonomyObjectiveType,
+          problem_statement: asString(c.problem_statement),
+          trigger_type: triggerType,
+          component_area: asString(c.component_area) as AutonomyComponentArea,
+          target_paths: asStringArray(c.target_paths),
+          scope: {
+            read_anywhere: asBoolean(asObject(c.scope).read_anywhere, false),
+            write_globs: asStringArray(asObject(c.scope).write_globs),
+          },
+          risk_level: asString(c.risk_level) as "low" | "medium" | "high",
+          expected_validation: asStringArray(c.expected_validation),
+          estimated_effort: asString(c.estimated_effort) as "small" | "medium" | "large",
+          why_now_signal_ids: asStringArray(c.why_now_signal_ids),
+          confidence: clamp01(asNumber(c.confidence, 0)),
+          requires_user_input: asBoolean(c.requires_user_input, false),
+          question_if_blocked: asString(c.question_if_blocked),
+          candidate_created_at: new Date(candidateCreatedBaseMs + candidateIndex).toISOString(),
+        };
+        const policy = POLICY[candidate.objective_type];
+        if (!policy || !policy.autonomousAllowed) continue;
+        if (!isRiskLevel(candidate.risk_level)) continue;
+        if (RISK_ORDER[candidate.risk_level] > RISK_ORDER[policy.maxRisk]) continue;
+        const scopeValidation = validateScopeInvariants(
+          candidate.component_area,
+          candidate.target_paths,
+          candidate.scope.write_globs,
+          { requireWriteGlobs: true },
+        );
+        if (!scopeValidation.ok) continue;
+        if (BREADTH_ORDER[scopeValidation.breadth] > BREADTH_ORDER[policy.maxBreadth]) continue;
+        if (candidate.scope.read_anywhere && !this.cfg.allowReadAnywhere) continue;
+        if (policy.requireValidation && candidate.expected_validation.length === 0) continue;
+        candidate.target_paths = scopeValidation.normalizedTargetPaths;
+        candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
+        normalizedCandidates.push(candidate);
+      }
+      candidatesPayload = normalizedCandidates.map((candidate) => ({
+        id: candidate.id,
+        title: candidate.title,
+        objective_type: candidate.objective_type,
+        problem_statement: candidate.problem_statement,
+        trigger_type: candidate.trigger_type,
+        component_area: candidate.component_area,
+        target_paths: candidate.target_paths,
+        scope: candidate.scope,
+        risk_level: candidate.risk_level,
+        expected_validation: candidate.expected_validation,
+        estimated_effort: candidate.estimated_effort,
+        why_now_signal_ids: candidate.why_now_signal_ids,
+        confidence: candidate.confidence,
+        gate_decision: "proposed",
+        gate_reasons: [],
+        candidate_created_at: candidate.candidate_created_at,
+      }));
+      if (normalizedCandidates.length === 0) {
+        await this.postObjective({
+          runId,
+          snapshotId: snapshot.snapshot_id,
+          sessionId: this.sessionId,
+          candidates: candidatesPayload,
+          llmCalls,
+        });
+        return;
+      }
+      if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        return;
+      }
+      if (!(await this.renewDispatchLock(runId))) return;
+
+      const scoringPhase = await this.llmPhase("scoring", runId, snapshot.snapshot_id, {
+        system: SCORING_SYSTEM_PROMPT,
+        json: true,
+        maxTokens: 1400,
+        temperature: 0.1,
+        messages: [
+          {
+            role: "user",
+            content: JSON.stringify({ candidates: normalizedCandidates, top_k: this.cfg.topK }),
+          },
+        ],
+      });
+      llmCalls.push(scoringPhase.llmCall);
+      const scoringJson = scoringPhase.json;
+      if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        return;
+      }
+      const scoreById = new Map<string, number>();
+      for (const rawScore of Array.isArray(scoringJson.scores) ? scoringJson.scores : []) {
+        const s = asObject(rawScore);
+        const id = asString(s.id);
+        if (!id) continue;
+        scoreById.set(id, clamp01(asNumber(s.llm_score, 0)));
+      }
+
+      const scored = normalizedCandidates.map((candidate) => {
+        const llmScore = scoreById.get(candidate.id) ?? 0;
+        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore);
+        return { candidate, llmScore, ...scoredCandidate };
+      });
+      scored.sort((a, b) => {
+        if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+        if (a.candidate.candidate_created_at !== b.candidate.candidate_created_at) {
+          return a.candidate.candidate_created_at.localeCompare(b.candidate.candidate_created_at);
+        }
+        return a.candidate.id.localeCompare(b.candidate.id);
+      });
+
+      const eligibilityById = await this.fetchEligibility(
+        runId,
+        snapshot.snapshot_id,
+        scored.map((row) => ({
+          id: row.candidate.id,
+          objective_type: row.candidate.objective_type,
+          pattern_key: row.patternKey,
+          confidence: row.candidate.confidence,
+        })),
+      );
+      const rankedWithEligibility = scored.map((row) => ({
+        ...row,
+        eligibility: eligibilityById.get(row.candidate.id) ?? {
+          ok: false,
+          reason: "eligibility_unavailable",
+        },
+      }));
+      candidatesPayload = rankedWithEligibility.map((row) => ({
+        id: row.candidate.id,
+        title: row.candidate.title,
+        objective_type: row.candidate.objective_type,
+        problem_statement: row.candidate.problem_statement,
+        trigger_type: row.candidate.trigger_type,
+        component_area: row.candidate.component_area,
+        target_paths: row.candidate.target_paths,
+        scope: row.candidate.scope,
+        risk_level: row.candidate.risk_level,
+        expected_validation: row.candidate.expected_validation,
+        estimated_effort: row.candidate.estimated_effort,
+        why_now_signal_ids: row.candidate.why_now_signal_ids,
+        confidence: row.candidate.confidence,
+        llm_score: row.llmScore,
+        impact_signal: row.impactSignal,
+        ema_success: row.emaSuccess,
+        ema_user_accept: row.emaUserAccept,
+        penalties: row.penalties,
+        final_score: row.finalScore,
+        gate_decision: row.eligibility.ok ? "approved" : "rejected",
+        gate_reasons: row.eligibility.ok ? [] : [row.eligibility.reason],
+        selected: false,
+        candidate_created_at: row.candidate.candidate_created_at,
+      }));
+      if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        return;
+      }
+      if (!(await this.renewDispatchLock(runId))) return;
+      const top = rankedWithEligibility[0];
+      if (!top) return;
+      const selected = rankedWithEligibility.find((row) => row.eligibility.ok);
+      const objectiveId = `obj_${randomUUID().slice(0, 8)}`;
+      selectedCandidatePayload = selected
+        ? {
+            id: selected.candidate.id,
+            title: selected.candidate.title,
+            objective_type: selected.candidate.objective_type,
+            problem_statement: selected.candidate.problem_statement,
+            trigger_type: selected.candidate.trigger_type,
+            component_area: selected.candidate.component_area,
+            target_paths: selected.candidate.target_paths,
+            scope: selected.candidate.scope,
+            risk_level: selected.candidate.risk_level,
+            confidence: selected.candidate.confidence,
+          }
+        : {
+            id: top.candidate.id,
+            title: top.candidate.title,
+            objective_type: top.candidate.objective_type,
+            problem_statement: top.candidate.problem_statement,
+            trigger_type: top.candidate.trigger_type,
+            component_area: top.candidate.component_area,
+            target_paths: top.candidate.target_paths,
+            scope: top.candidate.scope,
+            risk_level: top.candidate.risk_level,
+            confidence: top.candidate.confidence,
+          };
+      for (const row of candidatesPayload) {
+        row.selected = Boolean(row.id === selectedCandidatePayload.id);
+      }
+
+      if (!selected) {
+        await this.postObjective({
+          runId,
+          snapshotId: snapshot.snapshot_id,
+          sessionId: this.sessionId,
+          candidates: candidatesPayload,
+          objective: {
+            id: objectiveId,
+            candidate_id: top.candidate.id,
+            title: top.candidate.title,
+            instruction: top.candidate.problem_statement,
+            objective_type: top.candidate.objective_type,
+            component_area: top.candidate.component_area,
+            trigger_type: top.candidate.trigger_type,
+            target_paths: top.candidate.target_paths,
+            scope: top.candidate.scope,
+            confidence: top.candidate.confidence,
+            risk_level: top.candidate.risk_level,
+            status: "rejected",
+            block_reason: top.eligibility.reason ?? "no eligible candidate",
+            score_breakdown: {
+              llm_score: top.llmScore,
+              impact_signal: top.impactSignal,
+              penalties: top.penalties,
+              ema_success: top.emaSuccess,
+              ema_user_accept: top.emaUserAccept,
+              final_score: top.finalScore,
+            },
+          },
+          llmCalls,
+        });
+        return;
+      }
+
+      if (selected.candidate.requires_user_input) {
+        await this.postObjective({
+          runId,
+          snapshotId: snapshot.snapshot_id,
+          sessionId: this.sessionId,
+          candidates: candidatesPayload,
+          objective: {
+            id: objectiveId,
+            candidate_id: selected.candidate.id,
+            title: selected.candidate.title,
+            instruction: selected.candidate.problem_statement,
+            objective_type: selected.candidate.objective_type,
+            component_area: selected.candidate.component_area,
+            trigger_type: selected.candidate.trigger_type,
+            target_paths: selected.candidate.target_paths,
+            scope: selected.candidate.scope,
+            confidence: selected.candidate.confidence,
+            risk_level: selected.candidate.risk_level,
+            status: "blocked",
+            block_reason: "requires_user_input",
+            score_breakdown: {
+              llm_score: selected.llmScore,
+              impact_signal: selected.impactSignal,
+              penalties: selected.penalties,
+              ema_success: selected.emaSuccess,
+              ema_user_accept: selected.emaUserAccept,
+              final_score: selected.finalScore,
+            },
+          },
+          question: {
+            question:
+              selected.candidate.question_if_blocked ||
+              "Please confirm objective scope and constraints.",
+            question_type: "bounded_text",
+            expected_answer_schema: { min_length: 3, max_length: 1000 },
+          },
+          llmCalls,
+        });
+        return;
+      }
+      if (!(await this.renewDispatchLock(runId))) return;
+
+      const planningPhase = await this.llmPhase(
+        "planning",
+        runId,
+        snapshot.snapshot_id,
+        {
+          system: PLANNING_SYSTEM_PROMPT,
+          json: true,
+          maxTokens: 800,
+          temperature: 0.1,
+          messages: [
+            {
+              role: "user",
+              content: JSON.stringify({ candidate: selected.candidate }),
+            },
+          ],
+        },
+        objectiveId,
+      );
+      llmCalls.push(planningPhase.llmCall);
+      const planningJson = planningPhase.json;
+      if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        await this.recordSnapshotExpired(
+          runId,
+          snapshot.snapshot_id,
+          llmCalls,
+          candidatesPayload,
+          selectedCandidatePayload,
+        );
+        return;
+      }
+      if (!(await this.renewDispatchLock(runId))) return;
+      const instruction =
+        asString(planningJson.instruction) ||
+        `${selected.candidate.title}\n\n${selected.candidate.problem_statement}\n\nScope:\n- target_paths: ${selected.candidate.target_paths.join(
+          ", ",
+        )}\n- write_globs: ${selected.candidate.scope.write_globs.join(", ")}`;
+
+      const requestId = await this.enqueueSyntheticRequest(instruction, {
+        objectiveId,
+        runId,
+        snapshotId: snapshot.snapshot_id,
+        patternKey: selected.patternKey,
+        componentArea: selected.candidate.component_area,
+        targetPaths: selected.candidate.target_paths,
+        writeGlobs: selected.candidate.scope.write_globs,
+      });
+      if (!requestId) {
+        await this.postObjective({
+          runId,
+          snapshotId: snapshot.snapshot_id,
+          sessionId: this.sessionId,
+          candidates: candidatesPayload,
+          objective: {
+            id: objectiveId,
+            candidate_id: selected.candidate.id,
+            title: selected.candidate.title,
+            instruction,
+            objective_type: selected.candidate.objective_type,
+            component_area: selected.candidate.component_area,
+            trigger_type: selected.candidate.trigger_type,
+            target_paths: selected.candidate.target_paths,
+            scope: selected.candidate.scope,
+            confidence: selected.candidate.confidence,
+            risk_level: selected.candidate.risk_level,
+            status: "failed",
+            block_reason: "request_enqueue_failed",
+          },
+          llmCalls,
+        });
+        return;
+      }
+
+      await this.postObjective({
+        runId,
+        snapshotId: snapshot.snapshot_id,
+        sessionId: this.sessionId,
+        candidates: candidatesPayload,
+        objective: {
+          id: objectiveId,
+          candidate_id: selected.candidate.id,
+          title: selected.candidate.title,
+          instruction,
+          objective_type: selected.candidate.objective_type,
+          component_area: selected.candidate.component_area,
+          trigger_type: selected.candidate.trigger_type,
+          target_paths: selected.candidate.target_paths,
+          scope: selected.candidate.scope,
+          confidence: selected.candidate.confidence,
+          risk_level: selected.candidate.risk_level,
+          status: "dispatched",
+          request_id: requestId,
+          score_breakdown: {
+            llm_score: selected.llmScore,
+            impact_signal: selected.impactSignal,
+            penalties: selected.penalties,
+            ema_success: selected.emaSuccess,
+            ema_user_accept: selected.emaUserAccept,
+            final_score: selected.finalScore,
+          },
+        },
+        llmCalls,
+      });
+    } catch (error) {
+      console.error("[RemoteBuddyAutonomousEngine] tick failed:", error);
+    } finally {
+      if (lockAcquired) await this.releaseDispatchLock(runId);
+      this.inFlight = false;
+    }
+  }
+
+  start(): void {
+    if (!this.cfg.enabled || this.timer) return;
+    this.timer = setInterval(() => {
+      void this.tick();
+    }, this.cfg.tickIntervalMs);
+    void this.tick();
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+}

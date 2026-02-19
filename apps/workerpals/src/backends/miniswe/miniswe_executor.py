@@ -317,6 +317,82 @@ def _repo_safe_path(repo: str, rel_path: str) -> Path:
     raise RuntimeError(f"Refusing to access path outside repo: {rel}")
 
 
+def _normalize_scope_rel_path(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().replace("\\", "/")
+    if not raw:
+        return None
+    while raw.startswith("./"):
+        raw = raw[2:]
+    raw = raw.rstrip("/")
+    if not raw or raw.startswith("/"):
+        return None
+    if re.match(r"^[A-Za-z]:[\\/]", raw):
+        return None
+    segments = []
+    for segment in raw.split("/"):
+        seg = segment.strip()
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            return None
+        segments.append(seg)
+    if not segments:
+        return None
+    return "/".join(segments)
+
+
+def _extract_write_globs_from_payload(payload: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(payload, dict):
+        return []
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return []
+    planning = params.get("planning")
+    if not isinstance(planning, dict):
+        return []
+    scope = planning.get("scope")
+    if not isinstance(scope, dict):
+        return []
+    write_globs_raw = scope.get("writeGlobs")
+    if not isinstance(write_globs_raw, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for item in write_globs_raw:
+        normalized = _normalize_scope_rel_path(item)
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _assert_write_allowed(repo: str, path: str, write_globs: Optional[List[str]]) -> None:
+    if not write_globs:
+        return
+    normalized = _normalize_scope_rel_path(path)
+    if not normalized:
+        raise RuntimeError(f"Invalid write path for scope enforcement: {path!r}")
+    for glob in write_globs:
+        pattern = str(glob or "").strip()
+        if not pattern:
+            continue
+        if any(ch in pattern for ch in "*?[]"):
+            if fnmatch.fnmatchcase(normalized, pattern):
+                return
+            continue
+        if normalized == pattern or normalized.startswith(pattern + "/"):
+            return
+    raise RuntimeError(
+        "Scope violation: attempted write outside writeGlobs. "
+        f"path={normalized!r} write_globs={write_globs!r}"
+    )
+
+
 def _read_text_file(repo: str, path: str, max_chars: int = 60000) -> str:
     p = _repo_safe_path(repo, path)
     if not p.exists():
@@ -327,17 +403,19 @@ def _read_text_file(repo: str, path: str, max_chars: int = 60000) -> str:
     return data
 
 
-def _write_text_file(repo: str, path: str, content: str) -> None:
+def _write_text_file(repo: str, path: str, content: str, write_globs: Optional[List[str]] = None) -> None:
+    _assert_write_allowed(repo, path, write_globs)
     p = _repo_safe_path(repo, path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
 
 
-def _append_line(repo: str, path: str, line: str) -> None:
+def _append_line(repo: str, path: str, line: str, write_globs: Optional[List[str]] = None) -> None:
     """
     Append a single line to end of file using append mode (no full-file rewrite).
     If the file exists and does not end with newline, add one first.
     """
+    _assert_write_allowed(repo, path, write_globs)
     p = _repo_safe_path(repo, path)
     p.parent.mkdir(parents=True, exist_ok=True)
     needs_prefix_newline = False
@@ -354,7 +432,14 @@ def _append_line(repo: str, path: str, line: str) -> None:
         wf.write(f"{line}\n")
 
 
-def _replace_text_once(repo: str, path: str, old: str, new: str) -> int:
+def _replace_text_once(
+    repo: str,
+    path: str,
+    old: str,
+    new: str,
+    write_globs: Optional[List[str]] = None,
+) -> int:
+    _assert_write_allowed(repo, path, write_globs)
     p = _repo_safe_path(repo, path)
     data = p.read_text(encoding="utf-8", errors="replace")
     idx = data.find(old)
@@ -678,6 +763,7 @@ def _broker_run(
     llm: _LLMConfig,
     timeout_ms: int,
     explicit_targets: Optional[List[str]] = None,
+    write_globs: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Executes a simple plan/act loop where the model emits JSON actions.
@@ -694,6 +780,7 @@ def _broker_run(
     edits_made = False
     shell_validation_ran = False
     explicit_target_set = {str(t).strip() for t in (explicit_targets or []) if str(t).strip()}
+    allowed_write_globs = [g for g in (write_globs or []) if str(g).strip()]
     expected_targets = sorted(explicit_target_set) if explicit_target_set else _extract_expected_target_paths(instruction)
 
     messages: List[Dict[str, str]] = [
@@ -789,20 +876,20 @@ def _broker_run(
                 elif typ == "append_line":
                     path = str(act.get("path") or "")
                     line = str(act.get("line") or "")
-                    _append_line(repo, path, line)
+                    _append_line(repo, path, line, allowed_write_globs)
                     edits_made = True
                     action_logs.append(f"- append_line {path}: ok (appended {line!r})")
                 elif typ == "replace_text_once":
                     path = str(act.get("path") or "")
                     old = str(act.get("old") or "")
                     new = str(act.get("new") or "")
-                    n = _replace_text_once(repo, path, old, new)
+                    n = _replace_text_once(repo, path, old, new, allowed_write_globs)
                     edits_made = edits_made or (n > 0)
                     action_logs.append(f"- replace_text_once {path}: {n} replacement(s)")
                 elif typ == "write_file":
                     path = str(act.get("path") or "")
                     content = str(act.get("content") or "")
-                    _write_text_file(repo, path, content)
+                    _write_text_file(repo, path, content, allowed_write_globs)
                     edits_made = True
                     action_logs.append(f"- write_file {path}: ok ({len(content)} chars)")
                 elif typ == "run_shell":
@@ -993,6 +1080,8 @@ def _run_miniswe_task(
 
     # Pre-run baseline so we can tell whether *anything* changed even if the model/tooling is flaky.
     baseline_changes = set(summarize_git_changes(repo))
+    explicit_targets = _extract_explicit_target_paths_from_payload(payload)
+    explicit_write_globs = _extract_write_globs_from_payload(payload)
 
     # Prepare broker config upfront (so we can fall back cleanly)
     llm_cfg = _LLMConfig(model=model_name, api_key=api_key or "", base_url=base_url or "")
@@ -1000,89 +1089,166 @@ def _run_miniswe_task(
     exit_info: Dict[str, Any] = {}
     agent = None
     agent_messages: List[Dict[str, Any]] = []
-
-    try:
-        import yaml
-        from minisweagent import package_dir
-
-        litellm_kwargs: Dict[str, Any] = {}
-        if api_key:
-            litellm_kwargs["api_key"] = api_key
-        if base_url:
-            litellm_kwargs["base_url"] = base_url
-
-        model = LitellmModel(
-            model_name=model_name,
-            model_kwargs=litellm_kwargs,
-            cost_tracking="ignore_errors",
+    broker_enabled = _tool_broker_enabled(base_url)
+    prefer_broker_for_scoped_writes = bool(explicit_write_globs)
+    ran_primary_broker = False
+    if prefer_broker_for_scoped_writes and broker_enabled:
+        log.info("Using tool broker shim for strict per-write scope enforcement.")
+        broker_result = _broker_run(
+            repo,
+            instruction=_compose_instruction(),
+            llm=llm_cfg,
+            timeout_ms=timeout_ms,
+            explicit_targets=explicit_targets,
+            write_globs=explicit_write_globs,
+        )
+        if not bool(broker_result.get("ok")):
+            return {
+                "ok": False,
+                "summary": str(broker_result.get("summary") or "tool broker execution failed"),
+                "stdout": str(broker_result.get("stdout") or ""),
+                "stderr": str(broker_result.get("stderr") or ""),
+                "exitCode": to_int(broker_result.get("exitCode"), 3),
+            }
+        exit_info = {"submission": broker_result.get("stdout") or ""}
+        ran_primary_broker = True
+    elif prefer_broker_for_scoped_writes and not broker_enabled:
+        log.info(
+            "Strict write scope requested but tool broker is disabled; "
+            "using native mini-swe path with post-run scope verification."
         )
 
-        env = LocalEnvironment(cwd=repo)
+    if not ran_primary_broker:
+        try:
+            import yaml
+            from minisweagent import package_dir
 
-        config_path = package_dir / "config" / "default.yaml"
-        with open(config_path, "r", encoding="utf-8") as f:
-            builtin_config = yaml.safe_load(f)
-        agent_kwargs = builtin_config.get("agent", {}) or {}
+            litellm_kwargs: Dict[str, Any] = {}
+            if api_key:
+                litellm_kwargs["api_key"] = api_key
+            if base_url:
+                litellm_kwargs["base_url"] = base_url
 
-        agent_kwargs["cost_limit"] = 0.0  # we manage budget externally
-        agent_kwargs["step_limit"] = setting_int(
-            "WORKERPALS_MINISWE_AGENT_MAX_STEPS",
-            "workerpals.miniswe.agent_max_steps",
-            30,
-        )
+            model = LitellmModel(
+                model_name=model_name,
+                model_kwargs=litellm_kwargs,
+                cost_tracking="ignore_errors",
+            )
 
-        agent = DefaultAgent(model, env, **agent_kwargs)
-        log.info("Agent initialized, running task...")
+            env = LocalEnvironment(cwd=repo)
 
-        toolcall_retry_max = _toolcall_retry_max()
-        attempt = 0
-        while True:
-            try:
-                attempt += 1
-                if attempt > 1:
-                    log.info(
-                        f"Retrying agent run after tool-call failure (attempt {attempt}/{toolcall_retry_max + 1})."
+            config_path = package_dir / "config" / "default.yaml"
+            with open(config_path, "r", encoding="utf-8") as f:
+                builtin_config = yaml.safe_load(f)
+            agent_kwargs = builtin_config.get("agent", {}) or {}
+
+            agent_kwargs["cost_limit"] = 0.0  # we manage budget externally
+            agent_kwargs["step_limit"] = setting_int(
+                "WORKERPALS_MINISWE_AGENT_MAX_STEPS",
+                "workerpals.miniswe.agent_max_steps",
+                30,
+            )
+
+            agent = DefaultAgent(model, env, **agent_kwargs)
+            log.info("Agent initialized, running task...")
+
+            toolcall_retry_max = _toolcall_retry_max()
+            attempt = 0
+            while True:
+                try:
+                    attempt += 1
+                    if attempt > 1:
+                        log.info(
+                            f"Retrying agent run after tool-call failure (attempt {attempt}/{toolcall_retry_max + 1})."
+                        )
+
+                    extra_guidance: List[str] = []
+                    if attempt > 1:
+                        extra_guidance.append(_build_strict_tool_use_guidance(repo))
+                        extra_guidance.append(
+                            "If you previously failed because you did not emit tool calls: "
+                            "you must now call tools immediately (read target files, then edit)."
+                        )
+
+                    exit_info = agent.run(_compose_instruction(extra_guidance=extra_guidance)) or {}
+                    log.info("Agent execution completed.")
+
+                    # Log what the agent did
+                    if hasattr(agent, "messages") and agent.messages:
+                        agent_messages = [msg for msg in agent.messages if isinstance(msg, dict)]
+                        log.debug(f"Agent message history ({len(agent.messages)} messages):")
+                        log_agent_messages(agent.messages, log)
+                    log_git_status(repo, log)
+                    break
+
+                except Exception as exc:
+                    if is_no_tool_calls_error(exc) and (attempt - 1) < toolcall_retry_max:
+                        log.info(
+                            "Detected tool-call failure from model/runtime: "
+                            f"{to_single_line(exc, 220)}"
+                        )
+                        continue
+                    raise
+
+        except Exception as exc:
+            # If it's a tool-call failure, optionally fall back to broker shim.
+            if is_no_tool_calls_error(exc):
+                if broker_enabled:
+                    log.info("mini-swe-agent failed due to missing tool calls; falling back to tool broker shim.")
+                    broker_result = _broker_run(
+                        repo,
+                        instruction=_compose_instruction(),
+                        llm=llm_cfg,
+                        timeout_ms=timeout_ms,
+                        explicit_targets=explicit_targets,
+                        write_globs=explicit_write_globs,
                     )
+                    if not bool(broker_result.get("ok")):
+                        return {
+                            "ok": False,
+                            "summary": str(broker_result.get("summary") or "tool broker fallback failed"),
+                            "stdout": str(broker_result.get("stdout") or ""),
+                            "stderr": str(broker_result.get("stderr") or ""),
+                            "exitCode": to_int(broker_result.get("exitCode"), 3),
+                        }
 
-                extra_guidance: List[str] = []
-                if attempt > 1:
-                    extra_guidance.append(_build_strict_tool_use_guidance(repo))
-                    extra_guidance.append(
-                        "If you previously failed because you did not emit tool calls: "
-                        "you must now call tools immediately (read target files, then edit)."
-                    )
+                    # The broker_result itself doesn't include changed-files list; we add it below in the shared post-run path.
+                    # We return broker_result as "exit_info-like" output by mapping it into exit_info and continuing.
+                    exit_info = {"submission": broker_result.get("stdout") or ""}
+                    # Continue into post-run summary construction (changed files etc.) by not returning early.
+                else:
+                    return {
+                        "ok": False,
+                        "summary": "mini-swe-agent could not execute: model did not emit tool calls",
+                        "stderr": (
+                            "Agentic execution requires a tool-calling-capable model/runtime. "
+                            "The model output did not include any tool calls.\n"
+                            f"Error: {to_single_line(exc, 600)}\n"
+                            "Fix options:\n"
+                            "- Use a model/runtime that supports tool calls (function calling), or\n"
+                            "- Enable the tool broker shim: WORKERPALS_MINISWE_TOOL_BROKER=1, or\n"
+                            "- Switch executor backend."
+                        ),
+                        "exitCode": 3,
+                    }
+            else:
+                return {
+                    "ok": False,
+                    "summary": "mini-swe-agent task execution failed",
+                    "stderr": str(exc),
+                    "exitCode": 1,
+                }
 
-                exit_info = agent.run(_compose_instruction(extra_guidance=extra_guidance)) or {}
-                log.info("Agent execution completed.")
-
-                # Log what the agent did
-                if hasattr(agent, "messages") and agent.messages:
-                    agent_messages = [msg for msg in agent.messages if isinstance(msg, dict)]
-                    log.debug(f"Agent message history ({len(agent.messages)} messages):")
-                    log_agent_messages(agent.messages, log)
-                log_git_status(repo, log)
-                break
-
-            except Exception as exc:
-                if is_no_tool_calls_error(exc) and (attempt - 1) < toolcall_retry_max:
-                    log.info(
-                        "Detected tool-call failure from model/runtime: "
-                        f"{to_single_line(exc, 220)}"
-                    )
-                    continue
-                raise
-
-    except Exception as exc:
-        # If it's a tool-call failure, optionally fall back to broker shim.
-        if is_no_tool_calls_error(exc):
-            if _tool_broker_enabled(base_url):
-                log.info("mini-swe-agent failed due to missing tool calls; falling back to tool broker shim.")
+        if _messages_indicate_missing_tool_calls(agent_messages):
+            if broker_enabled:
+                log.info("mini-swe-agent exited without tool calls; falling back to tool broker shim.")
                 broker_result = _broker_run(
                     repo,
                     instruction=_compose_instruction(),
                     llm=llm_cfg,
                     timeout_ms=timeout_ms,
-                    explicit_targets=_extract_explicit_target_paths_from_payload(payload),
+                    explicit_targets=explicit_targets,
+                    write_globs=explicit_write_globs,
                 )
                 if not bool(broker_result.get("ok")):
                     return {
@@ -1092,11 +1258,7 @@ def _run_miniswe_task(
                         "stderr": str(broker_result.get("stderr") or ""),
                         "exitCode": to_int(broker_result.get("exitCode"), 3),
                     }
-
-                # The broker_result itself doesn't include changed-files list; we add it below in the shared post-run path.
-                # We return broker_result as "exit_info-like" output by mapping it into exit_info and continuing.
                 exit_info = {"submission": broker_result.get("stdout") or ""}
-                # Continue into post-run summary construction (changed files etc.) by not returning early.
             else:
                 return {
                     "ok": False,
@@ -1104,54 +1266,12 @@ def _run_miniswe_task(
                     "stderr": (
                         "Agentic execution requires a tool-calling-capable model/runtime. "
                         "The model output did not include any tool calls.\n"
-                        f"Error: {to_single_line(exc, 600)}\n"
                         "Fix options:\n"
-                        "- Use a model/runtime that supports tool calls (function calling), or\n"
                         "- Enable the tool broker shim: WORKERPALS_MINISWE_TOOL_BROKER=1, or\n"
-                        "- Switch executor backend."
+                        "- Use a model/runtime with function-calling support."
                     ),
                     "exitCode": 3,
                 }
-        else:
-            return {
-                "ok": False,
-                "summary": "mini-swe-agent task execution failed",
-                "stderr": str(exc),
-                "exitCode": 1,
-            }
-
-    if _messages_indicate_missing_tool_calls(agent_messages):
-        if _tool_broker_enabled(base_url):
-            log.info("mini-swe-agent exited without tool calls; falling back to tool broker shim.")
-            broker_result = _broker_run(
-                repo,
-                instruction=_compose_instruction(),
-                llm=llm_cfg,
-                timeout_ms=timeout_ms,
-                explicit_targets=_extract_explicit_target_paths_from_payload(payload),
-            )
-            if not bool(broker_result.get("ok")):
-                return {
-                    "ok": False,
-                    "summary": str(broker_result.get("summary") or "tool broker fallback failed"),
-                    "stdout": str(broker_result.get("stdout") or ""),
-                    "stderr": str(broker_result.get("stderr") or ""),
-                    "exitCode": to_int(broker_result.get("exitCode"), 3),
-                }
-            exit_info = {"submission": broker_result.get("stdout") or ""}
-        else:
-            return {
-                "ok": False,
-                "summary": "mini-swe-agent could not execute: model did not emit tool calls",
-                "stderr": (
-                    "Agentic execution requires a tool-calling-capable model/runtime. "
-                    "The model output did not include any tool calls.\n"
-                    "Fix options:\n"
-                    "- Enable the tool broker shim: WORKERPALS_MINISWE_TOOL_BROKER=1, or\n"
-                    "- Use a model/runtime with function-calling support."
-                ),
-                "exitCode": 3,
-            }
 
     # Extract the agent's conversational output from its message history (or broker transcript).
     agent_text = ""

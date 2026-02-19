@@ -408,7 +408,18 @@
             "jobId": { "type": "string" },
             "taskId": { "type": "string" },
             "kind": { "type": "string" },
-            "params": { "type": "object", "additionalProperties": true }
+            "params": { "type": "object", "additionalProperties": true },
+            "origin": { "type": "string", "enum": ["user", "autonomy"] },
+            "autonomy": {
+              "type": "object",
+              "properties": {
+                "objectiveId": { "type": "string" },
+                "runId": { "type": "string" },
+                "snapshotId": { "type": "string" },
+                "patternKey": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
           },
           "additionalProperties": false
         }
@@ -520,6 +531,143 @@
             "state": { "type": "string", "enum": ["idle", "busy", "error", "shutting_down"] },
             "uptimeMs": { "type": "number" },
             "detail": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_cycle_started" },
+        "payload": {
+          "type": "object",
+          "required": ["runId", "snapshotId"],
+          "properties": {
+            "runId": { "type": "string" },
+            "snapshotId": { "type": "string" },
+            "phase": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_candidates_generated" },
+        "payload": {
+          "type": "object",
+          "required": ["runId", "snapshotId", "candidateCount"],
+          "properties": {
+            "runId": { "type": "string" },
+            "snapshotId": { "type": "string" },
+            "candidateCount": { "type": "integer", "minimum": 0 },
+            "topCandidateIds": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_objective_dispatched" },
+        "payload": {
+          "type": "object",
+          "required": ["runId", "snapshotId", "objectiveId", "requestId", "patternKey"],
+          "properties": {
+            "runId": { "type": "string" },
+            "snapshotId": { "type": "string" },
+            "objectiveId": { "type": "string" },
+            "requestId": { "type": "string" },
+            "patternKey": { "type": "string" },
+            "origin": { "type": "string", "enum": ["autonomy"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_objective_blocked" },
+        "payload": {
+          "type": "object",
+          "required": ["runId", "snapshotId", "objectiveId", "reason"],
+          "properties": {
+            "runId": { "type": "string" },
+            "snapshotId": { "type": "string" },
+            "objectiveId": { "type": "string" },
+            "reason": { "type": "string" },
+            "questionId": { "type": "string" },
+            "patternKey": { "type": "string" },
+            "origin": { "type": "string", "enum": ["autonomy"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_feedback_recorded" },
+        "payload": {
+          "type": "object",
+          "required": ["objectiveId", "patternKey", "outcome", "success"],
+          "properties": {
+            "objectiveId": { "type": "string" },
+            "patternKey": { "type": "string" },
+            "outcome": { "type": "string" },
+            "success": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "question_asked" },
+        "payload": {
+          "type": "object",
+          "required": ["questionId", "objectiveId", "question", "questionType"],
+          "properties": {
+            "questionId": { "type": "string" },
+            "objectiveId": { "type": "string" },
+            "question": { "type": "string" },
+            "questionType": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "question_answered" },
+        "payload": {
+          "type": "object",
+          "required": ["questionId", "objectiveId", "status"],
+          "properties": {
+            "questionId": { "type": "string" },
+            "objectiveId": { "type": "string" },
+            "status": { "type": "string", "enum": ["valid", "invalid"] },
+            "answerSummary": { "type": "string" }
           },
           "additionalProperties": false
         }

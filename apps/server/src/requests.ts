@@ -10,6 +10,7 @@
 
 import { Database } from "bun:sqlite";
 import { randomUUID } from "crypto";
+import { validateScopeInvariants, type AutonomyComponentArea } from "shared";
 
 export type RequestStatus = "pending" | "claimed" | "completed" | "failed";
 export type QueuePriority = "interactive" | "normal" | "background";
@@ -38,6 +39,91 @@ function parseBudgetMs(value: unknown, fallback: number): number {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.max(1_000, parsed);
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+const AUTONOMY_COMPONENT_AREAS = new Set<AutonomyComponentArea>([
+  "apps/server",
+  "apps/remotebuddy",
+  "apps/workerpals",
+  "apps/client",
+  "packages/protocol",
+  "packages/shared",
+  "tests/integration",
+  "tests/unit",
+]);
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => asString(entry)).filter(Boolean);
+}
+
+function parseMetadataJson(raw: string | null | undefined): Record<string, unknown> | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const obj = asObject(parsed);
+    return obj ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeRequestMetadata(input: unknown): {
+  metadata: Record<string, unknown> | null;
+  error?: string;
+} {
+  const record = asObject(input);
+  if (!record) return { metadata: null };
+  const origin = asString(record.origin).toLowerCase();
+  if (origin !== "autonomy") return { metadata: null };
+  const autonomy = asObject(record.autonomy);
+  if (!autonomy) {
+    return { metadata: null, error: "metadata.autonomy object is required for origin=autonomy" };
+  }
+  const componentAreaRaw = asString(autonomy.componentArea ?? autonomy.component_area);
+  if (!AUTONOMY_COMPONENT_AREAS.has(componentAreaRaw as AutonomyComponentArea)) {
+    return {
+      metadata: null,
+      error: `autonomy metadata requires valid componentArea; received "${componentAreaRaw}"`,
+    };
+  }
+  const targetPathsRaw = asStringArray(autonomy.targetPaths ?? autonomy.target_paths);
+  const writeGlobsRaw = asStringArray(autonomy.writeGlobs ?? autonomy.write_globs);
+  const scope = validateScopeInvariants(
+    componentAreaRaw as AutonomyComponentArea,
+    targetPathsRaw,
+    writeGlobsRaw,
+    { requireWriteGlobs: true },
+  );
+  if (!scope.ok) {
+    return {
+      metadata: null,
+      error: `autonomy metadata scope invalid: ${scope.errors.join("; ")}`,
+    };
+  }
+  return {
+    metadata: {
+      origin: "autonomy",
+      autonomy: {
+        objectiveId: asString(autonomy.objectiveId ?? autonomy.objective_id),
+        runId: asString(autonomy.runId ?? autonomy.run_id),
+        snapshotId: asString(autonomy.snapshotId ?? autonomy.snapshot_id),
+        patternKey: asString(autonomy.patternKey ?? autonomy.pattern_key),
+        componentArea: componentAreaRaw,
+        targetPaths: scope.normalizedTargetPaths,
+        writeGlobs: scope.normalizedWriteGlobs,
+      },
+    },
+  };
 }
 
 function parseIsoMs(value: string | null | undefined): number | null {
@@ -74,6 +160,8 @@ export interface RequestRow {
   prompt: string;
   priority: QueuePriority;
   queueWaitBudgetMs: number;
+  metadataJson: string | null;
+  metadata?: Record<string, unknown>;
   // Overrides / routing hints for RemoteBuddy
   forceWorker: number; // 0/1 (SQLite INTEGER)
   forceLane: string | null; // "worker" | "deterministic" | null
@@ -115,6 +203,7 @@ export class RequestQueue {
     prompt,
     priority,
     queueWaitBudgetMs,
+    metadataJson,
     forceWorker,
     forceLane,
     status,
@@ -144,6 +233,7 @@ export class RequestQueue {
         prompt           TEXT NOT NULL,
         priority         TEXT NOT NULL DEFAULT 'normal',
         queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000,
+        metadataJson     TEXT,
         forceWorker      INTEGER NOT NULL DEFAULT 0,
         forceLane        TEXT,
         status           TEXT NOT NULL DEFAULT 'pending',
@@ -177,6 +267,7 @@ export class RequestQueue {
       "queueWaitBudgetMs",
       `ALTER TABLE requests ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`,
     );
+    ensureColumn("metadataJson", `ALTER TABLE requests ADD COLUMN metadataJson TEXT;`);
 
     ensureColumn(
       "forceWorker",
@@ -269,6 +360,12 @@ export class RequestQueue {
     const forceWorker = body.forceWorker === true ? 1 : 0;
     const rawLane = typeof body.forceLane === "string" ? body.forceLane.trim().toLowerCase() : "";
     const forceLane = rawLane === "deterministic" || rawLane === "worker" ? rawLane : null;
+    const metadataSource = body.metadata ?? body.meta;
+    const metadataParsed = sanitizeRequestMetadata(metadataSource);
+    if (metadataParsed.error) {
+      return { ok: false, message: metadataParsed.error };
+    }
+    const metadataJson = metadataParsed.metadata ? JSON.stringify(metadataParsed.metadata) : null;
 
     if (!sessionId || !prompt) {
       return { ok: false, message: "sessionId and prompt are required" };
@@ -280,11 +377,11 @@ export class RequestQueue {
     this.db
       .prepare(
         `INSERT INTO requests (
-          id, sessionId, prompt, priority, queueWaitBudgetMs, forceWorker, forceLane,
+          id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, forceWorker, forceLane,
           status, agentId, result, error,
           enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
       )
       .run(
         requestId,
@@ -292,6 +389,7 @@ export class RequestQueue {
         prompt,
         priority,
         queueWaitBudgetMs,
+        metadataJson,
         forceWorker,
         forceLane,
         now,
@@ -365,6 +463,7 @@ export class RequestQueue {
       return {
         request: {
           ...row,
+          metadata: parseMetadataJson(row.metadataJson),
           status: "claimed" as RequestStatus,
           agentId,
           claimedAt: now,
@@ -438,15 +537,16 @@ export class RequestQueue {
   }
 
   getRequest(requestId: string): RequestRow | null {
-    return (
+    const row =
       (this.db
         .prepare(`SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE id = ?`)
-        .get(requestId) as RequestRow) ?? null
-    );
+        .get(requestId) as RequestRow | undefined) ?? null;
+    if (!row) return null;
+    return { ...row, metadata: parseMetadataJson(row.metadataJson) };
   }
 
   getPendingRequests(): RequestRow[] {
-    return this.db
+    const rows = this.db
       .prepare(
         `SELECT ${RequestQueue.SELECT_COLUMNS}
          FROM requests
@@ -457,10 +557,11 @@ export class RequestQueue {
              WHEN 'normal' THEN 1
              WHEN 'background' THEN 2
              ELSE 1
-           END ASC,
-           createdAt ASC`,
+            END ASC,
+            createdAt ASC`,
       )
       .all() as RequestRow[];
+    return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
   }
 
   listRequests(options?: { status?: RequestStatus | "all"; limit?: number }): RequestRow[] {
@@ -471,7 +572,7 @@ export class RequestQueue {
         : 200;
 
     if (status === "all") {
-      return this.db
+      const rows = this.db
         .prepare(
           `SELECT ${RequestQueue.SELECT_COLUMNS}
            FROM requests
@@ -479,9 +580,10 @@ export class RequestQueue {
            LIMIT ?`,
         )
         .all(limit) as RequestRow[];
+      return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
     }
 
-    return this.db
+    const rows = this.db
       .prepare(
         `SELECT ${RequestQueue.SELECT_COLUMNS}
          FROM requests
@@ -490,6 +592,7 @@ export class RequestQueue {
          LIMIT ?`,
       )
       .all(status, limit) as RequestRow[];
+    return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
   }
 
   countByStatus(): Record<RequestStatus, number> {

@@ -75,6 +75,29 @@ export interface PushPalsConfig {
     executionBudgetNormalMs: number;
     executionBudgetBackgroundMs: number;
     finalizationBudgetMs: number;
+    autonomy: {
+      enabled: boolean;
+      tickIntervalMs: number;
+      ideationBudgetMs: number;
+      llmTimeoutMs: number;
+      ideationMaxCandidates: number;
+      topK: number;
+      minConfidence: number;
+      maxConcurrentObjectives: number;
+      maxDispatchPerHour: number;
+      maxDispatchPerHourByType: Record<string, number>;
+      cooldownFailStreakThreshold: number;
+      cooldownMs: number;
+      allowReadAnywhere: boolean;
+      questionTtlMs: number;
+      policyVersion: string;
+      impactModelVersion: string;
+      replay: {
+        storePromptPayloads: boolean;
+        maxRunsWithPayloads: number;
+        maxPayloadBytes: number;
+      };
+    };
     llm: PushPalsLlmConfig;
   };
   workerpals: {
@@ -255,6 +278,24 @@ function asIntOrNull(value: unknown): number | null {
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
+}
+
+function asStringNumberRecord(value: unknown): Record<string, number> {
+  if (!isObject(value)) return {};
+  const out: Record<string, number> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const name = key.trim();
+    if (!name) continue;
+    const num =
+      typeof raw === "number"
+        ? raw
+        : typeof raw === "string"
+          ? Number.parseInt(raw.trim(), 10)
+          : Number.NaN;
+    if (!Number.isFinite(num)) continue;
+    out[name] = Math.max(0, Math.floor(num));
+  }
+  return out;
 }
 
 function resolvePathFromRoot(projectRoot: string, value: string): string {
@@ -486,6 +527,20 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     },
     sessionId,
   );
+  const remoteAutonomyNode = getObject(remoteNode, "autonomy");
+  const remoteAutonomyReplayNode = getObject(remoteAutonomyNode, "replay");
+  const remoteAutonomyDispatchByTypeCfg = {
+    flaky_test: 4,
+    lint_fix: 3,
+    type_fix: 3,
+    small_refactor: 2,
+    docs: 3,
+    dep_bump: 0,
+  };
+  const remoteAutonomyDispatchByType = {
+    ...remoteAutonomyDispatchByTypeCfg,
+    ...asStringNumberRecord(remoteAutonomyNode.max_dispatch_per_hour_by_type),
+  };
 
   const workerNode = getObject(merged, "workerpals");
   const workerOpenHandsNode = getObject(workerNode, "openhands");
@@ -976,6 +1031,145 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
           120_000,
         ),
       ),
+      autonomy: {
+        enabled:
+          parseBoolEnv("REMOTEBUDDY_AUTONOMY_ENABLED") ??
+          asBoolean(remoteAutonomyNode.enabled, false),
+        tickIntervalMs: Math.max(
+          5_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_TICK_INTERVAL_MS") ??
+              remoteAutonomyNode.tick_interval_ms,
+            300_000,
+          ),
+        ),
+        ideationBudgetMs: Math.max(
+          1_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_IDEATION_BUDGET_MS") ??
+              remoteAutonomyNode.ideation_budget_ms,
+            20_000,
+          ),
+        ),
+        llmTimeoutMs: Math.max(
+          1_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_LLM_TIMEOUT_MS") ??
+              remoteAutonomyNode.llm_timeout_ms,
+            12_000,
+          ),
+        ),
+        ideationMaxCandidates: Math.max(
+          1,
+          Math.min(
+            100,
+            asInt(
+              parseIntEnv("REMOTEBUDDY_AUTONOMY_IDEATION_MAX_CANDIDATES") ??
+                remoteAutonomyNode.ideation_max_candidates,
+              20,
+            ),
+          ),
+        ),
+        topK: Math.max(
+          1,
+          Math.min(
+            20,
+            asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_TOP_K") ?? remoteAutonomyNode.top_k, 3),
+          ),
+        ),
+        minConfidence: Math.max(
+          0,
+          Math.min(
+            1,
+            (() => {
+              const parsed = Number.parseFloat(
+                String(
+                  firstNonEmpty(
+                    process.env.REMOTEBUDDY_AUTONOMY_MIN_CONFIDENCE,
+                    asString(remoteAutonomyNode.min_confidence, "0.65"),
+                    "0.65",
+                  ),
+                ),
+              );
+              return Number.isFinite(parsed) ? parsed : 0.65;
+            })(),
+          ),
+        ),
+        maxConcurrentObjectives: Math.max(
+          1,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_CONCURRENT_OBJECTIVES") ??
+              remoteAutonomyNode.max_concurrent_objectives,
+            2,
+          ),
+        ),
+        maxDispatchPerHour: Math.max(
+          1,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_DISPATCH_PER_HOUR") ??
+              remoteAutonomyNode.max_dispatch_per_hour,
+            6,
+          ),
+        ),
+        maxDispatchPerHourByType: remoteAutonomyDispatchByType,
+        cooldownFailStreakThreshold: Math.max(
+          1,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_COOLDOWN_FAIL_STREAK_THRESHOLD") ??
+              remoteAutonomyNode.cooldown_fail_streak_threshold,
+            2,
+          ),
+        ),
+        cooldownMs: Math.max(
+          1_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_COOLDOWN_MS") ?? remoteAutonomyNode.cooldown_ms,
+            1_800_000,
+          ),
+        ),
+        allowReadAnywhere:
+          parseBoolEnv("REMOTEBUDDY_AUTONOMY_ALLOW_READ_ANYWHERE") ??
+          asBoolean(remoteAutonomyNode.allow_read_anywhere, false),
+        questionTtlMs: Math.max(
+          60_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_QUESTION_TTL_MS") ??
+              remoteAutonomyNode.question_ttl_ms,
+            259_200_000,
+          ),
+        ),
+        policyVersion: firstNonEmpty(
+          process.env.REMOTEBUDDY_AUTONOMY_POLICY_VERSION,
+          asString(remoteAutonomyNode.policy_version, "policy-v3.3"),
+          "policy-v3.3",
+        ),
+        impactModelVersion: firstNonEmpty(
+          process.env.REMOTEBUDDY_AUTONOMY_IMPACT_MODEL_VERSION,
+          asString(remoteAutonomyNode.impact_model_version, "impact-v1"),
+          "impact-v1",
+        ),
+        replay: {
+          storePromptPayloads:
+            parseBoolEnv("REMOTEBUDDY_AUTONOMY_REPLAY_STORE_PROMPT_PAYLOADS") ??
+            asBoolean(remoteAutonomyReplayNode.store_prompt_payloads, false),
+          maxRunsWithPayloads: Math.max(
+            0,
+            asInt(
+              parseIntEnv("REMOTEBUDDY_AUTONOMY_REPLAY_MAX_RUNS_WITH_PAYLOADS") ??
+                remoteAutonomyReplayNode.max_runs_with_payloads,
+              50,
+            ),
+          ),
+          maxPayloadBytes: Math.max(
+            1024,
+            asInt(
+              parseIntEnv("REMOTEBUDDY_AUTONOMY_REPLAY_MAX_PAYLOAD_BYTES") ??
+                remoteAutonomyReplayNode.max_payload_bytes,
+              262_144,
+            ),
+          ),
+        },
+      },
       llm: remoteLlm,
     },
     workerpals: {

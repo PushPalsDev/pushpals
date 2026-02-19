@@ -18,11 +18,18 @@
 import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
-import { createLLMClient } from "./llm.js";
+import { createLLMClient, type LLMClient } from "./llm.js";
 import { AgentBrain, PlannerOutput } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
-import { CommunicationManager, detectRepoRoot, loadPushPalsConfig } from "shared";
+import {
+  CommunicationManager,
+  detectRepoRoot,
+  loadPushPalsConfig,
+  normalizeTargetPath,
+  normalizeWriteGlob,
+} from "shared";
 import { mkdirSync } from "fs";
+import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {
   extractExplicitTargetPath,
   normalizePathHints,
@@ -140,6 +147,15 @@ interface TaskExecuteJobParams {
   schemaVersion: 2;
   requestId: string;
   sessionId: string;
+  origin?: "user" | "autonomy";
+  autonomy?: {
+    origin: "autonomy";
+    objectiveId?: string;
+    runId?: string;
+    snapshotId?: string;
+    patternKey?: string;
+    componentArea?: string;
+  };
   instruction: string;
   plannerWorkerInstruction?: string;
   lane: TaskExecutionLane;
@@ -147,6 +163,7 @@ interface TaskExecuteJobParams {
   planning: {
     intent: PlannerIntent;
     riskLevel: PlannerRisk;
+    targetPaths?: string[];
     scope: {
       readAnywhere: boolean;
       writeAllowed: boolean;
@@ -171,6 +188,17 @@ interface TaskExecuteJobParams {
   recentJobs: Array<Record<string, unknown>>;
 }
 
+type RequestAutonomyMetadata = {
+  origin: "autonomy";
+  objectiveId?: string;
+  runId?: string;
+  snapshotId?: string;
+  patternKey?: string;
+  componentArea?: string;
+  targetPaths: string[];
+  writeGlobs: string[];
+};
+
 function normalizeRequestPriority(value: unknown): RequestPriority {
   const text = String(value ?? "")
     .trim()
@@ -185,6 +213,76 @@ function toSingleLine(value: unknown, max = 220): string {
     .trim();
   if (!text) return "";
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function normalizeMetadataTargetPaths(value: unknown, maxItems = 48): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    const normalized = normalizeTargetPath(raw);
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function normalizeMetadataWriteGlobs(value: unknown, maxItems = 48): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    const normalized = normalizeWriteGlob(raw);
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata | null {
+  let root = asObject(value);
+  if (!root && typeof value === "string") {
+    const text = value.trim();
+    if (text) {
+      try {
+        root = asObject(JSON.parse(text));
+      } catch {
+        root = null;
+      }
+    }
+  }
+  if (!root) return null;
+  const rootOrigin = String(root.origin ?? "")
+    .trim()
+    .toLowerCase();
+  const autonomy = asObject(root.autonomy);
+  const autonomyOrigin = String(autonomy?.origin ?? "")
+    .trim()
+    .toLowerCase();
+  if (rootOrigin !== "autonomy" && autonomyOrigin !== "autonomy") return null;
+
+  const payload = autonomy ?? root;
+  return {
+    origin: "autonomy",
+    objectiveId: String(payload.objectiveId ?? payload.objective_id ?? "").trim() || undefined,
+    runId: String(payload.runId ?? payload.run_id ?? "").trim() || undefined,
+    snapshotId: String(payload.snapshotId ?? payload.snapshot_id ?? "").trim() || undefined,
+    patternKey: String(payload.patternKey ?? payload.pattern_key ?? "").trim() || undefined,
+    componentArea: String(payload.componentArea ?? payload.component_area ?? "").trim() || undefined,
+    targetPaths: normalizeMetadataTargetPaths(payload.targetPaths ?? payload.target_paths),
+    writeGlobs: normalizeMetadataWriteGlobs(payload.writeGlobs ?? payload.write_globs),
+  };
 }
 
 function buildExecutionGuidance(plan: PlannerOutput): string {
@@ -387,6 +485,7 @@ class RemoteBuddyOrchestrator {
   private readonly executionBudgetNormalMs: number;
   private readonly executionBudgetBackgroundMs: number;
   private readonly finalizationBudgetMs: number;
+  private readonly autonomousEngine: RemoteBuddyAutonomousEngine;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -419,6 +518,7 @@ class RemoteBuddyOrchestrator {
     sessionId: string;
     authToken: string | null;
     brain: AgentBrain;
+    llm: LLMClient;
     idempotency: IdempotencyStore;
     jobsDbPath: string;
   }) {
@@ -463,6 +563,15 @@ class RemoteBuddyOrchestrator {
       sessionId: this.sessionId,
       authToken: this.authToken,
       from: `agent:${this.agentId}`,
+    });
+    this.autonomousEngine = new RemoteBuddyAutonomousEngine({
+      server: this.server,
+      sessionId: this.sessionId,
+      authToken: this.authToken,
+      repo: this.repo,
+      llm: opts.llm,
+      comm: this.comm,
+      config: CONFIG,
     });
     console.log(`[RemoteBuddy] Detected repo root: ${this.repo}`);
     console.log(
@@ -1025,6 +1134,8 @@ class RemoteBuddyOrchestrator {
       queueWaitBudgetMs?: number;
       forceWorker?: boolean;
       forceLane?: TaskExecutionLane;
+      metadata?: Record<string, unknown>;
+      metadataJson?: string | null;
     },
     queueWaitMs = 0,
   ): Promise<void> {
@@ -1049,14 +1160,19 @@ class RemoteBuddyOrchestrator {
     }
 
     const reqAny = request as any;
-    const forceWorker = Boolean(reqAny.forceWorker ?? reqAny.force_worker);
+    let forceWorker = Boolean(reqAny.forceWorker ?? reqAny.force_worker);
     const laneRaw = String(reqAny.forceLane ?? reqAny.force_lane ?? "")
       .trim()
       .toLowerCase();
-    const forceLane: TaskExecutionLane | undefined =
+    let forceLane: TaskExecutionLane | undefined =
       laneRaw === "deterministic" || laneRaw === "worker"
         ? (laneRaw as TaskExecutionLane)
         : undefined;
+    const autonomyMetadata = parseAutonomyRequestMetadata(reqAny.metadata ?? reqAny.metadataJson);
+    if (autonomyMetadata) {
+      forceWorker = true;
+      forceLane = "worker";
+    }
 
     const priority = normalizeRequestPriority(request.priority);
     const queueWaitBudgetMs = Math.max(
@@ -1084,9 +1200,20 @@ class RemoteBuddyOrchestrator {
         forceWorker,
         forceLane,
       });
+      if (autonomyMetadata) {
+        plan.requires_worker = true;
+        plan.job_kind = "task.execute";
+        plan.lane = "worker";
+        plan.scope.read_anywhere = false;
+        plan.scope.write_allowed = true;
+        plan.scope.write_globs = [...autonomyMetadata.writeGlobs];
+      }
       this.pushContext(`[user] ${toSingleLine(prompt, 700)}`);
       this.pushContext(`[plan] ${toSingleLine(JSON.stringify(plan), 900)}`);
-      const targetPaths = plannerTargetPaths(plan, prompt);
+      const targetPaths =
+        autonomyMetadata && autonomyMetadata.targetPaths.length > 0
+          ? autonomyMetadata.targetPaths
+          : plannerTargetPaths(plan, prompt);
       const targetPath = targetPaths[0];
       // forceWorker overrides "direct reply" short-circuit + planner requires_worker
       const requiresWorker = forceWorker
@@ -1097,6 +1224,11 @@ class RemoteBuddyOrchestrator {
       console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
       // when forcing worker, don't fail on "planner contract incomplete" — fill safe defaults.
       if (requiresWorker) {
+        if (autonomyMetadata && (!plan.scope.write_globs || plan.scope.write_globs.length === 0)) {
+          throw new Error(
+            "Autonomy-origin request requires non-empty planning.scope.write_globs before task dispatch.",
+          );
+        }
         if (plan.acceptance_criteria.length === 0) {
           plan.acceptance_criteria = ["Produce a correct and helpful result for the user request."];
         }
@@ -1186,10 +1318,32 @@ class RemoteBuddyOrchestrator {
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
       const executionBudgetMs = this.executionBudgetForPriority(priority);
+      const strictTargetPaths = targetPaths.filter((entry) => entry && entry !== ".");
       const params: TaskExecuteJobParams = {
         schemaVersion: 2,
         requestId,
         sessionId: this.sessionId,
+        origin: autonomyMetadata ? "autonomy" : "user",
+        ...(autonomyMetadata
+          ? {
+              autonomy: {
+                origin: "autonomy" as const,
+                ...(autonomyMetadata.objectiveId
+                  ? { objectiveId: autonomyMetadata.objectiveId }
+                  : {}),
+                ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
+                ...(autonomyMetadata.snapshotId
+                  ? { snapshotId: autonomyMetadata.snapshotId }
+                  : {}),
+                ...(autonomyMetadata.patternKey
+                  ? { patternKey: autonomyMetadata.patternKey }
+                  : {}),
+                ...(autonomyMetadata.componentArea
+                  ? { componentArea: autonomyMetadata.componentArea }
+                  : {}),
+              },
+            }
+          : {}),
         instruction: canonicalInstruction,
         plannerWorkerInstruction:
           plannerWorkerInstruction && plannerWorkerInstruction !== canonicalInstruction
@@ -1200,6 +1354,7 @@ class RemoteBuddyOrchestrator {
         planning: {
           intent: plan.intent,
           riskLevel: plan.risk_level,
+          ...(strictTargetPaths.length > 0 ? { targetPaths: strictTargetPaths } : {}),
           scope: {
             readAnywhere: plan.scope.read_anywhere,
             writeAllowed: plan.scope.write_allowed,
@@ -1275,7 +1430,29 @@ class RemoteBuddyOrchestrator {
       if (jobId) {
         await this.sendCommand({
           type: "job_enqueued",
-          payload: { jobId, taskId, kind: "task.execute", params },
+          payload: {
+            jobId,
+            taskId,
+            kind: "task.execute",
+            params,
+            origin: autonomyMetadata ? "autonomy" : "user",
+            ...(autonomyMetadata
+              ? {
+                  autonomy: {
+                    ...(autonomyMetadata.objectiveId
+                      ? { objectiveId: autonomyMetadata.objectiveId }
+                      : {}),
+                    ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
+                    ...(autonomyMetadata.snapshotId
+                      ? { snapshotId: autonomyMetadata.snapshotId }
+                      : {}),
+                    ...(autonomyMetadata.patternKey
+                      ? { patternKey: autonomyMetadata.patternKey }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
           turnId,
         });
       }
@@ -1339,6 +1516,8 @@ class RemoteBuddyOrchestrator {
               queueWaitBudgetMs?: number;
               forceWorker?: boolean;
               forceLane?: TaskExecutionLane;
+              metadata?: Record<string, unknown>;
+              metadataJson?: string | null;
             };
             queueWaitMs?: number;
           };
@@ -1363,8 +1542,13 @@ class RemoteBuddyOrchestrator {
     }
   }
 
+  startAutonomy(): void {
+    this.autonomousEngine.start();
+  }
+
   dispose(): void {
     this.disposed = true;
+    this.autonomousEngine.stop();
     if (this.statusHeartbeatTimer) {
       clearInterval(this.statusHeartbeatTimer);
       this.statusHeartbeatTimer = null;
@@ -1469,6 +1653,7 @@ async function main() {
     sessionId,
     authToken: opts.authToken,
     brain,
+    llm,
     idempotency,
     jobsDbPath: sharedDbPath,
   });
@@ -1476,6 +1661,7 @@ async function main() {
   await orchestrator.emitStartupStatus();
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();
+  orchestrator.startAutonomy();
 
   // Start polling for requests from the Request Queue
   const pollMs = CONFIG.remotebuddy.pollMs;

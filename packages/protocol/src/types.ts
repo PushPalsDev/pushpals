@@ -98,6 +98,13 @@ export interface EventTypePayloadMap {
     taskId: string;
     kind: string;
     params: Record<string, unknown>;
+    origin?: "user" | "autonomy";
+    autonomy?: {
+      objectiveId?: string;
+      runId?: string;
+      snapshotId?: string;
+      patternKey?: string;
+    };
   };
   job_claimed: { jobId: string; workerId: string };
   job_completed: {
@@ -124,6 +131,54 @@ export interface EventTypePayloadMap {
     state: "idle" | "busy" | "error" | "shutting_down";
     uptimeMs?: number;
     detail?: string;
+  };
+
+  // —— Autonomous system lifecycle events ————————————————————————————————————————————
+  autonomy_cycle_started: {
+    runId: string;
+    snapshotId: string;
+    phase?: string;
+  };
+  autonomy_candidates_generated: {
+    runId: string;
+    snapshotId: string;
+    candidateCount: number;
+    topCandidateIds?: string[];
+  };
+  autonomy_objective_dispatched: {
+    runId: string;
+    snapshotId: string;
+    objectiveId: string;
+    requestId: string;
+    patternKey: string;
+    origin?: "autonomy";
+  };
+  autonomy_objective_blocked: {
+    runId: string;
+    snapshotId: string;
+    objectiveId: string;
+    reason: string;
+    questionId?: string;
+    patternKey?: string;
+    origin?: "autonomy";
+  };
+  autonomy_feedback_recorded: {
+    objectiveId: string;
+    patternKey: string;
+    outcome: string;
+    success: boolean;
+  };
+  question_asked: {
+    questionId: string;
+    objectiveId: string;
+    question: string;
+    questionType: string;
+  };
+  question_answered: {
+    questionId: string;
+    objectiveId: string;
+    status: "valid" | "invalid";
+    answerSummary?: string;
   };
 }
 
