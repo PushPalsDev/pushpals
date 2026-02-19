@@ -13,7 +13,8 @@
  */
 
 import { randomUUID } from "crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
 import { isAbsolute, relative, resolve } from "path";
 import { loadPushPalsConfig } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
@@ -514,10 +515,12 @@ export class DockerExecutor {
 
   private async startWarmContainer(): Promise<void> {
     await this.stopWarmContainer("pre-start cleanup", true);
-    const backendSpec = this.currentBackendSpec();
+    const backend = this.currentBackend();
+    const backendSpec = getDockerBackendSpec(backend);
     const warmContext = this.warmStartupContext();
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const envArgs = this.collectContainerEnv();
+    const authMountArgs = this.openaiCodexAuthMountArgs(backend);
     const args: string[] = [
       "run",
       "-d",
@@ -543,6 +546,7 @@ export class DockerExecutor {
       // Keep agent-server runtime artifacts off the host-mounted repo path.
       "/workspace",
       ...envArgs,
+      ...authMountArgs,
     ];
 
     if (this.options.gitToken) {
@@ -572,6 +576,54 @@ export class DockerExecutor {
       );
     }
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
+  }
+
+  private openaiCodexAuthMountArgs(backend: ExecutorBackend): string[] {
+    if (backend !== "openai_codex") return [];
+
+    const hostCodexHomeRaw = (process.env.WORKERPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
+    const hostCodexHome = (
+      hostCodexHomeRaw
+        ? isAbsolute(hostCodexHomeRaw)
+          ? hostCodexHomeRaw
+          : resolve(this.options.repo, hostCodexHomeRaw)
+        : resolve(homedir(), ".codex")
+    ).trim();
+    if (!hostCodexHome) return [];
+
+    if (!existsSync(hostCodexHome)) {
+      try {
+        mkdirSync(hostCodexHome, { recursive: true });
+      } catch (err) {
+        console.warn(
+          `[DockerExecutor] Failed to create Codex auth directory (${hostCodexHome}); skipping mount: ${this.compactError(
+            err,
+          )}`,
+        );
+        return [];
+      }
+    }
+
+    let containerCodexHome = (
+      process.env.WORKERPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME || "/root/.codex"
+    ).trim();
+    if (!containerCodexHome.startsWith("/")) {
+      console.warn(
+        `[DockerExecutor] Invalid WORKERPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME=${containerCodexHome}; expected absolute path. Using /root/.codex.`,
+      );
+      containerCodexHome = "/root/.codex";
+    }
+
+    const dockerHostPath = this.toDockerPath(hostCodexHome);
+    console.log(
+      `[DockerExecutor] Mounting Codex auth directory for openai_codex: ${hostCodexHome} -> ${containerCodexHome}`,
+    );
+    return [
+      "-v",
+      `${dockerHostPath}:${containerCodexHome}`,
+      "-e",
+      `CODEX_HOME=${containerCodexHome}`,
+    ];
   }
 
   private async ensureWarmContainer(): Promise<void> {

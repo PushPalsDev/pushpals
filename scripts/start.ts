@@ -110,6 +110,7 @@ function parseStartOptions(argv: string[]): StartOptions {
 const startOptions = parseStartOptions(process.argv.slice(2));
 
 type SupportedLlmBackend = "lmstudio" | "ollama" | "openai";
+type CodexAuthMode = "auto" | "api_key" | "chatgpt";
 
 function abortStart(exitCode: number): never {
   throw new StartAbort(exitCode);
@@ -347,6 +348,107 @@ function firstNonEmpty(...values: Array<string | null | undefined>): string {
     if (trimmed) return trimmed;
   }
   return "";
+}
+
+function normalizeCodexAuthMode(value: string | null | undefined): CodexAuthMode {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "auto") return "auto";
+  if (normalized === "api_key" || normalized === "api-key" || normalized === "api") {
+    return "api_key";
+  }
+  if (
+    normalized === "chatgpt" ||
+    normalized === "chatgpt_login" ||
+    normalized === "chatgpt-pro" ||
+    normalized === "subscription"
+  ) {
+    return "chatgpt";
+  }
+  return "auto";
+}
+
+function codexBackendEnabled(): boolean {
+  return (CONFIG.workerpals.executor ?? "").trim().toLowerCase() === "openai_codex";
+}
+
+function codexApiKeyPresent(): boolean {
+  const envKey = (process.env.OPENAI_API_KEY ?? "").trim();
+  const cfgKey = (CONFIG.workerpals.llm.apiKey ?? "").trim();
+  return Boolean(envKey || cfgKey);
+}
+
+function codexHostCommandPrefix(): string[] {
+  const override = (process.env.WORKERPALS_OPENAI_CODEX_BIN ?? "").trim();
+  if (override) {
+    const parsed = splitArgs(override);
+    if (parsed.length > 0) return parsed;
+  }
+  return ["bunx", "--yes", "@openai/codex"];
+}
+
+async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<string[]> {
+  const versionExit = await runQuiet([...commandPrefix, "--version"]);
+  if (versionExit === 0) return commandPrefix;
+
+  if (commandPrefix[0] !== "codex") {
+    const codexExit = await runQuiet(["codex", "--version"]);
+    if (codexExit === 0) return ["codex"];
+  }
+
+  const rendered = commandPrefix.join(" ");
+  console.error("[start] openai_codex backend selected but Codex CLI is unavailable.");
+  console.error(`[start] Tried: ${rendered} --version`);
+  if (commandPrefix[0] !== "codex") {
+    console.error("[start] Also tried: codex --version");
+  }
+  console.error("[start] Install/use Codex CLI, then retry start.");
+  abortStart(1);
+}
+
+async function ensureCodexCliAuthPreflight(): Promise<void> {
+  if (!codexBackendEnabled()) return;
+
+  const configuredMode = normalizeCodexAuthMode(process.env.WORKERPALS_OPENAI_CODEX_AUTH_MODE);
+  const hasApiKey = codexApiKeyPresent();
+  const effectiveMode: CodexAuthMode =
+    configuredMode === "auto" ? (hasApiKey ? "api_key" : "chatgpt") : configuredMode;
+
+  console.log(
+    `[start] openai_codex auth preflight: configured=${configuredMode} effective=${effectiveMode}`,
+  );
+
+  if (effectiveMode === "api_key") {
+    if (!hasApiKey) {
+      console.error(
+        "[start] openai_codex API-key auth requires OPENAI_API_KEY (or worker llm.api_key) but none was found.",
+      );
+      abortStart(1);
+    }
+    return;
+  }
+
+  const commandPrefix = await resolveHostCodexCommandPrefix(codexHostCommandPrefix());
+
+  const statusExit = await runQuiet([...commandPrefix, "login", "status"]);
+  if (statusExit === 0) {
+    console.log("[start] Codex CLI login status: already authenticated.");
+    return;
+  }
+
+  console.log("[start] Codex CLI is not logged in. Launching interactive login now...");
+  const loginExit = await runInherited([...commandPrefix, "login"], repoRoot);
+  if (loginExit !== 0) {
+    console.error(`[start] Codex login exited with code ${loginExit}.`);
+    console.error("[start] Complete `codex login` (or `bunx --yes @openai/codex login`) and retry.");
+    abortStart(1);
+  }
+
+  const verifyExit = await runQuiet([...commandPrefix, "login", "status"]);
+  if (verifyExit !== 0) {
+    console.error("[start] Codex login did not persist. Verify login and retry.");
+    abortStart(1);
+  }
+  console.log("[start] Codex CLI login completed.");
 }
 
 function normalizeCompletionEndpoint(raw: string, fallback: string): string {
@@ -2281,6 +2383,7 @@ try {
   cleanRuntimeStateIfRequested();
   sanitizeWindowsWatcherPaths();
   ensureRequiredLocalConfigFiles();
+  await ensureCodexCliAuthPreflight();
   await cleanupWorkerWarmContainers("startup preflight");
   await ensureLlmPreflight();
   await ensureIntegrationBranch();

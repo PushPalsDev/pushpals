@@ -44,6 +44,7 @@ log = Logger(LOG_PREFIX)
 _VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
 _VALID_SANDBOX_POLICIES = {"read-only", "workspace-write", "danger-full-access"}
 _VALID_COLORS = {"always", "never", "auto"}
+_VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
 
 
 def shutil_which(binary: str) -> str:
@@ -135,6 +136,55 @@ def _resolve_communicate_timeout_seconds() -> Optional[int]:
     if timeout_ms is None:
         return None
     return max(1, timeout_ms // 1000)
+
+
+def _normalize_auth_mode(raw: str) -> str:
+    lowered = (raw or "").strip().lower()
+    aliases = {
+        "apikey": "api_key",
+        "api": "api_key",
+        "api-key": "api_key",
+        "chatgpt_login": "chatgpt",
+        "chatgpt-pro": "chatgpt",
+        "subscription": "chatgpt",
+    }
+    normalized = aliases.get(lowered, lowered)
+    if normalized in _VALID_AUTH_MODES:
+        return normalized
+    if lowered:
+        log.info(
+            f"Invalid WORKERPALS_OPENAI_CODEX_AUTH_MODE={raw!r}; using default 'auto'. "
+            f"Allowed: {', '.join(sorted(_VALID_AUTH_MODES))}."
+        )
+    return "auto"
+
+
+def _run_codex_login_status(codex_cmd_prefix: List[str], repo: str, env: Dict[str, str]) -> Dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            [*codex_cmd_prefix, "login", "status"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=25,
+            check=False,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "exitCode": int(proc.returncode),
+            "stdout": proc.stdout or "",
+            "stderr": proc.stderr or "",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "exitCode": 1,
+            "stdout": "",
+            "stderr": f"Failed to run `codex login status`: {exc}",
+        }
 
 
 def _terminate_active_child() -> None:
@@ -277,6 +327,9 @@ def _run_codex_task(
         }
 
     configured_model, api_key, base_url = resolve_llm_config(DEFAULT_CODEX_MODEL, logger=log)
+    auth_mode_configured = _normalize_auth_mode(
+        os.environ.get("WORKERPALS_OPENAI_CODEX_AUTH_MODE", "auto")
+    )
     model = _safe_model_for_codex(configured_model, base_url)
     approval = _normalize_choice(
         os.environ.get("WORKERPALS_OPENAI_CODEX_APPROVAL_POLICY", "never"),
@@ -326,34 +379,94 @@ def _run_codex_task(
         env["PYTHONIOENCODING"] = "utf-8"
         env["PUSHPALS_REPO_PATH"] = repo
         env["PUSHPALS_ASSIGNED_REPO_ROOT"] = repo
-        if api_key and api_key.strip().lower() != "lmstudio" and not env.get("OPENAI_API_KEY"):
-            env["OPENAI_API_KEY"] = api_key
+        existing_openai_key = (env.get("OPENAI_API_KEY") or "").strip()
+        llm_key = api_key.strip()
+        if llm_key.lower() == "lmstudio":
+            llm_key = ""
+        auth_mode = auth_mode_configured
+        if auth_mode == "auto":
+            auth_mode = "api_key" if (llm_key or existing_openai_key) else "chatgpt"
+        log.info(f"Codex auth mode: {auth_mode} (configured={auth_mode_configured})")
+
         existing_openai_base = (
             env.get("OPENAI_BASE_URL", "").strip() or env.get("OPENAI_API_BASE", "").strip()
         )
         override_base = (os.environ.get("WORKERPALS_OPENAI_CODEX_BASE_URL") or "").strip()
-        effective_base = override_base or base_url
-        if (
-            not override_base
-            and not existing_openai_base
-            and looks_local_base_url(base_url)
-            and (env.get("OPENAI_API_KEY") or "").strip()
-        ):
-            # If an OpenAI key exists but base URL came from local worker LLM config,
-            # prefer Codex/OpenAI defaults unless explicitly overridden.
-            log.info(
-                "Detected local worker LLM endpoint with OPENAI_API_KEY present; "
-                "using Codex default OpenAI endpoint (set WORKERPALS_OPENAI_CODEX_BASE_URL to force local)."
-            )
-            effective_base = ""
-        if effective_base:
-            env.setdefault("OPENAI_BASE_URL", effective_base)
-            env.setdefault("OPENAI_API_BASE", effective_base)
+        effective_base = ""
+
+        if auth_mode == "chatgpt":
+            if llm_key or existing_openai_key:
+                log.info(
+                    "ChatGPT auth mode selected; ignoring OPENAI_API_KEY to use Codex CLI login credentials."
+                )
+            if override_base or existing_openai_base or base_url:
+                log.info("ChatGPT auth mode selected; ignoring OPENAI_BASE_URL/OPENAI_API_BASE overrides.")
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("OPENAI_BASE_URL", None)
+            env.pop("OPENAI_API_BASE", None)
+            login_status = _run_codex_login_status(codex_cmd_prefix, repo, env)
+            if not login_status.get("ok"):
+                detail = (
+                    str(login_status.get("stderr") or "").strip()
+                    or str(login_status.get("stdout") or "").strip()
+                    or "codex login status returned non-zero"
+                )
+                return {
+                    "ok": False,
+                    "summary": "openai_codex chatgpt auth is not ready",
+                    "stdout": _truncate(str(login_status.get("stdout") or "")),
+                    "stderr": _truncate(
+                        "Codex CLI is not logged in for ChatGPT subscription mode. "
+                        "Run `bunx --yes @openai/codex login` on the host (no global install needed), "
+                        "complete browser sign-in, then retry.\n"
+                        f"Details: {detail}"
+                    ),
+                    "exitCode": int(login_status.get("exitCode") or 1),
+                }
+        else:
+            final_key = llm_key or existing_openai_key
+            if not final_key:
+                return {
+                    "ok": False,
+                    "summary": "openai_codex api_key auth requires OPENAI_API_KEY",
+                    "stderr": (
+                        "API-key auth mode selected, but no API key is available. "
+                        "Set OPENAI_API_KEY (or WORKERPALS_LLM_API_KEY), "
+                        "or set WORKERPALS_OPENAI_CODEX_AUTH_MODE=chatgpt."
+                    ),
+                    "exitCode": 2,
+                }
+            env["OPENAI_API_KEY"] = final_key
+            effective_base = override_base or base_url
+            if (
+                not override_base
+                and not existing_openai_base
+                and looks_local_base_url(base_url)
+                and (env.get("OPENAI_API_KEY") or "").strip()
+            ):
+                # If an OpenAI key exists but base URL came from local worker LLM config,
+                # prefer Codex/OpenAI defaults unless explicitly overridden.
+                log.info(
+                    "Detected local worker LLM endpoint with OPENAI_API_KEY present; "
+                    "using Codex default OpenAI endpoint (set WORKERPALS_OPENAI_CODEX_BASE_URL to force local)."
+                )
+                effective_base = ""
+            if effective_base:
+                env["OPENAI_BASE_URL"] = effective_base
+                env["OPENAI_API_BASE"] = effective_base
+            else:
+                env.pop("OPENAI_BASE_URL", None)
+                env.pop("OPENAI_API_BASE", None)
 
         log.info(f"Starting codex exec in {repo}")
         log.debug(f"Codex command: {' '.join(codex_cmd_prefix)}")
         log.debug(f"Model: {model}")
-        log.debug(f"Base URL: {effective_base or existing_openai_base or '<default>'}")
+        base_for_log = (
+            env.get("OPENAI_BASE_URL", "").strip()
+            or env.get("OPENAI_API_BASE", "").strip()
+            or "<default>"
+        )
+        log.debug(f"Base URL: {base_for_log}")
         if communicate_timeout_s:
             log.debug(f"communicate timeout: {communicate_timeout_s}s")
 

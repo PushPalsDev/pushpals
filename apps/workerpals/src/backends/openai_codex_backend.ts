@@ -23,15 +23,26 @@ function normalizeContainerPython(configuredPython: string, sharedVenvPython: st
 function warmupProbeCommand(sharedVenvPython: string): string {
   return (
     `PY="\${WORKERPALS_OPENAI_CODEX_PYTHON:-${sharedVenvPython}}"; ` +
+    'AUTH_MODE="$(printf %s "${WORKERPALS_OPENAI_CODEX_AUTH_MODE:-auto}" | tr "[:upper:]" "[:lower:]")"; ' +
     'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
     '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }; ' +
     'if command -v bunx >/dev/null 2>&1; then ' +
-    '  bunx --yes @openai/codex --version; ' +
+    '  CODEX_CMD="bunx --yes @openai/codex"; ' +
     'elif command -v codex >/dev/null 2>&1; then ' +
-    '  codex --version; ' +
+    '  CODEX_CMD="codex"; ' +
     'else ' +
     '  echo "Neither bunx nor codex was found in PATH" >&2; ' +
     "  exit 1; " +
+    'fi; ' +
+    'sh -lc "$CODEX_CMD --version"; ' +
+    'NEED_LOGIN="0"; ' +
+    'if [ "$AUTH_MODE" = "chatgpt" ] || [ "$AUTH_MODE" = "chatgpt_login" ] || [ "$AUTH_MODE" = "subscription" ]; then NEED_LOGIN="1"; fi; ' +
+    'if [ "$AUTH_MODE" = "auto" ] && [ -z "${OPENAI_API_KEY:-}" ]; then NEED_LOGIN="1"; fi; ' +
+    'if [ "$NEED_LOGIN" = "1" ]; then ' +
+    '  sh -lc "$CODEX_CMD login status" >/dev/null 2>&1 || { ' +
+    '    echo "Codex CLI login is required for WORKERPALS_OPENAI_CODEX_AUTH_MODE=${AUTH_MODE}. Run codex login (or bunx --yes @openai/codex login)." >&2; ' +
+    "    exit 1; " +
+    "  }; " +
     "fi"
   );
 }
