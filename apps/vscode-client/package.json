@@ -1,0 +1,86 @@
+{
+  "name": "pushpals-vscode-client",
+  "displayName": "PushPals VS Code Client",
+  "description": "VS Code client for PushPals with local stack orchestration and live session chat.",
+  "version": "0.1.0",
+  "publisher": "pushpals",
+  "private": true,
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": ["Other"],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onCommand:pushpals.openClient",
+    "onCommand:pushpals.startStack",
+    "onCommand:pushpals.stopStack",
+    "onCommand:pushpals.showOutput"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "pushpals.openClient",
+        "title": "PushPals: Open VS Code Client"
+      },
+      {
+        "command": "pushpals.startStack",
+        "title": "PushPals: Start Local Stack"
+      },
+      {
+        "command": "pushpals.stopStack",
+        "title": "PushPals: Stop Local Stack"
+      },
+      {
+        "command": "pushpals.showOutput",
+        "title": "PushPals: Show Extension Output"
+      }
+    ],
+    "configuration": {
+      "title": "PushPals",
+      "properties": {
+        "pushpals.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:3001",
+          "description": "PushPals server base URL used by the VS Code client."
+        },
+        "pushpals.authToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token for authenticated PushPals server routes."
+        },
+        "pushpals.workerDockerImage": {
+          "type": "string",
+          "default": "pushpals-worker-sandbox:latest",
+          "description": "Worker sandbox Docker image tag required by workerpals:only:docker."
+        },
+        "pushpals.includeSourceControlManager": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also start source_control_manager:only:dev when starting the stack."
+        },
+        "pushpals.autoStartStackOnActivate": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start PushPals stack when this extension activates."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "bun -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc -p .",
+    "watch": "tsc -w -p .",
+    "lint": "tsc -p . --noEmit",
+    "test": "bun test src/**/*.test.ts",
+    "package": "bun run compile && vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/vscode": "^1.95.0",
+    "@types/ws": "^8.5.13",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "~5.9.2"
+  }
+}

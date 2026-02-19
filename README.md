@@ -116,6 +116,21 @@ Copy-Item config/local.example.toml config/local.toml
 - `bun run ios:only`
 - `bun run android:only`
 
+### VS Code extension client
+
+PushPals also ships a VS Code extension client in `apps/vscode-client` that can:
+
+- Start/stop local stack services (`server`, `localbuddy`, `remotebuddy`, `workerpals:only:docker`).
+- Verify/build the worker Docker image before stack startup.
+- Provide an in-editor chat/event client wired to your local PushPals server.
+
+Build and package:
+
+```bash
+bun run vscode:client:compile
+bun run vscode:client:package
+```
+
 ### Common partial-stack recipes
 
 ### Remote agent only (no UI, no LocalBuddy)
