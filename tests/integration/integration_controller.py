@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HARNESS = REPO_ROOT / "tests" / "integration" / "test_workerpals_e2e.py"
+DEFAULT_LOG_PATH = REPO_ROOT / "workerpals_e2e.log"
 
 
 def _set_default_env(env: dict[str, str], key: str, value: str) -> None:
@@ -55,6 +57,50 @@ def _configure_mode_env(mode: str, env: dict[str, str]) -> None:
     )
 
 
+def _stream_harness_output(
+    cmd: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path,
+    prelude_lines: list[str] | None = None,
+) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8", newline="") as log_file:
+        lines = list(prelude_lines or [])
+        lines.append(f"[integration-controller] tee log file: {log_path}")
+        for line in lines:
+            print(line)
+            log_file.write(f"{line}\n")
+        log_file.flush()
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log_file.write(line)
+                log_file.flush()
+            return int(proc.wait())
+        except KeyboardInterrupt:
+            if proc.poll() is None:
+                try:
+                    proc.send_signal(signal.SIGINT)
+                except Exception:
+                    proc.terminate()
+            return int(proc.wait())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="PushPals integration test controller")
     parser.add_argument(
@@ -68,12 +114,17 @@ def main() -> int:
         action="store_true",
         help="Only print mode/env config; do not launch the harness.",
     )
+    parser.add_argument(
+        "--log-file",
+        default=os.environ.get("WORKERPALS_E2E_LOG_FILE", str(DEFAULT_LOG_PATH)),
+        help="Path for tee-style integration output log (default: repo/workerpals_e2e.log).",
+    )
     args = parser.parse_args()
 
     env = os.environ.copy()
     _configure_mode_env(args.mode, env)
 
-    print(
+    controller_line = (
         "[integration-controller] mode={mode} eval={eval_flag} budget={budget} "
         "backend_budget={backend_budget} request_timeout={timeout} scenario_suite={suite} scenarios_per_backend={spb}".format(
             mode=args.mode,
@@ -87,11 +138,26 @@ def main() -> int:
     )
 
     if args.pass_through:
+        print(controller_line)
         return 0
 
+    log_path = Path(args.log_file)
+    default_log_resolved = DEFAULT_LOG_PATH.resolve()
+    try:
+        selected_log_resolved = log_path.resolve()
+    except Exception:
+        selected_log_resolved = log_path
+    if selected_log_resolved == default_log_resolved and log_path.exists():
+        log_path.unlink()
+
     cmd = [sys.executable, "-u", str(HARNESS)]
-    proc = subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=False)
-    return int(proc.returncode)
+    return _stream_harness_output(
+        cmd=cmd,
+        cwd=REPO_ROOT,
+        env=env,
+        log_path=log_path,
+        prelude_lines=[controller_line],
+    )
 
 
 if __name__ == "__main__":

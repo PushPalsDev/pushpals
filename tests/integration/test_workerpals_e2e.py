@@ -241,12 +241,29 @@ class _ElapsedTicker:
         self.started_at = started_at
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._isatty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        default_period = 1 if self._isatty else 15
+        self._print_period_sec = max(
+            1,
+            _env_int("WORKERPALS_E2E_TICKER_PERIOD_SEC", default_period),
+        )
+        self._last_printed_second = -1
 
     def start(self) -> None:
         def _run() -> None:
             while not self._stop.wait(1.0):
+                elapsed_seconds = max(0, int(_now() - self.started_at))
                 elapsed = _fmt_elapsed(_now() - self.started_at)
-                sys.stdout.write(f"\r[TIMER] {self.label}: {elapsed}")
+                if self._isatty:
+                    sys.stdout.write(f"\r[TIMER] {self.label}: {elapsed}")
+                    sys.stdout.flush()
+                    continue
+                if elapsed_seconds == self._last_printed_second:
+                    continue
+                if elapsed_seconds % self._print_period_sec != 0:
+                    continue
+                self._last_printed_second = elapsed_seconds
+                print(f"[TIMER] {self.label}: {elapsed}")
                 sys.stdout.flush()
 
         self._thread = threading.Thread(target=_run, name="e2e-elapsed-ticker", daemon=True)
@@ -257,9 +274,15 @@ class _ElapsedTicker:
         if self._thread is not None:
             self._thread.join(timeout=0.5)
         elapsed = _fmt_elapsed(_now() - self.started_at)
-        # Pad to clear remnants from longer previous values.
-        sys.stdout.write(f"\r[TIMER] {self.label}: {elapsed}                     \n")
-        sys.stdout.flush()
+        elapsed_seconds = max(0, int(_now() - self.started_at))
+        if self._isatty:
+            # Pad to clear remnants from longer previous values.
+            sys.stdout.write(f"\r[TIMER] {self.label}: {elapsed}                     \n")
+            sys.stdout.flush()
+            return
+        if elapsed_seconds != self._last_printed_second:
+            print(f"[TIMER] {self.label}: {elapsed}")
+            sys.stdout.flush()
 
 
 def _is_truthy(value: str) -> bool:
