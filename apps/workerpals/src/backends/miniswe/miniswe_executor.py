@@ -655,6 +655,14 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
             lambda m: json.dumps(m.group(1)),
             working,
         )
+        # Sometimes malformed model output leaves an extra quote after normalization:
+        #   "line": "value.""}
+        # Repair by dropping the stray quote before delimiters.
+        working = re.sub(
+            r'("(?:(?:\\.|[^"\\])*)")\s*"\s*([,}\]])',
+            r"\1\2",
+            working,
+        )
         # Remove trailing commas before object/array close.
         working = re.sub(r",(\s*[}\]])", r"\1", working)
         try:
@@ -913,6 +921,8 @@ def _broker_system_prompt(repo: str) -> str:
         "\n"
         "Rules:\n"
         "- Keep actions minimal and directly relevant.\n"
+        '- JSON syntax must be exact: use ":" between keys and values, never ",".\n'
+        "- Use double quotes for all keys and string values.\n"
         "- Paths must be repo-relative.\n"
         "- Use read_file before edit when unsure.\n"
         "- After edits, run_shell: \"git status --porcelain\".\n"
@@ -1120,13 +1130,40 @@ def _broker_run(
             _record(f"[Broker] Step {step} JSON repair output: {to_single_line(raw2, 500)}")
             obj = _extract_first_json_object(raw2)
             if not obj:
-                return {
-                    "ok": False,
-                    "summary": "tool broker failed: model did not produce parsable JSON actions",
-                    "stderr": "Model output could not be parsed as the required JSON action format.",
-                    "exitCode": 3,
-                }
-            raw = raw2
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Still invalid JSON. Return ONLY one valid JSON object using strict syntax: "
+                            'keys must use double quotes, key/value separator must be ":", and top-level '
+                            'keys must be exactly: actions, done, note. '
+                            'Example format: {"actions":[{"type":"read_file","path":"README.md"}],'
+                            '"done":false,"note":"short"}'
+                        ),
+                    }
+                )
+                try:
+                    raw3 = _broker_llm_call(f"step {step} hard-json-repair call")
+                except Exception as exc:
+                    recovered = _attempt_append_line_timeout_recovery(step, str(exc))
+                    if recovered:
+                        return recovered
+                    return _broker_fail(
+                        "tool broker failed: llm request error",
+                        f"Broker hard JSON-repair request failed at step {step}: {to_single_line(exc, 500)}",
+                    )
+                _record(f"[Broker] Step {step} hard JSON repair output: {to_single_line(raw3, 500)}")
+                obj = _extract_first_json_object(raw3)
+                if not obj:
+                    return {
+                        "ok": False,
+                        "summary": "tool broker failed: model did not produce parsable JSON actions",
+                        "stderr": "Model output could not be parsed as the required JSON action format.",
+                        "exitCode": 3,
+                    }
+                raw = raw3
+            else:
+                raw = raw2
         allowed_top_keys = {"actions", "done", "note"}
         extras = [k for k in obj.keys() if str(k) not in allowed_top_keys]
         if extras:
