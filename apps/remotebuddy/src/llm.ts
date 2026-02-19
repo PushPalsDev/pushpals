@@ -1,6 +1,7 @@
 /**
- * LLM client abstraction with two supported backends:
+ * LLM client abstraction with supported backends:
  * - LM Studio
+ * - OpenAI
  * - Ollama
  */
 
@@ -34,7 +35,7 @@ export interface LLMClient {
   generate(input: LLMGenerateInput): Promise<LLMGenerateOutput>;
 }
 
-type LlmBackend = "lmstudio" | "ollama";
+type LlmBackend = "lmstudio" | "ollama" | "openai";
 type LlmService = "localbuddy" | "remotebuddy" | "workerpals";
 
 export interface LLMClientOptions {
@@ -57,6 +58,7 @@ interface ResolvedServiceLlmConfig {
 
 const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
+const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "local-model";
 const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
@@ -86,7 +88,24 @@ function normalizeBackend(value: string | null | undefined): LlmBackend | null {
   const normalized = (value ?? "").trim().toLowerCase();
   if (normalized === "lmstudio") return "lmstudio";
   if (normalized === "ollama") return "ollama";
+  if (normalized === "openai" || normalized === "openai_compatible") return "openai";
   return null;
+}
+
+function endpointHost(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  if (!trimmed) return "";
+  try {
+    return new URL(trimmed).hostname.trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isOpenAIEndpoint(endpoint: string): boolean {
+  const host = endpointHost(endpoint);
+  if (!host) return false;
+  return host === "api.openai.com" || host.endsWith(".api.openai.com");
 }
 
 function configuredBackend(
@@ -94,6 +113,8 @@ function configuredBackend(
   explicitBackend?: string | null | undefined,
 ): LlmBackend {
   const explicit = normalizeBackend(explicitBackend);
+  if (explicit === "ollama") return explicit;
+  if (isOpenAIEndpoint(endpoint)) return "openai";
   if (explicit) return explicit;
   return endpoint.includes("/api/chat") ? "ollama" : "lmstudio";
 }
@@ -117,20 +138,33 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
         : config.remotebuddy.llm;
 
   const explicitBackend = normalizeBackend(firstNonEmpty(opts.backend, serviceLlmConfig.backend));
+  const fallbackEndpoint =
+    explicitBackend === "ollama"
+      ? DEFAULT_OLLAMA_ENDPOINT
+      : explicitBackend === "openai"
+        ? DEFAULT_OPENAI_ENDPOINT
+        : DEFAULT_LMSTUDIO_ENDPOINT;
   const endpoint = firstNonEmpty(
     opts.endpoint,
     serviceLlmConfig.endpoint,
-    explicitBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT,
+    fallbackEndpoint,
   );
   const backend = configuredBackend(endpoint ?? "", explicitBackend);
   const normalizedEndpoint =
     backend === "ollama"
       ? normalizeOllamaEndpoint(endpoint ?? DEFAULT_OLLAMA_ENDPOINT)
-      : normalizeLmStudioEndpoint(endpoint ?? DEFAULT_LMSTUDIO_ENDPOINT);
+      : normalizeLmStudioEndpoint(
+          endpoint ?? (backend === "openai" ? DEFAULT_OPENAI_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT),
+        );
 
   const model = firstNonEmpty(opts.model, serviceLlmConfig.model, DEFAULT_MODEL) ?? DEFAULT_MODEL;
+  const openAiApiKey = (process.env.OPENAI_API_KEY ?? "").trim();
   const apiKey =
-    firstNonEmpty(opts.apiKey, serviceLlmConfig.apiKey, backend === "lmstudio" ? "lmstudio" : "") ??
+    firstNonEmpty(
+      opts.apiKey,
+      serviceLlmConfig.apiKey,
+      backend === "lmstudio" ? "lmstudio" : backend === "openai" ? openAiApiKey : "",
+    ) ??
     "";
   const sessionId =
     firstNonEmpty(opts.sessionId, serviceLlmConfig.sessionId, config.sessionId, "default") ??
@@ -350,6 +384,8 @@ export class LmStudioClient implements LLMClient {
   private apiKey: string;
   private model: string;
   private sessionTag: string;
+  private providerKind: "lmstudio" | "openai";
+  private providerLabel: string;
   private contextWindow: number;
   private minOutputTokens: number;
   private tokenSafetyMargin: number;
@@ -365,13 +401,18 @@ export class LmStudioClient implements LLMClient {
     endpoint?: string;
     apiKey?: string;
     model?: string;
+    backend?: "lmstudio" | "openai";
     service?: LlmService;
     sessionId?: string;
     lmStudio?: PushPalsLmStudioConfig;
   }) {
-    const rawEndpoint = opts?.endpoint ?? DEFAULT_LMSTUDIO_ENDPOINT;
+    this.providerKind = opts?.backend ?? "lmstudio";
+    this.providerLabel = this.providerKind === "openai" ? "OpenAI" : "LM Studio";
+    const defaultEndpoint =
+      this.providerKind === "openai" ? DEFAULT_OPENAI_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
+    const rawEndpoint = opts?.endpoint ?? defaultEndpoint;
     this.endpoint = normalizeLmStudioEndpoint(rawEndpoint);
-    this.apiKey = opts?.apiKey ?? "lmstudio";
+    this.apiKey = opts?.apiKey ?? (this.providerKind === "lmstudio" ? "lmstudio" : "");
     this.model = opts?.model ?? DEFAULT_MODEL;
     this.sessionTag = stableConversationTag(opts?.service ?? "remotebuddy", opts?.sessionId);
     const lmStudio = opts?.lmStudio;
@@ -392,8 +433,22 @@ export class LmStudioClient implements LLMClient {
     this.batchMemoryChars = Math.max(0, lmStudio?.batchMemoryChars ?? 0);
   }
 
-  private lmStudioModelProbeUrls(): string[] {
+  private modelProbeUrls(): string[] {
     const trimmed = this.endpoint.replace(/\/+$/, "");
+    if (this.providerKind === "openai") {
+      if (trimmed.endsWith("/v1/chat/completions")) {
+        const root = trimmed.slice(0, -"/v1/chat/completions".length);
+        return uniqueNonEmptyStrings([`${root}/v1/models`]);
+      }
+      if (trimmed.endsWith("/chat/completions")) {
+        const root = trimmed.slice(0, -"/chat/completions".length);
+        if (root.endsWith("/v1")) {
+          return uniqueNonEmptyStrings([`${root}/models`]);
+        }
+        return uniqueNonEmptyStrings([`${root}/v1/models`]);
+      }
+      return uniqueNonEmptyStrings([`${trimmed}/v1/models`]);
+    }
     if (trimmed.endsWith("/v1/chat/completions")) {
       const root = trimmed.slice(0, -"/v1/chat/completions".length);
       return uniqueNonEmptyStrings([`${root}/v1/models`, `${root}/models`]);
@@ -414,7 +469,7 @@ export class LmStudioClient implements LLMClient {
   }
 
   private async discoverAvailableModels(): Promise<{ models: string[]; detail: string }> {
-    const probes = this.lmStudioModelProbeUrls();
+    const probes = this.modelProbeUrls();
     const headers: Record<string, string> = { Accept: "application/json" };
     if (this.apiKey.trim()) {
       headers.Authorization = `Bearer ${this.apiKey.trim()}`;
@@ -461,15 +516,15 @@ export class LmStudioClient implements LLMClient {
 
       if (selected.source === "available_fallback") {
         console.warn(
-          `[LLM] Configured model "${configuredModel || "(empty)"}" not present in LM Studio model list; using discovered fallback "${selected.model}".`,
+          `[LLM] Configured model "${configuredModel || "(empty)"}" not present in ${this.providerLabel} model list; using discovered fallback "${selected.model}".`,
         );
       } else if (selected.source === "available_default") {
         console.warn(
-          `[LLM] No model configured; using discovered LM Studio model "${selected.model}".`,
+          `[LLM] No model configured; using discovered ${this.providerLabel} model "${selected.model}".`,
         );
       } else if (selected.source === "default_local_model") {
         console.warn(
-          `[LLM] No configured/discovered LM Studio model available; falling back to default "${DEFAULT_MODEL}".`,
+          `[LLM] No configured/discovered ${this.providerLabel} model available; falling back to default "${DEFAULT_MODEL}".`,
         );
       } else if (selected.source === "configured_unverified") {
         console.warn(
@@ -477,7 +532,7 @@ export class LmStudioClient implements LLMClient {
         );
       }
 
-      console.log(`[LLM] LM Studio resolved model "${selected.model}" (${selected.source}).`);
+      console.log(`[LLM] ${this.providerLabel} resolved model "${selected.model}" (${selected.source}).`);
 
       return selected.model;
     })();
@@ -596,18 +651,18 @@ export class LmStudioClient implements LLMClient {
             this.lmStudioSupportsExtendedSessionFields = false;
             loggedSessionFallback = true;
             console.warn(
-              `[LLM] LM Studio rejected session hint fields, retrying compatibility payload (${lastStatus}).`,
+              `[LLM] ${this.providerLabel} rejected session hint fields, retrying compatibility payload (${lastStatus}).`,
             );
           } else if (responseFormatRejected && !loggedResponseFormatFallback) {
             this.lmStudioSupportsResponseFormat = false;
             loggedResponseFormatFallback = true;
             console.warn(
-              `[LLM] LM Studio rejected response_format payload, retrying with fallback (${lastStatus}).`,
+              `[LLM] ${this.providerLabel} rejected response_format payload, retrying with fallback (${lastStatus}).`,
             );
           }
           continue;
         }
-        throw new Error(`LM Studio API error ${res.status}: ${lastError}`);
+        throw new Error(`${this.providerLabel} API error ${res.status}: ${lastError}`);
       }
 
       const data = (await res.json()) as any;
@@ -630,7 +685,7 @@ export class LmStudioClient implements LLMClient {
       };
     }
 
-    throw new Error(`LM Studio API error ${lastStatus}: ${lastError}`);
+    throw new Error(`${this.providerLabel} API error ${lastStatus}: ${lastError}`);
   }
 
   private async packContextInBatches(
@@ -757,13 +812,13 @@ export class LmStudioClient implements LLMClient {
           latestUserOverflow = latestUserOverflow || packedTrimmed.latestUserOverflow;
         }
       } catch (err) {
-        throw new Error(`LM Studio batch context packing failed: ${String(err)}`);
+        throw new Error(`${this.providerLabel} batch context packing failed: ${String(err)}`);
       }
     }
 
     if (latestUserOverflow) {
       throw new Error(
-        "Latest user request exceeds LM Studio context window and cannot be safely truncated. Increase model context window or split the request into smaller messages.",
+        `Latest user request exceeds ${this.providerLabel} context window and cannot be safely truncated. Increase model context window or split the request into smaller messages.`,
       );
     }
 
@@ -778,7 +833,7 @@ export class LmStudioClient implements LLMClient {
       );
     } else if (trimmed) {
       console.warn(
-        `[LLM] Trimmed LM Studio prompt context to fit window (~${contextWindow} tokens, est prompt ${promptTokensEstimate}).`,
+        `[LLM] Trimmed ${this.providerLabel} prompt context to fit window (~${contextWindow} tokens, est prompt ${promptTokensEstimate}).`,
       );
     }
 
@@ -852,6 +907,21 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
     });
   }
 
+  if (resolved.backend === "openai") {
+    console.log(
+      `[LLM] Using OpenAI backend (model: ${resolved.model}, endpoint: ${resolved.endpoint})`,
+    );
+    return new LmStudioClient({
+      endpoint: resolved.endpoint,
+      apiKey: resolved.apiKey,
+      model: resolved.model,
+      backend: "openai",
+      service,
+      sessionId: resolved.sessionId,
+      lmStudio: resolved.lmStudio,
+    });
+  }
+
   console.log(
     `[LLM] Using LM Studio backend (model: ${resolved.model}, endpoint: ${resolved.endpoint})`,
   );
@@ -859,6 +929,7 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
     endpoint: resolved.endpoint,
     apiKey: resolved.apiKey,
     model: resolved.model,
+    backend: "lmstudio",
     service,
     sessionId: resolved.sessionId,
     lmStudio: resolved.lmStudio,

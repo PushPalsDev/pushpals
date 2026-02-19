@@ -29,6 +29,7 @@ const CONFIG = loadPushPalsConfig({ projectRoot: repoRoot });
 const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
 const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
+const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_LMSTUDIO_READY_TIMEOUT_MS = 120_000;
 const DEFAULT_INTEGRATION_BRANCH = "main_agents";
 const INTEGRATION_BRANCH =
@@ -108,7 +109,7 @@ function parseStartOptions(argv: string[]): StartOptions {
 
 const startOptions = parseStartOptions(process.argv.slice(2));
 
-type SupportedLlmBackend = "lmstudio" | "ollama";
+type SupportedLlmBackend = "lmstudio" | "ollama" | "openai";
 
 function abortStart(exitCode: number): never {
   throw new StartAbort(exitCode);
@@ -364,11 +365,19 @@ function parseUrl(value: string): URL | null {
   }
 }
 
+function endpointLooksOpenAI(endpoint: string): boolean {
+  const parsed = parseUrl(endpoint.trim());
+  if (!parsed) return false;
+  const host = parsed.hostname.trim().toLowerCase();
+  if (!host) return false;
+  return host === "api.openai.com" || host.endsWith(".api.openai.com");
+}
+
 function normalizeLlmBackend(value: string | null | undefined): SupportedLlmBackend | null {
   const normalized = (value ?? "").trim().toLowerCase();
   if (normalized === "lmstudio") return "lmstudio";
   if (normalized === "ollama") return "ollama";
-  if (normalized === "openai" || normalized === "openai_compatible") return "lmstudio";
+  if (normalized === "openai" || normalized === "openai_compatible") return "openai";
   if (normalized === "ollama_chat") return "ollama";
   return null;
 }
@@ -378,6 +387,8 @@ function configuredLlmBackend(
   explicitBackend?: string | null | undefined,
 ): SupportedLlmBackend {
   const explicit = normalizeLlmBackend(explicitBackend);
+  if (explicit === "ollama") return "ollama";
+  if (endpointLooksOpenAI(endpoint)) return "openai";
   if (explicit) return explicit;
   return endpoint.includes("/api/chat") ? "ollama" : "lmstudio";
 }
@@ -583,6 +594,25 @@ function modelProbeUrls(target: LlmPreflightTarget): string[] {
     }
     return Array.from(new Set([`${normalized}/api/tags`, `${normalized}/tags`]));
   }
+  if (target.backend === "openai") {
+    if (normalized.endsWith("/v1/chat/completions")) {
+      const root = normalized.slice(0, -"/v1/chat/completions".length);
+      return Array.from(new Set([`${root}/v1/models`]));
+    }
+    if (normalized.endsWith("/chat/completions")) {
+      const root = normalized.slice(0, -"/chat/completions".length);
+      if (root.endsWith("/v1")) {
+        return Array.from(new Set([`${root}/models`]));
+      }
+      return Array.from(new Set([`${root}/v1/models`]));
+    }
+    if (normalized.endsWith("/v1")) {
+      return Array.from(new Set([`${normalized}/models`]));
+    }
+    const parsed = parseUrl(normalized);
+    if (parsed) return Array.from(new Set([`${parsed.origin}/v1/models`]));
+    return Array.from(new Set([`${normalized}/v1/models`]));
+  }
 
   if (normalized.endsWith("/v1/chat/completions")) {
     const root = normalized.slice(0, -"/v1/chat/completions".length);
@@ -681,11 +711,23 @@ function llmPreflightTargets(): LlmPreflightTarget[] {
     configuredLlmBackend(configuredWorkerRaw || DEFAULT_LMSTUDIO_ENDPOINT);
 
   const remoteFallback =
-    remoteBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
+    remoteBackend === "ollama"
+      ? DEFAULT_OLLAMA_ENDPOINT
+      : remoteBackend === "openai"
+        ? DEFAULT_OPENAI_ENDPOINT
+        : DEFAULT_LMSTUDIO_ENDPOINT;
   const localFallback =
-    localBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
+    localBackend === "ollama"
+      ? DEFAULT_OLLAMA_ENDPOINT
+      : localBackend === "openai"
+        ? DEFAULT_OPENAI_ENDPOINT
+        : DEFAULT_LMSTUDIO_ENDPOINT;
   const workerFallback =
-    workerBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
+    workerBackend === "ollama"
+      ? DEFAULT_OLLAMA_ENDPOINT
+      : workerBackend === "openai"
+        ? DEFAULT_OPENAI_ENDPOINT
+        : DEFAULT_LMSTUDIO_ENDPOINT;
 
   const addTarget = (
     name: string,
@@ -699,7 +741,7 @@ function llmPreflightTargets(): LlmPreflightTarget[] {
 
     const probes: string[] = [];
     const parsed = parseUrl(normalized);
-    if (normalized.includes("/v1/chat/completions")) {
+    if (backend === "openai" && normalized.includes("/v1/chat/completions")) {
       probes.push(normalized.replace(/\/v1\/chat\/completions$/, "/v1/models"));
     } else if (normalized.endsWith("/api/chat")) {
       probes.push(normalized.replace(/\/api\/chat$/, "/api/tags"));
@@ -1056,6 +1098,10 @@ async function ensureLlmPreflight(): Promise<void> {
       if (primaryBackend === "ollama") {
         console.error(
           `[start] Ollama backend selected. Start Ollama manually and ensure ${primary.services.join(", ")} endpoint points to /api/chat.`,
+        );
+      } else if (primaryBackend === "openai") {
+        console.error(
+          "[start] OpenAI backend selected. Verify OPENAI_API_KEY is set and the configured endpoint is https://api.openai.com/v1/chat/completions.",
         );
       } else {
         console.error(
