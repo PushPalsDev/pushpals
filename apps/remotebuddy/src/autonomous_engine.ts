@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "crypto";
 import type { CommunicationManager } from "shared";
 import {
+  loadPromptTemplate,
   makePatternKey,
   normalizePenalties,
   penaltyTotal,
@@ -111,50 +112,17 @@ const BREADTH_ORDER: Record<"narrow" | "medium" | "broad", number> = {
   broad: 2,
 };
 
-const IDEATION_SYSTEM_PROMPT = `
-You are RemoteBuddyAutonomousEngine ideation planner for a monorepo.
-Generate objective candidates only from provided evidence signals.
-Return strict JSON with this shape:
-{
-  "candidates": [{
-    "id": "cand_...",
-    "title": "...",
-    "objective_type": "flaky_test|lint_fix|type_fix|small_refactor|docs|dep_bump",
-    "problem_statement": "...",
-    "trigger_type": "test_failure|lint_failure|typecheck_failure|queue_health|regret_signal",
-    "component_area": "apps/server|apps/remotebuddy|apps/workerpals|apps/client|packages/protocol|packages/shared|tests/integration|tests/unit",
-    "target_paths": ["repo/relative/path"],
-    "scope": { "read_anywhere": false, "write_globs": ["repo/relative/glob"] },
-    "risk_level": "low|medium|high",
-    "expected_validation": ["command"],
-    "estimated_effort": "small|medium|large",
-    "why_now_signal_ids": ["sig_x"],
-    "confidence": 0.0,
-    "requires_user_input": false,
-    "question_if_blocked": ""
-  }]
-}
-Constraints:
-- target_paths must be literal repo-relative paths.
-- write_globs must be repo-relative globs.
-- do not invent evidence ids.
-`.trim();
+const IDEATION_SYSTEM_PROMPT = loadPromptTemplate(
+  "remotebuddy/autonomy_ideation_system_prompt.md",
+).trim();
 
-const SCORING_SYSTEM_PROMPT = `
-Score each candidate and return top ids.
-Return strict JSON:
-{
-  "scores": [{ "id": "cand_1", "llm_score": 0.0, "rationale": "..." }],
-  "top_candidate_ids": ["cand_1", "cand_2", "cand_3"]
-}
-`.trim();
+const SCORING_SYSTEM_PROMPT = loadPromptTemplate(
+  "remotebuddy/autonomy_scoring_system_prompt.md",
+).trim();
 
-const PLANNING_SYSTEM_PROMPT = `
-Write objective instruction text for a worker.
-Return strict JSON:
-{ "instruction": "..." }
-Keep it concise, executable, and scoped to target_paths and write_globs only.
-`.trim();
+const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
+  "remotebuddy/autonomy_planning_system_prompt.md",
+).trim();
 
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};

@@ -70,7 +70,7 @@ max_dispatch_per_hour = 6
 max_dispatch_per_hour_by_type = { flaky_test = 4, lint_fix = 3, type_fix = 3, small_refactor = 2, docs = 3, dep_bump = 0 }
 cooldown_fail_streak_threshold = 2
 cooldown_ms = 1800000
-allow_read_anywhere = false
+allow_read_anywhere = true
 question_ttl_ms = 259200000
 policy_version = "policy-v3.3"
 impact_model_version = "impact-v1"
