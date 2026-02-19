@@ -47,6 +47,14 @@ _VALID_COLORS = {"always", "never", "auto"}
 _VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
 
 
+def _env_first_non_empty(*names: str) -> str:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def shutil_which(binary: str) -> str:
     return which(binary) or ""
 
@@ -109,13 +117,13 @@ def _is_git_repo(repo: str) -> bool:
 
 
 def _resolve_codex_command_prefix() -> List[str]:
-    override = (os.environ.get("WORKERPALS_OPENAI_CODEX_BIN") or "").strip()
+    override = _env_first_non_empty("PUSHPALS_OPENAI_CODEX_BIN", "WORKERPALS_OPENAI_CODEX_BIN")
     if override:
         try:
             parts = [p for p in shlex.split(override) if p.strip()]
         except Exception:
             log.info(
-                "Invalid WORKERPALS_OPENAI_CODEX_BIN value; expected a command string parseable by shlex."
+                "Invalid PUSHPALS_OPENAI_CODEX_BIN/WORKERPALS_OPENAI_CODEX_BIN value; expected a command string parseable by shlex."
             )
             return []
         return parts
@@ -129,10 +137,14 @@ def _resolve_codex_command_prefix() -> List[str]:
 
 
 def _resolve_communicate_timeout_seconds() -> Optional[int]:
-    explicit_s = _to_positive_int((os.environ.get("WORKERPALS_OPENAI_CODEX_TIMEOUT_S") or "").strip())
+    explicit_s = _to_positive_int(
+        _env_first_non_empty("PUSHPALS_OPENAI_CODEX_TIMEOUT_S", "WORKERPALS_OPENAI_CODEX_TIMEOUT_S")
+    )
     if explicit_s is not None:
         return explicit_s
-    timeout_ms = _to_positive_int((os.environ.get("WORKERPALS_OPENAI_CODEX_TIMEOUT_MS") or "").strip())
+    timeout_ms = _to_positive_int(
+        _env_first_non_empty("PUSHPALS_OPENAI_CODEX_TIMEOUT_MS", "WORKERPALS_OPENAI_CODEX_TIMEOUT_MS")
+    )
     if timeout_ms is None:
         return None
     return max(1, timeout_ms // 1000)
@@ -153,7 +165,7 @@ def _normalize_auth_mode(raw: str) -> str:
         return normalized
     if lowered:
         log.info(
-            f"Invalid WORKERPALS_OPENAI_CODEX_AUTH_MODE={raw!r}; using default 'auto'. "
+            f"Invalid PUSHPALS_OPENAI_CODEX_AUTH_MODE/WORKERPALS_OPENAI_CODEX_AUTH_MODE={raw!r}; using default 'auto'. "
             f"Allowed: {', '.join(sorted(_VALID_AUTH_MODES))}."
         )
     return "auto"
@@ -321,14 +333,16 @@ def _run_codex_task(
             "stderr": (
                 "Could not find a runnable Codex command. "
                 "Expected one of: `bunx --yes @openai/codex` or `codex` in PATH. "
-                "You can also set WORKERPALS_OPENAI_CODEX_BIN explicitly."
+                "You can also set PUSHPALS_OPENAI_CODEX_BIN (or WORKERPALS_OPENAI_CODEX_BIN) explicitly."
             ),
             "exitCode": 3,
         }
 
     configured_model, api_key, base_url = resolve_llm_config(DEFAULT_CODEX_MODEL, logger=log)
     auth_mode_configured = _normalize_auth_mode(
-        os.environ.get("WORKERPALS_OPENAI_CODEX_AUTH_MODE", "auto")
+        _env_first_non_empty(
+            "PUSHPALS_OPENAI_CODEX_AUTH_MODE", "WORKERPALS_OPENAI_CODEX_AUTH_MODE", "auto"
+        )
     )
     model = _safe_model_for_codex(configured_model, base_url)
     approval = _normalize_choice(
@@ -350,7 +364,9 @@ def _run_codex_task(
         env_name="WORKERPALS_OPENAI_CODEX_COLOR",
     )
     # JSON event output is noisy by default; prefer plain text + output-last-message.
-    use_json = _bool_from_env("WORKERPALS_OPENAI_CODEX_JSON", False)
+    use_json = _bool_from_env(
+        "PUSHPALS_OPENAI_CODEX_JSON", _bool_from_env("WORKERPALS_OPENAI_CODEX_JSON", False)
+    )
     communicate_timeout_s = _resolve_communicate_timeout_seconds()
     prompt = _build_instruction(instruction, supplemental_guidance)
     baseline_changes = summarize_git_changes(repo)
@@ -391,7 +407,9 @@ def _run_codex_task(
         existing_openai_base = (
             env.get("OPENAI_BASE_URL", "").strip() or env.get("OPENAI_API_BASE", "").strip()
         )
-        override_base = (os.environ.get("WORKERPALS_OPENAI_CODEX_BASE_URL") or "").strip()
+        override_base = _env_first_non_empty(
+            "PUSHPALS_OPENAI_CODEX_BASE_URL", "WORKERPALS_OPENAI_CODEX_BASE_URL"
+        )
         effective_base = ""
 
         if auth_mode == "chatgpt":
@@ -432,7 +450,8 @@ def _run_codex_task(
                     "stderr": (
                         "API-key auth mode selected, but no API key is available. "
                         "Set OPENAI_API_KEY (or WORKERPALS_LLM_API_KEY), "
-                        "or set WORKERPALS_OPENAI_CODEX_AUTH_MODE=chatgpt."
+                        "or set PUSHPALS_OPENAI_CODEX_AUTH_MODE=chatgpt "
+                        "(WORKERPALS_OPENAI_CODEX_AUTH_MODE also supported)."
                     ),
                     "exitCode": 2,
                 }
@@ -448,7 +467,8 @@ def _run_codex_task(
                 # prefer Codex/OpenAI defaults unless explicitly overridden.
                 log.info(
                     "Detected local worker LLM endpoint with OPENAI_API_KEY present; "
-                    "using Codex default OpenAI endpoint (set WORKERPALS_OPENAI_CODEX_BASE_URL to force local)."
+                    "using Codex default OpenAI endpoint (set PUSHPALS_OPENAI_CODEX_BASE_URL "
+                    "or WORKERPALS_OPENAI_CODEX_BASE_URL to force local)."
                 )
                 effective_base = ""
             if effective_base:

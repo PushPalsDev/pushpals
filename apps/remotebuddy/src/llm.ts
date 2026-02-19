@@ -3,8 +3,13 @@
  * - LM Studio
  * - OpenAI
  * - Ollama
+ * - OpenAI Codex CLI
  */
 
+import { spawn } from "child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { loadPushPalsConfig, type PushPalsLmStudioConfig } from "shared";
 
 export interface LLMMessage {
@@ -35,7 +40,7 @@ export interface LLMClient {
   generate(input: LLMGenerateInput): Promise<LLMGenerateOutput>;
 }
 
-type LlmBackend = "lmstudio" | "ollama" | "openai";
+type LlmBackend = "lmstudio" | "ollama" | "openai" | "openai_codex";
 type LlmService = "localbuddy" | "remotebuddy" | "workerpals";
 
 export interface LLMClientOptions {
@@ -60,6 +65,8 @@ const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "local-model";
+const DEFAULT_CODEX_MODEL = "gpt-5-codex";
+const DEFAULT_CODEX_TIMEOUT_MS = 120_000;
 const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
 const DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
@@ -84,11 +91,212 @@ const KNOWN_PROVIDER_PREFIXES = new Set([
   "together_ai",
   "fireworks_ai",
 ]);
+
+type CodexAuthMode = "auto" | "api_key" | "chatgpt";
+
+type ProcessRunResult = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+};
+
+function splitArgs(raw: string): string[] {
+  return raw
+    .trim()
+    .split(/\s+/)
+    .filter((part) => part.length > 0);
+}
+
+function normalizeCodexAuthMode(value: string | null | undefined): CodexAuthMode {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "auto") return "auto";
+  if (normalized === "api_key" || normalized === "api-key" || normalized === "api") {
+    return "api_key";
+  }
+  if (
+    normalized === "chatgpt" ||
+    normalized === "chatgpt_login" ||
+    normalized === "chatgpt-pro" ||
+    normalized === "subscription"
+  ) {
+    return "chatgpt";
+  }
+  return "auto";
+}
+
+function codexConfiguredAuthMode(): CodexAuthMode {
+  return normalizeCodexAuthMode(
+    firstNonEmpty(
+      process.env.PUSHPALS_OPENAI_CODEX_AUTH_MODE,
+      process.env.WORKERPALS_OPENAI_CODEX_AUTH_MODE,
+      "auto",
+    ),
+  );
+}
+
+function codexCommandOverride(): string {
+  return (
+    firstNonEmpty(
+      process.env.PUSHPALS_OPENAI_CODEX_BIN,
+      process.env.WORKERPALS_OPENAI_CODEX_BIN,
+      "",
+    ) ?? ""
+  );
+}
+
+function codexBaseUrlOverride(): string {
+  return (
+    firstNonEmpty(
+      process.env.PUSHPALS_OPENAI_CODEX_BASE_URL,
+      process.env.WORKERPALS_OPENAI_CODEX_BASE_URL,
+      "",
+    ) ?? ""
+  );
+}
+
+function codexTimeoutMs(): number {
+  const raw = firstNonEmpty(
+    process.env.PUSHPALS_OPENAI_CODEX_TIMEOUT_MS,
+    process.env.WORKERPALS_OPENAI_CODEX_TIMEOUT_MS,
+    "",
+  );
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  return DEFAULT_CODEX_TIMEOUT_MS;
+}
+
+function normalizeCodexModel(rawModel: string): string {
+  const model = rawModel.trim();
+  if (!model) return DEFAULT_CODEX_MODEL;
+  if (!model.includes("/")) return model;
+  const [provider, bare] = model.split("/", 2);
+  if (provider.trim().toLowerCase() === "openai" && bare.trim()) {
+    return bare.trim();
+  }
+  return model;
+}
+
+function normalizeOpenAiBaseFromEndpoint(rawEndpoint: string): string {
+  const trimmed = rawEndpoint.trim().replace(/\/+$/, "");
+  if (!trimmed) return "";
+  if (trimmed.endsWith("/v1/chat/completions")) {
+    return trimmed.slice(0, -"/chat/completions".length);
+  }
+  if (trimmed.endsWith("/chat/completions")) {
+    const base = trimmed.slice(0, -"/chat/completions".length);
+    if (!base) return "";
+    return base.endsWith("/v1") ? base : `${base}/v1`;
+  }
+  return trimmed;
+}
+
+async function runProcess(
+  command: string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+): Promise<ProcessRunResult> {
+  const timeoutMs = opts.timeoutMs ?? 0;
+  return new Promise<ProcessRunResult>((resolve, reject) => {
+    const child = spawn(command[0]!, command.slice(1), {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: "pipe",
+    });
+    let stdout = "";
+    let stderr = "";
+    let finished = false;
+    let timedOut = false;
+    let timeout: NodeJS.Timeout | null = null;
+
+    const cleanup = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+    };
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.once("error", (err) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(err);
+    });
+    child.once("close", (code, signal) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      resolve({ code, signal, stdout, stderr, timedOut });
+    });
+
+    if (timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // best effort
+        }
+        setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // best effort
+          }
+        }, 1_000).unref();
+      }, timeoutMs);
+    }
+
+    if (typeof opts.stdin === "string") {
+      child.stdin?.write(opts.stdin);
+    }
+    child.stdin?.end();
+  });
+}
+
+let cachedCodexCommandPrefix: string[] | null = null;
+
+async function resolveCodexCommandPrefix(): Promise<string[]> {
+  if (cachedCodexCommandPrefix) return cachedCodexCommandPrefix;
+  const override = codexCommandOverride();
+  const preferred = override ? splitArgs(override) : ["bunx", "--yes", "@openai/codex"];
+  const candidates: string[][] = preferred[0] === "codex" ? [preferred] : [preferred, ["codex"]];
+  const cwd = process.cwd();
+  const env = process.env;
+  for (const candidate of candidates) {
+    if (candidate.length === 0) continue;
+    try {
+      const probe = await runProcess([...candidate, "--version"], {
+        cwd,
+        env,
+        timeoutMs: 15_000,
+      });
+      if (probe.code === 0) {
+        cachedCodexCommandPrefix = candidate;
+        return candidate;
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+  throw new Error(
+    "OpenAI Codex CLI is unavailable. Install/use Codex CLI (`bunx --yes @openai/codex` or `codex`) and retry.",
+  );
+}
 function normalizeBackend(value: string | null | undefined): LlmBackend | null {
   const normalized = (value ?? "").trim().toLowerCase();
   if (normalized === "lmstudio") return "lmstudio";
   if (normalized === "ollama") return "ollama";
   if (normalized === "openai" || normalized === "openai_compatible") return "openai";
+  if (normalized === "openai_codex" || normalized === "codex" || normalized === "codex_cli") {
+    return "openai_codex";
+  }
   return null;
 }
 
@@ -113,6 +321,7 @@ function configuredBackend(
   explicitBackend?: string | null | undefined,
 ): LlmBackend {
   const explicit = normalizeBackend(explicitBackend);
+  if (explicit === "openai_codex") return explicit;
   if (explicit === "ollama") return explicit;
   if (isOpenAIEndpoint(endpoint)) return "openai";
   if (explicit) return explicit;
@@ -141,7 +350,7 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
   const fallbackEndpoint =
     explicitBackend === "ollama"
       ? DEFAULT_OLLAMA_ENDPOINT
-      : explicitBackend === "openai"
+      : explicitBackend === "openai" || explicitBackend === "openai_codex"
         ? DEFAULT_OPENAI_ENDPOINT
         : DEFAULT_LMSTUDIO_ENDPOINT;
   const endpoint = firstNonEmpty(
@@ -149,13 +358,7 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
     serviceLlmConfig.endpoint,
     fallbackEndpoint,
   );
-  const backend = configuredBackend(endpoint ?? "", explicitBackend);
-  const normalizedEndpoint =
-    backend === "ollama"
-      ? normalizeOllamaEndpoint(endpoint ?? DEFAULT_OLLAMA_ENDPOINT)
-      : normalizeLmStudioEndpoint(
-          endpoint ?? (backend === "openai" ? DEFAULT_OPENAI_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT),
-        );
+  let backend = configuredBackend(endpoint ?? "", explicitBackend);
 
   const model = firstNonEmpty(opts.model, serviceLlmConfig.model, DEFAULT_MODEL) ?? DEFAULT_MODEL;
   const openAiApiKey = (process.env.OPENAI_API_KEY ?? "").trim();
@@ -163,9 +366,22 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
     firstNonEmpty(
       opts.apiKey,
       serviceLlmConfig.apiKey,
-      backend === "lmstudio" ? "lmstudio" : backend === "openai" ? openAiApiKey : "",
+      backend === "lmstudio"
+        ? "lmstudio"
+        : backend === "openai" || backend === "openai_codex"
+          ? openAiApiKey
+          : "",
     ) ??
     "";
+  if (service !== "workerpals" && shouldUseCodexCliFallback(backend, model, apiKey)) {
+    backend = "openai_codex";
+  }
+  const normalizedEndpoint =
+    backend === "ollama"
+      ? normalizeOllamaEndpoint(endpoint ?? DEFAULT_OLLAMA_ENDPOINT)
+      : normalizeLmStudioEndpoint(
+          endpoint ?? (backend === "openai" ? DEFAULT_OPENAI_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT),
+        );
   const sessionId =
     firstNonEmpty(opts.sessionId, serviceLlmConfig.sessionId, config.sessionId, "default") ??
     "default";
@@ -232,6 +448,25 @@ function providerlessModelName(raw: string): string {
     return (rest ?? "").trim();
   }
   return normalized;
+}
+
+function isLikelyCodexModel(raw: string): boolean {
+  const normalized = providerlessModelName(raw).trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized.includes("codex");
+}
+
+function shouldUseCodexCliFallback(
+  backend: LlmBackend,
+  model: string,
+  apiKey: string,
+): boolean {
+  if (backend !== "openai") return false;
+  if (!isLikelyCodexModel(model)) return false;
+  const mode = codexConfiguredAuthMode();
+  if (mode === "api_key") return false;
+  if (mode === "chatgpt") return true;
+  return !apiKey.trim();
 }
 
 function uniqueNonEmptyStrings(values: string[]): string[] {
@@ -846,6 +1081,176 @@ export class LmStudioClient implements LLMClient {
   }
 }
 
+function renderCodexPrompt(input: LLMGenerateInput): string {
+  const lines: string[] = [
+    "You are the PushPals LLM adapter.",
+    "Use only the provided system instruction and conversation context.",
+    "Do not run tools, inspect files, or make code changes.",
+    "Return only the final assistant response text for the conversation.",
+  ];
+  if (input.json) {
+    lines.push(
+      "Output requirements: return exactly one valid JSON object. Do not include markdown fences or extra prose.",
+    );
+    if (input.jsonSchema) {
+      lines.push("The JSON object must satisfy this schema:");
+      lines.push(JSON.stringify(input.jsonSchema, null, 2));
+    }
+  }
+  if (typeof input.maxTokens === "number" && Number.isFinite(input.maxTokens) && input.maxTokens > 0) {
+    lines.push(
+      `Keep the response concise and approximately within ${Math.max(64, Math.floor(input.maxTokens))} tokens.`,
+    );
+  }
+  lines.push("");
+  lines.push("SYSTEM INSTRUCTION:");
+  lines.push(input.system);
+  lines.push("");
+  lines.push("CONVERSATION (oldest to newest):");
+  for (const message of input.messages) {
+    lines.push(`[${message.role}]`);
+    lines.push(message.content ?? "");
+    lines.push("");
+  }
+  lines.push("ASSISTANT RESPONSE:");
+  return lines.join("\n");
+}
+
+export class OpenAiCodexCliClient implements LLMClient {
+  private readonly model: string;
+  private readonly apiKey: string;
+  private readonly endpoint: string;
+  private readonly service: LlmService;
+  private readonly sessionTag: string;
+
+  constructor(opts?: {
+    model?: string;
+    apiKey?: string;
+    endpoint?: string;
+    service?: LlmService;
+    sessionId?: string;
+  }) {
+    this.model = normalizeCodexModel(opts?.model ?? DEFAULT_CODEX_MODEL);
+    this.apiKey = (opts?.apiKey ?? "").trim();
+    this.endpoint = normalizeOpenAiBaseFromEndpoint(opts?.endpoint ?? DEFAULT_OPENAI_ENDPOINT);
+    this.service = opts?.service ?? "remotebuddy";
+    this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
+  }
+
+  private effectiveAuthMode(): CodexAuthMode {
+    const configured = codexConfiguredAuthMode();
+    if (configured !== "auto") return configured;
+    const envKey = (process.env.OPENAI_API_KEY ?? "").trim();
+    return this.apiKey || envKey ? "api_key" : "chatgpt";
+  }
+
+  private async ensureChatGptLoginReady(
+    commandPrefix: string[],
+    env: NodeJS.ProcessEnv,
+  ): Promise<void> {
+    const status = await runProcess([...commandPrefix, "login", "status"], {
+      cwd: process.cwd(),
+      env,
+      timeoutMs: 25_000,
+    });
+    if (status.code === 0) return;
+    const detail = (status.stderr || status.stdout || "").trim();
+    throw new Error(
+      `Codex CLI is not logged in for ChatGPT auth mode. Run \`bunx --yes @openai/codex login\` (or \`codex login\`) and retry.${detail ? ` Details: ${detail}` : ""}`,
+    );
+  }
+
+  private async runCodexExec(prompt: string): Promise<{ text: string; stderr: string }> {
+    const commandPrefix = await resolveCodexCommandPrefix();
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    env.PYTHONIOENCODING = "utf-8";
+    env.PUSHPALS_LLM_SERVICE = this.service;
+    env.PUSHPALS_LLM_SESSION_TAG = this.sessionTag;
+
+    const authMode = this.effectiveAuthMode();
+    if (authMode === "chatgpt") {
+      delete env.OPENAI_API_KEY;
+      delete env.OPENAI_BASE_URL;
+      delete env.OPENAI_API_BASE;
+      await this.ensureChatGptLoginReady(commandPrefix, env);
+    } else {
+      const finalApiKey = this.apiKey || (process.env.OPENAI_API_KEY ?? "").trim();
+      if (!finalApiKey) {
+        throw new Error(
+          "openai_codex API-key auth requires OPENAI_API_KEY (or service llm.api_key), but none is configured.",
+        );
+      }
+      env.OPENAI_API_KEY = finalApiKey;
+      const baseOverride = codexBaseUrlOverride();
+      const baseUrl = baseOverride || this.endpoint;
+      if (baseUrl) {
+        env.OPENAI_BASE_URL = baseUrl;
+        env.OPENAI_API_BASE = baseUrl;
+      } else {
+        delete env.OPENAI_BASE_URL;
+        delete env.OPENAI_API_BASE;
+      }
+    }
+
+    const tmp = mkdtempSync(join(tmpdir(), "pushpals-codex-"));
+    const lastMessagePath = join(tmp, "codex-last-message.txt");
+    try {
+      const command: string[] = [
+        ...commandPrefix,
+        "-a",
+        "never",
+        "-s",
+        "read-only",
+        "exec",
+        "--color",
+        "never",
+        "--output-last-message",
+        lastMessagePath,
+      ];
+      if (this.model) {
+        command.push("-m", this.model);
+      }
+      command.push("-");
+
+      const result = await runProcess(command, {
+        cwd: process.cwd(),
+        env,
+        stdin: prompt,
+        timeoutMs: codexTimeoutMs(),
+      });
+      if (result.timedOut) {
+        throw new Error(`Codex CLI request timed out after ${codexTimeoutMs()}ms.`);
+      }
+      const stderr = (result.stderr || "").trim();
+      const stdout = (result.stdout || "").trim();
+      const lastMessage = existsSync(lastMessagePath) ? readFileSync(lastMessagePath, "utf8").trim() : "";
+      if (result.code !== 0) {
+        const detail = stderr || stdout || "codex exec exited with non-zero status";
+        throw new Error(`Codex CLI request failed (exit ${result.code ?? "unknown"}): ${detail}`);
+      }
+      const text = lastMessage || stdout;
+      if (!text) {
+        throw new Error("Codex CLI completed without producing a response.");
+      }
+      return { text, stderr };
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+    const prompt = renderCodexPrompt(input);
+    const result = await this.runCodexExec(prompt);
+    if (result.stderr) {
+      const firstLine = result.stderr.split(/\r?\n/).find((line) => line.trim().length > 0);
+      if (firstLine) {
+        console.warn(`[LLM] Codex CLI stderr (${this.service}): ${firstLine.trim()}`);
+      }
+    }
+    return { text: result.text };
+  }
+}
+
 export class OllamaClient implements LLMClient {
   private endpoint: string;
   private model: string;
@@ -896,6 +1301,19 @@ export class OllamaClient implements LLMClient {
 export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
   const resolved = resolveServiceLlmConfig(opts);
   const service = opts.service ?? "remotebuddy";
+
+  if (resolved.backend === "openai_codex") {
+    console.log(
+      `[LLM] Using OpenAI Codex CLI backend (model: ${resolved.model}, auth_mode: ${codexConfiguredAuthMode()}).`,
+    );
+    return new OpenAiCodexCliClient({
+      model: resolved.model,
+      apiKey: resolved.apiKey,
+      endpoint: resolved.endpoint,
+      service,
+      sessionId: resolved.sessionId,
+    });
+  }
 
   if (resolved.backend === "ollama") {
     console.log(
