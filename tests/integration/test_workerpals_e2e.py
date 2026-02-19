@@ -186,6 +186,8 @@ started_worker = False
 started_remotebuddy = False
 _CLEANED_UP = False
 _INTERRUPTED = False
+_TRACKED_WARM_CONTAINER_NAMES: set[str] = set()
+_E2E_WARM_CONTAINER_NAME_RE = re.compile(r"^pushpals-e2e-[a-z0-9-]+-warm$")
 
 _WIN_JOB_OBJECT_HANDLE: int | None = None
 _WIN_JOB_OBJECT_INIT_ATTEMPTED = False
@@ -294,6 +296,99 @@ def _require_docker_available() -> None:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"Docker daemon is unavailable for docker E2E mode: {detail}")
+
+
+def _register_e2e_warm_container(worker_id: str) -> None:
+    wid = str(worker_id or "").strip()
+    if not wid:
+        return
+    _TRACKED_WARM_CONTAINER_NAMES.add(f"pushpals-{wid}-warm")
+
+
+def _discover_e2e_warm_containers() -> list[str]:
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "label=pushpals.component=workerpals-warm",
+                "--format",
+                "{{.Names}}",
+            ],
+            env=_build_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except Exception as exc:
+        _debug(f"docker warm container discovery failed: {_one_line(exc, 200)}")
+        return []
+
+    if proc.returncode != 0:
+        _debug(
+            "docker warm container discovery failed "
+            f"rc={proc.returncode} err={_one_line(proc.stderr, 200)}"
+        )
+        return []
+
+    out: list[str] = []
+    for raw in (proc.stdout or "").splitlines():
+        name = raw.strip()
+        if not name:
+            continue
+        if _E2E_WARM_CONTAINER_NAME_RE.match(name.lower()):
+            out.append(name)
+    return out
+
+
+def _remove_container_if_exists(name: str, reason: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["docker", "rm", "-f", name],
+            env=_build_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=25,
+        )
+    except Exception as exc:
+        _debug(f"docker rm -f {name} failed during {reason}: {_one_line(exc, 200)}")
+        return False
+
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode == 0:
+        return True
+    if "No such container" in stderr:
+        return False
+
+    _debug(
+        f"docker rm -f {name} failed during {reason} "
+        f"rc={proc.returncode} err={_one_line(stderr, 200)}"
+    )
+    return False
+
+
+def _cleanup_e2e_warm_containers(reason: str, include_untracked: bool) -> None:
+    names = set(_TRACKED_WARM_CONTAINER_NAMES)
+    if include_untracked:
+        names.update(_discover_e2e_warm_containers())
+    if not names:
+        return
+
+    removed: list[str] = []
+    for name in sorted(names):
+        if _remove_container_if_exists(name, reason):
+            removed.append(name)
+        _TRACKED_WARM_CONTAINER_NAMES.discard(name)
+
+    if removed:
+        print(
+            f"[NOTICE] Removed {len(removed)} E2E warm Docker container(s) during {reason}: "
+            + ", ".join(removed)
+        )
 
 
 def _server_port() -> int:
@@ -2127,6 +2222,31 @@ def kill_proc_tree(proc):
         return
 
     if sys.platform == "win32":
+        # Give daemons a chance to run their own SIGBREAK/SIGTERM handlers first.
+        try:
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            if ctrl_break is not None:
+                proc.send_signal(ctrl_break)
+                try:
+                    proc.wait(timeout=6)
+                    return
+                except Exception:
+                    pass
+        except Exception as exc:
+            _debug(f"CTRL_BREAK_EVENT delivery failed for pid={proc.pid}: {_one_line(exc, 200)}")
+
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            proc.wait(timeout=4)
+            return
+        except Exception:
+            pass
+
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -2207,6 +2327,15 @@ def cleanup():
             _debug(f"server interrupt cleanup failed: {_one_line(exc, 200)}")
         wait_for_server_down(5.0)
 
+    if "E2E_USE_DOCKER" in globals() and E2E_USE_DOCKER:
+        try:
+            _cleanup_e2e_warm_containers(
+                reason="interrupt cleanup" if _INTERRUPTED else "normal shutdown",
+                include_untracked=_INTERRUPTED,
+            )
+        except Exception as exc:
+            _debug(f"warm container cleanup failed: {_one_line(exc, 200)}")
+
     _close_windows_kill_on_close_job_object()
 
 
@@ -2276,6 +2405,7 @@ def main():
         docker_ready_started_at = _now()
         _require_docker_available()
         _ensure_docker_image(E2E_DOCKER_IMAGE_EFFECTIVE)
+        _cleanup_e2e_warm_containers(reason="preflight", include_untracked=True)
         _print_duration("docker readiness (daemon + image)", docker_ready_started_at)
     else:
         print("[NOTICE] WorkerPals E2E running in direct host executor mode.")
@@ -2444,6 +2574,8 @@ def main():
             backend_started_at = _now()
             attempted += 1
             worker_id = f"e2e-{backend}-{uuid4().hex[:10]}"
+            if E2E_USE_DOCKER:
+                _register_e2e_warm_container(worker_id)
             selected_scenarios = _select_eval_scenarios(
                 all_scenarios=eval_scenarios,
                 backend_index=attempted - 1,
@@ -2883,6 +3015,11 @@ def main():
                     # before starting the next backend (prevents "multiple workers" error).
                     if not wait_for_worker_offline(worker_id, timeout_sec=20.0):
                         print(f"[WARN] Worker {worker_id} still appears online after kill; proceeding anyway")
+                if E2E_USE_DOCKER:
+                    _cleanup_e2e_warm_containers(
+                        reason=f"backend {backend} teardown",
+                        include_untracked=False,
+                    )
 
         if attempted == 0:
             raise RuntimeError("No executor backends were attempted. Install OpenHands or configure mini-swe.")
