@@ -325,8 +325,24 @@ function normalizeWorkerImageRebuildMode(value: string): "auto" | "always" | "ne
   return "auto";
 }
 
-function defaultApiKeyForBackend(backend: string): string {
-  return backend === "lmstudio" ? "lmstudio" : "";
+function defaultApiKeyForBackend(backend: string, endpoint: string): string {
+  const normalizedBackend = backend.trim().toLowerCase();
+  const normalizedEndpoint = endpoint.trim().toLowerCase();
+  const openAiKey = (process.env.OPENAI_API_KEY ?? "").trim();
+
+  if (normalizedBackend === "openai") {
+    return openAiKey;
+  }
+  if (normalizedBackend === "lmstudio") {
+    return "lmstudio";
+  }
+
+  // Safety: if backend is omitted/legacy but endpoint points to OpenAI,
+  // still allow OPENAI_API_KEY as fallback.
+  if (normalizedEndpoint.includes("api.openai.com")) {
+    return openAiKey;
+  }
+  return "";
 }
 
 function resolveLlmConfig(
@@ -361,7 +377,7 @@ function resolveLlmConfig(
   );
   const apiKey = firstNonEmpty(
     process.env[`${envPrefix}_LLM_API_KEY`],
-    defaultApiKeyForBackend(backend),
+    defaultApiKeyForBackend(backend, endpoint),
   );
   return { backend, endpoint, model, sessionId, apiKey };
 }
