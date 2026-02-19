@@ -161,6 +161,10 @@ try:
     )
 except Exception:
     COMPLETION_POLL_INTERVAL_SEC = 1.5
+COMPLETION_AFTER_JOB_GRACE_SEC = max(
+    1.0,
+    _env_float("WORKERPALS_E2E_COMPLETION_AFTER_JOB_GRACE_SEC", 20.0),
+)
 _requested_backends_env = (os.environ.get("WORKERPALS_E2E_BACKENDS") or "").strip()
 REQUESTED_BACKENDS = [
     item.strip().lower()
@@ -2039,6 +2043,40 @@ def _contains_clarification_signal(value: object) -> bool:
     )
 
 
+def _contains_no_change_signal(value: object) -> bool:
+    text = str(value or "").lower()
+    return (
+        "no file changes" in text
+        or "no changes to commit" in text
+        or "no changes made" in text
+        or "nothing to commit" in text
+        or ("modified 0 file" in text)
+    )
+
+
+def _job_completion_detail(job: dict | None) -> str:
+    if not isinstance(job, dict):
+        return ""
+    parts: list[str] = []
+    summary = _one_line(job.get("summary"), 300)
+    if summary:
+        parts.append(f"summary={summary}")
+    error = _one_line(job.get("error"), 300)
+    if error:
+        parts.append(f"error={error}")
+    result_text = _one_line(extract_text_from_job_result(job), 300)
+    if result_text:
+        parts.append(f"result={result_text}")
+    return " | ".join(parts)
+
+
+def _job_completed_without_expected_completion(job: dict | None) -> bool:
+    if not isinstance(job, dict):
+        return False
+    detail = _job_completion_detail(job)
+    return _contains_clarification_signal(detail) or _contains_no_change_signal(detail)
+
+
 def _request_failed_due_to_clarification(req: dict | None) -> bool:
     if not isinstance(req, dict):
         return False
@@ -2809,6 +2847,9 @@ def main():
                 last_request_status = None
                 intercepted_completion: dict | None = None
                 matched_failed_job: dict | None = None
+                matched_completed_job: dict | None = None
+                completion_grace_job_id = ""
+                completion_grace_deadline: float | None = None
                 next_completion_poll_at = 0.0
                 next_job_poll_at = 0.0
                 phase_b_ticker = _ElapsedTicker(f"{backend} phase B waiting", phase_b_started_at)
@@ -2922,7 +2963,8 @@ def main():
                                     continue
                                 if str(j.get("sessionId") or "") != run_session_id:
                                     continue
-                                if str(j.get("status") or "").strip().lower() != "failed":
+                                job_status = str(j.get("status") or "").strip().lower()
+                                if job_status not in {"failed", "completed"}:
                                     continue
                                 if not _job_matches_request(
                                     j,
@@ -2931,7 +2973,10 @@ def main():
                                     enqueue_monotonic=request_enqueue_monotonic,
                                 ):
                                     continue
-                                matched_failed_job = j
+                                if job_status == "failed":
+                                    matched_failed_job = j
+                                else:
+                                    matched_completed_job = j
                                 break
                             next_job_poll_at = now + COMPLETION_POLL_INTERVAL_SEC
 
@@ -2943,6 +2988,36 @@ def main():
                                 f"backend={backend} request_id={request_id} job_id={job_id}\n"
                                 f"job_error={job_error}"
                             )
+
+                        if matched_completed_job and not intercepted_completion:
+                            completed_job_id = str(matched_completed_job.get("id") or "")
+                            completion_detail = _job_completion_detail(matched_completed_job)
+                            if _job_completed_without_expected_completion(matched_completed_job):
+                                raise RuntimeError(
+                                    "Observed completed worker job without completion payload "
+                                    "(clarification/no-change signal).\n"
+                                    f"backend={backend} request_id={request_id} job_id={completed_job_id}\n"
+                                    f"job_detail={completion_detail}"
+                                )
+                            if completion_grace_job_id != completed_job_id:
+                                completion_grace_job_id = completed_job_id
+                                completion_grace_deadline = _mono_now() + COMPLETION_AFTER_JOB_GRACE_SEC
+                                print(
+                                    "[NOTICE] Matched completed worker job without completion payload yet. "
+                                    f"Waiting up to {_fmt_elapsed(COMPLETION_AFTER_JOB_GRACE_SEC)} "
+                                    f"for completion enqueue (job_id={completed_job_id})."
+                                )
+                            elif (
+                                completion_grace_deadline is not None
+                                and _mono_now() >= completion_grace_deadline
+                            ):
+                                raise RuntimeError(
+                                    "Observed completed worker job but no completion enqueue payload "
+                                    "arrived within grace window.\n"
+                                    f"backend={backend} request_id={request_id} job_id={completed_job_id}\n"
+                                    f"grace={_fmt_elapsed(COMPLETION_AFTER_JOB_GRACE_SEC)} "
+                                    f"job_detail={completion_detail}"
+                                )
 
                         if intercepted_completion:
                             break
