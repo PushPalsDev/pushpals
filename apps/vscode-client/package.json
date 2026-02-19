@@ -67,11 +67,11 @@
     }
   },
   "scripts": {
-    "compile": "bun -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc -p .",
-    "watch": "tsc -w -p .",
-    "lint": "tsc -p . --noEmit",
+    "compile": "bun -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && bunx tsc -p .",
+    "watch": "bunx tsc -w -p .",
+    "lint": "bunx tsc -p . --noEmit",
     "test": "bun test src/**/*.test.ts",
-    "package": "bun run compile && vsce package --allow-missing-repository"
+    "package": "bun run compile && bunx @vscode/vsce package --allow-missing-repository"
   },
   "dependencies": {
     "ws": "^8.18.3"
