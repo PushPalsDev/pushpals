@@ -464,6 +464,7 @@ async function ensureCodexCliAuthPreflight(): Promise<void> {
   const configuredMode = codexConfiguredAuthMode();
   const effectiveMode = codexEffectiveAuthMode() ?? "chatgpt";
   const hasApiKey = codexApiKeyPresent();
+  const commandPrefix = await resolveHostCodexCommandPrefix(codexHostCommandPrefix());
 
   console.log(
     `[start] openai_codex auth preflight: configured=${configuredMode} effective=${effectiveMode}`,
@@ -476,10 +477,9 @@ async function ensureCodexCliAuthPreflight(): Promise<void> {
       );
       abortStart(1);
     }
+    console.log(`[start] Codex CLI preflight ok: ${commandPrefix.join(" ")}`);
     return;
   }
-
-  const commandPrefix = await resolveHostCodexCommandPrefix(codexHostCommandPrefix());
 
   const statusExit = await runQuiet([...commandPrefix, "login", "status"]);
   if (statusExit === 0) {
