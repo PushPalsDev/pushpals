@@ -594,7 +594,8 @@ export function createRequestHandler() {
           const status = compactText(objectiveRecord.status, 64);
           const requestId = compactText(objectiveRecord.requestId ?? objectiveRecord.request_id, 128);
           const patternKey = compactText(
-            (objectiveRecord as Record<string, unknown>).patternKey ??
+            result.patternKey ??
+              (objectiveRecord as Record<string, unknown>).patternKey ??
               (objectiveRecord as Record<string, unknown>).pattern_key,
             128,
           );
@@ -984,8 +985,13 @@ export function createRequestHandler() {
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = requestQueue.complete(requestId, body);
         if (result.ok) {
+          const resultPayload =
+            body.result && typeof body.result === "object" && !Array.isArray(body.result)
+              ? (body.result as Record<string, unknown>)
+              : null;
+          const wasDelegatedToWorker = Boolean(resultPayload?.requiresWorker);
           const matched = autonomyStore.findObjectiveByRequestId(requestId);
-          if (matched) {
+          if (matched && !wasDelegatedToWorker) {
             autonomyStore.recordOutcome({
               objectiveId: matched.objectiveId,
               requestId,

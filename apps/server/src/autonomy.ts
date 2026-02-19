@@ -235,6 +235,16 @@ function asTriggerType(value: unknown): SignalValue["type"] | null {
   return TRIGGER_TYPES.has(text as SignalValue["type"]) ? (text as SignalValue["type"]) : null;
 }
 
+function scopedCandidateStorageId(runId: string, candidateId: string): string {
+  const normalizedRunId = asString(runId);
+  const normalizedCandidateId = asString(candidateId);
+  if (!normalizedRunId) return normalizedCandidateId || randomUUID();
+  if (!normalizedCandidateId) return `${normalizedRunId}:${randomUUID()}`;
+  const prefix = `${normalizedRunId}:`;
+  if (normalizedCandidateId.startsWith(prefix)) return normalizedCandidateId;
+  return `${prefix}${normalizedCandidateId}`;
+}
+
 function policyViolations(params: {
   objectiveType: string;
   riskLevel: string;
@@ -1010,6 +1020,7 @@ export class AutonomyStore {
     ok: boolean;
     objectiveId?: string;
     questionId?: string;
+    patternKey?: string;
     reason?: string;
   } {
     const runId = asString(body.runId);
@@ -1081,6 +1092,12 @@ export class AutonomyStore {
       const objectiveTypePersist = (objectiveType ?? objectiveTypeRaw) || "invalid";
       const triggerTypePersist = (triggerType ?? triggerTypeRaw) || "invalid";
       const componentAreaPersist = (componentArea ?? componentAreaRaw) || "invalid";
+      const candidateExternalId = asString(record.id) || randomUUID();
+      const candidateStorageId = scopedCandidateStorageId(runId, candidateExternalId);
+      const debugRecord = {
+        ...asObject(record.debug),
+        candidate_external_id: candidateExternalId,
+      };
 
       this.db
         .prepare(
@@ -1093,7 +1110,7 @@ export class AutonomyStore {
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
-          asString(record.id) || randomUUID(),
+          candidateStorageId,
           runId,
           snapshotId,
           sessionId,
@@ -1131,7 +1148,7 @@ export class AutonomyStore {
           JSON.stringify(
             gateReasons.length === 0 ? asStringArray(record.gateReasons ?? record.gate_reasons) : gateReasons,
           ),
-          JSON.stringify(asObject(record.debug)),
+          JSON.stringify(debugRecord),
           asIsoNow(),
         );
     }
@@ -1227,6 +1244,10 @@ export class AutonomyStore {
       triggerType,
       componentArea,
     );
+    const objectiveCandidateRaw = asString(objective.candidateId ?? objective.candidate_id);
+    const objectiveCandidateId = objectiveCandidateRaw
+      ? scopedCandidateStorageId(runId, objectiveCandidateRaw)
+      : null;
     if (objectiveStatus === "dispatched") {
       const overrideCooldown = asBoolean(
         objective.overrideCooldown ?? objective.override_cooldown ?? body.overrideCooldown ?? body.override_cooldown,
@@ -1275,7 +1296,7 @@ export class AutonomyStore {
         runId,
         snapshotId,
         sessionId,
-        asString(objective.candidateId ?? objective.candidate_id) || null,
+        objectiveCandidateId,
         asString(objective.title),
         asString(objective.instruction),
         objectiveType,
@@ -1335,7 +1356,7 @@ export class AutonomyStore {
         .run(questionId, now, objectiveId);
     }
 
-    return { ok: true, objectiveId, questionId };
+    return { ok: true, objectiveId, questionId, patternKey };
   }
 
   recordOutcome(body: Record<string, unknown>): { ok: boolean; reason?: string } {
@@ -1347,12 +1368,39 @@ export class AutonomyStore {
     const latencyMs = Number.isFinite(asNumber(body.latencyMs ?? body.latency_ms, Number.NaN))
       ? Math.max(0, Math.floor(asNumber(body.latencyMs ?? body.latency_ms, 0)))
       : null;
+    const objectiveId = asString(body.objectiveId ?? body.objective_id) || null;
+    const requestId = asString(body.requestId ?? body.request_id) || null;
+    const jobId = asString(body.jobId ?? body.job_id) || null;
     const userAction = asString(body.userAction ?? body.user_action) || null;
     const reopenedWithin24h = asBoolean(
       body.reopenedWithin24h ?? body.reopened_within_24h,
       false,
     );
     const regressionFlag = asBoolean(body.regressionFlag ?? body.regression_flag, false);
+    const normalizedUserAction = userAction ? userAction.toLowerCase() : "";
+
+    // RemoteBuddy marks delegated requests complete after enqueueing a worker job.
+    // Ignore those pre-execution "accepted" signals for autonomy objectives until job-linked outcomes arrive.
+    if (success && normalizedUserAction === "accepted" && !jobId && objectiveId) {
+      const objectiveRow = this.db
+        .prepare(`SELECT source, status, job_id FROM autonomy_objectives WHERE id = ? LIMIT 1`)
+        .get(objectiveId) as
+        | {
+            source: string | null;
+            status: string | null;
+            job_id: string | null;
+          }
+        | undefined;
+      if (objectiveRow) {
+        const source = asString(objectiveRow.source).toLowerCase();
+        const status = asString(objectiveRow.status).toLowerCase();
+        const linkedJobId = asString(objectiveRow.job_id);
+        const pendingStatuses = new Set(["proposed", "gated", "dispatched", "running"]);
+        if (source === "autonomous" && !linkedJobId && pendingStatuses.has(status)) {
+          return { ok: true };
+        }
+      }
+    }
 
     this.db
       .prepare(
@@ -1362,9 +1410,9 @@ export class AutonomyStore {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        asString(body.objectiveId ?? body.objective_id) || null,
-        asString(body.requestId ?? body.request_id) || null,
-        asString(body.jobId ?? body.job_id) || null,
+        objectiveId,
+        requestId,
+        jobId,
         patternKey,
         success ? 1 : 0,
         retries,

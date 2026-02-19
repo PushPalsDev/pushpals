@@ -312,6 +312,15 @@ export class RemoteBuddyAutonomousEngine {
     );
   }
 
+  private cycleBudgetMs(): number {
+    // One cycle includes ideation + scoring + planning LLM phases plus dispatch work.
+    return Math.max(
+      this.cfg.ideationBudgetMs + this.cfg.llmTimeoutMs * 3,
+      this.cfg.llmTimeoutMs * 4,
+      20_000,
+    );
+  }
+
   private async fetchSnapshot(
     runId: string,
     preflight: {
@@ -651,7 +660,7 @@ export class RemoteBuddyAutonomousEngine {
     if (!this.cfg.enabled || this.inFlight) return;
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
-    const cycleDeadline = Date.now() + Math.max(this.cfg.ideationBudgetMs, this.cfg.llmTimeoutMs);
+    const cycleDeadline = Date.now() + this.cycleBudgetMs();
     let lockAcquired = false;
     try {
       lockAcquired = await this.acquireDispatchLock(runId);

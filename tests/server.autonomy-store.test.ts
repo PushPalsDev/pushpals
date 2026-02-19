@@ -214,4 +214,113 @@ describe("server AutonomyStore policy gates", () => {
         firstRejection.includes("budget exceeded"),
     ).toBe(true);
   });
+
+  test("persists candidates with run-scoped ids to prevent cross-run overwrites", () => {
+    const store = makeStore();
+    const snapshotA = store.createSnapshot({ sessionId: "s1", runId: "run_a" }).snapshot_id;
+    const snapshotB = store.createSnapshot({ sessionId: "s1", runId: "run_b" }).snapshot_id;
+
+    const baseCandidate = {
+      id: "cand_shared",
+      title: "Stabilize lint failures",
+      objective_type: "lint_fix",
+      problem_statement: "Fix recurring lint failure in server route.",
+      trigger_type: "lint_failure",
+      component_area: "apps/server",
+      target_paths: ["apps/server/src/server_main.ts"],
+      scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+      risk_level: "low",
+      expected_validation: ["bun run lint"],
+      estimated_effort: "small",
+      why_now_signal_ids: ["sig_lint"],
+      confidence: 0.9,
+    };
+
+    const runA = store.recordObjectiveDecision({
+      runId: "run_a",
+      snapshotId: snapshotA,
+      sessionId: "s1",
+      candidates: [baseCandidate],
+    });
+    const runB = store.recordObjectiveDecision({
+      runId: "run_b",
+      snapshotId: snapshotB,
+      sessionId: "s1",
+      candidates: [baseCandidate],
+    });
+    expect(runA.ok).toBe(true);
+    expect(runB.ok).toBe(true);
+
+    const db = (store as unknown as { db: any }).db;
+    const rows = db
+      .prepare(
+        `SELECT id, run_id
+         FROM autonomy_candidates
+         WHERE id LIKE ?
+         ORDER BY run_id ASC`,
+      )
+      .all("%:cand_shared") as Array<{ id: string; run_id: string }>;
+
+    expect(rows.length).toBe(2);
+    expect(rows[0]?.id).toBe("run_a:cand_shared");
+    expect(rows[1]?.id).toBe("run_b:cand_shared");
+  });
+
+  test("ignores autonomy accepted outcomes before any worker job is linked", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_guard" }).snapshot_id;
+
+    const decision = store.recordObjectiveDecision({
+      runId: "run_guard",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_guard",
+        candidate_id: "cand_guard",
+        title: "Guard against premature accepted outcome",
+        instruction: "Run worker fix and validate",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+        request_id: "req_guard",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const premature = store.recordOutcome({
+      objectiveId: "obj_guard",
+      requestId: "req_guard",
+      patternKey: decision.patternKey,
+      success: true,
+      userAction: "accepted",
+    });
+    expect(premature.ok).toBe(true);
+
+    const db = (store as unknown as { db: any }).db;
+    const before = db
+      .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE objective_id = ?`)
+      .get("obj_guard") as { count: number };
+    expect(before.count).toBe(0);
+
+    const applied = store.recordOutcome({
+      objectiveId: "obj_guard",
+      requestId: "req_guard",
+      jobId: "job_guard",
+      patternKey: decision.patternKey,
+      success: true,
+      userAction: "applied",
+    });
+    expect(applied.ok).toBe(true);
+
+    const after = db
+      .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE objective_id = ?`)
+      .get("obj_guard") as { count: number };
+    expect(after.count).toBe(1);
+  });
 });

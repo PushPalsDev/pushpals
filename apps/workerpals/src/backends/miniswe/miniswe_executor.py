@@ -506,6 +506,13 @@ def _parse_and_validate_shell_command(cmd: str) -> Tuple[Optional[List[str]], st
                 return None, f"path escape git arg is not allowed: {arg}"
     if binary == "git" and len(args) < 2:
         return None, "git command requires an explicit allowed subcommand"
+    if binary == "sed":
+        for raw_arg in args[1:]:
+            arg = str(raw_arg or "").strip().lower()
+            if not arg:
+                continue
+            if arg == "-i" or arg.startswith("-i") or arg.startswith("--in-place"):
+                return None, "sed in-place edits are not allowed"
     if binary == "awk":
         joined = " ".join(args[1:]).lower()
         if "system(" in joined:
