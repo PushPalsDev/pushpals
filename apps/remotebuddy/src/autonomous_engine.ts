@@ -1076,6 +1076,43 @@ export class RemoteBuddyAutonomousEngine {
     }
   }
 
+  /**
+   * Re-enqueue a synthetic worker request based on an analysis result from the orchestrator.
+   * Called by the orchestrator when a user/engine request was classified as `analysis` intent
+   * and the autonomous engine should decide the next step.
+   */
+  async enqueueFromAnalysis(
+    instruction: string,
+    autonomyCtx: {
+      objectiveId?: string;
+      runId?: string;
+      snapshotId?: string;
+      patternKey?: string;
+      componentArea?: string;
+      targetPaths: string[];
+      writeGlobs: string[];
+    },
+    originRequestId: string,
+  ): Promise<string | null> {
+    if (!this.cfg.enabled) return null;
+    const objectiveId = autonomyCtx.objectiveId ?? `obj_${originRequestId.slice(0, 8)}`;
+    const runId = autonomyCtx.runId ?? `run_${Date.now()}_${originRequestId.slice(0, 8)}`;
+    const snapshotId = autonomyCtx.snapshotId ?? `snap_analysis_${originRequestId.slice(0, 8)}`;
+    const patternKey = autonomyCtx.patternKey ?? "analysis_followup";
+    console.log(
+      `[RemoteBuddyAutonomousEngine] Enqueuing analysis follow-up (objective ${objectiveId})`,
+    );
+    return this.enqueueSyntheticRequest(instruction, {
+      objectiveId,
+      runId,
+      snapshotId,
+      patternKey,
+      componentArea: (autonomyCtx.componentArea ?? "shared") as AutonomyComponentArea,
+      targetPaths: autonomyCtx.targetPaths,
+      writeGlobs: autonomyCtx.writeGlobs,
+    });
+  }
+
   start(): void {
     if (!this.cfg.enabled || this.timer) return;
     this.timer = setInterval(() => {

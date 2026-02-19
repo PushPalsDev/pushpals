@@ -1383,9 +1383,13 @@ class RemoteBuddyOrchestrator {
         forceLane,
       });
       if (autonomyMetadata) {
-        plan.requires_worker = true;
-        plan.job_kind = "task.execute";
-        plan.lane = "worker";
+        // For analysis intent from the engine, don't force to worker — let it fall through
+        // to the !requiresWorker branch where the autonomous engine will handle next steps.
+        if (plan.intent !== "analysis") {
+          plan.requires_worker = true;
+          plan.job_kind = "task.execute";
+          plan.lane = "worker";
+        }
         plan.scope.read_anywhere = false;
         plan.scope.write_allowed = true;
         plan.scope.write_globs = [...autonomyMetadata.writeGlobs];
@@ -1397,8 +1401,11 @@ class RemoteBuddyOrchestrator {
           ? autonomyMetadata.targetPaths
           : plannerTargetPaths(plan, prompt);
       const targetPath = targetPaths[0];
-      // forceWorker overrides "direct reply" short-circuit + planner requires_worker
-      const requiresWorker = forceWorker
+      // forceWorker overrides "direct reply" short-circuit + planner requires_worker,
+      // except for analysis intent from the engine — those fall through so the autonomous
+      // engine can handle next-step dispatch rather than blindly queueing a worker job.
+      const isAnalysisFromEngine = plan.intent === "analysis" && Boolean(autonomyMetadata);
+      const requiresWorker = forceWorker && !isAnalysisFromEngine
         ? true
         : this.shouldForceDirectReply(prompt, plan.intent)
           ? false
@@ -1501,6 +1508,35 @@ class RemoteBuddyOrchestrator {
           payload: { text: plan.assistant_message },
           turnId,
         });
+
+        if (plan.intent === "analysis") {
+          if (autonomyMetadata && CONFIG.remotebuddy.autonomy.enabled) {
+            // Option 3: autonomous engine origin — re-enqueue the worker instruction so
+            // the engine can drive next-step execution rather than silently dropping it.
+            const workerInstruction = String(plan.worker_instruction ?? "").trim() || plan.assistant_message;
+            const enqueued = await this.autonomousEngine.enqueueFromAnalysis(
+              workerInstruction,
+              autonomyMetadata,
+              requestId,
+            );
+            if (enqueued) {
+              console.log(
+                `[RemoteBuddy] Analysis from engine re-enqueued as worker request ${enqueued}`,
+              );
+            } else {
+              console.warn(
+                `[RemoteBuddy] Analysis from engine: enqueueFromAnalysis returned null (engine disabled or enqueue failed)`,
+              );
+            }
+          } else if (!autonomyMetadata) {
+            // Option 2: user origin — ask if they want a worker to implement this.
+            await this.comm.assistantMessage(
+              "Should I have a WorkerPal implement this? Reply to confirm and I'll enqueue the work, or clarify what you'd like focused on.",
+              { turnId, correlationId: requestId },
+            );
+          }
+        }
+
         await fetch(`${this.server}/requests/${requestId}/complete`, {
           method: "POST",
           headers: this.authHeaders(),
