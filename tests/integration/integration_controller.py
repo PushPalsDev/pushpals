@@ -33,6 +33,8 @@ def _configure_mode_env(mode: str, env: dict[str, str]) -> None:
         _set_default_env(env, "WORKERPALS_E2E_MAX_TOTAL_SEC", "0")
         _set_default_env(env, "WORKERPALS_E2E_MAX_BACKEND_SEC", "1200")
         _set_default_env(env, "WORKERPALS_E2E_REQUEST_TIMEOUT_SEC", "960")
+        _set_default_env(env, "WORKERPALS_MINISWE_TOOL_BROKER_HTTP_TIMEOUT_SEC", "120")
+        _set_default_env(env, "WORKERPALS_MINISWE_TOOL_BROKER_HTTP_RETRY_MAX", "1")
         _set_default_env(env, "WORKERPALS_E2E_EVAL_OUTPUT", str(REPO_ROOT / "outputs" / "workerpals_backend_eval.json"))
         _set_default_env(env, "WORKERPALS_E2E_EVAL_SCENARIO_SUITE", "real-hard")
         _set_default_env(env, "WORKERPALS_E2E_SCENARIOS_PER_BACKEND", "1")

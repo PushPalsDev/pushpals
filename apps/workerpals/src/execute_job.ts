@@ -198,8 +198,16 @@ function parseChangedPathsFromStatus(statusOutput: string): string[] {
     const raw = line.replace(/\r$/, "");
     if (!raw.trim()) continue;
     // git status --porcelain output is "<XY><space><path>".
-    // Do not trim before slicing; leading spaces are significant for X/Y fields.
-    let path = raw.length > 3 ? raw.slice(3) : raw;
+    // Be tolerant of callers that accidentally trimmed leading space on the first line.
+    let path = "";
+    const porcelain = raw.match(/^.. (.+)$/);
+    if (porcelain?.[1]) {
+      path = porcelain[1];
+    } else {
+      const degraded = raw.match(/^. (.+)$/);
+      if (degraded?.[1]) path = degraded[1];
+      else path = raw;
+    }
     if (path.includes(" -> ")) {
       path = path.split(" -> ", 2)[1] ?? path;
     }
@@ -743,7 +751,8 @@ export async function git(
       proc.exited,
     ]);
 
-    return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim() };
+    // Preserve leading spaces in stdout for porcelain parsers.
+    return { ok: exitCode === 0, stdout: stdout.trimEnd(), stderr: stderr.trim() };
   } catch (err) {
     return { ok: false, stdout: "", stderr: String(err) };
   }

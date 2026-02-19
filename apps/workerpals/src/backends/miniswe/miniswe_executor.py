@@ -29,6 +29,7 @@ Tool-broker shim:
 from __future__ import annotations
 
 import json
+import ast
 import os
 import re
 import shlex
@@ -329,16 +330,37 @@ def _repo_safe_path(repo: str, rel_path: str) -> Path:
         raise RuntimeError("Path is required")
     if "\x00" in rel:
         raise RuntimeError("Path contains NUL byte")
-    if Path(rel).is_absolute():
-        raise RuntimeError(f"Absolute paths are not allowed: {rel}")
-    if re.match(r"^[A-Za-z]:[\\/]", rel):
-        raise RuntimeError(f"Drive-letter paths are not allowed: {rel}")
     root = Path(repo).resolve()
-    p = (root / rel).resolve()
+    # Accept absolute paths only when they are contained inside the assigned repo root.
+    if Path(rel).is_absolute() or re.match(r"^[A-Za-z]:[\\/]", rel):
+        p = Path(rel).resolve()
+    else:
+        p = (root / rel).resolve()
     # Ensure p is within root
     if root == p or root in p.parents:
         return p
     raise RuntimeError(f"Refusing to access path outside repo: {rel}")
+
+
+def _normalize_concrete_repo_path(repo: str, path_value: str) -> Optional[str]:
+    """
+    Normalize a concrete file path (possibly absolute) to repo-relative POSIX form.
+    Returns None when the path cannot be normalized safely.
+    """
+    if not isinstance(path_value, str):
+        return None
+    raw = path_value.strip()
+    if not raw:
+        return None
+    try:
+        root = Path(repo).resolve()
+        p = _repo_safe_path(repo, raw)
+        rel = p.relative_to(root).as_posix().strip()
+        if not rel:
+            return "."
+        return rel
+    except Exception:
+        return None
 
 
 def _normalize_scope_rel_path(value: Any) -> Optional[str]:
@@ -398,7 +420,7 @@ def _extract_write_globs_from_payload(payload: Optional[Dict[str, Any]]) -> List
 def _assert_write_allowed(repo: str, path: str, write_globs: Optional[List[str]]) -> None:
     if not write_globs:
         return
-    normalized = _normalize_scope_rel_path(path)
+    normalized = _normalize_concrete_repo_path(repo, path)
     if not normalized:
         raise RuntimeError(f"Invalid write path for scope enforcement: {path!r}")
     for glob in write_globs:
@@ -598,6 +620,45 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
+    def _try_relaxed_json_parse(src: str) -> Optional[Dict[str, Any]]:
+        # Common model drift: single-quoted strings, trailing commas, Python booleans.
+        working = src.strip()
+        if not working:
+            return None
+        # Convert single-quoted literals to JSON double-quoted strings when possible.
+        working = re.sub(
+            r"'([^'\\]*(?:\\.[^'\\]*)*)'",
+            lambda m: json.dumps(m.group(1)),
+            working,
+        )
+        # Remove trailing commas before object/array close.
+        working = re.sub(r",(\s*[}\]])", r"\1", working)
+        try:
+            obj = json.loads(working)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            pass
+        # As a final fallback, parse Python-literal style payloads.
+        py_working = (
+            working.replace(": true", ": True")
+            .replace(": false", ": False")
+            .replace(": null", ": None")
+        )
+        py_working = re.sub(r"\btrue\b", "True", py_working)
+        py_working = re.sub(r"\bfalse\b", "False", py_working)
+        py_working = re.sub(r"\bnull\b", "None", py_working)
+        try:
+            parsed = ast.literal_eval(py_working)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+        return None
+
+    relaxed = _try_relaxed_json_parse(candidate)
+    if relaxed is not None:
+        return relaxed
+
     # Heuristic: find first {...} block
     start = candidate.find("{")
     end = candidate.rfind("}")
@@ -607,6 +668,9 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
             obj = json.loads(snippet)
             return obj if isinstance(obj, dict) else None
         except Exception:
+            relaxed_snippet = _try_relaxed_json_parse(snippet)
+            if relaxed_snippet is not None:
+                return relaxed_snippet
             return None
     return None
 
@@ -700,6 +764,43 @@ def _extract_expected_target_paths(instruction: str) -> List[str]:
         if len(targets) >= 8:
             break
     return targets
+
+
+def _extract_append_line_directives(instruction: str) -> List[Tuple[str, str]]:
+    """
+    Extract simple deterministic directives like:
+      In <path> append the bullet line '<text>'
+      In <path> append the comment line "<text>"
+    """
+    directives: List[Tuple[str, str]] = []
+    seen = set()
+    text = str(instruction or "")
+    patterns = [
+        re.compile(
+            r"in\s+([A-Za-z0-9._/\-\\]+)\s+append\s+the\s+(?:bullet|comment|text)?\s*line\s+['\"]([^'\"]+)['\"]",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"append\s+the\s+(?:bullet|comment|text)?\s*line\s+['\"]([^'\"]+)['\"]\s+to\s+([A-Za-z0-9._/\-\\]+)",
+            flags=re.IGNORECASE,
+        ),
+    ]
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            if pattern is patterns[0]:
+                path = str(match.group(1) or "").strip()
+                line = str(match.group(2) or "").strip()
+            else:
+                line = str(match.group(1) or "").strip()
+                path = str(match.group(2) or "").strip()
+            if not path or not line:
+                continue
+            key = (path.replace("\\", "/").lower(), line)
+            if key in seen:
+                continue
+            seen.add(key)
+            directives.append((path, line))
+    return directives
 
 
 def _extract_explicit_target_paths_from_payload(payload: Optional[Dict[str, Any]]) -> List[str]:
@@ -869,6 +970,83 @@ def _broker_run(
             "exitCode": exit_code,
         }
 
+    def _attempt_append_line_timeout_recovery(step: int, error_text: str) -> Optional[Dict[str, Any]]:
+        lowered = str(error_text or "").lower()
+        if "timeout" not in lowered and "timed out" not in lowered:
+            return None
+        directives = _extract_append_line_directives(instruction)
+        if not directives:
+            return None
+        _record(
+            f"[Broker] timeout recovery: attempting deterministic append-line completion from instruction "
+            f"(step={step}, directives={len(directives)})."
+        )
+
+        applied = 0
+        skipped = 0
+        for raw_path, line in directives:
+            normalized = _normalize_concrete_repo_path(repo, raw_path)
+            if not normalized or normalized in {".", "/"}:
+                skipped += 1
+                continue
+            if expected_targets and not any(
+                _target_hint_matches_changed_path(target, normalized) for target in expected_targets
+            ):
+                skipped += 1
+                continue
+            try:
+                existing = _read_text_file(repo, normalized, max_chars=500_000)
+            except Exception:
+                existing = ""
+            if any(existing_line.strip() == line.strip() for existing_line in existing.splitlines()):
+                skipped += 1
+                continue
+            try:
+                _append_line(repo, normalized, line, allowed_write_globs)
+                applied += 1
+            except Exception as exc:
+                _record(
+                    f"[Broker] timeout recovery: failed to apply append_line for {normalized}: "
+                    f"{to_single_line(exc, 240)}"
+                )
+                return None
+
+        changed_paths = summarize_git_changes(repo)
+        changed_set = {str(p).strip().replace("\\", "/") for p in changed_paths}
+        missing_targets = [
+            t
+            for t in expected_targets
+            if t not in {".", "/"} and not any(_target_hint_matches_changed_path(t, c) for c in changed_set)
+        ]
+        if missing_targets:
+            _record(
+                "[Broker] timeout recovery incomplete: expected targets still missing changes: "
+                + ", ".join(missing_targets)
+            )
+            return None
+        if applied == 0 and not changed_paths:
+            return None
+
+        try:
+            final_status = _run_shell(repo, "git status --porcelain", timeout_sec=shell_timeout_sec)
+        except Exception as exc:
+            final_status = f"(git status failed) {to_single_line(exc, 300)}"
+
+        transcript_text = "\n".join(transcript).strip()
+        stdout = ""
+        if transcript_text:
+            stdout += "Tool broker transcript:\n" + transcript_text + "\n\n"
+        stdout += "Deterministic timeout recovery applied append-line directives.\n"
+        stdout += f"Applied directives: {applied}, skipped: {skipped}\n\n"
+        stdout += "Final verification:\n" + final_status
+        return {
+            "ok": True,
+            "summary": "Executed task via tool broker timeout recovery",
+            "stdout": stdout,
+            "stderr": "",
+            "exitCode": 0,
+        }
+
     step = 0
     model_done = False
     while step < max_steps and time.time() < deadline:
@@ -880,6 +1058,9 @@ def _broker_run(
         try:
             raw = _broker_llm_call(f"step {step} initial call")
         except Exception as exc:
+            recovered = _attempt_append_line_timeout_recovery(step, str(exc))
+            if recovered:
+                return recovered
             return _broker_fail(
                 "tool broker failed: llm request error",
                 f"Broker LLM request failed at step {step}: {to_single_line(exc, 500)}",
@@ -894,6 +1075,9 @@ def _broker_run(
             try:
                 raw2 = _broker_llm_call(f"step {step} json-repair call")
             except Exception as exc:
+                recovered = _attempt_append_line_timeout_recovery(step, str(exc))
+                if recovered:
+                    return recovered
                 return _broker_fail(
                     "tool broker failed: llm request error",
                     f"Broker JSON-repair request failed at step {step}: {to_single_line(exc, 500)}",
@@ -923,6 +1107,9 @@ def _broker_run(
             try:
                 raw3 = _broker_llm_call(f"step {step} shape-repair call")
             except Exception as exc:
+                recovered = _attempt_append_line_timeout_recovery(step, str(exc))
+                if recovered:
+                    return recovered
                 return _broker_fail(
                     "tool broker failed: llm request error",
                     f"Broker shape-repair request failed at step {step}: {to_single_line(exc, 500)}",

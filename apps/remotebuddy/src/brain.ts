@@ -147,11 +147,22 @@ function parseStructuredJson(text: string): unknown {
     return JSON.parse(trimmed);
   } catch {
     const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-    if (fenced?.[1]) return JSON.parse(fenced[1]);
+    if (fenced?.[1]) {
+      try {
+        return JSON.parse(fenced[1]);
+      } catch {
+        // fall through
+      }
+    }
     const firstBrace = trimmed.indexOf("{");
     const lastBrace = trimmed.lastIndexOf("}");
     if (firstBrace >= 0 && lastBrace > firstBrace) {
-      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+      const snippet = trimmed.slice(firstBrace, lastBrace + 1);
+      try {
+        return JSON.parse(snippet);
+      } catch {
+        // fall through
+      }
     }
     throw new Error("response did not contain parseable JSON");
   }
@@ -297,6 +308,89 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   };
 }
 
+function looksCodeChangeRequest(userText: string): boolean {
+  const lower = userText.toLowerCase();
+  return (
+    /\b(append|edit|update|modify|change|write|create|delete|rename|refactor|fix|patch)\b/.test(
+      lower,
+    ) || /\b(file|path|prompt|readme|config|test|ts|js|py|md)\b/.test(lower)
+  );
+}
+
+function extractPromptPathHints(userText: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: unknown) => {
+    const normalized = normalizeRepoPathHint(value);
+    if (!normalized) return;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(normalized);
+  };
+  for (const match of userText.matchAll(/\b([A-Za-z0-9._/\-\\]+\.[A-Za-z0-9._-]+)\b/g)) {
+    add(match[1]);
+    if (out.length >= MAX_SCOPE_GLOBS) break;
+  }
+  if (out.length < MAX_SCOPE_GLOBS) {
+    for (const match of userText.matchAll(/["'`]([^"'`\r\n]+)["'`]/g)) {
+      const candidate = String(match[1] ?? "").trim();
+      if (!(candidate.includes("/") || candidate.includes("\\") || candidate.includes("."))) {
+        continue;
+      }
+      add(candidate);
+      if (out.length >= MAX_SCOPE_GLOBS) break;
+    }
+  }
+  return out;
+}
+
+function fallbackPlannerOutput(userText: string): PlannerOutput {
+  const requiresWorker = looksCodeChangeRequest(userText);
+  const targetPaths = extractPromptPathHints(userText).filter((entry) => entry !== ".");
+  const likelyDirs = dedupeRepoPathHints(
+    targetPaths
+      .map((entry) => {
+        const idx = entry.lastIndexOf("/");
+        return idx > 0 ? entry.slice(0, idx) : ".";
+      })
+      .filter(Boolean),
+    MAX_DISCOVERY_ITEMS,
+  );
+  const validation = targetPaths.length
+    ? [`git diff -- ${targetPaths.slice(0, 4).join(" ")}`, "git status --porcelain"]
+    : ["git status --porcelain"];
+  return {
+    intent: requiresWorker ? "code_change" : "chat",
+    requires_worker: requiresWorker,
+    job_kind: requiresWorker ? "task.execute" : "none",
+    lane: requiresWorker ? "worker" : "deterministic",
+    scope: {
+      read_anywhere: true,
+      write_allowed: requiresWorker,
+      ...(targetPaths.length > 0 ? { write_globs: targetPaths } : {}),
+      ...(targetPaths.length > 0 ? { max_files_to_edit: targetPaths.length } : {}),
+    },
+    ...(requiresWorker
+      ? {
+          discovery: {
+            ripgrep_queries: targetPaths.length > 0 ? [...targetPaths] : ["README.md"],
+            ...(likelyDirs.length > 0 ? { likely_dirs: likelyDirs } : {}),
+          },
+        }
+      : {}),
+    acceptance_criteria: [
+      "Apply the requested update(s) exactly and keep unrelated content unchanged.",
+    ],
+    validation_steps: validation,
+    risk_level: targetPaths.length <= 2 ? "low" : "medium",
+    assistant_message:
+      "Planner JSON was invalid; proceeding with a safe fallback execution plan derived from your request.",
+    worker_instruction: userText.trim().slice(0, MAX_WORKER_INSTRUCTION_CHARS),
+    user_message: userText.trim().slice(0, MAX_WORKER_INSTRUCTION_CHARS),
+  };
+}
+
 function applyOverrides(plan: PlannerOutput, overrides?: PlannerOverrides): PlannerOutput {
   if (!overrides) return plan;
 
@@ -352,7 +446,7 @@ export class AgentBrain {
   private async generatePlanRaw(
     system: string,
     messages: LLMMessage[],
-    maxTokens = 1600,
+    maxTokens = 900,
   ): Promise<string> {
     const result = await this.llm.generate({
       system,
@@ -360,7 +454,7 @@ export class AgentBrain {
       json: true,
       jsonSchema: REMOTEBUDDY_PLANNER_JSON_SCHEMA,
       maxTokens,
-      temperature: 0.1,
+      temperature: 0,
     });
     if (result.usage) {
       console.log(
@@ -401,10 +495,17 @@ export class AgentBrain {
         },
       ];
 
-      const repairedRaw = await this.generatePlanRaw(REPAIR_SYSTEM_PROMPT, repairMessages, 1800);
-      const repairedParsed = parseStructuredJson(repairedRaw);
-      const plan = sanitizePlannerOutput(repairedParsed, userText);
-      return applyOverrides(plan, overrides);
+      try {
+        const repairedRaw = await this.generatePlanRaw(REPAIR_SYSTEM_PROMPT, repairMessages, 1800);
+        const repairedParsed = parseStructuredJson(repairedRaw);
+        const plan = sanitizePlannerOutput(repairedParsed, userText);
+        return applyOverrides(plan, overrides);
+      } catch (repairErr) {
+        console.warn(
+          `[Brain] Planner repair failed; using deterministic fallback plan (${String(repairErr)}).`,
+        );
+        return applyOverrides(fallbackPlannerOutput(userText), overrides);
+      }
     }
   }
 }

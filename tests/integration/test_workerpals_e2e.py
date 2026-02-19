@@ -551,8 +551,9 @@ _DOCKER_IMAGE_MAIN_SHA_LABEL = "pushpals.main_sha"
 _DOCKER_IMAGE_TREE_STATE_LABEL = "pushpals.tree_state"
 
 
-def _git_main_commit_sha() -> str:
-    refs_to_try = ("refs/heads/main", "refs/remotes/origin/main", "HEAD")
+def _git_workspace_commit_sha() -> str:
+    # Prefer the currently checked out commit so image freshness tracks the active branch/worktree.
+    refs_to_try = ("HEAD", "refs/heads/main", "refs/remotes/origin/main")
     for ref in refs_to_try:
         try:
             proc = subprocess.run(
@@ -570,7 +571,7 @@ def _git_main_commit_sha() -> str:
             sha = (proc.stdout or "").strip()
             if sha:
                 return sha
-    raise RuntimeError("Unable to resolve git commit for main/HEAD when preparing Docker image.")
+    raise RuntimeError("Unable to resolve git commit for HEAD/main when preparing Docker image.")
 
 
 def _git_tree_state_token() -> str:
@@ -633,7 +634,7 @@ def _docker_image_label(image: str, label: str) -> str | None:
 
 
 def _ensure_docker_image(image: str) -> None:
-    expected_main_sha = _git_main_commit_sha()
+    expected_main_sha = _git_workspace_commit_sha()
     expected_tree_state = _git_tree_state_token()
     image_exists = _docker_image_exists(image)
     current_label_sha = _docker_image_label(image, _DOCKER_IMAGE_MAIN_SHA_LABEL) if image_exists else None
@@ -645,7 +646,7 @@ def _ensure_docker_image(image: str) -> None:
     ):
         suffix = f" ({expected_tree_state})" if expected_tree_state != "clean" else ""
         print(
-            f"[NOTICE] Docker image already present and current for main@{expected_main_sha[:12]}{suffix}: {image}"
+            f"[NOTICE] Docker image already present and current for HEAD@{expected_main_sha[:12]}{suffix}: {image}"
         )
         return
     if image_exists:
