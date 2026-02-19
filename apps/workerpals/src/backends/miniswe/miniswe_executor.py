@@ -1092,6 +1092,63 @@ def _broker_run(
             "exitCode": 0,
         }
 
+    def _attempt_timeout_finalize_from_existing_edits(
+        step: int, error_text: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        If the model times out after prior edit actions already changed files,
+        finalize deterministically from repo state instead of hard-failing.
+        """
+        lowered = str(error_text or "").lower()
+        if "timeout" not in lowered and "timed out" not in lowered:
+            return None
+        if not edits_made:
+            return None
+
+        changed_paths = summarize_git_changes(repo)
+        if not changed_paths:
+            return None
+
+        changed_set = {str(p).strip().replace("\\", "/") for p in changed_paths}
+        if expected_targets:
+            expected_set = {str(p).strip().replace("\\", "/") for p in expected_targets}
+            matched = any(
+                _target_hint_matches_changed_path(expected, changed)
+                for expected in expected_set
+                for changed in changed_set
+            )
+            if not matched:
+                _record(
+                    "[Broker] timeout finalize skipped: changed files do not match expected targets. "
+                    f"expected={sorted(expected_set)} observed={sorted(changed_set)}"
+                )
+                return None
+
+        try:
+            final_status = _run_shell(repo, "git status --porcelain", timeout_sec=shell_timeout_sec)
+        except Exception as exc:
+            final_status = f"(git status failed) {to_single_line(exc, 300)}"
+
+        transcript_text = "\n".join(transcript).strip()
+        stdout = ""
+        if transcript_text:
+            stdout += "Tool broker transcript:\n" + transcript_text + "\n\n"
+        stdout += (
+            "Timeout recovery finalized already-applied edit actions from repository state.\n"
+            f"Recovery trigger: step={step}, error={to_single_line(error_text, 220)}\n\n"
+            "Changed files:\n"
+            + "\n".join(f"- {p}" for p in changed_paths[:80])
+            + "\n\nFinal verification:\n"
+            + final_status
+        )
+        return {
+            "ok": True,
+            "summary": "Executed task via tool broker timeout finalize",
+            "stdout": stdout,
+            "stderr": "",
+            "exitCode": 0,
+        }
+
     step = 0
     model_done = False
     while step < max_steps and time.time() < deadline:
@@ -1104,6 +1161,9 @@ def _broker_run(
             raw = _broker_llm_call(f"step {step} initial call")
         except Exception as exc:
             recovered = _attempt_append_line_timeout_recovery(step, str(exc))
+            if recovered:
+                return recovered
+            recovered = _attempt_timeout_finalize_from_existing_edits(step, str(exc))
             if recovered:
                 return recovered
             return _broker_fail(
@@ -1121,6 +1181,9 @@ def _broker_run(
                 raw2 = _broker_llm_call(f"step {step} json-repair call")
             except Exception as exc:
                 recovered = _attempt_append_line_timeout_recovery(step, str(exc))
+                if recovered:
+                    return recovered
+                recovered = _attempt_timeout_finalize_from_existing_edits(step, str(exc))
                 if recovered:
                     return recovered
                 return _broker_fail(
@@ -1146,6 +1209,9 @@ def _broker_run(
                     raw3 = _broker_llm_call(f"step {step} hard-json-repair call")
                 except Exception as exc:
                     recovered = _attempt_append_line_timeout_recovery(step, str(exc))
+                    if recovered:
+                        return recovered
+                    recovered = _attempt_timeout_finalize_from_existing_edits(step, str(exc))
                     if recovered:
                         return recovered
                     return _broker_fail(
@@ -1180,6 +1246,9 @@ def _broker_run(
                 raw3 = _broker_llm_call(f"step {step} shape-repair call")
             except Exception as exc:
                 recovered = _attempt_append_line_timeout_recovery(step, str(exc))
+                if recovered:
+                    return recovered
+                recovered = _attempt_timeout_finalize_from_existing_edits(step, str(exc))
                 if recovered:
                     return recovered
                 return _broker_fail(
