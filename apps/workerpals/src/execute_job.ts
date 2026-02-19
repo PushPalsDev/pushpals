@@ -1189,6 +1189,24 @@ function inferComponentAreaFromTargets(targetPaths: string[]): AutonomyComponent
   return area;
 }
 
+function asAutonomyComponentArea(value: unknown): AutonomyComponentArea | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  switch (text) {
+    case "apps/server":
+    case "apps/remotebuddy":
+    case "apps/workerpals":
+    case "apps/client":
+    case "packages/protocol":
+    case "packages/shared":
+    case "tests/integration":
+    case "tests/unit":
+      return text;
+    default:
+      return null;
+  }
+}
+
 function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user" {
   const explicit = String(params.origin ?? "")
     .trim()
@@ -1274,11 +1292,16 @@ function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
 
 function validateTaskExecutePlanning(
   value: unknown,
+  options?: {
+    origin?: "autonomy" | "user";
+    autonomyComponentArea?: unknown;
+  },
 ): { ok: true } | { ok: false; message: string } {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { ok: false, message: "task.execute requires params.planning object" };
   }
   const planning = value as Record<string, unknown>;
+  const origin = options?.origin === "autonomy" ? "autonomy" : "user";
 
   const intent = String(planning.intent ?? "");
   const riskLevel = String(planning.riskLevel ?? "");
@@ -1352,24 +1375,45 @@ function validateTaskExecutePlanning(
         message: "task.execute planning.targetPaths must contain literal repo-relative paths",
       };
     }
-    const componentArea = inferComponentAreaFromTargets(normalizedTargetPaths);
-    if (!componentArea) {
-      return {
-        ok: false,
-        message: "task.execute planning.targetPaths must map to one supported component area",
-      };
-    }
-    const validatedScope = validateScopeInvariants(
-      componentArea,
-      normalizedTargetPaths,
-      isStringArray(scope.writeGlobs) ? scope.writeGlobs : [],
-      { requireWriteGlobs: true },
-    );
-    if (!validatedScope.ok) {
-      return {
-        ok: false,
-        message: `task.execute scope invariants failed: ${validatedScope.errors.join("; ")}`,
-      };
+    const normalizedWriteGlobs = isStringArray(scope.writeGlobs) ? toStringArray(scope.writeGlobs) : [];
+    if (origin === "autonomy") {
+      const declaredComponentArea = asAutonomyComponentArea(options?.autonomyComponentArea);
+      const inferredComponentArea = inferComponentAreaFromTargets(normalizedTargetPaths);
+      const componentArea = declaredComponentArea ?? inferredComponentArea;
+      if (!componentArea) {
+        return {
+          ok: false,
+          message: "task.execute planning.targetPaths must map to one supported component area",
+        };
+      }
+      if (declaredComponentArea && inferredComponentArea && declaredComponentArea !== inferredComponentArea) {
+        return {
+          ok: false,
+          message: "task.execute planning.targetPaths do not match autonomy componentArea",
+        };
+      }
+      const validatedScope = validateScopeInvariants(
+        componentArea,
+        normalizedTargetPaths,
+        normalizedWriteGlobs,
+        { requireWriteGlobs: true },
+      );
+      if (!validatedScope.ok) {
+        return {
+          ok: false,
+          message: `task.execute scope invariants failed: ${validatedScope.errors.join("; ")}`,
+        };
+      }
+    } else if (normalizedWriteGlobs.length > 0) {
+      const uncoveredPaths = normalizedTargetPaths.filter(
+        (targetPath) => !normalizedWriteGlobs.some((glob) => matchesGlob(targetPath, glob)),
+      );
+      if (uncoveredPaths.length > 0) {
+        return {
+          ok: false,
+          message: `task.execute planning.targetPaths must be covered by planning.scope.writeGlobs: ${uncoveredPaths.join(", ")}`,
+        };
+      }
     }
   }
 
@@ -1475,7 +1519,15 @@ export async function executeJob(
     };
   }
 
-  const planningValidation = validateTaskExecutePlanning(params.planning);
+  const origin = taskExecuteOrigin(params);
+  const autonomyScope =
+    params.autonomy && typeof params.autonomy === "object" && !Array.isArray(params.autonomy)
+      ? (params.autonomy as Record<string, unknown>)
+      : null;
+  const planningValidation = validateTaskExecutePlanning(params.planning, {
+    origin,
+    autonomyComponentArea: autonomyScope?.componentArea ?? autonomyScope?.component_area,
+  });
   if (!planningValidation.ok) {
     return {
       ok: false,
@@ -1485,7 +1537,6 @@ export async function executeJob(
   }
   const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(params.planning);
   const planning = sanitizedPlanning as TaskExecutePlanning;
-  const origin = taskExecuteOrigin(params);
   if (origin === "autonomy" && toStringArray(planning.scope.writeGlobs ?? []).length === 0) {
     return {
       ok: false,

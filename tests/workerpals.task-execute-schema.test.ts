@@ -123,4 +123,28 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.ok).toBe(false);
     expect(result.summary).toContain("autonomy task.execute requires planning.scope.writeGlobs");
   });
+
+  test("allows user-origin repo-root targetPaths and continues validation", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      targetPaths: ["README.md"],
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["README.md"],
+      },
+      finalizationBudgetMs: 0,
+    };
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        instruction: "append one marker line to README",
+        planning,
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
+  });
 });
