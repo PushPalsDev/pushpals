@@ -14,6 +14,11 @@ shared_passthrough = [
   "GITHUB_TOKEN",
   "GH_TOKEN",
   "GIT_TOKEN",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "OPENAI_API_BASE",
+  "OPENAI_ORG_ID",
+  "OPENAI_PROJECT",
   "PUSHPALS_REPO_PATH",
   "WORKERPALS_DEBUG",
 ]
@@ -58,4 +63,18 @@ passthrough_env = [
   "WORKERPALS_MINISWE_TOOL_BROKER_MAX_STEPS",
   "WORKERPALS_MINISWE_TOOL_BROKER_MAX_ACTIONS_PER_STEP",
   "WORKERPALS_MINISWE_TOOL_BROKER_SHELL_TIMEOUT_SEC",
+]
+
+[backends.openai_codex]
+script_segments = ["backends", "openai_codex", "openai_codex_executor.py"]
+python_config_key = "openaiCodexPython"
+timeout_config_key = "openaiCodexTimeoutMs"
+passthrough_env = [
+  "WORKERPALS_OPENAI_CODEX_BIN",
+  "WORKERPALS_OPENAI_CODEX_BASE_URL",
+  "WORKERPALS_OPENAI_CODEX_TIMEOUT_S",
+  "WORKERPALS_OPENAI_CODEX_APPROVAL_POLICY",
+  "WORKERPALS_OPENAI_CODEX_SANDBOX",
+  "WORKERPALS_OPENAI_CODEX_COLOR",
+  "WORKERPALS_OPENAI_CODEX_JSON",
 ]

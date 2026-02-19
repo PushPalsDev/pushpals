@@ -108,6 +108,8 @@ export interface PushPalsConfig {
     openhandsTimeoutMs: number;
     miniswePython: string;
     minisweTimeoutMs: number;
+    openaiCodexPython: string;
+    openaiCodexTimeoutMs: number;
     openhandsStuckGuardEnabled: boolean;
     openhandsStuckGuardExploreLimit: number;
     openhandsStuckGuardMinElapsedMs: number;
@@ -577,6 +579,18 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const workerMinisweTimeoutMs = Math.max(
     10_000,
     asInt(parseIntEnv("WORKERPALS_MINISWE_TIMEOUT_MS") ?? workerNode.miniswe_timeout_ms, 1_800_000),
+  );
+  const workerOpenAICodexPython = firstNonEmpty(
+    process.env.WORKERPALS_OPENAI_CODEX_PYTHON,
+    asString(workerNode.openai_codex_python, "python"),
+    "python",
+  );
+  const workerOpenAICodexTimeoutMs = Math.max(
+    10_000,
+    asInt(
+      parseIntEnv("WORKERPALS_OPENAI_CODEX_TIMEOUT_MS") ?? workerNode.openai_codex_timeout_ms,
+      1_800_000,
+    ),
   );
   const workerOpenHandsStuckGuardEnabled =
     parseBoolEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_ENABLED") ??
@@ -1180,6 +1194,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       openhandsTimeoutMs: workerOpenHandsTimeoutMs,
       miniswePython: workerMiniswePython,
       minisweTimeoutMs: workerMinisweTimeoutMs,
+      openaiCodexPython: workerOpenAICodexPython,
+      openaiCodexTimeoutMs: workerOpenAICodexTimeoutMs,
       openhandsStuckGuardEnabled: workerOpenHandsStuckGuardEnabled,
       openhandsStuckGuardExploreLimit: workerOpenHandsStuckGuardExploreLimit,
       openhandsStuckGuardMinElapsedMs: workerOpenHandsStuckGuardMinElapsedMs,

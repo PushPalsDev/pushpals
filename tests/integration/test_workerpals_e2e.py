@@ -305,6 +305,8 @@ def _detect_available_backends() -> list[str]:
         available.append("miniswe")
     except Exception:
         pass
+    if shutil.which("codex"):
+        available.append("openai_codex")
     return available
 
 
@@ -2570,14 +2572,21 @@ def main():
         assert_proc_alive(remotebuddy_proc, "remotebuddy")
 
         if E2E_USE_DOCKER:
+            # Keep default docker benchmark stable, but allow selecting
+            # additional docker-supported backends via WORKERPALS_E2E_BACKENDS.
             backends_to_try = ["openhands", "miniswe"]
+            if REQUESTED_BACKENDS:
+                for candidate in ("openai_codex",):
+                    if candidate in REQUESTED_BACKENDS and candidate not in backends_to_try:
+                        backends_to_try.append(candidate)
         else:
             backends_to_try = _detect_available_backends()
             if not backends_to_try:
                 raise RuntimeError(
                     "No supported executor dependencies found. Install at least one:\n"
                     "- OpenHands: pip install openhands-ai\n"
-                    "- mini-swe-agent: pip install mini-swe-agent"
+                    "- mini-swe-agent: pip install mini-swe-agent\n"
+                    "- OpenAI Codex CLI: npm i -g @openai/codex"
                 )
         if REQUESTED_BACKENDS:
             filtered_backends = [backend for backend in backends_to_try if backend in REQUESTED_BACKENDS]

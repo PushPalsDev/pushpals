@@ -37,12 +37,14 @@ RUN mkdir -p /workspace \
         openhands-tools \
         mini-swe-agent \
         playwright \
+    && npm install -g @openai/codex \
     && /workspace/.venv/bin/playwright install --with-deps chromium
 
 ENV PATH="/workspace/.venv/bin:${PATH}"
 ENV WORKERPALS_OPENHANDS_PYTHON="/workspace/.venv/bin/python"
 ENV WORKERPALS_OPENHANDS_WORKSPACE_PYTHON="/workspace/.venv/bin/python"
 ENV WORKERPALS_MINISWE_PYTHON="/workspace/.venv/bin/python"
+ENV WORKERPALS_OPENAI_CODEX_PYTHON="/workspace/.venv/bin/python"
 
 # Configure git for the worker
 RUN git config --global user.name "PushPals Worker" \

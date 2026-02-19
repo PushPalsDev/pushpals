@@ -3,6 +3,7 @@ import { resolve } from "path";
 import { loadPushPalsConfig } from "shared";
 import type { ExecutorBackend } from "../common/types.js";
 import { MINISWE_BACKEND } from "./miniswe_backend.js";
+import { OPENAI_CODEX_BACKEND } from "./openai_codex_backend.js";
 import { OPENHANDS_BACKEND } from "./openhands_backend.js";
 import type { BackendTaskExecutor, DockerBackendSpec } from "./types.js";
 import { registerBackendTaskExecutor } from "./task_execute_registry.js";
@@ -79,7 +80,11 @@ export const BACKEND_RUNTIME_CONFIG_KEYS: Record<
   ]),
 );
 
-export const DOCKER_BACKENDS: readonly DockerBackendSpec[] = [OPENHANDS_BACKEND, MINISWE_BACKEND];
+export const DOCKER_BACKENDS: readonly DockerBackendSpec[] = [
+  OPENHANDS_BACKEND,
+  MINISWE_BACKEND,
+  OPENAI_CODEX_BACKEND,
+];
 
 export function getDockerBackendSpec(name: ExecutorBackend): DockerBackendSpec {
   const spec = DOCKER_BACKENDS.find((entry) => entry.name === name);
