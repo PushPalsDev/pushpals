@@ -581,7 +581,7 @@ export class DockerExecutor {
   private openaiCodexAuthMountArgs(backend: ExecutorBackend): string[] {
     if (backend !== "openai_codex") return [];
 
-    const hostCodexHomeRaw = (process.env.WORKERPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
+    const hostCodexHomeRaw = (process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
     const hostCodexHome = (
       hostCodexHomeRaw
         ? isAbsolute(hostCodexHomeRaw)
@@ -605,11 +605,11 @@ export class DockerExecutor {
     }
 
     let containerCodexHome = (
-      process.env.WORKERPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME || "/root/.codex"
+      process.env.PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME || "/root/.codex"
     ).trim();
     if (!containerCodexHome.startsWith("/")) {
       console.warn(
-        `[DockerExecutor] Invalid WORKERPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME=${containerCodexHome}; expected absolute path. Using /root/.codex.`,
+        `[DockerExecutor] Invalid PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME=${containerCodexHome}; expected absolute path. Using /root/.codex.`,
       );
       containerCodexHome = "/root/.codex";
     }

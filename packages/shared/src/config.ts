@@ -18,6 +18,10 @@ export interface PushPalsLlmConfig {
   model: string;
   apiKey: string;
   sessionId: string;
+  reasoningEffort: string;
+  codexAuthMode: string;
+  codexBin: string;
+  codexTimeoutMs: number;
 }
 
 export interface PushPalsLmStudioConfig {
@@ -379,7 +383,36 @@ function resolveLlmConfig(
     process.env[`${envPrefix}_LLM_API_KEY`],
     defaultApiKeyForBackend(backend, endpoint),
   );
-  return { backend, endpoint, model, sessionId, apiKey };
+  const reasoningEffort = firstNonEmpty(
+    process.env[`${envPrefix}_LLM_REASONING_EFFORT`],
+    asString(llmNode.reasoning_effort, ""),
+  );
+  const codexAuthMode = firstNonEmpty(
+    process.env[`${envPrefix}_LLM_CODEX_AUTH_MODE`],
+    asString(llmNode.codex_auth_mode, ""),
+  );
+  const codexBin = firstNonEmpty(
+    process.env[`${envPrefix}_LLM_CODEX_BIN`],
+    asString(llmNode.codex_bin, ""),
+  );
+  const codexTimeoutMs = Math.max(
+    10_000,
+    asInt(
+      parseIntEnv(`${envPrefix}_LLM_CODEX_TIMEOUT_MS`) ?? llmNode.codex_timeout_ms,
+      120_000,
+    ),
+  );
+  return {
+    backend,
+    endpoint,
+    model,
+    sessionId,
+    apiKey,
+    reasoningEffort,
+    codexAuthMode,
+    codexBin,
+    codexTimeoutMs,
+  };
 }
 
 export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
@@ -597,16 +630,13 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     asInt(parseIntEnv("WORKERPALS_MINISWE_TIMEOUT_MS") ?? workerNode.miniswe_timeout_ms, 1_800_000),
   );
   const workerOpenAICodexPython = firstNonEmpty(
-    process.env.WORKERPALS_OPENAI_CODEX_PYTHON,
+    process.env.PUSHPALS_OPENAI_CODEX_PYTHON,
     asString(workerNode.openai_codex_python, "python"),
     "python",
   );
   const workerOpenAICodexTimeoutMs = Math.max(
     10_000,
-    asInt(
-      parseIntEnv("WORKERPALS_OPENAI_CODEX_TIMEOUT_MS") ?? workerNode.openai_codex_timeout_ms,
-      1_800_000,
-    ),
+    asInt(workerNode.openai_codex_timeout_ms, 1_800_000),
   );
   const workerOpenHandsStuckGuardEnabled =
     parseBoolEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_ENABLED") ??

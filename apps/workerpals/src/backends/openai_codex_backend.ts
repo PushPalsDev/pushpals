@@ -22,8 +22,8 @@ function normalizeContainerPython(configuredPython: string, sharedVenvPython: st
 
 function warmupProbeCommand(sharedVenvPython: string): string {
   return (
-    `PY="\${PUSHPALS_OPENAI_CODEX_PYTHON:-\${WORKERPALS_OPENAI_CODEX_PYTHON:-${sharedVenvPython}}}"; ` +
-    'AUTH_MODE_RAW="${PUSHPALS_OPENAI_CODEX_AUTH_MODE:-${WORKERPALS_OPENAI_CODEX_AUTH_MODE:-auto}}"; ' +
+    `PY="\${PUSHPALS_OPENAI_CODEX_PYTHON:-${sharedVenvPython}}"; ` +
+    'AUTH_MODE_RAW="${PUSHPALS_OPENAI_CODEX_AUTH_MODE:-auto}"; ' +
     'AUTH_MODE="$(printf %s "$AUTH_MODE_RAW" | tr "[:upper:]" "[:lower:]")"; ' +
     'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
     '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }; ' +
@@ -41,7 +41,7 @@ function warmupProbeCommand(sharedVenvPython: string): string {
     'if [ "$AUTH_MODE" = "auto" ] && [ -z "${OPENAI_API_KEY:-}" ]; then NEED_LOGIN="1"; fi; ' +
     'if [ "$NEED_LOGIN" = "1" ]; then ' +
     '  sh -lc "$CODEX_CMD login status" >/dev/null 2>&1 || { ' +
-    '    echo "Codex CLI login is required for PUSHPALS_OPENAI_CODEX_AUTH_MODE/WORKERPALS_OPENAI_CODEX_AUTH_MODE=${AUTH_MODE}. Run codex login (or bunx --yes @openai/codex login)." >&2; ' +
+    '    echo "Codex CLI login is required for PUSHPALS_OPENAI_CODEX_AUTH_MODE=${AUTH_MODE}. Run codex login (or bunx --yes @openai/codex login)." >&2; ' +
     "    exit 1; " +
     "  }; " +
     "fi"

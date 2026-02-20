@@ -367,11 +367,20 @@ function normalizeCodexAuthMode(value: string | null | undefined): CodexAuthMode
   return "auto";
 }
 
+function codexAuthModeFromConfig(): string {
+  return firstNonEmpty(
+    CONFIG.remotebuddy.llm.codexAuthMode,
+    CONFIG.localbuddy.llm.codexAuthMode,
+    CONFIG.workerpals.llm.codexAuthMode,
+    "auto",
+  );
+}
+
 function codexConfiguredAuthMode(): CodexAuthMode {
   return normalizeCodexAuthMode(
     firstNonEmpty(
       process.env.PUSHPALS_OPENAI_CODEX_AUTH_MODE,
-      process.env.WORKERPALS_OPENAI_CODEX_AUTH_MODE,
+      codexAuthModeFromConfig(),
       "auto",
     ),
   );
@@ -430,7 +439,6 @@ function codexEffectiveAuthMode(): CodexAuthMode | null {
 function codexHostCommandPrefix(): string[] {
   const jsonOverride = firstNonEmpty(
     process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON,
-    process.env.WORKERPALS_OPENAI_CODEX_BIN_JSON,
   );
   if (jsonOverride) {
     try {
@@ -447,7 +455,9 @@ function codexHostCommandPrefix(): string[] {
   }
   const override = firstNonEmpty(
     process.env.PUSHPALS_OPENAI_CODEX_BIN,
-    process.env.WORKERPALS_OPENAI_CODEX_BIN,
+    CONFIG.remotebuddy.llm.codexBin,
+    CONFIG.localbuddy.llm.codexBin,
+    CONFIG.workerpals.llm.codexBin,
   );
   if (override) {
     const parsed = splitArgs(override);
@@ -461,9 +471,7 @@ function persistResolvedCodexCommandPrefix(commandPrefix: string[]): void {
   const serialized = commandPrefix.join(" ");
   const json = JSON.stringify(commandPrefix);
   process.env.PUSHPALS_OPENAI_CODEX_BIN = serialized;
-  process.env.WORKERPALS_OPENAI_CODEX_BIN = serialized;
   process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON = json;
-  process.env.WORKERPALS_OPENAI_CODEX_BIN_JSON = json;
 }
 
 async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<string[]> {
@@ -513,6 +521,7 @@ async function ensureCodexCliAuthPreflight(): Promise<void> {
   const effectiveMode = codexEffectiveAuthMode() ?? "chatgpt";
   const hasApiKey = codexApiKeyPresent();
   const commandPrefix = await resolveHostCodexCommandPrefix(codexHostCommandPrefix());
+  process.env.PUSHPALS_OPENAI_CODEX_AUTH_MODE = configuredMode;
   persistResolvedCodexCommandPrefix(commandPrefix);
 
   console.log(

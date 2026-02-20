@@ -4,13 +4,25 @@
 [localbuddy.llm]
 backend = "openai_codex"
 model = "gpt-5-codex"
+codex_auth_mode = "chatgpt"
+codex_bin = "bun x --yes @openai/codex"
+codex_timeout_ms = 120000
+reasoning_effort = "high"
 
 [remotebuddy.llm]
 backend = "openai_codex"
 model = "gpt-5-codex"
+codex_auth_mode = "chatgpt"
+codex_bin = "bun x --yes @openai/codex"
+codex_timeout_ms = 120000
+reasoning_effort = "high"
 
 [workerpals.llm]
 model = "gpt-5-codex"
+codex_auth_mode = "chatgpt"
+codex_bin = "bun x --yes @openai/codex"
+codex_timeout_ms = 120000
+reasoning_effort = "high"
 
 [workerpals]
 executor = "openai_codex"
@@ -36,6 +48,17 @@ auto_steer_enabled = true
 auto_steer_initial_delay_sec = 90
 auto_steer_interval_sec = 60
 auto_steer_max_nudges = 30
+
+[workerpals.openai_codex]
+auth_mode = "chatgpt"
+bin = "bun x --yes @openai/codex"
+timeout_ms = 120000
+# timeout_s = 120  # optional; if set, overrides timeout_ms
+reasoning_effort = "high"
+approval_policy = "never"
+sandbox = "workspace-write"
+color = "never"
+json = false
 
 [llm.lmstudio]
 context_window = 4096

@@ -147,6 +147,14 @@ endpoint = "http://127.0.0.1:1234"
 model = "local-model"
 session_id = "workerpals-dev"
 
+[workerpals.openai_codex]
+timeout_ms = 120000
+reasoning_effort = "high"
+approval_policy = "never"
+sandbox = "workspace-write"
+color = "never"
+json = false
+
 [source_control_manager]
 repo_path = ".worktrees/source_control_manager"
 remote = "origin"

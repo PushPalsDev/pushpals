@@ -44,7 +44,7 @@ ENV PATH="/workspace/.venv/bin:/root/.bun/bin:${PATH}"
 ENV WORKERPALS_OPENHANDS_PYTHON="/workspace/.venv/bin/python"
 ENV WORKERPALS_OPENHANDS_WORKSPACE_PYTHON="/workspace/.venv/bin/python"
 ENV WORKERPALS_MINISWE_PYTHON="/workspace/.venv/bin/python"
-ENV WORKERPALS_OPENAI_CODEX_PYTHON="/workspace/.venv/bin/python"
+ENV PUSHPALS_OPENAI_CODEX_PYTHON="/workspace/.venv/bin/python"
 
 # Configure git for the worker
 RUN git config --global user.name "PushPals Worker" \

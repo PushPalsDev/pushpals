@@ -58,6 +58,10 @@ interface ResolvedServiceLlmConfig {
   model: string;
   apiKey: string;
   sessionId: string;
+  reasoningEffort: string;
+  codexAuthMode: string;
+  codexBin: string;
+  codexTimeoutMs: number;
   lmStudio: PushPalsLmStudioConfig;
 }
 
@@ -160,21 +164,18 @@ function normalizeCodexAuthMode(value: string | null | undefined): CodexAuthMode
   return "auto";
 }
 
-function codexConfiguredAuthMode(): CodexAuthMode {
+function codexConfiguredAuthMode(configuredValue?: string | null): CodexAuthMode {
   return normalizeCodexAuthMode(
     firstNonEmpty(
       process.env.PUSHPALS_OPENAI_CODEX_AUTH_MODE,
-      process.env.WORKERPALS_OPENAI_CODEX_AUTH_MODE,
+      configuredValue,
       "auto",
     ),
   );
 }
 
-function codexCommandOverrideParts(): string[] {
-  const jsonOverride = firstNonEmpty(
-    process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON,
-    process.env.WORKERPALS_OPENAI_CODEX_BIN_JSON,
-  );
+function codexCommandOverrideParts(configuredValue?: string | null): string[] {
+  const jsonOverride = firstNonEmpty(process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON);
   if (jsonOverride) {
     try {
       const parsed = JSON.parse(jsonOverride);
@@ -191,7 +192,7 @@ function codexCommandOverrideParts(): string[] {
   const stringOverride =
     firstNonEmpty(
       process.env.PUSHPALS_OPENAI_CODEX_BIN,
-      process.env.WORKERPALS_OPENAI_CODEX_BIN,
+      configuredValue,
       "",
     ) ?? "";
   if (!stringOverride) return [];
@@ -202,21 +203,27 @@ function codexBaseUrlOverride(): string {
   return (
     firstNonEmpty(
       process.env.PUSHPALS_OPENAI_CODEX_BASE_URL,
-      process.env.WORKERPALS_OPENAI_CODEX_BASE_URL,
       "",
     ) ?? ""
   );
 }
 
-function codexTimeoutMs(): number {
-  const raw = firstNonEmpty(
-    process.env.PUSHPALS_OPENAI_CODEX_TIMEOUT_MS,
-    process.env.WORKERPALS_OPENAI_CODEX_TIMEOUT_MS,
-    "",
-  );
+function codexTimeoutMs(configuredTimeoutMs?: number | null): number {
+  const raw =
+    typeof configuredTimeoutMs === "number" &&
+    Number.isFinite(configuredTimeoutMs) &&
+    configuredTimeoutMs > 0
+      ? String(Math.floor(configuredTimeoutMs))
+      : "";
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   if (Number.isFinite(parsed) && parsed > 0) return parsed;
   return DEFAULT_CODEX_TIMEOUT_MS;
+}
+
+function codexReasoningEffort(configured: string | null | undefined): "low" | "medium" | "high" {
+  const raw = (configured ?? "").trim().toLowerCase();
+  if (raw === "low" || raw === "medium" || raw === "high") return raw;
+  return "high";
 }
 
 function normalizeCodexModel(rawModel: string): string {
@@ -312,11 +319,13 @@ async function runProcess(
   });
 }
 
-let cachedCodexCommandPrefix: string[] | null = null;
+const cachedCodexCommandPrefix = new Map<string, string[]>();
 
-async function resolveCodexCommandPrefix(): Promise<string[]> {
-  if (cachedCodexCommandPrefix) return cachedCodexCommandPrefix;
-  const override = codexCommandOverrideParts();
+async function resolveCodexCommandPrefix(configuredCommand?: string | null): Promise<string[]> {
+  const override = codexCommandOverrideParts(configuredCommand);
+  const cacheKey = override.join("\u0000");
+  const cached = cachedCodexCommandPrefix.get(cacheKey);
+  if (cached) return cached;
   const preferred = override.length > 0 ? override : ["bun", "x", "--yes", "@openai/codex"];
   const candidates: string[][] = [];
   const pushCandidate = (cmd: string[]) => {
@@ -349,7 +358,7 @@ async function resolveCodexCommandPrefix(): Promise<string[]> {
         timeoutMs: 15_000,
       });
       if (probe.code === 0) {
-        cachedCodexCommandPrefix = candidate;
+        cachedCodexCommandPrefix.set(cacheKey, candidate);
         return candidate;
       }
       const detail = (probe.stderr || probe.stdout || "").trim();
@@ -450,7 +459,10 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
           : "",
     ) ??
     "";
-  if (service !== "workerpals" && shouldUseCodexCliFallback(backend, model, apiKey)) {
+  if (
+    service !== "workerpals" &&
+    shouldUseCodexCliFallback(backend, model, apiKey, serviceLlmConfig.codexAuthMode)
+  ) {
     backend = "openai_codex";
   }
   const normalizedEndpoint =
@@ -469,6 +481,10 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
     model,
     apiKey,
     sessionId,
+    reasoningEffort: serviceLlmConfig.reasoningEffort,
+    codexAuthMode: serviceLlmConfig.codexAuthMode,
+    codexBin: serviceLlmConfig.codexBin,
+    codexTimeoutMs: serviceLlmConfig.codexTimeoutMs,
     lmStudio: config.llm.lmstudio,
   };
 }
@@ -537,10 +553,11 @@ function shouldUseCodexCliFallback(
   backend: LlmBackend,
   model: string,
   apiKey: string,
+  configuredAuthMode?: string,
 ): boolean {
   if (backend !== "openai") return false;
   if (!isLikelyCodexModel(model)) return false;
-  const mode = codexConfiguredAuthMode();
+  const mode = codexConfiguredAuthMode(configuredAuthMode);
   if (mode === "api_key") return false;
   if (mode === "chatgpt") return true;
   return !apiKey.trim();
@@ -1197,25 +1214,37 @@ export class OpenAiCodexCliClient implements LLMClient {
   private readonly model: string;
   private readonly apiKey: string;
   private readonly endpoint: string;
+  private readonly codexAuthMode: string;
+  private readonly codexBin: string;
+  private readonly codexTimeoutMs: number;
   private readonly service: LlmService;
   private readonly sessionTag: string;
+  private readonly reasoningEffort: string;
 
   constructor(opts?: {
     model?: string;
     apiKey?: string;
     endpoint?: string;
+    codexAuthMode?: string;
+    codexBin?: string;
+    codexTimeoutMs?: number;
+    reasoningEffort?: string;
     service?: LlmService;
     sessionId?: string;
   }) {
     this.model = normalizeCodexModel(opts?.model ?? DEFAULT_CODEX_MODEL);
     this.apiKey = (opts?.apiKey ?? "").trim();
     this.endpoint = normalizeOpenAiBaseFromEndpoint(opts?.endpoint ?? DEFAULT_OPENAI_ENDPOINT);
+    this.codexAuthMode = (opts?.codexAuthMode ?? "").trim();
+    this.codexBin = (opts?.codexBin ?? "").trim();
+    this.codexTimeoutMs = opts?.codexTimeoutMs ?? DEFAULT_CODEX_TIMEOUT_MS;
     this.service = opts?.service ?? "remotebuddy";
     this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
+    this.reasoningEffort = (opts?.reasoningEffort ?? "").trim();
   }
 
   private effectiveAuthMode(): CodexAuthMode {
-    const configured = codexConfiguredAuthMode();
+    const configured = codexConfiguredAuthMode(this.codexAuthMode);
     if (configured !== "auto") return configured;
     const envKey = (process.env.OPENAI_API_KEY ?? "").trim();
     return this.apiKey || envKey ? "api_key" : "chatgpt";
@@ -1238,7 +1267,7 @@ export class OpenAiCodexCliClient implements LLMClient {
   }
 
   private async runCodexExec(prompt: string): Promise<{ text: string; stderr: string }> {
-    const commandPrefix = await resolveCodexCommandPrefix();
+    const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
     const env: NodeJS.ProcessEnv = { ...process.env };
     env.PYTHONIOENCODING = "utf-8";
     env.PUSHPALS_LLM_SERVICE = this.service;
@@ -1274,6 +1303,8 @@ export class OpenAiCodexCliClient implements LLMClient {
     try {
       const command: string[] = [
         ...commandPrefix,
+        "-c",
+        `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort)}"`,
         "-a",
         "never",
         "-s",
@@ -1293,10 +1324,10 @@ export class OpenAiCodexCliClient implements LLMClient {
         cwd: process.cwd(),
         env,
         stdin: prompt,
-        timeoutMs: codexTimeoutMs(),
+        timeoutMs: codexTimeoutMs(this.codexTimeoutMs),
       });
       if (result.timedOut) {
-        throw new Error(`Codex CLI request timed out after ${codexTimeoutMs()}ms.`);
+        throw new Error(`Codex CLI request timed out after ${codexTimeoutMs(this.codexTimeoutMs)}ms.`);
       }
       const stderr = (result.stderr || "").trim();
       const stdout = (result.stdout || "").trim();
@@ -1381,12 +1412,16 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
 
   if (resolved.backend === "openai_codex") {
     console.log(
-      `[LLM] Using OpenAI Codex CLI backend (model: ${resolved.model}, auth_mode: ${codexConfiguredAuthMode()}).`,
+      `[LLM] Using OpenAI Codex CLI backend (model: ${resolved.model}, auth_mode: ${codexConfiguredAuthMode(resolved.codexAuthMode)}).`,
     );
     return new OpenAiCodexCliClient({
       model: resolved.model,
       apiKey: resolved.apiKey,
       endpoint: resolved.endpoint,
+      codexAuthMode: resolved.codexAuthMode,
+      codexBin: resolved.codexBin,
+      codexTimeoutMs: resolved.codexTimeoutMs,
+      reasoningEffort: resolved.reasoningEffort,
       service,
       sessionId: resolved.sessionId,
     });
