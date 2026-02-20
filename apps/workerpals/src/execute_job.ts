@@ -1205,23 +1205,62 @@ function summarizeScope(kind: string, params?: Record<string, unknown>): string 
 function deriveSummary(action: string, params?: Record<string, unknown>): string {
   const explicit = sanitizeCommitValue(params?.commitSummary, 72);
   if (explicit) return explicit;
+
+  // For task.execute, derive a meaningful summary from the instruction before
+  // falling back to the generic action string ("execute apps/localbuddy").
+  if (params) {
+    const instrRaw = String(params.instruction ?? "").trim();
+    if (instrRaw) {
+      // Use first sentence/line of instruction (up to 72 chars).
+      const firstLine = instrRaw.split(/[\n.!?]/)[0]?.trim() ?? instrRaw;
+      const instrSummary = sanitizeCommitValue(firstLine || instrRaw, 72);
+      if (instrSummary && instrSummary !== action) return instrSummary;
+    }
+  }
+
   const raw = sanitizeCommitValue(action, 72);
   if (!raw) return "apply requested repository update";
   return raw;
 }
 
 function buildImplementationPoints(kind: string, params?: Record<string, unknown>): string {
-  const targets = buildStageTargets(kind, params);
-  const lines: string[] = [];
-  if (targets.length === 0) return "";
+  // 1. Explicit commit points take highest priority (set by dispatcher or worker).
+  const explicitPoints = toNonEmptyStringArray(
+    params?.commitPoints ?? params?.changeDetails ?? params?.implementationPoints,
+  );
+  if (explicitPoints.length > 0) {
+    return explicitPoints
+      .slice(0, 8)
+      .map((point) => `- ${sanitizeCommitValue(point, 220)}`)
+      .join("\n");
+  }
 
+  // 2. Use acceptance criteria from planning as implementation bullets.
+  //    These are always set for autonomy/re-queue jobs and describe what was achieved.
+  const planning =
+    params && typeof params.planning === "object" && !Array.isArray(params.planning)
+      ? (params.planning as Record<string, unknown>)
+      : undefined;
+  const criteria = toNonEmptyStringArray(
+    planning?.acceptanceCriteria ?? planning?.acceptance_criteria,
+  );
+  if (criteria.length > 0) {
+    return criteria
+      .slice(0, 6)
+      .map((criterion) => `- ${sanitizeCommitValue(criterion, 220)}`)
+      .join("\n");
+  }
+
+  // 3. Fall back to staged file paths.
+  const targets = buildStageTargets(kind, params);
+  if (targets.length === 0) return "";
+  const lines: string[] = [];
   for (const target of targets.slice(0, 5)) {
     lines.push(`- updated path: ${sanitizeCommitValue(target, 220)}`);
   }
   if (targets.length > 5) {
     lines.push(`- updated path: +${targets.length - 5} additional file(s)`);
   }
-
   return lines.join("\n");
 }
 
