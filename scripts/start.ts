@@ -2780,66 +2780,6 @@ async function ensureSourceControlManagerWorktree(): Promise<void> {
   process.env.SOURCE_CONTROL_MANAGER_REPO_PATH = repoPath;
 }
 
-/**
- * After the remote sync (which runs inside the SCM worktree), fetch origin/main_agents
- * into the main repo and fast-forward the local branch if it is cleanly behind origin.
- * This is best-effort — it logs a hint if not possible but never aborts startup.
- */
-async function tryFastForwardLocalIntegrationBranch(): Promise<void> {
-  const fetch = await runCapture(
-    ["git", "fetch", "origin", INTEGRATION_BRANCH, "--quiet"],
-    repoRoot,
-  );
-  if (!fetch.ok) return;
-
-  const localExists = await runCapture(
-    ["git", "rev-parse", "--verify", "--quiet", INTEGRATION_BRANCH],
-    repoRoot,
-  );
-  if (!localExists.ok) return;
-
-  const originRef = `origin/${INTEGRATION_BRANCH}`;
-
-  // Is local strictly behind origin? (merge-base --is-ancestor local origin succeeds when local ⊆ origin)
-  const localBehind = await runCapture(
-    ["git", "merge-base", "--is-ancestor", INTEGRATION_BRANCH, originRef],
-    repoRoot,
-  );
-  if (!localBehind.ok) return; // diverged or ahead — don't touch
-
-  // Is local already equal to origin? (both directions are ancestors ↔ same commit)
-  const alreadyEqual = await runCapture(
-    ["git", "merge-base", "--is-ancestor", originRef, INTEGRATION_BRANCH],
-    repoRoot,
-  );
-  if (alreadyEqual.ok) return; // already up to date
-
-  const currentBranch = (
-    await runCapture(["git", "rev-parse", "--abbrev-ref", "HEAD"], repoRoot)
-  ).stdout.trim();
-
-  if (currentBranch === INTEGRATION_BRANCH) {
-    // Branch is checked out — use merge --ff-only so the working tree is updated too.
-    const ff = await runCapture(["git", "merge", "--ff-only", originRef], repoRoot);
-    if (ff.ok) {
-      console.log(`[start] Fast-forwarded local ${INTEGRATION_BRANCH} to match origin.`);
-    } else {
-      console.log(
-        `[start] Note: local ${INTEGRATION_BRANCH} is behind origin but could not be fast-forwarded (uncommitted changes?). Run: git pull`,
-      );
-    }
-  } else {
-    // Branch is not checked out — safe to move its ref directly.
-    const update = await runCapture(
-      ["git", "branch", "-f", INTEGRATION_BRANCH, originRef],
-      repoRoot,
-    );
-    if (update.ok) {
-      console.log(`[start] Updated local ${INTEGRATION_BRANCH} branch to match origin.`);
-    }
-  }
-}
-
 async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
   if (!syncIntegrationWithMainEnabled()) {
     console.log("[start] Skipping integration-branch sync with main (disabled by env).");
@@ -2913,7 +2853,6 @@ async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
     console.log(
       `[start] ${INTEGRATION_REMOTE_REF} is already up to date with ${INTEGRATION_BASE_REMOTE_REF}.`,
     );
-    await tryFastForwardLocalIntegrationBranch();
     return;
   }
 
@@ -2985,7 +2924,6 @@ async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
     console.log(
       `[start] Synced ${INTEGRATION_REMOTE_REF} with ${INTEGRATION_BASE_REMOTE_REF} successfully.`,
     );
-    await tryFastForwardLocalIntegrationBranch();
   } finally {
     if (checkoutCreated) {
       await gitInScm(["checkout", "--detach", integrationRemoteTrackingRef]);
