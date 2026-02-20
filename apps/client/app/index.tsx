@@ -13,6 +13,7 @@ import { ChatPane } from "../src/components/ChatPane";
 import { CoordinationPane } from "../src/components/CoordinationPane";
 import { deriveCoordinationRows } from "../src/components/coordinationModel";
 import type {
+  CoordinationRow,
   DashboardTheme,
   FlowStep,
   ResolvedMode,
@@ -142,6 +143,10 @@ export default function DashboardScreen() {
   const [completionCounts, setCompletionCounts] = useState<QueueCounts>({});
   const [systemSummary, setSystemSummary] = useState<SystemStatusSummary>({});
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
+  const [jobsFilter, setJobsFilter] = useState<{
+    requestId: string | null;
+    jobId: string | null;
+  }>({ requestId: null, jobId: null });
 
   const mountAnim = useRef(new Animated.Value(0)).current;
   const tabAnim = useRef(new Animated.Value(1)).current;
@@ -248,6 +253,18 @@ export default function DashboardScreen() {
   const reusePromptInComposer = useCallback((prompt: string) => {
     setInput(prompt);
     setActiveTab("chat");
+  }, []);
+
+  const openLogsForCoordination = useCallback((row: CoordinationRow) => {
+    const preferredJob =
+      row.jobs.find((job) => job.status === "claimed") ??
+      [...row.jobs].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0] ??
+      null;
+    setJobsFilter({
+      requestId: row.request.id,
+      jobId: preferredJob?.id ?? null,
+    });
+    setActiveTab("jobs");
   }, []);
 
   const lastClientMessageTs = useMemo(() => {
@@ -446,6 +463,7 @@ export default function DashboardScreen() {
               jobCounts={jobCounts}
               completionCounts={completionCounts}
               onReusePrompt={reusePromptInComposer}
+              onOpenLogs={openLogsForCoordination}
             />
           ) : null}
           {activeTab === "chat" ? (
@@ -479,6 +497,9 @@ export default function DashboardScreen() {
               completions={completions}
               completionCounts={completionCounts}
               sessionState={session.state}
+              requestFilterId={jobsFilter.requestId}
+              jobFilterId={jobsFilter.jobId}
+              onClearFilter={() => setJobsFilter({ requestId: null, jobId: null })}
             />
           ) : null}
           {activeTab === "system" ? (

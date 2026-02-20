@@ -1,5 +1,5 @@
 import React from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { QueueCounts } from "../lib/pushpalsApi";
 import type { CoordinationRow, CoordinationStage, DashboardTheme, Tone } from "./dashboardTypes";
 import {
@@ -26,6 +26,24 @@ function stageTone(stage: CoordinationStage): Tone {
   return "accent";
 }
 
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function encodeGitRefForPath(ref: string): string {
+  return ref
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+}
+
+function extractFirstHttpUrl(text: string | null | undefined): string | null {
+  const raw = String(text ?? "").trim();
+  if (!raw) return null;
+  const match = raw.match(/https?:\/\/[^\s)]+/i);
+  return match?.[0] ?? null;
+}
+
 export function CoordinationPane({
   theme,
   isWide,
@@ -34,6 +52,7 @@ export function CoordinationPane({
   jobCounts,
   completionCounts,
   onReusePrompt,
+  onOpenLogs,
 }: {
   theme: DashboardTheme;
   isWide: boolean;
@@ -42,7 +61,48 @@ export function CoordinationPane({
   jobCounts: QueueCounts;
   completionCounts: QueueCounts;
   onReusePrompt: (text: string) => void;
+  onOpenLogs: (row: CoordinationRow) => void;
 }) {
+  const repoBaseUrl = React.useMemo(
+    () => trimTrailingSlash(String(process.env.EXPO_PUBLIC_PUSHPALS_REPO_URL ?? "").trim()),
+    [],
+  );
+  const getReviewTargetUrl = React.useCallback(
+    (completion: CoordinationRow["completions"][number] | undefined): string | null => {
+      if (!completion) return null;
+      const urlFromBody = extractFirstHttpUrl(completion.prBody);
+      if (urlFromBody) return urlFromBody;
+      const urlFromTitle = extractFirstHttpUrl(completion.prTitle);
+      if (urlFromTitle) return urlFromTitle;
+      if (!repoBaseUrl) return null;
+      if (completion.commitSha) {
+        return `${repoBaseUrl}/commit/${encodeURIComponent(completion.commitSha)}`;
+      }
+      if (completion.branch) {
+        return `${repoBaseUrl}/tree/${encodeGitRefForPath(completion.branch)}`;
+      }
+      return null;
+    },
+    [repoBaseUrl],
+  );
+  const openReviewTarget = React.useCallback(
+    async (completion: CoordinationRow["completions"][number] | undefined): Promise<void> => {
+      const url = getReviewTargetUrl(completion);
+      if (!url) return;
+      try {
+        const supported = await Linking.canOpenURL(url);
+        if (!supported) {
+          console.error(`[CoordinationPane] Cannot open review URL: ${url}`);
+          return;
+        }
+        await Linking.openURL(url);
+      } catch (err) {
+        console.error(`[CoordinationPane] Failed to open review URL: ${url}`, err);
+      }
+    },
+    [getReviewTargetUrl],
+  );
+
   const readyCount = rows.filter((row) => row.stage === "ready_for_review").length;
   const failedCount = rows.filter((row) => row.stage === "failed").length;
   const activeCount = rows.filter(
@@ -327,6 +387,7 @@ export function CoordinationPane({
           ) : (
             reviewRows.map((row) => {
               const completion = row.completions.find((entry) => entry.status === "processed");
+              const reviewTargetUrl = getReviewTargetUrl(completion);
               return (
                 <View
                   key={`review-${row.request.id}`}
@@ -350,6 +411,62 @@ export function CoordinationPane({
                   >
                     {completion?.branch ?? "--"} | {completion?.commitSha?.slice(0, 8) ?? "--"}
                   </Text>
+                  <View style={styles.sideActions}>
+                    <Pressable
+                      style={[
+                        styles.sideActionButton,
+                        { borderColor: theme.border, backgroundColor: theme.panel },
+                      ]}
+                      onPress={() => onReusePrompt(row.request.prompt)}
+                    >
+                      <Text
+                        style={[
+                          styles.sideActionLabel,
+                          { color: theme.accent, fontFamily: theme.fontSans },
+                        ]}
+                      >
+                        Retry
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.sideActionButton,
+                        { borderColor: theme.border, backgroundColor: theme.panel },
+                      ]}
+                      onPress={() => onOpenLogs(row)}
+                    >
+                      <Text
+                        style={[
+                          styles.sideActionLabel,
+                          { color: theme.accent, fontFamily: theme.fontSans },
+                        ]}
+                      >
+                        Open Logs
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.sideActionButton,
+                        styles.sideActionButtonWide,
+                        { borderColor: theme.border, backgroundColor: theme.panel },
+                        !reviewTargetUrl && styles.sideActionDisabled,
+                      ]}
+                      onPress={() => void openReviewTarget(completion)}
+                      disabled={!reviewTargetUrl}
+                    >
+                      <Text
+                        style={[
+                          styles.sideActionLabel,
+                          {
+                            color: reviewTargetUrl ? theme.positive : theme.textMuted,
+                            fontFamily: theme.fontSans,
+                          },
+                        ]}
+                      >
+                        Open Branch/PR
+                      </Text>
+                    </Pressable>
+                  </View>
                 </View>
               );
             })
@@ -391,6 +508,40 @@ export function CoordinationPane({
                 >
                   {row.stageDetail}
                 </Text>
+                <View style={styles.sideActions}>
+                  <Pressable
+                    style={[
+                      styles.sideActionButton,
+                      { borderColor: theme.border, backgroundColor: theme.panel },
+                    ]}
+                    onPress={() => onReusePrompt(row.request.prompt)}
+                  >
+                    <Text
+                      style={[
+                        styles.sideActionLabel,
+                        { color: theme.accent, fontFamily: theme.fontSans },
+                      ]}
+                    >
+                      Retry
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={[
+                      styles.sideActionButton,
+                      { borderColor: theme.border, backgroundColor: theme.panel },
+                    ]}
+                    onPress={() => onOpenLogs(row)}
+                  >
+                    <Text
+                      style={[
+                        styles.sideActionLabel,
+                        { color: theme.accent, fontFamily: theme.fontSans },
+                      ]}
+                    >
+                      Open Logs
+                    </Text>
+                  </Pressable>
+                </View>
               </View>
             ))
           )}
@@ -539,5 +690,30 @@ const styles = StyleSheet.create({
   sideMeta: {
     marginTop: 5,
     fontSize: 11,
+  },
+  sideActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginTop: 8,
+  },
+  sideActionButton: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    marginRight: 6,
+    marginBottom: 6,
+  },
+  sideActionButtonWide: {
+    minWidth: 124,
+  },
+  sideActionDisabled: {
+    opacity: 0.55,
+  },
+  sideActionLabel: {
+    fontSize: 10,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.2,
   },
 });

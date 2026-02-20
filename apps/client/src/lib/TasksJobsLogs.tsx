@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Platform } from "react-native";
 import type { SessionState, Task, Job, LogLine } from "./eventReducer";
 
@@ -345,6 +345,10 @@ function createStyles(palette: TracePalette, theme?: TasksJobsLogsTheme) {
       borderWidth: 1,
       borderColor: palette.border,
     },
+    jobCardFocused: {
+      borderColor: palette.accent,
+      borderWidth: 2,
+    },
     jobHeader: {
       flexDirection: "row",
       alignItems: "center",
@@ -511,6 +515,7 @@ function TaskRow({
   logs,
   expanded,
   onToggle,
+  focusJobId,
   styles,
   palette,
 }: {
@@ -519,6 +524,7 @@ function TaskRow({
   logs: Map<string, LogLine[]>;
   expanded: boolean;
   onToggle: () => void;
+  focusJobId?: string | null;
   styles: TraceStyles;
   palette: TracePalette;
 }) {
@@ -547,6 +553,8 @@ function TaskRow({
               key={job.jobId}
               job={job}
               logs={logs.get(job.jobId) ?? []}
+              forceExpanded={focusJobId === job.jobId}
+              focused={focusJobId === job.jobId}
               styles={styles}
               palette={palette}
             />
@@ -560,17 +568,25 @@ function TaskRow({
 function JobRow({
   job,
   logs,
+  forceExpanded = false,
+  focused = false,
   styles,
   palette,
 }: {
   job: Job;
   logs: LogLine[];
+  forceExpanded?: boolean;
+  focused?: boolean;
   styles: TraceStyles;
   palette: TracePalette;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [showRawLogs, setShowRawLogs] = useState(false);
   const color = statusColor(job.status, palette);
+
+  useEffect(() => {
+    if (forceExpanded) setExpanded(true);
+  }, [forceExpanded, job.jobId]);
 
   const stdoutLines = useMemo(
     () => logs.filter((line) => line.stream === "stdout").sort((a, b) => a.seq - b.seq),
@@ -584,7 +600,7 @@ function JobRow({
   const totalLines = stdoutLines.length + stderrLines.length;
 
   return (
-    <View style={styles.jobCard}>
+    <View style={[styles.jobCard, focused && styles.jobCardFocused]}>
       <TouchableOpacity onPress={() => setExpanded(!expanded)} style={styles.jobHeader}>
         <View style={[styles.dot, { backgroundColor: color }]} />
         <Text style={styles.jobKind}>{job.kind}</Text>
@@ -677,12 +693,14 @@ function OrphanJobs({
   jobs,
   logs,
   taskJobIds,
+  focusJobId,
   styles,
   palette,
 }: {
   jobs: Map<string, Job>;
   logs: Map<string, LogLine[]>;
   taskJobIds: Set<string>;
+  focusJobId?: string | null;
   styles: TraceStyles;
   palette: TracePalette;
 }) {
@@ -699,6 +717,8 @@ function OrphanJobs({
           key={job.jobId}
           job={job}
           logs={logs.get(job.jobId) ?? []}
+          forceExpanded={focusJobId === job.jobId}
+          focused={focusJobId === job.jobId}
           styles={styles}
           palette={palette}
         />
@@ -710,9 +730,11 @@ function OrphanJobs({
 export function TasksJobsLogs({
   state,
   theme,
+  focusJobId,
 }: {
   state: SessionState;
   theme?: TasksJobsLogsTheme;
+  focusJobId?: string | null;
 }) {
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   const mode = theme?.mode ?? "light";
@@ -724,6 +746,12 @@ export function TasksJobsLogs({
   for (const task of tasks) {
     for (const jobId of task.jobIds) taskJobIds.add(jobId);
   }
+
+  useEffect(() => {
+    if (!focusJobId) return;
+    const taskWithJob = tasks.find((task) => task.jobIds.includes(focusJobId));
+    if (taskWithJob) setExpandedTaskId(taskWithJob.taskId);
+  }, [focusJobId, tasks]);
 
   if (tasks.length === 0 && state.jobs.size === 0) {
     return (
@@ -764,6 +792,7 @@ export function TasksJobsLogs({
                 onToggle={() =>
                   setExpandedTaskId(expandedTaskId === task.taskId ? null : task.taskId)
                 }
+                focusJobId={focusJobId}
                 styles={styles}
                 palette={palette}
               />
@@ -776,6 +805,7 @@ export function TasksJobsLogs({
         jobs={state.jobs}
         logs={state.logs}
         taskJobIds={taskJobIds}
+        focusJobId={focusJobId}
         styles={styles}
         palette={palette}
       />

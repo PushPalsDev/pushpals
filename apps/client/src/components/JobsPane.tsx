@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import { FlatList, StyleSheet, Text, View } from "react-native";
+import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import { TasksJobsLogs } from "../lib/TasksJobsLogs";
 import type { SessionState } from "../lib/eventReducer";
 import type {
@@ -20,6 +20,18 @@ import {
 } from "./dashboardFormatters";
 import { MetricTile } from "./MetricTile";
 
+function parseJobParamsRequestId(params: string): string | null {
+  if (!params) return null;
+  try {
+    const parsed = JSON.parse(params) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const value = (parsed as Record<string, unknown>).requestId;
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 export function JobsPane({
   theme,
   isWide,
@@ -29,6 +41,9 @@ export function JobsPane({
   completions,
   completionCounts,
   sessionState,
+  requestFilterId,
+  jobFilterId,
+  onClearFilter,
 }: {
   theme: DashboardTheme;
   isWide: boolean;
@@ -38,12 +53,30 @@ export function JobsPane({
   completions: CompletionSnapshotRow[];
   completionCounts: QueueCounts;
   sessionState: SessionState;
+  requestFilterId?: string | null;
+  jobFilterId?: string | null;
+  onClearFilter?: () => void;
 }) {
-  const recentJobs = jobs.slice(0, 40);
+  const filteredJobs = useMemo(() => {
+    if (jobFilterId) return jobs.filter((job) => job.id === jobFilterId);
+    if (requestFilterId) {
+      return jobs.filter((job) => parseJobParamsRequestId(job.params) === requestFilterId);
+    }
+    return jobs;
+  }, [jobs, requestFilterId, jobFilterId]);
+  const recentJobs = filteredJobs.slice(0, 40);
+  const filteredJobIds = useMemo(() => new Set(filteredJobs.map((job) => job.id)), [filteredJobs]);
+  const visibleCompletions = useMemo(() => {
+    if (filteredJobIds.size === 0 && (requestFilterId || jobFilterId)) return [];
+    if (!requestFilterId && !jobFilterId) return completions;
+    return completions.filter((completion) => filteredJobIds.has(completion.jobId));
+  }, [completions, filteredJobIds, requestFilterId, jobFilterId]);
   const pendingById = useMemo(
     () => new Map(pendingSnapshot.map((snapshot) => [snapshot.id, snapshot])),
     [pendingSnapshot],
   );
+  const hasFilter = Boolean(requestFilterId || jobFilterId);
+  const focusJobId = jobFilterId ?? (filteredJobs[0]?.id ?? null);
 
   return (
     <View style={styles.fill}>
@@ -78,14 +111,36 @@ export function JobsPane({
         <View
           style={[styles.jobsListPane, { borderColor: theme.border, backgroundColor: theme.panel }]}
         >
-          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
-            Queue Activity
-          </Text>
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+              Queue Activity
+            </Text>
+            {hasFilter && onClearFilter ? (
+              <Pressable
+                style={[
+                  styles.clearFilterButton,
+                  { borderColor: theme.border, backgroundColor: theme.panelAlt },
+                ]}
+                onPress={onClearFilter}
+              >
+                <Text
+                  style={[styles.clearFilterLabel, { color: theme.accent, fontFamily: theme.fontSans }]}
+                >
+                  Clear Filter
+                </Text>
+              </Pressable>
+            ) : null}
+          </View>
+          {hasFilter ? (
+            <Text style={[styles.filterMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+              request {requestFilterId?.slice(0, 8) ?? "--"} | job {jobFilterId?.slice(0, 8) ?? "--"}
+            </Text>
+          ) : null}
           {recentJobs.length === 0 ? (
             <Text
               style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
             >
-              No job rows yet.
+              {hasFilter ? "No jobs matched the selected request/job." : "No job rows yet."}
             </Text>
           ) : (
             <FlatList
@@ -169,14 +224,14 @@ export function JobsPane({
             />
           )}
 
-          {completions.length > 0 ? (
+          {visibleCompletions.length > 0 ? (
             <View style={styles.completionStrip}>
               <Text
                 style={[styles.subSectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}
               >
                 Recent Completions
               </Text>
-              {completions.slice(0, 16).map((completion) => {
+              {visibleCompletions.slice(0, 16).map((completion) => {
                 const color = statusColor(theme, completion.status);
                 return (
                   <View
@@ -234,6 +289,7 @@ export function JobsPane({
                 fontSans: theme.fontSans,
                 fontMono: theme.fontMono,
               }}
+              focusJobId={focusJobId}
             />
           </View>
         </View>
@@ -276,10 +332,33 @@ const styles = StyleSheet.create({
     minHeight: 260,
   },
   tracePanelBody: { flex: 1, minHeight: 260 },
+  sectionHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
   sectionTitle: {
     fontSize: 16,
     fontWeight: "700",
     marginBottom: 8,
+  },
+  filterMeta: {
+    fontSize: 11,
+    marginBottom: 8,
+  },
+  clearFilterButton: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    marginBottom: 8,
+    marginLeft: 8,
+  },
+  clearFilterLabel: {
+    fontSize: 10,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.2,
   },
   subSectionTitle: {
     fontSize: 13,
