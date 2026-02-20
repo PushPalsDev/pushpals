@@ -40,6 +40,21 @@ Each queue has typed statuses (`pending`, `claimed`, `completed`, `failed`, etc.
 
 Jobs claimed by dead workers can be recovered through stale-claim sweeps.
 
+## Endpoint Families
+
+Server endpoints are easiest to reason about by family:
+
+- Session/event transport:
+  - session create, SSE/WS stream, command/message ingress.
+- Request queue:
+  - enqueue, claim, complete/fail, list/snapshot.
+- Job queue:
+  - enqueue, claim, log, complete/fail, worker heartbeat.
+- Completion queue:
+  - enqueue, claim, processed/failed state updates.
+- Autonomy:
+  - snapshot/objective state, lock lifecycle, replay payload storage.
+
 ## Request Queue Model
 
 Requests support:
@@ -69,6 +84,16 @@ Completions are the handoff from execution to integration:
 - commit SHA + branch,
 - optional worker-supplied PR metadata,
 - process state (`pending`, `claimed`, `processed`, `failed`).
+
+## On-Call Debug Checklist
+
+When a workflow appears stuck:
+
+1. Check request queue pending/claimed counts.
+2. Check job queue pending/claimed counts and worker heartbeat recency.
+3. Check completion queue pending/claimed counts.
+4. Check latest session cursor and whether new events are still being persisted.
+5. Check stale-claim recovery logs for automatic handback behavior.
 
 ## Tradeoffs
 

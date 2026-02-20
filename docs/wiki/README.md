@@ -38,3 +38,25 @@ PushPals is intentionally split into small services with strict boundaries:
 - User surfaces stay thin (`apps/client`, `apps/vscode-client`).
 
 This separation increases observability and recoverability, at the cost of higher orchestration complexity.
+
+## Documentation Quality Bar
+
+Each component page should answer, at minimum:
+
+- What this component owns.
+- What it explicitly does not own.
+- How data enters and leaves it.
+- What breaks most often.
+- How to debug it quickly.
+- What tradeoffs we accepted.
+- What improvements are next.
+
+## How To Use This Wiki While Coding
+
+- Before editing a component:
+  - read that component page end-to-end.
+- While implementing:
+  - keep open the related architecture and config pages.
+- Before opening a PR:
+  - confirm docs still match behavior.
+  - update the component page if ownership or flow changed.

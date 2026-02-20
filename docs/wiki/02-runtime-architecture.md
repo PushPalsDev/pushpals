@@ -13,6 +13,17 @@ At runtime, a typical interactive request flows like this:
 7. SourceControlManager claims completion and integrates it.
 8. Server emits session events over SSE/WS so UI can render the full lifecycle.
 
+## Flow Boundaries
+
+Three boundaries matter most during design and debugging:
+
+- Planning boundary:
+  - LocalBuddy/RemoteBuddy decide what should be done.
+- Execution boundary:
+  - WorkerPals decides how planned work is executed.
+- Integration boundary:
+  - SourceControlManager decides whether and how execution output lands on integration branch.
+
 ## Control Plane and Data Plane Split
 
 - Control plane: `apps/server`
@@ -40,6 +51,19 @@ Important design detail:
 
 This guarantees replay correctness after crashes or reconnects.
 
+## Failure Domains
+
+- If `apps/client` fails:
+  - request/job pipelines still run; only user visibility is reduced.
+- If `apps/remotebuddy` fails:
+  - requests accumulate; workers continue current claimed jobs.
+- If `apps/workerpals` fails:
+  - jobs remain pending/claimed until recovery sweeps and worker return.
+- If `apps/source_control_manager` fails:
+  - completions accumulate pending integration.
+- If `apps/server` fails:
+  - control plane is unavailable; all components degrade until restart.
+
 ## Session Transport
 
 Two transport options are supported:
@@ -58,6 +82,15 @@ Both requests and jobs support priority tiers:
 - `background`
 
 Ordering is priority first, then age. Queue stats and SLO summaries are computed from persisted timestamps.
+
+## Correlation and Traceability
+
+To trace one unit of work end-to-end, follow:
+
+- `requestId` (request lifecycle),
+- `jobId` (execution lifecycle),
+- `completionId` (integration lifecycle),
+- `sessionId` and event cursor (user-visible timeline).
 
 ## Reliability Patterns Used
 
@@ -80,6 +113,15 @@ Cons:
 - operational complexity for local development,
 - more infrastructure code compared to direct single-agent execution,
 - requires disciplined schema/version management across components.
+
+## Safe Change Checklist
+
+When modifying runtime flow:
+
+1. Confirm queue status transitions still form a valid state machine.
+2. Confirm session events remain replay-safe.
+3. Confirm idempotency behavior on reconnect/restart.
+4. Update the corresponding component wiki pages.
 
 ## Future Improvements
 

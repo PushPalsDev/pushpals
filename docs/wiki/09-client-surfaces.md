@@ -31,6 +31,13 @@ PushPals has two user surfaces with different strengths:
 - Session stream drives real-time UI state.
 - Polling snapshots augment event stream for queue/system summaries.
 
+### Developer Workflow
+
+- Start stack (`bun run start`) then open web client.
+- Use Coordination tab for pipeline state.
+- Use Chat tab to submit prompts and route remote work.
+- Use Requests/Jobs/System tabs for queue and service diagnostics.
+
 ### Tradeoffs
 
 Pros:
@@ -67,6 +74,12 @@ Cons:
 - Optional include of SourceControlManager in startup profile.
 - Workspace trust gating for stack operations.
 
+### Startup Preconditions
+
+- Workspace root must be the PushPals repo.
+- Required local config files must exist (`.env`, `config/local.toml`).
+- Bun and Docker must be available for stack orchestration.
+
 ### Notable Engineering Detail
 
 The extension scripts use `bunx tsc` / `bunx @vscode/vsce` instead of raw `tsc`/`vsce` binaries so package/lint commands work in environments without global installs.
@@ -82,6 +95,15 @@ Cons:
 
 - process orchestration complexity in extension host,
 - platform-specific process shutdown edge cases (especially Windows).
+
+### Troubleshooting Quick Hits
+
+- `tsc` not found while packaging:
+  - use extension scripts that call `bunx tsc`.
+- Stack start fails in extension:
+  - inspect extension output channel preflight logs.
+- Client panel disconnected:
+  - verify `pushpals.serverUrl` and server runtime status.
 
 ### Future Improvements
 

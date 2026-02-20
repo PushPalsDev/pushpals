@@ -29,6 +29,18 @@ Main responsibilities:
   - jobs run in isolated containers with worktree mounting.
   - warm container model reduces repeated startup overhead.
 
+## Job Lifecycle
+
+At a high level:
+
+1. Worker claims job.
+2. Isolated worktree is created.
+3. Backend executor runs task.
+4. Logs stream to server as job logs.
+5. Job result is reported complete/fail.
+6. Commit metadata is enqueued as completion when applicable.
+7. Worktree is cleaned up.
+
 ## Why Worktree Isolation Matters
 
 Each job runs in an isolated git worktree to avoid cross-job contamination.
@@ -47,6 +59,15 @@ This provides:
 - validation-step execution support,
 - optional critic/revision loops (backend-specific),
 - output compaction and structured result handling.
+
+## Operational Failure Patterns
+
+- Backend output parse errors:
+  - usually schema/format mismatch in executor output.
+- Docker warm container issues:
+  - usually image/tooling/network precondition failures.
+- Repeated timeouts:
+  - usually budget mismatch or backend model/tool slowness.
 
 ## Backend Abstraction
 
@@ -72,6 +93,13 @@ Cons:
 - Docker mode adds startup and tooling requirements,
 - backend diversity increases complexity and test matrix size,
 - execution wrappers are operationally heavy.
+
+## Debugging Checklist
+
+1. Confirm worker heartbeat recency.
+2. Confirm claimed job state transitions and job logs.
+3. Confirm executor backend and timeout config in effective runtime config.
+4. Confirm Docker image and warm-container health when in Docker mode.
 
 ## Future Improvements
 

@@ -23,6 +23,20 @@ This is the main abstraction boundary that prevents downstream code churn when c
 5. CLI flags
    - final runtime overrides for service entrypoints.
 
+## Env vs TOML Decision Rule
+
+Use TOML for:
+
+- non-secret runtime behavior,
+- policy and timeout knobs,
+- stable defaults that should be versioned.
+
+Use `.env` for:
+
+- secrets and tokens,
+- deployment-specific endpoints,
+- CI/runtime wiring that should not be committed.
+
 ## Why This Design Works
 
 The loader in `packages/shared/src/config.ts` centralizes:
@@ -34,6 +48,15 @@ The loader in `packages/shared/src/config.ts` centralizes:
 - path resolution to project root.
 
 Downstream services consume one typed `PushPalsConfig` shape instead of manually reading env values.
+
+## Migration Pattern (Env <-> TOML)
+
+When moving a setting between env and TOML:
+
+1. Update `packages/shared/src/config.ts` first.
+2. Keep backward-compatible fallback reads during migration window.
+3. Update `.env.example` and `config/local.example.toml` guidance.
+4. Remove old read paths only after all callers use the unified typed field.
 
 ## Operationally Important Knobs
 
@@ -59,6 +82,15 @@ Keep secrets out of TOML and in `.env` or secret stores:
 - git/github tokens.
 
 The repository templates (`.env.example`, `config/local.example.toml`) are intentionally non-secret.
+
+## Common Misconfiguration Symptoms
+
+- Wrong LLM backend/endpoint:
+  - services boot but generation fails at runtime.
+- Missing `config/local.toml` or `.env`:
+  - startup preflight fails.
+- Branch/base mismatch in integration config:
+  - SourceControlManager push/merge behavior appears inconsistent.
 
 ## Tradeoffs
 

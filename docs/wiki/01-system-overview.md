@@ -61,6 +61,22 @@ Costs:
 - more moving parts to reason about,
 - stricter requirements on idempotency and correlation IDs.
 
+## System Invariants
+
+These assumptions should remain true unless we intentionally redesign the platform:
+
+- Requests and jobs are queue-mediated, not direct ad-hoc calls.
+- Event history is replayable for session recovery.
+- Execution and integration are separate responsibilities.
+- Write scope is bounded by planning/policy metadata.
+- Human-guided and autonomous flows converge into the same control plane.
+
+## Explicit Non-Goals
+
+- Not a zero-setup SaaS product; local infrastructure is expected.
+- Not a single-agent monolith optimized only for speed.
+- Not a free-form autonomous executor without policy gates.
+
 ## What "Good" Looks Like In This Codebase
 
 - Deterministic contracts where possible (`protocol`, JSON schemas, typed queues).
@@ -81,6 +97,17 @@ Cons:
 - steeper onboarding than a single-process assistant,
 - more configuration surface area,
 - higher complexity in local startup and integration workflows.
+
+## Quick Debug Map
+
+- "UI is stale or missing history":
+  - inspect session event cursor behavior first.
+- "Job finished but code did not integrate":
+  - inspect completion queue and SourceControlManager logs.
+- "Planner output is inconsistent":
+  - inspect RemoteBuddy planner schema handling and fallback path.
+- "Autonomy did nothing":
+  - inspect lock, cooldown, policy, and budget constraints.
 
 ## Future Improvements
 

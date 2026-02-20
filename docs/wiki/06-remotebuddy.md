@@ -38,6 +38,17 @@ The planner targets strict structured output:
 
 RemoteBuddy includes repair and fallback behavior for malformed model output, then applies safety sanitization.
 
+## Request Lifecycle In RemoteBuddy
+
+For each claimed request, RemoteBuddy typically:
+
+1. Reads request metadata and routing hints.
+2. Generates structured plan output.
+3. Normalizes/sanitizes plan (intent, lane, scope, messages).
+4. Emits user-facing assistant status/messages.
+5. Enqueues worker job when `requires_worker=true`.
+6. Marks request complete/fail with traceable metadata.
+
 ## Scope and Path Safety
 
 `path_targeting.ts` and shared policy utils normalize:
@@ -63,6 +74,16 @@ Autonomy is implemented as a bounded control loop:
 
 Policy/budget/cooldown constraints are first-class.
 
+## Autonomy Safety Gates
+
+Autonomy dispatch is blocked when any of the following fail:
+
+- lock acquisition/renewal,
+- snapshot freshness and repo preflight checks,
+- policy checks (risk/breadth/objective constraints),
+- confidence and dispatch budget constraints,
+- scope invariants for target paths and write globs.
+
 ## Tradeoffs
 
 Pros:
@@ -76,6 +97,15 @@ Cons:
 - planning object is rich and can be intimidating to modify,
 - orchestration code path is long,
 - autonomous mode introduces additional state/locking complexity.
+
+## Debugging Checklist
+
+- "Request never dispatched to worker":
+  - inspect `requires_worker`, lane, and scope normalization output.
+- "Autonomy loop runs but dispatches nothing":
+  - inspect cooldown, confidence threshold, and per-hour dispatch budget.
+- "Planner appears flaky":
+  - inspect schema repair/fallback behavior and provider output shape.
 
 ## Future Improvements
 

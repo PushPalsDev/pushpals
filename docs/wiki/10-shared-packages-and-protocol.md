@@ -37,6 +37,15 @@ Key modules:
 - `packages/shared/src/prompts.ts`
   - prompt template loading.
 
+## Ownership Rule of Thumb
+
+- Put code in `packages/shared` only if:
+  - at least two apps need it,
+  - behavior must stay consistent across those apps,
+  - the abstraction can be tested independently.
+
+Otherwise keep it local to the owning app.
+
 ## Why This Split Is Important
 
 Without shared packages:
@@ -63,6 +72,15 @@ Cons:
 
 - shared packages can become dumping grounds if not curated,
 - backward compatibility concerns can slow refactors.
+
+## Safe Change Checklist
+
+When changing shared exports:
+
+1. Update type contracts first.
+2. Confirm all importing apps still compile.
+3. Validate runtime behavior in at least one end-to-end flow.
+4. Document any migration/deprecation in wiki and templates.
 
 ## Future Improvements
 

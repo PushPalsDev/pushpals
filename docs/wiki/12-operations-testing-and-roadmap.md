@@ -19,6 +19,20 @@ Useful alternatives:
 - `bun run dev:full` for direct multi-service launch.
 - individual `*:only` scripts for targeted debugging.
 
+## Fast Runbook Commands
+
+- Full stack with preflights:
+  - `bun run start`
+- Full stack without preflight wrapper:
+  - `bun run dev:full`
+- Integration harness:
+  - `bun run test:integration`
+- Eval harness:
+  - `bun run test:integration:eval`
+- VS Code extension package/lint:
+  - `bun run vscode:client:lint`
+  - `bun run vscode:client:package`
+
 ## Local Environment Expectations
 
 Baseline tooling:
@@ -40,6 +54,16 @@ Where to look first:
 For session behavior:
 
 - inspect event stream (`/sessions/:id/events` with cursor replay semantics).
+
+## Incident Triage Order
+
+When the system is "stuck", diagnose in this order:
+
+1. Server health and session event progression.
+2. Request queue movement.
+3. Job queue movement and worker heartbeat.
+4. Completion queue movement and SCM processing.
+5. Client transport/reconnect state.
 
 ## Testing Layers
 

@@ -33,6 +33,15 @@ PushPals prioritizes strict structured outputs for orchestration layers:
 
 Reason: orchestration should fail soft with explicit structure, not silently continue on ambiguous text.
 
+## Prompt Change Workflow
+
+When editing prompts:
+
+1. Keep output contract requirements explicit.
+2. Prefer additive constraints over broad rewrites.
+3. Validate against integration/eval scenarios that touch affected components.
+4. Update related wiki sections when behavior intent changes.
+
 ## Safety and Scope Controls
 
 Safety is implemented as layered controls:
@@ -42,6 +51,15 @@ Safety is implemented as layered controls:
 - write limits (`max_files_to_edit`) and lane enforcement,
 - execution isolation (worktrees, Docker mode),
 - downstream integration gating in SourceControlManager.
+
+## Common Failure Modes
+
+- Model returns prose instead of required JSON:
+  - rely on repair path/fallback and tighten prompt contract.
+- Over-broad path suggestions:
+  - enforce scope invariants and target/write alignment.
+- Provider behavior drift:
+  - run eval suites and compare quality metrics before rollout.
 
 ## Tradeoffs
 

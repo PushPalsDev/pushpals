@@ -31,6 +31,15 @@ When a message arrives, LocalBuddy decides:
 
 It also supports explicit routing via `/ask_remote_buddy ...`.
 
+## Routing Heuristics (Conceptual)
+
+- Lightweight and status/read-only prompts:
+  - prefer local response path.
+- Explicit execution prompts or `/ask_remote_buddy`:
+  - force RemoteBuddy enqueue path.
+- Ambiguous prompts:
+  - bias toward safe local clarification or explicit routing prompt.
+
 ## Why This Layer Exists
 
 Without LocalBuddy, every user interaction would hit deep orchestration paths, increasing latency and noise.
@@ -46,6 +55,14 @@ LocalBuddy provides:
 - Prompt sanitization for local LLM replies.
 - Fallback reply behavior when structured output is malformed.
 - Lightweight failure summarization for user-visible status.
+
+## Safe Change Guidance
+
+When editing LocalBuddy:
+
+1. Preserve explicit `/ask_remote_buddy` override behavior.
+2. Keep local-reply fallbacks deterministic for malformed model output.
+3. Avoid adding hidden routing side effects that bypass request queue visibility.
 
 ## Tradeoffs
 

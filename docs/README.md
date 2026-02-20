@@ -19,3 +19,9 @@ This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base
 - `docs/wiki/10-shared-packages-and-protocol.md` - `packages/shared` and `packages/protocol`
 - `docs/wiki/11-prompts-llm-and-safety.md` - Prompting strategy, structured outputs, and guardrails
 - `docs/wiki/12-operations-testing-and-roadmap.md` - Startup, operations, testing, and future roadmap
+
+## Maintenance Notes
+
+- Keep component ownership docs aligned with code changes.
+- Prefer updating the relevant wiki page in the same PR as behavioral changes.
+- Treat these docs as operational references, not marketing copy.

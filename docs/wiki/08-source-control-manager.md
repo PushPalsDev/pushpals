@@ -31,6 +31,17 @@ For each claimed completion:
 7. Optionally create/reuse PR.
 8. Mark completion processed or failed.
 
+## Merge Strategy Notes
+
+- `cherry-pick`:
+  - best when worker output should be applied as discrete commits.
+- `no-ff`:
+  - best when preserving merge topology is valuable.
+- `ff-only`:
+  - strictest linear-history mode, best for clean branch discipline.
+
+Choose strategy based on repository governance, not personal preference.
+
 ## Why Separate SCM Exists
 
 Separating integration from execution gives:
@@ -46,6 +57,14 @@ Separating integration from execution gives:
 - Requeue logic on transient race conditions (e.g., branch advanced).
 - Skip/fail policies after max attempts.
 - Optional clean-repo guard.
+
+## Debugging Checklist
+
+1. Confirm completion was claimed from server queue.
+2. Confirm remote refs were fetched and expected branch exists.
+3. Confirm apply step result (merge/cherry-pick/ff-only).
+4. Confirm check-command outcomes and retry state.
+5. Confirm push and optional PR creation logs.
 
 ## Tradeoffs
 
