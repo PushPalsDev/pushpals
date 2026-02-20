@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { ReviewAgent, type ReviewAgentConfig } from "../apps/source_control_manager/src/review_agent";
+import { resolve } from "path";
+import {
+  ReviewAgent,
+  resolveCodexCmd,
+  resolveReviewerMdPath,
+  type ReviewAgentConfig,
+} from "../apps/source_control_manager/src/review_agent";
 import type { GitHubPR } from "../apps/source_control_manager/src/github_pr";
 
 const baseConfig: ReviewAgentConfig = {
@@ -43,6 +49,26 @@ const silentLogs = {
 };
 
 describe("ReviewAgent", () => {
+  test("resolves reviewer markdown path from workspace root", () => {
+    const workspaceRoot = resolve(import.meta.dir, "..");
+    const reviewerPath = resolveReviewerMdPath("prompts/review_agent/reviewer.md", {
+      workspaceRoot,
+      cwd: resolve(workspaceRoot, "apps/source_control_manager"),
+    });
+    expect(reviewerPath).toBe(resolve(workspaceRoot, "prompts/review_agent/reviewer.md"));
+  });
+
+  test("normalizes bun and bunx codex commands to current Bun executable", () => {
+    const bunExec = process.execPath;
+    const bunCmd = resolveCodexCmd("bun x --yes @openai/codex");
+    expect(bunCmd[0]).toBe(bunExec);
+    expect(bunCmd.slice(1)).toEqual(["x", "--yes", "@openai/codex"]);
+
+    const bunxCmd = resolveCodexCmd("bunx --yes @openai/codex");
+    expect(bunxCmd[0]).toBe(bunExec);
+    expect(bunxCmd.slice(1)).toEqual(["x", "--yes", "@openai/codex"]);
+  });
+
   test("poll uses configured PR base branch", async () => {
     let capturedBase = "";
 

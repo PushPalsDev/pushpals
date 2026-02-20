@@ -1216,13 +1216,82 @@ function buildImplementationPoints(kind: string, params?: Record<string, unknown
   if (targets.length === 0) return "";
 
   for (const target of targets.slice(0, 5)) {
-    lines.push(`- Updated path: ${sanitizeCommitValue(target, 220)}.`);
+    lines.push(`- updated path: ${sanitizeCommitValue(target, 220)}`);
   }
   if (targets.length > 5) {
-    lines.push(`- Updated path: +${targets.length - 5} additional file(s).`);
+    lines.push(`- updated path: +${targets.length - 5} additional file(s)`);
   }
 
   return lines.join("\n");
+}
+
+function parseBooleanFlag(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function toNonEmptyStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => sanitizeCommitValue(entry, 240))
+    .filter((entry) => entry.length > 0);
+}
+
+function buildCommitTestsBlock(params?: Record<string, unknown>): string {
+  const planning =
+    params && typeof params.planning === "object" && !Array.isArray(params.planning)
+      ? (params.planning as Record<string, unknown>)
+      : undefined;
+
+  const candidates = [
+    ...toNonEmptyStringArray(params?.validationSteps),
+    ...toNonEmptyStringArray(params?.validation_steps),
+    ...toNonEmptyStringArray(planning?.validationSteps),
+    ...toNonEmptyStringArray(planning?.validation_steps),
+  ];
+
+  const seen = new Set<string>();
+  const unique = candidates.filter((entry) => {
+    if (seen.has(entry)) return false;
+    seen.add(entry);
+    return true;
+  });
+
+  if (unique.length === 0) return "- not run (not provided)";
+  return unique.map((entry) => `- ${entry}`).join("\n");
+}
+
+function shouldIncludeCommitMeta(params?: Record<string, unknown>): boolean {
+  return (
+    parseBooleanFlag(params?.commitIncludeMeta) ||
+    parseBooleanFlag(params?.includeCommitMeta) ||
+    parseBooleanFlag(params?.commit_meta)
+  );
+}
+
+function buildCommitMetaBlock(
+  kind: string,
+  params: Record<string, unknown> | undefined,
+  replacements: {
+    worker_id: string;
+    task_id: string;
+    job_id: string;
+    context: string;
+    session_line: string;
+  },
+): string {
+  const lines = [
+    "Meta:",
+    `- scope: ${sanitizeCommitValue(summarizeScope(kind, params), 220)}`,
+    `- job kind: ${sanitizeCommitValue(kind, 64)}`,
+    `- traceability: worker ${replacements.worker_id}, task ${replacements.task_id}, job ${replacements.job_id}`,
+    `- execution context: ${replacements.context}`,
+  ];
+  if (replacements.session_line) lines.push(replacements.session_line);
+  return `\n\n${lines.join("\n")}`;
 }
 
 function summarizeJobAction(kind: string, params?: Record<string, unknown>): string {
@@ -1285,24 +1354,32 @@ function buildWorkerCommitMessage(
     worker_id: sanitizeCommitValue(workerId, 64),
     task_id: sanitizeCommitValue(job.taskId, 128),
     job_id: sanitizeCommitValue(job.id, 128),
-    job_kind: sanitizeCommitValue(job.kind, 64),
     action: sanitizeCommitValue(action, 180),
-    scope: sanitizeCommitValue(summarizeScope(job.kind, job.params), 220),
     context: contextValue || "host",
-    session_line: sessionValue ? `- Session: ${sessionValue}.` : "",
-    implementation_points: buildImplementationPoints(job.kind, job.params),
+    session_line: sessionValue ? `- session: ${sessionValue}` : "",
+    implementation_points: "",
+    tests_block: "",
+    meta_block: "",
   };
 
+  const implementationPoints = buildImplementationPoints(job.kind, job.params);
+  replacements.implementation_points =
+    implementationPoints || `- ${sanitizeCommitValue(action, 220) || "apply requested repository update"}`;
+  replacements.tests_block = buildCommitTestsBlock(job.params);
+  replacements.meta_block = shouldIncludeCommitMeta(job.params)
+    ? buildCommitMetaBlock(job.kind, job.params, replacements)
+    : "";
+
   const deterministicFallback = () => {
-    const fallbackLines = [
+    const fallbackLines: string[] = [
       `${replacements.type}(${replacements.area}): ${replacements.summary}`,
       "",
-      `- Implementation: ${replacements.action}.`,
-      `- Scope: ${sanitizeCommitValue(summarizeScope(job.kind, job.params), 220)}.`,
-      `- Traceability: worker:${replacements.worker_id}, task ${replacements.task_id}, job ${replacements.job_id}.`,
-      `- Execution context: ${replacements.context}.`,
+      replacements.implementation_points,
+      "",
+      "Tests:",
+      replacements.tests_block,
     ];
-    if (replacements.session_line) fallbackLines.push(replacements.session_line);
+    if (replacements.meta_block) fallbackLines.push(replacements.meta_block);
     return fallbackLines.join("\n");
   };
 

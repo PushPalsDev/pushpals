@@ -1,6 +1,6 @@
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
-import { join, resolve } from "path";
+import { basename, isAbsolute, join, resolve } from "path";
 import {
   addPullRequestComment,
   getPullRequestDiff,
@@ -45,6 +45,7 @@ interface ReviewAgentDeps {
 const MAX_DIFF_BYTES = 150_000;
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
+const DEFAULT_WORKSPACE_ROOT = resolve(import.meta.dir, "..", "..", "..");
 
 const ts = () => new Date().toISOString();
 
@@ -61,10 +62,104 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   logError: (line) => console.error(line),
 };
 
-function resolveCodexCmd(codexBin: string): string[] {
-  const trimmed = codexBin.trim();
-  if (!trimmed) return ["bun", "x", "--yes", "@openai/codex"];
-  return trimmed.split(/\s+/);
+function splitArgs(raw: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const ch of raw.trim()) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        out.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += "\\";
+  if (current.length > 0) out.push(current);
+  return out;
+}
+
+function currentBunExecPath(): string {
+  const execPath = (process.execPath ?? "").trim();
+  if (!execPath) return "";
+  const leaf = basename(execPath).toLowerCase();
+  if (leaf === "bun" || leaf === "bun.exe") return execPath;
+  return "";
+}
+
+export function resolveCodexCmd(codexBin: string): string[] {
+  const bunExec = currentBunExecPath();
+  const overrideParts = splitArgs(codexBin);
+  const parts =
+    overrideParts.length > 0
+      ? overrideParts
+      : bunExec
+        ? [bunExec, "x", "--yes", "@openai/codex"]
+        : ["bun", "x", "--yes", "@openai/codex"];
+
+  const first = (parts[0] ?? "").trim().toLowerCase();
+  if (!first) return parts;
+  if (first === "bunx" && bunExec) {
+    return [bunExec, "x", ...parts.slice(1)];
+  }
+  if (first === "bun" && bunExec) {
+    return [bunExec, ...parts.slice(1)];
+  }
+  return parts;
+}
+
+export function resolveReviewerMdPath(
+  reviewerMdPath: string,
+  options?: { workspaceRoot?: string; cwd?: string },
+): string {
+  const raw = reviewerMdPath.trim();
+  if (!raw) return "";
+
+  const workspaceRoot = resolve(options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
+  const cwd = resolve(options?.cwd || process.cwd());
+  if (isAbsolute(raw)) return raw;
+
+  const candidates = new Set<string>();
+  candidates.add(resolve(workspaceRoot, raw));
+  candidates.add(resolve(cwd, raw));
+
+  let cursor = cwd;
+  for (let i = 0; i < 6; i += 1) {
+    const parent = resolve(cursor, "..");
+    if (parent === cursor) break;
+    candidates.add(resolve(parent, raw));
+    cursor = parent;
+  }
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  return resolve(workspaceRoot, raw);
 }
 
 export function buildCodexEnv(config: ReviewAgentConfig): Record<string, string> {
@@ -267,12 +362,12 @@ export class ReviewAgent {
     if (this.reviewerMd) return this.reviewerMd;
 
     try {
-      const mdPath = resolve(this.config.reviewerMdPath);
+      const mdPath = resolveReviewerMdPath(this.config.reviewerMdPath);
       this.reviewerMd = readFileSync(mdPath, "utf-8");
       return this.reviewerMd;
     } catch (err: any) {
       this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] Could not load reviewer.md from ${this.config.reviewerMdPath}: ${err?.message ?? err}`,
+        `[${ts()}] [ReviewAgent] Could not load reviewer.md from ${this.config.reviewerMdPath} (cwd=${process.cwd()}): ${err?.message ?? err}`,
       );
       return "";
     }
