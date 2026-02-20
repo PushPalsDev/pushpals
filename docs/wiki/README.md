@@ -5,6 +5,9 @@ This wiki is written for two audiences:
 - New engineers who need a clear system mental model.
 - Maintainers who need precise operational and architectural details.
 
+This wiki is hopefully synced via:
+https://github.com/PushPalsDev/pushpals/actions/workflows/publish-wiki.yml
+
 ## Recommended Reading Paths
 
 ## Path A: New Engineer (first 60 minutes)
