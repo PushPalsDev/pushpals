@@ -117,7 +117,7 @@ class OpenAICodexRuntimeConfig:
             progress_log_interval_s=cfg.get_int(
                 env_names=("WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S",),
                 config_paths=("workerpals.openai_codex.progress_log_interval_s",),
-                default=15,
+                default=30,
             ),
             reasoning_effort=cfg.get_str(
                 env_names=("WORKERPALS_LLM_REASONING_EFFORT", "WORKERPALS_OPENAI_CODEX_REASONING_EFFORT"),
@@ -264,9 +264,9 @@ def _resolve_reasoning_effort(config: OpenAICodexRuntimeConfig) -> str:
 
 
 def _resolve_progress_log_interval_seconds(config: OpenAICodexRuntimeConfig) -> int:
-    interval = to_int(config.progress_log_interval_s, 15)
-    # Avoid noisy logs (<5s) and stale logs (>120s).
-    return max(5, min(120, interval))
+    interval = to_int(config.progress_log_interval_s, 30)
+    # Avoid noisy logs (<30s) and stale logs (>120s).
+    return max(30, min(120, interval))
 
 
 def _normalize_auth_mode(raw: str) -> str:

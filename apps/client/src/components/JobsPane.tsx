@@ -32,6 +32,27 @@ function parseJobParamsRequestId(params: string): string | null {
   }
 }
 
+function parseIsoMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function deriveJobElapsedMs(job: JobSnapshotRow): number | null {
+  if (typeof job.durationMs === "number" && Number.isFinite(job.durationMs) && job.durationMs >= 0) {
+    return Math.floor(job.durationMs);
+  }
+
+  const end =
+    parseIsoMs(job.completedAt) ??
+    parseIsoMs(job.failedAt) ??
+    (job.status === "completed" || job.status === "failed" ? parseIsoMs(job.updatedAt) : null);
+  const start =
+    parseIsoMs(job.startedAt) ?? parseIsoMs(job.claimedAt) ?? parseIsoMs(job.enqueuedAt);
+  if (start == null || end == null || end < start) return null;
+  return end - start;
+}
+
 export function JobsPane({
   theme,
   isWide,
@@ -150,6 +171,7 @@ export function JobsPane({
                 const color = statusColor(theme, item.status);
                 const queueMeta = pendingById.get(item.id);
                 const priority = item.priority ?? "normal";
+                const elapsedMs = deriveJobElapsedMs(item);
                 const phaseBits = [
                   item.enqueuedAt ? `enq ${prettyTs(item.enqueuedAt)}` : null,
                   item.claimedAt ? `claim ${prettyTs(item.claimedAt)}` : null,
@@ -158,13 +180,17 @@ export function JobsPane({
                   item.completedAt ? `done ${prettyTs(item.completedAt)}` : null,
                   item.failedAt ? `fail ${prettyTs(item.failedAt)}` : null,
                 ].filter(Boolean) as string[];
+                const isTerminal = item.status === "completed" || item.status === "failed";
+                if (isTerminal && elapsedMs != null) {
+                  phaseBits.push(`elapsed ${formatDuration(elapsedMs)}`);
+                }
                 const lifecycleSummary =
                   item.status === "pending" && queueMeta
                     ? `queue #${queueMeta.position} (eta ${formatEtaMs(queueMeta.etaMs)})`
                     : item.status === "claimed"
                       ? "running"
-                      : item.durationMs != null
-                        ? `elapsed ${formatDuration(item.durationMs)}`
+                      : elapsedMs != null
+                        ? `elapsed ${formatDuration(elapsedMs)}`
                         : "terminal";
 
                 return (
