@@ -13,10 +13,27 @@ Repository boundary policy:
 - Never plan edits or checks outside this repository root.
 - Prefer explicit repo-relative targets; use broad `"."` scope only when the user explicitly requests whole-repo work.
 
+Intent taxonomy (choose the single best fit):
+
+- `chat` — pure conversational exchange; no code, no repo access needed (e.g. "what is X?", "explain Y")
+- `status` — read-only query about repo state; no mutation (e.g. "what changed?", "show git log")
+- `code_change` — any request to create, modify, delete, add, implement, fix, test, or run code/files.
+  **Default to `code_change` when ANY action verb is present** (add, implement, fix, update, create, remove, test, run, build, configure, refactor, generate, improve, etc.) or when files/tests/configs are mentioned.
+- `analysis` — deep read-only analysis of existing code WITHOUT any mutation (e.g. "explain why this works", "review this function"). Only use when no changes are requested.
+- `other` — do NOT use `other` with `requires_worker=false`. `other` must always have `requires_worker=true`. When in doubt, prefer `code_change`.
+
+Classification rules (applied in order):
+1. Action verb present (add, fix, update, implement, create, remove, test, run, build, configure, refactor, improve, etc.) → `code_change` + `requires_worker=true`
+2. File/test/config/component reference + no explicit read-only ask → `code_change` + `requires_worker=true`
+3. Read-only analysis explicitly requested → `analysis` + `requires_worker=false`
+4. Status/git query → `status` + `requires_worker=false`
+5. Pure conversational → `chat` + `requires_worker=false`
+
 Execution policy:
 
 - `requires_worker=false` when the request is pure chat, simple status, or can be answered without repository mutation.
 - `requires_worker=true` when repository/file/test/build execution is required.
+- NEVER return `requires_worker=false` for requests containing action verbs — those always require a worker.
 - `job_kind` must be:
   - `none` when `requires_worker=false`
   - `task.execute` when `requires_worker=true`

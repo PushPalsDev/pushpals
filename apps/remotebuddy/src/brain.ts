@@ -247,8 +247,20 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
     throw new Error("planner output is not an object");
   }
   const record = raw as Record<string, unknown>;
-  const intent = asIntent(record.intent);
-  const requiresWorker = Boolean(record.requires_worker);
+  let intent = asIntent(record.intent);
+  let requiresWorker = Boolean(record.requires_worker);
+
+  // Safety override: LLM chose "other" (or "analysis") + requires_worker=false for what looks
+  // like a coding task. Upgrade to code_change + requires_worker=true rather than silently
+  // completing with no action.
+  if (!requiresWorker && (intent === "other" || intent === "analysis") && looksCodeChangeRequest(userText)) {
+    console.warn(
+      `[Brain] sanitize: upgraded intent "${intent}" → "code_change" (requires_worker=true) based on prompt heuristic`,
+    );
+    intent = "code_change";
+    requiresWorker = true;
+  }
+
   const lane = asLane(record.lane);
   const riskLevel = asRisk(record.risk_level);
   const scopeRecord =
@@ -335,9 +347,12 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
 function looksCodeChangeRequest(userText: string): boolean {
   const lower = userText.toLowerCase();
   return (
-    /\b(append|edit|update|modify|change|write|create|delete|rename|refactor|fix|patch)\b/.test(
+    /\b(add|append|implement|build|integrate|generate|setup|configure|improve|optimize|edit|update|modify|change|write|create|delete|remove|rename|refactor|fix|patch|test|run|apply|migrate|wire|hook|connect)\b/.test(
       lower,
-    ) || /\b(file|path|prompt|readme|config|test|ts|js|py|md)\b/.test(lower)
+    ) ||
+    /\b(file|path|prompt|readme|config|test|tests|spec|coverage|feature|function|class|module|component|ts|js|py|md|toml|json|yaml|yml)\b/.test(
+      lower,
+    )
   );
 }
 

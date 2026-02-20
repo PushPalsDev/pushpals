@@ -365,6 +365,16 @@ function isLikelyLocalOnlyPrompt(input: string): boolean {
     );
   if (executionCue) return false;
 
+  // Short affirmatives are replies to a prior RemoteBuddy question ("Should I implement this?")
+  // and should be forwarded there, not handled locally.
+  if (
+    /^(yes|confirm|confirmed|proceed|go ahead|go|do it|let'?s?(?: do it| go)?|sure|yep|yup|absolutely|approved?)[!. ]*$/.test(
+      text,
+    )
+  ) {
+    return false;
+  }
+
   return text.length <= 120;
 }
 
@@ -587,7 +597,7 @@ Respond in strict JSON with this shape:
   /**
    * Start the HTTP server
    */
-  startServer(port: number): void {
+  async startServer(port: number): Promise<void> {
     // Capture `this` context for use in fetch handler
     const agentId = this.agentId;
     const repo = this.repo;
@@ -721,10 +731,15 @@ Respond in strict JSON with this shape:
       process.once("SIGBREAK", stopMonitor);
     }
 
-    Bun.serve({
-      port,
-      hostname: "0.0.0.0",
-      idleTimeout: 120,
+    // Retry Bun.serve() on EADDRINUSE — can happen when Bun crashes and auto-restarts
+    // before the dying process has fully released the port.
+    const maxPortRetries = 8;
+    for (let portAttempt = 1; portAttempt <= maxPortRetries; portAttempt++) {
+      try {
+        Bun.serve({
+          port,
+          hostname: "0.0.0.0",
+          idleTimeout: 120,
 
       async fetch(req: Request): Promise<Response> {
         const url = new URL(req.url);
@@ -967,7 +982,20 @@ Respond in strict JSON with this shape:
 
         return makeJson({ ok: false, message: "Not found" }, 404);
       },
-    });
+        });
+        // Bun.serve() succeeded — exit the retry loop
+        break;
+      } catch (err: any) {
+        if (err?.code === "EADDRINUSE" && portAttempt < maxPortRetries) {
+          console.warn(
+            `[LocalBuddy] Port ${port} in use; retrying in 2000ms (attempt ${portAttempt}/${maxPortRetries})...`,
+          );
+          await Bun.sleep(2000);
+        } else {
+          throw err;
+        }
+      }
+    }
 
     console.log(`[LocalBuddy] HTTP server listening on http://0.0.0.0:${port}`);
     console.log(`[LocalBuddy] Ready to receive messages at POST http://localhost:${port}/message`);
@@ -1027,7 +1055,7 @@ async function main() {
     authToken: opts.authToken,
   });
 
-  agent.startServer(opts.port);
+  await agent.startServer(opts.port);
 }
 
 main().catch((err) => {
