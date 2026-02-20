@@ -25,6 +25,7 @@ interface TraceEntry {
   source: string;
   line: string;
   tone: TraceTone;
+  ts?: string;
 }
 
 export type TasksJobsLogsThemeMode = "light" | "dark";
@@ -128,6 +129,13 @@ function clampLine(raw: string): string {
   return `${raw.slice(0, MAX_TRACE_LINE_LENGTH - 3)}...`;
 }
 
+function formatLogTimestamp(ts: string | undefined): string {
+  if (!ts) return "";
+  const parsed = Date.parse(ts);
+  if (!Number.isFinite(parsed)) return "";
+  return new Date(parsed).toLocaleTimeString();
+}
+
 function toLines(raw: string): string[] {
   return raw
     .split(/\r?\n/)
@@ -165,6 +173,7 @@ function pushTraceEntry(
   source: string,
   line: string,
   tone: TraceTone,
+  ts?: string,
 ): void {
   const normalized = line.trim();
   if (!normalized) return;
@@ -176,6 +185,7 @@ function pushTraceEntry(
     source,
     line: normalized,
     tone,
+    ts,
   });
 }
 
@@ -259,12 +269,13 @@ function extractTrace(job: Job, logs: LogLine[]): TraceEntry[] {
       continue;
     }
 
-    appendTraceFromText(
+    pushTraceEntry(
       entries,
       seen,
       `log.${log.stream}`,
       line,
       classifyTraceTone(line, log.stream),
+      log.ts,
     );
   }
 
@@ -630,7 +641,7 @@ function JobRow({
                     style={[styles.traceLine, traceToneStyle(entry.tone, styles)]}
                     selectable
                   >
-                    [{entry.source}] {entry.line}
+                    {entry.ts ? `${formatLogTimestamp(entry.ts)} ` : ""}[{entry.source}] {entry.line}
                   </Text>
                 ))}
               </ScrollView>
@@ -659,6 +670,7 @@ function JobRow({
                         style={[styles.logLine, styles.logStdout]}
                         selectable
                       >
+                        {line.ts ? `${formatLogTimestamp(line.ts)} ` : ""}
                         {line.line}
                       </Text>
                     ))}
@@ -675,6 +687,7 @@ function JobRow({
                         style={[styles.logLine, styles.logStderr]}
                         selectable
                       >
+                        {line.ts ? `${formatLogTimestamp(line.ts)} ` : ""}
                         {line.line}
                       </Text>
                     ))}

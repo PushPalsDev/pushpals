@@ -511,7 +511,8 @@
             "jobId": { "type": "string" },
             "stream": { "type": "string", "enum": ["stdout", "stderr"] },
             "seq": { "type": "integer", "minimum": 1 },
-            "line": { "type": "string" }
+            "line": { "type": "string" },
+            "ts": { "type": "string" }
           },
           "additionalProperties": false
         }

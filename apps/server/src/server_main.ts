@@ -944,11 +944,12 @@ export function createRequestHandler() {
             : typeof body.line === "string"
               ? body.line
               : "";
+        const logTs = typeof body.ts === "string" ? body.ts.trim() : "";
         const trimmed = message.trim();
         if (!trimmed) {
           return makeJson({ ok: false, message: "message is required" }, 400);
         }
-        const logId = jobQueue.addLog(jobId, trimmed);
+        const logId = jobQueue.addLog(jobId, trimmed, logTs || undefined);
         return makeJson({ ok: true, jobId, logId }, 200);
       }
 

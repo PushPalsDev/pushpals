@@ -148,6 +148,15 @@ function parseIsoMs(value: string | null | undefined): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
+function coerceIsoTimestamp(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const ms = Date.parse(trimmed);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString();
+}
+
 function percentile(values: number[], p: number): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -1108,8 +1117,8 @@ export class JobQueue {
     };
   }
 
-  addLog(jobId: string, message: string): number | null {
-    const now = new Date().toISOString();
+  addLog(jobId: string, message: string, ts?: string): number | null {
+    const now = coerceIsoTimestamp(ts) ?? new Date().toISOString();
     let insertedId: number | null = null;
     const tx = this.db.transaction(() => {
       const insertInfo = this.db

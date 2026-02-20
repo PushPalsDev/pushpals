@@ -123,6 +123,7 @@ export interface EventTypePayloadMap {
     stream: "stdout" | "stderr";
     seq: number;
     line: string;
+    ts?: string;
   };
 
   /** System heartbeat / status beacon */

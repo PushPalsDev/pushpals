@@ -61,6 +61,7 @@ export interface LogLine {
   stream: "stdout" | "stderr";
   seq: number;
   line: string;
+  ts: string;
 }
 
 export interface SessionState {
@@ -389,6 +390,7 @@ export function eventReducer(state: SessionState, action: ReducerAction): Sessio
         stream,
         seq: rawSeq,
         line: (p.line as string) ?? "",
+        ts: (p.ts as string) || envelope.ts,
       };
 
       const logs = new Map(state.logs);

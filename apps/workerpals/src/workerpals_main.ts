@@ -838,19 +838,20 @@ async function workerLoop(
                 if (cleaned === lastCleanLog && now - lastCleanLogAt < 1_000) return;
                 lastCleanLog = cleaned;
                 lastCleanLogAt = now;
+                const logTs = new Date(now).toISOString();
 
                 const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
                 logChain = logChain.then(() =>
                   Promise.allSettled([
                     sendCommand(opts.server, job.sessionId, headers, {
                       type: "job_log",
-                      payload: { jobId: job.id, stream, seq, line: cleaned },
+                      payload: { jobId: job.id, stream, seq, line: cleaned, ts: logTs },
                       from: `worker:${opts.workerId}`,
                     }),
                     fetch(`${opts.server}/jobs/${job.id}/log`, {
                       method: "POST",
                       headers,
-                      body: JSON.stringify({ stream, seq, message: cleaned }),
+                      body: JSON.stringify({ stream, seq, message: cleaned, ts: logTs }),
                     }),
                   ]).then(() => undefined),
                 );

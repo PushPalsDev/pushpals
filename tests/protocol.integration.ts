@@ -577,6 +577,24 @@ test("Event type 'job_log' validates", () => {
   return validateEventEnvelope(event).ok === true;
 });
 
+test("Event type 'job_log' validates with per-line timestamp", () => {
+  const event: EventEnvelope<"job_log"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "job_log",
+    payload: {
+      jobId: randomUUID(),
+      stream: "stderr",
+      seq: 7,
+      line: "retrying in 2s",
+      ts: new Date().toISOString(),
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
 test("Event type 'job_log' rejects missing seq", () => {
   const event = {
     protocolVersion: PROTOCOL_VERSION,
