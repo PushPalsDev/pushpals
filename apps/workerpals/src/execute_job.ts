@@ -402,8 +402,22 @@ async function runDeterministicQualityGate(
       const runSummary = `[QualityGate] Quality gate validation ${run.ok ? "passed" : "failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
       onLog?.(run.ok ? "stdout" : "stderr", runSummary);
     }
-    if (validationRuns.every((run) => !run.ok)) {
+    // exit 127 = command not found: separate tool-availability issues from real test failures.
+    const notFoundRuns = validationRuns.filter((run) => run.exitCode === 127);
+    const executedRuns = validationRuns.filter((run) => run.exitCode !== 127);
+    if (notFoundRuns.length > 0) {
+      const cmds = notFoundRuns.map((run) => run.command).join(", ");
+      onLog?.(
+        "stderr",
+        `[QualityGate] Some validation commands not found (exit 127 — wrong tool?): ${cmds}. This project uses Bun: prefer "bun test".`,
+      );
+    }
+    if (executedRuns.length > 0 && executedRuns.every((run) => !run.ok)) {
       issues.push("Validation commands were executed but none passed.");
+    } else if (executedRuns.length === 0 && notFoundRuns.length > 0) {
+      issues.push(
+        'No validation command could be run (command not found). Use "bun test" or another available test runner.',
+      );
     }
     if (
       !validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))
