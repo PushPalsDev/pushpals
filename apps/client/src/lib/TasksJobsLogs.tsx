@@ -706,7 +706,7 @@ function OrphanJobs({
 }) {
   const orphanJobs = Array.from(jobs.values())
     .filter((job) => !taskJobIds.has(job.jobId))
-    .sort((a, b) => a.ts.localeCompare(b.ts));
+    .sort((a, b) => b.ts.localeCompare(a.ts));
   if (orphanJobs.length === 0) return null;
 
   return (
@@ -741,7 +741,7 @@ export function TasksJobsLogs({
   const palette = useMemo(() => paletteForMode(mode), [mode]);
   const styles = useMemo(() => createStyles(palette, theme), [palette, theme]);
 
-  const tasks = Array.from(state.tasks.values()).sort((a, b) => a.ts.localeCompare(b.ts));
+  const tasks = Array.from(state.tasks.values()).sort((a, b) => b.ts.localeCompare(a.ts));
   const taskJobIds = new Set<string>();
   for (const task of tasks) {
     for (const jobId of task.jobIds) taskJobIds.add(jobId);
