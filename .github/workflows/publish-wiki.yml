@@ -1,0 +1,52 @@
+name: Publish Wiki
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/wiki/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-wiki
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Checkout wiki repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki
+
+      - name: Sync docs/wiki -> wiki
+        run: |
+          rsync -av --delete docs/wiki/ wiki/
+
+          # Ensure a wiki homepage exists
+          if [ ! -f wiki/Home.md ]; then
+            if [ -f wiki/README.md ]; then
+              mv wiki/README.md wiki/Home.md
+            else
+              echo "# Home" > wiki/Home.md
+              echo "" >> wiki/Home.md
+              echo "Welcome to the PushPals wiki." >> wiki/Home.md
+            fi
+          fi
+
+      - name: Commit & push wiki
+        run: |
+          cd wiki
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git diff --cached --quiet || git commit -m "Sync wiki from docs/wiki"
+          git push
