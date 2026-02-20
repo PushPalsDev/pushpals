@@ -183,6 +183,11 @@ def _resolve_communicate_timeout_seconds() -> Optional[int]:
     explicit_s = _to_positive_int(explicit_s_raw)
     if explicit_s is not None:
         return explicit_s
+    # Top-level execution budget (e.g. openai_codex_timeout_ms = 1800000 in [workerpals])
+    # takes precedence over the more granular LLM/CLI-level timeout settings.
+    top_level_ms = _config_int("workerpals.openai_codex_timeout_ms", 0)
+    if top_level_ms > 0:
+        return max(1, top_level_ms // 1000)
     timeout_ms = _config_int("workerpals.llm.codex_timeout_ms", 0)
     if timeout_ms <= 0:
         timeout_ms = _config_int("workerpals.openai_codex.timeout_ms", 0)
@@ -566,9 +571,9 @@ def _run_codex_task(
             f'model_reasoning_effort="{reasoning_effort}"',
             "-a",
             approval,
+            "exec",
             "-s",
             sandbox,
-            "exec",
             "--color",
             color,
             "--output-last-message",
