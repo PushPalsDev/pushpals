@@ -71,6 +71,18 @@ export interface SourceControlManagerConfig {
   skipCleanCheck: boolean;
   /** Auto-create missing integration branch without prompt. */
   autoCreateMainBranch: boolean;
+  /** ReviewAgent configuration. */
+  reviewAgent: {
+    enabled: boolean;
+    pollIntervalMs: number;
+    reviewerMdPath: string;
+    passThreshold: number;
+    mergeMethod: "squash" | "merge" | "rebase";
+    codexBin: string;
+    codexAuthMode: string;
+    codexHomeDir: string;
+    codexTimeoutMs: number;
+  };
 }
 
 const PUSH_CONFIG = loadPushPalsConfig();
@@ -100,6 +112,7 @@ const DEFAULTS: SourceControlManagerConfig = {
   statusHeartbeatMs: PUSH_CONFIG.sourceControlManager.statusHeartbeatMs,
   skipCleanCheck: PUSH_CONFIG.sourceControlManager.skipCleanCheck,
   autoCreateMainBranch: PUSH_CONFIG.sourceControlManager.autoCreateMainBranch,
+  reviewAgent: PUSH_CONFIG.sourceControlManager.reviewAgent,
 };
 
 /**
@@ -113,7 +126,14 @@ export function loadConfig(configPath?: string): SourceControlManagerConfig {
     fileConfig = JSON.parse(raw) as Partial<SourceControlManagerConfig>;
   }
 
-  return { ...DEFAULTS, ...fileConfig };
+  return {
+    ...DEFAULTS,
+    ...fileConfig,
+    reviewAgent: {
+      ...DEFAULTS.reviewAgent,
+      ...(fileConfig.reviewAgent ?? {}),
+    },
+  };
 }
 
 /**
@@ -188,5 +208,42 @@ export function validateConfig(config: SourceControlManagerConfig): void {
   }
   if (typeof config.prBaseBranch !== "string" || config.prBaseBranch.length === 0) {
     throw new Error(`Invalid config: prBaseBranch must be a non-empty string`);
+  }
+  if (
+    typeof config.reviewAgent.pollIntervalMs !== "number" ||
+    !Number.isFinite(config.reviewAgent.pollIntervalMs) ||
+    config.reviewAgent.pollIntervalMs < 5_000
+  ) {
+    throw new Error(
+      `Invalid config: reviewAgent.pollIntervalMs must be >= 5000, got ${JSON.stringify(config.reviewAgent.pollIntervalMs)}`,
+    );
+  }
+  if (
+    typeof config.reviewAgent.passThreshold !== "number" ||
+    !Number.isFinite(config.reviewAgent.passThreshold) ||
+    config.reviewAgent.passThreshold < 1 ||
+    config.reviewAgent.passThreshold > 10
+  ) {
+    throw new Error(
+      `Invalid config: reviewAgent.passThreshold must be between 1 and 10, got ${JSON.stringify(config.reviewAgent.passThreshold)}`,
+    );
+  }
+  if (
+    config.reviewAgent.mergeMethod !== "squash" &&
+    config.reviewAgent.mergeMethod !== "merge" &&
+    config.reviewAgent.mergeMethod !== "rebase"
+  ) {
+    throw new Error(
+      `Invalid config: reviewAgent.mergeMethod must be \"squash\", \"merge\", or \"rebase\", got ${JSON.stringify(config.reviewAgent.mergeMethod)}`,
+    );
+  }
+  if (
+    typeof config.reviewAgent.codexTimeoutMs !== "number" ||
+    !Number.isFinite(config.reviewAgent.codexTimeoutMs) ||
+    config.reviewAgent.codexTimeoutMs < 30_000
+  ) {
+    throw new Error(
+      `Invalid config: reviewAgent.codexTimeoutMs must be >= 30000, got ${JSON.stringify(config.reviewAgent.codexTimeoutMs)}`,
+    );
   }
 }

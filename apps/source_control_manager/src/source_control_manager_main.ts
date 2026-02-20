@@ -7,6 +7,7 @@ import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { GitOps } from "./git";
 import { ensureIntegrationPullRequest } from "./github_pr";
+import { ReviewAgent } from "./review_agent";
 import { createStatusServer } from "./http";
 import {
   loadConfig,
@@ -211,6 +212,7 @@ try {
 
 let running = true;
 let statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let reviewAgentPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusSessionReady = false;
 
 function createSessionComm(sessionId: string): CommunicationManager {
@@ -445,39 +447,103 @@ async function tick(): Promise<void> {
         console.log(`[${ts()}]   ✓ Check passed: ${check.name}`);
       }
 
-      // 5. Merge to main
-      console.log(`[${ts()}] Merging ${tempBranch} to ${config.mainBranch}...`);
-      await gitOps.checkoutMain();
-      const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
-
-      if (!ffResult.ok) {
-        throw new Error(`FF merge to main failed: ${ffResult.stderr || ffResult.stdout}`);
-      }
-
-      console.log(`[${ts()}] ✓ Successfully merged ${completion.branch} to ${config.mainBranch}`);
-      if (config.pushMainAfterMerge) {
-        console.log(`[${ts()}] Pushing ${config.mainBranch} to ${config.remote}...`);
-        const pushResult = await gitOps.pushMain();
-        if (!pushResult.ok) {
-          throw new Error(`Push failed: ${pushResult.stderr || pushResult.stdout}`);
+      // 5. Merge to main OR create individual PR (ReviewAgent mode)
+      if (config.reviewAgent.enabled) {
+        // ReviewAgent mode: create individual PR from agent branch to prBaseBranch.
+        // The agent branch already exists on remote (pushed by the worker).
+        // Checks have passed; we skip merging into main_agents entirely.
+        console.log(
+          `[${ts()}] ReviewAgent mode - creating individual PR for ${completion.branch}`,
+        );
+        const remoteUrlResult = await runGitCapture(
+          ["-C", config.repoPath, "remote", "get-url", config.remote],
+          repoRoot,
+        );
+        if (!remoteUrlResult.ok || !remoteUrlResult.stdout) {
+          throw new Error(
+            `Unable to resolve git remote URL for ${config.remote}: ${remoteUrlResult.stderr || remoteUrlResult.stdout}`,
+          );
         }
-        console.log(`[${ts()}] Push succeeded for ${config.mainBranch}`);
-        if (config.openPrAfterPush) {
-          try {
-            const pr = await ensureMainPullRequest(completion);
-            const prMessage = pr.created
-              ? `Opened PR #${pr.number}: ${pr.htmlUrl}`
-              : `Reused existing PR #${pr.number}: ${pr.htmlUrl}`;
-            console.log(`[${ts()}] ${prMessage}`);
-            await emitPusherMessage(comm, prMessage, completion.id);
-          } catch (prErr: any) {
-            const warning = `Push succeeded, but PR auto-open failed: ${prErr?.message ?? prErr}`;
-            console.error(`[${ts()}] ${warning}`);
-            await emitPusherMessage(comm, warning, completion.id);
-          }
+        const token = await resolveGitHubToken();
+        if (!token) {
+          throw new Error(
+            "No GitHub token available for individual PR creation (set PUSHPALS_GIT_TOKEN/GITHUB_TOKEN/GH_TOKEN).",
+          );
         }
+
+        const completionPrTitle = (completion.prTitle ?? "").trim();
+        const prTitle =
+          completionPrTitle ||
+          `PushPals: ${completion.branch.replace(/^agent\//, "")} -> ${integrationBaseBranch}`;
+
+        const completionPrBody = (completion.prBody ?? "").trim();
+        const prBody = [
+          completionPrBody || "Automated PR opened by SourceControlManager.",
+          "",
+          `- Agent branch: \`${completion.branch}\``,
+          `- Commit: \`${completion.commitSha}\``,
+          `- Completion ID: \`${completion.id}\``,
+          "",
+          "<!-- DO NOT EDIT: ReviewAgent metadata below -->",
+          `<!-- pushpals-jobId: ${completion.jobId} -->`,
+          `<!-- pushpals-sessionId: ${completion.sessionId} -->`,
+        ].join("\n");
+
+        const remoteUrl = remoteUrlResult.stdout.trim();
+        const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
+        const agentBranch = completion.branch.replace(/^refs\/heads\//, "");
+
+        const pr = await ensureIntegrationPullRequest({
+          token,
+          remoteUrl,
+          headBranch: agentBranch,
+          baseBranch: prBaseBranch,
+          title: prTitle,
+          body: prBody,
+          draft: false,
+        });
+        const prMessage = pr.created
+          ? `Opened individual PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`
+          : `Reused existing PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`;
+        console.log(`[${ts()}] ${prMessage}`);
+        await emitPusherMessage(comm, prMessage, completion.id);
       } else {
-        console.log(`[${ts()}] pushMainAfterMerge=false - skipping push`);
+        // Normal mode: merge temp branch into main_agents, push, open aggregated PR.
+        console.log(`[${ts()}] Merging ${tempBranch} to ${config.mainBranch}...`);
+        await gitOps.checkoutMain();
+        const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
+
+        if (!ffResult.ok) {
+          throw new Error(`FF merge to main failed: ${ffResult.stderr || ffResult.stdout}`);
+        }
+
+        console.log(
+          `[${ts()}] ✓ Successfully merged ${completion.branch} to ${config.mainBranch}`,
+        );
+        if (config.pushMainAfterMerge) {
+          console.log(`[${ts()}] Pushing ${config.mainBranch} to ${config.remote}...`);
+          const pushResult = await gitOps.pushMain();
+          if (!pushResult.ok) {
+            throw new Error(`Push failed: ${pushResult.stderr || pushResult.stdout}`);
+          }
+          console.log(`[${ts()}] Push succeeded for ${config.mainBranch}`);
+          if (config.openPrAfterPush) {
+            try {
+              const pr = await ensureMainPullRequest(completion);
+              const prMessage = pr.created
+                ? `Opened PR #${pr.number}: ${pr.htmlUrl}`
+                : `Reused existing PR #${pr.number}: ${pr.htmlUrl}`;
+              console.log(`[${ts()}] ${prMessage}`);
+              await emitPusherMessage(comm, prMessage, completion.id);
+            } catch (prErr: any) {
+              const warning = `Push succeeded, but PR auto-open failed: ${prErr?.message ?? prErr}`;
+              console.error(`[${ts()}] ${warning}`);
+              await emitPusherMessage(comm, warning, completion.id);
+            }
+          }
+        } else {
+          console.log(`[${ts()}] pushMainAfterMerge=false - skipping push`);
+        }
       }
 
       // 6. Clean up temp branch
@@ -497,9 +563,11 @@ async function tick(): Promise<void> {
         console.error(`[${ts()}] Failed to mark completion processed: ${markResponse.status}`);
       } else {
         console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
-        const pushMessage = config.pushMainAfterMerge
-          ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.`
-          : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
+        const pushMessage = config.reviewAgent.enabled
+          ? `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.`
+          : config.pushMainAfterMerge
+            ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.`
+            : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
         await emitPusherMessage(comm, pushMessage, completion.id);
       }
     } catch (err: any) {
@@ -851,6 +919,48 @@ async function main(): Promise<void> {
   await emitStartupStatus();
   startStatusHeartbeat();
 
+  // Start ReviewAgent poll loop if enabled
+  if (config.reviewAgent.enabled) {
+    const remoteUrlResult = await runGitCapture(
+      ["-C", config.repoPath, "remote", "get-url", config.remote],
+      repoRoot,
+    );
+    const remoteUrl = remoteUrlResult.ok ? remoteUrlResult.stdout.trim() : "";
+    const githubToken = await resolveGitHubToken();
+
+    if (!remoteUrl) {
+      console.warn(
+        `[${ts()}] ReviewAgent enabled but could not resolve remote URL — polling disabled`,
+      );
+    } else if (!githubToken) {
+      console.warn(
+        `[${ts()}] ReviewAgent enabled but no GitHub token found (set PUSHPALS_GIT_TOKEN/GITHUB_TOKEN/GH_TOKEN) — polling disabled`,
+      );
+    } else {
+      const reviewAgent = new ReviewAgent(
+        config.reviewAgent,
+        config.serverUrl,
+        githubToken,
+        remoteUrl,
+        (config.prBaseBranch || integrationBaseBranch).trim(),
+        config.authToken,
+      );
+      console.log(
+        `[${ts()}] ReviewAgent started (poll interval: ${config.reviewAgent.pollIntervalMs}ms, pass threshold: ${config.reviewAgent.passThreshold}/10)`,
+      );
+      reviewAgentPollTimer = setInterval(
+        () =>
+          reviewAgent.poll().catch((err: any) => {
+            console.error(`[${ts()}] [ReviewAgent] Poll error: ${err?.message ?? err}`);
+          }),
+        config.reviewAgent.pollIntervalMs,
+      );
+      void reviewAgent.poll().catch((err: any) => {
+        console.error(`[${ts()}] [ReviewAgent] Initial poll error: ${err?.message ?? err}`);
+      });
+    }
+  }
+
   // Initial tick — retry on transient errors (e.g. remote unreachable)
   for (let attempt = 1; ; attempt++) {
     try {
@@ -882,6 +992,10 @@ function shutdown(): void {
   if (statusHeartbeatTimer) {
     clearInterval(statusHeartbeatTimer);
     statusHeartbeatTimer = null;
+  }
+  if (reviewAgentPollTimer) {
+    clearInterval(reviewAgentPollTimer);
+    reviewAgentPollTimer = null;
   }
   void createSessionComm(statusSessionId).status(
     "source_control_manager",

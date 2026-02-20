@@ -166,6 +166,17 @@ export interface PushPalsConfig {
     statusHeartbeatMs: number;
     skipCleanCheck: boolean;
     autoCreateMainBranch: boolean;
+    reviewAgent: {
+      enabled: boolean;
+      pollIntervalMs: number;
+      reviewerMdPath: string;
+      passThreshold: number;
+      mergeMethod: "squash" | "merge" | "rebase";
+      codexBin: string;
+      codexAuthMode: string;
+      codexHomeDir: string;
+      codexTimeoutMs: number;
+    };
   };
   startup: {
     workerImageRebuild: "auto" | "always" | "never";
@@ -930,6 +941,64 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     parseBoolEnv("SOURCE_CONTROL_MANAGER_AUTO_CREATE_MAIN_BRANCH") ??
     asBoolean(scmNode.auto_create_main_branch, false);
 
+  const scmReviewAgentNode = getObject(scmNode, "review_agent");
+  const scmReviewAgentEnabled =
+    parseBoolEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_ENABLED") ??
+    asBoolean(scmReviewAgentNode.enabled, false);
+  const scmReviewAgentPollIntervalMs = Math.max(
+    5_000,
+    asInt(
+      parseIntEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_POLL_INTERVAL_MS") ??
+        scmReviewAgentNode.poll_interval_ms,
+      60_000,
+    ),
+  );
+  const scmReviewAgentReviewerMdPath = firstNonEmpty(
+    process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_REVIEWER_MD_PATH,
+    asString(scmReviewAgentNode.reviewer_md_path, "prompts/review_agent/reviewer.md"),
+    "prompts/review_agent/reviewer.md",
+  );
+  const scmReviewAgentPassThreshold = (() => {
+    const raw = firstNonEmpty(
+      process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_PASS_THRESHOLD,
+      asString(scmReviewAgentNode.pass_threshold, "9.5"),
+      "9.5",
+    );
+    const parsed = Number.parseFloat(raw);
+    return Number.isFinite(parsed) ? Math.max(1, Math.min(10, parsed)) : 9.5;
+  })();
+  const scmReviewAgentMergeMethodRaw = firstNonEmpty(
+    process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MERGE_METHOD,
+    asString(scmReviewAgentNode.merge_method, "squash"),
+    "squash",
+  ).toLowerCase();
+  const scmReviewAgentMergeMethod: "squash" | "merge" | "rebase" =
+    scmReviewAgentMergeMethodRaw === "merge" || scmReviewAgentMergeMethodRaw === "rebase"
+      ? scmReviewAgentMergeMethodRaw
+      : "squash";
+  const scmReviewAgentCodexBin = firstNonEmpty(
+    process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_BIN,
+    asString(scmReviewAgentNode.codex_bin, "bun x --yes @openai/codex"),
+    "bun x --yes @openai/codex",
+  );
+  const scmReviewAgentCodexAuthMode = firstNonEmpty(
+    process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_AUTH_MODE,
+    asString(scmReviewAgentNode.codex_auth_mode, "chatgpt"),
+    "chatgpt",
+  );
+  const scmReviewAgentCodexHomeDir = firstNonEmpty(
+    process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_HOME_DIR,
+    asString(scmReviewAgentNode.codex_home_dir, ""),
+  );
+  const scmReviewAgentCodexTimeoutMs = Math.max(
+    30_000,
+    asInt(
+      parseIntEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_TIMEOUT_MS") ??
+        scmReviewAgentNode.codex_timeout_ms,
+      300_000,
+    ),
+  );
+
   const startupNode = getObject(merged, "startup");
   const startupWorkerImageRebuild = normalizeWorkerImageRebuildMode(
     firstNonEmpty(
@@ -1370,6 +1439,17 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       statusHeartbeatMs: scmStatusHeartbeatMs,
       skipCleanCheck: scmSkipCleanCheck,
       autoCreateMainBranch: scmAutoCreateMainBranch,
+      reviewAgent: {
+        enabled: scmReviewAgentEnabled,
+        pollIntervalMs: scmReviewAgentPollIntervalMs,
+        reviewerMdPath: scmReviewAgentReviewerMdPath,
+        passThreshold: scmReviewAgentPassThreshold,
+        mergeMethod: scmReviewAgentMergeMethod,
+        codexBin: scmReviewAgentCodexBin,
+        codexAuthMode: scmReviewAgentCodexAuthMode,
+        codexHomeDir: scmReviewAgentCodexHomeDir,
+        codexTimeoutMs: scmReviewAgentCodexTimeoutMs,
+      },
     },
     startup: {
       workerImageRebuild: startupWorkerImageRebuild,

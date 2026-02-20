@@ -77,6 +77,17 @@ repo_path = ".worktrees/source_control_manager"
 pushpals_branch = "main_agents"
 base_branch = "main"
 
+[source_control_manager.review_agent]
+enabled = true
+poll_interval_ms = 60000
+reviewer_md_path = "prompts/review_agent/reviewer.md"
+pass_threshold = 9.5
+merge_method = "squash"
+codex_auth_mode = "chatgpt"
+codex_bin = "bun x --yes @openai/codex"
+codex_home_dir = ""
+codex_timeout_ms = 300000
+
 [startup]
 startup_warmup = true
 lmstudio_ready_timeout_ms = 120000

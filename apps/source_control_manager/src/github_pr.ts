@@ -4,6 +4,16 @@ export interface PullRequestUpsertResult {
   htmlUrl: string;
 }
 
+export interface GitHubPR {
+  number: number;
+  html_url: string;
+  title: string;
+  body: string | null;
+  state: string;
+  head: { ref: string; sha: string; label: string };
+  base: { ref: string; sha: string };
+}
+
 export interface EnsurePullRequestOptions {
   token: string;
   remoteUrl: string;
@@ -113,4 +123,121 @@ export async function ensureIntegrationPullRequest(
 
   const createBody = await createResponse.text();
   throw githubError(createResponse.status, createBody);
+}
+
+export async function listOpenPullRequests(opts: {
+  token: string;
+  remoteUrl: string;
+  headPrefix: string;
+  base: string;
+}): Promise<GitHubPR[]> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`;
+  const url = `${apiBase}/pulls?state=open&base=${encodeURIComponent(opts.base)}&per_page=100`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: githubHeaders(opts.token),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw githubError(response.status, text);
+  }
+
+  const prs = (await response.json()) as GitHubPR[];
+  if (!Array.isArray(prs)) return [];
+
+  if (!opts.headPrefix) return prs;
+  return prs.filter((pr) => pr.head.ref.startsWith(opts.headPrefix));
+}
+
+export async function getPullRequestDiff(opts: {
+  token: string;
+  remoteUrl: string;
+  prNumber: number;
+}): Promise<string> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      ...githubHeaders(opts.token),
+      Accept: "application/vnd.github.diff",
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw githubError(response.status, text);
+  }
+
+  return response.text();
+}
+
+export async function mergePullRequest(opts: {
+  token: string;
+  remoteUrl: string;
+  prNumber: number;
+  mergeMethod?: "merge" | "squash" | "rebase";
+  commitTitle?: string;
+  commitMessage?: string;
+}): Promise<{ merged: boolean; sha: string; message: string }> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}/merge`;
+  const body: Record<string, string> = {
+    merge_method: opts.mergeMethod ?? "squash",
+  };
+  if (opts.commitTitle) body.commit_title = opts.commitTitle;
+  if (opts.commitMessage) body.commit_message = opts.commitMessage;
+
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: githubHeaders(opts.token),
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw githubError(response.status, text);
+  }
+
+  const data = (await response.json()) as { merged: boolean; sha: string; message: string };
+  return data;
+}
+
+export async function addPullRequestComment(opts: {
+  token: string;
+  remoteUrl: string;
+  prNumber: number;
+  body: string;
+}): Promise<void> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/issues/${opts.prNumber}/comments`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: githubHeaders(opts.token),
+    body: JSON.stringify({ body: opts.body }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw githubError(response.status, text);
+  }
 }
