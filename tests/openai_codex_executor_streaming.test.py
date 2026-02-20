@@ -57,6 +57,32 @@ class OpenAICodexExecutorStreamingTests(unittest.TestCase):
         self.assertEqual(finalized["line_count"], 1)
         self.assertIn("hello from codex", "\n".join(finalized["summaries"]))
 
+    def test_surfaces_nested_reasoning_from_item_updated(self) -> None:
+        trace = module._empty_codex_trace()
+        module._record_live_codex_stdout_line(
+            '{"type":"item.updated","item":{"type":"reasoning","summary":[{"text":"drafting plan"}]},"delta":{"type":"response.reasoning_summary_text.delta","text":"next step"}}',
+            True,
+            trace,
+        )
+        self.assertGreaterEqual(trace.get("reasoning_events", 0), 1)
+        finalized = module._finalize_codex_stdout_trace(trace, True)
+        joined = "\n".join(finalized["summaries"])
+        self.assertIn("item.updated", joined)
+        self.assertIn("drafting plan", joined)
+        self.assertGreaterEqual(finalized.get("reasoning_events", 0), 1)
+
+    def test_reasoning_event_without_text_has_fallback_summary(self) -> None:
+        trace = module._empty_codex_trace()
+        module._record_live_codex_stdout_line(
+            '{"type":"item.updated","item":{"type":"reasoning"}}',
+            True,
+            trace,
+        )
+        finalized = module._finalize_codex_stdout_trace(trace, True)
+        joined = "\n".join(finalized["summaries"])
+        self.assertIn("item.updated", joined)
+        self.assertIn("reasoning update", joined)
+
 
 if __name__ == "__main__":
     unittest.main()

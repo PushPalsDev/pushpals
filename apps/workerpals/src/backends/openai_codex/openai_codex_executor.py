@@ -343,6 +343,46 @@ def _truncate_inline(text: str, max_chars: int = 180) -> str:
     return value[: max(1, max_chars - 3)] + "..."
 
 
+def _contains_reasoning_marker(value: str) -> bool:
+    lowered = str(value or "").strip().lower()
+    if not lowered:
+        return False
+    return "reasoning" in lowered or "thinking" in lowered
+
+
+def _event_contains_reasoning(value: Any) -> bool:
+    max_nodes = 256
+    visited = 0
+    stack: List[Any] = [value]
+    while stack and visited < max_nodes:
+        current = stack.pop()
+        visited += 1
+        if isinstance(current, str):
+            if _contains_reasoning_marker(current):
+                return True
+            continue
+        if isinstance(current, list):
+            for item in reversed(current[:80]):
+                if isinstance(item, (dict, list, str)):
+                    stack.append(item)
+            continue
+        if not isinstance(current, dict):
+            continue
+
+        for raw_key, nested in current.items():
+            key = str(raw_key or "")
+            key_lower = key.lower()
+            if _contains_reasoning_marker(key_lower):
+                return True
+            if key_lower in ("type", "kind", "event", "item_type", "role", "channel"):
+                if isinstance(nested, str) and _contains_reasoning_marker(nested):
+                    return True
+            if isinstance(nested, (dict, list, str)):
+                stack.append(nested)
+
+    return False
+
+
 def _collect_text_fragments(value: Any, out: List[str]) -> None:
     if isinstance(value, str):
         text = _truncate_inline(value, 220)
@@ -354,9 +394,24 @@ def _collect_text_fragments(value: Any, out: List[str]) -> None:
             _collect_text_fragments(item, out)
         return
     if isinstance(value, dict):
-        for key in ("text", "content", "summary", "message", "error", "reason"):
-            if key in value:
-                _collect_text_fragments(value.get(key), out)
+        matched_key = False
+        for raw_key, nested in value.items():
+            key = str(raw_key or "").lower()
+            if key.endswith("_text") or key.endswith("_message"):
+                matched_key = True
+                _collect_text_fragments(nested, out)
+                continue
+            if (
+                key in ("text", "content", "summary", "message", "error", "reason", "delta", "output", "item")
+                or _contains_reasoning_marker(key)
+            ):
+                matched_key = True
+                _collect_text_fragments(nested, out)
+        if not matched_key:
+            # Fallback: recurse into nested containers so unknown payload shapes still surface text.
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    _collect_text_fragments(nested, out)
         return
 
 
@@ -367,7 +422,7 @@ def _summarize_json_event(obj: Dict[str, Any]) -> str:
     # Skip noisy streaming deltas unless they contain meaningful text fragments.
     delta_like = event_type.endswith(".delta") or event_type.endswith("_delta")
     # Reasoning/thinking events are always surfaced — they show the model's reasoning process.
-    reasoning_like = "reasoning" in event_type or "thinking" in event_type
+    reasoning_like = _contains_reasoning_marker(event_type) or _event_contains_reasoning(obj)
 
     tool_name = ""
     for key in ("tool_name", "tool", "name"):
@@ -380,12 +435,18 @@ def _summarize_json_event(obj: Dict[str, Any]) -> str:
             if isinstance(nested, str) and nested.strip():
                 tool_name = nested.strip()
                 break
+    # For Codex CLI item.* events, the tool/function name is nested under obj["item"]["name"].
+    if not tool_name and isinstance(obj.get("item"), dict):
+        nested = obj["item"].get("name")
+        if isinstance(nested, str) and nested.strip():
+            tool_name = nested.strip()
 
     fragments: List[str] = []
-    extract_keys = ["message", "text", "summary", "content", "output_text", "error"]
-    # Reasoning delta events carry their incremental text in a "delta" field (not "text").
-    if reasoning_like:
-        extract_keys.append("delta")
+    # "item" covers Codex CLI's item.started/updated/completed events where reasoning and
+    # tool call content is nested under the item object.
+    # "output" covers turn.completed and similar events that carry output arrays.
+    # "delta" covers reasoning delta events (response.reasoning_summary_text.delta).
+    extract_keys = ["message", "text", "summary", "content", "output_text", "error", "item", "output", "delta"]
     for key in extract_keys:
         if key in obj:
             _collect_text_fragments(obj.get(key), fragments)
@@ -407,6 +468,8 @@ def _summarize_json_event(obj: Dict[str, Any]) -> str:
         parts.append(f"tool={tool_name}")
     if text_part:
         parts.append(text_part)
+    elif reasoning_like:
+        parts.append("reasoning update")
     return " | ".join(parts)
 
 
@@ -448,6 +511,7 @@ def _empty_codex_trace() -> Dict[str, Any]:
         "live_omitted": 0,
         "raw_logged": 0,
         "raw_omitted": 0,
+        "reasoning_events": 0,
     }
 
 
@@ -485,9 +549,10 @@ def _record_live_codex_stdout_line(line: str, use_json: bool, trace: Dict[str, A
             )
             event_type_counts[event_type] = to_int(event_type_counts.get(event_type), 0) + 1
             summary = _summarize_json_event(parsed)
-            # Reasoning/thinking events are always logged regardless of the live-log cap so
-            # the model's reasoning process is always visible in the run log.
-            priority = "reasoning" in event_type or "thinking" in event_type
+            # Reasoning can arrive under generic event types (for example item.updated).
+            priority = _event_contains_reasoning(parsed)
+            if priority:
+                trace["reasoning_events"] = to_int(trace.get("reasoning_events"), 0) + 1
             if summary:
                 if len(summaries) < max_recorded_summaries:
                     summaries.append(summary)
@@ -542,6 +607,11 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
     raw_omitted = to_int(trace.get("raw_omitted"), 0)
     if raw_omitted > 0:
         log.info(f"[codex/raw] ... {raw_omitted} additional line(s) omitted.")
+    reasoning_events = to_int(trace.get("reasoning_events"), 0)
+    if reasoning_events > 0:
+        log.info(f"[codex] Reasoning-like event(s): {reasoning_events}")
+    elif use_json and valid_json > 0:
+        log.info("[codex] No reasoning-like events observed in this run.")
 
     if not summaries and event_type_counts:
         ranked = sorted(event_type_counts.items(), key=lambda item: item[1], reverse=True)
@@ -554,6 +624,7 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
         "invalid_json": invalid_json,
         "summaries": summaries,
         "event_type_counts": event_type_counts,
+        "reasoning_events": reasoning_events,
     }
 
 
