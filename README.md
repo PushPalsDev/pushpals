@@ -15,7 +15,7 @@ Both modes flow through the same queues, events, and integration pipeline so beh
 
 - Excalidraw source: `docs/architecture.excalidraw`:
 
-![Excalidraw Architecture](docs\excalidraw_architecture.png)
+![Excalidraw Architecture](docs/excalidraw_architecture.png)
 
 - Mermaid runtime flow:
 
