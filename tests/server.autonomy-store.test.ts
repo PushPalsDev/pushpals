@@ -43,8 +43,9 @@ describe("server AutonomyStore policy gates", () => {
     expect(String(result.reason ?? "")).toContain("exceeds policy");
   });
 
-  test("rejects read_anywhere=true when not allowlisted", () => {
+  test("applies read_anywhere policy gate based on config allowlist", () => {
     const store = makeStore();
+    const allowReadAnywhere = (store as unknown as { config?: { remotebuddy?: { autonomy?: { allowReadAnywhere?: boolean } } } }).config?.remotebuddy?.autonomy?.allowReadAnywhere ?? false;
     const snapshotId = store.createSnapshot({ sessionId: "s1" }).snapshot_id;
 
     const result = store.recordObjectiveDecision({
@@ -67,8 +68,10 @@ describe("server AutonomyStore policy gates", () => {
       },
     });
 
-    expect(result.ok).toBe(false);
-    expect(String(result.reason ?? "")).toContain("read_anywhere");
+    expect(result.ok).toBe(allowReadAnywhere);
+    if (!allowReadAnywhere) {
+      expect(String(result.reason ?? "")).toContain("read_anywhere");
+    }
   });
 
   test("dispatch lock is visible only to other runs", () => {

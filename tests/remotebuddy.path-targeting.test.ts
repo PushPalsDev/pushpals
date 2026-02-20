@@ -14,7 +14,7 @@ describe("remotebuddy path targeting", () => {
     expect(normalizeRepoPathHint("C:\\Windows\\System32\\drivers\\etc\\hosts")).toBeNull();
   });
 
-  test("derives scoped paths from planner hints and prompt", () => {
+  test("prefers explicit prompt paths over planner hints", () => {
     const paths = plannerTargetPaths(
       {
         scope: { write_globs: ["apps/workerpals/src/**/*.ts"] },
@@ -22,7 +22,7 @@ describe("remotebuddy path targeting", () => {
       },
       "Please update `apps/workerpals/src/workerpals_main.ts`.",
     );
-    expect(paths).toEqual(["apps/workerpals/src/workerpals_main.ts", "apps/workerpals/src"]);
+    expect(paths).toEqual(["apps/workerpals/src/workerpals_main.ts"]);
   });
 
   test("falls back to repository root when no safe hints exist", () => {

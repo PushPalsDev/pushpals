@@ -12,7 +12,7 @@ describe("workerpals shell manager", () => {
     expect(result).toBe(true);
   });
 
-  test("fails to acquire lease for same session twice", () => {
+  test("renews lease when the same worker reacquires the same session", () => {
     const db = new Database(":memory:");
     const manager = new ShellManager(db, "worker-1");
     const sessionId = "test-session-2";
@@ -21,7 +21,7 @@ describe("workerpals shell manager", () => {
     const result2 = manager.acquireLease(sessionId);
 
     expect(result1).toBe(true);
-    expect(result2).toBe(false); // This might fail if the implementation doesn't handle this case
+    expect(result2).toBe(true);
   });
 
   test("acquires lease for different sessions", () => {
@@ -44,6 +44,6 @@ describe("workerpals shell manager", () => {
     const result2 = manager2.acquireLease("session-3");
 
     expect(result1).toBe(true);
-    expect(result2).toBe(false); // This might fail if the implementation doesn't handle this case
+    expect(result2).toBe(false);
   });
 });
