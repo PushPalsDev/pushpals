@@ -238,7 +238,7 @@ def _resolve_communicate_timeout_seconds(config: OpenAICodexRuntimeConfig) -> Op
     explicit_s = _to_positive_int(str(config.timeout_seconds_override))
     if explicit_s is not None:
         return explicit_s
-    # Top-level execution budget (e.g. openai_codex_timeout_ms = 1800000 in [workerpals])
+    # Top-level execution budget (e.g. openai_codex_timeout_ms = 7200000 in [workerpals])
     # takes precedence over the more granular LLM/CLI-level timeout settings.
     top_level_ms = config.timeout_ms_top_level
     if top_level_ms > 0:

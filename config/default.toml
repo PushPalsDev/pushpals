@@ -89,7 +89,7 @@ openhands_timeout_ms = 1800000
 miniswe_python = "python"
 miniswe_timeout_ms = 1800000
 openai_codex_python = "python"
-openai_codex_timeout_ms = 1800000
+openai_codex_timeout_ms = 7200000
 openhands_stuck_guard_enabled = true
 openhands_stuck_guard_explore_limit = 18
 openhands_stuck_guard_min_elapsed_ms = 180000
@@ -100,7 +100,7 @@ push_agent_branch = false
 require_docker = false
 skip_docker_self_check = false
 docker_image = "pushpals-worker-sandbox:latest"
-docker_timeout_ms = 1800000
+docker_timeout_ms = 7260000
 docker_idle_timeout_ms = 600000
 docker_agent_startup_timeout_ms = 45000
 docker_warm_max_attempts = 3
@@ -150,7 +150,7 @@ model = "local-model"
 session_id = "workerpals-dev"
 
 [workerpals.openai_codex]
-timeout_ms = 120000
+timeout_ms = 7200000
 progress_log_interval_s = 30
 reasoning_effort = "high"
 approval_policy = "never"

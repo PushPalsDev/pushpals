@@ -652,7 +652,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
   const workerOpenAICodexTimeoutMs = Math.max(
     10_000,
-    asInt(workerNode.openai_codex_timeout_ms, 1_800_000),
+    asInt(workerNode.openai_codex_timeout_ms, 7_200_000),
   );
   const workerQualityMaxAutoRevisions = Math.max(
     0,
@@ -1304,7 +1304,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         10_000,
         asInt(
           parseIntEnv("WORKERPALS_DOCKER_TIMEOUT_MS") ?? workerNode.docker_timeout_ms,
-          1_800_000,
+          7_260_000,
         ),
       ),
       dockerIdleTimeoutMs: Math.max(
