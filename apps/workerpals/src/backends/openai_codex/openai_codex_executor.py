@@ -366,6 +366,8 @@ def _summarize_json_event(obj: Dict[str, Any]) -> str:
         event_type = "event"
     # Skip noisy streaming deltas unless they contain meaningful text fragments.
     delta_like = event_type.endswith(".delta") or event_type.endswith("_delta")
+    # Reasoning/thinking events are always surfaced — they show the model's reasoning process.
+    reasoning_like = "reasoning" in event_type or "thinking" in event_type
 
     tool_name = ""
     for key in ("tool_name", "tool", "name"):
@@ -380,7 +382,11 @@ def _summarize_json_event(obj: Dict[str, Any]) -> str:
                 break
 
     fragments: List[str] = []
-    for key in ("message", "text", "summary", "content", "output_text", "error"):
+    extract_keys = ["message", "text", "summary", "content", "output_text", "error"]
+    # Reasoning delta events carry their incremental text in a "delta" field (not "text").
+    if reasoning_like:
+        extract_keys.append("delta")
+    for key in extract_keys:
         if key in obj:
             _collect_text_fragments(obj.get(key), fragments)
     deduped: List[str] = []
@@ -392,7 +398,8 @@ def _summarize_json_event(obj: Dict[str, Any]) -> str:
         deduped.append(frag)
     text_part = deduped[0] if deduped else ""
 
-    if delta_like and not text_part:
+    # Suppress noisy deltas, but always surface reasoning events even if text is empty.
+    if delta_like and not text_part and not reasoning_like:
         return ""
 
     parts = [event_type]
@@ -453,7 +460,7 @@ def _record_live_codex_stdout_line(line: str, use_json: bool, trace: Dict[str, A
     summaries = trace.setdefault("summaries", [])
     event_type_counts = trace.setdefault("event_type_counts", {})
     max_recorded_summaries = 500
-    max_live_logged = 120
+    max_live_logged = 300
     max_raw_logged = 5
 
     if use_json:
@@ -478,11 +485,14 @@ def _record_live_codex_stdout_line(line: str, use_json: bool, trace: Dict[str, A
             )
             event_type_counts[event_type] = to_int(event_type_counts.get(event_type), 0) + 1
             summary = _summarize_json_event(parsed)
+            # Reasoning/thinking events are always logged regardless of the live-log cap so
+            # the model's reasoning process is always visible in the run log.
+            priority = "reasoning" in event_type or "thinking" in event_type
             if summary:
                 if len(summaries) < max_recorded_summaries:
                     summaries.append(summary)
                 live_logged = to_int(trace.get("live_logged"), 0)
-                if live_logged < max_live_logged:
+                if live_logged < max_live_logged or priority:
                     log.info(f"[codex] {summary}")
                     trace["live_logged"] = live_logged + 1
                 else:
