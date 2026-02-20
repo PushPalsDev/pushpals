@@ -92,16 +92,14 @@ describe("JobQueue stale recovery", () => {
     expect(queue.getJob(jobId)?.status).toBe("failed");
   });
 
-  test("does not recover an aligned busy job before effective grace window", () => {
+  test("does not recover an aligned busy job before effective grace window when heartbeat is fresh", () => {
     const queue = new JobQueue(":memory:");
     const jobId = enqueueAndClaim(queue, "worker-c");
     const db = (queue as unknown as { db: any }).db as any;
     const onlyThreeMinutesOld = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+    const freshHeartbeat = new Date(Date.now() - 60 * 1000).toISOString();
 
-    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
-      onlyThreeMinutesOld,
-      "worker-c",
-    );
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(freshHeartbeat, "worker-c");
     db.prepare("UPDATE jobs SET updatedAt = ?, startedAt = ?, claimedAt = ? WHERE id = ?").run(
       onlyThreeMinutesOld,
       onlyThreeMinutesOld,
@@ -113,6 +111,28 @@ describe("JobQueue stale recovery", () => {
 
     expect(recovered.length).toBe(0);
     expect(queue.getJob(jobId)?.status).toBe("claimed");
+  });
+
+  test("recovers an aligned busy job when heartbeat is stale beyond base TTL", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueAndClaim(queue, "worker-d");
+    const db = (queue as unknown as { db: any }).db as any;
+    const staleIso = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(staleIso, "worker-d");
+    db.prepare("UPDATE jobs SET updatedAt = ?, startedAt = ?, claimedAt = ? WHERE id = ?").run(
+      staleIso,
+      staleIso,
+      staleIso,
+      jobId,
+    );
+
+    const recovered = queue.recoverStaleClaimedJobs(120_000);
+
+    expect(recovered.length).toBe(1);
+    expect(recovered[0]?.jobId).toBe(jobId);
+    expect(recovered[0]?.detail).toContain("heartbeatFreshForGrace=no");
+    expect(queue.getJob(jobId)?.status).toBe("failed");
   });
 
   test("computes job SLO summary including timeout failures", () => {

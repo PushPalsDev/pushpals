@@ -670,6 +670,17 @@ function sendCommand(
 }
 
 type WorkerHeartbeatStatus = "idle" | "busy" | "error" | "offline";
+type WorkerRuntimeState = {
+  currentJobId: string | null;
+  currentSessionId: string | null;
+  shutdownRequested: boolean;
+};
+
+function buildWorkerHeaders(authToken: string | null): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+  return headers;
+}
 
 async function sendWorkerHeartbeat(
   opts: ReturnType<typeof parseArgs>,
@@ -705,12 +716,50 @@ async function sendWorkerHeartbeat(
   }
 }
 
+async function failActiveJobOnShutdown(
+  opts: ReturnType<typeof parseArgs>,
+  headers: Record<string, string>,
+  runtimeState: WorkerRuntimeState,
+  signalName: string,
+): Promise<void> {
+  const activeJobId = runtimeState.currentJobId;
+  if (!activeJobId) return;
+
+  const message = "Worker process shutting down during claimed job";
+  const detail = `worker=${opts.workerId}; signal=${signalName}; action=fail-claimed-job-on-shutdown`;
+
+  try {
+    await fetch(`${opts.server}/jobs/${activeJobId}/fail`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ message, detail }),
+    });
+  } catch (err) {
+    console.error(
+      `[WorkerPals] Failed to mark active job ${activeJobId} as failed during shutdown:`,
+      err,
+    );
+  }
+
+  if (runtimeState.currentSessionId) {
+    await sendCommand(opts.server, runtimeState.currentSessionId, headers, {
+      type: "job_failed",
+      payload: {
+        jobId: activeJobId,
+        message,
+        detail,
+      },
+      from: `worker:${opts.workerId}`,
+    });
+  }
+}
+
 async function workerLoop(
   opts: ReturnType<typeof parseArgs>,
   dockerExecutor: DockerExecutor | null,
+  runtimeState: WorkerRuntimeState,
 ): Promise<void> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (opts.authToken) headers["Authorization"] = `Bearer ${opts.authToken}`;
+  const headers = buildWorkerHeaders(opts.authToken);
 
   console.log(`[WorkerPals ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
   if (dockerExecutor) {
@@ -737,7 +786,7 @@ async function workerLoop(
 
   await maybeHeartbeat("idle", null, true);
 
-  while (true) {
+  while (!runtimeState.shutdownRequested) {
     try {
       await maybeHeartbeat("idle");
       const claimRes = await fetch(`${opts.server}/jobs/claim`, {
@@ -751,6 +800,8 @@ async function workerLoop(
         const job = data.job;
 
         if (job) {
+          runtimeState.currentJobId = job.id;
+          runtimeState.currentSessionId = job.sessionId ?? null;
           console.log(`[WorkerPals] Claimed job ${job.id} (${job.kind})`);
           await maybeHeartbeat("busy", job.id, true);
 
@@ -1047,6 +1098,8 @@ async function workerLoop(
               await new Promise((resolvePromise) => setTimeout(resolvePromise, cooldownMs));
             }
             await maybeHeartbeat("idle", null, true);
+            runtimeState.currentJobId = null;
+            runtimeState.currentSessionId = null;
             if (directWorktreePath) {
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                 console.error(`[WorkerPals] Failed to remove isolated worktree: ${String(err)}`);
@@ -1056,10 +1109,12 @@ async function workerLoop(
         }
       }
     } catch (err) {
+      if (runtimeState.shutdownRequested) break;
       console.error(`[WorkerPals] Poll error:`, err);
       await maybeHeartbeat("error", null, true);
     }
 
+    if (runtimeState.shutdownRequested) break;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, opts.pollMs));
   }
 }
@@ -1139,31 +1194,60 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (dockerExecutor) {
-    let cleanupTriggered = false;
-    const cleanup = async () => {
-      await dockerExecutor.shutdown().catch((err) => {
+  const runtimeState: WorkerRuntimeState = {
+    currentJobId: null,
+    currentSessionId: null,
+    shutdownRequested: false,
+  };
+  const headers = buildWorkerHeaders(opts.authToken);
+  let shutdownTriggered = false;
+  const shutdownAndExit = (signalName: string, code: number) => {
+    if (shutdownTriggered) return;
+    shutdownTriggered = true;
+    runtimeState.shutdownRequested = true;
+    console.warn(`[WorkerPals] Shutdown signal received (${signalName}); draining active work...`);
+
+    const withTimeout = async (promise: Promise<unknown>, timeoutMs = 3_000) => {
+      await Promise.race([
+        promise.catch(() => undefined),
+        new Promise((resolvePromise) => setTimeout(resolvePromise, timeoutMs)),
+      ]);
+    };
+
+    void (async () => {
+      await withTimeout(
+        sendWorkerHeartbeat(opts, headers, "offline", runtimeState.currentJobId ?? null),
+      );
+      await withTimeout(failActiveJobOnShutdown(opts, headers, runtimeState, signalName));
+      if (dockerExecutor) {
+        await withTimeout(
+          dockerExecutor.shutdown().catch((err) => {
+            console.error(`[WorkerPals] Docker shutdown cleanup failed: ${String(err)}`);
+          }),
+          10_000,
+        );
+      }
+      process.exit(code);
+    })();
+  };
+
+  process.once("SIGINT", () => shutdownAndExit("SIGINT", 130));
+  process.once("SIGTERM", () => shutdownAndExit("SIGTERM", 143));
+  if (process.platform === "win32") {
+    process.once("SIGBREAK", () => shutdownAndExit("SIGBREAK", 131));
+  }
+  process.once("exit", () => {
+    runtimeState.shutdownRequested = true;
+    if (shutdownTriggered) return;
+    shutdownTriggered = true;
+    if (dockerExecutor) {
+      void dockerExecutor.shutdown().catch((err) => {
         console.error(`[WorkerPals] Docker shutdown cleanup failed: ${String(err)}`);
       });
-    };
-    const cleanupAndExit = (code: number) => {
-      if (cleanupTriggered) return;
-      cleanupTriggered = true;
-      void cleanup().finally(() => process.exit(code));
-    };
-    process.once("SIGINT", () => cleanupAndExit(130));
-    process.once("SIGTERM", () => cleanupAndExit(143));
-    if (process.platform === "win32") {
-      process.once("SIGBREAK", () => cleanupAndExit(131));
     }
-    process.once("exit", () => {
-      if (cleanupTriggered) return;
-      cleanupTriggered = true;
-      void cleanup();
-    });
-  }
+  });
 
-  workerLoop(opts, dockerExecutor).catch((err) => {
+  workerLoop(opts, dockerExecutor, runtimeState).catch((err) => {
     console.error("[WorkerPals] Fatal:", err);
     process.exit(1);
   });

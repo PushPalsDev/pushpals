@@ -844,10 +844,16 @@ export class JobQueue {
         const combinedBudgetMs = executionBudgetMs + finalizationBudgetMs;
 
         // Busy workers assigned to the current job are given a longer grace window
-        // before stale recovery kicks in, to avoid false positives on long-running tasks
-        // with sparse logs/heartbeats.
+        // before stale recovery kicks in, but only while heartbeat freshness indicates
+        // the worker is still alive. If heartbeat is already stale, fall back to base TTL.
         const alignedGraceMs = Math.max(ttlMs, Math.min(combinedBudgetMs, ttlMs * 5));
-        const effectiveStaleAfterMs = workerAligned ? alignedGraceMs : ttlMs;
+        const heartbeatFreshForGrace =
+          heartbeatMs != null &&
+          Number.isFinite(heartbeatMs) &&
+          !Number.isNaN(heartbeatMs) &&
+          heartbeatAgeMs <= ttlMs;
+        const effectiveStaleAfterMs =
+          workerAligned && heartbeatFreshForGrace ? alignedGraceMs : ttlMs;
         if (activityAgeMs < effectiveStaleAfterMs) continue;
         if (workerAligned && heartbeatAgeMs < effectiveStaleAfterMs) continue;
 
@@ -865,6 +871,7 @@ export class JobQueue {
           `activityAt=${row.activityAt}`,
           `jobUpdatedAt=${row.jobUpdatedAt}`,
           `workerAligned=${workerAligned ? "yes" : "no"}`,
+          `heartbeatFreshForGrace=${heartbeatFreshForGrace ? "yes" : "no"}`,
           `activityAgeMs=${activityAgeMs}`,
           `heartbeatAgeMs=${Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs : -1}`,
           `staleAfterMs=${ttlMs}`,
