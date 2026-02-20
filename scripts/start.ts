@@ -143,6 +143,90 @@ function dataDirPath(): string {
   return resolve(CONFIG.paths.dataDir);
 }
 
+function toRepoRelativePosix(pathValue: string): string | null {
+  const rel = relative(repoRoot, pathValue);
+  if (rel === "") return ".";
+  if (rel.startsWith("..") || isAbsolute(rel)) return null;
+  return rel.replace(/\\/g, "/");
+}
+
+function isGitIgnoredPath(pathValue: string): boolean {
+  const rel = toRepoRelativePosix(pathValue);
+  if (!rel || rel === ".") return false;
+  try {
+    const result = Bun.spawnSync(["git", "check-ignore", "-q", rel], {
+      cwd: repoRoot,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    return result.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+function errorCode(err: unknown): string {
+  return typeof (err as any)?.code === "string" ? (err as any).code : "";
+}
+
+function isRecoverableCleanError(err: unknown): boolean {
+  const code = errorCode(err);
+  return code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY";
+}
+
+function removeUnlockedChildrenBestEffort(pathValue: string): number {
+  if (!existsSync(pathValue)) return 0;
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(pathValue);
+  } catch {
+    return 0;
+  }
+
+  let removed = 0;
+  for (const entry of entries) {
+    const fullPath = resolve(pathValue, entry);
+    try {
+      rmSync(fullPath, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // best-effort only
+    }
+  }
+  return removed;
+}
+
+function removePathForClean(pathValue: string, label: string): void {
+  if (!existsSync(pathValue)) {
+    console.log(`[start] Clean run: no ${label} found at ${pathValue} (nothing to delete).`);
+    return;
+  }
+
+  try {
+    rmSync(pathValue, { recursive: true, force: true });
+    console.log(`[start] Clean run: removed ${label} at ${pathValue}`);
+    return;
+  } catch (err) {
+    const code = errorCode(err);
+    const ignored = isGitIgnoredPath(pathValue);
+    if (ignored || isRecoverableCleanError(err)) {
+      const removedChildren = removeUnlockedChildrenBestEffort(pathValue);
+      const parts = [
+        `[start] Clean run: could not fully remove ${label} at ${pathValue}`,
+        code ? `(code=${code})` : "",
+        ignored ? "(gitignored path)" : "",
+        removedChildren > 0 ? `removed ${removedChildren} unlocked child entr${removedChildren === 1 ? "y" : "ies"}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      console.warn(`${parts}; continuing.`);
+      return;
+    }
+    throw err;
+  }
+}
+
 function ensureRequiredLocalConfigFiles(): void {
   const required: Array<{ path: string; hint: string }> = [
     {
@@ -180,18 +264,14 @@ function cleanRuntimeStateIfRequested(): void {
   }
 
   if (!existsSync(dataDir)) {
-    console.log(
-      `[start] Clean run: no runtime data directory found at ${dataDir} (nothing to delete).`,
-    );
+    console.log(`[start] Clean run: no runtime state found at ${dataDir} (nothing to delete).`);
   } else {
-    rmSync(dataDir, { recursive: true, force: true });
-    console.log(`[start] Clean run: removed runtime state at ${dataDir}`);
+    removePathForClean(dataDir, "runtime state");
   }
 
   const scratchWorkspaceDir = resolve(repoRoot, "workspace");
   if (existsSync(scratchWorkspaceDir)) {
-    rmSync(scratchWorkspaceDir, { recursive: true, force: true });
-    console.log(`[start] Clean run: removed runtime scratch dir at ${scratchWorkspaceDir}`);
+    removePathForClean(scratchWorkspaceDir, "runtime scratch dir");
   }
 }
 
