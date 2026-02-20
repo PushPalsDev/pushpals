@@ -132,6 +132,24 @@ export function resolveCodexCmd(codexBin: string): string[] {
   return parts;
 }
 
+export function buildCodexExecArgs(codexCmd: string[], outputPath: string): string[] {
+  return [
+    ...codexCmd,
+    "-c",
+    "model_reasoning_effort=low",
+    "-a",
+    "never",
+    "exec",
+    "-s",
+    "read-only",
+    "--color",
+    "never",
+    "--output-last-message",
+    outputPath,
+    "-",
+  ];
+}
+
 export function resolveReviewerMdPath(
   reviewerMdPath: string,
   options?: { workspaceRoot?: string; cwd?: string },
@@ -174,21 +192,7 @@ export function buildCodexEnv(config: ReviewAgentConfig): Record<string, string>
 async function invokeCodexReview(prompt: string, config: ReviewAgentConfig): Promise<string> {
   const tmpFile = join(tmpdir(), `review-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
   const codexCmd = resolveCodexCmd(config.codexBin);
-  const args = [
-    ...codexCmd,
-    "exec",
-    "--color",
-    "never",
-    "--approval-policy",
-    "never",
-    "--sandbox",
-    "read-only",
-    "-c",
-    "model_reasoning_effort=low",
-    "--output-last-message",
-    tmpFile,
-    "-",
-  ];
+  const args = buildCodexExecArgs(codexCmd, tmpFile);
 
   const proc = Bun.spawn(args, {
     stdin: new Blob([prompt]),

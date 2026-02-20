@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { resolve } from "path";
 import {
   ReviewAgent,
+  buildCodexExecArgs,
   resolveCodexCmd,
   resolveReviewerMdPath,
   type ReviewAgentConfig,
@@ -67,6 +68,17 @@ describe("ReviewAgent", () => {
     const bunxCmd = resolveCodexCmd("bunx --yes @openai/codex");
     expect(bunxCmd[0]).toBe(bunExec);
     expect(bunxCmd.slice(1)).toEqual(["x", "--yes", "@openai/codex"]);
+  });
+
+  test("builds review codex args using CLI-compatible approval/sandbox flags", () => {
+    const args = buildCodexExecArgs(["bun", "x", "--yes", "@openai/codex"], "/tmp/out.txt");
+    expect(args).toContain("-a");
+    expect(args).toContain("never");
+    expect(args).toContain("-s");
+    expect(args).toContain("read-only");
+    expect(args).not.toContain("--approval-policy");
+    expect(args).not.toContain("--sandbox");
+    expect(args).toContain("exec");
   });
 
   test("poll uses configured PR base branch", async () => {
