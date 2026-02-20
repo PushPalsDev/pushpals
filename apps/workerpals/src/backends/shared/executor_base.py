@@ -16,7 +16,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:
     import tomllib
@@ -182,6 +182,7 @@ def is_no_tool_calls_error(exc: Exception) -> bool:
 # ─── Config loading (TOML + env) ────────────────────────────────────────────
 
 _CONFIG_CACHE: Optional[Dict[str, Any]] = None
+_MISSING = object()
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -230,75 +231,180 @@ def runtime_config() -> Dict[str, Any]:
     return _CONFIG_CACHE
 
 
-def config_get(path: str, default: Any = None) -> Any:
-    node: Any = runtime_config()
-    for part in path.split("."):
-        if not isinstance(node, dict) or part not in node:
+class SettingsResolver:
+    """Thin config interface over env + runtime TOML config.
+
+    This isolates source precedence (env vs TOML paths) from backend logic so
+    call sites consume stable typed accessors.
+    """
+
+    def __init__(
+        self,
+        *,
+        env: Optional[Mapping[str, str]] = None,
+        config_loader: Optional[Callable[[], Dict[str, Any]]] = None,
+    ) -> None:
+        self._env: Mapping[str, str] = env if env is not None else os.environ
+        self._config_loader: Callable[[], Dict[str, Any]] = config_loader or runtime_config
+
+    def _config_value(self, path: str, default: Any = _MISSING) -> Any:
+        node: Any = self._config_loader()
+        for part in path.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def _first_env(self, names: Sequence[str]) -> Any:
+        for name in names:
+            raw = self._env.get(name)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if text:
+                return text
+        return _MISSING
+
+    def _first_config(self, paths: Sequence[str]) -> Any:
+        for path in paths:
+            value = self._config_value(path, _MISSING)
+            if value is _MISSING:
+                continue
+            if isinstance(value, str):
+                trimmed = value.strip()
+                if trimmed:
+                    return trimmed
+                continue
+            return value
+        return _MISSING
+
+    def get_str(
+        self,
+        *,
+        env_names: Sequence[str] = (),
+        config_paths: Sequence[str] = (),
+        default: str = "",
+    ) -> str:
+        env_value = self._first_env(env_names)
+        if env_value is not _MISSING:
+            return str(env_value)
+        cfg_value = self._first_config(config_paths)
+        if cfg_value is _MISSING:
             return default
-        node = node[part]
-    return node
+        return str(cfg_value).strip() or default
+
+    def get_int(
+        self,
+        *,
+        env_names: Sequence[str] = (),
+        config_paths: Sequence[str] = (),
+        default: int,
+    ) -> int:
+        env_value = self._first_env(env_names)
+        if env_value is not _MISSING:
+            return to_int(env_value, default)
+        cfg_value = self._first_config(config_paths)
+        if cfg_value is _MISSING:
+            return default
+        return to_int(cfg_value, default)
+
+    def get_float(
+        self,
+        *,
+        env_names: Sequence[str] = (),
+        config_paths: Sequence[str] = (),
+        default: float,
+    ) -> float:
+        env_value = self._first_env(env_names)
+        if env_value is not _MISSING:
+            return to_float(env_value, default)
+        cfg_value = self._first_config(config_paths)
+        if cfg_value is _MISSING:
+            return default
+        return to_float(cfg_value, default)
+
+    def get_bool(
+        self,
+        *,
+        env_names: Sequence[str] = (),
+        config_paths: Sequence[str] = (),
+        default: bool = False,
+    ) -> bool:
+        env_value = self._first_env(env_names)
+        if env_value is not _MISSING:
+            lowered = str(env_value).strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+            return default
+
+        cfg_value = self._first_config(config_paths)
+        if cfg_value is _MISSING:
+            return default
+        if isinstance(cfg_value, bool):
+            return cfg_value
+        if isinstance(cfg_value, (int, float)):
+            return bool(cfg_value)
+        if isinstance(cfg_value, str):
+            lowered = cfg_value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+
+def build_settings_resolver(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> SettingsResolver:
+    if config is None:
+        return SettingsResolver(env=env)
+    return SettingsResolver(env=env, config_loader=lambda: config)
+
+
+def config_get(path: str, default: Any = None) -> Any:
+    return build_settings_resolver()._config_value(path, default)
 
 
 def setting_str(name: str, config_path: str, default: str = "") -> str:
-    raw = (os.environ.get(name) or "").strip()
-    if raw:
-        return raw
-    cfg = config_get(config_path)
-    if cfg is None:
-        return default
-    if isinstance(cfg, str):
-        trimmed = cfg.strip()
-        return trimmed if trimmed else default
-    return str(cfg).strip() or default
+    return build_settings_resolver().get_str(
+        env_names=(name,),
+        config_paths=(config_path,),
+        default=default,
+    )
 
 
 def setting_int(name: str, config_path: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    if raw:
-        return to_int(raw, default)
-    cfg = config_get(config_path, default)
-    return to_int(cfg, default)
+    return build_settings_resolver().get_int(
+        env_names=(name,),
+        config_paths=(config_path,),
+        default=default,
+    )
 
 
 def setting_float(name: str, config_path: str, default: float) -> float:
-    raw = (os.environ.get(name) or "").strip()
-    if raw:
-        return to_float(raw, default)
-    cfg = config_get(config_path, default)
-    return to_float(cfg, default)
+    return build_settings_resolver().get_float(
+        env_names=(name,),
+        config_paths=(config_path,),
+        default=default,
+    )
 
 
 def setting_bool(name: str, config_path: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is not None:
-        text = raw.strip().lower()
-        if text in {"1", "true", "yes", "on"}:
-            return True
-        if text in {"0", "false", "no", "off"}:
-            return False
-        return default
-
-    cfg = config_get(config_path, default)
-    if isinstance(cfg, bool):
-        return cfg
-    if isinstance(cfg, (int, float)):
-        return bool(cfg)
-    if isinstance(cfg, str):
-        text = cfg.strip().lower()
-        if text in {"1", "true", "yes", "on"}:
-            return True
-        if text in {"0", "false", "no", "off"}:
-            return False
-    return default
+    return build_settings_resolver().get_bool(
+        env_names=(name,),
+        config_paths=(config_path,),
+        default=default,
+    )
 
 
 def is_truthy_env(name: str, default: bool = False, config_path: str = "") -> bool:
     if config_path:
         return setting_bool(name, config_path, default)
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return build_settings_resolver().get_bool(env_names=(name,), default=default)
 
 
 # ─── LLM config resolution ──────────────────────────────────────────────────
