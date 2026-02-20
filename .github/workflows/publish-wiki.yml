@@ -21,31 +21,28 @@ jobs:
       - name: Checkout main repo
         uses: actions/checkout@v4
 
-      - name: Checkout wiki repo
+      - name: Checkout wiki repo (master)
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository }}.wiki
           path: wiki
+          ref: master
 
-      - name: Sync docs/wiki -> wiki repo
+      - name: Sync docs/wiki -> wiki repo root
         shell: bash
         run: |
-          # Copy docs/wiki contents into the ROOT of the wiki repo
           rsync -av --delete docs/wiki/ wiki/
-
-          # GitHub wiki homepage must be Home.md
-          # Keep README.md in your repo, but publish it as Home.md in the wiki.
+          # Keep README.md in repo, but publish it as wiki Home
           if [ -f wiki/README.md ]; then
             cp -f wiki/README.md wiki/Home.md
           fi
 
-      - name: Commit & push wiki
+      - name: Commit & push wiki (master)
         working-directory: wiki
         shell: bash
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add -A
           git diff --cached --quiet || git commit -m "Sync wiki from docs/wiki"
-          git push
+          git push origin HEAD:master
