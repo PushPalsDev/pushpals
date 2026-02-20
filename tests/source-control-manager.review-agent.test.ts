@@ -3,6 +3,7 @@ import { resolve } from "path";
 import {
   ReviewAgent,
   buildCodexExecArgs,
+  deriveFixWriteGlobsFromDiff,
   resolveCodexCmd,
   resolveReviewerMdPath,
   type ReviewAgentConfig,
@@ -81,6 +82,19 @@ describe("ReviewAgent", () => {
     expect(args).toContain("exec");
   });
 
+  test("derives scoped write globs from PR diff paths", () => {
+    const globs = deriveFixWriteGlobsFromDiff([
+      "diff --git a/apps/localbuddy/src/request_status.ts b/apps/localbuddy/src/request_status.ts",
+      "diff --git a/tests/localbuddy.request-status.test.ts b/tests/localbuddy.request-status.test.ts",
+      "diff --git a/README.md b/README.md",
+      "diff --git \"a/apps/local buddy/src/space file.ts\" \"b/apps/local buddy/src/space file.ts\"",
+    ].join("\n"));
+    expect(globs).toContain("apps/localbuddy/**");
+    expect(globs).toContain("tests/**");
+    expect(globs).toContain("README.md");
+    expect(globs).toContain("apps/local buddy/**");
+  });
+
   test("poll uses configured PR base branch", async () => {
     let capturedBase = "";
 
@@ -148,6 +162,7 @@ describe("ReviewAgent", () => {
   test("enqueues fallback instruction when reviewer omits fix_instruction", async () => {
     const pr = makePr({ number: 7, html_url: "https://example.com/pr/7" });
     let enqueuedInstruction = "";
+    let enqueuedWriteGlobs: string[] = [];
 
     const agent = new ReviewAgent(
       baseConfig,
@@ -170,9 +185,13 @@ describe("ReviewAgent", () => {
         addPullRequestComment: async () => {},
         fetchImpl: async (_input, init) => {
           const payload = JSON.parse(String(init?.body ?? "{}")) as {
-            params?: { instruction?: string };
+            params?: {
+              instruction?: string;
+              planning?: { scope?: { writeGlobs?: string[] } };
+            };
           };
           enqueuedInstruction = payload.params?.instruction ?? "";
+          enqueuedWriteGlobs = payload.params?.planning?.scope?.writeGlobs ?? [];
           return new Response("ok", { status: 200 });
         },
         now: () => 123,
@@ -184,6 +203,7 @@ describe("ReviewAgent", () => {
 
     expect(enqueuedInstruction).toContain("Address ReviewAgent feedback for PR #7");
     expect(enqueuedInstruction).toContain("Missing negative-path assertions");
+    expect(enqueuedWriteGlobs.length).toBeGreaterThan(0);
   });
 
   test("skips overlapping poll ticks", async () => {

@@ -344,6 +344,93 @@ function buildFallbackFixInstruction(pr: GitHubPR, verdict: ReviewVerdict): stri
   ].join("\n");
 }
 
+function normalizeDiffPath(value: string): string | null {
+  const trimmed = value.trim().replace(/^"+|"+$/g, "");
+  if (!trimmed || trimmed === "/dev/null") return null;
+  const normalized = trimmed.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) return null;
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0) return null;
+  if (parts.some((part) => part === "." || part === "..")) return null;
+  return parts.join("/");
+}
+
+function decodeQuotedGitPath(value: string): string {
+  return value.replace(/\\([0-7]{1,3}|.)/g, (_match, token: string) => {
+    if (/^[0-7]{1,3}$/.test(token)) {
+      return String.fromCharCode(Number.parseInt(token, 8));
+    }
+    switch (token) {
+      case "n":
+        return "\n";
+      case "t":
+        return "\t";
+      case "r":
+        return "\r";
+      case "\\":
+        return "\\";
+      case '"':
+        return '"';
+      default:
+        return token;
+    }
+  });
+}
+
+function parseDiffGitLinePaths(line: string): { aPath: string; bPath: string } | null {
+  const body = line.slice("diff --git ".length).trim();
+  // Supports both:
+  // - diff --git a/path b/path
+  // - diff --git "a/path with spaces" "b/path with spaces"
+  const match = body.match(
+    /^(?:"a\/((?:[^"\\]|\\.)+)"|a\/(\S+))\s+(?:"b\/((?:[^"\\]|\\.)+)"|b\/(\S+))$/,
+  );
+  if (!match) return null;
+  const aRaw = match[1] ?? match[2] ?? "";
+  const bRaw = match[3] ?? match[4] ?? "";
+  return {
+    aPath: decodeQuotedGitPath(aRaw),
+    bPath: decodeQuotedGitPath(bRaw),
+  };
+}
+
+function parseChangedPathsFromDiff(diff: string): string[] {
+  const paths = new Set<string>();
+  for (const line of diff.split(/\r?\n/)) {
+    if (!line.startsWith("diff --git ")) continue;
+    const parsed = parseDiffGitLinePaths(line);
+    if (!parsed) continue;
+    const aPath = normalizeDiffPath(parsed.aPath);
+    const bPath = normalizeDiffPath(parsed.bPath);
+    const path = bPath ?? aPath;
+    if (path) paths.add(path);
+  }
+  return [...paths];
+}
+
+function scopeGlobForPath(path: string): string {
+  const parts = path.split("/");
+  if (parts.length === 1) return path;
+  const [first, second] = parts;
+  if (parts.length === 2 && second.includes(".")) {
+    return `${first}/**`;
+  }
+  if ((first === "apps" || first === "packages" || first === "tests") && second) {
+    return `${first}/${second}/**`;
+  }
+  return `${first}/**`;
+}
+
+export function deriveFixWriteGlobsFromDiff(diff: string): string[] {
+  const changedPaths = parseChangedPathsFromDiff(diff);
+  if (changedPaths.length === 0) {
+    return ["apps/**", "packages/**", "tests/**", "config/**", "scripts/**"];
+  }
+  const globs = new Set<string>();
+  for (const path of changedPaths) globs.add(scopeGlobForPath(path));
+  return [...globs].slice(0, 16);
+}
+
 export class ReviewAgent {
   private reviewed = new Map<number, string>();
   private reviewerMd = "";
@@ -471,7 +558,7 @@ export class ReviewAgent {
     const approved = verdict.approved && verdict.score >= this.config.passThreshold;
     const finalized = approved
       ? await this.approvePr(pr, verdict)
-      : await this.rejectPr(pr, verdict);
+      : await this.rejectPr(pr, verdict, diff);
 
     if (finalized) {
       this.reviewed.set(pr.number, sha);
@@ -500,7 +587,7 @@ export class ReviewAgent {
     }
   }
 
-  private async rejectPr(pr: GitHubPR, verdict: ReviewVerdict): Promise<boolean> {
+  private async rejectPr(pr: GitHubPR, verdict: ReviewVerdict, diff: string): Promise<boolean> {
     try {
       await this.deps.addPullRequestComment({
         token: this.githubToken,
@@ -524,7 +611,7 @@ export class ReviewAgent {
       return true;
     }
 
-    void this.enqueueFixJob(pr, verdict, sessionId, jobId);
+    void this.enqueueFixJob(pr, verdict, sessionId, jobId, diff);
     return true;
   }
 
@@ -533,10 +620,12 @@ export class ReviewAgent {
     verdict: ReviewVerdict,
     sessionId: string,
     _jobId: string | null,
+    diff: string,
   ): Promise<boolean> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
     const issuesSummary = verdict.issues.length > 0 ? verdict.issues.join("; ") : "see summary";
     const fixInstruction = verdict.fix_instruction.trim() || buildFallbackFixInstruction(pr, verdict);
+    const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
 
     const payload = {
       taskId,
@@ -563,7 +652,7 @@ export class ReviewAgent {
           queueWaitBudgetMs: 90_000,
           executionBudgetMs: 1_800_000,
           finalizationBudgetMs: 120_000,
-          scope: { readAnywhere: true, writeAllowed: true },
+          scope: { readAnywhere: true, writeAllowed: true, writeGlobs },
         },
         lane: "worker",
         recentJobs: [],
