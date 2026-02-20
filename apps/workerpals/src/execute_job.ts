@@ -3,7 +3,7 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { readFileSync } from "fs";
+import { readFileSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import {
   loadPromptTemplate,
@@ -1550,6 +1550,159 @@ function validateTaskExecutePlanning(
   return { ok: true };
 }
 
+// ─── Codex-based critic (used when executor === "openai_codex") ───────────────
+
+async function resolveCodexCommandPrefix(repo: string): Promise<string[] | null> {
+  for (const [bin, extra] of [
+    ["bunx", ["--yes", "@openai/codex"]],
+    ["codex", []],
+  ] as [string, string[]][]) {
+    try {
+      const proc = Bun.spawn(["which", bin], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+      const exitCode = await proc.exited;
+      if (exitCode === 0) return [bin, ...extra];
+    } catch {
+      // bin not available
+    }
+  }
+  return null;
+}
+
+async function runCodexCriticReview(
+  repo: string,
+  params: Record<string, unknown>,
+  quality: DeterministicQualityResult,
+  _runtimeConfig: WorkerpalsRuntimeConfig,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<CriticReview | null> {
+  const codexPrefix = await resolveCodexCommandPrefix(repo);
+  if (!codexPrefix) {
+    onLog?.("stderr", "[QualityGate] Codex critic: bunx/codex not found in PATH; skipping.");
+    return null;
+  }
+
+  const instruction = String(params.instruction ?? "").trim();
+  const planning = params.planning as TaskExecutePlanning;
+
+  const changedForDiff = quality.changedPaths.slice(0, 8);
+  let diffText = "";
+  if (changedForDiff.length > 0) {
+    const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
+    diffText = (diffResult.ok ? diffResult.stdout : diffResult.stderr).slice(
+      0,
+      QUALITY_CRITIC_MAX_DIFF_CHARS,
+    );
+  }
+
+  const validationSummary = quality.validationRuns
+    .map((run) => {
+      const output = [run.stdout, run.stderr]
+        .filter(Boolean)
+        .join("\n")
+        .slice(0, QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS);
+      return [`Command: ${run.command}`, `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode})`, output]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n---\n");
+
+  const criticInstruction = [
+    "You are a strict code review critic. Return ONLY a valid JSON object with exactly these keys:",
+    '{"score": <number 0-10>, "findings": [<string>], "must_fix": [<string>], "revision_guidance": "<string>"}',
+    "Do not output any prose, explanation, or markdown — only the JSON object.",
+    "",
+    `Task: ${instruction}`,
+    "",
+    `Acceptance criteria:\n${planning.acceptanceCriteria.map((c) => `- ${c}`).join("\n") || "- (none)"}`,
+    "",
+    `Changed paths: ${quality.changedPaths.join(", ") || "(none)"}`,
+    "",
+    diffText ? `Diff:\n${diffText}` : "Diff: (empty — no changes detected)",
+    "",
+    validationSummary ? `Validation:\n${validationSummary}` : "Validation: (none)",
+  ].join("\n");
+
+  const tmpOutputPath = `/tmp/pushpals-critic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`;
+  const cmd = [
+    ...codexPrefix,
+    "-c", 'model_reasoning_effort="low"',
+    "-a", "never",
+    "exec",
+    "-s", "read-only",
+    "--output-last-message", tmpOutputPath,
+    "-",
+  ];
+
+  try {
+    const proc = Bun.spawn(cmd, {
+      cwd: repo,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: new Blob([criticInstruction]),
+    });
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { proc.kill(); } catch { /* ignore */ }
+    }, QUALITY_CRITIC_TIMEOUT_MS);
+
+    const exitCode = await proc.exited;
+    clearTimeout(timer);
+
+    if (timedOut) {
+      onLog?.("stderr", "[QualityGate] Codex critic timed out; skipping.");
+      return null;
+    }
+    if (exitCode !== 0) {
+      const stderrText = await new Response(proc.stderr).text();
+      onLog?.(
+        "stderr",
+        `[QualityGate] Codex critic exited ${exitCode}: ${toSingleLine(stderrText, 220)}`,
+      );
+      return null;
+    }
+
+    let lastMessage = "";
+    try {
+      lastMessage = (await Bun.file(tmpOutputPath).text()).trim();
+    } catch { /* file may not exist if codex produced no output */ }
+    try { unlinkSync(tmpOutputPath); } catch { /* ignore */ }
+
+    if (!lastMessage) {
+      onLog?.("stderr", "[QualityGate] Codex critic: no output message captured; skipping.");
+      return null;
+    }
+
+    const reviewObj = parseJsonObjectLoose(lastMessage);
+    if (!reviewObj) {
+      onLog?.(
+        "stderr",
+        `[QualityGate] Codex critic returned non-JSON: ${toSingleLine(lastMessage, 220)}`,
+      );
+      return null;
+    }
+
+    const scoreRaw = Number(reviewObj.score);
+    const score = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(10, scoreRaw)) : 0;
+    const findings = Array.isArray(reviewObj.findings)
+      ? reviewObj.findings.map((f) => String(f).trim()).filter(Boolean)
+      : [];
+    const mustFix = Array.isArray(reviewObj.must_fix)
+      ? reviewObj.must_fix.map((f) => String(f).trim()).filter(Boolean)
+      : [];
+    const revisionGuidance = String(reviewObj.revision_guidance ?? "").trim().slice(0, 2000);
+    onLog?.("stdout", `[QualityGate] Codex critic score: ${score}/10`);
+    return { score, findings, mustFix, revisionGuidance, raw: compactJobOutput(lastMessage) };
+  } catch (err) {
+    onLog?.(
+      "stderr",
+      `[QualityGate] Codex critic error: ${toSingleLine(err, 220)} (skipping).`,
+    );
+    return null;
+  }
+}
+
 export async function executeJob(
   kind: string,
   params: Record<string, unknown>,
@@ -1667,7 +1820,9 @@ export async function executeJob(
     const quality = await runDeterministicQualityGate(repo, attemptParams, onLog);
     const critic = quality.skipped
       ? null
-      : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
+      : executor === "openai_codex"
+        ? await runCodexCriticReview(repo, attemptParams, quality, runtimeConfig, onLog)
+        : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
     const criticRequiresRevision = Boolean(
       critic && (critic.score < QUALITY_CRITIC_MIN_SCORE || critic.mustFix.length > 0),
     );

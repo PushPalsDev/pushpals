@@ -15,6 +15,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +63,7 @@ class OpenAICodexRuntimeConfig:
     timeout_ms_top_level: int
     timeout_ms_llm_codex: int
     timeout_ms_backend: int
+    progress_log_interval_s: int
     reasoning_effort: str
     approval_policy: str
     sandbox: str
@@ -110,6 +113,11 @@ class OpenAICodexRuntimeConfig:
                 env_names=("WORKERPALS_OPENAI_CODEX_BACKEND_TIMEOUT_MS",),
                 config_paths=("workerpals.openai_codex.timeout_ms",),
                 default=0,
+            ),
+            progress_log_interval_s=cfg.get_int(
+                env_names=("WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S",),
+                config_paths=("workerpals.openai_codex.progress_log_interval_s",),
+                default=15,
             ),
             reasoning_effort=cfg.get_str(
                 env_names=("WORKERPALS_LLM_REASONING_EFFORT", "WORKERPALS_OPENAI_CODEX_REASONING_EFFORT"),
@@ -253,6 +261,12 @@ def _resolve_reasoning_effort(config: OpenAICodexRuntimeConfig) -> str:
         f"{raw!r}; using default 'high'. Allowed: low, medium, high."
     )
     return "high"
+
+
+def _resolve_progress_log_interval_seconds(config: OpenAICodexRuntimeConfig) -> int:
+    interval = to_int(config.progress_log_interval_s, 15)
+    # Avoid noisy logs (<5s) and stale logs (>120s).
+    return max(5, min(120, interval))
 
 
 def _normalize_auth_mode(raw: str) -> str:
@@ -727,12 +741,25 @@ def _run_codex_task(
             errors="replace",
         )
         _ACTIVE_CHILD = proc
+        started_at = time.monotonic()
+        progress_interval_s = _resolve_progress_log_interval_seconds(runtime_config)
+        progress_stop = threading.Event()
+
+        def _progress_heartbeat() -> None:
+            while not progress_stop.wait(progress_interval_s):
+                elapsed = int(max(0.0, time.monotonic() - started_at))
+                log.info(f"codex exec still running ({elapsed}s elapsed)")
+
+        progress_thread = threading.Thread(target=_progress_heartbeat, daemon=True)
+        progress_thread.start()
         try:
             if communicate_timeout_s:
                 stdout, stderr = proc.communicate(prompt, timeout=communicate_timeout_s)
             else:
                 stdout, stderr = proc.communicate(prompt)
         except subprocess.TimeoutExpired as exc:
+            progress_stop.set()
+            progress_thread.join(timeout=0.2)
             _terminate_active_child()
             _ACTIVE_CHILD = None
             stdout = str(exc.stdout or "")
@@ -754,9 +781,14 @@ def _run_codex_task(
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
             }
+        finally:
+            progress_stop.set()
+            progress_thread.join(timeout=0.2)
 
         return_code = proc.returncode
         _ACTIVE_CHILD = None
+        elapsed_total = int(max(0.0, time.monotonic() - started_at))
+        log.info(f"codex exec finished in {elapsed_total}s")
 
         stdout = stdout or ""
         stderr = stderr or ""

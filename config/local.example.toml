@@ -53,6 +53,7 @@ auto_steer_max_nudges = 30
 auth_mode = "chatgpt"
 bin = "bun x --yes @openai/codex"
 timeout_ms = 120000
+progress_log_interval_s = 15
 # timeout_s = 120  # optional; if set, overrides timeout_ms
 reasoning_effort = "high"
 approval_policy = "never"
