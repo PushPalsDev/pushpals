@@ -76,3 +76,5 @@ base_branch = "main"
 [startup]
 startup_warmup = true
 lmstudio_ready_timeout_ms = 120000
+port_preflight = true
+port_conflict_policy = "terminate_pushpals"  # fail|terminate_pushpals

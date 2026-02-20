@@ -193,6 +193,8 @@ startup_warmup = true
 startup_warmup_timeout_ms = 120000
 startup_warmup_poll_ms = 1000
 allow_external_clean = false
+port_preflight = true
+port_conflict_policy = "terminate_pushpals"
 
 [client]
 local_agent_url = "http://localhost:3003"

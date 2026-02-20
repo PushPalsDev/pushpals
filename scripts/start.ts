@@ -18,6 +18,7 @@
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } from "fs";
 import { createHash } from "crypto";
+import { createServer } from "net";
 import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { loadPushPalsConfig } from "../packages/shared/src/config.js";
@@ -1703,6 +1704,304 @@ async function runCapture(cmd: string[], cwd = repoRoot): Promise<CmdResult> {
   }
 }
 
+type StartupPortSpec = {
+  name: string;
+  port: number;
+};
+
+type ListeningProcess = {
+  pid: number;
+  name: string;
+  commandLine: string;
+};
+
+function startupPortPreflightEnabled(): boolean {
+  return CONFIG.startup.portPreflight;
+}
+
+function startupPortConflictPolicy(): "fail" | "terminate_pushpals" {
+  return CONFIG.startup.portConflictPolicy;
+}
+
+function normalizeForMatch(value: string): string {
+  return value.toLowerCase().replace(/\\/g, "/");
+}
+
+function isLikelyPushPalsListener(listener: ListeningProcess): boolean {
+  const haystack = normalizeForMatch(`${listener.name} ${listener.commandLine}`);
+  if (!haystack) return false;
+
+  const repoHint = normalizeForMatch(repoRoot);
+  if (repoHint && haystack.includes(repoHint)) return true;
+
+  return (
+    haystack.includes("/pushpals/") ||
+    haystack.includes("scripts/start.ts") ||
+    haystack.includes("apps/localbuddy") ||
+    haystack.includes("apps/remotebuddy") ||
+    haystack.includes("apps/workerpals") ||
+    haystack.includes("apps/server")
+  );
+}
+
+function requiredStartupPorts(): StartupPortSpec[] {
+  const rawPorts: StartupPortSpec[] = [
+    { name: "Server", port: CONFIG.server.port },
+    { name: "LocalBuddy", port: CONFIG.localbuddy.port },
+    { name: "SourceControlManager", port: CONFIG.sourceControlManager.port },
+  ];
+
+  const out: StartupPortSpec[] = [];
+  const seen = new Set<number>();
+  for (const item of rawPorts) {
+    const port = Math.floor(item.port);
+    if (!Number.isFinite(port) || port < 1 || port > 65_535) continue;
+    if (seen.has(port)) continue;
+    seen.add(port);
+    out.push({ name: item.name, port });
+  }
+  return out;
+}
+
+async function isPortAvailable(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolveAvailability) => {
+    const server = createServer();
+    let settled = false;
+
+    const settle = (available: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolveAvailability(available);
+    };
+
+    server.once("error", () => {
+      try {
+        server.close();
+      } catch {}
+      settle(false);
+    });
+
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+      server.close(() => settle(true));
+    });
+  });
+}
+
+function parseJsonLoose(text: string): any {
+  const raw = text.trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeListenerRows(parsed: any): ListeningProcess[] {
+  const rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+  const out: ListeningProcess[] = [];
+  const seen = new Set<number>();
+
+  for (const row of rows) {
+    const pid = Number.parseInt(String(row?.pid ?? row?.ProcessId ?? ""), 10);
+    if (!Number.isFinite(pid) || pid <= 0 || seen.has(pid)) continue;
+    seen.add(pid);
+    out.push({
+      pid,
+      name: String(row?.name ?? row?.Name ?? "").trim(),
+      commandLine: String(row?.commandLine ?? row?.CommandLine ?? "").trim(),
+    });
+  }
+
+  return out;
+}
+
+async function listPortListenersWindows(port: number): Promise<ListeningProcess[]> {
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$pids = @(Get-NetTCPConnection -State Listen -LocalPort ${port} | Select-Object -ExpandProperty OwningProcess -Unique)`,
+    "$rows = @()",
+    "foreach ($pid in $pids) {",
+    "  if (-not $pid) { continue }",
+    "  $proc = Get-CimInstance Win32_Process -Filter \"ProcessId = $pid\"",
+    "  if ($null -eq $proc) { continue }",
+    "  $rows += [pscustomobject]@{ pid = [int]$proc.ProcessId; name = [string]$proc.Name; commandLine = [string]$proc.CommandLine }",
+    "}",
+    "if ($rows.Count -eq 0) { '[]' } else { $rows | ConvertTo-Json -Compress }",
+  ].join("; ");
+
+  const result = await runCapture(
+    ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+    repoRoot,
+  );
+  if (!result.stdout.trim()) return [];
+
+  const parsed = parseJsonLoose(result.stdout);
+  return normalizeListenerRows(parsed);
+}
+
+async function describePosixPid(pid: number): Promise<ListeningProcess> {
+  const [nameResult, argsResult] = await Promise.all([
+    runCapture(["ps", "-p", String(pid), "-o", "comm="], repoRoot),
+    runCapture(["ps", "-p", String(pid), "-o", "args="], repoRoot),
+  ]);
+
+  return {
+    pid,
+    name: (nameResult.stdout || "").trim(),
+    commandLine: (argsResult.stdout || "").trim(),
+  };
+}
+
+async function listPortListenersPosix(port: number): Promise<ListeningProcess[]> {
+  const pids = new Set<number>();
+
+  const lsofResult = await runCapture(
+    ["lsof", "-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"],
+    repoRoot,
+  );
+  if (lsofResult.ok && lsofResult.stdout) {
+    for (const line of lsofResult.stdout.split(/\r?\n/)) {
+      const pid = Number.parseInt(line.trim(), 10);
+      if (Number.isFinite(pid) && pid > 0) pids.add(pid);
+    }
+  }
+
+  if (pids.size === 0) {
+    const netstatResult = await runCapture(["netstat", "-ltnp"], repoRoot);
+    if (netstatResult.ok && netstatResult.stdout) {
+      for (const line of netstatResult.stdout.split(/\r?\n/)) {
+        if (!line.includes("LISTEN") || !line.includes(`:${port}`)) continue;
+        const cols = line.trim().split(/\s+/);
+        const pidProgram = cols[cols.length - 1] ?? "";
+        const pidToken = pidProgram.split("/", 1)[0] ?? "";
+        const pid = Number.parseInt(pidToken, 10);
+        if (Number.isFinite(pid) && pid > 0) pids.add(pid);
+      }
+    }
+  }
+
+  const out: ListeningProcess[] = [];
+  for (const pid of pids) {
+    out.push(await describePosixPid(pid));
+  }
+  return out;
+}
+
+async function listPortListeners(port: number): Promise<ListeningProcess[]> {
+  if (process.platform === "win32") {
+    return listPortListenersWindows(port);
+  }
+  return listPortListenersPosix(port);
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function terminateProcess(pid: number): Promise<boolean> {
+  if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) return false;
+
+  if (process.platform === "win32") {
+    const result = await runCapture(["taskkill", "/PID", String(pid), "/T", "/F"], repoRoot);
+    return result.ok;
+  }
+
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return false;
+  }
+
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await delay(100);
+  }
+
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {}
+  await delay(100);
+  return !isPidAlive(pid);
+}
+
+function shortCommandLine(value: string, maxChars = 180): string {
+  const text = (value || "").trim().replace(/\s+/g, " ");
+  if (!text) return "";
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars - 3)}...`;
+}
+
+async function ensureServicePortsAvailable(): Promise<void> {
+  if (!startupPortPreflightEnabled()) return;
+
+  const specs = requiredStartupPorts();
+  const conflicts: Array<{ spec: StartupPortSpec; listeners: ListeningProcess[] }> = [];
+
+  for (const spec of specs) {
+    if (await isPortAvailable(spec.port)) continue;
+
+    let listeners = await listPortListeners(spec.port);
+    if (startupPortConflictPolicy() === "terminate_pushpals" && listeners.length > 0) {
+      const staleCandidates = listeners.filter(
+        (listener) => listener.pid !== process.pid && isLikelyPushPalsListener(listener),
+      );
+      for (const candidate of staleCandidates) {
+        const summary = shortCommandLine(candidate.commandLine) || "<no command line>";
+        console.warn(
+          `[start] Port ${spec.port} occupied by stale PushPals process; terminating pid=${candidate.pid} (${candidate.name || "unknown"}) ${summary}`,
+        );
+        const terminated = await terminateProcess(candidate.pid);
+        if (!terminated) {
+          console.warn(`[start] Failed to terminate pid ${candidate.pid} on port ${spec.port}.`);
+        }
+      }
+
+      if (staleCandidates.length > 0) {
+        await delay(300);
+        if (await isPortAvailable(spec.port)) continue;
+        listeners = await listPortListeners(spec.port);
+      }
+    }
+
+    conflicts.push({ spec, listeners });
+  }
+
+  if (conflicts.length === 0) return;
+
+  console.error("[start] Required service port(s) are already in use:");
+  for (const conflict of conflicts) {
+    console.error(`[start] - ${conflict.spec.name} (${conflict.spec.port})`);
+    if (conflict.listeners.length === 0) {
+      console.error(`[start]   owner: unavailable (could not resolve process for port ${conflict.spec.port})`);
+      continue;
+    }
+    for (const listener of conflict.listeners) {
+      const summary = shortCommandLine(listener.commandLine) || "<no command line>";
+      console.error(
+        `[start]   pid=${listener.pid} name=${listener.name || "unknown"} cmd=${summary}`,
+      );
+    }
+  }
+
+  if (startupPortConflictPolicy() === "fail") {
+    console.error(
+      '[start] Set startup.port_conflict_policy = "terminate_pushpals" to auto-clean stale PushPals listeners.',
+    );
+  } else {
+    console.error(
+      "[start] One or more conflicting listeners are not recognized as PushPals processes; stop them manually and retry.",
+    );
+  }
+  abortStart(1);
+}
+
 function startupWarmupEnabled(): boolean {
   return CONFIG.startup.startupWarmup;
 }
@@ -2481,6 +2780,66 @@ async function ensureSourceControlManagerWorktree(): Promise<void> {
   process.env.SOURCE_CONTROL_MANAGER_REPO_PATH = repoPath;
 }
 
+/**
+ * After the remote sync (which runs inside the SCM worktree), fetch origin/main_agents
+ * into the main repo and fast-forward the local branch if it is cleanly behind origin.
+ * This is best-effort — it logs a hint if not possible but never aborts startup.
+ */
+async function tryFastForwardLocalIntegrationBranch(): Promise<void> {
+  const fetch = await runCapture(
+    ["git", "fetch", "origin", INTEGRATION_BRANCH, "--quiet"],
+    repoRoot,
+  );
+  if (!fetch.ok) return;
+
+  const localExists = await runCapture(
+    ["git", "rev-parse", "--verify", "--quiet", INTEGRATION_BRANCH],
+    repoRoot,
+  );
+  if (!localExists.ok) return;
+
+  const originRef = `origin/${INTEGRATION_BRANCH}`;
+
+  // Is local strictly behind origin? (merge-base --is-ancestor local origin succeeds when local ⊆ origin)
+  const localBehind = await runCapture(
+    ["git", "merge-base", "--is-ancestor", INTEGRATION_BRANCH, originRef],
+    repoRoot,
+  );
+  if (!localBehind.ok) return; // diverged or ahead — don't touch
+
+  // Is local already equal to origin? (both directions are ancestors ↔ same commit)
+  const alreadyEqual = await runCapture(
+    ["git", "merge-base", "--is-ancestor", originRef, INTEGRATION_BRANCH],
+    repoRoot,
+  );
+  if (alreadyEqual.ok) return; // already up to date
+
+  const currentBranch = (
+    await runCapture(["git", "rev-parse", "--abbrev-ref", "HEAD"], repoRoot)
+  ).stdout.trim();
+
+  if (currentBranch === INTEGRATION_BRANCH) {
+    // Branch is checked out — use merge --ff-only so the working tree is updated too.
+    const ff = await runCapture(["git", "merge", "--ff-only", originRef], repoRoot);
+    if (ff.ok) {
+      console.log(`[start] Fast-forwarded local ${INTEGRATION_BRANCH} to match origin.`);
+    } else {
+      console.log(
+        `[start] Note: local ${INTEGRATION_BRANCH} is behind origin but could not be fast-forwarded (uncommitted changes?). Run: git pull`,
+      );
+    }
+  } else {
+    // Branch is not checked out — safe to move its ref directly.
+    const update = await runCapture(
+      ["git", "branch", "-f", INTEGRATION_BRANCH, originRef],
+      repoRoot,
+    );
+    if (update.ok) {
+      console.log(`[start] Updated local ${INTEGRATION_BRANCH} branch to match origin.`);
+    }
+  }
+}
+
 async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
   if (!syncIntegrationWithMainEnabled()) {
     console.log("[start] Skipping integration-branch sync with main (disabled by env).");
@@ -2554,6 +2913,7 @@ async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
     console.log(
       `[start] ${INTEGRATION_REMOTE_REF} is already up to date with ${INTEGRATION_BASE_REMOTE_REF}.`,
     );
+    await tryFastForwardLocalIntegrationBranch();
     return;
   }
 
@@ -2625,6 +2985,7 @@ async function ensureIntegrationBranchUpToDateWithMain(): Promise<void> {
     console.log(
       `[start] Synced ${INTEGRATION_REMOTE_REF} with ${INTEGRATION_BASE_REMOTE_REF} successfully.`,
     );
+    await tryFastForwardLocalIntegrationBranch();
   } finally {
     if (checkoutCreated) {
       await gitInScm(["checkout", "--detach", integrationRemoteTrackingRef]);
@@ -2727,6 +3088,7 @@ try {
   cleanRuntimeStateIfRequested();
   sanitizeWindowsWatcherPaths();
   ensureRequiredLocalConfigFiles();
+  await ensureServicePortsAvailable();
   await ensureCodexCliAuthPreflight();
   await cleanupWorkerWarmContainers("startup preflight");
   await ensureLlmPreflight();

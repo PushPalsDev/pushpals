@@ -180,6 +180,8 @@ export interface PushPalsConfig {
     startupWarmupTimeoutMs: number;
     startupWarmupPollMs: number;
     allowExternalClean: boolean;
+    portPreflight: boolean;
+    portConflictPolicy: "fail" | "terminate_pushpals";
   };
   client: {
     localAgentUrl: string;
@@ -329,6 +331,18 @@ function normalizeWorkerImageRebuildMode(value: string): "auto" | "always" | "ne
     return "never";
   }
   return "auto";
+}
+
+function normalizeStartupPortConflictPolicy(value: string): "fail" | "terminate_pushpals" {
+  const text = value.trim().toLowerCase().replace(/-/g, "_");
+  if (
+    text === "terminate_pushpals" ||
+    text === "kill_pushpals" ||
+    text === "auto_kill_pushpals"
+  ) {
+    return "terminate_pushpals";
+  }
+  return "fail";
 }
 
 function defaultApiKeyForBackend(backend: string, endpoint: string): string {
@@ -977,6 +991,16 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const startupAllowExternalClean =
     parseBoolEnv("PUSHPALS_ALLOW_EXTERNAL_CLEAN") ??
     asBoolean(startupNode.allow_external_clean, false);
+  const startupPortPreflight =
+    parseBoolEnv("PUSHPALS_STARTUP_PORT_PREFLIGHT") ??
+    asBoolean(startupNode.port_preflight, true);
+  const startupPortConflictPolicy = normalizeStartupPortConflictPolicy(
+    firstNonEmpty(
+      process.env.PUSHPALS_STARTUP_PORT_CONFLICT_POLICY,
+      asString(startupNode.port_conflict_policy, "terminate_pushpals"),
+      "terminate_pushpals",
+    ),
+  );
 
   const clientNode = getObject(merged, "client");
 
@@ -1360,6 +1384,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       startupWarmupTimeoutMs: startupWarmupTimeoutMs,
       startupWarmupPollMs: startupWarmupPollMs,
       allowExternalClean: startupAllowExternalClean,
+      portPreflight: startupPortPreflight,
+      portConflictPolicy: startupPortConflictPolicy,
     },
     client: {
       localAgentUrl: firstNonEmpty(
