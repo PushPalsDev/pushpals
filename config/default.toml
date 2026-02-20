@@ -153,7 +153,7 @@ reasoning_effort = "high"
 approval_policy = "never"
 sandbox = "workspace-write"
 color = "never"
-json = false
+json = true
 
 [source_control_manager]
 repo_path = ".worktrees/source_control_manager"

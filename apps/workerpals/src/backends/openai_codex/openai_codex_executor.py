@@ -272,34 +272,158 @@ def _terminate_active_child() -> None:
             pass
 
 
-def _log_stdout(stdout: str, use_json: bool) -> None:
+def _truncate_inline(text: str, max_chars: int = 180) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= max_chars:
+        return value
+    return value[: max(1, max_chars - 3)] + "..."
+
+
+def _collect_text_fragments(value: Any, out: List[str]) -> None:
+    if isinstance(value, str):
+        text = _truncate_inline(value, 220)
+        if text:
+            out.append(text)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_text_fragments(item, out)
+        return
+    if isinstance(value, dict):
+        for key in ("text", "content", "summary", "message", "error", "reason"):
+            if key in value:
+                _collect_text_fragments(value.get(key), out)
+        return
+
+
+def _summarize_json_event(obj: Dict[str, Any]) -> str:
+    event_type = str(obj.get("type") or obj.get("event") or obj.get("kind") or "event").strip()
+    if not event_type:
+        event_type = "event"
+    # Skip noisy streaming deltas unless they contain meaningful text fragments.
+    delta_like = event_type.endswith(".delta") or event_type.endswith("_delta")
+
+    tool_name = ""
+    for key in ("tool_name", "tool", "name"):
+        raw = obj.get(key)
+        if isinstance(raw, str) and raw.strip():
+            tool_name = raw.strip()
+            break
+        if isinstance(raw, dict):
+            nested = raw.get("name")
+            if isinstance(nested, str) and nested.strip():
+                tool_name = nested.strip()
+                break
+
+    fragments: List[str] = []
+    for key in ("message", "text", "summary", "content", "output_text", "error"):
+        if key in obj:
+            _collect_text_fragments(obj.get(key), fragments)
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for frag in fragments:
+        if frag in seen:
+            continue
+        seen.add(frag)
+        deduped.append(frag)
+    text_part = deduped[0] if deduped else ""
+
+    if delta_like and not text_part:
+        return ""
+
+    parts = [event_type]
+    if tool_name:
+        parts.append(f"tool={tool_name}")
+    if text_part:
+        parts.append(text_part)
+    return " | ".join(parts)
+
+
+def _format_codex_trace_excerpt(trace: Dict[str, Any], max_items: int = 20) -> str:
+    summaries = trace.get("summaries")
+    if isinstance(summaries, list):
+        items = [str(item).strip() for item in summaries if str(item).strip()]
+        if items:
+            shown = items[:max_items]
+            lines = [f"- {item}" for item in shown]
+            omitted = len(items) - len(shown)
+            if omitted > 0:
+                lines.append(f"- ... ({omitted} more event(s) omitted)")
+            return "Codex event trace:\n" + "\n".join(lines)
+
+    event_counts = trace.get("event_type_counts")
+    if isinstance(event_counts, dict):
+        pairs = [
+            (str(key).strip() or "event", to_int(value, 0))
+            for key, value in event_counts.items()
+            if to_int(value, 0) > 0
+        ]
+        if pairs:
+            pairs.sort(key=lambda item: item[1], reverse=True)
+            listed = ", ".join(f"{name}={count}" for name, count in pairs[:8])
+            return f"Codex event types: {listed}"
+
+    return ""
+
+
+def _log_stdout(stdout: str, use_json: bool) -> Dict[str, Any]:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     if not lines:
-        return
+        return {"line_count": 0, "summaries": [], "event_type_counts": {}}
     if use_json:
         valid = 0
         invalid = 0
+        summaries: List[str] = []
+        event_type_counts: Dict[str, int] = {}
         for line in lines:
             try:
-                json.loads(line)
+                parsed = json.loads(line)
                 valid += 1
+                if isinstance(parsed, dict):
+                    event_type = (
+                        str(parsed.get("type") or parsed.get("event") or parsed.get("kind") or "event")
+                        .strip()
+                        or "event"
+                    )
+                    event_type_counts[event_type] = event_type_counts.get(event_type, 0) + 1
+                    summary = _summarize_json_event(parsed)
+                    if summary:
+                        summaries.append(summary)
             except Exception:
                 invalid += 1
         log.info(
-            f"Codex JSON stream captured ({len(lines)} line(s), valid_json={valid}, invalid={invalid}); "
-            "suppressing per-line event logs."
+            f"Codex JSON stream captured ({len(lines)} line(s), valid_json={valid}, invalid={invalid})."
         )
-        for line in lines[:8]:
-            log.debug(line)
-        if len(lines) > 8:
-            log.debug(f"... {len(lines) - 8} more JSON line(s) omitted.")
-        return
+        if summaries:
+            max_lines = 40
+            for line in summaries[:max_lines]:
+                log.info(f"[codex] {line}")
+            if len(summaries) > max_lines:
+                log.info(f"[codex] ... {len(summaries) - max_lines} additional event(s) omitted.")
+        elif event_type_counts:
+            ranked = sorted(event_type_counts.items(), key=lambda item: item[1], reverse=True)
+            top = ", ".join(f"{name}={count}" for name, count in ranked[:8])
+            log.info(f"[codex] Event types: {top}")
+        else:
+            # Keep a tiny sample if parsing produced no recognisable event objects.
+            for line in lines[:5]:
+                log.info(f"[codex/raw] {_truncate_inline(line, 220)}")
+            if len(lines) > 5:
+                log.info(f"[codex/raw] ... {len(lines) - 5} additional line(s) omitted.")
+        return {
+            "line_count": len(lines),
+            "valid_json": valid,
+            "invalid_json": invalid,
+            "summaries": summaries,
+            "event_type_counts": event_type_counts,
+        }
 
     max_lines = 40
     for line in lines[:max_lines]:
         log.info(line)
     if len(lines) > max_lines:
         log.info(f"... {len(lines) - max_lines} additional stdout line(s) omitted.")
+    return {"line_count": len(lines), "summaries": lines[:max_lines], "event_type_counts": {}}
 
 
 def _log_stderr(stderr: str) -> None:
@@ -576,11 +700,16 @@ def _run_codex_task(
             _ACTIVE_CHILD = None
             stdout = str(exc.stdout or "")
             stderr = str(exc.stderr or "")
+            stdout_trace = _log_stdout(stdout, use_json)
+            trace_excerpt = _format_codex_trace_excerpt(stdout_trace)
+            _log_stderr(stderr)
             detail = (
                 f"codex exec timed out after {communicate_timeout_s}s"
                 if communicate_timeout_s
                 else "codex exec timed out"
             )
+            if trace_excerpt:
+                detail = f"{detail}\n{trace_excerpt}"
             return {
                 "ok": False,
                 "summary": "openai_codex execution timed out",
@@ -594,7 +723,8 @@ def _run_codex_task(
 
         stdout = stdout or ""
         stderr = stderr or ""
-        _log_stdout(stdout, use_json)
+        stdout_trace = _log_stdout(stdout, use_json)
+        trace_excerpt = _format_codex_trace_excerpt(stdout_trace)
         _log_stderr(stderr)
 
         last_message = _read_text_if_exists(last_message_path)
@@ -624,6 +754,8 @@ def _run_codex_task(
             detail = stderr.strip() or stdout.strip() or "codex exec exited with a non-zero status"
             if last_message:
                 detail = f"{detail}\nLast assistant message:\n{last_message}"
+            if trace_excerpt:
+                detail = f"{detail}\n{trace_excerpt}"
             return {
                 "ok": False,
                 "summary": f"openai_codex execution failed (exit {exit_code})",
@@ -638,6 +770,8 @@ def _run_codex_task(
         stdout_parts: List[str] = []
         if last_message:
             stdout_parts.append(last_message)
+        elif trace_excerpt:
+            stdout_parts.append(trace_excerpt)
         if effective:
             listed = "\n".join(f"- {path}" for path in effective[:40])
             if len(effective) > 40:

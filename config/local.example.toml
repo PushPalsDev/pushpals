@@ -58,7 +58,7 @@ reasoning_effort = "high"
 approval_policy = "never"
 sandbox = "workspace-write"
 color = "never"
-json = false
+json = true
 
 [llm.lmstudio]
 context_window = 4096
