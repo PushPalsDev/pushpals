@@ -8,6 +8,7 @@ import { FileLock } from "./lock";
 import { GitOps } from "./git";
 import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
+import { deriveReviewPrHeadBranch } from "./review_pr_branch";
 import { createStatusServer } from "./http";
 import {
   loadConfig,
@@ -472,15 +473,57 @@ async function tick(): Promise<void> {
         }
 
         const completionPrTitle = (completion.prTitle ?? "").trim();
+        const resolvedHead = deriveReviewPrHeadBranch(completion.branch, completion.id);
+        let prHeadBranch = resolvedHead.headBranch;
+        if (resolvedHead.requiresMaterialize) {
+          console.log(
+            `[${ts()}] ReviewAgent mode - materializing hidden completion ref ${completion.branch} -> refs/heads/${prHeadBranch}`,
+          );
+          let pushResult = await runGitCapture(
+            ["-C", config.repoPath, "push", config.remote, `HEAD:refs/heads/${prHeadBranch}`],
+            repoRoot,
+          );
+          if (!pushResult.ok) {
+            const detail = `${pushResult.stderr}\n${pushResult.stdout}`.toLowerCase();
+            const likelyNonFf =
+              detail.includes("non-fast-forward") ||
+              detail.includes("fetch first") ||
+              detail.includes("rejected");
+            if (likelyNonFf) {
+              console.warn(
+                `[${ts()}] Non-fast-forward while publishing ${prHeadBranch}; retrying with --force-with-lease`,
+              );
+              pushResult = await runGitCapture(
+                [
+                  "-C",
+                  config.repoPath,
+                  "push",
+                  "--force-with-lease",
+                  config.remote,
+                  `HEAD:refs/heads/${prHeadBranch}`,
+                ],
+                repoRoot,
+              );
+            }
+          }
+          if (!pushResult.ok) {
+            throw new Error(
+              `Failed to publish review branch ${prHeadBranch}: ${pushResult.stderr || pushResult.stdout}`,
+            );
+          }
+        }
         const prTitle =
           completionPrTitle ||
-          `PushPals: ${completion.branch.replace(/^agent\//, "")} -> ${integrationBaseBranch}`;
+          `PushPals: ${prHeadBranch.replace(/^agent\//, "")} -> ${integrationBaseBranch}`;
 
         const completionPrBody = (completion.prBody ?? "").trim();
         const prBody = [
           completionPrBody || "Automated PR opened by SourceControlManager.",
           "",
-          `- Agent branch: \`${completion.branch}\``,
+          `- Agent branch: \`${prHeadBranch}\``,
+          ...(prHeadBranch !== completion.branch
+            ? [`- Completion ref: \`${completion.branch}\``]
+            : []),
           `- Commit: \`${completion.commitSha}\``,
           `- Completion ID: \`${completion.id}\``,
           "",
@@ -491,12 +534,11 @@ async function tick(): Promise<void> {
 
         const remoteUrl = remoteUrlResult.stdout.trim();
         const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
-        const agentBranch = completion.branch.replace(/^refs\/heads\//, "");
 
         const pr = await ensureIntegrationPullRequest({
           token,
           remoteUrl,
-          headBranch: agentBranch,
+          headBranch: prHeadBranch,
           baseBranch: prBaseBranch,
           title: prTitle,
           body: prBody,
