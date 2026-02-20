@@ -13,7 +13,12 @@ import type { JobResult } from "./types.js";
 import type { WorkerpalsRuntimeConfig } from "./executor_backend.js";
 import type { BackendTaskExecutor } from "../backends/types.js";
 import { EXECUTOR_RESULT_PREFIX } from "./constants.js";
-import { truncate, parseStructuredResult, filterResultLines } from "./execution_utils.js";
+import {
+  truncate,
+  parseStructuredResult,
+  filterResultLines,
+  streamLines,
+} from "./execution_utils.js";
 
 interface GenericPythonExecutorConfig {
   backendName: string;
@@ -111,25 +116,40 @@ export function createGenericPythonExecutor(
         proc.kill();
       }, timeoutMs);
 
+      const progressIntervalMs = 15_000;
+      const startedAt = Date.now();
+      let sawProcessOutput = false;
+      const progressTimer = setInterval(() => {
+        if (timedOut || sawProcessOutput) return;
+        const elapsedMs = Math.max(0, Date.now() - startedAt);
+        onLog?.(
+          "stdout",
+          `[${backendLabel}Executor] Still running (${Math.floor(
+            elapsedMs / 1000,
+          )}s elapsed); waiting for executor output...`,
+        );
+      }, progressIntervalMs);
+
+      const onProcessLine = (stream: "stdout" | "stderr", line: string) => {
+        if (!line.trim()) return;
+        sawProcessOutput = true;
+        if (stream === "stdout" && line.startsWith(EXECUTOR_RESULT_PREFIX)) {
+          return;
+        }
+        onLog?.(stream, line);
+      };
+
       const [rawStdout, rawStderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
+        proc.stdout ? streamLines(proc.stdout, "stdout", onProcessLine) : Promise.resolve(""),
+        proc.stderr ? streamLines(proc.stderr, "stderr", onProcessLine) : Promise.resolve(""),
         proc.exited,
       ]);
 
       clearTimeout(timeoutTimer);
+      clearInterval(progressTimer);
 
       const stdout = rawStdout ?? "";
       const stderr = rawStderr ?? "";
-
-      for (const line of stdout.split(/\r?\n/)) {
-        if (line.trim() && !line.startsWith(EXECUTOR_RESULT_PREFIX)) {
-          onLog?.("stdout", line);
-        }
-      }
-      for (const line of stderr.split(/\r?\n/)) {
-        if (line.trim()) onLog?.("stderr", line);
-      }
 
       const parsed = parseStructuredResult(stdout);
       const filteredStdout = filterResultLines(stdout);
