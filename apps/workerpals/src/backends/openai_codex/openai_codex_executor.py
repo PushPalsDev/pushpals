@@ -430,64 +430,121 @@ def _format_codex_trace_excerpt(trace: Dict[str, Any], max_items: int = 20) -> s
     return ""
 
 
-def _log_stdout(stdout: str, use_json: bool) -> Dict[str, Any]:
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if not lines:
-        return {"line_count": 0, "summaries": [], "event_type_counts": {}}
-    if use_json:
-        valid = 0
-        invalid = 0
-        summaries: List[str] = []
-        event_type_counts: Dict[str, int] = {}
-        for line in lines:
-            try:
-                parsed = json.loads(line)
-                valid += 1
-                if isinstance(parsed, dict):
-                    event_type = (
-                        str(parsed.get("type") or parsed.get("event") or parsed.get("kind") or "event")
-                        .strip()
-                        or "event"
-                    )
-                    event_type_counts[event_type] = event_type_counts.get(event_type, 0) + 1
-                    summary = _summarize_json_event(parsed)
-                    if summary:
-                        summaries.append(summary)
-            except Exception:
-                invalid += 1
-        log.info(
-            f"Codex JSON stream captured ({len(lines)} line(s), valid_json={valid}, invalid={invalid})."
-        )
-        if summaries:
-            max_lines = 40
-            for line in summaries[:max_lines]:
-                log.info(f"[codex] {line}")
-            if len(summaries) > max_lines:
-                log.info(f"[codex] ... {len(summaries) - max_lines} additional event(s) omitted.")
-        elif event_type_counts:
-            ranked = sorted(event_type_counts.items(), key=lambda item: item[1], reverse=True)
-            top = ", ".join(f"{name}={count}" for name, count in ranked[:8])
-            log.info(f"[codex] Event types: {top}")
-        else:
-            # Keep a tiny sample if parsing produced no recognisable event objects.
-            for line in lines[:5]:
-                log.info(f"[codex/raw] {_truncate_inline(line, 220)}")
-            if len(lines) > 5:
-                log.info(f"[codex/raw] ... {len(lines) - 5} additional line(s) omitted.")
-        return {
-            "line_count": len(lines),
-            "valid_json": valid,
-            "invalid_json": invalid,
-            "summaries": summaries,
-            "event_type_counts": event_type_counts,
-        }
+def _empty_codex_trace() -> Dict[str, Any]:
+    return {
+        "line_count": 0,
+        "valid_json": 0,
+        "invalid_json": 0,
+        "summaries": [],
+        "event_type_counts": {},
+        "live_logged": 0,
+        "live_omitted": 0,
+        "raw_logged": 0,
+        "raw_omitted": 0,
+    }
 
-    max_lines = 40
-    for line in lines[:max_lines]:
-        log.info(line)
-    if len(lines) > max_lines:
-        log.info(f"... {len(lines) - max_lines} additional stdout line(s) omitted.")
-    return {"line_count": len(lines), "summaries": lines[:max_lines], "event_type_counts": {}}
+
+def _record_live_codex_stdout_line(line: str, use_json: bool, trace: Dict[str, Any]) -> None:
+    stripped = line.strip()
+    if not stripped:
+        return
+
+    trace["line_count"] = to_int(trace.get("line_count"), 0) + 1
+    summaries = trace.setdefault("summaries", [])
+    event_type_counts = trace.setdefault("event_type_counts", {})
+    max_recorded_summaries = 500
+    max_live_logged = 120
+    max_raw_logged = 5
+
+    if use_json:
+        try:
+            parsed = json.loads(stripped)
+            trace["valid_json"] = to_int(trace.get("valid_json"), 0) + 1
+        except Exception:
+            trace["invalid_json"] = to_int(trace.get("invalid_json"), 0) + 1
+            raw_logged = to_int(trace.get("raw_logged"), 0)
+            if raw_logged < max_raw_logged:
+                log.info(f"[codex/raw] {_truncate_inline(stripped, 220)}")
+                trace["raw_logged"] = raw_logged + 1
+            else:
+                trace["raw_omitted"] = to_int(trace.get("raw_omitted"), 0) + 1
+            return
+
+        if isinstance(parsed, dict):
+            event_type = (
+                str(parsed.get("type") or parsed.get("event") or parsed.get("kind") or "event")
+                .strip()
+                or "event"
+            )
+            event_type_counts[event_type] = to_int(event_type_counts.get(event_type), 0) + 1
+            summary = _summarize_json_event(parsed)
+            if summary:
+                if len(summaries) < max_recorded_summaries:
+                    summaries.append(summary)
+                live_logged = to_int(trace.get("live_logged"), 0)
+                if live_logged < max_live_logged:
+                    log.info(f"[codex] {summary}")
+                    trace["live_logged"] = live_logged + 1
+                else:
+                    trace["live_omitted"] = to_int(trace.get("live_omitted"), 0) + 1
+        return
+
+    summary = _truncate_inline(stripped, 220)
+    if summary:
+        if len(summaries) < max_recorded_summaries:
+            summaries.append(summary)
+        live_logged = to_int(trace.get("live_logged"), 0)
+        if live_logged < max_live_logged:
+            log.info(f"[codex] {summary}")
+            trace["live_logged"] = live_logged + 1
+        else:
+            trace["live_omitted"] = to_int(trace.get("live_omitted"), 0) + 1
+
+
+def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[str, Any]:
+    line_count = to_int(trace.get("line_count"), 0)
+    valid_json = to_int(trace.get("valid_json"), 0)
+    invalid_json = to_int(trace.get("invalid_json"), 0)
+    summaries = trace.get("summaries")
+    if not isinstance(summaries, list):
+        summaries = []
+    else:
+        summaries = [str(item).strip() for item in summaries if str(item).strip()]
+    event_type_counts_raw = trace.get("event_type_counts")
+    event_type_counts: Dict[str, int] = {}
+    if isinstance(event_type_counts_raw, dict):
+        for key, value in event_type_counts_raw.items():
+            name = str(key).strip() or "event"
+            count = to_int(value, 0)
+            if count > 0:
+                event_type_counts[name] = count
+
+    if use_json:
+        log.info(
+            f"Codex JSON stream captured ({line_count} line(s), valid_json={valid_json}, invalid={invalid_json})."
+        )
+    else:
+        log.info(f"Codex stdout captured ({line_count} non-empty line(s)).")
+
+    live_omitted = to_int(trace.get("live_omitted"), 0)
+    if live_omitted > 0:
+        log.info(f"[codex] ... {live_omitted} additional event(s) omitted.")
+    raw_omitted = to_int(trace.get("raw_omitted"), 0)
+    if raw_omitted > 0:
+        log.info(f"[codex/raw] ... {raw_omitted} additional line(s) omitted.")
+
+    if not summaries and event_type_counts:
+        ranked = sorted(event_type_counts.items(), key=lambda item: item[1], reverse=True)
+        top = ", ".join(f"{name}={count}" for name, count in ranked[:8])
+        log.info(f"[codex] Event types: {top}")
+
+    return {
+        "line_count": line_count,
+        "valid_json": valid_json,
+        "invalid_json": invalid_json,
+        "summaries": summaries,
+        "event_type_counts": event_type_counts,
+    }
 
 
 def _log_stderr(stderr: str) -> None:
@@ -743,30 +800,123 @@ def _run_codex_task(
         _ACTIVE_CHILD = proc
         started_at = time.monotonic()
         progress_interval_s = _resolve_progress_log_interval_seconds(runtime_config)
-        progress_stop = threading.Event()
 
-        def _progress_heartbeat() -> None:
-            while not progress_stop.wait(progress_interval_s):
-                elapsed = int(max(0.0, time.monotonic() - started_at))
-                log.info(f"codex exec still running ({elapsed}s elapsed)")
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+        stdout_trace_state = _empty_codex_trace()
+        trace_lock = threading.Lock()
+        last_activity_at = {"ts": started_at}
 
-        progress_thread = threading.Thread(target=_progress_heartbeat, daemon=True)
-        progress_thread.start()
+        def _drain_stdout() -> None:
+            stream = proc.stdout
+            if stream is None:
+                return
+            try:
+                for chunk in iter(stream.readline, ""):
+                    if chunk == "":
+                        break
+                    stdout_chunks.append(chunk)
+                    line = chunk.strip()
+                    if not line:
+                        continue
+                    with trace_lock:
+                        last_activity_at["ts"] = time.monotonic()
+                        _record_live_codex_stdout_line(line, use_json, stdout_trace_state)
+            except Exception:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        def _drain_stderr() -> None:
+            stream = proc.stderr
+            if stream is None:
+                return
+            try:
+                for chunk in iter(stream.readline, ""):
+                    if chunk == "":
+                        break
+                    stderr_chunks.append(chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        stdout_thread = threading.Thread(target=_drain_stdout, daemon=True)
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+            except Exception:
+                pass
+
+        deadline = (
+            started_at + float(communicate_timeout_s)
+            if communicate_timeout_s and communicate_timeout_s > 0
+            else None
+        )
+        next_progress_at = started_at + float(progress_interval_s)
+        timed_out = False
+
+        while proc.poll() is None:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                timed_out = True
+                _terminate_active_child()
+                break
+
+            if now >= next_progress_at:
+                elapsed = int(max(0.0, now - started_at))
+                with trace_lock:
+                    last_event = float(last_activity_at.get("ts", started_at))
+                    valid_json = to_int(stdout_trace_state.get("valid_json"), 0)
+                    total_lines = to_int(stdout_trace_state.get("line_count"), 0)
+                idle_for = int(max(0.0, now - last_event))
+                if use_json:
+                    log.info(
+                        f"codex exec still running ({elapsed}s elapsed, json_events={valid_json}, idle={idle_for}s)"
+                    )
+                else:
+                    log.info(
+                        f"codex exec still running ({elapsed}s elapsed, stdout_lines={total_lines}, idle={idle_for}s)"
+                    )
+                next_progress_at = now + float(progress_interval_s)
+
+            time.sleep(1.0)
+
         try:
-            if communicate_timeout_s:
-                stdout, stderr = proc.communicate(prompt, timeout=communicate_timeout_s)
-            else:
-                stdout, stderr = proc.communicate(prompt)
-        except subprocess.TimeoutExpired as exc:
-            progress_stop.set()
-            progress_thread.join(timeout=0.2)
-            _terminate_active_child()
-            _ACTIVE_CHILD = None
-            stdout = str(exc.stdout or "")
-            stderr = str(exc.stderr or "")
-            stdout_trace = _log_stdout(stdout, use_json)
-            trace_excerpt = _format_codex_trace_excerpt(stdout_trace)
-            _log_stderr(stderr)
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+
+        return_code = proc.returncode
+        _ACTIVE_CHILD = None
+        elapsed_total = int(max(0.0, time.monotonic() - started_at))
+        log.info(f"codex exec finished in {elapsed_total}s")
+
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
+        stdout_trace = _finalize_codex_stdout_trace(stdout_trace_state, use_json)
+        trace_excerpt = _format_codex_trace_excerpt(stdout_trace)
+        _log_stderr(stderr)
+
+        if timed_out:
             detail = (
                 f"codex exec timed out after {communicate_timeout_s}s"
                 if communicate_timeout_s
@@ -781,20 +931,6 @@ def _run_codex_task(
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
             }
-        finally:
-            progress_stop.set()
-            progress_thread.join(timeout=0.2)
-
-        return_code = proc.returncode
-        _ACTIVE_CHILD = None
-        elapsed_total = int(max(0.0, time.monotonic() - started_at))
-        log.info(f"codex exec finished in {elapsed_total}s")
-
-        stdout = stdout or ""
-        stderr = stderr or ""
-        stdout_trace = _log_stdout(stdout, use_json)
-        trace_excerpt = _format_codex_trace_excerpt(stdout_trace)
-        _log_stderr(stderr)
 
         last_message = _read_text_if_exists(last_message_path)
         log_git_status(repo, log)

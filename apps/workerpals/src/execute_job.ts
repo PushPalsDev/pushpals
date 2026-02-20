@@ -142,20 +142,69 @@ function parseJsonObjectLoose(text: string): Record<string, unknown> | null {
   return null;
 }
 
-function shellCommandForPlatform(command: string): string[] {
-  if (process.platform === "win32") {
-    return ["powershell", "-NoProfile", "-Command", command];
+const SHELL_CONTROL_TOKENS = new Set(["&&", "||", ";", "|"]);
+
+export function tokenizeValidationCommandArgv(command: string): string[] | null {
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+
+  const out: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+
+  const pushCurrent = () => {
+    if (!current) return;
+    out.push(current);
+    current = "";
+  };
+
+  for (const ch of trimmed) {
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      pushCurrent();
+      continue;
+    }
+    current += ch;
   }
-  return ["/bin/bash", "-lc", command];
+  if (quote) return null;
+  pushCurrent();
+  if (out.length === 0) return null;
+  if (out.some((token) => SHELL_CONTROL_TOKENS.has(token))) return null;
+  return out;
 }
 
-async function runShellValidationCommand(
+async function runValidationCommand(
   repo: string,
   command: string,
   timeoutMs: number,
 ): Promise<ValidationExecutionResult> {
+  const argv = tokenizeValidationCommandArgv(command);
+  if (!argv) {
+    return {
+      step: command,
+      command,
+      ok: false,
+      exitCode: 2,
+      stdout: "",
+      stderr:
+        "Validation command could not be parsed safely. Use a plain command without shell chaining/pipes.",
+      elapsedMs: 1,
+    };
+  }
   const startedAt = Date.now();
-  const proc = Bun.spawn(shellCommandForPlatform(command), {
+  const proc = Bun.spawn(argv, {
     cwd: repo,
     stdout: "pipe",
     stderr: "pipe",
@@ -287,6 +336,63 @@ function extractRunnableValidationCommand(step: string): string | null {
   return null;
 }
 
+export function inferFallbackValidationCommandsForTestTask(
+  instruction: string,
+  targetPath: string | undefined,
+  planning: TaskExecutePlanning,
+  changedTestPaths: string[],
+): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const add = (command: string) => {
+    const trimmed = command.trim();
+    if (!trimmed) return;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(trimmed);
+  };
+
+  const lowerInstruction = instruction.toLowerCase();
+  const pythonSignal =
+    /\b(pytest|python)\b/.test(lowerInstruction) ||
+    changedTestPaths.some((entry) => entry.toLowerCase().endsWith(".py"));
+
+  const normalizedTarget = (targetPath ?? "").replace(/\\/g, "/").trim();
+  if (normalizedTarget && isLikelyTestPath(normalizedTarget)) {
+    add(pythonSignal ? `pytest ${normalizedTarget}` : `bun test ${normalizedTarget}`);
+  }
+
+  if (changedTestPaths.length > 0) {
+    const focused = changedTestPaths.slice(0, 4).join(" ");
+    add(pythonSignal ? `pytest ${focused}` : `bun test ${focused}`);
+  }
+
+  const scopeHints = [
+    targetPath ?? "",
+    ...(planning.targetPaths ?? []),
+    ...(planning.scope.writeGlobs ?? []),
+    ...(planning.discovery?.likelyDirs ?? []),
+  ]
+    .map((entry) => entry.replace(/\\/g, "/").trim())
+    .filter(Boolean);
+  const appRoot = scopeHints
+    .map((entry) => {
+      const match = entry.match(/^apps\/[^/]+/i);
+      return match?.[0] ?? "";
+    })
+    .find(Boolean);
+  if (appRoot) {
+    add(pythonSignal ? `pytest ${appRoot}` : `bun --cwd ${appRoot} test`);
+  }
+
+  // Prefer scoped validation; only fall back to full-suite test runs when no scope is available.
+  if (candidates.length === 0) {
+    add(pythonSignal ? "pytest" : "bun test");
+  }
+  return candidates.slice(0, 4);
+}
+
 function isTestFocusedTask(
   instruction: string,
   planning: TaskExecutePlanning,
@@ -385,15 +491,31 @@ async function runDeterministicQualityGate(
     .map((step) => extractRunnableValidationCommand(step))
     .filter((entry): entry is string => Boolean(entry))
     .slice(0, 4);
+  const fallbackValidationSteps =
+    runnableSteps.length === 0
+      ? inferFallbackValidationCommandsForTestTask(
+          instruction,
+          targetPath,
+          planning,
+          changedTestPaths,
+        )
+      : [];
+  const commandsToRun = runnableSteps.length > 0 ? runnableSteps : fallbackValidationSteps;
   const validationRuns: ValidationExecutionResult[] = [];
-  if (runnableSteps.length === 0) {
+  if (commandsToRun.length === 0) {
     issues.push(
       "No runnable validation command was provided in planning.validationSteps (expected at least one test command).",
     );
   } else {
-    for (const command of runnableSteps) {
+    if (runnableSteps.length === 0) {
+      onLog?.(
+        "stdout",
+        `[QualityGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
+      );
+    }
+    for (const command of commandsToRun) {
       onLog?.("stdout", `[QualityGate] Quality gate validation: running "${command}"`);
-      const run = await runShellValidationCommand(
+      const run = await runValidationCommand(
         repo,
         command,
         QUALITY_VALIDATION_STEP_TIMEOUT_MS,
