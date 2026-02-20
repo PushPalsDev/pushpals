@@ -1898,10 +1898,28 @@ export async function executeJob(
   };
   const executionBudgetMs = Number(planning.executionBudgetMs);
   const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
+  const qualityMaxAutoRevisions = Math.max(
+    0,
+    Math.min(
+      10,
+      Number.isFinite(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
+        ? Math.floor(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
+        : QUALITY_MAX_AUTO_REVISIONS,
+    ),
+  );
+  const qualitySoftPassOnExhausted =
+    typeof runtimeConfig.workerpals.qualitySoftPassOnExhausted === "boolean"
+      ? runtimeConfig.workerpals.qualitySoftPassOnExhausted
+      : true;
+
+  onLog?.(
+    "stdout",
+    `[QualityGate] Policy: max_auto_revisions=${qualityMaxAutoRevisions}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}, critic_min_score=${QUALITY_CRITIC_MIN_SCORE}`,
+  );
 
   let revisionAttempt = 0;
   let revisionHint = "";
-  while (revisionAttempt <= QUALITY_MAX_AUTO_REVISIONS) {
+  while (revisionAttempt <= qualityMaxAutoRevisions) {
     const attemptParams: Record<string, unknown> = { ...normalizedParams };
     if (revisionHint) {
       attemptParams.qualityRevisionHint = revisionHint;
@@ -1968,7 +1986,33 @@ export async function executeJob(
       }
     }
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
-    if (revisionAttempt >= QUALITY_MAX_AUTO_REVISIONS) {
+    if (revisionAttempt >= qualityMaxAutoRevisions) {
+      if (qualitySoftPassOnExhausted) {
+        const diagnostics = truncate(
+          [
+            result.stderr ?? "",
+            quality.skipped
+              ? ""
+              : `Deterministic issues: ${quality.issues.map((entry) => toSingleLine(entry, 220)).join(" | ")}`,
+            critic ? `Critic raw: ${critic.raw}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+        onLog?.(
+          "stderr",
+          `[QualityGate] Soft-pass after ${revisionAttempt} auto-revision attempt(s): ${toSingleLine(
+            issueSummary,
+            260,
+          )}`,
+        );
+        return {
+          ...result,
+          summary: `${result.summary} (quality gate soft-pass after ${revisionAttempt} auto-revision attempt(s))`,
+          stderr: diagnostics,
+          exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
+        };
+      }
       return {
         ok: false,
         summary: `Quality gate failed after ${revisionAttempt} auto-revision attempt(s): ${toSingleLine(
@@ -1995,7 +2039,7 @@ export async function executeJob(
     revisionHint = buildQualityRevisionHint(issues, critic, planning);
     onLog?.(
       "stderr",
-      `[QualityGate] Quality gate requested revision ${revisionAttempt}/${QUALITY_MAX_AUTO_REVISIONS}: ${toSingleLine(
+      `[QualityGate] Quality gate requested revision ${revisionAttempt}/${qualityMaxAutoRevisions}: ${toSingleLine(
         issueSummary,
         260,
       )}`,

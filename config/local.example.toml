@@ -36,6 +36,8 @@ openhands_stuck_guard_broad_scan_limit = 2
 openhands_stuck_guard_no_progress_max_ms = 300000
 docker_warm_memory_mb = 2048
 docker_warm_cpus = 2
+quality_max_auto_revisions = 4
+quality_soft_pass_on_exhausted = true
 
 [workerpals.openhands]
 prompt_profile = "minimal"

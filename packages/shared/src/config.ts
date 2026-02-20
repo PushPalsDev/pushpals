@@ -138,6 +138,8 @@ export interface PushPalsConfig {
     dockerNetworkMode: string;
     dockerWarmMemoryMb: number;
     dockerWarmCpus: number;
+    qualityMaxAutoRevisions: number;
+    qualitySoftPassOnExhausted: boolean;
     baseRef: string;
     labels: string[];
     failureCooldownMs: number;
@@ -638,6 +640,19 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     10_000,
     asInt(workerNode.openai_codex_timeout_ms, 1_800_000),
   );
+  const workerQualityMaxAutoRevisions = Math.max(
+    0,
+    Math.min(
+      10,
+      asInt(
+        parseIntEnv("WORKERPALS_QUALITY_MAX_AUTO_REVISIONS") ?? workerNode.quality_max_auto_revisions,
+        4,
+      ),
+    ),
+  );
+  const workerQualitySoftPassOnExhausted =
+    parseBoolEnv("WORKERPALS_QUALITY_SOFT_PASS_ON_EXHAUSTED") ??
+    asBoolean(workerNode.quality_soft_pass_on_exhausted, true);
   const workerOpenHandsStuckGuardEnabled =
     parseBoolEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_ENABLED") ??
     asBoolean(workerNode.openhands_stuck_guard_enabled, true);
@@ -1282,6 +1297,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       dockerJobRetryBackoffMs: workerDockerJobRetryBackoffMs,
       dockerWarmMemoryMb: workerDockerWarmMemoryMb,
       dockerWarmCpus: workerDockerWarmCpus,
+      qualityMaxAutoRevisions: workerQualityMaxAutoRevisions,
+      qualitySoftPassOnExhausted: workerQualitySoftPassOnExhausted,
       dockerNetworkMode: asString(
         process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? workerNode.docker_network_mode,
         "bridge",
