@@ -31,11 +31,11 @@ jobs:
       - name: Sync docs/wiki -> wiki repo root
         shell: bash
         run: |
-          rsync -av --delete docs/wiki/ wiki/
-          # Keep README.md in repo, but publish it as wiki Home
+          rsync -av --delete --exclude='.git' docs/wiki/ wiki/
           if [ -f wiki/README.md ]; then
             cp -f wiki/README.md wiki/Home.md
           fi
+          test -d wiki/.git
 
       - name: Commit & push wiki (master)
         working-directory: wiki
