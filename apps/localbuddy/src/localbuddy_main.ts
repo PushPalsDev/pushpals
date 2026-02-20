@@ -23,7 +23,15 @@ import {
   type JobLogApiRow,
   type RequestApiRow,
 } from "./request_status.js";
-import { answerLocalReadonlyQuery, isLocalReadonlyQueryPrompt } from "./local_readonly.js";
+import {
+  isLikelyLocalOnlyPrompt,
+  parseRemoteBuddyCommand,
+  classifyRemoteRequestPriority,
+  queueWaitBudgetForPriority,
+  formatEtaFromMs,
+  parseStatusHeartbeatMs,
+} from "./localbuddy_helpers.js";
+import { answerLocalReadonlyQuery } from "./local_readonly.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -61,13 +69,6 @@ function parseArgs(): {
   return { server, port, sessionId, authToken };
 }
 
-function parseStatusHeartbeatMs(fallbackMs: number): number {
-  const parsed = Math.floor(fallbackMs);
-  if (!Number.isFinite(parsed)) return 120_000;
-  if (parsed <= 0) return 0;
-  return Math.max(30_000, parsed);
-}
-
 function summarizeFailureForPrompt(value: unknown): string {
   const text = String(value ?? "")
     .replace(/\s+/g, " ")
@@ -101,8 +102,6 @@ function summarizeFailureForPrompt(value: unknown): string {
   if (compact.length <= 220) return compact;
   return `${compact.slice(0, 217)}...`;
 }
-
-const ASK_REMOTE_BUDDY_COMMAND = "/ask_remote_buddy";
 
 const LOCAL_QUICK_REPLY_SYSTEM_PROMPT = `
 You are PushPals LocalBuddy.
@@ -263,120 +262,216 @@ interface JobLogListResponse {
   message?: string;
 }
 
-type RequestPriority = "interactive" | "normal" | "background";
 
-function classifyRemoteRequestPriority(input: string): RequestPriority {
-  const text = String(input ?? "")
-    .trim()
-    .toLowerCase();
-  if (!text) return "normal";
-
-  if (
-    /\b(status|progress|queue|queued|eta|where|hows my job|what'?s my status|check on)\b/.test(text)
-  ) {
-    return "interactive";
-  }
-
-  if (
-    /\b(comprehensive|deep dive|full pass|phase\s+\d|architecture|migration|refactor|rewrite|all components|everything)\b/.test(
-      text,
-    ) ||
-    text.length > 1200
-  ) {
-    return "background";
-  }
-
-  return "normal";
+export interface LocalBuddyMessageHandlerOptions {
+  comm: Pick<CommunicationManager, "userMessage" | "assistantMessage">;
+  serverUrl: string;
+  sessionId: string;
+  authToken: string | null;
+  answerLocally: (prompt: string) => Promise<string>;
 }
 
-function queueWaitBudgetForPriority(priority: RequestPriority): number {
-  switch (priority) {
-    case "interactive":
-      return 20_000;
-    case "background":
-      return 240_000;
-    default:
-      return 90_000;
-  }
-}
-
-function formatEtaFromMs(ms: number | undefined): string {
-  if (!Number.isFinite(ms as number) || (ms as number) <= 0) return "now";
-  const value = Math.max(0, Math.floor(ms as number));
-  if (value < 1_000) return `${value}ms`;
-  const secs = Math.ceil(value / 1_000);
-  if (secs < 60) return `${secs}s`;
-  const minutes = Math.floor(secs / 60);
-  const remSecs = secs % 60;
-  return remSecs > 0 ? `${minutes}m ${remSecs}s` : `${minutes}m`;
-}
-
-function parseRemoteBuddyCommand(input: string): {
-  forceRemote: boolean;
-  prompt: string;
-  usageMessage?: string;
-} {
-  const trimmed = String(input ?? "").trim();
-  const command = ASK_REMOTE_BUDDY_COMMAND.toLowerCase();
-  if (!trimmed.toLowerCase().startsWith(command)) {
-    return { forceRemote: false, prompt: trimmed };
-  }
-
-  const rest = trimmed
-    .slice(command.length)
-    .replace(/^[:\-]\s*/, "")
-    .trim();
-  if (!rest) {
-    return {
-      forceRemote: true,
-      prompt: "",
-      usageMessage:
-        "Usage: /ask_remote_buddy <request>. Example: /ask_remote_buddy fix the failing job status in the dashboard.",
+export function createLocalBuddyMessageHandler(
+  options: LocalBuddyMessageHandlerOptions,
+): (req: Request) => Promise<Response> {
+  const { comm, serverUrl, sessionId, authToken, answerLocally } = options;
+  return async function handleMessage(req: Request): Promise<Response> {
+    const jsonHeaders = {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers": "content-type, authorization",
     };
-  }
-  return { forceRemote: true, prompt: rest };
+
+    const makeJson = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), { status, headers: jsonHeaders });
+
+    try {
+      const body = (await req.json()) as { text: string };
+      const rawPrompt = String(body.text ?? "");
+      const routing = parseRemoteBuddyCommand(rawPrompt);
+      const routedPrompt = routing.prompt;
+      const forceRemote = routing.forceRemote;
+      const statusLookupIntent = isStatusLookupPrompt(routedPrompt);
+      const localOnly =
+        !forceRemote && (statusLookupIntent || isLikelyLocalOnlyPrompt(routedPrompt));
+
+      if (!rawPrompt.trim()) {
+        return makeJson({ ok: false, message: "text is required" }, 400);
+      }
+
+      console.log(
+        `[LocalBuddy] Received message: ${rawPrompt.substring(0, 80)}${rawPrompt.length > 80 ? "..." : ""}`,
+      );
+      if (forceRemote) {
+        console.log("[LocalBuddy] Routing mode: forced RemoteBuddy via /ask_remote_buddy");
+      } else if (statusLookupIntent) {
+        console.log("[LocalBuddy] Routing mode: local status lookup");
+      } else if (localOnly) {
+        console.log("[LocalBuddy] Routing mode: local-only reply");
+      } else {
+        console.log("[LocalBuddy] Routing mode: queue for RemoteBuddy");
+      }
+
+      const cmdHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (authToken) cmdHeaders["Authorization"] = `Bearer ${authToken}`;
+
+      void comm
+        .userMessage(rawPrompt)
+        .then((ok) => {
+          if (!ok) {
+            console.error(`[LocalBuddy] Failed to emit user message to session`);
+          }
+        })
+        .catch((err) =>
+          console.error(`[LocalBuddy] Failed to emit user message to session:`, err),
+        );
+
+      void comm
+        .assistantMessage(
+          forceRemote
+            ? "Received your request. Routing this to RemoteBuddy now."
+            : localOnly
+              ? "Received your request. I can answer this directly as LocalBuddy."
+              : "Received your request. Queueing this to RemoteBuddy now.",
+        )
+        .then((ok) => {
+          if (!ok) {
+            console.error(`[LocalBuddy] Failed to emit immediate acknowledgement message`);
+          }
+        })
+        .catch((err) =>
+          console.error(`[LocalBuddy] Failed to emit immediate acknowledgement message:`, err),
+        );
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          let closed = false;
+          const send = (data: { type: string; message: string; data?: any }) => {
+            if (closed) return;
+            try {
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`));
+            } catch {
+              closed = true;
+            }
+          };
+
+          const close = () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              /* already closed */
+            }
+          };
+
+          try {
+            if (routing.usageMessage) {
+              send({ type: "status", message: "Command missing request body." });
+              await comm.assistantMessage(routing.usageMessage);
+              send({
+                type: "complete",
+                message: "Handled locally",
+                data: { mode: "local_usage_hint", sessionId },
+              });
+              close();
+              return;
+            }
+
+            if (localOnly) {
+              send({ type: "status", message: "Generating LocalBuddy response..." });
+              const localReply = await answerLocally(routedPrompt);
+              await comm.assistantMessage(localReply);
+              send({
+                type: "complete",
+                message: "Responded locally",
+                data: { mode: "local", sessionId },
+              });
+              close();
+              return;
+            }
+
+            send({ type: "status", message: "Enqueuing to Request Queue..." });
+
+            const priority = classifyRemoteRequestPriority(routedPrompt);
+            const queueWaitBudgetMs = queueWaitBudgetForPriority(priority);
+
+            const res = await fetch(`${serverUrl}/requests/enqueue`, {
+              method: "POST",
+              headers: cmdHeaders,
+              body: JSON.stringify({
+                sessionId,
+                prompt: routedPrompt,
+                priority,
+                queueWaitBudgetMs,
+              }),
+            });
+
+            if (!res.ok) {
+              const err = await res.text();
+              console.error(`[LocalBuddy] Failed to enqueue request: ${err}`);
+              send({ type: "error", message: `Failed to enqueue: ${err}` });
+              close();
+              return;
+            }
+
+            const data = (await res.json()) as {
+              ok: boolean;
+              requestId?: string;
+              queuePosition?: number;
+              etaMs?: number;
+            };
+            console.log(`[LocalBuddy] Enqueued request: ${data.requestId}`);
+
+            const requestSuffix = data.requestId ? ` (${data.requestId.slice(0, 8)})` : "";
+            const queueSuffix =
+              Number.isFinite(data.queuePosition as number) &&
+              (data.queuePosition as number) > 0
+                ? ` Priority ${priority}; queue #${data.queuePosition} (ETA ${formatEtaFromMs(
+                    data.etaMs,
+                  )}).`
+                : ` Priority ${priority}.`;
+            await comm.assistantMessage(
+              `Request queued${requestSuffix}.${queueSuffix} RemoteBuddy is planning and will assign a WorkerPal.`,
+            );
+
+            send({
+              type: "complete",
+              message: "Request enqueued successfully",
+              data: {
+                requestId: data.requestId,
+                sessionId,
+                priority,
+                queuePosition: data.queuePosition,
+                etaMs: data.etaMs,
+              },
+            });
+
+            close();
+          } catch (err) {
+            console.error(`[LocalBuddy] Error processing message:`, err);
+            send({ type: "error", message: String(err) });
+            close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    } catch (err) {
+      console.error(`[LocalBuddy] Error processing message:`, err);
+      return makeJson({ ok: false, message: String(err) }, 500);
+    }
+  };
 }
 
-function isLikelyLocalOnlyPrompt(input: string): boolean {
-  const text = String(input ?? "")
-    .trim()
-    .toLowerCase();
-  if (!text) return true;
-
-  if (isLocalReadonlyQueryPrompt(text)) {
-    return true;
-  }
-
-  if (
-    /^(hi|hello|hey|yo|sup|thanks|thank you|thx|ok|okay|cool|nice|good morning|good afternoon|good evening)[!. ]*$/.test(
-      text,
-    )
-  ) {
-    return true;
-  }
-
-  if (/^(how are you|what can you do|who are you|are you there|status\??)\b/.test(text)) {
-    return true;
-  }
-
-  const executionCue =
-    /\b(fix|implement|write|create|add|remove|delete|rename|refactor|run|test|lint|build|debug|search|find|edit|update|change)\b/.test(
-      text,
-    );
-  if (executionCue) return false;
-
-  // Short affirmatives are replies to a prior RemoteBuddy question ("Should I implement this?")
-  // and should be forwarded there, not handled locally.
-  if (
-    /^(yes|confirm|confirmed|proceed|go ahead|go|do it|let'?s?(?: do it| go)?|sure|yep|yup|absolutely|approved?)[!. ]*$/.test(
-      text,
-    )
-  ) {
-    return false;
-  }
-
-  return text.length <= 120;
-}
 
 // ─── LocalBuddy HTTP Server ─────────────────────────────────────────────────
 
@@ -611,6 +706,13 @@ Respond in strict JSON with this shape:
       authToken,
       from: `agent:${agentId}`,
     });
+    const handleMessage = createLocalBuddyMessageHandler({
+      comm,
+      serverUrl,
+      sessionId,
+      authToken,
+      answerLocally,
+    });
     let stopping = false;
     let statusSessionReady = false;
     const ensureSessionWithRetry = async (
@@ -763,198 +865,7 @@ Respond in strict JSON with this shape:
 
         // POST /message - Main endpoint for client messages with streaming status
         if (pathname === "/message" && method === "POST") {
-          try {
-            const body = (await req.json()) as { text: string };
-            const rawPrompt = String(body.text ?? "");
-            const routing = parseRemoteBuddyCommand(rawPrompt);
-            const routedPrompt = routing.prompt;
-            const forceRemote = routing.forceRemote;
-            const statusLookupIntent = isStatusLookupPrompt(routedPrompt);
-            const localOnly =
-              !forceRemote && (statusLookupIntent || isLikelyLocalOnlyPrompt(routedPrompt));
-
-            if (!rawPrompt.trim()) {
-              return makeJson({ ok: false, message: "text is required" }, 400);
-            }
-
-            console.log(
-              `[LocalBuddy] Received message: ${rawPrompt.substring(0, 80)}${rawPrompt.length > 80 ? "..." : ""}`,
-            );
-            if (forceRemote) {
-              console.log("[LocalBuddy] Routing mode: forced RemoteBuddy via /ask_remote_buddy");
-            } else if (statusLookupIntent) {
-              console.log("[LocalBuddy] Routing mode: local status lookup");
-            } else if (localOnly) {
-              console.log("[LocalBuddy] Routing mode: local-only reply");
-            } else {
-              console.log("[LocalBuddy] Routing mode: queue for RemoteBuddy");
-            }
-
-            // ── Step 0: Emit user message to server session so it appears in UI ──
-            const cmdHeaders: Record<string, string> = { "Content-Type": "application/json" };
-            if (authToken) cmdHeaders["Authorization"] = `Bearer ${authToken}`;
-
-            void comm
-              .userMessage(rawPrompt)
-              .then((ok) => {
-                if (!ok) {
-                  console.error(`[LocalBuddy] Failed to emit user message to session`);
-                }
-              })
-              .catch((err) =>
-                console.error(`[LocalBuddy] Failed to emit user message to session:`, err),
-              );
-
-            void comm
-              .assistantMessage(
-                forceRemote
-                  ? "Received your request. Routing this to RemoteBuddy now."
-                  : localOnly
-                    ? "Received your request. I can answer this directly as LocalBuddy."
-                    : "Received your request. Queueing this to RemoteBuddy now.",
-              )
-              .then((ok) => {
-                if (!ok) {
-                  console.error(`[LocalBuddy] Failed to emit immediate acknowledgement message`);
-                }
-              })
-              .catch((err) =>
-                console.error(
-                  `[LocalBuddy] Failed to emit immediate acknowledgement message:`,
-                  err,
-                ),
-              );
-
-            // ── Process and stream status back via SSE ──
-            let closed = false;
-            const stream = new ReadableStream({
-              async start(controller) {
-                const send = (data: { type: string; message: string; data?: any }) => {
-                  if (closed) return;
-                  try {
-                    controller.enqueue(
-                      new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`),
-                    );
-                  } catch {
-                    closed = true;
-                  }
-                };
-
-                const close = () => {
-                  if (closed) return;
-                  closed = true;
-                  try {
-                    controller.close();
-                  } catch {
-                    /* already closed */
-                  }
-                };
-
-                try {
-                  if (routing.usageMessage) {
-                    send({ type: "status", message: "Command missing request body." });
-                    await comm.assistantMessage(routing.usageMessage);
-                    send({
-                      type: "complete",
-                      message: "Handled locally",
-                      data: { mode: "local_usage_hint", sessionId },
-                    });
-                    close();
-                    return;
-                  }
-
-                  if (localOnly) {
-                    send({ type: "status", message: "Generating LocalBuddy response..." });
-                    const localReply = await answerLocally(routedPrompt);
-                    await comm.assistantMessage(localReply);
-                    send({
-                      type: "complete",
-                      message: "Responded locally",
-                      data: { mode: "local", sessionId },
-                    });
-                    close();
-                    return;
-                  }
-
-                  // Queue immediately; RemoteBuddy handles context/planning.
-                  send({ type: "status", message: "Enqueuing to Request Queue..." });
-
-                  const priority = classifyRemoteRequestPriority(routedPrompt);
-                  const queueWaitBudgetMs = queueWaitBudgetForPriority(priority);
-
-                  const res = await fetch(`${serverUrl}/requests/enqueue`, {
-                    method: "POST",
-                    headers: cmdHeaders,
-                    body: JSON.stringify({
-                      sessionId,
-                      prompt: routedPrompt,
-                      priority,
-                      queueWaitBudgetMs,
-                    }),
-                  });
-
-                  if (!res.ok) {
-                    const err = await res.text();
-                    console.error(`[LocalBuddy] Failed to enqueue request: ${err}`);
-                    send({ type: "error", message: `Failed to enqueue: ${err}` });
-                    close();
-                    return;
-                  }
-
-                  const data = (await res.json()) as {
-                    ok: boolean;
-                    requestId?: string;
-                    queuePosition?: number;
-                    etaMs?: number;
-                  };
-                  console.log(`[LocalBuddy] Enqueued request: ${data.requestId}`);
-
-                  const requestSuffix = data.requestId ? ` (${data.requestId.slice(0, 8)})` : "";
-                  const queueSuffix =
-                    Number.isFinite(data.queuePosition as number) &&
-                    (data.queuePosition as number) > 0
-                      ? ` Priority ${priority}; queue #${data.queuePosition} (ETA ${formatEtaFromMs(
-                          data.etaMs,
-                        )}).`
-                      : ` Priority ${priority}.`;
-                  await comm.assistantMessage(
-                    `Request queued${requestSuffix}.${queueSuffix} RemoteBuddy is planning and will assign a WorkerPal.`,
-                  );
-
-                  // Final success message
-                  send({
-                    type: "complete",
-                    message: "Request enqueued successfully",
-                    data: {
-                      requestId: data.requestId,
-                      sessionId,
-                      priority,
-                      queuePosition: data.queuePosition,
-                      etaMs: data.etaMs,
-                    },
-                  });
-
-                  close();
-                } catch (err) {
-                  console.error(`[LocalBuddy] Error processing message:`, err);
-                  send({ type: "error", message: String(err) });
-                  close();
-                }
-              },
-            });
-
-            return new Response(stream, {
-              headers: {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                Connection: "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-              },
-            });
-          } catch (err) {
-            console.error(`[LocalBuddy] Error processing message:`, err);
-            return makeJson({ ok: false, message: String(err) }, 500);
-          }
+          return handleMessage(req);
         }
 
         // GET /healthz - Health check endpoint
@@ -1058,7 +969,9 @@ async function main() {
   await agent.startServer(opts.port);
 }
 
-main().catch((err) => {
-  console.error("[LocalBuddy] Fatal:", err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("[LocalBuddy] Fatal:", err);
+    process.exit(1);
+  });
+}
