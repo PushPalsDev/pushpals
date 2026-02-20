@@ -1509,7 +1509,9 @@ class RemoteBuddyOrchestrator {
           turnId,
         });
 
-        if (plan.intent === "analysis") {
+        // For any intent that isn't a pure conversational reply (chat/status), the planner
+        // returning requires_worker=false is ambiguous — ask the user or re-route to the engine.
+        if (plan.intent !== "chat" && plan.intent !== "status") {
           if (autonomyMetadata && CONFIG.remotebuddy.autonomy.enabled) {
             // Option 3: autonomous engine origin — re-enqueue the worker instruction so
             // the engine can drive next-step execution rather than silently dropping it.
@@ -1521,11 +1523,11 @@ class RemoteBuddyOrchestrator {
             );
             if (enqueued) {
               console.log(
-                `[RemoteBuddy] Analysis from engine re-enqueued as worker request ${enqueued}`,
+                `[RemoteBuddy] Non-chat intent (${plan.intent}) from engine re-enqueued as worker request ${enqueued}`,
               );
             } else {
               console.warn(
-                `[RemoteBuddy] Analysis from engine: enqueueFromAnalysis returned null (engine disabled or enqueue failed)`,
+                `[RemoteBuddy] Non-chat intent (${plan.intent}) from engine: enqueueFromAnalysis returned null (engine disabled or enqueue failed)`,
               );
             }
           } else if (!autonomyMetadata) {
