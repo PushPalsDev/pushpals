@@ -74,6 +74,13 @@ interface ResolvedServiceLlmConfig {
   lmStudio: PushPalsLmStudioConfig;
 }
 
+type LoadConfigFn = typeof loadPushPalsConfig;
+
+export interface LLMClientDependencies {
+  config?: PushPalsConfig;
+  loadConfig?: LoadConfigFn;
+}
+
 const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
