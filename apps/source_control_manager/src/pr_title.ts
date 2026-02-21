@@ -12,11 +12,24 @@ function firstNonEmptyLine(value: string): string {
   return line.trim();
 }
 
+/**
+ * Title-only normalization hack:
+ * - keep only the first line
+ * - if the first line contains " - " segments, keep only the leading segment
+ */
+export function normalizePrTitleCandidate(value: string): string {
+  const firstLine = firstNonEmptyLine(value);
+  if (!firstLine) return "";
+  const dashIndex = firstLine.indexOf(" - ");
+  if (dashIndex < 0) return firstLine;
+  return firstLine.slice(0, dashIndex).trim();
+}
+
 export function resolveReviewAgentPrTitle(args: ResolveReviewAgentPrTitleArgs): string {
-  const commitSubject = firstNonEmptyLine(args.commitSubject);
+  const commitSubject = normalizePrTitleCandidate(args.commitSubject);
   if (commitSubject) return commitSubject;
 
-  const completionPrTitle = firstNonEmptyLine(args.completionPrTitle ?? "");
+  const completionPrTitle = normalizePrTitleCandidate(args.completionPrTitle ?? "");
   if (completionPrTitle) return completionPrTitle;
 
   return `PushPals: ${args.prHeadBranch.replace(/^agent\//, "")} -> ${args.integrationBaseBranch}`;

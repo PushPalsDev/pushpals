@@ -1808,6 +1808,15 @@ export function isRebaseEditorPromptOutput(text: string): boolean {
   );
 }
 
+export function isPullRebaseDirtyWorkingTreeOutput(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("cannot pull with rebase: you have unstaged changes") ||
+    normalized.includes("cannot rebase: you have unstaged changes") ||
+    normalized.includes("please commit or stash them")
+  );
+}
+
 async function currentRefSha(repo: string, ref: string): Promise<string | null> {
   const result = await git(repo, ["rev-parse", ref]);
   if (!result.ok) return null;
@@ -1840,17 +1849,18 @@ async function autoResolveRebaseConflicts(
             };
           }
         }
-        const add = await git(repo, ["add", "--", path]);
-        if (!add.ok) {
-          return {
-            ok: false,
-            error: `Failed to stage resolved rebase conflict for ${path}: ${combinedGitOutput(add)}`,
-          };
-        }
+      }
+      // Stage resolved tracked files before continuing rebase, without pulling in unrelated untracked artifacts.
+      const addAll = await git(repo, ["add", "--update", "--", "."]);
+      if (!addAll.ok) {
+        return {
+          ok: false,
+          error: `Failed to stage resolved rebase conflicts: ${combinedGitOutput(addAll)}`,
+        };
       }
     }
 
-    let rebaseContinue = await git(repo, ["rebase", "--continue"]);
+    let rebaseContinue = await git(repo, ["-c", "core.editor=true", "rebase", "--continue"]);
     let continueOutput = combinedGitOutput(rebaseContinue);
     if (!rebaseContinue.ok && isRebaseEditorPromptOutput(continueOutput)) {
       // Ensure rebase continuation stays non-interactive in worker environments.
@@ -1885,12 +1895,24 @@ async function autoResolveRebaseConflicts(
   };
 }
 
-async function syncHiddenRefWithRemoteBranchByRebase(
+export async function syncHiddenRefWithRemoteBranchByRebase(
   repo: string,
   hiddenCommitRef: string,
   publicBranchName: string,
   jobId: string,
 ): Promise<{ ok: true; sha: string } | { ok: false; error: string }> {
+  const pullRebaseNonInteractive = () =>
+    git(repo, [
+      "-c",
+      "core.editor=true",
+      "-c",
+      "rebase.autoStash=true",
+      "pull",
+      "--rebase",
+      "origin",
+      publicBranchName,
+    ]);
+
   const remoteHead = await git(repo, ["ls-remote", "--heads", "origin", `refs/heads/${publicBranchName}`]);
   if (!remoteHead.ok) {
     return {
@@ -1917,8 +1939,27 @@ async function syncHiddenRefWithRemoteBranchByRebase(
     }
     branchCheckedOut = true;
 
-    const pullRebase = await git(repo, ["pull", "--rebase", "origin", publicBranchName]);
-    if (!pullRebase.ok) {
+    const maxPullRebaseAttempts = 5;
+    let syncedWithRemote = false;
+    for (let attempt = 1; attempt <= maxPullRebaseAttempts; attempt++) {
+      let pullRebase = await pullRebaseNonInteractive();
+      if (!pullRebase.ok && isPullRebaseDirtyWorkingTreeOutput(combinedGitOutput(pullRebase))) {
+        // Recover from dirty index/worktree left by previous attempts and retry non-interactively.
+        const reset = await git(repo, ["reset", "--hard", "HEAD"]);
+        if (!reset.ok) {
+          return {
+            ok: false,
+            error: `Failed to clean working tree before retrying pull --rebase: ${combinedGitOutput(reset)}`,
+          };
+        }
+        pullRebase = await pullRebaseNonInteractive();
+      }
+
+      if (pullRebase.ok) {
+        syncedWithRemote = true;
+        break;
+      }
+
       const pullOutput = combinedGitOutput(pullRebase);
       if (!isRebaseConflictOutput(pullOutput)) {
         return { ok: false, error: `git pull --rebase failed for ${publicBranchName}: ${pullOutput}` };
@@ -1931,6 +1972,17 @@ async function syncHiddenRefWithRemoteBranchByRebase(
           error: `Rebase conflict resolution failed for ${publicBranchName}: ${resolved.error}`,
         };
       }
+      if (attempt < maxPullRebaseAttempts) {
+        console.warn(
+          `[WorkerPals] Rebase conflicts resolved for ${publicBranchName}; re-running git pull --rebase (attempt ${attempt + 1}/${maxPullRebaseAttempts}).`,
+        );
+      }
+    }
+    if (!syncedWithRemote) {
+      return {
+        ok: false,
+        error: `Failed to sync ${publicBranchName} after ${maxPullRebaseAttempts} pull --rebase attempt(s).`,
+      };
     }
 
     const rebasedSha = await currentRefSha(repo, "HEAD");

@@ -3,6 +3,7 @@ import {
   buildWorkerCommitMessage,
   buildCommitMessageGeneratorUserMessage,
   isNonFastForwardPushOutput,
+  isPullRebaseDirtyWorkingTreeOutput,
   isRebaseConflictOutput,
   isRebaseEditorPromptOutput,
   isTestLikeValidationStep,
@@ -203,6 +204,20 @@ describe("workerpals commit message generation helpers", () => {
     ].join("\n");
     expect(isRebaseEditorPromptOutput(message)).toBe(true);
     expect(isRebaseEditorPromptOutput("CONFLICT (content): Merge conflict in file.ts")).toBe(false);
+  });
+
+  test("detects pull --rebase dirty working-tree output", () => {
+    const message = [
+      "error: cannot pull with rebase: You have unstaged changes.",
+      "error: Please commit or stash them.",
+    ].join("\n");
+    expect(isPullRebaseDirtyWorkingTreeOutput(message)).toBe(true);
+    expect(
+      isPullRebaseDirtyWorkingTreeOutput("fatal: cannot rebase: You have unstaged changes."),
+    ).toBe(true);
+    expect(
+      isPullRebaseDirtyWorkingTreeOutput("fatal: unable to access 'https://github.com/...': 401"),
+    ).toBe(false);
   });
 
   test("uses codex commit-message path when executor is openai_codex", () => {

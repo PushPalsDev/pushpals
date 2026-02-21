@@ -10,7 +10,7 @@ import { GitOps } from "./git";
 import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
-import { resolveReviewAgentPrTitle } from "./pr_title";
+import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { createStatusServer } from "./http";
 import {
   loadConfig,
@@ -778,10 +778,11 @@ async function ensureMainPullRequest(completion: {
   const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
   const completionPrTitle = (completion.prTitle ?? "").trim();
   const completionPrBody = (completion.prBody ?? "").trim();
-  const prTitle =
+  const prTitleCandidate =
     completionPrTitle ||
     (config.prTitle ?? "").trim() ||
     `PushPals: merge ${config.mainBranch} into ${prBaseBranch}`;
+  const prTitle = normalizePrTitleCandidate(prTitleCandidate);
   const prBody =
     completionPrBody ||
     (config.prBody ?? "").trim() ||

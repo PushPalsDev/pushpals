@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { resolveReviewAgentPrTitle } from "../apps/source_control_manager/src/pr_title";
+import {
+  normalizePrTitleCandidate,
+  resolveReviewAgentPrTitle,
+} from "../apps/source_control_manager/src/pr_title";
 
 describe("resolveReviewAgentPrTitle", () => {
   test("uses commit subject when available", () => {
@@ -40,5 +43,32 @@ describe("resolveReviewAgentPrTitle", () => {
       integrationBaseBranch: "main",
     });
     expect(title).toBe("fix(queue): handle retries");
+  });
+
+  test("truncates fallback completion title at first ' - ' segment", () => {
+    const title = resolveReviewAgentPrTitle({
+      commitSubject: "",
+      completionPrTitle:
+        "feat(local_agent): add request_status helper tests - add fixtures - assert statuses",
+      prHeadBranch: "agent/workerpal-123/job-5",
+      integrationBaseBranch: "main",
+    });
+    expect(title).toBe("feat(local_agent): add request_status helper tests");
+  });
+});
+
+describe("normalizePrTitleCandidate", () => {
+  test("returns first non-empty line and trims trailing ' - ' segments", () => {
+    const normalized = normalizePrTitleCandidate(
+      "feat(local_agent): summary headline - bullet one - bullet two\nextra body",
+    );
+    expect(normalized).toBe("feat(local_agent): summary headline");
+  });
+
+  test("keeps regular hyphenated words intact", () => {
+    const normalized = normalizePrTitleCandidate(
+      "fix(workerpals): handle non-fast-forward push retries",
+    );
+    expect(normalized).toBe("fix(workerpals): handle non-fast-forward push retries");
   });
 });
