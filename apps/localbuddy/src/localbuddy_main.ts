@@ -24,6 +24,13 @@ import {
   type RequestApiRow,
 } from "./request_status.js";
 import { answerLocalReadonlyQuery, isLocalReadonlyQueryPrompt } from "./local_readonly.js";
+import {
+  classifyRemoteRequestPriority,
+  parseRemoteBuddyCommand,
+  parseStatusHeartbeatMs,
+  queueWaitBudgetForPriority,
+  summarizeFailureForPrompt,
+} from "./localbuddy_utils.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -60,49 +67,6 @@ function parseArgs(): {
 
   return { server, port, sessionId, authToken };
 }
-
-function parseStatusHeartbeatMs(fallbackMs: number): number {
-  const parsed = Math.floor(fallbackMs);
-  if (!Number.isFinite(parsed)) return 120_000;
-  if (parsed <= 0) return 0;
-  return Math.max(30_000, parsed);
-}
-
-function summarizeFailureForPrompt(value: unknown): string {
-  const text = String(value ?? "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!text) return "";
-
-  const lowered = text.toLowerCase();
-  if (
-    lowered.includes("cannot truncate prompt with n_keep") ||
-    lowered.includes("context size has been exceeded") ||
-    (lowered.includes("prompt exceeded") && lowered.includes("context"))
-  ) {
-    return "Prompt/context exceeded the model window.";
-  }
-  if (
-    lowered.includes("connection refused") ||
-    lowered.includes("connection error") ||
-    lowered.includes("econnrefused")
-  ) {
-    return "LLM endpoint connection error.";
-  }
-  if (lowered.includes("timed out") || lowered.includes("job timeout")) {
-    return "Worker job timed out.";
-  }
-  if (lowered.includes("response did not contain parseable json")) {
-    return "Model returned non-JSON output when structured output was expected.";
-  }
-
-  const stackLikeIndex = text.search(/\b(traceback|stack trace| at [A-Za-z0-9_.]+[:(])/i);
-  const compact = stackLikeIndex > 0 ? text.slice(0, stackLikeIndex).trim() : text;
-  if (compact.length <= 220) return compact;
-  return `${compact.slice(0, 217)}...`;
-}
-
-const ASK_REMOTE_BUDDY_COMMAND = "/ask_remote_buddy";
 
 const LOCAL_QUICK_REPLY_SYSTEM_PROMPT = `
 You are PushPals LocalBuddy.
@@ -263,43 +227,6 @@ interface JobLogListResponse {
   message?: string;
 }
 
-type RequestPriority = "interactive" | "normal" | "background";
-
-function classifyRemoteRequestPriority(input: string): RequestPriority {
-  const text = String(input ?? "")
-    .trim()
-    .toLowerCase();
-  if (!text) return "normal";
-
-  if (
-    /\b(status|progress|queue|queued|eta|where|hows my job|what'?s my status|check on)\b/.test(text)
-  ) {
-    return "interactive";
-  }
-
-  if (
-    /\b(comprehensive|deep dive|full pass|phase\s+\d|architecture|migration|refactor|rewrite|all components|everything)\b/.test(
-      text,
-    ) ||
-    text.length > 1200
-  ) {
-    return "background";
-  }
-
-  return "normal";
-}
-
-function queueWaitBudgetForPriority(priority: RequestPriority): number {
-  switch (priority) {
-    case "interactive":
-      return 20_000;
-    case "background":
-      return 240_000;
-    default:
-      return 90_000;
-  }
-}
-
 function formatEtaFromMs(ms: number | undefined): string {
   if (!Number.isFinite(ms as number) || (ms as number) <= 0) return "now";
   const value = Math.max(0, Math.floor(ms as number));
@@ -309,32 +236,6 @@ function formatEtaFromMs(ms: number | undefined): string {
   const minutes = Math.floor(secs / 60);
   const remSecs = secs % 60;
   return remSecs > 0 ? `${minutes}m ${remSecs}s` : `${minutes}m`;
-}
-
-function parseRemoteBuddyCommand(input: string): {
-  forceRemote: boolean;
-  prompt: string;
-  usageMessage?: string;
-} {
-  const trimmed = String(input ?? "").trim();
-  const command = ASK_REMOTE_BUDDY_COMMAND.toLowerCase();
-  if (!trimmed.toLowerCase().startsWith(command)) {
-    return { forceRemote: false, prompt: trimmed };
-  }
-
-  const rest = trimmed
-    .slice(command.length)
-    .replace(/^[:\-]\s*/, "")
-    .trim();
-  if (!rest) {
-    return {
-      forceRemote: true,
-      prompt: "",
-      usageMessage:
-        "Usage: /ask_remote_buddy <request>. Example: /ask_remote_buddy fix the failing job status in the dashboard.",
-    };
-  }
-  return { forceRemote: true, prompt: rest };
 }
 
 function isLikelyLocalOnlyPrompt(input: string): boolean {
