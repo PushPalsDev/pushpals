@@ -129,6 +129,7 @@ describe("ReviewAgent", () => {
     const pr = makePr();
     let reviewCalls = 0;
     let mergeCalls = 0;
+    let commentCalls = 0;
 
     const agent = new ReviewAgent(
       baseConfig,
@@ -155,6 +156,10 @@ describe("ReviewAgent", () => {
           mergeCalls += 1;
           return { merged: true, sha: "deadbeef", message: "merged" };
         },
+        getCommitMessage: async () => "feat(test): improve coverage\n- Adds regression assertions",
+        addPullRequestComment: async () => {
+          commentCalls += 1;
+        },
         ...silentLogs,
       },
     );
@@ -163,6 +168,7 @@ describe("ReviewAgent", () => {
     await agent.poll();
 
     expect(reviewCalls).toBe(2);
+    expect(commentCalls).toBe(1);
     expect(mergeCalls).toBe(1);
   });
 
@@ -266,6 +272,9 @@ describe("ReviewAgent", () => {
   test("approves by score threshold even when reviewer sets approved=false", async () => {
     const pr = makePr({ number: 55, html_url: "https://example.com/pr/55" });
     let mergeCalls = 0;
+    let mergeCommitTitle = "";
+    let mergeCommitMessage = "";
+    let approvalCommentBody = "";
     let commentCalls = 0;
     let enqueueCalls = 0;
 
@@ -287,12 +296,24 @@ describe("ReviewAgent", () => {
             issues: ["Minor cleanup suggested"],
             fix_instruction: "",
           }),
-        mergePullRequest: async () => {
+        getCommitMessage: async () =>
+          [
+            "feat(local_agent): expand localbuddy test coverage",
+            "- A new meaningful test case is added under apps/localbuddy exercising an untested scenario relevant to LocalBuddy.",
+            "- All existing and new tests pass and any necessary fixtures/mocks updated accordingly.",
+            "",
+            "Tests:",
+            "- bun --cwd apps/localbuddy test",
+          ].join("\n"),
+        mergePullRequest: async (opts) => {
           mergeCalls += 1;
+          mergeCommitTitle = opts.commitTitle ?? "";
+          mergeCommitMessage = opts.commitMessage ?? "";
           return { merged: true, sha: "deadbeef", message: "merged" };
         },
-        addPullRequestComment: async () => {
+        addPullRequestComment: async (opts) => {
           commentCalls += 1;
+          approvalCommentBody = opts.body;
         },
         fetchImpl: async () => {
           enqueueCalls += 1;
@@ -305,8 +326,153 @@ describe("ReviewAgent", () => {
     await agent.poll();
 
     expect(mergeCalls).toBe(1);
-    expect(commentCalls).toBe(0);
+    expect(commentCalls).toBe(1);
+    expect(approvalCommentBody).toContain("ReviewAgent: Changes Approved");
+    expect(approvalCommentBody).toContain("Verdict:** Good quality overall");
+    expect(approvalCommentBody).toContain("Threshold:** 8.5/10");
+    expect(approvalCommentBody).toContain("Why this passed:** Score 8.7/10 is >= 8.5/10");
+    expect(approvalCommentBody).toContain("Potential Improvements:**");
+    expect(approvalCommentBody).toContain("Minor cleanup suggested");
+    expect(approvalCommentBody).toContain("This PR met the configured review threshold and is approved for automated merge");
+    expect(mergeCommitTitle).toBe("feat(local_agent): expand localbuddy test coverage");
+    expect(mergeCommitMessage).toContain("- A new meaningful test case is added under apps/localbuddy");
+    expect(mergeCommitMessage).toContain("Tests:\n- bun --cwd apps/localbuddy test");
+    expect(mergeCommitMessage).toContain("ReviewAgent:");
+    expect(mergeCommitMessage).toContain("passed threshold of 8.5, commit rating 8.7/10");
+    expect(mergeCommitMessage).toContain("PR: https://example.com/pr/55");
     expect(enqueueCalls).toBe(0);
+  });
+
+  test("falls back to PR title merge metadata when head commit message lookup fails", async () => {
+    const pr = makePr({ number: 58, html_url: "https://example.com/pr/58", title: "Keep tests green" });
+    let mergeCommitTitle = "";
+    let mergeCommitMessage = "";
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 8.9,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => {
+          throw new Error("commit lookup failed");
+        },
+        getPullRequestCommitMessage: async () => {
+          throw new Error("pr commit lookup failed");
+        },
+        mergePullRequest: async (opts) => {
+          mergeCommitTitle = opts.commitTitle ?? "";
+          mergeCommitMessage = opts.commitMessage ?? "";
+          return { merged: true, sha: "deadbeef", message: "merged" };
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(mergeCommitTitle).toBe("Keep tests green (#58)");
+    expect(mergeCommitMessage).toContain("ReviewAgent:");
+    expect(mergeCommitMessage).toContain("passed threshold of 8.5, commit rating 8.9/10");
+    expect(mergeCommitMessage).toContain("PR: https://example.com/pr/58");
+  });
+
+  test("uses PR commit fallback when head commit lookup fails", async () => {
+    const pr = makePr({ number: 59, html_url: "https://example.com/pr/59", title: "Fallback title" });
+    let mergeCommitTitle = "";
+    let mergeCommitMessage = "";
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 9.2,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => {
+          throw new Error("head lookup failed");
+        },
+        getPullRequestCommitMessage: async () =>
+          [
+            "feat(local_agent): fallback commit subject",
+            "- Preserved from PR commit list fallback.",
+          ].join("\n"),
+        mergePullRequest: async (opts) => {
+          mergeCommitTitle = opts.commitTitle ?? "";
+          mergeCommitMessage = opts.commitMessage ?? "";
+          return { merged: true, sha: "deadbeef", message: "merged" };
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(mergeCommitTitle).toBe("feat(local_agent): fallback commit subject");
+    expect(mergeCommitMessage).toContain("- Preserved from PR commit list fallback.");
+    expect(mergeCommitMessage).toContain("ReviewAgent:");
+    expect(mergeCommitMessage).toContain("passed threshold of 8.5, commit rating 9.2/10");
+    expect(mergeCommitMessage).toContain("PR: https://example.com/pr/59");
+  });
+
+  test("does not merge when approval comment cannot be posted", async () => {
+    const pr = makePr({ number: 57, html_url: "https://example.com/pr/57" });
+    let mergeCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 8.9,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {
+          throw new Error("comment API failed");
+        },
+        mergePullRequest: async () => {
+          mergeCalls += 1;
+          return { merged: true, sha: "deadbeef", message: "merged" };
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(mergeCalls).toBe(0);
   });
 
   test("rejects when score is below threshold even when reviewer sets approved=true", async () => {

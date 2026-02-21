@@ -183,6 +183,105 @@ export async function getPullRequestDiff(opts: {
   return response.text();
 }
 
+export async function getCommitMessage(opts: {
+  token: string;
+  remoteUrl: string;
+  sha: string;
+}): Promise<string> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/commits/${encodeURIComponent(opts.sha)}`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: githubHeaders(opts.token),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw githubError(response.status, text);
+  }
+
+  const data = (await response.json()) as { commit?: { message?: unknown } | null };
+  const message = data && data.commit && typeof data.commit.message === "string" ? data.commit.message : "";
+  if (!message) {
+    throw new Error(`GitHub API commit ${opts.sha} missing commit.message`);
+  }
+  return message;
+}
+
+function parseNextLink(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  for (const part of linkHeader.split(",")) {
+    const match = part.trim().match(/^<([^>]+)>\s*;\s*rel="([^"]+)"$/);
+    if (match && match[2] === "next") return match[1];
+  }
+  return null;
+}
+
+export async function getPullRequestCommitMessage(opts: {
+  token: string;
+  remoteUrl: string;
+  prNumber: number;
+  sha: string;
+}): Promise<string> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  let url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}/commits?per_page=100`;
+  let pages = 0;
+  let latestMessage = "";
+
+  while (url && pages < 50) {
+    pages += 1;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: githubHeaders(opts.token),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw githubError(response.status, text);
+    }
+
+    const commits = (await response.json()) as Array<{
+      sha?: unknown;
+      commit?: { message?: unknown } | null;
+    }>;
+
+    if (!Array.isArray(commits) || commits.length === 0) break;
+
+    for (const commit of commits) {
+      const sha = typeof commit.sha === "string" ? commit.sha : "";
+      const message =
+        commit.commit && typeof commit.commit.message === "string" ? commit.commit.message : "";
+      if (sha === opts.sha && message.trim()) return message;
+    }
+
+    // Keep a deterministic fallback to the latest commit visible in PR history.
+    for (let i = commits.length - 1; i >= 0; i -= 1) {
+      const entry = commits[i];
+      const messageCandidate = entry && entry.commit ? entry.commit.message : undefined;
+      const message = typeof messageCandidate === "string" ? messageCandidate : "";
+      if (message && message.trim()) {
+        latestMessage = message;
+        break;
+      }
+    }
+
+    url = parseNextLink(response.headers.get("link")) ?? "";
+  }
+
+  if (latestMessage) return latestMessage;
+  throw new Error(
+    `Could not resolve commit message from PR #${opts.prNumber} for sha ${opts.sha}`,
+  );
+}
+
 export async function mergePullRequest(opts: {
   token: string;
   remoteUrl: string;

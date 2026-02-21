@@ -3,6 +3,8 @@ import { tmpdir } from "os";
 import { basename, isAbsolute, join, resolve } from "path";
 import {
   addPullRequestComment,
+  getCommitMessage,
+  getPullRequestCommitMessage,
   getPullRequestDiff,
   listOpenPullRequests,
   mergePullRequest,
@@ -22,6 +24,8 @@ interface ReviewVerdict {
 interface ReviewAgentDeps {
   listOpenPullRequests: typeof listOpenPullRequests;
   getPullRequestDiff: typeof getPullRequestDiff;
+  getCommitMessage: typeof getCommitMessage;
+  getPullRequestCommitMessage: typeof getPullRequestCommitMessage;
   mergePullRequest: typeof mergePullRequest;
   addPullRequestComment: typeof addPullRequestComment;
   invokeCodexReview: (prompt: string, config: ReviewAgentConfig) => Promise<string>;
@@ -42,6 +46,8 @@ const ts = () => new Date().toISOString();
 const DEFAULT_DEPS: ReviewAgentDeps = {
   listOpenPullRequests,
   getPullRequestDiff,
+  getCommitMessage,
+  getPullRequestCommitMessage,
   mergePullRequest,
   addPullRequestComment,
   invokeCodexReview,
@@ -325,6 +331,69 @@ function formatRejectionComment(verdict: ReviewVerdict): string {
   return lines.join("\n");
 }
 
+function formatApprovalComment(verdict: ReviewVerdict, passThreshold: number): string {
+  const normalizedThreshold = Math.max(1, Math.min(10, passThreshold));
+  const lines = [
+    `## ReviewAgent: Changes Approved (score ${verdict.score.toFixed(1)}/10)`,
+    "",
+    `**Verdict:** ${verdict.summary}`,
+    `**Threshold:** ${normalizedThreshold.toFixed(1)}/10`,
+    `**Why this passed:** Score ${verdict.score.toFixed(1)}/10 is >= ${normalizedThreshold.toFixed(1)}/10.`,
+    "",
+    "**Potential Improvements:**",
+  ];
+
+  if (verdict.issues.length > 0) {
+    for (const issue of verdict.issues) {
+      lines.push(`- ${issue}`);
+    }
+  } else {
+    lines.push("- None noted by reviewer.");
+  }
+
+  lines.push("", "_This PR met the configured review threshold and is approved for automated merge._");
+
+  return lines.join("\n");
+}
+
+function splitCommitTitleAndBody(message: string): { title: string; body: string } {
+  const normalized = message.replace(/\r\n/g, "\n").trimEnd();
+  if (!normalized) return { title: "", body: "" };
+  const [firstLine, ...rest] = normalized.split("\n");
+  return {
+    title: firstLine.trim(),
+    body: rest.join("\n").replace(/^\n+/, "").trimEnd(),
+  };
+}
+
+function formatReviewAgentMergeSection(
+  pr: GitHubPR,
+  verdict: ReviewVerdict,
+  passThreshold: number,
+): string {
+  const normalizedThreshold = Math.max(1, Math.min(10, passThreshold));
+  return [
+    "ReviewAgent:",
+    `- Merged, passed threshold of ${normalizedThreshold.toFixed(1)}, commit rating ${verdict.score.toFixed(1)}/10.`,
+    `- PR: ${pr.html_url}`,
+  ].join("\n");
+}
+
+function buildMergeCommitText(args: {
+  pr: GitHubPR;
+  verdict: ReviewVerdict;
+  passThreshold: number;
+  sourceCommitMessage: string;
+}): { commitTitle: string; commitMessage: string } {
+  const parsed = splitCommitTitleAndBody(args.sourceCommitMessage);
+  const commitTitle = parsed.title || `${args.pr.title} (#${args.pr.number})`;
+  const reviewAgentSection = formatReviewAgentMergeSection(args.pr, args.verdict, args.passThreshold);
+  const commitMessage = parsed.body
+    ? `${parsed.body}\n\n${reviewAgentSection}`
+    : reviewAgentSection;
+  return { commitTitle, commitMessage };
+}
+
 function buildFallbackFixInstruction(pr: GitHubPR, verdict: ReviewVerdict): string {
   const issueBlock =
     verdict.issues.length > 0
@@ -587,13 +656,63 @@ export class ReviewAgent {
 
   private async approvePr(pr: GitHubPR, verdict: ReviewVerdict): Promise<boolean> {
     try {
+      await this.deps.addPullRequestComment({
+        token: this.githubToken,
+        remoteUrl: this.remoteUrl,
+        prNumber: pr.number,
+        body: formatApprovalComment(verdict, this.config.passThreshold),
+      });
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Failed to post approval comment on PR #${pr.number}: ${err?.message ?? err}`,
+      );
+      return false;
+    }
+
+    let commitTitle = `${pr.title} (#${pr.number})`;
+    let commitMessage = formatReviewAgentMergeSection(pr, verdict, this.config.passThreshold);
+    try {
+      let sourceCommitMessage = "";
+      try {
+        sourceCommitMessage = await this.deps.getCommitMessage({
+          token: this.githubToken,
+          remoteUrl: this.remoteUrl,
+          sha: pr.head.sha,
+        });
+      } catch (primaryErr: any) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Failed to fetch head commit message for PR #${pr.number} (${pr.head.sha.slice(0, 8)}): ${primaryErr?.message ?? primaryErr}. Trying PR commit fallback...`,
+        );
+        sourceCommitMessage = await this.deps.getPullRequestCommitMessage({
+          token: this.githubToken,
+          remoteUrl: this.remoteUrl,
+          prNumber: pr.number,
+          sha: pr.head.sha,
+        });
+      }
+
+      const composed = buildMergeCommitText({
+        pr,
+        verdict,
+        passThreshold: this.config.passThreshold,
+        sourceCommitMessage,
+      });
+      commitTitle = composed.commitTitle;
+      commitMessage = composed.commitMessage;
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Failed to resolve source commit message for PR #${pr.number}; using PR metadata fallback: ${err?.message ?? err}`,
+      );
+    }
+
+    try {
       const result = await this.deps.mergePullRequest({
         token: this.githubToken,
         remoteUrl: this.remoteUrl,
         prNumber: pr.number,
         mergeMethod: this.config.mergeMethod,
-        commitTitle: `${pr.title} (#${pr.number})`,
-        commitMessage: `Reviewed by ReviewAgent - score ${verdict.score.toFixed(1)}/10\n\n${verdict.summary}`,
+        commitTitle,
+        commitMessage,
       });
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${result.sha.slice(0, 8)})`,
