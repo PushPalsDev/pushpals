@@ -234,4 +234,79 @@ describe("buildRequestStatusReply", () => {
     expect(reply).toContain("e11225b1");
     expect(reply).toContain("a6f87819");
   });
+
+  test("reports failed request with structured failure detail", () => {
+    const failedRequest: RequestApiRow = {
+      id: "70b0ab9c-5555-4555-8555-555555555555",
+      sessionId: "dev",
+      prompt: "status check",
+      status: "failed",
+      agentId: "remotebuddy-orchestrator",
+      error: JSON.stringify({
+        message: "RemoteBuddy orchestration timed out",
+        detail: "planner stalled",
+      }),
+      createdAt: "2026-02-13T02:00:00.000Z",
+      updatedAt: "2026-02-13T02:10:00.000Z",
+    };
+
+    const reply = buildRequestStatusReply({
+      userPrompt: "what happened to request 70b0ab9c?",
+      sessionId: "dev",
+      requests: [failedRequest],
+      jobs: [],
+      summarizeFailure,
+      formatTime,
+    });
+
+    if (!reply) {
+      throw new Error("Expected reply to exist");
+    }
+    expect(reply).toMatch(/Request\s+70b0ab9c\s+is\s+failed/i);
+    expect(reply).toMatch(/Failure:\s+RemoteBuddy orchestration timed out/i);
+    expect(reply).toContain("planner stalled");
+  });
+
+  test("handles malformed failure payloads gracefully", () => {
+    const failedRequest: RequestApiRow = {
+      id: "5a77f8c1-7777-4777-8777-777777777777",
+      sessionId: "dev",
+      prompt: "status please",
+      status: "failed",
+      agentId: "remotebuddy-orchestrator",
+      error: "RemoteBuddy aborted mid-flight <status::500>",
+      createdAt: "2026-02-13T04:00:00.000Z",
+      updatedAt: "2026-02-13T04:05:00.000Z",
+    };
+    const jobs: JobApiRow[] = [
+      {
+        id: "a1399aa4-eeee-4eee-8eee-eeeeeeeeeeee",
+        taskId: "task-11",
+        sessionId: "dev",
+        status: "failed",
+        workerId: "workerpal-delta",
+        params: JSON.stringify({ requestId: failedRequest.id }),
+        error: "Executor crashed >> non-json stacktrace <<",
+        createdAt: "2026-02-13T04:01:00.000Z",
+        updatedAt: "2026-02-13T04:04:00.000Z",
+      },
+    ];
+
+    const reply = buildRequestStatusReply({
+      userPrompt: "status for request 5a77f8c1",
+      sessionId: "dev",
+      requests: [failedRequest],
+      jobs,
+      summarizeFailure,
+      formatTime,
+    });
+
+    if (!reply) {
+      throw new Error("Expected reply to exist");
+    }
+    expect(reply).toMatch(/Request\s+5a77f8c1\s+is\s+failed/i);
+    expect(reply).toMatch(/Failure:\s+RemoteBuddy aborted mid-flight <status::500>/i);
+    expect(reply).toContain("Latest WorkerPal job a1399aa4");
+    expect(reply).toMatch(/Executor crashed >> non-json stacktrace <<$/m);
+  });
 });
