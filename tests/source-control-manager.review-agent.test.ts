@@ -172,6 +172,91 @@ describe("ReviewAgent", () => {
     expect(mergeCalls).toBe(1);
   });
 
+  test("re-reviews the same PR SHA exactly once when re-review is requested", async () => {
+    const pr = makePr({ number: 61, html_url: "https://example.com/pr/61" });
+    let reviewCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () => {
+          reviewCalls += 1;
+          return JSON.stringify({
+            score: 9.1,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          });
+        },
+        addPullRequestComment: async () => {},
+        mergePullRequest: async () => ({ merged: true, sha: "deadbeef", message: "merged" }),
+        getCommitMessage: async () => "feat(tests): keep coverage stable",
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+    agent.requestReReview(pr.number, pr.head.sha);
+    await agent.poll();
+    await agent.poll();
+
+    expect(reviewCalls).toBe(2);
+  });
+
+  test("caps auto-enqueued re-reviews at 500 per PR", async () => {
+    const prNumber = 62;
+    let pollCount = 0;
+    let jobEnqueueCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => {
+          const sha = pollCount.toString(16).padStart(40, "0");
+          pollCount += 1;
+          return [makePr({ number: prNumber, html_url: `https://example.com/pr/${prNumber}`, head: { sha } })];
+        },
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.0,
+            summary: "Needs follow-up fixes",
+            issues: ["Add missing edge-case assertions"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/jobs/enqueue")) {
+            jobEnqueueCalls += 1;
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        now: () => 789,
+        ...silentLogs,
+      },
+    );
+
+    for (let i = 0; i < 505; i += 1) {
+      await agent.poll();
+    }
+
+    expect(jobEnqueueCalls).toBe(500);
+  });
+
   test("enqueues fallback instruction when reviewer omits fix_instruction", async () => {
     const pr = makePr({ number: 7, html_url: "https://example.com/pr/7" });
     let enqueuedInstruction = "";

@@ -202,6 +202,7 @@ try {
 let running = true;
 let statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentPollTimer: ReturnType<typeof setInterval> | null = null;
+let reviewAgentInstance: ReviewAgent | null = null;
 let statusSessionReady = false;
 
 function createSessionComm(sessionId: string): CommunicationManager {
@@ -546,6 +547,9 @@ async function tick(): Promise<void> {
           body: prBody,
           draft: false,
         });
+        if (!pr.created) {
+          reviewAgentInstance?.requestReReview(pr.number, completion.commitSha);
+        }
         const prMessage = pr.created
           ? `Opened individual PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`
           : `Reused existing PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`;
@@ -1000,6 +1004,7 @@ async function main(): Promise<void> {
         (config.prBaseBranch || integrationBaseBranch).trim(),
         config.authToken,
       );
+      reviewAgentInstance = reviewAgent;
       console.log(
         `[${ts()}] ReviewAgent started (poll interval: ${config.reviewAgent.pollIntervalMs}ms, pass threshold: ${config.reviewAgent.passThreshold}/10)`,
       );
@@ -1052,6 +1057,7 @@ function shutdown(): void {
     clearInterval(reviewAgentPollTimer);
     reviewAgentPollTimer = null;
   }
+  reviewAgentInstance = null;
   void createSessionComm(statusSessionId).status(
     "source_control_manager",
     "shutting_down",

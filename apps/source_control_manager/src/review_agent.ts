@@ -37,6 +37,7 @@ interface ReviewAgentDeps {
 }
 
 const MAX_DIFF_BYTES = 150_000;
+const MAX_PR_RE_REVIEW_ENQUEUES = 500;
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
 const DEFAULT_WORKSPACE_ROOT = resolve(import.meta.dir, "..", "..", "..");
@@ -522,6 +523,8 @@ export function deriveFixWriteGlobsFromDiff(diff: string): string[] {
 
 export class ReviewAgent {
   private reviewed = new Map<number, string>();
+  private forceReReview = new Map<number, string>();
+  private reReviewEnqueueCounts = new Map<number, number>();
   private reviewerMd = "";
   private pollInFlight = false;
   private readonly deps: ReviewAgentDeps;
@@ -536,6 +539,12 @@ export class ReviewAgent {
     deps?: Partial<ReviewAgentDeps>,
   ) {
     this.deps = { ...DEFAULT_DEPS, ...(deps ?? {}) };
+  }
+
+  requestReReview(prNumber: number, sha: string): void {
+    const normalizedSha = String(sha ?? "").trim();
+    if (!normalizedSha) return;
+    this.forceReReview.set(prNumber, normalizedSha);
   }
 
   private loadReviewerMd(): string {
@@ -584,7 +593,19 @@ export class ReviewAgent {
 
   private async reviewPr(pr: GitHubPR): Promise<void> {
     const sha = pr.head.sha;
-    if (this.reviewed.get(pr.number) === sha) return;
+    const reviewedSha = this.reviewed.get(pr.number);
+    const forcedSha = this.forceReReview.get(pr.number);
+    if (reviewedSha !== sha && forcedSha) {
+      // Clear stale forced re-review markers when the PR head has advanced.
+      this.forceReReview.delete(pr.number);
+    }
+    if (reviewedSha === sha) {
+      if (forcedSha !== sha) return;
+      this.forceReReview.delete(pr.number);
+      this.deps.logInfo(
+        `[${ts()}] [ReviewAgent] Re-reviewing PR #${pr.number} at unchanged head ${sha.slice(0, 8)} (forced re-review).`,
+      );
+    }
 
     this.deps.logInfo(
       `[${ts()}] [ReviewAgent] Reviewing PR #${pr.number} (${pr.head.ref} @ ${sha.slice(0, 8)})`,
@@ -717,6 +738,9 @@ export class ReviewAgent {
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${result.sha.slice(0, 8)})`,
       );
+      this.reReviewEnqueueCounts.delete(pr.number);
+      this.forceReReview.delete(pr.number);
+      this.reviewed.delete(pr.number);
       return true;
     } catch (err: any) {
       this.deps.logError(
@@ -750,7 +774,24 @@ export class ReviewAgent {
       return true;
     }
 
-    await this.enqueueFixJob(pr, verdict, sessionId, jobId, diff);
+    const priorReReviewEnqueues = this.reReviewEnqueueCounts.get(pr.number) ?? 0;
+    if (priorReReviewEnqueues >= MAX_PR_RE_REVIEW_ENQUEUES) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} reached max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); skipping additional fix-job enqueue.`,
+      );
+      return true;
+    }
+
+    const enqueued = await this.enqueueFixJob(pr, verdict, sessionId, jobId, diff);
+    if (enqueued) {
+      const nextReReviewEnqueues = priorReReviewEnqueues + 1;
+      this.reReviewEnqueueCounts.set(pr.number, nextReReviewEnqueues);
+      if (nextReReviewEnqueues === MAX_PR_RE_REVIEW_ENQUEUES) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] PR #${pr.number} hit max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); future rejections will not auto-enqueue fix jobs.`,
+        );
+      }
+    }
     return true;
   }
 

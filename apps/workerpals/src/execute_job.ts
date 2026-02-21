@@ -107,6 +107,17 @@ function toSingleLine(value: unknown, max = 240): string {
   return text.length > max ? `${text.slice(0, Math.max(1, max - 3))}...` : text;
 }
 
+export function buildCriticRevisionIssues(
+  critic: { score: number; mustFix: string[] } | null | undefined,
+  qualityCriticMinScore: number,
+): string[] {
+  if (!critic) return [];
+  if (critic.score >= qualityCriticMinScore) return [];
+  return [
+    `Critic score ${critic.score.toFixed(1)} is below required threshold ${qualityCriticMinScore}.`,
+  ];
+}
+
 export function resolveReviewFixCompletionBranch(
   value: unknown,
   fallbackBranch: string,
@@ -132,6 +143,20 @@ export function resolveReviewFixCompletionBranch(
   }
   if (/[~^:?*\[\]\s]/.test(normalized)) return { branch: fallbackBranch, overridden: false };
   return { branch: normalized, overridden: true };
+}
+
+export function resolveReviewNoChangeCompletionBranch(
+  params: Record<string, unknown> | null | undefined,
+): string | null {
+  if (!params || typeof params !== "object" || Array.isArray(params)) return null;
+  const reviewAgent =
+    params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent)
+      ? (params.reviewAgent as Record<string, unknown>)
+      : null;
+  const reviewAgentHeadRef = reviewAgent?.prHeadRef;
+  const candidate = params.completionBranch ?? reviewAgentHeadRef;
+  const resolved = resolveReviewFixCompletionBranch(candidate, "");
+  return resolved.overridden ? resolved.branch : null;
 }
 
 function normalizeChatCompletionsEndpoint(endpoint: string): string {
@@ -2472,11 +2497,9 @@ export async function executeJob(
       : executor === "openai_codex"
         ? await runCodexCriticReview(repo, attemptParams, quality, runtimeConfig, onLog)
         : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
-    const criticRequiresRevision = Boolean(
-      critic && (critic.score < qualityCriticMinScore || critic.mustFix.length > 0),
-    );
+    const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
 
-    if (quality.ok && !criticRequiresRevision) {
+    if (!criticRequiresRevision) {
       if (critic) {
         onLog?.(
           "stdout",
@@ -2486,13 +2509,9 @@ export async function executeJob(
       return result;
     }
 
-    const issues = [...quality.issues];
+    const issues: string[] = [];
     if (criticRequiresRevision && critic) {
-      const scoreIssue = `Critic score ${critic.score.toFixed(1)} is below required threshold ${qualityCriticMinScore}.`;
-      issues.push(scoreIssue);
-      for (const entry of critic.mustFix.slice(0, 8)) {
-        issues.push(`Critic must-fix: ${entry}`);
-      }
+      issues.push(...buildCriticRevisionIssues(critic, qualityCriticMinScore));
     }
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
     if (revisionAttempt >= qualityMaxAutoRevisions) {
@@ -2500,9 +2519,6 @@ export async function executeJob(
         const diagnostics = truncate(
           [
             result.stderr ?? "",
-            quality.skipped
-              ? ""
-              : `Deterministic issues: ${quality.issues.map((entry) => toSingleLine(entry, 220)).join(" | ")}`,
             critic ? `Critic raw: ${critic.raw}` : "",
           ]
             .filter(Boolean)
@@ -2533,9 +2549,6 @@ export async function executeJob(
         stderr: truncate(
           [
             result.stderr ?? "",
-            quality.skipped
-              ? ""
-              : `Deterministic issues: ${quality.issues.map((entry) => toSingleLine(entry, 220)).join(" | ")}`,
             critic ? `Critic raw: ${critic.raw}` : "",
           ]
             .filter(Boolean)

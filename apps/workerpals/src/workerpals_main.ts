@@ -27,7 +27,14 @@ import { resolve } from "path";
 import { detectRepoRoot, loadPromptTemplate, loadPushPalsConfig } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
 import { Logger } from "./common/logger.js";
-import { executeJob, shouldCommit, createJobCommit, git, type JobResult } from "./execute_job.js";
+import {
+  executeJob,
+  shouldCommit,
+  createJobCommit,
+  git,
+  resolveReviewNoChangeCompletionBranch,
+  type JobResult,
+} from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 
@@ -599,6 +606,38 @@ function buildCompletionPrMetadata(args: {
   });
 }
 
+function parseLsRemoteSha(output: string): string | null {
+  const firstLine = (output ?? "").split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
+  const match = firstLine.match(/^([0-9a-f]{40})\s+/i);
+  return match ? match[1] : null;
+}
+
+async function resolveReReviewNoChangeCommit(
+  repo: string,
+  params: Record<string, unknown> | null | undefined,
+): Promise<CommitRef | null> {
+  const branch = resolveReviewNoChangeCompletionBranch(params);
+  if (!branch) return null;
+
+  const remoteRef = `refs/heads/${branch}`;
+  const lsRemote = await git(repo, ["ls-remote", "origin", remoteRef]);
+  if (lsRemote.ok) {
+    const sha = parseLsRemoteSha(lsRemote.stdout);
+    if (sha) return { branch, sha };
+  }
+
+  const localRefs = [branch, `refs/heads/${branch}`, `origin/${branch}`];
+  for (const ref of localRefs) {
+    const revParse = await git(repo, ["rev-parse", "--verify", ref]);
+    if (revParse.ok) {
+      const sha = revParse.stdout.trim();
+      if (sha) return { branch, sha };
+    }
+  }
+
+  return null;
+}
+
 async function enqueueCompletion(
   server: string,
   headers: Record<string, string>,
@@ -933,7 +972,18 @@ async function workerLoop(
                 if (result.commit.sha !== "no-changes") {
                   completionCommit = result.commit;
                 } else {
-                  console.log(`[WorkerPals] Job ${job.id} produced no file changes to commit.`);
+                  const reReviewCommit = await resolveReReviewNoChangeCommit(
+                    executionRepo,
+                    parsedParams,
+                  );
+                  if (reReviewCommit) {
+                    completionCommit = reReviewCommit;
+                    console.log(
+                      `[WorkerPals] Job ${job.id} produced no file changes; enqueuing re-review completion for ${reReviewCommit.branch} @ ${reReviewCommit.sha.slice(0, 8)}.`,
+                    );
+                  } else {
+                    console.log(`[WorkerPals] Job ${job.id} produced no file changes to commit.`);
+                  }
                 }
               } else if (dockerExecutor) {
                 result = {
