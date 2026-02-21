@@ -37,6 +37,7 @@ import {
   shouldCommit,
   createJobCommit,
   git,
+  redactSensitiveText,
   resolveReviewNoChangeCompletionBranch,
   type JobResult,
 } from "./execute_job.js";
@@ -105,11 +106,12 @@ function formatDurationMs(durationMs: number): string {
 
 function sanitizeJobLogLine(line: string): string {
   // Strip ANSI escape/control sequences and collapse whitespace.
-  return line
+  const cleaned = line
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
     .replace(/\r/g, "")
     .replace(/\s+/g, " ")
     .trim();
+  return redactSensitiveText(cleaned);
 }
 
 function isNoisyProgressLine(line: string): boolean {
@@ -1120,7 +1122,7 @@ async function workerLoop(
                 headers,
                 body: JSON.stringify({
                   message: result.summary,
-                  detail: result.stderr,
+                  detail: redactSensitiveText(result.stderr ?? ""),
                   durationMs: jobDurationMs,
                 }),
               });
@@ -1172,7 +1174,7 @@ async function workerLoop(
                     payload: {
                       jobId: job.id,
                       message: result.summary,
-                      detail: result.stderr,
+                      detail: redactSensitiveText(result.stderr ?? ""),
                     },
                     from: `worker:${opts.workerId}`,
                   };

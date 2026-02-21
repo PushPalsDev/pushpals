@@ -51,6 +51,7 @@ const silentLogs = {
   logInfo: () => {},
   logWarn: () => {},
   logError: () => {},
+  deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
 };
 
 describe("ReviewAgent", () => {
@@ -396,6 +397,8 @@ describe("ReviewAgent", () => {
     let approvalCommentBody = "";
     let commentCalls = 0;
     let enqueueCalls = 0;
+    let branchDeleteCalls = 0;
+    let deletedBranchRef = "";
 
     const agent = new ReviewAgent(
       { ...baseConfig, passThreshold: 8.5 },
@@ -405,6 +408,7 @@ describe("ReviewAgent", () => {
       "main",
       undefined,
       {
+        ...silentLogs,
         listOpenPullRequests: async () => [pr],
         getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
         invokeCodexReview: async () =>
@@ -430,6 +434,11 @@ describe("ReviewAgent", () => {
           mergeCommitMessage = opts.commitMessage ?? "";
           return { merged: true, sha: "deadbeef", message: "merged" };
         },
+        deleteBranchRef: async (opts) => {
+          branchDeleteCalls += 1;
+          deletedBranchRef = opts.branchRef;
+          return { deleted: true, reason: "deleted" as const };
+        },
         addPullRequestComment: async (opts) => {
           commentCalls += 1;
           approvalCommentBody = opts.body;
@@ -438,7 +447,6 @@ describe("ReviewAgent", () => {
           enqueueCalls += 1;
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
         },
-        ...silentLogs,
       },
     );
 
@@ -460,6 +468,174 @@ describe("ReviewAgent", () => {
     expect(mergeCommitMessage).toContain("passed threshold of 8.5, commit rating 8.7/10");
     expect(mergeCommitMessage).toContain("PR: https://example.com/pr/55");
     expect(enqueueCalls).toBe(0);
+    expect(branchDeleteCalls).toBe(1);
+    expect(deletedBranchRef).toBe("agent/test-branch");
+  });
+
+  test("does not delete protected branch main after merge", async () => {
+    const pr = makePr({
+      number: 63,
+      html_url: "https://example.com/pr/63",
+      head: { ref: "main", sha: "abc123def456" },
+    });
+    let branchDeleteCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 9.2,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "feat(local_agent): preserve quality",
+        mergePullRequest: async () => ({ merged: true, sha: "deadbeef", message: "merged" }),
+        deleteBranchRef: async () => {
+          branchDeleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(branchDeleteCalls).toBe(0);
+  });
+
+  test("does not delete protected branch main_agent after merge", async () => {
+    const pr = makePr({
+      number: 64,
+      html_url: "https://example.com/pr/64",
+      head: { ref: "main_agent", sha: "abc123def457" },
+      base: { ref: "main" },
+    });
+    let branchDeleteCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 9.0,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "feat(local_agent): preserve quality",
+        mergePullRequest: async () => ({ merged: true, sha: "deadbeef", message: "merged" }),
+        deleteBranchRef: async () => {
+          branchDeleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(branchDeleteCalls).toBe(0);
+  });
+
+  test("does not delete protected branch main_agents after merge", async () => {
+    const pr = makePr({
+      number: 66,
+      html_url: "https://example.com/pr/66",
+      head: { ref: "main_agents", sha: "abc123def459" },
+      base: { ref: "main" },
+    });
+    let branchDeleteCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 9.0,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "feat(local_agent): preserve quality",
+        mergePullRequest: async () => ({ merged: true, sha: "deadbeef", message: "merged" }),
+        deleteBranchRef: async () => {
+          branchDeleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(branchDeleteCalls).toBe(0);
+  });
+
+  test("does not delete branch when head ref fails safety validation", async () => {
+    const pr = makePr({
+      number: 65,
+      html_url: "https://example.com/pr/65",
+      head: { ref: "agent/unsafe branch", sha: "abc123def458" },
+    });
+    let branchDeleteCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 9.1,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "feat(local_agent): preserve quality",
+        mergePullRequest: async () => ({ merged: true, sha: "deadbeef", message: "merged" }),
+        deleteBranchRef: async () => {
+          branchDeleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(branchDeleteCalls).toBe(0);
   });
 
   test("falls back to PR title merge metadata when head commit message lookup fails", async () => {

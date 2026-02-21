@@ -3,6 +3,8 @@ import { tmpdir } from "os";
 import { basename, isAbsolute, join, resolve } from "path";
 import {
   addPullRequestComment,
+  deleteBranchRef,
+  type DeleteBranchRefResult,
   getCommitMessage,
   listPullRequestComments,
   getPullRequestCommitMessage,
@@ -30,6 +32,7 @@ interface ReviewAgentDeps {
   getPullRequestCommitMessage: typeof getPullRequestCommitMessage;
   listPullRequestComments: typeof listPullRequestComments;
   mergePullRequest: typeof mergePullRequest;
+  deleteBranchRef: typeof deleteBranchRef;
   addPullRequestComment: typeof addPullRequestComment;
   invokeCodexReview: (prompt: string, config: ReviewAgentConfig) => Promise<string>;
   fetchImpl: typeof fetch;
@@ -44,6 +47,7 @@ const MAX_PR_RE_REVIEW_ENQUEUES = 500;
 const MAX_REVIEW_CONTEXT_COMMENTS = 8;
 const MAX_REVIEW_CONTEXT_COMMENT_CHARS = 320;
 const MAX_REVIEW_CONTEXT_TOTAL_CHARS = 3_000;
+const PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
 const DEFAULT_WORKSPACE_ROOT = resolve(import.meta.dir, "..", "..", "..");
@@ -57,6 +61,7 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   getPullRequestCommitMessage,
   listPullRequestComments,
   mergePullRequest,
+  deleteBranchRef,
   addPullRequestComment,
   invokeCodexReview,
   fetchImpl: fetch,
@@ -499,6 +504,69 @@ function normalizeReviewPrHeadRef(value: unknown): string | null {
   return normalized;
 }
 
+function normalizeBranchRef(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .replace(/^refs\/heads\//, "")
+    .replace(/^heads\//, "")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+}
+
+function isSafeBranchRefForDelete(ref: string): boolean {
+  const normalized = normalizeBranchRef(ref);
+  if (!normalized) return false;
+  if (normalized.includes("..")) return false;
+  if (normalized.includes("@{")) return false;
+  if (normalized.endsWith(".")) return false;
+  if (normalized.endsWith(".lock")) return false;
+  if (/[\s~^:?*\[\]\\]/.test(normalized)) return false;
+  return true;
+}
+
+function resolveMergedBranchDeletionPlan(pr: GitHubPR): {
+  shouldDelete: boolean;
+  normalizedHeadRef: string;
+  reason: string;
+} {
+  const normalizedHeadRef = normalizeBranchRef(pr.head.ref);
+  if (!normalizedHeadRef) {
+    return {
+      shouldDelete: false,
+      normalizedHeadRef: "",
+      reason: "head ref missing or invalid",
+    };
+  }
+  const headLower = normalizedHeadRef.toLowerCase();
+  if (PROTECTED_BRANCHES_FOR_AUTO_DELETE.has(headLower)) {
+    return {
+      shouldDelete: false,
+      normalizedHeadRef,
+      reason: `protected branch (${normalizedHeadRef})`,
+    };
+  }
+  const baseLower = normalizeBranchRef(pr.base.ref).toLowerCase();
+  if (baseLower && baseLower === headLower) {
+    return {
+      shouldDelete: false,
+      normalizedHeadRef,
+      reason: "head branch matches base branch",
+    };
+  }
+  if (!isSafeBranchRefForDelete(normalizedHeadRef)) {
+    return {
+      shouldDelete: false,
+      normalizedHeadRef,
+      reason: "head branch ref failed safety validation",
+    };
+  }
+  return {
+    shouldDelete: true,
+    normalizedHeadRef,
+    reason: "",
+  };
+}
+
 function decodeQuotedGitPath(value: string): string {
   return value.replace(/\\([0-7]{1,3}|.)/g, (_match, token: string) => {
     if (/^[0-7]{1,3}$/.test(token)) {
@@ -792,6 +860,7 @@ export class ReviewAgent {
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${result.sha.slice(0, 8)})`,
       );
+      await this.deleteMergedPrHeadBranch(pr);
       this.reReviewEnqueueCounts.delete(pr.number);
       this.forceReReview.delete(pr.number);
       this.reviewed.delete(pr.number);
@@ -850,6 +919,36 @@ export class ReviewAgent {
       }
     }
     return true;
+  }
+
+  private async deleteMergedPrHeadBranch(pr: GitHubPR): Promise<void> {
+    const plan = resolveMergedBranchDeletionPlan(pr);
+    if (!plan.shouldDelete) {
+      this.deps.logInfo(
+        `[${ts()}] [ReviewAgent] Skipping branch delete for PR #${pr.number}: ${plan.reason}`,
+      );
+      return;
+    }
+    try {
+      const result: DeleteBranchRefResult = await this.deps.deleteBranchRef({
+        token: this.githubToken,
+        remoteUrl: this.remoteUrl,
+        branchRef: plan.normalizedHeadRef,
+      });
+      if (result.deleted) {
+        this.deps.logInfo(
+          `[${ts()}] [ReviewAgent] Deleted merged PR head branch ${plan.normalizedHeadRef} for PR #${pr.number}`,
+        );
+      } else {
+        this.deps.logInfo(
+          `[${ts()}] [ReviewAgent] Branch ${plan.normalizedHeadRef} already absent after merge for PR #${pr.number}`,
+        );
+      }
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Failed to delete merged branch ${plan.normalizedHeadRef} for PR #${pr.number}: ${err?.message ?? err}`,
+      );
+    }
   }
 
   private async sendSessionCommand(

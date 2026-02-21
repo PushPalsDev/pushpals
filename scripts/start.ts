@@ -2552,6 +2552,79 @@ async function promptYesNo(question: string): Promise<boolean> {
   return normalized === "y" || normalized === "yes";
 }
 
+function ghRefreshOnStartEnabled(): boolean {
+  const raw = (process.env.PUSHPALS_GH_AUTH_REFRESH_ON_START ?? "").trim().toLowerCase();
+  if (!raw) return true;
+  return raw !== "0" && raw !== "false" && raw !== "no" && raw !== "off";
+}
+
+async function ghAuthStatusOk(): Promise<boolean> {
+  return (
+    (await runQuiet(["gh", "auth", "status", "--hostname", "github.com"])) === 0 ||
+    (await runQuiet(["gh", "auth", "status"])) === 0
+  );
+}
+
+async function ghApiAccessOk(): Promise<boolean> {
+  // Verifies that the active gh token can actually call GitHub APIs.
+  return (await runQuiet(["gh", "api", "user", "--hostname", "github.com"])) === 0;
+}
+
+async function exportGitTokenFromGhAuth(): Promise<boolean> {
+  const tokenResult = await runCapture(
+    ["gh", "auth", "token", "--hostname", "github.com"],
+    repoRoot,
+  );
+  if (!tokenResult.ok) return false;
+  const token = tokenResult.stdout.trim();
+  if (!token) return false;
+  process.env.PUSHPALS_GIT_TOKEN = token;
+  return true;
+}
+
+async function attemptGhAuthRefresh(
+  reason: string,
+  opts: { allowInteractive?: boolean } = {},
+): Promise<boolean> {
+  const allowInteractive = opts.allowInteractive ?? false;
+  console.log(`[start] ${reason} Attempting non-interactive \`gh auth refresh\`...`);
+  try {
+    const proc = Bun.spawn(["gh", "auth", "refresh", "-h", "github.com"], {
+      cwd: repoRoot,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        GH_PROMPT_DISABLED: "1",
+      },
+    });
+    const exitCode = await proc.exited;
+    if (exitCode === 0) {
+      return ghAuthStatusOk();
+    }
+  } catch {
+    // Continue to optional interactive fallback below.
+  }
+
+  if (!allowInteractive) {
+    console.warn("[start] `gh auth refresh` did not succeed in non-interactive mode.");
+    return false;
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.warn("[start] Unable to run interactive `gh auth refresh` (non-interactive shell).");
+    return false;
+  }
+
+  console.log("[start] Non-interactive refresh failed; attempting interactive `gh auth refresh`...");
+  const refreshExitCode = await runInherited(["gh", "auth", "refresh", "-h", "github.com"], repoRoot);
+  if (refreshExitCode !== 0) {
+    console.warn("[start] `gh auth refresh` did not succeed.");
+    return false;
+  }
+  return ghAuthStatusOk();
+}
+
 async function ensureGitHubAuth(force = false): Promise<void> {
   const skipCheck = envTruthy("PUSHPALS_SKIP_GH_AUTH_CHECK");
   const sourceControlManagerPushDisabled = envTruthy("SOURCE_CONTROL_MANAGER_NO_PUSH");
@@ -2567,20 +2640,56 @@ async function ensureGitHubAuth(force = false): Promise<void> {
 
   const ghAvailable = (await runQuiet(["gh", "--version"])) === 0;
   if (ghAvailable) {
-    const ghAuthed = (await runQuiet(["gh", "auth", "status"])) === 0;
-    if (ghAuthed) return;
-
-    console.log("[start] GitHub CLI is not authenticated. Starting `gh auth login`...");
-    const loginExitCode = await runInherited(["gh", "auth", "login"]);
-    if (loginExitCode !== 0) {
-      console.error("[start] `gh auth login` failed.");
-      abortStart(loginExitCode);
+    if (ghRefreshOnStartEnabled()) {
+      await attemptGhAuthRefresh(
+        "GitHub CLI auth refresh-on-start is enabled (PUSHPALS_GH_AUTH_REFRESH_ON_START=1).",
+      );
     }
 
-    const ghAuthedAfterLogin = (await runQuiet(["gh", "auth", "status"])) === 0;
-    if (!ghAuthedAfterLogin) {
-      console.error("[start] GitHub CLI is still not authenticated after login.");
-      abortStart(1);
+    let ghAuthed = await ghAuthStatusOk();
+    if (!ghAuthed) {
+      console.log("[start] GitHub CLI is not authenticated. Starting `gh auth login`...");
+      const loginExitCode = await runInherited(["gh", "auth", "login"], repoRoot);
+      if (loginExitCode !== 0) {
+        console.error("[start] `gh auth login` failed.");
+        abortStart(loginExitCode);
+      }
+      ghAuthed = await ghAuthStatusOk();
+      if (!ghAuthed) {
+        console.error("[start] GitHub CLI is still not authenticated after login.");
+        abortStart(1);
+      }
+    }
+
+    let apiAccessOk = await ghApiAccessOk();
+    if (!apiAccessOk) {
+      const refreshed = await attemptGhAuthRefresh(
+        "GitHub CLI auth is present but API validation failed.",
+        { allowInteractive: true },
+      );
+      apiAccessOk = refreshed ? await ghApiAccessOk() : false;
+    }
+    if (!apiAccessOk) {
+      console.log("[start] GitHub CLI token could not access GitHub API. Starting `gh auth login`...");
+      const loginExitCode = await runInherited(["gh", "auth", "login"], repoRoot);
+      if (loginExitCode !== 0) {
+        console.error("[start] `gh auth login` failed.");
+        abortStart(loginExitCode);
+      }
+      const apiAccessAfterLogin = await ghApiAccessOk();
+      if (!apiAccessAfterLogin) {
+        console.error("[start] GitHub CLI auth exists, but API access is still failing.");
+        abortStart(1);
+      }
+    }
+
+    const exported = await exportGitTokenFromGhAuth();
+    if (exported) {
+      console.log("[start] GitHub CLI auth preflight: authenticated and token exported for startup services.");
+    } else {
+      console.warn(
+        "[start] GitHub CLI auth is valid, but `gh auth token` export failed. Services will fall back to direct gh auth when needed.",
+      );
     }
     return;
   }

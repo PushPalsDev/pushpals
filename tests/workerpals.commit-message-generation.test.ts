@@ -4,6 +4,7 @@ import {
   buildCommitMessageGeneratorUserMessage,
   isTestLikeValidationStep,
   parseChangedPathsFromNameOnlyOutput,
+  redactSensitiveText,
   sanitizeGeneratedCommitMessage,
 } from "../apps/workerpals/src/execute_job";
 
@@ -153,5 +154,16 @@ describe("workerpals commit message generation helpers", () => {
     expect(message).toContain("Tests:\n- bun --cwd apps/localbuddy test");
     expect(message).not.toContain("updated path: .");
     expect(message).not.toContain("can you add 1 more test case for localbuddy");
+  });
+
+  test("redacts credentialed git URL and bearer tokens from error text", () => {
+    const redacted = redactSensitiveText(
+      "Failed to push branch: fatal: 'https%3A//oauth2%3Agho_abcdefghijklmnopqrstuvwxyz123456@github.com/PushPalsDev/pushpals' Bearer sk-proj-secret-token",
+    );
+
+    expect(redacted).toContain("https%3A//***@github.com");
+    expect(redacted).toContain("Bearer ***");
+    expect(redacted).not.toContain("gho_abcdefghijklmnopqrstuvwxyz123456");
+    expect(redacted).not.toContain("sk-proj-secret-token");
   });
 });

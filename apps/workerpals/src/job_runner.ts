@@ -17,6 +17,7 @@
 
 import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
 import { loadPushPalsConfig } from "shared";
+import { writeFileSync } from "fs";
 
 const CONFIG = loadPushPalsConfig();
 
@@ -56,32 +57,40 @@ function setupGitCredentials(): void {
   const token = CONFIG.gitToken ?? process.env.GIT_TOKEN ?? null;
   if (!token) return;
   try {
-    // Get the origin URL and rewrite it with the token
-    const proc = Bun.spawn(["git", "remote", "get-url", "origin"], {
+    // Use a credential helper script and avoid remote URL rewriting with embedded secrets.
+    // This keeps push auth stable and prevents token leakage in git stderr output.
+    const helperScript = `#!/bin/sh
+echo "username=x-access-token"
+echo "password=${token}"
+`;
+    const helperPath = "/tmp/git-credential-helper";
+    writeFileSync(helperPath, helperScript, { mode: 0o755 });
+
+    // Remove any legacy URL rewrite rules that may have embedded token credentials.
+    const urlRules = Bun.spawnSync(["git", "config", "--global", "--get-regexp", "^url\\..*\\.insteadOf$"], {
       stdout: "pipe",
       stderr: "pipe",
     });
-    // We need to do this synchronously-ish for setup
-    // For now, we'll set up a credential helper
-    const helperScript = `#!/bin/sh
-echo "username=oauth2"
-echo "password=${token}"
-`;
-    // Write credential helper
-    const fs = require("fs");
-    const path = require("path");
-    const helperPath = "/tmp/git-credential-helper";
-    fs.writeFileSync(helperPath, helperScript, { mode: 0o755 });
-    // Configure git to use it
+    if (urlRules.exitCode === 0) {
+      const lines = String(urlRules.stdout ?? "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      for (const line of lines) {
+        const key = line.split(/\s+/, 1)[0] ?? "";
+        if (!key) continue;
+        const lower = key.toLowerCase();
+        if (!lower.startsWith("url.")) continue;
+        if (!lower.endsWith(".insteadof")) continue;
+        if (!lower.includes("oauth2") && !lower.includes("%3a//")) continue;
+        Bun.spawnSync(["git", "config", "--global", "--unset-all", key], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+      }
+    }
+
     Bun.spawnSync(["git", "config", "--global", "credential.helper", helperPath]);
-    // Also set up the URL to use HTTPS with token
-    Bun.spawnSync([
-      "git",
-      "config",
-      "--global",
-      "url." + `https://oauth2:${token}@github.com/`.replace(/:/g, "%3A") + ".insteadOf",
-      "https://github.com/",
-    ]);
   } catch (err) {
     log("stderr", `Failed to setup git credentials: ${err}`);
   }

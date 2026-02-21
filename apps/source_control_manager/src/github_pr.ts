@@ -317,6 +317,47 @@ export async function mergePullRequest(opts: {
   return data;
 }
 
+export interface DeleteBranchRefResult {
+  deleted: boolean;
+  reason: "deleted" | "not_found";
+}
+
+export async function deleteBranchRef(opts: {
+  token: string;
+  remoteUrl: string;
+  branchRef: string;
+}): Promise<DeleteBranchRefResult> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const normalizedRef = String(opts.branchRef ?? "")
+    .trim()
+    .replace(/^refs\/heads\//, "")
+    .replace(/^heads\//, "")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (!normalizedRef) {
+    throw new Error("branchRef is required to delete a branch");
+  }
+
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/git/refs/heads/${encodeURIComponent(normalizedRef)}`;
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: githubHeaders(opts.token),
+  });
+
+  if (response.status === 404) {
+    return { deleted: false, reason: "not_found" };
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw githubError(response.status, text);
+  }
+  return { deleted: true, reason: "deleted" };
+}
+
 export interface PullRequestComment {
   id: number;
   body: string;

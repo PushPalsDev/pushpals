@@ -107,6 +107,22 @@ function toSingleLine(value: unknown, max = 240): string {
   return text.length > max ? `${text.slice(0, Math.max(1, max - 3))}...` : text;
 }
 
+export function redactSensitiveText(value: string): string {
+  let out = String(value ?? "");
+  if (!out) return "";
+  // redact URL userinfo credentials: https://user:pass@host -> https://***@host
+  out = out.replace(/(https?:\/\/)[^@\s/]+@/gi, "$1***@");
+  // redact malformed/encoded scheme userinfo from legacy rewrite bugs: https%3A//user%3Apass@host
+  out = out.replace(/https%3a\/\/[^@\s/]+@/gi, "https%3A//***@");
+  // redact bearer tokens
+  out = out.replace(/\b(Bearer\s+)[A-Za-z0-9._\-:+/=]+\b/gi, "$1***");
+  // redact common VCS token shapes
+  out = out.replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "gh***");
+  out = out.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "github_pat_***");
+  out = out.replace(/\bglpat-[A-Za-z0-9\-_]{20,}\b/gi, "glpat-***");
+  return out;
+}
+
 export function buildCriticRevisionIssues(
   critic: { score: number; mustFix: string[] } | null | undefined,
   qualityCriticMinScore: number,
@@ -1208,7 +1224,7 @@ export async function createJobCommit(
         `${hiddenCommitRef}:refs/heads/${publicBranchName}`,
       ]);
       if (!result.ok) {
-        const pushError = `Failed to push branch: ${result.stderr || result.stdout}`;
+        const pushError = `Failed to push branch: ${redactSensitiveText(result.stderr || result.stdout)}`;
         if (requirePush) {
           if (hiddenRefCreated) {
             await git(repo, ["update-ref", "-d", hiddenCommitRef]);
