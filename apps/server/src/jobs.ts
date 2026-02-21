@@ -32,6 +32,7 @@ export interface JobRow {
   workerId: string | null;
   targetWorkerId: string | null;
   result: string | null;
+  prUrl: string | null;
   error: string | null;
   enqueuedAt: string;
   claimedAt: string | null;
@@ -227,6 +228,7 @@ export class JobQueue {
           workerId            TEXT,
           targetWorkerId      TEXT,
           result              TEXT,
+          prUrl               TEXT,
           error               TEXT,
           enqueuedAt          TEXT,
           claimedAt           TEXT,
@@ -316,6 +318,9 @@ export class JobQueue {
     }
     if (!jobColumns.some((col) => col.name === "durationMs")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN durationMs INTEGER;`);
+    }
+    if (!jobColumns.some((col) => col.name === "prUrl")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN prUrl TEXT;`);
     }
 
     // Column-dependent indexes are created after legacy column backfills complete.
@@ -675,6 +680,8 @@ export class JobQueue {
     const now = new Date().toISOString();
     const summary = (body.summary as string) ?? null;
     const artifacts = body.artifacts ? JSON.stringify(body.artifacts) : null;
+    const prUrl =
+      typeof body.prUrl === "string" && body.prUrl.trim().length > 0 ? body.prUrl.trim() : null;
 
     const jobRow = this.db.prepare(`SELECT workerId FROM jobs WHERE id = ?`).get(jobId) as
       | { workerId: string | null }
@@ -685,6 +692,7 @@ export class JobQueue {
         `UPDATE jobs
          SET status = 'completed',
              result = ?,
+             prUrl = COALESCE(?, prUrl),
              completedAt = ?,
              failedAt = NULL,
              durationMs = MAX(
@@ -694,7 +702,7 @@ export class JobQueue {
              updatedAt = ?
          WHERE id = ? AND status = 'claimed'`,
       )
-      .run(JSON.stringify({ summary, artifacts }), now, now, now, jobId);
+      .run(JSON.stringify({ summary, artifacts }), prUrl, now, now, now, jobId);
 
     if (info.changes === 0) {
       return { ok: false, message: "Job not found or not in claimed state" };
@@ -953,6 +961,27 @@ export class JobQueue {
          WHERE workerId = ?`,
       )
       .run(now, now, workerId);
+  }
+
+  setPrUrl(jobId: string, prUrl: string | null | undefined): { ok: boolean; message?: string } {
+    const normalizedPrUrl =
+      typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
+    if (!normalizedPrUrl) {
+      return { ok: false, message: "prUrl is required" };
+    }
+    const now = new Date().toISOString();
+    const info = this.db
+      .prepare(
+        `UPDATE jobs
+         SET prUrl = COALESCE(?, prUrl),
+             updatedAt = ?
+         WHERE id = ?`,
+      )
+      .run(normalizedPrUrl, now, jobId);
+    if (info.changes === 0) {
+      return { ok: false, message: "Job not found" };
+    }
+    return { ok: true };
   }
 
   getJob(jobId: string): JobRow | null {

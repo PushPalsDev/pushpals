@@ -22,6 +22,7 @@ export interface CompletionRow {
   commitSha: string | null;
   branch: string | null;
   message: string;
+  prUrl: string | null;
   prTitle: string | null;
   prBody: string | null;
   status: CompletionStatus;
@@ -49,6 +50,7 @@ export class CompletionQueue {
         commitSha  TEXT,
         branch     TEXT,
         message    TEXT NOT NULL,
+        prUrl      TEXT,
         prTitle    TEXT,
         prBody     TEXT,
         status     TEXT NOT NULL DEFAULT 'pending',
@@ -71,6 +73,9 @@ export class CompletionQueue {
     if (!columns.some((col) => col.name === "prBody")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN prBody TEXT;`);
     }
+    if (!columns.some((col) => col.name === "prUrl")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN prUrl TEXT;`);
+    }
   }
 
   /**
@@ -82,6 +87,8 @@ export class CompletionQueue {
     const commitSha = body.commitSha as string | undefined;
     const branch = body.branch as string | undefined;
     const message = body.message as string;
+    const prUrl =
+      typeof body.prUrl === "string" && body.prUrl.trim().length > 0 ? body.prUrl.trim() : null;
     const prTitle =
       typeof body.prTitle === "string" && body.prTitle.trim().length > 0
         ? body.prTitle.trim()
@@ -98,8 +105,8 @@ export class CompletionQueue {
 
     this.db
       .prepare(
-        `INSERT INTO completions (id, jobId, sessionId, commitSha, branch, message, prTitle, prBody, status, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        `INSERT INTO completions (id, jobId, sessionId, commitSha, branch, message, prUrl, prTitle, prBody, status, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       )
       .run(
         completionId,
@@ -108,6 +115,7 @@ export class CompletionQueue {
         commitSha ?? null,
         branch ?? null,
         message,
+        prUrl,
         prTitle,
         prBody,
         now,
@@ -149,14 +157,20 @@ export class CompletionQueue {
   /**
    * Mark a completion as processed (checks passed, merged to integration branch)
    */
-  markProcessed(completionId: string): { ok: boolean; message?: string } {
+  markProcessed(completionId: string, prUrl?: string | null): { ok: boolean; message?: string } {
     const now = new Date().toISOString();
+    const normalizedPrUrl =
+      typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
 
     const info = this.db
       .prepare(
-        `UPDATE completions SET status = 'processed', updatedAt = ? WHERE id = ? AND status = 'claimed'`,
+        `UPDATE completions
+         SET status = 'processed',
+             prUrl = COALESCE(?, prUrl),
+             updatedAt = ?
+         WHERE id = ? AND status = 'claimed'`,
       )
-      .run(now, completionId);
+      .run(normalizedPrUrl, now, completionId);
 
     if (info.changes === 0) {
       return { ok: false, message: "Completion not found or not in claimed state" };

@@ -1063,7 +1063,20 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const completionId = compProcMatch[1];
-        const result = completionQueue.markProcessed(completionId);
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const prUrl = typeof body.prUrl === "string" ? body.prUrl : null;
+        const result = completionQueue.markProcessed(completionId, prUrl);
+        if (result.ok && prUrl) {
+          const completion = completionQueue.getCompletion(completionId);
+          if (completion?.jobId) {
+            const syncResult = jobQueue.setPrUrl(completion.jobId, prUrl);
+            if (!syncResult.ok) {
+              console.warn(
+                `[Server] Completion ${completionId} marked processed, but failed to sync job PR URL for ${completion.jobId}: ${syncResult.message ?? "unknown error"}`,
+              );
+            }
+          }
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
 

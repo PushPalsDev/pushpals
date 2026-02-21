@@ -382,6 +382,7 @@ export interface JobSnapshotRow {
   workerId: string | null;
   targetWorkerId: string | null;
   result: string | null;
+  prUrl?: string | null;
   error: string | null;
   enqueuedAt?: string | null;
   claimedAt?: string | null;
@@ -401,6 +402,7 @@ export interface CompletionSnapshotRow {
   commitSha: string | null;
   branch: string | null;
   message: string;
+  prUrl?: string | null;
   prTitle?: string | null;
   prBody?: string | null;
   status: "pending" | "claimed" | "processed" | "failed";

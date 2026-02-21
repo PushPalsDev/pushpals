@@ -347,6 +347,7 @@ async function tick(): Promise<void> {
         commitSha: string;
         branch: string;
         message: string;
+        prUrl: string | null;
         prTitle: string | null;
         prBody: string | null;
         status: string;
@@ -390,6 +391,10 @@ async function tick(): Promise<void> {
 
     // ── Process completion ─────────────────────────────────────────────
     try {
+      let processedPrUrl: string | null =
+        typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0
+          ? completion.prUrl.trim()
+          : null;
       // 1. Refresh refs before applying completion commit/ref
       console.log(`[${ts()}] Refreshing refs before applying ${completion.branch}...`);
       await gitOps.fetchPrune();
@@ -544,6 +549,7 @@ async function tick(): Promise<void> {
         const prMessage = pr.created
           ? `Opened individual PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`
           : `Reused existing PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`;
+        processedPrUrl = pr.htmlUrl;
         console.log(`[${ts()}] ${prMessage}`);
         await emitPusherMessage(comm, prMessage, completion.id);
       } else {
@@ -572,6 +578,7 @@ async function tick(): Promise<void> {
               const prMessage = pr.created
                 ? `Opened PR #${pr.number}: ${pr.htmlUrl}`
                 : `Reused existing PR #${pr.number}: ${pr.htmlUrl}`;
+              processedPrUrl = pr.htmlUrl;
               console.log(`[${ts()}] ${prMessage}`);
               await emitPusherMessage(comm, prMessage, completion.id);
             } catch (prErr: any) {
@@ -594,7 +601,7 @@ async function tick(): Promise<void> {
         {
           method: "POST",
           headers,
-          body: JSON.stringify({}),
+          body: JSON.stringify({ prUrl: processedPrUrl }),
         },
       );
 

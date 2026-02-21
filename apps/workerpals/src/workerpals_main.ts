@@ -615,6 +615,14 @@ async function enqueueCompletion(
   resultSummary: string,
 ): Promise<boolean> {
   try {
+    const reviewAgent =
+      job.params?.reviewAgent && typeof job.params.reviewAgent === "object"
+        ? (job.params.reviewAgent as Record<string, unknown>)
+        : null;
+    const prUrl =
+      reviewAgent && typeof reviewAgent.prUrl === "string" && reviewAgent.prUrl.trim().length > 0
+        ? reviewAgent.prUrl.trim()
+        : null;
     const pr = buildCompletionPrMetadata({
       workerId,
       integrationBranch,
@@ -632,6 +640,7 @@ async function enqueueCompletion(
         commitSha: commit.sha,
         branch: commit.branch,
         message: `${job.kind}: ${job.taskId} (worker PR metadata attached)`,
+        prUrl,
         prTitle: pr.title,
         prBody: pr.body,
       }),
@@ -999,12 +1008,23 @@ async function workerLoop(
             }
 
             if (result.ok) {
+              const reviewAgent =
+                parsedParams.reviewAgent && typeof parsedParams.reviewAgent === "object"
+                  ? (parsedParams.reviewAgent as Record<string, unknown>)
+                  : null;
+              const jobPrUrl =
+                reviewAgent &&
+                typeof reviewAgent.prUrl === "string" &&
+                reviewAgent.prUrl.trim().length > 0
+                  ? reviewAgent.prUrl.trim()
+                  : null;
               await fetch(`${opts.server}/jobs/${job.id}/complete`, {
                 method: "POST",
                 headers,
                 body: JSON.stringify({
                   summary: result.summary,
                   durationMs: jobDurationMs,
+                  prUrl: jobPrUrl,
                   artifacts: [
                     ...(result.stdout ? [{ kind: "stdout", text: result.stdout }] : []),
                     ...(result.stderr ? [{ kind: "stderr", text: result.stderr }] : []),

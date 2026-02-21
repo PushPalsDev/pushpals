@@ -26,17 +26,6 @@ function stageTone(stage: CoordinationStage): Tone {
   return "accent";
 }
 
-function trimTrailingSlash(value: string): string {
-  return value.replace(/\/+$/, "");
-}
-
-function encodeGitRefForPath(ref: string): string {
-  return ref
-    .split("/")
-    .map((part) => encodeURIComponent(part))
-    .join("/");
-}
-
 function extractFirstHttpUrl(text: string | null | undefined): string | null {
   const raw = String(text ?? "").trim();
   if (!raw) return null;
@@ -63,27 +52,18 @@ export function CoordinationPane({
   onReusePrompt: (text: string) => void;
   onOpenLogs: (row: CoordinationRow) => void;
 }) {
-  const repoBaseUrl = React.useMemo(
-    () => trimTrailingSlash(String(process.env.EXPO_PUBLIC_PUSHPALS_REPO_URL ?? "").trim()),
-    [],
-  );
   const getReviewTargetUrl = React.useCallback(
     (completion: CoordinationRow["completions"][number] | undefined): string | null => {
       if (!completion) return null;
+      const urlFromCompletion = extractFirstHttpUrl(completion.prUrl);
+      if (urlFromCompletion) return urlFromCompletion;
       const urlFromBody = extractFirstHttpUrl(completion.prBody);
       if (urlFromBody) return urlFromBody;
       const urlFromTitle = extractFirstHttpUrl(completion.prTitle);
       if (urlFromTitle) return urlFromTitle;
-      if (!repoBaseUrl) return null;
-      if (completion.commitSha) {
-        return `${repoBaseUrl}/commit/${encodeURIComponent(completion.commitSha)}`;
-      }
-      if (completion.branch) {
-        return `${repoBaseUrl}/tree/${encodeGitRefForPath(completion.branch)}`;
-      }
       return null;
     },
-    [repoBaseUrl],
+    [],
   );
   const openReviewTarget = React.useCallback(
     async (completion: CoordinationRow["completions"][number] | undefined): Promise<void> => {
@@ -463,7 +443,7 @@ export function CoordinationPane({
                           },
                         ]}
                       >
-                        Open Branch/PR
+                        PR
                       </Text>
                     </Pressable>
                   </View>
