@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   inferFallbackValidationCommandsForTestTask,
+  isTestLikeValidationStep,
   tokenizeValidationCommandArgv,
 } from "../apps/workerpals/src/execute_job";
 
@@ -44,6 +45,19 @@ describe("workerpals validation command safety", () => {
   test("rejects shell control chaining tokens", () => {
     expect(tokenizeValidationCommandArgv("bun test && echo hi")).toBeNull();
     expect(tokenizeValidationCommandArgv("bun test | cat")).toBeNull();
+  });
+
+  test("detects test-like validation steps with argv flags and inline backticks", () => {
+    expect(isTestLikeValidationStep("bun --cwd apps/localbuddy test")).toBe(true);
+    expect(isTestLikeValidationStep("Run `bun --cwd apps/localbuddy test`")).toBe(true);
+    expect(isTestLikeValidationStep("npm --prefix apps/server test")).toBe(true);
+    expect(isTestLikeValidationStep("python -m pytest tests")).toBe(true);
+  });
+
+  test("rejects non-test validation steps", () => {
+    expect(isTestLikeValidationStep("bun run build")).toBe(false);
+    expect(isTestLikeValidationStep("echo done")).toBe(false);
+    expect(isTestLikeValidationStep("Run `node scripts/lint.js`")).toBe(false);
   });
 
   test("prefers scoped fallback commands before full-suite runs", () => {

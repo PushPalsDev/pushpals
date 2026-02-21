@@ -142,6 +142,8 @@ function parseJsonObjectLoose(text: string): Record<string, unknown> | null {
   return null;
 }
 
+const COMMIT_MSG_MAX_DIFF_CHARS = 120_000;
+
 const SHELL_CONTROL_TOKENS = new Set(["&&", "||", ";", "|"]);
 
 export function tokenizeValidationCommandArgv(command: string): string[] | null {
@@ -953,7 +955,6 @@ export async function createJobCommit(
   const publicBranchName = `agent/${workerId}/${job.id}`;
   // Keep worker refs out of refs/heads so user-visible branch lists stay clean.
   const hiddenCommitRef = `refs/pushpals/agent/${workerId}/${job.id}`;
-  const commitMsg = buildWorkerCommitMessage(workerId, job);
   let completionRef = hiddenCommitRef;
   let hiddenRefCreated = false;
 
@@ -1001,6 +1002,25 @@ export async function createJobCommit(
       console.log(`[WorkerPals] No changes to commit for job ${job.id}`);
       return { ok: true, branch: hiddenCommitRef, sha: "no-changes" };
     }
+
+    // Generate commit message from actual staged diff; fall back to deterministic.
+    const cachedDiff = await git(repo, ["diff", "--cached"]);
+    const diff = cachedDiff.ok ? cachedDiff.stdout : "";
+    const jobPlanning = job.params?.planning as Record<string, unknown> | undefined;
+    const jobValidationSteps = toNonEmptyStringArray(
+      jobPlanning?.validationSteps ?? job.params?.validationSteps,
+    );
+    const commitMsg =
+      (await generateCommitMessageFromDiff(
+        diff,
+        {
+          instruction: String(job.params?.instruction ?? ""),
+          type: normalizeCommitType(job.kind, job.params),
+          area: inferCommitArea(job.kind, job.params),
+          validationSteps: jobValidationSteps,
+        },
+        runtimeConfig,
+      ).catch(() => null)) ?? buildWorkerCommitMessage(workerId, job);
 
     // Commit changes
     result = await git(repo, ["commit", "-m", commitMsg]);
@@ -1223,6 +1243,13 @@ function deriveSummary(action: string, params?: Record<string, unknown>): string
   return raw;
 }
 
+/** Returns true for acceptance criteria that are generic boilerplate with no commit signal. */
+function isBoilerplateCriterion(criterion: string): boolean {
+  return /produce a correct and helpful result|complete the requested task|accomplish the (?:stated )?goal|provide a (?:correct|good|helpful) (?:solution|result|answer)|the task (?:is|should be) completed|successfully complete(?:d)? the task/i.test(
+    criterion,
+  );
+}
+
 function buildImplementationPoints(kind: string, params?: Record<string, unknown>): string {
   // 1. Explicit commit points take highest priority (set by dispatcher or worker).
   const explicitPoints = toNonEmptyStringArray(
@@ -1235,15 +1262,15 @@ function buildImplementationPoints(kind: string, params?: Record<string, unknown
       .join("\n");
   }
 
-  // 2. Use acceptance criteria from planning as implementation bullets.
-  //    These are always set for autonomy/re-queue jobs and describe what was achieved.
+  // 2. Use acceptance criteria from planning as implementation bullets, but only
+  //    when they describe specific outcomes (not generic boilerplate phrases).
   const planning =
     params && typeof params.planning === "object" && !Array.isArray(params.planning)
       ? (params.planning as Record<string, unknown>)
       : undefined;
   const criteria = toNonEmptyStringArray(
     planning?.acceptanceCriteria ?? planning?.acceptance_criteria,
-  );
+  ).filter((criterion) => !isBoilerplateCriterion(criterion));
   if (criteria.length > 0) {
     return criteria
       .slice(0, 6)
@@ -1279,6 +1306,43 @@ function toNonEmptyStringArray(value: unknown): string[] {
     .filter((entry) => entry.length > 0);
 }
 
+/** Returns true only for validation steps that invoke a recognizable test runner. */
+export function isTestLikeValidationStep(step: string): boolean {
+  const classify = (candidate: string): boolean => {
+    const argv = tokenizeValidationCommandArgv(candidate);
+    if (!argv || argv.length === 0) return false;
+    const tool = argv[0].toLowerCase();
+    const hasToken = (token: string) => argv.some((entry) => entry.toLowerCase() === token);
+
+    switch (tool) {
+      case "bun":
+      case "npm":
+      case "pnpm":
+      case "yarn":
+        return hasToken("test");
+      case "pytest":
+      case "vitest":
+      case "jest":
+        return true;
+      case "python":
+        return (
+          argv.length >= 3 &&
+          argv[1].toLowerCase() === "-m" &&
+          argv[2].toLowerCase() === "pytest"
+        );
+      case "coverage":
+        return hasToken("pytest");
+      default:
+        return false;
+    }
+  };
+
+  if (classify(step)) return true;
+  // Also check commands wrapped in backticks (e.g. "Run `bun --cwd apps/localbuddy test`").
+  const fenced = step.match(/`([^`]+)`/)?.[1]?.trim() ?? "";
+  return fenced ? classify(fenced) : false;
+}
+
 function buildCommitTestsBlock(params?: Record<string, unknown>): string {
   const planning =
     params && typeof params.planning === "object" && !Array.isArray(params.planning)
@@ -1293,13 +1357,15 @@ function buildCommitTestsBlock(params?: Record<string, unknown>): string {
   ];
 
   const seen = new Set<string>();
-  const unique = candidates.filter((entry) => {
-    if (seen.has(entry)) return false;
-    seen.add(entry);
-    return true;
-  });
+  const unique = candidates
+    .filter((entry) => {
+      if (seen.has(entry)) return false;
+      seen.add(entry);
+      return true;
+    })
+    .filter(isTestLikeValidationStep);
 
-  if (unique.length === 0) return "- not run (not provided)";
+  if (unique.length === 0) return "- not run (no test commands provided)";
   return unique.map((entry) => `- ${entry}`).join("\n");
 }
 
@@ -1369,6 +1435,85 @@ function summarizeJobAction(kind: string, params?: Record<string, unknown>): str
   }
 }
 
+async function generateCommitMessageFromDiff(
+  diff: string,
+  opts: { instruction: string; type: string; area: string; validationSteps: string[] },
+  runtimeConfig: WorkerpalsRuntimeConfig,
+): Promise<string | null> {
+  const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
+  const model = runtimeConfig.workerpals.llm.model.trim();
+  if (!endpoint || !model || !diff.trim()) return null;
+
+  let systemPrompt: string;
+  try {
+    systemPrompt = loadPromptTemplate("workerpals/commit_message_prompt.md", {
+      type: opts.type,
+      area: opts.area,
+    }).trim();
+    if (!systemPrompt || systemPrompt.includes("{{")) return null;
+  } catch {
+    return null;
+  }
+
+  const testLines =
+    opts.validationSteps
+      .filter(isTestLikeValidationStep)
+      .map((s) => `- ${s}`)
+      .join("\n") || "- (none)";
+
+  const userMessage = [
+    `Task instruction: ${opts.instruction.slice(0, 400)}`,
+    "",
+    "Validation steps:",
+    testLines,
+    "",
+    "Staged diff:",
+    diff.slice(0, COMMIT_MSG_MAX_DIFF_CHARS),
+  ].join("\n");
+
+  const apiKey = runtimeConfig.workerpals.llm.apiKey.trim() || "local";
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage },
+        ],
+        temperature: 0,
+        max_tokens: 500,
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!response.ok) return null;
+    const payload = parseJsonObjectLoose(await response.text());
+    if (!payload) return null;
+    const choices = Array.isArray(payload.choices)
+      ? (payload.choices as Array<Record<string, unknown>>)
+      : [];
+    const content = String(
+      (choices[0]?.message as Record<string, unknown> | undefined)?.content ?? "",
+    ).trim();
+    if (!content) return null;
+    // Strip accidental markdown fences.
+    const clean = content.replace(/^```[^\n]*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
+    // Sanity check: must open with the expected conventional commit prefix.
+    if (!clean.startsWith(`${opts.type}(${opts.area})`)) return null;
+    return clean;
+  } catch {
+    clearTimeout(timer);
+    return null;
+  }
+}
+
 function buildWorkerCommitMessage(
   workerId: string,
   job: {
@@ -1384,68 +1529,32 @@ function buildWorkerCommitMessage(
   const type = normalizeCommitType(job.kind, job.params);
   const area = inferCommitArea(job.kind, job.params);
   const summary = deriveSummary(action, job.params);
-  const contextValue = sanitizeCommitValue(job.context ?? "host", 32);
-  const sessionValue = sanitizeCommitValue(job.sessionId ?? "", 128);
-  const replacements = {
-    type: sanitizeCommitValue(type, 16),
-    area: sanitizeCommitValue(area, 48),
-    summary: sanitizeCommitValue(summary, 72),
-    worker_id: sanitizeCommitValue(workerId, 64),
-    task_id: sanitizeCommitValue(job.taskId, 128),
-    job_id: sanitizeCommitValue(job.id, 128),
-    action: sanitizeCommitValue(action, 180),
-    context: contextValue || "host",
-    session_line: sessionValue ? `- session: ${sessionValue}` : "",
-    implementation_points: "",
-    tests_block: "",
-    meta_block: "",
-  };
-
-  const implementationPoints = buildImplementationPoints(job.kind, job.params);
-  replacements.implementation_points =
-    implementationPoints || `- ${sanitizeCommitValue(action, 220) || "apply requested repository update"}`;
-  replacements.tests_block = buildCommitTestsBlock(job.params);
-  replacements.meta_block = shouldIncludeCommitMeta(job.params)
-    ? buildCommitMetaBlock(job.kind, job.params, replacements)
-    : "";
-
-  const deterministicFallback = () => {
-    const fallbackLines: string[] = [
-      `${replacements.type}(${replacements.area}): ${replacements.summary}`,
-      "",
-      replacements.implementation_points,
-      "",
-      "Tests:",
-      replacements.tests_block,
-    ];
-    if (replacements.meta_block) fallbackLines.push(replacements.meta_block);
-    return fallbackLines.join("\n");
-  };
-
-  const isInstructionalTemplateOutput = (value: string): boolean => {
-    const text = value.trim().toLowerCase();
-    if (!text) return true;
-    if (text.includes("required output structure")) return true;
-    if (text.includes("absolute prohibitions")) return true;
-    if (text.includes("quality checklist")) return true;
-    if (text.startsWith("# commit message writer")) return true;
-    if (text.includes("{{")) return true;
-    return false;
-  };
-
-  try {
-    const rendered = loadPromptTemplate("workerpals/commit_message_prompt.md", replacements).trim();
-    if (isInstructionalTemplateOutput(rendered)) {
-      console.warn(
-        `[WorkerPals] Commit message template appears instructional/unrendered; using deterministic fallback message.`,
-      );
-      return deterministicFallback();
-    }
-    return rendered;
-  } catch (err) {
-    console.warn(`[WorkerPals] Failed to load commit message prompt template: ${String(err)}`);
-    return deterministicFallback();
+  const implementationPoints =
+    buildImplementationPoints(job.kind, job.params) ||
+    `- ${sanitizeCommitValue(action, 220) || "apply requested repository update"}`;
+  const testsBlock = buildCommitTestsBlock(job.params);
+  const lines: string[] = [
+    `${sanitizeCommitValue(type, 16)}(${sanitizeCommitValue(area, 48)}): ${sanitizeCommitValue(summary, 72)}`,
+    "",
+    implementationPoints,
+    "",
+    "Tests:",
+    testsBlock,
+  ];
+  if (shouldIncludeCommitMeta(job.params)) {
+    const contextValue = sanitizeCommitValue(job.context ?? "host", 32);
+    const sessionValue = sanitizeCommitValue(job.sessionId ?? "", 128);
+    lines.push(
+      buildCommitMetaBlock(job.kind, job.params, {
+        worker_id: sanitizeCommitValue(workerId, 64),
+        task_id: sanitizeCommitValue(job.taskId, 128),
+        job_id: sanitizeCommitValue(job.id, 128),
+        context: contextValue || "host",
+        session_line: sessionValue ? `- session: ${sessionValue}` : "",
+      }),
+    );
   }
+  return lines.join("\n");
 }
 
 // ─── Job execution ───────────────────────────────────────────────────────────
