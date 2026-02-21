@@ -2557,6 +2557,8 @@ function ghRefreshOnStartEnabled(): boolean {
   if (!raw) return true;
   return raw !== "0" && raw !== "false" && raw !== "no" && raw !== "off";
 }
+let ghRefreshOnStartAttempted = false;
+let ghAuthPreflightSatisfied = false;
 
 async function ghAuthStatusOk(): Promise<boolean> {
   return (
@@ -2582,23 +2584,111 @@ async function exportGitTokenFromGhAuth(): Promise<boolean> {
   return true;
 }
 
+function openUrlInBrowser(url: string): boolean {
+  try {
+    if (process.platform === "win32") {
+      const proc = Bun.spawn(["cmd", "/c", "start", "", url], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      void proc.exited;
+      return true;
+    }
+    if (process.platform === "darwin") {
+      const proc = Bun.spawn(["open", url], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      void proc.exited;
+      return true;
+    }
+    const proc = Bun.spawn(["xdg-open", url], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    void proc.exited;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function attemptGhAuthRefresh(
   reason: string,
   opts: { allowInteractive?: boolean } = {},
 ): Promise<boolean> {
   const allowInteractive = opts.allowInteractive ?? false;
+  let openedDeviceFlowUrl = false;
+  let deviceFlowDetected = false;
   console.log(`[start] ${reason} Attempting non-interactive \`gh auth refresh\`...`);
   try {
     const proc = Bun.spawn(["gh", "auth", "refresh", "-h", "github.com"], {
       cwd: repoRoot,
       stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
       env: {
         ...process.env,
         GH_PROMPT_DISABLED: "1",
       },
     });
+    let stderrTail = "";
+    const maybeHandleDeviceFlowUrl = (text: string): void => {
+      stderrTail = `${stderrTail}${text}`;
+      if (stderrTail.length > 2048) {
+        stderrTail = stderrTail.slice(-2048);
+      }
+      const match = stderrTail.match(/https:\/\/github\.com\/login\/device[^\s)]*/i);
+      if (!match || openedDeviceFlowUrl) return;
+      const url = match[0];
+      openedDeviceFlowUrl = true;
+      if (openUrlInBrowser(url)) {
+        console.log(`[start] Opened browser for GitHub device flow: ${url}`);
+      } else {
+        console.warn(`[start] Could not auto-open browser. Open this URL manually: ${url}`);
+      }
+      deviceFlowDetected = true;
+      try {
+        proc.kill();
+      } catch {
+        // ignore
+      }
+    };
+    const streamToTerminal = async (
+      stream: ReadableStream<Uint8Array> | null,
+      write: (value: string) => void,
+      onChunk?: (value: string) => void,
+    ): Promise<void> => {
+      if (!stream) return;
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          if (!chunk) continue;
+          write(chunk);
+          if (onChunk) onChunk(chunk);
+        }
+        const tail = decoder.decode();
+        if (tail) {
+          write(tail);
+          if (onChunk) onChunk(tail);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    };
+    const stdoutPump = streamToTerminal(proc.stdout, (value) => process.stdout.write(value));
+    const stderrPump = streamToTerminal(
+      proc.stderr,
+      (value) => process.stderr.write(value),
+      maybeHandleDeviceFlowUrl,
+    );
     const timeoutMs = 12_000;
     let timedOut = false;
     const timeout = setTimeout(() => {
@@ -2610,7 +2700,19 @@ async function attemptGhAuthRefresh(
       }
     }, timeoutMs);
     const exitCode = await proc.exited;
+    await Promise.allSettled([stdoutPump, stderrPump]);
     clearTimeout(timeout);
+    if (deviceFlowDetected) {
+      if (!allowInteractive) {
+        console.warn(
+          "[start] Non-interactive `gh auth refresh` entered device flow and requires browser completion.",
+        );
+        return false;
+      }
+      console.warn(
+        "[start] Non-interactive `gh auth refresh` entered device flow; requiring browser authentication before continuing.",
+      );
+    }
     if (timedOut) {
       console.warn(
         `[start] Non-interactive \`gh auth refresh\` timed out after ${timeoutMs}ms; continuing startup.`,
@@ -2633,16 +2735,33 @@ async function attemptGhAuthRefresh(
     return false;
   }
 
-  console.log("[start] Non-interactive refresh failed; attempting interactive `gh auth refresh`...");
-  const refreshExitCode = await runInherited(["gh", "auth", "refresh", "-h", "github.com"], repoRoot);
-  if (refreshExitCode !== 0) {
-    console.warn("[start] `gh auth refresh` did not succeed.");
+  const deviceFlowUrl = "https://github.com/login/device";
+  if (!openedDeviceFlowUrl && openUrlInBrowser(deviceFlowUrl)) {
+    console.log(`[start] Opened browser for GitHub device flow: ${deviceFlowUrl}`);
+  } else if (!openedDeviceFlowUrl) {
+    console.warn(`[start] Could not auto-open browser. Open this URL manually: ${deviceFlowUrl}`);
+  } else {
+    console.log("[start] Browser was already opened for GitHub device flow.");
+  }
+  console.log(
+    "[start] Non-interactive refresh failed; opening browser auth flow via `gh auth login --web`...",
+  );
+  const loginExitCode = await runInherited(
+    ["gh", "auth", "login", "--hostname", "github.com", "--web"],
+    repoRoot,
+  );
+  if (loginExitCode !== 0) {
+    console.warn("[start] Interactive GitHub auth login did not succeed.");
     return false;
   }
   return ghAuthStatusOk();
 }
 
 async function ensureGitHubAuth(force = false): Promise<void> {
+  if (ghAuthPreflightSatisfied) {
+    return;
+  }
+
   const skipCheck = envTruthy("PUSHPALS_SKIP_GH_AUTH_CHECK");
   const sourceControlManagerPushDisabled = envTruthy("SOURCE_CONTROL_MANAGER_NO_PUSH");
   if (!force && (skipCheck || sourceControlManagerPushDisabled)) {
@@ -2652,21 +2771,40 @@ async function ensureGitHubAuth(force = false): Promise<void> {
   const gitToken = CONFIG.gitToken;
   if (gitToken) {
     process.env.PUSHPALS_GIT_TOKEN = gitToken;
+    ghAuthPreflightSatisfied = true;
     return;
   }
 
   const ghAvailable = (await runQuiet(["gh", "--version"])) === 0;
   if (ghAvailable) {
-    if (ghRefreshOnStartEnabled()) {
-      await attemptGhAuthRefresh(
+    if (ghRefreshOnStartEnabled() && !ghRefreshOnStartAttempted) {
+      ghRefreshOnStartAttempted = true;
+      const allowInteractiveRefresh = process.stdin.isTTY && process.stdout.isTTY;
+      const refreshed = await attemptGhAuthRefresh(
         "GitHub CLI auth refresh-on-start is enabled (PUSHPALS_GH_AUTH_REFRESH_ON_START=1).",
+        { allowInteractive: allowInteractiveRefresh },
       );
+      if (!refreshed) {
+        if (allowInteractiveRefresh) {
+          console.error(
+            "[start] GitHub auth refresh-on-start did not complete. Finish browser authentication and rerun.",
+          );
+          abortStart(1);
+        } else {
+          console.warn(
+            "[start] GitHub auth refresh-on-start could not run interactively in this shell; continuing with existing auth checks.",
+          );
+        }
+      }
     }
 
     let ghAuthed = await ghAuthStatusOk();
     if (!ghAuthed) {
       console.log("[start] GitHub CLI is not authenticated. Starting `gh auth login`...");
-      const loginExitCode = await runInherited(["gh", "auth", "login"], repoRoot);
+      const loginExitCode = await runInherited(
+        ["gh", "auth", "login", "--hostname", "github.com", "--web"],
+        repoRoot,
+      );
       if (loginExitCode !== 0) {
         console.error("[start] `gh auth login` failed.");
         abortStart(loginExitCode);
@@ -2688,7 +2826,10 @@ async function ensureGitHubAuth(force = false): Promise<void> {
     }
     if (!apiAccessOk) {
       console.log("[start] GitHub CLI token could not access GitHub API. Starting `gh auth login`...");
-      const loginExitCode = await runInherited(["gh", "auth", "login"], repoRoot);
+      const loginExitCode = await runInherited(
+        ["gh", "auth", "login", "--hostname", "github.com", "--web"],
+        repoRoot,
+      );
       if (loginExitCode !== 0) {
         console.error("[start] `gh auth login` failed.");
         abortStart(loginExitCode);
@@ -2708,6 +2849,7 @@ async function ensureGitHubAuth(force = false): Promise<void> {
         "[start] GitHub CLI auth is valid, but `gh auth token` export failed. Services will fall back to direct gh auth when needed.",
       );
     }
+    ghAuthPreflightSatisfied = true;
     return;
   }
 
