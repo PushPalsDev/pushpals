@@ -2592,14 +2592,31 @@ async function attemptGhAuthRefresh(
     const proc = Bun.spawn(["gh", "auth", "refresh", "-h", "github.com"], {
       cwd: repoRoot,
       stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
+      stdout: "ignore",
+      stderr: "ignore",
       env: {
         ...process.env,
         GH_PROMPT_DISABLED: "1",
       },
     });
+    const timeoutMs = 12_000;
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill();
+      } catch {
+        // ignore
+      }
+    }, timeoutMs);
     const exitCode = await proc.exited;
+    clearTimeout(timeout);
+    if (timedOut) {
+      console.warn(
+        `[start] Non-interactive \`gh auth refresh\` timed out after ${timeoutMs}ms; continuing startup.`,
+      );
+      return false;
+    }
     if (exitCode === 0) {
       return ghAuthStatusOk();
     }
