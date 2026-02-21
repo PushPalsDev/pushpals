@@ -8,18 +8,9 @@ import {
   mergePullRequest,
   type GitHubPR,
 } from "./github_pr";
+import type { ReviewAgentConfig as SourceControlManagerReviewAgentConfig } from "./config";
 
-export interface ReviewAgentConfig {
-  enabled: boolean;
-  pollIntervalMs: number;
-  reviewerMdPath: string;
-  passThreshold: number;
-  mergeMethod: "squash" | "merge" | "rebase";
-  codexBin: string;
-  codexAuthMode: string;
-  codexHomeDir: string;
-  codexTimeoutMs: number;
-}
+export type ReviewAgentConfig = SourceControlManagerReviewAgentConfig;
 
 interface ReviewVerdict {
   score: number;
@@ -227,7 +218,10 @@ async function invokeCodexReview(prompt: string, config: ReviewAgentConfig): Pro
   }
 }
 
-export function parseReviewVerdict(raw: string): ReviewVerdict | null {
+export function parseReviewVerdict(
+  raw: string,
+  options?: { fallbackApprovedThreshold?: number },
+): ReviewVerdict | null {
   const stripped = raw
     .replace(/^```(?:json)?\s*/m, "")
     .replace(/\s*```\s*$/m, "")
@@ -245,7 +239,10 @@ export function parseReviewVerdict(raw: string): ReviewVerdict | null {
     const score = typeof obj.score === "number" ? obj.score : Number.parseFloat(String(obj.score));
     if (!Number.isFinite(score)) return null;
 
-    const approved = typeof obj.approved === "boolean" ? obj.approved : score >= 9.5;
+    const fallbackThreshold = Number.isFinite(options?.fallbackApprovedThreshold)
+      ? Math.max(1, Math.min(10, Number(options?.fallbackApprovedThreshold)))
+      : 9.5;
+    const approved = typeof obj.approved === "boolean" ? obj.approved : score >= fallbackThreshold;
     const summary = typeof obj.summary === "string" ? obj.summary : "";
     const issues = Array.isArray(obj.issues)
       ? (obj.issues as unknown[]).filter((entry) => typeof entry === "string").map(String)
@@ -566,7 +563,9 @@ export class ReviewAgent {
       return;
     }
 
-    const verdict = parseReviewVerdict(raw);
+    const verdict = parseReviewVerdict(raw, {
+      fallbackApprovedThreshold: this.config.passThreshold,
+    });
     if (!verdict) {
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] Could not parse Codex verdict for PR #${pr.number}. Raw output:\n${raw.slice(0, 500)}`,

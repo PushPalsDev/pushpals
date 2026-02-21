@@ -76,6 +76,7 @@ batch_tail_messages = 3
 repo_path = ".worktrees/source_control_manager"
 pushpals_branch = "main_agents"
 base_branch = "main"
+checks = []
 
 [source_control_manager.review_agent]
 enabled = true

@@ -33,6 +33,12 @@ export interface PushPalsLmStudioConfig {
   batchMemoryChars: number;
 }
 
+export interface PushPalsCheckConfig {
+  name: string;
+  command: string;
+  timeoutMs: number;
+}
+
 export interface PushPalsConfig {
   projectRoot: string;
   configDir: string;
@@ -152,6 +158,7 @@ export interface PushPalsConfig {
     baseBranch: string;
     branchPrefix: string;
     pollIntervalSeconds: number;
+    checks: PushPalsCheckConfig[];
     stateDir: string;
     port: number;
     deleteAfterMerge: boolean;
@@ -299,6 +306,20 @@ function asIntOrNull(value: unknown): number | null {
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
+}
+
+function asCheckArray(value: unknown): PushPalsCheckConfig[] {
+  if (!Array.isArray(value)) return [];
+  const checks: PushPalsCheckConfig[] = [];
+  for (const entry of value) {
+    if (!isObject(entry)) continue;
+    const name = asString(entry.name, "").trim();
+    const command = asString(entry.command, "").trim();
+    if (!name || !command) continue;
+    const timeoutMs = Math.max(1_000, asInt(entry.timeout_ms ?? entry.timeoutMs, 300_000));
+    checks.push({ name, command, timeoutMs });
+  }
+  return checks;
 }
 
 function asStringNumberRecord(value: unknown): Record<string, number> {
@@ -872,6 +893,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       10,
     ),
   );
+  const scmChecks = asCheckArray(scmNode.checks);
   const scmStateDir = resolvePathFromRoot(
     projectRoot,
     firstNonEmpty(
@@ -1425,6 +1447,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       baseBranch: scmBaseBranch,
       branchPrefix: scmBranchPrefix,
       pollIntervalSeconds: scmPollIntervalSeconds,
+      checks: scmChecks,
       stateDir: scmStateDir,
       port: scmPort,
       deleteAfterMerge: scmDeleteAfterMerge,

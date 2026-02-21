@@ -1357,8 +1357,24 @@ export function isTestLikeValidationStep(step: string): boolean {
       case "bun":
       case "npm":
       case "pnpm":
-      case "yarn":
-        return hasToken("test");
+      case "yarn": {
+        // "bun test", "npm test", "yarn test"
+        if (hasToken("test")) return true;
+        const sub = argv[1]?.toLowerCase() ?? "";
+        // "bun run test:root", "npm run test:unit", "pnpm run test:integration"
+        if (sub === "run" && argv[2]?.toLowerCase().startsWith("test")) return true;
+        // "yarn test:integration" — second token itself starts with "test"
+        if (sub.startsWith("test")) return true;
+        // "bun ./tests/file.ts" or "bun ./path/to/foo.test.ts" — direct execution
+        if (tool === "bun") {
+          return argv
+            .slice(1)
+            .some((arg) =>
+              /(?:^|[/\\])tests?[/\\]|\.test\.[a-z]+$|\.spec\.[a-z]+$/i.test(arg),
+            );
+        }
+        return false;
+      }
       case "pytest":
       case "vitest":
       case "jest":
@@ -1551,15 +1567,26 @@ export function buildCommitMessageGeneratorUserMessage(
       .filter(isTestLikeValidationStep)
       .map((step) => `- ${step}`)
       .join("\n") || "- (none)";
+  // Diff comes first so the model anchors on actual code changes, not the instruction.
   return [
-    `Background context (do not copy into subject line): ${instruction.slice(0, 400)}`,
+    "Staged diff (derive subject line and all bullets from this):",
+    diff.slice(0, COMMIT_MSG_MAX_DIFF_CHARS),
     "",
-    "Validation steps:",
+    "Validation steps (for Tests section only):",
     testLines,
     "",
-    "Staged diff (derive subject and bullets from this):",
-    diff.slice(0, COMMIT_MSG_MAX_DIFF_CHARS),
+    `Background context (do not restate in subject or bullets): ${instruction.slice(0, 400)}`,
   ].join("\n");
+}
+
+/**
+ * Returns true for bullet text that reads like planning/acceptance criteria
+ * rather than a concrete description of what the diff changed.
+ */
+function isPlanningLanguageBullet(bullet: string): boolean {
+  return /^at least\b|^all existing\b|^no unrelated\b|\bshould be\b|\bmust be\b|\bwill (pass|work|run|be)\b|\bare (added|modified|changed|updated|created)\b/i.test(
+    bullet,
+  );
 }
 
 export function sanitizeGeneratedCommitMessage(
@@ -1571,6 +1598,16 @@ export function sanitizeGeneratedCommitMessage(
   const clean = content.replace(/^```[^\n]*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
   // Sanity check: must open with the expected conventional commit prefix.
   if (!clean.startsWith(`${type}(${area})`)) return null;
+  // Reject if the majority of bullet points look like planning/acceptance criteria
+  // rather than concrete code-change descriptions derived from the diff.
+  const lines = clean.split("\n");
+  const testsSectionIndex = lines.findIndex((line) => /^Tests:\s*$/i.test(line.trim()));
+  const implementationLines = testsSectionIndex >= 0 ? lines.slice(0, testsSectionIndex) : lines;
+  const bullets = implementationLines
+    .filter((line) => /^\s*-\s+\S/.test(line) && !/^Tests:/i.test(line.trim()))
+    .map((line) => line.replace(/^\s*-\s+/, "").trim());
+  const planningCount = bullets.filter(isPlanningLanguageBullet).length;
+  if (bullets.length > 0 && planningCount / bullets.length >= 0.67) return null;
   return clean;
 }
 

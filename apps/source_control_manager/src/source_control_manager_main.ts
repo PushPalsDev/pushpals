@@ -1,6 +1,6 @@
 import { parseArgs } from "util";
 import { isAbsolute, join, relative, resolve } from "path";
-import { mkdirSync, existsSync } from "fs";
+import { mkdirSync } from "fs";
 import { CommunicationManager } from "../../../packages/shared/src/communication.js";
 import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 import { MergeQueueDB } from "./db";
@@ -59,7 +59,6 @@ Usage:
   bun run apps/source_control_manager/src/source_control_manager_main.ts [options]
 
 Options:
-  -c, --config <path>       Config file path (default: source_control_manager.config.json)
   -r, --repo <path>         Git repository path (default: config/default.toml source_control_manager.repo_path)
   -s, --server <url>        PushPals server URL (default: http://localhost:3001)
   -p, --port <number>       HTTP status server port (default: 3002)
@@ -77,25 +76,13 @@ Options:
 }
 
 // ─── Config ─────────────────────────────────────────────────────────────────
-
-const configPath =
-  args.config && typeof args.config === "string" ? resolve(args.config) : undefined;
-
-// Search for config: explicit path > cwd > app-local default
-function resolveConfigPath(): string | undefined {
-  if (configPath) return configPath;
-  const candidates = [
-    resolve("source_control_manager.config.json"),
-    resolve("apps/source_control_manager/source_control_manager.config.json"),
-  ];
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
-  }
-  return undefined;
+if (typeof args.config === "string" && args.config.trim()) {
+  console.warn(
+    `[${new Date().toISOString()}] Ignoring --config override; SourceControlManager now uses shared PushPals config only.`,
+  );
 }
 
-const resolvedConfig = resolveConfigPath();
-let config = loadConfig(resolvedConfig);
+let config = loadConfig();
 
 const cliOverrides: Partial<SourceControlManagerConfig> = {};
 if (typeof args.repo === "string") cliOverrides.repoPath = resolve(args.repo);
@@ -148,7 +135,7 @@ const statusHeartbeatMs = Math.max(0, config.statusHeartbeatMs);
 const ts = () => new Date().toISOString();
 
 console.log(`[${ts()}] source_control_manager starting`);
-console.log(`[${ts()}]   config:   ${resolvedConfig ?? "(defaults)"}`);
+console.log(`[${ts()}]   config:   shared (packages/shared/src/config.ts)`);
 console.log(`[${ts()}]   repo:     ${config.repoPath}`);
 console.log(`[${ts()}]   remote:   ${config.remote}`);
 console.log(`[${ts()}]   main:     ${config.mainBranch}`);

@@ -1,46 +1,31 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "fs";
-import { join } from "path";
-import { tmpdir } from "os";
-import { loadConfig, validateConfig } from "../apps/source_control_manager/src/config";
-
-const tempPaths: string[] = [];
-
-afterEach(() => {
-  while (tempPaths.length > 0) {
-    const path = tempPaths.pop();
-    if (!path) continue;
-    try {
-      rmSync(path, { force: true, recursive: true });
-    } catch {
-      // ignore cleanup errors in tests
-    }
-  }
-});
-
-function makeTempConfigFile(contents: Record<string, unknown>): string {
-  const dir = join(tmpdir(), `pushpals-scm-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, "source_control_manager.config.json");
-  writeFileSync(path, JSON.stringify(contents), "utf-8");
-  tempPaths.push(dir);
-  return path;
-}
+import { describe, expect, test } from "bun:test";
+import { applyCliOverrides, loadConfig, validateConfig } from "../apps/source_control_manager/src/config";
 
 describe("source_control_manager config", () => {
-  test("loadConfig deep-merges reviewAgent with defaults", () => {
-    const path = makeTempConfigFile({
-      reviewAgent: {
-        enabled: true,
-      },
-    });
+  test("loadConfig reads defaults from shared PushPals config", () => {
+    const config = loadConfig();
 
-    const config = loadConfig(path);
-
-    expect(config.reviewAgent.enabled).toBe(true);
+    expect(config.repoPath.length).toBeGreaterThan(0);
+    expect(config.remote.length).toBeGreaterThan(0);
+    expect(config.mainBranch.length).toBeGreaterThan(0);
     expect(config.reviewAgent.pollIntervalMs).toBeGreaterThanOrEqual(5_000);
     expect(config.reviewAgent.passThreshold).toBeGreaterThanOrEqual(1);
     expect(config.reviewAgent.codexBin.length).toBeGreaterThan(0);
+  });
+
+  test("applyCliOverrides applies explicit runtime overrides", () => {
+    const config = loadConfig();
+    const merged = applyCliOverrides(config, { port: 3999, pollIntervalSeconds: 42 });
+    expect(merged.port).toBe(3999);
+    expect(merged.pollIntervalSeconds).toBe(42);
+  });
+
+  test("loadConfig returns independent checks arrays", () => {
+    const first = loadConfig();
+    first.checks.push({ name: "temp", command: "echo temp", timeoutMs: 1000 });
+
+    const second = loadConfig();
+    expect(second.checks.some((check) => check.name === "temp")).toBe(false);
   });
 
   test("validateConfig rejects invalid reviewAgent values", () => {

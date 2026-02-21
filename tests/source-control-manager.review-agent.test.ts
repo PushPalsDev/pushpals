@@ -4,6 +4,7 @@ import {
   ReviewAgent,
   buildCodexExecArgs,
   deriveFixWriteGlobsFromDiff,
+  parseReviewVerdict,
   resolveCodexCmd,
   resolveReviewerMdPath,
   type ReviewAgentConfig,
@@ -254,5 +255,31 @@ describe("ReviewAgent", () => {
     await Promise.all([agent.poll(), agent.poll()]);
 
     expect(listCalls).toBe(1);
+  });
+
+  test("parseReviewVerdict uses configured fallback threshold when approved is missing", () => {
+    const raw = JSON.stringify({
+      score: 8.7,
+      summary: "Looks good enough",
+      issues: [],
+      fix_instruction: "",
+    });
+
+    const withHighThreshold = parseReviewVerdict(raw, { fallbackApprovedThreshold: 9.5 });
+    const withLowerThreshold = parseReviewVerdict(raw, { fallbackApprovedThreshold: 8.5 });
+    const withExplicitFalse = parseReviewVerdict(
+      JSON.stringify({
+        score: 9.8,
+        approved: false,
+        summary: "Not approved",
+        issues: ["needs work"],
+        fix_instruction: "",
+      }),
+      { fallbackApprovedThreshold: 8.5 },
+    );
+
+    expect(withHighThreshold?.approved).toBe(false);
+    expect(withLowerThreshold?.approved).toBe(true);
+    expect(withExplicitFalse?.approved).toBe(false);
   });
 });

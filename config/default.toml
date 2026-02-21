@@ -165,6 +165,7 @@ pushpals_branch = "main_agents"
 base_branch = "main"
 branch_prefix = "agent/"
 poll_interval_seconds = 10
+checks = []
 state_dir = "outputs/data/source_control_manager"
 port = 3002
 delete_after_merge = false
