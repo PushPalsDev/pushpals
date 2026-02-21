@@ -4,111 +4,138 @@
 
 RemoteBuddy is the planning and orchestration brain.
 
-It is responsible for:
+It owns:
 
 - claiming queued requests,
 - generating structured plans,
 - deciding lane (`deterministic` vs `worker`),
-- emitting user-facing assistant updates,
-- enqueuing executable jobs for WorkerPals,
-- optionally running autonomous objective cycles.
+- emitting assistant/task/job status events,
+- enqueueing executable jobs for WorkerPals,
+- maintaining durable planning memory for the repository.
+
+It does not own:
+
+- code execution (WorkerPals),
+- git integration/PR merge policy (SourceControlManager),
+- queue persistence (Server).
 
 ## Key Files
 
-- `apps/remotebuddy/src/remotebuddy_main.ts` - orchestrator loop and request lifecycle.
-- `apps/remotebuddy/src/brain.ts` - strict planner and fallback repair logic.
-- `apps/remotebuddy/src/path_targeting.ts` - path hint extraction and normalization.
+- `apps/remotebuddy/src/remotebuddy_main.ts` - orchestrator loop, planning, dispatch, and memory usage.
+- `apps/remotebuddy/src/brain.ts` - planner contract + repair/fallback behavior.
+- `apps/remotebuddy/src/memory.ts` - memory backend interface, noop/in-memory/composite backends.
+- `apps/remotebuddy/src/persistent_memory.ts` - SQLite-backed persistent memory backend.
 - `apps/remotebuddy/src/idempotency.ts` - replay-safe duplicate suppression.
-- `apps/remotebuddy/src/autonomous_engine.ts` - autonomy ideation/scoring/planning dispatch loop.
-- `apps/remotebuddy/src/llm.ts` - provider abstraction (LM Studio, OpenAI, Ollama, Codex CLI).
+- `apps/remotebuddy/src/autonomous_engine.ts` - bounded autonomous objective dispatch.
 
-## Planner Contract
+## New Memory Layer
 
-The planner targets strict structured output:
+RemoteBuddy now has a modular memory backend layer instead of hardwiring a single store.
 
-- intent,
-- worker requirement,
-- lane selection,
-- read/write scope,
-- discovery hints,
-- acceptance criteria,
-- validation steps,
-- risk level,
-- user/assistant/worker messages.
+`memory.ts` defines a pluggable interface:
 
-RemoteBuddy includes repair and fallback behavior for malformed model output, then applies safety sanitization.
+- `remember(input, options)`
+- `recallForPlanning(options)`
+- `purgeExpired(retentionDays, repoRoot?)`
+- `close()`
 
-## Request Lifecycle In RemoteBuddy
+`createSessionMemoryBackend(enabled, factories)` builds one of:
 
-For each claimed request, RemoteBuddy typically:
+- `NoopSessionMemory` when disabled,
+- a single backend instance,
+- `CompositeSessionMemory` when multiple backends are provided.
 
-1. Reads request metadata and routing hints.
-2. Generates structured plan output.
-3. Normalizes/sanitizes plan (intent, lane, scope, messages).
-4. Emits user-facing assistant status/messages.
-5. Enqueues worker job when `requires_worker=true`.
-6. Marks request complete/fail with traceable metadata.
+This allows adding a new memory system by appending another factory in one place (`remotebuddy_main.ts`) without changing orchestrator call sites.
 
-## Scope and Path Safety
+## Persistent Memory Backend (SQLite)
 
-`path_targeting.ts` and shared policy utils normalize:
+`PersistentSessionMemory` stores rows in `remotebuddy_memory` with:
 
-- repo-relative path hints,
-- write globs,
-- explicit target paths from user prompts.
+- `repoRoot`
+- `sessionId`
+- `requestId`
+- `kind`
+- `summary`
+- `createdAt`
 
-RemoteBuddy also patches planner output when needed so write globs cover target paths.
+It uses:
 
-## Autonomy Engine
+- WAL mode,
+- bounded summary truncation (`max_summary_chars`),
+- bounded recall (`max_recall_items`, `max_recall_chars`),
+- TTL-based pruning (`retention_days`), both at startup and during writes.
 
-Autonomy is implemented as a bounded control loop:
+RemoteBuddy currently initializes memory as `composite(sqlite)` when enabled.
 
-1. Preflight repository health checks.
-2. Acquire dispatch lock.
-3. Build snapshot from Server autonomy store.
-4. Run ideation phase (candidate generation).
-5. Run scoring phase.
-6. Run planning phase for selected candidates.
-7. Enqueue synthetic background requests with scoped metadata.
-8. Persist telemetry, release lock, and wait for next tick.
+## What Gets Remembered
 
-Policy/budget/cooldown constraints are first-class.
+RemoteBuddy persists high-signal orchestration facts, including:
 
-## Autonomy Safety Gates
+- incoming request summary (`kind=request`),
+- planner decision summary (`kind=plan`),
+- job enqueue success/failure (`kind=job_enqueued`, `kind=job_enqueue_failed`),
+- observed worker outcomes (`kind=job_completed`, `kind=job_failed`),
+- planning failures (`kind=planning_failed`).
 
-Autonomy dispatch is blocked when any of the following fail:
+This history is scoped by repo root and session.
 
-- lock acquisition/renewal,
-- snapshot freshness and repo preflight checks,
-- policy checks (risk/breadth/objective constraints),
-- confidence and dispatch budget constraints,
-- scope invariants for target paths and write globs.
+## How Memory Is Used In Planning
+
+At plan time, RemoteBuddy builds context from:
+
+1. persistent recall (`recallForPlanning`)
+2. current in-process recent context ring buffer
+
+It then de-duplicates and passes the merged list to the planner.
+
+When `include_cross_session=true`, recall includes repo history from prior sessions; otherwise it can remain session-local.
+
+## Request Lifecycle (Current)
+
+For each claimed request:
+
+1. Parse routing/force metadata.
+2. Build planning context (persistent + live).
+3. Call planner and sanitize plan.
+4. Patch scope/write globs when needed.
+5. Emit task/job progress events.
+6. Enqueue `task.execute` or return direct response.
+7. Persist request/plan/outcome memory entries.
+
+## Config Knobs
+
+Primary knobs live in `config/*.toml` under `[remotebuddy.memory]`:
+
+- `enabled`
+- `include_cross_session`
+- `max_recall_items`
+- `max_recall_chars`
+- `max_summary_chars`
+- `retention_days`
+
+Env overrides are also supported via `REMOTEBUDDY_MEMORY_*` variables in `packages/shared/src/config.ts`.
+
+## Debugging Checklist
+
+- "Memory appears unused":
+  - confirm `remotebuddy.memory.enabled=true`.
+  - check startup log line for `Persistent memory backend: composite(sqlite)`.
+- "No cross-session recall":
+  - confirm `include_cross_session=true`.
+  - inspect `retention_days` and whether old entries were purged.
+- "Planner quality regressed":
+  - inspect `Recent PR/job/request memory` lines injected into planning context.
 
 ## Tradeoffs
 
 Pros:
 
-- clear separation of planning from execution,
-- strong structure around LLM outputs,
-- autonomy built with policy and budget gates, not open-ended loops.
+- durable repo-level context across sessions,
+- backend modularity for future memory systems,
+- bounded recall/summary size protects prompt budgets.
 
 Cons:
 
-- planning object is rich and can be intimidating to modify,
-- orchestration code path is long,
-- autonomous mode introduces additional state/locking complexity.
-
-## Debugging Checklist
-
-- "Request never dispatched to worker":
-  - inspect `requires_worker`, lane, and scope normalization output.
-- "Autonomy loop runs but dispatches nothing":
-  - inspect cooldown, confidence threshold, and per-hour dispatch budget.
-- "Planner appears flaky":
-  - inspect schema repair/fallback behavior and provider output shape.
-
-## Future Improvements
-
-- Introduce planner quality scoring in CI using golden scenario suites.
-- Add explicit planner model fallback chain (provider-level failover).
-- Add objective outcome attribution reports (which signals improve completion success).
+- more state to reason about,
+- risk of stale memory bias if retention is too long,
+- extra storage/maintenance path (SQLite + pruning).

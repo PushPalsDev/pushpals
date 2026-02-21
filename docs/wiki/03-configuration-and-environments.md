@@ -64,14 +64,41 @@ When moving a setting between env and TOML:
   - host/port, stale-claim recovery windows.
 - RemoteBuddy:
   - poll intervals, worker spawn policy, execution/finalization budgets.
+- RemoteBuddy memory:
+  - `remotebuddy.memory.enabled`
+  - `remotebuddy.memory.include_cross_session`
+  - `remotebuddy.memory.max_recall_items`
+  - `remotebuddy.memory.max_recall_chars`
+  - `remotebuddy.memory.max_summary_chars`
+  - `remotebuddy.memory.retention_days`
 - RemoteBuddy autonomy:
   - tick interval, candidate limits, confidence gates, dispatch quotas, cooldown windows.
 - WorkerPals:
   - backend selection, runtime timeouts, Docker warm/jitter policy.
 - SourceControlManager:
   - integration branch/base branch, merge strategy, PR behavior.
+- SourceControlManager ReviewAgent:
+  - `source_control_manager.review_agent.enabled`
+  - `source_control_manager.review_agent.poll_interval_ms`
+  - `source_control_manager.review_agent.pass_threshold`
+  - `source_control_manager.review_agent.merge_method`
+  - `source_control_manager.review_agent.reviewer_md_path`
+  - `source_control_manager.review_agent.codex_*`
 - Startup:
   - preflight behavior, image rebuild policy, LLM startup behavior.
+
+## Memory/Review Env Overrides
+
+Examples of high-impact env overrides supported by the shared config loader:
+
+- `REMOTEBUDDY_MEMORY_ENABLED`
+- `REMOTEBUDDY_MEMORY_INCLUDE_CROSS_SESSION`
+- `REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS`
+- `REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS`
+- `REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS`
+- `REMOTEBUDDY_MEMORY_RETENTION_DAYS`
+- `SOURCE_CONTROL_MANAGER_REVIEW_AGENT_PASS_THRESHOLD`
+- `SOURCE_CONTROL_MANAGER_REVIEW_AGENT_POLL_INTERVAL_MS`
 
 ## Secrets Guidance
 

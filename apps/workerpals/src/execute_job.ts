@@ -183,6 +183,47 @@ function normalizeChatCompletionsEndpoint(endpoint: string): string {
   return `${source}/v1/chat/completions`;
 }
 
+function splitArgs(raw: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const ch of raw.trim()) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        out.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += "\\";
+  if (current.length > 0) out.push(current);
+  return out;
+}
+
 function parseJsonObjectLoose(text: string): Record<string, unknown> | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
@@ -1187,6 +1228,7 @@ export async function createJobCommit(
         area: inferCommitArea(job.kind, job.params, changedPaths),
         validationSteps: jobValidationSteps,
       },
+      repo,
       runtimeConfig,
     ).catch(() => null);
     if (!llmCommitMsg) {
@@ -1207,7 +1249,7 @@ export async function createJobCommit(
     if (!result.ok) {
       return { ok: false, error: `Failed to get commit SHA: ${result.stderr}` };
     }
-    const sha = result.stdout;
+    let sha = result.stdout;
 
     // Persist commit under an internal ref so it remains reachable after worktree cleanup.
     result = await git(repo, ["update-ref", hiddenCommitRef, sha]);
@@ -1218,13 +1260,44 @@ export async function createJobCommit(
 
     // Push branch to origin (optional; disabled by default for shared-.git workflows)
     if (pushAgentBranch) {
-      result = await git(repo, [
-        "push",
-        "origin",
-        `${hiddenCommitRef}:refs/heads/${publicBranchName}`,
-      ]);
-      if (!result.ok) {
-        const pushError = `Failed to push branch: ${redactSensitiveText(result.stderr || result.stdout)}`;
+      const maxPushAttempts = 3;
+      let pushed = false;
+      let pushError = "";
+      for (let attempt = 1; attempt <= maxPushAttempts; attempt++) {
+        const sync = await syncHiddenRefWithRemoteBranchByRebase(
+          repo,
+          hiddenCommitRef,
+          publicBranchName,
+          job.id,
+        );
+        if (!sync.ok) {
+          pushError = `Failed to sync branch before push: ${redactSensitiveText(sync.error)}`;
+          break;
+        }
+        sha = sync.sha;
+
+        result = await git(repo, [
+          "push",
+          "origin",
+          `${hiddenCommitRef}:refs/heads/${publicBranchName}`,
+        ]);
+        if (result.ok) {
+          completionRef = publicBranchName;
+          pushed = true;
+          break;
+        }
+
+        pushError = `Failed to push branch: ${redactSensitiveText(result.stderr || result.stdout)}`;
+        if (attempt < maxPushAttempts && isNonFastForwardPushOutput(pushError)) {
+          console.warn(
+            `[WorkerPals] Push rejected as non-fast-forward for ${publicBranchName}; retrying after git pull --rebase (attempt ${attempt + 1}/${maxPushAttempts}).`,
+          );
+          continue;
+        }
+        break;
+      }
+
+      if (!pushed) {
         if (requirePush) {
           if (hiddenRefCreated) {
             await git(repo, ["update-ref", "-d", hiddenCommitRef]);
@@ -1236,7 +1309,6 @@ export async function createJobCommit(
         );
         return { ok: true, branch: completionRef, sha };
       }
-      completionRef = publicBranchName;
     } else {
       console.log(
         `[WorkerPals] Skipping push for ${publicBranchName} (WORKERPALS_PUSH_AGENT_BRANCH is disabled).`,
@@ -1702,15 +1774,209 @@ function summarizeJobAction(kind: string, params?: Record<string, unknown>): str
   }
 }
 
+function combinedGitOutput(result: { stdout: string; stderr: string }): string {
+  return [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+}
+
+export function isNonFastForwardPushOutput(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("non-fast-forward") ||
+    normalized.includes("fetch first") ||
+    normalized.includes("failed to push some refs") ||
+    normalized.includes("updates were rejected because") ||
+    normalized.includes("tip is behind its remote counterpart")
+  );
+}
+
+export function isRebaseConflictOutput(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("conflict") ||
+    normalized.includes("resolve all conflicts manually") ||
+    normalized.includes("could not apply") ||
+    normalized.includes("fix conflicts and then run")
+  );
+}
+
+async function currentRefSha(repo: string, ref: string): Promise<string | null> {
+  const result = await git(repo, ["rev-parse", ref]);
+  if (!result.ok) return null;
+  return result.stdout.trim() || null;
+}
+
+async function autoResolveRebaseConflicts(
+  repo: string,
+  maxPasses = 8,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    const unresolved = await git(repo, ["diff", "--name-only", "--diff-filter=U"]);
+    if (!unresolved.ok) {
+      return { ok: false, error: `Failed to inspect rebase conflicts: ${combinedGitOutput(unresolved)}` };
+    }
+    const unresolvedPaths = parseChangedPathsFromNameOnlyOutput(unresolved.stdout);
+    if (unresolvedPaths.length > 0) {
+      console.warn(
+        `[WorkerPals] Rebase conflict detected (${unresolvedPaths.length} file(s)); auto-resolving in favor of worker changes (pass ${pass}/${maxPasses}).`,
+      );
+      for (const path of unresolvedPaths) {
+        // In rebase conflicts, --theirs preserves the worker commit currently being replayed.
+        let checkout = await git(repo, ["checkout", "--theirs", "--", path]);
+        if (!checkout.ok) {
+          checkout = await git(repo, ["checkout", "--ours", "--", path]);
+          if (!checkout.ok) {
+            return {
+              ok: false,
+              error: `Failed to resolve rebase conflict for ${path}: ${combinedGitOutput(checkout)}`,
+            };
+          }
+        }
+        const add = await git(repo, ["add", "--", path]);
+        if (!add.ok) {
+          return {
+            ok: false,
+            error: `Failed to stage resolved rebase conflict for ${path}: ${combinedGitOutput(add)}`,
+          };
+        }
+      }
+    }
+
+    const rebaseContinue = await git(repo, ["rebase", "--continue"]);
+    if (rebaseContinue.ok) {
+      continue;
+    }
+    const continueOutput = combinedGitOutput(rebaseContinue);
+    if (/no rebase in progress/i.test(continueOutput)) {
+      return { ok: true };
+    }
+    if (/no changes - did you forget to use 'git add'|nothing to commit/i.test(continueOutput)) {
+      const rebaseSkip = await git(repo, ["rebase", "--skip"]);
+      if (rebaseSkip.ok) {
+        continue;
+      }
+      const skipOutput = combinedGitOutput(rebaseSkip);
+      if (isRebaseConflictOutput(skipOutput)) {
+        continue;
+      }
+      return { ok: false, error: `Failed to skip empty rebase commit: ${skipOutput}` };
+    }
+    if (isRebaseConflictOutput(continueOutput)) {
+      continue;
+    }
+    return { ok: false, error: `Failed to continue rebase: ${continueOutput}` };
+  }
+  return {
+    ok: false,
+    error: `Rebase conflict auto-resolution exceeded ${maxPasses} passes; manual intervention required.`,
+  };
+}
+
+async function syncHiddenRefWithRemoteBranchByRebase(
+  repo: string,
+  hiddenCommitRef: string,
+  publicBranchName: string,
+  jobId: string,
+): Promise<{ ok: true; sha: string } | { ok: false; error: string }> {
+  const remoteHead = await git(repo, ["ls-remote", "--heads", "origin", `refs/heads/${publicBranchName}`]);
+  if (!remoteHead.ok) {
+    return {
+      ok: false,
+      error: `Failed to inspect remote branch ${publicBranchName}: ${combinedGitOutput(remoteHead)}`,
+    };
+  }
+  const remoteExists = remoteHead.stdout.trim().length > 0;
+  if (!remoteExists) {
+    const sha = await currentRefSha(repo, hiddenCommitRef);
+    if (!sha) return { ok: false, error: `Failed to resolve commit SHA for ${hiddenCommitRef}.` };
+    return { ok: true, sha };
+  }
+
+  const tempBranch = `_pushpals/rebase-${jobId.slice(0, 8)}-${Date.now().toString(36)}`;
+  let branchCheckedOut = false;
+  try {
+    const checkout = await git(repo, ["checkout", "-B", tempBranch, hiddenCommitRef]);
+    if (!checkout.ok) {
+      return {
+        ok: false,
+        error: `Failed to prepare temporary rebase branch ${tempBranch}: ${combinedGitOutput(checkout)}`,
+      };
+    }
+    branchCheckedOut = true;
+
+    const pullRebase = await git(repo, ["pull", "--rebase", "origin", publicBranchName]);
+    if (!pullRebase.ok) {
+      const pullOutput = combinedGitOutput(pullRebase);
+      if (!isRebaseConflictOutput(pullOutput)) {
+        return { ok: false, error: `git pull --rebase failed for ${publicBranchName}: ${pullOutput}` };
+      }
+      const resolved = await autoResolveRebaseConflicts(repo);
+      if (!resolved.ok) {
+        await git(repo, ["rebase", "--abort"]);
+        return {
+          ok: false,
+          error: `Rebase conflict resolution failed for ${publicBranchName}: ${resolved.error}`,
+        };
+      }
+    }
+
+    const rebasedSha = await currentRefSha(repo, "HEAD");
+    if (!rebasedSha) {
+      return { ok: false, error: "Failed to resolve rebased commit SHA after pull --rebase." };
+    }
+    const updateHiddenRef = await git(repo, ["update-ref", hiddenCommitRef, rebasedSha]);
+    if (!updateHiddenRef.ok) {
+      return {
+        ok: false,
+        error: `Failed to update hidden commit ref after rebase: ${combinedGitOutput(updateHiddenRef)}`,
+      };
+    }
+    return { ok: true, sha: rebasedSha };
+  } finally {
+    if (branchCheckedOut) {
+      await git(repo, ["checkout", "--detach", hiddenCommitRef]);
+      await git(repo, ["branch", "-D", tempBranch]);
+    }
+  }
+}
+
+export function shouldUseCodexCliForExecutor(executor: string): boolean {
+  return executor.trim().toLowerCase() === "openai_codex";
+}
+
+function normalizeCodexReasoningEffort(value: unknown): "low" | "medium" | "high" {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+    return normalized;
+  }
+  return "high";
+}
+
 async function generateCommitMessageFromDiff(
   diff: string,
   opts: { instruction: string; type: string; area: string; validationSteps: string[] },
+  repo: string,
   runtimeConfig: WorkerpalsRuntimeConfig,
 ): Promise<string | null> {
-  const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
-  const model = runtimeConfig.workerpals.llm.model.trim();
-  if (!endpoint || !model || !diff.trim()) return null;
+  const prompt = buildCommitMessageGeneratorPrompt(diff, opts);
+  if (!prompt) return null;
+  if (shouldUseCodexCliForExecutor(resolveExecutor(runtimeConfig))) {
+    return generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtimeConfig);
+  }
+  return generateCommitMessageFromDiffViaHttp(prompt, opts, runtimeConfig);
+}
 
+type CommitMessagePrompt = {
+  systemPrompt: string;
+  userMessage: string;
+};
+
+function buildCommitMessageGeneratorPrompt(
+  diff: string,
+  opts: { instruction: string; type: string; area: string; validationSteps: string[] },
+): CommitMessagePrompt | null {
+  if (!diff.trim()) return null;
   let systemPrompt: string;
   try {
     systemPrompt = loadPromptTemplate("workerpals/commit_message_prompt.md", {
@@ -1721,12 +1987,104 @@ async function generateCommitMessageFromDiff(
   } catch {
     return null;
   }
-
   const userMessage = buildCommitMessageGeneratorUserMessage(
     opts.instruction,
     opts.validationSteps,
     diff,
   );
+  return { systemPrompt, userMessage };
+}
+
+async function generateCommitMessageFromDiffViaCodex(
+  prompt: CommitMessagePrompt,
+  opts: { type: string; area: string },
+  repo: string,
+  runtimeConfig: WorkerpalsRuntimeConfig,
+): Promise<string | null> {
+  const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
+  if (!codexPrefix) return null;
+  const model = runtimeConfig.workerpals.llm.model.trim();
+  const timeoutMs = (() => {
+    const value = Number(runtimeConfig.workerpals.llm.codexTimeoutMs);
+    if (!Number.isFinite(value)) return 120_000;
+    return Math.max(10_000, Math.min(600_000, Math.floor(value)));
+  })();
+  const reasoningEffort = normalizeCodexReasoningEffort(runtimeConfig.workerpals.llm.reasoningEffort);
+  const tmpOutputPath = resolve(
+    Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp",
+    `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`,
+  );
+  const cmd = [
+    ...codexPrefix,
+    "-c",
+    `model_reasoning_effort="${reasoningEffort}"`,
+    "-a",
+    "never",
+    "-s",
+    "read-only",
+    "exec",
+    "--color",
+    "never",
+    "--output-last-message",
+    tmpOutputPath,
+  ];
+  if (model) cmd.push("-m", model);
+  cmd.push("-");
+
+  try {
+    const stdinText = `${prompt.systemPrompt}\n\n${prompt.userMessage}`;
+    const proc = Bun.spawn(cmd, {
+      cwd: repo,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: new Blob([stdinText]),
+    });
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill();
+      } catch {
+        // ignore
+      }
+    }, timeoutMs);
+
+    const exitCode = await proc.exited;
+    clearTimeout(timer);
+    if (timedOut || exitCode !== 0) return null;
+
+    let content = "";
+    try {
+      content = readFileSync(tmpOutputPath, "utf8").trim();
+    } catch {
+      content = "";
+    }
+    if (!content) {
+      content = (await new Response(proc.stdout).text()).trim();
+    }
+    if (!content) return null;
+    const clean = sanitizeGeneratedCommitMessage(content, opts.type, opts.area);
+    return clean;
+  } catch {
+    return null;
+  } finally {
+    try {
+      unlinkSync(tmpOutputPath);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function generateCommitMessageFromDiffViaHttp(
+  prompt: CommitMessagePrompt,
+  opts: { type: string; area: string },
+  runtimeConfig: WorkerpalsRuntimeConfig,
+): Promise<string | null> {
+  const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
+  const model = runtimeConfig.workerpals.llm.model.trim();
+  if (!endpoint || !model) return null;
 
   const apiKey = runtimeConfig.workerpals.llm.apiKey.trim() || "local";
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -1741,8 +2099,8 @@ async function generateCommitMessageFromDiff(
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userMessage },
+          { role: "system", content: prompt.systemPrompt },
+          { role: "user", content: prompt.userMessage },
         ],
         temperature: 0,
         max_tokens: 500,
@@ -2205,17 +2563,52 @@ function validateTaskExecutePlanning(
 
 // ─── Codex-based critic (used when executor === "openai_codex") ───────────────
 
-async function resolveCodexCommandPrefix(repo: string): Promise<string[] | null> {
-  for (const [bin, extra] of [
-    ["bunx", ["--yes", "@openai/codex"]],
-    ["codex", []],
-  ] as [string, string[]][]) {
-    try {
-      const proc = Bun.spawn(["which", bin], { cwd: repo, stdout: "pipe", stderr: "pipe" });
-      const exitCode = await proc.exited;
-      if (exitCode === 0) return [bin, ...extra];
-    } catch {
-      // bin not available
+const cachedCodexCommandPrefix = new Map<string, string[]>();
+
+async function canExecuteCodexCommandCandidate(repo: string, candidate: string[]): Promise<boolean> {
+  if (candidate.length === 0) return false;
+  try {
+    const proc = Bun.spawn([...candidate, "--version"], {
+      cwd: repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill();
+      } catch {
+        // ignore
+      }
+    }, 15_000);
+    const exitCode = await proc.exited;
+    clearTimeout(timer);
+    return !timedOut && exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveCodexCommandPrefix(
+  repo: string,
+  configuredCommand = "",
+): Promise<string[] | null> {
+  const cacheKey = `${repo}\u0000${configuredCommand.trim()}`;
+  const cached = cachedCodexCommandPrefix.get(cacheKey);
+  if (cached) return [...cached];
+
+  const candidates: string[][] = [];
+  const configured = splitArgs(configuredCommand);
+  if (configured.length > 0) candidates.push(configured);
+  candidates.push(["bun", "x", "--yes", "@openai/codex"]);
+  candidates.push(["bunx", "--yes", "@openai/codex"]);
+  candidates.push(["codex"]);
+
+  for (const candidate of candidates) {
+    if (await canExecuteCodexCommandCandidate(repo, candidate)) {
+      cachedCodexCommandPrefix.set(cacheKey, [...candidate]);
+      return candidate;
     }
   }
   return null;
@@ -2228,9 +2621,12 @@ async function runCodexCriticReview(
   runtimeConfig: WorkerpalsRuntimeConfig,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<CriticReview | null> {
-  const codexPrefix = await resolveCodexCommandPrefix(repo);
+  const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
   if (!codexPrefix) {
-    onLog?.("stderr", "[QualityGate] Codex critic: bunx/codex not found in PATH; skipping.");
+    onLog?.(
+      "stderr",
+      "[QualityGate] Codex critic: unable to resolve Codex CLI command (workerpals.llm.codex_bin/PATH); skipping.",
+    );
     return null;
   }
 

@@ -29,6 +29,7 @@ max_summary_chars = 420
 retention_days = 30
 
 [workerpals.llm]
+backend = "openai_codex"
 model = "gpt-5-codex"
 codex_auth_mode = "chatgpt"
 codex_bin = "bun x --yes @openai/codex"

@@ -2,10 +2,13 @@ import { describe, expect, test } from "bun:test";
 import {
   buildWorkerCommitMessage,
   buildCommitMessageGeneratorUserMessage,
+  isNonFastForwardPushOutput,
+  isRebaseConflictOutput,
   isTestLikeValidationStep,
   parseChangedPathsFromNameOnlyOutput,
   redactSensitiveText,
   sanitizeGeneratedCommitMessage,
+  shouldUseCodexCliForExecutor,
 } from "../apps/workerpals/src/execute_job";
 
 describe("workerpals commit message generation helpers", () => {
@@ -165,5 +168,35 @@ describe("workerpals commit message generation helpers", () => {
     expect(redacted).toContain("Bearer ***");
     expect(redacted).not.toContain("gho_abcdefghijklmnopqrstuvwxyz123456");
     expect(redacted).not.toContain("sk-proj-secret-token");
+  });
+
+  test("detects non-fast-forward push rejection output", () => {
+    const text = [
+      "To https://github.com/PushPalsDev/pushpals.git",
+      " ! [rejected] refs/foo -> refs/heads/foo (non-fast-forward)",
+      "error: failed to push some refs",
+      "hint: Updates were rejected because a pushed branch tip is behind its remote counterpart.",
+    ].join("\n");
+    expect(isNonFastForwardPushOutput(text)).toBe(true);
+    expect(isNonFastForwardPushOutput("fatal: authentication failed")).toBe(false);
+  });
+
+  test("detects rebase conflict output", () => {
+    expect(
+      isRebaseConflictOutput(
+        "CONFLICT (content): Merge conflict in apps/localbuddy/src/request_status.ts",
+      ),
+    ).toBe(true);
+    expect(
+      isRebaseConflictOutput("error: could not apply 1234abcd... add tests for request status"),
+    ).toBe(true);
+    expect(isRebaseConflictOutput("fatal: could not read Username for 'https://github.com'"))
+      .toBe(false);
+  });
+
+  test("uses codex commit-message path when executor is openai_codex", () => {
+    expect(shouldUseCodexCliForExecutor("openai_codex")).toBe(true);
+    expect(shouldUseCodexCliForExecutor(" OPENAI_CODEX ")).toBe(true);
+    expect(shouldUseCodexCliForExecutor("openhands")).toBe(false);
   });
 });
