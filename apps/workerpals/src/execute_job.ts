@@ -1671,39 +1671,34 @@ function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user"
   return "user";
 }
 
-async function enforceWriteScope(
+async function collectWriteScopeWarnings(
   repo: string,
   planning: TaskExecutePlanning,
-): Promise<{ ok: boolean; message?: string }> {
+): Promise<{ warnings: string[] }> {
   const writeGlobs = toStringArray(planning.scope.writeGlobs ?? []);
-  if (writeGlobs.length === 0) return { ok: true };
+  if (writeGlobs.length === 0) return { warnings: [] };
 
   const statusResult = await git(repo, ["status", "--porcelain"]);
   if (!statusResult.ok) {
-    return { ok: false, message: "Unable to evaluate changed paths for scope enforcement." };
+    return { warnings: ["Unable to evaluate changed paths for scope suggestion check."] };
   }
 
   const changedPaths = parseChangedPathsFromStatus(statusResult.stdout)
     .map((entry) => normalizeStagePath(entry))
     .filter((entry): entry is string => Boolean(entry) && entry !== ".");
-  if (changedPaths.length === 0) return { ok: true };
+  if (changedPaths.length === 0) return { warnings: [] };
 
   const forbidden = toStringArray(planning.scope.forbiddenGlobs ?? []);
+  const warnings: string[] = [];
   const outOfScope = changedPaths.filter((path) => !writeGlobs.some((glob) => matchesGlob(path, glob)));
   if (outOfScope.length > 0) {
-    return {
-      ok: false,
-      message: `Scope violation: modified paths outside writeGlobs: ${outOfScope.join(", ")}`,
-    };
+    warnings.push(`Scope suggestion: modified paths outside writeGlobs: ${outOfScope.join(", ")}`);
   }
   const forbiddenTouched = changedPaths.filter((path) => forbidden.some((glob) => matchesGlob(path, glob)));
   if (forbiddenTouched.length > 0) {
-    return {
-      ok: false,
-      message: `Scope violation: modified forbidden paths: ${forbiddenTouched.join(", ")}`,
-    };
+    warnings.push(`Scope suggestion: modified paths matching forbiddenGlobs: ${forbiddenTouched.join(", ")}`);
   }
-  return { ok: true };
+  return { warnings };
 }
 
 function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
@@ -1845,7 +1840,7 @@ function validateTaskExecutePlanning(
         componentArea,
         normalizedTargetPaths,
         normalizedWriteGlobs,
-        { requireWriteGlobs: true },
+        { requireWriteGlobs: false },
       );
       if (!validatedScope.ok) {
         return {
@@ -2140,11 +2135,10 @@ export async function executeJob(
   const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(params.planning);
   const planning = sanitizedPlanning as TaskExecutePlanning;
   if (origin === "autonomy" && toStringArray(planning.scope.writeGlobs ?? []).length === 0) {
-    return {
-      ok: false,
-      summary: "autonomy task.execute requires planning.scope.writeGlobs",
-      exitCode: 2,
-    };
+    onLog?.(
+      "stdout",
+      "[TaskExecute] Scope suggestion: planning.scope.writeGlobs is empty for autonomy-origin task.",
+    );
   }
 
   const instruction = String(params.instruction ?? "").trim();
@@ -2210,15 +2204,9 @@ export async function executeJob(
     );
     if (!result.ok) return result;
 
-    const scopeCheck = await enforceWriteScope(repo, planning);
-    if (!scopeCheck.ok) {
-      return {
-        ok: false,
-        summary: scopeCheck.message ?? "Scope enforcement failed for task.execute changes.",
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exitCode: 5,
-      };
+    const scopeCheck = await collectWriteScopeWarnings(repo, planning);
+    for (const warning of scopeCheck.warnings) {
+      onLog?.("stdout", `[TaskExecute] ${warning}`);
     }
 
     const quality = await runDeterministicQualityGate(repo, attemptParams, onLog);

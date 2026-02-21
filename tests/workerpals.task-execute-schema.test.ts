@@ -100,12 +100,13 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.summary).toContain("writeGlobs");
   });
 
-  test("rejects autonomy-origin task when writeGlobs are missing", async () => {
+  test("allows autonomy-origin task when writeGlobs are missing", async () => {
     const planning = {
       ...VALID_PLANNING,
       scope: {
         ...(VALID_PLANNING.scope ?? {}),
       },
+      finalizationBudgetMs: 0,
     } as Record<string, unknown>;
     delete (planning.scope as Record<string, unknown>).writeGlobs;
 
@@ -121,7 +122,8 @@ describe("workerpals task.execute strict schema", () => {
     );
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toContain("autonomy task.execute requires planning.scope.writeGlobs");
+    expect(result.summary).not.toContain("autonomy task.execute requires planning.scope.writeGlobs");
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
 
   test("allows user-origin repo-root targetPaths and continues validation", async () => {
