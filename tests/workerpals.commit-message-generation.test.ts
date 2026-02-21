@@ -4,6 +4,7 @@ import {
   buildCommitMessageGeneratorUserMessage,
   isNonFastForwardPushOutput,
   isRebaseConflictOutput,
+  isRebaseEditorPromptOutput,
   isTestLikeValidationStep,
   parseChangedPathsFromNameOnlyOutput,
   redactSensitiveText,
@@ -192,6 +193,16 @@ describe("workerpals commit message generation helpers", () => {
     ).toBe(true);
     expect(isRebaseConflictOutput("fatal: could not read Username for 'https://github.com'"))
       .toBe(false);
+  });
+
+  test("detects rebase editor prompt output", () => {
+    const message = [
+      "error: Terminal is dumb, but EDITOR unset",
+      "Please supply the message using either -m or -F option.",
+      "error: could not commit staged changes.",
+    ].join("\n");
+    expect(isRebaseEditorPromptOutput(message)).toBe(true);
+    expect(isRebaseEditorPromptOutput("CONFLICT (content): Merge conflict in file.ts")).toBe(false);
   });
 
   test("uses codex commit-message path when executor is openai_codex", () => {

@@ -1799,6 +1799,15 @@ export function isRebaseConflictOutput(text: string): boolean {
   );
 }
 
+export function isRebaseEditorPromptOutput(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("terminal is dumb, but editor unset") ||
+    normalized.includes("please supply the message using either -m or -f option") ||
+    normalized.includes("waiting for your editor to close the file")
+  );
+}
+
 async function currentRefSha(repo: string, ref: string): Promise<string | null> {
   const result = await git(repo, ["rev-parse", ref]);
   if (!result.ok) return null;
@@ -1841,11 +1850,16 @@ async function autoResolveRebaseConflicts(
       }
     }
 
-    const rebaseContinue = await git(repo, ["rebase", "--continue"]);
+    let rebaseContinue = await git(repo, ["rebase", "--continue"]);
+    let continueOutput = combinedGitOutput(rebaseContinue);
+    if (!rebaseContinue.ok && isRebaseEditorPromptOutput(continueOutput)) {
+      // Ensure rebase continuation stays non-interactive in worker environments.
+      rebaseContinue = await git(repo, ["-c", "core.editor=true", "rebase", "--continue"]);
+      continueOutput = combinedGitOutput(rebaseContinue);
+    }
     if (rebaseContinue.ok) {
       continue;
     }
-    const continueOutput = combinedGitOutput(rebaseContinue);
     if (/no rebase in progress/i.test(continueOutput)) {
       return { ok: true };
     }
