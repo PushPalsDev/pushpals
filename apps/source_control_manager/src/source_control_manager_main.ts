@@ -9,6 +9,7 @@ import { GitOps } from "./git";
 import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
+import { resolveReviewAgentPrTitle } from "./pr_title";
 import { createStatusServer } from "./http";
 import {
   loadConfig,
@@ -499,9 +500,18 @@ async function tick(): Promise<void> {
             );
           }
         }
-        const prTitle =
-          completionPrTitle ||
-          `PushPals: ${prHeadBranch.replace(/^agent\//, "")} -> ${integrationBaseBranch}`;
+        const commitSubject = await resolveCommitSubject(completion.commitSha);
+        if (!commitSubject) {
+          console.warn(
+            `[${ts()}] ReviewAgent mode - could not resolve commit subject for ${completion.commitSha.slice(0, 8)}; falling back to completion/default PR title`,
+          );
+        }
+        const prTitle = resolveReviewAgentPrTitle({
+          commitSubject,
+          completionPrTitle,
+          prHeadBranch,
+          integrationBaseBranch,
+        });
 
         const completionPrBody = (completion.prBody ?? "").trim();
         const prBody = [
@@ -748,6 +758,15 @@ async function resolveGitHubToken(): Promise<string> {
   }
 
   return "";
+}
+
+async function resolveCommitSubject(commitSha: string): Promise<string> {
+  const showResult = await runGitCapture(
+    ["-C", config.repoPath, "show", "-s", "--format=%s", commitSha],
+    repoRoot,
+  );
+  if (!showResult.ok) return "";
+  return (showResult.stdout.split(/\r?\n/, 1)[0] ?? "").trim();
 }
 
 async function ensureMainPullRequest(completion: {

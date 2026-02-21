@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { resolve } from "path";
 import {
   ReviewAgent,
+  buildReviewPrompt,
   buildCodexExecArgs,
   deriveFixWriteGlobsFromDiff,
   parseReviewVerdict,
@@ -81,6 +82,11 @@ describe("ReviewAgent", () => {
     expect(args).not.toContain("--approval-policy");
     expect(args).not.toContain("--sandbox");
     expect(args).toContain("exec");
+  });
+
+  test("builds review prompt with configured score threshold policy", () => {
+    const prompt = buildReviewPrompt("Criteria body", makePr(), "diff --git a/file b/file\n+line", 8.5);
+    expect(prompt).toContain("ReviewAgent approves iff score >= 8.5/10.");
   });
 
   test("derives scoped write globs from PR diff paths", () => {
@@ -257,29 +263,126 @@ describe("ReviewAgent", () => {
     expect(listCalls).toBe(1);
   });
 
-  test("parseReviewVerdict uses configured fallback threshold when approved is missing", () => {
+  test("approves by score threshold even when reviewer sets approved=false", async () => {
+    const pr = makePr({ number: 55, html_url: "https://example.com/pr/55" });
+    let mergeCalls = 0;
+    let commentCalls = 0;
+    let enqueueCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 8.7,
+            approved: false,
+            summary: "Good quality overall",
+            issues: ["Minor cleanup suggested"],
+            fix_instruction: "",
+          }),
+        mergePullRequest: async () => {
+          mergeCalls += 1;
+          return { merged: true, sha: "deadbeef", message: "merged" };
+        },
+        addPullRequestComment: async () => {
+          commentCalls += 1;
+        },
+        fetchImpl: async () => {
+          enqueueCalls += 1;
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(mergeCalls).toBe(1);
+    expect(commentCalls).toBe(0);
+    expect(enqueueCalls).toBe(0);
+  });
+
+  test("rejects when score is below threshold even when reviewer sets approved=true", async () => {
+    const pr = makePr({ number: 56, html_url: "https://example.com/pr/56" });
+    let mergeCalls = 0;
+    let commentCalls = 0;
+    let enqueueCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 8.4,
+            approved: true,
+            summary: "Close, but not enough",
+            issues: ["Edge-case test missing"],
+            fix_instruction: "",
+          }),
+        mergePullRequest: async () => {
+          mergeCalls += 1;
+          return { merged: true, sha: "deadbeef", message: "merged" };
+        },
+        addPullRequestComment: async () => {
+          commentCalls += 1;
+        },
+        fetchImpl: async () => {
+          enqueueCalls += 1;
+          return new Response(JSON.stringify({ ok: true, jobId: "job-fix-56" }), { status: 200 });
+        },
+        now: () => 456,
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(mergeCalls).toBe(0);
+    expect(commentCalls).toBe(1);
+    expect(enqueueCalls).toBeGreaterThan(0);
+  });
+
+  test("parseReviewVerdict ignores reviewer approved flag and keeps score payload", () => {
     const raw = JSON.stringify({
       score: 8.7,
+      approved: false,
       summary: "Looks good enough",
-      issues: [],
+      issues: ["needs follow-up"],
       fix_instruction: "",
     });
 
-    const withHighThreshold = parseReviewVerdict(raw, { fallbackApprovedThreshold: 9.5 });
-    const withLowerThreshold = parseReviewVerdict(raw, { fallbackApprovedThreshold: 8.5 });
-    const withExplicitFalse = parseReviewVerdict(
+    const verdict = parseReviewVerdict(raw);
+
+    expect(verdict?.score).toBe(8.7);
+    expect(verdict?.summary).toBe("Looks good enough");
+    expect(verdict?.issues).toEqual(["needs follow-up"]);
+    expect("approved" in ((verdict as unknown as Record<string, unknown>) ?? {})).toBe(false);
+  });
+
+  test("parseReviewVerdict rejects out-of-range score payloads", () => {
+    const verdict = parseReviewVerdict(
       JSON.stringify({
-        score: 9.8,
-        approved: false,
-        summary: "Not approved",
-        issues: ["needs work"],
+        score: 10.5,
+        summary: "Invalid score",
+        issues: [],
         fix_instruction: "",
       }),
-      { fallbackApprovedThreshold: 8.5 },
     );
 
-    expect(withHighThreshold?.approved).toBe(false);
-    expect(withLowerThreshold?.approved).toBe(true);
-    expect(withExplicitFalse?.approved).toBe(false);
+    expect(verdict).toBeNull();
   });
 });

@@ -14,7 +14,6 @@ export type ReviewAgentConfig = SourceControlManagerReviewAgentConfig;
 
 interface ReviewVerdict {
   score: number;
-  approved: boolean;
   summary: string;
   issues: string[];
   fix_instruction: string;
@@ -218,10 +217,7 @@ async function invokeCodexReview(prompt: string, config: ReviewAgentConfig): Pro
   }
 }
 
-export function parseReviewVerdict(
-  raw: string,
-  options?: { fallbackApprovedThreshold?: number },
-): ReviewVerdict | null {
+export function parseReviewVerdict(raw: string): ReviewVerdict | null {
   const stripped = raw
     .replace(/^```(?:json)?\s*/m, "")
     .replace(/\s*```\s*$/m, "")
@@ -238,11 +234,8 @@ export function parseReviewVerdict(
     const obj = parsed as Record<string, unknown>;
     const score = typeof obj.score === "number" ? obj.score : Number.parseFloat(String(obj.score));
     if (!Number.isFinite(score)) return null;
+    if (score < 1 || score > 10) return null;
 
-    const fallbackThreshold = Number.isFinite(options?.fallbackApprovedThreshold)
-      ? Math.max(1, Math.min(10, Number(options?.fallbackApprovedThreshold)))
-      : 9.5;
-    const approved = typeof obj.approved === "boolean" ? obj.approved : score >= fallbackThreshold;
     const summary = typeof obj.summary === "string" ? obj.summary : "";
     const issues = Array.isArray(obj.issues)
       ? (obj.issues as unknown[]).filter((entry) => typeof entry === "string").map(String)
@@ -252,7 +245,6 @@ export function parseReviewVerdict(
 
     return {
       score,
-      approved,
       summary,
       issues,
       fix_instruction: fixInstruction,
@@ -278,12 +270,20 @@ export function extractPrMeta(body: string | null): { jobId: string | null; sess
   };
 }
 
-export function buildReviewPrompt(reviewerMd: string, pr: GitHubPR, diff: string): string {
+export function buildReviewPrompt(
+  reviewerMd: string,
+  pr: GitHubPR,
+  diff: string,
+  passThreshold: number,
+): string {
   const truncatedDiff =
     diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}\n...(diff truncated)` : diff;
+  const normalizedThreshold = Math.max(1, Math.min(10, passThreshold));
 
   return [
     "You are a Distinguished Engineer performing a code review for the PushPals project.",
+    `Operational policy: ReviewAgent approves iff score >= ${normalizedThreshold.toFixed(1)}/10.`,
+    "Provide objective scoring and actionable issues only; do not make the final approve/reject policy decision.",
     "",
     "Review Criteria:",
     reviewerMd,
@@ -550,7 +550,7 @@ export class ReviewAgent {
     }
 
     const reviewerMd = this.loadReviewerMd();
-    const prompt = buildReviewPrompt(reviewerMd, pr, diff);
+    const prompt = buildReviewPrompt(reviewerMd, pr, diff, this.config.passThreshold);
 
     let raw: string;
     try {
@@ -563,9 +563,7 @@ export class ReviewAgent {
       return;
     }
 
-    const verdict = parseReviewVerdict(raw, {
-      fallbackApprovedThreshold: this.config.passThreshold,
-    });
+    const verdict = parseReviewVerdict(raw);
     if (!verdict) {
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] Could not parse Codex verdict for PR #${pr.number}. Raw output:\n${raw.slice(0, 500)}`,
@@ -573,11 +571,11 @@ export class ReviewAgent {
       return;
     }
 
+    const approved = verdict.score >= this.config.passThreshold;
     this.deps.logInfo(
-      `[${ts()}] [ReviewAgent] PR #${pr.number} score: ${verdict.score.toFixed(1)}/10 - ${verdict.approved ? "APPROVED" : "REJECTED"} - ${verdict.summary}`,
+      `[${ts()}] [ReviewAgent] PR #${pr.number} score: ${verdict.score.toFixed(1)}/10 - ${approved ? "APPROVED" : "REJECTED"} (threshold ${this.config.passThreshold.toFixed(1)}/10) - ${verdict.summary}`,
     );
 
-    const approved = verdict.approved && verdict.score >= this.config.passThreshold;
     const finalized = approved
       ? await this.approvePr(pr, verdict)
       : await this.rejectPr(pr, verdict, diff);
