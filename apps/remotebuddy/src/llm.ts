@@ -13,6 +13,7 @@ import { join } from "path";
 import {
   loadPushPalsConfig,
   type PushPalsConfig,
+  type PushPalsLlmConfig,
   type PushPalsLmStudioConfig,
 } from "shared";
 
@@ -44,11 +45,6 @@ export interface LLMClient {
   generate(input: LLMGenerateInput): Promise<LLMGenerateOutput>;
 }
 
-export interface LLMClientDependencies {
-  config?: PushPalsConfig;
-  loadConfig?: () => PushPalsConfig;
-}
-
 type LlmBackend = "lmstudio" | "ollama" | "openai" | "openai_codex";
 type LlmService = "localbuddy" | "remotebuddy" | "workerpals";
 
@@ -59,6 +55,10 @@ export interface LLMClientOptions {
   apiKey?: string;
   model?: string;
   backend?: string;
+}
+
+export interface LLMClientDependencies {
+  loadConfig(): PushPalsConfig;
 }
 
 interface ResolvedServiceLlmConfig {
@@ -74,12 +74,9 @@ interface ResolvedServiceLlmConfig {
   lmStudio: PushPalsLmStudioConfig;
 }
 
-type LoadConfigFn = typeof loadPushPalsConfig;
-
-export interface LLMClientDependencies {
-  config?: PushPalsConfig;
-  loadConfig?: LoadConfigFn;
-}
+const DEFAULT_LLM_CLIENT_DEPENDENCIES: LLMClientDependencies = {
+  loadConfig: () => loadPushPalsConfig(),
+};
 
 const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
@@ -438,19 +435,36 @@ function firstNonEmpty(...values: Array<string | null | undefined>): string | nu
   return null;
 }
 
+function requireServiceLlmConfig(config: PushPalsConfig, service: LlmService): PushPalsLlmConfig {
+  const candidate =
+    service === "localbuddy"
+      ? config.localbuddy?.llm
+      : service === "workerpals"
+        ? config.workerpals?.llm
+        : config.remotebuddy?.llm;
+  if (!candidate) {
+    throw new Error(
+      `Missing ${service} LLM configuration (expected config.${service}.llm in PushPals config).`,
+    );
+  }
+  return candidate;
+}
+
+function requireGlobalLmStudioConfig(config: PushPalsConfig): PushPalsLmStudioConfig {
+  const defaults = config.llm?.lmstudio;
+  if (!defaults) {
+    throw new Error("Missing global LM Studio configuration (config.llm.lmstudio).");
+  }
+  return defaults;
+}
+
 function resolveServiceLlmConfig(
   opts: LLMClientOptions = {},
-  deps: LLMClientDependencies = {},
+  dependencies: LLMClientDependencies = DEFAULT_LLM_CLIENT_DEPENDENCIES,
 ): ResolvedServiceLlmConfig {
   const service = opts.service ?? "remotebuddy";
-  const loadConfig = deps.loadConfig ?? loadPushPalsConfig;
-  const config = deps.config ?? loadConfig();
-  const serviceLlmConfig =
-    service === "localbuddy"
-      ? config.localbuddy.llm
-      : service === "workerpals"
-        ? config.workerpals.llm
-        : config.remotebuddy.llm;
+  const config = dependencies.loadConfig();
+  const serviceLlmConfig = requireServiceLlmConfig(config, service);
 
   const explicitBackend = normalizeBackend(firstNonEmpty(opts.backend, serviceLlmConfig.backend));
   const fallbackEndpoint =
@@ -505,7 +519,7 @@ function resolveServiceLlmConfig(
     codexAuthMode: serviceLlmConfig.codexAuthMode,
     codexBin: serviceLlmConfig.codexBin,
     codexTimeoutMs: serviceLlmConfig.codexTimeoutMs,
-    lmStudio: config.llm.lmstudio,
+    lmStudio: requireGlobalLmStudioConfig(config),
   };
 }
 
@@ -1428,9 +1442,9 @@ export class OllamaClient implements LLMClient {
 
 export function createLLMClient(
   opts: LLMClientOptions = {},
-  deps: LLMClientDependencies = {},
+  dependencies: LLMClientDependencies = DEFAULT_LLM_CLIENT_DEPENDENCIES,
 ): LLMClient {
-  const resolved = resolveServiceLlmConfig(opts, deps);
+  const resolved = resolveServiceLlmConfig(opts, dependencies);
   const service = opts.service ?? "remotebuddy";
 
   if (resolved.backend === "openai_codex") {

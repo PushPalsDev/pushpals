@@ -1,274 +1,202 @@
 import { describe, expect, test } from "bun:test";
-import { createLLMClient } from "../src/llm";
-import type {
-  PushPalsConfig,
-  PushPalsLlmConfig,
-  PushPalsLmStudioConfig,
+import { createLLMClient, type LLMClientDependencies } from "../src/llm";
+import {
+  loadPushPalsConfig,
+  type PushPalsConfig,
 } from "../../../packages/shared/src/config";
 
-describe("localbuddy LLM session dependencies", () => {
-  test("deps.config takes precedence over deps.loadConfig", () => {
-    const configModel = "localbuddy-config-model";
-    const loaderModel = "localbuddy-loader-model";
-    const client = createLLMClient(
-      { service: "localbuddy" },
-      {
-        config: stubConfig({ localbuddy: { model: configModel } }),
-        loadConfig: () => stubConfig({ localbuddy: { model: loaderModel } }),
-      },
+type ServiceId = "localbuddy" | "remotebuddy" | "workerpals";
+
+type FetchCallRecord = {
+  url: string;
+  init?: RequestInit;
+  body?: Record<string, unknown>;
+};
+
+type EnvSnapshot = Record<string, string | undefined>;
+
+const BASE_CONFIG = loadPushPalsConfig({ reload: true });
+
+function cloneConfig(config: PushPalsConfig): PushPalsConfig {
+  return JSON.parse(JSON.stringify(config)) as PushPalsConfig;
+}
+
+function depsWithConfig(
+  patch?: (cfg: PushPalsConfig) => void,
+): LLMClientDependencies {
+  return {
+    loadConfig: () => {
+      const copy = cloneConfig(BASE_CONFIG);
+      patch?.(copy);
+      return copy;
+    },
+  };
+}
+
+function createFetchRecorder() {
+  const calls: FetchCallRecord[] = [];
+  const stub: typeof fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    const method = (init?.method ?? "GET").toUpperCase();
+    if (method === "GET") {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ data: [{ id: "local-model" }] }), {
+        status: 200,
+      });
+    }
+
+    const bodyText = typeof init?.body === "string" ? init.body : "";
+    const parsedBody = bodyText ? JSON.parse(bodyText) : undefined;
+    calls.push({ url, init, body: parsedBody });
+
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      }),
+      { status: 200 },
     );
+  };
+  return { calls, stub };
+}
 
-    expect((client as any).model).toBe(configModel);
-  });
+function swapFetch(mock: typeof fetch): () => void {
+  const previous = globalThis.fetch;
+  globalThis.fetch = mock;
+  return () => {
+    globalThis.fetch = previous;
+  };
+}
 
-  test("deps.loadConfig is skipped when deps.config is provided", () => {
-    let loadCalls = 0;
-    createLLMClient(
-      { service: "localbuddy" },
-      {
-        config: stubConfig(),
-        loadConfig: () => {
-          loadCalls += 1;
-          return stubConfig({ localbuddy: { model: "unused" } });
+function normalizeSessionTagValue(raw: string | undefined): string {
+  const normalized = (raw ?? "default")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._:-]+/g, "-");
+  const collapsed = normalized.replace(/-+/g, "-").replace(/^-|-$/g, "");
+  if (!collapsed) return "default";
+  return collapsed.length <= 96 ? collapsed : collapsed.slice(0, 96);
+}
+
+function expectedSessionTag(service: ServiceId, sessionId?: string): string {
+  return `pushpals-${service}-${normalizeSessionTagValue(sessionId)}`;
+}
+
+function captureEnv(keys: string[]): EnvSnapshot {
+  const snapshot: EnvSnapshot = {};
+  for (const key of keys) {
+    snapshot[key] = process.env[key];
+  }
+  return snapshot;
+}
+
+function restoreEnv(snapshot: EnvSnapshot): void {
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
+
+describe("localbuddy LLM session propagation", () => {
+  test("attaches normalized session tag to LM Studio request payloads", async () => {
+    const { stub, calls } = createFetchRecorder();
+    const restore = swapFetch(stub);
+    try {
+      const deps = depsWithConfig((cfg) => {
+        cfg.localbuddy.llm.backend = "lmstudio";
+        cfg.localbuddy.llm.endpoint = "http://127.0.0.1:1234";
+        cfg.localbuddy.llm.model = "local-model";
+      });
+
+      const client = createLLMClient(
+        {
+          service: "localbuddy",
+          backend: "lmstudio",
+          endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+          sessionId: "Session ABC",
+          model: "local-model",
         },
-      },
-    );
+        deps,
+      );
 
-    expect(loadCalls).toBe(0);
+      const output = await client.generate({
+        system: "test system",
+        messages: [{ role: "user", content: "ping" }],
+      });
+      expect(output.text).toBe("ok");
+
+      const completionCall = calls.find(
+        (call) => (call.init?.method ?? "GET").toUpperCase() === "POST",
+      );
+      expect(completionCall).toBeDefined();
+      const headers = new Headers(
+        (completionCall?.init?.headers as HeadersInit | undefined) ?? {},
+      );
+      const expectedTag = expectedSessionTag("localbuddy", "Session ABC");
+      expect(headers.get("X-PushPals-Session-Id")).toBe(expectedTag);
+      expect(headers.get("X-Session-Id")).toBe(expectedTag);
+      expect(headers.get("X-Conversation-Id")).toBe(expectedTag);
+      expect(completionCall?.body?.user).toBe(expectedTag);
+      expect(completionCall?.body?.session_id).toBe(expectedTag);
+      expect(completionCall?.body?.conversation_id).toBe(expectedTag);
+    } finally {
+      restore();
+    }
   });
 
-  test("service session id overrides global session id", () => {
-    const localbuddySession = "localbuddy-svc-session";
-    const client = createLLMClient(
-      { service: "localbuddy" },
-      {
-        config: stubConfig({
-          globalSessionId: "global-session-x",
-          localbuddy: { sessionId: localbuddySession },
-        }),
-      },
-    );
+  test("defaults to config-backed session when dependencies are omitted", async () => {
+    const { stub, calls } = createFetchRecorder();
+    const restore = swapFetch(stub);
+    const envKeys = [
+      "LOCALBUDDY_LLM_BACKEND",
+      "LOCALBUDDY_LLM_ENDPOINT",
+      "LOCALBUDDY_LLM_MODEL",
+      "LOCALBUDDY_LLM_SESSION_ID",
+    ];
+    const envSnapshot = captureEnv(envKeys);
+    const overrideSession = "localbuddy-env-default";
+    try {
+      process.env.LOCALBUDDY_LLM_BACKEND = "lmstudio";
+      process.env.LOCALBUDDY_LLM_ENDPOINT = "http://127.0.0.1:1234";
+      process.env.LOCALBUDDY_LLM_MODEL = "local-model";
+      process.env.LOCALBUDDY_LLM_SESSION_ID = overrideSession;
+      loadPushPalsConfig({ reload: true });
 
-    expect((client as any).sessionTag).toBe(`pushpals-localbuddy-${localbuddySession}`);
+      const client = createLLMClient({ service: "localbuddy" });
+      const output = await client.generate({
+        system: "system",
+        messages: [{ role: "user", content: "ping" }],
+      });
+      expect(output.text).toBe("ok");
+
+      const completionCall = calls.find(
+        (call) => (call.init?.method ?? "GET").toUpperCase() === "POST",
+      );
+      expect(completionCall).toBeDefined();
+      const headers = new Headers(
+        (completionCall?.init?.headers as HeadersInit | undefined) ?? {},
+      );
+      const expectedTag = expectedSessionTag("localbuddy", overrideSession);
+      expect(headers.get("X-PushPals-Session-Id")).toBe(expectedTag);
+      expect(completionCall?.body?.user).toBe(expectedTag);
+    } finally {
+      restore();
+      restoreEnv(envSnapshot);
+      loadPushPalsConfig({ reload: true });
+    }
+  });
+
+  test("throws when injected config omits the target service llm block", () => {
+    const deps = depsWithConfig((cfg) => {
+      Object.assign(cfg, {
+        localbuddy: undefined as unknown as typeof cfg.localbuddy,
+      });
+    });
+    expect(() => createLLMClient({ service: "localbuddy" }, deps)).toThrow(
+      /missing localbuddy llm configuration/i,
+    );
   });
 });
-
-interface StubConfigOverrides {
-  globalSessionId?: string;
-  localbuddy?: Partial<PushPalsLlmConfig>;
-  remotebuddy?: Partial<PushPalsLlmConfig>;
-  workerpals?: Partial<PushPalsLlmConfig>;
-  lmstudio?: Partial<PushPalsLmStudioConfig>;
-}
-
-function stubConfig(overrides: StubConfigOverrides = {}): PushPalsConfig {
-  const makeLlm = (
-    sessionId: string,
-    partial?: Partial<PushPalsLlmConfig>,
-  ): PushPalsLlmConfig => ({
-    backend: "lmstudio",
-    endpoint: "http://127.0.0.1:1234",
-    model: "local-model",
-    apiKey: "lmstudio",
-    sessionId,
-    reasoningEffort: "high",
-    codexAuthMode: "auto",
-    codexBin: "/tmp/codex",
-    codexTimeoutMs: 120_000,
-    ...partial,
-  });
-
-  const lmstudio: PushPalsLmStudioConfig = {
-    contextWindow: 4096,
-    minOutputTokens: 256,
-    tokenSafetyMargin: 64,
-    batchTailMessages: 3,
-    batchChunkTokens: 0,
-    batchMemoryChars: 0,
-    ...overrides.lmstudio,
-  };
-
-  return {
-    projectRoot: "/repo",
-    configDir: "/repo/config",
-    profile: "test",
-    sessionId: overrides.globalSessionId ?? "global-session",
-    authToken: null,
-    gitToken: null,
-    llm: { lmstudio },
-    paths: {
-      dataDir: "/tmp/data",
-      sharedDbPath: "/tmp/shared.db",
-      remotebuddyDbPath: "/tmp/remotebuddy.db",
-    },
-    server: {
-      url: "http://localhost:3001",
-      host: "0.0.0.0",
-      port: 3001,
-      debugHttp: false,
-      staleClaimTtlMs: 1000,
-      staleClaimSweepIntervalMs: 1000,
-    },
-    localbuddy: {
-      port: 3003,
-      statusHeartbeatMs: 1000,
-      llm: makeLlm("localbuddy-session", overrides.localbuddy),
-    },
-    remotebuddy: {
-      pollMs: 1000,
-      statusHeartbeatMs: 1000,
-      workerpalOnlineTtlMs: 1000,
-      waitForWorkerpalMs: 1000,
-      autoSpawnWorkerpals: false,
-      maxWorkerpals: 1,
-      workerpalStartupTimeoutMs: 1000,
-      workerpalDocker: false,
-      workerpalRequireDocker: false,
-      workerpalImage: null,
-      workerpalPollMs: null,
-      workerpalHeartbeatMs: null,
-      workerpalLabels: [],
-      executionBudgetInteractiveMs: 1000,
-      executionBudgetNormalMs: 1000,
-      executionBudgetBackgroundMs: 1000,
-      finalizationBudgetMs: 1000,
-      memory: {
-        enabled: false,
-        includeCrossSession: false,
-        maxRecallItems: 1,
-        maxRecallChars: 1,
-        maxSummaryChars: 1,
-        retentionDays: 1,
-      },
-      autonomy: {
-        enabled: false,
-        tickIntervalMs: 1000,
-        ideationBudgetMs: 1000,
-        llmTimeoutMs: 1000,
-        ideationMaxCandidates: 1,
-        topK: 1,
-        minConfidence: 0.5,
-        maxConcurrentObjectives: 1,
-        maxDispatchPerHour: 1,
-        maxDispatchPerHourByType: {},
-        cooldownFailStreakThreshold: 1,
-        cooldownMs: 1000,
-        allowReadAnywhere: false,
-        questionTtlMs: 1000,
-        policyVersion: "policy",
-        impactModelVersion: "impact",
-        replay: {
-          storePromptPayloads: false,
-          maxRunsWithPayloads: 1,
-          maxPayloadBytes: 1024,
-        },
-      },
-      llm: makeLlm("remotebuddy-session", overrides.remotebuddy),
-    },
-    workerpals: {
-      pollMs: 1000,
-      heartbeatMs: 1000,
-      executor: "none",
-      openhandsPython: "python",
-      openhandsTimeoutMs: 1000,
-      miniswePython: "python",
-      minisweTimeoutMs: 1000,
-      openaiCodexPython: "python",
-      openaiCodexTimeoutMs: 1000,
-      openhandsStuckGuardEnabled: false,
-      openhandsStuckGuardExploreLimit: 1,
-      openhandsStuckGuardMinElapsedMs: 1000,
-      openhandsStuckGuardBroadScanLimit: 1,
-      openhandsStuckGuardNoProgressMaxMs: 1000,
-      openhandsAutoSteerEnabled: false,
-      openhandsAutoSteerInitialDelaySec: 1,
-      openhandsAutoSteerIntervalSec: 1,
-      openhandsAutoSteerMaxNudges: 1,
-      requirePush: false,
-      pushAgentBranch: false,
-      requireDocker: false,
-      skipDockerSelfCheck: false,
-      dockerImage: "worker",
-      dockerTimeoutMs: 1000,
-      dockerIdleTimeoutMs: 1000,
-      dockerAgentStartupTimeoutMs: 1000,
-      dockerWarmMaxAttempts: 1,
-      dockerWarmRetryBackoffMs: 1,
-      dockerJobMaxAttempts: 1,
-      dockerJobRetryBackoffMs: 1,
-      dockerNetworkMode: "bridge",
-      dockerWarmMemoryMb: 1,
-      dockerWarmCpus: 1,
-      fileModifyingJobs: [],
-      outputMaxChars: 1000,
-      outputMaxLines: 100,
-      outputMaxHeadLines: 10,
-      qualityMaxAutoRevisions: 1,
-      qualityValidationStepTimeoutMs: 1000,
-      qualityCriticTimeoutMs: 1000,
-      qualitySoftPassOnExhausted: false,
-      qualityCriticMinScore: 1,
-      qualityCriticMaxDiffChars: 1000,
-      qualityCriticMaxValidationOutputChars: 1000,
-      executorResultPrefix: "__",
-      baseRef: "origin/main",
-      labels: [],
-      failureCooldownMs: 1000,
-      llm: makeLlm("workerpals-session", overrides.workerpals),
-    },
-    sourceControlManager: {
-      repoPath: "/repo",
-      remote: "origin",
-      mainBranch: "main",
-      baseBranch: "main_agents",
-      branchPrefix: "agent/",
-      pollIntervalSeconds: 60,
-      checks: [],
-      stateDir: "/tmp/state",
-      port: 4000,
-      deleteAfterMerge: false,
-      maxAttempts: 1,
-      mergeStrategy: "no-ff",
-      pushMainAfterMerge: false,
-      openPrAfterPush: false,
-      prBaseBranch: "main",
-      prTitle: null,
-      prBody: null,
-      prDraft: false,
-      statusHeartbeatMs: 1000,
-      skipCleanCheck: true,
-      autoCreateMainBranch: false,
-      reviewAgent: {
-        enabled: false,
-        pollIntervalMs: 1000,
-        reviewerMdPath: "",
-        passThreshold: 10,
-        mergeMethod: "squash",
-        codexBin: "",
-        codexAuthMode: "auto",
-        codexHomeDir: "",
-        codexTimeoutMs: 120_000,
-      },
-    },
-    startup: {
-      workerImageRebuild: false,
-      syncIntegrationWithMain: false,
-      skipLlmPreflight: true,
-      autoStartLmStudio: false,
-      lmStudioReadyTimeoutMs: 1_000,
-      lmStudioCli: "",
-      lmStudioPort: 1234,
-      lmStudioStartArgs: [],
-      startupWarmup: [],
-      startupWarmupTimeoutMs: 1_000,
-      startupWarmupPollMs: 1_000,
-      allowExternalClean: false,
-      portPreflight: [],
-      portConflictPolicy: "ignore",
-    },
-    client: {
-      localAgentUrl: "http://localhost:3003",
-      traceTailLines: 100,
-    },
-  } satisfies PushPalsConfig;
-}
