@@ -44,6 +44,11 @@ export interface LLMClient {
   generate(input: LLMGenerateInput): Promise<LLMGenerateOutput>;
 }
 
+export interface LLMClientDependencies {
+  config?: PushPalsConfig;
+  loadConfig?: () => PushPalsConfig;
+}
+
 type LlmBackend = "lmstudio" | "ollama" | "openai" | "openai_codex";
 type LlmService = "localbuddy" | "remotebuddy" | "workerpals";
 
@@ -109,13 +114,6 @@ type ProcessRunResult = {
   stderr: string;
   timedOut: boolean;
 };
-
-type PushPalsConfigLoader = () => PushPalsConfig;
-let pushPalsConfigLoader: PushPalsConfigLoader = loadPushPalsConfig;
-
-export function setPushPalsConfigLoader(loader?: PushPalsConfigLoader): void {
-  pushPalsConfigLoader = loader ?? loadPushPalsConfig;
-}
 
 function splitArgs(raw: string): string[] {
   const out: string[] = [];
@@ -433,9 +431,13 @@ function firstNonEmpty(...values: Array<string | null | undefined>): string | nu
   return null;
 }
 
-function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLlmConfig {
+function resolveServiceLlmConfig(
+  opts: LLMClientOptions = {},
+  deps: LLMClientDependencies = {},
+): ResolvedServiceLlmConfig {
   const service = opts.service ?? "remotebuddy";
-  const config = pushPalsConfigLoader();
+  const loadConfig = deps.loadConfig ?? loadPushPalsConfig;
+  const config = deps.config ?? loadConfig();
   const serviceLlmConfig =
     service === "localbuddy"
       ? config.localbuddy.llm
@@ -771,10 +773,6 @@ export class LmStudioClient implements LLMClient {
     );
     this.batchChunkTokens = Math.max(0, lmStudio?.batchChunkTokens ?? 0);
     this.batchMemoryChars = Math.max(0, lmStudio?.batchMemoryChars ?? 0);
-  }
-
-  getSessionTag(): string {
-    return this.sessionTag;
   }
 
   private modelProbeUrls(): string[] {
@@ -1258,10 +1256,6 @@ export class OpenAiCodexCliClient implements LLMClient {
     this.reasoningEffort = (opts?.reasoningEffort ?? "").trim();
   }
 
-  getSessionTag(): string {
-    return this.sessionTag;
-  }
-
   private effectiveAuthMode(): CodexAuthMode {
     const configured = codexConfiguredAuthMode(this.codexAuthMode);
     if (configured !== "auto") return configured;
@@ -1425,8 +1419,11 @@ export class OllamaClient implements LLMClient {
   }
 }
 
-export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
-  const resolved = resolveServiceLlmConfig(opts);
+export function createLLMClient(
+  opts: LLMClientOptions = {},
+  deps: LLMClientDependencies = {},
+): LLMClient {
+  const resolved = resolveServiceLlmConfig(opts, deps);
   const service = opts.service ?? "remotebuddy";
 
   if (resolved.backend === "openai_codex") {
