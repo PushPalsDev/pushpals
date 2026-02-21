@@ -355,6 +355,29 @@ function normalizeDiffPath(value: string): string | null {
   return parts.join("/");
 }
 
+function normalizeReviewPrHeadRef(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const withoutPrefix = trimmed.replace(/^refs\/heads\//, "");
+  const normalized = withoutPrefix
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (!normalized) return null;
+  if (!normalized.startsWith("agent/")) return null;
+  if (
+    normalized.includes("..") ||
+    normalized.includes("@{") ||
+    normalized.endsWith(".") ||
+    normalized.endsWith(".lock")
+  ) {
+    return null;
+  }
+  if (/[~^:?*\[\]\s]/.test(normalized)) return null;
+  return normalized;
+}
+
 function decodeQuotedGitPath(value: string): string {
   return value.replace(/\\([0-7]{1,3}|.)/g, (_match, token: string) => {
     if (/^[0-7]{1,3}$/.test(token)) {
@@ -611,21 +634,103 @@ export class ReviewAgent {
       return true;
     }
 
-    void this.enqueueFixJob(pr, verdict, sessionId, jobId, diff);
+    await this.enqueueFixJob(pr, verdict, sessionId, jobId, diff);
     return true;
+  }
+
+  private async sendSessionCommand(
+    sessionId: string,
+    headers: Record<string, string>,
+    command: Record<string, unknown>,
+  ): Promise<void> {
+    const response = await this.deps.fetchImpl(
+      `${this.serverUrl}/sessions/${encodeURIComponent(sessionId)}/command`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(command),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`session command failed: HTTP ${response.status}${text ? `: ${text}` : ""}`);
+    }
+  }
+
+  private async emitFixJobQueuedEvents(args: {
+    sessionId: string;
+    taskId: string;
+    jobId: string;
+    kind: string;
+    params: Record<string, unknown>;
+    pr: GitHubPR;
+    verdict: ReviewVerdict;
+    headers: Record<string, string>;
+  }): Promise<void> {
+    // Ensure the target session exists before posting task/job events.
+    const ensureSessionResponse = await this.deps.fetchImpl(`${this.serverUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: args.sessionId }),
+    });
+    if (!ensureSessionResponse.ok) {
+      const text = await ensureSessionResponse.text().catch(() => "");
+      throw new Error(
+        `failed to ensure session ${args.sessionId}: HTTP ${ensureSessionResponse.status}${text ? `: ${text}` : ""}`,
+      );
+    }
+
+    const from = "agent:source_control_manager/review_agent";
+    const taskDescription =
+      args.verdict.summary.trim() ||
+      `Address ReviewAgent feedback and update PR #${args.pr.number} (${args.pr.html_url}).`;
+    await this.sendSessionCommand(args.sessionId, args.headers, {
+      type: "task_created",
+      from,
+      correlationId: args.taskId,
+      payload: {
+        taskId: args.taskId,
+        title: `Address ReviewAgent feedback for PR #${args.pr.number}`,
+        description: taskDescription,
+        createdBy: "review_agent",
+        priority: "normal",
+        tags: ["review-agent", "pr-fix"],
+      },
+    });
+    await this.sendSessionCommand(args.sessionId, args.headers, {
+      type: "task_started",
+      from,
+      correlationId: args.taskId,
+      payload: {
+        taskId: args.taskId,
+      },
+    });
+    await this.sendSessionCommand(args.sessionId, args.headers, {
+      type: "job_enqueued",
+      from,
+      correlationId: args.taskId,
+      payload: {
+        jobId: args.jobId,
+        taskId: args.taskId,
+        kind: args.kind,
+        params: args.params,
+        origin: "autonomy",
+      },
+    });
   }
 
   private async enqueueFixJob(
     pr: GitHubPR,
     verdict: ReviewVerdict,
     sessionId: string,
-    _jobId: string | null,
+    jobId: string | null,
     diff: string,
   ): Promise<boolean> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
     const issuesSummary = verdict.issues.length > 0 ? verdict.issues.join("; ") : "see summary";
     const fixInstruction = verdict.fix_instruction.trim() || buildFallbackFixInstruction(pr, verdict);
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
+    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
 
     const payload = {
       taskId,
@@ -654,6 +759,17 @@ export class ReviewAgent {
           finalizationBudgetMs: 120_000,
           scope: { readAnywhere: true, writeAllowed: true, writeGlobs },
         },
+        completionBranch: prHeadRef ?? undefined,
+        reviewAgent: {
+          prNumber: pr.number,
+          prUrl: pr.html_url,
+          prHeadRef: prHeadRef ?? pr.head.ref,
+          prBaseRef: pr.base.ref,
+          previousReviewScore: verdict.score,
+          previousReviewSummary: verdict.summary,
+          rejectedAt: new Date().toISOString(),
+          sourceJobId: jobId,
+        },
         lane: "worker",
         recentJobs: [],
       },
@@ -673,9 +789,30 @@ export class ReviewAgent {
         const text = await response.text();
         throw new Error(`HTTP ${response.status}: ${text}`);
       }
+      const responseBody = (await response.json().catch(() => null)) as { jobId?: unknown } | null;
+      const enqueuedJobId =
+        responseBody && typeof responseBody.jobId === "string" ? responseBody.jobId : "";
+      if (enqueuedJobId) {
+        try {
+          await this.emitFixJobQueuedEvents({
+            sessionId,
+            taskId,
+            jobId: enqueuedJobId,
+            kind: "task.execute",
+            params: payload.params,
+            pr,
+            verdict,
+            headers,
+          });
+        } catch (emitErr: any) {
+          this.deps.logWarn(
+            `[${ts()}] [ReviewAgent] Fix job ${enqueuedJobId} enqueued for PR #${pr.number}, but failed to emit session task/job events: ${emitErr?.message ?? emitErr}`,
+          );
+        }
+      }
 
       this.deps.logInfo(
-        `[${ts()}] [ReviewAgent] PR #${pr.number} rejected (score ${verdict.score.toFixed(1)}/10) - fix job ${taskId} enqueued`,
+        `[${ts()}] [ReviewAgent] PR #${pr.number} rejected (score ${verdict.score.toFixed(1)}/10) - fix job ${taskId}${enqueuedJobId ? ` (${enqueuedJobId})` : ""} enqueued`,
       );
       return true;
     } catch (err: any) {

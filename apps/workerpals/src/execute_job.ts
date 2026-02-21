@@ -97,6 +97,33 @@ function toSingleLine(value: unknown, max = 240): string {
   return text.length > max ? `${text.slice(0, Math.max(1, max - 3))}...` : text;
 }
 
+export function resolveReviewFixCompletionBranch(
+  value: unknown,
+  fallbackBranch: string,
+): { branch: string; overridden: boolean } {
+  if (typeof value !== "string") {
+    return { branch: fallbackBranch, overridden: false };
+  }
+  const trimmed = value.trim();
+  if (!trimmed) return { branch: fallbackBranch, overridden: false };
+  const withoutPrefix = trimmed.replace(/^refs\/heads\//, "");
+  const normalized = withoutPrefix
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (!normalized.startsWith("agent/")) return { branch: fallbackBranch, overridden: false };
+  if (
+    normalized.includes("..") ||
+    normalized.includes("@{") ||
+    normalized.endsWith(".") ||
+    normalized.endsWith(".lock")
+  ) {
+    return { branch: fallbackBranch, overridden: false };
+  }
+  if (/[~^:?*\[\]\s]/.test(normalized)) return { branch: fallbackBranch, overridden: false };
+  return { branch: normalized, overridden: true };
+}
+
 function normalizeChatCompletionsEndpoint(endpoint: string): string {
   const source = endpoint.trim().replace(/\/+$/, "");
   if (!source) return "http://127.0.0.1:1234/v1/chat/completions";
@@ -950,9 +977,21 @@ export async function createJobCommit(
   },
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
 ): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
-  const requirePush = runtimeConfig.workerpals.requirePush;
-  const pushAgentBranch = requirePush || runtimeConfig.workerpals.pushAgentBranch;
-  const publicBranchName = `agent/${workerId}/${job.id}`;
+  const defaultPublicBranchName = `agent/${workerId}/${job.id}`;
+  const reviewAgentHeadRef =
+    job.params?.reviewAgent &&
+    typeof job.params.reviewAgent === "object" &&
+    !Array.isArray(job.params.reviewAgent)
+      ? (job.params.reviewAgent as Record<string, unknown>).prHeadRef
+      : undefined;
+  const resolvedPublicBranch = resolveReviewFixCompletionBranch(
+    job.params?.completionBranch ?? reviewAgentHeadRef,
+    defaultPublicBranchName,
+  );
+  const publicBranchName = resolvedPublicBranch.branch;
+  const requirePush = runtimeConfig.workerpals.requirePush || resolvedPublicBranch.overridden;
+  const pushAgentBranch =
+    requirePush || runtimeConfig.workerpals.pushAgentBranch || resolvedPublicBranch.overridden;
   // Keep worker refs out of refs/heads so user-visible branch lists stay clean.
   const hiddenCommitRef = `refs/pushpals/agent/${workerId}/${job.id}`;
   let completionRef = hiddenCommitRef;

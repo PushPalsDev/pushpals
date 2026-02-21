@@ -163,6 +163,9 @@ describe("ReviewAgent", () => {
     const pr = makePr({ number: 7, html_url: "https://example.com/pr/7" });
     let enqueuedInstruction = "";
     let enqueuedWriteGlobs: string[] = [];
+    let enqueuedTaskId = "";
+    let enqueuedCompletionBranch = "";
+    const emittedCommandTypes: string[] = [];
 
     const agent = new ReviewAgent(
       baseConfig,
@@ -184,14 +187,33 @@ describe("ReviewAgent", () => {
           }),
         addPullRequestComment: async () => {},
         fetchImpl: async (_input, init) => {
-          const payload = JSON.parse(String(init?.body ?? "{}")) as {
-            params?: {
-              instruction?: string;
-              planning?: { scope?: { writeGlobs?: string[] } };
-            };
-          };
-          enqueuedInstruction = payload.params?.instruction ?? "";
-          enqueuedWriteGlobs = payload.params?.planning?.scope?.writeGlobs ?? [];
+          const url = String(_input);
+          const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueuedTaskId = String(payload.taskId ?? "");
+            const params =
+              payload.params && typeof payload.params === "object"
+                ? (payload.params as Record<string, unknown>)
+                : {};
+            const planning =
+              params.planning && typeof params.planning === "object"
+                ? (params.planning as Record<string, unknown>)
+                : {};
+            const scope =
+              planning.scope && typeof planning.scope === "object"
+                ? (planning.scope as Record<string, unknown>)
+                : {};
+            enqueuedInstruction = String(params.instruction ?? "");
+            enqueuedCompletionBranch = String(params.completionBranch ?? "");
+            enqueuedWriteGlobs = Array.isArray(scope.writeGlobs)
+              ? scope.writeGlobs.map((entry) => String(entry))
+              : [];
+            return new Response(JSON.stringify({ ok: true, jobId: "job-fix-7" }), { status: 200 });
+          }
+          if (url.endsWith("/sessions/dev/command")) {
+            emittedCommandTypes.push(String(payload.type ?? ""));
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
           return new Response("ok", { status: 200 });
         },
         now: () => 123,
@@ -203,7 +225,10 @@ describe("ReviewAgent", () => {
 
     expect(enqueuedInstruction).toContain("Address ReviewAgent feedback for PR #7");
     expect(enqueuedInstruction).toContain("Missing negative-path assertions");
+    expect(enqueuedTaskId).toBe("review-fix-pr7-123");
+    expect(enqueuedCompletionBranch).toBe("agent/test-branch");
     expect(enqueuedWriteGlobs.length).toBeGreaterThan(0);
+    expect(emittedCommandTypes).toEqual(["task_created", "task_started", "job_enqueued"]);
   });
 
   test("skips overlapping poll ticks", async () => {
