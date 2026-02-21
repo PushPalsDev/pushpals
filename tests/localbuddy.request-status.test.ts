@@ -112,6 +112,19 @@ describe("buildJobStatusReply", () => {
     expect(reply).toContain("Thinking: scanning apps/server/src/jobs.ts");
   });
 
+  test("informs the user when no jobs exist for a session", () => {
+    const reply = buildJobStatusReply({
+      userPrompt: "status of job deadbeef",
+      sessionId: "dev",
+      jobs: [],
+      logs: [],
+      summarizeFailure,
+      formatTime,
+    });
+
+    expect(reply).toBe("I don't see any jobs in this session yet.");
+  });
+
   test("returns helpful hint when job id is not found", () => {
     const job: JobApiRow = {
       id: "7c7683fa-3333-4333-8333-333333333333",
@@ -163,6 +176,19 @@ describe("buildRequestStatusReply", () => {
     });
     expect(reply).toContain("Request a6f87819 is pending");
     expect(reply).toContain("waiting for RemoteBuddy to claim it");
+  });
+
+  test("explains claimed request when worker job not enqueued yet", () => {
+    const reply = buildRequestStatusReply({
+      userPrompt: "status update e11225b1",
+      sessionId: "dev",
+      requests: [requestA],
+      jobs: [],
+      summarizeFailure,
+      formatTime,
+    });
+    expect(reply).toContain("Request e11225b1 is claimed by remotebuddy-orchestrator");
+    expect(reply).toContain("RemoteBuddy is still planning and has not enqueued a WorkerPal job yet.");
   });
 
   test("reports claimed request with active worker job", () => {
@@ -219,6 +245,45 @@ describe("buildRequestStatusReply", () => {
     });
     expect(reply).toContain("Latest WorkerPal job e49e1b78 is failed");
     expect(reply).toContain("Failure: OpenHands wrapper timed out after 600000ms | task.execute");
+  });
+
+  test("summarizes multiple worker jobs with counts", () => {
+    const jobs: JobApiRow[] = [
+      {
+        id: "972d9a6c-5555-4555-8555-555555555555",
+        taskId: "task-1",
+        sessionId: "dev",
+        status: "completed",
+        workerId: "workerpal-1",
+        params: JSON.stringify({ requestId: requestA.id }),
+        error: null,
+        createdAt: "2026-02-13T01:11:00.000Z",
+        updatedAt: "2026-02-13T01:15:00.000Z",
+      },
+      {
+        id: "a45e9c49-6666-4666-8666-666666666666",
+        taskId: "task-1",
+        sessionId: "dev",
+        status: "failed",
+        workerId: "workerpal-2",
+        params: JSON.stringify({ requestId: requestA.id }),
+        error: JSON.stringify({ message: "Plan failed", detail: "apply_patch" }),
+        createdAt: "2026-02-13T01:16:00.000Z",
+        updatedAt: "2026-02-13T01:20:00.000Z",
+      },
+    ];
+    const reply = buildRequestStatusReply({
+      userPrompt: "check status of request e11225b1",
+      sessionId: "dev",
+      requests: [requestA],
+      jobs,
+      summarizeFailure,
+      formatTime,
+    });
+    expect(reply).toContain("Request e11225b1 is claimed by remotebuddy-orchestrator");
+    expect(reply).toContain("Latest WorkerPal job a45e9c49 is failed");
+    expect(reply).toContain("Failure: Plan failed | apply_patch");
+    expect(reply).toContain("Jobs: 2 total (0 pending, 0 claimed, 1 completed, 1 failed).");
   });
 
   test("returns helpful hint when request id is not found", () => {

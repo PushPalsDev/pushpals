@@ -4,6 +4,11 @@
     "module": "ES2020",
     "lib": ["ES2020"],
     "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "paths": {
+      "shared": ["../../packages/shared/src/index.ts"],
+      "shared/*": ["../../packages/shared/src/*"]
+    },
     "strict": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
