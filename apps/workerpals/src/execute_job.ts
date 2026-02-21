@@ -1494,21 +1494,11 @@ async function generateCommitMessageFromDiff(
     return null;
   }
 
-  const testLines =
-    opts.validationSteps
-      .filter(isTestLikeValidationStep)
-      .map((s) => `- ${s}`)
-      .join("\n") || "- (none)";
-
-  const userMessage = [
-    `Task instruction: ${opts.instruction.slice(0, 400)}`,
-    "",
-    "Validation steps:",
-    testLines,
-    "",
-    "Staged diff:",
-    diff.slice(0, COMMIT_MSG_MAX_DIFF_CHARS),
-  ].join("\n");
+  const userMessage = buildCommitMessageGeneratorUserMessage(
+    opts.instruction,
+    opts.validationSteps,
+    diff,
+  );
 
   const apiKey = runtimeConfig.workerpals.llm.apiKey.trim() || "local";
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -1542,15 +1532,46 @@ async function generateCommitMessageFromDiff(
       (choices[0]?.message as Record<string, unknown> | undefined)?.content ?? "",
     ).trim();
     if (!content) return null;
-    // Strip accidental markdown fences.
-    const clean = content.replace(/^```[^\n]*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
-    // Sanity check: must open with the expected conventional commit prefix.
-    if (!clean.startsWith(`${opts.type}(${opts.area})`)) return null;
+    const clean = sanitizeGeneratedCommitMessage(content, opts.type, opts.area);
+    if (!clean) return null;
     return clean;
   } catch {
     clearTimeout(timer);
     return null;
   }
+}
+
+export function buildCommitMessageGeneratorUserMessage(
+  instruction: string,
+  validationSteps: string[],
+  diff: string,
+): string {
+  const testLines =
+    validationSteps
+      .filter(isTestLikeValidationStep)
+      .map((step) => `- ${step}`)
+      .join("\n") || "- (none)";
+  return [
+    `Background context (do not copy into subject line): ${instruction.slice(0, 400)}`,
+    "",
+    "Validation steps:",
+    testLines,
+    "",
+    "Staged diff (derive subject and bullets from this):",
+    diff.slice(0, COMMIT_MSG_MAX_DIFF_CHARS),
+  ].join("\n");
+}
+
+export function sanitizeGeneratedCommitMessage(
+  content: string,
+  type: string,
+  area: string,
+): string | null {
+  // Strip accidental markdown fences.
+  const clean = content.replace(/^```[^\n]*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
+  // Sanity check: must open with the expected conventional commit prefix.
+  if (!clean.startsWith(`${type}(${area})`)) return null;
+  return clean;
 }
 
 function buildWorkerCommitMessage(
