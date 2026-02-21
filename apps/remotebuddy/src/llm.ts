@@ -10,7 +10,11 @@ import { spawn } from "child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { loadPushPalsConfig, type PushPalsLmStudioConfig } from "shared";
+import {
+  loadPushPalsConfig,
+  type PushPalsConfig,
+  type PushPalsLmStudioConfig,
+} from "shared";
 
 export interface LLMMessage {
   role: "system" | "user" | "assistant";
@@ -105,6 +109,13 @@ type ProcessRunResult = {
   stderr: string;
   timedOut: boolean;
 };
+
+type PushPalsConfigLoader = () => PushPalsConfig;
+let pushPalsConfigLoader: PushPalsConfigLoader = loadPushPalsConfig;
+
+export function setPushPalsConfigLoader(loader?: PushPalsConfigLoader): void {
+  pushPalsConfigLoader = loader ?? loadPushPalsConfig;
+}
 
 function splitArgs(raw: string): string[] {
   const out: string[] = [];
@@ -424,7 +435,7 @@ function firstNonEmpty(...values: Array<string | null | undefined>): string | nu
 
 function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLlmConfig {
   const service = opts.service ?? "remotebuddy";
-  const config = loadPushPalsConfig();
+  const config = pushPalsConfigLoader();
   const serviceLlmConfig =
     service === "localbuddy"
       ? config.localbuddy.llm
@@ -760,6 +771,10 @@ export class LmStudioClient implements LLMClient {
     );
     this.batchChunkTokens = Math.max(0, lmStudio?.batchChunkTokens ?? 0);
     this.batchMemoryChars = Math.max(0, lmStudio?.batchMemoryChars ?? 0);
+  }
+
+  getSessionTag(): string {
+    return this.sessionTag;
   }
 
   private modelProbeUrls(): string[] {
@@ -1241,6 +1256,10 @@ export class OpenAiCodexCliClient implements LLMClient {
     this.service = opts?.service ?? "remotebuddy";
     this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
     this.reasoningEffort = (opts?.reasoningEffort ?? "").trim();
+  }
+
+  getSessionTag(): string {
+    return this.sessionTag;
   }
 
   private effectiveAuthMode(): CodexAuthMode {
