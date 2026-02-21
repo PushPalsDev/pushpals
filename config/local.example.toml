@@ -20,6 +20,14 @@ reasoning_effort = "high"
 [remotebuddy]
 max_workerpals = 20
 
+[remotebuddy.memory]
+enabled = true
+include_cross_session = true
+max_recall_items = 12
+max_recall_chars = 2400
+max_summary_chars = 420
+retention_days = 30
+
 [workerpals.llm]
 model = "gpt-5-codex"
 codex_auth_mode = "chatgpt"

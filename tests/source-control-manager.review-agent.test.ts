@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { resolve } from "path";
 import {
   ReviewAgent,
+  buildReviewFeedbackContext,
   buildReviewPrompt,
   buildCodexExecArgs,
   deriveFixWriteGlobsFromDiff,
@@ -237,6 +238,7 @@ describe("ReviewAgent", () => {
             fix_instruction: "",
           }),
         addPullRequestComment: async () => {},
+        listPullRequestComments: async () => [],
         fetchImpl: async (input) => {
           const url = String(input);
           if (url.endsWith("/jobs/enqueue")) {
@@ -263,6 +265,7 @@ describe("ReviewAgent", () => {
     let enqueuedWriteGlobs: string[] = [];
     let enqueuedTaskId = "";
     let enqueuedCompletionBranch = "";
+    let enqueuedRecentContext: string[] = [];
     const emittedCommandTypes: string[] = [];
 
     const agent = new ReviewAgent(
@@ -284,6 +287,22 @@ describe("ReviewAgent", () => {
             fix_instruction: "",
           }),
         addPullRequestComment: async () => {},
+        listPullRequestComments: async () => [
+          {
+            id: 101,
+            body: "Please include stronger assertions for malformed payload handling.",
+            userLogin: "reviewer-alpha",
+            createdAt: "2026-02-20T01:00:00Z",
+            htmlUrl: "https://example.com/pr/7#issuecomment-101",
+          },
+          {
+            id: 102,
+            body: "Also validate status transitions when no jobs exist.",
+            userLogin: "reviewer-beta",
+            createdAt: "2026-02-20T02:00:00Z",
+            htmlUrl: "https://example.com/pr/7#issuecomment-102",
+          },
+        ],
         fetchImpl: async (_input, init) => {
           const url = String(_input);
           const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
@@ -303,6 +322,9 @@ describe("ReviewAgent", () => {
                 : {};
             enqueuedInstruction = String(params.instruction ?? "");
             enqueuedCompletionBranch = String(params.completionBranch ?? "");
+            enqueuedRecentContext = Array.isArray(params.recentContext)
+              ? params.recentContext.map((entry) => String(entry))
+              : [];
             enqueuedWriteGlobs = Array.isArray(scope.writeGlobs)
               ? scope.writeGlobs.map((entry) => String(entry))
               : [];
@@ -326,6 +348,18 @@ describe("ReviewAgent", () => {
     expect(enqueuedTaskId).toBe("review-fix-pr7-123");
     expect(enqueuedCompletionBranch).toBe("agent/test-branch");
     expect(enqueuedWriteGlobs.length).toBeGreaterThan(0);
+    expect(enqueuedRecentContext).toContain("Recent PR feedback comments:");
+    expect(
+      enqueuedRecentContext.some(
+        (line) => line.includes("@reviewer-alpha") && line.includes("malformed payload handling"),
+      ),
+    ).toBe(true);
+    expect(
+      enqueuedRecentContext.some(
+        (line) =>
+          line.includes("@reviewer-beta") && line.includes("status transitions when no jobs exist"),
+      ),
+    ).toBe(true);
     expect(emittedCommandTypes).toEqual(["task_created", "task_started", "job_enqueued"]);
   });
 
@@ -591,6 +625,7 @@ describe("ReviewAgent", () => {
         addPullRequestComment: async () => {
           commentCalls += 1;
         },
+        listPullRequestComments: async () => [],
         fetchImpl: async () => {
           enqueueCalls += 1;
           return new Response(JSON.stringify({ ok: true, jobId: "job-fix-56" }), { status: 200 });
@@ -605,6 +640,77 @@ describe("ReviewAgent", () => {
     expect(mergeCalls).toBe(0);
     expect(commentCalls).toBe(1);
     expect(enqueueCalls).toBeGreaterThan(0);
+  });
+
+  test("continues enqueue flow when PR feedback comment lookup fails", async () => {
+    const pr = makePr({ number: 66, html_url: "https://example.com/pr/66" });
+    let enqueueCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 8.2,
+            summary: "Needs more work",
+            issues: ["Add stronger edge-case assertions"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => {
+          throw new Error("temporary github comment API issue");
+        },
+        fetchImpl: async (_input) => {
+          const url = String(_input);
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+            return new Response(JSON.stringify({ ok: true, jobId: "job-fix-66" }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(enqueueCalls).toBe(1);
+  });
+
+  test("buildReviewFeedbackContext excludes configured bodies and truncates long entries", () => {
+    const comments = [
+      {
+        id: 1,
+        body: "This exact entry should be excluded.",
+        userLogin: "reviewer-1",
+        createdAt: "2026-02-20T00:00:00Z",
+        htmlUrl: "https://example.com/comment/1",
+      },
+      {
+        id: 2,
+        body: "Need stronger assertions on timeout transitions and malformed payload handling. ".repeat(
+          12,
+        ),
+        userLogin: "reviewer-2",
+        createdAt: "2026-02-20T00:05:00Z",
+        htmlUrl: "https://example.com/comment/2",
+      },
+    ];
+
+    const context = buildReviewFeedbackContext(comments, ["This exact entry should be excluded."]);
+
+    expect(context[0]).toBe("Recent PR feedback comments:");
+    expect(context.some((line) => line.includes("@reviewer-1"))).toBe(false);
+    const reviewerLine = context.find((line) => line.includes("@reviewer-2")) ?? "";
+    expect(reviewerLine.endsWith("...")).toBe(true);
+    expect(reviewerLine.length).toBeLessThanOrEqual(360);
   });
 
   test("parseReviewVerdict ignores reviewer approved flag and keeps score payload", () => {

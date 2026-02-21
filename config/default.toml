@@ -51,6 +51,14 @@ execution_budget_normal_ms = 1500000
 execution_budget_background_ms = 1800000
 finalization_budget_ms = 120000
 
+[remotebuddy.memory]
+enabled = true
+include_cross_session = true
+max_recall_items = 12
+max_recall_chars = 2400
+max_summary_chars = 420
+retention_days = 30
+
 [remotebuddy.llm]
 backend = "lmstudio"
 endpoint = "http://127.0.0.1:1234"

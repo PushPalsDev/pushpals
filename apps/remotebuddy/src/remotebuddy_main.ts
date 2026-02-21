@@ -21,6 +21,8 @@ import { Database } from "bun:sqlite";
 import { createLLMClient, type LLMClient } from "./llm.js";
 import { AgentBrain, PlannerOutput } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
+import { createSessionMemoryBackend, type SessionMemoryBackend } from "./memory.js";
+import { PersistentSessionMemory } from "./persistent_memory.js";
 import {
   CommunicationManager,
   detectRepoRoot,
@@ -656,8 +658,16 @@ class RemoteBuddyOrchestrator {
   private brain: AgentBrain;
   /** Durable idempotency store — prevents replay-induced duplicates */
   private idempotency: IdempotencyStore;
+  /** Durable planning memory store for cross-session repo context */
+  private persistentMemory: SessionMemoryBackend;
   /** Recent session context for LLM (bounded ring buffer) */
   private recentContext: string[] = [];
+  private memoryEnabled = false;
+  private memoryIncludeCrossSession = true;
+  private memoryMaxRecallItems = 12;
+  private memoryMaxRecallChars = 2400;
+  private memoryMaxSummaryChars = 420;
+  private memoryRetentionDays = 30;
   private static readonly MAX_CONTEXT = 20;
   private static readonly MAX_CONTEXT_ENTRY_CHARS = 1200;
   private static readonly CHAT_CONTEXT_MAX = 8;
@@ -670,6 +680,7 @@ class RemoteBuddyOrchestrator {
     brain: AgentBrain;
     llm: LLMClient;
     idempotency: IdempotencyStore;
+    persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
   }) {
     this.server = opts.server;
@@ -677,6 +688,7 @@ class RemoteBuddyOrchestrator {
     this.authToken = opts.authToken;
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
+    this.persistentMemory = opts.persistentMemory;
     this.jobsDbPath = opts.jobsDbPath;
     const remoteCfg = CONFIG.remotebuddy;
     this.workerOnlineTtlMs = Math.max(1_000, remoteCfg.workerpalOnlineTtlMs);
@@ -705,9 +717,18 @@ class RemoteBuddyOrchestrator {
     this.executionBudgetNormalMs = Math.max(120_000, remoteCfg.executionBudgetNormalMs);
     this.executionBudgetBackgroundMs = Math.max(180_000, remoteCfg.executionBudgetBackgroundMs);
     this.finalizationBudgetMs = Math.max(30_000, remoteCfg.finalizationBudgetMs);
+    this.memoryEnabled = remoteCfg.memory.enabled;
+    this.memoryIncludeCrossSession = remoteCfg.memory.includeCrossSession;
+    this.memoryMaxRecallItems = Math.max(1, remoteCfg.memory.maxRecallItems);
+    this.memoryMaxRecallChars = Math.max(120, remoteCfg.memory.maxRecallChars);
+    this.memoryMaxSummaryChars = Math.max(64, remoteCfg.memory.maxSummaryChars);
+    this.memoryRetentionDays = Math.max(1, remoteCfg.memory.retentionDays);
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
+    if (this.memoryEnabled) {
+      this.persistentMemory.purgeExpired(this.memoryRetentionDays, this.repo);
+    }
     this.comm = new CommunicationManager({
       serverUrl: this.server,
       sessionId: this.sessionId,
@@ -732,6 +753,9 @@ class RemoteBuddyOrchestrator {
     );
     console.log(
       `[RemoteBuddy] Failure log fetch on job failures: ${this.fetchFailureLogsOnJobFailure ? "on" : "off"}`,
+    );
+    console.log(
+      `[RemoteBuddy] Persistent memory: ${this.memoryEnabled ? "on" : "off"} crossSession=${this.memoryIncludeCrossSession ? "on" : "off"} recallItems=${this.memoryMaxRecallItems} recallChars=${this.memoryMaxRecallChars} retentionDays=${this.memoryRetentionDays}`,
     );
   }
 
@@ -946,6 +970,10 @@ class RemoteBuddyOrchestrator {
 
           const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
           this.pushContext(failureLine);
+          this.rememberPersistentMemory(
+            "job_failed",
+            `Job ${jobId.slice(0, 8)} failed: ${toSingleLine(`${message}${detail ? ` (${detail})` : ""}`, 360)}`,
+          );
           console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
           void this.handleObservedJobFailure(envelope, jobId, message, detail);
           return;
@@ -963,6 +991,10 @@ class RemoteBuddyOrchestrator {
         this.seenJobCompletions.add(jobId);
 
         this.pushContext(`[job_completed ${jobId}] ${summary}`);
+        this.rememberPersistentMemory(
+          "job_completed",
+          `Job ${jobId.slice(0, 8)} completed: ${toSingleLine(summary, 360)}`,
+        );
         const shortJob = jobId.slice(0, 8);
         const clarificationQuestion = extractClarificationFromCompletionSummary(summary);
         const note = clarificationQuestion
@@ -1070,6 +1102,68 @@ class RemoteBuddyOrchestrator {
     return filtered
       .slice(-limit)
       .map((entry) => toSingleLine(entry, RemoteBuddyOrchestrator.CHAT_CONTEXT_ENTRY_CHARS));
+  }
+
+  private persistentPlanningContextSnapshot(priority: RequestPriority): string[] {
+    if (!this.memoryEnabled) return [];
+    const maxItems =
+      priority === "interactive"
+        ? Math.max(2, Math.min(this.memoryMaxRecallItems, 6))
+        : this.memoryMaxRecallItems;
+    try {
+      return this.persistentMemory.recallForPlanning({
+        repoRoot: this.repo,
+        sessionId: this.sessionId,
+        includeCurrentSession: true,
+        includeCrossSession: this.memoryIncludeCrossSession,
+        maxItems,
+        maxChars: this.memoryMaxRecallChars,
+      });
+    } catch (err) {
+      console.warn("[RemoteBuddy] Could not recall persistent planning memory:", err);
+      return [];
+    }
+  }
+
+  private rememberPersistentMemory(
+    kind: string,
+    summary: string,
+    requestId: string | null = null,
+  ): void {
+    if (!this.memoryEnabled) return;
+    try {
+      this.persistentMemory.remember(
+        {
+          repoRoot: this.repo,
+          sessionId: this.sessionId,
+          requestId,
+          kind,
+          summary,
+        },
+        {
+          maxSummaryChars: this.memoryMaxSummaryChars,
+          retentionDays: this.memoryRetentionDays,
+        },
+      );
+    } catch (err) {
+      console.warn("[RemoteBuddy] Could not persist planning memory:", err);
+    }
+  }
+
+  private buildPlanningContext(priority: RequestPriority): string[] {
+    const fromMemory = this.persistentPlanningContextSnapshot(priority);
+    const live = this.planningContextSnapshot(priority);
+    if (fromMemory.length === 0) return live;
+    const merged = [...fromMemory, ...live];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const entry of merged) {
+      const line = String(entry ?? "").trim();
+      if (!line || seen.has(line)) continue;
+      seen.add(line);
+      out.push(line);
+    }
+    return out;
   }
 
   private executionBudgetForPriority(priority: RequestPriority): number {
@@ -1368,7 +1462,12 @@ class RemoteBuddyOrchestrator {
             : 90_000,
     );
     const turnId = randomUUID();
-    const planningContext = this.planningContextSnapshot(priority);
+    const planningContext = this.buildPlanningContext(priority);
+    this.rememberPersistentMemory(
+      "request",
+      `priority=${priority} prompt=${toSingleLine(prompt, 520)}`,
+      requestId,
+    );
 
     try {
       console.log(
@@ -1400,6 +1499,11 @@ class RemoteBuddyOrchestrator {
         autonomyMetadata && autonomyMetadata.targetPaths.length > 0
           ? autonomyMetadata.targetPaths
           : plannerTargetPaths(plan, prompt);
+      this.rememberPersistentMemory(
+        "plan",
+        `intent=${plan.intent} worker=${plan.requires_worker ? "yes" : "no"} lane=${plan.lane} risk=${plan.risk_level} targets=${targetPaths.slice(0, 6).join(",") || "(none)"}`,
+        requestId,
+      );
       const targetPath = targetPaths[0];
       // forceWorker overrides "direct reply" short-circuit + planner requires_worker,
       // except for analysis intent from the engine — those fall through so the autonomous
@@ -1554,6 +1658,11 @@ class RemoteBuddyOrchestrator {
             },
           }),
         }).catch(() => {});
+        this.rememberPersistentMemory(
+          "decision",
+          `completed_without_worker intent=${plan.intent} lane=deterministic`,
+          requestId,
+        );
         return;
       }
 
@@ -1675,6 +1784,11 @@ class RemoteBuddyOrchestrator {
 
       const jobId = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
       if (jobId) {
+        this.rememberPersistentMemory(
+          "job_enqueued",
+          `job=${jobId.slice(0, 8)} lane=${lane} intent=${plan.intent} worker=${targetWorkerId ?? "queue"}`,
+          requestId,
+        );
         await this.sendCommand({
           type: "job_enqueued",
           payload: {
@@ -1702,6 +1816,12 @@ class RemoteBuddyOrchestrator {
           },
           turnId,
         });
+      } else {
+        this.rememberPersistentMemory(
+          "job_enqueue_failed",
+          `enqueue_failed lane=${lane} intent=${plan.intent}`,
+          requestId,
+        );
       }
 
       await fetch(`${this.server}/requests/${requestId}/complete`, {
@@ -1729,6 +1849,7 @@ class RemoteBuddyOrchestrator {
     } catch (err) {
       const message = `RemoteBuddy planning failed: ${toSingleLine(err, 220) || "unknown error"}`;
       console.error(`[RemoteBuddy] ${message}`);
+      this.rememberPersistentMemory("planning_failed", message, requestId);
       await this.comm.assistantMessage(message, { turnId, correlationId: requestId });
       await fetch(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
@@ -1825,6 +1946,11 @@ class RemoteBuddyOrchestrator {
       }
       this.jobsDb = null;
     }
+    try {
+      this.persistentMemory.close();
+    } catch {
+      // ignore close errors on shutdown
+    }
   }
 }
 
@@ -1877,7 +2003,19 @@ async function main() {
   const sharedDbPath = CONFIG.paths.sharedDbPath;
   const dbPath = CONFIG.paths.remotebuddyDbPath;
   const idempotency = new IdempotencyStore(dbPath);
+  const persistentMemory: SessionMemoryBackend = createSessionMemoryBackend(
+    CONFIG.remotebuddy.memory.enabled,
+    [
+      () => new PersistentSessionMemory(dbPath),
+      // Future memory systems can be appended here without touching orchestrator code.
+    ],
+  );
   console.log(`[RemoteBuddy] Idempotency store: ${dbPath}`);
+  console.log(
+    `[RemoteBuddy] Persistent memory backend: ${
+      CONFIG.remotebuddy.memory.enabled ? "composite(sqlite)" : "noop"
+    }`,
+  );
 
   let sessionId = opts.sessionId;
   console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
@@ -1902,6 +2040,7 @@ async function main() {
     brain,
     llm,
     idempotency,
+    persistentMemory,
     jobsDbPath: sharedDbPath,
   });
 

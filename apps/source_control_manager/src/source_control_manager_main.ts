@@ -3,6 +3,7 @@ import { isAbsolute, join, relative, resolve } from "path";
 import { mkdirSync } from "fs";
 import { CommunicationManager } from "../../../packages/shared/src/communication.js";
 import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
+import { resolveGitTokenForRemote } from "../../../packages/shared/src/git_backend.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { GitOps } from "./git";
@@ -459,10 +460,10 @@ async function tick(): Promise<void> {
             `Unable to resolve git remote URL for ${config.remote}: ${remoteUrlResult.stderr || remoteUrlResult.stdout}`,
           );
         }
-        const token = await resolveGitHubToken();
+        const token = await resolveGitAuthToken(remoteUrlResult.stdout.trim());
         if (!token) {
           throw new Error(
-            "No GitHub token available for individual PR creation (set PUSHPALS_GIT_TOKEN/GITHUB_TOKEN/GH_TOKEN).",
+            "No git provider token available for individual PR creation (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN).",
           );
         }
 
@@ -730,45 +731,13 @@ async function runGitCapture(args: string[], cwd = repoRoot): Promise<GitCmdResu
   }
 }
 
-async function runCommandCapture(cmd: string[], cwd = repoRoot): Promise<GitCmdResult> {
-  try {
-    const proc = Bun.spawn(cmd, {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      stdout: "",
-      stderr: String(err),
-      exitCode: 127,
-    };
-  }
-}
-
-async function resolveGitHubToken(): Promise<string> {
-  const configuredToken = (config.gitToken ?? "").trim();
-  if (configuredToken) return configuredToken;
-
-  // Fall back to GitHub CLI auth if available (e.g. gh auth login already done).
-  const ghToken = await runCommandCapture(["gh", "auth", "token"]);
-  if (ghToken.ok && ghToken.stdout) {
-    return ghToken.stdout;
-  }
-
-  return "";
+async function resolveGitAuthToken(remoteUrl: string): Promise<string> {
+  const resolved = await resolveGitTokenForRemote({
+    remoteUrl,
+    configuredToken: config.gitToken ?? "",
+    cwd: repoRoot,
+  });
+  return resolved.token;
 }
 
 async function resolveCommitSubject(commitSha: string): Promise<string> {
@@ -787,13 +756,6 @@ async function ensureMainPullRequest(completion: {
   prTitle?: string | null;
   prBody?: string | null;
 }) {
-  const token = await resolveGitHubToken();
-  if (!token) {
-    throw new Error(
-      "No GitHub token available for PR creation (set PUSHPALS_GIT_TOKEN/GITHUB_TOKEN/GH_TOKEN or configure git token in runtime env).",
-    );
-  }
-
   const remoteUrlResult = await runGitCapture(
     ["-C", config.repoPath, "remote", "get-url", config.remote],
     repoRoot,
@@ -803,6 +765,13 @@ async function ensureMainPullRequest(completion: {
       `Unable to resolve git remote URL for ${config.remote}: ${
         remoteUrlResult.stderr || remoteUrlResult.stdout
       }`,
+    );
+  }
+  const remoteUrl = remoteUrlResult.stdout.trim();
+  const token = await resolveGitAuthToken(remoteUrl);
+  if (!token) {
+    throw new Error(
+      "No git provider token available for PR creation (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN).",
     );
   }
 
@@ -829,7 +798,7 @@ async function ensureMainPullRequest(completion: {
 
   return ensureIntegrationPullRequest({
     token,
-    remoteUrl: remoteUrlResult.stdout.trim(),
+    remoteUrl,
     headBranch: config.mainBranch,
     baseBranch: prBaseBranch,
     title: prTitle,
@@ -985,21 +954,21 @@ async function main(): Promise<void> {
       repoRoot,
     );
     const remoteUrl = remoteUrlResult.ok ? remoteUrlResult.stdout.trim() : "";
-    const githubToken = await resolveGitHubToken();
+    const gitProviderToken = remoteUrl ? await resolveGitAuthToken(remoteUrl) : "";
 
     if (!remoteUrl) {
       console.warn(
         `[${ts()}] ReviewAgent enabled but could not resolve remote URL — polling disabled`,
       );
-    } else if (!githubToken) {
+    } else if (!gitProviderToken) {
       console.warn(
-        `[${ts()}] ReviewAgent enabled but no GitHub token found (set PUSHPALS_GIT_TOKEN/GITHUB_TOKEN/GH_TOKEN) — polling disabled`,
+        `[${ts()}] ReviewAgent enabled but no git provider token found (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN) — polling disabled`,
       );
     } else {
       const reviewAgent = new ReviewAgent(
         config.reviewAgent,
         config.serverUrl,
-        githubToken,
+        gitProviderToken,
         remoteUrl,
         (config.prBaseBranch || integrationBaseBranch).trim(),
         config.authToken,
@@ -1085,3 +1054,4 @@ main().catch((err) => {
   shutdown();
   process.exit(1);
 });
+

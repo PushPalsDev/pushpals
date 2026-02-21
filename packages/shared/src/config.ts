@@ -21,6 +21,10 @@ const DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 45_000;
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16_000;
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8_000;
 const DEFAULT_WORKERPALS_EXECUTOR_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
+const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
+const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
+const DEFAULT_REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS = 420;
+const DEFAULT_REMOTEBUDDY_MEMORY_RETENTION_DAYS = 30;
 
 export interface PushPalsLlmConfig {
   backend: string;
@@ -95,6 +99,14 @@ export interface PushPalsConfig {
     executionBudgetNormalMs: number;
     executionBudgetBackgroundMs: number;
     finalizationBudgetMs: number;
+    memory: {
+      enabled: boolean;
+      includeCrossSession: boolean;
+      maxRecallItems: number;
+      maxRecallChars: number;
+      maxSummaryChars: number;
+      retentionDays: number;
+    };
     autonomy: {
       enabled: boolean;
       tickIntervalMs: number;
@@ -649,6 +661,52 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       sessionId: "remotebuddy-dev",
     },
     sessionId,
+  );
+  const remoteMemoryNode = getObject(remoteNode, "memory");
+  const remoteMemoryEnabled =
+    parseBoolEnv("REMOTEBUDDY_MEMORY_ENABLED") ?? asBoolean(remoteMemoryNode.enabled, true);
+  const remoteMemoryIncludeCrossSession =
+    parseBoolEnv("REMOTEBUDDY_MEMORY_INCLUDE_CROSS_SESSION") ??
+    asBoolean(remoteMemoryNode.include_cross_session, true);
+  const remoteMemoryMaxRecallItems = Math.max(
+    1,
+    Math.min(
+      128,
+      asInt(
+        parseIntEnv("REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS") ?? remoteMemoryNode.max_recall_items,
+        DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS,
+      ),
+    ),
+  );
+  const remoteMemoryMaxRecallChars = Math.max(
+    120,
+    Math.min(
+      64_000,
+      asInt(
+        parseIntEnv("REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS") ?? remoteMemoryNode.max_recall_chars,
+        DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS,
+      ),
+    ),
+  );
+  const remoteMemoryMaxSummaryChars = Math.max(
+    64,
+    Math.min(
+      16_000,
+      asInt(
+        parseIntEnv("REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS") ?? remoteMemoryNode.max_summary_chars,
+        DEFAULT_REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS,
+      ),
+    ),
+  );
+  const remoteMemoryRetentionDays = Math.max(
+    1,
+    Math.min(
+      3650,
+      asInt(
+        parseIntEnv("REMOTEBUDDY_MEMORY_RETENTION_DAYS") ?? remoteMemoryNode.retention_days,
+        DEFAULT_REMOTEBUDDY_MEMORY_RETENTION_DAYS,
+      ),
+    ),
   );
   const remoteAutonomyNode = getObject(remoteNode, "autonomy");
   const remoteAutonomyReplayNode = getObject(remoteAutonomyNode, "replay");
@@ -1354,6 +1412,14 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
           120_000,
         ),
       ),
+      memory: {
+        enabled: remoteMemoryEnabled,
+        includeCrossSession: remoteMemoryIncludeCrossSession,
+        maxRecallItems: remoteMemoryMaxRecallItems,
+        maxRecallChars: remoteMemoryMaxRecallChars,
+        maxSummaryChars: remoteMemoryMaxSummaryChars,
+        retentionDays: remoteMemoryRetentionDays,
+      },
       autonomy: {
         enabled:
           parseBoolEnv("REMOTEBUDDY_AUTONOMY_ENABLED") ??

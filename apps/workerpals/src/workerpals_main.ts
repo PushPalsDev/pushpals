@@ -24,7 +24,12 @@ import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import { resolve } from "path";
-import { detectRepoRoot, loadPromptTemplate, loadPushPalsConfig } from "shared";
+import {
+  detectRepoRoot,
+  loadPromptTemplate,
+  loadPushPalsConfig,
+  resolveGitTokenForRemote,
+} from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
 import { Logger } from "./common/logger.js";
 import {
@@ -228,6 +233,31 @@ function parseArgs(): {
         ? Math.min(failureCooldownMs, 300_000)
         : 20_000,
   };
+}
+
+async function resolveGitRemoteUrl(repo: string, remote = "origin"): Promise<string> {
+  const result = await git(repo, ["remote", "get-url", remote]);
+  if (!result.ok) return "";
+  return String(result.stdout ?? "").trim();
+}
+
+async function resolveWorkerGitToken(repo: string, configuredToken: string | null): Promise<string> {
+  const remoteUrl = await resolveGitRemoteUrl(repo, "origin");
+  const resolved = await resolveGitTokenForRemote({
+    remoteUrl,
+    configuredToken: configuredToken ?? "",
+    cwd: repo,
+  });
+  if (resolved.token) {
+    console.log(
+      `[WorkerPals] Git auth: backend=${resolved.backend} host=${resolved.host || "unknown"} source=${resolved.source}`,
+    );
+  } else {
+    console.warn(
+      `[WorkerPals] Git auth token not found (backend=${resolved.backend}, host=${resolved.host || "unknown"}). Push-required jobs may fail.`,
+    );
+  }
+  return resolved.token;
 }
 
 async function runJob(
@@ -1193,6 +1223,7 @@ async function workerLoop(
 async function main(): Promise<void> {
   const opts = parseArgs();
   const llmConfig = workerLlmConfig(CONFIG);
+  opts.gitToken = await resolveWorkerGitToken(opts.repo, opts.gitToken);
 
   console.log(`[WorkerPals] PushPals WorkerPals Daemon (${opts.workerId})`);
   console.log(`[WorkerPals] Server: ${opts.server}`);

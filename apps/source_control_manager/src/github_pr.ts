@@ -317,6 +317,94 @@ export async function mergePullRequest(opts: {
   return data;
 }
 
+export interface PullRequestComment {
+  id: number;
+  body: string;
+  userLogin: string;
+  createdAt: string;
+  htmlUrl: string;
+}
+
+export async function listPullRequestComments(opts: {
+  token: string;
+  remoteUrl: string;
+  prNumber: number;
+  maxComments?: number;
+}): Promise<PullRequestComment[]> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const requested = Number.isFinite(opts.maxComments) ? Math.trunc(opts.maxComments ?? 0) : 0;
+  const perPage = Math.max(1, Math.min(100, requested > 0 ? requested : 20));
+  const issueUrl = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/issues/${opts.prNumber}/comments?sort=created&direction=desc&per_page=${perPage}`;
+  const issueResponse = await fetch(issueUrl, {
+    method: "GET",
+    headers: githubHeaders(opts.token),
+  });
+
+  if (!issueResponse.ok) {
+    const text = await issueResponse.text();
+    throw githubError(issueResponse.status, text);
+  }
+
+  const issueComments = (await issueResponse.json()) as Array<{
+    id?: unknown;
+    body?: unknown;
+    created_at?: unknown;
+    html_url?: unknown;
+    user?: { login?: unknown } | null;
+  }>;
+  const normalizedIssueComments = Array.isArray(issueComments)
+    ? issueComments
+    : [];
+
+  const reviewUrl = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}/comments?sort=created&direction=desc&per_page=${perPage}`;
+  let normalizedReviewComments: Array<{
+    id?: unknown;
+    body?: unknown;
+    created_at?: unknown;
+    html_url?: unknown;
+    user?: { login?: unknown } | null;
+  }> = [];
+  const reviewResponse = await fetch(reviewUrl, {
+    method: "GET",
+    headers: githubHeaders(opts.token),
+  });
+  if (reviewResponse.ok) {
+    const reviewComments = (await reviewResponse.json()) as Array<{
+      id?: unknown;
+      body?: unknown;
+      created_at?: unknown;
+      html_url?: unknown;
+      user?: { login?: unknown } | null;
+    }>;
+    normalizedReviewComments = Array.isArray(reviewComments) ? reviewComments : [];
+  }
+
+  return [...normalizedIssueComments, ...normalizedReviewComments]
+    .map((comment): PullRequestComment | null => {
+      const id = typeof comment.id === "number" ? comment.id : Number(comment.id);
+      if (!Number.isFinite(id)) return null;
+      const body = typeof comment.body === "string" ? comment.body : "";
+      const createdAt = typeof comment.created_at === "string" ? comment.created_at : "";
+      const htmlUrl = typeof comment.html_url === "string" ? comment.html_url : "";
+      const userLogin =
+        comment.user && typeof comment.user.login === "string" ? comment.user.login : "";
+      return {
+        id,
+        body,
+        userLogin,
+        createdAt,
+        htmlUrl,
+      };
+    })
+    .filter((comment): comment is PullRequestComment => !!comment)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, perPage);
+}
+
 export async function addPullRequestComment(opts: {
   token: string;
   remoteUrl: string;

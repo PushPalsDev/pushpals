@@ -4,11 +4,13 @@ import { basename, isAbsolute, join, resolve } from "path";
 import {
   addPullRequestComment,
   getCommitMessage,
+  listPullRequestComments,
   getPullRequestCommitMessage,
   getPullRequestDiff,
   listOpenPullRequests,
   mergePullRequest,
   type GitHubPR,
+  type PullRequestComment,
 } from "./github_pr";
 import type { ReviewAgentConfig as SourceControlManagerReviewAgentConfig } from "./config";
 
@@ -26,6 +28,7 @@ interface ReviewAgentDeps {
   getPullRequestDiff: typeof getPullRequestDiff;
   getCommitMessage: typeof getCommitMessage;
   getPullRequestCommitMessage: typeof getPullRequestCommitMessage;
+  listPullRequestComments: typeof listPullRequestComments;
   mergePullRequest: typeof mergePullRequest;
   addPullRequestComment: typeof addPullRequestComment;
   invokeCodexReview: (prompt: string, config: ReviewAgentConfig) => Promise<string>;
@@ -38,6 +41,9 @@ interface ReviewAgentDeps {
 
 const MAX_DIFF_BYTES = 150_000;
 const MAX_PR_RE_REVIEW_ENQUEUES = 500;
+const MAX_REVIEW_CONTEXT_COMMENTS = 8;
+const MAX_REVIEW_CONTEXT_COMMENT_CHARS = 320;
+const MAX_REVIEW_CONTEXT_TOTAL_CHARS = 3_000;
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
 const DEFAULT_WORKSPACE_ROOT = resolve(import.meta.dir, "..", "..", "..");
@@ -49,6 +55,7 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   getPullRequestDiff,
   getCommitMessage,
   getPullRequestCommitMessage,
+  listPullRequestComments,
   mergePullRequest,
   addPullRequestComment,
   invokeCodexReview,
@@ -411,6 +418,53 @@ function buildFallbackFixInstruction(pr: GitHubPR, verdict: ReviewVerdict): stri
   ].join("\n");
 }
 
+function normalizeCommentBody(body: string): string {
+  return body.replace(/\r\n/g, "\n").trim();
+}
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateText(value: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (value.length <= maxChars) return value;
+  if (maxChars <= 3) return value.slice(0, maxChars);
+  return `${value.slice(0, maxChars - 3).trimEnd()}...`;
+}
+
+export function buildReviewFeedbackContext(
+  comments: PullRequestComment[],
+  excludedBodies: string[] = [],
+): string[] {
+  const excluded = new Set(
+    excludedBodies.map((body) => normalizeCommentBody(body)).filter((body) => body.length > 0),
+  );
+  const lines: string[] = [];
+  let usedChars = 0;
+
+  for (const comment of comments) {
+    if (lines.length >= MAX_REVIEW_CONTEXT_COMMENTS) break;
+    const normalizedBody = normalizeCommentBody(comment.body);
+    if (!normalizedBody || excluded.has(normalizedBody)) continue;
+
+    const compactBody = truncateText(
+      collapseWhitespace(normalizedBody),
+      MAX_REVIEW_CONTEXT_COMMENT_CHARS,
+    );
+    if (!compactBody) continue;
+
+    const author = comment.userLogin.trim() ? `@${comment.userLogin.trim()}` : "unknown";
+    const line = `- ${author}: ${compactBody}`;
+    if (usedChars + line.length > MAX_REVIEW_CONTEXT_TOTAL_CHARS) break;
+    lines.push(line);
+    usedChars += line.length;
+  }
+
+  if (lines.length === 0) return [];
+  return ["Recent PR feedback comments:", ...lines];
+}
+
 function normalizeDiffPath(value: string): string | null {
   const trimmed = value.trim().replace(/^"+|"+$/g, "");
   if (!trimmed || trimmed === "/dev/null") return null;
@@ -751,12 +805,13 @@ export class ReviewAgent {
   }
 
   private async rejectPr(pr: GitHubPR, verdict: ReviewVerdict, diff: string): Promise<boolean> {
+    const rejectionComment = formatRejectionComment(verdict);
     try {
       await this.deps.addPullRequestComment({
         token: this.githubToken,
         remoteUrl: this.remoteUrl,
         prNumber: pr.number,
-        body: formatRejectionComment(verdict),
+        body: rejectionComment,
       });
     } catch (err: any) {
       this.deps.logWarn(
@@ -782,7 +837,9 @@ export class ReviewAgent {
       return true;
     }
 
-    const enqueued = await this.enqueueFixJob(pr, verdict, sessionId, jobId, diff);
+    const enqueued = await this.enqueueFixJob(pr, verdict, sessionId, jobId, diff, [
+      rejectionComment,
+    ]);
     if (enqueued) {
       const nextReReviewEnqueues = priorReReviewEnqueues + 1;
       this.reReviewEnqueueCounts.set(pr.number, nextReReviewEnqueues);
@@ -876,18 +933,40 @@ export class ReviewAgent {
     });
   }
 
+  private async getRecentFeedbackContext(
+    pr: GitHubPR,
+    excludedBodies: string[] = [],
+  ): Promise<string[]> {
+    try {
+      const comments = await this.deps.listPullRequestComments({
+        token: this.githubToken,
+        remoteUrl: this.remoteUrl,
+        prNumber: pr.number,
+        maxComments: MAX_REVIEW_CONTEXT_COMMENTS * 3,
+      });
+      return buildReviewFeedbackContext(comments, excludedBodies);
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Failed to load comments for PR #${pr.number}; continuing without PR feedback context: ${err?.message ?? err}`,
+      );
+      return [];
+    }
+  }
+
   private async enqueueFixJob(
     pr: GitHubPR,
     verdict: ReviewVerdict,
     sessionId: string,
     jobId: string | null,
     diff: string,
+    excludedBodies: string[] = [],
   ): Promise<boolean> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
     const issuesSummary = verdict.issues.length > 0 ? verdict.issues.join("; ") : "see summary";
     const fixInstruction = verdict.fix_instruction.trim() || buildFallbackFixInstruction(pr, verdict);
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
     const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
+    const feedbackContext = await this.getRecentFeedbackContext(pr, excludedBodies);
 
     const payload = {
       taskId,
@@ -901,6 +980,7 @@ export class ReviewAgent {
           `You are fixing PR #${pr.number} (${pr.html_url}) on branch ${pr.head.ref}.`,
           "The branch already exists on the remote. Checkout the branch, make required fixes, and push.",
           `Reviewer score was ${verdict.score.toFixed(1)}/10. Issues: ${issuesSummary}`,
+          ...feedbackContext,
         ],
         planning: {
           intent: "code_change",

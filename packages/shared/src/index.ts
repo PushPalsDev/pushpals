@@ -6,6 +6,16 @@ export { detectRepoRoot, getRepoContext } from "./repo.js";
 export { CommunicationManager, type CommunicationManagerOptions } from "./communication.js";
 export { loadPromptTemplate } from "./prompts.js";
 export {
+  inferGitBackendFromRemote,
+  parseGitRemoteHost,
+  resolveGitTokenForRemote,
+  type CommandCaptureResult,
+  type GitBackendId,
+  type GitTokenResolution,
+  type GitTokenSource,
+  type ResolveGitTokenOptions,
+} from "./git_backend.js";
+export {
   loadPushPalsConfig,
   type PushPalsConfig,
   type PushPalsLlmConfig,
