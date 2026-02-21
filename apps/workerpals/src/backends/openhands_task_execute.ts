@@ -10,7 +10,6 @@ import { existsSync } from "fs";
 import { resolve } from "path";
 import type { JobResult } from "../common/types.js";
 import type { WorkerpalsRuntimeConfig } from "../common/executor_backend.js";
-import { EXECUTOR_RESULT_PREFIX } from "../common/constants.js";
 import {
   truncate,
   streamLines,
@@ -200,6 +199,12 @@ export async function executeWithOpenHands(
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
   let stuckNudgeStartTimer: ReturnType<typeof setTimeout> | null = null;
   let stuckNudgeTimer: ReturnType<typeof setInterval> | null = null;
+  const outputPolicy = {
+    maxOutputChars: runtimeConfig.workerpals.outputMaxChars,
+    maxOutputLines: runtimeConfig.workerpals.outputMaxLines,
+    maxOutputHeadLines: runtimeConfig.workerpals.outputMaxHeadLines,
+    executorResultPrefix: runtimeConfig.workerpals.executorResultPrefix,
+  };
 
   try {
     const proc = Bun.spawn([pythonBin, scriptPath, payload], {
@@ -443,8 +448,8 @@ export async function executeWithOpenHands(
     stopStuckNudges();
     const exitCode = await proc.exited;
 
-    const parsed = parseStructuredResult(stdout);
-    const filteredStdout = filterResultLines(stdout);
+    const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
+    const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);
 
     if (!parsed) {
       if (timedOut) {
@@ -456,16 +461,16 @@ export async function executeWithOpenHands(
           summary: `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind} (effective limit: ${timeoutLimitSource}${
             extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
           }). Worker returned a timeout failure.${stuckNote}`,
-          stdout: truncate(filteredStdout),
-          stderr: truncate(stderr),
+          stdout: truncate(filteredStdout, outputPolicy),
+          stderr: truncate(stderr, outputPolicy),
           exitCode: exitCode === 0 ? 124 : exitCode,
         };
       }
       return {
         ok: false,
         summary: `OpenHands wrapper did not return a structured result for ${kind}`,
-        stdout: truncate(filteredStdout),
-        stderr: truncate(stderr),
+        stdout: truncate(filteredStdout, outputPolicy),
+        stderr: truncate(stderr, outputPolicy),
         exitCode,
       };
     }
@@ -494,8 +499,8 @@ export async function executeWithOpenHands(
         return {
           ok: true,
           summary: `OpenHands needs clarification: ${clarificationQuestion}`,
-          stdout: truncate(filteredStdout || String(parsedStdout ?? "")),
-          stderr: truncate(`Clarification needed: ${clarificationQuestion}`),
+          stdout: truncate(filteredStdout || String(parsedStdout ?? ""), outputPolicy),
+          stderr: truncate(`Clarification needed: ${clarificationQuestion}`, outputPolicy),
           exitCode: 0,
         };
       }
@@ -504,8 +509,8 @@ export async function executeWithOpenHands(
     return {
       ok: parsedOk,
       summary,
-      stdout: truncate(parsedStdout ?? ""),
-      stderr: truncate(parsedStderr ?? ""),
+      stdout: truncate(parsedStdout ?? "", outputPolicy),
+      stderr: truncate(parsedStderr ?? "", outputPolicy),
       exitCode: parsedExitCode,
     };
   } catch (err) {

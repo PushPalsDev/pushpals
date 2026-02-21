@@ -919,7 +919,7 @@ async function workerLoop(
             await logChain;
 
             let completionCommit: CommitRef | null = null;
-            if (result.ok && shouldCommit(job.kind)) {
+            if (result.ok && shouldCommit(job.kind, CONFIG)) {
               if (result.commit) {
                 if (result.commit.sha !== "no-changes") {
                   completionCommit = result.commit;

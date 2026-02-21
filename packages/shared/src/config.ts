@@ -11,6 +11,16 @@ const DEFAULT_CONFIG_DIR = "config";
 
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const FALSY = new Set(["0", "false", "no", "off"]);
+const DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE = 8;
+const DEFAULT_WORKERPALS_FILE_MODIFYING_JOBS = ["task.execute"];
+const DEFAULT_WORKERPALS_OUTPUT_MAX_CHARS = 192 * 1024;
+const DEFAULT_WORKERPALS_OUTPUT_MAX_LINES = 600;
+const DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES = 120;
+const DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180_000;
+const DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 45_000;
+const DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16_000;
+const DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8_000;
+const DEFAULT_WORKERPALS_EXECUTOR_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 
 export interface PushPalsLlmConfig {
   backend: string;
@@ -144,8 +154,18 @@ export interface PushPalsConfig {
     dockerNetworkMode: string;
     dockerWarmMemoryMb: number;
     dockerWarmCpus: number;
+    fileModifyingJobs: string[];
+    outputMaxChars: number;
+    outputMaxLines: number;
+    outputMaxHeadLines: number;
     qualityMaxAutoRevisions: number;
+    qualityValidationStepTimeoutMs: number;
+    qualityCriticTimeoutMs: number;
     qualitySoftPassOnExhausted: boolean;
+    qualityCriticMinScore: number;
+    qualityCriticMaxDiffChars: number;
+    qualityCriticMaxValidationOutputChars: number;
+    executorResultPrefix: string;
     baseRef: string;
     labels: string[];
     failureCooldownMs: number;
@@ -700,9 +720,116 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       ),
     ),
   );
+  const workerFileModifyingJobs = (() => {
+    const envRaw = firstNonEmpty(process.env.WORKERPALS_FILE_MODIFYING_JOBS);
+    const parsed = envRaw
+      ? envRaw
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+      : asStringArray(workerNode.file_modifying_jobs);
+    const out = parsed.length > 0 ? parsed : DEFAULT_WORKERPALS_FILE_MODIFYING_JOBS;
+    return [...new Set(out)];
+  })();
+  const workerOutputMaxChars = Math.max(
+    8_192,
+    Math.min(
+      4_194_304,
+      asInt(
+        parseIntEnv("WORKERPALS_OUTPUT_MAX_CHARS") ?? workerNode.output_max_chars,
+        DEFAULT_WORKERPALS_OUTPUT_MAX_CHARS,
+      ),
+    ),
+  );
+  const workerOutputMaxLines = Math.max(
+    50,
+    Math.min(
+      20_000,
+      asInt(
+        parseIntEnv("WORKERPALS_OUTPUT_MAX_LINES") ?? workerNode.output_max_lines,
+        DEFAULT_WORKERPALS_OUTPUT_MAX_LINES,
+      ),
+    ),
+  );
+  const workerOutputMaxHeadLines = Math.max(
+    1,
+    Math.min(
+      workerOutputMaxLines,
+      asInt(
+        parseIntEnv("WORKERPALS_OUTPUT_MAX_HEAD_LINES") ?? workerNode.output_max_head_lines,
+        DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES,
+      ),
+    ),
+  );
+  const workerQualityValidationStepTimeoutMs = Math.max(
+    1_000,
+    asInt(
+      parseIntEnv("WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS") ??
+        workerNode.quality_validation_step_timeout_ms,
+      DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS,
+    ),
+  );
+  const workerQualityCriticTimeoutMs = Math.max(
+    1_000,
+    asInt(
+      parseIntEnv("WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS") ??
+        workerNode.quality_critic_timeout_ms,
+      DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS,
+    ),
+  );
   const workerQualitySoftPassOnExhausted =
     parseBoolEnv("WORKERPALS_QUALITY_SOFT_PASS_ON_EXHAUSTED") ??
     asBoolean(workerNode.quality_soft_pass_on_exhausted, true);
+  const workerQualityCriticMinScore = (() => {
+    const configThresholdRaw =
+      workerNode.quality_critic_min_score == null
+        ? ""
+        : String(workerNode.quality_critic_min_score);
+    const raw = firstNonEmpty(
+      process.env.WORKERPALS_QUALITY_CRITIC_MIN_SCORE,
+      configThresholdRaw,
+      String(DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE),
+    );
+    const parsed = Number.parseFloat(raw);
+    if (!Number.isFinite(parsed)) return DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE;
+    return Math.max(0, Math.min(10, parsed));
+  })();
+  const workerQualityCriticMaxDiffChars = Math.max(
+    256,
+    Math.min(
+      524_288,
+      asInt(
+        parseIntEnv("WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS") ??
+          workerNode.quality_critic_max_diff_chars,
+        DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS,
+      ),
+    ),
+  );
+  const workerQualityCriticMaxValidationOutputChars = Math.max(
+    256,
+    Math.min(
+      524_288,
+      asInt(
+        parseIntEnv("WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS") ??
+          workerNode.quality_critic_max_validation_output_chars,
+        DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS,
+      ),
+    ),
+  );
+  const workerExecutorResultPrefix = (() => {
+    if (process.env.WORKERPALS_EXECUTOR_RESULT_PREFIX !== undefined) {
+      const raw = process.env.WORKERPALS_EXECUTOR_RESULT_PREFIX;
+      if (typeof raw === "string" && raw.length > 0) return raw;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(workerNode, "executor_result_prefix") &&
+      typeof workerNode.executor_result_prefix === "string" &&
+      workerNode.executor_result_prefix.length > 0
+    ) {
+      return workerNode.executor_result_prefix;
+    }
+    return DEFAULT_WORKERPALS_EXECUTOR_RESULT_PREFIX;
+  })();
   const workerOpenHandsStuckGuardEnabled =
     parseBoolEnv("WORKERPALS_OPENHANDS_STUCK_GUARD_ENABLED") ??
     asBoolean(workerNode.openhands_stuck_guard_enabled, true);
@@ -1418,8 +1545,18 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       dockerJobRetryBackoffMs: workerDockerJobRetryBackoffMs,
       dockerWarmMemoryMb: workerDockerWarmMemoryMb,
       dockerWarmCpus: workerDockerWarmCpus,
+      fileModifyingJobs: workerFileModifyingJobs,
+      outputMaxChars: workerOutputMaxChars,
+      outputMaxLines: workerOutputMaxLines,
+      outputMaxHeadLines: workerOutputMaxHeadLines,
       qualityMaxAutoRevisions: workerQualityMaxAutoRevisions,
+      qualityValidationStepTimeoutMs: workerQualityValidationStepTimeoutMs,
+      qualityCriticTimeoutMs: workerQualityCriticTimeoutMs,
       qualitySoftPassOnExhausted: workerQualitySoftPassOnExhausted,
+      qualityCriticMinScore: workerQualityCriticMinScore,
+      qualityCriticMaxDiffChars: workerQualityCriticMaxDiffChars,
+      qualityCriticMaxValidationOutputChars: workerQualityCriticMaxValidationOutputChars,
+      executorResultPrefix: workerExecutorResultPrefix,
       dockerNetworkMode: asString(
         process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? workerNode.docker_network_mode,
         "bridge",

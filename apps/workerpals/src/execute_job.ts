@@ -13,18 +13,9 @@ import {
   validateScopeInvariants,
   type AutonomyComponentArea,
 } from "shared";
-import {
-  FILE_MODIFYING_JOBS,
-  QUALITY_CRITIC_MAX_DIFF_CHARS,
-  QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS,
-  QUALITY_CRITIC_MIN_SCORE,
-  QUALITY_CRITIC_TIMEOUT_MS,
-  QUALITY_MAX_AUTO_REVISIONS,
-  QUALITY_VALIDATION_STEP_TIMEOUT_MS,
-} from "./common/constants.js";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { JobResult } from "./common/types.js";
-import { compactJobOutput, truncate } from "./common/execution_utils.js";
+import { compactJobOutput, truncate, type OutputCompactionPolicy } from "./common/execution_utils.js";
 // Re-export shared utilities for backward compatibility with external consumers.
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
@@ -85,8 +76,27 @@ interface CriticReview {
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
-export function shouldCommit(kind: string): boolean {
-  return FILE_MODIFYING_JOBS.has(kind);
+export function shouldCommit(
+  kind: string,
+  runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
+): boolean {
+  const configured = Array.isArray(runtimeConfig.workerpals.fileModifyingJobs)
+    ? runtimeConfig.workerpals.fileModifyingJobs
+    : [];
+  const fallback = ["task.execute"];
+  const jobs = configured.length > 0 ? configured : fallback;
+  return jobs.includes(kind);
+}
+
+function outputPolicyForRuntime(
+  runtimeConfig: WorkerpalsRuntimeConfig,
+): Partial<OutputCompactionPolicy> {
+  return {
+    maxOutputChars: runtimeConfig.workerpals.outputMaxChars,
+    maxOutputLines: runtimeConfig.workerpals.outputMaxLines,
+    maxOutputHeadLines: runtimeConfig.workerpals.outputMaxHeadLines,
+    executorResultPrefix: runtimeConfig.workerpals.executorResultPrefix,
+  };
 }
 
 function toSingleLine(value: unknown, max = 240): string {
@@ -218,6 +228,7 @@ async function runValidationCommand(
   repo: string,
   command: string,
   timeoutMs: number,
+  outputPolicy: Partial<OutputCompactionPolicy>,
 ): Promise<ValidationExecutionResult> {
   const argv = tokenizeValidationCommandArgv(command);
   if (!argv) {
@@ -263,8 +274,8 @@ async function runValidationCommand(
     command,
     ok: !timedOut && exitCode === 0,
     exitCode: timedOut ? 124 : exitCode,
-    stdout: compactJobOutput(stdout.trim()),
-    stderr: compactJobOutput(stderr.trim()),
+    stdout: compactJobOutput(stdout.trim(), outputPolicy),
+    stderr: compactJobOutput(stderr.trim(), outputPolicy),
     elapsedMs: Math.max(1, Date.now() - startedAt),
   };
 }
@@ -483,6 +494,7 @@ function hasBalancedPositiveNegativeAssertions(paths: string[], repo: string): b
 async function runDeterministicQualityGate(
   repo: string,
   params: Record<string, unknown>,
+  runtimeConfig: WorkerpalsRuntimeConfig,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<DeterministicQualityResult> {
   const instruction = String(params.instruction ?? "");
@@ -531,6 +543,12 @@ async function runDeterministicQualityGate(
       : [];
   const commandsToRun = runnableSteps.length > 0 ? runnableSteps : fallbackValidationSteps;
   const validationRuns: ValidationExecutionResult[] = [];
+  const outputPolicy = outputPolicyForRuntime(runtimeConfig);
+  const qualityValidationStepTimeoutMs = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityValidationStepTimeoutMs);
+    if (!Number.isFinite(value)) return 180_000;
+    return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
+  })();
   if (commandsToRun.length === 0) {
     issues.push(
       "No runnable validation command was provided in planning.validationSteps (expected at least one test command).",
@@ -547,7 +565,8 @@ async function runDeterministicQualityGate(
       const run = await runValidationCommand(
         repo,
         command,
-        QUALITY_VALIDATION_STEP_TIMEOUT_MS,
+        qualityValidationStepTimeoutMs,
+        outputPolicy,
       );
       validationRuns.push(run);
       const runSummary = `[QualityGate] Quality gate validation ${run.ok ? "passed" : "failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
@@ -604,14 +623,32 @@ async function runTaskCriticReview(
     const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
     diffText = diffResult.ok ? diffResult.stdout : diffResult.stderr;
   }
-  diffText = compactJobOutput(diffText).slice(0, QUALITY_CRITIC_MAX_DIFF_CHARS);
+  const qualityCriticMaxDiffChars = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityCriticMaxDiffChars);
+    if (!Number.isFinite(value)) return 16_000;
+    return Math.max(256, Math.min(524_288, Math.floor(value)));
+  })();
+  const qualityCriticMaxValidationOutputChars = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityCriticMaxValidationOutputChars);
+    if (!Number.isFinite(value)) return 8_000;
+    return Math.max(256, Math.min(524_288, Math.floor(value)));
+  })();
+  const qualityCriticTimeoutMs = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityCriticTimeoutMs);
+    if (!Number.isFinite(value)) return 45_000;
+    return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
+  })();
+  diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
+    0,
+    qualityCriticMaxDiffChars,
+  );
 
   const validationSummary = quality.validationRuns
     .map((run) => {
       const output = [run.stdout, run.stderr]
         .filter(Boolean)
         .join("\n")
-        .slice(0, QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS);
+        .slice(0, qualityCriticMaxValidationOutputChars);
       return [
         `Command: ${run.command}`,
         `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
@@ -661,7 +698,7 @@ async function runTaskCriticReview(
 
   const runCriticRequest = async (responseFormat: Record<string, unknown> | null) => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), QUALITY_CRITIC_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), qualityCriticTimeoutMs);
     try {
       const response = await fetch(endpoint, {
         method: "POST",
@@ -733,7 +770,7 @@ async function runTaskCriticReview(
       findings,
       mustFix,
       revisionGuidance,
-      raw: compactJobOutput(content),
+      raw: compactJobOutput(content, outputPolicyForRuntime(runtimeConfig)),
     };
   } catch (err) {
     onLog?.(
@@ -2147,7 +2184,7 @@ async function runCodexCriticReview(
   repo: string,
   params: Record<string, unknown>,
   quality: DeterministicQualityResult,
-  _runtimeConfig: WorkerpalsRuntimeConfig,
+  runtimeConfig: WorkerpalsRuntimeConfig,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<CriticReview | null> {
   const codexPrefix = await resolveCodexCommandPrefix(repo);
@@ -2161,11 +2198,26 @@ async function runCodexCriticReview(
 
   const changedForDiff = quality.changedPaths.slice(0, 8);
   let diffText = "";
+  const qualityCriticMaxDiffChars = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityCriticMaxDiffChars);
+    if (!Number.isFinite(value)) return 16_000;
+    return Math.max(256, Math.min(524_288, Math.floor(value)));
+  })();
+  const qualityCriticMaxValidationOutputChars = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityCriticMaxValidationOutputChars);
+    if (!Number.isFinite(value)) return 8_000;
+    return Math.max(256, Math.min(524_288, Math.floor(value)));
+  })();
+  const qualityCriticTimeoutMs = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityCriticTimeoutMs);
+    if (!Number.isFinite(value)) return 45_000;
+    return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
+  })();
   if (changedForDiff.length > 0) {
     const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
     diffText = (diffResult.ok ? diffResult.stdout : diffResult.stderr).slice(
       0,
-      QUALITY_CRITIC_MAX_DIFF_CHARS,
+      qualityCriticMaxDiffChars,
     );
   }
 
@@ -2174,7 +2226,7 @@ async function runCodexCriticReview(
       const output = [run.stdout, run.stderr]
         .filter(Boolean)
         .join("\n")
-        .slice(0, QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS);
+        .slice(0, qualityCriticMaxValidationOutputChars);
       return [`Command: ${run.command}`, `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode})`, output]
         .filter(Boolean)
         .join("\n");
@@ -2220,7 +2272,7 @@ async function runCodexCriticReview(
     const timer = setTimeout(() => {
       timedOut = true;
       try { proc.kill(); } catch { /* ignore */ }
-    }, QUALITY_CRITIC_TIMEOUT_MS);
+    }, qualityCriticTimeoutMs);
 
     const exitCode = await proc.exited;
     clearTimeout(timer);
@@ -2268,7 +2320,13 @@ async function runCodexCriticReview(
       : [];
     const revisionGuidance = String(reviewObj.revision_guidance ?? "").trim().slice(0, 2000);
     onLog?.("stdout", `[QualityGate] Codex critic score: ${score}/10`);
-    return { score, findings, mustFix, revisionGuidance, raw: compactJobOutput(lastMessage) };
+    return {
+      score,
+      findings,
+      mustFix,
+      revisionGuidance,
+      raw: compactJobOutput(lastMessage, outputPolicyForRuntime(runtimeConfig)),
+    };
   } catch (err) {
     onLog?.(
       "stderr",
@@ -2356,17 +2414,22 @@ export async function executeJob(
       10,
       Number.isFinite(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
         ? Math.floor(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
-        : QUALITY_MAX_AUTO_REVISIONS,
+        : 4,
     ),
   );
   const qualitySoftPassOnExhausted =
     typeof runtimeConfig.workerpals.qualitySoftPassOnExhausted === "boolean"
       ? runtimeConfig.workerpals.qualitySoftPassOnExhausted
       : true;
+  const qualityCriticMinScore = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityCriticMinScore);
+    if (!Number.isFinite(value)) return 8;
+    return Math.max(0, Math.min(10, value));
+  })();
 
   onLog?.(
     "stdout",
-    `[QualityGate] Policy: max_auto_revisions=${qualityMaxAutoRevisions}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}, critic_min_score=${QUALITY_CRITIC_MIN_SCORE}`,
+    `[QualityGate] Policy: max_auto_revisions=${qualityMaxAutoRevisions}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}, critic_min_score=${qualityCriticMinScore}`,
   );
 
   let revisionAttempt = 0;
@@ -2403,21 +2466,21 @@ export async function executeJob(
       onLog?.("stdout", `[TaskExecute] ${warning}`);
     }
 
-    const quality = await runDeterministicQualityGate(repo, attemptParams, onLog);
+    const quality = await runDeterministicQualityGate(repo, attemptParams, runtimeConfig, onLog);
     const critic = quality.skipped
       ? null
       : executor === "openai_codex"
         ? await runCodexCriticReview(repo, attemptParams, quality, runtimeConfig, onLog)
         : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
     const criticRequiresRevision = Boolean(
-      critic && (critic.score < QUALITY_CRITIC_MIN_SCORE || critic.mustFix.length > 0),
+      critic && (critic.score < qualityCriticMinScore || critic.mustFix.length > 0),
     );
 
     if (quality.ok && !criticRequiresRevision) {
       if (critic) {
         onLog?.(
           "stdout",
-          `[QualityGate] Critic review score ${critic.score.toFixed(1)}/10 (threshold ${QUALITY_CRITIC_MIN_SCORE}).`,
+          `[QualityGate] Critic review score ${critic.score.toFixed(1)}/10 (threshold ${qualityCriticMinScore}).`,
         );
       }
       return result;
@@ -2425,7 +2488,7 @@ export async function executeJob(
 
     const issues = [...quality.issues];
     if (criticRequiresRevision && critic) {
-      const scoreIssue = `Critic score ${critic.score.toFixed(1)} is below required threshold ${QUALITY_CRITIC_MIN_SCORE}.`;
+      const scoreIssue = `Critic score ${critic.score.toFixed(1)} is below required threshold ${qualityCriticMinScore}.`;
       issues.push(scoreIssue);
       for (const entry of critic.mustFix.slice(0, 8)) {
         issues.push(`Critic must-fix: ${entry}`);
@@ -2444,6 +2507,7 @@ export async function executeJob(
           ]
             .filter(Boolean)
             .join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
         );
         onLog?.(
           "stderr",
@@ -2476,6 +2540,7 @@ export async function executeJob(
           ]
             .filter(Boolean)
             .join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
         ),
         exitCode: 4,
       };

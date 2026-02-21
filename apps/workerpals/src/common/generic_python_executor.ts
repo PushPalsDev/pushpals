@@ -12,7 +12,6 @@ import { resolve } from "path";
 import type { JobResult } from "./types.js";
 import type { WorkerpalsRuntimeConfig } from "./executor_backend.js";
 import type { BackendTaskExecutor } from "../backends/types.js";
-import { EXECUTOR_RESULT_PREFIX } from "./constants.js";
 import {
   truncate,
   parseStructuredResult,
@@ -94,6 +93,12 @@ export function createGenericPythonExecutor(
     );
 
     try {
+      const outputPolicy = {
+        maxOutputChars: runtimeConfig.workerpals.outputMaxChars,
+        maxOutputLines: runtimeConfig.workerpals.outputMaxLines,
+        maxOutputHeadLines: runtimeConfig.workerpals.outputMaxHeadLines,
+        executorResultPrefix: runtimeConfig.workerpals.executorResultPrefix,
+      };
       const proc = Bun.spawn(args, {
         cwd: repo,
         stdout: "pipe",
@@ -133,7 +138,7 @@ export function createGenericPythonExecutor(
       const onProcessLine = (stream: "stdout" | "stderr", line: string) => {
         if (!line.trim()) return;
         sawProcessOutput = true;
-        if (stream === "stdout" && line.startsWith(EXECUTOR_RESULT_PREFIX)) {
+        if (stream === "stdout" && line.startsWith(outputPolicy.executorResultPrefix)) {
           return;
         }
         onLog?.(stream, line);
@@ -151,24 +156,24 @@ export function createGenericPythonExecutor(
       const stdout = rawStdout ?? "";
       const stderr = rawStderr ?? "";
 
-      const parsed = parseStructuredResult(stdout);
-      const filteredStdout = filterResultLines(stdout);
+      const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
+      const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);
 
       if (!parsed) {
         if (timedOut) {
           return {
             ok: false,
             summary: `${backendName} wrapper timed out after ${timeoutMs}ms for ${kind}`,
-            stdout: truncate(filteredStdout),
-            stderr: truncate(stderr),
+            stdout: truncate(filteredStdout, outputPolicy),
+            stderr: truncate(stderr, outputPolicy),
             exitCode: exitCode === 0 ? 124 : exitCode,
           };
         }
         return {
           ok: false,
           summary: `${backendName} wrapper did not return a structured result for ${kind}`,
-          stdout: truncate(filteredStdout),
-          stderr: truncate(stderr),
+          stdout: truncate(filteredStdout, outputPolicy),
+          stderr: truncate(stderr, outputPolicy),
           exitCode,
         };
       }
@@ -181,8 +186,14 @@ export function createGenericPythonExecutor(
             : exitCode === 0
               ? `${kind} passed via ${backendName}`
               : `${kind} failed via ${backendName} (exit ${exitCode})`,
-        stdout: truncate(typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout),
-        stderr: truncate(typeof parsed.stderr === "string" ? parsed.stderr : stderr),
+        stdout: truncate(
+          typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout,
+          outputPolicy,
+        ),
+        stderr: truncate(
+          typeof parsed.stderr === "string" ? parsed.stderr : stderr,
+          outputPolicy,
+        ),
         exitCode:
           typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
             ? parsed.exitCode

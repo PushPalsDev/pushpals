@@ -18,6 +18,8 @@
 import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
 import { loadPushPalsConfig } from "shared";
 
+const CONFIG = loadPushPalsConfig();
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 interface JobSpec {
@@ -51,7 +53,7 @@ function log(stream: "stdout" | "stderr", line: string): void {
 // ─── Git credentials setup ──────────────────────────────────────────────────
 
 function setupGitCredentials(): void {
-  const token = loadPushPalsConfig().gitToken ?? process.env.GIT_TOKEN ?? null;
+  const token = CONFIG.gitToken ?? process.env.GIT_TOKEN ?? null;
   if (!token) return;
   try {
     // Get the origin URL and rewrite it with the token
@@ -112,9 +114,15 @@ async function main(): Promise<void> {
   setupGitCredentials();
   // Execute inside the mounted job worktree (docker -w), not the baked image copy.
   const jobRepo = process.cwd();
-  const result = await executeJob(spec.kind, spec.params, jobRepo, (stream, line) => {
-    log(stream, line);
-  });
+  const result = await executeJob(
+    spec.kind,
+    spec.params,
+    jobRepo,
+    (stream, line) => {
+      log(stream, line);
+    },
+    CONFIG,
+  );
   // Build result object
   const jobResult: JobResult = {
     ok: result.ok,
@@ -124,15 +132,20 @@ async function main(): Promise<void> {
     exitCode: result.exitCode,
   };
   // Create commit for file-modifying jobs
-  if (result.ok && shouldCommit(spec.kind)) {
+  if (result.ok && shouldCommit(spec.kind, CONFIG)) {
     log("stdout", `[JobRunner] Job modified files, creating commit...`);
-    const commitResult = await createJobCommit(jobRepo, spec.workerId, {
-      id: spec.jobId,
-      taskId: spec.taskId,
-      kind: spec.kind,
-      params: spec.params,
-      context: "docker",
-    });
+    const commitResult = await createJobCommit(
+      jobRepo,
+      spec.workerId,
+      {
+        id: spec.jobId,
+        taskId: spec.taskId,
+        kind: spec.kind,
+        params: spec.params,
+        context: "docker",
+      },
+      CONFIG,
+    );
 
     if (commitResult.ok && commitResult.sha && commitResult.branch) {
       jobResult.commit = {
