@@ -478,8 +478,12 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     "dev",
   );
   const profileToml = parseTomlFile(join(configDir, `${preferredProfile}.toml`));
+  const localExampleToml = parseTomlFile(join(configDir, "local.example.toml"));
   const localToml = parseTomlFile(join(configDir, "local.toml"));
-  const merged = mergeDeep(mergeDeep(defaultToml, profileToml), localToml);
+  const merged = mergeDeep(
+    mergeDeep(mergeDeep(defaultToml, profileToml), localExampleToml),
+    localToml,
+  );
 
   const profile = firstNonEmpty(
     process.env.PUSHPALS_PROFILE,
@@ -981,9 +985,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     "prompts/review_agent/reviewer.md",
   );
   const scmReviewAgentPassThreshold = (() => {
+    const configThresholdRaw =
+      scmReviewAgentNode.pass_threshold == null ? "" : String(scmReviewAgentNode.pass_threshold);
     const raw = firstNonEmpty(
       process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_PASS_THRESHOLD,
-      asString(scmReviewAgentNode.pass_threshold, "9.5"),
+      configThresholdRaw,
       "9.5",
     );
     const parsed = Number.parseFloat(raw);
