@@ -11,6 +11,7 @@ import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
+import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
 import { createStatusServer } from "./http";
 import {
   loadConfig,
@@ -410,6 +411,7 @@ async function tick(): Promise<void> {
       await gitOps.pullMainFF();
       await gitOps.syncMainWithBaseBranch();
       await gitOps.createTempBranch(tempBranch);
+      let skipLocalApplyDueConflict = false;
 
       const applyResult =
         config.mergeStrategy === "cherry-pick"
@@ -427,20 +429,47 @@ async function tick(): Promise<void> {
             })();
 
       if (!applyResult.ok) {
-        throw new Error(`Apply failed: ${applyResult.stderr || applyResult.stdout}`);
+        if (
+          shouldBypassApplyFailureInReviewMode({
+            reviewAgentEnabled: config.reviewAgent.enabled,
+            mergeStrategy: config.mergeStrategy,
+            applyStdout: applyResult.stdout,
+            applyStderr: applyResult.stderr,
+          })
+        ) {
+          skipLocalApplyDueConflict = true;
+          const applyDetail = applyResult.stderr || applyResult.stdout;
+          console.warn(
+            `[${ts()}] ReviewAgent mode - cherry-pick conflict while applying ${completion.commitSha.slice(0, 8)}; continuing with PR flow from worker branch commit.`,
+          );
+          await emitPusherMessage(
+            comm,
+            `ReviewAgent mode: local apply conflicted (${completion.commitSha.slice(0, 8)}), so SourceControlManager continued with branch-based PR flow. Detail: ${applyDetail}`,
+            completion.id,
+          );
+          await gitOps.resetToClean();
+        } else {
+          throw new Error(`Apply failed: ${applyResult.stderr || applyResult.stdout}`);
+        }
       }
 
       // 4. Run checks
-      console.log(`[${ts()}] Running checks...`);
-      for (const check of config.checks) {
-        console.log(`[${ts()}]   - Running check: ${check.name}`);
-        const checkResult = await runCheck(config.repoPath, check);
+      if (skipLocalApplyDueConflict) {
+        console.warn(
+          `[${ts()}] Skipping local checks for ${completion.commitSha.slice(0, 8)} because ReviewAgent fallback bypassed temp-branch apply.`,
+        );
+      } else {
+        console.log(`[${ts()}] Running checks...`);
+        for (const check of config.checks) {
+          console.log(`[${ts()}]   - Running check: ${check.name}`);
+          const checkResult = await runCheck(config.repoPath, check);
 
-        if (!checkResult.ok) {
-          throw new Error(`Check "${check.name}" failed: ${checkResult.output}`);
+          if (!checkResult.ok) {
+            throw new Error(`Check "${check.name}" failed: ${checkResult.output}`);
+          }
+
+          console.log(`[${ts()}]   - Check passed: ${check.name}`);
         }
-
-        console.log(`[${ts()}]   ✓ Check passed: ${check.name}`);
       }
 
       // 5. Merge to main OR create individual PR (ReviewAgent mode)
@@ -471,11 +500,12 @@ async function tick(): Promise<void> {
         const resolvedHead = deriveReviewPrHeadBranch(completion.branch, completion.id);
         let prHeadBranch = resolvedHead.headBranch;
         if (resolvedHead.requiresMaterialize) {
+          const publishRef = skipLocalApplyDueConflict ? completion.commitSha : "HEAD";
           console.log(
             `[${ts()}] ReviewAgent mode - materializing hidden completion ref ${completion.branch} -> refs/heads/${prHeadBranch}`,
           );
           let pushResult = await runGitCapture(
-            ["-C", config.repoPath, "push", config.remote, `HEAD:refs/heads/${prHeadBranch}`],
+            ["-C", config.repoPath, "push", config.remote, `${publishRef}:refs/heads/${prHeadBranch}`],
             repoRoot,
           );
           if (!pushResult.ok) {
@@ -495,7 +525,7 @@ async function tick(): Promise<void> {
                   "push",
                   "--force-with-lease",
                   config.remote,
-                  `HEAD:refs/heads/${prHeadBranch}`,
+                  `${publishRef}:refs/heads/${prHeadBranch}`,
                 ],
                 repoRoot,
               );
@@ -615,7 +645,9 @@ async function tick(): Promise<void> {
       } else {
         console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
         const pushMessage = config.reviewAgent.enabled
-          ? `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.`
+          ? skipLocalApplyDueConflict
+            ? `Local apply/checks were bypassed for ${completion.commitSha.slice(0, 8)} due cherry-pick conflict; individual PR flow continued for ReviewAgent.`
+            : `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.`
           : config.pushMainAfterMerge
             ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.`
             : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
