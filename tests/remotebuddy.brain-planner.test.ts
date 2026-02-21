@@ -93,6 +93,40 @@ describe("RemoteBuddy AgentBrain planner", () => {
     expect(llm.calls[1]?.messages?.[0]?.content).toContain("Invalid planner output to repair");
   });
 
+  test("locally repairs near-JSON planner output without a second LLM call", async () => {
+    const llm = new MockLLMClient([
+      `{
+        \u201Cintent\u201D: \u201Ccode_change\u201D,
+        \u201Crequires_worker\u201D: true,
+        \u201Cjob_kind\u201D: \u201Ctask.execute\u201D,
+        \u201Clane\u201D: \u201Cworker\u201D,
+        \u201Cscope\u201D: {
+          \u201Cread_anywhere\u201D: true,
+          \u201Cwrite_allowed\u201D: true,
+          \u201Cwrite_globs\u201D: [\u201Capps/localbuddy/tests/request_status.test.ts\u201D,],
+        },
+        \u201Cdiscovery\u201D: {
+          \u201Cripgrep_queries\u201D: [\u201Crequest status\u201D,],
+        },
+        \u201Cacceptance_criteria\u201D: [\u201CAdd one more LocalBuddy test case.\u201D,],
+        \u201Cvalidation_steps\u201D: [\u201Cbun --cwd apps/localbuddy test\u201D,],
+        \u201Crisk_level\u201D: \u201Cmedium\u201D,
+        \u201Cassistant_message\u201D: \u201CDelegating to worker.\u201D,
+        \u201Cworker_instruction\u201D: \u201CAdd one more LocalBuddy test case.\u201D,
+        \u201Cuser_message\u201D: \u201Cadd one more test for localbuddy\u201D,
+      }`,
+    ]);
+    const brain = new AgentBrain(llm);
+
+    const plan = await brain.think("add one more test for localbuddy");
+
+    expect(plan.intent).toBe("code_change");
+    expect(plan.requires_worker).toBe(true);
+    expect(plan.scope.write_globs).toEqual(["apps/localbuddy/tests/request_status.test.ts"]);
+    expect(plan.validation_steps).toEqual(["bun --cwd apps/localbuddy test"]);
+    expect(llm.calls.length).toBe(1);
+  });
+
   test("falls back worker_instruction to user text when missing", async () => {
     const userText = "please inspect the queue and apply a minimal fix";
     const llm = new MockLLMClient([

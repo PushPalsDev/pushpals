@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildWorkerCommitMessage,
   buildCommitMessageGeneratorUserMessage,
   isTestLikeValidationStep,
+  parseChangedPathsFromNameOnlyOutput,
   sanitizeGeneratedCommitMessage,
 } from "../apps/workerpals/src/execute_job";
 
@@ -115,5 +117,41 @@ describe("workerpals commit message generation helpers", () => {
     ].join("\n");
 
     expect(sanitizeGeneratedCommitMessage(content, "fix", "workerpals")).toBeNull();
+  });
+
+  test("parses changed paths from git name-only output without '.' or duplicates", () => {
+    const parsed = parseChangedPathsFromNameOnlyOutput([
+      ".",
+      "apps/localbuddy/src/request_status.ts",
+      "apps/localbuddy/src/request_status.ts",
+      "wiki/05-localbuddy.md",
+      "",
+    ].join("\n"));
+
+    expect(parsed).toEqual(["apps/localbuddy/src/request_status.ts", "wiki/05-localbuddy.md"]);
+  });
+
+  test("deterministic fallback commit message uses changed paths over instruction text", () => {
+    const message = buildWorkerCommitMessage(
+      "workerpal-test",
+      {
+        id: "job-1",
+        taskId: "task-1",
+        kind: "task.execute",
+        params: {
+          instruction: "can you add 1 more test case for localbuddy",
+          targetPath: ".",
+          validationSteps: ["bun --cwd apps/localbuddy test"],
+        },
+      },
+      ["apps/localbuddy/src/request_status.ts", "apps/localbuddy/tests/request_status.test.ts"],
+    );
+
+    expect(message).toContain("feat(local_agent): update localbuddy implementation and test coverage");
+    expect(message).toContain("- update apps/localbuddy/src/request_status.ts");
+    expect(message).toContain("- add or update tests in apps/localbuddy/tests/request_status.test.ts");
+    expect(message).toContain("Tests:\n- bun --cwd apps/localbuddy test");
+    expect(message).not.toContain("updated path: .");
+    expect(message).not.toContain("can you add 1 more test case for localbuddy");
   });
 });

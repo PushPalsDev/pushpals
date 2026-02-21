@@ -168,6 +168,19 @@ function parseStructuredJson(text: string): unknown {
   }
 }
 
+function normalizeJsonLikeText(input: string): string {
+  return input
+    .replace(/\uFEFF/g, "")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/,\s*([}\]])/g, "$1");
+}
+
+function parseStructuredJsonWithLocalRepair(text: string): unknown {
+  const repaired = normalizeJsonLikeText(text);
+  return parseStructuredJson(repaired);
+}
+
 function asIntent(value: unknown): PlannerIntent {
   const text = String(value ?? "")
     .trim()
@@ -516,8 +529,21 @@ export class AgentBrain {
       const plan = sanitizePlannerOutput(parsed, userText);
       return applyOverrides(plan, overrides);
     } catch (primaryErr) {
+      try {
+        const repairedParsed = parseStructuredJsonWithLocalRepair(primaryRaw);
+        console.warn(
+          `[Brain] Primary planner JSON was invalid; local deterministic repair succeeded (${String(primaryErr)}).`,
+        );
+        const plan = sanitizePlannerOutput(repairedParsed, userText);
+        return applyOverrides(plan, overrides);
+      } catch (localRepairErr) {
+        console.warn(
+          `[Brain] Primary planner JSON was invalid; local repair failed, sending to LLM strict repair (${String(localRepairErr)}).`,
+        );
+      }
+
       console.warn(
-        `[Brain] Invalid planner JSON; attempting strict repair (${String(primaryErr)}).`,
+        `[Brain] Invalid planner JSON; attempting strict repair via LLM (${String(primaryErr)}).`,
       );
       const repairMessages: LLMMessage[] = [
         {

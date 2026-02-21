@@ -831,6 +831,54 @@ function toStringArray(value: unknown): string[] {
     .filter((entry): entry is string => Boolean(entry));
 }
 
+function normalizeChangedPathForCommit(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  let path = value.trim();
+  if (!path) return null;
+
+  if (
+    (path.startsWith('"') && path.endsWith('"')) ||
+    (path.startsWith("'") && path.endsWith("'"))
+  ) {
+    path = path.slice(1, -1).trim();
+  }
+
+  // Git may emit escaped spaces in some contexts.
+  path = path.replace(/\\ /g, " ").replace(/\\/g, "/");
+
+  if (path === "." || path === "/repo" || path === "/workspace") return null;
+  if (path.startsWith("/repo/")) path = path.slice("/repo/".length);
+  else if (path.startsWith("/workspace/")) path = path.slice("/workspace/".length);
+  else if (path.startsWith("/")) return null;
+  if (/^[A-Za-z]:[\\/]/.test(path)) return null;
+
+  path = path
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/")
+    .trim();
+  if (!path || path === ".") return null;
+
+  const segments = path.split("/");
+  for (const segment of segments) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") return null;
+  }
+
+  return path;
+}
+
+export function parseChangedPathsFromNameOnlyOutput(output: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of output.split(/\r?\n/)) {
+    const path = normalizeChangedPathForCommit(raw);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+  }
+  return out;
+}
+
 function summarizeRecentJobsForDoc(value: unknown, limit = 6): string[] {
   if (!Array.isArray(value)) return [];
   const out: string[] = [];
@@ -1045,21 +1093,30 @@ export async function createJobCommit(
     // Generate commit message from actual staged diff; fall back to deterministic.
     const cachedDiff = await git(repo, ["diff", "--cached"]);
     const diff = cachedDiff.ok ? cachedDiff.stdout : "";
+    const cachedNameOnly = await git(repo, ["diff", "--cached", "--name-only"]);
+    const changedPaths = cachedNameOnly.ok
+      ? parseChangedPathsFromNameOnlyOutput(cachedNameOnly.stdout)
+      : [];
     const jobPlanning = job.params?.planning as Record<string, unknown> | undefined;
     const jobValidationSteps = toNonEmptyStringArray(
       jobPlanning?.validationSteps ?? job.params?.validationSteps,
     );
-    const commitMsg =
-      (await generateCommitMessageFromDiff(
-        diff,
-        {
-          instruction: String(job.params?.instruction ?? ""),
-          type: normalizeCommitType(job.kind, job.params),
-          area: inferCommitArea(job.kind, job.params),
-          validationSteps: jobValidationSteps,
-        },
-        runtimeConfig,
-      ).catch(() => null)) ?? buildWorkerCommitMessage(workerId, job);
+    const llmCommitMsg = await generateCommitMessageFromDiff(
+      diff,
+      {
+        instruction: String(job.params?.instruction ?? ""),
+        type: normalizeCommitType(job.kind, job.params),
+        area: inferCommitArea(job.kind, job.params, changedPaths),
+        validationSteps: jobValidationSteps,
+      },
+      runtimeConfig,
+    ).catch(() => null);
+    if (!llmCommitMsg) {
+      console.warn(
+        `[WorkerPals] Commit message generator unavailable for job ${job.id}; using deterministic fallback.`,
+      );
+    }
+    const commitMsg = llmCommitMsg ?? buildWorkerCommitMessage(workerId, job, changedPaths);
 
     // Commit changes
     result = await git(repo, ["commit", "-m", commitMsg]);
@@ -1235,11 +1292,16 @@ function normalizeCommitArea(raw: string): string {
   return cleaned || "worker";
 }
 
-function inferCommitArea(kind: string, params?: Record<string, unknown>): string {
+function inferCommitArea(
+  kind: string,
+  params?: Record<string, unknown>,
+  changedPaths: string[] = [],
+): string {
   const explicit = String(params?.area ?? params?.scope ?? params?.component ?? "").trim();
   if (explicit) return normalizeCommitArea(explicit);
 
-  const targets = buildStageTargets(kind, params);
+  const targets =
+    changedPaths.length > 0 ? changedPaths : buildStageTargets(kind, params).filter((p) => p !== ".");
   const pick = (prefix: string): boolean =>
     targets.some((path) => path.toLowerCase().startsWith(prefix.toLowerCase()));
 
@@ -1254,26 +1316,71 @@ function inferCommitArea(kind: string, params?: Record<string, unknown>): string
   return "worker";
 }
 
-function summarizeScope(kind: string, params?: Record<string, unknown>): string {
-  const targets = buildStageTargets(kind, params);
+function summarizeScope(
+  kind: string,
+  params?: Record<string, unknown>,
+  changedPaths: string[] = [],
+): string {
+  const targets =
+    changedPaths.length > 0 ? changedPaths : buildStageTargets(kind, params).filter((p) => p !== ".");
   if (targets.length === 0) return "repository-level changes";
   const visible = targets.slice(0, 3).join(", ");
   return targets.length > 3 ? `${visible}, +${targets.length - 3} more` : visible;
 }
 
-function deriveSummary(action: string, params?: Record<string, unknown>): string {
+function isDocPath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return (
+    lower.startsWith("docs/") ||
+    lower.startsWith("wiki/") ||
+    lower === "readme.md" ||
+    lower.endsWith(".md")
+  );
+}
+
+function isTestPath(path: string): boolean {
+  return /(?:^|[/\\])tests?[/\\]|\.test\.[a-z0-9]+$|\.spec\.[a-z0-9]+$/i.test(path);
+}
+
+function humanizeCommitArea(area: string): string {
+  switch (area) {
+    case "local_agent":
+      return "localbuddy";
+    case "remote_agent":
+      return "remotebuddy";
+    case "source_control_manager":
+      return "source control manager";
+    default:
+      return area.replace(/_/g, " ");
+  }
+}
+
+function deriveSummary(
+  action: string,
+  params?: Record<string, unknown>,
+  changedPaths: string[] = [],
+  areaHint = "worker",
+): string {
   const explicit = sanitizeCommitValue(params?.commitSummary, 72);
   if (explicit) return explicit;
 
-  // For task.execute, derive a meaningful summary from the instruction before
-  // falling back to the generic action string ("execute apps/localbuddy").
-  if (params) {
-    const instrRaw = String(params.instruction ?? "").trim();
-    if (instrRaw) {
-      // Use first sentence/line of instruction (up to 72 chars).
-      const firstLine = instrRaw.split(/[\n.!?]/)[0]?.trim() ?? instrRaw;
-      const instrSummary = sanitizeCommitValue(firstLine || instrRaw, 72);
-      if (instrSummary && instrSummary !== action) return instrSummary;
+  if (changedPaths.length > 0) {
+    const label = humanizeCommitArea(areaHint);
+    const testCount = changedPaths.filter(isTestPath).length;
+    const docCount = changedPaths.filter(isDocPath).length;
+    const codeCount = changedPaths.length - testCount - docCount;
+
+    if (testCount > 0 && codeCount === 0 && docCount === 0) {
+      return sanitizeCommitValue(`expand ${label} test coverage`, 72);
+    }
+    if (docCount > 0 && codeCount === 0 && testCount === 0) {
+      return sanitizeCommitValue(`update ${label} documentation`, 72);
+    }
+    if (testCount > 0 && codeCount > 0) {
+      return sanitizeCommitValue(`update ${label} implementation and test coverage`, 72);
+    }
+    if (codeCount > 0) {
+      return sanitizeCommitValue(`update ${label} implementation`, 72);
     }
   }
 
@@ -1289,7 +1396,29 @@ function isBoilerplateCriterion(criterion: string): boolean {
   );
 }
 
-function buildImplementationPoints(kind: string, params?: Record<string, unknown>): string {
+function buildChangedPathImplementationPoints(changedPaths: string[]): string {
+  if (changedPaths.length === 0) return "";
+  const lines: string[] = [];
+  for (const path of changedPaths.slice(0, 6)) {
+    if (isTestPath(path)) {
+      lines.push(`- add or update tests in ${sanitizeCommitValue(path, 220)}`);
+    } else if (isDocPath(path)) {
+      lines.push(`- update documentation in ${sanitizeCommitValue(path, 220)}`);
+    } else {
+      lines.push(`- update ${sanitizeCommitValue(path, 220)}`);
+    }
+  }
+  if (changedPaths.length > 6) {
+    lines.push(`- update +${changedPaths.length - 6} additional file(s)`);
+  }
+  return lines.join("\n");
+}
+
+function buildImplementationPoints(
+  kind: string,
+  params?: Record<string, unknown>,
+  changedPaths: string[] = [],
+): string {
   // 1. Explicit commit points take highest priority (set by dispatcher or worker).
   const explicitPoints = toNonEmptyStringArray(
     params?.commitPoints ?? params?.changeDetails ?? params?.implementationPoints,
@@ -1317,15 +1446,19 @@ function buildImplementationPoints(kind: string, params?: Record<string, unknown
       .join("\n");
   }
 
-  // 3. Fall back to staged file paths.
-  const targets = buildStageTargets(kind, params);
+  // 3. Use actual changed file paths when available.
+  const fromChangedPaths = buildChangedPathImplementationPoints(changedPaths);
+  if (fromChangedPaths) return fromChangedPaths;
+
+  // 4. Fall back to staged target hints.
+  const targets = buildStageTargets(kind, params).filter((target) => target !== ".");
   if (targets.length === 0) return "";
   const lines: string[] = [];
   for (const target of targets.slice(0, 5)) {
-    lines.push(`- updated path: ${sanitizeCommitValue(target, 220)}`);
+    lines.push(`- update ${sanitizeCommitValue(target, 220)}`);
   }
   if (targets.length > 5) {
-    lines.push(`- updated path: +${targets.length - 5} additional file(s)`);
+    lines.push(`- update +${targets.length - 5} additional file(s)`);
   }
   return lines.join("\n");
 }
@@ -1442,10 +1575,11 @@ function buildCommitMetaBlock(
     context: string;
     session_line: string;
   },
+  changedPaths: string[] = [],
 ): string {
   const lines = [
     "Meta:",
-    `- scope: ${sanitizeCommitValue(summarizeScope(kind, params), 220)}`,
+    `- scope: ${sanitizeCommitValue(summarizeScope(kind, params, changedPaths), 220)}`,
     `- job kind: ${sanitizeCommitValue(kind, 64)}`,
     `- traceability: worker ${replacements.worker_id}, task ${replacements.task_id}, job ${replacements.job_id}`,
     `- execution context: ${replacements.context}`,
@@ -1611,7 +1745,7 @@ export function sanitizeGeneratedCommitMessage(
   return clean;
 }
 
-function buildWorkerCommitMessage(
+export function buildWorkerCommitMessage(
   workerId: string,
   job: {
     id: string;
@@ -1621,13 +1755,15 @@ function buildWorkerCommitMessage(
     sessionId?: string;
     context?: "host" | "docker";
   },
+  changedPaths: string[] = [],
 ): string {
+  const normalizedChangedPaths = parseChangedPathsFromNameOnlyOutput(changedPaths.join("\n"));
   const action = summarizeJobAction(job.kind, job.params);
   const type = normalizeCommitType(job.kind, job.params);
-  const area = inferCommitArea(job.kind, job.params);
-  const summary = deriveSummary(action, job.params);
+  const area = inferCommitArea(job.kind, job.params, normalizedChangedPaths);
+  const summary = deriveSummary(action, job.params, normalizedChangedPaths, area);
   const implementationPoints =
-    buildImplementationPoints(job.kind, job.params) ||
+    buildImplementationPoints(job.kind, job.params, normalizedChangedPaths) ||
     `- ${sanitizeCommitValue(action, 220) || "apply requested repository update"}`;
   const testsBlock = buildCommitTestsBlock(job.params);
   const lines: string[] = [
@@ -1648,7 +1784,7 @@ function buildWorkerCommitMessage(
         job_id: sanitizeCommitValue(job.id, 128),
         context: contextValue || "host",
         session_line: sessionValue ? `- session: ${sessionValue}` : "",
-      }),
+      }, normalizedChangedPaths),
     );
   }
   return lines.join("\n");
