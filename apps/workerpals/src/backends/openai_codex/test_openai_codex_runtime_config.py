@@ -9,7 +9,13 @@ for path in (_HERE, _SHARED):
         sys.path.insert(0, str(path))
 
 from executor_base import SettingsResolver
-from openai_codex_executor import OpenAICodexRuntimeConfig
+from openai_codex_executor import (
+    OpenAICodexRuntimeConfig,
+    _build_instruction,
+    _detect_codex_workaround_signal,
+    _load_prompt_template,
+    _repo_root_for_prompt_loading,
+)
 
 
 class OpenAICodexRuntimeConfigTests(unittest.TestCase):
@@ -50,6 +56,41 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.sandbox, "workspace-write")
         self.assertEqual(cfg.color, "never")
         self.assertFalse(cfg.json_output)
+
+    def test_build_instruction_includes_codex_runtime_invariants(self) -> None:
+        prompt = _build_instruction("Add two tests for localbuddy", [])
+        self.assertIn("Codex CLI is required infrastructure", prompt)
+        self.assertIn("Canonical task instruction", prompt)
+        self.assertIn("Add two tests for localbuddy", prompt)
+
+    def test_build_instruction_appends_supplemental_guidance(self) -> None:
+        prompt = _build_instruction(
+            "Fix flaky request-status tests",
+            ["Keep assertions strict", "Run bun test tests/localbuddy.request-status.test.ts"],
+        )
+        self.assertIn("Supplemental execution guidance", prompt)
+        self.assertIn("Keep assertions strict", prompt)
+        self.assertIn("bun test tests/localbuddy.request-status.test.ts", prompt)
+
+    def test_detects_codex_workaround_signals(self) -> None:
+        signal = _detect_codex_workaround_signal(
+            "Adapting test to avoid external Codex calls because Codex CLI isn't available in this environment.",
+        )
+        self.assertIsNotNone(signal)
+
+    def test_ignores_normal_codex_status_messages(self) -> None:
+        signal = _detect_codex_workaround_signal(
+            "Codex CLI login status is ready and task execution can proceed.",
+        )
+        self.assertIsNone(signal)
+
+    def test_discovers_repo_root_for_prompt_loading(self) -> None:
+        repo_root = _repo_root_for_prompt_loading()
+        self.assertTrue((repo_root / "prompts").is_dir())
+
+    def test_loads_openai_codex_task_prompt_template(self) -> None:
+        template = _load_prompt_template("workerpals/openai_codex_task_execute_system_prompt.md")
+        self.assertIn("Codex CLI is required infrastructure", template)
 
 
 if __name__ == "__main__":

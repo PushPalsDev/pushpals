@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from shutil import which
 import shlex
 import signal
@@ -45,6 +46,19 @@ DEFAULT_CODEX_MODEL = "gpt-5-codex"
 _ACTIVE_CHILD: Optional[subprocess.Popen[str]] = None
 _INTERRUPTED_SIGNAL: Optional[int] = None
 log = Logger(LOG_PREFIX)
+
+_PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
+_DEFAULT_TASK_SYSTEM_PROMPT = (
+    "You are PushPals WorkerPal running via the OpenAI Codex CLI backend.\n"
+    "Codex CLI is required infrastructure in this environment.\n"
+    "Do not modify tests or product code to bypass, stub, or avoid Codex CLI usage due to assumed environment limits.\n"
+    "If Codex CLI auth/execution is unavailable, fail loudly with a clear error and stop; do not apply non-Codex workarounds."
+)
+_CODEX_WORKAROUND_PATTERNS = (
+    re.compile(r"\bcodex cli\b.{0,120}\b(isn't|is not|not)\b.{0,120}\bavailable\b", re.IGNORECASE),
+    re.compile(r"\bwithout requiring\b.{0,120}\bcodex\b", re.IGNORECASE),
+    re.compile(r"\bavoid(?:ing)?\b.{0,120}\bcodex\b.{0,120}\bcall", re.IGNORECASE),
+)
 
 _VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
 _VALID_SANDBOX_POLICIES = {"read-only", "workspace-write", "danger-full-access"}
@@ -156,6 +170,33 @@ def _truncate(text: str, max_chars: int = 4000) -> str:
     if len(value) <= max_chars:
         return value
     return value[: max(1, max_chars - 15)] + "\n...[truncated]"
+
+
+def _repo_root_for_prompt_loading() -> Path:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "prompts").is_dir():
+            return parent
+    # Fallback to historical layout depth if prompts/ cannot be discovered.
+    return current.parents[5]
+
+
+def _resolve_prompt_file(relative_path: str) -> Path:
+    return _repo_root_for_prompt_loading() / "prompts" / relative_path
+
+
+def _load_prompt_template(relative_path: str) -> str:
+    prompt_path = _resolve_prompt_file(relative_path)
+    cache_key = str(prompt_path)
+    cached = _PROMPT_TEMPLATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        template = prompt_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        template = ""
+    _PROMPT_TEMPLATE_CACHE[cache_key] = template
+    return template
 
 
 def _to_positive_int(raw: str) -> Optional[int]:
@@ -656,11 +697,33 @@ def _safe_model_for_codex(raw_model: str, base_url: str) -> str:
 
 
 def _build_instruction(instruction: str, supplemental_guidance: List[str]) -> str:
+    system_prompt = (
+        _load_prompt_template("workerpals/openai_codex_task_execute_system_prompt.md")
+        or _DEFAULT_TASK_SYSTEM_PROMPT
+    ).strip()
+    lines = [
+        system_prompt,
+        "",
+        "Canonical task instruction (do not change user intent):",
+        instruction,
+    ]
     if not supplemental_guidance:
-        return instruction
-    lines = [instruction, "", "Supplemental execution guidance (do not change canonical user intent):"]
+        return "\n".join(lines).strip()
+    lines.extend(["", "Supplemental execution guidance (do not change canonical user intent):"])
     lines.extend(str(item).strip() for item in supplemental_guidance if str(item).strip())
     return "\n".join(lines).strip()
+
+
+def _detect_codex_workaround_signal(*texts: str) -> Optional[str]:
+    for text in texts:
+        source = str(text or "")
+        if not source:
+            continue
+        for pattern in _CODEX_WORKAROUND_PATTERNS:
+            match = pattern.search(source)
+            if match:
+                return match.group(0)
+    return None
 
 
 def _read_text_if_exists(path: Path) -> str:
@@ -1048,6 +1111,25 @@ def _run_codex_task(
                 "stdout": _truncate(stdout),
                 "stderr": _truncate(detail),
                 "exitCode": exit_code,
+            }
+
+        policy_signal = _detect_codex_workaround_signal(last_message, stdout)
+        if policy_signal:
+            detail = (
+                "Codex CLI is mandatory in this backend, but worker output suggests a workaround "
+                f"instead of hard-failing: {policy_signal!r}. "
+                "Return an explicit failure if Codex auth/execution is unavailable."
+            )
+            if last_message:
+                detail = f"{detail}\nLast assistant message:\n{last_message}"
+            if trace_excerpt:
+                detail = f"{detail}\n{trace_excerpt}"
+            return {
+                "ok": False,
+                "summary": "openai_codex policy violation: Codex CLI workaround detected",
+                "stdout": _truncate(stdout),
+                "stderr": _truncate(detail),
+                "exitCode": 5,
             }
 
         changed_paths = summarize_git_changes(repo)
