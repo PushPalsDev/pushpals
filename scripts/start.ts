@@ -21,7 +21,7 @@ import { createHash } from "crypto";
 import { createServer } from "net";
 import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
-import { loadPushPalsConfig } from "../packages/shared/src/config.js";
+import { loadPushPalsConfig, sanitizePushPalsConfigForLogging } from "../packages/shared/src/config.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -109,6 +109,16 @@ function parseStartOptions(argv: string[]): StartOptions {
 }
 
 const startOptions = parseStartOptions(process.argv.slice(2));
+
+function logEffectiveConfigSnapshot(): void {
+  if (!CONFIG.startup.logConfigOnStart) {
+    console.log("[start] Config snapshot logging disabled (startup.log_config_on_start=false).");
+    return;
+  }
+  const sanitized = sanitizePushPalsConfigForLogging(CONFIG);
+  console.log("[start] Effective config snapshot (sanitized):");
+  console.log(JSON.stringify(sanitized, null, 2));
+}
 
 type SupportedLlmBackend = "lmstudio" | "ollama" | "openai" | "openai_codex";
 type CodexAuthMode = "auto" | "api_key" | "chatgpt";
@@ -3294,6 +3304,7 @@ try {
   cleanRuntimeStateIfRequested();
   sanitizeWindowsWatcherPaths();
   ensureRequiredLocalConfigFiles();
+  logEffectiveConfigSnapshot();
   await ensureServicePortsAvailable();
   await ensureCodexCliAuthPreflight();
   await cleanupWorkerWarmContainers("startup preflight");

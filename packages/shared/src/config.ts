@@ -25,6 +25,9 @@ const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
 const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
 const DEFAULT_REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS = 420;
 const DEFAULT_REMOTEBUDDY_MEMORY_RETENTION_DAYS = 30;
+const REDACTED_LOG_VALUE = "[REDACTED]";
+const SENSITIVE_CONFIG_KEY_PATTERN =
+  /(token|secret|password|api[_-]?key|private[_-]?key|access[_-]?key)/i;
 
 export interface PushPalsLlmConfig {
   backend: string;
@@ -219,6 +222,7 @@ export interface PushPalsConfig {
   };
   startup: {
     workerImageRebuild: "auto" | "always" | "never";
+    logConfigOnStart: boolean;
     syncIntegrationWithMain: boolean;
     skipLlmPreflight: boolean;
     autoStartLmStudio: boolean;
@@ -1220,6 +1224,9 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       "auto",
     ),
   );
+  const startupLogConfigOnStart =
+    parseBoolEnv("PUSHPALS_LOG_CONFIG_ON_START") ??
+    asBoolean(startupNode.log_config_on_start, true);
   const startupSyncIntegrationWithMain =
     parseBoolEnv("PUSHPALS_SYNC_INTEGRATION_WITH_MAIN") ??
     asBoolean(startupNode.sync_integration_with_main, true);
@@ -1685,6 +1692,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     },
     startup: {
       workerImageRebuild: startupWorkerImageRebuild,
+      logConfigOnStart: startupLogConfigOnStart,
       syncIntegrationWithMain: startupSyncIntegrationWithMain,
       skipLlmPreflight: startupSkipLlmPreflight,
       autoStartLmStudio: startupAutoStartLmStudio,
@@ -1718,4 +1726,59 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   cachedConfig = config;
   cachedConfigKey = cacheKey;
   return config;
+}
+
+function sanitizeConfigString(value: string): string {
+  let out = String(value ?? "");
+  if (!out) return out;
+  // redact URL userinfo credentials: https://user:pass@host -> https://***@host
+  out = out.replace(/(https?:\/\/)[^@\s/]+@/gi, "$1***@");
+  // redact malformed/encoded scheme userinfo from legacy rewrite bugs: https%3A//user%3Apass@host
+  out = out.replace(/https%3a\/\/[^@\s/]+@/gi, "https%3A//***@");
+  // redact bearer tokens
+  out = out.replace(/\b(Bearer\s+)[A-Za-z0-9._\-:+/=]+\b/gi, "$1***");
+  // redact common token formats
+  out = out.replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "gh***");
+  out = out.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "github_pat_***");
+  out = out.replace(/\bglpat-[A-Za-z0-9\-_]{20,}\b/gi, "glpat-***");
+  out = out.replace(/\bsk-[A-Za-z0-9]{20,}\b/g, "sk-***");
+  return out;
+}
+
+function sanitizeConfigValueForLogging(
+  value: unknown,
+  parentKey = "",
+): unknown {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value == null
+  ) {
+    if (typeof value === "string") {
+      if (SENSITIVE_CONFIG_KEY_PATTERN.test(parentKey)) {
+        return value.trim() ? REDACTED_LOG_VALUE : "";
+      }
+      return sanitizeConfigString(value);
+    }
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeConfigValueForLogging(entry, parentKey));
+  }
+
+  if (typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = sanitizeConfigValueForLogging(entry, key);
+    }
+    return out;
+  }
+
+  return String(value);
+}
+
+export function sanitizePushPalsConfigForLogging<T>(value: T): T {
+  return sanitizeConfigValueForLogging(value) as T;
 }

@@ -109,6 +109,7 @@ codex_home_dir = ""
 codex_timeout_ms = 300000
 
 [startup]
+log_config_on_start = true
 startup_warmup = true
 lmstudio_ready_timeout_ms = 120000
 port_preflight = true

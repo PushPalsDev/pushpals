@@ -27,6 +27,7 @@ import {
   CommunicationManager,
   detectRepoRoot,
   loadPushPalsConfig,
+  sanitizePushPalsConfigForLogging,
   matchesGlob,
   normalizeTargetPath,
   normalizeWriteGlob,
@@ -756,6 +757,9 @@ class RemoteBuddyOrchestrator {
     );
     console.log(
       `[RemoteBuddy] Persistent memory: ${this.memoryEnabled ? "on" : "off"} crossSession=${this.memoryIncludeCrossSession ? "on" : "off"} recallItems=${this.memoryMaxRecallItems} recallChars=${this.memoryMaxRecallChars} retentionDays=${this.memoryRetentionDays}`,
+    );
+    console.log(
+      `[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour}`,
     );
   }
 
@@ -1911,6 +1915,10 @@ class RemoteBuddyOrchestrator {
   }
 
   startAutonomy(): void {
+    if (!CONFIG.remotebuddy.autonomy.enabled) {
+      console.log("[RemoteBuddy] Autonomous engine disabled by config (remotebuddy.autonomy.enabled=false).");
+      return;
+    }
     this.autonomousEngine.start();
   }
 
@@ -1993,6 +2001,12 @@ async function main() {
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
+  if (CONFIG.startup.logConfigOnStart) {
+    console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
+    console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
+  } else {
+    console.log("[RemoteBuddy] Config snapshot logging disabled (startup.log_config_on_start=false).");
+  }
 
   // ── Initialise LLM + brain ──
   let brain: AgentBrain;

@@ -17,6 +17,7 @@ export {
 } from "./git_backend.js";
 export {
   loadPushPalsConfig,
+  sanitizePushPalsConfigForLogging,
   type PushPalsConfig,
   type PushPalsLlmConfig,
   type PushPalsLmStudioConfig,

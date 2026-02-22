@@ -66,7 +66,7 @@ model = "local-model"
 session_id = "remotebuddy-dev"
 
 [remotebuddy.autonomy]
-enabled = false
+enabled = true
 tick_interval_ms = 300000
 ideation_budget_ms = 20000
 llm_timeout_ms = 12000
@@ -212,6 +212,7 @@ codex_timeout_ms = 300000
 
 [startup]
 worker_image_rebuild = "auto"
+log_config_on_start = true
 sync_integration_with_main = true
 skip_llm_preflight = false
 auto_start_lmstudio = true
