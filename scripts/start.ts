@@ -2569,6 +2569,7 @@ function ghRefreshOnStartEnabled(): boolean {
 }
 let ghRefreshOnStartAttempted = false;
 let ghAuthPreflightSatisfied = false;
+let ghLastRefreshEnteredDeviceFlow = false;
 
 async function ghAuthStatusOk(): Promise<boolean> {
   return (
@@ -2631,6 +2632,7 @@ async function attemptGhAuthRefresh(
   opts: { allowInteractive?: boolean } = {},
 ): Promise<boolean> {
   const allowInteractive = opts.allowInteractive ?? false;
+  ghLastRefreshEnteredDeviceFlow = false;
   let openedDeviceFlowUrl = false;
   let deviceFlowDetected = false;
   console.log(`[start] ${reason} Attempting non-interactive \`gh auth refresh\`...`);
@@ -2661,10 +2663,12 @@ async function attemptGhAuthRefresh(
         console.warn(`[start] Could not auto-open browser. Open this URL manually: ${url}`);
       }
       deviceFlowDetected = true;
-      try {
-        proc.kill();
-      } catch {
-        // ignore
+      if (!allowInteractive) {
+        try {
+          proc.kill();
+        } catch {
+          // ignore
+        }
       }
     };
     const streamToTerminal = async (
@@ -2699,7 +2703,7 @@ async function attemptGhAuthRefresh(
       (value) => process.stderr.write(value),
       maybeHandleDeviceFlowUrl,
     );
-    const timeoutMs = 12_000;
+    const timeoutMs = allowInteractive ? 180_000 : 12_000;
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -2713,15 +2717,29 @@ async function attemptGhAuthRefresh(
     await Promise.allSettled([stdoutPump, stderrPump]);
     clearTimeout(timeout);
     if (deviceFlowDetected) {
+      ghLastRefreshEnteredDeviceFlow = true;
       if (!allowInteractive) {
         console.warn(
           "[start] Non-interactive `gh auth refresh` entered device flow and requires browser completion.",
         );
         return false;
       }
-      console.warn(
-        "[start] Non-interactive `gh auth refresh` entered device flow; requiring browser authentication before continuing.",
+      if (timedOut) {
+        console.error(
+          `[start] GitHub device-flow authentication did not complete within ${Math.round(
+            timeoutMs / 1000,
+          )}s. Complete it in browser and rerun startup.`,
+        );
+        return false;
+      }
+      if (exitCode === 0) {
+        ghLastRefreshEnteredDeviceFlow = false;
+        return ghAuthStatusOk();
+      }
+      console.error(
+        "[start] GitHub device-flow authentication did not complete successfully. Finish browser auth and rerun startup.",
       );
+      return false;
     }
     if (timedOut) {
       console.warn(
@@ -2832,6 +2850,12 @@ async function ensureGitHubAuth(force = false): Promise<void> {
         "GitHub CLI auth is present but API validation failed.",
         { allowInteractive: true },
       );
+      if (!refreshed && ghLastRefreshEnteredDeviceFlow) {
+        console.error(
+          "[start] GitHub device-flow authentication is pending. Complete browser authentication and rerun startup.",
+        );
+        abortStart(1);
+      }
       apiAccessOk = refreshed ? await ghApiAccessOk() : false;
     }
     if (!apiAccessOk) {
