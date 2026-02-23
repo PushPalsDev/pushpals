@@ -39,6 +39,10 @@ import {
   normalizePathHints,
   plannerTargetPaths,
 } from "./path_targeting.js";
+import {
+  canonicalizeInstructionTextForBun,
+  canonicalizeValidationCommandForBun,
+} from "./command_policy.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -383,7 +387,7 @@ function buildExecutionGuidance(plan: PlannerOutput, targetPaths: string[]): str
   return lines.join("\n").trim();
 }
 
-const VALIDATION_COMMAND_PREFIX = /^(git|bun|npm|pnpm|yarn|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
+const VALIDATION_COMMAND_PREFIX = /^(git|bun|bunx|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
 const VALIDATION_GENERIC_SAFE = /^(git\s+status\s+--porcelain|git\s+diff\b)/i;
 const PATH_TOKEN_REGEX = /\b([A-Za-z0-9._/\-\\]+\.[A-Za-z0-9._-]+)\b/g;
 
@@ -416,7 +420,7 @@ function normalizeValidationSteps(steps: string[], targetPaths: string[]): strin
   const out: string[] = [];
   const seen = new Set<string>();
   for (const raw of steps) {
-    const value = String(raw ?? "").trim();
+    const value = canonicalizeValidationCommandForBun(String(raw ?? "").trim());
     if (!value) continue;
     if (!isCommandLikeValidationStep(value)) continue;
     if (!hasRelevantTargetPath(value, targetPaths)) continue;
@@ -451,9 +455,10 @@ function sanitizePlannerWorkerInstruction(
   workerInstruction: string,
   canonicalInstruction: string,
 ): string {
-  const value = String(workerInstruction ?? "").trim();
+  const value = canonicalizeInstructionTextForBun(String(workerInstruction ?? "").trim());
   if (!value) return "";
-  if (value === canonicalInstruction) return "";
+  const canonicalReference = canonicalizeInstructionTextForBun(String(canonicalInstruction ?? "").trim());
+  if (value === canonicalReference) return "";
   const lower = value.toLowerCase();
   if (
     lower.includes("no worker instruction needed") ||
@@ -1623,7 +1628,9 @@ class RemoteBuddyOrchestrator {
           if (autonomyMetadata && CONFIG.remotebuddy.autonomy.enabled) {
             // Option 3: autonomous engine origin — re-enqueue the worker instruction so
             // the engine can drive next-step execution rather than silently dropping it.
-            const workerInstruction = String(plan.worker_instruction ?? "").trim() || plan.assistant_message;
+            const workerInstruction = canonicalizeInstructionTextForBun(
+              String(plan.worker_instruction ?? "").trim() || plan.assistant_message,
+            );
             const enqueued = await this.autonomousEngine.enqueueFromAnalysis(
               workerInstruction,
               autonomyMetadata,

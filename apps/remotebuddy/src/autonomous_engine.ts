@@ -13,6 +13,10 @@ import {
 } from "shared";
 import type { PushPalsConfig } from "shared";
 import type { LLMClient } from "./llm.js";
+import {
+  canonicalizeInstructionTextForBun,
+  canonicalizeValidationCommandForBun,
+} from "./command_policy.js";
 
 type AutonomyCandidate = {
   id: string;
@@ -528,12 +532,13 @@ export class RemoteBuddyAutonomousEngine {
       writeGlobs: string[];
     },
   ): Promise<string | null> {
+    const canonicalInstruction = canonicalizeInstructionTextForBun(instruction);
     const res = await fetch(`${this.server}/requests/enqueue`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
         sessionId: this.sessionId,
-        prompt: instruction,
+        prompt: canonicalInstruction,
         priority: "background",
         forceWorker: true,
         forceLane: "worker",
@@ -837,7 +842,9 @@ export class RemoteBuddyAutonomousEngine {
             write_globs: asStringArray(asObject(c.scope).write_globs),
           },
           risk_level: asString(c.risk_level) as "low" | "medium" | "high",
-          expected_validation: asStringArray(c.expected_validation),
+          expected_validation: asStringArray(c.expected_validation)
+            .map((command) => canonicalizeValidationCommandForBun(command))
+            .filter(Boolean),
           estimated_effort: asString(c.estimated_effort) as "small" | "medium" | "large",
           why_now_signal_ids: asStringArray(c.why_now_signal_ids),
           confidence: clamp01(asNumber(c.confidence, 0)),
@@ -1158,11 +1165,12 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       if (!(await this.renewDispatchLock(runId))) return;
-      const instruction =
+      const instruction = canonicalizeInstructionTextForBun(
         asString(planningJson.instruction) ||
-        `${selected.candidate.title}\n\n${selected.candidate.problem_statement}\n\nScope:\n- target_paths: ${selected.candidate.target_paths.join(
-          ", ",
-        )}\n- write_globs: ${selected.candidate.scope.write_globs.join(", ")}`;
+          `${selected.candidate.title}\n\n${selected.candidate.problem_statement}\n\nScope:\n- target_paths: ${selected.candidate.target_paths.join(
+            ", ",
+          )}\n- write_globs: ${selected.candidate.scope.write_globs.join(", ")}`,
+      );
 
       const requestId = await this.enqueueSyntheticRequest(instruction, {
         objectiveId,
