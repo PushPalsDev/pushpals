@@ -86,6 +86,45 @@ RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Install these before 
   - Architecture/explanation intents => `project.summary`.
   - Code-change intents => `task.execute` delegated to WorkerPals.
 
+## Operational Runbook (Updated Feb 2026)
+
+### Queue-handling flow (current state)
+
+1. RemoteBuddy polls `POST /requests/claim` every ~2 s, dedups via the idempotency cache, and computes `queueWaitBudgetMs` (≥ 20 s interactive, 90 s default, 240 s background).
+2. If observed wait exceeds the budget, RemoteBuddy immediately posts an assistant update and fast-tracks planning so the request becomes the next dispatch regardless of priority lane.
+3. Planner output determines whether to reply directly or enqueue a WorkerPal job. When a worker is required, RemoteBuddy normalizes scope globs, enforces acceptance/validation steps, selects a lane, and emits `task_*` + `job_enqueued` events before calling `POST /jobs/enqueue`.
+4. **Recent automation (Jan–Feb 2026):**
+   - The Server autonomy snapshot now emits `sig_queue_health` whenever `queue_p95` or job failure rate trend upward. RemoteBuddy’s autonomous engine consumes that signal and auto-enqueues `forceWorker` background remediation requests (metadata `origin=autonomy`, lane `worker`) so backlogs are drained without a manual query.
+   - Auto-spawn logic keeps ≥`maxWorkers` online by launching WorkerPals when `/workers` reports fewer than the configured minimum; treat these workers as ephemeral and avoid manually claim-stealing from them.
+   - Queue-health automation tags each synthetic request with explicit `write_globs` and `target_paths`. Operators should leave those untouched; override only when scope corrections are verified, then reply in the originating request so the engine stops re-firing.
+5. Completion: successful runs call `POST /requests/:id/complete`; failures post `/fail` with the planner error so LocalBuddy/UI surface transparent status.
+
+> For deeper recovery steps, pair this section with `apps/remotebuddy/docs/queue-playbook.md` (kept in sync with this README every time the runbook changes).
+
+### Guardrails for queue_p95 ≈ 0
+
+| Condition (rolling 5 min) | Target behavior | Required action |
+| --- | --- | --- |
+| `queue_p95` ≤ 1.0 s and pending interactive < 10 | Healthy “≈0” wait time | No action; keep `/system/status` tailing hourly. |
+| `queue_p95` 1.0–1.5 s or pending interactive ≥ 15 | Early warning | Trigger queue-playbook diagnostics, verify automation already injected remediation requests, and pause new background/eval submissions. |
+| `queue_p95` ≥ 1.5 s for > 5 min **or** pending interactive ≥ 30 | Degradation | Announce in `#pushpals-ops`, throttle enqueueing to interactive-only, add WorkerPal capacity, and watch `jobPendingSnapshot` for stalled jobs. |
+| `queue_p95` ≥ 2.0 s **or** queue depth > 60 **or** < 2 idle workers for 5 polls | Incident | Page platform on-call, hand over `/system/status` snapshot + worker logs, and keep posting updates every 15 min until p95 drops below 1.0 s. |
+
+### Operator checkpoints (per rotation)
+
+- `curl -sS /system/status` → confirm `queues.requests.pending`, `slo.requests.queueWaitMs`, and `jobPendingSnapshot` stay at/near zero; log anomalies in the ops doc.
+- `curl -sS /requests?status=pending&limit=20` → ensure interactive requests have `createdAt` within the last minute; anything older gets re-queued or force-completed depending on owner feedback.
+- `curl -sS /jobs?status=pending` + WorkerPals logs → verify no job kind is retrying > 3 times; reboot workers stuck `busy` without logs.
+- `curl -sS /workers` → maintain ≥ 2 idle WorkerPals per lane; if automation hasn’t reached `maxWorkers`, start another `bun run workerpals` instance locally or in the pool.
+- `apps/remotebuddy/docs/queue-playbook.md` → follow the mitigation checklist whenever any checkpoint crosses the warning threshold.
+
+### On-call escalation path
+
+1. **RemoteBuddy primary (24 × 7 rotation):** acknowledge dashboard/webhook alerts within 5 minutes, run the checkpoints above, and document steps in `#pushpals-ops`.
+2. **WorkerPals/Platform secondary:** ping the platform on-call (same rotation as WorkerPals) if queue guardrails enter “Degradation” or “Incident” bands for >10 minutes, or if auto-spawn cannot reach ≥2 idle workers.
+3. **Infrastructure/SRE tertiary:** escalate to infra on-call when degradation roots in shared services (LLM vendor, git, registry) or when queue automation repeatedly re-enqueues the same remediation instruction after operators intervene.
+4. Keep a rolling incident log (timestamp, metric snapshot, corrective action) and attach it to the follow-up RCA if paging was required.
+
 ## Commands & Working Directories
 
 ### Repo-root scripts (validated against `package.json`)
