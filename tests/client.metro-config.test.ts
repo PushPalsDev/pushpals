@@ -18,9 +18,13 @@ describe("client metro config", () => {
     expect(metroConfig.watchFolders).toEqual([expectedPackagesRoot]);
   });
 
-  test("resolves modules from app-level node_modules only", () => {
+  test("resolves modules from app-level and workspace-root node_modules", () => {
     const expectedAppNodeModules = resolve(import.meta.dir, "..", "apps", "client", "node_modules");
-    expect(metroConfig.resolver?.nodeModulesPaths).toEqual([expectedAppNodeModules]);
+    const expectedWorkspaceNodeModules = resolve(import.meta.dir, "..", "node_modules");
+    expect(metroConfig.resolver?.nodeModulesPaths).toEqual([
+      expectedAppNodeModules,
+      expectedWorkspaceNodeModules,
+    ]);
   });
 
   test("blocks repo-root workspace links under node_modules", () => {
@@ -35,4 +39,3 @@ describe("client metro config", () => {
     expect(patterns.some((pattern) => pattern.test(sampleWorkspaceLink))).toBe(true);
   });
 });
-
