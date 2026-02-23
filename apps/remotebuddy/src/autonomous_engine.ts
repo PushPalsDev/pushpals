@@ -129,6 +129,7 @@ const SCORING_SYSTEM_PROMPT = loadPromptTemplate(
 const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/autonomy_planning_system_prompt.md",
 ).trim();
+const AUTONOMY_HEARTBEAT_LOG_MS = 30_000;
 
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -267,7 +268,16 @@ export class RemoteBuddyAutonomousEngine {
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
   private timer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
+  private nextTickAtMs = 0;
+  private currentRunId: string | null = null;
+  private currentPhase = "idle";
+  private currentPhaseStartedAtMs = 0;
+  private currentRunStartedAtMs = 0;
+  private lastOutcome: "none" | "success" | "skipped" | "failed" = "none";
+  private lastDetail = "not_started";
+  private lastCompletedAtMs = 0;
 
   constructor(opts: {
     server: string;
@@ -292,6 +302,51 @@ export class RemoteBuddyAutonomousEngine {
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
+  }
+
+  private setPhase(phase: string): void {
+    this.currentPhase = phase;
+    this.currentPhaseStartedAtMs = Date.now();
+  }
+
+  private markTickStart(runId: string): void {
+    const now = Date.now();
+    this.currentRunId = runId;
+    this.currentRunStartedAtMs = now;
+    this.setPhase("acquire_lock");
+  }
+
+  private markTickDone(
+    outcome: "success" | "skipped" | "failed",
+    detail: string,
+  ): void {
+    this.currentRunId = null;
+    this.currentRunStartedAtMs = 0;
+    this.lastOutcome = outcome;
+    this.lastDetail = detail || "unspecified";
+    this.lastCompletedAtMs = Date.now();
+    this.setPhase("idle");
+  }
+
+  private logHeartbeat(): void {
+    if (!this.cfg.enabled) return;
+    const now = Date.now();
+    if (this.currentRunId) {
+      const runElapsedMs = Math.max(0, now - this.currentRunStartedAtMs);
+      const phaseElapsedMs = Math.max(0, now - this.currentPhaseStartedAtMs);
+      console.log(
+        `[RemoteBuddyAutonomousEngine] heartbeat: status=running run=${this.currentRunId} phase=${this.currentPhase} run_elapsed_ms=${runElapsedMs} phase_elapsed_ms=${phaseElapsedMs}`,
+      );
+      return;
+    }
+
+    const nextTickInMs =
+      this.timer && this.nextTickAtMs > 0 ? Math.max(0, this.nextTickAtMs - now) : 0;
+    const lastAgeMs =
+      this.lastCompletedAtMs > 0 ? Math.max(0, now - this.lastCompletedAtMs) : -1;
+    console.log(
+      `[RemoteBuddyAutonomousEngine] heartbeat: status=idle last_outcome=${this.lastOutcome} detail=${this.lastDetail} last_tick_age_ms=${lastAgeMs} next_tick_in_ms=${nextTickInMs}`,
+    );
   }
 
   private headers(): Record<string, string> {
@@ -738,37 +793,57 @@ export class RemoteBuddyAutonomousEngine {
     if (!this.cfg.enabled || this.inFlight) return;
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
+    this.markTickStart(runId);
     const cycleDeadline = Date.now() + this.cycleBudgetMs();
     let lockAcquired = false;
+    let outcome: "success" | "skipped" | "failed" = "skipped";
+    let outcomeDetail = "not_dispatched";
     try {
+      this.setPhase("acquire_lock");
       lockAcquired = await this.acquireDispatchLock(runId);
-      if (!lockAcquired) return;
+      if (!lockAcquired) {
+        outcomeDetail = "lock_not_acquired";
+        return;
+      }
 
+      this.setPhase("prepare_worktree");
       const ready = await this.ensureAutonomyRepoReady(runId);
-      if (!ready) return;
+      if (!ready) {
+        outcomeDetail = "autonomy_repo_not_ready";
+        return;
+      }
 
+      this.setPhase("repo_preflight");
       const preflight = await repoPreflight(this.autonomyRepo);
       if (preflight.isMergeInProgress) {
         console.log(
           "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (merge/rebase in progress).",
         );
+        outcomeDetail = "repo_preflight_merge_in_progress";
         return;
       }
       if (preflight.isWorktreeDirty && !this.cfg.allowDirtyWorktree) {
         console.log(
           "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (worktree is dirty and allow_dirty_worktree=false).",
         );
+        outcomeDetail = "repo_preflight_dirty_worktree";
         return;
       }
 
+      this.setPhase("fetch_snapshot");
       const snapshot = await this.fetchSnapshot(runId, preflight);
-      if (!snapshot) return;
+      if (!snapshot) {
+        outcomeDetail = "snapshot_unavailable";
+        return;
+      }
 
       const llmCalls: Record<string, unknown>[] = [];
       let candidatesPayload: Array<Record<string, unknown>> = [];
       let selectedCandidatePayload: Record<string, unknown> | undefined;
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        outcomeDetail = "snapshot_expired";
         return;
       }
 
@@ -777,8 +852,13 @@ export class RemoteBuddyAutonomousEngine {
         snapshotId: snapshot.snapshot_id,
         phase: "ideation",
       });
-      if (!(await this.renewDispatchLock(runId))) return;
+      this.setPhase("renew_lock_before_ideation");
+      if (!(await this.renewDispatchLock(runId))) {
+        outcomeDetail = "lock_renew_failed_before_ideation";
+        return;
+      }
 
+      this.setPhase("ideation");
       const ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, {
         system: IDEATION_SYSTEM_PROMPT,
         json: true,
@@ -810,7 +890,9 @@ export class RemoteBuddyAutonomousEngine {
       llmCalls.push(ideationPhase.llmCall);
       const ideationJson = ideationPhase.json;
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        outcomeDetail = "snapshot_expired_after_ideation";
         return;
       }
       const rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
@@ -924,6 +1006,7 @@ export class RemoteBuddyAutonomousEngine {
         console.log(
           `[RemoteBuddyAutonomousEngine] tick produced no eligible candidates: raw=${rawCandidates.length} normalized=0 drop_reasons=${JSON.stringify(dropReasons)} top_signals=${topSignals || "none"}${parseHint}`,
         );
+        this.setPhase("record_no_candidate_objective");
         await this.postObjective({
           runId,
           snapshotId: snapshot.snapshot_id,
@@ -931,14 +1014,22 @@ export class RemoteBuddyAutonomousEngine {
           candidates: candidatesPayload,
           llmCalls,
         });
+        outcomeDetail = "no_eligible_candidates";
         return;
       }
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        outcomeDetail = "snapshot_expired_post_ideation_filter";
         return;
       }
-      if (!(await this.renewDispatchLock(runId))) return;
+      this.setPhase("renew_lock_before_scoring");
+      if (!(await this.renewDispatchLock(runId))) {
+        outcomeDetail = "lock_renew_failed_before_scoring";
+        return;
+      }
 
+      this.setPhase("scoring");
       const scoringPhase = await this.llmPhase("scoring", runId, snapshot.snapshot_id, {
         system: SCORING_SYSTEM_PROMPT,
         json: true,
@@ -954,7 +1045,9 @@ export class RemoteBuddyAutonomousEngine {
       llmCalls.push(scoringPhase.llmCall);
       const scoringJson = scoringPhase.json;
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        outcomeDetail = "snapshot_expired_after_scoring";
         return;
       }
       const scoreById = new Map<string, number>();
@@ -1021,12 +1114,21 @@ export class RemoteBuddyAutonomousEngine {
         candidate_created_at: row.candidate.candidate_created_at,
       }));
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
+        outcomeDetail = "snapshot_expired_after_eligibility";
         return;
       }
-      if (!(await this.renewDispatchLock(runId))) return;
+      this.setPhase("renew_lock_before_selection");
+      if (!(await this.renewDispatchLock(runId))) {
+        outcomeDetail = "lock_renew_failed_before_selection";
+        return;
+      }
       const top = rankedWithEligibility[0];
-      if (!top) return;
+      if (!top) {
+        outcomeDetail = "no_ranked_candidate";
+        return;
+      }
       const selected = rankedWithEligibility.find((row) => row.eligibility.ok);
       const objectiveId = `obj_${randomUUID().slice(0, 8)}`;
       selectedCandidatePayload = selected
@@ -1059,6 +1161,7 @@ export class RemoteBuddyAutonomousEngine {
       }
 
       if (!selected) {
+        this.setPhase("record_rejected_objective");
         await this.postObjective({
           runId,
           snapshotId: snapshot.snapshot_id,
@@ -1089,10 +1192,12 @@ export class RemoteBuddyAutonomousEngine {
           },
           llmCalls,
         });
+        outcomeDetail = "no_eligible_candidate";
         return;
       }
 
       if (selected.candidate.requires_user_input) {
+        this.setPhase("record_blocked_requires_input");
         await this.postObjective({
           runId,
           snapshotId: snapshot.snapshot_id,
@@ -1130,10 +1235,16 @@ export class RemoteBuddyAutonomousEngine {
           },
           llmCalls,
         });
+        outcomeDetail = "requires_user_input";
         return;
       }
-      if (!(await this.renewDispatchLock(runId))) return;
+      this.setPhase("renew_lock_before_planning");
+      if (!(await this.renewDispatchLock(runId))) {
+        outcomeDetail = "lock_renew_failed_before_planning";
+        return;
+      }
 
+      this.setPhase("planning");
       const planningPhase = await this.llmPhase(
         "planning",
         runId,
@@ -1155,6 +1266,7 @@ export class RemoteBuddyAutonomousEngine {
       llmCalls.push(planningPhase.llmCall);
       const planningJson = planningPhase.json;
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(
           runId,
           snapshot.snapshot_id,
@@ -1162,9 +1274,14 @@ export class RemoteBuddyAutonomousEngine {
           candidatesPayload,
           selectedCandidatePayload,
         );
+        outcomeDetail = "snapshot_expired_after_planning";
         return;
       }
-      if (!(await this.renewDispatchLock(runId))) return;
+      this.setPhase("renew_lock_before_enqueue");
+      if (!(await this.renewDispatchLock(runId))) {
+        outcomeDetail = "lock_renew_failed_before_enqueue";
+        return;
+      }
       const instruction = canonicalizeInstructionTextForBun(
         asString(planningJson.instruction) ||
           `${selected.candidate.title}\n\n${selected.candidate.problem_statement}\n\nScope:\n- target_paths: ${selected.candidate.target_paths.join(
@@ -1172,6 +1289,7 @@ export class RemoteBuddyAutonomousEngine {
           )}\n- write_globs: ${selected.candidate.scope.write_globs.join(", ")}`,
       );
 
+      this.setPhase("enqueue_request");
       const requestId = await this.enqueueSyntheticRequest(instruction, {
         objectiveId,
         runId,
@@ -1182,6 +1300,7 @@ export class RemoteBuddyAutonomousEngine {
         writeGlobs: selected.candidate.scope.write_globs,
       });
       if (!requestId) {
+        this.setPhase("record_failed_enqueue");
         await this.postObjective({
           runId,
           snapshotId: snapshot.snapshot_id,
@@ -1204,9 +1323,11 @@ export class RemoteBuddyAutonomousEngine {
           },
           llmCalls,
         });
+        outcomeDetail = "request_enqueue_failed";
         return;
       }
 
+      this.setPhase("record_dispatched_objective");
       await this.postObjective({
         runId,
         snapshotId: snapshot.snapshot_id,
@@ -1237,11 +1358,16 @@ export class RemoteBuddyAutonomousEngine {
         },
         llmCalls,
       });
+      outcome = "success";
+      outcomeDetail = `dispatched_request_${requestId.slice(0, 8)}`;
     } catch (error) {
       console.error("[RemoteBuddyAutonomousEngine] tick failed:", error);
+      outcome = "failed";
+      outcomeDetail = `error:${error instanceof Error ? error.message : String(error)}`;
     } finally {
       if (lockAcquired) await this.releaseDispatchLock(runId);
       this.inFlight = false;
+      this.markTickDone(outcome, outcomeDetail);
     }
   }
 
@@ -1287,9 +1413,15 @@ export class RemoteBuddyAutonomousEngine {
     console.log(
       `[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`,
     );
+    this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
     this.timer = setInterval(() => {
+      this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
       void this.tick();
     }, this.cfg.tickIntervalMs);
+    this.heartbeatTimer = setInterval(() => {
+      this.logHeartbeat();
+    }, AUTONOMY_HEARTBEAT_LOG_MS);
+    this.logHeartbeat();
     void this.tick();
   }
 
@@ -1298,5 +1430,10 @@ export class RemoteBuddyAutonomousEngine {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    this.nextTickAtMs = 0;
   }
 }
