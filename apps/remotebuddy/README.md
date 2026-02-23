@@ -43,43 +43,55 @@ WorkerPals -> POST /jobs/:id/complete|fail (+ optional /completions/enqueue)
 SourceControlManager -> POST /completions/claim -> merge/push -> POST /completions/:id/processed|fail
 ```
 
-## Current Workflows
+## Maintenance and Recovery
 
-### Request + Planning Loop
+All commands below target `http://localhost:3001`; swap in the real control-plane origin when operating in another environment. Do not proceed unless you can complete every checklist item—skipping any gate invalidates the cleanup.
 
-- LocalBuddy (or an autonomy objective) enqueues into the server queue; RemoteBuddy polls `POST /requests/claim` on a fixed cadence and immediately emits `assistant_message` + `task_started` status so the UI shows ownership.
-- The orchestrator composes context from `recentContext` and persistent memory (`remotebuddy-state.db`, populated via `PersistentSessionMemory`) before calling the planner in `apps/remotebuddy/src/brain.ts`.
-- Planner output is normalized: scope/write globs are patched, validation steps are enforced, and deterministic intents can short-circuit as a direct reply without WorkerPals.
-- All responses (direct or delegated) are finalized through `POST /requests/:id/complete`, keeping the request queue consistent even when RemoteBuddy answers inline.
+### Pre-cleanup verification checklist (run top-to-bottom)
+- **Requests:**
+  - `curl -s http://localhost:3001/requests?status=claimed | jq '.items | length'` — must be `0` so no claims are mid-flight.
+  - `curl -s http://localhost:3001/requests?status=queued | jq '.items | length'` — record the intentionally pending count for post-check comparison.
+- **Jobs:**
+  - `curl -s http://localhost:3001/jobs?status=claimed | jq '.items | length'` — must be `0`; pause maintenance if any job claims exist.
+  - `curl -s http://localhost:3001/jobs?status=running | jq '.items | length'` — ensure all WorkerPal jobs have finished or are explicitly approved to keep running.
+- **Sessions:** `curl -s http://localhost:3001/sessions/active | jq '.[] | {id, worker, status}'` — confirm interactive/autonomy sessions are closed or that you are tailing them intentionally.
+- **Autonomy locks:** `curl -s http://localhost:3001/locks/autonomy | jq '.[] | {resource, holder}'` — document any lock you plan to restore.
+- **State backup:** `cp apps/remotebuddy/remotebuddy-state.db /tmp/remotebuddy-state.$(date +%s).db` (Linux/macOS) or `Copy-Item .\apps\remotebuddy\remotebuddy-state.db "$env:TEMP\remotebuddy-state.$(Get-Date -Format yyyyMMddHHmmss).db"` (PowerShell), then verify the file exists.
+- **Worktree confirmation:** declare the exact worktree(s) you plan to touch and prove they exist before editing anything.
+  - Linux/macOS: `TARGET_WORKTREE="/repo/.../job-xxxx"; realpath "$TARGET_WORKTREE"; ls -ld "$TARGET_WORKTREE"; ls -ld "$(dirname "$TARGET_WORKTREE")"` — abort if `realpath` points outside the intended repo scope.
+  - Windows PowerShell: `$TargetWorktree = "C:\repo\...\job-xxxx"; Resolve-Path $TargetWorktree; Get-ChildItem -Force (Split-Path $TargetWorktree -Parent) | Where-Object { $_.FullName -eq $TargetWorktree }` — abort if the directory is missing or the resolved path differs from the plan.
+- **Log evidence:** capture timestamped command output for every check above. You will need it for the post-cleanup comparison.
 
-### Delegated Execution Workflow
+### Controlled shutdown procedure
+1. **Non-destructive discovery (always first).** Enumerate every RemoteBuddy PID and command line before touching anything—never jump straight to `pkill`/`Stop-Process -Force`.
+   - Linux/macOS: `pgrep -fal remotebuddy_main | tee /tmp/remotebuddy-processes.txt` plus `pgrep -f remotebuddy_main > /tmp/remotebuddy.pids`, or `ps -eo pid,ppid,start,time,command | grep remotebuddy_main | grep -v grep`. Keep these files immutable until cleanup finishes.
+   - Windows PowerShell: `Get-Process -Name remotebuddy*,bun -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime, Path | Tee-Object -FilePath $env:TEMP\remotebuddy-processes.txt | Export-Csv -Path $env:TEMP\remotebuddy-processes.csv -NoTypeInformation`. This preserves typed PID metadata for later import.
+2. **Graceful stop gate.** Work only with the captured PIDs.
+   - Linux/macOS: send SIGTERM (`kill -15 <pid>`) to each RemoteBuddy PID and wait for the processes to exit.
+   - Windows PowerShell: `Stop-Process -Id <pid>` **without** `-Force` for each recorded PID.
+   - Re-run the pre-cleanup checklist commands until request/job counts and autonomy/sessions match the recorded baseline.
+3. **Mandatory safety gates before destructive actions.** Do **not** attempt forceful termination until all of the following are true:
+   - RemoteBuddy services (bun dev/start or systemd units) are already stopped gracefully.
+   - `requests?status=claimed`, `requests?status=queued`, `jobs?status=claimed`, and `jobs?status=running` all match the acceptable counts captured earlier.
+   - The `remotebuddy-state.db` backup above completed successfully, the backup file exists off the repo path, and you have noted its location.
+   - Target worktree paths to be touched are explicitly listed; `realpath`/`Resolve-Path` still points to the intended directories, and `ls`/`Get-ChildItem` output of their parents confirms no collateral directories.
+4. **Destructive termination (last resort, document the reason).** If a PID refuses to exit but the gates above hold, force-kill **only** the specific PIDs from Step 1. Never blanket-kill `bun` or unrelated processes.
+   - Linux/macOS example: `cat /tmp/remotebuddy.pids | xargs -n1 -I{} sh -c 'echo "Force-killing PID {}"; kill -9 {}'` where `/tmp/remotebuddy.pids` contains the previously captured PIDs.
+   - Windows PowerShell example: `$processLog = Import-Csv $env:TEMP\remotebuddy-processes.csv; $processLog | Where-Object { $_.ProcessName -like "remotebuddy*" } | ForEach-Object { $pid = [int]$_.Id; Write-Host "Force-killing PID $pid ($($_.ProcessName))"; Stop-Process -Id $pid -Force }`. This keeps the force-kill list typed and auditable.
+   - After forcing a PID down, immediately re-run the pre-cleanup checklist (including the job-claim check) to ensure queues, sessions, and locks remain in the expected state.
 
-- When `requiresWorker=true`, RemoteBuddy derives execution budgets (`executionBudget*Ms`) and target paths, then enqueues jobs through `/jobs/enqueue`.
-- The scheduler tracks `maxWorkers`, `autoSpawnWorkers`, and `waitForWorkerMs` to either attach to an idle WorkerPal or spawn one (`bun run workerpals:only*`), emitting `job_enqueued`/`task_progress` events so LocalBuddy/clients can surface progress.
-- Worker outcomes are observed via `CommunicationManager` subscriptions; `job_completed`/`job_failed` events fan back into persistent memory, request completion, and optional `REMOTEBUDDY_FETCH_FAILURE_LOGS` snapshots for debugging.
-- Session monitoring keeps a soft heartbeat alive. If the loop stalls (lost SSE/WS, request backlog), RemoteBuddy logs the degraded state and will exit so `start.ts` can restart with a clean claim cursor.
+### Data and worktree safety gates
+- Stop every RemoteBuddy service (CLI `bun run dev/start`, process supervisors, or systemd units) before touching `apps/remotebuddy` artifacts.
+- Rerun the request/job/session/lock commands until `requests?status=claimed` and `jobs?status=claimed` return `0`, running-job counts match the baseline you captured, and session/lock output still matches expectations.
+- Create fresh compressed backups of `remotebuddy-state.db` and any worktree directories slated for deletion (`tar -czf /tmp/remotebuddy-worktree.$(date +%s).tgz <worktree>` for Linux/macOS or `Compress-Archive -Path <worktree> -DestinationPath "$env:TEMP\remotebuddy-worktree.$(Get-Date -Format yyyyMMddHHmmss).zip"`). Keep the backup path in your maintenance log and confirm the archive exists.
+- Write down each worktree path you will modify or remove, then `realpath`/`Resolve-Path` them and `ls` / `Get-ChildItem` the parent directory immediately before executing destructive commands to confirm scope and avoid collateral damage.
 
-### Autonomous Maintenance Workflow
+### Post-cleanup verification checklist
+- **Requests:** `curl -s http://localhost:3001/requests?status=claimed | jq '.items | length'` must return `0`, and the queued count (`requests?status=queued`) must match the `Pre-cleanup` baseline.
+- **Jobs:** both `curl -s http://localhost:3001/jobs?status=claimed | jq '.items | length'` and `curl -s http://localhost:3001/jobs?status=running | jq '.items | length'` must return `0`; reconcile any difference before declaring success.
+- **Sessions:** `curl -s http://localhost:3001/sessions/active | jq '.[] | {id, worker, status}'` should show no unexpected sessions or locks.
+- **Autonomy locks:** `curl -s http://localhost:3001/locks/autonomy | jq '.[] | {resource, holder}'` should be empty or match the documented restores.
+- **Processes:** rerun the non-destructive process-list commands from Step 1 to confirm no RemoteBuddy-related PID is alive. If anything restarted, return to the graceful stop gate.
+- **Evidence:** attach the before/after command output in the maintenance log so future operators can validate the cleanup deterministically.
 
-- When `[remotebuddy.autonomy] enabled=true`, `RemoteBuddyAutonomousEngine` ticks on `CONFIG.remotebuddy.autonomy.tickIntervalMs`, acquires a dispatch lock from the server, and prepares a dedicated git worktree at `.worktrees/remotebuddy-autonomy-<session>`.
-- Each tick fetches an autonomy snapshot (`/autonomy/snapshot`), runs ideation/execution LLM phases, filters candidates by policy (scope/risk/write globs), and enqueues objectives back through the same `/requests/enqueue` + `/jobs/enqueue` surfaces with `background` priority.
-- Cooldowns (`maxConcurrentObjectives`, `maxDispatchPerHour`, `allowDirtyWorktree`) ensure RemoteBuddy never spams jobs; policy violations or dirty worktrees are logged and leave the system idle until a human intervenes.
-
-## Maintenance Duties
-
-- **Process health:** keep `bun run remotebuddy:only` (or `bun run start`) attached to a terminal so heartbeats, `Session monitor` warnings, and planner failures are visible. RemoteBuddy intentionally exits on repeated transport errors; restart promptly to reclaim pending requests.
-- **Configuration + secrets:** align `.env` and `config/local.toml` with server URLs, auth tokens (`--token`), and `[remotebuddy.memory|autonomy]` blocks. Prefer env overrides (`REMOTEBUDDY_MEMORY_*`, `REMOTEBUDDY_AUTONOMY_*`) for quick adjustments without committing sensitive data.
-- **Worker scheduling:** set `remotebuddy.max_workers`, `auto_spawn_workers`, and wait/backoff knobs so the orchestrator matches available WorkerPal capacity. Review logs for `Skipping already-handled request` or `Planner write_globs did not cover target paths` to catch policy drift early.
-- **Persistent memory hygiene:** monitor the `remotebuddy-state.db` SQLite file (default cwd of `apps/remotebuddy`). Use retention knobs (`REMOTEBUDDY_MEMORY_RETENTION_DAYS`, `max_recall_items/chars`) to bound growth, and vacuum or delete the file only while RemoteBuddy is stopped to reset bias.
-- **Autonomy worktree upkeep:** the autonomous engine maintains `.worktrees/remotebuddy-autonomy-*`. Prune these when switching branches or after long pauses so the next tick can re-clone cleanly. If autonomy is disabled, remove stale worktrees to avoid “preflight blocked” logs.
-- **Observability + failure logs:** leave `REMOTEBUDDY_FETCH_FAILURE_LOGS=1` set in CI/E2E contexts so failed jobs pull worker logs automatically. Scan `task_progress` events for repeated planner repairs—those often indicate missing protocol updates or schema drift.
-
-## Idle System Cleanup
-
-When RemoteBuddy is idle (no queued requests, no autonomous objectives), reset the runtime state so the next operator starts cleanly:
-
-1. **Stop daemons:** terminate any lingering `bun` processes for RemoteBuddy/WorkerPals/SourceControlManager. The integration tests expose a reference command (`pkill -f "apps/remotebuddy|apps/workerpals|apps/source_control_manager|remotebuddy:only|workerpals:only|source_control_manager:only"`) that safely reaps stray sidecars before new runs.
-2. **Drain queues:** check the server (`apps/server`) request/job dashboards or query SQLite (`outputs/data/pushpals.db`) to confirm pending entries are either completed or intentionally left for later. Close any claimed-but-unfinished requests with `POST /requests/:id/complete` + a failure reason so LocalBuddy stops waiting.
-3. **Remove autonomy worktrees:** delete `.worktrees/remotebuddy-autonomy-*` if autonomy was enabled. This prevents stale locks/branches from blocking future ticks and keeps disk usage predictable.
-4. **Reset memory (optional):** if you need a fresh planning slate, stop RemoteBuddy and remove `apps/remotebuddy/remotebuddy-state.db` (or run `sqlite3 remotebuddy-state.db 'VACUUM'`). The next startup will recreate tables and rebuild recall history from scratch.
-5. **Verify config drift:** before restarting later, re-run `bun run start -c` or at least `bun run remotebuddy:only -- --server ... --sessionId ... --token ...` to ensure env/config changes (LLM keys, queue URLs) still align with the rest of PushPals.
+Document these results (timestamps + command output) in the maintenance log so future operators can prove the cleanup completed deterministically.
