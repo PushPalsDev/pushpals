@@ -44,6 +44,11 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import {
+  ConsoleQueueWorkerObserver,
+  RequestQueueWorker,
+  type QueueRequestPayload,
+} from "./queue/worker.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -644,6 +649,9 @@ class RemoteBuddyOrchestrator {
   private readonly executionBudgetNormalMs: number;
   private readonly executionBudgetBackgroundMs: number;
   private readonly finalizationBudgetMs: number;
+  private readonly queuePollMs: number;
+  private readonly queueClaimBatchSize: number;
+  private readonly queueMaxParallel: number;
   private readonly autonomousEngine: RemoteBuddyAutonomousEngine;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
@@ -657,9 +665,7 @@ class RemoteBuddyOrchestrator {
   private disposed = false;
   private sessionMonitorWsErrorCount = 0;
   private sessionMonitorFatal = false;
-
-  /** Serialises async request handling to preserve ordering */
-  private chain: Promise<void> = Promise.resolve();
+  private queueWorker: RequestQueueWorker | null = null;
 
   /** AI brain — produces assistant messages + optional action plans */
   private brain: AgentBrain;
@@ -724,6 +730,9 @@ class RemoteBuddyOrchestrator {
     this.executionBudgetNormalMs = Math.max(120_000, remoteCfg.executionBudgetNormalMs);
     this.executionBudgetBackgroundMs = Math.max(180_000, remoteCfg.executionBudgetBackgroundMs);
     this.finalizationBudgetMs = Math.max(30_000, remoteCfg.finalizationBudgetMs);
+    this.queuePollMs = Math.max(200, remoteCfg.pollMs);
+    this.queueClaimBatchSize = Math.max(1, Math.min(8, remoteCfg.queueClaimBatchSize));
+    this.queueMaxParallel = Math.max(1, Math.min(16, remoteCfg.queueMaxParallel));
     this.memoryEnabled = remoteCfg.memory.enabled;
     this.memoryIncludeCrossSession = remoteCfg.memory.includeCrossSession;
     this.memoryMaxRecallItems = Math.max(1, remoteCfg.memory.maxRecallItems);
@@ -757,6 +766,9 @@ class RemoteBuddyOrchestrator {
     );
     console.log(
       `[RemoteBuddy] Budgets: interactive=${this.executionBudgetInteractiveMs}ms normal=${this.executionBudgetNormalMs}ms background=${this.executionBudgetBackgroundMs}ms finalization=${this.finalizationBudgetMs}ms`,
+    );
+    console.log(
+      `[RemoteBuddy] Queue worker: poll=${this.queuePollMs}ms batch=${this.queueClaimBatchSize} parallel=${this.queueMaxParallel}`,
     );
     console.log(
       `[RemoteBuddy] Failure log fetch on job failures: ${this.fetchFailureLogsOnJobFailure ? "on" : "off"}`,
@@ -1392,19 +1404,7 @@ class RemoteBuddyOrchestrator {
   // ── Dispatch, Polling for Request Queue ────────────────────────────────────────
 
   /** Process a request from the Request Queue (replaces handleMessage) */
-  private async processRequest(
-    request: {
-      id: string;
-      prompt: string;
-      priority?: string;
-      queueWaitBudgetMs?: number;
-      forceWorker?: boolean;
-      forceLane?: TaskExecutionLane;
-      metadata?: Record<string, unknown>;
-      metadataJson?: string | null;
-    },
-    queueWaitMs = 0,
-  ): Promise<void> {
+  private async processRequest(request: QueueRequestPayload, queueWaitMs = 0): Promise<void> {
     const requestId = String(request.id ?? "").trim();
     if (!requestId) return;
 
@@ -1855,51 +1855,36 @@ class RemoteBuddyOrchestrator {
   }
 
   /** Start polling the Request Queue */
-  async startPolling(pollMs: number = 2000): Promise<void> {
-    console.log(`[RemoteBuddy] Starting polling loop (every ${pollMs}ms)`);
-
-    while (!this.disposed) {
-      try {
-        const res = await fetch(`${this.server}/requests/claim`, {
-          method: "POST",
-          headers: this.authHeaders(),
-          body: JSON.stringify({ agentId: this.agentId }),
-        });
-
-        if (res.ok) {
-          const data = (await res.json()) as {
-            ok: boolean;
-            request?: {
-              id: string;
-              prompt: string;
-              priority?: string;
-              queueWaitBudgetMs?: number;
-              forceWorker?: boolean;
-              forceLane?: TaskExecutionLane;
-              metadata?: Record<string, unknown>;
-              metadataJson?: string | null;
-            };
-            queueWaitMs?: number;
-          };
-          console.log("[RemoteBuddy] claim payload:", JSON.stringify(data, null, 2));
-          if (data.ok && data.request) {
-            console.log(
-              `[RemoteBuddy] Claimed request ${data.request.id}${
-                data.request.forceWorker ? ` (forceWorker=true)` : ""
-              }`,
-            );
-            // Serialize processing
-            this.chain = this.chain
-              .then(() => this.processRequest(data.request!, Number(data.queueWaitMs ?? 0)))
-              .catch((err) => console.error("[RemoteBuddy] Process error:", err));
-          }
-        }
-      } catch (err) {
-        console.error(`[RemoteBuddy] Poll error:`, err);
-      }
-
-      await Bun.sleep(pollMs);
+  async startPolling(
+    pollMs: number = this.queuePollMs,
+    claimBatchSize: number = this.queueClaimBatchSize,
+    maxParallel: number = this.queueMaxParallel,
+  ): Promise<void> {
+    if (this.queueWorker) {
+      console.log("[RemoteBuddy] Queue worker already running; skip duplicate start.");
+      return;
     }
+
+    const worker = new RequestQueueWorker({
+      server: this.server,
+      agentId: this.agentId,
+      pollIntervalMs: Math.max(200, pollMs),
+      claimBatchSize: Math.max(1, claimBatchSize),
+      maxParallel: Math.max(1, maxParallel),
+      authHeaders: () => this.authHeaders(),
+      observer: new ConsoleQueueWorkerObserver(),
+      onRequest: async (request, queueWaitMs) => {
+        await this.processRequest(request, queueWaitMs);
+      },
+    });
+    worker.start();
+    this.queueWorker = worker;
+    console.log(
+      `[RemoteBuddy] Queue worker started (poll=${Math.max(200, pollMs)}ms batch=${Math.max(
+        1,
+        claimBatchSize,
+      )} parallel=${Math.max(1, maxParallel)})`,
+    );
   }
 
   startAutonomy(): void {
@@ -1912,6 +1897,11 @@ class RemoteBuddyOrchestrator {
 
   dispose(): void {
     this.disposed = true;
+    const worker = this.queueWorker;
+    this.queueWorker = null;
+    if (worker) {
+      void worker.stop();
+    }
     this.autonomousEngine.stop();
     if (this.statusHeartbeatTimer) {
       clearInterval(this.statusHeartbeatTimer);
@@ -2053,7 +2043,9 @@ async function main() {
 
   // Start polling for requests from the Request Queue
   const pollMs = CONFIG.remotebuddy.pollMs;
-  orchestrator.startPolling(pollMs);
+  const claimBatchSize = CONFIG.remotebuddy.queueClaimBatchSize;
+  const maxParallel = CONFIG.remotebuddy.queueMaxParallel;
+  orchestrator.startPolling(pollMs, claimBatchSize, maxParallel);
 }
 
 main().catch((err) => {

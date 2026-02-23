@@ -86,6 +86,8 @@ export interface PushPalsConfig {
   };
   remotebuddy: {
     pollMs: number;
+    queueClaimBatchSize: number;
+    queueMaxParallel: number;
     statusHeartbeatMs: number;
     workerpalOnlineTtlMs: number;
     waitForWorkerpalMs: number;
@@ -658,6 +660,27 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const remotePollMs = Math.max(
     200,
     asInt(parseIntEnv("REMOTEBUDDY_POLL_MS") ?? remoteNode.poll_ms, 2_000),
+  );
+  const remoteQueueClaimBatchSize = Math.max(
+    1,
+    Math.min(
+      8,
+      asInt(
+        parseIntEnv("REMOTEBUDDY_QUEUE_CLAIM_BATCH_SIZE") ??
+          remoteNode.queue_claim_batch_size,
+        2,
+      ),
+    ),
+  );
+  const remoteQueueMaxParallel = Math.max(
+    1,
+    Math.min(
+      16,
+      asInt(
+        parseIntEnv("REMOTEBUDDY_QUEUE_MAX_PARALLEL") ?? remoteNode.queue_max_parallel,
+        4,
+      ),
+    ),
   );
   const remoteLlm = resolveLlmConfig(
     remoteNode,
@@ -1339,6 +1362,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     },
     remotebuddy: {
       pollMs: remotePollMs,
+      queueClaimBatchSize: remoteQueueClaimBatchSize,
+      queueMaxParallel: remoteQueueMaxParallel,
       statusHeartbeatMs: remoteStatusHeartbeatMs,
       workerpalOnlineTtlMs: Math.max(
         1_000,

@@ -18,6 +18,9 @@ codex_timeout_ms = 120000
 reasoning_effort = "high"
 
 [remotebuddy]
+poll_ms = 500
+queue_claim_batch_size = 2
+queue_max_parallel = 4
 max_workerpals = 20
 crash_restart_enabled = true
 crash_restart_max_restarts = 3
