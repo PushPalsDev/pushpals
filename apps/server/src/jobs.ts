@@ -24,6 +24,8 @@ export interface JobRow {
   sessionId: string;
   kind: string;
   params: string;
+  dedupeKey: string | null;
+  dedupeCooldownMs: number;
   priority: JobPriority;
   queueWaitBudgetMs: number;
   executionBudgetMs: number;
@@ -143,6 +145,12 @@ function parseBudgetMs(value: unknown, fallback: number): number {
   return Math.max(1_000, parsed);
 }
 
+function parseDedupeCooldownMs(value: unknown, fallback: number): number {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.max(0, Math.min(parsed, 10 * 60 * 1000));
+}
+
 function parseIsoMs(value: string | null | undefined): number | null {
   if (!value) return null;
   const ms = Date.parse(value);
@@ -203,6 +211,13 @@ function extractPlanningField(params: unknown, key: string): unknown {
   return (planning as Record<string, unknown>)[key];
 }
 
+function normalizeDedupeKey(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const key = value.trim().toLowerCase();
+  if (!key) return null;
+  return key.slice(0, 512);
+}
+
 export class JobQueue {
   private db: Database;
 
@@ -220,6 +235,8 @@ export class JobQueue {
           sessionId           TEXT NOT NULL DEFAULT '',
           kind                TEXT NOT NULL,
           params              TEXT NOT NULL DEFAULT '{}',
+          dedupeKey           TEXT,
+          dedupeCooldownMs    INTEGER NOT NULL DEFAULT 0,
           priority            TEXT NOT NULL DEFAULT 'normal',
           queueWaitBudgetMs   INTEGER NOT NULL DEFAULT 90000,
           executionBudgetMs   INTEGER NOT NULL DEFAULT 900000,
@@ -285,6 +302,12 @@ export class JobQueue {
     if (!jobColumns.some((col) => col.name === "priority")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
     }
+    if (!jobColumns.some((col) => col.name === "dedupeKey")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN dedupeKey TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "dedupeCooldownMs")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN dedupeCooldownMs INTEGER NOT NULL DEFAULT 0;`);
+    }
     if (!jobColumns.some((col) => col.name === "queueWaitBudgetMs")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`);
     }
@@ -328,6 +351,14 @@ export class JobQueue {
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`,
     );
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_created ON jobs(dedupeKey, createdAt);`);
+    this.db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_active
+         ON jobs(dedupeKey)
+       WHERE dedupeKey IS NOT NULL
+         AND dedupeKey <> ''
+         AND status IN ('pending','claimed');`,
+    );
 
     this.db.exec(`
       UPDATE jobs
@@ -336,6 +367,10 @@ export class JobQueue {
           WHEN 'interactive' THEN 'interactive'
           WHEN 'background' THEN 'background'
           ELSE 'normal'
+        END,
+        dedupeCooldownMs = CASE
+          WHEN dedupeCooldownMs IS NULL OR dedupeCooldownMs < 0 THEN 0
+          ELSE dedupeCooldownMs
         END,
         queueWaitBudgetMs = CASE WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90000 ELSE queueWaitBudgetMs END,
         executionBudgetMs = CASE WHEN executionBudgetMs IS NULL OR executionBudgetMs <= 0 THEN 900000 ELSE executionBudgetMs END,
@@ -402,6 +437,7 @@ export class JobQueue {
     jobId?: string;
     queuePosition?: number;
     etaMs?: number;
+    deduped?: boolean;
     message?: string;
   } {
     const taskId = String(body.taskId ?? "").trim();
@@ -436,42 +472,114 @@ export class JobQueue {
       body.finalizationBudgetMs ?? extractPlanningField(params, "finalizationBudgetMs"),
       JOB_FINALIZATION_BUDGET_MS_DEFAULT,
     );
+    const dedupeKey = normalizeDedupeKey(body.dedupeKey);
+    const dedupeCooldownMs = parseDedupeCooldownMs(body.dedupeCooldownMs, dedupeKey ? 0 : 0);
+
+    if (dedupeKey) {
+      const active = this.db
+        .prepare(
+          `SELECT id
+           FROM jobs
+           WHERE dedupeKey = ?
+             AND status IN ('pending', 'claimed')
+           ORDER BY createdAt DESC
+           LIMIT 1`,
+        )
+        .get(dedupeKey) as { id: string } | undefined;
+      if (active?.id) {
+        return {
+          ok: true,
+          jobId: active.id,
+          deduped: true,
+          message: `Active job already exists for dedupeKey ${dedupeKey}`,
+        };
+      }
+
+      if (dedupeCooldownMs > 0) {
+        const latest = this.db
+          .prepare(
+            `SELECT id, createdAt
+             FROM jobs
+             WHERE dedupeKey = ?
+             ORDER BY createdAt DESC
+             LIMIT 1`,
+          )
+          .get(dedupeKey) as { id: string; createdAt: string } | undefined;
+        if (latest?.id) {
+          const createdAtMs = parseIsoMs(latest.createdAt);
+          if (createdAtMs != null && Date.now() - createdAtMs < dedupeCooldownMs) {
+            return {
+              ok: true,
+              jobId: latest.id,
+              deduped: true,
+              message: `Dedupe cooldown active for dedupeKey ${dedupeKey}`,
+            };
+          }
+        }
+      }
+    }
 
     const jobId = randomUUID();
     const now = new Date().toISOString();
-
-    this.db
-      .prepare(
-        `INSERT INTO jobs (
-          id, taskId, sessionId, kind, params, priority,
-          queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
-          status, workerId, targetWorkerId, result, error,
-          enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, completedAt, durationMs,
-          createdAt, updatedAt
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO jobs (
+            id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
+            queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+            status, workerId, targetWorkerId, result, error,
+            enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, completedAt, durationMs,
+            createdAt, updatedAt
+          )
+           VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?,
+            'pending', NULL, ?, NULL, NULL,
+            ?, NULL, NULL, NULL, NULL, NULL, NULL,
+            ?, ?
+           )`,
         )
-         VALUES (
-          ?, ?, ?, ?, ?, ?,
-          ?, ?, ?,
-          'pending', NULL, ?, NULL, NULL,
-          ?, NULL, NULL, NULL, NULL, NULL, NULL,
-          ?, ?
-         )`,
-      )
-      .run(
-        jobId,
-        taskId,
-        sessionId,
-        kind,
-        JSON.stringify(params),
-        priority,
-        queueWaitBudgetMs,
-        executionBudgetMs,
-        finalizationBudgetMs,
-        targetWorkerId,
-        now,
-        now,
-        now,
-      );
+        .run(
+          jobId,
+          taskId,
+          sessionId,
+          kind,
+          JSON.stringify(params),
+          dedupeKey,
+          dedupeCooldownMs,
+          priority,
+          queueWaitBudgetMs,
+          executionBudgetMs,
+          finalizationBudgetMs,
+          targetWorkerId,
+          now,
+          now,
+          now,
+        );
+    } catch (err: any) {
+      const message = String(err?.message ?? err ?? "");
+      if (dedupeKey && /UNIQUE constraint failed/i.test(message)) {
+        const active = this.db
+          .prepare(
+            `SELECT id
+             FROM jobs
+             WHERE dedupeKey = ?
+               AND status IN ('pending', 'claimed')
+             ORDER BY createdAt DESC
+             LIMIT 1`,
+          )
+          .get(dedupeKey) as { id: string } | undefined;
+        if (active?.id) {
+          return {
+            ok: true,
+            jobId: active.id,
+            deduped: true,
+            message: `Active job already exists for dedupeKey ${dedupeKey}`,
+          };
+        }
+      }
+      throw err;
+    }
 
     const queuePosition = this.queuePosition(jobId, targetWorkerId);
     const etaMs = this.estimateEtaMs(priority, queuePosition);

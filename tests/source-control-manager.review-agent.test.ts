@@ -260,6 +260,65 @@ describe("ReviewAgent", () => {
     expect(jobEnqueueCalls).toBe(500);
   });
 
+  test("skips duplicate fix enqueue when active job already exists for same PR head SHA", async () => {
+    const pr = makePr({ number: 77, html_url: "https://example.com/pr/77" });
+    let enqueueCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.0,
+            summary: "Needs follow-up fixes",
+            issues: ["Add missing edge-case assertions"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => [],
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (url.includes("/jobs?status=pending")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                jobs: [
+                  {
+                    id: "existing-fix-job",
+                    kind: "task.execute",
+                    params: JSON.stringify({
+                      reviewAgent: {
+                        prNumber: pr.number,
+                        prHeadSha: pr.head.sha,
+                      },
+                    }),
+                  },
+                ],
+              }),
+              { status: 200 },
+            );
+          }
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+            return new Response(JSON.stringify({ ok: true, jobId: "new-job" }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+    expect(enqueueCalls).toBe(0);
+  });
+
   test("enqueues fallback instruction when reviewer omits fix_instruction", async () => {
     const pr = makePr({ number: 7, html_url: "https://example.com/pr/7" });
     let enqueuedInstruction = "";
@@ -267,6 +326,9 @@ describe("ReviewAgent", () => {
     let enqueuedTaskId = "";
     let enqueuedCompletionBranch = "";
     let enqueuedRecentContext: string[] = [];
+    let enqueuedDedupeKey = "";
+    let enqueuedDedupeCooldownMs = -1;
+    let createdTaskTitle = "";
     const emittedCommandTypes: string[] = [];
 
     const agent = new ReviewAgent(
@@ -309,6 +371,8 @@ describe("ReviewAgent", () => {
           const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
           if (url.endsWith("/jobs/enqueue")) {
             enqueuedTaskId = String(payload.taskId ?? "");
+            enqueuedDedupeKey = String(payload.dedupeKey ?? "");
+            enqueuedDedupeCooldownMs = Number(payload.dedupeCooldownMs ?? -1);
             const params =
               payload.params && typeof payload.params === "object"
                 ? (payload.params as Record<string, unknown>)
@@ -332,6 +396,13 @@ describe("ReviewAgent", () => {
             return new Response(JSON.stringify({ ok: true, jobId: "job-fix-7" }), { status: 200 });
           }
           if (url.endsWith("/sessions/dev/command")) {
+            if (String(payload.type ?? "") === "task_created") {
+              const commandPayload =
+                payload.payload && typeof payload.payload === "object"
+                  ? (payload.payload as Record<string, unknown>)
+                  : {};
+              createdTaskTitle = String(commandPayload.title ?? "");
+            }
             emittedCommandTypes.push(String(payload.type ?? ""));
             return new Response(JSON.stringify({ ok: true }), { status: 200 });
           }
@@ -347,7 +418,10 @@ describe("ReviewAgent", () => {
     expect(enqueuedInstruction).toContain("Address ReviewAgent feedback for PR #7");
     expect(enqueuedInstruction).toContain("Missing negative-path assertions");
     expect(enqueuedTaskId).toBe("review-fix-pr7-123");
+    expect(enqueuedDedupeKey).toBe("7:abc123def456");
+    expect(enqueuedDedupeCooldownMs).toBe(60_000);
     expect(enqueuedCompletionBranch).toBe("agent/test-branch");
+    expect(createdTaskTitle).toBe("Address ReviewAgent feedback for PR #7 @ abc123de");
     expect(enqueuedWriteGlobs.length).toBeGreaterThan(0);
     expect(enqueuedRecentContext).toContain("Recent PR feedback comments:");
     expect(

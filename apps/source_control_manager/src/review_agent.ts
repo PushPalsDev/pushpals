@@ -47,6 +47,8 @@ const MAX_PR_RE_REVIEW_ENQUEUES = 500;
 const MAX_REVIEW_CONTEXT_COMMENTS = 8;
 const MAX_REVIEW_CONTEXT_COMMENT_CHARS = 320;
 const MAX_REVIEW_CONTEXT_TOTAL_CHARS = 3_000;
+const MAX_ACTIVE_FIX_JOB_SCAN = 500;
+const REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS = 60_000;
 const PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
@@ -643,6 +645,47 @@ export function deriveFixWriteGlobsFromDiff(diff: string): string[] {
   return [...globs].slice(0, 16);
 }
 
+function normalizeReviewFixHeadSha(value: string): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function reviewFixDedupeKey(prNumber: number, headSha: string): string {
+  return `${prNumber}:${normalizeReviewFixHeadSha(headSha)}`;
+}
+
+type ActiveJobLike = {
+  id?: string;
+  kind?: string;
+  params?: string | Record<string, unknown> | null;
+};
+
+function extractReviewFixDedupeKeyFromJob(job: ActiveJobLike): string | null {
+  if (String(job.kind ?? "").trim() !== "task.execute") return null;
+  const rawParams = job.params;
+  let params: Record<string, unknown> = {};
+  if (typeof rawParams === "string") {
+    try {
+      const parsed = JSON.parse(rawParams) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        params = parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  } else if (rawParams && typeof rawParams === "object" && !Array.isArray(rawParams)) {
+    params = rawParams as Record<string, unknown>;
+  } else {
+    return null;
+  }
+  const reviewAgent = params.reviewAgent;
+  if (!reviewAgent || typeof reviewAgent !== "object" || Array.isArray(reviewAgent)) return null;
+  const reviewAgentRecord = reviewAgent as Record<string, unknown>;
+  const prNumber = Number(reviewAgentRecord.prNumber);
+  const prHeadSha = normalizeReviewFixHeadSha(String(reviewAgentRecord.prHeadSha ?? ""));
+  if (!Number.isFinite(prNumber) || prNumber <= 0 || !prHeadSha) return null;
+  return reviewFixDedupeKey(Math.floor(prNumber), prHeadSha);
+}
+
 export class ReviewAgent {
   private reviewed = new Map<number, string>();
   private forceReReview = new Map<number, string>();
@@ -906,6 +949,14 @@ export class ReviewAgent {
       return true;
     }
 
+    const existingFixJobId = await this.findActiveFixJobIdForPrHead(pr.number, pr.head.sha);
+    if (existingFixJobId) {
+      this.deps.logInfo(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} already has active fix job ${existingFixJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate enqueue.`,
+      );
+      return true;
+    }
+
     const enqueued = await this.enqueueFixJob(pr, verdict, sessionId, jobId, diff, [
       rejectionComment,
     ]);
@@ -970,6 +1021,46 @@ export class ReviewAgent {
     }
   }
 
+  private async findActiveFixJobIdForPrHead(
+    prNumber: number,
+    headSha: string,
+  ): Promise<string | null> {
+    const dedupeKey = reviewFixDedupeKey(prNumber, headSha);
+    const headers: Record<string, string> = {};
+    if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
+    for (const status of ["pending", "claimed"] as const) {
+      try {
+        const url = `${this.serverUrl}/jobs?status=${status}&limit=${MAX_ACTIVE_FIX_JOB_SCAN}`;
+        const response = await this.deps.fetchImpl(url, { headers });
+        if (!response.ok) {
+          const text = await response.text().catch(() => "");
+          this.deps.logWarn(
+            `[${ts()}] [ReviewAgent] Failed active-fix dedupe scan (${status}) for PR #${prNumber}: HTTP ${response.status}${text ? `: ${text}` : ""}`,
+          );
+          continue;
+        }
+        const payload = (await response.json().catch(() => null)) as
+          | { jobs?: unknown }
+          | null;
+        const jobs = payload && Array.isArray(payload.jobs) ? payload.jobs : [];
+        for (const rawJob of jobs) {
+          if (!rawJob || typeof rawJob !== "object" || Array.isArray(rawJob)) continue;
+          const job = rawJob as ActiveJobLike;
+          const jobDedupeKey = extractReviewFixDedupeKeyFromJob(job);
+          if (jobDedupeKey !== dedupeKey) continue;
+          const jobId =
+            typeof job.id === "string" && job.id.trim().length > 0 ? job.id.trim() : "(unknown)";
+          return jobId;
+        }
+      } catch (err: any) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Active-fix dedupe scan failed for PR #${prNumber} (${status}): ${err?.message ?? err}`,
+        );
+      }
+    }
+    return null;
+  }
+
   private async emitFixJobQueuedEvents(args: {
     sessionId: string;
     taskId: string;
@@ -997,13 +1088,14 @@ export class ReviewAgent {
     const taskDescription =
       args.verdict.summary.trim() ||
       `Address ReviewAgent feedback and update PR #${args.pr.number} (${args.pr.html_url}).`;
+    const shortHeadSha = normalizeReviewFixHeadSha(args.pr.head.sha).slice(0, 8) || "unknown";
     await this.sendSessionCommand(args.sessionId, args.headers, {
       type: "task_created",
       from,
       correlationId: args.taskId,
       payload: {
         taskId: args.taskId,
-        title: `Address ReviewAgent feedback for PR #${args.pr.number}`,
+        title: `Address ReviewAgent feedback for PR #${args.pr.number} @ ${shortHeadSha}`,
         description: taskDescription,
         createdBy: "review_agent",
         priority: "normal",
@@ -1071,6 +1163,8 @@ export class ReviewAgent {
       taskId,
       sessionId,
       kind: "task.execute",
+      dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha),
+      dedupeCooldownMs: REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS,
       params: {
         schemaVersion: 2,
         origin: "autonomy",
@@ -1099,6 +1193,7 @@ export class ReviewAgent {
         reviewAgent: {
           prNumber: pr.number,
           prUrl: pr.html_url,
+          prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
           prHeadRef: prHeadRef ?? pr.head.ref,
           prBaseRef: pr.base.ref,
           previousReviewScore: verdict.score,
