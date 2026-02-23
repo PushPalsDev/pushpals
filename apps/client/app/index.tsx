@@ -280,6 +280,25 @@ export default function DashboardScreen() {
     return latest?.ts;
   }, [session.state.messages]);
 
+  const pendingRequestsCount =
+    systemSummary.queues?.requests?.pending ?? queueValue(requestCounts, "pending");
+  const claimedRequestsCount =
+    systemSummary.queues?.requests?.claimed ?? queueValue(requestCounts, "claimed");
+  const pendingJobsCount = systemSummary.queues?.jobs?.pending ?? queueValue(jobCounts, "pending");
+  const runningJobsCount = systemSummary.queues?.jobs?.claimed ?? queueValue(jobCounts, "claimed");
+  const failedJobsCount = systemSummary.queues?.jobs?.failed ?? queueValue(jobCounts, "failed");
+  const processedCompletionsCount =
+    systemSummary.queues?.completions?.processed ?? queueValue(completionCounts, "processed");
+  const pendingCompletionsCount =
+    systemSummary.queues?.completions?.pending ?? queueValue(completionCounts, "pending");
+  const failedCompletionsCount =
+    systemSummary.queues?.completions?.failed ?? queueValue(completionCounts, "failed");
+  const onlineWorkersCount =
+    systemSummary.workers?.online ?? workers.filter((worker) => worker.isOnline).length;
+  const busyWorkersCount =
+    systemSummary.workers?.busy ??
+    workers.filter((worker) => worker.isOnline && worker.status === "busy").length;
+
   const flowSteps = useMemo<FlowStep[]>(
     () => [
       {
@@ -304,33 +323,29 @@ export default function DashboardScreen() {
       {
         key: "remote",
         label: "3. RemoteBuddy",
-        detail: `${queueValue(requestCounts, "pending")} pending, ${queueValue(requestCounts, "claimed")} claimed`,
+        detail: `${pendingRequestsCount} pending, ${claimedRequestsCount} claimed`,
         tone:
-          queueValue(requestCounts, "claimed") > 0
-            ? "warning"
-            : queueValue(requestCounts, "pending") > 0
-              ? "accent"
-              : "positive",
+          claimedRequestsCount > 0 ? "warning" : pendingRequestsCount > 0 ? "accent" : "positive",
       },
       {
         key: "worker",
         label: "4. WorkerPals",
-        detail: `${queueValue(jobCounts, "claimed")} running, ${queueValue(jobCounts, "pending")} queued`,
+        detail: `${onlineWorkersCount} online, ${busyWorkersCount} busy, ${pendingJobsCount} queued`,
         tone:
-          queueValue(jobCounts, "claimed") > 0
+          busyWorkersCount > 0 || runningJobsCount > 0
             ? "warning"
-            : queueValue(jobCounts, "failed") > 0
+            : failedJobsCount > 0
               ? "danger"
               : "positive",
       },
       {
         key: "scm",
         label: "5. SCM",
-        detail: `${queueValue(completionCounts, "processed")} ready, ${queueValue(completionCounts, "pending")} pending`,
+        detail: `${processedCompletionsCount} ready, ${pendingCompletionsCount} pending`,
         tone:
-          queueValue(completionCounts, "failed") > 0
+          failedCompletionsCount > 0
             ? "danger"
-            : queueValue(completionCounts, "processed") > 0
+            : processedCompletionsCount > 0
               ? "positive"
               : "accent",
       },
@@ -339,9 +354,16 @@ export default function DashboardScreen() {
       lastClientMessageTs,
       pendingLocalResponses,
       lastLocalBuddyTs,
-      requestCounts,
-      jobCounts,
-      completionCounts,
+      pendingRequestsCount,
+      claimedRequestsCount,
+      onlineWorkersCount,
+      busyWorkersCount,
+      pendingJobsCount,
+      runningJobsCount,
+      failedJobsCount,
+      processedCompletionsCount,
+      pendingCompletionsCount,
+      failedCompletionsCount,
     ],
   );
 
@@ -413,6 +435,9 @@ export default function DashboardScreen() {
           theme={theme}
           mode={mode}
           repo={systemSummary.repo}
+          snapshotTs={systemSummary.ts ?? null}
+          formatRelativeTime={relativeMs}
+          formatAbsoluteTime={prettyTs}
           onChangeMode={setMode}
         />
 
@@ -435,12 +460,10 @@ export default function DashboardScreen() {
           theme={theme}
           connected={session.isConnected}
           totalEvents={totalEvents}
-          pendingRequests={queueValue(requestCounts, "pending")}
-          pendingJobs={queueValue(jobCounts, "pending")}
-          onlineWorkers={systemSummary.workers?.online ?? workers.filter((w) => w.isOnline).length}
-          busyWorkers={
-            systemSummary.workers?.busy ?? workers.filter((w) => w.status === "busy").length
-          }
+          pendingRequests={pendingRequestsCount}
+          pendingJobs={pendingJobsCount}
+          onlineWorkers={onlineWorkersCount}
+          busyWorkers={busyWorkersCount}
           lastRefresh={lastRefresh}
           formatRelativeTime={relativeMs}
           formatAbsoluteTime={prettyTs}

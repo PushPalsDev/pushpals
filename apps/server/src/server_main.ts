@@ -495,7 +495,7 @@ export function createRequestHandler() {
         const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
         const workers = jobQueue.listWorkers(ttlMs);
         const onlineWorkers = workers.filter((w) => w.isOnline);
-        const busyWorkers = workers.filter((w) => w.status === "busy").length;
+        const busyWorkers = onlineWorkers.filter((w) => w.status === "busy").length;
 
         return makeJson({
           ok: true,

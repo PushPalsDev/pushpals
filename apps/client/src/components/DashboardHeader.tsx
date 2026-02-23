@@ -8,15 +8,24 @@ export function DashboardHeader({
   theme,
   mode,
   repo,
+  snapshotTs,
+  formatRelativeTime,
+  formatAbsoluteTime,
   onChangeMode,
 }: {
   theme: DashboardTheme;
   mode: ThemeModeOption;
   repo?: SystemRepoSummary;
+  snapshotTs?: string | null;
+  formatRelativeTime: (iso?: string) => string;
+  formatAbsoluteTime: (iso?: string) => string;
   onChangeMode: (mode: ThemeModeOption) => void;
 }) {
   const repoText = repo?.remoteUrl?.trim() || "unavailable";
   const repoLink = repo?.provider === "github" ? repo.browserUrl : null;
+  const snapshotValue = snapshotTs
+    ? `${formatRelativeTime(snapshotTs)} (${formatAbsoluteTime(snapshotTs)})`
+    : "waiting for /system/status";
   const openRepoLink = React.useCallback(async () => {
     if (!repoLink) return;
     try {
@@ -52,6 +61,17 @@ export function DashboardHeader({
             onPress={repoLink ? () => void openRepoLink() : undefined}
           >
             {repoText}
+          </Text>
+        </Text>
+        <Text
+          style={[
+            styles.snapshotLine,
+            { color: snapshotTs ? theme.accent : theme.textMuted, fontFamily: theme.fontSans },
+          ]}
+        >
+          Snapshot:{" "}
+          <Text style={[styles.snapshotValue, { color: theme.text, fontFamily: theme.fontMono }]}>
+            {snapshotValue}
           </Text>
         </Text>
       </View>
@@ -96,5 +116,13 @@ const styles = StyleSheet.create({
   },
   repoLink: {
     textDecorationLine: "underline",
+  },
+  snapshotLine: {
+    marginTop: 4,
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  snapshotValue: {
+    fontSize: 12,
   },
 });

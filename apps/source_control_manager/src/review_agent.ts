@@ -262,8 +262,7 @@ export function parseReviewVerdict(raw: string): ReviewVerdict | null {
     const issues = Array.isArray(obj.issues)
       ? (obj.issues as unknown[]).filter((entry) => typeof entry === "string").map(String)
       : [];
-    const fixInstruction =
-      typeof obj.fix_instruction === "string" ? obj.fix_instruction : "";
+    const fixInstruction = typeof obj.fix_instruction === "string" ? obj.fix_instruction : "";
 
     return {
       score,
@@ -283,7 +282,10 @@ function extractMetaMarker(body: string, markerName: string): string | null {
   return match ? match[1] : null;
 }
 
-export function extractPrMeta(body: string | null): { jobId: string | null; sessionId: string | null } {
+export function extractPrMeta(body: string | null): {
+  jobId: string | null;
+  sessionId: string | null;
+} {
   if (!body) return { jobId: null, sessionId: null };
 
   return {
@@ -367,7 +369,10 @@ function formatApprovalComment(verdict: ReviewVerdict, passThreshold: number): s
     lines.push("- None noted by reviewer.");
   }
 
-  lines.push("", "_This PR met the configured review threshold and is approved for automated merge._");
+  lines.push(
+    "",
+    "_This PR met the configured review threshold and is approved for automated merge._",
+  );
 
   return lines.join("\n");
 }
@@ -403,7 +408,11 @@ function buildMergeCommitText(args: {
 }): { commitTitle: string; commitMessage: string } {
   const parsed = splitCommitTitleAndBody(args.sourceCommitMessage);
   const commitTitle = parsed.title || `${args.pr.title} (#${args.pr.number})`;
-  const reviewAgentSection = formatReviewAgentMergeSection(args.pr, args.verdict, args.passThreshold);
+  const reviewAgentSection = formatReviewAgentMergeSection(
+    args.pr,
+    args.verdict,
+    args.passThreshold,
+  );
   const commitMessage = parsed.body
     ? `${parsed.body}\n\n${reviewAgentSection}`
     : reviewAgentSection;
@@ -647,7 +656,9 @@ export function deriveFixWriteGlobsFromDiff(diff: string): string[] {
 }
 
 function normalizeReviewFixHeadSha(value: string): string {
-  return String(value ?? "").trim().toLowerCase();
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
 }
 
 function reviewFixDedupeKey(prNumber: number, headSha: string): string {
@@ -1092,9 +1103,7 @@ export class ReviewAgent {
           );
           continue;
         }
-        const payload = (await response.json().catch(() => null)) as
-          | { jobs?: unknown }
-          | null;
+        const payload = (await response.json().catch(() => null)) as { jobs?: unknown } | null;
         const jobs = payload && Array.isArray(payload.jobs) ? payload.jobs : [];
         for (const rawJob of jobs) {
           if (!rawJob || typeof rawJob !== "object" || Array.isArray(rawJob)) continue;
@@ -1149,9 +1158,10 @@ export class ReviewAgent {
     const taskTitle =
       args.taskTitle?.trim() ||
       `Address ReviewAgent feedback for PR #${args.pr.number} @ ${shortHeadSha}`;
-    const taskTags = Array.isArray(args.taskTags) && args.taskTags.length > 0
-      ? args.taskTags
-      : ["review-agent", "pr-fix"];
+    const taskTags =
+      Array.isArray(args.taskTags) && args.taskTags.length > 0
+        ? args.taskTags
+        : ["review-agent", "pr-fix"];
     await this.sendSessionCommand(args.sessionId, args.headers, {
       type: "task_created",
       from,
@@ -1217,7 +1227,8 @@ export class ReviewAgent {
   ): Promise<boolean> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
     const issuesSummary = verdict.issues.length > 0 ? verdict.issues.join("; ") : "see summary";
-    const fixInstruction = verdict.fix_instruction.trim() || buildFallbackFixInstruction(pr, verdict);
+    const fixInstruction =
+      verdict.fix_instruction.trim() || buildFallbackFixInstruction(pr, verdict);
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
     const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
     const feedbackContext = await this.getRecentFeedbackContext(pr, excludedBodies);
@@ -1283,10 +1294,17 @@ export class ReviewAgent {
         const text = await response.text();
         throw new Error(`HTTP ${response.status}: ${text}`);
       }
-      const responseBody = (await response.json().catch(() => null)) as { jobId?: unknown } | null;
+      const responseBody = (await response.json().catch(() => null)) as {
+        jobId?: unknown;
+        deduped?: unknown;
+        message?: unknown;
+      } | null;
       const enqueuedJobId =
         responseBody && typeof responseBody.jobId === "string" ? responseBody.jobId : "";
-      if (enqueuedJobId) {
+      const deduped = responseBody?.deduped === true;
+      const dedupeMessage =
+        responseBody && typeof responseBody.message === "string" ? responseBody.message : "";
+      if (enqueuedJobId && !deduped) {
         try {
           await this.emitFixJobQueuedEvents({
             sessionId,
@@ -1303,6 +1321,12 @@ export class ReviewAgent {
             `[${ts()}] [ReviewAgent] Fix job ${enqueuedJobId} enqueued for PR #${pr.number}, but failed to emit session task/job events: ${emitErr?.message ?? emitErr}`,
           );
         }
+      }
+      if (deduped) {
+        this.deps.logInfo(
+          `[${ts()}] [ReviewAgent] PR #${pr.number} fix request deduped to existing active job ${enqueuedJobId || "(unknown)"} for head ${pr.head.sha.slice(0, 8)}${dedupeMessage ? ` (${dedupeMessage})` : ""}; skipping duplicate task events.`,
+        );
+        return true;
       }
 
       this.deps.logInfo(
@@ -1329,7 +1353,9 @@ export class ReviewAgent {
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
     const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
     const mergeErrorSummary = truncateText(
-      collapseWhitespace(String((mergeError as { message?: unknown })?.message ?? mergeError ?? "")),
+      collapseWhitespace(
+        String((mergeError as { message?: unknown })?.message ?? mergeError ?? ""),
+      ),
       360,
     );
     const instruction = [
@@ -1352,7 +1378,9 @@ export class ReviewAgent {
         recentContext: [
           `PR #${pr.number} (${pr.html_url}) is approved but blocked by merge conflicts.`,
           `Approved score: ${verdict.score.toFixed(1)}/10`,
-          mergeErrorSummary ? `GitHub merge error: ${mergeErrorSummary}` : "GitHub merge error: (unavailable)",
+          mergeErrorSummary
+            ? `GitHub merge error: ${mergeErrorSummary}`
+            : "GitHub merge error: (unavailable)",
         ],
         planning: {
           intent: "code_change",
@@ -1401,10 +1429,17 @@ export class ReviewAgent {
         const text = await response.text();
         throw new Error(`HTTP ${response.status}: ${text}`);
       }
-      const responseBody = (await response.json().catch(() => null)) as { jobId?: unknown } | null;
+      const responseBody = (await response.json().catch(() => null)) as {
+        jobId?: unknown;
+        deduped?: unknown;
+        message?: unknown;
+      } | null;
       const enqueuedJobId =
         responseBody && typeof responseBody.jobId === "string" ? responseBody.jobId : "";
-      if (enqueuedJobId) {
+      const deduped = responseBody?.deduped === true;
+      const dedupeMessage =
+        responseBody && typeof responseBody.message === "string" ? responseBody.message : "";
+      if (enqueuedJobId && !deduped) {
         try {
           const shortHeadSha = normalizeReviewFixHeadSha(pr.head.sha).slice(0, 8) || "unknown";
           await this.emitFixJobQueuedEvents({
@@ -1427,6 +1462,12 @@ export class ReviewAgent {
             `[${ts()}] [ReviewAgent] Merge-conflict job ${enqueuedJobId} enqueued for PR #${pr.number}, but failed to emit session task/job events: ${emitErr?.message ?? emitErr}`,
           );
         }
+      }
+      if (deduped) {
+        this.deps.logInfo(
+          `[${ts()}] [ReviewAgent] PR #${pr.number} merge-conflict request deduped to existing active job ${enqueuedJobId || "(unknown)"} for head ${pr.head.sha.slice(0, 8)}${dedupeMessage ? ` (${dedupeMessage})` : ""}; skipping duplicate task events.`,
+        );
+        return true;
       }
 
       this.deps.logInfo(

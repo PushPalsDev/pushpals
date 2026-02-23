@@ -87,17 +87,24 @@ describe("ReviewAgent", () => {
   });
 
   test("builds review prompt with configured score threshold policy", () => {
-    const prompt = buildReviewPrompt("Criteria body", makePr(), "diff --git a/file b/file\n+line", 8.5);
+    const prompt = buildReviewPrompt(
+      "Criteria body",
+      makePr(),
+      "diff --git a/file b/file\n+line",
+      8.5,
+    );
     expect(prompt).toContain("ReviewAgent approves iff score >= 8.5/10.");
   });
 
   test("derives scoped write globs from PR diff paths", () => {
-    const globs = deriveFixWriteGlobsFromDiff([
-      "diff --git a/apps/localbuddy/src/request_status.ts b/apps/localbuddy/src/request_status.ts",
-      "diff --git a/tests/localbuddy.request-status.test.ts b/tests/localbuddy.request-status.test.ts",
-      "diff --git a/README.md b/README.md",
-      "diff --git \"a/apps/local buddy/src/space file.ts\" \"b/apps/local buddy/src/space file.ts\"",
-    ].join("\n"));
+    const globs = deriveFixWriteGlobsFromDiff(
+      [
+        "diff --git a/apps/localbuddy/src/request_status.ts b/apps/localbuddy/src/request_status.ts",
+        "diff --git a/tests/localbuddy.request-status.test.ts b/tests/localbuddy.request-status.test.ts",
+        "diff --git a/README.md b/README.md",
+        'diff --git "a/apps/local buddy/src/space file.ts" "b/apps/local buddy/src/space file.ts"',
+      ].join("\n"),
+    );
     expect(globs).toContain("apps/localbuddy/**");
     expect(globs).toContain("tests/**");
     expect(globs).toContain("README.md");
@@ -228,7 +235,13 @@ describe("ReviewAgent", () => {
         listOpenPullRequests: async () => {
           const sha = pollCount.toString(16).padStart(40, "0");
           pollCount += 1;
-          return [makePr({ number: prNumber, html_url: `https://example.com/pr/${prNumber}`, head: { sha } })];
+          return [
+            makePr({
+              number: prNumber,
+              html_url: `https://example.com/pr/${prNumber}`,
+              head: { sha },
+            }),
+          ];
         },
         getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
         invokeCodexReview: async () =>
@@ -438,6 +451,65 @@ describe("ReviewAgent", () => {
     expect(emittedCommandTypes).toEqual(["task_created", "task_started", "job_enqueued"]);
   });
 
+  test("does not emit duplicate session task events when fix enqueue is deduped", async () => {
+    const pr = makePr({ number: 8, html_url: "https://example.com/pr/8" });
+    let enqueueCalls = 0;
+    const emittedCommandTypes: string[] = [];
+
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.1,
+            approved: false,
+            summary: "Needs work",
+            issues: ["add stronger assertions"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => [],
+        fetchImpl: async (_input, init) => {
+          const url = String(_input);
+          const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          if (url.includes("/jobs?status=pending") || url.includes("/jobs?status=claimed")) {
+            return new Response(JSON.stringify({ ok: true, jobs: [] }), { status: 200 });
+          }
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                jobId: "existing-fix-job",
+                deduped: true,
+                message: "Active job already exists for dedupeKey 8:abc123def456",
+              }),
+              { status: 200 },
+            );
+          }
+          if (url.endsWith("/sessions/dev/command")) {
+            emittedCommandTypes.push(String(payload.type ?? ""));
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        now: () => 234,
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(enqueueCalls).toBe(1);
+    expect(emittedCommandTypes).toEqual([]);
+  });
+
   test("skips overlapping poll ticks", async () => {
     let listCalls = 0;
 
@@ -534,9 +606,13 @@ describe("ReviewAgent", () => {
     expect(approvalCommentBody).toContain("Why this passed:** Score 8.7/10 is >= 8.5/10");
     expect(approvalCommentBody).toContain("Potential Improvements:**");
     expect(approvalCommentBody).toContain("Minor cleanup suggested");
-    expect(approvalCommentBody).toContain("This PR met the configured review threshold and is approved for automated merge");
+    expect(approvalCommentBody).toContain(
+      "This PR met the configured review threshold and is approved for automated merge",
+    );
     expect(mergeCommitTitle).toBe("feat(local_agent): expand localbuddy test coverage");
-    expect(mergeCommitMessage).toContain("- A new meaningful test case is added under apps/localbuddy");
+    expect(mergeCommitMessage).toContain(
+      "- A new meaningful test case is added under apps/localbuddy",
+    );
     expect(mergeCommitMessage).toContain("Tests:\n- bun --cwd apps/localbuddy test");
     expect(mergeCommitMessage).toContain("ReviewAgent:");
     expect(mergeCommitMessage).toContain("passed threshold of 8.5, commit rating 8.7/10");
@@ -713,7 +789,11 @@ describe("ReviewAgent", () => {
   });
 
   test("falls back to PR title merge metadata when head commit message lookup fails", async () => {
-    const pr = makePr({ number: 58, html_url: "https://example.com/pr/58", title: "Keep tests green" });
+    const pr = makePr({
+      number: 58,
+      html_url: "https://example.com/pr/58",
+      title: "Keep tests green",
+    });
     let mergeCommitTitle = "";
     let mergeCommitMessage = "";
 
@@ -759,7 +839,11 @@ describe("ReviewAgent", () => {
   });
 
   test("uses PR commit fallback when head commit lookup fails", async () => {
-    const pr = makePr({ number: 59, html_url: "https://example.com/pr/59", title: "Fallback title" });
+    const pr = makePr({
+      number: 59,
+      html_url: "https://example.com/pr/59",
+      title: "Fallback title",
+    });
     let mergeCommitTitle = "";
     let mergeCommitMessage = "";
 
@@ -866,7 +950,8 @@ describe("ReviewAgent", () => {
       undefined,
       {
         listOpenPullRequests: async () => [pr],
-        getPullRequestDiff: async () => "diff --git a/apps/remotebuddy/README.md b/apps/remotebuddy/README.md\n+line",
+        getPullRequestDiff: async () =>
+          "diff --git a/apps/remotebuddy/README.md b/apps/remotebuddy/README.md\n+line",
         invokeCodexReview: async () => {
           reviewCalls += 1;
           return JSON.stringify({
@@ -945,6 +1030,73 @@ describe("ReviewAgent", () => {
     expect(emittedCommandTypes).toEqual(["task_created", "task_started", "job_enqueued"]);
   });
 
+  test("does not emit duplicate session task events when merge-conflict enqueue is deduped", async () => {
+    const pr = makePr({ number: 72, html_url: "https://example.com/pr/72" });
+    let reviewCalls = 0;
+    let enqueueCalls = 0;
+    const emittedCommandTypes: string[] = [];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () =>
+          "diff --git a/apps/remotebuddy/README.md b/apps/remotebuddy/README.md\n+line",
+        invokeCodexReview: async () => {
+          reviewCalls += 1;
+          return JSON.stringify({
+            score: 9.3,
+            summary: "Looks good",
+            issues: [],
+            fix_instruction: "",
+          });
+        },
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "docs(remotebuddy): improve onboarding",
+        mergePullRequest: async () => {
+          throw new Error(
+            'GitHub API 405: {"message":"Pull Request is not mergeable","documentation_url":"https://docs.github.com/rest/pulls/pulls#merge-a-pull-request","status":"405"}',
+          );
+        },
+        fetchImpl: async (_input, init) => {
+          const url = String(_input);
+          const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          if (url.includes("/jobs?status=pending") || url.includes("/jobs?status=claimed")) {
+            return new Response(JSON.stringify({ ok: true, jobs: [] }), { status: 200 });
+          }
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                jobId: "existing-merge-job",
+                deduped: true,
+                message: "Active job already exists for dedupeKey 72:abc123def456",
+              }),
+              { status: 200 },
+            );
+          }
+          if (url.endsWith("/sessions/dev/command")) {
+            emittedCommandTypes.push(String(payload.type ?? ""));
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(reviewCalls).toBe(1);
+    expect(enqueueCalls).toBe(1);
+    expect(emittedCommandTypes).toEqual([]);
+  });
+
   test("skips duplicate merge-conflict enqueue when matching review job is already active", async () => {
     const pr = makePr({ number: 71, html_url: "https://example.com/pr/71" });
     let reviewCalls = 0;
@@ -959,7 +1111,8 @@ describe("ReviewAgent", () => {
       undefined,
       {
         listOpenPullRequests: async () => [pr],
-        getPullRequestDiff: async () => "diff --git a/apps/remotebuddy/README.md b/apps/remotebuddy/README.md\n+line",
+        getPullRequestDiff: async () =>
+          "diff --git a/apps/remotebuddy/README.md b/apps/remotebuddy/README.md\n+line",
         invokeCodexReview: async () => {
           reviewCalls += 1;
           return JSON.stringify({
@@ -972,7 +1125,9 @@ describe("ReviewAgent", () => {
         addPullRequestComment: async () => {},
         getCommitMessage: async () => "docs(remotebuddy): improve onboarding",
         mergePullRequest: async () => {
-          throw new Error('GitHub API 405: {"message":"Pull Request is not mergeable","status":"405"}');
+          throw new Error(
+            'GitHub API 405: {"message":"Pull Request is not mergeable","status":"405"}',
+          );
         },
         fetchImpl: async (_input) => {
           const url = String(_input);
