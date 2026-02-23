@@ -2785,6 +2785,56 @@ async function attemptGhAuthRefresh(
   return ghAuthStatusOk();
 }
 
+async function ensureGitHubAuthPreflight(): Promise<void> {
+  const skipCheck = envTruthy("PUSHPALS_SKIP_GH_AUTH_CHECK");
+  const sourceControlManagerPushDisabled = envTruthy("SOURCE_CONTROL_MANAGER_NO_PUSH");
+  if (skipCheck || sourceControlManagerPushDisabled) {
+    const reason = skipCheck ? "PUSHPALS_SKIP_GH_AUTH_CHECK=1" : "SOURCE_CONTROL_MANAGER_NO_PUSH=1";
+    console.log(`[start] GitHub auth preflight skipped (${reason}).`);
+    ghAuthPreflightSatisfied = true;
+    return;
+  }
+
+  const gitToken = CONFIG.gitToken;
+  if (gitToken) {
+    process.env.PUSHPALS_GIT_TOKEN = gitToken;
+    ghAuthPreflightSatisfied = true;
+    console.log("[start] GitHub auth preflight: token is configured via env/config.");
+    return;
+  }
+
+  const ghAvailable = (await runQuiet(["gh", "--version"])) === 0;
+  if (!ghAvailable) {
+    console.error("[start] GitHub auth preflight failed: `gh` CLI is not installed.");
+    console.error("[start] Install GitHub CLI or set one of: PUSHPALS_GIT_TOKEN, GITHUB_TOKEN, GH_TOKEN.");
+    abortStart(1);
+  }
+
+  const ghAuthed = await ghAuthStatusOk();
+  if (!ghAuthed) {
+    console.error("[start] GitHub auth preflight failed: GitHub CLI is not authenticated.");
+    console.error("[start] Run: gh auth login --hostname github.com --web");
+    abortStart(1);
+  }
+
+  const apiAccessOk = await ghApiAccessOk();
+  if (!apiAccessOk) {
+    console.error("[start] GitHub auth preflight failed: authenticated CLI token cannot access GitHub API.");
+    console.error("[start] Run: gh auth refresh -h github.com");
+    abortStart(1);
+  }
+
+  const exported = await exportGitTokenFromGhAuth();
+  if (exported) {
+    console.log("[start] GitHub auth preflight: authenticated and token exported for startup services.");
+  } else {
+    console.warn(
+      "[start] GitHub auth preflight: authenticated, but `gh auth token` export failed. Services will use direct gh auth as needed.",
+    );
+  }
+  ghAuthPreflightSatisfied = true;
+}
+
 async function ensureGitHubAuth(force = false): Promise<void> {
   if (ghAuthPreflightSatisfied) {
     return;
@@ -3331,6 +3381,7 @@ try {
   logEffectiveConfigSnapshot();
   await ensureServicePortsAvailable();
   await ensureCodexCliAuthPreflight();
+  await ensureGitHubAuthPreflight();
   await cleanupWorkerWarmContainers("startup preflight");
   await ensureLlmPreflight();
   await ensureIntegrationBranch();

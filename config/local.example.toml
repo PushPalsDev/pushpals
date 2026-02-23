@@ -20,6 +20,9 @@ reasoning_effort = "high"
 [remotebuddy]
 max_workerpals = 20
 
+[remotebuddy.autonomy]
+llm_timeout_ms = 60000
+
 [remotebuddy.memory]
 enabled = true
 include_cross_session = true
