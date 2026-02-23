@@ -42,6 +42,7 @@ import {
   type JobResult,
 } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
+import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 
 type CommitRef = {
@@ -343,11 +344,23 @@ async function createIsolatedWorktree(
 async function removeIsolatedWorktree(repo: string, worktreePath: string): Promise<void> {
   const removeResult = await git(repo, ["worktree", "remove", "--force", worktreePath]);
   if (!removeResult.ok) {
-    console.error(
+    console.warn(
       `[WorkerPals] Worktree cleanup warning (${worktreePath}): ${removeResult.stderr || removeResult.stdout}`,
     );
   }
-  await git(repo, ["worktree", "prune"]);
+  const pruneResult = await git(repo, ["worktree", "prune"]);
+  if (!pruneResult.ok) {
+    console.warn(
+      `[WorkerPals] Worktree prune warning (${worktreePath}): ${pruneResult.stderr || pruneResult.stdout}`,
+    );
+  }
+
+  const forced = await forceDeleteWorktreePath(worktreePath);
+  if (!forced.removed) {
+    throw new Error(
+      `worktree path persisted after cleanup (${worktreePath})${forced.lastError ? `: ${forced.lastError}` : ""}`,
+    );
+  }
 }
 
 function sanitizePrText(value: unknown, max = 240): string {

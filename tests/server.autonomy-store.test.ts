@@ -185,6 +185,76 @@ describe("server AutonomyStore policy gates", () => {
     expect(String(result.results?.[0]?.reason ?? "")).toContain("confidence");
   });
 
+  test("evaluateEligibility allows dirty worktree when allowDirtyWorktree is enabled", () => {
+    const store = makeStore();
+    (
+      store as unknown as {
+        config?: { remotebuddy?: { autonomy?: { allowDirtyWorktree?: boolean } } };
+      }
+    ).config!.remotebuddy!.autonomy!.allowDirtyWorktree = true;
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_dirty_allowed",
+      repoHealthFlags: {
+        is_worktree_dirty: true,
+        is_merge_in_progress: false,
+      },
+    }).snapshot_id;
+
+    const result = store.evaluateEligibility({
+      runId: "run_dirty_allowed",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_dirty_allowed",
+          objective_type: "lint_fix",
+          pattern_key: "pk_dirty_allowed",
+          confidence: 0.95,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.results?.length).toBe(1);
+    expect(result.results?.[0]?.ok).toBe(true);
+  });
+
+  test("evaluateEligibility blocks dirty worktree when allowDirtyWorktree is disabled", () => {
+    const store = makeStore();
+    (
+      store as unknown as {
+        config?: { remotebuddy?: { autonomy?: { allowDirtyWorktree?: boolean } } };
+      }
+    ).config!.remotebuddy!.autonomy!.allowDirtyWorktree = false;
+
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_dirty_blocked",
+      repoHealthFlags: {
+        is_worktree_dirty: true,
+        is_merge_in_progress: false,
+      },
+    }).snapshot_id;
+
+    const result = store.evaluateEligibility({
+      runId: "run_dirty_blocked",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_dirty_blocked",
+          objective_type: "lint_fix",
+          pattern_key: "pk_dirty_blocked",
+          confidence: 0.95,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.results?.length).toBe(1);
+    expect(result.results?.[0]?.ok).toBe(false);
+    expect(String(result.results?.[0]?.reason ?? "")).toContain("worktree is dirty");
+  });
+
   test("evaluateEligibility applies sequential accounting for batch candidates", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({

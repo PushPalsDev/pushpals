@@ -918,7 +918,12 @@ export class AutonomyStore {
     if (!row?.payload_json) return null;
     const payload = parseJsonObject(row.payload_json);
     const flags = asObject(payload.repo_health_flags);
-    if (asBoolean(flags.is_worktree_dirty, false)) return "repo preflight blocked: worktree is dirty";
+    if (
+      asBoolean(flags.is_worktree_dirty, false) &&
+      !this.config.remotebuddy.autonomy.allowDirtyWorktree
+    ) {
+      return "repo preflight blocked: worktree is dirty";
+    }
     if (asBoolean(flags.is_merge_in_progress, false)) return "repo preflight blocked: merge/rebase in progress";
     if (asBoolean(flags.dispatch_lock_held, false)) return "repo preflight blocked: dispatch lock held";
     return null;

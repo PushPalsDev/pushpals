@@ -24,3 +24,5 @@ Constraints:
 - target_paths must be literal repo-relative paths.
 - write_globs must be repo-relative globs.
 - do not invent evidence ids.
+- If all signals are low/noisy, still propose exactly 1 low-risk proactive maintenance candidate (`docs` or `small_refactor`) using existing signal ids.
+- Treat a low `sig_queue_health` value as maintenance-window evidence for safe proactive work, not only incident response.

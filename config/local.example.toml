@@ -22,6 +22,7 @@ max_workerpals = 20
 
 [remotebuddy.autonomy]
 llm_timeout_ms = 60000
+allow_dirty_worktree = false
 
 [remotebuddy.memory]
 enabled = true

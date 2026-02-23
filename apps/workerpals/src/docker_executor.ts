@@ -27,6 +27,7 @@ import {
   SHARED_DOCKER_PASSTHROUGH_ENV,
   getDockerBackendSpec,
 } from "./backends/backend_config.js";
+import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
 import type {
   DockerBackendRuntimeConfig,
   DockerBackendSpec,
@@ -385,15 +386,35 @@ export class DockerExecutor {
       stderr: "pipe",
     });
 
+    const stdoutPromise = new Response(proc.stdout).text();
+    const stderrPromise = new Response(proc.stderr).text();
     const exitCode = await proc.exited;
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
 
     if (exitCode !== 0) {
-      const stderr = await new Response(proc.stderr).text();
-      console.error(`[DockerExecutor] Worktree removal warning: ${stderr}`);
+      console.warn(`[DockerExecutor] Worktree removal warning: ${stderr || stdout}`);
     }
 
     // Also prune worktree list
-    Bun.spawn(["git", "worktree", "prune"], { cwd: this.options.repo });
+    const prune = Bun.spawn(["git", "worktree", "prune"], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const pruneExit = await prune.exited;
+    if (pruneExit !== 0) {
+      const pruneStderr = await new Response(prune.stderr).text();
+      console.warn(`[DockerExecutor] Worktree prune warning: ${pruneStderr}`);
+    }
+
+    const forced = await forceDeleteWorktreePath(worktreePath, {
+      sleepFn: (ms) => this.sleep(ms),
+    });
+    if (!forced.removed) {
+      throw new Error(
+        `worktree path persisted after cleanup (${worktreePath})${forced.lastError ? `: ${forced.lastError}` : ""}`,
+      );
+    }
 
     console.log(`[DockerExecutor] Removed worktree: ${worktreePath}`);
   }

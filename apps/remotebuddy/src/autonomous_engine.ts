@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "crypto";
+import { existsSync, mkdirSync, rmSync } from "fs";
+import { resolve } from "path";
 import type { CommunicationManager } from "shared";
 import {
   loadPromptTemplate,
@@ -223,15 +225,25 @@ async function gitOutput(repo: string, args: string[]): Promise<string> {
   return stdout.trim();
 }
 
-async function repoPreflight(repo: string): Promise<{
+type GitRunResult = {
   ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+};
+
+function sanitizeForGitRef(value: string): string {
+  const text = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
+  return text || "default";
+}
+
+async function repoPreflight(repo: string): Promise<{
   isWorktreeDirty: boolean;
   isMergeInProgress: boolean;
 }> {
   const porcelain = await gitOutput(repo, ["status", "--porcelain"]);
   const mergeHead = await gitOutput(repo, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
   return {
-    ok: !porcelain && !mergeHead,
     isWorktreeDirty: Boolean(porcelain),
     isMergeInProgress: Boolean(mergeHead),
   };
@@ -241,7 +253,12 @@ export class RemoteBuddyAutonomousEngine {
   private readonly server: string;
   private readonly sessionId: string;
   private readonly authToken: string | null;
-  private readonly repo: string;
+  private readonly repoRoot: string;
+  private readonly autonomyRepo: string;
+  private readonly autonomyBranch: string;
+  private readonly gitRemote: string;
+  private readonly integrationBranch: string;
+  private readonly baseBranch: string;
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
@@ -260,7 +277,14 @@ export class RemoteBuddyAutonomousEngine {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
-    this.repo = opts.repo;
+    this.repoRoot = opts.repo;
+    const safeSession = sanitizeForGitRef(this.sessionId).slice(0, 40);
+    this.autonomyRepo = resolve(this.repoRoot, ".worktrees", `remotebuddy-autonomy-${safeSession}`);
+    this.autonomyBranch = `_remotebuddy/autonomy-${safeSession}`;
+    this.gitRemote = String(opts.config.sourceControlManager.remote || "origin").trim() || "origin";
+    this.integrationBranch =
+      String(opts.config.sourceControlManager.mainBranch || "main_agents").trim() || "main_agents";
+    this.baseBranch = String(opts.config.sourceControlManager.baseBranch || "main").trim() || "main";
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
@@ -287,6 +311,87 @@ export class RemoteBuddyAutonomousEngine {
       this.cfg.llmTimeoutMs * 4,
       20_000,
     );
+  }
+
+  private async runGit(cwd: string, args: string[]): Promise<GitRunResult> {
+    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      ok: exitCode === 0,
+      exitCode,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+    };
+  }
+
+  private async ensureAutonomyRepoReady(runId: string): Promise<boolean> {
+    const integrationRef = `${this.gitRemote}/${this.integrationBranch}`;
+    const baseRef = `${this.gitRemote}/${this.baseBranch}`;
+
+    const fetch = await this.runGit(this.repoRoot, [
+      "fetch",
+      this.gitRemote,
+      this.integrationBranch,
+      this.baseBranch,
+    ]);
+    if (!fetch.ok) {
+      console.error(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: failed to fetch refs for autonomy worktree (${this.gitRemote} ${this.integrationBranch}/${this.baseBranch}): ${fetch.stderr || fetch.stdout || `exit ${fetch.exitCode}`}`,
+      );
+      return false;
+    }
+
+    if (existsSync(this.autonomyRepo)) {
+      await this.runGit(this.repoRoot, ["worktree", "remove", "--force", this.autonomyRepo]);
+      try {
+        rmSync(this.autonomyRepo, { recursive: true, force: true });
+      } catch (error) {
+        console.error(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: failed to delete previous autonomy worktree ${this.autonomyRepo}: ${String(error)}`,
+        );
+        return false;
+      }
+    }
+    await this.runGit(this.repoRoot, ["worktree", "prune"]);
+    await this.runGit(this.repoRoot, ["branch", "-D", this.autonomyBranch]);
+
+    const parentDir = resolve(this.autonomyRepo, "..");
+    if (!existsSync(parentDir)) mkdirSync(parentDir, { recursive: true });
+    const add = await this.runGit(this.repoRoot, [
+      "worktree",
+      "add",
+      "-B",
+      this.autonomyBranch,
+      this.autonomyRepo,
+      integrationRef,
+    ]);
+    if (!add.ok) {
+      console.error(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: failed to create autonomy worktree at ${this.autonomyRepo}: ${add.stderr || add.stdout || `exit ${add.exitCode}`}`,
+      );
+      return false;
+    }
+
+    const mergeMain = await this.runGit(this.autonomyRepo, ["merge", "--ff-only", baseRef]);
+    if (!mergeMain.ok) {
+      // Keep this non-interactive and deterministic: fall back to the latest base branch when ff-only is impossible.
+      const resetBase = await this.runGit(this.autonomyRepo, ["reset", "--hard", baseRef]);
+      if (!resetBase.ok) {
+        console.error(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: failed to sync autonomy worktree with ${baseRef}: ${mergeMain.stderr || mergeMain.stdout || `merge exit ${mergeMain.exitCode}`}; reset failed: ${resetBase.stderr || resetBase.stdout || `exit ${resetBase.exitCode}`}`,
+        );
+        return false;
+      }
+      console.log(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: ff-only merge ${baseRef} into ${integrationRef} was not possible; reset autonomy worktree to ${baseRef}.`,
+      );
+    }
+
+    return true;
   }
 
   private async fetchSnapshot(
@@ -634,8 +739,22 @@ export class RemoteBuddyAutonomousEngine {
       lockAcquired = await this.acquireDispatchLock(runId);
       if (!lockAcquired) return;
 
-      const preflight = await repoPreflight(this.repo);
-      if (!preflight.ok) return;
+      const ready = await this.ensureAutonomyRepoReady(runId);
+      if (!ready) return;
+
+      const preflight = await repoPreflight(this.autonomyRepo);
+      if (preflight.isMergeInProgress) {
+        console.log(
+          "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (merge/rebase in progress).",
+        );
+        return;
+      }
+      if (preflight.isWorktreeDirty && !this.cfg.allowDirtyWorktree) {
+        console.log(
+          "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (worktree is dirty and allow_dirty_worktree=false).",
+        );
+        return;
+      }
 
       const snapshot = await this.fetchSnapshot(runId, preflight);
       if (!snapshot) return;
@@ -691,13 +810,20 @@ export class RemoteBuddyAutonomousEngine {
       }
       const rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
       const normalizedCandidates: AutonomyCandidate[] = [];
+      const dropReasonCounts = new Map<string, number>();
+      const recordDropReason = (reason: string): void => {
+        dropReasonCounts.set(reason, (dropReasonCounts.get(reason) ?? 0) + 1);
+      };
       const candidateCreatedBaseMs = Date.now();
       for (const [candidateIndex, rawCandidate] of rawCandidates
         .slice(0, this.cfg.ideationMaxCandidates)
         .entries()) {
         const c = asObject(rawCandidate);
         const triggerType = asString(c.trigger_type);
-        if (!isTriggerType(triggerType)) continue;
+        if (!isTriggerType(triggerType)) {
+          recordDropReason("invalid_trigger_type");
+          continue;
+        }
         const candidate: AutonomyCandidate = {
           id: asString(c.id) || `cand_${randomUUID().slice(0, 8)}`,
           title: asString(c.title),
@@ -720,19 +846,40 @@ export class RemoteBuddyAutonomousEngine {
           candidate_created_at: new Date(candidateCreatedBaseMs + candidateIndex).toISOString(),
         };
         const policy = POLICY[candidate.objective_type];
-        if (!policy || !policy.autonomousAllowed) continue;
-        if (!isRiskLevel(candidate.risk_level)) continue;
-        if (RISK_ORDER[candidate.risk_level] > RISK_ORDER[policy.maxRisk]) continue;
+        if (!policy || !policy.autonomousAllowed) {
+          recordDropReason("objective_type_not_allowed");
+          continue;
+        }
+        if (!isRiskLevel(candidate.risk_level)) {
+          recordDropReason("invalid_risk_level");
+          continue;
+        }
+        if (RISK_ORDER[candidate.risk_level] > RISK_ORDER[policy.maxRisk]) {
+          recordDropReason("risk_exceeds_policy");
+          continue;
+        }
         const scopeValidation = validateScopeInvariants(
           candidate.component_area,
           candidate.target_paths,
           candidate.scope.write_globs,
           { requireWriteGlobs: true },
         );
-        if (!scopeValidation.ok) continue;
-        if (BREADTH_ORDER[scopeValidation.breadth] > BREADTH_ORDER[policy.maxBreadth]) continue;
-        if (candidate.scope.read_anywhere && !this.cfg.allowReadAnywhere) continue;
-        if (policy.requireValidation && candidate.expected_validation.length === 0) continue;
+        if (!scopeValidation.ok) {
+          recordDropReason("scope_validation_failed");
+          continue;
+        }
+        if (BREADTH_ORDER[scopeValidation.breadth] > BREADTH_ORDER[policy.maxBreadth]) {
+          recordDropReason("scope_breadth_exceeds_policy");
+          continue;
+        }
+        if (candidate.scope.read_anywhere && !this.cfg.allowReadAnywhere) {
+          recordDropReason("read_anywhere_not_allowed");
+          continue;
+        }
+        if (policy.requireValidation && candidate.expected_validation.length === 0) {
+          recordDropReason("missing_validation_steps");
+          continue;
+        }
         candidate.target_paths = scopeValidation.normalizedTargetPaths;
         candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
         normalizedCandidates.push(candidate);
@@ -756,6 +903,20 @@ export class RemoteBuddyAutonomousEngine {
         candidate_created_at: candidate.candidate_created_at,
       }));
       if (normalizedCandidates.length === 0) {
+        const dropReasons = Object.fromEntries(
+          [...dropReasonCounts.entries()].sort(([a], [b]) => a.localeCompare(b)),
+        );
+        const topSignals = snapshot.top_signals
+          .slice(0, 3)
+          .map((signal) => `${signal.signal_id}:${Number(signal.value ?? 0).toFixed(2)}`)
+          .join(", ");
+        const parseHint =
+          rawCandidates.length === 0 && Object.keys(ideationJson).length === 0
+            ? " (ideation returned empty or non-parseable JSON)"
+            : "";
+        console.log(
+          `[RemoteBuddyAutonomousEngine] tick produced no eligible candidates: raw=${rawCandidates.length} normalized=0 drop_reasons=${JSON.stringify(dropReasons)} top_signals=${topSignals || "none"}${parseHint}`,
+        );
         await this.postObjective({
           runId,
           snapshotId: snapshot.snapshot_id,
@@ -1115,6 +1276,9 @@ export class RemoteBuddyAutonomousEngine {
 
   start(): void {
     if (!this.cfg.enabled || this.timer) return;
+    console.log(
+      `[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`,
+    );
     this.timer = setInterval(() => {
       void this.tick();
     }, this.cfg.tickIntervalMs);

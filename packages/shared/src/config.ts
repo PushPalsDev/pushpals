@@ -115,6 +115,7 @@ export interface PushPalsConfig {
       tickIntervalMs: number;
       ideationBudgetMs: number;
       llmTimeoutMs: number;
+      allowDirtyWorktree: boolean;
       ideationMaxCandidates: number;
       topK: number;
       minConfidence: number;
@@ -1455,6 +1456,9 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
             12_000,
           ),
         ),
+        allowDirtyWorktree:
+          parseBoolEnv("REMOTEBUDDY_AUTONOMY_ALLOW_DIRTY_WORKTREE") ??
+          asBoolean(remoteAutonomyNode.allow_dirty_worktree, false),
         ideationMaxCandidates: Math.max(
           1,
           Math.min(
