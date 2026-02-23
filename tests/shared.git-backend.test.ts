@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   inferGitBackendFromRemote,
+  parseGitHubRepo,
   parseGitRemoteHost,
   resolveGitTokenForRemote,
+  sanitizeGitRemoteUrl,
+  toGitHubRepoWebUrl,
   type CommandCaptureResult,
 } from "../packages/shared/src/git_backend";
 
@@ -13,6 +16,36 @@ describe("shared git backend token resolution", () => {
     expect(parseGitRemoteHost("ssh://git@gitlab.example.com/org/repo.git")).toBe(
       "gitlab.example.com",
     );
+  });
+
+  test("sanitizes credentials from HTTPS remote URLs", () => {
+    expect(
+      sanitizeGitRemoteUrl(
+        "https://oauth2:gho_abcdefghijklmnopqrstuvwxyz123456@github.com/PushPalsDev/pushpals.git",
+      ),
+    ).toBe("https://github.com/PushPalsDev/pushpals.git");
+  });
+
+  test("parses GitHub owner/repo from HTTPS and SSH remotes", () => {
+    expect(parseGitHubRepo("https://github.com/PushPalsDev/pushpals.git")).toEqual({
+      owner: "PushPalsDev",
+      repo: "pushpals",
+    });
+    expect(parseGitHubRepo("git@github.com:PushPalsDev/pushpals.git")).toEqual({
+      owner: "PushPalsDev",
+      repo: "pushpals",
+    });
+    expect(parseGitHubRepo("https://gitlab.com/org/repo.git")).toBeNull();
+  });
+
+  test("converts GitHub remotes to browser URLs", () => {
+    expect(toGitHubRepoWebUrl("https://github.com/PushPalsDev/pushpals.git")).toBe(
+      "https://github.com/PushPalsDev/pushpals",
+    );
+    expect(toGitHubRepoWebUrl("git@github.com:PushPalsDev/pushpals.git")).toBe(
+      "https://github.com/PushPalsDev/pushpals",
+    );
+    expect(toGitHubRepoWebUrl("https://gitlab.com/org/repo.git")).toBeNull();
   });
 
   test("infers backend from remote host", () => {

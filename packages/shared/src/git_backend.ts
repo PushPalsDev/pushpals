@@ -23,8 +23,23 @@ export interface GitTokenResolution {
   source: GitTokenSource;
 }
 
+export interface GitHubRepoRef {
+  owner: string;
+  repo: string;
+}
+
 function trimToken(value: string | null | undefined): string {
   return String(value ?? "").trim();
+}
+
+/**
+ * Remove userinfo credentials from HTTPS git remote URLs.
+ * Example: https://oauth2:token@github.com/org/repo.git -> https://github.com/org/repo.git
+ */
+export function sanitizeGitRemoteUrl(remoteUrl: string): string {
+  const raw = trimToken(remoteUrl);
+  if (!raw) return "";
+  return raw.replace(/^(https?:\/\/)[^@/]+@/i, "$1");
 }
 
 function firstNonEmpty(
@@ -66,6 +81,33 @@ export function inferGitBackendFromRemote(remoteUrl: string): GitBackendId {
     return "gitlab";
   }
   return "unknown";
+}
+
+export function parseGitHubRepo(remoteUrl: string): GitHubRepoRef | null {
+  const sanitized = sanitizeGitRemoteUrl(remoteUrl);
+  if (!sanitized) return null;
+
+  const httpsMatch = sanitized.match(
+    /^https?:\/\/(?:[^@/]+@)?github\.com\/([^/\s]+)\/([^/\s]+?)(?:\.git)?(?:[/?#].*)?$/i,
+  );
+  if (httpsMatch) {
+    return { owner: httpsMatch[1], repo: httpsMatch[2] };
+  }
+
+  const sshMatch = sanitized.match(
+    /^(?:ssh:\/\/)?(?:[^@/\s]+@)?github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?$/i,
+  );
+  if (sshMatch) {
+    return { owner: sshMatch[1], repo: sshMatch[2] };
+  }
+
+  return null;
+}
+
+export function toGitHubRepoWebUrl(remoteUrl: string): string | null {
+  const repo = parseGitHubRepo(remoteUrl);
+  if (!repo) return null;
+  return `https://github.com/${repo.owner}/${repo.repo}`;
 }
 
 async function defaultRunCommand(

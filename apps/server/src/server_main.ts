@@ -6,7 +6,12 @@ import { CompletionQueue } from "./completions.js";
 import { AutonomyStore } from "./autonomy.js";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
-import { loadPushPalsConfig } from "shared";
+import {
+  inferGitBackendFromRemote,
+  loadPushPalsConfig,
+  sanitizeGitRemoteUrl,
+  toGitHubRepoWebUrl,
+} from "shared";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
 const CONFIG = loadPushPalsConfig();
@@ -19,6 +24,66 @@ const jobQueue = new JobQueue(sharedDbPath);
 const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
 const autonomyStore = new AutonomyStore(sharedDbPath);
+const REPO_STATUS_CACHE_TTL_MS = 60_000;
+
+interface RepoStatusSummary {
+  remote: string;
+  remoteUrl: string | null;
+  browserUrl: string | null;
+  provider: "github" | "gitlab" | "unknown";
+  refreshedAt: string;
+}
+
+let repoStatusCache:
+  | {
+      value: RepoStatusSummary;
+      fetchedAtMs: number;
+    }
+  | null = null;
+
+async function resolveRemoteUrl(repoPath: string, remote: string): Promise<string> {
+  const proc = Bun.spawn(["git", "-C", repoPath, "remote", "get-url", remote], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) {
+    const detail = stderr.trim() || stdout.trim() || `exit ${exitCode}`;
+    console.warn(`[Server] Failed to resolve git remote URL (${remote}): ${detail}`);
+    return "";
+  }
+  return stdout.trim();
+}
+
+async function getRepoStatusSummary(repoPath: string, remote: string): Promise<RepoStatusSummary> {
+  const now = Date.now();
+  if (
+    repoStatusCache &&
+    repoStatusCache.value.remote === remote &&
+    now - repoStatusCache.fetchedAtMs < REPO_STATUS_CACHE_TTL_MS
+  ) {
+    return repoStatusCache.value;
+  }
+
+  const remoteUrlRaw = await resolveRemoteUrl(repoPath, remote);
+  const remoteUrl = remoteUrlRaw ? sanitizeGitRemoteUrl(remoteUrlRaw) : null;
+  const provider = inferGitBackendFromRemote(remoteUrl ?? "");
+  const browserUrl = provider === "github" ? toGitHubRepoWebUrl(remoteUrl ?? "") : null;
+
+  const value: RepoStatusSummary = {
+    remote,
+    remoteUrl,
+    browserUrl,
+    provider,
+    refreshedAt: new Date().toISOString(),
+  };
+  repoStatusCache = { value, fetchedAtMs: now };
+  return value;
+}
 
 /**
  * HTTP Middleware & Routes
@@ -421,6 +486,10 @@ export function createRequestHandler() {
         const denied = requireAuth();
         if (denied) return denied;
         maybeRecoverStaleClaims();
+        const repo = await getRepoStatusSummary(
+          CONFIG.projectRoot,
+          CONFIG.sourceControlManager.remote,
+        );
 
         const ttlMsRaw = parseInt(url.searchParams.get("ttlMs") ?? "", 10);
         const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
@@ -450,6 +519,7 @@ export function createRequestHandler() {
             requests: requestQueue.sloSummary(24),
             jobs: jobQueue.sloSummary(24),
           },
+          repo,
         });
       }
 

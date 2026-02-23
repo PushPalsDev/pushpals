@@ -409,7 +409,12 @@ export default function DashboardScreen() {
           },
         ]}
       >
-        <DashboardHeader theme={theme} mode={mode} onChangeMode={setMode} />
+        <DashboardHeader
+          theme={theme}
+          mode={mode}
+          repo={systemSummary.repo}
+          onChangeMode={setMode}
+        />
 
         {session.error ? (
           <View

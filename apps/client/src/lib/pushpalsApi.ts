@@ -452,6 +452,14 @@ export interface JobSloSummary {
   queueWaitMs: SloMetricSummary;
 }
 
+export interface SystemRepoSummary {
+  remote: string;
+  remoteUrl: string | null;
+  browserUrl: string | null;
+  provider: "github" | "gitlab" | "unknown";
+  refreshedAt?: string;
+}
+
 export interface SystemStatusSummary {
   workers?: { total: number; online: number; busy: number; idle: number };
   queues?: {
@@ -463,6 +471,7 @@ export interface SystemStatusSummary {
     requests?: RequestSloSummary;
     jobs?: JobSloSummary;
   };
+  repo?: SystemRepoSummary;
   ts?: string;
 }
 
@@ -599,6 +608,7 @@ export async function fetchSystemStatus(
       workers: payload.workers,
       queues: payload.queues,
       slo: payload.slo,
+      repo: payload.repo,
       ts: payload.ts,
     };
   } catch (err) {

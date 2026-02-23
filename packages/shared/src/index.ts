@@ -7,10 +7,14 @@ export { CommunicationManager, type CommunicationManagerOptions } from "./commun
 export { loadPromptTemplate } from "./prompts.js";
 export {
   inferGitBackendFromRemote,
+  parseGitHubRepo,
   parseGitRemoteHost,
   resolveGitTokenForRemote,
+  sanitizeGitRemoteUrl,
+  toGitHubRepoWebUrl,
   type CommandCaptureResult,
   type GitBackendId,
+  type GitHubRepoRef,
   type GitTokenResolution,
   type GitTokenSource,
   type ResolveGitTokenOptions,
