@@ -45,6 +45,36 @@ const START_SYNC_GIT_USER_EMAIL = "pushpals-start@local";
 const DEFAULT_PUSHPALS_PORT = CONFIG.server.port;
 const DEFAULT_STARTUP_WARMUP_TIMEOUT_MS = 120_000;
 const DEFAULT_STARTUP_WARMUP_POLL_MS = 1_000;
+const REQUIRED_DEPENDENCY_SENTINELS: Array<{ path: string; label: string }> = [
+  { path: resolve(repoRoot, "node_modules"), label: "root node_modules" },
+  {
+    path: resolve(repoRoot, "node_modules", "typescript", "bin", "tsc"),
+    label: "TypeScript compiler",
+  },
+  {
+    path: resolve(repoRoot, "node_modules", "expo", "package.json"),
+    label: "Expo runtime package",
+  },
+];
+const WORKSPACE_NODE_MODULES_HEALTH_CHECKS: Array<{
+  nodeModulesPath: string;
+  sentinelPath: string;
+  label: string;
+  sentinelLabel: string;
+}> = [
+  {
+    nodeModulesPath: resolve(repoRoot, "packages", "protocol", "node_modules"),
+    sentinelPath: resolve(repoRoot, "packages", "protocol", "node_modules", "typescript", "bin", "tsc"),
+    label: "packages/protocol node_modules",
+    sentinelLabel: "packages/protocol TypeScript compiler",
+  },
+  {
+    nodeModulesPath: resolve(repoRoot, "apps", "client", "node_modules"),
+    sentinelPath: resolve(repoRoot, "apps", "client", "node_modules", "expo", "package.json"),
+    label: "apps/client node_modules",
+    sentinelLabel: "apps/client Expo runtime package",
+  },
+];
 const workerImage = CONFIG.workerpals.dockerImage || DEFAULT_IMAGE;
 const WORKER_IMAGE_INPUTS_HASH_LABEL = "pushpals.worker.inputs_hash";
 const WORKER_IMAGE_INPUT_PATHS = [
@@ -260,6 +290,95 @@ function ensureRequiredLocalConfigFiles(): void {
     console.error(`[start]   ${entry.hint}`);
   }
   abortStart(1);
+}
+
+function missingDependencySentinels(): Array<{ path: string; label: string }> {
+  return REQUIRED_DEPENDENCY_SENTINELS.filter((entry) => !existsSync(entry.path));
+}
+
+function brokenWorkspaceNodeModules(): Array<{
+  nodeModulesPath: string;
+  sentinelPath: string;
+  label: string;
+  sentinelLabel: string;
+}> {
+  return WORKSPACE_NODE_MODULES_HEALTH_CHECKS.filter(
+    (entry) => existsSync(entry.nodeModulesPath) && !existsSync(entry.sentinelPath),
+  );
+}
+
+function currentBunBinary(): string {
+  const execPath = (process.execPath ?? "").trim();
+  if (!execPath) return "bun";
+  const lower = execPath.toLowerCase();
+  if (lower.endsWith("bun") || lower.endsWith("bun.exe")) return execPath;
+  return "bun";
+}
+
+async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
+  const brokenWorkspaceModules = brokenWorkspaceNodeModules();
+  const missing = missingDependencySentinels();
+  if (missing.length === 0 && brokenWorkspaceModules.length === 0) return;
+
+  if (brokenWorkspaceModules.length > 0) {
+    console.warn("[start] Dependency preflight detected stale workspace node_modules links:");
+    for (const entry of brokenWorkspaceModules) {
+      const relPath = relative(repoRoot, entry.nodeModulesPath).replace(/\\/g, "/");
+      const relSentinel = relative(repoRoot, entry.sentinelPath).replace(/\\/g, "/");
+      console.warn(
+        `[start] - ${entry.label} is present but missing ${entry.sentinelLabel} (${relSentinel}); removing ${relPath}`,
+      );
+      try {
+        rmSync(entry.nodeModulesPath, { recursive: true, force: true });
+      } catch (err) {
+        console.error(
+          `[start] Failed to remove stale workspace dependencies at ${relPath}: ${String(err)}`,
+        );
+        abortStart(1);
+      }
+    }
+  }
+
+  if (missing.length > 0) {
+    console.log("[start] Dependency preflight detected missing workspace artifacts:");
+    for (const entry of missing) {
+      const rel = relative(repoRoot, entry.path).replace(/\\/g, "/");
+      console.log(`[start] - ${entry.label}: ${rel}`);
+    }
+  }
+  const installArgs =
+    brokenWorkspaceModules.length > 0
+      ? [currentBunBinary(), "install", "--force"]
+      : [currentBunBinary(), "install"];
+  const installDisplay =
+    brokenWorkspaceModules.length > 0 ? "`bun install --force`" : "`bun install`";
+  console.log(`[start] Running ${installDisplay} to restore workspace dependencies...`);
+
+  const installExitCode = await runInherited(installArgs, repoRoot);
+  if (installExitCode !== 0) {
+    console.error(`[start] ${installDisplay} failed with exit code ${installExitCode}.`);
+    abortStart(installExitCode);
+  }
+
+  const missingAfterInstall = missingDependencySentinels();
+  const brokenAfterInstall = brokenWorkspaceNodeModules();
+  if (missingAfterInstall.length > 0 || brokenAfterInstall.length > 0) {
+    console.error("[start] Dependency preflight still failing after install:");
+    for (const entry of missingAfterInstall) {
+      const rel = relative(repoRoot, entry.path).replace(/\\/g, "/");
+      console.error(`[start] - ${entry.label}: ${rel}`);
+    }
+    for (const entry of brokenAfterInstall) {
+      const relPath = relative(repoRoot, entry.nodeModulesPath).replace(/\\/g, "/");
+      const relSentinel = relative(repoRoot, entry.sentinelPath).replace(/\\/g, "/");
+      console.error(
+        `[start] - ${entry.label}: missing ${entry.sentinelLabel} (${relSentinel}) in ${relPath}`,
+      );
+    }
+    abortStart(1);
+  }
+
+  console.log("[start] Dependency preflight: workspace dependencies look healthy.");
 }
 
 function cleanRuntimeStateIfRequested(): void {
@@ -1737,7 +1856,21 @@ function normalizeForMatch(value: string): string {
   return value.toLowerCase().replace(/\\/g, "/");
 }
 
+function escapePowerShellSingleQuoted(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
 function isLikelyPushPalsListener(listener: ListeningProcess): boolean {
+  const processName = normalizeForMatch(listener.name);
+  if (
+    processName === "powershell.exe" ||
+    processName === "pwsh.exe" ||
+    processName === "cmd.exe" ||
+    processName === "conhost.exe"
+  ) {
+    return false;
+  }
+
   const haystack = normalizeForMatch(`${listener.name} ${listener.commandLine}`);
   if (!haystack) return false;
 
@@ -1747,10 +1880,17 @@ function isLikelyPushPalsListener(listener: ListeningProcess): boolean {
   return (
     haystack.includes("/pushpals/") ||
     haystack.includes("scripts/start.ts") ||
+    haystack.includes("scripts/start-client.ts") ||
     haystack.includes("apps/localbuddy") ||
     haystack.includes("apps/remotebuddy") ||
     haystack.includes("apps/workerpals") ||
-    haystack.includes("apps/server")
+    haystack.includes("apps/source_control_manager") ||
+    haystack.includes("apps/server") ||
+    haystack.includes("src/server_main.ts") ||
+    haystack.includes("src/localbuddy_main.ts") ||
+    haystack.includes("src/remotebuddy_main.ts") ||
+    haystack.includes("src/workerpals_main.ts") ||
+    haystack.includes("src/source_control_manager_main.ts")
   );
 }
 
@@ -1826,6 +1966,72 @@ function normalizeListenerRows(parsed: any): ListeningProcess[] {
   return out;
 }
 
+function parseWindowsNetstatListeningPids(stdout: string, port: number): number[] {
+  const out = new Set<number>();
+  const targetPort = String(port);
+
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (!/\bLISTENING\b/i.test(line)) continue;
+
+    const cols = line.split(/\s+/);
+    if (cols.length < 5) continue;
+
+    const localAddress = cols[1] ?? "";
+    const pidToken = cols[4] ?? "";
+    const portMatch = localAddress.match(/:(\d+)$/);
+    if (!portMatch) continue;
+    if (portMatch[1] !== targetPort) continue;
+
+    const pid = Number.parseInt(pidToken, 10);
+    if (Number.isFinite(pid) && pid > 0) out.add(pid);
+  }
+
+  return Array.from(out);
+}
+
+function parseTasklistName(stdout: string): string {
+  const line = stdout
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find((item) => item.length > 0 && !/no tasks are running/i.test(item));
+  if (!line) return "";
+  if (line.startsWith('"') && line.endsWith('"')) {
+    const cols = line.slice(1, -1).split('","');
+    return (cols[0] ?? "").trim();
+  }
+  const cols = line.split(/\s+/);
+  return (cols[0] ?? "").trim();
+}
+
+async function describeWindowsPid(pid: number): Promise<ListeningProcess> {
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$proc = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"`,
+    "if ($null -eq $proc) { '{}' } else {",
+    "  [pscustomobject]@{ pid = [int]$proc.ProcessId; name = [string]$proc.Name; commandLine = [string]$proc.CommandLine } | ConvertTo-Json -Compress",
+    "}",
+  ].join("; ");
+  const cim = await runCapture(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], repoRoot);
+  if (cim.ok && cim.stdout.trim()) {
+    const parsed = parseJsonLoose(cim.stdout);
+    const rows = normalizeListenerRows(parsed);
+    if (rows.length > 0) return rows[0];
+  }
+
+  const tasklist = await runCapture(
+    ["tasklist", "/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
+    repoRoot,
+  );
+  const name = tasklist.ok ? parseTasklistName(tasklist.stdout) : "";
+  return {
+    pid,
+    name,
+    commandLine: "",
+  };
+}
+
 async function listPortListenersWindows(port: number): Promise<ListeningProcess[]> {
   const script = [
     "$ErrorActionPreference = 'SilentlyContinue'",
@@ -1847,7 +2053,19 @@ async function listPortListenersWindows(port: number): Promise<ListeningProcess[
   if (!result.stdout.trim()) return [];
 
   const parsed = parseJsonLoose(result.stdout);
-  return normalizeListenerRows(parsed);
+  const direct = normalizeListenerRows(parsed);
+  if (direct.length > 0) return direct;
+
+  const netstat = await runCapture(["netstat", "-ano", "-p", "tcp"], repoRoot);
+  if (!netstat.ok || !netstat.stdout.trim()) return [];
+  const pids = parseWindowsNetstatListeningPids(netstat.stdout, port);
+  if (pids.length === 0) return [];
+
+  const described: ListeningProcess[] = [];
+  for (const pid of pids) {
+    described.push(await describeWindowsPid(pid));
+  }
+  return described;
 }
 
 async function describePosixPid(pid: number): Promise<ListeningProcess> {
@@ -1941,6 +2159,47 @@ async function terminateProcess(pid: number): Promise<boolean> {
   return !isPidAlive(pid);
 }
 
+async function listLikelyPushPalsHostProcessesWindows(): Promise<ListeningProcess[]> {
+  const repoNeedle = normalizeForMatch(repoRoot);
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$needle = '${escapePowerShellSingleQuoted(repoNeedle)}'`,
+    "$rows = Get-CimInstance Win32_Process | Where-Object {",
+    "  $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle)",
+    "} | Select-Object @{n='pid';e={[int]$_.ProcessId}}, @{n='name';e={[string]$_.Name}}, @{n='commandLine';e={[string]$_.CommandLine}}",
+    "if ($rows.Count -eq 0) { '[]' } else { $rows | ConvertTo-Json -Compress }",
+  ].join("; ");
+
+  const result = await runCapture(
+    ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+    repoRoot,
+  );
+  if (!result.ok || !result.stdout.trim()) return [];
+  const parsed = parseJsonLoose(result.stdout);
+  return normalizeListenerRows(parsed).filter(
+    (listener) => listener.pid !== process.pid && isLikelyPushPalsListener(listener),
+  );
+}
+
+async function terminateLikelyPushPalsHostProcessesWindows(): Promise<number> {
+  const candidates = await listLikelyPushPalsHostProcessesWindows();
+  let terminated = 0;
+
+  for (const candidate of candidates) {
+    const summary = shortCommandLine(candidate.commandLine) || "<no command line>";
+    console.warn(
+      `[start] Port preflight fallback: terminating likely stale PushPals host process pid=${candidate.pid} (${candidate.name || "unknown"}) ${summary}`,
+    );
+    if (await terminateProcess(candidate.pid)) {
+      terminated += 1;
+      continue;
+    }
+    console.warn(`[start] Port preflight fallback: failed to terminate pid ${candidate.pid}.`);
+  }
+
+  return terminated;
+}
+
 function shortCommandLine(value: string, maxChars = 180): string {
   const text = (value || "").trim().replace(/\s+/g, " ");
   if (!text) return "";
@@ -1953,6 +2212,7 @@ async function ensureServicePortsAvailable(): Promise<void> {
 
   const specs = requiredStartupPorts();
   const conflicts: Array<{ spec: StartupPortSpec; listeners: ListeningProcess[] }> = [];
+  let attemptedWindowsFallbackCleanup = false;
 
   for (const spec of specs) {
     if (await isPortAvailable(spec.port)) continue;
@@ -1977,6 +2237,23 @@ async function ensureServicePortsAvailable(): Promise<void> {
         await delay(300);
         if (await isPortAvailable(spec.port)) continue;
         listeners = await listPortListeners(spec.port);
+      }
+    }
+
+    if (
+      startupPortConflictPolicy() === "terminate_pushpals" &&
+      process.platform === "win32" &&
+      !attemptedWindowsFallbackCleanup
+    ) {
+      const anyKnownPushPals = listeners.some((listener) => isLikelyPushPalsListener(listener));
+      if (!anyKnownPushPals) {
+        attemptedWindowsFallbackCleanup = true;
+        const terminated = await terminateLikelyPushPalsHostProcessesWindows();
+        if (terminated > 0) {
+          await delay(500);
+          if (await isPortAvailable(spec.port)) continue;
+          listeners = await listPortListeners(spec.port);
+        }
       }
     }
 
@@ -3376,6 +3653,7 @@ process.on("SIGTERM", () => {
 
 try {
   cleanRuntimeStateIfRequested();
+  await ensureWorkspaceDependenciesInstalled();
   sanitizeWindowsWatcherPaths();
   ensureRequiredLocalConfigFiles();
   logEffectiveConfigSnapshot();
