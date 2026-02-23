@@ -64,7 +64,7 @@ Quality gates:
 - `validation_steps` should be minimal and relevant (empty array only for no-worker requests):
   - each item must be an executable command, not prose
   - prefer targeted checks tied to requested file paths
-  - **this project uses Bun**: use `bun test` (not `pnpm test`, `npm test`, or `yarn test`) for running tests; use `bun run <script>` for other scripts; use `bun --cwd <app> test` to test a specific app
+  - **this project uses Bun**: use `bun test` (not `pnpm test`, `npm test`, or `yarn test`) for running tests; use `bun run <script>` for scripts; use `bunx <tool>` (not `npx`) for ad-hoc CLIs; use `bun --cwd <app> test` to test a specific app
   - for Python/pytest targets, use `pytest` or `python -m pytest`
 - `risk_level` must be one of `low`, `medium`, `high`.
 - Never ask WorkerPal for architecture summaries or broad repository overviews unless user explicitly requests that.
