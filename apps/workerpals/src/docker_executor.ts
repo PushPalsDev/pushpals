@@ -65,6 +65,75 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+type ParsedWorktreeRecord = {
+  path: string;
+  detached: boolean;
+  prunable: boolean;
+};
+
+function normalizePathForMatching(path: string): string {
+  return path.replace(/\\/g, "/").toLowerCase();
+}
+
+export function isEphemeralWorkerWorktreePath(path: string): boolean {
+  const normalized = normalizePathForMatching(path);
+  const marker = "/.worktrees/";
+  const markerIndex = normalized.lastIndexOf(marker);
+  if (markerIndex < 0) return false;
+  const leaf = normalized.slice(markerIndex + marker.length);
+  return leaf.startsWith("job-") || leaf.startsWith("selfcheck-");
+}
+
+export function parseGitWorktreeListPorcelain(output: string): ParsedWorktreeRecord[] {
+  const blocks = output
+    .split(/\r?\n\r?\n/g)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  const records: ParsedWorktreeRecord[] = [];
+
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/g).map((line) => line.trim());
+    const pathLine = lines.find((line) => line.startsWith("worktree "));
+    if (!pathLine) continue;
+    records.push({
+      path: pathLine.slice("worktree ".length).trim(),
+      detached: lines.includes("detached"),
+      prunable: lines.some((line) => line === "prunable" || line.startsWith("prunable ")),
+    });
+  }
+
+  return records;
+}
+
+export function collectPrunableEphemeralWorktrees(output: string): string[] {
+  return parseGitWorktreeListPorcelain(output)
+    .filter((entry) => entry.prunable && isEphemeralWorkerWorktreePath(entry.path))
+    .map((entry) => entry.path);
+}
+
+function normalizeMergeConflictHeadRef(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const withoutRefs = trimmed.replace(/^refs\/heads\//, "");
+  const withoutOrigin = withoutRefs.replace(/^origin\//, "");
+  const normalized = withoutOrigin
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (!normalized) return null;
+  if (
+    normalized.includes("..") ||
+    normalized.includes("@{") ||
+    normalized.endsWith(".") ||
+    normalized.endsWith(".lock")
+  ) {
+    return null;
+  }
+  if (/[~^:?*\[\]\s]/.test(normalized)) return null;
+  return normalized;
+}
+
 export class DockerExecutionExhaustedError extends Error {
   readonly cooldownMs: number;
   readonly category: "warm_setup" | "job_execution";
@@ -208,12 +277,13 @@ export class DockerExecutor {
   ): Promise<DockerJobResult> {
     this.activeJobs += 1;
     this.clearIdleTimer();
-    const worktreeName = `job-${job.id}`;
+    const worktreeName = this.buildEphemeralWorktreeName("job", job.id);
     const worktreePath = resolve(this.worktreeDir, worktreeName);
 
     try {
+      const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog);
       // Step 1: Create isolated git worktree
-      await this.createWorktree(worktreePath);
+      await this.createWorktree(worktreePath, worktreeBaseRef);
 
       // Step 2: Prepare job spec as base64
       const jobSpec = {
@@ -304,11 +374,11 @@ export class DockerExecutor {
    * worker container. This catches host/container path mapping issues early.
    */
   async validateWorktreeGitInterop(): Promise<void> {
-    const worktreeName = `selfcheck-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+    const worktreeName = this.buildEphemeralWorktreeName("selfcheck", "startup");
     const worktreePath = resolve(this.worktreeDir, worktreeName);
 
     try {
-      await this.createWorktree(worktreePath);
+      await this.createWorktree(worktreePath, this.options.baseRef);
       await this.runGitSelfCheckContainer(worktreePath);
       console.log(`[DockerExecutor] Startup self-check passed (git/worktree in container).`);
     } finally {
@@ -321,22 +391,44 @@ export class DockerExecutor {
   /**
    * Create a git worktree for isolated job execution
    */
-  private async createWorktree(worktreePath: string): Promise<void> {
+  private async createWorktree(worktreePath: string, baseRef: string): Promise<void> {
+    await this.ensureFreshWorktreePath(worktreePath);
+
     // Create worktree from configured base ref (detached)
-    const proc = Bun.spawn(
-      ["git", "worktree", "add", "--detach", worktreePath, this.options.baseRef],
-      {
+    let proc = Bun.spawn(["git", "worktree", "add", "--detach", worktreePath, baseRef], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let exitCode = await proc.exited;
+    let stdout = await new Response(proc.stdout).text();
+    let stderr = await new Response(proc.stderr).text();
+    let detail = [stderr, stdout].filter(Boolean).join("\n").trim();
+
+    if (exitCode !== 0 && /already registered worktree/i.test(detail)) {
+      const prune = Bun.spawn(["git", "worktree", "prune"], {
         cwd: this.options.repo,
         stdout: "pipe",
         stderr: "pipe",
-      },
-    );
+      });
+      await prune.exited;
 
-    const exitCode = await proc.exited;
+      proc = Bun.spawn(
+        ["git", "worktree", "add", "--force", "--detach", worktreePath, baseRef],
+        {
+          cwd: this.options.repo,
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      exitCode = await proc.exited;
+      stdout = await new Response(proc.stdout).text();
+      stderr = await new Response(proc.stderr).text();
+      detail = [stderr, stdout].filter(Boolean).join("\n").trim();
+    }
 
     if (exitCode !== 0) {
-      const stderr = await new Response(proc.stderr).text();
-      throw new Error(`Failed to create worktree from ${this.options.baseRef}: ${stderr}`);
+      throw new Error(`Failed to create worktree from ${baseRef}: ${detail}`);
     }
 
     this.rewriteWorktreeGitdirToRelative(worktreePath);
@@ -380,7 +472,7 @@ export class DockerExecutor {
    */
   private async removeWorktree(worktreePath: string): Promise<void> {
     // Remove worktree
-    const proc = Bun.spawn(["git", "worktree", "remove", "--force", worktreePath], {
+    const proc = Bun.spawn(["git", "worktree", "remove", "--force", "--force", worktreePath], {
       cwd: this.options.repo,
       stdout: "pipe",
       stderr: "pipe",
@@ -1344,7 +1436,7 @@ export class DockerExecutor {
    */
   async cleanupOrphanedWorktrees(): Promise<void> {
     try {
-      // List all worktrees
+      // List all worktrees and only prune stale metadata entries.
       const proc = Bun.spawn(["git", "worktree", "list", "--porcelain"], {
         cwd: this.options.repo,
         stdout: "pipe",
@@ -1355,27 +1447,132 @@ export class DockerExecutor {
 
       if (exitCode !== 0) return;
 
-      // Parse worktree list
-      const worktrees = output.trim().split("\n\n");
-      for (const wt of worktrees) {
-        const lines = wt.split("\n");
-        const worktreeLine = lines.find((l) => l.startsWith("worktree "));
-        const detachedLine = lines.find((l) => l === "detached");
-
-        if (worktreeLine && detachedLine) {
-          const path = worktreeLine.replace("worktree ", "").trim();
-          // Check if it's one of our job worktrees
-          if (path.includes("/job-") || path.includes("\\job-")) {
-            console.log(`[DockerExecutor] Cleaning up orphaned worktree: ${path}`);
-            await this.removeWorktree(path).catch(() => {
-              // Ignore errors during cleanup
-            });
-          }
+      const prunablePaths = collectPrunableEphemeralWorktrees(output);
+      if (prunablePaths.length > 0) {
+        for (const path of prunablePaths) {
+          console.log(`[DockerExecutor] Pruning stale worktree metadata: ${path}`);
         }
+      }
+
+      const prune = Bun.spawn(["git", "worktree", "prune"], {
+        cwd: this.options.repo,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const pruneExit = await prune.exited;
+      if (pruneExit !== 0) {
+        const pruneStderr = await new Response(prune.stderr).text();
+        console.warn(`[DockerExecutor] Worktree prune warning: ${pruneStderr}`);
       }
     } catch (err) {
       console.error(`[DockerExecutor] Cleanup error: ${err}`);
     }
+  }
+
+  private buildEphemeralWorktreeName(prefix: "job" | "selfcheck", token: string): string {
+    const safeWorker = this.sanitizeWorktreeToken(this.options.workerId, 24);
+    const safeToken = this.sanitizeWorktreeToken(token, 40);
+    const nonce = `${Date.now().toString(36)}-${randomUUID().slice(0, 8).toLowerCase()}`;
+    return `${prefix}-${safeToken}-${safeWorker}-${nonce}`;
+  }
+
+  private sanitizeWorktreeToken(value: string, maxLength: number): string {
+    const normalized = String(value ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    if (!normalized) return "work";
+    return normalized.slice(0, maxLength);
+  }
+
+  private async ensureFreshWorktreePath(worktreePath: string): Promise<void> {
+    if (!existsSync(worktreePath)) return;
+
+    console.warn(
+      `[DockerExecutor] Worktree path already exists; forcing cleanup before create: ${worktreePath}`,
+    );
+
+    const unregister = Bun.spawn(["git", "worktree", "remove", "--force", "--force", worktreePath], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await unregister.exited;
+
+    const prune = Bun.spawn(["git", "worktree", "prune"], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await prune.exited;
+
+    const forced = await forceDeleteWorktreePath(worktreePath, {
+      sleepFn: (ms) => this.sleep(ms),
+    });
+    if (!forced.removed) {
+      throw new Error(
+        `Failed to remove stale worktree path before create (${worktreePath})${
+          forced.lastError ? `: ${forced.lastError}` : ""
+        }`,
+      );
+    }
+  }
+
+  private async resolveWorktreeBaseRefForJob(
+    job: Job,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<string> {
+    const reviewAgent =
+      job.params?.reviewAgent && typeof job.params.reviewAgent === "object"
+        ? (job.params.reviewAgent as Record<string, unknown>)
+        : null;
+    const resolutionType =
+      reviewAgent && typeof reviewAgent.resolutionType === "string"
+        ? reviewAgent.resolutionType.trim().toLowerCase()
+        : "";
+    if (resolutionType !== "merge_conflict") return this.options.baseRef;
+
+    const normalizedHeadRef = normalizeMergeConflictHeadRef(reviewAgent?.prHeadRef);
+    if (!normalizedHeadRef) {
+      const note = `[DockerExecutor] Merge-conflict job ${job.id} has no usable prHeadRef; falling back to ${this.options.baseRef}.`;
+      console.warn(note);
+      onLog?.("stderr", note);
+      return this.options.baseRef;
+    }
+
+    const remoteRef = `origin/${normalizedHeadRef}`;
+    const fetch = Bun.spawn(["git", "fetch", "origin", normalizedHeadRef, "--quiet"], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const fetchExit = await fetch.exited;
+    if (fetchExit !== 0) {
+      const fetchErr = (await new Response(fetch.stderr).text()).trim();
+      const note = `[DockerExecutor] Merge-conflict job ${job.id} could not refresh ${remoteRef}; falling back to ${this.options.baseRef}${fetchErr ? ` (${fetchErr})` : ""}.`;
+      console.warn(note);
+      onLog?.("stderr", note);
+      return this.options.baseRef;
+    }
+
+    const verify = Bun.spawn(["git", "rev-parse", "--verify", "--quiet", remoteRef], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const verifyExit = await verify.exited;
+    if (verifyExit !== 0) {
+      const note = `[DockerExecutor] Merge-conflict job ${job.id} could not verify ${remoteRef}; falling back to ${this.options.baseRef}.`;
+      console.warn(note);
+      onLog?.("stderr", note);
+      return this.options.baseRef;
+    }
+
+    const info = `[DockerExecutor] Merge-conflict job ${job.id}: using fresh worktree base ${remoteRef}.`;
+    console.log(info);
+    onLog?.("stdout", info);
+    return remoteRef;
   }
 
   /**

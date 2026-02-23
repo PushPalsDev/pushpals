@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { DockerExecutor } from "../apps/workerpals/src/docker_executor";
+import {
+  collectPrunableEphemeralWorktrees,
+  DockerExecutor,
+  isEphemeralWorkerWorktreePath,
+  parseGitWorktreeListPorcelain,
+} from "../apps/workerpals/src/docker_executor";
 
 function createExecutor() {
   return new DockerExecutor({
@@ -73,5 +78,94 @@ describe("workerpals docker executor internals", () => {
     expect(executor.matchesRetryablePattern("OpenHands wrapper timed out after 900000ms")).toBe(
       true,
     );
+  });
+
+  test("parseGitWorktreeListPorcelain extracts detached and prunable flags", () => {
+    const parsed = parseGitWorktreeListPorcelain(
+      [
+        "worktree /repo",
+        "HEAD 0123456789abcdef",
+        "branch refs/heads/main",
+        "",
+        "worktree /repo/.worktrees/job-123",
+        "HEAD fedcba9876543210",
+        "detached",
+        "prunable gitdir file points to non-existent location",
+      ].join("\n"),
+    );
+
+    expect(parsed).toEqual([
+      { path: "/repo", detached: false, prunable: false },
+      { path: "/repo/.worktrees/job-123", detached: true, prunable: true },
+    ]);
+  });
+
+  test("collectPrunableEphemeralWorktrees limits cleanup to stale managed entries", () => {
+    const output = [
+      "worktree /repo",
+      "HEAD 1111111111111111",
+      "branch refs/heads/main",
+      "",
+      "worktree /repo/.worktrees/job-active",
+      "HEAD 2222222222222222",
+      "detached",
+      "",
+      "worktree /repo/.worktrees/job-stale",
+      "HEAD 3333333333333333",
+      "detached",
+      "prunable missing",
+      "",
+      "worktree /repo/.worktrees/selfcheck-stale",
+      "HEAD 4444444444444444",
+      "detached",
+      "prunable missing",
+      "",
+      "worktree /repo/.worktrees/feature-scratch",
+      "HEAD 5555555555555555",
+      "detached",
+      "prunable missing",
+    ].join("\n");
+
+    expect(isEphemeralWorkerWorktreePath("/repo/.worktrees/job-123")).toBe(true);
+    expect(isEphemeralWorkerWorktreePath("/repo/.worktrees/selfcheck-abc")).toBe(true);
+    expect(isEphemeralWorkerWorktreePath("/repo/.worktrees/feature-scratch")).toBe(false);
+
+    expect(collectPrunableEphemeralWorktrees(output)).toEqual([
+      "/repo/.worktrees/job-stale",
+      "/repo/.worktrees/selfcheck-stale",
+    ]);
+  });
+
+  test("execute decrements activeJobs when base ref resolution fails", async () => {
+    const executor = createExecutor() as unknown as {
+      execute: (
+        job: {
+          id: string;
+          taskId: string;
+          kind: string;
+          params: Record<string, unknown>;
+          sessionId: string;
+        },
+      ) => Promise<unknown>;
+      activeJobs: number;
+      resolveWorktreeBaseRefForJob: () => Promise<string>;
+      removeWorktree: () => Promise<void>;
+    };
+
+    executor.resolveWorktreeBaseRefForJob = async () => {
+      throw new Error("boom");
+    };
+    executor.removeWorktree = async () => {};
+
+    await expect(
+      executor.execute({
+        id: "job-1",
+        taskId: "task-1",
+        kind: "task.execute",
+        params: {},
+        sessionId: "dev",
+      }),
+    ).rejects.toThrow("boom");
+    expect(executor.activeJobs).toBe(0);
   });
 });

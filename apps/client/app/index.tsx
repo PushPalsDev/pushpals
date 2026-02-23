@@ -3,6 +3,7 @@ import {
   Animated,
   KeyboardAvoidingView,
   Platform,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -391,165 +392,180 @@ export default function DashboardScreen() {
       style={[styles.root, { backgroundColor: theme.background }]}
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
-      <View
-        style={[
-          styles.backdropBlob,
-          styles.backdropBlobA,
-          { backgroundColor: `${theme.accent}20` },
-        ]}
-      />
-      <View
-        style={[
-          styles.backdropBlob,
-          styles.backdropBlobB,
-          { backgroundColor: `${theme.warning}16` },
-        ]}
-      />
-      <View
-        style={[
-          styles.backdropBlob,
-          styles.backdropBlobC,
-          { backgroundColor: `${theme.positive}18` },
-        ]}
-      />
-
-      <Animated.View
-        style={[
-          styles.shell,
-          {
-            backgroundColor: theme.shell,
-            borderColor: theme.border,
-            opacity: mountAnim,
-            transform: [
-              {
-                translateY: mountAnim.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [18, 0],
-                }),
-              },
-            ],
-          },
-        ]}
-      >
-        <DashboardHeader
-          theme={theme}
-          mode={mode}
-          repo={systemSummary.repo}
-          snapshotTs={systemSummary.ts ?? null}
-          formatRelativeTime={relativeMs}
-          formatAbsoluteTime={prettyTs}
-          onChangeMode={setMode}
+      <View style={styles.root}>
+        <View
+          style={[
+            styles.backdropBlob,
+            styles.backdropBlobA,
+            { backgroundColor: `${theme.accent}20` },
+          ]}
         />
-
-        {session.error ? (
-          <View
+        <View
+          style={[
+            styles.backdropBlob,
+            styles.backdropBlobB,
+            { backgroundColor: `${theme.warning}16` },
+          ]}
+        />
+        <View
+          style={[
+            styles.backdropBlob,
+            styles.backdropBlobC,
+            { backgroundColor: `${theme.positive}18` },
+          ]}
+        />
+        <ScrollView
+          style={styles.root}
+          contentContainerStyle={styles.rootScrollContent}
+          keyboardShouldPersistTaps="handled"
+        >
+          <Animated.View
             style={[
-              styles.banner,
-              { backgroundColor: `${theme.danger}22`, borderColor: `${theme.danger}55` },
+              styles.shell,
+              {
+                backgroundColor: theme.shell,
+                borderColor: theme.border,
+                opacity: mountAnim,
+                transform: [
+                  {
+                    translateY: mountAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [18, 0],
+                    }),
+                  },
+                ],
+              },
             ]}
           >
-            <Text style={[styles.bannerText, { color: theme.danger, fontFamily: theme.fontSans }]}>
-              {session.error}
-            </Text>
-          </View>
-        ) : null}
-
-        <FlowRibbon theme={theme} steps={flowSteps} />
-
-        <DashboardMetrics
-          theme={theme}
-          connected={session.isConnected}
-          totalEvents={totalEvents}
-          pendingRequests={pendingRequestsCount}
-          pendingJobs={pendingJobsCount}
-          onlineWorkers={onlineWorkersCount}
-          busyWorkers={busyWorkersCount}
-          lastRefresh={lastRefresh}
-          formatRelativeTime={relativeMs}
-          formatAbsoluteTime={prettyTs}
-        />
-
-        <SegmentedTabs tabs={tabs} active={activeTab} onSelect={setActiveTab} theme={theme} />
-
-        <Animated.View
-          style={[
-            styles.tabFill,
-            {
-              opacity: tabAnim,
-              transform: [
-                { translateY: tabAnim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }) },
-              ],
-            },
-          ]}
-        >
-          {activeTab === "coordination" ? (
-            <CoordinationPane
+            <DashboardHeader
               theme={theme}
-              isWide={isWide}
-              rows={coordinationRows}
-              requestCounts={requestCounts}
-              jobCounts={jobCounts}
-              completionCounts={completionCounts}
-              onReusePrompt={reusePromptInComposer}
-              onOpenLogs={openLogsForCoordination}
+              mode={mode}
+              repo={systemSummary.repo}
+              snapshotTs={systemSummary.ts ?? null}
+              formatRelativeTime={relativeMs}
+              formatAbsoluteTime={prettyTs}
+              onChangeMode={setMode}
             />
-          ) : null}
-          {activeTab === "chat" ? (
-            <ChatPane
+
+            {session.error ? (
+              <View
+                style={[
+                  styles.banner,
+                  { backgroundColor: `${theme.danger}22`, borderColor: `${theme.danger}55` },
+                ]}
+              >
+                <Text style={[styles.bannerText, { color: theme.danger, fontFamily: theme.fontSans }]}>
+                  {session.error}
+                </Text>
+              </View>
+            ) : null}
+
+            <FlowRibbon theme={theme} steps={flowSteps} />
+
+            <DashboardMetrics
               theme={theme}
-              messages={session.state.messages}
-              input={input}
-              setInput={setInput}
-              onSend={sendMessage}
-              onSendRemote={sendDirectRemote}
-              onEscalate={escalateToRemote}
               connected={session.isConnected}
-              localBuddyThinking={pendingLocalResponses > 0}
-            />
-          ) : null}
-          {activeTab === "requests" ? (
-            <RequestsPane
-              theme={theme}
-              rows={requests}
-              counts={requestCounts}
-              pendingSnapshot={requestPendingSnapshot}
-            />
-          ) : null}
-          {activeTab === "jobs" ? (
-            <JobsPane
-              theme={theme}
-              isWide={isWide}
-              jobs={jobs}
-              jobCounts={jobCounts}
-              pendingSnapshot={jobPendingSnapshot}
-              completions={completions}
-              completionCounts={completionCounts}
-              sessionState={session.state}
-              requestFilterId={jobsFilter.requestId}
-              jobFilterId={jobsFilter.jobId}
-              onClearFilter={() => setJobsFilter({ requestId: null, jobId: null })}
-            />
-          ) : null}
-          {activeTab === "system" ? (
-            <SystemPane
-              theme={theme}
-              events={session.events}
-              connected={session.isConnected}
-              workers={workers}
-              systemSummary={systemSummary}
+              totalEvents={totalEvents}
+              pendingRequests={pendingRequestsCount}
+              pendingJobs={pendingJobsCount}
+              onlineWorkers={onlineWorkersCount}
+              busyWorkers={busyWorkersCount}
               lastRefresh={lastRefresh}
+              formatRelativeTime={relativeMs}
+              formatAbsoluteTime={prettyTs}
             />
-          ) : null}
-        </Animated.View>
-      </Animated.View>
+
+            <SegmentedTabs tabs={tabs} active={activeTab} onSelect={setActiveTab} theme={theme} />
+
+            <Animated.View
+              style={[
+                styles.tabFill,
+                {
+                  opacity: tabAnim,
+                  transform: [
+                    {
+                      translateY: tabAnim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }),
+                    },
+                  ],
+                },
+              ]}
+            >
+              {activeTab === "coordination" ? (
+                <CoordinationPane
+                  theme={theme}
+                  isWide={isWide}
+                  rows={coordinationRows}
+                  requestCounts={requestCounts}
+                  jobCounts={jobCounts}
+                  completionCounts={completionCounts}
+                  onReusePrompt={reusePromptInComposer}
+                  onOpenLogs={openLogsForCoordination}
+                />
+              ) : null}
+              {activeTab === "chat" ? (
+                <ChatPane
+                  theme={theme}
+                  messages={session.state.messages}
+                  input={input}
+                  setInput={setInput}
+                  onSend={sendMessage}
+                  onSendRemote={sendDirectRemote}
+                  onEscalate={escalateToRemote}
+                  connected={session.isConnected}
+                  localBuddyThinking={pendingLocalResponses > 0}
+                />
+              ) : null}
+              {activeTab === "requests" ? (
+                <RequestsPane
+                  theme={theme}
+                  rows={requests}
+                  counts={requestCounts}
+                  pendingSnapshot={requestPendingSnapshot}
+                />
+              ) : null}
+              {activeTab === "jobs" ? (
+                <JobsPane
+                  theme={theme}
+                  isWide={isWide}
+                  jobs={jobs}
+                  jobCounts={jobCounts}
+                  pendingSnapshot={jobPendingSnapshot}
+                  completions={completions}
+                  completionCounts={completionCounts}
+                  sessionState={session.state}
+                  requestFilterId={jobsFilter.requestId}
+                  jobFilterId={jobsFilter.jobId}
+                  onClearFilter={() => setJobsFilter({ requestId: null, jobId: null })}
+                />
+              ) : null}
+              {activeTab === "system" ? (
+                <SystemPane
+                  theme={theme}
+                  events={session.events}
+                  connected={session.isConnected}
+                  workers={workers}
+                  systemSummary={systemSummary}
+                  lastRefresh={lastRefresh}
+                />
+              ) : null}
+            </Animated.View>
+          </Animated.View>
+        </ScrollView>
+      </View>
     </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
+  rootScrollContent: {
+    flexGrow: 1,
+    minHeight: "100%",
+    paddingBottom: 12,
+  },
   shell: {
     flex: 1,
+    minHeight: 0,
     margin: 12,
     borderRadius: 22,
     borderWidth: 1,
@@ -572,5 +588,5 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   bannerText: { fontSize: 12, fontWeight: "600" },
-  tabFill: { flex: 1 },
+  tabFill: { flex: 1, minHeight: 0 },
 });
