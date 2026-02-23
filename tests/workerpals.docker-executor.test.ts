@@ -168,4 +168,60 @@ describe("workerpals docker executor internals", () => {
     ).rejects.toThrow("boom");
     expect(executor.activeJobs).toBe(0);
   });
+
+  test("rebuilds Docker image only for merge-conflict jobs", async () => {
+    const executor = createExecutor() as unknown as {
+      execute: (
+        job: {
+          id: string;
+          taskId: string;
+          kind: string;
+          params: Record<string, unknown>;
+          sessionId: string;
+        },
+      ) => Promise<{ ok: boolean; summary: string }>;
+      rebuildImageForMergeConflictJob: () => Promise<void>;
+      resolveWorktreeBaseRefForJob: () => Promise<string>;
+      createWorktree: () => Promise<void>;
+      logExecutionConfig: () => void;
+      runInWarmContainer: () => Promise<{ ok: boolean; summary: string }>;
+      removeWorktree: () => Promise<void>;
+      scheduleIdleShutdown: () => void;
+    };
+
+    let rebuildCalls = 0;
+    executor.rebuildImageForMergeConflictJob = async () => {
+      rebuildCalls += 1;
+    };
+    executor.resolveWorktreeBaseRefForJob = async () => "HEAD";
+    executor.createWorktree = async () => {};
+    executor.logExecutionConfig = () => {};
+    executor.runInWarmContainer = async () => ({ ok: true, summary: "ok" });
+    executor.removeWorktree = async () => {};
+    executor.scheduleIdleShutdown = () => {};
+
+    const mergeConflictResult = await executor.execute({
+      id: "job-merge",
+      taskId: "task-merge",
+      kind: "task.execute",
+      params: {
+        reviewAgent: {
+          resolutionType: "merge_conflict",
+        },
+      },
+      sessionId: "dev",
+    });
+    expect(mergeConflictResult.ok).toBe(true);
+    expect(rebuildCalls).toBe(1);
+
+    const regularResult = await executor.execute({
+      id: "job-regular",
+      taskId: "task-regular",
+      kind: "task.execute",
+      params: {},
+      sessionId: "dev",
+    });
+    expect(regularResult.ok).toBe(true);
+    expect(rebuildCalls).toBe(1);
+  });
 });

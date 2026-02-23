@@ -205,6 +205,7 @@ export class DockerExecutor {
   private lastLoggedExecutionConfig = "";
   private lastLoggedEndpointRewrite = "";
   private warmedBackends = new Set<string>();
+  private mergeConflictRefreshPromise: Promise<void> | null = null;
   private readonly config: WorkerpalsRuntimeConfig;
 
   constructor(options: DockerExecutorOptions) {
@@ -281,6 +282,7 @@ export class DockerExecutor {
     const worktreePath = resolve(this.worktreeDir, worktreeName);
 
     try {
+      await this.ensureFreshImageForMergeConflictJob(job, onLog);
       const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog);
       // Step 1: Create isolated git worktree
       await this.createWorktree(worktreePath, worktreeBaseRef);
@@ -1517,6 +1519,89 @@ export class DockerExecutor {
         }`,
       );
     }
+  }
+
+  private isMergeConflictResolutionJob(job: Job): boolean {
+    const reviewAgent =
+      job.params?.reviewAgent && typeof job.params.reviewAgent === "object"
+        ? (job.params.reviewAgent as Record<string, unknown>)
+        : null;
+    const resolutionType =
+      reviewAgent && typeof reviewAgent.resolutionType === "string"
+        ? reviewAgent.resolutionType.trim().toLowerCase()
+        : "";
+    return resolutionType === "merge_conflict";
+  }
+
+  private async ensureFreshImageForMergeConflictJob(
+    job: Job,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<void> {
+    if (!this.isMergeConflictResolutionJob(job)) return;
+
+    if (this.mergeConflictRefreshPromise) {
+      await this.mergeConflictRefreshPromise;
+      return;
+    }
+
+    this.mergeConflictRefreshPromise = this.rebuildImageForMergeConflictJob(job, onLog);
+    try {
+      await this.mergeConflictRefreshPromise;
+    } finally {
+      this.mergeConflictRefreshPromise = null;
+    }
+  }
+
+  private async rebuildImageForMergeConflictJob(
+    job: Job,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<void> {
+    const dockerfilePath = resolve(this.options.repo, "apps/workerpals/Dockerfile.sandbox");
+    if (!existsSync(dockerfilePath)) {
+      throw new Error(
+        `Merge-conflict job ${job.id} requires Docker image refresh, but Dockerfile is missing at ${dockerfilePath}.`,
+      );
+    }
+
+    const startMsg = `[DockerExecutor] Merge-conflict job ${job.id}: rebuilding ${this.options.imageName} with --no-cache and restarting warm runtime.`;
+    console.log(startMsg);
+    onLog?.("stdout", startMsg);
+
+    await this.stopWarmContainer("merge-conflict image refresh", true);
+    this.warmedBackends.clear();
+
+    const build = Bun.spawn(
+      [
+        "docker",
+        "build",
+        "--no-cache",
+        "-f",
+        "apps/workerpals/Dockerfile.sandbox",
+        "-t",
+        this.options.imageName,
+        ".",
+      ],
+      {
+        cwd: this.options.repo,
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const [exitCode, stdout, stderr] = await Promise.all([
+      build.exited,
+      new Response(build.stdout).text(),
+      new Response(build.stderr).text(),
+    ]);
+    if (exitCode !== 0) {
+      const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+      throw new Error(
+        `Failed to rebuild Docker image for merge-conflict job ${job.id}: ${detail || `exit ${exitCode}`}`,
+      );
+    }
+
+    const doneMsg = `[DockerExecutor] Merge-conflict job ${job.id}: Docker image refresh complete (${this.options.imageName}).`;
+    console.log(doneMsg);
+    onLog?.("stdout", doneMsg);
   }
 
   private async resolveWorktreeBaseRefForJob(
