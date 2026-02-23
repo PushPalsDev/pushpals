@@ -1,71 +1,228 @@
-# remotebuddy - RemoteBuddy Orchestrator
+# RemoteBuddy (`apps/remotebuddy`)
 
-RemoteBuddy is the always-on planner/scheduler. It claims requests from the server queue, decides whether a request is lightweight chat or WorkerPal-owned execution, and enqueues scoped jobs for WorkerPals.
+RemoteBuddy is the always-on planner/orchestrator. It claims requests from the Server queue, decides whether a prompt can be answered directly or must be executed by WorkerPals, emits session events via `CommunicationManager`, enqueues/scopes jobs, and closes out requests (`POST /requests/:id/complete`).
 
-## Contributor Onboarding
+## Boundary & Responsibilities
 
-### Environment setup
-- Install Bun 1.1+ (for example `brew install oven-sh/bun/bun`) and ensure Docker is available because RemoteBuddy's default config expects WorkerPals to spawn inside containers.
-- From the repo root run `bun install` to pull shared workspace dependencies, then `bun run protocol:build` so RemoteBuddy and the server share the latest protocol types.
-- Bring up the API server that owns the request/job queues with `bun run server:only -- --env-file ../../.env` from `apps/server`, then launch RemoteBuddy via `bun run remotebuddy:only -- --sessionId dev --token <server-token>` (omit `--token` when the server trusts your localhost).
+| Component | Responsibilities | APIs touched |
+| --- | --- | --- |
+| **LocalBuddy** (`apps/localbuddy`) | User ingress on `POST /message`, handles status/lookups/lightweight chat, enqueues heavier prompts. | `POST /requests/enqueue` |
+| **RemoteBuddy** (`apps/remotebuddy`) | Claims queued requests, plans tasks, emits `assistant_message`, `task_*`, `job_enqueued`, optionally spawns WorkerPals, completes requests or escalates failures. | `POST /requests/claim`, `POST /jobs/enqueue`, `POST /requests/:id/(complete|fail)` |
 
-### Configuration
-- Copy `config/local.example.toml` to `config/local.toml` and adjust the `[server]` or `[remotebuddy]` sections to point at your server URL, preferred session id, and WorkerPal caps. Keeping a unique `remotebuddy.session_id` avoids fighting with teammates.
-- Secrets live in `.env` at the repo root. RemoteBuddy's LLM client reads `OPENAI_API_KEY`, `PUSHPALS_OPENAI_CODEX_AUTH_MODE` (chatgpt/api_key/auto), `PUSHPALS_OPENAI_CODEX_BIN` (override command such as `bun x --yes @openai/codex`), and optionally `PUSHPALS_OPENAI_CODEX_BASE_URL`. Export these before running or specify `--env-file ../../.env` when invoking Bun scripts.
-- Optional tuning env vars such as `REMOTEBUDDY_SESSION_MONITOR_MAX_WS_ERRORS` and `REMOTEBUDDY_FETCH_FAILURE_LOGS=1` live in the same `.env` file and give more insight when debugging websocket/session health.
+### Dependency Snapshot
 
-### Quiet queue workflow
-- **When to use it:** Any time you want to test long-running or experimental prompts without impacting the shared interactive lane. RemoteBuddy claims requests per `sessionId`, so giving yourself a dedicated session keeps the queue "quiet" for everyone else.
-- **How to enable it:** Set a session id like `quiet-dev` in `config/local.toml` (`session_id = "quiet-dev"`) or pass `--sessionId quiet-dev` when starting both LocalBuddy and RemoteBuddy. Only those processes will enqueue/claim from that isolated lane.
-- **How to enqueue background work:** When posting directly to the server queue use `priority: "background"` to keep items in the quiet lane:
-  ```bash
-  curl -X POST "$SERVER/requests/enqueue" \
-    -H 'Content-Type: application/json' \
-    -d '{"sessionId":"quiet-dev","prompt":"run integration smoke suite","priority":"background"}'
-  ```
-  LocalBuddy already auto-detects "deep dive" prompts and marks them background, but you can force it by adding `priority:"background"` when sending custom payloads.
-- **Observing the lane:** Use `curl "$SERVER/requests?sessionId=quiet-dev"` (or LocalBuddy's `/status` view) to confirm the queue is empty before routing live traffic back to the main session, and drop the `--sessionId` override whenever you're ready to rejoin the shared queue.
-
-### Validate changes
-- Run `bun run lint` from the repo root before opening a PR so RemoteBuddy, shared protocol types, and any touched packages stay consistent with the workspace lint rules.
-
-## Runtime Role
-
-- Claims queued requests: `POST /requests/claim`
-- Emits session events via `CommunicationManager`:
-  - `assistant_message`
-  - `task_created`, `task_started`, `task_progress`
-  - `job_enqueued`
-- Schedules WorkerPals:
-  - picks idle workers
-  - optionally auto-spawns workers
-  - waits/retries when capacity is full
-- Marks requests complete: `POST /requests/:id/complete`
-
-## Usage
-
-```bash
-bun run dev
-bun run start
-
-bun run src/remotebuddy_main.ts \
-  --server http://localhost:3001 \
-  --sessionId dev \
-  --token <auth-token>
-```
-
-## Worker Routing Notes
-
-- Lightweight non-actionable prompts can be answered directly.
-- Non-trivial actionable prompts are delegated to WorkerPals.
-- Architecture/explanation intents can be routed as `project.summary`.
-- Code-change intents are routed as `task.execute`.
-
-## Event/Data Flow
+- **LocalBuddy → RemoteBuddy**: LocalBuddy forwards anything heavier than a lightweight chat to the shared Server queue via `POST /requests/enqueue`.
+- **RemoteBuddy → WorkerPals**: RemoteBuddy enqueues jobs via `POST /jobs/enqueue`, then WorkerPals claim from `POST /jobs/claim`.
+- **CommunicationManager** fans out `assistant_message`, `task_*`, and completion events so LocalBuddy can answer client polling/SSE requests.
 
 ```text
-LocalBuddy -> POST /requests/enqueue -> Server Request Queue
-RemoteBuddy -> POST /requests/claim -> plan -> POST /jobs/enqueue
-WorkerPals -> POST /jobs/:id/complete|fail (+ optional /completions/enqueue)
-SourceControlManager -> POST /completions/claim -> merge/push -> POST /completions/:id/processed|fail
+Client -> LocalBuddy --POST /requests/enqueue--> Server Queue <--POST /requests/claim-- RemoteBuddy
+RemoteBuddy --POST /jobs/enqueue--> Server Job Queue <--POST /jobs/claim-- WorkerPals
+RemoteBuddy -> CommunicationManager -> UI + LocalBuddy status responders
 ```
+
+## Prerequisites & Cross-Platform Install Commands
+
+RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Install these before running the service.
+
+1. **Bun 1.x**
+   - macOS (zsh/bash):
+     ```bash
+     curl -fsSL https://bun.sh/install | bash
+     ```
+   - Linux (bash):
+     ```bash
+     curl -fsSL https://bun.sh/install | bash
+     ```
+   - Windows PowerShell (native):
+     ```powershell
+     irm https://bun.sh/install.ps1 | iex
+     ```
+2. **Install workspace dependencies (prevents `ENOENT ... node_modules/shared`)**
+   - macOS/Linux:
+     ```bash
+     cd /path/to/pushpals
+     bun install
+     ```
+   - Windows PowerShell:
+     ```powershell
+     Set-Location C:\path\to\pushpals
+     bun install
+     ```
+3. **Seed local config**
+   - macOS/Linux:
+     ```bash
+     cp .env.example .env
+     cp config/local.example.toml config/local.toml
+     ```
+   - Windows PowerShell:
+     ```powershell
+     Copy-Item .env.example .env
+     Copy-Item config\local.example.toml config\local.toml
+     ```
+4. **`jq` for status checks (`curl ... | jq`)**
+   - macOS:
+     ```bash
+     brew install jq
+     ```
+   - Debian/Ubuntu:
+     ```bash
+     sudo apt-get update && sudo apt-get install -y jq
+     ```
+   - Windows PowerShell:
+     ```powershell
+     winget install --id jqlang.jq --source winget
+     # or: choco install jq
+     ```
+
+## Runtime Role Reference
+
+- Claims queued requests (`POST /requests/claim`).
+- Emits session events via `CommunicationManager`: `assistant_message`, `task_created`, `task_started`, `task_progress`, `job_enqueued`.
+- Schedules WorkerPals (picks idle workers, optionally auto-spawns, retries when capacity is full).
+- Marks requests complete/fail (`POST /requests/:id/complete` or `/fail`).
+- Follows routing heuristics:
+  - Lightweight, non-actionable prompts => respond directly.
+  - Architecture/explanation intents => `project.summary`.
+  - Code-change intents => `task.execute` delegated to WorkerPals.
+
+## Commands & Working Directories
+
+### Repo-root scripts (validated against `package.json`)
+
+| Use case | Run from repo root | Script body | Working directory during execution |
+| --- | --- | --- | --- |
+| Build protocol + start RemoteBuddy (recommended path) | `bun run remotebuddy` | `protocol:build` → `remotebuddy:only` | Root during build, then `apps/remotebuddy` via `--cwd` |
+| Start RemoteBuddy with `.env` wiring only | `bun run remotebuddy:only` | `bun --cwd apps/remotebuddy --env-file ../../.env start` | `apps/remotebuddy` |
+| Hot reload/watch mode | `bun run remotebuddy:only:watch` | `bun --cwd apps/remotebuddy --env-file ../../.env dev` | `apps/remotebuddy` |
+
+> Tip: Keep `bun run server:only` running in another terminal so the claim/complete round-trip works.
+
+### App-local scripts (`cd apps/remotebuddy` first)
+
+| Command | Working directory | Description |
+| --- | --- | --- |
+| `bun run start` | `apps/remotebuddy` | Runs `src/remotebuddy_main.ts` once (root `remotebuddy:only` delegates here). |
+| `bun run dev` | `apps/remotebuddy` | `bun --watch --no-clear-screen src/remotebuddy_main.ts` for rapid iteration. |
+
+### Direct CLI invocation
+
+```bash
+cd apps/remotebuddy
+bun run src/remotebuddy_main.ts \
+  --server ${PUSHPALS_SERVER_URL:-http://localhost:3001} \
+  --sessionId ${PUSHPALS_SESSION_ID:-dev} \
+  --token ${PUSHPALS_AUTH_TOKEN:-<optional>}
+```
+
+- `--server`, `--sessionId`, and `--token` override values loaded from `config/*.toml` + `.env`.
+- When `--token` is omitted, the process uses `PUSHPALS_AUTH_TOKEN` (if set) or runs without auth headers.
+
+## Token Acquisition & Verification Flow
+
+RemoteBuddy and Server share the same bearer token (`PUSHPALS_AUTH_TOKEN`). The token gates every `requests/*` and `jobs/*` endpoint once configured.
+
+1. **Generate/store the token**
+   - macOS/Linux:
+     ```bash
+     export AUTH_TOKEN=$(openssl rand -hex 32)
+     echo "PUSHPALS_AUTH_TOKEN=$AUTH_TOKEN" >> .env
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $env:AUTH_TOKEN = [guid]::NewGuid().ToString("N")
+     Add-Content -Path .env -Value "PUSHPALS_AUTH_TOKEN=$env:AUTH_TOKEN"
+     ```
+2. **Verify guarded access (success path)**
+   - Bash/zsh:
+     ```bash
+     curl -i \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+       "http://localhost:3001/requests?limit=1"
+     # Expect HTTP/1.1 200 OK + `{ "ok": true, ... }`
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $resp = Invoke-WebRequest -Uri "http://localhost:3001/requests?limit=1" -Headers $headers -Method Get
+     $resp.StatusCode # Expect 200
+     $resp.Content    # Contains `{ "ok": true, ... }`
+     ```
+3. **Verify guarded access (failure path)**
+   - Bash/zsh:
+     ```bash
+     curl -i \
+       -H "Authorization: Bearer wrong-token" \
+       "http://localhost:3001/requests?limit=1"
+     # Expect HTTP/1.1 401 Unauthorized + `{ "ok": false, "message": "Unauthorized" }`
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $badHeaders = @{ Authorization = "Bearer wrong-token" }
+     try {
+       Invoke-WebRequest -Uri "http://localhost:3001/requests?limit=1" -Headers $badHeaders -Method Get -ErrorAction Stop
+     } catch {
+       $_.Exception.Response.StatusCode.value__ # 401
+       $_.Exception.Response.StatusDescription  # Unauthorized
+     }
+     ```
+4. **Run without a token**
+   - Remove/comment `PUSHPALS_AUTH_TOKEN` from `.env` then `unset PUSHPALS_AUTH_TOKEN` (bash) or `Remove-Item Env:PUSHPALS_AUTH_TOKEN` (PowerShell).
+   - Restart Server + RemoteBuddy. `SessionManager.validateAuth` now allows requests without the header. Repeat the success curl/PowerShell calls without the `Authorization` header and expect HTTP 200.
+5. **Diagnose auth failures (canonical signals)**
+   - HTTP view: every `POST /requests/claim` responds with `401`, and curl/PowerShell output contains `{ "ok": false, "message": "Unauthorized" }`.
+   - RemoteBuddy log view: `Starting polling loop...` repeats without `claim payload` lines because polls are rejected.
+   - Server log view: `[POST] /requests/claim 401` paired with `auth=invalid-token` metadata.
+   - Fix by aligning RemoteBuddy’s `--token` flag or `PUSHPALS_AUTH_TOKEN` env var with the Server token and restarting both processes.
+
+## Runtime Smoke-Test Checklist (beyond lint)
+
+> All curl/PowerShell examples assume a tokenized server; omit the header if you are running open access.
+
+1. **Enqueue a synthetic request**
+   - Bash/zsh:
+     ```bash
+     curl -sS -X POST http://localhost:3001/requests/enqueue \
+       -H "Content-Type: application/json" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+       -d '{"sessionId":"dev","prompt":"List repo packages","priority":"interactive"}'
+     # Expect HTTP 201 + `{ "ok": true, "requestId": "<ID>", "queuePosition": 1 }`
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $headers = @{ "Content-Type" = "application/json"; Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $body = '{"sessionId":"dev","prompt":"List repo packages","priority":"interactive"}'
+     $resp = Invoke-WebRequest -Uri "http://localhost:3001/requests/enqueue" -Method Post -Headers $headers -Body $body
+     $resp.StatusCode # Expect 201
+     $resp.Content    # Contains ok=true + requestId
+     ```
+2. **Confirm RemoteBuddy claims it**
+   - Observe the RemoteBuddy terminal (started via `bun run remotebuddy` from repo root). Within ~1s expect:
+     - `[RemoteBuddy] claim payload: { ... "request": { "id": "<ID>" } }`
+     - `[RemoteBuddy] Claimed request <ID>`
+   - Manual API fallback if RemoteBuddy is stopped:
+     ```bash
+     curl -sS -X POST http://localhost:3001/requests/claim \
+       -H "Content-Type: application/json" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+       -d '{"agentId":"smoke-check"}'
+     # Expect HTTP 200 + payload containing the queued request
+     ```
+3. **Check queue status transitions**
+   ```bash
+   curl -sS "http://localhost:3001/requests?status=claimed&limit=5" \
+     -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests[0].status'
+   # Expect "claimed" with agentId="remotebuddy"
+
+   curl -sS "http://localhost:3001/requests?status=completed&limit=5" \
+     -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests[].durationMs'
+   # Expect the same requestId listed with durationMs populated once planning completes
+   ```
+4. **Inspect overall runtime health**
+   ```bash
+   curl -sS "http://localhost:3001/system/status" \
+     -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '{pending: .queues.requests.pending, jobQueue: .jobPendingSnapshot}'
+   # Expect `pending: 0` after the smoke item clears; jobQueue is empty unless RemoteBuddy enqueued WorkerPal jobs
+   ```
+
+For a fully automated round-trip (Client → LocalBuddy → RemoteBuddy → WorkerPals), keep `server`, `localbuddy`, and `workerpals` running, then execute `PUSHPALS_AUTH_TOKEN=<token> bun run smoke` from the repo root. That script asserts the presence of `task_created` and terminal events, complementing the manual enqueue/claim/status checks above.
