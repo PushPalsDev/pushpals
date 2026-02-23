@@ -21,7 +21,10 @@ import { createHash } from "crypto";
 import { createServer } from "net";
 import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
-import { loadPushPalsConfig, sanitizePushPalsConfigForLogging } from "../packages/shared/src/config.js";
+import {
+  loadPushPalsConfig,
+  sanitizePushPalsConfigForLogging,
+} from "../packages/shared/src/config.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -64,7 +67,15 @@ const WORKSPACE_NODE_MODULES_HEALTH_CHECKS: Array<{
 }> = [
   {
     nodeModulesPath: resolve(repoRoot, "packages", "protocol", "node_modules"),
-    sentinelPath: resolve(repoRoot, "packages", "protocol", "node_modules", "typescript", "bin", "tsc"),
+    sentinelPath: resolve(
+      repoRoot,
+      "packages",
+      "protocol",
+      "node_modules",
+      "typescript",
+      "bin",
+      "tsc",
+    ),
     label: "packages/protocol node_modules",
     sentinelLabel: "packages/protocol TypeScript compiler",
   },
@@ -257,7 +268,9 @@ function removePathForClean(pathValue: string, label: string): void {
         `[start] Clean run: could not fully remove ${label} at ${pathValue}`,
         code ? `(code=${code})` : "",
         ignored ? "(gitignored path)" : "",
-        removedChildren > 0 ? `removed ${removedChildren} unlocked child entr${removedChildren === 1 ? "y" : "ies"}` : "",
+        removedChildren > 0
+          ? `removed ${removedChildren} unlocked child entr${removedChildren === 1 ? "y" : "ies"}`
+          : "",
       ]
         .filter(Boolean)
         .join(" ");
@@ -588,11 +601,7 @@ function codexAuthModeFromConfig(): string {
 
 function codexConfiguredAuthMode(): CodexAuthMode {
   return normalizeCodexAuthMode(
-    firstNonEmpty(
-      process.env.PUSHPALS_OPENAI_CODEX_AUTH_MODE,
-      codexAuthModeFromConfig(),
-      "auto",
-    ),
+    firstNonEmpty(process.env.PUSHPALS_OPENAI_CODEX_AUTH_MODE, codexAuthModeFromConfig(), "auto"),
   );
 }
 
@@ -647,9 +656,7 @@ function codexEffectiveAuthMode(): CodexAuthMode | null {
 }
 
 function codexHostCommandPrefix(): string[] {
-  const jsonOverride = firstNonEmpty(
-    process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON,
-  );
+  const jsonOverride = firstNonEmpty(process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON);
   if (jsonOverride) {
     try {
       const parsed = JSON.parse(jsonOverride);
@@ -759,7 +766,9 @@ async function ensureCodexCliAuthPreflight(): Promise<void> {
   const loginExit = await runInherited([...commandPrefix, "login"], repoRoot);
   if (loginExit !== 0) {
     console.error(`[start] Codex login exited with code ${loginExit}.`);
-    console.error("[start] Complete `codex login` (or `bunx --yes @openai/codex login`) and retry.");
+    console.error(
+      "[start] Complete `codex login` (or `bunx --yes @openai/codex login`) and retry.",
+    );
     abortStart(1);
   }
 
@@ -1152,7 +1161,10 @@ function resolveServiceBackendForPreflight(opts: {
   let backend =
     normalizeLlmBackend(firstNonEmpty(opts.backend)) ??
     configuredLlmBackend(opts.endpoint || DEFAULT_LMSTUDIO_ENDPOINT);
-  if ((opts.allowCodexFallback ?? true) && shouldUseCodexCliFallbackBackend(backend, opts.model, opts.apiKey)) {
+  if (
+    (opts.allowCodexFallback ?? true) &&
+    shouldUseCodexCliFallbackBackend(backend, opts.model, opts.apiKey)
+  ) {
     backend = "openai_codex";
   }
   return backend;
@@ -1293,7 +1305,8 @@ function llmPreflightEndpointGroups(targets: LlmPreflightTarget[]): LlmPreflight
 
 function codexLlmPreflightSkippedServices(): string[] {
   const services: string[] = [];
-  const remoteEndpoint = firstNonEmpty(CONFIG.remotebuddy.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT;
+  const remoteEndpoint =
+    firstNonEmpty(CONFIG.remotebuddy.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT;
   const localEndpoint = firstNonEmpty(CONFIG.localbuddy.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT;
   const workerEndpoint = firstNonEmpty(CONFIG.workerpals.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT;
 
@@ -1894,6 +1907,25 @@ function isLikelyPushPalsListener(listener: ListeningProcess): boolean {
   );
 }
 
+function isLikelyWorkerPalsProcess(listener: ListeningProcess): boolean {
+  if (listener.pid === process.pid) return false;
+
+  const processName = normalizeForMatch(listener.name);
+  if (processName === "conhost.exe") return false;
+
+  const haystack = normalizeForMatch(`${listener.name} ${listener.commandLine}`);
+  if (!haystack) return false;
+
+  const repoHint = normalizeForMatch(repoRoot);
+  if (repoHint && !haystack.includes(repoHint)) return false;
+
+  return (
+    haystack.includes("src/workerpals_main.ts") ||
+    haystack.includes("apps/workerpals") ||
+    haystack.includes("workerpals:only")
+  );
+}
+
 function requiredStartupPorts(): StartupPortSpec[] {
   const rawPorts: StartupPortSpec[] = [
     { name: "Server", port: CONFIG.server.port },
@@ -2013,7 +2045,10 @@ async function describeWindowsPid(pid: number): Promise<ListeningProcess> {
     "  [pscustomobject]@{ pid = [int]$proc.ProcessId; name = [string]$proc.Name; commandLine = [string]$proc.CommandLine } | ConvertTo-Json -Compress",
     "}",
   ].join("; ");
-  const cim = await runCapture(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], repoRoot);
+  const cim = await runCapture(
+    ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+    repoRoot,
+  );
   if (cim.ok && cim.stdout.trim()) {
     const parsed = parseJsonLoose(cim.stdout);
     const rows = normalizeListenerRows(parsed);
@@ -2039,7 +2074,7 @@ async function listPortListenersWindows(port: number): Promise<ListeningProcess[
     "$rows = @()",
     "foreach ($pid in $pids) {",
     "  if (-not $pid) { continue }",
-    "  $proc = Get-CimInstance Win32_Process -Filter \"ProcessId = $pid\"",
+    '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $pid"',
     "  if ($null -eq $proc) { continue }",
     "  $rows += [pscustomobject]@{ pid = [int]$proc.ProcessId; name = [string]$proc.Name; commandLine = [string]$proc.CommandLine }",
     "}",
@@ -2181,6 +2216,106 @@ async function listLikelyPushPalsHostProcessesWindows(): Promise<ListeningProces
   );
 }
 
+async function listLikelyWorkerPalsProcessesWindows(): Promise<ListeningProcess[]> {
+  const repoNeedle = normalizeForMatch(repoRoot);
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$needle = '${escapePowerShellSingleQuoted(repoNeedle)}'`,
+    "$rows = Get-CimInstance Win32_Process | Where-Object {",
+    "  $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle)",
+    "} | Select-Object @{n='pid';e={[int]$_.ProcessId}}, @{n='name';e={[string]$_.Name}}, @{n='commandLine';e={[string]$_.CommandLine}}",
+    "if ($rows.Count -eq 0) { '[]' } else { $rows | ConvertTo-Json -Compress }",
+  ].join("; ");
+
+  const result = await runCapture(
+    ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+    repoRoot,
+  );
+  if (!result.ok || !result.stdout.trim()) return [];
+  const parsed = parseJsonLoose(result.stdout);
+  return normalizeListenerRows(parsed).filter((listener) => isLikelyWorkerPalsProcess(listener));
+}
+
+async function listLikelyWorkerPalsProcessesPosix(): Promise<ListeningProcess[]> {
+  const result = await runCapture(["ps", "-eo", "pid=,comm=,args="], repoRoot);
+  if (!result.ok || !result.stdout.trim()) return [];
+
+  const out: ListeningProcess[] = [];
+  const seen = new Set<number>();
+  for (const rawLine of result.stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = line.match(/^(\d+)\s+(\S+)\s+(.*)$/);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (!Number.isFinite(pid) || pid <= 0 || seen.has(pid)) continue;
+    seen.add(pid);
+    const row: ListeningProcess = {
+      pid,
+      name: match[2] ?? "",
+      commandLine: match[3] ?? "",
+    };
+    if (isLikelyWorkerPalsProcess(row)) {
+      out.push(row);
+    }
+  }
+  return out;
+}
+
+async function listLikelyWorkerPalsProcesses(): Promise<ListeningProcess[]> {
+  if (process.platform === "win32") {
+    return listLikelyWorkerPalsProcessesWindows();
+  }
+  return listLikelyWorkerPalsProcessesPosix();
+}
+
+async function cleanupStaleWorkerPalsProcesses(): Promise<void> {
+  const initial = await listLikelyWorkerPalsProcesses();
+  if (initial.length === 0) return;
+
+  console.warn(
+    `[start] Startup preflight: found ${initial.length} stale WorkerPals process(es); terminating before warmup.`,
+  );
+
+  let terminated = 0;
+  for (const candidate of initial) {
+    const summary = shortCommandLine(candidate.commandLine) || "<no command line>";
+    console.warn(
+      `[start] Startup preflight: terminating stale WorkerPals pid=${candidate.pid} (${candidate.name || "unknown"}) ${summary}`,
+    );
+    if (await terminateProcess(candidate.pid)) {
+      terminated += 1;
+    } else {
+      console.warn(
+        `[start] Startup preflight: failed to terminate stale WorkerPals pid=${candidate.pid}.`,
+      );
+    }
+  }
+
+  if (terminated > 0) {
+    await delay(400);
+  }
+
+  const remaining = await listLikelyWorkerPalsProcesses();
+  if (remaining.length > 0) {
+    console.error(
+      `[start] Startup preflight: ${remaining.length} stale WorkerPals process(es) remain after cleanup.`,
+    );
+    for (const candidate of remaining) {
+      const summary = shortCommandLine(candidate.commandLine) || "<no command line>";
+      console.error(
+        `[start]   pid=${candidate.pid} name=${candidate.name || "unknown"} cmd=${summary}`,
+      );
+    }
+    console.error(
+      "[start] Stop remaining stale WorkerPals processes and retry. This prevents warmup worktree races.",
+    );
+    abortStart(1);
+  }
+
+  console.log(`[start] Startup preflight: terminated ${terminated} stale WorkerPals process(es).`);
+}
+
 async function terminateLikelyPushPalsHostProcessesWindows(): Promise<number> {
   const candidates = await listLikelyPushPalsHostProcessesWindows();
   let terminated = 0;
@@ -2266,7 +2401,9 @@ async function ensureServicePortsAvailable(): Promise<void> {
   for (const conflict of conflicts) {
     console.error(`[start] - ${conflict.spec.name} (${conflict.spec.port})`);
     if (conflict.listeners.length === 0) {
-      console.error(`[start]   owner: unavailable (could not resolve process for port ${conflict.spec.port})`);
+      console.error(
+        `[start]   owner: unavailable (could not resolve process for port ${conflict.spec.port})`,
+      );
       continue;
     }
     for (const listener of conflict.listeners) {
@@ -3083,7 +3220,9 @@ async function ensureGitHubAuthPreflight(): Promise<void> {
   const ghAvailable = (await runQuiet(["gh", "--version"])) === 0;
   if (!ghAvailable) {
     console.error("[start] GitHub auth preflight failed: `gh` CLI is not installed.");
-    console.error("[start] Install GitHub CLI or set one of: PUSHPALS_GIT_TOKEN, GITHUB_TOKEN, GH_TOKEN.");
+    console.error(
+      "[start] Install GitHub CLI or set one of: PUSHPALS_GIT_TOKEN, GITHUB_TOKEN, GH_TOKEN.",
+    );
     abortStart(1);
   }
 
@@ -3096,14 +3235,18 @@ async function ensureGitHubAuthPreflight(): Promise<void> {
 
   const apiAccessOk = await ghApiAccessOk();
   if (!apiAccessOk) {
-    console.error("[start] GitHub auth preflight failed: authenticated CLI token cannot access GitHub API.");
+    console.error(
+      "[start] GitHub auth preflight failed: authenticated CLI token cannot access GitHub API.",
+    );
     console.error("[start] Run: gh auth refresh -h github.com");
     abortStart(1);
   }
 
   const exported = await exportGitTokenFromGhAuth();
   if (exported) {
-    console.log("[start] GitHub auth preflight: authenticated and token exported for startup services.");
+    console.log(
+      "[start] GitHub auth preflight: authenticated and token exported for startup services.",
+    );
   } else {
     console.warn(
       "[start] GitHub auth preflight: authenticated, but `gh auth token` export failed. Services will use direct gh auth as needed.",
@@ -3186,7 +3329,9 @@ async function ensureGitHubAuth(force = false): Promise<void> {
       apiAccessOk = refreshed ? await ghApiAccessOk() : false;
     }
     if (!apiAccessOk) {
-      console.log("[start] GitHub CLI token could not access GitHub API. Starting `gh auth login`...");
+      console.log(
+        "[start] GitHub CLI token could not access GitHub API. Starting `gh auth login`...",
+      );
       const loginExitCode = await runInherited(
         ["gh", "auth", "login", "--hostname", "github.com", "--web"],
         repoRoot,
@@ -3204,7 +3349,9 @@ async function ensureGitHubAuth(force = false): Promise<void> {
 
     const exported = await exportGitTokenFromGhAuth();
     if (exported) {
-      console.log("[start] GitHub CLI auth preflight: authenticated and token exported for startup services.");
+      console.log(
+        "[start] GitHub CLI auth preflight: authenticated and token exported for startup services.",
+      );
     } else {
       console.warn(
         "[start] GitHub CLI auth is valid, but `gh auth token` export failed. Services will fall back to direct gh auth when needed.",
@@ -3658,6 +3805,7 @@ try {
   ensureRequiredLocalConfigFiles();
   logEffectiveConfigSnapshot();
   await ensureServicePortsAvailable();
+  await cleanupStaleWorkerPalsProcesses();
   await ensureCodexCliAuthPreflight();
   await ensureGitHubAuthPreflight();
   await cleanupWorkerWarmContainers("startup preflight");
