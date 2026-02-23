@@ -129,7 +129,6 @@ const SCORING_SYSTEM_PROMPT = loadPromptTemplate(
 const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/autonomy_planning_system_prompt.md",
 ).trim();
-const AUTONOMY_HEARTBEAT_LOG_MS = 30_000;
 
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -1420,7 +1419,7 @@ export class RemoteBuddyAutonomousEngine {
     }, this.cfg.tickIntervalMs);
     this.heartbeatTimer = setInterval(() => {
       this.logHeartbeat();
-    }, AUTONOMY_HEARTBEAT_LOG_MS);
+    }, this.cfg.heartbeatLogMs);
     this.logHeartbeat();
     void this.tick();
   }
