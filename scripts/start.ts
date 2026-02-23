@@ -286,14 +286,18 @@ function removePathForClean(pathValue: string, label: string): void {
 }
 
 function ensureRequiredLocalConfigFiles(): void {
-  const required: Array<{ path: string; hint: string }> = [
+  const required: Array<{ path: string; hint: string; windowsCopy: string; linuxCopy: string }> = [
     {
       path: resolve(repoRoot, ".env"),
       hint: "Create .env from .env.example and set your local secrets/wiring.",
+      windowsCopy: "Copy-Item .env.example .env",
+      linuxCopy: "cp .env.example .env",
     },
     {
       path: resolve(repoRoot, "config", "local.toml"),
       hint: "Create config/local.toml from config/local.example.toml for local overrides.",
+      windowsCopy: "Copy-Item config/local.example.toml config/local.toml",
+      linuxCopy: "cp config/local.example.toml config/local.toml",
     },
   ];
 
@@ -305,6 +309,8 @@ function ensureRequiredLocalConfigFiles(): void {
     const rel = relative(repoRoot, entry.path).replace(/\\/g, "/");
     console.error(`[start] - ${rel}`);
     console.error(`[start]   ${entry.hint}`);
+    console.error(`[start]   Windows (PowerShell): ${entry.windowsCopy}`);
+    console.error(`[start]   Linux/macOS (bash): ${entry.linuxCopy}`);
   }
   abortStart(1);
 }
