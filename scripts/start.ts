@@ -59,6 +59,10 @@ const REQUIRED_DEPENDENCY_SENTINELS: Array<{ path: string; label: string }> = [
     label: "Expo runtime package",
   },
 ];
+const HOISTED_LINKER_RETRY_SENTINEL_PATHS = new Set<string>([
+  resolve(repoRoot, "node_modules", "typescript", "bin", "tsc"),
+  resolve(repoRoot, "node_modules", "expo", "package.json"),
+]);
 const WORKSPACE_NODE_MODULES_HEALTH_CHECKS: Array<{
   nodeModulesPath: string;
   sentinelPath: string;
@@ -309,6 +313,12 @@ function missingDependencySentinels(): Array<{ path: string; label: string }> {
   return REQUIRED_DEPENDENCY_SENTINELS.filter((entry) => !existsSync(entry.path));
 }
 
+function shouldRetryInstallWithHoistedLinker(
+  missing: Array<{ path: string; label: string }>,
+): boolean {
+  return missing.some((entry) => HOISTED_LINKER_RETRY_SENTINEL_PATHS.has(entry.path));
+}
+
 function brokenWorkspaceNodeModules(): Array<{
   nodeModulesPath: string;
   sentinelPath: string;
@@ -373,8 +383,26 @@ async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
     abortStart(installExitCode);
   }
 
-  const missingAfterInstall = missingDependencySentinels();
-  const brokenAfterInstall = brokenWorkspaceNodeModules();
+  let missingAfterInstall = missingDependencySentinels();
+  let brokenAfterInstall = brokenWorkspaceNodeModules();
+  if (missingAfterInstall.length > 0 && shouldRetryInstallWithHoistedLinker(missingAfterInstall)) {
+    console.warn(
+      "[start] Dependency preflight still missing root artifacts after install; retrying with `bun install --linker hoisted --force`...",
+    );
+    const hoistedInstallArgs = [currentBunBinary(), "install", "--linker", "hoisted", "--force"];
+    const hoistedInstallExitCode = await runInherited(hoistedInstallArgs, repoRoot);
+    if (hoistedInstallExitCode !== 0) {
+      console.error(
+        `[start] \`bun install --linker hoisted --force\` failed with exit code ${hoistedInstallExitCode}.`,
+      );
+      abortStart(hoistedInstallExitCode);
+    }
+    missingAfterInstall = missingDependencySentinels();
+    brokenAfterInstall = brokenWorkspaceNodeModules();
+    if (missingAfterInstall.length === 0 && brokenAfterInstall.length === 0) {
+      console.log("[start] Dependency preflight recovered after hoisted-linker install.");
+    }
+  }
   if (missingAfterInstall.length > 0 || brokenAfterInstall.length > 0) {
     console.error("[start] Dependency preflight still failing after install:");
     for (const entry of missingAfterInstall) {
