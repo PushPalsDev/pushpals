@@ -43,6 +43,7 @@ import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
+import { buildWorkerSpawnCommand } from "./worker_spawn.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -1323,36 +1324,16 @@ class RemoteBuddyOrchestrator {
   }
 
   private buildWorkerSpawnCommand(workerId: string): string[] {
-    const args = [
-      "bun",
-      "--cwd",
-      "apps/workerpals",
-      "--env-file",
-      "../../.env",
-      "run",
-      "src/workerpals_main.ts",
-      "--server",
-      this.server,
-      "--workerId",
+    return buildWorkerSpawnCommand({
+      server: this.server,
       workerId,
-    ];
-    if (this.spawnWorkerPollMs) {
-      args.push("--poll", String(this.spawnWorkerPollMs));
-    }
-    if (this.spawnWorkerHeartbeatMs) {
-      args.push("--heartbeat", String(this.spawnWorkerHeartbeatMs));
-    }
-    if (this.spawnWorkerLabels.length > 0) {
-      args.push("--labels", this.spawnWorkerLabels.join(","));
-    }
-    if (this.spawnWorkerDocker) {
-      args.push("--docker");
-      if (this.spawnWorkerRequireDocker) args.push("--require-docker");
-      if (this.spawnWorkerImage) {
-        args.push("--docker-image", this.spawnWorkerImage);
-      }
-    }
-    return args;
+      pollMs: this.spawnWorkerPollMs,
+      heartbeatMs: this.spawnWorkerHeartbeatMs,
+      labels: this.spawnWorkerLabels,
+      docker: this.spawnWorkerDocker,
+      requireDocker: this.spawnWorkerRequireDocker,
+      dockerImage: this.spawnWorkerImage,
+    });
   }
 
   private async spawnWorker(): Promise<string | null> {
