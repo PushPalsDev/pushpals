@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch --no-clear-screen src/remotebuddy_main.ts",
-    "start": "bun run src/remotebuddy_main.ts"
+    "start": "bun run src/remotebuddy_supervisor.ts"
   },
   "dependencies": {
     "protocol": "workspace:*",

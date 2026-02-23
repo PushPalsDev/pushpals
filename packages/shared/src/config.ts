@@ -102,6 +102,9 @@ export interface PushPalsConfig {
     executionBudgetNormalMs: number;
     executionBudgetBackgroundMs: number;
     finalizationBudgetMs: number;
+    crashRestartEnabled: boolean;
+    crashRestartMaxRestarts: number;
+    crashRestartBackoffMs: number;
     memory: {
       enabled: boolean;
       includeCrossSession: boolean;
@@ -1418,6 +1421,25 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         asInt(
           parseIntEnv("REMOTEBUDDY_FINALIZATION_BUDGET_MS") ?? remoteNode.finalization_budget_ms,
           120_000,
+        ),
+      ),
+      crashRestartEnabled:
+        parseBoolEnv("REMOTEBUDDY_CRASH_RESTART_ENABLED") ??
+        asBoolean(remoteNode.crash_restart_enabled, true),
+      crashRestartMaxRestarts: Math.max(
+        0,
+        asInt(
+          parseIntEnv("REMOTEBUDDY_CRASH_RESTART_MAX_RESTARTS") ??
+            remoteNode.crash_restart_max_restarts,
+          3,
+        ),
+      ),
+      crashRestartBackoffMs: Math.max(
+        0,
+        asInt(
+          parseIntEnv("REMOTEBUDDY_CRASH_RESTART_BACKOFF_MS") ??
+            remoteNode.crash_restart_backoff_ms,
+          3_000,
         ),
       ),
       memory: {
