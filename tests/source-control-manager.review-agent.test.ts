@@ -844,6 +844,176 @@ describe("ReviewAgent", () => {
     expect(mergeCalls).toBe(0);
   });
 
+  test("enqueues dedicated merge-conflict resolution job for approved unmergeable PRs", async () => {
+    const pr = makePr({ number: 70, html_url: "https://example.com/pr/70" });
+    let reviewCalls = 0;
+    let mergeCalls = 0;
+    let enqueueCalls = 0;
+    let enqueuedTaskId = "";
+    let enqueuedDedupeKey = "";
+    let enqueuedResolutionType = "";
+    let enqueuedInstruction = "";
+    let createdTaskTitle = "";
+    let createdTaskTags: string[] = [];
+    const emittedCommandTypes: string[] = [];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/apps/remotebuddy/README.md b/apps/remotebuddy/README.md\n+line",
+        invokeCodexReview: async () => {
+          reviewCalls += 1;
+          return JSON.stringify({
+            score: 9.4,
+            summary: "Docs update is good",
+            issues: [],
+            fix_instruction: "",
+          });
+        },
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "docs(remotebuddy): improve onboarding",
+        mergePullRequest: async () => {
+          mergeCalls += 1;
+          throw new Error(
+            'GitHub API 405: {"message":"Pull Request is not mergeable","documentation_url":"https://docs.github.com/rest/pulls/pulls#merge-a-pull-request","status":"405"}',
+          );
+        },
+        fetchImpl: async (_input, init) => {
+          const url = String(_input);
+          const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          if (url.includes("/jobs?status=pending") || url.includes("/jobs?status=claimed")) {
+            return new Response(JSON.stringify({ ok: true, jobs: [] }), { status: 200 });
+          }
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+            enqueuedTaskId = String(payload.taskId ?? "");
+            enqueuedDedupeKey = String(payload.dedupeKey ?? "");
+            const params =
+              payload.params && typeof payload.params === "object"
+                ? (payload.params as Record<string, unknown>)
+                : {};
+            enqueuedInstruction = String(params.instruction ?? "");
+            const reviewAgent =
+              params.reviewAgent && typeof params.reviewAgent === "object"
+                ? (params.reviewAgent as Record<string, unknown>)
+                : {};
+            enqueuedResolutionType = String(reviewAgent.resolutionType ?? "");
+            return new Response(JSON.stringify({ ok: true, jobId: "job-merge-70" }), {
+              status: 200,
+            });
+          }
+          if (url.endsWith("/sessions/dev/command")) {
+            if (String(payload.type ?? "") === "task_created") {
+              const commandPayload =
+                payload.payload && typeof payload.payload === "object"
+                  ? (payload.payload as Record<string, unknown>)
+                  : {};
+              createdTaskTitle = String(commandPayload.title ?? "");
+              createdTaskTags = Array.isArray(commandPayload.tags)
+                ? commandPayload.tags.map((entry) => String(entry))
+                : [];
+            }
+            emittedCommandTypes.push(String(payload.type ?? ""));
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        now: () => 321,
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+    await agent.poll();
+
+    expect(reviewCalls).toBe(1);
+    expect(mergeCalls).toBe(1);
+    expect(enqueueCalls).toBe(1);
+    expect(enqueuedTaskId).toBe("review-merge-conflict-pr70-321");
+    expect(enqueuedDedupeKey).toBe("70:abc123def456");
+    expect(enqueuedResolutionType).toBe("merge_conflict");
+    expect(enqueuedInstruction).toContain("Resolve merge conflicts for PR #70");
+    expect(enqueuedInstruction).toContain("Do not create a new PR");
+    expect(createdTaskTitle).toBe("Resolve merge conflicts for PR #70 @ abc123de");
+    expect(createdTaskTags).toEqual(["review-agent", "merge-conflict"]);
+    expect(emittedCommandTypes).toEqual(["task_created", "task_started", "job_enqueued"]);
+  });
+
+  test("skips duplicate merge-conflict enqueue when matching review job is already active", async () => {
+    const pr = makePr({ number: 71, html_url: "https://example.com/pr/71" });
+    let reviewCalls = 0;
+    let enqueueCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/apps/remotebuddy/README.md b/apps/remotebuddy/README.md\n+line",
+        invokeCodexReview: async () => {
+          reviewCalls += 1;
+          return JSON.stringify({
+            score: 9.2,
+            summary: "Looks solid",
+            issues: [],
+            fix_instruction: "",
+          });
+        },
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "docs(remotebuddy): improve onboarding",
+        mergePullRequest: async () => {
+          throw new Error('GitHub API 405: {"message":"Pull Request is not mergeable","status":"405"}');
+        },
+        fetchImpl: async (_input) => {
+          const url = String(_input);
+          if (url.includes("/jobs?status=pending")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                jobs: [
+                  {
+                    id: "existing-merge-job",
+                    kind: "task.execute",
+                    params: JSON.stringify({
+                      reviewAgent: {
+                        prNumber: pr.number,
+                        prHeadSha: pr.head.sha,
+                        resolutionType: "merge_conflict",
+                      },
+                    }),
+                  },
+                ],
+              }),
+              { status: 200 },
+            );
+          }
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+            return new Response(JSON.stringify({ ok: true, jobId: "new-job" }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+    await agent.poll();
+
+    expect(reviewCalls).toBe(1);
+    expect(enqueueCalls).toBe(0);
+  });
+
   test("rejects when score is below threshold even when reviewer sets approved=true", async () => {
     const pr = makePr({ number: 56, html_url: "https://example.com/pr/56" });
     let mergeCalls = 0;

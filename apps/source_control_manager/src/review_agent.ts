@@ -49,6 +49,7 @@ const MAX_REVIEW_CONTEXT_COMMENT_CHARS = 320;
 const MAX_REVIEW_CONTEXT_TOTAL_CHARS = 3_000;
 const MAX_ACTIVE_FIX_JOB_SCAN = 500;
 const REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS = 60_000;
+const REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS = 60_000;
 const PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
@@ -653,6 +654,26 @@ function reviewFixDedupeKey(prNumber: number, headSha: string): string {
   return `${prNumber}:${normalizeReviewFixHeadSha(headSha)}`;
 }
 
+function extractGitHubApiStatus(error: unknown): number | null {
+  const message = String((error as { message?: unknown })?.message ?? error ?? "");
+  const match = message.match(/\bGitHub API\s+(\d{3})\b/i);
+  if (!match) return null;
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isUnmergeablePullRequestError(error: unknown): boolean {
+  const status = extractGitHubApiStatus(error);
+  if (status !== 405 && status !== 409 && status !== 422) return false;
+  const message = String((error as { message?: unknown })?.message ?? error ?? "").toLowerCase();
+  return (
+    message.includes("not mergeable") ||
+    message.includes("cannot be merged") ||
+    message.includes("merge conflict") ||
+    message.includes("has conflicts")
+  );
+}
+
 type ActiveJobLike = {
   id?: string;
   kind?: string;
@@ -832,7 +853,7 @@ export class ReviewAgent {
     );
 
     const finalized = approved
-      ? await this.approvePr(pr, verdict)
+      ? await this.approvePr(pr, verdict, diff)
       : await this.rejectPr(pr, verdict, diff);
 
     if (finalized) {
@@ -840,7 +861,7 @@ export class ReviewAgent {
     }
   }
 
-  private async approvePr(pr: GitHubPR, verdict: ReviewVerdict): Promise<boolean> {
+  private async approvePr(pr: GitHubPR, verdict: ReviewVerdict, diff: string): Promise<boolean> {
     try {
       await this.deps.addPullRequestComment({
         token: this.githubToken,
@@ -909,11 +930,43 @@ export class ReviewAgent {
       this.reviewed.delete(pr.number);
       return true;
     } catch (err: any) {
+      if (isUnmergeablePullRequestError(err)) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] PR #${pr.number} is approved but not mergeable at ${pr.head.sha.slice(0, 8)}. Enqueueing merge-conflict resolution job.`,
+        );
+        const handled = await this.handleApprovedMergeConflict(pr, verdict, diff, err);
+        if (handled) return true;
+      }
       this.deps.logError(
         `[${ts()}] [ReviewAgent] Failed to merge PR #${pr.number}: ${err?.message ?? err}`,
       );
       return false;
     }
+  }
+
+  private async handleApprovedMergeConflict(
+    pr: GitHubPR,
+    verdict: ReviewVerdict,
+    diff: string,
+    mergeError: unknown,
+  ): Promise<boolean> {
+    const { jobId, sessionId } = extractPrMeta(pr.body);
+    if (!sessionId) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} merge conflict handler requires pushpals-sessionId metadata; cannot enqueue resolution job.`,
+      );
+      return false;
+    }
+
+    const existingReviewJobId = await this.findActiveReviewJobIdForPrHead(pr.number, pr.head.sha);
+    if (existingReviewJobId) {
+      this.deps.logInfo(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} already has active review job ${existingReviewJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate merge-conflict enqueue.`,
+      );
+      return true;
+    }
+
+    return this.enqueueMergeConflictJob(pr, verdict, sessionId, jobId, diff, mergeError);
   }
 
   private async rejectPr(pr: GitHubPR, verdict: ReviewVerdict, diff: string): Promise<boolean> {
@@ -949,7 +1002,7 @@ export class ReviewAgent {
       return true;
     }
 
-    const existingFixJobId = await this.findActiveFixJobIdForPrHead(pr.number, pr.head.sha);
+    const existingFixJobId = await this.findActiveReviewJobIdForPrHead(pr.number, pr.head.sha);
     if (existingFixJobId) {
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} already has active fix job ${existingFixJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate enqueue.`,
@@ -1021,7 +1074,7 @@ export class ReviewAgent {
     }
   }
 
-  private async findActiveFixJobIdForPrHead(
+  private async findActiveReviewJobIdForPrHead(
     prNumber: number,
     headSha: string,
   ): Promise<string | null> {
@@ -1070,6 +1123,9 @@ export class ReviewAgent {
     pr: GitHubPR;
     verdict: ReviewVerdict;
     headers: Record<string, string>;
+    taskTitle?: string;
+    taskDescription?: string;
+    taskTags?: string[];
   }): Promise<void> {
     // Ensure the target session exists before posting task/job events.
     const ensureSessionResponse = await this.deps.fetchImpl(`${this.serverUrl}/sessions`, {
@@ -1085,21 +1141,28 @@ export class ReviewAgent {
     }
 
     const from = "agent:source_control_manager/review_agent";
-    const taskDescription =
+    const defaultTaskDescription =
       args.verdict.summary.trim() ||
       `Address ReviewAgent feedback and update PR #${args.pr.number} (${args.pr.html_url}).`;
+    const taskDescription = args.taskDescription?.trim() || defaultTaskDescription;
     const shortHeadSha = normalizeReviewFixHeadSha(args.pr.head.sha).slice(0, 8) || "unknown";
+    const taskTitle =
+      args.taskTitle?.trim() ||
+      `Address ReviewAgent feedback for PR #${args.pr.number} @ ${shortHeadSha}`;
+    const taskTags = Array.isArray(args.taskTags) && args.taskTags.length > 0
+      ? args.taskTags
+      : ["review-agent", "pr-fix"];
     await this.sendSessionCommand(args.sessionId, args.headers, {
       type: "task_created",
       from,
       correlationId: args.taskId,
       payload: {
         taskId: args.taskId,
-        title: `Address ReviewAgent feedback for PR #${args.pr.number} @ ${shortHeadSha}`,
+        title: taskTitle,
         description: taskDescription,
         createdBy: "review_agent",
         priority: "normal",
-        tags: ["review-agent", "pr-fix"],
+        tags: taskTags,
       },
     });
     await this.sendSessionCommand(args.sessionId, args.headers, {
@@ -1249,6 +1312,130 @@ export class ReviewAgent {
     } catch (err: any) {
       this.deps.logError(
         `[${ts()}] [ReviewAgent] Failed to enqueue fix job for PR #${pr.number}: ${err?.message ?? err}`,
+      );
+      return false;
+    }
+  }
+
+  private async enqueueMergeConflictJob(
+    pr: GitHubPR,
+    verdict: ReviewVerdict,
+    sessionId: string,
+    jobId: string | null,
+    diff: string,
+    mergeError: unknown,
+  ): Promise<boolean> {
+    const taskId = `review-merge-conflict-pr${pr.number}-${this.deps.now()}`;
+    const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
+    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
+    const mergeErrorSummary = truncateText(
+      collapseWhitespace(String((mergeError as { message?: unknown })?.message ?? mergeError ?? "")),
+      360,
+    );
+    const instruction = [
+      `Resolve merge conflicts for PR #${pr.number} (${pr.html_url}) on branch ${pr.head.ref}.`,
+      `This PR already passed ReviewAgent (${verdict.score.toFixed(1)}/10) but GitHub reports it is not mergeable due to conflicts.`,
+      `Rebase ${pr.head.ref} onto ${pr.base.ref}, resolve all conflicts, keep intended behavior, run relevant tests, and push updates to the same branch.`,
+      "Do not create a new PR; update only the existing PR branch.",
+    ].join("\n");
+
+    const payload = {
+      taskId,
+      sessionId,
+      kind: "task.execute",
+      dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha),
+      dedupeCooldownMs: REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS,
+      params: {
+        schemaVersion: 2,
+        origin: "autonomy",
+        instruction,
+        recentContext: [
+          `PR #${pr.number} (${pr.html_url}) is approved but blocked by merge conflicts.`,
+          `Approved score: ${verdict.score.toFixed(1)}/10`,
+          mergeErrorSummary ? `GitHub merge error: ${mergeErrorSummary}` : "GitHub merge error: (unavailable)",
+        ],
+        planning: {
+          intent: "code_change",
+          riskLevel: "medium",
+          acceptanceCriteria: [
+            `Branch ${pr.head.ref} rebases cleanly onto ${pr.base.ref} with conflicts resolved.`,
+            `PR #${pr.number} becomes mergeable without manual GitHub conflict edits.`,
+            "Validation commands relevant to changed files pass.",
+          ],
+          validationSteps: ["bun test"],
+          queuePriority: "normal",
+          queueWaitBudgetMs: 90_000,
+          executionBudgetMs: 1_800_000,
+          finalizationBudgetMs: 120_000,
+          scope: { readAnywhere: true, writeAllowed: true, writeGlobs },
+        },
+        completionBranch: prHeadRef ?? undefined,
+        reviewAgent: {
+          prNumber: pr.number,
+          prUrl: pr.html_url,
+          prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
+          prHeadRef: prHeadRef ?? pr.head.ref,
+          prBaseRef: pr.base.ref,
+          resolutionType: "merge_conflict",
+          previousReviewScore: verdict.score,
+          previousReviewSummary: verdict.summary,
+          mergeError: mergeErrorSummary,
+          requestedAt: new Date().toISOString(),
+          sourceJobId: jobId,
+        },
+        lane: "worker",
+        recentJobs: [],
+      },
+    };
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
+
+    try {
+      const response = await this.deps.fetchImpl(`${this.serverUrl}/jobs/enqueue`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`HTTP ${response.status}: ${text}`);
+      }
+      const responseBody = (await response.json().catch(() => null)) as { jobId?: unknown } | null;
+      const enqueuedJobId =
+        responseBody && typeof responseBody.jobId === "string" ? responseBody.jobId : "";
+      if (enqueuedJobId) {
+        try {
+          const shortHeadSha = normalizeReviewFixHeadSha(pr.head.sha).slice(0, 8) || "unknown";
+          await this.emitFixJobQueuedEvents({
+            sessionId,
+            taskId,
+            jobId: enqueuedJobId,
+            kind: "task.execute",
+            params: payload.params,
+            pr,
+            verdict,
+            headers,
+            taskTitle: `Resolve merge conflicts for PR #${pr.number} @ ${shortHeadSha}`,
+            taskDescription:
+              mergeErrorSummary ||
+              `Resolve merge conflicts on ${pr.head.ref} so PR #${pr.number} can be merged.`,
+            taskTags: ["review-agent", "merge-conflict"],
+          });
+        } catch (emitErr: any) {
+          this.deps.logWarn(
+            `[${ts()}] [ReviewAgent] Merge-conflict job ${enqueuedJobId} enqueued for PR #${pr.number}, but failed to emit session task/job events: ${emitErr?.message ?? emitErr}`,
+          );
+        }
+      }
+
+      this.deps.logInfo(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} approved but unmergeable; merge-conflict job ${taskId}${enqueuedJobId ? ` (${enqueuedJobId})` : ""} enqueued`,
+      );
+      return true;
+    } catch (err: any) {
+      this.deps.logError(
+        `[${ts()}] [ReviewAgent] Failed to enqueue merge-conflict job for PR #${pr.number}: ${err?.message ?? err}`,
       );
       return false;
     }
