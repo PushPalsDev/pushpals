@@ -43,55 +43,78 @@ WorkerPals -> POST /jobs/:id/complete|fail (+ optional /completions/enqueue)
 SourceControlManager -> POST /completions/claim -> merge/push -> POST /completions/:id/processed|fail
 ```
 
-## Maintenance and Recovery
+## Operational Runbook
 
-All commands below target `http://localhost:3001`; swap in the real control-plane origin when operating in another environment. Do not proceed unless you can complete every checklist item—skipping any gate invalidates the cleanup.
+### Checklist Structure
 
-### Pre-cleanup verification checklist (run top-to-bottom)
-- **Requests:**
-  - `curl -s http://localhost:3001/requests?status=claimed | jq '.items | length'` — must be `0` so no claims are mid-flight.
-  - `curl -s http://localhost:3001/requests?status=queued | jq '.items | length'` — record the intentionally pending count for post-check comparison.
-- **Jobs:**
-  - `curl -s http://localhost:3001/jobs?status=claimed | jq '.items | length'` — must be `0`; pause maintenance if any job claims exist.
-  - `curl -s http://localhost:3001/jobs?status=running | jq '.items | length'` — ensure all WorkerPal jobs have finished or are explicitly approved to keep running.
-- **Sessions:** `curl -s http://localhost:3001/sessions/active | jq '.[] | {id, worker, status}'` — confirm interactive/autonomy sessions are closed or that you are tailing them intentionally.
-- **Autonomy locks:** `curl -s http://localhost:3001/locks/autonomy | jq '.[] | {resource, holder}'` — document any lock you plan to restore.
-- **State backup:** `cp apps/remotebuddy/remotebuddy-state.db /tmp/remotebuddy-state.$(date +%s).db` (Linux/macOS) or `Copy-Item .\apps\remotebuddy\remotebuddy-state.db "$env:TEMP\remotebuddy-state.$(Get-Date -Format yyyyMMddHHmmss).db"` (PowerShell), then verify the file exists.
-- **Worktree confirmation:** declare the exact worktree(s) you plan to touch and prove they exist before editing anything.
-  - Linux/macOS: `TARGET_WORKTREE="/repo/.../job-xxxx"; realpath "$TARGET_WORKTREE"; ls -ld "$TARGET_WORKTREE"; ls -ld "$(dirname "$TARGET_WORKTREE")"` — abort if `realpath` points outside the intended repo scope.
-  - Windows PowerShell: `$TargetWorktree = "C:\repo\...\job-xxxx"; Resolve-Path $TargetWorktree; Get-ChildItem -Force (Split-Path $TargetWorktree -Parent) | Where-Object { $_.FullName -eq $TargetWorktree }` — abort if the directory is missing or the resolved path differs from the plan.
-- **Log evidence:** capture timestamped command output for every check above. You will need it for the post-cleanup comparison.
+**One-time prerequisites (single pass; never loop these again):**
+1. Confirm the most recent RemoteBuddy backup/snapshot per platform SLO before taking any action, then log the timestamp.
+2. Pin work to the issued worktree (for example `/repo/.worktrees/job-…/apps/remotebuddy`) by running `git rev-parse --show-toplevel` and documenting the resolved path.
+3. Start evidence capture (shell transcript or screen recording) that spans the entire intervention; restart it only if it stops unexpectedly.
 
-### Controlled shutdown procedure
-1. **Non-destructive discovery (always first).** Enumerate every RemoteBuddy PID and command line before touching anything—never jump straight to `pkill`/`Stop-Process -Force`.
-   - Linux/macOS: `pgrep -fal remotebuddy_main | tee /tmp/remotebuddy-processes.txt` plus `pgrep -f remotebuddy_main > /tmp/remotebuddy.pids`, or `ps -eo pid,ppid,start,time,command | grep remotebuddy_main | grep -v grep`. Keep these files immutable until cleanup finishes.
-   - Windows PowerShell: `Get-Process -Name remotebuddy*,bun -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime, Path | Tee-Object -FilePath $env:TEMP\remotebuddy-processes.txt | Export-Csv -Path $env:TEMP\remotebuddy-processes.csv -NoTypeInformation`. This preserves typed PID metadata for later import.
-2. **Graceful stop gate.** Work only with the captured PIDs.
-   - Linux/macOS: send SIGTERM (`kill -15 <pid>`) to each RemoteBuddy PID and wait for the processes to exit.
-   - Windows PowerShell: `Stop-Process -Id <pid>` **without** `-Force` for each recorded PID.
-   - Re-run the pre-cleanup checklist commands until request/job counts and autonomy/sessions match the recorded baseline.
-3. **Mandatory safety gates before destructive actions.** Do **not** attempt forceful termination until all of the following are true:
-   - RemoteBuddy services (bun dev/start or systemd units) are already stopped gracefully.
-   - `requests?status=claimed`, `requests?status=queued`, `jobs?status=claimed`, and `jobs?status=running` all match the acceptable counts captured earlier.
-   - The `remotebuddy-state.db` backup above completed successfully, the backup file exists off the repo path, and you have noted its location.
-   - Target worktree paths to be touched are explicitly listed; `realpath`/`Resolve-Path` still points to the intended directories, and `ls`/`Get-ChildItem` output of their parents confirms no collateral directories.
-4. **Destructive termination (last resort, document the reason).** If a PID refuses to exit but the gates above hold, force-kill **only** the specific PIDs from Step 1. Never blanket-kill `bun` or unrelated processes.
-   - Linux/macOS example: `cat /tmp/remotebuddy.pids | xargs -n1 -I{} sh -c 'echo "Force-killing PID {}"; kill -9 {}'` where `/tmp/remotebuddy.pids` contains the previously captured PIDs.
-   - Windows PowerShell example: `$processLog = Import-Csv $env:TEMP\remotebuddy-processes.csv; $processLog | Where-Object { $_.ProcessName -like "remotebuddy*" } | ForEach-Object { $pid = [int]$_.Id; Write-Host "Force-killing PID $pid ($($_.ProcessName))"; Stop-Process -Id $pid -Force }`. This keeps the force-kill list typed and auditable.
-   - After forcing a PID down, immediately re-run the pre-cleanup checklist (including the job-claim check) to ensure queues, sessions, and locks remain in the expected state.
+**Repeatable runtime health checks (loop only these when told to “re-check”):**
+1. `GET /jobs?status=running&scope=remotebuddy&sessionId=<current-session>` must return zero rows; anything else blocks progress.
+2. The scoped Windows PID list is limited to RemoteBuddy processes tied to the active worktree and entrypoint path (details below).
+3. The session record for the active `sessionId` is closed (`status=idle|closed`) or absent.
+4. No locks remain for the `sessionId` or worktree in `GET /locks?owner=remotebuddy`.
 
-### Data and worktree safety gates
-- Stop every RemoteBuddy service (CLI `bun run dev/start`, process supervisors, or systemd units) before touching `apps/remotebuddy` artifacts.
-- Rerun the request/job/session/lock commands until `requests?status=claimed` and `jobs?status=claimed` return `0`, running-job counts match the baseline you captured, and session/lock output still matches expectations.
-- Create fresh compressed backups of `remotebuddy-state.db` and any worktree directories slated for deletion (`tar -czf /tmp/remotebuddy-worktree.$(date +%s).tgz <worktree>` for Linux/macOS or `Compress-Archive -Path <worktree> -DestinationPath "$env:TEMP\remotebuddy-worktree.$(Get-Date -Format yyyyMMddHHmmss).zip"`). Keep the backup path in your maintenance log and confirm the archive exists.
-- Write down each worktree path you will modify or remove, then `realpath`/`Resolve-Path` them and `ls` / `Get-ChildItem` the parent directory immediately before executing destructive commands to confirm scope and avoid collateral damage.
+Whenever the runbook says “re-check,” rerun the **repeatable runtime health checks** list above verbatim; never repeat the one-time prerequisites unless the environment materially changes (for example, a new worktree is issued or evidence capture fails).
 
-### Post-cleanup verification checklist
-- **Requests:** `curl -s http://localhost:3001/requests?status=claimed | jq '.items | length'` must return `0`, and the queued count (`requests?status=queued`) must match the `Pre-cleanup` baseline.
-- **Jobs:** both `curl -s http://localhost:3001/jobs?status=claimed | jq '.items | length'` and `curl -s http://localhost:3001/jobs?status=running | jq '.items | length'` must return `0`; reconcile any difference before declaring success.
-- **Sessions:** `curl -s http://localhost:3001/sessions/active | jq '.[] | {id, worker, status}'` should show no unexpected sessions or locks.
-- **Autonomy locks:** `curl -s http://localhost:3001/locks/autonomy | jq '.[] | {resource, holder}'` should be empty or match the documented restores.
-- **Processes:** rerun the non-destructive process-list commands from Step 1 to confirm no RemoteBuddy-related PID is alive. If anything restarted, return to the graceful stop gate.
-- **Evidence:** attach the before/after command output in the maintenance log so future operators can validate the cleanup deterministically.
+### Running Jobs Acceptance Criteria
 
-Document these results (timestamps + command output) in the maintenance log so future operators can prove the cleanup completed deterministically.
+RemoteBuddy uses a **strict zero-running-jobs** contract everywhere in the workflow:
+
+1. Call `GET /jobs?status=running&scope=remotebuddy&sessionId=<current-session>`.
+2. **Pass rule:** response array length is zero.
+3. **Fail rule:** any non-zero length, any job referencing another session, or any transport error. Failures block promotion and require either waiting for the queue to drain or pausing WorkerPals manually—there are no baselines or carve-outs.
+4. Document every polling attempt (request parameters, timestamp, response JSON) until a zero-length response is observed, then proceed.
+
+Apply this exact check before remediation, again after each stop/force-stop attempt, and throughout the final verification loop so acceptance never diverges between stages.
+
+### Windows Process Control
+
+Replace broad `tasklist` usage with RemoteBuddy-scoped filtering and keep that PID list immutable for every stop scenario.
+
+```powershell
+$worktree   = (Get-Item $env:CODEX_WORKTREE).FullName
+$entryPoint = Join-Path $worktree 'apps\remotebuddy\src\remotebuddy_main.ts'
+
+$scoped = Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.Name -ieq 'bun.exe' -and
+    $_.ExecutablePath -like "$worktree*" -and
+    $_.CommandLine -match [Regex]::Escape($entryPoint)
+  } |
+  Select-Object ProcessId, ExecutablePath, CommandLine
+
+if (-not $scoped) {
+  Write-Error 'No RemoteBuddy processes found in this worktree.'
+}
+```
+
+- **Stop step:** `Stop-Process -Id $scoped.ProcessId -PassThru` (graceful attempt uses only the stored `$scoped` IDs).
+- **Force-stop step:** `Stop-Process -Id $scoped.ProcessId -Force -PassThru` (run only if the graceful attempt fails, still using the same `$scoped` set).
+
+Do **not** collect new processes between attempts or pass unfiltered PIDs to `Stop-Process`/`taskkill`; every command must stay bound to the vetted `$scoped` set to avoid collateral WorkerPal outages.
+
+### Session and Lock Post-Verification Rules
+
+Treat session and lock outcomes as separate gates:
+
+**Session cleanup**
+- *Pass:* `GET /sessions/<sessionId>` returns HTTP 404 or a JSON `status` in `{ "idle", "closed" }` once RemoteBuddy has shut down.
+- *Fail:* Any other status (active, blocked, closing) observed more than 60 seconds after the last stop command, or if the endpoint continues returning the session with `workerId` assigned.
+
+**Lock cleanup**
+- *Pass:* `GET /locks?owner=remotebuddy&sessionId=<sessionId>` returns an empty array and `GET /locks?worktree=<path>` shows no entries tied to the scoped worktree.
+- *Fail:* Any lock row referencing the same `sessionId` or worktree persists beyond the same 60-second window.
+
+Escalate if either check fails independently; do not allow a passing session check to mask a stuck lock or vice versa.
+
+### Recovery Loop Template
+
+1. Run the repeatable health checks.
+2. If the running-jobs check fails, pause further action until it returns zero; capture timestamps for every poll.
+3. If scoped PIDs exist, apply the stop then force-stop commands (only with the saved PID set) and immediately return to step 1.
+4. Once jobs are zero and the PID list is empty, evaluate the session rule followed by the lock rule; continue looping through the repeatable health checks until both are in a pass state.
+5. Exit the loop only after two consecutive passes of all repeatable checks; otherwise continue remediation or escalate per incident policy.
