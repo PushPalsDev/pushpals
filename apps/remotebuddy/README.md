@@ -116,6 +116,24 @@ RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Work through the step
   # or: choco install jq
   ```
 
+## Bun Workflow
+
+**Prerequisites** – Follow the repo-wide Bun 1.x requirement from the [Setup Checklist](#setup-checklist); RemoteBuddy is validated on Bun 1.1.x today. Confirm with `bun --version`, then reinstall via `curl -fsSL https://bun.sh/install | bash` (macOS/Linux) or `powershell -c "irm https://bun.sh/install.ps1 | iex"` (Windows) if the version lags.
+
+**Run these from the repo root** (the folder containing `apps/remotebuddy`). The root `package.json` owns the build/test/lint scripts; running inside `apps/remotebuddy` will throw `Script not found "build"`/`"test"` unless you prefix commands with `bun --cwd ../..`.
+
+```bash
+bun install
+bun run build
+bun test
+bun run lint
+```
+
+- `bun run build` is the RemoteBuddy build step; if your local root package.json predates the alias and errors, run `bun run protocol:build` instead.
+- `bun test` must run from the repo root so the shared tests and `package.json` scripts resolve; inside the app directory use `bun --cwd ../.. test` (or `bun run test`) to avoid `Script not found "test"`.
+
+Troubleshooting – If Bun crashes, loops on cache errors, or still reports missing scripts, clear the cache via `bun pm cache rm --all`, reinstall Bun with the commands above, ensure you are in the repo root, then rerun the workflow.
+
 ## Runtime Role Reference
 
 - Claims queued requests (`POST /requests/claim`).
