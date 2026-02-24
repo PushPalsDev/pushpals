@@ -7,7 +7,7 @@ export type WorkerSpawnCommandOptions = {
   docker: boolean;
   requireDocker: boolean;
   dockerImage: string | null;
-  passthrough?: readonly string[];
+  passthroughArgs?: string[];
 };
 
 export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): string[] {
@@ -40,8 +40,9 @@ export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): str
       args.push("--docker-image", options.dockerImage);
     }
   }
-  if (options.passthrough && options.passthrough.length > 0) {
-    args.push(...options.passthrough);
+  const passthrough = (options.passthroughArgs ?? []).filter((arg) => arg.length > 0);
+  if (passthrough.length > 0) {
+    args.push("--", ...passthrough);
   }
   return args;
 }

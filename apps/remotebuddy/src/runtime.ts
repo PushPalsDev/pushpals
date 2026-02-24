@@ -1,208 +1,208 @@
 import { loadPushPalsConfig, type PushPalsConfig } from "shared";
 
-const RUNTIME_PREFIX = "[RemoteBuddyRuntime]";
-
-type OverrideSource = "config" | "env" | "cli";
-
-export type RemoteBuddyRuntime = {
-  serverUrl: string;
-  sessionId: string;
+export type RemoteBuddyRuntimeOptions = {
+  server: string;
+  sessionId: string | null;
   authToken: string | null;
   passthroughArgs: string[];
-  sources: {
-    serverUrl: OverrideSource;
-    sessionId: OverrideSource;
-    authToken: OverrideSource;
-  };
 };
 
-export interface LoadRemoteBuddyRuntimeOptions {
+export type RuntimeParseOptions = {
   argv?: string[];
-  env?: Record<string, string | undefined>;
+  env?: NodeJS.ProcessEnv;
   config?: PushPalsConfig;
-}
-
-type CliOverrideAccumulator = {
-  serverUrl?: string;
-  sessionId?: string;
-  authToken?: string | null;
 };
 
-type CliParseResult = {
-  overrides: CliOverrideAccumulator;
-  passthrough: string[];
+export type ConnectWithRetryOptions = {
+  maxRetries?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  fetchFn?: typeof fetch;
+  sleepFn?: (ms: number) => Promise<void> | void;
 };
 
-export function loadRemoteBuddyRuntime(
-  options: LoadRemoteBuddyRuntimeOptions = {},
-): RemoteBuddyRuntime {
+const DEFAULT_BASE_DELAY_MS = 2000;
+const DEFAULT_MAX_DELAY_MS = 30_000;
+
+export function parseRuntimeOptions(
+  options: RuntimeParseOptions = {},
+): RemoteBuddyRuntimeOptions {
   const config = options.config ?? loadPushPalsConfig();
   const env = options.env ?? process.env;
-  const argv = options.argv ?? Bun.argv.slice(2);
+  const argv = options.argv ?? process.argv.slice(2);
 
-  const result: RemoteBuddyRuntime = {
-    serverUrl: requireConfigValue("server.url", config.server.url),
-    sessionId: requireConfigValue("session_id", config.sessionId),
-    authToken: normalizeTokenValue(config.authToken),
-    passthroughArgs: [],
-    sources: {
-      serverUrl: "config",
-      sessionId: "config",
-      authToken: "config",
-    },
-  };
+  let server = normalizeConfigServer(config);
+  let sessionId = normalizeConfigSessionId(config);
+  let authToken = normalizeConfigAuthToken(config);
 
-  const envServer = readEnvOverride(env, ["REMOTEBUDDY_SERVER_URL", "PUSHPALS_SERVER_URL"]);
-  if (envServer.provided && envServer.value) {
-    result.serverUrl = envServer.value;
-    result.sources.serverUrl = "env";
-  }
+  const envServer = normalizeEnvServer(env?.PUSHPALS_SERVER_URL);
+  if (envServer) server = envServer;
 
-  const envSession = readEnvOverride(env, ["REMOTEBUDDY_SESSION_ID", "PUSHPALS_SESSION_ID"]);
-  if (envSession.provided && envSession.value) {
-    result.sessionId = envSession.value;
-    result.sources.sessionId = "env";
-  }
+  const envSessionId = normalizeOverrideSessionId(env?.PUSHPALS_SESSION_ID);
+  if (envSessionId !== undefined) sessionId = envSessionId;
 
-  const envToken = readEnvOverride(
-    env,
-    ["REMOTEBUDDY_AUTH_TOKEN", "REMOTEBUDDY_TOKEN", "PUSHPALS_AUTH_TOKEN"],
-    true,
-  );
-  if (envToken.provided) {
-    result.authToken = envToken.value;
-    result.sources.authToken = "env";
-  }
+  const envAuthToken = normalizeOverrideAuthToken(env?.PUSHPALS_AUTH_TOKEN);
+  if (envAuthToken !== undefined) authToken = envAuthToken;
 
-  const parsedCli = parseCliArgs(argv);
-  if (parsedCli.overrides.serverUrl) {
-    result.serverUrl = parsedCli.overrides.serverUrl;
-    result.sources.serverUrl = "cli";
-  }
-  if (parsedCli.overrides.sessionId) {
-    result.sessionId = parsedCli.overrides.sessionId;
-    result.sources.sessionId = "cli";
-  }
-  if (Object.prototype.hasOwnProperty.call(parsedCli.overrides, "authToken")) {
-    result.authToken = parsedCli.overrides.authToken ?? null;
-    result.sources.authToken = "cli";
-  }
+  const { runtimeArgs, passthroughArgs } = splitPassthroughArgs(argv);
 
-  result.passthroughArgs = parsedCli.passthrough;
-
-  if (!result.serverUrl) {
-    throw new Error(`${RUNTIME_PREFIX} Resolved server URL is empty.`);
-  }
-  if (!result.sessionId) {
-    throw new Error(`${RUNTIME_PREFIX} Resolved session ID is empty.`);
-  }
-
-  return result;
-}
-
-function requireConfigValue(field: string, raw: string | null | undefined): string {
-  const value = (raw ?? "").trim();
-  if (!value) {
-    throw new Error(`${RUNTIME_PREFIX} Missing required config value ${field}.`);
-  }
-  return value;
-}
-
-function normalizeTokenValue(raw: string | null | undefined): string | null {
-  const value = (raw ?? "").trim();
-  return value ? value : null;
-}
-
-function readEnvOverride(
-  env: Record<string, string | undefined>,
-  keys: string[],
-  allowBlank = false,
-): { provided: boolean; value: string | null } {
-  for (const key of keys) {
-    if (!Object.prototype.hasOwnProperty.call(env, key)) {
-      continue;
-    }
-    const raw = env[key];
-    if (raw == null) {
-      if (allowBlank) return { provided: true, value: null };
-      continue;
-    }
-    const trimmed = raw.trim();
-    if (!trimmed) {
-      if (allowBlank) return { provided: true, value: null };
-      continue;
-    }
-    return { provided: true, value: trimmed };
-  }
-  return { provided: false, value: null };
-}
-
-function parseCliArgs(argv: string[]): CliParseResult {
-  const overrides: CliOverrideAccumulator = {};
-  const passthrough: string[] = [];
-
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--") {
-      passthrough.push(...argv.slice(i + 1));
-      break;
-    }
-
+  for (let i = 0; i < runtimeArgs.length; i++) {
+    const arg = runtimeArgs[i];
     if (!arg.startsWith("-")) {
-      throw new Error(`${RUNTIME_PREFIX} Unexpected positional argument "${arg}".`);
+      throw new Error(`Unexpected positional argument "${arg}" (flags must precede -- passthrough).`);
     }
-
-    if (!arg.startsWith("--")) {
-      throw new Error(`${RUNTIME_PREFIX} Unknown flag "${arg}".`);
-    }
-
-    const eq = arg.indexOf("=");
-    const flag = eq >= 0 ? arg.slice(0, eq) : arg;
-
-    const consumeNext = (): string => {
-      if (eq >= 0) {
-        return arg.slice(eq + 1);
-      }
-      i += 1;
-      if (i >= argv.length) {
-        throw missingFlagValue(flag);
-      }
-      return argv[i];
-    };
-
-    switch (flag) {
+    switch (arg) {
       case "--server": {
-        const value = requireNonEmptyValue(flag, consumeNext());
-        overrides.serverUrl = value;
+        const value = runtimeArgs[++i];
+        if (value === undefined) {
+          throw new Error("Missing value for --server");
+        }
+        const normalized = value.trim();
+        if (!normalized) {
+          throw new Error("--server requires a non-empty URL");
+        }
+        server = normalized;
         break;
       }
       case "--sessionId": {
-        const value = requireNonEmptyValue(flag, consumeNext());
-        overrides.sessionId = value;
+        const value = runtimeArgs[++i];
+        if (value === undefined) {
+          throw new Error("Missing value for --sessionId");
+        }
+        const normalized = value.trim();
+        sessionId = normalized ? normalized : null;
         break;
       }
       case "--token": {
-        const raw = consumeNext();
-        const trimmed = raw.trim();
-        overrides.authToken = trimmed ? trimmed : null;
+        const value = runtimeArgs[++i];
+        if (value === undefined) {
+          throw new Error("Missing value for --token");
+        }
+        const normalized = value.trim();
+        if (!normalized) {
+          throw new Error("--token requires a non-empty value");
+        }
+        authToken = normalized;
         break;
       }
+      case "":
+        break;
       default:
-        throw new Error(`${RUNTIME_PREFIX} Unknown flag "${flag}".`);
+        throw new Error(`Unknown runtime flag: ${arg}`);
     }
   }
 
-  return { overrides, passthrough };
+  return {
+    server,
+    sessionId,
+    authToken,
+    passthroughArgs,
+  };
 }
 
-function requireNonEmptyValue(flag: string, raw: string): string {
-  const value = raw.trim();
-  if (!value) {
-    throw missingFlagValue(flag);
+export async function connectWithRetry(
+  server: string,
+  sessionId?: string | null,
+  options: ConnectWithRetryOptions = {},
+): Promise<string> {
+  const maxRetries = options.maxRetries ?? Infinity;
+  const baseDelay = Math.max(0, options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS);
+  const maxDelay = Math.max(baseDelay, options.maxDelayMs ?? DEFAULT_MAX_DELAY_MS);
+  const fetchImpl = options.fetchFn ?? globalThis.fetch;
+  const sleepImpl = options.sleepFn ?? Bun.sleep;
+
+  if (typeof fetchImpl !== "function") {
+    throw new Error("Global fetch is not available");
   }
-  return value;
+
+  let attempt = 0;
+  const payload = sessionId && sessionId.trim() ? { sessionId: sessionId.trim() } : {};
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    attempt += 1;
+    try {
+      const res = await fetchImpl(`${server}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+      const data = (await res.json()) as { sessionId?: string | null };
+      if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
+        throw new Error("Server response missing sessionId");
+      }
+      return data.sessionId;
+    } catch (error) {
+      if (attempt >= maxRetries) {
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+      const delay = Math.min(baseDelay * 2 ** (attempt - 1), maxDelay);
+      const message =
+        error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
+      console.log(
+        `[RemoteBuddy] Server unavailable (${message}), retrying in ${(delay / 1000).toFixed(1)} s... (attempt ${attempt})`,
+      );
+      await sleepImpl(delay);
+    }
+  }
 }
 
-function missingFlagValue(flag: string): Error {
-  return new Error(`${RUNTIME_PREFIX} Flag ${flag} requires a non-empty value.`);
+function splitPassthroughArgs(args: string[]): {
+  runtimeArgs: string[];
+  passthroughArgs: string[];
+} {
+  const dividerIndex = args.indexOf("--");
+  if (dividerIndex === -1) {
+    return { runtimeArgs: [...args], passthroughArgs: [] };
+  }
+  return {
+    runtimeArgs: args.slice(0, dividerIndex),
+    passthroughArgs: args.slice(dividerIndex + 1),
+  };
+}
+
+function normalizeConfigServer(config: PushPalsConfig): string {
+  const base = config.server?.url?.trim();
+  if (!base) {
+    throw new Error("PushPals config is missing server.url");
+  }
+  return base;
+}
+
+function normalizeConfigSessionId(config: PushPalsConfig): string | null {
+  const raw = config.sessionId;
+  if (raw === undefined || raw === null) return null;
+  const trimmed = raw.trim();
+  return trimmed || null;
+}
+
+function normalizeConfigAuthToken(config: PushPalsConfig): string | null {
+  const raw = config.authToken;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return trimmed || null;
+}
+
+function normalizeEnvServer(value: string | undefined): string | undefined {
+  if (typeof value === "undefined") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function normalizeOverrideSessionId(
+  value: string | undefined,
+): string | null | undefined {
+  if (typeof value === "undefined") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeOverrideAuthToken(
+  value: string | undefined,
+): string | null | undefined {
+  if (typeof value === "undefined") return undefined;
+  const trimmed = value.trim();
+  return trimmed || null;
 }
