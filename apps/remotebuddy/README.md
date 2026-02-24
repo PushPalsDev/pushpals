@@ -49,59 +49,72 @@ IdempotencyStore (SQLite remotebuddy-state.db) ──► AgentBrain + SessionMem
 
 For deeper internals, inspect `apps/remotebuddy/src/*.ts` alongside `packages/shared`, but this overview should be enough for on-call triage.
 
-## Prerequisites & Cross-Platform Install Commands
+## Quick Start Workflow
 
-RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Install these before running the service.
+Use this high-level flow while bringing a new machine online:
 
-1. **Bun 1.x**
-   - macOS (zsh/bash):
-     ```bash
-     curl -fsSL https://bun.sh/install | bash
-     ```
-   - Linux (bash):
-     ```bash
-     curl -fsSL https://bun.sh/install | bash
-     ```
-   - Windows PowerShell (native):
-     ```powershell
-     irm https://bun.sh/install.ps1 | iex
-     ```
-2. **Install workspace dependencies (prevents `ENOENT ... node_modules/shared`)**
-   - macOS/Linux:
-     ```bash
-     cd /path/to/pushpals
-     bun install
-     ```
-   - Windows PowerShell:
-     ```powershell
-     Set-Location C:\path\to\pushpals
-     bun install
-     ```
-3. **Seed local config**
-   - macOS/Linux:
-     ```bash
-     cp .env.example .env
-     cp config/local.example.toml config/local.toml
-     ```
-   - Windows PowerShell:
-     ```powershell
-     Copy-Item .env.example .env
-     Copy-Item config\local.example.toml config\local.toml
-     ```
-4. **`jq` for status checks (`curl ... | jq`)**
-   - macOS:
-     ```bash
-     brew install jq
-     ```
-   - Debian/Ubuntu:
-     ```bash
-     sudo apt-get update && sudo apt-get install -y jq
-     ```
-   - Windows PowerShell:
-     ```powershell
-     winget install --id jqlang.jq --source winget
-     # or: choco install jq
-     ```
+1. Complete the steps in the [Setup Checklist](#setup-checklist) so Bun, dependencies, configs, and helper tools exist locally.
+2. Acquire a bearer token (or confirm auth is disabled) using the [Token Setup and Verification](#token-setup-and-verification) steps.
+3. Start the supporting services you need (typically `bun run server:only`, optionally LocalBuddy/WorkerPals) before launching RemoteBuddy.
+4. Run `bun run remotebuddy` from the repo root for the recommended entry point, or pick another command from [Usage Commands](#usage-commands) when you need a specific mode.
+5. Validate the round trip with the [Runtime Smoke Test](#runtime-smoke-test) so you catch queue, auth, or worker issues before handling real traffic.
+
+## Setup Checklist
+
+RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Work through the steps below in order; each step calls out the platform-specific commands you can reuse later.
+
+### Step 1: Install Bun 1.x
+
+- macOS/Linux (bash/zsh):
+  ```bash
+  curl -fsSL https://bun.sh/install | bash
+  ```
+- Windows PowerShell (native):
+  ```powershell
+  irm https://bun.sh/install.ps1 | iex
+  ```
+
+### Step 2: Install workspace dependencies
+
+- macOS/Linux:
+  ```bash
+  cd /path/to/pushpals
+  bun install
+  ```
+- Windows PowerShell:
+  ```powershell
+  Set-Location C:\path\to\pushpals
+  bun install
+  ```
+
+### Step 3: Seed local config files
+
+- macOS/Linux:
+  ```bash
+  cp .env.example .env
+  cp config/local.example.toml config/local.toml
+  ```
+- Windows PowerShell:
+  ```powershell
+  Copy-Item .env.example .env
+  Copy-Item config\local.example.toml config\local.toml
+  ```
+
+### Step 4: Install `jq` for status checks (`curl ... | jq`)
+
+- macOS:
+  ```bash
+  brew install jq
+  ```
+- Debian/Ubuntu:
+  ```bash
+  sudo apt-get update && sudo apt-get install -y jq
+  ```
+- Windows PowerShell:
+  ```powershell
+  winget install --id jqlang.jq --source winget
+  # or: choco install jq
+  ```
 
 ## Runtime Role Reference
 
@@ -163,9 +176,9 @@ Use this path any time you need to redeploy RemoteBuddy because of a regression,
 4. **Validate the new instance** – Wait for `[RemoteBuddy] Starting polling loop…` followed by at least one `claim payload` log. Immediately hit `curl -sS $SERVER/system/status | jq '{queues: .queues.requests, jobs: .jobPendingSnapshot}'` and `curl -sS "$SERVER/requests?status=claimed&limit=5"`. Optionally run the smoke test in the section below (`bun run smoke`) or enqueue a single interactive request to prove round-trip health. Confirm `queue_p95`, worker idle counts, and the CommunicationManager WebSocket reconnect cleanly.
 5. **Observe, rollback if needed** – Watch logs for 5–10 minutes. If failures persist, stop the process, `git checkout <last-known-good>`, rerun step 3, and move `remotebuddy-state.db` aside only when it is clearly corrupted (RemoteBuddy will recreate it, but previously-handled events may replay once). Document the outcome and handoff time in `#pushpals-ops`.
 
-## Commands & Working Directories
+## Usage Commands
 
-### Repo-root scripts (validated against `package.json`)
+### Repo Root Scripts (validated against `package.json`)
 
 | Use case | Run from repo root | Script body | Working directory during execution |
 | --- | --- | --- | --- |
@@ -175,14 +188,14 @@ Use this path any time you need to redeploy RemoteBuddy because of a regression,
 
 > Tip: Keep `bun run server:only` running in another terminal so the claim/complete round-trip works.
 
-### App-local scripts (`cd apps/remotebuddy` first)
+### App-Local Scripts (`cd apps/remotebuddy` first)
 
 | Command | Working directory | Description |
 | --- | --- | --- |
 | `bun run start` | `apps/remotebuddy` | Runs `src/remotebuddy_main.ts` once (root `remotebuddy:only` delegates here). |
 | `bun run dev` | `apps/remotebuddy` | `bun --watch --no-clear-screen src/remotebuddy_main.ts` for rapid iteration. |
 
-### Direct CLI invocation
+### Direct CLI Invocation
 
 ```bash
 cd apps/remotebuddy
@@ -195,9 +208,9 @@ bun run src/remotebuddy_main.ts \
 - `--server`, `--sessionId`, and `--token` override values loaded from `config/*.toml` + `.env`.
 - When `--token` is omitted, the process uses `PUSHPALS_AUTH_TOKEN` (if set) or runs without auth headers.
 
-## Token Acquisition & Verification Flow
+## Token Setup and Verification
 
-RemoteBuddy and Server share the same bearer token (`PUSHPALS_AUTH_TOKEN`). The token gates every `requests/*` and `jobs/*` endpoint once configured.
+RemoteBuddy and Server share the same bearer token (`PUSHPALS_AUTH_TOKEN`). The steps below cover creating that token, validating auth, and falling back to tokenless mode when needed.
 
 1. **Generate/store the token**
    - macOS/Linux:
@@ -252,9 +265,9 @@ RemoteBuddy and Server share the same bearer token (`PUSHPALS_AUTH_TOKEN`). The 
    - Server log view: `[POST] /requests/claim 401` paired with `auth=invalid-token` metadata.
    - Fix by aligning RemoteBuddy’s `--token` flag or `PUSHPALS_AUTH_TOKEN` env var with the Server token and restarting both processes.
 
-## Runtime Smoke-Test Checklist (beyond lint)
+## Runtime Smoke Test
 
-> All curl/PowerShell examples assume a tokenized server; omit the header if you are running open access.
+Run this checklist after `bun run lint` passes so you confirm queue + auth paths before touching user requests. All curl/PowerShell examples assume a tokenized server; omit the header if you are running open access.
 
 1. **Enqueue a synthetic request**
    - Bash/zsh:
