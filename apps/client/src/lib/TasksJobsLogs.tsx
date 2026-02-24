@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Platform } from "react-native";
 import type { SessionState, Task, Job, LogLine } from "./eventReducer";
 
@@ -17,6 +17,28 @@ function parseTraceTailLines(raw: string | undefined): number {
 }
 
 const TRACE_TAIL_LINES = parseTraceTailLines(process.env.EXPO_PUBLIC_PUSHPALS_TRACE_TAIL_LINES);
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  const value = String(text ?? "").trim();
+  if (!value) return false;
+  try {
+    const maybeNavigator = (
+      globalThis as {
+        navigator?: {
+          clipboard?: {
+            writeText?: (data: string) => Promise<void>;
+          };
+        };
+      }
+    ).navigator;
+    const writeText = maybeNavigator?.clipboard?.writeText;
+    if (typeof writeText !== "function") return false;
+    await writeText(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 type TraceTone = "reasoning" | "action" | "info" | "error";
 
@@ -397,6 +419,38 @@ function createStyles(palette: TracePalette, theme?: TasksJobsLogsTheme) {
       paddingBottom: 4,
       fontFamily: sans,
     },
+    identifierSection: {
+      paddingHorizontal: 8,
+      paddingTop: 6,
+      paddingBottom: 2,
+    },
+    identifierRow: {
+      flexDirection: "row",
+      flexWrap: "wrap",
+      gap: 6,
+      alignItems: "center",
+    },
+    identifierText: {
+      fontSize: 11,
+      color: palette.textMuted,
+      fontFamily: mono,
+    },
+    copyIdsButton: {
+      marginTop: 6,
+      alignSelf: "flex-start",
+      borderRadius: 6,
+      borderWidth: 1,
+      borderColor: palette.border,
+      backgroundColor: palette.panel,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+    },
+    copyIdsButtonText: {
+      fontSize: 11,
+      fontWeight: "600",
+      color: palette.text,
+      fontFamily: sans,
+    },
     jobError: {
       fontSize: 12,
       color: palette.danger,
@@ -593,11 +647,29 @@ function JobRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [showRawLogs, setShowRawLogs] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "unavailable">("idle");
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const color = statusColor(job.status, palette);
 
   useEffect(() => {
     if (forceExpanded) setExpanded(true);
   }, [forceExpanded, job.jobId]);
+
+  useEffect(
+    () => () => {
+      if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current);
+    },
+    [],
+  );
+
+  const handleCopyIds = useCallback(async () => {
+    const parts = [`jobId=${job.jobId}`];
+    if (job.workerId) parts.push(`workerId=${job.workerId}`);
+    const didCopy = await copyTextToClipboard(parts.join("\n"));
+    setCopyStatus(didCopy ? "copied" : "unavailable");
+    if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current);
+    copyResetTimerRef.current = setTimeout(() => setCopyStatus("idle"), didCopy ? 1600 : 2600);
+  }, [job.jobId, job.workerId]);
 
   const stdoutLines = useMemo(
     () => logs.filter((line) => line.stream === "stdout").sort((a, b) => a.seq - b.seq),
@@ -628,6 +700,30 @@ function JobRow({
       {expanded && (
         <View style={styles.jobBody}>
           {job.summary ? <Text style={styles.jobSummary}>{job.summary}</Text> : null}
+          <View style={styles.identifierSection}>
+            <Text style={styles.streamLabel}>Identifiers</Text>
+            <View style={styles.identifierRow}>
+              <Text style={styles.identifierText} selectable>
+                jobId={job.jobId}
+              </Text>
+              {job.workerId ? (
+                <Text style={styles.identifierText} selectable>
+                  workerId={job.workerId}
+                </Text>
+              ) : (
+                <Text style={styles.identifierText}>workerId=--</Text>
+              )}
+            </View>
+            <TouchableOpacity style={styles.copyIdsButton} onPress={handleCopyIds}>
+              <Text style={styles.copyIdsButtonText}>
+                {copyStatus === "copied"
+                  ? "Copied IDs"
+                  : copyStatus === "unavailable"
+                    ? "Select text to copy"
+                    : "Copy IDs"}
+              </Text>
+            </TouchableOpacity>
+          </View>
           {job.message ? <Text style={styles.jobError}>{job.message}</Text> : null}
           {job.detail ? <Text style={styles.jobErrorDetail}>{job.detail}</Text> : null}
 
@@ -641,7 +737,8 @@ function JobRow({
                     style={[styles.traceLine, traceToneStyle(entry.tone, styles)]}
                     selectable
                   >
-                    {entry.ts ? `${formatLogTimestamp(entry.ts)} ` : ""}[{entry.source}] {entry.line}
+                    {entry.ts ? `${formatLogTimestamp(entry.ts)} ` : ""}[{entry.source}]{" "}
+                    {entry.line}
                   </Text>
                 ))}
               </ScrollView>

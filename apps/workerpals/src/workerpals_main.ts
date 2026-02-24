@@ -61,6 +61,7 @@ type WorkerJobResult = JobResult & {
 };
 
 const DEFAULT_LLM_MODEL = "local-model";
+const CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
 const CONFIG = loadPushPalsConfig();
 const LOG = new Logger("WorkerPals");
 
@@ -117,6 +118,21 @@ function sanitizeJobLogLine(line: string): string {
 
 function isNoisyProgressLine(line: string): boolean {
   return /^(📦 Installing \[\d+\/\d+\]|🔍 Resolving\.\.\.|🔒 Saving lockfile\.\.\.)$/.test(line);
+}
+
+function shouldRecycleWorkerForCodexUnavailableFailure(
+  summary: string,
+  stderr?: string | null,
+): boolean {
+  const text = `${summary}\n${stderr ?? ""}`.toLowerCase();
+  return [
+    "openai_codex cli is not installed",
+    "openai_codex chatgpt auth is not ready",
+    "openai_codex api_key auth requires openai_api_key",
+    "openai_codex policy violation: codex cli workaround detected",
+    "codex cli isn't available",
+    "codex cli is mandatory in this backend",
+  ].some((needle) => text.includes(needle));
 }
 
 function parseArgs(): {
@@ -244,7 +260,10 @@ async function resolveGitRemoteUrl(repo: string, remote = "origin"): Promise<str
   return String(result.stdout ?? "").trim();
 }
 
-async function resolveWorkerGitToken(repo: string, configuredToken: string | null): Promise<string> {
+async function resolveWorkerGitToken(
+  repo: string,
+  configuredToken: string | null,
+): Promise<string> {
   const remoteUrl = await resolveGitRemoteUrl(repo, "origin");
   const resolved = await resolveGitTokenForRemote({
     remoteUrl,
@@ -652,7 +671,11 @@ function buildCompletionPrMetadata(args: {
 }
 
 function parseLsRemoteSha(output: string): string | null {
-  const firstLine = (output ?? "").split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
+  const firstLine =
+    (output ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) ?? "";
   const match = firstLine.match(/^([0-9a-f]{40})\s+/i);
   return match ? match[1] : null;
 }
@@ -954,6 +977,7 @@ async function workerLoop(
           let directWorktreePath: string | null = null;
           let executionRepo = opts.repo;
           let result: WorkerJobResult | null = null;
+          let recycleWorkerAfterJob = false;
 
           try {
             if (!dockerExecutor) {
@@ -1142,6 +1166,15 @@ async function workerLoop(
               console.log(
                 `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
               );
+              recycleWorkerAfterJob = shouldRecycleWorkerForCodexUnavailableFailure(
+                result.summary,
+                result.stderr,
+              );
+              if (recycleWorkerAfterJob) {
+                console.error(
+                  `[WorkerPals] Codex backend unavailable for job ${job.id}; terminating this worker for replacement.`,
+                );
+              }
             }
 
             if (job.sessionId) {
@@ -1196,7 +1229,12 @@ async function workerLoop(
             }
           } finally {
             clearInterval(busyHeartbeat);
-            if (job.sessionId && result?.cooldownMs && result.cooldownMs > 0) {
+            if (
+              !recycleWorkerAfterJob &&
+              job.sessionId &&
+              result?.cooldownMs &&
+              result.cooldownMs > 0
+            ) {
               await sendCommand(opts.server, job.sessionId, headers, {
                 type: "assistant_message",
                 payload: {
@@ -1205,7 +1243,7 @@ async function workerLoop(
                 from: `worker:${opts.workerId}`,
               });
             }
-            if (result?.cooldownMs && result.cooldownMs > 0) {
+            if (!recycleWorkerAfterJob && result?.cooldownMs && result.cooldownMs > 0) {
               const cooldownMs = Math.max(0, Math.floor(result.cooldownMs));
               console.warn(
                 `[WorkerPals] Entering cooldown for ${formatDurationMs(cooldownMs)} after retry exhaustion.`,
@@ -1220,6 +1258,18 @@ async function workerLoop(
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                 console.error(`[WorkerPals] Failed to remove isolated worktree: ${String(err)}`);
               });
+            }
+            if (recycleWorkerAfterJob) {
+              runtimeState.shutdownRequested = true;
+              await maybeHeartbeat("offline", null, true);
+              if (dockerExecutor) {
+                try {
+                  await dockerExecutor.shutdown();
+                } catch (err) {
+                  console.error(`[WorkerPals] Docker shutdown cleanup failed: ${String(err)}`);
+                }
+              }
+              process.exit(CODEX_UNAVAILABLE_WORKER_EXIT_CODE);
             }
           }
         }

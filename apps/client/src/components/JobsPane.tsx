@@ -39,7 +39,11 @@ function parseIsoMs(value: string | null | undefined): number | null {
 }
 
 function deriveJobElapsedMs(job: JobSnapshotRow): number | null {
-  if (typeof job.durationMs === "number" && Number.isFinite(job.durationMs) && job.durationMs >= 0) {
+  if (
+    typeof job.durationMs === "number" &&
+    Number.isFinite(job.durationMs) &&
+    job.durationMs >= 0
+  ) {
     return Math.floor(job.durationMs);
   }
 
@@ -97,7 +101,7 @@ export function JobsPane({
     [pendingSnapshot],
   );
   const hasFilter = Boolean(requestFilterId || jobFilterId);
-  const focusJobId = jobFilterId ?? (filteredJobs[0]?.id ?? null);
+  const focusJobId = jobFilterId ?? filteredJobs[0]?.id ?? null;
 
   return (
     <View style={styles.fill}>
@@ -145,7 +149,10 @@ export function JobsPane({
                 onPress={onClearFilter}
               >
                 <Text
-                  style={[styles.clearFilterLabel, { color: theme.accent, fontFamily: theme.fontSans }]}
+                  style={[
+                    styles.clearFilterLabel,
+                    { color: theme.accent, fontFamily: theme.fontSans },
+                  ]}
                 >
                   Clear Filter
                 </Text>
@@ -153,8 +160,11 @@ export function JobsPane({
             ) : null}
           </View>
           {hasFilter ? (
-            <Text style={[styles.filterMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
-              request {requestFilterId?.slice(0, 8) ?? "--"} | job {jobFilterId?.slice(0, 8) ?? "--"}
+            <Text
+              style={[styles.filterMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}
+            >
+              request {requestFilterId?.slice(0, 8) ?? "--"} | job{" "}
+              {jobFilterId?.slice(0, 8) ?? "--"}
             </Text>
           ) : null}
           {recentJobs.length === 0 ? (
@@ -210,6 +220,15 @@ export function JobsPane({
                       >
                         {item.id.slice(0, 8)} | worker {item.workerId ?? "--"} |{" "}
                         {relativeMs(item.updatedAt)}
+                      </Text>
+                      <Text
+                        selectable
+                        style={[
+                          styles.jobIdentifierLine,
+                          { color: theme.textMuted, fontFamily: theme.fontMono },
+                        ]}
+                      >
+                        jobId={item.id} | workerId={item.workerId ?? "--"}
                       </Text>
                       <Text
                         style={[
@@ -406,6 +425,7 @@ const styles = StyleSheet.create({
   jobTextCol: { flex: 1 },
   jobKind: { fontSize: 13, fontWeight: "700" },
   jobMeta: { fontSize: 12, marginTop: 2 },
+  jobIdentifierLine: { fontSize: 11, marginTop: 3 },
   jobPhaseLine: { fontSize: 11, marginTop: 4 },
   jobStatus: { fontSize: 11, fontWeight: "700", textTransform: "uppercase" },
   completionStrip: { marginTop: 8 },

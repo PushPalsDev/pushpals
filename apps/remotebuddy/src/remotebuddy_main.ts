@@ -121,6 +121,18 @@ function parseEnabledFlag(raw: string | undefined | null, defaultValue: boolean)
   return !["0", "false", "no", "off"].includes(text);
 }
 
+function isCodexUnavailableFailureSignal(message: string, detail: string): boolean {
+  const text = `${message}\n${detail}`.toLowerCase();
+  return [
+    "openai_codex cli is not installed",
+    "openai_codex chatgpt auth is not ready",
+    "openai_codex api_key auth requires openai_api_key",
+    "openai_codex policy violation: codex cli workaround detected",
+    "codex cli isn't available",
+    "codex cli is mandatory in this backend",
+  ].some((needle) => text.includes(needle));
+}
+
 type TaskExecutionLane = "deterministic" | "worker";
 type RequestPriority = "interactive" | "normal" | "background";
 type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
@@ -262,7 +274,8 @@ function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata |
     runId: String(payload.runId ?? payload.run_id ?? "").trim() || undefined,
     snapshotId: String(payload.snapshotId ?? payload.snapshot_id ?? "").trim() || undefined,
     patternKey: String(payload.patternKey ?? payload.pattern_key ?? "").trim() || undefined,
-    componentArea: String(payload.componentArea ?? payload.component_area ?? "").trim() || undefined,
+    componentArea:
+      String(payload.componentArea ?? payload.component_area ?? "").trim() || undefined,
     targetPaths: normalizeMetadataTargetPaths(payload.targetPaths ?? payload.target_paths),
     writeGlobs: normalizeMetadataWriteGlobs(payload.writeGlobs ?? payload.write_globs),
   };
@@ -362,7 +375,8 @@ function buildExecutionGuidance(plan: PlannerOutput, targetPaths: string[]): str
   return lines.join("\n").trim();
 }
 
-const VALIDATION_COMMAND_PREFIX = /^(git|bun|bunx|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
+const VALIDATION_COMMAND_PREFIX =
+  /^(git|bun|bunx|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
 const VALIDATION_GENERIC_SAFE = /^(git\s+status\s+--porcelain|git\s+diff\b)/i;
 const PATH_TOKEN_REGEX = /\b([A-Za-z0-9._/\-\\]+\.[A-Za-z0-9._-]+)\b/g;
 
@@ -379,7 +393,9 @@ function hasRelevantTargetPath(step: string, targetPaths: string[]): boolean {
     if (lower.includes(target.toLowerCase())) return true;
   }
   const explicitPathTokens = [...step.matchAll(PATH_TOKEN_REGEX)].map((match) =>
-    String(match[1] ?? "").replace(/\\/g, "/").toLowerCase(),
+    String(match[1] ?? "")
+      .replace(/\\/g, "/")
+      .toLowerCase(),
   );
   if (explicitPathTokens.length === 0) return true;
   for (const token of explicitPathTokens) {
@@ -409,9 +425,7 @@ function normalizeValidationSteps(steps: string[], targetPaths: string[]): strin
 
 function defaultValidationStepsForRequest(prompt: string, targetPaths: string[]): string[] {
   const text = prompt.toLowerCase();
-  const concreteTargets = targetPaths
-    .filter((entry) => entry && entry !== ".")
-    .slice(0, 4);
+  const concreteTargets = targetPaths.filter((entry) => entry && entry !== ".").slice(0, 4);
   if (/\b(lint|eslint|tsc|typecheck)\b/.test(text)) {
     return ["bun run lint"];
   }
@@ -432,7 +446,9 @@ function sanitizePlannerWorkerInstruction(
 ): string {
   const value = canonicalizeInstructionTextForBun(String(workerInstruction ?? "").trim());
   if (!value) return "";
-  const canonicalReference = canonicalizeInstructionTextForBun(String(canonicalInstruction ?? "").trim());
+  const canonicalReference = canonicalizeInstructionTextForBun(
+    String(canonicalInstruction ?? "").trim(),
+  );
   if (value === canonicalReference) return "";
   const lower = value.toLowerCase();
   if (
@@ -444,7 +460,11 @@ function sanitizePlannerWorkerInstruction(
   ) {
     return "";
   }
-  if (!/\b(apply|append|add|edit|update|modify|change|replace|write|create|remove|run|verify|check|ensure)\b/i.test(value)) {
+  if (
+    !/\b(apply|append|add|edit|update|modify|change|replace|write|create|remove|run|verify|check|ensure)\b/i.test(
+      value,
+    )
+  ) {
     return "";
   }
   return value;
@@ -861,6 +881,7 @@ class RemoteBuddyOrchestrator {
     detail: string,
   ): Promise<void> {
     const shortJob = jobId.slice(0, 8);
+    void this.recycleWorkerForCodexUnavailableFailure(jobId, message, detail);
     const clarificationQuestion = extractClarificationFromJobFailure(message, detail);
     if (clarificationQuestion) {
       const clarificationMsg =
@@ -1192,6 +1213,75 @@ class RemoteBuddyOrchestrator {
     return !isExecutionIntent(prompt, extractExplicitTargetPath(prompt));
   }
 
+  private resolveWorkerIdForJob(jobId: string): string | null {
+    const id = String(jobId ?? "").trim();
+    if (!id) return null;
+    try {
+      if (!this.jobsDb) {
+        this.jobsDb = new Database(this.jobsDbPath);
+      }
+      const row = this.jobsDb.prepare("SELECT workerId FROM jobs WHERE id = ? LIMIT 1").get(id) as
+        | { workerId: string | null }
+        | undefined;
+      const workerId = String(row?.workerId ?? "").trim();
+      return workerId || null;
+    } catch (err) {
+      console.warn(`[RemoteBuddy] Could not resolve worker for failed job ${id}:`, err);
+      return null;
+    }
+  }
+
+  private async recycleWorkerForCodexUnavailableFailure(
+    jobId: string,
+    message: string,
+    detail: string,
+  ): Promise<void> {
+    if (!isCodexUnavailableFailureSignal(message, detail)) return;
+    const workerId = this.resolveWorkerIdForJob(jobId);
+    if (!workerId) {
+      console.warn(
+        `[RemoteBuddy] Codex unavailable failure for job ${jobId}, but no workerId was found; cannot recycle.`,
+      );
+      return;
+    }
+
+    const proc = this.managedWorkers.get(workerId);
+    if (!proc) {
+      console.warn(
+        `[RemoteBuddy] Codex unavailable failure for job ${jobId}; worker ${workerId} is not managed by RemoteBuddy, skipping recycle.`,
+      );
+      return;
+    }
+
+    console.warn(
+      `[RemoteBuddy] Codex unavailable for job ${jobId}; recycling WorkerPal ${workerId}.`,
+    );
+    this.managedWorkers.delete(workerId);
+    try {
+      proc.kill();
+    } catch (err) {
+      console.warn(`[RemoteBuddy] Failed to kill WorkerPal ${workerId} during recycle:`, err);
+    }
+
+    if (!this.autoSpawnWorkers) {
+      console.warn(
+        `[RemoteBuddy] Auto-spawn is disabled; WorkerPal ${workerId} was recycled without replacement.`,
+      );
+      return;
+    }
+
+    const replacement = await this.spawnWorker();
+    if (replacement) {
+      console.log(
+        `[RemoteBuddy] WorkerPal recycle complete: replaced ${workerId} with ${replacement}.`,
+      );
+      return;
+    }
+    console.warn(
+      `[RemoteBuddy] WorkerPal ${workerId} was recycled, but replacement did not become ready in time.`,
+    );
+  }
+
   private getRecentJobContext(limit: number = 12): Array<Record<string, unknown>> {
     try {
       if (!this.jobsDb) {
@@ -1477,11 +1567,12 @@ class RemoteBuddyOrchestrator {
       // except for analysis intent from the engine — those fall through so the autonomous
       // engine can handle next-step dispatch rather than blindly queueing a worker job.
       const isAnalysisFromEngine = plan.intent === "analysis" && Boolean(autonomyMetadata);
-      const requiresWorker = forceWorker && !isAnalysisFromEngine
-        ? true
-        : this.shouldForceDirectReply(prompt, plan.intent)
-          ? false
-          : plan.requires_worker;
+      const requiresWorker =
+        forceWorker && !isAnalysisFromEngine
+          ? true
+          : this.shouldForceDirectReply(prompt, plan.intent)
+            ? false
+            : plan.requires_worker;
       console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
       // when forcing worker, don't fail on "planner contract incomplete" — fill safe defaults.
       if (requiresWorker) {
@@ -1658,12 +1749,8 @@ class RemoteBuddyOrchestrator {
                   ? { objectiveId: autonomyMetadata.objectiveId }
                   : {}),
                 ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
-                ...(autonomyMetadata.snapshotId
-                  ? { snapshotId: autonomyMetadata.snapshotId }
-                  : {}),
-                ...(autonomyMetadata.patternKey
-                  ? { patternKey: autonomyMetadata.patternKey }
-                  : {}),
+                ...(autonomyMetadata.snapshotId ? { snapshotId: autonomyMetadata.snapshotId } : {}),
+                ...(autonomyMetadata.patternKey ? { patternKey: autonomyMetadata.patternKey } : {}),
                 ...(autonomyMetadata.componentArea
                   ? { componentArea: autonomyMetadata.componentArea }
                   : {}),
@@ -1882,7 +1969,9 @@ class RemoteBuddyOrchestrator {
 
   startAutonomy(): void {
     if (!CONFIG.remotebuddy.autonomy.enabled) {
-      console.log("[RemoteBuddy] Autonomous engine disabled by config (remotebuddy.autonomy.enabled=false).");
+      console.log(
+        "[RemoteBuddy] Autonomous engine disabled by config (remotebuddy.autonomy.enabled=false).",
+      );
       return;
     }
     this.autonomousEngine.start();
@@ -1971,7 +2060,9 @@ async function main() {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
   } else {
-    console.log("[RemoteBuddy] Config snapshot logging disabled (startup.log_config_on_start=false).");
+    console.log(
+      "[RemoteBuddy] Config snapshot logging disabled (startup.log_config_on_start=false).",
+    );
   }
 
   // ── Initialise LLM + brain ──

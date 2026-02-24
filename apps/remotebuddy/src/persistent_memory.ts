@@ -15,6 +15,10 @@ type MemoryRow = {
   createdAt: string;
 };
 
+const SQLITE_BUSY_CODES = new Set(["SQLITE_BUSY", "SQLITE_BUSY_SNAPSHOT", "SQLITE_LOCKED"]);
+const SQLITE_BUSY_RETRY_ATTEMPTS = 3;
+const SQLITE_BUSY_TIMEOUT_MS = 3_000;
+
 function normalizeSummary(input: unknown): string {
   return String(input ?? "")
     .replace(/\s+/g, " ")
@@ -34,7 +38,33 @@ export class PersistentSessionMemory implements SessionMemoryBackend {
     this.db = new Database(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA synchronous = NORMAL;");
+    this.db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     this.migrate();
+  }
+
+  private isBusyError(error: unknown): boolean {
+    const code = String((error as { code?: unknown })?.code ?? "").toUpperCase();
+    if (SQLITE_BUSY_CODES.has(code)) return true;
+    const message = String((error as { message?: unknown })?.message ?? "").toLowerCase();
+    return message.includes("database is locked");
+  }
+
+  private runWithBusyRetry<T>(operation: string, action: () => T): T {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= SQLITE_BUSY_RETRY_ATTEMPTS; attempt++) {
+      try {
+        return action();
+      } catch (error) {
+        lastError = error;
+        if (!this.isBusyError(error) || attempt >= SQLITE_BUSY_RETRY_ATTEMPTS) {
+          throw error;
+        }
+      }
+    }
+    throw (
+      lastError ??
+      new Error(`[RemoteBuddy] SQLite busy retry exhausted for operation: ${operation}`)
+    );
   }
 
   private migrate(): void {
@@ -70,15 +100,21 @@ export class PersistentSessionMemory implements SessionMemoryBackend {
         : `${summaryRaw.slice(0, maxSummaryChars - 14)} ...[truncated]`;
     const requestId = normalizeSummary(input.requestId ?? "") || null;
     const createdAt = new Date().toISOString();
-    this.db
-      .prepare(
-        `INSERT INTO remotebuddy_memory (repoRoot, sessionId, requestId, kind, summary, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(repoRoot, sessionId, requestId, kind, summary, createdAt);
+    this.runWithBusyRetry("remember.insert", () =>
+      this.db
+        .prepare(
+          `INSERT INTO remotebuddy_memory (repoRoot, sessionId, requestId, kind, summary, createdAt)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(repoRoot, sessionId, requestId, kind, summary, createdAt),
+    );
 
     const retentionDays = clampPositiveInt(options.retentionDays, 30, 1, 3650);
-    this.purgeExpired(retentionDays, repoRoot);
+    try {
+      this.purgeExpired(retentionDays, repoRoot);
+    } catch (error) {
+      console.warn("[RemoteBuddy] Persistent memory purge skipped:", error);
+    }
   }
 
   recallForPlanning(options: SessionMemoryRecallOptions): string[] {
@@ -132,11 +168,13 @@ export class PersistentSessionMemory implements SessionMemoryBackend {
     const days = clampPositiveInt(retentionDays, 30, 1, 3650);
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     const repo = normalizeSummary(repoRoot ?? "");
-    const result = repo
-      ? this.db
-          .prepare(`DELETE FROM remotebuddy_memory WHERE repoRoot = ? AND createdAt < ?`)
-          .run(repo, cutoff)
-      : this.db.prepare(`DELETE FROM remotebuddy_memory WHERE createdAt < ?`).run(cutoff);
+    const result = this.runWithBusyRetry("remember.purge_expired", () =>
+      repo
+        ? this.db
+            .prepare(`DELETE FROM remotebuddy_memory WHERE repoRoot = ? AND createdAt < ?`)
+            .run(repo, cutoff)
+        : this.db.prepare(`DELETE FROM remotebuddy_memory WHERE createdAt < ?`).run(cutoff),
+    );
     return Number(result.changes ?? 0);
   }
 
