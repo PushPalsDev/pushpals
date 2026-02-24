@@ -154,10 +154,14 @@ bun run src/remotebuddy_main.ts \
   --token ${PUSHPALS_AUTH_TOKEN:-<optional>}
 ```
 
-- `--server`, `--sessionId`, and `--token` override values loaded from `config/*.toml` + `.env`.
-- Blank `--token` values are rejected; omit the flag to fall back to `PUSHPALS_AUTH_TOKEN` (if set) or to run without auth headers.
-- Pass `--sessionId ""` to request a fresh server-assigned session ID while keeping config defaults intact.
-- Append `--` followed by WorkerPal flags (for example `-- --docker --git-token $PUSHPALS_GIT_TOKEN`) to forward extra CLI options to every auto-spawned WorkerPal instance.
+- Runtime precedence is `CLI flag > env vars (PUSHPALS_SERVER_URL/PUSHPALS_URL, PUSHPALS_SESSION_ID, PUSHPALS_AUTH_TOKEN/AUTH_TOKEN) > config defaults`.
+- `--sessionId ""` (or `PUSHPALS_SESSION_ID=""`) requests a brand-new session; blank CLI tokens are rejected (`--token` must be omitted to run without auth).
+- Setting `PUSHPALS_AUTH_TOKEN=""` or `AUTH_TOKEN=""` clears a previously configured token (useful when falling back to unauthenticated local stacks).
+- Use `--token <value>` for auth (the legacy `--authToken` alias is still accepted for backward compatibility).
+- `--server` must receive a non-empty value. Any unexpected positional argument before `--` throws (`bun run ... -- --foo` preserves downstream args).
+- Arguments after `--` are preserved for downstream tooling; RemoteBuddy logs them but leaves interpretation to the consumer.
+- Env/CLI values are trimmed before parsing so stray whitespace does not affect detection.
+- When no CLI flag or env var supplies a token, RemoteBuddy runs without auth headers (only acceptable for unsecured local stacks).
 
 ## Token Acquisition & Verification Flow
 
