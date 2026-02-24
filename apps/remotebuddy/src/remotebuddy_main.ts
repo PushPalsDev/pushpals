@@ -44,36 +44,18 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import { parseCliArgs, type RuntimeCliArgs } from "./runtime.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
 
-function parseArgs(): {
-  server: string;
-  sessionId: string | null;
-  authToken: string | null;
-} {
-  const args = process.argv.slice(2);
-  let server = CONFIG.server.url;
-  let sessionId: string | null = CONFIG.sessionId;
-  let authToken = CONFIG.authToken;
-
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case "--server":
-        server = args[++i];
-        break;
-      case "--sessionId":
-        sessionId = args[++i];
-        break;
-      case "--token":
-        authToken = args[++i];
-        break;
-    }
-  }
-
-  return { server, sessionId, authToken };
+function parseArgs(): RuntimeCliArgs {
+  return parseCliArgs(process.argv.slice(2), {
+    server: CONFIG.server.url,
+    sessionId: CONFIG.sessionId,
+    authToken: CONFIG.authToken,
+  });
 }
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
