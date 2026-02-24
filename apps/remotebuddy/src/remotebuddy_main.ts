@@ -31,6 +31,7 @@ import {
   matchesGlob,
   normalizeTargetPath,
   normalizeWriteGlob,
+  type PushPalsConfig,
 } from "shared";
 import { mkdirSync } from "fs";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
@@ -44,17 +45,25 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
-import { parseCliArgs, type RuntimeCliArgs } from "./runtime.js";
+import { loadRemoteBuddyRuntime, type RemoteBuddyRuntime } from "./runtime.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
 
-function parseArgs(): RuntimeCliArgs {
-  return parseCliArgs(process.argv.slice(2), {
-    server: CONFIG.server.url,
-    sessionId: CONFIG.sessionId,
-    authToken: CONFIG.authToken,
+type RuntimeResolutionOverrides = {
+  argv?: string[];
+  env?: Record<string, string | undefined>;
+  config?: PushPalsConfig;
+};
+
+export function resolveProcessRuntime(
+  overrides: RuntimeResolutionOverrides = {},
+): RemoteBuddyRuntime {
+  return loadRemoteBuddyRuntime({
+    config: overrides.config ?? CONFIG,
+    argv: overrides.argv,
+    env: overrides.env,
   });
 }
 
@@ -1966,11 +1975,19 @@ async function connectWithRetry(
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-async function main() {
-  const opts = parseArgs();
+export async function startRemoteBuddy() {
+  const runtime = resolveProcessRuntime();
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
-  console.log(`[RemoteBuddy] Server: ${opts.server}`);
+  console.log(`[RemoteBuddy] Server: ${runtime.serverUrl}`);
+  console.log(
+    `[RemoteBuddy] Runtime sources: server=${runtime.sources.serverUrl} session=${runtime.sources.sessionId} token=${runtime.sources.authToken}`,
+  );
+  if (runtime.passthroughArgs.length > 0) {
+    console.warn(
+      `[RemoteBuddy] Ignoring passthrough args after \"--\": ${runtime.passthroughArgs.join(" ")}`,
+    );
+  }
   if (CONFIG.startup.logConfigOnStart) {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
@@ -2001,9 +2018,9 @@ async function main() {
     }`,
   );
 
-  let sessionId = opts.sessionId;
+  let sessionId = runtime.sessionId;
   console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
-  sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
+  sessionId = await connectWithRetry(runtime.serverUrl, sessionId ?? undefined);
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
   const llmCfg = CONFIG.remotebuddy.llm;
@@ -2018,9 +2035,9 @@ async function main() {
   brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
-    server: opts.server,
+    server: runtime.serverUrl,
     sessionId,
-    authToken: opts.authToken,
+    authToken: runtime.authToken,
     brain,
     llm,
     idempotency,
@@ -2034,11 +2051,12 @@ async function main() {
   orchestrator.startAutonomy();
 
   // Start polling for requests from the Request Queue
-  const pollMs = CONFIG.remotebuddy.pollMs;
-  orchestrator.startPolling(pollMs);
+  orchestrator.startPolling(CONFIG.remotebuddy.pollMs);
 }
 
-main().catch((err) => {
-  console.error("[RemoteBuddy] Fatal:", err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  startRemoteBuddy().catch((err) => {
+    console.error("[RemoteBuddy] Fatal:", err);
+    process.exit(1);
+  });
+}

@@ -193,6 +193,8 @@ bun run src/remotebuddy_main.ts \
 ```
 
 - `--server`, `--sessionId`, and `--token` override values loaded from `config/*.toml` + `.env`.
+- Flags accept either `--flag value` or `--flag=value`. Append `--` to stop RemoteBuddy flag parsing and pass subsequent args through to Bun (passthrough args are ignored today).
+- Missing or blank flag values fail fast with a `[RemoteBuddyRuntime]` error so overrides are always explicit.
 - When `--token` is omitted, the process uses `PUSHPALS_AUTH_TOKEN` (if set) or runs without auth headers.
 
 ## Token Acquisition & Verification Flow
