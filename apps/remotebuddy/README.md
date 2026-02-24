@@ -21,34 +21,6 @@ RemoteBuddy --POST /jobs/enqueue--> Server Job Queue <--POST /jobs/claim-- Worke
 RemoteBuddy -> CommunicationManager -> UI + LocalBuddy status responders
 ```
 
-## Architecture Overview (On-Call Crash Course)
-
-RemoteBuddy runs as the single Bun process in `apps/remotebuddy/src/remotebuddy_main.ts`. It polls the server queue, plans via an LLM-backed `AgentBrain`, and either replies inline or ships structured `task.execute` work to WorkerPals while streaming events through `CommunicationManager`. Keep the following mental model in mind when debugging:
-
-```text
-POST /requests/claim
-        │
-        ▼
-IdempotencyStore (SQLite remotebuddy-state.db) ──► AgentBrain + SessionMemory
-        │                                               │
-        │                            assistant_message / task_* events via CommunicationManager
-        │                                               ▼
-        └──────► Planner output + path/command policy ──► POST /jobs/enqueue → WorkerPals
-                                            ▲
-                                            │
-                                   RemoteBuddyAutonomousEngine (queue health + remediation)
-```
-
-### Core subsystems
-
-- **Request poller & idempotency** – `RemoteBuddyOrchestrator` hits `POST /requests/claim` every ~2 s, then de-dupes messages through `IdempotencyStore` so crashes/retries do not replay finished prompts. The store, together with cursors, lives in `remotebuddy-state.db` inside the repo root; back it up (or delete intentionally) if the file becomes corrupted.
-- **Planner, memory & heuristics** – `AgentBrain` (LLM) and `LLMClient` evaluate prompts, hydrate `SessionMemory`/`PersistentSessionMemory`, and call `path_targeting` plus `command_policy` helpers to normalize scope, target paths, validation, and execution guidance before anything is handed to WorkerPals. This is where most “why did it plan that?” questions originate.
-- **Task/worker coordination** – The orchestrator emits `assistant_message`, `task_*`, and completion payloads via `CommunicationManager`, then enqueues WorkerPal jobs with `POST /jobs/enqueue`. If extra capacity is required, `worker_spawn.ts` can build the exact `bun run apps/workerpals` command RemoteBuddy launches automatically to keep ≥`maxWorkers` idle.
-- **Autonomy + queue automation** – `RemoteBuddyAutonomousEngine` consumes signals such as `sig_queue_health`, retry streaks, and regret telemetry. It can enqueue synthetic remediation tasks labeled `origin=autonomy`, each pre-populated with `write_globs`/`target_paths`. Operators should only edit those scopes when they’ve proved the automation was wrong.
-- **Observability & recovery** – `CommunicationManager.subscribeSessionEvents` keeps a WebSocket open for `job_failed`/`job_completed` envelopes so RemoteBuddy can annotate memory and immediately inform users. Long-running hosts should use `bun --cwd apps/remotebuddy run start` (which runs `remotebuddy_supervisor.ts`) so the agent auto-restarts on crashes while reusing the same `remotebuddy-state.db`.
-
-For deeper internals, inspect `apps/remotebuddy/src/*.ts` alongside `packages/shared`, but this overview should be enough for on-call triage.
-
 ## Prerequisites & Cross-Platform Install Commands
 
 RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Install these before running the service.
@@ -153,16 +125,6 @@ RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Install these before 
 3. **Infrastructure/SRE tertiary:** escalate to infra on-call when degradation roots in shared services (LLM vendor, git, registry) or when queue automation repeatedly re-enqueues the same remediation instruction after operators intervene.
 4. Keep a rolling incident log (timestamp, metric snapshot, corrective action) and attach it to the follow-up RCA if paging was required.
 
-## On-Call Deployment Flow (Summary)
-
-Use this path any time you need to redeploy RemoteBuddy because of a regression, host reboot, or planned change. The goal is to minimize queue downtime while keeping provenance crystal clear.
-
-1. **Stabilize & communicate** – Post intent in `#pushpals-ops`, capture the latest `/system/status` snapshot, and pause new background/eval submissions if queue guardrails are already amber/red. Confirm another operator is watching WorkerPals capacity before you bounce RemoteBuddy.
-2. **Sync repo + dependencies** – On the target host run `git fetch origin && git checkout <target-commit> && git pull --ff-only`. Compare `bun.lock`/`package.json`; if they changed, run `bun install`. Double-check `.env` and `config/local.toml` still have the right `PUSHPALS_*` entries.
-3. **Build protocol + start the process** – Prefer the repo-root script `bun run remotebuddy` (executes `protocol:build` first, then `remotebuddy:only`). When protocols are already current, `bun run remotebuddy:only` or `bun --cwd apps/remotebuddy run start` (enables `remotebuddy_supervisor.ts` restarts) keeps downtime minimal. Keep the existing terminal or tmux pane open so you can tail logs live.
-4. **Validate the new instance** – Wait for `[RemoteBuddy] Starting polling loop…` followed by at least one `claim payload` log. Immediately hit `curl -sS $SERVER/system/status | jq '{queues: .queues.requests, jobs: .jobPendingSnapshot}'` and `curl -sS "$SERVER/requests?status=claimed&limit=5"`. Optionally run the smoke test in the section below (`bun run smoke`) or enqueue a single interactive request to prove round-trip health. Confirm `queue_p95`, worker idle counts, and the CommunicationManager WebSocket reconnect cleanly.
-5. **Observe, rollback if needed** – Watch logs for 5–10 minutes. If failures persist, stop the process, `git checkout <last-known-good>`, rerun step 3, and move `remotebuddy-state.db` aside only when it is clearly corrupted (RemoteBuddy will recreate it, but previously-handled events may replay once). Document the outcome and handoff time in `#pushpals-ops`.
-
 ## Commands & Working Directories
 
 ### Repo-root scripts (validated against `package.json`)
@@ -193,9 +155,9 @@ bun run src/remotebuddy_main.ts \
 ```
 
 - `--server`, `--sessionId`, and `--token` override values loaded from `config/*.toml` + `.env`.
-- Flags accept either `--flag value` or `--flag=value`. Append `--` to stop RemoteBuddy flag parsing and pass subsequent args through to Bun (passthrough args are ignored today).
-- Missing or blank flag values fail fast with a `[RemoteBuddyRuntime]` error so overrides are always explicit.
-- When `--token` is omitted, the process uses `PUSHPALS_AUTH_TOKEN` (if set) or runs without auth headers.
+- Blank `--token` values are rejected; omit the flag to fall back to `PUSHPALS_AUTH_TOKEN` (if set) or to run without auth headers.
+- Pass `--sessionId ""` to request a fresh server-assigned session ID while keeping config defaults intact.
+- Append `--` followed by WorkerPal flags (for example `-- --docker --git-token $PUSHPALS_GIT_TOKEN`) to forward extra CLI options to every auto-spawned WorkerPal instance.
 
 ## Token Acquisition & Verification Flow
 
