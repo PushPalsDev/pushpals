@@ -1,199 +1,163 @@
-import type { PushPalsConfig } from "shared";
+import { loadPushPalsConfig, type PushPalsConfig } from "shared";
 
-type EnvSource = Record<string, string | undefined>;
+export interface RuntimeLoaderOptions {
+  argv?: string[];
+  env?: Record<string, string | undefined>;
+  config?: PushPalsConfig;
+}
 
-export type RemoteBuddyRuntimeOptions = {
+export interface RuntimeBootstrap {
+  config: PushPalsConfig;
   server: string;
   sessionId: string | null;
   authToken: string | null;
-  passthroughArgs: string[];
-};
+  workerPassthroughArgs: string[];
+}
 
-export type RemoteBuddyRuntimeLoaderConfig = {
-  server: { url: string };
-} & Pick<PushPalsConfig, "sessionId" | "authToken">;
+export function loadRuntime(options: RuntimeLoaderOptions = {}): RuntimeBootstrap {
+  const config = options.config ?? loadPushPalsConfig();
+  const env = options.env ?? process.env;
+  const rawArgv = options.argv ?? process.argv.slice(2);
+  const { cliArgs, passthroughArgs } = splitArgv(rawArgv);
+  const cliOverrides = parseCliArgs(cliArgs);
 
-export type LoadRemoteBuddyRuntimeOptionsParams = {
-  argv?: string[];
-  env?: EnvSource;
-  config: RemoteBuddyRuntimeLoaderConfig;
-};
+  const envServer = readEnvString(env.PUSHPALS_SERVER_URL);
+  const envSession = readEnvString(env.PUSHPALS_SESSION_ID);
+  const envAuth = readEnvAuthToken(env);
 
-export function loadRemoteBuddyRuntimeOptions({
-  argv = process.argv.slice(2),
-  env = process.env,
-  config,
-}: LoadRemoteBuddyRuntimeOptionsParams): RemoteBuddyRuntimeOptions {
-  const args = [...argv];
-  let cliServer: string | null = null;
-  let cliSession: string | null = null;
-  let cliSessionProvided = false;
-  let cliToken: string | null = null;
-  let cliTokenProvided = false;
-  const passthroughArgs: string[] = [];
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === "--") {
-      passthroughArgs.push(...args.slice(i + 1));
-      break;
-    }
-    if (!arg.startsWith("-")) {
-      throw new Error(
-        `Unexpected positional argument "${arg}". Use \"--\" to pass through additional args.`,
-      );
-    }
-
-    const { flag, inlineValue } = splitFlag(arg);
-    switch (flag) {
-      case "--server": {
-        const raw = inlineValue ?? args[++i];
-        ensureHasValue(flag, raw);
-        cliServer = requireNonBlank(flag, raw!);
-        break;
-      }
-      case "--session":
-      case "--sessionId": {
-        const raw = inlineValue ?? args[++i];
-        ensureHasValue(flag, raw);
-        cliSessionProvided = true;
-        cliSession = normalizeNullable(raw!);
-        break;
-      }
-      case "--token": {
-        const raw = inlineValue ?? args[++i];
-        ensureHasValue(flag, raw);
-        cliTokenProvided = true;
-        cliToken = requireNonBlank(flag, raw!);
-        break;
-      }
-      default: {
-        throw new Error(
-          `Unknown flag \"${flag}\". Valid flags: --server, --sessionId (--session), --token.`,
-        );
-      }
-    }
-  }
-
-  const server =
-    cliServer ??
-    firstNonEmpty(env.PUSHPALS_SERVER_URL, env.PUSHPALS_URL) ??
-    normalizeNullable(config.server?.url);
+  const server = (cliOverrides.server ?? envServer ?? config.server.url ?? "").trim();
   if (!server) {
     throw new Error(
-      "RemoteBuddy requires a server URL. Provide --server, set PUSHPALS_SERVER_URL/PUSHPALS_URL, or configure server.url.",
+      "Server URL is required (configure via config.server.url, PUSHPALS_SERVER_URL, or --server)",
     );
   }
 
-  const sessionId = cliSessionProvided
-    ? cliSession
-    : firstNonEmpty(env.PUSHPALS_SESSION_ID, config.sessionId);
-
-  const authToken =
-    (cliTokenProvided ? cliToken : null) ??
-    firstNonEmpty(env.PUSHPALS_AUTH_TOKEN, env.AUTH_TOKEN, config.authToken ?? undefined);
+  const sessionIdRaw = cliOverrides.sessionId ?? envSession ?? config.sessionId ?? "";
+  const sessionId = sessionIdRaw.trim() || null;
+  const authToken = resolveAuthToken(cliOverrides.authToken, envAuth, config.authToken);
 
   return {
+    config,
     server,
     sessionId,
     authToken,
-    passthroughArgs,
+    workerPassthroughArgs: [...passthroughArgs],
   };
 }
 
-type ConnectWithRetryOptions = {
-  maxRetries?: number;
-  baseDelayMs?: number;
-  maxDelayMs?: number;
-  fetchFn?: typeof fetch;
-  sleepFn?: (ms: number) => Promise<void>;
+function splitArgv(args: string[]): { cliArgs: string[]; passthroughArgs: string[] } {
+  const idx = args.indexOf("--");
+  if (idx === -1) {
+    return { cliArgs: [...args], passthroughArgs: [] };
+  }
+  return {
+    cliArgs: args.slice(0, idx),
+    passthroughArgs: args.slice(idx + 1),
+  };
+}
+
+type CliOverrides = {
+  server?: string;
+  sessionId?: string;
+  authToken?: string;
 };
 
-export async function connectWithRetry(
-  server: string,
-  sessionId?: string,
-  {
-    maxRetries = Infinity,
-    baseDelayMs = 2_000,
-    maxDelayMs = 30_000,
-    fetchFn = fetch,
-    sleepFn = (ms: number) => Bun.sleep(ms),
-  }: ConnectWithRetryOptions = {},
-): Promise<string> {
-  if (!server || !server.trim()) {
-    throw new Error("connectWithRetry requires a server URL.");
-  }
-  const normalizedServer = server.trim().replace(/\/+$/, "");
-  const effectiveMaxRetries =
-    Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : Infinity;
-  const payloadSession = normalizeNullable(sessionId ?? undefined);
+function parseCliArgs(args: string[]): CliOverrides {
+  const overrides: CliOverrides = {};
+  let i = 0;
+  while (i < args.length) {
+    const token = args[i];
+    const eqIndex = token.indexOf("=");
+    const flag = eqIndex >= 0 ? token.slice(0, eqIndex) : token;
+    const inlineValue = eqIndex >= 0 ? token.slice(eqIndex + 1) : undefined;
 
-  let attempt = 0;
-  while (true) {
-    attempt += 1;
-    try {
-      const res = await fetchFn(`${normalizedServer}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payloadSession ? { sessionId: payloadSession } : {}),
-      });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    if (!flag.startsWith("--")) {
+      throw new Error(`Unexpected positional argument "${token}"`);
+    }
+
+    switch (flag) {
+      case "--server": {
+        const { value, consumed } = consumeValue(args, i, inlineValue, flag);
+        overrides.server = requireNonEmpty(value, flag);
+        i += consumed + 1;
+        break;
       }
-      const data = (await res.json()) as { sessionId?: string };
-      const received = normalizeNullable(data.sessionId ?? null);
-      if (!received) {
-        throw new Error("Server response did not include sessionId.");
+      case "--sessionId": {
+        const { value, consumed } = consumeValue(args, i, inlineValue, flag);
+        overrides.sessionId = requireNonEmpty(value, flag);
+        i += consumed + 1;
+        break;
       }
-      return received;
-    } catch (err: any) {
-      if (attempt >= effectiveMaxRetries) {
-        throw err;
+      case "--token":
+      case "--authToken": {
+        const { value, consumed } = consumeValue(args, i, inlineValue, flag);
+        overrides.authToken = requireNonEmpty(value, flag);
+        i += consumed + 1;
+        break;
       }
-      const delay = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-      console.log(
-        `[RemoteBuddy] Server unavailable (${err?.message ?? err}), retrying in ${(delay / 1000).toFixed(
-          1,
-        )} s... (attempt ${attempt})`,
-      );
-      await sleepFn(delay);
+      default:
+        throw new Error(`Unknown flag "${flag}"`);
     }
   }
+  return overrides;
 }
 
-function splitFlag(arg: string): { flag: string; inlineValue?: string } {
-  const eqIdx = arg.indexOf("=");
-  if (eqIdx === -1) return { flag: arg };
-  return {
-    flag: arg.slice(0, eqIdx),
-    inlineValue: arg.slice(eqIdx + 1),
-  };
+function consumeValue(
+  args: string[],
+  index: number,
+  inlineValue: string | undefined,
+  flag: string,
+): { value: string; consumed: number } {
+  if (inlineValue !== undefined) {
+    return { value: inlineValue, consumed: 0 };
+  }
+  const nextIndex = index + 1;
+  if (nextIndex >= args.length) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return { value: args[nextIndex], consumed: 1 };
 }
 
-function ensureHasValue(flag: string, value: string | undefined): void {
+function requireNonEmpty(value: string | undefined, flag: string): string {
   if (value === undefined) {
-    throw new Error(`Flag \"${flag}\" requires a value.`);
+    throw new Error(`${flag} requires a value`);
   }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`${flag} cannot be blank`);
+  }
+  return trimmed;
 }
 
-function normalizeNullable(raw: string | undefined | null): string | null {
-  if (raw === undefined || raw === null) return null;
-  const trimmed = `${raw}`.trim();
-  return trimmed.length > 0 ? trimmed : null;
+function readEnvString(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
-function requireNonBlank(flag: string, raw: string): string {
-  const normalized = normalizeNullable(raw);
-  if (!normalized) {
-    throw new Error(`Flag \"${flag}\" requires a non-empty value.`);
+function readEnvAuthToken(env: Record<string, string | undefined>): string | null | undefined {
+  if (env.PUSHPALS_AUTH_TOKEN !== undefined) {
+    const trimmed = env.PUSHPALS_AUTH_TOKEN.trim();
+    return trimmed ? trimmed : null;
   }
-  return normalized;
+  if (env.AUTH_TOKEN !== undefined) {
+    const trimmed = env.AUTH_TOKEN.trim();
+    return trimmed ? trimmed : null;
+  }
+  return undefined;
 }
 
-function firstNonEmpty(...values: Array<string | undefined | null>): string | null {
-  for (const value of values) {
-    const normalized = normalizeNullable(value);
-    if (normalized) return normalized;
+function resolveAuthToken(
+  cliValue: string | undefined,
+  envValue: string | null | undefined,
+  configValue: string | null,
+): string | null {
+  if (cliValue !== undefined) {
+    return cliValue;
   }
-  return null;
+  if (envValue !== undefined) {
+    return envValue;
+  }
+  const trimmed = (configValue ?? "").trim();
+  return trimmed || null;
 }

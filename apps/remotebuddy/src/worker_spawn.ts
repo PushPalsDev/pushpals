@@ -7,7 +7,7 @@ export type WorkerSpawnCommandOptions = {
   docker: boolean;
   requireDocker: boolean;
   dockerImage: string | null;
-  passthroughArgs?: readonly string[];
+  passthroughArgs?: string[];
 };
 
 export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): string[] {
