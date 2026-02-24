@@ -1,164 +1,199 @@
-export interface RemotebuddyRuntimeDefaults {
-  server?: string | null;
-  sessionId?: string | null;
-  authToken?: string | null;
-}
+import type { PushPalsConfig } from "shared";
 
-export interface RemotebuddyRuntimeLoaderInit {
-  argv?: string[];
-  env?: Record<string, string | undefined>;
-  defaults?: RemotebuddyRuntimeDefaults;
-}
+type EnvSource = Record<string, string | undefined>;
 
-export interface RemotebuddyRuntimeOptions {
+export type RemoteBuddyRuntimeOptions = {
   server: string;
   sessionId: string | null;
   authToken: string | null;
-  passthrough: string[];
-}
+  passthroughArgs: string[];
+};
 
-export class RemotebuddyRuntimeOptionsError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "RemotebuddyRuntimeOptionsError";
-  }
-}
+export type RemoteBuddyRuntimeLoaderConfig = {
+  server: { url: string };
+} & Pick<PushPalsConfig, "sessionId" | "authToken">;
 
-function sanitize(value: string | null | undefined): string {
-  return typeof value === "string" ? value.trim() : "";
-}
+export type LoadRemoteBuddyRuntimeOptionsParams = {
+  argv?: string[];
+  env?: EnvSource;
+  config: RemoteBuddyRuntimeLoaderConfig;
+};
 
-function coalesceServer(
-  defaults: RemotebuddyRuntimeDefaults | undefined,
-  env: Record<string, string | undefined>,
-): string {
-  const fromDefaults = sanitize(defaults?.server);
-  const fromEnv = sanitize(env.PUSHPALS_SERVER_URL);
-  const server = fromEnv || fromDefaults;
-  if (server) return server;
-  return "http://localhost:3001";
-}
+export function loadRemoteBuddyRuntimeOptions({
+  argv = process.argv.slice(2),
+  env = process.env,
+  config,
+}: LoadRemoteBuddyRuntimeOptionsParams): RemoteBuddyRuntimeOptions {
+  const args = [...argv];
+  let cliServer: string | null = null;
+  let cliSession: string | null = null;
+  let cliSessionProvided = false;
+  let cliToken: string | null = null;
+  let cliTokenProvided = false;
+  const passthroughArgs: string[] = [];
 
-function coalesceSessionId(
-  defaults: RemotebuddyRuntimeDefaults | undefined,
-  env: Record<string, string | undefined>,
-): string | null {
-  const fromDefaults = sanitize(defaults?.sessionId);
-  const fromEnv = sanitize(env.PUSHPALS_SESSION_ID);
-  const value = fromEnv || fromDefaults;
-  return value || null;
-}
-
-function coalesceAuthToken(
-  defaults: RemotebuddyRuntimeDefaults | undefined,
-  env: Record<string, string | undefined>,
-): string | null {
-  const fromDefaults = sanitize(defaults?.authToken);
-  const fromEnv = sanitize(env.PUSHPALS_AUTH_TOKEN);
-  const value = fromEnv || fromDefaults;
-  return value || null;
-}
-
-function requireValue(flag: string, value: string | undefined): string {
-  if (value === undefined) {
-    throw new RemotebuddyRuntimeOptionsError(`Missing value for ${flag}.`);
-  }
-  return value;
-}
-
-export function loadRemotebuddyRuntimeOptions(
-  init: RemotebuddyRuntimeLoaderInit = {},
-): RemotebuddyRuntimeOptions {
-  const argv = [...(init.argv ?? process.argv.slice(2))];
-  const env = init.env ?? process.env;
-  const defaults = init.defaults;
-
-  let server = coalesceServer(defaults, env);
-  let sessionId = coalesceSessionId(defaults, env);
-  let authToken = coalesceAuthToken(defaults, env);
-  const passthrough: string[] = [];
-
-  let index = 0;
-  while (index < argv.length) {
-    const arg = argv[index];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
     if (arg === "--") {
-      passthrough.push(...argv.slice(index + 1));
+      passthroughArgs.push(...args.slice(i + 1));
       break;
     }
-
-    if (!arg.startsWith("--")) {
-      throw new RemotebuddyRuntimeOptionsError(
-        `Unexpected positional argument "${arg}". RemoteBuddy only accepts --server, --sessionId, and --token.`,
+    if (!arg.startsWith("-")) {
+      throw new Error(
+        `Unexpected positional argument "${arg}". Use \"--\" to pass through additional args.`,
       );
     }
 
-    const eqIndex = arg.indexOf("=");
-    const flag = eqIndex === -1 ? arg : arg.slice(0, eqIndex);
-    let inlineValue = eqIndex === -1 ? undefined : arg.slice(eqIndex + 1);
-
+    const { flag, inlineValue } = splitFlag(arg);
     switch (flag) {
       case "--server": {
-        if (inlineValue === undefined) {
-          const next = argv[index + 1];
-          const nextInvalid = typeof next !== "string" || next.startsWith("--");
-          if (nextInvalid) {
-            inlineValue = undefined;
-          } else {
-            index += 1;
-            inlineValue = next;
-          }
-        }
-        const value = sanitize(requireValue("--server", inlineValue));
-        if (!value) {
-          throw new RemotebuddyRuntimeOptionsError("--server value cannot be blank.");
-        }
-        server = value;
+        const raw = inlineValue ?? args[++i];
+        ensureHasValue(flag, raw);
+        cliServer = requireNonBlank(flag, raw!);
         break;
       }
+      case "--session":
       case "--sessionId": {
-        if (inlineValue === undefined) {
-          const next = argv[index + 1];
-          const nextInvalid = typeof next !== "string" || next.startsWith("--");
-          if (nextInvalid) {
-            inlineValue = undefined;
-          } else {
-            index += 1;
-            inlineValue = next;
-          }
-        }
-        const raw = sanitize(requireValue("--sessionId", inlineValue));
-        sessionId = raw || null;
+        const raw = inlineValue ?? args[++i];
+        ensureHasValue(flag, raw);
+        cliSessionProvided = true;
+        cliSession = normalizeNullable(raw!);
         break;
       }
       case "--token": {
-        if (inlineValue === undefined) {
-          const next = argv[index + 1];
-          const nextInvalid = typeof next !== "string" || next.startsWith("--");
-          if (nextInvalid) {
-            inlineValue = undefined;
-          } else {
-            index += 1;
-            inlineValue = next;
-          }
-        }
-        const value = sanitize(requireValue("--token", inlineValue));
-        if (!value) {
-          throw new RemotebuddyRuntimeOptionsError(
-            "--token value cannot be blank; omit the flag to use the config/env token or run without auth.",
-          );
-        }
-        authToken = value;
+        const raw = inlineValue ?? args[++i];
+        ensureHasValue(flag, raw);
+        cliTokenProvided = true;
+        cliToken = requireNonBlank(flag, raw!);
         break;
       }
       default: {
-        throw new RemotebuddyRuntimeOptionsError(
-          `Unknown flag "${flag}". RemoteBuddy only accepts --server, --sessionId, and --token.`,
+        throw new Error(
+          `Unknown flag \"${flag}\". Valid flags: --server, --sessionId (--session), --token.`,
         );
       }
     }
-
-    index += 1;
   }
 
-  return { server, sessionId, authToken, passthrough };
+  const server =
+    cliServer ??
+    firstNonEmpty(env.PUSHPALS_SERVER_URL, env.PUSHPALS_URL) ??
+    normalizeNullable(config.server?.url);
+  if (!server) {
+    throw new Error(
+      "RemoteBuddy requires a server URL. Provide --server, set PUSHPALS_SERVER_URL/PUSHPALS_URL, or configure server.url.",
+    );
+  }
+
+  const sessionId = cliSessionProvided
+    ? cliSession
+    : firstNonEmpty(env.PUSHPALS_SESSION_ID, config.sessionId);
+
+  const authToken =
+    (cliTokenProvided ? cliToken : null) ??
+    firstNonEmpty(env.PUSHPALS_AUTH_TOKEN, env.AUTH_TOKEN, config.authToken ?? undefined);
+
+  return {
+    server,
+    sessionId,
+    authToken,
+    passthroughArgs,
+  };
+}
+
+type ConnectWithRetryOptions = {
+  maxRetries?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  fetchFn?: typeof fetch;
+  sleepFn?: (ms: number) => Promise<void>;
+};
+
+export async function connectWithRetry(
+  server: string,
+  sessionId?: string,
+  {
+    maxRetries = Infinity,
+    baseDelayMs = 2_000,
+    maxDelayMs = 30_000,
+    fetchFn = fetch,
+    sleepFn = (ms: number) => Bun.sleep(ms),
+  }: ConnectWithRetryOptions = {},
+): Promise<string> {
+  if (!server || !server.trim()) {
+    throw new Error("connectWithRetry requires a server URL.");
+  }
+  const normalizedServer = server.trim().replace(/\/+$/, "");
+  const effectiveMaxRetries =
+    Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : Infinity;
+  const payloadSession = normalizeNullable(sessionId ?? undefined);
+
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    try {
+      const res = await fetchFn(`${normalizedServer}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payloadSession ? { sessionId: payloadSession } : {}),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+      const data = (await res.json()) as { sessionId?: string };
+      const received = normalizeNullable(data.sessionId ?? null);
+      if (!received) {
+        throw new Error("Server response did not include sessionId.");
+      }
+      return received;
+    } catch (err: any) {
+      if (attempt >= effectiveMaxRetries) {
+        throw err;
+      }
+      const delay = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+      console.log(
+        `[RemoteBuddy] Server unavailable (${err?.message ?? err}), retrying in ${(delay / 1000).toFixed(
+          1,
+        )} s... (attempt ${attempt})`,
+      );
+      await sleepFn(delay);
+    }
+  }
+}
+
+function splitFlag(arg: string): { flag: string; inlineValue?: string } {
+  const eqIdx = arg.indexOf("=");
+  if (eqIdx === -1) return { flag: arg };
+  return {
+    flag: arg.slice(0, eqIdx),
+    inlineValue: arg.slice(eqIdx + 1),
+  };
+}
+
+function ensureHasValue(flag: string, value: string | undefined): void {
+  if (value === undefined) {
+    throw new Error(`Flag \"${flag}\" requires a value.`);
+  }
+}
+
+function normalizeNullable(raw: string | undefined | null): string | null {
+  if (raw === undefined || raw === null) return null;
+  const trimmed = `${raw}`.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function requireNonBlank(flag: string, raw: string): string {
+  const normalized = normalizeNullable(raw);
+  if (!normalized) {
+    throw new Error(`Flag \"${flag}\" requires a non-empty value.`);
+  }
+  return normalized;
+}
+
+function firstNonEmpty(...values: Array<string | undefined | null>): string | null {
+  for (const value of values) {
+    const normalized = normalizeNullable(value);
+    if (normalized) return normalized;
+  }
+  return null;
 }

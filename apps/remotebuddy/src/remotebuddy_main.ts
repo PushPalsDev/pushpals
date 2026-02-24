@@ -26,6 +26,7 @@ import { PersistentSessionMemory } from "./persistent_memory.js";
 import {
   CommunicationManager,
   detectRepoRoot,
+  loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
   matchesGlob,
   normalizeTargetPath,
@@ -45,14 +46,12 @@ import {
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
 import {
   connectWithRetry,
-  getRuntimeConfig,
-  resolveRuntimeOptions,
-  type RuntimeOptions,
-} from "./runtime.js";
+  loadRemoteBuddyRuntimeOptions,
+} from "./runtime_loader.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
-const CONFIG = getRuntimeConfig();
+const CONFIG = loadPushPalsConfig();
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
 
@@ -616,7 +615,6 @@ class RemoteBuddyOrchestrator {
   private readonly spawnWorkerPollMs: number | null;
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
-  private readonly spawnWorkerPassthroughArgs: readonly string[];
   private readonly statusHeartbeatMs: number;
   private readonly fetchFailureLogsOnJobFailure: boolean;
   private readonly executionBudgetInteractiveMs: number;
@@ -668,7 +666,6 @@ class RemoteBuddyOrchestrator {
     idempotency: IdempotencyStore;
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
-    workerPassthroughArgs?: readonly string[];
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
@@ -695,7 +692,6 @@ class RemoteBuddyOrchestrator {
         ? remoteCfg.workerpalHeartbeatMs
         : null;
     this.spawnWorkerLabels = remoteCfg.workerpalLabels;
-    this.spawnWorkerPassthroughArgs = [...(opts.workerPassthroughArgs ?? [])];
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
     this.fetchFailureLogsOnJobFailure = parseEnabledFlag(
       process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS,
@@ -1314,7 +1310,6 @@ class RemoteBuddyOrchestrator {
       docker: this.spawnWorkerDocker,
       requireDocker: this.spawnWorkerRequireDocker,
       dockerImage: this.spawnWorkerImage,
-      passthroughArgs: this.spawnWorkerPassthroughArgs,
     });
   }
 
@@ -1935,15 +1930,7 @@ class RemoteBuddyOrchestrator {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
-  let runtime: RuntimeOptions;
-  try {
-    runtime = resolveRuntimeOptions();
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[RemoteBuddy] ${message}`);
-    process.exit(1);
-    return;
-  }
+  const runtime = loadRemoteBuddyRuntimeOptions({ config: CONFIG });
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
   console.log(`[RemoteBuddy] Server: ${runtime.server}`);
@@ -1978,13 +1965,8 @@ async function main() {
   );
 
   let sessionId = runtime.sessionId;
-  console.log(
-    `[RemoteBuddy] Ensuring session "${sessionId ?? "(auto)"}" exists on server...`,
-  );
-  sessionId = await connectWithRetry({
-    server: runtime.server,
-    sessionId: sessionId ?? undefined,
-  });
+  console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
+  sessionId = await connectWithRetry(runtime.server, sessionId ?? undefined);
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
   const llmCfg = CONFIG.remotebuddy.llm;
@@ -2007,7 +1989,6 @@ async function main() {
     idempotency,
     persistentMemory,
     jobsDbPath: sharedDbPath,
-    workerPassthroughArgs: runtime.passthroughArgs,
   });
 
   await orchestrator.emitStartupStatus();
