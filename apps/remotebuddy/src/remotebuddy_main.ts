@@ -612,7 +612,7 @@ class RemoteBuddyOrchestrator {
   private readonly spawnWorkerPollMs: number | null;
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
-  private readonly spawnWorkerPassthroughArgs: string[];
+  private readonly workerPassthroughArgs: string[];
   private readonly statusHeartbeatMs: number;
   private readonly fetchFailureLogsOnJobFailure: boolean;
   private readonly executionBudgetInteractiveMs: number;
@@ -664,7 +664,7 @@ class RemoteBuddyOrchestrator {
     idempotency: IdempotencyStore;
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
-    spawnWorkerPassthroughArgs?: string[];
+    workerPassthroughArgs?: string[];
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
@@ -691,7 +691,7 @@ class RemoteBuddyOrchestrator {
         ? remoteCfg.workerpalHeartbeatMs
         : null;
     this.spawnWorkerLabels = remoteCfg.workerpalLabels;
-    this.spawnWorkerPassthroughArgs = [...(opts.spawnWorkerPassthroughArgs ?? [])];
+    this.workerPassthroughArgs = (opts.workerPassthroughArgs ?? []).slice();
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
     this.fetchFailureLogsOnJobFailure = parseEnabledFlag(
       process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS,
@@ -1310,7 +1310,7 @@ class RemoteBuddyOrchestrator {
       docker: this.spawnWorkerDocker,
       requireDocker: this.spawnWorkerRequireDocker,
       dockerImage: this.spawnWorkerImage,
-      passthroughArgs: this.spawnWorkerPassthroughArgs,
+      passthroughArgs: this.workerPassthroughArgs,
     });
   }
 
@@ -1928,13 +1928,22 @@ class RemoteBuddyOrchestrator {
   }
 }
 
+// ─── Bootstrap: connect with retry ──────────────────────────────────────────
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
-  const runtime = parseRuntimeOptions({ config: CONFIG });
+  const opts = parseRuntimeOptions({
+    argv: process.argv.slice(2),
+    defaults: {
+      serverUrl: CONFIG.server.url,
+      sessionId: CONFIG.sessionId,
+      authToken: CONFIG.authToken,
+    },
+  });
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
-  console.log(`[RemoteBuddy] Server: ${runtime.server}`);
+  console.log(`[RemoteBuddy] Server: ${opts.server}`);
   if (CONFIG.startup.logConfigOnStart) {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
@@ -1965,9 +1974,11 @@ async function main() {
     }`,
   );
 
-  let sessionId = runtime.sessionId;
-  console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
-  sessionId = await connectWithRetry(runtime.server, sessionId ?? undefined);
+  const requestedSessionId = opts.sessionId;
+  console.log(
+    `[RemoteBuddy] Ensuring session "${requestedSessionId ?? "(auto)"}" exists on server...`,
+  );
+  const sessionId = await connectWithRetry(opts.server, requestedSessionId ?? undefined);
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
   const llmCfg = CONFIG.remotebuddy.llm;
@@ -1982,15 +1993,15 @@ async function main() {
   brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
-    server: runtime.server,
+    server: opts.server,
     sessionId,
-    authToken: runtime.authToken,
+    authToken: opts.authToken,
     brain,
     llm,
     idempotency,
     persistentMemory,
     jobsDbPath: sharedDbPath,
-    spawnWorkerPassthroughArgs: runtime.passthroughArgs,
+    workerPassthroughArgs: opts.workerPassthroughArgs,
   });
 
   await orchestrator.emitStartupStatus();

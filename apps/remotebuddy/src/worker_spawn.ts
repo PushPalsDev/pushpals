@@ -40,9 +40,8 @@ export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): str
       args.push("--docker-image", options.dockerImage);
     }
   }
-  const passthrough = (options.passthroughArgs ?? []).filter((arg) => arg.length > 0);
-  if (passthrough.length > 0) {
-    args.push("--", ...passthrough);
+  if (options.passthroughArgs && options.passthroughArgs.length > 0) {
+    args.push(...options.passthroughArgs);
   }
   return args;
 }
