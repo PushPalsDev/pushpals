@@ -21,59 +21,100 @@ RemoteBuddy --POST /jobs/enqueue--> Server Job Queue <--POST /jobs/claim-- Worke
 RemoteBuddy -> CommunicationManager -> UI + LocalBuddy status responders
 ```
 
-## Prerequisites & Cross-Platform Install Commands
+## Architecture Overview (On-Call Crash Course)
 
-RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Install these before running the service.
+RemoteBuddy runs as the single Bun process in `apps/remotebuddy/src/remotebuddy_main.ts`. It polls the server queue, plans via an LLM-backed `AgentBrain`, and either replies inline or ships structured `task.execute` work to WorkerPals while streaming events through `CommunicationManager`. Keep the following mental model in mind when debugging:
 
-1. **Bun 1.x**
-   - macOS (zsh/bash):
-     ```bash
-     curl -fsSL https://bun.sh/install | bash
-     ```
-   - Linux (bash):
-     ```bash
-     curl -fsSL https://bun.sh/install | bash
-     ```
-   - Windows PowerShell (native):
-     ```powershell
-     irm https://bun.sh/install.ps1 | iex
-     ```
-2. **Install workspace dependencies (prevents `ENOENT ... node_modules/shared`)**
-   - macOS/Linux:
-     ```bash
-     cd /path/to/pushpals
-     bun install
-     ```
-   - Windows PowerShell:
-     ```powershell
-     Set-Location C:\path\to\pushpals
-     bun install
-     ```
-3. **Seed local config**
-   - macOS/Linux:
-     ```bash
-     cp .env.example .env
-     cp config/local.example.toml config/local.toml
-     ```
-   - Windows PowerShell:
-     ```powershell
-     Copy-Item .env.example .env
-     Copy-Item config\local.example.toml config\local.toml
-     ```
-4. **`jq` for status checks (`curl ... | jq`)**
-   - macOS:
-     ```bash
-     brew install jq
-     ```
-   - Debian/Ubuntu:
-     ```bash
-     sudo apt-get update && sudo apt-get install -y jq
-     ```
-   - Windows PowerShell:
-     ```powershell
-     winget install --id jqlang.jq --source winget
-     # or: choco install jq
-     ```
+```text
+POST /requests/claim
+        │
+        ▼
+IdempotencyStore (SQLite remotebuddy-state.db) ──► AgentBrain + SessionMemory
+        │                                               │
+        │                            assistant_message / task_* events via CommunicationManager
+        │                                               ▼
+        └──────► Planner output + path/command policy ──► POST /jobs/enqueue → WorkerPals
+                                            ▲
+                                            │
+                                   RemoteBuddyAutonomousEngine (queue health + remediation)
+```
+
+### Core subsystems
+
+- **Request poller & idempotency** – `RemoteBuddyOrchestrator` hits `POST /requests/claim` every ~2 s, then de-dupes messages through `IdempotencyStore` so crashes/retries do not replay finished prompts. The store, together with cursors, lives in `remotebuddy-state.db` inside the repo root; back it up (or delete intentionally) if the file becomes corrupted.
+- **Planner, memory & heuristics** – `AgentBrain` (LLM) and `LLMClient` evaluate prompts, hydrate `SessionMemory`/`PersistentSessionMemory`, and call `path_targeting` plus `command_policy` helpers to normalize scope, target paths, validation, and execution guidance before anything is handed to WorkerPals. This is where most “why did it plan that?” questions originate.
+- **Task/worker coordination** – The orchestrator emits `assistant_message`, `task_*`, and completion payloads via `CommunicationManager`, then enqueues WorkerPal jobs with `POST /jobs/enqueue`. If extra capacity is required, `worker_spawn.ts` can build the exact `bun run apps/workerpals` command RemoteBuddy launches automatically to keep ≥`maxWorkers` idle.
+- **Autonomy + queue automation** – `RemoteBuddyAutonomousEngine` consumes signals such as `sig_queue_health`, retry streaks, and regret telemetry. It can enqueue synthetic remediation tasks labeled `origin=autonomy`, each pre-populated with `write_globs`/`target_paths`. Operators should only edit those scopes when they’ve proved the automation was wrong.
+- **Observability & recovery** – `CommunicationManager.subscribeSessionEvents` keeps a WebSocket open for `job_failed`/`job_completed` envelopes so RemoteBuddy can annotate memory and immediately inform users. Long-running hosts should use `bun --cwd apps/remotebuddy run start` (which runs `remotebuddy_supervisor.ts`) so the agent auto-restarts on crashes while reusing the same `remotebuddy-state.db`.
+
+For deeper internals, inspect `apps/remotebuddy/src/*.ts` alongside `packages/shared`, but this overview should be enough for on-call triage.
+
+## Quick Start Workflow
+
+Use this high-level flow while bringing a new machine online:
+
+1. Complete the steps in the [Setup Checklist](#setup-checklist) so Bun, dependencies, configs, and helper tools exist locally.
+2. Acquire a bearer token (or confirm auth is disabled) using the [Token Setup and Verification](#token-setup-and-verification) steps.
+3. Start the supporting services you need (typically `bun run server:only`, optionally LocalBuddy/WorkerPals) before launching RemoteBuddy.
+4. Run `bun run remotebuddy` from the repo root for the recommended entry point, or pick another command from [Usage Commands](#usage-commands) when you need a specific mode.
+5. Validate the round trip with the [Runtime Smoke Test](#runtime-smoke-test) so you catch queue, auth, or worker issues before handling real traffic.
+
+## Setup Checklist
+
+RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Work through the steps below in order; each step calls out the platform-specific commands you can reuse later.
+
+### Step 1: Install Bun 1.x
+
+- macOS/Linux (bash/zsh):
+  ```bash
+  curl -fsSL https://bun.sh/install | bash
+  ```
+- Windows PowerShell (native):
+  ```powershell
+  irm https://bun.sh/install.ps1 | iex
+  ```
+
+### Step 2: Install workspace dependencies
+
+- macOS/Linux:
+  ```bash
+  cd /path/to/pushpals
+  bun install
+  ```
+- Windows PowerShell:
+  ```powershell
+  Set-Location C:\path\to\pushpals
+  bun install
+  ```
+
+### Step 3: Seed local config files
+
+- macOS/Linux:
+  ```bash
+  cp .env.example .env
+  cp config/local.example.toml config/local.toml
+  ```
+- Windows PowerShell:
+  ```powershell
+  Copy-Item .env.example .env
+  Copy-Item config\local.example.toml config\local.toml
+  ```
+
+### Step 4: Install `jq` for status checks (`curl ... | jq`)
+
+- macOS:
+  ```bash
+  brew install jq
+  ```
+- Debian/Ubuntu:
+  ```bash
+  sudo apt-get update && sudo apt-get install -y jq
+  ```
+- Windows PowerShell:
+  ```powershell
+  winget install --id jqlang.jq --source winget
+  # or: choco install jq
+  ```
 
 ## Runtime Role Reference
 
@@ -125,9 +166,19 @@ RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Install these before 
 3. **Infrastructure/SRE tertiary:** escalate to infra on-call when degradation roots in shared services (LLM vendor, git, registry) or when queue automation repeatedly re-enqueues the same remediation instruction after operators intervene.
 4. Keep a rolling incident log (timestamp, metric snapshot, corrective action) and attach it to the follow-up RCA if paging was required.
 
-## Commands & Working Directories
+## On-Call Deployment Flow (Summary)
 
-### Repo-root scripts (validated against `package.json`)
+Use this path any time you need to redeploy RemoteBuddy because of a regression, host reboot, or planned change. The goal is to minimize queue downtime while keeping provenance crystal clear.
+
+1. **Stabilize & communicate** – Post intent in `#pushpals-ops`, capture the latest `/system/status` snapshot, and pause new background/eval submissions if queue guardrails are already amber/red. Confirm another operator is watching WorkerPals capacity before you bounce RemoteBuddy.
+2. **Sync repo + dependencies** – On the target host run `git fetch origin && git checkout <target-commit> && git pull --ff-only`. Compare `bun.lock`/`package.json`; if they changed, run `bun install`. Double-check `.env` and `config/local.toml` still have the right `PUSHPALS_*` entries.
+3. **Build protocol + start the process** – Prefer the repo-root script `bun run remotebuddy` (executes `protocol:build` first, then `remotebuddy:only`). When protocols are already current, `bun run remotebuddy:only` or `bun --cwd apps/remotebuddy run start` (enables `remotebuddy_supervisor.ts` restarts) keeps downtime minimal. Keep the existing terminal or tmux pane open so you can tail logs live.
+4. **Validate the new instance** – Wait for `[RemoteBuddy] Starting polling loop…` followed by at least one `claim payload` log. Immediately hit `curl -sS $SERVER/system/status | jq '{queues: .queues.requests, jobs: .jobPendingSnapshot}'` and `curl -sS "$SERVER/requests?status=claimed&limit=5"`. Optionally run the smoke test in the section below (`bun run smoke`) or enqueue a single interactive request to prove round-trip health. Confirm `queue_p95`, worker idle counts, and the CommunicationManager WebSocket reconnect cleanly.
+5. **Observe, rollback if needed** – Watch logs for 5–10 minutes. If failures persist, stop the process, `git checkout <last-known-good>`, rerun step 3, and move `remotebuddy-state.db` aside only when it is clearly corrupted (RemoteBuddy will recreate it, but previously-handled events may replay once). Document the outcome and handoff time in `#pushpals-ops`.
+
+## Usage Commands
+
+### Repo Root Scripts (validated against `package.json`)
 
 | Use case | Run from repo root | Script body | Working directory during execution |
 | --- | --- | --- | --- |
@@ -137,14 +188,14 @@ RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Install these before 
 
 > Tip: Keep `bun run server:only` running in another terminal so the claim/complete round-trip works.
 
-### App-local scripts (`cd apps/remotebuddy` first)
+### App-Local Scripts (`cd apps/remotebuddy` first)
 
 | Command | Working directory | Description |
 | --- | --- | --- |
 | `bun run start` | `apps/remotebuddy` | Runs `src/remotebuddy_main.ts` once (root `remotebuddy:only` delegates here). |
 | `bun run dev` | `apps/remotebuddy` | `bun --watch --no-clear-screen src/remotebuddy_main.ts` for rapid iteration. |
 
-### Direct CLI invocation
+### Direct CLI Invocation
 
 ```bash
 cd apps/remotebuddy
@@ -154,18 +205,12 @@ bun run src/remotebuddy_main.ts \
   --token ${PUSHPALS_AUTH_TOKEN:-<optional>}
 ```
 
-- Runtime precedence is `CLI flag > env vars (PUSHPALS_SERVER_URL/PUSHPALS_URL, PUSHPALS_SESSION_ID, PUSHPALS_AUTH_TOKEN/AUTH_TOKEN) > config defaults`.
-- `--sessionId ""` (or `PUSHPALS_SESSION_ID=""`) requests a brand-new session; blank CLI tokens are rejected (`--token` must be omitted to run without auth).
-- Setting `PUSHPALS_AUTH_TOKEN=""` or `AUTH_TOKEN=""` clears a previously configured token (useful when falling back to unauthenticated local stacks).
-- Use `--token <value>` for auth (the legacy `--authToken` alias is still accepted for backward compatibility).
-- `--server` must receive a non-empty value. Any unexpected positional argument before `--` throws (`bun run ... -- --foo` preserves downstream args).
-- Arguments after `--` are preserved for downstream tooling; RemoteBuddy logs them but leaves interpretation to the consumer.
-- Env/CLI values are trimmed before parsing so stray whitespace does not affect detection.
-- When no CLI flag or env var supplies a token, RemoteBuddy runs without auth headers (only acceptable for unsecured local stacks).
+- `--server`, `--sessionId`, and `--token` override values loaded from `config/*.toml` + `.env`.
+- When `--token` is omitted, the process uses `PUSHPALS_AUTH_TOKEN` (if set) or runs without auth headers.
 
-## Token Acquisition & Verification Flow
+## Token Setup and Verification
 
-RemoteBuddy and Server share the same bearer token (`PUSHPALS_AUTH_TOKEN`). The token gates every `requests/*` and `jobs/*` endpoint once configured.
+RemoteBuddy and Server share the same bearer token (`PUSHPALS_AUTH_TOKEN`). The steps below cover creating that token, validating auth, and falling back to tokenless mode when needed.
 
 1. **Generate/store the token**
    - macOS/Linux:
@@ -220,9 +265,9 @@ RemoteBuddy and Server share the same bearer token (`PUSHPALS_AUTH_TOKEN`). The 
    - Server log view: `[POST] /requests/claim 401` paired with `auth=invalid-token` metadata.
    - Fix by aligning RemoteBuddy’s `--token` flag or `PUSHPALS_AUTH_TOKEN` env var with the Server token and restarting both processes.
 
-## Runtime Smoke-Test Checklist (beyond lint)
+## Runtime Smoke Test
 
-> All curl/PowerShell examples assume a tokenized server; omit the header if you are running open access.
+Run this checklist after `bun run lint` passes so you confirm queue + auth paths before touching user requests. All curl/PowerShell examples assume a tokenized server; omit the header if you are running open access.
 
 1. **Enqueue a synthetic request**
    - Bash/zsh:
