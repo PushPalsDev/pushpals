@@ -425,10 +425,8 @@ function createStyles(palette: TracePalette, theme?: TasksJobsLogsTheme) {
       paddingBottom: 2,
     },
     identifierRow: {
-      flexDirection: "row",
-      flexWrap: "wrap",
-      gap: 6,
-      alignItems: "center",
+      flexDirection: "column",
+      alignItems: "flex-start",
     },
     identifierText: {
       fontSize: 11,

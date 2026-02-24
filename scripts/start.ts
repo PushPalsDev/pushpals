@@ -67,6 +67,57 @@ const REQUIRED_DEPENDENCY_PROBES: Array<{
     moduleSpecifier: "expo/package.json",
     retryWithHoisted: true,
   },
+  {
+    label: "Server protocol workspace package",
+    fromDir: resolve(repoRoot, "apps", "server"),
+    moduleSpecifier: "protocol",
+    retryWithHoisted: true,
+  },
+  {
+    label: "LocalBuddy shared workspace package",
+    fromDir: resolve(repoRoot, "apps", "localbuddy"),
+    moduleSpecifier: "shared",
+    retryWithHoisted: true,
+  },
+  {
+    label: "RemoteBuddy shared workspace package",
+    fromDir: resolve(repoRoot, "apps", "remotebuddy"),
+    moduleSpecifier: "shared",
+    retryWithHoisted: true,
+  },
+  {
+    label: "WorkerPals shared workspace package",
+    fromDir: resolve(repoRoot, "apps", "workerpals"),
+    moduleSpecifier: "shared",
+    retryWithHoisted: true,
+  },
+  {
+    label: "SourceControlManager protocol workspace package",
+    fromDir: resolve(repoRoot, "apps", "source_control_manager"),
+    moduleSpecifier: "protocol",
+    retryWithHoisted: true,
+  },
+  {
+    label: "packages/shared protocol workspace package",
+    fromDir: resolve(repoRoot, "packages", "shared"),
+    moduleSpecifier: "protocol",
+    retryWithHoisted: true,
+  },
+];
+
+const ROOT_WORKSPACE_LINK_HEALTH_CHECKS: Array<{ path: string; label: string }> = [
+  {
+    path: resolve(repoRoot, "node_modules", "shared"),
+    label: "node_modules/shared workspace link",
+  },
+  {
+    path: resolve(repoRoot, "node_modules", "protocol"),
+    label: "node_modules/protocol workspace link",
+  },
+  {
+    path: resolve(repoRoot, "node_modules", "client"),
+    label: "node_modules/client workspace link",
+  },
 ];
 const WORKSPACE_NODE_MODULES_HEALTH_CHECKS: Array<{
   nodeModulesPath: string;
@@ -413,6 +464,21 @@ function brokenWorkspaceNodeModules(): Array<{
   });
 }
 
+function inspectRootWorkspaceLinks(): Array<{ path: string; label: string; probeError: string }> {
+  return ROOT_WORKSPACE_LINK_HEALTH_CHECKS.flatMap((entry) => {
+    if (!existsSync(entry.path)) {
+      return [{ path: entry.path, label: entry.label, probeError: "ENOENT" }];
+    }
+    try {
+      lstatSync(entry.path);
+      return [];
+    } catch (err: any) {
+      const code = typeof err?.code === "string" ? err.code : "";
+      return [{ path: entry.path, label: entry.label, probeError: code || String(err) }];
+    }
+  });
+}
+
 function currentBunBinary(): string {
   const execPath = (process.execPath ?? "").trim();
   if (!execPath) return "bun";
@@ -423,8 +489,36 @@ function currentBunBinary(): string {
 
 async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
   const brokenWorkspaceModules = brokenWorkspaceNodeModules();
+  const rootWorkspaceLinkIssues = inspectRootWorkspaceLinks();
   const missing = missingDependencySentinels();
-  if (missing.length === 0 && brokenWorkspaceModules.length === 0) return;
+  if (
+    missing.length === 0 &&
+    brokenWorkspaceModules.length === 0 &&
+    rootWorkspaceLinkIssues.length === 0
+  ) {
+    return;
+  }
+
+  if (rootWorkspaceLinkIssues.length > 0) {
+    console.warn(
+      "[start] Dependency preflight detected broken/inaccessible root workspace links (often caused by cross-OS installs):",
+    );
+    for (const entry of rootWorkspaceLinkIssues) {
+      const relPath = relative(repoRoot, entry.path).replace(/\\/g, "/");
+      console.warn(
+        `[start] - ${entry.label} (error=${entry.probeError}); removing ${relPath} for clean reinstall`,
+      );
+      if (!existsSync(entry.path)) continue;
+      try {
+        rmSync(entry.path, { recursive: true, force: true });
+      } catch (err) {
+        console.error(
+          `[start] Failed to remove broken root workspace link ${relPath}: ${String(err)}`,
+        );
+        abortStart(1);
+      }
+    }
+  }
 
   if (brokenWorkspaceModules.length > 0) {
     console.warn("[start] Dependency preflight detected stale workspace node_modules links:");
@@ -454,12 +548,11 @@ async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
       );
     }
   }
-  const installArgs =
-    brokenWorkspaceModules.length > 0
-      ? [currentBunBinary(), "install", "--force"]
-      : [currentBunBinary(), "install"];
-  const installDisplay =
-    brokenWorkspaceModules.length > 0 ? "`bun install --force`" : "`bun install`";
+  const forceInstall = brokenWorkspaceModules.length > 0 || rootWorkspaceLinkIssues.length > 0;
+  const installArgs = forceInstall
+    ? [currentBunBinary(), "install", "--force"]
+    : [currentBunBinary(), "install"];
+  const installDisplay = forceInstall ? "`bun install --force`" : "`bun install`";
   console.log(`[start] Running ${installDisplay} to restore workspace dependencies...`);
 
   const installExitCode = await runInherited(installArgs, repoRoot);
@@ -470,6 +563,7 @@ async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
 
   let missingAfterInstall = missingDependencySentinels();
   let brokenAfterInstall = brokenWorkspaceNodeModules();
+  let rootWorkspaceLinkIssuesAfterInstall = inspectRootWorkspaceLinks();
   if (missingAfterInstall.length > 0 && shouldRetryInstallWithHoistedLinker(missingAfterInstall)) {
     console.warn(
       "[start] Dependency preflight still missing root artifacts after install; retrying with `bun install --linker hoisted --force`...",
@@ -484,11 +578,20 @@ async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
     }
     missingAfterInstall = missingDependencySentinels();
     brokenAfterInstall = brokenWorkspaceNodeModules();
-    if (missingAfterInstall.length === 0 && brokenAfterInstall.length === 0) {
+    rootWorkspaceLinkIssuesAfterInstall = inspectRootWorkspaceLinks();
+    if (
+      missingAfterInstall.length === 0 &&
+      brokenAfterInstall.length === 0 &&
+      rootWorkspaceLinkIssuesAfterInstall.length === 0
+    ) {
       console.log("[start] Dependency preflight recovered after hoisted-linker install.");
     }
   }
-  if (missingAfterInstall.length > 0 || brokenAfterInstall.length > 0) {
+  if (
+    missingAfterInstall.length > 0 ||
+    brokenAfterInstall.length > 0 ||
+    rootWorkspaceLinkIssuesAfterInstall.length > 0
+  ) {
     console.error("[start] Dependency preflight still failing after install:");
     for (const entry of missingAfterInstall) {
       const relResolveFrom = relative(repoRoot, entry.fromDir).replace(/\\/g, "/");
@@ -501,6 +604,12 @@ async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
       const relResolveFrom = relative(repoRoot, entry.resolveFromDir).replace(/\\/g, "/");
       console.error(
         `[start] - ${entry.label}: cannot resolve ${entry.moduleLabel} (${entry.moduleSpecifier} from ${relResolveFrom}, error=${entry.probeError}) in ${relPath}`,
+      );
+    }
+    for (const entry of rootWorkspaceLinkIssuesAfterInstall) {
+      const relPath = relative(repoRoot, entry.path).replace(/\\/g, "/");
+      console.error(
+        `[start] - ${entry.label}: path ${relPath} remains inaccessible after reinstall (error=${entry.probeError})`,
       );
     }
     abortStart(1);
