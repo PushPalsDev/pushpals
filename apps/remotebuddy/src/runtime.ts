@@ -1,108 +1,90 @@
-export type RuntimeDefaults = {
-  serverUrl: string;
-  sessionId: string | null;
-  authToken: string | null;
-};
+import { loadPushPalsConfig, type PushPalsConfig } from "shared";
 
-export type RuntimeOptions = {
+export interface RuntimeOptions {
   server: string;
   sessionId: string | null;
   authToken: string | null;
   passthroughArgs: string[];
-};
+}
 
-export type LoadRuntimeOptionsArgs = {
-  defaults: RuntimeDefaults;
+export interface ResolveRuntimeOptionsParams {
   argv?: string[];
-  env?: Record<string, string | undefined>;
-};
+  config?: PushPalsConfig;
+}
 
-type FetchFn = typeof fetch;
-
-export type ConnectWithRetryOptions = {
+export interface ConnectWithRetryOptions {
   server: string;
   sessionId?: string | null;
-  maxAttempts?: number;
+  maxRetries?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
-  fetchFn?: FetchFn;
-  sleepFn?: (ms: number) => Promise<void>;
+  fetchImpl?: typeof fetch;
+  sleepImpl?: (ms: number) => Promise<void>;
   logger?: (message: string) => void;
-};
+}
 
-const SERVER_ENV_KEYS = ["PUSHPALS_SERVER_URL", "PUSHPALS_URL"];
-const SESSION_ENV_KEYS = ["PUSHPALS_SESSION_ID"];
-const TOKEN_ENV_KEYS = ["PUSHPALS_AUTH_TOKEN", "AUTH_TOKEN"];
+const RUNTIME_CONFIG = loadPushPalsConfig();
+const DEFAULT_BASE_DELAY_MS = 2_000;
+const DEFAULT_MAX_DELAY_MS = 30_000;
 
-export function loadRuntimeOptions(args: LoadRuntimeOptionsArgs): RuntimeOptions {
-  const env = args.env ?? process.env;
-  const argv = args.argv ?? process.argv.slice(2);
+export function getRuntimeConfig(): PushPalsConfig {
+  return RUNTIME_CONFIG;
+}
 
-  let server = sanitizeServer(args.defaults.serverUrl);
-  let sessionId = sanitizeSession(args.defaults.sessionId);
-  let authToken = sanitizeToken(args.defaults.authToken);
+export function resolveRuntimeOptions(
+  params: ResolveRuntimeOptionsParams = {},
+): RuntimeOptions {
+  const config = params.config ?? RUNTIME_CONFIG;
+  const argv = params.argv ?? process.argv.slice(2);
 
-  const envServer = readEnvValue(SERVER_ENV_KEYS, env);
-  if (envServer !== undefined) {
-    const normalized = sanitizeServer(envServer);
-    if (normalized) server = normalized;
-  }
-
-  const envSession = readEnvValue(SESSION_ENV_KEYS, env);
-  if (envSession !== undefined) {
-    sessionId = sanitizeSession(envSession);
-  }
-
-  const envToken = readEnvValue(TOKEN_ENV_KEYS, env);
-  if (envToken !== undefined) {
-    authToken = sanitizeToken(envToken);
-  }
-
+  let serverOverride: string | undefined;
+  let sessionOverride: string | null | undefined;
+  let authOverride: string | null | undefined;
   const passthroughArgs: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    const rawArg = argv[i];
-    if (rawArg === "--") {
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--") {
       passthroughArgs.push(...argv.slice(i + 1));
       break;
     }
-    if (!rawArg.startsWith("--")) {
-      throw new Error(
-        `Unexpected positional argument "${rawArg}". Use -- to pass through extra arguments.`,
-      );
+    if (!arg.startsWith("--")) {
+      throw new Error(`Unexpected positional argument "${arg}". Provide RemoteBuddy flags before "--".`);
     }
-    const { flag, value, nextIndex } = parseFlag(rawArg, argv, i);
-    i = nextIndex;
-    const trimmed = value.trim();
-    switch (flag) {
+    switch (arg) {
       case "--server": {
+        const value = expectValue(argv, i, arg);
+        i += 1;
+        const trimmed = value.trim();
         if (!trimmed) {
-          throw new Error("--server requires a non-empty value.");
+          throw new Error("--server requires a non-empty URL.");
         }
-        server = trimmed;
+        serverOverride = trimmed;
         break;
       }
       case "--sessionId": {
-        sessionId = trimmed ? trimmed : null;
+        const value = expectValue(argv, i, arg);
+        i += 1;
+        sessionOverride = normalizeOptional(value);
         break;
       }
       case "--token":
       case "--authToken": {
-        if (!trimmed) {
-          throw new Error("--token cannot be blank. Remove the flag to omit auth.");
-        }
-        authToken = trimmed;
+        const value = expectValue(argv, i, arg);
+        i += 1;
+        authOverride = normalizeOptional(value);
         break;
       }
       default:
-        throw new Error(`Unknown flag: ${flag}`);
+        throw new Error(`Unknown RemoteBuddy flag "${arg}".`);
     }
   }
 
-  if (!server) {
-    throw new Error(
-      "RemoteBuddy server URL is required. Configure config.server.url, PUSHPALS_SERVER_URL, or --server.",
-    );
-  }
+  const server = normalizeServer(serverOverride ?? config.server.url);
+  const sessionId =
+    sessionOverride !== undefined ? sessionOverride : normalizeOptional(config.sessionId);
+  const authToken =
+    authOverride !== undefined ? authOverride : normalizeOptional(config.authToken);
 
   return {
     server,
@@ -112,133 +94,81 @@ export function loadRuntimeOptions(args: LoadRuntimeOptionsArgs): RuntimeOptions
   };
 }
 
-export async function connectWithRetry(options: ConnectWithRetryOptions): Promise<string> {
-  const server = sanitizeServer(options.server);
-  if (!server) {
-    throw new Error("Server URL is required for connectWithRetry().");
-  }
-  const sessionId = sanitizeSession(options.sessionId);
-  const maxAttempts = options.maxAttempts ?? Infinity;
-  const baseDelayMs = clampPositive(options.baseDelayMs, 2000);
-  const maxDelayMs = clampPositive(options.maxDelayMs, 30000);
-  const fetchImpl = options.fetchFn ?? globalThis.fetch;
-  if (typeof fetchImpl !== "function") {
-    throw new Error("Global fetch is unavailable. Provide a fetchFn implementation.");
-  }
-  const sleep = options.sleepFn ?? defaultSleep;
-  const log = options.logger ?? defaultLogger;
+export async function connectWithRetry(
+  options: ConnectWithRetryOptions,
+): Promise<string> {
+  const {
+    server,
+    sessionId,
+    maxRetries = Infinity,
+    baseDelayMs = DEFAULT_BASE_DELAY_MS,
+    maxDelayMs = DEFAULT_MAX_DELAY_MS,
+    fetchImpl = fetch,
+    sleepImpl = (ms: number) => Bun.sleep(ms),
+    logger = (message: string) => console.log(message),
+  } = options;
 
+  const normalizedServer = normalizeServer(server);
+  const sessionPayload = normalizeOptional(sessionId);
+  const maxAttempts = Number.isFinite(maxRetries)
+    ? Math.max(1, Math.floor(maxRetries))
+    : Infinity;
   let attempt = 0;
-  const endpoint = buildSessionsEndpoint(server);
-  while (true) {
+  let lastError: Error | null = null;
+
+  while (attempt < maxAttempts) {
     attempt += 1;
     try {
-      const res = await fetchImpl(endpoint, {
+      const res = await fetchImpl(`${normalizedServer}/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(sessionId ? { sessionId } : {}),
+        body: JSON.stringify(sessionPayload ? { sessionId: sessionPayload } : {}),
       });
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status} ${res.statusText}`.trim());
+        throw new Error(`HTTP ${res.status} ${res.statusText || ""}`.trim());
       }
-      const data = (await res.json()) as unknown;
-      const remoteSessionId = extractSessionId(data);
-      if (remoteSessionId) {
-        return remoteSessionId;
+      const data = (await res.json()) as { sessionId?: string };
+      const resolvedSession = normalizeOptional(data.sessionId);
+      if (!resolvedSession) {
+        throw new Error("Server response did not include a sessionId.");
       }
-      throw new Error("Server response missing sessionId.");
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (attempt >= maxAttempts) {
-        throw err instanceof Error ? err : new Error(message);
-      }
+      return resolvedSession;
+    } catch (error: unknown) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (attempt >= maxAttempts) break;
       const delay = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-      if (log) {
-        log(
-          `[RemoteBuddy] Server unavailable (${message}), retrying in ${(delay / 1000).toFixed(1)} s... (attempt ${attempt})`,
-        );
-      }
-      await sleep(delay);
+      logger(
+        `[RemoteBuddy] Server unavailable (${lastError.message}), retrying in ${(delay / 1000).toFixed(1)} s... (attempt ${attempt})`,
+      );
+      await sleepImpl(delay);
     }
   }
+
+  throw lastError ?? new Error("Failed to connect to RemoteBuddy server.");
 }
 
-function parseFlag(arg: string, argv: string[], index: number): {
-  flag: string;
-  value: string;
-  nextIndex: number;
-} {
-  const eqIndex = arg.indexOf("=");
-  if (eqIndex >= 0) {
-    const flag = arg.slice(0, eqIndex) || arg;
-    return { flag, value: arg.slice(eqIndex + 1), nextIndex: index };
+function normalizeServer(value: string | null | undefined): string {
+  const trimmed = (value ?? "").trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    throw new Error("RemoteBuddy server URL is required.");
   }
-  if (index + 1 >= argv.length) {
-    throw new Error(`Flag ${arg} requires a value.`);
-  }
-  const next = argv[index + 1];
-  if (next.startsWith("--")) {
-    throw new Error(`Flag ${arg} requires a value.`);
-  }
-  return { flag: arg, value: next, nextIndex: index + 1 };
+  return trimmed;
 }
 
-function sanitizeServer(value: string | null | undefined): string {
-  return (value ?? "").trim();
-}
-
-function sanitizeSession(value: string | null | undefined): string | null {
+function normalizeOptional(value: string | null | undefined): string | null {
   const trimmed = (value ?? "").trim();
-  return trimmed || null;
+  return trimmed ? trimmed : null;
 }
 
-function sanitizeToken(value: string | null | undefined): string | null {
-  const trimmed = (value ?? "").trim();
-  return trimmed || null;
-}
-
-function readEnvValue(
-  keys: readonly string[],
-  env: Record<string, string | undefined>,
-): string | undefined {
-  for (const key of keys) {
-    if (Object.prototype.hasOwnProperty.call(env, key)) {
-      const raw = env[key];
-      if (raw === undefined || raw === null) continue;
-      return raw;
-    }
+function expectValue(argv: string[], index: number, flag: string): string {
+  const value = argv[index + 1];
+  if (value === undefined) {
+    throw new Error(`Flag "${flag}" expects a value.`);
   }
-  return undefined;
-}
-
-function clampPositive(value: number | undefined, fallback: number): number {
-  if (!Number.isFinite(value ?? NaN)) return fallback;
-  const normalized = Math.max(0, Number(value));
-  return normalized === 0 ? fallback : normalized;
-}
-
-function buildSessionsEndpoint(server: string): string {
-  const trimmed = server.trim();
-  if (!trimmed) return "";
-  if (trimmed.endsWith("/")) return `${trimmed.replace(/\/+$/, "")}/sessions`;
-  return `${trimmed}/sessions`;
-}
-
-function extractSessionId(data: unknown): string | null {
-  if (!data || typeof data !== "object") return null;
-  const sessionId = (data as { sessionId?: unknown }).sessionId;
-  if (typeof sessionId !== "string") return null;
-  const trimmed = sessionId.trim();
-  return trimmed || null;
-}
-
-const defaultSleep = (ms: number): Promise<void> => {
-  if (typeof Bun !== "undefined" && typeof Bun.sleep === "function") {
-    return Bun.sleep(ms);
+  if (value.startsWith("--")) {
+    throw new Error(
+      `Flag "${flag}" expects a value, but received another flag-like token "${value}".`,
+    );
   }
-  return new Promise((resolve) => setTimeout(resolve, ms));
-};
-
-const defaultLogger = (message: string): void => {
-  console.log(message);
-};
+  return value;
+}

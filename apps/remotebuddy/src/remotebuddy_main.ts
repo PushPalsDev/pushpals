@@ -26,7 +26,6 @@ import { PersistentSessionMemory } from "./persistent_memory.js";
 import {
   CommunicationManager,
   detectRepoRoot,
-  loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
   matchesGlob,
   normalizeTargetPath,
@@ -46,40 +45,14 @@ import {
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
 import {
   connectWithRetry,
-  loadRuntimeOptions,
+  getRuntimeConfig,
+  resolveRuntimeOptions,
   type RuntimeOptions,
 } from "./runtime.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
-const CONFIG = loadPushPalsConfig();
-
-type RuntimeConfigSource = {
-  server: { url: string };
-  sessionId?: string | null;
-  authToken?: string | null;
-};
-
-type ResolveRuntimeOptionsInput = {
-  argv?: string[];
-  env?: Record<string, string | undefined>;
-  config?: RuntimeConfigSource;
-};
-
-export function resolveRuntimeOptionsForMain(
-  overrides: ResolveRuntimeOptionsInput = {},
-): RuntimeOptions {
-  const runtimeConfig = overrides.config ?? CONFIG;
-  return loadRuntimeOptions({
-    defaults: {
-      serverUrl: runtimeConfig.server.url,
-      sessionId: runtimeConfig.sessionId ?? null,
-      authToken: runtimeConfig.authToken ?? null,
-    },
-    argv: overrides.argv,
-    env: overrides.env,
-  });
-}
+const CONFIG = getRuntimeConfig();
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
 
@@ -643,6 +616,7 @@ class RemoteBuddyOrchestrator {
   private readonly spawnWorkerPollMs: number | null;
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
+  private readonly spawnWorkerPassthroughArgs: readonly string[];
   private readonly statusHeartbeatMs: number;
   private readonly fetchFailureLogsOnJobFailure: boolean;
   private readonly executionBudgetInteractiveMs: number;
@@ -694,6 +668,7 @@ class RemoteBuddyOrchestrator {
     idempotency: IdempotencyStore;
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
+    workerPassthroughArgs?: readonly string[];
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
@@ -720,6 +695,7 @@ class RemoteBuddyOrchestrator {
         ? remoteCfg.workerpalHeartbeatMs
         : null;
     this.spawnWorkerLabels = remoteCfg.workerpalLabels;
+    this.spawnWorkerPassthroughArgs = [...(opts.workerPassthroughArgs ?? [])];
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
     this.fetchFailureLogsOnJobFailure = parseEnabledFlag(
       process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS,
@@ -1338,6 +1314,7 @@ class RemoteBuddyOrchestrator {
       docker: this.spawnWorkerDocker,
       requireDocker: this.spawnWorkerRequireDocker,
       dockerImage: this.spawnWorkerImage,
+      passthroughArgs: this.spawnWorkerPassthroughArgs,
     });
   }
 
@@ -1958,15 +1935,18 @@ class RemoteBuddyOrchestrator {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
-  const runtimeOptions = resolveRuntimeOptionsForMain();
+  let runtime: RuntimeOptions;
+  try {
+    runtime = resolveRuntimeOptions();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[RemoteBuddy] ${message}`);
+    process.exit(1);
+    return;
+  }
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
-  if (runtimeOptions.passthroughArgs.length > 0) {
-    console.log(
-      `[RemoteBuddy] Passthrough args preserved after "--": ${runtimeOptions.passthroughArgs.join(" ")}`,
-    );
-  }
-  console.log(`[RemoteBuddy] Server: ${runtimeOptions.server}`);
+  console.log(`[RemoteBuddy] Server: ${runtime.server}`);
   if (CONFIG.startup.logConfigOnStart) {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
@@ -1997,15 +1977,13 @@ async function main() {
     }`,
   );
 
-  const desiredSessionId = runtimeOptions.sessionId;
-  if (desiredSessionId) {
-    console.log(`[RemoteBuddy] Ensuring session "${desiredSessionId}" exists on server...`);
-  } else {
-    console.log("[RemoteBuddy] Requesting a new session from server...");
-  }
-  const sessionId = await connectWithRetry({
-    server: runtimeOptions.server,
-    sessionId: desiredSessionId,
+  let sessionId = runtime.sessionId;
+  console.log(
+    `[RemoteBuddy] Ensuring session "${sessionId ?? "(auto)"}" exists on server...`,
+  );
+  sessionId = await connectWithRetry({
+    server: runtime.server,
+    sessionId: sessionId ?? undefined,
   });
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
@@ -2021,14 +1999,15 @@ async function main() {
   brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
-    server: runtimeOptions.server,
+    server: runtime.server,
     sessionId,
-    authToken: runtimeOptions.authToken,
+    authToken: runtime.authToken,
     brain,
     llm,
     idempotency,
     persistentMemory,
     jobsDbPath: sharedDbPath,
+    workerPassthroughArgs: runtime.passthroughArgs,
   });
 
   await orchestrator.emitStartupStatus();
@@ -2041,9 +2020,7 @@ async function main() {
   orchestrator.startPolling(pollMs);
 }
 
-if (import.meta.main) {
-  main().catch((err) => {
-    console.error("[RemoteBuddy] Fatal:", err);
-    process.exit(1);
-  });
-}
+main().catch((err) => {
+  console.error("[RemoteBuddy] Fatal:", err);
+  process.exit(1);
+});
