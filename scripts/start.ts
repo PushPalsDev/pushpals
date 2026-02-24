@@ -21,6 +21,7 @@ import { createHash } from "crypto";
 import { createServer } from "net";
 import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 import {
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
@@ -48,46 +49,87 @@ const START_SYNC_GIT_USER_EMAIL = "pushpals-start@local";
 const DEFAULT_PUSHPALS_PORT = CONFIG.server.port;
 const DEFAULT_STARTUP_WARMUP_TIMEOUT_MS = 120_000;
 const DEFAULT_STARTUP_WARMUP_POLL_MS = 1_000;
-const REQUIRED_DEPENDENCY_SENTINELS: Array<{ path: string; label: string }> = [
-  { path: resolve(repoRoot, "node_modules"), label: "root node_modules" },
+const REQUIRED_DEPENDENCY_PROBES: Array<{
+  label: string;
+  fromDir: string;
+  moduleSpecifier: string;
+  retryWithHoisted: boolean;
+}> = [
   {
-    path: resolve(repoRoot, "node_modules", "typescript", "bin", "tsc"),
     label: "TypeScript compiler",
+    fromDir: resolve(repoRoot, "packages", "protocol"),
+    moduleSpecifier: "typescript/bin/tsc",
+    retryWithHoisted: true,
   },
   {
-    path: resolve(repoRoot, "node_modules", "expo", "package.json"),
     label: "Expo runtime package",
+    fromDir: resolve(repoRoot, "apps", "client"),
+    moduleSpecifier: "expo/package.json",
+    retryWithHoisted: true,
   },
 ];
-const HOISTED_LINKER_RETRY_SENTINEL_PATHS = new Set<string>([
-  resolve(repoRoot, "node_modules", "typescript", "bin", "tsc"),
-  resolve(repoRoot, "node_modules", "expo", "package.json"),
-]);
 const WORKSPACE_NODE_MODULES_HEALTH_CHECKS: Array<{
   nodeModulesPath: string;
-  sentinelPath: string;
+  resolveFromDir: string;
+  moduleSpecifier: string;
   label: string;
-  sentinelLabel: string;
+  moduleLabel: string;
 }> = [
   {
     nodeModulesPath: resolve(repoRoot, "packages", "protocol", "node_modules"),
-    sentinelPath: resolve(
-      repoRoot,
-      "packages",
-      "protocol",
-      "node_modules",
-      "typescript",
-      "bin",
-      "tsc",
-    ),
+    resolveFromDir: resolve(repoRoot, "packages", "protocol"),
+    moduleSpecifier: "typescript/bin/tsc",
     label: "packages/protocol node_modules",
-    sentinelLabel: "packages/protocol TypeScript compiler",
+    moduleLabel: "packages/protocol TypeScript compiler",
   },
   {
     nodeModulesPath: resolve(repoRoot, "apps", "client", "node_modules"),
-    sentinelPath: resolve(repoRoot, "apps", "client", "node_modules", "expo", "package.json"),
+    resolveFromDir: resolve(repoRoot, "apps", "client"),
+    moduleSpecifier: "expo/package.json",
     label: "apps/client node_modules",
-    sentinelLabel: "apps/client Expo runtime package",
+    moduleLabel: "apps/client Expo runtime package",
+  },
+  {
+    nodeModulesPath: resolve(repoRoot, "apps", "server", "node_modules"),
+    resolveFromDir: resolve(repoRoot, "apps", "server"),
+    moduleSpecifier: "protocol",
+    label: "apps/server node_modules",
+    moduleLabel: "apps/server protocol workspace link",
+  },
+  {
+    nodeModulesPath: resolve(repoRoot, "apps", "localbuddy", "node_modules"),
+    resolveFromDir: resolve(repoRoot, "apps", "localbuddy"),
+    moduleSpecifier: "shared",
+    label: "apps/localbuddy node_modules",
+    moduleLabel: "apps/localbuddy shared workspace link",
+  },
+  {
+    nodeModulesPath: resolve(repoRoot, "apps", "remotebuddy", "node_modules"),
+    resolveFromDir: resolve(repoRoot, "apps", "remotebuddy"),
+    moduleSpecifier: "shared",
+    label: "apps/remotebuddy node_modules",
+    moduleLabel: "apps/remotebuddy shared workspace link",
+  },
+  {
+    nodeModulesPath: resolve(repoRoot, "apps", "workerpals", "node_modules"),
+    resolveFromDir: resolve(repoRoot, "apps", "workerpals"),
+    moduleSpecifier: "shared",
+    label: "apps/workerpals node_modules",
+    moduleLabel: "apps/workerpals shared workspace link",
+  },
+  {
+    nodeModulesPath: resolve(repoRoot, "apps", "source_control_manager", "node_modules"),
+    resolveFromDir: resolve(repoRoot, "apps", "source_control_manager"),
+    moduleSpecifier: "protocol",
+    label: "apps/source_control_manager node_modules",
+    moduleLabel: "apps/source_control_manager protocol workspace link",
+  },
+  {
+    nodeModulesPath: resolve(repoRoot, "packages", "shared", "node_modules"),
+    resolveFromDir: resolve(repoRoot, "packages", "shared"),
+    moduleSpecifier: "protocol",
+    label: "packages/shared node_modules",
+    moduleLabel: "packages/shared protocol workspace link",
   },
 ];
 const workerImage = CONFIG.workerpals.dockerImage || DEFAULT_IMAGE;
@@ -315,25 +357,60 @@ function ensureRequiredLocalConfigFiles(): void {
   abortStart(1);
 }
 
-function missingDependencySentinels(): Array<{ path: string; label: string }> {
-  return REQUIRED_DEPENDENCY_SENTINELS.filter((entry) => !existsSync(entry.path));
+function probeModuleResolution(
+  fromDir: string,
+  moduleSpecifier: string,
+): { ok: boolean; error: string } {
+  try {
+    const req = createRequire(resolve(fromDir, "package.json"));
+    req.resolve(moduleSpecifier);
+    return { ok: true, error: "" };
+  } catch (err: any) {
+    const code = typeof err?.code === "string" ? err.code : "";
+    return { ok: false, error: code || String(err) };
+  }
+}
+
+function missingDependencySentinels(): Array<{
+  label: string;
+  fromDir: string;
+  moduleSpecifier: string;
+  retryWithHoisted: boolean;
+  probeError: string;
+}> {
+  return REQUIRED_DEPENDENCY_PROBES.flatMap((entry) => {
+    const probe = probeModuleResolution(entry.fromDir, entry.moduleSpecifier);
+    if (probe.ok) return [];
+    return [{ ...entry, probeError: probe.error }];
+  });
 }
 
 function shouldRetryInstallWithHoistedLinker(
-  missing: Array<{ path: string; label: string }>,
+  missing: Array<{
+    label: string;
+    fromDir: string;
+    moduleSpecifier: string;
+    retryWithHoisted: boolean;
+    probeError: string;
+  }>,
 ): boolean {
-  return missing.some((entry) => HOISTED_LINKER_RETRY_SENTINEL_PATHS.has(entry.path));
+  return missing.some((entry) => entry.retryWithHoisted);
 }
 
 function brokenWorkspaceNodeModules(): Array<{
   nodeModulesPath: string;
-  sentinelPath: string;
+  resolveFromDir: string;
+  moduleSpecifier: string;
   label: string;
-  sentinelLabel: string;
+  moduleLabel: string;
+  probeError: string;
 }> {
-  return WORKSPACE_NODE_MODULES_HEALTH_CHECKS.filter(
-    (entry) => existsSync(entry.nodeModulesPath) && !existsSync(entry.sentinelPath),
-  );
+  return WORKSPACE_NODE_MODULES_HEALTH_CHECKS.flatMap((entry) => {
+    if (!existsSync(entry.nodeModulesPath)) return [];
+    const probe = probeModuleResolution(entry.resolveFromDir, entry.moduleSpecifier);
+    if (probe.ok) return [];
+    return [{ ...entry, probeError: probe.error }];
+  });
 }
 
 function currentBunBinary(): string {
@@ -353,9 +430,9 @@ async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
     console.warn("[start] Dependency preflight detected stale workspace node_modules links:");
     for (const entry of brokenWorkspaceModules) {
       const relPath = relative(repoRoot, entry.nodeModulesPath).replace(/\\/g, "/");
-      const relSentinel = relative(repoRoot, entry.sentinelPath).replace(/\\/g, "/");
+      const relResolveFrom = relative(repoRoot, entry.resolveFromDir).replace(/\\/g, "/");
       console.warn(
-        `[start] - ${entry.label} is present but missing ${entry.sentinelLabel} (${relSentinel}); removing ${relPath}`,
+        `[start] - ${entry.label} cannot resolve ${entry.moduleLabel} (${entry.moduleSpecifier} from ${relResolveFrom}, error=${entry.probeError}); removing ${relPath}`,
       );
       try {
         rmSync(entry.nodeModulesPath, { recursive: true, force: true });
@@ -371,8 +448,10 @@ async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
   if (missing.length > 0) {
     console.log("[start] Dependency preflight detected missing workspace artifacts:");
     for (const entry of missing) {
-      const rel = relative(repoRoot, entry.path).replace(/\\/g, "/");
-      console.log(`[start] - ${entry.label}: ${rel}`);
+      const relResolveFrom = relative(repoRoot, entry.fromDir).replace(/\\/g, "/");
+      console.log(
+        `[start] - ${entry.label}: unable to resolve ${entry.moduleSpecifier} from ${relResolveFrom} (error=${entry.probeError})`,
+      );
     }
   }
   const installArgs =
@@ -412,14 +491,16 @@ async function ensureWorkspaceDependenciesInstalled(): Promise<void> {
   if (missingAfterInstall.length > 0 || brokenAfterInstall.length > 0) {
     console.error("[start] Dependency preflight still failing after install:");
     for (const entry of missingAfterInstall) {
-      const rel = relative(repoRoot, entry.path).replace(/\\/g, "/");
-      console.error(`[start] - ${entry.label}: ${rel}`);
+      const relResolveFrom = relative(repoRoot, entry.fromDir).replace(/\\/g, "/");
+      console.error(
+        `[start] - ${entry.label}: unable to resolve ${entry.moduleSpecifier} from ${relResolveFrom} (error=${entry.probeError})`,
+      );
     }
     for (const entry of brokenAfterInstall) {
       const relPath = relative(repoRoot, entry.nodeModulesPath).replace(/\\/g, "/");
-      const relSentinel = relative(repoRoot, entry.sentinelPath).replace(/\\/g, "/");
+      const relResolveFrom = relative(repoRoot, entry.resolveFromDir).replace(/\\/g, "/");
       console.error(
-        `[start] - ${entry.label}: missing ${entry.sentinelLabel} (${relSentinel}) in ${relPath}`,
+        `[start] - ${entry.label}: cannot resolve ${entry.moduleLabel} (${entry.moduleSpecifier} from ${relResolveFrom}, error=${entry.probeError}) in ${relPath}`,
       );
     }
     abortStart(1);

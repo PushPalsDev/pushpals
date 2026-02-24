@@ -114,4 +114,62 @@ describe("remotebuddy persistent session memory", () => {
       }
     }
   });
+
+  test("retries SQLITE_BUSY during remember insert and persists once lock clears", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-memory-"));
+    const dbPath = join(root, "remotebuddy-state.db");
+    const repoRoot = "C:/repo/pushpals";
+    const store = new PersistentSessionMemory(dbPath);
+    const db = (store as unknown as { db: { prepare: (sql: string) => any } }).db;
+    const originalPrepare = db.prepare.bind(db);
+    let busyRemaining = 2;
+
+    db.prepare = ((sql: string) => {
+      const stmt = originalPrepare(sql);
+      if (!/INSERT INTO remotebuddy_memory/i.test(sql)) return stmt;
+      const originalRun = stmt.run.bind(stmt);
+      stmt.run = (...args: unknown[]) => {
+        if (busyRemaining > 0) {
+          busyRemaining -= 1;
+          const err = new Error("database is locked") as Error & { code?: string; errno?: number };
+          err.code = "SQLITE_BUSY";
+          err.errno = 5;
+          throw err;
+        }
+        return originalRun(...args);
+      };
+      return stmt;
+    }) as typeof db.prepare;
+
+    try {
+      store.remember(
+        {
+          repoRoot,
+          sessionId: "session-a",
+          requestId: "req-1",
+          kind: "note",
+          summary: "Memory write should survive transient SQLITE_BUSY lock.",
+        },
+        { retentionDays: 30, maxSummaryChars: 420 },
+      );
+      const recalled = store.recallForPlanning({
+        repoRoot,
+        sessionId: "session-a",
+        includeCurrentSession: true,
+        includeCrossSession: true,
+        maxItems: 5,
+        maxChars: 1200,
+      });
+      expect(busyRemaining).toBe(0);
+      expect(recalled.join("\n")).toContain("transient SQLITE_BUSY lock");
+    } finally {
+      db.prepare = originalPrepare;
+      store.close();
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // Windows can briefly hold sqlite handles; cleanup is best-effort in tests.
+      }
+    }
+  });
 });
