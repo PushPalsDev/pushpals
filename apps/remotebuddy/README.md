@@ -160,6 +160,35 @@ Troubleshooting – If Bun crashes, loops on cache errors, or still reports miss
 - **Fast load-spike detection tips** – Run `watch -n 5 curl -sS $SERVER/system/status | jq '{p95: .slo.requests.queueWaitMs.p95, pending: .queues.requests.pending, jobs: .queues.jobPendingSnapshot}'` during incidents so you catch >0.5 s jumps before alerts aggregate, and keep `tail -f logs/remotebuddy.log | rg sig_queue_health` open to spot remediation bursts. When `queue_p95` jumps ≥0.3 s between polls, immediately check `/requests?status=pending&limit=20` for aging interactive prompts and manually re-prioritize them.
 - **Escalation steps** – 1) Announce the metric breach with snapshots in `#pushpals-ops`; 2) loop WorkerPals/Platform on-call if warning bands last >10 minutes or `job_failure_rate` crosses 0.4; 3) page Infrastructure/SRE if worker restarts do not clear the spike or shared services look unhealthy. Keep time-stamped updates every 15 minutes until `queue_p95` < 1.0 s and `job_failure_rate` < 0.2 for two consecutive polls.
 
+#### Queue monitoring & recovery runbook (TL;DR)
+
+Keep this section handy when p95, regret, or autonomy signals start drifting between full incident reviews.
+
+| Signal | Dashboards / logs | Warning (self-triage) | Page / escalate |
+| --- | --- | --- | --- |
+| `queue_p95` | Grafana › RemoteBuddy Queue Overview (`queue_p95` panel); `/system/status.slo.requests.queueWaitMs` snapshots; `tail -f logs/remotebuddy.log` for planner budget hits. | ≥ 1.0 s for 3 polls **or** pending interactive ≥ 15. | ≥ 1.5 s for 5 min **or** queue depth > 60 / < 2 idle workers; page **RemoteBuddy Platform** and ping `@workerpals-oc` for surge capacity. |
+| Reopenings (`reopened_within_24h`) | Grafana › Autonomy board (`reopenings_24h` panel); `sqlite3 autonomy.db 'select count(*) from autonomy_outcomes where reopened_within_24h=1 and datetime(created_at)>=datetime(\"now\",\"-24 hours\")'`; WorkerPal transcripts via `logs/workerpals*.log`. | ≥ 3 reopenings in 24 h or any request reopened twice. | ≥ 6 reopenings / 24 h or rising trend 30 min; notify `@remote-autonomy` and prep rollback of the newest planner/autonomy change. |
+| `sig_queue_health` | `tail -f logs/remotebuddy.log | rg sig_queue_health`; Grafana alert `queue_health_forceWorker`; `/system/status.autonomySignals`. | Value ≥ 0.45 for 3 polls **or** ≥ 2 synthetic `forceWorker` jobs/minute. | Value ≥ 0.75 for ≥10 min or auto-remediation loop detected; escalate to **WorkerPals Runtime** for restarts + capacity audit. |
+| `sig_regret_24h` | `tail -f logs/remotebuddy.log | rg sig_regret_24h`; Grafana › Autonomy signals; alert payload evidence lines. | Value ≥ 0.5 (≈3 reopenings) for 2 polls. | Value ≥ 0.8 (≥5 reopenings) or paired with user-visible regressions; engage **RemoteBuddy Platform** + SRE immediately. |
+
+- **Bookmark these views:** Grafana RemoteBuddy Queue Overview + Autonomy signal boards, `/system/status` JSON saved per poll, `logs/remotebuddy.log`, `logs/server.log`, and the deep-dive docs in `apps/remotebuddy/docs/queue-monitoring.md` + `queue-playbook.md`.
+
+**Low-traffic response checklist (idle window regression)**
+
+1. Capture evidence – Export `queue_p95` + autonomy Grafana snapshots, run `/system/status` + reopening SQL above, paste results in `#pushpals-ops` with timestamps.
+2. Stabilize demand – Force LocalBuddy/background throttles to interactive-only, cancel eval submissions, and confirm `forceWorker` automation isn’t piling on (pending synthetic requests stay flat).
+3. Inspect regret roots – Pull the latest reopened request IDs from `autonomy_outcomes` and WorkerPal logs, fix or pause the offending planner patterns before replaying users.
+4. Roll back – If `queue_p95` ≥ 1.0 s or reopenings ≥ 3 for >10 min, follow the queue-playbook rollback (`git checkout remotebuddy-queue-lowload-*`, `bun run remotebuddy`) and note the restored commit/config in the ops thread.
+5. Escalate – Page PagerDuty **RemoteBuddy Platform**, tag `@remote-autonomy`, and keep Infra/SRE looped if `sig_queue_health` ≥ 0.75 or `sig_regret_24h` ≥ 0.8 after rollback; continue status posts every 15 min until signals clear.
+
+**High-traffic response checklist (backlog / incident state)**
+
+1. Snapshot telemetry – Grab `/system/status`, queue/backlog Grafana panels, and `sig_*` log excerpts; specify organic vs synthetic load in `#pushpals-ops`.
+2. Add capacity – Launch extra WorkerPals via `bun run workerpals:only[:docker]`, confirm ≥ 3 idle interactive slots and auto-spawn is caught up (`/workers` idle counts).
+3. Drain + debug – Pause non-critical lanes, tail WorkerPals logs for retry storms, fail/redo reopened head-of-line requests, and re-run `/requests?status=pending` until wait budgets clear.
+4. Roll back / redeploy – If metrics stay red after 10 min, revert the most recent RemoteBuddy/Server release through the [On-Call Deployment Flow](#on-call-deployment-flow-summary), documenting the rollback command, build, and state DB handling.
+5. Escalate – Page **WorkerPals Runtime** when idle < 2 or `job_failure_rate` ≥ 0.4, escalate to Infrastructure/SRE if backlog > 60, cross-region impact, or automation loops; keep PagerDuty + Slack timelines updated with owner/ETA.
+
 ### Queue-handling flow (current state)
 
 1. RemoteBuddy polls `POST /requests/claim` every ~2 s, dedups via the idempotency cache, and computes `queueWaitBudgetMs` (≥ 20 s interactive, 90 s default, 240 s background).
