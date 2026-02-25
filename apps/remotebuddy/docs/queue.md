@@ -6,6 +6,8 @@ Use this guide whenever RemoteBuddy request latency (`queue_p95`) drifts away fr
 SLO, or whenever alerts related to queue depth/backlog fire. The deeper triage commands
 and background reading still live in `apps/remotebuddy/docs/queue-playbook.md`.
 
+Need a concrete walkthrough of how a user request flows across LocalBuddy, RemoteBuddy, WorkerPals, and SourceControlManager? See [request-workflow-example.md](./request-workflow-example.md).
+
 ## Monitoring and Detection
 
 ### Dashboards and tools in rotation
