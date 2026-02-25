@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, isAbsolute, join, resolve } from "path";
+import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import {
   addPullRequestComment,
   deleteBranchRef,
@@ -303,27 +304,15 @@ export function buildReviewPrompt(
   const truncatedDiff =
     diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}\n...(diff truncated)` : diff;
   const normalizedThreshold = Math.max(1, Math.min(10, passThreshold));
-
-  return [
-    "You are a Distinguished Engineer performing a code review for the PushPals project.",
-    `Operational policy: ReviewAgent approves iff score >= ${normalizedThreshold.toFixed(1)}/10.`,
-    "Provide objective scoring and actionable issues only; do not make the final approve/reject policy decision.",
-    "",
-    "Review Criteria:",
-    reviewerMd,
-    "",
-    "---",
-    "",
-    `Pull Request: #${pr.number} - ${pr.title}`,
-    `Branch: ${pr.head.ref} -> ${pr.base.ref}`,
-    "",
-    "Diff:",
-    "```diff",
-    truncatedDiff,
-    "```",
-    "",
-    "Respond with a JSON verdict object only. No markdown, no explanation outside the JSON.",
-  ].join("\n");
+  return loadPromptTemplate("review_agent/review_prompt_template.md", {
+    pass_threshold: normalizedThreshold.toFixed(1),
+    reviewer_md: reviewerMd,
+    pr_number: String(pr.number),
+    pr_title: String(pr.title ?? ""),
+    head_ref: String(pr.head?.ref ?? ""),
+    base_ref: String(pr.base?.ref ?? ""),
+    diff: truncatedDiff,
+  });
 }
 
 function formatRejectionComment(verdict: ReviewVerdict): string {
@@ -1244,7 +1233,11 @@ export class ReviewAgent {
         origin: "autonomy",
         instruction: fixInstruction,
         recentContext: [
-          `You are fixing PR #${pr.number} (${pr.html_url}) on branch ${pr.head.ref}.`,
+          loadPromptTemplate("review_agent/fix_job_intro_line.md", {
+            pr_number: String(pr.number),
+            pr_url: pr.html_url,
+            pr_head_ref: String(pr.head?.ref ?? ""),
+          }),
           "The branch already exists on the remote. Checkout the branch, make required fixes, and push.",
           `Reviewer score was ${verdict.score.toFixed(1)}/10. Issues: ${issuesSummary}`,
           ...feedbackContext,
@@ -1358,12 +1351,13 @@ export class ReviewAgent {
       ),
       360,
     );
-    const instruction = [
-      `Resolve merge conflicts for PR #${pr.number} (${pr.html_url}) on branch ${pr.head.ref}.`,
-      `This PR already passed ReviewAgent (${verdict.score.toFixed(1)}/10) but GitHub reports it is not mergeable due to conflicts.`,
-      `Rebase ${pr.head.ref} onto ${pr.base.ref}, resolve all conflicts, keep intended behavior, run relevant tests, and push updates to the same branch.`,
-      "Do not create a new PR; update only the existing PR branch.",
-    ].join("\n");
+    const instruction = loadPromptTemplate("review_agent/merge_conflict_instruction.md", {
+      pr_number: String(pr.number),
+      pr_url: pr.html_url,
+      pr_head_ref: String(pr.head?.ref ?? ""),
+      pr_base_ref: String(pr.base?.ref ?? ""),
+      review_score: verdict.score.toFixed(1),
+    });
 
     const payload = {
       taskId,
@@ -1376,7 +1370,10 @@ export class ReviewAgent {
         origin: "autonomy",
         instruction,
         recentContext: [
-          `PR #${pr.number} (${pr.html_url}) is approved but blocked by merge conflicts.`,
+          loadPromptTemplate("review_agent/merge_conflict_context_intro_line.md", {
+            pr_number: String(pr.number),
+            pr_url: pr.html_url,
+          }),
           `Approved score: ${verdict.score.toFixed(1)}/10`,
           mergeErrorSummary
             ? `GitHub merge error: ${mergeErrorSummary}`

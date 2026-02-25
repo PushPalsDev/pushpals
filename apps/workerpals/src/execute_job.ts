@@ -15,7 +15,11 @@ import {
 } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { JobResult } from "./common/types.js";
-import { compactJobOutput, truncate, type OutputCompactionPolicy } from "./common/execution_utils.js";
+import {
+  compactJobOutput,
+  truncate,
+  type OutputCompactionPolicy,
+} from "./common/execution_utils.js";
 // Re-export shared utilities for backward compatibility with external consumers.
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
@@ -166,7 +170,9 @@ export function resolveReviewNoChangeCompletionBranch(
 ): string | null {
   if (!params || typeof params !== "object" || Array.isArray(params)) return null;
   const reviewAgent =
-    params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent)
+    params.reviewAgent &&
+    typeof params.reviewAgent === "object" &&
+    !Array.isArray(params.reviewAgent)
       ? (params.reviewAgent as Record<string, unknown>)
       : null;
   const reviewAgentHeadRef = reviewAgent?.prHeadRef;
@@ -743,25 +749,21 @@ async function runTaskCriticReview(
 
   const planning = params.planning as TaskExecutePlanning;
   const instruction = String(params.instruction ?? "").trim();
-  const criticSystem = [
-    "You are a strict code-review critic for worker-generated patches.",
-    "Return exactly one JSON object with keys:",
-    `{"score": <0-10 number>, "findings": [string], "must_fix": [string], "revision_guidance": string}`,
-    "Scoring rubric:",
-    "- 10: complete, correct, and robust with strong validation coverage.",
-    "- 8-9: good quality with minor non-blocking issues.",
-    "- <=7: requires revision before commit.",
-    "must_fix must list blocking issues only.",
-    "Do not include markdown or prose outside JSON.",
-  ].join("\n");
-  const criticUser = [
-    `Instruction:\n${instruction}`,
-    `Acceptance criteria:\n${planning.acceptanceCriteria.map((entry) => `- ${entry}`).join("\n") || "- (none)"}`,
-    `Validation steps:\n${planning.validationSteps.map((entry) => `- ${entry}`).join("\n") || "- (none)"}`,
-    `Changed paths:\n${quality.changedPaths.map((entry) => `- ${entry}`).join("\n") || "- (none)"}`,
-    `Diff excerpt:\n${diffText || "(empty diff excerpt)"}`,
-    `Validation evidence:\n${validationSummary || "(no validation output)"}`,
-  ].join("\n\n");
+  const acceptanceCriteriaText =
+    planning.acceptanceCriteria.map((entry) => `- ${entry}`).join("\n") || "- (none)";
+  const validationStepsText =
+    planning.validationSteps.map((entry) => `- ${entry}`).join("\n") || "- (none)";
+  const changedPathsText =
+    quality.changedPaths.map((entry) => `- ${entry}`).join("\n") || "- (none)";
+  const criticSystem = loadPromptTemplate("workerpals/task_quality_critic_system_prompt.md").trim();
+  const criticUser = loadPromptTemplate("workerpals/task_quality_critic_user_prompt.md", {
+    instruction,
+    acceptance_criteria: acceptanceCriteriaText,
+    validation_steps: validationStepsText,
+    changed_paths: changedPathsText,
+    diff_excerpt: diffText || "(empty diff excerpt)",
+    validation_evidence: validationSummary || "(no validation output)",
+  });
 
   const apiKey = runtimeConfig.workerpals.llm.apiKey.trim() || "local";
   const headers: Record<string, string> = {
@@ -1451,7 +1453,9 @@ function inferCommitArea(
   if (explicit) return normalizeCommitArea(explicit);
 
   const targets =
-    changedPaths.length > 0 ? changedPaths : buildStageTargets(kind, params).filter((p) => p !== ".");
+    changedPaths.length > 0
+      ? changedPaths
+      : buildStageTargets(kind, params).filter((p) => p !== ".");
   const pick = (prefix: string): boolean =>
     targets.some((path) => path.toLowerCase().startsWith(prefix.toLowerCase()));
 
@@ -1472,7 +1476,9 @@ function summarizeScope(
   changedPaths: string[] = [],
 ): string {
   const targets =
-    changedPaths.length > 0 ? changedPaths : buildStageTargets(kind, params).filter((p) => p !== ".");
+    changedPaths.length > 0
+      ? changedPaths
+      : buildStageTargets(kind, params).filter((p) => p !== ".");
   if (targets.length === 0) return "repository-level changes";
   const visible = targets.slice(0, 3).join(", ");
   return targets.length > 3 ? `${visible}, +${targets.length - 3} more` : visible;
@@ -1623,9 +1629,7 @@ function parseBooleanFlag(value: unknown): boolean {
 
 function toNonEmptyStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
-  return value
-    .map((entry) => sanitizeCommitValue(entry, 240))
-    .filter((entry) => entry.length > 0);
+  return value.map((entry) => sanitizeCommitValue(entry, 240)).filter((entry) => entry.length > 0);
 }
 
 /** Returns true only for validation steps that invoke a recognizable test runner. */
@@ -1652,9 +1656,7 @@ export function isTestLikeValidationStep(step: string): boolean {
         if (tool === "bun") {
           return argv
             .slice(1)
-            .some((arg) =>
-              /(?:^|[/\\])tests?[/\\]|\.test\.[a-z]+$|\.spec\.[a-z]+$/i.test(arg),
-            );
+            .some((arg) => /(?:^|[/\\])tests?[/\\]|\.test\.[a-z]+$|\.spec\.[a-z]+$/i.test(arg));
         }
         return false;
       }
@@ -1664,9 +1666,7 @@ export function isTestLikeValidationStep(step: string): boolean {
         return true;
       case "python":
         return (
-          argv.length >= 3 &&
-          argv[1].toLowerCase() === "-m" &&
-          argv[2].toLowerCase() === "pytest"
+          argv.length >= 3 && argv[1].toLowerCase() === "-m" && argv[2].toLowerCase() === "pytest"
         );
       case "coverage":
         return hasToken("pytest");
@@ -1830,7 +1830,10 @@ async function autoResolveRebaseConflicts(
   for (let pass = 1; pass <= maxPasses; pass++) {
     const unresolved = await git(repo, ["diff", "--name-only", "--diff-filter=U"]);
     if (!unresolved.ok) {
-      return { ok: false, error: `Failed to inspect rebase conflicts: ${combinedGitOutput(unresolved)}` };
+      return {
+        ok: false,
+        error: `Failed to inspect rebase conflicts: ${combinedGitOutput(unresolved)}`,
+      };
     }
     const unresolvedPaths = parseChangedPathsFromNameOnlyOutput(unresolved.stdout);
     if (unresolvedPaths.length > 0) {
@@ -1913,7 +1916,12 @@ export async function syncHiddenRefWithRemoteBranchByRebase(
       publicBranchName,
     ]);
 
-  const remoteHead = await git(repo, ["ls-remote", "--heads", "origin", `refs/heads/${publicBranchName}`]);
+  const remoteHead = await git(repo, [
+    "ls-remote",
+    "--heads",
+    "origin",
+    `refs/heads/${publicBranchName}`,
+  ]);
   if (!remoteHead.ok) {
     return {
       ok: false,
@@ -1962,7 +1970,10 @@ export async function syncHiddenRefWithRemoteBranchByRebase(
 
       const pullOutput = combinedGitOutput(pullRebase);
       if (!isRebaseConflictOutput(pullOutput)) {
-        return { ok: false, error: `git pull --rebase failed for ${publicBranchName}: ${pullOutput}` };
+        return {
+          ok: false,
+          error: `git pull --rebase failed for ${publicBranchName}: ${pullOutput}`,
+        };
       }
       const resolved = await autoResolveRebaseConflicts(repo);
       if (!resolved.ok) {
@@ -2075,7 +2086,9 @@ async function generateCommitMessageFromDiffViaCodex(
     if (!Number.isFinite(value)) return 120_000;
     return Math.max(10_000, Math.min(600_000, Math.floor(value)));
   })();
-  const reasoningEffort = normalizeCodexReasoningEffort(runtimeConfig.workerpals.llm.reasoningEffort);
+  const reasoningEffort = normalizeCodexReasoningEffort(
+    runtimeConfig.workerpals.llm.reasoningEffort,
+  );
   const tmpOutputPath = resolve(
     Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp",
     `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`,
@@ -2203,16 +2216,11 @@ export function buildCommitMessageGeneratorUserMessage(
       .filter(isTestLikeValidationStep)
       .map((step) => `- ${step}`)
       .join("\n") || "- (none)";
-  // Diff comes first so the model anchors on actual code changes, not the instruction.
-  return [
-    "Staged diff (derive subject line and all bullets from this):",
-    diff.slice(0, COMMIT_MSG_MAX_DIFF_CHARS),
-    "",
-    "Validation steps (for Tests section only):",
-    testLines,
-    "",
-    `Background context (do not restate in subject or bullets): ${instruction.slice(0, 400)}`,
-  ].join("\n");
+  return loadPromptTemplate("workerpals/commit_message_user_prompt.md", {
+    diff_excerpt: diff.slice(0, COMMIT_MSG_MAX_DIFF_CHARS),
+    test_lines: testLines,
+    instruction_excerpt: instruction.slice(0, 400),
+  });
 }
 
 /**
@@ -2231,7 +2239,10 @@ export function sanitizeGeneratedCommitMessage(
   area: string,
 ): string | null {
   // Strip accidental markdown fences.
-  const clean = content.replace(/^```[^\n]*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
+  const clean = content
+    .replace(/^```[^\n]*\n?/m, "")
+    .replace(/\n?```\s*$/m, "")
+    .trim();
   // Sanity check: must open with the expected conventional commit prefix.
   if (!clean.startsWith(`${type}(${area})`)) return null;
   // Reject if the majority of bullet points look like planning/acceptance criteria
@@ -2280,13 +2291,18 @@ export function buildWorkerCommitMessage(
     const contextValue = sanitizeCommitValue(job.context ?? "host", 32);
     const sessionValue = sanitizeCommitValue(job.sessionId ?? "", 128);
     lines.push(
-      buildCommitMetaBlock(job.kind, job.params, {
-        worker_id: sanitizeCommitValue(workerId, 64),
-        task_id: sanitizeCommitValue(job.taskId, 128),
-        job_id: sanitizeCommitValue(job.id, 128),
-        context: contextValue || "host",
-        session_line: sessionValue ? `- session: ${sessionValue}` : "",
-      }, normalizedChangedPaths),
+      buildCommitMetaBlock(
+        job.kind,
+        job.params,
+        {
+          worker_id: sanitizeCommitValue(workerId, 64),
+          task_id: sanitizeCommitValue(job.taskId, 128),
+          job_id: sanitizeCommitValue(job.id, 128),
+          context: contextValue || "host",
+          session_line: sessionValue ? `- session: ${sessionValue}` : "",
+        },
+        normalizedChangedPaths,
+      ),
     );
   }
   return lines.join("\n");
@@ -2386,13 +2402,19 @@ async function collectWriteScopeWarnings(
 
   const forbidden = toStringArray(planning.scope.forbiddenGlobs ?? []);
   const warnings: string[] = [];
-  const outOfScope = changedPaths.filter((path) => !writeGlobs.some((glob) => matchesGlob(path, glob)));
+  const outOfScope = changedPaths.filter(
+    (path) => !writeGlobs.some((glob) => matchesGlob(path, glob)),
+  );
   if (outOfScope.length > 0) {
     warnings.push(`Scope suggestion: modified paths outside writeGlobs: ${outOfScope.join(", ")}`);
   }
-  const forbiddenTouched = changedPaths.filter((path) => forbidden.some((glob) => matchesGlob(path, glob)));
+  const forbiddenTouched = changedPaths.filter((path) =>
+    forbidden.some((glob) => matchesGlob(path, glob)),
+  );
   if (forbiddenTouched.length > 0) {
-    warnings.push(`Scope suggestion: modified paths matching forbiddenGlobs: ${forbiddenTouched.join(", ")}`);
+    warnings.push(
+      `Scope suggestion: modified paths matching forbiddenGlobs: ${forbiddenTouched.join(", ")}`,
+    );
   }
   return { warnings };
 }
@@ -2515,7 +2537,9 @@ function validateTaskExecutePlanning(
         message: "task.execute planning.targetPaths must contain literal repo-relative paths",
       };
     }
-    const normalizedWriteGlobs = isStringArray(scope.writeGlobs) ? toStringArray(scope.writeGlobs) : [];
+    const normalizedWriteGlobs = isStringArray(scope.writeGlobs)
+      ? toStringArray(scope.writeGlobs)
+      : [];
     if (origin === "autonomy") {
       const declaredComponentArea = asAutonomyComponentArea(options?.autonomyComponentArea);
       const inferredComponentArea = inferComponentAreaFromTargets(normalizedTargetPaths);
@@ -2526,7 +2550,11 @@ function validateTaskExecutePlanning(
           message: "task.execute planning.targetPaths must map to one supported component area",
         };
       }
-      if (declaredComponentArea && inferredComponentArea && declaredComponentArea !== inferredComponentArea) {
+      if (
+        declaredComponentArea &&
+        inferredComponentArea &&
+        declaredComponentArea !== inferredComponentArea
+      ) {
         return {
           ok: false,
           message: "task.execute planning.targetPaths do not match autonomy componentArea",
@@ -2631,7 +2659,10 @@ function validateTaskExecutePlanning(
 
 const cachedCodexCommandPrefix = new Map<string, string[]>();
 
-async function canExecuteCodexCommandCandidate(repo: string, candidate: string[]): Promise<boolean> {
+async function canExecuteCodexCommandCandidate(
+  repo: string,
+  candidate: string[],
+): Promise<boolean> {
   if (candidate.length === 0) return false;
   try {
     const proc = Bun.spawn([...candidate, "--version"], {
@@ -2730,36 +2761,42 @@ async function runCodexCriticReview(
         .filter(Boolean)
         .join("\n")
         .slice(0, qualityCriticMaxValidationOutputChars);
-      return [`Command: ${run.command}`, `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode})`, output]
+      return [
+        `Command: ${run.command}`,
+        `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode})`,
+        output,
+      ]
         .filter(Boolean)
         .join("\n");
     })
     .join("\n---\n");
 
-  const criticInstruction = [
-    "You are a strict code review critic. Return ONLY a valid JSON object with exactly these keys:",
-    '{"score": <number 0-10>, "findings": [<string>], "must_fix": [<string>], "revision_guidance": "<string>"}',
-    "Do not output any prose, explanation, or markdown — only the JSON object.",
-    "",
-    `Task: ${instruction}`,
-    "",
-    `Acceptance criteria:\n${planning.acceptanceCriteria.map((c) => `- ${c}`).join("\n") || "- (none)"}`,
-    "",
-    `Changed paths: ${quality.changedPaths.join(", ") || "(none)"}`,
-    "",
-    diffText ? `Diff:\n${diffText}` : "Diff: (empty — no changes detected)",
-    "",
-    validationSummary ? `Validation:\n${validationSummary}` : "Validation: (none)",
-  ].join("\n");
+  const criticInstruction = loadPromptTemplate(
+    "workerpals/codex_quality_critic_instruction_prompt.md",
+    {
+      instruction,
+      acceptance_criteria:
+        planning.acceptanceCriteria.map((c) => `- ${c}`).join("\n") || "- (none)",
+      changed_paths: quality.changedPaths.join(", ") || "(none)",
+      diff_section: diffText ? `Diff:\n${diffText}` : "Diff: (empty - no changes detected)",
+      validation_section: validationSummary
+        ? `Validation:\n${validationSummary}`
+        : "Validation: (none)",
+    },
+  );
 
   const tmpOutputPath = `/tmp/pushpals-critic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`;
   const cmd = [
     ...codexPrefix,
-    "-c", 'model_reasoning_effort="low"',
-    "-a", "never",
+    "-c",
+    'model_reasoning_effort="low"',
+    "-a",
+    "never",
     "exec",
-    "-s", "read-only",
-    "--output-last-message", tmpOutputPath,
+    "-s",
+    "read-only",
+    "--output-last-message",
+    tmpOutputPath,
     "-",
   ];
 
@@ -2774,7 +2811,11 @@ async function runCodexCriticReview(
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      try { proc.kill(); } catch { /* ignore */ }
+      try {
+        proc.kill();
+      } catch {
+        /* ignore */
+      }
     }, qualityCriticTimeoutMs);
 
     const exitCode = await proc.exited;
@@ -2796,8 +2837,14 @@ async function runCodexCriticReview(
     let lastMessage = "";
     try {
       lastMessage = (await Bun.file(tmpOutputPath).text()).trim();
-    } catch { /* file may not exist if codex produced no output */ }
-    try { unlinkSync(tmpOutputPath); } catch { /* ignore */ }
+    } catch {
+      /* file may not exist if codex produced no output */
+    }
+    try {
+      unlinkSync(tmpOutputPath);
+    } catch {
+      /* ignore */
+    }
 
     if (!lastMessage) {
       onLog?.("stderr", "[QualityGate] Codex critic: no output message captured; skipping.");
@@ -2821,7 +2868,9 @@ async function runCodexCriticReview(
     const mustFix = Array.isArray(reviewObj.must_fix)
       ? reviewObj.must_fix.map((f) => String(f).trim()).filter(Boolean)
       : [];
-    const revisionGuidance = String(reviewObj.revision_guidance ?? "").trim().slice(0, 2000);
+    const revisionGuidance = String(reviewObj.revision_guidance ?? "")
+      .trim()
+      .slice(0, 2000);
     onLog?.("stdout", `[QualityGate] Codex critic score: ${score}/10`);
     return {
       score,
@@ -2831,10 +2880,7 @@ async function runCodexCriticReview(
       raw: compactJobOutput(lastMessage, outputPolicyForRuntime(runtimeConfig)),
     };
   } catch (err) {
-    onLog?.(
-      "stderr",
-      `[QualityGate] Codex critic error: ${toSingleLine(err, 220)} (skipping).`,
-    );
+    onLog?.("stderr", `[QualityGate] Codex critic error: ${toSingleLine(err, 220)} (skipping).`);
     return null;
   }
 }
@@ -2995,10 +3041,7 @@ export async function executeJob(
     if (revisionAttempt >= qualityMaxAutoRevisions) {
       if (qualitySoftPassOnExhausted) {
         const diagnostics = truncate(
-          [
-            result.stderr ?? "",
-            critic ? `Critic raw: ${critic.raw}` : "",
-          ]
+          [result.stderr ?? "", critic ? `Critic raw: ${critic.raw}` : ""]
             .filter(Boolean)
             .join("\n"),
           outputPolicyForRuntime(runtimeConfig),
@@ -3025,10 +3068,7 @@ export async function executeJob(
         )}`,
         stdout: result.stdout,
         stderr: truncate(
-          [
-            result.stderr ?? "",
-            critic ? `Critic raw: ${critic.raw}` : "",
-          ]
+          [result.stderr ?? "", critic ? `Critic raw: ${critic.raw}` : ""]
             .filter(Boolean)
             .join("\n"),
           outputPolicyForRuntime(runtimeConfig),

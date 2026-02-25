@@ -48,16 +48,31 @@ _INTERRUPTED_SIGNAL: Optional[int] = None
 log = Logger(LOG_PREFIX)
 
 _PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
-_DEFAULT_TASK_SYSTEM_PROMPT = (
-    "You are PushPals WorkerPal running via the OpenAI Codex CLI backend.\n"
-    "Codex CLI is required infrastructure in this environment.\n"
-    "Do not modify tests or product code to bypass, stub, or avoid Codex CLI usage due to assumed environment limits.\n"
-    "If Codex CLI auth/execution is unavailable, fail loudly with a clear error and stop; do not apply non-Codex workarounds."
-)
+_PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+_TASK_SYSTEM_PROMPT_PATH = "workerpals/openai_codex_task_execute_system_prompt.md"
+_DEFAULT_TASK_SYSTEM_PROMPT_PATH = "workerpals/openai_codex_default_system_prompt.md"
+_MANDATORY_RUNTIME_POLICY_APPENDIX_PATH = "workerpals/openai_codex_runtime_policy_appendix.md"
+_INSTRUCTION_WRAPPER_PROMPT_PATH = "workerpals/openai_codex_instruction_wrapper.md"
+_SUPPLEMENTAL_GUIDANCE_SECTION_PATH = "workerpals/openai_codex_supplemental_guidance_section.md"
 _CODEX_WORKAROUND_PATTERNS = (
-    re.compile(r"\bcodex cli\b.{0,120}\b(isn't|is not|not)\b.{0,120}\bavailable\b", re.IGNORECASE),
+    re.compile(
+        r"\bcodex cli\b.{0,120}\b(isn't|is not|not)\b.{0,120}\bavailable\b.{0,120}\b(so|therefore|instead|fallback|workaround|without|using)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bwithout requiring\b.{0,120}\bcodex\b", re.IGNORECASE),
     re.compile(r"\bavoid(?:ing)?\b.{0,120}\bcodex\b.{0,120}\bcall", re.IGNORECASE),
+    re.compile(r"\b(fell back|fallback|worked around|workaround|bypass(?:ed)?|switched to)\b.{0,120}\bcodex\b", re.IGNORECASE),
+)
+_CODEX_WORKAROUND_NEGATION_HINTS = (
+    "do not",
+    "don't",
+    "never",
+    "must not",
+    "fail loudly",
+    "hard-fail",
+    "hard fail",
+    "explicit failure",
+    "codex cli is required infrastructure",
 )
 
 _VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
@@ -185,18 +200,31 @@ def _resolve_prompt_file(relative_path: str) -> Path:
     return _repo_root_for_prompt_loading() / "prompts" / relative_path
 
 
-def _load_prompt_template(relative_path: str) -> str:
+def _load_prompt_template(
+    relative_path: str, replacements: Optional[Dict[str, str]] = None
+) -> str:
     prompt_path = _resolve_prompt_file(relative_path)
     cache_key = str(prompt_path)
     cached = _PROMPT_TEMPLATE_CACHE.get(cache_key)
     if cached is not None:
-        return cached
-    try:
-        template = prompt_path.read_text(encoding="utf-8").strip()
-    except Exception:
-        template = ""
-    _PROMPT_TEMPLATE_CACHE[cache_key] = template
-    return template
+        template = cached
+    else:
+        try:
+            template = prompt_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            template = ""
+        _PROMPT_TEMPLATE_CACHE[cache_key] = template
+    if not replacements:
+        return template
+
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        value = replacements.get(key)
+        if value is None:
+            raise KeyError(f"Missing prompt replacement '{{{{{key}}}}}' for {prompt_path}")
+        return value
+
+    return _PROMPT_TOKEN_REGEX.sub(_replace, template)
 
 
 def _to_positive_int(raw: str) -> Optional[int]:
@@ -697,21 +725,54 @@ def _safe_model_for_codex(raw_model: str, base_url: str) -> str:
 
 
 def _build_instruction(instruction: str, supplemental_guidance: List[str]) -> str:
-    system_prompt = (
-        _load_prompt_template("workerpals/openai_codex_task_execute_system_prompt.md")
-        or _DEFAULT_TASK_SYSTEM_PROMPT
+    system_prompt = (_load_prompt_template(_TASK_SYSTEM_PROMPT_PATH) or "").strip()
+    if not system_prompt:
+        system_prompt = (_load_prompt_template(_DEFAULT_TASK_SYSTEM_PROMPT_PATH) or "").strip()
+    if not system_prompt:
+        raise RuntimeError(
+            "Missing required OpenAI Codex system prompt template. "
+            f"Expected one of: {_TASK_SYSTEM_PROMPT_PATH}, {_DEFAULT_TASK_SYSTEM_PROMPT_PATH}"
+        )
+
+    runtime_policy_appendix = (
+        _load_prompt_template(_MANDATORY_RUNTIME_POLICY_APPENDIX_PATH) or ""
     ).strip()
-    lines = [
-        system_prompt,
-        "",
-        "Canonical task instruction (do not change user intent):",
-        instruction,
-    ]
-    if not supplemental_guidance:
-        return "\n".join(lines).strip()
-    lines.extend(["", "Supplemental execution guidance (do not change canonical user intent):"])
-    lines.extend(str(item).strip() for item in supplemental_guidance if str(item).strip())
-    return "\n".join(lines).strip()
+    if not runtime_policy_appendix:
+        raise RuntimeError(
+            "Missing required OpenAI Codex runtime policy appendix template. "
+            f"Expected: {_MANDATORY_RUNTIME_POLICY_APPENDIX_PATH}"
+        )
+    if runtime_policy_appendix.lower() not in system_prompt.lower():
+        system_prompt = f"{system_prompt}\n\n{runtime_policy_appendix}".strip()
+
+    supplemental_section = ""
+    filtered_guidance = [str(item).strip() for item in supplemental_guidance if str(item).strip()]
+    if filtered_guidance:
+        supplemental_section_template = _load_prompt_template(_SUPPLEMENTAL_GUIDANCE_SECTION_PATH)
+        if not supplemental_section_template.strip():
+            raise RuntimeError(
+                "Missing required OpenAI Codex supplemental guidance section template. "
+                f"Expected: {_SUPPLEMENTAL_GUIDANCE_SECTION_PATH}"
+            )
+        supplemental_section = "\n\n" + _load_prompt_template(
+            _SUPPLEMENTAL_GUIDANCE_SECTION_PATH,
+            {"guidance_lines": "\n".join(filtered_guidance)},
+        ).strip()
+
+    wrapped = _load_prompt_template(
+        _INSTRUCTION_WRAPPER_PROMPT_PATH,
+        {
+            "system_prompt": system_prompt,
+            "instruction": instruction,
+            "supplemental_section": supplemental_section,
+        },
+    )
+    if not wrapped.strip():
+        raise RuntimeError(
+            "Missing required OpenAI Codex instruction wrapper template. "
+            f"Expected: {_INSTRUCTION_WRAPPER_PROMPT_PATH}"
+        )
+    return wrapped.strip()
 
 
 def _detect_codex_workaround_signal(*texts: str) -> Optional[str]:
@@ -720,9 +781,14 @@ def _detect_codex_workaround_signal(*texts: str) -> Optional[str]:
         if not source:
             continue
         for pattern in _CODEX_WORKAROUND_PATTERNS:
-            match = pattern.search(source)
-            if match:
-                return match.group(0)
+            for match in pattern.finditer(source):
+                snippet = match.group(0).strip()
+                if not snippet:
+                    continue
+                lowered = snippet.lower()
+                if any(hint in lowered for hint in _CODEX_WORKAROUND_NEGATION_HINTS):
+                    continue
+                return snippet
     return None
 
 
@@ -1113,7 +1179,10 @@ def _run_codex_task(
                 "exitCode": exit_code,
             }
 
-        policy_signal = _detect_codex_workaround_signal(last_message, stdout)
+        policy_signal = _detect_codex_workaround_signal(last_message)
+        if not policy_signal and not last_message.strip():
+            # Fallback only when the CLI did not emit a final assistant message.
+            policy_signal = _detect_codex_workaround_signal(stdout)
         if policy_signal:
             detail = (
                 "Codex CLI is mandatory in this backend, but worker output suggests a workaround "
