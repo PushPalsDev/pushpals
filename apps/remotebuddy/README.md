@@ -147,6 +147,19 @@ Troubleshooting – If Bun crashes, loops on cache errors, or still reports miss
 
 ## Operational Runbook (Updated Feb 2026)
 
+### Queue health monitoring & triage
+
+- **Telemetry watchlist** – Keep `/system/status` tailing so you can see `slo.requests.queueWaitMs.p95` (aka `queue_p95`) alongside `queues.requests.pending`, and pin Grafana’s WorkerPals Job Outcomes panel for `job_failure_rate` (task.execute failures / total jobs in the last 10 minutes). Pair those with `sig_queue_health` logs so autonomous spikes are surfaced even when dashboards lag.
+- **Alert thresholds** – Treat the table below as additive to the [queue-health doc](apps/remotebuddy/docs/queue-health.md); hit the warning column as soon as either signal drifts for ≥3 polls so you can stop background traffic before pages fire.
+
+| Signal | Warning (self-triage) | Page-worthy | Immediate action |
+| --- | --- | --- | --- |
+| `queue_p95` | ≥ 1.0 s for 3 polls **or** pending interactive ≥ 15 | ≥ 1.5 s for 5 min **or** queue depth > 60 / < 2 idle workers for 5 polls | Freeze background/eval submissions, confirm automation injected remediation jobs, and add WorkerPal capacity until idle ≥ 2 per lane. |
+| `job_failure_rate` | ≥ 0.25 rolling 10 min | ≥ 0.40 rolling 10 min | Pull the most recent WorkerPals logs, look for retry storms/regressions, and prep the worker restart flow if failure spikes persist. |
+
+- **Fast load-spike detection tips** – Run `watch -n 5 curl -sS $SERVER/system/status | jq '{p95: .slo.requests.queueWaitMs.p95, pending: .queues.requests.pending, jobs: .queues.jobPendingSnapshot}'` during incidents so you catch >0.5 s jumps before alerts aggregate, and keep `tail -f logs/remotebuddy.log | rg sig_queue_health` open to spot remediation bursts. When `queue_p95` jumps ≥0.3 s between polls, immediately check `/requests?status=pending&limit=20` for aging interactive prompts and manually re-prioritize them.
+- **Escalation steps** – 1) Announce the metric breach with snapshots in `#pushpals-ops`; 2) loop WorkerPals/Platform on-call if warning bands last >10 minutes or `job_failure_rate` crosses 0.4; 3) page Infrastructure/SRE if worker restarts do not clear the spike or shared services look unhealthy. Keep time-stamped updates every 15 minutes until `queue_p95` < 1.0 s and `job_failure_rate` < 0.2 for two consecutive polls.
+
 ### Queue-handling flow (current state)
 
 1. RemoteBuddy polls `POST /requests/claim` every ~2 s, dedups via the idempotency cache, and computes `queueWaitBudgetMs` (≥ 20 s interactive, 90 s default, 240 s background).
