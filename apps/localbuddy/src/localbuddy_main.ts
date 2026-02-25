@@ -15,6 +15,7 @@ import { randomUUID } from "crypto";
 import {
   CommunicationManager,
   detectRepoRoot,
+  connectSessionWithRetry,
   loadPromptTemplate,
   loadPushPalsConfig,
 } from "shared";
@@ -1008,36 +1009,6 @@ class LocalBuddyServer {
 
 // ─── Session creation helper ────────────────────────────────────────────────
 
-async function connectWithRetry(
-  server: string,
-  sessionId: string,
-  maxRetries = 10,
-  baseDelay = 2000,
-  maxDelay = 30000,
-): Promise<string> {
-  let attempt = 0;
-  while (true) {
-    attempt++;
-    try {
-      const res = await fetch(`${server}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-      const data = (await res.json()) as { sessionId: string };
-      return data.sessionId;
-    } catch (err: any) {
-      if (attempt >= maxRetries) throw err;
-      const delay = Math.min(baseDelay * 2 ** (attempt - 1), maxDelay);
-      console.log(
-        `[LocalBuddy] Server unavailable (${err.message}), retrying in ${(delay / 1000).toFixed(1)}s… (attempt ${attempt})`,
-      );
-      await Bun.sleep(delay);
-    }
-  }
-}
-
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1049,7 +1020,12 @@ async function main() {
 
   // Create or join session (with retry - server may not be up yet)
   console.log(`[LocalBuddy] Ensuring session "${opts.sessionId}" exists on server…`);
-  const sessionId = await connectWithRetry(opts.server, opts.sessionId);
+  const sessionId = await connectSessionWithRetry({
+    server: opts.server,
+    sessionId: opts.sessionId,
+    component: "LocalBuddy",
+    maxRetries: 10,
+  });
   console.log(`[LocalBuddy] Using session: ${sessionId}`);
 
   // Start LocalBuddy HTTP server

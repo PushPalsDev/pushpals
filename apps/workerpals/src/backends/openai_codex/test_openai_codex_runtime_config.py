@@ -14,6 +14,7 @@ from openai_codex_executor import (
     _build_instruction,
     _detect_codex_workaround_signal,
     _load_prompt_template,
+    _scan_codex_workaround_policy,
     _repo_root_for_prompt_loading,
 )
 
@@ -82,6 +83,13 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
     def test_detects_explicit_fallback_language(self) -> None:
         signal = _detect_codex_workaround_signal(
             "Codex CLI isn't available, so I switched to a fallback and continued with edits.",
+        )
+        self.assertIsNotNone(signal)
+
+    def test_stdout_signal_detected_even_when_last_message_is_present(self) -> None:
+        signal = _scan_codex_workaround_policy(
+            "Codex CLI login succeeded; continuing with edits.",
+            "Codex CLI isn't available, so I switched to a fallback and kept working.",
         )
         self.assertIsNotNone(signal)
 

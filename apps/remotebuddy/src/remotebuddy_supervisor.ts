@@ -7,7 +7,8 @@ const restartEnabled = CONFIG.remotebuddy.crashRestartEnabled;
 const maxRestarts = Math.max(0, CONFIG.remotebuddy.crashRestartMaxRestarts);
 const restartBackoffMs = Math.max(0, CONFIG.remotebuddy.crashRestartBackoffMs);
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
-const command = [bunExecPath, "run", "src/remotebuddy_main.ts"];
+const runtimeArgs = process.argv.slice(2);
+const command = [bunExecPath, "run", "src/remotebuddy_main.ts", ...runtimeArgs];
 
 let activeChild: ReturnType<typeof Bun.spawn> | null = null;
 let shuttingDown = false;

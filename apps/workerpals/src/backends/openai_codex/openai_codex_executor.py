@@ -792,6 +792,10 @@ def _detect_codex_workaround_signal(*texts: str) -> Optional[str]:
     return None
 
 
+def _scan_codex_workaround_policy(last_message: str, stdout: str) -> Optional[str]:
+    return _detect_codex_workaround_signal(last_message, stdout)
+
+
 def _read_text_if_exists(path: Path) -> str:
     try:
         if not path.exists():
@@ -1179,10 +1183,7 @@ def _run_codex_task(
                 "exitCode": exit_code,
             }
 
-        policy_signal = _detect_codex_workaround_signal(last_message)
-        if not policy_signal and not last_message.strip():
-            # Fallback only when the CLI did not emit a final assistant message.
-            policy_signal = _detect_codex_workaround_signal(stdout)
+        policy_signal = _scan_codex_workaround_policy(last_message, stdout)
         if policy_signal:
             detail = (
                 "Codex CLI is mandatory in this backend, but worker output suggests a workaround "
