@@ -1,223 +1,223 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { WorkerpalsRuntimeConfig } from "../../apps/workerpals/src/common/executor_backend";
+import { describe, expect, test } from "bun:test";
+import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
+import { loadPushPalsConfig } from "../../packages/shared/src/config";
 import { executeJob } from "../../apps/workerpals/src/execute_job";
-import type { BackendTaskExecutor } from "../../apps/workerpals/src/backends/types";
+import type { WorkerpalsRuntimeConfig } from "../../apps/workerpals/src/common/executor_backend";
+import type { ExecutorBackend } from "../../apps/workerpals/src/common/types";
+import {
+  BACKEND_EXECUTOR_SCRIPT_SEGMENTS,
+} from "../../apps/workerpals/src/backends/backend_config";
 import {
   getBackendTaskExecutor,
   registerBackendTaskExecutor,
+  unregisterBackendTaskExecutor,
+  type BackendTaskExecutor,
 } from "../../apps/workerpals/src/backends/task_execute_registry";
 
-const REPO_ROOT = process.cwd();
-const TEST_RUNTIME_WORKERPALS_CONFIG = {
-  executor: "miniswe",
-  fileModifyingJobs: ["task.execute"],
-  outputMaxChars: 32_768,
-  outputMaxLines: 400,
-  outputMaxHeadLines: 120,
-  executorResultPrefix: "__PUSHPALS_TEST_RESULT__ ",
-  qualityValidationStepTimeoutMs: 120_000,
-  qualityCriticMaxDiffChars: 16_000,
-  qualityCriticMaxValidationOutputChars: 8_000,
-  qualityCriticTimeoutMs: 45_000,
-  qualityMaxAutoRevisions: 0,
-  qualitySoftPassOnExhausted: false,
-  qualityCriticMinScore: 8,
-  requirePush: false,
-  pushAgentBranch: false,
-  llm: {
-    backend: "local",
-    endpoint: "http://127.0.0.1:1234/v1/chat/completions",
-    model: "codellama:13b",
-    apiKey: "",
-    sessionId: "test-session",
-    reasoningEffort: "medium",
-    codexAuthMode: "local",
-    codexBin: "codex",
-    codexTimeoutMs: 60_000,
-  },
-} as const;
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FIXTURE_REPO = resolve(__dirname, "fixtures", "task-execute-repo");
+const TEST_BACKEND = "__test_task_execute_backend__" as ExecutorBackend;
 
-const TEST_RUNTIME_CONFIG_TEMPLATE: WorkerpalsRuntimeConfig = {
-  projectRoot: REPO_ROOT,
-  workerpals: {
-    ...TEST_RUNTIME_WORKERPALS_CONFIG,
-    fileModifyingJobs: [...TEST_RUNTIME_WORKERPALS_CONFIG.fileModifyingJobs],
-    llm: { ...TEST_RUNTIME_WORKERPALS_CONFIG.llm },
-  },
-};
+type ForwardedLog = { stream: "stdout" | "stderr"; line: string };
+type Cleanup = () => void;
 
-interface HarnessCall {
-  stream: "stdout" | "stderr";
-  line: string;
+function stubBackendScriptSegmentsForTesting(
+  backend: ExecutorBackend,
+  segments: readonly string[] = [],
+): Cleanup {
+  const hadEntry = Object.prototype.hasOwnProperty.call(
+    BACKEND_EXECUTOR_SCRIPT_SEGMENTS,
+    backend,
+  );
+  const previousSegments = BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend];
+  BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend] = segments;
+  return () => {
+    if (!hadEntry) {
+      delete BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend];
+    } else {
+      BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend] = previousSegments ?? [];
+    }
+  };
 }
 
-function createHarness() {
-  const calls: HarnessCall[] = [];
-  const log = (stream: "stdout" | "stderr", line: string) => {
-    calls.push({ stream, line });
+function installTestBackendExecutor(executor: BackendTaskExecutor): Cleanup {
+  const previousExecutor = getBackendTaskExecutor(TEST_BACKEND);
+  registerBackendTaskExecutor(TEST_BACKEND, executor);
+  return () => {
+    if (previousExecutor) {
+      registerBackendTaskExecutor(TEST_BACKEND, previousExecutor);
+    } else {
+      unregisterBackendTaskExecutor(TEST_BACKEND);
+    }
   };
-  return { calls, log };
 }
 
-function createTaskParams(overrides: Record<string, unknown> = {}) {
-  const basePlanning = {
-    intent: "code_change",
-    riskLevel: "low",
-    scope: {
-      readAnywhere: true,
-      writeAllowed: true,
-      writeGlobs: ["README.md"],
-    },
-    discovery: {
-      ripgrepQueries: ["readme"],
-      likelyDirs: ["."],
-      keywords: ["docs"],
-    },
-    acceptanceCriteria: ["Document change applied"],
-    validationSteps: ["bun test tests/workerpals.task-execute-schema.test.ts"],
-    queuePriority: "normal",
-    queueWaitBudgetMs: 60_000,
-    executionBudgetMs: 120_000,
-    finalizationBudgetMs: 60_000,
-  };
-
+function createTaskExecuteParams(): Record<string, unknown> {
   return {
     schemaVersion: 2,
-    instruction: "Append a changelog entry.",
-    planning: basePlanning,
-    ...overrides,
-  };
-}
-
-function createRuntimeConfig(): WorkerpalsRuntimeConfig {
-  return {
-    projectRoot: TEST_RUNTIME_CONFIG_TEMPLATE.projectRoot,
-    workerpals: {
-      ...TEST_RUNTIME_CONFIG_TEMPLATE.workerpals,
-      fileModifyingJobs: [...TEST_RUNTIME_CONFIG_TEMPLATE.workerpals.fileModifyingJobs],
-      llm: { ...TEST_RUNTIME_CONFIG_TEMPLATE.workerpals.llm },
+    lane: "deterministic",
+    instruction: "Summarize the fixture repository README for release notes.",
+    planning: {
+      intent: "analysis",
+      riskLevel: "low",
+      scope: {
+        readAnywhere: true,
+        writeAllowed: false,
+        writeGlobs: [],
+      },
+      discovery: {
+        ripgrepQueries: ["fixture repository summary"],
+        likelyDirs: ["docs"],
+      },
+      acceptanceCriteria: ["Summary mentions the fixture README context."],
+      validationSteps: ["bun lint docs"],
+      queuePriority: "normal",
+      queueWaitBudgetMs: 60_000,
+      executionBudgetMs: 120_000,
+      finalizationBudgetMs: 60_000,
     },
-  } satisfies WorkerpalsRuntimeConfig;
-}
-
-interface MinisweExecutorSnapshot {
-  executor?: BackendTaskExecutor;
-  hadExecutor: boolean;
-}
-
-function captureMinisweExecutorSnapshot(): MinisweExecutorSnapshot {
-  const executor = getBackendTaskExecutor("miniswe");
-  return { executor, hadExecutor: typeof executor === "function" };
-}
-
-function unregisterMinisweExecutor(): void {
-  registerBackendTaskExecutor("miniswe", undefined as unknown as BackendTaskExecutor);
-}
-
-function restoreMinisweExecutor(snapshot: MinisweExecutorSnapshot): void {
-  if (snapshot.hadExecutor && snapshot.executor) {
-    registerBackendTaskExecutor("miniswe", snapshot.executor);
-    return;
-  }
-  unregisterMinisweExecutor();
-}
-
-function stubMinisweExecutor(stub: BackendTaskExecutor): void {
-  registerBackendTaskExecutor("miniswe", stub);
-}
-
-function temporarilyRemoveMinisweExecutor(): void {
-  unregisterMinisweExecutor();
+  };
 }
 
 describe("task.execute integration harness", () => {
-  let runtimeConfig: WorkerpalsRuntimeConfig;
-  let minisweSnapshot: MinisweExecutorSnapshot | null = null;
+  test("returns executor result and forwards logs", async () => {
+    const runtimeConfig = loadPushPalsConfig({ reload: true });
 
-  beforeEach(() => {
-    runtimeConfig = createRuntimeConfig();
-    minisweSnapshot = captureMinisweExecutorSnapshot();
-  });
+    const testRuntimeConfig: WorkerpalsRuntimeConfig = {
+      ...runtimeConfig,
+      workerpals: {
+        ...runtimeConfig.workerpals,
+        executor: TEST_BACKEND,
+      },
+    };
 
-  afterEach(() => {
-    if (minisweSnapshot) {
-      try {
-        restoreMinisweExecutor(minisweSnapshot);
-      } finally {
-        minisweSnapshot = null;
-      }
-    } else {
-      unregisterMinisweExecutor();
+    const stubResult = {
+      ok: true,
+      summary: "stub executor completed",
+      stdout: "__stub_stdout__",
+      stderr: "__stub_stderr__",
+      exitCode: 0,
+    };
+
+    const forwardedLogs: ForwardedLog[] = [];
+    let observedRepo: string | null = null;
+    let observedRuntime: WorkerpalsRuntimeConfig | null = null;
+    let observedBudgets: { executionBudgetMs?: number; finalizationBudgetMs?: number } | null = null;
+
+    const stubExecutor: BackendTaskExecutor = async (
+      kind,
+      _params,
+      repo,
+      runtime,
+      onLog,
+      budgets,
+    ) => {
+      observedRepo = repo;
+      observedRuntime = runtime;
+      observedBudgets = budgets ? { ...budgets } : null;
+      onLog?.("stdout", `[stub] executing ${kind}`);
+      onLog?.("stderr", `[stub] budgets=${JSON.stringify(budgets ?? {})}`);
+      return stubResult;
+    };
+    const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
+    const restoreExecutor = installTestBackendExecutor(stubExecutor);
+
+    try {
+      const result = await executeJob(
+        "task.execute",
+        createTaskExecuteParams(),
+        FIXTURE_REPO,
+        (stream, line) => {
+          forwardedLogs.push({ stream, line });
+        },
+        testRuntimeConfig,
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.summary).toBe(stubResult.summary);
+      expect(result.stdout).toBe(stubResult.stdout);
+      expect(result.stderr).toBe(stubResult.stderr);
+      expect(result.exitCode).toBe(0);
+      expect(observedRepo).toBe(FIXTURE_REPO);
+      expect(observedRuntime).toBe(testRuntimeConfig);
+      expect(observedBudgets).toEqual({
+        executionBudgetMs: 120_000,
+        finalizationBudgetMs: 60_000,
+      });
+      expect(
+        forwardedLogs.some(
+          (entry) => entry.stream === "stdout" && entry.line.includes("[stub] executing"),
+        ),
+      ).toBe(true);
+      expect(
+        forwardedLogs.some(
+          (entry) => entry.stream === "stderr" && entry.line.includes("budgets="),
+        ),
+      ).toBe(true);
+    } finally {
+      restoreExecutor();
+      restoreSegments();
     }
   });
 
-  test("propagates backend failure contract with captured stderr", async () => {
-    const harness = createHarness();
-    const params = createTaskParams();
-    const failureResult = {
-      ok: false,
-      summary: "stubbed backend failure",
-      stdout: "partial context",
-      stderr: "fatal: repo dirty",
-      exitCode: 87,
-    };
-    const stub: BackendTaskExecutor = async (kind, receivedParams, repo, config, onLog, budgets) => {
-      expect(kind).toBe("task.execute");
-      expect(receivedParams.planning).toEqual(params.planning);
-      expect(repo).toBe(REPO_ROOT);
-      expect(config).toBe(runtimeConfig);
-      expect(budgets).toEqual({
-        executionBudgetMs: params.planning.executionBudgetMs,
-        finalizationBudgetMs: params.planning.finalizationBudgetMs,
-      });
-      onLog?.("stderr", "backend stderr line");
-      return failureResult;
+  test("unregister backend executors removes the binding", async () => {
+    const runtimeConfig = loadPushPalsConfig({ reload: true });
+
+    const testRuntimeConfig: WorkerpalsRuntimeConfig = {
+      ...runtimeConfig,
+      workerpals: {
+        ...runtimeConfig.workerpals,
+        executor: TEST_BACKEND,
+      },
     };
 
-    stubMinisweExecutor(stub);
+    const stubResult = {
+      ok: true,
+      summary: "stub executor before unregister",
+      stdout: "__stub_stdout__",
+      stderr: "",
+      exitCode: 0,
+    };
 
-    const result = await executeJob(
-      "task.execute",
-      params,
-      REPO_ROOT,
-      harness.log,
-      runtimeConfig,
-    );
+    const stubExecutor: BackendTaskExecutor = async () => stubResult;
+    const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
+    const restoreExecutor = installTestBackendExecutor(stubExecutor);
 
-    expect(result).toMatchObject(failureResult);
+    try {
+      const initialResult = await executeJob(
+        "task.execute",
+        createTaskExecuteParams(),
+        FIXTURE_REPO,
+        undefined,
+        testRuntimeConfig,
+      );
 
-    expect(harness.calls.length).toBe(2);
-    const qualityGateLog = harness.calls[0]!;
-    const backendLog = harness.calls[1]!;
-    expect(qualityGateLog.stream).toBe("stdout");
-    expect(qualityGateLog.line).toContain("[QualityGate]");
-    expect(backendLog.stream).toBe("stderr");
-    expect(backendLog.line).toContain("backend stderr line");
-  });
+      expect(initialResult).toEqual(stubResult);
 
-  test("fails fast when configured executor has no registered backend", async () => {
-    const harness = createHarness();
-    temporarilyRemoveMinisweExecutor();
+      const removed = unregisterBackendTaskExecutor(TEST_BACKEND);
+      expect(removed).toBe(true);
+      expect(getBackendTaskExecutor(TEST_BACKEND)).toBeUndefined();
 
-    const result = await executeJob(
-      "task.execute",
-      createTaskParams(),
-      REPO_ROOT,
-      harness.log,
-      runtimeConfig,
-    );
+      const missingExecutorResult = await executeJob(
+        "task.execute",
+        createTaskExecuteParams(),
+        FIXTURE_REPO,
+        undefined,
+        testRuntimeConfig,
+      );
 
-    expect(result).toMatchObject({
-      ok: false,
-      exitCode: 1,
-      summary: expect.stringContaining('No task executor registered for backend "miniswe"'),
-    });
-    expect(result.stderr).toBeUndefined();
-    expect(result.stdout).toBeUndefined();
+      expect(missingExecutorResult.ok).toBe(false);
+      expect(missingExecutorResult.exitCode).toBe(1);
+      expect(missingExecutorResult.summary).toContain(
+        `No task executor registered for backend "${TEST_BACKEND}"`,
+      );
 
-    expect(harness.calls.length).toBe(1);
-    const qualityGateLog = harness.calls[0]!;
-    expect(qualityGateLog.stream).toBe("stdout");
-    expect(qualityGateLog.line).toContain("[QualityGate]");
+      const secondRemoval = unregisterBackendTaskExecutor(TEST_BACKEND);
+      expect(secondRemoval).toBe(false);
+    } finally {
+      restoreExecutor();
+      restoreSegments();
+    }
   });
 });
