@@ -4,6 +4,7 @@ import { mkdirSync } from "fs";
 import { CommunicationManager } from "../../../packages/shared/src/communication.js";
 import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 import { resolveGitTokenForRemote } from "../../../packages/shared/src/git_backend.js";
+import { ensureSessionWithRetry as ensureSessionWithRetryShared } from "../../../packages/shared/src/runtime.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { GitOps } from "./git";
@@ -216,39 +217,33 @@ function createSessionComm(sessionId: string): CommunicationManager {
   });
 }
 
-async function ensureSessionWithRetry(
+async function ensureStatusSession(
   sessionId: string,
   maxRetries = 10,
   baseDelayMs = 1000,
   maxDelayMs = 10000,
 ): Promise<boolean> {
-  let attempt = 0;
-  while (running) {
-    attempt += 1;
-    try {
-      const response = await fetch(`${config.serverUrl}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId }),
-      });
-      if (response.ok) return true;
-      throw new Error(`HTTP ${response.status}`);
-    } catch (err: any) {
-      if (attempt >= maxRetries) {
-        console.warn(
-          `[${ts()}] Could not ensure session "${sessionId}" for source_control_manager status events: ${err?.message ?? err}`,
-        );
-        return false;
-      }
-      const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-      await Bun.sleep(delayMs);
-    }
+  try {
+    await ensureSessionWithRetryShared(config.serverUrl, {
+      sessionId,
+      authToken: config.authToken ?? null,
+      maxRetries,
+      baseDelayMs,
+      maxDelayMs,
+      logLabel: "SourceControlManagerStatus",
+      shouldContinue: () => running,
+    });
+    return true;
+  } catch (err: any) {
+    console.warn(
+      `[${ts()}] Could not ensure session "${sessionId}" for source_control_manager status events: ${err?.message ?? err}`,
+    );
+    return false;
   }
-  return false;
 }
 
 async function emitStartupStatus(): Promise<void> {
-  const sessionReady = await ensureSessionWithRetry(statusSessionId);
+  const sessionReady = await ensureStatusSession(statusSessionId);
   if (!sessionReady) return;
   statusSessionReady = true;
   const comm = createSessionComm(statusSessionId);
@@ -267,7 +262,7 @@ async function emitInitializingStatus(): Promise<void> {
   // Keep retrying in the background so UI gets an initializing signal even if
   // server/session startup races SourceControlManager boot checks.
   while (running && !statusSessionReady) {
-    const sessionReady = await ensureSessionWithRetry(statusSessionId, 6, 400, 2_500);
+    const sessionReady = await ensureStatusSession(statusSessionId, 6, 400, 2_500);
     if (!sessionReady) {
       await Bun.sleep(1_000);
       continue;
@@ -293,7 +288,7 @@ function startStatusHeartbeat(): void {
     if (!running) return;
     void (async () => {
       if (!statusSessionReady) {
-        statusSessionReady = await ensureSessionWithRetry(statusSessionId, 3, 400, 2500);
+        statusSessionReady = await ensureStatusSession(statusSessionId, 3, 400, 2500);
       }
       const ok = await comm.status(
         "source_control_manager",

@@ -27,6 +27,18 @@ export {
   type PushPalsLmStudioConfig,
 } from "./config.js";
 export {
+  resolveRuntimeArgs,
+  ensureSessionWithRetry,
+  bootstrapRuntime,
+  extractForwardedArgs,
+  type RuntimeArgDefaults,
+  type RuntimeArgResolution,
+  type ResolveRuntimeArgsOptions,
+  type EnsureSessionOptions,
+  type BootstrapRuntimeOptions,
+  type BootstrapRuntimeResult,
+} from "./runtime.js";
+export {
   classifyGlobBreadth,
   componentRootPrefix,
   containsGlobMeta,

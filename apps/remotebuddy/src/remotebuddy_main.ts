@@ -26,15 +26,15 @@ import { PersistentSessionMemory } from "./persistent_memory.js";
 import {
   CommunicationManager,
   detectRepoRoot,
-  connectSessionWithRetry,
   loadPushPalsConfig,
-  loadRuntimeOptions,
+  bootstrapRuntime,
   sanitizePushPalsConfigForLogging,
   matchesGlob,
   normalizeTargetPath,
   normalizeWriteGlob,
+  ensureSessionWithRetry as ensureSessionWithRetryShared,
 } from "shared";
-import { mkdirSync } from "fs";
+import { mkdirSync, writeFileSync } from "fs";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {
   extractExplicitTargetPath,
@@ -765,7 +765,7 @@ class RemoteBuddyOrchestrator {
   }
 
   async emitStartupStatus(): Promise<void> {
-    this.statusSessionReady = await this.ensureSessionWithRetry();
+    this.statusSessionReady = await this.ensureStatusSession();
     if (!this.statusSessionReady) {
       console.warn("[RemoteBuddy] Could not ensure session for startup presence events");
       return;
@@ -782,7 +782,7 @@ class RemoteBuddyOrchestrator {
       this.statusSessionReady = false;
       if (Date.now() >= startupDeadlineMs) break;
       await Bun.sleep(1_000);
-      this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2_500);
+      this.statusSessionReady = await this.ensureStatusSession(3, 400, 2_500);
     }
     if (!startupStatusOk) {
       console.warn("[RemoteBuddy] Failed to emit startup status event");
@@ -795,7 +795,7 @@ class RemoteBuddyOrchestrator {
       if (this.disposed) return;
       void (async () => {
         if (!this.statusSessionReady) {
-          this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2500);
+          this.statusSessionReady = await this.ensureStatusSession(3, 400, 2500);
         }
         const ok = await this.comm.status(this.agentId, "idle", "RemoteBuddy heartbeat");
         if (!ok) {
@@ -805,26 +805,25 @@ class RemoteBuddyOrchestrator {
     }, this.statusHeartbeatMs);
   }
 
-  private async ensureSessionWithRetry(
+  private async ensureStatusSession(
     maxRetries = 20,
     baseDelayMs = 500,
     maxDelayMs = 5000,
   ): Promise<boolean> {
-    for (let attempt = 1; attempt <= maxRetries && !this.disposed; attempt++) {
-      try {
-        const res = await fetch(`${this.server}/sessions`, {
-          method: "POST",
-          headers: this.authHeaders(),
-          body: JSON.stringify({ sessionId: this.sessionId }),
-        });
-        if (res.ok) return true;
-      } catch {
-        // retry
-      }
-      const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-      await Bun.sleep(delayMs);
+    try {
+      await ensureSessionWithRetryShared(this.server, {
+        sessionId: this.sessionId,
+        authToken: this.authToken,
+        maxRetries,
+        baseDelayMs,
+        maxDelayMs,
+        logLabel: "RemoteBuddyStatus",
+        shouldContinue: () => !this.disposed,
+      });
+      return true;
+    } catch {
+      return false;
     }
-    return false;
   }
 
   // ── HTTP helpers ──────────────────────────────────────────────────────
@@ -2017,17 +2016,43 @@ class RemoteBuddyOrchestrator {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
-  const runtimeOptions = loadRuntimeOptions({ config: CONFIG });
+  const runtimeDumpPath = (process.env.REMOTEBUDDY_RUNTIME_DUMP_PATH ?? "").trim();
+  const dumpOnlyMode = runtimeDumpPath.length > 0;
+  const bootstrap = await bootstrapRuntime({
+    config: CONFIG,
+    ensureSession: dumpOnlyMode
+      ? false
+      : {
+          enabled: true,
+          logLabel: "RemoteBuddy",
+          maxRetries: Number.POSITIVE_INFINITY,
+        },
+  });
+  const runtime = bootstrap.runtime;
+  let sessionId = bootstrap.sessionId;
+  if (!sessionId && dumpOnlyMode) {
+    sessionId = runtime.sessionId ?? null;
+    if (!sessionId) {
+      sessionId = "stub-session";
+    }
+  }
+  if (!sessionId) {
+    throw new Error("RemoteBuddy requires a valid sessionId after bootstrap.");
+  }
+
+  if (runtimeDumpPath) {
+    const snapshot = {
+      server: runtime.server,
+      sessionId,
+      authToken: runtime.authToken,
+      rest: runtime.rest,
+    };
+    writeFileSync(runtimeDumpPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+    return;
+  }
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
-  console.log(`[RemoteBuddy] Server: ${runtimeOptions.server}`);
-  if (runtimeOptions.passthroughArgs.length > 0) {
-    console.log(
-      `[RemoteBuddy] Passthrough args detected (ignored by RemoteBuddy): ${runtimeOptions.passthroughArgs.join(
-        " ",
-      )}`,
-    );
-  }
+  console.log(`[RemoteBuddy] Server: ${runtime.server}`);
   if (CONFIG.startup.logConfigOnStart) {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
@@ -2060,15 +2085,6 @@ async function main() {
     }`,
   );
 
-  const requestedSessionId = runtimeOptions.sessionId;
-  const sessionLabel = requestedSessionId ?? "(server-assigned)";
-  console.log(`[RemoteBuddy] Ensuring session "${sessionLabel}" exists on server...`);
-  const sessionId = await connectSessionWithRetry({
-    server: runtimeOptions.server,
-    sessionId: requestedSessionId ?? undefined,
-    component: "RemoteBuddy",
-    maxRetries: Infinity,
-  });
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
   const llmCfg = CONFIG.remotebuddy.llm;
@@ -2083,9 +2099,9 @@ async function main() {
   brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
-    server: runtimeOptions.server,
+    server: runtime.server,
     sessionId,
-    authToken: runtimeOptions.authToken,
+    authToken: runtime.authToken,
     brain,
     llm,
     idempotency,
@@ -2103,7 +2119,9 @@ async function main() {
   orchestrator.startPolling(pollMs);
 }
 
-main().catch((err) => {
-  console.error("[RemoteBuddy] Fatal:", err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("[RemoteBuddy] Fatal:", err);
+    process.exit(1);
+  });
+}

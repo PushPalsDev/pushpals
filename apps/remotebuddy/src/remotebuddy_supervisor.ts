@@ -1,14 +1,16 @@
 #!/usr/bin/env bun
 
-import { loadPushPalsConfig } from "shared";
+import { extractForwardedArgs, loadPushPalsConfig } from "shared";
 
 const CONFIG = loadPushPalsConfig();
 const restartEnabled = CONFIG.remotebuddy.crashRestartEnabled;
 const maxRestarts = Math.max(0, CONFIG.remotebuddy.crashRestartMaxRestarts);
 const restartBackoffMs = Math.max(0, CONFIG.remotebuddy.crashRestartBackoffMs);
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
-const runtimeArgs = process.argv.slice(2);
-const command = [bunExecPath, "run", "src/remotebuddy_main.ts", ...runtimeArgs];
+const childOverride = (process.env.REMOTEBUDDY_SUPERVISOR_CHILD ?? "").trim();
+const childTarget = childOverride || "src/remotebuddy_main.ts";
+const forwarded = extractForwardedArgs(process.argv.slice(2));
+const command = [bunExecPath, "run", childTarget, ...forwarded];
 
 let activeChild: ReturnType<typeof Bun.spawn> | null = null;
 let shuttingDown = false;

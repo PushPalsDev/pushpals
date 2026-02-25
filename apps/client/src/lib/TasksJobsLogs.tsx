@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Platform } from "react-native";
 import type { SessionState, Task, Job, LogLine } from "./eventReducer";
+import { hasClipboardSupport, copyTextToClipboard } from "./clipboard";
 
 const OPENHANDS_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 const JOB_RUNNER_RESULT_PREFIX = "___RESULT___ ";
@@ -17,28 +18,6 @@ function parseTraceTailLines(raw: string | undefined): number {
 }
 
 const TRACE_TAIL_LINES = parseTraceTailLines(process.env.EXPO_PUBLIC_PUSHPALS_TRACE_TAIL_LINES);
-
-async function copyTextToClipboard(text: string): Promise<boolean> {
-  const value = String(text ?? "").trim();
-  if (!value) return false;
-  try {
-    const maybeNavigator = (
-      globalThis as {
-        navigator?: {
-          clipboard?: {
-            writeText?: (data: string) => Promise<void>;
-          };
-        };
-      }
-    ).navigator;
-    const writeText = maybeNavigator?.clipboard?.writeText;
-    if (typeof writeText !== "function") return false;
-    await writeText(value);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 type TraceTone = "reasoning" | "action" | "info" | "error";
 
@@ -449,6 +428,12 @@ function createStyles(palette: TracePalette, theme?: TasksJobsLogsTheme) {
       color: palette.text,
       fontFamily: sans,
     },
+    copyIdsButtonDisabled: {
+      opacity: 0.45,
+    },
+    copyIdsButtonDisabledText: {
+      color: palette.textMuted,
+    },
     jobError: {
       fontSize: 12,
       color: palette.danger,
@@ -645,7 +630,11 @@ function JobRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [showRawLogs, setShowRawLogs] = useState(false);
-  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "unavailable">("idle");
+  const initialClipboardAvailable = useMemo(hasClipboardSupport, []);
+  const [clipboardAvailable, setClipboardAvailable] = useState(initialClipboardAvailable);
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "unavailable">(
+    initialClipboardAvailable ? "idle" : "unavailable",
+  );
   const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const color = statusColor(job.status, palette);
 
@@ -659,15 +648,36 @@ function JobRow({
     },
     [],
   );
+  useEffect(() => {
+    if (!clipboardAvailable && copyResetTimerRef.current) {
+      clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = null;
+    }
+    if (!clipboardAvailable) {
+      setCopyStatus("unavailable");
+    }
+  }, [clipboardAvailable]);
 
   const handleCopyIds = useCallback(async () => {
+    if (!clipboardAvailable) {
+      setCopyStatus("unavailable");
+      return;
+    }
     const parts = [`jobId=${job.jobId}`];
     if (job.workerId) parts.push(`workerId=${job.workerId}`);
     const didCopy = await copyTextToClipboard(parts.join("\n"));
-    setCopyStatus(didCopy ? "copied" : "unavailable");
+    if (!didCopy) {
+      setClipboardAvailable(false);
+      setCopyStatus("unavailable");
+      return;
+    }
+    setCopyStatus("copied");
     if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current);
-    copyResetTimerRef.current = setTimeout(() => setCopyStatus("idle"), didCopy ? 1600 : 2600);
-  }, [job.jobId, job.workerId]);
+    copyResetTimerRef.current = setTimeout(() => {
+      setCopyStatus("idle");
+      copyResetTimerRef.current = null;
+    }, 1600);
+  }, [clipboardAvailable, job.jobId, job.workerId]);
 
   const stdoutLines = useMemo(
     () => logs.filter((line) => line.stream === "stdout").sort((a, b) => a.seq - b.seq),
@@ -712,12 +722,26 @@ function JobRow({
                 <Text style={styles.identifierText}>workerId=--</Text>
               )}
             </View>
-            <TouchableOpacity style={styles.copyIdsButton} onPress={handleCopyIds}>
-              <Text style={styles.copyIdsButtonText}>
+            <TouchableOpacity
+              style={[
+                styles.copyIdsButton,
+                !clipboardAvailable && styles.copyIdsButtonDisabled,
+              ]}
+              onPress={handleCopyIds}
+              disabled={!clipboardAvailable}
+            >
+              <Text
+                style={[
+                  styles.copyIdsButtonText,
+                  !clipboardAvailable && styles.copyIdsButtonDisabledText,
+                ]}
+              >
                 {copyStatus === "copied"
                   ? "Copied IDs"
                   : copyStatus === "unavailable"
-                    ? "Select text to copy"
+                    ? initialClipboardAvailable
+                      ? "Copy unavailable"
+                      : "Select text to copy"
                     : "Copy IDs"}
               </Text>
             </TouchableOpacity>

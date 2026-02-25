@@ -15,9 +15,10 @@ import { randomUUID } from "crypto";
 import {
   CommunicationManager,
   detectRepoRoot,
-  connectSessionWithRetry,
   loadPromptTemplate,
   loadPushPalsConfig,
+  bootstrapRuntime,
+  ensureSessionWithRetry as ensureSessionWithRetryShared,
 } from "shared";
 import { createLLMClient, type LLMClient } from "../../remotebuddy/src/llm.js";
 import {
@@ -34,37 +35,80 @@ import { answerLocalReadonlyQuery, isLocalReadonlyQueryPrompt } from "./local_re
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
+const LOCALBUDDY_PORT_MIN = 1;
+const LOCALBUDDY_PORT_MAX = 65535;
 
-function parseArgs(): {
+function parsePortValue(rawValue: string | undefined, sourceFlag: string): number {
+  if (rawValue === undefined) {
+    throw new Error(`${sourceFlag} requires a port value (example: ${sourceFlag} 3003).`);
+  }
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    throw new Error(
+      `${sourceFlag} requires a non-empty numeric value between ${LOCALBUDDY_PORT_MIN} and ${LOCALBUDDY_PORT_MAX}.`,
+    );
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(
+      `Invalid ${sourceFlag} value "${rawValue}": port must be an integer between ${LOCALBUDDY_PORT_MIN} and ${LOCALBUDDY_PORT_MAX}.`,
+    );
+  }
+  const port = Number.parseInt(trimmed, 10);
+  if (port < LOCALBUDDY_PORT_MIN || port > LOCALBUDDY_PORT_MAX) {
+    throw new Error(
+      `Invalid ${sourceFlag} value "${trimmed}": port must be between ${LOCALBUDDY_PORT_MIN} and ${LOCALBUDDY_PORT_MAX}.`,
+    );
+  }
+  return port;
+}
+
+export function resolveLocalBuddyPort(args: readonly string[], defaultPort: number): number {
+  let port = defaultPort;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--port") {
+      port = parsePortValue(args[i + 1], "--port");
+      i++;
+      continue;
+    }
+    if (arg.startsWith("--port=")) {
+      port = parsePortValue(arg.slice("--port=".length), "--port");
+    }
+  }
+  return port;
+}
+
+async function parseArgs(): Promise<{
   server: string;
   port: number;
   sessionId: string;
   authToken: string | null;
-} {
-  const args = process.argv.slice(2);
-  let server = CONFIG.server.url;
-  let port = CONFIG.localbuddy.port;
-  let sessionId = CONFIG.sessionId;
-  let authToken = CONFIG.authToken;
+}> {
+  const bootstrap = await bootstrapRuntime({
+    config: CONFIG,
+    requireSessionInput: true,
+    ensureSession: {
+      enabled: true,
+      logLabel: "LocalBuddy",
+    },
+  });
 
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case "--server":
-        server = args[++i];
-        break;
-      case "--port":
-        port = parseInt(args[++i], 10);
-        break;
-      case "--sessionId":
-        sessionId = args[++i];
-        break;
-      case "--token":
-        authToken = args[++i];
-        break;
-    }
+  const runtime = bootstrap.runtime;
+  const port = resolveLocalBuddyPort(runtime.rest, CONFIG.localbuddy.port);
+
+  const sessionId = bootstrap.sessionId;
+  if (!sessionId) {
+    throw new Error(
+      "LocalBuddy requires a sessionId. Set session_id in config/default.toml or pass --sessionId.",
+    );
   }
 
-  return { server, port, sessionId, authToken };
+  return {
+    server: runtime.server,
+    port,
+    sessionId,
+    authToken: runtime.authToken,
+  };
 }
 
 function parseStatusHeartbeatMs(fallbackMs: number): number {
@@ -612,31 +656,28 @@ class LocalBuddyServer {
     });
     let stopping = false;
     let statusSessionReady = false;
-    const ensureSessionWithRetry = async (
+    const ensureStatusSession = async (
       maxRetries = 20,
       baseDelayMs = 500,
       maxDelayMs = 5000,
     ): Promise<boolean> => {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
-      for (let attempt = 1; attempt <= maxRetries && !stopping; attempt++) {
-        try {
-          const res = await fetch(`${serverUrl}/sessions`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ sessionId }),
-          });
-          if (res.ok) return true;
-        } catch {
-          // retry
-        }
-        const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-        await Bun.sleep(delayMs);
+      try {
+        await ensureSessionWithRetryShared(serverUrl, {
+          sessionId,
+          authToken,
+          maxRetries,
+          baseDelayMs,
+          maxDelayMs,
+          logLabel: "LocalBuddyStatus",
+          shouldContinue: () => !stopping,
+        });
+        return true;
+      } catch {
+        return false;
       }
-      return false;
     };
     const emitStartupPresence = async (): Promise<void> => {
-      const ready = await ensureSessionWithRetry();
+      const ready = await ensureStatusSession();
       if (!ready) {
         console.warn("[LocalBuddy] Could not ensure session for startup presence events");
         return;
@@ -651,7 +692,7 @@ class LocalBuddyServer {
         statusSessionReady = false;
         if (Date.now() >= startupDeadlineMs) break;
         await Bun.sleep(1_000);
-        statusSessionReady = await ensureSessionWithRetry(3, 400, 2_500);
+        statusSessionReady = await ensureStatusSession(3, 400, 2_500);
       }
       console.warn("[LocalBuddy] Failed to emit startup status event");
     };
@@ -663,7 +704,7 @@ class LocalBuddyServer {
             void (async () => {
               if (stopping) return;
               if (!statusSessionReady) {
-                statusSessionReady = await ensureSessionWithRetry(3, 400, 2500);
+                statusSessionReady = await ensureStatusSession(3, 400, 2500);
               }
               const ok = await comm.status(agentId, "idle", "LocalBuddy heartbeat");
               if (!ok) {
@@ -1007,38 +1048,28 @@ class LocalBuddyServer {
   }
 }
 
-// ─── Session creation helper ────────────────────────────────────────────────
-
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
-  const opts = parseArgs();
+  const opts = await parseArgs();
 
   console.log(`[LocalBuddy] PushPals LocalBuddy - HTTP Server`);
   console.log(`[LocalBuddy] Server: ${opts.server}`);
   console.log(`[LocalBuddy] Port: ${opts.port}`);
-
-  // Create or join session (with retry - server may not be up yet)
-  console.log(`[LocalBuddy] Ensuring session "${opts.sessionId}" exists on server…`);
-  const sessionId = await connectSessionWithRetry({
-    server: opts.server,
-    sessionId: opts.sessionId,
-    component: "LocalBuddy",
-    maxRetries: 10,
-  });
-  console.log(`[LocalBuddy] Using session: ${sessionId}`);
+  console.log(`[LocalBuddy] Using session: ${opts.sessionId}`);
 
   // Start LocalBuddy HTTP server
   const agent = new LocalBuddyServer({
     server: opts.server,
-    sessionId,
+    sessionId: opts.sessionId,
     authToken: opts.authToken,
   });
 
   await agent.startServer(opts.port);
 }
-
-main().catch((err) => {
-  console.error("[LocalBuddy] Fatal:", err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("[LocalBuddy] Fatal:", err);
+    process.exit(1);
+  });
+}
