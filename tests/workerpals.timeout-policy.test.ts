@@ -5,7 +5,7 @@ import {
   computeTimeoutWarningWindow,
   parseDockerTimeoutMs,
   parseOpenHandsTimeoutMs,
-} from "../apps/workerpals/src/timeout_policy";
+} from "../packages/shared/src/timeout_policy";
 
 describe("workerpals timeout policy", () => {
   test("uses expected defaults", () => {

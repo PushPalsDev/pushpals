@@ -21,15 +21,17 @@
  */
 
 import type { CommandRequest } from "protocol";
-import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import { resolve } from "path";
 import {
-  detectRepoRoot,
   loadPromptTemplate,
   loadPushPalsConfig,
   resolveGitTokenForRemote,
+  loadWorkerRuntimeOptions,
+  resolveWorkerRuntimeDefaults,
+  RuntimeCliError,
 } from "shared";
+import type { WorkerRuntimeOptions } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
 import { Logger } from "./common/logger.js";
 import {
@@ -43,7 +45,6 @@ import {
 } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
-import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 
 type CommitRef = {
   branch: string;
@@ -64,6 +65,9 @@ const DEFAULT_LLM_MODEL = "local-model";
 const CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
 const CONFIG = loadPushPalsConfig();
 const LOG = new Logger("WorkerPals");
+const WORKER_RUNTIME_DEFAULTS = resolveWorkerRuntimeDefaults(CONFIG, {
+  worktreeBaseRef: CONFIG.workerpals.baseRef || `origin/${integrationBranchName()}`,
+});
 
 function workerLlmConfig(runtimeConfig: ReturnType<typeof loadPushPalsConfig>): {
   model: string;
@@ -133,125 +137,6 @@ function shouldRecycleWorkerForCodexUnavailableFailure(
     "codex cli isn't available",
     "codex cli is mandatory in this backend",
   ].some((needle) => text.includes(needle));
-}
-
-function parseArgs(): {
-  server: string;
-  pollMs: number;
-  heartbeatMs: number;
-  repo: string;
-  workerId: string;
-  authToken: string | null;
-  docker: boolean;
-  requireDocker: boolean;
-  dockerImage: string;
-  gitToken: string | null;
-  dockerTimeout: number;
-  dockerIdleTimeout: number;
-  dockerNetworkMode: string;
-  worktreeBaseRef: string;
-  labels: string[];
-  failureCooldownMs: number;
-} {
-  const args = process.argv.slice(2);
-  let server = CONFIG.server.url;
-  let pollMs = CONFIG.workerpals.pollMs;
-  let heartbeatMs = CONFIG.workerpals.heartbeatMs;
-  let repo = detectRepoRoot(process.cwd());
-  let workerId = `workerpal-${randomUUID().substring(0, 8)}`;
-  let authToken = CONFIG.authToken;
-  let docker = false;
-  let requireDocker = CONFIG.workerpals.requireDocker;
-  let dockerImage = CONFIG.workerpals.dockerImage;
-  let gitToken = CONFIG.gitToken;
-  let dockerTimeout = CONFIG.workerpals.dockerTimeoutMs;
-  let dockerIdleTimeout = CONFIG.workerpals.dockerIdleTimeoutMs;
-  let dockerNetworkMode = CONFIG.workerpals.dockerNetworkMode;
-  let worktreeBaseRef = CONFIG.workerpals.baseRef || `origin/${integrationBranchName()}`;
-  let labels = [...CONFIG.workerpals.labels];
-  let failureCooldownMs = CONFIG.workerpals.failureCooldownMs;
-
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case "--server":
-        server = args[++i];
-        break;
-      case "--poll":
-        pollMs = parseInt(args[++i], 10);
-        break;
-      case "--heartbeat":
-        heartbeatMs = parseInt(args[++i], 10);
-        break;
-      case "--repo":
-        repo = detectRepoRoot(args[++i]);
-        break;
-      case "--workerId":
-        workerId = args[++i];
-        break;
-      case "--token":
-        authToken = args[++i];
-        break;
-      case "--docker":
-        docker = true;
-        break;
-      case "--require-docker":
-        requireDocker = true;
-        break;
-      case "--docker-image":
-        dockerImage = args[++i];
-        break;
-      case "--git-token":
-        gitToken = args[++i];
-        break;
-      case "--docker-timeout":
-        dockerTimeout = parseDockerTimeoutMs(args[++i]);
-        break;
-      case "--docker-idle-timeout":
-        dockerIdleTimeout = parseInt(args[++i], 10);
-        break;
-      case "--docker-network":
-        dockerNetworkMode = (args[++i] ?? "").trim() || dockerNetworkMode;
-        break;
-      case "--base-ref":
-        worktreeBaseRef = args[++i];
-        break;
-      case "--labels":
-        labels = args[++i]
-          .split(",")
-          .map((label) => label.trim())
-          .filter(Boolean);
-        break;
-      case "--failure-cooldown-ms":
-        failureCooldownMs = parseInt(args[++i], 10);
-        break;
-    }
-  }
-
-  return {
-    server,
-    pollMs,
-    heartbeatMs: Number.isFinite(heartbeatMs) && heartbeatMs > 0 ? heartbeatMs : pollMs,
-    repo,
-    workerId,
-    authToken,
-    docker,
-    requireDocker,
-    dockerImage,
-    gitToken,
-    dockerTimeout:
-      Number.isFinite(dockerTimeout) && dockerTimeout > 0
-        ? dockerTimeout
-        : DEFAULT_DOCKER_TIMEOUT_MS,
-    dockerIdleTimeout:
-      Number.isFinite(dockerIdleTimeout) && dockerIdleTimeout >= 0 ? dockerIdleTimeout : 600000,
-    dockerNetworkMode,
-    worktreeBaseRef,
-    labels,
-    failureCooldownMs:
-      Number.isFinite(failureCooldownMs) && failureCooldownMs >= 0
-        ? Math.min(failureCooldownMs, 300_000)
-        : 20_000,
-  };
 }
 
 async function resolveGitRemoteUrl(repo: string, remote = "origin"): Promise<string> {
@@ -799,7 +684,7 @@ function buildWorkerHeaders(authToken: string | null): Record<string, string> {
 }
 
 async function sendWorkerHeartbeat(
-  opts: ReturnType<typeof parseArgs>,
+  opts: WorkerRuntimeOptions,
   headers: Record<string, string>,
   status: WorkerHeartbeatStatus,
   currentJobId: string | null = null,
@@ -833,7 +718,7 @@ async function sendWorkerHeartbeat(
 }
 
 async function failActiveJobOnShutdown(
-  opts: ReturnType<typeof parseArgs>,
+  opts: WorkerRuntimeOptions,
   headers: Record<string, string>,
   runtimeState: WorkerRuntimeState,
   signalName: string,
@@ -871,7 +756,7 @@ async function failActiveJobOnShutdown(
 }
 
 async function workerLoop(
-  opts: ReturnType<typeof parseArgs>,
+  opts: WorkerRuntimeOptions,
   dockerExecutor: DockerExecutor | null,
   runtimeState: WorkerRuntimeState,
 ): Promise<void> {
@@ -1286,7 +1171,16 @@ async function workerLoop(
 }
 
 async function main(): Promise<void> {
-  const opts = parseArgs();
+  let opts: WorkerRuntimeOptions;
+  try {
+    opts = loadWorkerRuntimeOptions(process.argv.slice(2), WORKER_RUNTIME_DEFAULTS);
+  } catch (err) {
+    if (err instanceof RuntimeCliError) {
+      console.error(`[WorkerPals] ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
+  }
   const llmConfig = workerLlmConfig(CONFIG);
   opts.gitToken = await resolveWorkerGitToken(opts.repo, opts.gitToken);
 

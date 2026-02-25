@@ -60,3 +60,33 @@ export {
   type AutonomyRiskLevel,
   type ScopeValidationResult,
 } from "./autonomy_policy.js";
+export {
+  loadWorkerRuntimeOptions,
+  resolveWorkerRuntimeDefaults,
+  loadRemoteBuddyRuntimeOptions,
+  resolveRemoteBuddyRuntimeDefaults,
+  loadLocalBuddyRuntimeOptions,
+  resolveLocalBuddyRuntimeDefaults,
+  RuntimeCliError,
+  type WorkerRuntimeDefaults,
+  type WorkerRuntimeOptions,
+  type RemoteBuddyRuntimeDefaults,
+  type RemoteBuddyRuntimeOptions,
+  type LocalBuddyRuntimeDefaults,
+  type LocalBuddyRuntimeOptions,
+} from "./runtime_options.js";
+export {
+  ensureSessionExists,
+  connectSessionWithRetry,
+  SessionConnectionAbortedError,
+  type EnsureSessionOptions,
+  type ConnectSessionWithRetryOptions,
+  type SessionRetryNotice,
+} from "./session.js";
+export {
+  computeTimeoutWarningWindow,
+  DEFAULT_DOCKER_TIMEOUT_MS,
+  DEFAULT_OPENHANDS_TIMEOUT_MS,
+  parseDockerTimeoutMs,
+  parseOpenHandsTimeoutMs,
+} from "./timeout_policy.js";

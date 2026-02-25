@@ -16,7 +16,7 @@ import {
   parseStructuredResult,
   filterResultLines,
 } from "../common/execution_utils.js";
-import { computeTimeoutWarningWindow } from "../timeout_policy.js";
+import { computeTimeoutWarningWindow } from "shared/timeout_policy.js";
 
 // ---- Script path (resolved relative to this file) ----------------------------
 

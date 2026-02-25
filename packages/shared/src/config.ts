@@ -1780,9 +1780,15 @@ function sanitizeConfigString(value: string): string {
   return out;
 }
 
+function unsafeRuntimeDumpEnabled(): boolean {
+  const raw = (process.env.PUSHPALS_UNSAFE_RUNTIME_DUMP ?? "").trim().toLowerCase();
+  return TRUTHY.has(raw);
+}
+
 function sanitizeConfigValueForLogging(
   value: unknown,
   parentKey = "",
+  allowUnsafe = false,
 ): unknown {
   if (
     typeof value === "string" ||
@@ -1791,7 +1797,7 @@ function sanitizeConfigValueForLogging(
     value == null
   ) {
     if (typeof value === "string") {
-      if (SENSITIVE_CONFIG_KEY_PATTERN.test(parentKey)) {
+      if (SENSITIVE_CONFIG_KEY_PATTERN.test(parentKey) && !allowUnsafe) {
         return value.trim() ? REDACTED_LOG_VALUE : "";
       }
       return sanitizeConfigString(value);
@@ -1800,13 +1806,13 @@ function sanitizeConfigValueForLogging(
   }
 
   if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeConfigValueForLogging(entry, parentKey));
+    return value.map((entry) => sanitizeConfigValueForLogging(entry, parentKey, allowUnsafe));
   }
 
   if (typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = sanitizeConfigValueForLogging(entry, key);
+      out[key] = sanitizeConfigValueForLogging(entry, key, allowUnsafe);
     }
     return out;
   }
@@ -1815,5 +1821,5 @@ function sanitizeConfigValueForLogging(
 }
 
 export function sanitizePushPalsConfigForLogging<T>(value: T): T {
-  return sanitizeConfigValueForLogging(value) as T;
+  return sanitizeConfigValueForLogging(value, "", unsafeRuntimeDumpEnabled()) as T;
 }

@@ -27,14 +27,18 @@ import {
   CommunicationManager,
   detectRepoRoot,
   loadPushPalsConfig,
-  bootstrapRuntime,
   sanitizePushPalsConfigForLogging,
   matchesGlob,
   normalizeTargetPath,
   normalizeWriteGlob,
-  ensureSessionWithRetry as ensureSessionWithRetryShared,
+  loadRemoteBuddyRuntimeOptions,
+  resolveRemoteBuddyRuntimeDefaults,
+  RuntimeCliError,
+  connectSessionWithRetry,
+  SessionConnectionAbortedError,
 } from "shared";
-import { mkdirSync, writeFileSync } from "fs";
+import type { RemoteBuddyRuntimeOptions } from "shared";
+import { mkdirSync } from "fs";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {
   extractExplicitTargetPath,
@@ -50,6 +54,7 @@ import { buildWorkerSpawnCommand } from "./worker_spawn.js";
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
+const REMOTE_RUNTIME_DEFAULTS = resolveRemoteBuddyRuntimeDefaults(CONFIG);
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
 
@@ -765,7 +770,7 @@ class RemoteBuddyOrchestrator {
   }
 
   async emitStartupStatus(): Promise<void> {
-    this.statusSessionReady = await this.ensureStatusSession();
+    this.statusSessionReady = await this.ensureSessionWithRetry();
     if (!this.statusSessionReady) {
       console.warn("[RemoteBuddy] Could not ensure session for startup presence events");
       return;
@@ -782,7 +787,7 @@ class RemoteBuddyOrchestrator {
       this.statusSessionReady = false;
       if (Date.now() >= startupDeadlineMs) break;
       await Bun.sleep(1_000);
-      this.statusSessionReady = await this.ensureStatusSession(3, 400, 2_500);
+      this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2_500);
     }
     if (!startupStatusOk) {
       console.warn("[RemoteBuddy] Failed to emit startup status event");
@@ -795,7 +800,7 @@ class RemoteBuddyOrchestrator {
       if (this.disposed) return;
       void (async () => {
         if (!this.statusSessionReady) {
-          this.statusSessionReady = await this.ensureStatusSession(3, 400, 2500);
+          this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2500);
         }
         const ok = await this.comm.status(this.agentId, "idle", "RemoteBuddy heartbeat");
         if (!ok) {
@@ -805,23 +810,33 @@ class RemoteBuddyOrchestrator {
     }, this.statusHeartbeatMs);
   }
 
-  private async ensureStatusSession(
+  private async ensureSessionWithRetry(
     maxRetries = 20,
     baseDelayMs = 500,
     maxDelayMs = 5000,
   ): Promise<boolean> {
+    if (this.disposed) return false;
     try {
-      await ensureSessionWithRetryShared(this.server, {
+      await connectSessionWithRetry({
+        serverUrl: this.server,
         sessionId: this.sessionId,
         authToken: this.authToken,
-        maxRetries,
+        maxAttempts: maxRetries,
         baseDelayMs,
         maxDelayMs,
-        logLabel: "RemoteBuddyStatus",
-        shouldContinue: () => !this.disposed,
+        shouldAbort: () => this.disposed,
+        abortMessage: "RemoteBuddy shutdown requested",
       });
       return true;
-    } catch {
+    } catch (err) {
+      if (err instanceof SessionConnectionAbortedError) {
+        return false;
+      }
+      if (!this.disposed) {
+        console.warn(
+          `[RemoteBuddy] Could not ensure session "${this.sessionId}": ${String(err instanceof Error ? err.message : err)}`,
+        );
+      }
       return false;
     }
   }
@@ -2016,43 +2031,19 @@ class RemoteBuddyOrchestrator {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
-  const runtimeDumpPath = (process.env.REMOTEBUDDY_RUNTIME_DUMP_PATH ?? "").trim();
-  const dumpOnlyMode = runtimeDumpPath.length > 0;
-  const bootstrap = await bootstrapRuntime({
-    config: CONFIG,
-    ensureSession: dumpOnlyMode
-      ? false
-      : {
-          enabled: true,
-          logLabel: "RemoteBuddy",
-          maxRetries: Number.POSITIVE_INFINITY,
-        },
-  });
-  const runtime = bootstrap.runtime;
-  let sessionId = bootstrap.sessionId;
-  if (!sessionId && dumpOnlyMode) {
-    sessionId = runtime.sessionId ?? null;
-    if (!sessionId) {
-      sessionId = "stub-session";
+  let opts: RemoteBuddyRuntimeOptions;
+  try {
+    opts = loadRemoteBuddyRuntimeOptions(process.argv.slice(2), REMOTE_RUNTIME_DEFAULTS);
+  } catch (err) {
+    if (err instanceof RuntimeCliError) {
+      console.error(`[RemoteBuddy] ${err.message}`);
+      process.exit(1);
     }
-  }
-  if (!sessionId) {
-    throw new Error("RemoteBuddy requires a valid sessionId after bootstrap.");
-  }
-
-  if (runtimeDumpPath) {
-    const snapshot = {
-      server: runtime.server,
-      sessionId,
-      authToken: runtime.authToken,
-      rest: runtime.rest,
-    };
-    writeFileSync(runtimeDumpPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
-    return;
+    throw err;
   }
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
-  console.log(`[RemoteBuddy] Server: ${runtime.server}`);
+  console.log(`[RemoteBuddy] Server: ${opts.server}`);
   if (CONFIG.startup.logConfigOnStart) {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
@@ -2085,6 +2076,19 @@ async function main() {
     }`,
   );
 
+  let sessionId = opts.sessionId;
+  const desiredSessionLabel = sessionId ? `"${sessionId}"` : "(server-assigned)";
+  console.log(`[RemoteBuddy] Ensuring session ${desiredSessionLabel} exists on server...`);
+  sessionId = await connectSessionWithRetry({
+    serverUrl: opts.server,
+    sessionId: sessionId ?? undefined,
+    authToken: opts.authToken,
+    onRetryNotice: ({ attempt, delayMs }) => {
+      console.log(
+        `[RemoteBuddy] Server unavailable, retrying in ${(delayMs / 1000).toFixed(1)} s... (attempt ${attempt})`,
+      );
+    },
+  });
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
   const llmCfg = CONFIG.remotebuddy.llm;
@@ -2099,9 +2103,9 @@ async function main() {
   brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
-    server: runtime.server,
+    server: opts.server,
     sessionId,
-    authToken: runtime.authToken,
+    authToken: opts.authToken,
     brain,
     llm,
     idempotency,
@@ -2119,9 +2123,7 @@ async function main() {
   orchestrator.startPolling(pollMs);
 }
 
-if (import.meta.main) {
-  main().catch((err) => {
-    console.error("[RemoteBuddy] Fatal:", err);
-    process.exit(1);
-  });
-}
+main().catch((err) => {
+  console.error("[RemoteBuddy] Fatal:", err);
+  process.exit(1);
+});

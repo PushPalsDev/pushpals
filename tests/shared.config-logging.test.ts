@@ -28,6 +28,18 @@ describe("shared config logging sanitization", () => {
     expect(sanitized.nested.normalValue).toBe("keep-me");
   });
 
+  test("sanitized config JSON does not include plaintext token values by default", () => {
+    const input = {
+      authToken: "ghp_this_should_not_log",
+      nested: {
+        gitToken: "github_pat_SHOULD_NOT_APPEAR",
+      },
+    };
+    const serialized = JSON.stringify(sanitizePushPalsConfigForLogging(input));
+    expect(serialized).not.toContain("ghp_this_should_not_log");
+    expect(serialized).not.toContain("github_pat_SHOULD_NOT_APPEAR");
+  });
+
   test("redacts embedded credentials and bearer tokens inside strings", () => {
     const input = {
       remoteUrl: "https://oauth2:ghp_abcdefghijklmnopqrstuvwxyz012345@github.com/PushPalsDev/pushpals.git",
@@ -59,5 +71,21 @@ describe("shared config logging sanitization", () => {
     expect(sanitized.endpoints[0]).toBe("https://***@example.com/path");
     expect(sanitized.endpoints[1]).toBe("Bearer ***");
     expect(sanitized.tokens).toEqual(["[REDACTED]", "[REDACTED]"]);
+  });
+
+  test("allows explicit unsafe opt-in for runtime dumps", () => {
+    const original = process.env.PUSHPALS_UNSAFE_RUNTIME_DUMP;
+    process.env.PUSHPALS_UNSAFE_RUNTIME_DUMP = "1";
+    try {
+      const input = { authToken: "secret-token-value" };
+      const sanitized = sanitizePushPalsConfigForLogging(input);
+      expect(sanitized.authToken).toBe("secret-token-value");
+    } finally {
+      if (original === undefined) {
+        delete process.env.PUSHPALS_UNSAFE_RUNTIME_DUMP;
+      } else {
+        process.env.PUSHPALS_UNSAFE_RUNTIME_DUMP = original;
+      }
+    }
   });
 });

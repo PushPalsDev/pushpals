@@ -19,7 +19,7 @@ import { isAbsolute, relative, resolve } from "path";
 import { loadPushPalsConfig } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { ExecutorBackend } from "./common/types.js";
-import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
+import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "shared/timeout_policy.js";
 import {
   BACKEND_DOCKER_PASSTHROUGH_ENV,
   BACKEND_RUNTIME_CONFIG_KEYS,
