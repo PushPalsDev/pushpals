@@ -39,15 +39,14 @@ const BASE_REMOTE_PLANNER_SYSTEM_PROMPT = loadPromptTemplate(
   "localbuddy/localbuddy_system_prompt.md",
 );
 const POST_SYSTEM_PROMPT = loadPromptTemplate("shared/post_system_prompt.md");
+const REMOTE_PLANNER_OUTPUT_CONTRACT = loadPromptTemplate(
+  "localbuddy/localbuddy_planner_output_contract.md",
+).trim();
 const REMOTE_PLANNER_SYSTEM_PROMPT = `${BASE_REMOTE_PLANNER_SYSTEM_PROMPT}
 
 ${POST_SYSTEM_PROMPT}
 
-Planner-specific output contract:
-- For this response, output STRICT JSON only.
-- JSON shape: { "tasks": [{ "title": string, "description": string, "toolsNeeded": string[], "confidence": number }] }
-- Do not include markdown, prose, or code fences.
-- Keep tasks concrete and executable by available tools.
+${REMOTE_PLANNER_OUTPUT_CONTRACT}
 `.trim();
 
 const CONFIG = loadPushPalsConfig();
@@ -359,9 +358,21 @@ export class RemotePlanner implements PlannerModel {
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {
-    const userPrompt = `User request: "${input.userText}"
-${input.repoContext?.gitStatus ? `\nGit status:\n${input.repoContext.gitStatus}` : ""}
-${input.repoContext?.gitDiff ? `\nGit diff (truncated):\n${input.repoContext.gitDiff.substring(0, 2000)}` : ""}`;
+    const gitStatusSection = input.repoContext?.gitStatus
+      ? loadPromptTemplate("localbuddy/localbuddy_planner_git_status_section.md", {
+          git_status: input.repoContext.gitStatus,
+        })
+      : "";
+    const gitDiffSection = input.repoContext?.gitDiff
+      ? loadPromptTemplate("localbuddy/localbuddy_planner_git_diff_section.md", {
+          git_diff: input.repoContext.gitDiff.substring(0, 2000),
+        })
+      : "";
+    const userPrompt = loadPromptTemplate("localbuddy/localbuddy_planner_user_prompt.md", {
+      user_text: input.userText,
+      git_status_section: gitStatusSection,
+      git_diff_section: gitDiffSection,
+    });
 
     try {
       const headers: Record<string, string> = { "Content-Type": "application/json" };

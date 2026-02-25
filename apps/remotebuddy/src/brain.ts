@@ -60,11 +60,16 @@ const BASE_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/remotebuddy_system_pr
   platform: process.platform,
 });
 const POST_SYSTEM_PROMPT = loadPromptTemplate("shared/post_system_prompt.md");
+const PLANNER_POST_SYSTEM_PROMPT = loadPromptTemplate(
+  "remotebuddy/planner_post_system_prompt.md",
+).trim();
+const PLANNER_REPAIR_SUFFIX_PROMPT = loadPromptTemplate(
+  "remotebuddy/planner_repair_suffix_prompt.md",
+).trim();
 const SYSTEM_PROMPT =
-  `${BASE_SYSTEM_PROMPT}\n\n${POST_SYSTEM_PROMPT}\n\nYou are a strict planning function.\nReturn only structured JSON that matches the required schema.`.trim();
+  `${BASE_SYSTEM_PROMPT}\n\n${POST_SYSTEM_PROMPT}\n\n${PLANNER_POST_SYSTEM_PROMPT}`.trim();
 
-const REPAIR_SYSTEM_PROMPT =
-  `${SYSTEM_PROMPT}\n\nYour previous response was invalid. Repair it to valid schema-compliant JSON only.`.trim();
+const REPAIR_SYSTEM_PROMPT = `${SYSTEM_PROMPT}\n\n${PLANNER_REPAIR_SUFFIX_PROMPT}`.trim();
 
 export const REMOTEBUDDY_PLANNER_JSON_SCHEMA: Record<string, unknown> = {
   name: "remotebuddy_planner",
@@ -266,7 +271,11 @@ function sanitizePlannerOutput(raw: unknown, userText: string): PlannerOutput {
   // Safety override: LLM chose "other" (or "analysis") + requires_worker=false for what looks
   // like a coding task. Upgrade to code_change + requires_worker=true rather than silently
   // completing with no action.
-  if (!requiresWorker && (intent === "other" || intent === "analysis") && looksCodeChangeRequest(userText)) {
+  if (
+    !requiresWorker &&
+    (intent === "other" || intent === "analysis") &&
+    looksCodeChangeRequest(userText)
+  ) {
     console.warn(
       `[Brain] sanitize: upgraded intent "${intent}" → "code_change" (requires_worker=true) based on prompt heuristic`,
     );
@@ -548,15 +557,10 @@ export class AgentBrain {
       const repairMessages: LLMMessage[] = [
         {
           role: "user",
-          content: [
-            "Original request:",
-            userText,
-            "",
-            "Invalid planner output to repair:",
-            primaryRaw,
-            "",
-            "Return only valid schema-compliant JSON.",
-          ].join("\n"),
+          content: loadPromptTemplate("remotebuddy/planner_repair_user_prompt.md", {
+            user_text: userText,
+            primary_raw: primaryRaw,
+          }),
         },
       ];
 

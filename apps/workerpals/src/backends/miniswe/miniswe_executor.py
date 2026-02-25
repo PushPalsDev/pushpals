@@ -86,6 +86,8 @@ _BROKER_TEMPERATURE = 0.0
 _BROKER_SHELL_TIMEOUT_SEC_DEFAULT = 120
 _BROKER_OBSERVATION_MAX_CHARS = 4_000
 _BROKER_READ_PREVIEW_CHARS = 800
+PROMPT_TOKEN_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+_PROMPT_TEMPLATE_CACHE: Dict[str, str] = {}
 
 # Safety: very simple denylist for shell commands (can be adjusted)
 _DENY_PATTERNS = [
@@ -246,14 +248,7 @@ def _tool_broker_run_retry_max() -> int:
 
 
 def _build_strict_tool_use_guidance(repo: str) -> str:
-    return (
-        "CRITICAL: You must use tools to make progress.\n"
-        "- Use the environment's tools (file read/list/search, and file edit/write/patch) to inspect and modify the repo.\n"
-        "- Do NOT only describe what you would do; actually do it.\n"
-        "- Avoid broad scans; choose one target file quickly.\n"
-        "- After making edits, run a narrow validation command if available (tests/lint) and then finish.\n"
-        f"- Repo root: {repo}\n"
-    )
+    return _load_prompt_template("workerpals/miniswe_strict_tool_use_guidance.md", {"repo": repo})
 
 
 # ─── Tool Broker Shim ────────────────────────────────────────────────────────
@@ -996,42 +991,44 @@ def _is_git_porcelain_status_command(cmd: str) -> bool:
     return any(a.lower().startswith("--porcelain") for a in args[2:])
 
 
+def _repo_root_for_prompt_loading() -> Path:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "prompts").is_dir():
+            return parent
+    return current.parents[5]
+
+
+def _resolve_prompt_file(relative_path: str) -> Path:
+    return _repo_root_for_prompt_loading() / "prompts" / relative_path
+
+
+def _load_prompt_template(
+    relative_path: str, replacements: Optional[Dict[str, str]] = None
+) -> str:
+    prompt_path = _resolve_prompt_file(relative_path)
+    cache_key = str(prompt_path)
+    template = _PROMPT_TEMPLATE_CACHE.get(cache_key)
+    if template is None:
+        if not prompt_path.exists():
+            raise FileNotFoundError(f"Prompt template not found: {prompt_path}")
+        template = prompt_path.read_text(encoding="utf-8")
+        _PROMPT_TEMPLATE_CACHE[cache_key] = template
+
+    if not replacements:
+        return template
+
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in replacements:
+            raise KeyError(f"Missing prompt replacement '{{{{{key}}}}}' for {prompt_path}")
+        return replacements[key]
+
+    return PROMPT_TOKEN_REGEX.sub(_replace, template)
+
+
 def _broker_system_prompt(repo: str) -> str:
-    return (
-        "You are a code-changing assistant operating on a local git repository.\n"
-        "You DO NOT have native tool/function calling. Instead, you must output a STRICT JSON object describing actions.\n"
-        "\n"
-        "Repository root: " + repo + "\n"
-        "\n"
-        "Output format (STRICT JSON, no markdown, no extra keys unless specified):\n"
-        "{\n"
-        '  "actions": [\n'
-        "    {\"type\":\"read_file\",\"path\":\"README.md\"},\n"
-        "    {\"type\":\"append_line\",\"path\":\"README.md\",\"line\":\"...\"},\n"
-        "    {\"type\":\"replace_text_once\",\"path\":\"x\",\"old\":\"a\",\"new\":\"b\"},\n"
-        "    {\"type\":\"write_file\",\"path\":\"x\",\"content\":\"...\"},\n"
-        "    {\"type\":\"run_shell\",\"command\":\"git status --porcelain\"}\n"
-        "  ],\n"
-        '  "done": false,\n'
-        '  "note": "short explanation"\n'
-        "}\n"
-        "\n"
-        "Rules:\n"
-        "- Keep actions minimal and directly relevant.\n"
-        '- JSON syntax must be exact: use ":" between keys and values, never ",".\n'
-        "- Use double quotes for all keys and string values.\n"
-        "- Paths must be repo-relative.\n"
-        "- run_shell safety: no pipes/redirection/chaining; issue one simple command per action.\n"
-        "- Allowed run_shell binaries: git, bun, npm, cat, tail, head, ls, find, rg, grep, sed, awk, wc, stat, printf, echo, test.\n"
-        "- For this repository, prefer `bun test` / `bun run <script>` over npm.\n"
-        "- Use read_file before edit when unsure.\n"
-        "- After edits, run_shell: \"git status --porcelain\".\n"
-        "- If the instruction is a bounded edit over explicit file paths, complete all requested edits in one response when possible.\n"
-        "- Progress requirement: do not spend more than 2 steps on exploration; then perform an edit action.\n"
-        "- If blocked from editing after exploration, set done=true and explain the blocker in note.\n"
-        "- Do not stop after partially applying explicit directives; only set done=true after all requested edits are handled.\n"
-        "- When task is complete, set done=true and keep actions empty or only verification commands.\n"
-    )
+    return _load_prompt_template("workerpals/miniswe_broker_system_prompt.md", {"repo": repo})
 
 
 def _broker_run(
@@ -1062,18 +1059,32 @@ def _broker_run(
     allowed_write_globs = [g for g in (write_globs or []) if str(g).strip()]
     expected_targets = sorted(explicit_target_set) if explicit_target_set else _extract_expected_target_paths(instruction)
 
-    task_lines = [f"Task:\n{instruction}"]
+    explicit_targets_block = ""
+    completion_requirement = ""
     if expected_targets:
         targets_block = "\n".join(f"- {target}" for target in expected_targets[:8])
-        task_lines.append("Explicit target paths:\n" + targets_block)
-        task_lines.append(
-            "Completion requirement: handle all requested edits across all explicit target paths "
-            "before setting done=true."
+        explicit_targets_block = (
+            "\n\n"
+            + _load_prompt_template(
+                "workerpals/miniswe_explicit_targets_block.md",
+                {"targets_block": targets_block},
+            ).strip()
         )
-    task_lines.append("Start now. Output STRICT JSON only.")
+        completion_requirement = (
+            "\n\n" + _load_prompt_template("workerpals/miniswe_completion_requirement.md").strip()
+        )
+
+    task_prompt = _load_prompt_template(
+        "workerpals/miniswe_broker_task_prompt.md",
+        {
+            "instruction": instruction,
+            "explicit_targets_block": explicit_targets_block,
+            "completion_requirement": completion_requirement,
+        },
+    ).strip()
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": _broker_system_prompt(repo)},
-        {"role": "user", "content": "\n\n".join(task_lines)},
+        {"role": "user", "content": task_prompt},
     ]
 
     def _record(line: str) -> None:
@@ -1100,10 +1111,9 @@ def _broker_run(
         compacted.append(
             {
                 "role": "user",
-                "content": (
-                    "Context was compacted after timeout. Continue from the latest observation and "
-                    "current repository state. Return STRICT JSON only."
-                ),
+                "content": _load_prompt_template(
+                    "workerpals/miniswe_context_compaction_retry_prompt.md"
+                ).strip(),
             }
         )
         compacted.extend(tail)
@@ -1686,13 +1696,17 @@ def _run_miniswe_task(
         if merged_guidance:
             parts = [str(g).strip() for g in merged_guidance if str(g).strip()]
             if parts:
-                full += "\n\n--- Supplemental execution guidance ---\n" + "\n\n".join(parts)
+                guidance_section = _load_prompt_template(
+                    "workerpals/miniswe_supplemental_guidance_section.md",
+                    {"guidance_entries": "\n\n".join(parts)},
+                ).strip()
+                full += f"\n\n{guidance_section}"
 
-        full += (
-            f"\n\nTime limit: about {timeout_minutes} minute(s) for this task. "
-            "If you cannot finish in time, stop and provide a concise status of what you checked, "
-            "what remains, and the blocker."
-        )
+        timeout_note = _load_prompt_template(
+            "workerpals/miniswe_timeout_note.md",
+            {"timeout_minutes": str(timeout_minutes)},
+        ).strip()
+        full += f"\n\n{timeout_note}"
         return full
 
     log.info(f"Starting mini-swe-agent execution in {repo}")
@@ -1736,14 +1750,15 @@ def _run_miniswe_task(
                     f"{retry_count}/{retry_max} with strict completion guidance."
                 )
             retry_guidance = [
-                "Recovery mode: complete the task in one pass with minimal actions.",
-                "Prefer at most 3 actions: read target file(s), apply edit(s), run `git status --porcelain`.",
-                "Do not perform broad exploration.",
-                "Set done=true in the same response after applying edits.",
+                line.strip()
+                for line in _load_prompt_template(
+                    "workerpals/miniswe_recovery_guidance_base.md"
+                ).splitlines()
+                if line.strip()
             ]
             if not timeout_like:
                 retry_guidance.append(
-                    "If no edit is possible, set done=true and explain the blocker in note."
+                    _load_prompt_template("workerpals/miniswe_recovery_guidance_blocker_line.md").strip()
                 )
             merged_guidance = list(extra_guidance or [])
             merged_guidance.extend(retry_guidance)
@@ -1843,8 +1858,7 @@ def _run_miniswe_task(
                     if attempt > 1:
                         extra_guidance.append(_build_strict_tool_use_guidance(repo))
                         extra_guidance.append(
-                            "If you previously failed because you did not emit tool calls: "
-                            "you must now call tools immediately (read target files, then edit)."
+                            _load_prompt_template("workerpals/miniswe_toolcall_retry_guidance.md").strip()
                         )
 
                     exit_info = agent.run(_compose_instruction(extra_guidance=extra_guidance)) or {}

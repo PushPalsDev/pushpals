@@ -10,7 +10,7 @@ import { spawn } from "child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { loadPushPalsConfig, type PushPalsLmStudioConfig } from "shared";
+import { loadPromptTemplate, loadPushPalsConfig, type PushPalsLmStudioConfig } from "shared";
 
 export interface LLMMessage {
   role: "system" | "user" | "assistant";
@@ -75,6 +75,12 @@ const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
 const DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
 const DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES = 3;
+const CONTEXT_PACKER_SYSTEM_PROMPT = loadPromptTemplate(
+  "remotebuddy/context_packer_system_prompt.md",
+).trim();
+const CONTEXT_PACKER_CONDENSED_HISTORY_SYSTEM_PROMPT = loadPromptTemplate(
+  "remotebuddy/context_packer_condensed_history_system_prompt.md",
+).trim();
 const KNOWN_PROVIDER_PREFIXES = new Set([
   "openai",
   "azure",
@@ -166,11 +172,7 @@ function normalizeCodexAuthMode(value: string | null | undefined): CodexAuthMode
 
 function codexConfiguredAuthMode(configuredValue?: string | null): CodexAuthMode {
   return normalizeCodexAuthMode(
-    firstNonEmpty(
-      process.env.PUSHPALS_OPENAI_CODEX_AUTH_MODE,
-      configuredValue,
-      "auto",
-    ),
+    firstNonEmpty(process.env.PUSHPALS_OPENAI_CODEX_AUTH_MODE, configuredValue, "auto"),
   );
 }
 
@@ -190,22 +192,13 @@ function codexCommandOverrideParts(configuredValue?: string | null): string[] {
     }
   }
   const stringOverride =
-    firstNonEmpty(
-      process.env.PUSHPALS_OPENAI_CODEX_BIN,
-      configuredValue,
-      "",
-    ) ?? "";
+    firstNonEmpty(process.env.PUSHPALS_OPENAI_CODEX_BIN, configuredValue, "") ?? "";
   if (!stringOverride) return [];
   return splitArgs(stringOverride);
 }
 
 function codexBaseUrlOverride(): string {
-  return (
-    firstNonEmpty(
-      process.env.PUSHPALS_OPENAI_CODEX_BASE_URL,
-      "",
-    ) ?? ""
-  );
+  return firstNonEmpty(process.env.PUSHPALS_OPENAI_CODEX_BASE_URL, "") ?? "";
 }
 
 function codexTimeoutMs(configuredTimeoutMs?: number | null): number {
@@ -439,11 +432,7 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
       : explicitBackend === "openai" || explicitBackend === "openai_codex"
         ? DEFAULT_OPENAI_ENDPOINT
         : DEFAULT_LMSTUDIO_ENDPOINT;
-  const endpoint = firstNonEmpty(
-    opts.endpoint,
-    serviceLlmConfig.endpoint,
-    fallbackEndpoint,
-  );
+  const endpoint = firstNonEmpty(opts.endpoint, serviceLlmConfig.endpoint, fallbackEndpoint);
   let backend = configuredBackend(endpoint ?? "", explicitBackend);
 
   const model = firstNonEmpty(opts.model, serviceLlmConfig.model, DEFAULT_MODEL) ?? DEFAULT_MODEL;
@@ -457,8 +446,7 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
         : backend === "openai" || backend === "openai_codex"
           ? openAiApiKey
           : "",
-    ) ??
-    "";
+    ) ?? "";
   if (
     service !== "workerpals" &&
     shouldUseCodexCliFallback(backend, model, apiKey, serviceLlmConfig.codexAuthMode)
@@ -861,7 +849,9 @@ export class LmStudioClient implements LLMClient {
         );
       }
 
-      console.log(`[LLM] ${this.providerLabel} resolved model "${selected.model}" (${selected.source}).`);
+      console.log(
+        `[LLM] ${this.providerLabel} resolved model "${selected.model}" (${selected.source}).`,
+      );
 
       return selected.model;
     })();
@@ -1049,26 +1039,19 @@ export class LmStudioClient implements LLMClient {
     let memory = "";
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
-      const packPrompt = [
-        `New batch ${i + 1}/${chunks.length}:`,
-        chunk,
-        "",
-        "Current packed memory:",
-        memory || "(empty)",
-        "",
-        `Update the packed memory with maximal fidelity. Requirements:`,
-        "- Preserve concrete instructions, constraints, IDs, file paths, env vars, and error text.",
-        "- Keep conflicting details if present; do not silently discard.",
-        `- Keep output under ${memoryCharBudget} characters.`,
-        "- Output only packed memory plain text.",
-      ].join("\n");
+      const packPrompt = loadPromptTemplate("remotebuddy/context_packer_user_prompt.md", {
+        batch_index: String(i + 1),
+        batch_count: String(chunks.length),
+        batch_chunk: chunk,
+        current_memory: memory || "(empty)",
+        memory_char_budget: String(memoryCharBudget),
+      });
 
       const packed = await this.runLmStudioCompletion(
         [
           {
             role: "system",
-            content:
-              "You are a high-fidelity context packer. Merge incoming batch context into compact memory without losing critical implementation detail.",
+            content: CONTEXT_PACKER_SYSTEM_PROMPT,
           },
           { role: "user", content: packPrompt },
         ],
@@ -1080,8 +1063,7 @@ export class LmStudioClient implements LLMClient {
     const packedMessages: Array<{ role: string; content: string }> = [
       {
         role: "system",
-        content:
-          "Prior context was streamed in multiple batches and condensed below. Treat PACKED_CONTEXT as authoritative history for this request.",
+        content: CONTEXT_PACKER_CONDENSED_HISTORY_SYSTEM_PROMPT,
       },
       {
         role: "system",
@@ -1176,38 +1158,29 @@ export class LmStudioClient implements LLMClient {
 }
 
 function renderCodexPrompt(input: LLMGenerateInput): string {
-  const lines: string[] = [
-    "You are the PushPals LLM adapter.",
-    "Use only the provided system instruction and conversation context.",
-    "Do not run tools, inspect files, or make code changes.",
-    "Return only the final assistant response text for the conversation.",
-  ];
-  if (input.json) {
-    lines.push(
-      "Output requirements: return exactly one valid JSON object. Do not include markdown fences or extra prose.",
-    );
-    if (input.jsonSchema) {
-      lines.push("The JSON object must satisfy this schema:");
-      lines.push(JSON.stringify(input.jsonSchema, null, 2));
-    }
-  }
-  if (typeof input.maxTokens === "number" && Number.isFinite(input.maxTokens) && input.maxTokens > 0) {
-    lines.push(
-      `Keep the response concise and approximately within ${Math.max(64, Math.floor(input.maxTokens))} tokens.`,
-    );
-  }
-  lines.push("");
-  lines.push("SYSTEM INSTRUCTION:");
-  lines.push(input.system);
-  lines.push("");
-  lines.push("CONVERSATION (oldest to newest):");
-  for (const message of input.messages) {
-    lines.push(`[${message.role}]`);
-    lines.push(message.content ?? "");
-    lines.push("");
-  }
-  lines.push("ASSISTANT RESPONSE:");
-  return lines.join("\n");
+  const jsonRequirements = input.json
+    ? loadPromptTemplate("remotebuddy/codex_adapter_json_requirements.md").trim()
+    : "";
+  const jsonSchemaBlock = input.jsonSchema
+    ? `${loadPromptTemplate("remotebuddy/codex_adapter_json_schema_intro.md").trim()}\n${JSON.stringify(input.jsonSchema, null, 2)}`
+    : "";
+  const maxTokensLine =
+    typeof input.maxTokens === "number" && Number.isFinite(input.maxTokens) && input.maxTokens > 0
+      ? loadPromptTemplate("remotebuddy/codex_adapter_max_tokens_line.md", {
+          max_tokens: String(Math.max(64, Math.floor(input.maxTokens))),
+        }).trim()
+      : "";
+  const conversationTranscript = input.messages
+    .map((message) => `[${message.role}]\n${message.content ?? ""}\n`)
+    .join("\n");
+
+  return loadPromptTemplate("remotebuddy/codex_adapter_prompt_template.md", {
+    json_requirements: jsonRequirements,
+    json_schema_block: jsonSchemaBlock,
+    max_tokens_line: maxTokensLine,
+    system_instruction: input.system,
+    conversation_transcript: conversationTranscript,
+  });
 }
 
 export class OpenAiCodexCliClient implements LLMClient {
@@ -1327,11 +1300,15 @@ export class OpenAiCodexCliClient implements LLMClient {
         timeoutMs: codexTimeoutMs(this.codexTimeoutMs),
       });
       if (result.timedOut) {
-        throw new Error(`Codex CLI request timed out after ${codexTimeoutMs(this.codexTimeoutMs)}ms.`);
+        throw new Error(
+          `Codex CLI request timed out after ${codexTimeoutMs(this.codexTimeoutMs)}ms.`,
+        );
       }
       const stderr = (result.stderr || "").trim();
       const stdout = (result.stdout || "").trim();
-      const lastMessage = existsSync(lastMessagePath) ? readFileSync(lastMessagePath, "utf8").trim() : "";
+      const lastMessage = existsSync(lastMessagePath)
+        ? readFileSync(lastMessagePath, "utf8").trim()
+        : "";
       if (result.code !== 0) {
         const detail = stderr || stdout || "codex exec exited with non-zero status";
         throw new Error(`Codex CLI request failed (exit ${result.code ?? "unknown"}): ${detail}`);

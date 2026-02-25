@@ -60,6 +60,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
     def test_build_instruction_includes_codex_runtime_invariants(self) -> None:
         prompt = _build_instruction("Add two tests for localbuddy", [])
         self.assertIn("Codex CLI is required infrastructure", prompt)
+        self.assertIn("Runtime policy guardrails (mandatory):", prompt)
         self.assertIn("Canonical task instruction", prompt)
         self.assertIn("Add two tests for localbuddy", prompt)
 
@@ -78,9 +79,21 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         )
         self.assertIsNotNone(signal)
 
+    def test_detects_explicit_fallback_language(self) -> None:
+        signal = _detect_codex_workaround_signal(
+            "Codex CLI isn't available, so I switched to a fallback and continued with edits.",
+        )
+        self.assertIsNotNone(signal)
+
     def test_ignores_normal_codex_status_messages(self) -> None:
         signal = _detect_codex_workaround_signal(
             "Codex CLI login status is ready and task execution can proceed.",
+        )
+        self.assertIsNone(signal)
+
+    def test_ignores_policy_instruction_text(self) -> None:
+        signal = _detect_codex_workaround_signal(
+            "If Codex CLI auth/execution is unavailable, fail loudly with a clear error and stop; do not apply non-Codex workarounds.",
         )
         self.assertIsNone(signal)
 

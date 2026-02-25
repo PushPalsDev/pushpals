@@ -219,11 +219,10 @@ def _browser_tool_enabled() -> bool:
 
 def _build_user_message(instruction: str, timeout_ms: int) -> str:
     timeout_minutes = max(1, round(timeout_ms / 60000))
-    timeout_note = (
-        f"Time limit: about {timeout_minutes} minute(s) for this task. "
-        "If you cannot finish in time, stop and provide a concise status of what you checked, "
-        "what remains, and the blocker."
-    )
+    timeout_note = _load_prompt_template(
+        "workerpals/openhands_timeout_note.md",
+        {"timeout_minutes": str(timeout_minutes)},
+    ).strip()
 
     mode = setting_str(
         "WORKERPALS_OPENHANDS_TASK_PROMPT_MODE",
@@ -236,15 +235,21 @@ def _build_user_message(instruction: str, timeout_ms: int) -> str:
     try:
         system_prompt = _load_prompt_template("workerpals/openhands_task_execute_system_prompt.md").strip()
     except Exception:
-        system_prompt = "You are PushPals WorkerPal. Complete the task with minimal correct changes."
-    return f"{system_prompt}\n\nTask:\n{instruction}\n\n{timeout_note}"
+        system_prompt = _load_prompt_template(
+            "workerpals/openhands_task_execute_fallback_system_prompt.md"
+        ).strip()
+    return _load_prompt_template(
+        "workerpals/openhands_task_user_prompt.md",
+        {
+            "system_prompt": system_prompt,
+            "instruction": instruction,
+            "timeout_note": timeout_note,
+        },
+    ).strip()
 
 
 def _build_strict_tool_use_message() -> str:
-    return (
-        "CRITICAL: You must use tools to make progress. "
-        "Use TerminalTool and FileEditorTool to inspect and modify files, then run one focused validation command."
-    )
+    return _load_prompt_template("workerpals/openhands_strict_tool_use_message.md").strip()
 
 
 def _normalize_repo_relative_path(value: Any) -> Optional[str]:
@@ -465,7 +470,10 @@ def _run_openhands_task(
                 trimmed = str(guidance or "").strip()
                 if trimmed:
                     conversation.send_message(
-                        "Supplemental execution guidance (do not change canonical user intent):\n" + trimmed
+                        _load_prompt_template(
+                            "workerpals/openhands_supplemental_guidance_message.md",
+                            {"guidance": trimmed},
+                        ).strip()
                     )
 
         try:
