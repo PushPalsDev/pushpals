@@ -1,163 +1,159 @@
 import { loadPushPalsConfig, type PushPalsConfig } from "shared";
 
-export interface RuntimeLoaderOptions {
+export interface RemoteBuddyRuntimeOptions {
+  server: string;
+  sessionId: string | null;
+  authToken: string | null;
+  passthroughArgs: string[];
+}
+
+export interface RuntimeLoaderInit {
   argv?: string[];
   env?: Record<string, string | undefined>;
   config?: PushPalsConfig;
 }
 
-export interface RuntimeBootstrap {
-  config: PushPalsConfig;
-  server: string;
-  sessionId: string | null;
-  authToken: string | null;
-  workerPassthroughArgs: string[];
-}
-
-export function loadRuntime(options: RuntimeLoaderOptions = {}): RuntimeBootstrap {
-  const config = options.config ?? loadPushPalsConfig();
-  const env = options.env ?? process.env;
-  const rawArgv = options.argv ?? process.argv.slice(2);
-  const { cliArgs, passthroughArgs } = splitArgv(rawArgv);
-  const cliOverrides = parseCliArgs(cliArgs);
-
-  const envServer = readEnvString(env.PUSHPALS_SERVER_URL);
-  const envSession = readEnvString(env.PUSHPALS_SESSION_ID);
-  const envAuth = readEnvAuthToken(env);
-
-  const server = (cliOverrides.server ?? envServer ?? config.server.url ?? "").trim();
-  if (!server) {
-    throw new Error(
-      "Server URL is required (configure via config.server.url, PUSHPALS_SERVER_URL, or --server)",
-    );
-  }
-
-  const sessionIdRaw = cliOverrides.sessionId ?? envSession ?? config.sessionId ?? "";
-  const sessionId = sessionIdRaw.trim() || null;
-  const authToken = resolveAuthToken(cliOverrides.authToken, envAuth, config.authToken);
-
-  return {
-    config,
-    server,
-    sessionId,
-    authToken,
-    workerPassthroughArgs: [...passthroughArgs],
-  };
-}
-
-function splitArgv(args: string[]): { cliArgs: string[]; passthroughArgs: string[] } {
-  const idx = args.indexOf("--");
-  if (idx === -1) {
-    return { cliArgs: [...args], passthroughArgs: [] };
-  }
-  return {
-    cliArgs: args.slice(0, idx),
-    passthroughArgs: args.slice(idx + 1),
-  };
-}
-
 type CliOverrides = {
   server?: string;
-  sessionId?: string;
+  sessionId?: string | null;
   authToken?: string;
 };
 
-function parseCliArgs(args: string[]): CliOverrides {
-  const overrides: CliOverrides = {};
-  let i = 0;
-  while (i < args.length) {
-    const token = args[i];
-    const eqIndex = token.indexOf("=");
-    const flag = eqIndex >= 0 ? token.slice(0, eqIndex) : token;
-    const inlineValue = eqIndex >= 0 ? token.slice(eqIndex + 1) : undefined;
+type CliParseResult = {
+  overrides: CliOverrides;
+  passthrough: string[];
+};
 
-    if (!flag.startsWith("--")) {
+export function loadRuntimeOptions(init: RuntimeLoaderInit = {}): RemoteBuddyRuntimeOptions {
+  const config = init.config ?? loadPushPalsConfig();
+  const env = init.env ?? process.env;
+  const argv = init.argv ?? process.argv.slice(2);
+
+  const { overrides, passthrough } = parseCliArgs(argv);
+
+  let server = selectServer(config, env);
+  let sessionId = selectSessionId(config, env);
+  let authToken = selectAuthToken(config, env);
+
+  if (overrides.server !== undefined) {
+    server = overrides.server;
+  }
+  if (overrides.sessionId !== undefined) {
+    sessionId = overrides.sessionId;
+  }
+  if (overrides.authToken !== undefined) {
+    authToken = overrides.authToken;
+  }
+
+  return {
+    server,
+    sessionId,
+    authToken,
+    passthroughArgs: passthrough,
+  };
+}
+
+function selectServer(config: PushPalsConfig, env: Record<string, string | undefined>): string {
+  const envServer = env["PUSHPALS_SERVER_URL"];
+  if (envServer !== undefined) {
+    const normalized = normalizeNonEmpty(envServer);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return normalizeNonEmpty(config.server.url) ?? config.server.url;
+}
+
+function selectSessionId(
+  config: PushPalsConfig,
+  env: Record<string, string | undefined>,
+): string | null {
+  const envSession = env["PUSHPALS_SESSION_ID"];
+  if (envSession !== undefined) {
+    return normalizeSessionValue(envSession);
+  }
+  return normalizeSessionValue(config.sessionId);
+}
+
+function selectAuthToken(
+  config: PushPalsConfig,
+  env: Record<string, string | undefined>,
+): string | null {
+  const envToken = env["PUSHPALS_AUTH_TOKEN"];
+  if (envToken !== undefined) {
+    return normalizeOptional(envToken);
+  }
+  return normalizeOptional(config.authToken);
+}
+
+function parseCliArgs(argv: string[]): CliParseResult {
+  const overrides: CliOverrides = {};
+  const dividerIndex = argv.indexOf("--");
+  const args = dividerIndex >= 0 ? argv.slice(0, dividerIndex) : argv.slice();
+  const passthrough = dividerIndex >= 0 ? argv.slice(dividerIndex + 1) : [];
+
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i];
+    if (!token.startsWith("-")) {
       throw new Error(`Unexpected positional argument "${token}"`);
     }
-
-    switch (flag) {
+    switch (token) {
       case "--server": {
-        const { value, consumed } = consumeValue(args, i, inlineValue, flag);
-        overrides.server = requireNonEmpty(value, flag);
-        i += consumed + 1;
+        const value = nextFlagValue(args, ++i, token);
+        overrides.server = requireNonEmpty(value, token);
         break;
       }
       case "--sessionId": {
-        const { value, consumed } = consumeValue(args, i, inlineValue, flag);
-        overrides.sessionId = requireNonEmpty(value, flag);
-        i += consumed + 1;
+        const value = nextFlagValue(args, ++i, token);
+        overrides.sessionId = normalizeSessionValue(value);
         break;
       }
-      case "--token":
-      case "--authToken": {
-        const { value, consumed } = consumeValue(args, i, inlineValue, flag);
-        overrides.authToken = requireNonEmpty(value, flag);
-        i += consumed + 1;
+      case "--token": {
+        const value = nextFlagValue(args, ++i, token);
+        const trimmed = value.trim();
+        if (!trimmed) {
+          throw new Error("Flag --token requires a non-empty value.");
+        }
+        overrides.authToken = trimmed;
         break;
       }
+      case "":
+        throw new Error("Received empty argument.");
       default:
-        throw new Error(`Unknown flag "${flag}"`);
+        throw new Error(`Unknown flag ${token}`);
     }
   }
-  return overrides;
+
+  return { overrides, passthrough };
 }
 
-function consumeValue(
-  args: string[],
-  index: number,
-  inlineValue: string | undefined,
-  flag: string,
-): { value: string; consumed: number } {
-  if (inlineValue !== undefined) {
-    return { value: inlineValue, consumed: 0 };
+function nextFlagValue(args: string[], index: number, flag: string): string {
+  const value = args[index];
+  if (value === undefined || value.startsWith("-")) {
+    throw new Error(`Flag ${flag} requires a value.`);
   }
-  const nextIndex = index + 1;
-  if (nextIndex >= args.length) {
-    throw new Error(`${flag} requires a value`);
-  }
-  return { value: args[nextIndex], consumed: 1 };
+  return value;
 }
 
-function requireNonEmpty(value: string | undefined, flag: string): string {
-  if (value === undefined) {
-    throw new Error(`${flag} requires a value`);
-  }
+function normalizeNonEmpty(value: string | null | undefined): string | null {
+  const trimmed = (value ?? "").trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeOptional(value: string | null | undefined): string | null {
+  const trimmed = (value ?? "").trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeSessionValue(value: string | null | undefined): string | null {
+  const trimmed = (value ?? "").trim();
+  return trimmed ? trimmed : null;
+}
+
+function requireNonEmpty(value: string, flag: string): string {
   const trimmed = value.trim();
   if (!trimmed) {
-    throw new Error(`${flag} cannot be blank`);
+    throw new Error(`Flag ${flag} requires a non-empty value.`);
   }
   return trimmed;
-}
-
-function readEnvString(value: string | undefined): string | undefined {
-  if (value === undefined) return undefined;
-  const trimmed = value.trim();
-  return trimmed || undefined;
-}
-
-function readEnvAuthToken(env: Record<string, string | undefined>): string | null | undefined {
-  if (env.PUSHPALS_AUTH_TOKEN !== undefined) {
-    const trimmed = env.PUSHPALS_AUTH_TOKEN.trim();
-    return trimmed ? trimmed : null;
-  }
-  if (env.AUTH_TOKEN !== undefined) {
-    const trimmed = env.AUTH_TOKEN.trim();
-    return trimmed ? trimmed : null;
-  }
-  return undefined;
-}
-
-function resolveAuthToken(
-  cliValue: string | undefined,
-  envValue: string | null | undefined,
-  configValue: string | null,
-): string | null {
-  if (cliValue !== undefined) {
-    return cliValue;
-  }
-  if (envValue !== undefined) {
-    return envValue;
-  }
-  const trimmed = (configValue ?? "").trim();
-  return trimmed || null;
 }

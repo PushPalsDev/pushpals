@@ -26,6 +26,7 @@ import { PersistentSessionMemory } from "./persistent_memory.js";
 import {
   CommunicationManager,
   detectRepoRoot,
+  loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
   matchesGlob,
   normalizeTargetPath,
@@ -43,12 +44,11 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
-import { loadRuntime } from "./runtime_loader.js";
+import { loadRuntimeOptions } from "./runtime_loader.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
-const RUNTIME = loadRuntime();
-const CONFIG = RUNTIME.config;
+const CONFIG = loadPushPalsConfig();
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
 
@@ -632,7 +632,6 @@ class RemoteBuddyOrchestrator {
   private readonly spawnWorkerPollMs: number | null;
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
-  private readonly workerPassthroughArgs: string[];
   private readonly statusHeartbeatMs: number;
   private readonly fetchFailureLogsOnJobFailure: boolean;
   private readonly executionBudgetInteractiveMs: number;
@@ -679,7 +678,6 @@ class RemoteBuddyOrchestrator {
     server: string;
     sessionId: string;
     authToken: string | null;
-    workerPassthroughArgs?: string[];
     brain: AgentBrain;
     llm: LLMClient;
     idempotency: IdempotencyStore;
@@ -711,7 +709,6 @@ class RemoteBuddyOrchestrator {
         ? remoteCfg.workerpalHeartbeatMs
         : null;
     this.spawnWorkerLabels = remoteCfg.workerpalLabels;
-    this.workerPassthroughArgs = [...(opts.workerPassthroughArgs ?? [])];
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
     this.fetchFailureLogsOnJobFailure = parseEnabledFlag(
       process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS,
@@ -1400,7 +1397,6 @@ class RemoteBuddyOrchestrator {
       docker: this.spawnWorkerDocker,
       requireDocker: this.spawnWorkerRequireDocker,
       dockerImage: this.spawnWorkerImage,
-      passthroughArgs: this.workerPassthroughArgs,
     });
   }
 
@@ -2052,10 +2048,10 @@ async function connectWithRetry(
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
-  const opts = RUNTIME;
+  const runtime = loadRuntimeOptions({ config: CONFIG });
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
-  console.log(`[RemoteBuddy] Server: ${opts.server}`);
+  console.log(`[RemoteBuddy] Server: ${runtime.server}`);
   if (CONFIG.startup.logConfigOnStart) {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
@@ -2088,9 +2084,9 @@ async function main() {
     }`,
   );
 
-  let sessionId = opts.sessionId;
+  let sessionId = runtime.sessionId;
   console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
-  sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
+  sessionId = await connectWithRetry(runtime.server, sessionId ?? undefined);
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
   const llmCfg = CONFIG.remotebuddy.llm;
@@ -2105,10 +2101,9 @@ async function main() {
   brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
-    server: opts.server,
+    server: runtime.server,
     sessionId,
-    authToken: opts.authToken,
-    workerPassthroughArgs: opts.workerPassthroughArgs,
+    authToken: runtime.authToken,
     brain,
     llm,
     idempotency,
