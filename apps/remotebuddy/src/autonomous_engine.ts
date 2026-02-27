@@ -138,6 +138,21 @@ const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
 const VISION_DOC_FNAME = "vision.md";
 const MAX_VISION_CONTEXT_CHARS = 12_000;
 const MAX_VISION_SECTION_CHARS = 1_200;
+const DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
+const DOCS_WEAK_EVIDENCE_MAX_PENALTY = 0.12;
+
+export function docsWeakEvidencePenaltyForImpact(
+  objectiveType: string,
+  impactSignal: number,
+): number {
+  if (objectiveType !== "docs") return 0;
+  const normalizedImpact = clamp01(impactSignal);
+  if (normalizedImpact >= DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY) return 0;
+  const gapRatio =
+    (DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY - normalizedImpact) / DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY;
+  const penalty = DOCS_WEAK_EVIDENCE_MAX_PENALTY * clamp01(gapRatio);
+  return Math.round(penalty * 1_000_000) / 1_000_000;
+}
 
 type VisionContext = {
   path: string;
@@ -777,8 +792,20 @@ export class RemoteBuddyAutonomousEngine {
         evidence_ids: candidate.why_now_signal_ids,
       });
     }
-    const normalizedPenalties = normalizePenalties(penalties);
     const impactSignal = this.impactSignalV1(snapshot, candidate);
+    const docsWeakEvidencePenalty = docsWeakEvidencePenaltyForImpact(
+      candidate.objective_type,
+      impactSignal,
+    );
+    if (docsWeakEvidencePenalty > 0) {
+      penalties.push({
+        kind: "docs_weak_evidence",
+        weight: docsWeakEvidencePenalty,
+        reason: `docs candidate impact_signal ${impactSignal.toFixed(2)} below ${DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY.toFixed(2)}`,
+        evidence_ids: candidate.why_now_signal_ids,
+      });
+    }
+    const normalizedPenalties = normalizePenalties(penalties);
     const finalScore =
       0.55 * clamp01(llmScore) +
       0.2 * clamp01(impactSignal) +
@@ -801,6 +828,7 @@ export class RemoteBuddyAutonomousEngine {
     candidates: Array<{
       id: string;
       objective_type: AutonomyObjectiveType;
+      component_area: AutonomyComponentArea;
       pattern_key: string;
       confidence: number;
     }>,
@@ -1202,6 +1230,7 @@ export class RemoteBuddyAutonomousEngine {
         scored.map((row) => ({
           id: row.candidate.id,
           objective_type: row.candidate.objective_type,
+          component_area: row.candidate.component_area,
           pattern_key: row.patternKey,
           confidence: row.candidate.confidence,
         })),

@@ -92,4 +92,29 @@ describe("shared config remotebuddy autonomy parsing", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("defaults docs dispatch budget to 1 per hour when unset", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "config");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[remotebuddy.autonomy]",
+        "enabled = true",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByType.docs).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

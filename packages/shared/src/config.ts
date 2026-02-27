@@ -724,7 +724,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     lint_fix: 3,
     type_fix: 3,
     small_refactor: 2,
-    docs: 3,
+    docs: 1,
     dep_bump: 0,
   };
   const remoteAutonomyDispatchByType = {

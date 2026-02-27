@@ -118,6 +118,7 @@ const TRIGGER_TYPES = new Set<SignalValue["type"]>([
   "queue_health",
   "regret_signal",
 ]);
+const RECENT_SUCCESS_SUPPRESSION_WINDOW_HOURS = 24;
 
 export interface AutonomySnapshot {
   snapshot_id: string;
@@ -908,6 +909,47 @@ export class AutonomyStore {
     return untilMs > nowMs ? `cooldown_active until ${until}` : null;
   }
 
+  private recentSuccessSuppressionReason(params: {
+    patternKey: string;
+    objectiveType: AutonomyObjectiveType;
+    componentArea: AutonomyComponentArea | null;
+    nowIso: string;
+  }): string | null {
+    const { patternKey, objectiveType, componentArea, nowIso } = params;
+    if (patternKey) {
+      const exactRow = this.db
+        .prepare(
+          `SELECT 1
+           FROM autonomy_outcomes
+           WHERE pattern_key = ?
+             AND success = 1
+             AND datetime(created_at) >= datetime(?, '-${RECENT_SUCCESS_SUPPRESSION_WINDOW_HOURS} hours')
+           LIMIT 1`,
+        )
+        .get(patternKey, nowIso) as { 1: number } | null;
+      if (exactRow) return "recent_success_same_pattern_within_24h";
+    }
+
+    // "Near-same" suppression for docs: if the same component area already had a
+    // successful docs objective recently, block another docs dispatch burst.
+    if (objectiveType === "docs" && componentArea) {
+      const nearRow = this.db
+        .prepare(
+          `SELECT 1
+           FROM autonomy_outcomes o
+           JOIN autonomy_objectives obj ON obj.id = o.objective_id
+           WHERE o.success = 1
+             AND obj.objective_type = 'docs'
+             AND obj.component_area = ?
+             AND datetime(o.created_at) >= datetime(?, '-${RECENT_SUCCESS_SUPPRESSION_WINDOW_HOURS} hours')
+           LIMIT 1`,
+        )
+        .get(componentArea, nowIso) as { 1: number } | null;
+      if (nearRow) return "recent_success_near_pattern_within_24h";
+    }
+    return null;
+  }
+
   private preflightReason(snapshotId: string, runId?: string): string | null {
     if (this.isDispatchLockHeldByAnotherRun(runId)) {
       return "repo preflight blocked: dispatch lock held";
@@ -973,6 +1015,7 @@ export class AutonomyStore {
         return { candidate_id: candidateId, ok: false, reason: `invalid objective_type "${objectiveTypeRaw}"` };
       }
       const patternKey = asString(record.patternKey ?? record.pattern_key);
+      const componentArea = asComponentArea(record.componentArea ?? record.component_area);
       const confidence = clamp01(asNumber(record.confidence, 0));
 
       const perTypeLimit = Math.max(
@@ -996,6 +1039,15 @@ export class AutonomyStore {
       const cooldownErr = this.cooldownReason(patternKey, now);
       if (cooldownErr) {
         return { candidate_id: candidateId, ok: false, reason: cooldownErr };
+      }
+      const recentSuccessErr = this.recentSuccessSuppressionReason({
+        patternKey,
+        objectiveType,
+        componentArea,
+        nowIso: now,
+      });
+      if (recentSuccessErr) {
+        return { candidate_id: candidateId, ok: false, reason: recentSuccessErr };
       }
       if (preflightErr) {
         return { candidate_id: candidateId, ok: false, reason: preflightErr };

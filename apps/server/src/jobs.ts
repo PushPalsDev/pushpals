@@ -17,6 +17,7 @@ const JOB_EXECUTION_BUDGET_MS: Record<JobPriority, number> = {
   background: 1_800_000,
 };
 const JOB_FINALIZATION_BUDGET_MS_DEFAULT = 120_000;
+const PR_WORKER_ASSIGNMENT_MAX_AGE_MS = 120_000;
 
 export interface JobRow {
   id: string;
@@ -218,6 +219,34 @@ function normalizeDedupeKey(value: unknown): string | null {
   return key.slice(0, 512);
 }
 
+function normalizePrUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    parsed.hash = "";
+    parsed.search = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString().replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return trimmed.replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+function extractReviewAgentPrUrl(params: Record<string, unknown>): string | null {
+  const reviewAgent = params.reviewAgent;
+  if (!reviewAgent || typeof reviewAgent !== "object" || Array.isArray(reviewAgent)) return null;
+  return normalizePrUrl((reviewAgent as Record<string, unknown>).prUrl);
+}
+
+function resolveJobPrUrl(
+  body: Record<string, unknown>,
+  params: Record<string, unknown>,
+): string | null {
+  return normalizePrUrl(body.prUrl) ?? extractReviewAgentPrUrl(params);
+}
+
 export class JobQueue {
   private db: Database;
 
@@ -293,6 +322,14 @@ export class JobQueue {
       );
 
       CREATE INDEX IF NOT EXISTS idx_workers_last_heartbeat ON workers(lastHeartbeat);
+
+      CREATE TABLE IF NOT EXISTS pr_worker_assignments (
+        prUrl         TEXT PRIMARY KEY,
+        workerId      TEXT NOT NULL,
+        createdAt     TEXT NOT NULL,
+        updatedAt     TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_worker_assignments_worker ON pr_worker_assignments(workerId);
     `);
 
     const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{ name: string }>;
@@ -380,6 +417,48 @@ export class JobQueue {
     `);
   }
 
+  private assignedWorkerForPr(prUrl: string | null): string | null {
+    const normalizedPrUrl = normalizePrUrl(prUrl);
+    if (!normalizedPrUrl) return null;
+    const row = this.db
+      .prepare(`SELECT workerId FROM pr_worker_assignments WHERE prUrl = ?`)
+      .get(normalizedPrUrl) as { workerId: string | null } | undefined;
+    const workerId = row?.workerId?.trim() ?? "";
+    if (!workerId) return null;
+    const worker = this.db
+      .prepare(`SELECT status, lastHeartbeat FROM workers WHERE workerId = ?`)
+      .get(workerId) as { status: string | null; lastHeartbeat: string | null } | undefined;
+    if (!worker) return null;
+    if (String(worker.status ?? "").trim().toLowerCase() === "offline") return null;
+    const heartbeatMs = parseIsoMs(worker.lastHeartbeat);
+    if (heartbeatMs == null) return null;
+    if (Date.now() - heartbeatMs > PR_WORKER_ASSIGNMENT_MAX_AGE_MS) return null;
+    return workerId ? workerId : null;
+  }
+
+  private upsertPrWorkerAssignment(prUrl: string | null, workerId: string | null, now: string): void {
+    const normalizedPrUrl = normalizePrUrl(prUrl);
+    const normalizedWorkerId = typeof workerId === "string" ? workerId.trim() : "";
+    if (!normalizedPrUrl || !normalizedWorkerId) return;
+    this.db
+      .prepare(
+        `INSERT INTO pr_worker_assignments (prUrl, workerId, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(prUrl) DO UPDATE SET
+           workerId = excluded.workerId,
+           updatedAt = excluded.updatedAt`,
+      )
+      .run(normalizedPrUrl, normalizedWorkerId, now, now);
+  }
+
+  private refreshPrWorkerAssignmentForJob(jobId: string, now: string): void {
+    const row = this.db
+      .prepare(`SELECT prUrl, workerId FROM jobs WHERE id = ?`)
+      .get(jobId) as { prUrl: string | null; workerId: string | null } | undefined;
+    if (!row) return;
+    this.upsertPrWorkerAssignment(row.prUrl, row.workerId, now);
+  }
+
   private pendingOrderedIds(targetWorkerId: string | null = null): string[] {
     if (targetWorkerId) {
       const rows = this.db
@@ -447,11 +526,14 @@ export class JobQueue {
       body.params && typeof body.params === "object" && !Array.isArray(body.params)
         ? (body.params as Record<string, unknown>)
         : {};
+    const prUrl = resolveJobPrUrl(body, params);
     const targetWorkerIdRaw = body.targetWorkerId;
-    const targetWorkerId =
+    const requestedTargetWorkerId =
       typeof targetWorkerIdRaw === "string" && targetWorkerIdRaw.trim().length > 0
         ? targetWorkerIdRaw.trim()
         : null;
+    const targetWorkerId =
+      requestedTargetWorkerId || (prUrl ? this.assignedWorkerForPr(prUrl) : null);
 
     if (!taskId || !kind) {
       return { ok: false, message: "taskId and kind are required" };
@@ -527,14 +609,14 @@ export class JobQueue {
           `INSERT INTO jobs (
             id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
             queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
-            status, workerId, targetWorkerId, result, error,
+            status, workerId, targetWorkerId, result, prUrl, error,
             enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, completedAt, durationMs,
             createdAt, updatedAt
           )
            VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?,
-            'pending', NULL, ?, NULL, NULL,
+            'pending', NULL, ?, NULL, ?, NULL,
             ?, NULL, NULL, NULL, NULL, NULL, NULL,
             ?, ?
            )`,
@@ -552,6 +634,7 @@ export class JobQueue {
           executionBudgetMs,
           finalizationBudgetMs,
           targetWorkerId,
+          prUrl,
           now,
           now,
           now,
@@ -660,6 +743,7 @@ export class JobQueue {
            WHERE workerId = ?`,
         )
         .run(row.id, now, now, workerId);
+      this.upsertPrWorkerAssignment(row.prUrl, workerId, now);
 
       const queueWaitMs = Math.max(
         0,
@@ -825,6 +909,7 @@ export class JobQueue {
         }
       | undefined;
 
+    this.refreshPrWorkerAssignmentForJob(jobId, now);
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return {
       ok: true,
@@ -874,6 +959,7 @@ export class JobQueue {
         }
       | undefined;
 
+    this.refreshPrWorkerAssignmentForJob(jobId, now);
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return {
       ok: true,
@@ -1089,6 +1175,7 @@ export class JobQueue {
     if (info.changes === 0) {
       return { ok: false, message: "Job not found" };
     }
+    this.refreshPrWorkerAssignmentForJob(jobId, now);
     return { ok: true };
   }
 

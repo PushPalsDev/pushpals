@@ -1226,6 +1226,7 @@ export class ReviewAgent {
       taskId,
       sessionId,
       kind: "task.execute",
+      prUrl: pr.html_url,
       dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha),
       dedupeCooldownMs: REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS,
       params: {
@@ -1363,6 +1364,7 @@ export class ReviewAgent {
       taskId,
       sessionId,
       kind: "task.execute",
+      prUrl: pr.html_url,
       dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha),
       dedupeCooldownMs: REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS,
       params: {

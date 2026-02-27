@@ -185,6 +185,131 @@ describe("server AutonomyStore policy gates", () => {
     expect(String(result.results?.[0]?.reason ?? "")).toContain("confidence");
   });
 
+  test("evaluateEligibility suppresses dispatch when same pattern succeeded within 24h", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_recent_exact",
+      repoHealthFlags: {
+        is_worktree_dirty: false,
+        is_merge_in_progress: false,
+      },
+    }).snapshot_id;
+
+    const seeded = store.recordObjectiveDecision({
+      runId: "run_recent_exact",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_recent_exact",
+        candidate_id: "cand_recent_exact",
+        title: "Seed exact pattern success",
+        instruction: "Apply a stable lint fix",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "rejected",
+      },
+    });
+    expect(seeded.ok).toBe(true);
+    expect(typeof seeded.patternKey).toBe("string");
+
+    const seededOutcome = store.recordOutcome({
+      objectiveId: "obj_recent_exact",
+      patternKey: seeded.patternKey,
+      success: true,
+      userAction: "applied",
+    });
+    expect(seededOutcome.ok).toBe(true);
+
+    const result = store.evaluateEligibility({
+      runId: "run_recent_exact",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_again_exact",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          pattern_key: seeded.patternKey,
+          confidence: 0.95,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.results?.[0]?.ok).toBe(false);
+    expect(String(result.results?.[0]?.reason ?? "")).toContain(
+      "recent_success_same_pattern_within_24h",
+    );
+  });
+
+  test("evaluateEligibility suppresses near-same docs candidate in same component after recent success", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_recent_docs_near",
+      repoHealthFlags: {
+        is_worktree_dirty: false,
+        is_merge_in_progress: false,
+      },
+    }).snapshot_id;
+
+    const seeded = store.recordObjectiveDecision({
+      runId: "run_recent_docs_near",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_recent_docs",
+        candidate_id: "cand_recent_docs",
+        title: "Seed docs success",
+        instruction: "Refresh docs guidance",
+        objective_type: "docs",
+        component_area: "apps/remotebuddy",
+        trigger_type: "queue_health",
+        target_paths: ["apps/remotebuddy/docs/queue.md"],
+        scope: { read_anywhere: false, write_globs: ["apps/remotebuddy/docs/*.md"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "rejected",
+      },
+    });
+    expect(seeded.ok).toBe(true);
+
+    const seededOutcome = store.recordOutcome({
+      objectiveId: "obj_recent_docs",
+      patternKey: seeded.patternKey,
+      success: true,
+      userAction: "applied",
+    });
+    expect(seededOutcome.ok).toBe(true);
+
+    const result = store.evaluateEligibility({
+      runId: "run_recent_docs_near",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_docs_again",
+          objective_type: "docs",
+          component_area: "apps/remotebuddy",
+          pattern_key: "pk_docs_other_scope",
+          confidence: 0.95,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.results?.[0]?.ok).toBe(false);
+    expect(String(result.results?.[0]?.reason ?? "")).toContain(
+      "recent_success_near_pattern_within_24h",
+    );
+  });
+
   test("evaluateEligibility allows dirty worktree when allowDirtyWorktree is enabled", () => {
     const store = makeStore();
     (
