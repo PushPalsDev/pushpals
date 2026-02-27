@@ -6,13 +6,14 @@ export { detectRepoRoot, getRepoContext } from "./repo.js";
 export { CommunicationManager, type CommunicationManagerOptions } from "./communication.js";
 export { loadPromptTemplate, loadRepoDocText } from "./prompts.js";
 export {
+  extractVisionKeyItems,
   normalizeVisionSectionRef,
   normalizeVisionSectionRefs,
   parseVisionDoc,
   validateVisionDocStructure,
-  REQUIRED_VISION_SECTION_NUMBERS,
   type ParsedVisionDoc,
   type VisionDocValidation,
+  type VisionKeyItems,
   type VisionSection,
 } from "./vision.js";
 export {

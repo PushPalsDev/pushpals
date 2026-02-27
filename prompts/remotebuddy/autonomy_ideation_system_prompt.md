@@ -24,7 +24,8 @@ Return strict JSON with this shape:
 }
 Constraints:
 - You will receive `vision.markdown`; use it as inspiration and prioritize candidates that clearly advance that vision.
-- You will also receive `vision.sections`; every candidate must cite at least one section number in `vision_section_refs`.
+- You will also receive `vision.sections`; if numbered sections are present, cite at least one section number in `vision_section_refs`.
+- You will also receive `vision.key_items`; prioritize alignment with `priorities` + `objectives`, respect `guardrails` + `constraints`, and avoid `non_goals`.
 - `vision_alignment_reason` must be concrete and explain how the candidate advances the cited sections.
 - target_paths must be literal repo-relative paths.
 - write_globs must be repo-relative globs.
