@@ -4,10 +4,16 @@ import { detectRepoRoot } from "./repo.js";
 
 const TEMPLATE_TOKEN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 const promptTemplateCache = new Map<string, string>();
+const repoDocCache = new Map<string, string>();
 
 function resolvePromptPath(relativePath: string): string {
   const repoRoot = detectRepoRoot(process.cwd());
   return join(repoRoot, "prompts", relativePath);
+}
+
+function resolveRepoDocPath(relativePath: string): string {
+  const repoRoot = detectRepoRoot(process.cwd());
+  return join(repoRoot, relativePath);
 }
 
 export function loadPromptTemplate(
@@ -33,4 +39,25 @@ export function loadPromptTemplate(
     }
     return value;
   });
+}
+
+export function loadRepoDocText(relativePath: string, opts?: { cache?: boolean }): string {
+  const pathValue = String(relativePath ?? "").trim();
+  if (!pathValue) {
+    throw new Error("[docs] relativePath is required");
+  }
+
+  const docPath = resolveRepoDocPath(pathValue);
+  const shouldCache = opts?.cache !== false;
+
+  if (shouldCache) {
+    const cached = repoDocCache.get(docPath);
+    if (cached !== undefined) return cached;
+  }
+
+  const text = readFileSync(docPath, "utf8");
+  if (shouldCache) {
+    repoDocCache.set(docPath, text);
+  }
+  return text;
 }

@@ -3,10 +3,13 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import type { CommunicationManager } from "shared";
 import {
+  loadRepoDocText,
   loadPromptTemplate,
   makePatternKey,
   normalizePenalties,
+  normalizeVisionSectionRefs,
   penaltyTotal,
+  parseVisionDoc,
   validateScopeInvariants,
   type AutonomyComponentArea,
   type AutonomyObjectiveType,
@@ -35,6 +38,8 @@ type AutonomyCandidate = {
   estimated_effort: "small" | "medium" | "large";
   why_now_signal_ids: string[];
   confidence: number;
+  vision_alignment_reason: string;
+  vision_section_refs: string[];
   requires_user_input?: boolean;
   question_if_blocked?: string;
   candidate_created_at: string;
@@ -129,6 +134,24 @@ const SCORING_SYSTEM_PROMPT = loadPromptTemplate(
 const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/autonomy_planning_system_prompt.md",
 ).trim();
+const VISION_DOC_FNAME = "vision.md";
+const MAX_VISION_CONTEXT_CHARS = 12_000;
+const MAX_VISION_SECTION_CHARS = 1_200;
+
+type VisionContext = {
+  path: string;
+  markdown: string;
+  one_sentence: string;
+  sections: Array<{
+    number: string;
+    title: string;
+    markdown: string;
+    truncated: boolean;
+  }>;
+  section_numbers: string[];
+  sha256: string;
+  truncated: boolean;
+};
 
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -369,6 +392,58 @@ export class RemoteBuddyAutonomousEngine {
       this.cfg.llmTimeoutMs * 4,
       20_000,
     );
+  }
+
+  private loadVisionContext(runId: string): VisionContext | null {
+    let raw = "";
+    try {
+      raw = loadRepoDocText(VISION_DOC_FNAME);
+    } catch (error) {
+      console.error(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: failed to read ${VISION_DOC_FNAME}: ${String(error)}`,
+      );
+      return null;
+    }
+
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      console.error(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: ${VISION_DOC_FNAME} is empty; autonomy ideation requires non-empty vision context.`,
+      );
+      return null;
+    }
+
+    const truncated = trimmed.length > MAX_VISION_CONTEXT_CHARS;
+    if (truncated) {
+      console.log(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: ${VISION_DOC_FNAME} exceeded ${MAX_VISION_CONTEXT_CHARS} chars; using first ${MAX_VISION_CONTEXT_CHARS} chars for ideation.`,
+      );
+    }
+
+    const parsed = parseVisionDoc(trimmed);
+    const section_numbers = parsed.sections.map((section) => section.number);
+    const sections = parsed.sections.map((section) => {
+      const sectionMarkdown = section.markdown.trim();
+      const sectionTruncated = sectionMarkdown.length > MAX_VISION_SECTION_CHARS;
+      return {
+        number: section.number,
+        title: section.title,
+        markdown: sectionTruncated
+          ? sectionMarkdown.slice(0, MAX_VISION_SECTION_CHARS)
+          : sectionMarkdown,
+        truncated: sectionTruncated,
+      };
+    });
+
+    return {
+      path: VISION_DOC_FNAME,
+      markdown: truncated ? trimmed.slice(0, MAX_VISION_CONTEXT_CHARS) : trimmed,
+      one_sentence: parsed.oneSentence,
+      sections,
+      section_numbers,
+      sha256: sha256(trimmed),
+      truncated,
+    };
   }
 
   private async runGit(cwd: string, args: string[]): Promise<GitRunResult> {
@@ -836,6 +911,14 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
 
+      this.setPhase("load_vision_context");
+      const visionContext = this.loadVisionContext(runId);
+      if (!visionContext) {
+        outcomeDetail = "vision_unavailable";
+        return;
+      }
+      const visionSectionNumberSet = new Set(visionContext.section_numbers);
+
       const llmCalls: Record<string, unknown>[] = [];
       let candidatesPayload: Array<Record<string, unknown>> = [];
       let selectedCandidatePayload: Record<string, unknown> | undefined;
@@ -875,6 +958,7 @@ export class RemoteBuddyAutonomousEngine {
                   open_objectives: snapshot.open_objectives.slice(0, 20),
                   active_cooldowns: snapshot.active_cooldowns.slice(0, 20),
                 },
+                vision: visionContext,
                 limits: {
                   ideation_max_candidates: this.cfg.ideationMaxCandidates,
                   min_confidence: this.cfg.minConfidence,
@@ -929,6 +1013,11 @@ export class RemoteBuddyAutonomousEngine {
           estimated_effort: asString(c.estimated_effort) as "small" | "medium" | "large",
           why_now_signal_ids: asStringArray(c.why_now_signal_ids),
           confidence: clamp01(asNumber(c.confidence, 0)),
+          vision_alignment_reason: asString(c.vision_alignment_reason),
+          vision_section_refs: normalizeVisionSectionRefs(
+            asStringArray(c.vision_section_refs),
+            visionSectionNumberSet,
+          ),
           requires_user_input: asBoolean(c.requires_user_input, false),
           question_if_blocked: asString(c.question_if_blocked),
           candidate_created_at: new Date(candidateCreatedBaseMs + candidateIndex).toISOString(),
@@ -968,6 +1057,14 @@ export class RemoteBuddyAutonomousEngine {
           recordDropReason("missing_validation_steps");
           continue;
         }
+        if (!candidate.vision_alignment_reason) {
+          recordDropReason("missing_vision_alignment_reason");
+          continue;
+        }
+        if (candidate.vision_section_refs.length === 0) {
+          recordDropReason("missing_vision_section_refs");
+          continue;
+        }
         candidate.target_paths = scopeValidation.normalizedTargetPaths;
         candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
         normalizedCandidates.push(candidate);
@@ -986,6 +1083,8 @@ export class RemoteBuddyAutonomousEngine {
         estimated_effort: candidate.estimated_effort,
         why_now_signal_ids: candidate.why_now_signal_ids,
         confidence: candidate.confidence,
+        vision_alignment_reason: candidate.vision_alignment_reason,
+        vision_section_refs: candidate.vision_section_refs,
         gate_decision: "proposed",
         gate_reasons: [],
         candidate_created_at: candidate.candidate_created_at,
@@ -1101,6 +1200,8 @@ export class RemoteBuddyAutonomousEngine {
         estimated_effort: row.candidate.estimated_effort,
         why_now_signal_ids: row.candidate.why_now_signal_ids,
         confidence: row.candidate.confidence,
+        vision_alignment_reason: row.candidate.vision_alignment_reason,
+        vision_section_refs: row.candidate.vision_section_refs,
         llm_score: row.llmScore,
         impact_signal: row.impactSignal,
         ema_success: row.emaSuccess,
@@ -1142,6 +1243,8 @@ export class RemoteBuddyAutonomousEngine {
             scope: selected.candidate.scope,
             risk_level: selected.candidate.risk_level,
             confidence: selected.candidate.confidence,
+            vision_alignment_reason: selected.candidate.vision_alignment_reason,
+            vision_section_refs: selected.candidate.vision_section_refs,
           }
         : {
             id: top.candidate.id,
@@ -1154,6 +1257,8 @@ export class RemoteBuddyAutonomousEngine {
             scope: top.candidate.scope,
             risk_level: top.candidate.risk_level,
             confidence: top.candidate.confidence,
+            vision_alignment_reason: top.candidate.vision_alignment_reason,
+            vision_section_refs: top.candidate.vision_section_refs,
           };
       for (const row of candidatesPayload) {
         row.selected = Boolean(row.id === selectedCandidatePayload.id);

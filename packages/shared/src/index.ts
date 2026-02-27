@@ -4,7 +4,17 @@
 
 export { detectRepoRoot, getRepoContext } from "./repo.js";
 export { CommunicationManager, type CommunicationManagerOptions } from "./communication.js";
-export { loadPromptTemplate } from "./prompts.js";
+export { loadPromptTemplate, loadRepoDocText } from "./prompts.js";
+export {
+  normalizeVisionSectionRef,
+  normalizeVisionSectionRefs,
+  parseVisionDoc,
+  validateVisionDocStructure,
+  REQUIRED_VISION_SECTION_NUMBERS,
+  type ParsedVisionDoc,
+  type VisionDocValidation,
+  type VisionSection,
+} from "./vision.js";
 export {
   inferGitBackendFromRemote,
   parseGitHubRepo,
