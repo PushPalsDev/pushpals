@@ -59,6 +59,54 @@ Use this high-level flow while bringing a new machine online:
 4. Run `bun run remotebuddy` from the repo root for the recommended entry point, or pick another command from [Usage Commands](#usage-commands) when you need a specific mode.
 5. Validate the round trip with the [Runtime Smoke Test](#runtime-smoke-test) so you catch queue, auth, or worker issues before handling real traffic.
 
+## Deterministic RemoteBuddy Startup Diagnostics
+
+Follow this ordered, deterministic checklist whenever you need to cold start RemoteBuddy. Do not skip steps—each preflight blocker prevents healthy queue p95 ≈ 0 performance downstream.
+
+### Prerequisites (must be true before preflight)
+
+- Bun 1.1.x installed (`bun --version` prints `1.1.x`). Reinstall via the commands in the [Setup Checklist](#setup-checklist) if the version drifts.
+- Dependencies installed at repo root (`bun install` completed without errors) and `bun.lock` matches the checked-out commit.
+- `.env` and `config/local.toml` exist with the required `PUSHPALS_*` entries plus `PUSHPALS_AUTH_TOKEN` (or confirmed tokenless operation).
+- `jq` available on the PATH for JSON diagnostics (`jq --version`).
+- Server URL reachable from the host (`curl -sS $SERVER/system/status` returns HTTP 200 within 1 s).
+
+### Environment verification commands
+
+Run these from the repo root and stop immediately if any fail:
+
+1. `bun --version | grep -q '^1\.1\.'` – re-install Bun when the check fails.
+2. `test -f .env && rg -q '^PUSHPALS_AUTH_TOKEN=' .env` – ensures RemoteBuddy can load auth. If unset, generate a token via [Token Setup and Verification](#token-setup-and-verification).
+3. `test -f config/local.toml && test -s config/local.toml` – confirms config seeding. Copy from `config/local.example.toml` if missing.
+4. `curl -sfS "$SERVER/system/status" | jq '{queue_p95: .slo.requests.queueWaitMs.p95, job_failure_rate: .metrics.jobFailureRate}'` – proves the server is answering before RemoteBuddy starts.
+5. `bun run lint` – optional but recommended to surface obvious dependency drift before runtime work.
+
+### Deterministic boot sequence
+
+Run commands in separate terminals/tmux panes so logs stay visible:
+
+1. `bun run server:only` – starts the API that serves `/requests/claim` and `/system/status`.
+2. `bun run workerpals` – optional for pure planning, required if RemoteBuddy will enqueue `task.execute` work immediately.
+3. `bun run localbuddy` – optional, only when you need the full Client → LocalBuddy → RemoteBuddy flow.
+4. `bun run remotebuddy` – runs protocol build + `remotebuddy:only`, creating/tailing `remotebuddy-state.db`.
+
+### Healthy startup signals (gate RemoteBuddy admission)
+
+- RemoteBuddy logs show `Starting polling loop...` followed by at least one `claim payload` log within 3 s.
+- `curl -sS "$SERVER/system/status" | jq '{queue_p95: .slo.requests.queueWaitMs.p95, job_failure_rate: .metrics.jobFailureRate, pending: .queues.requests.pending}'` outputs `queue_p95: 0`, `job_failure_rate: 0.000`, and `pending: 0` within 10 s of launch.
+- `curl -sS "$SERVER/workers" | jq '.idle >= 2'` (or the equivalent lane-specific section) returns `true` so RemoteBuddy has immediate WorkerPal capacity.
+- `tail -n1 logs/remotebuddy.log` (or live terminal) shows `CommunicationManager` reconnected without errors.
+
+### Recovery steps for preflight failures
+
+- **Version or dependency mismatch:** rerun `bun install`, clear cache via `bun pm cache rm --all`, and retry the verification list before continuing.
+- **Missing secrets/config:** copy `.env.example` and `config/local.example.toml`, regenerate `PUSHPALS_AUTH_TOKEN`, then re-run the environment checks.
+- **Server reachability failure (curl exits non-zero):** start/restart `bun run server:only`, inspect server logs, and block RemoteBuddy start until `/system/status` stabilizes.
+- **Healthy signal mismatch (queue_p95≠0 or job_failure_rate≠0.000):** pause the launch, empty any stale requests via `/requests?status=pending`, confirm WorkerPals show ≥2 idle, then relaunch RemoteBuddy once metrics hit the healthy targets.
+- **CommunicationManager fails to connect:** verify `config/local.toml` WebSocket params, restart RemoteBuddy, and escalate to platform if retries persist for >2 minutes.
+
+Only resume normal operations once every prerequisite, environment check, boot command, and healthy signal above passes in order.
+
 ## Setup Checklist
 
 RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Work through the steps below in order; each step calls out the platform-specific commands you can reuse later.
