@@ -63,7 +63,15 @@ const START_SYNC_GIT_USER_EMAIL = "pushpals-start@local";
 const DEFAULT_PUSHPALS_PORT = CONFIG.server.port;
 const DEFAULT_STARTUP_WARMUP_TIMEOUT_MS = 120_000;
 const DEFAULT_STARTUP_WARMUP_POLL_MS = 1_000;
-const SYSTEM_LOG_PATH = resolve(repoRoot, "system.log");
+export const START_RUNTIME_TEST_MODE = (() => {
+  const raw = (process.env.PUSHPALS_START_RUNTIME_TEST_MODE ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true";
+})();
+const SYSTEM_LOG_FILENAME = START_RUNTIME_TEST_MODE
+  ? `system.test-${process.pid}-${Math.random().toString(36).slice(2)}.log`
+  : "system.log";
+const SYSTEM_LOG_PATH = resolve(repoRoot, SYSTEM_LOG_FILENAME);
+export const START_RUNTIME_SYSTEM_LOG_PATH = SYSTEM_LOG_PATH;
 const SYSTEM_LOG_TAIL_POLL_MS = 250;
 const SYSTEM_LOG_TAIL_READ_CHUNK_BYTES = 64 * 1024;
 const ANSI_RESET = "\u001b[0m";
@@ -76,7 +84,11 @@ const ANSI_GREEN = "\u001b[32m";
 const ANSI_BLUE = "\u001b[34m";
 const ANSI_BRIGHT_WHITE = "\u001b[97m";
 
-const systemLogStream = createWriteStream(SYSTEM_LOG_PATH, { flags: "w" });
+function createSystemLogWriteStream() {
+  return createWriteStream(SYSTEM_LOG_PATH, { flags: "w" });
+}
+
+let systemLogStream = createSystemLogWriteStream();
 
 const originalConsole = {
   log: console.log.bind(console),
@@ -166,6 +178,13 @@ function writeSystemLog(chunk: string | Uint8Array): void {
   }
 }
 
+export function startRuntimeTestWriteSystemLog(chunk: string | Uint8Array): void {
+  if (!START_RUNTIME_TEST_MODE) {
+    throw new Error("startRuntimeTestWriteSystemLog is only available in test mode.");
+  }
+  writeSystemLog(chunk);
+}
+
 function mirrorConsole(level: "log" | "info" | "warn" | "error", args: unknown[]): void {
   const message = format(...args);
   writeSystemLog(`${message}\n`);
@@ -174,91 +193,326 @@ function mirrorConsole(level: "log" | "info" | "warn" | "error", args: unknown[]
   }
 }
 
-console.log = (...args: unknown[]) => mirrorConsole("log", args);
-console.info = (...args: unknown[]) => mirrorConsole("info", args);
-console.warn = (...args: unknown[]) => mirrorConsole("warn", args);
-console.error = (...args: unknown[]) => mirrorConsole("error", args);
+if (!START_RUNTIME_TEST_MODE) {
+  console.log = (...args: unknown[]) => mirrorConsole("log", args);
+  console.info = (...args: unknown[]) => mirrorConsole("info", args);
+  console.warn = (...args: unknown[]) => mirrorConsole("warn", args);
+  console.error = (...args: unknown[]) => mirrorConsole("error", args);
+}
 
 function relSystemLogPath(): string {
   const rel = relative(repoRoot, SYSTEM_LOG_PATH);
   return rel ? rel.replace(/\\/g, "/") : "system.log";
 }
 
-type SystemLogTailHandle = {
+export type SystemLogTailHandle = {
   stop: () => void;
+  poll?: () => void;
 };
 
-function createSystemLogTail(pathValue: string): SystemLogTailHandle {
+type DecoderFactory = () => TextDecoder;
+
+type SystemLogTailFsOps = {
+  openSync: typeof openSync;
+  closeSync: typeof closeSync;
+  readSync: typeof readSync;
+  statSync: typeof statSync;
+};
+
+type SystemLogTailOptions = {
+  writer?: (chunk: string) => void;
+  autoStart?: boolean;
+  pollIntervalMs?: number;
+  fsOps?: SystemLogTailFsOps;
+  decoderFactory?: DecoderFactory;
+};
+
+const defaultSystemLogTailFsOps: SystemLogTailFsOps = {
+  openSync,
+  closeSync,
+  readSync,
+  statSync,
+};
+
+const SYSTEM_LOG_TAIL_PENDING_LIMIT_BYTES = SYSTEM_LOG_TAIL_READ_CHUNK_BYTES * 4;
+const SYSTEM_LOG_TAIL_RECOVERABLE_ERROR_CODES = new Set([
+  "ENOENT",
+  "EBADF",
+  "EIO",
+  "ETIMEDOUT",
+  "EPIPE",
+  "ECONNRESET",
+  "ENXIO",
+  "EAGAIN",
+  "EINVAL",
+  "EPERM",
+  "EACCES",
+  "ENOTCONN",
+  "ESTALE",
+]);
+const defaultDecoderFactory: DecoderFactory = () => new TextDecoder();
+
+export function createSystemLogTail(
+  pathValue: string,
+  options?: SystemLogTailOptions,
+): SystemLogTailHandle {
   let readOffset = 0;
   let pendingLine = "";
-  let decoder = new TextDecoder();
-  try {
-    readOffset = statSync(pathValue).size;
-  } catch {
-    readOffset = 0;
-  }
+  const makeDecoder = options?.decoderFactory ?? defaultDecoderFactory;
+  let decoder = makeDecoder();
+  const fsOps = options?.fsOps ?? defaultSystemLogTailFsOps;
+  let lastFileIdentity: string | null = null;
+  let pendingBytes: Uint8Array | null = null;
+  const writer = options?.writer ?? ((text: string) => process.stdout.write(text));
+  const safeWrite = (text: string): void => {
+    try {
+      writer(text);
+    } catch {
+      // swallow writer errors
+    }
+  };
+  const pollIntervalMs = options?.pollIntervalMs ?? SYSTEM_LOG_TAIL_POLL_MS;
+  const autoStart = options?.autoStart ?? true;
+  const fallbackDecoder = new TextDecoder();
+
+  const trimPendingBytes = (bytes: Uint8Array): Uint8Array => {
+    if (bytes.length <= SYSTEM_LOG_TAIL_PENDING_LIMIT_BYTES) {
+      return bytes.slice();
+    }
+    return bytes.slice(bytes.length - SYSTEM_LOG_TAIL_PENDING_LIMIT_BYTES);
+  };
+
+  const storePendingBytes = (bytes: Uint8Array): void => {
+    if (!bytes.length) {
+      pendingBytes = null;
+      return;
+    }
+    pendingBytes = trimPendingBytes(bytes);
+  };
+
+  const appendPendingBytes = (chunk: Uint8Array): Uint8Array => {
+    if (!pendingBytes?.length) return chunk;
+    const combined = new Uint8Array(pendingBytes.length + chunk.length);
+    combined.set(pendingBytes);
+    combined.set(chunk, pendingBytes.length);
+    pendingBytes = null;
+    return combined;
+  };
 
   const writeDecoded = (text: string, flush = false): void => {
     if (text) pendingLine += text;
     const parts = pendingLine.split(/\r\n|\n|\r/);
     pendingLine = parts.pop() ?? "";
     for (const line of parts) {
-      process.stdout.write(`${colorizeSystemLogLine(line)}\n`);
+      safeWrite(`${colorizeSystemLogLine(line)}\n`);
     }
     if (flush && pendingLine) {
-      process.stdout.write(`${colorizeSystemLogLine(pendingLine)}\n`);
+      safeWrite(`${colorizeSystemLogLine(pendingLine)}\n`);
       pendingLine = "";
     }
   };
 
-  const drain = (): void => {
-    let size = 0;
+  const flushPendingState = (): void => {
+    if (pendingBytes?.length) {
+      let bestEffortText = "";
+      try {
+        bestEffortText = fallbackDecoder.decode(pendingBytes);
+      } catch {
+        try {
+          bestEffortText = Buffer.from(pendingBytes).toString("utf8");
+        } catch {
+          bestEffortText = "";
+        }
+      }
+      pendingBytes = null;
+      if (bestEffortText) {
+        writeDecoded(bestEffortText, true);
+      }
+    } else {
+      writeDecoded("", true);
+    }
+  };
+
+  const resetDecoderState = (flush: boolean): void => {
+    if (flush) {
+      flushPendingState();
+    } else {
+      pendingLine = "";
+      pendingBytes = null;
+    }
+    decoder = makeDecoder();
+  };
+
+  const decodeChunk = (chunk: Uint8Array): string | null => {
+    let buffer = chunk;
+    if (pendingBytes?.length) {
+      buffer = appendPendingBytes(chunk);
+    }
     try {
-      size = statSync(pathValue).size;
+      const decoded = decoder.decode(buffer, { stream: true });
+      pendingBytes = null;
+      return decoded;
     } catch {
+      storePendingBytes(buffer);
+      decoder = makeDecoder();
+      return null;
+    }
+  };
+
+  const extractFsErrorCode = (err: unknown): string | null => {
+    if (!err || typeof err !== "object") return null;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (typeof code !== "string" || code.length === 0) return null;
+    return code.toUpperCase();
+  };
+
+  const handleFsError = (err: unknown): void => {
+    const code = extractFsErrorCode(err);
+    if (!code || !SYSTEM_LOG_TAIL_RECOVERABLE_ERROR_CODES.has(code)) return;
+    resetDecoderState(lastFileIdentity !== null);
+    lastFileIdentity = null;
+    readOffset = 0;
+  };
+
+  const runFsOp = <T>(operation: () => T): T | null => {
+    try {
+      return operation();
+    } catch (err) {
+      handleFsError(err);
+      return null;
+    }
+  };
+
+  const safeStat = (): ReturnType<typeof statSync> | null => {
+    return runFsOp(() => fsOps.statSync(pathValue));
+  };
+
+  const safeOpen = (): number | null => {
+    return runFsOp(() => fsOps.openSync(pathValue, "r"));
+  };
+
+  const safeClose = (fd: number | null): void => {
+    if (fd === null) return;
+    runFsOp(() => {
+      fsOps.closeSync(fd);
+      return true;
+    });
+  };
+
+  const safeRead = (
+    fd: number,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number,
+  ): number => {
+    const result = runFsOp(() => fsOps.readSync(fd, buffer, offset, length, position));
+    return typeof result === "number" ? result : -1;
+  };
+
+  const primeInitialState = (): void => {
+    const stats = safeStat();
+    if (!stats) {
+      readOffset = 0;
       return;
     }
-    if (size < readOffset) {
-      readOffset = 0;
-      pendingLine = "";
-      decoder = new TextDecoder();
-    }
-    if (size === readOffset) return;
+    readOffset = stats.size;
+    lastFileIdentity = `${stats.dev}:${stats.ino ?? 0}`;
+  };
+  primeInitialState();
 
-    const fd = openSync(pathValue, "r");
+  const drain = (): void => {
     try {
-      let remaining = size - readOffset;
-      while (remaining > 0) {
-        const chunkSize = Math.min(remaining, SYSTEM_LOG_TAIL_READ_CHUNK_BYTES);
-        const buffer = Buffer.allocUnsafe(chunkSize);
-        const bytesRead = readSync(fd, buffer, 0, chunkSize, readOffset);
-        if (bytesRead <= 0) break;
-        readOffset += bytesRead;
-        remaining -= bytesRead;
-        writeDecoded(decoder.decode(buffer.subarray(0, bytesRead), { stream: true }));
+      const stats = safeStat();
+      if (!stats) return;
+      const size = stats.size;
+      const fileIdentity = `${stats.dev}:${stats.ino ?? 0}`;
+      if (lastFileIdentity === null || fileIdentity !== lastFileIdentity) {
+        resetDecoderState(true);
+        readOffset = 0;
       }
-    } finally {
-      closeSync(fd);
+      lastFileIdentity = fileIdentity;
+      if (size < readOffset) {
+        resetDecoderState(true);
+        readOffset = 0;
+      }
+      if (size === readOffset) return;
+
+      const fd = safeOpen();
+      if (fd === null) {
+        return;
+      }
+      try {
+        let remaining = size - readOffset;
+        while (remaining > 0) {
+          const chunkSize = Math.min(remaining, SYSTEM_LOG_TAIL_READ_CHUNK_BYTES);
+          const buffer = Buffer.allocUnsafe(chunkSize);
+          const bytesRead = safeRead(fd, buffer, 0, chunkSize, readOffset);
+          if (bytesRead <= 0) break;
+          readOffset += bytesRead;
+          remaining -= bytesRead;
+          const decoded = decodeChunk(buffer.subarray(0, bytesRead));
+          if (decoded) {
+            writeDecoded(decoded);
+          }
+        }
+      } finally {
+        safeClose(fd);
+      }
+    } catch {
+      // swallow tail errors
     }
   };
 
-  const timer = setInterval(drain, SYSTEM_LOG_TAIL_POLL_MS);
+  const timer = autoStart ? setInterval(drain, pollIntervalMs) : null;
   return {
     stop: () => {
-      clearInterval(timer);
-      drain();
-      writeDecoded(decoder.decode(), true);
+      if (timer) clearInterval(timer);
+      try {
+        drain();
+      } catch {
+        // ignore final drain failures
+      }
+      try {
+        flushPendingState();
+        const finalText = decoder.decode();
+        if (finalText) {
+          writeDecoded(finalText, true);
+        }
+      } catch {
+        pendingLine = "";
+      }
     },
+    poll: drain,
   };
 }
 
 let systemLogTail: SystemLogTailHandle | null = null;
+let systemLogTailLastOptions: SystemLogTailOptions | undefined;
+
+const cloneTailOptions = (options?: SystemLogTailOptions): SystemLogTailOptions | undefined => {
+  if (!options) return undefined;
+  return { ...options };
+};
+
+function startSystemLogTailInternal(
+  options?: SystemLogTailOptions,
+  { forceRestart = false }: { forceRestart?: boolean } = {},
+): SystemLogTailHandle | null {
+  if (systemLogTail) {
+    if (!forceRestart) return systemLogTail;
+    systemLogTail.stop();
+    systemLogTail = null;
+  }
+  systemLogTailUsesAnsi = shouldUseAnsiColors();
+  systemLogTail = createSystemLogTail(SYSTEM_LOG_PATH, options);
+  systemLogTailLastOptions = cloneTailOptions(options);
+  consolePassthroughEnabled = false;
+  return systemLogTail;
+}
 
 function startSystemLogTail(): void {
-  if (systemLogTail) return;
-  systemLogTailUsesAnsi = shouldUseAnsiColors();
-  systemLogTail = createSystemLogTail(SYSTEM_LOG_PATH);
-  consolePassthroughEnabled = false;
+  startSystemLogTailInternal();
 }
 
 function stopSystemLogTail(): void {
@@ -267,6 +521,29 @@ function stopSystemLogTail(): void {
     systemLogTail = null;
   }
   consolePassthroughEnabled = true;
+}
+
+export function startRuntimeSystemLogTailForTests(
+  options?: SystemLogTailOptions,
+): SystemLogTailHandle | null {
+  if (!START_RUNTIME_TEST_MODE) {
+    throw new Error("startRuntimeSystemLogTailForTests is only available in test mode.");
+  }
+  return startSystemLogTailInternal(options, { forceRestart: true });
+}
+
+export function getRuntimeSystemLogTailForTests(): SystemLogTailHandle | null {
+  if (!START_RUNTIME_TEST_MODE) {
+    throw new Error("getRuntimeSystemLogTailForTests is only available in test mode.");
+  }
+  return systemLogTail;
+}
+
+export function stopRuntimeSystemLogTailForTests(): void {
+  if (!START_RUNTIME_TEST_MODE) {
+    throw new Error("stopRuntimeSystemLogTailForTests is only available in test mode.");
+  }
+  stopSystemLogTail();
 }
 
 async function pipeProcStreamToSystemLog(
@@ -315,12 +592,32 @@ async function pipeProcStreamToOutputAndSystemLog(
   }
 }
 
-async function closeSystemLog(): Promise<void> {
+export async function closeSystemLog(): Promise<void> {
+  if (!systemLogStream.destroyed && !systemLogStream.writableEnded) {
+    await new Promise<void>((resolveClose) => {
+      systemLogStream.end(() => resolveClose());
+    });
+  }
   stopSystemLogTail();
-  if (systemLogStream.destroyed) return;
-  await new Promise<void>((resolveClose) => {
-    systemLogStream.end(() => resolveClose());
-  });
+}
+
+export async function resetStartRuntimeSystemLogForTests(): Promise<void> {
+  if (!START_RUNTIME_TEST_MODE) {
+    throw new Error("resetStartRuntimeSystemLogForTests is only available in test mode.");
+  }
+  const tailWasRunning = systemLogTail !== null;
+  const restartOptions = cloneTailOptions(systemLogTailLastOptions);
+  await closeSystemLog();
+  try {
+    rmSync(SYSTEM_LOG_PATH, { force: true });
+  } catch {
+    // ignore cleanup failures
+  }
+  systemLogStream = createSystemLogWriteStream();
+  systemLogWriteFailed = false;
+  if (tailWasRunning) {
+    startSystemLogTailInternal(restartOptions, { forceRestart: true });
+  }
 }
 const REQUIRED_DEPENDENCY_PROBES: Array<{
   label: string;
@@ -481,6 +778,7 @@ const WORKER_IMAGE_HASH_IGNORE_DIRS = new Set([
 ]);
 const DEFAULT_SOURCE_CONTROL_MANAGER_WORKTREE = resolve(CONFIG.sourceControlManager.repoPath);
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
+const FALSY = new Set(["0", "false", "no", "off", "never"]);
 
 type StartOptions = {
   clean: boolean;
@@ -2345,14 +2643,376 @@ async function runQuiet(cmd: string[]): Promise<number> {
   }
 }
 
-async function runInherited(cmd: string[], cwd?: string): Promise<number> {
+export type RunInheritedOptions = {
+  cwd?: string;
+  interactive?: boolean;
+};
+
+type RunInheritedTestDecision = {
+  cmd: string[];
+  interactive: boolean;
+  reason: "forced" | "auto" | "default";
+};
+
+const runInheritedTestDecisions: RunInheritedTestDecision[] | null = START_RUNTIME_TEST_MODE ? [] : null;
+
+function recordRunInheritedTestDecision(decision: RunInheritedTestDecision): void {
+  if (!runInheritedTestDecisions) return;
+  runInheritedTestDecisions.push({
+    cmd: [...decision.cmd],
+    interactive: decision.interactive,
+    reason: decision.reason,
+  });
+}
+
+export function getRunInheritedTestDecisions(): RunInheritedTestDecision[] {
+  if (!runInheritedTestDecisions) return [];
+  return runInheritedTestDecisions.map((entry) => ({
+    cmd: [...entry.cmd],
+    interactive: entry.interactive,
+    reason: entry.reason,
+  }));
+}
+
+export function resetRunInheritedTestDecisions(): void {
+  runInheritedTestDecisions?.splice(0, runInheritedTestDecisions.length);
+}
+
+const AUTO_INTERACTIVE_COMMAND_TOKENS = new Set(["login", "--login"]);
+const AUTO_INTERACTIVE_FLAG_NAMES = ["--interactive", "--web", "--browser"] as const;
+const AUTO_INTERACTIVE_WRAPPER_COMMANDS = new Set([
+  "env",
+  "sudo",
+  "doas",
+  "command",
+  "bun",
+  "bunx",
+  "npx",
+  "pnpx",
+  "pnpm",
+  "npm",
+  "yarn",
+  "yarnpkg",
+]);
+const AUTO_INTERACTIVE_WRAPPER_SUBCOMMANDS = new Map<string, ReadonlySet<string>>([
+  ["bun", new Set(["run", "x"])],
+  ["bunx", new Set()],
+  ["env", new Set()],
+  ["sudo", new Set()],
+  ["doas", new Set()],
+  ["command", new Set()],
+  ["npx", new Set()],
+  ["pnpx", new Set()],
+  ["pnpm", new Set(["exec", "run", "dlx"])],
+  ["npm", new Set(["exec", "run"])],
+  ["yarn", new Set(["run"])],
+  ["yarnpkg", new Set(["run"])],
+]);
+const AUTO_INTERACTIVE_BASE_COMMANDS = new Set([
+  "ssh",
+  "slogin",
+  "scp",
+  "sftp",
+  "ftp",
+  "bash",
+  "sh",
+  "zsh",
+  "fish",
+  "pwsh",
+  "powershell",
+  "cmd",
+  "tmux",
+  "screen",
+]);
+const AUTO_INTERACTIVE_TTY_FLAG_COMMANDS = new Set(["docker", "kubectl", "podman", "nerdctl", "ctr"]);
+const AUTO_INTERACTIVE_TTY_SUBCOMMANDS = new Set(["exec", "run", "attach"]);
+const AUTO_INTERACTIVE_LONG_TTY_FLAGS = new Set(["--tty", "--force-tty"]);
+const ENV_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=.*/;
+
+function normalizeCommandBasename(token: string | undefined): string {
+  if (!token) return "";
+  const trimmed = token.trim();
+  if (!trimmed) return "";
+  const withoutDirs = trimmed.replace(/^.*[\\/]/, "").toLowerCase();
+  return withoutDirs.replace(/\.(exe|bat|cmd)$/g, "");
+}
+
+function tokenRequestsInteractiveTty(token: string): boolean {
+  const normalized = token.trim().toLowerCase();
+  if (!normalized || !normalized.startsWith("-")) return false;
+  const eqIndex = normalized.indexOf("=");
+  const base = eqIndex === -1 ? normalized : normalized.slice(0, eqIndex);
+  if (AUTO_INTERACTIVE_LONG_TTY_FLAGS.has(base)) return true;
+  if (base.startsWith("--")) return false;
+  const short = base.replace(/^-+/, "");
+  if (!short || !short.includes("t")) return false;
+  // docker-like commands often compress flags such as -itd; allow a limited charset
+  for (const char of short) {
+    if ("itd".indexOf(char) === -1) return false;
+  }
+  return true;
+}
+
+function isEnvAssignmentToken(token: string | undefined): boolean {
+  if (!token) return false;
+  return ENV_ASSIGNMENT_PATTERN.test(token.trim());
+}
+
+function trimCommandWrappersForAnalysis(cmd: string[]): string[] {
+  if (cmd.length === 0) return cmd;
+  let index = 0;
+  let trimmed = false;
+  while (index < cmd.length) {
+    const raw = cmd[index];
+    if (!raw) {
+      index += 1;
+      continue;
+    }
+    const token = raw.trim();
+    if (!token) {
+      index += 1;
+      continue;
+    }
+    if (token === "--") {
+      index += 1;
+      trimmed = true;
+      break;
+    }
+    if (isEnvAssignmentToken(token)) {
+      index += 1;
+      trimmed = true;
+      continue;
+    }
+    const base = normalizeCommandBasename(token);
+    if (AUTO_INTERACTIVE_WRAPPER_COMMANDS.has(base)) {
+      index += 1;
+      trimmed = true;
+      const subcommands = AUTO_INTERACTIVE_WRAPPER_SUBCOMMANDS.get(base);
+      if (subcommands && subcommands.size > 0) {
+        while (index < cmd.length) {
+          const nextRaw = cmd[index];
+          if (!nextRaw) break;
+          const nextToken = nextRaw.trim();
+          if (!nextToken) {
+            index += 1;
+            trimmed = true;
+            continue;
+          }
+          if (nextToken === "--") {
+            index += 1;
+            trimmed = true;
+            break;
+          }
+          const nextBase = normalizeCommandBasename(nextToken);
+          const compareKey = nextToken.toLowerCase();
+          if (
+            (nextBase && subcommands.has(nextBase)) ||
+            (compareKey && subcommands.has(compareKey))
+          ) {
+            index += 1;
+            trimmed = true;
+            continue;
+          }
+          break;
+        }
+      }
+      continue;
+    }
+    if (token.startsWith("-") && token !== "--") {
+      index += 1;
+      trimmed = true;
+      continue;
+    }
+    break;
+  }
+  if (!trimmed) return cmd;
+  const sliced = cmd.slice(index);
+  return sliced.length > 0 ? sliced : cmd;
+}
+
+function commandPrefixCandidates(cmd: string[]): string[] {
+  const candidates: string[] = [];
+  for (let i = 0; i < cmd.length && candidates.length < 2; i += 1) {
+    const token = cmd[i];
+    if (!token) continue;
+    const trimmed = token.trim();
+    if (!trimmed) continue;
+    if (trimmed === "--") continue;
+    if (isEnvAssignmentToken(trimmed)) continue;
+    const base = normalizeCommandBasename(trimmed);
+    if (!base) continue;
+    if (AUTO_INTERACTIVE_WRAPPER_COMMANDS.has(base)) {
+      const subcommands = AUTO_INTERACTIVE_WRAPPER_SUBCOMMANDS.get(base);
+      if (subcommands && subcommands.size > 0 && i + 1 < cmd.length) {
+        const nextToken = cmd[i + 1];
+        if (nextToken) {
+          const nextTrimmed = nextToken.trim();
+          const nextBase = normalizeCommandBasename(nextTrimmed);
+          const compareKey = nextTrimmed.toLowerCase();
+          if (
+            (nextBase && subcommands.has(nextBase)) ||
+            (compareKey && subcommands.has(compareKey))
+          ) {
+            i += 1;
+          }
+        }
+      }
+      continue;
+    }
+    candidates.push(base);
+  }
+  if (candidates.length === 0 && cmd.length > 0) {
+    candidates.push(normalizeCommandBasename(cmd[0]));
+  }
+  return candidates;
+}
+
+function normalizedTokensBeforeTerminator(cmd: string[]): string[] {
+  const normalized: string[] = [];
+  for (const part of cmd) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    if (trimmed === "--") break;
+    normalized.push(trimmed.toLowerCase());
+  }
+  return normalized;
+}
+
+function dockerLikeCommandRequestsInteractive(tokens: string[]): boolean {
+  let awaitingComposeSubcommand = false;
+  let hasInteractiveSubcommand = false;
+  for (let i = 1; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!token) continue;
+    if (token === "--") break;
+    if (token.startsWith("-")) {
+      if (tokenRequestsInteractiveTty(token) && hasInteractiveSubcommand) {
+        return true;
+      }
+      continue;
+    }
+    if (token === "compose") {
+      awaitingComposeSubcommand = true;
+      continue;
+    }
+    if (awaitingComposeSubcommand) {
+      awaitingComposeSubcommand = false;
+      if (AUTO_INTERACTIVE_TTY_SUBCOMMANDS.has(token)) {
+        hasInteractiveSubcommand = true;
+      }
+      continue;
+    }
+    if (AUTO_INTERACTIVE_TTY_SUBCOMMANDS.has(token)) {
+      hasInteractiveSubcommand = true;
+    }
+  }
+  return false;
+}
+
+function commandNeedsTtyByName(cmd: string[]): boolean {
+  const effectiveTokens = trimCommandWrappersForAnalysis(cmd);
+  const candidates = commandPrefixCandidates(effectiveTokens);
+  const normalized = effectiveTokens.map((part) => part.trim().toLowerCase());
+  for (const base of candidates) {
+    if (!base) continue;
+    if (AUTO_INTERACTIVE_BASE_COMMANDS.has(base)) return true;
+    if (AUTO_INTERACTIVE_TTY_FLAG_COMMANDS.has(base) && dockerLikeCommandRequestsInteractive(normalized)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parseFlagValue(token: string, flagName: string): string | null {
+  if (!token.startsWith(`${flagName}=`)) return null;
+  return token.slice(flagName.length + 1);
+}
+
+function flagImpliesInteractive(token: string, flagName: string): boolean {
+  const value = parseFlagValue(token, flagName);
+  if (value === null) return false;
+  const normalizedValue = value.trim().toLowerCase();
+  if (!normalizedValue) return true;
+  if (TRUTHY.has(normalizedValue)) return true;
+  if (FALSY.has(normalizedValue)) return false;
+  if (normalizedValue === "auto" || normalizedValue === "tty") return true;
+  return true;
+}
+
+function interpretBooleanLiteral(value: string | undefined): boolean | null {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized.startsWith("-")) return null;
+  if (TRUTHY.has(normalized) || normalized === "auto" || normalized === "tty") return true;
+  if (FALSY.has(normalized)) return false;
+  return null;
+}
+
+function shouldAutoUseInteractiveStdio(cmd: string[]): boolean {
+  if (commandNeedsTtyByName(cmd)) return true;
+  const normalized = normalizedTokensBeforeTerminator(cmd);
+  for (let i = 0; i < normalized.length; ) {
+    const token = normalized[i];
+    let advanceBy = 1;
+    if (token) {
+      if (AUTO_INTERACTIVE_COMMAND_TOKENS.has(token)) return true;
+      for (const flagName of AUTO_INTERACTIVE_FLAG_NAMES) {
+        if (flagImpliesInteractive(token, flagName)) return true;
+        if (token === flagName) {
+          const explicit = interpretBooleanLiteral(normalized[i + 1]);
+          if (explicit === false) {
+            advanceBy = 2;
+            break;
+          }
+          if (explicit === true) return true;
+          return true;
+        }
+      }
+    }
+    i += advanceBy;
+  }
+  return false;
+}
+
+function resolveRunInheritedOptions(
+  cmd: string[],
+  cwdOrOptions?: string | RunInheritedOptions,
+): { cwd?: string; interactive: boolean; reason: RunInheritedTestDecision["reason"] } {
+  const options =
+    typeof cwdOrOptions === "string" ? { cwd: cwdOrOptions } : (cwdOrOptions ?? {});
+  let interactive = Boolean(options.interactive);
+  let reason: RunInheritedTestDecision["reason"] = "default";
+  if (options.interactive !== undefined) {
+    reason = "forced";
+  } else if (shouldAutoUseInteractiveStdio(cmd)) {
+    interactive = true;
+    reason = "auto";
+  }
+  return { cwd: options.cwd, interactive, reason };
+}
+
+export async function runInherited(
+  cmd: string[],
+  cwdOrOptions?: string | RunInheritedOptions,
+): Promise<number> {
+  const resolved = resolveRunInheritedOptions(cmd, cwdOrOptions);
+  // Interactive commands inherit stdout/stderr directly, so their console output
+  // bypasses system.log to preserve the real TTY experience.
+  recordRunInheritedTestDecision({
+    cmd,
+    interactive: resolved.interactive,
+    reason: resolved.reason,
+  });
   try {
     const proc = Bun.spawn(cmd, {
-      cwd,
+      cwd: resolved.cwd,
       stdin: "inherit",
-      stdout: "pipe",
-      stderr: "pipe",
+      stdout: resolved.interactive ? "inherit" : "pipe",
+      stderr: resolved.interactive ? "inherit" : "pipe",
     });
+    if (resolved.interactive) {
+      return await proc.exited;
+    }
     const stdoutPump = pipeProcStreamToOutputAndSystemLog(proc.stdout, process.stdout);
     const stderrPump = pipeProcStreamToOutputAndSystemLog(proc.stderr, process.stderr);
     const exitCode = await proc.exited;
@@ -4330,81 +4990,83 @@ async function ensureDockerImage(): Promise<void> {
   }
 }
 
-let shuttingDown = false;
-let proc: ReturnType<typeof Bun.spawn> | null = null;
-const shutdown = async (code: number) => {
-  if (shuttingDown) return;
-  shuttingDown = true;
+if (!START_RUNTIME_TEST_MODE) {
+  let shuttingDown = false;
+  let proc: ReturnType<typeof Bun.spawn> | null = null;
+  const shutdown = async (code: number) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      proc?.kill();
+    } catch {}
+    await cleanupWorkerWarmContainers("shutdown");
+    await stopManagedLmStudio();
+    await closeSystemLog();
+    process.exit(code);
+  };
+
+  process.on("SIGINT", () => {
+    void shutdown(130);
+  });
+  process.on("SIGTERM", () => {
+    void shutdown(143);
+  });
+
   try {
-    proc?.kill();
-  } catch {}
-  await cleanupWorkerWarmContainers("shutdown");
-  await stopManagedLmStudio();
-  await closeSystemLog();
-  process.exit(code);
-};
-
-process.on("SIGINT", () => {
-  void shutdown(130);
-});
-process.on("SIGTERM", () => {
-  void shutdown(143);
-});
-
-try {
-  cleanRuntimeStateIfRequested();
-  await ensureWorkspaceDependenciesInstalled();
-  sanitizeWindowsWatcherPaths();
-  ensureRequiredLocalConfigFiles();
-  ensureAutonomyVisionFile();
-  logEffectiveConfigSnapshot();
-  await ensureServicePortsAvailable();
-  await cleanupStaleWorkerPalsProcesses();
-  await ensureCodexCliAuthPreflight();
-  await ensureGitHubAuthPreflight();
-  await cleanupWorkerWarmContainers("startup preflight");
-  await ensureLlmPreflight();
-  await ensureIntegrationBranch();
-  await cleanLegacyLocalBranchesIfRequested();
-  await ensureGitHubAuth();
-  await ensureSourceControlManagerWorktree();
-  await ensureIntegrationBranchUpToDateWithMain();
-  await ensureDockerImage();
-} catch (err) {
-  await cleanupWorkerWarmContainers("startup failure");
-  await stopManagedLmStudio();
-  await closeSystemLog();
-  if (err instanceof StartAbort) {
-    process.exit(err.exitCode);
+    cleanRuntimeStateIfRequested();
+    await ensureWorkspaceDependenciesInstalled();
+    sanitizeWindowsWatcherPaths();
+    ensureRequiredLocalConfigFiles();
+    ensureAutonomyVisionFile();
+    logEffectiveConfigSnapshot();
+    await ensureServicePortsAvailable();
+    await cleanupStaleWorkerPalsProcesses();
+    await ensureCodexCliAuthPreflight();
+    await ensureGitHubAuthPreflight();
+    await cleanupWorkerWarmContainers("startup preflight");
+    await ensureLlmPreflight();
+    await ensureIntegrationBranch();
+    await cleanLegacyLocalBranchesIfRequested();
+    await ensureGitHubAuth();
+    await ensureSourceControlManagerWorktree();
+    await ensureIntegrationBranchUpToDateWithMain();
+    await ensureDockerImage();
+  } catch (err) {
+    await cleanupWorkerWarmContainers("startup failure");
+    await stopManagedLmStudio();
+    await closeSystemLog();
+    if (err instanceof StartAbort) {
+      process.exit(err.exitCode);
+    }
+    console.error(`[start] Unexpected startup failure: ${String(err)}`);
+    process.exit(1);
   }
-  console.error(`[start] Unexpected startup failure: ${String(err)}`);
-  process.exit(1);
+
+  const bunExecPath = (process.execPath ?? "").trim() || "bun";
+  console.log(`[start] Runtime logs are being written to ${relSystemLogPath()}.`);
+  proc = Bun.spawn([bunExecPath, "run", "dev:full"], {
+    stdin: "inherit",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env },
+  });
+  startSystemLogTail();
+
+  const devStdoutPump = pipeProcStreamToSystemLog(proc.stdout);
+  const devStderrPump = pipeProcStreamToSystemLog(proc.stderr);
+
+  const startupWarmupPromise = runStartupWarmup().catch((err) => {
+    console.warn(`[start] Startup warmup failed: ${String(err)}`);
+  });
+
+  const exitCode = await proc.exited;
+  await Promise.allSettled([devStdoutPump, devStderrPump]);
+  await Promise.race([
+    startupWarmupPromise,
+    new Promise((resolveWait) => setTimeout(resolveWait, 500)),
+  ]);
+  await cleanupWorkerWarmContainers("dev:full exit");
+  await stopManagedLmStudio();
+  await closeSystemLog();
+  process.exit(exitCode);
 }
-
-const bunExecPath = (process.execPath ?? "").trim() || "bun";
-console.log(`[start] Runtime logs are being written to ${relSystemLogPath()}.`);
-proc = Bun.spawn([bunExecPath, "run", "dev:full"], {
-  stdin: "inherit",
-  stdout: "pipe",
-  stderr: "pipe",
-  env: { ...process.env },
-});
-startSystemLogTail();
-
-const devStdoutPump = pipeProcStreamToSystemLog(proc.stdout);
-const devStderrPump = pipeProcStreamToSystemLog(proc.stderr);
-
-const startupWarmupPromise = runStartupWarmup().catch((err) => {
-  console.warn(`[start] Startup warmup failed: ${String(err)}`);
-});
-
-const exitCode = await proc.exited;
-await Promise.allSettled([devStdoutPump, devStderrPump]);
-await Promise.race([
-  startupWarmupPromise,
-  new Promise((resolveWait) => setTimeout(resolveWait, 500)),
-]);
-await cleanupWorkerWarmContainers("dev:full exit");
-await stopManagedLmStudio();
-await closeSystemLog();
-process.exit(exitCode);
