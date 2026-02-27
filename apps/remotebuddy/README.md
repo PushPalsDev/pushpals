@@ -55,9 +55,30 @@ Use this high-level flow while bringing a new machine online:
 
 1. Complete the steps in the [Setup Checklist](#setup-checklist) so Bun, dependencies, configs, and helper tools exist locally.
 2. Acquire a bearer token (or confirm auth is disabled) using the [Token Setup and Verification](#token-setup-and-verification) steps.
-3. Start the supporting services you need (typically `bun run server:only`, optionally LocalBuddy/WorkerPals) before launching RemoteBuddy.
+3. Bring up Server and WorkerPals (plus optional LocalBuddy) in dedicated terminals that all share the same `.env`/secret-manager session before you launch RemoteBuddy; keep every pane running concurrently so queue traffic never outruns a missing dependency.
 4. Run `bun run remotebuddy` from the repo root for the recommended entry point, or pick another command from [Usage Commands](#usage-commands) when you need a specific mode.
 5. Validate the round trip with the [Runtime Smoke Test](#runtime-smoke-test) so you catch queue, auth, or worker issues before handling real traffic.
+
+### Service bring-up order (mirrors `docs/startup.md`)
+
+Load `.env` (for example, `set -a; source .env; set +a`) or your secret manager before opening the panes below so every process inherits the same env block. Confirm the required vars exist without printing values:
+
+```bash
+for var in PUSHPALS_AUTH_TOKEN REMOTE_STABLE_ID WORKERPALS_API_URL SERVER_BASE_URL; do
+  if [ -z "${!var:-}" ]; then
+    echo "$var is unset — load it via .env or your secret manager before continuing."; exit 1
+  fi
+done
+```
+
+| Terminal | Service | Command | Notes |
+| --- | --- | --- | --- |
+| A (required) | Server | `bun run server:only --env-file .env` | Keep the pane attached; watch `/healthz` and `/system/status`. |
+| B (required) | WorkerPals | `bun run workerpals:only -- --lanes interactive=4,normal=2,background=1` | Same env as Server; confirm ≥3 idle slots per lane. |
+| C (optional) | LocalBuddy / client probes | `bun run client:only` | Start before RemoteBuddy if the host also fronts LocalBuddy traffic. |
+| D (required) | RemoteBuddy | `bun run remotebuddy:only` (or `bun run remotebuddy` when you also need `protocol:build`) | Only launch once the other panes report healthy telemetry; leave logs visible. |
+
+Reference `apps/remotebuddy/docs/startup.md` for the full preflight evidence requirements; this table just captures the required process order without leaking tokens.
 
 ## Setup Checklist
 
@@ -240,7 +261,7 @@ Troubleshooting – If Bun crashes, loops on cache errors, or still reports miss
 Use this path any time you need to redeploy RemoteBuddy because of a regression, host reboot, or planned change. The goal is to minimize queue downtime while keeping provenance crystal clear.
 
 1. **Stabilize & communicate** – Post intent in `#pushpals-ops`, capture the latest `/system/status` snapshot, and pause new background/eval submissions if queue guardrails are already amber/red. Confirm another operator is watching WorkerPals capacity before you bounce RemoteBuddy.
-2. **Sync repo + dependencies** – On the target host run `git fetch origin && git checkout <target-commit> && git pull --ff-only`. Compare `bun.lock`/`package.json`; if they changed, run `bun install`. Double-check `.env` and `config/local.toml` still have the right `PUSHPALS_*` entries.
+2. **Sync repo + dependencies** – On the target host run `git fetch origin && git checkout <target-commit> && git pull --ff-only`. Compare `bun.lock`/`package.json`; if they changed, run `bun install`. Instead of printing `.env`, run the presence-only env check from the service bring-up section to confirm all `PUSHPALS_*` vars are exported, and verify `config/local.toml` only contains the intended overrides.
 3. **Build protocol + start the process** – Prefer the repo-root script `bun run remotebuddy` (executes `protocol:build` first, then `remotebuddy:only`). When protocols are already current, `bun run remotebuddy:only` or `bun --cwd apps/remotebuddy run start` (enables `remotebuddy_supervisor.ts` restarts) keeps downtime minimal. Keep the existing terminal or tmux pane open so you can tail logs live.
 4. **Validate the new instance** – Wait for `[RemoteBuddy] Starting polling loop…` followed by at least one `claim payload` log. Immediately hit `curl -sS $SERVER/system/status | jq '{queues: .queues.requests, jobs: .jobPendingSnapshot}'` and `curl -sS "$SERVER/requests?status=claimed&limit=5"`. Optionally run the smoke test in the section below (`bun run smoke`) or enqueue a single interactive request to prove round-trip health. Confirm `queue_p95`, worker idle counts, and the CommunicationManager WebSocket reconnect cleanly.
 5. **Observe, rollback if needed** – Watch logs for 5–10 minutes. If failures persist, stop the process, `git checkout <last-known-good>`, rerun step 3, and move `remotebuddy-state.db` aside only when it is clearly corrupted (RemoteBuddy will recreate it, but previously-handled events may replay once). Document the outcome and handoff time in `#pushpals-ops`.
@@ -336,7 +357,7 @@ RemoteBuddy and Server share the same bearer token (`PUSHPALS_AUTH_TOKEN`). The 
 
 ## Runtime Smoke Test
 
-Run this checklist after `bun run lint` passes so you confirm queue + auth paths before touching user requests. All curl/PowerShell examples assume a tokenized server; omit the header if you are running open access.
+Run this checklist after `bun run lint` passes so you confirm queue + auth paths before touching user requests. All curl/PowerShell examples assume a tokenized server; omit the header if you are running open access. Source `.env` (or load the same secret-manager session you used for the running services) before executing these commands so `$PUSHPALS_AUTH_TOKEN` is already set—never inline or echo the token in a command.
 
 1. **Enqueue a synthetic request**
    - Bash/zsh:
@@ -384,4 +405,4 @@ Run this checklist after `bun run lint` passes so you confirm queue + auth paths
    # Expect `pending: 0` after the smoke item clears; jobQueue is empty unless RemoteBuddy enqueued WorkerPal jobs
    ```
 
-For a fully automated round-trip (Client → LocalBuddy → RemoteBuddy → WorkerPals), keep `server`, `localbuddy`, and `workerpals` running, then execute `PUSHPALS_AUTH_TOKEN=<token> bun run smoke` from the repo root. That script asserts the presence of `task_created` and terminal events, complementing the manual enqueue/claim/status checks above.
+For a fully automated round-trip (Client → LocalBuddy → RemoteBuddy → WorkerPals), keep `server`, `localbuddy`, and `workerpals` running, then execute `bun run smoke` from the repo root inside the same env-loaded shell. That script asserts the presence of `task_created` and terminal events, complementing the manual enqueue/claim/status checks above.

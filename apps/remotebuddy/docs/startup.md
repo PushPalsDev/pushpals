@@ -30,41 +30,35 @@ startup can reference a single source of truth.
 
 ## Dependency bring-up checklist
 
-1. **Config + secrets (must finish before any service starts)**
-   - From the repo root, run `bun install` (or re-run it after pulling new commits) and wait for it to exit successfully before launching Server/WorkerPals. This guarantees `node_modules/shared` exists so later tests do not fail with `ENOENT`.
-   - `config/default.toml` and `config/local.toml` match the intended train (`git status --short` is empty or only shows deliberate overrides).
-   - Load `.env` (for example `set -a && source .env && set +a`, `direnv allow`, or a secret manager injection) so every terminal inherits the same exported variables.
-   - Validate secret presence without printing values. Example presence checks:
-     - Bash/zsh:
-       ```bash
-       for var in PUSHPALS_AUTH_TOKEN REMOTE_STABLE_ID WORKERPALS_API_URL SERVER_BASE_URL; do
-         if [[ -z "${!var:-}" ]]; then
-           echo "Missing $var"; exit 1
-         fi
-       done
-       echo "Required env vars detected (values not printed)."
-       ```
-     - Windows PowerShell:
-       ```powershell
-       'PUSHPALS_AUTH_TOKEN','REMOTE_STABLE_ID','WORKERPALS_API_URL','SERVER_BASE_URL' |
-         ForEach-Object { if (-not $env:$_) { throw "Missing $_" } }
-       Write-Host "Required env vars detected (values not printed)."
-       ```
-     - Record only that the variables are present; never echo `PUSHPALS_AUTH_TOKEN` or other secrets, and never pass them inline on the command line (for example `PUSHPALS_AUTH_TOKEN=... bun …`) because shells, process lists, and history logs can leak them.
-2. **Server (Terminal A – keep running)**
-   - Launch Server in its own terminal/tmux pane and keep the logs visible while the stack is up. Command: `bun run server:only` (the script already loads `.env`; add `--env-file` only if you need a non-default path). Leave Terminal A running while you process the rest of the checklist so concurrency is explicitly documented.
+> Keep each service in its own terminal/tmux pane so they remain online together. Launch them in this order: Server → WorkerPals → (optional) LocalBuddy → RemoteBuddy. Do not start RemoteBuddy until the upstream panes show healthy status.
+
+1. **Config + secrets**
+   - `bun install` has been run at least once on the host; `node_modules` is present.
+   - `config/default.toml` and `config/local.toml` match the intended train (`git status --short` is
+     empty or only shows deliberate overrides).
+   - Load `.env` (for example, `set -a; source .env; set +a`) or your secret manager session **before** starting the commands below so every pane inherits the same env.
+   - Presence-only check for required secrets; this prints variable names only when something is missing:
+     ```bash
+     for var in PUSHPALS_AUTH_TOKEN REMOTE_STABLE_ID WORKERPALS_API_URL SERVER_BASE_URL; do
+       if [ -z "${!var:-}" ]; then
+         echo "$var is unset — load it from .env or your secret manager before continuing."; exit 1
+       fi
+     done
+     ```
+     Document that the values exist in the ops log, but never paste the secrets themselves.
+2. **Server (Terminal A — required)**
+   - Command: `bun run server:only --env-file .env` (or run the script inside a shell where your secret manager already exported the env block). Leave the pane attached so logs remain visible.
    - Health: `curl -sf http://localhost:3001/healthz` returns `ok` within 2 seconds.
-   - Metrics: `/system/status` shows `queues.requests.pending` ≤ 5 per lane. Note in the ops log that Terminal A is dedicated to Server so concurrency evidence is captured.
-3. **WorkerPals (Terminal B – runs in parallel with Server)**
-   - Start WorkerPals in a second terminal/process manager slot and leave it running beside Server. Command: `bun run workerpals:only -- --lanes interactive=4,normal=2,background=1`. Keep this pane live so Terminals A and B visibly run at the same time.
+   - Metrics: `/system/status` shows `queues.requests.pending` ≤ 5 per lane.
+3. **WorkerPals (Terminal B — required)**
+   - Command: `bun run workerpals:only -- --lanes interactive=4,normal=2,background=1` (wrap with `--env-file .env` or an equivalent secret loader just like the Server pane).
    - Confirm `worker_idle_slots` ≥ 3 per lane for two consecutive polls.
-   - Watch Worker Backends Latency dashboard for RPC spikes and annotate the ops log with the Terminal B identifier so concurrent service coverage is explicit.
-4. **RemoteBuddy (Terminal C once base services are stable)**
-   - If `packages/protocol/dist` or other protocol artifacts are missing, run `bun run protocol:build` once before this step; the runbook only rebuilds artifacts when they are missing and it does not attempt to detect stale-but-present outputs.
-   - Command: `bun run remotebuddy:only` (env already loaded from `.env`/secret manager; do not append inline token assignments).
-   - Verify the bootstrap log prints `planner ready` and `worker lease acquired` within 90 seconds while Terminals A/B continue streaming logs.
-5. **Optional LocalBuddy / client probes**
-   - If this host also serves LocalBuddy traffic, start `bun run client:only` and open the Ops tab to confirm it sees the new RemoteBuddy instance before accepting paid tasks.
+   - Watch Worker Backends Latency dashboard for RPC spikes.
+4. **Optional LocalBuddy / client probes (Terminal C)**
+   - If this host also serves LocalBuddy traffic, start `bun run client:only` (again sourcing `.env` or your secret manager first) and open the Ops tab to confirm it sees the upcoming RemoteBuddy instance.
+5. **RemoteBuddy (Terminal D — required)**
+   - Command: `bun run remotebuddy:only` (or `bun run remotebuddy` if you need the protocol build step). Ensure this terminal inherited the same env block rather than inlining tokens.
+   - Verify the bootstrap log prints `planner ready` and `worker lease acquired` within 90 seconds.
 
 ## Telemetry gates (block startup if any fail)
 
@@ -80,6 +74,8 @@ Record each check with timestamp, screenshot link, and the PromQL/command you us
 evidence the preflight is considered incomplete.
 
 ## Verification steps before declaring success
+
+All verification commands assume the shell already inherited the `.env`/secret-manager block used for the running services. Never paste bearer tokens inline; rely on the preloaded `PUSHPALS_AUTH_TOKEN` environment variable.
 
 1. **API smoke test**
    ```bash
