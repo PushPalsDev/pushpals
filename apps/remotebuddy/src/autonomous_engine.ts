@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import type { CommunicationManager } from "shared";
 import {
+  extractVisionKeyItems,
   loadRepoDocText,
   loadPromptTemplate,
   makePatternKey,
@@ -148,6 +149,18 @@ type VisionContext = {
     markdown: string;
     truncated: boolean;
   }>;
+  key_items: {
+    target_users: string[];
+    priorities: string[];
+    objectives: string[];
+    guardrails: string[];
+    constraints: string[];
+    non_goals: string[];
+    metrics: string[];
+    risk_policy: string[];
+    operating_model: string[];
+    governance: string[];
+  };
   section_numbers: string[];
   sha256: string;
   truncated: boolean;
@@ -421,6 +434,7 @@ export class RemoteBuddyAutonomousEngine {
     }
 
     const parsed = parseVisionDoc(trimmed);
+    const keyItems = extractVisionKeyItems(trimmed);
     const section_numbers = parsed.sections.map((section) => section.number);
     const sections = parsed.sections.map((section) => {
       const sectionMarkdown = section.markdown.trim();
@@ -440,6 +454,18 @@ export class RemoteBuddyAutonomousEngine {
       markdown: truncated ? trimmed.slice(0, MAX_VISION_CONTEXT_CHARS) : trimmed,
       one_sentence: parsed.oneSentence,
       sections,
+      key_items: {
+        target_users: keyItems.targetUsers,
+        priorities: keyItems.priorities,
+        objectives: keyItems.objectives,
+        guardrails: keyItems.guardrails,
+        constraints: keyItems.constraints,
+        non_goals: keyItems.nonGoals,
+        metrics: keyItems.metrics,
+        risk_policy: keyItems.riskPolicy,
+        operating_model: keyItems.operatingModel,
+        governance: keyItems.governance,
+      },
       section_numbers,
       sha256: sha256(trimmed),
       truncated,
@@ -918,6 +944,7 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
+      const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
 
       const llmCalls: Record<string, unknown>[] = [];
       let candidatesPayload: Array<Record<string, unknown>> = [];
@@ -1061,7 +1088,7 @@ export class RemoteBuddyAutonomousEngine {
           recordDropReason("missing_vision_alignment_reason");
           continue;
         }
-        if (candidate.vision_section_refs.length === 0) {
+        if (requireVisionSectionRefs && candidate.vision_section_refs.length === 0) {
           recordDropReason("missing_vision_section_refs");
           continue;
         }

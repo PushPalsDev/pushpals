@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "fs";
 import { join } from "path";
 import {
+  extractVisionKeyItems,
   normalizeVisionSectionRefs,
   parseVisionDoc,
-  REQUIRED_VISION_SECTION_NUMBERS,
   validateVisionDocStructure,
 } from "../packages/shared/src/vision";
 
@@ -25,28 +25,49 @@ describe("shared vision doc parsing", () => {
     const markdown = readFileSync(join(repoRoot, "vision.md"), "utf8");
     const validation = validateVisionDocStructure(markdown);
     expect(validation.ok).toBe(true);
-    expect(validation.sectionCount).toBeGreaterThanOrEqual(REQUIRED_VISION_SECTION_NUMBERS.length);
-    expect(validation.missingSectionNumbers.length).toBe(0);
+    expect(validation.sectionCount).toBeGreaterThan(0);
     expect(validation.hasOneSentence).toBe(true);
   });
 
-  test("validateVisionDocStructure rejects missing required sections", () => {
+  test("validateVisionDocStructure allows flexible section numbering", () => {
     const markdown = [
       "# Vision",
       "> **One sentence:** Keep this short.",
       "",
-      "## 1) Who this is for",
-      "Example content.",
+      "## 0) Custom Section",
+      "Custom content.",
+      "",
+      "## 42) Another Section",
+      "More content.",
     ].join("\n");
     const validation = validateVisionDocStructure(markdown);
-    expect(validation.ok).toBe(false);
-    expect(validation.missingSectionNumbers.length).toBeGreaterThan(0);
-    expect(validation.missingSectionNumbers).toContain("2");
+    expect(validation.ok).toBe(true);
+    expect(validation.sectionCount).toBe(2);
+    expect(validation.missingSectionNumbers).toEqual([]);
   });
 
   test("normalizeVisionSectionRefs normalizes and filters references", () => {
     const allowed = new Set(["1", "3", "10"]);
     const refs = normalizeVisionSectionRefs(["01", "section 3", "10)", "9", "3"], allowed);
     expect(refs).toEqual(["1", "3", "10"]);
+  });
+
+  test("extractVisionKeyItems maps key bullets from template sections", () => {
+    const markdown = readFileSync(join(repoRoot, "vision.example.md"), "utf8");
+    const items = extractVisionKeyItems(markdown);
+    expect(items.priorities.length).toBeGreaterThan(0);
+    expect(items.objectives.length).toBeGreaterThan(0);
+    expect(items.guardrails.length).toBeGreaterThan(0);
+    expect(items.constraints.length).toBeGreaterThan(0);
+  });
+
+  test("extractVisionKeyItems captures PushPals-specific priorities and guardrails", () => {
+    const markdown = readFileSync(join(repoRoot, "vision.md"), "utf8");
+    const items = extractVisionKeyItems(markdown);
+    expect(items.priorities.length).toBeGreaterThan(0);
+    expect(items.objectives.length).toBeGreaterThan(0);
+    expect(items.nonGoals.length).toBeGreaterThan(0);
+    expect(items.guardrails.length).toBeGreaterThan(0);
+    expect(items.riskPolicy.length).toBeGreaterThan(0);
   });
 });

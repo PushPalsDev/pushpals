@@ -446,11 +446,6 @@ function ensureAutonomyVisionFile(): void {
     console.error(
       `[start] Autonomy vision preflight failed: ${relVisionPath} must follow the required vision template structure.`,
     );
-    if (validation.missingSectionNumbers.length > 0) {
-      console.error(
-        `[start]   Missing required section number(s): ${validation.missingSectionNumbers.join(", ")}`,
-      );
-    }
     for (const error of validation.errors) {
       console.error(`[start]   ${error}`);
     }
