@@ -59,53 +59,141 @@ Use this high-level flow while bringing a new machine online:
 4. Run `bun run remotebuddy` from the repo root for the recommended entry point, or pick another command from [Usage Commands](#usage-commands) when you need a specific mode.
 5. Validate the round trip with the [Runtime Smoke Test](#runtime-smoke-test) so you catch queue, auth, or worker issues before handling real traffic.
 
-## Deterministic RemoteBuddy Startup Diagnostics
+## Startup Diagnostics & Preflight Checks
 
-Follow this ordered, deterministic checklist whenever you need to cold start RemoteBuddy. Do not skip steps—each preflight blocker prevents healthy queue p95 ≈ 0 performance downstream.
+RemoteBuddy only counts as “up” after the shared HTTP APIs report healthy telemetry. Avoid log-text heuristics; rely on `/system/status`, `/requests`, `/jobs`, and `/workers` so diagnostics stay portable across platforms.
 
-### Prerequisites (must be true before preflight)
+### Baseline-driven guardrails
 
-- Bun 1.1.x installed (`bun --version` prints `1.1.x`). Reinstall via the commands in the [Setup Checklist](#setup-checklist) if the version drifts.
-- Dependencies installed at repo root (`bun install` completed without errors) and `bun.lock` matches the checked-out commit.
-- `.env` and `config/local.toml` exist with the required `PUSHPALS_*` entries plus `PUSHPALS_AUTH_TOKEN` (or confirmed tokenless operation).
-- `jq` available on the PATH for JSON diagnostics (`jq --version`).
-- Server URL reachable from the host (`curl -sS $SERVER/system/status` returns HTTP 200 within 1 s).
+Capture fresh baselines with `/system/status` once the server is idle, then compare startup readings to those values instead of hard-coded thresholds. For a default low-load workstation, the following mappings apply (substitute your measured baselines when traffic differs):
 
-### Environment verification commands
+| Signal (source) | Default baseline (low-load dev) | Acceptable startup band | Investigate / stop when… |
+| --- | --- | --- | --- |
+| `queue_p95` (interactive lane) – `.slo.requests.queueWaitMs.p50/p95` | ~0.55 s (p50) with sampleSize ≥ 20 | `baseline ± 0.25 s` (≈0.30–0.80 s) for up to 3 consecutive polls | `p95 > baseline + 0.35 s` (≈≥0.90 s) for ≥3 polls **or** sampleSize stays < 3 after 30 s |
+| Pending interactive requests – `.queues.requests.pending.interactive` | 0–5 requests | ≤ `baseline + 10` (≈≤10) and oldest request < 90 s | > `baseline + 15` (≈≥15) **or** any pending item > 120 s |
+| Worker idle slots – `.workers.idle` | 3–5 idle workers per lane | 2–6 idle workers for ≤2 polls | < 2 idle workers for 3 polls **or** ≤ 1 idle worker cluster-wide |
+| Job success rate (1 − failure) – `.slo.jobs.successRate` & `.slo.jobs.timeoutRate` | ≥ 0.85 success (≤ 0.15 failure) | ≥ 0.75 success while timeoutRate ≤ 0.10 | < 0.70 success **or** timeoutRate ≥ 0.20 for 5 min |
 
-Run these from the repo root and stop immediately if any fail:
+If your environment’s baselines differ (e.g., staging traffic), substitute those numbers but keep the same ± deltas so “warning” vs “incident” comparisons remain proportional.
 
-1. `bun --version | grep -q '^1\.1\.'` – re-install Bun when the check fails.
-2. `test -f .env && rg -q '^PUSHPALS_AUTH_TOKEN=' .env` – ensures RemoteBuddy can load auth. If unset, generate a token via [Token Setup and Verification](#token-setup-and-verification).
-3. `test -f config/local.toml && test -s config/local.toml` – confirms config seeding. Copy from `config/local.example.toml` if missing.
-4. `curl -sfS "$SERVER/system/status" | jq '{queue_p95: .slo.requests.queueWaitMs.p95, job_failure_rate: .metrics.jobFailureRate}'` – proves the server is answering before RemoteBuddy starts.
-5. `bun run lint` – optional but recommended to surface obvious dependency drift before runtime work.
+### Preflight probes (run after Quick Start step 4)
 
-### Deterministic boot sequence
+Set `SERVER=${PUSHPALS_SERVER_URL:-http://localhost:3001}` (bash/zsh) or `$server = if ($env:PUSHPALS_SERVER_URL) { $env:PUSHPALS_SERVER_URL } else { "http://localhost:3001" }` (Windows PowerShell 5.1-compatible), then run the checks below before handling user traffic.
 
-Run commands in separate terminals/tmux panes so logs stay visible:
+1. **Status snapshot (`/system/status`)** – Confirms RemoteBuddy can see queue + worker telemetry.
+   - Bash/zsh:
+     ```bash
+     SERVER=${PUSHPALS_SERVER_URL:-http://localhost:3001}
+     curl -sS "$SERVER/system/status" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+       | jq '{p95: .slo.requests.queueWaitMs.p95, pending: .queues.requests.pending, workers: .workers}'
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $server = if ($env:PUSHPALS_SERVER_URL) { $env:PUSHPALS_SERVER_URL } else { "http://localhost:3001" }
+     $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $json = (Invoke-WebRequest -Uri "$server/system/status" -Headers $headers -Method Get).Content | ConvertFrom-Json
+     $json.slo.requests.queueWaitMs.p95
+     $json.queues.requests.pending
+     $json.workers
+     ```
+   Confirm the values align with the baseline bands above and that `workers.idle ≥ 1` (goal ≥ 2) within 30 s of launch.
+2. **Queue depth + claimability (`/requests`)** – Ensures RemoteBuddy is draining interactive work.
+   - Bash/zsh:
+     ```bash
+     SERVER=${PUSHPALS_SERVER_URL:-http://localhost:3001}
+     curl -sS "$SERVER/requests?status=pending&limit=5" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '{pending: .requests, counts: .counts}'
+     curl -sS "$SERVER/requests?status=claimed&limit=5" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests | map({id, agentId, status})'
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $server = if ($env:PUSHPALS_SERVER_URL) { $env:PUSHPALS_SERVER_URL } else { "http://localhost:3001" }
+     $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $pending = (Invoke-WebRequest -Uri "$server/requests?status=pending&limit=5" -Headers $headers).Content | ConvertFrom-Json
+     $pending.requests
+     $claimed = (Invoke-WebRequest -Uri "$server/requests?status=claimed&limit=5" -Headers $headers).Content | ConvertFrom-Json
+     $claimed.requests | Select-Object id, agentId, status
+     ```
+   Pending interactive items should stay within the acceptable band; claimed results should show `agentId="remotebuddy"`.
+3. **Worker inventory (`/workers?ttlMs=15000`)** – Verifies idle slots exist and heartbeats are fresh.
+   - Bash/zsh:
+     ```bash
+     SERVER=${PUSHPALS_SERVER_URL:-http://localhost:3001}
+     curl -sS "$SERVER/workers?ttlMs=15000" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '{total: (.workers | length), idle: [ .workers[] | select(.status=="idle") ] | length, workers}'
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $server = if ($env:PUSHPALS_SERVER_URL) { $env:PUSHPALS_SERVER_URL } else { "http://localhost:3001" }
+     $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $workers = (Invoke-WebRequest -Uri "$server/workers?ttlMs=15000" -Headers $headers).Content | ConvertFrom-Json
+     $workers.workers | Select-Object workerId, status, lastHeartbeat
+     ```
+   Expect at least two idle workers per lane before you unpause interactive requests.
+4. **Job backlog sanity (`/jobs?status=pending`)** – Confirms WorkerPals queue is empty or progressing.
+   - Bash/zsh:
+     ```bash
+     SERVER=${PUSHPALS_SERVER_URL:-http://localhost:3001}
+     curl -sS "$SERVER/jobs?status=pending&limit=5" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '{pending: .jobs, counts: .counts}'
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $server = if ($env:PUSHPALS_SERVER_URL) { $env:PUSHPALS_SERVER_URL } else { "http://localhost:3001" }
+     $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $jobs = (Invoke-WebRequest -Uri "$server/jobs?status=pending&limit=5" -Headers $headers).Content | ConvertFrom-Json
+     $jobs.jobs | Select-Object id, kind, status, enqueuedAt
+     ```
+   For a clean startup the result set should be empty; any retries should fall within their queue budgets.
+5. **Round-trip validation** – Run `bun run smoke` (cross-platform) or follow the [Runtime Smoke Test](#runtime-smoke-test) section for manual verification. The script fails fast if `task_created`, `job_enqueued`, and completion events do not arrive.
+   - Bash/zsh:
+     ```bash
+     export PUSHPALS_AUTH_TOKEN=${PUSHPALS_AUTH_TOKEN:-<dev-token>}
+     bun run smoke
+     ```
+   - Windows PowerShell 5.1:
+     ```powershell
+     $env:PUSHPALS_AUTH_TOKEN = if ($env:PUSHPALS_AUTH_TOKEN) { $env:PUSHPALS_AUTH_TOKEN } else { "<dev-token>" }
+     bun run smoke
+     ```
 
-1. `bun run server:only` – starts the API that serves `/requests/claim` and `/system/status`.
-2. `bun run workerpals` – optional for pure planning, required if RemoteBuddy will enqueue `task.execute` work immediately.
-3. `bun run localbuddy` – optional, only when you need the full Client → LocalBuddy → RemoteBuddy flow.
-4. `bun run remotebuddy` – runs protocol build + `remotebuddy:only`, creating/tailing `remotebuddy-state.db`.
+### Local/dev-only queue reset (danger zone)
 
-### Healthy startup signals (gate RemoteBuddy admission)
+> ⚠️ **Never run these commands on shared hosts or production.** They delete `outputs/data/pushpals.db` and `remotebuddy-state.db`, clearing every queued request/job and idempotency cursor. Use them only when your personal dev environment needs a clean slate.
 
-- RemoteBuddy logs show `Starting polling loop...` followed by at least one `claim payload` log within 3 s.
-- `curl -sS "$SERVER/system/status" | jq '{queue_p95: .slo.requests.queueWaitMs.p95, job_failure_rate: .metrics.jobFailureRate, pending: .queues.requests.pending}'` outputs `queue_p95: 0`, `job_failure_rate: 0.000`, and `pending: 0` within 10 s of launch.
-- `curl -sS "$SERVER/workers" | jq '.idle >= 2'` (or the equivalent lane-specific section) returns `true` so RemoteBuddy has immediate WorkerPal capacity.
-- `tail -n1 logs/remotebuddy.log` (or live terminal) shows `CommunicationManager` reconnected without errors.
+Follow the checklist in order so you never touch shared infrastructure:
 
-### Recovery steps for preflight failures
+1. **Confirm the target really is your localhost server.**
+   - Bash/zsh:
+     ```bash
+     SERVER=${PUSHPALS_SERVER_URL:-http://localhost:3001}
+     [[ "$SERVER" == http://localhost:3001 ]] || { echo "Refusing to wipe non-local server ($SERVER)"; exit 1; }
+     git remote -v
+     hostname
+     ```
+   - Windows PowerShell 5.1:
+     ```powershell
+     $server = if ($env:PUSHPALS_SERVER_URL) { $env:PUSHPALS_SERVER_URL } else { "http://localhost:3001" }
+     if ($server -ne "http://localhost:3001") { throw "Refusing to wipe non-local server ($server)" }
+     git remote -v
+     hostname
+     ```
+   Ensure `git remote -v` points to your fork/personal workspace and `hostname` matches your dev machine before continuing.
+2. **Delete the local SQLite databases and restart only after the safety check passes.**
+   - Bash/zsh (repo root):
+     ```bash
+     rm -f outputs/data/pushpals.db outputs/data/remotebuddy-state.db
+     bun run server:only &
+     ```
+   - Windows PowerShell (repo root):
+     ```powershell
+     Remove-Item -Force outputs\data\pushpals.db, outputs\data\remotebuddy-state.db -ErrorAction SilentlyContinue
+     Start-Process bun -ArgumentList "run","server:only" -NoNewWindow
+     ```
 
-- **Version or dependency mismatch:** rerun `bun install`, clear cache via `bun pm cache rm --all`, and retry the verification list before continuing.
-- **Missing secrets/config:** copy `.env.example` and `config/local.example.toml`, regenerate `PUSHPALS_AUTH_TOKEN`, then re-run the environment checks.
-- **Server reachability failure (curl exits non-zero):** start/restart `bun run server:only`, inspect server logs, and block RemoteBuddy start until `/system/status` stabilizes.
-- **Healthy signal mismatch (queue_p95≠0 or job_failure_rate≠0.000):** pause the launch, empty any stale requests via `/requests?status=pending`, confirm WorkerPals show ≥2 idle, then relaunch RemoteBuddy once metrics hit the healthy targets.
-- **CommunicationManager fails to connect:** verify `config/local.toml` WebSocket params, restart RemoteBuddy, and escalate to platform if retries persist for >2 minutes.
-
-Only resume normal operations once every prerequisite, environment check, boot command, and healthy signal above passes in order.
+After wiping, re-run the preflight probes above to ensure `/system/status` repopulates with fresh baselines before enqueueing new work.
 
 ## Setup Checklist
 
@@ -197,15 +285,43 @@ Troubleshooting – If Bun crashes, loops on cache errors, or still reports miss
 
 ### Queue health monitoring & triage
 
-- **Telemetry watchlist** – Keep `/system/status` tailing so you can see `slo.requests.queueWaitMs.p95` (aka `queue_p95`) alongside `queues.requests.pending`, and pin Grafana’s WorkerPals Job Outcomes panel for `job_failure_rate` (task.execute failures / total jobs in the last 10 minutes). Pair those with `sig_queue_health` logs so autonomous spikes are surfaced even when dashboards lag.
-- **Alert thresholds** – Treat the table below as additive to the [queue-health doc](apps/remotebuddy/docs/queue-health.md); hit the warning column as soon as either signal drifts for ≥3 polls so you can stop background traffic before pages fire.
+- **Telemetry watchlist** – Continuously poll `/system/status` (the bash/PowerShell loops above work) and stamp your shift’s baseline before load ramps: `baseline_queue_p95 = max(.slo.requests.queueWaitMs.p50, 0.35)`, `baseline_pending_interactive = max(.queues.requests.pending.interactive, 0)`, and `baseline_idle = max(.workers.idle, 3)`. Mirror those HTTP snapshots with Grafana’s WorkerPals Job Outcomes panel to validate job success trends. Only open `sig_queue_health` logs after the API data shows drift; logs never set the pass/fail gate.
+- **Alert thresholds** – Apply the deltas below to your per-shift baselines (these match the [queue-health doc](apps/remotebuddy/docs/queue-health.md)). As soon as a warning band holds for ≥3 polls, throttle background load before PagerDuty fires.
 
-| Signal | Warning (self-triage) | Page-worthy | Immediate action |
-| --- | --- | --- | --- |
-| `queue_p95` | ≥ 1.0 s for 3 polls **or** pending interactive ≥ 15 | ≥ 1.5 s for 5 min **or** queue depth > 60 / < 2 idle workers for 5 polls | Freeze background/eval submissions, confirm automation injected remediation jobs, and add WorkerPal capacity until idle ≥ 2 per lane. |
-| `job_failure_rate` | ≥ 0.25 rolling 10 min | ≥ 0.40 rolling 10 min | Pull the most recent WorkerPals logs, look for retry storms/regressions, and prep the worker restart flow if failure spikes persist. |
+| Signal | Baseline (per shift) | Warning (self-triage) | Page-worthy | Immediate action |
+| --- | --- | --- | --- | --- |
+| `queue_p95` / interactive backlog | `.slo.requests.queueWaitMs.p50` (floor 0.35 s) and `baseline_pending_interactive` | `p95 > baseline + 0.25 s` for ≥3 polls **or** pending interactive > `baseline + 10` **or** idle workers < `baseline_idle − 1` | `p95 > baseline + 0.40 s` for ≥5 min (≈1.5 s when baseline ≈0.55 s) **or** queue depth > `baseline + 45` (≈≥60) **or** idle workers < 2 for 5 polls | Freeze background/eval submissions, confirm automation injected remediation jobs, and add WorkerPal capacity until idle ≥ 2 per lane. |
+| `job_failure_rate` (1 − success) | `1 − .slo.jobs.successRate` (ceil 0) | Failure rate > `baseline + 0.10` (≈≥0.25) rolling 10 min | Failure rate > `baseline + 0.20` (≈≥0.40) rolling 10 min | Pull the most recent WorkerPals logs, look for retry storms/regressions, and prep the worker restart flow if failure spikes persist. |
 
-- **Fast load-spike detection tips** – Run `watch -n 5 curl -sS $SERVER/system/status | jq '{p95: .slo.requests.queueWaitMs.p95, pending: .queues.requests.pending, jobs: .queues.jobPendingSnapshot}'` during incidents so you catch >0.5 s jumps before alerts aggregate, and keep `tail -f logs/remotebuddy.log | rg sig_queue_health` open to spot remediation bursts. When `queue_p95` jumps ≥0.3 s between polls, immediately check `/requests?status=pending&limit=20` for aging interactive prompts and manually re-prioritize them.
+- **Fast load-spike detection tips** – Poll `/system/status` and `/requests` on a 5 s loop so the same HTTP signals drive every action. When `queue_p95` increases by more than `max(0.30 s, baseline_queue_p95 × 0.40)` or pending interactive requests exceed `baseline_pending_interactive + 15`, throttle background load and reprioritize manually. Use the shell below (omit the header flags if auth is disabled):
+  - Bash/zsh:
+    ```bash
+    SERVER=${PUSHPALS_SERVER_URL:-http://localhost:3001}
+    while true; do
+      date -u +"%Y-%m-%dT%H:%M:%SZ"
+      curl -sS "$SERVER/system/status" \
+        -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+        | jq '{p95: .slo.requests.queueWaitMs.p95, pending: .queues.requests.pending, idle: .workers.idle}'
+      curl -sS "$SERVER/requests?status=pending&limit=5" \
+        -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+        | jq '{count: (.requests | length), sample: (.requests | map({id, priority, createdAt}))}'
+      sleep 5
+    done
+    ```
+  - Windows PowerShell 5.1:
+    ```powershell
+    $server = if ($env:PUSHPALS_SERVER_URL) { $env:PUSHPALS_SERVER_URL } else { "http://localhost:3001" }
+    $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+    while ($true) {
+      $status = (Invoke-WebRequest -Uri "$server/system/status" -Headers $headers).Content | ConvertFrom-Json
+      $pending = (Invoke-WebRequest -Uri "$server/requests?status=pending&limit=5" -Headers $headers).Content | ConvertFrom-Json
+      "{0:u} p95={1:N2}s pendingInteractive={2} idleWorkers={3}" -f (Get-Date), $status.slo.requests.queueWaitMs.p95, $status.queues.requests.pending.interactive, $status.workers.idle
+      if ($pending.requests.Count -gt 0) {
+        $pending.requests | Select-Object -First 5 id, priority, createdAt | Format-Table -AutoSize
+      }
+      Start-Sleep -Seconds 5
+    }
+    ```
 - **Escalation steps** – 1) Announce the metric breach with snapshots in `#pushpals-ops`; 2) loop WorkerPals/Platform on-call if warning bands last >10 minutes or `job_failure_rate` crosses 0.4; 3) page Infrastructure/SRE if worker restarts do not clear the spike or shared services look unhealthy. Keep time-stamped updates every 15 minutes until `queue_p95` < 1.0 s and `job_failure_rate` < 0.2 for two consecutive polls.
 
 ### Queue-handling flow (current state)
@@ -223,18 +339,20 @@ Troubleshooting – If Bun crashes, loops on cache errors, or still reports miss
 
 ### Guardrails for queue_p95 ≈ 0
 
-| Condition (rolling 5 min) | Target behavior | Required action |
+Re-use the per-shift baselines from the previous section. With a typical 0.55 s interactive baseline, the limits below line up with the old 1.0 s / 1.5 s / 2.0 s constants, but they automatically adjust if your environment differs.
+
+| Condition (rolling 5 min) | Criteria (use baselines) | Required action |
 | --- | --- | --- |
-| `queue_p95` ≤ 1.0 s and pending interactive < 10 | Healthy “≈0” wait time | No action; keep `/system/status` tailing hourly. |
-| `queue_p95` 1.0–1.5 s or pending interactive ≥ 15 | Early warning | Trigger queue-playbook diagnostics, verify automation already injected remediation requests, and pause new background/eval submissions. |
-| `queue_p95` ≥ 1.5 s for > 5 min **or** pending interactive ≥ 30 | Degradation | Announce in `#pushpals-ops`, throttle enqueueing to interactive-only, add WorkerPal capacity, and watch `jobPendingSnapshot` for stalled jobs. |
-| `queue_p95` ≥ 2.0 s **or** queue depth > 60 **or** < 2 idle workers for 5 polls | Incident | Page platform on-call, hand over `/system/status` snapshot + worker logs, and keep posting updates every 15 min until p95 drops below 1.0 s. |
+| Healthy | `queue_p95 ≤ baseline + 0.15 s` **and** pending interactive ≤ `baseline + 5` **and** idle workers ≥ `baseline_idle` | No action; poll `/system/status` hourly and archive a snapshot. |
+| Early warning | `queue_p95` between `baseline + 0.15 s` and `baseline + 0.30 s` **or** pending interactive ≥ `baseline + 10` **or** idle workers < `baseline_idle − 1` for 2 polls | Trigger queue-playbook diagnostics, verify automation already injected remediation requests, and pause new background/eval submissions. |
+| Degradation | `queue_p95 ≥ baseline + 0.30 s` for > 5 min **or** pending interactive ≥ `baseline + 20` **or** idle workers ≤ `baseline_idle − 2` | Announce in `#pushpals-ops`, throttle enqueueing to interactive-only, add WorkerPal capacity, and watch `jobPendingSnapshot` for stalled jobs. |
+| Incident | `queue_p95 ≥ baseline + 0.50 s` **or** queue depth > `baseline + 50` **or** < 2 idle workers for 5 polls | Page platform on-call, hand over `/system/status` snapshot + worker logs, and keep posting updates every 15 min until `queue_p95` drops below `baseline + 0.15 s`. |
 
 ### Operator checkpoints (per rotation)
 
 - `curl -sS /system/status` → confirm `queues.requests.pending`, `slo.requests.queueWaitMs`, and `jobPendingSnapshot` stay at/near zero; log anomalies in the ops doc.
 - `curl -sS /requests?status=pending&limit=20` → ensure interactive requests have `createdAt` within the last minute; anything older gets re-queued or force-completed depending on owner feedback.
-- `curl -sS /jobs?status=pending` + WorkerPals logs → verify no job kind is retrying > 3 times; reboot workers stuck `busy` without logs.
+- `curl -sS /jobs?status=pending` → ensure no job ID survives more than three polls; only after the endpoint proves a stall should you open WorkerPals logs to capture context before restarting workers.
 - `curl -sS /workers` → maintain ≥ 2 idle WorkerPals per lane; if automation hasn’t reached `maxWorkers`, start another `bun run workerpals` instance locally or in the pool.
 - `apps/remotebuddy/docs/queue-playbook.md` → follow the mitigation checklist whenever any checkpoint crosses the warning threshold.
 
@@ -252,7 +370,7 @@ Use this path any time you need to redeploy RemoteBuddy because of a regression,
 1. **Stabilize & communicate** – Post intent in `#pushpals-ops`, capture the latest `/system/status` snapshot, and pause new background/eval submissions if queue guardrails are already amber/red. Confirm another operator is watching WorkerPals capacity before you bounce RemoteBuddy.
 2. **Sync repo + dependencies** – On the target host run `git fetch origin && git checkout <target-commit> && git pull --ff-only`. Compare `bun.lock`/`package.json`; if they changed, run `bun install`. Double-check `.env` and `config/local.toml` still have the right `PUSHPALS_*` entries.
 3. **Build protocol + start the process** – Prefer the repo-root script `bun run remotebuddy` (executes `protocol:build` first, then `remotebuddy:only`). When protocols are already current, `bun run remotebuddy:only` or `bun --cwd apps/remotebuddy run start` (enables `remotebuddy_supervisor.ts` restarts) keeps downtime minimal. Keep the existing terminal or tmux pane open so you can tail logs live.
-4. **Validate the new instance** – Wait for `[RemoteBuddy] Starting polling loop…` followed by at least one `claim payload` log. Immediately hit `curl -sS $SERVER/system/status | jq '{queues: .queues.requests, jobs: .jobPendingSnapshot}'` and `curl -sS "$SERVER/requests?status=claimed&limit=5"`. Optionally run the smoke test in the section below (`bun run smoke`) or enqueue a single interactive request to prove round-trip health. Confirm `queue_p95`, worker idle counts, and the CommunicationManager WebSocket reconnect cleanly.
+4. **Validate the new instance** – Run the [Startup Diagnostics & Preflight Checks](#startup-diagnostics--preflight-checks) immediately after launch. `/system/status` must return HTTP 200 with `queue_p95` inside the acceptable band (baseline ± 0.25 s; typically 0.30–0.80 s) and `workers.idle ≥ 1` (goal ≥ 2). Then ensure `/requests?status=claimed&limit=5` shows your RemoteBuddy instance and `/jobs?status=pending` stays empty for at least two polls. Use the bash/PowerShell commands from that section instead of relying on log strings so the readiness test stays platform-safe.
 5. **Observe, rollback if needed** – Watch logs for 5–10 minutes. If failures persist, stop the process, `git checkout <last-known-good>`, rerun step 3, and move `remotebuddy-state.db` aside only when it is clearly corrupted (RemoteBuddy will recreate it, but previously-handled events may replay once). Document the outcome and handoff time in `#pushpals-ops`.
 
 ## Usage Commands
@@ -366,32 +484,58 @@ Run this checklist after `bun run lint` passes so you confirm queue + auth paths
      $resp.Content    # Contains ok=true + requestId
      ```
 2. **Confirm RemoteBuddy claims it**
-   - Observe the RemoteBuddy terminal (started via `bun run remotebuddy` from repo root). Within ~1s expect:
-     - `[RemoteBuddy] claim payload: { ... "request": { "id": "<ID>" } }`
-     - `[RemoteBuddy] Claimed request <ID>`
-   - Manual API fallback if RemoteBuddy is stopped:
+   - Bash/zsh:
      ```bash
-     curl -sS -X POST http://localhost:3001/requests/claim \
-       -H "Content-Type: application/json" \
-       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
-       -d '{"agentId":"smoke-check"}'
-     # Expect HTTP 200 + payload containing the queued request
+     curl -sS "http://localhost:3001/requests?status=claimed&limit=5" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests | map({id, agentId, status})'
+     # Expect the new requestId with agentId="remotebuddy" and status="claimed"
      ```
+   - Windows PowerShell:
+     ```powershell
+     $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $claimed = (Invoke-WebRequest -Uri "http://localhost:3001/requests?status=claimed&limit=5" -Headers $headers).Content | ConvertFrom-Json
+     $claimed.requests | Select-Object id, agentId, status
+     ```
+   - Manual API fallback (only when RemoteBuddy is stopped) proves the queue still returns work:
+     - Bash/zsh:
+       ```bash
+       curl -sS -X POST http://localhost:3001/requests/claim \
+         -H "Content-Type: application/json" \
+         -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+         -d '{"agentId":"smoke-check"}'
+       ```
+     - Windows PowerShell:
+       ```powershell
+       $headers = @{ "Content-Type" = "application/json"; Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+       Invoke-WebRequest -Uri "http://localhost:3001/requests/claim" -Method Post -Headers $headers -Body '{"agentId":"smoke-check"}'
+       ```
 3. **Check queue status transitions**
-   ```bash
-   curl -sS "http://localhost:3001/requests?status=claimed&limit=5" \
-     -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests[0].status'
-   # Expect "claimed" with agentId="remotebuddy"
-
-   curl -sS "http://localhost:3001/requests?status=completed&limit=5" \
-     -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests[].durationMs'
-   # Expect the same requestId listed with durationMs populated once planning completes
-   ```
+   - Bash/zsh:
+     ```bash
+     curl -sS "http://localhost:3001/requests?status=completed&limit=5" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests | map({id, status, durationMs})'
+     # Expect the smoke-test request to show status="completed" with durationMs populated
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $completed = (Invoke-WebRequest -Uri "http://localhost:3001/requests?status=completed&limit=5" -Headers $headers).Content | ConvertFrom-Json
+     $completed.requests | Select-Object id, status, durationMs
+     ```
 4. **Inspect overall runtime health**
-   ```bash
-   curl -sS "http://localhost:3001/system/status" \
-     -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '{pending: .queues.requests.pending, jobQueue: .jobPendingSnapshot}'
-   # Expect `pending: 0` after the smoke item clears; jobQueue is empty unless RemoteBuddy enqueued WorkerPal jobs
-   ```
+   - Bash/zsh:
+     ```bash
+     curl -sS "http://localhost:3001/system/status" \
+       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '{pending: .queues.requests.pending, jobQueue: .queues.jobPendingSnapshot, workers: .workers}'
+     # Expect pending queues to drop back to their baseline band once the smoke request completes
+     ```
+   - Windows PowerShell:
+     ```powershell
+     $headers = @{ Authorization = "Bearer $env:PUSHPALS_AUTH_TOKEN" }
+     $status = (Invoke-WebRequest -Uri "http://localhost:3001/system/status" -Headers $headers).Content | ConvertFrom-Json
+     $status.queues.requests.pending
+     $status.queues.jobPendingSnapshot
+     $status.workers
+     ```
 
 For a fully automated round-trip (Client → LocalBuddy → RemoteBuddy → WorkerPals), keep `server`, `localbuddy`, and `workerpals` running, then execute `PUSHPALS_AUTH_TOKEN=<token> bun run smoke` from the repo root. That script asserts the presence of `task_created` and terminal events, complementing the manual enqueue/claim/status checks above.
