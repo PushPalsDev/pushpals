@@ -39,7 +39,10 @@ import {
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
 } from "../packages/shared/src/config.js";
-import { validateVisionDocStructure } from "../packages/shared/src/vision.js";
+import {
+  resolveVisionDocPath,
+  validateVisionDocStructure,
+} from "../packages/shared/src/vision.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -684,7 +687,16 @@ function ensureRequiredLocalConfigFiles(): void {
 function ensureAutonomyVisionFile(): void {
   if (!CONFIG.remotebuddy.autonomy.enabled) return;
 
-  const visionPath = resolve(repoRoot, "vision.md");
+  const configuredVisionDocPath = CONFIG.remotebuddy.autonomy.visionDocPath?.trim() || "vision.md";
+  let visionPath = "";
+  try {
+    visionPath = resolveVisionDocPath(configuredVisionDocPath, { allowAbsolutePath: true });
+  } catch (err) {
+    console.error(
+      `[start] Autonomy vision preflight failed: invalid vision path "${configuredVisionDocPath}": ${String(err)}`,
+    );
+    abortStart(1);
+  }
   const relVisionPath = relative(repoRoot, visionPath).replace(/\\/g, "/");
   if (!existsSync(visionPath)) {
     console.error(
@@ -718,6 +730,11 @@ function ensureAutonomyVisionFile(): void {
     console.error(
       `[start] Autonomy vision preflight failed: ${relVisionPath} must follow the required vision template structure.`,
     );
+    if (validation.missingSectionNumbers.length > 0) {
+      console.error(
+        `[start]   Missing required sections: ${validation.missingSectionNumbers.join(", ")}.`,
+      );
+    }
     for (const error of validation.errors) {
       console.error(`[start]   ${error}`);
     }

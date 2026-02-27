@@ -178,7 +178,7 @@ Describe where this repo is going, without over-promising.
 
 ---
 
-## Appendix (optional but powerful)
+### Appendix (optional but powerful)
 
 ### A) Glossary
 - Term: definition…

@@ -289,7 +289,7 @@ A task is not done unless:
 
 ---
 
-## Appendix
+### Appendix
 
 ### A) Glossary
 - **RemoteAgent:** Orchestrating agent that plans, delegates, integrates, and ships.

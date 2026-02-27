@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "crypto";
 import { existsSync, mkdirSync, rmSync } from "fs";
-import { resolve } from "path";
+import { isAbsolute, resolve } from "path";
 import type { CommunicationManager } from "shared";
 import {
   extractVisionKeyItems,
@@ -11,6 +11,7 @@ import {
   normalizeVisionSectionRefs,
   penaltyTotal,
   parseVisionDoc,
+  resolveVisionDocPath,
   validateScopeInvariants,
   type AutonomyComponentArea,
   type AutonomyObjectiveType,
@@ -302,6 +303,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
+  private readonly visionDocPath: string;
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -322,6 +324,7 @@ export class RemoteBuddyAutonomousEngine {
     llm: LLMClient;
     comm: CommunicationManager;
     config: PushPalsConfig;
+    visionDocPath?: string;
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
@@ -337,6 +340,11 @@ export class RemoteBuddyAutonomousEngine {
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
+    const configuredVisionDocPath = String(this.cfg.visionDocPath ?? "").trim();
+    const requestedVisionDocPath = String(opts.visionDocPath ?? "").trim();
+    const effectiveVisionDocPath =
+      requestedVisionDocPath || configuredVisionDocPath || VISION_DOC_FNAME;
+    this.visionDocPath = resolveVisionDocPath(effectiveVisionDocPath, { allowAbsolutePath: true });
   }
 
   private setPhase(phase: string): void {
@@ -410,10 +418,13 @@ export class RemoteBuddyAutonomousEngine {
   private loadVisionContext(runId: string): VisionContext | null {
     let raw = "";
     try {
-      raw = loadRepoDocText(VISION_DOC_FNAME);
+      raw = loadRepoDocText(this.visionDocPath, {
+        cache: false,
+        allowAbsolutePath: isAbsolute(this.visionDocPath),
+      });
     } catch (error) {
       console.error(
-        `[RemoteBuddyAutonomousEngine] tick ${runId}: failed to read ${VISION_DOC_FNAME}: ${String(error)}`,
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: failed to read ${this.visionDocPath}: ${String(error)}`,
       );
       return null;
     }
@@ -421,7 +432,7 @@ export class RemoteBuddyAutonomousEngine {
     const trimmed = raw.trim();
     if (!trimmed) {
       console.error(
-        `[RemoteBuddyAutonomousEngine] tick ${runId}: ${VISION_DOC_FNAME} is empty; autonomy ideation requires non-empty vision context.`,
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: ${this.visionDocPath} is empty; autonomy ideation requires non-empty vision context.`,
       );
       return null;
     }
@@ -429,7 +440,7 @@ export class RemoteBuddyAutonomousEngine {
     const truncated = trimmed.length > MAX_VISION_CONTEXT_CHARS;
     if (truncated) {
       console.log(
-        `[RemoteBuddyAutonomousEngine] tick ${runId}: ${VISION_DOC_FNAME} exceeded ${MAX_VISION_CONTEXT_CHARS} chars; using first ${MAX_VISION_CONTEXT_CHARS} chars for ideation.`,
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: ${this.visionDocPath} exceeded ${MAX_VISION_CONTEXT_CHARS} chars; using first ${MAX_VISION_CONTEXT_CHARS} chars for ideation.`,
       );
     }
 
@@ -450,7 +461,7 @@ export class RemoteBuddyAutonomousEngine {
     });
 
     return {
-      path: VISION_DOC_FNAME,
+      path: this.visionDocPath,
       markdown: truncated ? trimmed.slice(0, MAX_VISION_CONTEXT_CHARS) : trimmed,
       one_sentence: parsed.oneSentence,
       sections,

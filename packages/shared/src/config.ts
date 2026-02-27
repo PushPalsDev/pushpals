@@ -132,6 +132,7 @@ export interface PushPalsConfig {
       questionTtlMs: number;
       policyVersion: string;
       impactModelVersion: string;
+      visionDocPath: string;
       replay: {
         storePromptPayloads: boolean;
         maxRunsWithPayloads: number;
@@ -731,6 +732,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     ...remoteAutonomyDispatchByTypeCfg,
     ...asStringNumberRecord(remoteAutonomyNode.max_dispatch_per_hour_by_type),
   };
+  const remoteAutonomyVisionDocPath = firstNonEmpty(
+    process.env.REMOTEBUDDY_AUTONOMY_VISION_DOC_PATH,
+    asString(remoteAutonomyNode.vision_doc_path, "vision.md"),
+    "vision.md",
+  );
 
   const workerNode = getObject(merged, "workerpals");
   const workerOpenHandsNode = getObject(workerNode, "openhands");
@@ -1579,6 +1585,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
           asString(remoteAutonomyNode.impact_model_version, "impact-v1"),
           "impact-v1",
         ),
+        visionDocPath: remoteAutonomyVisionDocPath,
         replay: {
           storePromptPayloads:
             parseBoolEnv("REMOTEBUDDY_AUTONOMY_REPLAY_STORE_PROMPT_PAYLOADS") ??

@@ -1,5 +1,5 @@
 import { readFileSync } from "fs";
-import { join } from "path";
+import { isAbsolute, join, relative, resolve } from "path";
 import { detectRepoRoot } from "./repo.js";
 
 const TEMPLATE_TOKEN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
@@ -11,9 +11,32 @@ function resolvePromptPath(relativePath: string): string {
   return join(repoRoot, "prompts", relativePath);
 }
 
-function resolveRepoDocPath(relativePath: string): string {
+type RepoDocOptions = {
+  cache?: boolean;
+  allowAbsolutePath?: boolean;
+};
+
+export function resolveRepoDocPath(pathValue: string, opts?: RepoDocOptions): string {
   const repoRoot = detectRepoRoot(process.cwd());
-  return join(repoRoot, relativePath);
+  const repoRootResolved = resolve(repoRoot);
+  const normalizedPath = isAbsolute(pathValue)
+    ? resolve(pathValue)
+    : resolve(repoRootResolved, pathValue);
+
+  if (isAbsolute(pathValue) && !opts?.allowAbsolutePath) {
+    throw new Error(
+      `[docs] Absolute repo doc paths ("${pathValue}") require allowAbsolutePath=true and must remain inside the repository root.`,
+    );
+  }
+
+  const relativePath = relative(repoRootResolved, normalizedPath);
+  if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    throw new Error(
+      `[docs] Refusing to read repo doc outside repo root (${normalizedPath}). Provide a path within ${repoRootResolved}.`,
+    );
+  }
+
+  return normalizedPath;
 }
 
 export function loadPromptTemplate(
@@ -41,16 +64,18 @@ export function loadPromptTemplate(
   });
 }
 
-export function loadRepoDocText(relativePath: string, opts?: { cache?: boolean }): string {
+export function loadRepoDocText(relativePath: string, opts?: RepoDocOptions): string {
   const pathValue = String(relativePath ?? "").trim();
   if (!pathValue) {
     throw new Error("[docs] relativePath is required");
   }
 
-  const docPath = resolveRepoDocPath(pathValue);
+  const docPath = resolveRepoDocPath(pathValue, opts);
   const shouldCache = opts?.cache !== false;
 
-  if (shouldCache) {
+  if (!shouldCache) {
+    repoDocCache.delete(docPath);
+  } else {
     const cached = repoDocCache.get(docPath);
     if (cached !== undefined) return cached;
   }

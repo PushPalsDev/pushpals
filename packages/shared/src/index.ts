@@ -10,6 +10,7 @@ export {
   normalizeVisionSectionRef,
   normalizeVisionSectionRefs,
   parseVisionDoc,
+  resolveVisionDocPath,
   validateVisionDocStructure,
   type ParsedVisionDoc,
   type VisionDocValidation,
