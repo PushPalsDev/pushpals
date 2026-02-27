@@ -16,12 +16,25 @@
  * - worker Docker image existence
  */
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } from "fs";
+import {
+  closeSync,
+  createWriteStream,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from "fs";
 import { createHash } from "crypto";
 import { createServer } from "net";
 import { dirname, isAbsolute, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
+import { format } from "util";
 import {
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
@@ -50,6 +63,265 @@ const START_SYNC_GIT_USER_EMAIL = "pushpals-start@local";
 const DEFAULT_PUSHPALS_PORT = CONFIG.server.port;
 const DEFAULT_STARTUP_WARMUP_TIMEOUT_MS = 120_000;
 const DEFAULT_STARTUP_WARMUP_POLL_MS = 1_000;
+const SYSTEM_LOG_PATH = resolve(repoRoot, "system.log");
+const SYSTEM_LOG_TAIL_POLL_MS = 250;
+const SYSTEM_LOG_TAIL_READ_CHUNK_BYTES = 64 * 1024;
+const ANSI_RESET = "\u001b[0m";
+const ANSI_CYAN = "\u001b[36m";
+const ANSI_MAGENTA = "\u001b[35m";
+const ANSI_RED = "\u001b[31m";
+const ANSI_BRIGHT_RED = "\u001b[1;31m";
+const ANSI_YELLOW = "\u001b[33m";
+const ANSI_GREEN = "\u001b[32m";
+const ANSI_BLUE = "\u001b[34m";
+const ANSI_BRIGHT_WHITE = "\u001b[97m";
+
+const systemLogStream = createWriteStream(SYSTEM_LOG_PATH, { flags: "w" });
+
+const originalConsole = {
+  log: console.log.bind(console),
+  info: console.info.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+};
+
+let consolePassthroughEnabled = true;
+let systemLogWriteFailed = false;
+let systemLogTailUsesAnsi = false;
+
+const SYSTEM_LOG_COMPONENT_COLOR_BY_TAG = new Map<string, string>([
+  ["server", ANSI_CYAN],
+  ["localbuddy", ANSI_MAGENTA],
+  ["remotebuddy", ANSI_RED],
+  ["workerpals", ANSI_YELLOW],
+  ["source_control_manager", ANSI_GREEN],
+  ["client", ANSI_BLUE],
+  ["start", ANSI_BRIGHT_WHITE],
+]);
+
+const SYSTEM_LOG_ERROR_PATTERN =
+  /\b(error|failed|fatal|panic|exception|traceback|eacces|sqlite_busy|epipe|econnreset)\b/i;
+const SYSTEM_LOG_WARN_PATTERN = /\b(warn|warning)\b/i;
+const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/;
+const SYSTEM_LOG_PREFIX_PATTERN = /^((?:\[[^\]\r\n]+\]\s*)+)(.*)$/;
+const SYSTEM_LOG_TAG_PATTERN = /\[[^\]\r\n]+\]/g;
+
+function shouldUseAnsiColors(): boolean {
+  const forceColor = (process.env.FORCE_COLOR ?? "").trim();
+  if (forceColor === "0") return false;
+  if (forceColor.length > 0) return true;
+  if (process.env.NO_COLOR !== undefined) return false;
+  if (!process.stdout.isTTY) return false;
+  const term = (process.env.TERM ?? "").trim().toLowerCase();
+  if (term === "dumb") return false;
+  return true;
+}
+
+function colorizeSystemLogLine(line: string): string {
+  if (!systemLogTailUsesAnsi) return line;
+  if (!line) return line;
+  if (ANSI_ESCAPE_PATTERN.test(line)) return line;
+
+  const prefixMatch = line.match(SYSTEM_LOG_PREFIX_PATTERN);
+  if (!prefixMatch) return line;
+
+  const prefix = prefixMatch[1] ?? "";
+  const remainder = prefixMatch[2] ?? "";
+  const tags = prefix.match(SYSTEM_LOG_TAG_PATTERN) ?? [];
+  if (tags.length === 0) return line;
+
+  let color: string | null = null;
+  for (const tag of tags) {
+    const tagText = tag.slice(1, -1).trim().toLowerCase();
+    const componentColor = SYSTEM_LOG_COMPONENT_COLOR_BY_TAG.get(tagText);
+    if (componentColor) {
+      color = componentColor;
+      break;
+    }
+  }
+  if (!color && SYSTEM_LOG_ERROR_PATTERN.test(line)) {
+    color = ANSI_BRIGHT_RED;
+  }
+  if (!color && SYSTEM_LOG_WARN_PATTERN.test(line)) {
+    color = ANSI_YELLOW;
+  }
+  if (!color) return line;
+
+  const colorizedPrefix = prefix.replace(
+    SYSTEM_LOG_TAG_PATTERN,
+    (tag) => `${color}${tag}${ANSI_RESET}`,
+  );
+  return `${colorizedPrefix}${remainder}`;
+}
+
+function writeSystemLog(chunk: string | Uint8Array): void {
+  if (systemLogStream.destroyed) return;
+  try {
+    systemLogStream.write(chunk);
+  } catch (err) {
+    if (!systemLogWriteFailed) {
+      systemLogWriteFailed = true;
+      originalConsole.error(`[start] Failed to write system.log: ${String(err)}`);
+    }
+  }
+}
+
+function mirrorConsole(level: "log" | "info" | "warn" | "error", args: unknown[]): void {
+  const message = format(...args);
+  writeSystemLog(`${message}\n`);
+  if (consolePassthroughEnabled) {
+    originalConsole[level](...args);
+  }
+}
+
+console.log = (...args: unknown[]) => mirrorConsole("log", args);
+console.info = (...args: unknown[]) => mirrorConsole("info", args);
+console.warn = (...args: unknown[]) => mirrorConsole("warn", args);
+console.error = (...args: unknown[]) => mirrorConsole("error", args);
+
+function relSystemLogPath(): string {
+  const rel = relative(repoRoot, SYSTEM_LOG_PATH);
+  return rel ? rel.replace(/\\/g, "/") : "system.log";
+}
+
+type SystemLogTailHandle = {
+  stop: () => void;
+};
+
+function createSystemLogTail(pathValue: string): SystemLogTailHandle {
+  let readOffset = 0;
+  let pendingLine = "";
+  let decoder = new TextDecoder();
+  try {
+    readOffset = statSync(pathValue).size;
+  } catch {
+    readOffset = 0;
+  }
+
+  const writeDecoded = (text: string, flush = false): void => {
+    if (text) pendingLine += text;
+    const parts = pendingLine.split(/\r\n|\n|\r/);
+    pendingLine = parts.pop() ?? "";
+    for (const line of parts) {
+      process.stdout.write(`${colorizeSystemLogLine(line)}\n`);
+    }
+    if (flush && pendingLine) {
+      process.stdout.write(`${colorizeSystemLogLine(pendingLine)}\n`);
+      pendingLine = "";
+    }
+  };
+
+  const drain = (): void => {
+    let size = 0;
+    try {
+      size = statSync(pathValue).size;
+    } catch {
+      return;
+    }
+    if (size < readOffset) {
+      readOffset = 0;
+      pendingLine = "";
+      decoder = new TextDecoder();
+    }
+    if (size === readOffset) return;
+
+    const fd = openSync(pathValue, "r");
+    try {
+      let remaining = size - readOffset;
+      while (remaining > 0) {
+        const chunkSize = Math.min(remaining, SYSTEM_LOG_TAIL_READ_CHUNK_BYTES);
+        const buffer = Buffer.allocUnsafe(chunkSize);
+        const bytesRead = readSync(fd, buffer, 0, chunkSize, readOffset);
+        if (bytesRead <= 0) break;
+        readOffset += bytesRead;
+        remaining -= bytesRead;
+        writeDecoded(decoder.decode(buffer.subarray(0, bytesRead), { stream: true }));
+      }
+    } finally {
+      closeSync(fd);
+    }
+  };
+
+  const timer = setInterval(drain, SYSTEM_LOG_TAIL_POLL_MS);
+  return {
+    stop: () => {
+      clearInterval(timer);
+      drain();
+      writeDecoded(decoder.decode(), true);
+    },
+  };
+}
+
+let systemLogTail: SystemLogTailHandle | null = null;
+
+function startSystemLogTail(): void {
+  if (systemLogTail) return;
+  systemLogTailUsesAnsi = shouldUseAnsiColors();
+  systemLogTail = createSystemLogTail(SYSTEM_LOG_PATH);
+  consolePassthroughEnabled = false;
+}
+
+function stopSystemLogTail(): void {
+  if (systemLogTail) {
+    systemLogTail.stop();
+    systemLogTail = null;
+  }
+  consolePassthroughEnabled = true;
+}
+
+async function pipeProcStreamToSystemLog(
+  stream: ReadableStream<Uint8Array> | number | null | undefined,
+): Promise<void> {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") return;
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        writeSystemLog(value);
+      }
+    }
+  } catch {
+    // best-effort stream piping
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function pipeProcStreamToOutputAndSystemLog(
+  stream: ReadableStream<Uint8Array> | number | null | undefined,
+  target: { write: (chunk: Uint8Array | string) => boolean },
+): Promise<void> {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") return;
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        writeSystemLog(value);
+        try {
+          target.write(value);
+        } catch {
+          // best-effort terminal mirror
+        }
+      }
+    }
+  } catch {
+    // best-effort stream piping
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function closeSystemLog(): Promise<void> {
+  stopSystemLogTail();
+  if (systemLogStream.destroyed) return;
+  await new Promise<void>((resolveClose) => {
+    systemLogStream.end(() => resolveClose());
+  });
+}
 const REQUIRED_DEPENDENCY_PROBES: Array<{
   label: string;
   fromDir: string;
@@ -1129,8 +1401,11 @@ function appendLmStudioLogTail(line: string): void {
   }
 }
 
-function streamProcessOutput(stream: ReadableStream<Uint8Array> | null, prefix: string): void {
-  if (!stream) return;
+function streamProcessOutput(
+  stream: ReadableStream<Uint8Array> | number | null | undefined,
+  prefix: string,
+): void {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") return;
 
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -2075,10 +2350,14 @@ async function runInherited(cmd: string[], cwd?: string): Promise<number> {
     const proc = Bun.spawn(cmd, {
       cwd,
       stdin: "inherit",
-      stdout: "inherit",
-      stderr: "inherit",
+      stdout: "pipe",
+      stderr: "pipe",
     });
-    return proc.exited;
+    const stdoutPump = pipeProcStreamToOutputAndSystemLog(proc.stdout, process.stdout);
+    const stderrPump = pipeProcStreamToOutputAndSystemLog(proc.stderr, process.stderr);
+    const exitCode = await proc.exited;
+    await Promise.allSettled([stdoutPump, stderrPump]);
+    return exitCode;
   } catch {
     return 127;
   }
@@ -4061,6 +4340,7 @@ const shutdown = async (code: number) => {
   } catch {}
   await cleanupWorkerWarmContainers("shutdown");
   await stopManagedLmStudio();
+  await closeSystemLog();
   process.exit(code);
 };
 
@@ -4093,6 +4373,7 @@ try {
 } catch (err) {
   await cleanupWorkerWarmContainers("startup failure");
   await stopManagedLmStudio();
+  await closeSystemLog();
   if (err instanceof StartAbort) {
     process.exit(err.exitCode);
   }
@@ -4101,22 +4382,29 @@ try {
 }
 
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
+console.log(`[start] Runtime logs are being written to ${relSystemLogPath()}.`);
 proc = Bun.spawn([bunExecPath, "run", "dev:full"], {
   stdin: "inherit",
-  stdout: "inherit",
-  stderr: "inherit",
+  stdout: "pipe",
+  stderr: "pipe",
   env: { ...process.env },
 });
+startSystemLogTail();
+
+const devStdoutPump = pipeProcStreamToSystemLog(proc.stdout);
+const devStderrPump = pipeProcStreamToSystemLog(proc.stderr);
 
 const startupWarmupPromise = runStartupWarmup().catch((err) => {
   console.warn(`[start] Startup warmup failed: ${String(err)}`);
 });
 
 const exitCode = await proc.exited;
+await Promise.allSettled([devStdoutPump, devStderrPump]);
 await Promise.race([
   startupWarmupPromise,
   new Promise((resolveWait) => setTimeout(resolveWait, 500)),
 ]);
 await cleanupWorkerWarmContainers("dev:full exit");
 await stopManagedLmStudio();
+await closeSystemLog();
 process.exit(exitCode);
