@@ -1,172 +1,187 @@
-# RemoteBuddy Quickstart
+# RemoteBuddy Quickstart (Deterministic Runbook)
 
-_Last updated: 27 Feb 2026 — validated against RemoteBuddy v2026.02 on Bun 1.1.x._
+_Last updated: 27 Feb 2026 — applies to the RemoteBuddy v2026.02 train._
 
-This playbook turns a fresh workstation into a deterministic RemoteBuddy operator node. Follow
-every numbered step in order—each one is self-contained and rerunnable so you can recover quickly
-after failures or host rebuilds.
+> **Scope:** Every command is written for Bash/WSL shells launched from the PushPals repo root. Use WSL2 on Windows for parity; native PowerShell is intentionally out of scope so that each step stays deterministic.
 
-## Prerequisites
+This runbook turns a blank or previously used host into a reproducible RemoteBuddy stack. The numbered steps can be rerun as often as needed; the reset and verification commands make each iteration start from the same state.
 
-### Tooling baseline
+## One-time prerequisites (per host)
 
-| Item | Required version | Purpose | Verification |
-| --- | --- | --- | --- |
-| Git | ≥ 2.44 | Clone repo + keep worktrees in sync | `git --version` |
-| Bun | 1.1.x (latest stable) | Runtime + package manager | `bun --version` |
-| Docker Desktop / Engine | ≥ 24.0 | WorkerPals auto-spawn (default `workerpal_docker=true`) | `docker version` |
-| Python | 3.11+ on PATH | WorkerPals OpenHands + MiniSWE backends | `python3 --version` |
-| Codex CLI | Latest (auto-updates) | Mandatory orchestration/runtime integration | `codex --version && codex login` |
-| jq | ≥ 1.6 | Inspect `/system/status` responses | `jq --version` |
+1. **Codex CLI auth (manual prerequisite).** Codex CLI is required infrastructure. Sign in once on the host so later steps can run unattended:
+   ```bash
+   bunx --yes @openai/codex login
+   codex login status
+   ```
+   - Keep the session alive (the start script will refuse to continue if Codex auth is missing).
+   - **Non-interactive alternative:** If you cannot complete an interactive login (CI, remote shell), set the following in `.env` and skip the login prompt altogether:
+     ```bash
+     export OPENAI_API_KEY="sk-your-key"
+     export PUSHPALS_OPENAI_CODEX_AUTH_MODE=api_key
+     ```
+     With API-key mode enabled the CLI relies purely on the key you provide, so no `codex login` prompt is triggered.
+2. **Helper tooling.** Ensure `jq` and `sqlite3` are installed (macOS: `brew install jq sqlite`; Debian/Ubuntu/WSL: `sudo apt-get update && sudo apt-get install -y jq sqlite3`).
 
-> Keep Docker running and signed in before starting any services. Codex CLI auth must succeed—do
-> not bypass it. If `codex login` fails, stop and resolve credentials before proceeding.
+## Step 1 – Pin and verify Bun 1.1.30
 
-### Secrets, env vars, and services
-
-Populate these in `.env` (or export them in your shell) before starting services:
-
-- `PUSHPALS_AUTH_TOKEN` – bearer token for Server/RemoteBuddy/WorkerPals RPCs.
-- `OPENAI_API_KEY` (or per-service overrides such as `REMOTEBUDDY_LLM_API_KEY`) — required when
-  `remotebuddy.llm.backend=openai`.
-- `PUSHPALS_SERVER_URL` (default `http://localhost:3001`) — matches the Server listener address.
-- `REMOTE_STABLE_ID` – freeform identifier for this RemoteBuddy pod, used in telemetry threads.
-- `WORKERPALS_API_URL` – URL RemoteBuddy hits for worker control-plane operations.
-- Optional Git access (`PUSHPALS_GIT_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`) if RemoteBuddy must push
-  commits via SourceControlManager.
-
-Required background services/resources:
-
-- Docker daemon up with the `pushpals-worker-sandbox:latest` image pulled (the `start` script can
-  build it, but pulling ahead avoids first-run latency).
-- LLM endpoint reachable at the URL specified in `config/local.toml` (OpenAI, LM Studio, etc.).
-- Network access to the Git remote used by SourceControlManager (`origin/main_agents` by default).
-
-## Step 1 – Install Bun 1.1.x
+RemoteBuddy is tested against Bun **1.1.30**. Install/upgrade to that exact patch so dependency resolution and runtime behavior match CI.
 
 ```bash
-# macOS / Linux
-curl -fsSL https://bun.sh/install | bash
-exec $SHELL -l
-bun --version  # expect 1.1.x
-
-# Windows PowerShell / WSL
-irm https://bun.sh/install.ps1 | iex
-bun --version
+export BUN_VERSION="bun-v1.1.30"
+curl -fsSL https://bun.sh/install | bash -s -- "$BUN_VERSION"
+# Reload your shell so ~/.bun/bin is on PATH
+test -x "$HOME/.bun/bin/bun" && exec "$SHELL" -l
+bun --version  # should print 1.1.30
 ```
+- Re-run the same install command any time you need to upgrade/downgrade; it is idempotent.
+- If Bun lives outside `~/.bun`, set `BUN_INSTALL=/opt/bun` before running the installer.
 
-If you already have Bun, upgrade deterministically via `bun upgrade --canary --exact 1.1.x`.
-
-## Step 2 – Clone (or update) the repo
+## Step 2 – Install workspace dependencies deterministically
 
 ```bash
-git clone git@github.com:pushpals/pushpals.git
-cd pushpals
-# or, if the repo is present already
-git fetch origin && git switch main_agents && git pull
+bun install --frozen-lockfile
+bun run protocol:build
 ```
+- `--frozen-lockfile` ensures `bun.lock` is honored exactly; deletions or additions abort instead of mutating the lockfile.
+- When re-running after a failed attempt, first execute `bun pm cache rm --all` if you suspect cache corruption, then re-run the two commands above.
 
-All following commands assume you run them from the repo root.
+## Step 3 – Prepare `.env` and config via idempotent upserts
 
-## Step 3 – Configure the environment
+1. Seed local copies only if they do not exist:
+   ```bash
+   if [ ! -f .env ]; then cp .env.example .env; fi
+   if [ ! -f config/local.toml ]; then cp config/local.example.toml config/local.toml; fi
+   ```
+2. Use the helper below whenever you need to set or update a key in `.env`. It replaces existing values instead of blindly appending duplicate lines:
+   ```bash
+   upsert_env() {
+     python3 - "$1" "$2" <<'PY'
+import os, sys
+from pathlib import Path
+key, value = sys.argv[1:3]
+path = Path('.env')
+lines = path.read_text().splitlines() if path.exists() else []
+key_line = f"{key}="
+updated = False
+for idx, line in enumerate(lines):
+    if line.startswith(key_line):
+        lines[idx] = f"{key}={value}"
+        updated = True
+        break
+if not updated:
+    lines.append(f"{key}={value}")
+path.write_text("\n".join(lines) + "\n")
+PY
+   }
+
+   upsert_env PUSHPALS_AUTH_TOKEN "dev-local-token"
+   upsert_env OPENAI_API_KEY "sk-your-key"
+   # Force API-key auth if you used the non-interactive Codex path
+   upsert_env PUSHPALS_OPENAI_CODEX_AUTH_MODE "api_key"
+   ```
+   Replace the placeholder values with your actual secrets. Re-run `upsert_env KEY VALUE` any time you need to change a value; the helper is safe to call repeatedly.
+
+## Step 4 – Reset + verify the Server SQLite database (`outputs/data/pushpals.db`)
 
 ```bash
-cp .env.example .env            # only if .env does not exist yet
-cp config/local.example.toml config/local.toml
 mkdir -p outputs/data
-
-# Append required secrets (replace placeholders!)
-cat <<'EOF' >> .env
-PUSHPALS_AUTH_TOKEN=replace-me
-REMOTE_STABLE_ID=remotebuddy-dev-01
-WORKERPALS_API_URL=http://localhost:3004
-OPENAI_API_KEY=replace-me
-PUSHPALS_SERVER_URL=http://localhost:3001
-EOF
-
-# Verify Codex CLI auth so RemoteBuddy/WorkerPals may delegate to it later
-codex --version
-codex login
+rm -f outputs/data/pushpals.db{,-shm,-wal}
+sqlite3 outputs/data/pushpals.db <<'SQL'
+PRAGMA journal_mode=WAL;
+PRAGMA user_version;
+SQL
+sqlite3 outputs/data/pushpals.db 'PRAGMA integrity_check;'
 ```
+- The `rm` call wipes any previous queue/session state so reenqueues behave identically between runs.
+- `PRAGMA integrity_check` must print `ok`; anything else indicates disk or schema corruption and you should stop before proceeding.
 
-Update `config/local.toml` if you need to point `remotebuddy.llm.endpoint` or data directories to
-non-default locations. Keep `paths.data_dir` aligned with `PUSHPALS_DATA_DIR`.
-
-## Step 4 – Install dependencies and build shared protocol
+## Step 5 – Reset + verify the RemoteBuddy SQLite database (`outputs/data/remotebuddy-state.db`)
 
 ```bash
-bun install                 # installs root + workspace deps
-bun run protocol:build      # generates protocol artifacts RemoteBuddy imports
+rm -f outputs/data/remotebuddy-state.db{,-shm,-wal}
+sqlite3 outputs/data/remotebuddy-state.db <<'SQL'
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS _bootstrap(key TEXT PRIMARY KEY, value TEXT);
+SQL
+sqlite3 outputs/data/remotebuddy-state.db 'PRAGMA integrity_check;'
 ```
+- This file stores idempotency + session memory. Removing it before each deterministic run guarantees RemoteBuddy will not skip or replay prior requests.
+- Keep a backup only when you intentionally need to preserve long-running context; otherwise treat the reset above as mandatory.
 
-Run `bun install` again whenever `bun.lock` changes to keep local packages deterministic.
+## Step 6 – Start the supporting services (new terminals)
 
-## Step 5 – Bootstrap the SQLite stores (database migration)
-
-The Server and RemoteBuddy components auto-migrate their SQLite schemas on startup (see
-`apps/server/src/db.ts`, `apps/server/src/requests.ts`, and `apps/remotebuddy/src/idempotency.ts`).
-Run the Server once to create `outputs/data/pushpals.db`, then stop it so you can proceed with a
-clean state.
-
-```bash
-PUSHPALS_DATA_DIR=outputs/data \
-REMOTEBUDDY_DB_PATH=outputs/data/remotebuddy-state.db \
-bun run server:only --env-file .env
-# wait for "[server] listening on http://localhost:3001" then Ctrl+C
-
-ls -lh outputs/data/pushpals.db                 # confirms migrations ran
-```
-
-RemoteBuddy will initialize `outputs/data/remotebuddy-state.db` automatically the first time the
-process starts; no manual SQL is required.
-
-## Step 6 – Start core services
-
-Launch each service in its own terminal so logs stay isolated:
-
-1. **Server (queue + SSE)**
-
+1. **Server (Terminal A):**
    ```bash
-   PUSHPALS_DATA_DIR=outputs/data bun run server:only --env-file .env
+   bun run server:only
    ```
-
-2. **WorkerPals (Docker-backed workers)**
-
+   The script automatically points to `.env`. Wait for `Listening on http://0.0.0.0:3001`.
+2. **WorkerPals (Terminal B):**
    ```bash
-   # Requires Docker daemon + pushpals-worker-sandbox:latest image
-   PUSHPALS_DATA_DIR=outputs/data \
-   WORKERPALS_DOCKER_IMAGE=pushpals-worker-sandbox:latest \
-   bun run workerpals:only:docker
+   bun run workerpals:only
    ```
+   Confirm the log shows at least the configured idle workers coming online. Leave both terminals running for the remainder of the session.
 
-3. **RemoteBuddy**
+## Step 7 – Launch RemoteBuddy and gate on readiness
 
+1. **Start RemoteBuddy (Terminal C):**
    ```bash
-   # Uses .env + config/local.toml for auth, LLM, and queue endpoints
-   bun run remotebuddy:only
+   mkdir -p logs
+   bun run remotebuddy:only 2>&1 | tee logs/remotebuddy.log
    ```
-
-RemoteBuddy logs `planner ready` once it has claimed its first request cursor. Use
-`bun run remotebuddy:only:watch` if you prefer the live-reload dev loop.
-
-## Step 7 – Validate the stack
-
-1. Confirm Server health and queue metrics:
-
+   Wait for the log line `planner ready` but do not proceed until the readiness loop passes.
+2. **Run the readiness retry loop (Terminal D):** this polls `/system/status` until queue depth and worker idleness are healthy before you continue. It bails out after 10 attempts (≈2 minutes).
    ```bash
-   curl -sS http://localhost:3001/system/status | \
-     jq '{queue_p95: .slo.requests.queueWaitMs.p95, pending: .queues.requests.pending, workers: .workers.online}'
+   set -a; source .env; set +a
+   export PUSHPALS_AUTH_TOKEN=${PUSHPALS_AUTH_TOKEN:?set in .env}
+   readiness_check() {
+     curl -sf -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+       http://localhost:3001/system/status | \
+       jq '(
+            (.queues.requests.pending // 0) < 5 and
+            (.queues.jobs.pending // 0) == 0 and
+            (.workers.idle // 0) >= 2
+          )'
+   }
+
+   attempt=0
+   until readiness_check | grep -q true; do
+     attempt=$((attempt + 1))
+     if [ "$attempt" -ge 10 ]; then
+       echo "[ready] RemoteBuddy did not become ready within 10 polls." >&2
+       echo "Inspect logs/remotebuddy.log and /system/status for blockers." >&2
+       exit 1
+     fi
+     echo "[ready] Pending queues still draining (attempt $attempt)..."
+     sleep 12
+   done
+   echo "[ready] Queue + worker health gates satisfied."
    ```
+   Do **not** continue to health assertions or smoke tests until the loop reports success; this guarantees every rerun waits for the same starting conditions. If it exits non-zero, resolve the underlying issue, re-run Steps 4–7, and document the failure in `#pushpals-ops`.
 
-   Expect low pending counts and ≥1 worker per lane.
+## Step 8 – Smoke test RemoteBuddy + verify DB state
 
-2. Run the docs linter to ensure the repo is in a lint-clean state before committing or opening a
-   PR:
-
+1. **Enqueue a deterministic request:**
    ```bash
-   bun run lint:docs
+   curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     http://localhost:3001/requests/enqueue \
+     -d '{"sessionId":"dev","prompt":"remotebuddy quickstart smoke","priority":"interactive","metadata":{"source":"quickstart"}}'
    ```
+   Note the `requestId` returned.
+2. **Confirm RemoteBuddy handled it:** tail `logs/remotebuddy.log` for the `requestId` and wait for `request completed`.
+3. **Verify the databases captured the run:**
+   ```bash
+   sqlite3 outputs/data/pushpals.db 'SELECT count(*) FROM requests WHERE metadata LIKE "%quickstart%";'
+   sqlite3 outputs/data/remotebuddy-state.db 'SELECT count(*) FROM idempotency WHERE request_id IS NOT NULL;'
+   ```
+   Both commands should return a value ≥ 1; rerunning the smoke test after a reset should increment consistently.
+4. **Queue/worker assertion:**
+   ```bash
+   curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \
+     | jq '{pending: .queues.requests.pending, jobPending: .queues.jobs.pending, idle: .workers.idle}'
+   ```
+   Healthy output shows `pending: 0`, `jobPending: 0`, and `idle >= 2` immediately after the smoke completes. If any field violates those bounds, stop RemoteBuddy, repeat Steps 4–7, and only then accept traffic.
 
-   Address any failures before distributing the quickstart or shipping a change.
+## Rerun checklist
 
-Once these checks pass, RemoteBuddy is ready to take traffic or enqueue synthetic smoke tests.
+For every subsequent startup on the same host, repeat Steps **4–8** in order. That sequence clears residual queue state, revalidates the SQLite files, and enforces the readiness gate before you trust worker/queue health again.
