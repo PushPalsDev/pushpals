@@ -16,11 +16,16 @@ Return strict JSON with this shape:
     "estimated_effort": "small|medium|large",
     "why_now_signal_ids": ["sig_x"],
     "confidence": 0.0,
+    "vision_alignment_reason": "...",
+    "vision_section_refs": ["6", "9"],
     "requires_user_input": false,
     "question_if_blocked": ""
   }]
 }
 Constraints:
+- You will receive `vision.markdown`; use it as inspiration and prioritize candidates that clearly advance that vision.
+- You will also receive `vision.sections`; every candidate must cite at least one section number in `vision_section_refs`.
+- `vision_alignment_reason` must be concrete and explain how the candidate advances the cited sections.
 - target_paths must be literal repo-relative paths.
 - write_globs must be repo-relative globs.
 - do not invent evidence ids.

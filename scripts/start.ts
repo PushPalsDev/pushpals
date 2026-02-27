@@ -26,6 +26,7 @@ import {
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
 } from "../packages/shared/src/config.js";
+import { validateVisionDocStructure } from "../packages/shared/src/vision.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -406,6 +407,59 @@ function ensureRequiredLocalConfigFiles(): void {
     console.error(`[start]   Linux/macOS (bash): ${entry.linuxCopy}`);
   }
   abortStart(1);
+}
+
+function ensureAutonomyVisionFile(): void {
+  if (!CONFIG.remotebuddy.autonomy.enabled) return;
+
+  const visionPath = resolve(repoRoot, "vision.md");
+  const relVisionPath = relative(repoRoot, visionPath).replace(/\\/g, "/");
+  if (!existsSync(visionPath)) {
+    console.error(
+      `[start] Missing required autonomy vision file: ${relVisionPath} (required when remotebuddy.autonomy.enabled=true).`,
+    );
+    console.error("[start]   Windows (PowerShell): Copy-Item vision.example.md vision.md");
+    console.error("[start]   Linux/macOS (bash): cp vision.example.md vision.md");
+    abortStart(1);
+  }
+
+  let visionRaw = "";
+  try {
+    visionRaw = readFileSync(visionPath, "utf8");
+  } catch (err) {
+    console.error(
+      `[start] Autonomy vision preflight failed: could not read ${relVisionPath}: ${String(err)}`,
+    );
+    abortStart(1);
+  }
+
+  const visionText = visionRaw.trim();
+  if (!visionText) {
+    console.error(
+      `[start] Autonomy vision preflight failed: ${relVisionPath} is empty. Add repository vision/goals before startup.`,
+    );
+    abortStart(1);
+  }
+
+  const validation = validateVisionDocStructure(visionText);
+  if (!validation.ok) {
+    console.error(
+      `[start] Autonomy vision preflight failed: ${relVisionPath} must follow the required vision template structure.`,
+    );
+    if (validation.missingSectionNumbers.length > 0) {
+      console.error(
+        `[start]   Missing required section number(s): ${validation.missingSectionNumbers.join(", ")}`,
+      );
+    }
+    for (const error of validation.errors) {
+      console.error(`[start]   ${error}`);
+    }
+    abortStart(1);
+  }
+
+  console.log(
+    `[start] Autonomy preflight: loaded ${relVisionPath} (${visionText.length} chars, ${validation.sectionCount} section(s)).`,
+  );
 }
 
 function probeModuleResolution(
@@ -4027,6 +4081,7 @@ try {
   await ensureWorkspaceDependenciesInstalled();
   sanitizeWindowsWatcherPaths();
   ensureRequiredLocalConfigFiles();
+  ensureAutonomyVisionFile();
   logEffectiveConfigSnapshot();
   await ensureServicePortsAvailable();
   await cleanupStaleWorkerPalsProcesses();
