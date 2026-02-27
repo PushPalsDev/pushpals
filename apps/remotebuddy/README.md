@@ -116,6 +116,44 @@ RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Work through the step
   # or: choco install jq
   ```
 
+## Startup / Preflight Checklist
+
+Run these steps from the repo root so RemoteBuddy starts with a known-good setup. Each line is a blocking command; wait for success (or fix errors) before advancing.
+
+1. **Verify runtime + secrets** – Confirm Bun ≥ 1.1.x and ensure the required env vars (`PUSHPALS_SERVER_URL`, `PUSHPALS_SESSION_ID`, `PUSHPALS_AUTH_TOKEN`) are loaded.
+   ```bash
+   bun --version
+   bun -p "['PUSHPALS_SERVER_URL','PUSHPALS_SESSION_ID','PUSHPALS_AUTH_TOKEN'].forEach((k)=>{if(!process.env[k]){throw new Error(k+' missing');}console.log(k+'='+process.env[k]);})"
+   ```
+2. **Ensure supporting services are online** – RemoteBuddy expects the Server queue plus at least one WorkerPal and LocalBuddy instance.
+   ```bash
+   bun run server:only
+   bun run workerpals:only
+   bun run localbuddy:only
+   ```
+3. **Install workspace dependencies** – Pull node_modules in case `bun.lock`/`package.json` changed.
+   ```bash
+   bun install
+   ```
+4. **Seed config + env files** – Copy `.env` and `config/local.toml` from their examples if they are missing or stale.
+   ```bash
+   bun -e "import {copyFileSync,existsSync} from 'node:fs';const pairs=[['.env.example','.env'],['config/local.example.toml','config/local.toml']];pairs.forEach(([src,dst])=>{if(!existsSync(dst)){copyFileSync(src,dst);console.log('seeded '+dst);}else{console.log('ok '+dst);}});"
+   ```
+5. **Bootstrap the idempotency store** – Make sure `remotebuddy-state.db` exists (RemoteBuddy recreates schema on launch).
+   ```bash
+   bun -e "import {existsSync,writeFileSync} from 'node:fs';const path='remotebuddy-state.db';if(!existsSync(path)){writeFileSync(path,'');console.log('created '+path);}else{console.log('ok '+path);}"
+   ```
+6. **Launch RemoteBuddy** – Build protocol files and start the orchestrator with the shared `.env`.
+   ```bash
+   bun run remotebuddy
+   ```
+7. **Verify health** – Run the smoke test with the same auth token to confirm RemoteBuddy can round-trip a request before handling real traffic.
+   ```bash
+   PUSHPALS_AUTH_TOKEN=<token> bun run smoke
+   ```
+
+After completing the checklist successfully, `bun run lint` should pass to confirm the workspace is in a healthy state.
+
 ## Bun Workflow
 
 **Prerequisites** – Follow the repo-wide Bun 1.x requirement from the [Setup Checklist](#setup-checklist); RemoteBuddy is validated on Bun 1.1.x today. Confirm with `bun --version`, then reinstall via `curl -fsSL https://bun.sh/install | bash` (macOS/Linux) or `powershell -c "irm https://bun.sh/install.ps1 | iex"` (Windows) if the version lags.
