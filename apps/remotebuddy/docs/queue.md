@@ -16,17 +16,30 @@ Need a concrete walkthrough of how a user request flows across LocalBuddy, Remot
 | --- | --- | --- |
 | Grafana › RemoteBuddy Queue Overview | `queue_p95`, per-lane backlog, retry spikes (panels: `queue_p95`, `requests_pending`, `jobs_pending`) | Auto-refresh 30 s. Pin compare window (last 4 h vs 24 h) to confirm trend reversals. |
 | Grafana › Worker Backends Latency | Worker RPC p95/p99, upstream saturation | Helps prove whether queue inflation started upstream (LLM/storage) before spending time on workers. |
-| Server `/system/status` API | `slo.requests.queueWaitMs`, `queues.requestPendingSnapshot`, `queues.jobPendingSnapshot`, worker idle counts | Run `curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status | jq '{queues, slo}'`. Bookmark per-priority depth. |
+| Server `/system/status` API | `slo.requests.queueWaitMs`, `queues.requestPriorities`, `queues.jobPendingSnapshot`, worker idle counts | Run `curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \| jq '{queue_p95: .slo.requests.queueWaitMs.p95, pendingInteractive: .queues.requestPriorities.interactive, jobPendingSnapshot: .queues.jobPendingSnapshot, idleWorkers: .workers.idle}'`. Bookmark per-priority depth. |
 | Client Ops board (`bun run client:only` → Ops tab) | Real-time session ETA + backlog overlay | Highlights user-facing retries and which sessions are waiting longest. |
 | WorkerPals logs (`bun run workerpals:only[:docker]`) | `task.execute` retries, wrapper timeouts | Use alongside `/workers` to ensure idle slots exist; match timestamps with Grafana spikes. |
 
-### Thresholds that matter (current baseline 0.7 s–0.9 s p95)
+### Thresholds that matter (current baseline 0.533 s ± 0.075 s p95)
+
+#### Canonical queue + idle guardrails
+
+Copied verbatim from `apps/remotebuddy/README.md`; treat this as the single source for queue wait, backlog, and idle worker bands.
+
+<!-- QUEUE_GUARDRAILS_TABLE:start -->
+| Band | Conditions (observed via `/system/status`) | Operator action |
+| --- | --- | --- |
+| **Healthy** | `queue_p95` ≤ 1.0 s, pending interactive < 10, and idle workers ≥ 6 total (≈ 2 per lane via `.workers.idle`). | Keep `/system/status` tailing hourly; capture baseline snapshots once per shift. |
+| **Warning** | `queue_p95` 1.0–1.5 s for ≥ 3 polls, or pending interactive ≥ 15 for ≥ 3 polls, or idle workers < 6 total for 3 polls. | Trigger queue-playbook diagnostics, pause background/eval submissions, and confirm queue automation already injected remediation jobs. |
+| **Degradation** | `queue_p95` ≥ 1.5 s for ≥ 5 min, or pending interactive ≥ 30, or queue depth > 60 while idle workers stay < 6 total. | Announce in `#pushpals-ops`, throttle enqueueing to interactive-only, add WorkerPal capacity until idle ≥ 6 total again, and watch `jobPendingSnapshot` for stalls. |
+| **Incident** | `queue_p95` ≥ 2.0 s, or queue depth > 60 for 5 polls, or idle workers < 6 total for 5 polls. | Page RemoteBuddy Platform + WorkerPals Runtime, freeze background traffic, and post 15 min updates until `queue_p95` < 1.0 s and idle ≥ 6 total for two consecutive polls. |
+<!-- QUEUE_GUARDRAILS_TABLE:end -->
 
 | Signal | Warning (Slack) | Paging (PagerDuty) | Expectation |
 | --- | --- | --- | --- |
-| `queue_p95` 15 min rolling | ≥ 1.5 s sustained for 2 minutes → Grafana alert `queue_p95_spike_warning` posts in `#pushpals-ops` and tags `@remote-queue-oc`. | ≥ 2.0 s for 5 minutes → `queue_p95_sustained` pages the **RemoteBuddy Platform** schedule and mirrors the message into `#pushpals-ops`. | Acknowledge in ≤5 minutes, start mitigation, post status thread until resolved. |
-| Interactive backlog (`requests.pending.interactive`) | > 40 requests for 3 consecutive polls → Slack reminder in `#pushpals-ops`. | > 60 requests or any request older than 10 minutes → auto-page RemoteBuddy Platform on-call. | Throttle new background/eval traffic within 5 minutes, document deferrals. |
-| Worker idle slots | < 2 idle workers per queue lane for 3 polls → Slack ping to `@workerpals-oc`. | ≤ 1 idle worker across cluster for 5 minutes → WorkerPals Runtime schedule secondary page. | Add capacity or shed load before queue wait breaches escalate further. |
+| `queue_p95` 15 min rolling | Guardrail **Warning** band → `queue_p95` 1.0–1.5 s for ≥ 3 `/system/status` polls (~6 min) or `pendingInteractive` ≥ 15; Grafana alert `queue_p95_spike_warning` posts in `#pushpals-ops` and tags `@remote-queue-oc`. | Guardrail **Degradation/Incident** bands → `queue_p95` ≥ 1.5 s for ≥ 5 min, `pendingInteractive` ≥ 30, queue depth > 60 while idle workers stay < 6 total, or idle workers < 6 total for 5 polls; triggers PagerDuty **RemoteBuddy Platform** and mirrors into Slack. | Acknowledge in ≤5 minutes, start mitigation, post status thread until resolved. |
+| Interactive backlog (`queues.requestPriorities.interactive`) | ≥ 15 requests for 3 consecutive polls (part of the guardrail **Warning** band) → Slack reminder in `#pushpals-ops`. | ≥ 30 requests for ≥ 5 minutes (guardrail **Degradation** trigger) or queue depth > 60 while idle < 6 total → auto-page RemoteBuddy Platform on-call. | Throttle new background/eval traffic within 5 minutes, document deferrals. |
+| Worker idle slots | Idle workers < 6 total for 3 polls (guardrail **Warning** band) → Slack ping to `@workerpals-oc`. | Idle workers < 6 total for 5 polls (guardrail **Incident** trigger) → WorkerPals Runtime schedule secondary page. | Add capacity or shed load before queue wait breaches escalate further. |
 
 ### Alert routing
 
@@ -55,7 +68,7 @@ Need a concrete walkthrough of how a user request flows across LocalBuddy, Remot
 6. **Communicate + document**: Update `#pushpals-ops` thread every 15 minutes while p95 ≥ 1.5 s,
    note which mitigations ran, and log outstanding risks. Capture the `/system/status` snapshot in
    the PagerDuty incident.
-7. **Escalate quickly**: If queue_p95 stays ≥ 2.0 s or backlog > 60 requests for 10 minutes despite
+7. **Escalate quickly**: If `queue_p95` stays ≥ 1.5 s or backlog ≥ 30 requests for 10 minutes despite
    actions above, escalate to the Reliability Lead and broaden comms (status page / leadership DM).
 
 ## Owners and Escalation Path
@@ -81,8 +94,8 @@ Complete these steps before the rotation changes (or midway if relief arrives du
    clearly assigned for follow-up.
 4. List outstanding remediation items (e.g., “restart workerpals-west-02 when back online” or
    “rebuild docker base image once registry maintenance ends”) and tag owners.
-5. Verify WorkerPals logs are clean (no active crash loops) and `/workers` shows ≥2 idle workers per
-   queue lane; if not, explain why and who is handling it.
+5. Verify WorkerPals logs are clean (no active crash loops) and `/workers` shows ≥ 6 idle workers
+   total (≈ 2 per lane); if not, explain why and who is handling it.
 6. Ensure `apps/remotebuddy/docs/queue-playbook.md` notes are still accurate if new fixes were added;
    open a follow-up task if documentation drifted.
 7. Transfer auth context: confirm the incoming on-call has the current `PUSHPALS_AUTH_TOKEN` and access

@@ -19,7 +19,7 @@ safe and auditable.
 | Minute | Owner | Action | Evidence to capture |
 | --- | --- | --- | --- |
 | 0 | Platform on-call | Confirm repo state + config parity (`git status`, `config/*.toml`). | Screenshot or paste of clean diff summary. |
-| 2 | Server on-call | Start Server + WorkerPals lanes; watch `/system/status`. | `curl .../system/status` JSON snippet with worker idle counts. |
+| 2 | Server on-call | Start Server + WorkerPals lanes; watch `/system/status`. | `curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" $SERVER/system/status \| jq '{queue_p95: .slo.requests.queueWaitMs.p95, pendingInteractive: .queues.requestPriorities.interactive, jobPendingSnapshot: .queues.jobPendingSnapshot, idleWorkers: .workers.idle}'` snapshot with worker idle counts. |
 | 5 | RemoteBuddy on-call | Launch RemoteBuddy process with `PUSHPALS_AUTH_TOKEN` loaded. | Process log tail sent to `#pushpals-ops`. |
 | 7 | Platform on-call | Perform telemetry gates (table below). | Grafana snapshot + Alertmanager screenshot. |
 | 10 | RemoteBuddy on-call | Run verification RPC + synthetic end-to-end request. | `request_id` link + resulting transcript. |
@@ -39,10 +39,10 @@ startup can reference a single source of truth.
 2. **Server**
    - Command: `PUSHPALS_AUTH_TOKEN=... bun run server:only --env-file .env`.
    - Health: `curl -sf http://localhost:3001/healthz` returns `ok` within 2 seconds.
-   - Metrics: `/system/status` shows `queues.requests.pending` ≤ 5 per lane.
+   - Metrics: `/system/status` shows `queues.requestPriorities` (focus on `pendingInteractive`) ≤ 5 per lane.
 3. **WorkerPals**
    - Command: `PUSHPALS_AUTH_TOKEN=... bun run workerpals:only -- --lanes interactive=4,normal=2,background=1`.
-   - Confirm `worker_idle_slots` ≥ 3 per lane for two consecutive polls.
+   - Confirm `/system/status.workers.idle` ≥ 6 (≈ 2 per lane) for two consecutive polls.
    - Watch Worker Backends Latency dashboard for RPC spikes.
 4. **RemoteBuddy**
    - Command: `PUSHPALS_AUTH_TOKEN=... bun run remotebuddy:only`.
@@ -55,9 +55,9 @@ startup can reference a single source of truth.
 
 | Signal | Pass criteria | Source or command | Rollback / block trigger |
 | --- | --- | --- | --- |
-| Remote queue latency `queue_p95` (interactive, 5 min) | ≤ 0.65 s while traffic ≤ 35 RPS. | Grafana › RemoteBuddy Queue Overview › `queue_p95`. | ≥ 0.8 s for 5 min or upward trend immediately after RemoteBuddy launch. Roll back to previous build or pause RemoteBuddy start. |
-| Pending interactive requests | < 10 steady; zero monotonic growth. | `/system/status` → `queues.requests.pending`. | ≥ 15 pending with flat traffic: stop RemoteBuddy and re-check WorkerPals allocation. |
-| Worker idle slots | ≥ 3 per lane; no `busy` workers > queue budget. | Worker Backends Latency dashboard + `/system/status.workers`. | ≤ 1 idle slot for 3 polls: tear down RemoteBuddy, scale WorkerPals up, retry. |
+| Remote queue latency `queue_p95` (interactive, 5 min) | ≤ 1.0 s while traffic ≤ 35 RPS. | Grafana › RemoteBuddy Queue Overview › `queue_p95`. | ≥ 1.5 s for 5 min **or** queue depth > 60 / idle workers < 6 total for 5 polls: roll back to the previous build or pause RemoteBuddy start. |
+| Pending interactive requests | < 10 steady; zero monotonic growth. | `/system/status` → `queues.requestPriorities.interactive` (`pendingInteractive`). | ≥ 15 pending with flat traffic: stop RemoteBuddy and re-check WorkerPals allocation. |
+| Worker idle slots | ≥ 6 total (≈ 2 per lane); no `busy` workers > queue budget. | Worker Backends Latency dashboard + `/system/status.workers`. | < 6 idle workers for 5 polls: tear down RemoteBuddy, scale WorkerPals up, retry. |
 | Synthetic probe `probe.remote_startup` | < 700 ms, 0 drops in 10 samples. | Grafana › Synthetic Probes › `probe.remote_startup`. | ≥ 850 ms or probe failures: roll back RemoteBuddy or mute traffic sources. |
 | Alertmanager `remote-*` group | No active warning/page alerts. | Alertmanager quick view filtered by `remote`. | Any warning still firing after dependency start: block startup until cleared. |
 
@@ -98,7 +98,7 @@ Trigger any of the actions below and immediately follow the recorded rollback pr
 
 - Telemetry gate fails for two consecutive polls (≈5 minutes) after RemoteBuddy launch.
 - Startup logs show `worker lease lost` or `planner panic` twice in 10 minutes.
-- `/system/status` pending counts grow ≥ 20 despite idle slots being ≥ 5 (indicates logic regressions).
+- `/system/status` pending counts grow ≥ 20 despite `workers.idle` staying ≥ 6 (indicates logic regressions).
 - Synthetic probe uptime < 95% over the first 15 minutes of traffic.
 - Alertmanager escalates (`remote_startup_page` or `worker_idle_global_page`) before verification ends.
 

@@ -8,6 +8,19 @@ high-severity incidents; this playbook documents how to stay inside the low-load
 sources back each lever, and the exact rollback plus follow-up actions so the low-load reference
 remains single-sourced.
 
+## Canonical queue + idle guardrails
+
+Copied verbatim from `apps/remotebuddy/README.md`. Update this once and propagate to every queue doc.
+
+<!-- QUEUE_GUARDRAILS_TABLE:start -->
+| Band | Conditions (observed via `/system/status`) | Operator action |
+| --- | --- | --- |
+| **Healthy** | `queue_p95` ≤ 1.0 s, pending interactive < 10, and idle workers ≥ 6 total (≈ 2 per lane via `.workers.idle`). | Keep `/system/status` tailing hourly; capture baseline snapshots once per shift. |
+| **Warning** | `queue_p95` 1.0–1.5 s for ≥ 3 polls, or pending interactive ≥ 15 for ≥ 3 polls, or idle workers < 6 total for 3 polls. | Trigger queue-playbook diagnostics, pause background/eval submissions, and confirm queue automation already injected remediation jobs. |
+| **Degradation** | `queue_p95` ≥ 1.5 s for ≥ 5 min, or pending interactive ≥ 30, or queue depth > 60 while idle workers stay < 6 total. | Announce in `#pushpals-ops`, throttle enqueueing to interactive-only, add WorkerPal capacity until idle ≥ 6 total again, and watch `jobPendingSnapshot` for stalls. |
+| **Incident** | `queue_p95` ≥ 2.0 s, or queue depth > 60 for 5 polls, or idle workers < 6 total for 5 polls. | Page RemoteBuddy Platform + WorkerPals Runtime, freeze background traffic, and post 15 min updates until `queue_p95` < 1.0 s and idle ≥ 6 total for two consecutive polls. |
+<!-- QUEUE_GUARDRAILS_TABLE:end -->
+
 ## Baseline + Thresholds (23–24 Feb 2026 low-load window)
 
 The table below is the only authoritative baseline and threshold reference. It combines the
@@ -16,9 +29,9 @@ not maintain duplicate bullet lists elsewhere—update this table when baselines
 
 | Signal | Baseline (23–24 Feb) | Warning threshold + sources | Rollback trigger + sources |
 | --- | --- | --- | --- |
-| `queue_p95` (interactive, 15 min rollup) | 0.533 s ± 0.075 s with ≤ 35 interactive RPS and ≤ 10 eval/background RPS. | ≥ 0.8 s for ≥ 5 min without matching traffic.<br>• Grafana panel — [RemoteBuddy Queue Overview › `queue_p95`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=queue_p95)<br>• Alert rule — [`queue_p95_spike_warning`](alertmanager://remote-buddy-platform/rules/queue_p95_spike_warning)<br>• PromQL — [`histogram_quantile(0.95,sum(rate(remote_queue_wait_ms_bucket{lane="interactive"}[15m])))`](promql://remote_queue_wait_ms_bucket/p95-interactive)<br>• Evidence (2026‑02‑24 00:45 UTC) — [Grafana snapshot](grafana://snapshots/remotebuddy-queue/low-load-20260224T0045Z) | ≥ 0.9 s for ≥ 5 min or ± > 75 ms jitter immediately after a lever change.<br>• Grafana panel — [RemoteBuddy Queue Overview › `queue_p95`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=queue_p95)<br>• Alert rule — [`queue_p95_sustained`](alertmanager://remote-buddy-platform/rules/queue_p95_sustained)<br>• PromQL — [`stddev_over_time(remote_queue_wait_ms_bucket{lane="interactive"}[15m])`](promql://remote_queue_wait_ms_bucket/stddev)<br>• Evidence (2026‑02‑24 00:45 UTC) — [Grafana snapshot](grafana://snapshots/remotebuddy-queue/low-load-20260224T0045Z) |
-| Pending interactive requests (`requests.pending.interactive`) | < 10 per lane steady state. | > 15 for 3 polls (~6 min) while traffic remains ≤ 35 RPS.<br>• Grafana panel — [`requests_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=requests_pending)<br>• Alert rule — [`queue_pending_interactive_warning`](alertmanager://remote-buddy-platform/rules/queue_pending_interactive_warning)<br>• PromQL — [`sum(queues_requests_pending{priority="interactive"})`](promql://queues_requests_pending/interactive)<br>• Evidence (2026‑02‑24 00:55 UTC) — [Slack ops log](slack://channel/queue_p95_spike_warning/p/202602240055) | ≥ 20 or any interactive wait > 2 min; revert the last lever immediately.<br>• Grafana panel — [`requests_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=requests_pending)<br>• Alert rule — [`queue_pending_interactive_page`](alertmanager://remote-buddy-platform/rules/queue_pending_interactive_page)<br>• PromQL — [`sum(queues_requests_pending{priority="interactive"})`](promql://queues_requests_pending/interactive)<br>• Evidence (2026‑02‑24 00:55 UTC) — [Slack ops log](slack://channel/queue_p95_spike_warning/p/202602240055) |
-| Worker idle slots (per lane) | ≥ 3 idle workers per lane; no worker stuck `busy` beyond queue budget. | < 3 idle workers for 3 consecutive `/system/status` polls.<br>• API — [/system/status `queues.requestPendingSnapshot` + `workers`](runbook://server/system-status#queues)<br>• Grafana panel — [Worker Backends Latency › `idle_slots`](grafana://d/worker-backends/latency?viewPanel=idle_slots)<br>• Alert rule — [`worker_idle_lane_warning`](alertmanager://workerpals-runtime/rules/worker_idle_lane_warning)<br>• PromQL — [`sum(remote_worker_idle_slots{lane=~"interactive\|background"})`](promql://remote_worker_idle_slots/sum)<br>• Evidence (2026‑02‑24 01:00 UTC) — [PagerDuty incident PD-REMOTE-2026-02-24-01](pagerduty://incidents/PD-REMOTE-2026-02-24-01) | ≤ 1 idle worker cluster-wide for ≥ 5 min or automation fails to recover idle slots.<br>• Grafana panel — [Worker Backends Latency › `idle_slots`](grafana://d/worker-backends/latency?viewPanel=idle_slots)<br>• Alert rule — [`worker_idle_global_page`](alertmanager://workerpals-runtime/rules/worker_idle_global_page)<br>• PromQL — [`sum(remote_worker_idle_slots{lane=~"interactive\|background"})`](promql://remote_worker_idle_slots/sum)<br>• Evidence (2026‑02‑24 01:00 UTC) — [PagerDuty incident PD-REMOTE-2026-02-24-01](pagerduty://incidents/PD-REMOTE-2026-02-24-01) |
+| `queue_p95` (interactive, 15 min rollup) | 0.533 s ± 0.075 s with ≤ 35 interactive RPS and ≤ 10 eval/background RPS. | Guardrail **Warning** row — see `QUEUE_GUARDRAILS_TABLE` (`queue_p95` 1.0–1.5 s for ≥ 3 polls or `pendingInteractive` ≥ 15).<br>• Grafana panel — [RemoteBuddy Queue Overview › `queue_p95`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=queue_p95)<br>• Alert rule — [`queue_p95_spike_warning`](alertmanager://remote-buddy-platform/rules/queue_p95_spike_warning)<br>• PromQL — [`histogram_quantile(0.95,sum(rate(remote_queue_wait_ms_bucket{lane="interactive"}[15m])))`](promql://remote_queue_wait_ms_bucket/p95-interactive)<br>• Evidence (2026‑02‑24 00:45 UTC) — [Grafana snapshot](grafana://snapshots/remotebuddy-queue/low-load-20260224T0045Z) | Guardrail **Degradation/Incident** rows — see `QUEUE_GUARDRAILS_TABLE` (`queue_p95` ≥ 1.5 s for ≥ 5 min, queue depth > 60, or idle workers < 6 total for 5 polls).<br>• Grafana panel — [RemoteBuddy Queue Overview › `queue_p95`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=queue_p95)<br>• Alert rule — [`queue_p95_sustained`](alertmanager://remote-buddy-platform/rules/queue_p95_sustained)<br>• PromQL — [`stddev_over_time(remote_queue_wait_ms_bucket{lane="interactive"}[15m])`](promql://remote_queue_wait_ms_bucket/stddev)<br>• Evidence (2026‑02‑24 00:45 UTC) — [Grafana snapshot](grafana://snapshots/remotebuddy-queue/low-load-20260224T0045Z) |
+| Pending interactive requests (`pendingInteractive` / `.queues.requestPriorities.interactive`) | < 10 total steady state. | Guardrail **Warning** row — see `QUEUE_GUARDRAILS_TABLE` (`pendingInteractive` ≥ 15 for ≥ 3 polls).<br>• Grafana panel — [`requests_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=requests_pending)<br>• Alert rule — [`queue_pending_interactive_warning`](alertmanager://remote-buddy-platform/rules/queue_pending_interactive_warning)<br>• PromQL — [`sum(queues_requests_pending{priority="interactive"})`](promql://queues_requests_pending/interactive)<br>• Evidence (2026‑02‑24 00:55 UTC) — [Slack ops log](slack://channel/queue_p95_spike_warning/p/202602240055) | Guardrail **Degradation/Incident** rows — see `QUEUE_GUARDRAILS_TABLE` (`pendingInteractive` ≥ 30 for ≥ 5 min or queue depth > 60 while idle workers stay < 6 total).<br>• Grafana panel — [`requests_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=requests_pending)<br>• Alert rule — [`queue_pending_interactive_page`](alertmanager://remote-buddy-platform/rules/queue_pending_interactive_page)<br>• PromQL — [`sum(queues_requests_pending{priority="interactive"})`](promql://queues_requests_pending/interactive)<br>• Evidence (2026‑02‑24 00:55 UTC) — [Slack ops log](slack://channel/queue_p95_spike_warning/p/202602240055) |
+| Worker idle slots (`/system/status.workers.idle`) | ≥ 6 idle workers total (≈ 2 per lane); no worker stuck `busy` beyond queue budget. | Guardrail **Warning** row — see `QUEUE_GUARDRAILS_TABLE` (idle workers < 6 total for 3 polls).<br>• API — [/system/status `queues.requestPriorities` + `workers`](runbook://server/system-status#queues)<br>• Grafana panel — [Worker Backends Latency › `idle_slots`](grafana://d/worker-backends/latency?viewPanel=idle_slots)<br>• Alert rule — [`worker_idle_lane_warning`](alertmanager://workerpals-runtime/rules/worker_idle_lane_warning)<br>• PromQL — [`sum(remote_worker_idle_slots{lane=~"interactive\|background"})`](promql://remote_worker_idle_slots/sum)<br>• Evidence (2026‑02‑24 01:00 UTC) — [PagerDuty incident PD-REMOTE-2026-02-24-01](pagerduty://incidents/PD-REMOTE-2026-02-24-01) | Guardrail **Incident** row — see `QUEUE_GUARDRAILS_TABLE` (idle workers < 6 total for 5 polls while queue depth > 60).<br>• Grafana panel — [Worker Backends Latency › `idle_slots`](grafana://d/worker-backends/latency?viewPanel=idle_slots)<br>• Alert rule — [`worker_idle_global_page`](alertmanager://workerpals-runtime/rules/worker_idle_global_page)<br>• PromQL — [`sum(remote_worker_idle_slots{lane=~"interactive\|background"})`](promql://remote_worker_idle_slots/sum)<br>• Evidence (2026‑02‑24 01:00 UTC) — [PagerDuty incident PD-REMOTE-2026-02-24-01](pagerduty://incidents/PD-REMOTE-2026-02-24-01) |
 | Job failures (`queues.jobPendingSnapshot.failed`) | 0 failures, 0 worker retry bursts. | Any increment > 0 or retries > 3/min tied to tuning.<br>• Grafana panel — [`jobs_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=jobs_pending)<br>• Alert rule — [`queue_job_failure_warning`](alertmanager://remote-buddy-platform/rules/queue_job_failure_warning)<br>• PromQL — [`sum(rate(remote_jobs_failed_total[5m]))`](promql://remote_jobs_failed_total/rate)<br>• Evidence (2026‑02‑24 01:05 UTC) — [WorkerPals log bundle](s3://pushpals-ops/queue-low-load/workerpals-20260224T0105Z.log) | Failure rate ≥ 0.5/min or alert reopens twice within 30 min for the same knob.<br>• Grafana panel — [`jobs_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=jobs_pending)<br>• Alert rule — [`queue_job_failure_page`](alertmanager://remote-buddy-platform/rules/queue_job_failure_page)<br>• PromQL — [`sum(rate(remote_jobs_failed_total[5m]))`](promql://remote_jobs_failed_total/rate)<br>• Evidence (2026‑02‑24 01:05 UTC) — [WorkerPals log bundle](s3://pushpals-ops/queue-low-load/workerpals-20260224T0105Z.log) |
 | Synthetic probe latency (`probe.queue_lowload`) | < 550 ms round-trip, 0 drops per 20 samples. | ≥ 650 ms for 2 probes or 1 drop/20 samples.<br>• Grafana panel — [Synthetic Queue Probes › `queue_lowload`](grafana://d/remotebuddy-synth/probe?viewPanel=queue_lowload)<br>• Alert rule — [`probe_queue_lowload_warning`](alertmanager://remote-buddy-platform/rules/probe_queue_lowload_warning)<br>• PromQL — [`avg_over_time(probe_queue_lowload_latency_ms[10m])`](promql://probe_queue_lowload_latency_ms/avg)<br>• Evidence (2026‑02‑24 00:40 UTC) — [Probe export](notion://pushpals/ops-journal/remote-queue-low-load-2026-02-24#probe) | ≥ 750 ms or ≥ 2 drops/20 → roll back the last lever and re-check upstream dependencies.<br>• Grafana panel — [Synthetic Queue Probes › `queue_lowload`](grafana://d/remotebuddy-synth/probe?viewPanel=queue_lowload)<br>• Alert rule — [`probe_queue_lowload_page`](alertmanager://remote-buddy-platform/rules/probe_queue_lowload_page)<br>• PromQL — [`avg_over_time(probe_queue_lowload_latency_ms[10m])`](promql://probe_queue_lowload_latency_ms/avg)<br>• Evidence (2026‑02‑24 00:40 UTC) — [Probe export](notion://pushpals/ops-journal/remote-queue-low-load-2026-02-24#probe) |
 
@@ -33,7 +46,7 @@ set of numbers.
 | Grafana › RemoteBuddy Queue Overview | `queue_p95`, `requests_pending`, `jobs_pending`, backlog shape. | Pin last 15 min vs 24 h, export snapshot links for the table above. |
 | Grafana › Worker Backends Latency | Worker RPC p95/p99, upstream saturation, idle slots. | Confirms whether queue inflation started upstream before spending time on WorkerPals. |
 | Alertmanager quick view | Active `queue_*`, `worker_idle_*`, probe alerts. | Link alerts to the threshold table row when posting in `#pushpals-ops`. |
-| Server `/system/status` API | `queues.requestPendingSnapshot`, `queues.jobPendingSnapshot`, worker idle counts, SLO digests. | `curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \| jq '{queues, slo}'` |
+| Server `/system/status` API | `queues.requestPriorities`, `queues.jobPendingSnapshot`, worker idle counts, SLO digests. | `curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \| jq '{queue_p95: .slo.requests.queueWaitMs.p95, pendingInteractive: .queues.requestPriorities.interactive, jobPendingSnapshot: .queues.jobPendingSnapshot, idleWorkers: .workers.idle}'` |
 | Client Ops board (`bun run client:only` → Ops tab) | Real-time ETA overlay + retry notifications. | Use when deciding whether to pause background/eval submissions. |
 | WorkerPals logs (`bun run workerpals:only[:docker] -- --tail`) | `task.execute` retries, wrapper timeouts, stuck workers. | Combine with `/workers` heartbeat to prove capacity additions had effect. |
 
@@ -57,7 +70,7 @@ entry point before diving into the per-lever procedures.
 - Owner: WorkerPals Runtime ([Slack `@workerpals-oc`](slack://user/@workerpals-oc), [PagerDuty WorkerPals Runtime](pagerduty://schedules/workerpals-runtime)).
 - How to:
   1. Launch one extra worker per stressed lane: `PUSHPALS_AUTH_TOKEN=… bun run workerpals:only -- --lanes interactive=4,normal=2,background=1` (increase/decrease counts symmetrically).
-  2. Confirm `/system/status` shows ≥ 3 idle slots per lane before ending the change.
+  2. Confirm `/system/status.workers.idle` shows ≥ 6 idle slots total (≈ 2 per lane) before ending the change.
   3. Document the invocation + timestamp in the on-call thread so rollback just reverses the same command.
 
 ### 2. Lane throttles (background/eval deferral)
@@ -74,7 +87,7 @@ entry point before diving into the per-lever procedures.
        -d '{"prompt":"pause background","priority":"background","forceLane":"worker","forceWorker":true,"metadata":{"throttle":"queue-low-load"}}'
      ```
 
-  2. If LocalBuddy is injecting traffic, toggle its Admin throttle to `interactive-only` and note when you resume (5-job increments once `queue_p95` ≤ 0.6 s).
+  2. If LocalBuddy is injecting traffic, toggle its Admin throttle to `interactive-only` and note when you resume (5-job increments once `queue_p95` ≤ 1.0 s).
   3. Keep a list of deferred job IDs in the incident thread so they can be replayed once the queue stabilizes.
 
 ### 3. Deterministic lane prefetch toggle
@@ -102,7 +115,7 @@ entry point before diving into the per-lever procedures.
 - How to:
   1. If interactive latency creeps upward despite low backlog, temporarily bump the interactive SLA by editing `JOB_PRIORITY_QUEUE_SLA_MS.interactive` and restarting the server: `bun run server:only --env-file .env`.
   2. Keep the change local (commitless) and note the diff/sha in the ops thread.
-  3. Roll back by re-checking the file from `main` or via the rollback procedure below as soon as p95 returns < 0.7 s.
+  3. Roll back by re-checking the file from `main` or via the rollback procedure below as soon as p95 returns < 1.0 s.
 
 ## On-call response flow
 
@@ -110,7 +123,7 @@ entry point before diving into the per-lever procedures.
 2. **Confirm traffic really is “low-load”** (≤ 35 interactive RPS, ≤ 10 eval/background RPS). If the traffic window is higher, switch to the primary incident guide in `apps/remotebuddy/docs/queue.md`.
 3. **Pick exactly one lever** from the section above, tag the owner listed for that lever, and record the command/override you applied in the thread together with the evidence links used for the decision.
 4. **Measure for three intervals** (minimum 5 minutes) before stacking another change. If a rollback trigger hits, jump directly to the rollback procedure instead of experimenting further.
-5. **Escalate** when `queue_p95` ≥ 0.9 s or idle slots fall below the rollback trigger even after undoing the most recent change; page RemoteBuddy Platform first, then WorkerPals Runtime if capacity is at fault.
+5. **Escalate** when `queue_p95` ≥ 1.5 s or idle slots fall below the rollback trigger even after undoing the most recent change; page RemoteBuddy Platform first, then WorkerPals Runtime if capacity is at fault.
 
 ## Rollback procedure (config + deployment)
 
@@ -121,7 +134,7 @@ When a rollback trigger fires, stop changing levers and follow these reproducibl
 ```bash
 git status --short config/default.toml config/local.toml
 curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \
-  | jq '{queue_p95: .slo.requests.queueWaitMs, pending: .queues.requests.pending, idle: .workers.idle}'
+  | jq '{queue_p95: .slo.requests.queueWaitMs.p95, pendingInteractive: .queues.requestPriorities.interactive, jobPendingSnapshot: .queues.jobPendingSnapshot, idleWorkers: .workers.idle}'
 ```
 
 1. Discover and select the last known-good tag. Pick the newest `remotebuddy-queue-lowload-*` tag that predates the current incident window and matches the evidence timestamps in the baseline table:
@@ -149,19 +162,31 @@ curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/s
    git checkout $RB_QUEUE_TAG -- config/local.toml 2>/dev/null || true
    ```
 
-4. Restart the services so the restored config applies:
+4. Restart the dependencies (Server + WorkerPals) so the restored config applies before touching RemoteBuddy:
 
    ```bash
    bun run server:only > /tmp/server.log 2>&1 &
-   bun run remotebuddy:only > /tmp/remotebuddy.log 2>&1 &
    bun run workerpals:only:docker > /tmp/workerpals.log 2>&1 &
+   ```
+
+5. **Non-runtime preflight checks (keep RemoteBuddy stopped):**
+
+   ```bash
+   bun run docs:validate
+   PUSHPALS_AUTH_TOKEN=$PUSHPALS_AUTH_TOKEN bun run smoke
+   ```
+
+6. **Start RemoteBuddy (runtime) as its own execution step** so the fresh config + preflight results stay auditable:
+
+   ```bash
+   PUSHPALS_AUTH_TOKEN=$PUSHPALS_AUTH_TOKEN bun run remotebuddy
    ```
 
 **Post-checks (prove rollback succeeded before closing the loop)**
 
 ```bash
 curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \
-  | jq '{queue_p95: .slo.requests.queueWaitMs, pending: .queues.requests.pending, idle: .workers.idle}'
+  | jq '{queue_p95: .slo.requests.queueWaitMs.p95, pendingInteractive: .queues.requestPriorities.interactive, jobPendingSnapshot: .queues.jobPendingSnapshot, idleWorkers: .workers.idle}'
 ```
 
 5. Post the tag, command log, and `/system/status` snapshot in the PagerDuty incident + `#pushpals-ops` thread.
