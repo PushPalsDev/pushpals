@@ -28,6 +28,7 @@ import type { ThemeModeOption } from "../src/components/ModeSwitcher";
 import { RequestsPane } from "../src/components/RequestsPane";
 import { SegmentedTabs } from "../src/components/SegmentedTabs";
 import { SystemPane } from "../src/components/SystemPane";
+import { ConfigPane } from "../src/components/ConfigPane";
 import { usePushPalsSession } from "../src/lib/usePushPalsSession";
 import {
   type CompletionSnapshotRow,
@@ -48,7 +49,7 @@ const DEFAULT_BASE = process.env.EXPO_PUBLIC_PUSHPALS_URL ?? "http://localhost:3
 const AUTH_TOKEN = process.env.EXPO_PUBLIC_PUSHPALS_AUTH_TOKEN;
 const POLL_INTERVAL_MS = 4000;
 
-type UiTab = "coordination" | "chat" | "requests" | "jobs" | "system";
+type UiTab = "coordination" | "chat" | "requests" | "jobs" | "system" | "config";
 
 function createTheme(mode: ResolvedMode): DashboardTheme {
   if (mode === "dark") {
@@ -375,6 +376,7 @@ export default function DashboardScreen() {
       { id: "requests" as const, label: "Requests", count: requests.length },
       { id: "jobs" as const, label: "Jobs & Traces", count: session.state.jobs.size },
       { id: "system" as const, label: "System", count: workers.length },
+      { id: "config" as const, label: "Config" },
     ],
     [
       coordinationRows.length,
@@ -547,6 +549,9 @@ export default function DashboardScreen() {
                   systemSummary={systemSummary}
                   lastRefresh={lastRefresh}
                 />
+              ) : null}
+              {activeTab === "config" ? (
+                <ConfigPane baseUrl={DEFAULT_BASE} authToken={AUTH_TOKEN} theme={theme} />
               ) : null}
             </Animated.View>
           </Animated.View>

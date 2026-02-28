@@ -475,6 +475,28 @@ export interface SystemStatusSummary {
   ts?: string;
 }
 
+export interface RuntimeConfigMutation {
+  scope: "env" | "toml";
+  key: string;
+  value: unknown;
+}
+
+export interface RuntimeConfigSnapshot {
+  config: Record<string, unknown>;
+  files?: {
+    envPath?: string;
+    localTomlPath?: string;
+  };
+}
+
+export interface RuntimeConfigUpdateResult extends RuntimeConfigSnapshot {
+  applied: RuntimeConfigMutation[];
+  warnings: string[];
+  touchedFiles: string[];
+  restartRequired: boolean;
+  restartRequiredKeys: string[];
+}
+
 function authHeaders(authToken?: string): Record<string, string> {
   const headers: Record<string, string> = {};
   if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
@@ -614,6 +636,73 @@ export async function fetchSystemStatus(
   } catch (err) {
     console.error("Error fetching system status:", err);
     return {};
+  }
+}
+
+export async function fetchRuntimeConfig(
+  baseUrl: string,
+  authToken?: string,
+): Promise<RuntimeConfigSnapshot | null> {
+  try {
+    const response = await fetch(`${baseUrl}/config/runtime`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      config?: Record<string, unknown>;
+      files?: { envPath?: string; localTomlPath?: string };
+    };
+    if (!payload || typeof payload !== "object" || !payload.config) return null;
+    return {
+      config: payload.config,
+      files: payload.files,
+    };
+  } catch (err) {
+    console.error("Error fetching runtime config:", err);
+    return null;
+  }
+}
+
+export async function updateRuntimeConfig(
+  baseUrl: string,
+  updates: RuntimeConfigMutation[],
+  authToken?: string,
+): Promise<RuntimeConfigUpdateResult | null> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+    const response = await fetch(`${baseUrl}/config/runtime`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ updates }),
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      config?: Record<string, unknown>;
+      files?: { envPath?: string; localTomlPath?: string };
+      applied?: RuntimeConfigMutation[];
+      warnings?: string[];
+      touchedFiles?: string[];
+      restartRequired?: boolean;
+      restartRequiredKeys?: string[];
+    };
+    if (!payload || typeof payload !== "object" || !payload.config) return null;
+    return {
+      config: payload.config,
+      files: payload.files,
+      applied: Array.isArray(payload.applied) ? payload.applied : [],
+      warnings: Array.isArray(payload.warnings) ? payload.warnings : [],
+      touchedFiles: Array.isArray(payload.touchedFiles) ? payload.touchedFiles : [],
+      restartRequired: Boolean(payload.restartRequired),
+      restartRequiredKeys: Array.isArray(payload.restartRequiredKeys)
+        ? payload.restartRequiredKeys.map((entry) => String(entry))
+        : [],
+    };
+  } catch (err) {
+    console.error("Error updating runtime config:", err);
+    return null;
   }
 }
 

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "crypto";
-import { loadPushPalsConfig } from "shared";
+import { loadPushPalsConfig, type PushPalsConfig } from "shared";
 import {
   makePatternKey,
   normalizePenalties,
@@ -383,7 +383,9 @@ function validateAnswerAgainstSchema(
 
 export class AutonomyStore {
   private readonly db: Database;
-  private readonly config = loadPushPalsConfig();
+  private get config(): PushPalsConfig {
+    return loadPushPalsConfig();
+  }
   private readonly alpha = 0.2;
 
   constructor(dbPath: string) {

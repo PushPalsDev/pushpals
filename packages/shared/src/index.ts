@@ -31,6 +31,7 @@ export {
   type ResolveGitTokenOptions,
 } from "./git_backend.js";
 export {
+  invalidatePushPalsConfigCache,
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
   type PushPalsConfig,

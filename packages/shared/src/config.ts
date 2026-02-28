@@ -259,6 +259,11 @@ interface LoadOptions {
 let cachedConfig: PushPalsConfig | null = null;
 let cachedConfigKey = "";
 
+export function invalidatePushPalsConfigCache(): void {
+  cachedConfig = null;
+  cachedConfigKey = "";
+}
+
 function firstNonEmpty(...values: Array<string | null | undefined>): string {
   for (const value of values) {
     const trimmed = (value ?? "").trim();

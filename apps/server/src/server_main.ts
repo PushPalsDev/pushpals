@@ -7,18 +7,26 @@ import { AutonomyStore } from "./autonomy.js";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import {
+  invalidatePushPalsConfigCache,
   inferGitBackendFromRemote,
   loadPushPalsConfig,
+  sanitizePushPalsConfigForLogging,
   sanitizeGitRemoteUrl,
   toGitHubRepoWebUrl,
 } from "shared";
+import {
+  applyRuntimeConfigMutations,
+  describeRuntimeConfigFiles,
+  getRuntimeConfigFiles,
+  type RuntimeConfigMutation,
+} from "./runtime_config.js";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
-const CONFIG = loadPushPalsConfig();
-const dataDir = CONFIG.paths.dataDir;
+const STARTUP_CONFIG = loadPushPalsConfig();
+const dataDir = STARTUP_CONFIG.paths.dataDir;
 mkdirSync(dataDir, { recursive: true });
 
-const sharedDbPath = CONFIG.paths.sharedDbPath;
+const sharedDbPath = STARTUP_CONFIG.paths.sharedDbPath;
 const sessionManager = new SessionManager(sharedDbPath);
 const jobQueue = new JobQueue(sharedDbPath);
 const requestQueue = new RequestQueue(sharedDbPath);
@@ -90,15 +98,15 @@ async function getRepoStatusSummary(repoPath: string, remote: string): Promise<R
  */
 
 export function createRequestHandler() {
-  const debugHttpLogs = CONFIG.server.debugHttp;
-  const port = CONFIG.server.port;
-  const staleClaimTtlMs = CONFIG.server.staleClaimTtlMs;
-  const staleClaimSweepIntervalMs = CONFIG.server.staleClaimSweepIntervalMs;
+  const startupConfig = loadPushPalsConfig();
+  const port = startupConfig.server.port;
+  const hostname = startupConfig.server.host;
+  const isDebugHttpLogsEnabled = (): boolean => loadPushPalsConfig().server.debugHttp;
   let lastStaleRecoverySweepAt = 0;
   let isShuttingDown = false;
   return Bun.serve({
     port,
-    hostname: CONFIG.server.host,
+    hostname,
     idleTimeout: 180, // 3 minutes — SSE/WS connections are long-lived
 
     async fetch(req: Request, server): Promise<Response> {
@@ -156,7 +164,29 @@ export function createRequestHandler() {
         }
         return {};
       };
+      const parseRuntimeMutations = (value: unknown): RuntimeConfigMutation[] => {
+        if (!Array.isArray(value)) return [];
+        const out: RuntimeConfigMutation[] = [];
+        for (const entry of value) {
+          if (!entry || typeof entry !== "object") continue;
+          const record = entry as Record<string, unknown>;
+          const scope = String(record.scope ?? "")
+            .trim()
+            .toLowerCase();
+          const key = String(record.key ?? "").trim();
+          if ((scope !== "env" && scope !== "toml") || !key) continue;
+          out.push({
+            scope: scope as "env" | "toml",
+            key,
+            value: record.value,
+          });
+        }
+        return out;
+      };
       const maybeRecoverStaleClaims = (): void => {
+        const runtimeConfig = loadPushPalsConfig();
+        const staleClaimTtlMs = runtimeConfig.server.staleClaimTtlMs;
+        const staleClaimSweepIntervalMs = runtimeConfig.server.staleClaimSweepIntervalMs;
         const nowMs = Date.now();
         if (nowMs - lastStaleRecoverySweepAt < staleClaimSweepIntervalMs) return;
         lastStaleRecoverySweepAt = nowMs;
@@ -229,7 +259,7 @@ export function createRequestHandler() {
             pathname,
           ));
       if (isNoisyPoll) {
-        if (debugHttpLogs) console.log(`[${method}] ${pathname}`);
+        if (isDebugHttpLogsEnabled()) console.log(`[${method}] ${pathname}`);
       } else {
         console.log(`[${method}] ${pathname}`);
       }
@@ -256,6 +286,93 @@ export function createRequestHandler() {
         const reason = compactText(body.reason, 180) || "remote shutdown request";
         initiateShutdown(reason);
         return makeJson({ ok: true, shuttingDown: true, reason }, 202);
+      }
+
+      // GET /config/runtime (auth protected)
+      if (pathname === "/config/runtime" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const runtimeConfig = loadPushPalsConfig({ reload: true });
+        const files = describeRuntimeConfigFiles(getRuntimeConfigFiles(runtimeConfig));
+        return makeJson(
+          {
+            ok: true,
+            config: sanitizePushPalsConfigForLogging(runtimeConfig),
+            files,
+          },
+          200,
+        );
+      }
+
+      // POST /config/runtime (auth protected)
+      if (pathname === "/config/runtime" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const updates = parseRuntimeMutations(body.updates);
+        if (updates.length === 0) {
+          return makeJson(
+            {
+              ok: false,
+              message: "updates must include at least one valid { scope, key, value } entry",
+            },
+            400,
+          );
+        }
+
+        const runtimeConfig = loadPushPalsConfig();
+        const files = getRuntimeConfigFiles(runtimeConfig);
+        const applyResult = applyRuntimeConfigMutations(files, updates);
+
+        // Invalidate + reload so runtime reads pick up file/env changes immediately.
+        invalidatePushPalsConfigCache();
+        const nextConfig = loadPushPalsConfig({ reload: true });
+        sessionManager.authToken = nextConfig.authToken;
+        repoStatusCache = null;
+
+        const restartRequiredPrefixes = [
+          "server.host",
+          "server.port",
+          "paths.data_dir",
+          "paths.shared_db_path",
+          "paths.remotebuddy_db_path",
+          "source_control_manager.repo_path",
+        ];
+        const normalizePathKey = (raw: string): string =>
+          String(raw ?? "")
+            .split(".")
+            .map((segment) =>
+              segment
+                .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+                .replace(/[^A-Za-z0-9_]+/g, "_")
+                .replace(/^_+|_+$/g, "")
+                .toLowerCase(),
+            )
+            .filter(Boolean)
+            .join(".");
+        const restartRequiredFor = applyResult.applied
+          .map((change) => change.key)
+          .filter((key) =>
+            restartRequiredPrefixes.some((prefix) =>
+              normalizePathKey(key) === prefix || normalizePathKey(key).startsWith(`${prefix}.`),
+            ),
+          );
+
+        return makeJson(
+          {
+            ok: true,
+            applied: applyResult.applied,
+            warnings: applyResult.warnings,
+            touchedFiles: applyResult.touchedFiles.map((entry) => entry.replace(/\\/g, "/")),
+            restartRequired: restartRequiredFor.length > 0,
+            restartRequiredKeys: restartRequiredFor,
+            config: sanitizePushPalsConfigForLogging(nextConfig),
+            files: describeRuntimeConfigFiles(files),
+          },
+          200,
+        );
       }
 
       // POST /sessions - Create (or join) a session
@@ -486,9 +603,10 @@ export function createRequestHandler() {
         const denied = requireAuth();
         if (denied) return denied;
         maybeRecoverStaleClaims();
+        const runtimeConfig = loadPushPalsConfig();
         const repo = await getRepoStatusSummary(
-          CONFIG.projectRoot,
-          CONFIG.sourceControlManager.remote,
+          runtimeConfig.projectRoot,
+          runtimeConfig.sourceControlManager.remote,
         );
 
         const ttlMsRaw = parseInt(url.searchParams.get("ttlMs") ?? "", 10);
