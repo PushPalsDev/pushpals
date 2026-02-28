@@ -62,7 +62,7 @@ Usage:
   bun run apps/source_control_manager/src/source_control_manager_main.ts [options]
 
 Options:
-  -r, --repo <path>         Git repository path (default: config/default.toml source_control_manager.repo_path)
+  -r, --repo <path>         Git repository path (default: configs/default.toml source_control_manager.repo_path)
   -s, --server <url>        PushPals server URL (default: http://localhost:3001)
   -p, --port <number>       HTTP status server port (default: 3002)
       --remote <name>       Git remote (default: origin)
@@ -1087,4 +1087,3 @@ main().catch((err) => {
   shutdown();
   process.exit(1);
 });
-

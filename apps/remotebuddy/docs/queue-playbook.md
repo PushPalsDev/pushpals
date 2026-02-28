@@ -45,15 +45,15 @@ entry point before diving into the per-lever procedures.
 
 | Lever / flag | Canonical config path(s) | Owner (Slack / PagerDuty) | Execution entry point |
 | --- | --- | --- | --- |
-| Worker allocation per lane | [`config/default.toml`](../../../config/default.toml) (`[remotebuddy]`, `[workerpals]`); [`apps/workerpals/src/workerpals_main.ts`](../../workerpals/src/workerpals_main.ts) | [Slack `@workerpals-oc`](slack://user/@workerpals-oc) / [PagerDuty WorkerPals Runtime](pagerduty://schedules/workerpals-runtime) | `bun run workerpals:only -- --lanes <lane=m>` (record command) |
+| Worker allocation per lane | [`configs/default.toml`](../../../configs/default.toml) (`[remotebuddy]`, `[workerpals]`); [`apps/workerpals/src/workerpals_main.ts`](../../workerpals/src/workerpals_main.ts) | [Slack `@workerpals-oc`](slack://user/@workerpals-oc) / [PagerDuty WorkerPals Runtime](pagerduty://schedules/workerpals-runtime) | `bun run workerpals:only -- --lanes <lane=m>` (record command) |
 | Lane throttles (background/eval deferral) | [`apps/server/src/requests.ts`](../../server/src/requests.ts); [`apps/remotebuddy/src/remotebuddy_main.ts`](../src/remotebuddy_main.ts) | [Slack `@remote-queue-oc`](slack://user/@remote-queue-oc) / [PagerDuty RemoteBuddy Platform](pagerduty://schedules/remotebuddy-platform) | `curl …/requests/enqueue` to force worker lane; LocalBuddy Admin throttle toggle |
 | Deterministic lane prefetch toggle | [`apps/remotebuddy/src/brain.ts`](../src/brain.ts); [`prompts/remotebuddy/remotebuddy_system_prompt.md`](../../prompts/remotebuddy/remotebuddy_system_prompt.md) | [Slack `@remote-queue-oc`](slack://user/@remote-queue-oc), [Slack `@safety-review`](slack://user/@safety-review) / [PagerDuty RemoteBuddy Platform](pagerduty://schedules/remotebuddy-platform) | Planner override change (`requires_worker=false`, `lane="deterministic"`) |
-| Autonomy `forceWorker` remediation rate | [`config/default.toml`](../../../config/default.toml) (`[remotebuddy.autonomy]`); [`apps/remotebuddy/src/autonomous_engine.ts`](../src/autonomous_engine.ts) | [Slack `@remote-autonomy`](slack://user/@remote-autonomy) / [PagerDuty Remote Autonomy](pagerduty://schedules/remote-autonomy) | `remotebuddy.autonomy.max_dispatch_per_hour=<n>` + `bun run remotebuddy:only` |
+| Autonomy `forceWorker` remediation rate | [`configs/default.toml`](../../../configs/default.toml) (`[remotebuddy.autonomy]`); [`apps/remotebuddy/src/autonomous_engine.ts`](../src/autonomous_engine.ts) | [Slack `@remote-autonomy`](slack://user/@remote-autonomy) / [PagerDuty Remote Autonomy](pagerduty://schedules/remote-autonomy) | `remotebuddy.autonomy.max_dispatch_per_hour=<n>` + `bun run remotebuddy:only` |
 | Queue priority weights/budgets | [`apps/server/src/jobs.ts`](../../server/src/jobs.ts) | [Slack `@server-core`](slack://user/@server-core), [Slack `@remote-queue-oc`](slack://user/@remote-queue-oc) / [PagerDuty Server Core](pagerduty://schedules/server-core) | Edit `JOB_PRIORITY_QUEUE_SLA_MS` + `bun run server:only --env-file .env` |
 
 ### 1. Worker allocation per lane
 
-- Config reference: [`config/default.toml` (`[remotebuddy]` & `[workerpals]`)](../../../config/default.toml) and [`apps/workerpals/src/workerpals_main.ts`](../../workerpals/src/workerpals_main.ts).
+- Config reference: [`configs/default.toml` (`[remotebuddy]` & `[workerpals]`)](../../../configs/default.toml) and [`apps/workerpals/src/workerpals_main.ts`](../../workerpals/src/workerpals_main.ts).
 - Owner: WorkerPals Runtime ([Slack `@workerpals-oc`](slack://user/@workerpals-oc), [PagerDuty WorkerPals Runtime](pagerduty://schedules/workerpals-runtime)).
 - How to:
   1. Launch one extra worker per stressed lane: `PUSHPALS_AUTH_TOKEN=… bun run workerpals:only -- --lanes interactive=4,normal=2,background=1` (increase/decrease counts symmetrically).
@@ -88,10 +88,10 @@ entry point before diving into the per-lever procedures.
 
 ### 4. Autonomy `forceWorker` remediation rate
 
-- Config reference: [`config/default.toml` (`[remotebuddy.autonomy]`)](../../../config/default.toml) and [`apps/remotebuddy/src/autonomous_engine.ts`](../src/autonomous_engine.ts) (`max_dispatch_per_hour`, `queue_health` logic).
+- Config reference: [`configs/default.toml` (`[remotebuddy.autonomy]`)](../../../configs/default.toml) and [`apps/remotebuddy/src/autonomous_engine.ts`](../src/autonomous_engine.ts) (`max_dispatch_per_hour`, `queue_health` logic).
 - Owner: RemoteBuddy Autonomy DRI ([Slack `@remote-autonomy`](slack://user/@remote-autonomy), [PagerDuty Remote Autonomy](pagerduty://schedules/remote-autonomy)).
 - How to:
-  1. Tighten the dispatch budget when automation is over-enqueuing by dropping `remotebuddy.autonomy.max_dispatch_per_hour` to 3 via `config/local.toml` or a temporary env override.
+  1. Tighten the dispatch budget when automation is over-enqueuing by dropping `remotebuddy.autonomy.max_dispatch_per_hour` to 3 via `configs/local.toml` or a temporary env override.
   2. Restart RemoteBuddy (`bun run remotebuddy:only`) so the new limit applies, then watch the `forceWorker` metadata in `/requests?status=pending` to confirm the rate change.
   3. Restore the default (6) once backlog and idle slots return to baseline.
 
@@ -119,7 +119,7 @@ When a rollback trigger fires, stop changing levers and follow these reproducibl
 **Pre-checks (capture current state before overwriting config)**
 
 ```bash
-git status --short config/default.toml config/local.toml
+git status --short configs/default.toml configs/local.toml
 curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \
   | jq '{queue_p95: .slo.requests.queueWaitMs, pending: .queues.requests.pending, idle: .workers.idle}'
 ```
@@ -135,18 +135,18 @@ curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/s
 2. Inspect the tagged config so you know what will be restored:
 
    ```bash
-   git show $RB_QUEUE_TAG:config/default.toml | sed -n '/^\[remotebuddy\]/,/^\[/p'
-   git show $RB_QUEUE_TAG:config/default.toml | sed -n '/^\[workerpals\]/,/^\[/p'
+   git show $RB_QUEUE_TAG:configs/default.toml | sed -n '/^\[remotebuddy\]/,/^\[/p'
+   git show $RB_QUEUE_TAG:configs/default.toml | sed -n '/^\[workerpals\]/,/^\[/p'
    ```
 
 3. Backup current overrides, then restore the tagged values:
 
    ```bash
    ts=$(date +%Y%m%d%H%M%S)
-   cp config/default.toml config/default.toml.$ts.bak
-   cp config/local.toml config/local.toml.$ts.bak 2>/dev/null || true
-   git checkout $RB_QUEUE_TAG -- config/default.toml
-   git checkout $RB_QUEUE_TAG -- config/local.toml 2>/dev/null || true
+   cp configs/default.toml configs/default.toml.$ts.bak
+   cp configs/local.toml configs/local.toml.$ts.bak 2>/dev/null || true
+   git checkout $RB_QUEUE_TAG -- configs/default.toml
+   git checkout $RB_QUEUE_TAG -- configs/local.toml 2>/dev/null || true
    ```
 
 4. Restart the services so the restored config applies:

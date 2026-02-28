@@ -637,7 +637,7 @@ function scopeGlobForPath(path: string): string {
 export function deriveFixWriteGlobsFromDiff(diff: string): string[] {
   const changedPaths = parseChangedPathsFromDiff(diff);
   if (changedPaths.length === 0) {
-    return ["apps/**", "packages/**", "tests/**", "config/**", "scripts/**"];
+    return ["apps/**", "packages/**", "tests/**", "configs/**", "scripts/**"];
   }
   const globs = new Set<string>();
   for (const path of changedPaths) globs.add(scopeGlobForPath(path));

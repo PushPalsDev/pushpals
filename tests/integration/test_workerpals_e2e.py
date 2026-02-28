@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """PushPals end-to-end smoke test: start stack, run warmup + real LLM request.
 
 Phase A: warmup.execute (fast, proves WorkerPals can claim + complete jobs)
@@ -1179,14 +1179,14 @@ def _builtin_eval_scenarios() -> list[dict]:
             "title": "Add quality-prioritization notes to config and README",
             "prompt": (
                 "Apply both updates exactly and keep all other content unchanged: "
-                "1) In config/local.example.toml append the comment line "
+                "1) In configs/local.example.toml append the comment line "
                 "'# Guardrail: keep autonomy write scope narrow, explicit, and auditable.' "
                 "2) In README.md append the bullet line "
                 "'- Eval benchmarks prioritize correctness and code quality over raw speed.'"
             ),
-            "expected_paths": ["config/local.example.toml", "README.md"],
+            "expected_paths": ["configs/local.example.toml", "README.md"],
             "must_contain": {
-                "config/local.example.toml": (
+                "configs/local.example.toml": (
                     r"(?m)^# Guardrail: keep autonomy write scope narrow, explicit, and auditable\.$"
                 ),
                 "README.md": (
@@ -2760,7 +2760,7 @@ def main():
                         _debug(f"online_workers={online}")
 
                 warmup_started_at = _now()
-                print(f"Server healthy â€” enqueueing warmup job ({backend})")
+                print(f"Server healthy — enqueueing warmup job ({backend})")
                 warmup_body = {
                     "taskId": f"test-workerpal-e2e-warmup-{backend}-{worker_id}",
                     "sessionId": run_session_id,

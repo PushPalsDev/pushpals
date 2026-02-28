@@ -652,6 +652,22 @@ function removePathForClean(pathValue: string, label: string): void {
 }
 
 function ensureRequiredLocalConfigFiles(): void {
+  const configDirRel = relative(repoRoot, CONFIG.configDir).replace(/\\/g, "/");
+  const normalizedConfigDirRel = configDirRel && configDirRel !== "." ? configDirRel : "configs";
+  const localTomlRel = `${normalizedConfigDirRel}/local.toml`;
+  const localExampleTomlRel = `${normalizedConfigDirRel}/local.example.toml`;
+  const canonicalLocalTomlPath = resolve(CONFIG.configDir, "local.toml");
+  const legacyLocalTomlPath = resolve(repoRoot, "config", "local.toml");
+  const usingLegacyLocalTomlFallback =
+    canonicalLocalTomlPath !== legacyLocalTomlPath &&
+    !existsSync(canonicalLocalTomlPath) &&
+    existsSync(legacyLocalTomlPath);
+  if (usingLegacyLocalTomlFallback) {
+    console.warn(
+      `[start] Legacy local config detected at config/local.toml; migrate to ${localTomlRel} (legacy fallback will be removed in a future release).`,
+    );
+  }
+
   const required: Array<{ path: string; hint: string; windowsCopy: string; linuxCopy: string }> = [
     {
       path: resolve(repoRoot, ".env"),
@@ -660,10 +676,10 @@ function ensureRequiredLocalConfigFiles(): void {
       linuxCopy: "cp .env.example .env",
     },
     {
-      path: resolve(repoRoot, "config", "local.toml"),
-      hint: "Create config/local.toml from config/local.example.toml for local overrides.",
-      windowsCopy: "Copy-Item config/local.example.toml config/local.toml",
-      linuxCopy: "cp config/local.example.toml config/local.toml",
+      path: usingLegacyLocalTomlFallback ? legacyLocalTomlPath : canonicalLocalTomlPath,
+      hint: `Create ${localTomlRel} from ${localExampleTomlRel} for local overrides.`,
+      windowsCopy: `Copy-Item ${localExampleTomlRel} ${localTomlRel}`,
+      linuxCopy: `cp ${localExampleTomlRel} ${localTomlRel}`,
     },
   ];
 
@@ -2322,7 +2338,7 @@ async function ensureLlmPreflight(): Promise<void> {
     }
     if (configuredModelMissingFailures.length > 0) {
       console.error(
-        "[start] Startup aborted: configured service model(s) are missing. Update config/*.toml model names or load those exact models in your LLM server.",
+        "[start] Startup aborted: configured service model(s) are missing. Update configs/*.toml model names or load those exact models in your LLM server.",
       );
     } else {
       console.error(

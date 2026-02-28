@@ -93,7 +93,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
     }
   });
 
-  test("defaults docs dispatch budget to 1 per hour when unset", () => {
+  test("defaults per-type autonomy dispatch budgets when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
     const configDir = join(root, "config");
     mkdirSync(configDir, { recursive: true });
@@ -113,6 +113,9 @@ describe("shared config remotebuddy autonomy parsing", () => {
     try {
       const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
       expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByType.docs).toBe(1);
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByType.feature_small).toBe(2);
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByType.feature_medium).toBe(1);
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByType.feature_large).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

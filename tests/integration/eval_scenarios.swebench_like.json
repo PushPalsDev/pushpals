@@ -17,13 +17,13 @@
   {
     "instance_id": "pushpals.autonomy.config_readme_bundle.hard",
     "title": "Add quality-prioritization notes to config and README",
-    "problem_statement": "Apply both updates exactly and keep all other content unchanged: 1) In config/local.example.toml append the comment line '# Guardrail: keep autonomy write scope narrow, explicit, and auditable.' 2) In README.md append the bullet line '- Eval benchmarks prioritize correctness and code quality over raw speed.'",
+    "problem_statement": "Apply both updates exactly and keep all other content unchanged: 1) In configs/local.example.toml append the comment line '# Guardrail: keep autonomy write scope narrow, explicit, and auditable.' 2) In README.md append the bullet line '- Eval benchmarks prioritize correctness and code quality over raw speed.'",
     "expected_paths": [
-      "config/local.example.toml",
+      "configs/local.example.toml",
       "README.md"
     ],
     "must_contain": {
-      "config/local.example.toml": "(?m)^# Guardrail: keep autonomy write scope narrow, explicit, and auditable\\.$",
+      "configs/local.example.toml": "(?m)^# Guardrail: keep autonomy write scope narrow, explicit, and auditable\\.$",
       "README.md": "(?m)^- Eval benchmarks prioritize correctness and code quality over raw speed\\.$"
     },
     "max_files_changed": 2,

@@ -6,6 +6,9 @@ export type AutonomyObjectiveType =
   | "lint_fix"
   | "type_fix"
   | "small_refactor"
+  | "feature_small"
+  | "feature_medium"
+  | "feature_large"
   | "docs"
   | "dep_bump";
 

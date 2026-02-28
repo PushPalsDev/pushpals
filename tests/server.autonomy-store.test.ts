@@ -16,6 +16,69 @@ afterEach(() => {
 });
 
 describe("server AutonomyStore policy gates", () => {
+  test("createSnapshot builds multi-source state traits", () => {
+    const store = makeStore();
+    const snapshot = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_traits",
+      requestSlo: { queueWaitMs: { p95: 210_000 } },
+      jobSlo: { completed: 6, failed: 4 },
+      repoHealthFlags: {
+        is_worktree_dirty: true,
+        is_merge_in_progress: false,
+      },
+    });
+
+    expect(snapshot.top_signals.length).toBeGreaterThan(0);
+    expect(snapshot.state_traits.length).toBeGreaterThan(0);
+    expect(snapshot.state_traits.some((trait) => trait.trait_id === "queue_latency_high")).toBe(true);
+    expect(snapshot.state_traits.some((trait) => trait.trait_id === "job_failure_rate_high")).toBe(true);
+    expect(snapshot.state_traits.some((trait) => trait.trait_id === "repo_dirty_worktree")).toBe(true);
+  });
+
+  test("createSnapshot derives component strength traits from outcomes", () => {
+    const store = makeStore();
+    const sessionId = "s1";
+    const runId = "run_component_traits";
+    const snapshotId = store.createSnapshot({ sessionId, runId }).snapshot_id;
+
+    for (let i = 0; i < 2; i++) {
+      const objectiveId = `obj_component_${i + 1}`;
+      const decision = store.recordObjectiveDecision({
+        runId,
+        snapshotId,
+        sessionId,
+        objective: {
+          id: objectiveId,
+          title: `Component trait seed ${i + 1}`,
+          instruction: "Seed outcome for component area strength trait",
+          objective_type: "lint_fix",
+          component_area: "apps/client",
+          trigger_type: "lint_failure",
+          target_paths: ["apps/client/src/app.tsx"],
+          scope: { read_anywhere: false, write_globs: ["apps/client/src/*"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun run lint"],
+          status: "rejected",
+        },
+      });
+      expect(decision.ok).toBe(true);
+      const outcome = store.recordOutcome({
+        objectiveId,
+        patternKey: decision.patternKey,
+        success: true,
+        userAction: "manual_fix",
+      });
+      expect(outcome.ok).toBe(true);
+    }
+
+    const enriched = store.createSnapshot({ sessionId, runId });
+    expect(
+      enriched.state_traits.some((trait) => trait.trait_id === "component_strong_apps/client"),
+    ).toBe(true);
+  });
+
   test("rejects objective risk above policy ceiling", () => {
     const store = makeStore();
     store.createSnapshot({ sessionId: "s1" });
@@ -41,6 +104,34 @@ describe("server AutonomyStore policy gates", () => {
 
     expect(result.ok).toBe(false);
     expect(String(result.reason ?? "")).toContain("exceeds policy");
+  });
+
+  test("rejects non-autonomous feature_large objectives", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1" }).snapshot_id;
+
+    const result = store.recordObjectiveDecision({
+      runId: "run_feature_large_block",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_feature_large",
+        title: "Build broad feature autonomously",
+        instruction: "Implement a large feature touching many areas.",
+        objective_type: "feature_large",
+        component_area: "apps/server",
+        trigger_type: "queue_health",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.9,
+        risk_level: "medium",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(String(result.reason ?? "")).toContain("autonomous_allowed");
   });
 
   test("applies read_anywhere policy gate based on config allowlist", () => {

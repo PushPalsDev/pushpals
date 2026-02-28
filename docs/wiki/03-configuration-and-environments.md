@@ -12,11 +12,11 @@ This is the main abstraction boundary that prevents downstream code churn when c
 
 ## Source of Truth Layers
 
-1. `config/default.toml`
+1. `configs/default.toml`
    - baseline defaults for all services.
-2. `config/<profile>.toml`
+2. `configs/<profile>.toml`
    - profile-specific overrides (via `PUSHPALS_PROFILE`).
-3. `config/local.toml`
+3. `configs/local.toml`
    - machine-local, gitignored overrides.
 4. `.env`
    - URLs, tokens, API keys, deployment wiring.
@@ -55,7 +55,7 @@ When moving a setting between env and TOML:
 
 1. Update `packages/shared/src/config.ts` first.
 2. Keep backward-compatible fallback reads during migration window.
-3. Update `.env.example` and `config/local.example.toml` guidance.
+3. Update `.env.example` and `configs/local.example.toml` guidance.
 4. Remove old read paths only after all callers use the unified typed field.
 
 ## Operationally Important Knobs
@@ -108,13 +108,13 @@ Keep secrets out of TOML and in `.env` or secret stores:
 - auth tokens,
 - git/github tokens.
 
-The repository templates (`.env.example`, `config/local.example.toml`) are intentionally non-secret.
+The repository templates (`.env.example`, `configs/local.example.toml`) are intentionally non-secret.
 
 ## Common Misconfiguration Symptoms
 
 - Wrong LLM backend/endpoint:
   - services boot but generation fails at runtime.
-- Missing `config/local.toml` or `.env`:
+- Missing `configs/local.toml` or `.env`:
   - startup preflight fails.
 - Branch/base mismatch in integration config:
   - SourceControlManager push/merge behavior appears inconsistent.

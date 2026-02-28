@@ -1,4 +1,4 @@
-# Copy this file to config/local.toml for machine-specific, non-secret overrides.
+# Copy this file to configs/local.toml for machine-specific, non-secret overrides.
 # Keep secrets in .env (or CI secret store), not in TOML.
 
 [localbuddy.llm]

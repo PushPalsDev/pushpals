@@ -92,7 +92,7 @@ RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Work through the step
 - macOS/Linux:
   ```bash
   cp .env.example .env
-  cp config/local.example.toml config/local.toml
+  cp configs/local.example.toml configs/local.toml
   ```
 - Windows PowerShell:
   ```powershell
@@ -202,7 +202,7 @@ Troubleshooting – If Bun crashes, loops on cache errors, or still reports miss
 Use this path any time you need to redeploy RemoteBuddy because of a regression, host reboot, or planned change. The goal is to minimize queue downtime while keeping provenance crystal clear.
 
 1. **Stabilize & communicate** – Post intent in `#pushpals-ops`, capture the latest `/system/status` snapshot, and pause new background/eval submissions if queue guardrails are already amber/red. Confirm another operator is watching WorkerPals capacity before you bounce RemoteBuddy.
-2. **Sync repo + dependencies** – On the target host run `git fetch origin && git checkout <target-commit> && git pull --ff-only`. Compare `bun.lock`/`package.json`; if they changed, run `bun install`. Double-check `.env` and `config/local.toml` still have the right `PUSHPALS_*` entries.
+2. **Sync repo + dependencies** – On the target host run `git fetch origin && git checkout <target-commit> && git pull --ff-only`. Compare `bun.lock`/`package.json`; if they changed, run `bun install`. Double-check `.env` and `configs/local.toml` still have the right `PUSHPALS_*` entries.
 3. **Build protocol + start the process** – Prefer the repo-root script `bun run remotebuddy` (executes `protocol:build` first, then `remotebuddy:only`). When protocols are already current, `bun run remotebuddy:only` or `bun --cwd apps/remotebuddy run start` (enables `remotebuddy_supervisor.ts` restarts) keeps downtime minimal. Keep the existing terminal or tmux pane open so you can tail logs live.
 4. **Validate the new instance** – Wait for `[RemoteBuddy] Starting polling loop…` followed by at least one `claim payload` log. Immediately hit `curl -sS $SERVER/system/status | jq '{queues: .queues.requests, jobs: .jobPendingSnapshot}'` and `curl -sS "$SERVER/requests?status=claimed&limit=5"`. Optionally run the smoke test in the section below (`bun run smoke`) or enqueue a single interactive request to prove round-trip health. Confirm `queue_p95`, worker idle counts, and the CommunicationManager WebSocket reconnect cleanly.
 5. **Observe, rollback if needed** – Watch logs for 5–10 minutes. If failures persist, stop the process, `git checkout <last-known-good>`, rerun step 3, and move `remotebuddy-state.db` aside only when it is clearly corrupted (RemoteBuddy will recreate it, but previously-handled events may replay once). Document the outcome and handoff time in `#pushpals-ops`.
@@ -236,7 +236,7 @@ bun run src/remotebuddy_main.ts \
   --token ${PUSHPALS_AUTH_TOKEN:-<optional>}
 ```
 
-- `--server`, `--sessionId`, and `--token` override values loaded from `config/*.toml` + `.env`.
+- `--server`, `--sessionId`, and `--token` override values loaded from `configs/*.toml` + `.env`.
 - When `--token` is omitted, the process uses `PUSHPALS_AUTH_TOKEN` (if set) or runs without auth headers.
 
 ## Token Setup and Verification

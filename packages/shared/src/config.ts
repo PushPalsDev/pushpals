@@ -7,7 +7,8 @@ interface TomlObject {
 }
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
-const DEFAULT_CONFIG_DIR = "config";
+const DEFAULT_CONFIG_DIR = "configs";
+const LEGACY_CONFIG_DIR = "config";
 
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const FALSY = new Set(["0", "false", "no", "off"]);
@@ -387,6 +388,27 @@ function resolvePathFromRoot(projectRoot: string, value: string): string {
   return resolve(projectRoot, value);
 }
 
+function resolveRuntimeConfigDir(projectRoot: string, configuredDir?: string): string {
+  if (configuredDir && configuredDir.trim()) {
+    return resolvePathFromRoot(projectRoot, configuredDir);
+  }
+
+  const canonicalDir = resolvePathFromRoot(projectRoot, DEFAULT_CONFIG_DIR);
+  const legacyDir = resolvePathFromRoot(projectRoot, LEGACY_CONFIG_DIR);
+  if (existsSync(join(canonicalDir, "default.toml"))) return canonicalDir;
+  if (existsSync(join(legacyDir, "default.toml"))) return legacyDir;
+  return canonicalDir;
+}
+
+function parseTomlWithLegacyFallback(
+  primaryPath: string,
+  fallbackPath?: string,
+): TomlObject {
+  if (existsSync(primaryPath)) return parseTomlFile(primaryPath);
+  if (fallbackPath && existsSync(fallbackPath)) return parseTomlFile(fallbackPath);
+  return {};
+}
+
 function normalizeBackend(value: string): string {
   const text = value.trim().toLowerCase();
   if (!text) return "lmstudio";
@@ -506,21 +528,36 @@ function resolveLlmConfig(
 
 export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const projectRoot = resolve(options.projectRoot ?? PROJECT_ROOT);
-  const configDir = resolvePathFromRoot(projectRoot, options.configDir ?? DEFAULT_CONFIG_DIR);
+  const configDir = resolveRuntimeConfigDir(projectRoot, options.configDir);
+  const legacyConfigDir = resolvePathFromRoot(projectRoot, LEGACY_CONFIG_DIR);
+  const fallbackConfigDir =
+    !options.configDir && configDir !== legacyConfigDir ? legacyConfigDir : "";
   const cacheKey = `${projectRoot}::${configDir}::${process.env.PUSHPALS_PROFILE ?? ""}`;
   if (!options.reload && cachedConfig && cachedConfigKey === cacheKey) {
     return cachedConfig;
   }
 
-  const defaultToml = parseTomlFile(join(configDir, "default.toml"));
+  const defaultToml = parseTomlWithLegacyFallback(
+    join(configDir, "default.toml"),
+    fallbackConfigDir ? join(fallbackConfigDir, "default.toml") : undefined,
+  );
   const preferredProfile = firstNonEmpty(
     process.env.PUSHPALS_PROFILE,
     asString(defaultToml.profile, "dev"),
     "dev",
   );
-  const profileToml = parseTomlFile(join(configDir, `${preferredProfile}.toml`));
-  const localExampleToml = parseTomlFile(join(configDir, "local.example.toml"));
-  const localToml = parseTomlFile(join(configDir, "local.toml"));
+  const profileToml = parseTomlWithLegacyFallback(
+    join(configDir, `${preferredProfile}.toml`),
+    fallbackConfigDir ? join(fallbackConfigDir, `${preferredProfile}.toml`) : undefined,
+  );
+  const localExampleToml = parseTomlWithLegacyFallback(
+    join(configDir, "local.example.toml"),
+    fallbackConfigDir ? join(fallbackConfigDir, "local.example.toml") : undefined,
+  );
+  const localToml = parseTomlWithLegacyFallback(
+    join(configDir, "local.toml"),
+    fallbackConfigDir ? join(fallbackConfigDir, "local.toml") : undefined,
+  );
   const merged = mergeDeep(
     mergeDeep(mergeDeep(defaultToml, profileToml), localExampleToml),
     localToml,
@@ -724,6 +761,9 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     lint_fix: 3,
     type_fix: 3,
     small_refactor: 2,
+    feature_small: 2,
+    feature_medium: 1,
+    feature_large: 0,
     docs: 1,
     dep_bump: 0,
   };

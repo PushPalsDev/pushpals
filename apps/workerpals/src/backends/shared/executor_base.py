@@ -218,7 +218,11 @@ def runtime_config() -> Dict[str, Any]:
     if _CONFIG_CACHE is not None:
         return _CONFIG_CACHE
     repo_root = repo_root_for_runtime_config()
-    config_dir = repo_root / "config"
+    legacy_config_dir = repo_root / "config"
+    config_dir = repo_root / "configs"
+    if not (config_dir / "default.toml").exists():
+        if (legacy_config_dir / "default.toml").exists():
+            config_dir = legacy_config_dir
     default_cfg = _parse_toml_file(config_dir / "default.toml")
     profile = (
         (os.environ.get("PUSHPALS_PROFILE") or "").strip()
@@ -227,6 +231,12 @@ def runtime_config() -> Dict[str, Any]:
     )
     profile_cfg = _parse_toml_file(config_dir / f"{profile}.toml")
     local_cfg = _parse_toml_file(config_dir / "local.toml")
+    if (
+        not local_cfg
+        and config_dir != legacy_config_dir
+        and (legacy_config_dir / "local.toml").exists()
+    ):
+        local_cfg = _parse_toml_file(legacy_config_dir / "local.toml")
     _CONFIG_CACHE = _deep_merge(_deep_merge(default_cfg, profile_cfg), local_cfg)
     return _CONFIG_CACHE
 

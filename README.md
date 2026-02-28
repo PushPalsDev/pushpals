@@ -78,7 +78,7 @@ flowchart LR
 ```bash
 bun install
 cp .env.example .env
-cp config/local.example.toml config/local.toml
+cp configs/local.example.toml configs/local.toml
 ```
 
 Windows PowerShell:
@@ -86,7 +86,7 @@ Windows PowerShell:
 ```powershell
 bun install
 Copy-Item .env.example .env
-Copy-Item config/local.example.toml config/local.toml
+Copy-Item configs/local.example.toml configs/local.toml
 ```
 
 ## Run commands
@@ -216,7 +216,7 @@ Configured in `configs/backend.toml` and resolved by `apps/workerpals/src/backen
 How to switch:
 
 ```toml
-# config/local.toml
+# configs/local.toml
 [workerpals]
 executor = "openhands" # or "miniswe"
 ```
@@ -402,7 +402,7 @@ Autonomy tables in `apps/server/src/autonomy.ts`:
 
 `scripts/start.ts` enforces critical safety checks before full startup, including:
 
-- required local config files (`.env`, `config/local.toml`)
+- required local config files (`.env`, `configs/local.toml`)
 - LLM endpoint preflight
 - integration branch existence/sync checks
 - dedicated SourceControlManager worktree guard
@@ -412,15 +412,15 @@ Autonomy tables in `apps/server/src/autonomy.ts`:
 
 Canonical config files:
 
-- `config/default.toml`
-- `config/<profile>.toml`
-- `config/local.toml` (local override, typically gitignored)
+- `configs/default.toml`
+- `configs/<profile>.toml`
+- `configs/local.toml` (local override, typically gitignored)
 
 Load order (last wins):
 
-1. `config/default.toml`
-2. `config/<PUSHPALS_PROFILE>.toml`
-3. `config/local.toml`
+1. `configs/default.toml`
+2. `configs/<PUSHPALS_PROFILE>.toml`
+3. `configs/local.toml`
 4. environment variables
 
 High-value env overrides:

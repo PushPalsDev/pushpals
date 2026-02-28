@@ -164,6 +164,7 @@ apps/worker/.dockerbuild/
 .worktrees/
 
 # Local machine config overrides
+configs/local.toml
 config/local.toml
 
 

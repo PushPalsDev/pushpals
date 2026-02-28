@@ -25,6 +25,14 @@ interface SignalValue {
   evidence: string;
 }
 
+interface StateTrait {
+  trait_id: string;
+  category: "strength" | "weakness" | "opportunity" | "risk";
+  focus: string;
+  score: number;
+  evidence: string;
+}
+
 interface FeedbackPrior {
   pattern_key: string;
   ema_success: number;
@@ -82,6 +90,27 @@ const OBJECTIVE_POLICY: Record<AutonomyObjectiveType, ObjectivePolicy> = {
     requireValidation: true,
     dependencyChanges: false,
   },
+  feature_small: {
+    maxRisk: "low",
+    maxGlobBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true,
+    dependencyChanges: false,
+  },
+  feature_medium: {
+    maxRisk: "medium",
+    maxGlobBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true,
+    dependencyChanges: false,
+  },
+  feature_large: {
+    maxRisk: "high",
+    maxGlobBreadth: "broad",
+    autonomousAllowed: false,
+    requireValidation: true,
+    dependencyChanges: false,
+  },
   docs: {
     maxRisk: "low",
     maxGlobBreadth: "medium",
@@ -126,6 +155,7 @@ export interface AutonomySnapshot {
   snapshot_ttl_ms: number;
   impact_model_version: string;
   top_signals: SignalValue[];
+  state_traits: StateTrait[];
   feedback_priors: FeedbackPrior[];
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
   open_objectives: OpenObjective[];
@@ -593,6 +623,250 @@ export class AutonomyStore {
       .slice(0, 20);
   }
 
+  private buildStateTraits(params: {
+    nowIso: string;
+    requestSlo?: QueueSloSummary;
+    jobSlo?: QueueSloSummary;
+    topSignals: SignalValue[];
+    dispatchBudget: { globalCount: number; byType: Record<string, number> };
+    openObjectives: OpenObjective[];
+    repoHealthFlags?: { is_worktree_dirty?: boolean; is_merge_in_progress?: boolean };
+  }): StateTrait[] {
+    const traits: StateTrait[] = [];
+    const pushTrait = (trait: StateTrait): void => {
+      if (!trait.trait_id || !trait.evidence) return;
+      traits.push({
+        ...trait,
+        score: clamp01(asNumber(trait.score, 0)),
+      });
+    };
+
+    const queueP95 = asNumber(params.requestSlo?.queueWaitMs?.p95, 0);
+    if (queueP95 >= 120_000) {
+      pushTrait({
+        trait_id: "queue_latency_high",
+        category: "weakness",
+        focus: "queue_latency",
+        score: norm(queueP95, 120_000, 300_000),
+        evidence: `request queue p95=${Math.floor(queueP95)}ms`,
+      });
+    } else {
+      pushTrait({
+        trait_id: "queue_latency_healthy",
+        category: "strength",
+        focus: "queue_latency",
+        score: norm(120_000 - queueP95, 0, 120_000),
+        evidence: `request queue p95=${Math.floor(queueP95)}ms`,
+      });
+    }
+
+    const completed = Math.max(0, Math.floor(asNumber(params.jobSlo?.completed, 0)));
+    const failed = Math.max(0, Math.floor(asNumber(params.jobSlo?.failed, 0)));
+    const terminal = completed + failed;
+    const failureRate = terminal > 0 ? failed / terminal : 0;
+    if (terminal >= 5) {
+      if (failureRate >= 0.12) {
+        pushTrait({
+          trait_id: "job_failure_rate_high",
+          category: "weakness",
+          focus: "worker_reliability",
+          score: norm(failureRate, 0.12, 0.4),
+          evidence: `job failure rate=${failureRate.toFixed(3)} (${failed}/${terminal})`,
+        });
+      } else {
+        pushTrait({
+          trait_id: "job_failure_rate_low",
+          category: "strength",
+          focus: "worker_reliability",
+          score: norm(0.12 - failureRate, 0, 0.12),
+          evidence: `job failure rate=${failureRate.toFixed(3)} (${failed}/${terminal})`,
+        });
+      }
+    }
+
+    for (const signal of params.topSignals.slice(0, 5)) {
+      if (signal.value < 0.35) continue;
+      const focus =
+        signal.type === "test_failure"
+          ? "test_reliability"
+          : signal.type === "lint_failure"
+            ? "lint_hygiene"
+            : signal.type === "typecheck_failure"
+              ? "type_hygiene"
+              : signal.type === "regret_signal"
+                ? "change_stability"
+                : "queue_health";
+      pushTrait({
+        trait_id: `signal_${signal.signal_id}`,
+        category: signal.type === "regret_signal" ? "risk" : "weakness",
+        focus,
+        score: clamp01(signal.value),
+        evidence: signal.evidence,
+      });
+    }
+
+    const componentRows = this.db
+      .prepare(
+        `SELECT obj.component_area AS componentArea,
+                SUM(CASE WHEN o.success = 1 THEN 1 ELSE 0 END) AS successCount,
+                COUNT(*) AS totalCount
+         FROM autonomy_outcomes o
+         JOIN autonomy_objectives obj ON obj.id = o.objective_id
+         WHERE datetime(o.created_at) >= datetime(?, '-7 days')
+         GROUP BY obj.component_area
+         HAVING COUNT(*) >= 2
+         ORDER BY totalCount DESC
+         LIMIT 24`,
+      )
+      .all(params.nowIso) as Array<{
+      componentArea: string | null;
+      successCount: number;
+      totalCount: number;
+    }>;
+    for (const row of componentRows) {
+      const area = asString(row.componentArea);
+      if (!area) continue;
+      const totalCount = Math.max(0, Math.floor(asNumber(row.totalCount, 0)));
+      if (totalCount < 2) continue;
+      const successCount = Math.max(0, Math.floor(asNumber(row.successCount, 0)));
+      const successRate = successCount / totalCount;
+      if (successRate <= 0.45) {
+        pushTrait({
+          trait_id: `component_weak_${area}`,
+          category: "weakness",
+          focus: `component:${area}`,
+          score: norm(0.45 - successRate, 0, 0.45),
+          evidence: `${area} 7d success=${successRate.toFixed(2)} (${successCount}/${totalCount})`,
+        });
+      } else if (successRate >= 0.75) {
+        pushTrait({
+          trait_id: `component_strong_${area}`,
+          category: "strength",
+          focus: `component:${area}`,
+          score: norm(successRate, 0.75, 1),
+          evidence: `${area} 7d success=${successRate.toFixed(2)} (${successCount}/${totalCount})`,
+        });
+      }
+    }
+
+    const objectiveRows = this.db
+      .prepare(
+        `SELECT obj.objective_type AS objectiveType,
+                SUM(CASE WHEN o.success = 1 THEN 1 ELSE 0 END) AS successCount,
+                COUNT(*) AS totalCount
+         FROM autonomy_outcomes o
+         JOIN autonomy_objectives obj ON obj.id = o.objective_id
+         WHERE datetime(o.created_at) >= datetime(?, '-7 days')
+         GROUP BY obj.objective_type
+         ORDER BY totalCount DESC
+         LIMIT 24`,
+      )
+      .all(params.nowIso) as Array<{
+      objectiveType: string | null;
+      successCount: number;
+      totalCount: number;
+    }>;
+    for (const row of objectiveRows) {
+      const objectiveType = asString(row.objectiveType);
+      if (!objectiveType) continue;
+      const totalCount = Math.max(0, Math.floor(asNumber(row.totalCount, 0)));
+      if (totalCount === 0) continue;
+      const successCount = Math.max(0, Math.floor(asNumber(row.successCount, 0)));
+      const successRate = successCount / totalCount;
+      if (totalCount >= 3 && successRate <= 0.45) {
+        pushTrait({
+          trait_id: `objective_weak_${objectiveType}`,
+          category: "weakness",
+          focus: `objective_type:${objectiveType}`,
+          score: norm(0.45 - successRate, 0, 0.45),
+          evidence: `${objectiveType} 7d success=${successRate.toFixed(2)} (${successCount}/${totalCount})`,
+        });
+      } else if (totalCount >= 3 && successRate >= 0.75) {
+        pushTrait({
+          trait_id: `objective_strong_${objectiveType}`,
+          category: "strength",
+          focus: `objective_type:${objectiveType}`,
+          score: norm(successRate, 0.75, 1),
+          evidence: `${objectiveType} 7d success=${successRate.toFixed(2)} (${successCount}/${totalCount})`,
+        });
+      } else if (totalCount <= 1) {
+        pushTrait({
+          trait_id: `objective_opportunity_${objectiveType}`,
+          category: "opportunity",
+          focus: `objective_type:${objectiveType}`,
+          score: norm(1 - totalCount, 0, 1),
+          evidence: `${objectiveType} has sparse recent samples (${totalCount} in 7d)`,
+        });
+      }
+    }
+
+    const globalLimit = Math.max(1, this.config.remotebuddy.autonomy.maxDispatchPerHour);
+    const dispatchPressure = clamp01(params.dispatchBudget.globalCount / globalLimit);
+    if (dispatchPressure >= 0.8) {
+      pushTrait({
+        trait_id: "dispatch_pressure_high",
+        category: "risk",
+        focus: "dispatch_budget",
+        score: dispatchPressure,
+        evidence: `dispatch usage ${params.dispatchBudget.globalCount}/${globalLimit} in last hour`,
+      });
+    }
+
+    const activeCount = params.openObjectives.length;
+    const concurrentLimit = Math.max(1, this.config.remotebuddy.autonomy.maxConcurrentObjectives);
+    const activePressure = clamp01(activeCount / concurrentLimit);
+    if (activePressure >= 1) {
+      pushTrait({
+        trait_id: "active_objectives_saturated",
+        category: "risk",
+        focus: "objective_concurrency",
+        score: activePressure,
+        evidence: `active objectives ${activeCount}/${concurrentLimit}`,
+      });
+    }
+
+    if (asBoolean(params.repoHealthFlags?.is_worktree_dirty, false)) {
+      pushTrait({
+        trait_id: "repo_dirty_worktree",
+        category: "risk",
+        focus: "repo_state",
+        score: 0.9,
+        evidence: "repo preflight reports dirty worktree",
+      });
+    }
+    if (asBoolean(params.repoHealthFlags?.is_merge_in_progress, false)) {
+      pushTrait({
+        trait_id: "repo_merge_in_progress",
+        category: "risk",
+        focus: "repo_state",
+        score: 1,
+        evidence: "repo preflight reports merge/rebase in progress",
+      });
+    }
+
+    if (traits.length === 0) {
+      pushTrait({
+        trait_id: "state_signal_sparse",
+        category: "opportunity",
+        focus: "exploration",
+        score: 0.5,
+        evidence: "insufficient recent signals; prioritize low-risk scoped improvements",
+      });
+    }
+
+    const deduped = new Map<string, StateTrait>();
+    for (const trait of traits) {
+      const existing = deduped.get(trait.trait_id);
+      if (!existing || trait.score > existing.score) deduped.set(trait.trait_id, trait);
+    }
+    return [...deduped.values()]
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.trait_id.localeCompare(b.trait_id);
+      })
+      .slice(0, 32);
+  }
+
   private lockRow(nowIso: string): {
     lock_id: string;
     owner_session_id: string;
@@ -742,6 +1016,7 @@ export class AutonomyStore {
         snapshot_ttl_ms: snapshot.snapshot_ttl_ms,
         impact_model_version: snapshot.impact_model_version,
         top_signals: snapshot.top_signals,
+        state_traits: snapshot.state_traits,
         feedback_priors: snapshot.feedback_priors.slice(0, 40),
         active_cooldowns: snapshot.active_cooldowns.slice(0, 40),
         open_objectives: snapshot.open_objectives.slice(0, 40),
@@ -854,6 +1129,15 @@ export class AutonomyStore {
       )
       .all() as OpenObjective[];
     const dispatchBudget = this.getDispatchCountsLastHour(now);
+    const stateTraits = this.buildStateTraits({
+      nowIso: now,
+      requestSlo: params.requestSlo,
+      jobSlo: params.jobSlo,
+      topSignals,
+      dispatchBudget,
+      openObjectives,
+      repoHealthFlags: params.repoHealthFlags,
+    });
 
     const snapshot: AutonomySnapshot = {
       snapshot_id: snapshotId,
@@ -861,6 +1145,7 @@ export class AutonomyStore {
       snapshot_ttl_ms: ttlMs,
       impact_model_version: this.config.remotebuddy.autonomy.impactModelVersion,
       top_signals: topSignals,
+      state_traits: stateTraits,
       feedback_priors: feedbackPriors,
       active_cooldowns: activeCooldowns,
       open_objectives: openObjectives,

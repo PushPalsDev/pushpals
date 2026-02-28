@@ -41,6 +41,7 @@ type AutonomyCandidate = {
   confidence: number;
   vision_alignment_reason: string;
   vision_section_refs: string[];
+  feature_hypotheses: string[];
   requires_user_input?: boolean;
   question_if_blocked?: string;
   candidate_created_at: string;
@@ -52,6 +53,13 @@ type Snapshot = {
   snapshot_ttl_ms: number;
   impact_model_version: string;
   top_signals: Array<{ signal_id: string; type: string; value: number; evidence: string }>;
+  state_traits: Array<{
+    trait_id: string;
+    category: "strength" | "weakness" | "opportunity" | "risk";
+    focus: string;
+    score: number;
+    evidence: string;
+  }>;
   feedback_priors: Array<{
     pattern_key: string;
     ema_success: number;
@@ -101,6 +109,24 @@ const POLICY: Record<AutonomyObjectiveType, PolicyRule> = {
     maxRisk: "medium",
     maxBreadth: "medium",
     autonomousAllowed: true,
+    requireValidation: true,
+  },
+  feature_small: {
+    maxRisk: "low",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true,
+  },
+  feature_medium: {
+    maxRisk: "medium",
+    maxBreadth: "medium",
+    autonomousAllowed: true,
+    requireValidation: true,
+  },
+  feature_large: {
+    maxRisk: "high",
+    maxBreadth: "broad",
+    autonomousAllowed: false,
     requireValidation: true,
   },
   docs: {
@@ -1009,6 +1035,7 @@ export class RemoteBuddyAutonomousEngine {
                 snapshot: {
                   snapshot_id: snapshot.snapshot_id,
                   top_signals: snapshot.top_signals.slice(0, 16),
+                  state_traits: snapshot.state_traits.slice(0, 24),
                   feedback_priors: snapshot.feedback_priors.slice(0, 20),
                   open_objectives: snapshot.open_objectives.slice(0, 20),
                   active_cooldowns: snapshot.active_cooldowns.slice(0, 20),
@@ -1073,6 +1100,7 @@ export class RemoteBuddyAutonomousEngine {
             asStringArray(c.vision_section_refs),
             visionSectionNumberSet,
           ),
+          feature_hypotheses: asStringArray(c.feature_hypotheses).slice(0, 24),
           requires_user_input: asBoolean(c.requires_user_input, false),
           question_if_blocked: asString(c.question_if_blocked),
           candidate_created_at: new Date(candidateCreatedBaseMs + candidateIndex).toISOString(),
@@ -1140,6 +1168,7 @@ export class RemoteBuddyAutonomousEngine {
         confidence: candidate.confidence,
         vision_alignment_reason: candidate.vision_alignment_reason,
         vision_section_refs: candidate.vision_section_refs,
+        feature_hypotheses: candidate.feature_hypotheses,
         gate_decision: "proposed",
         gate_reasons: [],
         candidate_created_at: candidate.candidate_created_at,
@@ -1258,6 +1287,7 @@ export class RemoteBuddyAutonomousEngine {
         confidence: row.candidate.confidence,
         vision_alignment_reason: row.candidate.vision_alignment_reason,
         vision_section_refs: row.candidate.vision_section_refs,
+        feature_hypotheses: row.candidate.feature_hypotheses,
         llm_score: row.llmScore,
         impact_signal: row.impactSignal,
         ema_success: row.emaSuccess,
@@ -1301,6 +1331,7 @@ export class RemoteBuddyAutonomousEngine {
             confidence: selected.candidate.confidence,
             vision_alignment_reason: selected.candidate.vision_alignment_reason,
             vision_section_refs: selected.candidate.vision_section_refs,
+            feature_hypotheses: selected.candidate.feature_hypotheses,
           }
         : {
             id: top.candidate.id,
@@ -1315,6 +1346,7 @@ export class RemoteBuddyAutonomousEngine {
             confidence: top.candidate.confidence,
             vision_alignment_reason: top.candidate.vision_alignment_reason,
             vision_section_refs: top.candidate.vision_section_refs,
+            feature_hypotheses: top.candidate.feature_hypotheses,
           };
       for (const row of candidatesPayload) {
         row.selected = Boolean(row.id === selectedCandidatePayload.id);

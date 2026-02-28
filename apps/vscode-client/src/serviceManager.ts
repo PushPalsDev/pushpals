@@ -122,8 +122,16 @@ export class StackServiceManager implements vscode.Disposable {
   }
 
   private validateLocalConfig(workspaceRoot: string): void {
-    const required = [resolve(workspaceRoot, ".env"), resolve(workspaceRoot, "config", "local.toml")];
-    const missing = required.filter((entry) => !existsSync(entry));
+    const envPath = resolve(workspaceRoot, ".env");
+    const localConfigPath = resolve(workspaceRoot, "configs", "local.toml");
+    const legacyLocalConfigPath = resolve(workspaceRoot, "config", "local.toml");
+    const missing: string[] = [];
+    if (!existsSync(envPath)) {
+      missing.push(envPath);
+    }
+    if (!existsSync(localConfigPath) && !existsSync(legacyLocalConfigPath)) {
+      missing.push(localConfigPath);
+    }
     if (missing.length === 0) return;
 
     const rel = missing.map((entry) => entry.replace(`${workspaceRoot}\\`, "").replace(/\\/g, "/"));

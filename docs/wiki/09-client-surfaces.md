@@ -77,7 +77,7 @@ Cons:
 ### Startup Preconditions
 
 - Workspace root must be the PushPals repo.
-- Required local config files must exist (`.env`, `config/local.toml`).
+- Required local config files must exist (`.env`, `configs/local.toml`).
 - Bun and Docker must be available for stack orchestration.
 
 ### Notable Engineering Detail

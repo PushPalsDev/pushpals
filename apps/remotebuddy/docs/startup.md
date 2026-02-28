@@ -18,7 +18,7 @@ safe and auditable.
 
 | Minute | Owner | Action | Evidence to capture |
 | --- | --- | --- | --- |
-| 0 | Platform on-call | Confirm repo state + config parity (`git status`, `config/*.toml`). | Screenshot or paste of clean diff summary. |
+| 0 | Platform on-call | Confirm repo state + config parity (`git status`, `configs/*.toml`). | Screenshot or paste of clean diff summary. |
 | 2 | Server on-call | Start Server + WorkerPals lanes; watch `/system/status`. | `curl .../system/status` JSON snippet with worker idle counts. |
 | 5 | RemoteBuddy on-call | Launch RemoteBuddy process with `PUSHPALS_AUTH_TOKEN` loaded. | Process log tail sent to `#pushpals-ops`. |
 | 7 | Platform on-call | Perform telemetry gates (table below). | Grafana snapshot + Alertmanager screenshot. |
@@ -32,7 +32,7 @@ startup can reference a single source of truth.
 
 1. **Config + secrets**
    - `bun install` has been run at least once on the host; `node_modules` is present.
-   - `config/default.toml` and `config/local.toml` match the intended train (`git status --short` is
+   - `configs/default.toml` and `configs/local.toml` match the intended train (`git status --short` is
      empty or only shows deliberate overrides).
    - Environment variables exported: `PUSHPALS_AUTH_TOKEN`, `REMOTE_STABLE_ID`, `WORKERPALS_API_URL`,
      `SERVER_BASE_URL`. Document redacted values in the ops log.
@@ -106,7 +106,7 @@ Trigger any of the actions below and immediately follow the recorded rollback pr
 
 1. `git status` → snapshot current diffs; stash if necessary.
 2. Stop RemoteBuddy (`Ctrl+C`) plus WorkerPals lanes you started for this attempt.
-3. `git checkout <last-good-tag> -- config/default.toml config/local.toml` (or reapply the saved copies).
+3. `git checkout <last-good-tag> -- configs/default.toml configs/local.toml` (or reapply the saved copies).
 4. Restart Server and WorkerPals using the known-good command set.
 5. Re-run telemetry gates; keep RemoteBuddy offline until every signal is green for one full interval.
 

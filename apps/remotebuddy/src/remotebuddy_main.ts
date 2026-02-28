@@ -12,7 +12,7 @@
  *
  * Usage:
  *   bun run src/remotebuddy_main.ts --server http://localhost:3001 [--sessionId <id>] [--token <auth>]
- *   Defaults resolve from config/*.toml via shared config loader.
+ *   Defaults resolve from configs/*.toml via shared config loader.
  */
 
 import type { CommandRequest } from "protocol";

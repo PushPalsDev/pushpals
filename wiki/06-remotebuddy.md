@@ -104,7 +104,7 @@ For each claimed request:
 
 ## Config Knobs
 
-Primary knobs live in `config/*.toml` under `[remotebuddy.memory]`:
+Primary knobs live in `configs/*.toml` under `[remotebuddy.memory]`:
 
 - `enabled`
 - `include_cross_session`
