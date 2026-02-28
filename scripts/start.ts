@@ -39,6 +39,12 @@ import {
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
 } from "../packages/shared/src/config.js";
+import {
+  extraLocalKeys,
+  missingTemplateKeys,
+  readDotEnvKeys,
+  readTomlLeafKeys,
+} from "../packages/shared/src/config_template_parity.js";
 import { validateVisionDocStructure } from "../packages/shared/src/vision.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -651,17 +657,50 @@ function removePathForClean(pathValue: string, label: string): void {
   }
 }
 
-function ensureRequiredLocalConfigFiles(): void {
+type LocalConfigPaths = {
+  localTomlPath: string;
+  localTomlRel: string;
+  localExampleTomlPath: string;
+  localExampleTomlRel: string;
+};
+
+function resolveLocalConfigPaths(): {
+  localTomlPath: string;
+  localTomlRel: string;
+  localExampleTomlPath: string;
+  localExampleTomlRel: string;
+  usingLegacyLocalTomlFallback: boolean;
+} {
   const configDirRel = relative(repoRoot, CONFIG.configDir).replace(/\\/g, "/");
   const normalizedConfigDirRel = configDirRel && configDirRel !== "." ? configDirRel : "configs";
   const localTomlRel = `${normalizedConfigDirRel}/local.toml`;
   const localExampleTomlRel = `${normalizedConfigDirRel}/local.example.toml`;
   const canonicalLocalTomlPath = resolve(CONFIG.configDir, "local.toml");
+  const localExampleTomlPath = resolve(CONFIG.configDir, "local.example.toml");
   const legacyLocalTomlPath = resolve(repoRoot, "config", "local.toml");
   const usingLegacyLocalTomlFallback =
     canonicalLocalTomlPath !== legacyLocalTomlPath &&
     !existsSync(canonicalLocalTomlPath) &&
     existsSync(legacyLocalTomlPath);
+  return {
+    localTomlPath: usingLegacyLocalTomlFallback ? legacyLocalTomlPath : canonicalLocalTomlPath,
+    localTomlRel,
+    localExampleTomlPath,
+    localExampleTomlRel,
+    usingLegacyLocalTomlFallback,
+  };
+}
+
+function ensureRequiredLocalConfigFiles(): LocalConfigPaths {
+  const localConfigPaths = resolveLocalConfigPaths();
+  const {
+    localTomlPath,
+    localTomlRel,
+    localExampleTomlPath,
+    localExampleTomlRel,
+    usingLegacyLocalTomlFallback,
+  } = localConfigPaths;
+
   if (usingLegacyLocalTomlFallback) {
     console.warn(
       `[start] Legacy local config detected at config/local.toml; migrate to ${localTomlRel} (legacy fallback will be removed in a future release).`,
@@ -676,7 +715,7 @@ function ensureRequiredLocalConfigFiles(): void {
       linuxCopy: "cp .env.example .env",
     },
     {
-      path: usingLegacyLocalTomlFallback ? legacyLocalTomlPath : canonicalLocalTomlPath,
+      path: localTomlPath,
       hint: `Create ${localTomlRel} from ${localExampleTomlRel} for local overrides.`,
       windowsCopy: `Copy-Item ${localExampleTomlRel} ${localTomlRel}`,
       linuxCopy: `cp ${localExampleTomlRel} ${localTomlRel}`,
@@ -684,7 +723,14 @@ function ensureRequiredLocalConfigFiles(): void {
   ];
 
   const missing = required.filter((entry) => !existsSync(entry.path));
-  if (missing.length === 0) return;
+  if (missing.length === 0) {
+    return {
+      localTomlPath,
+      localTomlRel,
+      localExampleTomlPath,
+      localExampleTomlRel,
+    };
+  }
 
   console.error("[start] Missing required local config file(s):");
   for (const entry of missing) {
@@ -694,6 +740,88 @@ function ensureRequiredLocalConfigFiles(): void {
     console.error(`[start]   Windows (PowerShell): ${entry.windowsCopy}`);
     console.error(`[start]   Linux/macOS (bash): ${entry.linuxCopy}`);
   }
+  abortStart(1);
+}
+
+function ensureLocalConfigTemplateKeyParity(localConfigPaths: LocalConfigPaths): void {
+  const envExamplePath = resolve(repoRoot, ".env.example");
+  const envPath = resolve(repoRoot, ".env");
+  const envExampleRel = relative(repoRoot, envExamplePath).replace(/\\/g, "/");
+  const envRel = relative(repoRoot, envPath).replace(/\\/g, "/");
+  const localExampleRel = relative(repoRoot, localConfigPaths.localExampleTomlPath).replace(
+    /\\/g,
+    "/",
+  );
+
+  const problems: Array<{
+    label: string;
+    templateLabel: string;
+    missingKeys: string[];
+    extraKeys: string[];
+  }> = [];
+
+  try {
+    const envExampleKeys = readDotEnvKeys(envExamplePath);
+    const envKeys = readDotEnvKeys(envPath);
+    const missingEnvKeys = missingTemplateKeys(envExampleKeys, envKeys);
+    const extraEnvKeys = extraLocalKeys(envExampleKeys, envKeys);
+    if (missingEnvKeys.length > 0 || extraEnvKeys.length > 0) {
+      problems.push({
+        label: envRel,
+        templateLabel: envExampleRel,
+        missingKeys: missingEnvKeys,
+        extraKeys: extraEnvKeys,
+      });
+    }
+  } catch (err) {
+    console.error(`[start] Local env key-parity preflight failed: ${String(err)}`);
+    abortStart(1);
+  }
+
+  try {
+    const localExampleKeys = readTomlLeafKeys(localConfigPaths.localExampleTomlPath);
+    const localTomlKeys = readTomlLeafKeys(localConfigPaths.localTomlPath);
+    const missingTomlKeys = missingTemplateKeys(localExampleKeys, localTomlKeys);
+    const extraTomlKeys = extraLocalKeys(localExampleKeys, localTomlKeys);
+    if (missingTomlKeys.length > 0 || extraTomlKeys.length > 0) {
+      problems.push({
+        label: localConfigPaths.localTomlRel,
+        templateLabel: localExampleRel,
+        missingKeys: missingTomlKeys,
+        extraKeys: extraTomlKeys,
+      });
+    }
+  } catch (err) {
+    console.error(
+      `[start] Local TOML key-parity preflight failed (${localExampleRel} vs ${localConfigPaths.localTomlRel}): ${String(err)}`,
+    );
+    abortStart(1);
+  }
+
+  if (problems.length === 0) return;
+
+  console.error("[start] Template key-parity preflight failed:");
+  for (const problem of problems) {
+    if (problem.missingKeys.length > 0) {
+      console.error(
+        `[start] - ${problem.label} is missing ${problem.missingKeys.length} key(s) from ${problem.templateLabel}:`,
+      );
+      for (const key of problem.missingKeys) {
+        console.error(`[start]   ${key}`);
+      }
+    }
+    if (problem.extraKeys.length > 0) {
+      console.error(
+        `[start] - ${problem.label} has ${problem.extraKeys.length} extra key(s) not present in ${problem.templateLabel}:`,
+      );
+      for (const key of problem.extraKeys) {
+        console.error(`[start]   ${key}`);
+      }
+    }
+  }
+  console.error(
+    "[start] Keep local files in strict key parity with templates before startup.",
+  );
   abortStart(1);
 }
 
@@ -4371,7 +4499,8 @@ try {
   cleanRuntimeStateIfRequested();
   await ensureWorkspaceDependenciesInstalled();
   sanitizeWindowsWatcherPaths();
-  ensureRequiredLocalConfigFiles();
+  const localConfigPaths = ensureRequiredLocalConfigFiles();
+  ensureLocalConfigTemplateKeyParity(localConfigPaths);
   ensureAutonomyVisionFile();
   logEffectiveConfigSnapshot();
   await ensureServicePortsAvailable();
