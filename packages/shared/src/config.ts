@@ -118,6 +118,7 @@ export interface PushPalsConfig {
       enabled: boolean;
       tickIntervalMs: number;
       heartbeatLogMs: number;
+      visionContextMaxChars: number;
       ideationBudgetMs: number;
       llmTimeoutMs: number;
       allowDirtyWorktree: boolean;
@@ -1509,6 +1510,17 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
             parseIntEnv("REMOTEBUDDY_AUTONOMY_HEARTBEAT_LOG_MS") ??
               remoteAutonomyNode.heartbeat_log_ms,
             30_000,
+          ),
+        ),
+        visionContextMaxChars: Math.max(
+          1_000,
+          Math.min(
+            1_000_000,
+            asInt(
+              parseIntEnv("REMOTEBUDDY_AUTONOMY_VISION_CONTEXT_MAX_CHARS") ??
+                remoteAutonomyNode.vision_context_max_chars,
+              65_536,
+            ),
           ),
         ),
         ideationBudgetMs: Math.max(

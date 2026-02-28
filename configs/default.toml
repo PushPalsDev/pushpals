@@ -72,6 +72,7 @@ session_id = "remotebuddy-dev"
 enabled = true
 tick_interval_ms = 300000
 heartbeat_log_ms = 30000
+vision_context_max_chars = 65536
 ideation_budget_ms = 20000
 llm_timeout_ms = 60000
 allow_dirty_worktree = false

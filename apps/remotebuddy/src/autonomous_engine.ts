@@ -162,7 +162,6 @@ const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/autonomy_planning_system_prompt.md",
 ).trim();
 const VISION_DOC_FNAME = "vision.md";
-const MAX_VISION_CONTEXT_CHARS = 12_000;
 const MAX_VISION_SECTION_CHARS = 1_200;
 const DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
 const DOCS_WEAK_EVIDENCE_MAX_PENALTY = 0.12;
@@ -449,6 +448,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   private loadVisionContext(runId: string): VisionContext | null {
+    const maxVisionContextChars = this.cfg.visionContextMaxChars;
     let raw = "";
     try {
       raw = loadRepoDocText(VISION_DOC_FNAME);
@@ -467,10 +467,10 @@ export class RemoteBuddyAutonomousEngine {
       return null;
     }
 
-    const truncated = trimmed.length > MAX_VISION_CONTEXT_CHARS;
+    const truncated = trimmed.length > maxVisionContextChars;
     if (truncated) {
       console.log(
-        `[RemoteBuddyAutonomousEngine] tick ${runId}: ${VISION_DOC_FNAME} exceeded ${MAX_VISION_CONTEXT_CHARS} chars; using first ${MAX_VISION_CONTEXT_CHARS} chars for ideation.`,
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: ${VISION_DOC_FNAME} exceeded ${maxVisionContextChars} chars; using first ${maxVisionContextChars} chars for ideation.`,
       );
     }
 
@@ -492,7 +492,7 @@ export class RemoteBuddyAutonomousEngine {
 
     return {
       path: VISION_DOC_FNAME,
-      markdown: truncated ? trimmed.slice(0, MAX_VISION_CONTEXT_CHARS) : trimmed,
+      markdown: truncated ? trimmed.slice(0, maxVisionContextChars) : trimmed,
       one_sentence: parsed.oneSentence,
       sections,
       key_items: {
