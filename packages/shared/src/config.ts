@@ -1501,7 +1501,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
           asInt(
             parseIntEnv("REMOTEBUDDY_AUTONOMY_TICK_INTERVAL_MS") ??
               remoteAutonomyNode.tick_interval_ms,
-            300_000,
+            120_000,
           ),
         ),
         heartbeatLogMs: Math.max(
