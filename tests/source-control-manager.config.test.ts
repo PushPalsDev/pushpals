@@ -10,6 +10,7 @@ describe("source_control_manager config", () => {
     expect(config.mainBranch.length).toBeGreaterThan(0);
     expect(config.reviewAgent.pollIntervalMs).toBeGreaterThanOrEqual(5_000);
     expect(config.reviewAgent.passThreshold).toBeGreaterThanOrEqual(1);
+    expect(config.reviewAgent.maxPrCommentsBeforeGiveUp).toBeGreaterThanOrEqual(1);
     expect(config.reviewAgent.codexBin.length).toBeGreaterThan(0);
   });
 

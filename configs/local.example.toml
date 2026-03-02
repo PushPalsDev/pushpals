@@ -109,6 +109,7 @@ enabled = true
 poll_interval_ms = 60000
 reviewer_md_path = "prompts/review_agent/reviewer.md"
 pass_threshold = 8.1
+max_pr_comments_before_give_up = 10
 merge_method = "squash"
 codex_auth_mode = "chatgpt"
 codex_bin = "bun x --yes @openai/codex"
