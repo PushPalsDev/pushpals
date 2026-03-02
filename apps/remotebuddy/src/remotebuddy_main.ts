@@ -44,10 +44,28 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import {
+  buildPreflightFailureLogPayload,
+  buildPreflightFailureSignature,
+  formatPreflightFailureContext,
+  runRemoteBuddyPreflight,
+  type RemoteBuddyPreflightFailure,
+  type RemoteBuddyPreflightResult,
+  REMOTEBUDDY_PREFLIGHT_REMEDIATION_FALLBACK,
+} from "./remotebuddy_preflight.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
+
+type EnqueueJobResult =
+  | { ok: true; jobId: string }
+  | { ok: false; reason: "preflight_blocked"; failure: RemoteBuddyPreflightFailure | null }
+  | { ok: false; reason: "http_error"; status: number; body: string }
+  | { ok: false; reason: "invalid_response"; response: unknown }
+  | { ok: false; reason: "network_error"; error: string };
+
+type FailedEnqueueJobResult = Extract<EnqueueJobResult, { ok: false }>;
 
 function parseArgs(): {
   server: string;
@@ -641,6 +659,8 @@ class RemoteBuddyOrchestrator {
     1,
     Number.parseInt(process.env.REMOTEBUDDY_SESSION_MONITOR_MAX_WS_ERRORS ?? "6", 10) || 6,
   );
+  private static readonly PREFLIGHT_SUCCESS_CACHE_MS = 60_000;
+  private static readonly PREFLIGHT_FAILURE_RETRY_MS = 5_000;
   private readonly agentId = "remotebuddy-orchestrator";
   private readonly server: string;
   private readonly sessionId: string;
@@ -699,6 +719,9 @@ class RemoteBuddyOrchestrator {
   private static readonly MAX_CONTEXT_ENTRY_CHARS = 1200;
   private static readonly CHAT_CONTEXT_MAX = 8;
   private static readonly CHAT_CONTEXT_ENTRY_CHARS = 420;
+  private preflightResult: RemoteBuddyPreflightResult | null = null;
+  private preflightLastCheckMs = 0;
+  private preflightLastFailureSignature: string | null = null;
 
   constructor(opts: {
     server: string;
@@ -787,6 +810,73 @@ class RemoteBuddyOrchestrator {
     console.log(
       `[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour} allowDirtyWorktree=${CONFIG.remotebuddy.autonomy.allowDirtyWorktree ? "on" : "off"}`,
     );
+  }
+
+  async runPreflightCheck(force = false): Promise<boolean> {
+    return this.ensurePreflightReady(force);
+  }
+
+  getLatestPreflightFailure(): RemoteBuddyPreflightFailure | null {
+    if (this.preflightResult && !this.preflightResult.ok) {
+      return this.preflightResult.failure;
+    }
+    return null;
+  }
+
+  describeLatestPreflightFailure(): string | null {
+    const failure = this.getLatestPreflightFailure();
+    if (!failure) return null;
+    return formatPreflightFailureContext(failure);
+  }
+
+  private async ensurePreflightReady(force = false): Promise<boolean> {
+    const now = Date.now();
+    if (
+      !force &&
+      this.preflightResult?.ok &&
+      now - this.preflightLastCheckMs < RemoteBuddyOrchestrator.PREFLIGHT_SUCCESS_CACHE_MS
+    ) {
+      return true;
+    }
+    if (
+      !force &&
+      this.preflightResult &&
+      !this.preflightResult.ok &&
+      now - this.preflightLastCheckMs < RemoteBuddyOrchestrator.PREFLIGHT_FAILURE_RETRY_MS
+    ) {
+      return false;
+    }
+    const result = await runRemoteBuddyPreflight({
+      config: CONFIG,
+      repoRoot: this.repo,
+    });
+    this.preflightResult = result;
+    this.preflightLastCheckMs = now;
+    if (result.ok) {
+      const message = `[RemoteBuddy] Preflight ready: repo=${result.summary.repoRoot} server=${result.summary.serverUrl}`;
+      if (!this.preflightLastFailureSignature) {
+        console.log(message);
+      } else {
+        console.log(`${message} (recovered from previous failure)`);
+      }
+      this.preflightLastFailureSignature = null;
+      return true;
+    }
+    const failureLogPayload = buildPreflightFailureLogPayload(result.failure);
+    const signature = buildPreflightFailureSignature(failureLogPayload);
+    if (signature !== this.preflightLastFailureSignature) {
+      const remediation = ` Remediation: ${failureLogPayload.remediation}`;
+      const details =
+        Object.keys(failureLogPayload.details).length > 0
+          ? ` Details: ${JSON.stringify(failureLogPayload.details)}`
+          : "";
+      console.error(
+        `[RemoteBuddy] Preflight blocked (${failureLogPayload.code}): ${failureLogPayload.reason}.${remediation}${details}`,
+      );
+      this.pushContext(formatPreflightFailureContext(failureLogPayload));
+      this.preflightLastFailureSignature = signature;
+    }
+    return false;
   }
 
   async emitStartupStatus(): Promise<void> {
@@ -1066,14 +1156,22 @@ class RemoteBuddyOrchestrator {
 
   /**
    * Enqueue a job via the server job queue.
-   * Returns the server-assigned jobId on success, or null on failure.
+   * Returns a structured result that surfaces the failure reason when enqueueing is blocked.
    */
   private async enqueueJob(
     taskId: string,
     kind: "task.execute",
     params: TaskExecuteJobParams,
     targetWorkerId: string | null = null,
-  ): Promise<string | null> {
+  ): Promise<EnqueueJobResult> {
+    if (!(await this.ensurePreflightReady())) {
+      const failure = this.getLatestPreflightFailure();
+      const detail = this.describeLatestPreflightFailure() ?? "preflight result unavailable";
+      console.warn(
+        `[RemoteBuddy] Preflight not ready; skipping enqueue for task ${taskId} (kind=${kind}). ${detail}`,
+      );
+      return { ok: false, reason: "preflight_blocked", failure };
+    }
     try {
       const payload: Record<string, unknown> = {
         taskId,
@@ -1091,17 +1189,34 @@ class RemoteBuddyOrchestrator {
       if (!res.ok) {
         const err = await res.text();
         console.error(`[RemoteBuddy] Enqueue failed: ${res.status} ${err}`);
-        return null;
+        return { ok: false, reason: "http_error", status: res.status, body: err };
       }
       const data = (await res.json()) as { ok: boolean; jobId?: string };
       if (!data.ok || !data.jobId) {
         console.error(`[RemoteBuddy] Enqueue response missing jobId:`, data);
-        return null;
+        return { ok: false, reason: "invalid_response", response: data };
       }
-      return data.jobId;
+      return { ok: true, jobId: data.jobId };
     } catch (err) {
       console.error(`[RemoteBuddy] Enqueue error:`, err);
-      return null;
+      return { ok: false, reason: "network_error", error: String(err) };
+    }
+  }
+
+  private describeEnqueueFailure(result: FailedEnqueueJobResult): string {
+    switch (result.reason) {
+      case "preflight_blocked":
+        return result.failure
+          ? `${result.failure.code}:${result.failure.reason}`
+          : "preflight_result_unavailable";
+      case "http_error":
+        return `http_error:${result.status}`;
+      case "invalid_response":
+        return "invalid_response";
+      case "network_error":
+        return `network_error:${result.error}`;
+      default:
+        return "unknown";
     }
   }
 
@@ -1861,8 +1976,9 @@ class RemoteBuddyOrchestrator {
         { turnId, correlationId: requestId },
       );
 
-      const jobId = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
-      if (jobId) {
+      const enqueueResult = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
+      if (enqueueResult.ok) {
+        const jobId = enqueueResult.jobId;
         this.rememberPersistentMemory(
           "job_enqueued",
           `job=${jobId.slice(0, 8)} lane=${lane} intent=${plan.intent} worker=${targetWorkerId ?? "queue"}`,
@@ -1896,11 +2012,22 @@ class RemoteBuddyOrchestrator {
           turnId,
         });
       } else {
+        const failureDetail = this.describeEnqueueFailure(enqueueResult);
         this.rememberPersistentMemory(
           "job_enqueue_failed",
-          `enqueue_failed lane=${lane} intent=${plan.intent}`,
+          `enqueue_failed lane=${lane} intent=${plan.intent} reason=${failureDetail}`,
           requestId,
         );
+        if (enqueueResult.reason === "preflight_blocked") {
+          const failure = enqueueResult.failure;
+          const remediation =
+            failure?.remediation ?? REMOTEBUDDY_PREFLIGHT_REMEDIATION_FALLBACK;
+          const reason = failure?.reason ?? "preflight result unavailable";
+          await this.comm.assistantMessage(
+            `RemoteBuddy preflight blocked this request: ${reason}. Remediation: ${remediation}`,
+            { turnId, correlationId: requestId },
+          );
+        }
       }
 
       await fetch(`${this.server}/requests/${requestId}/complete`, {
@@ -2136,6 +2263,15 @@ async function main() {
     persistentMemory,
     jobsDbPath: sharedDbPath,
   });
+
+  const preflightReady = await orchestrator.runPreflightCheck(true);
+  if (!preflightReady) {
+    const detail =
+      orchestrator.describeLatestPreflightFailure() ?? "preflight result unavailable";
+    console.warn(
+      `[RemoteBuddy] Preflight failed during startup – job dispatch is blocked until the issue is resolved. ${detail}`,
+    );
+  }
 
   await orchestrator.emitStartupStatus();
   orchestrator.startStatusHeartbeat();
