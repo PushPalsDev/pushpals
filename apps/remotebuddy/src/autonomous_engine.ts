@@ -47,6 +47,8 @@ type AutonomyCandidate = {
   candidate_created_at: string;
 };
 
+type IntegrationState = "merge" | "rebase";
+
 type Snapshot = {
   snapshot_id: string;
   snapshot_created_at: string;
@@ -70,7 +72,8 @@ type Snapshot = {
   open_objectives: Array<{ objective_id: string; pattern_key: string; status: string }>;
   repo_health_flags: {
     is_worktree_dirty: boolean;
-    is_merge_in_progress: boolean;
+    is_integration_in_progress: boolean;
+    integration_state: IntegrationState | null;
     dispatch_lock_held: boolean;
   };
   dispatch_budget: {
@@ -317,16 +320,113 @@ function sanitizeForGitRef(value: string): string {
   return text || "default";
 }
 
-async function repoPreflight(repo: string): Promise<{
+export async function repoPreflight(repo: string): Promise<{
   isWorktreeDirty: boolean;
-  isMergeInProgress: boolean;
+  isIntegrationInProgress: boolean;
+  integrationState: IntegrationState | null;
 }> {
   const porcelain = await gitOutput(repo, ["status", "--porcelain"]);
   const mergeHead = await gitOutput(repo, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+  const rebaseHead = await gitOutput(repo, ["rev-parse", "-q", "--verify", "REBASE_HEAD"]);
+  const gitDirRaw = await gitOutput(repo, ["rev-parse", "--git-dir"]);
+  const gitDir =
+    gitDirRaw && gitDirRaw.trim().length > 0
+      ? gitDirRaw.startsWith("/") || gitDirRaw.startsWith("\\")
+        ? gitDirRaw
+        : resolve(repo, gitDirRaw)
+      : null;
+  const rebaseApplyDir = gitDir ? resolve(gitDir, "rebase-apply") : null;
+  const rebaseMergeDir = gitDir ? resolve(gitDir, "rebase-merge") : null;
+  const rebaseDirsPresent =
+    Boolean(rebaseApplyDir && existsSync(rebaseApplyDir)) ||
+    Boolean(rebaseMergeDir && existsSync(rebaseMergeDir));
+  const isMergeInProgress = Boolean(mergeHead);
+  const isRebaseInProgress = Boolean(rebaseHead || rebaseDirsPresent);
+  const integrationState: IntegrationState | null = isMergeInProgress
+    ? "merge"
+    : isRebaseInProgress
+      ? "rebase"
+      : null;
   return {
     isWorktreeDirty: Boolean(porcelain),
-    isMergeInProgress: Boolean(mergeHead),
+    isIntegrationInProgress: Boolean(integrationState),
+    integrationState,
   };
+}
+
+export type NotifyDependencyPreflightBlockParams = {
+  server: string;
+  sessionId: string;
+  authToken: string | null;
+  reason: string;
+  detail?: string;
+  runId?: string;
+  fetchImpl?: typeof fetch;
+};
+
+export type PreflightBlockNotificationResult =
+  | { ok: true }
+  | {
+      ok: false;
+      status?: number;
+      statusText?: string;
+      responseText?: string;
+      error?: string;
+    };
+
+export async function notifyDependencyPreflightBlock(
+  params: NotifyDependencyPreflightBlockParams,
+): Promise<PreflightBlockNotificationResult> {
+  const { server, sessionId, authToken, reason, detail, runId, fetchImpl } = params;
+  if (!server || !sessionId || !reason) {
+    console.warn(
+      "[RemoteBuddyAutonomousEngine] notifyDependencyPreflightBlock skipped: missing server, sessionId, or reason.",
+    );
+    return { ok: false, error: "missing_parameters" };
+  }
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+  const body: Record<string, unknown> = {
+    sessionId,
+    reason,
+    detail,
+    ts: new Date().toISOString(),
+  };
+  if (runId) body.runId = runId;
+  try {
+    const fetchFn = fetchImpl ?? fetch;
+    const res = await fetchFn(`${server}/autonomy/preflight/block`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let responseText = "";
+      try {
+        responseText = await res.text();
+      } catch {
+        // ignore body parse issues for logging
+      }
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] notifyDependencyPreflightBlock failed: ${res.status} ${res.statusText}${
+          responseText ? ` | ${responseText}` : ""
+        }`,
+      );
+      return {
+        ok: false,
+        status: res.status,
+        statusText: res.statusText,
+        responseText: responseText || undefined,
+      };
+    }
+    return { ok: true };
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[RemoteBuddyAutonomousEngine] notifyDependencyPreflightBlock error: ${errorMessage}`,
+    );
+    return { ok: false, error: errorMessage };
+  }
 }
 
 export class RemoteBuddyAutonomousEngine {
@@ -342,6 +442,8 @@ export class RemoteBuddyAutonomousEngine {
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
+  private readonly repoPreflightFn: typeof repoPreflight;
+  private readonly notifyPreflightBlock: typeof notifyDependencyPreflightBlock;
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -362,6 +464,8 @@ export class RemoteBuddyAutonomousEngine {
     llm: LLMClient;
     comm: CommunicationManager;
     config: PushPalsConfig;
+    repoPreflightFn?: typeof repoPreflight;
+    preflightNotifier?: typeof notifyDependencyPreflightBlock;
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
@@ -377,6 +481,8 @@ export class RemoteBuddyAutonomousEngine {
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
+    this.repoPreflightFn = opts.repoPreflightFn ?? repoPreflight;
+    this.notifyPreflightBlock = opts.preflightNotifier ?? notifyDependencyPreflightBlock;
   }
 
   private setPhase(phase: string): void {
@@ -428,6 +534,19 @@ export class RemoteBuddyAutonomousEngine {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
     return headers;
+  }
+
+  private describePreflightNotifyFailure(
+    result: PreflightBlockNotificationResult,
+  ): string {
+    if (result.ok) return "ok";
+    if ("error" in result && result.error) return result.error;
+    if (typeof result.status === "number") {
+      const statusLabel = result.statusText ? `${result.status} ${result.statusText}` : `${result.status}`;
+      return statusLabel.trim();
+    }
+    if ("responseText" in result && result.responseText) return result.responseText;
+    return "unknown_error";
   }
 
   private lockTtlMs(): number {
@@ -598,15 +717,17 @@ export class RemoteBuddyAutonomousEngine {
     runId: string,
     preflight: {
       isWorktreeDirty: boolean;
-      isMergeInProgress: boolean;
+      isIntegrationInProgress: boolean;
+      integrationState: IntegrationState | null;
     },
   ): Promise<Snapshot | null> {
     const qs = new URLSearchParams({
       sessionId: this.sessionId,
       runId,
       isWorktreeDirty: preflight.isWorktreeDirty ? "true" : "false",
-      isMergeInProgress: preflight.isMergeInProgress ? "true" : "false",
+      isIntegrationInProgress: preflight.isIntegrationInProgress ? "true" : "false",
     });
+    if (preflight.integrationState) qs.set("integrationState", preflight.integrationState);
     const res = await fetch(`${this.server}/autonomy/snapshot?${qs.toString()}`, {
       method: "GET",
       headers: this.headers(),
@@ -968,15 +1089,68 @@ export class RemoteBuddyAutonomousEngine {
       }
 
       this.setPhase("repo_preflight");
-      const preflight = await repoPreflight(this.autonomyRepo);
-      if (preflight.isMergeInProgress) {
+      const preflight = await this.repoPreflightFn(this.autonomyRepo);
+      if (preflight.isIntegrationInProgress) {
+        const integrationDetail =
+          preflight.integrationState === "rebase"
+            ? "Autonomy worktree has a rebase in progress."
+            : preflight.integrationState === "merge"
+              ? "Autonomy worktree has a merge in progress."
+              : "Autonomy worktree has a merge or rebase in progress.";
+        const notification = await this.notifyPreflightBlock({
+          server: this.server,
+          sessionId: this.sessionId,
+          authToken: this.authToken,
+          runId,
+          reason: "integration_in_progress",
+          detail: integrationDetail,
+        });
+        if (!notification.ok) {
+          const failureSummary = this.describePreflightNotifyFailure(notification);
+          console.warn(
+            `[RemoteBuddyAutonomousEngine] tick ${runId}: preflight block notification failed (${failureSummary}).`,
+          );
+          outcome = "failed";
+          outcomeDetail =
+            preflight.integrationState === "rebase"
+              ? "repo_preflight_rebase_notify_failed"
+              : preflight.integrationState === "merge"
+                ? "repo_preflight_merge_notify_failed"
+                : "repo_preflight_integration_notify_failed";
+          return;
+        }
         console.log(
-          "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (merge/rebase in progress).",
+          `[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (${integrationDetail.replace(
+            /\.$/,
+            "",
+          )}).`,
         );
-        outcomeDetail = "repo_preflight_merge_in_progress";
+        outcomeDetail =
+          preflight.integrationState === "rebase"
+            ? "repo_preflight_rebase_in_progress"
+            : preflight.integrationState === "merge"
+              ? "repo_preflight_merge_in_progress"
+              : "repo_preflight_integration_in_progress";
         return;
       }
       if (preflight.isWorktreeDirty && !this.cfg.allowDirtyWorktree) {
+        const notification = await this.notifyPreflightBlock({
+          server: this.server,
+          sessionId: this.sessionId,
+          authToken: this.authToken,
+          runId,
+          reason: "worktree_dirty",
+          detail: "Autonomy worktree has uncommitted changes and allow_dirty_worktree=false.",
+        });
+        if (!notification.ok) {
+          const failureSummary = this.describePreflightNotifyFailure(notification);
+          console.warn(
+            `[RemoteBuddyAutonomousEngine] tick ${runId}: dirty-worktree block notification failed (${failureSummary}).`,
+          );
+          outcome = "failed";
+          outcomeDetail = "repo_preflight_worktree_notify_failed";
+          return;
+        }
         console.log(
           "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (worktree is dirty and allow_dirty_worktree=false).",
         );
