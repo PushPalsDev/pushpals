@@ -18,6 +18,7 @@ const baseConfig: ReviewAgentConfig = {
   pollIntervalMs: 60_000,
   reviewerMdPath: "prompts/review_agent/reviewer.md",
   passThreshold: 9.5,
+  maxPrCommentsBeforeGiveUp: 10,
   mergeMethod: "squash",
   codexBin: "bun x --yes @openai/codex",
   codexAuthMode: "chatgpt",
@@ -51,6 +52,7 @@ const silentLogs = {
   logInfo: () => {},
   logWarn: () => {},
   logError: () => {},
+  closePullRequest: async () => ({ state: "closed", closed: true }),
   deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
 };
 
@@ -589,8 +591,11 @@ describe("ReviewAgent", () => {
           commentCalls += 1;
           approvalCommentBody = opts.body;
         },
-        fetchImpl: async () => {
-          enqueueCalls += 1;
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+          }
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
         },
       },
@@ -1215,6 +1220,81 @@ describe("ReviewAgent", () => {
     expect(mergeCalls).toBe(0);
     expect(commentCalls).toBe(1);
     expect(enqueueCalls).toBeGreaterThan(0);
+  });
+
+  test("closes PR and deletes branch when rejection hits configured PR comment cap", async () => {
+    const pr = makePr({ number: 67, html_url: "https://example.com/pr/67" });
+    let mergeCalls = 0;
+    let closeCalls = 0;
+    let closedPrNumber = 0;
+    let commentCalls = 0;
+    let deleteCalls = 0;
+    let deletedBranchRef = "";
+    let enqueueCalls = 0;
+
+    const comments = Array.from({ length: 10 }, (_, idx) => ({
+      id: idx + 1,
+      body: `Feedback item ${idx + 1}`,
+      userLogin: `reviewer-${idx + 1}`,
+      createdAt: `2026-02-20T00:${String(idx).padStart(2, "0")}:00Z`,
+      htmlUrl: `https://example.com/comment/${idx + 1}`,
+    }));
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 10 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.9,
+            summary: "Major gaps remain",
+            issues: ["Expand negative-path coverage"],
+            fix_instruction: "",
+          }),
+        mergePullRequest: async () => {
+          mergeCalls += 1;
+          return { merged: true, sha: "deadbeef", message: "merged" };
+        },
+        closePullRequest: async (opts) => {
+          closeCalls += 1;
+          closedPrNumber = opts.prNumber;
+          return { state: "closed", closed: true };
+        },
+        addPullRequestComment: async () => {
+          commentCalls += 1;
+        },
+        deleteBranchRef: async (opts) => {
+          deleteCalls += 1;
+          deletedBranchRef = opts.branchRef;
+          return { deleted: true, reason: "deleted" as const };
+        },
+        listPullRequestComments: async () => comments,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(mergeCalls).toBe(0);
+    expect(closeCalls).toBe(1);
+    expect(closedPrNumber).toBe(pr.number);
+    expect(commentCalls).toBe(1);
+    expect(deleteCalls).toBe(1);
+    expect(deletedBranchRef).toBe(pr.head.ref);
+    expect(enqueueCalls).toBe(0);
   });
 
   test("continues enqueue flow when PR feedback comment lookup fails", async () => {

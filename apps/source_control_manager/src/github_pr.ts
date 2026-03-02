@@ -317,6 +317,38 @@ export async function mergePullRequest(opts: {
   return data;
 }
 
+export interface ClosePullRequestResult {
+  state: string;
+  closed: boolean;
+}
+
+export async function closePullRequest(opts: {
+  token: string;
+  remoteUrl: string;
+  prNumber: number;
+}): Promise<ClosePullRequestResult> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}`;
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: githubHeaders(opts.token),
+    body: JSON.stringify({ state: "closed" }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw githubError(response.status, text);
+  }
+
+  const data = (await response.json()) as { state?: unknown };
+  const state = typeof data.state === "string" ? data.state : "";
+  return { state, closed: state.toLowerCase() === "closed" };
+}
+
 export interface DeleteBranchRefResult {
   deleted: boolean;
   reason: "deleted" | "not_found";
