@@ -18,7 +18,7 @@ codex_timeout_ms = 120000
 reasoning_effort = "high"
 
 [remotebuddy]
-max_workerpals = 20
+max_workerpals = 10
 crash_restart_enabled = true
 crash_restart_max_restarts = 3
 crash_restart_backoff_ms = 3000
