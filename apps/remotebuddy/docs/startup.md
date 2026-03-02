@@ -7,6 +7,12 @@ from a full outage). It sequences the dependent services, captures the telemetry
 green before admitting traffic, and lists the verification plus rollback actions that keep startup
 safe and auditable.
 
+## Running the automated preflight
+
+- Execute `bun run preflight` from the repo root to run the same startup checks (env-file precedence, Bun version, auth variables) without launching long-lived services.
+- Pass `--json` for machine-readable output, or rely on the default human-readable summary for manual bring-up.
+- Override the env file by setting `REMOTEBUDDY_PREFLIGHT_ENV_FILE=/path/to/.env` when you need to test a specific configuration snapshot.
+
 ## When to run this check
 
 - Any time you restart `bun run remotebuddy:only` outside a rolling deploy.
