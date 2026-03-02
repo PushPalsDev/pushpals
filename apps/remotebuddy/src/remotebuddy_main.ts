@@ -44,6 +44,15 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import {
+  DependencyPreflightCache,
+  type DependencySnapshot,
+  type PreflightReport,
+} from "./preflight.js";
+import {
+  ensureDependencySnapshot,
+  notifyDependencyPreflightBlock,
+} from "./dependency_gate.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -204,6 +213,7 @@ interface TaskExecuteJobParams {
     executionBudgetMs: number;
     finalizationBudgetMs: number;
   };
+  dependencies?: DependencySnapshot;
   targetPath?: string;
   recentContext: string[];
   recentJobs: Array<Record<string, unknown>>;
@@ -667,6 +677,7 @@ class RemoteBuddyOrchestrator {
   private readonly autonomousEngine: RemoteBuddyAutonomousEngine;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
+  private readonly dependencyPreflight: DependencyPreflightCache;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private statusSessionReady = false;
   private stopSessionEvents: (() => void) | null = null;
@@ -756,6 +767,14 @@ class RemoteBuddyOrchestrator {
     if (this.memoryEnabled) {
       this.persistentMemory.purgeExpired(this.memoryRetentionDays, this.repo);
     }
+    this.dependencyPreflight = new DependencyPreflightCache({
+      ttlMs: 120_000,
+      options: {
+        repoRoot: this.repo,
+        config: CONFIG,
+        env: process.env,
+      },
+    });
     this.comm = new CommunicationManager({
       serverUrl: this.server,
       sessionId: this.sessionId,
@@ -1179,6 +1198,23 @@ class RemoteBuddyOrchestrator {
     } catch (err) {
       console.warn("[RemoteBuddy] Could not persist planning memory:", err);
     }
+  }
+
+  private async blockRequestForDependencyFailure(
+    requestId: string,
+    turnId: string,
+    report: PreflightReport,
+  ): Promise<void> {
+    await notifyDependencyPreflightBlock({
+      requestId,
+      turnId,
+      report,
+      comm: this.comm,
+      server: this.server,
+      authHeaders: () => this.authHeaders(),
+      fetchImpl: fetch,
+      remember: (kind, summary, reqId) => this.rememberPersistentMemory(kind, summary, reqId),
+    });
   }
 
   private buildPlanningContext(priority: RequestPriority): string[] {
@@ -1687,6 +1723,8 @@ class RemoteBuddyOrchestrator {
         );
       }
 
+      let dependencySnapshot: DependencySnapshot | null = null;
+
       if (!requiresWorker) {
         await this.sendCommand({
           type: "assistant_message",
@@ -1746,6 +1784,16 @@ class RemoteBuddyOrchestrator {
           `completed_without_worker intent=${plan.intent} lane=deterministic`,
           requestId,
         );
+        return;
+      }
+
+      dependencySnapshot = await ensureDependencySnapshot(
+        this.dependencyPreflight,
+        async (report) => {
+          await this.blockRequestForDependencyFailure(requestId, turnId, report);
+        },
+      );
+      if (!dependencySnapshot) {
         return;
       }
 
@@ -1823,6 +1871,7 @@ class RemoteBuddyOrchestrator {
           executionBudgetMs,
           finalizationBudgetMs: this.finalizationBudgetMs,
         },
+        ...(dependencySnapshot ? { dependencies: dependencySnapshot } : {}),
         targetPath,
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
