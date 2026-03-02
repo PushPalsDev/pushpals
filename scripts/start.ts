@@ -349,7 +349,7 @@ const REQUIRED_DEPENDENCY_PROBES: Array<{
   {
     label: "Server protocol workspace package",
     fromDir: resolve(repoRoot, "apps", "server"),
-    moduleSpecifier: "protocol",
+    moduleSpecifier: "protocol/package.json",
     retryWithHoisted: true,
   },
   {
@@ -373,13 +373,13 @@ const REQUIRED_DEPENDENCY_PROBES: Array<{
   {
     label: "SourceControlManager protocol workspace package",
     fromDir: resolve(repoRoot, "apps", "source_control_manager"),
-    moduleSpecifier: "protocol",
+    moduleSpecifier: "protocol/package.json",
     retryWithHoisted: true,
   },
   {
     label: "packages/shared protocol workspace package",
     fromDir: resolve(repoRoot, "packages", "shared"),
-    moduleSpecifier: "protocol",
+    moduleSpecifier: "protocol/package.json",
     retryWithHoisted: true,
   },
 ];
@@ -422,7 +422,7 @@ const WORKSPACE_NODE_MODULES_HEALTH_CHECKS: Array<{
   {
     nodeModulesPath: resolve(repoRoot, "apps", "server", "node_modules"),
     resolveFromDir: resolve(repoRoot, "apps", "server"),
-    moduleSpecifier: "protocol",
+    moduleSpecifier: "protocol/package.json",
     label: "apps/server node_modules",
     moduleLabel: "apps/server protocol workspace link",
   },
@@ -450,14 +450,14 @@ const WORKSPACE_NODE_MODULES_HEALTH_CHECKS: Array<{
   {
     nodeModulesPath: resolve(repoRoot, "apps", "source_control_manager", "node_modules"),
     resolveFromDir: resolve(repoRoot, "apps", "source_control_manager"),
-    moduleSpecifier: "protocol",
+    moduleSpecifier: "protocol/package.json",
     label: "apps/source_control_manager node_modules",
     moduleLabel: "apps/source_control_manager protocol workspace link",
   },
   {
     nodeModulesPath: resolve(repoRoot, "packages", "shared", "node_modules"),
     resolveFromDir: resolve(repoRoot, "packages", "shared"),
-    moduleSpecifier: "protocol",
+    moduleSpecifier: "protocol/package.json",
     label: "packages/shared node_modules",
     moduleLabel: "packages/shared protocol workspace link",
   },
