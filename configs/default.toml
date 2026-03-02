@@ -85,6 +85,9 @@ max_dispatch_per_hour_by_type = { flaky_test = 4, lint_fix = 3, type_fix = 3, sm
 cooldown_fail_streak_threshold = 2
 cooldown_ms = 1800000
 allow_read_anywhere = true
+pr_feedback_comment_rows = 16
+pr_feedback_comment_chars = 600
+pr_feedback_summary_chars = 600
 question_ttl_ms = 259200000
 policy_version = "policy-v3.3"
 impact_model_version = "impact-v1"

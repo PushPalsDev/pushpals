@@ -131,6 +131,9 @@ export interface PushPalsConfig {
       cooldownFailStreakThreshold: number;
       cooldownMs: number;
       allowReadAnywhere: boolean;
+      prFeedbackCommentRows: number;
+      prFeedbackCommentChars: number;
+      prFeedbackSummaryChars: number;
       questionTtlMs: number;
       policyVersion: string;
       impactModelVersion: string;
@@ -1618,6 +1621,39 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         allowReadAnywhere:
           parseBoolEnv("REMOTEBUDDY_AUTONOMY_ALLOW_READ_ANYWHERE") ??
           asBoolean(remoteAutonomyNode.allow_read_anywhere, false),
+        prFeedbackCommentRows: Math.max(
+          1,
+          Math.min(
+            200,
+            asInt(
+              parseIntEnv("REMOTEBUDDY_AUTONOMY_PR_FEEDBACK_COMMENT_ROWS") ??
+                remoteAutonomyNode.pr_feedback_comment_rows,
+              16,
+            ),
+          ),
+        ),
+        prFeedbackCommentChars: Math.max(
+          32,
+          Math.min(
+            20_000,
+            asInt(
+              parseIntEnv("REMOTEBUDDY_AUTONOMY_PR_FEEDBACK_COMMENT_CHARS") ??
+                remoteAutonomyNode.pr_feedback_comment_chars,
+              600,
+            ),
+          ),
+        ),
+        prFeedbackSummaryChars: Math.max(
+          32,
+          Math.min(
+            20_000,
+            asInt(
+              parseIntEnv("REMOTEBUDDY_AUTONOMY_PR_FEEDBACK_SUMMARY_CHARS") ??
+                remoteAutonomyNode.pr_feedback_summary_chars,
+              600,
+            ),
+          ),
+        ),
         questionTtlMs: Math.max(
           60_000,
           asInt(
