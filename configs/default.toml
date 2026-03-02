@@ -38,7 +38,7 @@ status_heartbeat_ms = 120000
 workerpal_online_ttl_ms = 15000
 wait_for_workerpal_ms = 15000
 auto_spawn_workerpals = true
-max_workerpals = 20
+max_workerpals = 10
 workerpal_startup_timeout_ms = 10000
 workerpal_docker = true
 workerpal_require_docker = true
@@ -70,7 +70,7 @@ session_id = "remotebuddy-dev"
 
 [remotebuddy.autonomy]
 enabled = true
-tick_interval_ms = 120000
+tick_interval_ms = 300000
 heartbeat_log_ms = 30000
 vision_context_max_chars = 65536
 ideation_budget_ms = 20000
