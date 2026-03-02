@@ -4,6 +4,7 @@ import { basename, isAbsolute, join, resolve } from "path";
 import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import {
   addPullRequestComment,
+  closePullRequest,
   deleteBranchRef,
   type DeleteBranchRefResult,
   getCommitMessage,
@@ -33,6 +34,7 @@ interface ReviewAgentDeps {
   getPullRequestCommitMessage: typeof getPullRequestCommitMessage;
   listPullRequestComments: typeof listPullRequestComments;
   mergePullRequest: typeof mergePullRequest;
+  closePullRequest: typeof closePullRequest;
   deleteBranchRef: typeof deleteBranchRef;
   addPullRequestComment: typeof addPullRequestComment;
   invokeCodexReview: (prompt: string, config: ReviewAgentConfig) => Promise<string>;
@@ -68,6 +70,7 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   getPullRequestCommitMessage,
   listPullRequestComments,
   mergePullRequest,
+  closePullRequest,
   deleteBranchRef,
   addPullRequestComment,
   invokeCodexReview,
@@ -338,6 +341,18 @@ function formatRejectionComment(verdict: ReviewVerdict): string {
     "_This PR has been re-queued for automated fixes. A worker will address the issues above._",
   );
 
+  return lines.join("\n");
+}
+
+function formatGiveUpComment(verdict: ReviewVerdict, maxCommentsBeforeGiveUp: number): string {
+  const lines = [
+    `## ReviewAgent: PR Closed Without Merge (score ${verdict.score.toFixed(1)}/10)`,
+    "",
+    `**Verdict:** ${verdict.summary}`,
+    `**Reason:** Reached PR feedback comment cap (${Math.max(1, Math.floor(maxCommentsBeforeGiveUp))}).`,
+    "",
+    "_No additional auto-fix attempts will be made for this PR. The PR is being closed and its branch deleted._",
+  ];
   return lines.join("\n");
 }
 
@@ -1002,9 +1017,25 @@ export class ReviewAgent {
   }
 
   private async rejectPr(pr: GitHubPR, verdict: ReviewVerdict, diff: string): Promise<boolean> {
-    const rejectionComment = formatRejectionComment(verdict);
+    const maxPrCommentsBeforeGiveUp = Math.max(
+      1,
+      Math.floor(this.config.maxPrCommentsBeforeGiveUp),
+    );
     const { jobId, sessionId } = extractPrMeta(pr.body);
-    const recentComments = await this.listRecentPrComments(pr.number);
+    const recentComments = await this.listRecentPrComments(
+      pr.number,
+      Math.max(MAX_REVIEW_CONTEXT_COMMENTS * 3, maxPrCommentsBeforeGiveUp),
+    );
+    if (recentComments.length >= maxPrCommentsBeforeGiveUp) {
+      return await this.giveUpOnRejectedPr(pr, verdict, {
+        jobId,
+        sessionId,
+        recentComments,
+        maxPrCommentsBeforeGiveUp,
+      });
+    }
+
+    const rejectionComment = formatRejectionComment(verdict);
     try {
       await this.deps.addPullRequestComment({
         token: this.githubToken,
@@ -1073,11 +1104,79 @@ export class ReviewAgent {
     return true;
   }
 
+  private async giveUpOnRejectedPr(
+    pr: GitHubPR,
+    verdict: ReviewVerdict,
+    context: {
+      jobId: string | null;
+      sessionId: string | null;
+      recentComments: PullRequestComment[];
+      maxPrCommentsBeforeGiveUp: number;
+    },
+  ): Promise<boolean> {
+    this.deps.logWarn(
+      `[${ts()}] [ReviewAgent] PR #${pr.number} reached PR comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}); closing without merge.`,
+    );
+
+    try {
+      const result = await this.deps.closePullRequest({
+        token: this.githubToken,
+        remoteUrl: this.remoteUrl,
+        prNumber: pr.number,
+      });
+      if (!result.closed) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Close PR #${pr.number} request returned state=${result.state || "(unknown)"}; will retry on next poll.`,
+        );
+        return false;
+      }
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Failed to close PR #${pr.number} after comment-cap hit: ${err?.message ?? err}`,
+      );
+      return false;
+    }
+
+    const giveUpComment = formatGiveUpComment(verdict, context.maxPrCommentsBeforeGiveUp);
+    try {
+      await this.deps.addPullRequestComment({
+        token: this.githubToken,
+        remoteUrl: this.remoteUrl,
+        prNumber: pr.number,
+        body: giveUpComment,
+      });
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Closed PR #${pr.number} but failed to post give-up comment: ${err?.message ?? err}`,
+      );
+    }
+
+    await this.postAutonomyPrFeedback({
+      pr,
+      verdict: "rejected_comment_cap_closed",
+      verdictSummary: `${verdict.summary} | closed after reaching PR comment cap (${context.maxPrCommentsBeforeGiveUp}).`,
+      reviewScore: verdict.score,
+      jobId: context.jobId,
+      sessionId: context.sessionId,
+      comments: context.recentComments,
+    });
+
+    await this.deletePrHeadBranch(pr, "closed");
+    this.reReviewEnqueueCounts.delete(pr.number);
+    this.forceReReview.delete(pr.number);
+    this.reviewed.delete(pr.number);
+    return true;
+  }
+
   private async deleteMergedPrHeadBranch(pr: GitHubPR): Promise<void> {
+    await this.deletePrHeadBranch(pr, "merged");
+  }
+
+  private async deletePrHeadBranch(pr: GitHubPR, mode: "merged" | "closed"): Promise<void> {
     const plan = resolveMergedBranchDeletionPlan(pr);
     if (!plan.shouldDelete) {
       this.deps.logInfo(
-        `[${ts()}] [ReviewAgent] Skipping branch delete for PR #${pr.number}: ${plan.reason}`,
+        `[${ts()}] [ReviewAgent] Skipping branch delete for ${mode} PR #${pr.number}: ${plan.reason}`,
       );
       return;
     }
@@ -1089,16 +1188,16 @@ export class ReviewAgent {
       });
       if (result.deleted) {
         this.deps.logInfo(
-          `[${ts()}] [ReviewAgent] Deleted merged PR head branch ${plan.normalizedHeadRef} for PR #${pr.number}`,
+          `[${ts()}] [ReviewAgent] Deleted ${mode} PR head branch ${plan.normalizedHeadRef} for PR #${pr.number}`,
         );
       } else {
         this.deps.logInfo(
-          `[${ts()}] [ReviewAgent] Branch ${plan.normalizedHeadRef} already absent after merge for PR #${pr.number}`,
+          `[${ts()}] [ReviewAgent] Branch ${plan.normalizedHeadRef} already absent after ${mode} for PR #${pr.number}`,
         );
       }
     } catch (err: any) {
       this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] Failed to delete merged branch ${plan.normalizedHeadRef} for PR #${pr.number}: ${err?.message ?? err}`,
+        `[${ts()}] [ReviewAgent] Failed to delete ${mode} branch ${plan.normalizedHeadRef} for PR #${pr.number}: ${err?.message ?? err}`,
       );
     }
   }
@@ -1234,13 +1333,16 @@ export class ReviewAgent {
     });
   }
 
-  private async listRecentPrComments(prNumber: number): Promise<PullRequestComment[]> {
+  private async listRecentPrComments(
+    prNumber: number,
+    maxComments: number = MAX_REVIEW_CONTEXT_COMMENTS * 3,
+  ): Promise<PullRequestComment[]> {
     try {
       return await this.deps.listPullRequestComments({
         token: this.githubToken,
         remoteUrl: this.remoteUrl,
         prNumber,
-        maxComments: MAX_REVIEW_CONTEXT_COMMENTS * 3,
+        maxComments: Math.max(1, Math.floor(maxComments)),
       });
     } catch (err: any) {
       this.deps.logWarn(

@@ -171,6 +171,16 @@ export function validateConfig(config: SourceControlManagerConfig): void {
     );
   }
   if (
+    typeof config.reviewAgent.maxPrCommentsBeforeGiveUp !== "number" ||
+    !Number.isFinite(config.reviewAgent.maxPrCommentsBeforeGiveUp) ||
+    config.reviewAgent.maxPrCommentsBeforeGiveUp < 1 ||
+    config.reviewAgent.maxPrCommentsBeforeGiveUp > 100
+  ) {
+    throw new Error(
+      `Invalid config: reviewAgent.maxPrCommentsBeforeGiveUp must be between 1 and 100, got ${JSON.stringify(config.reviewAgent.maxPrCommentsBeforeGiveUp)}`,
+    );
+  }
+  if (
     config.reviewAgent.mergeMethod !== "squash" &&
     config.reviewAgent.mergeMethod !== "merge" &&
     config.reviewAgent.mergeMethod !== "rebase"

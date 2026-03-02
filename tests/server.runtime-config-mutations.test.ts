@@ -226,6 +226,7 @@ function makeConfig(projectRoot: string): PushPalsConfig {
         pollIntervalMs: 60000,
         reviewerMdPath: "prompts/review_agent/reviewer.md",
         passThreshold: 8.1,
+        maxPrCommentsBeforeGiveUp: 10,
         mergeMethod: "squash",
         codexBin: "bun x --yes @openai/codex",
         codexAuthMode: "chatgpt",
