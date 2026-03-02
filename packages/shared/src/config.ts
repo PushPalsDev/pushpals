@@ -223,6 +223,7 @@ export interface PushPalsConfig {
       pollIntervalMs: number;
       reviewerMdPath: string;
       passThreshold: number;
+      maxPrCommentsBeforeGiveUp: number;
       mergeMethod: "squash" | "merge" | "rebase";
       codexBin: string;
       codexAuthMode: string;
@@ -1238,6 +1239,17 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     const parsed = Number.parseFloat(raw);
     return Number.isFinite(parsed) ? Math.max(1, Math.min(10, parsed)) : 9.5;
   })();
+  const scmReviewAgentMaxPrCommentsBeforeGiveUp = Math.max(
+    1,
+    Math.min(
+      100,
+      asInt(
+        parseIntEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MAX_PR_COMMENTS_BEFORE_GIVE_UP") ??
+          scmReviewAgentNode.max_pr_comments_before_give_up,
+        10,
+      ),
+    ),
+  );
   const scmReviewAgentMergeMethodRaw = firstNonEmpty(
     process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MERGE_METHOD,
     asString(scmReviewAgentNode.merge_method, "squash"),
@@ -1811,6 +1823,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         pollIntervalMs: scmReviewAgentPollIntervalMs,
         reviewerMdPath: scmReviewAgentReviewerMdPath,
         passThreshold: scmReviewAgentPassThreshold,
+        maxPrCommentsBeforeGiveUp: scmReviewAgentMaxPrCommentsBeforeGiveUp,
         mergeMethod: scmReviewAgentMergeMethod,
         codexBin: scmReviewAgentCodexBin,
         codexAuthMode: scmReviewAgentCodexAuthMode,
