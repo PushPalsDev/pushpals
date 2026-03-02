@@ -48,6 +48,9 @@ const MAX_PR_RE_REVIEW_ENQUEUES = 500;
 const MAX_REVIEW_CONTEXT_COMMENTS = 8;
 const MAX_REVIEW_CONTEXT_COMMENT_CHARS = 320;
 const MAX_REVIEW_CONTEXT_TOTAL_CHARS = 3_000;
+const MAX_AUTONOMY_FEEDBACK_COMMENTS = 12;
+const MAX_AUTONOMY_FEEDBACK_COMMENT_CHARS = 500;
+const MAX_AUTONOMY_FEEDBACK_SUMMARY_CHARS = 500;
 const MAX_ACTIVE_FIX_JOB_SCAN = 500;
 const REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS = 60_000;
 const REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS = 60_000;
@@ -437,6 +440,10 @@ function truncateText(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   if (maxChars <= 3) return value.slice(0, maxChars);
   return `${value.slice(0, maxChars - 3).trimEnd()}...`;
+}
+
+function summarizeFeedbackText(value: string): string {
+  return truncateText(collapseWhitespace(value), MAX_AUTONOMY_FEEDBACK_SUMMARY_CHARS);
 }
 
 export function buildReviewFeedbackContext(
@@ -862,6 +869,7 @@ export class ReviewAgent {
   }
 
   private async approvePr(pr: GitHubPR, verdict: ReviewVerdict, diff: string): Promise<boolean> {
+    const { jobId, sessionId } = extractPrMeta(pr.body);
     try {
       await this.deps.addPullRequestComment({
         token: this.githubToken,
@@ -928,6 +936,16 @@ export class ReviewAgent {
       this.reReviewEnqueueCounts.delete(pr.number);
       this.forceReReview.delete(pr.number);
       this.reviewed.delete(pr.number);
+      const comments = await this.listRecentPrComments(pr.number);
+      await this.postAutonomyPrFeedback({
+        pr,
+        verdict: "approved_merged",
+        verdictSummary: verdict.summary,
+        reviewScore: verdict.score,
+        jobId,
+        sessionId,
+        comments,
+      });
       return true;
     } catch (err: any) {
       if (isUnmergeablePullRequestError(err)) {
@@ -966,11 +984,27 @@ export class ReviewAgent {
       return true;
     }
 
-    return this.enqueueMergeConflictJob(pr, verdict, sessionId, jobId, diff, mergeError);
+    const handled = await this.enqueueMergeConflictJob(pr, verdict, sessionId, jobId, diff, mergeError);
+    if (handled) {
+      const comments = await this.listRecentPrComments(pr.number);
+      await this.postAutonomyPrFeedback({
+        pr,
+        verdict: "approved_unmergeable",
+        verdictSummary:
+          `${verdict.summary} merge blocked: ${String((mergeError as { message?: unknown })?.message ?? mergeError ?? "")}`.trim(),
+        reviewScore: verdict.score,
+        jobId,
+        sessionId,
+        comments,
+      });
+    }
+    return handled;
   }
 
   private async rejectPr(pr: GitHubPR, verdict: ReviewVerdict, diff: string): Promise<boolean> {
     const rejectionComment = formatRejectionComment(verdict);
+    const { jobId, sessionId } = extractPrMeta(pr.body);
+    const recentComments = await this.listRecentPrComments(pr.number);
     try {
       await this.deps.addPullRequestComment({
         token: this.githubToken,
@@ -983,10 +1017,18 @@ export class ReviewAgent {
         `[${ts()}] [ReviewAgent] Failed to comment on PR #${pr.number}: ${err?.message ?? err}`,
       );
     }
+    await this.postAutonomyPrFeedback({
+      pr,
+      verdict: "rejected",
+      verdictSummary: verdict.summary,
+      reviewScore: verdict.score,
+      jobId,
+      sessionId,
+      comments: recentComments,
+    });
 
     // Always return true here so the SHA is cached and we don't post duplicate
     // rejection comments if the enqueue below fails. Enqueue errors are logged.
-    const { jobId, sessionId } = extractPrMeta(pr.body);
     if (!sessionId) {
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] PR #${pr.number} has no pushpals-sessionId in body - cannot re-queue`,
@@ -1010,9 +1052,15 @@ export class ReviewAgent {
       return true;
     }
 
-    const enqueued = await this.enqueueFixJob(pr, verdict, sessionId, jobId, diff, [
-      rejectionComment,
-    ]);
+    const enqueued = await this.enqueueFixJob(
+      pr,
+      verdict,
+      sessionId,
+      jobId,
+      diff,
+      [rejectionComment],
+      recentComments,
+    );
     if (enqueued) {
       const nextReReviewEnqueues = priorReReviewEnqueues + 1;
       this.reReviewEnqueueCounts.set(pr.number, nextReReviewEnqueues);
@@ -1186,23 +1234,93 @@ export class ReviewAgent {
     });
   }
 
+  private async listRecentPrComments(prNumber: number): Promise<PullRequestComment[]> {
+    try {
+      return await this.deps.listPullRequestComments({
+        token: this.githubToken,
+        remoteUrl: this.remoteUrl,
+        prNumber,
+        maxComments: MAX_REVIEW_CONTEXT_COMMENTS * 3,
+      });
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Failed to load comments for PR #${prNumber}: ${err?.message ?? err}`,
+      );
+      return [];
+    }
+  }
+
   private async getRecentFeedbackContext(
     pr: GitHubPR,
     excludedBodies: string[] = [],
+    prefetchedComments?: PullRequestComment[],
   ): Promise<string[]> {
+    const comments =
+      Array.isArray(prefetchedComments) && prefetchedComments.length > 0
+        ? prefetchedComments
+        : await this.listRecentPrComments(pr.number);
+    if (comments.length === 0) return [];
+    return buildReviewFeedbackContext(comments, excludedBodies);
+  }
+
+  private async postAutonomyPrFeedback(args: {
+    pr: GitHubPR;
+    verdict: string;
+    verdictSummary: string;
+    reviewScore: number;
+    jobId: string | null;
+    sessionId: string | null;
+    comments?: PullRequestComment[];
+  }): Promise<void> {
+    const normalizedVerdict = String(args.verdict ?? "").trim().toLowerCase();
+    if (!normalizedVerdict) return;
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
+
+    const normalizedHeadSha = normalizeReviewFixHeadSha(args.pr.head.sha) || "unknown";
+    const feedbackKey = `review_agent:pr:${args.pr.number}:head:${normalizedHeadSha}:verdict:${normalizedVerdict}`;
+    const comments = (Array.isArray(args.comments) ? args.comments : [])
+      .slice(0, MAX_AUTONOMY_FEEDBACK_COMMENTS)
+      .map((comment) => ({
+        body: truncateText(normalizeCommentBody(comment.body), MAX_AUTONOMY_FEEDBACK_COMMENT_CHARS),
+        userLogin: String(comment.userLogin ?? "").trim(),
+        createdAt: String(comment.createdAt ?? "").trim(),
+        htmlUrl: String(comment.htmlUrl ?? "").trim(),
+      }))
+      .filter((row) => row.body.length > 0);
+
+    const payload = {
+      source: "review_agent",
+      feedbackKey,
+      jobId: args.jobId ?? undefined,
+      sessionId: args.sessionId ?? undefined,
+      prNumber: args.pr.number,
+      prUrl: args.pr.html_url,
+      verdict: normalizedVerdict,
+      reviewScore: Number.isFinite(args.reviewScore) ? args.reviewScore : undefined,
+      reviewThreshold: this.config.passThreshold,
+      summary: summarizeFeedbackText(args.verdictSummary || args.pr.title || normalizedVerdict),
+      commentCount: comments.length,
+      comments,
+    };
+
     try {
-      const comments = await this.deps.listPullRequestComments({
-        token: this.githubToken,
-        remoteUrl: this.remoteUrl,
-        prNumber: pr.number,
-        maxComments: MAX_REVIEW_CONTEXT_COMMENTS * 3,
+      const response = await this.deps.fetchImpl(`${this.serverUrl}/autonomy/pr-feedback`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
       });
-      return buildReviewFeedbackContext(comments, excludedBodies);
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Failed to post autonomy PR feedback for PR #${args.pr.number}: HTTP ${response.status}${text ? `: ${text}` : ""}`,
+        );
+      }
     } catch (err: any) {
       this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] Failed to load comments for PR #${pr.number}; continuing without PR feedback context: ${err?.message ?? err}`,
+        `[${ts()}] [ReviewAgent] Failed to post autonomy PR feedback for PR #${args.pr.number}: ${err?.message ?? err}`,
       );
-      return [];
     }
   }
 
@@ -1213,6 +1331,7 @@ export class ReviewAgent {
     jobId: string | null,
     diff: string,
     excludedBodies: string[] = [],
+    prefetchedComments?: PullRequestComment[],
   ): Promise<boolean> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
     const issuesSummary = verdict.issues.length > 0 ? verdict.issues.join("; ") : "see summary";
@@ -1220,7 +1339,11 @@ export class ReviewAgent {
       verdict.fix_instruction.trim() || buildFallbackFixInstruction(pr, verdict);
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
     const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
-    const feedbackContext = await this.getRecentFeedbackContext(pr, excludedBodies);
+    const feedbackContext = await this.getRecentFeedbackContext(
+      pr,
+      excludedBodies,
+      prefetchedComments,
+    );
 
     const payload = {
       taskId,
