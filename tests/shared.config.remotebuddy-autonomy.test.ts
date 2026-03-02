@@ -5,7 +5,7 @@ import { join } from "path";
 import { loadPushPalsConfig } from "../packages/shared/src/config";
 
 describe("shared config remotebuddy autonomy parsing", () => {
-  test("defaults tickIntervalMs to 120000, allowDirtyWorktree to false, heartbeatLogMs to 30000, and visionContextMaxChars to 65536 when unset", () => {
+  test("defaults autonomy timing, safety, and PR-feedback limits when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
     const configDir = join(root, "config");
     mkdirSync(configDir, { recursive: true });
@@ -28,6 +28,9 @@ describe("shared config remotebuddy autonomy parsing", () => {
       expect(cfg.remotebuddy.autonomy.allowDirtyWorktree).toBe(false);
       expect(cfg.remotebuddy.autonomy.heartbeatLogMs).toBe(30_000);
       expect(cfg.remotebuddy.autonomy.visionContextMaxChars).toBe(65_536);
+      expect(cfg.remotebuddy.autonomy.prFeedbackCommentRows).toBe(16);
+      expect(cfg.remotebuddy.autonomy.prFeedbackCommentChars).toBe(600);
+      expect(cfg.remotebuddy.autonomy.prFeedbackSummaryChars).toBe(600);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

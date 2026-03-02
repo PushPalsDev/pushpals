@@ -913,6 +913,45 @@ export function createRequestHandler() {
         return makeJson(result, 200);
       }
 
+      // POST /autonomy/pr-feedback
+      if (pathname === "/autonomy/pr-feedback" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.recordPrFeedback(body);
+        if (!result.ok) return makeJson(result, 400);
+
+        const sessionId = compactText(body.sessionId, 128);
+        const session = sessionId ? sessionManager.getSession(sessionId) : null;
+        if (session) {
+          session.emit({
+            protocolVersion: PROTOCOL_VERSION,
+            id: randomUUID(),
+            ts: new Date().toISOString(),
+            sessionId,
+            type: "autonomy_feedback_recorded",
+            from: "server:autonomy",
+            payload: {
+              objectiveId:
+                compactText(body.objectiveId ?? body.objective_id ?? result.objectiveId, 128) ||
+                "unknown",
+              patternKey:
+                compactText(body.patternKey ?? body.pattern_key ?? result.patternKey, 128) ||
+                "unknown",
+              outcome:
+                compactText(body.verdict ?? body.userAction ?? body.user_action ?? "pr_feedback", 120) ||
+                "pr_feedback",
+              success:
+                typeof result.success === "boolean"
+                  ? result.success
+                  : Boolean(body.success),
+            },
+          });
+        }
+        return makeJson(result, 200);
+      }
+
       // GET /questions
       if (pathname === "/questions" && method === "GET") {
         const denied = requireAuth();

@@ -45,6 +45,12 @@ interface FeedbackPrior {
   updated_at: string;
 }
 
+interface PrFeedbackSignalRow {
+  verdict: string | null;
+  summary: string | null;
+  comment_count: number | null;
+}
+
 interface OpenObjective {
   objective_id: string;
   status: string;
@@ -149,6 +155,40 @@ const TRIGGER_TYPES = new Set<SignalValue["type"]>([
 ]);
 const RECENT_SUCCESS_SUPPRESSION_WINDOW_HOURS = 24;
 
+function isNegativePrFeedbackVerdict(value: string): boolean {
+  const text = value.toLowerCase();
+  return (
+    text.includes("reject") ||
+    text.includes("unmergeable") ||
+    text.includes("merge_conflict") ||
+    text.includes("merge_failed") ||
+    text.includes("failed")
+  );
+}
+
+function deriveOutcomeFromPrFeedbackVerdict(
+  verdict: string,
+): { success: boolean; userAction: string; reopenedWithin24h: boolean; regressionFlag: boolean } | null {
+  const text = verdict.toLowerCase();
+  if (isNegativePrFeedbackVerdict(text)) {
+    return {
+      success: false,
+      userAction: "rejected",
+      reopenedWithin24h: true,
+      regressionFlag: true,
+    };
+  }
+  if (text.includes("approved") || text.includes("merged")) {
+    return {
+      success: true,
+      userAction: "accepted",
+      reopenedWithin24h: false,
+      regressionFlag: false,
+    };
+  }
+  return null;
+}
+
 export interface AutonomySnapshot {
   snapshot_id: string;
   snapshot_created_at: string;
@@ -197,6 +237,13 @@ function asObject(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string {
   return String(value ?? "").trim();
+}
+
+function truncateText(value: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (value.length <= maxChars) return value;
+  if (maxChars <= 3) return value.slice(0, maxChars);
+  return `${value.slice(0, maxChars - 3).trimEnd()}...`;
 }
 
 function asStringArray(value: unknown): string[] {
@@ -490,6 +537,33 @@ export class AutonomyStore {
         sample_count INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS autonomy_pr_feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        feedback_key TEXT,
+        objective_id TEXT,
+        request_id TEXT,
+        job_id TEXT,
+        pattern_key TEXT NOT NULL,
+        pr_number INTEGER,
+        pr_url TEXT,
+        verdict TEXT NOT NULL,
+        review_score REAL,
+        review_threshold REAL,
+        summary TEXT,
+        comment_count INTEGER NOT NULL DEFAULT 0,
+        comments_json TEXT,
+        source TEXT NOT NULL DEFAULT 'review_agent',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_pattern_created
+        ON autonomy_pr_feedback(pattern_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_created
+        ON autonomy_pr_feedback(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_job
+        ON autonomy_pr_feedback(job_id, created_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_key
+        ON autonomy_pr_feedback(feedback_key)
+        WHERE feedback_key IS NOT NULL AND feedback_key <> '';
       CREATE TABLE IF NOT EXISTS questions_queue (
         id TEXT PRIMARY KEY,
         objective_id TEXT NOT NULL,
@@ -619,6 +693,78 @@ export class AutonomyStore {
       value: clamp01(regretCount / 6),
       evidence: `reopened_within_24h=${regretCount}`,
     });
+
+    let prFeedbackRows: PrFeedbackSignalRow[] = [];
+    try {
+      prFeedbackRows = this.db
+        .prepare(
+          `SELECT verdict, summary, comment_count
+           FROM autonomy_pr_feedback
+           WHERE datetime(created_at) >= datetime('now', '-24 hours')
+           ORDER BY created_at DESC
+           LIMIT 60`,
+        )
+        .all() as PrFeedbackSignalRow[];
+    } catch {
+      prFeedbackRows = [];
+    }
+    if (prFeedbackRows.length > 0) {
+      const negativeRows = prFeedbackRows.filter((row) =>
+        isNegativePrFeedbackVerdict(asString(row.verdict)),
+      );
+      if (negativeRows.length > 0) {
+        const totalComments = negativeRows.reduce(
+          (sum, row) => sum + Math.max(0, Math.floor(asNumber(row.comment_count, 0))),
+          0,
+        );
+        const negativeRatio = negativeRows.length / Math.max(1, prFeedbackRows.length);
+        topSignals.push({
+          signal_id: "sig_pr_feedback_24h",
+          type: "regret_signal",
+          value: clamp01(
+            0.55 * negativeRatio +
+              0.3 * clamp01(negativeRows.length / 6) +
+              0.15 * clamp01(totalComments / 20),
+          ),
+          evidence: `pr_feedback_negative=${negativeRows.length}/${prFeedbackRows.length} comments=${totalComments}`,
+        });
+
+        const byType = new Map<SignalValue["type"], number>();
+        for (const row of negativeRows) {
+          const text = `${asString(row.verdict)} ${asString(row.summary)}`.trim();
+          const signalType = normalizeSignalType(text);
+          byType.set(signalType, (byType.get(signalType) ?? 0) + 1);
+        }
+        const typed = [...byType.entries()]
+          .sort((a, b) => {
+            if (b[1] !== a[1]) return b[1] - a[1];
+            return a[0].localeCompare(b[0]);
+          })
+          .slice(0, 3);
+        for (let i = 0; i < typed.length; i++) {
+          const [type, count] = typed[i];
+          topSignals.push({
+            signal_id: `sig_pr_feedback_type_${i + 1}`,
+            type,
+            value: clamp01(count / 4),
+            evidence: `pr feedback ${type} count=${count}`,
+          });
+        }
+      }
+
+      for (let i = 0; i < Math.min(prFeedbackRows.length, 3); i++) {
+        const row = prFeedbackRows[i];
+        const summary = truncateText(asString(row.summary), 180);
+        if (!summary) continue;
+        const verdict = asString(row.verdict) || "feedback";
+        topSignals.push({
+          signal_id: `sig_pr_comment_${i + 1}`,
+          type: normalizeSignalType(`${verdict} ${summary}`),
+          value: clamp01(0.38 + Math.min(0.28, summary.length / 500)),
+          evidence: `pr ${verdict}: ${summary}`,
+        });
+      }
+    }
 
     return topSignals
       .sort((a, b) => b.value - a.value)
@@ -1703,18 +1849,293 @@ export class AutonomyStore {
     return { ok: true, objectiveId, questionId, patternKey };
   }
 
+  private resolvePatternContext(params: {
+    objectiveId?: string | null;
+    requestId?: string | null;
+    jobId?: string | null;
+    prUrl?: string | null;
+  }): { objectiveId: string | null; requestId: string | null; jobId: string | null; patternKey: string | null } | null {
+    const objectiveId = asString(params.objectiveId);
+    const requestId = asString(params.requestId);
+    const jobId = asString(params.jobId);
+    const prUrl = asString(params.prUrl);
+
+    const readByObjective = (id: string) =>
+      this.db
+        .prepare(
+          `SELECT id AS objectiveId, request_id AS requestId, job_id AS jobId, pattern_key AS patternKey
+           FROM autonomy_objectives
+           WHERE id = ?
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+        )
+        .get(id) as
+        | {
+            objectiveId: string | null;
+            requestId: string | null;
+            jobId: string | null;
+            patternKey: string | null;
+          }
+        | undefined;
+    const readByRequest = (id: string) =>
+      this.db
+        .prepare(
+          `SELECT id AS objectiveId, request_id AS requestId, job_id AS jobId, pattern_key AS patternKey
+           FROM autonomy_objectives
+           WHERE request_id = ?
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+        )
+        .get(id) as
+        | {
+            objectiveId: string | null;
+            requestId: string | null;
+            jobId: string | null;
+            patternKey: string | null;
+          }
+        | undefined;
+    const readByJob = (id: string) =>
+      this.db
+        .prepare(
+          `SELECT id AS objectiveId, request_id AS requestId, job_id AS jobId, pattern_key AS patternKey
+           FROM autonomy_objectives
+           WHERE job_id = ?
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+        )
+        .get(id) as
+        | {
+            objectiveId: string | null;
+            requestId: string | null;
+            jobId: string | null;
+            patternKey: string | null;
+          }
+        | undefined;
+
+    const readByPrUrl = (url: string) =>
+      this.db
+        .prepare(
+          `SELECT o.id AS objectiveId,
+                  o.request_id AS requestId,
+                  o.job_id AS jobId,
+                  o.pattern_key AS patternKey
+           FROM autonomy_objectives o
+           JOIN jobs j ON j.id = o.job_id
+           WHERE j.prUrl = ? OR LOWER(j.prUrl) = LOWER(?)
+           ORDER BY o.updated_at DESC
+           LIMIT 1`,
+        )
+        .get(url, url) as
+        | {
+            objectiveId: string | null;
+            requestId: string | null;
+            jobId: string | null;
+            patternKey: string | null;
+          }
+        | undefined;
+
+    const row =
+      (objectiveId ? readByObjective(objectiveId) : undefined) ??
+      (jobId ? readByJob(jobId) : undefined) ??
+      (requestId ? readByRequest(requestId) : undefined) ??
+      (prUrl ? readByPrUrl(prUrl) : undefined);
+
+    if (!row) return null;
+    return {
+      objectiveId: asString(row.objectiveId) || null,
+      requestId: asString(row.requestId) || null,
+      jobId: asString(row.jobId) || null,
+      patternKey: asString(row.patternKey) || null,
+    };
+  }
+
+  recordPrFeedback(body: Record<string, unknown>): {
+    ok: boolean;
+    reason?: string;
+    patternKey?: string;
+    objectiveId?: string;
+    deduped?: boolean;
+    success?: boolean;
+    userAction?: string;
+  } {
+    const now = asIsoNow();
+    const verdict = asString(body.verdict).toLowerCase();
+    if (!verdict) return { ok: false, reason: "verdict is required" };
+
+    const feedbackKey = asString(body.feedbackKey ?? body.feedback_key) || null;
+    const objectiveIdRaw = asString(body.objectiveId ?? body.objective_id) || null;
+    const requestIdRaw = asString(body.requestId ?? body.request_id) || null;
+    const jobIdRaw = asString(body.jobId ?? body.job_id) || null;
+    const prUrl = asString(body.prUrl ?? body.pr_url) || null;
+
+    let patternKey = asString(body.patternKey ?? body.pattern_key) || null;
+    const resolved = this.resolvePatternContext({
+      objectiveId: objectiveIdRaw,
+      requestId: requestIdRaw,
+      jobId: jobIdRaw,
+      prUrl,
+    });
+    if (!patternKey) {
+      patternKey = asString(resolved?.patternKey) || null;
+    }
+    if (!patternKey) {
+      return {
+        ok: false,
+        reason: "unable to resolve patternKey from objectiveId/requestId/jobId/prUrl",
+      };
+    }
+
+    const objectiveId = objectiveIdRaw ?? resolved?.objectiveId ?? null;
+    const requestId = requestIdRaw ?? resolved?.requestId ?? null;
+    const jobId = jobIdRaw ?? resolved?.jobId ?? null;
+
+    const reviewScore = Number.isFinite(asNumber(body.reviewScore ?? body.review_score, Number.NaN))
+      ? asNumber(body.reviewScore ?? body.review_score, 0)
+      : null;
+    const reviewThreshold = Number.isFinite(
+      asNumber(body.reviewThreshold ?? body.review_threshold, Number.NaN),
+    )
+      ? asNumber(body.reviewThreshold ?? body.review_threshold, 0)
+      : null;
+    const prFeedbackCommentRows = Math.max(
+      1,
+      Math.floor(asNumber(this.config.remotebuddy.autonomy.prFeedbackCommentRows, 16)),
+    );
+    const prFeedbackCommentChars = Math.max(
+      32,
+      Math.floor(asNumber(this.config.remotebuddy.autonomy.prFeedbackCommentChars, 600)),
+    );
+    const prFeedbackSummaryChars = Math.max(
+      32,
+      Math.floor(asNumber(this.config.remotebuddy.autonomy.prFeedbackSummaryChars, 600)),
+    );
+    const summary = truncateText(
+      asString(body.summary ?? body.verdictSummary ?? body.verdict_summary),
+      prFeedbackSummaryChars,
+    );
+    const source = asString(body.source) || "review_agent";
+    const prNumber = Number.isFinite(asNumber(body.prNumber ?? body.pr_number, Number.NaN))
+      ? Math.max(0, Math.floor(asNumber(body.prNumber ?? body.pr_number, 0)))
+      : null;
+
+    const rawComments = Array.isArray(body.comments) ? body.comments : [];
+    const comments = rawComments
+      .map((entry) => {
+        const row = asObject(entry);
+        const text = truncateText(asString(row.body), prFeedbackCommentChars);
+        if (!text) return null;
+        return {
+          body: text,
+          user_login: asString(row.userLogin ?? row.user_login ?? row.author),
+          created_at: asString(row.createdAt ?? row.created_at),
+          html_url: asString(row.htmlUrl ?? row.html_url),
+        };
+      })
+      .filter((entry): entry is { body: string; user_login: string; created_at: string; html_url: string } =>
+        Boolean(entry),
+      )
+      .slice(0, prFeedbackCommentRows);
+    const payloadCommentCount = Number.isFinite(asNumber(body.commentCount ?? body.comment_count, Number.NaN))
+      ? Math.max(0, Math.floor(asNumber(body.commentCount ?? body.comment_count, 0)))
+      : 0;
+    const commentCount = Math.max(payloadCommentCount, comments.length);
+
+    const insertInfo = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO autonomy_pr_feedback (
+          feedback_key, objective_id, request_id, job_id, pattern_key, pr_number, pr_url,
+          verdict, review_score, review_threshold, summary, comment_count, comments_json, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        feedbackKey,
+        objectiveId,
+        requestId,
+        jobId,
+        patternKey,
+        prNumber,
+        prUrl,
+        verdict,
+        reviewScore,
+        reviewThreshold,
+        summary || null,
+        commentCount,
+        comments.length > 0 ? JSON.stringify(comments) : null,
+        source,
+        now,
+      );
+    const inserted = Number(insertInfo.changes ?? 0) > 0;
+    if (!inserted) {
+      return {
+        ok: true,
+        deduped: true,
+        patternKey,
+        ...(objectiveId ? { objectiveId } : {}),
+      };
+    }
+
+    const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
+    if (!mappedOutcome) {
+      return {
+        ok: true,
+        patternKey,
+        ...(objectiveId ? { objectiveId } : {}),
+      };
+    }
+
+    const outcome = this.recordOutcome({
+      objectiveId,
+      requestId,
+      jobId,
+      patternKey,
+      success: mappedOutcome.success,
+      retries: 0,
+      latencyMs: null,
+      userAction: mappedOutcome.userAction,
+      reopenedWithin24h: mappedOutcome.reopenedWithin24h,
+      regressionFlag: mappedOutcome.regressionFlag,
+    });
+    if (!outcome.ok) {
+      return {
+        ok: false,
+        reason: outcome.reason,
+      };
+    }
+    return {
+      ok: true,
+      patternKey,
+      ...(objectiveId ? { objectiveId } : {}),
+      success: mappedOutcome.success,
+      userAction: mappedOutcome.userAction,
+    };
+  }
+
   recordOutcome(body: Record<string, unknown>): { ok: boolean; reason?: string } {
-    const patternKey = asString(body.patternKey ?? body.pattern_key);
+    let patternKey = asString(body.patternKey ?? body.pattern_key);
+    const objectiveIdRaw = asString(body.objectiveId ?? body.objective_id) || null;
+    const requestIdRaw = asString(body.requestId ?? body.request_id) || null;
+    const jobIdRaw = asString(body.jobId ?? body.job_id) || null;
+    const resolved =
+      !patternKey || !objectiveIdRaw || !requestIdRaw || !jobIdRaw
+        ? this.resolvePatternContext({
+            objectiveId: objectiveIdRaw,
+            requestId: requestIdRaw,
+            jobId: jobIdRaw,
+          })
+        : null;
+    if (!patternKey) {
+      patternKey = asString(resolved?.patternKey);
+    }
     if (!patternKey) return { ok: false, reason: "patternKey is required" };
+    const objectiveId = objectiveIdRaw ?? resolved?.objectiveId ?? null;
+    const requestId = requestIdRaw ?? resolved?.requestId ?? null;
+    const jobId = jobIdRaw ?? resolved?.jobId ?? null;
     const now = asIsoNow();
     const success = asBoolean(body.success, false);
     const retries = Math.max(0, Math.floor(asNumber(body.retries, 0)));
     const latencyMs = Number.isFinite(asNumber(body.latencyMs ?? body.latency_ms, Number.NaN))
       ? Math.max(0, Math.floor(asNumber(body.latencyMs ?? body.latency_ms, 0)))
       : null;
-    const objectiveId = asString(body.objectiveId ?? body.objective_id) || null;
-    const requestId = asString(body.requestId ?? body.request_id) || null;
-    const jobId = asString(body.jobId ?? body.job_id) || null;
     const userAction = asString(body.userAction ?? body.user_action) || null;
     const reopenedWithin24h = asBoolean(
       body.reopenedWithin24h ?? body.reopened_within_24h,
