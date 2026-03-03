@@ -45,14 +45,15 @@ import {
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
 import {
-  DependencyPreflightCache,
-  type DependencySnapshot,
-  type PreflightReport,
-} from "./preflight.js";
-import {
-  ensureDependencySnapshot,
   notifyDependencyPreflightBlock,
-} from "./dependency_gate.js";
+  runPreflightChecks,
+  type PreflightFailureSummary,
+} from "./preflight.js";
+
+type DependencyPreflightHooks = {
+  runPreflightChecks?: typeof runPreflightChecks;
+  notifyDependencyPreflightBlock?: typeof notifyDependencyPreflightBlock;
+};
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -213,7 +214,6 @@ interface TaskExecuteJobParams {
     executionBudgetMs: number;
     finalizationBudgetMs: number;
   };
-  dependencies?: DependencySnapshot;
   targetPath?: string;
   recentContext: string[];
   recentJobs: Array<Record<string, unknown>>;
@@ -646,7 +646,7 @@ function extractClarificationFromJobFailure(
   return null;
 }
 
-class RemoteBuddyOrchestrator {
+export class RemoteBuddyOrchestrator {
   private static readonly SESSION_MONITOR_MAX_WS_ERRORS = Math.max(
     1,
     Number.parseInt(process.env.REMOTEBUDDY_SESSION_MONITOR_MAX_WS_ERRORS ?? "6", 10) || 6,
@@ -677,7 +677,8 @@ class RemoteBuddyOrchestrator {
   private readonly autonomousEngine: RemoteBuddyAutonomousEngine;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
-  private readonly dependencyPreflight: DependencyPreflightCache;
+  private readonly runPreflightChecksImpl: typeof runPreflightChecks;
+  private readonly notifyDependencyPreflightBlockImpl: typeof notifyDependencyPreflightBlock;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private statusSessionReady = false;
   private stopSessionEvents: (() => void) | null = null;
@@ -688,6 +689,7 @@ class RemoteBuddyOrchestrator {
   private disposed = false;
   private sessionMonitorWsErrorCount = 0;
   private sessionMonitorFatal = false;
+  private dependencyPreflightLoggedStatus: "ok" | "fail" | null = null;
 
   /** Serialises async request handling to preserve ordering */
   private chain: Promise<void> = Promise.resolve();
@@ -711,7 +713,8 @@ class RemoteBuddyOrchestrator {
   private static readonly CHAT_CONTEXT_MAX = 8;
   private static readonly CHAT_CONTEXT_ENTRY_CHARS = 420;
 
-  constructor(opts: {
+  constructor(
+    opts: {
     server: string;
     sessionId: string;
     authToken: string | null;
@@ -720,7 +723,9 @@ class RemoteBuddyOrchestrator {
     idempotency: IdempotencyStore;
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
-  }) {
+  },
+    preflightHooks: DependencyPreflightHooks = {},
+  ) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
@@ -728,6 +733,9 @@ class RemoteBuddyOrchestrator {
     this.idempotency = opts.idempotency;
     this.persistentMemory = opts.persistentMemory;
     this.jobsDbPath = opts.jobsDbPath;
+    this.runPreflightChecksImpl = preflightHooks.runPreflightChecks ?? runPreflightChecks;
+    this.notifyDependencyPreflightBlockImpl =
+      preflightHooks.notifyDependencyPreflightBlock ?? notifyDependencyPreflightBlock;
     const remoteCfg = CONFIG.remotebuddy;
     this.workerOnlineTtlMs = Math.max(1_000, remoteCfg.workerpalOnlineTtlMs);
     this.waitForWorkerMs = Math.max(0, remoteCfg.waitForWorkerpalMs);
@@ -767,14 +775,6 @@ class RemoteBuddyOrchestrator {
     if (this.memoryEnabled) {
       this.persistentMemory.purgeExpired(this.memoryRetentionDays, this.repo);
     }
-    this.dependencyPreflight = new DependencyPreflightCache({
-      ttlMs: 120_000,
-      options: {
-        repoRoot: this.repo,
-        config: CONFIG,
-        env: process.env,
-      },
-    });
     this.comm = new CommunicationManager({
       serverUrl: this.server,
       sessionId: this.sessionId,
@@ -1200,23 +1200,6 @@ class RemoteBuddyOrchestrator {
     }
   }
 
-  private async blockRequestForDependencyFailure(
-    requestId: string,
-    turnId: string,
-    report: PreflightReport,
-  ): Promise<void> {
-    await notifyDependencyPreflightBlock({
-      requestId,
-      turnId,
-      report,
-      comm: this.comm,
-      server: this.server,
-      authHeaders: () => this.authHeaders(),
-      fetchImpl: fetch,
-      remember: (kind, summary, reqId) => this.rememberPersistentMemory(kind, summary, reqId),
-    });
-  }
-
   private buildPlanningContext(priority: RequestPriority): string[] {
     const fromMemory = this.persistentPlanningContextSnapshot(priority);
     const live = this.planningContextSnapshot(priority);
@@ -1513,6 +1496,91 @@ class RemoteBuddyOrchestrator {
     return waited?.workerId ?? null;
   }
 
+  private async dependencyPreflightGate(): Promise<PreflightFailureSummary | null> {
+    let failure: PreflightFailureSummary | null = null;
+    try {
+      const result = await this.runPreflightChecksImpl({ repoRoot: this.repo });
+      if (!result.ok) {
+        failure =
+          result.failure ?? {
+            id: "dependency",
+            label: "Workspace dependency health",
+            detail: "Dependency preflight failed without detail.",
+          };
+      }
+    } catch (err) {
+      const detail =
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : "Unknown dependency preflight error.";
+      failure = {
+        id: "dependency",
+        label: "Workspace dependency health",
+        detail: `Dependency preflight crashed: ${detail}`,
+      };
+    }
+
+    const previousStatus = this.dependencyPreflightLoggedStatus;
+    if (failure) {
+      if (previousStatus !== "fail") {
+        console.error(`[RemoteBuddy] Dependency preflight failed: ${failure.detail}`);
+      }
+      this.dependencyPreflightLoggedStatus = "fail";
+    } else {
+      if (previousStatus === "fail") {
+        console.log("[RemoteBuddy] Dependency preflight recovered.");
+      }
+      this.dependencyPreflightLoggedStatus = "ok";
+    }
+    return failure;
+  }
+
+  private async handleDependencyPreflightFailure(
+    requestId: string,
+    turnId: string,
+    failure: PreflightFailureSummary,
+  ): Promise<boolean> {
+    const issue = failure.issues?.[0];
+    const issueDetail = issue ? `${issue.label}: ${issue.detail}` : failure.detail;
+    try {
+      await this.comm.assistantMessage(
+        `I cannot start this request because workspace dependencies look unhealthy (${issueDetail}). ` +
+          "Please run `bun install` in the repository root to repair dependencies, then retry this request.",
+        { turnId, correlationId: requestId },
+      );
+    } catch (err) {
+      console.error(
+        `[RemoteBuddy] Failed to send dependency preflight assistant message for ${requestId}:`,
+        err,
+      );
+    }
+
+    try {
+      const notifyResult = await this.notifyDependencyPreflightBlockImpl({
+        server: this.server,
+        requestId,
+        authHeaders: this.authHeaders(),
+        failure,
+      });
+      if (!notifyResult.delivered) {
+        const suffix = notifyResult.error ? ` (${notifyResult.error})` : "";
+        console.error(
+          `[RemoteBuddy] Dependency preflight block notification for ${requestId} was not delivered${suffix}.`,
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.error(
+        `[RemoteBuddy] Failed to notify dependency preflight block for ${requestId}:`,
+        err,
+      );
+      return false;
+    }
+  }
+
   // In this architecture, RemoteBuddy only creates tasks/jobs via polling.
   // Job completion tracking is handled by the server event stream and workers.
   // ── Dispatch, Polling for Request Queue ────────────────────────────────────────
@@ -1538,7 +1606,12 @@ class RemoteBuddyOrchestrator {
       console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
       return;
     }
-    this.idempotency.markHandled(this.sessionId, requestId);
+    let handledCommitted = false;
+    const markHandled = (): void => {
+      if (handledCommitted) return;
+      this.idempotency.markHandled(this.sessionId, requestId);
+      handledCommitted = true;
+    };
 
     const prompt = String(request.prompt ?? "").trim();
     if (!prompt) {
@@ -1547,7 +1620,11 @@ class RemoteBuddyOrchestrator {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({ message: "Request missing prompt" }),
-      }).catch(() => {});
+      })
+        .catch(() => {})
+        .finally(() => {
+          markHandled();
+        });
       return;
     }
 
@@ -1578,6 +1655,23 @@ class RemoteBuddyOrchestrator {
             : 90_000,
     );
     const turnId = randomUUID();
+    const dependencyFailure = await this.dependencyPreflightGate();
+    if (dependencyFailure) {
+      const delivered = await this.handleDependencyPreflightFailure(
+        requestId,
+        turnId,
+        dependencyFailure,
+      );
+      if (delivered) {
+        markHandled();
+      } else {
+        console.warn(
+          `[RemoteBuddy] Dependency preflight failure for ${requestId} not acknowledged; request will be retried once the server replays it.`,
+        );
+      }
+      return;
+    }
+    markHandled();
     const planningContext = this.buildPlanningContext(priority);
     this.rememberPersistentMemory(
       "request",
@@ -1723,8 +1817,6 @@ class RemoteBuddyOrchestrator {
         );
       }
 
-      let dependencySnapshot: DependencySnapshot | null = null;
-
       if (!requiresWorker) {
         await this.sendCommand({
           type: "assistant_message",
@@ -1784,16 +1876,6 @@ class RemoteBuddyOrchestrator {
           `completed_without_worker intent=${plan.intent} lane=deterministic`,
           requestId,
         );
-        return;
-      }
-
-      dependencySnapshot = await ensureDependencySnapshot(
-        this.dependencyPreflight,
-        async (report) => {
-          await this.blockRequestForDependencyFailure(requestId, turnId, report);
-        },
-      );
-      if (!dependencySnapshot) {
         return;
       }
 
@@ -1871,7 +1953,6 @@ class RemoteBuddyOrchestrator {
           executionBudgetMs,
           finalizationBudgetMs: this.finalizationBudgetMs,
         },
-        ...(dependencySnapshot ? { dependencies: dependencySnapshot } : {}),
         targetPath,
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
