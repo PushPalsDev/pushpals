@@ -44,16 +44,7 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
-import type { RemotebuddyPreflightConfig } from "./startup/preflight_runner.js";
-import {
-  ensurePreflightPasses,
-  RemoteBuddyPreflightError,
-  type PreflightGateExecutor,
-} from "./startup/preflight_barrier.js";
-
-export interface RemoteBuddyMainOptions {
-  runPreflightGate?: PreflightGateExecutor;
-}
+import { ensurePreflightPasses, RemoteBuddyPreflightError } from "./startup/preflight_gate.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -84,6 +75,12 @@ function parseArgs(): {
   }
 
   return { server, sessionId, authToken };
+}
+
+export interface RemoteBuddyMainOptions {
+  server: string;
+  sessionId: string | null;
+  authToken: string | null;
 }
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
@@ -2083,9 +2080,7 @@ async function connectWithRetry(
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-export async function runRemoteBuddyMain(options: RemoteBuddyMainOptions = {}) {
-  const opts = parseArgs();
-
+export async function runRemoteBuddyMain(opts: RemoteBuddyMainOptions): Promise<void> {
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
   if (CONFIG.startup.logConfigOnStart) {
@@ -2097,18 +2092,7 @@ export async function runRemoteBuddyMain(options: RemoteBuddyMainOptions = {}) {
     );
   }
 
-  const preflightConfig: RemotebuddyPreflightConfig = {
-    sessionId: opts.sessionId ?? CONFIG.sessionId ?? null,
-    authToken: opts.authToken ?? CONFIG.authToken ?? null,
-    serverUrl: opts.server ?? CONFIG.server.url ?? null,
-    llmBackend: CONFIG.remotebuddy.llm.backend,
-    llmApiKey: CONFIG.remotebuddy.llm.apiKey ?? null,
-  };
-  await ensurePreflightPasses(preflightConfig, {
-    runPreflightGate: options.runPreflightGate,
-    env: process.env,
-    logger: console,
-  });
+  await ensurePreflightPasses();
 
   // ── Initialise LLM + brain ──
   let brain: AgentBrain;
@@ -2171,12 +2155,21 @@ export async function runRemoteBuddyMain(options: RemoteBuddyMainOptions = {}) {
 }
 
 async function main() {
-  await runRemoteBuddyMain();
+  const opts = parseArgs();
+  await runRemoteBuddyMain(opts);
 }
 
 if (import.meta.main) {
   main().catch((err) => {
-    console.error("[RemoteBuddy] Fatal:", err);
+    if (err instanceof RemoteBuddyPreflightError) {
+      console.error("[RemoteBuddy] Startup preflight failed:", err.message);
+      const action = err.failure.action ? ` Action: ${err.failure.action}` : "";
+      console.error(
+        `[RemoteBuddy] Startup failure code=${err.failure.code} detail=${err.failure.detail}${action}`,
+      );
+    } else {
+      console.error("[RemoteBuddy] Fatal:", err);
+    }
     process.exit(1);
   });
 }
