@@ -18,6 +18,12 @@ export interface DiscoveredBranch {
   sha: string;
 }
 
+export interface TempBranchCleanupSummary {
+  deletedBranches: string[];
+  failedBranches: string[];
+  warnings: string[];
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 async function git(
@@ -388,6 +394,58 @@ export class GitOps {
    */
   async deleteTempBranch(name: string): Promise<void> {
     await git(this.repoPath, ["branch", "-D", name]);
+  }
+
+  /**
+   * Delete all local temp branches with the given prefix.
+   * Intended for daemon shutdown cleanup after interrupted runs.
+   */
+  async cleanupLocalTempBranches(prefix = "_source_control_manager/"): Promise<TempBranchCleanupSummary> {
+    const normalizedPrefix = prefix.trim().replace(/^\/+/, "");
+    const warnings: string[] = [];
+    const deletedBranches: string[] = [];
+    const failedBranches: string[] = [];
+    if (!normalizedPrefix) {
+      return { deletedBranches, failedBranches, warnings };
+    }
+
+    // Move off temp branches first so deletion does not fail due to "branch checked out".
+    try {
+      await this.resetToClean();
+    } catch (err: any) {
+      warnings.push(`resetToClean failed before temp-branch cleanup: ${err?.message ?? err}`);
+    }
+
+    const listResult = await git(
+      this.repoPath,
+      ["for-each-ref", "--format=%(refname:short)", `refs/heads/${normalizedPrefix}`],
+      { timeout: 15_000 },
+    );
+    if (!listResult.ok) {
+      warnings.push(`for-each-ref failed: ${listResult.stderr || listResult.stdout}`);
+      return { deletedBranches, failedBranches, warnings };
+    }
+
+    const branches = listResult.stdout
+      .split(/\r?\n/g)
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && value.startsWith(normalizedPrefix));
+
+    for (const branch of branches) {
+      const deleteResult = await git(this.repoPath, ["branch", "-D", branch], { timeout: 15_000 });
+      if (deleteResult.ok) {
+        deletedBranches.push(branch);
+      } else {
+        failedBranches.push(`${branch}: ${deleteResult.stderr || deleteResult.stdout}`);
+      }
+    }
+
+    const pruneResult = await git(this.repoPath, ["worktree", "prune"], { timeout: 15_000 });
+    if (!pruneResult.ok) {
+      warnings.push(`worktree prune failed: ${pruneResult.stderr || pruneResult.stdout}`);
+    }
+
+    return { deletedBranches, failedBranches, warnings };
   }
 
   /**

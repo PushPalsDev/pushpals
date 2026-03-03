@@ -206,6 +206,12 @@ let statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentPollTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentInstance: ReviewAgent | null = null;
 let statusSessionReady = false;
+let shutdownPromise: Promise<void> | null = null;
+
+function summarizeBranchNames(names: string[], max = 5): string {
+  if (names.length <= max) return names.join(", ");
+  return `${names.slice(0, max).join(", ")}, +${names.length - max} more`;
+}
 
 function createSessionComm(sessionId: string): CommunicationManager {
   return new CommunicationManager({
@@ -970,7 +976,7 @@ async function main(): Promise<void> {
       console.error(`[${ts()}] SourceControlManager requires a dedicated clean clone. Exiting.`);
       console.error(`[${ts()}] WARNING: Do not run this daemon in a developer working copy.`);
       console.error(`[${ts()}] TIP: Pass --skip-clean-check to bypass this guard in dev.`);
-      shutdown();
+      await shutdown();
       process.exit(1);
     }
     console.log(`[${ts()}] Repo is clean`);
@@ -1047,43 +1053,74 @@ async function main(): Promise<void> {
 
 // ─── Shutdown ───────────────────────────────────────────────────────────────
 
-function shutdown(): void {
-  if (!running) return;
-  running = false;
-  console.log(`\n[${ts()}] Shutting down...`);
-  if (statusHeartbeatTimer) {
-    clearInterval(statusHeartbeatTimer);
-    statusHeartbeatTimer = null;
-  }
-  if (reviewAgentPollTimer) {
-    clearInterval(reviewAgentPollTimer);
-    reviewAgentPollTimer = null;
-  }
-  reviewAgentInstance = null;
-  void createSessionComm(statusSessionId).status(
-    "source_control_manager",
-    "shutting_down",
-    "SourceControlManager shutting down",
-  );
-  server?.stop();
-  db.close();
-  lock.release();
-  console.log(`[${ts()}] Goodbye.`);
+async function shutdown(): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = (async () => {
+    if (!running) return;
+    running = false;
+    console.log(`\n[${ts()}] Shutting down...`);
+    if (statusHeartbeatTimer) {
+      clearInterval(statusHeartbeatTimer);
+      statusHeartbeatTimer = null;
+    }
+    if (reviewAgentPollTimer) {
+      clearInterval(reviewAgentPollTimer);
+      reviewAgentPollTimer = null;
+    }
+    reviewAgentInstance = null;
+    void createSessionComm(statusSessionId).status(
+      "source_control_manager",
+      "shutting_down",
+      "SourceControlManager shutting down",
+    );
+    server?.stop();
+
+    try {
+      const cleanup = await gitOps.cleanupLocalTempBranches("_source_control_manager/");
+      if (cleanup.deletedBranches.length > 0) {
+        console.log(
+          `[${ts()}] Shutdown cleanup removed ${cleanup.deletedBranches.length} temp branch(es): ${summarizeBranchNames(
+            cleanup.deletedBranches,
+          )}`,
+        );
+      }
+      if (cleanup.failedBranches.length > 0) {
+        console.warn(
+          `[${ts()}] Shutdown cleanup failed to remove ${cleanup.failedBranches.length} temp branch(es): ${summarizeBranchNames(
+            cleanup.failedBranches,
+          )}`,
+        );
+      }
+      for (const warning of cleanup.warnings) {
+        console.warn(`[${ts()}] Shutdown cleanup warning: ${warning}`);
+      }
+    } catch (err: any) {
+      console.warn(`[${ts()}] Shutdown temp-branch cleanup failed: ${err?.message ?? err}`);
+    }
+
+    db.close();
+    lock.release();
+    console.log(`[${ts()}] Goodbye.`);
+  })();
+  return shutdownPromise;
+}
+
+async function shutdownAndExit(code: number): Promise<void> {
+  await shutdown();
+  process.exit(code);
 }
 
 process.on("SIGINT", () => {
-  shutdown();
-  process.exit(130);
+  void shutdownAndExit(130);
 });
 process.on("SIGTERM", () => {
-  shutdown();
-  process.exit(143);
+  void shutdownAndExit(143);
 });
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error(`[${ts()}] Fatal: ${err.message}`);
-  shutdown();
+  await shutdown();
   process.exit(1);
 });
