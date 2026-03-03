@@ -28,6 +28,10 @@ safe and auditable.
 Always attach the captured evidence to your PagerDuty incident or the on-call log so the next
 startup can reference a single source of truth.
 
+### CLI automation quick start
+
+Run `bun run remotebuddy:preflight -- --allow-dirty-worktree` (or add `--repo <path>` if you are checking another working directory) before launching the full stack. The command exercises the dependency, repo, alert, and synthetic gates without starting RemoteBuddy. Pass `--json` to capture the structured `PreflightReport` payload that runtime logs reference.
+
 ## Dependency bring-up checklist
 
 1. **Config + secrets**

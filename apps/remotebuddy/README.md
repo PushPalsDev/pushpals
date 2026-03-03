@@ -216,8 +216,11 @@ Use this path any time you need to redeploy RemoteBuddy because of a regression,
 | Build protocol + start RemoteBuddy (recommended path) | `bun run remotebuddy` | `protocol:build` → `remotebuddy:only` | Root during build, then `apps/remotebuddy` via `--cwd` |
 | Start RemoteBuddy with `.env` wiring only | `bun run remotebuddy:only` | `bun --cwd apps/remotebuddy --env-file ../../.env start` | `apps/remotebuddy` |
 | Hot reload/watch mode | `bun run remotebuddy:only:watch` | `bun --cwd apps/remotebuddy --env-file ../../.env dev` | `apps/remotebuddy` |
+| Startup preflight only | `bun run remotebuddy:preflight -- [args]` | `bun --cwd apps/remotebuddy src/startup/preflight_cli.ts` | `apps/remotebuddy` |
 
 > Tip: Keep `bun run server:only` running in another terminal so the claim/complete round-trip works.
+
+`remotebuddy:preflight` accepts the same CLI flags as the standalone entrypoint. Use `--repo <path>` to point at a different working tree and `--json` to emit the machine-readable report that RemoteBuddy runtime logs reference.
 
 ### App-Local Scripts (`cd apps/remotebuddy` first)
 

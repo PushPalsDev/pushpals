@@ -16,7 +16,7 @@ export const STARTUP_FAILURE_CODES = {
 export type StartupFailureCode =
   (typeof STARTUP_FAILURE_CODES)[keyof typeof STARTUP_FAILURE_CODES];
 
-type StartupCheckStatus = "pass" | "fail";
+export type StartupCheckStatus = "pass" | "fail";
 
 export type StartupCheckCategory = "repo" | "alerts" | "synthetic" | "dispatch";
 
