@@ -7,6 +7,46 @@ from a full outage). It sequences the dependent services, captures the telemetry
 green before admitting traffic, and lists the verification plus rollback actions that keep startup
 safe and auditable.
 
+## Deterministic preflight workflow
+
+Run the Bun preflight guard before you spin up RemoteBuddy or hand traffic to it. The command emits
+newline-delimited JSON (one object per check) plus readable log lines so both humans and
+automation can consume the results.
+
+```bash
+cd apps/remotebuddy
+bun run preflight [--json] [--allow-dirty] [--allow-missing-auth]
+```
+
+- `--json` suppresses the human-readable log lines and prints JSON only.
+- `--allow-dirty` lets you bypass the dirty worktree guard (the output still notes the bypass).
+- `--allow-missing-auth` is only for open Server deployments; otherwise, export `PUSHPALS_AUTH_TOKEN`.
+
+RemoteBuddy’s supervisor (`bun run remotebuddy:only`) now runs the same guard automatically and
+refuses to start if any check fails. Operators should therefore run the standalone command first so
+they can remediate issues without restarting RemoteBuddy repeatedly.
+
+### Failure codes surfaced by `bun run preflight`
+
+| Code | Meaning | Remediation |
+| --- | --- | --- |
+| `remotebuddy.config_missing` | `configs/default.toml` or `configs/local.toml` is missing/empty. | Copy `configs/local.example.toml` to `configs/local.toml`, keep both configs readable, then rerun. |
+| `remotebuddy.config_invalid` | TOML/env parsing failed (syntax errors, bad values). | Fix the parse error reported in the detail field, usually by correcting TOML syntax. |
+| `remotebuddy.secrets_missing` | `PUSHPALS_AUTH_TOKEN` (and therefore Server auth) is absent. | Export the token in `.env`/shell or run with `--allow-missing-auth` only if the Server is intentionally open. |
+| `remotebuddy.merge_in_progress` | Git merge/rebase detected in the repo root. | Resolve/abort the merge before dispatching jobs so RemoteBuddy reads a stable tree. |
+| `remotebuddy.workspace_dirty` | Uncommitted files found. | Commit/stash/drop the files or rerun with `--allow-dirty` for explicitly blessed diffs. |
+| `remotebuddy.server_unreachable` | `GET /system/status` failed or timed out. | Start Server via `bun run server:only`, confirm the auth token, and verify `/healthz` before retrying. |
+| `remotebuddy.workerpals_capacity_blocked` | Worker idle slots < 1 or queue depth > 15. | Launch/scale WorkerPals lanes until idle slots recover and queues drain. |
+| `remotebuddy.unknown_preflight_failure` | Supervisor blocked before a check produced failure metadata (usually due to a crash or unexpected exception). | Rerun `bun run preflight --json`, capture the stderr leading up to the crash, and fix the top-level error before restarting RemoteBuddy. |
+
+Every telemetry line includes `code`, `category`, `step`, `status`, `detail`, and `action`, so it’s
+easy to ship into log pipelines or attach directly to the on-call thread. Each supervisor run prints
+per-check log lines that match the literal string `[RemoteBuddySupervisor] [preflight] PASS|FAIL …`
+plus a single structured JSON event that looks like
+`{"component":"RemoteBuddySupervisor","event":"preflight_result","status":"passed","record_count":7,...}`.
+Automation should parse that JSON blob to read the `code`, `category`, `step`, `detail`, and
+`action` fields surfaced back to the CLI.
+
 ## When to run this check
 
 - Any time you restart `bun run remotebuddy:only` outside a rolling deploy.
@@ -36,6 +76,8 @@ startup can reference a single source of truth.
      empty or only shows deliberate overrides).
    - Environment variables exported: `PUSHPALS_AUTH_TOKEN`, `REMOTE_STABLE_ID`, `WORKERPALS_API_URL`,
      `SERVER_BASE_URL`. Document redacted values in the ops log.
+   - Run `bun run preflight` and attach its JSON output to the incident/on-call log. RemoteBuddy startup
+     will not continue until this succeeds.
 2. **Server**
    - Command: `PUSHPALS_AUTH_TOKEN=... bun run server:only --env-file .env`.
    - Health: `curl -sf http://localhost:3001/healthz` returns `ok` within 2 seconds.
@@ -46,6 +88,8 @@ startup can reference a single source of truth.
    - Watch Worker Backends Latency dashboard for RPC spikes.
 4. **RemoteBuddy**
    - Command: `PUSHPALS_AUTH_TOKEN=... bun run remotebuddy:only`.
+   - The supervisor blocks on the preflight guard; wait for `[RemoteBuddySupervisor] [preflight] PASS`
+     logs to finish before expecting RemoteBuddy to spawn.
    - Verify the bootstrap log prints `planner ready` and `worker lease acquired` within 90 seconds.
 5. **Optional LocalBuddy / client probes**
    - If this host also serves LocalBuddy traffic, start `bun run client:only` and open the Ops tab to
