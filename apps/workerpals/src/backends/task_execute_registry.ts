@@ -12,6 +12,10 @@ export function registerBackendTaskExecutor(
   specializedTaskExecutors.set(backend, executor);
 }
 
+export function unregisterBackendTaskExecutor(backend: ExecutorBackend): boolean {
+  return specializedTaskExecutors.delete(backend);
+}
+
 export function getBackendTaskExecutor(backend: ExecutorBackend): BackendTaskExecutor | undefined {
   return specializedTaskExecutors.get(backend);
 }
