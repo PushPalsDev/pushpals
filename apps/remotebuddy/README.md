@@ -214,9 +214,20 @@ Use this path any time you need to redeploy RemoteBuddy because of a regression,
 
 | Use case | Run from repo root | Script body | Working directory during execution |
 | --- | --- | --- | --- |
+| Run startup-only checks (dry run) | `bun run remotebuddy:preflight [--json]` | `scripts/startup-checks.ts` | Root |
 | Build protocol + start RemoteBuddy (recommended path) | `bun run remotebuddy` | `protocol:build` → `remotebuddy:only` | Root during build, then `apps/remotebuddy` via `--cwd` |
 | Start RemoteBuddy with `.env` wiring only | `bun run remotebuddy:only` | `bun --cwd apps/remotebuddy --env-file ../../.env start` | `apps/remotebuddy` |
 | Hot reload/watch mode | `bun run remotebuddy:only:watch` | `bun --cwd apps/remotebuddy --env-file ../../.env dev` | `apps/remotebuddy` |
+
+#### Startup Preflight CLI
+
+- `bun run remotebuddy:preflight` runs the deterministic repo/alerts/synthetic checklist without launching RemoteBuddy.
+- Pass `--json` for machine-readable output (suitable for CI annotations).
+- Environment file resolution honors `REMOTEBUDDY_PREFLIGHT_ENV_FILE`; when unset it falls back to `.env` in the repo root.
+- Override inputs when needed:
+  - `REMOTEBUDDY_PREFLIGHT_REPO=/path/to/worktree` → inspect a different repo state (tests use temp repos).
+  - `REMOTEBUDDY_PREFLIGHT_SYNTHETIC_MODE=mock` → skip the `/healthz` probe when the server is offline.
+  - `REMOTEBUDDY_PREFLIGHT_ALERTS='[\"queue_p95\"]'` → simulate Alertmanager gating for drills.
 
 > Tip: Keep `bun run server:only` running in another terminal so the claim/complete round-trip works.
 

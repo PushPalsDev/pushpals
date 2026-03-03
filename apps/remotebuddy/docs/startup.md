@@ -34,6 +34,14 @@ safe and auditable.
 Always attach the captured evidence to your PagerDuty incident or the on-call log so the next
 startup can reference a single source of truth.
 
+## Preflight CLI quick reference
+
+- Run `bun run remotebuddy:preflight` from the repo root to execute the deterministic repo/alerts/synthetic checklist.
+- Pass `--json` when you need structured output for CI/bots.
+- `REMOTEBUDDY_PREFLIGHT_ENV_FILE` (absolute path or repo-relative) controls which env file gets loaded before the checks; when unset the script falls back to `.env`.
+- Set `REMOTEBUDDY_PREFLIGHT_SYNTHETIC_MODE=mock` if the Server stack is offline but you still need to verify repo/Alertmanager state.
+- Provide comma-separated or JSON alert names via `REMOTEBUDDY_PREFLIGHT_ALERTS` to simulate Alertmanager failures during drills.
+
 ## Dependency bring-up checklist
 
 1. **Config + secrets**
