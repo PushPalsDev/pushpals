@@ -57,6 +57,12 @@ export interface StartupCheckRecord {
   detail: string;
   action?: string;
   elapsedMs: number;
+  durationMs: number;
+  startedAtMs: number;
+  endedAtMs: number;
+  error?: {
+    message: string;
+  };
 }
 
 export interface StartupChecklistFailure {
@@ -249,9 +255,10 @@ export class StartupChecklist {
     const history: StartupCheckRecord[] = [];
     for (const [index, check] of this.checks.entries()) {
       const step = index + 1;
-      const started = nowMs(ctx);
+      const startedAtMs = nowMs(ctx);
       let status: StartupCheckStatus = "pass";
       let detail = check.label;
+      let failureErrorMessage: string | undefined;
       try {
         const outcome = await check.run(ctx, options);
         status = outcome.ok ? "pass" : "fail";
@@ -262,7 +269,14 @@ export class StartupChecklist {
           error instanceof Error
             ? error.message
             : "Unknown error running startup check.";
+        if (error instanceof Error) {
+          failureErrorMessage = error.message;
+        } else if (typeof error === "string" && error.trim()) {
+          failureErrorMessage = error.trim();
+        }
       }
+      const endedAtMs = nowMs(ctx);
+      const durationMs = Math.max(0, endedAtMs - startedAtMs);
       const record: StartupCheckRecord = {
         code: check.code,
         label: check.label,
@@ -271,7 +285,11 @@ export class StartupChecklist {
         status,
         detail,
         action: status === "fail" ? check.action : undefined,
-        elapsedMs: Math.max(0, nowMs(ctx) - started),
+        elapsedMs: durationMs,
+        durationMs,
+        startedAtMs,
+        endedAtMs,
+        error: status === "fail" && failureErrorMessage ? { message: failureErrorMessage } : undefined,
       };
       history.push(record);
       ctx.log?.(record);
@@ -315,10 +333,11 @@ export const gateDispatchWithStartupPreflight = async (
   const dispatchStep = result.history.length + 1;
   const dispatchLabel = DISPATCH_CHECK_LABEL;
   const dispatchAction = DISPATCH_CHECK_ACTION;
-  const started = nowMs(ctx);
+  const startedAtMs = nowMs(ctx);
   try {
     await dispatchJob();
-    const elapsedMs = Math.max(0, nowMs(ctx) - started);
+    const endedAtMs = nowMs(ctx);
+    const durationMs = Math.max(0, endedAtMs - startedAtMs);
     const successRecord: StartupCheckRecord = {
       code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
       label: dispatchLabel,
@@ -326,7 +345,10 @@ export const gateDispatchWithStartupPreflight = async (
       step: dispatchStep,
       status: "pass",
       detail: "Dispatch completed successfully.",
-      elapsedMs,
+      elapsedMs: durationMs,
+      durationMs,
+      startedAtMs,
+      endedAtMs,
     };
     result.history.push(successRecord);
     ctx.log?.(successRecord);
@@ -339,7 +361,8 @@ export const gateDispatchWithStartupPreflight = async (
           ? error
           : "Unknown dispatch failure.";
     const detail = `Dispatch job failed: ${errorMessage}`;
-    const elapsedMs = Math.max(0, nowMs(ctx) - started);
+    const endedAtMs = nowMs(ctx);
+    const durationMs = Math.max(0, endedAtMs - startedAtMs);
     const failureRecord: StartupCheckRecord = {
       code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
       label: dispatchLabel,
@@ -348,7 +371,11 @@ export const gateDispatchWithStartupPreflight = async (
       status: "fail",
       detail,
       action: dispatchAction,
-      elapsedMs,
+      elapsedMs: durationMs,
+      durationMs,
+      startedAtMs,
+      endedAtMs,
+      error: { message: errorMessage },
     };
     ctx.log?.(failureRecord);
     const history = [...result.history, failureRecord];
