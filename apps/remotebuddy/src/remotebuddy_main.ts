@@ -15,7 +15,7 @@
  *   Defaults resolve from configs/*.toml via shared config loader.
  */
 
-import type { CommandRequest } from "protocol";
+import type { CommandRequest, EventEnvelope } from "protocol";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 import { createLLMClient, type LLMClient } from "./llm.js";
@@ -46,12 +46,46 @@ import {
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
 import {
   RemoteBuddyPreflightCache,
-  runRemoteBuddyPreflight,
-  sanitizePreflightDetail,
-  formatStartupCheckLog,
-  type RemoteBuddyPreflightResult,
-  type StartupCheckRecord,
-} from "./orchestrator_preflight.js";
+  RepoPreflightError,
+  type RepoPreflightFailureDetail,
+  type RepoPreflightProvider,
+  type RepoPreflightStatus,
+  formatRepoPreflightFailure,
+} from "./repo_preflight.js";
+
+type AutonomyEngineLike = Pick<
+  RemoteBuddyAutonomousEngine,
+  "start" | "stop" | "enqueueFromAnalysis"
+>;
+
+type RepoPreflightBlockDetail =
+  | {
+      reason: "git_error";
+      summary: string;
+      requestId: string;
+      source: "user" | "autonomy";
+      repo: string;
+      failure: RepoPreflightFailureDetail;
+    }
+  | {
+      reason: "merge_in_progress";
+      summary: string;
+      requestId: string;
+      source: "user" | "autonomy";
+      repo: string;
+      branch: string;
+    }
+  | {
+      reason: "dirty_worktree";
+      summary: string;
+      requestId: string;
+      source: "user" | "autonomy";
+      repo: string;
+      branch: string;
+      dirtyCount: number;
+      dirtySamples: string[];
+      allowDirtyWorktree: boolean;
+    };
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -644,7 +678,7 @@ function extractClarificationFromJobFailure(
   return null;
 }
 
-class RemoteBuddyOrchestrator {
+export class RemoteBuddyOrchestrator {
   private static readonly SESSION_MONITOR_MAX_WS_ERRORS = Math.max(
     1,
     Number.parseInt(process.env.REMOTEBUDDY_SESSION_MONITOR_MAX_WS_ERRORS ?? "6", 10) || 6,
@@ -672,10 +706,10 @@ class RemoteBuddyOrchestrator {
   private readonly executionBudgetNormalMs: number;
   private readonly executionBudgetBackgroundMs: number;
   private readonly finalizationBudgetMs: number;
-  private readonly autonomousEngine: RemoteBuddyAutonomousEngine;
+  private readonly autonomousEngine: AutonomyEngineLike;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
-  private readonly repoPreflightCache = new RemoteBuddyPreflightCache(250);
+  private readonly repoPreflight: RepoPreflightProvider;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private statusSessionReady = false;
   private stopSessionEvents: (() => void) | null = null;
@@ -718,6 +752,8 @@ class RemoteBuddyOrchestrator {
     idempotency: IdempotencyStore;
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
+    preflightProvider?: RepoPreflightProvider;
+    autonomousEngine?: AutonomyEngineLike;
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
@@ -762,6 +798,7 @@ class RemoteBuddyOrchestrator {
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
+    this.repoPreflight = opts.preflightProvider ?? new RemoteBuddyPreflightCache(this.repo);
     if (this.memoryEnabled) {
       this.persistentMemory.purgeExpired(this.memoryRetentionDays, this.repo);
     }
@@ -771,15 +808,23 @@ class RemoteBuddyOrchestrator {
       authToken: this.authToken,
       from: `agent:${this.agentId}`,
     });
-    this.autonomousEngine = new RemoteBuddyAutonomousEngine({
-      server: this.server,
-      sessionId: this.sessionId,
-      authToken: this.authToken,
-      repo: this.repo,
-      llm: opts.llm,
-      comm: this.comm,
-      config: CONFIG,
-    });
+    this.autonomousEngine =
+      opts.autonomousEngine ??
+      new RemoteBuddyAutonomousEngine({
+        server: this.server,
+        sessionId: this.sessionId,
+        authToken: this.authToken,
+        repo: this.repo,
+        llm: opts.llm,
+        comm: this.comm,
+        config: CONFIG,
+        onRepoMutation: (command) => {
+          const joined = Array.isArray(command) && command.length > 0 ? command.join(" ") : null;
+          this.repoPreflight.invalidate(
+            joined ? `autonomy_git:${joined}` : "autonomy_git",
+          );
+        },
+      });
     console.log(`[RemoteBuddy] Detected repo root: ${this.repo}`);
     console.log(
       `[RemoteBuddy] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
@@ -902,101 +947,6 @@ class RemoteBuddyOrchestrator {
     }
   }
 
-  // ── Preflight helpers ──────────────────────────────────────────────────
-
-  private logStartupCheck(record: StartupCheckRecord, source: string): void {
-    const entry = formatStartupCheckLog(record, { repoRoot: this.repo, source });
-    if (entry.level === "info") {
-      console.log(entry.message);
-    } else {
-      console.error(entry.message);
-    }
-  }
-
-  private async fetchRepoPreflight(
-    source: string,
-    options: { forceFresh?: boolean } = {},
-  ): Promise<RemoteBuddyPreflightResult> {
-    const forceFresh = options.forceFresh ?? false;
-    if (forceFresh) {
-      this.repoPreflightCache.invalidate();
-    } else {
-      const cached = this.repoPreflightCache.get();
-      if (cached) return cached;
-    }
-    const result = await runRemoteBuddyPreflight({
-      repoRoot: this.repo,
-      allowDirtyWorktree: CONFIG.remotebuddy.autonomy.allowDirtyWorktree,
-      now: () => Date.now(),
-      log: (record) => this.logStartupCheck(record, source),
-    });
-    if (!forceFresh) {
-      this.repoPreflightCache.set(result);
-    }
-    return result;
-  }
-
-  private async ensureRepoPreflightReady(requestId: string, turnId: string): Promise<boolean> {
-    let result: RemoteBuddyPreflightResult;
-    try {
-      result = await this.fetchRepoPreflight(`request:${requestId.slice(0, 8)}`, { forceFresh: true });
-    } catch (error) {
-      const detail = sanitizePreflightDetail(
-        error instanceof Error ? error.message : String(error),
-        this.repo,
-      );
-      console.error(`[RemoteBuddy] Repo preflight error: ${detail}`);
-      this.pushContext(`[preflight_error] ${detail}`);
-      await this.comm.assistantMessage(
-        `I'm blocked from delegating work because the repo preflight errored: ${detail}`,
-        { turnId, correlationId: requestId },
-      );
-      await fetch(`${this.server}/requests/${requestId}/fail`, {
-        method: "POST",
-        headers: this.authHeaders(),
-        body: JSON.stringify({
-          message: "Repo preflight error",
-          detail,
-        }),
-      }).catch(() => {});
-      this.rememberPersistentMemory("preflight_error", detail, requestId);
-      return false;
-    }
-    if (result.ok) return true;
-    const detail = result.failure?.sanitizedDetail ?? "Repo preflight blocked.";
-    console.error(`[RemoteBuddy] Repo preflight blocked: ${detail}`);
-    this.pushContext(`[preflight_blocked] ${detail}`);
-    this.rememberPersistentMemory("preflight_blocked", detail, requestId);
-    await this.comm.assistantMessage(
-      `I can't enqueue this request right now because the repo preflight failed: ${detail}`,
-      { turnId, correlationId: requestId },
-    );
-    await fetch(`${this.server}/requests/${requestId}/fail`, {
-      method: "POST",
-      headers: this.authHeaders(),
-      body: JSON.stringify({
-        message: "Repo preflight blocked",
-        detail,
-      }),
-    }).catch(() => {});
-    return false;
-  }
-
-  async runOrchestratorStartupPreflight(): Promise<void> {
-    try {
-      const result = await this.fetchRepoPreflight("startup", { forceFresh: true });
-      if (result.ok) {
-        console.log("[RemoteBuddy] Startup repo preflight passed.");
-      } else {
-        const detail = result.failure?.sanitizedDetail ?? "unknown failure";
-        console.error(`[RemoteBuddy] Startup repo preflight failed: ${detail}`);
-      }
-    } catch (error) {
-      const detail = sanitizePreflightDetail(toSingleLine(error, 220) || "unknown", this.repo);
-      console.error(`[RemoteBuddy] Startup repo preflight error: ${detail}`);
-    }
-  }
-
   private async handleObservedJobFailure(
     envelope: {
       id?: string;
@@ -1082,66 +1032,73 @@ class RemoteBuddyOrchestrator {
     });
   }
 
+  private handleSessionEvent(envelope: EventEnvelope, cursor: number): void {
+    if (envelope.type !== "job_failed" && envelope.type !== "job_completed") return;
+    const tsMs = Date.parse(envelope.ts);
+    if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
+    if (envelope.type === "job_failed") {
+      const payload = envelope.payload as {
+        jobId?: unknown;
+        message?: unknown;
+        detail?: unknown;
+      };
+      const jobId = String(payload.jobId ?? "").trim();
+      const message = toSingleLine(payload.message, 220);
+      const detail = toSingleLine(payload.detail, 220);
+      if (!jobId || !message) return;
+
+      const dedupeKey = `${jobId}:${message}`;
+      if (this.seenJobFailures.has(dedupeKey)) return;
+      this.seenJobFailures.add(dedupeKey);
+
+      const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
+      this.pushContext(failureLine);
+      this.rememberPersistentMemory(
+        "job_failed",
+        `Job ${jobId.slice(0, 8)} failed: ${toSingleLine(`${message}${detail ? ` (${detail})` : ""}`, 360)}`,
+      );
+      console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
+      this.repoPreflight.invalidate("job_failed");
+      void this.handleObservedJobFailure(envelope, jobId, message, detail);
+      return;
+    }
+
+    const payload = envelope.payload as {
+      jobId?: unknown;
+      summary?: unknown;
+    };
+    const jobId = String(payload.jobId ?? "").trim();
+    const summary = toSingleLine(payload.summary, 240) || "Job completed";
+    if (!jobId) return;
+    if (/startup warmup completed/i.test(summary)) return;
+    if (this.seenJobCompletions.has(jobId)) return;
+    this.seenJobCompletions.add(jobId);
+
+    this.pushContext(`[job_completed ${jobId}] ${summary}`);
+    this.rememberPersistentMemory(
+      "job_completed",
+      `Job ${jobId.slice(0, 8)} completed: ${toSingleLine(summary, 360)}`,
+    );
+    const shortJob = jobId.slice(0, 8);
+    const clarificationQuestion = extractClarificationFromCompletionSummary(summary);
+    const mutated = !isNoChangeCompletionSummary(summary);
+    this.repoPreflight.invalidate(mutated ? "job_completed_mutated" : "job_completed_noop");
+    const note = clarificationQuestion
+      ? `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationQuestion}\n\nPlease reply with the missing details and I will enqueue a follow-up request.`
+      : mutated
+        ? `WorkerPal job ${shortJob} completed: ${summary}.`
+        : `WorkerPal job ${shortJob} completed: ${summary}. No files were changed, so no commit was created.`;
+    void this.comm.assistantMessage(note, {
+      correlationId: envelope.correlationId,
+      turnId: envelope.turnId,
+      parentId: envelope.id,
+    });
+  }
+
   startSessionEventMonitor(): void {
     this.stopSessionEvents = this.comm.subscribeSessionEvents(
-      (envelope) => {
-        if (envelope.type !== "job_failed" && envelope.type !== "job_completed") return;
-        const tsMs = Date.parse(envelope.ts);
-        if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
-        if (envelope.type === "job_failed") {
-          const payload = envelope.payload as {
-            jobId?: unknown;
-            message?: unknown;
-            detail?: unknown;
-          };
-          const jobId = String(payload.jobId ?? "").trim();
-          const message = toSingleLine(payload.message, 220);
-          const detail = toSingleLine(payload.detail, 220);
-          if (!jobId || !message) return;
-
-          const dedupeKey = `${jobId}:${message}`;
-          if (this.seenJobFailures.has(dedupeKey)) return;
-          this.seenJobFailures.add(dedupeKey);
-
-          const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
-          this.pushContext(failureLine);
-          this.rememberPersistentMemory(
-            "job_failed",
-            `Job ${jobId.slice(0, 8)} failed: ${toSingleLine(`${message}${detail ? ` (${detail})` : ""}`, 360)}`,
-          );
-          console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
-          void this.handleObservedJobFailure(envelope, jobId, message, detail);
-          return;
-        }
-
-        const payload = envelope.payload as {
-          jobId?: unknown;
-          summary?: unknown;
-        };
-        const jobId = String(payload.jobId ?? "").trim();
-        const summary = toSingleLine(payload.summary, 240) || "Job completed";
-        if (!jobId) return;
-        if (/startup warmup completed/i.test(summary)) return;
-        if (this.seenJobCompletions.has(jobId)) return;
-        this.seenJobCompletions.add(jobId);
-
-        this.pushContext(`[job_completed ${jobId}] ${summary}`);
-        this.rememberPersistentMemory(
-          "job_completed",
-          `Job ${jobId.slice(0, 8)} completed: ${toSingleLine(summary, 360)}`,
-        );
-        const shortJob = jobId.slice(0, 8);
-        const clarificationQuestion = extractClarificationFromCompletionSummary(summary);
-        const note = clarificationQuestion
-          ? `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationQuestion}\n\nPlease reply with the missing details and I will enqueue a follow-up request.`
-          : isNoChangeCompletionSummary(summary)
-            ? `WorkerPal job ${shortJob} completed: ${summary}. No files were changed, so no commit was created.`
-            : `WorkerPal job ${shortJob} completed: ${summary}.`;
-        void this.comm.assistantMessage(note, {
-          correlationId: envelope.correlationId,
-          turnId: envelope.turnId,
-          parentId: envelope.id,
-        });
+      (envelope, cursor) => {
+        this.handleSessionEvent(envelope, cursor);
       },
       {
         onOpen: () => {
@@ -1166,6 +1123,121 @@ class RemoteBuddyOrchestrator {
         },
       },
     );
+  }
+
+  private async ensureWorkerPreflightOk(params: {
+    requestId: string;
+    turnId: string;
+    allowDirtyWorktree: boolean;
+    source: "user" | "autonomy";
+  }): Promise<boolean> {
+    let status: RepoPreflightStatus;
+    try {
+      const result = await this.repoPreflight.read();
+      if (!result.ok) {
+        return this.blockOnRepoPreflightGitFailure(result.error, params);
+      }
+      status = result.status;
+    } catch (error) {
+      return this.blockOnRepoPreflightGitFailure(error, params);
+    }
+
+    if (status.isMergeInProgress) {
+      const summary = `Worker dispatch blocked: git detected a merge or rebase in progress on branch ${status.branch}. Resolve or abort the merge, then retry.`;
+      const detail: RepoPreflightBlockDetail = {
+        reason: "merge_in_progress",
+        summary,
+        requestId: params.requestId,
+        source: params.source,
+        repo: status.repo,
+        branch: status.branch,
+      };
+      console.warn(
+        `[RemoteBuddy] ${summary} repo=${status.repo} source=${params.source} branch=${status.branch}`,
+      );
+      await this.failRequestPreflight(params.requestId, params.turnId, summary, detail);
+      return false;
+    }
+
+    if (status.isWorktreeDirty && !params.allowDirtyWorktree) {
+      const sample =
+        status.dirtySamples.length > 0
+          ? ` First dirty paths: ${status.dirtySamples.slice(0, 4).join(", ")}.`
+          : "";
+      const summary = `Worker dispatch blocked: git status reports ${status.dirtyCount} uncommitted change(s) on branch ${status.branch}. Commit, stash, or drop them, then retry.${sample}`;
+      const detail: RepoPreflightBlockDetail = {
+        reason: "dirty_worktree",
+        summary,
+        requestId: params.requestId,
+        source: params.source,
+        repo: status.repo,
+        branch: status.branch,
+        dirtyCount: status.dirtyCount,
+        dirtySamples: status.dirtySamples,
+        allowDirtyWorktree: params.allowDirtyWorktree,
+      };
+      console.warn(
+        `[RemoteBuddy] ${summary} repo=${status.repo} source=${params.source} branch=${status.branch}`,
+      );
+      await this.failRequestPreflight(params.requestId, params.turnId, summary, detail);
+      return false;
+    }
+
+    if (status.isWorktreeDirty && params.allowDirtyWorktree) {
+      console.log(
+        `[RemoteBuddy] Dirty worktree bypassed via allowDirtyWorktree=true (source=${params.source}).`,
+      );
+    }
+
+    return true;
+  }
+
+  private async blockOnRepoPreflightGitFailure(
+    error: unknown,
+    params: {
+      requestId: string;
+      turnId: string;
+      source: "user" | "autonomy";
+    },
+  ): Promise<boolean> {
+    this.repoPreflight.invalidate("git_error");
+    const summary =
+      "Worker dispatch blocked: git repo preflight failed. Please repair the repo and retry.";
+    const failure = formatRepoPreflightFailure(error);
+    const detail: RepoPreflightBlockDetail = {
+      reason: "git_error",
+      summary,
+      requestId: params.requestId,
+      source: params.source,
+      repo: error instanceof RepoPreflightError ? error.repo : this.repo,
+      failure,
+    };
+    const snippetSource = failure.stderr || failure.stdout || "";
+    const snippet = snippetSource ? toSingleLine(snippetSource, 220) : null;
+    console.error(
+      `[RemoteBuddy] ${summary}${snippet && snippet !== summary ? ` (${snippet})` : ""}`,
+    );
+    await this.failRequestPreflight(params.requestId, params.turnId, summary, detail);
+    return false;
+  }
+
+  private async failRequestPreflight(
+    requestId: string,
+    turnId: string,
+    summary: string,
+    detail: string | RepoPreflightBlockDetail,
+  ): Promise<void> {
+    const serializedDetail = typeof detail === "string" ? detail : JSON.stringify(detail);
+    await this.comm.assistantMessage(summary, { turnId, correlationId: requestId });
+    this.rememberPersistentMemory("preflight_blocked", serializedDetail, requestId);
+    await fetch(`${this.server}/requests/${requestId}/fail`, {
+      method: "POST",
+      headers: this.authHeaders(),
+      body: JSON.stringify({
+        message: "repo_preflight_blocked",
+        detail,
+      }),
+    }).catch(() => {});
   }
 
   /**
@@ -1853,8 +1925,16 @@ class RemoteBuddyOrchestrator {
         return;
       }
 
-      const repoReady = await this.ensureRepoPreflightReady(requestId, turnId);
-      if (!repoReady) return;
+      const preflightOk = await this.ensureWorkerPreflightOk({
+        requestId,
+        turnId,
+        allowDirtyWorktree:
+          Boolean(autonomyMetadata) && CONFIG.remotebuddy.autonomy.allowDirtyWorktree,
+        source: autonomyMetadata ? "autonomy" : "user",
+      });
+      if (!preflightOk) {
+        return;
+      }
 
       await this.comm.assistantMessage("Understood. I am delegating this to a WorkerPal now.", {
         turnId,
@@ -1968,7 +2048,6 @@ class RemoteBuddyOrchestrator {
         { turnId, correlationId: requestId },
       );
 
-      this.repoPreflightCache.invalidate();
       const jobId = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
       if (jobId) {
         this.rememberPersistentMemory(
@@ -2245,7 +2324,6 @@ async function main() {
     jobsDbPath: sharedDbPath,
   });
 
-  await orchestrator.runOrchestratorStartupPreflight();
   await orchestrator.emitStartupStatus();
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();

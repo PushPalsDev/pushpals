@@ -21,7 +21,12 @@ import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
-import { describeRepo, type RepoHealthStatus } from "./orchestrator_preflight.js";
+import {
+  RemoteBuddyPreflightCache,
+  formatRepoPreflightFailure,
+  type RepoPreflightProvider,
+  type RepoPreflightStatus,
+} from "./repo_preflight.js";
 
 type AutonomyCandidate = {
   id: string;
@@ -302,6 +307,155 @@ type GitRunResult = {
   stderr: string;
 };
 
+const SIMPLE_MUTATING_GIT_COMMANDS = new Set([
+  "commit",
+  "merge",
+  "rebase",
+  "cherry-pick",
+  "reset",
+  "switch",
+  "pull",
+  "revert",
+  "apply",
+  "am",
+  "rm",
+  "mv",
+  "add",
+  "clean",
+]);
+
+const STASH_MUTATIONS = new Set(["push", "save", "apply", "pop", "drop", "clear"]);
+const WORKTREE_MUTATIONS = new Set(["add", "move", "prune", "remove", "repair"]);
+const SUBMODULE_MUTATIONS = new Set([
+  "add",
+  "update",
+  "init",
+  "deinit",
+  "set-branch",
+  "set-url",
+  "absorbgitdirs",
+  "sync",
+]);
+const BRANCH_MUTATION_FLAGS = new Set([
+  "-d",
+  "-D",
+  "--delete",
+  "-m",
+  "-M",
+  "--move",
+  "--rename",
+  "-c",
+  "-C",
+  "--copy",
+  "-f",
+  "--force",
+  "-u",
+  "--track",
+  "--no-track",
+  "--unset-upstream",
+]);
+const BRANCH_VALUE_FLAGS = new Set([
+  "--contains",
+  "--merged",
+  "--no-merged",
+  "--points-at",
+  "--format",
+  "--sort",
+  "--abbrev",
+  "--color",
+  "--remotes",
+  "--all",
+]);
+const CHECKOUT_NOOP_ARGS = new Set(["--help", "-h", "--version"]);
+
+export function isMutatingGitCommand(args: string[]): boolean {
+  if (!Array.isArray(args) || args.length === 0) return false;
+  const [commandRaw, ...rest] = args;
+  const primary = String(commandRaw ?? "").toLowerCase();
+  if (!primary) return false;
+
+  switch (primary) {
+    case "stash":
+      return isStashMutation(rest);
+    case "worktree":
+      return isWorktreeMutation(rest);
+    case "branch":
+      return isBranchMutation(rest);
+    case "checkout":
+      return isCheckoutMutation(rest);
+    case "restore":
+      return isRestoreMutation(rest);
+    case "submodule":
+      return isSubmoduleMutation(rest);
+    default:
+      return SIMPLE_MUTATING_GIT_COMMANDS.has(primary);
+  }
+}
+
+function isStashMutation(args: string[]): boolean {
+  const sub = String(args[0] ?? "").trim().toLowerCase();
+  if (!sub) return true; // `git stash` defaults to push.
+  return STASH_MUTATIONS.has(sub);
+}
+
+function isWorktreeMutation(args: string[]): boolean {
+  const sub = String(args[0] ?? "").trim().toLowerCase();
+  if (!sub) return false;
+  return WORKTREE_MUTATIONS.has(sub);
+}
+
+function isSubmoduleMutation(args: string[]): boolean {
+  const sub = String(args[0] ?? "").trim().toLowerCase();
+  if (!sub) return false;
+  return SUBMODULE_MUTATIONS.has(sub);
+}
+
+function isCheckoutMutation(args: string[]): boolean {
+  if (args.length === 0) return false;
+  return args.some((arg) => {
+    const token = String(arg ?? "").trim();
+    if (!token) return false;
+    return !CHECKOUT_NOOP_ARGS.has(token.toLowerCase());
+  });
+}
+
+function isRestoreMutation(args: string[]): boolean {
+  if (args.length === 0) return false;
+  return args.some((arg) => {
+    const token = String(arg ?? "").trim();
+    if (!token) return false;
+    return token !== "--help" && token !== "-h" && token !== "--version";
+  });
+}
+
+function isBranchMutation(args: string[]): boolean {
+  if (args.length === 0) return false;
+  let skipNext = false;
+  for (const raw of args) {
+    const arg = String(raw ?? "").trim();
+    if (!arg) continue;
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
+    const lower = arg.toLowerCase();
+    if (!arg.startsWith("-") || arg === "--") {
+      return true;
+    }
+    const token = lower.includes("=") ? lower.split("=")[0] ?? lower : lower;
+    if (BRANCH_MUTATION_FLAGS.has(token) || token.startsWith("--set-upstream")) {
+      return true;
+    }
+    if (BRANCH_VALUE_FLAGS.has(token)) {
+      if (!lower.includes("=")) {
+        skipNext = true;
+      }
+      continue;
+    }
+  }
+  return false;
+}
+
 function sanitizeForGitRef(value: string): string {
   const text = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
   return text || "default";
@@ -320,6 +474,8 @@ export class RemoteBuddyAutonomousEngine {
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
+  private readonly onRepoMutation: ((command: string[]) => void) | null;
+  private readonly repoPreflight: RepoPreflightProvider;
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -340,6 +496,8 @@ export class RemoteBuddyAutonomousEngine {
     llm: LLMClient;
     comm: CommunicationManager;
     config: PushPalsConfig;
+    onRepoMutation?: (command: string[]) => void;
+    preflightProvider?: RepoPreflightProvider;
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
@@ -355,6 +513,10 @@ export class RemoteBuddyAutonomousEngine {
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
+    this.onRepoMutation = opts.onRepoMutation ?? null;
+    this.repoPreflight =
+      opts.preflightProvider ??
+      new RemoteBuddyPreflightCache(this.autonomyRepo, { ttlMs: 0 });
   }
 
   private setPhase(phase: string): void {
@@ -498,6 +660,9 @@ export class RemoteBuddyAutonomousEngine {
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
+    if (exitCode === 0 && this.onRepoMutation && isMutatingGitCommand(args)) {
+      this.onRepoMutation(args);
+    }
     return {
       ok: exitCode === 0,
       exitCode,
@@ -572,11 +737,11 @@ export class RemoteBuddyAutonomousEngine {
     return true;
   }
 
-  private async fetchSnapshot(runId: string, preflight: RepoHealthStatus): Promise<Snapshot | null> {
+  private async fetchSnapshot(runId: string, preflight: RepoPreflightStatus): Promise<Snapshot | null> {
     const qs = new URLSearchParams({
       sessionId: this.sessionId,
       runId,
-      isWorktreeDirty: preflight.isDirty ? "true" : "false",
+      isWorktreeDirty: preflight.isWorktreeDirty ? "true" : "false",
       isMergeInProgress: preflight.isMergeInProgress ? "true" : "false",
     });
     const res = await fetch(`${this.server}/autonomy/snapshot?${qs.toString()}`, {
@@ -940,7 +1105,20 @@ export class RemoteBuddyAutonomousEngine {
       }
 
       this.setPhase("repo_preflight");
-      const preflight = await describeRepo(this.autonomyRepo);
+      const preflightResult = await this.repoPreflight.read(true);
+      if (!preflightResult.ok) {
+        const failure = formatRepoPreflightFailure(preflightResult.error);
+        const repo = preflightResult.error.repo;
+        const snippet = failure.stderr || failure.stdout || `exit=${failure.exitCode ?? "unknown"}`;
+        console.error(
+          `[RemoteBuddyAutonomousEngine] tick skipped: repo preflight failed for ${repo}: ${snippet}. detail=${JSON.stringify(
+            failure,
+          )}`,
+        );
+        outcomeDetail = "repo_preflight_git_failed";
+        return;
+      }
+      const preflight = preflightResult.status;
       if (preflight.isMergeInProgress) {
         console.log(
           "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (merge/rebase in progress).",
@@ -948,7 +1126,7 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "repo_preflight_merge_in_progress";
         return;
       }
-      if (preflight.isDirty && !this.cfg.allowDirtyWorktree) {
+      if (preflight.isWorktreeDirty && !this.cfg.allowDirtyWorktree) {
         console.log(
           "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (worktree is dirty and allow_dirty_worktree=false).",
         );

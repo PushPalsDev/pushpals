@@ -12,6 +12,7 @@ import {
   normalizeTargetPath,
   validateScopeInvariants,
   type AutonomyComponentArea,
+  redactWindowsHomePaths,
 } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { JobResult } from "./common/types.js";
@@ -124,6 +125,7 @@ export function redactSensitiveText(value: string): string {
   out = out.replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "gh***");
   out = out.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "github_pat_***");
   out = out.replace(/\bglpat-[A-Za-z0-9\-_]{20,}\b/gi, "glpat-***");
+  out = redactWindowsHomePaths(out);
   return out;
 }
 
