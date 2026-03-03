@@ -8,7 +8,23 @@ import {
   type RepoStatus,
   type StartupChecklistContext,
   type StartupFailureCode,
+  type StartupTelemetryEvent,
+  type StartupTelemetryPhase,
 } from "./checklist.js";
+
+const REQUIRED_ENV_DEFAULTS = {
+  REMOTE_STABLE_ID: "rb-test",
+  WORKERPALS_API_URL: "http://localhost:4000",
+  SERVER_BASE_URL: "http://localhost:3001",
+  PUSHPALS_AUTH_TOKEN: "preflight-test-token",
+} as const;
+
+type EnvState = Record<string, string | undefined>;
+
+const buildEnvState = (overrides: EnvState = {}): EnvState => ({
+  ...REQUIRED_ENV_DEFAULTS,
+  ...overrides,
+});
 
 const cleanRepo = (): RepoStatus => ({
   isDirty: false,
@@ -19,14 +35,23 @@ const cleanRepo = (): RepoStatus => ({
 
 const buildContext = (
   overrides: Partial<StartupChecklistContext> = {},
-): StartupChecklistContext => ({
-  describeRepo: async () => cleanRepo(),
-  listFiringAlerts: async () => [],
-  syntheticTester: {
-    runSyntheticJob: async () => ({ ok: true, latencyMs: 150 }),
-  },
-  ...overrides,
-});
+  envOverrides: EnvState = {},
+): StartupChecklistContext => {
+  const env = buildEnvState(envOverrides);
+  const base: StartupChecklistContext = {
+    describeRepo: async () => cleanRepo(),
+    listFiringAlerts: async () => [],
+    syntheticTester: {
+      runSyntheticJob: async () => ({ ok: true, latencyMs: 150 }),
+    },
+    readEnvVar: (name) => env[name],
+  };
+  return {
+    ...base,
+    ...overrides,
+    readEnvVar: overrides.readEnvVar ?? base.readEnvVar,
+  };
+};
 
 const actionFor = (code: StartupFailureCode): string => {
   const entry = STARTUP_CHECK_STRUCTURE.find((item) => item.code === code);
@@ -34,6 +59,25 @@ const actionFor = (code: StartupFailureCode): string => {
     throw new Error(`Missing startup check structure for ${code}`);
   }
   return entry.action;
+};
+
+const captureTelemetry = () => {
+  const events: StartupTelemetryEvent[] = [];
+  return {
+    events,
+    emitter: {
+      emit: (event: StartupTelemetryEvent) => {
+        events.push(event);
+      },
+    },
+    eventFor: (
+      phase: StartupTelemetryPhase,
+      code: StartupFailureCode,
+    ): StartupTelemetryEvent | undefined =>
+      events.find(
+        (event) => event.phase === phase && event.code === code,
+      ),
+  };
 };
 
 describe("StartupChecklist", () => {
@@ -95,6 +139,258 @@ describe("StartupChecklist", () => {
     expect(dirtyRecord?.detail).toContain("allowDirtyWorktree=true");
   });
 
+  test("preflight fails when required env vars missing", async () => {
+    const telemetry = captureTelemetry();
+    const ctx = buildContext(
+      {
+        telemetry: telemetry.emitter,
+      },
+      { SERVER_BASE_URL: undefined },
+    );
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.ENV_MISSING);
+    expect(result.failure?.category).toBe("env");
+    expect(result.failure?.step).toBe(3);
+    expect(result.failure?.detail).toMatch(/SERVER_BASE_URL/);
+    expect(result.failure?.action).toContain("REMOTE_STABLE_ID");
+    const startEvent = telemetry.eventFor(
+      "start",
+      STARTUP_FAILURE_CODES.ENV_MISSING,
+    );
+    expect(startEvent?.status).toBe("pending");
+    expect(startEvent?.step).toBe(3);
+    const finishEvent = telemetry.eventFor(
+      "finish",
+      STARTUP_FAILURE_CODES.ENV_MISSING,
+    );
+    expect(finishEvent?.status).toBe("fail");
+    expect(finishEvent?.code).toBe(STARTUP_FAILURE_CODES.ENV_MISSING);
+    expect(finishEvent?.step).toBe(3);
+    expect(finishEvent?.detail).toContain("SERVER_BASE_URL");
+    expect(finishEvent?.action).toBe(result.failure?.action);
+  });
+
+  test("preflight fails when API token is blank", async () => {
+    const telemetry = captureTelemetry();
+    const ctx = buildContext(
+      {
+        telemetry: telemetry.emitter,
+      },
+      { PUSHPALS_AUTH_TOKEN: "" },
+    );
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.API_TOKEN_INVALID,
+    );
+    expect(result.failure?.category).toBe("env");
+    expect(result.failure?.step).toBe(4);
+    expect(result.failure?.detail).toContain("PUSHPALS_AUTH_TOKEN");
+    expect(result.failure?.action).toContain("PUSHPALS_AUTH_TOKEN");
+    const startEvent = telemetry.eventFor(
+      "start",
+      STARTUP_FAILURE_CODES.API_TOKEN_INVALID,
+    );
+    expect(startEvent?.status).toBe("pending");
+    expect(startEvent?.step).toBe(4);
+    const finishEvent = telemetry.eventFor(
+      "finish",
+      STARTUP_FAILURE_CODES.API_TOKEN_INVALID,
+    );
+    expect(finishEvent?.status).toBe("fail");
+    expect(finishEvent?.detail).toContain("PUSHPALS_AUTH_TOKEN");
+    expect(finishEvent?.action).toBe(result.failure?.action);
+    expect(finishEvent?.step).toBe(4);
+  });
+
+  test("preflight rejects placeholder API token values", async () => {
+    const telemetry = captureTelemetry();
+    const ctx = buildContext(
+      {
+        telemetry: telemetry.emitter,
+      },
+      { PUSHPALS_AUTH_TOKEN: "placeholder-token" },
+    );
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.API_TOKEN_INVALID,
+    );
+    expect(result.failure?.detail).toContain("placeholder-token");
+    const startEvent = telemetry.eventFor(
+      "start",
+      STARTUP_FAILURE_CODES.API_TOKEN_INVALID,
+    );
+    expect(startEvent?.status).toBe("pending");
+    expect(startEvent?.step).toBe(4);
+    const finishEvent = telemetry.eventFor(
+      "finish",
+      STARTUP_FAILURE_CODES.API_TOKEN_INVALID,
+    );
+    expect(finishEvent?.status).toBe("fail");
+    expect(finishEvent?.detail).toContain("placeholder-token");
+    expect(finishEvent?.action).toBe(result.failure?.action);
+    expect(finishEvent?.step).toBe(4);
+  });
+
+  test("preflight success path emits pass telemetry for env, token, and docker checks", async () => {
+    const telemetry = captureTelemetry();
+    const dockerDetail = "Docker daemon responded (version 25.0.2).";
+    const ctx = buildContext(
+      {
+        telemetry: telemetry.emitter,
+        describeDocker: async () => ({
+          ready: true,
+          detail: dockerDetail,
+          version: "25.0.2",
+        }),
+      },
+    );
+    const result = await runStartupPreflight(ctx, { requireDocker: true });
+    expect(result.ok).toBe(true);
+
+    const expectTelemetryPass = (
+      code: StartupFailureCode,
+      detailMatcher: RegExp | string,
+    ) => {
+      const startEvent = telemetry.eventFor("start", code);
+      expect(startEvent?.status).toBe("pending");
+      const finishEvent = telemetry.eventFor("finish", code);
+      expect(finishEvent?.status).toBe("pass");
+      if (typeof detailMatcher === "string") {
+        expect(finishEvent?.detail).toContain(detailMatcher);
+      } else {
+        expect(finishEvent?.detail).toMatch(detailMatcher);
+      }
+      const record = result.history.find((entry) => entry.code === code);
+      expect(record?.status).toBe("pass");
+    };
+
+    expectTelemetryPass(
+      STARTUP_FAILURE_CODES.ENV_MISSING,
+      /Required env vars present/,
+    );
+    expectTelemetryPass(
+      STARTUP_FAILURE_CODES.API_TOKEN_INVALID,
+      /loaded \(\d+ chars\)/,
+    );
+    expectTelemetryPass(
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
+      dockerDetail,
+    );
+  });
+
+  test("preflight fails when docker readiness probe reports down", async () => {
+    const telemetry = captureTelemetry();
+    const ctx = buildContext({
+      describeDocker: async () => ({
+        ready: false,
+        detail: "Docker Desktop is not running",
+      }),
+      telemetry: telemetry.emitter,
+    });
+    const result = await runStartupPreflight(ctx, { requireDocker: true });
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
+    );
+    expect(result.failure?.category).toBe("infra");
+    expect(result.failure?.step).toBe(5);
+    expect(result.failure?.detail).toContain("Docker Desktop is not running");
+    expect(result.failure?.action).toContain("Docker Desktop");
+    const startEvent = telemetry.eventFor(
+      "start",
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
+    );
+    expect(startEvent?.status).toBe("pending");
+    expect(startEvent?.step).toBe(5);
+    const finishEvent = telemetry.eventFor(
+      "finish",
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
+    );
+    expect(finishEvent?.status).toBe("fail");
+    expect(finishEvent?.detail).toContain("Docker Desktop is not running");
+    expect(finishEvent?.action).toBe(result.failure?.action);
+    expect(finishEvent?.step).toBe(5);
+  });
+
+  test("preflight fails when docker readiness probe returns a timeout detail", async () => {
+    const telemetry = captureTelemetry();
+    const ctx = buildContext({
+      telemetry: telemetry.emitter,
+    });
+    const timeoutDetail =
+      "Docker CLI timed out after 1500 ms. Start Docker Desktop and retry.";
+    const result = await runStartupPreflight(ctx, {
+      requireDocker: true,
+      dockerProbe: async () => ({
+        ready: false,
+        detail: timeoutDetail,
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
+    );
+    expect(result.failure?.detail).toContain("timed out");
+    expect(result.failure?.action).toContain("Docker Desktop");
+    const finishEvent = telemetry.eventFor(
+      "finish",
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
+    );
+    expect(finishEvent?.status).toBe("fail");
+    expect(finishEvent?.detail).toContain("timed out");
+    expect(finishEvent?.action).toBe(result.failure?.action);
+  });
+
+  test("preflight surfaces docker readiness probe exceptions", async () => {
+    const telemetry = captureTelemetry();
+    const ctx = buildContext({
+      describeDocker: async () => {
+        throw new Error("permission denied /var/run/docker.sock");
+      },
+      telemetry: telemetry.emitter,
+    });
+    const result = await runStartupPreflight(ctx, { requireDocker: true });
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
+    );
+    expect(result.failure?.detail).toContain("permission denied");
+    const finishEvent = telemetry.eventFor(
+      "finish",
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
+    );
+    expect(finishEvent?.status).toBe("fail");
+    expect(finishEvent?.detail).toContain("permission denied");
+    expect(finishEvent?.action).toBe(result.failure?.action);
+  });
+
+  test("telemetry emits start + finish events for every step", async () => {
+    const emitted: StartupTelemetryEvent[] = [];
+    const ctx = buildContext({
+      telemetry: {
+        emit: (event) => emitted.push(event),
+      },
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(true);
+    expect(emitted).toHaveLength(result.history.length * 2);
+    const startEvents = emitted.filter((event) => event.phase === "start");
+    const finishEvents = emitted.filter((event) => event.phase === "finish");
+    expect(startEvents).toHaveLength(result.history.length);
+    expect(finishEvents).toHaveLength(result.history.length);
+    expect(startEvents.every((event) => event.status === "pending")).toBe(true);
+    finishEvents.forEach((event, index) => {
+      const historyEntry = result.history[index];
+      expect(event.code).toBe(historyEntry.code);
+      expect(event.step).toBe(historyEntry.step);
+      expect(event.status).toBe(historyEntry.status);
+      expect(event.elapsedMs).toBe(historyEntry.elapsedMs);
+    });
+  });
+
   test("synthetic guard runs before dispatch and blocks failures", async () => {
     const successOrder: string[] = [];
     const successCtx = buildContext({
@@ -121,7 +417,7 @@ describe("StartupChecklist", () => {
     const lastEntry = success.history.at(-1);
     expect(lastEntry?.category).toBe("dispatch");
     expect(lastEntry?.status).toBe("pass");
-    expect(lastEntry?.step).toBe(5);
+    expect(lastEntry?.step).toBe(8);
 
     const failureOrder: string[] = [];
     const failureDispatchCalls: string[] = [];
@@ -207,7 +503,7 @@ describe("StartupChecklist", () => {
     expect(result.ok).toBe(false);
     expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.SYNTHETIC_FAILED);
     expect(result.failure?.category).toBe("synthetic");
-    expect(result.failure?.step).toBe(4);
+    expect(result.failure?.step).toBe(7);
     expect(result.failure?.detail).toContain("startup.synthetic");
     expect(result.failure?.detail).toContain("connection reset");
     expect(result.failure?.action).toContain("synthetic probe");
@@ -219,17 +515,23 @@ describe("StartupChecklist", () => {
       syntheticMaxLatencyMs: 500,
     });
     expect(result.ok).toBe(true);
-    expect(result.history).toHaveLength(4);
+    expect(result.history).toHaveLength(7);
     expect(result.history.map((h) => h.code)).toEqual([
       STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
       STARTUP_FAILURE_CODES.REPO_DIRTY,
+      STARTUP_FAILURE_CODES.ENV_MISSING,
+      STARTUP_FAILURE_CODES.API_TOKEN_INVALID,
+      STARTUP_FAILURE_CODES.DOCKER_UNAVAILABLE,
       STARTUP_FAILURE_CODES.ALERTS_ACTIVE,
       STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
     ]);
-    expect(result.history.map((h) => h.step)).toEqual([1, 2, 3, 4]);
+    expect(result.history.map((h) => h.step)).toEqual([1, 2, 3, 4, 5, 6, 7]);
     expect(result.history.map((h) => h.category)).toEqual([
       "repo",
       "repo",
+      "env",
+      "env",
+      "infra",
       "alerts",
       "synthetic",
     ]);
@@ -239,11 +541,14 @@ describe("StartupChecklist", () => {
 
   test("exports structured checklist metadata", () => {
     expect(STARTUP_CHECK_STRUCTURE.map((item) => item.step)).toEqual([
-      1, 2, 3, 4, 5,
+      1, 2, 3, 4, 5, 6, 7, 8,
     ]);
     expect(STARTUP_CHECK_STRUCTURE.map((item) => item.category)).toEqual([
       "repo",
       "repo",
+      "env",
+      "env",
+      "infra",
       "alerts",
       "synthetic",
       "dispatch",
@@ -279,7 +584,7 @@ describe("StartupChecklist", () => {
     expect(result.ok).toBe(false);
     expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.SYNTHETIC_FAILED);
     expect(result.failure?.category).toBe("synthetic");
-    expect(result.failure?.step).toBe(4);
+    expect(result.failure?.step).toBe(7);
     const lastHistoryEntry = result.history.at(-1);
     expect(lastHistoryEntry?.code).toBe(
       STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
@@ -315,7 +620,7 @@ describe("StartupChecklist", () => {
     const result = await runStartupPreflight(ctx);
     expect(result.ok).toBe(false);
     expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.ALERTS_ACTIVE);
-    expect(result.failure?.step).toBe(3);
+    expect(result.failure?.step).toBe(6);
     const record = result.history.find(
       (entry) => entry.code === STARTUP_FAILURE_CODES.ALERTS_ACTIVE,
     );
@@ -335,7 +640,7 @@ describe("StartupChecklist", () => {
     const result = await runStartupPreflight(ctx);
     expect(result.ok).toBe(false);
     expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.SYNTHETIC_FAILED);
-    expect(result.failure?.step).toBe(4);
+    expect(result.failure?.step).toBe(7);
     const record = result.history.at(-1);
     expect(record?.status).toBe("fail");
     expect(record?.detail).toContain("probe crashed");
@@ -352,7 +657,7 @@ describe("StartupChecklist", () => {
     expect(result.failure?.category).toBe("dispatch");
     expect(result.failure?.detail).toContain("Dispatch job failed");
     expect(result.failure?.detail).toContain("enqueue failed");
-    expect(result.failure?.step).toBe(5);
+    expect(result.failure?.step).toBe(8);
     const expectedAction = actionFor(STARTUP_FAILURE_CODES.DISPATCH_FAILED);
     expect(result.failure?.action).toBe(expectedAction);
     const lastHistoryEntry = result.history.at(-1);
