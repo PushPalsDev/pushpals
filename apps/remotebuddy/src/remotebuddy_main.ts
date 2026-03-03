@@ -44,68 +44,20 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import { runRemoteBuddyStartupGuard } from "./startup/startup_guard.js";
 import {
-  CliUsageError,
-  dispatchCliCommand,
-  parseCliCommand,
-  type CliHelpFlag,
-  type CliVersionFlag,
-  type RemoteBuddyCliCommand,
-  type RemoteBuddyRunOptions,
-} from "./remotebuddy_cli.js";
-import { runSystemPreflight } from "./system_preflight.js";
+  createRemoteBuddyCliRuntime,
+  type RemoteBuddyLaunchOptions,
+} from "./remotebuddy_cli_runtime.js";
+import packageJson from "../package.json" assert { type: "json" };
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
-
-const CLI_DEFAULTS: RemoteBuddyRunOptions = {
-  server: CONFIG.server.url,
-  sessionId: CONFIG.sessionId,
-  authToken: CONFIG.authToken,
-};
-
-const REMOTEBUDDY_VERSION =
-  process.env.REMOTEBUDDY_VERSION ??
-  process.env.PUSHPALS_BUILD_VERSION ??
-  detectGitVersionTag() ??
-  "dev";
-
-const CLI_USAGE = [
-  "Usage: bun run apps/remotebuddy/src/remotebuddy_main.ts [options]",
-  "",
-  "Options:",
-  "  --server <url>      Override server base URL",
-  "  --sessionId <id>    Override session ID",
-  "  --token <token>     Override auth token for server RPCs",
-  "  -h, --help          Show this help message",
-  "  -V, --version       Show RemoteBuddy version information",
-].join("\n");
-
-function detectGitVersionTag(): string | null {
-  try {
-    const result = Bun.spawnSync(["git", "rev-parse", "--short", "HEAD"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    if (result.exitCode === 0) {
-      const text = String(result.stdout ?? "").trim();
-      if (text) return text;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-function printCliHelp(_flag?: CliHelpFlag): void {
-  console.log("PushPals RemoteBuddy Orchestrator");
-  console.log(CLI_USAGE);
-}
-
-function printCliVersion(_flag?: CliVersionFlag): void {
-  console.log(`[RemoteBuddy] Version: ${REMOTEBUDDY_VERSION}`);
-}
+const RUNTIME_VERSION =
+  typeof (packageJson as { version?: unknown })?.version === "string"
+    ? (packageJson as { version?: string }).version
+    : "0.0.0";
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
 
@@ -2104,9 +2056,9 @@ async function connectWithRetry(
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-async function startRemoteBuddy(runOptions: RemoteBuddyRunOptions): Promise<void> {
+async function launchRemoteBuddy(opts: RemoteBuddyLaunchOptions) {
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
-  console.log(`[RemoteBuddy] Server: ${runOptions.server}`);
+  console.log(`[RemoteBuddy] Server: ${opts.server}`);
   if (CONFIG.startup.logConfigOnStart) {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
@@ -2139,9 +2091,9 @@ async function startRemoteBuddy(runOptions: RemoteBuddyRunOptions): Promise<void
     }`,
   );
 
-  let sessionId = runOptions.sessionId;
+  let sessionId = opts.sessionId;
   console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
-  sessionId = await connectWithRetry(runOptions.server, sessionId ?? undefined);
+  sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
   const llmCfg = CONFIG.remotebuddy.llm;
@@ -2156,9 +2108,9 @@ async function startRemoteBuddy(runOptions: RemoteBuddyRunOptions): Promise<void
   brain = new AgentBrain(llm);
 
   const orchestrator = new RemoteBuddyOrchestrator({
-    server: runOptions.server,
+    server: opts.server,
     sessionId,
-    authToken: runOptions.authToken,
+    authToken: opts.authToken,
     brain,
     llm,
     idempotency,
@@ -2176,103 +2128,26 @@ async function startRemoteBuddy(runOptions: RemoteBuddyRunOptions): Promise<void
   orchestrator.startPolling(pollMs);
 }
 
-interface StartupGuardRunnerDeps {
-  detectRepoRootFn: typeof detectRepoRoot;
-  cwdFn: () => string;
-  runSystemPreflightFn: typeof runSystemPreflight;
-}
-
-function createStartupGuardRunner(deps: StartupGuardRunnerDeps) {
-  return async function runStartupGuardHandler(_options: RemoteBuddyRunOptions): Promise<boolean> {
-    const repoRoot = deps.detectRepoRootFn(deps.cwdFn());
-    console.log(`[RemoteBuddy] Running startup preflight for repo ${repoRoot}...`);
-    try {
-      const result = await deps.runSystemPreflightFn({
-        repo: repoRoot,
-        allowDirtyWorktree: false,
-      });
-      if (!result.ok) {
-        console.error(
-          "[RemoteBuddy] Startup preflight failed. Refer to RemoteBuddyStartupPreflight logs for remediation detail.",
-        );
-        process.exitCode = 1;
-        return false;
-      }
-      console.log("[RemoteBuddy] Startup preflight passed.");
-      return true;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`[RemoteBuddy] Startup preflight error: ${message}`);
-      process.exitCode = 1;
-      return false;
-    }
-  };
-}
-
-export interface RemoteBuddyCliRuntimeOverrides {
-  argv?: string[];
-  parseCommand?: typeof parseCliCommand;
-  dispatchCommand?: typeof dispatchCliCommand;
-  detectRepoRoot?: typeof detectRepoRoot;
-  runSystemPreflight?: typeof runSystemPreflight;
-  startRemoteBuddy?: (options: RemoteBuddyRunOptions) => Promise<void>;
-  printCliHelp?: (flag: CliHelpFlag) => void;
-  printCliVersion?: (flag: CliVersionFlag) => void;
-  cwd?: () => string;
-}
-
-export function createRemoteBuddyCliRuntime(
-  overrides: RemoteBuddyCliRuntimeOverrides = {},
-): { run: () => Promise<void> } {
-  const parseCommandImpl = overrides.parseCommand ?? parseCliCommand;
-  const dispatchCommandImpl = overrides.dispatchCommand ?? dispatchCliCommand;
-  const detectRepoRootImpl = overrides.detectRepoRoot ?? detectRepoRoot;
-  const runSystemPreflightImpl = overrides.runSystemPreflight ?? runSystemPreflight;
-  const launchOrchestratorImpl = overrides.startRemoteBuddy ?? startRemoteBuddy;
-  const printHelpImpl = overrides.printCliHelp ?? printCliHelp;
-  const printVersionImpl = overrides.printCliVersion ?? printCliVersion;
-  const cwdImpl = overrides.cwd ?? (() => process.cwd());
-  const fixedArgv = overrides.argv ?? null;
-
-  const runStartupGuardHandler = createStartupGuardRunner({
-    detectRepoRootFn: detectRepoRootImpl,
-    cwdFn: cwdImpl,
-    runSystemPreflightFn: runSystemPreflightImpl,
-  });
-
-  async function run(): Promise<void> {
-    const argv = fixedArgv ?? process.argv.slice(2);
-    let command: RemoteBuddyCliCommand;
-    try {
-      command = parseCommandImpl(argv, CLI_DEFAULTS);
-    } catch (error) {
-      if (error instanceof CliUsageError) {
-        console.error(`[RemoteBuddy] ${error.message}`);
-        process.exitCode = 1;
-        return;
-      }
-      throw error;
-    }
-
-    await dispatchCommandImpl(command, {
-      showHelp: (flag) => printHelpImpl(flag),
-      showVersion: (flag) => printVersionImpl(flag),
-      runStartupGuard: async (options) => runStartupGuardHandler(options),
-      launchOrchestrator: (options) => launchOrchestratorImpl(options),
-    });
-  }
-
-  return { run };
-}
-
-export async function main(): Promise<void> {
-  const runtime = createRemoteBuddyCliRuntime();
-  await runtime.run();
-}
+const runtime = createRemoteBuddyCliRuntime({
+  version: RUNTIME_VERSION,
+  defaults: {
+    server: CONFIG.server.url,
+    sessionId: CONFIG.sessionId,
+    authToken: CONFIG.authToken,
+  },
+  guard: (options) => runRemoteBuddyStartupGuard(options),
+  launch: (options) => launchRemoteBuddy(options),
+  detectRepoRoot: () => detectRepoRoot(process.cwd()),
+});
 
 if (import.meta.main) {
-  main().catch((err) => {
-    console.error("[RemoteBuddy] Fatal:", err);
-    process.exit(1);
-  });
+  runtime
+    .run()
+    .then((state) => {
+      process.exitCode = state.code;
+    })
+    .catch((err) => {
+      console.error("[RemoteBuddy] Fatal:", err);
+      process.exit(1);
+    });
 }
