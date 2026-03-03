@@ -1,344 +1,337 @@
-export type DispatcherRequestPriority = "interactive" | "normal" | "background";
-
-export interface MetricSummary {
-  sampleCount: number;
-  totalSamples: number;
-  last: number | null;
-  min: number | null;
-  max: number | null;
-  avg: number | null;
-  p50: number | null;
-  p95: number | null;
-}
-
-function isFiniteNonNegative(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
-}
-
-function percentile(sortedValues: number[], percentileRank: number): number | null {
-  if (sortedValues.length === 0) return null;
-  if (percentileRank <= 0) return sortedValues[0] ?? null;
-  if (percentileRank >= 100) return sortedValues[sortedValues.length - 1] ?? null;
-  const idx = Math.ceil((percentileRank / 100) * sortedValues.length) - 1;
-  const clampedIdx = Math.max(0, Math.min(sortedValues.length - 1, idx));
-  return sortedValues[clampedIdx] ?? null;
-}
-
-class MetricWindow {
-  private readonly values: number[] = [];
-  private lastValue: number | null = null;
-  private totalSamples = 0;
-
-  constructor(private readonly capacity: number) {
-    this.capacity = Math.max(1, Math.floor(capacity));
-  }
-
-  add(value: number): void {
-    if (!isFiniteNonNegative(value)) return;
-    this.values.push(value);
-    this.lastValue = value;
-    this.totalSamples += 1;
-    if (this.values.length > this.capacity) {
-      this.values.shift();
-    }
-  }
-
-  snapshot(): MetricSummary {
-    if (this.values.length === 0) {
-      return {
-        sampleCount: 0,
-        totalSamples: this.totalSamples,
-        last: null,
-        min: null,
-        max: null,
-        avg: null,
-        p50: null,
-        p95: null,
-      };
-    }
-    const sorted = [...this.values].sort((a, b) => a - b);
-    const sum = sorted.reduce((acc, value) => acc + value, 0);
-    const avg = sum / sorted.length;
-    return {
-      sampleCount: sorted.length,
-      totalSamples: this.totalSamples,
-      last: this.lastValue,
-      min: sorted[0] ?? null,
-      max: sorted[sorted.length - 1] ?? null,
-      avg: Number.isFinite(avg) ? Math.round(avg) : null,
-      p50: percentile(sorted, 50),
-      p95: percentile(sorted, 95),
-    };
-  }
-}
-
-export interface DispatcherTelemetrySnapshot {
-  queueWaitMs: MetricSummary;
-  dispatchLatencyMs: MetricSummary;
-  concurrency: {
-    pending: number;
-    active: number;
-    managedWorkers: number;
-    maxWorkers: number;
-  };
-  lastPriority: DispatcherRequestPriority | null;
-  backpressure: DispatcherBackpressureState;
-}
-
+type DispatcherQueuePriority = "interactive" | "normal" | "background";
+export type DispatcherTelemetryEvent =
+  | "activate"
+  | "hold"
+  | "recovery"
+  | "clear"
+  | "insufficient_data"
+  | "tick";
 export type DispatcherBackpressurePhase =
   | "inactive"
-  | "active_hold"
-  | "recovery_pending";
+  | "active"
+  | "hold"
+  | "recovery"
+  | "insufficient_data";
 
-export interface DispatcherBackpressureState {
-  active: boolean;
-  phase: DispatcherBackpressurePhase;
-  code: string | null;
-  reason: string | null;
-  triggeredAtMs: number | null;
-  lastObservedLatencyP95Ms: number | null;
-  releaseEligibleAtMs: number | null;
-  intakeHoldMs: number | null;
+export interface DispatcherTelemetryPayload {
+  event: DispatcherTelemetryEvent;
+  emittedAt: string;
+  ingestion: {
+    sampleCount: number;
+    sampleWindowMs: number;
+    p95: number | null;
+    avg: number | null;
+    latestQueueWaitMs: number | null;
+    latestPriority: DispatcherQueuePriority | null;
+    latestSampleAt: string | null;
+  };
+  backpressure: {
+    phase: DispatcherBackpressurePhase;
+    activationThresholdMs: number;
+    releaseThresholdMs: number;
+    minSamples: number;
+    activatedAt: string | null;
+    holdSince: string | null;
+    recoverySince: string | null;
+    insufficientSince: string | null;
+  };
 }
 
-const DEFAULT_BACKPRESSURE_STATE: DispatcherBackpressureState = {
-  active: false,
-  phase: "inactive",
-  code: null,
-  reason: null,
-  triggeredAtMs: null,
-  lastObservedLatencyP95Ms: null,
-  releaseEligibleAtMs: null,
-  intakeHoldMs: null,
-};
+export interface DispatcherTelemetryOptions {
+  enabled: boolean;
+  emitIntervalMs: number;
+  sampleTtlMs: number;
+  minSamples: number;
+  backpressure: {
+    enabled: boolean;
+    activationThresholdMs: number;
+    releaseThresholdMs: number;
+    minSamples: number;
+    throttle: {
+      activeDelayMs: number;
+      recoveryDelayMs: number;
+    };
+  };
+  emit: (payload: DispatcherTelemetryPayload) => void | Promise<void>;
+  now?: () => number;
+}
+
+interface TelemetrySample {
+  value: number;
+  priority: DispatcherQueuePriority;
+  ts: number;
+}
+
+interface TelemetryStats {
+  sampleCount: number;
+  p95: number | null;
+  avg: number | null;
+}
+
+function normalizePriority(value: unknown): DispatcherQueuePriority {
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (text === "interactive" || text === "background") return text;
+  return "normal";
+}
+
+function percentile(values: number[], percentileRank: number): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0];
+  const idx = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil((percentileRank / 100) * sorted.length) - 1),
+  );
+  return sorted[idx] ?? null;
+}
 
 export class DispatcherTelemetry {
-  private readonly queueWaitWindow: MetricWindow;
-  private readonly dispatchLatencyWindow: MetricWindow;
-  private pendingDispatches = 0;
-  private activeDispatches = 0;
-  private managedWorkers = 0;
-  private maxWorkers = 0;
-  private lastPriority: DispatcherRequestPriority | null = null;
-  private backpressure: DispatcherBackpressureState = { ...DEFAULT_BACKPRESSURE_STATE };
+  private readonly samples: TelemetrySample[] = [];
+  private stats: TelemetryStats = { sampleCount: 0, p95: null, avg: null };
+  private lastSample: TelemetrySample | null = null;
+  private lastTickEmitMs = 0;
+  private readonly backpressure = {
+    phase: "inactive" as DispatcherBackpressurePhase,
+    activatedAtMs: null as number | null,
+    holdSinceMs: null as number | null,
+    recoverySinceMs: null as number | null,
+    insufficientSinceMs: null as number | null,
+  };
+  private recoverySampleCount = 0;
 
-  constructor(opts?: { queueWindowSize?: number; dispatchWindowSize?: number }) {
-    const queueWindowSize = opts?.queueWindowSize ?? 120;
-    const dispatchWindowSize = opts?.dispatchWindowSize ?? 120;
-    this.queueWaitWindow = new MetricWindow(queueWindowSize);
-    this.dispatchLatencyWindow = new MetricWindow(dispatchWindowSize);
-  }
+  constructor(private readonly options: DispatcherTelemetryOptions) {}
 
-  incrementPending(): void {
-    this.pendingDispatches += 1;
-  }
-
-  beginDispatch(meta: { queueWaitMs?: number; priority?: DispatcherRequestPriority }): void {
-    if (this.pendingDispatches > 0) {
-      this.pendingDispatches -= 1;
-    }
-    this.activeDispatches += 1;
-    if (isFiniteNonNegative(meta.queueWaitMs)) {
-      this.queueWaitWindow.add(Math.round(meta.queueWaitMs));
-    }
-    if (meta.priority) {
-      this.lastPriority = meta.priority;
-    }
-  }
-
-  completeDispatch(latencyMs: number): void {
-    if (isFiniteNonNegative(latencyMs)) {
-      this.dispatchLatencyWindow.add(Math.round(latencyMs));
-    }
-    if (this.activeDispatches > 0) {
-      this.activeDispatches -= 1;
+  recordQueueSample(sample: { queueWaitMs: number | null | undefined; priority: unknown }): void {
+    if (!this.options.enabled) return;
+    const value = Number(sample.queueWaitMs);
+    if (!Number.isFinite(value) || value < 0) return;
+    const now = this.now();
+    const normalized: TelemetrySample = {
+      value: Math.floor(value),
+      priority: normalizePriority(sample.priority),
+      ts: now,
+    };
+    this.samples.push(normalized);
+    this.trimSamples(now);
+    this.lastSample = this.samples[this.samples.length - 1] ?? null;
+    this.stats = this.computeStats();
+    const transition = this.evaluateBackpressure(now, "sample");
+    if (transition) {
+      this.emit(transition, now);
     }
   }
 
-  setWorkerPoolStats(stats: { managed: number; max: number }): void {
-    this.managedWorkers = Math.max(0, Math.floor(stats.managed));
-    this.maxWorkers = Math.max(1, Math.floor(stats.max));
+  maybeEmitTick(now = this.now()): void {
+    if (!this.options.enabled) return;
+    this.trimSamples(now);
+    this.lastSample = this.samples[this.samples.length - 1] ?? null;
+    this.stats = this.computeStats();
+    const transition = this.evaluateBackpressure(now, "tick");
+    if (transition) {
+      this.emit(transition, now);
+    }
+    if (this.lastTickEmitMs === 0 || now - this.lastTickEmitMs >= this.options.emitIntervalMs) {
+      this.lastTickEmitMs = now;
+      this.emit("tick", now);
+    }
   }
 
-  setBackpressureState(state: DispatcherBackpressureState): void {
-    this.backpressure = { ...state };
+  getIntakeDelayMs(): number {
+    if (!this.options.enabled || !this.options.backpressure.enabled) return 0;
+    const { throttle } = this.options.backpressure;
+    switch (this.backpressure.phase) {
+      case "active":
+      case "hold":
+      case "insufficient_data":
+        return throttle.activeDelayMs;
+      case "recovery":
+        return throttle.recoveryDelayMs;
+      default:
+        return 0;
+    }
   }
 
-  snapshot(): DispatcherTelemetrySnapshot {
+  getPhase(): DispatcherBackpressurePhase {
+    return this.backpressure.phase;
+  }
+
+  private now(): number {
+    return typeof this.options.now === "function" ? this.options.now() : Date.now();
+  }
+
+  private trimSamples(now: number): void {
+    if (this.samples.length === 0) return;
+    const cutoff = now - this.options.sampleTtlMs;
+    while (this.samples.length > 0 && this.samples[0].ts < cutoff) {
+      this.samples.shift();
+    }
+  }
+
+  private computeStats(): TelemetryStats {
+    if (this.samples.length === 0) {
+      return { sampleCount: 0, p95: null, avg: null };
+    }
+    const values = this.samples.map((sample) => sample.value);
+    const sum = values.reduce((acc, value) => acc + value, 0);
     return {
-      queueWaitMs: this.queueWaitWindow.snapshot(),
-      dispatchLatencyMs: this.dispatchLatencyWindow.snapshot(),
-      concurrency: {
-        pending: this.pendingDispatches,
-        active: this.activeDispatches,
-        managedWorkers: this.managedWorkers,
-        maxWorkers: this.maxWorkers,
-      },
-      lastPriority: this.lastPriority,
-      backpressure: { ...this.backpressure },
+      sampleCount: values.length,
+      p95: percentile(values, 95),
+      avg: Math.round(sum / values.length),
     };
   }
-}
 
-export interface DispatcherBackpressureOptions {
-  triggerP95Ms?: number;
-  releaseP95Ms?: number;
-  minHoldMs?: number;
-  minSamples?: number;
-}
+  private evaluateBackpressure(
+    now: number,
+    source: "sample" | "tick",
+  ): DispatcherTelemetryEvent | null {
+    if (!this.options.backpressure.enabled) {
+      if (this.backpressure.phase === "inactive") return null;
+      this.resetBackpressure();
+      return "clear";
+    }
 
-export interface DispatcherBackpressureSignal {
-  active: boolean;
-  phase: DispatcherBackpressurePhase;
-  code: string;
-  reason: string;
-  triggeredAtMs: number;
-  intakeHoldMs?: number;
-}
+    const { activationThresholdMs, releaseThresholdMs, minSamples } = this.options.backpressure;
+    const sampleCount = this.stats.sampleCount;
+    const p95 = this.stats.p95;
+    const phase = this.backpressure.phase;
 
-export interface BackpressureEvaluation {
-  changed: boolean;
-  state: DispatcherBackpressureState;
-  event: "activated" | "cleared" | null;
-  signal: DispatcherBackpressureSignal | null;
-}
-
-const DEFAULT_TRIGGER_P95_MS = 1_500;
-const DEFAULT_RELEASE_P95_MS = 1_000;
-const DEFAULT_MIN_HOLD_MS = 60_000;
-const DEFAULT_MIN_SAMPLES = 5;
-
-export class DispatcherBackpressureController {
-  private readonly triggerP95Ms: number;
-  private readonly releaseP95Ms: number;
-  private readonly minHoldMs: number;
-  private readonly minSamples: number;
-  private state: DispatcherBackpressureState = { ...DEFAULT_BACKPRESSURE_STATE };
-  private lastClearSampleVersion = 0;
-
-  constructor(options: DispatcherBackpressureOptions = {}) {
-    this.triggerP95Ms = Math.max(1, options.triggerP95Ms ?? DEFAULT_TRIGGER_P95_MS);
-    this.releaseP95Ms = Math.max(0, options.releaseP95Ms ?? DEFAULT_RELEASE_P95_MS);
-    this.minHoldMs = Math.max(1_000, options.minHoldMs ?? DEFAULT_MIN_HOLD_MS);
-    this.minSamples = Math.max(1, Math.floor(options.minSamples ?? DEFAULT_MIN_SAMPLES));
-  }
-
-  evaluate(snapshot: DispatcherTelemetrySnapshot, now = Date.now()): BackpressureEvaluation {
-    const latencySummary = snapshot.dispatchLatencyMs;
-    const p95 = isFiniteNonNegative(latencySummary.p95 ?? null) ? Number(latencySummary.p95) : null;
-    const sampleCount = latencySummary.sampleCount ?? 0;
-    const sampleVersion = isFiniteNonNegative(latencySummary.totalSamples ?? null)
-      ? Number(latencySummary.totalSamples)
-      : sampleCount;
-    this.state = {
-      ...this.state,
-      lastObservedLatencyP95Ms: p95,
-    };
-
-    if (!this.state.active) {
-      const shouldActivate =
-        sampleVersion > this.lastClearSampleVersion &&
-        p95 != null &&
-        sampleCount >= this.minSamples &&
-        p95 >= this.triggerP95Ms;
-      if (shouldActivate) {
-        const triggeredAtMs = now;
-        const releaseEligibleAtMs = triggeredAtMs + this.minHoldMs;
-        const intakeHoldMs = Math.max(1_000, Math.min(2_000, Math.floor(this.minHoldMs / 30)));
-        this.state = {
-          active: true,
-          phase: "active_hold",
-          code: "dispatcher.backpressure.latency_p95_high",
-          reason: `dispatch_latency_p95=${p95}ms threshold=${this.triggerP95Ms}ms`,
-          triggeredAtMs,
-          lastObservedLatencyP95Ms: p95,
-          releaseEligibleAtMs,
-          intakeHoldMs,
-        };
-        return {
-          changed: true,
-          state: this.state,
-          event: "activated",
-          signal: {
-            active: true,
-            phase: this.state.phase,
-            code: this.state.code ?? "dispatcher.backpressure.latency_p95_high",
-            reason: this.state.reason ?? "dispatcher latency backpressure",
-            triggeredAtMs,
-            intakeHoldMs,
-          },
-        };
+    if (phase === "inactive") {
+      if (sampleCount >= minSamples && p95 != null && p95 >= activationThresholdMs) {
+        return this.transitionPhase("active", now);
       }
-      return { changed: false, state: this.state, event: null, signal: null };
+      return null;
     }
 
-    const releaseEligibleAtMs =
-      this.state.releaseEligibleAtMs ??
-      (this.state.triggeredAtMs ? this.state.triggeredAtMs + this.minHoldMs : null);
-    const holdExpired = releaseEligibleAtMs != null ? now >= releaseEligibleAtMs : true;
-    const phase = holdExpired ? "recovery_pending" : "active_hold";
-    if (this.state.phase !== phase) {
-      this.state = {
-        ...this.state,
-        phase,
-        releaseEligibleAtMs,
-      };
-    }
-    const shouldRelease =
-      holdExpired &&
-      (p95 == null || p95 <= this.releaseP95Ms || sampleCount < this.minSamples);
-    if (shouldRelease) {
-      this.state = {
-        ...DEFAULT_BACKPRESSURE_STATE,
-        lastObservedLatencyP95Ms: p95,
-      };
-      this.lastClearSampleVersion = sampleVersion;
-      return {
-        changed: true,
-        state: this.state,
-        event: "cleared",
-        signal: {
-          active: false,
-          phase: this.state.phase,
-          code: "dispatcher.backpressure.cleared",
-          reason: "dispatcher backpressure cleared",
-          triggeredAtMs: now,
-        },
-      };
+    if (sampleCount < minSamples || p95 == null) {
+      if (phase === "insufficient_data") return null;
+      return this.transitionPhase("insufficient_data", now);
     }
 
-    this.state = {
-      ...this.state,
-      lastObservedLatencyP95Ms: p95,
-      releaseEligibleAtMs,
-      phase,
+    if (p95 >= activationThresholdMs) {
+      if (phase === "active") {
+        return this.transitionPhase("hold", now);
+      }
+      if (phase !== "hold") {
+        this.recoverySampleCount = 0;
+        return this.transitionPhase("hold", now);
+      }
+      this.recoverySampleCount = 0;
+      return null;
+    }
+
+    if (p95 <= releaseThresholdMs) {
+      if (phase === "recovery") {
+        if (source === "sample") {
+          this.recoverySampleCount += 1;
+        }
+        if (this.recoverySampleCount >= minSamples) {
+          this.resetBackpressure();
+          return "clear";
+        }
+        return null;
+      }
+      this.recoverySampleCount = 1;
+      return this.transitionPhase("recovery", now);
+    }
+
+    if (phase !== "hold") {
+      this.recoverySampleCount = 0;
+      return this.transitionPhase("hold", now);
+    }
+    this.recoverySampleCount = 0;
+    return null;
+  }
+
+  private transitionPhase(
+    next: DispatcherBackpressurePhase,
+    now: number,
+  ): DispatcherTelemetryEvent {
+    if (next === "inactive") {
+      this.resetBackpressure();
+      return "clear";
+    }
+    this.backpressure.phase = next;
+    switch (next) {
+      case "active":
+        this.backpressure.activatedAtMs = now;
+        this.backpressure.holdSinceMs = null;
+        this.backpressure.recoverySinceMs = null;
+        this.backpressure.insufficientSinceMs = null;
+        this.recoverySampleCount = 0;
+        return "activate";
+      case "hold":
+        this.backpressure.holdSinceMs = now;
+        this.backpressure.recoverySinceMs = null;
+        this.backpressure.insufficientSinceMs = null;
+        this.recoverySampleCount = 0;
+        return "hold";
+      case "recovery":
+        this.backpressure.recoverySinceMs = now;
+        this.backpressure.holdSinceMs = null;
+        this.backpressure.insufficientSinceMs = null;
+        this.recoverySampleCount = 1;
+        return "recovery";
+      case "insufficient_data":
+        this.backpressure.insufficientSinceMs = now;
+        return "insufficient_data";
+      default:
+        return "tick";
+    }
+  }
+
+  private resetBackpressure(): void {
+    this.backpressure.phase = "inactive";
+    this.backpressure.activatedAtMs = null;
+    this.backpressure.holdSinceMs = null;
+    this.backpressure.recoverySinceMs = null;
+    this.backpressure.insufficientSinceMs = null;
+    this.recoverySampleCount = 0;
+  }
+
+  private emit(event: DispatcherTelemetryEvent, now: number): void {
+    if (!this.options.enabled) return;
+    const payload: DispatcherTelemetryPayload = {
+      event,
+      emittedAt: new Date(now).toISOString(),
+      ingestion: {
+        sampleCount: this.stats.sampleCount,
+        sampleWindowMs: this.options.sampleTtlMs,
+        p95: this.stats.p95,
+        avg: this.stats.avg,
+        latestQueueWaitMs: this.lastSample ? this.lastSample.value : null,
+        latestPriority: this.lastSample ? this.lastSample.priority : null,
+        latestSampleAt: this.lastSample ? new Date(this.lastSample.ts).toISOString() : null,
+      },
+      backpressure: {
+        phase: this.backpressure.phase,
+        activationThresholdMs: this.options.backpressure.activationThresholdMs,
+        releaseThresholdMs: this.options.backpressure.releaseThresholdMs,
+        minSamples: this.options.backpressure.minSamples,
+        activatedAt: this.backpressure.activatedAtMs
+          ? new Date(this.backpressure.activatedAtMs).toISOString()
+          : null,
+        holdSince: this.backpressure.holdSinceMs
+          ? new Date(this.backpressure.holdSinceMs).toISOString()
+          : null,
+        recoverySince: this.backpressure.recoverySinceMs
+          ? new Date(this.backpressure.recoverySinceMs).toISOString()
+          : null,
+        insufficientSince: this.backpressure.insufficientSinceMs
+          ? new Date(this.backpressure.insufficientSinceMs).toISOString()
+          : null,
+      },
     };
-
-    return { changed: false, state: this.state, event: null, signal: null };
-  }
-}
-
-export class DispatcherIntakeGate {
-  private holdUntilMs = 0;
-
-  requestHold(durationMs: number, now = Date.now()): number {
-    const hold = Math.max(0, Math.floor(durationMs));
-    if (hold <= 0) return this.holdUntilMs;
-    const target = now + hold;
-    this.holdUntilMs = Math.max(this.holdUntilMs, target);
-    return this.holdUntilMs;
-  }
-
-  clear(): void {
-    this.holdUntilMs = 0;
-  }
-
-  remainingHoldMs(now = Date.now()): number {
-    if (this.holdUntilMs <= 0) return 0;
-    return Math.max(0, this.holdUntilMs - now);
-  }
-
-  isHolding(now = Date.now()): boolean {
-    return this.remainingHoldMs(now) > 0;
+    try {
+      const result = this.options.emit(payload);
+      if (result && typeof (result as Promise<void>).then === "function") {
+        void (result as Promise<void>).catch(() => {
+          // swallow telemetry emission errors
+        });
+      }
+    } catch {
+      // ignore telemetry emit failures
+    }
   }
 }
