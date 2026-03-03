@@ -1,3 +1,12 @@
+import {
+  MIN_GIT_VERSION,
+  compareGitVersions,
+  detectGitVersion,
+  formatGitVersion,
+  parseGitVersion,
+  type DetectGitVersionFn,
+} from "./git_runtime.js";
+
 /**
  * Deterministic startup preflight checklist plus a synthetic dispatch guard.
  * The helper executes each check sequentially, surfaces actionable failure codes,
@@ -9,6 +18,7 @@ export const STARTUP_FAILURE_CODES = {
   ALERTS_ACTIVE: "startup.alerts_active",
   SYNTHETIC_FAILED: "startup.synthetic_failed",
   DISPATCH_FAILED: "startup.dispatch_failed",
+  GIT_RUNTIME_UNSUPPORTED: "startup.git_runtime_unsupported",
 } as const;
 
 export type StartupFailureCode =
@@ -79,6 +89,7 @@ export interface StartupChecklistContext {
   syntheticTester: SyntheticStartupTester;
   now?: () => number;
   log?: (entry: StartupCheckRecord) => void;
+  detectGitVersion?: DetectGitVersionFn;
 }
 
 type StartupCheckDefinition = {
@@ -105,8 +116,53 @@ const DEFAULT_SYNTHETIC_PROBE = "probe.remote_startup";
 const DISPATCH_CHECK_LABEL = "Job dispatch must succeed.";
 const DISPATCH_CHECK_ACTION =
   "Inspect RemoteBuddy + WorkerPals logs, repair dependencies, then rerun dispatch.";
+const MIN_GIT_VERSION_LABEL = formatGitVersion(MIN_GIT_VERSION);
+const GIT_RUNTIME_CHECK_LABEL = "Git CLI must be installed and supported.";
+const GIT_RUNTIME_CHECK_ACTION = `Install Git ${MIN_GIT_VERSION_LABEL}+ and ensure it is on PATH for startup.`;
 
 const defaultChecks: readonly StartupCheckDefinition[] = [
+  {
+    code: STARTUP_FAILURE_CODES.GIT_RUNTIME_UNSUPPORTED,
+    label: GIT_RUNTIME_CHECK_LABEL,
+    action: GIT_RUNTIME_CHECK_ACTION,
+    category: "repo",
+    run: async (ctx) => {
+      const detector = ctx.detectGitVersion ?? detectGitVersion;
+      let rawVersion: string | null;
+      try {
+        rawVersion = await detector();
+      } catch (error) {
+        const detail =
+          error instanceof Error
+            ? `Git runtime check failed: ${error.message}`
+            : "Git runtime check failed: unknown error.";
+        return { ok: false, detail };
+      }
+      if (!rawVersion) {
+        return {
+          ok: false,
+          detail: "Git runtime was not detected. Install Git and ensure it is on PATH.",
+        };
+      }
+      const parsed = parseGitVersion(rawVersion);
+      if (!parsed) {
+        return {
+          ok: false,
+          detail: `Git runtime output "${rawVersion.trim() || rawVersion}" is not a supported semver (major.minor.patch). Install Git ${MIN_GIT_VERSION_LABEL}+ and ensure it is on PATH.`,
+        };
+      }
+      if (compareGitVersions(parsed, MIN_GIT_VERSION) < 0) {
+        return {
+          ok: false,
+          detail: `Git ${parsed.version} is below required ${MIN_GIT_VERSION_LABEL}.`,
+        };
+      }
+      return {
+        ok: true,
+        detail: `Git ${parsed.version} detected (minimum ${MIN_GIT_VERSION_LABEL}).`,
+      };
+    },
+  },
   {
     code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
     label: "Git merge or rebase must be resolved.",
@@ -228,6 +284,8 @@ const memoizeContext = (
   ctx: StartupChecklistContext,
 ): StartupChecklistContext => {
   let repoStatusPromise: Promise<RepoStatus> | undefined;
+  let gitVersionPromise: Promise<string | null> | undefined;
+  const detector = ctx.detectGitVersion ?? detectGitVersion;
   return {
     ...ctx,
     describeRepo: () => {
@@ -235,6 +293,12 @@ const memoizeContext = (
         repoStatusPromise = ctx.describeRepo();
       }
       return repoStatusPromise;
+    },
+    detectGitVersion: () => {
+      if (!gitVersionPromise) {
+        gitVersionPromise = detector();
+      }
+      return gitVersionPromise;
     },
   };
 };
