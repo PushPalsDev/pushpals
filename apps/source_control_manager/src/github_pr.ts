@@ -394,6 +394,10 @@ export interface PullRequestComment {
   id: number;
   body: string;
   userLogin: string;
+  userId?: number | null;
+  userType?: string | null;
+  authorAssociation?: string | null;
+  githubAppSlug?: string | null;
   createdAt: string;
   htmlUrl: string;
 }
@@ -427,7 +431,9 @@ export async function listPullRequestComments(opts: {
     body?: unknown;
     created_at?: unknown;
     html_url?: unknown;
-    user?: { login?: unknown } | null;
+    author_association?: unknown;
+    performed_via_github_app?: { slug?: unknown } | null;
+    user?: { login?: unknown; id?: unknown; type?: unknown } | null;
   }>;
   const normalizedIssueComments = Array.isArray(issueComments)
     ? issueComments
@@ -439,7 +445,9 @@ export async function listPullRequestComments(opts: {
     body?: unknown;
     created_at?: unknown;
     html_url?: unknown;
-    user?: { login?: unknown } | null;
+    author_association?: unknown;
+    performed_via_github_app?: { slug?: unknown } | null;
+    user?: { login?: unknown; id?: unknown; type?: unknown } | null;
   }> = [];
   const reviewResponse = await fetch(reviewUrl, {
     method: "GET",
@@ -451,7 +459,9 @@ export async function listPullRequestComments(opts: {
       body?: unknown;
       created_at?: unknown;
       html_url?: unknown;
-      user?: { login?: unknown } | null;
+      author_association?: unknown;
+      performed_via_github_app?: { slug?: unknown } | null;
+      user?: { login?: unknown; id?: unknown; type?: unknown } | null;
     }>;
     normalizedReviewComments = Array.isArray(reviewComments) ? reviewComments : [];
   }
@@ -461,14 +471,31 @@ export async function listPullRequestComments(opts: {
       const id = typeof comment.id === "number" ? comment.id : Number(comment.id);
       if (!Number.isFinite(id)) return null;
       const body = typeof comment.body === "string" ? comment.body : "";
+      const authorAssociation =
+        typeof comment.author_association === "string" ? comment.author_association : "";
+      const githubAppSlug =
+        comment.performed_via_github_app &&
+        typeof comment.performed_via_github_app.slug === "string"
+          ? comment.performed_via_github_app.slug
+          : "";
       const createdAt = typeof comment.created_at === "string" ? comment.created_at : "";
       const htmlUrl = typeof comment.html_url === "string" ? comment.html_url : "";
       const userLogin =
         comment.user && typeof comment.user.login === "string" ? comment.user.login : "";
+      const userId =
+        comment.user && typeof comment.user.id === "number"
+          ? comment.user.id
+          : Number(comment.user?.id);
+      const userType =
+        comment.user && typeof comment.user.type === "string" ? comment.user.type : "";
       return {
         id,
         body,
         userLogin,
+        userId: Number.isFinite(userId) ? userId : null,
+        userType,
+        authorAssociation,
+        githubAppSlug: githubAppSlug || null,
         createdAt,
         htmlUrl,
       };
@@ -500,4 +527,33 @@ export async function addPullRequestComment(opts: {
     const text = await response.text();
     throw githubError(response.status, text);
   }
+}
+
+export async function getAuthenticatedUser(opts: {
+  token: string;
+}): Promise<{ login: string; id: number | null; type: string; name: string | null }> {
+  const response = await fetch("https://api.github.com/user", {
+    method: "GET",
+    headers: githubHeaders(opts.token),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw githubError(response.status, text);
+  }
+  const data = (await response.json()) as {
+    login?: unknown;
+    id?: unknown;
+    type?: unknown;
+    name?: unknown;
+  };
+  const login = typeof data.login === "string" ? data.login : "";
+  const id = typeof data.id === "number" ? data.id : Number(data.id);
+  const type = typeof data.type === "string" ? data.type : "";
+  const name = typeof data.name === "string" ? data.name : null;
+  return {
+    login,
+    id: Number.isFinite(id) ? id : null,
+    type,
+    name,
+  };
 }

@@ -8,6 +8,7 @@ import {
   deleteBranchRef,
   type DeleteBranchRefResult,
   getCommitMessage,
+  getAuthenticatedUser,
   listPullRequestComments,
   getPullRequestCommitMessage,
   getPullRequestDiff,
@@ -37,6 +38,7 @@ interface ReviewAgentDeps {
   closePullRequest: typeof closePullRequest;
   deleteBranchRef: typeof deleteBranchRef;
   addPullRequestComment: typeof addPullRequestComment;
+  getAuthenticatedUser: typeof getAuthenticatedUser;
   invokeCodexReview: (prompt: string, config: ReviewAgentConfig) => Promise<string>;
   fetchImpl: typeof fetch;
   now: () => number;
@@ -59,6 +61,9 @@ const REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS = 60_000;
 const PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
+export const REVIEW_AGENT_FEEDBACK_MARKER = "<!-- ReviewAgent:feedback -->";
+const REVIEW_AGENT_IDENTITY_CACHE_SUCCESS_MS = 10 * 60 * 1000;
+const REVIEW_AGENT_IDENTITY_RETRY_BACKOFF_MS = 60 * 1000;
 const DEFAULT_WORKSPACE_ROOT = resolve(import.meta.dir, "..", "..", "..");
 
 const ts = () => new Date().toISOString();
@@ -73,6 +78,7 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   closePullRequest,
   deleteBranchRef,
   addPullRequestComment,
+  getAuthenticatedUser,
   invokeCodexReview,
   fetchImpl: fetch,
   now: () => Date.now(),
@@ -323,6 +329,8 @@ export function buildReviewPrompt(
 
 function formatRejectionComment(verdict: ReviewVerdict): string {
   const lines = [
+    REVIEW_AGENT_FEEDBACK_MARKER,
+    "",
     `## ReviewAgent: Changes Rejected (score ${verdict.score.toFixed(1)}/10)`,
     "",
     `**Verdict:** ${verdict.summary}`,
@@ -346,10 +354,12 @@ function formatRejectionComment(verdict: ReviewVerdict): string {
 
 function formatGiveUpComment(verdict: ReviewVerdict, maxCommentsBeforeGiveUp: number): string {
   const lines = [
+    REVIEW_AGENT_FEEDBACK_MARKER,
+    "",
     `## ReviewAgent: PR Closed Without Merge (score ${verdict.score.toFixed(1)}/10)`,
     "",
     `**Verdict:** ${verdict.summary}`,
-    `**Reason:** Reached PR feedback comment cap (${Math.max(1, Math.floor(maxCommentsBeforeGiveUp))}).`,
+    `**Reason:** Reached ReviewAgent feedback comment cap (${Math.max(1, Math.floor(maxCommentsBeforeGiveUp))}).`,
     "",
     "_No additional auto-fix attempts will be made for this PR. The PR is being closed and its branch deleted._",
   ];
@@ -359,6 +369,8 @@ function formatGiveUpComment(verdict: ReviewVerdict, maxCommentsBeforeGiveUp: nu
 function formatApprovalComment(verdict: ReviewVerdict, passThreshold: number): string {
   const normalizedThreshold = Math.max(1, Math.min(10, passThreshold));
   const lines = [
+    REVIEW_AGENT_FEEDBACK_MARKER,
+    "",
     `## ReviewAgent: Changes Approved (score ${verdict.score.toFixed(1)}/10)`,
     "",
     `**Verdict:** ${verdict.summary}`,
@@ -444,6 +456,80 @@ function buildFallbackFixInstruction(pr: GitHubPR, verdict: ReviewVerdict): stri
 
 function normalizeCommentBody(body: string): string {
   return body.replace(/\r\n/g, "\n").trim();
+}
+
+function normalizeLogin(value: string | null | undefined): string | null {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return null;
+  return trimmed.toLowerCase();
+}
+
+function deriveGithubAppSlugFromLogin(login: string | null): string | null {
+  const normalized = normalizeLogin(login);
+  if (!normalized || !normalized.endsWith("[bot]")) return null;
+  return normalized.replace(/\[bot\]$/, "") || null;
+}
+
+function isBotAuthor(comment: PullRequestComment): boolean {
+  const userType = normalizeLogin(comment.userType);
+  if (userType === "bot" || userType === "application") return true;
+  const login = normalizeLogin(comment.userLogin);
+  return login ? login.endsWith("[bot]") : false;
+}
+
+function hasReviewAgentMarker(normalizedBody: string): boolean {
+  return normalizedBody.includes(REVIEW_AGENT_FEEDBACK_MARKER);
+}
+
+interface ReviewAgentCommentMatchOptions {
+  login?: string | null;
+  userId?: number | null;
+  githubAppSlug?: string | null;
+}
+
+function isReviewAgentFeedbackComment(
+  comment: PullRequestComment,
+  opts: ReviewAgentCommentMatchOptions = {},
+): boolean {
+  const normalizedBody = normalizeCommentBody(String(comment.body ?? ""));
+  if (!normalizedBody || !hasReviewAgentMarker(normalizedBody)) {
+    return false;
+  }
+
+  const hasTrustedIdentity =
+    (typeof opts.userId === "number" && Number.isFinite(opts.userId)) ||
+    Boolean(normalizeLogin(opts.login)) ||
+    Boolean(normalizeLogin(opts.githubAppSlug));
+  if (!hasTrustedIdentity) {
+    return false;
+  }
+
+  const normalizedLogin = normalizeLogin(comment.userLogin);
+  const trustedLogin = normalizeLogin(opts.login);
+  const loginMatches = Boolean(trustedLogin && normalizedLogin && trustedLogin === normalizedLogin);
+
+  const trustedUserId =
+    typeof opts.userId === "number" && Number.isFinite(opts.userId) ? opts.userId : null;
+  const commentUserId =
+    typeof comment.userId === "number" && Number.isFinite(comment.userId) ? comment.userId : null;
+  const userIdMatches =
+    trustedUserId != null && commentUserId != null && trustedUserId === commentUserId;
+
+  const trustedAppSlug = normalizeLogin(opts.githubAppSlug);
+  const commentAppSlug = normalizeLogin(comment.githubAppSlug);
+  const appMatches = Boolean(trustedAppSlug && commentAppSlug && trustedAppSlug === commentAppSlug);
+
+  return userIdMatches || appMatches || loginMatches;
+}
+
+function countReviewAgentFeedbackComments(
+  comments: PullRequestComment[],
+  opts: ReviewAgentCommentMatchOptions = {},
+): number {
+  return comments.reduce(
+    (count, comment) => (isReviewAgentFeedbackComment(comment, opts) ? count + 1 : count),
+    0,
+  );
 }
 
 function collapseWhitespace(value: string): string {
@@ -735,6 +821,20 @@ export class ReviewAgent {
   private reReviewEnqueueCounts = new Map<number, number>();
   private reviewerMd = "";
   private pollInFlight = false;
+  private reviewAgentAuthor: {
+    login: string | null;
+    normalizedLogin: string | null;
+    userId: number | null;
+    githubAppSlug: string | null;
+  } | null = null;
+  private reviewAgentAuthorResolved = false;
+  private reviewAgentAuthorNextRefreshMs = 0;
+  private reviewAgentAuthorPromise: Promise<{
+    login: string | null;
+    normalizedLogin: string | null;
+    userId: number | null;
+    githubAppSlug: string | null;
+  } | null> | null = null;
   private readonly deps: ReviewAgentDeps;
 
   constructor(
@@ -768,6 +868,63 @@ export class ReviewAgent {
       );
       return "";
     }
+  }
+
+  private async resolveReviewAgentAuthor(): Promise<{
+    login: string | null;
+    normalizedLogin: string | null;
+    userId: number | null;
+    githubAppSlug: string | null;
+  } | null> {
+    const now = this.deps.now();
+    if (
+      this.reviewAgentAuthorResolved &&
+      !this.reviewAgentAuthorPromise &&
+      now < this.reviewAgentAuthorNextRefreshMs
+    ) {
+      return this.reviewAgentAuthor;
+    }
+    if (
+      this.reviewAgentAuthorResolved &&
+      !this.reviewAgentAuthorPromise &&
+      now >= this.reviewAgentAuthorNextRefreshMs
+    ) {
+      this.reviewAgentAuthorResolved = false;
+      this.reviewAgentAuthor = null;
+    }
+    if (this.reviewAgentAuthorPromise) {
+      return this.reviewAgentAuthorPromise;
+    }
+
+    this.reviewAgentAuthorPromise = (async () => {
+      const startedAt = this.deps.now();
+      try {
+        const viewer = await this.deps.getAuthenticatedUser({ token: this.githubToken });
+        const login = viewer.login?.trim() || null;
+        const normalizedLogin = normalizeLogin(login);
+        const userId = typeof viewer.id === "number" ? viewer.id : null;
+        this.reviewAgentAuthor = {
+          login,
+          normalizedLogin,
+          userId,
+          githubAppSlug: deriveGithubAppSlugFromLogin(login),
+        };
+        this.reviewAgentAuthorNextRefreshMs =
+          startedAt + REVIEW_AGENT_IDENTITY_CACHE_SUCCESS_MS;
+      } catch (err: any) {
+        this.reviewAgentAuthor = null;
+        this.reviewAgentAuthorNextRefreshMs =
+          startedAt + REVIEW_AGENT_IDENTITY_RETRY_BACKOFF_MS;
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Failed to resolve ReviewAgent comment identity: ${err?.message ?? err}`,
+        );
+      } finally {
+        this.reviewAgentAuthorResolved = true;
+        this.reviewAgentAuthorPromise = null;
+      }
+      return this.reviewAgentAuthor;
+    })();
+    return this.reviewAgentAuthorPromise;
   }
 
   async poll(): Promise<void> {
@@ -1026,12 +1183,26 @@ export class ReviewAgent {
       pr.number,
       Math.max(MAX_REVIEW_CONTEXT_COMMENTS * 3, maxPrCommentsBeforeGiveUp),
     );
-    if (recentComments.length >= maxPrCommentsBeforeGiveUp) {
+    const authorIdentity = await this.resolveReviewAgentAuthor();
+    if (!authorIdentity) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Unable to resolve ReviewAgent identity; skipping comment-cap enforcement for PR #${pr.number}.`,
+      );
+    }
+    const reviewAgentCommentCount = authorIdentity
+      ? countReviewAgentFeedbackComments(recentComments, {
+          login: authorIdentity.normalizedLogin ?? authorIdentity.login ?? null,
+          userId: authorIdentity.userId ?? null,
+          githubAppSlug: authorIdentity.githubAppSlug ?? null,
+        })
+      : 0;
+    if (reviewAgentCommentCount >= maxPrCommentsBeforeGiveUp) {
       return await this.giveUpOnRejectedPr(pr, verdict, {
         jobId,
         sessionId,
         recentComments,
         maxPrCommentsBeforeGiveUp,
+        reviewAgentCommentCount,
       });
     }
 
@@ -1112,10 +1283,11 @@ export class ReviewAgent {
       sessionId: string | null;
       recentComments: PullRequestComment[];
       maxPrCommentsBeforeGiveUp: number;
+      reviewAgentCommentCount: number;
     },
   ): Promise<boolean> {
     this.deps.logWarn(
-      `[${ts()}] [ReviewAgent] PR #${pr.number} reached PR comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}); closing without merge.`,
+      `[${ts()}] [ReviewAgent] PR #${pr.number} reached ReviewAgent comment cap (${context.reviewAgentCommentCount}/${context.maxPrCommentsBeforeGiveUp}); closing without merge.`,
     );
 
     try {
@@ -1154,7 +1326,8 @@ export class ReviewAgent {
     await this.postAutonomyPrFeedback({
       pr,
       verdict: "rejected_comment_cap_closed",
-      verdictSummary: `${verdict.summary} | closed after reaching PR comment cap (${context.maxPrCommentsBeforeGiveUp}).`,
+      verdictSummary:
+        `${verdict.summary} | closed after reaching ReviewAgent comment cap (${context.reviewAgentCommentCount}/${context.maxPrCommentsBeforeGiveUp}).`,
       reviewScore: verdict.score,
       jobId: context.jobId,
       sessionId: context.sessionId,

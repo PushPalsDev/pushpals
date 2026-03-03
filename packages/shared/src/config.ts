@@ -647,7 +647,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
 
   const serverNode = getObject(merged, "server");
-  const serverPort = Math.max(1, asInt(parseIntEnv("PUSHPALS_PORT") ?? serverNode.port, 3001));
+  const requestedServerPort = asInt(
+    parseIntEnv("PUSHPALS_PORT") ?? serverNode.port,
+    3001,
+  );
+  const serverPort = requestedServerPort === 0 ? 0 : Math.max(1, requestedServerPort);
   const serverUrl = firstNonEmpty(
     process.env.PUSHPALS_SERVER_URL,
     asString(serverNode.url, `http://localhost:${serverPort}`),

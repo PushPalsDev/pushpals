@@ -9,6 +9,62 @@ function makeStore(): AutonomyStore {
   return store;
 }
 
+function seedObjectiveWithContext(store: AutonomyStore, overrides?: { requestId?: string; jobId?: string; objectiveId?: string; prUrl?: string }): {
+  objectiveId: string;
+  requestId: string;
+  jobId: string;
+  patternKey: string;
+  prUrl: string;
+} {
+  const sessionId = "session_ctx";
+  const runId = "run_ctx";
+  const snapshotId = store.createSnapshot({ sessionId, runId }).snapshot_id;
+  const objectiveId = overrides?.objectiveId ?? "obj_ctx";
+  const requestId = overrides?.requestId ?? "req_ctx";
+  const jobId = overrides?.jobId ?? "job_ctx";
+  const prUrl = overrides?.prUrl ?? "https://example.com/pr/ctx";
+  const decision = store.recordObjectiveDecision({
+    runId,
+    snapshotId,
+    sessionId,
+    objective: {
+      id: objectiveId,
+      title: "Context resolution objective",
+      instruction: "Exercise PR feedback routing",
+      objective_type: "lint_fix",
+      component_area: "apps/server",
+      trigger_type: "lint_failure",
+      target_paths: ["apps/server/src/server_main.ts"],
+      scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+      confidence: 0.9,
+      risk_level: "low",
+      expected_validation: ["bun test"],
+      status: "dispatched",
+      request_id: requestId,
+      job_id: jobId,
+    },
+  });
+  expect(decision.ok).toBe(true);
+  expect(decision.patternKey).toBeTruthy();
+  const rawDb = (store as unknown as { db?: { exec: (sql: string) => void; prepare: (sql: string) => any } }).db;
+  if (rawDb) {
+    rawDb.exec(
+      `CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        prUrl TEXT
+      )`,
+    );
+    rawDb.prepare(`INSERT OR REPLACE INTO jobs (id, prUrl) VALUES (?, ?)`).run(jobId, prUrl);
+  }
+  return {
+    objectiveId,
+    requestId,
+    jobId,
+    patternKey: String(decision.patternKey ?? ""),
+    prUrl,
+  };
+}
+
 afterEach(() => {
   while (stores.length > 0) {
     stores.pop()?.close();
@@ -611,5 +667,155 @@ describe("server AutonomyStore policy gates", () => {
       .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE objective_id = ?`)
       .get("obj_guard") as { count: number };
     expect(after.count).toBe(1);
+  });
+
+  test("recordPrFeedback resolves pattern context via request, job, and prUrl hints", () => {
+    const store = makeStore();
+    const seeded = seedObjectiveWithContext(store, {
+      prUrl: "https://example.com/pr/ctx-resolution",
+    });
+
+    const byRequest = store.recordPrFeedback({
+      verdict: "rejected",
+      feedbackKey: "ctx-request",
+      summary: "Needs more unit tests",
+      requestId: seeded.requestId,
+    });
+    expect(byRequest.ok).toBe(true);
+    expect(byRequest.patternKey).toBe(seeded.patternKey);
+    expect(byRequest.objectiveId).toBe(seeded.objectiveId);
+
+    const byJob = store.recordPrFeedback({
+      verdict: "rejected",
+      feedbackKey: "ctx-job",
+      summary: "Still failing integration",
+      jobId: seeded.jobId,
+    });
+    expect(byJob.ok).toBe(true);
+    expect(byJob.patternKey).toBe(seeded.patternKey);
+    expect(byJob.objectiveId).toBe(seeded.objectiveId);
+
+    const byPrUrl = store.recordPrFeedback({
+      verdict: "rejected_comment_cap_closed",
+      feedbackKey: "ctx-pr-url",
+      summary: "Closed after repeated failures",
+      prUrl: seeded.prUrl,
+    });
+    expect(byPrUrl.ok).toBe(true);
+    expect(byPrUrl.patternKey).toBe(seeded.patternKey);
+    expect(byPrUrl.objectiveId).toBe(seeded.objectiveId);
+
+    const byObjective = store.recordPrFeedback({
+      verdict: "approved_unmergeable",
+      feedbackKey: "ctx-objective",
+      summary: "Approved but merge blocked",
+      objectiveId: seeded.objectiveId,
+    });
+    expect(byObjective.ok).toBe(true);
+    expect(byObjective.patternKey).toBe(seeded.patternKey);
+    expect(byObjective.objectiveId).toBe(seeded.objectiveId);
+  });
+
+  test("recordPrFeedback dedupes repeated feedback_key submissions", () => {
+    const store = makeStore();
+    const seeded = seedObjectiveWithContext(store);
+    const db = (store as unknown as { db: any }).db;
+    const rowCount = (table: string): number =>
+      (
+        db
+          .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
+          .get() as {
+          count: number;
+        }
+      ).count;
+
+    const first = store.recordPrFeedback({
+      verdict: "approved_merged",
+      feedbackKey: "dup-key",
+      summary: "Merged successfully",
+      objectiveId: seeded.objectiveId,
+    });
+    expect(first.ok).toBe(true);
+    expect(first.success).toBe(true);
+    expect(first.normalizedVerdict).toBe("approved_merged");
+    expect(first.rawVerdict).toBe("approved_merged");
+    expect(rowCount("autonomy_pr_feedback")).toBe(1);
+    expect(rowCount("autonomy_outcomes")).toBe(1);
+
+    const second = store.recordPrFeedback({
+      verdict: "approved_merged",
+      feedbackKey: "dup-key",
+      summary: "Duplicate signal",
+      objectiveId: seeded.objectiveId,
+    });
+    expect(second.ok).toBe(true);
+    expect(second.deduped).toBe(true);
+    expect(second.normalizedVerdict).toBe("approved_merged");
+    expect(second.success).toBeUndefined();
+    expect(rowCount("autonomy_pr_feedback")).toBe(1);
+    expect(rowCount("autonomy_outcomes")).toBe(1);
+  });
+
+  test("recordPrFeedback maps verdicts to deterministic outcomes", () => {
+    const store = makeStore();
+    const seeded = seedObjectiveWithContext(store);
+    const accepted = store.recordPrFeedback({
+      verdict: "approved_merged",
+      feedbackKey: "outcome-accepted",
+      summary: "Merged cleanly",
+      objectiveId: seeded.objectiveId,
+    });
+    expect(accepted.ok).toBe(true);
+    expect(accepted.success).toBe(true);
+    expect(accepted.userAction).toBe("accepted");
+    expect(accepted.normalizedVerdict).toBe("approved_merged");
+
+    const blocked = store.recordPrFeedback({
+      verdict: "approved_unmergeable",
+      feedbackKey: "outcome-blocked",
+      summary: "Approved but merge conflict",
+      objectiveId: seeded.objectiveId,
+    });
+    expect(blocked.ok).toBe(true);
+    expect(blocked.success).toBe(false);
+    expect(blocked.userAction).toBe("merge_conflict");
+    expect(blocked.normalizedVerdict).toBe("approved_unmergeable");
+
+    const rows = (
+      (store as unknown as { db: any }).db
+        .prepare(
+          `SELECT user_action AS userAction, success
+           FROM autonomy_outcomes
+           ORDER BY id ASC`,
+        )
+        .all() as Array<{ userAction: string | null; success: number }>
+    ).map((row) => ({ userAction: row.userAction, success: row.success }));
+
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(rows[0]).toEqual({ userAction: "accepted", success: 1 });
+    expect(rows[1]).toEqual({ userAction: "merge_conflict", success: 0 });
+  });
+
+  test("recordPrFeedback ignores unknown verdict strings for outcomes", () => {
+    const store = makeStore();
+    const seeded = seedObjectiveWithContext(store);
+    const result = store.recordPrFeedback({
+      verdict: "custom_notice",
+      feedbackKey: "unknown-outcome",
+      summary: "Just FYI",
+      objectiveId: seeded.objectiveId,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.success).toBeUndefined();
+    expect(result.userAction).toBeUndefined();
+    expect(result.normalizedVerdict).toBeNull();
+    expect(result.rawVerdict).toBe("custom_notice");
+
+    const rows = (
+      (store as unknown as { db: any }).db
+        .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes`)
+        .get() as { count: number }
+    ).count;
+    expect(rows).toBe(0);
   });
 });

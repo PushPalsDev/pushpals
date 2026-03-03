@@ -97,14 +97,19 @@ async function getRepoStatusSummary(repoPath: string, remote: string): Promise<R
  * HTTP Middleware & Routes
  */
 
-export function createRequestHandler() {
+type ServeImpl = (
+  options: Parameters<typeof Bun.serve>[0],
+) => ReturnType<typeof Bun.serve>;
+
+export function createRequestHandler(deps?: { serveImpl?: ServeImpl }) {
   const startupConfig = loadPushPalsConfig();
   const port = startupConfig.server.port;
   const hostname = startupConfig.server.host;
   const isDebugHttpLogsEnabled = (): boolean => loadPushPalsConfig().server.debugHttp;
   let lastStaleRecoverySweepAt = 0;
   let isShuttingDown = false;
-  return Bun.serve({
+  const serve = deps?.serveImpl ?? Bun.serve;
+  return serve({
     port,
     hostname,
     idleTimeout: 180, // 3 minutes — SSE/WS connections are long-lived
@@ -921,6 +926,18 @@ export function createRequestHandler() {
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = autonomyStore.recordPrFeedback(body);
         if (!result.ok) return makeJson(result, 400);
+        const normalizedVerdict = result.normalizedVerdict ?? null;
+        const rawVerdictText =
+          compactText(result.rawVerdict ?? "", 80) || compactText(body.verdict, 80);
+
+        if (!normalizedVerdict) {
+          const patternKeyHint =
+            compactText(body.patternKey ?? body.pattern_key ?? result.patternKey, 64) || "unknown";
+          const verdictLabel = rawVerdictText || "unknown";
+          console.warn(
+            `[Server] [Autonomy] Unknown PR feedback verdict "${verdictLabel}" recorded for pattern ${patternKeyHint}; ignoring outcome mapping.`,
+          );
+        }
 
         const sessionId = compactText(body.sessionId, 128);
         const session = sessionId ? sessionManager.getSession(sessionId) : null;
@@ -940,12 +957,16 @@ export function createRequestHandler() {
                 compactText(body.patternKey ?? body.pattern_key ?? result.patternKey, 128) ||
                 "unknown",
               outcome:
-                compactText(body.verdict ?? body.userAction ?? body.user_action ?? "pr_feedback", 120) ||
+                compactText(
+                  result.normalizedVerdict ??
+                    result.rawVerdict ??
+                    body.userAction ??
+                    body.user_action ??
+                    "pr_feedback",
+                  120,
+                ) ||
                 "pr_feedback",
-              success:
-                typeof result.success === "boolean"
-                  ? result.success
-                  : Boolean(body.success),
+              ...(typeof result.success === "boolean" ? { success: result.success } : {}),
             },
           });
         }

@@ -155,38 +155,65 @@ const TRIGGER_TYPES = new Set<SignalValue["type"]>([
 ]);
 const RECENT_SUCCESS_SUPPRESSION_WINDOW_HOURS = 24;
 
-function isNegativePrFeedbackVerdict(value: string): boolean {
-  const text = value.toLowerCase();
-  return (
-    text.includes("reject") ||
-    text.includes("unmergeable") ||
-    text.includes("merge_conflict") ||
-    text.includes("merge_failed") ||
-    text.includes("failed")
-  );
+export type PrFeedbackVerdict =
+  | "approved_merged"
+  | "approved_unmergeable"
+  | "rejected"
+  | "rejected_comment_cap_closed";
+
+const PR_FEEDBACK_VERDICTS = new Set<PrFeedbackVerdict>([
+  "approved_merged",
+  "approved_unmergeable",
+  "rejected",
+  "rejected_comment_cap_closed",
+]);
+
+const NEGATIVE_PR_FEEDBACK_VERDICTS = new Set<PrFeedbackVerdict>([
+  "approved_unmergeable",
+  "rejected",
+  "rejected_comment_cap_closed",
+]);
+
+const PR_FEEDBACK_VERDICT_OUTCOMES: Record<
+  PrFeedbackVerdict,
+  { success: boolean; userAction: string; reopenedWithin24h: boolean; regressionFlag: boolean }
+> = {
+  approved_merged: {
+    success: true,
+    userAction: "accepted",
+    reopenedWithin24h: false,
+    regressionFlag: false,
+  },
+  approved_unmergeable: {
+    success: false,
+    userAction: "merge_conflict",
+    reopenedWithin24h: true,
+    regressionFlag: true,
+  },
+  rejected: {
+    success: false,
+    userAction: "rejected",
+    reopenedWithin24h: true,
+    regressionFlag: true,
+  },
+  rejected_comment_cap_closed: {
+    success: false,
+    userAction: "comment_cap_closed",
+    reopenedWithin24h: true,
+    regressionFlag: true,
+  },
+};
+
+export function normalizePrFeedbackVerdict(verdict: unknown): PrFeedbackVerdict | null {
+  if (typeof verdict !== "string") return null;
+  const normalized = verdict.trim().toLowerCase() as PrFeedbackVerdict;
+  return PR_FEEDBACK_VERDICTS.has(normalized) ? normalized : null;
 }
 
-function deriveOutcomeFromPrFeedbackVerdict(
-  verdict: string,
-): { success: boolean; userAction: string; reopenedWithin24h: boolean; regressionFlag: boolean } | null {
-  const text = verdict.toLowerCase();
-  if (isNegativePrFeedbackVerdict(text)) {
-    return {
-      success: false,
-      userAction: "rejected",
-      reopenedWithin24h: true,
-      regressionFlag: true,
-    };
-  }
-  if (text.includes("approved") || text.includes("merged")) {
-    return {
-      success: true,
-      userAction: "accepted",
-      reopenedWithin24h: false,
-      regressionFlag: false,
-    };
-  }
-  return null;
+export function isNegativePrFeedbackVerdict(verdict: string | null): boolean {
+  const normalized = normalizePrFeedbackVerdict(verdict);
+  if (!normalized) return false;
+  return NEGATIVE_PR_FEEDBACK_VERDICTS.has(normalized);
 }
 
 export interface AutonomySnapshot {
@@ -1957,10 +1984,14 @@ export class AutonomyStore {
     deduped?: boolean;
     success?: boolean;
     userAction?: string;
+    rawVerdict?: string;
+    normalizedVerdict?: PrFeedbackVerdict | null;
   } {
     const now = asIsoNow();
-    const verdict = asString(body.verdict).toLowerCase();
-    if (!verdict) return { ok: false, reason: "verdict is required" };
+    const rawVerdict = asString(body.verdict);
+    if (!rawVerdict) return { ok: false, reason: "verdict is required" };
+    const normalizedVerdict = normalizePrFeedbackVerdict(rawVerdict);
+    const verdict = rawVerdict.toLowerCase();
 
     const feedbackKey = asString(body.feedbackKey ?? body.feedback_key) || null;
     const objectiveIdRaw = asString(body.objectiveId ?? body.objective_id) || null;
@@ -2065,21 +2096,27 @@ export class AutonomyStore {
         now,
       );
     const inserted = Number(insertInfo.changes ?? 0) > 0;
+    const contextFields = {
+      patternKey,
+      ...(objectiveId ? { objectiveId } : {}),
+      rawVerdict,
+      normalizedVerdict,
+    };
     if (!inserted) {
       return {
         ok: true,
         deduped: true,
-        patternKey,
-        ...(objectiveId ? { objectiveId } : {}),
+        ...contextFields,
       };
     }
 
-    const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
+    const mappedOutcome = normalizedVerdict
+      ? PR_FEEDBACK_VERDICT_OUTCOMES[normalizedVerdict]
+      : null;
     if (!mappedOutcome) {
       return {
         ok: true,
-        patternKey,
-        ...(objectiveId ? { objectiveId } : {}),
+        ...contextFields,
       };
     }
 
@@ -2103,8 +2140,7 @@ export class AutonomyStore {
     }
     return {
       ok: true,
-      patternKey,
-      ...(objectiveId ? { objectiveId } : {}),
+      ...contextFields,
       success: mappedOutcome.success,
       userAction: mappedOutcome.userAction,
     };

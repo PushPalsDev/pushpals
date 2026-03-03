@@ -6,12 +6,14 @@ import {
   buildReviewPrompt,
   buildCodexExecArgs,
   deriveFixWriteGlobsFromDiff,
+  REVIEW_AGENT_FEEDBACK_MARKER,
   parseReviewVerdict,
   resolveCodexCmd,
   resolveReviewerMdPath,
   type ReviewAgentConfig,
+  type ReviewVerdict,
 } from "../apps/source_control_manager/src/review_agent";
-import type { GitHubPR } from "../apps/source_control_manager/src/github_pr";
+import type { GitHubPR, PullRequestComment } from "../apps/source_control_manager/src/github_pr";
 
 const baseConfig: ReviewAgentConfig = {
   enabled: true,
@@ -54,6 +56,12 @@ const silentLogs = {
   logError: () => {},
   closePullRequest: async () => ({ state: "closed", closed: true }),
   deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
+  getAuthenticatedUser: async () => ({
+    login: "reviewagent[bot]",
+    id: 999,
+    type: "Bot",
+    name: "Review Agent",
+  }),
 };
 
 describe("ReviewAgent", () => {
@@ -219,6 +227,290 @@ describe("ReviewAgent", () => {
     await agent.poll();
 
     expect(reviewCalls).toBe(2);
+  });
+
+  test("human-only comments never trigger give-up but repeated ReviewAgent comments do", async () => {
+    const pr = makePr({ number: 71, html_url: "https://example.com/pr/71" });
+    const maxPrCommentsBeforeGiveUp = 2;
+    let closeCalls = 0;
+    let shaSeed = 1;
+    const bumpSha = () => {
+      pr.head.sha = shaSeed.toString(16).padStart(40, "0");
+      shaSeed += 1;
+    };
+
+    const makeHumanComment = (id: number, text: string): PullRequestComment => ({
+      id,
+      body: text,
+      userLogin: `human-${id}`,
+      userType: "User",
+      createdAt: `2026-02-20T00:${String(id).padStart(2, "0")}:00Z`,
+      htmlUrl: `https://example.com/pr/71#issuecomment-${id}`,
+    });
+    const buildReviewAgentComment = (id: number): PullRequestComment => ({
+      id,
+      body: `${REVIEW_AGENT_FEEDBACK_MARKER}\n\n## ReviewAgent: Changes Rejected (score 7.${id}/10)\n\n- Auto feedback #${id}`,
+      userLogin: "reviewagent[bot]",
+      userType: "Bot",
+      createdAt: `2026-02-21T00:${String(id).padStart(2, "0")}:00Z`,
+      htmlUrl: `https://example.com/pr/71#issuecomment-ra-${id}`,
+    });
+
+    const nonFeedbackComments = [
+      makeHumanComment(1, "Can you add more screenshots?"),
+      makeHumanComment(2, "We're waiting on staging validation."),
+      makeHumanComment(3, "## ReviewAgent: Totally legit rejection heading"),
+      makeHumanComment(4, "Needs doc updates."),
+      {
+        id: 41,
+        body: "Thanks for pushing the fixes!",
+        userLogin: "reviewagent[bot]",
+        userType: "Bot",
+        createdAt: "2026-02-20T01:30:00Z",
+        htmlUrl: "https://example.com/pr/71#issuecomment-ra-smalltalk",
+      },
+    ];
+    const reviewAgentHistory = [
+      ...nonFeedbackComments,
+      buildReviewAgentComment(5),
+      buildReviewAgentComment(6),
+    ];
+    let listRecentCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 9.5, maxPrCommentsBeforeGiveUp },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.4,
+            summary: "Needs more robust negative-path tests",
+            issues: ["Missing validation for bad payloads"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => nonFeedbackComments,
+        closePullRequest: async () => ({ closed: true, state: "closed" }),
+        deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.includes("/jobs?status=")) {
+            return new Response(JSON.stringify({ ok: true, jobs: [] }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        ...silentLogs,
+      },
+    );
+    expect((agent as any).config.maxPrCommentsBeforeGiveUp).toBe(maxPrCommentsBeforeGiveUp);
+
+    (agent as any).listRecentPrComments = async () => {
+      const data = listRecentCalls === 0 ? nonFeedbackComments : reviewAgentHistory;
+      listRecentCalls += 1;
+      return data;
+    };
+    const giveUpContexts: Array<{ reviewAgentCommentCount: number }> = [];
+    (agent as any).giveUpOnRejectedPr = async (_pr: GitHubPR, _verdict: ReviewVerdict, context: any) => {
+      giveUpContexts.push(context);
+      closeCalls += 1;
+      return true;
+    };
+
+    await agent.poll();
+    expect(closeCalls).toBe(0);
+    bumpSha();
+
+    await agent.poll();
+    expect(closeCalls).toBe(1);
+    expect(giveUpContexts.length).toBe(1);
+    expect(giveUpContexts[0]?.reviewAgentCommentCount).toBe(maxPrCommentsBeforeGiveUp);
+  });
+
+  test("skips give-up when ReviewAgent identity cannot be resolved", async () => {
+    const pr = makePr({ number: 77, html_url: "https://example.com/pr/77" });
+    const botComment: PullRequestComment = {
+      id: 41,
+      body: `${REVIEW_AGENT_FEEDBACK_MARKER}\n\n## ReviewAgent: Changes Rejected (score 7.1/10)\n\n- Stabilize flaky tests`,
+      userLogin: "fallback-reviewagent[bot]",
+      userType: "Bot",
+      createdAt: "2026-02-22T00:00:00Z",
+      htmlUrl: "https://example.com/pr/77#issuecomment-41",
+    };
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 9.5, maxPrCommentsBeforeGiveUp: 1 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.2,
+            summary: "Not ready",
+            issues: ["Needs regression test for overflow"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => [botComment],
+        getAuthenticatedUser: async () => {
+          throw new Error("viewer lookup failed");
+        },
+      },
+    );
+
+    (agent as any).giveUpOnRejectedPr = () => {
+      throw new Error("Should not give up when identity cannot be resolved");
+    };
+
+    await agent.poll();
+  });
+
+  test("counts ReviewAgent feedback when GitHub App slug matches even if login differs", async () => {
+    const pr = makePr({ number: 80, html_url: "https://example.com/pr/80" });
+    const slugComment: PullRequestComment = {
+      id: 51,
+      body: `${REVIEW_AGENT_FEEDBACK_MARKER}\n\n## ReviewAgent: Changes Rejected (score 7.9/10)\n\n- Fix flaky tests`,
+      userLogin: "app-bot-shadow",
+      userType: "Bot",
+      githubAppSlug: "reviewagent",
+      createdAt: "2026-02-25T00:00:00Z",
+      htmlUrl: "https://example.com/pr/80#issuecomment-51",
+    };
+    let giveUpCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 9.5, maxPrCommentsBeforeGiveUp: 1 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.4,
+            summary: "Needs deterministic tests",
+            issues: ["Flaky integration path"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => [slugComment],
+      },
+    );
+
+    (agent as any).giveUpOnRejectedPr = async () => {
+      giveUpCalls += 1;
+      return true;
+    };
+
+    await agent.poll();
+    expect(giveUpCalls).toBe(1);
+  });
+
+  test("ignores other bot comments without ReviewAgent marker when identity cannot be resolved", async () => {
+    const pr = makePr({ number: 78, html_url: "https://example.com/pr/78" });
+    const impostorBot: PullRequestComment = {
+      id: 52,
+      body: "## ReviewAgent: Totally real feedback without marker",
+      userLogin: "some-other-bot[bot]",
+      userType: "Bot",
+      createdAt: "2026-02-22T01:00:00Z",
+      htmlUrl: "https://example.com/pr/78#issuecomment-52",
+    };
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, maxPrCommentsBeforeGiveUp: 1 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.3,
+            summary: "Needs polish",
+            issues: ["Add missing validation"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => [impostorBot],
+        getAuthenticatedUser: async () => {
+          throw new Error("viewer lookup failed");
+        },
+        fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+      },
+    );
+
+    (agent as any).postAutonomyPrFeedback = async () => {};
+    (agent as any).enqueueFixJob = async () => true;
+    (agent as any).findActiveReviewJobIdForPrHead = async () => null;
+    (agent as any).giveUpOnRejectedPr = () => {
+      throw new Error("Should not give up on non-ReviewAgent bot comments");
+    };
+
+    await agent.poll();
+  });
+
+  test("ignores ReviewAgent identity comments without feedback marker or heading", async () => {
+    const pr = makePr({ number: 79, html_url: "https://example.com/pr/79" });
+    const smalltalk: PullRequestComment = {
+      id: 61,
+      body: "Appreciate the follow-up! Keep iterating.",
+      userLogin: "reviewagent[bot]",
+      userType: "Bot",
+      createdAt: "2026-02-22T02:00:00Z",
+      htmlUrl: "https://example.com/pr/79#issuecomment-61",
+    };
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, maxPrCommentsBeforeGiveUp: 1 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.0,
+            summary: "Needs more tests",
+            issues: ["Lack of negative paths"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => [smalltalk],
+        fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+      },
+    );
+
+    (agent as any).postAutonomyPrFeedback = async () => {};
+    (agent as any).enqueueFixJob = async () => true;
+    (agent as any).findActiveReviewJobIdForPrHead = async () => null;
+    (agent as any).giveUpOnRejectedPr = () => {
+      throw new Error("Should not give up on non-feedback ReviewAgent comments");
+    };
+
+    await agent.poll();
   });
 
   test("caps auto-enqueued re-reviews at 500 per PR", async () => {
@@ -1222,6 +1514,91 @@ describe("ReviewAgent", () => {
     expect(enqueueCalls).toBeGreaterThan(0);
   });
 
+  test("ignores human comments when enforcing ReviewAgent comment cap", async () => {
+    const pr = makePr({ number: 68, html_url: "https://example.com/pr/68" });
+    let closeCalls = 0;
+    let rejectionComments = 0;
+
+    const humanComments: PullRequestComment[] = [
+      {
+        id: 101,
+        body: `${REVIEW_AGENT_FEEDBACK_MARKER}\n\n## ReviewAgent: Workerpal feedback\n\nCopied template`,
+        userLogin: "maintainer",
+        userId: 123,
+        userType: "User",
+        authorAssociation: "MEMBER",
+        githubAppSlug: null,
+        createdAt: "2026-02-25T10:00:00Z",
+        htmlUrl: "https://example.com/comment/101",
+      },
+      {
+        id: 102,
+        body: "Thanks for the update!",
+        userLogin: "reviewer2",
+        userId: 456,
+        userType: "User",
+        authorAssociation: "MEMBER",
+        githubAppSlug: null,
+        createdAt: "2026-02-25T10:05:00Z",
+        htmlUrl: "https://example.com/comment/102",
+      },
+      {
+        id: 103,
+        body: `${REVIEW_AGENT_FEEDBACK_MARKER}\n\n## ReviewAgent: Custom copy`,
+        userLogin: "maintainer",
+        userId: 123,
+        userType: "User",
+        authorAssociation: "MEMBER",
+        githubAppSlug: null,
+        createdAt: "2026-02-25T10:10:00Z",
+        htmlUrl: "https://example.com/comment/103",
+      },
+    ];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 6.4,
+            summary: "Still broken",
+            issues: ["Need more tests"],
+            fix_instruction: "",
+          }),
+        listPullRequestComments: async () => humanComments,
+        addPullRequestComment: async () => {
+          rejectionComments += 1;
+        },
+        closePullRequest: async () => {
+          closeCalls += 1;
+          return { state: "closed", closed: true };
+        },
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/jobs/enqueue")) {
+            return new Response(JSON.stringify({ ok: true, jobId: "job-human" }), {
+              status: 200,
+            });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(closeCalls).toBe(0);
+    expect(rejectionComments).toBe(1);
+  });
+
   test("closes PR and deletes branch when rejection hits configured PR comment cap", async () => {
     const pr = makePr({ number: 67, html_url: "https://example.com/pr/67" });
     let mergeCalls = 0;
@@ -1232,13 +1609,30 @@ describe("ReviewAgent", () => {
     let deletedBranchRef = "";
     let enqueueCalls = 0;
 
-    const comments = Array.from({ length: 10 }, (_, idx) => ({
-      id: idx + 1,
-      body: `Feedback item ${idx + 1}`,
-      userLogin: `reviewer-${idx + 1}`,
-      createdAt: `2026-02-20T00:${String(idx).padStart(2, "0")}:00Z`,
-      htmlUrl: `https://example.com/comment/${idx + 1}`,
-    }));
+    const comments = [
+      {
+        id: 9001,
+        body: `${REVIEW_AGENT_FEEDBACK_MARKER}\n\n## ReviewAgent: Human copy`,
+        userLogin: "repo-maintainer",
+        userId: 123_456,
+        userType: "User",
+        authorAssociation: "MEMBER",
+        githubAppSlug: null,
+        createdAt: "2026-02-20T00:59:00Z",
+        htmlUrl: "https://example.com/comment/9001",
+      },
+      ...Array.from({ length: 10 }, (_, idx) => ({
+        id: idx + 1,
+        body: `${REVIEW_AGENT_FEEDBACK_MARKER}\n\n## ReviewAgent: Changes Rejected (score ${(7 + idx / 10).toFixed(1)}/10)\n\nFeedback item ${idx + 1}`,
+        userLogin: `reviewagent[bot]`,
+        userId: 999,
+        userType: "Bot",
+        authorAssociation: "MEMBER",
+        githubAppSlug: "reviewagent",
+        createdAt: `2026-02-20T00:${String(idx).padStart(2, "0")}:00Z`,
+        htmlUrl: `https://example.com/comment/${idx + 1}`,
+      })),
+    ];
 
     const agent = new ReviewAgent(
       { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 10 },
