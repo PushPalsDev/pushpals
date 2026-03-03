@@ -44,7 +44,10 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
-import { ensureStartupPreflightReadiness } from "./startup/preflight.js";
+import {
+  buildRemotebuddyStartupPreflightSpec,
+  ensureStartupPreflightReadiness,
+} from "./startup/preflight_readiness.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -2076,6 +2079,9 @@ async function connectWithRetry(
 
 async function main() {
   const opts = parseArgs();
+  await ensureStartupPreflightReadiness(
+    buildRemotebuddyStartupPreflightSpec(CONFIG, { authToken: opts.authToken }),
+  );
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
@@ -2087,12 +2093,6 @@ async function main() {
       "[RemoteBuddy] Config snapshot logging disabled (startup.log_config_on_start=false).",
     );
   }
-
-  await ensureStartupPreflightReadiness({
-    config: CONFIG,
-    allowDirtyWorktree: CONFIG.remotebuddy.autonomy.allowDirtyWorktree,
-    logger: (line) => console.log(line),
-  });
 
   // ── Initialise LLM + brain ──
   let brain: AgentBrain;
