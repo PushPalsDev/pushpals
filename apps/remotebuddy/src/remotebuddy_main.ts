@@ -164,7 +164,7 @@ type RequestPriority = "interactive" | "normal" | "background";
 type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
 type PlannerRisk = "low" | "medium" | "high";
 
-interface TaskExecuteJobParams {
+export interface TaskExecutePayload {
   schemaVersion: 2;
   requestId: string;
   sessionId: string;
@@ -239,6 +239,163 @@ function toSingleLine(value: unknown, max = 220): string {
 function asObject(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
+}
+
+/** Guards worker job payloads so producers/consumers share one runtime contract. */
+export function validateTaskExecutePayload(raw: unknown): TaskExecutePayload {
+  const payloadRecord = asObject(raw);
+  if (!payloadRecord) {
+    throw new Error("task.execute payload must be an object");
+  }
+  const payload = payloadRecord as TaskExecutePayload;
+
+  const assertNonEmptyString = (value: unknown, field: string): string => {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new Error(`task.execute payload ${field} must be a non-empty string`);
+    }
+    return value;
+  };
+
+  const assertString = (value: unknown, field: string): string => {
+    if (typeof value !== "string") {
+      throw new Error(`task.execute payload ${field} must be a string`);
+    }
+    return value;
+  };
+
+  const assertBoolean = (value: unknown, field: string): boolean => {
+    if (typeof value !== "boolean") {
+      throw new Error(`task.execute payload ${field} must be a boolean`);
+    }
+    return value;
+  };
+
+  const assertFiniteNumber = (value: unknown, field: string): number => {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new Error(`task.execute payload ${field} must be a finite number`);
+    }
+    return value;
+  };
+
+  const assertStringArray = (value: unknown, field: string): string[] => {
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+      throw new Error(`task.execute payload ${field} must be an array of strings`);
+    }
+    return value as string[];
+  };
+
+  const assertOptionalStringArray = (value: unknown, field: string): string[] | undefined => {
+    if (value === undefined) return undefined;
+    return assertStringArray(value, field);
+  };
+
+  const assertRecord = (value: unknown, field: string): Record<string, unknown> => {
+    const obj = asObject(value);
+    if (!obj) {
+      throw new Error(`task.execute payload ${field} must be an object`);
+    }
+    return obj;
+  };
+
+  if (payload.schemaVersion !== 2) {
+    throw new Error("task.execute payload schemaVersion must be 2");
+  }
+
+  assertNonEmptyString(payload.requestId, "requestId");
+  assertNonEmptyString(payload.sessionId, "sessionId");
+  assertNonEmptyString(payload.instruction, "instruction");
+
+  if (payload.origin !== undefined && payload.origin !== "user" && payload.origin !== "autonomy") {
+    throw new Error("task.execute payload origin must be \"user\" or \"autonomy\"");
+  }
+
+  if (payload.autonomy) {
+    const autonomy = assertRecord(payload.autonomy, "autonomy") as NonNullable<TaskExecutePayload["autonomy"]>;
+    if (autonomy.origin !== "autonomy") {
+      throw new Error("task.execute payload autonomy.origin must be \"autonomy\"");
+    }
+    (["objectiveId", "runId", "snapshotId", "patternKey", "componentArea"] as const).forEach((key) => {
+      const value = autonomy[key];
+      if (value !== undefined) {
+        assertString(value, `autonomy.${key}`);
+      }
+    });
+  }
+
+  if (payload.lane !== "deterministic" && payload.lane !== "worker") {
+    throw new Error('task.execute payload lane must be "deterministic" or "worker"');
+  }
+
+  if (payload.plannerWorkerInstruction !== undefined) {
+    assertString(payload.plannerWorkerInstruction, "plannerWorkerInstruction");
+  }
+
+  assertOptionalStringArray(payload.paths, "paths");
+
+  const planningRecord = assertRecord(payload.planning, "planning");
+  const planning = planningRecord as TaskExecutePayload["planning"];
+  if (
+    planning.intent !== "chat" &&
+    planning.intent !== "status" &&
+    planning.intent !== "code_change" &&
+    planning.intent !== "analysis" &&
+    planning.intent !== "other"
+  ) {
+    throw new Error("task.execute payload planning.intent is invalid");
+  }
+  if (planning.riskLevel !== "low" && planning.riskLevel !== "medium" && planning.riskLevel !== "high") {
+    throw new Error("task.execute payload planning.riskLevel is invalid");
+  }
+  if (planning.targetPaths) {
+    assertStringArray(planning.targetPaths, "planning.targetPaths");
+  }
+
+  const scopeRecord = assertRecord(planning.scope, "planning.scope");
+  const scope = scopeRecord as TaskExecutePayload["planning"]["scope"];
+  assertBoolean(scope.readAnywhere, "planning.scope.readAnywhere");
+  assertBoolean(scope.writeAllowed, "planning.scope.writeAllowed");
+  assertOptionalStringArray(scope.writeGlobs, "planning.scope.writeGlobs");
+  assertOptionalStringArray(scope.forbiddenGlobs, "planning.scope.forbiddenGlobs");
+  if (scope.maxFilesToEdit !== undefined) {
+    assertFiniteNumber(scope.maxFilesToEdit, "planning.scope.maxFilesToEdit");
+  }
+
+  if (planning.discovery) {
+    const discoveryRecord = assertRecord(planning.discovery, "planning.discovery");
+    const discovery = discoveryRecord as NonNullable<TaskExecutePayload["planning"]["discovery"]>;
+    assertStringArray(discovery.ripgrepQueries, "planning.discovery.ripgrepQueries");
+    assertOptionalStringArray(discovery.likelyDirs, "planning.discovery.likelyDirs");
+    assertOptionalStringArray(discovery.keywords, "planning.discovery.keywords");
+  }
+
+  assertStringArray(planning.acceptanceCriteria, "planning.acceptanceCriteria");
+  assertStringArray(planning.validationSteps, "planning.validationSteps");
+  if (
+    planning.queuePriority !== "interactive" &&
+    planning.queuePriority !== "normal" &&
+    planning.queuePriority !== "background"
+  ) {
+    throw new Error("task.execute payload planning.queuePriority is invalid");
+  }
+  assertFiniteNumber(planning.queueWaitBudgetMs, "planning.queueWaitBudgetMs");
+  assertFiniteNumber(planning.executionBudgetMs, "planning.executionBudgetMs");
+  assertFiniteNumber(planning.finalizationBudgetMs, "planning.finalizationBudgetMs");
+
+  if (payload.targetPath !== undefined) {
+    assertString(payload.targetPath, "targetPath");
+  }
+  assertStringArray(payload.recentContext, "recentContext");
+
+  if (!Array.isArray(payload.recentJobs)) {
+    throw new Error("task.execute payload recentJobs must be an array");
+  }
+  payload.recentJobs.forEach((job, idx) => {
+    if (!asObject(job)) {
+      throw new Error(`task.execute payload recentJobs[${idx}] must be an object`);
+    }
+  });
+
+  return payload;
 }
 
 function normalizeMetadataTargetPaths(value: unknown, maxItems = 48): string[] {
@@ -1071,15 +1228,16 @@ class RemoteBuddyOrchestrator {
   private async enqueueJob(
     taskId: string,
     kind: "task.execute",
-    params: TaskExecuteJobParams,
+    params: TaskExecutePayload,
     targetWorkerId: string | null = null,
   ): Promise<string | null> {
     try {
+      const validatedParams = validateTaskExecutePayload(params);
       const payload: Record<string, unknown> = {
         taskId,
         sessionId: this.sessionId,
         kind,
-        params,
+        params: validatedParams,
       };
       if (targetWorkerId) payload.targetWorkerId = targetWorkerId;
 
@@ -1758,7 +1916,7 @@ class RemoteBuddyOrchestrator {
       const targetWorkerId = await this.selectTargetWorkerForJob();
       const executionBudgetMs = this.executionBudgetForPriority(priority);
       const strictTargetPaths = targetPaths.filter((entry) => entry && entry !== ".");
-      const params: TaskExecuteJobParams = {
+      const params = validateTaskExecutePayload({
         schemaVersion: 2,
         requestId,
         sessionId: this.sessionId,
@@ -1826,7 +1984,7 @@ class RemoteBuddyOrchestrator {
         targetPath,
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
-      };
+      } satisfies TaskExecutePayload);
 
       await this.sendCommand({
         type: "task_created",
