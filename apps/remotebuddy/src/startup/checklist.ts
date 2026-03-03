@@ -4,6 +4,9 @@
  * and optionally blocks job dispatch until a synthetic probe completes.
  */
 export const STARTUP_FAILURE_CODES = {
+  BUN_VERSION_UNSUPPORTED: "startup.bun_version_unsupported",
+  DOCKER_AUTH_FAILED: "startup.docker_auth_failed",
+  ENV_VARS_MISSING: "startup.env_vars_missing",
   MERGE_IN_PROGRESS: "startup.merge_in_progress",
   REPO_DIRTY: "startup.repo_dirty",
   ALERTS_ACTIVE: "startup.alerts_active",
@@ -16,12 +19,24 @@ export type StartupFailureCode =
 
 type StartupCheckStatus = "pass" | "fail";
 
-export type StartupCheckCategory = "repo" | "alerts" | "synthetic" | "dispatch";
+export type StartupCheckCategory =
+  | "runtime"
+  | "docker"
+  | "env"
+  | "repo"
+  | "alerts"
+  | "synthetic"
+  | "dispatch";
 
 export interface StartupChecklistOptions {
   syntheticMaxLatencyMs?: number;
   syntheticProbeName?: string;
   allowDirtyWorktree?: boolean;
+  minBunVersion?: string;
+  bunVersionProvider?: () => string | Promise<string>;
+  dockerProbe?: DockerAuthProbe;
+  requiredEnvVars?: string[];
+  envVarResolver?: (key: string) => string | undefined | Promise<string | undefined>;
 }
 
 export interface RepoStatus {
@@ -79,6 +94,31 @@ export interface StartupChecklistContext {
   syntheticTester: SyntheticStartupTester;
   now?: () => number;
   log?: (entry: StartupCheckRecord) => void;
+  telemetry?: StartupTelemetryEmitter;
+}
+
+export interface DockerAuthProbeResult {
+  ok: boolean;
+  detail?: string;
+}
+
+export type DockerAuthProbe = () => Promise<DockerAuthProbeResult>;
+
+export type StartupTelemetryEventType = "start" | "end";
+
+export interface StartupTelemetryEvent {
+  event: StartupTelemetryEventType;
+  code: StartupFailureCode;
+  label: string;
+  category: StartupCheckCategory;
+  step: number;
+  status?: StartupCheckStatus;
+  detail?: string;
+  elapsedMs?: number;
+}
+
+export interface StartupTelemetryEmitter {
+  emit: (event: StartupTelemetryEvent) => void;
 }
 
 type StartupCheckDefinition = {
@@ -105,8 +145,160 @@ const DEFAULT_SYNTHETIC_PROBE = "probe.remote_startup";
 const DISPATCH_CHECK_LABEL = "Job dispatch must succeed.";
 const DISPATCH_CHECK_ACTION =
   "Inspect RemoteBuddy + WorkerPals logs, repair dependencies, then rerun dispatch.";
+const BUN_CHECK_LABEL = "Bun runtime must satisfy the minimum supported version.";
+const BUN_CHECK_ACTION =
+  "Install the required Bun version (`bun upgrade` or align with the pinned workspace version) before launching RemoteBuddy.";
+const DOCKER_CHECK_LABEL = "Docker daemon + registry credentials must be available.";
+const DOCKER_CHECK_ACTION =
+  "Start Docker Desktop/daemon and run `docker login` for the required registry, then rerun the preflight.";
+const ENV_CHECK_LABEL = "RemoteBuddy startup requires specific environment variables.";
+const ENV_CHECK_ACTION =
+  "Export the documented env vars (see docs/startup.md) via `.env` or the shell session before running RemoteBuddy.";
+const DEFAULT_MIN_BUN_VERSION = "1.3.0";
+
+const builtinBunVersionProvider = async (): Promise<string> => {
+  try {
+    if (typeof Bun !== "undefined" && typeof Bun.version === "string") {
+      return Bun.version.trim();
+    }
+  } catch {
+    // ignore Bun global access errors
+  }
+  const runtimeVersion = typeof process !== "undefined" ? process.version : "";
+  return runtimeVersion.replace(/^v/, "").trim();
+};
+
+const parseSemverParts = (value: string): [number, number, number] => {
+  const sanitized = value.split("+", 1)[0]?.split("-", 1)[0] ?? "";
+  const pieces = sanitized.split(".");
+  const major = Number.parseInt(pieces[0] ?? "0", 10) || 0;
+  const minor = Number.parseInt(pieces[1] ?? "0", 10) || 0;
+  const patch = Number.parseInt(pieces[2] ?? "0", 10) || 0;
+  return [major, minor, patch];
+};
+
+const compareSemver = (a: string, b: string): number => {
+  const [aMajor, aMinor, aPatch] = parseSemverParts(a);
+  const [bMajor, bMinor, bPatch] = parseSemverParts(b);
+  if (aMajor !== bMajor) return aMajor < bMajor ? -1 : 1;
+  if (aMinor !== bMinor) return aMinor < bMinor ? -1 : 1;
+  if (aPatch !== bPatch) return aPatch < bPatch ? -1 : 1;
+  return 0;
+};
+
+const defaultEnvVarResolver = (key: string): string | undefined =>
+  (typeof process !== "undefined" ? process.env?.[key] : undefined);
+
+const emitTelemetryEvent = (
+  ctx: StartupChecklistContext,
+  event: StartupTelemetryEvent,
+): void => {
+  try {
+    ctx.telemetry?.emit(event);
+  } catch {
+    // avoid propagating telemetry failures into startup gating logic
+  }
+};
 
 const defaultChecks: readonly StartupCheckDefinition[] = [
+  {
+    code: STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    label: BUN_CHECK_LABEL,
+    action: BUN_CHECK_ACTION,
+    category: "runtime",
+    run: async (_ctx, options) => {
+      const currentVersionProvider =
+        options.bunVersionProvider ?? builtinBunVersionProvider;
+      const minVersion = (options.minBunVersion ?? DEFAULT_MIN_BUN_VERSION).trim();
+      const currentRaw = await currentVersionProvider();
+      const currentVersion = (currentRaw ?? "").trim();
+      if (!currentVersion) {
+        return {
+          ok: false,
+          detail: "Unable to detect Bun runtime version from the current process.",
+        };
+      }
+      if (minVersion && compareSemver(currentVersion, minVersion) < 0) {
+        return {
+          ok: false,
+          detail: `Installed Bun ${currentVersion} but startup requires ${minVersion} or later.`,
+        };
+      }
+      return {
+        ok: true,
+        detail: `Bun ${currentVersion} satisfies >= ${minVersion || "configured requirement"}.`,
+      };
+    },
+  },
+  {
+    code: STARTUP_FAILURE_CODES.DOCKER_AUTH_FAILED,
+    label: DOCKER_CHECK_LABEL,
+    action: DOCKER_CHECK_ACTION,
+    category: "docker",
+    run: async (_ctx, options) => {
+      const probe = options.dockerProbe;
+      if (!probe) {
+        return {
+          ok: true,
+          detail: "Docker auth probe not configured; skipping runtime enforcement.",
+        };
+      }
+      try {
+        const result = await probe();
+        if (!result.ok) {
+          return {
+            ok: false,
+            detail:
+              result.detail ??
+              "Docker daemon unreachable or credentials missing. Run `docker login` and retry.",
+          };
+        }
+        return { ok: true, detail: result.detail ?? "Docker daemon + creds verified." };
+      } catch (err) {
+        return {
+          ok: false,
+          detail: err instanceof Error ? err.message : "Docker auth probe threw an error.",
+        };
+      }
+    },
+  },
+  {
+    code: STARTUP_FAILURE_CODES.ENV_VARS_MISSING,
+    label: ENV_CHECK_LABEL,
+    action: ENV_CHECK_ACTION,
+    category: "env",
+    run: async (_ctx, options) => {
+      const required = options.requiredEnvVars ?? [];
+      if (required.length === 0) {
+        return { ok: true, detail: "No required env vars configured for startup enforcement." };
+      }
+      const resolver = options.envVarResolver ?? defaultEnvVarResolver;
+      const missing: string[] = [];
+      for (const key of required) {
+        try {
+          const raw = await resolver(key);
+          if (typeof raw !== "string" || raw.trim().length === 0) {
+            missing.push(key);
+          }
+        } catch (err) {
+          return {
+            ok: false,
+            detail: `Could not resolve env var ${key}: ${err instanceof Error ? err.message : "unknown error"}`,
+          };
+        }
+      }
+      if (missing.length > 0) {
+        return {
+          ok: false,
+          detail: `Missing env vars: ${missing.join(", ")}.`,
+        };
+      }
+      return {
+        ok: true,
+        detail: `All required env vars present (${required.join(", ")}).`,
+      };
+    },
+  },
   {
     code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
     label: "Git merge or rebase must be resolved.",
@@ -249,6 +441,13 @@ export class StartupChecklist {
     const history: StartupCheckRecord[] = [];
     for (const [index, check] of this.checks.entries()) {
       const step = index + 1;
+      emitTelemetryEvent(ctx, {
+        event: "start",
+        code: check.code,
+        label: check.label,
+        category: check.category,
+        step,
+      });
       const started = nowMs(ctx);
       let status: StartupCheckStatus = "pass";
       let detail = check.label;
@@ -263,6 +462,7 @@ export class StartupChecklist {
             ? error.message
             : "Unknown error running startup check.";
       }
+      const elapsedMs = Math.max(0, nowMs(ctx) - started);
       const record: StartupCheckRecord = {
         code: check.code,
         label: check.label,
@@ -271,10 +471,20 @@ export class StartupChecklist {
         status,
         detail,
         action: status === "fail" ? check.action : undefined,
-        elapsedMs: Math.max(0, nowMs(ctx) - started),
+        elapsedMs,
       };
       history.push(record);
       ctx.log?.(record);
+      emitTelemetryEvent(ctx, {
+        event: "end",
+        code: check.code,
+        label: check.label,
+        category: check.category,
+        step,
+        status,
+        detail,
+        elapsedMs,
+      });
       if (status === "fail") {
         return {
           ok: false,
@@ -316,6 +526,13 @@ export const gateDispatchWithStartupPreflight = async (
   const dispatchLabel = DISPATCH_CHECK_LABEL;
   const dispatchAction = DISPATCH_CHECK_ACTION;
   const started = nowMs(ctx);
+  emitTelemetryEvent(ctx, {
+    event: "start",
+    code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+    label: dispatchLabel,
+    category: "dispatch",
+    step: dispatchStep,
+  });
   try {
     await dispatchJob();
     const elapsedMs = Math.max(0, nowMs(ctx) - started);
@@ -330,6 +547,16 @@ export const gateDispatchWithStartupPreflight = async (
     };
     result.history.push(successRecord);
     ctx.log?.(successRecord);
+    emitTelemetryEvent(ctx, {
+      event: "end",
+      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+      label: dispatchLabel,
+      category: "dispatch",
+      step: dispatchStep,
+      status: "pass",
+      detail: successRecord.detail,
+      elapsedMs,
+    });
     return result;
   } catch (error) {
     const errorMessage =
@@ -351,6 +578,16 @@ export const gateDispatchWithStartupPreflight = async (
       elapsedMs,
     };
     ctx.log?.(failureRecord);
+    emitTelemetryEvent(ctx, {
+      event: "end",
+      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+      label: dispatchLabel,
+      category: "dispatch",
+      step: dispatchStep,
+      status: "fail",
+      detail,
+      elapsedMs,
+    });
     const history = [...result.history, failureRecord];
     return {
       ok: false,

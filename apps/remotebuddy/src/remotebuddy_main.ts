@@ -44,6 +44,7 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import { ensureStartupPreflightReadiness } from "./startup/preflight.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -2086,6 +2087,12 @@ async function main() {
       "[RemoteBuddy] Config snapshot logging disabled (startup.log_config_on_start=false).",
     );
   }
+
+  await ensureStartupPreflightReadiness({
+    config: CONFIG,
+    allowDirtyWorktree: CONFIG.remotebuddy.autonomy.allowDirtyWorktree,
+    logger: (line) => console.log(line),
+  });
 
   // ── Initialise LLM + brain ──
   let brain: AgentBrain;
