@@ -155,38 +155,72 @@ const TRIGGER_TYPES = new Set<SignalValue["type"]>([
 ]);
 const RECENT_SUCCESS_SUPPRESSION_WINDOW_HOURS = 24;
 
-function isNegativePrFeedbackVerdict(value: string): boolean {
-  const text = value.toLowerCase();
-  return (
-    text.includes("reject") ||
-    text.includes("unmergeable") ||
-    text.includes("merge_conflict") ||
-    text.includes("merge_failed") ||
-    text.includes("failed")
-  );
+export type NormalizedPrFeedbackVerdict =
+  | "approved_merged"
+  | "approved_unmergeable"
+  | "rejected"
+  | "rejected_comment_cap_closed"
+  | "unknown";
+
+const PR_FEEDBACK_VERDICT_MAP: Record<string, NormalizedPrFeedbackVerdict> = {
+  approved: "approved_merged",
+  approved_merged: "approved_merged",
+  approvedmerged: "approved_merged",
+  merged: "approved_merged",
+  merge_success: "approved_merged",
+  approved_unmergeable: "approved_unmergeable",
+  approvedunmergeable: "approved_unmergeable",
+  unmergeable: "approved_unmergeable",
+  merge_conflict: "rejected",
+  mergeconflict: "rejected",
+  merge_failed: "rejected",
+  mergefailed: "rejected",
+  failed: "rejected",
+  failure: "rejected",
+  reject: "rejected",
+  rejected: "rejected",
+  rejected_comment_cap_closed: "rejected_comment_cap_closed",
+  comment_cap_closed: "rejected_comment_cap_closed",
+  pr_closed_comment_cap: "rejected_comment_cap_closed",
+};
+
+export function normalizePrFeedbackVerdict(value: string): NormalizedPrFeedbackVerdict {
+  const trimmed = String(value ?? "").trim().toLowerCase();
+  if (!trimmed) return "unknown";
+  const sanitized = trimmed.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!sanitized) return "unknown";
+  return PR_FEEDBACK_VERDICT_MAP[sanitized] ?? "unknown";
 }
 
-function deriveOutcomeFromPrFeedbackVerdict(
+function isNegativePrFeedbackVerdict(value: string): boolean {
+  const normalized = normalizePrFeedbackVerdict(value);
+  return normalized === "rejected" || normalized === "rejected_comment_cap_closed";
+}
+
+export function deriveOutcomeFromPrFeedbackVerdict(
   verdict: string,
 ): { success: boolean; userAction: string; reopenedWithin24h: boolean; regressionFlag: boolean } | null {
-  const text = verdict.toLowerCase();
-  if (isNegativePrFeedbackVerdict(text)) {
-    return {
-      success: false,
-      userAction: "rejected",
-      reopenedWithin24h: true,
-      regressionFlag: true,
-    };
+  const normalized = normalizePrFeedbackVerdict(verdict);
+  switch (normalized) {
+    case "approved_merged":
+    case "approved_unmergeable":
+      return {
+        success: true,
+        userAction: normalized,
+        reopenedWithin24h: false,
+        regressionFlag: false,
+      };
+    case "rejected":
+    case "rejected_comment_cap_closed":
+      return {
+        success: false,
+        userAction: normalized,
+        reopenedWithin24h: true,
+        regressionFlag: true,
+      };
+    default:
+      return null;
   }
-  if (text.includes("approved") || text.includes("merged")) {
-    return {
-      success: true,
-      userAction: "accepted",
-      reopenedWithin24h: false,
-      regressionFlag: false,
-    };
-  }
-  return null;
 }
 
 export interface AutonomySnapshot {

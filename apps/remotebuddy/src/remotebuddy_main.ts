@@ -44,6 +44,7 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import { runStartupChecklist } from "./startup/runtime_checklist.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -2085,6 +2086,20 @@ async function main() {
     console.log(
       "[RemoteBuddy] Config snapshot logging disabled (startup.log_config_on_start=false).",
     );
+  }
+
+  const repoRoot = detectRepoRoot(process.cwd());
+  try {
+    await runStartupChecklist({
+      repoPath: repoRoot,
+      serverUrl: opts.server,
+      checklist: CONFIG.remotebuddy.startupChecklist,
+    });
+  } catch (err: any) {
+    console.error(
+      `[RemoteBuddy] Startup checklist failed; aborting launch: ${err?.message ?? err}`,
+    );
+    process.exit(1);
   }
 
   // ── Initialise LLM + brain ──

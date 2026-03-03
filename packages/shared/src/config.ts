@@ -143,6 +143,15 @@ export interface PushPalsConfig {
         maxPayloadBytes: number;
       };
     };
+    startupChecklist: {
+      enabled: boolean;
+      allowDirtyWorktree: boolean;
+      alertsEndpoint: string;
+      alertsLabelPrefix: string;
+      syntheticUrl: string;
+      syntheticTimeoutMs: number;
+      syntheticProbeName: string;
+    };
     llm: PushPalsLlmConfig;
   };
   workerpals: {
@@ -781,6 +790,42 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     ...remoteAutonomyDispatchByTypeCfg,
     ...asStringNumberRecord(remoteAutonomyNode.max_dispatch_per_hour_by_type),
   };
+  const remoteStartupNode = getObject(remoteNode, "startup");
+  const remoteStartupChecklistEnabled =
+    parseBoolEnv("REMOTEBUDDY_STARTUP_CHECKLIST_ENABLED") ??
+    asBoolean(remoteStartupNode.checklist_enabled, true);
+  const remoteStartupAllowDirtyWorktree =
+    parseBoolEnv("REMOTEBUDDY_STARTUP_ALLOW_DIRTY_WORKTREE") ??
+    asBoolean(remoteStartupNode.allow_dirty_worktree, false);
+  const remoteStartupAlertsEndpoint = firstNonEmpty(
+    process.env.REMOTEBUDDY_STARTUP_ALERTS_ENDPOINT,
+    asString(remoteStartupNode.alerts_endpoint, ""),
+  );
+  const remoteStartupAlertsLabelPrefix = firstNonEmpty(
+    process.env.REMOTEBUDDY_STARTUP_ALERTS_LABEL_PREFIX,
+    asString(remoteStartupNode.alerts_label_prefix, "remote_"),
+    "remote_",
+  );
+  const sanitizedServerUrl = (serverUrl || "http://localhost:3001").replace(/\/+$/, "");
+  const defaultSyntheticUrl = `${sanitizedServerUrl}/healthz`;
+  const remoteStartupSyntheticUrl = firstNonEmpty(
+    process.env.REMOTEBUDDY_STARTUP_SYNTHETIC_URL,
+    asString(remoteStartupNode.synthetic_url, defaultSyntheticUrl),
+    defaultSyntheticUrl,
+  );
+  const remoteStartupSyntheticTimeoutMs = Math.max(
+    500,
+    asInt(
+      parseIntEnv("REMOTEBUDDY_STARTUP_SYNTHETIC_TIMEOUT_MS") ??
+        remoteStartupNode.synthetic_timeout_ms,
+      15_000,
+    ),
+  );
+  const remoteStartupSyntheticProbeName = firstNonEmpty(
+    process.env.REMOTEBUDDY_STARTUP_SYNTHETIC_PROBE_NAME,
+    asString(remoteStartupNode.synthetic_probe_name, "probe.remote_startup"),
+    "probe.remote_startup",
+  );
 
   const workerNode = getObject(merged, "workerpals");
   const workerOpenHandsNode = getObject(workerNode, "openhands");
@@ -1705,6 +1750,15 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
             ),
           ),
         },
+      },
+      startupChecklist: {
+        enabled: remoteStartupChecklistEnabled,
+        allowDirtyWorktree: remoteStartupAllowDirtyWorktree,
+        alertsEndpoint: remoteStartupAlertsEndpoint,
+        alertsLabelPrefix: remoteStartupAlertsLabelPrefix,
+        syntheticUrl: remoteStartupSyntheticUrl,
+        syntheticTimeoutMs: remoteStartupSyntheticTimeoutMs,
+        syntheticProbeName: remoteStartupSyntheticProbeName,
       },
       llm: remoteLlm,
     },

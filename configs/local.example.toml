@@ -35,6 +35,15 @@ max_recall_chars = 2400
 max_summary_chars = 420
 retention_days = 30
 
+[remotebuddy.startup]
+checklist_enabled = true
+allow_dirty_worktree = false
+alerts_endpoint = ""
+alerts_label_prefix = "remote_"
+synthetic_url = ""
+synthetic_timeout_ms = 4000
+synthetic_probe_name = "probe.remote_startup"
+
 [workerpals.llm]
 backend = "openai_codex"
 model = "gpt-5-codex"

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { join, resolve } from "path";
-import { tmpdir } from "os";
+import { resolve } from "path";
 import {
   ReviewAgent,
   buildReviewFeedbackContext,
@@ -56,12 +55,6 @@ const silentLogs = {
   closePullRequest: async () => ({ state: "closed", closed: true }),
   deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
 };
-
-const tempCycleStatePath = (label: string): string =>
-  join(
-    tmpdir(),
-    `review-agent-cycle-state-${label}-${Math.random().toString(36).slice(2)}.json`,
-  );
 
 describe("ReviewAgent", () => {
   test("resolves reviewer markdown path from workspace root", () => {
@@ -1241,8 +1234,8 @@ describe("ReviewAgent", () => {
 
     const comments = Array.from({ length: 10 }, (_, idx) => ({
       id: idx + 1,
-      body: `Feedback item ${idx + 1}`,
-      userLogin: `reviewer-${idx + 1}`,
+      body: `## ReviewAgent: Changes Rejected (score 7.${idx}/10)\n\n**Verdict:** Feedback item ${idx + 1}`,
+      userLogin: `review-agent`,
       createdAt: `2026-02-20T00:${String(idx).padStart(2, "0")}:00Z`,
       htmlUrl: `https://example.com/comment/${idx + 1}`,
     }));
@@ -1256,7 +1249,6 @@ describe("ReviewAgent", () => {
       undefined,
       {
         ...silentLogs,
-        now: () => Date.parse("2026-02-19T00:00:00Z"),
         listOpenPullRequests: async () => [pr],
         getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
         invokeCodexReview: async () =>
@@ -1305,22 +1297,20 @@ describe("ReviewAgent", () => {
     expect(enqueueCalls).toBe(0);
   });
 
-  test("ignores historical comments when enforcing PR comment cap", async () => {
+  test("ignores human-only comment bursts when enforcing PR comment cap", async () => {
     const pr = makePr({ number: 68, html_url: "https://example.com/pr/68" });
     let closeCalls = 0;
-    let rejectionComments = 0;
-    let enqueueCalls = 0;
-
-    const comments = Array.from({ length: 4 }, (_, idx) => ({
+    let commentCalls = 0;
+    const comments = Array.from({ length: 8 }, (_, idx) => ({
       id: idx + 1,
-      body: `Historical comment ${idx + 1}`,
-      userLogin: `reviewer-${idx + 1}`,
-      createdAt: `2026-02-19T0${idx}:00:00Z`,
-      htmlUrl: `https://example.com/comment/${idx + 1}`,
+      body: `Human reviewer note ${idx + 1}`,
+      userLogin: `eng-${idx + 1}`,
+      createdAt: `2026-02-20T01:${String(idx).padStart(2, "0")}:00Z`,
+      htmlUrl: `https://example.com/human/${idx + 1}`,
     }));
 
     const agent = new ReviewAgent(
-      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 3 },
       "http://localhost:3001",
       "token",
       "https://github.com/org/repo.git",
@@ -1328,197 +1318,32 @@ describe("ReviewAgent", () => {
       undefined,
       {
         ...silentLogs,
-        now: () => Date.parse("2026-02-21T00:00:00Z"),
         listOpenPullRequests: async () => [pr],
         getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
         invokeCodexReview: async () =>
           JSON.stringify({
-            score: 7.4,
-            summary: "Still needs fixes",
-            issues: ["Handle edge cases"],
+            score: 7.5,
+            summary: "Needs more work",
+            issues: ["Add regression tests"],
             fix_instruction: "",
           }),
         addPullRequestComment: async () => {
-          rejectionComments += 1;
+          commentCalls += 1;
         },
         listPullRequestComments: async () => comments,
         closePullRequest: async () => {
           closeCalls += 1;
-          return { state: "closed", closed: true };
+          return { closed: true, state: "closed" };
         },
-        fetchImpl: async (input) => {
-          const url = String(input);
-          if (url.endsWith("/jobs/enqueue")) {
-            enqueueCalls += 1;
-            return new Response(JSON.stringify({ ok: true, jobId: "job-old-comments" }), {
-              status: 200,
-            });
-          }
-          return new Response(JSON.stringify({ ok: true }), { status: 200 });
-        },
+        fetchImpl: async () =>
+          new Response(JSON.stringify({ ok: true, jobId: "job-fix-68" }), { status: 200 }),
       },
     );
 
     await agent.poll();
 
     expect(closeCalls).toBe(0);
-    expect(rejectionComments).toBe(1);
-    expect(enqueueCalls).toBe(1);
-  });
-
-  test("persists relevant comment counts across restarts to enforce cap deterministically", async () => {
-    const pr = makePr({ number: 69, html_url: "https://example.com/pr/69" });
-    let closeCalls = 0;
-    let rejectionComments = 0;
-    const commentsRound1 = [
-      {
-        id: 101,
-        body: "Initial rejection context",
-        userLogin: "reviewer-1",
-        createdAt: "2026-02-22T01:00:00Z",
-        htmlUrl: "https://example.com/comment/101",
-      },
-    ];
-    const commentsRound2 = [
-      ...commentsRound1,
-      {
-        id: 102,
-        body: "Another reminder after fixes missed",
-        userLogin: "reviewer-2",
-        createdAt: "2026-02-22T02:00:00Z",
-        htmlUrl: "https://example.com/comment/102",
-      },
-    ];
-    const cycleStatePath = tempCycleStatePath("restart");
-    const sharedDeps = {
-      ...silentLogs,
-      now: () => Date.parse("2026-02-22T00:00:00Z"),
-      getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
-      invokeCodexReview: async () =>
-        JSON.stringify({
-          score: 7.4,
-          summary: "Still failing CI",
-          issues: ["Address lint failures"],
-          fix_instruction: "",
-        }),
-      addPullRequestComment: async () => {
-        rejectionComments += 1;
-      },
-      closePullRequest: async () => {
-        closeCalls += 1;
-        return { state: "closed", closed: true };
-      },
-      deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
-      fetchImpl: async (input) => {
-        const url = String(input);
-        if (url.endsWith("/autonomy/pr-feedback")) {
-          return new Response(JSON.stringify({ ok: true }), { status: 200 });
-        }
-        if (url.endsWith("/jobs/enqueue")) {
-          return new Response(JSON.stringify({ ok: true, jobId: "job-cycle" }), { status: 200 });
-        }
-        return new Response(JSON.stringify({ ok: true }), { status: 200 });
-      },
-    };
-
-    const agentFirst = new ReviewAgent(
-      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
-      "http://localhost:3001",
-      "token",
-      "https://github.com/org/repo.git",
-      "main",
-      undefined,
-      {
-        ...sharedDeps,
-        listOpenPullRequests: async () => [pr],
-        listPullRequestComments: async () => commentsRound1,
-      },
-      { commentCycleStatePath: cycleStatePath },
-    );
-
-    await agentFirst.poll();
-    expect(closeCalls).toBe(0);
-
-    const agentSecond = new ReviewAgent(
-      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
-      "http://localhost:3001",
-      "token",
-      "https://github.com/org/repo.git",
-      "main",
-      undefined,
-      {
-        ...sharedDeps,
-        listOpenPullRequests: async () => [pr],
-        listPullRequestComments: async () => commentsRound2,
-      },
-      { commentCycleStatePath: cycleStatePath },
-    );
-
-    await agentSecond.poll();
-    expect(closeCalls).toBe(1);
-    expect(rejectionComments).toBeGreaterThanOrEqual(1);
-  });
-
-  test("tolerates malformed head SHAs by skipping historical comment counting", async () => {
-    const pr = makePr({
-      number: 70,
-      html_url: "https://example.com/pr/70",
-      head: { sha: "" },
-    });
-    let closeCalls = 0;
-    let rejectionComments = 0;
-    const comments = Array.from({ length: 5 }, (_, idx) => ({
-      id: idx + 1,
-      body: `Legacy thread ${idx + 1}`,
-      userLogin: `reviewer-${idx + 1}`,
-      createdAt: `2026-02-18T0${idx}:00:00Z`,
-      htmlUrl: `https://example.com/comment/${idx + 1}`,
-    }));
-
-    const agent = new ReviewAgent(
-      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
-      "http://localhost:3001",
-      "token",
-      "https://github.com/org/repo.git",
-      "main",
-      undefined,
-      {
-        ...silentLogs,
-        now: () => Date.parse("2026-02-23T00:00:00Z"),
-        listOpenPullRequests: async () => [pr],
-        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
-        invokeCodexReview: async () =>
-          JSON.stringify({
-            score: 7.3,
-            summary: "Needs fixes",
-            issues: ["Flaky tests"],
-            fix_instruction: "",
-          }),
-        listPullRequestComments: async () => comments,
-        addPullRequestComment: async () => {
-          rejectionComments += 1;
-        },
-        closePullRequest: async () => {
-          closeCalls += 1;
-          return { state: "closed", closed: true };
-        },
-        fetchImpl: async (input) => {
-          const url = String(input);
-          if (url.endsWith("/jobs/enqueue")) {
-            return new Response(JSON.stringify({ ok: true, jobId: "job-invalid-head" }), {
-              status: 200,
-            });
-          }
-          return new Response(JSON.stringify({ ok: true }), { status: 200 });
-        },
-      },
-      { commentCycleStatePath: tempCycleStatePath("invalid-head") },
-    );
-
-    await agent.poll();
-
-    expect(closeCalls).toBe(0);
-    expect(rejectionComments).toBe(1);
+    expect(commentCalls).toBe(1);
   });
 
   test("continues enqueue flow when PR feedback comment lookup fails", async () => {

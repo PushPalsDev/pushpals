@@ -97,6 +97,15 @@ store_prompt_payloads = false
 max_runs_with_payloads = 50
 max_payload_bytes = 262144
 
+[remotebuddy.startup]
+checklist_enabled = true
+allow_dirty_worktree = false
+alerts_endpoint = ""
+alerts_label_prefix = "remote_"
+synthetic_url = ""
+synthetic_timeout_ms = 4000
+synthetic_probe_name = "probe.remote_startup"
+
 [workerpals]
 poll_ms = 2000
 heartbeat_ms = 5000

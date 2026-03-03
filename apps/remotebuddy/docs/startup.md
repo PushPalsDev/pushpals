@@ -7,11 +7,11 @@ from a full outage). It sequences the dependent services, captures the telemetry
 green before admitting traffic, and lists the verification plus rollback actions that keep startup
 safe and auditable.
 
-## Running the automated preflight
-
-- Execute `bun run preflight` from the repo root to run the same startup checks (env-file precedence, Bun version, auth variables) without launching long-lived services.
-- Pass `--json` for machine-readable output, or rely on the default human-readable summary for manual bring-up.
-- Override the env file by setting `REMOTEBUDDY_PREFLIGHT_ENV_FILE=/path/to/.env` when you need to test a specific configuration snapshot.
+> **Heads-up:** RemoteBuddy now runs this checklist automatically during `bun run remotebuddy:only`
+> startup. The guards (repo cleanliness, Alertmanager silence, synthetic probe latency, and dispatch
+> dry-run) are controlled via the `remotebuddy.startup.*` config block. If any check fails, the
+> process exits with the actionable failure code noted below; you must either fix the issue or
+> explicitly disable the guard in config before RemoteBuddy will accept work.
 
 ## When to run this check
 
@@ -33,14 +33,6 @@ safe and auditable.
 
 Always attach the captured evidence to your PagerDuty incident or the on-call log so the next
 startup can reference a single source of truth.
-
-## Preflight CLI quick reference
-
-- Run `bun run remotebuddy:preflight` from the repo root to execute the deterministic repo/alerts/synthetic checklist.
-- Pass `--json` when you need structured output for CI/bots.
-- `REMOTEBUDDY_PREFLIGHT_ENV_FILE` (absolute path or repo-relative) controls which env file gets loaded before the checks; when unset the script falls back to `.env`.
-- Set `REMOTEBUDDY_PREFLIGHT_SYNTHETIC_MODE=mock` if the Server stack is offline but you still need to verify repo/Alertmanager state.
-- Provide comma-separated or JSON alert names via `REMOTEBUDDY_PREFLIGHT_ALERTS` to simulate Alertmanager failures during drills.
 
 ## Dependency bring-up checklist
 
