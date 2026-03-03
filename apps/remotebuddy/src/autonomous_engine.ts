@@ -21,6 +21,7 @@ import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
+import { describeRepoStatus } from "./startup/system_preflight.js";
 
 type AutonomyCandidate = {
   id: string;
@@ -294,17 +295,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: st
   }
 }
 
-async function gitOutput(repo: string, args: string[]): Promise<string> {
-  const proc = Bun.spawn(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
-  const [stdout, _stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (exitCode !== 0) return "";
-  return stdout.trim();
-}
-
 type GitRunResult = {
   ok: boolean;
   exitCode: number;
@@ -321,11 +311,10 @@ async function repoPreflight(repo: string): Promise<{
   isWorktreeDirty: boolean;
   isMergeInProgress: boolean;
 }> {
-  const porcelain = await gitOutput(repo, ["status", "--porcelain"]);
-  const mergeHead = await gitOutput(repo, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+  const status = await describeRepoStatus({ repoRoot: repo, tolerateGitErrors: true });
   return {
-    isWorktreeDirty: Boolean(porcelain),
-    isMergeInProgress: Boolean(mergeHead),
+    isWorktreeDirty: status.isDirty,
+    isMergeInProgress: status.isMergeInProgress,
   };
 }
 

@@ -17,6 +17,7 @@
 
 import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
+import { parseArgs } from "node:util";
 import { Database } from "bun:sqlite";
 import { createLLMClient, type LLMClient } from "./llm.js";
 import { AgentBrain, PlannerOutput } from "./brain.js";
@@ -32,7 +33,7 @@ import {
   normalizeTargetPath,
   normalizeWriteGlob,
 } from "shared";
-import { mkdirSync } from "fs";
+import { mkdirSync, readFileSync } from "fs";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {
   extractExplicitTargetPath,
@@ -44,19 +45,72 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
-import packageJson from "../package.json" assert { type: "json" };
-import { SystemPreflightError } from "./startup/system_preflight.js";
 import {
-  guardStartupAndLaunchRemoteBuddy,
-  type RemoteBuddyLaunchOptions,
-} from "./startup/startup_guard.js";
+  runStartupPreflight,
+  type StartupChecklistContext,
+  type StartupChecklistFailure,
+  type StartupChecklistOptions,
+  type StartupChecklistResult,
+  type StartupCheckRecord,
+} from "./startup/checklist.js";
+import {
+  createServerSyntheticTester,
+  describeRepoStatus,
+  listFiringAlertsFromEnv,
+} from "./startup/system_preflight.js";
 
-// ─── CLI args ───────────────────────────────────────────────────────────────
+const packageJson = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { version?: string };
+const REMOTEBUDDY_VERSION =
+  typeof packageJson.version === "string" && packageJson.version.trim().length > 0
+    ? packageJson.version.trim()
+    : "dev";
+const EXIT_USAGE = 64;
 
 const CONFIG = loadPushPalsConfig();
-const pkgVersion = (packageJson as { version?: string }).version;
-const REMOTEBUDDY_VERSION =
-  typeof pkgVersion === "string" && pkgVersion.trim() ? pkgVersion.trim() : "0.0.0";
+
+export interface RemoteBuddyLaunchOptions {
+  server: string;
+  sessionId: string | null;
+  authToken: string | null;
+}
+
+export interface GuardStartupAndLaunchParams {
+  argv?: string[];
+  stdout?: (line: string) => void;
+  stderr?: (line: string) => void;
+  version?: string;
+  runStartupPreflight?: (
+    ctx: StartupChecklistContext,
+    options?: StartupChecklistOptions,
+  ) => Promise<StartupChecklistResult>;
+  createChecklistContext?: (input: {
+    server: string;
+    log: (line: string) => void;
+  }) => Promise<StartupChecklistContext>;
+  launchRemoteBuddy?: (opts: RemoteBuddyLaunchOptions) => Promise<void>;
+  preflightOptions?: StartupChecklistOptions;
+  configOverrides?: {
+    serverUrl?: string | null;
+    sessionId?: string | null;
+    authToken?: string | null;
+  };
+}
+
+export class RemoteBuddyUsageError extends Error {
+  constructor(message: string, public readonly showUsage = true) {
+    super(message);
+    this.name = "RemoteBuddyUsageError";
+  }
+}
+
+export class RemoteBuddyPreflightError extends Error {
+  constructor(message: string, public readonly failure: StartupChecklistFailure) {
+    super(message);
+    this.name = "RemoteBuddyPreflightError";
+  }
+}
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
 
@@ -2055,7 +2109,7 @@ async function connectWithRetry(
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-export async function launchRemoteBuddy(opts: RemoteBuddyLaunchOptions): Promise<void> {
+async function launchRemoteBuddyRuntime(opts: RemoteBuddyLaunchOptions) {
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
   if (CONFIG.startup.logConfigOnStart) {
@@ -2127,24 +2181,242 @@ export async function launchRemoteBuddy(opts: RemoteBuddyLaunchOptions): Promise
   orchestrator.startPolling(pollMs);
 }
 
-if (import.meta.main) {
-  guardStartupAndLaunchRemoteBuddy({
-    version: REMOTEBUDDY_VERSION,
-    defaults: {
-      server: CONFIG.server.url,
-      sessionId: CONFIG.sessionId ?? null,
-      authToken: CONFIG.authToken ?? null,
-      allowDirtyWorktree: CONFIG.remotebuddy.autonomy.allowDirtyWorktree,
-    },
-    run: (cli) => launchRemoteBuddy(cli),
-  }).catch((err) => {
-    if (err instanceof SystemPreflightError) {
-      console.error(
-        `[RemoteBuddy] Startup preflight blocked (${err.code}): ${err.detail}`,
-      );
-      process.exit(2);
-    }
-    console.error("[RemoteBuddy] Fatal:", err);
-    process.exit(1);
-  });
+type ParsedRemoteBuddyCli = {
+  server?: string;
+  sessionId?: string;
+  token?: string;
+  help: boolean;
+  version: boolean;
+  preflightOnly: boolean;
+  skipPreflight: boolean;
+};
+
+export async function guardStartupAndLaunchRemoteBuddy(
+  params: GuardStartupAndLaunchParams = {},
+): Promise<void> {
+  const argv =
+    params.argv ??
+    (typeof Bun !== "undefined" && Array.isArray(Bun.argv)
+      ? Bun.argv.slice(2)
+      : process.argv.slice(2));
+  const stdout = params.stdout ?? ((line: string) => console.log(line));
+  const stderr = params.stderr ?? ((line: string) => console.error(line));
+  const version = params.version ?? REMOTEBUDDY_VERSION;
+  const runPreflightImpl = params.runStartupPreflight ?? runStartupPreflight;
+  const createContextImpl =
+    params.createChecklistContext ?? createDefaultStartupChecklistContext;
+  const launchImpl = params.launchRemoteBuddy ?? launchRemoteBuddyRuntime;
+  const cli = parseRemoteBuddyCli(argv);
+
+  if (cli.help) {
+    stdout(formatUsage(version));
+    return;
+  }
+  if (cli.version) {
+    stdout(`RemoteBuddy ${version}`);
+    return;
+  }
+  if (cli.preflightOnly && cli.skipPreflight) {
+    throw new RemoteBuddyUsageError("Cannot combine --preflight-only with --skip-preflight.");
+  }
+
+  const configOverrides = params.configOverrides ?? {};
+  const server = resolveEffectiveServer(cli.server, configOverrides.serverUrl ?? undefined);
+  const configSession =
+    typeof configOverrides.sessionId === "string"
+      ? configOverrides.sessionId
+      : typeof CONFIG.sessionId === "string"
+        ? CONFIG.sessionId
+        : "";
+  const sessionId = (cli.sessionId ?? configSession).trim() || null;
+  const configToken =
+    typeof configOverrides.authToken === "string"
+      ? configOverrides.authToken
+      : typeof CONFIG.authToken === "string"
+        ? CONFIG.authToken
+        : "";
+  const authToken = (cli.token ?? configToken).trim() || null;
+
+  if (cli.skipPreflight) {
+    stdout("[RemoteBuddy] Startup preflight skipped (--skip-preflight).");
+    await launchImpl({ server, sessionId, authToken });
+    return;
+  }
+
+  const checklistContext = await createContextImpl({ server, log: stdout });
+  const preflightResult = await runPreflightImpl(
+    checklistContext,
+    params.preflightOptions ?? {},
+  );
+  if (!preflightResult.ok && preflightResult.failure) {
+    logPreflightFailure(stderr, preflightResult.failure);
+    throw new RemoteBuddyPreflightError(
+      `Startup preflight blocked (${preflightResult.failure.code})`,
+      preflightResult.failure,
+    );
+  } else if (!preflightResult.ok) {
+    throw new Error("Startup preflight failed without an actionable failure payload.");
+  }
+
+  const historyCount = preflightResult.history.length;
+  stdout(
+    `[RemoteBuddy] Startup preflight passed (${historyCount} check${historyCount === 1 ? "" : "s"}).`,
+  );
+  if (cli.preflightOnly) {
+    stdout("[RemoteBuddy] Exiting due to --preflight-only.");
+    return;
+  }
+
+  await launchImpl({ server, sessionId, authToken });
 }
+
+function parseRemoteBuddyCli(argv: string[]): ParsedRemoteBuddyCli {
+  try {
+    const { values } = parseArgs({
+      strict: true,
+      args: argv,
+      options: {
+        server: { type: "string" },
+        sessionId: { type: "string" },
+        token: { type: "string" },
+        "preflight-only": { type: "boolean" },
+        "skip-preflight": { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+        version: { type: "boolean", short: "v" },
+      },
+    });
+    return {
+      server: readOptionalCliString(values.server, "server"),
+      sessionId: readOptionalCliString(values.sessionId, "sessionId"),
+      token: readOptionalCliString(values.token, "token"),
+      preflightOnly: values["preflight-only"] === true,
+      skipPreflight: values["skip-preflight"] === true,
+      help: values.help === true,
+      version: values.version === true,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new RemoteBuddyUsageError(message);
+  }
+}
+
+function readOptionalCliString(value: unknown, flag: string): string | undefined {
+  if (value == null) return undefined;
+  if (typeof value !== "string") {
+    throw new RemoteBuddyUsageError(`--${flag} expects a string value.`);
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new RemoteBuddyUsageError(`--${flag} requires a non-empty value.`);
+  }
+  return trimmed;
+}
+
+function resolveEffectiveServer(
+  cliServer?: string,
+  configServer?: string | null,
+): string {
+  const overrideServer = typeof configServer === "string" ? configServer : undefined;
+  const defaultServer =
+    typeof CONFIG.server?.url === "string" ? CONFIG.server.url : undefined;
+  const serverCandidate = (cliServer ?? overrideServer ?? defaultServer ?? "").trim();
+  const server = serverCandidate;
+  if (!server) {
+    throw new RemoteBuddyUsageError(
+      "RemoteBuddy server URL is not configured. Set server.url in configs or pass --server <url>.",
+    );
+  }
+  return server;
+}
+
+async function createDefaultStartupChecklistContext({
+  server,
+  log,
+}: {
+  server: string;
+  log: (line: string) => void;
+}): Promise<StartupChecklistContext> {
+  return {
+    describeRepo: () => describeRepoStatus(),
+    listFiringAlerts: () => listFiringAlertsFromEnv(),
+    syntheticTester: createServerSyntheticTester(server),
+    log: (entry) => log(formatStartupCheckHistory(entry)),
+  };
+}
+
+function formatStartupCheckHistory(entry: StartupCheckRecord): string {
+  const status = entry.status === "pass" ? "PASS" : "FAIL";
+  const detail = entry.detail ? ` :: ${entry.detail}` : "";
+  return `[RemoteBuddy][startup] [${status}] step=${entry.step} code=${entry.code} ${entry.label}${detail}`;
+}
+
+function logPreflightFailure(
+  logFn: (line: string) => void,
+  failure: StartupChecklistFailure,
+): void {
+  logFn(
+    `[RemoteBuddy] Startup preflight blocked at step ${failure.step} (${failure.category}/${failure.code}): ${failure.detail}`,
+  );
+  if (failure.action) {
+    logFn(`[RemoteBuddy] Next action: ${failure.action}`);
+  }
+}
+
+function formatUsage(version: string): string {
+  return [
+    `RemoteBuddy ${version}`,
+    "",
+    "Usage:",
+    "  bun run apps/remotebuddy/src/remotebuddy_main.ts [options]",
+    "",
+    "Options:",
+    "  --server <url>          Override PushPals server URL (default: configs server.url)",
+    "  --sessionId <id>        Override session identifier",
+    "  --token <token>         Override auth token",
+    "  --preflight-only        Run startup preflight checks and exit",
+    "  --skip-preflight        Skip startup preflight checks",
+    "  -h, --help              Show this help",
+    "  -v, --version           Show version information",
+  ].join("\n");
+}
+
+export interface RemoteBuddyCliErrorHandlingOptions {
+  stderr?: (line: string) => void;
+  version?: string;
+  exit?: (code?: number) => never;
+}
+
+export function handleRemoteBuddyStartupError(
+  err: unknown,
+  options: RemoteBuddyCliErrorHandlingOptions = {},
+): never {
+  const stderr = options.stderr ?? ((line: string) => console.error(line));
+  const exit = options.exit ?? ((code?: number) => process.exit(code ?? 1));
+  const version = options.version ?? REMOTEBUDDY_VERSION;
+
+  if (err instanceof RemoteBuddyUsageError) {
+    stderr(`[RemoteBuddy] ${err.message}`);
+    if (err.showUsage) {
+      stderr(formatUsage(version));
+    }
+    exit(EXIT_USAGE);
+  } else if (err instanceof RemoteBuddyPreflightError) {
+    stderr("[RemoteBuddy] Startup aborted due to preflight failure.");
+    const failure = err.failure;
+    if (failure) {
+      stderr(
+        `[RemoteBuddy] Blocked step ${failure.step} (${failure.category}/${failure.code}): ${failure.detail}`,
+      );
+    }
+    exit(1);
+  } else {
+    const detail =
+      err instanceof Error ? err.stack ?? err.message : String(err);
+    stderr(`[RemoteBuddy] Fatal: ${detail}`);
+    exit(1);
+  }
+}
+
+guardStartupAndLaunchRemoteBuddy().catch((err) => {
+  handleRemoteBuddyStartupError(err);
+});
