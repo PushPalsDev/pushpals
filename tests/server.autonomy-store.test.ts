@@ -9,6 +9,45 @@ function makeStore(): AutonomyStore {
   return store;
 }
 
+function seedObjective(
+  store: AutonomyStore,
+  objectiveId?: string,
+  options?: { status?: string; targetPath?: string },
+): {
+  objectiveId: string;
+  patternKey: string;
+} {
+  const sessionId = "s-autonomy-store-tests";
+  const snapshotId = store.createSnapshot({ sessionId, runId: "run_seed" }).snapshot_id;
+  const id =
+    objectiveId ?? `obj_${Math.random().toString(36).replace(/[^a-z0-9]/gi, "").slice(0, 6)}`;
+  const decision = store.recordObjectiveDecision({
+    runId: `run_${id}`,
+    snapshotId,
+    sessionId,
+    objective: {
+      id,
+      title: `Seed objective ${id}`,
+      instruction: "Seeded objective for PR feedback tests",
+      objective_type: "lint_fix",
+      component_area: "apps/server",
+      trigger_type: "lint_failure",
+      target_paths: [options?.targetPath ?? "apps/server/src/server_main.ts"],
+      scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+      confidence: 0.9,
+      risk_level: "low",
+      expected_validation: ["bun run lint"],
+      status: options?.status ?? "dispatched",
+    },
+  });
+  if (!decision.ok) {
+    throw new Error(
+      `Failed to seed objective ${id}: ${String((decision as { reason?: unknown }).reason ?? "unknown reason")}`,
+    );
+  }
+  return { objectiveId: id, patternKey: decision.patternKey };
+}
+
 afterEach(() => {
   while (stores.length > 0) {
     stores.pop()?.close();
@@ -611,5 +650,256 @@ describe("server AutonomyStore policy gates", () => {
       .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE objective_id = ?`)
       .get("obj_guard") as { count: number };
     expect(after.count).toBe(1);
+  });
+
+  describe("recordPrFeedback", () => {
+    test("stores comments and records negative verdict outcomes", () => {
+      const store = makeStore();
+      const { objectiveId, patternKey } = seedObjective(store, "obj_pr_feedback_negative");
+
+      const result = store.recordPrFeedback({
+        objectiveId,
+        verdict: "rejected_merge_failed",
+        summary: "PR still fails linting",
+        comments: [
+          {
+            body: "Please rerun bun run lint and push the fixes.",
+            userLogin: "maintainer",
+            createdAt: "2026-03-03T10:15:00Z",
+            htmlUrl: "https://example.com/pr/22#comment-1",
+          },
+        ],
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.patternKey).toBe(patternKey);
+      expect(result.success).toBe(false);
+      expect(result.userAction).toBe("rejected");
+
+      const db = (store as unknown as { db: any }).db;
+      const feedbackRow = db
+        .prepare(
+          `SELECT verdict, comment_count, source
+           FROM autonomy_pr_feedback
+           WHERE pattern_key = ?`,
+        )
+        .get(patternKey) as { verdict: string; comment_count: number; source: string } | undefined;
+      expect(feedbackRow?.verdict).toBe("rejected_merge_failed");
+      expect(feedbackRow?.comment_count).toBe(1);
+      expect(feedbackRow?.source).toBe("review_agent");
+
+      const outcomeRow = db
+        .prepare(
+          `SELECT success, user_action
+           FROM autonomy_outcomes
+           WHERE pattern_key = ?
+           ORDER BY id DESC
+           LIMIT 1`,
+        )
+        .get(patternKey) as { success: number; user_action: string } | undefined;
+      expect(outcomeRow?.success).toBe(0);
+      expect(outcomeRow?.user_action).toBe("rejected");
+    });
+
+    test("dedupes repeated feedback keys without inserting duplicates", () => {
+      const store = makeStore();
+      const { objectiveId, patternKey } = seedObjective(store, "obj_pr_feedback_dedupe");
+      const payload = {
+        objectiveId,
+        verdict: "rejected_tests_failed",
+        feedbackKey: "review-agent:pr42",
+      };
+
+      const first = store.recordPrFeedback(payload);
+      expect(first.ok).toBe(true);
+      const second = store.recordPrFeedback(payload);
+      expect(second.ok).toBe(true);
+      expect(second.deduped).toBe(true);
+
+      const db = (store as unknown as { db: any }).db;
+      const feedbackCount = db
+        .prepare(`SELECT COUNT(*) AS count FROM autonomy_pr_feedback WHERE pattern_key = ?`)
+        .get(patternKey) as { count: number };
+      expect(feedbackCount.count).toBe(1);
+
+      const outcomeCount = db
+        .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE pattern_key = ?`)
+        .get(patternKey) as { count: number };
+      expect(outcomeCount.count).toBe(1);
+    });
+
+    test("fails when pattern context cannot be resolved", () => {
+      const store = makeStore();
+      const result = store.recordPrFeedback({
+        verdict: "rejected_merge_conflict",
+      });
+      expect(result.ok).toBe(false);
+      expect(String(result.reason ?? "")).toContain("patternKey");
+    });
+
+    test("maps positive verdicts to accepted outcomes", () => {
+      const store = makeStore();
+      const { objectiveId, patternKey } = seedObjective(store, "obj_pr_feedback_positive", {
+        status: "rejected",
+      });
+
+      const result = store.recordPrFeedback({
+        objectiveId,
+        verdict: "approved_merged",
+        summary: "Looks good to merge",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.success).toBe(true);
+      expect(result.userAction).toBe("accepted");
+
+      const db = (store as unknown as { db: any }).db;
+      const outcomeRow = db
+        .prepare(
+          `SELECT success, user_action
+           FROM autonomy_outcomes
+           WHERE pattern_key = ?
+           ORDER BY id DESC
+           LIMIT 1`,
+        )
+        .get(patternKey) as { success: number; user_action: string } | undefined;
+      expect(outcomeRow?.success).toBe(1);
+      expect(outcomeRow?.user_action).toBe("accepted");
+    });
+
+    test("persists trimmed comments and payload comment counts", () => {
+      const store = makeStore();
+      const { objectiveId, patternKey } = seedObjective(
+        store,
+        "obj_pr_feedback_comments",
+      );
+
+      const longBody = `${"Validation failure ".repeat(80)} still failing`;
+      const result = store.recordPrFeedback({
+        objectiveId,
+        verdict: "rejected_tests_failed",
+        summary: "CI logs attached",
+        commentCount: 5,
+        comments: [
+          {
+            body: longBody,
+            userLogin: "maintainer",
+            createdAt: "2026-03-03T02:00:00Z",
+            htmlUrl: "https://example.com/pr/50#comment-1",
+          },
+          {
+            body: "Second failure reference",
+            userLogin: "maintainer",
+            createdAt: "2026-03-03T02:05:00Z",
+            htmlUrl: "https://example.com/pr/50#comment-2",
+          },
+        ],
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.patternKey).toBe(patternKey);
+
+      const db = (store as unknown as { db: any }).db;
+      const row = db
+        .prepare(
+          `SELECT comment_count, comments_json
+             FROM autonomy_pr_feedback
+             WHERE pattern_key = ?`,
+        )
+        .get(patternKey) as { comment_count: number; comments_json: string | null } | undefined;
+
+      expect(row?.comment_count).toBe(5);
+      expect(row?.comments_json).toBeTruthy();
+      const parsed = JSON.parse(String(row?.comments_json)) as Array<{
+        body: string;
+        user_login: string;
+      }>;
+      expect(parsed).toHaveLength(2);
+      expect(parsed[0].user_login).toBe("maintainer");
+      expect(parsed[0].body.length).toBeLessThanOrEqual(600);
+      expect(parsed[0].body.endsWith("...")).toBe(true);
+      expect(parsed[1].body).toBe("Second failure reference");
+    });
+  });
+
+  describe("PR feedback signals", () => {
+    test("does not emit sig_pr_comment_* when only positive verdict feedback exists", () => {
+      const store = makeStore();
+      const { objectiveId } = seedObjective(store, "obj_pr_feedback_signal_positive", {
+        targetPath: "apps/server/src/signal_positive.ts",
+      });
+
+      const result = store.recordPrFeedback({
+        objectiveId,
+        verdict: "approved_merged",
+        summary: "All checks green",
+        comments: [
+          {
+            body: "Great work!",
+            userLogin: "maintainer",
+            createdAt: "2026-03-03T04:00:00Z",
+            htmlUrl: "https://example.com/pr/77#comment-1",
+          },
+        ],
+      });
+      expect(result.ok).toBe(true);
+
+      const snapshot = store.createSnapshot({ sessionId: "sig_positive" });
+      const commentSignals = snapshot.top_signals.filter((signal) =>
+        signal.signal_id?.startsWith("sig_pr_comment_"),
+      );
+      expect(commentSignals).toHaveLength(0);
+    });
+
+    test("emits sig_pr_comment_* only for negative verdict feedback", () => {
+      const store = makeStore();
+      const { objectiveId: positiveObjectiveId } = seedObjective(
+        store,
+        "obj_pr_feedback_signal_pos",
+        { targetPath: "apps/server/src/signal_pos.ts" },
+      );
+      store.recordPrFeedback({
+        objectiveId: positiveObjectiveId,
+        verdict: "approved_merged",
+        summary: "Ship it",
+      });
+
+      const { objectiveId: negativeObjectiveId } = seedObjective(
+        store,
+        "obj_pr_feedback_signal_neg",
+        { targetPath: "apps/server/src/signal_neg.ts" },
+      );
+      const negativeSummary = "CI still red";
+      store.recordPrFeedback({
+        objectiveId: negativeObjectiveId,
+        verdict: "rejected_ci_failed",
+        summary: negativeSummary,
+        comments: [
+          {
+            body: "Lint fails on worker",
+            userLogin: "maintainer",
+            createdAt: "2026-03-03T05:00:00Z",
+            htmlUrl: "https://example.com/pr/90#comment-1",
+          },
+        ],
+      });
+
+      const snapshot = store.createSnapshot({ sessionId: "sig_negative" });
+      const commentSignals = snapshot.top_signals.filter((signal) =>
+        signal.signal_id?.startsWith("sig_pr_comment_"),
+      );
+      expect(commentSignals.length).toBeGreaterThan(0);
+      expect(
+        commentSignals.every(
+          (signal) =>
+            typeof signal.evidence === "string" && signal.evidence.includes(negativeSummary),
+        ),
+      ).toBe(true);
+      expect(
+        commentSignals.some(
+          (signal) => typeof signal.evidence === "string" && signal.evidence.includes("Ship it"),
+        ),
+      ).toBe(false);
+    });
   });
 });

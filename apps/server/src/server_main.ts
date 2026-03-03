@@ -4,6 +4,7 @@ import { JobQueue } from "./jobs.js";
 import { RequestQueue } from "./requests.js";
 import { CompletionQueue } from "./completions.js";
 import { AutonomyStore } from "./autonomy.js";
+import { handleAutonomyPrFeedbackRequest } from "./autonomy_pr_feedback_handler.js";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import {
@@ -919,37 +920,31 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = autonomyStore.recordPrFeedback(body);
-        if (!result.ok) return makeJson(result, 400);
-
-        const sessionId = compactText(body.sessionId, 128);
-        const session = sessionId ? sessionManager.getSession(sessionId) : null;
-        if (session) {
-          session.emit({
-            protocolVersion: PROTOCOL_VERSION,
-            id: randomUUID(),
-            ts: new Date().toISOString(),
-            sessionId,
-            type: "autonomy_feedback_recorded",
-            from: "server:autonomy",
-            payload: {
-              objectiveId:
-                compactText(body.objectiveId ?? body.objective_id ?? result.objectiveId, 128) ||
-                "unknown",
-              patternKey:
-                compactText(body.patternKey ?? body.pattern_key ?? result.patternKey, 128) ||
-                "unknown",
-              outcome:
-                compactText(body.verdict ?? body.userAction ?? body.user_action ?? "pr_feedback", 120) ||
-                "pr_feedback",
-              success:
-                typeof result.success === "boolean"
-                  ? result.success
-                  : Boolean(body.success),
-            },
-          });
+        const { status, response, event } = handleAutonomyPrFeedbackRequest({
+          body,
+          autonomyStore,
+          compactText,
+        });
+        if (event) {
+          const session = sessionManager.getSession(event.sessionId);
+          if (session) {
+            session.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID(),
+              ts: new Date().toISOString(),
+              sessionId: event.sessionId,
+              type: "autonomy_feedback_recorded",
+              from: "server:autonomy",
+              payload: {
+                objectiveId: event.objectiveId || "unknown",
+                patternKey: event.patternKey || "unknown",
+                outcome: event.outcome || "pr_feedback",
+                success: event.success,
+              },
+            });
+          }
         }
-        return makeJson(result, 200);
+        return makeJson(response, status);
       }
 
       // GET /questions

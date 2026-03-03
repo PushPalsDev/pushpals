@@ -709,12 +709,18 @@ export class AutonomyStore {
       prFeedbackRows = [];
     }
     if (prFeedbackRows.length > 0) {
-      const negativeRows = prFeedbackRows.filter((row) =>
-        isNegativePrFeedbackVerdict(asString(row.verdict)),
-      );
+      const negativeRows = prFeedbackRows
+        .map((row) => {
+          const verdictText = asString(row.verdict);
+          return { row, verdictText };
+        })
+        .filter(
+          (entry) => deriveOutcomeFromPrFeedbackVerdict(entry.verdictText)?.success === false,
+        );
       if (negativeRows.length > 0) {
         const totalComments = negativeRows.reduce(
-          (sum, row) => sum + Math.max(0, Math.floor(asNumber(row.comment_count, 0))),
+          (sum, entry) =>
+            sum + Math.max(0, Math.floor(asNumber(entry.row.comment_count, 0))),
           0,
         );
         const negativeRatio = negativeRows.length / Math.max(1, prFeedbackRows.length);
@@ -730,8 +736,8 @@ export class AutonomyStore {
         });
 
         const byType = new Map<SignalValue["type"], number>();
-        for (const row of negativeRows) {
-          const text = `${asString(row.verdict)} ${asString(row.summary)}`.trim();
+        for (const entry of negativeRows) {
+          const text = `${entry.verdictText} ${asString(entry.row.summary)}`.trim();
           const signalType = normalizeSignalType(text);
           byType.set(signalType, (byType.get(signalType) ?? 0) + 1);
         }
@@ -750,19 +756,19 @@ export class AutonomyStore {
             evidence: `pr feedback ${type} count=${count}`,
           });
         }
-      }
 
-      for (let i = 0; i < Math.min(prFeedbackRows.length, 3); i++) {
-        const row = prFeedbackRows[i];
-        const summary = truncateText(asString(row.summary), 180);
-        if (!summary) continue;
-        const verdict = asString(row.verdict) || "feedback";
-        topSignals.push({
-          signal_id: `sig_pr_comment_${i + 1}`,
-          type: normalizeSignalType(`${verdict} ${summary}`),
-          value: clamp01(0.38 + Math.min(0.28, summary.length / 500)),
-          evidence: `pr ${verdict}: ${summary}`,
-        });
+        for (let i = 0; i < Math.min(negativeRows.length, 3); i++) {
+          const entry = negativeRows[i];
+          const summary = truncateText(asString(entry.row.summary), 180);
+          if (!summary) continue;
+          const verdict = entry.verdictText || "feedback";
+          topSignals.push({
+            signal_id: `sig_pr_comment_${i + 1}`,
+            type: normalizeSignalType(`${verdict} ${summary}`),
+            value: clamp01(0.38 + Math.min(0.28, summary.length / 500)),
+            evidence: `pr ${verdict}: ${summary}`,
+          });
+        }
       }
     }
 

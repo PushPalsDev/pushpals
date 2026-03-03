@@ -1005,6 +1005,10 @@ async function main(): Promise<void> {
         remoteUrl,
         (config.prBaseBranch || integrationBaseBranch).trim(),
         config.authToken,
+        undefined,
+        {
+          commentCycleStatePath: join(config.stateDir, "review_agent_comment_cycles.json"),
+        },
       );
       reviewAgentInstance = reviewAgent;
       console.log(

@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { basename, isAbsolute, join, resolve } from "path";
+import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import {
   addPullRequestComment,
@@ -43,6 +43,16 @@ interface ReviewAgentDeps {
   logInfo: (line: string) => void;
   logWarn: (line: string) => void;
   logError: (line: string) => void;
+}
+
+interface ReviewAgentOptions {
+  commentCycleStatePath?: string;
+}
+
+interface CommentCycleState {
+  anchorIso: string;
+  countedCommentIds: Set<number>;
+  totalCounted: number;
 }
 
 const MAX_DIFF_BYTES = 150_000;
@@ -733,6 +743,9 @@ export class ReviewAgent {
   private reviewed = new Map<number, string>();
   private forceReReview = new Map<number, string>();
   private reReviewEnqueueCounts = new Map<number, number>();
+  private commentCycleState = new Map<string, CommentCycleState>();
+  private commentCycleHeads = new Map<number, string>();
+  private readonly commentCycleStatePath: string;
   private reviewerMd = "";
   private pollInFlight = false;
   private readonly deps: ReviewAgentDeps;
@@ -745,8 +758,85 @@ export class ReviewAgent {
     private prBaseBranch: string,
     private authToken?: string,
     deps?: Partial<ReviewAgentDeps>,
+    options?: ReviewAgentOptions,
   ) {
     this.deps = { ...DEFAULT_DEPS, ...(deps ?? {}) };
+    this.commentCycleStatePath =
+      options?.commentCycleStatePath || join(tmpdir(), "review_agent_comment_cycles.json");
+    this.restoreCommentCycleState();
+  }
+
+  private restoreCommentCycleState(): void {
+    if (!this.commentCycleStatePath) return;
+    try {
+      if (!existsSync(this.commentCycleStatePath)) return;
+      const raw = readFileSync(this.commentCycleStatePath, "utf-8");
+      if (!raw) return;
+      const entries = JSON.parse(raw) as Array<Record<string, unknown>>;
+      if (!Array.isArray(entries)) return;
+      for (const entry of entries) {
+        if (!entry || typeof entry !== "object") continue;
+        const row = entry as Record<string, unknown>;
+        const key = typeof row.key === "string" ? row.key : "";
+        if (!key) continue;
+        const anchorIso =
+          typeof row.anchorIso === "string" && row.anchorIso.length > 0
+            ? row.anchorIso
+            : new Date(this.deps.now()).toISOString();
+        const countedIds = Array.isArray(row.countedCommentIds)
+          ? (row.countedCommentIds as unknown[])
+              .map((id) =>
+                typeof id === "number"
+                  ? Number.isFinite(id)
+                    ? Math.floor(id)
+                    : null
+                  : Number.parseInt(String(id ?? ""), 10),
+              )
+              .filter((value): value is number => Number.isFinite(value))
+          : [];
+        const totalCountRaw =
+          typeof row.totalCounted === "number"
+            ? row.totalCounted
+            : Number.parseInt(String(row.totalCounted ?? ""), 10);
+        const totalCounted = Number.isFinite(totalCountRaw)
+          ? Math.max(0, Math.floor(totalCountRaw))
+          : countedIds.length;
+        const state: CommentCycleState = {
+          anchorIso,
+          countedCommentIds: new Set(countedIds),
+          totalCounted,
+        };
+        this.commentCycleState.set(key, state);
+        const [prNumberText, ...headParts] = key.split(":");
+        const prNumber = Number.parseInt(prNumberText ?? "", 10);
+        const normalizedHead = headParts.join(":");
+        if (Number.isFinite(prNumber) && normalizedHead) {
+          this.commentCycleHeads.set(prNumber, normalizedHead);
+        }
+      }
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Failed to restore comment cycle state from ${this.commentCycleStatePath}: ${err?.message ?? err}`,
+      );
+    }
+  }
+
+  private persistCommentCycleState(): void {
+    if (!this.commentCycleStatePath) return;
+    try {
+      const payload = [...this.commentCycleState.entries()].map(([key, state]) => ({
+        key,
+        anchorIso: state.anchorIso,
+        countedCommentIds: [...state.countedCommentIds],
+        totalCounted: state.totalCounted,
+      }));
+      mkdirSync(dirname(this.commentCycleStatePath), { recursive: true });
+      writeFileSync(this.commentCycleStatePath, JSON.stringify(payload, null, 2));
+    } catch (err: any) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Failed to persist comment cycle state to ${this.commentCycleStatePath}: ${err?.message ?? err}`,
+      );
+    }
   }
 
   requestReReview(prNumber: number, sha: string): void {
@@ -951,6 +1041,7 @@ export class ReviewAgent {
       this.reReviewEnqueueCounts.delete(pr.number);
       this.forceReReview.delete(pr.number);
       this.reviewed.delete(pr.number);
+      this.dropCommentCycleTracking(pr.number);
       const comments = await this.listRecentPrComments(pr.number);
       await this.postAutonomyPrFeedback({
         pr,
@@ -1026,12 +1117,18 @@ export class ReviewAgent {
       pr.number,
       Math.max(MAX_REVIEW_CONTEXT_COMMENTS * 3, maxPrCommentsBeforeGiveUp),
     );
-    if (recentComments.length >= maxPrCommentsBeforeGiveUp) {
+    const relevantCommentCount = this.countRelevantCommentsForCurrentCycle(
+      pr.number,
+      pr.head.sha,
+      recentComments,
+    );
+    if (relevantCommentCount >= maxPrCommentsBeforeGiveUp) {
       return await this.giveUpOnRejectedPr(pr, verdict, {
         jobId,
         sessionId,
         recentComments,
         maxPrCommentsBeforeGiveUp,
+        relevantCommentCount,
       });
     }
 
@@ -1112,10 +1209,11 @@ export class ReviewAgent {
       sessionId: string | null;
       recentComments: PullRequestComment[];
       maxPrCommentsBeforeGiveUp: number;
+      relevantCommentCount: number;
     },
   ): Promise<boolean> {
     this.deps.logWarn(
-      `[${ts()}] [ReviewAgent] PR #${pr.number} reached PR comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}); closing without merge.`,
+      `[${ts()}] [ReviewAgent] PR #${pr.number} reached PR comment cap (${context.relevantCommentCount}/${context.maxPrCommentsBeforeGiveUp}); closing without merge.`,
     );
 
     try {
@@ -1165,6 +1263,7 @@ export class ReviewAgent {
     this.reReviewEnqueueCounts.delete(pr.number);
     this.forceReReview.delete(pr.number);
     this.reviewed.delete(pr.number);
+    this.dropCommentCycleTracking(pr.number);
     return true;
   }
 
@@ -1350,6 +1449,81 @@ export class ReviewAgent {
       );
       return [];
     }
+  }
+
+  private commentCycleKey(prNumber: number, normalizedHead: string): string {
+    return `${prNumber}:${normalizedHead}`;
+  }
+
+  private ensureCommentCycleState(
+    prNumber: number,
+    headSha: string,
+  ): CommentCycleState | null {
+    const normalizedHead = normalizeReviewFixHeadSha(headSha);
+    if (!normalizedHead) return null;
+    const trackedHead = this.commentCycleHeads.get(prNumber);
+    if (trackedHead && trackedHead !== normalizedHead) {
+      this.clearCommentCycleState(prNumber);
+    }
+    this.commentCycleHeads.set(prNumber, normalizedHead);
+    const key = this.commentCycleKey(prNumber, normalizedHead);
+    let state = this.commentCycleState.get(key);
+    if (!state) {
+      state = {
+        anchorIso: new Date(this.deps.now()).toISOString(),
+        countedCommentIds: new Set<number>(),
+        totalCounted: 0,
+      };
+      this.commentCycleState.set(key, state);
+      this.persistCommentCycleState();
+    }
+    return state;
+  }
+
+  private clearCommentCycleState(prNumber: number): void {
+    const prefix = `${prNumber}:`;
+    let removed = false;
+    for (const key of [...this.commentCycleState.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.commentCycleState.delete(key);
+        removed = true;
+      }
+    }
+    if (removed) {
+      this.persistCommentCycleState();
+    }
+  }
+
+  private dropCommentCycleTracking(prNumber: number): void {
+    this.clearCommentCycleState(prNumber);
+    this.commentCycleHeads.delete(prNumber);
+  }
+
+  private countRelevantCommentsForCurrentCycle(
+    prNumber: number,
+    headSha: string,
+    comments: PullRequestComment[],
+  ): number {
+    const state = this.ensureCommentCycleState(prNumber, headSha);
+    if (!state) return 0;
+    const anchorMs = Date.parse(state.anchorIso);
+    let updated = false;
+    for (const comment of comments) {
+      const commentId = Number((comment as { id?: unknown }).id);
+      if (!Number.isFinite(commentId)) continue;
+      if (state.countedCommentIds.has(commentId)) continue;
+      const createdMs = Date.parse(comment.createdAt ?? "");
+      if (Number.isFinite(anchorMs) && Number.isFinite(createdMs) && createdMs < anchorMs) {
+        continue;
+      }
+      state.countedCommentIds.add(Math.floor(commentId));
+      state.totalCounted += 1;
+      updated = true;
+    }
+    if (updated) {
+      this.persistCommentCycleState();
+    }
+    return state.totalCounted;
   }
 
   private async getRecentFeedbackContext(
