@@ -15,6 +15,8 @@ Use this doc when you are staring at Grafana, Alertmanager, or `/system/status` 
 | Worker idle slots per lane | ≥3 interactive, ≥1 background | `/workers`, WorkerPals dashboard, worker logs | Ensures the planner can immediately claim work; anything lower means add capacity or investigate hung workers.
 | Worker error rate (`job_failure_rate`) | ≤0.2 sustained | Grafana › WorkerPals Job Outcomes (`job_failure_rate` panel) | Rising failures reduce effective capacity and precede queue inflation.
 
+RemoteBuddy also pushes a structured `dispatcher_telemetry` session event every 15 s (and on state changes). The payload mirrors the `[dispatcher.telemetry]…` log line but adds `dispatchLatencyMs`/`queueWaitMs` percentiles, the current backpressure code/phase (`active_hold` vs `recovery_pending`), and an `ingestion` block showing whether dispatcher intake is currently throttled, the remaining hold window, and the reason code that triggered it. Events continue on that 15 s cadence even when intake is throttled so dashboards stay fresh during pauses. Subscribe via `/sessions/:id/ws` or pipe the events into Grafana if you need real-time dashboards during a surge.
+
 Always capture Grafana + `/system/status` snapshots before intervening so you can prove whether actions helped and so later handoffs stay grounded in data.
 
 ## Alert Thresholds and Expectations

@@ -21,6 +21,7 @@ import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
+import type { DispatcherBackpressureSignal } from "./dispatcher_telemetry.js";
 
 type AutonomyCandidate = {
   id: string;
@@ -165,6 +166,7 @@ const VISION_DOC_FNAME = "vision.md";
 const MAX_VISION_SECTION_CHARS = 1_200;
 const DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
 const DOCS_WEAK_EVIDENCE_MAX_PENALTY = 0.12;
+const DISPATCHER_BACKPRESSURE_LOG_INTERVAL_MS = 15_000;
 
 export function docsWeakEvidencePenaltyForImpact(
   objectiveType: string,
@@ -353,6 +355,8 @@ export class RemoteBuddyAutonomousEngine {
   private lastOutcome: "none" | "success" | "skipped" | "failed" = "none";
   private lastDetail = "not_started";
   private lastCompletedAtMs = 0;
+  private dispatcherBackpressure: DispatcherBackpressureSignal | null = null;
+  private dispatcherBackpressureLogMs = 0;
 
   constructor(opts: {
     server: string;
@@ -422,6 +426,25 @@ export class RemoteBuddyAutonomousEngine {
     console.log(
       `[RemoteBuddyAutonomousEngine] heartbeat: status=idle last_outcome=${this.lastOutcome} detail=${this.lastDetail} last_tick_age_ms=${lastAgeMs} next_tick_in_ms=${nextTickInMs}`,
     );
+  }
+
+  setDispatcherBackpressure(signal: DispatcherBackpressureSignal | null): void {
+    const previouslyActive = Boolean(this.dispatcherBackpressure?.active);
+    if (signal && signal.active) {
+      this.dispatcherBackpressure = signal;
+      this.dispatcherBackpressureLogMs = 0;
+      if (!previouslyActive) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] dispatcher backpressure enabled: code=${signal.code} reason=${signal.reason}`,
+        );
+      }
+      return;
+    }
+    if (previouslyActive) {
+      console.log("[RemoteBuddyAutonomousEngine] dispatcher backpressure cleared.");
+    }
+    this.dispatcherBackpressure = null;
+    this.dispatcherBackpressureLogMs = 0;
   }
 
   private headers(): Record<string, string> {
@@ -945,6 +968,19 @@ export class RemoteBuddyAutonomousEngine {
 
   async tick(): Promise<void> {
     if (!this.cfg.enabled || this.inFlight) return;
+    if (this.dispatcherBackpressure?.active) {
+      const now = Date.now();
+      if (
+        now - this.dispatcherBackpressureLogMs >= DISPATCHER_BACKPRESSURE_LOG_INTERVAL_MS ||
+        this.dispatcherBackpressureLogMs === 0
+      ) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] tick skipped: dispatcher backpressure active code=${this.dispatcherBackpressure.code} reason=${this.dispatcherBackpressure.reason}`,
+        );
+        this.dispatcherBackpressureLogMs = now;
+      }
+      return;
+    }
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
     this.markTickStart(runId);

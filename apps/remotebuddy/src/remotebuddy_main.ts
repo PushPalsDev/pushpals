@@ -44,6 +44,14 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import {
+  DispatcherBackpressureController,
+  DispatcherIntakeGate,
+  DispatcherTelemetry,
+  type DispatcherBackpressureSignal,
+  type DispatcherTelemetrySnapshot,
+  type DispatcherRequestPriority,
+} from "./dispatcher_telemetry.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -677,6 +685,17 @@ class RemoteBuddyOrchestrator {
   private disposed = false;
   private sessionMonitorWsErrorCount = 0;
   private sessionMonitorFatal = false;
+  private readonly dispatcherTelemetry = new DispatcherTelemetry();
+  private readonly dispatcherBackpressure = new DispatcherBackpressureController();
+  private dispatcherBackpressureSignal: DispatcherBackpressureSignal | null = null;
+  private readonly dispatcherIntakeGate = new DispatcherIntakeGate();
+  private readonly dispatcherTelemetryEmitIntervalMs = 15_000;
+  private readonly dispatcherTelemetryTickIntervalMs = 5_000;
+  private dispatcherTelemetryTicker: ReturnType<typeof setInterval> | null = null;
+  private lastDispatcherTelemetryEmitMs = 0;
+  private readonly dispatcherIntakeBackoffMs = 2_000;
+  private readonly dispatcherIntakeThrottleLogIntervalMs = 5_000;
+  private dispatcherIntakeThrottleLogMs = 0;
 
   /** Serialises async request handling to preserve ordering */
   private chain: Promise<void> = Promise.resolve();
@@ -787,6 +806,8 @@ class RemoteBuddyOrchestrator {
     console.log(
       `[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour} allowDirtyWorktree=${CONFIG.remotebuddy.autonomy.allowDirtyWorktree ? "on" : "off"}`,
     );
+    this.updateDispatcherWorkerStats();
+    this.startDispatcherTelemetryTicker();
   }
 
   async emitStartupStatus(): Promise<void> {
@@ -1388,6 +1409,20 @@ class RemoteBuddyOrchestrator {
     return idle[0] ?? null;
   }
 
+  private startDispatcherTelemetryTicker(): void {
+    if (this.dispatcherTelemetryTicker || this.dispatcherTelemetryTickIntervalMs <= 0) {
+      return;
+    }
+    this.dispatcherTelemetryTicker = setInterval(() => {
+      if (this.disposed) return;
+      try {
+        this.handleDispatcherTelemetry("telemetry_tick");
+      } catch (err) {
+        console.error("[RemoteBuddy] dispatcher telemetry tick failed:", err);
+      }
+    }, this.dispatcherTelemetryTickIntervalMs);
+  }
+
   private async waitForIdleWorker(
     timeoutMs: number,
     preferredWorkerId?: string,
@@ -1410,6 +1445,138 @@ class RemoteBuddyOrchestrator {
       if (idle) return idle;
       if (Date.now() >= deadline) return null;
       await Bun.sleep(500);
+    }
+  }
+
+  private updateDispatcherWorkerStats(): void {
+    this.dispatcherTelemetry.setWorkerPoolStats({
+      managed: this.managedWorkers.size,
+      max: this.maxWorkers,
+    });
+  }
+
+  private handleDispatcherTelemetry(reason: string): void {
+    const snapshot = this.dispatcherTelemetry.snapshot();
+    const evaluation = this.dispatcherBackpressure.evaluate(snapshot);
+    this.dispatcherTelemetry.setBackpressureState(evaluation.state);
+    const emitSnapshot = this.dispatcherTelemetry.snapshot();
+    if (evaluation.changed) {
+      this.applyDispatcherBackpressure(evaluation.signal);
+    } else if (evaluation.state.active && this.dispatcherBackpressureSignal) {
+      if (this.dispatcherBackpressureSignal.phase !== evaluation.state.phase) {
+        this.dispatcherBackpressureSignal = {
+          ...this.dispatcherBackpressureSignal,
+          phase: evaluation.state.phase,
+        };
+      }
+    }
+    if (evaluation.state.active) {
+      const holdMs =
+        evaluation.signal?.intakeHoldMs ??
+        evaluation.state.intakeHoldMs ??
+        this.dispatcherIntakeBackoffMs;
+      this.dispatcherIntakeGate.requestHold(holdMs);
+    } else {
+      this.dispatcherBackpressureSignal = null;
+      this.dispatcherIntakeGate.clear();
+      this.dispatcherIntakeThrottleLogMs = 0;
+    }
+    const now = Date.now();
+    const shouldEmit =
+      evaluation.changed || now - this.lastDispatcherTelemetryEmitMs >= this.dispatcherTelemetryEmitIntervalMs;
+    if (shouldEmit) {
+      this.emitDispatcherTelemetrySnapshot(emitSnapshot, reason, evaluation.event);
+      this.lastDispatcherTelemetryEmitMs = now;
+    }
+  }
+
+  private emitDispatcherTelemetrySnapshot(
+    snapshot: DispatcherTelemetrySnapshot,
+    reason: string,
+    event: "activated" | "cleared" | null,
+  ): void {
+    const throttleActive = this.dispatcherIntakeGate.isHolding();
+    const holdRemainingMs = this.dispatcherIntakeGate.remainingHoldMs();
+    const ingestion = {
+      throttleActive,
+      holdRemainingMs,
+      reasonCode:
+        this.dispatcherBackpressureSignal?.code ??
+        (snapshot.backpressure.active ? snapshot.backpressure.code : null),
+      phase: snapshot.backpressure.phase,
+    };
+    const payload = {
+      ts: new Date().toISOString(),
+      reason,
+      event,
+      queueWaitMs: {
+        sampleCount: snapshot.queueWaitMs.sampleCount,
+        last: snapshot.queueWaitMs.last,
+        avg: snapshot.queueWaitMs.avg,
+        p50: snapshot.queueWaitMs.p50,
+        p95: snapshot.queueWaitMs.p95,
+        min: snapshot.queueWaitMs.min,
+        max: snapshot.queueWaitMs.max,
+      },
+      dispatchLatencyMs: {
+        sampleCount: snapshot.dispatchLatencyMs.sampleCount,
+        last: snapshot.dispatchLatencyMs.last,
+        avg: snapshot.dispatchLatencyMs.avg,
+        p50: snapshot.dispatchLatencyMs.p50,
+        p95: snapshot.dispatchLatencyMs.p95,
+        min: snapshot.dispatchLatencyMs.min,
+        max: snapshot.dispatchLatencyMs.max,
+      },
+      concurrency: snapshot.concurrency,
+      lastPriority: snapshot.lastPriority,
+      backpressure: snapshot.backpressure,
+      ingestion,
+    };
+    const message = `[dispatcher.telemetry] ${JSON.stringify(payload)}`;
+    console.log(`[RemoteBuddy] ${message}`);
+    const level = snapshot.backpressure.active ? "warn" : "info";
+    void this.comm.emit("log", { level, message }).catch(() => {
+      // fire-and-forget
+    });
+    const operatorEvent: "activated" | "cleared" | "steady" = event ?? "steady";
+    void this.comm
+      .emit("dispatcher_telemetry", { ...payload, event: operatorEvent, code: snapshot.backpressure.code })
+      .catch(() => {
+        // fire-and-forget
+      });
+  }
+
+  private applyDispatcherBackpressure(signal: DispatcherBackpressureSignal | null): void {
+    if (!signal || !signal.active) {
+      this.dispatcherBackpressureSignal = null;
+      this.dispatcherIntakeGate.clear();
+      this.dispatcherIntakeThrottleLogMs = 0;
+      this.autonomousEngine.setDispatcherBackpressure(null);
+      return;
+    }
+    this.dispatcherBackpressureSignal = signal;
+    const intakeHoldMs = signal.intakeHoldMs ?? this.dispatcherIntakeBackoffMs;
+    this.dispatcherIntakeGate.requestHold(intakeHoldMs);
+    this.autonomousEngine.setDispatcherBackpressure(signal);
+  }
+
+  private async maybeThrottleDispatcherIntake(): Promise<void> {
+    while (!this.disposed) {
+      const remaining = this.dispatcherIntakeGate.remainingHoldMs();
+      if (remaining <= 0) return;
+      const now = Date.now();
+      if (
+        this.dispatcherBackpressureSignal?.active &&
+        (now - this.dispatcherIntakeThrottleLogMs >= this.dispatcherIntakeThrottleLogIntervalMs ||
+          this.dispatcherIntakeThrottleLogMs === 0)
+      ) {
+        const signal = this.dispatcherBackpressureSignal;
+        console.warn(
+          `[RemoteBuddy] Dispatcher intake throttled: code=${signal?.code ?? "unknown"} phase=${signal?.phase ?? "unknown"} reason=${signal?.reason ?? "unknown"} hold_remaining_ms=${remaining}`,
+        );
+        this.dispatcherIntakeThrottleLogMs = now;
+      }
+      await Bun.sleep(Math.min(remaining, 1_000));
     }
   }
 
@@ -1443,9 +1610,11 @@ class RemoteBuddyOrchestrator {
         stderr: "inherit",
       });
       this.managedWorkers.set(workerId, child);
+       this.updateDispatcherWorkerStats();
       child.exited.then((code) => {
         this.managedWorkers.delete(workerId);
         console.warn(`[RemoteBuddy] WorkerPal process ${workerId} exited with code ${code}`);
+        this.updateDispatcherWorkerStats();
       });
 
       const ready = await this.waitForIdleWorker(this.workerStartupTimeoutMs, workerId);
@@ -1495,25 +1664,35 @@ class RemoteBuddyOrchestrator {
     },
     queueWaitMs = 0,
   ): Promise<void> {
+    const priority = normalizeRequestPriority(request.priority);
+    const dispatcherPriority = priority as DispatcherRequestPriority;
+    this.dispatcherTelemetry.beginDispatch({
+      queueWaitMs,
+      priority: dispatcherPriority,
+    });
+    const dispatchStartedAt = Date.now();
+    const turnId = randomUUID();
     const requestId = String(request.id ?? "").trim();
-    if (!requestId) return;
 
-    if (this.idempotency.hasHandled(this.sessionId, requestId)) {
-      console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
-      return;
-    }
-    this.idempotency.markHandled(this.sessionId, requestId);
+    try {
+      if (!requestId) return;
 
-    const prompt = String(request.prompt ?? "").trim();
-    if (!prompt) {
-      console.warn(`[RemoteBuddy] Request ${requestId} missing prompt; marking failed`);
-      await fetch(`${this.server}/requests/${requestId}/fail`, {
-        method: "POST",
-        headers: this.authHeaders(),
-        body: JSON.stringify({ message: "Request missing prompt" }),
-      }).catch(() => {});
-      return;
-    }
+      if (this.idempotency.hasHandled(this.sessionId, requestId)) {
+        console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
+        return;
+      }
+      this.idempotency.markHandled(this.sessionId, requestId);
+
+      const prompt = String(request.prompt ?? "").trim();
+      if (!prompt) {
+        console.warn(`[RemoteBuddy] Request ${requestId} missing prompt; marking failed`);
+        await fetch(`${this.server}/requests/${requestId}/fail`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          body: JSON.stringify({ message: "Request missing prompt" }),
+        }).catch(() => {});
+        return;
+      }
 
     const reqAny = request as any;
     let forceWorker = Boolean(reqAny.forceWorker ?? reqAny.force_worker);
@@ -1530,7 +1709,6 @@ class RemoteBuddyOrchestrator {
       forceLane = "worker";
     }
 
-    const priority = normalizeRequestPriority(request.priority);
     const queueWaitBudgetMs = Math.max(
       5_000,
       Number.isFinite(Number(request.queueWaitBudgetMs))
@@ -1541,7 +1719,6 @@ class RemoteBuddyOrchestrator {
             ? 240_000
             : 90_000,
     );
-    const turnId = randomUUID();
     const planningContext = this.buildPlanningContext(priority);
     this.rememberPersistentMemory(
       "request",
@@ -1549,7 +1726,6 @@ class RemoteBuddyOrchestrator {
       requestId,
     );
 
-    try {
       console.log(
         `[RemoteBuddy] Planning request ${requestId.slice(0, 8)} priority=${priority} queueWait=${Math.max(
           0,
@@ -1938,6 +2114,9 @@ class RemoteBuddyOrchestrator {
           detail: String(err),
         }),
       }).catch(() => {});
+    } finally {
+      this.dispatcherTelemetry.completeDispatch(Date.now() - dispatchStartedAt);
+      this.handleDispatcherTelemetry("request_completed");
     }
   }
 
@@ -1946,6 +2125,7 @@ class RemoteBuddyOrchestrator {
     console.log(`[RemoteBuddy] Starting polling loop (every ${pollMs}ms)`);
 
     while (!this.disposed) {
+      await this.maybeThrottleDispatcherIntake();
       try {
         const res = await fetch(`${this.server}/requests/claim`, {
           method: "POST",
@@ -1976,6 +2156,7 @@ class RemoteBuddyOrchestrator {
               }`,
             );
             // Serialize processing
+            this.dispatcherTelemetry.incrementPending();
             this.chain = this.chain
               .then(() => this.processRequest(data.request!, Number(data.queueWaitMs ?? 0)))
               .catch((err) => console.error("[RemoteBuddy] Process error:", err));
@@ -2006,6 +2187,10 @@ class RemoteBuddyOrchestrator {
       clearInterval(this.statusHeartbeatTimer);
       this.statusHeartbeatTimer = null;
     }
+    if (this.dispatcherTelemetryTicker) {
+      clearInterval(this.dispatcherTelemetryTicker);
+      this.dispatcherTelemetryTicker = null;
+    }
     void this.comm.status(this.agentId, "shutting_down", "RemoteBuddy shutting down");
     if (this.stopSessionEvents) {
       try {
@@ -2023,6 +2208,7 @@ class RemoteBuddyOrchestrator {
       }
       this.managedWorkers.delete(workerId);
     }
+    this.updateDispatcherWorkerStats();
     if (this.jobsDb) {
       try {
         this.jobsDb.close();

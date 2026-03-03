@@ -13,6 +13,11 @@ import {
   type StartupTelemetryPhaseEvent,
   type StartupTelemetryUnknownFailureEvent,
 } from "./checklist.js";
+import {
+  DispatcherBackpressureController,
+  DispatcherIntakeGate,
+  DispatcherTelemetry,
+} from "../dispatcher_telemetry.js";
 
 const cleanRepo = (): RepoStatus => ({
   isDirty: false,
@@ -703,5 +708,133 @@ describe("StartupChecklist", () => {
     expect(dispatchLog?.error?.message).toContain("dispatch pipeline offline");
     expect(dispatchLog?.startedAtMs).toBeLessThanOrEqual(dispatchLog!.endedAtMs);
     expect(dispatchLog?.durationMs).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("DispatcherTelemetry", () => {
+  test("tracks queue wait percentiles and concurrency state", () => {
+    const telemetry = new DispatcherTelemetry({ queueWindowSize: 5, dispatchWindowSize: 5 });
+    telemetry.setWorkerPoolStats({ managed: 2, max: 6 });
+
+    const addSample = (queueWaitMs: number, latencyMs: number) => {
+      telemetry.incrementPending();
+      telemetry.beginDispatch({ queueWaitMs, priority: "normal" });
+      telemetry.completeDispatch(latencyMs);
+    };
+
+    addSample(500, 200);
+    addSample(1500, 400);
+
+    const snapshot = telemetry.snapshot();
+    expect(snapshot.queueWaitMs.sampleCount).toBe(2);
+    expect(snapshot.queueWaitMs.totalSamples).toBe(2);
+    expect(snapshot.queueWaitMs.p95).toBe(1500);
+    expect(snapshot.dispatchLatencyMs.avg).toBe(300);
+    expect(snapshot.concurrency.pending).toBe(0);
+    expect(snapshot.concurrency.managedWorkers).toBe(2);
+    expect(snapshot.lastPriority).toBe("normal");
+  });
+});
+
+describe("DispatcherBackpressureController", () => {
+  const recordSample = (telemetry: DispatcherTelemetry, latencyMs: number) => {
+    telemetry.incrementPending();
+    telemetry.beginDispatch({ queueWaitMs: 0, priority: "normal" });
+    telemetry.completeDispatch(latencyMs);
+  };
+
+  const buildTelemetry = (samples: number[]): DispatcherTelemetry => {
+    const telemetry = new DispatcherTelemetry({ queueWindowSize: 10, dispatchWindowSize: 10 });
+    samples.forEach((value) => recordSample(telemetry, value));
+    return telemetry;
+  };
+
+  test("activates on dispatch latency spikes, holds intake, and clears after recovery", () => {
+    const controller = new DispatcherBackpressureController({
+      triggerP95Ms: 1500,
+      releaseP95Ms: 900,
+      minHoldMs: 500,
+      minSamples: 3,
+    });
+
+    const hotTelemetry = buildTelemetry([1600, 1700, 1900]);
+    const hotEval = controller.evaluate(hotTelemetry.snapshot(), 0);
+    expect(hotEval.changed).toBe(true);
+    expect(hotEval.state.active).toBe(true);
+    expect(hotEval.state.phase).toBe("active_hold");
+    expect(hotEval.signal?.phase).toBe("active_hold");
+    expect(hotEval.signal?.intakeHoldMs).toBeGreaterThanOrEqual(1000);
+    expect(hotEval.signal?.intakeHoldMs).toBeLessThanOrEqual(2000);
+
+    const duringHold = controller.evaluate(hotTelemetry.snapshot(), 400);
+    expect(duringHold.state.active).toBe(true);
+    expect(duringHold.state.phase).toBe("active_hold");
+
+    const coolTelemetry = buildTelemetry([200, 300, 320, 450]);
+    const clearedEval = controller.evaluate(coolTelemetry.snapshot(), 1_200);
+    expect(clearedEval.event).toBe("cleared");
+    expect(clearedEval.signal?.active).toBe(false);
+    expect(clearedEval.state.active).toBe(false);
+    expect(clearedEval.state.phase).toBe("inactive");
+  });
+
+  test("remains in recovery pending until latency cools", () => {
+    const controller = new DispatcherBackpressureController({
+      triggerP95Ms: 1500,
+      releaseP95Ms: 900,
+      minHoldMs: 500,
+      minSamples: 4,
+    });
+
+    const hotTelemetry = buildTelemetry([1500, 1700, 1850, 2100]);
+    controller.evaluate(hotTelemetry.snapshot(), 0);
+
+    const postHoldEval = controller.evaluate(hotTelemetry.snapshot(), 1_200);
+    expect(postHoldEval.state.active).toBe(true);
+    expect(postHoldEval.state.phase).toBe("recovery_pending");
+    expect(postHoldEval.event).toBeNull();
+
+    const coolTelemetry = buildTelemetry([250, 300, 350, 400]);
+    const clearedEval = controller.evaluate(coolTelemetry.snapshot(), 1_400);
+    expect(clearedEval.event).toBe("cleared");
+    expect(clearedEval.state.active).toBe(false);
+  });
+
+  test("requires fresh samples before re-activation", () => {
+    const controller = new DispatcherBackpressureController({
+      triggerP95Ms: 1500,
+      releaseP95Ms: 900,
+      minHoldMs: 500,
+      minSamples: 4,
+    });
+
+    const hotTelemetry = buildTelemetry([1600, 1700, 2000, 2100]);
+    controller.evaluate(hotTelemetry.snapshot(), 0);
+
+    const coolTelemetry = buildTelemetry([200, 220, 240, 260]);
+    controller.evaluate(coolTelemetry.snapshot(), 1_300);
+
+    const staleEval = controller.evaluate(hotTelemetry.snapshot(), 1_500);
+    expect(staleEval.state.active).toBe(false);
+
+    recordSample(hotTelemetry, 2200);
+    const reactivated = controller.evaluate(hotTelemetry.snapshot(), 1_600);
+    expect(reactivated.changed).toBe(true);
+    expect(reactivated.state.active).toBe(true);
+  });
+});
+
+describe("DispatcherIntakeGate", () => {
+  test("extends holds and reports remaining ms", () => {
+    const gate = new DispatcherIntakeGate();
+    expect(gate.isHolding()).toBe(false);
+    gate.requestHold(500, 0);
+    expect(gate.isHolding(100)).toBe(true);
+    expect(gate.remainingHoldMs(200)).toBe(300);
+    gate.requestHold(400, 250);
+    expect(gate.remainingHoldMs(400)).toBe(250);
+    gate.clear();
+    expect(gate.isHolding()).toBe(false);
+    expect(gate.remainingHoldMs()).toBe(0);
   });
 });
