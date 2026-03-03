@@ -28,6 +28,16 @@ const baseConfig: ReviewAgentConfig = {
   codexTimeoutMs: 30_000,
 };
 
+type TestFeedbackPayload = {
+  verdict?: string;
+  commentContext?: {
+    countSource?: string;
+    rejectionAttempts?: number;
+  };
+  metrics?: Record<string, number>;
+  [key: string]: unknown;
+};
+
 function makePr(overrides: Partial<GitHubPR> = {}): GitHubPR {
   return {
     number: 42,
@@ -196,7 +206,7 @@ describe("ReviewAgent", () => {
     let reviewCalls = 0;
 
     const agent = new ReviewAgent(
-      { ...baseConfig, passThreshold: 8.5 },
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 600 },
       "http://localhost:3001",
       "token",
       "https://github.com/org/repo.git",
@@ -519,7 +529,7 @@ describe("ReviewAgent", () => {
     let jobEnqueueCalls = 0;
 
     const agent = new ReviewAgent(
-      { ...baseConfig, passThreshold: 8.5 },
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 600 },
       "http://localhost:3001",
       "token",
       "https://github.com/org/repo.git",
@@ -1689,6 +1699,255 @@ describe("ReviewAgent", () => {
     expect(deleteCalls).toBe(1);
     expect(deletedBranchRef).toBe(pr.head.ref);
     expect(enqueueCalls).toBe(0);
+  });
+
+  test("falls back to internal rejection count when GitHub comments are unavailable", async () => {
+    const pr = makePr({ number: 90, html_url: "https://example.com/pr/90" });
+    const postedComments: string[] = [];
+    const closedPrs: number[] = [];
+    let deleteCalls = 0;
+    let enqueueCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.2,
+            summary: "Needs edge cases",
+            issues: ["Add coverage for failure branches"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async ({ body }) => {
+          postedComments.push(body);
+        },
+        listPullRequestComments: async () => {
+          throw new Error("github identity scope missing");
+        },
+        closePullRequest: async (opts) => {
+          closedPrs.push(opts.prNumber);
+          return { closed: true, state: "closed" };
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/jobs/enqueue")) enqueueCalls += 1;
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      },
+    );
+
+    await agent.poll();
+    agent.requestReReview(pr.number, pr.head.sha);
+    await agent.poll();
+    agent.requestReReview(pr.number, pr.head.sha);
+    await agent.poll();
+
+    expect(closedPrs).toEqual([pr.number]);
+    expect(deleteCalls).toBe(1);
+    expect(
+      postedComments.filter((body) => body.includes("Changes Rejected (score")),
+    ).toHaveLength(2);
+    expect(
+      postedComments.filter((body) => body.includes("PR Closed Without Merge")),
+    ).toHaveLength(1);
+    expect(enqueueCalls).toBe(2);
+  });
+
+  test("isolates fallback comment counts per PR to prevent spoofing other PRs", async () => {
+    const prA = makePr({ number: 91, html_url: "https://example.com/pr/91" });
+    const prB = makePr({
+      number: 92,
+      html_url: "https://example.com/pr/92",
+      head: { ...prA.head, ref: "agent/other-branch" },
+    });
+    const closedPrs: number[] = [];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [prA, prB],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 6.8,
+            summary: "Major gaps remain",
+            issues: ["Fix negative-path handling"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        listPullRequestComments: async () => {
+          throw new Error("github identity scope missing");
+        },
+        closePullRequest: async (opts) => {
+          closedPrs.push(opts.prNumber);
+          return { closed: true, state: "closed" };
+        },
+        deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
+        fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+      },
+    );
+
+    await agent.poll();
+    agent.requestReReview(prA.number, prA.head.sha);
+    agent.requestReReview(prB.number, prB.head.sha);
+    await agent.poll();
+
+    expect(closedPrs).toEqual([prA.number, prB.number]);
+  });
+
+  test("retries closing the PR when GitHub close requests fail", async () => {
+    const pr = makePr({ number: 93, html_url: "https://example.com/pr/93" });
+    const comments = [
+      {
+        id: 1,
+        body: "Existing review feedback",
+        userLogin: "reviewer-a",
+        createdAt: new Date().toISOString(),
+        htmlUrl: "https://example.com/comment/1",
+      },
+    ];
+    let closeAttempts = 0;
+    const postedBodies: string[] = [];
+    let deleteCalls = 0;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 1 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.0,
+            summary: "Missing coverage",
+            issues: ["Add regression tests"],
+            fix_instruction: "",
+          }),
+        listPullRequestComments: async () => comments,
+        closePullRequest: async () => {
+          closeAttempts += 1;
+          if (closeAttempts === 1) {
+            return { closed: false, state: "open" };
+          }
+          return { closed: true, state: "closed" };
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+        addPullRequestComment: async ({ body }) => {
+          postedBodies.push(body);
+        },
+        fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+      },
+    );
+
+    await agent.poll();
+    await agent.poll();
+
+    expect(closeAttempts).toBe(2);
+    expect(deleteCalls).toBe(1);
+    expect(postedBodies).toHaveLength(1);
+    expect(postedBodies[0]).toContain("PR Closed Without Merge");
+  });
+
+  test("closes PR deterministically when identity lookups and comment posts fail", async () => {
+    const pr = makePr({
+      number: 94,
+      html_url: "https://example.com/pr/94",
+      body: "<!-- pushpals-jobId: job-94 -->",
+    });
+    const closedPrs: number[] = [];
+    let deleteCalls = 0;
+    const feedbackPayloads: TestFeedbackPayload[] = [];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.1,
+            summary: "Needs more regression coverage",
+            issues: ["Expand tests for timeout flow"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async ({ body }) => {
+          if (body.includes("PR Closed Without Merge")) return;
+          throw new Error("github identity scope missing");
+        },
+        listPullRequestComments: async () => {
+          throw new Error("github identity scope missing");
+        },
+        closePullRequest: async (opts) => {
+          closedPrs.push(opts.prNumber);
+          return { state: "closed", closed: true };
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (url.endsWith("/autonomy/pr-feedback")) {
+            const payload = JSON.parse(String(init?.body ?? "{}")) as TestFeedbackPayload;
+            feedbackPayloads.push(payload);
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      },
+    );
+
+    await agent.poll();
+    agent.requestReReview(pr.number, pr.head.sha);
+    await agent.poll();
+
+    expect(closedPrs).toEqual([pr.number]);
+    expect(deleteCalls).toBe(1);
+
+    const rejectionPayload = feedbackPayloads.find((payload) => payload.verdict === "rejected");
+    expect(rejectionPayload?.commentContext?.countSource).toBe("identity_scope");
+    expect(rejectionPayload?.commentContext?.rejectionAttempts).toBe(1);
+    expect(rejectionPayload?.metrics?.reviewAgentCommentIdentityScopeMissing).toBe(1);
+    expect(rejectionPayload?.metrics?.reviewAgentRejectionAttempts).toBe(1);
+
+    const capPayload = feedbackPayloads.find(
+      (payload) => payload.verdict === "rejected_comment_cap_closed",
+    );
+    expect(capPayload?.commentContext?.countSource).toBe("identity_scope");
+    expect(capPayload?.commentContext?.rejectionAttempts).toBe(2);
+    expect(capPayload?.metrics?.reviewAgentCommentIdentityScopeMissing).toBe(1);
+    expect(capPayload?.metrics?.reviewAgentRejectionAttempts).toBe(2);
   });
 
   test("continues enqueue flow when PR feedback comment lookup fails", async () => {

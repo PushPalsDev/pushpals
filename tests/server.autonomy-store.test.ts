@@ -611,6 +611,78 @@ describe("server AutonomyStore policy gates", () => {
     expect(rows[1]?.id).toBe("run_b:cand_shared");
   });
 
+  test("recordPrFeedback marks unknown verdicts with structured status", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1" }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_verdict_unknown",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_verdict_unknown",
+        title: "Seed objective for verdict test",
+        instruction: "noop",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const result = store.recordPrFeedback({
+      patternKey: decision.patternKey,
+      verdict: "mysterious_signal",
+      summary: "New verdict not yet mapped",
+      commentCount: 0,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.verdictStatus).toBe("unknown");
+    expect(result.metrics?.prFeedbackUnknownVerdict).toBe(1);
+
+    const db = (store as unknown as { db: any }).db;
+    const row = db
+      .prepare(
+        `SELECT verdict_status
+         FROM autonomy_pr_feedback
+         WHERE pattern_key = ?
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      )
+      .get(decision.patternKey) as { verdict_status: string } | undefined;
+    expect(row?.verdict_status).toBe("unknown");
+  });
+
+  test("recordPrFeedback tolerates missing jobs table when only prUrl is provided", () => {
+    const store = makeStore();
+    const result = store.recordPrFeedback({
+      verdict: "rejected_due_to_signal",
+      prUrl: "https://github.com/org/repo/pull/123",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(String(result.reason ?? "")).toContain("patternKey");
+  });
+
+  test("recordPrFeedback tolerates missing jobs.prUrl column when jobs table exists", () => {
+    const store = makeStore();
+    const db = (store as unknown as { db: any }).db;
+    db.exec(`DROP TABLE IF EXISTS jobs; CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT);`);
+    const result = store.recordPrFeedback({
+      verdict: "rejected_due_to_signal",
+      prUrl: "https://github.com/org/repo/pull/456",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(String(result.reason ?? "")).toContain("patternKey");
+  });
+
   test("ignores autonomy accepted outcomes before any worker job is linked", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_guard" }).snapshot_id;

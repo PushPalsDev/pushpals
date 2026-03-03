@@ -155,65 +155,38 @@ const TRIGGER_TYPES = new Set<SignalValue["type"]>([
 ]);
 const RECENT_SUCCESS_SUPPRESSION_WINDOW_HOURS = 24;
 
-export type PrFeedbackVerdict =
-  | "approved_merged"
-  | "approved_unmergeable"
-  | "rejected"
-  | "rejected_comment_cap_closed";
-
-const PR_FEEDBACK_VERDICTS = new Set<PrFeedbackVerdict>([
-  "approved_merged",
-  "approved_unmergeable",
-  "rejected",
-  "rejected_comment_cap_closed",
-]);
-
-const NEGATIVE_PR_FEEDBACK_VERDICTS = new Set<PrFeedbackVerdict>([
-  "approved_unmergeable",
-  "rejected",
-  "rejected_comment_cap_closed",
-]);
-
-const PR_FEEDBACK_VERDICT_OUTCOMES: Record<
-  PrFeedbackVerdict,
-  { success: boolean; userAction: string; reopenedWithin24h: boolean; regressionFlag: boolean }
-> = {
-  approved_merged: {
-    success: true,
-    userAction: "accepted",
-    reopenedWithin24h: false,
-    regressionFlag: false,
-  },
-  approved_unmergeable: {
-    success: false,
-    userAction: "merge_conflict",
-    reopenedWithin24h: true,
-    regressionFlag: true,
-  },
-  rejected: {
-    success: false,
-    userAction: "rejected",
-    reopenedWithin24h: true,
-    regressionFlag: true,
-  },
-  rejected_comment_cap_closed: {
-    success: false,
-    userAction: "comment_cap_closed",
-    reopenedWithin24h: true,
-    regressionFlag: true,
-  },
-};
-
-export function normalizePrFeedbackVerdict(verdict: unknown): PrFeedbackVerdict | null {
-  if (typeof verdict !== "string") return null;
-  const normalized = verdict.trim().toLowerCase() as PrFeedbackVerdict;
-  return PR_FEEDBACK_VERDICTS.has(normalized) ? normalized : null;
+function isNegativePrFeedbackVerdict(value: string): boolean {
+  const text = value.toLowerCase();
+  return (
+    text.includes("reject") ||
+    text.includes("unmergeable") ||
+    text.includes("merge_conflict") ||
+    text.includes("merge_failed") ||
+    text.includes("failed")
+  );
 }
 
-export function isNegativePrFeedbackVerdict(verdict: string | null): boolean {
-  const normalized = normalizePrFeedbackVerdict(verdict);
-  if (!normalized) return false;
-  return NEGATIVE_PR_FEEDBACK_VERDICTS.has(normalized);
+function deriveOutcomeFromPrFeedbackVerdict(
+  verdict: string,
+): { success: boolean; userAction: string; reopenedWithin24h: boolean; regressionFlag: boolean } | null {
+  const text = verdict.toLowerCase();
+  if (isNegativePrFeedbackVerdict(text)) {
+    return {
+      success: false,
+      userAction: "rejected",
+      reopenedWithin24h: true,
+      regressionFlag: true,
+    };
+  }
+  if (text.includes("approved") || text.includes("merged")) {
+    return {
+      success: true,
+      userAction: "accepted",
+      reopenedWithin24h: false,
+      regressionFlag: false,
+    };
+  }
+  return null;
 }
 
 export interface AutonomySnapshot {
@@ -461,6 +434,8 @@ export class AutonomyStore {
     return loadPushPalsConfig();
   }
   private readonly alpha = 0.2;
+  private jobsTableChecked = false;
+  private jobsTableExists = false;
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -574,6 +549,7 @@ export class AutonomyStore {
         pr_number INTEGER,
         pr_url TEXT,
         verdict TEXT NOT NULL,
+        verdict_status TEXT NOT NULL DEFAULT 'handled',
         review_score REAL,
         review_threshold REAL,
         summary TEXT,
@@ -633,6 +609,15 @@ export class AutonomyStore {
         updated_at TEXT NOT NULL
       );
     `);
+    try {
+      this.db.exec(
+        `ALTER TABLE autonomy_pr_feedback ADD COLUMN verdict_status TEXT NOT NULL DEFAULT 'handled';`,
+      );
+    } catch (err) {
+      if (!this.isDuplicateColumnError(err)) {
+        throw err;
+      }
+    }
   }
 
   private getDispatchCountsLastHour(nowIso: string): {
@@ -1939,27 +1924,37 @@ export class AutonomyStore {
           }
         | undefined;
 
-    const readByPrUrl = (url: string) =>
-      this.db
-        .prepare(
-          `SELECT o.id AS objectiveId,
-                  o.request_id AS requestId,
-                  o.job_id AS jobId,
-                  o.pattern_key AS patternKey
-           FROM autonomy_objectives o
-           JOIN jobs j ON j.id = o.job_id
-           WHERE j.prUrl = ? OR LOWER(j.prUrl) = LOWER(?)
-           ORDER BY o.updated_at DESC
-           LIMIT 1`,
-        )
-        .get(url, url) as
-        | {
-            objectiveId: string | null;
-            requestId: string | null;
-            jobId: string | null;
-            patternKey: string | null;
-          }
-        | undefined;
+    const readByPrUrl = (url: string) => {
+      if (!this.ensureJobsTableAvailable()) return undefined;
+      try {
+        return this.db
+          .prepare(
+            `SELECT o.id AS objectiveId,
+                    o.request_id AS requestId,
+                    o.job_id AS jobId,
+                    o.pattern_key AS patternKey
+             FROM autonomy_objectives o
+             JOIN jobs j ON j.id = o.job_id
+             WHERE j.prUrl = ? OR LOWER(j.prUrl) = LOWER(?)
+             ORDER BY o.updated_at DESC
+             LIMIT 1`,
+          )
+          .get(url, url) as
+          | {
+              objectiveId: string | null;
+              requestId: string | null;
+              jobId: string | null;
+              patternKey: string | null;
+            }
+          | undefined;
+      } catch (err) {
+        if (this.isJobsTableUnavailableError(err)) {
+          this.markJobsTableMissing();
+          return undefined;
+        }
+        throw err;
+      }
+    };
 
     const row =
       (objectiveId ? readByObjective(objectiveId) : undefined) ??
@@ -1976,6 +1971,60 @@ export class AutonomyStore {
     };
   }
 
+  private ensureJobsTableAvailable(): boolean {
+    if (this.jobsTableExists) return true;
+    if (this.jobsTableChecked && !this.jobsTableExists) return false;
+    try {
+      const table = this.db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'jobs' LIMIT 1`)
+        .get() as { name?: string } | undefined;
+      if (!table?.name) {
+        this.jobsTableExists = false;
+      } else {
+        const column = this.db
+          .prepare(
+            `SELECT name FROM pragma_table_info('jobs') WHERE LOWER(name) = 'prurl' LIMIT 1`,
+          )
+          .get() as { name?: string } | undefined;
+        this.jobsTableExists = Boolean(column?.name);
+      }
+    } catch (err) {
+      console.warn(
+        `[AutonomyStore] Jobs table availability check failed: ${
+          (err as { message?: unknown })?.message ?? err
+        }`,
+      );
+      this.jobsTableExists = false;
+    }
+    this.jobsTableChecked = true;
+    return this.jobsTableExists;
+  }
+
+  private markJobsTableMissing(): void {
+    this.jobsTableExists = false;
+    this.jobsTableChecked = true;
+  }
+
+  private isJobsTableUnavailableError(error: unknown): boolean {
+    const message = String((error as { message?: unknown })?.message ?? error ?? "").toLowerCase();
+    if (!message) return false;
+    if (message.includes("no such table") && message.includes("jobs")) {
+      return true;
+    }
+    if (
+      (message.includes("no such column") || message.includes("has no column")) &&
+      message.includes("prurl")
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  private isDuplicateColumnError(error: unknown): boolean {
+    const message = String((error as { message?: unknown })?.message ?? error ?? "").toLowerCase();
+    return message.includes("duplicate column name") || message.includes("already exists");
+  }
+
   recordPrFeedback(body: Record<string, unknown>): {
     ok: boolean;
     reason?: string;
@@ -1984,14 +2033,12 @@ export class AutonomyStore {
     deduped?: boolean;
     success?: boolean;
     userAction?: string;
-    rawVerdict?: string;
-    normalizedVerdict?: PrFeedbackVerdict | null;
+    verdictStatus?: "handled" | "unknown";
+    metrics?: Record<string, number>;
   } {
     const now = asIsoNow();
-    const rawVerdict = asString(body.verdict);
-    if (!rawVerdict) return { ok: false, reason: "verdict is required" };
-    const normalizedVerdict = normalizePrFeedbackVerdict(rawVerdict);
-    const verdict = rawVerdict.toLowerCase();
+    const verdict = asString(body.verdict).toLowerCase();
+    if (!verdict) return { ok: false, reason: "verdict is required" };
 
     const feedbackKey = asString(body.feedbackKey ?? body.feedback_key) || null;
     const objectiveIdRaw = asString(body.objectiveId ?? body.objective_id) || null;
@@ -2071,12 +2118,15 @@ export class AutonomyStore {
       : 0;
     const commentCount = Math.max(payloadCommentCount, comments.length);
 
+    const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
+    const verdictStatus: "handled" | "unknown" = mappedOutcome ? "handled" : "unknown";
+
     const insertInfo = this.db
       .prepare(
         `INSERT OR IGNORE INTO autonomy_pr_feedback (
           feedback_key, objective_id, request_id, job_id, pattern_key, pr_number, pr_url,
-          verdict, review_score, review_threshold, summary, comment_count, comments_json, source, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          verdict, verdict_status, review_score, review_threshold, summary, comment_count, comments_json, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         feedbackKey,
@@ -2087,6 +2137,7 @@ export class AutonomyStore {
         prNumber,
         prUrl,
         verdict,
+        verdictStatus,
         reviewScore,
         reviewThreshold,
         summary || null,
@@ -2096,27 +2147,24 @@ export class AutonomyStore {
         now,
       );
     const inserted = Number(insertInfo.changes ?? 0) > 0;
-    const contextFields = {
-      patternKey,
-      ...(objectiveId ? { objectiveId } : {}),
-      rawVerdict,
-      normalizedVerdict,
-    };
     if (!inserted) {
       return {
         ok: true,
         deduped: true,
-        ...contextFields,
+        patternKey,
+        ...(objectiveId ? { objectiveId } : {}),
+        verdictStatus,
       };
     }
 
-    const mappedOutcome = normalizedVerdict
-      ? PR_FEEDBACK_VERDICT_OUTCOMES[normalizedVerdict]
-      : null;
     if (!mappedOutcome) {
+      this.logUnknownPrFeedbackVerdict(verdict, patternKey);
       return {
         ok: true,
-        ...contextFields,
+        patternKey,
+        ...(objectiveId ? { objectiveId } : {}),
+        verdictStatus,
+        metrics: { prFeedbackUnknownVerdict: 1 },
       };
     }
 
@@ -2136,13 +2184,16 @@ export class AutonomyStore {
       return {
         ok: false,
         reason: outcome.reason,
+        verdictStatus,
       };
     }
     return {
       ok: true,
-      ...contextFields,
+      patternKey,
+      ...(objectiveId ? { objectiveId } : {}),
       success: mappedOutcome.success,
       userAction: mappedOutcome.userAction,
+      verdictStatus,
     };
   }
 
@@ -2293,6 +2344,11 @@ export class AutonomyStore {
         now,
       );
     return { ok: true };
+  }
+
+  private logUnknownPrFeedbackVerdict(verdict: string, patternKey: string | null): void {
+    const suffix = patternKey ? ` (patternKey=${patternKey})` : "";
+    console.warn(`[AutonomyStore] Unknown PR feedback verdict: ${verdict}${suffix}`);
   }
 
   listQuestions(params?: {
