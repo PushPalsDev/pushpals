@@ -159,16 +159,56 @@ function isCodexUnavailableFailureSignal(message: string, detail: string): boole
   ].some((needle) => text.includes(needle));
 }
 
-type TaskExecutionLane = "deterministic" | "worker";
-type RequestPriority = "interactive" | "normal" | "background";
-type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
-type PlannerRisk = "low" | "medium" | "high";
+export type TaskExecutionLane = "deterministic" | "worker";
+export type RequestPriority = "interactive" | "normal" | "background";
+export type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
+export type PlannerRisk = "low" | "medium" | "high";
+export type TaskExecuteJobOrigin = "user" | "autonomy";
 
-interface TaskExecuteJobParams {
+export interface TaskExecuteScope {
+  readAnywhere: boolean;
+  writeAllowed: boolean;
+  writeGlobs?: string[];
+  forbiddenGlobs?: string[];
+  maxFilesToEdit?: number;
+}
+
+export interface TaskExecuteDiscovery {
+  ripgrepQueries: string[];
+  likelyDirs?: string[];
+  keywords?: string[];
+}
+
+export interface TaskExecutePlanning {
+  intent: PlannerIntent;
+  riskLevel: PlannerRisk;
+  targetPaths?: string[];
+  scope: TaskExecuteScope;
+  discovery?: TaskExecuteDiscovery;
+  acceptanceCriteria: string[];
+  validationSteps: string[];
+  queuePriority: RequestPriority;
+  queueWaitBudgetMs: number;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+}
+
+export interface TaskExecuteAutonomyMetadata {
+  origin: "autonomy";
+  objectiveId?: string;
+  runId?: string;
+  snapshotId?: string;
+  patternKey?: string;
+  componentArea?: string;
+  targetPaths: string[];
+  writeGlobs: string[];
+}
+
+export interface TaskExecuteJobParams {
   schemaVersion: 2;
   requestId: string;
   sessionId: string;
-  origin?: "user" | "autonomy";
+  origin: TaskExecuteJobOrigin;
   autonomy?: {
     origin: "autonomy";
     objectiveId?: string;
@@ -181,44 +221,200 @@ interface TaskExecuteJobParams {
   plannerWorkerInstruction?: string;
   lane: TaskExecutionLane;
   paths?: string[];
-  planning: {
-    intent: PlannerIntent;
-    riskLevel: PlannerRisk;
-    targetPaths?: string[];
-    scope: {
-      readAnywhere: boolean;
-      writeAllowed: boolean;
-      writeGlobs?: string[];
-      forbiddenGlobs?: string[];
-      maxFilesToEdit?: number;
-    };
-    discovery?: {
-      ripgrepQueries: string[];
-      likelyDirs?: string[];
-      keywords?: string[];
-    };
-    acceptanceCriteria: string[];
-    validationSteps: string[];
-    queuePriority: RequestPriority;
-    queueWaitBudgetMs: number;
-    executionBudgetMs: number;
-    finalizationBudgetMs: number;
-  };
+  planning: TaskExecutePlanning;
   targetPath?: string;
   recentContext: string[];
   recentJobs: Array<Record<string, unknown>>;
 }
 
-type RequestAutonomyMetadata = {
-  origin: "autonomy";
-  objectiveId?: string;
-  runId?: string;
-  snapshotId?: string;
-  patternKey?: string;
-  componentArea?: string;
-  targetPaths: string[];
-  writeGlobs: string[];
+export interface TaskExecuteJobResult {
+  ok: boolean;
+  summary: string;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+}
+
+type ExecutorJobCompletedPayload = {
+  jobId: string;
+  summary: string;
+  result?: TaskExecuteJobResult;
 };
+
+type ExecutorJobFailedPayload = {
+  jobId: string;
+  message: string;
+  detail?: string;
+  result?: TaskExecuteJobResult;
+};
+
+const VALID_TASK_EXECUTION_LANES: ReadonlyArray<TaskExecutionLane> = [
+  "deterministic",
+  "worker",
+];
+const VALID_REQUEST_PRIORITIES: ReadonlyArray<RequestPriority> = [
+  "interactive",
+  "normal",
+  "background",
+];
+const VALID_PLANNER_INTENTS: ReadonlyArray<PlannerIntent> = [
+  "chat",
+  "status",
+  "code_change",
+  "analysis",
+  "other",
+];
+const VALID_PLANNER_RISKS: ReadonlyArray<PlannerRisk> = ["low", "medium", "high"];
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function assertStringArrayField(
+  value: unknown,
+  label: string,
+  { allowEmpty = true }: { allowEmpty?: boolean } = {},
+): asserts value is string[] {
+  if (!isStringArray(value)) {
+    throw new Error(`${label} must be an array of strings`);
+  }
+  if (!allowEmpty && value.length === 0) {
+    throw new Error(`${label} must not be empty`);
+  }
+}
+
+function assertOptionalStringArrayField(
+  value: unknown,
+  label: string,
+  options?: { allowEmpty?: boolean },
+): void {
+  if (value === undefined) return;
+  assertStringArrayField(value, label, options);
+}
+
+function assertValidTaskExecuteScope(scope: TaskExecuteScope): void {
+  if (typeof scope.readAnywhere !== "boolean") {
+    throw new Error("planning.scope.readAnywhere must be boolean");
+  }
+  if (typeof scope.writeAllowed !== "boolean") {
+    throw new Error("planning.scope.writeAllowed must be boolean");
+  }
+  assertOptionalStringArrayField(scope.writeGlobs, "planning.scope.writeGlobs");
+  assertOptionalStringArrayField(scope.forbiddenGlobs, "planning.scope.forbiddenGlobs");
+  if (
+    scope.maxFilesToEdit !== undefined &&
+    (!Number.isFinite(scope.maxFilesToEdit) || scope.maxFilesToEdit < 0)
+  ) {
+    throw new Error("planning.scope.maxFilesToEdit must be a positive integer when provided");
+  }
+}
+
+function assertValidTaskExecutePlanning(planning: TaskExecutePlanning): void {
+  if (!VALID_PLANNER_INTENTS.includes(planning.intent)) {
+    throw new Error("planning.intent must be a supported value");
+  }
+  if (!VALID_PLANNER_RISKS.includes(planning.riskLevel)) {
+    throw new Error("planning.riskLevel must be a supported value");
+  }
+  if (!VALID_REQUEST_PRIORITIES.includes(planning.queuePriority)) {
+    throw new Error("planning.queuePriority must be a supported value");
+  }
+  assertOptionalStringArrayField(planning.targetPaths, "planning.targetPaths");
+  assertValidTaskExecuteScope(planning.scope);
+  if (planning.discovery) {
+    assertStringArrayField(planning.discovery.ripgrepQueries, "planning.discovery.ripgrepQueries");
+    assertOptionalStringArrayField(planning.discovery.likelyDirs, "planning.discovery.likelyDirs");
+    assertOptionalStringArrayField(planning.discovery.keywords, "planning.discovery.keywords");
+  }
+  assertStringArrayField(
+    planning.acceptanceCriteria,
+    "planning.acceptanceCriteria",
+    { allowEmpty: false },
+  );
+  assertStringArrayField(
+    planning.validationSteps,
+    "planning.validationSteps",
+    { allowEmpty: false },
+  );
+  for (const [field, value] of [
+    ["planning.queueWaitBudgetMs", planning.queueWaitBudgetMs],
+    ["planning.executionBudgetMs", planning.executionBudgetMs],
+    ["planning.finalizationBudgetMs", planning.finalizationBudgetMs],
+  ] as Array<[string, number]>) {
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(`${field} must be a positive number`);
+    }
+  }
+}
+
+function assertValidTaskExecuteJobParams(params: TaskExecuteJobParams): void {
+  if (params.schemaVersion !== 2) {
+    throw new Error("task.execute schemaVersion must be 2");
+  }
+  if (!params.requestId.trim()) {
+    throw new Error("task.execute requestId is required");
+  }
+  if (!params.sessionId.trim()) {
+    throw new Error("task.execute sessionId is required");
+  }
+  if (!VALID_TASK_EXECUTION_LANES.includes(params.lane)) {
+    throw new Error("task.execute lane must be deterministic or worker");
+  }
+  if (!params.instruction.trim()) {
+    throw new Error("task.execute instruction is required");
+  }
+  if (params.paths) {
+    assertStringArrayField(params.paths, "params.paths");
+  }
+  assertValidTaskExecutePlanning(params.planning);
+  assertStringArrayField(params.recentContext, "params.recentContext", { allowEmpty: true });
+  if (
+    !Array.isArray(params.recentJobs) ||
+    params.recentJobs.some((entry) => !entry || typeof entry !== "object")
+  ) {
+    throw new Error("params.recentJobs must be an array of objects");
+  }
+}
+
+function validateTaskExecuteJobResult(value: unknown): TaskExecuteJobResult | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const root = value as Record<string, unknown>;
+  if (typeof root.ok !== "boolean") return null;
+  const summary = toSingleLine(root.summary, 240);
+  if (!summary) return null;
+  const result: TaskExecuteJobResult = { ok: root.ok, summary };
+  if (typeof root.stdout === "string") result.stdout = root.stdout;
+  if (typeof root.stderr === "string") result.stderr = root.stderr;
+  if (Number.isFinite(root.exitCode)) result.exitCode = Number(root.exitCode);
+  return result;
+}
+
+function normalizeJobId(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+function parseExecutorJobCompletedPayload(payload: unknown): ExecutorJobCompletedPayload | null {
+  const root = asObject(payload);
+  if (!root) return null;
+  const jobId = normalizeJobId(root.jobId);
+  if (!jobId) return null;
+  const summary = toSingleLine(root.summary, 240) || "Job completed";
+  const result = validateTaskExecuteJobResult(root.result);
+  return result ? { jobId, summary: result.summary, result } : { jobId, summary };
+}
+
+function parseExecutorJobFailedPayload(payload: unknown): ExecutorJobFailedPayload | null {
+  const root = asObject(payload);
+  if (!root) return null;
+  const jobId = normalizeJobId(root.jobId);
+  const message = toSingleLine(root.message, 220);
+  if (!jobId || !message) return null;
+  const detail = toSingleLine(root.detail, 220);
+  const result = validateTaskExecuteJobResult(root.result);
+  const parsed: ExecutorJobFailedPayload = detail ? { jobId, message, detail } : { jobId, message };
+  if (result) parsed.result = result;
+  return parsed;
+}
 
 function normalizeRequestPriority(value: unknown): RequestPriority {
   const text = String(value ?? "")
@@ -271,7 +467,7 @@ function normalizeMetadataWriteGlobs(value: unknown, maxItems = 48): string[] {
   return out;
 }
 
-function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata | null {
+function parseAutonomyRequestMetadata(value: unknown): TaskExecuteAutonomyMetadata | null {
   let root = asObject(value);
   if (!root && typeof value === "string") {
     const text = value.trim();
@@ -985,16 +1181,10 @@ class RemoteBuddyOrchestrator {
         const tsMs = Date.parse(envelope.ts);
         if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
         if (envelope.type === "job_failed") {
-          const payload = envelope.payload as {
-            jobId?: unknown;
-            message?: unknown;
-            detail?: unknown;
-          };
-          const jobId = String(payload.jobId ?? "").trim();
-          const message = toSingleLine(payload.message, 220);
-          const detail = toSingleLine(payload.detail, 220);
-          if (!jobId || !message) return;
-
+          const failure = parseExecutorJobFailedPayload(envelope.payload);
+          if (!failure) return;
+          const { jobId, message } = failure;
+          const detail = failure.detail ?? "";
           const dedupeKey = `${jobId}:${message}`;
           if (this.seenJobFailures.has(dedupeKey)) return;
           this.seenJobFailures.add(dedupeKey);
@@ -1010,13 +1200,9 @@ class RemoteBuddyOrchestrator {
           return;
         }
 
-        const payload = envelope.payload as {
-          jobId?: unknown;
-          summary?: unknown;
-        };
-        const jobId = String(payload.jobId ?? "").trim();
-        const summary = toSingleLine(payload.summary, 240) || "Job completed";
-        if (!jobId) return;
+        const completion = parseExecutorJobCompletedPayload(envelope.payload);
+        if (!completion) return;
+        const { jobId, summary } = completion;
         if (/startup warmup completed/i.test(summary)) return;
         if (this.seenJobCompletions.has(jobId)) return;
         this.seenJobCompletions.add(jobId);
@@ -1806,7 +1992,9 @@ class RemoteBuddyOrchestrator {
           ...(plan.discovery
             ? {
                 discovery: {
-                  ripgrepQueries: plan.discovery.ripgrep_queries,
+                  ripgrepQueries: Array.isArray(plan.discovery.ripgrep_queries)
+                    ? plan.discovery.ripgrep_queries
+                    : [],
                   ...(plan.discovery.likely_dirs && plan.discovery.likely_dirs.length > 0
                     ? { likelyDirs: plan.discovery.likely_dirs }
                     : {}),
@@ -1827,6 +2015,7 @@ class RemoteBuddyOrchestrator {
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
       };
+      assertValidTaskExecuteJobParams(params);
 
       await this.sendCommand({
         type: "task_created",
