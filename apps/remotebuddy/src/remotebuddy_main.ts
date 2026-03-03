@@ -15,7 +15,7 @@
  *   Defaults resolve from configs/*.toml via shared config loader.
  */
 
-import type { CommandRequest } from "protocol";
+import type { EventType, EventTypePayloadMap } from "protocol";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 import { createLLMClient, type LLMClient } from "./llm.js";
@@ -219,6 +219,136 @@ type RequestAutonomyMetadata = {
   targetPaths: string[];
   writeGlobs: string[];
 };
+
+type CreateTaskExecuteJobParamsOptions = {
+  requestId: string;
+  sessionId: string;
+  origin: "user" | "autonomy";
+  autonomyMetadata?: RequestAutonomyMetadata | null;
+  instruction: string;
+  plannerWorkerInstruction?: string;
+  lane: TaskExecutionLane;
+  targetPaths: string[];
+  strictTargetPaths: string[];
+  plan: PlannerOutput;
+  priority: RequestPriority;
+  queueWaitBudgetMs: number;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+  targetPath?: string | null;
+  recentContext: string[];
+  recentJobs: Array<Record<string, unknown>>;
+};
+
+function sanitizeStringList(values: readonly unknown[]): string[] {
+  const out: string[] = [];
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function createTaskExecuteJobParams({
+  requestId,
+  sessionId,
+  origin,
+  autonomyMetadata,
+  instruction,
+  plannerWorkerInstruction,
+  lane,
+  targetPaths,
+  strictTargetPaths,
+  plan,
+  priority,
+  queueWaitBudgetMs,
+  executionBudgetMs,
+  finalizationBudgetMs,
+  targetPath,
+  recentContext,
+  recentJobs,
+}: CreateTaskExecuteJobParamsOptions): TaskExecuteJobParams {
+  const scope: TaskExecuteJobParams["planning"]["scope"] = {
+    readAnywhere: Boolean(plan.scope.read_anywhere),
+    writeAllowed: Boolean(plan.scope.write_allowed),
+  };
+  const writeGlobs = sanitizeStringList(plan.scope.write_globs ?? []);
+  if (writeGlobs.length > 0) scope.writeGlobs = [...writeGlobs];
+  const forbiddenGlobs = sanitizeStringList(plan.scope.forbidden_globs ?? []);
+  if (forbiddenGlobs.length > 0) scope.forbiddenGlobs = [...forbiddenGlobs];
+  if (typeof plan.scope.max_files_to_edit === "number" && plan.scope.max_files_to_edit > 0) {
+    scope.maxFilesToEdit = plan.scope.max_files_to_edit;
+  }
+
+  let discovery: TaskExecuteJobParams["planning"]["discovery"] | undefined;
+  if (plan.discovery) {
+    const ripgrepQueries = sanitizeStringList(plan.discovery.ripgrep_queries ?? []);
+    const likelyDirs = sanitizeStringList(plan.discovery.likely_dirs ?? []);
+    const keywords = sanitizeStringList(plan.discovery.keywords ?? []);
+    if (ripgrepQueries.length > 0 || likelyDirs.length > 0 || keywords.length > 0) {
+      discovery = {
+        ripgrepQueries,
+        ...(likelyDirs.length > 0 ? { likelyDirs } : {}),
+        ...(keywords.length > 0 ? { keywords } : {}),
+      };
+    }
+  }
+
+  const planning: TaskExecuteJobParams["planning"] = {
+    intent: plan.intent,
+    riskLevel: plan.risk_level,
+    ...(strictTargetPaths.length > 0 ? { targetPaths: sanitizeStringList(strictTargetPaths) } : {}),
+    scope,
+    ...(discovery ? { discovery } : {}),
+    acceptanceCriteria: sanitizeStringList(plan.acceptance_criteria ?? []),
+    validationSteps: sanitizeStringList(plan.validation_steps ?? []),
+    queuePriority: priority,
+    queueWaitBudgetMs,
+    executionBudgetMs,
+    finalizationBudgetMs,
+  };
+
+  const safePaths = sanitizeStringList(targetPaths);
+  const safeRecentContext = recentContext
+    .map((entry) => (typeof entry === "string" ? entry : String(entry ?? "")))
+    .filter((entry) => entry.length > 0);
+  const safeRecentJobs = recentJobs.filter(
+    (row): row is Record<string, unknown> => Boolean(row) && typeof row === "object",
+  );
+
+  const autonomy =
+    origin === "autonomy" && autonomyMetadata
+      ? {
+          origin: "autonomy" as const,
+          ...(autonomyMetadata.objectiveId ? { objectiveId: autonomyMetadata.objectiveId } : {}),
+          ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
+          ...(autonomyMetadata.snapshotId ? { snapshotId: autonomyMetadata.snapshotId } : {}),
+          ...(autonomyMetadata.patternKey ? { patternKey: autonomyMetadata.patternKey } : {}),
+          ...(autonomyMetadata.componentArea
+            ? { componentArea: autonomyMetadata.componentArea }
+            : {}),
+        }
+      : undefined;
+
+  const jobParams: TaskExecuteJobParams = {
+    schemaVersion: 2,
+    requestId,
+    sessionId,
+    ...(autonomy ? { origin, autonomy } : { origin }),
+    instruction,
+    ...(plannerWorkerInstruction ? { plannerWorkerInstruction } : {}),
+    lane,
+    ...(safePaths.length > 0 ? { paths: safePaths } : {}),
+    planning,
+    ...(typeof targetPath === "string" && targetPath ? { targetPath } : {}),
+    recentContext: safeRecentContext,
+    recentJobs: safeRecentJobs,
+  };
+
+  return jobParams;
+}
 
 function normalizeRequestPriority(value: unknown): RequestPriority {
   const text = String(value ?? "")
@@ -861,9 +991,16 @@ class RemoteBuddyOrchestrator {
   }
 
   /** Send a command event through the server */
-  private async sendCommand(cmd: Omit<CommandRequest, "from">): Promise<void> {
+  private async sendCommand<T extends EventType>(cmd: {
+    type: T;
+    payload: EventTypePayloadMap[T];
+    to?: string;
+    correlationId?: string;
+    turnId?: string;
+    parentId?: string;
+  }): Promise<void> {
     try {
-      const ok = await this.comm.emit(cmd.type, cmd.payload as any, {
+      const ok = await this.comm.emit(cmd.type, cmd.payload, {
         to: cmd.to,
         correlationId: cmd.correlationId,
         turnId: cmd.turnId,
@@ -1758,75 +1895,29 @@ class RemoteBuddyOrchestrator {
       const targetWorkerId = await this.selectTargetWorkerForJob();
       const executionBudgetMs = this.executionBudgetForPriority(priority);
       const strictTargetPaths = targetPaths.filter((entry) => entry && entry !== ".");
-      const params: TaskExecuteJobParams = {
-        schemaVersion: 2,
+      const workerInstructionDetail =
+        plannerWorkerInstruction && plannerWorkerInstruction !== canonicalInstruction
+          ? plannerWorkerInstruction
+          : undefined;
+      const params = createTaskExecuteJobParams({
         requestId,
         sessionId: this.sessionId,
         origin: autonomyMetadata ? "autonomy" : "user",
-        ...(autonomyMetadata
-          ? {
-              autonomy: {
-                origin: "autonomy" as const,
-                ...(autonomyMetadata.objectiveId
-                  ? { objectiveId: autonomyMetadata.objectiveId }
-                  : {}),
-                ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
-                ...(autonomyMetadata.snapshotId ? { snapshotId: autonomyMetadata.snapshotId } : {}),
-                ...(autonomyMetadata.patternKey ? { patternKey: autonomyMetadata.patternKey } : {}),
-                ...(autonomyMetadata.componentArea
-                  ? { componentArea: autonomyMetadata.componentArea }
-                  : {}),
-              },
-            }
-          : {}),
+        autonomyMetadata,
         instruction: canonicalInstruction,
-        plannerWorkerInstruction:
-          plannerWorkerInstruction && plannerWorkerInstruction !== canonicalInstruction
-            ? plannerWorkerInstruction
-            : undefined,
+        plannerWorkerInstruction: workerInstructionDetail,
         lane,
-        ...(targetPaths.length > 0 ? { paths: targetPaths } : {}),
-        planning: {
-          intent: plan.intent,
-          riskLevel: plan.risk_level,
-          ...(strictTargetPaths.length > 0 ? { targetPaths: strictTargetPaths } : {}),
-          scope: {
-            readAnywhere: plan.scope.read_anywhere,
-            writeAllowed: plan.scope.write_allowed,
-            ...(plan.scope.write_globs && plan.scope.write_globs.length > 0
-              ? { writeGlobs: plan.scope.write_globs }
-              : {}),
-            ...(plan.scope.forbidden_globs && plan.scope.forbidden_globs.length > 0
-              ? { forbiddenGlobs: plan.scope.forbidden_globs }
-              : {}),
-            ...(plan.scope.max_files_to_edit && plan.scope.max_files_to_edit > 0
-              ? { maxFilesToEdit: plan.scope.max_files_to_edit }
-              : {}),
-          },
-          ...(plan.discovery
-            ? {
-                discovery: {
-                  ripgrepQueries: plan.discovery.ripgrep_queries,
-                  ...(plan.discovery.likely_dirs && plan.discovery.likely_dirs.length > 0
-                    ? { likelyDirs: plan.discovery.likely_dirs }
-                    : {}),
-                  ...(plan.discovery.keywords && plan.discovery.keywords.length > 0
-                    ? { keywords: plan.discovery.keywords }
-                    : {}),
-                },
-              }
-            : {}),
-          acceptanceCriteria: plan.acceptance_criteria,
-          validationSteps: plan.validation_steps,
-          queuePriority: priority,
-          queueWaitBudgetMs,
-          executionBudgetMs,
-          finalizationBudgetMs: this.finalizationBudgetMs,
-        },
+        targetPaths,
+        strictTargetPaths,
+        plan,
+        priority,
+        queueWaitBudgetMs,
+        executionBudgetMs,
+        finalizationBudgetMs: this.finalizationBudgetMs,
         targetPath,
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
-      };
+      });
 
       await this.sendCommand({
         type: "task_created",
