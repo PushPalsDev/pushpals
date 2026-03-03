@@ -81,6 +81,29 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   logError: (line) => console.error(line),
 };
 
+const REVIEW_AGENT_LOGIN_ENV_KEYS = [
+  "SOURCE_CONTROL_MANAGER_REVIEW_AGENT_GITHUB_LOGIN",
+  "REVIEW_AGENT_GITHUB_LOGIN",
+];
+
+function parseConfiguredReviewAgentLogins(): string[] {
+  const configured = new Set<string>();
+  for (const key of REVIEW_AGENT_LOGIN_ENV_KEYS) {
+    const raw = process.env[key];
+    if (!raw) continue;
+    for (const fragment of raw.split(",")) {
+      const normalized = fragment.trim().toLowerCase();
+      if (normalized) configured.add(normalized);
+    }
+  }
+  return Array.from(configured);
+}
+
+type GitHubIdentity = {
+  login: string | null;
+  id: number | null;
+};
+
 function splitArgs(raw: string): string[] {
   const out: string[] = [];
   let current = "";
@@ -446,6 +469,47 @@ function normalizeCommentBody(body: string): string {
   return body.replace(/\r\n/g, "\n").trim();
 }
 
+function normalizeCommentAuthor(author: string): string {
+  return author.trim().toLowerCase();
+}
+
+export type ReviewAgentFeedbackKind = "rejection" | "give_up";
+
+export interface ReviewAgentGiveUpFilter {
+  allowedAuthors: ReadonlySet<string>;
+}
+
+export function classifyReviewAgentFeedbackComment(body: string): ReviewAgentFeedbackKind | null {
+  const normalized = normalizeCommentBody(body).toLowerCase();
+  if (!normalized.startsWith("## reviewagent:")) return null;
+  if (normalized.includes("changes rejected")) return "rejection";
+  if (normalized.includes("pr closed without merge")) return "give_up";
+  return null;
+}
+
+export function isReviewAgentGiveUpEligibleComment(
+  comment: PullRequestComment,
+  filter: ReviewAgentGiveUpFilter,
+): boolean {
+  if (!filter.allowedAuthors || filter.allowedAuthors.size === 0) return false;
+  const classification = classifyReviewAgentFeedbackComment(comment.body);
+  if (classification !== "rejection" && classification !== "give_up") return false;
+  const normalizedAuthor = normalizeCommentAuthor(comment.userLogin ?? "");
+  if (!normalizedAuthor) return false;
+  return filter.allowedAuthors.has(normalizedAuthor);
+}
+
+export function countReviewAgentGiveUpEligibleComments(
+  comments: PullRequestComment[],
+  filter: ReviewAgentGiveUpFilter,
+): number {
+  if (!Array.isArray(comments) || comments.length === 0) return 0;
+  return comments.reduce(
+    (count, comment) => count + (isReviewAgentGiveUpEligibleComment(comment, filter) ? 1 : 0),
+    0,
+  );
+}
+
 function collapseWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -736,6 +800,10 @@ export class ReviewAgent {
   private reviewerMd = "";
   private pollInFlight = false;
   private readonly deps: ReviewAgentDeps;
+  private githubIdentity: GitHubIdentity | null = null;
+  private githubIdentityPromise: Promise<GitHubIdentity> | null = null;
+  private githubIdentityWarned = false;
+  private readonly configuredReviewAgentLogins: string[];
 
   constructor(
     private config: ReviewAgentConfig,
@@ -747,6 +815,7 @@ export class ReviewAgent {
     deps?: Partial<ReviewAgentDeps>,
   ) {
     this.deps = { ...DEFAULT_DEPS, ...(deps ?? {}) };
+    this.configuredReviewAgentLogins = parseConfiguredReviewAgentLogins();
   }
 
   requestReReview(prNumber: number, sha: string): void {
@@ -768,6 +837,77 @@ export class ReviewAgent {
       );
       return "";
     }
+  }
+
+  private async resolveGitHubIdentity(): Promise<GitHubIdentity> {
+    if (this.githubIdentity) return this.githubIdentity;
+    if (this.githubIdentityPromise) return this.githubIdentityPromise;
+    if (!this.githubToken) {
+      this.githubIdentity = { login: null, id: null };
+      return this.githubIdentity;
+    }
+    this.githubIdentityPromise = (async () => {
+      try {
+        const response = await this.deps.fetchImpl("https://api.github.com/user", {
+          method: "GET",
+          headers: {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${this.githubToken}`,
+            "User-Agent": "pushpals-source-control-manager",
+          },
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          this.deps.logWarn(
+            `[${ts()}] [ReviewAgent] Failed to resolve GitHub identity: HTTP ${response.status}${text ? `: ${text}` : ""}`,
+          );
+          return { login: null, id: null };
+        }
+        const payload = (await response.json()) as { login?: unknown; id?: unknown };
+        const login =
+          typeof payload.login === "string" && payload.login.trim().length > 0
+            ? payload.login.trim()
+            : null;
+        let id: number | null = null;
+        if (typeof payload.id === "number" && Number.isFinite(payload.id)) {
+          id = payload.id;
+        } else if (
+          typeof payload.id === "string" &&
+          payload.id.trim().length > 0 &&
+          Number.isFinite(Number(payload.id.trim()))
+        ) {
+          id = Number(payload.id.trim());
+        }
+        return { login, id };
+      } catch (err: any) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Failed to resolve GitHub identity: ${err?.message ?? err}`,
+        );
+        return { login: null, id: null };
+      }
+    })();
+    const identity = await this.githubIdentityPromise;
+    this.githubIdentity = identity;
+    this.githubIdentityPromise = null;
+    return identity;
+  }
+
+  private async resolveGiveUpCommentAuthors(): Promise<Set<string>> {
+    if (this.configuredReviewAgentLogins.length > 0) {
+      return new Set(this.configuredReviewAgentLogins);
+    }
+    const authors = new Set<string>();
+    const identity = await this.resolveGitHubIdentity();
+    if (identity.login?.trim()) {
+      authors.add(identity.login.trim().toLowerCase());
+    }
+    if (authors.size === 0 && !this.githubIdentityWarned) {
+      this.githubIdentityWarned = true;
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Could not determine authenticated GitHub login; PR comment cap enforcement will not auto-close until identity resolves.`,
+      );
+    }
+    return authors;
   }
 
   async poll(): Promise<void> {
@@ -1026,12 +1166,17 @@ export class ReviewAgent {
       pr.number,
       Math.max(MAX_REVIEW_CONTEXT_COMMENTS * 3, maxPrCommentsBeforeGiveUp),
     );
-    if (recentComments.length >= maxPrCommentsBeforeGiveUp) {
+    const allowedAuthors = await this.resolveGiveUpCommentAuthors();
+    const reviewAgentAutoCloseComments = countReviewAgentGiveUpEligibleComments(recentComments, {
+      allowedAuthors,
+    });
+    if (reviewAgentAutoCloseComments >= maxPrCommentsBeforeGiveUp) {
       return await this.giveUpOnRejectedPr(pr, verdict, {
         jobId,
         sessionId,
         recentComments,
         maxPrCommentsBeforeGiveUp,
+        reviewAgentCommentCount: reviewAgentAutoCloseComments,
       });
     }
 
@@ -1112,10 +1257,11 @@ export class ReviewAgent {
       sessionId: string | null;
       recentComments: PullRequestComment[];
       maxPrCommentsBeforeGiveUp: number;
+      reviewAgentCommentCount: number;
     },
   ): Promise<boolean> {
     this.deps.logWarn(
-      `[${ts()}] [ReviewAgent] PR #${pr.number} reached PR comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}); closing without merge.`,
+      `[${ts()}] [ReviewAgent] PR #${pr.number} reached ReviewAgent comment cap (${context.reviewAgentCommentCount}/${context.maxPrCommentsBeforeGiveUp}); closing without merge.`,
     );
 
     try {

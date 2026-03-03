@@ -32,7 +32,7 @@ import {
   normalizeTargetPath,
   normalizeWriteGlob,
 } from "shared";
-import { mkdirSync } from "fs";
+import { lstatSync, mkdirSync, realpathSync } from "fs";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {
   extractExplicitTargetPath,
@@ -44,20 +44,33 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import { resolve } from "path";
 import {
+  dependencySnapshotHasIssues,
   notifyDependencyPreflightBlock,
-  runPreflightChecks,
-  type PreflightFailureSummary,
+  toDependencySnapshot,
+  type DependencySnapshot,
 } from "./preflight.js";
-
-type DependencyPreflightHooks = {
-  runPreflightChecks?: typeof runPreflightChecks;
-  notifyDependencyPreflightBlock?: typeof notifyDependencyPreflightBlock;
-};
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
+const REQUIRED_WORKSPACE_LINKS: Array<{
+  label: string;
+  segments: string[];
+  targetSegments: string[];
+}> = [
+  {
+    label: "node_modules/shared workspace link",
+    segments: ["node_modules", "shared"],
+    targetSegments: ["packages", "shared"],
+  },
+  {
+    label: "node_modules/protocol workspace link",
+    segments: ["node_modules", "protocol"],
+    targetSegments: ["packages", "protocol"],
+  },
+];
 
 function parseArgs(): {
   server: string;
@@ -646,7 +659,7 @@ function extractClarificationFromJobFailure(
   return null;
 }
 
-export class RemoteBuddyOrchestrator {
+class RemoteBuddyOrchestrator {
   private static readonly SESSION_MONITOR_MAX_WS_ERRORS = Math.max(
     1,
     Number.parseInt(process.env.REMOTEBUDDY_SESSION_MONITOR_MAX_WS_ERRORS ?? "6", 10) || 6,
@@ -677,8 +690,6 @@ export class RemoteBuddyOrchestrator {
   private readonly autonomousEngine: RemoteBuddyAutonomousEngine;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
-  private readonly runPreflightChecksImpl: typeof runPreflightChecks;
-  private readonly notifyDependencyPreflightBlockImpl: typeof notifyDependencyPreflightBlock;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private statusSessionReady = false;
   private stopSessionEvents: (() => void) | null = null;
@@ -689,7 +700,6 @@ export class RemoteBuddyOrchestrator {
   private disposed = false;
   private sessionMonitorWsErrorCount = 0;
   private sessionMonitorFatal = false;
-  private dependencyPreflightLoggedStatus: "ok" | "fail" | null = null;
 
   /** Serialises async request handling to preserve ordering */
   private chain: Promise<void> = Promise.resolve();
@@ -713,8 +723,7 @@ export class RemoteBuddyOrchestrator {
   private static readonly CHAT_CONTEXT_MAX = 8;
   private static readonly CHAT_CONTEXT_ENTRY_CHARS = 420;
 
-  constructor(
-    opts: {
+  constructor(opts: {
     server: string;
     sessionId: string;
     authToken: string | null;
@@ -723,9 +732,7 @@ export class RemoteBuddyOrchestrator {
     idempotency: IdempotencyStore;
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
-  },
-    preflightHooks: DependencyPreflightHooks = {},
-  ) {
+  }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
@@ -733,9 +740,6 @@ export class RemoteBuddyOrchestrator {
     this.idempotency = opts.idempotency;
     this.persistentMemory = opts.persistentMemory;
     this.jobsDbPath = opts.jobsDbPath;
-    this.runPreflightChecksImpl = preflightHooks.runPreflightChecks ?? runPreflightChecks;
-    this.notifyDependencyPreflightBlockImpl =
-      preflightHooks.notifyDependencyPreflightBlock ?? notifyDependencyPreflightBlock;
     const remoteCfg = CONFIG.remotebuddy;
     this.workerOnlineTtlMs = Math.max(1_000, remoteCfg.workerpalOnlineTtlMs);
     this.waitForWorkerMs = Math.max(0, remoteCfg.waitForWorkerpalMs);
@@ -806,6 +810,94 @@ export class RemoteBuddyOrchestrator {
     console.log(
       `[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour} allowDirtyWorktree=${CONFIG.remotebuddy.autonomy.allowDirtyWorktree ? "on" : "off"}`,
     );
+  }
+
+  private buildDependencySnapshot(): DependencySnapshot {
+    const normalizePathForCompare = (value: string): string => resolve(value).replace(/\\/g, "/");
+    const rootIssues = REQUIRED_WORKSPACE_LINKS.flatMap((entry) => {
+      const fullPath = resolve(this.repo, ...entry.segments);
+      const expectedTarget = resolve(this.repo, ...entry.targetSegments);
+      try {
+        const stats = lstatSync(fullPath);
+        if (!stats.isSymbolicLink()) {
+          return [
+            {
+              path: fullPath,
+              label: entry.label,
+              expectedTarget,
+              actualTarget: stats.isDirectory() ? fullPath : undefined,
+              probeError: "NOT_SYMLINK",
+            },
+          ];
+        }
+        let resolvedTarget: string;
+        try {
+          resolvedTarget = realpathSync(fullPath);
+        } catch (err: any) {
+          const code = typeof err?.code === "string" ? err.code : "BROKEN_LINK";
+          return [
+            {
+              path: fullPath,
+              label: entry.label,
+              expectedTarget,
+              probeError: code || "BROKEN_LINK",
+            },
+          ];
+        }
+        if (
+          normalizePathForCompare(resolvedTarget) !== normalizePathForCompare(expectedTarget)
+        ) {
+          return [
+            {
+              path: fullPath,
+              label: entry.label,
+              expectedTarget,
+              actualTarget: resolvedTarget,
+              probeError: "SYMLINK_TARGET_MISMATCH",
+            },
+          ];
+        }
+        return [];
+      } catch (err: any) {
+        const code = typeof err?.code === "string" ? err.code : "UNKNOWN";
+        return [
+          {
+            path: fullPath,
+            label: entry.label,
+            expectedTarget,
+            probeError: code || "UNKNOWN",
+          },
+        ];
+      }
+    });
+    return toDependencySnapshot({
+      repoRoot: this.repo,
+      rootWorkspaceLinkIssues: rootIssues,
+    });
+  }
+
+  async runDependencyPreflight(): Promise<void> {
+    const snapshot = this.buildDependencySnapshot();
+    if (!dependencySnapshotHasIssues(snapshot)) {
+      console.log("[RemoteBuddy] Dependency preflight: workspace links healthy.");
+      return;
+    }
+    console.error("[RemoteBuddy] Dependency preflight blocked:");
+    for (const issue of snapshot.missingWorkspaceLinks) {
+      console.error(` - ${issue.label}: ${issue.path} (${issue.probeError})`);
+    }
+    for (const issue of snapshot.brokenNodeModules) {
+      console.error(` - ${issue.label}: ${issue.nodeModulesPath} (${issue.probeError})`);
+    }
+    for (const issue of snapshot.missingArtifacts) {
+      console.error(
+        ` - ${issue.label}: ${issue.moduleSpecifier} from ${issue.fromDir} (${issue.probeError})`,
+      );
+    }
+    await notifyDependencyPreflightBlock(this.comm, snapshot, {
+      detail: "RemoteBuddy cannot start because workspace dependencies are missing.",
+    });
+    throw new Error("dependency_preflight_block");
   }
 
   async emitStartupStatus(): Promise<void> {
@@ -1496,91 +1588,6 @@ export class RemoteBuddyOrchestrator {
     return waited?.workerId ?? null;
   }
 
-  private async dependencyPreflightGate(): Promise<PreflightFailureSummary | null> {
-    let failure: PreflightFailureSummary | null = null;
-    try {
-      const result = await this.runPreflightChecksImpl({ repoRoot: this.repo });
-      if (!result.ok) {
-        failure =
-          result.failure ?? {
-            id: "dependency",
-            label: "Workspace dependency health",
-            detail: "Dependency preflight failed without detail.",
-          };
-      }
-    } catch (err) {
-      const detail =
-        err instanceof Error
-          ? err.message
-          : typeof err === "string"
-            ? err
-            : "Unknown dependency preflight error.";
-      failure = {
-        id: "dependency",
-        label: "Workspace dependency health",
-        detail: `Dependency preflight crashed: ${detail}`,
-      };
-    }
-
-    const previousStatus = this.dependencyPreflightLoggedStatus;
-    if (failure) {
-      if (previousStatus !== "fail") {
-        console.error(`[RemoteBuddy] Dependency preflight failed: ${failure.detail}`);
-      }
-      this.dependencyPreflightLoggedStatus = "fail";
-    } else {
-      if (previousStatus === "fail") {
-        console.log("[RemoteBuddy] Dependency preflight recovered.");
-      }
-      this.dependencyPreflightLoggedStatus = "ok";
-    }
-    return failure;
-  }
-
-  private async handleDependencyPreflightFailure(
-    requestId: string,
-    turnId: string,
-    failure: PreflightFailureSummary,
-  ): Promise<boolean> {
-    const issue = failure.issues?.[0];
-    const issueDetail = issue ? `${issue.label}: ${issue.detail}` : failure.detail;
-    try {
-      await this.comm.assistantMessage(
-        `I cannot start this request because workspace dependencies look unhealthy (${issueDetail}). ` +
-          "Please run `bun install` in the repository root to repair dependencies, then retry this request.",
-        { turnId, correlationId: requestId },
-      );
-    } catch (err) {
-      console.error(
-        `[RemoteBuddy] Failed to send dependency preflight assistant message for ${requestId}:`,
-        err,
-      );
-    }
-
-    try {
-      const notifyResult = await this.notifyDependencyPreflightBlockImpl({
-        server: this.server,
-        requestId,
-        authHeaders: this.authHeaders(),
-        failure,
-      });
-      if (!notifyResult.delivered) {
-        const suffix = notifyResult.error ? ` (${notifyResult.error})` : "";
-        console.error(
-          `[RemoteBuddy] Dependency preflight block notification for ${requestId} was not delivered${suffix}.`,
-        );
-        return false;
-      }
-      return true;
-    } catch (err) {
-      console.error(
-        `[RemoteBuddy] Failed to notify dependency preflight block for ${requestId}:`,
-        err,
-      );
-      return false;
-    }
-  }
-
   // In this architecture, RemoteBuddy only creates tasks/jobs via polling.
   // Job completion tracking is handled by the server event stream and workers.
   // ── Dispatch, Polling for Request Queue ────────────────────────────────────────
@@ -1606,12 +1613,7 @@ export class RemoteBuddyOrchestrator {
       console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
       return;
     }
-    let handledCommitted = false;
-    const markHandled = (): void => {
-      if (handledCommitted) return;
-      this.idempotency.markHandled(this.sessionId, requestId);
-      handledCommitted = true;
-    };
+    this.idempotency.markHandled(this.sessionId, requestId);
 
     const prompt = String(request.prompt ?? "").trim();
     if (!prompt) {
@@ -1620,11 +1622,7 @@ export class RemoteBuddyOrchestrator {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({ message: "Request missing prompt" }),
-      })
-        .catch(() => {})
-        .finally(() => {
-          markHandled();
-        });
+      }).catch(() => {});
       return;
     }
 
@@ -1655,23 +1653,6 @@ export class RemoteBuddyOrchestrator {
             : 90_000,
     );
     const turnId = randomUUID();
-    const dependencyFailure = await this.dependencyPreflightGate();
-    if (dependencyFailure) {
-      const delivered = await this.handleDependencyPreflightFailure(
-        requestId,
-        turnId,
-        dependencyFailure,
-      );
-      if (delivered) {
-        markHandled();
-      } else {
-        console.warn(
-          `[RemoteBuddy] Dependency preflight failure for ${requestId} not acknowledged; request will be retried once the server replays it.`,
-        );
-      }
-      return;
-    }
-    markHandled();
     const planningContext = this.buildPlanningContext(priority);
     this.rememberPersistentMemory(
       "request",
@@ -2267,6 +2248,7 @@ async function main() {
     jobsDbPath: sharedDbPath,
   });
 
+  await orchestrator.runDependencyPreflight();
   await orchestrator.emitStartupStatus();
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();

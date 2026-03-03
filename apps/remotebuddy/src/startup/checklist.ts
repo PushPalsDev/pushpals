@@ -1,3 +1,5 @@
+import { mergeRebaseRemediationMessage } from "../preflight.js";
+
 /**
  * Deterministic startup preflight checklist plus a synthetic dispatch guard.
  * The helper executes each check sequentially, surfaces actionable failure codes,
@@ -110,7 +112,7 @@ const defaultChecks: readonly StartupCheckDefinition[] = [
   {
     code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
     label: "Git merge or rebase must be resolved.",
-    action: "Resolve or abort the merge/rebase before starting RemoteBuddy dispatch.",
+    action: mergeRebaseRemediationMessage(),
     category: "repo",
     run: async (ctx) => {
       const status = await ctx.describeRepo();

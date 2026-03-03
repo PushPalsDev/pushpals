@@ -21,7 +21,13 @@ import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
-import { mergeRebaseRemediationMessage, repoPreflight } from "./preflight.js";
+import {
+  mergeRebaseRemediationMessage,
+  repoPreflight,
+  summarizePreflightFailure,
+  type PreflightCheckResult,
+  type PreflightReport,
+} from "./preflight.js";
 
 type AutonomyCandidate = {
   id: string;
@@ -947,17 +953,46 @@ export class RemoteBuddyAutonomousEngine {
 
       this.setPhase("repo_preflight");
       const preflight = await repoPreflight(this.autonomyRepo);
-      if (preflight.isMergeInProgress || preflight.isRebaseInProgress) {
-        const guidance = mergeRebaseRemediationMessage(this.autonomyRepo, preflight);
+      const repoChecks: PreflightCheckResult[] = [
+        {
+          code: "repo.merge_in_progress",
+          label: "Merge or rebase must be resolved",
+          category: "repo",
+          ok: !preflight.isMergeInProgress,
+          detail: preflight.isMergeInProgress
+            ? "git MERGE_HEAD detected in autonomy worktree."
+            : "No merge or rebase in progress.",
+          remediation: mergeRebaseRemediationMessage(),
+        },
+        {
+          code: "repo.worktree_clean",
+          label: "Worktree must be clean",
+          category: "repo",
+          ok: !preflight.isWorktreeDirty || this.cfg.allowDirtyWorktree,
+          detail: preflight.isWorktreeDirty
+            ? this.cfg.allowDirtyWorktree
+              ? "Dirty worktree bypassed via allowDirtyWorktree=true."
+              : "Worktree is dirty."
+            : "Worktree is clean.",
+          remediation:
+            "Commit, stash, or drop local changes before autonomy dispatch (or enable allowDirtyWorktree).",
+        },
+      ];
+      const preflightReport: PreflightReport = {
+        repoRoot: this.autonomyRepo,
+        generatedAt: new Date().toISOString(),
+        checks: repoChecks,
+      };
+      if (preflight.isMergeInProgress) {
         console.log(
-          `[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (merge/rebase in progress). ${guidance}`,
+          `[RemoteBuddyAutonomousEngine] tick skipped: ${summarizePreflightFailure(preflightReport)}`,
         );
         outcomeDetail = "repo_preflight_merge_in_progress";
         return;
       }
       if (preflight.isWorktreeDirty && !this.cfg.allowDirtyWorktree) {
         console.log(
-          "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (worktree is dirty and allow_dirty_worktree=false).",
+          `[RemoteBuddyAutonomousEngine] tick skipped: ${summarizePreflightFailure(preflightReport)}`,
         );
         outcomeDetail = "repo_preflight_dirty_worktree";
         return;

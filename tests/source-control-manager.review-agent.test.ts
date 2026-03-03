@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { resolve } from "path";
 import {
   ReviewAgent,
@@ -9,9 +9,12 @@ import {
   parseReviewVerdict,
   resolveCodexCmd,
   resolveReviewerMdPath,
+  classifyReviewAgentFeedbackComment,
+  countReviewAgentGiveUpEligibleComments,
+  isReviewAgentGiveUpEligibleComment,
   type ReviewAgentConfig,
 } from "../apps/source_control_manager/src/review_agent";
-import type { GitHubPR } from "../apps/source_control_manager/src/github_pr";
+import type { GitHubPR, PullRequestComment } from "../apps/source_control_manager/src/github_pr";
 
 const baseConfig: ReviewAgentConfig = {
   enabled: true,
@@ -25,6 +28,21 @@ const baseConfig: ReviewAgentConfig = {
   codexHomeDir: "",
   codexTimeoutMs: 30_000,
 };
+
+const REVIEW_AGENT_LOGIN_ENV_KEY = "SOURCE_CONTROL_MANAGER_REVIEW_AGENT_GITHUB_LOGIN";
+const originalReviewAgentLoginEnv = process.env[REVIEW_AGENT_LOGIN_ENV_KEY];
+
+beforeAll(() => {
+  process.env[REVIEW_AGENT_LOGIN_ENV_KEY] = "review-agent";
+});
+
+afterAll(() => {
+  if (originalReviewAgentLoginEnv === undefined) {
+    delete process.env[REVIEW_AGENT_LOGIN_ENV_KEY];
+  } else {
+    process.env[REVIEW_AGENT_LOGIN_ENV_KEY] = originalReviewAgentLoginEnv;
+  }
+});
 
 function makePr(overrides: Partial<GitHubPR> = {}): GitHubPR {
   return {
@@ -57,6 +75,51 @@ const silentLogs = {
 };
 
 describe("ReviewAgent", () => {
+  test("review agent give-up predicate requires ReviewAgent login + signature", () => {
+    const filter = { allowedAuthors: new Set(["review-agent"]) };
+    const rejectionComment: PullRequestComment = {
+      id: 1,
+      body: "## ReviewAgent: Changes Rejected (score 7.4/10)\n\n**Verdict:** Needs more work",
+      userLogin: "review-agent",
+      createdAt: "2026-02-20T00:00:00Z",
+      htmlUrl: "https://example.com/comment/1",
+    };
+    const giveUpComment: PullRequestComment = {
+      id: 2,
+      body: "## ReviewAgent: PR Closed Without Merge (score 6.8/10)\n\n**Verdict:** Still failing",
+      userLogin: "review-agent",
+      createdAt: "2026-02-20T00:01:00Z",
+      htmlUrl: "https://example.com/comment/2",
+    };
+    const humanSpoof: PullRequestComment = {
+      id: 3,
+      body: rejectionComment.body,
+      userLogin: "maintainer-1",
+      createdAt: "2026-02-20T00:02:00Z",
+      htmlUrl: "https://example.com/comment/3",
+    };
+    const approvalComment: PullRequestComment = {
+      id: 4,
+      body: "## ReviewAgent: Changes Approved (score 9.1/10)\n\n**Verdict:** LGTM",
+      userLogin: "review-agent",
+      createdAt: "2026-02-20T00:03:00Z",
+      htmlUrl: "https://example.com/comment/4",
+    };
+    expect(classifyReviewAgentFeedbackComment(rejectionComment.body)).toBe("rejection");
+    expect(classifyReviewAgentFeedbackComment(giveUpComment.body)).toBe("give_up");
+    expect(classifyReviewAgentFeedbackComment(approvalComment.body)).toBeNull();
+    expect(isReviewAgentGiveUpEligibleComment(rejectionComment, filter)).toBe(true);
+    expect(isReviewAgentGiveUpEligibleComment(giveUpComment, filter)).toBe(true);
+    expect(isReviewAgentGiveUpEligibleComment(humanSpoof, filter)).toBe(false);
+    expect(isReviewAgentGiveUpEligibleComment(approvalComment, filter)).toBe(false);
+    expect(
+      countReviewAgentGiveUpEligibleComments(
+        [rejectionComment, giveUpComment, humanSpoof, approvalComment],
+        filter,
+      ),
+    ).toBe(2);
+  });
+
   test("resolves reviewer markdown path from workspace root", () => {
     const workspaceRoot = resolve(import.meta.dir, "..");
     const reviewerPath = resolveReviewerMdPath("prompts/review_agent/reviewer.md", {
@@ -1234,8 +1297,10 @@ describe("ReviewAgent", () => {
 
     const comments = Array.from({ length: 10 }, (_, idx) => ({
       id: idx + 1,
-      body: `Feedback item ${idx + 1}`,
-      userLogin: `reviewer-${idx + 1}`,
+      body: `## ReviewAgent: Changes Rejected (score ${(7 + idx * 0.1).toFixed(1)}/10)\n\n**Verdict:** Issue ${
+        idx + 1
+      }`,
+      userLogin: `review-agent`,
       createdAt: `2026-02-20T00:${String(idx).padStart(2, "0")}:00Z`,
       htmlUrl: `https://example.com/comment/${idx + 1}`,
     }));
@@ -1295,6 +1360,207 @@ describe("ReviewAgent", () => {
     expect(deleteCalls).toBe(1);
     expect(deletedBranchRef).toBe(pr.head.ref);
     expect(enqueueCalls).toBe(0);
+  });
+
+  test("counts rejection + give-up ReviewAgent comments toward cap even with human spoofs", async () => {
+    const pr = makePr({ number: 69, html_url: "https://example.com/pr/69" });
+    let closeCalls = 0;
+    let deleteCalls = 0;
+    let commentCalls = 0;
+    const comments: PullRequestComment[] = [
+      {
+        id: 1,
+        body: "## ReviewAgent: Changes Rejected (score 7.2/10)\n\n**Verdict:** Needs fixes",
+        userLogin: "review-agent",
+        createdAt: "2026-02-20T00:00:00Z",
+        htmlUrl: "https://example.com/comment/1",
+      },
+      {
+        id: 2,
+        body: "## ReviewAgent: PR Closed Without Merge (score 6.9/10)\n\n**Verdict:** Max attempts hit",
+        userLogin: "review-agent",
+        createdAt: "2026-02-20T00:01:00Z",
+        htmlUrl: "https://example.com/comment/2",
+      },
+      {
+        id: 3,
+        body: "## ReviewAgent: Changes Rejected (score 7.2/10)\n\n**Verdict:** Needs fixes",
+        userLogin: "maintainer-copy",
+        createdAt: "2026-02-20T00:02:00Z",
+        htmlUrl: "https://example.com/comment/3",
+      },
+    ];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.3,
+            summary: "Needs more polish",
+            issues: ["Add regression test"],
+            fix_instruction: "",
+          }),
+        closePullRequest: async () => {
+          closeCalls += 1;
+          return { state: "closed", closed: true };
+        },
+        addPullRequestComment: async () => {
+          commentCalls += 1;
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+        listPullRequestComments: async () => comments,
+        fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+      },
+    );
+
+    await agent.poll();
+
+    expect(closeCalls).toBe(1);
+    expect(deleteCalls).toBe(1);
+    expect(commentCalls).toBe(1);
+  });
+
+  test("ignores non-ReviewAgent comments when enforcing give-up cap", async () => {
+    const pr = makePr({ number: 68, html_url: "https://example.com/pr/68" });
+    let closeCalls = 0;
+    let commentCalls = 0;
+    let deleteCalls = 0;
+
+    const humanComments = Array.from({ length: 5 }, (_, idx) => ({
+      id: idx + 100,
+      body: `Maintainer feedback ${idx + 1}`,
+      userLogin: `maintainer-${idx + 1}`,
+      createdAt: `2026-02-21T00:${String(idx).padStart(2, "0")}:00Z`,
+      htmlUrl: `https://example.com/comment/human-${idx + 1}`,
+    }));
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 2 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.5,
+            summary: "Needs work",
+            issues: ["Add regression test"],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {
+          commentCalls += 1;
+        },
+        closePullRequest: async () => {
+          closeCalls += 1;
+          return { state: "closed", closed: true };
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+        listPullRequestComments: async () => humanComments,
+        fetchImpl: async () =>
+          new Response(JSON.stringify({ ok: true, jobId: "job-pr-68" }), { status: 200 }),
+      },
+    );
+
+    await agent.poll();
+
+    expect(closeCalls).toBe(0);
+    expect(deleteCalls).toBe(0);
+    expect(commentCalls).toBe(1);
+  });
+
+  test("enforces give-up cap using resolved GitHub identity when allowlist env absent", async () => {
+    const previousEnv = process.env[REVIEW_AGENT_LOGIN_ENV_KEY];
+    delete process.env[REVIEW_AGENT_LOGIN_ENV_KEY];
+    const pr = makePr({ number: 70, html_url: "https://example.com/pr/70" });
+    let closeCalls = 0;
+    let deleteCalls = 0;
+    let commentCalls = 0;
+    let userFetchCalls = 0;
+    const comments: PullRequestComment[] = [
+      {
+        id: 1,
+        body: "## ReviewAgent: Changes Rejected (score 7.0/10)\n\n**Verdict:** Needs fixes",
+        userLogin: "review-bot",
+        createdAt: "2026-02-22T00:00:00Z",
+        htmlUrl: "https://example.com/comment/ra",
+      },
+    ];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5, maxPrCommentsBeforeGiveUp: 1 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 7.0,
+            summary: "Needs fixes",
+            issues: ["Update docs"],
+            fix_instruction: "",
+          }),
+        closePullRequest: async () => {
+          closeCalls += 1;
+          return { state: "closed", closed: true };
+        },
+        addPullRequestComment: async () => {
+          commentCalls += 1;
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+        listPullRequestComments: async () => comments,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/user")) {
+            userFetchCalls += 1;
+            return new Response(JSON.stringify({ login: "review-bot", id: 4242 }), {
+              status: 200,
+            });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(userFetchCalls).toBe(1);
+    expect(closeCalls).toBe(1);
+    expect(deleteCalls).toBe(1);
+    expect(commentCalls).toBe(1);
+
+    if (previousEnv === undefined) {
+      delete process.env[REVIEW_AGENT_LOGIN_ENV_KEY];
+    } else {
+      process.env[REVIEW_AGENT_LOGIN_ENV_KEY] = previousEnv;
+    }
   });
 
   test("continues enqueue flow when PR feedback comment lookup fails", async () => {
