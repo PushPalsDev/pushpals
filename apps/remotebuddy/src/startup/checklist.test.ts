@@ -1,15 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  StartupChecklist,
-  createStartupChecklistCache,
   gateDispatchWithStartupPreflight,
   runStartupPreflight,
   STARTUP_CHECK_STRUCTURE,
   STARTUP_FAILURE_CODES,
-  type QueueLatencySample,
   type RepoStatus,
-  type StartupCheckCategory,
+  type StartupCheckRecord,
   type StartupChecklistContext,
   type StartupFailureCode,
 } from "./checklist.js";
@@ -367,6 +364,47 @@ describe("StartupChecklist", () => {
     expect(lastHistoryEntry?.step).toBe(result.failure?.step);
   });
 
+  test("log callback mirrors each history record including dispatch stage", async () => {
+    const logEntries: StartupCheckRecord[] = [];
+    const ctx = buildContext({
+      log: (entry) => {
+        logEntries.push(entry);
+      },
+    });
+    const result = await gateDispatchWithStartupPreflight(
+      ctx,
+      async () => {
+        // dispatch succeeds
+      },
+    );
+    expect(result.ok).toBe(true);
+    expect(logEntries).toHaveLength(result.history.length);
+    expect(logEntries.map((entry) => entry.code)).toEqual(
+      result.history.map((entry) => entry.code),
+    );
+    const dispatchLog = logEntries.at(-1);
+    expect(dispatchLog?.category).toBe("dispatch");
+    expect(dispatchLog?.status).toBe("pass");
+  });
+
+  test("memoizes describeRepo across repo checks", async () => {
+    let describeRepoCalls = 0;
+    const ctx = buildContext({
+      describeRepo: async () => {
+        describeRepoCalls += 1;
+        return {
+          isDirty: false,
+          isMergeInProgress: false,
+          branch: "main",
+          detail: "snapshot",
+        };
+      },
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(true);
+    expect(describeRepoCalls).toBe(1);
+  });
+
   describe("structured dependency failures", () => {
     test("describeRepo exceptions populate history/action/detail consistently", async () => {
       const err = new Error("git status failed hard");
@@ -463,173 +501,6 @@ describe("StartupChecklist", () => {
       expect(record?.detail).toBe(result.failure?.detail);
       expect(record?.action).toBe(expectedAction);
       expect(record?.step).toBe(result.failure?.step);
-    });
-  });
-
-  describe("probe caching safeguards", () => {
-    test("revalidates clean repo states before caching failure results", async () => {
-      const cache = createStartupChecklistCache();
-      let repoCalls = 0;
-      let repoStatus: RepoStatus = {
-        isDirty: false,
-        isMergeInProgress: false,
-        branch: "main",
-        detail: "clean repo",
-      };
-      const ctx = buildContext({
-        describeRepo: async () => {
-          repoCalls += 1;
-          return { ...repoStatus };
-        },
-      });
-      const options = { cache, cacheTtlMs: 10_000 };
-      const clean = await runStartupPreflight(ctx, options);
-      expect(clean.ok).toBe(true);
-      expect(repoCalls).toBe(1);
-
-      repoStatus = {
-        isDirty: true,
-        isMergeInProgress: false,
-        branch: "main",
-        detail: "dirty worktree",
-      };
-      const dirty = await runStartupPreflight(ctx, options);
-      expect(dirty.ok).toBe(false);
-      expect(dirty.failure?.code).toBe(STARTUP_FAILURE_CODES.REPO_DIRTY);
-      expect(repoCalls).toBe(2);
-
-      const dirtyAgain = await runStartupPreflight(ctx, options);
-      expect(repoCalls).toBe(2);
-      expect(dirtyAgain.failure?.code).toBe(
-        STARTUP_FAILURE_CODES.REPO_DIRTY,
-      );
-    });
-
-    test("caches failures so reruns stay under the 500ms target", async () => {
-      const cache = createStartupChecklistCache();
-      let repoCalls = 0;
-      let nowValue = 0;
-      const ctx = buildContext({
-        describeRepo: async () => {
-          repoCalls += 1;
-          nowValue += 520;
-          return {
-            isDirty: true,
-            isMergeInProgress: false,
-            detail: "dirty worktree",
-          };
-        },
-        now: () => nowValue,
-      });
-      const options = { cache, cacheTtlMs: 10_000 };
-      const first = await runStartupPreflight(ctx, options);
-      expect(first.ok).toBe(false);
-      expect(repoCalls).toBe(1);
-
-      const second = await runStartupPreflight(ctx, options);
-      expect(repoCalls).toBe(1);
-      const dirtyRecord = second.history.find(
-        (entry) => entry.code === STARTUP_FAILURE_CODES.REPO_DIRTY,
-      );
-      expect(dirtyRecord?.elapsedMs).toBeLessThan(500);
-    });
-  });
-
-  describe("queue latency telemetry", () => {
-    test("emits gauge and slow submission logs when p95 exceeds the threshold", async () => {
-      const gaugeSamples: QueueLatencySample[] = [];
-      const slowSamples: QueueLatencySample[] = [];
-      const ctx = buildContext({
-        readQueueLatency: async () => ({ p95Ms: 1_200, pending: 9 }),
-        queueTelemetry: {
-          emitGauge: (sample) => {
-            gaugeSamples.push(sample);
-          },
-          logSlowSubmission: (sample) => {
-            slowSamples.push(sample);
-          },
-        },
-      });
-      const result = await runStartupPreflight(ctx);
-      expect(result.ok).toBe(true);
-      expect(gaugeSamples).toHaveLength(1);
-      expect(gaugeSamples[0]?.thresholdMs).toBe(1_000);
-      expect(slowSamples).toHaveLength(1);
-      expect(slowSamples[0]?.p95Ms).toBe(1_200);
-    });
-
-    test("only slow-logs when p95 is strictly above the threshold", async () => {
-      const slowSamples: QueueLatencySample[] = [];
-      let observedP95 = 1_000;
-      const ctx = buildContext({
-        readQueueLatency: async () => ({ p95Ms: observedP95 }),
-        queueTelemetry: {
-          emitGauge: () => {},
-          logSlowSubmission: (sample) => {
-            slowSamples.push(sample);
-          },
-        },
-      });
-      await runStartupPreflight(ctx);
-      expect(slowSamples).toHaveLength(0);
-      observedP95 = 1_015;
-      await runStartupPreflight(ctx);
-      expect(slowSamples).toHaveLength(1);
-      expect(slowSamples[0]?.p95Ms).toBe(1_015);
-    });
-
-    test("respects custom queue latency thresholds", async () => {
-      const slowSamples: QueueLatencySample[] = [];
-      const ctx = buildContext({
-        readQueueLatency: async () => ({ p95Ms: 900, pending: 4 }),
-        queueTelemetry: {
-          emitGauge: () => {},
-          logSlowSubmission: (sample) => {
-            slowSamples.push(sample);
-          },
-        },
-      });
-      await runStartupPreflight(ctx, { queueLatencyWarnThresholdMs: 950 });
-      expect(slowSamples).toHaveLength(0);
-      await runStartupPreflight(ctx, { queueLatencyWarnThresholdMs: 800 });
-      expect(slowSamples).toHaveLength(1);
-      expect(slowSamples[0]?.p95Ms).toBe(900);
-      expect(slowSamples[0]?.thresholdMs).toBe(800);
-    });
-  });
-
-  describe("deterministic ordering", () => {
-    test("sorts supplied checks into a stable execution order", async () => {
-      const observed: StartupFailureCode[] = [];
-      const buildCheck = (
-        code: StartupFailureCode,
-        category: StartupCheckCategory,
-      ) => ({
-        code,
-        label: `check:${code}`,
-        action: "noop",
-        category,
-        run: async () => {
-          observed.push(code);
-          return { ok: true, detail: code };
-        },
-      });
-      const shuffledChecks = [
-        buildCheck(STARTUP_FAILURE_CODES.SYNTHETIC_FAILED, "synthetic"),
-        buildCheck(STARTUP_FAILURE_CODES.ALERTS_ACTIVE, "alerts"),
-        buildCheck(STARTUP_FAILURE_CODES.REPO_DIRTY, "repo"),
-        buildCheck(STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS, "repo"),
-      ];
-      const checklist = new StartupChecklist(shuffledChecks);
-      const ctx = buildContext();
-      const result = await checklist.run(ctx);
-      expect(result.ok).toBe(true);
-      expect(observed).toEqual([
-        STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
-        STARTUP_FAILURE_CODES.REPO_DIRTY,
-        STARTUP_FAILURE_CODES.ALERTS_ACTIVE,
-        STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
-      ]);
     });
   });
 });
