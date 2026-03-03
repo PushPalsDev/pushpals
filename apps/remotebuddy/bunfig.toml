@@ -1,0 +1,10 @@
+[default]
+tsconfig = "../../tsconfig.base.json"
+
+[alias]
+"shared" = "../../packages/shared/src/index.ts"
+"shared/*" = "../../packages/shared/src/*"
+"protocol" = "../../packages/protocol/src/index.ts"
+"protocol/*" = "../../packages/protocol/src/*"
+"protocol/browser" = "../../packages/protocol/src/index.browser.ts"
+"protocol/react-native" = "../../packages/protocol/src/index.browser.ts"

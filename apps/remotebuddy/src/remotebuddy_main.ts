@@ -15,6 +15,7 @@
  *   Defaults resolve from configs/*.toml via shared config loader.
  */
 
+import { PROTOCOL_VERSION } from "protocol";
 import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
