@@ -1,207 +1,331 @@
-import { existsSync, readFileSync, statSync } from "fs";
-import { resolve, isAbsolute } from "path";
-import { detectRepoRoot, loadPushPalsConfig, type PushPalsConfig } from "shared";
+import { execFileSync } from "child_process";
+import { readFileSync, realpathSync, statSync } from "fs";
+import { dirname, join, resolve } from "path";
 
-const SERVER_ENV = "PUSHPALS_SERVER_URL";
-const SESSION_ENV = "PUSHPALS_SESSION_ID";
-const SEQUENCER_INDICATORS = [
-  "MERGE_HEAD",
-  "CHERRY_PICK_HEAD",
-  "REVERT_HEAD",
-  "REBASE_HEAD",
-  "rebase-merge",
-  "rebase-apply",
-  "BISECT_LOG",
-  "sequencer",
-];
+import {
+  type RepoStatus,
+  type StartupChecklistContext,
+  type StartupChecklistFailure,
+  type StartupChecklistOptions,
+  type StartupChecklistResult,
+  type StartupCheckRecord,
+  type SyntheticStartupTestOptions,
+  type SyntheticStartupTestResult,
+  type SyntheticStartupTester,
+  runStartupPreflight,
+} from "./startup/checklist.js";
 
-export type RemoteBuddyPreflightFailureCode = "missing_env" | "sandbox_merge_in_progress";
+export type RepoSequencerFlags = {
+  isMergeInProgress: boolean;
+  isRebaseInProgress: boolean;
+  isCherryPickInProgress: boolean;
+  isRevertInProgress: boolean;
+  indicators: string[];
+};
 
-export type RemoteBuddyPreflightResult =
-  | {
-      ok: true;
-      serverUrl: string;
-      sessionId: string;
-      repoRoot: string;
-      gitDir: string;
-    }
-  | {
-      ok: false;
-      code: RemoteBuddyPreflightFailureCode;
-      detail: string;
-      missing?: string[];
-      indicator?: string;
-      gitDir?: string;
-    };
+export type RepoHealthStatus = RepoStatus & {
+  gitDir: string | null;
+  dirtyFileCount: number;
+  sequencer: RepoSequencerFlags;
+};
+
+export interface RemoteBuddyPreflightFailure extends StartupChecklistFailure {
+  sanitizedDetail: string;
+  rawDetail?: string;
+}
+
+export interface RemoteBuddyPreflightResult {
+  ok: boolean;
+  history: StartupCheckRecord[];
+  repoStatus: RepoHealthStatus;
+  failure?: RemoteBuddyPreflightFailure;
+}
 
 export interface RemoteBuddyPreflightOptions {
-  env?: NodeJS.ProcessEnv;
-  config?: PushPalsConfig;
-  repoRoot?: string;
-  resolveGitDir?: (repoRoot: string) => Promise<string | null>;
+  repoRoot: string;
+  allowDirtyWorktree?: boolean;
+  syntheticMaxLatencyMs?: number;
+  syntheticProbeName?: string;
+  listFiringAlerts?: () => Promise<string[]>;
+  syntheticTester?: SyntheticStartupTester;
+  now?: () => number;
+  log?: (record: StartupCheckRecord) => void;
+}
+
+type GitRunResult = {
+  stdout: string;
+  exitCode: number;
+};
+
+type ReplacementPattern = {
+  regex: RegExp;
+  replacement: string;
+};
+
+const DEFAULT_SYNTHETIC_TESTER: SyntheticStartupTester = {
+  async runSyntheticJob(options: SyntheticStartupTestOptions): Promise<SyntheticStartupTestResult> {
+    return { ok: true, latencyMs: options.maxLatencyMs ?? 0 };
+  },
+};
+
+const DEFAULT_ALERTS_LIST = async (): Promise<string[]> => [];
+
+async function git(args: string[], cwd: string): Promise<GitRunResult> {
+  const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  const [stdout, , exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { stdout: stdout.trim(), exitCode };
+}
+
+function ensureRealPath(target: string): string {
+  try {
+    return realpathSync(target);
+  } catch {
+    return target;
+  }
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function collectPathVariants(pathValue: string): string[] {
+  const variants = new Set<string>();
+  const record = (candidate: string | undefined | null) => {
+    const trimmed = candidate?.trim();
+    if (!trimmed) return;
+    variants.add(trimmed);
+    variants.add(trimmed.replace(/\\/g, "/"));
+    variants.add(trimmed.replace(/\//g, "\\"));
+  };
+  record(pathValue);
+  const real = ensureRealPath(pathValue);
+  if (real !== pathValue) {
+    record(real);
+  }
+  return Array.from(variants).filter(Boolean);
+}
+
+function buildPathReplacementPatterns(pathValue: string, replacement: string): ReplacementPattern[] {
+  return collectPathVariants(pathValue).map((variant) => ({
+    regex: new RegExp(escapeRegex(variant), "gi"),
+    replacement,
+  }));
+}
+
+function resolveGitDirViaGit(repoRoot: string): string | null {
+  try {
+    const output = execFileSync("git", ["rev-parse", "--git-dir"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const dir = output.toString("utf8").trim();
+    if (!dir) return null;
+    return ensureRealPath(resolve(repoRoot, dir));
+  } catch {
+    return null;
+  }
+}
+
+export function resolveGitDirPath(repoRoot: string): string | null {
+  const gitPath = join(repoRoot, ".git");
+  try {
+    const stats = statSync(gitPath);
+    if (stats.isDirectory()) return ensureRealPath(gitPath);
+    if (!stats.isFile()) return null;
+    const contents = readFileSync(gitPath, "utf8");
+    const match = contents.match(/gitdir:\s*(.+)\s*/i);
+    if (!match) return null;
+    const pointer = match[1].trim();
+    if (!pointer) return null;
+    return ensureRealPath(resolve(dirname(gitPath), pointer));
+  } catch {
+    // fall through to git-based discovery
+  }
+  return resolveGitDirViaGit(repoRoot);
+}
+
+function pathExists(path: string, expectDirectory = false): boolean {
+  try {
+    const stats = statSync(path);
+    if (expectDirectory) return stats.isDirectory();
+    return stats.isFile() || stats.isFIFO() || stats.isCharacterDevice();
+  } catch {
+    return false;
+  }
+}
+
+export function detectSequencerFlags(gitDir: string | null): RepoSequencerFlags {
+  if (!gitDir) {
+    return {
+      isMergeInProgress: false,
+      isRebaseInProgress: false,
+      isCherryPickInProgress: false,
+      isRevertInProgress: false,
+      indicators: [],
+    };
+  }
+
+  const indicators: string[] = [];
+  const mergeHead = pathExists(join(gitDir, "MERGE_HEAD"));
+  if (mergeHead) indicators.push("MERGE_HEAD");
+  const rebaseApply = pathExists(join(gitDir, "rebase-apply"), true);
+  if (rebaseApply) indicators.push("rebase-apply");
+  const rebaseMerge = pathExists(join(gitDir, "rebase-merge"), true);
+  if (rebaseMerge) indicators.push("rebase-merge");
+  const cherryPick = pathExists(join(gitDir, "CHERRY_PICK_HEAD"));
+  if (cherryPick) indicators.push("CHERRY_PICK_HEAD");
+  const revert = pathExists(join(gitDir, "REVERT_HEAD"));
+  if (revert) indicators.push("REVERT_HEAD");
+
+  return {
+    isMergeInProgress: mergeHead,
+    isRebaseInProgress: rebaseApply || rebaseMerge,
+    isCherryPickInProgress: cherryPick,
+    isRevertInProgress: revert,
+    indicators,
+  };
+}
+
+function buildRepoDetail(status: RepoHealthStatus): string {
+  const notes: string[] = [];
+  if (status.dirtyFileCount > 0) {
+    notes.push(`${status.dirtyFileCount} dirty path${status.dirtyFileCount === 1 ? "" : "s"}`);
+  }
+  if (status.sequencer.indicators.length > 0) {
+    notes.push(`sequencer active (${status.sequencer.indicators.join(", ")})`);
+  }
+  return notes.length > 0 ? notes.join("; ") : "Repo clean.";
+}
+
+export async function describeRepo(
+  repoRoot: string,
+  gitDirOverride?: string | null,
+): Promise<RepoHealthStatus> {
+  const gitDirCandidate = gitDirOverride ?? resolveGitDirPath(repoRoot);
+  const gitDir = gitDirCandidate ? ensureRealPath(gitDirCandidate) : null;
+  const sequencer = detectSequencerFlags(gitDir);
+  const [statusResult, branchResult] = await Promise.all([
+    git(["status", "--porcelain"], repoRoot),
+    git(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot),
+  ]);
+  const dirtyLines = statusResult.stdout
+    ? statusResult.stdout.split("\n").map((line) => line.trim()).filter(Boolean)
+    : [];
+  const dirtyFileCount = dirtyLines.length;
+  const repoStatus: RepoHealthStatus = {
+    isDirty: dirtyFileCount > 0,
+    isMergeInProgress:
+      sequencer.isMergeInProgress ||
+      sequencer.isRebaseInProgress ||
+      sequencer.isCherryPickInProgress ||
+      sequencer.isRevertInProgress,
+    branch: branchResult.stdout || undefined,
+    detail: "",
+    gitDir,
+    dirtyFileCount,
+    sequencer,
+  };
+  return { ...repoStatus, detail: buildRepoDetail(repoStatus) };
+}
+
+export function sanitizePreflightDetail(detail: string | undefined, repoRoot?: string): string {
+  const replacementPatterns: ReplacementPattern[] = [];
+  if (repoRoot) {
+    replacementPatterns.push(...buildPathReplacementPatterns(repoRoot, "<repo>"));
+  }
+  const home = process.env.HOME;
+  if (home) {
+    replacementPatterns.push(...buildPathReplacementPatterns(home, "~"));
+  }
+  const normalized = String(detail ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "Preflight failed (no detail provided).";
+  let redacted = normalized;
+  for (const { regex, replacement } of replacementPatterns) {
+    redacted = redacted.replace(regex, replacement);
+  }
+  return redacted.length > 500 ? `${redacted.slice(0, 497)}...` : redacted;
+}
+
+export function formatStartupCheckLog(
+  record: StartupCheckRecord,
+  options: { repoRoot?: string; source: string },
+): { level: "info" | "error"; message: string; detail: string } {
+  const detail = sanitizePreflightDetail(record.detail, options.repoRoot);
+  const prefix = `[RemoteBuddy][preflight][${options.source}] step=${record.step} code=${record.code}`;
+  const suffix = record.status === "pass" ? `: ${detail}` : ` FAILED: ${detail}`;
+  return {
+    level: record.status === "pass" ? "info" : "error",
+    detail,
+    message: `${prefix}${suffix}`,
+  };
+}
+
+export class RemoteBuddyPreflightCache {
+  private entry: { result: RemoteBuddyPreflightResult; expiresAt: number } | null = null;
+
+  constructor(private readonly ttlMs = 500, private readonly now: () => number = () => Date.now()) {}
+
+  get(): RemoteBuddyPreflightResult | null {
+    if (!this.entry) return null;
+    if (this.now() >= this.entry.expiresAt) {
+      this.entry = null;
+      return null;
+    }
+    return this.entry.result;
+  }
+
+  set(result: RemoteBuddyPreflightResult): void {
+    this.entry = { result, expiresAt: this.now() + Math.max(150, this.ttlMs) };
+  }
+
+  invalidate(): void {
+    this.entry = null;
+  }
 }
 
 export async function runRemoteBuddyPreflight(
-  options: RemoteBuddyPreflightOptions = {},
+  options: RemoteBuddyPreflightOptions,
 ): Promise<RemoteBuddyPreflightResult> {
-  const env = options.env ?? process.env;
-  let config = options.config;
-  const getConfig = (): PushPalsConfig => {
-    if (!config) {
-      config = loadPushPalsConfig();
-    }
-    return config;
+  const gitDir = resolveGitDirPath(options.repoRoot);
+  const repoStatusPromise = describeRepo(options.repoRoot, gitDir);
+  const context: StartupChecklistContext = {
+    describeRepo: () => repoStatusPromise,
+    listFiringAlerts: options.listFiringAlerts ?? DEFAULT_ALERTS_LIST,
+    syntheticTester: options.syntheticTester ?? DEFAULT_SYNTHETIC_TESTER,
+    now: options.now,
+    log: options.log,
   };
-
-  const { serverUrl, sessionId, missing } = resolveConnectionDetails(env, getConfig);
-  if (missing.length > 0) {
-    return {
-      ok: false,
-      code: "missing_env",
-      detail: `Missing required value(s): ${missing.join(", ")}`,
-      missing,
-    };
-  }
-
-  const repoRoot = options.repoRoot ?? detectRepoRoot(process.cwd());
-  const resolvedGitDir = await resolveGitDir(repoRoot, options.resolveGitDir);
-  const gitDir = resolvedGitDir ?? resolve(repoRoot, ".git");
-  const indicator = detectSequencerIndicator(resolvedGitDir ?? gitDir);
-  if (indicator) {
-    return {
-      ok: false,
-      code: "sandbox_merge_in_progress",
-      detail: `Git sequencer indicator detected (${indicator}) in ${gitDir}. Resolve merge/rebase state before running RemoteBuddy.`,
-      indicator,
-      gitDir,
-    };
-  }
-
-  return { ok: true, serverUrl, sessionId, repoRoot, gitDir };
+  const checklistOptions: StartupChecklistOptions = {
+    allowDirtyWorktree: options.allowDirtyWorktree,
+    syntheticMaxLatencyMs: options.syntheticMaxLatencyMs,
+    syntheticProbeName: options.syntheticProbeName,
+  };
+  const checklistResult: StartupChecklistResult = await runStartupPreflight(context, checklistOptions);
+  const repoStatus = await repoStatusPromise;
+  const failure = checklistResult.failure
+    ? (() => {
+        const rawDetail = checklistResult.failure.detail;
+        const sanitizedDetail = sanitizePreflightDetail(rawDetail, options.repoRoot);
+        return {
+          ...checklistResult.failure,
+          detail: sanitizedDetail,
+          sanitizedDetail,
+          rawDetail,
+        } satisfies RemoteBuddyPreflightFailure;
+      })()
+    : undefined;
+  return {
+    ok: checklistResult.ok,
+    history: checklistResult.history,
+    repoStatus,
+    failure,
+  };
 }
 
-function resolveConnectionDetails(
-  env: NodeJS.ProcessEnv,
-  getConfig: () => PushPalsConfig,
-): { serverUrl: string; sessionId: string; missing: string[] } {
-  const serverUrl = resolvePreflightValue(env[SERVER_ENV], () => getConfig().server.url);
-  const sessionId = resolvePreflightValue(env[SESSION_ENV], () => getConfig().sessionId);
-
-  const missing: string[] = [];
-  if (!serverUrl) missing.push(SERVER_ENV);
-  if (!sessionId) missing.push(SESSION_ENV);
-
-  return { serverUrl, sessionId, missing };
-}
-
-function firstNonEmpty(...values: Array<string | undefined | null>): string {
-  for (const value of values) {
-    if (typeof value !== "string") continue;
-    const trimmed = value.trim();
-    if (trimmed.length > 0) return trimmed;
-  }
-  return "";
-}
-
-function resolvePreflightValue(
-  envValue: string | undefined,
-  configValue: () => string | undefined,
-): string {
-  const envResolved = firstNonEmpty(envValue);
-  if (envResolved) return envResolved;
-  return firstNonEmpty(configValue());
-}
-
-async function resolveGitDir(
-  repoRoot: string,
-  resolver?: (repoRoot: string) => Promise<string | null>,
-): Promise<string | null> {
-  if (resolver) {
-    const fromResolver = finalizeGitDirCandidate(repoRoot, await resolver(repoRoot));
-    if (fromResolver) return fromResolver;
-  }
-  const fromGit = await gitRevParseGitDir(repoRoot);
-  if (fromGit) return fromGit;
-  return fallbackGitDir(repoRoot);
-}
-
-async function gitRevParseGitDir(repoRoot: string): Promise<string | null> {
-  try {
-    const proc = Bun.spawn(["git", "rev-parse", "--git-dir"], {
-      cwd: repoRoot,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const stdoutPromise = new Response(proc.stdout).text();
-    const stderrPromise = new Response(proc.stderr).text();
-    const exitCode = await proc.exited;
-    const stdout = await stdoutPromise;
-    await stderrPromise;
-    if (exitCode !== 0) return null;
-    const resolved = finalizeGitDirCandidate(repoRoot, stdout);
-    if (resolved) return resolved;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function fallbackGitDir(repoRoot: string): string | null {
-  const dotGitPath = resolve(repoRoot, ".git");
-  if (!existsSync(dotGitPath)) return null;
-  try {
-    const stats = statSync(dotGitPath);
-    if (stats.isDirectory()) return dotGitPath;
-    if (stats.isFile()) {
-      return resolveGitDirPointer(dotGitPath);
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-function normalizeGitDir(repoRoot: string, gitDir: string | null | undefined): string | null {
-  if (!gitDir) return null;
-  const trimmed = gitDir.trim();
-  if (!trimmed) return null;
-  return isAbsolute(trimmed) ? trimmed : resolve(repoRoot, trimmed);
-}
-
-function resolveGitDirPointer(pointerFilePath: string): string | null {
-  try {
-    const contents = readFileSync(pointerFilePath, "utf8");
-    const match = contents.match(/gitdir:\s*(.+)/i);
-    if (!match?.[1]) return null;
-    const pointerBase = resolve(pointerFilePath, "..");
-    return normalizeGitDir(pointerBase, match[1]);
-  } catch {
-    return null;
-  }
-}
-
-function finalizeGitDirCandidate(
-  basePath: string,
-  candidate: string | null | undefined,
-): string | null {
-  const normalized = normalizeGitDir(basePath, candidate);
-  if (!normalized) return null;
-  try {
-    const stats = statSync(normalized);
-    if (stats.isDirectory()) return normalized;
-    if (stats.isFile()) {
-      return resolveGitDirPointer(normalized);
-    }
-  } catch {
-    return normalized;
-  }
-  return normalized;
-}
-
-function detectSequencerIndicator(gitDir: string): string | null {
-  for (const indicator of SEQUENCER_INDICATORS) {
-    const candidate = resolve(gitDir, indicator);
-    if (existsSync(candidate)) return indicator;
-  }
-  return null;
-}
+export type { StartupCheckRecord } from "./startup/checklist.js";

@@ -21,6 +21,7 @@ import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
+import { describeRepo, type RepoHealthStatus } from "./orchestrator_preflight.js";
 
 type AutonomyCandidate = {
   id: string;
@@ -294,17 +295,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: st
   }
 }
 
-async function gitOutput(repo: string, args: string[]): Promise<string> {
-  const proc = Bun.spawn(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
-  const [stdout, _stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (exitCode !== 0) return "";
-  return stdout.trim();
-}
-
 type GitRunResult = {
   ok: boolean;
   exitCode: number;
@@ -315,18 +305,6 @@ type GitRunResult = {
 function sanitizeForGitRef(value: string): string {
   const text = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
   return text || "default";
-}
-
-async function repoPreflight(repo: string): Promise<{
-  isWorktreeDirty: boolean;
-  isMergeInProgress: boolean;
-}> {
-  const porcelain = await gitOutput(repo, ["status", "--porcelain"]);
-  const mergeHead = await gitOutput(repo, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
-  return {
-    isWorktreeDirty: Boolean(porcelain),
-    isMergeInProgress: Boolean(mergeHead),
-  };
 }
 
 export class RemoteBuddyAutonomousEngine {
@@ -594,17 +572,11 @@ export class RemoteBuddyAutonomousEngine {
     return true;
   }
 
-  private async fetchSnapshot(
-    runId: string,
-    preflight: {
-      isWorktreeDirty: boolean;
-      isMergeInProgress: boolean;
-    },
-  ): Promise<Snapshot | null> {
+  private async fetchSnapshot(runId: string, preflight: RepoHealthStatus): Promise<Snapshot | null> {
     const qs = new URLSearchParams({
       sessionId: this.sessionId,
       runId,
-      isWorktreeDirty: preflight.isWorktreeDirty ? "true" : "false",
+      isWorktreeDirty: preflight.isDirty ? "true" : "false",
       isMergeInProgress: preflight.isMergeInProgress ? "true" : "false",
     });
     const res = await fetch(`${this.server}/autonomy/snapshot?${qs.toString()}`, {
@@ -968,7 +940,7 @@ export class RemoteBuddyAutonomousEngine {
       }
 
       this.setPhase("repo_preflight");
-      const preflight = await repoPreflight(this.autonomyRepo);
+      const preflight = await describeRepo(this.autonomyRepo);
       if (preflight.isMergeInProgress) {
         console.log(
           "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (merge/rebase in progress).",
@@ -976,7 +948,7 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "repo_preflight_merge_in_progress";
         return;
       }
-      if (preflight.isWorktreeDirty && !this.cfg.allowDirtyWorktree) {
+      if (preflight.isDirty && !this.cfg.allowDirtyWorktree) {
         console.log(
           "[RemoteBuddyAutonomousEngine] tick skipped: repo preflight blocked (worktree is dirty and allow_dirty_worktree=false).",
         );
