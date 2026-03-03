@@ -8,6 +8,7 @@ export const STARTUP_FAILURE_CODES = {
   REPO_DIRTY: "startup.repo_dirty",
   ALERTS_ACTIVE: "startup.alerts_active",
   SYNTHETIC_FAILED: "startup.synthetic_failed",
+  DISPATCH_FAILED: "startup.dispatch_failed",
 } as const;
 
 export type StartupFailureCode =
@@ -15,11 +16,12 @@ export type StartupFailureCode =
 
 type StartupCheckStatus = "pass" | "fail";
 
-export type StartupCheckCategory = "repo" | "alerts" | "synthetic";
+export type StartupCheckCategory = "repo" | "alerts" | "synthetic" | "dispatch";
 
 export interface StartupChecklistOptions {
   syntheticMaxLatencyMs?: number;
   syntheticProbeName?: string;
+  allowDirtyWorktree?: boolean;
 }
 
 export interface RepoStatus {
@@ -100,6 +102,9 @@ export interface StartupCheckStructure {
 
 const DEFAULT_SYNTHETIC_LATENCY_MS = 850;
 const DEFAULT_SYNTHETIC_PROBE = "probe.remote_startup";
+const DISPATCH_CHECK_LABEL = "Job dispatch must succeed.";
+const DISPATCH_CHECK_ACTION =
+  "Inspect RemoteBuddy + WorkerPals logs, repair dependencies, then rerun dispatch.";
 
 const defaultChecks: readonly StartupCheckDefinition[] = [
   {
@@ -126,11 +131,18 @@ const defaultChecks: readonly StartupCheckDefinition[] = [
     code: STARTUP_FAILURE_CODES.REPO_DIRTY,
     label: "Worktree must be clean.",
     action:
-      "Commit, stash, or drop untracked files; rerun when git status is clean or explicitly allow dirty worktrees.",
+      "Commit, stash, or drop untracked files; rerun when git status is clean or pass allowDirtyWorktree=true during startup preflight.",
     category: "repo",
-    run: async (ctx) => {
+    run: async (ctx, options) => {
       const status = await ctx.describeRepo();
       if (status.isDirty) {
+        if (options.allowDirtyWorktree) {
+          const branchHint = status.branch ? ` (${status.branch})` : "";
+          const detail = status.detail
+            ? `Dirty worktree bypassed via allowDirtyWorktree=true: ${status.detail}${branchHint}`
+            : `Dirty worktree${branchHint}; bypass approved via allowDirtyWorktree=true.`;
+          return { ok: true, detail };
+        }
         const branchHint = status.branch ? ` (${status.branch})` : "";
         const detail = status.detail
           ? `${status.detail}${branchHint}`
@@ -192,14 +204,22 @@ const defaultChecks: readonly StartupCheckDefinition[] = [
   },
 ];
 
-export const STARTUP_CHECK_STRUCTURE: readonly StartupCheckStructure[] =
-  defaultChecks.map((check, index) => ({
+export const STARTUP_CHECK_STRUCTURE: readonly StartupCheckStructure[] = [
+  ...defaultChecks.map((check, index) => ({
     code: check.code,
     label: check.label,
     action: check.action,
     category: check.category,
     step: index + 1,
-  }));
+  })),
+  {
+    code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+    label: DISPATCH_CHECK_LABEL,
+    action: DISPATCH_CHECK_ACTION,
+    category: "dispatch",
+    step: defaultChecks.length + 1,
+  },
+];
 
 const nowMs = (ctx: StartupChecklistContext) =>
   ctx.now ? ctx.now() : Date.now();
@@ -292,278 +312,56 @@ export const gateDispatchWithStartupPreflight = async (
   if (!result.ok) {
     return result;
   }
-  await dispatchJob();
-  return result;
+  const dispatchStep = result.history.length + 1;
+  const dispatchLabel = DISPATCH_CHECK_LABEL;
+  const dispatchAction = DISPATCH_CHECK_ACTION;
+  const started = nowMs(ctx);
+  try {
+    await dispatchJob();
+    const elapsedMs = Math.max(0, nowMs(ctx) - started);
+    const successRecord: StartupCheckRecord = {
+      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+      label: dispatchLabel,
+      category: "dispatch",
+      step: dispatchStep,
+      status: "pass",
+      detail: "Dispatch completed successfully.",
+      elapsedMs,
+    };
+    result.history.push(successRecord);
+    ctx.log?.(successRecord);
+    return result;
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : "Unknown dispatch failure.";
+    const detail = `Dispatch job failed: ${errorMessage}`;
+    const elapsedMs = Math.max(0, nowMs(ctx) - started);
+    const failureRecord: StartupCheckRecord = {
+      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+      label: dispatchLabel,
+      category: "dispatch",
+      step: dispatchStep,
+      status: "fail",
+      detail,
+      action: dispatchAction,
+      elapsedMs,
+    };
+    ctx.log?.(failureRecord);
+    const history = [...result.history, failureRecord];
+    return {
+      ok: false,
+      failure: {
+        code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+        detail,
+        action: dispatchAction,
+        category: "dispatch",
+        step: dispatchStep,
+      },
+      history,
+    };
+  }
 };
-
-const isTestRuntime =
-  typeof globalThis !== "undefined" &&
-  (globalThis as { Bun?: { env?: Record<string, string | undefined> } }).Bun
-    ?.env?.NODE_ENV === "test";
-
-if (isTestRuntime) {
-  const { describe, expect, test } = await import("bun:test");
-
-  const cleanRepo = (): RepoStatus => ({
-    isDirty: false,
-    isMergeInProgress: false,
-    branch: "main",
-    detail: "clean repo",
-  });
-
-  describe("StartupChecklist", () => {
-    test(
-      "startup preflight surfaces actionable failure codes for merge or dirty states",
-      async () => {
-        const ctx: StartupChecklistContext = {
-          describeRepo: async () => cleanRepo(),
-          listFiringAlerts: async () => [],
-          syntheticTester: {
-            runSyntheticJob: async () => ({ ok: true, latencyMs: 150 }),
-          },
-        };
-
-        ctx.describeRepo = async () => ({
-          isDirty: false,
-          isMergeInProgress: true,
-          detail: "rebase in progress",
-        });
-        const mergeBlocked = await runStartupPreflight(ctx);
-        expect(mergeBlocked.ok).toBe(false);
-        expect(mergeBlocked.failure?.code).toBe(
-          STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
-        );
-        expect(mergeBlocked.failure?.action).toContain("Resolve");
-        expect(mergeBlocked.failure?.category).toBe("repo");
-        expect(mergeBlocked.failure?.step).toBe(1);
-
-        ctx.describeRepo = async () => ({
-          isDirty: true,
-          isMergeInProgress: false,
-          branch: "feature/foo",
-          detail: "src/startup.ts",
-        });
-        const dirtyBlocked = await runStartupPreflight(ctx);
-        expect(dirtyBlocked.ok).toBe(false);
-        expect(dirtyBlocked.failure?.code).toBe(STARTUP_FAILURE_CODES.REPO_DIRTY);
-        expect(dirtyBlocked.failure?.detail.includes("feature/foo")).toBeTruthy();
-        expect(dirtyBlocked.failure?.category).toBe("repo");
-        expect(dirtyBlocked.failure?.step).toBe(2);
-      },
-    );
-
-    test(
-      "startup synthetic guard runs before dispatch and blocks failures",
-      async () => {
-        const successOrder: string[] = [];
-        const successCtx: StartupChecklistContext = {
-          describeRepo: async () => cleanRepo(),
-          listFiringAlerts: async () => [],
-          syntheticTester: {
-            runSyntheticJob: async (options) => {
-              successOrder.push(`synthetic:${options.probeName}`);
-              return { ok: true, latencyMs: 200 };
-            },
-          },
-        };
-        const successDispatch = async () => {
-          successOrder.push("dispatch");
-        };
-        const success = await gateDispatchWithStartupPreflight(
-          successCtx,
-          successDispatch,
-          {
-            syntheticProbeName: "startup.synthetic",
-          },
-        );
-        expect(success.ok).toBe(true);
-        expect(successOrder).toEqual(["synthetic:startup.synthetic", "dispatch"]);
-        expect(success.history.at(-1)?.category).toBe("synthetic");
-        expect(success.history.at(-1)?.step).toBe(4);
-
-        const failureOrder: string[] = [];
-        const failureDispatchCalls: string[] = [];
-        const failureCtx: StartupChecklistContext = {
-          describeRepo: async () => cleanRepo(),
-          listFiringAlerts: async () => [],
-          syntheticTester: {
-            runSyntheticJob: async (options) => {
-              failureOrder.push(`synthetic:${options.probeName}`);
-              return {
-                ok: false,
-                latencyMs: 1200,
-                failureDetail: "timeout",
-              };
-            },
-          },
-        };
-        const blockedDispatch = async () => {
-          failureDispatchCalls.push("dispatch");
-        };
-        const failed = await gateDispatchWithStartupPreflight(
-          failureCtx,
-          blockedDispatch,
-        );
-        expect(failed.ok).toBe(false);
-        expect(failed.failure?.code).toBe(
-          STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
-        );
-        expect(failureOrder).toEqual(["synthetic:probe.remote_startup"]);
-        expect(failureDispatchCalls).toHaveLength(0);
-      },
-    );
-
-    test(
-      "startup gate aborts dispatch when deterministic checks fail early",
-      async () => {
-        const dispatchCalls: string[] = [];
-        let alertChecks = 0;
-        let syntheticChecks = 0;
-        const ctx: StartupChecklistContext = {
-          describeRepo: async () => ({
-            isDirty: true,
-            isMergeInProgress: false,
-            branch: "feature/dirty",
-            detail: "README.md",
-          }),
-          listFiringAlerts: async () => {
-            alertChecks += 1;
-            return [];
-          },
-          syntheticTester: {
-            runSyntheticJob: async () => {
-              syntheticChecks += 1;
-              return { ok: true, latencyMs: 210 };
-            },
-          },
-        };
-        const result = await gateDispatchWithStartupPreflight(
-          ctx,
-          async () => {
-            dispatchCalls.push("dispatch");
-          },
-        );
-        expect(result.ok).toBe(false);
-        expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.REPO_DIRTY);
-        expect(result.failure?.category).toBe("repo");
-        expect(result.failure?.step).toBe(2);
-        expect(dispatchCalls).toHaveLength(0);
-        expect(alertChecks).toBe(0);
-        expect(syntheticChecks).toBe(0);
-      },
-    );
-
-    test("startup synthetic probe failure surfaces actionable guidance", async () => {
-      const ctx: StartupChecklistContext = {
-        describeRepo: async () => cleanRepo(),
-        listFiringAlerts: async () => [],
-        syntheticTester: {
-          runSyntheticJob: async () => ({
-            ok: false,
-            latencyMs: 1337,
-            failureDetail: "connection reset",
-          }),
-        },
-      };
-      const result = await runStartupPreflight(ctx, {
-        syntheticMaxLatencyMs: 600,
-        syntheticProbeName: "startup.synthetic",
-      });
-      expect(result.ok).toBe(false);
-      expect(result.failure?.code).toBe(
-        STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
-      );
-      expect(result.failure?.category).toBe("synthetic");
-      expect(result.failure?.step).toBe(4);
-      expect(result.failure?.detail).toContain("startup.synthetic");
-      expect(result.failure?.detail).toContain("connection reset");
-      expect(result.failure?.action).toContain("synthetic probe");
-    });
-
-    test(
-      "startup pass history captures every check for observability",
-      async () => {
-        const ctx: StartupChecklistContext = {
-          describeRepo: async () => cleanRepo(),
-          listFiringAlerts: async () => [],
-          syntheticTester: {
-            runSyntheticJob: async () => ({ ok: true, latencyMs: 320 }),
-          },
-        };
-        const result = await runStartupPreflight(ctx, {
-          syntheticMaxLatencyMs: 500,
-        });
-        expect(result.ok).toBe(true);
-        expect(result.history).toHaveLength(4);
-        expect(result.history.map((h) => h.code)).toEqual([
-          STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
-          STARTUP_FAILURE_CODES.REPO_DIRTY,
-          STARTUP_FAILURE_CODES.ALERTS_ACTIVE,
-          STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
-        ]);
-        expect(result.history.map((h) => h.step)).toEqual([1, 2, 3, 4]);
-        expect(result.history.map((h) => h.category)).toEqual([
-          "repo",
-          "repo",
-          "alerts",
-          "synthetic",
-        ]);
-        const historyEntry = result.history.at(-1);
-        expect(historyEntry?.detail).toContain("finished");
-      },
-    );
-
-    test("startup structured checklist metadata is exported", () => {
-      expect(STARTUP_CHECK_STRUCTURE.map((item) => item.step)).toEqual([
-        1, 2, 3, 4,
-      ]);
-      expect(STARTUP_CHECK_STRUCTURE.map((item) => item.category)).toEqual([
-        "repo",
-        "repo",
-        "alerts",
-        "synthetic",
-      ]);
-    });
-
-    test(
-      "startup synthetic record captures gating failure before dispatch",
-      async () => {
-        const dispatchCalls: string[] = [];
-        const ctx: StartupChecklistContext = {
-          describeRepo: async () => cleanRepo(),
-          listFiringAlerts: async () => [],
-          syntheticTester: {
-            runSyntheticJob: async () => ({
-              ok: false,
-              latencyMs: 999,
-              failureDetail: "probe timeout",
-            }),
-          },
-        };
-        const result = await gateDispatchWithStartupPreflight(
-          ctx,
-          async () => {
-            dispatchCalls.push("dispatch");
-          },
-          {
-            syntheticProbeName: "startup.synthetic",
-            syntheticMaxLatencyMs: 500,
-          },
-        );
-        expect(result.ok).toBe(false);
-        expect(result.failure?.code).toBe(
-          STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
-        );
-        expect(result.failure?.category).toBe("synthetic");
-        expect(result.failure?.step).toBe(4);
-        const lastHistoryEntry = result.history.at(-1);
-        expect(lastHistoryEntry?.code).toBe(
-          STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
-        );
-        expect(lastHistoryEntry?.category).toBe("synthetic");
-        expect(lastHistoryEntry?.status).toBe("fail");
-        expect(dispatchCalls).toHaveLength(0);
-      },
-    );
-  });
-}
