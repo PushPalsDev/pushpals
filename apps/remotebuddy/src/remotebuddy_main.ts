@@ -44,20 +44,19 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
-import { runRemoteBuddyStartupGuard } from "./startup/startup_guard.js";
-import {
-  createRemoteBuddyCliRuntime,
-  type RemoteBuddyLaunchOptions,
-} from "./remotebuddy_cli_runtime.js";
 import packageJson from "../package.json" assert { type: "json" };
+import { SystemPreflightError } from "./startup/system_preflight.js";
+import {
+  guardStartupAndLaunchRemoteBuddy,
+  type RemoteBuddyLaunchOptions,
+} from "./startup/startup_guard.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
-const RUNTIME_VERSION =
-  typeof (packageJson as { version?: unknown })?.version === "string"
-    ? (packageJson as { version?: string }).version
-    : "0.0.0";
+const pkgVersion = (packageJson as { version?: string }).version;
+const REMOTEBUDDY_VERSION =
+  typeof pkgVersion === "string" && pkgVersion.trim() ? pkgVersion.trim() : "0.0.0";
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
 
@@ -2056,7 +2055,7 @@ async function connectWithRetry(
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-async function launchRemoteBuddy(opts: RemoteBuddyLaunchOptions) {
+export async function launchRemoteBuddy(opts: RemoteBuddyLaunchOptions): Promise<void> {
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
   if (CONFIG.startup.logConfigOnStart) {
@@ -2128,26 +2127,24 @@ async function launchRemoteBuddy(opts: RemoteBuddyLaunchOptions) {
   orchestrator.startPolling(pollMs);
 }
 
-const runtime = createRemoteBuddyCliRuntime({
-  version: RUNTIME_VERSION,
-  defaults: {
-    server: CONFIG.server.url,
-    sessionId: CONFIG.sessionId,
-    authToken: CONFIG.authToken,
-  },
-  guard: (options) => runRemoteBuddyStartupGuard(options),
-  launch: (options) => launchRemoteBuddy(options),
-  detectRepoRoot: () => detectRepoRoot(process.cwd()),
-});
-
 if (import.meta.main) {
-  runtime
-    .run()
-    .then((state) => {
-      process.exitCode = state.code;
-    })
-    .catch((err) => {
-      console.error("[RemoteBuddy] Fatal:", err);
-      process.exit(1);
-    });
+  guardStartupAndLaunchRemoteBuddy({
+    version: REMOTEBUDDY_VERSION,
+    defaults: {
+      server: CONFIG.server.url,
+      sessionId: CONFIG.sessionId ?? null,
+      authToken: CONFIG.authToken ?? null,
+      allowDirtyWorktree: CONFIG.remotebuddy.autonomy.allowDirtyWorktree,
+    },
+    run: (cli) => launchRemoteBuddy(cli),
+  }).catch((err) => {
+    if (err instanceof SystemPreflightError) {
+      console.error(
+        `[RemoteBuddy] Startup preflight blocked (${err.code}): ${err.detail}`,
+      );
+      process.exit(2);
+    }
+    console.error("[RemoteBuddy] Fatal:", err);
+    process.exit(1);
+  });
 }
