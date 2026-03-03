@@ -112,7 +112,8 @@ const DISPATCH_CHECK_LABEL = "Job dispatch must succeed.";
 const DISPATCH_CHECK_ACTION =
   "Inspect RemoteBuddy + WorkerPals logs, repair dependencies, then rerun dispatch.";
 
-const defaultChecks: readonly StartupCheckDefinition[] = [
+const defaultChecks = Object.freeze(
+  [
   {
     code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
     label: "Git merge or rebase must be resolved.",
@@ -208,24 +209,27 @@ const defaultChecks: readonly StartupCheckDefinition[] = [
       return { ok: false, detail };
     },
   },
-];
+  ] satisfies readonly StartupCheckDefinition[],
+);
 
-export const STARTUP_CHECK_STRUCTURE: readonly StartupCheckStructure[] = [
-  ...defaultChecks.map((check, index) => ({
-    code: check.code,
-    label: check.label,
-    action: check.action,
-    category: check.category,
-    step: index + 1,
-  })),
-  {
-    code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
-    label: DISPATCH_CHECK_LABEL,
-    action: DISPATCH_CHECK_ACTION,
-    category: "dispatch",
-    step: defaultChecks.length + 1,
-  },
-];
+export const STARTUP_CHECK_STRUCTURE = Object.freeze(
+  [
+    ...defaultChecks.map((check, index) => ({
+      code: check.code,
+      label: check.label,
+      action: check.action,
+      category: check.category,
+      step: index + 1,
+    })),
+    {
+      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+      label: DISPATCH_CHECK_LABEL,
+      action: DISPATCH_CHECK_ACTION,
+      category: "dispatch",
+      step: defaultChecks.length + 1,
+    },
+  ] satisfies readonly StartupCheckStructure[],
+);
 
 const nowMs = (ctx: StartupChecklistContext) =>
   ctx.now ? ctx.now() : Date.now();

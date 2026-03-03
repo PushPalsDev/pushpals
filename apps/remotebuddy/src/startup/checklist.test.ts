@@ -6,6 +6,7 @@ import {
   STARTUP_CHECK_STRUCTURE,
   STARTUP_FAILURE_CODES,
   type RepoStatus,
+  type StartupCheckRecord,
   type StartupChecklistContext,
   type StartupCheckRecord,
   type StartupFailureCode,
@@ -585,6 +586,47 @@ describe("StartupChecklist", () => {
     expect(lastHistoryEntry?.detail).toBe(result.failure?.detail);
     expect(lastHistoryEntry?.action).toBe(expectedAction);
     expect(lastHistoryEntry?.step).toBe(result.failure?.step);
+  });
+
+  test("log callback mirrors each history record including dispatch stage", async () => {
+    const logEntries: StartupCheckRecord[] = [];
+    const ctx = buildContext({
+      log: (entry) => {
+        logEntries.push(entry);
+      },
+    });
+    const result = await gateDispatchWithStartupPreflight(
+      ctx,
+      async () => {
+        // dispatch succeeds
+      },
+    );
+    expect(result.ok).toBe(true);
+    expect(logEntries).toHaveLength(result.history.length);
+    expect(logEntries.map((entry) => entry.code)).toEqual(
+      result.history.map((entry) => entry.code),
+    );
+    const dispatchLog = logEntries.at(-1);
+    expect(dispatchLog?.category).toBe("dispatch");
+    expect(dispatchLog?.status).toBe("pass");
+  });
+
+  test("memoizes describeRepo across repo checks", async () => {
+    let describeRepoCalls = 0;
+    const ctx = buildContext({
+      describeRepo: async () => {
+        describeRepoCalls += 1;
+        return {
+          isDirty: false,
+          isMergeInProgress: false,
+          branch: "main",
+          detail: "snapshot",
+        };
+      },
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(true);
+    expect(describeRepoCalls).toBe(1);
   });
 
   describe("structured dependency failures", () => {
