@@ -44,6 +44,16 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import type { RemotebuddyPreflightConfig } from "./startup/preflight_runner.js";
+import {
+  ensurePreflightPasses,
+  RemoteBuddyPreflightError,
+  type PreflightGateExecutor,
+} from "./startup/preflight_barrier.js";
+
+export interface RemoteBuddyMainOptions {
+  runPreflightGate?: PreflightGateExecutor;
+}
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -2073,7 +2083,7 @@ async function connectWithRetry(
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-async function main() {
+export async function runRemoteBuddyMain(options: RemoteBuddyMainOptions = {}) {
   const opts = parseArgs();
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
@@ -2086,6 +2096,19 @@ async function main() {
       "[RemoteBuddy] Config snapshot logging disabled (startup.log_config_on_start=false).",
     );
   }
+
+  const preflightConfig: RemotebuddyPreflightConfig = {
+    sessionId: opts.sessionId ?? CONFIG.sessionId ?? null,
+    authToken: opts.authToken ?? CONFIG.authToken ?? null,
+    serverUrl: opts.server ?? CONFIG.server.url ?? null,
+    llmBackend: CONFIG.remotebuddy.llm.backend,
+    llmApiKey: CONFIG.remotebuddy.llm.apiKey ?? null,
+  };
+  await ensurePreflightPasses(preflightConfig, {
+    runPreflightGate: options.runPreflightGate,
+    env: process.env,
+    logger: console,
+  });
 
   // ── Initialise LLM + brain ──
   let brain: AgentBrain;
@@ -2147,7 +2170,13 @@ async function main() {
   orchestrator.startPolling(pollMs);
 }
 
-main().catch((err) => {
-  console.error("[RemoteBuddy] Fatal:", err);
-  process.exit(1);
-});
+async function main() {
+  await runRemoteBuddyMain();
+}
+
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("[RemoteBuddy] Fatal:", err);
+    process.exit(1);
+  });
+}
