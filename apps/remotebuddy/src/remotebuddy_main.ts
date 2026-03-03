@@ -44,36 +44,122 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import {
+  SystemPreflightError,
+  type StartupPreflightFailurePayload,
+} from "./startup/system_preflight.js";
+import {
+  guardStartupAndLaunchRemoteBuddy,
+  type StartupCliArguments,
+} from "./startup/startup_guard.js";
+import manifest from "../package.json" assert { type: "json" };
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
+const REMOTEBUDDY_VERSION =
+  typeof manifest?.version === "string" && manifest.version.trim().length > 0
+    ? manifest.version
+    : "0.0.0";
 
-function parseArgs(): {
+type CliMode = "start" | "help" | "version";
+
+interface ParsedCliArguments {
   server: string;
   sessionId: string | null;
   authToken: string | null;
-} {
+  mode: CliMode;
+}
+
+class CliArgumentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliArgumentError";
+  }
+}
+
+const requireFlagValue = (
+  args: string[],
+  currentIndex: number,
+  flag: string,
+): [string, number] => {
+  const nextIndex = currentIndex + 1;
+  const value = args[nextIndex];
+  if (!value || value.startsWith("--")) {
+    throw new CliArgumentError(`Flag ${flag} requires a value.`);
+  }
+  const normalized = value.trim();
+  if (!normalized) {
+    throw new CliArgumentError(`Flag ${flag} requires a non-empty value.`);
+  }
+  return [normalized, nextIndex];
+};
+
+function parseArgs(): ParsedCliArguments {
   const args = process.argv.slice(2);
   let server = CONFIG.server.url;
   let sessionId: string | null = CONFIG.sessionId;
   let authToken = CONFIG.authToken;
+  let mode: CliMode = "start";
 
   for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
+    const current = args[i];
+    if (current === "--help" || current === "-h") {
+      mode = "help";
+      break;
+    }
+    if (current === "--version" || current === "-V") {
+      mode = "version";
+      break;
+    }
+    switch (current) {
       case "--server":
-        server = args[++i];
+        {
+          const [value, consumedIndex] = requireFlagValue(args, i, "--server");
+          server = value;
+          i = consumedIndex;
+        }
         break;
       case "--sessionId":
-        sessionId = args[++i];
+        {
+          const [value, consumedIndex] = requireFlagValue(args, i, "--sessionId");
+          sessionId = value;
+          i = consumedIndex;
+        }
         break;
       case "--token":
-        authToken = args[++i];
+        {
+          const [value, consumedIndex] = requireFlagValue(args, i, "--token");
+          authToken = value;
+          i = consumedIndex;
+        }
         break;
     }
   }
 
-  return { server, sessionId, authToken };
+  return { server, sessionId, authToken, mode };
+}
+
+const toStartupCliArguments = (cli: ParsedCliArguments): StartupCliArguments => ({
+  server: cli.server,
+  sessionId: cli.sessionId,
+  authToken: cli.authToken,
+});
+
+function printHelp(): void {
+  console.log("[RemoteBuddy] RemoteBuddy Orchestrator");
+  console.log("Usage: bun run src/remotebuddy_main.ts [options]");
+  console.log("Options:");
+  console.log("  --server <url>       Override server URL (defaults to configs/*.toml)");
+  console.log("  --sessionId <id>     Resume the given session (auto-creates if missing)");
+  console.log("  --token <token>      Override auth token used for server requests");
+  console.log("  -h, --help           Show this help message and exit");
+  console.log("  -V, --version        Print version details and exit");
+}
+
+function printVersion(): void {
+  const bunVersion = process.versions?.bun ?? "unknown";
+  console.log(`[RemoteBuddy] RemoteBuddy v${REMOTEBUDDY_VERSION} (Bun ${bunVersion})`);
 }
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
@@ -2073,8 +2159,7 @@ async function connectWithRetry(
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-async function main() {
-  const opts = parseArgs();
+async function startRemoteBuddyOrchestrator(opts: StartupCliArguments) {
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
@@ -2147,7 +2232,59 @@ async function main() {
   orchestrator.startPolling(pollMs);
 }
 
+async function main() {
+  let cli: ParsedCliArguments;
+  try {
+    cli = parseArgs();
+  } catch (error) {
+    if (error instanceof CliArgumentError) {
+      console.error(`[RemoteBuddy] CLI argument error: ${error.message}`);
+      process.exit(1);
+      return;
+    }
+    throw error;
+  }
+  if (cli.mode === "help") {
+    printHelp();
+    return;
+  }
+  if (cli.mode === "version") {
+    printVersion();
+    return;
+  }
+  await guardStartupAndLaunchRemoteBuddy(
+    toStartupCliArguments(cli),
+    startRemoteBuddyOrchestrator,
+  );
+}
+
+const emitStructuredPreflightFailure = (
+  payload: StartupPreflightFailurePayload,
+): void => {
+  console.error(
+    JSON.stringify({
+      source: "remotebuddy.startup_preflight",
+      severity: "error",
+      timestamp: new Date().toISOString(),
+      payload,
+    }),
+  );
+};
+
+function logStartupPreflightFailure(payload: StartupPreflightFailurePayload): void {
+  emitStructuredPreflightFailure(payload);
+  console.error(
+    `[RemoteBuddy] Startup preflight blocked at step ${payload.step} (${payload.code}): ${payload.detail}`,
+  );
+  console.error(`[RemoteBuddy] Remediation: ${payload.action}`);
+}
+
 main().catch((err) => {
+  if (err instanceof SystemPreflightError) {
+    logStartupPreflightFailure(err.payload);
+    process.exit(1);
+    return;
+  }
   console.error("[RemoteBuddy] Fatal:", err);
   process.exit(1);
 });
