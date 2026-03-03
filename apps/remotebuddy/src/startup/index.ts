@@ -1,3 +1,5 @@
+import { spawnSync } from "child_process";
+
 export type StartupComponent = "bun" | "docker";
 
 export enum StartupFailureAction {
@@ -65,6 +67,8 @@ export interface CommandRunResult {
 }
 
 export type CommandRunner = (command: string[], options?: CommandRunOptions) => CommandRunResult;
+
+const COMMAND_TIMEOUT_EXIT_CODE = 124;
 
 export interface StartupValidatorOptions {
   minBunVersion?: string;
@@ -145,6 +149,8 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
   const runner = options.commandRunner ?? defaultRunner;
   const checks: StartupValidationCheck[] = [];
   const issues: StartupValidationIssue[] = [];
+  const requiredBunVersion = normalizeRequirementVersion(requirements.bun.minVersion);
+  const requiredDockerVersion = normalizeRequirementVersion(requirements.docker.minVersion);
 
   const bunVersion = normalizeVersion(options.bunVersion ?? detectBunVersion());
   if (!bunVersion) {
@@ -152,16 +158,16 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
       component: "bun",
       code: StartupFailureCode.BunVersionUnknown,
       summary: "Bun version could not be detected (Bun.version was empty)",
-      required: requirements.bun.minVersion,
+      required: requiredBunVersion,
     });
     pushIssue(issue, checks, issues);
-  } else if (compareVersions(bunVersion, requirements.bun.minVersion) < 0) {
+  } else if (compareVersions(bunVersion, requiredBunVersion) < 0) {
     const issue = createIssue({
       component: "bun",
       code: StartupFailureCode.BunVersionUnsupported,
-      summary: `Bun ${bunVersion} is below required ${requirements.bun.minVersion}`,
+      summary: `Bun ${bunVersion} is below required ${requiredBunVersion}`,
       observed: bunVersion,
-      required: requirements.bun.minVersion,
+      required: requiredBunVersion,
     });
     pushIssue(issue, checks, issues);
   } else {
@@ -170,7 +176,7 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
       passed: true,
       summary: `Bun ${bunVersion} detected`,
       observed: bunVersion,
-      required: requirements.bun.minVersion,
+      required: requiredBunVersion,
     });
   }
 
@@ -180,7 +186,7 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
       component: "docker",
       code: StartupFailureCode.DockerBinaryMissing,
       summary: "Docker CLI was not found in PATH",
-      required: requirements.docker.minVersion,
+      required: requiredDockerVersion,
     });
     pushIssue(issue, checks, issues);
   } else {
@@ -198,7 +204,7 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
         code: StartupFailureCode.DockerDaemonUnavailable,
         summary: "Docker version command timed out",
         detail: `Timeout after ${requirements.docker.timeoutMs}ms while running ${renderCommand(dockerVersionCommand)}`,
-        required: requirements.docker.minVersion,
+        required: requiredDockerVersion,
       });
       pushIssue(issue, checks, issues);
     } else if (runResult.error) {
@@ -207,7 +213,7 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
         code: StartupFailureCode.DockerDaemonUnavailable,
         summary: "Docker command threw before producing output",
         detail: `${runResult.error}`,
-        required: requirements.docker.minVersion,
+        required: requiredDockerVersion,
       });
       pushIssue(issue, checks, issues);
     } else if (runResult.exitCode !== 0) {
@@ -217,7 +223,7 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
         summary: "Docker daemon is not reachable (docker version failed)",
         detail: sanitizeCliOutput(runResult.stderr) || sanitizeCliOutput(runResult.stdout) ||
           `docker version exited with code ${runResult.exitCode}`,
-        required: requirements.docker.minVersion,
+        required: requiredDockerVersion,
       });
       pushIssue(issue, checks, issues);
     } else {
@@ -228,16 +234,16 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
           code: StartupFailureCode.DockerVersionUnparseable,
           summary: "Docker version output could not be parsed",
           detail: sanitizeCliOutput(runResult.stdout) || "(empty output)",
-          required: requirements.docker.minVersion,
+          required: requiredDockerVersion,
         });
         pushIssue(issue, checks, issues);
-      } else if (compareVersions(parsedVersion, requirements.docker.minVersion) < 0) {
+      } else if (compareVersions(parsedVersion, requiredDockerVersion) < 0) {
         const issue = createIssue({
           component: "docker",
           code: StartupFailureCode.DockerVersionUnsupported,
-          summary: `Docker ${parsedVersion} is below required ${requirements.docker.minVersion}`,
+          summary: `Docker ${parsedVersion} is below required ${requiredDockerVersion}`,
           observed: parsedVersion,
-          required: requirements.docker.minVersion,
+          required: requiredDockerVersion,
         });
         pushIssue(issue, checks, issues);
       } else {
@@ -246,7 +252,7 @@ export function validateStartupPrerequisites(options: StartupValidatorOptions = 
           passed: true,
           summary: `Docker ${parsedVersion} reachable`,
           observed: parsedVersion,
-          required: requirements.docker.minVersion,
+          required: requiredDockerVersion,
         });
       }
     }
@@ -281,15 +287,37 @@ function parseDockerVersion(raw: string): string | null {
   try {
     const parsed = JSON.parse(trimmed);
     if (parsed && typeof parsed.Version === "string" && parsed.Version.trim().length > 0) {
-      return parsed.Version.trim();
+      const normalized = normalizeVersion(parsed.Version);
+      if (normalized) return normalized;
     }
     // Fallback when templating is unavailable and CLI returns plain text
     if (typeof parsed === "string" && parsed.trim().length > 0) {
-      return parsed.trim();
+      const normalized = normalizeVersion(parsed);
+      if (normalized) return normalized;
     }
   } catch {
-    const firstLine = trimmed.split(/\r?\n/, 1)[0]?.trim();
-    if (firstLine) return firstLine;
+    // fall through to plain-text handling below
+  }
+
+  const lowerTrimmed = trimmed.toLowerCase();
+  const serverIndex = lowerTrimmed.indexOf("server:");
+  if (serverIndex >= 0) {
+    const serverSection = trimmed.slice(serverIndex);
+    const serverVersionLine = serverSection.match(/Version:\s*([^\r\n]+)/i);
+    if (serverVersionLine?.[1]) {
+      const normalizedServerLine = normalizeVersion(serverVersionLine[1]);
+      if (normalizedServerLine) return normalizedServerLine;
+    }
+    const normalizedServerChunk = normalizeVersion(serverSection);
+    if (normalizedServerChunk) return normalizedServerChunk;
+  }
+
+  const normalized = normalizeVersion(trimmed);
+  if (normalized) return normalized;
+
+  for (const line of trimmed.split(/\r?\n/)) {
+    const normalizedLine = normalizeVersion(line);
+    if (normalizedLine) return normalizedLine;
   }
 
   return null;
@@ -319,46 +347,276 @@ function safeRunCommand(
   runner: CommandRunner,
   command: string[],
   options: CommandRunOptions,
-): CommandRunResult & { timedOut?: boolean } {
+): CommandRunResult & { timedOut: boolean } {
   try {
     const result = runner(command, options);
-    return result;
+    const timedOut = resolveTimedOutFlag(result, options);
+    if (result.timedOut === timedOut) {
+      return result as CommandRunResult & { timedOut: boolean };
+    }
+    return { ...result, timedOut };
   } catch (error) {
-    return { exitCode: -1, stdout: "", stderr: "", error };
+    return { exitCode: -1, stdout: "", stderr: "", error, timedOut: isTimeoutError(error) };
   }
 }
 
 function defaultRunner(command: string[], options?: CommandRunOptions): CommandRunResult {
-  try {
-    const result = Bun.spawnSync(command, { stdout: "pipe", stderr: "pipe" });
+  if (command.length === 0) {
     return {
-      exitCode: result.exitCode,
-      stdout: result.stdout.toString(),
-      stderr: result.stderr.toString(),
+      exitCode: -1,
+      stdout: "",
+      stderr: "",
+      error: new Error("No command provided"),
       timedOut: false,
     };
+  }
+
+  try {
+    const [binary, ...args] = command;
+    const timeout = coerceTimeoutMs(options?.timeoutMs);
+    const spawnResult = spawnSync(binary, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+      timeout,
+      killSignal: "SIGKILL",
+    });
+    const timedOut = didSpawnTimeout(spawnResult, timeout);
+    return {
+      exitCode:
+        typeof spawnResult.status === "number"
+          ? spawnResult.status
+          : timedOut
+            ? COMMAND_TIMEOUT_EXIT_CODE
+            : spawnResult.signal
+              ? 128
+              : -1,
+      stdout: typeof spawnResult.stdout === "string" ? spawnResult.stdout : "",
+      stderr: typeof spawnResult.stderr === "string" ? spawnResult.stderr : "",
+      error: timedOut ? undefined : spawnResult.error,
+      timedOut,
+    };
   } catch (error) {
-    return { exitCode: -1, stdout: "", stderr: "", error };
+    return { exitCode: -1, stdout: "", stderr: "", error, timedOut: isTimeoutError(error) };
   }
 }
 
+type PreReleaseIdentifier = number | string;
+
+interface ParsedSemver {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: PreReleaseIdentifier[];
+  prereleaseText: string[];
+  build: string[];
+  normalized: string;
+}
+
+const STRICT_SEMVER_REGEX =
+  /^(?:v|V)?\d+(?:\.\d+){1,2}(?:-[0-9A-Za-z-.]+)?(?:\+[0-9A-Za-z-.]+)?$/;
+const SEMVER_CANDIDATE_REGEX =
+  /(?:v|V)?\d+(?:\.\d+){1,2}(?:-[0-9A-Za-z-.]+)?(?:\+[0-9A-Za-z-.]+)?/;
+const SEMVER_CORE_REGEX =
+  /^(\d+)\.(\d+)(?:\.(\d+))?(?:-([0-9A-Za-z-.]+))?(?:\+([0-9A-Za-z-.]+))?$/;
+
 function compareVersions(left: string, right: string): number {
-  const leftParts = left.split(".").map((value) => parseInt(value, 10) || 0);
-  const rightParts = right.split(".").map((value) => parseInt(value, 10) || 0);
-  const max = Math.max(leftParts.length, rightParts.length);
+  const leftSemver = parseSemver(left);
+  const rightSemver = parseSemver(right);
+  if (!leftSemver || !rightSemver) {
+    return left === right ? 0 : left > right ? 1 : -1;
+  }
+  return compareParsedSemver(leftSemver, rightSemver);
+}
+
+function compareParsedSemver(left: ParsedSemver, right: ParsedSemver): number {
+  if (left.major !== right.major) {
+    return left.major > right.major ? 1 : -1;
+  }
+  if (left.minor !== right.minor) {
+    return left.minor > right.minor ? 1 : -1;
+  }
+  if (left.patch !== right.patch) {
+    return left.patch > right.patch ? 1 : -1;
+  }
+  const leftHasPrerelease = left.prerelease.length > 0;
+  const rightHasPrerelease = right.prerelease.length > 0;
+  if (!leftHasPrerelease && !rightHasPrerelease) {
+    return 0;
+  }
+  if (!leftHasPrerelease) return 1;
+  if (!rightHasPrerelease) return -1;
+  return comparePrerelease(left.prerelease, right.prerelease);
+}
+
+function normalizeVersion(value: string | null | undefined): string | null {
+  const parsed = parseSemver(value);
+  return parsed?.normalized ?? null;
+}
+
+function normalizeRequirementVersion(value: string): string {
+  const normalized = normalizeVersion(value);
+  if (normalized) return normalized;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : value;
+}
+
+function parseSemver(value: string | null | undefined): ParsedSemver | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const candidate = findSemverCandidate(trimmed);
+  if (!candidate) return null;
+  return parseSemverCore(candidate);
+}
+
+function findSemverCandidate(value: string): string | null {
+  if (STRICT_SEMVER_REGEX.test(value)) {
+    return value;
+  }
+  const matches = value.match(new RegExp(SEMVER_CANDIDATE_REGEX.source, "g"));
+  if (!matches || matches.length === 0) {
+    return null;
+  }
+  let best = matches[0];
+  let bestParsed = parseSemverCore(best);
+  for (let i = 1; i < matches.length; i++) {
+    const candidate = matches[i];
+    const parsedCandidate = parseSemverCore(candidate);
+    if (!parsedCandidate) {
+      if (!bestParsed && candidate.length > best.length) {
+        best = candidate;
+      }
+      continue;
+    }
+    if (!bestParsed) {
+      best = candidate;
+      bestParsed = parsedCandidate;
+      continue;
+    }
+    if (compareParsedSemver(parsedCandidate, bestParsed) > 0) {
+      best = candidate;
+      bestParsed = parsedCandidate;
+    }
+  }
+  return best;
+}
+
+function parseSemverCore(candidate: string): ParsedSemver | null {
+  const sanitized = candidate.replace(/^(?:v|V)/, "");
+  const match = sanitized.match(SEMVER_CORE_REGEX);
+  if (!match) return null;
+  const [, majorRaw, minorRaw, patchRaw, prereleaseRaw, buildRaw] = match;
+  const major = Number.parseInt(majorRaw, 10);
+  const minor = Number.parseInt(minorRaw ?? "0", 10);
+  const patch = Number.parseInt(patchRaw ?? "0", 10);
+  if ([major, minor, patch].some((segment) => Number.isNaN(segment))) {
+    return null;
+  }
+  const prereleaseText = splitIdentifiers(prereleaseRaw);
+  const prerelease = prereleaseText.map((segment) =>
+    /^\d+$/.test(segment) ? Number.parseInt(segment, 10) : segment,
+  );
+  const build = splitIdentifiers(buildRaw);
+  const normalized = formatSemverString(major, minor, patch, prereleaseText, build);
+  return { major, minor, patch, prerelease, prereleaseText, build, normalized };
+}
+
+function splitIdentifiers(value?: string): string[] {
+  if (!value) return [];
+  return value
+    .split(".")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+}
+
+function formatSemverString(
+  major: number,
+  minor: number,
+  patch: number,
+  prerelease: string[],
+  build: string[],
+): string {
+  let normalized = `${major}.${minor}.${patch}`;
+  if (prerelease.length > 0) {
+    normalized += `-${prerelease.join(".")}`;
+  }
+  if (build.length > 0) {
+    normalized += `+${build.join(".")}`;
+  }
+  return normalized;
+}
+
+function comparePrerelease(left: PreReleaseIdentifier[], right: PreReleaseIdentifier[]): number {
+  const max = Math.max(left.length, right.length);
   for (let i = 0; i < max; i++) {
-    const l = leftParts[i] ?? 0;
-    const r = rightParts[i] ?? 0;
-    if (l > r) return 1;
-    if (l < r) return -1;
+    const l = left[i];
+    const r = right[i];
+    if (l === undefined) return -1;
+    if (r === undefined) return 1;
+    if (l === r) continue;
+    if (typeof l === "number" && typeof r === "number") {
+      if (l > r) return 1;
+      if (l < r) return -1;
+      continue;
+    }
+    if (typeof l === "number") return -1;
+    if (typeof r === "number") return 1;
+    const comparison = String(l).localeCompare(String(r));
+    if (comparison !== 0) return comparison;
   }
   return 0;
 }
 
-function normalizeVersion(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  return trimmed.length === 0 ? null : trimmed;
+function isTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  if ("timedOut" in error && typeof (error as { timedOut?: unknown }).timedOut === "boolean") {
+    return Boolean((error as { timedOut?: unknown }).timedOut);
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && code.toUpperCase() === "ETIMEDOUT";
+}
+
+function resolveTimedOutFlag(result: CommandRunResult, options?: CommandRunOptions): boolean {
+  if (typeof result.timedOut === "boolean") {
+    return result.timedOut;
+  }
+  if (result.error && isTimeoutError(result.error)) {
+    return true;
+  }
+  return didExitLikeTimeout(result, options);
+}
+
+function didExitLikeTimeout(result: CommandRunResult, options?: CommandRunOptions): boolean {
+  if (!options) return false;
+  if (typeof options.timeoutMs !== "number" || options.timeoutMs <= 0) {
+    return false;
+  }
+  return result.exitCode === COMMAND_TIMEOUT_EXIT_CODE;
+}
+
+function coerceTimeoutMs(value?: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  if (value <= 0) {
+    return undefined;
+  }
+  const coerced = Math.floor(value);
+  return coerced > 0 ? coerced : undefined;
+}
+
+function didSpawnTimeout(result: ReturnType<typeof spawnSync>, timeout?: number): boolean {
+  if (typeof timeout !== "number" || timeout <= 0) {
+    return false;
+  }
+  if (result.error && isTimeoutError(result.error)) {
+    return true;
+  }
+  if (result.status === null && typeof result.signal === "string") {
+    const normalizedSignal = result.signal.toUpperCase();
+    return normalizedSignal === "SIGKILL" || normalizedSignal === "SIGTERM";
+  }
+  return false;
 }
 
 function sanitizeCliOutput(value: string | undefined): string {
