@@ -612,4 +612,236 @@ describe("server AutonomyStore policy gates", () => {
       .get("obj_guard") as { count: number };
     expect(after.count).toBe(1);
   });
+
+  test("recordOutcome transitions objectives to terminal status and frees concurrency slots", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_terminal" }).snapshot_id;
+
+    const first = store.recordObjectiveDecision({
+      runId: "run_terminal",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_terminal_1",
+        title: "Seed first active objective",
+        instruction: "Fix lint issue in server",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+      },
+    });
+    const second = store.recordObjectiveDecision({
+      runId: "run_terminal",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_terminal_2",
+        title: "Seed second active objective",
+        instruction: "Refresh docs",
+        objective_type: "docs",
+        component_area: "apps/remotebuddy",
+        trigger_type: "queue_health",
+        target_paths: ["apps/remotebuddy/docs/queue.md"],
+        scope: { read_anywhere: false, write_globs: ["apps/remotebuddy/docs/*.md"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+      },
+    });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+
+    const before = store.evaluateEligibility({
+      runId: "run_terminal",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_before_terminal",
+          objective_type: "type_fix",
+          component_area: "apps/server",
+          pattern_key: "pk_before_terminal",
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(before.ok).toBe(true);
+    expect(before.results?.[0]?.ok).toBe(false);
+    expect(String(before.results?.[0]?.reason ?? "")).toContain("max concurrent objectives reached");
+
+    const completed = store.recordOutcome({
+      objectiveId: "obj_terminal_1",
+      patternKey: first.patternKey,
+      requestId: "req_terminal_1",
+      jobId: "job_terminal_1",
+      success: true,
+      userAction: "applied",
+      reopenedWithin24h: false,
+      regressionFlag: false,
+    });
+    expect(completed.ok).toBe(true);
+
+    const after = store.evaluateEligibility({
+      runId: "run_terminal",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_after_terminal",
+          objective_type: "type_fix",
+          component_area: "apps/server",
+          pattern_key: "pk_after_terminal",
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(after.ok).toBe(true);
+    expect(after.results?.[0]?.ok).toBe(true);
+  });
+
+  test("recordOutcome clears active pattern lock after terminal failure", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_pattern_release" }).snapshot_id;
+
+    const seeded = store.recordObjectiveDecision({
+      runId: "run_pattern_release",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_pattern_release",
+        title: "Seed active pattern objective",
+        instruction: "Fix lint issue",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+      },
+    });
+    expect(seeded.ok).toBe(true);
+
+    const blocked = store.evaluateEligibility({
+      runId: "run_pattern_release",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_same_pattern_blocked",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          pattern_key: seeded.patternKey,
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(blocked.ok).toBe(true);
+    expect(blocked.results?.[0]?.ok).toBe(false);
+    expect(String(blocked.results?.[0]?.reason ?? "")).toContain("pattern already has active objective");
+
+    const failed = store.recordOutcome({
+      objectiveId: "obj_pattern_release",
+      patternKey: seeded.patternKey,
+      requestId: "req_pattern_release",
+      jobId: "job_pattern_release",
+      success: false,
+      userAction: "failed",
+      reopenedWithin24h: false,
+      regressionFlag: true,
+    });
+    expect(failed.ok).toBe(true);
+
+    const unblocked = store.evaluateEligibility({
+      runId: "run_pattern_release",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_same_pattern_unblocked",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          pattern_key: seeded.patternKey,
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(unblocked.ok).toBe(true);
+    expect(unblocked.results?.[0]?.ok).toBe(true);
+  });
+
+  test("listInsights returns pattern stats and structured PR feedback", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_insights" }).snapshot_id;
+
+    const decision = store.recordObjectiveDecision({
+      runId: "run_insights",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_insights",
+        title: "Seed objective for insights",
+        instruction: "Fix lint issue for insights query",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const outcome = store.recordOutcome({
+      objectiveId: "obj_insights",
+      patternKey: decision.patternKey,
+      requestId: "req_insights",
+      jobId: "job_insights",
+      success: false,
+      userAction: "failed",
+      reopenedWithin24h: false,
+      regressionFlag: true,
+    });
+    expect(outcome.ok).toBe(true);
+
+    const feedback = store.recordPrFeedback({
+      objectiveId: "obj_insights",
+      patternKey: decision.patternKey,
+      jobId: "job_insights",
+      verdict: "rejected",
+      summary: "Missing validation coverage for edge-case transitions.",
+      reviewScore: 6.2,
+      reviewThreshold: 8.1,
+      comments: [
+        {
+          userLogin: "reviewer-alpha",
+          body: "Please add tests for empty queue and stale-claim handoff.",
+          createdAt: "2026-03-02T12:00:00.000Z",
+          htmlUrl: "https://example.test/comment/1",
+        },
+      ],
+    });
+    expect(feedback.ok).toBe(true);
+
+    const insights = store.listInsights({
+      patternKey: decision.patternKey,
+      objectiveId: "obj_insights",
+      limit: 5,
+      feedbackLimit: 5,
+    });
+    expect(insights.patternStats.length).toBeGreaterThan(0);
+    expect(insights.patternStats[0]?.patternKey).toBe(decision.patternKey);
+    expect(insights.recentPrFeedback.length).toBeGreaterThan(0);
+    expect(insights.recentPrFeedback[0]?.objectiveId).toBe("obj_insights");
+    expect(insights.recentPrFeedback[0]?.summary).toContain("Missing validation coverage");
+    expect(insights.recentPrFeedback[0]?.comments.length).toBeGreaterThan(0);
+  });
 });

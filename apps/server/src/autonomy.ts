@@ -51,6 +51,13 @@ interface PrFeedbackSignalRow {
   comment_count: number | null;
 }
 
+interface PrFeedbackComment {
+  body: string;
+  user_login: string;
+  created_at: string;
+  html_url: string;
+}
+
 interface OpenObjective {
   objective_id: string;
   status: string;
@@ -211,6 +218,41 @@ export interface AutonomySnapshot {
   };
 }
 
+export interface AutonomyPatternStatsInsight {
+  patternKey: string;
+  emaSuccess: number;
+  emaUserAccept: number;
+  emaLatency: number;
+  emaRegret: number;
+  failStreak: number;
+  sampleCount: number;
+  cooldownUntil: string | null;
+  updatedAt: string;
+}
+
+export interface AutonomyPrFeedbackInsight {
+  id: number;
+  createdAt: string;
+  source: string;
+  patternKey: string;
+  objectiveId: string | null;
+  requestId: string | null;
+  jobId: string | null;
+  prNumber: number | null;
+  prUrl: string | null;
+  verdict: string;
+  reviewScore: number | null;
+  reviewThreshold: number | null;
+  summary: string | null;
+  commentCount: number;
+  comments: PrFeedbackComment[];
+}
+
+export interface AutonomyInsights {
+  patternStats: AutonomyPatternStatsInsight[];
+  recentPrFeedback: AutonomyPrFeedbackInsight[];
+}
+
 function asIsoNow(): string {
   return new Date().toISOString();
 }
@@ -272,6 +314,16 @@ function parseJsonObject(raw: string | null): Record<string, unknown> {
     return asObject(JSON.parse(raw));
   } catch {
     return {};
+  }
+}
+
+function parseJsonArray(raw: string | null): unknown[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 }
 
@@ -2188,6 +2240,20 @@ export class AutonomyStore {
         now,
       );
 
+    if (objectiveId) {
+      const terminalStatus = success ? "completed" : "failed";
+      this.db
+        .prepare(
+          `UPDATE autonomy_objectives
+           SET status = ?,
+               request_id = COALESCE(?, request_id),
+               job_id = COALESCE(?, job_id),
+               updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(terminalStatus, requestId, jobId, now, objectiveId);
+    }
+
     const existing = this.db
       .prepare(
         `SELECT ema_success, ema_user_accept, ema_latency, ema_regret, fail_streak, sample_count
@@ -2257,6 +2323,149 @@ export class AutonomyStore {
         now,
       );
     return { ok: true };
+  }
+
+  listInsights(params?: {
+    patternKey?: string;
+    objectiveId?: string;
+    limit?: number;
+    feedbackLimit?: number;
+  }): AutonomyInsights {
+    const limit = Math.max(1, Math.min(200, Math.floor(asNumber(params?.limit, 20))));
+    const feedbackLimit = Math.max(
+      1,
+      Math.min(200, Math.floor(asNumber(params?.feedbackLimit, 30))),
+    );
+    const patternKey = asString(params?.patternKey);
+    const objectiveId = asString(params?.objectiveId);
+
+    const patternStatsRows = patternKey
+      ? (this.db
+          .prepare(
+            `SELECT pattern_key, ema_success, ema_user_accept, ema_latency, ema_regret, fail_streak, sample_count, cooldown_until, updated_at
+             FROM autonomy_pattern_stats
+             WHERE pattern_key = ?
+             ORDER BY updated_at DESC
+             LIMIT ?`,
+          )
+          .all(patternKey, limit) as Array<{
+          pattern_key: string;
+          ema_success: number;
+          ema_user_accept: number;
+          ema_latency: number;
+          ema_regret: number;
+          fail_streak: number;
+          sample_count: number;
+          cooldown_until: string | null;
+          updated_at: string;
+        }>)
+      : (this.db
+          .prepare(
+            `SELECT pattern_key, ema_success, ema_user_accept, ema_latency, ema_regret, fail_streak, sample_count, cooldown_until, updated_at
+             FROM autonomy_pattern_stats
+             ORDER BY updated_at DESC
+             LIMIT ?`,
+          )
+          .all(limit) as Array<{
+          pattern_key: string;
+          ema_success: number;
+          ema_user_accept: number;
+          ema_latency: number;
+          ema_regret: number;
+          fail_streak: number;
+          sample_count: number;
+          cooldown_until: string | null;
+          updated_at: string;
+        }>);
+
+    const prFeedbackWhere: string[] = [];
+    const prFeedbackArgs: Array<string | number> = [];
+    if (patternKey) {
+      prFeedbackWhere.push("pattern_key = ?");
+      prFeedbackArgs.push(patternKey);
+    }
+    if (objectiveId) {
+      prFeedbackWhere.push("objective_id = ?");
+      prFeedbackArgs.push(objectiveId);
+    }
+    const prFeedbackRows = this.db
+      .prepare(
+        `SELECT id, created_at, source, pattern_key, objective_id, request_id, job_id, pr_number, pr_url,
+                verdict, review_score, review_threshold, summary, comment_count, comments_json
+         FROM autonomy_pr_feedback
+         ${prFeedbackWhere.length > 0 ? `WHERE ${prFeedbackWhere.join(" AND ")}` : ""}
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(...prFeedbackArgs, feedbackLimit) as Array<{
+      id: number;
+      created_at: string;
+      source: string | null;
+      pattern_key: string | null;
+      objective_id: string | null;
+      request_id: string | null;
+      job_id: string | null;
+      pr_number: number | null;
+      pr_url: string | null;
+      verdict: string | null;
+      review_score: number | null;
+      review_threshold: number | null;
+      summary: string | null;
+      comment_count: number | null;
+      comments_json: string | null;
+    }>;
+
+    return {
+      patternStats: patternStatsRows.map((row) => ({
+        patternKey: asString(row.pattern_key),
+        emaSuccess: clamp01(asNumber(row.ema_success, 0)),
+        emaUserAccept: clamp01(asNumber(row.ema_user_accept, 0)),
+        emaLatency: clamp01(asNumber(row.ema_latency, 0)),
+        emaRegret: clamp01(asNumber(row.ema_regret, 0)),
+        failStreak: Math.max(0, Math.floor(asNumber(row.fail_streak, 0))),
+        sampleCount: Math.max(0, Math.floor(asNumber(row.sample_count, 0))),
+        cooldownUntil: asString(row.cooldown_until) || null,
+        updatedAt: asString(row.updated_at),
+      })),
+      recentPrFeedback: prFeedbackRows.map((row) => {
+        const comments = parseJsonArray(row.comments_json)
+          .map((entry) => {
+            const parsed = asObject(entry);
+            const body = asString(parsed.body);
+            if (!body) return null;
+            return {
+              body,
+              user_login: asString(parsed.user_login ?? parsed.userLogin ?? parsed.author),
+              created_at: asString(parsed.created_at ?? parsed.createdAt),
+              html_url: asString(parsed.html_url ?? parsed.htmlUrl),
+            };
+          })
+          .filter((entry): entry is PrFeedbackComment => Boolean(entry));
+        return {
+          id: Math.max(0, Math.floor(asNumber(row.id, 0))),
+          createdAt: asString(row.created_at),
+          source: asString(row.source) || "review_agent",
+          patternKey: asString(row.pattern_key),
+          objectiveId: asString(row.objective_id) || null,
+          requestId: asString(row.request_id) || null,
+          jobId: asString(row.job_id) || null,
+          prNumber: Number.isFinite(asNumber(row.pr_number, Number.NaN))
+            ? Math.max(0, Math.floor(asNumber(row.pr_number, 0)))
+            : null,
+          prUrl: asString(row.pr_url) || null,
+          verdict: asString(row.verdict),
+          reviewScore: Number.isFinite(asNumber(row.review_score, Number.NaN))
+            ? asNumber(row.review_score, 0)
+            : null,
+          reviewThreshold: Number.isFinite(asNumber(row.review_threshold, Number.NaN))
+            ? asNumber(row.review_threshold, 0)
+            : null,
+          summary: asString(row.summary) || null,
+          commentCount: Math.max(0, Math.floor(asNumber(row.comment_count, comments.length))),
+          comments,
+        };
+      }),
+    };
   }
 
   listQuestions(params?: {

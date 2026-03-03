@@ -747,6 +747,23 @@ export function createRequestHandler() {
         return makeJson({ ok: true, snapshot }, 200);
       }
 
+      // GET /autonomy/insights
+      if (pathname === "/autonomy/insights" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const patternKey = compactText(url.searchParams.get("patternKey"), 256) || undefined;
+        const objectiveId = compactText(url.searchParams.get("objectiveId"), 256) || undefined;
+        const limit = parseLimit(url.searchParams.get("limit"), 20);
+        const feedbackLimit = parseLimit(url.searchParams.get("feedbackLimit"), 30);
+        const insights = autonomyStore.listInsights({
+          patternKey,
+          objectiveId,
+          limit,
+          feedbackLimit,
+        });
+        return makeJson({ ok: true, ...insights }, 200);
+      }
+
       // POST /autonomy/eligibility
       if (pathname === "/autonomy/eligibility" && method === "POST") {
         const denied = requireAuth();

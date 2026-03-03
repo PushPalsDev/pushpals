@@ -64,6 +64,8 @@ type Snapshot = {
     pattern_key: string;
     ema_success: number;
     ema_user_accept: number;
+    ema_latency: number;
+    ema_regret: number;
     fail_streak: number;
   }>;
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
@@ -166,6 +168,13 @@ const MAX_VISION_SECTION_CHARS = 1_200;
 const DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
 const DOCS_WEAK_EVIDENCE_MAX_PENALTY = 0.12;
 
+type FeedbackPriorForScoring = {
+  ema_success?: unknown;
+  ema_user_accept?: unknown;
+  ema_latency?: unknown;
+  ema_regret?: unknown;
+} | null;
+
 export function docsWeakEvidencePenaltyForImpact(
   objectiveType: string,
   impactSignal: number,
@@ -177,6 +186,31 @@ export function docsWeakEvidencePenaltyForImpact(
     (DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY - normalizedImpact) / DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY;
   const penalty = DOCS_WEAK_EVIDENCE_MAX_PENALTY * clamp01(gapRatio);
   return Math.round(penalty * 1_000_000) / 1_000_000;
+}
+
+export function feedbackPriorSignalForScoring(prior: FeedbackPriorForScoring): {
+  emaSuccess: number;
+  emaUserAccept: number;
+  emaLatency: number;
+  emaRegret: number;
+  priorScore: number;
+} {
+  const emaSuccess = clamp01(asNumber(prior?.ema_success, 0));
+  const emaUserAccept = clamp01(asNumber(prior?.ema_user_accept, 0));
+  const emaLatency = clamp01(asNumber(prior?.ema_latency, 0));
+  const emaRegret = clamp01(asNumber(prior?.ema_regret, 0));
+  const priorScore =
+    0.12 * emaSuccess +
+    0.08 * emaUserAccept +
+    0.06 * emaLatency +
+    0.04 * (1 - emaRegret);
+  return {
+    emaSuccess,
+    emaUserAccept,
+    emaLatency,
+    emaRegret,
+    priorScore,
+  };
 }
 
 type VisionContext = {
@@ -819,6 +853,7 @@ export class RemoteBuddyAutonomousEngine {
       });
     }
     const impactSignal = this.impactSignalV1(snapshot, candidate);
+    const priorSignal = feedbackPriorSignalForScoring(prior);
     const docsWeakEvidencePenalty = docsWeakEvidencePenaltyForImpact(
       candidate.objective_type,
       impactSignal,
@@ -833,18 +868,19 @@ export class RemoteBuddyAutonomousEngine {
     }
     const normalizedPenalties = normalizePenalties(penalties);
     const finalScore =
-      0.55 * clamp01(llmScore) +
+      0.5 * clamp01(llmScore) +
       0.2 * clamp01(impactSignal) +
-      0.15 * clamp01(asNumber(prior?.ema_success, 0)) +
-      0.1 * clamp01(asNumber(prior?.ema_user_accept, 0)) -
+      priorSignal.priorScore -
       penaltyTotal(normalizedPenalties);
     return {
       patternKey,
       impactSignal,
       penalties: normalizedPenalties,
       finalScore,
-      emaSuccess: clamp01(asNumber(prior?.ema_success, 0)),
-      emaUserAccept: clamp01(asNumber(prior?.ema_user_accept, 0)),
+      emaSuccess: priorSignal.emaSuccess,
+      emaUserAccept: priorSignal.emaUserAccept,
+      emaLatency: priorSignal.emaLatency,
+      emaRegret: priorSignal.emaRegret,
     };
   }
 

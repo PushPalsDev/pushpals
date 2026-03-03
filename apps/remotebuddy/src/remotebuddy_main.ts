@@ -717,6 +717,7 @@ class RemoteBuddyOrchestrator {
   private stopSessionEvents: (() => void) | null = null;
   private readonly seenJobFailures = new Set<string>();
   private readonly seenJobCompletions = new Set<string>();
+  private readonly seenAutonomyFeedbackEvents = new Set<string>();
   private readonly eventMonitorStartedAt = Date.now();
   private jobsDb: Database | null = null;
   private disposed = false;
@@ -938,6 +939,116 @@ class RemoteBuddyOrchestrator {
     }
   }
 
+  private markAutonomyFeedbackEventSeen(eventId: string): boolean {
+    const id = String(eventId ?? "").trim();
+    if (!id) return true;
+    if (this.seenAutonomyFeedbackEvents.has(id)) return false;
+    this.seenAutonomyFeedbackEvents.add(id);
+    if (this.seenAutonomyFeedbackEvents.size > 2000) {
+      const oldest = this.seenAutonomyFeedbackEvents.values().next().value;
+      if (typeof oldest === "string" && oldest) {
+        this.seenAutonomyFeedbackEvents.delete(oldest);
+      }
+    }
+    return true;
+  }
+
+  private async fetchLatestAutonomyFeedbackInsight(params: {
+    objectiveId?: string;
+    patternKey?: string;
+  }): Promise<Record<string, unknown> | null> {
+    const objectiveId = String(params.objectiveId ?? "").trim();
+    const patternKey = String(params.patternKey ?? "").trim();
+    const query = new URLSearchParams();
+    if (objectiveId) query.set("objectiveId", objectiveId);
+    if (patternKey) query.set("patternKey", patternKey);
+    query.set("limit", "1");
+    query.set("feedbackLimit", "3");
+    const suffix = query.toString();
+    try {
+      const res = await fetch(
+        `${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`,
+        {
+          method: "GET",
+          headers: this.authHeaders(),
+        },
+      );
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        ok?: boolean;
+        recentPrFeedback?: unknown;
+      };
+      if (!data.ok || !Array.isArray(data.recentPrFeedback) || data.recentPrFeedback.length === 0) {
+        return null;
+      }
+      const first = data.recentPrFeedback[0];
+      if (!first || typeof first !== "object" || Array.isArray(first)) return null;
+      return first as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  private async rememberAutonomyFeedbackFromEvent(payload: Record<string, unknown>): Promise<void> {
+    const objectiveId = toSingleLine(payload.objectiveId, 128) || "unknown";
+    const patternKey = toSingleLine(payload.patternKey, 128) || "unknown";
+    const outcome = toSingleLine(payload.outcome, 120) || "recorded";
+    const success = Boolean(payload.success);
+    const insight = await this.fetchLatestAutonomyFeedbackInsight({
+      objectiveId: objectiveId !== "unknown" ? objectiveId : undefined,
+      patternKey: patternKey !== "unknown" ? patternKey : undefined,
+    });
+    const summary = toSingleLine(
+      insight?.summary ?? payload.feedbackSummary ?? payload.outcomeReason ?? "",
+      320,
+    );
+    const verdict = toSingleLine(insight?.verdict ?? "", 80);
+    const source = toSingleLine(insight?.source ?? "", 64);
+    const reviewScoreRaw = Number(insight?.reviewScore);
+    const reviewThresholdRaw = Number(insight?.reviewThreshold);
+    const reviewScore = Number.isFinite(reviewScoreRaw) ? reviewScoreRaw : null;
+    const reviewThreshold = Number.isFinite(reviewThresholdRaw) ? reviewThresholdRaw : null;
+    const commentCountRaw = Number(insight?.commentCount);
+    const commentCount = Number.isFinite(commentCountRaw) ? Math.max(0, Math.floor(commentCountRaw)) : 0;
+    const commentExamples = Array.isArray(insight?.comments)
+      ? insight.comments
+          .slice(0, 2)
+          .map((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) return "";
+            const row = entry as Record<string, unknown>;
+            const author = toSingleLine(row.user_login ?? row.userLogin ?? row.author, 32);
+            const body = toSingleLine(row.body, 140);
+            if (!body) return "";
+            return `${author ? `@${author}: ` : ""}${body}`;
+          })
+          .filter(Boolean)
+      : [];
+
+    const parts: string[] = [
+      `objective=${objectiveId}`,
+      `pattern=${patternKey}`,
+      `outcome=${outcome}`,
+      `success=${success ? "true" : "false"}`,
+    ];
+    if (source) parts.push(`source=${source}`);
+    if (verdict) parts.push(`verdict=${verdict}`);
+    if (reviewScore != null || reviewThreshold != null) {
+      parts.push(
+        `review=${
+          reviewScore != null ? reviewScore.toFixed(2) : "?"
+        }/${reviewThreshold != null ? reviewThreshold.toFixed(2) : "?"}`,
+      );
+    }
+    if (commentCount > 0) parts.push(`comments=${commentCount}`);
+    if (summary) parts.push(`why=${summary}`);
+    if (commentExamples.length > 0) {
+      parts.push(`examples=${commentExamples.join(" || ")}`);
+    }
+    const structured = parts.join(" | ");
+    this.pushContext(`[autonomy_feedback] ${toSingleLine(structured, 1100)}`);
+    this.rememberPersistentMemory("autonomy_feedback", structured);
+  }
+
   private async handleObservedJobFailure(
     envelope: {
       id?: string;
@@ -1026,9 +1137,22 @@ class RemoteBuddyOrchestrator {
   startSessionEventMonitor(): void {
     this.stopSessionEvents = this.comm.subscribeSessionEvents(
       (envelope) => {
-        if (envelope.type !== "job_failed" && envelope.type !== "job_completed") return;
+        if (
+          envelope.type !== "job_failed" &&
+          envelope.type !== "job_completed" &&
+          envelope.type !== "autonomy_feedback_recorded"
+        ) {
+          return;
+        }
         const tsMs = Date.parse(envelope.ts);
         if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
+        if (envelope.type === "autonomy_feedback_recorded") {
+          if (!this.markAutonomyFeedbackEventSeen(String(envelope.id ?? ""))) return;
+          const payload = asObject(envelope.payload);
+          if (!payload) return;
+          void this.rememberAutonomyFeedbackFromEvent(payload);
+          return;
+        }
         if (envelope.type === "job_failed") {
           const payload = envelope.payload as {
             jobId?: unknown;
