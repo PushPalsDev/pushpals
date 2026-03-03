@@ -32,6 +32,7 @@ import {
   normalizeTargetPath,
   normalizeWriteGlob,
 } from "shared";
+import type { AutonomyComponentArea } from "shared";
 import { mkdirSync } from "fs";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {
@@ -159,66 +160,111 @@ function isCodexUnavailableFailureSignal(message: string, detail: string): boole
   ].some((needle) => text.includes(needle));
 }
 
-type TaskExecutionLane = "deterministic" | "worker";
-type RequestPriority = "interactive" | "normal" | "background";
-type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
-type PlannerRisk = "low" | "medium" | "high";
+export type TaskExecutionLane = "deterministic" | "worker";
+export type RequestPriority = "interactive" | "normal" | "background";
+export type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
+export type PlannerRisk = "low" | "medium" | "high";
 
-interface TaskExecuteJobParams {
-  schemaVersion: 2;
-  requestId: string;
-  sessionId: string;
-  origin?: "user" | "autonomy";
-  autonomy?: {
-    origin: "autonomy";
-    objectiveId?: string;
-    runId?: string;
-    snapshotId?: string;
-    patternKey?: string;
-    componentArea?: string;
-  };
-  instruction: string;
-  plannerWorkerInstruction?: string;
-  lane: TaskExecutionLane;
-  paths?: string[];
-  planning: {
-    intent: PlannerIntent;
-    riskLevel: PlannerRisk;
-    targetPaths?: string[];
-    scope: {
-      readAnywhere: boolean;
-      writeAllowed: boolean;
-      writeGlobs?: string[];
-      forbiddenGlobs?: string[];
-      maxFilesToEdit?: number;
-    };
-    discovery?: {
-      ripgrepQueries: string[];
-      likelyDirs?: string[];
-      keywords?: string[];
-    };
-    acceptanceCriteria: string[];
-    validationSteps: string[];
-    queuePriority: RequestPriority;
-    queueWaitBudgetMs: number;
-    executionBudgetMs: number;
-    finalizationBudgetMs: number;
-  };
-  targetPath?: string;
-  recentContext: string[];
-  recentJobs: Array<Record<string, unknown>>;
-}
-
-type RequestAutonomyMetadata = {
+export type AutonomyJobMetadata = {
   origin: "autonomy";
   objectiveId?: string;
   runId?: string;
   snapshotId?: string;
   patternKey?: string;
-  componentArea?: string;
+  componentArea?: AutonomyComponentArea;
+};
+
+export type TaskExecutePlanningScope = {
+  readAnywhere: boolean;
+  writeAllowed: boolean;
+  writeGlobs?: string[];
+  forbiddenGlobs?: string[];
+  maxFilesToEdit?: number;
+};
+
+export type TaskExecutePlanningDiscovery = {
+  ripgrepQueries: string[];
+  likelyDirs?: string[];
+  keywords?: string[];
+};
+
+export type TaskExecutePlanning = {
+  intent: PlannerIntent;
+  riskLevel: PlannerRisk;
+  targetPaths?: string[];
+  scope: TaskExecutePlanningScope;
+  discovery?: TaskExecutePlanningDiscovery;
+  acceptanceCriteria: string[];
+  validationSteps: string[];
+  queuePriority: RequestPriority;
+  queueWaitBudgetMs: number;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+};
+
+export type WorkerRecentJobSummary = {
+  jobId: string;
+  taskId: string;
+  kind: string;
+  status: string;
+  workerId: string | null;
+  summary: string;
+  error: string;
+  updatedAt: string;
+};
+
+export type BaseTaskExecuteJobParams = {
+  schemaVersion: 2;
+  requestId: string;
+  sessionId: string;
+  instruction: string;
+  plannerWorkerInstruction?: string;
+  lane: TaskExecutionLane;
+  paths?: string[];
+  planning: TaskExecutePlanning;
+  targetPath?: string;
+  recentContext: string[];
+  recentJobs: WorkerRecentJobSummary[];
+};
+
+export type TaskExecuteJobParams =
+  | (BaseTaskExecuteJobParams & {
+      origin: "user";
+      autonomy?: undefined;
+    })
+  | (BaseTaskExecuteJobParams & {
+      origin: "autonomy";
+      autonomy: AutonomyJobMetadata;
+    });
+
+export type RequestAutonomyMetadata = AutonomyJobMetadata & {
   targetPaths: string[];
   writeGlobs: string[];
 };
+
+const AUTONOMY_COMPONENT_AREAS = new Set<AutonomyComponentArea>([
+  "apps/server",
+  "apps/remotebuddy",
+  "apps/workerpals",
+  "apps/client",
+  "packages/protocol",
+  "packages/shared",
+  "tests/integration",
+  "tests/unit",
+]);
+
+function asAutonomyComponentArea(value: unknown): AutonomyComponentArea | undefined {
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (!text) return undefined;
+  for (const area of AUTONOMY_COMPONENT_AREAS) {
+    if (area.toLowerCase() === text) {
+      return area;
+    }
+  }
+  return undefined;
+}
 
 function normalizeRequestPriority(value: unknown): RequestPriority {
   const text = String(value ?? "")
@@ -300,8 +346,7 @@ function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata |
     runId: String(payload.runId ?? payload.run_id ?? "").trim() || undefined,
     snapshotId: String(payload.snapshotId ?? payload.snapshot_id ?? "").trim() || undefined,
     patternKey: String(payload.patternKey ?? payload.pattern_key ?? "").trim() || undefined,
-    componentArea:
-      String(payload.componentArea ?? payload.component_area ?? "").trim() || undefined,
+    componentArea: asAutonomyComponentArea(payload.componentArea ?? payload.component_area),
     targetPaths: normalizeMetadataTargetPaths(payload.targetPaths ?? payload.target_paths),
     writeGlobs: normalizeMetadataWriteGlobs(payload.writeGlobs ?? payload.write_globs),
   };
@@ -1305,7 +1350,7 @@ class RemoteBuddyOrchestrator {
     );
   }
 
-  private getRecentJobContext(limit: number = 12): Array<Record<string, unknown>> {
+  private getRecentJobContext(limit: number = 12): WorkerRecentJobSummary[] {
     try {
       if (!this.jobsDb) {
         this.jobsDb = new Database(this.jobsDbPath);
@@ -1758,27 +1803,10 @@ class RemoteBuddyOrchestrator {
       const targetWorkerId = await this.selectTargetWorkerForJob();
       const executionBudgetMs = this.executionBudgetForPriority(priority);
       const strictTargetPaths = targetPaths.filter((entry) => entry && entry !== ".");
-      const params: TaskExecuteJobParams = {
+      const baseParams: BaseTaskExecuteJobParams = {
         schemaVersion: 2,
         requestId,
         sessionId: this.sessionId,
-        origin: autonomyMetadata ? "autonomy" : "user",
-        ...(autonomyMetadata
-          ? {
-              autonomy: {
-                origin: "autonomy" as const,
-                ...(autonomyMetadata.objectiveId
-                  ? { objectiveId: autonomyMetadata.objectiveId }
-                  : {}),
-                ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
-                ...(autonomyMetadata.snapshotId ? { snapshotId: autonomyMetadata.snapshotId } : {}),
-                ...(autonomyMetadata.patternKey ? { patternKey: autonomyMetadata.patternKey } : {}),
-                ...(autonomyMetadata.componentArea
-                  ? { componentArea: autonomyMetadata.componentArea }
-                  : {}),
-              },
-            }
-          : {}),
         instruction: canonicalInstruction,
         plannerWorkerInstruction:
           plannerWorkerInstruction && plannerWorkerInstruction !== canonicalInstruction
@@ -1827,6 +1855,25 @@ class RemoteBuddyOrchestrator {
         recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
         recentJobs: this.getRecentJobContext(),
       };
+      const params: TaskExecuteJobParams = autonomyMetadata
+        ? {
+            ...baseParams,
+            origin: "autonomy",
+            autonomy: {
+              origin: "autonomy",
+              ...(autonomyMetadata.objectiveId ? { objectiveId: autonomyMetadata.objectiveId } : {}),
+              ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
+              ...(autonomyMetadata.snapshotId ? { snapshotId: autonomyMetadata.snapshotId } : {}),
+              ...(autonomyMetadata.patternKey ? { patternKey: autonomyMetadata.patternKey } : {}),
+              ...(autonomyMetadata.componentArea
+                ? { componentArea: autonomyMetadata.componentArea }
+                : {}),
+            },
+          }
+        : {
+            ...baseParams,
+            origin: "user",
+          };
 
       await this.sendCommand({
         type: "task_created",

@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch --no-clear-screen src/remotebuddy_main.ts",
-    "start": "bun run src/remotebuddy_supervisor.ts"
+    "start": "bun run src/remotebuddy_supervisor.ts",
+    "typecheck": "bun ../../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "protocol": "workspace:*",
