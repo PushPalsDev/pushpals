@@ -7,6 +7,7 @@ import {
   STARTUP_FAILURE_CODES,
   type RepoStatus,
   type StartupChecklistContext,
+  type StartupCheckRecord,
   type StartupFailureCode,
   type StartupTelemetryEvent,
   type StartupTelemetryPhaseEvent,
@@ -683,5 +684,24 @@ describe("StartupChecklist", () => {
       expect(record?.action).toBe(expectedAction);
       expect(record?.step).toBe(result.failure?.step);
     });
+  });
+
+  test("dispatch telemetry log captures failure metadata", async () => {
+    const logs: StartupCheckRecord[] = [];
+    const ctx = buildContext({
+      log: (entry) => {
+        logs.push(entry);
+      },
+    });
+    await gateDispatchWithStartupPreflight(ctx, async () => {
+      throw new Error("dispatch pipeline offline");
+    });
+    const dispatchLog = logs.at(-1);
+    expect(dispatchLog?.code).toBe(STARTUP_FAILURE_CODES.DISPATCH_FAILED);
+    expect(dispatchLog?.status).toBe("fail");
+    expect(dispatchLog?.action).toContain("RemoteBuddy + WorkerPals");
+    expect(dispatchLog?.error?.message).toContain("dispatch pipeline offline");
+    expect(dispatchLog?.startedAtMs).toBeLessThanOrEqual(dispatchLog!.endedAtMs);
+    expect(dispatchLog?.durationMs).toBeGreaterThanOrEqual(0);
   });
 });
