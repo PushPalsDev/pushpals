@@ -19,7 +19,8 @@ import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 import { createLLMClient, type LLMClient } from "./llm.js";
-import { AgentBrain, PlannerOutput } from "./brain.js";
+import { AgentBrain } from "./brain.js";
+import type { PlannerIntent, PlannerLane, PlannerOutput, PlannerRiskLevel } from "./brain.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { createSessionMemoryBackend, type SessionMemoryBackend } from "./memory.js";
 import { PersistentSessionMemory } from "./persistent_memory.js";
@@ -159,12 +160,9 @@ function isCodexUnavailableFailureSignal(message: string, detail: string): boole
   ].some((needle) => text.includes(needle));
 }
 
-type TaskExecutionLane = "deterministic" | "worker";
 type RequestPriority = "interactive" | "normal" | "background";
-type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
-type PlannerRisk = "low" | "medium" | "high";
 
-interface TaskExecuteJobParams {
+export interface TaskExecuteJobParams {
   schemaVersion: 2;
   requestId: string;
   sessionId: string;
@@ -179,11 +177,11 @@ interface TaskExecuteJobParams {
   };
   instruction: string;
   plannerWorkerInstruction?: string;
-  lane: TaskExecutionLane;
+  lane: PlannerLane;
   paths?: string[];
   planning: {
     intent: PlannerIntent;
-    riskLevel: PlannerRisk;
+    riskLevel: PlannerRiskLevel;
     targetPaths?: string[];
     scope: {
       readAnywhere: boolean;
@@ -515,6 +513,17 @@ interface JobLogEntry {
   jobId: string;
   ts: string;
   message: string;
+}
+
+// Keeps queue health telemetry aligned with the live runtime fields we emit when budgets drift.
+interface QueueHealthTelemetry {
+  requestId: string;
+  queueWaitMs: number;
+  queueWaitBudgetMs: number;
+  priority: RequestPriority;
+  lane: PlannerLane;
+  targetWorkerId?: string | null;
+  recordedAt: string;
 }
 
 function explainJobFailureFromLogs(
@@ -1181,6 +1190,22 @@ class RemoteBuddyOrchestrator {
     }
   }
 
+  /** Records queue telemetry with the runtime fields we expose when queue budgets drift. */
+  private recordQueueHealthTelemetry(entry: QueueHealthTelemetry): void {
+    const summary = [
+      `queue_wait_ms=${entry.queueWaitMs}`,
+      `budget_ms=${entry.queueWaitBudgetMs}`,
+      `priority=${entry.priority}`,
+      `lane=${entry.lane}`,
+      entry.targetWorkerId ? `worker=${entry.targetWorkerId}` : null,
+      `recorded_at=${entry.recordedAt}`,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    console.log(`[RemoteBuddy] Queue health telemetry: ${summary}`);
+    this.rememberPersistentMemory("queue_health", summary, entry.requestId);
+  }
+
   private buildPlanningContext(priority: RequestPriority): string[] {
     const fromMemory = this.persistentPlanningContextSnapshot(priority);
     const live = this.planningContextSnapshot(priority);
@@ -1211,14 +1236,14 @@ class RemoteBuddyOrchestrator {
   private chooseExecutionLane(
     prompt: string,
     plan: {
-      lane: TaskExecutionLane;
+      lane: PlannerLane;
       intent: PlannerIntent;
-      risk_level: PlannerRisk;
+      risk_level: PlannerRiskLevel;
       acceptance_criteria: string[];
       validation_steps: string[];
     },
     targetPathCount: number,
-  ): TaskExecutionLane {
+  ): PlannerLane {
     if (plan.intent === "status") return "deterministic";
     if (
       plan.risk_level === "low" &&
@@ -1489,7 +1514,7 @@ class RemoteBuddyOrchestrator {
       priority?: string;
       queueWaitBudgetMs?: number;
       forceWorker?: boolean;
-      forceLane?: TaskExecutionLane;
+      forceLane?: PlannerLane;
       metadata?: Record<string, unknown>;
       metadataJson?: string | null;
     },
@@ -1520,9 +1545,9 @@ class RemoteBuddyOrchestrator {
     const laneRaw = String(reqAny.forceLane ?? reqAny.force_lane ?? "")
       .trim()
       .toLowerCase();
-    let forceLane: TaskExecutionLane | undefined =
+    let forceLane: PlannerLane | undefined =
       laneRaw === "deterministic" || laneRaw === "worker"
-        ? (laneRaw as TaskExecutionLane)
+        ? (laneRaw as PlannerLane)
         : undefined;
     const autonomyMetadata = parseAutonomyRequestMetadata(reqAny.metadata ?? reqAny.metadataJson);
     if (autonomyMetadata) {
@@ -1679,6 +1704,15 @@ class RemoteBuddyOrchestrator {
         .trim();
 
       if (queueWaitMs > queueWaitBudgetMs) {
+        this.recordQueueHealthTelemetry({
+          requestId,
+          queueWaitMs: Math.max(0, Math.floor(queueWaitMs)),
+          queueWaitBudgetMs: Math.max(0, Math.floor(queueWaitBudgetMs)),
+          priority,
+          lane,
+          targetWorkerId: null,
+          recordedAt: new Date().toISOString(),
+        });
         await this.comm.assistantMessage(
           `Request ${requestId.slice(0, 8)} waited ${Math.floor(
             queueWaitMs / 1000,
@@ -1962,7 +1996,7 @@ class RemoteBuddyOrchestrator {
               priority?: string;
               queueWaitBudgetMs?: number;
               forceWorker?: boolean;
-              forceLane?: TaskExecutionLane;
+              forceLane?: PlannerLane;
               metadata?: Record<string, unknown>;
               metadataJson?: string | null;
             };
