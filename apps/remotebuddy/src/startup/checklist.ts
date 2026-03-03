@@ -48,6 +48,13 @@ export interface SyntheticStartupTester {
   ) => Promise<SyntheticStartupTestResult>;
 }
 
+export interface StartupCheckErrorDetail {
+  message: string;
+  stack?: string;
+  raw?: unknown;
+  cause?: unknown;
+}
+
 export interface StartupCheckRecord {
   code: StartupFailureCode;
   label: string;
@@ -57,7 +64,20 @@ export interface StartupCheckRecord {
   detail: string;
   action?: string;
   elapsedMs: number;
+  startedAtMs?: number;
+  completedAtMs?: number;
+  error?: StartupCheckErrorDetail;
 }
+
+type AssertOptionalTimingFields =
+  StartupCheckRecord extends Required<
+    Pick<StartupCheckRecord, "startedAtMs" | "completedAtMs">
+  >
+    ? never
+    : true;
+
+const __startupCheckRecordTimingOptionalGuard: AssertOptionalTimingFields = true;
+void __startupCheckRecordTimingOptionalGuard;
 
 export interface StartupChecklistFailure {
   code: StartupFailureCode;
@@ -65,6 +85,10 @@ export interface StartupChecklistFailure {
   action: string;
   category: StartupCheckCategory;
   step: number;
+  elapsedMs?: number;
+  startedAtMs?: number;
+  completedAtMs?: number;
+  error?: StartupCheckErrorDetail;
 }
 
 export interface StartupChecklistResult {
@@ -221,6 +245,125 @@ export const STARTUP_CHECK_STRUCTURE: readonly StartupCheckStructure[] = [
   },
 ];
 
+type NormalizedChecklistError = {
+  message: string;
+  payload: StartupCheckErrorDetail;
+};
+
+const safeJsonStringify = (value: unknown): string | undefined => {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized || undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const hasStructuredObjectDetail = (value: object): boolean => {
+  const entries = Object.keys(value as Record<string, unknown>);
+  return entries.some((key) => key !== "message");
+};
+
+const formatThrownObject = (value: object): string => {
+  const candidate =
+    typeof (value as { message?: unknown }).message === "string"
+      ? (value as { message: string }).message.trim()
+      : undefined;
+  const effectiveCandidate = candidate || undefined;
+  const json = safeJsonStringify(value);
+  if (effectiveCandidate) {
+    if (json && hasStructuredObjectDetail(value)) {
+      return `${effectiveCandidate} | ${json}`;
+    }
+    return effectiveCandidate;
+  }
+  if (json) {
+    return json;
+  }
+  if (typeof (value as { toString?: () => string }).toString === "function") {
+    const text = (value as { toString: () => string }).toString();
+    if (text && text !== "[object Object]") {
+      return text;
+    }
+  }
+  return Object.prototype.toString.call(value);
+};
+
+const formatThrownFunction = (fn: (...args: never[]) => unknown): string => {
+  if (fn.name) {
+    return `[function ${fn.name}]`;
+  }
+  const text = fn.toString();
+  return text || "[function anonymous]";
+};
+
+const formatThrownSymbol = (symbolValue: symbol): string =>
+  symbolValue.description
+    ? `Symbol(${symbolValue.description})`
+    : symbolValue.toString();
+
+const normalizeChecklistError = (
+  error: unknown,
+  fallbackMessage: string,
+): NormalizedChecklistError => {
+  if (error instanceof Error) {
+    const message = error.message?.trim() || fallbackMessage;
+    const payload: StartupCheckErrorDetail = {
+      message,
+      stack: error.stack,
+      raw: error,
+    };
+    if ("cause" in error) {
+      payload.cause = (error as { cause?: unknown }).cause;
+    }
+    return { message, payload };
+  }
+  if (error === null || error === undefined) {
+    const hint = error === null ? "null" : "undefined";
+    const message = `${fallbackMessage} (received ${hint})`;
+    return {
+      message,
+      payload: { message, raw: error },
+    };
+  }
+  if (typeof error === "string") {
+    const message = error.trim() || fallbackMessage;
+    return { message, payload: { message, raw: error } };
+  }
+  if (
+    typeof error === "number" ||
+    typeof error === "boolean" ||
+    typeof error === "bigint"
+  ) {
+    const message = String(error);
+    return { message, payload: { message, raw: error } };
+  }
+  if (typeof error === "symbol") {
+    const message = formatThrownSymbol(error);
+    return { message, payload: { message, raw: error } };
+  }
+  if (typeof error === "function") {
+    const message = formatThrownFunction(error as (...args: never[]) => unknown);
+    return { message, payload: { message, raw: error } };
+  }
+  if (typeof error === "object") {
+    const message = formatThrownObject(error);
+    const payload: StartupCheckErrorDetail = { message, raw: error };
+    if (
+      "stack" in (error as { stack?: unknown }) &&
+      typeof (error as { stack?: unknown }).stack === "string"
+    ) {
+      payload.stack = (error as { stack?: string }).stack;
+    }
+    if ("cause" in (error as { cause?: unknown })) {
+      payload.cause = (error as { cause?: unknown }).cause;
+    }
+    return { message, payload };
+  }
+  const message = fallbackMessage;
+  return { message, payload: { message, raw: error } };
+};
+
 const nowMs = (ctx: StartupChecklistContext) =>
   ctx.now ? ctx.now() : Date.now();
 
@@ -252,17 +395,22 @@ export class StartupChecklist {
       const started = nowMs(ctx);
       let status: StartupCheckStatus = "pass";
       let detail = check.label;
+      let errorPayload: StartupCheckErrorDetail | undefined;
       try {
         const outcome = await check.run(ctx, options);
         status = outcome.ok ? "pass" : "fail";
         detail = outcome.detail ?? check.label;
       } catch (error) {
         status = "fail";
-        detail =
-          error instanceof Error
-            ? error.message
-            : "Unknown error running startup check.";
+        const normalized = normalizeChecklistError(
+          error,
+          "Unknown error running startup check.",
+        );
+        detail = normalized.message;
+        errorPayload = normalized.payload;
       }
+      const completedAtMs = nowMs(ctx);
+      const elapsedMs = Math.max(0, completedAtMs - started);
       const record: StartupCheckRecord = {
         code: check.code,
         label: check.label,
@@ -271,7 +419,10 @@ export class StartupChecklist {
         status,
         detail,
         action: status === "fail" ? check.action : undefined,
-        elapsedMs: Math.max(0, nowMs(ctx) - started),
+        elapsedMs,
+        startedAtMs: started,
+        completedAtMs,
+        error: errorPayload,
       };
       history.push(record);
       ctx.log?.(record);
@@ -284,6 +435,10 @@ export class StartupChecklist {
             action: check.action,
             category: check.category,
             step,
+            elapsedMs,
+            startedAtMs: started,
+            completedAtMs,
+            error: errorPayload,
           },
           history,
         };
@@ -318,7 +473,8 @@ export const gateDispatchWithStartupPreflight = async (
   const started = nowMs(ctx);
   try {
     await dispatchJob();
-    const elapsedMs = Math.max(0, nowMs(ctx) - started);
+    const completedAtMs = nowMs(ctx);
+    const elapsedMs = Math.max(0, completedAtMs - started);
     const successRecord: StartupCheckRecord = {
       code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
       label: dispatchLabel,
@@ -327,19 +483,20 @@ export const gateDispatchWithStartupPreflight = async (
       status: "pass",
       detail: "Dispatch completed successfully.",
       elapsedMs,
+      startedAtMs: started,
+      completedAtMs,
     };
     result.history.push(successRecord);
     ctx.log?.(successRecord);
     return result;
   } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : typeof error === "string"
-          ? error
-          : "Unknown dispatch failure.";
-    const detail = `Dispatch job failed: ${errorMessage}`;
-    const elapsedMs = Math.max(0, nowMs(ctx) - started);
+    const normalized = normalizeChecklistError(
+      error,
+      "Unknown dispatch failure.",
+    );
+    const detail = `Dispatch job failed: ${normalized.message}`;
+    const completedAtMs = nowMs(ctx);
+    const elapsedMs = Math.max(0, completedAtMs - started);
     const failureRecord: StartupCheckRecord = {
       code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
       label: dispatchLabel,
@@ -349,6 +506,9 @@ export const gateDispatchWithStartupPreflight = async (
       detail,
       action: dispatchAction,
       elapsedMs,
+      startedAtMs: started,
+      completedAtMs,
+      error: normalized.payload,
     };
     ctx.log?.(failureRecord);
     const history = [...result.history, failureRecord];
@@ -360,6 +520,10 @@ export const gateDispatchWithStartupPreflight = async (
         action: dispatchAction,
         category: "dispatch",
         step: dispatchStep,
+        elapsedMs,
+        startedAtMs: started,
+        completedAtMs,
+        error: normalized.payload,
       },
       history,
     };

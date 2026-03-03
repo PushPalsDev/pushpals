@@ -6,6 +6,7 @@ import {
   STARTUP_CHECK_STRUCTURE,
   STARTUP_FAILURE_CODES,
   type RepoStatus,
+  type StartupCheckRecord,
   type StartupChecklistContext,
   type StartupFailureCode,
 } from "./checklist.js";
@@ -35,6 +36,17 @@ const actionFor = (code: StartupFailureCode): string => {
   }
   return entry.action;
 };
+
+const externalRecordCompatibility = {
+  code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
+  label: "compat",
+  category: "repo",
+  step: 1,
+  status: "pass",
+  detail: "example",
+  elapsedMs: 0,
+} satisfies StartupCheckRecord;
+void externalRecordCompatibility;
 
 describe("StartupChecklist", () => {
   test(
@@ -363,6 +375,41 @@ describe("StartupChecklist", () => {
     expect(lastHistoryEntry?.step).toBe(result.failure?.step);
   });
 
+  describe("record compatibility", () => {
+    test("externally constructed records without timing fields integrate with telemetry", async () => {
+      const minimalRecord: StartupCheckRecord = {
+        code: STARTUP_FAILURE_CODES.ALERTS_ACTIVE,
+        label: "external history",
+        category: "alerts",
+        step: 3,
+        status: "pass",
+        detail: "preexisting pass record",
+        elapsedMs: 5,
+      };
+      const revived = JSON.parse(JSON.stringify(minimalRecord)) as StartupCheckRecord;
+      expect(revived.startedAtMs).toBeUndefined();
+      expect(revived.completedAtMs).toBeUndefined();
+      const telemetry: StartupCheckRecord[] = [revived];
+      const ctx = buildContext({
+        log: (entry) => {
+          const serialized = JSON.stringify(entry);
+          const externalized = JSON.parse(serialized) as StartupCheckRecord;
+          telemetry.push(externalized);
+        },
+      });
+      const result = await gateDispatchWithStartupPreflight(ctx, async () => {});
+      expect(result.ok).toBe(true);
+      expect(telemetry[0]).toEqual(revived);
+      const dispatchRecord = telemetry.at(-1);
+      expect(dispatchRecord?.code).toBe(STARTUP_FAILURE_CODES.DISPATCH_FAILED);
+      expect(typeof dispatchRecord?.startedAtMs).toBe("number");
+      expect(typeof dispatchRecord?.completedAtMs).toBe("number");
+      expect(
+        telemetry.filter((record) => record.startedAtMs === undefined).length,
+      ).toBeGreaterThan(0);
+    });
+  });
+
   describe("structured dependency failures", () => {
     test("describeRepo exceptions populate history/action/detail consistently", async () => {
       const err = new Error("git status failed hard");
@@ -459,6 +506,205 @@ describe("StartupChecklist", () => {
       expect(record?.detail).toBe(result.failure?.detail);
       expect(record?.action).toBe(expectedAction);
       expect(record?.step).toBe(result.failure?.step);
+    });
+  });
+
+  describe("telemetry parity", () => {
+    test("preflight failure telemetry matches failure envelope", async () => {
+      const telemetry: StartupCheckRecord[] = [];
+      const failureCause = { step: "describeRepo" };
+      const err = new Error("git status offline", { cause: failureCause });
+      const ctx = buildContext({
+        describeRepo: async () => {
+          throw err;
+        },
+        log: (entry) => {
+          telemetry.push(entry);
+        },
+      });
+      const result = await runStartupPreflight(ctx);
+      expect(result.ok).toBe(false);
+      const failureRecord = telemetry.find(
+        (entry) => entry.code === STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
+      );
+      expect(failureRecord?.status).toBe("fail");
+      expect(result.failure?.error).toBe(failureRecord?.error);
+      expect(failureRecord?.error?.message).toBe(err.message);
+      expect(failureRecord?.error?.raw).toBe(err);
+      expect(failureRecord?.error?.cause).toBe(failureCause);
+      expect(failureRecord?.error?.stack).toBeTruthy();
+      expect(result.failure?.error?.stack).toBe(failureRecord?.error?.stack);
+    });
+
+    test("dispatch failure telemetry matches failure envelope", async () => {
+      const telemetry: StartupCheckRecord[] = [];
+      const failureCause = new Error("queue saturated");
+      const dispatchError = new Error("dispatch offline", { cause: failureCause });
+      const ctx = buildContext({
+        log: (entry) => {
+          telemetry.push(entry);
+        },
+      });
+      const result = await gateDispatchWithStartupPreflight(ctx, async () => {
+        throw dispatchError;
+      });
+      expect(result.ok).toBe(false);
+      const failureRecord = telemetry.at(-1);
+      expect(failureRecord?.code).toBe(STARTUP_FAILURE_CODES.DISPATCH_FAILED);
+      expect(failureRecord?.status).toBe("fail");
+      expect(result.failure?.error).toBe(failureRecord?.error);
+      expect(failureRecord?.error?.message).toBe(dispatchError.message);
+      expect(failureRecord?.error?.raw).toBe(dispatchError);
+      expect(failureRecord?.error?.cause).toBe(failureCause);
+      expect(failureRecord?.error?.stack).toBeTruthy();
+    });
+  });
+
+  describe("error normalization", () => {
+    test("string throws populate detail and telemetry payloads", async () => {
+      const telemetry: StartupCheckRecord[] = [];
+      const ctx = buildContext({
+        describeRepo: async () => {
+          throw "git status offline";
+        },
+        log: (entry) => {
+          telemetry.push(entry);
+        },
+      });
+      const result = await runStartupPreflight(ctx);
+      expect(result.ok).toBe(false);
+      expect(result.failure?.detail).toBe("git status offline");
+      expect(result.failure?.error?.message).toBe("git status offline");
+      expect(result.failure?.error?.stack).toBeUndefined();
+      const historyRecord = telemetry[0];
+      expect(historyRecord?.error?.message).toBe("git status offline");
+      expect(typeof historyRecord?.startedAtMs).toBe("number");
+      expect(typeof historyRecord?.completedAtMs).toBe("number");
+    });
+
+    test("object throws serialize into error detail for operators", async () => {
+      const thrown = { reason: "git offline", cause: { step: "describeRepo" } };
+      const ctx = buildContext({
+        describeRepo: async () => {
+          throw thrown;
+        },
+      });
+      const result = await runStartupPreflight(ctx);
+      const expectedDetail = JSON.stringify(thrown);
+      expect(result.ok).toBe(false);
+      expect(result.failure?.detail).toBe(expectedDetail);
+      expect(result.failure?.error?.message).toBe(expectedDetail);
+      const firstRecord = result.history[0];
+      expect(firstRecord.error?.raw).toBe(thrown);
+      expect(firstRecord.error?.cause).toBe(thrown.cause);
+    });
+
+    test("dispatch telemetry captures non-Error throw fidelity", async () => {
+      const telemetry: StartupCheckRecord[] = [];
+      const thrown = { reason: "queue blocked" };
+      const ctx = buildContext({
+        log: (entry) => {
+          telemetry.push(entry);
+        },
+      });
+      const result = await gateDispatchWithStartupPreflight(ctx, async () => {
+        throw thrown;
+      });
+      const expectedDetail = JSON.stringify(thrown);
+      expect(result.ok).toBe(false);
+      expect(result.failure?.detail).toBe(
+        `Dispatch job failed: ${expectedDetail}`,
+      );
+      expect(result.failure?.error?.message).toBe(expectedDetail);
+      const failureRecord = telemetry.at(-1);
+      expect(failureRecord?.error?.message).toBe(expectedDetail);
+      expect(failureRecord?.error?.raw).toBe(thrown);
+    });
+
+    test("object throws with explicit message retain JSON structure in detail", async () => {
+      const thrown = {
+        message: "probe blocked",
+        probe: "startup.synthetic",
+        detail: "latency sla breach",
+      };
+      const ctx = buildContext({
+        syntheticTester: {
+          runSyntheticJob: async () => {
+            throw thrown;
+          },
+        },
+      });
+      const result = await runStartupPreflight(ctx);
+      const expectedJson = JSON.stringify(thrown);
+      const expectedDetail = `probe blocked | ${expectedJson}`;
+      expect(result.ok).toBe(false);
+      expect(result.failure?.detail).toBe(expectedDetail);
+      expect(result.failure?.error?.message).toBe(expectedDetail);
+      expect(result.failure?.error?.raw).toBe(thrown);
+    });
+
+    test("non-Error primitives produce descriptive failure detail", async () => {
+      const panicSymbol = Symbol("panic");
+      function meltdown() {
+        return "fail";
+      }
+      const cases: Array<{ thrown: unknown; expected: string }> = [
+        {
+          thrown: null,
+          expected: "Unknown error running startup check. (received null)",
+        },
+        {
+          thrown: undefined,
+          expected: "Unknown error running startup check. (received undefined)",
+        },
+        { thrown: 404, expected: "404" },
+        { thrown: false, expected: "false" },
+        { thrown: panicSymbol, expected: "Symbol(panic)" },
+        { thrown: meltdown, expected: "[function meltdown]" },
+      ];
+      for (const { thrown, expected } of cases) {
+        const ctx = buildContext({
+          describeRepo: async () => {
+            throw thrown;
+          },
+        });
+        const result = await runStartupPreflight(ctx);
+        expect(result.ok).toBe(false);
+        expect(result.failure?.detail).toBe(expected);
+        expect(result.failure?.error?.message).toBe(expected);
+        expect(result.failure?.error?.raw).toBe(thrown);
+      }
+    });
+
+    test("dispatch guard normalizes primitive throws consistently", async () => {
+      const panicSymbol = Symbol("dispatch-panic");
+      function dispatchFn() {
+        return undefined;
+      }
+      const cases: Array<{ thrown: unknown; expected: string }> = [
+        { thrown: panicSymbol, expected: "Symbol(dispatch-panic)" },
+        { thrown: dispatchFn, expected: "[function dispatchFn]" },
+      ];
+      for (const { thrown, expected } of cases) {
+        const telemetry: StartupCheckRecord[] = [];
+        const ctx = buildContext({
+          log: (entry) => {
+            telemetry.push(entry);
+          },
+        });
+        const result = await gateDispatchWithStartupPreflight(ctx, async () => {
+          throw thrown;
+        });
+        expect(result.ok).toBe(false);
+        expect(result.failure?.detail).toBe(
+          `Dispatch job failed: ${expected}`,
+        );
+        expect(result.failure?.error?.message).toBe(expected);
+        expect(result.failure?.error?.raw).toBe(thrown);
+        const failureRecord = telemetry.at(-1);
+        expect(failureRecord?.error?.message).toBe(expected);
+        expect(failureRecord?.error?.raw).toBe(thrown);
+      }
     });
   });
 });
