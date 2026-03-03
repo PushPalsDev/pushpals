@@ -1,133 +1,218 @@
 import { describe, expect, test } from "bun:test";
+import { loadPushPalsConfig } from "shared";
 
+import { STARTUP_FAILURE_CODES } from "./startup/checklist.js";
 import {
-  PREFLIGHT_FAILURE_CODES,
-  type PreflightTelemetryEntry,
-  type RemotebuddyPreflightConfig,
-} from "./startup/preflight_runner.js";
-import { ensurePreflightPasses, RemoteBuddyPreflightError } from "./startup/preflight_barrier.js";
-import { enforceStartupPreflightGate } from "./startup/startup_preflight_gate.js";
+  RemoteBuddyPreflightError,
+  type RemoteBuddyPreflightRuntimeConfig,
+} from "./startup/preflight.js";
+import {
+  runRemoteBuddyMain,
+  type RunRemoteBuddyMainDependencies,
+  type RunRemoteBuddyMainOptions,
+} from "./remotebuddy_main.js";
+import type { StartupChecklistResult } from "./startup/checklist.js";
 
-const baseConfig: RemotebuddyPreflightConfig = {
-  sessionId: "test",
-  authToken: "token",
-  serverUrl: "http://localhost:3001",
-  llmBackend: "openai",
-  llmApiKey: "sk-test",
-};
+type DependencyOverrides = Partial<RunRemoteBuddyMainDependencies>;
 
-const noopLogger = {
-  log: () => {},
-  error: () => {},
-};
-
-describe("enforceStartupPreflightGate", () => {
-  test("halts workload initialization when preflight fails", async () => {
-    let workloadStarted = false;
-    const exitCodes: number[] = [];
-    const logs: string[] = [];
-    const allowed = await enforceStartupPreflightGate({
-      config: baseConfig,
-      env: {},
-      runPreflight: async () => ({
-        ok: false,
-        history: [],
-        failure: {
-          code: PREFLIGHT_FAILURE_CODES.DOCKER_UNAVAILABLE,
-          check: "docker_version",
-          detail: "Docker CLI missing",
-          action: "Install Docker",
-        },
-      }),
-      exit: (code) => {
-        exitCodes.push(code);
-      },
-      logger: {
-        log: (line) => logs.push(line),
-        error: (line) => logs.push(line),
-      },
-    });
-    if (allowed) {
-      workloadStarted = true;
-    }
-    expect(workloadStarted).toBe(false);
-    expect(exitCodes).toEqual([1]);
-    expect(logs.some((line) => line.includes("preflight.docker_unavailable"))).toBe(true);
-  });
-
-  test("allows workload initialization when preflight passes", async () => {
-    let workloadStarted = false;
-    const allowed = await enforceStartupPreflightGate({
-      config: baseConfig,
-      env: {},
-      runPreflight: async () => ({
+const stubDependencies = (
+  overrides: DependencyOverrides = {},
+): RunRemoteBuddyMainDependencies => ({
+  ensurePreflight:
+    overrides.ensurePreflight ??
+    (async () =>
+      ({
         ok: true,
         history: [],
-      }),
-      exit: () => {
-        throw new Error("exit should not be invoked when preflight passes");
-      },
-      logger: noopLogger,
-    });
-    if (allowed) {
-      workloadStarted = true;
-    }
-    expect(workloadStarted).toBe(true);
-  });
-
-  test("fails closed when runner reports ok=false without failure detail", async () => {
-    const exitCodes: number[] = [];
-    const logs: string[] = [];
-    const historySample: PreflightTelemetryEntry[] = [
-      {
-        code: "preflight.check.required_env.fail",
-        check: "required_env",
-        status: "fail",
-        detail: "Missing server URL wiring",
-        metadata: {
-          "req.PUSHPALS_SERVER_URL": "missing",
-        },
-        elapsedMs: 15,
-        timestamp: new Date().toISOString(),
-        action: undefined,
-        failureCode: PREFLIGHT_FAILURE_CODES.ENV_VARS_MISSING,
-      },
-    ];
-    const allowed = await enforceStartupPreflightGate({
-      config: baseConfig,
-      env: {},
-      runPreflight: async () => ({
-        ok: false,
-        history: historySample,
-      }),
-      exit: (code) => exitCodes.push(code),
-      logger: {
-        log: (line) => logs.push(line),
-        error: (line) => logs.push(line),
-      },
-    });
-    expect(allowed).toBe(false);
-    expect(exitCodes).toEqual([1]);
-    expect(logs.some((line) => line.includes("failure without details"))).toBe(true);
-    expect(
-      logs.some((line) => line.includes("Last telemetry sample") && line.includes("required_env")),
-    ).toBe(true);
-  });
+      }) as StartupChecklistResult),
+  connectWithRetry:
+    overrides.connectWithRetry ??
+    (async () => "session-from-server"),
+  createLLMClient:
+    overrides.createLLMClient ??
+    (() => ({} as any)),
+  createBrain:
+    overrides.createBrain ??
+    (() => ({} as any)),
+  createOrchestrator:
+    overrides.createOrchestrator ??
+    (() =>
+      ({
+        emitStartupStatus: async () => {},
+        startStatusHeartbeat: () => {},
+        startSessionEventMonitor: () => {},
+        startAutonomy: () => {},
+        startPolling: () => {},
+      }) as any),
 });
 
-describe("runRemoteBuddyMain preflight enforcement", () => {
-  test("throws RemoteBuddyPreflightError when the preflight gate reports failure", async () => {
-    const gateCalls: Array<unknown> = [];
+const CONFIG = loadPushPalsConfig();
+
+const defaultRuntime = (): RemoteBuddyPreflightRuntimeConfig => ({
+  repoRoot: process.cwd(),
+  server: "http://localhost:3001",
+  sessionId: null,
+  authToken: null,
+  llm: {
+    backend: "lmstudio",
+    endpoint: "http://127.0.0.1:1234",
+    model: "local-model",
+    apiKey: null,
+  },
+  startup: {
+    allowDirtyWorktree: false,
+    alertsCheckMode: "skip",
+    syntheticCheckMode: "skip",
+    syntheticProbeName: "probe.remote_startup",
+    syntheticMaxLatencyMs: 850,
+    alertsEndpoint: null,
+  },
+});
+
+describe("runRemoteBuddyMain preflight wiring", () => {
+  test("forwards CLI override values to preflight runtime config", async () => {
+    const captured: RemoteBuddyPreflightRuntimeConfig[] = [];
+    const dependencies = stubDependencies({
+      ensurePreflight: async (runtime) => {
+        captured.push(runtime);
+        return { ok: true, history: [] } as StartupChecklistResult;
+      },
+    });
+    await runRemoteBuddyMain({
+      cliOverrides: {
+        server: "http://override",
+        sessionId: "cli-session",
+        authToken: "cli-token",
+      },
+      dependencies,
+    });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].server).toBe("http://override");
+    expect(captured[0].sessionId).toBe("cli-session");
+    expect(captured[0].authToken).toBe("cli-token");
+    expect(captured[0].llm).toEqual({
+      backend: CONFIG.remotebuddy.llm.backend,
+      endpoint: CONFIG.remotebuddy.llm.endpoint ?? null,
+      model: CONFIG.remotebuddy.llm.model ?? null,
+      apiKey: CONFIG.remotebuddy.llm.apiKey ?? null,
+    });
+    expect(captured[0].startup).toEqual({
+      allowDirtyWorktree: CONFIG.remotebuddy.startup.allowDirtyWorktree,
+      alertsCheckMode: CONFIG.remotebuddy.startup.alertsCheckMode,
+      syntheticCheckMode: CONFIG.remotebuddy.startup.syntheticCheckMode,
+      syntheticProbeName: CONFIG.remotebuddy.startup.syntheticProbeName,
+      syntheticMaxLatencyMs: CONFIG.remotebuddy.startup.syntheticMaxLatencyMs,
+      alertsEndpoint: CONFIG.remotebuddy.startup.alertsEndpoint ?? null,
+    });
+  });
+
+  test("ensures preflight finishes before connecting and wires success path dependencies", async () => {
+    const callOrder: string[] = [];
+    let preflightDone = false;
+    const pollValues: number[] = [];
+    const orchestrator = {
+      emitStartupStatus: async () => {
+        callOrder.push("emitStartupStatus");
+      },
+      startStatusHeartbeat: () => {
+        callOrder.push("startStatusHeartbeat");
+      },
+      startSessionEventMonitor: () => {
+        callOrder.push("startSessionEventMonitor");
+      },
+      startAutonomy: () => {
+        callOrder.push("startAutonomy");
+      },
+      startPolling: (ms: number) => {
+        callOrder.push("startPolling");
+        pollValues.push(ms);
+      },
+    };
+    const llmRef = {} as any;
+    const brainRef = {} as any;
+    const dependencies = stubDependencies({
+      ensurePreflight: async () => {
+        callOrder.push("ensurePreflight");
+        preflightDone = true;
+        return { ok: true, history: [] } as StartupChecklistResult;
+      },
+      connectWithRetry: async (server, sessionId) => {
+        expect(preflightDone).toBe(true);
+        callOrder.push("connectWithRetry");
+        expect(server).toBe("http://success-override");
+        expect(sessionId).toBe("success-session");
+        return "session-from-preflight";
+      },
+      createLLMClient: (config) => {
+        callOrder.push("createLLMClient");
+        expect(config.sessionId).toBe("session-from-preflight");
+        return llmRef;
+      },
+      createBrain: (llm) => {
+        callOrder.push("createBrain");
+        expect(llm).toBe(llmRef);
+        return brainRef;
+      },
+      createOrchestrator: (options) => {
+        callOrder.push("createOrchestrator");
+        expect(options.server).toBe("http://success-override");
+        expect(options.sessionId).toBe("session-from-preflight");
+        expect(options.authToken).toBe("success-token");
+        expect(options.llm).toBe(llmRef);
+        expect(options.brain).toBe(brainRef);
+        return orchestrator as any;
+      },
+    });
+    await runRemoteBuddyMain({
+      cliOverrides: {
+        server: "http://success-override",
+        sessionId: "success-session",
+        authToken: "success-token",
+      },
+      dependencies,
+    });
+    expect(callOrder).toEqual([
+      "ensurePreflight",
+      "connectWithRetry",
+      "createLLMClient",
+      "createBrain",
+      "createOrchestrator",
+      "emitStartupStatus",
+      "startStatusHeartbeat",
+      "startSessionEventMonitor",
+      "startAutonomy",
+      "startPolling",
+    ]);
+    expect(pollValues).toEqual([CONFIG.remotebuddy.pollMs]);
+  });
+
+  test("surface RemoteBuddyPreflightError without altering metadata", async () => {
+    const failure = {
+      code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
+      detail: "blocked",
+      action: "resolve merge",
+      category: "repo" as const,
+      step: 1,
+    };
+    const runtime = defaultRuntime();
+    const error = new RemoteBuddyPreflightError(failure, [], runtime);
     await expect(
-      ensurePreflightPasses(baseConfig, {
-        runPreflightGate: async (options) => {
-          gateCalls.push(options.config);
-          return false;
-        },
-        env: {},
-        logger: noopLogger,
+      runRemoteBuddyMain({
+        dependencies: stubDependencies({
+          ensurePreflight: async () => {
+            throw error;
+          },
+        }),
       }),
-    ).rejects.toBeInstanceOf(RemoteBuddyPreflightError);
-    expect(gateCalls).toHaveLength(1);
+    ).rejects.toBe(error);
+    expect(error.failure).toBe(failure);
+    expect(error.failure).toEqual({
+      code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
+      detail: "blocked",
+      action: "resolve merge",
+      category: "repo",
+      step: 1,
+    });
+    expect(error.runtime).toBe(runtime);
   });
 });

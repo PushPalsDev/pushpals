@@ -44,7 +44,11 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
-import { ensurePreflightPasses, RemoteBuddyPreflightError } from "./startup/preflight_gate.js";
+import type { StartupChecklistResult } from "./startup/checklist.js";
+import {
+  ensureRemoteBuddyPreflight,
+  type RemoteBuddyPreflightRuntimeConfig,
+} from "./startup/preflight.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -77,10 +81,27 @@ function parseArgs(): {
   return { server, sessionId, authToken };
 }
 
-export interface RemoteBuddyMainOptions {
-  server: string;
-  sessionId: string | null;
-  authToken: string | null;
+type RemoteBuddyCliArgs = ReturnType<typeof parseArgs>;
+
+type RemoteBuddyOrchestratorInit = ConstructorParameters<
+  typeof RemoteBuddyOrchestrator
+>[0];
+
+export interface RunRemoteBuddyMainDependencies {
+  ensurePreflight: (
+    runtime: RemoteBuddyPreflightRuntimeConfig,
+  ) => Promise<StartupChecklistResult>;
+  connectWithRetry: typeof connectWithRetry;
+  createLLMClient: typeof createLLMClient;
+  createBrain: (llm: LLMClient) => AgentBrain;
+  createOrchestrator: (
+    options: RemoteBuddyOrchestratorInit,
+  ) => RemoteBuddyOrchestrator;
+}
+
+export interface RunRemoteBuddyMainOptions {
+  cliOverrides?: Partial<RemoteBuddyCliArgs>;
+  dependencies?: Partial<RunRemoteBuddyMainDependencies>;
 }
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────
@@ -2078,11 +2099,61 @@ async function connectWithRetry(
   }
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+const DEFAULT_MAIN_DEPENDENCIES: RunRemoteBuddyMainDependencies = {
+  ensurePreflight: (runtime) => ensureRemoteBuddyPreflight(runtime),
+  connectWithRetry,
+  createLLMClient: (config) => createLLMClient(config),
+  createBrain: (llm) => new AgentBrain(llm),
+  createOrchestrator: (options) => new RemoteBuddyOrchestrator(options),
+};
 
-export async function runRemoteBuddyMain(opts: RemoteBuddyMainOptions): Promise<void> {
+const mergeDependencies = (
+  overrides: Partial<RunRemoteBuddyMainDependencies> = {},
+): RunRemoteBuddyMainDependencies => ({
+  ensurePreflight: overrides.ensurePreflight ?? DEFAULT_MAIN_DEPENDENCIES.ensurePreflight,
+  connectWithRetry: overrides.connectWithRetry ?? DEFAULT_MAIN_DEPENDENCIES.connectWithRetry,
+  createLLMClient: overrides.createLLMClient ?? DEFAULT_MAIN_DEPENDENCIES.createLLMClient,
+  createBrain: overrides.createBrain ?? DEFAULT_MAIN_DEPENDENCIES.createBrain,
+  createOrchestrator:
+    overrides.createOrchestrator ?? DEFAULT_MAIN_DEPENDENCIES.createOrchestrator,
+});
+
+const buildPreflightRuntimeConfig = (
+  cli: RemoteBuddyCliArgs,
+): RemoteBuddyPreflightRuntimeConfig => {
+  const llmCfg = CONFIG.remotebuddy.llm;
+  const startupCfg = CONFIG.remotebuddy.startup;
+  return {
+    repoRoot: detectRepoRoot(process.cwd()),
+    server: cli.server,
+    sessionId: cli.sessionId,
+    authToken: cli.authToken,
+    llm: {
+      backend: llmCfg.backend,
+      endpoint: llmCfg.endpoint ?? null,
+      model: llmCfg.model ?? null,
+      apiKey: llmCfg.apiKey ?? null,
+    },
+    startup: {
+      allowDirtyWorktree: startupCfg.allowDirtyWorktree,
+      alertsCheckMode: startupCfg.alertsCheckMode,
+      syntheticCheckMode: startupCfg.syntheticCheckMode,
+      syntheticProbeName: startupCfg.syntheticProbeName,
+      syntheticMaxLatencyMs: startupCfg.syntheticMaxLatencyMs,
+      alertsEndpoint: startupCfg.alertsEndpoint ?? null,
+    },
+  };
+};
+
+export async function runRemoteBuddyMain(
+  options: RunRemoteBuddyMainOptions = {},
+): Promise<void> {
+  const cli = { ...parseArgs(), ...options.cliOverrides };
+  const runtimeConfig = buildPreflightRuntimeConfig(cli);
+  const deps = mergeDependencies(options.dependencies);
+
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
-  console.log(`[RemoteBuddy] Server: ${opts.server}`);
+  console.log(`[RemoteBuddy] Server: ${cli.server}`);
   if (CONFIG.startup.logConfigOnStart) {
     console.log("[RemoteBuddy] Effective config snapshot (sanitized):");
     console.log(JSON.stringify(sanitizePushPalsConfigForLogging(CONFIG), null, 2));
@@ -2092,10 +2163,7 @@ export async function runRemoteBuddyMain(opts: RemoteBuddyMainOptions): Promise<
     );
   }
 
-  await ensurePreflightPasses();
-
-  // ── Initialise LLM + brain ──
-  let brain: AgentBrain;
+  await deps.ensurePreflight(runtimeConfig);
 
   // ── Initialise idempotency store ──
   const dataDir = CONFIG.paths.dataDir;
@@ -2117,13 +2185,13 @@ export async function runRemoteBuddyMain(opts: RemoteBuddyMainOptions): Promise<
     }`,
   );
 
-  let sessionId = opts.sessionId;
+  let sessionId = cli.sessionId;
   console.log(`[RemoteBuddy] Ensuring session "${sessionId}" exists on server...`);
-  sessionId = await connectWithRetry(opts.server, sessionId ?? undefined);
+  sessionId = await deps.connectWithRetry(cli.server, sessionId ?? undefined);
   console.log(`[RemoteBuddy] Using session: ${sessionId}`);
 
   const llmCfg = CONFIG.remotebuddy.llm;
-  const llm = createLLMClient({
+  const llm = deps.createLLMClient({
     service: "remotebuddy",
     sessionId,
     backend: llmCfg.backend,
@@ -2131,12 +2199,12 @@ export async function runRemoteBuddyMain(opts: RemoteBuddyMainOptions): Promise<
     model: llmCfg.model,
     apiKey: llmCfg.apiKey,
   });
-  brain = new AgentBrain(llm);
+  const brain = deps.createBrain(llm);
 
-  const orchestrator = new RemoteBuddyOrchestrator({
-    server: opts.server,
+  const orchestrator = deps.createOrchestrator({
+    server: cli.server,
     sessionId,
-    authToken: opts.authToken,
+    authToken: cli.authToken,
     brain,
     llm,
     idempotency,
@@ -2155,21 +2223,12 @@ export async function runRemoteBuddyMain(opts: RemoteBuddyMainOptions): Promise<
 }
 
 async function main() {
-  const opts = parseArgs();
-  await runRemoteBuddyMain(opts);
+  await runRemoteBuddyMain();
 }
 
 if (import.meta.main) {
   main().catch((err) => {
-    if (err instanceof RemoteBuddyPreflightError) {
-      console.error("[RemoteBuddy] Startup preflight failed:", err.message);
-      const action = err.failure.action ? ` Action: ${err.failure.action}` : "";
-      console.error(
-        `[RemoteBuddy] Startup failure code=${err.failure.code} detail=${err.failure.detail}${action}`,
-      );
-    } else {
-      console.error("[RemoteBuddy] Fatal:", err);
-    }
+    console.error("[RemoteBuddy] Fatal:", err);
     process.exit(1);
   });
 }

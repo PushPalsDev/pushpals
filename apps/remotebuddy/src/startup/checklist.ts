@@ -8,7 +8,6 @@ export const STARTUP_FAILURE_CODES = {
   REPO_DIRTY: "startup.repo_dirty",
   ALERTS_ACTIVE: "startup.alerts_active",
   SYNTHETIC_FAILED: "startup.synthetic_failed",
-  DISPATCH_FAILED: "startup.dispatch_failed",
 } as const;
 
 export type StartupFailureCode =
@@ -18,10 +17,14 @@ type StartupCheckStatus = "pass" | "fail";
 
 export type StartupCheckCategory = "repo" | "alerts" | "synthetic" | "dispatch";
 
+export type StartupCheckMode = "enforced" | "skip";
+
 export interface StartupChecklistOptions {
   syntheticMaxLatencyMs?: number;
   syntheticProbeName?: string;
   allowDirtyWorktree?: boolean;
+  alertCheckMode?: StartupCheckMode;
+  syntheticCheckMode?: StartupCheckMode;
 }
 
 export interface RepoStatus {
@@ -102,10 +105,6 @@ export interface StartupCheckStructure {
 
 const DEFAULT_SYNTHETIC_LATENCY_MS = 850;
 const DEFAULT_SYNTHETIC_PROBE = "probe.remote_startup";
-const DISPATCH_CHECK_LABEL = "Job dispatch must succeed.";
-const DISPATCH_CHECK_ACTION =
-  "Inspect RemoteBuddy + WorkerPals logs, repair dependencies, then rerun dispatch.";
-
 const defaultChecks: readonly StartupCheckDefinition[] = [
   {
     code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
@@ -161,7 +160,14 @@ const defaultChecks: readonly StartupCheckDefinition[] = [
     action:
       "Visit Alertmanager › remote-* group and resolve or silence outstanding alerts before dispatch resumes.",
     category: "alerts",
-    run: async (ctx) => {
+    run: async (ctx, options) => {
+      const mode = options.alertCheckMode ?? "enforced";
+      if (mode === "skip") {
+        return {
+          ok: true,
+          detail: "Alertmanager check skipped (alertCheckMode=skip).",
+        };
+      }
       const alerts = await ctx.listFiringAlerts();
       if (alerts.length === 0) {
         return { ok: true, detail: "No remote-* alerts are firing." };
@@ -179,6 +185,14 @@ const defaultChecks: readonly StartupCheckDefinition[] = [
       "Re-run the synthetic probe (`bun run test --filter startup`) and repair LM Studio / remote dependencies if it keeps failing.",
     category: "synthetic",
     run: async (ctx, options) => {
+      const mode = options.syntheticCheckMode ?? "enforced";
+      if (mode === "skip") {
+        const probe = options.syntheticProbeName ?? DEFAULT_SYNTHETIC_PROBE;
+        return {
+          ok: true,
+          detail: `${probe} skipped (syntheticCheckMode=skip).`,
+        };
+      }
       const maxLatencyMs =
         options.syntheticMaxLatencyMs ?? DEFAULT_SYNTHETIC_LATENCY_MS;
       const probeName = options.syntheticProbeName ?? DEFAULT_SYNTHETIC_PROBE;
@@ -212,13 +226,6 @@ export const STARTUP_CHECK_STRUCTURE: readonly StartupCheckStructure[] = [
     category: check.category,
     step: index + 1,
   })),
-  {
-    code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
-    label: DISPATCH_CHECK_LABEL,
-    action: DISPATCH_CHECK_ACTION,
-    category: "dispatch",
-    step: defaultChecks.length + 1,
-  },
 ];
 
 const nowMs = (ctx: StartupChecklistContext) =>
@@ -303,65 +310,3 @@ export const runStartupPreflight = async (
   return buildDefaultChecklist().run(memoized, options);
 };
 
-export const gateDispatchWithStartupPreflight = async (
-  ctx: StartupChecklistContext,
-  dispatchJob: () => Promise<void>,
-  options: StartupChecklistOptions = {},
-): Promise<StartupChecklistResult> => {
-  const result = await runStartupPreflight(ctx, options);
-  if (!result.ok) {
-    return result;
-  }
-  const dispatchStep = result.history.length + 1;
-  const dispatchLabel = DISPATCH_CHECK_LABEL;
-  const dispatchAction = DISPATCH_CHECK_ACTION;
-  const started = nowMs(ctx);
-  try {
-    await dispatchJob();
-    const elapsedMs = Math.max(0, nowMs(ctx) - started);
-    const successRecord: StartupCheckRecord = {
-      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
-      label: dispatchLabel,
-      category: "dispatch",
-      step: dispatchStep,
-      status: "pass",
-      detail: "Dispatch completed successfully.",
-      elapsedMs,
-    };
-    result.history.push(successRecord);
-    ctx.log?.(successRecord);
-    return result;
-  } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : typeof error === "string"
-          ? error
-          : "Unknown dispatch failure.";
-    const detail = `Dispatch job failed: ${errorMessage}`;
-    const elapsedMs = Math.max(0, nowMs(ctx) - started);
-    const failureRecord: StartupCheckRecord = {
-      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
-      label: dispatchLabel,
-      category: "dispatch",
-      step: dispatchStep,
-      status: "fail",
-      detail,
-      action: dispatchAction,
-      elapsedMs,
-    };
-    ctx.log?.(failureRecord);
-    const history = [...result.history, failureRecord];
-    return {
-      ok: false,
-      failure: {
-        code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
-        detail,
-        action: dispatchAction,
-        category: "dispatch",
-        step: dispatchStep,
-      },
-      history,
-    };
-  }
-};

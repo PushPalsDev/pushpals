@@ -51,6 +51,26 @@ startup can reference a single source of truth.
    - If this host also serves LocalBuddy traffic, start `bun run client:only` and open the Ops tab to
      confirm it sees the new RemoteBuddy instance before accepting paid tasks.
 
+## Startup preflight configuration
+
+`remotebuddy.startup` in `configs/*.toml` controls which preflight gates are enforced before
+`runRemoteBuddyMain` starts polling:
+
+- `alerts_check` (`"skip"` by default) toggles the Alertmanager gate. When set to `"skip"`, the
+  checklist records a pass with `alertCheckMode=skip` so operators have explicit evidence that the
+  check was intentionally bypassed. Set it to `"enforced"` and provide `alerts_endpoint` (or export
+  `REMOTEBUDDY_PREFLIGHT_ALERTS_ENDPOINT`) once a real alert source is wired up.
+- `synthetic_check` mirrors that behavior for the synthetic probe. `"skip"` documents the no-op
+  policy, while `"enforced"` requires a tester implementation (or override via
+  `REMOTEBUDDY_PREFLIGHT_SYNTHETIC_*` env vars) before RemoteBuddy will accept work.
+- `synthetic_probe_name`, `synthetic_max_latency_ms`, and `allow_dirty_worktree` feed the canonical
+  preflight runtime config so failures include actionable metadata.
+
+Environment overrides exist as `REMOTEBUDDY_PREFLIGHT_ALERTS_MODE`,
+`REMOTEBUDDY_PREFLIGHT_ALERTS_ENDPOINT`, `REMOTEBUDDY_PREFLIGHT_SYNTHETIC_CHECK_MODE`, and
+`REMOTEBUDDY_PREFLIGHT_SYNTHETIC_PROBE/MAX_LATENCY_MS`; use those for one-off experiments without
+editing checked-in config.
+
 ## Telemetry gates (block startup if any fail)
 
 | Signal | Pass criteria | Source or command | Rollback / block trigger |
