@@ -44,6 +44,7 @@ import {
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
 import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import { logStartupPreflightFailure, runRuntimePreflight } from "./preflight/runtime.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -2073,8 +2074,20 @@ async function connectWithRetry(
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-async function main() {
+export async function main() {
   const opts = parseArgs();
+
+  const runtimePreflight = await runRuntimePreflight();
+  if (!runtimePreflight.ok) {
+    const { failure, history } = runtimePreflight;
+    logStartupPreflightFailure(failure, history);
+    console.error(
+      `[RemoteBuddy] Startup preflight blocked (${failure.code}): ${failure.detail}`,
+    );
+    console.error(`[RemoteBuddy] Recommended action: ${failure.action}`);
+    process.exitCode = failure.exitCode;
+    return;
+  }
 
   console.log("[RemoteBuddy] PushPals RemoteBuddy Orchestrator");
   console.log(`[RemoteBuddy] Server: ${opts.server}`);
@@ -2147,7 +2160,9 @@ async function main() {
   orchestrator.startPolling(pollMs);
 }
 
-main().catch((err) => {
-  console.error("[RemoteBuddy] Fatal:", err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("[RemoteBuddy] Fatal:", err);
+    process.exit(1);
+  });
+}
