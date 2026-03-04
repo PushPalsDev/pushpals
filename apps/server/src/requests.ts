@@ -77,6 +77,10 @@ function parseMetadataJson(raw: string | null | undefined): Record<string, unkno
   }
 }
 
+function isAutonomyMetadata(metadata: Record<string, unknown> | undefined): boolean {
+  return asString(metadata?.origin).toLowerCase() === "autonomy";
+}
+
 function sanitizeRequestMetadata(input: unknown): {
   metadata: Record<string, unknown> | null;
   error?: string;
@@ -632,6 +636,40 @@ export class RequestQueue {
       counts[priority] = Number(row.count || 0);
     }
     return counts;
+  }
+
+  countAutonomyRequests(statuses: Array<RequestStatus> = ["pending", "claimed"]): number {
+    const normalized = Array.from(
+      new Set(
+        statuses
+          .map((status) => String(status ?? "").trim().toLowerCase())
+          .filter(
+            (status): status is RequestStatus =>
+              status === "pending" ||
+              status === "claimed" ||
+              status === "completed" ||
+              status === "failed",
+          ),
+      ),
+    );
+    if (normalized.length === 0) return 0;
+    const placeholders = normalized.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT metadataJson
+         FROM requests
+         WHERE status IN (${placeholders})
+           AND metadataJson IS NOT NULL
+           AND metadataJson <> ''`,
+      )
+      .all(...normalized) as Array<{ metadataJson: string | null }>;
+
+    let count = 0;
+    for (const row of rows) {
+      const metadata = parseMetadataJson(row.metadataJson);
+      if (isAutonomyMetadata(metadata)) count += 1;
+    }
+    return count;
   }
 
   nextPendingSnapshot(

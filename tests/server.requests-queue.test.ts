@@ -173,4 +173,48 @@ describe("server RequestQueue", () => {
     expect(String(enqueued.message ?? "")).toContain("scope invalid");
     queue.close();
   });
+
+  test("counts autonomy requests by status", () => {
+    const queue = new RequestQueue(":memory:");
+
+    const autonomyOne = queue.enqueue({
+      sessionId: "dev",
+      prompt: "autonomy request one",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          componentArea: "apps/server",
+          targetPaths: ["apps/server/src/server_main.ts"],
+          writeGlobs: ["apps/server/src/*"],
+        },
+      },
+    });
+    const autonomyTwo = queue.enqueue({
+      sessionId: "dev",
+      prompt: "autonomy request two",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          componentArea: "apps/remotebuddy",
+          targetPaths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+          writeGlobs: ["apps/remotebuddy/src/*"],
+        },
+      },
+    });
+    const userRequest = queue.enqueue({
+      sessionId: "dev",
+      prompt: "plain user request",
+    });
+
+    expect(autonomyOne.ok).toBe(true);
+    expect(autonomyTwo.ok).toBe(true);
+    expect(userRequest.ok).toBe(true);
+    expect(queue.countAutonomyRequests(["pending"])).toBe(2);
+
+    const claim = queue.claim("remotebuddy-orchestrator");
+    expect(claim.ok).toBe(true);
+    expect(queue.countAutonomyRequests(["pending"])).toBe(1);
+    expect(queue.countAutonomyRequests(["pending", "claimed"])).toBe(2);
+    queue.close();
+  });
 });

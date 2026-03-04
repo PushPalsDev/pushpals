@@ -33,6 +33,9 @@ const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
 const autonomyStore = new AutonomyStore(sharedDbPath);
 const REPO_STATUS_CACHE_TTL_MS = 60_000;
+const AUTONOMY_BUSY_QUEUE_MAX_REQUESTS = 5;
+const AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS = 10;
+const AUTONOMY_WORKER_TTL_MS = 15_000;
 
 interface RepoStatusSummary {
   remote: string;
@@ -163,6 +166,14 @@ export function createRequestHandler() {
           // ignore malformed JSON payload
         }
         return {};
+      };
+      const isAutonomyRequestPayload = (value: Record<string, unknown>): boolean => {
+        const metadata = value.metadata ?? value.meta;
+        if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+        const origin = String((metadata as Record<string, unknown>).origin ?? "")
+          .trim()
+          .toLowerCase();
+        return origin === "autonomy";
       };
       const parseRuntimeMutations = (value: unknown): RuntimeConfigMutation[] => {
         if (!Array.isArray(value)) return [];
@@ -614,6 +625,14 @@ export function createRequestHandler() {
         const workers = jobQueue.listWorkers(ttlMs);
         const onlineWorkers = workers.filter((w) => w.isOnline);
         const busyWorkers = onlineWorkers.filter((w) => w.status === "busy").length;
+        const workerPrBacklog = jobQueue.listWorkerPrBacklog(200);
+        const openUnmergedWorkerPrs = workerPrBacklog.filter(
+          (entry) => entry.mergeState === "open_unmerged",
+        );
+        const mergedWorkerPrs = workerPrBacklog.filter((entry) => entry.mergeState === "merged");
+        const closedUnmergedWorkerPrs = workerPrBacklog.filter(
+          (entry) => entry.mergeState === "closed_unmerged",
+        );
 
         return makeJson({
           ok: true,
@@ -631,6 +650,19 @@ export function createRequestHandler() {
             jobs: jobQueue.countByStatus(),
             jobPriorities: jobQueue.countByPriority(),
             jobPendingSnapshot: jobQueue.nextPendingSnapshot(10),
+            workerPrBacklog: {
+              openUnmergedCount: openUnmergedWorkerPrs.length,
+              mergedCount: mergedWorkerPrs.length,
+              closedUnmergedCount: closedUnmergedWorkerPrs.length,
+              openUnmergedSnapshot: openUnmergedWorkerPrs.slice(0, 10).map((entry) => ({
+                prUrl: entry.prUrl,
+                latestJobId: entry.latestJobId,
+                latestJobStatus: entry.latestJobStatus,
+                latestJobAt: entry.latestJobAt,
+                latestFeedbackVerdict: entry.latestFeedbackVerdict,
+                latestFeedbackAt: entry.latestFeedbackAt,
+              })),
+            },
             completions: completionQueue.countByStatus(),
           },
           slo: {
@@ -1205,6 +1237,51 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        if (isAutonomyRequestPayload(body)) {
+          const workers = jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS);
+          const schedulableWorkers = workers.filter((worker) => worker.isOnline && worker.status !== "offline");
+          const idleWorkers = schedulableWorkers.filter(
+            (worker) => worker.status === "idle" && worker.activeJobCount === 0,
+          );
+          const workersAllBusy = schedulableWorkers.length > 0 && idleWorkers.length === 0;
+          if (workersAllBusy) {
+            const autonomyQueued = requestQueue.countAutonomyRequests(["pending", "claimed"]);
+            if (autonomyQueued >= AUTONOMY_BUSY_QUEUE_MAX_REQUESTS) {
+              return makeJson(
+                {
+                  ok: false,
+                  code: "autonomy_queue_backpressure",
+                  message:
+                    `Autonomy enqueue blocked: workers are saturated and autonomy queue depth reached ` +
+                    `${AUTONOMY_BUSY_QUEUE_MAX_REQUESTS}.`,
+                  currentQueued: autonomyQueued,
+                  limit: AUTONOMY_BUSY_QUEUE_MAX_REQUESTS,
+                },
+                429,
+              );
+            }
+          }
+
+          const workerPrBacklog = jobQueue.listWorkerPrBacklog(500);
+          const openUnmergedWorkerPrs = workerPrBacklog.filter(
+            (entry) => entry.mergeState === "open_unmerged",
+          );
+          if (openUnmergedWorkerPrs.length >= AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS) {
+            return makeJson(
+              {
+                ok: false,
+                code: "autonomy_open_pr_limit",
+                message:
+                  `Autonomy enqueue blocked: open unmerged worker PR backlog reached ` +
+                  `${AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS}.`,
+                currentOpenUnmergedWorkerPrs: openUnmergedWorkerPrs.length,
+                limit: AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS,
+                openUnmergedPrs: openUnmergedWorkerPrs.slice(0, 10).map((entry) => entry.prUrl),
+              },
+              429,
+            );
+          }
+        }
         const result = requestQueue.enqueue(body);
         return makeJson(result, result.ok ? 201 : 400);
       }

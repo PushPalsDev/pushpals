@@ -111,6 +111,19 @@ export interface JobSloSummary {
   queueWaitMs: JobSloMetricSummary;
 }
 
+export type WorkerPrMergeState = "open_unmerged" | "merged" | "closed_unmerged";
+
+export interface WorkerPrBacklogEntry {
+  prUrl: string;
+  normalizedPrUrl: string;
+  latestJobId: string;
+  latestJobStatus: JobStatus;
+  latestJobAt: string;
+  latestFeedbackVerdict: string | null;
+  latestFeedbackAt: string | null;
+  mergeState: WorkerPrMergeState;
+}
+
 function parseObjectJson(value: string | null): Record<string, unknown> {
   if (!value) return {};
   try {
@@ -232,6 +245,32 @@ function normalizePrUrl(value: unknown): string | null {
   } catch {
     return trimmed.replace(/\/+$/, "").toLowerCase();
   }
+}
+
+function normalizePrFeedbackVerdict(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function isMergedPrFeedbackVerdict(value: unknown): boolean {
+  const verdict = normalizePrFeedbackVerdict(value);
+  if (!verdict) return false;
+  if (
+    verdict.includes("unmergeable") ||
+    verdict.includes("merge_conflict") ||
+    verdict.includes("merge_failed")
+  ) {
+    return false;
+  }
+  return verdict.includes("merged");
+}
+
+function isClosedPrFeedbackVerdict(value: unknown): boolean {
+  const verdict = normalizePrFeedbackVerdict(value);
+  if (!verdict) return false;
+  if (isMergedPrFeedbackVerdict(verdict)) return false;
+  return verdict.includes("closed");
 }
 
 function extractReviewAgentPrUrl(params: Record<string, unknown>): string | null {
@@ -1255,6 +1294,112 @@ export class JobQueue {
       counts[priority] = Number(row.count || 0);
     }
     return counts;
+  }
+
+  listWorkerPrBacklog(limit = 200): WorkerPrBacklogEntry[] {
+    const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(2_000, Math.floor(limit))) : 200;
+    const scanRows = Math.max(50, maxRows * 8);
+    const latestJobs = new Map<
+      string,
+      {
+        prUrl: string;
+        latestJobId: string;
+        latestJobStatus: JobStatus;
+        latestJobAt: string;
+      }
+    >();
+    const jobRows = this.db
+      .prepare(
+        `SELECT
+           id,
+           prUrl,
+           status,
+           COALESCE(completedAt, failedAt, updatedAt, createdAt) AS latestJobAt
+         FROM jobs
+         WHERE prUrl IS NOT NULL
+           AND TRIM(prUrl) <> ''
+         ORDER BY latestJobAt DESC
+         LIMIT ?`,
+      )
+      .all(scanRows) as Array<{
+      id: string;
+      prUrl: string | null;
+      status: JobStatus;
+      latestJobAt: string;
+    }>;
+
+    for (const row of jobRows) {
+      const normalizedPrUrl = normalizePrUrl(row.prUrl);
+      if (!normalizedPrUrl || latestJobs.has(normalizedPrUrl)) continue;
+      latestJobs.set(normalizedPrUrl, {
+        prUrl: String(row.prUrl ?? "").trim(),
+        latestJobId: row.id,
+        latestJobStatus: row.status,
+        latestJobAt: row.latestJobAt,
+      });
+      if (latestJobs.size >= maxRows) break;
+    }
+
+    const latestFeedbackByPr = new Map<
+      string,
+      {
+        verdict: string | null;
+        createdAt: string | null;
+      }
+    >();
+    try {
+      const feedbackRows = this.db
+        .prepare(
+          `SELECT pr_url AS prUrl, verdict, created_at AS createdAt
+           FROM autonomy_pr_feedback
+           WHERE pr_url IS NOT NULL
+             AND TRIM(pr_url) <> ''
+           ORDER BY created_at DESC
+           LIMIT ?`,
+        )
+        .all(Math.max(200, maxRows * 12)) as Array<{
+        prUrl: string | null;
+        verdict: string | null;
+        createdAt: string | null;
+      }>;
+      for (const row of feedbackRows) {
+        const normalizedPrUrl = normalizePrUrl(row.prUrl);
+        if (!normalizedPrUrl || latestFeedbackByPr.has(normalizedPrUrl)) continue;
+        latestFeedbackByPr.set(normalizedPrUrl, {
+          verdict: row.verdict ? String(row.verdict).trim() : null,
+          createdAt: row.createdAt ? String(row.createdAt).trim() : null,
+        });
+      }
+    } catch {
+      // autonomy_pr_feedback may not exist in isolated JobQueue tests.
+    }
+
+    const entries: WorkerPrBacklogEntry[] = [];
+    for (const [normalizedPrUrl, job] of latestJobs.entries()) {
+      const feedback = latestFeedbackByPr.get(normalizedPrUrl);
+      const latestFeedbackVerdict = feedback?.verdict ?? null;
+      const mergeState: WorkerPrMergeState = isMergedPrFeedbackVerdict(latestFeedbackVerdict)
+        ? "merged"
+        : isClosedPrFeedbackVerdict(latestFeedbackVerdict)
+          ? "closed_unmerged"
+          : "open_unmerged";
+      entries.push({
+        prUrl: job.prUrl,
+        normalizedPrUrl,
+        latestJobId: job.latestJobId,
+        latestJobStatus: job.latestJobStatus,
+        latestJobAt: job.latestJobAt,
+        latestFeedbackVerdict,
+        latestFeedbackAt: feedback?.createdAt ?? null,
+        mergeState,
+      });
+    }
+    return entries.slice(0, maxRows);
+  }
+
+  countOpenUnmergedWorkerPrs(limit = 500): number {
+    return this.listWorkerPrBacklog(limit).filter((entry) => entry.mergeState === "open_unmerged")
+      .length;
   }
 
   nextPendingSnapshot(
