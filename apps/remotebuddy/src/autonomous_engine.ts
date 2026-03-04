@@ -188,6 +188,8 @@ const MAX_VISION_SECTION_CHARS = 1_200;
 const DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
 const DOCS_WEAK_EVIDENCE_MAX_PENALTY = 0.12;
 const ENGINE_EXPLORE_RATE_DEFAULT = 0.3;
+const ENGINE_EXPLORE_RATE_MIN = 0.1;
+const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
 
@@ -205,6 +207,17 @@ type EngineIdeaPriorForScoring = {
   ema_regret?: unknown;
   sample_count?: unknown;
 } | null;
+
+type AdaptiveExploreRateSnapshot = {
+  top_signals?: Array<{ type?: unknown; value?: unknown }>;
+  feedback_priors?: Array<{
+    ema_success?: unknown;
+    ema_user_accept?: unknown;
+    ema_regret?: unknown;
+    sample_count?: unknown;
+  }>;
+  engine_idea_priors?: Array<{ sample_count?: unknown }>;
+};
 
 export function docsWeakEvidencePenaltyForImpact(
   objectiveType: string,
@@ -286,6 +299,100 @@ export function engineIdeaPriorSignalForScoring(prior: EngineIdeaPriorForScoring
     noveltyScore,
     priorScore,
     noveltyBonus: 0.06 * noveltyScore,
+  };
+}
+
+function clampToRange(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  if (value <= min) return min;
+  if (value >= max) return max;
+  return value;
+}
+
+export function computeAdaptiveExploreRate(params: {
+  baseRate?: number;
+  minRate?: number;
+  maxRate?: number;
+  snapshot: AdaptiveExploreRateSnapshot;
+}): {
+  baseRate: number;
+  effectiveRate: number;
+  adjustment: number;
+  regretSignal: number;
+  revisionPressure: number;
+  stability: number;
+  diversityDeficit: number;
+} {
+  const baseRate = clamp01(asNumber(params.baseRate, ENGINE_EXPLORE_RATE_DEFAULT));
+  const minRate = clamp01(asNumber(params.minRate, ENGINE_EXPLORE_RATE_MIN));
+  const maxRate = clamp01(asNumber(params.maxRate, ENGINE_EXPLORE_RATE_MAX));
+  const lowerBound = Math.min(minRate, maxRate);
+  const upperBound = Math.max(minRate, maxRate);
+
+  const topSignals = Array.isArray(params.snapshot.top_signals) ? params.snapshot.top_signals : [];
+  const regretSignal = clamp01(
+    Math.max(
+      0,
+      ...topSignals
+        .filter((entry) => asString(entry.type).toLowerCase() === "regret_signal")
+        .map((entry) => asNumber(entry.value, 0)),
+    ),
+  );
+  const queuePressure = clamp01(
+    Math.max(
+      0,
+      ...topSignals
+        .filter((entry) => asString(entry.type).toLowerCase() === "queue_health")
+        .map((entry) => asNumber(entry.value, 0)),
+    ),
+  );
+
+  const feedback = Array.isArray(params.snapshot.feedback_priors) ? params.snapshot.feedback_priors : [];
+  let weightedTotal = 0;
+  let weightedSuccess = 0;
+  let weightedUserAccept = 0;
+  let weightedRegret = 0;
+  for (const prior of feedback) {
+    const weight = Math.max(1, Math.floor(asNumber(prior.sample_count, 1)));
+    weightedTotal += weight;
+    weightedSuccess += weight * clamp01(asNumber(prior.ema_success, 0));
+    weightedUserAccept += weight * clamp01(asNumber(prior.ema_user_accept, 0));
+    weightedRegret += weight * clamp01(asNumber(prior.ema_regret, 0));
+  }
+  const avgSuccess = weightedTotal > 0 ? weightedSuccess / weightedTotal : 0;
+  const avgUserAccept = weightedTotal > 0 ? weightedUserAccept / weightedTotal : 0;
+  const avgRegret = weightedTotal > 0 ? weightedRegret / weightedTotal : 0;
+  const revisionPressure = clamp01(1 - avgUserAccept);
+  const stability = clamp01(0.65 * avgSuccess + 0.35 * (1 - avgRegret));
+
+  const engineRows = Array.isArray(params.snapshot.engine_idea_priors)
+    ? params.snapshot.engine_idea_priors
+    : [];
+  const sampleCounts = engineRows
+    .map((row) => Math.max(0, Math.floor(asNumber(row.sample_count, 0))))
+    .filter((count) => count > 0);
+  const engineSampleTotal = sampleCounts.reduce((sum, count) => sum + count, 0);
+  const topShare = engineSampleTotal > 0 ? Math.max(...sampleCounts) / engineSampleTotal : 1;
+  const activeBlocks = sampleCounts.length;
+  const scarcity = clamp01(1 - Math.min(activeBlocks, 5) / 5);
+  const diversityDeficit =
+    engineSampleTotal <= 0 ? 1 : clamp01(0.65 * clamp01(topShare) + 0.35 * scarcity);
+  const coldStartBoost = engineSampleTotal < 6 ? 0.05 : 0;
+
+  const upwardPressure =
+    0.16 * regretSignal + 0.1 * revisionPressure + 0.08 * diversityDeficit + 0.05 * queuePressure;
+  const downwardPressure = 0.18 * stability + 0.08 * (1 - regretSignal);
+  const rawRate = baseRate + upwardPressure - downwardPressure + coldStartBoost;
+  const effectiveRate = clampToRange(rawRate, lowerBound, upperBound);
+  const adjustment = effectiveRate - baseRate;
+  return {
+    baseRate,
+    effectiveRate,
+    adjustment,
+    regretSignal,
+    revisionPressure,
+    stability,
+    diversityDeficit,
   };
 }
 
@@ -2097,6 +2204,12 @@ export class RemoteBuddyAutonomousEngine {
         }
         return a.candidate.id.localeCompare(b.candidate.id);
       });
+      const adaptiveExplore = computeAdaptiveExploreRate({
+        baseRate: this.cfg.exploreRate,
+        minRate: ENGINE_EXPLORE_RATE_MIN,
+        maxRate: ENGINE_EXPLORE_RATE_MAX,
+        snapshot,
+      });
 
       const eligibilityById = await this.fetchEligibility(
         runId,
@@ -2142,12 +2255,16 @@ export class RemoteBuddyAutonomousEngine {
         engine_idea_novelty_score: row.engineIdeaNoveltyScore,
         engine_idea_novelty_bonus: row.engineIdeaNoveltyBonus,
         engine_idea_sample_count: row.engineIdeaSampleCount,
+        explore_rate_configured: adaptiveExplore.baseRate,
+        effective_explore_rate: adaptiveExplore.effectiveRate,
+        explore_rate_adjustment: adaptiveExplore.adjustment,
         penalties: row.penalties,
         final_score: row.finalScore,
         gate_decision: row.eligibility.ok ? "approved" : "rejected",
         gate_reasons: row.eligibility.ok ? [] : [row.eligibility.reason],
         selected: false,
         selection_strategy: "not_selected",
+        selection_roll: null,
         candidate_created_at: row.candidate.candidate_created_at,
       }));
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
@@ -2174,7 +2291,7 @@ export class RemoteBuddyAutonomousEngine {
           noveltyScore: row.engineIdeaNoveltyScore,
         })),
         seed: `${runId}:${snapshot.snapshot_id}:${snapshot.snapshot_created_at}`,
-        exploreRate: this.cfg.exploreRate,
+        exploreRate: adaptiveExplore.effectiveRate,
       });
       const selected = selection.selected
         ? eligibleRows.find((row) => row.candidate.id === selection.selected?.id)
@@ -2198,6 +2315,8 @@ export class RemoteBuddyAutonomousEngine {
             feature_hypotheses: selected.candidate.feature_hypotheses,
             ...(selected.candidate.engine_trial ? { engine_trial: selected.candidate.engine_trial } : {}),
             selection_strategy: selectedStrategy,
+            selection_roll: selection.roll,
+            effective_explore_rate: adaptiveExplore.effectiveRate,
           }
         : {
             id: top.candidate.id,
@@ -2215,11 +2334,14 @@ export class RemoteBuddyAutonomousEngine {
             feature_hypotheses: top.candidate.feature_hypotheses,
             ...(top.candidate.engine_trial ? { engine_trial: top.candidate.engine_trial } : {}),
             selection_strategy: "none",
+            selection_roll: null,
+            effective_explore_rate: adaptiveExplore.effectiveRate,
           };
       for (const row of candidatesPayload) {
         const isSelected = Boolean(row.id === selectedCandidatePayload.id);
         row.selected = isSelected;
         row.selection_strategy = isSelected && selected ? selectedStrategy : "not_selected";
+        row.selection_roll = isSelected ? selection.roll : null;
       }
 
       if (!selected) {
@@ -2253,8 +2375,12 @@ export class RemoteBuddyAutonomousEngine {
               engine_idea_novelty_score: top.engineIdeaNoveltyScore,
               engine_idea_novelty_bonus: top.engineIdeaNoveltyBonus,
               engine_idea_sample_count: top.engineIdeaSampleCount,
+              explore_rate_configured: adaptiveExplore.baseRate,
+              effective_explore_rate: adaptiveExplore.effectiveRate,
+              explore_rate_adjustment: adaptiveExplore.adjustment,
               final_score: top.finalScore,
               selection_strategy: "none",
+              selection_roll: null,
             },
           },
           llmCalls,
@@ -2294,8 +2420,12 @@ export class RemoteBuddyAutonomousEngine {
               engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
               engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
               engine_idea_sample_count: selected.engineIdeaSampleCount,
+              explore_rate_configured: adaptiveExplore.baseRate,
+              effective_explore_rate: adaptiveExplore.effectiveRate,
+              explore_rate_adjustment: adaptiveExplore.adjustment,
               final_score: selected.finalScore,
               selection_strategy: selectedStrategy,
+              selection_roll: selection.roll,
             },
           },
           question: {
@@ -2429,8 +2559,12 @@ export class RemoteBuddyAutonomousEngine {
             engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
             engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
             engine_idea_sample_count: selected.engineIdeaSampleCount,
+            explore_rate_configured: adaptiveExplore.baseRate,
+            effective_explore_rate: adaptiveExplore.effectiveRate,
+            explore_rate_adjustment: adaptiveExplore.adjustment,
             final_score: selected.finalScore,
             selection_strategy: selectedStrategy,
+            selection_roll: selection.roll,
           },
         },
         llmCalls,

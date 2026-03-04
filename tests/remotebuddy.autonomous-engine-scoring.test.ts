@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  computeAdaptiveExploreRate,
   docsWeakEvidencePenaltyForImpact,
   engineIdeaPriorSignalForScoring,
   feedbackPriorSignalForScoring,
@@ -104,6 +105,92 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
     expect(first.strategy).toBe("exploit");
     expect(first.selected?.id).toBe("cand_top");
     expect(second.selected?.id).toBe(first.selected?.id);
+  });
+
+  test("adaptive explore rate increases under regret pressure and low idea diversity", () => {
+    const adaptive = computeAdaptiveExploreRate({
+      baseRate: 0.3,
+      snapshot: {
+        top_signals: [
+          { type: "regret_signal", value: 0.9 },
+          { type: "queue_health", value: 0.6 },
+        ],
+        feedback_priors: [
+          {
+            ema_success: 0.35,
+            ema_user_accept: 0.3,
+            ema_regret: 0.75,
+            sample_count: 24,
+          },
+        ],
+        engine_idea_priors: [
+          { sample_count: 20 },
+          { sample_count: 1 },
+        ],
+      },
+    });
+    expect(adaptive.effectiveRate).toBeGreaterThan(0.3);
+    expect(adaptive.adjustment).toBeGreaterThan(0);
+  });
+
+  test("adaptive explore rate decreases under stable high-success signals", () => {
+    const adaptive = computeAdaptiveExploreRate({
+      baseRate: 0.4,
+      snapshot: {
+        top_signals: [
+          { type: "regret_signal", value: 0.05 },
+          { type: "queue_health", value: 0.1 },
+        ],
+        feedback_priors: [
+          {
+            ema_success: 0.95,
+            ema_user_accept: 0.9,
+            ema_regret: 0.05,
+            sample_count: 40,
+          },
+        ],
+        engine_idea_priors: [
+          { sample_count: 8 },
+          { sample_count: 7 },
+          { sample_count: 6 },
+          { sample_count: 5 },
+        ],
+      },
+    });
+    expect(adaptive.effectiveRate).toBeLessThan(0.4);
+    expect(adaptive.adjustment).toBeLessThan(0);
+  });
+
+  test("adaptive explore rate respects configured min/max bounds", () => {
+    const high = computeAdaptiveExploreRate({
+      baseRate: 0.9,
+      minRate: 0.1,
+      maxRate: 0.6,
+      snapshot: {
+        top_signals: [{ type: "regret_signal", value: 1 }],
+        feedback_priors: [],
+        engine_idea_priors: [],
+      },
+    });
+    const low = computeAdaptiveExploreRate({
+      baseRate: 0,
+      minRate: 0.1,
+      maxRate: 0.6,
+      snapshot: {
+        top_signals: [{ type: "regret_signal", value: 0 }],
+        feedback_priors: [
+          {
+            ema_success: 1,
+            ema_user_accept: 1,
+            ema_regret: 0,
+            sample_count: 100,
+          },
+        ],
+        engine_idea_priors: [{ sample_count: 100 }],
+      },
+    });
+    expect(high.effectiveRate).toBe(0.6);
+    expect(low.effectiveRate).toBe(0.1);
   });
 });
 
