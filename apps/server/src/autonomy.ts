@@ -45,6 +45,17 @@ interface FeedbackPrior {
   updated_at: string;
 }
 
+interface EngineIdeaPrior {
+  engine_building_block_id: string;
+  engine_algorithm: string;
+  ema_success: number;
+  ema_user_accept: number;
+  ema_latency: number;
+  ema_regret: number;
+  sample_count: number;
+  updated_at: string;
+}
+
 interface PrFeedbackSignalRow {
   verdict: string | null;
   summary: string | null;
@@ -204,6 +215,7 @@ export interface AutonomySnapshot {
   top_signals: SignalValue[];
   state_traits: StateTrait[];
   feedback_priors: FeedbackPrior[];
+  engine_idea_priors: EngineIdeaPrior[];
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
   open_objectives: OpenObjective[];
   repo_health_flags: {
@@ -373,6 +385,83 @@ function scopedCandidateStorageId(runId: string, candidateId: string): string {
   const prefix = `${normalizedRunId}:`;
   if (normalizedCandidateId.startsWith(prefix)) return normalizedCandidateId;
   return `${prefix}${normalizedCandidateId}`;
+}
+
+type EngineTrialCandidateMeta = {
+  buildingBlockId: string;
+  algorithm: string;
+  source: string;
+  score: number | null;
+  objectiveIds: string[];
+  gapIds: string[];
+  metadata: Record<string, unknown>;
+};
+
+function parseEngineBuildingBlockIdFromCandidateId(candidateId: string): string {
+  if (!candidateId.startsWith("cand_engine_")) return "";
+  const suffix = candidateId.slice("cand_engine_".length);
+  if (!suffix) return "";
+  const pieces = suffix.split("_");
+  if (pieces.length < 2) return "";
+  pieces.pop();
+  return pieces.join("_").trim();
+}
+
+function deriveEngineAlgorithmFromTitle(title: string): string {
+  const prefix = "engine building block:";
+  const text = title.trim();
+  if (!text) return "";
+  if (!text.toLowerCase().startsWith(prefix)) return "";
+  return text.slice(prefix.length).trim();
+}
+
+function extractEngineTrialCandidateMeta(record: Record<string, unknown>): EngineTrialCandidateMeta | null {
+  const candidateId = asString(record.id);
+  const title = asString(record.title);
+  const trial = asObject(
+    record.engine_trial ??
+      record.engineTrial ??
+      record.engine_inspiration ??
+      record.engineInspiration ??
+      asObject(record.debug).engine_trial ??
+      asObject(record.debug).engineTrial,
+  );
+  const explicitBlockId = asString(
+    trial.building_block_id ??
+      trial.buildingBlockId ??
+      trial.block_id ??
+      trial.blockId ??
+      trial.engine_building_block_id ??
+      trial.engineBuildingBlockId,
+  );
+  const fallbackBlockId = parseEngineBuildingBlockIdFromCandidateId(candidateId);
+  const buildingBlockId = explicitBlockId || fallbackBlockId;
+  if (!buildingBlockId) return null;
+
+  const explicitAlgorithm = asString(trial.algorithm ?? trial.algo ?? trial.name);
+  const algorithm = explicitAlgorithm || deriveEngineAlgorithmFromTitle(title) || "engine_building_block";
+  const score = Number.isFinite(asNumber(trial.score, Number.NaN)) ? asNumber(trial.score, 0) : null;
+  const source = asString(trial.source) || (fallbackBlockId ? "engine_fallback" : "llm");
+  const objectiveIds = asStringArray(trial.objective_ids ?? trial.objectiveIds);
+  const gapIds = asStringArray(trial.gap_ids ?? trial.gapIds ?? trial.opportunity_gap_ids);
+
+  const metadata = asObject(trial.metadata);
+  const summary = asString(trial.summary);
+  if (summary) metadata.summary = summary;
+  const hypothesis = asString(trial.hypothesis);
+  if (hypothesis) metadata.hypothesis = hypothesis;
+  if (candidateId) metadata.candidate_id = candidateId;
+  if (title) metadata.candidate_title = title;
+
+  return {
+    buildingBlockId,
+    algorithm,
+    source,
+    score,
+    objectiveIds,
+    gapIds,
+    metadata,
+  };
 }
 
 function policyViolations(params: {
@@ -586,6 +675,44 @@ export class AutonomyStore {
         ema_regret REAL NOT NULL DEFAULT 0,
         fail_streak INTEGER NOT NULL DEFAULT 0,
         cooldown_until TEXT,
+        sample_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS autonomy_engine_idea_trials (
+        trial_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        objective_id TEXT,
+        candidate_id TEXT,
+        pattern_key TEXT NOT NULL,
+        engine_building_block_id TEXT NOT NULL,
+        engine_algorithm TEXT NOT NULL,
+        engine_source TEXT NOT NULL DEFAULT 'llm',
+        engine_score REAL,
+        objective_ids_json TEXT NOT NULL,
+        gap_ids_json TEXT NOT NULL,
+        metadata_json TEXT,
+        status TEXT NOT NULL,
+        success INTEGER,
+        user_action TEXT,
+        latency_ms INTEGER,
+        last_outcome_id INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_engine_trials_objective
+        ON autonomy_engine_idea_trials(objective_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_engine_trials_block
+        ON autonomy_engine_idea_trials(engine_building_block_id, created_at DESC);
+      CREATE TABLE IF NOT EXISTS autonomy_engine_idea_stats (
+        engine_building_block_id TEXT PRIMARY KEY,
+        engine_algorithm TEXT NOT NULL,
+        ema_success REAL NOT NULL DEFAULT 0,
+        ema_user_accept REAL NOT NULL DEFAULT 0,
+        ema_latency REAL NOT NULL DEFAULT 0,
+        ema_regret REAL NOT NULL DEFAULT 0,
         sample_count INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
       );
@@ -1218,6 +1345,7 @@ export class AutonomyStore {
         top_signals: snapshot.top_signals,
         state_traits: snapshot.state_traits,
         feedback_priors: snapshot.feedback_priors.slice(0, 40),
+        engine_idea_priors: snapshot.engine_idea_priors.slice(0, 40),
         active_cooldowns: snapshot.active_cooldowns.slice(0, 40),
         open_objectives: snapshot.open_objectives.slice(0, 40),
         repo_health_flags: snapshot.repo_health_flags,
@@ -1231,6 +1359,7 @@ export class AutonomyStore {
       snapshot_created_at: snapshot.snapshot_created_at,
       snapshot_ttl_ms: snapshot.snapshot_ttl_ms,
       impact_model_version: snapshot.impact_model_version,
+      engine_idea_priors: snapshot.engine_idea_priors.slice(0, 20),
       repo_health_flags: snapshot.repo_health_flags,
       dispatch_budget: snapshot.dispatch_budget,
       payload_hash: payloadHash,
@@ -1311,6 +1440,14 @@ export class AutonomyStore {
          LIMIT 80`,
       )
       .all() as FeedbackPrior[];
+    const engineIdeaPriors = this.db
+      .prepare(
+        `SELECT engine_building_block_id, engine_algorithm, ema_success, ema_user_accept, ema_latency, ema_regret, sample_count, updated_at
+         FROM autonomy_engine_idea_stats
+         ORDER BY updated_at DESC
+         LIMIT 80`,
+      )
+      .all() as EngineIdeaPrior[];
     const activeCooldowns = feedbackPriors
       .filter(
         (row) =>
@@ -1347,6 +1484,7 @@ export class AutonomyStore {
       top_signals: topSignals,
       state_traits: stateTraits,
       feedback_priors: feedbackPriors,
+      engine_idea_priors: engineIdeaPriors,
       active_cooldowns: activeCooldowns,
       open_objectives: openObjectives,
       repo_health_flags: {
@@ -1573,6 +1711,7 @@ export class AutonomyStore {
     }
 
     const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+    const candidateEngineTrialMetaById = new Map<string, EngineTrialCandidateMeta>();
     for (const raw of candidates) {
       const record = asObject(raw);
       const objectiveTypeRaw = asString(record.objectiveType ?? record.objective_type);
@@ -1636,6 +1775,10 @@ export class AutonomyStore {
       const componentAreaPersist = (componentArea ?? componentAreaRaw) || "invalid";
       const candidateExternalId = asString(record.id) || randomUUID();
       const candidateStorageId = scopedCandidateStorageId(runId, candidateExternalId);
+      const engineTrialMeta = extractEngineTrialCandidateMeta(record);
+      if (engineTrialMeta) {
+        candidateEngineTrialMetaById.set(candidateStorageId, engineTrialMeta);
+      }
       const debugRecord = {
         ...asObject(record.debug),
         candidate_external_id: candidateExternalId,
@@ -1868,6 +2011,39 @@ export class AutonomyStore {
         now,
         now,
       );
+    const trialMeta =
+      (objectiveCandidateId ? candidateEngineTrialMetaById.get(objectiveCandidateId) : undefined) ?? null;
+    if (trialMeta) {
+      const trialId = `trial_${objectiveId}`;
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO autonomy_engine_idea_trials (
+            trial_id, run_id, snapshot_id, session_id, objective_id, candidate_id, pattern_key,
+            engine_building_block_id, engine_algorithm, engine_source, engine_score,
+            objective_ids_json, gap_ids_json, metadata_json, status, success, user_action, latency_ms,
+            last_outcome_id, created_at, updated_at, completed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)`,
+        )
+        .run(
+          trialId,
+          runId,
+          snapshotId,
+          sessionId,
+          objectiveId,
+          objectiveCandidateId,
+          patternKey,
+          trialMeta.buildingBlockId,
+          trialMeta.algorithm,
+          trialMeta.source || "llm",
+          trialMeta.score,
+          JSON.stringify(trialMeta.objectiveIds),
+          JSON.stringify(trialMeta.gapIds),
+          JSON.stringify(trialMeta.metadata),
+          objectiveStatus || "proposed",
+          now,
+          now,
+        );
+    }
 
     let questionId: string | undefined;
     const question = asObject(body.question);
@@ -2219,7 +2395,7 @@ export class AutonomyStore {
       }
     }
 
-    this.db
+    const outcomeInsert = this.db
       .prepare(
         `INSERT INTO autonomy_outcomes (
           objective_id, request_id, job_id, pattern_key, success, retries, latency_ms, user_action,
@@ -2239,6 +2415,7 @@ export class AutonomyStore {
         regressionFlag ? 1 : 0,
         now,
       );
+    const outcomeId = Math.max(0, Math.floor(asNumber(outcomeInsert.lastInsertRowid, 0)));
 
     if (objectiveId) {
       const terminalStatus = success ? "completed" : "failed";
@@ -2253,6 +2430,21 @@ export class AutonomyStore {
         )
         .run(terminalStatus, requestId, jobId, now, objectiveId);
     }
+    const pendingIdeaTrials = objectiveId
+      ? (this.db
+          .prepare(
+            `SELECT trial_id, engine_building_block_id, engine_algorithm
+             FROM autonomy_engine_idea_trials
+             WHERE objective_id = ?
+               AND completed_at IS NULL
+             ORDER BY created_at ASC`,
+          )
+          .all(objectiveId) as Array<{
+          trial_id: string;
+          engine_building_block_id: string;
+          engine_algorithm: string;
+        }>)
+      : [];
 
     const existing = this.db
       .prepare(
@@ -2294,6 +2486,82 @@ export class AutonomyStore {
       !success && nextFailStreak >= this.config.remotebuddy.autonomy.cooldownFailStreakThreshold
         ? new Date(Date.parse(now) + this.config.remotebuddy.autonomy.cooldownMs).toISOString()
         : null;
+    if (pendingIdeaTrials.length > 0) {
+      const terminalStatus = success ? "completed" : "failed";
+      const outcomeRef = outcomeId > 0 ? outcomeId : null;
+      const updateTrial = this.db.prepare(
+        `UPDATE autonomy_engine_idea_trials
+         SET status = ?,
+             success = ?,
+             user_action = ?,
+             latency_ms = ?,
+             last_outcome_id = ?,
+             completed_at = ?,
+             updated_at = ?
+         WHERE trial_id = ?
+           AND completed_at IS NULL`,
+      );
+      const readIdeaStat = this.db.prepare(
+        `SELECT ema_success, ema_user_accept, ema_latency, ema_regret, sample_count
+         FROM autonomy_engine_idea_stats
+         WHERE engine_building_block_id = ?`,
+      );
+      const upsertIdeaStat = this.db.prepare(
+        `INSERT INTO autonomy_engine_idea_stats (
+          engine_building_block_id, engine_algorithm, ema_success, ema_user_accept, ema_latency, ema_regret, sample_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(engine_building_block_id) DO UPDATE SET
+          engine_algorithm = excluded.engine_algorithm,
+          ema_success = excluded.ema_success,
+          ema_user_accept = excluded.ema_user_accept,
+          ema_latency = excluded.ema_latency,
+          ema_regret = excluded.ema_regret,
+          sample_count = excluded.sample_count,
+          updated_at = excluded.updated_at`,
+      );
+      for (const trial of pendingIdeaTrials) {
+        updateTrial.run(
+          terminalStatus,
+          success ? 1 : 0,
+          userAction,
+          latencyMs,
+          outcomeRef,
+          now,
+          now,
+          trial.trial_id,
+        );
+        const blockId = asString(trial.engine_building_block_id);
+        if (!blockId) continue;
+        const stats = readIdeaStat.get(blockId) as
+          | {
+              ema_success: number;
+              ema_user_accept: number;
+              ema_latency: number;
+              ema_regret: number;
+              sample_count: number;
+            }
+          | undefined;
+        const prevIdea = stats ?? {
+          ema_success: 0,
+          ema_user_accept: 0,
+          ema_latency: 0,
+          ema_regret: 0,
+          sample_count: 0,
+        };
+        const ideaLatencyScore =
+          typeof latencyMs === "number" ? clamp01(1 - latencyMs / 600_000) : prevIdea.ema_latency;
+        upsertIdeaStat.run(
+          blockId,
+          asString(trial.engine_algorithm) || "engine_building_block",
+          ema(prevIdea.ema_success, successValue),
+          ema(prevIdea.ema_user_accept, userAcceptValue),
+          ema(prevIdea.ema_latency, ideaLatencyScore),
+          ema(prevIdea.ema_regret, regretValue),
+          prevIdea.sample_count + 1,
+          now,
+        );
+      }
+    }
 
     this.db
       .prepare(

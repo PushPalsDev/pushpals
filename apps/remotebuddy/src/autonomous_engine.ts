@@ -45,6 +45,16 @@ type AutonomyCandidate = {
   requires_user_input?: boolean;
   question_if_blocked?: string;
   candidate_created_at: string;
+  engine_trial?: {
+    building_block_id: string;
+    algorithm: string;
+    source: "llm" | "engine_fallback" | "engine_mapped";
+    score?: number;
+    objective_ids: string[];
+    gap_ids: string[];
+    summary?: string;
+    hypothesis?: string;
+  };
 };
 
 type Snapshot = {
@@ -67,6 +77,16 @@ type Snapshot = {
     ema_latency: number;
     ema_regret: number;
     fail_streak: number;
+  }>;
+  engine_idea_priors?: Array<{
+    engine_building_block_id: string;
+    engine_algorithm: string;
+    ema_success: number;
+    ema_user_accept: number;
+    ema_latency: number;
+    ema_regret: number;
+    sample_count: number;
+    updated_at: string;
   }>;
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
   open_objectives: Array<{ objective_id: string; pattern_key: string; status: string }>;
@@ -740,6 +760,67 @@ function pickSignalIdsForTrigger(
   return fallback.slice(0, 3);
 }
 
+function normalizeEngineTrialMetadata(
+  value: unknown,
+): NonNullable<AutonomyCandidate["engine_trial"]> | undefined {
+  const raw = asObject(value);
+  const buildingBlockId = asString(
+    raw.building_block_id ??
+      raw.buildingBlockId ??
+      raw.block_id ??
+      raw.blockId ??
+      raw.engine_building_block_id,
+  );
+  if (!buildingBlockId) return undefined;
+  const sourceRaw = asString(raw.source).toLowerCase();
+  const source =
+    sourceRaw === "engine_fallback" || sourceRaw === "engine_mapped" ? sourceRaw : "llm";
+  const score = Number.isFinite(asNumber(raw.score, Number.NaN)) ? asNumber(raw.score, 0) : undefined;
+  return {
+    building_block_id: buildingBlockId,
+    algorithm: asString(raw.algorithm) || "engine_building_block",
+    source,
+    ...(typeof score === "number" ? { score } : {}),
+    objective_ids: asStringArray(raw.objective_ids ?? raw.objectiveIds),
+    gap_ids: asStringArray(raw.gap_ids ?? raw.gapIds ?? raw.opportunity_gap_ids),
+    summary: asString(raw.summary) || undefined,
+    hypothesis: asString(raw.hypothesis) || undefined,
+  };
+}
+
+function inferEngineTrialFromCandidate(
+  candidate: Pick<AutonomyCandidate, "objective_type" | "trigger_type" | "component_area">,
+  engineInspiration: EngineInspirationContext,
+): NonNullable<AutonomyCandidate["engine_trial"]> | undefined {
+  const exact = engineInspiration.building_blocks.find(
+    (block) =>
+      block.candidate_shape.objective_type === candidate.objective_type &&
+      block.candidate_shape.trigger_type === candidate.trigger_type &&
+      block.candidate_shape.component_area === candidate.component_area,
+  );
+  const fallback =
+    exact ??
+    engineInspiration.building_blocks.find(
+      (block) =>
+        block.candidate_shape.objective_type === candidate.objective_type &&
+        block.candidate_shape.component_area === candidate.component_area,
+    ) ??
+    engineInspiration.building_blocks.find(
+      (block) => block.candidate_shape.objective_type === candidate.objective_type,
+    );
+  if (!fallback) return undefined;
+  return {
+    building_block_id: fallback.id,
+    algorithm: fallback.algorithm,
+    source: "engine_mapped",
+    score: fallback.score,
+    objective_ids: fallback.objective_ids,
+    gap_ids: fallback.gap_ids,
+    summary: fallback.summary,
+    hypothesis: fallback.hypothesis,
+  };
+}
+
 export function buildEngineFallbackCandidates(params: {
   engineInspiration: EngineInspirationContext;
   snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
@@ -791,6 +872,16 @@ export function buildEngineFallbackCandidates(params: {
           block.hypothesis,
           `Add measurable telemetry and guardrails for ${block.algorithm}.`,
         ].slice(0, 3),
+        engine_trial: {
+          building_block_id: block.id,
+          algorithm: block.algorithm,
+          source: "engine_fallback",
+          score: block.score,
+          objective_ids: block.objective_ids,
+          gap_ids: block.gap_ids,
+          summary: block.summary,
+          hypothesis: block.hypothesis,
+        },
         requires_user_input: false,
         question_if_blocked: "",
       } as Record<string, unknown>;
@@ -1624,6 +1715,7 @@ export class RemoteBuddyAutonomousEngine {
                   top_signals: snapshot.top_signals.slice(0, 16),
                   state_traits: snapshot.state_traits.slice(0, 24),
                   feedback_priors: snapshot.feedback_priors.slice(0, 20),
+                  engine_idea_priors: (snapshot.engine_idea_priors ?? []).slice(0, 20),
                   open_objectives: snapshot.open_objectives.slice(0, 20),
                   active_cooldowns: snapshot.active_cooldowns.slice(0, 20),
                 },
@@ -1710,6 +1802,9 @@ export class RemoteBuddyAutonomousEngine {
             requires_user_input: asBoolean(c.requires_user_input, false),
             question_if_blocked: asString(c.question_if_blocked),
             candidate_created_at: new Date(candidateCreatedBaseMs + candidateIndex).toISOString(),
+            engine_trial:
+              normalizeEngineTrialMetadata(c.engine_trial ?? c.engineTrial ?? asObject(c.debug).engine_trial) ??
+              undefined,
           };
           const policy = POLICY[candidate.objective_type];
           if (!policy || !policy.autonomousAllowed) {
@@ -1756,6 +1851,15 @@ export class RemoteBuddyAutonomousEngine {
           }
           candidate.target_paths = scopeValidation.normalizedTargetPaths;
           candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
+          if (!candidate.engine_trial) {
+            const inferred = inferEngineTrialFromCandidate(candidate, engineInspiration);
+            if (inferred) {
+              candidate.engine_trial = {
+                ...inferred,
+                source: source === "engine_fallback" ? "engine_fallback" : inferred.source,
+              };
+            }
+          }
           normalizedCandidates.push(candidate);
         }
       };
@@ -1788,6 +1892,7 @@ export class RemoteBuddyAutonomousEngine {
         vision_alignment_reason: candidate.vision_alignment_reason,
         vision_section_refs: candidate.vision_section_refs,
         feature_hypotheses: candidate.feature_hypotheses,
+        ...(candidate.engine_trial ? { engine_trial: candidate.engine_trial } : {}),
         gate_decision: "proposed",
         gate_reasons: [],
         candidate_created_at: candidate.candidate_created_at,
@@ -1907,6 +2012,7 @@ export class RemoteBuddyAutonomousEngine {
         vision_alignment_reason: row.candidate.vision_alignment_reason,
         vision_section_refs: row.candidate.vision_section_refs,
         feature_hypotheses: row.candidate.feature_hypotheses,
+        ...(row.candidate.engine_trial ? { engine_trial: row.candidate.engine_trial } : {}),
         llm_score: row.llmScore,
         impact_signal: row.impactSignal,
         ema_success: row.emaSuccess,
@@ -1951,6 +2057,7 @@ export class RemoteBuddyAutonomousEngine {
             vision_alignment_reason: selected.candidate.vision_alignment_reason,
             vision_section_refs: selected.candidate.vision_section_refs,
             feature_hypotheses: selected.candidate.feature_hypotheses,
+            ...(selected.candidate.engine_trial ? { engine_trial: selected.candidate.engine_trial } : {}),
           }
         : {
             id: top.candidate.id,
@@ -1966,6 +2073,7 @@ export class RemoteBuddyAutonomousEngine {
             vision_alignment_reason: top.candidate.vision_alignment_reason,
             vision_section_refs: top.candidate.vision_section_refs,
             feature_hypotheses: top.candidate.feature_hypotheses,
+            ...(top.candidate.engine_trial ? { engine_trial: top.candidate.engine_trial } : {}),
           };
       for (const row of candidatesPayload) {
         row.selected = Boolean(row.id === selectedCandidatePayload.id);

@@ -555,6 +555,135 @@ describe("server AutonomyStore policy gates", () => {
     expect(rows[1]?.id).toBe("run_b:cand_shared");
   });
 
+  test("persists engine idea trials and rolls outcome learning into snapshot priors", () => {
+    const store = makeStore();
+    const runId = "run_engine_idea_trials";
+    const sessionId = "s1";
+    const snapshotId = store.createSnapshot({ sessionId, runId }).snapshot_id;
+
+    const decision = store.recordObjectiveDecision({
+      runId,
+      snapshotId,
+      sessionId,
+      candidates: [
+        {
+          id: "cand_engine_trial_seed",
+          title: "Engine building block: novelty curriculum scheduler",
+          objective_type: "lint_fix",
+          problem_statement: "Prototype novelty curriculum scheduling for autonomous objective selection.",
+          trigger_type: "lint_failure",
+          component_area: "apps/remotebuddy",
+          target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/remotebuddy/src/*.ts"] },
+          risk_level: "low",
+          expected_validation: ["bun run test"],
+          estimated_effort: "small",
+          why_now_signal_ids: ["sig_queue_health"],
+          confidence: 0.92,
+          engine_trial: {
+            building_block_id: "novelty_curriculum_scheduler",
+            algorithm: "novelty curriculum scheduler",
+            source: "engine_mapped",
+            score: 0.81,
+            objective_ids: ["reliable_autonomous_delivery"],
+            gap_ids: ["idea_stagnation"],
+            summary: "Increase idea diversity while preserving safety constraints.",
+            hypothesis: "A curriculum schedule improves outcome quality over repeated loops.",
+          },
+        },
+      ],
+      objective: {
+        id: "obj_engine_trial_seed",
+        candidate_id: "cand_engine_trial_seed",
+        title: "Seed objective for engine trial persistence",
+        instruction: "Implement small autonomous scheduler scaffolding with metrics.",
+        objective_type: "lint_fix",
+        component_area: "apps/remotebuddy",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/remotebuddy/src/*.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun run test"],
+        status: "dispatched",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const db = (store as unknown as { db: any }).db;
+    const trialBefore = db
+      .prepare(
+        `SELECT engine_building_block_id, engine_algorithm, status, success, completed_at
+         FROM autonomy_engine_idea_trials
+         WHERE objective_id = ?`,
+      )
+      .get("obj_engine_trial_seed") as {
+      engine_building_block_id: string;
+      engine_algorithm: string;
+      status: string;
+      success: number | null;
+      completed_at: string | null;
+    };
+    expect(trialBefore.engine_building_block_id).toBe("novelty_curriculum_scheduler");
+    expect(trialBefore.engine_algorithm).toBe("novelty curriculum scheduler");
+    expect(trialBefore.status).toBe("dispatched");
+    expect(trialBefore.success).toBe(null);
+    expect(trialBefore.completed_at).toBe(null);
+
+    const outcome = store.recordOutcome({
+      objectiveId: "obj_engine_trial_seed",
+      patternKey: decision.patternKey,
+      requestId: "req_engine_trial_seed",
+      jobId: "job_engine_trial_seed",
+      success: true,
+      userAction: "applied",
+      latencyMs: 12_000,
+      reopenedWithin24h: false,
+      regressionFlag: false,
+    });
+    expect(outcome.ok).toBe(true);
+
+    const trialAfter = db
+      .prepare(
+        `SELECT status, success, user_action, latency_ms, completed_at
+         FROM autonomy_engine_idea_trials
+         WHERE objective_id = ?`,
+      )
+      .get("obj_engine_trial_seed") as {
+      status: string;
+      success: number;
+      user_action: string | null;
+      latency_ms: number | null;
+      completed_at: string | null;
+    };
+    expect(trialAfter.status).toBe("completed");
+    expect(trialAfter.success).toBe(1);
+    expect(trialAfter.user_action).toBe("applied");
+    expect(trialAfter.latency_ms).toBe(12_000);
+    expect(String(trialAfter.completed_at ?? "")).toContain("T");
+
+    const ideaStats = db
+      .prepare(
+        `SELECT sample_count, ema_success, ema_user_accept
+         FROM autonomy_engine_idea_stats
+         WHERE engine_building_block_id = ?`,
+      )
+      .get("novelty_curriculum_scheduler") as {
+      sample_count: number;
+      ema_success: number;
+      ema_user_accept: number;
+    };
+    expect(ideaStats.sample_count).toBe(1);
+    expect(ideaStats.ema_success).toBeGreaterThan(0);
+    expect(ideaStats.ema_user_accept).toBeGreaterThan(0);
+
+    const enriched = store.createSnapshot({ sessionId, runId });
+    expect(enriched.engine_idea_priors.length).toBeGreaterThan(0);
+    expect(enriched.engine_idea_priors[0]?.engine_building_block_id).toBe(
+      "novelty_curriculum_scheduler",
+    );
+  });
+
   test("ignores autonomy accepted outcomes before any worker job is linked", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_guard" }).snapshot_id;

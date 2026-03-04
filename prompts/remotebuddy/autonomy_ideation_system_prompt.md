@@ -19,6 +19,16 @@ Return strict JSON with this shape:
     "vision_alignment_reason": "...",
     "vision_section_refs": ["6", "9"],
     "feature_hypotheses": ["feature idea A", "feature idea B"],
+    "engine_trial": {
+      "building_block_id": "short_id",
+      "algorithm": "algorithm label",
+      "source": "llm|engine_mapped|engine_fallback",
+      "score": 0.0,
+      "objective_ids": ["objective_id"],
+      "gap_ids": ["gap_id"],
+      "summary": "short summary",
+      "hypothesis": "short hypothesis"
+    },
     "requires_user_input": false,
     "question_if_blocked": ""
   }]
@@ -32,7 +42,10 @@ Constraints:
   - `compiled_objectives`: weighted priorities derived from `vision.md`
   - `opportunity_gaps`: quantified delivery/merge/activation/governance/workforce gaps
   - `building_blocks`: candidate algorithms for improving the autonomous workforce itself
+- You may also receive `snapshot.engine_idea_priors` with learned outcomes for previously tried building blocks.
+- Prefer high-sample/high-success `snapshot.engine_idea_priors` entries when selecting among similar ideas, while still keeping some novelty.
 - Prefer candidates that implement or operationalize one or more `engine_inspiration.building_blocks` when their score is high.
+- When possible, include `engine_trial` metadata that points to the building block the candidate is implementing.
 - `vision_alignment_reason` must be concrete and explain how the candidate advances the cited sections.
 - `objective_type` is a governance lane, not a fixed feature catalog. Feature ideas are free-form and should be expressed in `title`, `problem_statement`, and `feature_hypotheses`.
 - `feature_hypotheses` may contain any suitable product/engineering features; keep each item concise and actionable.
