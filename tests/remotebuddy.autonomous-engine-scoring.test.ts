@@ -90,6 +90,35 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
     expect(learned.priorScore).toBeGreaterThan(0);
   });
 
+  test("engine source prior scoring boosts trusted sources and penalizes archived sources", () => {
+    const trusted = engineSourcePriorSignalForScoring({
+      ema_success: 0.9,
+      ema_user_accept: 0.85,
+      ema_latency: 0.8,
+      ema_regret: 0.1,
+      sample_count: 12,
+      curation_status: "trusted",
+      trust_score: 0.88,
+      freshness_score: 0.92,
+    });
+    const archived = engineSourcePriorSignalForScoring({
+      ema_success: 0.2,
+      ema_user_accept: 0.25,
+      ema_latency: 0.4,
+      ema_regret: 0.8,
+      sample_count: 16,
+      curation_status: "archived",
+      trust_score: 0.2,
+      freshness_score: 0.35,
+    });
+    expect(trusted.curationStatus).toBe("trusted");
+    expect(trusted.trustBoost).toBeGreaterThan(0);
+    expect(trusted.curationPenalty).toBe(0);
+    expect(archived.curationStatus).toBe("archived");
+    expect(archived.curationPenalty).toBeGreaterThan(0);
+    expect(archived.noveltyBonus).toBe(0);
+  });
+
   test("explore/exploit selector explores novelty when forced", () => {
     const rows = [
       { id: "cand_top", finalScore: 0.8, noveltyScore: 0.1 },

@@ -721,6 +721,145 @@ describe("server AutonomyStore policy gates", () => {
     expect(enriched.engine_source_priors[0]?.source_type).toBe("external_repo");
   });
 
+  test("curates inspiration sources into trusted shortlist and archives low performers", () => {
+    const store = makeStore();
+    const autonomyCfg = (
+      store as unknown as {
+        config?: {
+          remotebuddy?: {
+            autonomy?: {
+              maxDispatchPerHour?: number;
+              maxDispatchPerHourByType?: Record<string, number>;
+            };
+          };
+        };
+      }
+    ).config?.remotebuddy?.autonomy;
+    if (autonomyCfg) {
+      autonomyCfg.maxDispatchPerHour = 64;
+      autonomyCfg.maxDispatchPerHourByType = {
+        ...autonomyCfg.maxDispatchPerHourByType,
+        lint_fix: 64,
+      };
+    }
+    const sessionId = "s1";
+    const snapshotId = store.createSnapshot({ sessionId, runId: "run_source_curation_seed" }).snapshot_id;
+    const seedObjective = (params: {
+      n: number;
+      sourceFingerprint: string;
+      sourceType: string;
+      sourceLabel: string;
+      sourceUrl: string;
+      success: boolean;
+      userAction: string;
+    }) => {
+      const idSuffix = `${params.sourceFingerprint}_${params.n}`;
+      const decision = store.recordObjectiveDecision({
+        runId: "run_source_curation_seed",
+        snapshotId,
+        sessionId,
+        candidates: [
+          {
+            id: `cand_${idSuffix}`,
+            title: `Engine building block: source_${params.sourceFingerprint}`,
+            objective_type: "lint_fix",
+            problem_statement: `Exercise source curation path for ${params.sourceFingerprint}`,
+            trigger_type: "lint_failure",
+            component_area: "apps/remotebuddy",
+            target_paths: [`apps/remotebuddy/src/source_${params.sourceFingerprint}_${params.n}.ts`],
+            scope: { read_anywhere: false, write_globs: ["apps/remotebuddy/src/*.ts"] },
+            risk_level: "low",
+            expected_validation: ["bun run test"],
+            estimated_effort: "small",
+            why_now_signal_ids: ["sig_queue_health"],
+            confidence: 0.9,
+            engine_trial: {
+              building_block_id: `bb_${params.sourceFingerprint}`,
+              algorithm: `algo_${params.sourceFingerprint}`,
+              source: "engine_mapped",
+              score: 0.8,
+              objective_ids: ["reliable_autonomous_delivery"],
+              gap_ids: ["delivery_reliability_gap"],
+              source_type: params.sourceType,
+              source_label: params.sourceLabel,
+              source_url: params.sourceUrl,
+              source_fingerprint: params.sourceFingerprint,
+            },
+          },
+        ],
+        objective: {
+          id: `obj_${idSuffix}`,
+          candidate_id: `cand_${idSuffix}`,
+          title: `Objective ${idSuffix}`,
+          instruction: `Apply inspiration ${params.sourceFingerprint}`,
+          objective_type: "lint_fix",
+          component_area: "apps/remotebuddy",
+          trigger_type: "lint_failure",
+          target_paths: [`apps/remotebuddy/src/source_${params.sourceFingerprint}_${params.n}.ts`],
+          scope: { read_anywhere: false, write_globs: ["apps/remotebuddy/src/*.ts"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun run test"],
+          status: "dispatched",
+        },
+      });
+      expect(decision.ok).toBe(true);
+      const outcome = store.recordOutcome({
+        objectiveId: `obj_${idSuffix}`,
+        requestId: `req_${idSuffix}`,
+        jobId: `job_${idSuffix}`,
+        patternKey: decision.patternKey,
+        success: params.success,
+        userAction: params.userAction,
+        latencyMs: params.success ? 11_000 : 220_000,
+        reopenedWithin24h: !params.success,
+        regressionFlag: !params.success,
+      });
+      expect(outcome.ok).toBe(true);
+    };
+    for (let i = 0; i < 7; i += 1) {
+      seedObjective({
+        n: i,
+        sourceFingerprint: "fp_trusted_source",
+        sourceType: "external_repo",
+        sourceLabel: "trusted/repo",
+        sourceUrl: "https://example.com/trusted/repo",
+        success: true,
+        userAction: "applied",
+      });
+    }
+    for (let i = 0; i < 9; i += 1) {
+      seedObjective({
+        n: i,
+        sourceFingerprint: "fp_archived_source",
+        sourceType: "external_doc",
+        sourceLabel: "archived/doc",
+        sourceUrl: "https://example.com/archived/doc",
+        success: false,
+        userAction: "rejected",
+      });
+    }
+    const insights = store.listInsights({ limit: 100, feedbackLimit: 10 });
+    const trusted = insights.engineSourceStats.find(
+      (row) => row.sourceFingerprint === "fp_trusted_source",
+    );
+    const archived = insights.engineSourceStats.find(
+      (row) => row.sourceFingerprint === "fp_archived_source",
+    );
+    expect(trusted).toBeDefined();
+    expect(archived).toBeDefined();
+    expect(trusted?.curationStatus).toBe("trusted");
+    expect(archived?.curationStatus).toBe("archived");
+    expect((trusted?.trustScore ?? 0)).toBeGreaterThan(0.6);
+    expect((archived?.trustScore ?? 1)).toBeLessThan(0.5);
+    expect(
+      insights.trustedInspirationShortlist.some((row) => row.sourceFingerprint === "fp_trusted_source"),
+    ).toBe(true);
+    expect(
+      insights.archivedInspirationSources.some((row) => row.sourceFingerprint === "fp_archived_source"),
+    ).toBe(true);
+  });
+
   test("ignores autonomy accepted outcomes before any worker job is linked", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_guard" }).snapshot_id;

@@ -101,6 +101,11 @@ type Snapshot = {
     source_url?: string | null;
     source_fingerprint?: string | null;
     source_algorithm: string;
+    curation_status?: string;
+    curation_reason?: string | null;
+    trust_score?: number;
+    freshness_score?: number;
+    last_reinforced_at?: string | null;
     ema_success: number;
     ema_user_accept: number;
     ema_latency: number;
@@ -234,6 +239,10 @@ type EngineSourcePriorForScoring = {
   ema_latency?: unknown;
   ema_regret?: unknown;
   sample_count?: unknown;
+  curation_status?: unknown;
+  curation_reason?: unknown;
+  trust_score?: unknown;
+  freshness_score?: unknown;
 } | null;
 
 type AdaptiveExploreRateSnapshot = {
@@ -340,8 +349,22 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
   noveltyScore: number;
   priorScore: number;
   noveltyBonus: number;
+  curationStatus: "candidate" | "trusted" | "watchlist" | "archived";
+  curationReason: string;
+  trustScore: number;
+  freshnessScore: number;
+  trustBoost: number;
+  curationPenalty: number;
 } {
   const sampleCount = Math.max(0, Math.floor(asNumber(prior?.sample_count, 0)));
+  const curationRaw = asString(prior?.curation_status).toLowerCase();
+  const curationStatus =
+    curationRaw === "trusted" || curationRaw === "watchlist" || curationRaw === "archived"
+      ? curationRaw
+      : "candidate";
+  const curationReason = asString(prior?.curation_reason);
+  const trustScore = clamp01(asNumber(prior?.trust_score, 0));
+  const freshnessScore = clamp01(asNumber(prior?.freshness_score, sampleCount > 0 ? 0.7 : 0.5));
   if (sampleCount === 0) {
     return {
       emaSuccess: 0,
@@ -352,6 +375,12 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
       noveltyScore: 1,
       priorScore: 0,
       noveltyBonus: 0.03,
+      curationStatus,
+      curationReason,
+      trustScore,
+      freshnessScore,
+      trustBoost: 0,
+      curationPenalty: curationStatus === "archived" ? 0.14 : curationStatus === "watchlist" ? 0.05 : 0,
     };
   }
   const emaSuccess = clamp01(asNumber(prior?.ema_success, 0));
@@ -359,11 +388,15 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
   const emaLatency = clamp01(asNumber(prior?.ema_latency, 0));
   const emaRegret = clamp01(asNumber(prior?.ema_regret, 0));
   const noveltyScore = 1 - clamp01(sampleCount / ENGINE_NOVELTY_SAMPLE_SATURATION);
-  const priorScore =
+  const rawPriorScore =
     0.06 * emaSuccess +
     0.04 * emaUserAccept +
     0.03 * emaLatency +
     0.02 * (1 - emaRegret);
+  const priorScore = rawPriorScore * (0.45 + 0.55 * freshnessScore);
+  const trustBoost = curationStatus === "trusted" ? 0.04 * Math.max(trustScore, 0.6) : 0;
+  const curationPenalty = curationStatus === "archived" ? 0.14 : curationStatus === "watchlist" ? 0.05 : 0;
+  const noveltyBonus = curationStatus === "archived" ? 0 : 0.03 * noveltyScore;
   return {
     emaSuccess,
     emaUserAccept,
@@ -372,7 +405,13 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
     sampleCount,
     noveltyScore,
     priorScore,
-    noveltyBonus: 0.03 * noveltyScore,
+    noveltyBonus,
+    curationStatus,
+    curationReason,
+    trustScore,
+    freshnessScore,
+    trustBoost,
+    curationPenalty,
   };
 }
 
@@ -2570,6 +2609,25 @@ export class RemoteBuddyAutonomousEngine {
         evidence_ids: candidate.why_now_signal_ids,
       });
     }
+    if (sourcePriorSignal.curationStatus === "archived") {
+      penalties.push({
+        kind: "source_archived",
+        weight: sourcePriorSignal.curationPenalty,
+        reason:
+          sourcePriorSignal.curationReason ||
+          "inspiration source is archived due to low-performing outcomes",
+        evidence_ids: candidate.why_now_signal_ids,
+      });
+    } else if (sourcePriorSignal.curationStatus === "watchlist") {
+      penalties.push({
+        kind: "source_watchlist",
+        weight: sourcePriorSignal.curationPenalty,
+        reason:
+          sourcePriorSignal.curationReason ||
+          "inspiration source on watchlist due to mixed outcomes",
+        evidence_ids: candidate.why_now_signal_ids,
+      });
+    }
     const normalizedPenalties = normalizePenalties(penalties);
     const finalScore =
       0.46 * clamp01(llmScore) +
@@ -2578,7 +2636,8 @@ export class RemoteBuddyAutonomousEngine {
       enginePriorSignal.priorScore +
       sourcePriorSignal.priorScore +
       enginePriorSignal.noveltyBonus +
-      sourcePriorSignal.noveltyBonus -
+      sourcePriorSignal.noveltyBonus +
+      sourcePriorSignal.trustBoost -
       penaltyTotal(normalizedPenalties);
     return {
       patternKey,
@@ -2597,6 +2656,11 @@ export class RemoteBuddyAutonomousEngine {
       engineSourceNoveltyScore: sourcePriorSignal.noveltyScore,
       engineSourceNoveltyBonus: sourcePriorSignal.noveltyBonus,
       engineSourceSampleCount: sourcePriorSignal.sampleCount,
+      engineSourceTrustScore: sourcePriorSignal.trustScore,
+      engineSourceFreshnessScore: sourcePriorSignal.freshnessScore,
+      engineSourceCurationStatus: sourcePriorSignal.curationStatus,
+      engineSourceCurationReason: sourcePriorSignal.curationReason,
+      engineSourceTrustBoost: sourcePriorSignal.trustBoost,
     };
   }
 
@@ -3125,6 +3189,11 @@ export class RemoteBuddyAutonomousEngine {
         engine_source_novelty_score: row.engineSourceNoveltyScore,
         engine_source_novelty_bonus: row.engineSourceNoveltyBonus,
         engine_source_sample_count: row.engineSourceSampleCount,
+        engine_source_trust_score: row.engineSourceTrustScore,
+        engine_source_freshness_score: row.engineSourceFreshnessScore,
+        engine_source_curation_status: row.engineSourceCurationStatus,
+        engine_source_curation_reason: row.engineSourceCurationReason,
+        engine_source_trust_boost: row.engineSourceTrustBoost,
         explore_rate_configured: adaptiveExplore.baseRate,
         effective_explore_rate: adaptiveExplore.effectiveRate,
         explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -3249,6 +3318,11 @@ export class RemoteBuddyAutonomousEngine {
               engine_source_novelty_score: top.engineSourceNoveltyScore,
               engine_source_novelty_bonus: top.engineSourceNoveltyBonus,
               engine_source_sample_count: top.engineSourceSampleCount,
+              engine_source_trust_score: top.engineSourceTrustScore,
+              engine_source_freshness_score: top.engineSourceFreshnessScore,
+              engine_source_curation_status: top.engineSourceCurationStatus,
+              engine_source_curation_reason: top.engineSourceCurationReason,
+              engine_source_trust_boost: top.engineSourceTrustBoost,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -3298,6 +3372,11 @@ export class RemoteBuddyAutonomousEngine {
               engine_source_novelty_score: selected.engineSourceNoveltyScore,
               engine_source_novelty_bonus: selected.engineSourceNoveltyBonus,
               engine_source_sample_count: selected.engineSourceSampleCount,
+              engine_source_trust_score: selected.engineSourceTrustScore,
+              engine_source_freshness_score: selected.engineSourceFreshnessScore,
+              engine_source_curation_status: selected.engineSourceCurationStatus,
+              engine_source_curation_reason: selected.engineSourceCurationReason,
+              engine_source_trust_boost: selected.engineSourceTrustBoost,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -3441,6 +3520,11 @@ export class RemoteBuddyAutonomousEngine {
             engine_source_novelty_score: selected.engineSourceNoveltyScore,
             engine_source_novelty_bonus: selected.engineSourceNoveltyBonus,
             engine_source_sample_count: selected.engineSourceSampleCount,
+            engine_source_trust_score: selected.engineSourceTrustScore,
+            engine_source_freshness_score: selected.engineSourceFreshnessScore,
+            engine_source_curation_status: selected.engineSourceCurationStatus,
+            engine_source_curation_reason: selected.engineSourceCurationReason,
+            engine_source_trust_boost: selected.engineSourceTrustBoost,
             explore_rate_configured: adaptiveExplore.baseRate,
             effective_explore_rate: adaptiveExplore.effectiveRate,
             explore_rate_adjustment: adaptiveExplore.adjustment,

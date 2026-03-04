@@ -63,6 +63,11 @@ interface EngineSourcePrior {
   source_url: string | null;
   source_fingerprint: string | null;
   source_algorithm: string;
+  curation_status: string;
+  curation_reason: string | null;
+  trust_score: number;
+  freshness_score: number;
+  last_reinforced_at: string | null;
   ema_success: number;
   ema_user_accept: number;
   ema_latency: number;
@@ -187,6 +192,12 @@ const TRIGGER_TYPES = new Set<SignalValue["type"]>([
   "regret_signal",
 ]);
 const RECENT_SUCCESS_SUPPRESSION_WINDOW_HOURS = 24;
+const ENGINE_SOURCE_PROMOTE_MIN_SAMPLES = 5;
+const ENGINE_SOURCE_ARCHIVE_MIN_SAMPLES = 8;
+const ENGINE_SOURCE_WATCHLIST_MIN_SAMPLES = 4;
+const ENGINE_SOURCE_FRESHNESS_HALF_LIFE_DAYS = 14;
+
+type EngineSourceCurationStatus = "candidate" | "trusted" | "watchlist" | "archived";
 
 function isNegativePrFeedbackVerdict(value: string): boolean {
   const text = value.toLowerCase();
@@ -276,9 +287,46 @@ export interface AutonomyPrFeedbackInsight {
   comments: PrFeedbackComment[];
 }
 
+export interface AutonomyEngineSourceInsight {
+  sourceKey: string;
+  sourceType: string;
+  sourceLabel: string | null;
+  sourceUrl: string | null;
+  sourceFingerprint: string | null;
+  sourceAlgorithm: string;
+  curationStatus: string;
+  curationReason: string | null;
+  trustScore: number;
+  freshnessScore: number;
+  sampleCount: number;
+  emaSuccess: number;
+  emaUserAccept: number;
+  emaLatency: number;
+  emaRegret: number;
+  lastReinforcedAt: string | null;
+  updatedAt: string;
+}
+
+export interface AutonomyTrustedInspirationInsight {
+  sourceKey: string;
+  sourceType: string;
+  sourceLabel: string | null;
+  sourceUrl: string | null;
+  sourceFingerprint: string | null;
+  algorithm: string;
+  summary: string | null;
+  trustScore: number;
+  freshnessScore: number;
+  sampleCount: number;
+  curationReason: string | null;
+}
+
 export interface AutonomyInsights {
   patternStats: AutonomyPatternStatsInsight[];
   recentPrFeedback: AutonomyPrFeedbackInsight[];
+  engineSourceStats: AutonomyEngineSourceInsight[];
+  trustedInspirationShortlist: AutonomyTrustedInspirationInsight[];
+  archivedInspirationSources: AutonomyTrustedInspirationInsight[];
 }
 
 export interface AutonomyInspirationPattern {
@@ -487,6 +535,84 @@ function deriveInspirationSourceKey(params: {
   return `source:${createHash("sha256")
     .update([sourceType, sourceLabel, sourceUrl].join("|"))
     .digest("hex")}`;
+}
+
+function normalizeEngineSourceCurationStatus(value: unknown): EngineSourceCurationStatus {
+  const text = asString(value).toLowerCase();
+  if (text === "trusted") return "trusted";
+  if (text === "watchlist") return "watchlist";
+  if (text === "archived") return "archived";
+  return "candidate";
+}
+
+function computeEngineSourceTrustScore(row: {
+  ema_success: number;
+  ema_user_accept: number;
+  ema_latency: number;
+  ema_regret: number;
+}): number {
+  return clamp01(
+    0.45 * clamp01(asNumber(row.ema_success, 0)) +
+      0.25 * clamp01(asNumber(row.ema_user_accept, 0)) +
+      0.15 * clamp01(asNumber(row.ema_latency, 0)) +
+      0.15 * (1 - clamp01(asNumber(row.ema_regret, 0))),
+  );
+}
+
+function classifyEngineSourceCuration(row: {
+  sample_count: number;
+  trust_score: number;
+  ema_success: number;
+  ema_user_accept: number;
+  ema_regret: number;
+  freshness_score: number;
+}): { status: EngineSourceCurationStatus; reason: string } {
+  const sampleCount = Math.max(0, Math.floor(asNumber(row.sample_count, 0)));
+  const trustScore = clamp01(asNumber(row.trust_score, 0));
+  const emaSuccess = clamp01(asNumber(row.ema_success, 0));
+  const emaUserAccept = clamp01(asNumber(row.ema_user_accept, 0));
+  const emaRegret = clamp01(asNumber(row.ema_regret, 0));
+  const freshness = clamp01(asNumber(row.freshness_score, 0.5));
+  if (
+    sampleCount >= ENGINE_SOURCE_ARCHIVE_MIN_SAMPLES &&
+    (trustScore <= 0.35 || emaSuccess <= 0.35 || emaUserAccept <= 0.35 || emaRegret >= 0.65)
+  ) {
+    return {
+      status: "archived",
+      reason: `low-performing source after ${sampleCount} samples (trust=${trustScore.toFixed(2)})`,
+    };
+  }
+  if (
+    sampleCount >= ENGINE_SOURCE_PROMOTE_MIN_SAMPLES &&
+    trustScore >= 0.72 &&
+    emaRegret <= 0.35 &&
+    freshness >= 0.35
+  ) {
+    return {
+      status: "trusted",
+      reason: `promoted: strong outcomes (trust=${trustScore.toFixed(2)}, samples=${sampleCount})`,
+    };
+  }
+  if (
+    sampleCount >= ENGINE_SOURCE_WATCHLIST_MIN_SAMPLES &&
+    (trustScore <= 0.5 || emaRegret >= 0.5)
+  ) {
+    return {
+      status: "watchlist",
+      reason: `watchlist: mixed outcomes (trust=${trustScore.toFixed(2)}, regret=${emaRegret.toFixed(2)})`,
+    };
+  }
+  return {
+    status: "candidate",
+    reason: `candidate: awaiting stable evidence (samples=${sampleCount})`,
+  };
+}
+
+function freshnessDecay(value: number, staleDays: number): number {
+  const freshness = clamp01(value);
+  if (!Number.isFinite(staleDays) || staleDays <= 0) return freshness;
+  const lambda = Math.log(2) / ENGINE_SOURCE_FRESHNESS_HALF_LIFE_DAYS;
+  return clamp01(freshness * Math.exp(-lambda * staleDays));
 }
 
 function parseEngineBuildingBlockIdFromCandidateId(candidateId: string): string {
@@ -812,6 +938,7 @@ export class AutonomyStore {
     return loadPushPalsConfig();
   }
   private readonly alpha = 0.2;
+  private lastInspirationMaintenanceAtMs = 0;
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -965,6 +1092,11 @@ export class AutonomyStore {
         source_url TEXT,
         source_fingerprint TEXT,
         source_algorithm TEXT NOT NULL,
+        curation_status TEXT NOT NULL DEFAULT 'candidate',
+        curation_reason TEXT,
+        trust_score REAL NOT NULL DEFAULT 0,
+        freshness_score REAL NOT NULL DEFAULT 0.5,
+        last_reinforced_at TEXT,
         ema_success REAL NOT NULL DEFAULT 0,
         ema_user_accept REAL NOT NULL DEFAULT 0,
         ema_latency REAL NOT NULL DEFAULT 0,
@@ -1082,6 +1214,11 @@ export class AutonomyStore {
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_label TEXT");
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_url TEXT");
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_fingerprint TEXT");
+    ensureColumn("autonomy_engine_source_stats", "curation_status TEXT NOT NULL DEFAULT 'candidate'");
+    ensureColumn("autonomy_engine_source_stats", "curation_reason TEXT");
+    ensureColumn("autonomy_engine_source_stats", "trust_score REAL NOT NULL DEFAULT 0");
+    ensureColumn("autonomy_engine_source_stats", "freshness_score REAL NOT NULL DEFAULT 0.5");
+    ensureColumn("autonomy_engine_source_stats", "last_reinforced_at TEXT");
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_autonomy_engine_trials_source
         ON autonomy_engine_idea_trials(inspiration_source_key, created_at DESC);
@@ -1720,6 +1857,142 @@ export class AutonomyStore {
       .run(...keepIds);
   }
 
+  private maybeRunInspirationMaintenance(nowIso = asIsoNow()): void {
+    const nowMs = Date.parse(nowIso);
+    if (!Number.isFinite(nowMs)) return;
+    if (this.lastInspirationMaintenanceAtMs > 0 && nowMs - this.lastInspirationMaintenanceAtMs < 300_000) {
+      return;
+    }
+    this.applyInspirationFreshnessDecay(nowIso);
+    this.refreshEngineSourceCuration(nowIso);
+    this.lastInspirationMaintenanceAtMs = nowMs;
+  }
+
+  private applyInspirationFreshnessDecay(nowIso: string): void {
+    const nowMs = Date.parse(nowIso);
+    if (!Number.isFinite(nowMs)) return;
+    const sourceRows = this.db
+      .prepare(
+        `SELECT source_key, freshness_score, last_reinforced_at, updated_at
+         FROM autonomy_engine_source_stats`,
+      )
+      .all() as Array<{
+      source_key: string;
+      freshness_score: number;
+      last_reinforced_at: string | null;
+      updated_at: string | null;
+    }>;
+    const updateSource = this.db.prepare(
+      `UPDATE autonomy_engine_source_stats
+       SET freshness_score = ?, updated_at = ?
+       WHERE source_key = ?`,
+    );
+    for (const row of sourceRows) {
+      const anchorIso = asString(row.last_reinforced_at) || asString(row.updated_at);
+      const anchorMs = Date.parse(anchorIso);
+      if (!Number.isFinite(anchorMs)) continue;
+      const staleDays = Math.floor((nowMs - anchorMs) / 86_400_000);
+      if (staleDays <= 0) continue;
+      const prevFreshness = clamp01(asNumber(row.freshness_score, 0.5));
+      const nextFreshness = freshnessDecay(prevFreshness, staleDays);
+      if (Math.abs(nextFreshness - prevFreshness) < 0.005) continue;
+      updateSource.run(nextFreshness, nowIso, asString(row.source_key));
+    }
+    const patternRows = this.db
+      .prepare(
+        `SELECT id, freshness_score, metadata_json, last_seen_at, updated_at
+         FROM autonomy_inspiration_patterns`,
+      )
+      .all() as Array<{
+      id: number;
+      freshness_score: number;
+      metadata_json: string | null;
+      last_seen_at: string | null;
+      updated_at: string | null;
+    }>;
+    const updatePattern = this.db.prepare(
+      `UPDATE autonomy_inspiration_patterns
+       SET freshness_score = ?, metadata_json = ?, updated_at = ?
+       WHERE id = ?`,
+    );
+    for (const row of patternRows) {
+      const metadata = parseJsonObject(row.metadata_json);
+      const reinforcedIso = asString(metadata.last_reinforced_at);
+      const anchorIso = reinforcedIso || asString(row.last_seen_at) || asString(row.updated_at);
+      const anchorMs = Date.parse(anchorIso);
+      if (!Number.isFinite(anchorMs)) continue;
+      const staleDays = Math.floor((nowMs - anchorMs) / 86_400_000);
+      if (staleDays <= 0) continue;
+      const prevFreshness = clamp01(asNumber(row.freshness_score, 0.5));
+      const nextFreshness = freshnessDecay(prevFreshness, staleDays);
+      if (Math.abs(nextFreshness - prevFreshness) < 0.005) continue;
+      const nextMetadata = {
+        ...metadata,
+        freshness_decay_applied_at: nowIso,
+        freshness_stale_days: staleDays,
+      };
+      updatePattern.run(
+        nextFreshness,
+        JSON.stringify(nextMetadata),
+        nowIso,
+        Math.max(0, Math.floor(asNumber(row.id, 0))),
+      );
+    }
+  }
+
+  private refreshEngineSourceCuration(nowIso: string): void {
+    const rows = this.db
+      .prepare(
+        `SELECT source_key, curation_status, curation_reason, trust_score, freshness_score, sample_count,
+                ema_success, ema_user_accept, ema_latency, ema_regret
+         FROM autonomy_engine_source_stats`,
+      )
+      .all() as Array<{
+      source_key: string;
+      curation_status: string | null;
+      curation_reason: string | null;
+      trust_score: number;
+      freshness_score: number;
+      sample_count: number;
+      ema_success: number;
+      ema_user_accept: number;
+      ema_latency: number;
+      ema_regret: number;
+    }>;
+    const update = this.db.prepare(
+      `UPDATE autonomy_engine_source_stats
+       SET curation_status = ?, curation_reason = ?, trust_score = ?, updated_at = ?
+       WHERE source_key = ?`,
+    );
+    for (const row of rows) {
+      const trustScore = computeEngineSourceTrustScore({
+        ema_success: row.ema_success,
+        ema_user_accept: row.ema_user_accept,
+        ema_latency: row.ema_latency,
+        ema_regret: row.ema_regret,
+      });
+      const curation = classifyEngineSourceCuration({
+        sample_count: row.sample_count,
+        trust_score: trustScore,
+        ema_success: row.ema_success,
+        ema_user_accept: row.ema_user_accept,
+        ema_regret: row.ema_regret,
+        freshness_score: row.freshness_score,
+      });
+      const prevStatus = normalizeEngineSourceCurationStatus(row.curation_status);
+      const prevReason = asString(row.curation_reason);
+      const prevTrust = clamp01(asNumber(row.trust_score, 0));
+      if (
+        prevStatus === curation.status &&
+        prevReason === curation.reason &&
+        Math.abs(prevTrust - trustScore) < 0.005
+      ) {
+        continue;
+      }
+      update.run(curation.status, curation.reason, trustScore, nowIso, asString(row.source_key));
+    }
+  }
+
   createSnapshot(params: {
     sessionId: string;
     runId?: string;
@@ -1731,6 +2004,7 @@ export class AutonomyStore {
     };
   }): AutonomySnapshot {
     const now = asIsoNow();
+    this.maybeRunInspirationMaintenance(now);
     const snapshotId = `snap_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const ttlMs = this.config.remotebuddy.autonomy.tickIntervalMs * 2;
     const topSignals = this.buildTopSignals(params.requestSlo, params.jobSlo);
@@ -1754,6 +2028,7 @@ export class AutonomyStore {
     const engineSourcePriors = this.db
       .prepare(
         `SELECT source_key, source_type, source_label, source_url, source_fingerprint, source_algorithm,
+                curation_status, curation_reason, trust_score, freshness_score, last_reinforced_at,
                 ema_success, ema_user_accept, ema_latency, ema_regret, sample_count, updated_at
          FROM autonomy_engine_source_stats
          ORDER BY updated_at DESC
@@ -2847,27 +3122,49 @@ export class AutonomyStore {
           updated_at = excluded.updated_at`,
       );
       const readSourceStat = this.db.prepare(
-        `SELECT ema_success, ema_user_accept, ema_latency, ema_regret, sample_count
+        `SELECT ema_success, ema_user_accept, ema_latency, ema_regret, sample_count,
+                trust_score, freshness_score, curation_status, curation_reason
          FROM autonomy_engine_source_stats
          WHERE source_key = ?`,
       );
       const upsertSourceStat = this.db.prepare(
         `INSERT INTO autonomy_engine_source_stats (
           source_key, source_type, source_label, source_url, source_fingerprint, source_algorithm,
+          curation_status, curation_reason, trust_score, freshness_score, last_reinforced_at,
           ema_success, ema_user_accept, ema_latency, ema_regret, sample_count, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_key) DO UPDATE SET
           source_type = excluded.source_type,
           source_label = excluded.source_label,
           source_url = excluded.source_url,
           source_fingerprint = excluded.source_fingerprint,
           source_algorithm = excluded.source_algorithm,
+          curation_status = excluded.curation_status,
+          curation_reason = excluded.curation_reason,
+          trust_score = excluded.trust_score,
+          freshness_score = excluded.freshness_score,
+          last_reinforced_at = excluded.last_reinforced_at,
           ema_success = excluded.ema_success,
           ema_user_accept = excluded.ema_user_accept,
           ema_latency = excluded.ema_latency,
           ema_regret = excluded.ema_regret,
           sample_count = excluded.sample_count,
           updated_at = excluded.updated_at`,
+      );
+      const readPatternByFingerprint = this.db.prepare(
+        `SELECT id, quality_score, freshness_score, metadata_json
+         FROM autonomy_inspiration_patterns
+         WHERE fingerprint = ?
+         LIMIT 1`,
+      );
+      const updatePatternByFingerprint = this.db.prepare(
+        `UPDATE autonomy_inspiration_patterns
+         SET quality_score = ?,
+             freshness_score = ?,
+             metadata_json = ?,
+             last_seen_at = ?,
+             updated_at = ?
+         WHERE id = ?`,
       );
       for (const trial of pendingIdeaTrials) {
         updateTrial.run(
@@ -2926,6 +3223,10 @@ export class AutonomyStore {
               ema_latency: number;
               ema_regret: number;
               sample_count: number;
+              trust_score: number;
+              freshness_score: number;
+              curation_status: string | null;
+              curation_reason: string | null;
             }
           | undefined;
         const prevSource = sourceStats ?? {
@@ -2934,9 +3235,34 @@ export class AutonomyStore {
           ema_latency: 0,
           ema_regret: 0,
           sample_count: 0,
+          trust_score: 0,
+          freshness_score: 0.5,
+          curation_status: "candidate",
+          curation_reason: null,
         };
         const sourceLatencyScore =
           typeof latencyMs === "number" ? clamp01(1 - latencyMs / 600_000) : prevSource.ema_latency;
+        const nextSourceEmaSuccess = ema(prevSource.ema_success, successValue);
+        const nextSourceEmaUserAccept = ema(prevSource.ema_user_accept, userAcceptValue);
+        const nextSourceEmaLatency = ema(prevSource.ema_latency, sourceLatencyScore);
+        const nextSourceEmaRegret = ema(prevSource.ema_regret, regretValue);
+        const nextSourceSampleCount = prevSource.sample_count + 1;
+        const prevFreshness = clamp01(asNumber(prevSource.freshness_score, 0.5));
+        const reinforcedFreshness = clamp01(prevFreshness * 0.85 + (success ? 0.15 : 0.08));
+        const nextSourceTrustScore = computeEngineSourceTrustScore({
+          ema_success: nextSourceEmaSuccess,
+          ema_user_accept: nextSourceEmaUserAccept,
+          ema_latency: nextSourceEmaLatency,
+          ema_regret: nextSourceEmaRegret,
+        });
+        const nextSourceCuration = classifyEngineSourceCuration({
+          sample_count: nextSourceSampleCount,
+          trust_score: nextSourceTrustScore,
+          ema_success: nextSourceEmaSuccess,
+          ema_user_accept: nextSourceEmaUserAccept,
+          ema_regret: nextSourceEmaRegret,
+          freshness_score: reinforcedFreshness,
+        });
         upsertSourceStat.run(
           sourceKey,
           asString(trial.inspiration_source_type) || "unknown",
@@ -2944,12 +3270,52 @@ export class AutonomyStore {
           asString(trial.inspiration_source_url) || null,
           asString(trial.inspiration_source_fingerprint) || null,
           asString(trial.engine_algorithm) || "engine_building_block",
-          ema(prevSource.ema_success, successValue),
-          ema(prevSource.ema_user_accept, userAcceptValue),
-          ema(prevSource.ema_latency, sourceLatencyScore),
-          ema(prevSource.ema_regret, regretValue),
-          prevSource.sample_count + 1,
+          nextSourceCuration.status,
+          nextSourceCuration.reason,
+          nextSourceTrustScore,
+          reinforcedFreshness,
           now,
+          nextSourceEmaSuccess,
+          nextSourceEmaUserAccept,
+          nextSourceEmaLatency,
+          nextSourceEmaRegret,
+          nextSourceSampleCount,
+          now,
+        );
+        const fingerprint = asString(trial.inspiration_source_fingerprint);
+        if (!fingerprint) continue;
+        const patternRow = readPatternByFingerprint.get(fingerprint) as
+          | {
+              id: number;
+              quality_score: number;
+              freshness_score: number;
+              metadata_json: string | null;
+            }
+          | undefined;
+        if (!patternRow) continue;
+        const currentQuality = clamp01(asNumber(patternRow.quality_score, 0.5));
+        const currentFreshness = clamp01(asNumber(patternRow.freshness_score, 0.5));
+        const targetQuality = clamp01(
+          success ? 0.55 + 0.45 * nextSourceTrustScore : 0.25 + 0.2 * (1 - nextSourceEmaRegret),
+        );
+        const nextQuality = ema(currentQuality, targetQuality);
+        const nextPatternFreshness = clamp01(Math.max(currentFreshness * 0.9, reinforcedFreshness));
+        const patternMetadata = parseJsonObject(patternRow.metadata_json);
+        const nextPatternMetadata = {
+          ...patternMetadata,
+          source_key: sourceKey,
+          source_curation_status: nextSourceCuration.status,
+          source_curation_reason: nextSourceCuration.reason,
+          source_trust_score: nextSourceTrustScore,
+          last_reinforced_at: now,
+        };
+        updatePatternByFingerprint.run(
+          nextQuality,
+          nextPatternFreshness,
+          JSON.stringify(nextPatternMetadata),
+          now,
+          now,
+          Math.max(0, Math.floor(asNumber(patternRow.id, 0))),
         );
       }
     }
@@ -3193,6 +3559,7 @@ export class AutonomyStore {
     q?: string;
     limit?: number;
   }): AutonomyInspirationPattern[] {
+    this.maybeRunInspirationMaintenance(asIsoNow());
     const limit = Math.max(1, Math.min(500, Math.floor(asNumber(params?.limit, 40))));
     const sourceTypeRaw = asString(params?.sourceType);
     const sourceType = sourceTypeRaw ? normalizeInspirationSourceType(sourceTypeRaw) : "";
@@ -3201,23 +3568,33 @@ export class AutonomyStore {
     const where: string[] = [];
     const args: Array<string | number> = [];
     if (sourceType) {
-      where.push("source_type = ?");
+      where.push("p.source_type = ?");
       args.push(sourceType);
     }
     if (q) {
-      where.push("(LOWER(algorithm) LIKE ? OR LOWER(when_to_use) LIKE ? OR LOWER(summary) LIKE ?)");
+      where.push("(LOWER(p.algorithm) LIKE ? OR LOWER(p.when_to_use) LIKE ? OR LOWER(p.summary) LIKE ?)");
       const like = `%${q}%`;
       args.push(like, like, like);
     }
     const queryLimit = tag ? Math.min(1000, limit * 5) : limit;
     const rows = this.db
       .prepare(
-        `SELECT id, fingerprint, source_type, source_label, source_url, source_refs_json, algorithm, when_to_use, summary,
-                risks_json, validation_json, tags_json, quality_score, freshness_score, metadata_json,
-                first_seen_at, last_seen_at, seen_count, updated_at
-         FROM autonomy_inspiration_patterns
+        `SELECT p.id AS id, p.fingerprint AS fingerprint, p.source_type AS source_type,
+                p.source_label AS source_label, p.source_url AS source_url, p.source_refs_json AS source_refs_json,
+                p.algorithm AS algorithm, p.when_to_use AS when_to_use, p.summary AS summary,
+                p.risks_json AS risks_json, p.validation_json AS validation_json, p.tags_json AS tags_json,
+                p.quality_score AS quality_score, p.freshness_score AS freshness_score, p.metadata_json AS metadata_json,
+                p.first_seen_at AS first_seen_at, p.last_seen_at AS last_seen_at, p.seen_count AS seen_count,
+                p.updated_at AS updated_at,
+                src.curation_status AS source_curation_status,
+                src.curation_reason AS source_curation_reason,
+                src.trust_score AS source_trust_score,
+                src.freshness_score AS source_freshness_score
+         FROM autonomy_inspiration_patterns p
+         LEFT JOIN autonomy_engine_source_stats src
+           ON src.source_fingerprint = p.fingerprint
          ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
-         ORDER BY updated_at DESC
+         ORDER BY p.updated_at DESC
          LIMIT ?`,
       )
       .all(...args, queryLimit) as Array<{
@@ -3240,10 +3617,21 @@ export class AutonomyStore {
       last_seen_at: string | null;
       seen_count: number;
       updated_at: string | null;
+      source_curation_status: string | null;
+      source_curation_reason: string | null;
+      source_trust_score: number | null;
+      source_freshness_score: number | null;
     }>;
 
     const mapped = rows.map((row) => {
       const tags = uniqueLowercaseTokens(parseJsonArray(row.tags_json), 24);
+      const metadata = parseJsonObject(row.metadata_json);
+      const curationStatus = normalizeEngineSourceCurationStatus(row.source_curation_status);
+      if (curationStatus && curationStatus !== "candidate") metadata.source_curation_status = curationStatus;
+      const curationReason = asString(row.source_curation_reason);
+      if (curationReason) metadata.source_curation_reason = curationReason;
+      const trustScore = clamp01(asNumber(row.source_trust_score, Number.NaN));
+      if (Number.isFinite(asNumber(row.source_trust_score, Number.NaN))) metadata.source_trust_score = trustScore;
       return {
         id: Math.max(0, Math.floor(asNumber(row.id, 0))),
         fingerprint: asString(row.fingerprint),
@@ -3258,12 +3646,12 @@ export class AutonomyStore {
         validationIdeas: normalizeTextList(parseJsonArray(row.validation_json), 20, 320),
         tags,
         qualityScore: clamp01(asNumber(row.quality_score, 0.5)),
-        freshnessScore: clamp01(asNumber(row.freshness_score, 0.5)),
+        freshnessScore: clamp01(asNumber(row.source_freshness_score, asNumber(row.freshness_score, 0.5))),
         seenCount: Math.max(0, Math.floor(asNumber(row.seen_count, 0))),
         firstSeenAt: asString(row.first_seen_at),
         lastSeenAt: asString(row.last_seen_at),
         updatedAt: asString(row.updated_at),
-        metadata: parseJsonObject(row.metadata_json),
+        metadata,
       } as AutonomyInspirationPattern;
     });
     return tag ? mapped.filter((row) => row.tags.includes(tag)).slice(0, limit) : mapped;
@@ -3275,6 +3663,7 @@ export class AutonomyStore {
     limit?: number;
     feedbackLimit?: number;
   }): AutonomyInsights {
+    this.maybeRunInspirationMaintenance(asIsoNow());
     const limit = Math.max(1, Math.min(200, Math.floor(asNumber(params?.limit, 20))));
     const feedbackLimit = Math.max(
       1,
@@ -3358,6 +3747,94 @@ export class AutonomyStore {
       comment_count: number | null;
       comments_json: string | null;
     }>;
+    const sourceStatsRows = this.db
+      .prepare(
+        `SELECT source_key, source_type, source_label, source_url, source_fingerprint, source_algorithm,
+                curation_status, curation_reason, trust_score, freshness_score, sample_count,
+                ema_success, ema_user_accept, ema_latency, ema_regret, last_reinforced_at, updated_at
+         FROM autonomy_engine_source_stats
+         ORDER BY
+           CASE curation_status
+             WHEN 'trusted' THEN 0
+             WHEN 'candidate' THEN 1
+             WHEN 'watchlist' THEN 2
+             WHEN 'archived' THEN 3
+             ELSE 4
+           END ASC,
+           trust_score DESC,
+           freshness_score DESC,
+           updated_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      source_key: string | null;
+      source_type: string | null;
+      source_label: string | null;
+      source_url: string | null;
+      source_fingerprint: string | null;
+      source_algorithm: string | null;
+      curation_status: string | null;
+      curation_reason: string | null;
+      trust_score: number;
+      freshness_score: number;
+      sample_count: number;
+      ema_success: number;
+      ema_user_accept: number;
+      ema_latency: number;
+      ema_regret: number;
+      last_reinforced_at: string | null;
+      updated_at: string | null;
+    }>;
+    const trustedRows = this.db
+      .prepare(
+        `SELECT src.source_key, src.source_type, src.source_label, src.source_url, src.source_fingerprint,
+                src.source_algorithm, src.trust_score, src.freshness_score, src.sample_count, src.curation_reason,
+                pat.summary
+         FROM autonomy_engine_source_stats src
+         LEFT JOIN autonomy_inspiration_patterns pat
+           ON pat.fingerprint = src.source_fingerprint
+         WHERE src.curation_status = 'trusted'
+         ORDER BY src.trust_score DESC, src.freshness_score DESC, src.sample_count DESC, src.updated_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      source_key: string | null;
+      source_type: string | null;
+      source_label: string | null;
+      source_url: string | null;
+      source_fingerprint: string | null;
+      source_algorithm: string | null;
+      trust_score: number;
+      freshness_score: number;
+      sample_count: number;
+      curation_reason: string | null;
+      summary: string | null;
+    }>;
+    const archivedRows = this.db
+      .prepare(
+        `SELECT src.source_key, src.source_type, src.source_label, src.source_url, src.source_fingerprint,
+                src.source_algorithm, src.trust_score, src.freshness_score, src.sample_count, src.curation_reason,
+                pat.summary
+         FROM autonomy_engine_source_stats src
+         LEFT JOIN autonomy_inspiration_patterns pat
+           ON pat.fingerprint = src.source_fingerprint
+         WHERE src.curation_status = 'archived'
+         ORDER BY src.updated_at DESC, src.sample_count DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      source_key: string | null;
+      source_type: string | null;
+      source_label: string | null;
+      source_url: string | null;
+      source_fingerprint: string | null;
+      source_algorithm: string | null;
+      trust_score: number;
+      freshness_score: number;
+      sample_count: number;
+      curation_reason: string | null;
+      summary: string | null;
+    }>;
 
     return {
       patternStats: patternStatsRows.map((row) => ({
@@ -3409,6 +3886,51 @@ export class AutonomyStore {
           comments,
         };
       }),
+      engineSourceStats: sourceStatsRows.map((row) => ({
+        sourceKey: asString(row.source_key),
+        sourceType: asString(row.source_type) || "unknown",
+        sourceLabel: asString(row.source_label) || null,
+        sourceUrl: asString(row.source_url) || null,
+        sourceFingerprint: asString(row.source_fingerprint) || null,
+        sourceAlgorithm: asString(row.source_algorithm) || "engine_building_block",
+        curationStatus: normalizeEngineSourceCurationStatus(row.curation_status),
+        curationReason: asString(row.curation_reason) || null,
+        trustScore: clamp01(asNumber(row.trust_score, 0)),
+        freshnessScore: clamp01(asNumber(row.freshness_score, 0.5)),
+        sampleCount: Math.max(0, Math.floor(asNumber(row.sample_count, 0))),
+        emaSuccess: clamp01(asNumber(row.ema_success, 0)),
+        emaUserAccept: clamp01(asNumber(row.ema_user_accept, 0)),
+        emaLatency: clamp01(asNumber(row.ema_latency, 0)),
+        emaRegret: clamp01(asNumber(row.ema_regret, 0)),
+        lastReinforcedAt: asString(row.last_reinforced_at) || null,
+        updatedAt: asString(row.updated_at),
+      })),
+      trustedInspirationShortlist: trustedRows.map((row) => ({
+        sourceKey: asString(row.source_key),
+        sourceType: asString(row.source_type) || "unknown",
+        sourceLabel: asString(row.source_label) || null,
+        sourceUrl: asString(row.source_url) || null,
+        sourceFingerprint: asString(row.source_fingerprint) || null,
+        algorithm: asString(row.source_algorithm) || "engine_building_block",
+        summary: asString(row.summary) || null,
+        trustScore: clamp01(asNumber(row.trust_score, 0)),
+        freshnessScore: clamp01(asNumber(row.freshness_score, 0.5)),
+        sampleCount: Math.max(0, Math.floor(asNumber(row.sample_count, 0))),
+        curationReason: asString(row.curation_reason) || null,
+      })),
+      archivedInspirationSources: archivedRows.map((row) => ({
+        sourceKey: asString(row.source_key),
+        sourceType: asString(row.source_type) || "unknown",
+        sourceLabel: asString(row.source_label) || null,
+        sourceUrl: asString(row.source_url) || null,
+        sourceFingerprint: asString(row.source_fingerprint) || null,
+        algorithm: asString(row.source_algorithm) || "engine_building_block",
+        summary: asString(row.summary) || null,
+        trustScore: clamp01(asNumber(row.trust_score, 0)),
+        freshnessScore: clamp01(asNumber(row.freshness_score, 0.5)),
+        sampleCount: Math.max(0, Math.floor(asNumber(row.sample_count, 0))),
+        curationReason: asString(row.curation_reason) || null,
+      })),
     };
   }
 
