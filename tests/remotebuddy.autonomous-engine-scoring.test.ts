@@ -3,6 +3,7 @@ import {
   computeAdaptiveExploreRate,
   docsWeakEvidencePenaltyForImpact,
   engineIdeaPriorSignalForScoring,
+  engineSourcePriorSignalForScoring,
   feedbackPriorSignalForScoring,
   pickCandidateWithExploreExploit,
 } from "../apps/remotebuddy/src/autonomous_engine";
@@ -72,6 +73,23 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
     expect(learned.priorScore).toBeGreaterThan(0);
   });
 
+  test("engine source prior scoring gives novelty bonus for unseen sources", () => {
+    const unseen = engineSourcePriorSignalForScoring(null);
+    const learned = engineSourcePriorSignalForScoring({
+      ema_success: 0.95,
+      ema_user_accept: 0.9,
+      ema_latency: 0.8,
+      ema_regret: 0.05,
+      sample_count: 14,
+    });
+    expect(unseen.sampleCount).toBe(0);
+    expect(unseen.noveltyScore).toBe(1);
+    expect(unseen.noveltyBonus).toBeGreaterThan(0);
+    expect(learned.sampleCount).toBe(14);
+    expect(learned.noveltyScore).toBe(0);
+    expect(learned.priorScore).toBeGreaterThan(0);
+  });
+
   test("explore/exploit selector explores novelty when forced", () => {
     const rows = [
       { id: "cand_top", finalScore: 0.8, noveltyScore: 0.1 },
@@ -127,6 +145,7 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
           { sample_count: 20 },
           { sample_count: 1 },
         ],
+        engine_source_priors: [{ sample_count: 24 }],
       },
     });
     expect(adaptive.effectiveRate).toBeGreaterThan(0.3);

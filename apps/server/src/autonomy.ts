@@ -56,6 +56,21 @@ interface EngineIdeaPrior {
   updated_at: string;
 }
 
+interface EngineSourcePrior {
+  source_key: string;
+  source_type: string;
+  source_label: string | null;
+  source_url: string | null;
+  source_fingerprint: string | null;
+  source_algorithm: string;
+  ema_success: number;
+  ema_user_accept: number;
+  ema_latency: number;
+  ema_regret: number;
+  sample_count: number;
+  updated_at: string;
+}
+
 interface PrFeedbackSignalRow {
   verdict: string | null;
   summary: string | null;
@@ -216,6 +231,7 @@ export interface AutonomySnapshot {
   state_traits: StateTrait[];
   feedback_priors: FeedbackPrior[];
   engine_idea_priors: EngineIdeaPrior[];
+  engine_source_priors: EngineSourcePrior[];
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
   open_objectives: OpenObjective[];
   repo_health_flags: {
@@ -448,8 +464,30 @@ type EngineTrialCandidateMeta = {
   score: number | null;
   objectiveIds: string[];
   gapIds: string[];
+  inspirationSourceKey: string | null;
+  inspirationSourceType: string | null;
+  inspirationSourceLabel: string | null;
+  inspirationSourceUrl: string | null;
+  inspirationSourceFingerprint: string | null;
   metadata: Record<string, unknown>;
 };
+
+function deriveInspirationSourceKey(params: {
+  sourceFingerprint?: string | null;
+  sourceType?: string | null;
+  sourceLabel?: string | null;
+  sourceUrl?: string | null;
+}): string {
+  const fingerprint = asString(params.sourceFingerprint);
+  if (fingerprint) return `fingerprint:${fingerprint.toLowerCase()}`;
+  const sourceType = asString(params.sourceType).toLowerCase();
+  const sourceLabel = asString(params.sourceLabel).toLowerCase();
+  const sourceUrl = asString(params.sourceUrl).toLowerCase();
+  if (!sourceType && !sourceLabel && !sourceUrl) return "";
+  return `source:${createHash("sha256")
+    .update([sourceType, sourceLabel, sourceUrl].join("|"))
+    .digest("hex")}`;
+}
 
 function parseEngineBuildingBlockIdFromCandidateId(candidateId: string): string {
   if (!candidateId.startsWith("cand_engine_")) return "";
@@ -500,6 +538,34 @@ function extractEngineTrialCandidateMeta(record: Record<string, unknown>): Engin
   const gapIds = asStringArray(trial.gap_ids ?? trial.gapIds ?? trial.opportunity_gap_ids);
 
   const metadata = asObject(trial.metadata);
+  const inspirationSourceType = asString(
+    trial.source_type ?? trial.sourceType ?? metadata.source_type ?? metadata.sourceType,
+  );
+  const inspirationSourceLabel = asString(
+    trial.source_label ?? trial.sourceLabel ?? metadata.source_label ?? metadata.sourceLabel,
+  );
+  const inspirationSourceUrl = asString(
+    trial.source_url ?? trial.sourceUrl ?? metadata.source_url ?? metadata.sourceUrl,
+  );
+  const inspirationSourceFingerprint = asString(
+    trial.source_fingerprint ??
+      trial.sourceFingerprint ??
+      metadata.source_fingerprint ??
+      metadata.sourceFingerprint,
+  );
+  const inspirationSourceKey =
+    asString(trial.source_key ?? trial.sourceKey ?? metadata.source_key ?? metadata.sourceKey) ||
+    deriveInspirationSourceKey({
+      sourceFingerprint: inspirationSourceFingerprint,
+      sourceType: inspirationSourceType,
+      sourceLabel: inspirationSourceLabel,
+      sourceUrl: inspirationSourceUrl,
+    });
+  if (inspirationSourceType) metadata.source_type = inspirationSourceType;
+  if (inspirationSourceLabel) metadata.source_label = inspirationSourceLabel;
+  if (inspirationSourceUrl) metadata.source_url = inspirationSourceUrl;
+  if (inspirationSourceFingerprint) metadata.source_fingerprint = inspirationSourceFingerprint;
+  if (inspirationSourceKey) metadata.source_key = inspirationSourceKey;
   const summary = asString(trial.summary);
   if (summary) metadata.summary = summary;
   const hypothesis = asString(trial.hypothesis);
@@ -514,6 +580,11 @@ function extractEngineTrialCandidateMeta(record: Record<string, unknown>): Engin
     score,
     objectiveIds,
     gapIds,
+    inspirationSourceKey: inspirationSourceKey || null,
+    inspirationSourceType: inspirationSourceType || null,
+    inspirationSourceLabel: inspirationSourceLabel || null,
+    inspirationSourceUrl: inspirationSourceUrl || null,
+    inspirationSourceFingerprint: inspirationSourceFingerprint || null,
     metadata,
   };
 }
@@ -856,6 +927,11 @@ export class AutonomyStore {
         engine_algorithm TEXT NOT NULL,
         engine_source TEXT NOT NULL DEFAULT 'llm',
         engine_score REAL,
+        inspiration_source_key TEXT,
+        inspiration_source_type TEXT,
+        inspiration_source_label TEXT,
+        inspiration_source_url TEXT,
+        inspiration_source_fingerprint TEXT,
         objective_ids_json TEXT NOT NULL,
         gap_ids_json TEXT NOT NULL,
         metadata_json TEXT,
@@ -882,6 +958,24 @@ export class AutonomyStore {
         sample_count INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS autonomy_engine_source_stats (
+        source_key TEXT PRIMARY KEY,
+        source_type TEXT NOT NULL,
+        source_label TEXT,
+        source_url TEXT,
+        source_fingerprint TEXT,
+        source_algorithm TEXT NOT NULL,
+        ema_success REAL NOT NULL DEFAULT 0,
+        ema_user_accept REAL NOT NULL DEFAULT 0,
+        ema_latency REAL NOT NULL DEFAULT 0,
+        ema_regret REAL NOT NULL DEFAULT 0,
+        sample_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_engine_source_stats_type
+        ON autonomy_engine_source_stats(source_type, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_engine_source_stats_fingerprint
+        ON autonomy_engine_source_stats(source_fingerprint, updated_at DESC);
       CREATE TABLE IF NOT EXISTS autonomy_inspiration_patterns (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fingerprint TEXT NOT NULL UNIQUE,
@@ -975,6 +1069,22 @@ export class AutonomyStore {
         expires_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+    `);
+    const ensureColumn = (table: string, columnSql: string): void => {
+      try {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnSql}`);
+      } catch {
+        // no-op when column already exists
+      }
+    };
+    ensureColumn("autonomy_engine_idea_trials", "inspiration_source_key TEXT");
+    ensureColumn("autonomy_engine_idea_trials", "inspiration_source_type TEXT");
+    ensureColumn("autonomy_engine_idea_trials", "inspiration_source_label TEXT");
+    ensureColumn("autonomy_engine_idea_trials", "inspiration_source_url TEXT");
+    ensureColumn("autonomy_engine_idea_trials", "inspiration_source_fingerprint TEXT");
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_autonomy_engine_trials_source
+        ON autonomy_engine_idea_trials(inspiration_source_key, created_at DESC);
     `);
   }
 
@@ -1537,6 +1647,7 @@ export class AutonomyStore {
         state_traits: snapshot.state_traits,
         feedback_priors: snapshot.feedback_priors.slice(0, 40),
         engine_idea_priors: snapshot.engine_idea_priors.slice(0, 40),
+        engine_source_priors: snapshot.engine_source_priors.slice(0, 40),
         active_cooldowns: snapshot.active_cooldowns.slice(0, 40),
         open_objectives: snapshot.open_objectives.slice(0, 40),
         repo_health_flags: snapshot.repo_health_flags,
@@ -1551,6 +1662,7 @@ export class AutonomyStore {
       snapshot_ttl_ms: snapshot.snapshot_ttl_ms,
       impact_model_version: snapshot.impact_model_version,
       engine_idea_priors: snapshot.engine_idea_priors.slice(0, 20),
+      engine_source_priors: snapshot.engine_source_priors.slice(0, 20),
       repo_health_flags: snapshot.repo_health_flags,
       dispatch_budget: snapshot.dispatch_budget,
       payload_hash: payloadHash,
@@ -1639,6 +1751,15 @@ export class AutonomyStore {
          LIMIT 80`,
       )
       .all() as EngineIdeaPrior[];
+    const engineSourcePriors = this.db
+      .prepare(
+        `SELECT source_key, source_type, source_label, source_url, source_fingerprint, source_algorithm,
+                ema_success, ema_user_accept, ema_latency, ema_regret, sample_count, updated_at
+         FROM autonomy_engine_source_stats
+         ORDER BY updated_at DESC
+         LIMIT 80`,
+      )
+      .all() as EngineSourcePrior[];
     const activeCooldowns = feedbackPriors
       .filter(
         (row) =>
@@ -1676,6 +1797,7 @@ export class AutonomyStore {
       state_traits: stateTraits,
       feedback_priors: feedbackPriors,
       engine_idea_priors: engineIdeaPriors,
+      engine_source_priors: engineSourcePriors,
       active_cooldowns: activeCooldowns,
       open_objectives: openObjectives,
       repo_health_flags: {
@@ -2211,9 +2333,11 @@ export class AutonomyStore {
           `INSERT OR REPLACE INTO autonomy_engine_idea_trials (
             trial_id, run_id, snapshot_id, session_id, objective_id, candidate_id, pattern_key,
             engine_building_block_id, engine_algorithm, engine_source, engine_score,
+            inspiration_source_key, inspiration_source_type, inspiration_source_label, inspiration_source_url,
+            inspiration_source_fingerprint,
             objective_ids_json, gap_ids_json, metadata_json, status, success, user_action, latency_ms,
             last_outcome_id, created_at, updated_at, completed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)`,
         )
         .run(
           trialId,
@@ -2227,6 +2351,11 @@ export class AutonomyStore {
           trialMeta.algorithm,
           trialMeta.source || "llm",
           trialMeta.score,
+          trialMeta.inspirationSourceKey,
+          trialMeta.inspirationSourceType,
+          trialMeta.inspirationSourceLabel,
+          trialMeta.inspirationSourceUrl,
+          trialMeta.inspirationSourceFingerprint,
           JSON.stringify(trialMeta.objectiveIds),
           JSON.stringify(trialMeta.gapIds),
           JSON.stringify(trialMeta.metadata),
@@ -2624,7 +2753,9 @@ export class AutonomyStore {
     const pendingIdeaTrials = objectiveId
       ? (this.db
           .prepare(
-            `SELECT trial_id, engine_building_block_id, engine_algorithm
+            `SELECT trial_id, engine_building_block_id, engine_algorithm,
+                    inspiration_source_key, inspiration_source_type, inspiration_source_label,
+                    inspiration_source_url, inspiration_source_fingerprint
              FROM autonomy_engine_idea_trials
              WHERE objective_id = ?
                AND completed_at IS NULL
@@ -2634,6 +2765,11 @@ export class AutonomyStore {
           trial_id: string;
           engine_building_block_id: string;
           engine_algorithm: string;
+          inspiration_source_key: string | null;
+          inspiration_source_type: string | null;
+          inspiration_source_label: string | null;
+          inspiration_source_url: string | null;
+          inspiration_source_fingerprint: string | null;
         }>)
       : [];
 
@@ -2710,6 +2846,29 @@ export class AutonomyStore {
           sample_count = excluded.sample_count,
           updated_at = excluded.updated_at`,
       );
+      const readSourceStat = this.db.prepare(
+        `SELECT ema_success, ema_user_accept, ema_latency, ema_regret, sample_count
+         FROM autonomy_engine_source_stats
+         WHERE source_key = ?`,
+      );
+      const upsertSourceStat = this.db.prepare(
+        `INSERT INTO autonomy_engine_source_stats (
+          source_key, source_type, source_label, source_url, source_fingerprint, source_algorithm,
+          ema_success, ema_user_accept, ema_latency, ema_regret, sample_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_key) DO UPDATE SET
+          source_type = excluded.source_type,
+          source_label = excluded.source_label,
+          source_url = excluded.source_url,
+          source_fingerprint = excluded.source_fingerprint,
+          source_algorithm = excluded.source_algorithm,
+          ema_success = excluded.ema_success,
+          ema_user_accept = excluded.ema_user_accept,
+          ema_latency = excluded.ema_latency,
+          ema_regret = excluded.ema_regret,
+          sample_count = excluded.sample_count,
+          updated_at = excluded.updated_at`,
+      );
       for (const trial of pendingIdeaTrials) {
         updateTrial.run(
           terminalStatus,
@@ -2749,6 +2908,47 @@ export class AutonomyStore {
           ema(prevIdea.ema_latency, ideaLatencyScore),
           ema(prevIdea.ema_regret, regretValue),
           prevIdea.sample_count + 1,
+          now,
+        );
+        const sourceKey =
+          asString(trial.inspiration_source_key) ||
+          deriveInspirationSourceKey({
+            sourceFingerprint: asString(trial.inspiration_source_fingerprint),
+            sourceType: asString(trial.inspiration_source_type),
+            sourceLabel: asString(trial.inspiration_source_label),
+            sourceUrl: asString(trial.inspiration_source_url),
+          });
+        if (!sourceKey) continue;
+        const sourceStats = readSourceStat.get(sourceKey) as
+          | {
+              ema_success: number;
+              ema_user_accept: number;
+              ema_latency: number;
+              ema_regret: number;
+              sample_count: number;
+            }
+          | undefined;
+        const prevSource = sourceStats ?? {
+          ema_success: 0,
+          ema_user_accept: 0,
+          ema_latency: 0,
+          ema_regret: 0,
+          sample_count: 0,
+        };
+        const sourceLatencyScore =
+          typeof latencyMs === "number" ? clamp01(1 - latencyMs / 600_000) : prevSource.ema_latency;
+        upsertSourceStat.run(
+          sourceKey,
+          asString(trial.inspiration_source_type) || "unknown",
+          asString(trial.inspiration_source_label) || null,
+          asString(trial.inspiration_source_url) || null,
+          asString(trial.inspiration_source_fingerprint) || null,
+          asString(trial.engine_algorithm) || "engine_building_block",
+          ema(prevSource.ema_success, successValue),
+          ema(prevSource.ema_user_accept, userAcceptValue),
+          ema(prevSource.ema_latency, sourceLatencyScore),
+          ema(prevSource.ema_regret, regretValue),
+          prevSource.sample_count + 1,
           now,
         );
       }

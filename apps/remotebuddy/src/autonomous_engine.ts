@@ -53,6 +53,11 @@ type AutonomyCandidate = {
     score?: number;
     objective_ids: string[];
     gap_ids: string[];
+    source_key?: string;
+    source_type?: string;
+    source_label?: string;
+    source_url?: string;
+    source_fingerprint?: string;
     summary?: string;
     hypothesis?: string;
   };
@@ -82,6 +87,20 @@ type Snapshot = {
   engine_idea_priors?: Array<{
     engine_building_block_id: string;
     engine_algorithm: string;
+    ema_success: number;
+    ema_user_accept: number;
+    ema_latency: number;
+    ema_regret: number;
+    sample_count: number;
+    updated_at: string;
+  }>;
+  engine_source_priors?: Array<{
+    source_key: string;
+    source_type: string;
+    source_label?: string | null;
+    source_url?: string | null;
+    source_fingerprint?: string | null;
+    source_algorithm: string;
     ema_success: number;
     ema_user_accept: number;
     ema_latency: number;
@@ -209,6 +228,14 @@ type EngineIdeaPriorForScoring = {
   sample_count?: unknown;
 } | null;
 
+type EngineSourcePriorForScoring = {
+  ema_success?: unknown;
+  ema_user_accept?: unknown;
+  ema_latency?: unknown;
+  ema_regret?: unknown;
+  sample_count?: unknown;
+} | null;
+
 type AdaptiveExploreRateSnapshot = {
   top_signals?: Array<{ type?: unknown; value?: unknown }>;
   feedback_priors?: Array<{
@@ -218,6 +245,7 @@ type AdaptiveExploreRateSnapshot = {
     sample_count?: unknown;
   }>;
   engine_idea_priors?: Array<{ sample_count?: unknown }>;
+  engine_source_priors?: Array<{ sample_count?: unknown }>;
 };
 
 export function docsWeakEvidencePenaltyForImpact(
@@ -303,6 +331,68 @@ export function engineIdeaPriorSignalForScoring(prior: EngineIdeaPriorForScoring
   };
 }
 
+export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForScoring): {
+  emaSuccess: number;
+  emaUserAccept: number;
+  emaLatency: number;
+  emaRegret: number;
+  sampleCount: number;
+  noveltyScore: number;
+  priorScore: number;
+  noveltyBonus: number;
+} {
+  const sampleCount = Math.max(0, Math.floor(asNumber(prior?.sample_count, 0)));
+  if (sampleCount === 0) {
+    return {
+      emaSuccess: 0,
+      emaUserAccept: 0,
+      emaLatency: 0,
+      emaRegret: 0,
+      sampleCount: 0,
+      noveltyScore: 1,
+      priorScore: 0,
+      noveltyBonus: 0.03,
+    };
+  }
+  const emaSuccess = clamp01(asNumber(prior?.ema_success, 0));
+  const emaUserAccept = clamp01(asNumber(prior?.ema_user_accept, 0));
+  const emaLatency = clamp01(asNumber(prior?.ema_latency, 0));
+  const emaRegret = clamp01(asNumber(prior?.ema_regret, 0));
+  const noveltyScore = 1 - clamp01(sampleCount / ENGINE_NOVELTY_SAMPLE_SATURATION);
+  const priorScore =
+    0.06 * emaSuccess +
+    0.04 * emaUserAccept +
+    0.03 * emaLatency +
+    0.02 * (1 - emaRegret);
+  return {
+    emaSuccess,
+    emaUserAccept,
+    emaLatency,
+    emaRegret,
+    sampleCount,
+    noveltyScore,
+    priorScore,
+    noveltyBonus: 0.03 * noveltyScore,
+  };
+}
+
+function deriveInspirationSourceKey(params: {
+  sourceFingerprint?: string | null;
+  sourceType?: string | null;
+  sourceLabel?: string | null;
+  sourceUrl?: string | null;
+}): string {
+  const fingerprint = asString(params.sourceFingerprint);
+  if (fingerprint) return `fingerprint:${fingerprint.toLowerCase()}`;
+  const sourceType = asString(params.sourceType).toLowerCase();
+  const sourceLabel = asString(params.sourceLabel).toLowerCase();
+  const sourceUrl = asString(params.sourceUrl).toLowerCase();
+  if (!sourceType && !sourceLabel && !sourceUrl) return "";
+  return `source:${createHash("sha256")
+    .update([sourceType, sourceLabel, sourceUrl].join("|"))
+    .digest("hex")}`;
+}
+
 function clampToRange(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   if (value <= min) return min;
@@ -369,7 +459,10 @@ export function computeAdaptiveExploreRate(params: {
   const engineRows = Array.isArray(params.snapshot.engine_idea_priors)
     ? params.snapshot.engine_idea_priors
     : [];
-  const sampleCounts = engineRows
+  const sourceRows = Array.isArray(params.snapshot.engine_source_priors)
+    ? params.snapshot.engine_source_priors
+    : [];
+  const sampleCounts = [...engineRows, ...sourceRows]
     .map((row) => Math.max(0, Math.floor(asNumber(row.sample_count, 0))))
     .filter((count) => count > 0);
   const engineSampleTotal = sampleCounts.reduce((sum, count) => sum + count, 0);
@@ -1663,6 +1756,18 @@ function normalizeEngineTrialMetadata(
   const source =
     sourceRaw === "engine_fallback" || sourceRaw === "engine_mapped" ? sourceRaw : "llm";
   const score = Number.isFinite(asNumber(raw.score, Number.NaN)) ? asNumber(raw.score, 0) : undefined;
+  const sourceType = asString(raw.source_type ?? raw.sourceType);
+  const sourceLabel = asString(raw.source_label ?? raw.sourceLabel);
+  const sourceUrl = asString(raw.source_url ?? raw.sourceUrl);
+  const sourceFingerprint = asString(raw.source_fingerprint ?? raw.sourceFingerprint);
+  const sourceKey =
+    asString(raw.source_key ?? raw.sourceKey) ||
+    deriveInspirationSourceKey({
+      sourceFingerprint,
+      sourceType,
+      sourceLabel,
+      sourceUrl,
+    });
   return {
     building_block_id: buildingBlockId,
     algorithm: asString(raw.algorithm) || "engine_building_block",
@@ -1670,6 +1775,11 @@ function normalizeEngineTrialMetadata(
     ...(typeof score === "number" ? { score } : {}),
     objective_ids: asStringArray(raw.objective_ids ?? raw.objectiveIds),
     gap_ids: asStringArray(raw.gap_ids ?? raw.gapIds ?? raw.opportunity_gap_ids),
+    ...(sourceKey ? { source_key: sourceKey } : {}),
+    ...(sourceType ? { source_type: sourceType } : {}),
+    ...(sourceLabel ? { source_label: sourceLabel } : {}),
+    ...(sourceUrl ? { source_url: sourceUrl } : {}),
+    ...(sourceFingerprint ? { source_fingerprint: sourceFingerprint } : {}),
     summary: asString(raw.summary) || undefined,
     hypothesis: asString(raw.hypothesis) || undefined,
   };
@@ -1696,6 +1806,12 @@ function inferEngineTrialFromCandidate(
       (block) => block.candidate_shape.objective_type === candidate.objective_type,
     );
   if (!fallback) return undefined;
+  const sourceKey = deriveInspirationSourceKey({
+    sourceFingerprint: fallback.source_fingerprint,
+    sourceType: fallback.source_type,
+    sourceLabel: fallback.source_label,
+    sourceUrl: fallback.source_url,
+  });
   return {
     building_block_id: fallback.id,
     algorithm: fallback.algorithm,
@@ -1703,6 +1819,11 @@ function inferEngineTrialFromCandidate(
     score: fallback.score,
     objective_ids: fallback.objective_ids,
     gap_ids: fallback.gap_ids,
+    ...(sourceKey ? { source_key: sourceKey } : {}),
+    ...(fallback.source_type ? { source_type: fallback.source_type } : {}),
+    ...(fallback.source_label ? { source_label: fallback.source_label } : {}),
+    ...(fallback.source_url ? { source_url: fallback.source_url } : {}),
+    ...(fallback.source_fingerprint ? { source_fingerprint: fallback.source_fingerprint } : {}),
     summary: fallback.summary,
     hypothesis: fallback.hypothesis,
   };
@@ -1736,6 +1857,12 @@ export function buildEngineFallbackCandidates(params: {
         block.source_label || block.source_type
           ? `Source inspiration: ${block.source_label ?? block.source_type}.`
           : "";
+      const sourceKey = deriveInspirationSourceKey({
+        sourceFingerprint: block.source_fingerprint,
+        sourceType: block.source_type,
+        sourceLabel: block.source_label,
+        sourceUrl: block.source_url,
+      });
       return {
         id: `cand_engine_${block.id}_${randomUUID().slice(0, 8)}`,
         title: `Engine building block: ${block.algorithm}`,
@@ -1771,6 +1898,11 @@ export function buildEngineFallbackCandidates(params: {
           score: block.score,
           objective_ids: block.objective_ids,
           gap_ids: block.gap_ids,
+          ...(sourceKey ? { source_key: sourceKey } : {}),
+          ...(block.source_type ? { source_type: block.source_type } : {}),
+          ...(block.source_label ? { source_label: block.source_label } : {}),
+          ...(block.source_url ? { source_url: block.source_url } : {}),
+          ...(block.source_fingerprint ? { source_fingerprint: block.source_fingerprint } : {}),
           summary: block.summary,
           hypothesis: block.hypothesis,
         },
@@ -2394,6 +2526,25 @@ export class RemoteBuddyAutonomousEngine {
             asString(candidate.engine_trial?.building_block_id),
         )
       : null;
+    const sourceKey = candidate.engine_trial
+      ? asString(candidate.engine_trial.source_key) ||
+        deriveInspirationSourceKey({
+          sourceFingerprint: candidate.engine_trial.source_fingerprint,
+          sourceType: candidate.engine_trial.source_type,
+          sourceLabel: candidate.engine_trial.source_label,
+          sourceUrl: candidate.engine_trial.source_url,
+        })
+      : "";
+    const sourcePrior = candidate.engine_trial
+      ? (snapshot.engine_source_priors ?? []).find((entry) => {
+          const entryKey = asString(entry.source_key);
+          if (sourceKey && entryKey === sourceKey) return true;
+          const candidateFingerprint = asString(candidate.engine_trial?.source_fingerprint);
+          const entryFingerprint = asString(entry.source_fingerprint);
+          if (candidateFingerprint && entryFingerprint && candidateFingerprint === entryFingerprint) return true;
+          return false;
+        })
+      : null;
     const penalties: Array<{ kind: any; weight: number; reason: string; evidence_ids: string[] }> = [];
     if (candidate.confidence < this.cfg.minConfidence) {
       penalties.push({
@@ -2406,6 +2557,7 @@ export class RemoteBuddyAutonomousEngine {
     const impactSignal = this.impactSignalV1(snapshot, candidate);
     const priorSignal = feedbackPriorSignalForScoring(prior);
     const enginePriorSignal = engineIdeaPriorSignalForScoring(enginePrior);
+    const sourcePriorSignal = engineSourcePriorSignalForScoring(sourcePrior);
     const docsWeakEvidencePenalty = docsWeakEvidencePenaltyForImpact(
       candidate.objective_type,
       impactSignal,
@@ -2424,7 +2576,9 @@ export class RemoteBuddyAutonomousEngine {
       0.2 * clamp01(impactSignal) +
       priorSignal.priorScore +
       enginePriorSignal.priorScore +
-      enginePriorSignal.noveltyBonus -
+      sourcePriorSignal.priorScore +
+      enginePriorSignal.noveltyBonus +
+      sourcePriorSignal.noveltyBonus -
       penaltyTotal(normalizedPenalties);
     return {
       patternKey,
@@ -2439,6 +2593,10 @@ export class RemoteBuddyAutonomousEngine {
       engineIdeaNoveltyScore: enginePriorSignal.noveltyScore,
       engineIdeaNoveltyBonus: enginePriorSignal.noveltyBonus,
       engineIdeaSampleCount: enginePriorSignal.sampleCount,
+      engineSourcePriorScore: sourcePriorSignal.priorScore,
+      engineSourceNoveltyScore: sourcePriorSignal.noveltyScore,
+      engineSourceNoveltyBonus: sourcePriorSignal.noveltyBonus,
+      engineSourceSampleCount: sourcePriorSignal.sampleCount,
     };
   }
 
@@ -2963,6 +3121,10 @@ export class RemoteBuddyAutonomousEngine {
         engine_idea_novelty_score: row.engineIdeaNoveltyScore,
         engine_idea_novelty_bonus: row.engineIdeaNoveltyBonus,
         engine_idea_sample_count: row.engineIdeaSampleCount,
+        engine_source_prior_score: row.engineSourcePriorScore,
+        engine_source_novelty_score: row.engineSourceNoveltyScore,
+        engine_source_novelty_bonus: row.engineSourceNoveltyBonus,
+        engine_source_sample_count: row.engineSourceSampleCount,
         explore_rate_configured: adaptiveExplore.baseRate,
         effective_explore_rate: adaptiveExplore.effectiveRate,
         explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -3083,6 +3245,10 @@ export class RemoteBuddyAutonomousEngine {
               engine_idea_novelty_score: top.engineIdeaNoveltyScore,
               engine_idea_novelty_bonus: top.engineIdeaNoveltyBonus,
               engine_idea_sample_count: top.engineIdeaSampleCount,
+              engine_source_prior_score: top.engineSourcePriorScore,
+              engine_source_novelty_score: top.engineSourceNoveltyScore,
+              engine_source_novelty_bonus: top.engineSourceNoveltyBonus,
+              engine_source_sample_count: top.engineSourceSampleCount,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -3128,6 +3294,10 @@ export class RemoteBuddyAutonomousEngine {
               engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
               engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
               engine_idea_sample_count: selected.engineIdeaSampleCount,
+              engine_source_prior_score: selected.engineSourcePriorScore,
+              engine_source_novelty_score: selected.engineSourceNoveltyScore,
+              engine_source_novelty_bonus: selected.engineSourceNoveltyBonus,
+              engine_source_sample_count: selected.engineSourceSampleCount,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -3267,6 +3437,10 @@ export class RemoteBuddyAutonomousEngine {
             engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
             engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
             engine_idea_sample_count: selected.engineIdeaSampleCount,
+            engine_source_prior_score: selected.engineSourcePriorScore,
+            engine_source_novelty_score: selected.engineSourceNoveltyScore,
+            engine_source_novelty_bonus: selected.engineSourceNoveltyBonus,
+            engine_source_sample_count: selected.engineSourceSampleCount,
             explore_rate_configured: adaptiveExplore.baseRate,
             effective_explore_rate: adaptiveExplore.effectiveRate,
             explore_rate_adjustment: adaptiveExplore.adjustment,

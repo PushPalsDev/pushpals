@@ -587,6 +587,10 @@ describe("server AutonomyStore policy gates", () => {
             score: 0.81,
             objective_ids: ["reliable_autonomous_delivery"],
             gap_ids: ["idea_stagnation"],
+            source_type: "external_repo",
+            source_label: "acme/autonomy-lab",
+            source_url: "https://example.com/acme/autonomy-lab",
+            source_fingerprint: "fp_autonomy_lab_novelty",
             summary: "Increase idea diversity while preserving safety constraints.",
             hypothesis: "A curriculum schedule improves outcome quality over repeated loops.",
           },
@@ -613,19 +617,30 @@ describe("server AutonomyStore policy gates", () => {
     const db = (store as unknown as { db: any }).db;
     const trialBefore = db
       .prepare(
-        `SELECT engine_building_block_id, engine_algorithm, status, success, completed_at
+        `SELECT engine_building_block_id, engine_algorithm, inspiration_source_key, inspiration_source_type,
+                inspiration_source_label, inspiration_source_url, inspiration_source_fingerprint, status, success, completed_at
          FROM autonomy_engine_idea_trials
          WHERE objective_id = ?`,
       )
       .get("obj_engine_trial_seed") as {
       engine_building_block_id: string;
       engine_algorithm: string;
+      inspiration_source_key: string | null;
+      inspiration_source_type: string | null;
+      inspiration_source_label: string | null;
+      inspiration_source_url: string | null;
+      inspiration_source_fingerprint: string | null;
       status: string;
       success: number | null;
       completed_at: string | null;
     };
     expect(trialBefore.engine_building_block_id).toBe("novelty_curriculum_scheduler");
     expect(trialBefore.engine_algorithm).toBe("novelty curriculum scheduler");
+    expect(String(trialBefore.inspiration_source_key ?? "")).toContain("fingerprint:");
+    expect(trialBefore.inspiration_source_type).toBe("external_repo");
+    expect(trialBefore.inspiration_source_label).toBe("acme/autonomy-lab");
+    expect(trialBefore.inspiration_source_url).toBe("https://example.com/acme/autonomy-lab");
+    expect(trialBefore.inspiration_source_fingerprint).toBe("fp_autonomy_lab_novelty");
     expect(trialBefore.status).toBe("dispatched");
     expect(trialBefore.success).toBe(null);
     expect(trialBefore.completed_at).toBe(null);
@@ -676,12 +691,34 @@ describe("server AutonomyStore policy gates", () => {
     expect(ideaStats.sample_count).toBe(1);
     expect(ideaStats.ema_success).toBeGreaterThan(0);
     expect(ideaStats.ema_user_accept).toBeGreaterThan(0);
+    const sourceStats = db
+      .prepare(
+        `SELECT source_type, source_label, source_fingerprint, sample_count, ema_success, ema_user_accept
+         FROM autonomy_engine_source_stats
+         WHERE source_fingerprint = ?`,
+      )
+      .get("fp_autonomy_lab_novelty") as {
+      source_type: string;
+      source_label: string | null;
+      source_fingerprint: string | null;
+      sample_count: number;
+      ema_success: number;
+      ema_user_accept: number;
+    };
+    expect(sourceStats.source_type).toBe("external_repo");
+    expect(sourceStats.source_label).toBe("acme/autonomy-lab");
+    expect(sourceStats.source_fingerprint).toBe("fp_autonomy_lab_novelty");
+    expect(sourceStats.sample_count).toBe(1);
+    expect(sourceStats.ema_success).toBeGreaterThan(0);
+    expect(sourceStats.ema_user_accept).toBeGreaterThan(0);
 
     const enriched = store.createSnapshot({ sessionId, runId });
     expect(enriched.engine_idea_priors.length).toBeGreaterThan(0);
     expect(enriched.engine_idea_priors[0]?.engine_building_block_id).toBe(
       "novelty_curriculum_scheduler",
     );
+    expect(enriched.engine_source_priors.length).toBeGreaterThan(0);
+    expect(enriched.engine_source_priors[0]?.source_type).toBe("external_repo");
   });
 
   test("ignores autonomy accepted outcomes before any worker job is linked", () => {
