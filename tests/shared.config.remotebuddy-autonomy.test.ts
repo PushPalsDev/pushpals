@@ -28,6 +28,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
       expect(cfg.remotebuddy.autonomy.allowDirtyWorktree).toBe(false);
       expect(cfg.remotebuddy.autonomy.heartbeatLogMs).toBe(30_000);
       expect(cfg.remotebuddy.autonomy.visionContextMaxChars).toBe(65_536);
+      expect(cfg.remotebuddy.autonomy.exploreRate).toBe(0.3);
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentRows).toBe(16);
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentChars).toBe(600);
       expect(cfg.remotebuddy.autonomy.prFeedbackSummaryChars).toBe(600);
@@ -122,6 +123,37 @@ describe("shared config remotebuddy autonomy parsing", () => {
     try {
       const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
       expect(cfg.remotebuddy.autonomy.visionContextMaxChars).toBe(96_000);
+    } finally {
+      if (prior == null) delete process.env[key];
+      else process.env[key] = prior;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("REMOTEBUDDY_AUTONOMY_EXPLORE_RATE overrides TOML", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "config");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[remotebuddy.autonomy]",
+        "enabled = true",
+        "explore_rate = 0.3",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    const key = "REMOTEBUDDY_AUTONOMY_EXPLORE_RATE";
+    const prior = process.env[key];
+    process.env[key] = "0.45";
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.remotebuddy.autonomy.exploreRate).toBe(0.45);
     } finally {
       if (prior == null) delete process.env[key];
       else process.env[key] = prior;

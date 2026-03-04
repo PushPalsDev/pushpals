@@ -78,6 +78,7 @@ llm_timeout_ms = 60000
 allow_dirty_worktree = false
 ideation_max_candidates = 20
 top_k = 3
+explore_rate = 0.3
 min_confidence = 0.65
 max_concurrent_objectives = 2
 max_dispatch_per_hour = 6

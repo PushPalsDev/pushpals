@@ -124,6 +124,7 @@ export interface PushPalsConfig {
       allowDirtyWorktree: boolean;
       ideationMaxCandidates: number;
       topK: number;
+      exploreRate: number;
       minConfidence: number;
       maxConcurrentObjectives: number;
       maxDispatchPerHour: number;
@@ -1578,6 +1579,24 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
           Math.min(
             20,
             asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_TOP_K") ?? remoteAutonomyNode.top_k, 3),
+          ),
+        ),
+        exploreRate: Math.max(
+          0,
+          Math.min(
+            1,
+            (() => {
+              const parsed = Number.parseFloat(
+                String(
+                  firstNonEmpty(
+                    process.env.REMOTEBUDDY_AUTONOMY_EXPLORE_RATE,
+                    asString(remoteAutonomyNode.explore_rate, "0.3"),
+                    "0.3",
+                  ),
+                ),
+              );
+              return Number.isFinite(parsed) ? parsed : 0.3;
+            })(),
           ),
         ),
         minConfidence: Math.max(

@@ -187,12 +187,23 @@ const VISION_DOC_FNAME = "vision.md";
 const MAX_VISION_SECTION_CHARS = 1_200;
 const DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
 const DOCS_WEAK_EVIDENCE_MAX_PENALTY = 0.12;
+const ENGINE_EXPLORE_RATE_DEFAULT = 0.3;
+const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
+const ENGINE_EXPLORE_POOL_MAX = 3;
 
 type FeedbackPriorForScoring = {
   ema_success?: unknown;
   ema_user_accept?: unknown;
   ema_latency?: unknown;
   ema_regret?: unknown;
+} | null;
+
+type EngineIdeaPriorForScoring = {
+  ema_success?: unknown;
+  ema_user_accept?: unknown;
+  ema_latency?: unknown;
+  ema_regret?: unknown;
+  sample_count?: unknown;
 } | null;
 
 export function docsWeakEvidencePenaltyForImpact(
@@ -231,6 +242,102 @@ export function feedbackPriorSignalForScoring(prior: FeedbackPriorForScoring): {
     emaRegret,
     priorScore,
   };
+}
+
+export function engineIdeaPriorSignalForScoring(prior: EngineIdeaPriorForScoring): {
+  emaSuccess: number;
+  emaUserAccept: number;
+  emaLatency: number;
+  emaRegret: number;
+  sampleCount: number;
+  noveltyScore: number;
+  priorScore: number;
+  noveltyBonus: number;
+} {
+  const sampleCount = Math.max(0, Math.floor(asNumber(prior?.sample_count, 0)));
+  if (sampleCount === 0) {
+    return {
+      emaSuccess: 0,
+      emaUserAccept: 0,
+      emaLatency: 0,
+      emaRegret: 0,
+      sampleCount: 0,
+      noveltyScore: 1,
+      priorScore: 0,
+      noveltyBonus: 0.06,
+    };
+  }
+  const emaSuccess = clamp01(asNumber(prior?.ema_success, 0));
+  const emaUserAccept = clamp01(asNumber(prior?.ema_user_accept, 0));
+  const emaLatency = clamp01(asNumber(prior?.ema_latency, 0));
+  const emaRegret = clamp01(asNumber(prior?.ema_regret, 0));
+  const noveltyScore = 1 - clamp01(sampleCount / ENGINE_NOVELTY_SAMPLE_SATURATION);
+  const priorScore =
+    0.08 * emaSuccess +
+    0.05 * emaUserAccept +
+    0.03 * emaLatency +
+    0.02 * (1 - emaRegret);
+  return {
+    emaSuccess,
+    emaUserAccept,
+    emaLatency,
+    emaRegret,
+    sampleCount,
+    noveltyScore,
+    priorScore,
+    noveltyBonus: 0.06 * noveltyScore,
+  };
+}
+
+function deterministicUnitInterval(seed: string): number {
+  const digest = createHash("sha256").update(seed).digest();
+  const value = digest.readUInt32BE(0);
+  return value / 0x1_0000_0000;
+}
+
+type ExploreExploitRow = {
+  id: string;
+  finalScore: number;
+  noveltyScore: number;
+};
+
+export function pickCandidateWithExploreExploit<T extends ExploreExploitRow>(params: {
+  rows: T[];
+  seed: string;
+  exploreRate?: number;
+}): { selected: T | null; strategy: "exploit" | "explore"; roll: number } {
+  const exploreRate = clamp01(asNumber(params.exploreRate, ENGINE_EXPLORE_RATE_DEFAULT));
+  if (params.rows.length === 0) {
+    return { selected: null, strategy: "exploit", roll: 1 };
+  }
+  const exploitOrdered = [...params.rows].sort((a, b) => {
+    if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+    return a.id.localeCompare(b.id);
+  });
+  const exploitTop = exploitOrdered[0];
+  const modeRoll = deterministicUnitInterval(`${params.seed}:mode`);
+  const shouldExplore = exploitOrdered.length > 1 && modeRoll < exploreRate;
+  if (!shouldExplore) {
+    return { selected: exploitTop, strategy: "exploit", roll: modeRoll };
+  }
+  const noveltyOrdered = [...params.rows]
+    .filter((row) => row.noveltyScore > 0)
+    .sort((a, b) => {
+      if (b.noveltyScore !== a.noveltyScore) return b.noveltyScore - a.noveltyScore;
+      if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+      return a.id.localeCompare(b.id);
+    });
+  if (noveltyOrdered.length === 0) {
+    return { selected: exploitTop, strategy: "exploit", roll: modeRoll };
+  }
+  const pool = noveltyOrdered.slice(0, Math.min(ENGINE_EXPLORE_POOL_MAX, noveltyOrdered.length));
+  const pickRoll = deterministicUnitInterval(`${params.seed}:pick`);
+  const index = Math.min(pool.length - 1, Math.floor(pickRoll * pool.length));
+  let selected = pool[index];
+  if (selected.id === exploitTop.id && pool.length > 1) {
+    selected = pool[(index + 1) % pool.length];
+  }
+  return { selected, strategy: "explore", roll: modeRoll };
 }
 
 type VisionContext = {
@@ -1472,6 +1579,13 @@ export class RemoteBuddyAutonomousEngine {
       candidate.component_area,
     );
     const prior = snapshot.feedback_priors.find((entry) => entry.pattern_key === patternKey);
+    const enginePrior = candidate.engine_trial
+      ? (snapshot.engine_idea_priors ?? []).find(
+          (entry) =>
+            asString(entry.engine_building_block_id) ===
+            asString(candidate.engine_trial?.building_block_id),
+        )
+      : null;
     const penalties: Array<{ kind: any; weight: number; reason: string; evidence_ids: string[] }> = [];
     if (candidate.confidence < this.cfg.minConfidence) {
       penalties.push({
@@ -1483,6 +1597,7 @@ export class RemoteBuddyAutonomousEngine {
     }
     const impactSignal = this.impactSignalV1(snapshot, candidate);
     const priorSignal = feedbackPriorSignalForScoring(prior);
+    const enginePriorSignal = engineIdeaPriorSignalForScoring(enginePrior);
     const docsWeakEvidencePenalty = docsWeakEvidencePenaltyForImpact(
       candidate.objective_type,
       impactSignal,
@@ -1497,9 +1612,11 @@ export class RemoteBuddyAutonomousEngine {
     }
     const normalizedPenalties = normalizePenalties(penalties);
     const finalScore =
-      0.5 * clamp01(llmScore) +
+      0.46 * clamp01(llmScore) +
       0.2 * clamp01(impactSignal) +
-      priorSignal.priorScore -
+      priorSignal.priorScore +
+      enginePriorSignal.priorScore +
+      enginePriorSignal.noveltyBonus -
       penaltyTotal(normalizedPenalties);
     return {
       patternKey,
@@ -1510,6 +1627,10 @@ export class RemoteBuddyAutonomousEngine {
       emaUserAccept: priorSignal.emaUserAccept,
       emaLatency: priorSignal.emaLatency,
       emaRegret: priorSignal.emaRegret,
+      engineIdeaPriorScore: enginePriorSignal.priorScore,
+      engineIdeaNoveltyScore: enginePriorSignal.noveltyScore,
+      engineIdeaNoveltyBonus: enginePriorSignal.noveltyBonus,
+      engineIdeaSampleCount: enginePriorSignal.sampleCount,
     };
   }
 
@@ -2017,11 +2138,16 @@ export class RemoteBuddyAutonomousEngine {
         impact_signal: row.impactSignal,
         ema_success: row.emaSuccess,
         ema_user_accept: row.emaUserAccept,
+        engine_idea_prior_score: row.engineIdeaPriorScore,
+        engine_idea_novelty_score: row.engineIdeaNoveltyScore,
+        engine_idea_novelty_bonus: row.engineIdeaNoveltyBonus,
+        engine_idea_sample_count: row.engineIdeaSampleCount,
         penalties: row.penalties,
         final_score: row.finalScore,
         gate_decision: row.eligibility.ok ? "approved" : "rejected",
         gate_reasons: row.eligibility.ok ? [] : [row.eligibility.reason],
         selected: false,
+        selection_strategy: "not_selected",
         candidate_created_at: row.candidate.candidate_created_at,
       }));
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
@@ -2040,7 +2166,20 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "no_ranked_candidate";
         return;
       }
-      const selected = rankedWithEligibility.find((row) => row.eligibility.ok);
+      const eligibleRows = rankedWithEligibility.filter((row) => row.eligibility.ok);
+      const selection = pickCandidateWithExploreExploit({
+        rows: eligibleRows.map((row) => ({
+          id: row.candidate.id,
+          finalScore: row.finalScore,
+          noveltyScore: row.engineIdeaNoveltyScore,
+        })),
+        seed: `${runId}:${snapshot.snapshot_id}:${snapshot.snapshot_created_at}`,
+        exploreRate: this.cfg.exploreRate,
+      });
+      const selected = selection.selected
+        ? eligibleRows.find((row) => row.candidate.id === selection.selected?.id)
+        : undefined;
+      const selectedStrategy = selected ? selection.strategy : "exploit";
       const objectiveId = `obj_${randomUUID().slice(0, 8)}`;
       selectedCandidatePayload = selected
         ? {
@@ -2058,6 +2197,7 @@ export class RemoteBuddyAutonomousEngine {
             vision_section_refs: selected.candidate.vision_section_refs,
             feature_hypotheses: selected.candidate.feature_hypotheses,
             ...(selected.candidate.engine_trial ? { engine_trial: selected.candidate.engine_trial } : {}),
+            selection_strategy: selectedStrategy,
           }
         : {
             id: top.candidate.id,
@@ -2074,9 +2214,12 @@ export class RemoteBuddyAutonomousEngine {
             vision_section_refs: top.candidate.vision_section_refs,
             feature_hypotheses: top.candidate.feature_hypotheses,
             ...(top.candidate.engine_trial ? { engine_trial: top.candidate.engine_trial } : {}),
+            selection_strategy: "none",
           };
       for (const row of candidatesPayload) {
-        row.selected = Boolean(row.id === selectedCandidatePayload.id);
+        const isSelected = Boolean(row.id === selectedCandidatePayload.id);
+        row.selected = isSelected;
+        row.selection_strategy = isSelected && selected ? selectedStrategy : "not_selected";
       }
 
       if (!selected) {
@@ -2106,7 +2249,12 @@ export class RemoteBuddyAutonomousEngine {
               penalties: top.penalties,
               ema_success: top.emaSuccess,
               ema_user_accept: top.emaUserAccept,
+              engine_idea_prior_score: top.engineIdeaPriorScore,
+              engine_idea_novelty_score: top.engineIdeaNoveltyScore,
+              engine_idea_novelty_bonus: top.engineIdeaNoveltyBonus,
+              engine_idea_sample_count: top.engineIdeaSampleCount,
               final_score: top.finalScore,
+              selection_strategy: "none",
             },
           },
           llmCalls,
@@ -2142,7 +2290,12 @@ export class RemoteBuddyAutonomousEngine {
               penalties: selected.penalties,
               ema_success: selected.emaSuccess,
               ema_user_accept: selected.emaUserAccept,
+              engine_idea_prior_score: selected.engineIdeaPriorScore,
+              engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
+              engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
+              engine_idea_sample_count: selected.engineIdeaSampleCount,
               final_score: selected.finalScore,
+              selection_strategy: selectedStrategy,
             },
           },
           question: {
@@ -2272,7 +2425,12 @@ export class RemoteBuddyAutonomousEngine {
             penalties: selected.penalties,
             ema_success: selected.emaSuccess,
             ema_user_accept: selected.emaUserAccept,
+            engine_idea_prior_score: selected.engineIdeaPriorScore,
+            engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
+            engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
+            engine_idea_sample_count: selected.engineIdeaSampleCount,
             final_score: selected.finalScore,
+            selection_strategy: selectedStrategy,
           },
         },
         llmCalls,

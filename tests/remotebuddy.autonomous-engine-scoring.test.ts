@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   docsWeakEvidencePenaltyForImpact,
+  engineIdeaPriorSignalForScoring,
   feedbackPriorSignalForScoring,
+  pickCandidateWithExploreExploit,
 } from "../apps/remotebuddy/src/autonomous_engine";
 
 describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
@@ -50,6 +52,58 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
     expect(result.emaUserAccept).toBe(0);
     expect(result.emaLatency).toBe(0);
     expect(result.emaRegret).toBe(1);
+  });
+
+  test("engine idea prior scoring gives novelty bonus for unseen building blocks", () => {
+    const unseen = engineIdeaPriorSignalForScoring(null);
+    const learned = engineIdeaPriorSignalForScoring({
+      ema_success: 0.9,
+      ema_user_accept: 0.8,
+      ema_latency: 0.9,
+      ema_regret: 0.1,
+      sample_count: 24,
+    });
+    expect(unseen.sampleCount).toBe(0);
+    expect(unseen.noveltyScore).toBe(1);
+    expect(unseen.noveltyBonus).toBeGreaterThan(0);
+    expect(learned.sampleCount).toBe(24);
+    expect(learned.noveltyScore).toBe(0);
+    expect(learned.priorScore).toBeGreaterThan(0);
+  });
+
+  test("explore/exploit selector explores novelty when forced", () => {
+    const rows = [
+      { id: "cand_top", finalScore: 0.8, noveltyScore: 0.1 },
+      { id: "cand_novel", finalScore: 0.6, noveltyScore: 1.0 },
+      { id: "cand_mid", finalScore: 0.7, noveltyScore: 0.4 },
+    ];
+    const picked = pickCandidateWithExploreExploit({
+      rows,
+      seed: "run_a:snap_a",
+      exploreRate: 1,
+    });
+    expect(picked.strategy).toBe("explore");
+    expect(picked.selected?.id).toBe("cand_novel");
+  });
+
+  test("explore/exploit selector is deterministic and can force exploit", () => {
+    const rows = [
+      { id: "cand_top", finalScore: 0.9, noveltyScore: 0.2 },
+      { id: "cand_alt", finalScore: 0.6, noveltyScore: 1.0 },
+    ];
+    const first = pickCandidateWithExploreExploit({
+      rows,
+      seed: "run_b:snap_b",
+      exploreRate: 0,
+    });
+    const second = pickCandidateWithExploreExploit({
+      rows,
+      seed: "run_b:snap_b",
+      exploreRate: 0,
+    });
+    expect(first.strategy).toBe("exploit");
+    expect(first.selected?.id).toBe("cand_top");
+    expect(second.selected?.id).toBe(first.selected?.id);
   });
 });
 
