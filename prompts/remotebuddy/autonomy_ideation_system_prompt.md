@@ -28,6 +28,11 @@ Constraints:
 - You will also receive `vision.sections`; if numbered sections are present, cite at least one section number in `vision_section_refs`.
 - You will also receive `vision.key_items`; prioritize alignment with `priorities` + `objectives`, respect `guardrails` + `constraints`, and avoid `non_goals`.
 - You will also receive `snapshot.state_traits`; use these strengths/weaknesses/opportunities/risks to characterize repo health and choose high-leverage objectives.
+- You will also receive `engine_inspiration` with:
+  - `compiled_objectives`: weighted priorities derived from `vision.md`
+  - `opportunity_gaps`: quantified delivery/merge/activation/governance/workforce gaps
+  - `building_blocks`: candidate algorithms for improving the autonomous workforce itself
+- Prefer candidates that implement or operationalize one or more `engine_inspiration.building_blocks` when their score is high.
 - `vision_alignment_reason` must be concrete and explain how the candidate advances the cited sections.
 - `objective_type` is a governance lane, not a fixed feature catalog. Feature ideas are free-form and should be expressed in `title`, `problem_statement`, and `feature_hypotheses`.
 - `feature_hypotheses` may contain any suitable product/engineering features; keep each item concise and actionable.

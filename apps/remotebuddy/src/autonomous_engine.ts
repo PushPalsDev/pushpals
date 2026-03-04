@@ -240,6 +240,65 @@ type VisionContext = {
   truncated: boolean;
 };
 
+type VisionKeyItems = VisionContext["key_items"];
+
+export interface CompiledVisionObjective {
+  id: string;
+  title: string;
+  weight: number;
+  evidence: string[];
+}
+
+export interface EngineOpportunityGap {
+  id: string;
+  label: string;
+  score: number;
+  evidence: string[];
+}
+
+export interface EngineCandidateShape {
+  objective_type: AutonomyObjectiveType;
+  trigger_type: "test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal";
+  component_area: AutonomyComponentArea;
+  target_paths: string[];
+  write_globs: string[];
+  risk_level: "low" | "medium" | "high";
+  expected_validation: string[];
+}
+
+export interface EngineIdeaBuildingBlock {
+  id: string;
+  algorithm: string;
+  summary: string;
+  hypothesis: string;
+  objective_ids: string[];
+  gap_ids: string[];
+  score: number;
+  evidence: string[];
+  candidate_shape: EngineCandidateShape;
+}
+
+export interface EngineInspirationContext {
+  compiled_objectives: CompiledVisionObjective[];
+  opportunity_gaps: EngineOpportunityGap[];
+  building_blocks: EngineIdeaBuildingBlock[];
+}
+
+type EngineIdeaInputSnapshot = Pick<
+  Snapshot,
+  "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget"
+>;
+
+type EngineIdeaBlueprint = {
+  id: string;
+  algorithm: string;
+  summary: string;
+  hypothesis: string;
+  objective_ids: string[];
+  gap_ids: string[];
+  candidate_shape: EngineCandidateShape;
+};
+
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
@@ -257,6 +316,485 @@ function asStringArray(value: unknown): string[] {
 function asNumber(value: unknown, fallback = 0): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+const ENGINE_OBJECTIVE_BLUEPRINTS: Array<{
+  id: string;
+  title: string;
+  baseWeight: number;
+  keywordPattern: RegExp;
+  buckets: Array<keyof VisionKeyItems>;
+}> = [
+  {
+    id: "reliable_autonomous_delivery",
+    title: "Reliable Autonomous Delivery Loop",
+    baseWeight: 0.62,
+    keywordPattern:
+      /\b(reliab|stable|stability|startup|failure|flake|retry|incident|deterministic|preflight|runtime)\b/i,
+    buckets: ["priorities", "objectives", "metrics", "constraints"],
+  },
+  {
+    id: "merge_conversion_and_rework",
+    title: "High-Confidence Review + Merge Conversion",
+    baseWeight: 0.58,
+    keywordPattern:
+      /\b(merge|review|pr|pull request|rework|conflict|approved|conversion|comment cap|unmergeable)\b/i,
+    buckets: ["priorities", "objectives", "metrics", "operating_model"],
+  },
+  {
+    id: "mass_audience_activation",
+    title: "Activation: First Autonomous PR Fast",
+    baseWeight: 0.5,
+    keywordPattern:
+      /\b(activation|first pr|onboard|onboarding|quickstart|time-to-first-value|30 minutes|retention)\b/i,
+    buckets: ["priorities", "objectives", "metrics", "target_users"],
+  },
+  {
+    id: "policy_and_governance",
+    title: "Policy + Permission Governance",
+    baseWeight: 0.55,
+    keywordPattern:
+      /\b(policy|permission|scope|guardrail|audit|risk|security|approval|governance|least privilege)\b/i,
+    buckets: ["guardrails", "constraints", "risk_policy", "governance"],
+  },
+  {
+    id: "workforce_scaling",
+    title: "Workforce-Grade Delegation",
+    baseWeight: 0.6,
+    keywordPattern:
+      /\b(workforce|worker|delegation|specialist|dispatch|throughput|task schema|capability|taxonomy)\b/i,
+    buckets: ["priorities", "objectives", "operating_model"],
+  },
+];
+
+const ENGINE_IDEA_BLUEPRINTS: EngineIdeaBlueprint[] = [
+  {
+    id: "vision_compiler_refresh",
+    algorithm: "vision_compiler",
+    summary: "Continuously compile vision signals into weighted autonomous objectives.",
+    hypothesis:
+      "Objective-weighted planning reduces drift and increases accepted autonomous PR quality.",
+    objective_ids: ["reliable_autonomous_delivery", "policy_and_governance"],
+    gap_ids: ["delivery_reliability_gap", "governance_gap"],
+    candidate_shape: {
+      objective_type: "small_refactor",
+      trigger_type: "regret_signal",
+      component_area: "apps/remotebuddy",
+      target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+      write_globs: ["apps/remotebuddy/src/*"],
+      risk_level: "low",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+  {
+    id: "opportunity_graph_pipeline",
+    algorithm: "opportunity_graph",
+    summary: "Model queue/review/runtime friction as an opportunity graph and prioritize highest leverage edges.",
+    hypothesis:
+      "Graph-ranked bottlenecks improve throughput without increasing risk by focusing on high-friction links.",
+    objective_ids: ["reliable_autonomous_delivery", "workforce_scaling"],
+    gap_ids: ["delivery_reliability_gap", "workforce_throughput_gap"],
+    candidate_shape: {
+      objective_type: "feature_small",
+      trigger_type: "queue_health",
+      component_area: "apps/server",
+      target_paths: ["apps/server/src/autonomy.ts"],
+      write_globs: ["apps/server/src/*"],
+      risk_level: "low",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+  {
+    id: "motif_miner_learning_loop",
+    algorithm: "motif_miner",
+    summary: "Mine successful local commit/PR motifs and bias candidate generation toward those patterns.",
+    hypothesis:
+      "Learning from accepted local motifs lowers review churn and improves merge conversion.",
+    objective_ids: ["merge_conversion_and_rework", "workforce_scaling"],
+    gap_ids: ["merge_rework_gap", "workforce_throughput_gap"],
+    candidate_shape: {
+      objective_type: "feature_medium",
+      trigger_type: "regret_signal",
+      component_area: "apps/server",
+      target_paths: ["apps/server/src/autonomy.ts"],
+      write_globs: ["apps/server/src/*"],
+      risk_level: "medium",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+  {
+    id: "regret_miner_guard",
+    algorithm: "regret_miner",
+    summary: "Convert rejected/unmergeable feedback into deterministic preventive heuristics.",
+    hypothesis:
+      "Explicit regret-mined heuristics reduce repeated PR rejection modes across workers.",
+    objective_ids: ["merge_conversion_and_rework", "policy_and_governance"],
+    gap_ids: ["merge_rework_gap", "governance_gap"],
+    candidate_shape: {
+      objective_type: "feature_small",
+      trigger_type: "regret_signal",
+      component_area: "apps/server",
+      target_paths: ["apps/server/src/autonomy.ts"],
+      write_globs: ["apps/server/src/*"],
+      risk_level: "low",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+  {
+    id: "adjacent_possible_generator",
+    algorithm: "adjacent_possible",
+    summary: "Generate new ideas by recombining proven motifs with active bottlenecks.",
+    hypothesis:
+      "Adjacent-possible idea generation increases novelty while staying inside proven safety boundaries.",
+    objective_ids: ["workforce_scaling", "reliable_autonomous_delivery"],
+    gap_ids: ["workforce_throughput_gap", "delivery_reliability_gap"],
+    candidate_shape: {
+      objective_type: "feature_small",
+      trigger_type: "queue_health",
+      component_area: "apps/remotebuddy",
+      target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+      write_globs: ["apps/remotebuddy/src/*"],
+      risk_level: "low",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+  {
+    id: "portfolio_bandit_dispatch",
+    algorithm: "portfolio_bandit",
+    summary: "Allocate dispatch budget across reliability, mergeability, activation, and governance idea portfolios.",
+    hypothesis:
+      "Portfolio-based dispatch improves aggregate repo outcomes versus single-metric greedy selection.",
+    objective_ids: [
+      "reliable_autonomous_delivery",
+      "merge_conversion_and_rework",
+      "mass_audience_activation",
+      "policy_and_governance",
+    ],
+    gap_ids: ["delivery_reliability_gap", "merge_rework_gap", "activation_gap"],
+    candidate_shape: {
+      objective_type: "feature_medium",
+      trigger_type: "queue_health",
+      component_area: "apps/remotebuddy",
+      target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+      write_globs: ["apps/remotebuddy/src/*"],
+      risk_level: "medium",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+  {
+    id: "counterfactual_impact_estimator",
+    algorithm: "counterfactual_impact",
+    summary: "Estimate prevented incidents/rework if a proposed feature had existed over recent runs.",
+    hypothesis:
+      "Counterfactual scoring improves prioritization of ideas with measurable practical payoff.",
+    objective_ids: ["reliable_autonomous_delivery", "merge_conversion_and_rework"],
+    gap_ids: ["delivery_reliability_gap", "merge_rework_gap"],
+    candidate_shape: {
+      objective_type: "small_refactor",
+      trigger_type: "typecheck_failure",
+      component_area: "apps/server",
+      target_paths: ["apps/server/src/autonomy.ts"],
+      write_globs: ["apps/server/src/*"],
+      risk_level: "low",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+  {
+    id: "workforce_capability_planner",
+    algorithm: "capability_planner",
+    summary: "Propose and score new worker specializations from recurring task clusters.",
+    hypothesis:
+      "Capability-aware routing raises throughput and lowers fix-loop churn for autonomous execution.",
+    objective_ids: ["workforce_scaling", "mass_audience_activation"],
+    gap_ids: ["workforce_throughput_gap", "activation_gap"],
+    candidate_shape: {
+      objective_type: "feature_medium",
+      trigger_type: "queue_health",
+      component_area: "apps/workerpals",
+      target_paths: ["apps/workerpals/src/workerpals_main.ts"],
+      write_globs: ["apps/workerpals/src/*"],
+      risk_level: "medium",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+];
+
+function bucketLines(items: VisionKeyItems, keys: Array<keyof VisionKeyItems>): string[] {
+  return keys.flatMap((key) => (Array.isArray(items[key]) ? items[key] : [])).filter(Boolean);
+}
+
+function keywordEvidence(lines: string[], pattern: RegExp): string[] {
+  return lines.filter((line) => pattern.test(line)).slice(0, 6);
+}
+
+function average(values: number[]): number {
+  if (values.length === 0) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function maxSignalScore(
+  snapshot: EngineIdeaInputSnapshot,
+  types: Array<"test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal">,
+): number {
+  return clamp01(
+    Math.max(
+      0,
+      ...snapshot.top_signals
+        .filter((signal) =>
+          types.includes(
+            String(signal.type ?? "").trim() as
+              | "test_failure"
+              | "lint_failure"
+              | "typecheck_failure"
+              | "queue_health"
+              | "regret_signal",
+          ),
+        )
+        .map((signal) => asNumber(signal.value, 0)),
+    ),
+  );
+}
+
+function maxTraitScore(snapshot: EngineIdeaInputSnapshot, pattern: RegExp): number {
+  return clamp01(
+    Math.max(
+      0,
+      ...snapshot.state_traits
+        .filter(
+          (trait) =>
+            pattern.test(String(trait.focus ?? "")) ||
+            pattern.test(String(trait.evidence ?? "")) ||
+            pattern.test(String(trait.trait_id ?? "")),
+        )
+        .map((trait) => asNumber(trait.score, 0)),
+    ),
+  );
+}
+
+export function buildEngineInspirationContext(params: {
+  vision: Pick<VisionContext, "one_sentence" | "key_items" | "section_numbers">;
+  snapshot: EngineIdeaInputSnapshot;
+}): EngineInspirationContext {
+  const oneSentence = asString(params.vision.one_sentence);
+  const keyItems = params.vision.key_items;
+  const compiledObjectives = ENGINE_OBJECTIVE_BLUEPRINTS.map((blueprint) => {
+    const lines = bucketLines(keyItems, blueprint.buckets);
+    const evidence = keywordEvidence(lines, blueprint.keywordPattern);
+    const lineHitSignal = clamp01(evidence.length / 4);
+    const oneSentenceBoost = blueprint.keywordPattern.test(oneSentence) ? 0.08 : 0;
+    const weight = clamp01(blueprint.baseWeight + lineHitSignal * 0.3 + oneSentenceBoost);
+    return {
+      id: blueprint.id,
+      title: blueprint.title,
+      weight,
+      evidence,
+    } satisfies CompiledVisionObjective;
+  }).sort((a, b) => b.weight - a.weight);
+
+  const failureSignal = maxSignalScore(params.snapshot, ["test_failure", "lint_failure", "typecheck_failure"]);
+  const queueSignal = maxSignalScore(params.snapshot, ["queue_health"]);
+  const regretSignal = maxSignalScore(params.snapshot, ["regret_signal"]);
+  const reliabilityTrait = maxTraitScore(
+    params.snapshot,
+    /\b(reliab|stability|startup|failure|flake|retry|incident|runtime|preflight)\b/i,
+  );
+  const mergeTrait = maxTraitScore(
+    params.snapshot,
+    /\b(merge|review|pr|pull request|conflict|rework|comment)\b/i,
+  );
+  const activationTrait = maxTraitScore(
+    params.snapshot,
+    /\b(activation|onboard|first pr|quickstart|setup|time-to-first)\b/i,
+  );
+  const governanceTrait = maxTraitScore(
+    params.snapshot,
+    /\b(policy|permission|scope|guardrail|audit|security|compliance|risk)\b/i,
+  );
+  const workforceTrait = maxTraitScore(
+    params.snapshot,
+    /\b(worker|delegation|dispatch|specialist|capability|throughput|queue)\b/i,
+  );
+  const openObjectivePressure = clamp01(params.snapshot.open_objectives.length / 10);
+  const dispatchSaturation = clamp01(params.snapshot.dispatch_budget.global_count_last_hour / 10);
+
+  const opportunityGaps: EngineOpportunityGap[] = [
+    {
+      id: "delivery_reliability_gap",
+      label: "Delivery reliability gap",
+      score: clamp01(0.5 * failureSignal + 0.25 * reliabilityTrait + 0.15 * queueSignal + 0.1 * regretSignal),
+      evidence: [
+        `failure_signal=${failureSignal.toFixed(2)}`,
+        `reliability_trait=${reliabilityTrait.toFixed(2)}`,
+        `queue_signal=${queueSignal.toFixed(2)}`,
+      ],
+    },
+    {
+      id: "merge_rework_gap",
+      label: "Merge/rework gap",
+      score: clamp01(0.45 * regretSignal + 0.35 * mergeTrait + 0.2 * openObjectivePressure),
+      evidence: [
+        `regret_signal=${regretSignal.toFixed(2)}`,
+        `merge_trait=${mergeTrait.toFixed(2)}`,
+        `open_objective_pressure=${openObjectivePressure.toFixed(2)}`,
+      ],
+    },
+    {
+      id: "activation_gap",
+      label: "Activation/onboarding gap",
+      score: clamp01(0.5 * activationTrait + 0.3 * queueSignal + 0.2 * dispatchSaturation),
+      evidence: [
+        `activation_trait=${activationTrait.toFixed(2)}`,
+        `queue_signal=${queueSignal.toFixed(2)}`,
+        `dispatch_saturation=${dispatchSaturation.toFixed(2)}`,
+      ],
+    },
+    {
+      id: "governance_gap",
+      label: "Governance guardrail gap",
+      score: clamp01(0.6 * governanceTrait + 0.2 * regretSignal + 0.2 * dispatchSaturation),
+      evidence: [
+        `governance_trait=${governanceTrait.toFixed(2)}`,
+        `regret_signal=${regretSignal.toFixed(2)}`,
+        `dispatch_saturation=${dispatchSaturation.toFixed(2)}`,
+      ],
+    },
+    {
+      id: "workforce_throughput_gap",
+      label: "Workforce throughput gap",
+      score: clamp01(0.35 * workforceTrait + 0.35 * queueSignal + 0.3 * openObjectivePressure),
+      evidence: [
+        `workforce_trait=${workforceTrait.toFixed(2)}`,
+        `queue_signal=${queueSignal.toFixed(2)}`,
+        `open_objective_pressure=${openObjectivePressure.toFixed(2)}`,
+      ],
+    },
+  ].sort((a, b) => b.score - a.score);
+
+  const objectiveWeightById = new Map(compiledObjectives.map((entry) => [entry.id, entry.weight]));
+  const gapScoreById = new Map(opportunityGaps.map((entry) => [entry.id, entry.score]));
+  const dispatchByType = params.snapshot.dispatch_budget.by_type_count_last_hour ?? {};
+
+  const buildingBlocks: EngineIdeaBuildingBlock[] = ENGINE_IDEA_BLUEPRINTS.map((blueprint) => {
+    const objectiveWeights = blueprint.objective_ids
+      .map((id) => objectiveWeightById.get(id) ?? 0)
+      .filter((value) => Number.isFinite(value));
+    const gapScores = blueprint.gap_ids
+      .map((id) => gapScoreById.get(id) ?? 0)
+      .filter((value) => Number.isFinite(value));
+    const objectiveSignal = clamp01(average(objectiveWeights));
+    const gapSignal = clamp01(Math.max(0, ...gapScores));
+    const recentTypeCount = Math.max(
+      0,
+      Math.floor(asNumber(dispatchByType[blueprint.candidate_shape.objective_type], 0)),
+    );
+    const noveltySignal = clamp01(1 - recentTypeCount / 6);
+    const score = clamp01(
+      0.52 * objectiveSignal +
+        0.33 * gapSignal +
+        0.2 * noveltySignal -
+        0.08 * dispatchSaturation,
+    );
+    return {
+      ...blueprint,
+      score,
+      evidence: [
+        `objective_signal=${objectiveSignal.toFixed(2)}`,
+        `gap_signal=${gapSignal.toFixed(2)}`,
+        `novelty_signal=${noveltySignal.toFixed(2)}`,
+        `dispatch_saturation=${dispatchSaturation.toFixed(2)}`,
+      ],
+    };
+  }).sort((a, b) => b.score - a.score);
+
+  return {
+    compiled_objectives: compiledObjectives,
+    opportunity_gaps: opportunityGaps,
+    building_blocks: buildingBlocks,
+  };
+}
+
+function selectVisionSectionRefs(sectionRefs: string[]): string[] {
+  const preferred = ["6", "7", "8", "4", "3", "0", "5"];
+  const normalized = sectionRefs.map((value) => asString(value)).filter(Boolean);
+  const selected = preferred.filter((value) => normalized.includes(value)).slice(0, 2);
+  if (selected.length > 0) return selected;
+  return normalized.slice(0, 2);
+}
+
+function pickSignalIdsForTrigger(
+  topSignals: EngineIdeaInputSnapshot["top_signals"],
+  triggerType: EngineCandidateShape["trigger_type"],
+): string[] {
+  const exact = topSignals
+    .filter((signal) => asString(signal.type) === triggerType)
+    .map((signal) => asString(signal.signal_id))
+    .filter(Boolean);
+  if (exact.length > 0) return exact.slice(0, 3);
+  const fallback = topSignals
+    .filter((signal) => {
+      const type = asString(signal.type);
+      return type === "queue_health" || type === "regret_signal" || type === "test_failure";
+    })
+    .map((signal) => asString(signal.signal_id))
+    .filter(Boolean);
+  return fallback.slice(0, 3);
+}
+
+export function buildEngineFallbackCandidates(params: {
+  engineInspiration: EngineInspirationContext;
+  snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
+  visionSectionRefs: string[];
+  maxCandidates?: number;
+}): Array<Record<string, unknown>> {
+  const maxCandidates = Number.isFinite(params.maxCandidates)
+    ? Math.max(1, Math.min(6, Math.floor(params.maxCandidates as number)))
+    : 3;
+  const objectiveTitleById = new Map(
+    params.engineInspiration.compiled_objectives.map((objective) => [objective.id, objective.title]),
+  );
+  const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
+
+  return params.engineInspiration.building_blocks
+    .filter((block) => block.score >= 0.42)
+    .slice(0, maxCandidates)
+    .map((block, idx) => {
+      const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, block.candidate_shape.trigger_type);
+      const objectiveTitles = block.objective_ids
+        .map((id) => objectiveTitleById.get(id))
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .slice(0, 3);
+      const primaryObjectiveTitle = objectiveTitles[0] ?? "vision priorities";
+      return {
+        id: `cand_engine_${block.id}_${randomUUID().slice(0, 8)}`,
+        title: `Engine building block: ${block.algorithm}`,
+        objective_type: block.candidate_shape.objective_type,
+        problem_statement:
+          `Implement ${block.algorithm} in PushPals autonomy to improve ${primaryObjectiveTitle}. ` +
+          `Deliver a small, test-backed change with clear operational telemetry.`,
+        trigger_type: block.candidate_shape.trigger_type,
+        component_area: block.candidate_shape.component_area,
+        target_paths: block.candidate_shape.target_paths,
+        scope: {
+          read_anywhere: false,
+          write_globs: block.candidate_shape.write_globs,
+        },
+        risk_level: block.candidate_shape.risk_level,
+        expected_validation: block.candidate_shape.expected_validation,
+        estimated_effort: idx === 0 ? "small" : "medium",
+        why_now_signal_ids: signalIds,
+        confidence: clamp01(0.45 + block.score * 0.5),
+        vision_alignment_reason:
+          `Prioritize ${primaryObjectiveTitle} using ${block.algorithm}; score=${block.score.toFixed(2)}.`,
+        vision_section_refs: sectionRefs,
+        feature_hypotheses: [
+          block.summary,
+          block.hypothesis,
+          `Add measurable telemetry and guardrails for ${block.algorithm}.`,
+        ].slice(0, 3),
+        requires_user_input: false,
+        question_if_blocked: "",
+      } as Record<string, unknown>;
+    });
 }
 
 function asBoolean(value: unknown, fallback = false): boolean {
@@ -1033,6 +1571,19 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "vision_unavailable";
         return;
       }
+      const engineInspiration = buildEngineInspirationContext({
+        vision: {
+          one_sentence: visionContext.one_sentence,
+          key_items: visionContext.key_items,
+          section_numbers: visionContext.section_numbers,
+        },
+        snapshot: {
+          top_signals: snapshot.top_signals,
+          state_traits: snapshot.state_traits,
+          open_objectives: snapshot.open_objectives,
+          dispatch_budget: snapshot.dispatch_budget,
+        },
+      });
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
 
@@ -1077,6 +1628,7 @@ export class RemoteBuddyAutonomousEngine {
                   active_cooldowns: snapshot.active_cooldowns.slice(0, 20),
                 },
                 vision: visionContext,
+                engine_inspiration: engineInspiration,
                 limits: {
                   ideation_max_candidates: this.cfg.ideationMaxCandidates,
                   min_confidence: this.cfg.minConfidence,
@@ -1096,97 +1648,128 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "snapshot_expired_after_ideation";
         return;
       }
-      const rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
+      let rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
+      if (rawCandidates.length === 0) {
+        const synthesized = buildEngineFallbackCandidates({
+          engineInspiration,
+          snapshotTopSignals: snapshot.top_signals,
+          visionSectionRefs: visionContext.section_numbers,
+          maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+        });
+        if (synthesized.length > 0) {
+          console.log(
+            `[RemoteBuddyAutonomousEngine] tick ${runId}: ideation returned no candidates; using ${synthesized.length} deterministic engine-inspiration fallback candidates.`,
+          );
+          rawCandidates = synthesized;
+        }
+      }
       const normalizedCandidates: AutonomyCandidate[] = [];
       const dropReasonCounts = new Map<string, number>();
       const recordDropReason = (reason: string): void => {
         dropReasonCounts.set(reason, (dropReasonCounts.get(reason) ?? 0) + 1);
       };
-      const candidateCreatedBaseMs = Date.now();
-      for (const [candidateIndex, rawCandidate] of rawCandidates
-        .slice(0, this.cfg.ideationMaxCandidates)
-        .entries()) {
-        const c = asObject(rawCandidate);
-        const triggerType = asString(c.trigger_type);
-        if (!isTriggerType(triggerType)) {
-          recordDropReason("invalid_trigger_type");
-          continue;
+      const ingestRawCandidates = (
+        rawList: unknown[],
+        source: "llm" | "engine_fallback",
+      ): void => {
+        const candidateCreatedBaseMs = Date.now();
+        for (const [candidateIndex, rawCandidate] of rawList
+          .slice(0, this.cfg.ideationMaxCandidates)
+          .entries()) {
+          const c = asObject(rawCandidate);
+          const triggerType = asString(c.trigger_type);
+          if (!isTriggerType(triggerType)) {
+            recordDropReason(`${source}_invalid_trigger_type`);
+            continue;
+          }
+          const candidate: AutonomyCandidate = {
+            id: asString(c.id) || `cand_${randomUUID().slice(0, 8)}`,
+            title: asString(c.title),
+            objective_type: asString(c.objective_type) as AutonomyObjectiveType,
+            problem_statement: asString(c.problem_statement),
+            trigger_type: triggerType,
+            component_area: asString(c.component_area) as AutonomyComponentArea,
+            target_paths: asStringArray(c.target_paths),
+            scope: {
+              read_anywhere: asBoolean(asObject(c.scope).read_anywhere, false),
+              write_globs: asStringArray(asObject(c.scope).write_globs),
+            },
+            risk_level: asString(c.risk_level) as "low" | "medium" | "high",
+            expected_validation: asStringArray(c.expected_validation)
+              .map((command) => canonicalizeValidationCommandForBun(command))
+              .filter(Boolean),
+            estimated_effort: asString(c.estimated_effort) as "small" | "medium" | "large",
+            why_now_signal_ids: asStringArray(c.why_now_signal_ids),
+            confidence: clamp01(asNumber(c.confidence, 0)),
+            vision_alignment_reason: asString(c.vision_alignment_reason),
+            vision_section_refs: normalizeVisionSectionRefs(
+              asStringArray(c.vision_section_refs),
+              visionSectionNumberSet,
+            ),
+            feature_hypotheses: asStringArray(c.feature_hypotheses).slice(0, 24),
+            requires_user_input: asBoolean(c.requires_user_input, false),
+            question_if_blocked: asString(c.question_if_blocked),
+            candidate_created_at: new Date(candidateCreatedBaseMs + candidateIndex).toISOString(),
+          };
+          const policy = POLICY[candidate.objective_type];
+          if (!policy || !policy.autonomousAllowed) {
+            recordDropReason(`${source}_objective_type_not_allowed`);
+            continue;
+          }
+          if (!isRiskLevel(candidate.risk_level)) {
+            recordDropReason(`${source}_invalid_risk_level`);
+            continue;
+          }
+          if (RISK_ORDER[candidate.risk_level] > RISK_ORDER[policy.maxRisk]) {
+            recordDropReason(`${source}_risk_exceeds_policy`);
+            continue;
+          }
+          const scopeValidation = validateScopeInvariants(
+            candidate.component_area,
+            candidate.target_paths,
+            candidate.scope.write_globs,
+            { requireWriteGlobs: true },
+          );
+          if (!scopeValidation.ok) {
+            recordDropReason(`${source}_scope_validation_failed`);
+            continue;
+          }
+          if (BREADTH_ORDER[scopeValidation.breadth] > BREADTH_ORDER[policy.maxBreadth]) {
+            recordDropReason(`${source}_scope_breadth_exceeds_policy`);
+            continue;
+          }
+          if (candidate.scope.read_anywhere && !this.cfg.allowReadAnywhere) {
+            recordDropReason(`${source}_read_anywhere_not_allowed`);
+            continue;
+          }
+          if (policy.requireValidation && candidate.expected_validation.length === 0) {
+            recordDropReason(`${source}_missing_validation_steps`);
+            continue;
+          }
+          if (!candidate.vision_alignment_reason) {
+            recordDropReason(`${source}_missing_vision_alignment_reason`);
+            continue;
+          }
+          if (requireVisionSectionRefs && candidate.vision_section_refs.length === 0) {
+            recordDropReason(`${source}_missing_vision_section_refs`);
+            continue;
+          }
+          candidate.target_paths = scopeValidation.normalizedTargetPaths;
+          candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
+          normalizedCandidates.push(candidate);
         }
-        const candidate: AutonomyCandidate = {
-          id: asString(c.id) || `cand_${randomUUID().slice(0, 8)}`,
-          title: asString(c.title),
-          objective_type: asString(c.objective_type) as AutonomyObjectiveType,
-          problem_statement: asString(c.problem_statement),
-          trigger_type: triggerType,
-          component_area: asString(c.component_area) as AutonomyComponentArea,
-          target_paths: asStringArray(c.target_paths),
-          scope: {
-            read_anywhere: asBoolean(asObject(c.scope).read_anywhere, false),
-            write_globs: asStringArray(asObject(c.scope).write_globs),
-          },
-          risk_level: asString(c.risk_level) as "low" | "medium" | "high",
-          expected_validation: asStringArray(c.expected_validation)
-            .map((command) => canonicalizeValidationCommandForBun(command))
-            .filter(Boolean),
-          estimated_effort: asString(c.estimated_effort) as "small" | "medium" | "large",
-          why_now_signal_ids: asStringArray(c.why_now_signal_ids),
-          confidence: clamp01(asNumber(c.confidence, 0)),
-          vision_alignment_reason: asString(c.vision_alignment_reason),
-          vision_section_refs: normalizeVisionSectionRefs(
-            asStringArray(c.vision_section_refs),
-            visionSectionNumberSet,
-          ),
-          feature_hypotheses: asStringArray(c.feature_hypotheses).slice(0, 24),
-          requires_user_input: asBoolean(c.requires_user_input, false),
-          question_if_blocked: asString(c.question_if_blocked),
-          candidate_created_at: new Date(candidateCreatedBaseMs + candidateIndex).toISOString(),
-        };
-        const policy = POLICY[candidate.objective_type];
-        if (!policy || !policy.autonomousAllowed) {
-          recordDropReason("objective_type_not_allowed");
-          continue;
+      };
+      ingestRawCandidates(rawCandidates, "llm");
+      if (normalizedCandidates.length === 0) {
+        const synthesizedFallback = buildEngineFallbackCandidates({
+          engineInspiration,
+          snapshotTopSignals: snapshot.top_signals,
+          visionSectionRefs: visionContext.section_numbers,
+          maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+        });
+        if (synthesizedFallback.length > 0) {
+          ingestRawCandidates(synthesizedFallback, "engine_fallback");
         }
-        if (!isRiskLevel(candidate.risk_level)) {
-          recordDropReason("invalid_risk_level");
-          continue;
-        }
-        if (RISK_ORDER[candidate.risk_level] > RISK_ORDER[policy.maxRisk]) {
-          recordDropReason("risk_exceeds_policy");
-          continue;
-        }
-        const scopeValidation = validateScopeInvariants(
-          candidate.component_area,
-          candidate.target_paths,
-          candidate.scope.write_globs,
-          { requireWriteGlobs: true },
-        );
-        if (!scopeValidation.ok) {
-          recordDropReason("scope_validation_failed");
-          continue;
-        }
-        if (BREADTH_ORDER[scopeValidation.breadth] > BREADTH_ORDER[policy.maxBreadth]) {
-          recordDropReason("scope_breadth_exceeds_policy");
-          continue;
-        }
-        if (candidate.scope.read_anywhere && !this.cfg.allowReadAnywhere) {
-          recordDropReason("read_anywhere_not_allowed");
-          continue;
-        }
-        if (policy.requireValidation && candidate.expected_validation.length === 0) {
-          recordDropReason("missing_validation_steps");
-          continue;
-        }
-        if (!candidate.vision_alignment_reason) {
-          recordDropReason("missing_vision_alignment_reason");
-          continue;
-        }
-        if (requireVisionSectionRefs && candidate.vision_section_refs.length === 0) {
-          recordDropReason("missing_vision_section_refs");
-          continue;
-        }
-        candidate.target_paths = scopeValidation.normalizedTargetPaths;
-        candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
-        normalizedCandidates.push(candidate);
       }
       candidatesPayload = normalizedCandidates.map((candidate) => ({
         id: candidate.id,
