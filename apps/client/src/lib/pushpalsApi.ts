@@ -475,6 +475,46 @@ export interface SystemStatusSummary {
   ts?: string;
 }
 
+export interface AutonomyEngineSourceInsightRow {
+  sourceKey: string;
+  sourceType: string;
+  sourceLabel: string | null;
+  sourceUrl: string | null;
+  sourceFingerprint: string | null;
+  sourceAlgorithm: string;
+  curationStatus: "candidate" | "trusted" | "watchlist" | "archived";
+  curationReason: string | null;
+  trustScore: number;
+  freshnessScore: number;
+  sampleCount: number;
+  emaSuccess: number;
+  emaUserAccept: number;
+  emaLatency: number;
+  emaRegret: number;
+  lastReinforcedAt: string | null;
+  updatedAt: string;
+}
+
+export interface AutonomyTrustedInspirationInsightRow {
+  sourceKey: string;
+  sourceType: string;
+  sourceLabel: string | null;
+  sourceUrl: string | null;
+  sourceFingerprint: string | null;
+  algorithm: string;
+  summary: string | null;
+  trustScore: number;
+  freshnessScore: number;
+  sampleCount: number;
+  curationReason: string | null;
+}
+
+export interface AutonomyInsightsSummary {
+  engineSourceStats: AutonomyEngineSourceInsightRow[];
+  trustedInspirationShortlist: AutonomyTrustedInspirationInsightRow[];
+  archivedInspirationSources: AutonomyTrustedInspirationInsightRow[];
+}
+
 export interface RuntimeConfigMutation {
   scope: "env" | "toml";
   key: string;
@@ -636,6 +676,58 @@ export async function fetchSystemStatus(
   } catch (err) {
     console.error("Error fetching system status:", err);
     return {};
+  }
+}
+
+export async function fetchAutonomyInsights(
+  baseUrl: string,
+  authToken?: string,
+  limit = 40,
+): Promise<AutonomyInsightsSummary> {
+  try {
+    const qs = new URLSearchParams({
+      limit: String(Math.max(1, Math.min(200, Math.floor(limit)))),
+      feedbackLimit: "10",
+    });
+    const response = await fetch(`${baseUrl}/autonomy/insights?${qs.toString()}`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) {
+      return {
+        engineSourceStats: [],
+        trustedInspirationShortlist: [],
+        archivedInspirationSources: [],
+      };
+    }
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      engineSourceStats?: AutonomyEngineSourceInsightRow[];
+      trustedInspirationShortlist?: AutonomyTrustedInspirationInsightRow[];
+      archivedInspirationSources?: AutonomyTrustedInspirationInsightRow[];
+    };
+    if (!payload.ok) {
+      return {
+        engineSourceStats: [],
+        trustedInspirationShortlist: [],
+        archivedInspirationSources: [],
+      };
+    }
+    return {
+      engineSourceStats: Array.isArray(payload.engineSourceStats) ? payload.engineSourceStats : [],
+      trustedInspirationShortlist: Array.isArray(payload.trustedInspirationShortlist)
+        ? payload.trustedInspirationShortlist
+        : [],
+      archivedInspirationSources: Array.isArray(payload.archivedInspirationSources)
+        ? payload.archivedInspirationSources
+        : [],
+    };
+  } catch (err) {
+    console.error("Error fetching autonomy insights:", err);
+    return {
+      engineSourceStats: [],
+      trustedInspirationShortlist: [],
+      archivedInspirationSources: [],
+    };
   }
 }
 

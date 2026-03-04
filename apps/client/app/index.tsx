@@ -31,6 +31,7 @@ import { SystemPane } from "../src/components/SystemPane";
 import { ConfigPane } from "../src/components/ConfigPane";
 import { usePushPalsSession } from "../src/lib/usePushPalsSession";
 import {
+  type AutonomyInsightsSummary,
   type CompletionSnapshotRow,
   type JobSnapshotRow,
   type PendingQueueSnapshot,
@@ -38,6 +39,7 @@ import {
   type RequestSnapshotRow,
   type SystemStatusSummary,
   type WorkerStatusRow,
+  fetchAutonomyInsights,
   fetchCompletionsSnapshot,
   fetchJobsSnapshot,
   fetchRequestsSnapshot,
@@ -144,6 +146,11 @@ export default function DashboardScreen() {
   const [completions, setCompletions] = useState<CompletionSnapshotRow[]>([]);
   const [completionCounts, setCompletionCounts] = useState<QueueCounts>({});
   const [systemSummary, setSystemSummary] = useState<SystemStatusSummary>({});
+  const [autonomyInsights, setAutonomyInsights] = useState<AutonomyInsightsSummary>({
+    engineSourceStats: [],
+    trustedInspirationShortlist: [],
+    archivedInspirationSources: [],
+  });
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
   const [jobsFilter, setJobsFilter] = useState<{
     requestId: string | null;
@@ -173,12 +180,13 @@ export default function DashboardScreen() {
     }).start();
   }, [activeTab, tabAnim]);
   const refreshObservability = useCallback(async () => {
-    const [workersData, requestData, jobData, completionData, systemData] = await Promise.all([
+    const [workersData, requestData, jobData, completionData, systemData, autonomyData] = await Promise.all([
       fetchWorkers(DEFAULT_BASE, AUTH_TOKEN),
       fetchRequestsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
       fetchJobsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
       fetchCompletionsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
       fetchSystemStatus(DEFAULT_BASE, AUTH_TOKEN),
+      fetchAutonomyInsights(DEFAULT_BASE, AUTH_TOKEN, 80),
     ]);
 
     setWorkers(workersData);
@@ -191,6 +199,7 @@ export default function DashboardScreen() {
     setCompletions(completionData.completions);
     setCompletionCounts(completionData.counts);
     setSystemSummary(systemData);
+    setAutonomyInsights(autonomyData);
     setLastRefresh(new Date().toISOString());
   }, []);
 
@@ -547,6 +556,7 @@ export default function DashboardScreen() {
                   connected={session.isConnected}
                   workers={workers}
                   systemSummary={systemSummary}
+                  autonomyInsights={autonomyInsights}
                   lastRefresh={lastRefresh}
                 />
               ) : null}

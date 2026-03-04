@@ -218,6 +218,8 @@ const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
 
+type SourceCurationStatus = "candidate" | "trusted" | "watchlist" | "archived";
+
 type FeedbackPriorForScoring = {
   ema_success?: unknown;
   ema_user_accept?: unknown;
@@ -349,7 +351,7 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
   noveltyScore: number;
   priorScore: number;
   noveltyBonus: number;
-  curationStatus: "candidate" | "trusted" | "watchlist" | "archived";
+  curationStatus: SourceCurationStatus;
   curationReason: string;
   trustScore: number;
   freshnessScore: number;
@@ -357,11 +359,7 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
   curationPenalty: number;
 } {
   const sampleCount = Math.max(0, Math.floor(asNumber(prior?.sample_count, 0)));
-  const curationRaw = asString(prior?.curation_status).toLowerCase();
-  const curationStatus =
-    curationRaw === "trusted" || curationRaw === "watchlist" || curationRaw === "archived"
-      ? curationRaw
-      : "candidate";
+  const curationStatus = normalizeSourceCurationStatus(prior?.curation_status);
   const curationReason = asString(prior?.curation_reason);
   const trustScore = clamp01(asNumber(prior?.trust_score, 0));
   const freshnessScore = clamp01(asNumber(prior?.freshness_score, sampleCount > 0 ? 0.7 : 0.5));
@@ -413,6 +411,14 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
     trustBoost,
     curationPenalty,
   };
+}
+
+function normalizeSourceCurationStatus(value: unknown): SourceCurationStatus {
+  const raw = asString(value).toLowerCase();
+  if (raw === "trusted") return "trusted";
+  if (raw === "watchlist") return "watchlist";
+  if (raw === "archived") return "archived";
+  return "candidate";
 }
 
 function deriveInspirationSourceKey(params: {
@@ -648,6 +654,10 @@ export interface EngineIdeaBuildingBlock {
   source_url?: string | null;
   source_refs?: string[];
   source_fingerprint?: string;
+  source_curation_status?: "candidate" | "trusted" | "watchlist" | "archived";
+  source_curation_reason?: string | null;
+  source_trust_score?: number;
+  source_freshness_score?: number;
 }
 
 export interface EngineCommitHistoryHint {
@@ -673,6 +683,9 @@ export interface EngineInspirationSourcePattern {
   quality_score: number;
   freshness_score: number;
   seen_count: number;
+  source_curation_status: "candidate" | "trusted" | "watchlist" | "archived";
+  source_curation_reason: string | null;
+  source_trust_score: number;
 }
 
 export interface EngineInspirationContext {
@@ -1052,6 +1065,7 @@ const ENGINE_IDEA_BLUEPRINTS: EngineIdeaBlueprint[] = [
 type InspirationPatternInput = {
   id: string;
   fingerprint: string;
+  sourceKey: string;
   sourceType: string;
   sourceLabel: string | null;
   sourceUrl: string | null;
@@ -1065,7 +1079,23 @@ type InspirationPatternInput = {
   qualityScore: number;
   freshnessScore: number;
   seenCount: number;
+  sourceCurationStatus: "candidate" | "trusted" | "watchlist" | "archived";
+  sourceCurationReason: string | null;
+  sourceTrustScore: number;
   metadata: Record<string, unknown>;
+};
+
+type SourceCurationInsightInput = {
+  sourceKey: string;
+  sourceType: string;
+  sourceLabel: string | null;
+  sourceUrl: string | null;
+  sourceFingerprint: string | null;
+  curationStatus: "candidate" | "trusted" | "watchlist" | "archived";
+  curationReason: string | null;
+  trustScore: number;
+  freshnessScore: number;
+  sampleCount: number;
 };
 
 const INSPIRATION_COMPONENT_HINTS: Array<{ area: AutonomyComponentArea; pattern: RegExp }> = [
@@ -1328,12 +1358,32 @@ function normalizeInspirationPattern(value: unknown): InspirationPatternInput | 
   const metadata = asObject(raw.metadata);
   const fingerprintSeed = `${algorithm.toLowerCase()}|${whenToUse.toLowerCase()}`;
   const fingerprint = asString(raw.fingerprint) || sha256(fingerprintSeed);
+  const sourceLabel = asString(raw.sourceLabel ?? raw.source_label) || null;
+  const sourceUrl = asString(raw.sourceUrl ?? raw.source_url) || null;
+  const sourceKey =
+    asString(raw.sourceKey ?? raw.source_key) ||
+    asString(metadata.source_key) ||
+    deriveInspirationSourceKey({
+      sourceFingerprint: fingerprint,
+      sourceType,
+      sourceLabel,
+      sourceUrl,
+    });
+  const sourceCurationStatus = normalizeSourceCurationStatus(
+    raw.sourceCurationStatus ?? raw.source_curation_status ?? metadata.source_curation_status,
+  );
+  const sourceCurationReason =
+    asString(raw.sourceCurationReason ?? raw.source_curation_reason ?? metadata.source_curation_reason) || null;
+  const sourceTrustScore = clamp01(
+    asNumber(raw.sourceTrustScore ?? raw.source_trust_score ?? metadata.source_trust_score, 0),
+  );
   return {
     id: asString(raw.id) || `insp_${fingerprint.slice(0, 10)}`,
     fingerprint,
+    sourceKey,
     sourceType,
-    sourceLabel: asString(raw.sourceLabel ?? raw.source_label) || null,
-    sourceUrl: asString(raw.sourceUrl ?? raw.source_url) || null,
+    sourceLabel,
+    sourceUrl,
     sourceRefs,
     algorithm,
     whenToUse,
@@ -1344,8 +1394,106 @@ function normalizeInspirationPattern(value: unknown): InspirationPatternInput | 
     qualityScore: clamp01(asNumber(raw.qualityScore ?? raw.quality_score, 0.5)),
     freshnessScore: clamp01(asNumber(raw.freshnessScore ?? raw.freshness_score, 0.5)),
     seenCount: Math.max(0, Math.floor(asNumber(raw.seenCount ?? raw.seen_count, 0))),
+    sourceCurationStatus,
+    sourceCurationReason,
+    sourceTrustScore,
     metadata,
   };
+}
+
+function normalizeSourceCurationInsight(value: unknown): SourceCurationInsightInput | null {
+  const raw = asObject(value);
+  const sourceType = asString(raw.sourceType ?? raw.source_type).toLowerCase() || "unknown";
+  const sourceLabel = asString(raw.sourceLabel ?? raw.source_label) || null;
+  const sourceUrl = asString(raw.sourceUrl ?? raw.source_url) || null;
+  const sourceFingerprint = asString(raw.sourceFingerprint ?? raw.source_fingerprint) || null;
+  const sourceKey =
+    asString(raw.sourceKey ?? raw.source_key) ||
+    deriveInspirationSourceKey({
+      sourceFingerprint,
+      sourceType,
+      sourceLabel,
+      sourceUrl,
+    });
+  if (!sourceKey && !sourceFingerprint) return null;
+  return {
+    sourceKey,
+    sourceType,
+    sourceLabel,
+    sourceUrl,
+    sourceFingerprint,
+    curationStatus: normalizeSourceCurationStatus(raw.curationStatus ?? raw.curation_status),
+    curationReason: asString(raw.curationReason ?? raw.curation_reason) || null,
+    trustScore: clamp01(asNumber(raw.trustScore ?? raw.trust_score, 0)),
+    freshnessScore: clamp01(asNumber(raw.freshnessScore ?? raw.freshness_score, 0.5)),
+    sampleCount: Math.max(0, Math.floor(asNumber(raw.sampleCount ?? raw.sample_count, 0))),
+  };
+}
+
+function applySourceCurationToPatterns(
+  patterns: InspirationPatternInput[],
+  sourceInsights: unknown[],
+): InspirationPatternInput[] {
+  const normalizedInsights = sourceInsights
+    .map((entry) => normalizeSourceCurationInsight(entry))
+    .filter((entry): entry is SourceCurationInsightInput => Boolean(entry));
+  const insightBySourceKey = new Map<string, SourceCurationInsightInput>();
+  const insightByFingerprint = new Map<string, SourceCurationInsightInput>();
+  for (const insight of normalizedInsights) {
+    if (insight.sourceKey) insightBySourceKey.set(insight.sourceKey, insight);
+    if (insight.sourceFingerprint) insightByFingerprint.set(insight.sourceFingerprint, insight);
+  }
+
+  const curated = patterns
+    .map((pattern) => {
+      const insight = insightBySourceKey.get(pattern.sourceKey) ?? insightByFingerprint.get(pattern.fingerprint);
+      if (!insight) {
+        if (pattern.sourceCurationStatus === "archived") return null;
+        return pattern;
+      }
+      const trustScore = clamp01(asNumber(insight.trustScore, pattern.sourceTrustScore));
+      const freshnessScore = clamp01(asNumber(insight.freshnessScore, pattern.freshnessScore));
+      const nextStatus = insight.curationStatus;
+      if (nextStatus === "archived") return null;
+      const nextMetadata: Record<string, unknown> = {
+        ...pattern.metadata,
+        source_key: pattern.sourceKey,
+        source_curation_status: nextStatus,
+        source_curation_reason: insight.curationReason,
+        source_trust_score: trustScore,
+      };
+      const qualityScore =
+        nextStatus === "trusted"
+          ? clamp01(Math.max(pattern.qualityScore, 0.68 + 0.24 * trustScore))
+          : nextStatus === "watchlist"
+            ? clamp01(Math.min(pattern.qualityScore, 0.6 * pattern.qualityScore + 0.4 * trustScore))
+            : clamp01(0.72 * pattern.qualityScore + 0.28 * trustScore);
+      return {
+        ...pattern,
+        qualityScore,
+        freshnessScore: Math.max(pattern.freshnessScore, freshnessScore),
+        sourceCurationStatus: nextStatus,
+        sourceCurationReason: insight.curationReason,
+        sourceTrustScore: trustScore,
+        metadata: nextMetadata,
+      } satisfies InspirationPatternInput;
+    })
+    .filter((entry): entry is InspirationPatternInput => Boolean(entry));
+
+  const statusPriority: Record<SourceCurationStatus, number> = {
+    trusted: 0,
+    candidate: 1,
+    watchlist: 2,
+    archived: 3,
+  };
+  return curated.sort((a, b) => {
+    const pA = statusPriority[a.sourceCurationStatus];
+    const pB = statusPriority[b.sourceCurationStatus];
+    if (pA !== pB) return pA - pB;
+    const signalA = 0.52 * a.qualityScore + 0.28 * a.freshnessScore + 0.2 * a.sourceTrustScore;
+    const signalB = 0.52 * b.qualityScore + 0.28 * b.freshnessScore + 0.2 * b.sourceTrustScore;
+    return signalB - signalA;
+  });
 }
 
 function buildCandidateShapeFromPattern(pattern: InspirationPatternInput): EngineCandidateShape {
@@ -1425,10 +1573,17 @@ function buildExternalInspirationBlocks(params: {
         Math.max(0, ...gapIds.map((id) => gapScoreById.get(id) ?? 0).filter((value) => Number.isFinite(value))),
       );
       const sourceSignal = clamp01(
-        0.5 * pattern.qualityScore +
+        0.42 * pattern.qualityScore +
           0.3 * pattern.freshnessScore +
-          0.2 * clamp01(Math.log1p(pattern.seenCount) / Math.log1p(12)),
+          0.12 * pattern.sourceTrustScore +
+          0.16 * clamp01(Math.log1p(pattern.seenCount) / Math.log1p(12)),
       );
+      const curationAdjustment =
+        pattern.sourceCurationStatus === "trusted"
+          ? 0.12 + 0.06 * pattern.sourceTrustScore
+          : pattern.sourceCurationStatus === "watchlist"
+            ? -0.08
+            : 0;
       const recentTypeCount = Math.max(
         0,
         Math.floor(asNumber(params.dispatchByType[candidateShape.objective_type], 0)),
@@ -1438,6 +1593,7 @@ function buildExternalInspirationBlocks(params: {
         0.42 * objectiveSignal +
           0.28 * gapSignal +
           0.22 * sourceSignal +
+          curationAdjustment +
           0.16 * noveltySignal -
           0.08 * params.dispatchSaturation,
       );
@@ -1456,6 +1612,8 @@ function buildExternalInspirationBlocks(params: {
           `objective_signal=${objectiveSignal.toFixed(2)}`,
           `gap_signal=${gapSignal.toFixed(2)}`,
           `source_signal=${sourceSignal.toFixed(2)}`,
+          `source_curation=${pattern.sourceCurationStatus}`,
+          `source_trust=${pattern.sourceTrustScore.toFixed(2)}`,
           `novelty_signal=${noveltySignal.toFixed(2)}`,
           sourceLabel,
           ...(pattern.sourceRefs.slice(0, 2).map((ref) => `ref=${ref}`) ?? []),
@@ -1466,6 +1624,10 @@ function buildExternalInspirationBlocks(params: {
         source_url: pattern.sourceUrl,
         source_refs: pattern.sourceRefs,
         source_fingerprint: pattern.fingerprint,
+        source_curation_status: pattern.sourceCurationStatus,
+        source_curation_reason: pattern.sourceCurationReason,
+        source_trust_score: pattern.sourceTrustScore,
+        source_freshness_score: pattern.freshnessScore,
       } satisfies EngineIdeaBuildingBlock;
     })
     .sort((a, b) => b.score - a.score);
@@ -1562,6 +1724,7 @@ export function buildEngineInspirationContext(params: {
   vision: Pick<VisionContext, "one_sentence" | "key_items" | "section_numbers">;
   snapshot: EngineIdeaInputSnapshot;
   inspirationPatterns?: unknown[];
+  sourceInsights?: unknown[];
   commitHistoryHints?: EngineCommitHistoryHint[];
 }): EngineInspirationContext {
   const oneSentence = asString(params.vision.one_sentence);
@@ -1697,9 +1860,10 @@ export function buildEngineInspirationContext(params: {
 
   const normalizedPatterns = (Array.isArray(params.inspirationPatterns) ? params.inspirationPatterns : [])
     .map((entry) => normalizeInspirationPattern(entry))
-    .filter((entry): entry is InspirationPatternInput => Boolean(entry))
-    .slice(0, 80);
-  const sourcePatterns: EngineInspirationSourcePattern[] = normalizedPatterns.map((pattern) => ({
+    .filter((entry): entry is InspirationPatternInput => Boolean(entry));
+  const sourceInsights = Array.isArray(params.sourceInsights) ? params.sourceInsights : [];
+  const curatedPatterns = applySourceCurationToPatterns(normalizedPatterns, sourceInsights).slice(0, 80);
+  const sourcePatterns: EngineInspirationSourcePattern[] = curatedPatterns.map((pattern) => ({
     id: pattern.id,
     source_type: pattern.sourceType,
     source_label: pattern.sourceLabel,
@@ -1712,9 +1876,12 @@ export function buildEngineInspirationContext(params: {
     quality_score: pattern.qualityScore,
     freshness_score: pattern.freshnessScore,
     seen_count: pattern.seenCount,
+    source_curation_status: pattern.sourceCurationStatus,
+    source_curation_reason: pattern.sourceCurationReason,
+    source_trust_score: pattern.sourceTrustScore,
   }));
   const externalBlocks = buildExternalInspirationBlocks({
-    patterns: normalizedPatterns,
+    patterns: curatedPatterns,
     compiledObjectives,
     opportunityGaps,
     dispatchByType,
@@ -1896,6 +2063,10 @@ export function buildEngineFallbackCandidates(params: {
         block.source_label || block.source_type
           ? `Source inspiration: ${block.source_label ?? block.source_type}.`
           : "";
+      const sourceCurationNote =
+        block.source_curation_status && block.source_curation_status !== "candidate"
+          ? `Source curation: ${block.source_curation_status}${block.source_curation_reason ? ` (${block.source_curation_reason})` : ""}.`
+          : "";
       const sourceKey = deriveInspirationSourceKey({
         sourceFingerprint: block.source_fingerprint,
         sourceType: block.source_type,
@@ -1928,6 +2099,7 @@ export function buildEngineFallbackCandidates(params: {
           block.summary,
           block.hypothesis,
           ...(sourceAttribution ? [sourceAttribution] : []),
+          ...(sourceCurationNote ? [sourceCurationNote] : []),
           `Add measurable telemetry and guardrails for ${block.algorithm}.`,
         ].slice(0, 3),
         engine_trial: {
@@ -2353,6 +2525,30 @@ export class RemoteBuddyAutonomousEngine {
     if (!res.ok) return [];
     const data = (await res.json()) as { ok?: boolean; patterns?: unknown[] };
     return data.ok && Array.isArray(data.patterns) ? data.patterns : [];
+  }
+
+  private async fetchInspirationSourceInsights(limit = 120): Promise<unknown[]> {
+    const qs = new URLSearchParams({
+      limit: String(Math.max(1, Math.min(400, Math.floor(limit)))),
+      feedbackLimit: "1",
+    });
+    const res = await fetch(`${this.server}/autonomy/insights?${qs.toString()}`, {
+      method: "GET",
+      headers: this.headers(),
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      ok?: boolean;
+      engineSourceStats?: unknown[];
+      trustedInspirationShortlist?: unknown[];
+      archivedInspirationSources?: unknown[];
+    };
+    if (!data.ok) return [];
+    const rows = Array.isArray(data.engineSourceStats) ? data.engineSourceStats : [];
+    if (rows.length > 0) return rows;
+    const trusted = Array.isArray(data.trustedInspirationShortlist) ? data.trustedInspirationShortlist : [];
+    const archived = Array.isArray(data.archivedInspirationSources) ? data.archivedInspirationSources : [];
+    return [...trusted, ...archived];
   }
 
   private async loadCommitHistoryHints(): Promise<EngineCommitHistoryHint[]> {
@@ -2814,8 +3010,9 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       this.setPhase("collect_engine_inspiration");
-      const [inspirationPatterns, commitHistoryHints] = await Promise.all([
+      const [inspirationPatterns, sourceInsights, commitHistoryHints] = await Promise.all([
         this.fetchInspirationPatterns(80),
+        this.fetchInspirationSourceInsights(160),
         this.loadCommitHistoryHints(),
       ]);
       const engineInspiration = buildEngineInspirationContext({
@@ -2831,6 +3028,7 @@ export class RemoteBuddyAutonomousEngine {
           dispatch_budget: snapshot.dispatch_budget,
         },
         inspirationPatterns,
+        sourceInsights,
         commitHistoryHints,
       });
       const visionSectionNumberSet = new Set(visionContext.section_numbers);

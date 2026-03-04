@@ -178,6 +178,109 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
     expect(externalBlock?.score ?? 0).toBeGreaterThan(0.2);
   });
 
+  test("filters archived inspiration sources and boosts trusted sources into fallback objective seeds", () => {
+    const context = buildEngineInspirationContext({
+      vision,
+      snapshot,
+      inspirationPatterns: [
+        {
+          id: "ext_trusted_1",
+          fingerprint: "fp_trusted_queue_strategy",
+          sourceType: "external_repo",
+          sourceLabel: "trusted/workforce-lab",
+          sourceUrl: "https://example.com/trusted/workforce-lab",
+          sourceRefs: ["README#adaptive-queue-scheduler"],
+          algorithm: "trusted_queue_scheduler",
+          whenToUse: "queue backpressure and worker throughput are unstable",
+          summary: "Prioritize autonomous work by trust-weighted queue pressure and regret feedback.",
+          tags: ["queue", "backpressure", "worker", "regret"],
+          qualityScore: 0.56,
+          freshnessScore: 0.48,
+          seenCount: 4,
+          validationIdeas: ["bun run test:root"],
+          metadata: {
+            component_area: "apps/server",
+            target_paths: ["apps/server/src/autonomy.ts"],
+            write_globs: ["apps/server/src/*"],
+          },
+        },
+        {
+          id: "ext_archived_1",
+          fingerprint: "fp_archived_retry_loop",
+          sourceType: "external_doc",
+          sourceLabel: "archived/retry-notes",
+          sourceUrl: "https://example.com/archived/retry-notes",
+          sourceRefs: ["docs#retry-loop"],
+          algorithm: "archived_retry_loop",
+          whenToUse: "retry storms and queue retries keep cascading",
+          summary: "A retry loop idea that previously caused churn and should be retired.",
+          tags: ["retry", "queue", "storm"],
+          qualityScore: 0.95,
+          freshnessScore: 0.92,
+          seenCount: 9,
+          validationIdeas: ["bun run test:root"],
+          metadata: {
+            component_area: "apps/server",
+            target_paths: ["apps/server/src/autonomy.ts"],
+            write_globs: ["apps/server/src/*"],
+          },
+        },
+      ],
+      sourceInsights: [
+        {
+          sourceFingerprint: "fp_trusted_queue_strategy",
+          sourceType: "external_repo",
+          curationStatus: "trusted",
+          curationReason: "strong real-world outcomes",
+          trustScore: 0.93,
+          freshnessScore: 0.86,
+          sampleCount: 9,
+        },
+        {
+          sourceFingerprint: "fp_archived_retry_loop",
+          sourceType: "external_doc",
+          curationStatus: "archived",
+          curationReason: "low-performing source",
+          trustScore: 0.14,
+          freshnessScore: 0.22,
+          sampleCount: 11,
+        },
+      ],
+    });
+
+    expect(context.source_patterns.some((pattern) => pattern.algorithm === "archived_retry_loop")).toBe(false);
+    const trustedSourcePattern = context.source_patterns.find(
+      (pattern) => pattern.algorithm === "trusted_queue_scheduler",
+    );
+    expect(trustedSourcePattern).toBeDefined();
+    expect(trustedSourcePattern?.source_curation_status).toBe("trusted");
+    const trustedBlock = context.building_blocks.find((block) => block.algorithm === "trusted_queue_scheduler");
+    expect(trustedBlock).toBeDefined();
+    expect(trustedBlock?.source_curation_status).toBe("trusted");
+    expect(context.building_blocks.some((block) => block.algorithm === "archived_retry_loop")).toBe(false);
+
+    const fallback = buildEngineFallbackCandidates({
+      engineInspiration: context,
+      snapshotTopSignals: snapshot.top_signals,
+      visionSectionRefs: vision.section_numbers,
+      maxCandidates: 6,
+    });
+    expect(
+      fallback.some((candidate) => {
+        const trial = (candidate as Record<string, unknown>).engine_trial as Record<string, unknown> | undefined;
+        return (
+          String(candidate.title ?? "").toLowerCase().includes("trusted_queue_scheduler") ||
+          String(trial?.algorithm ?? "").toLowerCase().includes("trusted_queue_scheduler")
+        );
+      }),
+    ).toBe(true);
+    expect(
+      fallback.some((candidate) =>
+        String(candidate.title ?? "").toLowerCase().includes("archived_retry_loop"),
+      ),
+    ).toBe(false);
+  });
+
   test("summarizeCommitHistoryHints extracts recurring local motifs", () => {
     const hints = summarizeCommitHistoryHints([
       "autonomy: queue backpressure guardrail for worker saturation",

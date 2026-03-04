@@ -1,6 +1,10 @@
 import React, { useMemo, useRef } from "react";
 import { ScrollView, StyleSheet, Text, View } from "react-native";
-import type { SystemStatusSummary, WorkerStatusRow } from "../lib/pushpalsApi";
+import type {
+  AutonomyInsightsSummary,
+  SystemStatusSummary,
+  WorkerStatusRow,
+} from "../lib/pushpalsApi";
 import type { DashboardTheme } from "./dashboardTypes";
 import {
   clip,
@@ -54,6 +58,7 @@ export function SystemPane({
   connected,
   workers,
   systemSummary,
+  autonomyInsights,
   lastRefresh,
 }: {
   theme: DashboardTheme;
@@ -61,6 +66,7 @@ export function SystemPane({
   connected: boolean;
   workers: WorkerStatusRow[];
   systemSummary: SystemStatusSummary;
+  autonomyInsights: AutonomyInsightsSummary;
   lastRefresh: string | null;
 }) {
   const INITIALIZING_GRACE_MS = 90_000;
@@ -122,6 +128,11 @@ export function SystemPane({
   const recentEvents = useMemo(() => events.slice(-40).reverse(), [events]);
   const requestSlo = systemSummary.slo?.requests;
   const jobSlo = systemSummary.slo?.jobs;
+  const trustedSources = autonomyInsights.trustedInspirationShortlist.slice(0, 6);
+  const archivedSources = autonomyInsights.archivedInspirationSources.slice(0, 4);
+  const watchlistCount = autonomyInsights.engineSourceStats.filter(
+    (row) => row.curationStatus === "watchlist",
+  ).length;
 
   const componentRows = [
     {
@@ -203,6 +214,13 @@ export function SystemPane({
           theme={theme}
         />
         <MetricTile
+          title="Trusted Sources"
+          value={String(autonomyInsights.trustedInspirationShortlist.length)}
+          detail={`watchlist ${watchlistCount} | archived ${autonomyInsights.archivedInspirationSources.length}`}
+          tone="positive"
+          theme={theme}
+        />
+        <MetricTile
           title="Refresh"
           value={lastRefresh ? relativeMs(lastRefresh) : "--"}
           detail={lastRefresh ? prettyTs(lastRefresh) : "no sync"}
@@ -269,6 +287,75 @@ export function SystemPane({
             </View>
           );
         })}
+      </View>
+
+      <View
+        style={[styles.insightPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}
+      >
+        <View style={styles.rowBetween}>
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            Autonomy Source Curation
+          </Text>
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            {autonomyInsights.engineSourceStats.length} tracked
+          </Text>
+        </View>
+        <View style={styles.insightColumns}>
+          <View style={styles.insightCol}>
+            <Text style={[styles.insightSectionTitle, { color: theme.positive, fontFamily: theme.fontSans }]}>
+              Trusted Shortlist
+            </Text>
+            {trustedSources.length === 0 ? (
+              <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                No trusted sources yet.
+              </Text>
+            ) : (
+              trustedSources.map((row) => (
+                <View key={`trusted-${row.sourceKey}`} style={[styles.insightRow, { borderColor: theme.border }]}>
+                  <Text style={[styles.insightLabel, { color: theme.text, fontFamily: theme.fontSans }]}>
+                    {row.sourceLabel || row.algorithm}
+                  </Text>
+                  <Text style={[styles.insightMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                    trust {row.trustScore.toFixed(2)} | fresh {row.freshnessScore.toFixed(2)} | samples{" "}
+                    {row.sampleCount}
+                  </Text>
+                  {row.curationReason ? (
+                    <Text style={[styles.insightReason, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                      {row.curationReason}
+                    </Text>
+                  ) : null}
+                </View>
+              ))
+            )}
+          </View>
+          <View style={styles.insightCol}>
+            <Text style={[styles.insightSectionTitle, { color: theme.warning, fontFamily: theme.fontSans }]}>
+              Archived Sources
+            </Text>
+            {archivedSources.length === 0 ? (
+              <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                No archived sources.
+              </Text>
+            ) : (
+              archivedSources.map((row) => (
+                <View key={`archived-${row.sourceKey}`} style={[styles.insightRow, { borderColor: theme.border }]}>
+                  <Text style={[styles.insightLabel, { color: theme.text, fontFamily: theme.fontSans }]}>
+                    {row.sourceLabel || row.algorithm}
+                  </Text>
+                  <Text style={[styles.insightMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                    trust {row.trustScore.toFixed(2)} | fresh {row.freshnessScore.toFixed(2)} | samples{" "}
+                    {row.sampleCount}
+                  </Text>
+                  {row.curationReason ? (
+                    <Text style={[styles.insightReason, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                      {row.curationReason}
+                    </Text>
+                  ) : null}
+                </View>
+              ))
+            )}
+          </View>
+        </View>
       </View>
 
       <View
@@ -425,6 +512,46 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 12,
     marginBottom: 10,
+  },
+  insightPanel: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 10,
+  },
+  insightColumns: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+  },
+  insightCol: {
+    flex: 1,
+    minWidth: 280,
+  },
+  insightSectionTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  insightRow: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 8,
+  },
+  insightLabel: {
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  insightMeta: {
+    fontSize: 11,
+    marginTop: 3,
+  },
+  insightReason: {
+    fontSize: 12,
+    marginTop: 5,
+    lineHeight: 17,
   },
   workerRow: {
     flexDirection: "row",
