@@ -796,6 +796,32 @@ export function createRequestHandler() {
         return makeJson({ ok: true, ...insights }, 200);
       }
 
+      // POST /autonomy/inspiration/ingest
+      if (pathname === "/autonomy/inspiration/ingest" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.ingestInspirationPatterns(body);
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // GET /autonomy/inspiration
+      if (pathname === "/autonomy/inspiration" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const sourceType = compactText(url.searchParams.get("sourceType"), 64) || undefined;
+        const tag = compactText(url.searchParams.get("tag"), 64).toLowerCase() || undefined;
+        const q = compactText(url.searchParams.get("q"), 240) || undefined;
+        const limit = parseLimit(url.searchParams.get("limit"), 40);
+        const patterns = autonomyStore.listInspirationPatterns({
+          sourceType,
+          tag,
+          q,
+          limit,
+        });
+        return makeJson({ ok: true, count: patterns.length, patterns }, 200);
+      }
+
       // POST /autonomy/eligibility
       if (pathname === "/autonomy/eligibility" && method === "POST") {
         const denied = requireAuth();

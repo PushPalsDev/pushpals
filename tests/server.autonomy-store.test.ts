@@ -973,4 +973,69 @@ describe("server AutonomyStore policy gates", () => {
     expect(insights.recentPrFeedback[0]?.summary).toContain("Missing validation coverage");
     expect(insights.recentPrFeedback[0]?.comments.length).toBeGreaterThan(0);
   });
+
+  test("ingestInspirationPatterns dedupes fingerprints and tracks source attribution", () => {
+    const store = makeStore();
+    const firstIngest = store.ingestInspirationPatterns({
+      entries: [
+        {
+          source_type: "external_repo",
+          source_label: "github:org/autonomy-lab",
+          source_url: "https://github.com/org/autonomy-lab",
+          algorithm: "queue pressure governor",
+          when_to_use: "when workers are saturated and queue latency increases",
+          summary: "Throttle autonomous dispatch based on queue pressure and worker occupancy.",
+          risks: ["Over-throttling can starve useful work."],
+          validation: ["Replay historical queue windows to verify throughput/latency tradeoff."],
+          tags: ["backpressure", "scheduling"],
+          quality_score: 0.82,
+          freshness_score: 0.7,
+          metadata: { license: "MIT" },
+        },
+      ],
+    });
+    expect(firstIngest.ok).toBe(true);
+    expect(firstIngest.inserted).toBe(1);
+    expect(firstIngest.updated).toBe(0);
+
+    const secondIngest = store.ingestInspirationPatterns({
+      entries: [
+        {
+          source_type: "external_doc",
+          source_label: "docs:ops-handbook",
+          source_url: "https://example.test/ops/handbook",
+          algorithm: "queue pressure governor",
+          when_to_use: "when workers are saturated and queue latency increases",
+          summary: "Use dynamic dispatch throttles and release caps as pressure falls.",
+          risks: ["Can mask structural capacity limits."],
+          validation: ["A/B replay with synthetic burst traffic."],
+          tags: ["backpressure", "safety"],
+          quality_score: 0.74,
+          freshness_score: 0.9,
+          metadata: { section: "throughput-control" },
+        },
+      ],
+    });
+    expect(secondIngest.ok).toBe(true);
+    expect(secondIngest.inserted).toBe(0);
+    expect(secondIngest.updated).toBe(1);
+
+    const all = store.listInspirationPatterns({ limit: 10 });
+    expect(all.length).toBe(1);
+    const pattern = all[0];
+    expect(pattern.algorithm).toBe("queue pressure governor");
+    expect(pattern.seenCount).toBe(2);
+    expect(pattern.tags).toContain("backpressure");
+    expect(pattern.tags).toContain("safety");
+    expect(pattern.sourceRefs.some((ref) => ref.includes("github.com"))).toBe(true);
+    expect(pattern.sourceRefs.some((ref) => ref.includes("ops/handbook"))).toBe(true);
+
+    const tagFiltered = store.listInspirationPatterns({ tag: "safety", limit: 10 });
+    expect(tagFiltered.length).toBe(1);
+    const queryFiltered = store.listInspirationPatterns({
+      q: "queue latency",
+      limit: 10,
+    });
+    expect(queryFiltered.length).toBe(1);
+  });
 });

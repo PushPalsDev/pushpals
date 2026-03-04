@@ -265,6 +265,28 @@ export interface AutonomyInsights {
   recentPrFeedback: AutonomyPrFeedbackInsight[];
 }
 
+export interface AutonomyInspirationPattern {
+  id: number;
+  fingerprint: string;
+  sourceType: string;
+  sourceLabel: string | null;
+  sourceUrl: string | null;
+  sourceRefs: string[];
+  algorithm: string;
+  whenToUse: string;
+  summary: string;
+  risks: string[];
+  validationIdeas: string[];
+  tags: string[];
+  qualityScore: number;
+  freshnessScore: number;
+  seenCount: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  updatedAt: string;
+  metadata: Record<string, unknown>;
+}
+
 function asIsoNow(): string {
   return new Date().toISOString();
 }
@@ -303,6 +325,38 @@ function truncateText(value: string, maxChars: number): string {
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+}
+
+function uniqueLowercaseTokens(value: unknown, maxItems = 24): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of asStringArray(value)) {
+    const token = entry.toLowerCase();
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function normalizeInspirationSourceType(value: unknown): string {
+  const text = asString(value).toLowerCase();
+  if (!text) return "external_doc";
+  if (
+    [
+      "external_repo",
+      "external_doc",
+      "internal_doc",
+      "research_note",
+      "incident_postmortem",
+      "benchmark",
+      "community_discussion",
+    ].includes(text)
+  ) {
+    return text;
+  }
+  return "external_doc";
 }
 
 function asBoolean(value: unknown, fallback = false): boolean {
@@ -460,6 +514,118 @@ function extractEngineTrialCandidateMeta(record: Record<string, unknown>): Engin
     score,
     objectiveIds,
     gapIds,
+    metadata,
+  };
+}
+
+type NormalizedInspirationPattern = {
+  fingerprint: string;
+  sourceType: string;
+  sourceLabel: string | null;
+  sourceUrl: string | null;
+  sourceRefs: string[];
+  algorithm: string;
+  whenToUse: string;
+  summary: string;
+  risks: string[];
+  validationIdeas: string[];
+  tags: string[];
+  qualityScore: number;
+  freshnessScore: number;
+  metadata: Record<string, unknown>;
+};
+
+function normalizeTextList(value: unknown, maxItems = 16, maxChars = 240): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of asStringArray(value)) {
+    const text = truncateText(raw, maxChars);
+    const key = text.toLowerCase();
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    out.push(text);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function mergeUniqueText(base: string[], incoming: string[], maxItems = 24): string[] {
+  return normalizeTextList([...base, ...incoming], maxItems, 320);
+}
+
+function normalizeInspirationPatternEntry(raw: unknown): NormalizedInspirationPattern | null {
+  const record = asObject(raw);
+  const algorithm = truncateText(asString(record.algorithm ?? record.title ?? record.name), 220);
+  const whenToUse = truncateText(
+    asString(record.when_to_use ?? record.whenToUse ?? record.context ?? record.use_case),
+    360,
+  );
+  const summary = truncateText(
+    asString(record.summary ?? record.abstract ?? record.problem ?? record.content ?? record.notes),
+    2400,
+  );
+  if (!algorithm || !whenToUse || !summary) return null;
+
+  const sourceType = normalizeInspirationSourceType(
+    record.source_type ?? record.sourceType ?? record.kind ?? record.type,
+  );
+  const sourceLabel =
+    truncateText(
+      asString(record.source_label ?? record.sourceLabel ?? record.source_name ?? record.sourceName),
+      240,
+    ) || null;
+  const sourceUrl = truncateText(asString(record.source_url ?? record.sourceUrl ?? record.url), 1000) || null;
+  const explicitSourceRef =
+    truncateText(asString(record.source_ref ?? record.sourceRef ?? record.reference), 1000) || null;
+  const sourceRefs = normalizeTextList(
+    [explicitSourceRef, sourceUrl, sourceLabel, sourceType].filter(Boolean),
+    32,
+    1000,
+  );
+
+  const risks = normalizeTextList(record.risks ?? record.risk_notes ?? record.riskNotes, 20, 320);
+  const validationIdeas = normalizeTextList(
+    record.validation ?? record.validation_ideas ?? record.validationIdeas ?? record.checks,
+    20,
+    320,
+  );
+  const tags = uniqueLowercaseTokens(record.tags, 24);
+
+  const qualityScore = clamp01(asNumber(record.quality_score ?? record.qualityScore, 0.5));
+  const explicitFreshness = record.freshness_score ?? record.freshnessScore;
+  const freshnessScore = Number.isFinite(asNumber(explicitFreshness, Number.NaN))
+    ? clamp01(asNumber(explicitFreshness, 0.5))
+    : (() => {
+        const publishedAt = Date.parse(asString(record.published_at ?? record.publishedAt));
+        const ageDays = Number.isFinite(publishedAt)
+          ? Math.max(0, (Date.now() - publishedAt) / (24 * 60 * 60 * 1000))
+          : 180;
+        return clamp01(1 - ageDays / 365);
+      })();
+
+  const metadata = asObject(record.metadata);
+  if (sourceRefs.length > 0) metadata.source_refs = sourceRefs;
+  const fingerprint = sha256Hex(
+    [
+      algorithm.toLowerCase(),
+      whenToUse.toLowerCase(),
+    ].join("\n"),
+  );
+
+  return {
+    fingerprint,
+    sourceType,
+    sourceLabel,
+    sourceUrl,
+    sourceRefs,
+    algorithm,
+    whenToUse,
+    summary,
+    risks,
+    validationIdeas,
+    tags,
+    qualityScore,
+    freshnessScore,
     metadata,
   };
 }
@@ -716,6 +882,31 @@ export class AutonomyStore {
         sample_count INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS autonomy_inspiration_patterns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fingerprint TEXT NOT NULL UNIQUE,
+        source_type TEXT NOT NULL,
+        source_label TEXT,
+        source_url TEXT,
+        source_refs_json TEXT NOT NULL,
+        algorithm TEXT NOT NULL,
+        when_to_use TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        risks_json TEXT NOT NULL,
+        validation_json TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        quality_score REAL NOT NULL DEFAULT 0.5,
+        freshness_score REAL NOT NULL DEFAULT 0.5,
+        metadata_json TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_inspiration_updated
+        ON autonomy_inspiration_patterns(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_inspiration_source_updated
+        ON autonomy_inspiration_patterns(source_type, updated_at DESC);
       CREATE TABLE IF NOT EXISTS autonomy_pr_feedback (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         feedback_key TEXT,
@@ -2591,6 +2782,291 @@ export class AutonomyStore {
         now,
       );
     return { ok: true };
+  }
+
+  ingestInspirationPatterns(body: Record<string, unknown>): {
+    ok: boolean;
+    inserted: number;
+    updated: number;
+    skipped: number;
+    results: Array<{ fingerprint: string; status: "inserted" | "updated" | "skipped"; id?: number; reason?: string }>;
+    reason?: string;
+  } {
+    const rawEntries = Array.isArray(body.entries)
+      ? body.entries
+      : Array.isArray(body.patterns)
+        ? body.patterns
+        : Array.isArray(body.items)
+          ? body.items
+          : [];
+    if (rawEntries.length === 0) {
+      return {
+        ok: false,
+        inserted: 0,
+        updated: 0,
+        skipped: 0,
+        results: [],
+        reason: "entries (or patterns/items) array is required",
+      };
+    }
+    const now = asIsoNow();
+    let inserted = 0;
+    let updated = 0;
+    let skipped = 0;
+    const results: Array<{
+      fingerprint: string;
+      status: "inserted" | "updated" | "skipped";
+      id?: number;
+      reason?: string;
+    }> = [];
+    const readExisting = this.db.prepare(
+      `SELECT id, source_label, source_url, source_refs_json, summary, risks_json, validation_json, tags_json,
+              quality_score, freshness_score, metadata_json, seen_count
+       FROM autonomy_inspiration_patterns
+       WHERE fingerprint = ?
+       LIMIT 1`,
+    );
+    const insertPattern = this.db.prepare(
+      `INSERT INTO autonomy_inspiration_patterns (
+        fingerprint, source_type, source_label, source_url, source_refs_json, algorithm, when_to_use, summary,
+        risks_json, validation_json, tags_json, quality_score, freshness_score, metadata_json,
+        first_seen_at, last_seen_at, seen_count, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const updatePattern = this.db.prepare(
+      `UPDATE autonomy_inspiration_patterns
+       SET source_type = ?,
+           source_label = ?,
+           source_url = ?,
+           source_refs_json = ?,
+           algorithm = ?,
+           when_to_use = ?,
+           summary = ?,
+           risks_json = ?,
+           validation_json = ?,
+           tags_json = ?,
+           quality_score = ?,
+           freshness_score = ?,
+           metadata_json = ?,
+           last_seen_at = ?,
+           seen_count = ?,
+           updated_at = ?
+       WHERE id = ?`,
+    );
+
+    for (const raw of rawEntries) {
+      const normalized = normalizeInspirationPatternEntry(raw);
+      if (!normalized) {
+        skipped += 1;
+        results.push({
+          fingerprint: "",
+          status: "skipped",
+          reason: "missing required fields: algorithm, when_to_use, summary",
+        });
+        continue;
+      }
+      const existing = readExisting.get(normalized.fingerprint) as
+        | {
+            id: number;
+            source_label: string | null;
+            source_url: string | null;
+            source_refs_json: string | null;
+            summary: string | null;
+            risks_json: string | null;
+            validation_json: string | null;
+            tags_json: string | null;
+            quality_score: number;
+            freshness_score: number;
+            metadata_json: string | null;
+            seen_count: number;
+          }
+        | undefined;
+
+      if (!existing) {
+        const insertRes = insertPattern.run(
+          normalized.fingerprint,
+          normalized.sourceType,
+          normalized.sourceLabel,
+          normalized.sourceUrl,
+          JSON.stringify(normalized.sourceRefs),
+          normalized.algorithm,
+          normalized.whenToUse,
+          normalized.summary,
+          JSON.stringify(normalized.risks),
+          JSON.stringify(normalized.validationIdeas),
+          JSON.stringify(normalized.tags),
+          normalized.qualityScore,
+          normalized.freshnessScore,
+          JSON.stringify(normalized.metadata),
+          now,
+          now,
+          1,
+          now,
+        );
+        inserted += 1;
+        results.push({
+          fingerprint: normalized.fingerprint,
+          status: "inserted",
+          id: Math.max(0, Math.floor(asNumber(insertRes.lastInsertRowid, 0))),
+        });
+        continue;
+      }
+
+      const previousSeenCount = Math.max(1, Math.floor(asNumber(existing.seen_count, 1)));
+      const nextSeenCount = previousSeenCount + 1;
+      const mergedSourceRefs = mergeUniqueText(
+        normalizeTextList(parseJsonArray(existing.source_refs_json), 32, 1000),
+        normalized.sourceRefs,
+        32,
+      );
+      const mergedRisks = mergeUniqueText(
+        normalizeTextList(parseJsonArray(existing.risks_json), 20, 320),
+        normalized.risks,
+        20,
+      );
+      const mergedValidation = mergeUniqueText(
+        normalizeTextList(parseJsonArray(existing.validation_json), 20, 320),
+        normalized.validationIdeas,
+        20,
+      );
+      const mergedTags = uniqueLowercaseTokens(
+        [...normalizeTextList(parseJsonArray(existing.tags_json), 24, 120), ...normalized.tags],
+        24,
+      );
+      const existingSummary = asString(existing.summary);
+      const mergedSummary =
+        normalized.summary.length > existingSummary.length ? normalized.summary : existingSummary || normalized.summary;
+      const mergedQuality = clamp01(
+        (clamp01(asNumber(existing.quality_score, 0.5)) * previousSeenCount + normalized.qualityScore) /
+          nextSeenCount,
+      );
+      const mergedFreshness = clamp01(
+        (clamp01(asNumber(existing.freshness_score, 0.5)) * previousSeenCount + normalized.freshnessScore) /
+          nextSeenCount,
+      );
+      const existingMetadata = parseJsonObject(existing.metadata_json);
+      const mergedMetadata = {
+        ...existingMetadata,
+        ...normalized.metadata,
+        source_refs: mergedSourceRefs,
+      };
+
+      updatePattern.run(
+        normalized.sourceType,
+        normalized.sourceLabel || asString(existing.source_label) || null,
+        normalized.sourceUrl || asString(existing.source_url) || null,
+        JSON.stringify(mergedSourceRefs),
+        normalized.algorithm,
+        normalized.whenToUse,
+        mergedSummary,
+        JSON.stringify(mergedRisks),
+        JSON.stringify(mergedValidation),
+        JSON.stringify(mergedTags),
+        mergedQuality,
+        mergedFreshness,
+        JSON.stringify(mergedMetadata),
+        now,
+        nextSeenCount,
+        now,
+        Math.max(0, Math.floor(asNumber(existing.id, 0))),
+      );
+      updated += 1;
+      results.push({
+        fingerprint: normalized.fingerprint,
+        status: "updated",
+        id: Math.max(0, Math.floor(asNumber(existing.id, 0))),
+      });
+    }
+
+    return {
+      ok: true,
+      inserted,
+      updated,
+      skipped,
+      results,
+    };
+  }
+
+  listInspirationPatterns(params?: {
+    sourceType?: string;
+    tag?: string;
+    q?: string;
+    limit?: number;
+  }): AutonomyInspirationPattern[] {
+    const limit = Math.max(1, Math.min(500, Math.floor(asNumber(params?.limit, 40))));
+    const sourceTypeRaw = asString(params?.sourceType);
+    const sourceType = sourceTypeRaw ? normalizeInspirationSourceType(sourceTypeRaw) : "";
+    const tag = asString(params?.tag).toLowerCase();
+    const q = asString(params?.q).toLowerCase();
+    const where: string[] = [];
+    const args: Array<string | number> = [];
+    if (sourceType) {
+      where.push("source_type = ?");
+      args.push(sourceType);
+    }
+    if (q) {
+      where.push("(LOWER(algorithm) LIKE ? OR LOWER(when_to_use) LIKE ? OR LOWER(summary) LIKE ?)");
+      const like = `%${q}%`;
+      args.push(like, like, like);
+    }
+    const queryLimit = tag ? Math.min(1000, limit * 5) : limit;
+    const rows = this.db
+      .prepare(
+        `SELECT id, fingerprint, source_type, source_label, source_url, source_refs_json, algorithm, when_to_use, summary,
+                risks_json, validation_json, tags_json, quality_score, freshness_score, metadata_json,
+                first_seen_at, last_seen_at, seen_count, updated_at
+         FROM autonomy_inspiration_patterns
+         ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY updated_at DESC
+         LIMIT ?`,
+      )
+      .all(...args, queryLimit) as Array<{
+      id: number;
+      fingerprint: string | null;
+      source_type: string | null;
+      source_label: string | null;
+      source_url: string | null;
+      source_refs_json: string | null;
+      algorithm: string | null;
+      when_to_use: string | null;
+      summary: string | null;
+      risks_json: string | null;
+      validation_json: string | null;
+      tags_json: string | null;
+      quality_score: number;
+      freshness_score: number;
+      metadata_json: string | null;
+      first_seen_at: string | null;
+      last_seen_at: string | null;
+      seen_count: number;
+      updated_at: string | null;
+    }>;
+
+    const mapped = rows.map((row) => {
+      const tags = uniqueLowercaseTokens(parseJsonArray(row.tags_json), 24);
+      return {
+        id: Math.max(0, Math.floor(asNumber(row.id, 0))),
+        fingerprint: asString(row.fingerprint),
+        sourceType: asString(row.source_type) || "external_doc",
+        sourceLabel: asString(row.source_label) || null,
+        sourceUrl: asString(row.source_url) || null,
+        sourceRefs: normalizeTextList(parseJsonArray(row.source_refs_json), 32, 1000),
+        algorithm: asString(row.algorithm),
+        whenToUse: asString(row.when_to_use),
+        summary: asString(row.summary),
+        risks: normalizeTextList(parseJsonArray(row.risks_json), 20, 320),
+        validationIdeas: normalizeTextList(parseJsonArray(row.validation_json), 20, 320),
+        tags,
+        qualityScore: clamp01(asNumber(row.quality_score, 0.5)),
+        freshnessScore: clamp01(asNumber(row.freshness_score, 0.5)),
+        seenCount: Math.max(0, Math.floor(asNumber(row.seen_count, 0))),
+        firstSeenAt: asString(row.first_seen_at),
+        lastSeenAt: asString(row.last_seen_at),
+        updatedAt: asString(row.updated_at),
+        metadata: parseJsonObject(row.metadata_json),
+      } as AutonomyInspirationPattern;
+    });
+    return tag ? mapped.filter((row) => row.tags.includes(tag)).slice(0, limit) : mapped;
   }
 
   listInsights(params?: {

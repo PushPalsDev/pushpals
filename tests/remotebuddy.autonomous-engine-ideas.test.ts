@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildEngineFallbackCandidates,
   buildEngineInspirationContext,
+  summarizeCommitHistoryHints,
 } from "../apps/remotebuddy/src/autonomous_engine";
 
 describe("RemoteBuddy autonomous engine idea generation", () => {
@@ -139,5 +140,56 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
       expect(validation.length).toBeGreaterThan(0);
       expect(validation.every((command) => command.startsWith("bun "))).toBe(true);
     }
+  });
+
+  test("buildEngineInspirationContext merges external inspiration patterns with source attribution", () => {
+    const context = buildEngineInspirationContext({
+      vision,
+      snapshot,
+      inspirationPatterns: [
+        {
+          id: "ext_repo_1",
+          sourceType: "external_repo",
+          sourceLabel: "acme/autonomy-lab",
+          sourceUrl: "https://example.com/acme/autonomy-lab",
+          sourceRefs: ["README#queue-bandit"],
+          algorithm: "queue_portfolio_bandit",
+          whenToUse: "queue backpressure and worker saturation are recurring",
+          summary: "Allocate autonomous work across lanes using queue pressure + regret loops.",
+          tags: ["queue", "backpressure", "worker", "portfolio"],
+          qualityScore: 0.92,
+          freshnessScore: 0.81,
+          seenCount: 7,
+          validationIdeas: ["bun run test:root"],
+          metadata: {
+            component_area: "apps/server",
+            target_paths: ["apps/server/src/autonomy.ts"],
+            write_globs: ["apps/server/src/*"],
+          },
+        },
+      ],
+    });
+    expect(context.source_patterns.length).toBe(1);
+    const externalBlock = context.building_blocks.find((entry) => entry.id.startsWith("insp_"));
+    expect(externalBlock).toBeDefined();
+    expect(externalBlock?.algorithm).toBe("queue_portfolio_bandit");
+    expect(externalBlock?.source_type).toBe("external_repo");
+    expect(externalBlock?.candidate_shape.component_area).toBe("apps/server");
+    expect(externalBlock?.score ?? 0).toBeGreaterThan(0.2);
+  });
+
+  test("summarizeCommitHistoryHints extracts recurring local motifs", () => {
+    const hints = summarizeCommitHistoryHints([
+      "autonomy: queue backpressure guardrail for worker saturation",
+      "server: queue p95 telemetry + dispatch throttling",
+      "merge conflict retry handling for autonomous PRs",
+      "policy: scope guardrail validation hardening",
+      "tests: flaky retry stabilization for integration jobs",
+    ]);
+    expect(hints.length).toBeGreaterThan(0);
+    expect(hints.some((entry) => entry.motif_id === "queue_backpressure")).toBe(true);
+    const queue = hints.find((entry) => entry.motif_id === "queue_backpressure");
+    expect(queue?.count).toBe(2);
+    expect((queue?.sample_subjects ?? []).length).toBeGreaterThan(0);
   });
 });

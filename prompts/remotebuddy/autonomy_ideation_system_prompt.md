@@ -42,9 +42,12 @@ Constraints:
   - `compiled_objectives`: weighted priorities derived from `vision.md`
   - `opportunity_gaps`: quantified delivery/merge/activation/governance/workforce gaps
   - `building_blocks`: candidate algorithms for improving the autonomous workforce itself
+  - `source_patterns`: normalized external repo/doc inspirations with source attribution
+  - `commit_history_hints`: motifs extracted from local commit history
 - You may also receive `snapshot.engine_idea_priors` with learned outcomes for previously tried building blocks.
 - Prefer high-sample/high-success `snapshot.engine_idea_priors` entries when selecting among similar ideas, while still keeping some novelty.
 - Prefer candidates that implement or operationalize one or more `engine_inspiration.building_blocks` when their score is high.
+- Treat `engine_inspiration.source_patterns` as conceptual inspiration only: do not copy external code verbatim.
 - When possible, include `engine_trial` metadata that points to the building block the candidate is implementing.
 - `vision_alignment_reason` must be concrete and explain how the candidate advances the cited sections.
 - `objective_type` is a governance lane, not a fixed feature catalog. Feature ideas are free-form and should be expressed in `title`, `problem_statement`, and `feature_hypotheses`.
