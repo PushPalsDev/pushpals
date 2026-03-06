@@ -760,6 +760,739 @@ export interface EngineInspirationContext {
   building_blocks: EngineIdeaBuildingBlock[];
   source_patterns: EngineInspirationSourcePattern[];
   commit_history_hints: EngineCommitHistoryHint[];
+  adjacent_possible?: AdjacentPossibleResult;
+}
+
+export type AdjacentPossibleQueueTelemetrySource = "schema" | "mixed" | "evidence";
+
+export type AdjacentPossibleQueueTelemetry = {
+  signal: number;
+  p95Ms: number;
+  pending: number;
+  source?: AdjacentPossibleQueueTelemetrySource;
+  warnings?: string[];
+};
+
+export type AdjacentPossibleGuardrails = {
+  maxQueueSignal: number;
+  maxQueueP95Ms: number;
+  maxPending: number;
+  allowBlockedFallback?: boolean;
+};
+
+export type AdjacentPossibleExploreConfig = {
+  baseWeight: number;
+  minWeight: number;
+  maxWeight: number;
+  guardrailPenalty: number;
+  reliefBoost: number;
+};
+
+type AdjacentPossibleExploreRepair = {
+  field: "baseWeight" | "minWeight" | "maxWeight";
+  from: number;
+  to: number;
+  reason: "sorted_bounds" | "raised_to_min" | "lowered_to_max";
+};
+
+export type AdjacentPossibleTelemetryEventStage = "input" | "guardrail" | "mix";
+
+export interface AdjacentPossibleTelemetryEvent {
+  stage: AdjacentPossibleTelemetryEventStage;
+  message: string;
+  data: Record<string, unknown>;
+}
+
+export type AdjacentPossibleGuardrailState = "ready" | "blocked" | "demoted_allowed";
+
+export interface AdjacentPossibleMixDecision {
+  motif_id: string;
+  motif_label: string;
+  gap_id: string;
+  gap_label: string;
+  combined_score: number;
+  motif_signal: number;
+  gap_score: number;
+  guardrail_blocked: boolean;
+  guardrail_state: AdjacentPossibleGuardrailState;
+  evidence: string[];
+}
+
+export interface AdjacentPossibleResult {
+  mixes: AdjacentPossibleMixDecision[];
+  telemetry: AdjacentPossibleTelemetryEvent[];
+  explorationWeight: number;
+  guardrailEngaged: boolean;
+}
+
+export function adjacent_possible(params: {
+  motifs: EngineCommitHistoryHint[];
+  opportunityGaps: EngineOpportunityGap[];
+  queueTelemetry?: Partial<AdjacentPossibleQueueTelemetry>;
+  guardrails?: Partial<AdjacentPossibleGuardrails>;
+  exploration?: Partial<AdjacentPossibleExploreConfig>;
+}): AdjacentPossibleResult {
+  const motifs = Array.isArray(params.motifs) ? params.motifs : [];
+  const opportunityGaps = Array.isArray(params.opportunityGaps) ? params.opportunityGaps : [];
+  const queueTelemetry = normalizeQueueTelemetry(params.queueTelemetry);
+  const guardrails: AdjacentPossibleGuardrails = {
+    maxQueueSignal: clamp01(asNumber(params.guardrails?.maxQueueSignal, 0.82)),
+    maxQueueP95Ms: Math.max(0, asNumber(params.guardrails?.maxQueueP95Ms, 210_000)),
+    maxPending: Math.max(0, Math.floor(asNumber(params.guardrails?.maxPending, 160))),
+    allowBlockedFallback: Boolean(params.guardrails?.allowBlockedFallback),
+  };
+  const rawExploreCfg: AdjacentPossibleExploreConfig = {
+    baseWeight: clamp01(asNumber(params.exploration?.baseWeight, 0.34)),
+    minWeight: clamp01(asNumber(params.exploration?.minWeight, 0.18)),
+    maxWeight: clamp01(asNumber(params.exploration?.maxWeight, 0.62)),
+    guardrailPenalty: clamp01(asNumber(params.exploration?.guardrailPenalty, 0.2)),
+    reliefBoost: clamp01(asNumber(params.exploration?.reliefBoost, 0.12)),
+  };
+  const { config: exploreCfg, repairs: exploreRepairs } = repairExploreBounds(rawExploreCfg);
+
+  const telemetry: AdjacentPossibleTelemetryEvent[] = [];
+  telemetry.push({
+    stage: "input",
+    message: "adjacent_possible_inputs",
+    data: {
+      motifs: motifs.length,
+      gaps: opportunityGaps.length,
+      queue_signal: queueTelemetry.signal,
+      queue_p95_ms: queueTelemetry.p95Ms,
+      queue_pending: queueTelemetry.pending,
+      queue_source: queueTelemetry.source ?? "unknown",
+    },
+  });
+  if (Array.isArray(queueTelemetry.warnings) && queueTelemetry.warnings.length > 0) {
+    telemetry.push({
+      stage: "input",
+      message: "queue_telemetry_warning",
+      data: {
+        source: queueTelemetry.source ?? "unknown",
+        warnings: queueTelemetry.warnings,
+      },
+    });
+  }
+
+  const guardrailReasons: string[] = [];
+  if (guardrails.maxQueueSignal > 0 && queueTelemetry.signal >= guardrails.maxQueueSignal) {
+    guardrailReasons.push(
+      `queue_signal=${queueTelemetry.signal.toFixed(2)}>=${guardrails.maxQueueSignal.toFixed(2)}`,
+    );
+  }
+  if (guardrails.maxQueueP95Ms > 0 && queueTelemetry.p95Ms >= guardrails.maxQueueP95Ms) {
+    guardrailReasons.push(`queue_p95_ms=${queueTelemetry.p95Ms}>=${guardrails.maxQueueP95Ms}`);
+  }
+  if (guardrails.maxPending > 0 && queueTelemetry.pending >= guardrails.maxPending) {
+    guardrailReasons.push(`queue_pending=${queueTelemetry.pending}>=${guardrails.maxPending}`);
+  }
+  const guardrailEngaged = guardrailReasons.length > 0;
+  telemetry.push({
+    stage: "guardrail",
+    message: guardrailEngaged ? "queue_guardrail_engaged" : "queue_guardrail_clear",
+    data: {
+      reasons: guardrailReasons,
+      maxQueueSignal: guardrails.maxQueueSignal,
+      queueSignal: queueTelemetry.signal,
+      maxQueueP95Ms: guardrails.maxQueueP95Ms,
+      queueP95Ms: queueTelemetry.p95Ms,
+      maxPending: guardrails.maxPending,
+      queuePending: queueTelemetry.pending,
+      allowBlockedFallback: Boolean(guardrails.allowBlockedFallback),
+    },
+  });
+  if (exploreRepairs.length > 0) {
+    telemetry.push({
+      stage: "input",
+      message: "exploration_config_repaired",
+      data: {
+        repairs: exploreRepairs,
+        original: {
+          baseWeight: rawExploreCfg.baseWeight,
+          minWeight: rawExploreCfg.minWeight,
+          maxWeight: rawExploreCfg.maxWeight,
+        },
+        normalized: {
+          baseWeight: exploreCfg.baseWeight,
+          minWeight: exploreCfg.minWeight,
+          maxWeight: exploreCfg.maxWeight,
+        },
+      },
+    });
+  }
+
+  const normalizedQueueP95 = guardrails.maxQueueP95Ms
+    ? clamp01(queueTelemetry.p95Ms / guardrails.maxQueueP95Ms)
+    : 0;
+  const normalizedQueuePending = guardrails.maxPending
+    ? clamp01(queueTelemetry.pending / guardrails.maxPending)
+    : 0;
+  const queuePressure = clamp01(
+    0.55 * clamp01(queueTelemetry.signal) +
+      0.25 * normalizedQueueP95 +
+      0.2 * normalizedQueuePending,
+  );
+
+  let explorationWeight = exploreCfg.baseWeight;
+  if (guardrailEngaged) {
+    explorationWeight -= exploreCfg.guardrailPenalty;
+    explorationWeight -= 0.12 * queuePressure;
+  } else {
+    explorationWeight += exploreCfg.reliefBoost * (1 - queuePressure);
+  }
+  explorationWeight = clampToRange(explorationWeight, exploreCfg.minWeight, exploreCfg.maxWeight);
+
+  telemetry.push({
+    stage: "guardrail",
+    message: "exploration_weight_adjusted",
+    data: {
+      baseWeight: exploreCfg.baseWeight,
+      adjustedWeight: explorationWeight,
+      guardrailEngaged,
+      queuePressure,
+    },
+  });
+
+  const sortedGaps = [...opportunityGaps].sort((a, b) => b.score - a.score);
+  const gapById = new Map(opportunityGaps.map((gap) => [gap.id, gap]));
+  const sortedMotifs = [...motifs]
+    .map((motif) => ({
+      ...motif,
+      signal: clamp01(asNumber(motif.signal, 0)),
+    }))
+    .filter((motif) => motif.signal > 0)
+    .sort((a, b) => b.signal - a.signal)
+    .slice(0, 5);
+
+  if (sortedMotifs.length === 0 || sortedGaps.length === 0) {
+    return {
+      mixes: [],
+      telemetry,
+      explorationWeight,
+      guardrailEngaged,
+    };
+  }
+
+  const queuePreferredGaps = new Set([
+    "workforce_throughput_gap",
+    "delivery_reliability_gap",
+    "activation_gap",
+  ]);
+  const topGlobalGaps = sortedGaps.slice(0, Math.max(3, sortedMotifs.length));
+  const mixes: AdjacentPossibleMixDecision[] = [];
+  const exploitShare = clamp01(1 - explorationWeight);
+  const exploreShare = explorationWeight;
+  const queueReliefBonusBase =
+    guardrailEngaged && queuePressure > 0 ? 0.05 + 0.1 * queuePressure : 0;
+
+  for (const motif of sortedMotifs) {
+    const seenGapIds = new Set<string>();
+    const candidateGaps: EngineOpportunityGap[] = [];
+    const addCandidate = (gap?: EngineOpportunityGap | null) => {
+      if (!gap || seenGapIds.has(gap.id)) return;
+      seenGapIds.add(gap.id);
+      candidateGaps.push(gap);
+    };
+    const motifGapIds = Array.isArray(motif.gap_ids) ? motif.gap_ids : [];
+    const motifGapSet = new Set(motifGapIds.filter((value): value is string => Boolean(value)));
+    for (const gapId of motifGapIds) {
+      addCandidate(gapById.get(gapId) ?? null);
+    }
+    for (const globalGap of topGlobalGaps) {
+      addCandidate(globalGap);
+    }
+    if (candidateGaps.length === 0 && sortedGaps[0]) {
+      addCandidate(sortedGaps[0]);
+    }
+
+    let bestMix: AdjacentPossibleMixDecision | undefined;
+    let bestMixMeta:
+      | {
+          queuePenalty: number;
+          queueReliefBoost: number;
+          noveltyBoost: number;
+          exploitComponent: number;
+          exploreComponent: number;
+          recombinationPenalty: number;
+        }
+      | undefined;
+    for (const gap of candidateGaps) {
+      const gapScore = clamp01(asNumber(gap.score, 0));
+      const addressesQueue =
+        queuePreferredGaps.has(gap.id) ||
+        /\bqueue|latency|throughput|delivery\b/i.test(asString(gap.label));
+      const noveltyBoost = 0.1 * clamp01(1 - motif.signal);
+      const queuePenalty =
+        guardrailEngaged && !addressesQueue
+          ? clamp01((0.18 + 0.3 * exploreShare) * queuePressure)
+          : guardrailEngaged
+            ? 0.05 * queuePressure
+            : 0;
+      const queueReliefBoost = addressesQueue ? queueReliefBonusBase : 0;
+      const recombinationPenalty = motifGapSet.has(gap.id)
+        ? 0
+        : clamp01((1 - exploreShare) * 0.25);
+      const combinedScore = clamp01(
+        exploitShare * motif.signal +
+          exploreShare * gapScore +
+          noveltyBoost +
+          queueReliefBoost -
+          queuePenalty -
+          recombinationPenalty,
+      );
+      const guardrailBlocked = guardrailEngaged && !addressesQueue && queuePenalty >= 0.18;
+      const guardrailState: AdjacentPossibleGuardrailState = guardrailBlocked ? "blocked" : "ready";
+      const evidence = [
+        `motif_signal=${motif.signal.toFixed(2)}`,
+        `gap_score=${gapScore.toFixed(2)}`,
+        `exploration_weight=${explorationWeight.toFixed(2)}`,
+        `novelty_boost=${noveltyBoost.toFixed(2)}`,
+        motifGapSet.has(gap.id) ? "motif_gap_native" : "motif_gap_recombined",
+        recombinationPenalty > 0
+          ? `recombination_penalty=${recombinationPenalty.toFixed(2)}`
+          : "recombination_clear",
+        queueReliefBoost > 0 ? `queue_relief_bonus=${queueReliefBoost.toFixed(2)}` : "queue_relief_optional",
+        queuePenalty > 0 ? `queue_guardrail_penalty=${queuePenalty.toFixed(2)}` : "queue_guardrail_clear",
+      ];
+      const exploitComponent = exploitShare * motif.signal;
+      const exploreComponent = exploreShare * gapScore;
+      const mixDecision: AdjacentPossibleMixDecision = {
+        motif_id: motif.motif_id,
+        motif_label: motif.label,
+        gap_id: gap.id,
+        gap_label: gap.label ?? "Unknown bottleneck",
+        combined_score: combinedScore,
+        motif_signal: motif.signal,
+        gap_score: gapScore,
+        guardrail_blocked: guardrailState === "blocked",
+        guardrail_state: guardrailState,
+        evidence,
+      };
+      if (!bestMix || mixDecision.combined_score > bestMix.combined_score) {
+        bestMix = mixDecision;
+        bestMixMeta = {
+          queuePenalty,
+          queueReliefBoost,
+          noveltyBoost,
+          exploitComponent,
+          exploreComponent,
+          recombinationPenalty,
+        };
+      }
+    }
+
+    if (bestMix && bestMixMeta) {
+      mixes.push(bestMix);
+      telemetry.push({
+        stage: "mix",
+        message: bestMix.guardrail_state === "blocked" ? "mix_guardrailed" : "mix_ready",
+        data: {
+          motif_id: bestMix.motif_id,
+          gap_id: bestMix.gap_id,
+          combined_score: bestMix.combined_score,
+          motif_signal: bestMix.motif_signal,
+          gap_score: bestMix.gap_score,
+          exploration_weight: explorationWeight,
+          queue_pressure: queuePressure,
+          guardrailPenalty: bestMixMeta.queuePenalty,
+          novelty_boost: bestMixMeta.noveltyBoost,
+          queue_relief_bonus: bestMixMeta.queueReliefBoost,
+          exploit_component: bestMixMeta.exploitComponent,
+          explore_component: bestMixMeta.exploreComponent,
+          recombination_penalty: bestMixMeta.recombinationPenalty,
+          guardrail_state: bestMix.guardrail_state,
+          guardrail_blocked: bestMix.guardrail_blocked,
+        },
+      });
+    }
+  }
+
+  mixes.sort((a, b) => b.combined_score - a.combined_score);
+  const readyMixes = mixes.filter((mix) => !mix.guardrail_blocked).sort((a, b) => b.combined_score - a.combined_score);
+  const blockedMixes = mixes.filter((mix) => mix.guardrail_blocked).sort((a, b) => b.combined_score - a.combined_score);
+  const blockedPenaltyFactor = guardrailEngaged ? clamp01(0.45 + 0.4 * queuePressure) : 0.25;
+  const demotedBlockedMixes = blockedMixes
+    .map((mix) => {
+      const demotedScore = clamp01(mix.combined_score * (1 - blockedPenaltyFactor));
+      const guardrailEvidence = `guardrail_demoted=${blockedPenaltyFactor.toFixed(2)}`;
+      const evidence = mix.evidence.includes(guardrailEvidence)
+        ? mix.evidence
+        : [...mix.evidence, guardrailEvidence];
+      return {
+        ...mix,
+        combined_score: demotedScore,
+        evidence,
+        guardrail_blocked: false,
+        guardrail_state: "demoted_allowed",
+      };
+    })
+    .sort((a, b) => b.combined_score - a.combined_score);
+
+  let prioritizedMixes: AdjacentPossibleMixDecision[] = [];
+  if (readyMixes.length > 0) {
+    prioritizedMixes = [...readyMixes];
+    if (guardrails.allowBlockedFallback && demotedBlockedMixes.length > 0) {
+      prioritizedMixes = [...prioritizedMixes, ...demotedBlockedMixes];
+    }
+  } else if (guardrails.allowBlockedFallback && demotedBlockedMixes.length > 0) {
+    prioritizedMixes = demotedBlockedMixes;
+  }
+
+  if (guardrailEngaged && blockedMixes.length > 0) {
+    const demotedCount = guardrails.allowBlockedFallback ? demotedBlockedMixes.length : 0;
+    telemetry.push({
+      stage: "guardrail",
+      message: guardrails.allowBlockedFallback
+        ? "guardrail_demoted_blocked_candidates"
+        : "guardrail_blocked_candidates_dropped",
+      data: {
+        blocked: blockedMixes.length,
+        allowed: readyMixes.length,
+        demoted_allowed: demotedCount,
+        penaltyFactor: blockedPenaltyFactor,
+        allowBlockedFallback: Boolean(guardrails.allowBlockedFallback),
+        blockedOnly: readyMixes.length === 0,
+        guardrail_states: {
+          ready: readyMixes.length,
+          blocked: blockedMixes.length,
+          demoted_allowed: demotedCount,
+        },
+      },
+    });
+  }
+
+  const {
+    mixes: finalMixes,
+    uniqueGapCount,
+    candidateGapCount,
+    duplicatesDropped,
+  } = enforceMixGapDiversity(prioritizedMixes, 4);
+
+  if (duplicatesDropped > 0) {
+    telemetry.push({
+      stage: "mix",
+      message: "mix_gap_diversity_enforced",
+      data: {
+        requested: prioritizedMixes.length,
+        returned: finalMixes.length,
+        duplicates_dropped: duplicatesDropped,
+        unique_gap_count: uniqueGapCount,
+        unique_gap_available: candidateGapCount,
+      },
+    });
+  }
+
+  return {
+    mixes: finalMixes,
+    telemetry,
+    explorationWeight,
+    guardrailEngaged,
+  };
+}
+
+function enforceMixGapDiversity(
+  mixes: AdjacentPossibleMixDecision[],
+  limit: number,
+): {
+  mixes: AdjacentPossibleMixDecision[];
+  uniqueGapCount: number;
+  candidateGapCount: number;
+  duplicatesDropped: number;
+} {
+  if (limit <= 0 || mixes.length === 0) {
+    return {
+      mixes: [],
+      uniqueGapCount: 0,
+      candidateGapCount: 0,
+      duplicatesDropped: mixes.length,
+    };
+  }
+  const seenGaps = new Set<string>();
+  const uniqueFirst: AdjacentPossibleMixDecision[] = [];
+  const duplicates: AdjacentPossibleMixDecision[] = [];
+  for (const mix of mixes) {
+    const gapId = mix.gap_id;
+    if (!seenGaps.has(gapId)) {
+      seenGaps.add(gapId);
+      uniqueFirst.push(mix);
+    } else {
+      duplicates.push(mix);
+    }
+  }
+  const finalMixes = [...uniqueFirst, ...duplicates].slice(0, limit);
+  const finalUniqueCount = new Set(finalMixes.map((mix) => mix.gap_id)).size;
+  return {
+    mixes: finalMixes,
+    uniqueGapCount: finalUniqueCount,
+    candidateGapCount: seenGaps.size,
+    duplicatesDropped: Math.max(0, mixes.length - finalMixes.length),
+  };
+}
+
+function repairExploreBounds(
+  config: AdjacentPossibleExploreConfig,
+): { config: AdjacentPossibleExploreConfig; repairs: AdjacentPossibleExploreRepair[] } {
+  const repairs: AdjacentPossibleExploreRepair[] = [];
+  let minWeight = config.minWeight;
+  let maxWeight = config.maxWeight;
+  let baseWeight = config.baseWeight;
+
+  const sortedMin = Math.min(minWeight, maxWeight);
+  const sortedMax = Math.max(minWeight, maxWeight);
+  if (sortedMin !== minWeight) {
+    repairs.push({
+      field: "minWeight",
+      from: minWeight,
+      to: sortedMin,
+      reason: "sorted_bounds",
+    });
+    minWeight = sortedMin;
+  }
+  if (sortedMax !== maxWeight) {
+    repairs.push({
+      field: "maxWeight",
+      from: maxWeight,
+      to: sortedMax,
+      reason: "sorted_bounds",
+    });
+    maxWeight = sortedMax;
+  }
+  if (baseWeight < minWeight) {
+    repairs.push({
+      field: "baseWeight",
+      from: baseWeight,
+      to: minWeight,
+      reason: "raised_to_min",
+    });
+    baseWeight = minWeight;
+  } else if (baseWeight > maxWeight) {
+    repairs.push({
+      field: "baseWeight",
+      from: baseWeight,
+      to: maxWeight,
+      reason: "lowered_to_max",
+    });
+    baseWeight = maxWeight;
+  }
+
+  return {
+    config: {
+      ...config,
+      minWeight,
+      maxWeight,
+      baseWeight,
+    },
+    repairs,
+  };
+}
+
+function normalizeQueueTelemetry(value?: Partial<AdjacentPossibleQueueTelemetry>): AdjacentPossibleQueueTelemetry {
+  const source = normalizeQueueTelemetrySource(value?.source);
+  const warnings = Array.isArray(value?.warnings)
+    ? value!.warnings.map((entry) => asString(entry)).filter(Boolean)
+    : [];
+  return {
+    signal: clamp01(asNumber(value?.signal, 0)),
+    p95Ms: Math.max(0, asNumber(value?.p95Ms, 0)),
+    pending: Math.max(0, Math.floor(asNumber(value?.pending, 0))),
+    ...(source ? { source } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
+}
+
+function normalizeQueueTelemetrySource(
+  value: unknown,
+): AdjacentPossibleQueueTelemetrySource | undefined {
+  const normalized = asString(value).toLowerCase();
+  if (normalized === "schema" || normalized === "typed" || normalized === "metadata") {
+    return "schema";
+  }
+  if (normalized === "mixed") return "mixed";
+  if (normalized === "evidence" || normalized === "fallback" || normalized === "regex") {
+    return "evidence";
+  }
+  return undefined;
+}
+
+function parseQueueEvidenceNumber(
+  text: string,
+  patterns: string[],
+): { value: number; matched: boolean } {
+  for (const pattern of patterns) {
+    if (!pattern) continue;
+    const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`${escaped}\\s*[:=]?\\s*(-?\\d+(?:\\.\\d+)?)`, "i");
+    const match = text.match(regex);
+    if (!match) continue;
+    const value = Number(match[1]);
+    if (Number.isFinite(value)) {
+      return { value, matched: true };
+    }
+  }
+  return { value: 0, matched: false };
+}
+
+export function extractQueueTelemetryFromSignals(
+  topSignals: Snapshot["top_signals"],
+): AdjacentPossibleQueueTelemetry {
+  const signals = Array.isArray(topSignals) ? topSignals : [];
+  const queueSignals = signals.filter(
+    (signal) => asString(signal.type).toLowerCase() === "queue_health",
+  );
+  if (queueSignals.length === 0) {
+    return { signal: 0, p95Ms: 0, pending: 0 };
+  }
+  const queueSignal = clamp01(
+    Math.max(...queueSignals.map((signal) => asNumber(signal.value, 0))),
+  );
+  const warnings: string[] = [];
+  let typedUsed = false;
+  let fallbackUsed = false;
+  let typedP95: number | undefined;
+  let typedPending: number | undefined;
+  for (const signal of queueSignals) {
+    if (typedP95 === undefined) {
+      const value = pickQueueTelemetryNumber(queueTelemetryContainers(signal), QUEUE_P95_KEY_PATHS);
+      if (typeof value === "number") {
+        typedP95 = value;
+        typedUsed = true;
+      }
+    }
+    if (typedPending === undefined) {
+      const value = pickQueueTelemetryNumber(
+        queueTelemetryContainers(signal),
+        QUEUE_PENDING_KEY_PATHS,
+      );
+      if (typeof value === "number") {
+        typedPending = value;
+        typedUsed = true;
+      }
+    }
+    if (typedP95 !== undefined && typedPending !== undefined) break;
+  }
+
+  const evidenceText = queueSignals.map((signal) => asString(signal.evidence)).join(" ");
+  const p95Evidence = parseQueueEvidenceNumber(evidenceText, [
+    "queue_p95_ms",
+    "queue_p95",
+    "slo.requests.queueWaitMs.p95",
+    "queue.p95",
+  ]);
+  const pendingEvidence = parseQueueEvidenceNumber(evidenceText, [
+    "queue_pending",
+    "queues.requests.pending",
+    "queue_depth",
+    "queue_backlog",
+    "queue.wait.pending",
+  ]);
+
+  let p95Ms: number;
+  if (typedP95 !== undefined) {
+    p95Ms = typedP95;
+  } else if (p95Evidence.matched) {
+    fallbackUsed = true;
+    warnings.push("queue_p95_ms parsed from evidence");
+    p95Ms = p95Evidence.value;
+  } else {
+    p95Ms = 0;
+  }
+
+  let pending: number;
+  if (typedPending !== undefined) {
+    pending = typedPending;
+  } else if (pendingEvidence.matched) {
+    fallbackUsed = true;
+    warnings.push("queue_pending parsed from evidence");
+    pending = pendingEvidence.value;
+  } else {
+    pending = 0;
+  }
+
+  let source: AdjacentPossibleQueueTelemetrySource | undefined;
+  if (typedUsed && fallbackUsed) {
+    source = "mixed";
+  } else if (typedUsed) {
+    source = "schema";
+  } else if (fallbackUsed) {
+    source = "evidence";
+  }
+
+  return {
+    signal: queueSignal,
+    p95Ms,
+    pending,
+    ...(source ? { source } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
+}
+
+const QUEUE_P95_KEY_PATHS = [
+  "queue_p95_ms",
+  "queue_p95",
+  "queueP95Ms",
+  "queueP95",
+  "queue.p95_ms",
+  "queue.p95Ms",
+  "slo.requests.queueWaitMs.p95",
+  "queueWaitMs.p95",
+];
+
+const QUEUE_PENDING_KEY_PATHS = [
+  "queue_pending",
+  "queuePending",
+  "pending",
+  "pending_requests",
+  "requests_pending",
+  "queues.requests.pending",
+  "queue.pending",
+  "queues_pending",
+];
+
+function queueTelemetryContainers(signal: Snapshot["top_signals"][number]): Array<Record<string, unknown>> {
+  const baseRecord = asObject(signal as Record<string, unknown>);
+  const metadata = asObject((signal as Record<string, unknown> & { metadata?: unknown }).metadata);
+  const containers: Array<Record<string, unknown>> = [
+    baseRecord,
+    metadata,
+    asObject((baseRecord as Record<string, unknown> & { metrics?: unknown }).metrics),
+    asObject((baseRecord as Record<string, unknown> & { details?: unknown }).details),
+    asObject((baseRecord as Record<string, unknown> & { queue?: unknown }).queue),
+    asObject((metadata as Record<string, unknown> & { queue?: unknown }).queue),
+    asObject((metadata as Record<string, unknown> & { queue_stats?: unknown }).queue_stats),
+    asObject((metadata as Record<string, unknown> & { queueStats?: unknown }).queueStats),
+    asObject((metadata as Record<string, unknown> & { metrics?: unknown }).metrics),
+    asObject((metadata as Record<string, unknown> & { details?: unknown }).details),
+  ];
+  return containers;
+}
+
+function pickQueueTelemetryNumber(
+  containers: Array<Record<string, unknown>>,
+  keyPaths: string[],
+): number | undefined {
+  for (const path of keyPaths) {
+    const segments = path.split(".");
+    for (const container of containers) {
+      const value = getNestedQueueTelemetryValue(container, segments);
+      if (value === undefined) continue;
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) return numeric;
+    }
+  }
+  return undefined;
+}
+
+function getNestedQueueTelemetryValue(
+  container: Record<string, unknown>,
+  segments: string[],
+): unknown {
+  let current: unknown = container;
+  for (const segment of segments) {
+    const obj = asObject(current);
+    if (!(segment in obj)) return undefined;
+    current = obj[segment];
+  }
+  return current;
 }
 
 type EngineIdeaInputSnapshot = Pick<
@@ -1810,7 +2543,7 @@ export function buildEngineInspirationContext(params: {
   }).sort((a, b) => b.weight - a.weight);
 
   const failureSignal = maxSignalScore(params.snapshot, ["test_failure", "lint_failure", "typecheck_failure"]);
-  const queueSignal = maxSignalScore(params.snapshot, ["queue_health"]);
+  const queueSignalFallback = maxSignalScore(params.snapshot, ["queue_health"]);
   const regretSignal = maxSignalScore(params.snapshot, ["regret_signal"]);
   const reliabilityTrait = maxTraitScore(
     params.snapshot,
@@ -1834,6 +2567,15 @@ export function buildEngineInspirationContext(params: {
   );
   const openObjectivePressure = clamp01(params.snapshot.open_objectives.length / 10);
   const dispatchSaturation = clamp01(params.snapshot.dispatch_budget.global_count_last_hour / 10);
+  const queueTelemetryRaw = extractQueueTelemetryFromSignals(params.snapshot.top_signals);
+  const queueTelemetry: AdjacentPossibleQueueTelemetry = {
+    ...queueTelemetryRaw,
+    signal:
+      queueTelemetryRaw.signal > 0
+        ? queueTelemetryRaw.signal
+        : queueSignalFallback,
+  };
+  const queueSignal = queueTelemetry.signal;
 
   const opportunityGaps: EngineOpportunityGap[] = [
     {
@@ -1891,6 +2633,9 @@ export function buildEngineInspirationContext(params: {
   const objectiveWeightById = new Map(compiledObjectives.map((entry) => [entry.id, entry.weight]));
   const gapScoreById = new Map(opportunityGaps.map((entry) => [entry.id, entry.score]));
   const dispatchByType = params.snapshot.dispatch_budget.by_type_count_last_hour ?? {};
+  const commitHistoryHints = Array.isArray(params.commitHistoryHints)
+    ? params.commitHistoryHints.slice(0, 10)
+    : [];
 
   const staticBuildingBlocks: EngineIdeaBuildingBlock[] = ENGINE_IDEA_BLUEPRINTS.map((blueprint) => {
     const objectiveWeights = blueprint.objective_ids
@@ -1924,6 +2669,40 @@ export function buildEngineInspirationContext(params: {
     };
   });
 
+  const adjacentGuardrailPendingLimit =
+    120 + Math.max(0, Math.floor(asNumber(params.snapshot.dispatch_budget.global_count_last_hour, 0) * 5));
+  const adjacentPossibleContext = adjacent_possible({
+    motifs: commitHistoryHints,
+    opportunityGaps,
+    queueTelemetry,
+    guardrails: {
+      maxQueueSignal: 0.85,
+      maxQueueP95Ms: 210_000,
+      maxPending: adjacentGuardrailPendingLimit,
+    },
+    exploration: {
+      baseWeight: clamp01(0.3 + 0.2 * (1 - dispatchSaturation)),
+      minWeight: 0.16,
+      maxWeight: 0.62,
+      guardrailPenalty: 0.22,
+      reliefBoost: 0.1,
+    },
+  });
+  const adjacentBlock = staticBuildingBlocks.find((block) => block.algorithm === "adjacent_possible");
+  if (adjacentBlock) {
+    const topMixScore = adjacentPossibleContext.mixes[0]?.combined_score ?? 0;
+    const mixEvidence = adjacentPossibleContext.mixes
+      .slice(0, 3)
+      .map((mix) => `mix=${mix.motif_id}->${mix.gap_id}:${mix.combined_score.toFixed(2)}`);
+    adjacentBlock.score = clamp01(adjacentBlock.score * 0.7 + 0.3 * topMixScore);
+    adjacentBlock.evidence = [
+      ...adjacentBlock.evidence,
+      `explore_weight=${adjacentPossibleContext.explorationWeight.toFixed(2)}`,
+      adjacentPossibleContext.guardrailEngaged ? "queue_guardrail=engaged" : "queue_guardrail=clear",
+      ...mixEvidence,
+    ];
+  }
+
   const normalizedPatterns = (Array.isArray(params.inspirationPatterns) ? params.inspirationPatterns : [])
     .map((entry) => normalizeInspirationPattern(entry))
     .filter((entry): entry is InspirationPatternInput => Boolean(entry));
@@ -1953,9 +2732,6 @@ export function buildEngineInspirationContext(params: {
     dispatchByType,
     dispatchSaturation,
   });
-  const commitHistoryHints = Array.isArray(params.commitHistoryHints)
-    ? params.commitHistoryHints.slice(0, 10)
-    : [];
   const historyBlocks = buildCommitHistoryBlocks({
     hints: commitHistoryHints,
     compiledObjectives,
@@ -1982,6 +2758,7 @@ export function buildEngineInspirationContext(params: {
     building_blocks: buildingBlocks,
     source_patterns: sourcePatterns,
     commit_history_hints: commitHistoryHints,
+    adjacent_possible: adjacentPossibleContext,
   };
 }
 
