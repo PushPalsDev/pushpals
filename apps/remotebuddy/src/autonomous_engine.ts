@@ -800,6 +800,75 @@ export interface EngineInspirationContext {
   commit_history_hints: EngineCommitHistoryHint[];
 }
 
+type SystemStatusSnapshot = {
+  workers?: {
+    total?: number;
+    online?: number;
+    busy?: number;
+    idle?: number;
+  };
+  queues?: {
+    requests?: Record<string, number>;
+    jobs?: Record<string, number>;
+  };
+  slo?: {
+    requests?: {
+      queueWaitMs?: { p95?: number | null };
+    };
+  };
+};
+
+type AdjacentPossibleConfig = {
+  queueSlackMin: number;
+  queueSlackCapacity: number;
+  idleWorkersMin: number;
+  successThreshold: number;
+  minSampleCount: number;
+  priorMaxAgeMs: number;
+  maxGraphNodes: number;
+  maxSeeds: number;
+};
+
+type AdjacentPossibleGateMetrics = {
+  ok: boolean;
+  reason: string;
+  queuePending: number;
+  requestsPending: number;
+  jobPending: number;
+  jobClaimed: number;
+  jobBacklog: number;
+  queueSlack: number;
+  queueSlackRequired: number;
+  queueSlackCapacity: number;
+  idleWorkers: number;
+  idleRequired: number;
+  queueLatencyP95: number | null;
+  statusFailureReason: string | null;
+};
+
+type AdjacentPossibleNode = {
+  id: string;
+  block: EngineIdeaBuildingBlock;
+  success: number;
+  regret: number;
+  sampleCount: number;
+};
+
+type AdjacentPossibleEdge = {
+  from: string;
+  to: string;
+  weight: number;
+  sharedObjectives: number;
+  sharedGaps: number;
+  sharedComponent: boolean;
+  sharedTrigger: boolean;
+};
+
+type AdjacentPossibleGraph = {
+  nodes: AdjacentPossibleNode[];
+  edges: AdjacentPossibleEdge[];
+};
+
 type EngineIdeaInputSnapshot = Pick<
   Snapshot,
   "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget"
@@ -2393,6 +2462,384 @@ export function buildEngineInspirationContext(params: {
   };
 }
 
+function intersectionCount(values: string[], compare: string[]): number {
+  if (values.length === 0 || compare.length === 0) return 0;
+  const normalizedLeft = new Set(values.map((value) => asString(value)).filter(Boolean));
+  const normalizedRight = new Set(compare.map((value) => asString(value)).filter(Boolean));
+  if (normalizedLeft.size === 0 || normalizedRight.size === 0) return 0;
+  let matches = 0;
+  for (const value of normalizedLeft) {
+    if (normalizedRight.has(value)) {
+      matches += 1;
+    }
+  }
+  return matches;
+}
+
+function dedupeStrings(values: string[], maxCount: number): string[] {
+  if (maxCount <= 0) return [];
+  return Array.from(
+    new Set(values.map((value) => asString(value)).filter((value) => value.length > 0)),
+  ).slice(0, maxCount);
+}
+
+function deterministicAdjacentCandidateId(pairKey: string, seedSalt?: string): string {
+  const hash = createHash("sha256");
+  hash.update(pairKey);
+  if (seedSalt) {
+    hash.update("::");
+    hash.update(seedSalt);
+  }
+  return `cand_adjacent_${hash.digest("hex").slice(0, 12)}`;
+}
+
+function objectiveTypeToEffort(objectiveType: AutonomyObjectiveType): "small" | "medium" | "large" {
+  switch (objectiveType) {
+    case "feature_large":
+      return "large";
+    case "feature_medium":
+      return "medium";
+    case "feature_small":
+    case "small_refactor":
+    case "lint_fix":
+    case "type_fix":
+    case "flaky_test":
+    case "docs":
+    case "dep_bump":
+      return "small";
+    default:
+      return "small";
+  }
+}
+
+export function buildAdjacentPossibleGraph(params: {
+  buildingBlocks: EngineIdeaBuildingBlock[];
+  ideaPriors?: Snapshot["engine_idea_priors"];
+  successThreshold: number;
+  minSampleCount: number;
+  maxPriorAgeMs: number;
+  maxNodes: number;
+  nowMs?: number;
+}): AdjacentPossibleGraph {
+  const referenceNowMs = Number.isFinite(params.nowMs) ? Number(params.nowMs) : Date.now();
+  const maxAgeMs = Math.max(60 * 60 * 1000, Math.floor(params.maxPriorAgeMs));
+  const priorRows = Array.isArray(params.ideaPriors) ? params.ideaPriors : [];
+  const priorById = new Map<
+    string,
+    { success: number; regret: number; sampleCount: number; updatedAtMs: number }
+  >();
+  for (const prior of priorRows) {
+    const id = asString(prior.engine_building_block_id);
+    if (!id) continue;
+    const updatedAtText = asString(prior.updated_at);
+    const updatedAtMs = updatedAtText ? Date.parse(updatedAtText) : Number.NaN;
+    if (!Number.isFinite(updatedAtMs)) continue;
+    const stats = {
+      success: clamp01(asNumber(prior.ema_success, 0)),
+      regret: clamp01(asNumber(prior.ema_regret, 0)),
+      sampleCount: Math.max(0, Math.floor(asNumber(prior.sample_count, 0))),
+      updatedAtMs,
+    };
+    const existing = priorById.get(id);
+    if (!existing || updatedAtMs > existing.updatedAtMs) {
+      priorById.set(id, stats);
+      continue;
+    }
+    if (updatedAtMs === existing.updatedAtMs) {
+      if (
+        stats.sampleCount > existing.sampleCount ||
+        (stats.sampleCount === existing.sampleCount && stats.success > existing.success) ||
+        (stats.sampleCount === existing.sampleCount &&
+          stats.success === existing.success &&
+          stats.regret < existing.regret)
+      ) {
+        priorById.set(id, stats);
+      }
+    }
+  }
+  const nodes = params.buildingBlocks
+    // Graph nodes only represent recent, successful motifs to keep fusions inside proven adjacent possibilities.
+    .map<AdjacentPossibleNode | null>((block) => {
+      const stats = priorById.get(block.id);
+      if (!stats) return null;
+      if (stats.sampleCount < params.minSampleCount) return null;
+      if (stats.success < params.successThreshold) return null;
+      const ageMs = referenceNowMs - stats.updatedAtMs;
+      if (ageMs > maxAgeMs) return null;
+      return {
+        id: block.id,
+        block,
+        success: stats.success,
+        regret: stats.regret,
+        sampleCount: stats.sampleCount,
+      };
+    })
+    .filter((entry): entry is AdjacentPossibleNode => Boolean(entry))
+    .sort((a, b) => {
+      if (b.success !== a.success) return b.success - a.success;
+      if (b.sampleCount !== a.sampleCount) return b.sampleCount - a.sampleCount;
+      return a.id.localeCompare(b.id);
+    })
+    .slice(0, Math.max(0, params.maxNodes));
+  const edges: AdjacentPossibleEdge[] = [];
+  for (let i = 0; i < nodes.length; i += 1) {
+    for (let j = i + 1; j < nodes.length; j += 1) {
+      const a = nodes[i];
+      const b = nodes[j];
+      const sharedObjectives = intersectionCount(a.block.objective_ids, b.block.objective_ids);
+      const sharedGaps = intersectionCount(a.block.gap_ids, b.block.gap_ids);
+      const sharedComponent =
+        a.block.candidate_shape.component_area === b.block.candidate_shape.component_area;
+      const sharedTrigger =
+        a.block.candidate_shape.trigger_type === b.block.candidate_shape.trigger_type;
+      const novelty = clamp01(1 - (a.regret + b.regret) / 2);
+      const weight = clamp01(
+        0.32 * (sharedObjectives > 0 ? 1 : 0) +
+          0.24 * (sharedGaps > 0 ? 1 : 0) +
+          0.18 * (sharedComponent ? 1 : 0) +
+          0.1 * (sharedTrigger ? 1 : 0) +
+          0.16 * novelty,
+      );
+      if (weight <= 0.25) continue;
+      edges.push({
+        from: a.id,
+        to: b.id,
+        weight,
+        sharedObjectives,
+        sharedGaps,
+        sharedComponent,
+        sharedTrigger,
+      });
+    }
+  }
+  const maxEdges = Math.max(0, Math.min(12, params.maxNodes * 2));
+  edges.sort((a, b) => {
+    if (b.weight !== a.weight) return b.weight - a.weight;
+    return `${a.from}:${a.to}`.localeCompare(`${b.from}:${b.to}`);
+  });
+  return { nodes, edges: edges.slice(0, maxEdges) };
+}
+
+export function buildAdjacentPossibleCandidates(params: {
+  graph: AdjacentPossibleGraph;
+  topSignals: EngineIdeaInputSnapshot["top_signals"];
+  visionSectionRefs: string[];
+  maxCandidates: number;
+  seedSalt?: string;
+}): Array<Record<string, unknown>> {
+  const maxCandidates = Math.max(0, Math.floor(params.maxCandidates));
+  if (maxCandidates <= 0) return [];
+  if (params.graph.nodes.length === 0 || params.graph.edges.length === 0) return [];
+  const nodesById = new Map(params.graph.nodes.map((node) => [node.id, node]));
+  const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
+  const seeds: Array<Record<string, unknown>> = [];
+  const seenPairs = new Set<string>();
+  for (const edge of params.graph.edges) {
+    const a = nodesById.get(edge.from);
+    const b = nodesById.get(edge.to);
+    if (!a || !b) continue;
+    const pairKey = [a.id, b.id].sort().join("::");
+    if (seenPairs.has(pairKey)) continue;
+    seenPairs.add(pairKey);
+    const base = a.success >= b.success ? a : b;
+    const partner = base === a ? b : a;
+    const shape = base.block.candidate_shape;
+    const signalIds = pickSignalIdsForTrigger(params.topSignals, shape.trigger_type);
+    const combinedObjectives = [...new Set([...base.block.objective_ids, ...partner.block.objective_ids])].slice(
+      0,
+      4,
+    );
+    const combinedGaps = [...new Set([...base.block.gap_ids, ...partner.block.gap_ids])].slice(0, 4);
+    const confidence = clamp01(
+      0.55 + 0.25 * ((base.success + partner.success) / 2) - 0.15 * ((base.regret + partner.regret) / 2),
+    );
+    const partnerArea = partner.block.candidate_shape.component_area;
+    const candidateId = deterministicAdjacentCandidateId(pairKey, params.seedSalt);
+    const partnerShape = partner.block.candidate_shape;
+    const fusedTargetPaths = dedupeStrings([...shape.target_paths, ...partnerShape.target_paths], 6);
+    const fusedWriteGlobs = dedupeStrings([...shape.write_globs, ...partnerShape.write_globs], 6);
+    const fusedValidation = dedupeStrings(
+      [...shape.expected_validation, ...partnerShape.expected_validation],
+      5,
+    );
+    const scopeCheck = validateScopeInvariants(
+      shape.component_area,
+      fusedTargetPaths.length > 0 ? fusedTargetPaths : shape.target_paths,
+      fusedWriteGlobs.length > 0 ? fusedWriteGlobs : shape.write_globs,
+      { requireWriteGlobs: true },
+    );
+    const normalizedTargetPaths = scopeCheck.ok ? scopeCheck.normalizedTargetPaths : shape.target_paths;
+    const normalizedWriteGlobs = scopeCheck.ok ? scopeCheck.normalizedWriteGlobs : shape.write_globs;
+    const hypotheses = [
+      `${base.block.algorithm} success ${(base.success * 100).toFixed(0)}% enables safe expansion.`,
+      `${partner.block.algorithm} covers ${partnerArea}; link it with ${shape.component_area}.`,
+      `Shared motifs obj=${edge.sharedObjectives} gap=${edge.sharedGaps} weight=${edge.weight.toFixed(2)}.`,
+    ];
+    seeds.push({
+      id: candidateId,
+      title: `Adjacent fusion: ${base.block.algorithm} + ${partner.block.algorithm}`,
+      objective_type: shape.objective_type,
+      problem_statement:
+        `Fuse ${base.block.algorithm} improvements in ${shape.component_area} with ${partner.block.algorithm} guardrails ` +
+        `to unlock adjacent delivery wins for ${combinedObjectives[0] ?? "vision priorities"}. Focus on telemetry ` +
+        `linking ${shape.component_area} and ${partnerArea}.`,
+      trigger_type: shape.trigger_type,
+      component_area: shape.component_area,
+      target_paths: [...normalizedTargetPaths],
+      scope: {
+        read_anywhere: false,
+        write_globs: [...normalizedWriteGlobs],
+      },
+      risk_level: shape.risk_level,
+      expected_validation: fusedValidation.length > 0 ? [...fusedValidation] : [...shape.expected_validation],
+      estimated_effort: objectiveTypeToEffort(shape.objective_type),
+      why_now_signal_ids: signalIds,
+      confidence,
+      vision_alignment_reason:
+        `Adjacent-possible fusion for ${combinedObjectives.join(", ") || "vision priorities"} leveraging motifs with high acceptance.`,
+      vision_section_refs: sectionRefs,
+      feature_hypotheses: hypotheses.slice(0, 3),
+      engine_trial: {
+        building_block_id: `adjacent_possible:${pairKey}`,
+        algorithm: "adjacent_possible_fusion",
+        source: "engine_mapped",
+        score: Number(edge.weight.toFixed(3)),
+        objective_ids: combinedObjectives,
+        gap_ids: combinedGaps,
+        summary: `Combine ${base.block.algorithm} + ${partner.block.algorithm}`,
+        hypothesis:
+          `Recombine two high-performing motifs to explore adjacent improvements without leaving proven guardrails.`,
+      },
+    } as Record<string, unknown>);
+    if (seeds.length >= maxCandidates) break;
+  }
+  return seeds;
+}
+
+export function evaluateAdjacentPossibleGate(
+  status: SystemStatusSnapshot | null,
+  cfg: AdjacentPossibleConfig,
+  options?: { statusFailureReason?: string },
+): AdjacentPossibleGateMetrics {
+  const failureReason = options?.statusFailureReason ?? null;
+  if (!status) {
+    return {
+      ok: false,
+      reason: failureReason ? `status_unavailable:${failureReason}` : "status_unavailable",
+      queuePending: 0,
+      requestsPending: 0,
+      jobPending: 0,
+      jobClaimed: 0,
+      jobBacklog: 0,
+      queueSlack: 0,
+      queueSlackRequired: cfg.queueSlackMin,
+      queueSlackCapacity: cfg.queueSlackCapacity,
+      idleWorkers: 0,
+      idleRequired: cfg.idleWorkersMin,
+      queueLatencyP95: null,
+      statusFailureReason: failureReason,
+    };
+  }
+  const requestCounts = asObject(status.queues?.requests);
+  const requestsPending = Math.max(0, Math.floor(asNumber(requestCounts.pending, 0)));
+  const jobCounts = asObject(status.queues?.jobs);
+  const jobPending = Math.max(0, Math.floor(asNumber(jobCounts.pending, 0)));
+  const jobClaimed = Math.max(0, Math.floor(asNumber(jobCounts.claimed, 0)));
+  const jobBacklog = Math.max(0, jobPending + jobClaimed);
+  const queuePending = Math.max(0, requestsPending + jobBacklog);
+  const queueSlack = Math.max(0, cfg.queueSlackCapacity - queuePending);
+  const queueOk = queueSlack > cfg.queueSlackMin;
+  const idleWorkers = Math.max(0, Math.floor(asNumber(status.workers?.idle, 0)));
+  const idleOk = idleWorkers > cfg.idleWorkersMin;
+  const queueLatencyP95Raw = asNumber(status.slo?.requests?.queueWaitMs?.p95, Number.NaN);
+  const queueLatencyP95 = Number.isFinite(queueLatencyP95Raw) ? queueLatencyP95Raw : null;
+  return {
+    ok: queueOk && idleOk,
+    reason: queueOk ? (idleOk ? "ok" : "idle_capacity_low") : "queue_slack_low",
+    queuePending,
+    requestsPending,
+    jobPending,
+    jobClaimed,
+    jobBacklog,
+    queueSlack,
+    queueSlackRequired: cfg.queueSlackMin,
+    queueSlackCapacity: cfg.queueSlackCapacity,
+    idleWorkers,
+    idleRequired: cfg.idleWorkersMin,
+    queueLatencyP95,
+    statusFailureReason: failureReason,
+  };
+}
+
+export function buildAdjacentPossibleTelemetry(
+  runId: string,
+  metrics: AdjacentPossibleGateMetrics,
+  seededCount: number,
+  note?: string,
+): {
+  statusText: string;
+  logLine: string;
+  telemetry: {
+    runId: string;
+    status: string;
+    reason: string;
+    seededCount: number;
+    note: string | null;
+    queuePending: number;
+    requestsPending: number;
+    jobPending: number;
+    jobClaimed: number;
+    jobBacklog: number;
+    queueSlack: number;
+    queueSlackRequired: number;
+    queueSlackCapacity: number;
+    idleWorkers: number;
+    idleRequired: number;
+    queueLatencyP95: number | null;
+    statusFailureReason: string | null;
+  };
+} {
+  const queueP95Text =
+    metrics.queueLatencyP95 != null && Number.isFinite(metrics.queueLatencyP95)
+      ? metrics.queueLatencyP95.toFixed(0)
+      : "n/a";
+  const statusText = metrics.ok
+    ? seededCount > 0
+      ? "seeded"
+      : note ?? "skipped"
+    : metrics.reason;
+  const logLine =
+    `[RemoteBuddyAutonomousEngine] tick ${runId}: adjacent_possible status=${statusText} seeds=${seededCount} ` +
+    `queue_pending=${metrics.queuePending} requests_pending=${metrics.requestsPending} ` +
+    `job_backlog=${metrics.jobBacklog} queue_slack=${metrics.queueSlack}/${metrics.queueSlackRequired} ` +
+    `capacity=${metrics.queueSlackCapacity} idle_workers=${metrics.idleWorkers}/${metrics.idleRequired} ` +
+    `job_pending=${metrics.jobPending} job_claimed=${metrics.jobClaimed} queue_p95=${queueP95Text} ` +
+    `status_reason=${metrics.statusFailureReason ?? "n/a"}`;
+  return {
+    statusText,
+    logLine,
+    telemetry: {
+      runId,
+      status: statusText,
+      reason: metrics.reason,
+      seededCount,
+      note: note ?? null,
+      queuePending: metrics.queuePending,
+      requestsPending: metrics.requestsPending,
+      jobPending: metrics.jobPending,
+      jobClaimed: metrics.jobClaimed,
+      jobBacklog: metrics.jobBacklog,
+      queueSlack: metrics.queueSlack,
+      queueSlackRequired: metrics.queueSlackRequired,
+      queueSlackCapacity: metrics.queueSlackCapacity,
+      idleWorkers: metrics.idleWorkers,
+      idleRequired: metrics.idleRequired,
+      queueLatencyP95: metrics.queueLatencyP95,
+      statusFailureReason: metrics.statusFailureReason,
+    },
+  };
+}
+
 function selectVisionSectionRefs(sectionRefs: string[]): string[] {
   const preferred = ["6", "7", "8", "4", "3", "0", "5"];
   const normalized = sectionRefs.map((value) => asString(value)).filter(Boolean);
@@ -3025,6 +3472,38 @@ export class RemoteBuddyAutonomousEngine {
     return [...trusted, ...archived];
   }
 
+  private async fetchSystemStatus(): Promise<{ status: SystemStatusSnapshot | null; failureReason?: string }> {
+    const fail = (reason: string, detail: string) => {
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] system/status fetch failed reason=${reason} detail=${detail}`,
+      );
+      return { status: null, failureReason: reason };
+    };
+    try {
+      const res = await fetch(`${this.server}/system/status`, {
+        method: "GET",
+        headers: this.headers(),
+      });
+      if (!res.ok) {
+        return fail(`http_${res.status}`, `http_status=${res.status}`);
+      }
+      let data: (SystemStatusSnapshot & { ok?: boolean }) | null = null;
+      try {
+        data = (await res.json()) as (SystemStatusSnapshot & { ok?: boolean }) | null;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return fail("parse_error", detail || "json_parse_failed");
+      }
+      if (!data) return fail("empty_payload", "response_empty");
+      if (data.ok === false) return fail("ok_false", "payload_ok_false");
+      return { status: data, failureReason: undefined };
+    } catch (error) {
+      const reason = error instanceof Error ? `error_${error.name ?? "unknown"}` : "error_unknown";
+      const detail = error instanceof Error ? error.message : String(error);
+      return fail(reason, detail || "system_status_fetch_failed");
+    }
+  }
+
   private buildAutoInspirationEntries(commitHistoryHints: EngineCommitHistoryHint[]): Array<Record<string, unknown>> {
     const staticEntries = AUTO_INGEST_SEED_PATTERNS.map((seed) => ({
       source_type: "internal_doc",
@@ -3119,6 +3598,74 @@ export class RemoteBuddyAutonomousEngine {
       .map((line) => asString(line))
       .filter(Boolean);
     return summarizeCommitHistoryHints(subjects).slice(0, 8);
+  }
+
+  private adjacentPossibleConfig(): AdjacentPossibleConfig {
+    const raw = this.cfg as Record<string, unknown>;
+    const queueSlackMin = Math.max(
+      0,
+      Math.floor(asNumber(raw.adjacentPossibleQueueSlackMin ?? raw.adjacent_possible_queue_slack_min, 4)),
+    );
+    const capacityFallback = Math.max(
+      queueSlackMin + 1,
+      Math.floor(asNumber(this.cfg.alertQueuePendingThreshold, 20)),
+    );
+    const queueSlackCapacity = Math.max(
+      queueSlackMin + 1,
+      Math.floor(
+        asNumber(raw.adjacentPossibleQueueCapacity ?? raw.adjacent_possible_queue_capacity, capacityFallback),
+      ),
+    );
+    const idleWorkersMin = Math.max(
+      1,
+      Math.floor(asNumber(raw.adjacentPossibleIdleWorkersMin ?? raw.adjacent_possible_idle_workers_min, 2)),
+    );
+    const successThreshold = clamp01(
+      asNumber(raw.adjacentPossibleSuccessThreshold ?? raw.adjacent_possible_success_threshold, 0.6),
+    );
+    const minSampleCount = Math.max(
+      1,
+      Math.floor(asNumber(raw.adjacentPossibleMinSampleCount ?? raw.adjacent_possible_min_sample_count, 1)),
+    );
+    const priorMaxAgeDays = Math.max(
+      1,
+      Math.floor(
+        asNumber(raw.adjacentPossiblePriorMaxAgeDays ?? raw.adjacent_possible_prior_max_age_days, 14),
+      ),
+    );
+    const priorMaxAgeMs = priorMaxAgeDays * 24 * 60 * 60 * 1000;
+    const maxGraphNodes = Math.max(
+      2,
+      Math.min(
+        10,
+        Math.floor(asNumber(raw.adjacentPossibleMaxGraphNodes ?? raw.adjacent_possible_max_graph_nodes, 6)),
+      ),
+    );
+    const maxSeeds = Math.max(
+      0,
+      Math.min(3, Math.floor(asNumber(raw.adjacentPossibleMaxSeeds ?? raw.adjacent_possible_max_seeds, 2))),
+    );
+    return {
+      queueSlackMin,
+      queueSlackCapacity,
+      idleWorkersMin,
+      successThreshold,
+      minSampleCount,
+      priorMaxAgeMs,
+      maxGraphNodes,
+      maxSeeds,
+    };
+  }
+
+  private logAdjacentPossibleDecision(
+    runId: string,
+    metrics: AdjacentPossibleGateMetrics,
+    seededCount: number,
+    note?: string,
+  ): void {
+    const { logLine, telemetry } = buildAdjacentPossibleTelemetry(runId, metrics, seededCount, note);
+    console.log(logLine);
+    void this.comm.emit("autonomy_adjacent_possible_decision", telemetry);
   }
 
   private async postObjective(payload: Record<string, unknown>): Promise<boolean> {
@@ -3613,6 +4160,42 @@ export class RemoteBuddyAutonomousEngine {
         sourceInsights,
         commitHistoryHints,
       });
+      this.setPhase("collect_system_status");
+      const { status: systemStatus, failureReason: systemStatusFailureReason } = await this.fetchSystemStatus();
+      const adjacentConfig = this.adjacentPossibleConfig();
+      const adjacentGraph = buildAdjacentPossibleGraph({
+        buildingBlocks: engineInspiration.building_blocks,
+        ideaPriors: snapshot.engine_idea_priors ?? [],
+        successThreshold: adjacentConfig.successThreshold,
+        minSampleCount: adjacentConfig.minSampleCount,
+        maxPriorAgeMs: adjacentConfig.priorMaxAgeMs,
+        maxNodes: adjacentConfig.maxGraphNodes,
+      });
+      const adjacentCandidates = buildAdjacentPossibleCandidates({
+        graph: adjacentGraph,
+        topSignals: snapshot.top_signals,
+        visionSectionRefs: visionContext.section_numbers,
+        maxCandidates: adjacentConfig.maxSeeds,
+        seedSalt: runId,
+      });
+      const adjacentGating = evaluateAdjacentPossibleGate(systemStatus, adjacentConfig, {
+        statusFailureReason: systemStatusFailureReason,
+      });
+      const shouldSeedAdjacent =
+        adjacentConfig.maxSeeds > 0 && adjacentGating.ok && adjacentCandidates.length > 0;
+      const gatingNote =
+        adjacentGating.ok && adjacentConfig.maxSeeds <= 0
+          ? "disabled"
+          : adjacentGating.ok && adjacentCandidates.length === 0
+            ? "graph_empty"
+            : undefined;
+      const adjacentSeedPayloads = shouldSeedAdjacent ? adjacentCandidates : [];
+      this.logAdjacentPossibleDecision(
+        runId,
+        adjacentGating,
+        adjacentSeedPayloads.length,
+        adjacentSeedPayloads.length === 0 ? gatingNote : undefined,
+      );
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
 
@@ -3802,6 +4385,9 @@ export class RemoteBuddyAutonomousEngine {
         }
       };
       ingestRawCandidates(rawCandidates, "llm");
+      if (adjacentSeedPayloads.length > 0) {
+        ingestRawCandidates(adjacentSeedPayloads, "engine_fallback");
+      }
       if (normalizedCandidates.length === 0) {
         const synthesizedFallback = buildEngineFallbackCandidates({
           engineInspiration,
@@ -4400,4 +4986,322 @@ export class RemoteBuddyAutonomousEngine {
     }
     this.nextTickAtMs = 0;
   }
+}
+
+if (process.env.NODE_ENV === "test") {
+  void (async () => {
+    const { describe, expect, it } = await import("bun:test");
+
+    const baseShape: EngineCandidateShape = {
+      objective_type: "feature_small",
+      trigger_type: "queue_health",
+      component_area: "apps/remotebuddy",
+      target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+      write_globs: ["apps/remotebuddy/src/*"],
+      risk_level: "low",
+      expected_validation: ["bun run test:root"],
+    };
+
+    const buildBlock = (
+      id: string,
+      overrides?: Partial<EngineCandidateShape>,
+      metadata?: Partial<Pick<EngineIdeaBuildingBlock, "objective_ids" | "gap_ids">>,
+    ): EngineIdeaBuildingBlock => ({
+      id,
+      algorithm: id,
+      summary: `${id} summary`,
+      hypothesis: `${id} hypothesis`,
+      objective_ids: metadata?.objective_ids ?? ["workforce_scaling", "reliable_autonomous_delivery"],
+      gap_ids: metadata?.gap_ids ?? ["workforce_throughput_gap"],
+      score: 0.8,
+      evidence: [],
+      candidate_shape: {
+        ...baseShape,
+        ...(overrides ?? {}),
+      },
+    });
+
+    describe("buildAdjacentPossibleGraph", () => {
+      it("filters motifs by recency, success, and samples while preserving weighted edges", () => {
+        const now = Date.now();
+        const graph = buildAdjacentPossibleGraph({
+          buildingBlocks: [
+            buildBlock("motif_recent"),
+            buildBlock("motif_partner"),
+            buildBlock("motif_stale"),
+            buildBlock("motif_low"),
+          ],
+          ideaPriors: [
+            {
+              engine_building_block_id: "motif_recent",
+              ema_success: 0.78,
+              ema_regret: 0.18,
+              sample_count: 4,
+              updated_at: new Date(now - 15 * 60 * 1000).toISOString(),
+            },
+            {
+              engine_building_block_id: "motif_partner",
+              ema_success: 0.72,
+              ema_regret: 0.12,
+              sample_count: 3,
+              updated_at: new Date(now - 25 * 60 * 1000).toISOString(),
+            },
+            {
+              engine_building_block_id: "motif_stale",
+              ema_success: 0.9,
+              ema_regret: 0.1,
+              sample_count: 5,
+              updated_at: new Date(now - 4 * 60 * 60 * 1000).toISOString(),
+            },
+            {
+              engine_building_block_id: "motif_low",
+              ema_success: 0.42,
+              ema_regret: 0.09,
+              sample_count: 6,
+              updated_at: new Date(now - 10 * 60 * 1000).toISOString(),
+            },
+          ],
+          successThreshold: 0.6,
+          minSampleCount: 2,
+          maxPriorAgeMs: 2 * 60 * 60 * 1000,
+          maxNodes: 4,
+          nowMs: now,
+        });
+        expect(graph.nodes.map((node) => node.id)).toEqual(["motif_recent", "motif_partner"]);
+        expect(graph.edges).toHaveLength(1);
+        expect(graph.edges[0].weight).toBeGreaterThan(0.3);
+      });
+      it("prefers the newest prior per motif and deduplicates overlap counts", () => {
+        const now = Date.now();
+        const graph = buildAdjacentPossibleGraph({
+          buildingBlocks: [
+            buildBlock("motif_dup", undefined, {
+              objective_ids: ["obj_shared", "obj_shared", "obj_extra_a"],
+              gap_ids: ["gap_shared", "gap_shared"],
+            }),
+            buildBlock("motif_pair", undefined, {
+              objective_ids: ["obj_shared", "obj_extra_b"],
+              gap_ids: ["gap_shared", "gap_extra_b"],
+            }),
+          ],
+          ideaPriors: [
+            {
+              engine_building_block_id: "motif_dup",
+              ema_success: 0.75,
+              ema_regret: 0.1,
+              sample_count: 3,
+              updated_at: new Date(now - 60 * 1000).toISOString(),
+            },
+            {
+              engine_building_block_id: "motif_dup",
+              ema_success: 0.92,
+              ema_regret: 0.05,
+              sample_count: 6,
+              updated_at: new Date(now - 10 * 60 * 1000).toISOString(),
+            },
+            {
+              engine_building_block_id: "motif_pair",
+              ema_success: 0.71,
+              ema_regret: 0.12,
+              sample_count: 3,
+              updated_at: new Date(now - 45 * 1000).toISOString(),
+            },
+          ],
+          successThreshold: 0.6,
+          minSampleCount: 2,
+          maxPriorAgeMs: 2 * 60 * 60 * 1000,
+          maxNodes: 4,
+          nowMs: now,
+        });
+        expect(graph.nodes).toHaveLength(2);
+        const dupNode = graph.nodes.find((node) => node.id === "motif_dup");
+        expect(dupNode?.sampleCount).toBe(3);
+        expect(dupNode?.success).toBeCloseTo(0.75);
+        expect(graph.edges).toHaveLength(1);
+        expect(graph.edges[0].sharedObjectives).toBe(1);
+        expect(graph.edges[0].sharedGaps).toBe(1);
+      });
+    });
+
+    describe("buildAdjacentPossibleCandidates", () => {
+      it("recombines successful motifs into objective seeds", () => {
+        const blockA = buildBlock("motif_seed_a");
+        const blockB = buildBlock("motif_seed_b", {
+          component_area: "apps/remotebuddy",
+          target_paths: ["apps/remotebuddy/src/dispatch"],
+          write_globs: ["apps/remotebuddy/src/dispatch/*"],
+          expected_validation: ["bun run test:dispatch"],
+        });
+        const graph: AdjacentPossibleGraph = {
+          nodes: [
+            { id: blockA.id, block: blockA, success: 0.78, regret: 0.12, sampleCount: 4 },
+            { id: blockB.id, block: blockB, success: 0.7, regret: 0.1, sampleCount: 3 },
+          ],
+          edges: [
+            {
+              from: blockA.id,
+              to: blockB.id,
+              weight: 0.74,
+              sharedObjectives: 2,
+              sharedGaps: 1,
+              sharedComponent: false,
+              sharedTrigger: true,
+            },
+          ],
+        };
+        const seeds = buildAdjacentPossibleCandidates({
+          graph,
+          topSignals: [
+            { signal_id: "sig_queue", type: "queue_health", value: 0.81 },
+            { signal_id: "sig_regret", type: "regret_signal", value: 0.55 },
+          ],
+          visionSectionRefs: ["7", "4"],
+          maxCandidates: 2,
+          seedSalt: "inline_test",
+        });
+        expect(seeds).toHaveLength(1);
+        const seed = seeds[0] as Record<string, any>;
+        expect(String(seed.id)).toContain("cand_adjacent_");
+        expect(seed.why_now_signal_ids).toEqual(["sig_queue"]);
+        expect(seed.engine_trial).toMatchObject({
+          building_block_id: expect.stringContaining("adjacent_possible"),
+          algorithm: "adjacent_possible_fusion",
+          source: "engine_mapped",
+        });
+        expect(seed.target_paths).toEqual([
+          "apps/remotebuddy/src/autonomous_engine.ts",
+          "apps/remotebuddy/src/dispatch",
+        ]);
+        expect(seed.scope.write_globs).toEqual([
+          "apps/remotebuddy/src/*",
+          "apps/remotebuddy/src/dispatch/*",
+        ]);
+        expect(seed.expected_validation).toEqual(["bun run test:root", "bun run test:dispatch"]);
+
+        const gateCfg: AdjacentPossibleConfig = {
+          queueSlackMin: 1,
+          queueSlackCapacity: 10,
+          idleWorkersMin: 1,
+          successThreshold: 0.6,
+          minSampleCount: 2,
+          priorMaxAgeMs: 60 * 1000,
+          maxGraphNodes: 4,
+          maxSeeds: 2,
+        };
+        const gating = evaluateAdjacentPossibleGate(
+          {
+            queues: { requests: { pending: 4 } },
+            workers: { idle: 3 },
+            slo: { requests: { queueWaitMs: { p95: 1200 } } },
+          },
+          gateCfg,
+        );
+        expect(gating.ok).toBe(true);
+      });
+    });
+
+    describe("evaluateAdjacentPossibleGate", () => {
+      const cfg: AdjacentPossibleConfig = {
+        queueSlackMin: 3,
+        queueSlackCapacity: 12,
+        idleWorkersMin: 2,
+        successThreshold: 0.6,
+        minSampleCount: 2,
+        priorMaxAgeMs: 60 * 1000,
+        maxGraphNodes: 4,
+        maxSeeds: 2,
+      };
+      it("declines when queue slack drops to configured floor", () => {
+        const metrics = evaluateAdjacentPossibleGate(
+          {
+            queues: { requests: { pending: 10 } },
+            workers: { idle: 4 },
+            slo: { requests: { queueWaitMs: { p95: 2500 } } },
+          },
+          cfg,
+        );
+        expect(metrics.ok).toBe(false);
+        expect(metrics.reason).toBe("queue_slack_low");
+        expect(metrics.queueSlack).toBe(2);
+      });
+      it("declines when idle workers are at or below threshold", () => {
+        const metrics = evaluateAdjacentPossibleGate(
+          {
+            queues: { requests: { pending: 4 } },
+            workers: { idle: 2 },
+            slo: { requests: { queueWaitMs: { p95: 800 } } },
+          },
+          cfg,
+        );
+        expect(metrics.ok).toBe(false);
+        expect(metrics.reason).toBe("idle_capacity_low");
+      });
+      it("blocks seeding when job backlog is saturated despite low request slack", () => {
+        const metrics = evaluateAdjacentPossibleGate(
+          {
+            queues: { requests: { pending: 1 }, jobs: { pending: 7, claimed: 5 } },
+            workers: { idle: 5 },
+            slo: { requests: { queueWaitMs: { p95: 900 } } },
+          },
+          cfg,
+        );
+        expect(metrics.ok).toBe(false);
+        expect(metrics.reason).toBe("queue_slack_low");
+        expect(metrics.queuePending).toBe(13);
+        expect(metrics.jobBacklog).toBe(12);
+      });
+      it("propagates structured status failure reasons when unavailable", () => {
+        const metrics = evaluateAdjacentPossibleGate(null, cfg, { statusFailureReason: "http_500" });
+        expect(metrics.ok).toBe(false);
+        expect(metrics.reason).toBe("status_unavailable:http_500");
+        expect(metrics.statusFailureReason).toBe("http_500");
+      });
+    });
+
+    describe("buildAdjacentPossibleTelemetry", () => {
+      const baseMetrics: AdjacentPossibleGateMetrics = {
+        ok: true,
+        reason: "ok",
+        queuePending: 4,
+        requestsPending: 4,
+        jobPending: 0,
+        jobClaimed: 0,
+        jobBacklog: 0,
+        queueSlack: 8,
+        queueSlackRequired: 3,
+        queueSlackCapacity: 12,
+        idleWorkers: 4,
+        idleRequired: 2,
+        queueLatencyP95: 1200,
+        statusFailureReason: null,
+      };
+      it("reports seeded telemetry with queue and idle metrics", () => {
+        const decision = buildAdjacentPossibleTelemetry("run_inline", baseMetrics, 2);
+        expect(decision.statusText).toBe("seeded");
+        expect(decision.logLine).toContain("status=seeded");
+        expect(decision.telemetry).toMatchObject({
+          runId: "run_inline",
+          status: "seeded",
+          seededCount: 2,
+          queueSlack: baseMetrics.queueSlack,
+          idleWorkers: baseMetrics.idleWorkers,
+        });
+      });
+      it("reports gating notes when graph is empty despite slack", () => {
+        const decision = buildAdjacentPossibleTelemetry("run_skip", baseMetrics, 0, "graph_empty");
+        expect(decision.statusText).toBe("graph_empty");
+        expect(decision.telemetry.note).toBe("graph_empty");
+      });
+      it("propagates congestion reasons on skipped decisions", () => {
+        const blocked = buildAdjacentPossibleTelemetry(
+          "run_block",
+          { ...baseMetrics, ok: false, reason: "queue_slack_low" },
+          0,
+        );
+        expect(blocked.statusText).toBe("queue_slack_low");
+        expect(blocked.telemetry.status).toBe("queue_slack_low");
+        expect(blocked.telemetry.note).toBeNull();
+      });
+    });
+  })();
 }
