@@ -239,6 +239,15 @@ const ENGINE_EXPLORE_RATE_MIN = 0.1;
 const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
+const ADJACENT_POSSIBLE_DEFAULT_MAX_IDEAS = 3;
+const ADJACENT_POSSIBLE_MAX_IDEAS = 5;
+const ADJACENT_POSSIBLE_MIN_SIGNAL = 0.2;
+const ADJACENT_POSSIBLE_MIN_GAP_SCORE = 0.25;
+const ADJACENT_POSSIBLE_NOVELTY_DIVISOR = ENGINE_NOVELTY_SAMPLE_SATURATION;
+const ADJACENT_POSSIBLE_GAP_WEIGHT = 0.5;
+const ADJACENT_POSSIBLE_SIGNAL_WEIGHT = 0.3;
+const ADJACENT_POSSIBLE_NOVELTY_WEIGHT = 0.12;
+const ADJACENT_POSSIBLE_COVERAGE_BOOST = 0.08;
 const AUTO_INGEST_SEED_PATTERNS: Array<{
   algorithm: string;
   whenToUse: string;
@@ -734,6 +743,35 @@ export interface EngineCommitHistoryHint {
   objective_ids: string[];
   gap_ids: string[];
   sample_subjects: string[];
+}
+
+export interface AdjacentPossibleIdea {
+  id: string;
+  motif_id: string;
+  gap_id: string;
+  motif_label: string;
+  gap_label: string;
+  score: number;
+  summary: string;
+  hypothesis: string;
+  evidence: string[];
+  candidate_shape: EngineCandidateShape;
+}
+
+export interface AdjacentPossibleTelemetryEvent {
+  step:
+    | "motif_screen"
+    | "gap_screen"
+    | "pair_attempt"
+    | "guardrail_drop"
+    | "idea_emitted"
+    | "idea_truncated";
+  motif_id?: string;
+  gap_id?: string;
+  attempt_id?: string;
+  accepted: boolean;
+  reason?: string;
+  metrics?: Record<string, number>;
 }
 
 export interface EngineInspirationSourcePattern {
@@ -1784,6 +1822,376 @@ function buildCommitHistoryBlocks(params: {
     })
     .filter((entry): entry is EngineIdeaBuildingBlock => Boolean(entry))
     .sort((a, b) => b.score - a.score);
+}
+
+function cloneCandidateShape(shape: EngineCandidateShape): EngineCandidateShape {
+  return {
+    ...shape,
+    target_paths: [...shape.target_paths],
+    write_globs: [...shape.write_globs],
+    expected_validation: [...shape.expected_validation],
+  };
+}
+
+function isCandidateShapeComplete(shape: EngineCandidateShape): boolean {
+  return (
+    Array.isArray(shape.target_paths) &&
+    shape.target_paths.length > 0 &&
+    Array.isArray(shape.write_globs) &&
+    shape.write_globs.length > 0 &&
+    Array.isArray(shape.expected_validation) &&
+    shape.expected_validation.length > 0
+  );
+}
+
+export function adjacent_possible(params: {
+  hints?: EngineCommitHistoryHint[];
+  gaps?: EngineOpportunityGap[];
+  maxIdeas?: number;
+  minMotifSignal?: number;
+  minGapScore?: number;
+}): { ideas: AdjacentPossibleIdea[]; telemetry: AdjacentPossibleTelemetryEvent[] } {
+  const hints = Array.isArray(params.hints) ? params.hints : [];
+  const gaps = Array.isArray(params.gaps) ? params.gaps : [];
+  const configuredMax = Number.isFinite(params.maxIdeas)
+    ? Math.max(
+        0,
+        Math.min(ADJACENT_POSSIBLE_MAX_IDEAS, Math.floor(Number(params.maxIdeas))),
+      )
+    : ADJACENT_POSSIBLE_DEFAULT_MAX_IDEAS;
+  const maxIdeas = configuredMax;
+  const minSignal = clamp01(
+    Number.isFinite(params.minMotifSignal)
+      ? Number(params.minMotifSignal)
+      : ADJACENT_POSSIBLE_MIN_SIGNAL,
+  );
+  const minGapScore = clamp01(
+    Number.isFinite(params.minGapScore)
+      ? Number(params.minGapScore)
+      : ADJACENT_POSSIBLE_MIN_GAP_SCORE,
+  );
+  const telemetry: AdjacentPossibleTelemetryEvent[] = [];
+  const recordTelemetry = (event: AdjacentPossibleTelemetryEvent): void => {
+    telemetry.push(event);
+  };
+  const sanitizeIdList = (value: unknown): string[] => [...new Set(asStringArray(value))];
+  const mergeUniqueStrings = (existing: string[], additions: string[]): string[] => {
+    if (additions.length === 0) return existing;
+    const seen = new Set(existing);
+    for (const value of additions) {
+      if (!seen.has(value)) seen.add(value);
+    }
+    return [...seen];
+  };
+  const buildAttemptId = (pair: { motifId: string; gapId: string }): string =>
+    `${pair.motifId}::${pair.gapId}`;
+  const recordPairOutcome = (
+    pair: { motifId: string; gapId: string },
+    accepted: boolean,
+    details?: { reason?: string; metrics?: Record<string, number> },
+  ): string => {
+    const attemptId = buildAttemptId(pair);
+    recordTelemetry({
+      step: "pair_attempt",
+      motif_id: pair.motifId,
+      gap_id: pair.gapId,
+      attempt_id: attemptId,
+      accepted,
+      ...(details?.reason ? { reason: details.reason } : {}),
+      ...(details?.metrics ? { metrics: details.metrics } : {}),
+    });
+    return attemptId;
+  };
+  const rejectPair = (
+    pair: { motifId: string; gapId: string },
+    reason: string,
+    metrics?: Record<string, number>,
+  ): void => {
+    const attemptId = recordPairOutcome(pair, false, { reason, ...(metrics ? { metrics } : {}) });
+    recordTelemetry({
+      step: "guardrail_drop",
+      motif_id: pair.motifId,
+      gap_id: pair.gapId,
+      attempt_id: attemptId,
+      accepted: false,
+      reason,
+    });
+  };
+
+  const ruleByMotifId = new Map(COMMIT_MOTIF_RULES.map((rule) => [rule.motifId, rule]));
+  type AggregatedMotifInput = {
+    motifId: string;
+    motifLabel: string;
+    signal: number;
+    count: number;
+    observedGapIds: string[];
+    sourceIndex: number;
+  };
+  const aggregatedMotifMap = new Map<string, AggregatedMotifInput>();
+  hints.forEach((hint, index) => {
+    const motifId = asString(hint.motif_id);
+    if (!motifId) {
+      recordTelemetry({
+        step: "motif_screen",
+        accepted: false,
+        reason: "invalid_motif_id",
+      });
+      return;
+    }
+    const motifLabel = asString(hint.label);
+    if (!motifLabel) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "invalid_motif_label",
+      });
+      return;
+    }
+    const signal = clamp01(asNumber(hint.signal, 0));
+    const count = Math.max(0, Math.floor(asNumber(hint.count, 0)));
+    const observedGapIds = sanitizeIdList(hint.gap_ids);
+    const aggregated = aggregatedMotifMap.get(motifId);
+    if (!aggregated) {
+      aggregatedMotifMap.set(motifId, {
+        motifId,
+        motifLabel,
+        signal,
+        count,
+        observedGapIds,
+        sourceIndex: index,
+      });
+      return;
+    }
+    const mergedGapIds = mergeUniqueStrings(aggregated.observedGapIds, observedGapIds);
+    const shouldReplace =
+      signal > aggregated.signal ||
+      (signal === aggregated.signal && count > aggregated.count) ||
+      (signal === aggregated.signal && count === aggregated.count && index > aggregated.sourceIndex);
+    if (shouldReplace) {
+      aggregatedMotifMap.set(motifId, {
+        motifId,
+        motifLabel,
+        signal,
+        count,
+        observedGapIds: mergedGapIds,
+        sourceIndex: index,
+      });
+      return;
+    }
+    aggregatedMotifMap.set(motifId, {
+      ...aggregated,
+      observedGapIds: mergedGapIds,
+    });
+  });
+  const aggregatedMotifs = [...aggregatedMotifMap.values()].sort((a, b) =>
+    a.motifId.localeCompare(b.motifId),
+  );
+
+  type AggregatedGapInput = { gapId: string; gapLabel: string; score: number; sourceIndex: number };
+  const aggregatedGapMap = new Map<string, AggregatedGapInput>();
+  gaps.forEach((gap, index) => {
+    const gapId = asString(gap.id);
+    if (!gapId) {
+      recordTelemetry({
+        step: "gap_screen",
+        accepted: false,
+        reason: "invalid_gap_id",
+      });
+      return;
+    }
+    const gapLabel = asString(gap.label);
+    if (!gapLabel) {
+      recordTelemetry({
+        step: "gap_screen",
+        gap_id: gapId,
+        accepted: false,
+        reason: "invalid_gap_label",
+      });
+      return;
+    }
+    const score = clamp01(asNumber(gap.score, 0));
+    const existing = aggregatedGapMap.get(gapId);
+    if (
+      !existing ||
+      score > existing.score ||
+      (score === existing.score && index > existing.sourceIndex)
+    ) {
+      aggregatedGapMap.set(gapId, { gapId, gapLabel, score, sourceIndex: index });
+    }
+  });
+  const aggregatedGaps = [...aggregatedGapMap.values()].sort((a, b) =>
+    a.gapId.localeCompare(b.gapId),
+  );
+
+  type EligibleMotif = {
+    rule: CommitMotifRule;
+    motifId: string;
+    motifLabel: string;
+    observedGapIds: string[];
+    signal: number;
+    novelty: number;
+    candidateShape: EngineCandidateShape;
+  };
+  const eligibleMotifs: EligibleMotif[] = [];
+  for (const hint of aggregatedMotifs) {
+    const motifId = hint.motifId;
+    const motifLabel = hint.motifLabel;
+    const rule = ruleByMotifId.get(motifId);
+    if (!rule) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "unknown_motif",
+      });
+      continue;
+    }
+    const signal = clamp01(hint.signal);
+    if (signal < minSignal) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "motif_signal_below_threshold",
+        metrics: { signal },
+      });
+      continue;
+    }
+    const candidateShape = cloneCandidateShape(rule.shape);
+    if (!isCandidateShapeComplete(candidateShape)) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "candidate_shape_incomplete",
+      });
+      continue;
+    }
+    const novelty = clamp01(
+      1 - clamp01(hint.count / ADJACENT_POSSIBLE_NOVELTY_DIVISOR),
+    );
+    eligibleMotifs.push({
+      rule,
+      motifId,
+      motifLabel,
+      observedGapIds: [...hint.observedGapIds],
+      signal,
+      novelty,
+      candidateShape,
+    });
+    recordTelemetry({
+      step: "motif_screen",
+      motif_id: motifId,
+      accepted: true,
+      metrics: { signal, novelty },
+    });
+  }
+
+  type EligibleGap = { gapId: string; gapLabel: string; score: number };
+  const eligibleGaps: EligibleGap[] = [];
+  for (const gap of aggregatedGaps) {
+    const gapId = gap.gapId;
+    const gapLabel = gap.gapLabel;
+    const score = clamp01(gap.score);
+    const accepted = score >= minGapScore;
+    recordTelemetry({
+      step: "gap_screen",
+      gap_id: gapId,
+      accepted,
+      metrics: { score },
+      ...(accepted ? {} : { reason: "gap_score_below_threshold" }),
+    });
+    if (!accepted) continue;
+    eligibleGaps.push({ gapId, gapLabel, score });
+  }
+
+  const seenPairs = new Set<string>();
+  const generatedIdeas: AdjacentPossibleIdea[] = [];
+  for (const motif of eligibleMotifs) {
+    for (const gap of eligibleGaps) {
+      const pairKey = `${motif.motifId}:${gap.gapId}`;
+      const pairContext = { motifId: motif.motifId, gapId: gap.gapId };
+      if (seenPairs.has(pairKey)) {
+        rejectPair(pairContext, "duplicate_pair");
+        continue;
+      }
+      seenPairs.add(pairKey);
+      const supportsGap =
+        motif.rule.gapIds.includes(gap.gapId) || motif.observedGapIds.includes(gap.gapId);
+      if (!supportsGap) {
+        rejectPair(pairContext, "gap_not_supported");
+        continue;
+      }
+      if (!isCandidateShapeComplete(motif.candidateShape)) {
+        rejectPair(pairContext, "candidate_shape_incomplete");
+        continue;
+      }
+      const coverageBoost = motif.observedGapIds.includes(gap.gapId)
+        ? ADJACENT_POSSIBLE_COVERAGE_BOOST
+        : 0;
+      const score = clamp01(
+        ADJACENT_POSSIBLE_GAP_WEIGHT * gap.score +
+          ADJACENT_POSSIBLE_SIGNAL_WEIGHT * motif.signal +
+          ADJACENT_POSSIBLE_NOVELTY_WEIGHT * motif.novelty +
+          coverageBoost,
+      );
+      const idea: AdjacentPossibleIdea = {
+        id: `adjacent_possible_${motif.motifId}_${gap.gapId}`,
+        motif_id: motif.motifId,
+        gap_id: gap.gapId,
+        motif_label: motif.motifLabel,
+        gap_label: gap.gapLabel,
+        score,
+        summary: `Adjacent possible: ${motif.motifLabel} targeting ${gap.gapLabel}`,
+        hypothesis:
+          `Blend the ${motif.motifLabel.toLowerCase()} motif with ${gap.gapLabel.toLowerCase()} telemetry ` +
+          "to relieve the active bottleneck without widening scope.",
+        evidence: [
+          `motif_signal=${motif.signal.toFixed(2)}`,
+          `motif_novelty=${motif.novelty.toFixed(2)}`,
+          `gap_score=${gap.score.toFixed(2)}`,
+          `coverage_boost=${coverageBoost.toFixed(2)}`,
+        ],
+        candidate_shape: cloneCandidateShape(motif.candidateShape),
+      };
+      recordPairOutcome(pairContext, true, { metrics: { score } });
+      generatedIdeas.push(idea);
+    }
+  }
+
+  generatedIdeas.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.id.localeCompare(b.id);
+  });
+  const allowedIdeaCount = maxIdeas > 0 ? Math.min(maxIdeas, generatedIdeas.length) : 0;
+  const selectedIdeas = generatedIdeas.slice(0, allowedIdeaCount);
+  const truncationReason = maxIdeas <= 0 ? "max_ideas_disabled" : "max_ideas_limit";
+  generatedIdeas.forEach((idea, index) => {
+    const attemptId = buildAttemptId({ motifId: idea.motif_id, gapId: idea.gap_id });
+    if (index < allowedIdeaCount) {
+      recordTelemetry({
+        step: "idea_emitted",
+        motif_id: idea.motif_id,
+        gap_id: idea.gap_id,
+        attempt_id: attemptId,
+        accepted: true,
+        metrics: { score: idea.score, rank: index + 1 },
+      });
+    } else {
+      recordTelemetry({
+        step: "idea_truncated",
+        motif_id: idea.motif_id,
+        gap_id: idea.gap_id,
+        attempt_id: attemptId,
+        accepted: false,
+        reason: truncationReason,
+        metrics: { score: idea.score, rank: index + 1 },
+      });
+    }
+  });
+
+  return { ideas: selectedIdeas, telemetry };
 }
 
 export function buildEngineInspirationContext(params: {
