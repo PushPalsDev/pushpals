@@ -239,12 +239,15 @@ const ENGINE_EXPLORE_RATE_MIN = 0.1;
 const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
-const OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS = 2_000;
-const OPPORTUNITY_GRAPH_QUEUE_SEVERE_MS = 5_000;
-const OPPORTUNITY_GRAPH_MAX_PREVENTIVE_BONUS = 0.12;
-const OPPORTUNITY_GRAPH_MAX_THROTTLE_PENALTY = 0.9;
-const OPPORTUNITY_GRAPH_THROTTLE_FLOOR = 0.25;
-const OPPORTUNITY_GRAPH_LOG_COOLDOWN_MS = 120_000;
+const ADJACENT_POSSIBLE_DEFAULT_MAX_IDEAS = 3;
+const ADJACENT_POSSIBLE_MAX_IDEAS = 5;
+const ADJACENT_POSSIBLE_MIN_SIGNAL = 0.2;
+const ADJACENT_POSSIBLE_MIN_GAP_SCORE = 0.25;
+const ADJACENT_POSSIBLE_NOVELTY_DIVISOR = ENGINE_NOVELTY_SAMPLE_SATURATION;
+const ADJACENT_POSSIBLE_GAP_WEIGHT = 0.5;
+const ADJACENT_POSSIBLE_SIGNAL_WEIGHT = 0.3;
+const ADJACENT_POSSIBLE_NOVELTY_WEIGHT = 0.12;
+const ADJACENT_POSSIBLE_COVERAGE_BOOST = 0.08;
 const AUTO_INGEST_SEED_PATTERNS: Array<{
   algorithm: string;
   whenToUse: string;
@@ -740,6 +743,35 @@ export interface EngineCommitHistoryHint {
   objective_ids: string[];
   gap_ids: string[];
   sample_subjects: string[];
+}
+
+export interface AdjacentPossibleIdea {
+  id: string;
+  motif_id: string;
+  gap_id: string;
+  motif_label: string;
+  gap_label: string;
+  score: number;
+  summary: string;
+  hypothesis: string;
+  evidence: string[];
+  candidate_shape: EngineCandidateShape;
+}
+
+export interface AdjacentPossibleTelemetryEvent {
+  step:
+    | "motif_screen"
+    | "gap_screen"
+    | "pair_attempt"
+    | "guardrail_drop"
+    | "idea_emitted"
+    | "idea_truncated";
+  motif_id?: string;
+  gap_id?: string;
+  attempt_id?: string;
+  accepted: boolean;
+  reason?: string;
+  metrics?: Record<string, number>;
 }
 
 export interface EngineInspirationSourcePattern {
@@ -1341,281 +1373,8 @@ function maxTraitScore(snapshot: EngineIdeaInputSnapshot, pattern: RegExp): numb
             pattern.test(String(trait.trait_id ?? "")),
         )
         .map((trait) => asNumber(trait.score, 0)),
-    ),
+      ),
   );
-}
-
-function parseLatencyEvidenceInMs(
-  evidence: unknown,
-  patterns: RegExp[],
-): { value: number; patternIndex: number } | null {
-  const text = asString(evidence);
-  if (!text) return null;
-  const normalizedText = text.replace(/\u202f/g, " ");
-  for (let idx = 0; idx < patterns.length; idx += 1) {
-    const pattern = patterns[idx];
-    const match = normalizedText.match(pattern);
-    if (!match || match[1] === undefined) continue;
-    const value = Number(match[1]);
-    if (!Number.isFinite(value) || value <= 0) continue;
-    const unitToken = (match[2] ?? "ms").toLowerCase();
-    const normalizedUnit = unitToken.replace(/[^a-z]/g, "");
-    if (
-      normalizedUnit === "" ||
-      normalizedUnit.startsWith("ms") ||
-      normalizedUnit.startsWith("millisecond") ||
-      normalizedUnit.startsWith("millis") ||
-      normalizedUnit.startsWith("msec")
-    ) {
-      return { value, patternIndex: idx };
-    }
-    if (normalizedUnit.startsWith("s") || normalizedUnit.startsWith("sec")) {
-      return { value: value * 1_000, patternIndex: idx };
-    }
-    if (normalizedUnit.startsWith("us") || normalizedUnit.startsWith("micro")) {
-      return { value: value / 1_000, patternIndex: idx };
-    }
-  }
-  return null;
-}
-
-function extractQueueHealthMetrics(snapshot: EngineIdeaInputSnapshot): {
-  queueP95Ms: number | null;
-  queueSource: OpportunityGraphQueueMetricSource;
-} {
-  type QueueMetricCandidate = {
-    valueMs: number;
-    source: OpportunityGraphQueueMetricSource;
-    patternPriority: number;
-    confidence: number;
-    ordinal: number;
-  };
-  const queuePatterns = [
-    /\bqueue(?:_|\s*)p95\s*(?:[:=]|is)?\s*([0-9.]+)\s*(ms|milliseconds|millis|msec|s|sec|secs|seconds)?\b/i,
-    /\bqueue(?:_|\s*)p95\s+([0-9.]+)\s*(ms|milliseconds|millis|msec|s|sec|secs|seconds)?\b/i,
-    /\brequest\s+queue\s+p95\s*(?:[:=]|is)?\s*([0-9.]+)\s*(ms|milliseconds|millis|msec|s|sec|secs|seconds)?\b/i,
-    /\bslo\.requests\.queueWaitMs(?:\.p95)?\s*(?:[:=]|is)?\s*([0-9.]+)\s*(ms|milliseconds|millis|msec|s|sec|secs|seconds)?\b/i,
-    /\bqueueWaitMs(?:\.p95)?\s*(?:[:=]|is)?\s*([0-9.]+)\s*(ms|milliseconds|millis|msec|s|sec|secs|seconds)?\b/i,
-    /\bremote[_\s]*queue[_\s]*wait[_\s]*ms(?:\.p95)?\s*(?:[:=]|is)?\s*([0-9.]+)\s*(ms|milliseconds|millis|msec|s|sec|secs|seconds)?\b/i,
-    /\bp95\s+queue\s+wait\s*(?:[:=]|is)?\s*([0-9.]+)\s*(ms|milliseconds|millis|msec|s|sec|secs|seconds)?\b/i,
-  ];
-  const candidates: QueueMetricCandidate[] = [];
-  const considerEvidence = (
-    evidence: unknown,
-    source: OpportunityGraphQueueMetricSource,
-    ordinal: number,
-    confidence: number,
-  ): void => {
-    const parsed = parseLatencyEvidenceInMs(evidence, queuePatterns);
-    if (!parsed) return;
-    const patternPriority = queuePatterns.length - parsed.patternIndex;
-    candidates.push({
-      valueMs: parsed.value,
-      source,
-      patternPriority,
-      confidence,
-      ordinal,
-    });
-  };
-
-  snapshot.top_signals.forEach((signal, idx) => {
-    if (String(signal.type ?? "").toLowerCase() !== "queue_health") return;
-    considerEvidence(signal.evidence, "signal", idx, clamp01(asNumber(signal.value, 0)));
-  });
-
-  snapshot.state_traits.forEach((trait, idx) => {
-    if (
-      !/queue/i.test(String(trait.focus ?? "")) &&
-      !/queue/i.test(String(trait.trait_id ?? "")) &&
-      !/queue/i.test(String(trait.evidence ?? ""))
-    ) {
-      return;
-    }
-    considerEvidence(trait.evidence, "trait", idx, clamp01(asNumber(trait.score, 0)));
-  });
-
-  if (candidates.length === 0) {
-    return { queueP95Ms: null, queueSource: "unknown" };
-  }
-
-  const scoreCandidate = (candidate: QueueMetricCandidate): number => {
-    const sourcePriority = candidate.source === "signal" ? 3 : candidate.source === "trait" ? 2 : 1;
-    const confidenceScore = clamp01(candidate.confidence) * 100;
-    const recencyScore = Math.max(0, 40 - candidate.ordinal);
-    return sourcePriority * 1_000 + candidate.patternPriority * 100 + confidenceScore + recencyScore;
-  };
-
-  candidates.sort((a, b) => {
-    const scoreDelta = scoreCandidate(b) - scoreCandidate(a);
-    if (scoreDelta !== 0) return scoreDelta;
-    if (b.valueMs !== a.valueMs) return b.valueMs - a.valueMs;
-    return a.ordinal - b.ordinal;
-  });
-
-  const best = candidates[0];
-  return { queueP95Ms: best.valueMs, queueSource: best.source };
-}
-
-type OpportunityGraphQueueState = "healthy" | "degraded" | "severe" | "unknown";
-type OpportunityGraphQueueAction = "boost" | "throttle" | "pause" | "neutral";
-type OpportunityGraphQueueMetricSource = "signal" | "trait" | "unknown";
-type OpportunityGraphLogEntry = {
-  state: OpportunityGraphQueueState;
-  action: OpportunityGraphQueueAction;
-  timestamp: number;
-};
-type OpportunityGraphLogContext = {
-  lastEntry: OpportunityGraphLogEntry | null;
-  emit?: (line: string) => void;
-};
-
-function normalizeQueueP95Ms(value: number | null): number | null {
-  if (value === null || !Number.isFinite(value) || value <= 0) return null;
-  return value;
-}
-
-function classifyQueueHealthState(queueP95Ms: number | null): OpportunityGraphQueueState {
-  if (queueP95Ms === null) return "unknown";
-  if (queueP95Ms >= OPPORTUNITY_GRAPH_QUEUE_SEVERE_MS) return "severe";
-  if (queueP95Ms >= OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS) return "degraded";
-  return "healthy";
-}
-
-function logOpportunityGraphDecision(
-  logContext: OpportunityGraphLogContext | undefined,
-  args: {
-  state: OpportunityGraphQueueState;
-  action: OpportunityGraphQueueAction;
-  queueP95Ms: number | null;
-  slack: number;
-  detail: string;
-  score: number;
-  queueEvidence: string;
-  queueSource: OpportunityGraphQueueMetricSource;
-},
-): void {
-  if (args.action === "neutral" || !logContext) return;
-  const now = Date.now();
-  const lastEntry = logContext.lastEntry;
-  const shouldLog =
-    !lastEntry ||
-    lastEntry.state !== args.state ||
-    lastEntry.action !== args.action ||
-    now - lastEntry.timestamp >= OPPORTUNITY_GRAPH_LOG_COOLDOWN_MS;
-  if (!shouldLog) return;
-  logContext.lastEntry = { state: args.state, action: args.action, timestamp: now };
-  const queueDescriptor = args.queueP95Ms !== null ? `${Math.round(args.queueP95Ms)}ms` : "unknown";
-  const emit = logContext.emit ?? console.log;
-  emit(
-    `[RemoteBuddyAutonomousEngine] opportunity_graph ${args.action}: state=${args.state} queue_p95=${queueDescriptor} source=${args.queueSource} evidence=${args.queueEvidence} slack=${args.slack.toFixed(2)} ${args.detail} score=${args.score.toFixed(3)}`,
-  );
-}
-
-function adjustOpportunityGraphScore(params: {
-  baseScore: number;
-  queueSignal: number;
-  queueP95Ms: number | null;
-  queueMetricSource: OpportunityGraphQueueMetricSource;
-  dispatchSaturation: number;
-  openObjectivePressure: number;
-  logContext?: OpportunityGraphLogContext;
-}): { score: number; evidence: string[] } {
-  let score = clamp01(params.baseScore);
-  const normalizedQueueP95 = normalizeQueueP95Ms(params.queueP95Ms);
-  const queueState = classifyQueueHealthState(normalizedQueueP95);
-  const queueEvidence =
-    normalizedQueueP95 !== null
-      ? `queue_p95=${Math.round(normalizedQueueP95)}ms`
-      : `queue_signal=${params.queueSignal.toFixed(2)}`;
-  const queueSource: OpportunityGraphQueueMetricSource =
-    normalizedQueueP95 !== null ? params.queueMetricSource : "unknown";
-  const evidence: string[] = [
-    queueEvidence,
-    `queue_state=${queueState}`,
-    `op_graph_queue_source=${queueSource}`,
-  ];
-
-  const dispatchSlack = clamp01(1 - params.dispatchSaturation);
-  const concurrencySlack = clamp01(1 - params.openObjectivePressure);
-  const idleSlackEstimate = Math.max(dispatchSlack, concurrencySlack);
-  const queueHeadroom =
-    normalizedQueueP95 !== null
-      ? clamp01(
-          (OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS - normalizedQueueP95) /
-            OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS,
-        )
-      : 0;
-  const preventiveSlack = clamp01(queueHeadroom * idleSlackEstimate);
-  evidence.push(`op_graph_idle_slack=${idleSlackEstimate.toFixed(2)}`);
-  evidence.push(`op_graph_headroom=${queueHeadroom.toFixed(2)}`);
-  evidence.push(`op_graph_slack=${preventiveSlack.toFixed(2)}`);
-
-  let action: OpportunityGraphQueueAction = "neutral";
-  let detail = "detail=neutral";
-  let boostEvidence = "op_graph_boost=+0.000";
-  let throttleEvidence = "op_graph_throttle=0.00";
-
-  if (queueState === "healthy" && preventiveSlack > 0.01 && normalizedQueueP95 !== null) {
-    const boost = preventiveSlack * OPPORTUNITY_GRAPH_MAX_PREVENTIVE_BONUS;
-    score = clamp01(score + boost);
-    boostEvidence = `op_graph_boost=+${boost.toFixed(3)}`;
-    action = "boost";
-    detail = `boost=${boost.toFixed(3)}`;
-  }
-
-  let throttleMultiplier = 1;
-  let throttlePressure = 0;
-  let throttleFloorApplied = false;
-
-  if (normalizedQueueP95 !== null && normalizedQueueP95 >= OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS) {
-    const severitySpan = Math.max(
-      1,
-      OPPORTUNITY_GRAPH_QUEUE_SEVERE_MS - OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS,
-    );
-    const latencyDelta = normalizedQueueP95 - OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS;
-    const baseLatencyPressure = clamp01(latencyDelta / severitySpan);
-    const severeOverflow =
-      normalizedQueueP95 > OPPORTUNITY_GRAPH_QUEUE_SEVERE_MS
-        ? clamp01((normalizedQueueP95 - OPPORTUNITY_GRAPH_QUEUE_SEVERE_MS) / severitySpan)
-        : 0;
-    const combinedLatencyPressure = clamp01(baseLatencyPressure + severeOverflow * 0.5);
-    const slackPressure = 1 - idleSlackEstimate;
-    throttlePressure = clamp01(0.65 * combinedLatencyPressure + 0.35 * slackPressure);
-    const penalty = throttlePressure * OPPORTUNITY_GRAPH_MAX_THROTTLE_PENALTY;
-    const rawMultiplier = clamp01(1 - penalty);
-    const requestedFloor =
-      normalizedQueueP95 >= OPPORTUNITY_GRAPH_QUEUE_SEVERE_MS ? OPPORTUNITY_GRAPH_THROTTLE_FLOOR : 0;
-    throttleMultiplier = Math.max(rawMultiplier, requestedFloor);
-    throttleFloorApplied = requestedFloor > 0 && throttleMultiplier === requestedFloor;
-    if (throttleMultiplier < 1) {
-      const throttleReduction = 1 - throttleMultiplier;
-      throttleEvidence = `op_graph_throttle=${throttleReduction.toFixed(2)}${
-        throttleFloorApplied ? "_floor" : ""
-      }`;
-      action = throttleFloorApplied ? "pause" : "throttle";
-      detail = `multiplier=${throttleMultiplier.toFixed(2)} pressure=${throttlePressure.toFixed(2)}${
-        throttleFloorApplied ? ` floor=${requestedFloor.toFixed(2)}` : ""
-      }`;
-      score = clamp01(score * throttleMultiplier);
-    }
-  }
-
-  const throttleMultiplierEvidence = `op_graph_multiplier=${throttleMultiplier.toFixed(2)}`;
-  const throttlePressureEvidence = `op_graph_throttle_pressure=${throttlePressure.toFixed(2)}`;
-
-  evidence.push(boostEvidence, throttleEvidence, throttleMultiplierEvidence, throttlePressureEvidence);
-  logOpportunityGraphDecision(params.logContext, {
-    state: queueState,
-    action,
-    queueP95Ms: normalizedQueueP95,
-    slack: preventiveSlack,
-    detail,
-    score,
-    queueEvidence,
-    queueSource,
-  });
-
-  return { score, evidence };
 }
 
 function normalizeValidationIdeas(ideas: string[]): string[] {
@@ -2065,13 +1824,382 @@ function buildCommitHistoryBlocks(params: {
     .sort((a, b) => b.score - a.score);
 }
 
+function cloneCandidateShape(shape: EngineCandidateShape): EngineCandidateShape {
+  return {
+    ...shape,
+    target_paths: [...shape.target_paths],
+    write_globs: [...shape.write_globs],
+    expected_validation: [...shape.expected_validation],
+  };
+}
+
+function isCandidateShapeComplete(shape: EngineCandidateShape): boolean {
+  return (
+    Array.isArray(shape.target_paths) &&
+    shape.target_paths.length > 0 &&
+    Array.isArray(shape.write_globs) &&
+    shape.write_globs.length > 0 &&
+    Array.isArray(shape.expected_validation) &&
+    shape.expected_validation.length > 0
+  );
+}
+
+export function adjacent_possible(params: {
+  hints?: EngineCommitHistoryHint[];
+  gaps?: EngineOpportunityGap[];
+  maxIdeas?: number;
+  minMotifSignal?: number;
+  minGapScore?: number;
+}): { ideas: AdjacentPossibleIdea[]; telemetry: AdjacentPossibleTelemetryEvent[] } {
+  const hints = Array.isArray(params.hints) ? params.hints : [];
+  const gaps = Array.isArray(params.gaps) ? params.gaps : [];
+  const configuredMax = Number.isFinite(params.maxIdeas)
+    ? Math.max(
+        0,
+        Math.min(ADJACENT_POSSIBLE_MAX_IDEAS, Math.floor(Number(params.maxIdeas))),
+      )
+    : ADJACENT_POSSIBLE_DEFAULT_MAX_IDEAS;
+  const maxIdeas = configuredMax;
+  const minSignal = clamp01(
+    Number.isFinite(params.minMotifSignal)
+      ? Number(params.minMotifSignal)
+      : ADJACENT_POSSIBLE_MIN_SIGNAL,
+  );
+  const minGapScore = clamp01(
+    Number.isFinite(params.minGapScore)
+      ? Number(params.minGapScore)
+      : ADJACENT_POSSIBLE_MIN_GAP_SCORE,
+  );
+  const telemetry: AdjacentPossibleTelemetryEvent[] = [];
+  const recordTelemetry = (event: AdjacentPossibleTelemetryEvent): void => {
+    telemetry.push(event);
+  };
+  const sanitizeIdList = (value: unknown): string[] => [...new Set(asStringArray(value))];
+  const mergeUniqueStrings = (existing: string[], additions: string[]): string[] => {
+    if (additions.length === 0) return existing;
+    const seen = new Set(existing);
+    for (const value of additions) {
+      if (!seen.has(value)) seen.add(value);
+    }
+    return [...seen];
+  };
+  const buildAttemptId = (pair: { motifId: string; gapId: string }): string =>
+    `${pair.motifId}::${pair.gapId}`;
+  const recordPairOutcome = (
+    pair: { motifId: string; gapId: string },
+    accepted: boolean,
+    details?: { reason?: string; metrics?: Record<string, number> },
+  ): string => {
+    const attemptId = buildAttemptId(pair);
+    recordTelemetry({
+      step: "pair_attempt",
+      motif_id: pair.motifId,
+      gap_id: pair.gapId,
+      attempt_id: attemptId,
+      accepted,
+      ...(details?.reason ? { reason: details.reason } : {}),
+      ...(details?.metrics ? { metrics: details.metrics } : {}),
+    });
+    return attemptId;
+  };
+  const rejectPair = (
+    pair: { motifId: string; gapId: string },
+    reason: string,
+    metrics?: Record<string, number>,
+  ): void => {
+    const attemptId = recordPairOutcome(pair, false, { reason, ...(metrics ? { metrics } : {}) });
+    recordTelemetry({
+      step: "guardrail_drop",
+      motif_id: pair.motifId,
+      gap_id: pair.gapId,
+      attempt_id: attemptId,
+      accepted: false,
+      reason,
+    });
+  };
+
+  const ruleByMotifId = new Map(COMMIT_MOTIF_RULES.map((rule) => [rule.motifId, rule]));
+  type AggregatedMotifInput = {
+    motifId: string;
+    motifLabel: string;
+    signal: number;
+    count: number;
+    observedGapIds: string[];
+    sourceIndex: number;
+  };
+  const aggregatedMotifMap = new Map<string, AggregatedMotifInput>();
+  hints.forEach((hint, index) => {
+    const motifId = asString(hint.motif_id);
+    if (!motifId) {
+      recordTelemetry({
+        step: "motif_screen",
+        accepted: false,
+        reason: "invalid_motif_id",
+      });
+      return;
+    }
+    const motifLabel = asString(hint.label);
+    if (!motifLabel) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "invalid_motif_label",
+      });
+      return;
+    }
+    const signal = clamp01(asNumber(hint.signal, 0));
+    const count = Math.max(0, Math.floor(asNumber(hint.count, 0)));
+    const observedGapIds = sanitizeIdList(hint.gap_ids);
+    const aggregated = aggregatedMotifMap.get(motifId);
+    if (!aggregated) {
+      aggregatedMotifMap.set(motifId, {
+        motifId,
+        motifLabel,
+        signal,
+        count,
+        observedGapIds,
+        sourceIndex: index,
+      });
+      return;
+    }
+    const mergedGapIds = mergeUniqueStrings(aggregated.observedGapIds, observedGapIds);
+    const shouldReplace =
+      signal > aggregated.signal ||
+      (signal === aggregated.signal && count > aggregated.count) ||
+      (signal === aggregated.signal && count === aggregated.count && index > aggregated.sourceIndex);
+    if (shouldReplace) {
+      aggregatedMotifMap.set(motifId, {
+        motifId,
+        motifLabel,
+        signal,
+        count,
+        observedGapIds: mergedGapIds,
+        sourceIndex: index,
+      });
+      return;
+    }
+    aggregatedMotifMap.set(motifId, {
+      ...aggregated,
+      observedGapIds: mergedGapIds,
+    });
+  });
+  const aggregatedMotifs = [...aggregatedMotifMap.values()].sort((a, b) =>
+    a.motifId.localeCompare(b.motifId),
+  );
+
+  type AggregatedGapInput = { gapId: string; gapLabel: string; score: number; sourceIndex: number };
+  const aggregatedGapMap = new Map<string, AggregatedGapInput>();
+  gaps.forEach((gap, index) => {
+    const gapId = asString(gap.id);
+    if (!gapId) {
+      recordTelemetry({
+        step: "gap_screen",
+        accepted: false,
+        reason: "invalid_gap_id",
+      });
+      return;
+    }
+    const gapLabel = asString(gap.label);
+    if (!gapLabel) {
+      recordTelemetry({
+        step: "gap_screen",
+        gap_id: gapId,
+        accepted: false,
+        reason: "invalid_gap_label",
+      });
+      return;
+    }
+    const score = clamp01(asNumber(gap.score, 0));
+    const existing = aggregatedGapMap.get(gapId);
+    if (
+      !existing ||
+      score > existing.score ||
+      (score === existing.score && index > existing.sourceIndex)
+    ) {
+      aggregatedGapMap.set(gapId, { gapId, gapLabel, score, sourceIndex: index });
+    }
+  });
+  const aggregatedGaps = [...aggregatedGapMap.values()].sort((a, b) =>
+    a.gapId.localeCompare(b.gapId),
+  );
+
+  type EligibleMotif = {
+    rule: CommitMotifRule;
+    motifId: string;
+    motifLabel: string;
+    observedGapIds: string[];
+    signal: number;
+    novelty: number;
+    candidateShape: EngineCandidateShape;
+  };
+  const eligibleMotifs: EligibleMotif[] = [];
+  for (const hint of aggregatedMotifs) {
+    const motifId = hint.motifId;
+    const motifLabel = hint.motifLabel;
+    const rule = ruleByMotifId.get(motifId);
+    if (!rule) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "unknown_motif",
+      });
+      continue;
+    }
+    const signal = clamp01(hint.signal);
+    if (signal < minSignal) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "motif_signal_below_threshold",
+        metrics: { signal },
+      });
+      continue;
+    }
+    const candidateShape = cloneCandidateShape(rule.shape);
+    if (!isCandidateShapeComplete(candidateShape)) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "candidate_shape_incomplete",
+      });
+      continue;
+    }
+    const novelty = clamp01(
+      1 - clamp01(hint.count / ADJACENT_POSSIBLE_NOVELTY_DIVISOR),
+    );
+    eligibleMotifs.push({
+      rule,
+      motifId,
+      motifLabel,
+      observedGapIds: [...hint.observedGapIds],
+      signal,
+      novelty,
+      candidateShape,
+    });
+    recordTelemetry({
+      step: "motif_screen",
+      motif_id: motifId,
+      accepted: true,
+      metrics: { signal, novelty },
+    });
+  }
+
+  type EligibleGap = { gapId: string; gapLabel: string; score: number };
+  const eligibleGaps: EligibleGap[] = [];
+  for (const gap of aggregatedGaps) {
+    const gapId = gap.gapId;
+    const gapLabel = gap.gapLabel;
+    const score = clamp01(gap.score);
+    const accepted = score >= minGapScore;
+    recordTelemetry({
+      step: "gap_screen",
+      gap_id: gapId,
+      accepted,
+      metrics: { score },
+      ...(accepted ? {} : { reason: "gap_score_below_threshold" }),
+    });
+    if (!accepted) continue;
+    eligibleGaps.push({ gapId, gapLabel, score });
+  }
+
+  const seenPairs = new Set<string>();
+  const generatedIdeas: AdjacentPossibleIdea[] = [];
+  for (const motif of eligibleMotifs) {
+    for (const gap of eligibleGaps) {
+      const pairKey = `${motif.motifId}:${gap.gapId}`;
+      const pairContext = { motifId: motif.motifId, gapId: gap.gapId };
+      if (seenPairs.has(pairKey)) {
+        rejectPair(pairContext, "duplicate_pair");
+        continue;
+      }
+      seenPairs.add(pairKey);
+      const supportsGap =
+        motif.rule.gapIds.includes(gap.gapId) || motif.observedGapIds.includes(gap.gapId);
+      if (!supportsGap) {
+        rejectPair(pairContext, "gap_not_supported");
+        continue;
+      }
+      if (!isCandidateShapeComplete(motif.candidateShape)) {
+        rejectPair(pairContext, "candidate_shape_incomplete");
+        continue;
+      }
+      const coverageBoost = motif.observedGapIds.includes(gap.gapId)
+        ? ADJACENT_POSSIBLE_COVERAGE_BOOST
+        : 0;
+      const score = clamp01(
+        ADJACENT_POSSIBLE_GAP_WEIGHT * gap.score +
+          ADJACENT_POSSIBLE_SIGNAL_WEIGHT * motif.signal +
+          ADJACENT_POSSIBLE_NOVELTY_WEIGHT * motif.novelty +
+          coverageBoost,
+      );
+      const idea: AdjacentPossibleIdea = {
+        id: `adjacent_possible_${motif.motifId}_${gap.gapId}`,
+        motif_id: motif.motifId,
+        gap_id: gap.gapId,
+        motif_label: motif.motifLabel,
+        gap_label: gap.gapLabel,
+        score,
+        summary: `Adjacent possible: ${motif.motifLabel} targeting ${gap.gapLabel}`,
+        hypothesis:
+          `Blend the ${motif.motifLabel.toLowerCase()} motif with ${gap.gapLabel.toLowerCase()} telemetry ` +
+          "to relieve the active bottleneck without widening scope.",
+        evidence: [
+          `motif_signal=${motif.signal.toFixed(2)}`,
+          `motif_novelty=${motif.novelty.toFixed(2)}`,
+          `gap_score=${gap.score.toFixed(2)}`,
+          `coverage_boost=${coverageBoost.toFixed(2)}`,
+        ],
+        candidate_shape: cloneCandidateShape(motif.candidateShape),
+      };
+      recordPairOutcome(pairContext, true, { metrics: { score } });
+      generatedIdeas.push(idea);
+    }
+  }
+
+  generatedIdeas.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.id.localeCompare(b.id);
+  });
+  const allowedIdeaCount = maxIdeas > 0 ? Math.min(maxIdeas, generatedIdeas.length) : 0;
+  const selectedIdeas = generatedIdeas.slice(0, allowedIdeaCount);
+  const truncationReason = maxIdeas <= 0 ? "max_ideas_disabled" : "max_ideas_limit";
+  generatedIdeas.forEach((idea, index) => {
+    const attemptId = buildAttemptId({ motifId: idea.motif_id, gapId: idea.gap_id });
+    if (index < allowedIdeaCount) {
+      recordTelemetry({
+        step: "idea_emitted",
+        motif_id: idea.motif_id,
+        gap_id: idea.gap_id,
+        attempt_id: attemptId,
+        accepted: true,
+        metrics: { score: idea.score, rank: index + 1 },
+      });
+    } else {
+      recordTelemetry({
+        step: "idea_truncated",
+        motif_id: idea.motif_id,
+        gap_id: idea.gap_id,
+        attempt_id: attemptId,
+        accepted: false,
+        reason: truncationReason,
+        metrics: { score: idea.score, rank: index + 1 },
+      });
+    }
+  });
+
+  return { ideas: selectedIdeas, telemetry };
+}
+
 export function buildEngineInspirationContext(params: {
   vision: Pick<VisionContext, "one_sentence" | "key_items" | "section_numbers">;
   snapshot: EngineIdeaInputSnapshot;
   inspirationPatterns?: unknown[];
   sourceInsights?: unknown[];
   commitHistoryHints?: EngineCommitHistoryHint[];
-  opportunityGraphLogContext?: OpportunityGraphLogContext;
 }): EngineInspirationContext {
   const oneSentence = asString(params.vision.one_sentence);
   const keyItems = params.vision.key_items;
@@ -2091,7 +2219,6 @@ export function buildEngineInspirationContext(params: {
 
   const failureSignal = maxSignalScore(params.snapshot, ["test_failure", "lint_failure", "typecheck_failure"]);
   const queueSignal = maxSignalScore(params.snapshot, ["queue_health"]);
-  const queueHealthMetrics = extractQueueHealthMetrics(params.snapshot);
   const regretSignal = maxSignalScore(params.snapshot, ["regret_signal"]);
   const reliabilityTrait = maxTraitScore(
     params.snapshot,
@@ -2193,30 +2320,14 @@ export function buildEngineInspirationContext(params: {
         0.2 * noveltySignal -
         0.08 * dispatchSaturation,
     );
-    let adjustedScore = score;
-    let opportunityGraphEvidence: string[] = [];
-    if (blueprint.id === "opportunity_graph_pipeline") {
-      const adjustment = adjustOpportunityGraphScore({
-        baseScore: score,
-        queueSignal,
-        queueP95Ms: queueHealthMetrics.queueP95Ms,
-        queueMetricSource: queueHealthMetrics.queueSource,
-        dispatchSaturation,
-        openObjectivePressure,
-        logContext: params.opportunityGraphLogContext,
-      });
-      adjustedScore = adjustment.score;
-      opportunityGraphEvidence = adjustment.evidence;
-    }
     return {
       ...blueprint,
-      score: adjustedScore,
+      score,
       evidence: [
         `objective_signal=${objectiveSignal.toFixed(2)}`,
         `gap_signal=${gapSignal.toFixed(2)}`,
         `novelty_signal=${noveltySignal.toFixed(2)}`,
         `dispatch_saturation=${dispatchSaturation.toFixed(2)}`,
-        ...opportunityGraphEvidence,
       ],
     };
   });
@@ -2603,7 +2714,6 @@ export class RemoteBuddyAutonomousEngine {
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
-  private readonly opportunityGraphLogState: OpportunityGraphLogContext = { lastEntry: null };
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -3502,7 +3612,6 @@ export class RemoteBuddyAutonomousEngine {
         inspirationPatterns,
         sourceInsights,
         commitHistoryHints,
-        opportunityGraphLogContext: this.opportunityGraphLogState,
       });
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
@@ -4291,86 +4400,4 @@ export class RemoteBuddyAutonomousEngine {
     }
     this.nextTickAtMs = 0;
   }
-}
-
-const shouldRegisterAutonomousEngineInternalTests = (() => {
-  const bunNodeEnv =
-    typeof Bun !== "undefined" && Bun.env && typeof Bun.env.NODE_ENV === "string"
-      ? Bun.env.NODE_ENV
-      : undefined;
-  const processNodeEnv =
-    typeof process !== "undefined" && process.env ? process.env.NODE_ENV : undefined;
-  return bunNodeEnv === "test" || processNodeEnv === "test";
-})();
-
-if (shouldRegisterAutonomousEngineInternalTests) {
-  void import("bun:test")
-    .then(({ describe, expect, test }) => {
-      const createSilentLogContext = (): OpportunityGraphLogContext => ({
-        lastEntry: null,
-        emit: () => {},
-      });
-
-      describe("RemoteBuddyAutonomousEngine opportunity graph queue scoring", () => {
-        test("boosts preventive scoring when queue latency is healthy and slacky", () => {
-          const baseScore = 0.45;
-          const result = adjustOpportunityGraphScore({
-            baseScore,
-            queueSignal: 0.2,
-            queueP95Ms: OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS - 300,
-            queueMetricSource: "signal",
-            dispatchSaturation: 0.15,
-            openObjectivePressure: 0.2,
-            logContext: createSilentLogContext(),
-          });
-          expect(result.score).toBeGreaterThan(baseScore);
-          expect(result.evidence.some((entry) => entry.startsWith("op_graph_boost="))).toBe(true);
-        });
-
-        test("throttles opportunity graph work when queue latency degrades", () => {
-          const baseScore = 0.8;
-          const result = adjustOpportunityGraphScore({
-            baseScore,
-            queueSignal: 0.8,
-            queueP95Ms: OPPORTUNITY_GRAPH_QUEUE_HEALTH_THRESHOLD_MS + 600,
-            queueMetricSource: "signal",
-            dispatchSaturation: 0.7,
-            openObjectivePressure: 0.65,
-            logContext: createSilentLogContext(),
-          });
-          expect(result.score).toBeLessThan(baseScore);
-          expect(result.evidence.some((entry) => entry.startsWith("op_graph_throttle="))).toBe(true);
-          expect(
-            result.evidence.find((entry) => entry.startsWith("op_graph_throttle="))?.includes("_floor"),
-          ).toBe(false);
-        });
-
-        test("applies severe throttle floor and pause logs when queue latency spikes", () => {
-          const baseScore = 1;
-          const result = adjustOpportunityGraphScore({
-            baseScore,
-            queueSignal: 1,
-            queueP95Ms: OPPORTUNITY_GRAPH_QUEUE_SEVERE_MS + 1500,
-            queueMetricSource: "signal",
-            dispatchSaturation: 0.95,
-            openObjectivePressure: 0.95,
-            logContext: createSilentLogContext(),
-          });
-          expect(result.score).toBeCloseTo(OPPORTUNITY_GRAPH_THROTTLE_FLOOR, 6);
-          expect(
-            result.evidence.find((entry) => entry.startsWith("op_graph_throttle="))?.includes("_floor"),
-          ).toBe(true);
-        });
-      });
-
-      describe("RemoteBuddyAutonomousEngine queue latency parsing", () => {
-        test("parses ms, seconds, and microseconds evidence consistently", () => {
-          const patterns = [/\bp95[:=]?\s*([0-9.]+)\s*(ms|s|us)\b/i];
-          expect(parseLatencyEvidenceInMs("p95: 500 ms", patterns)?.value).toBeCloseTo(500);
-          expect(parseLatencyEvidenceInMs("p95=2 s", patterns)?.value).toBeCloseTo(2_000);
-          expect(parseLatencyEvidenceInMs("p95 750 us", patterns)?.value).toBeCloseTo(0.75);
-        });
-      });
-    })
-    .catch(() => {});
 }
