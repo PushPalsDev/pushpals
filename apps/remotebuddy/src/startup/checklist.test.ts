@@ -96,7 +96,7 @@ describe("StartupChecklist", () => {
     expect(result.failure?.step).toBe(1);
     expect(result.failure?.category).toBe("runtime");
     expect(result.failure?.detail).toContain("1.0.9");
-    expect(result.failure?.action).toContain("Bun 1.1");
+    expect(result.failure?.action).toContain("Install Bun >= 1.1.0");
     expect(result.history).toHaveLength(1);
     const bunPhase = telemetry.find(
       (event): event is StartupTelemetryPhaseEvent =>
@@ -129,6 +129,65 @@ describe("StartupChecklist", () => {
       (entry) => entry.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
     );
     expect(dockerRecord?.status).toBe("fail");
+  });
+
+  test("relaxed Bun runtime gating bypasses probe failures", async () => {
+    const ctx = buildContext({
+      readBunVersion: async () => {
+        throw new Error("bun shim missing");
+      },
+    });
+    const result = await runStartupPreflight(ctx, {
+      runtimeChecks: { bun: "relaxed" },
+    });
+    expect(result.ok).toBe(true);
+    const bunRecord = result.history.find(
+      (entry) => entry.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(bunRecord?.detail).toContain("relaxed");
+  });
+
+  test("relaxed Docker runtime gating bypasses probe failures", async () => {
+    const ctx = buildContext({
+      readDockerVersion: async () => {
+        throw new Error("docker socket missing");
+      },
+    });
+    const result = await runStartupPreflight(ctx, {
+      runtimeChecks: { docker: "relaxed" },
+    });
+    expect(result.ok).toBe(true);
+    const dockerRecord = result.history.find(
+      (entry) => entry.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    expect(dockerRecord?.detail).toContain("relaxed");
+  });
+
+  test("docker runtime gating auto-relaxes when capability indicates no docker support", async () => {
+    const ctx = buildContext({
+      runtimeCapabilities: { docker: false },
+      readDockerVersion: async () => {
+        throw new Error("should not be called");
+      },
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(true);
+    const dockerRecord = result.history.find(
+      (entry) => entry.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    expect(dockerRecord?.detail).toContain("relaxed");
+  });
+
+  test("runtime checks reject malformed version payloads with digits plus junk", async () => {
+    const ctx = buildContext({
+      readBunVersion: async () => "Bun 1.3.0 release build",
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(false);
+    const bunRecord = result.history.find(
+      (entry) => entry.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(bunRecord?.detail).toContain("unexpected payload");
   });
 
   test("supports explicit dirty-worktree bypass option", async () => {

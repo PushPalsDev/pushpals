@@ -2215,6 +2215,119 @@ export function buildEngineFallbackCandidates(params: {
     });
 }
 
+export function isZeroLatencyAdjacencyEligible(params: {
+  snapshot: Pick<Snapshot, "open_objectives" | "top_signals" | "state_traits">;
+  engineInspiration: EngineInspirationContext;
+  minSignalStrength?: number;
+}): boolean {
+  const openObjectiveCount = Array.isArray(params.snapshot.open_objectives)
+    ? params.snapshot.open_objectives.length
+    : 0;
+  if (openObjectiveCount > 0) return false;
+  const adjacencyBlocks = params.engineInspiration.building_blocks.filter((block) =>
+    block.algorithm.toLowerCase().includes("adjacent"),
+  );
+  if (adjacencyBlocks.length === 0) return false;
+  const threshold = typeof params.minSignalStrength === "number" ? params.minSignalStrength : 0.55;
+  const queueSignal = maxSignalScore(params.snapshot, ["queue_health"]);
+  const regretSignal = maxSignalScore(params.snapshot, ["regret_signal"]);
+  if (queueSignal < threshold && regretSignal < threshold) return false;
+  const hasCommitHints = params.engineInspiration.commit_history_hints.length > 0;
+  const hasTrustedSource = params.engineInspiration.source_patterns.some(
+    (pattern) => pattern.source_curation_status === "trusted",
+  );
+  return hasCommitHints || hasTrustedSource;
+}
+
+function describeAdjacencyHint(hint: EngineCommitHistoryHint | undefined): string | null {
+  if (!hint) return null;
+  const sample = Array.isArray(hint.sample_subjects) ? hint.sample_subjects[0] : null;
+  if (sample) return `${hint.label}: leverage ${sample}`;
+  return hint.label || null;
+}
+
+export function buildZeroLatencyAdjacentCandidates(params: {
+  engineInspiration: EngineInspirationContext;
+  snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
+  visionSectionRefs: string[];
+  maxCandidates?: number;
+}): Array<Record<string, unknown>> {
+  const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
+  const adjacencyBlocks = params.engineInspiration.building_blocks.filter((block) =>
+    block.algorithm.toLowerCase().includes("adjacent"),
+  );
+  if (adjacencyBlocks.length === 0) return [];
+  const maxCandidates = Number.isFinite(params.maxCandidates)
+    ? Math.max(1, Math.min(4, Math.floor(params.maxCandidates as number)))
+    : 2;
+  const hints = params.engineInspiration.commit_history_hints;
+  const candidates: Array<Record<string, unknown>> = [];
+  for (const [index, block] of adjacencyBlocks.slice(0, maxCandidates).entries()) {
+    const shape = block.candidate_shape;
+    const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, shape.trigger_type);
+    const hint = hints[index] ?? hints[0];
+    const hintDetail = describeAdjacencyHint(hint);
+    const featureHypotheses = [
+      `Zero-latency adjacency: recombine ${block.algorithm} with current queue pressure.`,
+      hintDetail,
+      block.summary,
+      block.hypothesis,
+    ]
+      .filter(Boolean)
+      .slice(0, 3);
+    const visionReason = hintDetail
+      ? `Adjacency motif "${hint?.label}" mapped into ${block.component_area ?? shape.component_area}.`
+      : `Apply ${block.algorithm} adjacency to relieve queue pressure.`;
+    const sourceKey = deriveInspirationSourceKey({
+      sourceFingerprint: block.source_fingerprint,
+      sourceType: block.source_type,
+      sourceLabel: block.source_label,
+      sourceUrl: block.source_url,
+    });
+    candidates.push({
+      id: `cand_adjacent_${block.id}_${randomUUID().slice(0, 8)}`,
+      title: `Zero-latency adjacency: ${block.algorithm}`,
+      objective_type: shape.objective_type,
+      problem_statement:
+        hintDetail ??
+        `Rapidly adapt ${block.algorithm} to queue and regret signals without waiting for LLM ideation.`,
+      trigger_type: shape.trigger_type,
+      component_area: shape.component_area,
+      target_paths: [...shape.target_paths],
+      scope: {
+        read_anywhere: false,
+        write_globs: [...shape.write_globs],
+      },
+      risk_level: shape.risk_level,
+      expected_validation: [...shape.expected_validation],
+      estimated_effort: "small",
+      why_now_signal_ids: signalIds,
+      confidence: clamp01(0.6 + block.score * 0.25),
+      vision_alignment_reason: visionReason,
+      vision_section_refs: sectionRefs,
+      feature_hypotheses: featureHypotheses,
+      engine_trial: {
+        building_block_id: block.id,
+        algorithm: block.algorithm,
+        source: "engine_fallback",
+        score: block.score,
+        objective_ids: block.objective_ids,
+        gap_ids: block.gap_ids,
+        ...(sourceKey ? { source_key: sourceKey } : {}),
+        ...(block.source_type ? { source_type: block.source_type } : {}),
+        ...(block.source_label ? { source_label: block.source_label } : {}),
+        ...(block.source_url ? { source_url: block.source_url } : {}),
+        ...(block.source_fingerprint ? { source_fingerprint: block.source_fingerprint } : {}),
+        summary: block.summary,
+        hypothesis: block.hypothesis,
+      },
+      requires_user_input: false,
+      question_if_blocked: "",
+    });
+  }
+  return candidates;
+}
+
 function asBoolean(value: unknown, fallback = false): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") {
@@ -3450,6 +3563,28 @@ export class RemoteBuddyAutonomousEngine {
             `[RemoteBuddyAutonomousEngine] tick ${runId}: ideation returned no candidates; using ${adjacency.length} zero-latency adjacency candidates.`,
           );
           rawCandidates = adjacency;
+        }
+      }
+      if (rawCandidates.length === 0) {
+        if (
+          isZeroLatencyAdjacencyEligible({
+            snapshot,
+            engineInspiration,
+            minSignalStrength: 0.55,
+          })
+        ) {
+          const adjacency = buildZeroLatencyAdjacentCandidates({
+            engineInspiration,
+            snapshotTopSignals: snapshot.top_signals,
+            visionSectionRefs: visionContext.section_numbers,
+            maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+          });
+          if (adjacency.length > 0) {
+            console.log(
+              `[RemoteBuddyAutonomousEngine] tick ${runId}: ideation returned no candidates; using ${adjacency.length} zero-latency adjacency candidate(s).`,
+            );
+            rawCandidates = adjacency;
+          }
         }
       }
       if (rawCandidates.length === 0) {
