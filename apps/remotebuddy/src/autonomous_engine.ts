@@ -800,6 +800,81 @@ export interface EngineInspirationContext {
   commit_history_hints: EngineCommitHistoryHint[];
 }
 
+type OpportunityGraphNodeQueue = {
+  id: string;
+  kind: "queue_lane";
+  label: string;
+  pressure: number;
+  latencyMs: number | null;
+  pending: number | null;
+  slackHint: number | null;
+  evidence: string;
+};
+
+type OpportunityGraphNodeWorker = {
+  id: string;
+  kind: "worker_pool";
+  label: string;
+  component_area: AutonomyComponentArea;
+  load: number;
+  idleCapacity: number;
+  dispatchCount: number;
+  maxDispatchPerHour: number;
+};
+
+type OpportunityGraphNodeSlack = {
+  id: string;
+  kind: "slack";
+  label: string;
+  slack: number;
+};
+
+type OpportunityGraphNode = OpportunityGraphNodeQueue | OpportunityGraphNodeWorker | OpportunityGraphNodeSlack;
+
+type OpportunityGraphEdgeFocus = "queue_pressure" | "latency_slack";
+
+type OpportunityGraphEdge = {
+  id: string;
+  from: string;
+  to: string;
+  weight: number;
+  focus: OpportunityGraphEdgeFocus;
+  rationale: string[];
+};
+
+type OpportunityAdjacencyEntry = {
+  queueWeight: number;
+  slackWeight: number;
+  idleCapacity: number;
+  reasons: string[];
+};
+
+type QueueWorkerOpportunityGraph = {
+  nodes: OpportunityGraphNode[];
+  edges: OpportunityGraphEdge[];
+  adjacencyByArea: Map<AutonomyComponentArea, OpportunityAdjacencyEntry>;
+  queuePressure: number;
+  latencySlack: number;
+  latencySlackSource: "telemetry" | "fallback";
+  latencyEvidenceCount: number;
+  workerIdleCapacity: number;
+  reliabilityCapacityGate: ReliabilityCapacityGate;
+};
+
+type ReliabilityCapacityGate = {
+  allowed: boolean;
+  reason: "ok" | "latency_slack" | "queue_pressure" | "latency_and_queue";
+  slackOk: boolean;
+  queueOk: boolean;
+  latencySlack: number;
+  latencySlackThreshold: number;
+  queuePressure: number;
+  queuePressureThreshold: number;
+  latencySource: "telemetry" | "fallback";
+  latencyEvidenceCount: number;
+  latencyEvidenceOk: boolean;
+};
+
 type EngineIdeaInputSnapshot = Pick<
   Snapshot,
   "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget"
@@ -832,6 +907,66 @@ function asStringArray(value: unknown): string[] {
 function asNumber(value: unknown, fallback = 0): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function parseTelemetryEvidence(text: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  const raw = asString(text);
+  if (!raw) return out;
+  const regex =
+    /([A-Za-z0-9_.-]+)\s*(?:=|:)\s*([-+]?(?:\d+(?:[,_]\d+)*(?:\.\d+)?|\.\d+)(?:e[-+]?\d+)?)(?:\s*(ms|millisecond|milliseconds|s|sec|secs|second|seconds|us|microsecond|microseconds|percent|pct|%))?/gi;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(raw))) {
+    const key = match[1]?.toLowerCase();
+    let numericText = match[2] ?? "";
+    if (!key || !numericText) continue;
+    numericText = numericText.replace(/[_\s,]/g, "");
+    const value = Number.parseFloat(numericText);
+    if (!Number.isFinite(value)) continue;
+    const unit = (match[3] ?? "").toLowerCase();
+    out[key] = normalizeTelemetryValue(value, unit);
+  }
+  return out;
+}
+
+function normalizeTelemetryValue(value: number, unit: string): number {
+  if (!unit) return value;
+  switch (unit) {
+    case "ms":
+    case "millisecond":
+    case "milliseconds":
+      return value;
+    case "s":
+    case "sec":
+    case "secs":
+    case "second":
+    case "seconds":
+      return value * 1000;
+    case "us":
+    case "microsecond":
+    case "microseconds":
+      return value / 1000;
+    case "%":
+    case "percent":
+    case "pct":
+      return value / 100;
+    default:
+      return value;
+  }
+}
+
+function meanOrNull(values: number[]): number | null {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const sum = values.reduce((acc, value) => acc + value, 0);
+  return sum / values.length;
+}
+
+function latencySlackFromMs(latencyMs: number): number {
+  if (!Number.isFinite(latencyMs) || latencyMs <= 0) return 1;
+  if (latencyMs >= LATENCY_TELEMETRY_MAX_MS) return 0;
+  const normalized = 1 - latencyMs / LATENCY_TELEMETRY_MAX_MS;
+  const targetBias = clamp01(1 - latencyMs / LATENCY_TELEMETRY_TARGET_MS);
+  return clamp01(0.5 * normalized + 0.5 * targetBias);
 }
 
 function uniqueLowercaseTokens(values: string[], max = 24): string[] {
@@ -869,6 +1004,24 @@ const COMPONENT_AREAS = new Set<AutonomyComponentArea>([
   "tests/integration",
   "tests/unit",
 ]);
+
+const RELIABILITY_OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>(["flaky_test", "lint_fix", "type_fix", "small_refactor"]);
+
+const MIN_LATENCY_SLACK_FOR_RELIABILITY = 0.35;
+const MAX_QUEUE_PRESSURE_FOR_RELIABILITY = 0.65;
+const RELIABILITY_GATE_LOG_LIMIT = 3;
+const LATENCY_TELEMETRY_TARGET_MS = 900;
+const LATENCY_TELEMETRY_MAX_MS = 2400;
+const LATENCY_SLACK_HINT_WEIGHT = 0.65;
+const LATENCY_SLACK_LATENCY_WEIGHT = 0.35;
+const LATENCY_SLACK_FALLBACK = 0.2;
+const ADJACENCY_OPPORTUNITY_BOOST_WEIGHT = 0.12;
+const ADJACENCY_LOG_THRESHOLD = 0.02;
+const BREADTH_GUARDRAIL_FACTOR: Record<PolicyRule["maxBreadth"], number> = {
+  narrow: 0.45,
+  medium: 0.75,
+  broad: 1,
+};
 
 function asAutonomyObjectiveType(value: unknown): AutonomyObjectiveType | null {
   const normalized = asString(value) as AutonomyObjectiveType;
@@ -1431,6 +1584,97 @@ function inferRiskLevelFromText(text: string, tags: string[]): "low" | "medium" 
   if (/\b(auth|permission|security|credential|secret|encryption)\b/i.test(joined)) return "medium";
   if (/\b(migration|schema rewrite|large rewrite|breaking change)\b/i.test(joined)) return "high";
   return "low";
+}
+
+function isReliabilityObjectiveType(value: AutonomyObjectiveType): boolean {
+  return RELIABILITY_OBJECTIVE_TYPES.has(value);
+}
+
+type AdjacencyBiasResult = {
+  adjacencyWeight: number;
+  adjacencyFocus: "none" | OpportunityGraphEdgeFocus | "mixed";
+  adjacencyBoost: number;
+  adjacencyGuardrail: number;
+  adjacencyReasons: string[];
+};
+
+function computeAdjacencyBias(params: {
+  candidate: Pick<AutonomyCandidate, "objective_type" | "trigger_type" | "risk_level">;
+  adjacencyEntry?: OpportunityAdjacencyEntry | null;
+  policy?: PolicyRule;
+}): AdjacencyBiasResult {
+  const adjacencyEntry = params.adjacencyEntry ?? null;
+  const adjacencyReasons = adjacencyEntry ? [...adjacencyEntry.reasons] : [];
+  let adjacencyWeight = 0;
+  let adjacencyFocus: AdjacencyBiasResult["adjacencyFocus"] = "none";
+  if (adjacencyEntry) {
+    if (isReliabilityObjectiveType(params.candidate.objective_type)) {
+      adjacencyWeight = clamp01(0.2 * adjacencyEntry.queueWeight + 0.8 * adjacencyEntry.slackWeight);
+      adjacencyFocus =
+        adjacencyEntry.slackWeight > adjacencyEntry.queueWeight
+          ? "latency_slack"
+          : adjacencyEntry.queueWeight > adjacencyEntry.slackWeight
+            ? "queue_pressure"
+            : "mixed";
+    } else if (params.candidate.trigger_type === "queue_health") {
+      adjacencyWeight = clamp01(0.75 * adjacencyEntry.queueWeight + 0.25 * adjacencyEntry.slackWeight);
+      adjacencyFocus = "queue_pressure";
+    } else {
+      adjacencyWeight = clamp01(0.5 * adjacencyEntry.queueWeight + 0.5 * adjacencyEntry.slackWeight);
+      adjacencyFocus =
+        adjacencyEntry.queueWeight > adjacencyEntry.slackWeight
+          ? "queue_pressure"
+          : adjacencyEntry.slackWeight > adjacencyEntry.queueWeight
+            ? "latency_slack"
+            : "mixed";
+    }
+  }
+  let adjacencyGuardrail = adjacencyEntry ? 1 : 0;
+  const policyReasons: string[] = [];
+  if (params.policy) {
+    if (!params.policy.autonomousAllowed) {
+      adjacencyGuardrail = 0;
+      policyReasons.push("policy_autonomy_disabled");
+    } else {
+      const candidateRiskOrder = RISK_ORDER[params.candidate.risk_level];
+      const policyRiskOrder = RISK_ORDER[params.policy.maxRisk];
+      const riskHeadroom = policyRiskOrder - candidateRiskOrder;
+      if (riskHeadroom <= 0) {
+        adjacencyGuardrail = 0;
+        policyReasons.push("policy_risk_headroom_exhausted");
+      } else {
+        const normalizedHeadroom = clamp01(riskHeadroom / Math.max(1, policyRiskOrder));
+        const breadthFactor = BREADTH_GUARDRAIL_FACTOR[params.policy.maxBreadth];
+        adjacencyGuardrail = clamp01(normalizedHeadroom * breadthFactor);
+        policyReasons.push(`policy_headroom=${normalizedHeadroom.toFixed(2)}`);
+        policyReasons.push(`policy_breadth_cap=${breadthFactor.toFixed(2)}`);
+        if (params.candidate.risk_level === "high") {
+          adjacencyGuardrail = Math.min(adjacencyGuardrail, 0.25);
+          policyReasons.push("policy_high_risk_cap");
+        }
+      }
+    }
+  } else if (!adjacencyEntry) {
+    adjacencyGuardrail = 0;
+  }
+  const adjacencyBoost =
+    adjacencyWeight > 0
+      ? adjacencyWeight * ADJACENCY_OPPORTUNITY_BOOST_WEIGHT * adjacencyGuardrail
+      : 0;
+  if ((adjacencyWeight > 0 || adjacencyGuardrail < 1) && adjacencyReasons.length < 3) {
+    adjacencyReasons.push(`guardrail=${adjacencyGuardrail.toFixed(2)}`);
+  }
+  for (const reason of policyReasons) {
+    if (adjacencyReasons.length >= 3) break;
+    adjacencyReasons.push(reason);
+  }
+  return {
+    adjacencyWeight,
+    adjacencyFocus,
+    adjacencyBoost,
+    adjacencyGuardrail,
+    adjacencyReasons,
+  };
 }
 
 function matchObjectiveIdsFromText(text: string, fallback: CompiledVisionObjective[]): string[] {
@@ -2393,6 +2637,216 @@ export function buildEngineInspirationContext(params: {
   };
 }
 
+function evaluateReliabilityCapacityGate(params: {
+  latencySlack: number;
+  latencySource: "telemetry" | "fallback";
+  latencyEvidenceCount: number;
+  latencyEvidenceOk: boolean;
+  queuePressure: number;
+  minLatencySlack: number;
+  maxQueuePressure: number;
+}): ReliabilityCapacityGate {
+  const latencySlack = clamp01(params.latencySlack);
+  const queuePressure = clamp01(params.queuePressure);
+  const slackOk = params.latencyEvidenceOk && latencySlack >= params.minLatencySlack;
+  const queueOk = queuePressure <= params.maxQueuePressure;
+  let reason: ReliabilityCapacityGate["reason"] = "ok";
+  if (!slackOk && !queueOk) {
+    reason = "latency_and_queue";
+  } else if (!slackOk) {
+    reason = "latency_slack";
+  } else if (!queueOk) {
+    reason = "queue_pressure";
+  }
+  return {
+    allowed: slackOk && queueOk,
+    reason,
+    slackOk,
+    queueOk,
+    latencySlack,
+    latencySlackThreshold: params.minLatencySlack,
+    queuePressure,
+    queuePressureThreshold: params.maxQueuePressure,
+    latencySource: params.latencySource,
+    latencyEvidenceCount: params.latencyEvidenceCount,
+    latencyEvidenceOk: params.latencyEvidenceOk,
+  };
+}
+
+function buildQueueWorkerOpportunityGraph(params: {
+  snapshot: Snapshot;
+  dispatchLimits: {
+    global?: number;
+    byComponent?: Record<string, number>;
+  };
+  componentAreas?: AutonomyComponentArea[];
+}): QueueWorkerOpportunityGraph {
+  const componentAreas = params.componentAreas ?? Array.from(COMPONENT_AREAS);
+  const dispatchLimit = Math.max(1, Math.floor(asNumber(params.dispatchLimits.global, 6)));
+  const queueSignals = Array.isArray(params.snapshot.top_signals) ? params.snapshot.top_signals : [];
+  const queueNodes: OpportunityGraphNodeQueue[] = queueSignals
+    .filter((signal) => asString(signal.type).toLowerCase() === "queue_health")
+    .slice(0, 8)
+    .map((signal, index) => {
+      const evidence = asString(signal.evidence);
+      const telemetry = parseTelemetryEvidence(evidence);
+      const latencyRaw =
+        telemetry.latency_ms ??
+        telemetry.latency_p95 ??
+        telemetry.latency ??
+        telemetry.p95 ??
+        undefined;
+      const pendingRaw = telemetry.pending ?? telemetry.backlog ?? telemetry.inflight ?? undefined;
+      const saturationRaw = telemetry.saturation ?? telemetry.utilization ?? telemetry.load ?? undefined;
+      const slackHintRaw =
+        telemetry.slack ??
+        (typeof saturationRaw === "number" ? 1 - clamp01(saturationRaw) : undefined);
+      const slackHint =
+        typeof slackHintRaw === "number" && Number.isFinite(slackHintRaw) ? clamp01(slackHintRaw) : null;
+      return {
+        id: asString(signal.signal_id) || `queue_${index}`,
+        kind: "queue_lane",
+        label: asString(signal.signal_id) || `queue_signal_${index}`,
+        pressure: clamp01(asNumber(signal.value, 0)),
+        latencyMs: Number.isFinite(latencyRaw) ? Math.max(0, Math.floor(latencyRaw)) : null,
+        pending: Number.isFinite(pendingRaw) ? Math.max(0, Math.floor(pendingRaw)) : null,
+        slackHint,
+        evidence,
+      };
+    });
+  const queueSignalPressure = queueNodes.length > 0 ? Math.max(...queueNodes.map((node) => node.pressure)) : 0;
+  const queueTraitPressure = maxTraitScore(params.snapshot, /\b(queue|latency|throughput|pending|worker)\b/i);
+  const dispatchPressure = clamp01(
+    asNumber(params.snapshot.dispatch_budget?.global_count_last_hour, 0) / dispatchLimit,
+  );
+  const queuePressure = clamp01(
+    0.55 * queueSignalPressure + 0.25 * queueTraitPressure + 0.2 * dispatchPressure,
+  );
+  const slackHintValues = queueNodes
+    .map((node) => (typeof node.slackHint === "number" ? clamp01(node.slackHint) : null))
+    .filter((value): value is number => value !== null);
+  const latencyDerivedValues = queueNodes
+    .map((node) => (typeof node.latencyMs === "number" ? latencySlackFromMs(node.latencyMs) : null))
+    .filter((value): value is number => value !== null);
+  const slackHintAvg = meanOrNull(slackHintValues);
+  const latencyDerivedAvg = meanOrNull(latencyDerivedValues);
+  let telemetrySlack: number | null = null;
+  if (slackHintAvg !== null || latencyDerivedAvg !== null) {
+    const hintWeight = slackHintAvg !== null ? LATENCY_SLACK_HINT_WEIGHT : 0;
+    const latencyWeight = latencyDerivedAvg !== null ? LATENCY_SLACK_LATENCY_WEIGHT : 0;
+    const weightTotal = hintWeight + latencyWeight || 1;
+    telemetrySlack = clamp01(
+      ((slackHintAvg ?? latencyDerivedAvg ?? 0) * hintWeight +
+        (latencyDerivedAvg ?? slackHintAvg ?? 0) * latencyWeight) /
+        weightTotal,
+    );
+  }
+  const latencyEvidenceCount =
+    (slackHintAvg !== null ? slackHintValues.length : 0) +
+    (latencyDerivedAvg !== null ? latencyDerivedValues.length : 0);
+  const latencySlack = telemetrySlack ?? LATENCY_SLACK_FALLBACK;
+  const latencySlackSource: "telemetry" | "fallback" = telemetrySlack !== null ? "telemetry" : "fallback";
+  const latencyEvidenceOk = telemetrySlack !== null && latencyEvidenceCount > 0;
+  const reliabilityCapacityGate = evaluateReliabilityCapacityGate({
+    latencySlack,
+    latencySource: latencySlackSource,
+    latencyEvidenceCount,
+    latencyEvidenceOk,
+    queuePressure,
+    minLatencySlack: MIN_LATENCY_SLACK_FOR_RELIABILITY,
+    maxQueuePressure: MAX_QUEUE_PRESSURE_FOR_RELIABILITY,
+  });
+
+  const workerCounts = params.snapshot.dispatch_budget?.by_component_count_last_hour ?? {};
+  const workerNodes: OpportunityGraphNodeWorker[] = componentAreas.map((area) => {
+    const limit = Math.max(1, Math.floor(asNumber(params.dispatchLimits.byComponent?.[area], dispatchLimit)));
+    const dispatchCount = Math.max(0, Math.floor(asNumber((workerCounts as Record<string, number>)[area], 0)));
+    const load = clamp01(dispatchCount / limit);
+    const idleCapacity = clamp01(1 - load);
+    return {
+      id: `worker:${area}`,
+      kind: "worker_pool",
+      label: area,
+      component_area: area,
+      load,
+      idleCapacity,
+      dispatchCount,
+      maxDispatchPerHour: limit,
+    };
+  });
+  const workerIdleCapacity =
+    workerNodes.length > 0
+      ? workerNodes.reduce((sum, node) => sum + node.idleCapacity, 0) / workerNodes.length
+      : 0.5;
+
+  const adjacencyByArea = new Map<AutonomyComponentArea, OpportunityAdjacencyEntry>();
+  const edges: OpportunityGraphEdge[] = [];
+  const slackNode: OpportunityGraphNodeSlack = {
+    id: "slack:latency",
+    kind: "slack",
+    label: "latency_slack",
+    slack: latencySlack,
+  };
+
+  for (const worker of workerNodes) {
+    const reasons: string[] = [];
+    let queueWeight = 0;
+    for (const queueNode of queueNodes) {
+      const hint = INSPIRATION_COMPONENT_HINTS.find((entry) => entry.area === worker.component_area);
+      const focusMultiplier =
+        hint && (hint.pattern.test(queueNode.label) || hint.pattern.test(queueNode.evidence)) ? 1 : 0.5;
+      const weight = clamp01(queueNode.pressure * worker.idleCapacity * (0.7 + 0.3 * focusMultiplier));
+      if (weight <= 0.01) continue;
+      queueWeight = Math.max(queueWeight, weight);
+      edges.push({
+        id: `edge:${queueNode.id}->${worker.component_area}`,
+        from: queueNode.id,
+        to: worker.id,
+        weight,
+        focus: "queue_pressure",
+        rationale: [
+          `queue_pressure=${queueNode.pressure.toFixed(2)}`,
+          `idle=${worker.idleCapacity.toFixed(2)}`,
+        ],
+      });
+      if (reasons.length < 3) reasons.push(`${queueNode.label}:${weight.toFixed(2)}`);
+    }
+    const slackWeight = clamp01(latencySlack * worker.idleCapacity);
+    if (slackWeight > 0.01) {
+      edges.push({
+        id: `edge:slack->${worker.component_area}`,
+        from: slackNode.id,
+        to: worker.id,
+        weight: slackWeight,
+        focus: "latency_slack",
+        rationale: [
+          `latency_slack=${latencySlack.toFixed(2)}`,
+          `idle=${worker.idleCapacity.toFixed(2)}`,
+        ],
+      });
+      if (reasons.length < 3) reasons.push(`slack:${slackWeight.toFixed(2)}`);
+    }
+    adjacencyByArea.set(worker.component_area, {
+      queueWeight,
+      slackWeight,
+      idleCapacity: worker.idleCapacity,
+      reasons,
+    });
+  }
+  edges.sort((a, b) => b.weight - a.weight);
+  return {
+    nodes: [...queueNodes, ...workerNodes, slackNode],
+    edges,
+    adjacencyByArea,
+    queuePressure,
+    latencySlack,
+    latencySlackSource,
+    latencyEvidenceCount,
+    workerIdleCapacity,
+    reliabilityCapacityGate,
+  };
+}
+
 function selectVisionSectionRefs(sectionRefs: string[]): string[] {
   const preferred = ["6", "7", "8", "4", "3", "0", "5"];
   const normalized = sectionRefs.map((value) => asString(value)).filter(Boolean);
@@ -3306,13 +3760,19 @@ export class RemoteBuddyAutonomousEngine {
     );
   }
 
-  private scoreCandidate(snapshot: Snapshot, candidate: AutonomyCandidate, llmScore: number) {
+  private scoreCandidate(
+    snapshot: Snapshot,
+    candidate: AutonomyCandidate,
+    llmScore: number,
+    opportunityGraph: QueueWorkerOpportunityGraph | null,
+  ) {
     const patternKey = makePatternKey(
       candidate.objective_type,
       candidate.target_paths,
       candidate.trigger_type,
       candidate.component_area,
     );
+    const policy = POLICY[candidate.objective_type];
     const prior = snapshot.feedback_priors.find((entry) => entry.pattern_key === patternKey);
     const enginePrior = candidate.engine_trial
       ? (snapshot.engine_idea_priors ?? []).find(
@@ -3385,6 +3845,19 @@ export class RemoteBuddyAutonomousEngine {
       });
     }
     const normalizedPenalties = normalizePenalties(penalties);
+    const adjacencyEntry = opportunityGraph?.adjacencyByArea.get(candidate.component_area) ?? null;
+    const latencySlack = opportunityGraph?.latencySlack ?? 0.5;
+    const queuePressure = opportunityGraph?.queuePressure ?? 0;
+    const adjacencyBias = computeAdjacencyBias({
+      candidate,
+      adjacencyEntry,
+      policy,
+    });
+    if (adjacencyBias.adjacencyBoost >= ADJACENCY_LOG_THRESHOLD) {
+      console.log(
+        `[RemoteBuddyAutonomousEngine] adjacency_bias candidate=${candidate.id} area=${candidate.component_area} focus=${adjacencyBias.adjacencyFocus} weight=${adjacencyBias.adjacencyWeight.toFixed(2)} guardrail=${adjacencyBias.adjacencyGuardrail.toFixed(2)} reasons=${adjacencyBias.adjacencyReasons.join("|")}`,
+      );
+    }
     const finalScore =
       0.46 * clamp01(llmScore) +
       0.2 * clamp01(impactSignal) +
@@ -3393,7 +3866,8 @@ export class RemoteBuddyAutonomousEngine {
       sourcePriorSignal.priorScore +
       enginePriorSignal.noveltyBonus +
       sourcePriorSignal.noveltyBonus +
-      sourcePriorSignal.trustBoost -
+      sourcePriorSignal.trustBoost +
+      adjacencyBias.adjacencyBoost -
       penaltyTotal(normalizedPenalties);
     return {
       patternKey,
@@ -3417,6 +3891,13 @@ export class RemoteBuddyAutonomousEngine {
       engineSourceCurationStatus: sourcePriorSignal.curationStatus,
       engineSourceCurationReason: sourcePriorSignal.curationReason,
       engineSourceTrustBoost: sourcePriorSignal.trustBoost,
+      adjacencyWeight: adjacencyBias.adjacencyWeight,
+      adjacencyBoost: adjacencyBias.adjacencyBoost,
+      adjacencyFocus: adjacencyBias.adjacencyFocus,
+      adjacencyReasons: adjacencyBias.adjacencyReasons,
+      adjacencyGuardrail: adjacencyBias.adjacencyGuardrail,
+      latencySlack,
+      queuePressure,
     };
   }
 
@@ -3613,6 +4094,25 @@ export class RemoteBuddyAutonomousEngine {
         sourceInsights,
         commitHistoryHints,
       });
+      const opportunityGraph = buildQueueWorkerOpportunityGraph({
+        snapshot,
+        dispatchLimits: {
+          global: this.cfg.maxDispatchPerHour,
+          byComponent: this.cfg.maxDispatchPerHourByComponent ?? {},
+        },
+        componentAreas: Array.from(COMPONENT_AREAS),
+      });
+      const topOpportunityEdge = opportunityGraph.edges[0];
+      const reliabilityGateStatus = opportunityGraph.reliabilityCapacityGate.allowed
+        ? "allowed"
+        : `blocked:${opportunityGraph.reliabilityCapacityGate.reason}`;
+      console.log(
+        `[RemoteBuddyAutonomousEngine] opportunity_graph: queue_pressure=${opportunityGraph.queuePressure.toFixed(2)} latency_slack=${opportunityGraph.latencySlack.toFixed(2)} latency_source=${opportunityGraph.latencySlackSource} latency_samples=${opportunityGraph.latencyEvidenceCount} worker_idle=${opportunityGraph.workerIdleCapacity.toFixed(2)} reliability_gate=${reliabilityGateStatus} top_edge=${
+          topOpportunityEdge
+            ? `${topOpportunityEdge.focus}:${topOpportunityEdge.from}->${topOpportunityEdge.to}@${topOpportunityEdge.weight.toFixed(2)}`
+            : "none"
+        }`,
+      );
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
 
@@ -3697,6 +4197,18 @@ export class RemoteBuddyAutonomousEngine {
       const dropReasonCounts = new Map<string, number>();
       const recordDropReason = (reason: string): void => {
         dropReasonCounts.set(reason, (dropReasonCounts.get(reason) ?? 0) + 1);
+      };
+      const reliabilityGate = opportunityGraph.reliabilityCapacityGate;
+      let reliabilityGateLogCount = 0;
+      let reliabilityGateAllowedLogged = false;
+      const logReliabilityGate = (status: "allowed" | "blocked", reason: string): void => {
+        if (reliabilityGateLogCount >= RELIABILITY_GATE_LOG_LIMIT) return;
+        console.log(
+          `[RemoteBuddyAutonomousEngine] reliability_capacity_gate status=${status} reason=${reason} slack=${reliabilityGate.latencySlack.toFixed(2)}/${reliabilityGate.latencySlackThreshold.toFixed(2)} queue_pressure=${reliabilityGate.queuePressure.toFixed(2)}/${reliabilityGate.queuePressureThreshold.toFixed(2)} latency_source=${reliabilityGate.latencySource} latency_samples=${reliabilityGate.latencyEvidenceCount} latency_evidence=${
+            reliabilityGate.latencyEvidenceOk ? "present" : "missing"
+          }`,
+        );
+        reliabilityGateLogCount += 1;
       };
       const ingestRawCandidates = (
         rawList: unknown[],
@@ -3796,6 +4308,20 @@ export class RemoteBuddyAutonomousEngine {
                 ...inferred,
                 source: source === "engine_fallback" ? "engine_fallback" : inferred.source,
               };
+            }
+          }
+          if (isReliabilityObjectiveType(candidate.objective_type)) {
+            if (!reliabilityGate.allowed) {
+              if (candidate.requires_user_input) {
+                logReliabilityGate("blocked", `${reliabilityGate.reason}_question_only`);
+              } else {
+                recordDropReason(`${source}_capacity_gate_${reliabilityGate.reason}`);
+                logReliabilityGate("blocked", reliabilityGate.reason);
+                continue;
+              }
+            } else if (!reliabilityGateAllowedLogged) {
+              logReliabilityGate("allowed", "ok");
+              reliabilityGateAllowedLogged = true;
             }
           }
           normalizedCandidates.push(candidate);
@@ -3904,7 +4430,7 @@ export class RemoteBuddyAutonomousEngine {
 
       const scored = normalizedCandidates.map((candidate) => {
         const llmScore = scoreById.get(candidate.id) ?? 0;
-        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore);
+        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore, opportunityGraph);
         return { candidate, llmScore, ...scoredCandidate };
       });
       scored.sort((a, b) => {
@@ -3981,6 +4507,13 @@ export class RemoteBuddyAutonomousEngine {
         engine_source_curation_status: row.engineSourceCurationStatus,
         engine_source_curation_reason: row.engineSourceCurationReason,
         engine_source_trust_boost: row.engineSourceTrustBoost,
+        adjacency_weight: row.adjacencyWeight,
+        adjacency_focus: row.adjacencyFocus,
+        adjacency_reasons: row.adjacencyReasons,
+        adjacency_boost: row.adjacencyBoost,
+        adjacency_guardrail: row.adjacencyGuardrail,
+        latency_slack: row.latencySlack,
+        queue_pressure: row.queuePressure,
         explore_rate_configured: adaptiveExplore.baseRate,
         effective_explore_rate: adaptiveExplore.effectiveRate,
         explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4043,6 +4576,12 @@ export class RemoteBuddyAutonomousEngine {
             selection_strategy: selectedStrategy,
             selection_roll: selection.roll,
             effective_explore_rate: adaptiveExplore.effectiveRate,
+            adjacency_weight: selected.adjacencyWeight,
+            adjacency_focus: selected.adjacencyFocus,
+            adjacency_reasons: selected.adjacencyReasons,
+            adjacency_guardrail: selected.adjacencyGuardrail,
+            latency_slack: selected.latencySlack,
+            queue_pressure: selected.queuePressure,
           }
         : {
             id: top.candidate.id,
@@ -4062,6 +4601,12 @@ export class RemoteBuddyAutonomousEngine {
             selection_strategy: "none",
             selection_roll: null,
             effective_explore_rate: adaptiveExplore.effectiveRate,
+            adjacency_weight: top.adjacencyWeight,
+            adjacency_focus: top.adjacencyFocus,
+            adjacency_reasons: top.adjacencyReasons,
+            adjacency_guardrail: top.adjacencyGuardrail,
+            latency_slack: top.latencySlack,
+            queue_pressure: top.queuePressure,
           };
       for (const row of candidatesPayload) {
         const isSelected = Boolean(row.id === selectedCandidatePayload.id);
@@ -4110,6 +4655,13 @@ export class RemoteBuddyAutonomousEngine {
               engine_source_curation_status: top.engineSourceCurationStatus,
               engine_source_curation_reason: top.engineSourceCurationReason,
               engine_source_trust_boost: top.engineSourceTrustBoost,
+              adjacency_weight: top.adjacencyWeight,
+              adjacency_focus: top.adjacencyFocus,
+              adjacency_reasons: top.adjacencyReasons,
+              adjacency_boost: top.adjacencyBoost,
+              adjacency_guardrail: top.adjacencyGuardrail,
+              latency_slack: top.latencySlack,
+              queue_pressure: top.queuePressure,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4164,6 +4716,13 @@ export class RemoteBuddyAutonomousEngine {
               engine_source_curation_status: selected.engineSourceCurationStatus,
               engine_source_curation_reason: selected.engineSourceCurationReason,
               engine_source_trust_boost: selected.engineSourceTrustBoost,
+              adjacency_weight: selected.adjacencyWeight,
+              adjacency_focus: selected.adjacencyFocus,
+              adjacency_reasons: selected.adjacencyReasons,
+              adjacency_boost: selected.adjacencyBoost,
+              adjacency_guardrail: selected.adjacencyGuardrail,
+              latency_slack: selected.latencySlack,
+              queue_pressure: selected.queuePressure,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4312,6 +4871,13 @@ export class RemoteBuddyAutonomousEngine {
             engine_source_curation_status: selected.engineSourceCurationStatus,
             engine_source_curation_reason: selected.engineSourceCurationReason,
             engine_source_trust_boost: selected.engineSourceTrustBoost,
+            adjacency_weight: selected.adjacencyWeight,
+            adjacency_focus: selected.adjacencyFocus,
+            adjacency_reasons: selected.adjacencyReasons,
+            adjacency_boost: selected.adjacencyBoost,
+            adjacency_guardrail: selected.adjacencyGuardrail,
+            latency_slack: selected.latencySlack,
+            queue_pressure: selected.queuePressure,
             explore_rate_configured: adaptiveExplore.baseRate,
             effective_explore_rate: adaptiveExplore.effectiveRate,
             explore_rate_adjustment: adaptiveExplore.adjustment,
