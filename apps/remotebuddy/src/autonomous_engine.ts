@@ -148,6 +148,259 @@ type Snapshot = {
   };
 };
 
+type QueuePriority = "interactive" | "normal" | "background";
+
+export type QueueTelemetry = {
+  capturedAt: string | null;
+  queueP95Ms: number | null;
+  idleWorkers: number | null;
+  pendingByPriority: Record<QueuePriority, number>;
+  pendingSnapshot: Array<{ id: string; priority: QueuePriority; position: number; etaMs: number }>;
+};
+
+type SkillBacklogMetric = {
+  skill: AutonomyComponentArea;
+  pending_autonomy_requests: number;
+  dispatch_last_hour: number;
+  is_target_skill: boolean;
+  backlog_ratio: number;
+};
+
+type QueueBacklogMetrics = {
+  captured_at: string | null;
+  queue_p95_ms: number | null;
+  idle_workers: number | null;
+  pending_by_priority: Record<QueuePriority, number>;
+  pending_autonomy_total: number;
+  pending_autonomy_sample_limit: number;
+  pending_autonomy_sample_size: number;
+  pending_autonomy_sample_truncated: boolean;
+  skills: SkillBacklogMetric[];
+};
+
+export type QueueThrottleReason =
+  | "queue_latency_exceeded"
+  | "no_idle_workers"
+  | "telemetry_unavailable"
+  | "recovery_cooldown";
+
+export type QueueThrottleDecision = {
+  throttle: boolean;
+  reason: QueueThrottleReason | null;
+  queueP95Ms: number | null;
+  idleWorkers: number | null;
+};
+
+export type QueueBackpressurePhase = "clear" | "engaged" | "stabilizing";
+
+export type QueueBackpressureState = {
+  phase: QueueBackpressurePhase;
+  reason: QueueThrottleReason | null;
+  engagedSinceMs: number | null;
+  healthySinceMs: number | null;
+  healthySamples: number;
+  lastTelemetry: QueueTelemetry | null;
+  lastHealthyTelemetry: QueueTelemetry | null;
+  telemetryFailureSinceMs: number | null;
+};
+
+export type QueueBackpressureTransition = "engaged" | "cleared";
+
+export type QueueBackpressureTransitionDetail = {
+  reason: QueueThrottleReason | null;
+  engagedSinceMs?: number | null;
+  durationMs?: number;
+};
+
+export type QueueBackpressureEvaluation = {
+  decision: QueueThrottleDecision;
+  transition: QueueBackpressureTransition | null;
+  transitionDetail?: QueueBackpressureTransitionDetail;
+};
+
+type QueueBackpressureControllerOptions = {
+  thresholdMs?: number;
+  recoverySamples?: number;
+  recoveryDurationMs?: number;
+  telemetryFailOpenMs?: number;
+};
+
+export class QueueBackpressureController {
+  private readonly thresholdMs: number;
+  private readonly recoverySamples: number;
+  private readonly recoveryDurationMs: number;
+  private readonly telemetryFailOpenMs: number;
+  private state: QueueBackpressureState = {
+    phase: "clear",
+    reason: null,
+    engagedSinceMs: null,
+    healthySinceMs: null,
+    healthySamples: 0,
+    lastTelemetry: null,
+    lastHealthyTelemetry: null,
+    telemetryFailureSinceMs: null,
+  };
+
+  constructor(opts: QueueBackpressureControllerOptions = {}) {
+    this.thresholdMs = opts.thresholdMs ?? QUEUE_P95_THROTTLE_MS;
+    this.recoverySamples = Math.max(1, opts.recoverySamples ?? QUEUE_RECOVERY_HEALTHY_SAMPLES);
+    this.recoveryDurationMs = Math.max(1_000, opts.recoveryDurationMs ?? QUEUE_RECOVERY_MIN_HEALTHY_MS);
+    this.telemetryFailOpenMs = Math.max(1, opts.telemetryFailOpenMs ?? QUEUE_TELEMETRY_FAIL_OPEN_MS);
+  }
+
+  evaluate(telemetry: QueueTelemetry | null, now = Date.now()): QueueBackpressureEvaluation {
+    const previousState = this.state;
+    const baseDecision = shouldThrottleQueue(telemetry, this.thresholdMs);
+    const hasHealthyTelemetry =
+      telemetry?.queueP95Ms != null && telemetry?.idleWorkers != null;
+    const telemetryFailureSinceMs = hasHealthyTelemetry
+      ? null
+      : previousState.telemetryFailureSinceMs ?? now;
+    const lastHealthyTelemetry = hasHealthyTelemetry ? telemetry : previousState.lastHealthyTelemetry;
+    const fallbackTelemetry = telemetry ?? lastHealthyTelemetry;
+    const failOpen =
+      baseDecision.reason === "telemetry_unavailable" &&
+      telemetryFailureSinceMs !== null &&
+      now - telemetryFailureSinceMs >= this.telemetryFailOpenMs;
+
+    if (failOpen) {
+      const decision: QueueThrottleDecision = {
+        throttle: false,
+        reason: null,
+        queueP95Ms: fallbackTelemetry?.queueP95Ms ?? null,
+        idleWorkers: fallbackTelemetry?.idleWorkers ?? null,
+      };
+      const transition = previousState.phase === "clear" ? null : "cleared";
+      const transitionDetail =
+        transition === "cleared"
+          ? {
+              reason: previousState.reason,
+              durationMs: Math.max(0, now - (previousState.engagedSinceMs ?? now)),
+            }
+          : undefined;
+      this.state = {
+        phase: "clear",
+        reason: null,
+        engagedSinceMs: null,
+        healthySinceMs: now,
+        healthySamples: 0,
+        lastTelemetry: telemetry ?? null,
+        lastHealthyTelemetry,
+        telemetryFailureSinceMs,
+      };
+      return {
+        decision,
+        transition,
+        transitionDetail,
+      };
+    }
+
+    if (baseDecision.throttle) {
+      const engagedSinceMs =
+        previousState.phase === "engaged" && previousState.reason === baseDecision.reason
+          ? previousState.engagedSinceMs ?? now
+          : now;
+      this.state = {
+        phase: "engaged",
+        reason: baseDecision.reason,
+        engagedSinceMs,
+        healthySinceMs: null,
+        healthySamples: 0,
+        lastTelemetry: telemetry ?? null,
+        lastHealthyTelemetry,
+        telemetryFailureSinceMs,
+      };
+      const transition =
+        previousState.phase === "engaged" && previousState.reason === baseDecision.reason
+          ? null
+          : "engaged";
+      const transitionDetail =
+        transition === "engaged"
+          ? {
+              reason: baseDecision.reason,
+              engagedSinceMs,
+            }
+          : undefined;
+      return {
+        decision: baseDecision,
+        transition,
+        transitionDetail,
+      };
+    }
+
+    if (previousState.phase === "engaged" || previousState.phase === "stabilizing") {
+      const healthySamples = previousState.healthySamples + 1;
+      const healthySinceMs = previousState.healthySinceMs ?? now;
+      const healthyDurationMs = Math.max(0, now - healthySinceMs);
+      if (
+        healthySamples >= this.recoverySamples &&
+        healthyDurationMs >= this.recoveryDurationMs
+      ) {
+        this.state = {
+          phase: "clear",
+          reason: null,
+          engagedSinceMs: null,
+          healthySinceMs: null,
+          healthySamples: 0,
+          lastTelemetry: telemetry ?? null,
+          lastHealthyTelemetry,
+          telemetryFailureSinceMs,
+        };
+        return {
+          decision: baseDecision,
+          transition: previousState.phase !== "clear" ? "cleared" : null,
+          transitionDetail:
+            previousState.phase !== "clear"
+              ? {
+                  reason: previousState.reason,
+                  durationMs: Math.max(0, now - (previousState.engagedSinceMs ?? now)),
+                }
+              : undefined,
+        };
+      }
+
+      this.state = {
+        phase: "stabilizing",
+        reason: previousState.reason,
+        engagedSinceMs: previousState.engagedSinceMs,
+        healthySinceMs,
+        healthySamples,
+        lastTelemetry: telemetry ?? null,
+        lastHealthyTelemetry,
+        telemetryFailureSinceMs,
+      };
+      return {
+        decision: {
+          throttle: true,
+          reason: "recovery_cooldown",
+          queueP95Ms: baseDecision.queueP95Ms,
+          idleWorkers: baseDecision.idleWorkers,
+        },
+        transition: null,
+      };
+    }
+
+    this.state = {
+      phase: "clear",
+      reason: null,
+      engagedSinceMs: null,
+      healthySinceMs: null,
+      healthySamples: 0,
+      lastTelemetry: telemetry ?? null,
+      lastHealthyTelemetry,
+      telemetryFailureSinceMs,
+    };
+    return {
+      decision: baseDecision,
+      transition: null,
+    };
+  }
+
+  getState(): QueueBackpressureState {
+    return this.state;
+  }
+}
+
 type PolicyRule = {
   maxRisk: "low" | "medium" | "high";
   maxBreadth: "narrow" | "medium" | "broad";
@@ -239,6 +492,11 @@ const ENGINE_EXPLORE_RATE_MIN = 0.1;
 const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
+const QUEUE_P95_THROTTLE_MS = 1_000;
+const QUEUE_RECOVERY_HEALTHY_SAMPLES = 2;
+const QUEUE_RECOVERY_MIN_HEALTHY_MS = 12_000;
+const QUEUE_TELEMETRY_FAIL_OPEN_MS = 60_000;
+const AUTONOMY_BACKLOG_SAMPLE_LIMIT = 500;
 const AUTO_INGEST_SEED_PATTERNS: Array<{
   algorithm: string;
   whenToUse: string;
@@ -794,6 +1052,132 @@ function asStringArray(value: unknown): string[] {
 function asNumber(value: unknown, fallback = 0): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+const QUEUE_PRIORITIES: QueuePriority[] = ["interactive", "normal", "background"];
+
+function normalizeQueuePriority(value: unknown): QueuePriority {
+  const text = asString(value).toLowerCase();
+  return QUEUE_PRIORITIES.includes(text as QueuePriority) ? (text as QueuePriority) : "normal";
+}
+
+function defaultPendingByPriority(): Record<QueuePriority, number> {
+  return {
+    interactive: 0,
+    normal: 0,
+    background: 0,
+  };
+}
+
+export function buildQueueBacklogMetrics(params: {
+  telemetry: QueueTelemetry | null;
+  pendingAutonomyBySkill: Record<AutonomyComponentArea, number>;
+  dispatchByComponent?: Record<string, unknown>;
+  targetSkill?: AutonomyComponentArea;
+  pendingAutonomySampleLimit: number;
+  pendingAutonomySampleSize: number;
+  pendingAutonomySampleTruncated: boolean;
+}): QueueBacklogMetrics | null {
+  const telemetry = params.telemetry;
+  const componentAreas = Array.from(COMPONENT_AREAS).sort();
+  const normalizedCounts: Record<AutonomyComponentArea, number> = {} as Record<
+    AutonomyComponentArea,
+    number
+  >;
+  for (const area of componentAreas) {
+    normalizedCounts[area] = Math.max(0, Math.floor(asNumber(params.pendingAutonomyBySkill[area], 0)));
+  }
+  const pendingAutonomyTotal = componentAreas.reduce(
+    (sum, area) => sum + normalizedCounts[area],
+    0,
+  );
+  const skills = componentAreas
+    .map((area) => {
+      const pending = normalizedCounts[area];
+      const dispatchLastHour = Math.max(
+        0,
+        Math.floor(asNumber(params.dispatchByComponent?.[area], 0)),
+      );
+      const backlogRatio = pendingAutonomyTotal > 0 ? pending / pendingAutonomyTotal : 0;
+      return {
+        skill: area,
+        pending_autonomy_requests: pending,
+        dispatch_last_hour: dispatchLastHour,
+        is_target_skill: area === params.targetSkill,
+        backlog_ratio: backlogRatio,
+      };
+    })
+    .sort((a, b) => {
+      if (b.pending_autonomy_requests !== a.pending_autonomy_requests) {
+        return b.pending_autonomy_requests - a.pending_autonomy_requests;
+      }
+      if (b.dispatch_last_hour !== a.dispatch_last_hour) {
+        return b.dispatch_last_hour - a.dispatch_last_hour;
+      }
+      return a.skill.localeCompare(b.skill);
+    });
+  const pendingByPriority = telemetry
+    ? {
+        interactive: telemetry.pendingByPriority.interactive,
+        normal: telemetry.pendingByPriority.normal,
+        background: telemetry.pendingByPriority.background,
+      }
+    : defaultPendingByPriority();
+  return {
+    captured_at: telemetry?.capturedAt ?? null,
+    queue_p95_ms: telemetry?.queueP95Ms ?? null,
+    idle_workers: telemetry?.idleWorkers ?? null,
+    pending_by_priority: pendingByPriority,
+    pending_autonomy_total: pendingAutonomyTotal,
+    pending_autonomy_sample_limit: Math.max(1, Math.floor(params.pendingAutonomySampleLimit)),
+    pending_autonomy_sample_size: Math.max(0, Math.floor(params.pendingAutonomySampleSize)),
+    pending_autonomy_sample_truncated: Boolean(params.pendingAutonomySampleTruncated),
+    skills,
+  };
+}
+
+export function shouldThrottleQueue(
+  telemetry: QueueTelemetry | null,
+  thresholdMs = QUEUE_P95_THROTTLE_MS,
+): QueueThrottleDecision {
+  if (!telemetry) {
+    return {
+      throttle: true,
+      reason: "telemetry_unavailable",
+      queueP95Ms: null,
+      idleWorkers: null,
+    };
+  }
+  if (telemetry.queueP95Ms == null || telemetry.idleWorkers == null) {
+    return {
+      throttle: true,
+      reason: "telemetry_unavailable",
+      queueP95Ms: telemetry.queueP95Ms ?? null,
+      idleWorkers: telemetry.idleWorkers ?? null,
+    };
+  }
+  if (telemetry.queueP95Ms > thresholdMs) {
+    return {
+      throttle: true,
+      reason: "queue_latency_exceeded",
+      queueP95Ms: telemetry.queueP95Ms,
+      idleWorkers: telemetry.idleWorkers,
+    };
+  }
+  if (telemetry.idleWorkers <= 0) {
+    return {
+      throttle: true,
+      reason: "no_idle_workers",
+      queueP95Ms: telemetry.queueP95Ms,
+      idleWorkers: telemetry.idleWorkers,
+    };
+  }
+  return {
+    throttle: false,
+    reason: null,
+    queueP95Ms: telemetry.queueP95Ms,
+    idleWorkers: telemetry.idleWorkers,
+  };
 }
 
 function uniqueLowercaseTokens(values: string[], max = 24): string[] {
@@ -2317,6 +2701,7 @@ export class RemoteBuddyAutonomousEngine {
   private lastOutcome: "none" | "success" | "skipped" | "failed" = "none";
   private lastDetail = "not_started";
   private lastCompletedAtMs = 0;
+  private readonly queueBackpressure: QueueBackpressureController;
 
   constructor(opts: {
     server: string;
@@ -2341,6 +2726,11 @@ export class RemoteBuddyAutonomousEngine {
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
+    this.queueBackpressure = new QueueBackpressureController({
+      thresholdMs: QUEUE_P95_THROTTLE_MS,
+      recoverySamples: QUEUE_RECOVERY_HEALTHY_SAMPLES,
+      recoveryDurationMs: QUEUE_RECOVERY_MIN_HEALTHY_MS,
+    });
   }
 
   private setPhase(phase: string): void {
@@ -2615,6 +3005,144 @@ export class RemoteBuddyAutonomousEngine {
     const trusted = Array.isArray(data.trustedInspirationShortlist) ? data.trustedInspirationShortlist : [];
     const archived = Array.isArray(data.archivedInspirationSources) ? data.archivedInspirationSources : [];
     return [...trusted, ...archived];
+  }
+
+  private async fetchQueueTelemetry(): Promise<QueueTelemetry | null> {
+    try {
+      const res = await fetch(`${this.server}/system/status`, {
+        method: "GET",
+        headers: this.headers(),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as Record<string, unknown>;
+      const workers = asObject(data.workers);
+      const idleWorkersRaw = asNumber(workers.idle ?? workers.idle_workers, Number.NaN);
+      const idleWorkers = Number.isFinite(idleWorkersRaw) ? Math.max(0, Math.floor(idleWorkersRaw)) : null;
+      const slo = asObject(data.slo);
+      const requestSlo = asObject(slo.requests);
+      const queueWait = asObject(requestSlo.queueWaitMs ?? requestSlo.queue_wait_ms);
+      const queueP95MsRaw = asNumber(queueWait.p95 ?? queueWait.P95, Number.NaN);
+      const queueP95Ms = Number.isFinite(queueP95MsRaw) ? Math.max(0, Math.floor(queueP95MsRaw)) : null;
+      const queues = asObject(data.queues);
+      const requestPriorities = asObject(queues.requestPriorities ?? queues.request_priorities);
+      const pendingByPriority = defaultPendingByPriority();
+      for (const [key, value] of Object.entries(requestPriorities)) {
+        const priority = normalizeQueuePriority(key);
+        pendingByPriority[priority] = Math.max(0, Math.floor(asNumber(value, 0)));
+      }
+      const pendingSnapshotRaw = Array.isArray(
+        queues.requestPendingSnapshot ?? queues.request_pending_snapshot,
+      )
+        ? (queues.requestPendingSnapshot ?? queues.request_pending_snapshot)
+        : [];
+      const pendingSnapshot = pendingSnapshotRaw
+        .map((entry) => {
+          const row = asObject(entry);
+          const id = asString(row.id);
+          if (!id) return null;
+          const priority = normalizeQueuePriority(row.priority);
+          const position = Math.max(1, Math.floor(asNumber(row.position, 1)));
+          const etaMs = Math.max(0, Math.floor(asNumber(row.etaMs ?? row.eta_ms, 0)));
+          return { id, priority, position, etaMs };
+        })
+        .filter(
+          (row): row is { id: string; priority: QueuePriority; position: number; etaMs: number } =>
+            Boolean(row),
+        );
+      return {
+        capturedAt: asString(data.ts) || null,
+        queueP95Ms,
+        idleWorkers,
+        pendingByPriority,
+        pendingSnapshot,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async fetchAutonomyBacklogCounts(
+    limit = AUTONOMY_BACKLOG_SAMPLE_LIMIT,
+  ): Promise<{
+    counts: Record<AutonomyComponentArea, number>;
+    sampleSize: number;
+    sampleLimit: number;
+    truncated: boolean;
+  }> {
+    const clamped = Math.max(1, Math.min(500, Math.floor(limit)));
+    try {
+      const res = await fetch(`${this.server}/requests?status=pending&limit=${clamped}`, {
+        method: "GET",
+        headers: this.headers(),
+      });
+      if (!res.ok) {
+        return { counts: {}, sampleSize: 0, sampleLimit: clamped, truncated: false };
+      }
+      const data = (await res.json()) as { ok?: boolean; requests?: unknown[] };
+      if (!data.ok || !Array.isArray(data.requests)) {
+        return { counts: {}, sampleSize: 0, sampleLimit: clamped, truncated: false };
+      }
+      const counts: Record<AutonomyComponentArea, number> = {};
+      let sampleSize = 0;
+      for (const raw of data.requests) {
+        const row = asObject(raw);
+        const metadata = asObject(row.metadata);
+        if (!metadata || asString(metadata.origin).toLowerCase() !== "autonomy") continue;
+        const autonomyMeta = asObject(metadata.autonomy);
+        const skill = asAutonomyComponentArea(autonomyMeta.componentArea ?? autonomyMeta.component_area);
+        if (!skill) continue;
+        sampleSize += 1;
+        counts[skill] = (counts[skill] ?? 0) + 1;
+      }
+      return {
+        counts,
+        sampleSize,
+        sampleLimit: clamped,
+        truncated: data.requests.length >= clamped,
+      };
+    } catch {
+      return { counts: {}, sampleSize: 0, sampleLimit: clamped, truncated: false };
+    }
+  }
+
+  private async collectQueueBacklogMetrics(params: {
+    snapshot: Snapshot;
+    targetSkill?: AutonomyComponentArea;
+  }): Promise<{ telemetry: QueueTelemetry | null; backlogMetrics: QueueBacklogMetrics | null }> {
+    const [telemetry, backlogSample] = await Promise.all([
+      this.fetchQueueTelemetry(),
+      this.fetchAutonomyBacklogCounts(AUTONOMY_BACKLOG_SAMPLE_LIMIT),
+    ]);
+    const dispatchByComponent = asObject(params.snapshot.dispatch_budget.by_component_count_last_hour);
+    const backlogMetrics = buildQueueBacklogMetrics({
+      telemetry,
+      pendingAutonomyBySkill: backlogSample.counts,
+      dispatchByComponent,
+      targetSkill: params.targetSkill,
+      pendingAutonomySampleLimit: backlogSample.sampleLimit,
+      pendingAutonomySampleSize: backlogSample.sampleSize,
+      pendingAutonomySampleTruncated: backlogSample.truncated,
+    });
+    return { telemetry, backlogMetrics };
+  }
+
+  private handleQueueBackpressureTransition(
+    transition: QueueBackpressureTransition | null,
+    detail: QueueBackpressureTransitionDetail | undefined,
+    decision: QueueThrottleDecision,
+  ): void {
+    if (transition === "engaged") {
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] queue throttle engaged (${detail?.reason ?? decision.reason ?? "unknown"}) queue_p95=${decision.queueP95Ms ?? "?"} idle_workers=${decision.idleWorkers ?? "?"}`,
+      );
+      return;
+    }
+    if (transition === "cleared") {
+      const durationMs = Math.max(0, detail?.durationMs ?? 0);
+      console.log(
+        `[RemoteBuddyAutonomousEngine] queue throttle cleared after ${durationMs}ms.`,
+      );
+    }
   }
 
   private buildAutoInspirationEntries(commitHistoryHints: EngineCommitHistoryHint[]): Array<Record<string, unknown>> {
@@ -3716,6 +4244,86 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
 
+      const queueContext = await this.collectQueueBacklogMetrics({
+        snapshot,
+        targetSkill: selected.candidate.component_area,
+      });
+      const objectiveEvidence = queueContext.backlogMetrics
+        ? { backlog_metrics: queueContext.backlogMetrics }
+        : undefined;
+      if (queueContext.backlogMetrics) {
+        selectedCandidatePayload = {
+          ...selectedCandidatePayload,
+          backlog_metrics: queueContext.backlogMetrics,
+        };
+        const selectedRow = candidatesPayload.find((row) => row.id === selectedCandidatePayload.id);
+        if (selectedRow) {
+          selectedRow.backlog_metrics = queueContext.backlogMetrics;
+        }
+      }
+      const queueEvaluation = this.queueBackpressure.evaluate(queueContext.telemetry);
+      const queueDecision = queueEvaluation.decision;
+      this.handleQueueBackpressureTransition(
+        queueEvaluation.transition,
+        queueEvaluation.transitionDetail,
+        queueDecision,
+      );
+      if (queueDecision.throttle) {
+        this.setPhase("record_blocked_queue_backpressure");
+        const blockReason = queueDecision.reason ?? "queue_backpressure";
+        await this.postObjective({
+          runId,
+          snapshotId: snapshot.snapshot_id,
+          sessionId: this.sessionId,
+          candidates: candidatesPayload,
+          objective: {
+            id: objectiveId,
+            candidate_id: selected.candidate.id,
+            title: selected.candidate.title,
+            instruction: selected.candidate.problem_statement,
+            objective_type: selected.candidate.objective_type,
+            component_area: selected.candidate.component_area,
+            trigger_type: selected.candidate.trigger_type,
+            target_paths: selected.candidate.target_paths,
+            scope: selected.candidate.scope,
+            confidence: selected.candidate.confidence,
+            risk_level: selected.candidate.risk_level,
+            status: "blocked",
+            block_reason: blockReason,
+            ...(objectiveEvidence ? { evidence: objectiveEvidence } : {}),
+            score_breakdown: {
+              llm_score: selected.llmScore,
+              impact_signal: selected.impactSignal,
+              penalties: selected.penalties,
+              ema_success: selected.emaSuccess,
+              ema_user_accept: selected.emaUserAccept,
+              engine_idea_prior_score: selected.engineIdeaPriorScore,
+              engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
+              engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
+              engine_idea_sample_count: selected.engineIdeaSampleCount,
+              engine_source_prior_score: selected.engineSourcePriorScore,
+              engine_source_novelty_score: selected.engineSourceNoveltyScore,
+              engine_source_novelty_bonus: selected.engineSourceNoveltyBonus,
+              engine_source_sample_count: selected.engineSourceSampleCount,
+              engine_source_trust_score: selected.engineSourceTrustScore,
+              engine_source_freshness_score: selected.engineSourceFreshnessScore,
+              engine_source_curation_status: selected.engineSourceCurationStatus,
+              engine_source_curation_reason: selected.engineSourceCurationReason,
+              engine_source_trust_boost: selected.engineSourceTrustBoost,
+              explore_rate_configured: adaptiveExplore.baseRate,
+              effective_explore_rate: adaptiveExplore.effectiveRate,
+              explore_rate_adjustment: adaptiveExplore.adjustment,
+              final_score: selected.finalScore,
+              selection_strategy: selectedStrategy,
+              selection_roll: selection.roll,
+            },
+          },
+          llmCalls,
+        });
+        outcomeDetail = blockReason;
+        return;
+      }
+
       if (selected.candidate.requires_user_input) {
         this.setPhase("record_blocked_requires_input");
         await this.postObjective({
@@ -3737,6 +4345,7 @@ export class RemoteBuddyAutonomousEngine {
             risk_level: selected.candidate.risk_level,
             status: "blocked",
             block_reason: "requires_user_input",
+            ...(objectiveEvidence ? { evidence: objectiveEvidence } : {}),
             score_breakdown: {
               llm_score: selected.llmScore,
               impact_signal: selected.impactSignal,
@@ -3858,6 +4467,7 @@ export class RemoteBuddyAutonomousEngine {
             risk_level: selected.candidate.risk_level,
             status: "failed",
             block_reason: "request_enqueue_failed",
+            ...(objectiveEvidence ? { evidence: objectiveEvidence } : {}),
           },
           llmCalls,
         });
@@ -3885,6 +4495,7 @@ export class RemoteBuddyAutonomousEngine {
           risk_level: selected.candidate.risk_level,
           status: "dispatched",
           request_id: requestId,
+          ...(objectiveEvidence ? { evidence: objectiveEvidence } : {}),
           score_breakdown: {
             llm_score: selected.llmScore,
             impact_signal: selected.impactSignal,
