@@ -4,6 +4,8 @@
  * and optionally blocks job dispatch until a synthetic probe completes.
  */
 export const STARTUP_FAILURE_CODES = {
+  BUN_VERSION_UNSUPPORTED: "startup.bun_version_unsupported",
+  DOCKER_VERSION_UNSUPPORTED: "startup.docker_version_unsupported",
   MERGE_IN_PROGRESS: "startup.merge_in_progress",
   REPO_DIRTY: "startup.repo_dirty",
   ALERTS_ACTIVE: "startup.alerts_active",
@@ -16,7 +18,13 @@ export type StartupFailureCode =
 
 type StartupCheckStatus = "pass" | "fail";
 
-export type StartupCheckCategory = "repo" | "alerts" | "synthetic" | "dispatch";
+export type StartupCheckCategory =
+  | "runtime"
+  | "infrastructure"
+  | "repo"
+  | "alerts"
+  | "synthetic"
+  | "dispatch";
 
 export interface StartupChecklistOptions {
   syntheticMaxLatencyMs?: number;
@@ -62,6 +70,8 @@ export interface StartupCheckRecord {
   endedAtMs: number;
   error?: {
     message: string;
+    raw?: unknown;
+    stack?: string;
   };
 }
 
@@ -82,9 +92,12 @@ export interface StartupChecklistResult {
 export interface StartupChecklistContext {
   describeRepo(): Promise<RepoStatus>;
   listFiringAlerts(): Promise<string[]>;
+  readBunVersion(): Promise<string>;
+  readDockerVersion(): Promise<string>;
   syntheticTester: SyntheticStartupTester;
   now?: () => number;
   log?: (entry: StartupCheckRecord) => void;
+  telemetry?: (event: StartupTelemetryEvent) => void;
 }
 
 type StartupCheckDefinition = {
@@ -106,14 +119,200 @@ export interface StartupCheckStructure {
   step: number;
 }
 
+export interface StartupTelemetryPhaseEvent {
+  type: "startup_phase";
+  code: StartupFailureCode;
+  category: StartupCheckCategory;
+  step: number;
+  status: StartupCheckStatus;
+  detail: string;
+  startedAtMs: number;
+  endedAtMs: number;
+  durationMs: number;
+  error?: {
+    message: string;
+    raw?: unknown;
+    stack?: string;
+  };
+}
+
+export interface StartupTelemetryUnknownFailureEvent {
+  type: "startup_unknown_failure";
+  code: StartupFailureCode;
+  category: StartupCheckCategory;
+  step: number;
+  phase: string;
+  detail: string;
+  whenMs: number;
+  error: {
+    message: string;
+    raw?: unknown;
+    stack?: string;
+  };
+}
+
+export type StartupTelemetryEvent =
+  | StartupTelemetryPhaseEvent
+  | StartupTelemetryUnknownFailureEvent;
+
 const DEFAULT_SYNTHETIC_LATENCY_MS = 850;
 const DEFAULT_SYNTHETIC_PROBE = "probe.remote_startup";
 const DISPATCH_CHECK_LABEL = "Job dispatch must succeed.";
 const DISPATCH_CHECK_ACTION =
   "Inspect RemoteBuddy + WorkerPals logs, repair dependencies, then rerun dispatch.";
+const MIN_BUN_VERSION = "1.1.0";
+const MIN_DOCKER_VERSION = "24.0.0";
+
+class StartupProbeError extends Error {
+  constructor(message: string, public readonly raw?: unknown) {
+    super(message);
+    this.name = "StartupProbeError";
+  }
+}
+
+type StartupErrorDetail = {
+  message: string;
+  raw?: unknown;
+  stack?: string;
+};
+
+const parseVersionParts = (value: string): number[] => {
+  return value
+    .split(/[^\d]+/g)
+    .filter(Boolean)
+    .slice(0, 4)
+    .map((part) => Number.parseInt(part, 10) || 0);
+};
+
+const compareVersions = (value: string, required: string): number => {
+  const a = parseVersionParts(value);
+  const b = parseVersionParts(required);
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i += 1) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+};
+
+const normalizeStartupError = (
+  error: unknown,
+  fallback: string,
+): StartupErrorDetail => {
+  if (error instanceof StartupProbeError) {
+    return { message: error.message, raw: error.raw, stack: error.stack };
+  }
+  if (error instanceof Error) {
+    return { message: error.message, raw: error, stack: error.stack };
+  }
+  if (typeof error === "string" && error.trim()) {
+    return { message: error.trim() };
+  }
+  return { message: fallback || "Startup check failed.", raw: error };
+};
+
+const emitTelemetryPhase = (
+  ctx: StartupChecklistContext,
+  record: StartupCheckRecord,
+): void => {
+  ctx.telemetry?.({
+    type: "startup_phase",
+    code: record.code,
+    category: record.category,
+    step: record.step,
+    status: record.status,
+    detail: record.detail,
+    startedAtMs: record.startedAtMs,
+    endedAtMs: record.endedAtMs,
+    durationMs: record.durationMs,
+    error: record.error
+      ? {
+          message: record.error.message,
+          raw: record.error.raw,
+          stack: record.error.stack,
+        }
+      : undefined,
+  });
+};
+
+const emitTelemetryUnknownFailure = (
+  ctx: StartupChecklistContext,
+  params: {
+    code: StartupFailureCode;
+    category: StartupCheckCategory;
+    step: number;
+    phase: string;
+    detail: string;
+    whenMs: number;
+    error: StartupErrorDetail;
+  },
+): void => {
+  ctx.telemetry?.({
+    type: "startup_unknown_failure",
+    code: params.code,
+    category: params.category,
+    step: params.step,
+    phase: params.phase,
+    detail: params.detail,
+    whenMs: params.whenMs,
+    error: {
+      message: params.error.message,
+      raw: params.error.raw,
+      stack: params.error.stack,
+    },
+  });
+};
 
 const defaultChecks = Object.freeze(
   [
+  {
+    code: STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    label: "Bun runtime must meet the minimum supported version.",
+    action:
+      "Install Bun 1.1.0 or later and rerun the RemoteBuddy startup preflight.",
+    category: "runtime",
+    run: async (ctx) => {
+      try {
+        const version = await ctx.readBunVersion();
+        if (compareVersions(version, MIN_BUN_VERSION) < 0) {
+          return {
+            ok: false,
+            detail: `Detected Bun ${version}; RemoteBuddy requires Bun >= ${MIN_BUN_VERSION}.`,
+          };
+        }
+        return {
+          ok: true,
+          detail: `Bun runtime ${version} is supported.`,
+        };
+      } catch (error) {
+        throw new StartupProbeError("Bun version probe failed", error);
+      }
+    },
+  },
+  {
+    code: STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    label: "Docker runtime must meet the minimum supported version.",
+    action:
+      "Upgrade Docker Engine to 24.0.0+ and rerun the RemoteBuddy startup preflight.",
+    category: "infrastructure",
+    run: async (ctx) => {
+      try {
+        const version = await ctx.readDockerVersion();
+        if (compareVersions(version, MIN_DOCKER_VERSION) < 0) {
+          return {
+            ok: false,
+            detail: `Detected Docker ${version}; RemoteBuddy requires Docker >= ${MIN_DOCKER_VERSION}.`,
+          };
+        }
+        return {
+          ok: true,
+          detail: `Docker runtime ${version} is supported.`,
+        };
+      } catch (error) {
+        throw new StartupProbeError("Docker version probe failed", error);
+      }
+    },
+  },
   {
     code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
     label: "Git merge or rebase must be resolved.",
@@ -262,22 +461,19 @@ export class StartupChecklist {
       const startedAtMs = nowMs(ctx);
       let status: StartupCheckStatus = "pass";
       let detail = check.label;
-      let failureErrorMessage: string | undefined;
+      let failureErrorDetail: StartupErrorDetail | undefined;
       try {
         const outcome = await check.run(ctx, options);
         status = outcome.ok ? "pass" : "fail";
         detail = outcome.detail ?? check.label;
       } catch (error) {
         status = "fail";
-        detail =
-          error instanceof Error
-            ? error.message
-            : "Unknown error running startup check.";
-        if (error instanceof Error) {
-          failureErrorMessage = error.message;
-        } else if (typeof error === "string" && error.trim()) {
-          failureErrorMessage = error.trim();
-        }
+        const normalized = normalizeStartupError(
+          error,
+          "Unknown error running startup check.",
+        );
+        failureErrorDetail = normalized;
+        detail = normalized.message;
       }
       const endedAtMs = nowMs(ctx);
       const durationMs = Math.max(0, endedAtMs - startedAtMs);
@@ -293,10 +489,28 @@ export class StartupChecklist {
         durationMs,
         startedAtMs,
         endedAtMs,
-        error: status === "fail" && failureErrorMessage ? { message: failureErrorMessage } : undefined,
+        error: failureErrorDetail
+          ? {
+              message: failureErrorDetail.message,
+              raw: failureErrorDetail.raw,
+              stack: failureErrorDetail.stack,
+            }
+          : undefined,
       };
       history.push(record);
       ctx.log?.(record);
+      emitTelemetryPhase(ctx, record);
+      if (failureErrorDetail) {
+        emitTelemetryUnknownFailure(ctx, {
+          code: check.code,
+          category: check.category,
+          step,
+          phase: check.label,
+          detail,
+          whenMs: endedAtMs,
+          error: failureErrorDetail,
+        });
+      }
       if (status === "fail") {
         return {
           ok: false,
@@ -356,15 +570,16 @@ export const gateDispatchWithStartupPreflight = async (
     };
     result.history.push(successRecord);
     ctx.log?.(successRecord);
+    emitTelemetryPhase(ctx, successRecord);
     return result;
   } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : typeof error === "string"
-          ? error
-          : "Unknown dispatch failure.";
-    const detail = `Dispatch job failed: ${errorMessage}`;
+    const normalizedError = normalizeStartupError(
+      error,
+      "Dispatch job failed.",
+    );
+    const detail = normalizedError.message.startsWith("Dispatch job failed")
+      ? normalizedError.message
+      : `Dispatch job failed: ${normalizedError.message}`;
     const endedAtMs = nowMs(ctx);
     const durationMs = Math.max(0, endedAtMs - startedAtMs);
     const failureRecord: StartupCheckRecord = {
@@ -379,9 +594,23 @@ export const gateDispatchWithStartupPreflight = async (
       durationMs,
       startedAtMs,
       endedAtMs,
-      error: { message: errorMessage },
+      error: {
+        message: normalizedError.message,
+        raw: normalizedError.raw,
+        stack: normalizedError.stack,
+      },
     };
     ctx.log?.(failureRecord);
+    emitTelemetryPhase(ctx, failureRecord);
+    emitTelemetryUnknownFailure(ctx, {
+      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+      category: "dispatch",
+      step: dispatchStep,
+      phase: dispatchLabel,
+      detail,
+      whenMs: endedAtMs,
+      error: normalizedError,
+    });
     const history = [...result.history, failureRecord];
     return {
       ok: false,
