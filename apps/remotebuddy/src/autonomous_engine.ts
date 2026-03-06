@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "crypto";
-import { existsSync, mkdirSync, rmSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import type { CommunicationManager } from "shared";
 import {
@@ -60,6 +60,7 @@ type AutonomyCandidate = {
     source_fingerprint?: string;
     summary?: string;
     hypothesis?: string;
+     metadata?: Record<string, unknown>;
   };
 };
 
@@ -239,6 +240,19 @@ const ENGINE_EXPLORE_RATE_MIN = 0.1;
 const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
+const RECENT_DISPATCH_MOTIF_WINDOW = 8;
+const RECENT_DISPATCH_MOTIF_TTL_MS = 6 * 60 * 60 * 1_000;
+const AUTONOMY_DATA_FALLBACK_DIR = ".codex/autonomy_state";
+const ADJACENT_QUEUE_THRESHOLD_MS = 2_200;
+const MAX_ADJACENT_VARIATIONS = 3;
+const MOTIF_ATTRIBUTION_SUBDIR = "remotebuddy-autonomy";
+const MOTIF_ATTRIBUTION_FILENAME = "motif_attribution.json";
+const MOTIF_ATTRIBUTION_STATE_VERSION = 1;
+const MOTIF_ATTRIBUTION_PERSIST_DEBOUNCE_MS = 750;
+const MAX_MOTIF_ATTRIBUTION_KEYS = 64;
+const MAX_PERSISTED_BIAS_ENTRIES = 32;
+const STALE_MOTIF_REUSE_THRESHOLD = 3;
+const MIN_INFERRED_QUEUE_LATENCY_MS = 90;
 const AUTO_INGEST_SEED_PATTERNS: Array<{
   algorithm: string;
   whenToUse: string;
@@ -291,6 +305,7 @@ type FeedbackPriorForScoring = {
   ema_user_accept?: unknown;
   ema_latency?: unknown;
   ema_regret?: unknown;
+  fail_streak?: unknown;
 } | null;
 
 type EngineIdeaPriorForScoring = {
@@ -323,6 +338,63 @@ type AdaptiveExploreRateSnapshot = {
   }>;
   engine_idea_priors?: Array<{ sample_count?: unknown }>;
   engine_source_priors?: Array<{ sample_count?: unknown }>;
+};
+
+type MotifDispatchEntry = {
+  motifKey: string;
+  dispatchedAt: number;
+  retryCount: number;
+};
+
+type PersistedMotifWindowEntry = {
+  motif_key?: string;
+  motifKey?: string;
+  dispatched_at?: number;
+  dispatchedAt?: number;
+  retry_count?: number;
+  retryCount?: number;
+  retries?: number;
+  ts?: number;
+};
+
+type PersistedMotifDispatchRow = {
+  motif_key?: string;
+  motifKey?: string;
+  dispatches?: Array<{
+    dispatched_at?: number;
+    dispatchedAt?: number;
+    retry_count?: number;
+    retryCount?: number;
+    retries?: number;
+    ts?: number;
+  }>;
+};
+
+type PersistedMotifDispatchState = {
+  version?: number;
+  updated_at?: string;
+  entries?: PersistedMotifDispatchRow[];
+  dispatch_window?: PersistedMotifWindowEntry[];
+  bias_index?: Array<{
+    motif_key?: string;
+    motifKey?: string;
+    avg_retry?: number;
+    avgRetry?: number;
+    reuse_count?: number;
+    reuseCount?: number;
+  }>;
+};
+
+type MotifBiasRecord = {
+  motif_key: string;
+  avg_retry: number;
+  reuse_count: number;
+};
+
+type MotifTelemetrySnapshot = {
+  staleMotifKeys: string[];
+  reuseCounts: Record<string, number>;
+  biasIndex: Record<string, { avgRetry: number; reuseCount: number }>;
 };
 
 export function docsWeakEvidencePenaltyForImpact(
@@ -715,6 +787,7 @@ export interface EngineIdeaBuildingBlock {
   score: number;
   evidence: string[];
   candidate_shape: EngineCandidateShape;
+  metadata?: Record<string, unknown>;
   source_type?: string;
   source_label?: string | null;
   source_url?: string | null;
@@ -807,6 +880,86 @@ function uniqueLowercaseTokens(values: string[], max = 24): string[] {
     if (out.length >= max) break;
   }
   return out;
+}
+
+function uniqueValues<T>(values: T[]): T[] {
+  const out: T[] = [];
+  for (const value of values) {
+    if (!out.includes(value)) out.push(value);
+  }
+  return out;
+}
+
+const QUEUE_LABEL_PATTERN = /\b(queue|dispatch|backlog)\b/i;
+
+function latencyStringToMs(
+  valueText: string,
+  unitText?: string | null,
+  fallbackUnit?: string | null,
+): number | null {
+  const numeric = Number(valueText);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  const unit = String(unitText ?? fallbackUnit ?? "")
+    .trim()
+    .toLowerCase();
+  if (!unit) {
+    return numeric >= MIN_INFERRED_QUEUE_LATENCY_MS ? Math.floor(numeric) : null;
+  }
+  if (unit.startsWith("s")) {
+    return Math.floor(numeric * 1_000);
+  }
+  if (unit.startsWith("ms") || unit.startsWith("millis") || unit.startsWith("msec")) {
+    return Math.floor(numeric);
+  }
+  return null;
+}
+
+function detectLatencyUnitHint(text: string): string | null {
+  if (/\b(ms|millis(?:econds)?|msec)\b/i.test(text)) return "ms";
+  if (/\b(s|sec|seconds)\b/i.test(text)) return "s";
+  return null;
+}
+
+function parseQueueP95Evidence(text: string): number | null {
+  const normalized = asString(text);
+  if (!normalized) return null;
+  if (!QUEUE_LABEL_PATTERN.test(normalized)) return null;
+  const canonical = normalized.replace(/[,;]/g, " ");
+  const contextUnit = detectLatencyUnitHint(canonical);
+  const primaryMatch = canonical.match(
+    /\b(?:queue|dispatch|backlog)(?:[_\s-]*(?:queue|latency|depth|lag))?[_\s-]*p95\b[^0-9]*([0-9.]+)\s*(ms|millis(?:econds)?|msec|s|sec|seconds)?/i,
+  );
+  if (primaryMatch) {
+    return latencyStringToMs(primaryMatch[1], primaryMatch[2], contextUnit);
+  }
+  const queueMatch = canonical.match(
+    /\b(?:queue|dispatch|backlog)[^0-9]{0,12}([0-9.]+)\s*(ms|millis(?:econds)?|msec)\b/i,
+  );
+  if (queueMatch) {
+    return latencyStringToMs(queueMatch[1], queueMatch[2], contextUnit);
+  }
+  return null;
+}
+
+function extractQueueP95Ms(snapshot: EngineIdeaInputSnapshot): number | null {
+  for (const signal of snapshot.top_signals ?? []) {
+    if (asString(signal.type) !== "queue_health") continue;
+    const hasQueueLabel =
+      QUEUE_LABEL_PATTERN.test(asString((signal as { signal_id?: unknown }).signal_id)) ||
+      QUEUE_LABEL_PATTERN.test(asString(signal.evidence));
+    if (!hasQueueLabel) continue;
+    const parsed = parseQueueP95Evidence(signal.evidence);
+    if (parsed != null) return parsed;
+  }
+  for (const trait of snapshot.state_traits ?? []) {
+    const traitHasQueueLabel =
+      QUEUE_LABEL_PATTERN.test(asString((trait as { trait_id?: unknown }).trait_id)) ||
+      QUEUE_LABEL_PATTERN.test(asString(trait.focus));
+    if (!traitHasQueueLabel) continue;
+    const parsed = parseQueueP95Evidence(trait.evidence);
+    if (parsed != null) return parsed;
+  }
+  return null;
 }
 
 const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>([
@@ -1780,10 +1933,159 @@ function buildCommitHistoryBlocks(params: {
           ...hint.sample_subjects.map((subject) => `commit=${subject}`),
         ],
         candidate_shape: rule.shape,
+        metadata: {
+          motif_key: `history_${hint.motif_id}`,
+          motif_id: hint.motif_id,
+          motif_count: hint.count,
+        },
       } satisfies EngineIdeaBuildingBlock;
     })
     .filter((entry): entry is EngineIdeaBuildingBlock => Boolean(entry))
     .sort((a, b) => b.score - a.score);
+}
+
+function mergeCandidateShapes(
+  primary: EngineCandidateShape,
+  secondary: EngineCandidateShape,
+): EngineCandidateShape {
+  const riskLevel =
+    RISK_ORDER[primary.risk_level] >= RISK_ORDER[secondary.risk_level]
+      ? primary.risk_level
+      : secondary.risk_level;
+  return {
+    objective_type: primary.objective_type,
+    trigger_type: primary.trigger_type,
+    component_area: primary.component_area,
+    target_paths: uniqueValues([...primary.target_paths, ...secondary.target_paths]).slice(0, 4),
+    write_globs: uniqueValues([...primary.write_globs, ...secondary.write_globs]).slice(0, 4),
+    risk_level,
+    expected_validation: uniqueValues([...primary.expected_validation, ...secondary.expected_validation]).slice(
+      0,
+      4,
+    ),
+  };
+}
+
+function motifKeyFromBuildingBlock(block: EngineIdeaBuildingBlock): string {
+  const metadata = asObject(block.metadata);
+  const explicit = asString(metadata.motif_key ?? metadata.motifKey);
+  if (explicit) return explicit;
+  if (block.id.startsWith("history_")) return block.id;
+  if (block.id.startsWith("adjacent_")) return `combo_${block.id}`;
+  return `block_${block.id}`;
+}
+
+function averageRetryHintForMotifs(
+  motifKeys: Array<string | null | undefined>,
+  biasIndex?: Record<string, { avgRetry: number; reuseCount: number }>,
+): number | null {
+  if (!biasIndex) return null;
+  const samples: number[] = [];
+  for (const key of motifKeys) {
+    if (!key) continue;
+    const entry = biasIndex[key];
+    if (!entry) continue;
+    if (Number.isFinite(entry.avgRetry)) {
+      samples.push(entry.avgRetry);
+    }
+  }
+  if (samples.length === 0) return null;
+  const total = samples.reduce((sum, value) => sum + value, 0);
+  return total / samples.length;
+}
+
+function stalePenaltyForReuseCount(count: number): number {
+  if (!Number.isFinite(count) || count <= 0) return 0;
+  const extra = Math.max(0, count - STALE_MOTIF_REUSE_THRESHOLD);
+  return Math.min(0.1, 0.03 + 0.015 * extra);
+}
+
+function buildAdjacencyVariationBlocks(params: {
+  baseBlocks: EngineIdeaBuildingBlock[];
+  queueP95Ms: number;
+  maxVariations?: number;
+  staleMotifKeys?: Set<string>;
+  motifBiasIndex?: Record<string, { avgRetry: number; reuseCount: number }>;
+}): EngineIdeaBuildingBlock[] {
+  if (params.queueP95Ms > ADJACENT_QUEUE_THRESHOLD_MS) return [];
+  const queueSlack = clamp01(
+    (ADJACENT_QUEUE_THRESHOLD_MS - Math.min(params.queueP95Ms, ADJACENT_QUEUE_THRESHOLD_MS)) /
+      ADJACENT_QUEUE_THRESHOLD_MS,
+  );
+  const staleSet = params.staleMotifKeys ?? new Set<string>();
+  const biasIndex = params.motifBiasIndex;
+  const maxVariations = Math.max(
+    1,
+    Math.min(MAX_ADJACENT_VARIATIONS, Math.floor(params.maxVariations ?? MAX_ADJACENT_VARIATIONS)),
+  );
+  const grouped = new Map<AutonomyComponentArea, EngineIdeaBuildingBlock[]>();
+  for (const block of params.baseBlocks) {
+    if (block.algorithm === "adjacent_possible") continue;
+    const area = block.candidate_shape.component_area;
+    const list = grouped.get(area) ?? [];
+    list.push(block);
+    grouped.set(area, list);
+  }
+  const variations: EngineIdeaBuildingBlock[] = [];
+  const seen = new Set<string>();
+  for (const blocks of grouped.values()) {
+    if (variations.length >= maxVariations) break;
+    const sorted = [...blocks].sort((a, b) => b.score - a.score).slice(0, 4);
+    if (sorted.length < 2) continue;
+    for (let i = 0; i < sorted.length - 1 && variations.length < maxVariations; i++) {
+      const base = sorted[i];
+      const neighbor = sorted[i + 1];
+      if (!neighbor || neighbor.algorithm === "adjacent_possible") continue;
+      const id = `adjacent_${base.id}_${neighbor.id}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const mergedShape = mergeCandidateShapes(base.candidate_shape, neighbor.candidate_shape);
+      const objectiveIds = uniqueValues([...base.objective_ids, ...neighbor.objective_ids]).slice(0, 4);
+      const gapIds = uniqueValues([...base.gap_ids, ...neighbor.gap_ids]).slice(0, 4);
+      const baseMotifKey = motifKeyFromBuildingBlock(base);
+      const neighborMotifKey = motifKeyFromBuildingBlock(neighbor);
+      const targetsStale =
+        staleSet.has(baseMotifKey) || staleSet.has(neighborMotifKey);
+      const avgRetryHint = averageRetryHintForMotifs(
+        [baseMotifKey, neighborMotifKey],
+        biasIndex,
+      );
+      const retryBonus =
+        avgRetryHint != null ? clamp01(Math.max(0, 3 - avgRetryHint) / 3) * 0.05 : 0;
+      const score = clamp01(
+        ((base.score + neighbor.score) / 2) + 0.1 * queueSlack + (targetsStale ? 0.04 : 0) + retryBonus,
+      );
+      variations.push({
+        id,
+        algorithm: "adjacent_possible",
+        summary: `Blend ${base.algorithm} with adjacency cues from ${neighbor.algorithm} while queue slack allows exploration.`,
+        hypothesis:
+          `Queue p95 ${Math.floor(params.queueP95Ms)}ms enables adjacent recombination across ${mergedShape.component_area}. ` +
+          `Combine ${base.algorithm} + ${neighbor.algorithm} to probe nearby motifs without risking backlog spikes.`,
+        objective_ids: objectiveIds,
+        gap_ids: gapIds,
+        score,
+        evidence: [
+          `queue_p95=${Math.floor(params.queueP95Ms)}`,
+          `queue_slack=${queueSlack.toFixed(2)}`,
+          `base=${base.id}`,
+          `adjacent=${neighbor.id}`,
+        ],
+        candidate_shape: mergedShape,
+        metadata: {
+          motif_combo: id,
+          motif_key: `combo_${id}`,
+          base_block_id: base.id,
+          adjacent_block_id: neighbor.id,
+          targeted_stale_motifs: targetsStale
+            ? [baseMotifKey, neighborMotifKey].filter((key) => staleSet.has(key))
+            : [],
+          retry_bias_hint: avgRetryHint ?? null,
+        },
+      });
+    }
+  }
+  return variations;
 }
 
 export function buildEngineInspirationContext(params: {
@@ -1792,6 +2094,11 @@ export function buildEngineInspirationContext(params: {
   inspirationPatterns?: unknown[];
   sourceInsights?: unknown[];
   commitHistoryHints?: EngineCommitHistoryHint[];
+  motifTelemetry?: {
+    staleMotifKeys?: string[];
+    reuseCounts?: Record<string, number>;
+    biasIndex?: Record<string, { avgRetry: number; reuseCount: number }>;
+  };
 }): EngineInspirationContext {
   const oneSentence = asString(params.vision.one_sentence);
   const keyItems = params.vision.key_items;
@@ -1963,6 +2270,9 @@ export function buildEngineInspirationContext(params: {
     dispatchByType,
     dispatchSaturation,
   });
+  const staleMotifSet = new Set(params.motifTelemetry?.staleMotifKeys ?? []);
+  const staleReuseCounts = params.motifTelemetry?.reuseCounts ?? {};
+  const motifBiasIndex = params.motifTelemetry?.biasIndex ?? {};
   const buildingBlockMap = new Map<string, EngineIdeaBuildingBlock>();
   for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks]) {
     if (!buildingBlockMap.has(block.id)) {
@@ -1974,7 +2284,40 @@ export function buildEngineInspirationContext(params: {
       buildingBlockMap.set(block.id, block);
     }
   }
-  const buildingBlocks = [...buildingBlockMap.values()].sort((a, b) => b.score - a.score);
+  let buildingBlocks = [...buildingBlockMap.values()].sort((a, b) => b.score - a.score);
+  if (staleMotifSet.size > 0) {
+    let mutated = false;
+    buildingBlocks = buildingBlocks.map((block) => {
+      const motifKey = motifKeyFromBuildingBlock(block);
+      if (!staleMotifSet.has(motifKey)) return block;
+      const penalty = stalePenaltyForReuseCount(staleReuseCounts[motifKey] ?? STALE_MOTIF_REUSE_THRESHOLD);
+      if (penalty <= 0) return block;
+      mutated = true;
+      return {
+        ...block,
+        score: clamp01(block.score - penalty),
+        metadata: {
+          ...(block.metadata ?? {}),
+          stale_motif_reuse_count: staleReuseCounts[motifKey] ?? 0,
+        },
+      };
+    });
+    if (mutated) {
+      buildingBlocks = buildingBlocks.sort((a, b) => b.score - a.score);
+    }
+  }
+  const queueP95Ms = extractQueueP95Ms(params.snapshot);
+  if (queueP95Ms != null && queueP95Ms <= ADJACENT_QUEUE_THRESHOLD_MS) {
+    const adjacencyBlocks = buildAdjacencyVariationBlocks({
+      baseBlocks: buildingBlocks,
+      queueP95Ms,
+      staleMotifKeys: staleMotifSet,
+      motifBiasIndex,
+    });
+    if (adjacencyBlocks.length > 0) {
+      buildingBlocks = [...buildingBlocks, ...adjacencyBlocks].sort((a, b) => b.score - a.score);
+    }
+  }
 
   return {
     compiled_objectives: compiledObjectives,
@@ -2040,6 +2383,8 @@ function normalizeEngineTrialMetadata(
       sourceLabel,
       sourceUrl,
     });
+  const metadata = asObject(raw.metadata);
+  const hasMetadata = Object.keys(metadata).length > 0;
   return {
     building_block_id: buildingBlockId,
     algorithm: asString(raw.algorithm) || "engine_building_block",
@@ -2054,6 +2399,7 @@ function normalizeEngineTrialMetadata(
     ...(sourceFingerprint ? { source_fingerprint: sourceFingerprint } : {}),
     summary: asString(raw.summary) || undefined,
     hypothesis: asString(raw.hypothesis) || undefined,
+    ...(hasMetadata ? { metadata } : {}),
   };
 }
 
@@ -2098,7 +2444,59 @@ function inferEngineTrialFromCandidate(
     ...(fallback.source_fingerprint ? { source_fingerprint: fallback.source_fingerprint } : {}),
     summary: fallback.summary,
     hypothesis: fallback.hypothesis,
+    ...(fallback.metadata ? { metadata: { ...fallback.metadata } } : {}),
   };
+}
+
+function motifKeyFromEngineTrial(
+  trial?: NonNullable<AutonomyCandidate["engine_trial"]>,
+): string | null {
+  if (!trial) return null;
+  const metadata = asObject((trial as Record<string, unknown>).metadata);
+  const explicitKey = asString(metadata.motif_key ?? metadata.motifKey);
+  if (explicitKey) return explicitKey;
+  const blockId = asString(trial.building_block_id);
+  if (blockId.startsWith("history_")) return blockId;
+  if (blockId.startsWith("adjacent_")) return `combo_${blockId}`;
+  const comboId = asString(
+    metadata.motif_combo ??
+      metadata.motifCombo ??
+      metadata.adjacent_combo ??
+      metadata.adjacentCombo ??
+      metadata.combo_id ??
+      metadata.comboId,
+  );
+  if (comboId) return comboId.startsWith("combo_") ? comboId : `combo_${comboId}`;
+  const algorithm = asString(trial.algorithm);
+  if (algorithm.startsWith("commit_history_")) {
+    return `history_${algorithm.slice("commit_history_".length)}`;
+  }
+  const motifId = asString(metadata.motif_id ?? metadata.motifId);
+  if (motifId) return `motif_${motifId}`;
+  return null;
+}
+
+function motifKeyFromCandidate(candidate: AutonomyCandidate): string | null {
+  const explicit = motifKeyFromEngineTrial(candidate.engine_trial);
+  if (explicit) return explicit;
+  const fallbackShapeKey = makePatternKey(
+    candidate.objective_type,
+    Array.isArray(candidate.target_paths) ? candidate.target_paths : [],
+    candidate.trigger_type,
+    candidate.component_area,
+  );
+  if (fallbackShapeKey) return fallbackShapeKey;
+  const seed = [
+    candidate.objective_type,
+    candidate.trigger_type,
+    candidate.component_area,
+    ...(Array.isArray(candidate.target_paths) ? candidate.target_paths : []),
+  ]
+    .map((value) => asString(value))
+    .filter(Boolean)
+    .join("|");
+  if (!seed) return null;
+  return `motif_${sha256(seed).slice(0, 12)}`;
 }
 
 export function buildEngineFallbackCandidates(params: {
@@ -2139,6 +2537,25 @@ export function buildEngineFallbackCandidates(params: {
         sourceLabel: block.source_label,
         sourceUrl: block.source_url,
       });
+      const trialMetadata: Record<string, unknown> = { ...(block.metadata ?? {}) };
+      const ensureMetadata = (key: string, value: unknown): void => {
+        if (!(key in trialMetadata)) {
+          trialMetadata[key] = value;
+        }
+      };
+      if (block.id.startsWith("history_")) {
+        ensureMetadata("motif_id", block.id.slice("history_".length));
+        ensureMetadata("motif_key", block.id);
+      }
+      if (block.algorithm === "adjacent_possible") {
+        ensureMetadata("adjacent_from", block.evidence.slice(0, 2));
+        ensureMetadata("motif_combo", block.id);
+        ensureMetadata("motif_key", `combo_${block.id}`);
+      }
+      const inferredMotifKey = motifKeyFromBuildingBlock(block);
+      if (inferredMotifKey) {
+        ensureMetadata("motif_key", inferredMotifKey);
+      }
       return {
         id: `cand_engine_${block.id}_${randomUUID().slice(0, 8)}`,
         title: `Engine building block: ${block.algorithm}`,
@@ -2182,6 +2599,7 @@ export function buildEngineFallbackCandidates(params: {
           ...(block.source_fingerprint ? { source_fingerprint: block.source_fingerprint } : {}),
           summary: block.summary,
           hypothesis: block.hypothesis,
+          ...(Object.keys(trialMetadata).length > 0 ? { metadata: trialMetadata } : {}),
         },
         requires_user_input: false,
         question_if_blocked: "",
@@ -2306,6 +2724,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
+  private readonly motifAttributionPath: string;
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -2317,6 +2736,11 @@ export class RemoteBuddyAutonomousEngine {
   private lastOutcome: "none" | "success" | "skipped" | "failed" = "none";
   private lastDetail = "not_started";
   private lastCompletedAtMs = 0;
+  private recentMotifDispatches: Map<string, MotifDispatchEntry[]> = new Map();
+  private motifDispatchWindow: MotifDispatchEntry[] = [];
+  private motifBiasIndex: Map<string, { avgRetry: number; reuseCount: number }> = new Map();
+  private motifPersistTimer: ReturnType<typeof setTimeout> | null = null;
+  private motifPersistPending = false;
 
   constructor(opts: {
     server: string;
@@ -2341,6 +2765,19 @@ export class RemoteBuddyAutonomousEngine {
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
+    const configuredPaths = (opts.config as Partial<PushPalsConfig>).paths;
+    const configuredDataDir =
+      configuredPaths && typeof configuredPaths.dataDir === "string"
+        ? configuredPaths.dataDir
+        : null;
+    const normalizedConfigured =
+      configuredDataDir && configuredDataDir.trim()
+        ? resolve(this.repoRoot, configuredDataDir.trim())
+        : null;
+    const persistenceRoot = normalizedConfigured ?? resolve(this.repoRoot, AUTONOMY_DATA_FALLBACK_DIR);
+    const autonomyDataDir = resolve(persistenceRoot, MOTIF_ATTRIBUTION_SUBDIR);
+    this.motifAttributionPath = resolve(autonomyDataDir, MOTIF_ATTRIBUTION_FILENAME);
+    this.loadMotifDispatchHistory();
   }
 
   private setPhase(phase: string): void {
@@ -2409,6 +2846,368 @@ export class RemoteBuddyAutonomousEngine {
       this.cfg.llmTimeoutMs * 4,
       20_000,
     );
+  }
+
+  private loadMotifDispatchHistory(): void {
+    try {
+      const raw = readFileSync(this.motifAttributionPath, "utf8");
+      if (!raw.trim()) return;
+      const parsed = JSON.parse(raw) as PersistedMotifDispatchState;
+      const rows = Array.isArray(parsed.entries) ? parsed.entries : [];
+      for (const row of rows) {
+        const motifKey = asString(row.motif_key ?? row.motifKey);
+        if (!motifKey) continue;
+        const dispatches = Array.isArray(row.dispatches) ? row.dispatches : [];
+        const normalized: MotifDispatchEntry[] = [];
+        for (const dispatch of dispatches) {
+          const dispatchedAt = Math.floor(
+            asNumber(
+              (dispatch as Record<string, unknown>).dispatched_at ??
+                (dispatch as Record<string, unknown>).dispatchedAt ??
+                (dispatch as Record<string, unknown>).ts,
+              0,
+            ),
+          );
+          if (!Number.isFinite(dispatchedAt) || dispatchedAt <= 0) continue;
+          const retryCount = Math.max(
+            0,
+            Math.floor(
+              asNumber(
+                (dispatch as Record<string, unknown>).retry_count ??
+                  (dispatch as Record<string, unknown>).retryCount ??
+                  (dispatch as Record<string, unknown>).retries,
+                0,
+              ),
+            ),
+          );
+          normalized.push({ motifKey, dispatchedAt, retryCount });
+        }
+        if (normalized.length > 0) {
+          this.recentMotifDispatches.set(motifKey, normalized);
+        }
+      }
+      const windowRows = Array.isArray(parsed.dispatch_window) ? parsed.dispatch_window : [];
+      const normalizedWindow: MotifDispatchEntry[] = [];
+      for (const row of windowRows) {
+        const motifKey = asString(row.motif_key ?? row.motifKey);
+        if (!motifKey) continue;
+        const dispatchedAt = Math.floor(
+          asNumber(
+            (row as Record<string, unknown>).dispatched_at ??
+              (row as Record<string, unknown>).dispatchedAt ??
+              (row as Record<string, unknown>).ts,
+            0,
+          ),
+        );
+        if (!Number.isFinite(dispatchedAt) || dispatchedAt <= 0) continue;
+        const retryCount = Math.max(
+          0,
+          Math.floor(
+            asNumber(
+              (row as Record<string, unknown>).retry_count ??
+                (row as Record<string, unknown>).retryCount ??
+                (row as Record<string, unknown>).retries,
+              0,
+            ),
+          ),
+        );
+        normalizedWindow.push({ motifKey, dispatchedAt, retryCount });
+      }
+      if (normalizedWindow.length > 0) {
+        this.motifDispatchWindow = normalizedWindow
+          .sort((a, b) => a.dispatchedAt - b.dispatchedAt)
+          .slice(-this.motifWindowSize());
+      } else {
+        const flattened: MotifDispatchEntry[] = [];
+        for (const history of this.recentMotifDispatches.values()) {
+          flattened.push(...history);
+        }
+        if (flattened.length > 0) {
+          this.motifDispatchWindow = flattened
+            .sort((a, b) => a.dispatchedAt - b.dispatchedAt)
+            .slice(-this.motifWindowSize());
+        }
+      }
+      const biasRows = Array.isArray(parsed.bias_index) ? parsed.bias_index : [];
+      if (biasRows.length > 0) {
+        const normalizedBias: MotifBiasRecord[] = [];
+        for (const row of biasRows) {
+          const motifKey = asString(row.motif_key ?? row.motifKey);
+          if (!motifKey) continue;
+          const avgRetry = asNumber(row.avg_retry ?? row.avgRetry, Number.NaN);
+          if (!Number.isFinite(avgRetry)) continue;
+          const reuseCount = Math.max(
+            0,
+            Math.floor(asNumber(row.reuse_count ?? row.reuseCount, 0)),
+          );
+          normalizedBias.push({
+            motif_key: motifKey,
+            avg_retry: Math.round(avgRetry * 100) / 100,
+            reuse_count: reuseCount,
+          });
+        }
+        const limited = normalizedBias
+          .sort((a, b) => a.avg_retry - b.avg_retry || b.reuse_count - a.reuse_count)
+          .slice(0, MAX_PERSISTED_BIAS_ENTRIES);
+        this.motifBiasIndex = new Map(
+          limited.map((entry) => [
+            entry.motif_key,
+            { avgRetry: entry.avg_retry, reuseCount: entry.reuse_count },
+          ]),
+        );
+      }
+      this.pruneMotifHistory();
+      if (this.motifBiasIndex.size === 0) {
+        this.rebuildMotifBiasIndex();
+      }
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code === "ENOENT") return;
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] failed to load motif attribution store: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  private persistMotifDispatches(): void {
+    try {
+      const storeDir = resolve(this.motifAttributionPath, "..");
+      if (!existsSync(storeDir)) mkdirSync(storeDir, { recursive: true });
+      this.pruneMotifHistory();
+      const maxWindow = this.motifWindowSize();
+      const entries: Array<{
+        motif_key: string;
+        dispatches: Array<{ dispatched_at: number; retry_count: number }>;
+      }> = [];
+      for (const [motifKey, history] of this.recentMotifDispatches) {
+        if (history.length === 0) continue;
+        const bounded = history.slice(-maxWindow);
+        entries.push({
+          motif_key: motifKey,
+          dispatches: bounded.map((entry) => ({
+            dispatched_at: entry.dispatchedAt,
+            retry_count: entry.retryCount,
+          })),
+        });
+      }
+      const windowEntries = this.motifDispatchWindow.slice(-maxWindow).map((entry) => ({
+        motif_key: entry.motifKey,
+        dispatched_at: entry.dispatchedAt,
+        retry_count: entry.retryCount,
+      }));
+      const biasIndex = this.rebuildMotifBiasIndex();
+      const payload = {
+        version: MOTIF_ATTRIBUTION_STATE_VERSION,
+        updated_at: new Date().toISOString(),
+        entries,
+        dispatch_window: windowEntries,
+        bias_index: biasIndex,
+      };
+      writeFileSync(this.motifAttributionPath, JSON.stringify(payload, null, 2), "utf8");
+    } catch (error) {
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] failed to persist motif attribution store: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  private motifWindowSize(): number {
+    return RECENT_DISPATCH_MOTIF_WINDOW;
+  }
+
+  private pruneMotifDispatchWindow(now = Date.now()): void {
+    const cutoff = now - RECENT_DISPATCH_MOTIF_TTL_MS;
+    const maxWindow = this.motifWindowSize();
+    if (this.motifDispatchWindow.length === 0) return;
+    this.motifDispatchWindow = this.motifDispatchWindow
+      .filter((entry) => entry.dispatchedAt >= cutoff)
+      .slice(-maxWindow);
+  }
+
+  private pruneMotifKeyCardinality(): void {
+    if (this.recentMotifDispatches.size <= MAX_MOTIF_ATTRIBUTION_KEYS) return;
+    const sorted = [...this.recentMotifDispatches.entries()].sort((a, b) => {
+      const lastA = a[1][a[1].length - 1];
+      const lastB = b[1][b[1].length - 1];
+      return (lastB?.dispatchedAt ?? 0) - (lastA?.dispatchedAt ?? 0);
+    });
+    for (let i = MAX_MOTIF_ATTRIBUTION_KEYS; i < sorted.length; i++) {
+      this.recentMotifDispatches.delete(sorted[i][0]);
+    }
+  }
+
+  private pruneMotifHistory(now = Date.now()): void {
+    this.pruneMotifDispatches(now);
+    this.pruneMotifDispatchWindow(now);
+    this.pruneMotifKeyCardinality();
+  }
+
+  private pushMotifWindowEntry(motifKey: string, dispatchedAt: number, retryCount: number): void {
+    this.motifDispatchWindow.push({ motifKey, dispatchedAt, retryCount });
+    this.pruneMotifDispatchWindow(dispatchedAt);
+  }
+
+  private pruneMotifDispatches(now = Date.now()): void {
+    const cutoff = now - RECENT_DISPATCH_MOTIF_TTL_MS;
+    const maxWindow = this.motifWindowSize();
+    for (const [motifKey, history] of this.recentMotifDispatches) {
+      const filtered = history.filter((entry) => entry.dispatchedAt >= cutoff);
+      if (filtered.length === 0) {
+        this.recentMotifDispatches.delete(motifKey);
+        continue;
+      }
+      this.recentMotifDispatches.set(motifKey, filtered.slice(-maxWindow));
+    }
+  }
+
+  private rebuildMotifBiasIndex(): MotifBiasRecord[] {
+    const maxWindow = this.motifWindowSize();
+    const rows: MotifBiasRecord[] = [];
+    for (const [motifKey, history] of this.recentMotifDispatches) {
+      if (history.length === 0) continue;
+      const bounded = history.slice(-maxWindow);
+      if (bounded.length === 0) continue;
+      const avgRetry =
+        bounded.reduce((sum, entry) => sum + entry.retryCount, 0) / bounded.length;
+      rows.push({
+        motif_key: motifKey,
+        avg_retry: Math.round(avgRetry * 100) / 100,
+        reuse_count: bounded.length,
+      });
+    }
+    const limited = rows
+      .sort((a, b) => a.avg_retry - b.avg_retry || b.reuse_count - a.reuse_count)
+      .slice(0, MAX_PERSISTED_BIAS_ENTRIES);
+    this.motifBiasIndex = new Map(
+      limited.map((entry) => [
+        entry.motif_key,
+        { avgRetry: entry.avg_retry, reuseCount: entry.reuse_count },
+      ]),
+    );
+    return limited;
+  }
+
+  private recordMotifDispatch(motifKey: string | null, retryCount: number): void {
+    if (!motifKey) return;
+    const dispatchedAt = Date.now();
+    const normalizedRetry = Math.max(0, Math.floor(retryCount));
+    const entries = this.recentMotifDispatches.get(motifKey) ?? [];
+    entries.push({
+      motifKey,
+      dispatchedAt,
+      retryCount: normalizedRetry,
+    });
+    this.recentMotifDispatches.set(motifKey, entries);
+    this.pushMotifWindowEntry(motifKey, dispatchedAt, normalizedRetry);
+    this.pruneMotifHistory(dispatchedAt);
+    this.rebuildMotifBiasIndex();
+    this.requestMotifPersistence();
+  }
+
+  private requestMotifPersistence(): void {
+    if (this.motifPersistPending) return;
+    this.motifPersistPending = true;
+    this.motifPersistTimer = setTimeout(() => {
+      this.motifPersistTimer = null;
+      this.motifPersistPending = false;
+      this.persistMotifDispatches();
+    }, MOTIF_ATTRIBUTION_PERSIST_DEBOUNCE_MS);
+  }
+
+  private flushMotifPersistence(): void {
+    if (this.motifPersistTimer) {
+      clearTimeout(this.motifPersistTimer);
+      this.motifPersistTimer = null;
+    }
+    if (this.motifPersistPending) {
+      this.motifPersistPending = false;
+      this.persistMotifDispatches();
+    }
+  }
+
+  private motifReuseStats(motifKey: string | null): {
+    reuseCount: number;
+    penalty: number;
+    retryBias: number;
+    retryPreference: number;
+  } {
+    if (!motifKey) return { reuseCount: 0, penalty: 0, retryBias: 0, retryPreference: 0 };
+    this.pruneMotifHistory();
+    const windowMatches = this.motifDispatchWindow.filter((entry) => entry.motifKey === motifKey);
+    const reuseCount = windowMatches.length;
+    const historyMatches = this.recentMotifDispatches.get(motifKey) ?? [];
+    const persistedBias = this.motifBiasIndex.get(motifKey);
+    if (reuseCount === 0 && historyMatches.length === 0 && !persistedBias) {
+      return { reuseCount: 0, penalty: 0, retryBias: 0, retryPreference: 0 };
+    }
+    const penalty = reuseCount > 1 ? Math.min(0.12, 0.04 * (reuseCount - 1)) : 0;
+    let avgRetry: number | null = null;
+    if (historyMatches.length > 0) {
+      avgRetry =
+        historyMatches.reduce((sum, entry) => sum + entry.retryCount, 0) /
+        historyMatches.length;
+    } else if (persistedBias) {
+      avgRetry = persistedBias.avgRetry;
+    }
+    const retryBias = avgRetry != null ? clamp01(Math.min(avgRetry, 6) / 6) : 0;
+    const retryPreference = avgRetry != null ? clamp01(Math.max(0, 3 - avgRetry) / 3) : 0;
+    return { reuseCount, penalty, retryBias, retryPreference };
+  }
+
+  private motifTelemetrySnapshot(now = Date.now()): MotifTelemetrySnapshot {
+    this.pruneMotifHistory(now);
+    const reuseCounts: Record<string, number> = {};
+    for (const entry of this.motifDispatchWindow) {
+      reuseCounts[entry.motifKey] = (reuseCounts[entry.motifKey] ?? 0) + 1;
+    }
+    const staleMotifKeys = Object.entries(reuseCounts)
+      .filter(([, count]) => count >= STALE_MOTIF_REUSE_THRESHOLD)
+      .map(([key]) => key);
+    const biasIndex: Record<string, { avgRetry: number; reuseCount: number }> = {};
+    for (const [motifKey, entry] of this.motifBiasIndex) {
+      biasIndex[motifKey] = { avgRetry: entry.avgRetry, reuseCount: entry.reuseCount };
+    }
+    return { staleMotifKeys, reuseCounts, biasIndex };
+  }
+
+  private retryCountForDispatch(candidate: AutonomyCandidate, failStreak?: number): number {
+    const metadata = asObject(candidate.engine_trial?.metadata);
+    const metadataRetry = asNumber(
+      metadata.retry_count ??
+        metadata.retryCount ??
+        metadata.dispatch_retry_count ??
+        metadata.dispatchRetryCount ??
+        metadata.retries,
+      Number.NaN,
+    );
+    if (Number.isFinite(metadataRetry) && metadataRetry >= 0) {
+      return Math.floor(metadataRetry);
+    }
+    if (Number.isFinite(failStreak) && (failStreak ?? 0) > 0) {
+      return Math.floor(failStreak ?? 0);
+    }
+    return 0;
+  }
+
+  private attributionEvidence(row?: {
+    patternKey?: string;
+    motifKey?: string | null;
+    motifReuseCount?: number;
+    failStreak?: number;
+    motifRetryPreference?: number;
+  }): Record<string, unknown> {
+    if (!row) return {};
+    return {
+      pattern_key: row.patternKey ?? null,
+      motif_key: row.motifKey ?? null,
+      motif_reuse_count: row.motifReuseCount ?? 0,
+      fail_streak: row.failStreak ?? 0,
+      motif_retry_preference: row.motifRetryPreference ?? 0,
+    };
   }
 
   private loadVisionContext(runId: string): VisionContext | null {
@@ -2906,6 +3705,7 @@ export class RemoteBuddyAutonomousEngine {
       candidate.component_area,
     );
     const prior = snapshot.feedback_priors.find((entry) => entry.pattern_key === patternKey);
+    const failStreak = Math.max(0, Math.floor(asNumber(prior?.fail_streak, 0)));
     const enginePrior = candidate.engine_trial
       ? (snapshot.engine_idea_priors ?? []).find(
           (entry) =>
@@ -2932,6 +3732,10 @@ export class RemoteBuddyAutonomousEngine {
           return false;
         })
       : null;
+    const motifKey = motifKeyFromCandidate(candidate);
+    const motifStats = this.motifReuseStats(motifKey);
+    const motifRetryPreferenceBonus =
+      motifStats.retryPreference > 0 ? Math.min(0.05, 0.05 * motifStats.retryPreference) : 0;
     const penalties: Array<{ kind: any; weight: number; reason: string; evidence_ids: string[] }> = [];
     if (candidate.confidence < this.cfg.minConfidence) {
       penalties.push({
@@ -2954,6 +3758,30 @@ export class RemoteBuddyAutonomousEngine {
         kind: "docs_weak_evidence",
         weight: docsWeakEvidencePenalty,
         reason: `docs candidate impact_signal ${impactSignal.toFixed(2)} below ${DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY.toFixed(2)}`,
+        evidence_ids: candidate.why_now_signal_ids,
+      });
+    }
+    if (failStreak > 0) {
+      penalties.push({
+        kind: "pattern_fail_streak",
+        weight: Math.min(0.15, 0.03 * failStreak),
+        reason: `pattern fail_streak=${failStreak}`,
+        evidence_ids: candidate.why_now_signal_ids,
+      });
+    }
+    if (motifStats.penalty > 0) {
+      penalties.push({
+        kind: "motif_reuse",
+        weight: motifStats.penalty,
+        reason: `recent motif reuse count=${motifStats.reuseCount}`,
+        evidence_ids: candidate.why_now_signal_ids,
+      });
+    }
+    if (motifStats.retryBias > 0) {
+      penalties.push({
+        kind: "motif_retry_bias",
+        weight: Math.min(0.08, 0.08 * motifStats.retryBias),
+        reason: `motif retry bias=${motifStats.retryBias.toFixed(2)}`,
         evidence_ids: candidate.why_now_signal_ids,
       });
     }
@@ -2985,13 +3813,23 @@ export class RemoteBuddyAutonomousEngine {
       sourcePriorSignal.priorScore +
       enginePriorSignal.noveltyBonus +
       sourcePriorSignal.noveltyBonus +
-      sourcePriorSignal.trustBoost -
+      sourcePriorSignal.trustBoost +
+      motifRetryPreferenceBonus -
       penaltyTotal(normalizedPenalties);
     return {
       patternKey,
       impactSignal,
       penalties: normalizedPenalties,
       finalScore,
+      failStreak,
+      motifKey,
+      motifReuseCount: motifStats.reuseCount,
+      attribution: {
+        motifKey,
+        motifReuseCount: motifStats.reuseCount,
+        motifRetryPreference: motifStats.retryPreference,
+        failStreak,
+      },
       emaSuccess: priorSignal.emaSuccess,
       emaUserAccept: priorSignal.emaUserAccept,
       emaLatency: priorSignal.emaLatency,
@@ -3204,6 +4042,7 @@ export class RemoteBuddyAutonomousEngine {
         inspirationPatterns,
         sourceInsights,
         commitHistoryHints,
+        motifTelemetry: this.motifTelemetrySnapshot(),
       });
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
@@ -3584,6 +4423,14 @@ export class RemoteBuddyAutonomousEngine {
         selection_strategy: "not_selected",
         selection_roll: null,
         candidate_created_at: row.candidate.candidate_created_at,
+        debug: {
+          attribution: {
+            pattern_key: row.patternKey,
+            motif_key: row.motifKey ?? null,
+            motif_reuse_count: row.motifReuseCount ?? 0,
+            fail_streak: row.failStreak ?? 0,
+          },
+        },
       }));
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
         this.setPhase("record_snapshot_expired");
@@ -3635,6 +4482,12 @@ export class RemoteBuddyAutonomousEngine {
             selection_strategy: selectedStrategy,
             selection_roll: selection.roll,
             effective_explore_rate: adaptiveExplore.effectiveRate,
+            attribution: {
+              pattern_key: selected.patternKey,
+              motif_key: selected.motifKey ?? null,
+              motif_reuse_count: selected.motifReuseCount ?? 0,
+              fail_streak: selected.failStreak ?? 0,
+            },
           }
         : {
             id: top.candidate.id,
@@ -3654,6 +4507,12 @@ export class RemoteBuddyAutonomousEngine {
             selection_strategy: "none",
             selection_roll: null,
             effective_explore_rate: adaptiveExplore.effectiveRate,
+            attribution: {
+              pattern_key: top.patternKey,
+              motif_key: top.motifKey ?? null,
+              motif_reuse_count: top.motifReuseCount ?? 0,
+              fail_streak: top.failStreak ?? 0,
+            },
           };
       for (const row of candidatesPayload) {
         const isSelected = Boolean(row.id === selectedCandidatePayload.id);
@@ -3683,6 +4542,9 @@ export class RemoteBuddyAutonomousEngine {
             risk_level: top.candidate.risk_level,
             status: "rejected",
             block_reason: top.eligibility.reason ?? "no eligible candidate",
+            evidence: {
+              attribution: this.attributionEvidence(top),
+            },
             score_breakdown: {
               llm_score: top.llmScore,
               impact_signal: top.impactSignal,
@@ -3737,6 +4599,9 @@ export class RemoteBuddyAutonomousEngine {
             risk_level: selected.candidate.risk_level,
             status: "blocked",
             block_reason: "requires_user_input",
+            evidence: {
+              attribution: this.attributionEvidence(selected),
+            },
             score_breakdown: {
               llm_score: selected.llmScore,
               impact_signal: selected.impactSignal,
@@ -3858,6 +4723,9 @@ export class RemoteBuddyAutonomousEngine {
             risk_level: selected.candidate.risk_level,
             status: "failed",
             block_reason: "request_enqueue_failed",
+            evidence: {
+              attribution: this.attributionEvidence(selected),
+            },
           },
           llmCalls,
         });
@@ -3885,6 +4753,9 @@ export class RemoteBuddyAutonomousEngine {
           risk_level: selected.candidate.risk_level,
           status: "dispatched",
           request_id: requestId,
+          evidence: {
+            attribution: this.attributionEvidence(selected),
+          },
           score_breakdown: {
             llm_score: selected.llmScore,
             impact_signal: selected.impactSignal,
@@ -3914,6 +4785,11 @@ export class RemoteBuddyAutonomousEngine {
         },
         llmCalls,
       });
+      if (selected) {
+        const motifKey = selected.motifKey ?? motifKeyFromCandidate(selected.candidate);
+        const retryCount = this.retryCountForDispatch(selected.candidate, selected.failStreak);
+        this.recordMotifDispatch(motifKey, retryCount);
+      }
       outcome = "success";
       outcomeDetail = `dispatched_request_${requestId.slice(0, 8)}`;
     } catch (error) {
@@ -3991,5 +4867,6 @@ export class RemoteBuddyAutonomousEngine {
       this.heartbeatTimer = null;
     }
     this.nextTickAtMs = 0;
+    this.flushMotifPersistence();
   }
 }
