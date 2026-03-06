@@ -1262,6 +1262,7 @@ describe("server AutonomyStore policy gates", () => {
     expect(answered.resume?.componentArea).toBe("apps/server");
     expect(answered.resume?.targetPaths).toEqual(["apps/server/src/autonomy.ts"]);
     expect(answered.resume?.writeGlobs).toEqual(["apps/server/src/*"]);
+    expect(answered.resume?.idempotencyKey).toBe("autonomy_resume:q_question_resume");
     expect(String(answered.resume?.instruction ?? "")).toContain("Prioritize interactive tasks first");
 
     const db = (store as unknown as { db: any }).db;
@@ -1313,5 +1314,117 @@ describe("server AutonomyStore policy gates", () => {
       .get("obj_running_state") as { status: string; job_id: string | null };
     expect(row.status).toBe("running");
     expect(row.job_id).toBe("job_running_state");
+  });
+
+  test("safety state kill switch blocks eligibility", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_safety_gate" }).snapshot_id;
+    const toggled = store.updateSafetyState({ killSwitchEnabled: true });
+    expect(toggled.ok).toBe(true);
+    expect(toggled.state.killSwitchEnabled).toBe(true);
+
+    const result = store.evaluateEligibility({
+      runId: "run_safety_gate",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_safety_gate",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          pattern_key: "pk_safety_gate",
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    expect(result.results?.[0]?.ok).toBe(false);
+    expect(String(result.results?.[0]?.reason ?? "")).toContain("kill switch");
+  });
+
+  test("question actions support skip/close/escalate", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_question_actions" }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_question_actions",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_question_actions",
+        candidate_id: "cand_question_actions",
+        title: "Question action target",
+        instruction: "Need user preference.",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "queue_health",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "blocked",
+      },
+      question: {
+        id: "q_question_actions",
+        question: "Continue with strict priority?",
+        question_type: "bounded_text",
+        expected_answer_schema: { min_length: 3, max_length: 300 },
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const escalated = store.actOnQuestion("q_question_actions", "escalate", "Need manual call");
+    expect(escalated.ok).toBe(true);
+    expect(escalated.action).toBe("escalate");
+
+    const db = (store as unknown as { db: any }).db;
+    const questionRow = db
+      .prepare(`SELECT status, closed_reason FROM questions_queue WHERE id = ?`)
+      .get("q_question_actions") as { status: string; closed_reason: string | null };
+    expect(questionRow.status).toBe("closed");
+    expect(questionRow.closed_reason).toBe("escalated_to_human");
+    const objectiveRow = db
+      .prepare(`SELECT status, block_reason FROM autonomy_objectives WHERE id = ?`)
+      .get("obj_question_actions") as { status: string; block_reason: string | null };
+    expect(objectiveRow.status).toBe("escalated");
+    expect(objectiveRow.block_reason).toBe("escalated_to_human");
+  });
+
+  test("stale objective sweeper dead-letters stale active objectives", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_stale_sweep" }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_stale_sweep",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_stale_sweep",
+        candidate_id: "cand_stale_sweep",
+        title: "Stale objective candidate",
+        instruction: "Test stale sweep.",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/autonomy.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.92,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+      },
+    });
+    expect(decision.ok).toBe(true);
+    const db = (store as unknown as { db: any }).db;
+    db.prepare(`UPDATE autonomy_objectives SET updated_at = datetime('now', '-5 hours') WHERE id = ?`).run(
+      "obj_stale_sweep",
+    );
+
+    const sweep = store.maybeSweepStaleObjectives(new Date(Date.now() + 120_000).toISOString());
+    expect(sweep.ok).toBe(true);
+    expect(sweep.deadLettered).toBeGreaterThanOrEqual(1);
+    const objectiveRow = db
+      .prepare(`SELECT status, block_reason FROM autonomy_objectives WHERE id = ?`)
+      .get("obj_stale_sweep") as { status: string; block_reason: string | null };
+    expect(objectiveRow.status).toBe("dead_letter");
+    expect(objectiveRow.block_reason).toBe("stale_objective_timeout");
   });
 });

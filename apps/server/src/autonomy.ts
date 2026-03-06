@@ -254,6 +254,20 @@ export interface AutonomySnapshot {
     rolling_window_seconds: number;
     global_count_last_hour: number;
     by_type_count_last_hour: Record<string, number>;
+    by_component_count_last_hour?: Record<string, number>;
+  };
+  safety_state?: {
+    kill_switch_enabled: boolean;
+    freeze_until: string | null;
+    freeze_reason: string | null;
+    is_frozen: boolean;
+  };
+  evaluator?: {
+    recommendation: string;
+    sample_count: number;
+    success_rate: number | null;
+    regret_rate: number | null;
+    created_at: string | null;
   };
 }
 
@@ -321,12 +335,51 @@ export interface AutonomyTrustedInspirationInsight {
   curationReason: string | null;
 }
 
+export interface AutonomyEvaluatorScorecard {
+  id: string;
+  windowHours: number;
+  sampleCount: number;
+  successRate: number | null;
+  regretRate: number | null;
+  avgLatencyMs: number | null;
+  dispatchCount: number;
+  recommendation: "healthy" | "constrain" | "pause";
+  createdAt: string;
+}
+
+export interface AutonomyOpsAlert {
+  id: string;
+  alertType: string;
+  severity: "info" | "warning" | "critical";
+  message: string;
+  details: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AutonomySafetyState {
+  killSwitchEnabled: boolean;
+  freezeUntil: string | null;
+  freezeReason: string | null;
+  isFrozen: boolean;
+  updatedAt: string | null;
+}
+
+export interface AutonomyOpsSummary {
+  safetyState: AutonomySafetyState;
+  latestEvaluatorScorecard: AutonomyEvaluatorScorecard | null;
+  recentAlerts: AutonomyOpsAlert[];
+  staleDeadLetterCount24h: number;
+  lastStaleSweepAt: string | null;
+}
+
 export interface AutonomyInsights {
   patternStats: AutonomyPatternStatsInsight[];
   recentPrFeedback: AutonomyPrFeedbackInsight[];
   engineSourceStats: AutonomyEngineSourceInsight[];
   trustedInspirationShortlist: AutonomyTrustedInspirationInsight[];
   archivedInspirationSources: AutonomyTrustedInspirationInsight[];
+  latestEvaluatorScorecard: AutonomyEvaluatorScorecard | null;
+  opsSummary: AutonomyOpsSummary;
 }
 
 export interface AutonomyInspirationPattern {
@@ -425,6 +478,10 @@ function normalizeInspirationSourceType(value: unknown): string {
 
 function asBoolean(value: unknown, fallback = false): boolean {
   if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return fallback;
+    return value !== 0;
+  }
   if (typeof value === "string") {
     const text = value.trim().toLowerCase();
     if (["1", "true", "yes", "on"].includes(text)) return true;
@@ -951,6 +1008,9 @@ export class AutonomyStore {
   }
   private readonly alpha = 0.2;
   private lastInspirationMaintenanceAtMs = 0;
+  private lastEvaluatorRunAtMs = 0;
+  private lastStaleObjectiveSweepAtMs = 0;
+  private lastStaleObjectiveSweepAtIso: string | null = null;
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -1188,6 +1248,47 @@ export class AutonomyStore {
         answered_at TEXT,
         expires_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS autonomy_safety_state (
+        state_id TEXT PRIMARY KEY,
+        kill_switch_enabled INTEGER NOT NULL DEFAULT 0,
+        freeze_until TEXT,
+        freeze_reason TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS autonomy_evaluator_scorecards (
+        id TEXT PRIMARY KEY,
+        window_hours INTEGER NOT NULL,
+        sample_count INTEGER NOT NULL,
+        success_rate REAL,
+        regret_rate REAL,
+        avg_latency_ms REAL,
+        dispatch_count INTEGER NOT NULL DEFAULT 0,
+        recommendation TEXT NOT NULL,
+        payload_json TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_evaluator_scorecards_created
+        ON autonomy_evaluator_scorecards(created_at DESC);
+      CREATE TABLE IF NOT EXISTS autonomy_ops_alerts (
+        id TEXT PRIMARY KEY,
+        alert_type TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        message TEXT NOT NULL,
+        details_json TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_ops_alerts_created
+        ON autonomy_ops_alerts(created_at DESC);
+      CREATE TABLE IF NOT EXISTS autonomy_dead_letters (
+        id TEXT PRIMARY KEY,
+        objective_id TEXT NOT NULL,
+        previous_status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        details_json TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_dead_letters_created
+        ON autonomy_dead_letters(created_at DESC);
       CREATE TABLE IF NOT EXISTS autonomy_llm_calls (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -1231,35 +1332,596 @@ export class AutonomyStore {
     ensureColumn("autonomy_engine_source_stats", "trust_score REAL NOT NULL DEFAULT 0");
     ensureColumn("autonomy_engine_source_stats", "freshness_score REAL NOT NULL DEFAULT 0.5");
     ensureColumn("autonomy_engine_source_stats", "last_reinforced_at TEXT");
+    ensureColumn("questions_queue", "closed_reason TEXT");
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_autonomy_engine_trials_source
         ON autonomy_engine_idea_trials(inspiration_source_key, created_at DESC);
     `);
+    const now = asIsoNow();
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO autonomy_safety_state (
+          state_id, kill_switch_enabled, freeze_until, freeze_reason, updated_at
+        ) VALUES ('global', 0, NULL, NULL, ?)`,
+      )
+      .run(now);
   }
 
   private getDispatchCountsLastHour(nowIso: string): {
     globalCount: number;
     byType: Record<string, number>;
+    byComponent: Record<string, number>;
   } {
     const rows = this.db
       .prepare(
-        `SELECT objective_type AS objectiveType, COUNT(*) AS count
+        `SELECT objective_type AS objectiveType, component_area AS componentArea, COUNT(*) AS count
          FROM autonomy_objectives
          WHERE dispatched_at IS NOT NULL
-           AND datetime(dispatched_at) >= datetime(?, '-1 hour')
-         GROUP BY objective_type`,
+            AND datetime(dispatched_at) >= datetime(?, '-1 hour')
+         GROUP BY objective_type, component_area`,
       )
-      .all(nowIso) as Array<{ objectiveType: string; count: number }>;
+      .all(nowIso) as Array<{ objectiveType: string; componentArea: string; count: number }>;
     const byType: Record<string, number> = {};
+    const byComponent: Record<string, number> = {};
     let globalCount = 0;
     for (const row of rows) {
       const key = asString(row.objectiveType);
-      if (!key) continue;
+      const component = asString(row.componentArea);
       const count = Math.max(0, Math.floor(asNumber(row.count, 0)));
-      byType[key] = count;
+      if (key) byType[key] = (byType[key] ?? 0) + count;
+      if (component) byComponent[component] = (byComponent[component] ?? 0) + count;
       globalCount += count;
     }
-    return { globalCount, byType };
+    return { globalCount, byType, byComponent };
+  }
+
+  private readSafetyStateRow(): {
+    kill_switch_enabled: number;
+    freeze_until: string | null;
+    freeze_reason: string | null;
+    updated_at: string | null;
+  } {
+    const row = this.db
+      .prepare(
+        `SELECT kill_switch_enabled, freeze_until, freeze_reason, updated_at
+         FROM autonomy_safety_state
+         WHERE state_id = 'global'
+         LIMIT 1`,
+      )
+      .get() as
+      | {
+          kill_switch_enabled: number;
+          freeze_until: string | null;
+          freeze_reason: string | null;
+          updated_at: string | null;
+        }
+      | undefined;
+    if (row) return row;
+    const now = asIsoNow();
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO autonomy_safety_state (
+          state_id, kill_switch_enabled, freeze_until, freeze_reason, updated_at
+        ) VALUES ('global', 0, NULL, NULL, ?)`,
+      )
+      .run(now);
+    return {
+      kill_switch_enabled: 0,
+      freeze_until: null,
+      freeze_reason: null,
+      updated_at: now,
+    };
+  }
+
+  getSafetyState(nowIso = asIsoNow()): AutonomySafetyState {
+    const row = this.readSafetyStateRow();
+    const freezeUntil = asString(row.freeze_until) || null;
+    const freezeUntilMs = freezeUntil ? Date.parse(freezeUntil) : Number.NaN;
+    const nowMs = Date.parse(nowIso);
+    const runtimeKillSwitch = Boolean(this.config.remotebuddy.autonomy.killSwitchEnabled);
+    return {
+      killSwitchEnabled: runtimeKillSwitch || asBoolean(row.kill_switch_enabled, false),
+      freezeUntil,
+      freezeReason: asString(row.freeze_reason) || null,
+      isFrozen:
+        Boolean(freezeUntil) &&
+        Number.isFinite(freezeUntilMs) &&
+        Number.isFinite(nowMs) &&
+        freezeUntilMs > nowMs,
+      updatedAt: asString(row.updated_at) || null,
+    };
+  }
+
+  updateSafetyState(body: Record<string, unknown>): {
+    ok: boolean;
+    reason?: string;
+    state: AutonomySafetyState;
+  } {
+    const now = asIsoNow();
+    const current = this.readSafetyStateRow();
+    let killSwitchEnabled = asBoolean(current.kill_switch_enabled, false);
+    let freezeUntil = asString(current.freeze_until) || null;
+    let freezeReason = asString(current.freeze_reason) || null;
+
+    if (typeof body.killSwitchEnabled === "boolean" || typeof body.kill_switch_enabled === "boolean") {
+      killSwitchEnabled = asBoolean(body.killSwitchEnabled ?? body.kill_switch_enabled, false);
+    }
+    if (asBoolean(body.unfreeze ?? body.clearFreeze ?? body.clear_freeze, false)) {
+      freezeUntil = null;
+      freezeReason = null;
+    }
+
+    const freezeForMsRaw = asNumber(body.freezeForMs ?? body.freeze_for_ms, Number.NaN);
+    if (Number.isFinite(freezeForMsRaw) && freezeForMsRaw > 0) {
+      const freezeForMs = Math.max(1_000, Math.floor(freezeForMsRaw));
+      freezeUntil = new Date(Date.parse(now) + freezeForMs).toISOString();
+      freezeReason = asString(body.freezeReason ?? body.freeze_reason) || "manual_freeze";
+    }
+    const freezeUntilInput = asString(body.freezeUntil ?? body.freeze_until);
+    if (freezeUntilInput) {
+      const freezeUntilMs = Date.parse(freezeUntilInput);
+      if (!Number.isFinite(freezeUntilMs)) {
+        return {
+          ok: false,
+          reason: "freezeUntil must be a valid ISO timestamp",
+          state: this.getSafetyState(now),
+        };
+      }
+      freezeUntil = new Date(freezeUntilMs).toISOString();
+      freezeReason = asString(body.freezeReason ?? body.freeze_reason) || freezeReason || "manual_freeze";
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO autonomy_safety_state (
+          state_id, kill_switch_enabled, freeze_until, freeze_reason, updated_at
+        ) VALUES ('global', ?, ?, ?, ?)
+        ON CONFLICT(state_id) DO UPDATE SET
+          kill_switch_enabled = excluded.kill_switch_enabled,
+          freeze_until = excluded.freeze_until,
+          freeze_reason = excluded.freeze_reason,
+          updated_at = excluded.updated_at`,
+      )
+      .run(killSwitchEnabled ? 1 : 0, freezeUntil, freezeReason, now);
+    return { ok: true, state: this.getSafetyState(now) };
+  }
+
+  private safetyBlockReason(nowIso = asIsoNow()): string | null {
+    const state = this.getSafetyState(nowIso);
+    if (state.killSwitchEnabled) return "autonomy kill switch enabled";
+    if (state.isFrozen) {
+      return `autonomy frozen until ${state.freezeUntil}`;
+    }
+    return null;
+  }
+
+  private recordOpsAlert(params: {
+    alertType: string;
+    severity: "info" | "warning" | "critical";
+    message: string;
+    details?: Record<string, unknown>;
+    nowIso?: string;
+  }): void {
+    const nowIso = params.nowIso ?? asIsoNow();
+    const alertType = asString(params.alertType);
+    const message = truncateText(asString(params.message), 800);
+    if (!alertType || !message) return;
+    const recent = this.db
+      .prepare(
+        `SELECT message, created_at
+         FROM autonomy_ops_alerts
+         WHERE alert_type = ?
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      )
+      .get(alertType) as
+      | {
+          message: string | null;
+          created_at: string | null;
+        }
+      | undefined;
+    const recentCreatedAt = asString(recent?.created_at);
+    if (recentCreatedAt) {
+      const ageMs = Date.parse(nowIso) - Date.parse(recentCreatedAt);
+      const sameMessage = asString(recent?.message) === message;
+      if (sameMessage && Number.isFinite(ageMs) && ageMs < 600_000) {
+        return;
+      }
+    }
+    this.db
+      .prepare(
+        `INSERT INTO autonomy_ops_alerts (
+          id, alert_type, severity, message, details_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        `alert_${randomUUID().slice(0, 8)}`,
+        alertType,
+        params.severity,
+        message,
+        JSON.stringify(asObject(params.details)),
+        nowIso,
+      );
+  }
+
+  private listRecentOpsAlerts(limit = 20): AutonomyOpsAlert[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, alert_type, severity, message, details_json, created_at
+         FROM autonomy_ops_alerts
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(Math.max(1, Math.min(200, Math.floor(limit)))) as Array<{
+      id: string | null;
+      alert_type: string | null;
+      severity: string | null;
+      message: string | null;
+      details_json: string | null;
+      created_at: string | null;
+    }>;
+    return rows.map((row) => {
+      const severityRaw = asString(row.severity).toLowerCase();
+      const severity: "info" | "warning" | "critical" =
+        severityRaw === "critical" ? "critical" : severityRaw === "warning" ? "warning" : "info";
+      return {
+        id: asString(row.id),
+        alertType: asString(row.alert_type) || "generic",
+        severity,
+        message: asString(row.message),
+        details: parseJsonObject(row.details_json),
+        createdAt: asString(row.created_at),
+      };
+    });
+  }
+
+  private latestEvaluatorScorecard(): AutonomyEvaluatorScorecard | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, window_hours, sample_count, success_rate, regret_rate, avg_latency_ms, dispatch_count,
+                recommendation, created_at
+         FROM autonomy_evaluator_scorecards
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      )
+      .get() as
+      | {
+          id: string;
+          window_hours: number;
+          sample_count: number;
+          success_rate: number | null;
+          regret_rate: number | null;
+          avg_latency_ms: number | null;
+          dispatch_count: number;
+          recommendation: string;
+          created_at: string;
+        }
+      | undefined;
+    if (!row) return null;
+    const recommendationRaw = asString(row.recommendation).toLowerCase();
+    const recommendation: "healthy" | "constrain" | "pause" =
+      recommendationRaw === "pause"
+        ? "pause"
+        : recommendationRaw === "constrain"
+          ? "constrain"
+          : "healthy";
+    return {
+      id: asString(row.id),
+      windowHours: Math.max(1, Math.floor(asNumber(row.window_hours, 24))),
+      sampleCount: Math.max(0, Math.floor(asNumber(row.sample_count, 0))),
+      successRate: Number.isFinite(asNumber(row.success_rate, Number.NaN))
+        ? clamp01(asNumber(row.success_rate, 0))
+        : null,
+      regretRate: Number.isFinite(asNumber(row.regret_rate, Number.NaN))
+        ? clamp01(asNumber(row.regret_rate, 0))
+        : null,
+      avgLatencyMs: Number.isFinite(asNumber(row.avg_latency_ms, Number.NaN))
+        ? Math.max(0, Math.floor(asNumber(row.avg_latency_ms, 0)))
+        : null,
+      dispatchCount: Math.max(0, Math.floor(asNumber(row.dispatch_count, 0))),
+      recommendation,
+      createdAt: asString(row.created_at),
+    };
+  }
+
+  private runEvaluator(nowIso = asIsoNow()): AutonomyEvaluatorScorecard {
+    const cfg = this.config.remotebuddy.autonomy;
+    const windowHours = Math.max(1, Math.floor(asNumber(cfg.evaluatorWindowHours, 24)));
+    const rows = this.db
+      .prepare(
+        `SELECT COUNT(*) AS sample_count,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count,
+                SUM(CASE WHEN reopened_within_24h = 1 OR regression_flag = 1 THEN 1 ELSE 0 END) AS regret_count,
+                AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS avg_latency_ms
+         FROM autonomy_outcomes
+         WHERE datetime(created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')`,
+      )
+      .get(nowIso) as
+      | {
+          sample_count: number;
+          success_count: number | null;
+          regret_count: number | null;
+          avg_latency_ms: number | null;
+        }
+      | undefined;
+    const dispatchRow = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM autonomy_objectives
+         WHERE dispatched_at IS NOT NULL
+           AND datetime(dispatched_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')`,
+      )
+      .get(nowIso) as { count: number } | undefined;
+    const sampleCount = Math.max(0, Math.floor(asNumber(rows?.sample_count, 0)));
+    const successCount = Math.max(0, Math.floor(asNumber(rows?.success_count, 0)));
+    const regretCount = Math.max(0, Math.floor(asNumber(rows?.regret_count, 0)));
+    const successRate = sampleCount > 0 ? clamp01(successCount / sampleCount) : null;
+    const regretRate = sampleCount > 0 ? clamp01(regretCount / sampleCount) : null;
+    const avgLatencyMs = Number.isFinite(asNumber(rows?.avg_latency_ms, Number.NaN))
+      ? Math.max(0, Math.floor(asNumber(rows?.avg_latency_ms, 0)))
+      : null;
+    const dispatchCount = Math.max(0, Math.floor(asNumber(dispatchRow?.count, 0)));
+    const minSamples = Math.max(1, Math.floor(asNumber(cfg.evaluatorMinSamples, 1)));
+    const minSuccessRate = clamp01(asNumber(cfg.evaluatorMinSuccessRate, 0.45));
+    const maxRegretRate = clamp01(asNumber(cfg.evaluatorMaxRegretRate, 0.35));
+
+    let recommendation: "healthy" | "constrain" | "pause" = "healthy";
+    if (sampleCount < minSamples) {
+      recommendation = "constrain";
+    } else if (
+      (typeof successRate === "number" && successRate < minSuccessRate) ||
+      (typeof regretRate === "number" && regretRate > maxRegretRate)
+    ) {
+      recommendation = "pause";
+    } else if (
+      (typeof successRate === "number" && successRate < Math.min(1, minSuccessRate + 0.08)) ||
+      (typeof regretRate === "number" && regretRate > maxRegretRate * 0.8)
+    ) {
+      recommendation = "constrain";
+    }
+
+    const payload = {
+      minSamples,
+      minSuccessRate,
+      maxRegretRate,
+      sampleCount,
+      successRate,
+      regretRate,
+      avgLatencyMs,
+      dispatchCount,
+    };
+    const id = `eval_${randomUUID().slice(0, 8)}`;
+    this.db
+      .prepare(
+        `INSERT INTO autonomy_evaluator_scorecards (
+          id, window_hours, sample_count, success_rate, regret_rate, avg_latency_ms, dispatch_count,
+          recommendation, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        windowHours,
+        sampleCount,
+        successRate,
+        regretRate,
+        avgLatencyMs,
+        dispatchCount,
+        recommendation,
+        JSON.stringify(payload),
+        nowIso,
+      );
+
+    if (recommendation === "pause" && sampleCount >= minSamples) {
+      this.recordOpsAlert({
+        alertType: "evaluator_pause",
+        severity: "critical",
+        message:
+          `Evaluator recommends pause: successRate=${successRate?.toFixed(2) ?? "n/a"} ` +
+          `regretRate=${regretRate?.toFixed(2) ?? "n/a"} samples=${sampleCount}`,
+        details: payload,
+        nowIso,
+      });
+      const safety = this.getSafetyState(nowIso);
+      if (!safety.killSwitchEnabled && !safety.isFrozen) {
+        this.updateSafetyState({
+          freezeForMs: Math.max(60_000, Math.floor(asNumber(cfg.autoFreezeDurationMs, 1_800_000))),
+          freezeReason: "auto_freeze:evaluator_pause",
+        });
+      }
+    } else if (recommendation === "constrain" && sampleCount >= minSamples) {
+      this.recordOpsAlert({
+        alertType: "evaluator_constrain",
+        severity: "warning",
+        message:
+          `Evaluator recommends constrain: successRate=${successRate?.toFixed(2) ?? "n/a"} ` +
+          `regretRate=${regretRate?.toFixed(2) ?? "n/a"} samples=${sampleCount}`,
+        details: payload,
+        nowIso,
+      });
+    }
+
+    return {
+      id,
+      windowHours,
+      sampleCount,
+      successRate,
+      regretRate,
+      avgLatencyMs,
+      dispatchCount,
+      recommendation,
+      createdAt: nowIso,
+    };
+  }
+
+  private maybeRunEvaluator(nowIso = asIsoNow()): AutonomyEvaluatorScorecard | null {
+    const intervalMs = Math.max(
+      10_000,
+      Math.floor(asNumber(this.config.remotebuddy.autonomy.evaluatorRunIntervalMs, 120_000)),
+    );
+    const nowMs = Date.parse(nowIso);
+    if (!Number.isFinite(nowMs)) return this.latestEvaluatorScorecard();
+    if (this.lastEvaluatorRunAtMs > 0 && nowMs - this.lastEvaluatorRunAtMs < intervalMs) {
+      return this.latestEvaluatorScorecard();
+    }
+    const card = this.runEvaluator(nowIso);
+    this.lastEvaluatorRunAtMs = nowMs;
+    return card;
+  }
+
+  maybeSweepStaleObjectives(nowIso = asIsoNow()): {
+    ok: boolean;
+    deadLettered: number;
+    scanned: number;
+    sweepAt: string;
+  } {
+    const cfg = this.config.remotebuddy.autonomy;
+    const intervalMs = Math.max(
+      5_000,
+      Math.floor(asNumber(cfg.staleObjectiveSweepIntervalMs, 60_000)),
+    );
+    const nowMs = Date.parse(nowIso);
+    if (!Number.isFinite(nowMs)) {
+      return { ok: false, deadLettered: 0, scanned: 0, sweepAt: nowIso };
+    }
+    if (
+      this.lastStaleObjectiveSweepAtMs > 0 &&
+      nowMs - this.lastStaleObjectiveSweepAtMs < intervalMs
+    ) {
+      return { ok: true, deadLettered: 0, scanned: 0, sweepAt: this.lastStaleObjectiveSweepAtIso ?? nowIso };
+    }
+    this.lastStaleObjectiveSweepAtMs = nowMs;
+    this.lastStaleObjectiveSweepAtIso = nowIso;
+
+    const ttlMs = Math.max(60_000, Math.floor(asNumber(cfg.staleObjectiveTtlMs, 2_700_000)));
+    const rows = this.db
+      .prepare(
+        `SELECT id, status, updated_at, question_id
+         FROM autonomy_objectives
+         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
+         ORDER BY updated_at ASC
+         LIMIT 400`,
+      )
+      .all() as Array<{
+      id: string;
+      status: string;
+      updated_at: string | null;
+      question_id: string | null;
+    }>;
+    let deadLettered = 0;
+    for (const row of rows) {
+      const updatedAt = asString(row.updated_at);
+      const updatedAtMs = Date.parse(updatedAt);
+      if (!Number.isFinite(updatedAtMs) || nowMs - updatedAtMs < ttlMs) continue;
+      this.db
+        .prepare(
+          `UPDATE autonomy_objectives
+           SET status = 'dead_letter',
+               block_reason = 'stale_objective_timeout',
+               updated_at = ?
+           WHERE id = ?
+             AND status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`,
+        )
+        .run(nowIso, row.id);
+      this.db
+        .prepare(
+          `INSERT INTO autonomy_dead_letters (
+            id, objective_id, previous_status, reason, details_json, created_at
+          ) VALUES (?, ?, ?, 'stale_objective_timeout', ?, ?)`,
+        )
+        .run(
+          `dl_${randomUUID().slice(0, 10)}`,
+          row.id,
+          asString(row.status) || "unknown",
+          JSON.stringify({
+            staleByMs: Math.max(0, nowMs - updatedAtMs),
+            staleObjectiveTtlMs: ttlMs,
+          }),
+          nowIso,
+        );
+      if (asString(row.question_id)) {
+        this.db
+          .prepare(
+            `UPDATE questions_queue
+             SET status = 'closed',
+                 answer_validation_status = COALESCE(NULLIF(answer_validation_status, ''), 'stale'),
+                 validation_error = COALESCE(validation_error, 'Objective timed out and was dead-lettered'),
+                 closed_reason = 'stale_objective_timeout'
+             WHERE id = ?
+               AND status IN ('open','invalid')`,
+          )
+          .run(asString(row.question_id));
+      }
+      deadLettered += 1;
+    }
+    if (deadLettered > 0) {
+      this.recordOpsAlert({
+        alertType: "stale_objective_dead_letter",
+        severity: "warning",
+        message: `Dead-lettered ${deadLettered} stale objective(s)`,
+        details: { deadLettered, staleObjectiveTtlMs: ttlMs },
+        nowIso,
+      });
+    }
+    return { ok: true, deadLettered, scanned: rows.length, sweepAt: nowIso };
+  }
+
+  getOpsSummary(params?: {
+    requestPending?: number;
+    jobFailureRate?: number;
+    alertLimit?: number;
+  }): AutonomyOpsSummary {
+    const now = asIsoNow();
+    this.maybeSweepStaleObjectives(now);
+    const safetyState = this.getSafetyState(now);
+    const latestEvaluatorScorecard = this.maybeRunEvaluator(now);
+    const deadLetterRow = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM autonomy_dead_letters
+         WHERE datetime(created_at) >= datetime(?, '-24 hours')`,
+      )
+      .get(now) as { count: number } | undefined;
+    const staleDeadLetterCount24h = Math.max(0, Math.floor(asNumber(deadLetterRow?.count, 0)));
+
+    const requestPending = Math.max(0, Math.floor(asNumber(params?.requestPending, 0)));
+    const queuePendingThreshold = Math.max(
+      1,
+      Math.floor(asNumber(this.config.remotebuddy.autonomy.alertQueuePendingThreshold, 20)),
+    );
+    if (requestPending >= queuePendingThreshold) {
+      this.recordOpsAlert({
+        alertType: "request_queue_pending_high",
+        severity: requestPending >= queuePendingThreshold * 2 ? "critical" : "warning",
+        message: `Request pending queue high: ${requestPending} (threshold ${queuePendingThreshold})`,
+        details: { requestPending, queuePendingThreshold },
+        nowIso: now,
+      });
+    }
+
+    const jobFailureRate = clamp01(asNumber(params?.jobFailureRate, 0));
+    const failureThreshold = clamp01(
+      asNumber(this.config.remotebuddy.autonomy.alertJobFailureRateThreshold, 0.3),
+    );
+    if (jobFailureRate >= failureThreshold && failureThreshold > 0) {
+      this.recordOpsAlert({
+        alertType: "job_failure_rate_high",
+        severity: jobFailureRate >= failureThreshold * 1.4 ? "critical" : "warning",
+        message:
+          `Job failure rate high: ${(jobFailureRate * 100).toFixed(1)}% ` +
+          `(threshold ${(failureThreshold * 100).toFixed(1)}%)`,
+        details: { jobFailureRate, threshold: failureThreshold },
+        nowIso: now,
+      });
+    }
+
+    const recentAlerts = this.listRecentOpsAlerts(params?.alertLimit ?? 16);
+    return {
+      safetyState,
+      latestEvaluatorScorecard,
+      recentAlerts,
+      staleDeadLetterCount24h,
+      lastStaleSweepAt: this.lastStaleObjectiveSweepAtIso,
+    };
   }
 
   private buildTopSignals(requestSlo?: QueueSloSummary, jobSlo?: QueueSloSummary): SignalValue[] {
@@ -2017,6 +2679,9 @@ export class AutonomyStore {
   }): AutonomySnapshot {
     const now = asIsoNow();
     this.maybeRunInspirationMaintenance(now);
+    this.maybeSweepStaleObjectives(now);
+    const evaluatorCard = this.maybeRunEvaluator(now);
+    const safetyState = this.getSafetyState(now);
     const snapshotId = `snap_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const ttlMs = this.config.remotebuddy.autonomy.tickIntervalMs * 2;
     const topSignals = this.buildTopSignals(params.requestSlo, params.jobSlo);
@@ -2096,6 +2761,20 @@ export class AutonomyStore {
         rolling_window_seconds: 3600,
         global_count_last_hour: dispatchBudget.globalCount,
         by_type_count_last_hour: dispatchBudget.byType,
+        by_component_count_last_hour: dispatchBudget.byComponent,
+      },
+      safety_state: {
+        kill_switch_enabled: safetyState.killSwitchEnabled,
+        freeze_until: safetyState.freezeUntil,
+        freeze_reason: safetyState.freezeReason,
+        is_frozen: safetyState.isFrozen,
+      },
+      evaluator: {
+        recommendation: evaluatorCard?.recommendation ?? "healthy",
+        sample_count: evaluatorCard?.sampleCount ?? 0,
+        success_rate: evaluatorCard?.successRate ?? null,
+        regret_rate: evaluatorCard?.regretRate ?? null,
+        created_at: evaluatorCard?.createdAt ?? null,
       },
     };
 
@@ -2191,6 +2870,15 @@ export class AutonomyStore {
     }
     if (asBoolean(flags.is_merge_in_progress, false)) return "repo preflight blocked: merge/rebase in progress";
     if (asBoolean(flags.dispatch_lock_held, false)) return "repo preflight blocked: dispatch lock held";
+    const safety = asObject(payload.safety_state);
+    if (asBoolean(safety.kill_switch_enabled, false)) {
+      return "autonomy kill switch enabled";
+    }
+    const isFrozen = asBoolean(safety.is_frozen, false);
+    if (isFrozen) {
+      const freezeUntil = asString(safety.freeze_until);
+      return freezeUntil ? `autonomy frozen until ${freezeUntil}` : "autonomy frozen";
+    }
     return null;
   }
 
@@ -2211,12 +2899,14 @@ export class AutonomyStore {
     const maxConcurrent = limits.maxConcurrentObjectives;
     let activeCount = this.activeObjectiveCount();
     const byTypeCounts: Record<string, number> = { ...counts.byType };
+    const byComponentCounts: Record<string, number> = { ...counts.byComponent };
     let globalCount = counts.globalCount;
     const applySequentialAccounting = asBoolean(
       body.applySequentialAccounting ?? body.apply_sequential_accounting,
       true,
     );
     const preflightErr = this.preflightReason(snapshotId, runId);
+    const safetyErr = this.safetyBlockReason(now);
     const activePatternRows = this.db
       .prepare(
         `SELECT DISTINCT pattern_key AS patternKey
@@ -2256,6 +2946,20 @@ export class AutonomyStore {
       if (globalCount >= limits.maxDispatchPerHour) {
         return { candidate_id: candidateId, ok: false, reason: "global dispatch budget exceeded" };
       }
+      if (componentArea) {
+        const perComponentLimit = Math.max(
+          0,
+          Math.floor(limits.maxDispatchPerHourByComponent[componentArea] ?? limits.maxDispatchPerHour),
+        );
+        const perComponentCount = Math.max(0, Math.floor(byComponentCounts[componentArea] ?? 0));
+        if (perComponentCount >= perComponentLimit) {
+          return {
+            candidate_id: candidateId,
+            ok: false,
+            reason: `per-component budget exceeded for ${componentArea}`,
+          };
+        }
+      }
       if (activeCount >= maxConcurrent) {
         return { candidate_id: candidateId, ok: false, reason: "max concurrent objectives reached" };
       }
@@ -2275,6 +2979,9 @@ export class AutonomyStore {
       if (preflightErr) {
         return { candidate_id: candidateId, ok: false, reason: preflightErr };
       }
+      if (safetyErr) {
+        return { candidate_id: candidateId, ok: false, reason: safetyErr };
+      }
       if (patternKey && activePatternKeys.has(patternKey)) {
         return { candidate_id: candidateId, ok: false, reason: "pattern already has active objective" };
       }
@@ -2287,6 +2994,7 @@ export class AutonomyStore {
       }
       if (applySequentialAccounting) {
         byTypeCounts[objectiveType] = perTypeCount + 1;
+        if (componentArea) byComponentCounts[componentArea] = Math.max(0, byComponentCounts[componentArea] ?? 0) + 1;
         globalCount += 1;
         activeCount += 1;
         if (patternKey) activePatternKeys.add(patternKey);
@@ -3359,6 +4067,37 @@ export class AutonomyStore {
         prev.sample_count + 1,
         now,
       );
+    const autoFreezeThreshold = Math.max(
+      1,
+      Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeFailStreakThreshold, 3)),
+    );
+    if (!success && nextFailStreak >= autoFreezeThreshold) {
+      const freezeForMs = Math.max(
+        60_000,
+        Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeDurationMs, 1_800_000)),
+      );
+      const freezeResult = this.updateSafetyState({
+        freezeForMs,
+        freezeReason: `auto_freeze:fail_streak:${patternKey}`,
+      });
+      if (freezeResult.ok) {
+        this.recordOpsAlert({
+          alertType: "auto_freeze_fail_streak",
+          severity: "critical",
+          message:
+            `Auto-freeze triggered by fail streak ${nextFailStreak} ` +
+            `for ${patternKey} (threshold ${autoFreezeThreshold})`,
+          details: {
+            patternKey,
+            failStreak: nextFailStreak,
+            threshold: autoFreezeThreshold,
+            freezeUntil: freezeResult.state.freezeUntil,
+          },
+          nowIso: now,
+        });
+      }
+    }
+    this.maybeRunEvaluator(now);
     return { ok: true };
   }
 
@@ -3675,7 +4414,11 @@ export class AutonomyStore {
     limit?: number;
     feedbackLimit?: number;
   }): AutonomyInsights {
-    this.maybeRunInspirationMaintenance(asIsoNow());
+    const now = asIsoNow();
+    this.maybeRunInspirationMaintenance(now);
+    this.maybeSweepStaleObjectives(now);
+    const latestEvaluatorScorecard = this.maybeRunEvaluator(now);
+    const opsSummary = this.getOpsSummary();
     const limit = Math.max(1, Math.min(200, Math.floor(asNumber(params?.limit, 20))));
     const feedbackLimit = Math.max(
       1,
@@ -3943,6 +4686,8 @@ export class AutonomyStore {
         sampleCount: Math.max(0, Math.floor(asNumber(row.sample_count, 0))),
         curationReason: asString(row.curation_reason) || null,
       })),
+      latestEvaluatorScorecard,
+      opsSummary,
     };
   }
 
@@ -3993,11 +4738,21 @@ export class AutonomyStore {
         )
         .all(limit) as any[];
     }
+    const nowMs = Date.now();
     return rows.map((row) => ({
       ...row,
       expected_answer_schema: parseJsonObject(row.expected_answer_schema_json),
       context: parseJsonObject(row.context_json),
       answer: row.answer_json ? JSON.parse(row.answer_json) : null,
+      is_expired: (() => {
+        const expiresAtMs = Date.parse(asString(row.expires_at));
+        return Number.isFinite(expiresAtMs) ? expiresAtMs <= nowMs : false;
+      })(),
+      expires_in_ms: (() => {
+        const expiresAtMs = Date.parse(asString(row.expires_at));
+        if (!Number.isFinite(expiresAtMs)) return null;
+        return Math.max(0, Math.floor(expiresAtMs - nowMs));
+      })(),
     }));
   }
 
@@ -4020,6 +4775,7 @@ export class AutonomyStore {
       targetPaths: string[];
       writeGlobs: string[];
       instruction: string;
+      idempotencyKey: string;
     };
   } {
     const row = this.db
@@ -4047,7 +4803,14 @@ export class AutonomyStore {
     const nowMs = Date.parse(now);
     if (Number.isFinite(expiresAtMs) && Number.isFinite(nowMs) && nowMs > expiresAtMs) {
       this.db
-        .prepare(`UPDATE questions_queue SET status = 'closed', validation_error = ? WHERE id = ?`)
+        .prepare(
+          `UPDATE questions_queue
+           SET status = 'closed',
+               answer_validation_status = 'expired',
+               validation_error = ?,
+               closed_reason = 'expired'
+           WHERE id = ?`,
+        )
         .run("Question expired before answer was provided", questionId);
       this.db
         .prepare(`UPDATE autonomy_objectives SET status = 'expired', updated_at = ? WHERE id = ?`)
@@ -4152,9 +4915,100 @@ export class AutonomyStore {
               targetPaths,
               writeGlobs,
               instruction,
+              idempotencyKey: `autonomy_resume:${questionId}`,
             },
           }
         : {}),
+    };
+  }
+
+  actOnQuestion(
+    questionId: string,
+    actionRaw: unknown,
+    noteRaw?: unknown,
+  ): {
+    ok: boolean;
+    action?: "skip" | "close" | "escalate";
+    objectiveId?: string;
+    sessionId?: string;
+    reason?: string;
+  } {
+    const actionText = asString(actionRaw).toLowerCase();
+    const action: "skip" | "close" | "escalate" | null =
+      actionText === "skip" || actionText === "close" || actionText === "escalate"
+        ? actionText
+        : null;
+    if (!action) return { ok: false, reason: `unsupported action "${actionText}"` };
+    const row = this.db
+      .prepare(
+        `SELECT id, objective_id, session_id, status
+         FROM questions_queue
+         WHERE id = ?
+         LIMIT 1`,
+      )
+      .get(questionId) as
+      | {
+          id: string;
+          objective_id: string;
+          session_id: string | null;
+          status: string | null;
+        }
+      | undefined;
+    if (!row) return { ok: false, reason: "Question not found" };
+    const status = asString(row.status).toLowerCase();
+    if (status !== "open" && status !== "invalid") {
+      return { ok: false, reason: `Question cannot be actioned in status "${status}"` };
+    }
+    const now = asIsoNow();
+    const note = truncateText(asString(noteRaw), 400);
+    const closeReason = action === "escalate" ? "escalated_to_human" : action === "skip" ? "skipped" : "closed";
+    const validationError =
+      action === "escalate"
+        ? note || "Escalated to human review."
+        : action === "skip"
+          ? note || "Skipped by user."
+          : note || "Closed by user.";
+    this.db
+      .prepare(
+        `UPDATE questions_queue
+         SET status = 'closed',
+             answer_validation_status = ?,
+             validation_error = ?,
+             closed_reason = ?,
+             answered_at = COALESCE(answered_at, ?)
+         WHERE id = ?`,
+      )
+      .run(action, validationError, closeReason, now, questionId);
+
+    const nextObjectiveStatus =
+      action === "escalate" ? "escalated" : action === "skip" ? "skipped" : "cancelled";
+    this.db
+      .prepare(
+        `UPDATE autonomy_objectives
+         SET status = ?,
+             block_reason = ?,
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(nextObjectiveStatus, closeReason, now, row.objective_id);
+    if (action === "escalate") {
+      this.recordOpsAlert({
+        alertType: "question_escalated",
+        severity: "warning",
+        message: `Autonomy question escalated by user: ${questionId}`,
+        details: {
+          questionId,
+          objectiveId: row.objective_id,
+          note: note || null,
+        },
+        nowIso: now,
+      });
+    }
+    return {
+      ok: true,
+      action,
+      objectiveId: row.objective_id,
+      sessionId: asString(row.session_id) || undefined,
     };
   }
 

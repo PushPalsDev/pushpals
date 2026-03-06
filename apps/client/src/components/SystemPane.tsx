@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type {
+  ActOnAutonomyQuestionResult,
   AutonomyInsightsSummary,
   AutonomyQuestionRow,
   AnswerAutonomyQuestionResult,
@@ -65,6 +66,30 @@ function serializeUnknown(value: unknown, maxChars = 320): string {
   }
 }
 
+function initialDraftForQuestion(question: AutonomyQuestionRow): string {
+  const schema = question.expectedAnswerSchema ?? {};
+  if (question.questionType === "single_choice") {
+    const choices = Array.isArray(schema.choices) ? schema.choices : [];
+    const first = choices.find((entry) => typeof entry === "string" && entry.trim());
+    return typeof first === "string" ? first : "";
+  }
+  if (question.questionType === "multi_choice") {
+    const choices = Array.isArray(schema.choices) ? schema.choices : [];
+    const first = choices.find((entry) => typeof entry === "string" && entry.trim());
+    return typeof first === "string" ? JSON.stringify([first]) : "[]";
+  }
+  if (question.questionType === "json_payload") {
+    const required = Array.isArray(schema.required_keys) ? schema.required_keys : [];
+    const payload: Record<string, string> = {};
+    for (const key of required) {
+      if (typeof key !== "string" || !key.trim()) continue;
+      payload[key] = "";
+    }
+    return Object.keys(payload).length > 0 ? JSON.stringify(payload, null, 2) : "{}";
+  }
+  return "";
+}
+
 export function SystemPane({
   theme,
   events,
@@ -76,6 +101,11 @@ export function SystemPane({
   autonomyAnswerResults,
   autonomyAnswerInFlight,
   onSubmitAutonomyAnswer,
+  autonomyActionResults,
+  autonomyActionInFlight,
+  onApplyAutonomyQuestionAction,
+  autonomySafetyInFlight,
+  onUpdateAutonomySafety,
   lastRefresh,
 }: {
   theme: DashboardTheme;
@@ -91,6 +121,21 @@ export function SystemPane({
     question: Pick<AutonomyQuestionRow, "id" | "sessionId">,
     answerText: string,
   ) => Promise<AnswerAutonomyQuestionResult>;
+  autonomyActionResults: Record<string, ActOnAutonomyQuestionResult>;
+  autonomyActionInFlight: Record<string, boolean>;
+  onApplyAutonomyQuestionAction: (
+    question: Pick<AutonomyQuestionRow, "id" | "sessionId">,
+    action: "skip" | "close" | "escalate",
+    note?: string,
+  ) => Promise<ActOnAutonomyQuestionResult>;
+  autonomySafetyInFlight: boolean;
+  onUpdateAutonomySafety: (update: {
+    killSwitchEnabled?: boolean;
+    freezeForMs?: number;
+    freezeUntil?: string;
+    freezeReason?: string;
+    unfreeze?: boolean;
+  }) => Promise<{ ok: boolean; reason?: string }>;
   lastRefresh: string | null;
 }) {
   const INITIALIZING_GRACE_MS = 90_000;
@@ -152,6 +197,10 @@ export function SystemPane({
   const recentEvents = useMemo(() => events.slice(-40).reverse(), [events]);
   const requestSlo = systemSummary.slo?.requests;
   const jobSlo = systemSummary.slo?.jobs;
+  const autonomyOps = systemSummary.autonomy ?? autonomyInsights.opsSummary;
+  const safety = autonomyOps?.safetyState ?? null;
+  const evaluator = autonomyOps?.latestEvaluatorScorecard ?? autonomyInsights.latestEvaluatorScorecard;
+  const recentAlerts = autonomyOps?.recentAlerts ?? [];
   const trustedSources = autonomyInsights.trustedInspirationShortlist.slice(0, 6);
   const archivedSources = autonomyInsights.archivedInspirationSources.slice(0, 4);
   const watchlistCount = autonomyInsights.engineSourceStats.filter(
@@ -182,7 +231,9 @@ export function SystemPane({
         }
         if (question.status === "invalid" && question.answer != null) {
           next[question.id] = serializeUnknown(question.answer, 2000);
+          continue;
         }
+        if (question.status === "open") next[question.id] = initialDraftForQuestion(question);
       }
       return next;
     });
@@ -200,6 +251,21 @@ export function SystemPane({
       }
     },
     [onSubmitAutonomyAnswer, questionDrafts],
+  );
+
+  const applyQuestionAction = useCallback(
+    async (question: AutonomyQuestionRow, action: "skip" | "close" | "escalate") => {
+      const note = (questionDrafts[question.id] ?? "").trim();
+      await onApplyAutonomyQuestionAction(
+        { id: question.id, sessionId: question.sessionId },
+        action,
+        note || undefined,
+      );
+      if (action !== "escalate") {
+        setQuestionDrafts((prev) => ({ ...prev, [question.id]: "" }));
+      }
+    },
+    [onApplyAutonomyQuestionAction, questionDrafts],
   );
 
   const componentRows = [
@@ -313,6 +379,99 @@ export function SystemPane({
           detail={`timeout ${formatPercent(jobSlo?.timeoutRate)} | p95 run ${formatDuration(jobSlo?.durationMs?.p95)}`}
           theme={theme}
         />
+      </View>
+
+      <View
+        style={[styles.safetyPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}
+      >
+        <View style={styles.rowBetween}>
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            Autonomy Safety Controls
+          </Text>
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            alerts {recentAlerts.length}
+          </Text>
+        </View>
+        <Text style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          kill switch {safety?.killSwitchEnabled ? "enabled" : "disabled"} | frozen{" "}
+          {safety?.isFrozen ? "yes" : "no"}
+          {safety?.freezeUntil ? ` until ${prettyTs(safety.freezeUntil)}` : ""}
+        </Text>
+        {safety?.freezeReason ? (
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            freeze reason: {safety.freezeReason}
+          </Text>
+        ) : null}
+        <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          evaluator {evaluator?.recommendation ?? "unknown"} | success{" "}
+          {typeof evaluator?.successRate === "number" ? `${(evaluator.successRate * 100).toFixed(1)}%` : "--"} |
+          regret{" "}
+          {typeof evaluator?.regretRate === "number" ? `${(evaluator.regretRate * 100).toFixed(1)}%` : "--"} | samples{" "}
+          {evaluator?.sampleCount ?? 0}
+        </Text>
+        <View style={styles.safetyActionsRow}>
+          <Pressable
+            style={[
+              styles.answerButton,
+              {
+                borderColor: theme.border,
+                backgroundColor: autonomySafetyInFlight ? theme.panelAlt : safety?.killSwitchEnabled ? `${theme.warning}33` : theme.accentSoft,
+                opacity: autonomySafetyInFlight ? 0.7 : 1,
+              },
+            ]}
+            disabled={autonomySafetyInFlight}
+            onPress={() => {
+              void onUpdateAutonomySafety({
+                killSwitchEnabled: !Boolean(safety?.killSwitchEnabled),
+              });
+            }}
+          >
+            <Text style={[styles.answerButtonText, { color: theme.accentText, fontFamily: theme.fontSans }]}>
+              {safety?.killSwitchEnabled ? "Disable Kill Switch" : "Enable Kill Switch"}
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[
+              styles.answerButton,
+              {
+                borderColor: theme.border,
+                backgroundColor: autonomySafetyInFlight ? theme.panelAlt : safety?.isFrozen ? `${theme.positive}22` : `${theme.warning}22`,
+                opacity: autonomySafetyInFlight ? 0.7 : 1,
+              },
+            ]}
+            disabled={autonomySafetyInFlight}
+            onPress={() => {
+              void onUpdateAutonomySafety(
+                safety?.isFrozen
+                  ? { unfreeze: true }
+                  : { freezeForMs: 30 * 60 * 1000, freezeReason: "manual_freeze_ui" },
+              );
+            }}
+          >
+            <Text style={[styles.answerButtonText, { color: theme.accentText, fontFamily: theme.fontSans }]}>
+              {safety?.isFrozen ? "Unfreeze" : "Freeze 30m"}
+            </Text>
+          </Pressable>
+        </View>
+        {recentAlerts.slice(0, 3).map((alert) => (
+          <Text
+            key={alert.id}
+            style={[
+              styles.systemMeta,
+              {
+                color:
+                  alert.severity === "critical"
+                    ? theme.danger
+                    : alert.severity === "warning"
+                      ? theme.warning
+                      : theme.textMuted,
+                fontFamily: theme.fontSans,
+              },
+            ]}
+          >
+            {prettyTs(alert.createdAt)} | {alert.alertType}: {clip(alert.message, 180)}
+          </Text>
+        ))}
       </View>
 
       <View style={styles.systemGrid}>
@@ -461,9 +620,22 @@ export function SystemPane({
                     : theme.accent;
             const result = autonomyAnswerResults[question.id];
             const submitting = Boolean(autonomyAnswerInFlight[question.id]);
+            const actionResult = autonomyActionResults[question.id];
+            const actionBusy = Boolean(autonomyActionInFlight[question.id]);
             const schemaText = serializeUnknown(question.expectedAnswerSchema, 260);
             const contextText = serializeUnknown(question.context, 260);
             const answerText = serializeUnknown(question.answer, 260);
+            const expiresInMs =
+              typeof question.expiresInMs === "number" && Number.isFinite(question.expiresInMs)
+                ? question.expiresInMs
+                : (() => {
+                    const ms = Date.parse(question.expiresAt);
+                    if (!Number.isFinite(ms)) return null;
+                    return Math.max(0, ms - Date.now());
+                  })();
+            const isExpired = Boolean(question.isExpired) || (typeof expiresInMs === "number" && expiresInMs <= 0);
+            const expiringSoon = !isExpired && typeof expiresInMs === "number" && expiresInMs <= 15 * 60 * 1000;
+            const expiryTone = isExpired ? theme.danger : expiringSoon ? theme.warning : theme.textMuted;
             return (
               <View key={question.id} style={[styles.questionRow, { borderColor: theme.border }]}>
                 <View style={styles.rowBetween}>
@@ -499,6 +671,17 @@ export function SystemPane({
                 >
                   created {prettyTs(question.createdAt)} | expires{" "}
                   {question.expiresAt ? prettyTs(question.expiresAt) : "--"}
+                </Text>
+                <Text
+                  style={[styles.questionMeta, { color: expiryTone, fontFamily: theme.fontSans }]}
+                >
+                  {isExpired
+                    ? "expired"
+                    : expiringSoon
+                      ? `expires soon (${formatDuration(expiresInMs)})`
+                      : typeof expiresInMs === "number"
+                        ? `expires in ${formatDuration(expiresInMs)}`
+                        : "expiry unknown"}
                 </Text>
                 {schemaText ? (
                   <Text
@@ -584,6 +767,64 @@ export function SystemPane({
                         {submitting ? "Submitting..." : "Submit Answer"}
                       </Text>
                     </Pressable>
+                    <View style={styles.questionSecondaryActions}>
+                      <Pressable
+                        style={[
+                          styles.miniActionButton,
+                          {
+                            borderColor: theme.border,
+                            backgroundColor: actionBusy ? theme.panelAlt : `${theme.warning}22`,
+                            opacity: actionBusy ? 0.7 : 1,
+                          },
+                        ]}
+                        disabled={actionBusy}
+                        onPress={() => {
+                          void applyQuestionAction(question, "skip");
+                        }}
+                      >
+                        <Text style={[styles.miniActionText, { color: theme.warning, fontFamily: theme.fontSans }]}>
+                          Skip
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        style={[
+                          styles.miniActionButton,
+                          {
+                            borderColor: theme.border,
+                            backgroundColor: actionBusy ? theme.panelAlt : `${theme.textMuted}22`,
+                            opacity: actionBusy ? 0.7 : 1,
+                          },
+                        ]}
+                        disabled={actionBusy}
+                        onPress={() => {
+                          void applyQuestionAction(question, "close");
+                        }}
+                      >
+                        <Text
+                          style={[styles.miniActionText, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                        >
+                          Close
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        style={[
+                          styles.miniActionButton,
+                          {
+                            borderColor: theme.border,
+                            backgroundColor: actionBusy ? theme.panelAlt : `${theme.danger}22`,
+                            opacity: actionBusy ? 0.7 : 1,
+                          },
+                        ]}
+                        disabled={actionBusy}
+                        onPress={() => {
+                          void applyQuestionAction(question, "escalate");
+                        }}
+                      >
+                        <Text style={[styles.miniActionText, { color: theme.danger, fontFamily: theme.fontSans }]}>
+                          Escalate
+                        </Text>
+                      </Pressable>
+                    </View>
                   </View>
                 ) : null}
 
@@ -641,6 +882,28 @@ export function SystemPane({
                         resume error: {result.resumeError}
                       </Text>
                     ) : null}
+                  </View>
+                ) : null}
+                {actionResult ? (
+                  <View
+                    style={[
+                      styles.answerResult,
+                      {
+                        borderColor: theme.border,
+                        backgroundColor: actionResult.ok ? `${theme.positive}22` : `${theme.danger}22`,
+                      },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.answerResultLine,
+                        { color: actionResult.ok ? theme.text : theme.danger, fontFamily: theme.fontSans },
+                      ]}
+                    >
+                      {actionResult.ok
+                        ? `action ${actionResult.action ?? "applied"}`
+                        : `action failed: ${actionResult.reason ?? "unknown error"}`}
+                    </Text>
                   </View>
                 ) : null}
               </View>
@@ -810,6 +1073,12 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 10,
   },
+  safetyPanel: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 10,
+  },
   questionPanel: {
     borderWidth: 1,
     borderRadius: 16,
@@ -881,6 +1150,12 @@ const styles = StyleSheet.create({
   questionActionRow: {
     marginTop: 7,
   },
+  questionSecondaryActions: {
+    marginTop: 7,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+  },
   questionInput: {
     borderWidth: 1,
     borderRadius: 10,
@@ -903,6 +1178,25 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     textTransform: "uppercase",
     letterSpacing: 0.3,
+  },
+  miniActionButton: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  miniActionText: {
+    fontSize: 10,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+  },
+  safetyActionsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 8,
+    marginBottom: 4,
   },
   answerResult: {
     marginTop: 7,

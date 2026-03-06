@@ -70,6 +70,7 @@ session_id = "remotebuddy-dev"
 
 [remotebuddy.autonomy]
 enabled = true
+kill_switch_enabled = false
 tick_interval_ms = 300000
 heartbeat_log_ms = 30000
 vision_context_max_chars = 65536
@@ -83,8 +84,21 @@ min_confidence = 0.65
 max_concurrent_objectives = 2
 max_dispatch_per_hour = 6
 max_dispatch_per_hour_by_type = { flaky_test = 4, lint_fix = 3, type_fix = 3, small_refactor = 2, feature_small = 2, feature_medium = 1, feature_large = 0, docs = 1, dep_bump = 0 }
+max_dispatch_per_hour_by_component = { "apps/server" = 3, "apps/remotebuddy" = 2, "apps/workerpals" = 2, "apps/client" = 2, "packages/protocol" = 1, "packages/shared" = 2, "tests/integration" = 2, "tests/unit" = 2 }
 cooldown_fail_streak_threshold = 2
 cooldown_ms = 1800000
+stale_objective_ttl_ms = 2700000
+stale_objective_sweep_interval_ms = 60000
+auto_freeze_fail_streak_threshold = 3
+auto_freeze_duration_ms = 1800000
+evaluator_window_hours = 24
+evaluator_min_samples = 6
+evaluator_min_success_rate = 0.45
+evaluator_max_regret_rate = 0.35
+evaluator_run_interval_ms = 120000
+alert_queue_pending_threshold = 20
+alert_job_failure_rate_threshold = 0.3
+alert_autonomy_failure_rate_threshold = 0.45
 allow_read_anywhere = true
 pr_feedback_comment_rows = 16
 pr_feedback_comment_chars = 600

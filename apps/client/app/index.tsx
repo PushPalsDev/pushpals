@@ -33,6 +33,7 @@ import { usePushPalsSession } from "../src/lib/usePushPalsSession";
 import {
   type AutonomyInsightsSummary,
   type AutonomyQuestionRow,
+  type ActOnAutonomyQuestionResult,
   type AnswerAutonomyQuestionResult,
   type CompletionSnapshotRow,
   type JobSnapshotRow,
@@ -41,6 +42,7 @@ import {
   type RequestSnapshotRow,
   type SystemStatusSummary,
   type WorkerStatusRow,
+  actOnAutonomyQuestion,
   answerAutonomyQuestion,
   fetchAutonomyInsights,
   fetchAutonomyQuestions,
@@ -49,6 +51,7 @@ import {
   fetchRequestsSnapshot,
   fetchSystemStatus,
   fetchWorkers,
+  updateAutonomySafety,
 } from "../src/lib/pushpalsApi";
 
 const DEFAULT_BASE = process.env.EXPO_PUBLIC_PUSHPALS_URL ?? "http://localhost:3001";
@@ -154,12 +157,19 @@ export default function DashboardScreen() {
     engineSourceStats: [],
     trustedInspirationShortlist: [],
     archivedInspirationSources: [],
+    latestEvaluatorScorecard: null,
+    opsSummary: null,
   });
   const [autonomyQuestions, setAutonomyQuestions] = useState<AutonomyQuestionRow[]>([]);
   const [autonomyAnswerResults, setAutonomyAnswerResults] = useState<
     Record<string, AnswerAutonomyQuestionResult>
   >({});
   const [autonomyAnswerInFlight, setAutonomyAnswerInFlight] = useState<Record<string, boolean>>({});
+  const [autonomyActionResults, setAutonomyActionResults] = useState<
+    Record<string, ActOnAutonomyQuestionResult>
+  >({});
+  const [autonomyActionInFlight, setAutonomyActionInFlight] = useState<Record<string, boolean>>({});
+  const [autonomySafetyInFlight, setAutonomySafetyInFlight] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
   const [jobsFilter, setJobsFilter] = useState<{
     requestId: string | null;
@@ -262,6 +272,52 @@ export default function DashboardScreen() {
       }
     },
     [refreshObservability, session.sessionId],
+  );
+
+  const applyAutonomyQuestionAction = useCallback(
+    async (
+      question: Pick<AutonomyQuestionRow, "id" | "sessionId">,
+      action: "skip" | "close" | "escalate",
+      note?: string,
+    ): Promise<ActOnAutonomyQuestionResult> => {
+      setAutonomyActionInFlight((prev) => ({ ...prev, [question.id]: true }));
+      try {
+        const result = await actOnAutonomyQuestion(
+          DEFAULT_BASE,
+          question.id,
+          action,
+          AUTH_TOKEN,
+          note,
+          question.sessionId || session.sessionId || undefined,
+        );
+        setAutonomyActionResults((prev) => ({ ...prev, [question.id]: result }));
+        if (result.ok) await refreshObservability();
+        return result;
+      } finally {
+        setAutonomyActionInFlight((prev) => ({ ...prev, [question.id]: false }));
+      }
+    },
+    [refreshObservability, session.sessionId],
+  );
+
+  const updateSafetyState = useCallback(
+    async (update: {
+      killSwitchEnabled?: boolean;
+      freezeForMs?: number;
+      freezeUntil?: string;
+      freezeReason?: string;
+      unfreeze?: boolean;
+    }) => {
+      setAutonomySafetyInFlight(true);
+      try {
+        const result = await updateAutonomySafety(DEFAULT_BASE, update, AUTH_TOKEN);
+        if (result.ok) await refreshObservability();
+        return result;
+      } finally {
+        setAutonomySafetyInFlight(false);
+      }
+    },
+    [refreshObservability],
   );
 
   const sendMessage = useCallback(async () => {
@@ -616,6 +672,11 @@ export default function DashboardScreen() {
                   autonomyAnswerResults={autonomyAnswerResults}
                   autonomyAnswerInFlight={autonomyAnswerInFlight}
                   onSubmitAutonomyAnswer={submitAutonomyAnswer}
+                  autonomyActionResults={autonomyActionResults}
+                  autonomyActionInFlight={autonomyActionInFlight}
+                  onApplyAutonomyQuestionAction={applyAutonomyQuestionAction}
+                  autonomySafetyInFlight={autonomySafetyInFlight}
+                  onUpdateAutonomySafety={updateSafetyState}
                   lastRefresh={lastRefresh}
                 />
               ) : null}

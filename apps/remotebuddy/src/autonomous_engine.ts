@@ -123,6 +123,20 @@ type Snapshot = {
   dispatch_budget: {
     global_count_last_hour: number;
     by_type_count_last_hour: Record<string, number>;
+    by_component_count_last_hour?: Record<string, number>;
+  };
+  safety_state?: {
+    kill_switch_enabled?: boolean;
+    freeze_until?: string | null;
+    freeze_reason?: string | null;
+    is_frozen?: boolean;
+  };
+  evaluator?: {
+    recommendation?: string;
+    sample_count?: number;
+    success_rate?: number | null;
+    regret_rate?: number | null;
+    created_at?: string | null;
   };
 };
 
@@ -3086,7 +3100,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   async tick(): Promise<void> {
-    if (!this.cfg.enabled || this.inFlight) return;
+    if (!this.cfg.enabled || this.cfg.killSwitchEnabled || this.inFlight) return;
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
     this.markTickStart(runId);
@@ -3130,6 +3144,16 @@ export class RemoteBuddyAutonomousEngine {
       const snapshot = await this.fetchSnapshot(runId, preflight);
       if (!snapshot) {
         outcomeDetail = "snapshot_unavailable";
+        return;
+      }
+      const snapshotSafety = asObject(snapshot.safety_state);
+      if (asBoolean(snapshotSafety.kill_switch_enabled, false)) {
+        outcomeDetail = "kill_switch_enabled";
+        return;
+      }
+      if (asBoolean(snapshotSafety.is_frozen, false)) {
+        const freezeUntil = asString(snapshotSafety.freeze_until);
+        outcomeDetail = freezeUntil ? `frozen_until_${freezeUntil}` : "frozen";
         return;
       }
 
@@ -3465,10 +3489,17 @@ export class RemoteBuddyAutonomousEngine {
         }
         return a.candidate.id.localeCompare(b.candidate.id);
       });
+      const evaluatorRecommendation = asString(snapshot.evaluator?.recommendation).toLowerCase();
+      const exploreBaseRate =
+        evaluatorRecommendation === "pause"
+          ? 0
+          : evaluatorRecommendation === "constrain"
+            ? Math.min(this.cfg.exploreRate, 0.15)
+            : this.cfg.exploreRate;
       const adaptiveExplore = computeAdaptiveExploreRate({
-        baseRate: this.cfg.exploreRate,
-        minRate: ENGINE_EXPLORE_RATE_MIN,
-        maxRate: ENGINE_EXPLORE_RATE_MAX,
+        baseRate: exploreBaseRate,
+        minRate: evaluatorRecommendation === "pause" ? 0 : ENGINE_EXPLORE_RATE_MIN,
+        maxRate: evaluatorRecommendation === "pause" ? 0 : ENGINE_EXPLORE_RATE_MAX,
         snapshot,
       });
 

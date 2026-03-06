@@ -25,10 +25,14 @@ describe("shared config remotebuddy autonomy parsing", () => {
     try {
       const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
       expect(cfg.remotebuddy.autonomy.tickIntervalMs).toBe(120_000);
+      expect(cfg.remotebuddy.autonomy.killSwitchEnabled).toBe(false);
       expect(cfg.remotebuddy.autonomy.allowDirtyWorktree).toBe(false);
       expect(cfg.remotebuddy.autonomy.heartbeatLogMs).toBe(30_000);
       expect(cfg.remotebuddy.autonomy.visionContextMaxChars).toBe(65_536);
       expect(cfg.remotebuddy.autonomy.exploreRate).toBe(0.3);
+      expect(cfg.remotebuddy.autonomy.staleObjectiveTtlMs).toBe(2_700_000);
+      expect(cfg.remotebuddy.autonomy.autoFreezeFailStreakThreshold).toBe(3);
+      expect(cfg.remotebuddy.autonomy.evaluatorWindowHours).toBe(24);
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentRows).toBe(16);
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentChars).toBe(600);
       expect(cfg.remotebuddy.autonomy.prFeedbackSummaryChars).toBe(600);
@@ -184,7 +188,40 @@ describe("shared config remotebuddy autonomy parsing", () => {
       expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByType.feature_small).toBe(2);
       expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByType.feature_medium).toBe(1);
       expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByType.feature_large).toBe(0);
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByComponent["apps/server"]).toBe(3);
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByComponent["apps/client"]).toBe(2);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("REMOTEBUDDY_AUTONOMY_KILL_SWITCH_ENABLED overrides TOML", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "config");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[remotebuddy.autonomy]",
+        "enabled = true",
+        "kill_switch_enabled = false",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    const key = "REMOTEBUDDY_AUTONOMY_KILL_SWITCH_ENABLED";
+    const prior = process.env[key];
+    process.env[key] = "1";
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.remotebuddy.autonomy.killSwitchEnabled).toBe(true);
+    } finally {
+      if (prior == null) delete process.env[key];
+      else process.env[key] = prior;
       rmSync(root, { recursive: true, force: true });
     }
   });

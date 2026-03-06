@@ -165,6 +165,7 @@ export interface RequestRow {
   priority: QueuePriority;
   queueWaitBudgetMs: number;
   metadataJson: string | null;
+  idempotencyKey: string | null;
   metadata?: Record<string, unknown>;
   // Overrides / routing hints for RemoteBuddy
   forceWorker: number; // 0/1 (SQLite INTEGER)
@@ -208,6 +209,7 @@ export class RequestQueue {
     priority,
     queueWaitBudgetMs,
     metadataJson,
+    idempotencyKey,
     forceWorker,
     forceLane,
     status,
@@ -238,6 +240,7 @@ export class RequestQueue {
         priority         TEXT NOT NULL DEFAULT 'normal',
         queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000,
         metadataJson     TEXT,
+        idempotencyKey   TEXT,
         forceWorker      INTEGER NOT NULL DEFAULT 0,
         forceLane        TEXT,
         status           TEXT NOT NULL DEFAULT 'pending',
@@ -272,6 +275,7 @@ export class RequestQueue {
       `ALTER TABLE requests ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`,
     );
     ensureColumn("metadataJson", `ALTER TABLE requests ADD COLUMN metadataJson TEXT;`);
+    ensureColumn("idempotencyKey", `ALTER TABLE requests ADD COLUMN idempotencyKey TEXT;`);
 
     ensureColumn(
       "forceWorker",
@@ -288,6 +292,11 @@ export class RequestQueue {
     // Column-dependent index is created after legacy column backfills complete.
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_requests_priority_created ON requests(status, priority, createdAt);`,
+    );
+    this.db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_idempotency
+         ON requests(idempotencyKey)
+         WHERE idempotencyKey IS NOT NULL AND idempotencyKey <> '';`,
     );
 
     this.db.exec(`
@@ -353,6 +362,7 @@ export class RequestQueue {
     requestId?: string;
     queuePosition?: number;
     etaMs?: number;
+    deduplicated?: boolean;
     message?: string;
   } {
     const sessionId = String(body.sessionId ?? "").trim();
@@ -370,9 +380,40 @@ export class RequestQueue {
       return { ok: false, message: metadataParsed.error };
     }
     const metadataJson = metadataParsed.metadata ? JSON.stringify(metadataParsed.metadata) : null;
+    const idempotencyKeyRaw = asString(body.idempotencyKey ?? body.idempotency_key);
+    const idempotencyKey = idempotencyKeyRaw ? idempotencyKeyRaw.slice(0, 256) : null;
 
     if (!sessionId || !prompt) {
       return { ok: false, message: "sessionId and prompt are required" };
+    }
+
+    if (idempotencyKey) {
+      const existing = this.db
+        .prepare(
+          `SELECT id, priority, status
+           FROM requests
+           WHERE idempotencyKey = ?
+           ORDER BY createdAt DESC
+           LIMIT 1`,
+        )
+        .get(idempotencyKey) as
+        | {
+            id: string;
+            priority: QueuePriority;
+            status: RequestStatus;
+          }
+        | null;
+      if (existing?.id) {
+        const queuePosition = existing.status === "pending" ? this.queuePosition(existing.id) : null;
+        const etaMs = this.estimateEtaMs(normalizePriority(existing.priority), queuePosition);
+        return {
+          ok: true,
+          requestId: existing.id,
+          queuePosition: queuePosition ?? undefined,
+          etaMs: etaMs ?? undefined,
+          deduplicated: true,
+        };
+      }
     }
 
     const requestId = randomUUID();
@@ -381,11 +422,11 @@ export class RequestQueue {
     this.db
       .prepare(
         `INSERT INTO requests (
-          id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, forceWorker, forceLane,
+          id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane,
           status, agentId, result, error,
           enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
       )
       .run(
         requestId,
@@ -394,6 +435,7 @@ export class RequestQueue {
         priority,
         queueWaitBudgetMs,
         metadataJson,
+        idempotencyKey,
         forceWorker,
         forceLane,
         now,

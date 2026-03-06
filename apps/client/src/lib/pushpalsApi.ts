@@ -472,7 +472,45 @@ export interface SystemStatusSummary {
     jobs?: JobSloSummary;
   };
   repo?: SystemRepoSummary;
+  autonomy?: AutonomyOpsSummary;
   ts?: string;
+}
+
+export interface AutonomyEvaluatorScorecard {
+  id: string;
+  windowHours: number;
+  sampleCount: number;
+  successRate: number | null;
+  regretRate: number | null;
+  avgLatencyMs: number | null;
+  dispatchCount: number;
+  recommendation: "healthy" | "constrain" | "pause";
+  createdAt: string;
+}
+
+export interface AutonomyOpsAlert {
+  id: string;
+  alertType: string;
+  severity: "info" | "warning" | "critical";
+  message: string;
+  details: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AutonomySafetyState {
+  killSwitchEnabled: boolean;
+  freezeUntil: string | null;
+  freezeReason: string | null;
+  isFrozen: boolean;
+  updatedAt: string | null;
+}
+
+export interface AutonomyOpsSummary {
+  safetyState: AutonomySafetyState;
+  latestEvaluatorScorecard: AutonomyEvaluatorScorecard | null;
+  recentAlerts: AutonomyOpsAlert[];
+  staleDeadLetterCount24h: number;
+  lastStaleSweepAt: string | null;
 }
 
 export interface AutonomyEngineSourceInsightRow {
@@ -513,6 +551,8 @@ export interface AutonomyInsightsSummary {
   engineSourceStats: AutonomyEngineSourceInsightRow[];
   trustedInspirationShortlist: AutonomyTrustedInspirationInsightRow[];
   archivedInspirationSources: AutonomyTrustedInspirationInsightRow[];
+  latestEvaluatorScorecard: AutonomyEvaluatorScorecard | null;
+  opsSummary: AutonomyOpsSummary | null;
 }
 
 export interface AutonomyQuestionRow {
@@ -530,6 +570,9 @@ export interface AutonomyQuestionRow {
   createdAt: string;
   answeredAt: string;
   expiresAt: string;
+  expiresInMs?: number | null;
+  isExpired?: boolean;
+  closedReason?: string;
 }
 
 export interface AnswerAutonomyQuestionResult {
@@ -539,6 +582,13 @@ export interface AnswerAutonomyQuestionResult {
   objectiveId?: string;
   resumedRequestId?: string;
   resumeError?: string;
+}
+
+export interface ActOnAutonomyQuestionResult {
+  ok: boolean;
+  action?: "skip" | "close" | "escalate";
+  objectiveId?: string;
+  reason?: string;
 }
 
 export interface RuntimeConfigMutation {
@@ -696,6 +746,7 @@ export async function fetchSystemStatus(
       workers: payload.workers,
       queues: payload.queues,
       slo: payload.slo,
+      autonomy: payload.autonomy,
       repo: payload.repo,
       ts: payload.ts,
     };
@@ -710,6 +761,13 @@ export async function fetchAutonomyInsights(
   authToken?: string,
   limit = 40,
 ): Promise<AutonomyInsightsSummary> {
+  const empty: AutonomyInsightsSummary = {
+    engineSourceStats: [],
+    trustedInspirationShortlist: [],
+    archivedInspirationSources: [],
+    latestEvaluatorScorecard: null,
+    opsSummary: null,
+  };
   try {
     const qs = new URLSearchParams({
       limit: String(Math.max(1, Math.min(200, Math.floor(limit)))),
@@ -718,26 +776,90 @@ export async function fetchAutonomyInsights(
     const response = await fetch(`${baseUrl}/autonomy/insights?${qs.toString()}`, {
       headers: authHeaders(authToken),
     });
-    if (!response.ok) {
-      return {
-        engineSourceStats: [],
-        trustedInspirationShortlist: [],
-        archivedInspirationSources: [],
-      };
-    }
+    if (!response.ok) return empty;
     const payload = (await response.json()) as {
       ok?: boolean;
       engineSourceStats?: AutonomyEngineSourceInsightRow[];
       trustedInspirationShortlist?: AutonomyTrustedInspirationInsightRow[];
       archivedInspirationSources?: AutonomyTrustedInspirationInsightRow[];
+      latestEvaluatorScorecard?: Record<string, unknown> | null;
+      opsSummary?: Record<string, unknown> | null;
     };
-    if (!payload.ok) {
-      return {
-        engineSourceStats: [],
-        trustedInspirationShortlist: [],
-        archivedInspirationSources: [],
-      };
-    }
+    if (!payload.ok) return empty;
+    const scorecardRaw =
+      payload.latestEvaluatorScorecard && typeof payload.latestEvaluatorScorecard === "object"
+        ? payload.latestEvaluatorScorecard
+        : null;
+    const scorecard: AutonomyEvaluatorScorecard | null = scorecardRaw
+      ? {
+          id: String(scorecardRaw.id ?? ""),
+          windowHours: Number(scorecardRaw.windowHours ?? 0),
+          sampleCount: Number(scorecardRaw.sampleCount ?? 0),
+          successRate:
+            Number.isFinite(Number(scorecardRaw.successRate)) ? Number(scorecardRaw.successRate) : null,
+          regretRate:
+            Number.isFinite(Number(scorecardRaw.regretRate)) ? Number(scorecardRaw.regretRate) : null,
+          avgLatencyMs:
+            Number.isFinite(Number(scorecardRaw.avgLatencyMs))
+              ? Number(scorecardRaw.avgLatencyMs)
+              : null,
+          dispatchCount: Number(scorecardRaw.dispatchCount ?? 0),
+          recommendation:
+            String(scorecardRaw.recommendation ?? "").toLowerCase() === "pause"
+              ? "pause"
+              : String(scorecardRaw.recommendation ?? "").toLowerCase() === "constrain"
+                ? "constrain"
+                : "healthy",
+          createdAt: String(scorecardRaw.createdAt ?? ""),
+        }
+      : null;
+    const opsRaw = payload.opsSummary && typeof payload.opsSummary === "object" ? payload.opsSummary : null;
+    const opsSummary: AutonomyOpsSummary | null = opsRaw
+      ? {
+          safetyState: {
+            killSwitchEnabled: Boolean(
+              (opsRaw.safetyState as Record<string, unknown> | undefined)?.killSwitchEnabled,
+            ),
+            freezeUntil:
+              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.freezeUntil === "string"
+                ? String((opsRaw.safetyState as Record<string, unknown>).freezeUntil)
+                : null,
+            freezeReason:
+              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.freezeReason === "string"
+                ? String((opsRaw.safetyState as Record<string, unknown>).freezeReason)
+                : null,
+            isFrozen: Boolean((opsRaw.safetyState as Record<string, unknown> | undefined)?.isFrozen),
+            updatedAt:
+              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.updatedAt === "string"
+                ? String((opsRaw.safetyState as Record<string, unknown>).updatedAt)
+                : null,
+          },
+          latestEvaluatorScorecard: scorecard,
+          recentAlerts: Array.isArray(opsRaw.recentAlerts)
+            ? opsRaw.recentAlerts
+                .filter((entry) => entry && typeof entry === "object")
+                .map((entry) => {
+                  const row = entry as Record<string, unknown>;
+                  const sev = String(row.severity ?? "").toLowerCase();
+                  return {
+                    id: String(row.id ?? ""),
+                    alertType: String(row.alertType ?? row.alert_type ?? "generic"),
+                    severity:
+                      sev === "critical" ? "critical" : sev === "warning" ? "warning" : "info",
+                    message: String(row.message ?? ""),
+                    details:
+                      row.details && typeof row.details === "object" && !Array.isArray(row.details)
+                        ? (row.details as Record<string, unknown>)
+                        : {},
+                    createdAt: String(row.createdAt ?? row.created_at ?? ""),
+                  } satisfies AutonomyOpsAlert;
+                })
+            : [],
+          staleDeadLetterCount24h: Number(opsRaw.staleDeadLetterCount24h ?? 0),
+          lastStaleSweepAt:
+            typeof opsRaw.lastStaleSweepAt === "string" ? String(opsRaw.lastStaleSweepAt) : null,
+        }
+      : null;
     return {
       engineSourceStats: Array.isArray(payload.engineSourceStats) ? payload.engineSourceStats : [],
       trustedInspirationShortlist: Array.isArray(payload.trustedInspirationShortlist)
@@ -746,14 +868,12 @@ export async function fetchAutonomyInsights(
       archivedInspirationSources: Array.isArray(payload.archivedInspirationSources)
         ? payload.archivedInspirationSources
         : [],
+      latestEvaluatorScorecard: scorecard,
+      opsSummary,
     };
   } catch (err) {
     console.error("Error fetching autonomy insights:", err);
-    return {
-      engineSourceStats: [],
-      trustedInspirationShortlist: [],
-      archivedInspirationSources: [],
-    };
+    return empty;
   }
 }
 
@@ -817,6 +937,11 @@ export async function fetchAutonomyQuestions(
           createdAt: String(record.created_at ?? ""),
           answeredAt: String(record.answered_at ?? ""),
           expiresAt: String(record.expires_at ?? ""),
+          expiresInMs: Number.isFinite(Number(record.expires_in_ms))
+            ? Number(record.expires_in_ms)
+            : null,
+          isExpired: Boolean(record.is_expired),
+          closedReason: String(record.closed_reason ?? ""),
         } satisfies AutonomyQuestionRow;
       });
   } catch (err) {
@@ -868,6 +993,123 @@ export async function answerAutonomyQuestion(
     };
   } catch (err) {
     console.error("Error answering autonomy question:", err);
+    return { ok: false, reason: String(err) };
+  }
+}
+
+export async function actOnAutonomyQuestion(
+  baseUrl: string,
+  questionId: string,
+  action: "skip" | "close" | "escalate",
+  authToken?: string,
+  note?: string,
+  sessionId?: string,
+): Promise<ActOnAutonomyQuestionResult> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+    const response = await fetch(`${baseUrl}/questions/${encodeURIComponent(questionId)}/action`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        action,
+        ...(note ? { note } : {}),
+        ...(sessionId ? { sessionId } : {}),
+      }),
+    });
+    const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    return {
+      ok: Boolean(payload.ok),
+      action:
+        String(payload.action ?? "").toLowerCase() === "skip" ||
+        String(payload.action ?? "").toLowerCase() === "close" ||
+        String(payload.action ?? "").toLowerCase() === "escalate"
+          ? (String(payload.action).toLowerCase() as "skip" | "close" | "escalate")
+          : undefined,
+      objectiveId:
+        typeof payload.objectiveId === "string"
+          ? payload.objectiveId
+          : typeof payload.objective_id === "string"
+            ? payload.objective_id
+            : undefined,
+      reason: typeof payload.reason === "string" ? payload.reason : undefined,
+    };
+  } catch (err) {
+    console.error("Error applying autonomy question action:", err);
+    return { ok: false, reason: String(err) };
+  }
+}
+
+export async function fetchAutonomySafety(
+  baseUrl: string,
+  authToken?: string,
+): Promise<AutonomySafetyState | null> {
+  try {
+    const response = await fetch(`${baseUrl}/autonomy/safety`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as Record<string, unknown>;
+    if (!payload.ok || !payload.state || typeof payload.state !== "object") return null;
+    const state = payload.state as Record<string, unknown>;
+    return {
+      killSwitchEnabled: Boolean(state.killSwitchEnabled),
+      freezeUntil: typeof state.freezeUntil === "string" ? state.freezeUntil : null,
+      freezeReason: typeof state.freezeReason === "string" ? state.freezeReason : null,
+      isFrozen: Boolean(state.isFrozen),
+      updatedAt: typeof state.updatedAt === "string" ? state.updatedAt : null,
+    };
+  } catch (err) {
+    console.error("Error fetching autonomy safety:", err);
+    return null;
+  }
+}
+
+export async function updateAutonomySafety(
+  baseUrl: string,
+  update: {
+    killSwitchEnabled?: boolean;
+    freezeForMs?: number;
+    freezeUntil?: string;
+    freezeReason?: string;
+    unfreeze?: boolean;
+  },
+  authToken?: string,
+): Promise<{ ok: boolean; reason?: string; state?: AutonomySafetyState }> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+    const response = await fetch(`${baseUrl}/autonomy/safety`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(update),
+    });
+    const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    const stateRaw = payload.state && typeof payload.state === "object" ? payload.state : null;
+    return {
+      ok: Boolean(payload.ok),
+      reason: typeof payload.reason === "string" ? payload.reason : undefined,
+      state: stateRaw
+        ? {
+            killSwitchEnabled: Boolean((stateRaw as Record<string, unknown>).killSwitchEnabled),
+            freezeUntil:
+              typeof (stateRaw as Record<string, unknown>).freezeUntil === "string"
+                ? String((stateRaw as Record<string, unknown>).freezeUntil)
+                : null,
+            freezeReason:
+              typeof (stateRaw as Record<string, unknown>).freezeReason === "string"
+                ? String((stateRaw as Record<string, unknown>).freezeReason)
+                : null,
+            isFrozen: Boolean((stateRaw as Record<string, unknown>).isFrozen),
+            updatedAt:
+              typeof (stateRaw as Record<string, unknown>).updatedAt === "string"
+                ? String((stateRaw as Record<string, unknown>).updatedAt)
+                : null,
+          }
+        : undefined,
+    };
+  } catch (err) {
+    console.error("Error updating autonomy safety:", err);
     return { ok: false, reason: String(err) };
   }
 }

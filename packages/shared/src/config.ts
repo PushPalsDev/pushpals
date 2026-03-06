@@ -116,6 +116,7 @@ export interface PushPalsConfig {
     };
     autonomy: {
       enabled: boolean;
+      killSwitchEnabled: boolean;
       tickIntervalMs: number;
       heartbeatLogMs: number;
       visionContextMaxChars: number;
@@ -129,8 +130,21 @@ export interface PushPalsConfig {
       maxConcurrentObjectives: number;
       maxDispatchPerHour: number;
       maxDispatchPerHourByType: Record<string, number>;
+      maxDispatchPerHourByComponent: Record<string, number>;
       cooldownFailStreakThreshold: number;
       cooldownMs: number;
+      staleObjectiveTtlMs: number;
+      staleObjectiveSweepIntervalMs: number;
+      autoFreezeFailStreakThreshold: number;
+      autoFreezeDurationMs: number;
+      evaluatorWindowHours: number;
+      evaluatorMinSamples: number;
+      evaluatorMinSuccessRate: number;
+      evaluatorMaxRegretRate: number;
+      evaluatorRunIntervalMs: number;
+      alertQueuePendingThreshold: number;
+      alertJobFailureRateThreshold: number;
+      alertAutonomyFailureRateThreshold: number;
       allowReadAnywhere: boolean;
       prFeedbackCommentRows: number;
       prFeedbackCommentChars: number;
@@ -782,6 +796,47 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     ...remoteAutonomyDispatchByTypeCfg,
     ...asStringNumberRecord(remoteAutonomyNode.max_dispatch_per_hour_by_type),
   };
+  const remoteAutonomyDispatchByComponentCfg = {
+    "apps/server": 3,
+    "apps/remotebuddy": 2,
+    "apps/workerpals": 2,
+    "apps/client": 2,
+    "packages/protocol": 1,
+    "packages/shared": 2,
+    "tests/integration": 2,
+    "tests/unit": 2,
+  };
+  const remoteAutonomyDispatchByComponentRaw = asStringNumberRecord(
+    remoteAutonomyNode.max_dispatch_per_hour_by_component,
+  );
+  const remoteAutonomyDispatchByComponent: Record<string, number> = {
+    ...remoteAutonomyDispatchByComponentCfg,
+  };
+  const normalizeAutonomyComponentKey = (value: string): string =>
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/\\/g, "/")
+      .replace(/_+/g, "/")
+      .replace(/-+/g, "/")
+      .replace(/\/+/g, "/");
+  const canonicalComponentByNormalized = new Map<string, string>(
+    Object.keys(remoteAutonomyDispatchByComponentCfg).map((key) => [normalizeAutonomyComponentKey(key), key]),
+  );
+  for (const [rawKey, rawValue] of Object.entries(remoteAutonomyDispatchByComponentRaw)) {
+    const normalized = normalizeAutonomyComponentKey(rawKey);
+    const canonical = canonicalComponentByNormalized.get(normalized);
+    if (!canonical) continue;
+    const parsed =
+      typeof rawValue === "number"
+        ? rawValue
+        : typeof rawValue === "string"
+          ? Number.parseInt(rawValue.trim(), 10)
+          : Number.NaN;
+    remoteAutonomyDispatchByComponent[canonical] = Number.isFinite(parsed)
+      ? Math.max(0, Math.floor(parsed))
+      : 0;
+  }
 
   const workerNode = getObject(merged, "workerpals");
   const workerOpenHandsNode = getObject(workerNode, "openhands");
@@ -1517,6 +1572,9 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         enabled:
           parseBoolEnv("REMOTEBUDDY_AUTONOMY_ENABLED") ??
           asBoolean(remoteAutonomyNode.enabled, false),
+        killSwitchEnabled:
+          parseBoolEnv("REMOTEBUDDY_AUTONOMY_KILL_SWITCH_ENABLED") ??
+          asBoolean(remoteAutonomyNode.kill_switch_enabled, false),
         tickIntervalMs: Math.max(
           5_000,
           asInt(
@@ -1634,6 +1692,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
           ),
         ),
         maxDispatchPerHourByType: remoteAutonomyDispatchByType,
+        maxDispatchPerHourByComponent: remoteAutonomyDispatchByComponent,
         cooldownFailStreakThreshold: Math.max(
           1,
           asInt(
@@ -1647,6 +1706,145 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
           asInt(
             parseIntEnv("REMOTEBUDDY_AUTONOMY_COOLDOWN_MS") ?? remoteAutonomyNode.cooldown_ms,
             1_800_000,
+          ),
+        ),
+        staleObjectiveTtlMs: Math.max(
+          60_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_STALE_OBJECTIVE_TTL_MS") ??
+              remoteAutonomyNode.stale_objective_ttl_ms,
+            2_700_000,
+          ),
+        ),
+        staleObjectiveSweepIntervalMs: Math.max(
+          5_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_STALE_OBJECTIVE_SWEEP_INTERVAL_MS") ??
+              remoteAutonomyNode.stale_objective_sweep_interval_ms,
+            60_000,
+          ),
+        ),
+        autoFreezeFailStreakThreshold: Math.max(
+          1,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_AUTO_FREEZE_FAIL_STREAK_THRESHOLD") ??
+              remoteAutonomyNode.auto_freeze_fail_streak_threshold,
+            3,
+          ),
+        ),
+        autoFreezeDurationMs: Math.max(
+          60_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_AUTO_FREEZE_DURATION_MS") ??
+              remoteAutonomyNode.auto_freeze_duration_ms,
+            1_800_000,
+          ),
+        ),
+        evaluatorWindowHours: Math.max(
+          1,
+          Math.min(
+            168,
+            asInt(
+              parseIntEnv("REMOTEBUDDY_AUTONOMY_EVALUATOR_WINDOW_HOURS") ??
+                remoteAutonomyNode.evaluator_window_hours,
+              24,
+            ),
+          ),
+        ),
+        evaluatorMinSamples: Math.max(
+          1,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_EVALUATOR_MIN_SAMPLES") ??
+              remoteAutonomyNode.evaluator_min_samples,
+            6,
+          ),
+        ),
+        evaluatorMinSuccessRate: Math.max(
+          0,
+          Math.min(
+            1,
+            (() => {
+              const parsed = Number.parseFloat(
+                String(
+                  firstNonEmpty(
+                    process.env.REMOTEBUDDY_AUTONOMY_EVALUATOR_MIN_SUCCESS_RATE,
+                    asString(remoteAutonomyNode.evaluator_min_success_rate, "0.45"),
+                    "0.45",
+                  ),
+                ),
+              );
+              return Number.isFinite(parsed) ? parsed : 0.45;
+            })(),
+          ),
+        ),
+        evaluatorMaxRegretRate: Math.max(
+          0,
+          Math.min(
+            1,
+            (() => {
+              const parsed = Number.parseFloat(
+                String(
+                  firstNonEmpty(
+                    process.env.REMOTEBUDDY_AUTONOMY_EVALUATOR_MAX_REGRET_RATE,
+                    asString(remoteAutonomyNode.evaluator_max_regret_rate, "0.35"),
+                    "0.35",
+                  ),
+                ),
+              );
+              return Number.isFinite(parsed) ? parsed : 0.35;
+            })(),
+          ),
+        ),
+        evaluatorRunIntervalMs: Math.max(
+          10_000,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_EVALUATOR_RUN_INTERVAL_MS") ??
+              remoteAutonomyNode.evaluator_run_interval_ms,
+            120_000,
+          ),
+        ),
+        alertQueuePendingThreshold: Math.max(
+          1,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_ALERT_QUEUE_PENDING_THRESHOLD") ??
+              remoteAutonomyNode.alert_queue_pending_threshold,
+            20,
+          ),
+        ),
+        alertJobFailureRateThreshold: Math.max(
+          0,
+          Math.min(
+            1,
+            (() => {
+              const parsed = Number.parseFloat(
+                String(
+                  firstNonEmpty(
+                    process.env.REMOTEBUDDY_AUTONOMY_ALERT_JOB_FAILURE_RATE_THRESHOLD,
+                    asString(remoteAutonomyNode.alert_job_failure_rate_threshold, "0.3"),
+                    "0.3",
+                  ),
+                ),
+              );
+              return Number.isFinite(parsed) ? parsed : 0.3;
+            })(),
+          ),
+        ),
+        alertAutonomyFailureRateThreshold: Math.max(
+          0,
+          Math.min(
+            1,
+            (() => {
+              const parsed = Number.parseFloat(
+                String(
+                  firstNonEmpty(
+                    process.env.REMOTEBUDDY_AUTONOMY_ALERT_AUTONOMY_FAILURE_RATE_THRESHOLD,
+                    asString(remoteAutonomyNode.alert_autonomy_failure_rate_threshold, "0.45"),
+                    "0.45",
+                  ),
+                ),
+              );
+              return Number.isFinite(parsed) ? parsed : 0.45;
+            })(),
           ),
         ),
         allowReadAnywhere:

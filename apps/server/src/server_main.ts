@@ -273,6 +273,7 @@ export function createRequestHandler() {
         const nowMs = Date.now();
         if (nowMs - lastStaleRecoverySweepAt < staleClaimSweepIntervalMs) return;
         lastStaleRecoverySweepAt = nowMs;
+        autonomyStore.maybeSweepStaleObjectives();
 
         const recovered = jobQueue.recoverStaleClaimedJobs(staleClaimTtlMs);
         if (recovered.length === 0) return;
@@ -711,6 +712,21 @@ export function createRequestHandler() {
         const closedUnmergedWorkerPrs = workerPrBacklog.filter(
           (entry) => entry.mergeState === "closed_unmerged",
         );
+        const requestCounts = requestQueue.countByStatus();
+        const requestPriorityCounts = requestQueue.countByPriority();
+        const requestPendingSnapshot = requestQueue.nextPendingSnapshot(10);
+        const requestSlo = requestQueue.sloSummary(24);
+        const jobCounts = jobQueue.countByStatus();
+        const jobPriorityCounts = jobQueue.countByPriority();
+        const jobPendingSnapshot = jobQueue.nextPendingSnapshot(10);
+        const jobSlo = jobQueue.sloSummary(24);
+        const completionCounts = completionQueue.countByStatus();
+        const jobTerminal = Math.max(0, Number(jobSlo.completed ?? 0) + Number(jobSlo.failed ?? 0));
+        const jobFailureRate = jobTerminal > 0 ? Number(jobSlo.failed ?? 0) / jobTerminal : 0;
+        const autonomyOps = autonomyStore.getOpsSummary({
+          requestPending: Math.max(0, Number(requestCounts.pending ?? 0)),
+          jobFailureRate,
+        });
 
         return makeJson({
           ok: true,
@@ -722,12 +738,12 @@ export function createRequestHandler() {
             idle: Math.max(0, onlineWorkers.length - busyWorkers),
           },
           queues: {
-            requests: requestQueue.countByStatus(),
-            requestPriorities: requestQueue.countByPriority(),
-            requestPendingSnapshot: requestQueue.nextPendingSnapshot(10),
-            jobs: jobQueue.countByStatus(),
-            jobPriorities: jobQueue.countByPriority(),
-            jobPendingSnapshot: jobQueue.nextPendingSnapshot(10),
+            requests: requestCounts,
+            requestPriorities: requestPriorityCounts,
+            requestPendingSnapshot,
+            jobs: jobCounts,
+            jobPriorities: jobPriorityCounts,
+            jobPendingSnapshot,
             workerPrBacklog: {
               openUnmergedCount: openUnmergedWorkerPrs.length,
               mergedCount: mergedWorkerPrs.length,
@@ -741,12 +757,13 @@ export function createRequestHandler() {
                 latestFeedbackAt: entry.latestFeedbackAt,
               })),
             },
-            completions: completionQueue.countByStatus(),
+            completions: completionCounts,
           },
           slo: {
-            requests: requestQueue.sloSummary(24),
-            jobs: jobQueue.sloSummary(24),
+            requests: requestSlo,
+            jobs: jobSlo,
           },
+          autonomy: autonomyOps,
           repo,
         });
       }
@@ -872,6 +889,22 @@ export function createRequestHandler() {
           feedbackLimit,
         });
         return makeJson({ ok: true, ...insights }, 200);
+      }
+
+      // GET /autonomy/safety
+      if (pathname === "/autonomy/safety" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        return makeJson({ ok: true, state: autonomyStore.getSafetyState() }, 200);
+      }
+
+      // POST /autonomy/safety
+      if (pathname === "/autonomy/safety" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.updateSafetyState(body);
+        return makeJson(result, result.ok ? 200 : 400);
       }
 
       // POST /autonomy/inspiration/ingest
@@ -1139,6 +1172,7 @@ export function createRequestHandler() {
             sessionId: result.resume.sessionId,
             prompt: result.resume.instruction,
             priority: "background",
+            idempotencyKey: result.resume.idempotencyKey,
             forceWorker: true,
             forceLane: "worker",
             metadata: {
@@ -1207,6 +1241,36 @@ export function createRequestHandler() {
           },
           200,
         );
+      }
+
+      // POST /questions/:id/action
+      const qActionMatch = pathname.match(/^\/questions\/([^/]+)\/action$/);
+      if (qActionMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const questionId = qActionMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.actOnQuestion(questionId, body.action, body.note);
+        if (!result.ok) return makeJson(result, 400);
+        const sessionId = compactText(body.sessionId, 128) || compactText(result.sessionId, 128);
+        const session = sessionId ? sessionManager.getSession(sessionId) : null;
+        if (session) {
+          session.emit({
+            protocolVersion: PROTOCOL_VERSION,
+            id: randomUUID(),
+            ts: new Date().toISOString(),
+            sessionId,
+            type: "question_answered",
+            from: "server:autonomy",
+            payload: {
+              questionId,
+              objectiveId: result.objectiveId || "unknown",
+              status: result.action || "closed",
+              ...(body.note ? { answerSummary: compactText(body.note, 240) } : {}),
+            },
+          });
+        }
+        return makeJson(result, 200);
       }
 
       // GET /jobs

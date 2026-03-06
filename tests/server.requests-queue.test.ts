@@ -217,4 +217,27 @@ describe("server RequestQueue", () => {
     expect(queue.countAutonomyRequests(["pending", "claimed"])).toBe(2);
     queue.close();
   });
+
+  test("deduplicates enqueue by idempotency key", () => {
+    const queue = new RequestQueue(":memory:");
+    const first = queue.enqueue({
+      sessionId: "dev",
+      prompt: "resume autonomy objective",
+      priority: "background",
+      idempotencyKey: "autonomy_resume:q_123",
+    });
+    const second = queue.enqueue({
+      sessionId: "dev",
+      prompt: "resume autonomy objective",
+      priority: "background",
+      idempotencyKey: "autonomy_resume:q_123",
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(second.deduplicated).toBe(true);
+    expect(second.requestId).toBe(first.requestId);
+    expect(queue.getPendingRequests().length).toBe(1);
+    queue.close();
+  });
 });
