@@ -239,6 +239,56 @@ const ENGINE_EXPLORE_RATE_MIN = 0.1;
 const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
+const QUEUE_P95_SOFT_THRESHOLD_MS = 120_000;
+const QUEUE_P95_SPIKE_BAND_MS = 240_000;
+const ADJACENCY_BACKLOG_SATURATION = 12;
+const DEFAULT_ADJACENCY_EXPLORATION_WEIGHT = 0.35;
+const DEFAULT_ADJACENCY_LATENCY_GUARD = 0.6;
+const JOB_FAILURE_RATE_SPIKE = 0.12;
+const ADJACENCY_HIGH_PRESSURE_THRESHOLD = 0.7;
+const ADJACENCY_SPIKE_THRESHOLD = 0.85;
+const ADJACENCY_HIGH_PRESSURE_NOVELTY_CAP = 0.35;
+const ADJACENCY_SPIKE_NOVELTY_CAP = 0.18;
+const QUEUE_P95_METRIC_ALIASES = [
+  "queue_p95",
+  "queue-p95",
+  "queueP95",
+  "queue_latency_p95",
+  "queueLatencyP95",
+  "queue_latency",
+  "queue-latency",
+  "latency_p95",
+  "p95",
+];
+const JOB_FAILURE_RATE_ALIASES = [
+  "job_failure_rate",
+  "job-failure-rate",
+  "jobFailureRate",
+  "failure_rate",
+  "failure-rate",
+  "fail_rate",
+  "job_fail_rate",
+  "queue_failure_rate",
+  "queue_fail_rate",
+  "error_rate",
+];
+const STRUCTURED_SIGNAL_FIELDS = [
+  "metrics",
+  "measurements",
+  "structured_metrics",
+  "structured",
+  "payload",
+  "data",
+  "fields",
+  "telemetry",
+  "values",
+];
+const STRUCTURED_SIGNAL_EVIDENCE_FIELDS = [
+  "structured_evidence",
+  "evidence_structured",
+  "evidence_json",
+  "metrics_json",
+];
 const AUTO_INGEST_SEED_PATTERNS: Array<{
   algorithm: string;
   whenToUse: string;
@@ -760,12 +810,86 @@ export interface EngineInspirationContext {
   building_blocks: EngineIdeaBuildingBlock[];
   source_patterns: EngineInspirationSourcePattern[];
   commit_history_hints: EngineCommitHistoryHint[];
+  motif_mixer?: MotifMixerSnapshot;
 }
 
 type EngineIdeaInputSnapshot = Pick<
   Snapshot,
   "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget"
 >;
+
+type MotifMixEntry = {
+  motifId: string;
+  role: "stability" | "conflict_resolution";
+  weight: number;
+};
+
+type MotifAdjacencyNode = {
+  motifId: string;
+  role: MotifMixEntry["role"];
+  neighbors: Array<{ motifId: string; influence: number }>;
+};
+
+const MOTIF_ADJACENCY_GRAPH: MotifAdjacencyNode[] = [
+  {
+    motifId: "startup_stability",
+    role: "stability",
+    neighbors: [{ motifId: "merge_rework_loop", influence: 0.2 }],
+  },
+  {
+    motifId: "merge_rework_loop",
+    role: "conflict_resolution",
+    neighbors: [{ motifId: "startup_stability", influence: 0.1 }],
+  },
+];
+
+type MotifMixerSnapshot = {
+  active: boolean;
+  queueP95: number;
+  queuePressure: number;
+  queueSignal: number;
+  queueEvidence: string;
+  queueSignalPresent: boolean;
+  queueEvidenceParseFailed: boolean;
+  queueMetricLabel?: string;
+  jobFailureRate: number;
+  jobFailureMetricLabel?: string;
+  jobFailureSampleCount: number;
+  failurePressure: number;
+  queueSoftThresholdMs: number;
+  backlogSize: number;
+  backlogPressure: number;
+  dispatchSaturation: number;
+  compositePressure: number;
+  queueGuardrailPressure: number;
+  backlogNoveltyBias: number;
+  reliabilityWeight: number;
+  noveltyWeight: number;
+  noveltyClamp: number;
+  explorationWeight: number;
+  mixes: MotifMixEntry[];
+  inactiveReason?: string;
+};
+
+type MotifMixerConfig = {
+  queueSoftThresholdMs: number;
+  queueSpikeBandMs: number;
+  backlogSaturation: number;
+  explorationWeight: number;
+  latencyGuardWeight: number;
+};
+
+type QueueTelemetry = {
+  queueP95: number;
+  jobFailureRate: number;
+  queueSignal: number;
+  queueEvidence: string;
+  queueSignalPresent: boolean;
+  queueEvidenceParseFailed: boolean;
+  queueMetricLabel?: string;
+  jobFailureMetricLabel?: string;
+  jobFailureSampleCount: number;
+};
 
 type EngineIdeaBlueprint = {
   id: string;
@@ -1786,12 +1910,500 @@ function buildCommitHistoryBlocks(params: {
     .sort((a, b) => b.score - a.score);
 }
 
+function normalizeMotifMixerConfig(config?: Partial<MotifMixerConfig>): MotifMixerConfig {
+  const queueSoftThresholdMs = clampToRange(
+    asNumber(config?.queueSoftThresholdMs, QUEUE_P95_SOFT_THRESHOLD_MS),
+    30_000,
+    600_000,
+  );
+  const queueSpikeBandMs = clampToRange(
+    asNumber(config?.queueSpikeBandMs, QUEUE_P95_SPIKE_BAND_MS),
+    30_000,
+    600_000,
+  );
+  const backlogSaturation = Math.max(
+    1,
+    Math.floor(asNumber(config?.backlogSaturation, ADJACENCY_BACKLOG_SATURATION)),
+  );
+  const explorationWeight = clamp01(
+    asNumber(config?.explorationWeight, DEFAULT_ADJACENCY_EXPLORATION_WEIGHT),
+  );
+  const latencyGuardWeight = clamp01(
+    asNumber(config?.latencyGuardWeight, DEFAULT_ADJACENCY_LATENCY_GUARD),
+  );
+  return {
+    queueSoftThresholdMs,
+    queueSpikeBandMs,
+    backlogSaturation,
+    explorationWeight,
+    latencyGuardWeight,
+  };
+}
+
+function extractTelemetryMetric(
+  evidence: string,
+  metric: string | string[],
+): { value: number | null; unit?: string; label?: string } {
+  if (!evidence) return { value: null };
+  const candidates = Array.isArray(metric) ? metric : [metric];
+  for (const candidate of candidates) {
+    const normalizedMetric = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(
+      `${normalizedMetric}\\s*(?:[:=]|->|=>|~|≈|is|was|at|approx(?:imately)?|about)?\\s*([-+]?[0-9]+(?:\\.[0-9]+)?)\\s*([a-z%]+)?`,
+      "i",
+    );
+    const match = evidence.match(pattern);
+    if (!match) continue;
+    const numericValue = Number(match[1]);
+    if (!Number.isFinite(numericValue)) continue;
+    const unit = match[2] ? match[2].toLowerCase() : undefined;
+    return { value: numericValue, unit, label: candidate };
+  }
+  return { value: null };
+}
+
+function normalizeDurationMs(value: number, unit?: string): number {
+  if (!Number.isFinite(value)) return Number.NaN;
+  if (!unit) return value;
+  const normalized = unit.toLowerCase();
+  if (
+    normalized === "ms" ||
+    normalized === "msec" ||
+    normalized === "millis" ||
+    normalized === "millisecond" ||
+    normalized === "milliseconds"
+  ) {
+    return value;
+  }
+  if (
+    normalized === "s" ||
+    normalized === "sec" ||
+    normalized === "secs" ||
+    normalized === "second" ||
+    normalized === "seconds"
+  ) {
+    return value * 1000;
+  }
+  return value;
+}
+
+function normalizeRateValue(value: number, unit?: string): number {
+  if (!Number.isFinite(value)) return Number.NaN;
+  if (!unit) return value;
+  const normalized = unit.toLowerCase();
+  if (normalized === "%" || normalized === "percent" || normalized === "pct") {
+    return value / 100;
+  }
+  return value;
+}
+
+function parseStructuredEvidence(value: string): unknown {
+  const trimmed = value.trim();
+  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeMetricFieldKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function metricUnitHintFromKey(key: string): string | undefined {
+  const normalized = key.toLowerCase();
+  if (/(?:^|[_-])(ms|millis|millisecond)s?$/.test(normalized) || normalized.endsWith("ms")) {
+    return "ms";
+  }
+  if (
+    /(?:^|[_-])(s|sec|second)s?$/.test(normalized) ||
+    normalized.endsWith("sec") ||
+    normalized.endsWith("second")
+  ) {
+    return "s";
+  }
+  if (/(percent|pct|%)$/.test(normalized)) return "%";
+  return undefined;
+}
+
+function findNumericMetricInSource(
+  source: unknown,
+  aliasKeys: string[],
+  depth = 0,
+): { value: number; unit?: string; label?: string } | null {
+  if (!source || depth > 5) return null;
+  if (Array.isArray(source)) {
+    for (const entry of source) {
+      const candidate = findNumericMetricInSource(entry, aliasKeys, depth + 1);
+      if (candidate) return candidate;
+    }
+    return null;
+  }
+  if (typeof source !== "object") return null;
+  for (const [key, rawValue] of Object.entries(source as Record<string, unknown>)) {
+    const normalizedKey = normalizeMetricFieldKey(key);
+    const matchesAlias = aliasKeys.some((aliasKey) => normalizedKey.includes(aliasKey));
+    if (matchesAlias) {
+      const unitHint = metricUnitHintFromKey(key);
+      if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+        return { value: rawValue, unit: unitHint, label: key };
+      }
+      if (typeof rawValue === "string") {
+        const parsed = Number(rawValue);
+        if (Number.isFinite(parsed)) {
+          return { value: parsed, unit: unitHint, label: key };
+        }
+      }
+      if (typeof rawValue === "object" && rawValue !== null) {
+        const nestedValue = Number(
+          (rawValue as Record<string, unknown>).value ??
+            (rawValue as Record<string, unknown>).amount ??
+            (rawValue as Record<string, unknown>).metric ??
+            (rawValue as Record<string, unknown>).count,
+        );
+        if (Number.isFinite(nestedValue)) {
+          const nestedUnitRaw =
+            (rawValue as Record<string, unknown>).unit ??
+            (rawValue as Record<string, unknown>).units ??
+            unitHint;
+          const nestedUnit =
+            typeof nestedUnitRaw === "string" ? (nestedUnitRaw as string) : unitHint;
+          return { value: nestedValue, unit: nestedUnit, label: key };
+        }
+        const nested = findNumericMetricInSource(rawValue, aliasKeys, depth + 1);
+        if (nested) return nested;
+      }
+    } else if (typeof rawValue === "object" && rawValue !== null) {
+      const nested = findNumericMetricInSource(rawValue, aliasKeys, depth + 1);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+function extractStructuredMetricFromSignal(
+  signal: Record<string, unknown>,
+  evidence: string,
+  aliases: string | string[],
+): { value: number | null; unit?: string; label?: string } {
+  const aliasList = Array.isArray(aliases) ? aliases : [aliases];
+  const aliasKeys = aliasList.map((alias) => normalizeMetricFieldKey(alias));
+  const structuredSources: unknown[] = [];
+  const signalRecord = signal as Record<string, unknown>;
+  const structuredEvidence = parseStructuredEvidence(evidence);
+  if (structuredEvidence) {
+    structuredSources.push(structuredEvidence);
+  }
+  for (const field of STRUCTURED_SIGNAL_FIELDS) {
+    const raw = signalRecord[field];
+    if (raw && typeof raw === "object") {
+      structuredSources.push(raw);
+    }
+  }
+  for (const field of STRUCTURED_SIGNAL_EVIDENCE_FIELDS) {
+    const raw = signalRecord[field];
+    if (typeof raw === "string") {
+      const parsed = parseStructuredEvidence(raw);
+      if (parsed) {
+        structuredSources.push(parsed);
+      }
+    } else if (raw && typeof raw === "object") {
+      structuredSources.push(raw);
+    }
+  }
+  structuredSources.push(signalRecord);
+  for (const source of structuredSources) {
+    const numeric = findNumericMetricInSource(source, aliasKeys);
+    if (numeric) {
+      return numeric;
+    }
+  }
+  const fallbackValue =
+    typeof signalRecord.value === "number" &&
+    Number.isFinite(signalRecord.value) &&
+    (signalRecord.value as number) > 1_000
+      ? (signalRecord.value as number)
+      : null;
+  return {
+    value: fallbackValue,
+    unit: fallbackValue !== null ? "ms" : undefined,
+    label: fallbackValue !== null ? "signal_value" : undefined,
+  };
+}
+
+function parseQueueTelemetry(snapshot: EngineIdeaInputSnapshot): QueueTelemetry {
+  const queueSignals = Array.isArray(snapshot.top_signals) ? snapshot.top_signals : [];
+  let queueP95 = 0;
+  let jobFailureRate = 0;
+  let queueEvidence = "";
+  let queueSignal = 0;
+  let queueSignalPresent = false;
+  let queueValueParsed = false;
+  let fallbackEvidence = "";
+  let queueMetricLabel: string | undefined;
+  let jobFailureMetricLabel: string | undefined;
+  const jobFailureSamples: number[] = [];
+  for (const signal of queueSignals) {
+    if (asString(signal.type) !== "queue_health") continue;
+    queueSignalPresent = true;
+    const evidence = asString(signal.evidence);
+    const signalRecord = signal as Record<string, unknown>;
+    const queueMetric = extractTelemetryMetric(evidence, QUEUE_P95_METRIC_ALIASES);
+    let queueMetricValue = queueMetric.value;
+    let queueMetricUnit = queueMetric.unit;
+    let queueMetricLabelCandidate = queueMetric.label;
+    if (queueMetricValue === null) {
+      const structuredQueueMetric = extractStructuredMetricFromSignal(
+        signalRecord,
+        evidence,
+        QUEUE_P95_METRIC_ALIASES,
+      );
+      if (structuredQueueMetric.value !== null) {
+        queueMetricValue = structuredQueueMetric.value;
+        queueMetricUnit = structuredQueueMetric.unit ?? queueMetricUnit;
+        queueMetricLabelCandidate = structuredQueueMetric.label ?? queueMetricLabelCandidate;
+      }
+    }
+    const parsedP95 =
+      queueMetricValue !== null
+        ? normalizeDurationMs(queueMetricValue, queueMetricUnit)
+        : Number.NaN;
+    const failureMetric = extractTelemetryMetric(evidence, JOB_FAILURE_RATE_ALIASES);
+    let failureMetricValue = failureMetric.value;
+    let failureMetricUnit = failureMetric.unit;
+    let failureMetricLabelCandidate = failureMetric.label;
+    if (failureMetricValue === null) {
+      const structuredFailureMetric = extractStructuredMetricFromSignal(
+        signalRecord,
+        evidence,
+        JOB_FAILURE_RATE_ALIASES,
+      );
+      if (structuredFailureMetric.value !== null) {
+        failureMetricValue = structuredFailureMetric.value;
+        failureMetricUnit = structuredFailureMetric.unit ?? failureMetricUnit;
+        failureMetricLabelCandidate = structuredFailureMetric.label ?? failureMetricLabelCandidate;
+      }
+    }
+    const parsedFailureRate =
+      failureMetricValue !== null
+        ? normalizeRateValue(failureMetricValue, failureMetricUnit)
+        : Number.NaN;
+    if (Number.isFinite(parsedP95) && parsedP95 >= queueP95) {
+      queueP95 = parsedP95;
+      queueValueParsed = true;
+      queueMetricLabel = queueMetricLabelCandidate ?? queueMetricLabel;
+      queueEvidence = evidence;
+    } else if (!queueEvidence && evidence) {
+      queueEvidence = evidence;
+    }
+    if (Number.isFinite(parsedFailureRate)) {
+      jobFailureSamples.push(parsedFailureRate);
+      if (!jobFailureMetricLabel) {
+        jobFailureMetricLabel = failureMetricLabelCandidate ?? jobFailureMetricLabel;
+      }
+    }
+    if (!queueValueParsed && fallbackEvidence === "" && evidence) {
+      fallbackEvidence = evidence;
+    }
+    queueSignal = Math.max(queueSignal, clamp01(asNumber(signal.value, 0)));
+  }
+  const queueEvidenceParseFailed = queueSignalPresent && !queueValueParsed;
+  if (queueEvidenceParseFailed && fallbackEvidence) {
+    queueEvidence = fallbackEvidence;
+  }
+  if (jobFailureSamples.length > 0) {
+    jobFailureRate = jobFailureSamples.reduce((max, sample) => Math.max(max, sample), 0);
+  } else {
+    jobFailureRate = 0;
+  }
+  return {
+    queueP95: queueValueParsed ? queueP95 : 0,
+    jobFailureRate,
+    queueSignal,
+    queueEvidence,
+    queueSignalPresent,
+    queueEvidenceParseFailed,
+    queueMetricLabel,
+    jobFailureMetricLabel,
+    jobFailureSampleCount: jobFailureSamples.length,
+  };
+}
+
+function mixMotifsFromAdjacency(reliabilityWeight: number, noveltyWeight: number): MotifMixEntry[] {
+  const baseWeights: Record<string, number> = {
+    startup_stability: clamp01(reliabilityWeight),
+    merge_rework_loop: clamp01(noveltyWeight),
+  };
+  const blended: Record<string, number> = {};
+  for (const node of MOTIF_ADJACENCY_GRAPH) {
+    const neighborContribution = node.neighbors.reduce((sum, neighbor) => {
+      const neighborWeight = baseWeights[neighbor.motifId] ?? 0;
+      return sum + neighborWeight * neighbor.influence;
+    }, 0);
+    blended[node.motifId] = clamp01((baseWeights[node.motifId] ?? 0) + neighborContribution);
+  }
+  const total = Object.values(blended).reduce((sum, value) => sum + value, 0) || 1;
+  return Object.entries(blended).map(([motifId, weight]) => {
+    const node = MOTIF_ADJACENCY_GRAPH.find((entry) => entry.motifId === motifId);
+    return {
+      motifId,
+      role: node?.role ?? "stability",
+      weight: weight / total,
+    };
+  });
+}
+
+function buildQueueAdjacencyMixer(params: {
+  snapshot: EngineIdeaInputSnapshot;
+  config: MotifMixerConfig;
+  dispatchSaturation: number;
+}): { block: EngineIdeaBuildingBlock | null; snapshot: MotifMixerSnapshot } {
+  const telemetry = parseQueueTelemetry(params.snapshot);
+  const backlogSize = params.snapshot.open_objectives.length;
+  const backlogPressure = clamp01(backlogSize / params.config.backlogSaturation);
+  const queueDelta = telemetry.queueP95 - params.config.queueSoftThresholdMs;
+  const queuePressure =
+    telemetry.queueP95 > params.config.queueSoftThresholdMs
+      ? clamp01(queueDelta / params.config.queueSpikeBandMs)
+      : 0;
+  const dispatchPressure = clamp01(params.dispatchSaturation);
+  const failurePressure = clamp01(
+    telemetry.jobFailureRate > 0 ? telemetry.jobFailureRate / JOB_FAILURE_RATE_SPIKE : 0,
+  );
+  const compositePressure = clamp01(
+    0.55 * queuePressure +
+      0.2 * failurePressure +
+      0.15 * dispatchPressure +
+      0.1 * backlogPressure,
+  );
+  const queueMeasurementReady = telemetry.queueSignalPresent && !telemetry.queueEvidenceParseFailed;
+  const active = queueMeasurementReady && queuePressure > 0;
+  let inactiveReason: string | undefined;
+  if (!queueMeasurementReady) {
+    inactiveReason = telemetry.queueSignalPresent ? "signal_present_but_unparseable" : "queue_signal_absent";
+  } else if (!active) {
+    inactiveReason = "queue_p95_below_threshold";
+  }
+
+  const explorationBias = clamp01(params.config.explorationWeight);
+  const backlogNoveltyBias = clamp01(0.25 + backlogPressure * 0.75);
+  let noveltyWeight = clamp01(explorationBias * backlogNoveltyBias);
+  noveltyWeight *= 1 - failurePressure * 0.35;
+  noveltyWeight = clamp01(noveltyWeight);
+  const queueGuardrailPressure = clamp01(
+    0.5 * queuePressure + 0.3 * dispatchPressure + 0.2 * backlogPressure,
+  );
+  let noveltyClamp = active
+    ? clamp01(1 - queueGuardrailPressure * params.config.latencyGuardWeight)
+    : 0;
+  const spikeClamp =
+    compositePressure >= ADJACENCY_SPIKE_THRESHOLD
+      ? ADJACENCY_SPIKE_NOVELTY_CAP
+      : compositePressure >= ADJACENCY_HIGH_PRESSURE_THRESHOLD
+        ? ADJACENCY_HIGH_PRESSURE_NOVELTY_CAP
+        : 1;
+  if (active) {
+    noveltyClamp = clamp01(noveltyClamp * spikeClamp);
+    noveltyWeight = clamp01(noveltyWeight * noveltyClamp);
+  } else {
+    noveltyWeight = 0;
+  }
+  const reliabilityFloor = clamp01(1 - explorationBias * 0.6);
+  const reliabilityWeight = clamp01(Math.max(reliabilityFloor, 1 - noveltyWeight));
+  const total = reliabilityWeight + noveltyWeight || 1;
+  const normalizedReliability = reliabilityWeight / total;
+  const normalizedNovelty = noveltyWeight / total;
+  const mixes = active ? mixMotifsFromAdjacency(normalizedReliability, normalizedNovelty) : [];
+
+  const snapshot: MotifMixerSnapshot = {
+    active,
+    inactiveReason,
+    queueP95: telemetry.queueP95,
+    queuePressure,
+    queueSignal: telemetry.queueSignal,
+    queueEvidence: telemetry.queueEvidence,
+    queueSignalPresent: telemetry.queueSignalPresent,
+    queueEvidenceParseFailed: telemetry.queueEvidenceParseFailed,
+    queueMetricLabel: telemetry.queueMetricLabel,
+    jobFailureRate: telemetry.jobFailureRate,
+    jobFailureMetricLabel: telemetry.jobFailureMetricLabel,
+    jobFailureSampleCount: telemetry.jobFailureSampleCount,
+    failurePressure,
+    queueSoftThresholdMs: params.config.queueSoftThresholdMs,
+    backlogSize,
+    backlogPressure,
+    dispatchSaturation: dispatchPressure,
+    compositePressure,
+    queueGuardrailPressure,
+    backlogNoveltyBias,
+    reliabilityWeight: active ? normalizedReliability : 1,
+    noveltyWeight: active ? normalizedNovelty : 0,
+    noveltyClamp,
+    explorationWeight: params.config.explorationWeight,
+    mixes,
+  };
+
+  if (!snapshot.active) {
+    return { block: null, snapshot };
+  }
+
+  const score = clamp01(
+    0.3 * queuePressure +
+      0.2 * compositePressure +
+      0.15 * failurePressure +
+      0.15 * normalizedReliability +
+      0.1 * normalizedNovelty +
+      0.05 * clamp01(1 - dispatchPressure) +
+      0.05 * telemetry.queueSignal,
+  );
+
+  const reliabilityPct = Math.round(normalizedReliability * 100);
+  const noveltyPct = Math.round(normalizedNovelty * 100);
+
+  const block: EngineIdeaBuildingBlock = {
+    id: "adjacency_queue_stability_conflict",
+    algorithm: "adjacency_graph_mixer",
+    summary: "Adjacency-graph mixer for startup stability + conflict-resolution motifs.",
+    hypothesis:
+      `Blend startup stability (${reliabilityPct}%) with conflict-resolution motifs (${noveltyPct}%) ` +
+      `to flatten queue_p95 spikes without increasing merge friction.`,
+    objective_ids: ["reliable_autonomous_delivery", "merge_conversion_and_rework"],
+    gap_ids: ["delivery_reliability_gap", "merge_rework_gap"],
+    score,
+    evidence: [
+      `queue_p95=${Math.floor(telemetry.queueP95)}`,
+      `queue_pressure=${queuePressure.toFixed(2)}`,
+      `backlog_pressure=${backlogPressure.toFixed(2)}`,
+      `dispatch_saturation=${dispatchPressure.toFixed(2)}`,
+      `job_failure_rate=${telemetry.jobFailureRate.toFixed(3)}`,
+      `failure_pressure=${failurePressure.toFixed(2)}`,
+      `composite_pressure=${compositePressure.toFixed(2)}`,
+      `reliability_mix=${normalizedReliability.toFixed(2)}`,
+      `novelty_mix=${normalizedNovelty.toFixed(2)}`,
+      telemetry.queueEvidence ? `queue_evidence=${telemetry.queueEvidence}` : "",
+    ].filter(Boolean),
+    candidate_shape: {
+      objective_type: "small_refactor",
+      trigger_type: "queue_health",
+      component_area: "apps/remotebuddy",
+      target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+      write_globs: ["apps/remotebuddy/src/*"],
+      risk_level: "low",
+      expected_validation: ["bun run test:root"],
+    },
+  };
+
+  return { block, snapshot };
+}
+
 export function buildEngineInspirationContext(params: {
   vision: Pick<VisionContext, "one_sentence" | "key_items" | "section_numbers">;
   snapshot: EngineIdeaInputSnapshot;
   inspirationPatterns?: unknown[];
   sourceInsights?: unknown[];
   commitHistoryHints?: EngineCommitHistoryHint[];
+  mixerConfig?: Partial<MotifMixerConfig>;
 }): EngineInspirationContext {
   const oneSentence = asString(params.vision.one_sentence);
   const keyItems = params.vision.key_items;
@@ -1834,6 +2446,12 @@ export function buildEngineInspirationContext(params: {
   );
   const openObjectivePressure = clamp01(params.snapshot.open_objectives.length / 10);
   const dispatchSaturation = clamp01(params.snapshot.dispatch_budget.global_count_last_hour / 10);
+  const motifMixerConfig = normalizeMotifMixerConfig(params.mixerConfig);
+  const queueMixer = buildQueueAdjacencyMixer({
+    snapshot: params.snapshot,
+    config: motifMixerConfig,
+    dispatchSaturation,
+  });
 
   const opportunityGaps: EngineOpportunityGap[] = [
     {
@@ -1964,7 +2582,13 @@ export function buildEngineInspirationContext(params: {
     dispatchSaturation,
   });
   const buildingBlockMap = new Map<string, EngineIdeaBuildingBlock>();
-  for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks]) {
+  const prioritizedBlocks = [
+    ...staticBuildingBlocks,
+    ...externalBlocks,
+    ...historyBlocks,
+    ...(queueMixer.block ? [queueMixer.block] : []),
+  ];
+  for (const block of prioritizedBlocks) {
     if (!buildingBlockMap.has(block.id)) {
       buildingBlockMap.set(block.id, block);
       continue;
@@ -1982,6 +2606,7 @@ export function buildEngineInspirationContext(params: {
     building_blocks: buildingBlocks,
     source_patterns: sourcePatterns,
     commit_history_hints: commitHistoryHints,
+    motif_mixer: queueMixer.snapshot,
   };
 }
 
@@ -2281,6 +2906,13 @@ function sanitizeForGitRef(value: string): string {
   return text || "default";
 }
 
+function encodeLogEvidence(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  // Base64 keeps evidence self-contained for log parsers.
+  return Buffer.from(trimmed, "utf8").toString("base64").slice(0, 512);
+}
+
 async function repoPreflight(repo: string): Promise<{
   isWorktreeDirty: boolean;
   isMergeInProgress: boolean;
@@ -2306,6 +2938,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
+  private readonly adjacencyMixerConfig: MotifMixerConfig;
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -2341,6 +2974,12 @@ export class RemoteBuddyAutonomousEngine {
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
+    const adjacencyMixerRaw = asObject(
+      (this.cfg as Record<string, unknown>).adjacencyMixer,
+    );
+    this.adjacencyMixerConfig = normalizeMotifMixerConfig(
+      adjacencyMixerRaw as Partial<MotifMixerConfig>,
+    );
   }
 
   private setPhase(phase: string): void {
@@ -2386,6 +3025,53 @@ export class RemoteBuddyAutonomousEngine {
     console.log(
       `[RemoteBuddyAutonomousEngine] heartbeat: status=idle last_outcome=${this.lastOutcome} detail=${this.lastDetail} last_tick_age_ms=${lastAgeMs} next_tick_in_ms=${nextTickInMs}`,
     );
+  }
+
+  private logMotifMixerDecision(decision?: MotifMixerSnapshot): void {
+    if (!decision) {
+      console.log(
+        "[RemoteBuddyAutonomousEngine] autonomy_mixer active=false inactive_reason=no_snapshot",
+      );
+      return;
+    }
+    const mixSummary =
+      decision.mixes.length > 0
+        ? decision.mixes.map((mix) => `${mix.motifId}:${Math.round(mix.weight * 100)}%`).join(",")
+        : "none";
+    const inactiveReason = decision.active ? "none" : decision.inactiveReason ?? "queue_p95_below_threshold";
+    const queueEvidenceEncoded = decision.queueEvidence
+      ? encodeLogEvidence(decision.queueEvidence)
+      : "";
+    const context = [
+      `active=${decision.active}`,
+      `inactive_reason=${inactiveReason}`,
+      `queue_p95=${Math.floor(decision.queueP95)}`,
+      `threshold=${Math.floor(decision.queueSoftThresholdMs)}`,
+      `queue_metric=${decision.queueMetricLabel ?? "unknown"}`,
+      `queue_pressure=${decision.queuePressure.toFixed(2)}`,
+      `queue_signal=${decision.queueSignal.toFixed(2)}`,
+      `queue_signal_present=${decision.queueSignalPresent}`,
+      `queue_parse_failed=${decision.queueEvidenceParseFailed}`,
+      `queue_guardrail_pressure=${decision.queueGuardrailPressure.toFixed(2)}`,
+      `failure_rate=${decision.jobFailureRate.toFixed(3)}`,
+      `failure_metric=${decision.jobFailureMetricLabel ?? "job_failure_rate"}`,
+      `failure_pressure=${decision.failurePressure.toFixed(2)}`,
+      `failure_samples=${decision.jobFailureSampleCount}`,
+      `dispatch_saturation=${decision.dispatchSaturation.toFixed(2)}`,
+      `backlog=${decision.backlogSize}`,
+      `backlog_pressure=${decision.backlogPressure.toFixed(2)}`,
+      `backlog_novelty_bias=${decision.backlogNoveltyBias.toFixed(2)}`,
+      `composite_pressure=${decision.compositePressure.toFixed(2)}`,
+      `reliability=${decision.reliabilityWeight.toFixed(2)}`,
+      `novelty=${decision.noveltyWeight.toFixed(2)}`,
+      `novelty_clamp=${decision.noveltyClamp.toFixed(2)}`,
+      `exploration_weight=${decision.explorationWeight.toFixed(2)}`,
+      `mix=${mixSummary}`,
+    ];
+    if (queueEvidenceEncoded) {
+      context.push(`queue_evidence_b64=${queueEvidenceEncoded}`);
+    }
+    console.log(`[RemoteBuddyAutonomousEngine] autonomy_mixer ${context.join(" ")}`);
   }
 
   private headers(): Record<string, string> {
@@ -3204,7 +3890,9 @@ export class RemoteBuddyAutonomousEngine {
         inspirationPatterns,
         sourceInsights,
         commitHistoryHints,
+        mixerConfig: this.adjacencyMixerConfig,
       });
+      this.logMotifMixerDecision(engineInspiration.motif_mixer);
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
 
@@ -3992,4 +4680,523 @@ export class RemoteBuddyAutonomousEngine {
     }
     this.nextTickAtMs = 0;
   }
+}
+
+if (import.meta.vitest) {
+  const { describe, it, expect, vi } = import.meta.vitest;
+
+  const buildSnapshot = (): EngineIdeaInputSnapshot => ({
+    top_signals: [],
+    state_traits: [],
+    open_objectives: [],
+    dispatch_budget: { global_count_last_hour: 0, by_type_count_last_hour: {} },
+  });
+
+  const buildMixerSnapshot = (
+    overrides: Partial<MotifMixerSnapshot> = {},
+  ): MotifMixerSnapshot => ({
+    active: true,
+    queueP95: 220_000,
+    queuePressure: 0.4,
+    queueSignal: 0.7,
+    queueEvidence: "queue_p95=220000 job_failure_rate=0.05",
+    queueSignalPresent: true,
+    queueEvidenceParseFailed: false,
+    queueMetricLabel: "queue_p95",
+    jobFailureRate: 0.05,
+    jobFailureMetricLabel: "job_failure_rate",
+    jobFailureSampleCount: 1,
+    failurePressure: 0.2,
+    queueSoftThresholdMs: 120_000,
+    backlogSize: 6,
+    backlogPressure: 0.5,
+    dispatchSaturation: 0.4,
+    compositePressure: 0.45,
+    queueGuardrailPressure: 0.32,
+    backlogNoveltyBias: 0.6,
+    reliabilityWeight: 0.7,
+    noveltyWeight: 0.3,
+    noveltyClamp: 0.85,
+    explorationWeight: 0.4,
+    mixes: [
+      { motifId: "startup_stability", role: "stability", weight: 0.7 },
+      { motifId: "merge_rework_loop", role: "conflict_resolution", weight: 0.3 },
+    ],
+    ...overrides,
+  });
+
+  describe("parseQueueTelemetry", () => {
+    it("extracts queue_p95 and job failure rate from evidence strings", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue",
+          type: "queue_health",
+          value: 0.82,
+          evidence: "queue_p95=210000 job_failure_rate=0.123",
+        },
+      ];
+      const telemetry = parseQueueTelemetry(snapshot);
+      expect(telemetry.queueP95).toBe(210000);
+      expect(telemetry.jobFailureRate).toBeCloseTo(0.123);
+      expect(telemetry.queueSignal).toBeCloseTo(0.82);
+      expect(telemetry.queueSignalPresent).toBe(true);
+      expect(telemetry.queueEvidenceParseFailed).toBe(false);
+    });
+
+    it("handles decimals, ms suffixes, and percent failure rates", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_units",
+          type: "queue_health",
+          value: 0.51,
+          evidence: "queue_p95 : 123.4ms job_failure_rate : 7.5%",
+        },
+      ];
+      const telemetry = parseQueueTelemetry(snapshot);
+      expect(telemetry.queueP95).toBeCloseTo(123.4, 3);
+      expect(telemetry.jobFailureRate).toBeCloseTo(0.075, 3);
+      expect(telemetry.queueEvidenceParseFailed).toBe(false);
+    });
+
+    it("flags queue signals that cannot be parsed", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_bad",
+          type: "queue_health",
+          value: 0.4,
+          evidence: "queue_p95=fast lane job_failure_rate=n/a",
+        },
+      ];
+      const telemetry = parseQueueTelemetry(snapshot);
+      expect(telemetry.queueP95).toBe(0);
+      expect(telemetry.queueEvidenceParseFailed).toBe(true);
+      expect(telemetry.queueSignalPresent).toBe(true);
+      expect(telemetry.queueEvidence).toContain("queue_p95=fast");
+    });
+
+    it("parses metrics when queue latency is labeled with alternate aliases", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_alias",
+          type: "queue_health",
+          value: 0.55,
+          evidence: "p95 ~ 185ms failure_rate=3%",
+        },
+      ];
+      const telemetry = parseQueueTelemetry(snapshot);
+      expect(telemetry.queueP95).toBeCloseTo(185, 5);
+      expect(telemetry.queueMetricLabel).toBe("p95");
+      expect(telemetry.jobFailureRate).toBeCloseTo(0.03, 5);
+      expect(telemetry.jobFailureMetricLabel).toBe("failure_rate");
+      expect(telemetry.jobFailureSampleCount).toBe(1);
+      expect(telemetry.queueEvidenceParseFailed).toBe(false);
+    });
+
+    it("aggregates failure signals independently of the max queue record", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_big",
+          type: "queue_health",
+          value: 0.6,
+          evidence: "queue_p95=240000",
+        },
+        {
+          signal_id: "sig_queue_fail",
+          type: "queue_health",
+          value: 0.4,
+          evidence: "p95: 180000 job_failure_rate=0.160",
+        },
+      ];
+      const telemetry = parseQueueTelemetry(snapshot);
+      expect(telemetry.queueP95).toBe(240000);
+      expect(telemetry.jobFailureRate).toBeCloseTo(0.16, 5);
+      expect(telemetry.jobFailureSampleCount).toBe(1);
+      expect(telemetry.queueMetricLabel).toBe("queue_p95");
+      expect(telemetry.jobFailureMetricLabel).toBe("job_failure_rate");
+    });
+
+    it("falls back to structured metric payloads when evidence text is ambiguous", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_structured",
+          type: "queue_health",
+          value: 0.68,
+          evidence: "Queue pressure telemetry available via metrics blob",
+          metrics: {
+            queue_p95_ms: 250_000,
+            job_failure_rate_pct: 12,
+          },
+        },
+      ] as unknown as EngineIdeaInputSnapshot["top_signals"];
+      const telemetry = parseQueueTelemetry(snapshot);
+      expect(telemetry.queueP95).toBe(250_000);
+      expect(telemetry.jobFailureRate).toBeCloseTo(0.12, 5);
+      expect(telemetry.queueMetricLabel).toBe("queue_p95_ms");
+      expect(telemetry.jobFailureMetricLabel).toBe("job_failure_rate_pct");
+      expect(telemetry.queueEvidenceParseFailed).toBe(false);
+      expect(telemetry.jobFailureSampleCount).toBe(1);
+    });
+
+    it("ingests structured evidence blobs when JSON payloads embed queue metrics", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_json",
+          type: "queue_health",
+          value: 0.71,
+          evidence: '{"metrics":{"queue_p95_ms":265000,"job_failure_rate_pct":9.5}}',
+        },
+      ];
+      const telemetry = parseQueueTelemetry(snapshot);
+      expect(telemetry.queueP95).toBe(265_000);
+      expect(telemetry.jobFailureRate).toBeCloseTo(0.095, 5);
+      expect(telemetry.queueEvidenceParseFailed).toBe(false);
+      expect(telemetry.queueMetricLabel).toBe("queue_p95_ms");
+      expect(telemetry.jobFailureMetricLabel).toBe("job_failure_rate_pct");
+    });
+  });
+
+  describe("buildQueueAdjacencyMixer", () => {
+    it("activates when queue_p95 exceeds the soft threshold and favors reliability", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue",
+          type: "queue_health",
+          value: 0.7,
+          evidence: "queue_p95=220000 job_failure_rate=0.050",
+        },
+      ];
+      snapshot.open_objectives = Array.from({ length: 6 }).map((_, idx) => ({
+        objective_id: `obj_${idx}`,
+        pattern_key: "pk",
+        status: "open",
+      }));
+      const { block, snapshot: mixer } = buildQueueAdjacencyMixer({
+        snapshot,
+        config: normalizeMotifMixerConfig({
+          queueSoftThresholdMs: 120_000,
+          queueSpikeBandMs: 120_000,
+          explorationWeight: 0.4,
+        }),
+        dispatchSaturation: 0.2,
+      });
+      expect(mixer.active).toBe(true);
+      expect(mixer.reliabilityWeight).toBeGreaterThan(mixer.noveltyWeight);
+      expect(mixer.jobFailureRate).toBeCloseTo(0.05, 3);
+      expect(mixer.dispatchSaturation).toBeCloseTo(0.2);
+      expect(mixer.compositePressure).toBeGreaterThan(0);
+      expect(mixer.noveltyClamp).toBeLessThan(1);
+      expect(mixer.queueSignalPresent).toBe(true);
+      expect(mixer.queueEvidenceParseFailed).toBe(false);
+      expect(mixer.mixes.length).toBe(2);
+      const mixSum = mixer.mixes.reduce((sum, mix) => sum + mix.weight, 0);
+      expect(mixSum).toBeCloseTo(1, 5);
+      const stabilityMix = mixer.mixes.find((mix) => mix.motifId === "startup_stability")?.weight ?? 0;
+      const conflictMix = mixer.mixes.find((mix) => mix.motifId === "merge_rework_loop")?.weight ?? 0;
+      expect(stabilityMix).toBeGreaterThan(conflictMix);
+      expect(block).not.toBeNull();
+    });
+
+    it("activates using structured telemetry when freeform evidence lacks queue metrics", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_structured",
+          type: "queue_health",
+          value: 0.75,
+          evidence: "Queue metrics forwarded separately",
+          metrics: {
+            queue_p95_ms: 240_000,
+            job_failure_rate: 0.03,
+          },
+        },
+      ] as unknown as EngineIdeaInputSnapshot["top_signals"];
+      snapshot.open_objectives = Array.from({ length: 5 }).map((_, idx) => ({
+        objective_id: `obj_struct_${idx}`,
+        pattern_key: "pk",
+        status: "open",
+      }));
+      const { snapshot: mixer } = buildQueueAdjacencyMixer({
+        snapshot,
+        config: normalizeMotifMixerConfig({
+          queueSoftThresholdMs: 120_000,
+          queueSpikeBandMs: 180_000,
+          explorationWeight: 0.4,
+        }),
+        dispatchSaturation: 0.25,
+      });
+      expect(mixer.active).toBe(true);
+      expect(mixer.queueEvidenceParseFailed).toBe(false);
+      expect(mixer.queueP95).toBe(240_000);
+      expect(mixer.jobFailureRate).toBeCloseTo(0.03, 3);
+      expect(mixer.mixes.length).toBe(2);
+    });
+
+    it("remains inactive when queue_p95 is below the soft threshold", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_healthy",
+          type: "queue_health",
+          value: 0.2,
+          evidence: "queue_p95=80000 job_failure_rate=0.010",
+        },
+      ];
+      const { block, snapshot: mixer } = buildQueueAdjacencyMixer({
+        snapshot,
+        config: normalizeMotifMixerConfig({ queueSoftThresholdMs: 120_000 }),
+        dispatchSaturation: 0.1,
+      });
+      expect(mixer.active).toBe(false);
+      expect(block).toBeNull();
+      expect(mixer.inactiveReason).toBe("queue_p95_below_threshold");
+      expect(mixer.queueSignalPresent).toBe(true);
+      expect(mixer.queueEvidenceParseFailed).toBe(false);
+      expect(mixer.noveltyWeight).toBe(0);
+      expect(mixer.mixes.length).toBe(0);
+    });
+
+    it("remains inactive but logs parse failures when queue evidence cannot be ingested", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_parse_fail",
+          type: "queue_health",
+          value: 0.6,
+          evidence: "queue_p95=unknown job_failure_rate=maybe",
+        },
+      ];
+      const { block, snapshot: mixer } = buildQueueAdjacencyMixer({
+        snapshot,
+        config: normalizeMotifMixerConfig({ queueSoftThresholdMs: 120_000 }),
+        dispatchSaturation: 0.3,
+      });
+      expect(mixer.active).toBe(false);
+      expect(block).toBeNull();
+      expect(mixer.queueSignalPresent).toBe(true);
+      expect(mixer.queueEvidenceParseFailed).toBe(true);
+      expect(mixer.inactiveReason).toBe("signal_present_but_unparseable");
+      expect(mixer.noveltyWeight).toBe(0);
+      expect(mixer.mixes.length).toBe(0);
+    });
+
+    it("biases further toward reliability when job failure rate spikes", () => {
+      const objectives = Array.from({ length: 5 }).map((_, idx) => ({
+        objective_id: `obj_rel_${idx}`,
+        pattern_key: "pk",
+        status: "open",
+      }));
+      const makeSnapshot = (failureRate: number): EngineIdeaInputSnapshot => {
+        const snap = buildSnapshot();
+        snap.top_signals = [
+          {
+            signal_id: `sig_queue_${failureRate}`,
+            type: "queue_health",
+            value: 0.6,
+            evidence: `queue_p95=200000 job_failure_rate=${failureRate.toFixed(3)}`,
+          },
+        ];
+        snap.open_objectives = objectives;
+        return snap;
+      };
+      const config = normalizeMotifMixerConfig({
+        queueSoftThresholdMs: 120_000,
+        queueSpikeBandMs: 120_000,
+        explorationWeight: 0.45,
+      });
+      const lowFailure = buildQueueAdjacencyMixer({
+        snapshot: makeSnapshot(0.01),
+        config,
+        dispatchSaturation: 0.3,
+      }).snapshot;
+      const highFailure = buildQueueAdjacencyMixer({
+        snapshot: makeSnapshot(0.22),
+        config,
+        dispatchSaturation: 0.3,
+      }).snapshot;
+      expect(highFailure.failurePressure).toBeGreaterThan(lowFailure.failurePressure);
+      expect(highFailure.reliabilityWeight).toBeGreaterThan(lowFailure.reliabilityWeight);
+      expect(highFailure.noveltyWeight).toBeLessThan(lowFailure.noveltyWeight);
+    });
+
+    it("ramps novelty weight upward as backlog grows while queue pressure is active", () => {
+      const buildBacklogSnapshot = (openObjectiveCount: number): EngineIdeaInputSnapshot => {
+        const snap = buildSnapshot();
+        snap.top_signals = [
+          {
+            signal_id: `sig_queue_backlog_${openObjectiveCount}`,
+            type: "queue_health",
+            value: 0.65,
+            evidence: "queue_p95=200000 job_failure_rate=0.020",
+          },
+        ];
+        snap.open_objectives = Array.from({ length: openObjectiveCount }).map((_, idx) => ({
+          objective_id: `obj_backlog_${idx}`,
+          pattern_key: "pk",
+          status: "open",
+        }));
+        return snap;
+      };
+      const config = normalizeMotifMixerConfig({
+        queueSoftThresholdMs: 120_000,
+        queueSpikeBandMs: 120_000,
+        explorationWeight: 0.45,
+      });
+      const lowBacklog = buildQueueAdjacencyMixer({
+        snapshot: buildBacklogSnapshot(2),
+        config,
+        dispatchSaturation: 0.2,
+      }).snapshot;
+      const highBacklog = buildQueueAdjacencyMixer({
+        snapshot: buildBacklogSnapshot(12),
+        config,
+        dispatchSaturation: 0.2,
+      }).snapshot;
+      expect(lowBacklog.active).toBe(true);
+      expect(highBacklog.active).toBe(true);
+      expect(highBacklog.backlogNoveltyBias).toBeGreaterThan(lowBacklog.backlogNoveltyBias);
+      expect(highBacklog.noveltyWeight).toBeGreaterThan(lowBacklog.noveltyWeight);
+    });
+
+    it("respects configurable exploration weight when backlog pressure stays constant", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_explore",
+          type: "queue_health",
+          value: 0.68,
+          evidence: "queue_p95=210000 job_failure_rate=0.030",
+        },
+      ];
+      snapshot.open_objectives = Array.from({ length: 8 }).map((_, idx) => ({
+        objective_id: `obj_explore_${idx}`,
+        pattern_key: "pk",
+        status: "open",
+      }));
+      const conservative = buildQueueAdjacencyMixer({
+        snapshot,
+        config: normalizeMotifMixerConfig({
+          queueSoftThresholdMs: 120_000,
+          queueSpikeBandMs: 120_000,
+          explorationWeight: 0.25,
+        }),
+        dispatchSaturation: 0.25,
+      }).snapshot;
+      const aggressive = buildQueueAdjacencyMixer({
+        snapshot,
+        config: normalizeMotifMixerConfig({
+          queueSoftThresholdMs: 120_000,
+          queueSpikeBandMs: 120_000,
+          explorationWeight: 0.65,
+        }),
+        dispatchSaturation: 0.25,
+      }).snapshot;
+      expect(conservative.active).toBe(true);
+      expect(aggressive.active).toBe(true);
+      expect(aggressive.backlogNoveltyBias).toBeCloseTo(conservative.backlogNoveltyBias);
+      expect(aggressive.noveltyWeight).toBeGreaterThan(conservative.noveltyWeight);
+      expect(aggressive.reliabilityWeight).toBeLessThan(conservative.reliabilityWeight);
+    });
+
+    it("aggressively clamps novelty when queues, backlog, and dispatch spike together", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_spike",
+          type: "queue_health",
+          value: 0.92,
+          evidence: "queue_p95=360000 job_failure_rate=0.150",
+        },
+      ];
+      snapshot.open_objectives = Array.from({ length: 20 }).map((_, idx) => ({
+        objective_id: `obj_spike_${idx}`,
+        pattern_key: "pk",
+        status: "open",
+      }));
+      const { snapshot: mixer } = buildQueueAdjacencyMixer({
+        snapshot,
+        config: normalizeMotifMixerConfig({
+          queueSoftThresholdMs: 120_000,
+          queueSpikeBandMs: 120_000,
+          explorationWeight: 0.5,
+        }),
+        dispatchSaturation: 0.9,
+      });
+      expect(mixer.compositePressure).toBeGreaterThanOrEqual(ADJACENCY_SPIKE_THRESHOLD);
+      expect(mixer.noveltyClamp).toBeLessThanOrEqual(ADJACENCY_SPIKE_NOVELTY_CAP);
+      expect(mixer.noveltyWeight).toBeLessThanOrEqual(ADJACENCY_SPIKE_NOVELTY_CAP);
+      expect(mixer.reliabilityWeight).toBeGreaterThan(0.9);
+    });
+
+    it("caps novelty under high composite pressure without requiring a full spike", () => {
+      const snapshot = buildSnapshot();
+      snapshot.top_signals = [
+        {
+          signal_id: "sig_queue_high_pressure",
+          type: "queue_health",
+          value: 0.86,
+          evidence: "queue_p95=300000 job_failure_rate=0.090",
+        },
+      ];
+      snapshot.open_objectives = Array.from({ length: 16 }).map((_, idx) => ({
+        objective_id: `obj_high_pressure_${idx}`,
+        pattern_key: "pk",
+        status: "open",
+      }));
+      const { snapshot: mixer } = buildQueueAdjacencyMixer({
+        snapshot,
+        config: normalizeMotifMixerConfig({
+          queueSoftThresholdMs: 120_000,
+          queueSpikeBandMs: 240_000,
+          explorationWeight: 0.5,
+        }),
+        dispatchSaturation: 0.8,
+      });
+      expect(mixer.active).toBe(true);
+      expect(mixer.compositePressure).toBeGreaterThanOrEqual(ADJACENCY_HIGH_PRESSURE_THRESHOLD);
+      expect(mixer.compositePressure).toBeLessThan(ADJACENCY_SPIKE_THRESHOLD);
+      expect(mixer.noveltyClamp).toBeLessThanOrEqual(ADJACENCY_HIGH_PRESSURE_NOVELTY_CAP);
+      expect(mixer.noveltyWeight).toBeLessThanOrEqual(ADJACENCY_HIGH_PRESSURE_NOVELTY_CAP);
+      expect(mixer.reliabilityWeight).toBeGreaterThan(0.85);
+    });
+  });
+
+  describe("RemoteBuddyAutonomousEngine motif mixer logging", () => {
+    it("records queue context and motif mix for traceability", () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const engine = Object.create(RemoteBuddyAutonomousEngine.prototype) as RemoteBuddyAutonomousEngine;
+      (
+        engine as unknown as {
+          logMotifMixerDecision(decision?: MotifMixerSnapshot): void;
+        }
+      ).logMotifMixerDecision(
+        buildMixerSnapshot({
+          mixes: [
+            { motifId: "startup_stability", role: "stability", weight: 0.68 },
+            { motifId: "merge_rework_loop", role: "conflict_resolution", weight: 0.32 },
+          ],
+          queueMetricLabel: "p95",
+          jobFailureMetricLabel: "failure_rate",
+          backlogNoveltyBias: 0.74,
+        }),
+      );
+      const logCall =
+        logSpy.mock.calls[logSpy.mock.calls.length - 1]?.[0] ?? "";
+      expect(logCall).toContain("autonomy_mixer");
+      expect(logCall).toContain("mix=startup_stability");
+      expect(logCall).toContain("queue_metric=");
+      expect(logCall).toContain("failure_metric=");
+      expect(logCall).toContain("backlog_novelty_bias=");
+      expect(logCall).toContain("reliability=");
+      expect(logCall).toContain("novelty=");
+      logSpy.mockRestore();
+    });
+  });
 }
