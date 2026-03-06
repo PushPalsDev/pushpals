@@ -726,15 +726,6 @@ export interface EngineIdeaBuildingBlock {
   source_freshness_score?: number;
 }
 
-function cloneCandidateShape(shape: EngineCandidateShape): EngineCandidateShape {
-  return {
-    ...shape,
-    target_paths: Array.isArray(shape.target_paths) ? [...shape.target_paths] : [],
-    write_globs: Array.isArray(shape.write_globs) ? [...shape.write_globs] : [],
-    expected_validation: Array.isArray(shape.expected_validation) ? [...shape.expected_validation] : [],
-  };
-}
-
 export interface EngineCommitHistoryHint {
   motif_id: string;
   label: string;
@@ -744,12 +735,6 @@ export interface EngineCommitHistoryHint {
   gap_ids: string[];
   sample_subjects: string[];
 }
-
-type RankedMotifHint = EngineCommitHistoryHint & {
-  telemetry_signal: number;
-  telemetry_recency: number;
-  telemetry_volume: number;
-};
 
 export interface EngineInspirationSourcePattern {
   id: string;
@@ -769,63 +754,12 @@ export interface EngineInspirationSourcePattern {
   source_trust_score: number;
 }
 
-export type EngineAdjacencyVariant =
-  | "balanced"
-  | "objective_bias"
-  | "motif_bias"
-  | "novelty_bias"
-  | "gap_bias";
-
-export interface EngineDiversityAdjacencyEntry {
-  id: string;
-  variant: EngineAdjacencyVariant;
-  variant_label: string;
-  variant_weight: number;
-  objective_id: string;
-  objective_title: string;
-  objective_weight: number;
-  motif_id: string;
-  motif_label: string;
-  motif_signal: number;
-  motif_recency: number;
-  motif_volume: number;
-  gap_ids: string[];
-  diversity_weight: number;
-  novelty_signal: number;
-  adjacency_bias: number;
-  score: number;
-}
-
-export interface EngineDiversityVariantMixEntry {
-  count: number;
-  share: number;
-  mean_score: number;
-  mean_variant_weight: number;
-  mean_diversity_weight: number;
-}
-
-export interface EngineDiversityMetrics {
-  objective_spread: number;
-  motif_coverage: number;
-  motif_signal_mean: number;
-  motif_recency_mean: number;
-  objective_weight_mean: number;
-  novelty_mean: number;
-  diversity_weight_mean: number;
-  adjacency_bias_weight: number;
-  dispatch_saturation: number;
-  adjacency_pool: EngineDiversityAdjacencyEntry[];
-  variant_mix: Record<EngineAdjacencyVariant, EngineDiversityVariantMixEntry>;
-  diversity_tuning_weights: Record<EngineAdjacencyVariant, number>;
-}
-
 export interface EngineInspirationContext {
   compiled_objectives: CompiledVisionObjective[];
   opportunity_gaps: EngineOpportunityGap[];
   building_blocks: EngineIdeaBuildingBlock[];
   source_patterns: EngineInspirationSourcePattern[];
   commit_history_hints: EngineCommitHistoryHint[];
-  diversity_metrics?: EngineDiversityMetrics;
 }
 
 type EngineIdeaInputSnapshot = Pick<
@@ -991,232 +925,6 @@ function defaultCandidateShapeForArea(area: AutonomyComponentArea): EngineCandid
         expected_validation: ["bun run test:root"],
       };
   }
-}
-
-if (typeof process !== "undefined" && process.env?.NODE_ENV === "test") {
-  void (async () => {
-    const { describe, expect, test } = await import("bun:test");
-
-    const createCompiledObjectives = () =>
-      [
-        {
-          id: "workforce_scaling",
-          title: "Workforce-Grade Delegation",
-          weight: 0.68,
-          evidence: ["Queue health and worker throughput appear in the vision priorities."],
-        },
-        {
-          id: "reliable_autonomous_delivery",
-          title: "Reliable Autonomous Delivery Loop",
-          weight: 0.64,
-          evidence: ["Vision stresses reliable autonomous delivery loops."],
-        },
-        {
-          id: "policy_and_governance",
-          title: "Policy + Permission Governance",
-          weight: 0.48,
-          evidence: ["Vision calls out policy and guardrail governance explicitly."],
-        },
-      ].map((entry) => ({ ...entry }));
-
-    const createOpportunityGaps = () =>
-      [
-        { id: "workforce_throughput_gap", label: "Workforce throughput gap", score: 0.73, evidence: [] },
-        { id: "delivery_reliability_gap", label: "Delivery reliability gap", score: 0.62, evidence: [] },
-        { id: "governance_gap", label: "Governance guardrail gap", score: 0.51, evidence: [] },
-      ].map((entry) => ({ ...entry }));
-
-    const createCommitHistoryHints = (): EngineCommitHistoryHint[] => [
-      {
-        motif_id: "queue_backpressure",
-        label: "Queue backpressure and throughput",
-        count: 9,
-        signal: 0.76,
-        objective_ids: ["workforce_scaling", "reliable_autonomous_delivery"],
-        gap_ids: ["workforce_throughput_gap"],
-        sample_subjects: [
-          "queue/backpressure guardrail instrumentation",
-          "dispatch throughput telemetry",
-          "worker saturation mitigations",
-        ],
-      },
-      {
-        motif_id: "startup_stability",
-        label: "Startup/environment stability",
-        count: 6,
-        signal: 0.6,
-        objective_ids: ["reliable_autonomous_delivery"],
-        gap_ids: ["delivery_reliability_gap"],
-        sample_subjects: [
-          "startup env healthcheck guard",
-          "flake: worker restart guard",
-          "config guard",
-        ],
-      },
-      {
-        motif_id: "policy_guardrails",
-        label: "Policy/scope guardrails",
-        count: 4,
-        signal: 0.58,
-        objective_ids: ["policy_and_governance"],
-        gap_ids: ["governance_gap"],
-        sample_subjects: [
-          "scope tighten review path",
-          "guardrail audit",
-          "permission boundary telemetry",
-        ],
-      },
-    ];
-
-    const createAdjacentInput = () => ({
-      compiledObjectives: createCompiledObjectives(),
-      opportunityGaps: createOpportunityGaps(),
-      commitHistoryHints: createCommitHistoryHints(),
-      dispatchByType: {
-        feature_small: 2,
-        small_refactor: 1,
-        feature_medium: 0,
-      } as Record<string, number>,
-      dispatchSaturation: 0.48,
-    });
-
-    const testVisionContext = {
-      one_sentence:
-        "Continuously improve autonomous repo delivery with safe, auditable, and high-confidence workflows.",
-      key_items: {
-        target_users: ["Engineering leads", "OSS maintainers"],
-        priorities: [
-          "Startup and environment stability",
-          "Worker reliability under conflict/retry scenarios",
-          "Activation: first PR in under 30 minutes",
-        ],
-        objectives: [
-          "Reliable autonomous delivery loop",
-          "High-confidence review and merge automation",
-          "Workforce-grade delegation",
-        ],
-        guardrails: ["Safe by default", "Small reversible steps", "No silent scope escalation"],
-        constraints: ["Predictable runtime behavior", "Audit trails", "Avoid operational toil expansion"],
-        non_goals: ["Unbounded autonomous architecture redesign"],
-        metrics: ["Autonomous merge rate", "Rework rate", "Queue health", "Time-to-first-value"],
-        risk_policy: ["Low risk can ship autonomously", "High risk requires explicit approval"],
-        operating_model: ["RemoteAgent delegates to specialized WorkerPals"],
-        governance: ["RFC for high-risk architecture changes"],
-      },
-      section_numbers: ["0", "4", "6", "7", "8"],
-    };
-
-    const testSnapshot = {
-      top_signals: [
-        { signal_id: "sig_queue", type: "queue_health", value: 0.82, evidence: "queue_p95=210000" },
-        { signal_id: "sig_regret", type: "regret_signal", value: 0.69, evidence: "reopened=3" },
-        { signal_id: "sig_test", type: "test_failure", value: 0.43, evidence: "flake clusters" },
-      ],
-      state_traits: [
-        {
-          trait_id: "queue_latency_high",
-          category: "weakness",
-          focus: "queue",
-          score: 0.78,
-          evidence: "request queue p95 above SLO",
-        },
-        {
-          trait_id: "merge_rework_high",
-          category: "risk",
-          focus: "merge",
-          score: 0.7,
-          evidence: "review churn and conflict loops",
-        },
-        {
-          trait_id: "policy_scope_ambiguity",
-          category: "risk",
-          focus: "policy",
-          score: 0.62,
-          evidence: "scope ambiguity across worker tasks",
-        },
-      ],
-      open_objectives: Array.from({ length: 5 }).map((_, i) => ({
-        objective_id: `obj_${i}`,
-        pattern_key: `pattern_${i}`,
-        status: "dispatched",
-      })),
-      dispatch_budget: {
-        global_count_last_hour: 5,
-        by_type_count_last_hour: {
-          feature_small: 2,
-          feature_medium: 0,
-          small_refactor: 1,
-        },
-      },
-    };
-
-    describe("adjacent possible generator", () => {
-      test("recombines compiled objectives with motif telemetry signals", () => {
-        const input = createAdjacentInput();
-        const { blocks, metrics } = buildAdjacentPossibleBlocks(input);
-        expect(blocks.length).toBeGreaterThan(0);
-        expect(blocks.every((block) => block.algorithm === "adjacent_possible")).toBe(true);
-        expect(
-          blocks.some(
-            (block) =>
-              block.objective_ids.includes("workforce_scaling") &&
-              block.gap_ids.includes("workforce_throughput_gap"),
-          ),
-        ).toBe(true);
-        expect(metrics.adjacency_pool.length).toBeGreaterThan(0);
-        expect(metrics.adjacency_pool.length).toBeLessThanOrEqual(MAX_ADJACENCY_POOL_ENTRIES);
-        const motifsInPool = new Set(metrics.adjacency_pool.map((entry) => entry.motif_id));
-        expect(motifsInPool.has("queue_backpressure")).toBe(true);
-      });
-
-      test("exposes normalized diversity metrics and tuning weights", () => {
-        const input = createAdjacentInput();
-        const { metrics } = buildAdjacentPossibleBlocks(input);
-        const variantKeys = ADJACENT_VARIANT_PROFILES.map((profile) => profile.key).sort();
-        expect(Object.keys(metrics.variant_mix).sort()).toEqual(variantKeys);
-        expect(Object.keys(metrics.diversity_tuning_weights).sort()).toEqual(variantKeys);
-        const tuningWeightSum = Object.values(metrics.diversity_tuning_weights).reduce(
-          (sum, value) => sum + value,
-          0,
-        );
-        expect(tuningWeightSum).toBeCloseTo(1, 5);
-        expect(metrics.dispatch_saturation).toBeCloseTo(input.dispatchSaturation, 6);
-        expect(metrics.objective_spread).toBeGreaterThan(0);
-        expect(metrics.motif_coverage).toBeGreaterThan(0);
-        expect(metrics.adjacency_pool.every((entry) => entry.score >= 0 && entry.score <= 1)).toBe(true);
-      });
-    });
-
-    describe("adjacent possible dispatch integration", () => {
-      test("keeps fallback scoring stable while surfacing diversity metrics", () => {
-        const commitHints = createCommitHistoryHints();
-        const context = buildEngineInspirationContext({
-          vision: testVisionContext,
-          snapshot: testSnapshot,
-          commitHistoryHints: commitHints,
-        });
-        expect(context.diversity_metrics?.adjacency_pool.length ?? 0).toBeGreaterThan(0);
-        expect(context.building_blocks.length).toBeGreaterThan(1);
-        expect(context.building_blocks[0].score).toBeGreaterThanOrEqual(
-          context.building_blocks[context.building_blocks.length - 1].score,
-        );
-        expect(context.building_blocks.some((block) => block.algorithm === "adjacent_possible")).toBe(true);
-        const fallback = buildEngineFallbackCandidates({
-          engineInspiration: context,
-          snapshotTopSignals: testSnapshot.top_signals,
-          visionSectionRefs: testVisionContext.section_numbers,
-          maxCandidates: 3,
-        });
-        expect(fallback.length).toBeGreaterThan(1);
-        const firstTrial = fallback[0].engine_trial as Record<string, unknown> | undefined;
-        const secondTrial = fallback[1].engine_trial as Record<string, unknown> | undefined;
-        const firstScore = Number(firstTrial?.score ?? 0);
-        const secondScore = Number(secondTrial?.score ?? 0);
-        expect(firstScore).toBeGreaterThanOrEqual(secondScore);
-        expect(fallback[0].confidence).toBeCloseTo(clamp01(0.45 + firstScore * 0.5));
-      });
-    });
-  })();
 }
 
 const ENGINE_OBJECTIVE_BLUEPRINTS: Array<{
@@ -1579,144 +1287,243 @@ const COMMIT_MOTIF_RULES: CommitMotifRule[] = [
   },
 ];
 
-type AdjacentVariantProfile = {
-  key: EngineAdjacencyVariant;
-  label: string;
-  weights: {
-    objective: number;
-    motif: number;
-    gap: number;
-    novelty: number;
-    dispatch: number;
-  };
-  condition: (context: {
-    objectiveWeight: number;
-    motifSignal: number;
-    gapSignal: number;
-    noveltySignal: number;
-    dispatchRelief: number;
-    motifRecency: number;
-    motifVolume: number;
-  }) => boolean;
+const ENGINE_DIVERSITY_MOTIF_IDS = new Set(COMMIT_MOTIF_RULES.map((rule) => rule.motifId));
+export const ENGINE_DIVERSITY_MAX_MOTIF_ROWS = 16;
+export const ENGINE_DIVERSITY_MAX_ADJACENCY_ROWS = 48;
+const ENGINE_DIVERSITY_MAX_WINDOW_MINUTES = 14 * 24 * 60;
+const ENGINE_DIVERSITY_MAX_SAMPLE_COUNT = 50_000;
+const ENGINE_DIVERSITY_MAX_OVERLAP = 50_000;
+const ENGINE_DIVERSITY_DEFAULT_UPDATED_AT = "1970-01-01T00:00:00.000Z";
+const ENGINE_DIVERSITY_WEIGHT_PRECISION = 1_000_000;
+
+export type EngineDiversityMotifMetric = {
+  motif_id: string;
+  sample_count: number;
+  novelty_ratio: number;
+  regret_ratio: number;
+  tuning_weight: number;
 };
 
-const ADJACENT_VARIANT_PROFILES: AdjacentVariantProfile[] = [
-  {
-    key: "balanced",
-    label: "Balanced motif/objective pairing",
-    weights: { objective: 0.35, motif: 0.25, gap: 0.2, novelty: 0.1, dispatch: 0.1 },
-    condition: () => true,
-  },
-  {
-    key: "objective_bias",
-    label: "Objective-led adjacent expansion",
-    weights: { objective: 0.5, motif: 0.2, gap: 0.2, novelty: 0.1, dispatch: 0 },
-    condition: ({ objectiveWeight }) => objectiveWeight >= 0.45,
-  },
-  {
-    key: "motif_bias",
-    label: "Motif-led adjacent expansion",
-    weights: { objective: 0.25, motif: 0.5, gap: 0.15, novelty: 0.05, dispatch: 0.05 },
-    condition: ({ motifSignal, motifRecency }) => motifSignal >= 0.4 || motifRecency >= 0.55,
-  },
-  {
-    key: "gap_bias",
-    label: "Gap-led adjacent expansion",
-    weights: { objective: 0.25, motif: 0.2, gap: 0.4, novelty: 0.1, dispatch: 0.05 },
-    condition: ({ gapSignal }) => gapSignal >= 0.45,
-  },
-  {
-    key: "novelty_bias",
-    label: "Novelty-led adjacent expansion",
-    weights: { objective: 0.25, motif: 0.2, gap: 0.15, novelty: 0.3, dispatch: 0.1 },
-    condition: ({ noveltySignal, dispatchRelief, motifVolume }) =>
-      noveltySignal >= 0.35 || dispatchRelief <= 0.55 || motifVolume <= 0.25,
-  },
-];
+export type EngineDiversityAdjacencyMetric = {
+  motif_id: string;
+  neighbor_motif_id: string;
+  sample_overlap: number;
+  novelty_delta: number;
+  regret_delta: number;
+  tuning_weight: number;
+};
 
-function createEmptyDiversityMetrics(): EngineDiversityMetrics {
-  const variantMix = {} as Record<EngineAdjacencyVariant, EngineDiversityVariantMixEntry>;
-  const diversityWeights = {} as Record<EngineAdjacencyVariant, number>;
-  const variantCount = Math.max(1, ADJACENT_VARIANT_PROFILES.length);
-  const defaultWeight = 1 / variantCount;
-  for (const profile of ADJACENT_VARIANT_PROFILES) {
-    variantMix[profile.key] = {
-      count: 0,
-      share: 0,
-      mean_score: 0,
-      mean_variant_weight: 0,
-      mean_diversity_weight: 0,
-    };
-    diversityWeights[profile.key] = defaultWeight;
-  }
+export type EngineDiversityMetrics = {
+  updated_at: string;
+  window_minutes: number;
+  motif_metrics: EngineDiversityMotifMetric[];
+  adjacency_pool: EngineDiversityAdjacencyMetric[];
+  truncated: boolean;
+};
+
+export function ensureEngineDiversityMetrics(value: unknown): EngineDiversityMetrics {
+  const raw = asObject(value);
+  const windowMs = asNumber(raw.window_ms, Number.NaN);
+  const windowMinutes = sanitizeEngineDiversityWindowMinutes(
+    raw.window_minutes ??
+      raw.sample_window_minutes ??
+      raw.window_mins ??
+      (Number.isFinite(windowMs) ? windowMs / 60_000 : undefined),
+  );
+  const updatedAt = sanitizeEngineDiversityTimestamp(
+    raw.updated_at ?? raw.window_ended_at ?? raw.generated_at,
+  );
+
+  const motifSource = Array.isArray(raw.motif_metrics)
+    ? raw.motif_metrics
+    : Array.isArray(raw.motifs)
+      ? raw.motifs
+      : [];
+  const adjacencySource = Array.isArray(raw.adjacency_pool) ? raw.adjacency_pool : [];
+
+  const motifResult = sanitizeEngineMotifMetrics(motifSource);
+  const adjacencyResult = sanitizeEngineAdjacencyMetrics(adjacencySource);
+  normalizeEngineAdjacencyWeights(adjacencyResult.items);
+
   return {
-    objective_spread: 0,
-    motif_coverage: 0,
-    motif_signal_mean: 0,
-    motif_recency_mean: 0,
-    objective_weight_mean: 0,
-    novelty_mean: 0,
-    diversity_weight_mean: 0,
-    adjacency_bias_weight: 0,
-    dispatch_saturation: 0,
-    adjacency_pool: [],
-    variant_mix: variantMix,
-    diversity_tuning_weights: diversityWeights,
+    updated_at: updatedAt,
+    window_minutes: windowMinutes,
+    motif_metrics: motifResult.items,
+    adjacency_pool: adjacencyResult.items,
+    truncated: motifResult.truncated || adjacencyResult.truncated,
   };
 }
 
-function ensureEngineDiversityMetrics(metrics?: EngineDiversityMetrics): EngineDiversityMetrics {
-  if (!metrics) return createEmptyDiversityMetrics();
-  const variantMix = {} as Record<EngineAdjacencyVariant, EngineDiversityVariantMixEntry>;
-  const diversityWeights = {} as Record<EngineAdjacencyVariant, number>;
-  const variantCount = Math.max(1, ADJACENT_VARIANT_PROFILES.length);
-  const defaultWeight = 1 / variantCount;
-  for (const profile of ADJACENT_VARIANT_PROFILES) {
-    const entry = metrics.variant_mix?.[profile.key];
-    variantMix[profile.key] = entry
-      ? {
-          count: Math.max(0, Math.floor(asNumber(entry.count, 0))),
-          share: clamp01(asNumber(entry.share, 0)),
-          mean_score: clamp01(asNumber(entry.mean_score, 0)),
-          mean_variant_weight: clamp01(asNumber(entry.mean_variant_weight, 0)),
-          mean_diversity_weight: clamp01(asNumber(entry.mean_diversity_weight, 0)),
-        }
-      : {
-          count: 0,
-          share: 0,
-          mean_score: 0,
-          mean_variant_weight: 0,
-          mean_diversity_weight: 0,
-        };
-    const rawWeight = metrics.diversity_tuning_weights?.[profile.key];
-    diversityWeights[profile.key] = clamp01(
-      typeof rawWeight === "number" ? rawWeight : defaultWeight,
+function sanitizeEngineMotifMetrics(source: unknown[]): {
+  items: EngineDiversityMotifMetric[];
+  truncated: boolean;
+} {
+  const items: EngineDiversityMotifMetric[] = [];
+  let accepted = 0;
+  for (const entry of source) {
+    const metric = sanitizeEngineMotifMetric(entry);
+    if (!metric) continue;
+    accepted++;
+    if (items.length < ENGINE_DIVERSITY_MAX_MOTIF_ROWS) {
+      items.push(metric);
+    }
+  }
+  items.sort((a, b) => {
+    if (b.sample_count !== a.sample_count) return b.sample_count - a.sample_count;
+    return a.motif_id.localeCompare(b.motif_id);
+  });
+  return { items, truncated: accepted > items.length };
+}
+
+function sanitizeEngineAdjacencyMetrics(source: unknown[]): {
+  items: EngineDiversityAdjacencyMetric[];
+  truncated: boolean;
+} {
+  const items: EngineDiversityAdjacencyMetric[] = [];
+  let accepted = 0;
+  for (const entry of source) {
+    const metric = sanitizeEngineAdjacencyMetric(entry);
+    if (!metric) continue;
+    accepted++;
+    if (items.length < ENGINE_DIVERSITY_MAX_ADJACENCY_ROWS) {
+      items.push(metric);
+    }
+  }
+  items.sort((a, b) => {
+    if (b.sample_overlap !== a.sample_overlap) return b.sample_overlap - a.sample_overlap;
+    const aKey = `${a.motif_id}:${a.neighbor_motif_id}`;
+    const bKey = `${b.motif_id}:${b.neighbor_motif_id}`;
+    return aKey.localeCompare(bKey);
+  });
+  return { items, truncated: accepted > items.length };
+}
+
+function sanitizeEngineMotifMetric(entry: unknown): EngineDiversityMotifMetric | null {
+  const obj = asObject(entry);
+  const motifId = asString(obj.motif_id ?? obj.motifId ?? obj.id);
+  if (!motifId || !ENGINE_DIVERSITY_MOTIF_IDS.has(motifId)) return null;
+  return {
+    motif_id: motifId,
+    sample_count: sanitizeEngineCount(
+      obj.sample_count ?? obj.sampleCount ?? obj.samples,
+      ENGINE_DIVERSITY_MAX_SAMPLE_COUNT,
+    ),
+    novelty_ratio: sanitizeEngineRatio(obj.novelty_ratio ?? obj.novelty ?? obj.novelty_bias),
+    regret_ratio: sanitizeEngineRatio(obj.regret_ratio ?? obj.regret ?? obj.regret_bias),
+    tuning_weight: sanitizeEngineRatio(obj.tuning_weight ?? obj.weight ?? obj.bias_weight),
+  };
+}
+
+function sanitizeEngineAdjacencyMetric(entry: unknown): EngineDiversityAdjacencyMetric | null {
+  const obj = asObject(entry);
+  const motifId = asString(obj.motif_id ?? obj.source_motif_id ?? obj.motif);
+  const neighborId = asString(obj.neighbor_motif_id ?? obj.target_motif_id ?? obj.neighbor);
+  if (!motifId || !neighborId) return null;
+  if (!ENGINE_DIVERSITY_MOTIF_IDS.has(motifId) || !ENGINE_DIVERSITY_MOTIF_IDS.has(neighborId)) return null;
+  return {
+    motif_id: motifId,
+    neighbor_motif_id: neighborId,
+    sample_overlap: sanitizeEngineCount(
+      obj.sample_overlap ?? obj.sampleCount ?? obj.samples ?? obj.overlap,
+      ENGINE_DIVERSITY_MAX_OVERLAP,
+    ),
+    novelty_delta: sanitizeEngineDelta(obj.novelty_delta ?? obj.novelty ?? obj.novelty_bias),
+    regret_delta: sanitizeEngineDelta(obj.regret_delta ?? obj.regret ?? obj.regret_bias),
+    tuning_weight: sanitizeEngineRatio(obj.tuning_weight ?? obj.weight ?? obj.bias_weight),
+  };
+}
+
+function coerceEngineNumber(value: unknown): number | null {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    if (!normalized) return null;
+    const parsed = Number(normalized);
+    if (!Number.isNaN(parsed)) return parsed;
+    return null;
+  }
+  return null;
+}
+
+function sanitizeEngineCount(value: unknown, max: number): number {
+  const raw = coerceEngineNumber(value);
+  if (raw === null) return 0;
+  if (Number.isNaN(raw)) return 0;
+  if (!Number.isFinite(raw)) return raw < 0 ? 0 : max;
+  const n = Math.floor(raw);
+  if (n <= 0) return 0;
+  if (n >= max) return max;
+  return n;
+}
+
+function sanitizeEngineDelta(value: unknown): number {
+  const raw = coerceEngineNumber(value);
+  if (raw === null) return 0;
+  if (Number.isNaN(raw)) return 0;
+  if (!Number.isFinite(raw)) return raw < 0 ? -1 : 1;
+  if (raw <= -1) return -1;
+  if (raw >= 1) return 1;
+  return raw;
+}
+
+function sanitizeEngineDiversityWindowMinutes(value: unknown): number {
+  return sanitizeEngineCount(value, ENGINE_DIVERSITY_MAX_WINDOW_MINUTES);
+}
+
+function sanitizeEngineDiversityTimestamp(value: unknown): string {
+  const text = asString(value);
+  if (text) {
+    const parsed = Date.parse(text);
+    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+  }
+  return ENGINE_DIVERSITY_DEFAULT_UPDATED_AT;
+}
+
+function normalizeEngineAdjacencyWeights(
+  rows: Array<Pick<EngineDiversityAdjacencyMetric, "motif_id" | "neighbor_motif_id" | "tuning_weight">>,
+): void {
+  if (rows.length === 0) return;
+  const clamped = rows.map((row) => sanitizeEngineRatio(row.tuning_weight));
+  const total = clamped.reduce((sum, value) => sum + value, 0);
+  const normalized =
+    total > 0 ? clamped.map((value) => value / total) : clamped.map(() => 1 / rows.length);
+  const scaled = normalized.map((value) => clampToRange(value, 0, 1) * ENGINE_DIVERSITY_WEIGHT_PRECISION);
+  const baseShares = scaled.map((value) => Math.floor(value));
+  let remainder = ENGINE_DIVERSITY_WEIGHT_PRECISION - baseShares.reduce((sum, share) => sum + share, 0);
+  const ranked = scaled.map((value, index) => ({
+    index,
+    fraction: value - baseShares[index],
+    key: `${rows[index].motif_id}:${rows[index].neighbor_motif_id}`,
+  }));
+  ranked.sort((a, b) => {
+    if (b.fraction !== a.fraction) return b.fraction - a.fraction;
+    const keyCompare = a.key.localeCompare(b.key);
+    if (keyCompare !== 0) return keyCompare;
+    return a.index - b.index;
+  });
+  while (remainder > 0) {
+    for (const entry of ranked) {
+      if (remainder <= 0) break;
+      baseShares[entry.index]++;
+      remainder--;
+    }
+  }
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].tuning_weight = Number(
+      (baseShares[i] / ENGINE_DIVERSITY_WEIGHT_PRECISION).toFixed(6),
     );
   }
-  return {
-    objective_spread: clamp01(asNumber(metrics.objective_spread, 0)),
-    motif_coverage: clamp01(asNumber(metrics.motif_coverage, 0)),
-    motif_signal_mean: clamp01(asNumber(metrics.motif_signal_mean, 0)),
-    motif_recency_mean: clamp01(asNumber(metrics.motif_recency_mean, 0)),
-    objective_weight_mean: clamp01(asNumber(metrics.objective_weight_mean, 0)),
-    novelty_mean: clamp01(asNumber(metrics.novelty_mean, 0)),
-    diversity_weight_mean: clamp01(asNumber(metrics.diversity_weight_mean, 0)),
-    adjacency_bias_weight: clamp01(asNumber(metrics.adjacency_bias_weight, 0)),
-    dispatch_saturation: clamp01(asNumber(metrics.dispatch_saturation, 0)),
-    adjacency_pool: Array.isArray(metrics.adjacency_pool)
-      ? metrics.adjacency_pool.map((entry) => ({ ...entry }))
-      : [],
-    variant_mix: variantMix,
-    diversity_tuning_weights: diversityWeights,
-  };
 }
 
-const MAX_ADJACENT_VARIANTS_PER_PAIR = 2;
-const MAX_ADJACENCY_POOL_ENTRIES = 12;
-const MIN_OBJECTIVE_PAIR_LIMIT = 2;
-const MAX_OBJECTIVE_PAIR_LIMIT = 6;
-const MIN_MOTIF_PAIR_LIMIT = 3;
-const MAX_MOTIF_PAIR_LIMIT = 6;
+function sanitizeEngineRatio(value: unknown): number {
+  const raw = coerceEngineNumber(value);
+  if (raw === null) return 0;
+  if (Number.isNaN(raw)) return 0;
+  if (!Number.isFinite(raw)) return raw < 0 ? 0 : 1;
+  if (raw <= 0) return 0;
+  if (raw >= 1) return 1;
+  return raw;
+}
 
 function bucketLines(items: VisionKeyItems, keys: Array<keyof VisionKeyItems>): string[] {
   return keys.flatMap((key) => (Array.isArray(items[key]) ? items[key] : [])).filter(Boolean);
@@ -2210,332 +2017,11 @@ function buildCommitHistoryBlocks(params: {
           `gap_signal=${gapSignal.toFixed(2)}`,
           ...hint.sample_subjects.map((subject) => `commit=${subject}`),
         ],
-        candidate_shape: cloneCandidateShape(rule.shape),
+        candidate_shape: rule.shape,
       } satisfies EngineIdeaBuildingBlock;
     })
     .filter((entry): entry is EngineIdeaBuildingBlock => Boolean(entry))
     .sort((a, b) => b.score - a.score);
-}
-
-function computeObjectiveSpread(objectives: CompiledVisionObjective[]): number {
-  if (objectives.length === 0) return 0;
-  const weights = objectives.map((entry) => clamp01(entry.weight));
-  const total = weights.reduce((sum, value) => sum + value, 0);
-  if (total <= 0) return 0;
-  const entropy = -weights.reduce((sum, weight) => {
-    const p = weight / total;
-    return p > 0 ? sum + p * Math.log(p) : sum;
-  }, 0);
-  const maxEntropy = Math.log(weights.length);
-  if (!Number.isFinite(maxEntropy) || maxEntropy <= 0) return 0;
-  return clamp01(entropy / maxEntropy);
-}
-
-function computeMotifCoverage(hints: EngineCommitHistoryHint[]): number {
-  const totalMotifs = COMMIT_MOTIF_RULES.length;
-  if (totalMotifs === 0 || hints.length === 0) return 0;
-  const activeMotifs = new Set(
-    hints
-      .filter((hint) => clamp01(hint.signal) >= 0.2)
-      .map((hint) => hint.motif_id),
-  );
-  return clamp01(activeMotifs.size / totalMotifs);
-}
-
-function enrichMotifHintWithTelemetry(hint: EngineCommitHistoryHint): RankedMotifHint {
-  const sampleSubjects = Array.isArray(hint.sample_subjects) ? hint.sample_subjects : [];
-  const telemetryRecency = clamp01(sampleSubjects.length / 8);
-  const telemetryVolume = clamp01(Math.log1p(Math.max(0, hint.count)) / Math.log1p(24));
-  const normalizedSignal = clamp01(hint.signal);
-  const telemetrySignal = clamp01(
-    0.55 * normalizedSignal + 0.3 * telemetryRecency + 0.15 * telemetryVolume,
-  );
-  return {
-    ...hint,
-    telemetry_signal: telemetrySignal,
-    telemetry_recency: telemetryRecency,
-    telemetry_volume: telemetryVolume,
-  };
-}
-
-function rankMotifHints(hints: EngineCommitHistoryHint[]): RankedMotifHint[] {
-  return hints
-    .map((hint) => enrichMotifHintWithTelemetry(hint))
-    .sort((a, b) => {
-      const telemetryDiff = b.telemetry_signal - a.telemetry_signal;
-      if (Math.abs(telemetryDiff) > 1e-6) return telemetryDiff;
-      const signalDiff = b.signal - a.signal;
-      if (Math.abs(signalDiff) > 1e-6) return signalDiff;
-      return b.count - a.count;
-    });
-}
-
-function buildAdjacentPossibleBlocks(params: {
-  compiledObjectives: CompiledVisionObjective[];
-  opportunityGaps: EngineOpportunityGap[];
-  commitHistoryHints: EngineCommitHistoryHint[];
-  dispatchByType: Record<string, number>;
-  dispatchSaturation: number;
-}): { blocks: EngineIdeaBuildingBlock[]; metrics: EngineDiversityMetrics } {
-  const gapScoreById = new Map(params.opportunityGaps.map((entry) => [entry.id, entry.score]));
-  const objectiveSpread = computeObjectiveSpread(params.compiledObjectives);
-  const objectivePairLimit = Math.min(
-    MAX_OBJECTIVE_PAIR_LIMIT,
-    Math.max(MIN_OBJECTIVE_PAIR_LIMIT, Math.round(3 + objectiveSpread * 3)),
-  );
-  const topObjectives = params.compiledObjectives.slice(0, objectivePairLimit);
-  const motifCoverage = computeMotifCoverage(params.commitHistoryHints);
-  const motifPairLimit = Math.min(
-    MAX_MOTIF_PAIR_LIMIT,
-    Math.max(MIN_MOTIF_PAIR_LIMIT, Math.round(3 + motifCoverage * 3)),
-  );
-  const motifHints = rankMotifHints(params.commitHistoryHints).slice(0, motifPairLimit);
-  const adjacencyPool: EngineDiversityAdjacencyEntry[] = [];
-  const blocks: EngineIdeaBuildingBlock[] = [];
-  const dispatchRelief = clamp01(1 - params.dispatchSaturation);
-
-  for (const [objectiveIndex, objective] of topObjectives.entries()) {
-    for (const [hintIndex, hint] of motifHints.entries()) {
-      const rule = COMMIT_MOTIF_RULES.find((entry) => entry.motifId === hint.motif_id);
-      if (!rule) continue;
-      const objectiveWeight = clamp01(objective.weight);
-      const motifSignal = clamp01(hint.telemetry_signal);
-      const motifRecency = clamp01(hint.telemetry_recency);
-      const motifVolume = clamp01(hint.telemetry_volume);
-      const motifScarcity = clamp01(1 - motifVolume);
-      const objectiveRankPenalty = topObjectives.length > 1 ? objectiveIndex / (topObjectives.length - 1) : 0;
-      const motifRankPenalty = motifHints.length > 1 ? hintIndex / (motifHints.length - 1) : 0;
-      const combinedObjectiveIds = [...new Set([objective.id, ...hint.objective_ids])].slice(0, 4);
-      const combinedGapIds = [...new Set([...hint.gap_ids, ...rule.gapIds])].slice(0, 4);
-      const gapSignal = clamp01(
-        Math.max(
-          0,
-          ...combinedGapIds.map((id) => gapScoreById.get(id) ?? 0).filter((value) => Number.isFinite(value)),
-        ),
-      );
-      const recentTypeCount = Math.max(
-        0,
-        Math.floor(asNumber(params.dispatchByType[rule.shape.objective_type], 0)),
-      );
-      const noveltySignal = clamp01(1 - recentTypeCount / 8);
-      const variantContext = {
-        objectiveWeight,
-        motifSignal,
-        gapSignal,
-        noveltySignal,
-        dispatchRelief,
-        motifRecency,
-        motifVolume,
-      };
-      const diversityBaseline = clamp01(
-        0.2 * (1 - objectiveRankPenalty) +
-          0.16 * (1 - motifRankPenalty) +
-          0.18 * noveltySignal +
-          0.12 * dispatchRelief +
-          0.2 * objectiveSpread +
-          0.07 * motifRecency +
-          0.07 * motifScarcity,
-      );
-      const profileCandidates = ADJACENT_VARIANT_PROFILES.map((profile) => {
-        if (!profile.condition(variantContext)) return undefined;
-        const variantWeight = clamp01(
-          profile.weights.objective * objectiveWeight +
-            profile.weights.motif * motifSignal +
-            profile.weights.gap * gapSignal +
-            profile.weights.novelty * noveltySignal +
-            profile.weights.dispatch * dispatchRelief,
-        );
-        const diversityWeight = clamp01(0.55 * diversityBaseline + 0.45 * variantWeight);
-        const adjacencyBias = clamp01(
-          0.28 * objectiveWeight +
-            0.22 * gapSignal +
-            0.18 * motifSignal +
-            0.12 * variantWeight +
-            0.1 * dispatchRelief +
-            0.1 * motifRecency,
-        );
-        const score = clamp01(
-          0.3 * adjacencyBias +
-            0.18 * gapSignal +
-            0.14 * motifSignal +
-            0.12 * diversityWeight +
-            0.08 * noveltySignal +
-            0.08 * variantWeight +
-            0.1 * motifRecency -
-            0.08 * params.dispatchSaturation,
-        );
-        return { profile, variantWeight, diversityWeight, adjacencyBias, score };
-      })
-        .filter(
-          (
-            entry,
-          ): entry is {
-            profile: AdjacentVariantProfile;
-            variantWeight: number;
-            diversityWeight: number;
-            adjacencyBias: number;
-            score: number;
-          } => Boolean(entry),
-        )
-        .sort((a, b) => b.score - a.score)
-        .slice(0, MAX_ADJACENT_VARIANTS_PER_PAIR);
-
-      for (const candidate of profileCandidates) {
-        const { profile, variantWeight, diversityWeight, adjacencyBias, score } = candidate;
-        const blockShape = cloneCandidateShape(rule.shape);
-        const blockFingerprintSeed = [
-          objective.id,
-          hint.motif_id,
-          profile.key,
-          String(objectiveIndex),
-          String(hintIndex),
-          blockShape.objective_type,
-          blockShape.trigger_type,
-          blockShape.component_area,
-        ].join("|");
-        const blockHash = createHash("sha256").update(blockFingerprintSeed).digest("hex").slice(0, 8);
-        const blockId = `adjacent_${objective.id}_${hint.motif_id}_${profile.key}_${blockHash}`;
-        const summary =
-          `Variant (${profile.label.toLowerCase()}): Pair ${objective.title.toLowerCase()} objective weight ` +
-          `with ${hint.label.toLowerCase()} telemetry to explore adjacent-possible planners.` +
-          " Keep scope narrow and telemetry-backed.";
-        const hypothesis =
-          `If RemoteAgent emphasizes ${profile.label.toLowerCase()} while blending ${hint.label.toLowerCase()} ` +
-          `motifs with ${objective.title.toLowerCase()} priorities, we maintain reliability while pushing novel planners.`;
-        blocks.push({
-          id: blockId,
-          algorithm: "adjacent_possible",
-          summary,
-          hypothesis,
-          objective_ids: combinedObjectiveIds,
-          gap_ids: combinedGapIds,
-          score,
-          evidence: [
-            `variant=${profile.key}`,
-            `objective_weight=${objectiveWeight.toFixed(2)}`,
-            `motif_signal=${motifSignal.toFixed(2)}`,
-            `motif_recency=${motifRecency.toFixed(2)}`,
-            `motif_volume=${motifVolume.toFixed(2)}`,
-            `motif_scarcity=${motifScarcity.toFixed(2)}`,
-            `gap_signal=${gapSignal.toFixed(2)}`,
-            `variant_weight=${variantWeight.toFixed(2)}`,
-            `diversity_weight=${diversityWeight.toFixed(2)}`,
-            `novelty_signal=${noveltySignal.toFixed(2)}`,
-            `adjacency_bias=${adjacencyBias.toFixed(2)}`,
-          ],
-          candidate_shape: blockShape,
-        });
-        adjacencyPool.push({
-          id: blockId,
-          variant: profile.key,
-          variant_label: profile.label,
-          variant_weight: variantWeight,
-          objective_id: objective.id,
-          objective_title: objective.title,
-          objective_weight: objectiveWeight,
-          motif_id: hint.motif_id,
-          motif_label: hint.label,
-          motif_signal: motifSignal,
-          motif_recency: motifRecency,
-          motif_volume: motifVolume,
-          gap_ids: combinedGapIds,
-          diversity_weight: diversityWeight,
-          novelty_signal: noveltySignal,
-          adjacency_bias: adjacencyBias,
-          score,
-        });
-      }
-    }
-  }
-
-  blocks.sort((a, b) => b.score - a.score);
-  adjacencyPool.sort((a, b) => b.score - a.score);
-  const adjacencySample = adjacencyPool.slice(0, MAX_ADJACENCY_POOL_ENTRIES);
-  const metricsSample = adjacencySample.length > 0 ? adjacencySample : adjacencyPool;
-  const motifSignalMean =
-    metricsSample.length > 0
-      ? metricsSample.reduce((sum, entry) => sum + entry.motif_signal, 0) / metricsSample.length
-      : motifHints.length > 0
-        ? motifHints.reduce((sum, hint) => sum + hint.telemetry_signal, 0) / motifHints.length
-        : 0;
-  const motifRecencyMean =
-    metricsSample.length > 0
-      ? metricsSample.reduce((sum, entry) => sum + entry.motif_recency, 0) / metricsSample.length
-      : motifHints.length > 0
-        ? motifHints.reduce((sum, hint) => sum + hint.telemetry_recency, 0) / motifHints.length
-        : 0;
-  const objectiveWeightMean =
-    metricsSample.length > 0
-      ? metricsSample.reduce((sum, entry) => sum + entry.objective_weight, 0) / metricsSample.length
-      : topObjectives.length > 0
-        ? topObjectives.reduce((sum, entry) => sum + clamp01(entry.weight), 0) / topObjectives.length
-        : 0;
-  const noveltyMean =
-    metricsSample.length > 0 ? metricsSample.reduce((sum, entry) => sum + entry.novelty_signal, 0) / metricsSample.length : 0;
-  const diversityWeightMean =
-    metricsSample.length > 0 ? metricsSample.reduce((sum, entry) => sum + entry.diversity_weight, 0) / metricsSample.length : 0;
-  const adjacencyBiasWeight =
-    metricsSample.length > 0
-      ? metricsSample.reduce((sum, entry) => sum + entry.adjacency_bias, 0) / metricsSample.length
-      : 0;
-  const variantTotals = ADJACENT_VARIANT_PROFILES.reduce(
-    (acc, profile) => {
-      acc[profile.key] = { count: 0, scoreSum: 0, variantWeightSum: 0, diversitySum: 0 };
-      return acc;
-    },
-    {} as Record<
-      EngineAdjacencyVariant,
-      { count: number; scoreSum: number; variantWeightSum: number; diversitySum: number }
-    >,
-  );
-  for (const entry of metricsSample) {
-    const bucket = variantTotals[entry.variant];
-    bucket.count += 1;
-    bucket.scoreSum += entry.score;
-    bucket.variantWeightSum += entry.variant_weight;
-    bucket.diversitySum += entry.diversity_weight;
-  }
-  const totalEntries = metricsSample.length;
-  const variantMix = {} as Record<EngineAdjacencyVariant, EngineDiversityVariantMixEntry>;
-  for (const profile of ADJACENT_VARIANT_PROFILES) {
-    const stats = variantTotals[profile.key];
-    const count = stats.count;
-    const share = totalEntries > 0 ? count / totalEntries : 0;
-    variantMix[profile.key] = {
-      count,
-      share,
-      mean_score: count > 0 ? stats.scoreSum / count : 0,
-      mean_variant_weight: count > 0 ? stats.variantWeightSum / count : 0,
-      mean_diversity_weight: count > 0 ? stats.diversitySum / count : 0,
-    };
-  }
-  const variantWeightTotal = Object.values(variantTotals).reduce((sum, stats) => sum + stats.variantWeightSum, 0);
-  const diversityTuningWeights = {} as Record<EngineAdjacencyVariant, number>;
-  for (const profile of ADJACENT_VARIANT_PROFILES) {
-    const stats = variantTotals[profile.key];
-    const normalizedWeight =
-      variantWeightTotal > 0
-        ? stats.variantWeightSum / variantWeightTotal
-        : totalEntries > 0
-          ? stats.count / totalEntries
-          : 1 / ADJACENT_VARIANT_PROFILES.length;
-    diversityTuningWeights[profile.key] = clamp01(normalizedWeight);
-  }
-  const metrics = ensureEngineDiversityMetrics({
-    objective_spread: objectiveSpread,
-    motif_coverage: motifCoverage,
-    motif_signal_mean: clamp01(motifSignalMean),
-    motif_recency_mean: clamp01(motifRecencyMean),
-    objective_weight_mean: clamp01(objectiveWeightMean),
-    novelty_mean: clamp01(noveltyMean),
-    diversity_weight_mean: clamp01(diversityWeightMean),
-    adjacency_bias_weight: clamp01(adjacencyBiasWeight),
-    dispatch_saturation: params.dispatchSaturation,
-    adjacency_pool: adjacencySample,
-    variant_mix: variantMix,
-    diversity_tuning_weights: diversityTuningWeights,
-  });
-  return { blocks: blocks.slice(0, 6), metrics };
 }
 
 export function buildEngineInspirationContext(params: {
@@ -2715,15 +2201,8 @@ export function buildEngineInspirationContext(params: {
     dispatchByType,
     dispatchSaturation,
   });
-  const { blocks: adjacentBlocks, metrics: rawDiversityMetrics } = buildAdjacentPossibleBlocks({
-    compiledObjectives,
-    opportunityGaps,
-    commitHistoryHints,
-    dispatchByType,
-    dispatchSaturation,
-  });
   const buildingBlockMap = new Map<string, EngineIdeaBuildingBlock>();
-  for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks, ...adjacentBlocks]) {
+  for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks]) {
     if (!buildingBlockMap.has(block.id)) {
       buildingBlockMap.set(block.id, block);
       continue;
@@ -2741,7 +2220,6 @@ export function buildEngineInspirationContext(params: {
     building_blocks: buildingBlocks,
     source_patterns: sourcePatterns,
     commit_history_hints: commitHistoryHints,
-    diversity_metrics: ensureEngineDiversityMetrics(rawDiversityMetrics),
   };
 }
 
