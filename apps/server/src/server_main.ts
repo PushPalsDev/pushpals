@@ -339,7 +339,7 @@ export function createRequestHandler() {
             pathname,
           )) ||
         (method === "GET" &&
-          /^\/+(workers|system\/status|requests|jobs|completions|requests\/[^/]+|jobs\/[^/]+|completions\/[^/]+|jobs\/[^/]+\/logs)(\/)?$/.test(
+          /^\/+(workers|system\/status|requests|jobs|completions|questions|autonomy\/insights|requests\/[^/]+|jobs\/[^/]+|completions\/[^/]+|jobs\/[^/]+\/logs)(\/)?$/.test(
             pathname,
           ));
       if (isNoisyPoll) {
