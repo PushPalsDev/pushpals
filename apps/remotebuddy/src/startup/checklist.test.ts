@@ -151,6 +151,102 @@ describe("StartupChecklist", () => {
     expect(dirtyRecord?.detail).toContain("allowDirtyWorktree=true");
   });
 
+  test("emits pass telemetry for runtime and infrastructure checks when versions satisfy requirements", async () => {
+    const telemetry: StartupTelemetryEvent[] = [];
+    const ctx = buildContext({
+      readBunVersion: async () => "1.4.2",
+      readDockerVersion: async () => "25.0.1",
+      telemetry: (event) => telemetry.push(event),
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(true);
+    const bunPhase = telemetry.find(
+      (event): event is StartupTelemetryPhaseEvent =>
+        event.type === "startup_phase" &&
+        event.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(bunPhase?.status).toBe("pass");
+    expect(bunPhase?.detail).toContain("meets the minimum");
+    expect(bunPhase?.error).toBeUndefined();
+    const dockerPhase = telemetry.find(
+      (event): event is StartupTelemetryPhaseEvent =>
+        event.type === "startup_phase" &&
+        event.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    expect(dockerPhase?.status).toBe("pass");
+    expect(dockerPhase?.detail).toContain("meets the minimum");
+    expect(dockerPhase?.error).toBeUndefined();
+    expect(
+      telemetry.some(
+        (event) =>
+          event.type === "startup_unknown_failure" &&
+          (event.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED ||
+            event.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED),
+      ),
+    ).toBe(false);
+  });
+
+  test("captures actionable detail when Bun version output is empty", async () => {
+    const telemetry: StartupTelemetryEvent[] = [];
+    const ctx = buildContext({
+      readBunVersion: async () => "",
+      telemetry: (event) => telemetry.push(event),
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(result.failure?.detail).toContain("output was empty");
+    const history = result.history.find(
+      (record) => record.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(history?.detail).toContain("output was empty");
+    const bunPhase = telemetry.find(
+      (event): event is StartupTelemetryPhaseEvent =>
+        event.type === "startup_phase" &&
+        event.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(bunPhase?.status).toBe("fail");
+    expect(bunPhase?.error).toBeUndefined();
+    expect(
+      telemetry.some(
+        (event) =>
+          event.type === "startup_unknown_failure" &&
+          event.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+      ),
+    ).toBe(false);
+  });
+
+  test("captures actionable detail when Docker version string is malformed", async () => {
+    const telemetry: StartupTelemetryEvent[] = [];
+    const ctx = buildContext({
+      readDockerVersion: async () => "not_a_version",
+      telemetry: (event) => telemetry.push(event),
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    expect(result.failure?.detail).toContain("is not recognized");
+    const dockerPhase = telemetry.find(
+      (event): event is StartupTelemetryPhaseEvent =>
+        event.type === "startup_phase" &&
+        event.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    expect(dockerPhase?.status).toBe("fail");
+    expect(dockerPhase?.detail).toContain("not_a_version");
+    expect(dockerPhase?.error).toBeUndefined();
+    expect(
+      telemetry.some(
+        (event) =>
+          event.type === "startup_unknown_failure" &&
+          event.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+      ),
+    ).toBe(false);
+  });
+
   test("synthetic guard runs before dispatch and blocks failures", async () => {
     const successOrder: string[] = [];
     const successCtx = buildContext({
@@ -475,6 +571,76 @@ describe("StartupChecklist", () => {
       );
       expect(unknownEvent.error.raw).toBe(dockerProbeError);
       expect(unknownEvent.step).toBe(2);
+    }
+  });
+
+  test("bun version string probe failures normalize telemetry error payloads", async () => {
+    const telemetry: StartupTelemetryEvent[] = [];
+    const ctx = buildContext({
+      readBunVersion: async () => {
+        throw "bun runtime unavailable";
+      },
+      telemetry: (event) => telemetry.push(event),
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    const bunPhase = telemetry.find(
+      (event): event is StartupTelemetryPhaseEvent =>
+        event.type === "startup_phase" &&
+        event.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(bunPhase).toBeDefined();
+    if (!bunPhase) return;
+    expect(bunPhase.error?.message).toContain("bun runtime unavailable");
+    expect(bunPhase.error?.raw).toBe("bun runtime unavailable");
+    const unknownEvent = telemetry.find(
+      (event): event is StartupTelemetryUnknownFailureEvent =>
+        event.type === "startup_unknown_failure" &&
+        event.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(unknownEvent).toBeDefined();
+    if (unknownEvent) {
+      expect(unknownEvent.error.raw).toBe("bun runtime unavailable");
+      expect(unknownEvent.error.message).toContain("bun runtime unavailable");
+    }
+  });
+
+  test("docker version unknown probe failures normalize telemetry error payloads", async () => {
+    const telemetry: StartupTelemetryEvent[] = [];
+    const rawError = { panic: true };
+    const ctx = buildContext({
+      readDockerVersion: async () => {
+        throw rawError;
+      },
+      telemetry: (event) => telemetry.push(event),
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(
+      STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    const dockerPhase = telemetry.find(
+      (event): event is StartupTelemetryPhaseEvent =>
+        event.type === "startup_phase" &&
+        event.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    expect(dockerPhase).toBeDefined();
+    if (!dockerPhase) return;
+    expect(dockerPhase.error?.message).toContain("Docker version probe failed");
+    expect(dockerPhase.error?.raw).toBe(rawError);
+    expect(typeof (dockerPhase.error?.stack ?? "")).toBe("string");
+    const unknownEvent = telemetry.find(
+      (event): event is StartupTelemetryUnknownFailureEvent =>
+        event.type === "startup_unknown_failure" &&
+        event.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    expect(unknownEvent).toBeDefined();
+    if (unknownEvent) {
+      expect(unknownEvent.error.raw).toBe(rawError);
+      expect(unknownEvent.error.message).toContain("Docker version probe failed");
     }
   });
 
