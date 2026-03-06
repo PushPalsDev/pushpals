@@ -31,8 +31,8 @@ import {
   matchesGlob,
   normalizeTargetPath,
   normalizeWriteGlob,
-} from "shared";
-import type { AutonomyComponentArea } from "shared";
+} from "./shared_runtime.js";
+import type { AutonomyComponentArea } from "./shared_runtime.js";
 import { mkdirSync } from "fs";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {

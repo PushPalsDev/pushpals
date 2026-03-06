@@ -10,7 +10,8 @@ import { spawn } from "child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { loadPromptTemplate, loadPushPalsConfig, type PushPalsLmStudioConfig } from "shared";
+import { loadPromptTemplate, loadPushPalsConfig } from "./shared_runtime.js";
+import type { PushPalsLmStudioConfig } from "./shared_runtime.js";
 
 export interface LLMMessage {
   role: "system" | "user" | "assistant";

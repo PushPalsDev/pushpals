@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "crypto";
 import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
-import type { CommunicationManager } from "shared";
 import {
   componentRootPrefix,
   extractVisionKeyItems,
@@ -13,10 +12,13 @@ import {
   penaltyTotal,
   parseVisionDoc,
   validateScopeInvariants,
-  type AutonomyComponentArea,
-  type AutonomyObjectiveType,
-} from "shared";
-import type { PushPalsConfig } from "shared";
+} from "./shared_runtime.js";
+import type {
+  AutonomyComponentArea,
+  AutonomyObjectiveType,
+  CommunicationManager,
+  PushPalsConfig,
+} from "./shared_runtime.js";
 import type { LLMClient } from "./llm.js";
 import {
   canonicalizeInstructionTextForBun,
@@ -681,6 +683,28 @@ type VisionContext = {
 
 type VisionKeyItems = VisionContext["key_items"];
 
+export type QueueTelemetrySnapshot = {
+  latencyMs: number | null;
+  backlog: number | null;
+  jobFailureRate: number | null;
+  normalizedLatency: number;
+  normalizedBacklog: number;
+  normalizedFailureRate: number;
+};
+
+type QueueTelemetryFocus = {
+  latency: number;
+  backlog: number;
+  failure: number;
+  dominant: "latency" | "backlog" | "failure" | "balanced";
+};
+
+type MotifTelemetryProfile = {
+  latency: number;
+  backlog: number;
+  failure: number;
+};
+
 export interface CompiledVisionObjective {
   id: string;
   title: string;
@@ -754,12 +778,86 @@ export interface EngineInspirationSourcePattern {
   source_trust_score: number;
 }
 
+export interface AdjacentPossibleTelemetryInputs {
+  motif: {
+    id: string;
+    label: string;
+    signal: number;
+    weighted_signal: number;
+    prioritized_signal: number;
+    queue_affinity: number;
+    telemetry_alignment: number;
+    telemetry_weight: number;
+  };
+  gap: {
+    id: string;
+    label: string;
+    score: number;
+  };
+  queue: {
+    signal: number;
+    weight: number;
+    pressure: number;
+    latency_ms: number | null;
+    backlog: number | null;
+    failure_rate_raw: number | null;
+    failure_rate_normalized: number;
+    normalized_latency: number;
+    normalized_backlog: number;
+    normalized_failure_rate: number;
+    stress: number;
+    focus: QueueTelemetryFocus;
+  };
+  novelty: {
+    score: number;
+    recent_dispatch_count: number;
+  };
+}
+
+export interface AdjacentPossibleTelemetryOutput {
+  mix_score: number;
+  accepted: boolean;
+  block_id?: string;
+  guardrail_reason?: string;
+  rejection_reason?: string;
+}
+
+export interface AdjacentPossibleTelemetryEntry {
+  motif_id: string;
+  gap_id: string;
+  motif_signal: number;
+  weighted_motif_signal: number;
+  motif_prioritized_signal: number;
+  motif_telemetry_alignment: number;
+  motif_queue_telemetry_weight: number;
+  telemetry_bias: number;
+  gap_score: number;
+  queue_signal: number;
+  queue_weight: number;
+  queue_latency_ms: number | null;
+  queue_backlog: number | null;
+  queue_failure_rate_raw: number | null;
+  queue_failure_rate_normalized: number;
+  queue_stress: number;
+  queue_affinity: number;
+  novelty_score: number;
+  mix_score: number;
+  accepted: boolean;
+  reason?: string;
+  guardrail_reason?: string;
+  rejection_reason?: string;
+  block_id?: string;
+  inputs: AdjacentPossibleTelemetryInputs;
+  output: AdjacentPossibleTelemetryOutput;
+}
+
 export interface EngineInspirationContext {
   compiled_objectives: CompiledVisionObjective[];
   opportunity_gaps: EngineOpportunityGap[];
   building_blocks: EngineIdeaBuildingBlock[];
   source_patterns: EngineInspirationSourcePattern[];
   commit_history_hints: EngineCommitHistoryHint[];
+  adjacent_possible_telemetry: AdjacentPossibleTelemetryEntry[];
 }
 
 type EngineIdeaInputSnapshot = Pick<
@@ -1562,6 +1660,36 @@ function applySourceCurationToPatterns(
   });
 }
 
+export function resolveComponentRootPrefix(
+  componentArea: AutonomyComponentArea,
+  options?: {
+    componentRoot?: (area: AutonomyComponentArea) => string;
+    pathExists?: (candidate: string) => boolean;
+    cwd?: () => string;
+  },
+): string {
+  const rootResolver = options?.componentRoot ?? componentRootPrefix;
+  const normalized = rootResolver(componentArea).replace(/\/$/, "");
+  if (!normalized) return componentArea;
+  const candidates = [normalized];
+  const nodeModulesPattern = /(^|\/)node_modules\//;
+  if (nodeModulesPattern.test(normalized)) {
+    const fallback = normalized.replace(nodeModulesPattern, "$1packages/");
+    if (fallback !== normalized) {
+      candidates.push(fallback);
+    }
+  }
+  const pathExists = options?.pathExists ?? existsSync;
+  const cwdResolver = options?.cwd ?? process.cwd;
+  for (const candidate of candidates) {
+    const absolute = candidate.startsWith("/") ? candidate : resolve(cwdResolver(), candidate);
+    if (pathExists(absolute)) {
+      return candidate;
+    }
+  }
+  return normalized;
+}
+
 function buildCandidateShapeFromPattern(pattern: InspirationPatternInput): EngineCandidateShape {
   const text = `${pattern.algorithm}\n${pattern.whenToUse}\n${pattern.summary}\n${pattern.tags.join(" ")}`.toLowerCase();
   const metadata = pattern.metadata;
@@ -1587,7 +1715,7 @@ function buildCandidateShapeFromPattern(pattern: InspirationPatternInput): Engin
     : inferTriggerTypeFromText(text) ?? defaults.trigger_type;
   const riskRaw = asString(metadataShape.risk_level ?? metadataShape.riskLevel ?? metadata.risk_level);
   const riskLevel = isRiskLevel(riskRaw) ? riskRaw : inferRiskLevelFromText(text, pattern.tags);
-  const rootPrefix = componentRootPrefix(componentArea).replace(/\/$/, "");
+  const rootPrefix = resolveComponentRootPrefix(componentArea);
   const targetPaths = asStringArray(
     metadataShape.target_paths ?? metadataShape.targetPaths ?? metadata.target_paths,
   );
@@ -1786,6 +1914,469 @@ function buildCommitHistoryBlocks(params: {
     .sort((a, b) => b.score - a.score);
 }
 
+function extractQueueTelemetryFromSignals(
+  topSignals: EngineIdeaInputSnapshot["top_signals"],
+): QueueTelemetrySnapshot {
+  const queueSignals = Array.isArray(topSignals)
+    ? topSignals.filter((entry) => asString(entry.type).toLowerCase() === "queue_health")
+    : [];
+  let latencyMs: number | null = null;
+  let backlog: number | null = null;
+  let jobFailureRate: number | null = null;
+  const metricRegex = /([A-Za-z0-9_.:-]+)=([0-9.]+)/g;
+  for (const signal of queueSignals) {
+    const evidence = asString(signal.evidence);
+    metricRegex.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = metricRegex.exec(evidence))) {
+      const key = match[1].toLowerCase();
+      const value = Number(match[2]);
+      if (!Number.isFinite(value)) continue;
+      if (key.includes("queue_p95") || key.includes("queuewait") || key.includes("wait_ms")) {
+        latencyMs = latencyMs === null ? value : Math.max(latencyMs, value);
+      } else if (
+        key.includes("pending") ||
+        key.includes("backlog") ||
+        key.includes("depth") ||
+        key.includes("queue_pending")
+      ) {
+        backlog = backlog === null ? value : Math.max(backlog, value);
+      } else if (key.includes("failure_rate") || key.includes("job_failure")) {
+        jobFailureRate = jobFailureRate === null ? value : Math.max(jobFailureRate, value);
+      }
+    }
+  }
+  return {
+    latencyMs,
+    backlog,
+    jobFailureRate,
+    normalizedLatency: latencyMs === null ? 0 : clamp01(latencyMs / 1_500),
+    normalizedBacklog: backlog === null ? 0 : clamp01(backlog / 60),
+    normalizedFailureRate: normalizeQueueFailureRate(jobFailureRate),
+  };
+}
+
+function computeQueueTelemetryWeight(queueSignal: number, telemetry: QueueTelemetrySnapshot): number {
+  return clamp01(
+    0.4 * queueSignal +
+      0.28 * telemetry.normalizedLatency +
+      0.18 * telemetry.normalizedBacklog +
+      0.14 * telemetry.normalizedFailureRate,
+  );
+}
+
+function normalizeQueueFailureRate(value: number | null): number {
+  if (value === null || !Number.isFinite(value)) return 0;
+  if (value <= 0) return 0;
+  const normalized = value > 1 ? value / 100 : value;
+  return clamp01(normalized);
+}
+
+function computeQueueStressSignal(telemetry: QueueTelemetrySnapshot): number {
+  return clamp01(
+    0.45 * telemetry.normalizedLatency +
+      0.35 * telemetry.normalizedBacklog +
+      0.2 * telemetry.normalizedFailureRate,
+  );
+}
+
+function computeQueueTelemetryFocus(telemetry: QueueTelemetrySnapshot): QueueTelemetryFocus {
+  const latency = clamp01(telemetry.normalizedLatency);
+  const backlog = clamp01(telemetry.normalizedBacklog);
+  const failure = clamp01(telemetry.normalizedFailureRate);
+  const total = latency + backlog + failure;
+  if (total <= 0) {
+    return {
+      latency: 1 / 3,
+      backlog: 1 / 3,
+      failure: 1 / 3,
+      dominant: "balanced",
+    };
+  }
+  const normalized = {
+    latency: latency / total,
+    backlog: backlog / total,
+    failure: failure / total,
+  };
+  const focusEntries: Array<["latency" | "backlog" | "failure", number]> = [
+    ["latency", normalized.latency],
+    ["backlog", normalized.backlog],
+    ["failure", normalized.failure],
+  ];
+  let [dominantKey, dominantValue] = focusEntries[0];
+  for (const [key, value] of focusEntries.slice(1)) {
+    if (value > dominantValue) {
+      dominantKey = key;
+      dominantValue = value;
+    }
+  }
+  const minValue = Math.min(normalized.latency, normalized.backlog, normalized.failure);
+  const isBalanced = dominantValue - minValue < 0.12;
+  return {
+    ...normalized,
+    dominant: isBalanced ? "balanced" : dominantKey,
+  };
+}
+
+const MOTIF_LATENCY_KEYWORDS = /\b(latency|p9[05]|p99|wait|slow|timeout|lag|queuewait|response)\b/;
+const MOTIF_BACKLOG_KEYWORDS = /\b(backlog|pending|depth|throughput|capacity|dispatch|queue|saturation)\b/;
+const MOTIF_FAILURE_KEYWORDS = /\b(failure|error|retry|flake|incident|crash|panic|regression)\b/;
+
+function motifTelemetryProfile(hint: EngineCommitHistoryHint): MotifTelemetryProfile {
+  const text = `${hint.motif_id} ${hint.label} ${hint.sample_subjects.join(" ")} ${hint.gap_ids.join(" ")} ${hint.objective_ids.join(" ")}`
+    .toLowerCase();
+  const base = 0.12;
+  const latency =
+    base +
+    (MOTIF_LATENCY_KEYWORDS.test(text) ? 0.65 : 0) +
+    (/\b(p9[05]|p99|queue_p95|response)\b/.test(text) ? 0.08 : 0);
+  const backlog =
+    base +
+    (MOTIF_BACKLOG_KEYWORDS.test(text) ? 0.65 : 0) +
+    (/\b(throughput|pending|queued|depth)\b/.test(text) ? 0.08 : 0);
+  const failure =
+    base +
+    (MOTIF_FAILURE_KEYWORDS.test(text) ? 0.65 : 0) +
+    (/\b(retry|regression|incident)\b/.test(text) ? 0.08 : 0);
+  return {
+    latency,
+    backlog,
+    failure,
+  };
+}
+
+function motifQueueTelemetryAlignment(
+  hint: EngineCommitHistoryHint,
+  focus: QueueTelemetryFocus,
+): number {
+  const profile = motifTelemetryProfile(hint);
+  const total = profile.latency + profile.backlog + profile.failure;
+  if (total <= 0) return 1 / 3;
+  const normalized = {
+    latency: profile.latency / total,
+    backlog: profile.backlog / total,
+    failure: profile.failure / total,
+  };
+  return clamp01(
+    normalized.latency * focus.latency +
+      normalized.backlog * focus.backlog +
+      normalized.failure * focus.failure,
+  );
+}
+
+// Weight motif affinity by real queue telemetry intensity rather than just distribution.
+function motifQueueTelemetryWeight(
+  hint: EngineCommitHistoryHint,
+  telemetry: QueueTelemetrySnapshot,
+): number {
+  const profile = motifTelemetryProfile(hint);
+  const total = profile.latency + profile.backlog + profile.failure;
+  const normalizedTelemetry = {
+    latency: clamp01(telemetry.normalizedLatency),
+    backlog: clamp01(telemetry.normalizedBacklog),
+    failure: clamp01(telemetry.normalizedFailureRate),
+  };
+  const telemetryAverage =
+    (normalizedTelemetry.latency + normalizedTelemetry.backlog + normalizedTelemetry.failure) / 3;
+  if (total <= 0) {
+    return clamp01(telemetryAverage);
+  }
+  const normalizedProfile = {
+    latency: profile.latency / total,
+    backlog: profile.backlog / total,
+    failure: profile.failure / total,
+  };
+  return clamp01(
+    normalizedProfile.latency * normalizedTelemetry.latency +
+      normalizedProfile.backlog * normalizedTelemetry.backlog +
+      normalizedProfile.failure * normalizedTelemetry.failure,
+  );
+}
+
+function motifQueueAffinity(hint: EngineCommitHistoryHint): number {
+  const label = hint.label.toLowerCase();
+  if (/\b(queue|backpressure|latency|throughput|pending)\b/.test(label)) return 1;
+  if (/\b(worker|dispatch|runtime|saturation)\b/.test(label)) return 0.75;
+  if (/\b(policy|scope|guardrail)\b/.test(label)) return 0.45;
+  if (/\b(merge|rework|review)\b/.test(label)) return 0.35;
+  return 0.25;
+}
+
+export function buildAdjacentPossibleRecombinations(params: {
+  hints: EngineCommitHistoryHint[];
+  gaps: EngineOpportunityGap[];
+  queueSignal: number;
+  queueWeight: number;
+  queueTelemetry: QueueTelemetrySnapshot;
+  dispatchByType: Record<string, number>;
+  dispatchSaturation: number;
+}): { blocks: EngineIdeaBuildingBlock[]; telemetry: AdjacentPossibleTelemetryEntry[] } {
+  const telemetry: AdjacentPossibleTelemetryEntry[] = [];
+  const blocks: EngineIdeaBuildingBlock[] = [];
+  const gaps = params.gaps.slice(0, 3);
+  if (params.hints.length === 0 || gaps.length === 0) {
+    return { blocks, telemetry };
+  }
+  const queueStress = computeQueueStressSignal(params.queueTelemetry);
+  const queuePressure = clamp01(0.55 * params.queueWeight + 0.45 * queueStress);
+  const queueFocus = computeQueueTelemetryFocus(params.queueTelemetry);
+  const queueFailureRateRaw = params.queueTelemetry.jobFailureRate;
+  const queueFailureRateNormalized = params.queueTelemetry.normalizedFailureRate;
+  const dispatchGuardrailReason = params.dispatchSaturation >= 0.95 ? "dispatch_saturation_high" : undefined;
+
+  type PrioritizedHint = {
+    hint: EngineCommitHistoryHint;
+    motifSignal: number;
+    queueAffinity: number;
+    telemetryAlignment: number;
+    prioritizedSignal: number;
+    queueTelemetryWeight: number;
+    telemetryBias: number;
+  };
+
+  const prioritizedHints: PrioritizedHint[] = params.hints
+    .slice(0, 8)
+    .map((hint) => {
+      const motifSignal = clamp01(hint.signal);
+      const queueAffinity = motifQueueAffinity(hint);
+      const telemetryAlignment = motifQueueTelemetryAlignment(hint, queueFocus);
+      const queueTelemetryWeight = motifQueueTelemetryWeight(hint, params.queueTelemetry);
+      const telemetryBias = clamp01(
+        0.35 * queueAffinity * queuePressure +
+          0.25 * queueStress +
+          0.2 * telemetryAlignment +
+          0.2 * queueTelemetryWeight,
+      );
+      const prioritizedSignal = clamp01(0.5 * motifSignal + 0.5 * telemetryBias);
+      return {
+        hint,
+        motifSignal,
+        queueAffinity,
+        telemetryAlignment,
+        prioritizedSignal,
+        queueTelemetryWeight,
+        telemetryBias,
+      };
+    })
+    .sort((a, b) => b.prioritizedSignal - a.prioritizedSignal)
+    .slice(0, 5);
+
+  if (prioritizedHints.length === 0) {
+    return { blocks, telemetry };
+  }
+
+  type TelemetryRecordInput = {
+    gap: EngineOpportunityGap;
+    entry: PrioritizedHint;
+    weightedMotifSignal: number;
+    noveltyScore: number;
+    recentTypeCount: number;
+    mixScore: number;
+    accepted: boolean;
+    blockId?: string;
+    reason?: string;
+    guardrailReason?: string;
+  };
+
+  const recordTelemetry = (details: TelemetryRecordInput): void => {
+    const rejectionReason = details.accepted ? undefined : details.reason ?? details.guardrailReason;
+    const { entry: prioritized } = details;
+    const telemetryEntry: AdjacentPossibleTelemetryEntry = {
+      motif_id: prioritized.hint.motif_id,
+      gap_id: details.gap.id,
+      motif_signal: prioritized.motifSignal,
+      weighted_motif_signal: details.weightedMotifSignal,
+      motif_prioritized_signal: prioritized.prioritizedSignal,
+      motif_telemetry_alignment: prioritized.telemetryAlignment,
+      motif_queue_telemetry_weight: prioritized.queueTelemetryWeight,
+      telemetry_bias: prioritized.telemetryBias,
+      gap_score: details.gap.score,
+      queue_signal: params.queueSignal,
+      queue_weight: params.queueWeight,
+      queue_latency_ms: params.queueTelemetry.latencyMs,
+      queue_backlog: params.queueTelemetry.backlog,
+      queue_failure_rate_raw: queueFailureRateRaw,
+      queue_failure_rate_normalized: queueFailureRateNormalized,
+      queue_stress: queueStress,
+      queue_affinity: prioritized.queueAffinity,
+      novelty_score: details.noveltyScore,
+      mix_score: details.mixScore,
+      accepted: details.accepted,
+      ...(details.blockId ? { block_id: details.blockId } : {}),
+      ...(details.guardrailReason ? { guardrail_reason: details.guardrailReason } : {}),
+      ...(!details.accepted && rejectionReason
+        ? { reason: rejectionReason, rejection_reason: rejectionReason }
+        : {}),
+      inputs: {
+        motif: {
+          id: prioritized.hint.motif_id,
+          label: prioritized.hint.label,
+          signal: prioritized.motifSignal,
+          weighted_signal: details.weightedMotifSignal,
+          prioritized_signal: prioritized.prioritizedSignal,
+          queue_affinity: prioritized.queueAffinity,
+          telemetry_alignment: prioritized.telemetryAlignment,
+          telemetry_weight: prioritized.queueTelemetryWeight,
+        },
+        gap: {
+          id: details.gap.id,
+          label: details.gap.label,
+          score: details.gap.score,
+        },
+        queue: {
+          signal: params.queueSignal,
+          weight: params.queueWeight,
+          pressure: queuePressure,
+          latency_ms: params.queueTelemetry.latencyMs,
+          backlog: params.queueTelemetry.backlog,
+          failure_rate_raw: queueFailureRateRaw,
+          failure_rate_normalized: queueFailureRateNormalized,
+          normalized_latency: params.queueTelemetry.normalizedLatency,
+          normalized_backlog: params.queueTelemetry.normalizedBacklog,
+          normalized_failure_rate: params.queueTelemetry.normalizedFailureRate,
+          stress: queueStress,
+          focus: { ...queueFocus },
+        },
+        novelty: {
+          score: details.noveltyScore,
+          recent_dispatch_count: details.recentTypeCount,
+        },
+      },
+      output: {
+        mix_score: details.mixScore,
+        accepted: details.accepted,
+        ...(details.blockId ? { block_id: details.blockId } : {}),
+        ...(details.guardrailReason ? { guardrail_reason: details.guardrailReason } : {}),
+        ...(!details.accepted && rejectionReason ? { rejection_reason: rejectionReason } : {}),
+      },
+    };
+    telemetry.push(telemetryEntry);
+  };
+
+  for (const entry of prioritizedHints) {
+    const {
+      hint,
+      motifSignal,
+      queueAffinity,
+      telemetryAlignment,
+      prioritizedSignal,
+      queueTelemetryWeight,
+      telemetryBias,
+    } = entry;
+    const rule = COMMIT_MOTIF_RULES.find((candidate) => candidate.motifId === hint.motif_id);
+    const affinityWeightedStress = clamp01(queuePressure * queueAffinity);
+    if (!rule) {
+      for (const gap of gaps) {
+        const weightedSignal = clamp01(
+          0.4 * motifSignal + 0.35 * prioritizedSignal + 0.25 * telemetryAlignment,
+        );
+        recordTelemetry({
+          gap,
+          entry,
+          weightedMotifSignal: weightedSignal,
+          noveltyScore: 0,
+          recentTypeCount: 0,
+          mixScore: 0,
+          accepted: false,
+          reason: "motif_rule_missing",
+        });
+      }
+      continue;
+    }
+    const recentTypeCount = Math.max(
+      0,
+      Math.floor(asNumber(params.dispatchByType[rule.shape.objective_type], 0)),
+    );
+    const noveltyScore = clamp01(1 - recentTypeCount / 6);
+    const weightedMotifSignal = clamp01(
+      0.32 * prioritizedSignal +
+        0.22 * affinityWeightedStress +
+        0.18 * telemetryAlignment +
+        0.16 * queueTelemetryWeight +
+        0.08 * queueStress +
+        0.04 * noveltyScore,
+    );
+    for (const gap of gaps) {
+      const telemetryPressureBonus = clamp01(
+        0.4 * affinityWeightedStress + 0.35 * telemetryAlignment + 0.25 * queueTelemetryWeight,
+      );
+      const mixScore = clamp01(
+        0.3 * weightedMotifSignal +
+          0.24 * gap.score +
+          0.16 * telemetryPressureBonus +
+          0.14 * telemetryBias +
+          0.08 * noveltyScore -
+          0.08 * params.dispatchSaturation,
+      );
+      const guardrailReason =
+        queuePressure < 0.18
+          ? "queue_pressure_low"
+          : queueAffinity * queuePressure < 0.12
+            ? "motif_queue_misalignment"
+            : dispatchGuardrailReason;
+      const accepted = mixScore >= 0.36 && !guardrailReason;
+      const blockId = `adjacent_${hint.motif_id}_${gap.id}`;
+      const rejectionReason = accepted ? undefined : guardrailReason ?? "score_below_threshold";
+      recordTelemetry({
+        gap,
+        entry,
+        weightedMotifSignal,
+        noveltyScore,
+        recentTypeCount,
+        mixScore,
+        accepted,
+        blockId: accepted ? blockId : undefined,
+        reason: rejectionReason,
+        guardrailReason: !accepted && guardrailReason ? guardrailReason : undefined,
+      });
+      if (!accepted) continue;
+      const gapIds = [...new Set([...hint.gap_ids, gap.id])].slice(0, 4);
+      const evidence: string[] = [
+        `motif_signal=${motifSignal.toFixed(2)}`,
+        `motif_priority=${prioritizedSignal.toFixed(2)}`,
+        `weighted_motif=${weightedMotifSignal.toFixed(2)}`,
+        `telemetry_alignment=${telemetryAlignment.toFixed(2)}`,
+        `gap_score=${gap.score.toFixed(2)}`,
+        `queue_weight=${params.queueWeight.toFixed(2)}`,
+        `queue_pressure=${queuePressure.toFixed(2)}`,
+        `queue_affinity=${queueAffinity.toFixed(2)}`,
+        `queue_telemetry_weight=${queueTelemetryWeight.toFixed(2)}`,
+        `telemetry_bias=${telemetryBias.toFixed(2)}`,
+        `queue_focus=${queueFocus.dominant}`,
+        `novelty_score=${noveltyScore.toFixed(2)}`,
+      ];
+      if (queueFailureRateRaw !== null) {
+        evidence.push(`queue_failure_rate_raw=${queueFailureRateRaw.toFixed(2)}`);
+      }
+      evidence.push(`queue_failure_rate_normalized=${queueFailureRateNormalized.toFixed(2)}`);
+      if (params.queueTelemetry.latencyMs !== null) {
+        evidence.push(`queue_latency_ms=${Math.round(params.queueTelemetry.latencyMs)}`);
+      }
+      if (params.queueTelemetry.backlog !== null) {
+        evidence.push(`queue_backlog=${Math.round(params.queueTelemetry.backlog)}`);
+      }
+      evidence.push(`queue_stress=${queueStress.toFixed(2)}`);
+      evidence.push(`dispatch_saturation=${params.dispatchSaturation.toFixed(2)}`);
+      blocks.push({
+        id: blockId,
+        algorithm: "adjacent_possible",
+        summary: `Recombine ${hint.label.toLowerCase()} motif with ${gap.label.toLowerCase()} pressure.`,
+        hypothesis:
+          `Mix ${hint.label.toLowerCase()} lessons with ${gap.label.toLowerCase()} mitigations ` +
+          "to relieve queue pressure without regressing safety signals.",
+        objective_ids: hint.objective_ids.slice(0, 4),
+        gap_ids: gapIds,
+        score: mixScore,
+        evidence,
+        candidate_shape: rule.shape,
+        source_type: "internal_recombination",
+        source_label: "adjacent_possible_mixer",
+      });
+    }
+  }
+  return { blocks, telemetry };
+}
+
 export function buildEngineInspirationContext(params: {
   vision: Pick<VisionContext, "one_sentence" | "key_items" | "section_numbers">;
   snapshot: EngineIdeaInputSnapshot;
@@ -1811,6 +2402,8 @@ export function buildEngineInspirationContext(params: {
 
   const failureSignal = maxSignalScore(params.snapshot, ["test_failure", "lint_failure", "typecheck_failure"]);
   const queueSignal = maxSignalScore(params.snapshot, ["queue_health"]);
+  const queueTelemetry = extractQueueTelemetryFromSignals(params.snapshot.top_signals);
+  const queueWeight = computeQueueTelemetryWeight(queueSignal, queueTelemetry);
   const regretSignal = maxSignalScore(params.snapshot, ["regret_signal"]);
   const reliabilityTrait = maxTraitScore(
     params.snapshot,
@@ -1963,8 +2556,17 @@ export function buildEngineInspirationContext(params: {
     dispatchByType,
     dispatchSaturation,
   });
+  const { blocks: adjacentBlocks, telemetry: adjacentTelemetry } = buildAdjacentPossibleRecombinations({
+    hints: commitHistoryHints,
+    gaps: opportunityGaps,
+    queueSignal,
+    queueWeight,
+    queueTelemetry,
+    dispatchByType,
+    dispatchSaturation,
+  });
   const buildingBlockMap = new Map<string, EngineIdeaBuildingBlock>();
-  for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks]) {
+  for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks, ...adjacentBlocks]) {
     if (!buildingBlockMap.has(block.id)) {
       buildingBlockMap.set(block.id, block);
       continue;
@@ -1982,6 +2584,7 @@ export function buildEngineInspirationContext(params: {
     building_blocks: buildingBlocks,
     source_patterns: sourcePatterns,
     commit_history_hints: commitHistoryHints,
+    adjacent_possible_telemetry: adjacentTelemetry,
   };
 }
 

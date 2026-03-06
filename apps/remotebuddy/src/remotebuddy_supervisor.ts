@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { loadPushPalsConfig } from "shared";
+import { loadPushPalsConfig } from "./shared_runtime.js";
 
 const CONFIG = loadPushPalsConfig();
 const restartEnabled = CONFIG.remotebuddy.crashRestartEnabled;

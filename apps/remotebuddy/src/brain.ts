@@ -5,7 +5,7 @@
  * without heuristic fallbacks.
  */
 
-import { loadPromptTemplate } from "shared";
+import { loadPromptTemplate } from "./shared_runtime.js";
 import type { LLMClient, LLMMessage } from "./llm.js";
 import { normalizeRepoPathHint } from "./path_targeting.js";
 
