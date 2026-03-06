@@ -68,7 +68,7 @@ type Snapshot = {
   snapshot_created_at: string;
   snapshot_ttl_ms: number;
   impact_model_version: string;
-  top_signals: Array<{ signal_id: string; type: string; value: number; evidence: string }>;
+  top_signals: Array<{ signal_id: string; type: string; value: number; evidence: unknown }>;
   state_traits: Array<{
     trait_id: string;
     category: "strength" | "weakness" | "opportunity" | "risk";
@@ -715,6 +715,7 @@ export interface EngineIdeaBuildingBlock {
   score: number;
   evidence: string[];
   candidate_shape: EngineCandidateShape;
+  telemetry?: Record<string, unknown>;
   source_type?: string;
   source_label?: string | null;
   source_url?: string | null;
@@ -764,8 +765,17 @@ export interface EngineInspirationContext {
 
 type EngineIdeaInputSnapshot = Pick<
   Snapshot,
-  "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget"
+  "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget" | "feedback_priors"
 >;
+
+type QueueTelemetry = {
+  signal: number;
+  p95Ms: number | null;
+  idleWorkers: number | null;
+  pending: number | null;
+  metricConfidence: number;
+  evidence: string[];
+};
 
 type EngineIdeaBlueprint = {
   id: string;
@@ -1323,6 +1333,255 @@ function maxSignalScore(
   );
 }
 
+function parseMetricEvidence(text: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!text) return out;
+  const regex = /([A-Za-z0-9_]+)=(-?\d+(?:\.\d+)?)/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const key = match[1]?.toLowerCase();
+    const value = Number(match[2]);
+    if (!key || !Number.isFinite(value)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+function pickFirstFiniteMetric(metrics: Record<string, number>, keys: string[]): number | null {
+  for (const key of keys) {
+    if (!key) continue;
+    const value = metrics[key];
+    if (Number.isFinite(value)) return value as number;
+  }
+  return null;
+}
+
+const QUEUE_LATENCY_METRIC_KEYS = [
+  "queue_p95_ms",
+  "queue_p95",
+  "queue_latency_p95_ms",
+  "queue_latency_p95",
+  "queue_latency_ms",
+  "queue_wait_p95_ms",
+  "queue_wait_p95",
+  "queue_wait_ms",
+  "latency_p95_ms",
+  "latency_p95",
+  "p95_ms",
+  "p95",
+] as const;
+
+const QUEUE_IDLE_METRIC_KEYS = ["idle_workers", "queue_idle_workers", "idle"] as const;
+
+const QUEUE_PENDING_METRIC_KEYS = ["queue_pending", "pending", "queue_backlog", "backlog"] as const;
+
+const QUEUE_LATENCY_METRIC_SET = new Set(QUEUE_LATENCY_METRIC_KEYS);
+const QUEUE_IDLE_METRIC_SET = new Set(QUEUE_IDLE_METRIC_KEYS);
+const QUEUE_PENDING_METRIC_SET = new Set(QUEUE_PENDING_METRIC_KEYS);
+
+function coerceMetricNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const normalized = asString(value);
+    if (!normalized) return null;
+    const commaStripped = normalized.replace(/,/g, "");
+    const unitMatch = commaStripped.match(/^(-?\d+(?:\.\d+)?)(?:\s*(ms|milliseconds|s|sec|seconds))?$/i);
+    if (unitMatch) {
+      const base = Number(unitMatch[1]);
+      if (!Number.isFinite(base)) return null;
+      const unit = (unitMatch[2] ?? "").toLowerCase();
+      if (!unit || unit === "ms" || unit === "milliseconds") return base;
+      if (unit === "s" || unit === "sec" || unit === "seconds") return base * 1000;
+      return base;
+    }
+    const parsed = Number(commaStripped);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const numeric = coerceMetricNumber(entry);
+      if (numeric != null) return numeric;
+    }
+    return null;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (typeof record.unit === "string" && "value" in record) {
+      const base = coerceMetricNumber(record.value);
+      if (base != null) {
+        const unit = asString(record.unit).toLowerCase();
+        if (unit === "ms" || unit === "millisecond" || unit === "milliseconds" || unit === "millis") return base;
+        if (unit === "s" || unit === "sec" || unit === "second" || unit === "seconds") return base * 1000;
+        return base;
+      }
+    }
+    const candidateKeys = [
+      "ms",
+      "millis",
+      "milliseconds",
+      "seconds",
+      "sec",
+      "value",
+      "avg",
+      "average",
+      "mean",
+      "p95",
+      "amount",
+      "reading",
+    ];
+    for (const key of candidateKeys) {
+      if (!(key in record)) continue;
+      const numeric = coerceMetricNumber(record[key]);
+      if (numeric == null) continue;
+      if (key === "seconds" || key === "sec") return numeric * 1000;
+      return numeric;
+    }
+  }
+  return null;
+}
+
+function normalizeQueueSignalEvidence(
+  evidence: unknown,
+): { metrics: Record<string, number>; evidenceStrings: string[] } {
+  const metrics: Record<string, number> = {};
+  const evidenceStrings: string[] = [];
+  const seenEvidence = new Set<string>();
+
+  const recordEvidence = (value: string): void => {
+    const trimmed = asString(value);
+    if (!trimmed || seenEvidence.has(trimmed)) return;
+    seenEvidence.add(trimmed);
+    evidenceStrings.push(trimmed.slice(0, 240));
+  };
+
+  const recordMetric = (key: string, value: unknown): void => {
+    const normalizedKey = asString(key).toLowerCase();
+    if (!normalizedKey) return;
+    const numeric = coerceMetricNumber(value);
+    if (numeric == null) return;
+    const existing = metrics[normalizedKey];
+    if (existing == null) {
+      metrics[normalizedKey] = numeric;
+      return;
+    }
+    if (QUEUE_IDLE_METRIC_SET.has(normalizedKey)) {
+      metrics[normalizedKey] = Math.min(existing, numeric);
+      return;
+    }
+    if (QUEUE_LATENCY_METRIC_SET.has(normalizedKey) || QUEUE_PENDING_METRIC_SET.has(normalizedKey)) {
+      metrics[normalizedKey] = Math.max(existing, numeric);
+      return;
+    }
+    metrics[normalizedKey] = numeric;
+  };
+
+  const visit = (value: unknown, depth = 0): void => {
+    if (depth > 4 || value == null) return;
+    if (typeof value === "string") {
+      const text = asString(value);
+      if (!text) return;
+      recordEvidence(text);
+      const parsedMetrics = parseMetricEvidence(text);
+      for (const [key, numeric] of Object.entries(parsedMetrics)) {
+        recordMetric(key, numeric);
+      }
+      if (/^\s*(?:[{[]|```)/.test(text)) {
+        const parsedJson = parseJsonObject(text);
+        if (Object.keys(parsedJson).length > 0) visit(parsedJson, depth + 1);
+      }
+      return;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      recordEvidence(String(value));
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry, depth + 1);
+      if (value.length > 0 && evidenceStrings.length < 6) {
+        recordEvidence(JSON.stringify(value).slice(0, 240));
+      }
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      const textFields = ["note", "summary", "details", "description", "message"];
+      for (const field of textFields) {
+        if (typeof record[field] === "string") recordEvidence(asString(record[field]));
+      }
+      for (const [key, child] of Object.entries(record)) {
+        recordMetric(key, child);
+        if (typeof child === "string") {
+          visit(child, depth + 1);
+          continue;
+        }
+        if (Array.isArray(child) || (child && typeof child === "object")) {
+          visit(child, depth + 1);
+        }
+      }
+      if (evidenceStrings.length < 6) {
+        recordEvidence(JSON.stringify(record).slice(0, 240));
+      }
+    }
+  };
+
+  visit(evidence);
+  return {
+    metrics,
+    evidenceStrings: evidenceStrings.slice(0, 6),
+  };
+}
+
+function deriveQueueTelemetry(topSignals: EngineIdeaInputSnapshot["top_signals"]): QueueTelemetry {
+  const queueSignals = Array.isArray(topSignals)
+    ? topSignals.filter((signal) => asString(signal.type).toLowerCase() === "queue_health")
+    : [];
+  if (queueSignals.length === 0) {
+    return { signal: 0, p95Ms: null, idleWorkers: null, pending: null, metricConfidence: 0, evidence: [] };
+  }
+  let signal = 0;
+  let p95Ms: number | null = null;
+  let idleWorkers: number | null = null;
+  let pending: number | null = null;
+  const evidence: string[] = [];
+  for (const queueSignal of queueSignals) {
+    signal = Math.max(signal, clamp01(asNumber(queueSignal.value, 0)));
+    const normalizedEvidence = normalizeQueueSignalEvidence(queueSignal.evidence);
+    const latencyCandidate = pickFirstFiniteMetric(normalizedEvidence.metrics, [...QUEUE_LATENCY_METRIC_KEYS]);
+    if (latencyCandidate != null && Number.isFinite(latencyCandidate)) {
+      const latencyValue = latencyCandidate;
+      p95Ms = p95Ms === null ? latencyValue : Math.max(p95Ms, latencyValue);
+    }
+    const idleCandidate = pickFirstFiniteMetric(normalizedEvidence.metrics, [...QUEUE_IDLE_METRIC_KEYS]);
+    if (idleCandidate != null && Number.isFinite(idleCandidate)) {
+      const idleValue = idleCandidate;
+      idleWorkers = idleWorkers === null ? idleValue : Math.min(idleWorkers, idleValue);
+    }
+    const pendingCandidate = pickFirstFiniteMetric(normalizedEvidence.metrics, [...QUEUE_PENDING_METRIC_KEYS]);
+    if (pendingCandidate != null && Number.isFinite(pendingCandidate)) {
+      const pendingValue = pendingCandidate;
+      pending = pending === null ? pendingValue : Math.max(pending, pendingValue);
+    }
+    if (normalizedEvidence.evidenceStrings.length > 0) {
+      evidence.push(...normalizedEvidence.evidenceStrings);
+    } else {
+      const fallbackEvidence = asString(queueSignal.evidence);
+      if (fallbackEvidence) evidence.push(fallbackEvidence);
+    }
+  }
+  const metricConfidence = clamp01(
+    (Number(p95Ms != null) + Number(idleWorkers != null) + Number(pending != null)) / 3,
+  );
+  const dedupedEvidence = [...new Set(evidence.map((entry) => entry.slice(0, 240)))].slice(0, 6);
+  return {
+    signal: clamp01(signal),
+    p95Ms,
+    idleWorkers,
+    pending,
+    metricConfidence,
+    evidence: dedupedEvidence,
+  };
+}
+
 function maxTraitScore(snapshot: EngineIdeaInputSnapshot, pattern: RegExp): number {
   return clamp01(
     Math.max(
@@ -1786,6 +2045,229 @@ function buildCommitHistoryBlocks(params: {
     .sort((a, b) => b.score - a.score);
 }
 
+function selectPriorityIdsFromContext<T extends { id: string }>(
+  entries: T[],
+  preferredOrder: string[],
+  getWeight: (entry: T) => number,
+  maxCount: number,
+): string[] {
+  const limit = Math.max(1, maxCount);
+  const normalized = Array.isArray(entries) ? entries : [];
+  if (normalized.length === 0) return [];
+  const sorted = [...normalized].sort((a, b) => getWeight(b) - getWeight(a));
+  const availableIds = new Set(sorted.map((entry) => entry.id).filter(Boolean) as string[]);
+  const selected: string[] = [];
+  for (const id of preferredOrder) {
+    if (!id || selected.length >= limit) break;
+    if (availableIds.has(id)) selected.push(id);
+  }
+  for (const entry of sorted) {
+    if (!entry.id || selected.includes(entry.id)) continue;
+    selected.push(entry.id);
+    if (selected.length >= limit) break;
+  }
+  return selected.slice(0, limit);
+}
+
+function quantizeQueueSeverity(signal: number): string {
+  if (!Number.isFinite(signal)) return "queue_unknown";
+  if (signal >= 0.85) return "queue_critical";
+  if (signal >= 0.6) return "queue_hot";
+  if (signal >= 0.35) return "queue_warm";
+  if (signal >= 0.15) return "queue_watch";
+  return "queue_calm";
+}
+
+function quantizeLatencyBand(latencyMs: number | null): string {
+  if (typeof latencyMs !== "number" || !Number.isFinite(latencyMs)) return "latency_unknown";
+  const value = latencyMs;
+  if (value >= 240_000) return "latency_extreme";
+  if (value >= 150_000) return "latency_high";
+  if (value >= 90_000) return "latency_elevated";
+  if (value >= 45_000) return "latency_watch";
+  return "latency_normal";
+}
+
+function quantizeIdleBand(idleWorkers: number | null): string {
+  if (typeof idleWorkers !== "number" || !Number.isFinite(idleWorkers)) return "idle_unknown";
+  const value = idleWorkers;
+  if (value <= 0.5) return "idle_dry";
+  if (value <= 1.5) return "idle_low";
+  if (value <= 3) return "idle_constrained";
+  if (value <= 5) return "idle_balanced";
+  return "idle_surplus";
+}
+
+function quantizePendingBand(pending: number | null): string {
+  if (typeof pending !== "number" || !Number.isFinite(pending)) return "pending_unknown";
+  const value = pending;
+  if (value >= 60) return "pending_extreme";
+  if (value >= 30) return "pending_high";
+  if (value >= 15) return "pending_elevated";
+  if (value >= 5) return "pending_watch";
+  return "pending_light";
+}
+
+function buildAdjacentPossibleBlocks(params: {
+  snapshot: EngineIdeaInputSnapshot;
+  queueTelemetry: QueueTelemetry;
+  compiledObjectives: CompiledVisionObjective[];
+  opportunityGaps: EngineOpportunityGap[];
+  dispatchByType: Record<string, number>;
+  dispatchSaturation: number;
+}): EngineIdeaBuildingBlock[] {
+  const priors = Array.isArray(params.snapshot.feedback_priors) ? params.snapshot.feedback_priors : [];
+  if (priors.length === 0) return [];
+  const queueP95Signal =
+    typeof params.queueTelemetry.p95Ms === "number"
+      ? clamp01(params.queueTelemetry.p95Ms / 180_000)
+      : 0;
+  const idleWorkerStress =
+    typeof params.queueTelemetry.idleWorkers === "number"
+      ? clamp01(1 - Math.min(Math.max(params.queueTelemetry.idleWorkers, 0), 6) / 6)
+      : 0;
+  const queueSeverity = clamp01(
+    0.6 * params.queueTelemetry.signal + 0.25 * queueP95Signal + 0.15 * idleWorkerStress,
+  );
+  if (queueSeverity < 0.15) return [];
+  const queueBand = quantizeQueueSeverity(queueSeverity);
+  const latencyBand = quantizeLatencyBand(params.queueTelemetry.p95Ms);
+  const idleBand = quantizeIdleBand(params.queueTelemetry.idleWorkers);
+  const pendingBand = quantizePendingBand(params.queueTelemetry.pending);
+  const motifRows = priors
+    .map((prior) => {
+      const patternKey = asString(prior.pattern_key);
+      if (!patternKey) return null;
+      const emaSuccess = clamp01(asNumber(prior.ema_success, 0));
+      const emaUserAccept = clamp01(asNumber(prior.ema_user_accept, 0));
+      const emaRegret = clamp01(asNumber(prior.ema_regret, 0));
+      const failStreak = Math.max(0, Math.floor(asNumber(prior.fail_streak, 0)));
+      const baseSignal = clamp01(0.5 * emaSuccess + 0.3 * emaUserAccept + 0.2 * (1 - emaRegret));
+      const penalty = Math.min(0.35, 0.07 * failStreak);
+      const motifSignal = clamp01(baseSignal - penalty);
+      return { patternKey, emaSuccess, emaUserAccept, emaRegret, failStreak, motifSignal };
+    })
+    .filter((row): row is NonNullable<typeof row> => Boolean(row) && row.motifSignal > 0.35)
+    .sort((a, b) => b.motifSignal - a.motifSignal)
+    .slice(0, 3);
+  if (motifRows.length === 0) return [];
+  const objectiveIds = selectPriorityIdsFromContext(
+    params.compiledObjectives,
+    ["workforce_scaling", "reliable_autonomous_delivery", "merge_conversion_and_rework"],
+    (entry) => (Number.isFinite(entry.weight) ? entry.weight : 0),
+    3,
+  );
+  const gapIds = selectPriorityIdsFromContext(
+    params.opportunityGaps,
+    ["workforce_throughput_gap", "delivery_reliability_gap", "merge_rework_gap"],
+    (entry) => (Number.isFinite(entry.score) ? entry.score : 0),
+    3,
+  );
+  const candidateShape: EngineCandidateShape = {
+    objective_type: "feature_small",
+    trigger_type: "queue_health",
+    component_area: "apps/remotebuddy",
+    target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+    write_globs: ["apps/remotebuddy/src/**"],
+    risk_level: "low",
+    expected_validation: ["bun run test:root"],
+  };
+  const recentTypeCount = Math.max(
+    0,
+    Math.floor(asNumber(params.dispatchByType[candidateShape.objective_type], 0)),
+  );
+  const noveltySignal = clamp01(1 - recentTypeCount / 6);
+  return motifRows.map((motif) => {
+    const exploitComponent = Math.max(0, 0.45 * motif.motifSignal);
+    const queueComponent = Math.max(0, 0.35 * queueSeverity);
+    const exploreComponent = Math.max(0, 0.12 * noveltySignal);
+    const penaltyComponent = Math.max(0, 0.08 * params.dispatchSaturation);
+    const exploitExploreTotal = Math.max(0, exploitComponent + exploreComponent);
+    const exploitationRatio =
+      exploitExploreTotal > 0 ? clamp01(exploitComponent / exploitExploreTotal) : 0;
+    const explorationRatio =
+      exploitExploreTotal > 0 ? clamp01(exploreComponent / exploitExploreTotal) : 0;
+    const score = clamp01(exploitComponent + queueComponent + exploreComponent - penaltyComponent);
+    const shortKey = motif.patternKey.replace(/^pk_/, "").slice(0, 12) || motif.patternKey.slice(0, 12);
+    const telemetrySummaryParts: string[] = [];
+    if (typeof params.queueTelemetry.p95Ms === "number") {
+      telemetrySummaryParts.push(`queue_p95≈${Math.round(params.queueTelemetry.p95Ms)}ms`);
+    }
+    if (typeof params.queueTelemetry.idleWorkers === "number") {
+      telemetrySummaryParts.push(`idle_workers≈${params.queueTelemetry.idleWorkers}`);
+    }
+    if (typeof params.queueTelemetry.pending === "number") {
+      telemetrySummaryParts.push(`pending≈${Math.round(params.queueTelemetry.pending)}`);
+    }
+    telemetrySummaryParts.push(`queue_band=${queueBand}`);
+    const telemetrySummary = telemetrySummaryParts.join(", ") || `queue_signal=${queueSeverity.toFixed(2)}`;
+    const candidateIdSeed = `${motif.patternKey}|${queueBand}|${latencyBand}|${idleBand}|${pendingBand}`;
+    const candidateHash = sha256(candidateIdSeed).slice(0, 10);
+    const candidateId = `adjacent_${shortKey}_${candidateHash}`;
+    const evidence: string[] = [
+      `motif_pattern=${motif.patternKey}`,
+      `motif_success=${motif.emaSuccess.toFixed(2)}`,
+      `motif_accept=${motif.emaUserAccept.toFixed(2)}`,
+      `motif_regret=${motif.emaRegret.toFixed(2)}`,
+      `motif_fail_streak=${motif.failStreak}`,
+      `queue_signal=${queueSeverity.toFixed(2)}`,
+      `queue_metric_confidence=${params.queueTelemetry.metricConfidence.toFixed(2)}`,
+      `exploit_share=${exploitationRatio.toFixed(2)}`,
+      `explore_share=${explorationRatio.toFixed(2)}`,
+      `dispatch_saturation=${params.dispatchSaturation.toFixed(2)}`,
+      `queue_band=${queueBand}`,
+      `latency_band=${latencyBand}`,
+      `idle_band=${idleBand}`,
+      `pending_band=${pendingBand}`,
+    ];
+    if (typeof params.queueTelemetry.p95Ms === "number") {
+      evidence.push(`queue_p95_ms=${Math.round(params.queueTelemetry.p95Ms)}`);
+    }
+    if (typeof params.queueTelemetry.idleWorkers === "number") {
+      evidence.push(`idle_workers=${params.queueTelemetry.idleWorkers.toFixed(1)}`);
+    }
+    if (typeof params.queueTelemetry.pending === "number") {
+      evidence.push(`queue_pending=${Math.round(params.queueTelemetry.pending)}`);
+    }
+    if (params.queueTelemetry.evidence.length > 0) {
+      evidence.push(`queue_evidence=${params.queueTelemetry.evidence[0]!.slice(0, 80)}`);
+    }
+    return {
+      id: candidateId,
+      algorithm: "adjacent_possible",
+      summary: `Recombine proven motif ${shortKey} with live queue telemetry (${telemetrySummary}) inside RemoteBuddy.`,
+      hypothesis:
+        `Blend motif ${shortKey} (high accept/regret signal) with queue stress (${telemetrySummary}) ` +
+        "to surface adjacent RemoteBuddy guardrails without deviating from trusted scopes.",
+      objective_ids: objectiveIds,
+      gap_ids: gapIds,
+      score,
+      evidence,
+      telemetry: {
+        queue_signal: queueSeverity,
+        queue_p95_ms: params.queueTelemetry.p95Ms ?? null,
+        idle_workers: params.queueTelemetry.idleWorkers ?? null,
+        queue_pending: params.queueTelemetry.pending ?? null,
+        queue_metric_confidence: params.queueTelemetry.metricConfidence,
+        motif_signal: motif.motifSignal,
+        novelty_signal: noveltySignal,
+        exploitation_ratio: exploitationRatio,
+        exploration_ratio: explorationRatio,
+        queue_band: queueBand,
+        latency_band: latencyBand,
+        idle_band: idleBand,
+        pending_band: pendingBand,
+        candidate_hash: candidateHash,
+        exploit_component: exploitComponent,
+        queue_component: queueComponent,
+        explore_component: exploreComponent,
+        penalty_component: penaltyComponent,
+      },
+      candidate_shape: candidateShape,
+    } satisfies EngineIdeaBuildingBlock;
+  }).sort((a, b) => b.score - a.score);
+}
+
 export function buildEngineInspirationContext(params: {
   vision: Pick<VisionContext, "one_sentence" | "key_items" | "section_numbers">;
   snapshot: EngineIdeaInputSnapshot;
@@ -1809,8 +2291,9 @@ export function buildEngineInspirationContext(params: {
     } satisfies CompiledVisionObjective;
   }).sort((a, b) => b.weight - a.weight);
 
+  const queueTelemetry = deriveQueueTelemetry(params.snapshot.top_signals);
   const failureSignal = maxSignalScore(params.snapshot, ["test_failure", "lint_failure", "typecheck_failure"]);
-  const queueSignal = maxSignalScore(params.snapshot, ["queue_health"]);
+  const queueSignal = queueTelemetry.signal;
   const regretSignal = maxSignalScore(params.snapshot, ["regret_signal"]);
   const reliabilityTrait = maxTraitScore(
     params.snapshot,
@@ -1963,8 +2446,21 @@ export function buildEngineInspirationContext(params: {
     dispatchByType,
     dispatchSaturation,
   });
+  const adjacentPossibleBlocks = buildAdjacentPossibleBlocks({
+    snapshot: params.snapshot,
+    queueTelemetry,
+    compiledObjectives,
+    opportunityGaps,
+    dispatchByType,
+    dispatchSaturation,
+  });
   const buildingBlockMap = new Map<string, EngineIdeaBuildingBlock>();
-  for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks]) {
+  for (const block of [
+    ...staticBuildingBlocks,
+    ...externalBlocks,
+    ...historyBlocks,
+    ...adjacentPossibleBlocks,
+  ]) {
     if (!buildingBlockMap.has(block.id)) {
       buildingBlockMap.set(block.id, block);
       continue;
@@ -3174,6 +3670,8 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
 
+      const queueTelemetry = deriveQueueTelemetry(snapshot.top_signals);
+
       this.setPhase("load_vision_context");
       const visionContext = this.loadVisionContext(runId);
       if (!visionContext) {
@@ -3200,6 +3698,7 @@ export class RemoteBuddyAutonomousEngine {
           state_traits: snapshot.state_traits,
           open_objectives: snapshot.open_objectives,
           dispatch_budget: snapshot.dispatch_budget,
+          feedback_priors: snapshot.feedback_priors,
         },
         inspirationPatterns,
         sourceInsights,
@@ -3662,6 +4161,26 @@ export class RemoteBuddyAutonomousEngine {
         row.selection_roll = isSelected ? selection.roll : null;
       }
 
+      const operatorTelemetry = {
+        explore_exploit: {
+          strategy: selection.strategy,
+          roll: selection.roll,
+          effective_rate: adaptiveExplore.effectiveRate,
+          configured_rate: adaptiveExplore.baseRate,
+          adjustment: adaptiveExplore.adjustment,
+          eligible_candidates: eligibleRows.length,
+          total_candidates: rankedWithEligibility.length,
+        },
+        queue: {
+          signal: queueTelemetry.signal,
+          p95_ms: queueTelemetry.p95Ms ?? null,
+          idle_workers: queueTelemetry.idleWorkers ?? null,
+          pending: queueTelemetry.pending ?? null,
+          metric_confidence: queueTelemetry.metricConfidence,
+          metrics_present: queueTelemetry.metricConfidence > 0,
+        },
+      };
+
       if (!selected) {
         this.setPhase("record_rejected_objective");
         await this.postObjective({
@@ -3669,6 +4188,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: snapshot.snapshot_id,
           sessionId: this.sessionId,
           candidates: candidatesPayload,
+          telemetry: operatorTelemetry,
           objective: {
             id: objectiveId,
             candidate_id: top.candidate.id,
@@ -3723,6 +4243,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: snapshot.snapshot_id,
           sessionId: this.sessionId,
           candidates: candidatesPayload,
+          telemetry: operatorTelemetry,
           objective: {
             id: objectiveId,
             candidate_id: selected.candidate.id,
@@ -3844,6 +4365,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: snapshot.snapshot_id,
           sessionId: this.sessionId,
           candidates: candidatesPayload,
+          telemetry: operatorTelemetry,
           objective: {
             id: objectiveId,
             candidate_id: selected.candidate.id,
@@ -3871,6 +4393,7 @@ export class RemoteBuddyAutonomousEngine {
         snapshotId: snapshot.snapshot_id,
         sessionId: this.sessionId,
         candidates: candidatesPayload,
+        telemetry: operatorTelemetry,
         objective: {
           id: objectiveId,
           candidate_id: selected.candidate.id,
