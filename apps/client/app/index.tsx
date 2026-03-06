@@ -32,6 +32,8 @@ import { ConfigPane } from "../src/components/ConfigPane";
 import { usePushPalsSession } from "../src/lib/usePushPalsSession";
 import {
   type AutonomyInsightsSummary,
+  type AutonomyQuestionRow,
+  type AnswerAutonomyQuestionResult,
   type CompletionSnapshotRow,
   type JobSnapshotRow,
   type PendingQueueSnapshot,
@@ -39,7 +41,9 @@ import {
   type RequestSnapshotRow,
   type SystemStatusSummary,
   type WorkerStatusRow,
+  answerAutonomyQuestion,
   fetchAutonomyInsights,
+  fetchAutonomyQuestions,
   fetchCompletionsSnapshot,
   fetchJobsSnapshot,
   fetchRequestsSnapshot,
@@ -151,6 +155,11 @@ export default function DashboardScreen() {
     trustedInspirationShortlist: [],
     archivedInspirationSources: [],
   });
+  const [autonomyQuestions, setAutonomyQuestions] = useState<AutonomyQuestionRow[]>([]);
+  const [autonomyAnswerResults, setAutonomyAnswerResults] = useState<
+    Record<string, AnswerAutonomyQuestionResult>
+  >({});
+  const [autonomyAnswerInFlight, setAutonomyAnswerInFlight] = useState<Record<string, boolean>>({});
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
   const [jobsFilter, setJobsFilter] = useState<{
     requestId: string | null;
@@ -180,14 +189,19 @@ export default function DashboardScreen() {
     }).start();
   }, [activeTab, tabAnim]);
   const refreshObservability = useCallback(async () => {
-    const [workersData, requestData, jobData, completionData, systemData, autonomyData] = await Promise.all([
-      fetchWorkers(DEFAULT_BASE, AUTH_TOKEN),
-      fetchRequestsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
-      fetchJobsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
-      fetchCompletionsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
-      fetchSystemStatus(DEFAULT_BASE, AUTH_TOKEN),
-      fetchAutonomyInsights(DEFAULT_BASE, AUTH_TOKEN, 80),
-    ]);
+    const [workersData, requestData, jobData, completionData, systemData, autonomyData, autonomyQuestionData] =
+      await Promise.all([
+        fetchWorkers(DEFAULT_BASE, AUTH_TOKEN),
+        fetchRequestsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
+        fetchJobsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
+        fetchCompletionsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
+        fetchSystemStatus(DEFAULT_BASE, AUTH_TOKEN),
+        fetchAutonomyInsights(DEFAULT_BASE, AUTH_TOKEN, 80),
+        fetchAutonomyQuestions(DEFAULT_BASE, AUTH_TOKEN, {
+          ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+          limit: 120,
+        }),
+      ]);
 
     setWorkers(workersData);
     setRequests(requestData.requests);
@@ -200,14 +214,55 @@ export default function DashboardScreen() {
     setCompletionCounts(completionData.counts);
     setSystemSummary(systemData);
     setAutonomyInsights(autonomyData);
+    setAutonomyQuestions(autonomyQuestionData);
     setLastRefresh(new Date().toISOString());
-  }, []);
+  }, [session.sessionId]);
 
   useEffect(() => {
     refreshObservability();
     const timer = setInterval(refreshObservability, POLL_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [refreshObservability]);
+
+  const submitAutonomyAnswer = useCallback(
+    async (
+      question: Pick<AutonomyQuestionRow, "id" | "sessionId">,
+      rawAnswerText: string,
+    ): Promise<AnswerAutonomyQuestionResult> => {
+      const text = String(rawAnswerText ?? "").trim();
+      if (!text) {
+        const result: AnswerAutonomyQuestionResult = { ok: false, reason: "Answer cannot be empty." };
+        setAutonomyAnswerResults((prev) => ({ ...prev, [question.id]: result }));
+        return result;
+      }
+
+      let answer: unknown = text;
+      try {
+        answer = JSON.parse(text);
+      } catch {
+        answer = text;
+      }
+
+      setAutonomyAnswerInFlight((prev) => ({ ...prev, [question.id]: true }));
+      try {
+        const result = await answerAutonomyQuestion(
+          DEFAULT_BASE,
+          question.id,
+          answer,
+          AUTH_TOKEN,
+          question.sessionId || session.sessionId || undefined,
+        );
+        setAutonomyAnswerResults((prev) => ({ ...prev, [question.id]: result }));
+        if (result.ok) {
+          await refreshObservability();
+        }
+        return result;
+      } finally {
+        setAutonomyAnswerInFlight((prev) => ({ ...prev, [question.id]: false }));
+      }
+    },
+    [refreshObservability, session.sessionId],
+  );
 
   const sendMessage = useCallback(async () => {
     const text = input.trim();
@@ -557,6 +612,10 @@ export default function DashboardScreen() {
                   workers={workers}
                   systemSummary={systemSummary}
                   autonomyInsights={autonomyInsights}
+                  autonomyQuestions={autonomyQuestions}
+                  autonomyAnswerResults={autonomyAnswerResults}
+                  autonomyAnswerInFlight={autonomyAnswerInFlight}
+                  onSubmitAutonomyAnswer={submitAutonomyAnswer}
                   lastRefresh={lastRefresh}
                 />
               ) : null}

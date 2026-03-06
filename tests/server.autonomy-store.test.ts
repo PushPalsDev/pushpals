@@ -1214,4 +1214,104 @@ describe("server AutonomyStore policy gates", () => {
     });
     expect(queryFiltered.length).toBe(1);
   });
+
+  test("answerQuestion returns resume context and objective can be re-dispatched automatically", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_question_resume" }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_question_resume",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_question_resume",
+        candidate_id: "cand_question_resume",
+        title: "Clarify queue priority objective",
+        instruction: "Implement queue backpressure guardrail for autonomous dispatch.",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "queue_health",
+        target_paths: ["apps/server/src/autonomy.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*"] },
+        confidence: 0.92,
+        risk_level: "low",
+        expected_validation: ["bun run test:root"],
+        status: "blocked",
+        block_reason: "requires_user_input",
+      },
+      question: {
+        id: "q_question_resume",
+        question: "Which queue class should receive priority under contention?",
+        question_type: "bounded_text",
+        expected_answer_schema: { min_length: 3, max_length: 300 },
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const answered = store.answerQuestion(
+      "q_question_resume",
+      "Prioritize interactive tasks first, then normal, while capping background dispatch.",
+    );
+    expect(answered.ok).toBe(true);
+    expect(answered.status).toBe("valid");
+    expect(answered.objectiveId).toBe("obj_question_resume");
+    expect(answered.resume?.objectiveId).toBe("obj_question_resume");
+    expect(answered.resume?.sessionId).toBe("s1");
+    expect(answered.resume?.runId).toBe("run_question_resume");
+    expect(answered.resume?.snapshotId).toBe(snapshotId);
+    expect(answered.resume?.patternKey).toBe(decision.patternKey);
+    expect(answered.resume?.componentArea).toBe("apps/server");
+    expect(answered.resume?.targetPaths).toEqual(["apps/server/src/autonomy.ts"]);
+    expect(answered.resume?.writeGlobs).toEqual(["apps/server/src/*"]);
+    expect(String(answered.resume?.instruction ?? "")).toContain("Prioritize interactive tasks first");
+
+    const db = (store as unknown as { db: any }).db;
+    const gatedBeforeDispatch = db
+      .prepare(`SELECT status FROM autonomy_objectives WHERE id = ?`)
+      .get("obj_question_resume") as { status: string };
+    expect(gatedBeforeDispatch.status).toBe("gated");
+
+    store.markObjectiveDispatched("obj_question_resume", "req_question_resume");
+    const dispatched = db
+      .prepare(`SELECT status, request_id FROM autonomy_objectives WHERE id = ?`)
+      .get("obj_question_resume") as { status: string; request_id: string | null };
+    expect(dispatched.status).toBe("dispatched");
+    expect(dispatched.request_id).toBe("req_question_resume");
+  });
+
+  test("markObjectiveRunningByJobId promotes linked objectives to running", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_running_state" }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_running_state",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_running_state",
+        candidate_id: "cand_running_state",
+        title: "Promote objective to running on claim",
+        instruction: "Run a scoped lint fix",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.91,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "dispatched",
+        request_id: "req_running_state",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    store.linkJobToObjectiveByRequest("req_running_state", "job_running_state");
+    store.markObjectiveRunningByJobId("job_running_state");
+
+    const db = (store as unknown as { db: any }).db;
+    const row = db
+      .prepare(`SELECT status, job_id FROM autonomy_objectives WHERE id = ?`)
+      .get("obj_running_state") as { status: string; job_id: string | null };
+    expect(row.status).toBe("running");
+    expect(row.job_id).toBe("job_running_state");
+  });
 });

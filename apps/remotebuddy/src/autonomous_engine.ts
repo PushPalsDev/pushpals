@@ -217,6 +217,50 @@ const ENGINE_EXPLORE_RATE_MIN = 0.1;
 const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
+const AUTO_INGEST_SEED_PATTERNS: Array<{
+  algorithm: string;
+  whenToUse: string;
+  summary: string;
+  tags: string[];
+  risks: string[];
+  validation: string[];
+  qualityScore: number;
+  freshnessScore: number;
+}> = [
+  {
+    algorithm: "autonomy_dispatch_backpressure_guard",
+    whenToUse: "when worker saturation and queue latency rise together",
+    summary:
+      "Throttle autonomous dispatch based on queue pressure and available idle worker capacity to reduce thrash.",
+    tags: ["queue", "backpressure", "scheduling", "autonomy"],
+    risks: ["Over-throttling can starve high-value opportunities."],
+    validation: ["Replay queue snapshots and confirm p95 latency improves without collapsing throughput."],
+    qualityScore: 0.78,
+    freshnessScore: 0.82,
+  },
+  {
+    algorithm: "objective_scope_guardrail_feedback_loop",
+    whenToUse: "when autonomous outcomes show repeated rework or scope drift",
+    summary:
+      "Use outcome feedback to tighten candidate scope defaults and reduce broad write targets for risky components.",
+    tags: ["scope", "safety", "guardrails", "regret"],
+    risks: ["Can become too conservative and suppress beneficial fixes."],
+    validation: ["Compare regret/reopen rate before and after scope guardrail adjustments."],
+    qualityScore: 0.74,
+    freshnessScore: 0.8,
+  },
+  {
+    algorithm: "engine_novelty_explore_exploit_tuner",
+    whenToUse: "when engine ideas overfit a small set of previously successful patterns",
+    summary:
+      "Adapt exploration rate using recent regret pressure and prior diversity to balance reliability with novelty.",
+    tags: ["bandit", "explore-exploit", "novelty", "engine"],
+    risks: ["Too much exploration can increase failed dispatches."],
+    validation: ["Track novelty diversity and successful dispatch rate across rolling 24h windows."],
+    qualityScore: 0.76,
+    freshnessScore: 0.79,
+  },
+];
 
 type SourceCurationStatus = "candidate" | "trusted" | "watchlist" | "archived";
 
@@ -2551,6 +2595,92 @@ export class RemoteBuddyAutonomousEngine {
     return [...trusted, ...archived];
   }
 
+  private buildAutoInspirationEntries(commitHistoryHints: EngineCommitHistoryHint[]): Array<Record<string, unknown>> {
+    const staticEntries = AUTO_INGEST_SEED_PATTERNS.map((seed) => ({
+      source_type: "internal_doc",
+      source_label: "pushpals:autonomy-engine",
+      source_url: "",
+      algorithm: seed.algorithm,
+      when_to_use: seed.whenToUse,
+      summary: seed.summary,
+      risks: seed.risks,
+      validation: seed.validation,
+      tags: seed.tags,
+      quality_score: seed.qualityScore,
+      freshness_score: seed.freshnessScore,
+      metadata: {
+        origin: "autonomy_engine_seed",
+      },
+    }));
+    const commitEntries = commitHistoryHints.slice(0, 8).map((hint) => ({
+      source_type: "internal_doc",
+      source_label: "pushpals:commit-history",
+      source_url: "",
+      algorithm: `commit_history_${hint.motif_id}`,
+      when_to_use: `when local history repeatedly indicates ${hint.label.toLowerCase()}`,
+      summary:
+        `Local commit history shows recurring ${hint.label.toLowerCase()} motifs (${hint.count} hits). ` +
+        "Bias ideas toward this motif while keeping scope small and testable.",
+      risks: ["Historical bias can overweight past patterns over current needs."],
+      validation: ["Verify motif-driven objectives improve acceptance and reduce reopen rate."],
+      tags: ["local_history", "motif", "autonomy", hint.motif_id],
+      quality_score: clamp01(0.52 + 0.35 * clamp01(hint.signal)),
+      freshness_score: 0.7,
+      metadata: {
+        origin: "autonomy_engine_commit_history",
+        motif_id: hint.motif_id,
+        motif_count: hint.count,
+        objective_ids: hint.objective_ids,
+        gap_ids: hint.gap_ids,
+        sample_subjects: hint.sample_subjects.slice(0, 3),
+      },
+    }));
+    return [...staticEntries, ...commitEntries];
+  }
+
+  private async ingestAutoInspirationPatterns(
+    runId: string,
+    commitHistoryHints: EngineCommitHistoryHint[],
+  ): Promise<void> {
+    const entries = this.buildAutoInspirationEntries(commitHistoryHints);
+    if (entries.length === 0) return;
+    try {
+      const res = await fetch(`${this.server}/autonomy/inspiration/ingest`, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({ entries }),
+      });
+      if (!res.ok) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: automatic inspiration ingest failed with HTTP ${res.status}.`,
+        );
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        inserted?: unknown;
+        updated?: unknown;
+        skipped?: unknown;
+      };
+      if (data.ok === false) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: automatic inspiration ingest returned ok=false.`,
+        );
+        return;
+      }
+      const inserted = Math.max(0, Math.floor(asNumber(data.inserted, 0)));
+      const updated = Math.max(0, Math.floor(asNumber(data.updated, 0)));
+      const skipped = Math.max(0, Math.floor(asNumber(data.skipped, 0)));
+      console.log(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: ingested inspiration seeds (inserted=${inserted} updated=${updated} skipped=${skipped}).`,
+      );
+    } catch (error) {
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: automatic inspiration ingest errored: ${String(error)}`,
+      );
+    }
+  }
+
   private async loadCommitHistoryHints(): Promise<EngineCommitHistoryHint[]> {
     const raw = await gitOutput(this.autonomyRepo, ["log", "--pretty=format:%s", "-n", "180"]);
     if (!raw) return [];
@@ -3010,10 +3140,13 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       this.setPhase("collect_engine_inspiration");
-      const [inspirationPatterns, sourceInsights, commitHistoryHints] = await Promise.all([
+      const commitHistoryHints = await this.loadCommitHistoryHints();
+      this.setPhase("ingest_engine_inspiration");
+      await this.ingestAutoInspirationPatterns(runId, commitHistoryHints);
+      this.setPhase("collect_engine_inspiration");
+      const [inspirationPatterns, sourceInsights] = await Promise.all([
         this.fetchInspirationPatterns(80),
         this.fetchInspirationSourceInsights(160),
-        this.loadCommitHistoryHints(),
       ]);
       const engineInspiration = buildEngineInspirationContext({
         vision: {

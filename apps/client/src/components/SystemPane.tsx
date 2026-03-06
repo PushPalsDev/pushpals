@@ -1,7 +1,9 @@
-import React, { useMemo, useRef } from "react";
-import { ScrollView, StyleSheet, Text, View } from "react-native";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type {
   AutonomyInsightsSummary,
+  AutonomyQuestionRow,
+  AnswerAutonomyQuestionResult,
   SystemStatusSummary,
   WorkerStatusRow,
 } from "../lib/pushpalsApi";
@@ -52,6 +54,17 @@ function summarizeEvent(event: SessionEvent): string {
   return "No payload details";
 }
 
+function serializeUnknown(value: unknown, maxChars = 320): string {
+  if (value == null) return "";
+  if (typeof value === "string") return clip(value, maxChars);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return clip(JSON.stringify(value), maxChars);
+  } catch {
+    return clip(String(value), maxChars);
+  }
+}
+
 export function SystemPane({
   theme,
   events,
@@ -59,6 +72,10 @@ export function SystemPane({
   workers,
   systemSummary,
   autonomyInsights,
+  autonomyQuestions,
+  autonomyAnswerResults,
+  autonomyAnswerInFlight,
+  onSubmitAutonomyAnswer,
   lastRefresh,
 }: {
   theme: DashboardTheme;
@@ -67,6 +84,13 @@ export function SystemPane({
   workers: WorkerStatusRow[];
   systemSummary: SystemStatusSummary;
   autonomyInsights: AutonomyInsightsSummary;
+  autonomyQuestions: AutonomyQuestionRow[];
+  autonomyAnswerResults: Record<string, AnswerAutonomyQuestionResult>;
+  autonomyAnswerInFlight: Record<string, boolean>;
+  onSubmitAutonomyAnswer: (
+    question: Pick<AutonomyQuestionRow, "id" | "sessionId">,
+    answerText: string,
+  ) => Promise<AnswerAutonomyQuestionResult>;
   lastRefresh: string | null;
 }) {
   const INITIALIZING_GRACE_MS = 90_000;
@@ -133,6 +157,50 @@ export function SystemPane({
   const watchlistCount = autonomyInsights.engineSourceStats.filter(
     (row) => row.curationStatus === "watchlist",
   ).length;
+  const [questionDrafts, setQuestionDrafts] = useState<Record<string, string>>({});
+  const actionableQuestionCount = autonomyQuestions.filter(
+    (question) => question.status === "open" || question.status === "invalid",
+  ).length;
+  const invalidQuestionCount = autonomyQuestions.filter(
+    (question) => question.status === "invalid",
+  ).length;
+  const visibleQuestions = useMemo(
+    () =>
+      [...autonomyQuestions]
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .slice(0, 20),
+    [autonomyQuestions],
+  );
+
+  useEffect(() => {
+    setQuestionDrafts((prev) => {
+      const next: Record<string, string> = {};
+      for (const question of autonomyQuestions) {
+        if (typeof prev[question.id] === "string") {
+          next[question.id] = prev[question.id];
+          continue;
+        }
+        if (question.status === "invalid" && question.answer != null) {
+          next[question.id] = serializeUnknown(question.answer, 2000);
+        }
+      }
+      return next;
+    });
+  }, [autonomyQuestions]);
+
+  const submitQuestionAnswer = useCallback(
+    async (question: AutonomyQuestionRow) => {
+      const draft = questionDrafts[question.id] ?? "";
+      const result = await onSubmitAutonomyAnswer(
+        { id: question.id, sessionId: question.sessionId },
+        draft,
+      );
+      if (result.ok && result.status === "valid") {
+        setQuestionDrafts((prev) => ({ ...prev, [question.id]: "" }));
+      }
+    },
+    [onSubmitAutonomyAnswer, questionDrafts],
+  );
 
   const componentRows = [
     {
@@ -218,6 +286,13 @@ export function SystemPane({
           value={String(autonomyInsights.trustedInspirationShortlist.length)}
           detail={`watchlist ${watchlistCount} | archived ${autonomyInsights.archivedInspirationSources.length}`}
           tone="positive"
+          theme={theme}
+        />
+        <MetricTile
+          title="Actionable Questions"
+          value={String(actionableQuestionCount)}
+          detail={`invalid ${invalidQuestionCount} | tracked ${autonomyQuestions.length}`}
+          tone={actionableQuestionCount > 0 ? "warning" : "positive"}
           theme={theme}
         />
         <MetricTile
@@ -356,6 +431,222 @@ export function SystemPane({
             )}
           </View>
         </View>
+      </View>
+
+      <View
+        style={[styles.questionPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}
+      >
+        <View style={styles.rowBetween}>
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            Autonomy Questions
+          </Text>
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            {actionableQuestionCount} actionable / {autonomyQuestions.length} total
+          </Text>
+        </View>
+        {visibleQuestions.length === 0 ? (
+          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            No autonomy questions available yet.
+          </Text>
+        ) : (
+          visibleQuestions.map((question) => {
+            const isActionable = question.status === "open" || question.status === "invalid";
+            const statusTone =
+              question.status === "answered"
+                ? theme.positive
+                : question.status === "invalid"
+                  ? theme.warning
+                  : question.status === "closed"
+                    ? theme.textMuted
+                    : theme.accent;
+            const result = autonomyAnswerResults[question.id];
+            const submitting = Boolean(autonomyAnswerInFlight[question.id]);
+            const schemaText = serializeUnknown(question.expectedAnswerSchema, 260);
+            const contextText = serializeUnknown(question.context, 260);
+            const answerText = serializeUnknown(question.answer, 260);
+            return (
+              <View key={question.id} style={[styles.questionRow, { borderColor: theme.border }]}>
+                <View style={styles.rowBetween}>
+                  <Text
+                    style={[styles.questionTitle, { color: theme.text, fontFamily: theme.fontSans }]}
+                  >
+                    {question.question || "Untitled question"}
+                  </Text>
+                  <View
+                    style={[
+                      styles.statusPill,
+                      {
+                        backgroundColor: `${statusTone}22`,
+                        borderColor: `${statusTone}66`,
+                      },
+                    ]}
+                  >
+                    <Text
+                      style={[styles.statusPillText, { color: statusTone, fontFamily: theme.fontSans }]}
+                    >
+                      {question.status}
+                    </Text>
+                  </View>
+                </View>
+                <Text
+                  style={[styles.questionMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}
+                >
+                  {question.id.slice(0, 8)} | type {question.questionType || "unknown"} | objective{" "}
+                  {question.objectiveId.slice(0, 8) || "--"}
+                </Text>
+                <Text
+                  style={[styles.questionMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                >
+                  created {prettyTs(question.createdAt)} | expires{" "}
+                  {question.expiresAt ? prettyTs(question.expiresAt) : "--"}
+                </Text>
+                {schemaText ? (
+                  <Text
+                    style={[
+                      styles.questionDetail,
+                      { color: theme.textMuted, fontFamily: theme.fontSans },
+                    ]}
+                  >
+                    expected: {schemaText}
+                  </Text>
+                ) : null}
+                {contextText && contextText !== "{}" ? (
+                  <Text
+                    style={[
+                      styles.questionDetail,
+                      { color: theme.textMuted, fontFamily: theme.fontSans },
+                    ]}
+                  >
+                    context: {contextText}
+                  </Text>
+                ) : null}
+                {question.validationError ? (
+                  <Text
+                    style={[
+                      styles.questionValidation,
+                      { color: theme.warning, fontFamily: theme.fontSans },
+                    ]}
+                  >
+                    validation: {question.validationError}
+                  </Text>
+                ) : null}
+                {answerText ? (
+                  <Text
+                    style={[
+                      styles.questionDetail,
+                      { color: theme.textMuted, fontFamily: theme.fontSans },
+                    ]}
+                  >
+                    answer: {answerText}
+                  </Text>
+                ) : null}
+
+                {isActionable ? (
+                  <View style={styles.questionActionRow}>
+                    <TextInput
+                      style={[
+                        styles.questionInput,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: theme.panelAlt,
+                          color: theme.text,
+                          fontFamily: theme.fontMono,
+                        },
+                      ]}
+                      multiline
+                      placeholder="Answer as plain text or JSON"
+                      placeholderTextColor={theme.textMuted}
+                      value={questionDrafts[question.id] ?? ""}
+                      onChangeText={(value) =>
+                        setQuestionDrafts((prev) => ({ ...prev, [question.id]: value }))
+                      }
+                    />
+                    <Pressable
+                      style={[
+                        styles.answerButton,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: submitting ? theme.panelAlt : theme.accentSoft,
+                          opacity: submitting ? 0.7 : 1,
+                        },
+                      ]}
+                      disabled={submitting}
+                      onPress={() => {
+                        void submitQuestionAnswer(question);
+                      }}
+                    >
+                      <Text
+                        style={[
+                          styles.answerButtonText,
+                          { color: theme.accentText, fontFamily: theme.fontSans },
+                        ]}
+                      >
+                        {submitting ? "Submitting..." : "Submit Answer"}
+                      </Text>
+                    </Pressable>
+                  </View>
+                ) : null}
+
+                {result ? (
+                  <View
+                    style={[
+                      styles.answerResult,
+                      {
+                        borderColor: theme.border,
+                        backgroundColor: result.ok
+                          ? result.status === "invalid"
+                            ? `${theme.warning}22`
+                            : `${theme.positive}22`
+                          : `${theme.danger}22`,
+                      },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.answerResultLine,
+                        { color: result.ok ? theme.text : theme.danger, fontFamily: theme.fontSans },
+                      ]}
+                    >
+                      {result.ok
+                        ? `answer ${result.status ?? "accepted"}`
+                        : `answer failed: ${result.reason ?? "unknown error"}`}
+                    </Text>
+                    {result.reason && result.ok ? (
+                      <Text
+                        style={[
+                          styles.answerResultLine,
+                          { color: theme.textMuted, fontFamily: theme.fontSans },
+                        ]}
+                      >
+                        {result.reason}
+                      </Text>
+                    ) : null}
+                    {result.resumedRequestId ? (
+                      <Text
+                        style={[
+                          styles.answerResultLine,
+                          { color: theme.textMuted, fontFamily: theme.fontMono },
+                        ]}
+                      >
+                        resumed request {result.resumedRequestId}
+                      </Text>
+                    ) : null}
+                    {result.resumeError ? (
+                      <Text
+                        style={[
+                          styles.answerResultLine,
+                          { color: theme.danger, fontFamily: theme.fontSans },
+                        ]}
+                      >
+                        resume error: {result.resumeError}
+                      </Text>
+                    ) : null}
+                  </View>
+                ) : null}
+              </View>
+            );
+          })
+        )}
       </View>
 
       <View
@@ -519,6 +810,12 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 10,
   },
+  questionPanel: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 10,
+  },
   insightColumns: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -552,6 +849,71 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 5,
     lineHeight: 17,
+  },
+  questionRow: {
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    marginBottom: 8,
+  },
+  questionTitle: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: "700",
+    marginRight: 8,
+  },
+  questionMeta: {
+    fontSize: 11,
+    marginTop: 3,
+  },
+  questionDetail: {
+    fontSize: 12,
+    marginTop: 4,
+    lineHeight: 17,
+  },
+  questionValidation: {
+    fontSize: 12,
+    marginTop: 4,
+    lineHeight: 17,
+    fontWeight: "600",
+  },
+  questionActionRow: {
+    marginTop: 7,
+  },
+  questionInput: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    minHeight: 70,
+    textAlignVertical: "top",
+    fontSize: 12,
+  },
+  answerButton: {
+    marginTop: 7,
+    alignSelf: "flex-start",
+    borderWidth: 1,
+    borderRadius: 9,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+  },
+  answerButtonText: {
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+  },
+  answerResult: {
+    marginTop: 7,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+  },
+  answerResultLine: {
+    fontSize: 11,
+    lineHeight: 16,
   },
   workerRow: {
     flexDirection: "row",

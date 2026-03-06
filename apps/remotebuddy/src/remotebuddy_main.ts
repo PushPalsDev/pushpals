@@ -718,6 +718,7 @@ class RemoteBuddyOrchestrator {
   private readonly seenJobFailures = new Set<string>();
   private readonly seenJobCompletions = new Set<string>();
   private readonly seenAutonomyFeedbackEvents = new Set<string>();
+  private readonly seenQuestionEvents = new Set<string>();
   private readonly eventMonitorStartedAt = Date.now();
   private jobsDb: Database | null = null;
   private disposed = false;
@@ -953,6 +954,20 @@ class RemoteBuddyOrchestrator {
     return true;
   }
 
+  private markQuestionEventSeen(eventId: string): boolean {
+    const id = String(eventId ?? "").trim();
+    if (!id) return true;
+    if (this.seenQuestionEvents.has(id)) return false;
+    this.seenQuestionEvents.add(id);
+    if (this.seenQuestionEvents.size > 2000) {
+      const oldest = this.seenQuestionEvents.values().next().value;
+      if (typeof oldest === "string" && oldest) {
+        this.seenQuestionEvents.delete(oldest);
+      }
+    }
+    return true;
+  }
+
   private async fetchLatestAutonomyFeedbackInsight(params: {
     objectiveId?: string;
     patternKey?: string;
@@ -1140,12 +1155,66 @@ class RemoteBuddyOrchestrator {
         if (
           envelope.type !== "job_failed" &&
           envelope.type !== "job_completed" &&
-          envelope.type !== "autonomy_feedback_recorded"
+          envelope.type !== "autonomy_feedback_recorded" &&
+          envelope.type !== "question_asked" &&
+          envelope.type !== "question_answered"
         ) {
           return;
         }
         const tsMs = Date.parse(envelope.ts);
         if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
+        if (envelope.type === "question_asked") {
+          if (!this.markQuestionEventSeen(String(envelope.id ?? ""))) return;
+          const payload = asObject(envelope.payload);
+          if (!payload) return;
+          const questionId = toSingleLine(payload.questionId, 128);
+          const objectiveId = toSingleLine(payload.objectiveId, 128);
+          const question = toSingleLine(payload.question, 320);
+          if (!question) return;
+          this.pushContext(
+            `[autonomy_question] objective=${objectiveId || "unknown"} question=${question}`,
+          );
+          this.rememberPersistentMemory(
+            "autonomy_question",
+            `Objective ${objectiveId || "unknown"} requires clarification: ${question}`,
+          );
+          void this.comm.assistantMessage(
+            `Autonomy objective ${objectiveId || "unknown"} needs clarification${questionId ? ` (${questionId})` : ""}: ${question}`,
+            {
+              correlationId: envelope.correlationId,
+              turnId: envelope.turnId,
+              parentId: envelope.id,
+            },
+          );
+          return;
+        }
+        if (envelope.type === "question_answered") {
+          if (!this.markQuestionEventSeen(String(envelope.id ?? ""))) return;
+          const payload = asObject(envelope.payload);
+          if (!payload) return;
+          const questionId = toSingleLine(payload.questionId, 128);
+          const objectiveId = toSingleLine(payload.objectiveId, 128);
+          const status = toSingleLine(payload.status, 32).toLowerCase();
+          const answerSummary = toSingleLine(payload.answerSummary, 280);
+          const contextLine =
+            `[autonomy_question_answered] objective=${objectiveId || "unknown"} ` +
+            `question=${questionId || "unknown"} status=${status || "unknown"}` +
+            (answerSummary ? ` detail=${answerSummary}` : "");
+          this.pushContext(contextLine);
+          this.rememberPersistentMemory("autonomy_question_answered", contextLine);
+          const note =
+            status === "valid"
+              ? `Captured clarification for autonomy objective ${objectiveId || "unknown"}; resuming execution.`
+              : `Clarification answer for autonomy objective ${objectiveId || "unknown"} was invalid${
+                  answerSummary ? `: ${answerSummary}` : "."
+                }`;
+          void this.comm.assistantMessage(note, {
+            correlationId: envelope.correlationId,
+            turnId: envelope.turnId,
+            parentId: envelope.id,
+          });
+          return;
+        }
         if (envelope.type === "autonomy_feedback_recorded") {
           if (!this.markAutonomyFeedbackEventSeen(String(envelope.id ?? ""))) return;
           const payload = asObject(envelope.payload);

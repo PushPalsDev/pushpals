@@ -515,6 +515,32 @@ export interface AutonomyInsightsSummary {
   archivedInspirationSources: AutonomyTrustedInspirationInsightRow[];
 }
 
+export interface AutonomyQuestionRow {
+  id: string;
+  objectiveId: string;
+  sessionId: string;
+  question: string;
+  questionType: string;
+  expectedAnswerSchema: Record<string, unknown>;
+  context: Record<string, unknown>;
+  status: "open" | "answered" | "invalid" | "closed";
+  answer: unknown;
+  answerValidationStatus: string;
+  validationError: string;
+  createdAt: string;
+  answeredAt: string;
+  expiresAt: string;
+}
+
+export interface AnswerAutonomyQuestionResult {
+  ok: boolean;
+  status?: "valid" | "invalid";
+  reason?: string;
+  objectiveId?: string;
+  resumedRequestId?: string;
+  resumeError?: string;
+}
+
 export interface RuntimeConfigMutation {
   scope: "env" | "toml";
   key: string;
@@ -728,6 +754,121 @@ export async function fetchAutonomyInsights(
       trustedInspirationShortlist: [],
       archivedInspirationSources: [],
     };
+  }
+}
+
+export async function fetchAutonomyQuestions(
+  baseUrl: string,
+  authToken?: string,
+  params?: {
+    sessionId?: string;
+    status?: "open" | "answered" | "invalid" | "closed";
+    limit?: number;
+  },
+): Promise<AutonomyQuestionRow[]> {
+  try {
+    const qs = new URLSearchParams();
+    if (params?.sessionId) qs.set("sessionId", params.sessionId);
+    if (params?.status) qs.set("status", params.status);
+    if (typeof params?.limit === "number" && Number.isFinite(params.limit)) {
+      qs.set("limit", String(Math.max(1, Math.min(500, Math.floor(params.limit)))));
+    }
+    const suffix = qs.toString();
+    const response = await fetch(`${baseUrl}/questions${suffix ? `?${suffix}` : ""}`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return [];
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      questions?: Array<Record<string, unknown>>;
+    };
+    if (!payload.ok || !Array.isArray(payload.questions)) return [];
+    return payload.questions
+      .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+      .map((row) => {
+        const record = row as Record<string, unknown>;
+        const statusRaw = String(record.status ?? "").toLowerCase();
+        const status: AutonomyQuestionRow["status"] =
+          statusRaw === "answered" || statusRaw === "invalid" || statusRaw === "closed"
+            ? statusRaw
+            : "open";
+        const expectedAnswerSchema =
+          record.expected_answer_schema &&
+          typeof record.expected_answer_schema === "object" &&
+          !Array.isArray(record.expected_answer_schema)
+            ? (record.expected_answer_schema as Record<string, unknown>)
+            : {};
+        const context =
+          record.context && typeof record.context === "object" && !Array.isArray(record.context)
+            ? (record.context as Record<string, unknown>)
+            : {};
+        return {
+          id: String(record.id ?? ""),
+          objectiveId: String(record.objective_id ?? record.objectiveId ?? ""),
+          sessionId: String(record.session_id ?? record.sessionId ?? ""),
+          question: String(record.question ?? ""),
+          questionType: String(record.question_type ?? record.questionType ?? ""),
+          expectedAnswerSchema,
+          context,
+          status,
+          answer: record.answer ?? null,
+          answerValidationStatus: String(record.answer_validation_status ?? ""),
+          validationError: String(record.validation_error ?? ""),
+          createdAt: String(record.created_at ?? ""),
+          answeredAt: String(record.answered_at ?? ""),
+          expiresAt: String(record.expires_at ?? ""),
+        } satisfies AutonomyQuestionRow;
+      });
+  } catch (err) {
+    console.error("Error fetching autonomy questions:", err);
+    return [];
+  }
+}
+
+export async function answerAutonomyQuestion(
+  baseUrl: string,
+  questionId: string,
+  answer: unknown,
+  authToken?: string,
+  sessionId?: string,
+): Promise<AnswerAutonomyQuestionResult> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+    const response = await fetch(`${baseUrl}/questions/${encodeURIComponent(questionId)}/answer`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        answer,
+        ...(sessionId ? { sessionId } : {}),
+      }),
+    });
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      return {
+        ok: false,
+        reason: typeof payload.reason === "string" ? payload.reason : "Failed to answer question",
+      };
+    }
+    const payload = (await response.json()) as Record<string, unknown>;
+    const statusRaw = String(payload.status ?? "").toLowerCase();
+    return {
+      ok: Boolean(payload.ok),
+      status: statusRaw === "valid" || statusRaw === "invalid" ? statusRaw : undefined,
+      reason: typeof payload.reason === "string" ? payload.reason : undefined,
+      objectiveId:
+        typeof payload.objectiveId === "string"
+          ? payload.objectiveId
+          : typeof payload.objective_id === "string"
+            ? payload.objective_id
+            : undefined,
+      resumedRequestId:
+        typeof payload.resumedRequestId === "string" ? payload.resumedRequestId : undefined,
+      resumeError: typeof payload.resumeError === "string" ? payload.resumeError : undefined,
+    };
+  } catch (err) {
+    console.error("Error answering autonomy question:", err);
+    return { ok: false, reason: String(err) };
   }
 }
 

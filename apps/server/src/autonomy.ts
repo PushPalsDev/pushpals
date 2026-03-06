@@ -457,6 +457,18 @@ function parseJsonArray(raw: string | null): unknown[] {
   }
 }
 
+function formatAnswerForAutonomyInstruction(answer: unknown, maxChars = 1600): string {
+  if (typeof answer === "string") return truncateText(answer.trim(), maxChars);
+  if (typeof answer === "number" || typeof answer === "boolean") return String(answer);
+  if (answer == null) return "";
+  try {
+    const encoded = JSON.stringify(answer, null, 2);
+    return truncateText(encoded, maxChars);
+  } catch {
+    return truncateText(String(answer), maxChars);
+  }
+}
+
 function norm(x: number, min: number, max: number): number {
   if (!Number.isFinite(x) || max <= min) return 0;
   return clamp01((x - min) / (max - min));
@@ -3992,7 +4004,24 @@ export class AutonomyStore {
   answerQuestion(
     questionId: string,
     answer: unknown,
-  ): { ok: boolean; status?: "valid" | "invalid"; reason?: string; objectiveId?: string } {
+  ): {
+    ok: boolean;
+    status?: "valid" | "invalid";
+    reason?: string;
+    objectiveId?: string;
+    sessionId?: string;
+    resume?: {
+      objectiveId: string;
+      sessionId: string;
+      runId: string;
+      snapshotId: string;
+      patternKey: string;
+      componentArea: string;
+      targetPaths: string[];
+      writeGlobs: string[];
+      instruction: string;
+    };
+  } {
     const row = this.db
       .prepare(
         `SELECT id, objective_id, question_type, expected_answer_schema_json, status, expires_at
@@ -4063,7 +4092,70 @@ export class AutonomyStore {
     this.db
       .prepare(`UPDATE autonomy_objectives SET status = 'gated', updated_at = ? WHERE id = ?`)
       .run(now, row.objective_id);
-    return { ok: true, status: "valid", objectiveId: row.objective_id };
+    const objective = this.db
+      .prepare(
+        `SELECT id, run_id, snapshot_id, session_id, pattern_key, component_area, instruction, scope_json
+         FROM autonomy_objectives
+         WHERE id = ?
+         LIMIT 1`,
+      )
+      .get(row.objective_id) as
+      | {
+          id: string;
+          run_id: string | null;
+          snapshot_id: string | null;
+          session_id: string | null;
+          pattern_key: string | null;
+          component_area: string | null;
+          instruction: string | null;
+          scope_json: string | null;
+        }
+      | undefined;
+    const scope = parseJsonObject(objective?.scope_json ?? null);
+    const targetPaths = asStringArray(scope.targetPaths ?? scope.target_paths).slice(0, 64);
+    const writeGlobs = asStringArray(scope.writeGlobs ?? scope.write_globs).slice(0, 64);
+    const sessionId = asString(objective?.session_id);
+    const runId = asString(objective?.run_id);
+    const snapshotId = asString(objective?.snapshot_id);
+    const patternKey = asString(objective?.pattern_key);
+    const componentArea = asString(objective?.component_area);
+    const objectiveInstruction = asString(objective?.instruction);
+    const answerText = formatAnswerForAutonomyInstruction(validation.normalized);
+    const instruction =
+      objectiveInstruction && answerText
+        ? `${objectiveInstruction}\n\nUser clarification:\n${answerText}\n\nApply this clarification while keeping changes scoped to the existing objective boundaries.`
+        : objectiveInstruction || answerText;
+    const resumeEligible =
+      Boolean(objective?.id) &&
+      Boolean(sessionId) &&
+      Boolean(runId) &&
+      Boolean(snapshotId) &&
+      Boolean(patternKey) &&
+      Boolean(componentArea) &&
+      targetPaths.length > 0 &&
+      writeGlobs.length > 0 &&
+      Boolean(instruction);
+    return {
+      ok: true,
+      status: "valid",
+      objectiveId: row.objective_id,
+      ...(sessionId ? { sessionId } : {}),
+      ...(resumeEligible
+        ? {
+            resume: {
+              objectiveId: row.objective_id,
+              sessionId,
+              runId,
+              snapshotId,
+              patternKey,
+              componentArea,
+              targetPaths,
+              writeGlobs,
+              instruction,
+            },
+          }
+        : {}),
+    };
   }
 
   findObjectiveByRequestId(requestId: string): {
@@ -4131,6 +4223,36 @@ export class AutonomyStore {
          WHERE request_id = ? AND (job_id IS NULL OR job_id = '')`,
       )
       .run(jobId, asIsoNow(), requestId);
+  }
+
+  markObjectiveDispatched(objectiveId: string, requestId: string): void {
+    if (!objectiveId || !requestId) return;
+    const now = asIsoNow();
+    this.db
+      .prepare(
+        `UPDATE autonomy_objectives
+         SET status = 'dispatched',
+             request_id = ?,
+             block_reason = NULL,
+             dispatched_at = COALESCE(dispatched_at, ?),
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(requestId, now, now, objectiveId);
+  }
+
+  markObjectiveRunningByJobId(jobId: string): void {
+    if (!jobId) return;
+    this.db
+      .prepare(
+        `UPDATE autonomy_objectives
+         SET status = 'running',
+             block_reason = NULL,
+             updated_at = ?
+         WHERE job_id = ?
+           AND status IN ('dispatched','gated','blocked','needs_clarification')`,
+      )
+      .run(asIsoNow(), jobId);
   }
 
   close(): void {

@@ -167,6 +167,78 @@ export function createRequestHandler() {
         }
         return {};
       };
+      const hasClarificationSignal = (value: string): boolean => {
+        const text = value.toLowerCase();
+        return (
+          text.includes("clarification") ||
+          text.includes("clarify") ||
+          text.includes("follow-up question") ||
+          text.includes("requested clarification")
+        );
+      };
+      const hasNoChangeSignal = (value: string): boolean => {
+        const text = value.toLowerCase();
+        return (
+          text.includes("no file changes") ||
+          text.includes("no changes to commit") ||
+          text.includes("no changes made") ||
+          text.includes("nothing to commit") ||
+          text.includes("modified 0 file") ||
+          text.includes("no modified files were detected") ||
+          text.includes("no file changes detected")
+        );
+      };
+      const classifyAutonomyJobCompletion = (
+        body: Record<string, unknown>,
+      ): {
+        success: boolean;
+        userAction: "applied" | "no_change" | "needs_clarification";
+        reopenedWithin24h: boolean;
+        regressionFlag: boolean;
+      } => {
+        const parts: string[] = [];
+        const summary = compactText(body.summary, 1400);
+        if (summary) parts.push(summary);
+        const detail = compactText(body.detail, 1400);
+        if (detail) parts.push(detail);
+        if (typeof body.result === "string") {
+          parts.push(compactText(body.result, 1400));
+        } else if (body.result && typeof body.result === "object" && !Array.isArray(body.result)) {
+          parts.push(compactText(JSON.stringify(body.result), 1800));
+        }
+        const artifacts = Array.isArray(body.artifacts)
+          ? (body.artifacts.filter((entry) => entry && typeof entry === "object") as Array<
+              Record<string, unknown>
+            >)
+          : [];
+        for (const artifact of artifacts.slice(0, 8)) {
+          const artifactText = compactText(artifact.text ?? artifact.message, 400);
+          if (artifactText) parts.push(artifactText);
+        }
+        const combined = parts.join("\n");
+        if (hasClarificationSignal(combined)) {
+          return {
+            success: false,
+            userAction: "needs_clarification",
+            reopenedWithin24h: true,
+            regressionFlag: false,
+          };
+        }
+        if (hasNoChangeSignal(combined)) {
+          return {
+            success: false,
+            userAction: "no_change",
+            reopenedWithin24h: true,
+            regressionFlag: false,
+          };
+        }
+        return {
+          success: true,
+          userAction: "applied",
+          reopenedWithin24h: false,
+          regressionFlag: false,
+        };
+      };
       const isAutonomyRequestPayload = (value: Record<string, unknown>): boolean => {
         const metadata = value.metadata ?? value.meta;
         if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
@@ -584,6 +656,12 @@ export function createRequestHandler() {
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const workerId = (body.workerId as string) || "unknown";
         const result = jobQueue.claim(workerId);
+        if (result.ok && result.job?.id) {
+          const params = parseJsonRecord(result.job.params ?? "");
+          const requestId = compactText(params.requestId, 128);
+          if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, result.job.id);
+          autonomyStore.markObjectiveRunningByJobId(result.job.id);
+        }
         return makeJson(result, result.ok ? 200 : 404);
       }
 
@@ -1053,7 +1131,55 @@ export function createRequestHandler() {
         const result = autonomyStore.answerQuestion(questionId, body.answer);
         if (!result.ok) return makeJson(result, 400);
 
-        const sessionId = compactText(body.sessionId, 128);
+        const sessionId = compactText(body.sessionId, 128) || compactText(result.sessionId, 128);
+        let resumeError = "";
+        let resumedRequestId = "";
+        if (result.status === "valid" && result.resume) {
+          const enqueueResult = requestQueue.enqueue({
+            sessionId: result.resume.sessionId,
+            prompt: result.resume.instruction,
+            priority: "background",
+            forceWorker: true,
+            forceLane: "worker",
+            metadata: {
+              origin: "autonomy",
+              autonomy: {
+                objectiveId: result.resume.objectiveId,
+                runId: result.resume.runId,
+                snapshotId: result.resume.snapshotId,
+                patternKey: result.resume.patternKey,
+                componentArea: result.resume.componentArea,
+                targetPaths: result.resume.targetPaths,
+                writeGlobs: result.resume.writeGlobs,
+              },
+            },
+          });
+          if (enqueueResult.ok && enqueueResult.requestId) {
+            resumedRequestId = enqueueResult.requestId;
+            autonomyStore.markObjectiveDispatched(result.resume.objectiveId, enqueueResult.requestId);
+            const dispatchSession = sessionManager.getSession(result.resume.sessionId);
+            if (dispatchSession) {
+              dispatchSession.emit({
+                protocolVersion: PROTOCOL_VERSION,
+                id: randomUUID(),
+                ts: new Date().toISOString(),
+                sessionId: result.resume.sessionId,
+                type: "autonomy_objective_dispatched",
+                from: "server:autonomy",
+                payload: {
+                  runId: result.resume.runId,
+                  snapshotId: result.resume.snapshotId,
+                  objectiveId: result.resume.objectiveId,
+                  requestId: enqueueResult.requestId,
+                  patternKey: result.resume.patternKey || "unknown",
+                  origin: "autonomy",
+                },
+              });
+            }
+          } else {
+            resumeError = compactText(enqueueResult.message, 300) || "failed to enqueue autonomy resume request";
+          }
+        }
         const session = sessionId ? sessionManager.getSession(sessionId) : null;
         if (session) {
           session.emit({
@@ -1067,11 +1193,20 @@ export function createRequestHandler() {
               questionId,
               objectiveId: result.objectiveId || "unknown",
               status: result.status === "valid" ? "valid" : "invalid",
-              ...(result.reason ? { answerSummary: compactText(result.reason, 240) } : {}),
+              ...(result.reason || resumeError
+                ? { answerSummary: compactText(result.reason || resumeError, 240) }
+                : {}),
             },
           });
         }
-        return makeJson(result, 200);
+        return makeJson(
+          {
+            ...result,
+            ...(resumedRequestId ? { resumedRequestId } : {}),
+            ...(resumeError ? { resumeError } : {}),
+          },
+          200,
+        );
       }
 
       // GET /jobs
@@ -1156,18 +1291,20 @@ export function createRequestHandler() {
           const params = parseJsonRecord(job?.params ?? "");
           const requestId = compactText(params.requestId, 128);
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
+          autonomyStore.markObjectiveRunningByJobId(jobId);
           const matched = autonomyStore.findObjectiveByJobId(jobId);
           if (matched) {
+            const outcome = classifyAutonomyJobCompletion(body);
             autonomyStore.recordOutcome({
               objectiveId: matched.objectiveId,
               requestId,
               jobId,
               patternKey: matched.patternKey,
-              success: true,
+              success: outcome.success,
               latencyMs: result.durationMs ?? null,
-              userAction: "applied",
-              reopenedWithin24h: false,
-              regressionFlag: false,
+              userAction: outcome.userAction,
+              reopenedWithin24h: outcome.reopenedWithin24h,
+              regressionFlag: outcome.regressionFlag,
             });
           }
         }
