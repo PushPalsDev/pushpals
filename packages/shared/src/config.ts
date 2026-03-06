@@ -131,6 +131,8 @@ export interface PushPalsConfig {
       maxDispatchPerHour: number;
       maxDispatchPerHourByType: Record<string, number>;
       maxDispatchPerHourByComponent: Record<string, number>;
+      maxTokenUsagePerHour: number;
+      maxRuntimeMsPerHour: number;
       cooldownFailStreakThreshold: number;
       cooldownMs: number;
       staleObjectiveTtlMs: number;
@@ -1693,6 +1695,22 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         ),
         maxDispatchPerHourByType: remoteAutonomyDispatchByType,
         maxDispatchPerHourByComponent: remoteAutonomyDispatchByComponent,
+        maxTokenUsagePerHour: Math.max(
+          0,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_TOKEN_USAGE_PER_HOUR") ??
+              remoteAutonomyNode.max_token_usage_per_hour,
+            120_000,
+          ),
+        ),
+        maxRuntimeMsPerHour: Math.max(
+          0,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_RUNTIME_MS_PER_HOUR") ??
+              remoteAutonomyNode.max_runtime_ms_per_hour,
+            5_400_000,
+          ),
+        ),
         cooldownFailStreakThreshold: Math.max(
           1,
           asInt(

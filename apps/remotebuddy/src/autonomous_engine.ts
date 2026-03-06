@@ -125,6 +125,14 @@ type Snapshot = {
     by_type_count_last_hour: Record<string, number>;
     by_component_count_last_hour?: Record<string, number>;
   };
+  resource_budget?: {
+    token_usage_last_hour?: number;
+    runtime_ms_last_hour?: number;
+    token_budget_per_hour?: number;
+    runtime_budget_ms_per_hour?: number;
+    token_budget_exhausted?: boolean;
+    runtime_budget_exhausted?: boolean;
+  };
   safety_state?: {
     kill_switch_enabled?: boolean;
     freeze_until?: string | null;
@@ -3154,6 +3162,15 @@ export class RemoteBuddyAutonomousEngine {
       if (asBoolean(snapshotSafety.is_frozen, false)) {
         const freezeUntil = asString(snapshotSafety.freeze_until);
         outcomeDetail = freezeUntil ? `frozen_until_${freezeUntil}` : "frozen";
+        return;
+      }
+      const snapshotResourceBudget = asObject(snapshot.resource_budget);
+      if (asBoolean(snapshotResourceBudget.token_budget_exhausted, false)) {
+        outcomeDetail = "resource_budget_token_exhausted";
+        return;
+      }
+      if (asBoolean(snapshotResourceBudget.runtime_budget_exhausted, false)) {
+        outcomeDetail = "resource_budget_runtime_exhausted";
         return;
       }
 

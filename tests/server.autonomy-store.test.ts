@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { AutonomyStore } from "../apps/server/src/autonomy";
 
 const stores: AutonomyStore[] = [];
+const tempDirs: string[] = [];
 
 function makeStore(): AutonomyStore {
   const store = new AutonomyStore(":memory:");
@@ -9,9 +13,33 @@ function makeStore(): AutonomyStore {
   return store;
 }
 
+function makePersistentStore(prefix = "pushpals-autonomy-store-"): { store: AutonomyStore; dbPath: string } {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const dbPath = join(root, "autonomy.sqlite");
+  tempDirs.push(root);
+  const store = new AutonomyStore(dbPath);
+  stores.push(store);
+  return { store, dbPath };
+}
+
+function closeTrackedStore(store: AutonomyStore): void {
+  const idx = stores.indexOf(store);
+  if (idx >= 0) stores.splice(idx, 1);
+  store.close();
+}
+
 afterEach(() => {
   while (stores.length > 0) {
     stores.pop()?.close();
+  }
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (!dir) continue;
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup for Windows file lock timing
+    }
   }
 });
 
@@ -502,6 +530,122 @@ describe("server AutonomyStore policy gates", () => {
       firstRejection.includes("max concurrent objectives reached") ||
         firstRejection.includes("budget exceeded"),
     ).toBe(true);
+  });
+
+  test("evaluateEligibility blocks dispatch when hourly token budget is exhausted", () => {
+    const store = makeStore();
+    const autonomyCfg = (
+      store as unknown as {
+        config?: { remotebuddy?: { autonomy?: { maxTokenUsagePerHour?: number } } };
+      }
+    ).config?.remotebuddy?.autonomy;
+    const priorLimit = autonomyCfg?.maxTokenUsagePerHour;
+    if (autonomyCfg) autonomyCfg.maxTokenUsagePerHour = 10;
+
+    try {
+      const snapshotId = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_token_budget",
+      }).snapshot_id;
+
+      const logged = store.recordObjectiveDecision({
+        runId: "run_token_budget",
+        snapshotId,
+        sessionId: "s1",
+        llmCalls: [
+          {
+            id: "llm_token_budget_1",
+            phase: "ideation",
+            tokenUsage: { promptTokens: 7, completionTokens: 5 },
+          },
+        ],
+      });
+      expect(logged.ok).toBe(true);
+
+      const result = store.evaluateEligibility({
+        runId: "run_token_budget",
+        snapshotId,
+        candidates: [
+          {
+            candidate_id: "cand_token_budget",
+            objective_type: "lint_fix",
+            component_area: "apps/server",
+            pattern_key: "pk_token_budget",
+            confidence: 0.95,
+          },
+        ],
+      });
+      expect(result.ok).toBe(true);
+      expect(result.results?.[0]?.ok).toBe(false);
+      expect(String(result.results?.[0]?.reason ?? "")).toContain("token budget exceeded");
+    } finally {
+      if (autonomyCfg && typeof priorLimit === "number") autonomyCfg.maxTokenUsagePerHour = priorLimit;
+    }
+  });
+
+  test("evaluateEligibility blocks dispatch when hourly runtime budget is exhausted", () => {
+    const store = makeStore();
+    const autonomyCfg = (
+      store as unknown as {
+        config?: { remotebuddy?: { autonomy?: { maxRuntimeMsPerHour?: number } } };
+      }
+    ).config?.remotebuddy?.autonomy;
+    const priorLimit = autonomyCfg?.maxRuntimeMsPerHour;
+    if (autonomyCfg) autonomyCfg.maxRuntimeMsPerHour = 1_000;
+
+    try {
+      const snapshotId = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_runtime_budget",
+      }).snapshot_id;
+      const decision = store.recordObjectiveDecision({
+        runId: "run_runtime_budget",
+        snapshotId,
+        sessionId: "s1",
+        objective: {
+          id: "obj_runtime_budget_seed",
+          title: "Runtime budget seed objective",
+          instruction: "Seed runtime usage for budget test.",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          trigger_type: "lint_failure",
+          target_paths: ["apps/server/src/autonomy.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+          confidence: 0.92,
+          risk_level: "low",
+          expected_validation: ["bun run lint"],
+          status: "dispatched",
+        },
+      });
+      expect(decision.ok).toBe(true);
+      const outcome = store.recordOutcome({
+        objectiveId: "obj_runtime_budget_seed",
+        patternKey: decision.patternKey,
+        success: true,
+        userAction: "applied",
+        latencyMs: 1_500,
+      });
+      expect(outcome.ok).toBe(true);
+
+      const result = store.evaluateEligibility({
+        runId: "run_runtime_budget",
+        snapshotId,
+        candidates: [
+          {
+            candidate_id: "cand_runtime_budget",
+            objective_type: "lint_fix",
+            component_area: "apps/server",
+            pattern_key: "pk_runtime_budget",
+            confidence: 0.95,
+          },
+        ],
+      });
+      expect(result.ok).toBe(true);
+      expect(result.results?.[0]?.ok).toBe(false);
+      expect(String(result.results?.[0]?.reason ?? "")).toContain("runtime budget exceeded");
+    } finally {
+      if (autonomyCfg && typeof priorLimit === "number") autonomyCfg.maxRuntimeMsPerHour = priorLimit;
+    }
   });
 
   test("persists candidates with run-scoped ids to prevent cross-run overwrites", () => {
@@ -1426,5 +1570,63 @@ describe("server AutonomyStore policy gates", () => {
       .get("obj_stale_sweep") as { status: string; block_reason: string | null };
     expect(objectiveRow.status).toBe("dead_letter");
     expect(objectiveRow.block_reason).toBe("stale_objective_timeout");
+  });
+
+  test("restart recovery sweep closes stale blocked objective + question without orphans", () => {
+    const { store: firstStore, dbPath } = makePersistentStore("pushpals-autonomy-recovery-");
+    const snapshotId = firstStore.createSnapshot({ sessionId: "s1", runId: "run_restart_recovery" }).snapshot_id;
+    const created = firstStore.recordObjectiveDecision({
+      runId: "run_restart_recovery",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_restart_recovery",
+        candidate_id: "cand_restart_recovery",
+        title: "Pending clarification objective",
+        instruction: "Need clarification before dispatch.",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "queue_health",
+        target_paths: ["apps/server/src/server_main.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun run lint"],
+        status: "blocked",
+        block_reason: "requires_user_input",
+      },
+      question: {
+        id: "q_restart_recovery",
+        question: "Should interactive requests always preempt background work?",
+        question_type: "bounded_text",
+        expected_answer_schema: { min_length: 3, max_length: 300 },
+      },
+    });
+    expect(created.ok).toBe(true);
+
+    const firstDb = (firstStore as unknown as { db: any }).db;
+    firstDb
+      .prepare(`UPDATE autonomy_objectives SET updated_at = datetime('now', '-6 hours') WHERE id = ?`)
+      .run("obj_restart_recovery");
+
+    closeTrackedStore(firstStore);
+    const resumedStore = new AutonomyStore(dbPath);
+    stores.push(resumedStore);
+
+    const sweep = resumedStore.maybeSweepStaleObjectives(new Date(Date.now() + 120_000).toISOString());
+    expect(sweep.ok).toBe(true);
+    expect(sweep.deadLettered).toBeGreaterThanOrEqual(1);
+
+    const resumedDb = (resumedStore as unknown as { db: any }).db;
+    const objectiveRow = resumedDb
+      .prepare(`SELECT status, block_reason FROM autonomy_objectives WHERE id = ?`)
+      .get("obj_restart_recovery") as { status: string; block_reason: string | null };
+    expect(objectiveRow.status).toBe("dead_letter");
+    expect(objectiveRow.block_reason).toBe("stale_objective_timeout");
+    const questionRow = resumedDb
+      .prepare(`SELECT status, closed_reason FROM questions_queue WHERE id = ?`)
+      .get("q_restart_recovery") as { status: string; closed_reason: string | null };
+    expect(questionRow.status).toBe("closed");
+    expect(questionRow.closed_reason).toBe("stale_objective_timeout");
   });
 });

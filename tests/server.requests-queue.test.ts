@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { RequestQueue } from "../apps/server/src/requests";
 
 describe("server RequestQueue", () => {
@@ -239,5 +242,45 @@ describe("server RequestQueue", () => {
     expect(second.requestId).toBe(first.requestId);
     expect(queue.getPendingRequests().length).toBe(1);
     queue.close();
+  });
+
+  test("deduplicates enqueue by idempotency key across queue restart", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-request-queue-restart-"));
+    const dbPath = join(root, "requests.sqlite");
+    let queue: RequestQueue | null = null;
+
+    try {
+      queue = new RequestQueue(dbPath);
+      const first = queue.enqueue({
+        sessionId: "dev",
+        prompt: "resume autonomy objective after crash",
+        priority: "background",
+        idempotencyKey: "autonomy_resume:q_restart",
+      });
+      expect(first.ok).toBe(true);
+      const firstId = String(first.requestId ?? "");
+      expect(firstId.length).toBeGreaterThan(0);
+      queue.close();
+      queue = null;
+
+      queue = new RequestQueue(dbPath);
+      const second = queue.enqueue({
+        sessionId: "dev",
+        prompt: "resume autonomy objective after crash",
+        priority: "background",
+        idempotencyKey: "autonomy_resume:q_restart",
+      });
+      expect(second.ok).toBe(true);
+      expect(second.deduplicated).toBe(true);
+      expect(second.requestId).toBe(firstId);
+      expect(queue.getPendingRequests().length).toBe(1);
+    } finally {
+      queue?.close();
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup for Windows file lock timing
+      }
+    }
   });
 });

@@ -32,6 +32,8 @@ describe("shared config remotebuddy autonomy parsing", () => {
       expect(cfg.remotebuddy.autonomy.exploreRate).toBe(0.3);
       expect(cfg.remotebuddy.autonomy.staleObjectiveTtlMs).toBe(2_700_000);
       expect(cfg.remotebuddy.autonomy.autoFreezeFailStreakThreshold).toBe(3);
+      expect(cfg.remotebuddy.autonomy.maxTokenUsagePerHour).toBe(120_000);
+      expect(cfg.remotebuddy.autonomy.maxRuntimeMsPerHour).toBe(5_400_000);
       expect(cfg.remotebuddy.autonomy.evaluatorWindowHours).toBe(24);
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentRows).toBe(16);
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentChars).toBe(600);
@@ -219,6 +221,37 @@ describe("shared config remotebuddy autonomy parsing", () => {
     try {
       const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
       expect(cfg.remotebuddy.autonomy.killSwitchEnabled).toBe(true);
+    } finally {
+      if (prior == null) delete process.env[key];
+      else process.env[key] = prior;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("REMOTEBUDDY_AUTONOMY_MAX_TOKEN_USAGE_PER_HOUR overrides TOML", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "config");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[remotebuddy.autonomy]",
+        "enabled = true",
+        "max_token_usage_per_hour = 120000",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    const key = "REMOTEBUDDY_AUTONOMY_MAX_TOKEN_USAGE_PER_HOUR";
+    const prior = process.env[key];
+    process.env[key] = "9000";
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.remotebuddy.autonomy.maxTokenUsagePerHour).toBe(9_000);
     } finally {
       if (prior == null) delete process.env[key];
       else process.env[key] = prior;

@@ -256,6 +256,15 @@ export interface AutonomySnapshot {
     by_type_count_last_hour: Record<string, number>;
     by_component_count_last_hour?: Record<string, number>;
   };
+  resource_budget?: {
+    rolling_window_seconds: number;
+    token_usage_last_hour: number;
+    runtime_ms_last_hour: number;
+    token_budget_per_hour: number;
+    runtime_budget_ms_per_hour: number;
+    token_budget_exhausted: boolean;
+    runtime_budget_exhausted: boolean;
+  };
   safety_state?: {
     kill_switch_enabled: boolean;
     freeze_until: string | null;
@@ -493,6 +502,39 @@ function asBoolean(value: unknown, fallback = false): boolean {
 function asNumber(value: unknown, fallback = 0): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function asNonNegativeInt(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.floor(parsed));
+}
+
+function extractTokenUsage(value: unknown): number {
+  const record = asObject(value);
+  const directTotal = asNonNegativeInt(record.totalTokens ?? record.total_tokens ?? record.total);
+  if (directTotal > 0) return directTotal;
+  const prompt = asNonNegativeInt(record.promptTokens ?? record.prompt_tokens ?? record.inputTokens ?? record.input_tokens);
+  const completion = asNonNegativeInt(
+    record.completionTokens ?? record.completion_tokens ?? record.outputTokens ?? record.output_tokens,
+  );
+  if (prompt > 0 || completion > 0) return prompt + completion;
+  const nestedUsage = asObject(record.usage);
+  const nestedTotal = asNonNegativeInt(
+    nestedUsage.totalTokens ?? nestedUsage.total_tokens ?? nestedUsage.total,
+  );
+  if (nestedTotal > 0) return nestedTotal;
+  const nestedPrompt = asNonNegativeInt(
+    nestedUsage.promptTokens ?? nestedUsage.prompt_tokens ?? nestedUsage.inputTokens ?? nestedUsage.input_tokens,
+  );
+  const nestedCompletion = asNonNegativeInt(
+    nestedUsage.completionTokens ??
+      nestedUsage.completion_tokens ??
+      nestedUsage.outputTokens ??
+      nestedUsage.output_tokens,
+  );
+  if (nestedPrompt > 0 || nestedCompletion > 0) return nestedPrompt + nestedCompletion;
+  return 0;
 }
 
 function parseJsonObject(raw: string | null): Record<string, unknown> {
@@ -1375,6 +1417,77 @@ export class AutonomyStore {
     return { globalCount, byType, byComponent };
   }
 
+  private getResourceUsageLastHour(nowIso: string): {
+    tokenUsage: number;
+    runtimeMs: number;
+  } {
+    const tokenRows = this.db
+      .prepare(
+        `SELECT token_usage_json
+         FROM autonomy_llm_calls
+         WHERE datetime(created_at) >= datetime(?, '-1 hour')`,
+      )
+      .all(nowIso) as Array<{ token_usage_json: string | null }>;
+    let tokenUsage = 0;
+    for (const row of tokenRows) {
+      tokenUsage += extractTokenUsage(parseJsonObject(row.token_usage_json));
+    }
+
+    const runtimeRow = this.db
+      .prepare(
+        `SELECT SUM(CASE WHEN latency_ms IS NOT NULL THEN latency_ms ELSE 0 END) AS runtime_ms
+         FROM autonomy_outcomes
+         WHERE datetime(created_at) >= datetime(?, '-1 hour')`,
+      )
+      .get(nowIso) as { runtime_ms: number | null } | undefined;
+    const runtimeMs = Math.max(0, Math.floor(asNumber(runtimeRow?.runtime_ms, 0)));
+    return {
+      tokenUsage: Math.max(0, Math.floor(tokenUsage)),
+      runtimeMs,
+    };
+  }
+
+  private resourceBudgetSnapshot(nowIso = asIsoNow()): {
+    rolling_window_seconds: number;
+    token_usage_last_hour: number;
+    runtime_ms_last_hour: number;
+    token_budget_per_hour: number;
+    runtime_budget_ms_per_hour: number;
+    token_budget_exhausted: boolean;
+    runtime_budget_exhausted: boolean;
+  } {
+    const usage = this.getResourceUsageLastHour(nowIso);
+    const cfg = this.config.remotebuddy.autonomy;
+    const tokenBudget = Math.max(0, Math.floor(asNumber(cfg.maxTokenUsagePerHour, 0)));
+    const runtimeBudgetMs = Math.max(0, Math.floor(asNumber(cfg.maxRuntimeMsPerHour, 0)));
+    return {
+      rolling_window_seconds: 3600,
+      token_usage_last_hour: usage.tokenUsage,
+      runtime_ms_last_hour: usage.runtimeMs,
+      token_budget_per_hour: tokenBudget,
+      runtime_budget_ms_per_hour: runtimeBudgetMs,
+      token_budget_exhausted: usage.tokenUsage >= tokenBudget,
+      runtime_budget_exhausted: usage.runtimeMs >= runtimeBudgetMs,
+    };
+  }
+
+  private resourceBudgetBlockReason(nowIso = asIsoNow()): string | null {
+    const snapshot = this.resourceBudgetSnapshot(nowIso);
+    if (snapshot.token_budget_exhausted) {
+      return (
+        `hourly token budget exceeded (${snapshot.token_usage_last_hour}/` +
+        `${snapshot.token_budget_per_hour})`
+      );
+    }
+    if (snapshot.runtime_budget_exhausted) {
+      return (
+        `hourly runtime budget exceeded (${snapshot.runtime_ms_last_hour}/` +
+        `${snapshot.runtime_budget_ms_per_hour} ms)`
+      );
+    }
+    return null;
+  }
+
   private readSafetyStateRow(): {
     kill_switch_enabled: number;
     freeze_until: string | null;
@@ -1910,6 +2023,30 @@ export class AutonomyStore {
           `Job failure rate high: ${(jobFailureRate * 100).toFixed(1)}% ` +
           `(threshold ${(failureThreshold * 100).toFixed(1)}%)`,
         details: { jobFailureRate, threshold: failureThreshold },
+        nowIso: now,
+      });
+    }
+
+    const resourceBudget = this.resourceBudgetSnapshot(now);
+    if (resourceBudget.token_budget_exhausted) {
+      this.recordOpsAlert({
+        alertType: "resource_budget_token_exhausted",
+        severity: "critical",
+        message:
+          `Hourly autonomy token budget exhausted: ${resourceBudget.token_usage_last_hour}/` +
+          `${resourceBudget.token_budget_per_hour}`,
+        details: resourceBudget,
+        nowIso: now,
+      });
+    }
+    if (resourceBudget.runtime_budget_exhausted) {
+      this.recordOpsAlert({
+        alertType: "resource_budget_runtime_exhausted",
+        severity: "critical",
+        message:
+          `Hourly autonomy runtime budget exhausted: ${resourceBudget.runtime_ms_last_hour}/` +
+          `${resourceBudget.runtime_budget_ms_per_hour} ms`,
+        details: resourceBudget,
         nowIso: now,
       });
     }
@@ -2463,6 +2600,7 @@ export class AutonomyStore {
         open_objectives: snapshot.open_objectives.slice(0, 40),
         repo_health_flags: snapshot.repo_health_flags,
         dispatch_budget: snapshot.dispatch_budget,
+        resource_budget: snapshot.resource_budget,
         payload_hash: payloadHash,
       });
     }
@@ -2476,6 +2614,7 @@ export class AutonomyStore {
       engine_source_priors: snapshot.engine_source_priors.slice(0, 20),
       repo_health_flags: snapshot.repo_health_flags,
       dispatch_budget: snapshot.dispatch_budget,
+      resource_budget: snapshot.resource_budget,
       payload_hash: payloadHash,
       truncated: true,
       truncated_reason: `payload exceeds max_payload_bytes=${replayCfg.maxPayloadBytes}`,
@@ -2730,6 +2869,7 @@ export class AutonomyStore {
       )
       .all() as OpenObjective[];
     const dispatchBudget = this.getDispatchCountsLastHour(now);
+    const resourceBudget = this.resourceBudgetSnapshot(now);
     const stateTraits = this.buildStateTraits({
       nowIso: now,
       requestSlo: params.requestSlo,
@@ -2763,6 +2903,7 @@ export class AutonomyStore {
         by_type_count_last_hour: dispatchBudget.byType,
         by_component_count_last_hour: dispatchBudget.byComponent,
       },
+      resource_budget: resourceBudget,
       safety_state: {
         kill_switch_enabled: safetyState.killSwitchEnabled,
         freeze_until: safetyState.freezeUntil,
@@ -2879,6 +3020,17 @@ export class AutonomyStore {
       const freezeUntil = asString(safety.freeze_until);
       return freezeUntil ? `autonomy frozen until ${freezeUntil}` : "autonomy frozen";
     }
+    const resourceBudget = asObject(payload.resource_budget);
+    if (asBoolean(resourceBudget.token_budget_exhausted, false)) {
+      const usage = Math.max(0, Math.floor(asNumber(resourceBudget.token_usage_last_hour, 0)));
+      const budget = Math.max(0, Math.floor(asNumber(resourceBudget.token_budget_per_hour, 0)));
+      return `hourly token budget exceeded (${usage}/${budget})`;
+    }
+    if (asBoolean(resourceBudget.runtime_budget_exhausted, false)) {
+      const usage = Math.max(0, Math.floor(asNumber(resourceBudget.runtime_ms_last_hour, 0)));
+      const budget = Math.max(0, Math.floor(asNumber(resourceBudget.runtime_budget_ms_per_hour, 0)));
+      return `hourly runtime budget exceeded (${usage}/${budget} ms)`;
+    }
     return null;
   }
 
@@ -2907,6 +3059,7 @@ export class AutonomyStore {
     );
     const preflightErr = this.preflightReason(snapshotId, runId);
     const safetyErr = this.safetyBlockReason(now);
+    const resourceBudgetErr = this.resourceBudgetBlockReason(now);
     const activePatternRows = this.db
       .prepare(
         `SELECT DISTINCT pattern_key AS patternKey
@@ -2981,6 +3134,9 @@ export class AutonomyStore {
       }
       if (safetyErr) {
         return { candidate_id: candidateId, ok: false, reason: safetyErr };
+      }
+      if (resourceBudgetErr) {
+        return { candidate_id: candidateId, ok: false, reason: resourceBudgetErr };
       }
       if (patternKey && activePatternKeys.has(patternKey)) {
         return { candidate_id: candidateId, ok: false, reason: "pattern already has active objective" };
