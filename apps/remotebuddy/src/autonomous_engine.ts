@@ -60,6 +60,8 @@ type AutonomyCandidate = {
     source_fingerprint?: string;
     summary?: string;
     hypothesis?: string;
+    diversity_score?: number;
+    motif_lineage?: string[];
   };
 };
 
@@ -239,6 +241,10 @@ const ENGINE_EXPLORE_RATE_MIN = 0.1;
 const ENGINE_EXPLORE_RATE_MAX = 0.6;
 const ENGINE_NOVELTY_SAMPLE_SATURATION = 12;
 const ENGINE_EXPLORE_POOL_MAX = 3;
+const HIGH_SIGNAL_IMPACT_THRESHOLD = 0.45;
+const LOW_PRESSURE_DIVERSITY_THRESHOLD = 0.35;
+const MAX_REVERSIBLE_TARGET_PATHS = 3;
+const MAX_REVERSIBLE_WRITE_GLOBS = 4;
 const AUTO_INGEST_SEED_PATTERNS: Array<{
   algorithm: string;
   whenToUse: string;
@@ -724,6 +730,8 @@ export interface EngineIdeaBuildingBlock {
   source_curation_reason?: string | null;
   source_trust_score?: number;
   source_freshness_score?: number;
+  diversity_score?: number;
+  motif_lineage?: string[];
 }
 
 export interface EngineCommitHistoryHint {
@@ -765,7 +773,10 @@ export interface EngineInspirationContext {
 type EngineIdeaInputSnapshot = Pick<
   Snapshot,
   "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget"
->;
+> & {
+  engine_idea_priors?: Snapshot["engine_idea_priors"];
+  feedback_priors?: Snapshot["feedback_priors"];
+};
 
 type EngineIdeaBlueprint = {
   id: string;
@@ -804,6 +815,34 @@ function uniqueLowercaseTokens(values: string[], max = 24): string[] {
     if (!normalized || seen.has(normalized)) continue;
     seen.add(normalized);
     out.push(normalized);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function canonicalMotifKey(value: unknown): string {
+  let normalized = asString(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!normalized) return "";
+  if (normalized.startsWith("engine_")) {
+    normalized = normalized.slice(7);
+  }
+  if (normalized.endsWith("_generator")) {
+    normalized = normalized.slice(0, -10);
+  }
+  return normalized;
+}
+
+function canonicalizeMotifLineage(values: string[], max = 24): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const key = canonicalMotifKey(value);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
     if (out.length >= max) break;
   }
   return out;
@@ -1127,6 +1166,10 @@ const ENGINE_IDEA_BLUEPRINTS: EngineIdeaBlueprint[] = [
     },
   },
 ];
+
+const ADJACENT_POSSIBLE_BLUEPRINT = ENGINE_IDEA_BLUEPRINTS.find(
+  (entry) => entry.id === "adjacent_possible_generator",
+);
 
 type InspirationPatternInput = {
   id: string;
@@ -1694,6 +1737,7 @@ function buildExternalInspirationBlocks(params: {
         source_curation_reason: pattern.sourceCurationReason,
         source_trust_score: pattern.sourceTrustScore,
         source_freshness_score: pattern.freshnessScore,
+        motif_lineage: canonicalizeMotifLineage([pattern.algorithm]),
       } satisfies EngineIdeaBuildingBlock;
     })
     .sort((a, b) => b.score - a.score);
@@ -1780,10 +1824,336 @@ function buildCommitHistoryBlocks(params: {
           ...hint.sample_subjects.map((subject) => `commit=${subject}`),
         ],
         candidate_shape: rule.shape,
+        motif_lineage: canonicalizeMotifLineage([hint.motif_id]),
       } satisfies EngineIdeaBuildingBlock;
     })
     .filter((entry): entry is EngineIdeaBuildingBlock => Boolean(entry))
     .sort((a, b) => b.score - a.score);
+}
+
+type QueueTelemetry = {
+  latency: number;
+  pressure: number;
+  idleCapacity: number;
+  zeroLatency: boolean;
+};
+
+function structuredQueueLatencyFromTraits(
+  traits: EngineIdeaInputSnapshot["state_traits"],
+): number | undefined {
+  if (!Array.isArray(traits)) return undefined;
+  let queueHigh: number | undefined;
+  let queueHealthy: number | undefined;
+  for (const trait of traits) {
+    const traitId = asString(trait.trait_id).toLowerCase();
+    const score = clamp01(asNumber(trait.score, 0));
+    if (traitId === "queue_latency_high") {
+      queueHigh = Math.max(queueHigh ?? 0, score);
+    } else if (traitId === "queue_latency_healthy") {
+      queueHealthy = Math.max(queueHealthy ?? 0, score);
+    }
+  }
+  if (typeof queueHigh === "number") return queueHigh;
+  if (typeof queueHealthy === "number") return clamp01(1 - queueHealthy);
+  return undefined;
+}
+
+function evidenceIndicatesZeroLatency(text: string): boolean {
+  const normalized = asString(text).toLowerCase();
+  if (!normalized) return false;
+  if (/\bzero[-\s]*latency\b/.test(normalized)) return true;
+  const zeroPattern =
+    /\b(?:latency|queue_p95|p95)\s*(?:=|:|<=|<)?\s*(?:~\s*)?(?:approx(?:\.|imately)?\s*)?0+(?:\.0+)?\s*(?:ms|milliseconds)?\b/;
+  return zeroPattern.test(normalized);
+}
+
+function deriveQueueTelemetry(snapshot: EngineIdeaInputSnapshot): QueueTelemetry {
+  const queueSignals = snapshot.top_signals.filter(
+    (signal) => asString(signal.type).toLowerCase() === "queue_health",
+  );
+  const signalLatency = clamp01(
+    Math.max(0, ...queueSignals.map((signal) => asNumber(signal.value, 0))),
+  );
+  const structuredLatency = structuredQueueLatencyFromTraits(snapshot.state_traits);
+  const latency = typeof structuredLatency === "number" ? structuredLatency : signalLatency;
+  const dispatchLoad = clamp01(
+    asNumber(snapshot.dispatch_budget?.global_count_last_hour, 0) / 10,
+  );
+  const pressure = clamp01(0.65 * latency + 0.35 * dispatchLoad);
+  const idleCapacity = clamp01(1 - dispatchLoad);
+  const zeroLatency =
+    (typeof structuredLatency === "number" && structuredLatency <= 0.001) ||
+    (queueSignals.length > 0 &&
+      (queueSignals.some((signal) => evidenceIndicatesZeroLatency(signal.evidence)) ||
+        signalLatency <= 0.001));
+  return { latency, pressure, idleCapacity, zeroLatency };
+}
+
+function uniqueStrings(values: string[], max = 8): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = asString(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function buildAdjacentPossibleBlocks(params: {
+  baseBlocks: EngineIdeaBuildingBlock[];
+  queueTelemetry: QueueTelemetry;
+  engineIdeaPriors?: Snapshot["engine_idea_priors"];
+}): EngineIdeaBuildingBlock[] {
+  if (!params.queueTelemetry.zeroLatency) return [];
+  const priors = Array.isArray(params.engineIdeaPriors) ? params.engineIdeaPriors : [];
+  if (priors.length === 0) return [];
+  const blockById = new Map(params.baseBlocks.map((block) => [block.id, block]));
+  type MotifSeed = { block: EngineIdeaBuildingBlock; sampleCount: number; successScore: number };
+  const seeds = priors
+    .map((prior) => {
+      const blockId = asString(prior.engine_building_block_id);
+      const block = blockById.get(blockId);
+      if (!block) return null;
+      const sampleCount = Math.max(0, Math.floor(asNumber(prior.sample_count, 0)));
+      if (sampleCount === 0) return null;
+      const successScore = clamp01(
+        0.35 * clamp01(asNumber(prior.ema_success, 0)) +
+          0.25 * clamp01(asNumber(prior.ema_user_accept, 0)) +
+          0.2 * (1 - clamp01(asNumber(prior.ema_regret, 0))) +
+          0.2 * (1 - clamp01(asNumber(prior.ema_latency, 0))),
+      );
+      if (successScore < 0.55) return null;
+      return { block, sampleCount, successScore } satisfies MotifSeed;
+    })
+    .filter((entry): entry is MotifSeed => Boolean(entry))
+    .sort((a, b) => {
+      if (b.successScore !== a.successScore) return b.successScore - a.successScore;
+      if (b.sampleCount !== a.sampleCount) return b.sampleCount - a.sampleCount;
+      return a.block.id.localeCompare(b.block.id);
+    })
+    .slice(0, 3);
+  if (seeds.length === 0) return [];
+  const candidateShape =
+    ADJACENT_POSSIBLE_BLUEPRINT?.candidate_shape ??
+    defaultCandidateShapeForArea("apps/remotebuddy");
+  const fallbackObjectiveIds =
+    ADJACENT_POSSIBLE_BLUEPRINT?.objective_ids ?? ["workforce_scaling", "reliable_autonomous_delivery"];
+  const fallbackGapIds =
+    ADJACENT_POSSIBLE_BLUEPRINT?.gap_ids ?? ["workforce_throughput_gap", "delivery_reliability_gap"];
+  const queueHeadroom = clamp01(1 - params.queueTelemetry.pressure);
+  const queueReliefSignal = clamp01(
+    0.5 * queueHeadroom +
+      0.3 * params.queueTelemetry.idleCapacity +
+      0.2 * (1 - params.queueTelemetry.latency),
+  );
+  const adjacencyBlocks: EngineIdeaBuildingBlock[] = [];
+  const pairCount = Math.min(seeds.length, 2);
+  for (let idx = 0; idx < pairCount; idx++) {
+    const primary = seeds[idx];
+    const secondary = seeds.length > 1 ? seeds[(idx + 1) % seeds.length] : undefined;
+    const combinedObjectives = uniqueStrings(
+      [...primary.block.objective_ids, ...(secondary ? secondary.block.objective_ids : []), ...fallbackObjectiveIds],
+      4,
+    );
+    const combinedGaps = uniqueStrings(
+      [...primary.block.gap_ids, ...(secondary ? secondary.block.gap_ids : []), ...fallbackGapIds],
+      4,
+    );
+    const motifLabel =
+      secondary && secondary.block.id !== primary.block.id
+        ? `${primary.block.algorithm}/${secondary.block.algorithm}`
+        : primary.block.algorithm;
+    const lineageSources = [
+      ...(primary.block.motif_lineage && primary.block.motif_lineage.length > 0
+        ? primary.block.motif_lineage
+        : [primary.block.algorithm]),
+      ...(secondary
+        ? secondary.block.motif_lineage && secondary.block.motif_lineage.length > 0
+          ? secondary.block.motif_lineage
+          : [secondary.block.algorithm]
+        : []),
+    ];
+    const motifLineage = canonicalizeMotifLineage(lineageSources, 4);
+    const baseDiversity = Math.max(
+      clamp01(primary.block.diversity_score ?? 0),
+      clamp01(secondary?.block.diversity_score ?? 0),
+    );
+    const telemetryBonus = clamp01(0.5 * queueReliefSignal + 0.5 * queueHeadroom);
+    const adjacencyScore = clamp01(
+      0.45 *
+        ((primary.successScore + (secondary?.successScore ?? primary.successScore)) /
+          (secondary ? 2 : 1)) +
+        0.25 * telemetryBonus +
+        0.2 * clamp01(primary.block.score) +
+        0.1 * Math.max(baseDiversity, 0.4),
+    );
+    adjacencyBlocks.push({
+      id: `adjacent_${primary.block.id}_${secondary?.block.id ?? "queue"}`,
+      algorithm: "adjacent_possible",
+      summary:
+        `Use zero-latency queue telemetry (pressure=${params.queueTelemetry.pressure.toFixed(2)}) to explore ${motifLabel} adjacent motifs ` +
+        "without blocking pending work.",
+      hypothesis:
+        "Recombining reversible, proven motifs while latency is zero should surface high-signal objectives " +
+        "with minimal rollback cost.",
+      objective_ids: combinedObjectives,
+      gap_ids: combinedGaps,
+      score: adjacencyScore,
+      evidence: [
+        `primary_success=${primary.successScore.toFixed(2)}`,
+        ...(secondary ? [`secondary_success=${secondary.successScore.toFixed(2)}`] : []),
+        `queue_latency=${params.queueTelemetry.latency.toFixed(2)}`,
+        `queue_headroom=${queueHeadroom.toFixed(2)}`,
+        `queue_pressure=${params.queueTelemetry.pressure.toFixed(2)}`,
+        `motif_lineage=${motifLineage.join("/") || motifLabel.toLowerCase()}`,
+      ],
+      candidate_shape: candidateShape,
+      motif_lineage: motifLineage,
+      source_type: "engine",
+      source_label: "adjacent_possible_generator",
+    });
+  }
+  return adjacencyBlocks;
+}
+
+type MotifDiversityStats = {
+  shareByAlgorithm: Map<string, number>;
+  totalSampleCount: number;
+  topShare: number;
+};
+
+function computeMotifDiversityStats(priors?: Snapshot["engine_idea_priors"]): MotifDiversityStats {
+  const shareByAlgorithm = new Map<string, number>();
+  let totalSampleCount = 0;
+  for (const prior of Array.isArray(priors) ? priors : []) {
+    const algorithm = canonicalMotifKey(prior.engine_algorithm ?? prior.engineAlgorithm);
+    const sampleCount = Math.max(0, Math.floor(asNumber(prior.sample_count, 0)));
+    if (!algorithm || sampleCount === 0) continue;
+    totalSampleCount += sampleCount;
+    shareByAlgorithm.set(algorithm, (shareByAlgorithm.get(algorithm) ?? 0) + sampleCount);
+  }
+  const topCount =
+    totalSampleCount > 0
+      ? Math.max(0, ...Array.from(shareByAlgorithm.values()))
+      : 0;
+  const topShare = totalSampleCount > 0 ? topCount / totalSampleCount : 0;
+  return { shareByAlgorithm, totalSampleCount, topShare };
+}
+
+function applyMotifDiversityAdjustments(params: {
+  blocks: EngineIdeaBuildingBlock[];
+  stats: MotifDiversityStats;
+  queuePressure: number;
+}): EngineIdeaBuildingBlock[] {
+  if (params.blocks.length === 0) return [];
+  const pressureGap =
+    params.queuePressure < LOW_PRESSURE_DIVERSITY_THRESHOLD
+      ? clamp01(
+          (LOW_PRESSURE_DIVERSITY_THRESHOLD - params.queuePressure) /
+            LOW_PRESSURE_DIVERSITY_THRESHOLD,
+        )
+      : 0;
+  const diversityAdjusted: EngineIdeaBuildingBlock[] = [];
+  for (const block of params.blocks) {
+    const algorithmKey = canonicalMotifKey(block.algorithm);
+    const baseShare =
+      params.stats.totalSampleCount > 0 && algorithmKey
+        ? clamp01(
+            (params.stats.shareByAlgorithm.get(algorithmKey) ?? 0) /
+              params.stats.totalSampleCount,
+          )
+        : 0;
+    const lineageTokens =
+      block.motif_lineage && block.motif_lineage.length > 0
+        ? canonicalizeMotifLineage(block.motif_lineage)
+        : algorithmKey
+          ? [algorithmKey]
+          : [];
+    const lineageShares =
+      lineageTokens.length > 0
+        ? lineageTokens.map((token) => {
+            const count = params.stats.shareByAlgorithm.get(token) ?? 0;
+            return params.stats.totalSampleCount > 0
+              ? clamp01(count / params.stats.totalSampleCount)
+              : 0;
+          })
+        : [baseShare];
+    const dominantShare = lineageShares.length > 0 ? Math.max(...lineageShares) : baseShare;
+    const diversityScore =
+      params.stats.totalSampleCount === 0 ? 1 : clamp01(1 - dominantShare);
+    const throttle = pressureGap > 0 ? 0.12 * pressureGap * dominantShare : 0;
+    const adjustedScore = clamp01(block.score - throttle);
+    const evidence =
+      params.stats.totalSampleCount > 0
+        ? [
+            ...block.evidence,
+            `motif_share=${baseShare.toFixed(2)}`,
+            ...(lineageTokens.length > 0
+              ? [`lineage_share=${dominantShare.toFixed(2)}`]
+              : []),
+            `diversity_score=${diversityScore.toFixed(2)}`,
+            ...(throttle > 0 ? [`diversity_throttle=${throttle.toFixed(2)}`] : []),
+          ]
+        : block.evidence;
+    diversityAdjusted.push({
+      ...block,
+      score: adjustedScore,
+      diversity_score: diversityScore,
+      evidence,
+    });
+  }
+  return diversityAdjusted;
+}
+
+function deriveCandidateMotifDiversity(params: {
+  candidate: AutonomyCandidate;
+  stats: MotifDiversityStats;
+}): { tokens: string[]; dominantShare: number; diversityScore: number } {
+  const trialLineage = params.candidate.engine_trial?.motif_lineage;
+  const lineage =
+    Array.isArray(trialLineage) && trialLineage.length > 0
+      ? canonicalizeMotifLineage(trialLineage)
+      : [];
+  const fallbackAlgorithm = canonicalMotifKey(params.candidate.engine_trial?.algorithm);
+  const tokens = lineage.length > 0 ? lineage : fallbackAlgorithm ? [fallbackAlgorithm] : [];
+  if (params.stats.totalSampleCount === 0) {
+    return { tokens, dominantShare: 0, diversityScore: 1 };
+  }
+  const shares = tokens.map((token) => {
+    const count = params.stats.shareByAlgorithm.get(token) ?? 0;
+    return clamp01(count / params.stats.totalSampleCount);
+  });
+  if (shares.length === 0) {
+    return { tokens, dominantShare: 0, diversityScore: 1 };
+  }
+  const dominantShare = Math.max(...shares);
+  const diversityScore = clamp01(1 - dominantShare);
+  return { tokens, dominantShare, diversityScore };
+}
+
+function computeCandidateDiversityThrottle(params: {
+  candidate: AutonomyCandidate;
+  stats: MotifDiversityStats;
+  queuePressure: number;
+}): { diversityScore: number; diversityThrottle: number } {
+  const derived = deriveCandidateMotifDiversity({ candidate: params.candidate, stats: params.stats });
+  const explicitScore = clamp01(asNumber(params.candidate.engine_trial?.diversity_score, 0));
+  const diversityScore = Math.max(explicitScore, derived.diversityScore);
+  const pressureGap =
+    params.queuePressure < LOW_PRESSURE_DIVERSITY_THRESHOLD
+      ? clamp01(
+          (LOW_PRESSURE_DIVERSITY_THRESHOLD - params.queuePressure) /
+            LOW_PRESSURE_DIVERSITY_THRESHOLD,
+        )
+      : 0;
+  if (pressureGap === 0 || derived.dominantShare <= 0) {
+    return { diversityScore, diversityThrottle: 0 };
+  }
+  const throttle = clamp01(0.12 * pressureGap * derived.dominantShare);
+  return { diversityScore, diversityThrottle: throttle };
 }
 
 export function buildEngineInspirationContext(params: {
@@ -1834,6 +2204,7 @@ export function buildEngineInspirationContext(params: {
   );
   const openObjectivePressure = clamp01(params.snapshot.open_objectives.length / 10);
   const dispatchSaturation = clamp01(params.snapshot.dispatch_budget.global_count_last_hour / 10);
+  const queueTelemetry = deriveQueueTelemetry(params.snapshot);
 
   const opportunityGaps: EngineOpportunityGap[] = [
     {
@@ -1915,6 +2286,7 @@ export function buildEngineInspirationContext(params: {
     return {
       ...blueprint,
       score,
+      motif_lineage: canonicalizeMotifLineage([blueprint.algorithm]),
       evidence: [
         `objective_signal=${objectiveSignal.toFixed(2)}`,
         `gap_signal=${gapSignal.toFixed(2)}`,
@@ -1963,8 +2335,14 @@ export function buildEngineInspirationContext(params: {
     dispatchByType,
     dispatchSaturation,
   });
+  const baseBlocks = [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks];
+  const adjacencyBlocks = buildAdjacentPossibleBlocks({
+    baseBlocks,
+    queueTelemetry,
+    engineIdeaPriors: params.snapshot.engine_idea_priors,
+  });
   const buildingBlockMap = new Map<string, EngineIdeaBuildingBlock>();
-  for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks]) {
+  for (const block of [...baseBlocks, ...adjacencyBlocks]) {
     if (!buildingBlockMap.has(block.id)) {
       buildingBlockMap.set(block.id, block);
       continue;
@@ -1974,7 +2352,12 @@ export function buildEngineInspirationContext(params: {
       buildingBlockMap.set(block.id, block);
     }
   }
-  const buildingBlocks = [...buildingBlockMap.values()].sort((a, b) => b.score - a.score);
+  let buildingBlocks = [...buildingBlockMap.values()];
+  buildingBlocks = applyMotifDiversityAdjustments({
+    blocks: buildingBlocks,
+    stats: computeMotifDiversityStats(params.snapshot.engine_idea_priors),
+    queuePressure: queueTelemetry.pressure,
+  }).sort((a, b) => b.score - a.score);
 
   return {
     compiled_objectives: compiledObjectives,
@@ -2101,6 +2484,198 @@ function inferEngineTrialFromCandidate(
   };
 }
 
+type EngineCandidateSourceKind = "engine_fallback" | "engine_adjacent";
+
+function buildCandidatePayloadFromBlock(params: {
+  block: EngineIdeaBuildingBlock;
+  idx: number;
+  objectiveTitleById: Map<string, string>;
+  snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
+  sectionRefs: string[];
+  titlePrefix: string;
+  estimatedEffort: "small" | "medium" | "large";
+  sourceKind: EngineCandidateSourceKind;
+  extraHypotheses?: string[];
+}): Record<string, unknown> {
+  const { block, objectiveTitleById } = params;
+  const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, block.candidate_shape.trigger_type);
+  const objectiveTitles = block.objective_ids
+    .map((id) => objectiveTitleById.get(id))
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .slice(0, 3);
+  const primaryObjectiveTitle = objectiveTitles[0] ?? "vision priorities";
+  const sourceAttribution =
+    block.source_label || block.source_type
+      ? `Source inspiration: ${block.source_label ?? block.source_type}.`
+      : params.sourceKind === "engine_adjacent"
+        ? "Source inspiration: adjacent_possible_generator."
+        : "";
+  const sourceCurationNote =
+    block.source_curation_status && block.source_curation_status !== "candidate"
+      ? `Source curation: ${block.source_curation_status}${
+          block.source_curation_reason ? ` (${block.source_curation_reason})` : ""
+        }.`
+      : "";
+  const sourceKey = deriveInspirationSourceKey({
+    sourceFingerprint: block.source_fingerprint,
+    sourceType: block.source_type,
+    sourceLabel: block.source_label,
+    sourceUrl: block.source_url,
+  });
+  const defaultHypotheses = [
+    block.summary,
+    block.hypothesis,
+    ...(sourceAttribution ? [sourceAttribution] : []),
+    ...(sourceCurationNote ? [sourceCurationNote] : []),
+    ...(params.extraHypotheses ?? []),
+    "Add measurable telemetry and guardrails for autonomous execution.",
+  ].filter(Boolean);
+  return {
+    id: `cand_engine_${block.id}_${randomUUID().slice(0, 8)}`,
+    title: `${params.titlePrefix} ${block.algorithm}`,
+    objective_type: block.candidate_shape.objective_type,
+    problem_statement:
+      `Implement ${block.algorithm} in PushPals autonomy to improve ${primaryObjectiveTitle}. ` +
+      `Deliver a small, test-backed change with clear operational telemetry.`,
+    trigger_type: block.candidate_shape.trigger_type,
+    component_area: block.candidate_shape.component_area,
+    target_paths: block.candidate_shape.target_paths,
+    scope: {
+      read_anywhere: false,
+      write_globs: block.candidate_shape.write_globs,
+    },
+    risk_level: block.candidate_shape.risk_level,
+    expected_validation: block.candidate_shape.expected_validation,
+    estimated_effort: params.estimatedEffort,
+    why_now_signal_ids: signalIds,
+    confidence: clamp01(0.45 + block.score * 0.5),
+    vision_alignment_reason:
+      `Prioritize ${primaryObjectiveTitle} using ${block.algorithm}; score=${block.score.toFixed(2)}.`,
+    vision_section_refs: params.sectionRefs,
+    feature_hypotheses: defaultHypotheses.slice(0, 3),
+    engine_trial: {
+      building_block_id: block.id,
+      algorithm: block.algorithm,
+      source: "engine_fallback",
+      score: block.score,
+      objective_ids: block.objective_ids,
+      gap_ids: block.gap_ids,
+      ...(sourceKey ? { source_key: sourceKey } : {}),
+      ...(block.source_type
+        ? { source_type: block.source_type }
+        : params.sourceKind === "engine_adjacent"
+          ? { source_type: "engine" }
+          : {}),
+      ...(block.source_label
+        ? { source_label: block.source_label }
+        : params.sourceKind === "engine_adjacent"
+          ? { source_label: "adjacent_possible_generator" }
+          : {}),
+      ...(block.source_url ? { source_url: block.source_url } : {}),
+      ...(block.source_fingerprint ? { source_fingerprint: block.source_fingerprint } : {}),
+      ...(typeof block.source_trust_score === "number"
+        ? { source_trust_score: block.source_trust_score }
+        : {}),
+      ...(typeof block.source_freshness_score === "number"
+        ? { source_freshness_score: block.source_freshness_score }
+        : {}),
+      ...(block.source_curation_status ? { source_curation_status: block.source_curation_status } : {}),
+      ...(block.source_curation_reason ? { source_curation_reason: block.source_curation_reason } : {}),
+      ...(typeof block.diversity_score === "number" ? { diversity_score: block.diversity_score } : {}),
+      ...(block.motif_lineage && block.motif_lineage.length > 0 ? { motif_lineage: block.motif_lineage } : {}),
+      summary: block.summary,
+      hypothesis: block.hypothesis,
+    },
+    requires_user_input: false,
+    question_if_blocked: "",
+  } as Record<string, unknown>;
+}
+
+function buildCandidatePayloadsFromBlocks(params: {
+  blocks: EngineIdeaBuildingBlock[];
+  objectiveTitleById: Map<string, string>;
+  snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
+  visionSectionRefs: string[];
+  titlePrefix: string;
+  sourceKind: EngineCandidateSourceKind;
+  estimatedEffortForIndex: (index: number) => "small" | "medium" | "large";
+  extraHypotheses?: string[];
+}): Array<Record<string, unknown>> {
+  const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
+  return params.blocks.map((block, idx) =>
+    buildCandidatePayloadFromBlock({
+      block,
+      idx,
+      objectiveTitleById: params.objectiveTitleById,
+      snapshotTopSignals: params.snapshotTopSignals,
+      sectionRefs,
+      titlePrefix: params.titlePrefix,
+      estimatedEffort: params.estimatedEffortForIndex(idx),
+      sourceKind: params.sourceKind,
+      extraHypotheses: params.extraHypotheses,
+    }),
+  );
+}
+
+
+
+type RankedCandidateForSelection = {
+  candidate: AutonomyCandidate;
+  finalScore: number;
+  engineIdeaNoveltyScore: number;
+  engineIdeaDiversityScore: number;
+  eligibility: { ok: boolean; reason?: string };
+  impactSignal: number;
+  llmScore: number;
+};
+
+function selectionNoveltyScore(row: RankedCandidateForSelection): number {
+  const diversityScore = clamp01(
+    typeof row.engineIdeaDiversityScore === "number"
+      ? row.engineIdeaDiversityScore
+      : asNumber(row.candidate.engine_trial?.diversity_score, 0),
+  );
+  return clamp01(0.6 * row.engineIdeaNoveltyScore + 0.4 * (diversityScore || 0));
+}
+
+export function selectMetaAutonomyCandidate(params: {
+  rows: RankedCandidateForSelection[];
+  adaptiveExploreRate: number;
+  seed: string;
+}): {
+  selectedRow: RankedCandidateForSelection | undefined;
+  strategy: "exploit" | "explore";
+  roll: number;
+  poolType: "reversible_high_signal" | "eligible" | "none";
+} {
+  const eligibleRows = params.rows.filter((row) => row.eligibility.ok);
+  if (eligibleRows.length === 0) {
+    return { selectedRow: undefined, strategy: "exploit", roll: 1, poolType: "none" };
+  }
+  const reversibleHighSignalRows = eligibleRows.filter(
+    (row) => isReversibleCandidate(row.candidate) && isHighSignalSelection(row),
+  );
+  const pool = reversibleHighSignalRows.length > 0 ? reversibleHighSignalRows : eligibleRows;
+  const selection = pickCandidateWithExploreExploit({
+    rows: pool.map((row) => ({
+      id: row.candidate.id,
+      finalScore: row.finalScore,
+      noveltyScore: selectionNoveltyScore(row),
+    })),
+    seed: params.seed,
+    exploreRate: params.adaptiveExploreRate,
+  });
+  const selectedRow = selection.selected
+    ? pool.find((row) => row.candidate.id === selection.selected?.id)
+    : undefined;
+  return {
+    selectedRow,
+    strategy: selectedRow ? selection.strategy : "exploit",
+    roll: selection.roll,
+    poolType: reversibleHighSignalRows.length > 0 ? "reversible_high_signal" : "eligible",
+  };
+}
+
 export function buildEngineFallbackCandidates(params: {
   engineInspiration: EngineInspirationContext;
   snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
@@ -2113,80 +2688,62 @@ export function buildEngineFallbackCandidates(params: {
   const objectiveTitleById = new Map(
     params.engineInspiration.compiled_objectives.map((objective) => [objective.id, objective.title]),
   );
-  const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
-
-  return params.engineInspiration.building_blocks
+  const eligibleBlocks = params.engineInspiration.building_blocks
     .filter((block) => block.score >= 0.42)
-    .slice(0, maxCandidates)
-    .map((block, idx) => {
-      const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, block.candidate_shape.trigger_type);
-      const objectiveTitles = block.objective_ids
-        .map((id) => objectiveTitleById.get(id))
-        .filter((value): value is string => typeof value === "string" && value.length > 0)
-        .slice(0, 3);
-      const primaryObjectiveTitle = objectiveTitles[0] ?? "vision priorities";
-      const sourceAttribution =
-        block.source_label || block.source_type
-          ? `Source inspiration: ${block.source_label ?? block.source_type}.`
-          : "";
-      const sourceCurationNote =
-        block.source_curation_status && block.source_curation_status !== "candidate"
-          ? `Source curation: ${block.source_curation_status}${block.source_curation_reason ? ` (${block.source_curation_reason})` : ""}.`
-          : "";
-      const sourceKey = deriveInspirationSourceKey({
-        sourceFingerprint: block.source_fingerprint,
-        sourceType: block.source_type,
-        sourceLabel: block.source_label,
-        sourceUrl: block.source_url,
-      });
-      return {
-        id: `cand_engine_${block.id}_${randomUUID().slice(0, 8)}`,
-        title: `Engine building block: ${block.algorithm}`,
-        objective_type: block.candidate_shape.objective_type,
-        problem_statement:
-          `Implement ${block.algorithm} in PushPals autonomy to improve ${primaryObjectiveTitle}. ` +
-          `Deliver a small, test-backed change with clear operational telemetry.`,
-        trigger_type: block.candidate_shape.trigger_type,
-        component_area: block.candidate_shape.component_area,
-        target_paths: block.candidate_shape.target_paths,
-        scope: {
-          read_anywhere: false,
-          write_globs: block.candidate_shape.write_globs,
-        },
-        risk_level: block.candidate_shape.risk_level,
-        expected_validation: block.candidate_shape.expected_validation,
-        estimated_effort: idx === 0 ? "small" : "medium",
-        why_now_signal_ids: signalIds,
-        confidence: clamp01(0.45 + block.score * 0.5),
-        vision_alignment_reason:
-          `Prioritize ${primaryObjectiveTitle} using ${block.algorithm}; score=${block.score.toFixed(2)}.`,
-        vision_section_refs: sectionRefs,
-        feature_hypotheses: [
-          block.summary,
-          block.hypothesis,
-          ...(sourceAttribution ? [sourceAttribution] : []),
-          ...(sourceCurationNote ? [sourceCurationNote] : []),
-          `Add measurable telemetry and guardrails for ${block.algorithm}.`,
-        ].slice(0, 3),
-        engine_trial: {
-          building_block_id: block.id,
-          algorithm: block.algorithm,
-          source: "engine_fallback",
-          score: block.score,
-          objective_ids: block.objective_ids,
-          gap_ids: block.gap_ids,
-          ...(sourceKey ? { source_key: sourceKey } : {}),
-          ...(block.source_type ? { source_type: block.source_type } : {}),
-          ...(block.source_label ? { source_label: block.source_label } : {}),
-          ...(block.source_url ? { source_url: block.source_url } : {}),
-          ...(block.source_fingerprint ? { source_fingerprint: block.source_fingerprint } : {}),
-          summary: block.summary,
-          hypothesis: block.hypothesis,
-        },
-        requires_user_input: false,
-        question_if_blocked: "",
-      } as Record<string, unknown>;
-    });
+    .slice(0, maxCandidates);
+  return buildCandidatePayloadsFromBlocks({
+    blocks: eligibleBlocks,
+    objectiveTitleById,
+    snapshotTopSignals: params.snapshotTopSignals,
+    visionSectionRefs: params.visionSectionRefs,
+    titlePrefix: "Engine building block:",
+    sourceKind: "engine_fallback",
+    estimatedEffortForIndex: (idx) => (idx === 0 ? "small" : "medium"),
+  });
+}
+
+function buildAdjacentObjectiveCandidates(params: {
+  engineInspiration: EngineInspirationContext;
+  snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
+  visionSectionRefs: string[];
+  maxCandidates?: number;
+}): Array<Record<string, unknown>> {
+  const maxCandidates = Number.isFinite(params.maxCandidates)
+    ? Math.max(1, Math.min(3, Math.floor(params.maxCandidates as number)))
+    : 2;
+  const objectiveTitleById = new Map(
+    params.engineInspiration.compiled_objectives.map((objective) => [objective.id, objective.title]),
+  );
+  const adjacencyBlocks = params.engineInspiration.building_blocks
+    .filter((block) => block.algorithm === "adjacent_possible" && block.score >= 0.38)
+    .slice(0, maxCandidates);
+  if (adjacencyBlocks.length === 0) return [];
+  return buildCandidatePayloadsFromBlocks({
+    blocks: adjacencyBlocks,
+    objectiveTitleById,
+    snapshotTopSignals: params.snapshotTopSignals,
+    visionSectionRefs: params.visionSectionRefs,
+    titlePrefix: "Adjacent motif block:",
+    sourceKind: "engine_adjacent",
+    estimatedEffortForIndex: () => "small",
+    extraHypotheses: ["Zero-latency queue telemetry allows reversible adjacency exploration."],
+  });
+}
+
+function isReversibleCandidate(candidate: AutonomyCandidate): boolean {
+  if (candidate.risk_level !== "low") return false;
+  if (candidate.scope.read_anywhere) return false;
+  if (candidate.estimated_effort && candidate.estimated_effort !== "small") return false;
+  if (candidate.target_paths.length > MAX_REVERSIBLE_TARGET_PATHS) return false;
+  if (candidate.scope.write_globs.length > MAX_REVERSIBLE_WRITE_GLOBS) return false;
+  return true;
+}
+
+function isHighSignalSelection(row: { impactSignal: number; llmScore: number }): boolean {
+  return (
+    row.impactSignal >= HIGH_SIGNAL_IMPACT_THRESHOLD ||
+    row.llmScore >= 0.65
+  );
 }
 
 function asBoolean(value: unknown, fallback = false): boolean {
@@ -2898,7 +3455,12 @@ export class RemoteBuddyAutonomousEngine {
     );
   }
 
-  private scoreCandidate(snapshot: Snapshot, candidate: AutonomyCandidate, llmScore: number) {
+  private scoreCandidate(
+    snapshot: Snapshot,
+    candidate: AutonomyCandidate,
+    llmScore: number,
+    opts: { queueTelemetry: QueueTelemetry; motifDiversityStats: MotifDiversityStats },
+  ) {
     const patternKey = makePatternKey(
       candidate.objective_type,
       candidate.target_paths,
@@ -2987,11 +3549,17 @@ export class RemoteBuddyAutonomousEngine {
       sourcePriorSignal.noveltyBonus +
       sourcePriorSignal.trustBoost -
       penaltyTotal(normalizedPenalties);
+    const { diversityScore, diversityThrottle } = computeCandidateDiversityThrottle({
+      candidate,
+      stats: opts.motifDiversityStats,
+      queuePressure: opts.queueTelemetry.pressure,
+    });
+    const finalScoreWithDiversity = clamp01(finalScore + 0.02 * diversityScore - diversityThrottle);
     return {
       patternKey,
       impactSignal,
       penalties: normalizedPenalties,
-      finalScore,
+      finalScore: finalScoreWithDiversity,
       emaSuccess: priorSignal.emaSuccess,
       emaUserAccept: priorSignal.emaUserAccept,
       emaLatency: priorSignal.emaLatency,
@@ -3009,6 +3577,7 @@ export class RemoteBuddyAutonomousEngine {
       engineSourceCurationStatus: sourcePriorSignal.curationStatus,
       engineSourceCurationReason: sourcePriorSignal.curationReason,
       engineSourceTrustBoost: sourcePriorSignal.trustBoost,
+      engineIdeaDiversityScore: diversityScore,
     };
   }
 
@@ -3173,6 +3742,8 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "resource_budget_runtime_exhausted";
         return;
       }
+      const queueTelemetry = deriveQueueTelemetry(snapshot);
+      const motifDiversityStats = computeMotifDiversityStats(snapshot.engine_idea_priors);
 
       this.setPhase("load_vision_context");
       const visionContext = this.loadVisionContext(runId);
@@ -3200,6 +3771,8 @@ export class RemoteBuddyAutonomousEngine {
           state_traits: snapshot.state_traits,
           open_objectives: snapshot.open_objectives,
           dispatch_budget: snapshot.dispatch_budget,
+          engine_idea_priors: snapshot.engine_idea_priors,
+          feedback_priors: snapshot.feedback_priors,
         },
         inspirationPatterns,
         sourceInsights,
@@ -3394,6 +3967,18 @@ export class RemoteBuddyAutonomousEngine {
         }
       };
       ingestRawCandidates(rawCandidates, "llm");
+      const adjacencySlots = Math.max(0, this.cfg.topK - normalizedCandidates.length);
+      if (queueTelemetry.zeroLatency && adjacencySlots > 0) {
+        const adjacencySeeds = buildAdjacentObjectiveCandidates({
+          engineInspiration,
+          snapshotTopSignals: snapshot.top_signals,
+          visionSectionRefs: visionContext.section_numbers,
+          maxCandidates: Math.min(2, adjacencySlots),
+        });
+        if (adjacencySeeds.length > 0) {
+          ingestRawCandidates(adjacencySeeds, "engine_fallback");
+        }
+      }
       if (normalizedCandidates.length === 0) {
         const synthesizedFallback = buildEngineFallbackCandidates({
           engineInspiration,
@@ -3496,7 +4081,10 @@ export class RemoteBuddyAutonomousEngine {
 
       const scored = normalizedCandidates.map((candidate) => {
         const llmScore = scoreById.get(candidate.id) ?? 0;
-        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore);
+        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore, {
+          queueTelemetry,
+          motifDiversityStats,
+        });
         return { candidate, llmScore, ...scoredCandidate };
       });
       scored.sort((a, b) => {
@@ -3573,6 +4161,7 @@ export class RemoteBuddyAutonomousEngine {
         engine_source_curation_status: row.engineSourceCurationStatus,
         engine_source_curation_reason: row.engineSourceCurationReason,
         engine_source_trust_boost: row.engineSourceTrustBoost,
+        engine_idea_diversity_score: row.engineIdeaDiversityScore,
         explore_rate_configured: adaptiveExplore.baseRate,
         effective_explore_rate: adaptiveExplore.effectiveRate,
         explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -3601,20 +4190,14 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "no_ranked_candidate";
         return;
       }
-      const eligibleRows = rankedWithEligibility.filter((row) => row.eligibility.ok);
-      const selection = pickCandidateWithExploreExploit({
-        rows: eligibleRows.map((row) => ({
-          id: row.candidate.id,
-          finalScore: row.finalScore,
-          noveltyScore: row.engineIdeaNoveltyScore,
-        })),
-        seed: `${runId}:${snapshot.snapshot_id}:${snapshot.snapshot_created_at}`,
-        exploreRate: adaptiveExplore.effectiveRate,
+      const selectionSeed = `${runId}:${snapshot.snapshot_id}:${snapshot.snapshot_created_at}`;
+      const selectionResult = selectMetaAutonomyCandidate({
+        rows: rankedWithEligibility,
+        adaptiveExploreRate: adaptiveExplore.effectiveRate,
+        seed: selectionSeed,
       });
-      const selected = selection.selected
-        ? eligibleRows.find((row) => row.candidate.id === selection.selected?.id)
-        : undefined;
-      const selectedStrategy = selected ? selection.strategy : "exploit";
+      const selected = selectionResult.selectedRow;
+      const selectedStrategy = selected ? selectionResult.strategy : "exploit";
       const objectiveId = `obj_${randomUUID().slice(0, 8)}`;
       selectedCandidatePayload = selected
         ? {
@@ -3632,8 +4215,9 @@ export class RemoteBuddyAutonomousEngine {
             vision_section_refs: selected.candidate.vision_section_refs,
             feature_hypotheses: selected.candidate.feature_hypotheses,
             ...(selected.candidate.engine_trial ? { engine_trial: selected.candidate.engine_trial } : {}),
+            engine_idea_diversity_score: selected.engineIdeaDiversityScore,
             selection_strategy: selectedStrategy,
-            selection_roll: selection.roll,
+            selection_roll: selectionResult.roll,
             effective_explore_rate: adaptiveExplore.effectiveRate,
           }
         : {
@@ -3651,6 +4235,7 @@ export class RemoteBuddyAutonomousEngine {
             vision_section_refs: top.candidate.vision_section_refs,
             feature_hypotheses: top.candidate.feature_hypotheses,
             ...(top.candidate.engine_trial ? { engine_trial: top.candidate.engine_trial } : {}),
+            engine_idea_diversity_score: top.engineIdeaDiversityScore,
             selection_strategy: "none",
             selection_roll: null,
             effective_explore_rate: adaptiveExplore.effectiveRate,
@@ -3659,7 +4244,7 @@ export class RemoteBuddyAutonomousEngine {
         const isSelected = Boolean(row.id === selectedCandidatePayload.id);
         row.selected = isSelected;
         row.selection_strategy = isSelected && selected ? selectedStrategy : "not_selected";
-        row.selection_roll = isSelected ? selection.roll : null;
+        row.selection_roll = isSelected ? selectionResult.roll : null;
       }
 
       if (!selected) {
@@ -3761,7 +4346,7 @@ export class RemoteBuddyAutonomousEngine {
               explore_rate_adjustment: adaptiveExplore.adjustment,
               final_score: selected.finalScore,
               selection_strategy: selectedStrategy,
-              selection_roll: selection.roll,
+              selection_roll: selectionResult.roll,
             },
           },
           question: {
@@ -3909,7 +4494,7 @@ export class RemoteBuddyAutonomousEngine {
             explore_rate_adjustment: adaptiveExplore.adjustment,
             final_score: selected.finalScore,
             selection_strategy: selectedStrategy,
-            selection_roll: selection.roll,
+            selection_roll: selectionResult.roll,
           },
         },
         llmCalls,
@@ -3992,4 +4577,327 @@ export class RemoteBuddyAutonomousEngine {
     }
     this.nextTickAtMs = 0;
   }
+}
+
+const shouldRegisterAutonomyEngineTests =
+  typeof Bun !== "undefined" &&
+  Array.isArray(Bun.argv) &&
+  Bun.argv.length > 1 &&
+  Bun.argv[1] === "test";
+
+const globalAutonomyTestState = globalThis as typeof globalThis & {
+  __REMOTE_BUDDY_AUTONOMY_TESTS_REGISTERED?: boolean;
+};
+
+if (shouldRegisterAutonomyEngineTests && !globalAutonomyTestState.__REMOTE_BUDDY_AUTONOMY_TESTS_REGISTERED) {
+  globalAutonomyTestState.__REMOTE_BUDDY_AUTONOMY_TESTS_REGISTERED = true;
+  import("bun:test")
+    .then(({ describe, expect, test }) => {
+      const makeSnapshot = (
+        overrides: Partial<EngineIdeaInputSnapshot>,
+      ): EngineIdeaInputSnapshot => ({
+        top_signals: [],
+        state_traits: [],
+        open_objectives: [],
+        dispatch_budget: { global_count_last_hour: 0, by_type_count_last_hour: {} },
+        ...overrides,
+      });
+
+      const baseCandidateShape = defaultCandidateShapeForArea("apps/remotebuddy");
+
+      const makeCandidate = (overrides: Partial<AutonomyCandidate>): AutonomyCandidate => ({
+        id: overrides.id ?? randomUUID(),
+        title: overrides.title ?? "Test Candidate",
+        objective_type: overrides.objective_type ?? "feature_small",
+        problem_statement: overrides.problem_statement ?? "Do something useful.",
+        trigger_type: overrides.trigger_type ?? "queue_health",
+        component_area: overrides.component_area ?? "apps/remotebuddy",
+        target_paths: overrides.target_paths ?? baseCandidateShape.target_paths,
+        scope: overrides.scope ?? { read_anywhere: false, write_globs: baseCandidateShape.write_globs },
+        risk_level: overrides.risk_level ?? "low",
+        expected_validation: overrides.expected_validation ?? ["bun run test:root"],
+        estimated_effort: overrides.estimated_effort ?? "small",
+        why_now_signal_ids: overrides.why_now_signal_ids ?? [],
+        confidence: overrides.confidence ?? 0.7,
+        vision_alignment_reason: overrides.vision_alignment_reason ?? "test",
+        vision_section_refs: overrides.vision_section_refs ?? ["6"],
+        feature_hypotheses: overrides.feature_hypotheses ?? ["test hypothesis"],
+        requires_user_input: overrides.requires_user_input ?? false,
+        question_if_blocked: overrides.question_if_blocked ?? "",
+        candidate_created_at: overrides.candidate_created_at ?? new Date().toISOString(),
+        engine_trial: overrides.engine_trial,
+      });
+
+      const makeMotifDiversityFixture = () => {
+        const stats: MotifDiversityStats = {
+          shareByAlgorithm: new Map([
+            ["motif_alpha", 8],
+            ["motif_beta", 2],
+          ]),
+          totalSampleCount: 10,
+          topShare: 0.8,
+        };
+        const repeated: EngineIdeaBuildingBlock = {
+          id: "repeat",
+          algorithm: "motif_alpha",
+          summary: "repeat",
+          hypothesis: "repeat",
+          objective_ids: [],
+          gap_ids: [],
+          score: 0.6,
+          evidence: [],
+          candidate_shape: baseCandidateShape,
+          motif_lineage: ["motif_alpha"],
+        };
+        const novel: EngineIdeaBuildingBlock = {
+          ...repeated,
+          id: "novel",
+          algorithm: "motif_beta",
+          motif_lineage: ["motif_beta"],
+          score: 0.55,
+        };
+        return { stats, repeated, novel };
+      };
+
+      describe("RemoteBuddy autonomous engine inline tests", () => {
+        test("deriveQueueTelemetry prefers structured queue traits over noisy signals", () => {
+          const snapshot = makeSnapshot({
+            state_traits: [
+              {
+                trait_id: "queue_latency_high",
+                category: "weakness",
+                focus: "queue",
+                score: 0.8,
+                evidence: "request queue p95=200000ms",
+              },
+            ],
+            top_signals: [
+              {
+                signal_id: "queue_sig",
+                type: "queue_health",
+                value: 0.1,
+                evidence: "queue_p95=120000",
+              },
+            ],
+          });
+          const telemetry = deriveQueueTelemetry(snapshot);
+          expect(telemetry.latency).toBeCloseTo(0.8);
+          expect(telemetry.zeroLatency).toBe(false);
+        });
+
+        test("deriveQueueTelemetry infers zero latency from healthy trait even without signals", () => {
+          const snapshot = makeSnapshot({
+            state_traits: [
+              {
+                trait_id: "queue_latency_healthy",
+                category: "strength",
+                focus: "queue",
+                score: 1,
+                evidence: "request queue p95=0ms",
+              },
+            ],
+          });
+          const telemetry = deriveQueueTelemetry(snapshot);
+          expect(telemetry.zeroLatency).toBe(true);
+          expect(telemetry.latency).toBeLessThanOrEqual(0.001);
+        });
+
+        test("deriveQueueTelemetry handles variant evidence strings for regex fallback", () => {
+          const snapshot = makeSnapshot({
+            top_signals: [
+              {
+                signal_id: "queue_variant",
+                type: "queue_health",
+                value: 0.05,
+                evidence: "Queue p95 approx 0ms (idle=1)",
+              },
+            ],
+          });
+          expect(deriveQueueTelemetry(snapshot).zeroLatency).toBe(true);
+        });
+
+        test("deriveQueueTelemetry ignores ambiguous evidence strings without numeric zeros", () => {
+          const snapshot = makeSnapshot({
+            top_signals: [
+              {
+                signal_id: "queue_ambiguous",
+                type: "queue_health",
+                value: 0.05,
+                evidence: "latency maybe zero-ish",
+              },
+            ],
+          });
+          expect(deriveQueueTelemetry(snapshot).zeroLatency).toBe(false);
+        });
+
+        test("adjacent-possible blocks only emit when queue latency is zero", () => {
+          const motifA: EngineIdeaBuildingBlock = {
+            id: "seed_a",
+            algorithm: "motif_alpha",
+            summary: "alpha",
+            hypothesis: "alpha-h",
+            objective_ids: ["workforce_scaling"],
+            gap_ids: ["workforce_throughput_gap"],
+            score: 0.66,
+            evidence: [],
+            candidate_shape: baseCandidateShape,
+            motif_lineage: ["motif_alpha"],
+            diversity_score: 0.8,
+          };
+          const motifB: EngineIdeaBuildingBlock = {
+            ...motifA,
+            id: "seed_b",
+            algorithm: "motif_beta",
+            motif_lineage: ["motif_beta"],
+            score: 0.62,
+          };
+          const priors = [
+            {
+              engine_building_block_id: "seed_a",
+              engine_algorithm: "motif_alpha",
+              sample_count: 5,
+              ema_success: 0.82,
+              ema_user_accept: 0.71,
+              ema_regret: 0.12,
+              ema_latency: 0.08,
+            },
+            {
+              engine_building_block_id: "seed_b",
+              engine_algorithm: "motif_beta",
+              sample_count: 4,
+              ema_success: 0.78,
+              ema_user_accept: 0.69,
+              ema_regret: 0.1,
+              ema_latency: 0.07,
+            },
+          ];
+          const zeroTelemetry: QueueTelemetry = {
+            latency: 0,
+            pressure: 0.2,
+            idleCapacity: 0.9,
+            zeroLatency: true,
+          };
+          const adjacency = buildAdjacentPossibleBlocks({
+            baseBlocks: [motifA, motifB],
+            queueTelemetry: zeroTelemetry,
+            engineIdeaPriors: priors,
+          });
+          expect(adjacency.length).toBeGreaterThan(0);
+          expect(adjacency[0].summary.toLowerCase()).toContain("zero-latency queue telemetry");
+          expect(adjacency[0].motif_lineage?.length ?? 0).toBeGreaterThan(0);
+          const busyTelemetry: QueueTelemetry = { ...zeroTelemetry, zeroLatency: false };
+          expect(
+            buildAdjacentPossibleBlocks({
+              baseBlocks: [motifA, motifB],
+              queueTelemetry: busyTelemetry,
+              engineIdeaPriors: priors,
+            }),
+          ).toHaveLength(0);
+        });
+
+        test("motif diversity throttles repeat motifs under low queue pressure", () => {
+          const { stats, repeated, novel } = makeMotifDiversityFixture();
+          const adjusted = applyMotifDiversityAdjustments({
+            blocks: [repeated, novel],
+            stats,
+            queuePressure: 0.1,
+          });
+          const repeatBlock = adjusted.find((block) => block.id === "repeat");
+          const novelBlock = adjusted.find((block) => block.id === "novel");
+          expect(repeatBlock?.score).toBeLessThan(repeated.score);
+          expect(novelBlock?.score).toBeCloseTo(novel.score);
+        });
+
+        test("motif diversity leaves urgent repeats untouched when pressure is high", () => {
+          const { stats, repeated, novel } = makeMotifDiversityFixture();
+          const adjusted = applyMotifDiversityAdjustments({
+            blocks: [repeated, novel],
+            stats,
+            queuePressure: 0.85,
+          });
+          const repeatBlock = adjusted.find((block) => block.id === "repeat");
+          const novelBlock = adjusted.find((block) => block.id === "novel");
+          expect(repeatBlock?.score).toBeCloseTo(repeated.score);
+          expect(novelBlock?.score).toBeCloseTo(novel.score);
+        });
+
+        test("candidate diversity throttle penalizes repeats only under low pressure", () => {
+          const { stats } = makeMotifDiversityFixture();
+          const candidate = makeCandidate({
+            engine_trial: {
+              building_block_id: "seed_repeat",
+              algorithm: "motif_alpha",
+              source: "engine_fallback",
+              objective_ids: [],
+              gap_ids: [],
+              diversity_score: 0.4,
+              motif_lineage: ["motif_alpha"],
+            },
+          });
+          const lowPressure = computeCandidateDiversityThrottle({
+            candidate,
+            stats,
+            queuePressure: 0.1,
+          });
+          expect(lowPressure.diversityThrottle).toBeGreaterThan(0);
+          const highPressure = computeCandidateDiversityThrottle({
+            candidate,
+            stats,
+            queuePressure: 0.9,
+          });
+          expect(highPressure.diversityThrottle).toBe(0);
+        });
+
+        test("meta-autonomy selection prefers reversible adjacent candidates when high-signal", () => {
+          const adjacent = makeCandidate({
+            id: "adjacent",
+            engine_trial: {
+              building_block_id: "bb_adj",
+              algorithm: "adjacent_possible",
+              source: "engine_fallback",
+              source_label: "adjacent_possible_generator",
+            },
+          });
+          const broad = makeCandidate({
+            id: "broad",
+            scope: { read_anywhere: true, write_globs: baseCandidateShape.write_globs },
+            engine_trial: { building_block_id: "bb2", algorithm: "motif_beta", source: "engine_fallback" },
+          });
+          const rows: RankedCandidateForSelection[] = [
+            {
+              candidate: adjacent,
+              finalScore: 0.7,
+              engineIdeaNoveltyScore: 0.4,
+              engineIdeaDiversityScore: 0.9,
+              impactSignal: 0.62,
+              llmScore: 0.7,
+              eligibility: { ok: true },
+            },
+            {
+              candidate: broad,
+              finalScore: 0.82,
+              engineIdeaNoveltyScore: 0.3,
+              engineIdeaDiversityScore: 0.2,
+              impactSignal: 0.2,
+              llmScore: 0.45,
+              eligibility: { ok: true },
+            },
+          ];
+          const preferred = selectMetaAutonomyCandidate({
+            rows,
+            adaptiveExploreRate: 0,
+            seed: "seed:1",
+          });
+          expect(preferred.selectedRow?.candidate.id).toBe("adjacent");
+
+          const fallback = selectMetaAutonomyCandidate({
+            rows: rows.map((row) => ({ ...row, impactSignal: 0.2, llmScore: 0.5 })),
+            adaptiveExploreRate: 0,
+            seed: "seed:2",
+          });
+          expect(fallback.selectedRow?.candidate.id).toBe("broad");
+        });
+      });
+    })
+    .catch(() => {});
 }
