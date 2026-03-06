@@ -777,6 +777,100 @@ type EngineIdeaBlueprint = {
   candidate_shape: EngineCandidateShape;
 };
 
+type QueueContextTelemetry = {
+  queue_signal: number;
+  dispatch_pressure: number;
+  global_dispatch_last_hour: number;
+  objective_type_pressure: Array<{ objective_type: string; count: number }>;
+  component_pressure: Array<{ component_area: string; count: number }>;
+};
+
+type MotifAdjacencyDraft = {
+  draft_id: string;
+  adjacency_rank: number;
+  emphasis: "startup_first" | "merge_first";
+  adjacency_score: number;
+  adjacency_rank_signal: number;
+  merged_objective_ids: string[];
+  merged_gap_ids: string[];
+  summary: string;
+  objective_brief: string;
+  objective_outline: string[];
+  motif_mix: Array<{ motif_id: string; label: string; signal: number }>;
+  queue_signal: number;
+  dispatch_pressure: number;
+};
+
+type PlannerMotifTelemetry = {
+  motif_mix: Array<{
+    draft_id: string;
+    adjacency_rank: number;
+    adjacency_score: number;
+    motif_id: string;
+    label: string;
+    signal: number;
+    queue_signal: number;
+    dispatch_pressure: number;
+  }>;
+  queue_context: QueueContextTelemetry;
+  adjacency_objective_drafts: MotifAdjacencyDraft[];
+};
+
+type PlannerInputArtifacts = {
+  plannerInput: {
+    candidate: AutonomyCandidate;
+    adjacency_objective_drafts: MotifAdjacencyDraft[];
+    queue_context: QueueContextTelemetry;
+  };
+  telemetry: PlannerMotifTelemetry;
+};
+
+type PlannerMotifLogStage =
+  | "planning_start"
+  | "lock_failed_before_planning"
+  | "planning_snapshot_expired"
+  | "lock_failed_before_enqueue"
+  | "planning_failed"
+  | "enqueue_failed"
+  | "dispatched";
+
+function logPlannerMotifTelemetry(params: {
+  runId: string;
+  stage: PlannerMotifLogStage;
+  telemetry: PlannerMotifTelemetry;
+}): void {
+  const { motif_mix: motifMix, queue_context: queueContext, adjacency_objective_drafts: drafts } =
+    params.telemetry;
+  const motifSummary =
+    motifMix.length === 0
+      ? "none"
+      : motifMix
+          .map(
+            (mix) =>
+              `${mix.draft_id}#${mix.adjacency_rank}:${mix.motif_id}@${mix.signal.toFixed(2)}`,
+          )
+          .join(", ");
+  const queueSummary = [
+    `queue_signal=${queueContext.queue_signal.toFixed(2)}`,
+    `dispatch_pressure=${queueContext.dispatch_pressure.toFixed(2)}`,
+    `global_dispatch_last_hour=${queueContext.global_dispatch_last_hour}`,
+  ].join(" ");
+  console.log(
+    `[RemoteBuddyAutonomousEngine] tick ${params.runId} [${params.stage}] planner_motif_mix=${motifSummary} queue_context=${queueSummary}`,
+    {
+      motif_mix: motifMix,
+      queue_context: queueContext,
+      adjacency_ranks: drafts.map((draft) => ({
+        draft_id: draft.draft_id,
+        adjacency_rank: draft.adjacency_rank,
+        adjacency_score: Number(draft.adjacency_score.toFixed(3)),
+        adjacency_rank_signal: Number(draft.adjacency_rank_signal.toFixed(3)),
+        emphasis: draft.emphasis,
+      })),
+    },
+  );
+}
+
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
@@ -1225,6 +1319,22 @@ const COMMIT_MOTIF_RULES: CommitMotifRule[] = [
     motifId: "merge_rework_loop",
     label: "Merge/rework loop hardening",
     pattern: /\b(merge|conflict|rebase|review|pr|churn|rework|unmergeable)\b/i,
+    objectiveIds: ["merge_conversion_and_rework", "reliable_autonomous_delivery"],
+    gapIds: ["merge_rework_gap", "delivery_reliability_gap"],
+    shape: {
+      objective_type: "feature_small",
+      trigger_type: "regret_signal",
+      component_area: "apps/server",
+      target_paths: ["apps/server/src/autonomy.ts"],
+      write_globs: ["apps/server/src/*"],
+      risk_level: "low",
+      expected_validation: ["bun run test:root"],
+    },
+  },
+  {
+    motifId: "merge_hardening",
+    label: "Merge hardening guardrails",
+    pattern: /\b(merge|guardrail|review|pr|rework|hardening|conflict)\b/i,
     objectiveIds: ["merge_conversion_and_rework", "reliable_autonomous_delivery"],
     gapIds: ["merge_rework_gap", "delivery_reliability_gap"],
     shape: {
@@ -1784,6 +1894,252 @@ function buildCommitHistoryBlocks(params: {
     })
     .filter((entry): entry is EngineIdeaBuildingBlock => Boolean(entry))
     .sort((a, b) => b.score - a.score);
+}
+
+function overlapCoefficient(left: string[], right: string[]): number {
+  if (left.length === 0 || right.length === 0) return 0;
+  const rightSet = new Set(right);
+  const overlap = left.filter((value) => rightSet.has(value)).length;
+  return clamp01(overlap / Math.min(left.length, right.length));
+}
+
+function summarizeQueueContext(snapshot: Snapshot): QueueContextTelemetry {
+  const queueSignal = clamp01(
+    Math.max(
+      0,
+      ...snapshot.top_signals
+        .filter((signal) => asString(signal.type) === "queue_health")
+        .map((signal) => asNumber(signal.value, 0)),
+    ),
+  );
+  const dispatchBudget = snapshot.dispatch_budget ?? {
+    global_count_last_hour: 0,
+    by_type_count_last_hour: {},
+    by_component_count_last_hour: {},
+  };
+  const globalDispatch = Math.max(0, Math.floor(asNumber(dispatchBudget.global_count_last_hour, 0)));
+  const dispatchPressure = clamp01(globalDispatch / 12);
+  const normalize = (
+    records: Record<string, number> | undefined,
+  ): Array<{ key: string; count: number }> => {
+    if (!records) return [];
+    return Object.entries(records)
+      .map(([key, count]) => ({ key, count: Math.max(0, Math.floor(asNumber(count, 0))) }))
+      .filter((entry) => entry.count > 0)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 4);
+  };
+  const objectiveTypePressure = normalize(dispatchBudget.by_type_count_last_hour).map((entry) => ({
+    objective_type: entry.key,
+    count: entry.count,
+  }));
+  const componentPressure = normalize(dispatchBudget.by_component_count_last_hour).map((entry) => ({
+    component_area: entry.key,
+    count: entry.count,
+  }));
+  return {
+    queue_signal: queueSignal,
+    dispatch_pressure: dispatchPressure,
+    global_dispatch_last_hour: globalDispatch,
+    objective_type_pressure: objectiveTypePressure,
+    component_pressure: componentPressure,
+  };
+}
+
+function buildMotifAdjacencyDrafts(params: {
+  queueContext: QueueContextTelemetry;
+  engineInspiration: EngineInspirationContext;
+  selectedCandidate: AutonomyCandidate;
+}): MotifAdjacencyDraft[] {
+  const startupRule = COMMIT_MOTIF_RULES.find((entry) => entry.motifId === "startup_stability");
+  const mergeRule = COMMIT_MOTIF_RULES.find((entry) => entry.motifId === "merge_hardening");
+  if (!startupRule || !mergeRule) {
+    const missingMotifId = !startupRule ? "startup_stability" : "merge_hardening";
+    console.warn(
+      `[RemoteBuddyAutonomousEngine] motif adjacency drafts unavailable: missing ${missingMotifId} motif rule.`,
+    );
+    return [];
+  }
+  const hintsById = new Map(
+    params.engineInspiration.commit_history_hints.map((hint) => [hint.motif_id, hint]),
+  );
+  const startupHint = hintsById.get(startupRule.motifId);
+  const mergeHint = hintsById.get(mergeRule.motifId);
+  const startupSignal = clamp01(startupHint?.signal ?? 0.35);
+  const mergeSignal = clamp01(mergeHint?.signal ?? 0.35);
+  const mergedObjectiveIds = Array.from(new Set([...startupRule.objectiveIds, ...mergeRule.objectiveIds]));
+  const mergedGapIds = Array.from(new Set([...startupRule.gapIds, ...mergeRule.gapIds]));
+  const adjacencyBridge = clamp01(
+    0.55 * overlapCoefficient(startupRule.objectiveIds, mergeRule.objectiveIds) +
+      0.45 * overlapCoefficient(startupRule.gapIds, mergeRule.gapIds),
+  );
+  const queueBoost = clamp01(
+    0.5 * params.queueContext.queue_signal + 0.5 * params.queueContext.dispatch_pressure,
+  );
+  const queuePressureBias = clamp01(params.queueContext.dispatch_pressure);
+  const motifMix = [
+    { motif_id: startupRule.motifId, label: startupRule.label, signal: startupSignal },
+    { motif_id: mergeRule.motifId, label: mergeRule.label, signal: mergeSignal },
+  ];
+  const makeSummary = (emphasis: "startup_first" | "merge_first"): string => {
+    const emphasisText =
+      emphasis === "startup_first"
+        ? "Stabilize worker startup/preflight paths, then layer merge guardrails to keep PRs admissible."
+        : "Harden merge/review loops first, then reinforce startup/preflight determinism.";
+    return `${emphasisText} Focus component=${params.selectedCandidate.component_area}.`;
+  };
+  const focusTargets = params.selectedCandidate.target_paths.slice(0, 3).join(", ") || "repo root";
+  const makeDraft = (
+    emphasis: "startup_first" | "merge_first",
+  ): Omit<MotifAdjacencyDraft, "adjacency_rank"> => {
+    const primarySignal = emphasis === "startup_first" ? startupSignal : mergeSignal;
+    const secondarySignal = emphasis === "startup_first" ? mergeSignal : startupSignal;
+    const adjacencyScore = clamp01(
+      0.45 * primarySignal + 0.25 * secondarySignal + 0.2 * adjacencyBridge + 0.1 * queueBoost,
+    );
+    // Deterministic bias: prefer merge-first when queue pressure is high, startup-first when slack.
+    const emphasisBias = emphasis === "startup_first" ? 1 - queuePressureBias : queuePressureBias;
+    const adjacencyRankSignal = 0.97 * adjacencyScore + 0.03 * emphasisBias;
+    const queueSnapshot = `queue=${params.queueContext.queue_signal.toFixed(
+      2,
+    )}|dispatch=${params.queueContext.dispatch_pressure.toFixed(2)}`;
+    const objectiveBrief =
+      emphasis === "startup_first"
+        ? `Startup-first adjacency draft blending ${startupRule.label.toLowerCase()} + ${mergeRule.label.toLowerCase()}.`
+        : `Merge-first adjacency draft blending ${mergeRule.label.toLowerCase()} + ${startupRule.label.toLowerCase()}.`;
+    const primaryOutline =
+      emphasis === "startup_first"
+        ? "Stabilize boot/preflight flows, eliminate flaky retries, and pin configuration drift."
+        : "Raise merge/PR guardrail quality before scaling any new startup automation.";
+    const secondaryOutline =
+      emphasis === "startup_first"
+        ? "Backfill merge-review hardening once startup paths stop oscillating."
+        : "Layer deterministic startup execution after merge blockers are squashed.";
+    return {
+      draft_id: `motif_adj_${emphasis}`,
+      emphasis,
+      adjacency_score: adjacencyScore,
+      adjacency_rank_signal: adjacencyRankSignal,
+      merged_objective_ids: mergedObjectiveIds,
+      merged_gap_ids: mergedGapIds,
+      summary: makeSummary(emphasis),
+      objective_brief: `${objectiveBrief} Focus component=${params.selectedCandidate.component_area}.`,
+      objective_outline: [
+        primaryOutline,
+        secondaryOutline,
+        `Queue snapshot ${queueSnapshot}`,
+        `Focus target_paths: ${focusTargets}`,
+      ],
+      motif_mix: motifMix,
+      queue_signal: params.queueContext.queue_signal,
+      dispatch_pressure: params.queueContext.dispatch_pressure,
+    };
+  };
+  return [makeDraft("startup_first"), makeDraft("merge_first")]
+    .sort((a, b) => {
+      const delta = b.adjacency_rank_signal - a.adjacency_rank_signal;
+      if (Math.abs(delta) > 1e-6) return delta;
+      return b.adjacency_score - a.adjacency_score;
+    })
+    .map((draft, index) => ({
+      ...draft,
+      adjacency_rank: index + 1,
+    }));
+}
+
+function buildPlannerInputArtifacts(params: {
+  snapshot: Snapshot;
+  engineInspiration: EngineInspirationContext;
+  candidate: AutonomyCandidate;
+}): PlannerInputArtifacts {
+  const queueContext = summarizeQueueContext(params.snapshot);
+  const adjacencyDrafts = buildMotifAdjacencyDrafts({
+    queueContext,
+    engineInspiration: params.engineInspiration,
+    selectedCandidate: params.candidate,
+  });
+  const motifMixTelemetry = adjacencyDrafts.flatMap((draft) =>
+    draft.motif_mix.map((mix) => ({
+      draft_id: draft.draft_id,
+      adjacency_rank: draft.adjacency_rank,
+      adjacency_score: draft.adjacency_score,
+      motif_id: mix.motif_id,
+      label: mix.label,
+      signal: mix.signal,
+      queue_signal: draft.queue_signal,
+      dispatch_pressure: draft.dispatch_pressure,
+    })),
+  );
+  return {
+    plannerInput: {
+      candidate: params.candidate,
+      adjacency_objective_drafts: adjacencyDrafts,
+      queue_context: queueContext,
+    },
+    telemetry: {
+      motif_mix: motifMixTelemetry,
+      queue_context: queueContext,
+      adjacency_objective_drafts: adjacencyDrafts,
+    },
+  };
+}
+
+function summarizePlannerTelemetryForEvidence(telemetry: PlannerMotifTelemetry): {
+  planner_queue_context: {
+    queue_signal: number;
+    dispatch_pressure: number;
+    global_dispatch_last_hour: number;
+    objective_type_pressure: QueueContextTelemetry["objective_type_pressure"];
+    component_pressure: QueueContextTelemetry["component_pressure"];
+  };
+  planner_motif_mix: Array<{
+    draft_id: string;
+    adjacency_rank: number;
+    motif_id: string;
+    label: string;
+    signal: number;
+  }>;
+  planner_adjacency_drafts: Array<{
+    draft_id: string;
+    adjacency_rank: number;
+    adjacency_score: number;
+    adjacency_rank_signal: number;
+    emphasis: MotifAdjacencyDraft["emphasis"];
+    summary: string;
+  }>;
+} {
+  const take = <T>(values: T[], max: number): T[] => values.slice(0, Math.max(0, max));
+  const round3 = (value: number): number => Math.round(value * 1000) / 1000;
+  const truncate = (value: string, max: number): string => {
+    const normalized = value ?? "";
+    if (normalized.length <= max) return normalized;
+    return normalized.slice(0, Math.max(0, max - 3)) + "...";
+  };
+  const queueContext = telemetry.queue_context;
+  return {
+    planner_queue_context: {
+      queue_signal: round3(queueContext.queue_signal),
+      dispatch_pressure: round3(queueContext.dispatch_pressure),
+      global_dispatch_last_hour: queueContext.global_dispatch_last_hour,
+      objective_type_pressure: take(queueContext.objective_type_pressure, 3),
+      component_pressure: take(queueContext.component_pressure, 3),
+    },
+    planner_motif_mix: take(telemetry.motif_mix, 6).map((mix) => ({
+      draft_id: mix.draft_id,
+      adjacency_rank: mix.adjacency_rank,
+      motif_id: mix.motif_id,
+      label: mix.label,
+      signal: round3(mix.signal),
+    })),
+    planner_adjacency_drafts: take(telemetry.adjacency_objective_drafts, 3).map((draft) => ({
+      draft_id: draft.draft_id,
+      adjacency_rank: draft.adjacency_rank,
+      adjacency_score: round3(draft.adjacency_score),
+      adjacency_rank_signal: round3(draft.adjacency_rank_signal),
+      emphasis: draft.emphasis,
+      summary: truncate(draft.summary, 200),
+    })),
+  };
 }
 
 export function buildEngineInspirationContext(params: {
@@ -3116,6 +3472,13 @@ export class RemoteBuddyAutonomousEngine {
     let lockAcquired = false;
     let outcome: "success" | "skipped" | "failed" = "skipped";
     let outcomeDetail = "not_dispatched";
+    let plannerTelemetryForLogging: PlannerMotifTelemetry | null = null;
+    let lastPlannerTelemetryStage: PlannerMotifLogStage | null = null;
+    const emitPlannerTelemetry = (stage: PlannerMotifLogStage): void => {
+      if (!plannerTelemetryForLogging) return;
+      logPlannerMotifTelemetry({ runId, stage, telemetry: plannerTelemetryForLogging });
+      lastPlannerTelemetryStage = stage;
+    };
     try {
       this.setPhase("acquire_lock");
       lockAcquired = await this.acquireDispatchLock(runId);
@@ -3776,12 +4139,21 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "requires_user_input";
         return;
       }
+      const { plannerInput, telemetry: plannerTelemetry } = buildPlannerInputArtifacts({
+        snapshot,
+        engineInspiration,
+        candidate: selected.candidate,
+      });
+      plannerTelemetryForLogging = plannerTelemetry;
+      const plannerEvidence = summarizePlannerTelemetryForEvidence(plannerTelemetry);
       this.setPhase("renew_lock_before_planning");
       if (!(await this.renewDispatchLock(runId))) {
+        emitPlannerTelemetry("lock_failed_before_planning");
         outcomeDetail = "lock_renew_failed_before_planning";
         return;
       }
 
+      emitPlannerTelemetry("planning_start");
       this.setPhase("planning");
       const planningPhase = await this.llmPhase(
         "planning",
@@ -3795,7 +4167,7 @@ export class RemoteBuddyAutonomousEngine {
           messages: [
             {
               role: "user",
-              content: JSON.stringify({ candidate: selected.candidate }),
+              content: JSON.stringify(plannerInput),
             },
           ],
         },
@@ -3804,6 +4176,7 @@ export class RemoteBuddyAutonomousEngine {
       llmCalls.push(planningPhase.llmCall);
       const planningJson = planningPhase.json;
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
+        emitPlannerTelemetry("planning_snapshot_expired");
         this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(
           runId,
@@ -3817,6 +4190,7 @@ export class RemoteBuddyAutonomousEngine {
       }
       this.setPhase("renew_lock_before_enqueue");
       if (!(await this.renewDispatchLock(runId))) {
+        emitPlannerTelemetry("lock_failed_before_enqueue");
         outcomeDetail = "lock_renew_failed_before_enqueue";
         return;
       }
@@ -3839,6 +4213,7 @@ export class RemoteBuddyAutonomousEngine {
       });
       if (!requestId) {
         this.setPhase("record_failed_enqueue");
+        emitPlannerTelemetry("enqueue_failed");
         await this.postObjective({
           runId,
           snapshotId: snapshot.snapshot_id,
@@ -3858,6 +4233,7 @@ export class RemoteBuddyAutonomousEngine {
             risk_level: selected.candidate.risk_level,
             status: "failed",
             block_reason: "request_enqueue_failed",
+            evidence: plannerEvidence,
           },
           llmCalls,
         });
@@ -3866,6 +4242,7 @@ export class RemoteBuddyAutonomousEngine {
       }
 
       this.setPhase("record_dispatched_objective");
+      emitPlannerTelemetry("dispatched");
       await this.postObjective({
         runId,
         snapshotId: snapshot.snapshot_id,
@@ -3885,6 +4262,7 @@ export class RemoteBuddyAutonomousEngine {
           risk_level: selected.candidate.risk_level,
           status: "dispatched",
           request_id: requestId,
+          evidence: plannerEvidence,
           score_breakdown: {
             llm_score: selected.llmScore,
             impact_signal: selected.impactSignal,
@@ -3917,6 +4295,14 @@ export class RemoteBuddyAutonomousEngine {
       outcome = "success";
       outcomeDetail = `dispatched_request_${requestId.slice(0, 8)}`;
     } catch (error) {
+      if (
+        plannerTelemetryForLogging &&
+        lastPlannerTelemetryStage !== "dispatched" &&
+        lastPlannerTelemetryStage !== "enqueue_failed" &&
+        lastPlannerTelemetryStage !== "planning_failed"
+      ) {
+        emitPlannerTelemetry("planning_failed");
+      }
       console.error("[RemoteBuddyAutonomousEngine] tick failed:", error);
       outcome = "failed";
       outcomeDetail = `error:${error instanceof Error ? error.message : String(error)}`;
@@ -3992,4 +4378,217 @@ export class RemoteBuddyAutonomousEngine {
     }
     this.nextTickAtMs = 0;
   }
+}
+
+const vitest = (import.meta as ImportMeta & { vitest?: typeof import("vitest") }).vitest;
+if (vitest) {
+  const { describe, expect, it, vi } = vitest;
+
+  const makeTestSnapshot = (): Snapshot => ({
+    snapshot_id: "snap_test",
+    snapshot_created_at: new Date(0).toISOString(),
+    snapshot_ttl_ms: 120_000,
+    impact_model_version: "impact-v1",
+    top_signals: [{ signal_id: "sig_queue", type: "queue_health", value: 0.72, evidence: "queue high" }],
+    state_traits: [],
+    feedback_priors: [],
+    engine_idea_priors: [],
+    engine_source_priors: [],
+    active_cooldowns: [],
+    open_objectives: [],
+    repo_health_flags: {
+      is_worktree_dirty: false,
+      is_merge_in_progress: false,
+      dispatch_lock_held: false,
+    },
+    dispatch_budget: {
+      global_count_last_hour: 4,
+      by_type_count_last_hour: { small_refactor: 2 },
+      by_component_count_last_hour: { "apps/remotebuddy": 1 },
+    },
+  });
+
+  const makeTestCandidate = (): AutonomyCandidate => ({
+    id: "cand_test",
+    title: "Exercise startup stability and merge guardrails",
+    objective_type: "small_refactor",
+    problem_statement: "Test-only candidate for motif adjacency planning.",
+    trigger_type: "regret_signal",
+    component_area: "apps/remotebuddy",
+    target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+    scope: { read_anywhere: false, write_globs: ["apps/remotebuddy/src/*"] },
+    risk_level: "low",
+    expected_validation: ["bun run test:root"],
+    estimated_effort: "small",
+    why_now_signal_ids: [],
+    confidence: 0.7,
+    vision_alignment_reason: "tests",
+    vision_section_refs: [],
+    feature_hypotheses: [],
+    candidate_created_at: new Date(0).toISOString(),
+  });
+
+  describe("buildPlannerInputArtifacts", () => {
+    it("recombines startup-stability + merge-hardening motifs into adjacency-ranked planner drafts", () => {
+      const snapshot = makeTestSnapshot();
+      const engineInspiration: EngineInspirationContext = {
+        compiled_objectives: [],
+        opportunity_gaps: [],
+        building_blocks: [],
+        source_patterns: [],
+        commit_history_hints: [
+          {
+            motif_id: "startup_stability",
+            label: "Startup stability",
+            count: 4,
+            signal: 0.9,
+            objective_ids: ["reliable_autonomous_delivery"],
+            gap_ids: ["delivery_reliability_gap"],
+            sample_subjects: ["feat/startup-signal"],
+          },
+          {
+            motif_id: "merge_hardening",
+            label: "Merge hardening guardrails",
+            count: 2,
+            signal: 0.35,
+            objective_ids: ["merge_conversion_and_rework"],
+            gap_ids: ["merge_rework_gap"],
+            sample_subjects: ["feat/merge-signal"],
+          },
+        ],
+      };
+      const artifacts = buildPlannerInputArtifacts({
+        snapshot,
+        engineInspiration,
+        candidate: makeTestCandidate(),
+      });
+      expect(artifacts.plannerInput.adjacency_objective_drafts).toHaveLength(2);
+      expect(
+        artifacts.plannerInput.adjacency_objective_drafts.map((draft) => draft.adjacency_rank),
+      ).toEqual([1, 2]);
+      expect(artifacts.telemetry.adjacency_objective_drafts).toBe(
+        artifacts.plannerInput.adjacency_objective_drafts,
+      );
+      expect(
+        artifacts.plannerInput.adjacency_objective_drafts.every((draft) =>
+          draft.motif_mix.some((mix) => mix.motif_id === "startup_stability") &&
+          draft.motif_mix.some((mix) => mix.motif_id === "merge_hardening"),
+        ),
+      ).toBe(true);
+    });
+
+    it("applies deterministic queue-pressure tie-breakers when adjacency scores match", () => {
+      const snapshot = makeTestSnapshot();
+      snapshot.dispatch_budget.global_count_last_hour = 12;
+      const engineInspiration: EngineInspirationContext = {
+        compiled_objectives: [],
+        opportunity_gaps: [],
+        building_blocks: [],
+        source_patterns: [],
+        commit_history_hints: [
+          {
+            motif_id: "startup_stability",
+            label: "Startup stability",
+            count: 3,
+            signal: 0.5,
+            objective_ids: ["reliable_autonomous_delivery"],
+            gap_ids: ["delivery_reliability_gap"],
+            sample_subjects: ["feat/startup-equal"],
+          },
+          {
+            motif_id: "merge_hardening",
+            label: "Merge hardening guardrails",
+            count: 3,
+            signal: 0.5,
+            objective_ids: ["merge_conversion_and_rework"],
+            gap_ids: ["merge_rework_gap"],
+            sample_subjects: ["feat/merge-equal"],
+          },
+        ],
+      };
+      const artifacts = buildPlannerInputArtifacts({
+        snapshot,
+        engineInspiration,
+        candidate: makeTestCandidate(),
+      });
+      const drafts = artifacts.plannerInput.adjacency_objective_drafts;
+      expect(drafts[0]).toBeDefined();
+      expect(drafts[1]).toBeDefined();
+      expect(drafts[0]?.adjacency_score).toBeCloseTo(drafts[1]?.adjacency_score ?? 0, 6);
+      expect(drafts[0]?.adjacency_rank_signal).toBeGreaterThan(drafts[1]?.adjacency_rank_signal ?? 0);
+      expect(drafts[0]?.emphasis).toBe("merge_first");
+      expect(drafts[0]?.adjacency_rank).toBe(1);
+      expect(drafts[1]?.adjacency_rank).toBe(2);
+    });
+  });
+
+  describe("logPlannerMotifTelemetry", () => {
+    const telemetry: PlannerMotifTelemetry = {
+      motif_mix: [
+        {
+          draft_id: "motif_adj_startup_first",
+          adjacency_rank: 1,
+          adjacency_score: 0.84,
+          motif_id: "startup_stability",
+          label: "Startup stability",
+          signal: 0.84,
+          queue_signal: 0.62,
+          dispatch_pressure: 0.41,
+        },
+      ],
+      queue_context: {
+        queue_signal: 0.62,
+        dispatch_pressure: 0.41,
+        global_dispatch_last_hour: 5,
+        objective_type_pressure: [{ objective_type: "small_refactor", count: 2 }],
+        component_pressure: [{ component_area: "apps/remotebuddy", count: 1 }],
+      },
+      adjacency_objective_drafts: [
+        {
+          draft_id: "motif_adj_startup_first",
+          adjacency_rank: 1,
+          emphasis: "startup_first",
+          adjacency_score: 0.84,
+          adjacency_rank_signal: 0.87,
+          merged_objective_ids: ["reliable_autonomous_delivery", "merge_conversion_and_rework"],
+          merged_gap_ids: ["delivery_reliability_gap", "merge_rework_gap"],
+          summary: "Stabilize startup paths, then harden merge loops.",
+          objective_brief: "Startup + merge hardening adjacency draft",
+          objective_outline: ["outline entry"],
+          motif_mix: [
+            { motif_id: "startup_stability", label: "Startup stability", signal: 0.84 },
+            { motif_id: "merge_hardening", label: "Merge hardening", signal: 0.35 },
+          ],
+          queue_signal: 0.62,
+          dispatch_pressure: 0.41,
+        },
+      ],
+    };
+
+    it("logs motif mix and queue context for dispatched outcomes", () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      logPlannerMotifTelemetry({ runId: "run_tests", stage: "dispatched", telemetry });
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      expect(logSpy.mock.calls[0]?.[0]).toContain("[dispatched]");
+      expect(logSpy.mock.calls[0]?.[0]).toContain("planner_motif_mix");
+      expect(logSpy.mock.calls[0]?.[0]).toContain("queue_context");
+      expect(logSpy.mock.calls[0]?.[0]).toContain("motif_adj_startup_first");
+      expect(logSpy.mock.calls[0]?.[0]).toContain("queue_signal=0.62");
+      expect(logSpy.mock.calls[0]?.[1]).toMatchObject({
+        motif_mix: telemetry.motif_mix,
+        queue_context: telemetry.queue_context,
+      });
+      logSpy.mockRestore();
+    });
+
+    it("logs motif mix and queue context for enqueue-failed outcomes", () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      logPlannerMotifTelemetry({ runId: "run_tests", stage: "enqueue_failed", telemetry });
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      expect(logSpy.mock.calls[0]?.[0]).toContain("[enqueue_failed]");
+      expect(logSpy.mock.calls[0]?.[0]).toContain("motif_adj_startup_first");
+      expect(logSpy.mock.calls[0]?.[0]).toContain("queue_signal=0.62");
+      logSpy.mockRestore();
+    });
+  });
 }
