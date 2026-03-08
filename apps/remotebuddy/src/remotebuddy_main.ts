@@ -2363,6 +2363,8 @@ async function main() {
     endpoint: llmCfg.endpoint,
     model: llmCfg.model,
     apiKey: llmCfg.apiKey,
+    serverUrl: opts.server,
+    authToken: opts.authToken,
   });
   brain = new AgentBrain(llm);
 

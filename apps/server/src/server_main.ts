@@ -335,7 +335,7 @@ export function createRequestHandler() {
       // Noisy poll endpoints: only log these at debug level.
       const isNoisyPoll =
         (method === "POST" &&
-          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/log)\/?$/.test(
+          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/log|telemetry\/llm-usage)\/?$/.test(
             pathname,
           )) ||
         (method === "GET" &&
@@ -727,6 +727,7 @@ export function createRequestHandler() {
           requestPending: Math.max(0, Number(requestCounts.pending ?? 0)),
           jobFailureRate,
         });
+        const llmUsage = autonomyStore.getLlmUsageSummary({ windowHours: 24 });
 
         return makeJson({
           ok: true,
@@ -763,9 +764,19 @@ export function createRequestHandler() {
             requests: requestSlo,
             jobs: jobSlo,
           },
+          llmUsage,
           autonomy: autonomyOps,
           repo,
         });
+      }
+
+      // POST /telemetry/llm-usage
+      if (pathname === "/telemetry/llm-usage" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = autonomyStore.recordLlmUsage(body);
+        return makeJson(result, result.ok ? 200 : 400);
       }
 
       // GET /requests
@@ -1260,13 +1271,16 @@ export function createRequestHandler() {
             id: randomUUID(),
             ts: new Date().toISOString(),
             sessionId,
-            type: "question_answered",
+            type: "log",
             from: "server:autonomy",
             payload: {
-              questionId,
-              objectiveId: result.objectiveId || "unknown",
-              status: result.action || "closed",
-              ...(body.note ? { answerSummary: compactText(body.note, 240) } : {}),
+              level: "info",
+              message: compactText(
+                `question ${questionId} action=${result.action || "closed"} objective=${result.objectiveId || "unknown"}${
+                  body.note ? ` note=${String(body.note)}` : ""
+                }`,
+                240,
+              ),
             },
           });
         }

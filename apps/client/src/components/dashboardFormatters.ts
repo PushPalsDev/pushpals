@@ -57,6 +57,20 @@ export function formatDuration(valueMs: number | null | undefined): string {
   return `${Math.round(valueMs / 1000)}s`;
 }
 
+function trimTrailingZeroes(value: string): string {
+  return value.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+}
+
+export function formatTokenCount(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "--";
+  if (value < 1_000) return Math.round(value).toLocaleString();
+  if (value < 1_000_000) return `${trimTrailingZeroes((value / 1_000).toFixed(value < 10_000 ? 1 : 0))}k`;
+  if (value < 1_000_000_000) {
+    return `${trimTrailingZeroes((value / 1_000_000).toFixed(value < 10_000_000 ? 1 : 0))}M`;
+  }
+  return value.toExponential(2).replace("+", "");
+}
+
 export function formatEtaMs(valueMs: number | null | undefined): string {
   if (typeof valueMs !== "number" || !Number.isFinite(valueMs) || valueMs <= 0) return "now";
   if (valueMs < 1_000) return `${Math.round(valueMs)}ms`;

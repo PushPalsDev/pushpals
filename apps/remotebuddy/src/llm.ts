@@ -43,6 +43,21 @@ export interface LLMClient {
 type LlmBackend = "lmstudio" | "ollama" | "openai" | "openai_codex";
 type LlmService = "localbuddy" | "remotebuddy" | "workerpals";
 
+export interface LLMUsageEvent {
+  service: LlmService;
+  sessionId?: string;
+  backend: LlmBackend;
+  modelId?: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimated?: boolean;
+}
+
+export interface LLMUsageReporter {
+  reportUsage(event: LLMUsageEvent): Promise<void>;
+}
+
 export interface LLMClientOptions {
   service?: LlmService;
   sessionId?: string;
@@ -50,6 +65,9 @@ export interface LLMClientOptions {
   apiKey?: string;
   model?: string;
   backend?: string;
+  serverUrl?: string;
+  authToken?: string | null;
+  usageReporter?: LLMUsageReporter;
 }
 
 interface ResolvedServiceLlmConfig {
@@ -521,6 +539,66 @@ function sumEstimatedTokens(messages: Array<{ role: string; content: string }>):
   return messages.reduce((acc, msg) => acc + estimateTokensFromText(msg.content), 0);
 }
 
+function tokenUsageFromEstimate(
+  messages: Array<{ role: string; content: string }>,
+  responseText: string,
+): { promptTokens: number; completionTokens: number } {
+  return {
+    promptTokens: Math.max(0, sumEstimatedTokens(messages)),
+    completionTokens: Math.max(0, estimateTokensFromText(responseText)),
+  };
+}
+
+function normalizeTokenUsage(
+  usage: { promptTokens: number; completionTokens: number } | undefined,
+  fallback: { promptTokens: number; completionTokens: number },
+): { promptTokens: number; completionTokens: number; estimated: boolean } {
+  if (
+    usage &&
+    Number.isFinite(usage.promptTokens) &&
+    usage.promptTokens >= 0 &&
+    Number.isFinite(usage.completionTokens) &&
+    usage.completionTokens >= 0
+  ) {
+    return {
+      promptTokens: Math.round(usage.promptTokens),
+      completionTokens: Math.round(usage.completionTokens),
+      estimated: false,
+    };
+  }
+  return {
+    promptTokens: Math.round(fallback.promptTokens),
+    completionTokens: Math.round(fallback.completionTokens),
+    estimated: true,
+  };
+}
+
+function createHttpUsageReporter(opts: {
+  serverUrl?: string;
+  authToken?: string | null;
+}): LLMUsageReporter | null {
+  const serverUrl = (opts.serverUrl ?? "").trim().replace(/\/+$/, "");
+  if (!serverUrl) return null;
+  return {
+    async reportUsage(event: LLMUsageEvent): Promise<void> {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const authToken = (opts.authToken ?? "").trim();
+      if (authToken) headers.Authorization = `Bearer ${authToken}`;
+      const response = await fetch(`${serverUrl}/telemetry/llm-usage`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(event),
+      });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(
+          `usage telemetry rejected (${response.status})${detail ? `: ${detail.trim()}` : ""}`,
+        );
+      }
+    },
+  };
+}
+
 function providerlessModelName(raw: string): string {
   const normalized = raw.trim();
   if (!normalized.includes("/")) return normalized;
@@ -700,9 +778,11 @@ export class LmStudioClient implements LLMClient {
   private endpoint: string;
   private apiKey: string;
   private model: string;
+  private service: LlmService;
   private sessionTag: string;
   private providerKind: "lmstudio" | "openai";
   private providerLabel: string;
+  private usageReporter: LLMUsageReporter | null;
   private contextWindow: number;
   private minOutputTokens: number;
   private tokenSafetyMargin: number;
@@ -722,6 +802,7 @@ export class LmStudioClient implements LLMClient {
     service?: LlmService;
     sessionId?: string;
     lmStudio?: PushPalsLmStudioConfig;
+    usageReporter?: LLMUsageReporter | null;
   }) {
     this.providerKind = opts?.backend ?? "lmstudio";
     this.providerLabel = this.providerKind === "openai" ? "OpenAI" : "LM Studio";
@@ -731,7 +812,9 @@ export class LmStudioClient implements LLMClient {
     this.endpoint = normalizeLmStudioEndpoint(rawEndpoint);
     this.apiKey = opts?.apiKey ?? (this.providerKind === "lmstudio" ? "lmstudio" : "");
     this.model = opts?.model ?? DEFAULT_MODEL;
-    this.sessionTag = stableConversationTag(opts?.service ?? "remotebuddy", opts?.sessionId);
+    this.service = opts?.service ?? "remotebuddy";
+    this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
+    this.usageReporter = opts?.usageReporter ?? null;
     const lmStudio = opts?.lmStudio;
     this.contextWindow = Math.max(512, lmStudio?.contextWindow ?? DEFAULT_LMSTUDIO_CONTEXT_WINDOW);
     this.minOutputTokens = Math.max(
@@ -748,6 +831,27 @@ export class LmStudioClient implements LLMClient {
     );
     this.batchChunkTokens = Math.max(0, lmStudio?.batchChunkTokens ?? 0);
     this.batchMemoryChars = Math.max(0, lmStudio?.batchMemoryChars ?? 0);
+  }
+
+  private async maybeReportUsage(
+    modelId: string,
+    usage: { promptTokens: number; completionTokens: number; estimated: boolean },
+  ): Promise<void> {
+    if (!this.usageReporter) return;
+    try {
+      await this.usageReporter.reportUsage({
+        service: this.service,
+        sessionId: this.sessionTag || undefined,
+        backend: this.providerKind,
+        modelId,
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        totalTokens: usage.promptTokens + usage.completionTokens,
+        estimated: usage.estimated,
+      });
+    } catch (err) {
+      console.warn(`[LLM] Usage telemetry failed (${this.service}): ${String(err)}`);
+    }
   }
 
   private modelProbeUrls(): string[] {
@@ -986,21 +1090,30 @@ export class LmStudioClient implements LLMClient {
 
       const data = (await res.json()) as any;
       const choice = data.choices?.[0];
+      const text = choice?.message?.content ?? "";
       if ("session_id" in body || "conversation_id" in body) {
         this.lmStudioSupportsExtendedSessionFields = true;
       }
       if ("response_format" in body) {
         this.lmStudioSupportsResponseFormat = true;
       }
-
-      return {
-        text: choice?.message?.content ?? "",
-        usage: data.usage
+      const usage = normalizeTokenUsage(
+        data.usage
           ? {
-              promptTokens: data.usage.prompt_tokens,
-              completionTokens: data.usage.completion_tokens,
+              promptTokens: Number(data.usage.prompt_tokens ?? 0),
+              completionTokens: Number(data.usage.completion_tokens ?? 0),
             }
           : undefined,
+        tokenUsageFromEstimate(messages, text),
+      );
+      await this.maybeReportUsage(model, usage);
+
+      return {
+        text,
+        usage: {
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+        },
       };
     }
 
@@ -1193,6 +1306,7 @@ export class OpenAiCodexCliClient implements LLMClient {
   private readonly service: LlmService;
   private readonly sessionTag: string;
   private readonly reasoningEffort: string;
+  private readonly usageReporter: LLMUsageReporter | null;
 
   constructor(opts?: {
     model?: string;
@@ -1204,6 +1318,7 @@ export class OpenAiCodexCliClient implements LLMClient {
     reasoningEffort?: string;
     service?: LlmService;
     sessionId?: string;
+    usageReporter?: LLMUsageReporter | null;
   }) {
     this.model = normalizeCodexModel(opts?.model ?? DEFAULT_CODEX_MODEL);
     this.apiKey = (opts?.apiKey ?? "").trim();
@@ -1214,6 +1329,27 @@ export class OpenAiCodexCliClient implements LLMClient {
     this.service = opts?.service ?? "remotebuddy";
     this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
     this.reasoningEffort = (opts?.reasoningEffort ?? "").trim();
+    this.usageReporter = opts?.usageReporter ?? null;
+  }
+
+  private async maybeReportUsage(
+    usage: { promptTokens: number; completionTokens: number; estimated: boolean },
+  ): Promise<void> {
+    if (!this.usageReporter) return;
+    try {
+      await this.usageReporter.reportUsage({
+        service: this.service,
+        sessionId: this.sessionTag || undefined,
+        backend: "openai_codex",
+        modelId: this.model,
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        totalTokens: usage.promptTokens + usage.completionTokens,
+        estimated: usage.estimated,
+      });
+    } catch (err) {
+      console.warn(`[LLM] Usage telemetry failed (${this.service}): ${String(err)}`);
+    }
   }
 
   private effectiveAuthMode(): CodexAuthMode {
@@ -1332,18 +1468,61 @@ export class OpenAiCodexCliClient implements LLMClient {
         console.warn(`[LLM] Codex CLI stderr (${this.service}): ${firstLine.trim()}`);
       }
     }
-    return { text: result.text };
+    const usage = normalizeTokenUsage(undefined, {
+      promptTokens: estimateTokensFromText(prompt),
+      completionTokens: estimateTokensFromText(result.text),
+    });
+    await this.maybeReportUsage(usage);
+    return {
+      text: result.text,
+      usage: {
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+      },
+    };
   }
 }
 
 export class OllamaClient implements LLMClient {
   private endpoint: string;
   private model: string;
+  private service: LlmService;
+  private sessionTag: string;
+  private usageReporter: LLMUsageReporter | null;
 
-  constructor(opts?: { endpoint?: string; model?: string }) {
+  constructor(opts?: {
+    endpoint?: string;
+    model?: string;
+    service?: LlmService;
+    sessionId?: string;
+    usageReporter?: LLMUsageReporter | null;
+  }) {
     const rawEndpoint = opts?.endpoint ?? DEFAULT_OLLAMA_ENDPOINT;
     this.endpoint = normalizeOllamaEndpoint(rawEndpoint);
     this.model = opts?.model ?? DEFAULT_MODEL;
+    this.service = opts?.service ?? "remotebuddy";
+    this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
+    this.usageReporter = opts?.usageReporter ?? null;
+  }
+
+  private async maybeReportUsage(
+    usage: { promptTokens: number; completionTokens: number; estimated: boolean },
+  ): Promise<void> {
+    if (!this.usageReporter) return;
+    try {
+      await this.usageReporter.reportUsage({
+        service: this.service,
+        sessionId: this.sessionTag || undefined,
+        backend: "ollama",
+        modelId: this.model,
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        totalTokens: usage.promptTokens + usage.completionTokens,
+        estimated: usage.estimated,
+      });
+    } catch (err) {
+      console.warn(`[LLM] Usage telemetry failed (${this.service}): ${String(err)}`);
+    }
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
@@ -1379,13 +1558,23 @@ export class OllamaClient implements LLMClient {
     }
 
     const data = (await res.json()) as any;
-    return { text: data.message?.content ?? "" };
+    const text = data.message?.content ?? "";
+    const usage = normalizeTokenUsage(undefined, tokenUsageFromEstimate(body.messages as Array<{ role: string; content: string }>, text));
+    await this.maybeReportUsage(usage);
+    return {
+      text,
+      usage: {
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+      },
+    };
   }
 }
 
 export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
   const resolved = resolveServiceLlmConfig(opts);
   const service = opts.service ?? "remotebuddy";
+  const usageReporter = opts.usageReporter ?? createHttpUsageReporter(opts);
 
   if (resolved.backend === "openai_codex") {
     console.log(
@@ -1401,6 +1590,7 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
       reasoningEffort: resolved.reasoningEffort,
       service,
       sessionId: resolved.sessionId,
+      usageReporter,
     });
   }
 
@@ -1411,6 +1601,9 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
     return new OllamaClient({
       endpoint: resolved.endpoint,
       model: resolved.model,
+      service,
+      sessionId: resolved.sessionId,
+      usageReporter,
     });
   }
 
@@ -1426,6 +1619,7 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
       service,
       sessionId: resolved.sessionId,
       lmStudio: resolved.lmStudio,
+      usageReporter,
     });
   }
 
@@ -1440,5 +1634,6 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
     service,
     sessionId: resolved.sessionId,
     lmStudio: resolved.lmStudio,
+    usageReporter,
   });
 }
