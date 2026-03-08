@@ -381,6 +381,28 @@ export interface AutonomyOpsSummary {
   lastStaleSweepAt: string | null;
 }
 
+export interface LlmUsageServiceSummary {
+  service: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  callCount: number;
+  avgTokensPerCall: number | null;
+  estimatedCallCount: number;
+  lastCallAt: string | null;
+}
+
+export interface LlmUsageSummary {
+  windowHours: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  callCount: number;
+  avgTokensPerCall: number | null;
+  estimatedCallCount: number;
+  services: LlmUsageServiceSummary[];
+}
+
 export interface AutonomyInsights {
   patternStats: AutonomyPatternStatsInsight[];
   recentPrFeedback: AutonomyPrFeedbackInsight[];
@@ -439,6 +461,10 @@ function asObject(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string {
   return String(value ?? "").trim();
+}
+
+function normalizeServiceName(value: unknown): string {
+  return asString(value).toLowerCase();
 }
 
 function truncateText(value: string, maxChars: number): string {
@@ -1348,6 +1374,22 @@ export class AutonomyStore {
         token_usage_json TEXT,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS llm_usage_events (
+        id TEXT PRIMARY KEY,
+        service TEXT NOT NULL,
+        session_id TEXT,
+        backend TEXT,
+        model_id TEXT,
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        estimated INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_llm_usage_events_created
+        ON llm_usage_events(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_llm_usage_events_service_created
+        ON llm_usage_events(service, created_at DESC);
       CREATE TABLE IF NOT EXISTS autonomy_dispatch_lock (
         lock_id TEXT PRIMARY KEY,
         owner_session_id TEXT NOT NULL,
@@ -2058,6 +2100,137 @@ export class AutonomyStore {
       recentAlerts,
       staleDeadLetterCount24h,
       lastStaleSweepAt: this.lastStaleObjectiveSweepAtIso,
+    };
+  }
+
+  recordLlmUsage(body: Record<string, unknown>): { ok: boolean; reason?: string } {
+    const service = normalizeServiceName(body.service);
+    if (!service) return { ok: false, reason: "service is required" };
+
+    const promptTokens = asNonNegativeInt(body.promptTokens ?? body.prompt_tokens);
+    const completionTokens = asNonNegativeInt(body.completionTokens ?? body.completion_tokens);
+    const explicitTotal = asNonNegativeInt(body.totalTokens ?? body.total_tokens);
+    const totalTokens = explicitTotal > 0 ? explicitTotal : promptTokens + completionTokens;
+    if (totalTokens <= 0) return { ok: false, reason: "token usage is required" };
+
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO llm_usage_events (
+          id, service, session_id, backend, model_id, prompt_tokens, completion_tokens,
+          total_tokens, estimated, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        asString(body.id) || randomUUID(),
+        service,
+        asString(body.sessionId ?? body.session_id) || null,
+        asString(body.backend) || null,
+        asString(body.modelId ?? body.model_id) || null,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        asBoolean(body.estimated, false) ? 1 : 0,
+        asIsoNow(),
+      );
+
+    return { ok: true };
+  }
+
+  getLlmUsageSummary(params?: { windowHours?: number }): LlmUsageSummary {
+    const rawWindowHours = asNonNegativeInt(params?.windowHours ?? 24);
+    const windowHours = Math.max(1, rawWindowHours || 24);
+    const nowIso = asIsoNow();
+    const modifier = `-${windowHours} hours`;
+    const overall = this.db
+      .prepare(
+        `SELECT
+           SUM(prompt_tokens) AS prompt_tokens,
+           SUM(completion_tokens) AS completion_tokens,
+           SUM(total_tokens) AS total_tokens,
+           COUNT(*) AS call_count,
+           SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END) AS estimated_call_count
+         FROM llm_usage_events
+         WHERE datetime(created_at) >= datetime(?, ?)`,
+      )
+      .get(nowIso, modifier) as
+      | {
+          prompt_tokens: number | null;
+          completion_tokens: number | null;
+          total_tokens: number | null;
+          call_count: number | null;
+          estimated_call_count: number | null;
+        }
+      | undefined;
+    const serviceRows = this.db
+      .prepare(
+        `SELECT
+           service,
+           SUM(prompt_tokens) AS prompt_tokens,
+           SUM(completion_tokens) AS completion_tokens,
+           SUM(total_tokens) AS total_tokens,
+           COUNT(*) AS call_count,
+           SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END) AS estimated_call_count,
+           MAX(created_at) AS last_call_at
+         FROM llm_usage_events
+         WHERE datetime(created_at) >= datetime(?, ?)
+         GROUP BY service
+         ORDER BY total_tokens DESC, service ASC`,
+      )
+      .all(nowIso, modifier) as Array<{
+      service: string;
+      prompt_tokens: number | null;
+      completion_tokens: number | null;
+      total_tokens: number | null;
+      call_count: number | null;
+      estimated_call_count: number | null;
+      last_call_at: string | null;
+    }>;
+
+    const toServiceSummary = (row: {
+      service: string;
+      prompt_tokens: number | null;
+      completion_tokens: number | null;
+      total_tokens: number | null;
+      call_count: number | null;
+      estimated_call_count: number | null;
+      last_call_at: string | null;
+    }): LlmUsageServiceSummary => {
+      const promptTokens = Math.max(0, Math.floor(asNumber(row.prompt_tokens, 0)));
+      const completionTokens = Math.max(0, Math.floor(asNumber(row.completion_tokens, 0)));
+      const totalTokens = Math.max(
+        0,
+        Math.floor(asNumber(row.total_tokens, promptTokens + completionTokens)),
+      );
+      const callCount = Math.max(0, Math.floor(asNumber(row.call_count, 0)));
+      return {
+        service: row.service,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        callCount,
+        avgTokensPerCall: callCount > 0 ? totalTokens / callCount : null,
+        estimatedCallCount: Math.max(0, Math.floor(asNumber(row.estimated_call_count, 0))),
+        lastCallAt: row.last_call_at || null,
+      };
+    };
+
+    const promptTokens = Math.max(0, Math.floor(asNumber(overall?.prompt_tokens, 0)));
+    const completionTokens = Math.max(0, Math.floor(asNumber(overall?.completion_tokens, 0)));
+    const totalTokens = Math.max(
+      0,
+      Math.floor(asNumber(overall?.total_tokens, promptTokens + completionTokens)),
+    );
+    const callCount = Math.max(0, Math.floor(asNumber(overall?.call_count, 0)));
+
+    return {
+      windowHours,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      callCount,
+      avgTokensPerCall: callCount > 0 ? totalTokens / callCount : null,
+      estimatedCallCount: Math.max(0, Math.floor(asNumber(overall?.estimated_call_count, 0))),
+      services: serviceRows.map(toServiceSummary),
     };
   }
 
