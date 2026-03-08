@@ -407,6 +407,8 @@ class LocalBuddyServer {
       endpoint: llmCfg.endpoint,
       model: llmCfg.model,
       apiKey: llmCfg.apiKey,
+      serverUrl: this.server,
+      authToken: this.authToken,
     });
     console.log(`[LocalBuddy] LLM client initialized`);
   }

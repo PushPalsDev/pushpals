@@ -460,6 +460,28 @@ export interface SystemRepoSummary {
   refreshedAt?: string;
 }
 
+export interface LlmUsageServiceSummary {
+  service: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  callCount: number;
+  avgTokensPerCall: number | null;
+  estimatedCallCount: number;
+  lastCallAt: string | null;
+}
+
+export interface LlmUsageSummary {
+  windowHours: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  callCount: number;
+  avgTokensPerCall: number | null;
+  estimatedCallCount: number;
+  services: LlmUsageServiceSummary[];
+}
+
 export interface SystemStatusSummary {
   workers?: { total: number; online: number; busy: number; idle: number };
   queues?: {
@@ -471,6 +493,7 @@ export interface SystemStatusSummary {
     requests?: RequestSloSummary;
     jobs?: JobSloSummary;
   };
+  llmUsage?: LlmUsageSummary;
   repo?: SystemRepoSummary;
   autonomy?: AutonomyOpsSummary;
   ts?: string;
@@ -746,6 +769,7 @@ export async function fetchSystemStatus(
       workers: payload.workers,
       queues: payload.queues,
       slo: payload.slo,
+      llmUsage: payload.llmUsage,
       autonomy: payload.autonomy,
       repo: payload.repo,
       ts: payload.ts,

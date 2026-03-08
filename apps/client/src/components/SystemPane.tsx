@@ -13,6 +13,7 @@ import {
   clip,
   formatDuration,
   formatPercent,
+  formatTokenCount,
   prettyTs,
   queueValue,
   relativeMs,
@@ -64,6 +65,14 @@ function serializeUnknown(value: unknown, maxChars = 320): string {
   } catch {
     return clip(String(value), maxChars);
   }
+}
+
+function serviceLabel(service: string): string {
+  const normalized = service.trim().toLowerCase();
+  if (normalized === "localbuddy") return "LocalBuddy";
+  if (normalized === "remotebuddy") return "RemoteBuddy";
+  if (normalized === "workerpals") return "WorkerPals";
+  return service || "Unknown";
 }
 
 function initialDraftForQuestion(question: AutonomyQuestionRow): string {
@@ -197,6 +206,7 @@ export function SystemPane({
   const recentEvents = useMemo(() => events.slice(-40).reverse(), [events]);
   const requestSlo = systemSummary.slo?.requests;
   const jobSlo = systemSummary.slo?.jobs;
+  const llmUsage = systemSummary.llmUsage;
   const autonomyOps = systemSummary.autonomy ?? autonomyInsights.opsSummary;
   const safety = autonomyOps?.safetyState ?? null;
   const evaluator = autonomyOps?.latestEvaluatorScorecard ?? autonomyInsights.latestEvaluatorScorecard;
@@ -220,6 +230,28 @@ export function SystemPane({
         .slice(0, 20),
     [autonomyQuestions],
   );
+  const llmUsageRows = useMemo(() => {
+    const defaults = ["localbuddy", "remotebuddy", "workerpals"];
+    const byService = new Map((llmUsage?.services ?? []).map((row) => [row.service.toLowerCase(), row]));
+    for (const service of defaults) {
+      if (!byService.has(service)) {
+        byService.set(service, {
+          service,
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+          callCount: 0,
+          avgTokensPerCall: null,
+          estimatedCallCount: 0,
+          lastCallAt: null,
+        });
+      }
+    }
+    return [...byService.values()].sort((a, b) => {
+      if (b.totalTokens !== a.totalTokens) return b.totalTokens - a.totalTokens;
+      return serviceLabel(a.service).localeCompare(serviceLabel(b.service));
+    });
+  }, [llmUsage]);
 
   useEffect(() => {
     setQuestionDrafts((prev) => {
@@ -348,6 +380,13 @@ export function SystemPane({
           theme={theme}
         />
         <MetricTile
+          title={`LLM Tokens (${llmUsage?.windowHours ?? 24}h)`}
+          value={formatTokenCount(llmUsage?.totalTokens)}
+          detail={`${llmUsage?.callCount ?? 0} calls | avg ${formatTokenCount(llmUsage?.avgTokensPerCall)}`}
+          tone={llmUsage && llmUsage.callCount > 0 ? "accent" : "warning"}
+          theme={theme}
+        />
+        <MetricTile
           title="Trusted Sources"
           value={String(autonomyInsights.trustedInspirationShortlist.length)}
           detail={`watchlist ${watchlistCount} | archived ${autonomyInsights.archivedInspirationSources.length}`}
@@ -379,6 +418,83 @@ export function SystemPane({
           detail={`timeout ${formatPercent(jobSlo?.timeoutRate)} | p95 run ${formatDuration(jobSlo?.durationMs?.p95)}`}
           theme={theme}
         />
+      </View>
+
+      <View
+        style={[styles.insightPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}
+      >
+        <View style={styles.rowBetween}>
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            LLM Usage
+          </Text>
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            {llmUsage?.windowHours ?? 24}h window | {llmUsage?.callCount ?? 0} calls
+          </Text>
+        </View>
+        <Text style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          total {formatTokenCount(llmUsage?.totalTokens)} tokens | prompt{" "}
+          {formatTokenCount(llmUsage?.promptTokens)} | completion{" "}
+          {formatTokenCount(llmUsage?.completionTokens)} | avg{" "}
+          {formatTokenCount(llmUsage?.avgTokensPerCall)} per call
+        </Text>
+        {llmUsage && llmUsage.estimatedCallCount > 0 ? (
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            {llmUsage.estimatedCallCount} call{llmUsage.estimatedCallCount === 1 ? "" : "s"} using estimated token counts.
+          </Text>
+        ) : null}
+        <View style={styles.systemGrid}>
+          {llmUsageRows.map((row) => (
+            <View
+              key={`llm-${row.service}`}
+              style={[
+                styles.systemCard,
+                { borderColor: theme.border, backgroundColor: theme.panelAlt },
+              ]}
+            >
+              <View style={styles.rowBetween}>
+                <Text style={[styles.systemTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+                  {serviceLabel(row.service)}
+                </Text>
+                <Text
+                  style={[
+                    styles.systemMeta,
+                    {
+                      color: row.callCount > 0 ? theme.accent : theme.textMuted,
+                      fontFamily: theme.fontMono,
+                    },
+                  ]}
+                >
+                  {row.callCount} call{row.callCount === 1 ? "" : "s"}
+                </Text>
+              </View>
+              <Text
+                style={[
+                  styles.tokenValue,
+                  {
+                    color: row.totalTokens > 0 ? theme.accent : theme.textMuted,
+                    fontFamily: theme.fontSans,
+                  },
+                ]}
+              >
+                {formatTokenCount(row.totalTokens)}
+              </Text>
+              <Text style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                avg {formatTokenCount(row.avgTokensPerCall)} / call
+              </Text>
+              <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+                in {formatTokenCount(row.promptTokens)} | out {formatTokenCount(row.completionTokens)}
+              </Text>
+              <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                {row.lastCallAt ? `last call ${relativeMs(row.lastCallAt)}` : "no usage recorded"}
+              </Text>
+              {row.estimatedCallCount > 0 ? (
+                <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                  estimated {row.estimatedCallCount} call{row.estimatedCallCount === 1 ? "" : "s"}
+                </Text>
+              ) : null}
+            </View>
+          ))}
+        </View>
       </View>
 
       <View
@@ -1059,6 +1175,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   systemTitle: { fontSize: 14, fontWeight: "700" },
+  tokenValue: { fontSize: 24, fontWeight: "700", marginTop: 6 },
   systemDetail: { fontSize: 12, marginTop: 7 },
   systemMeta: { fontSize: 11, marginTop: 5 },
   workerPanel: {
