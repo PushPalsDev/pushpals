@@ -648,6 +648,56 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("aggregates llm usage by service with average tokens per call", () => {
+    const store = makeStore();
+
+    expect(
+      store.recordLlmUsage({
+        id: "usage_local_1",
+        service: "localbuddy",
+        promptTokens: 120,
+        completionTokens: 30,
+      }).ok,
+    ).toBe(true);
+    expect(
+      store.recordLlmUsage({
+        id: "usage_local_2",
+        service: "localbuddy",
+        promptTokens: 80,
+        completionTokens: 20,
+        estimated: true,
+      }).ok,
+    ).toBe(true);
+    expect(
+      store.recordLlmUsage({
+        id: "usage_remote_1",
+        service: "remotebuddy",
+        promptTokens: 200,
+        completionTokens: 50,
+      }).ok,
+    ).toBe(true);
+
+    const summary = store.getLlmUsageSummary({ windowHours: 24 });
+
+    expect(summary.callCount).toBe(3);
+    expect(summary.totalTokens).toBe(500);
+    expect(summary.avgTokensPerCall).toBeCloseTo(500 / 3, 5);
+    expect(summary.estimatedCallCount).toBe(1);
+
+    const localbuddy = summary.services.find((row) => row.service === "localbuddy");
+    expect(localbuddy).toBeDefined();
+    expect(localbuddy?.callCount).toBe(2);
+    expect(localbuddy?.totalTokens).toBe(250);
+    expect(localbuddy?.avgTokensPerCall).toBe(125);
+    expect(localbuddy?.estimatedCallCount).toBe(1);
+
+    const remotebuddy = summary.services.find((row) => row.service === "remotebuddy");
+    expect(remotebuddy).toBeDefined();
+    expect(remotebuddy?.callCount).toBe(1);
+    expect(remotebuddy?.totalTokens).toBe(250);
+    expect(remotebuddy?.avgTokensPerCall).toBe(250);
+  });
+
   test("persists candidates with run-scoped ids to prevent cross-run overwrites", () => {
     const store = makeStore();
     const snapshotA = store.createSnapshot({ sessionId: "s1", runId: "run_a" }).snapshot_id;
