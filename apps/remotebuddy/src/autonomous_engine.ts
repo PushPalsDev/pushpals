@@ -46,6 +46,7 @@ type AutonomyCandidate = {
   requires_user_input?: boolean;
   question_if_blocked?: string;
   candidate_created_at: string;
+  debug?: Record<string, unknown>;
   engine_trial?: {
     building_block_id: string;
     algorithm: string;
@@ -63,12 +64,40 @@ type AutonomyCandidate = {
   };
 };
 
-type Snapshot = {
+type ReliabilityGateMode = "normal" | "fallback";
+
+type QueueTelemetrySummary = {
+  queueP95Ms: number | null;
+  jobFailureRate: number | null;
+  sampleCount: number;
+  sources: string[];
+  hasTelemetry: boolean;
+};
+
+type ReliabilityGateDecision = {
+  allowed: boolean;
+  mode: ReliabilityGateMode;
+  reason?: string;
+  penalty?: number;
+  telemetry: QueueTelemetrySummary;
+};
+
+type SnapshotSignal = {
+  signal_id: string;
+  type: string;
+  value: number;
+  evidence: string;
+  metadata?: Record<string, unknown>;
+  sample_id?: string;
+  sampleId?: string;
+} & Record<string, unknown>;
+
+export type Snapshot = {
   snapshot_id: string;
   snapshot_created_at: string;
   snapshot_ttl_ms: number;
   impact_model_version: string;
-  top_signals: Array<{ signal_id: string; type: string; value: number; evidence: string }>;
+  top_signals: SnapshotSignal[];
   state_traits: Array<{
     trait_id: string;
     category: "strength" | "weakness" | "opportunity" | "risk";
@@ -147,6 +176,422 @@ type Snapshot = {
     created_at?: string | null;
   };
 };
+
+const TELEMETRY_UNIT_PATTERN = "(?:[a-z%]+)";
+const TELEMETRY_ENTRY_RE = new RegExp(
+  `\\s*([a-z][a-z0-9_]+)\\s*(?:[:=~]\\s*|\\s+)?([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))(?:\\s*(${TELEMETRY_UNIT_PATTERN})(?=[,;\\s]|$))?(?:[,;\\s]+)?`,
+  "gi",
+);
+const TELEMETRY_KEY_ALIASES: Record<string, "queueP95Ms" | "jobFailureRate" | "sampleCount"> = {
+  queue_p95: "queueP95Ms",
+  queue_p95_ms: "queueP95Ms",
+  queue_ms_p95: "queueP95Ms",
+  queue_latency_p95: "queueP95Ms",
+  job_failure_rate: "jobFailureRate",
+  failure_rate: "jobFailureRate",
+  failure_pct: "jobFailureRate",
+  job_failure_pct: "jobFailureRate",
+  sample_size: "sampleCount",
+  samples: "sampleCount",
+  sample_count: "sampleCount",
+};
+const TELEMETRY_SECOND_UNITS = new Set(["s", "sec", "secs", "second", "seconds"]);
+const TELEMETRY_MILLISECOND_UNITS = new Set(["ms", "millis", "millisecond", "milliseconds"]);
+const TELEMETRY_PERCENT_UNITS = new Set(["%", "percent", "pct", "perc"]);
+const TELEMETRY_ID_TIMESTAMP_FIELDS = [
+  "window_start",
+  "windowStart",
+  "window_started_at",
+  "windowStartedAt",
+  "window_start_ms",
+  "windowStartMs",
+  "window_end",
+  "windowEnd",
+  "window_ended_at",
+  "windowEndedAt",
+  "observed_at",
+  "observedAt",
+  "captured_at",
+  "capturedAt",
+  "collected_at",
+  "collectedAt",
+  "sample_timestamp",
+  "sampleTimestamp",
+  "timestamp",
+  "ts",
+];
+const TELEMETRY_ID_WINDOW_LABEL_FIELDS = [
+  "window_label",
+  "windowLabel",
+  "window_bucket",
+  "windowBucket",
+  "time_window",
+  "timeWindow",
+  "interval_label",
+  "intervalLabel",
+  "window",
+];
+const TELEMETRY_ID_WINDOW_DURATION_FIELDS = [
+  "window_duration_ms",
+  "windowDurationMs",
+  "window_ms",
+  "windowMs",
+  "duration_ms",
+  "durationMs",
+];
+const TELEMETRY_ID_WINDOW_INTERVAL_FIELDS = [
+  "window_minutes",
+  "windowMinutes",
+  "window_seconds",
+  "windowSeconds",
+  "window_size",
+  "windowSize",
+];
+const TELEMETRY_ID_SOURCE_FIELDS = [
+  "source",
+  "source_id",
+  "sourceId",
+  "source_queue",
+  "sourceQueue",
+  "queue",
+  "queue_name",
+  "queueName",
+  "stream",
+  "worker",
+  "service",
+];
+const TELEMETRY_ID_REGION_FIELDS = ["region", "cluster", "shard", "workspace", "deployment"];
+const TELEMETRY_ID_DIGEST_FIELDS = ["sample_hash", "sampleHash", "sample_digest", "sampleDigest", "digest", "checksum"];
+const FALLBACK_SLOT_THRESHOLDS: Array<{ saturation: number; slots: number }> = [
+  { saturation: 0.85, slots: 0 },
+  { saturation: 0.6, slots: 1 },
+];
+const FALLBACK_MAX_SLOTS = 2;
+const FALLBACK_MIN_PENALTY = 0.03;
+const FALLBACK_MAX_PENALTY = 0.07;
+const TELEMETRY_NESTED_METADATA_FIELDS = ["window", "interval", "context", "bucket", "range"];
+
+function parseTelemetryEvidence(evidence: string): {
+  queueP95Ms?: number;
+  jobFailureRate?: number;
+  sampleCount?: number;
+} {
+  TELEMETRY_ENTRY_RE.lastIndex = 0;
+  const summary: { queueP95Ms?: number; jobFailureRate?: number; sampleCount?: number } = {};
+  const normalized = evidence
+    .toLowerCase()
+    .replace(/(^|[\s,;])([a-z][a-z0-9\s/.-]+)(?=\s*[:=~])/gi, (match, prefix: string, segment: string) => {
+      return `${prefix}${segment.replace(/\s+/g, "_")}`;
+    });
+  let match: RegExpExecArray | null;
+  while ((match = TELEMETRY_ENTRY_RE.exec(normalized)) != null) {
+    const rawKey = match[1];
+    const key = rawKey.replace(/[^a-z0-9]+/g, "_");
+    const alias = TELEMETRY_KEY_ALIASES[key];
+    if (!alias) continue;
+    const rawValue = Number(match[2]);
+    if (!Number.isFinite(rawValue)) continue;
+    const unit = match[3]?.toLowerCase() ?? "";
+    if (alias === "queueP95Ms") {
+      const asMs = convertLatencyToMs(rawValue, unit);
+      if (asMs !== null && Number.isFinite(asMs)) summary.queueP95Ms = asMs;
+    } else if (alias === "jobFailureRate") {
+      summary.jobFailureRate = normalizeFailureRate(rawValue, unit);
+    } else if (alias === "sampleCount") {
+      summary.sampleCount = Math.max(0, Math.floor(rawValue));
+    }
+  }
+  return summary;
+}
+
+function convertLatencyToMs(value: number, unit: string): number | null {
+  const normalizedUnit = unit.trim().toLowerCase();
+  if (normalizedUnit.length === 0 || TELEMETRY_MILLISECOND_UNITS.has(normalizedUnit)) return value;
+  if (TELEMETRY_SECOND_UNITS.has(normalizedUnit)) return value * 1_000;
+  return null;
+}
+
+function normalizeFailureRate(value: number, unit: string): number {
+  const needsPercentConversion = TELEMETRY_PERCENT_UNITS.has(unit) || Math.abs(value) > 1;
+  const normalized = needsPercentConversion ? value / 100 : value;
+  return clamp01(normalized);
+}
+
+function fallbackSlotCapacity(dispatchSaturation: number): number {
+  for (const tier of FALLBACK_SLOT_THRESHOLDS) {
+    if (dispatchSaturation >= tier.saturation) return tier.slots;
+  }
+  return FALLBACK_MAX_SLOTS;
+}
+
+function fallbackPenalty(dispatchSaturation: number): number {
+  const normalized = clamp01(dispatchSaturation);
+  const penalty =
+    FALLBACK_MIN_PENALTY + (FALLBACK_MAX_PENALTY - FALLBACK_MIN_PENALTY) * normalized;
+  return Math.round(penalty * 1_000) / 1_000;
+}
+
+function normalizeTelemetryTimestampToken(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (Math.abs(value) > 1_000_000_000_000) return new Date(Math.trunc(value)).toISOString();
+    if (Math.abs(value) > 1_000_000_000) return new Date(Math.trunc(value) * 1_000).toISOString();
+    return Math.trunc(value).toString();
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return undefined;
+    if (/^[+-]?\d+$/.test(text)) {
+      const parsed = Number(text);
+      if (text.length >= 13) return new Date(parsed).toISOString();
+      if (text.length >= 10) return new Date(parsed * 1_000).toISOString();
+      return text;
+    }
+    const timestamp = Date.parse(text);
+    if (!Number.isNaN(timestamp)) return new Date(timestamp).toISOString();
+    return text.toLowerCase();
+  }
+  return undefined;
+}
+
+function normalizeTelemetryStringToken(value: unknown): string | undefined {
+  const text = asString(value);
+  return text ? text.toLowerCase() : undefined;
+}
+
+function normalizeTelemetryNumberToken(value: unknown): string | undefined {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return undefined;
+  return Math.round(num).toString();
+}
+
+function pickTelemetryIdentityToken(
+  sources: Record<string, unknown>[],
+  fields: readonly string[],
+  normalizer: (value: unknown) => string | undefined,
+): string | undefined {
+  for (const source of sources) {
+    for (const field of fields) {
+      if (!source) continue;
+      const raw = (source as Record<string, unknown>)[field];
+      const normalized = normalizer(raw);
+      if (normalized) return normalized;
+    }
+  }
+  return undefined;
+}
+
+function buildTelemetryIdentitySources(
+  metadata: Record<string, unknown>,
+  record: Record<string, unknown>,
+): Record<string, unknown>[] {
+  const sources: Record<string, unknown>[] = [metadata];
+  for (const key of TELEMETRY_NESTED_METADATA_FIELDS) {
+    const nested = asObject(metadata[key]);
+    if (Object.keys(nested).length > 0) sources.push(nested);
+  }
+  sources.push(record);
+  return sources;
+}
+
+function canonicalizeQueueSampleIdentity(signal: Snapshot["top_signals"][number]): string | null {
+  const record = signal as Record<string, unknown>;
+  const metadata = asObject(record.metadata);
+  const sampleId =
+    asString(record.sample_id ?? record.sampleId) || asString(metadata.sample_id ?? metadata.sampleId);
+  if (sampleId) return `sample:${sampleId}`;
+  const identitySources = buildTelemetryIdentitySources(metadata, record);
+  const timestampToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_TIMESTAMP_FIELDS,
+    normalizeTelemetryTimestampToken,
+  );
+  const windowToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_WINDOW_LABEL_FIELDS,
+    normalizeTelemetryStringToken,
+  );
+  const bucketToken = pickTelemetryIdentityToken(
+    identitySources,
+    ["bucket_label", "bucketLabel"],
+    normalizeTelemetryStringToken,
+  );
+  const durationToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_WINDOW_DURATION_FIELDS,
+    normalizeTelemetryNumberToken,
+  );
+  const intervalToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_WINDOW_INTERVAL_FIELDS,
+    normalizeTelemetryNumberToken,
+  );
+  const sourceToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_SOURCE_FIELDS,
+    normalizeTelemetryStringToken,
+  );
+  const regionToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_REGION_FIELDS,
+    normalizeTelemetryStringToken,
+  );
+  const digestToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_DIGEST_FIELDS,
+    normalizeTelemetryStringToken,
+  );
+  const tokens: string[] = [];
+  if (timestampToken) tokens.push(`ts=${timestampToken}`);
+  if (windowToken) tokens.push(`wl=${windowToken}`);
+  if (bucketToken) tokens.push(`wb=${bucketToken}`);
+  if (durationToken) tokens.push(`dur=${durationToken}`);
+  if (intervalToken) tokens.push(`span=${intervalToken}`);
+  if (sourceToken) tokens.push(`src=${sourceToken}`);
+  if (regionToken) tokens.push(`region=${regionToken}`);
+  if (digestToken) tokens.push(`hash=${digestToken}`);
+  const hasWindowContext = Boolean(windowToken || bucketToken || durationToken || intervalToken);
+  const hasStrongIdentity =
+    Boolean(digestToken) ||
+    (Boolean(timestampToken) && (Boolean(sourceToken) || hasWindowContext || Boolean(regionToken)));
+  if (hasStrongIdentity && tokens.length > 0) {
+    return `meta:${tokens.join("|")}`;
+  }
+  const signalId = asString(record.signal_id);
+  return signalId ? `signal:${signalId}` : null;
+}
+
+function conservativeMax(current?: number, next?: number): number | undefined {
+  if (!Number.isFinite(next ?? Number.NaN)) return current;
+  if (!Number.isFinite(current ?? Number.NaN)) return next;
+  return Math.max(current as number, next as number);
+}
+
+export function extractQueueTelemetryFromSignals(
+  signals: Snapshot["top_signals"],
+): QueueTelemetrySummary {
+  const dedup = new Map<string, { queueP95Ms?: number; jobFailureRate?: number; sampleCount: number }>();
+  const sourceIds = new Set<string>();
+  for (const signal of signals) {
+    if (String(signal.type ?? "").toLowerCase() !== "queue_health") continue;
+    const evidence = String(signal.evidence ?? "").trim();
+    if (!evidence) continue;
+    const parsed = parseTelemetryEvidence(evidence);
+    const hasQueueValue = Number.isFinite(parsed.queueP95Ms ?? Number.NaN);
+    const hasFailureValue = Number.isFinite(parsed.jobFailureRate ?? Number.NaN);
+    if (!hasQueueValue && !hasFailureValue) continue;
+    const identity = canonicalizeQueueSampleIdentity(signal);
+    if (!identity) continue;
+    const signalId = asString(signal.signal_id);
+    if (signalId) sourceIds.add(signalId);
+    const sampleCount = Math.max(1, parsed.sampleCount ?? 1);
+    const existing = dedup.get(identity);
+    if (!existing) {
+      dedup.set(identity, {
+        queueP95Ms: parsed.queueP95Ms,
+        jobFailureRate: parsed.jobFailureRate,
+        sampleCount,
+      });
+      continue;
+    }
+    existing.sampleCount = Math.max(existing.sampleCount, sampleCount);
+    existing.queueP95Ms = conservativeMax(existing.queueP95Ms, parsed.queueP95Ms);
+    existing.jobFailureRate = conservativeMax(existing.jobFailureRate, parsed.jobFailureRate);
+  }
+  const queueP95Values: number[] = [];
+  const jobFailureRateValues: number[] = [];
+  let sampleCount = 0;
+  for (const entry of dedup.values()) {
+    if (Number.isFinite(entry.queueP95Ms ?? Number.NaN)) queueP95Values.push(entry.queueP95Ms as number);
+    if (Number.isFinite(entry.jobFailureRate ?? Number.NaN))
+      jobFailureRateValues.push(entry.jobFailureRate as number);
+    sampleCount += entry.sampleCount;
+  }
+  const hasTelemetry = queueP95Values.length > 0 || jobFailureRateValues.length > 0;
+  return {
+    queueP95Ms: queueP95Values.length > 0 ? Math.max(...queueP95Values) : null,
+    jobFailureRate: jobFailureRateValues.length > 0 ? Math.max(...jobFailureRateValues) : null,
+    sampleCount,
+    sources: [...sourceIds].sort(),
+    hasTelemetry,
+  };
+}
+
+function normalizedQueuePressure(queueP95Ms: number | null): number {
+  if (!Number.isFinite(queueP95Ms ?? Number.NaN)) return 0;
+  // Treat <=90s as healthy, >=180s as saturated.
+  return clamp01((Number(queueP95Ms) - 90_000) / 90_000);
+}
+
+function isReliabilityCandidate(candidate: AutonomyCandidate): boolean {
+  if (candidate.trigger_type === "queue_health") return true;
+  if (candidate.engine_trial?.gap_ids?.some((gap) => gap === "delivery_reliability_gap")) return true;
+  if (candidate.why_now_signal_ids.some((id) => id.toLowerCase().includes("queue"))) return true;
+  return false;
+}
+
+export class ReliabilityCapacityGate {
+  private readonly telemetry: QueueTelemetrySummary;
+  private fallbackSlotsRemaining: number;
+  private readonly fallbackSlotBudget: number;
+  private readonly fallbackPenalty: number;
+  private readonly dispatchSaturation: number;
+
+  constructor(private readonly snapshot: Snapshot, private readonly config: PushPalsConfig["remotebuddy"]["autonomy"]) {
+    this.telemetry = extractQueueTelemetryFromSignals(snapshot.top_signals);
+    const maxDispatch = Math.max(1, config.maxDispatchPerHour);
+    this.dispatchSaturation = clamp01(snapshot.dispatch_budget.global_count_last_hour / maxDispatch);
+    if (this.telemetry.hasTelemetry) {
+      this.fallbackSlotBudget = Number.POSITIVE_INFINITY;
+      this.fallbackSlotsRemaining = Number.POSITIVE_INFINITY;
+      this.fallbackPenalty = 0;
+    } else {
+      this.fallbackSlotBudget = fallbackSlotCapacity(this.dispatchSaturation);
+      this.fallbackSlotsRemaining = this.fallbackSlotBudget;
+      this.fallbackPenalty = fallbackPenalty(this.dispatchSaturation);
+    }
+  }
+
+  evaluate(candidate: AutonomyCandidate): ReliabilityGateDecision {
+    const telemetry = this.telemetry;
+    if (!isReliabilityCandidate(candidate)) {
+      return { allowed: true, mode: telemetry.hasTelemetry ? "normal" : "fallback", telemetry };
+    }
+    if (!telemetry.hasTelemetry) {
+      if (this.fallbackSlotsRemaining <= 0) {
+        return {
+          allowed: false,
+          mode: "fallback",
+          reason:
+            this.fallbackSlotBudget <= 0
+              ? "reliability_dispatch_saturated"
+              : "reliability_gate_fallback_slot_exhausted",
+          telemetry,
+        };
+      }
+      this.fallbackSlotsRemaining -= 1;
+      return {
+        allowed: true,
+        mode: "fallback",
+        penalty: this.fallbackPenalty,
+        telemetry,
+      };
+    }
+    const queuePressure = normalizedQueuePressure(telemetry.queueP95Ms);
+    if (queuePressure >= 0.95 && this.dispatchSaturation >= 0.8) {
+      return {
+        allowed: false,
+        mode: "normal",
+        reason: "reliability_queue_capacity_saturated",
+        telemetry,
+      };
+    }
+    return { allowed: true, mode: "normal", telemetry };
+  }
+
+  summary(): QueueTelemetrySummary {
+    return this.telemetry;
+  }
+}
 
 type PolicyRule = {
   maxRisk: "low" | "medium" | "high";
@@ -3617,6 +4062,8 @@ export class RemoteBuddyAutonomousEngine {
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
 
       const llmCalls: Record<string, unknown>[] = [];
+      const reliabilityGate = new ReliabilityCapacityGate(snapshot, this.cfg);
+      const reliabilityGateMeta = new Map<string, ReliabilityGateDecision>();
       let candidatesPayload: Array<Record<string, unknown>> = [];
       let selectedCandidatePayload: Record<string, unknown> | undefined;
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
@@ -3798,6 +4245,20 @@ export class RemoteBuddyAutonomousEngine {
               };
             }
           }
+          const gateDecision = reliabilityGate.evaluate(candidate);
+          if (!gateDecision.allowed) {
+            recordDropReason(`${source}_${gateDecision.reason ?? "reliability_gate_blocked"}`);
+            continue;
+          }
+          if (isReliabilityCandidate(candidate)) {
+            reliabilityGateMeta.set(candidate.id, gateDecision);
+            candidate.debug = {
+              ...(candidate.debug ?? {}),
+              reliability_gate_mode: gateDecision.mode,
+              ...(gateDecision.reason ? { reliability_gate_reason: gateDecision.reason } : {}),
+              queue_telemetry_sources: gateDecision.telemetry.sources,
+            };
+          }
           normalizedCandidates.push(candidate);
         }
       };
@@ -3831,6 +4292,7 @@ export class RemoteBuddyAutonomousEngine {
         vision_section_refs: candidate.vision_section_refs,
         feature_hypotheses: candidate.feature_hypotheses,
         ...(candidate.engine_trial ? { engine_trial: candidate.engine_trial } : {}),
+        ...(candidate.debug ? { debug: candidate.debug } : {}),
         gate_decision: "proposed",
         gate_reasons: [],
         candidate_created_at: candidate.candidate_created_at,
@@ -3905,7 +4367,11 @@ export class RemoteBuddyAutonomousEngine {
       const scored = normalizedCandidates.map((candidate) => {
         const llmScore = scoreById.get(candidate.id) ?? 0;
         const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore);
-        return { candidate, llmScore, ...scoredCandidate };
+        const gateMeta = reliabilityGateMeta.get(candidate.id);
+        const adjustedScore = gateMeta?.penalty
+          ? clamp01(scoredCandidate.finalScore - gateMeta.penalty)
+          : scoredCandidate.finalScore;
+        return { candidate, llmScore, ...scoredCandidate, finalScore: adjustedScore, reliabilityGate: gateMeta };
       });
       scored.sort((a, b) => {
         if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
@@ -3964,6 +4430,7 @@ export class RemoteBuddyAutonomousEngine {
         vision_section_refs: row.candidate.vision_section_refs,
         feature_hypotheses: row.candidate.feature_hypotheses,
         ...(row.candidate.engine_trial ? { engine_trial: row.candidate.engine_trial } : {}),
+        ...(row.candidate.debug ? { debug: row.candidate.debug } : {}),
         llm_score: row.llmScore,
         impact_signal: row.impactSignal,
         ema_success: row.emaSuccess,
