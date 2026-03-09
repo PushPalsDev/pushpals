@@ -43,6 +43,21 @@ const actionFor = (code: StartupFailureCode): string => {
   return entry.action;
 };
 
+describe("STARTUP_FAILURE_CODES", () => {
+  test("exports stable literal mappings", () => {
+    expect(STARTUP_FAILURE_CODES).toEqual({
+      BUN_VERSION_UNSUPPORTED: "startup.bun_version_unsupported",
+      DOCKER_VERSION_UNSUPPORTED: "startup.docker_version_unsupported",
+      MERGE_IN_PROGRESS: "startup.merge_in_progress",
+      REPO_DIRTY: "startup.repo_dirty",
+      ALERTS_ACTIVE: "startup.alerts_active",
+      SYNTHETIC_FAILED: "startup.synthetic_failed",
+      DISPATCH_FAILED: "startup.dispatch_failed",
+    });
+    expect(Object.isFrozen(STARTUP_FAILURE_CODES)).toBe(true);
+  });
+});
+
 describe("StartupChecklist", () => {
   test(
     "surfaces actionable failure codes for merge or dirty states",

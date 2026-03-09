@@ -815,6 +815,194 @@ type EngineIdeaBlueprint = {
   candidate_shape: EngineCandidateShape;
 };
 
+export type QueueHealthMetricKind = "queue_latency_ms" | "job_failure_rate";
+export type QueueHealthMetricSource = "signal" | "trait";
+
+export interface QueueHealthMetric {
+  metric: QueueHealthMetricKind;
+  value: number;
+  sourceType: QueueHealthMetricSource;
+  sourceId: string;
+  evidence: string;
+}
+
+const MICRO_SYMBOL_REGEX = /[\u00B5\u03BC]/gi;
+const LATENCY_UNIT_PATTERN = "(?:ms|milliseconds?|us|usec|microseconds?|microsecond|s|sec(?:ond)?s?)";
+const LATENCY_PATTERNS: RegExp[] = [
+  new RegExp(
+    `queue[_ ]?p95\\s*[:=]?\\s*([+-]?\\d+(?:[.,]\\d+)?)(?:\\s*(${LATENCY_UNIT_PATTERN}))?`,
+    "i",
+  ),
+  new RegExp(
+    `latency\\s*[:=]?\\s*([+-]?\\d+(?:[.,]\\d+)?)(?:\\s*(${LATENCY_UNIT_PATTERN}))?`,
+    "i",
+  ),
+  new RegExp(
+    `p95\\s*[:=]?\\s*([+-]?\\d+(?:[.,]\\d+)?)(?:\\s*(${LATENCY_UNIT_PATTERN}))?`,
+    "i",
+  ),
+];
+const LATENCY_UNIT_TO_MS: Record<string, number> = {
+  ms: 1,
+  millisecond: 1,
+  milliseconds: 1,
+  s: 1000,
+  sec: 1000,
+  secs: 1000,
+  second: 1000,
+  seconds: 1000,
+  us: 0.001,
+  usec: 0.001,
+  microsecond: 0.001,
+  microseconds: 0.001,
+};
+const SOURCE_RANK: Record<QueueHealthMetricSource, number> = { signal: 2, trait: 1 };
+const QUEUE_TRAIT_KEYWORDS = ["queue", "backpressure", "backlog", "dispatch", "pending"];
+const QUEUE_EVIDENCE_KEYWORDS = ["queue", "backpressure", "backlog", "dispatch", "pending"];
+
+export function parseLatencyEvidenceInMs(evidence: string | null | undefined): number | null {
+  const text = asString(evidence);
+  if (!text) return null;
+  const normalized = text.normalize("NFKC").replace(MICRO_SYMBOL_REGEX, "u");
+  for (const pattern of LATENCY_PATTERNS) {
+    const match = normalized.match(pattern);
+    if (!match) continue;
+    const rawValue = match[1]?.replace(/,/g, "");
+    const parsedValue = Number(rawValue);
+    if (!Number.isFinite(parsedValue)) continue;
+    const rawUnit = (match[2] || "ms").replace(MICRO_SYMBOL_REGEX, "u");
+    const unit = rawUnit.replace(/[^a-z]/gi, "").toLowerCase();
+    const multiplier = LATENCY_UNIT_TO_MS[unit] ?? 1;
+    return parsedValue * multiplier;
+  }
+  return null;
+}
+
+export function extractQueueHealthMetrics(params: {
+  topSignals?: Snapshot["top_signals"];
+  stateTraits?: Snapshot["state_traits"];
+}): QueueHealthMetric[] {
+  const topSignals = Array.isArray(params.topSignals) ? params.topSignals : [];
+  const stateTraits = Array.isArray(params.stateTraits) ? params.stateTraits : [];
+  const candidates: QueueHealthMetric[] = [];
+  const pushCandidate = (
+    metric: QueueHealthMetricKind,
+    value: number | null,
+    sourceType: QueueHealthMetricSource,
+    sourceId: string,
+    evidence: string,
+  ): void => {
+    if (value === null || !Number.isFinite(value)) return;
+    candidates.push({
+      metric,
+      value,
+      sourceType,
+      sourceId,
+      evidence,
+    });
+  };
+
+  for (const signal of topSignals) {
+    if (asString(signal.type).toLowerCase() !== "queue_health") continue;
+    const evidence = asString(signal.evidence);
+    if (!evidence) continue;
+    const sourceId = asString(signal.signal_id) || "queue_signal";
+    pushCandidate("queue_latency_ms", parseLatencyEvidenceInMs(evidence), "signal", sourceId, evidence);
+    pushCandidate(
+      "job_failure_rate",
+      parseJobFailureRateFromEvidence(evidence),
+      "signal",
+      sourceId,
+      evidence,
+    );
+  }
+
+  for (const trait of stateTraits) {
+    if (!isQueueRelevantTrait(trait)) continue;
+    const evidence = asString(trait.evidence);
+    if (!evidence) continue;
+    const sourceId = asString(trait.trait_id) || "queue_trait";
+    pushCandidate("queue_latency_ms", parseLatencyEvidenceInMs(evidence), "trait", sourceId, evidence);
+    pushCandidate(
+      "job_failure_rate",
+      parseJobFailureRateFromEvidence(evidence),
+      "trait",
+      sourceId,
+      evidence,
+    );
+  }
+
+  const bestByMetric = new Map<QueueHealthMetricKind, QueueHealthMetric>();
+  for (const candidate of candidates) {
+    const current = bestByMetric.get(candidate.metric);
+    if (!current) {
+      bestByMetric.set(candidate.metric, candidate);
+      continue;
+    }
+    const currentRank = SOURCE_RANK[current.sourceType];
+    const candidateRank = SOURCE_RANK[candidate.sourceType];
+    if (candidateRank > currentRank) {
+      bestByMetric.set(candidate.metric, candidate);
+      continue;
+    }
+    if (candidateRank < currentRank) continue;
+    if (candidate.value > current.value) {
+      bestByMetric.set(candidate.metric, candidate);
+      continue;
+    }
+    if (candidate.value === current.value && candidate.sourceId.localeCompare(current.sourceId) < 0) {
+      bestByMetric.set(candidate.metric, candidate);
+    }
+  }
+
+  return [...bestByMetric.values()].sort((a, b) => {
+    if (a.metric === b.metric) {
+      if (a.sourceType === b.sourceType) {
+        if (a.value === b.value) {
+          return a.sourceId.localeCompare(b.sourceId);
+        }
+        return b.value - a.value;
+      }
+      return SOURCE_RANK[b.sourceType] - SOURCE_RANK[a.sourceType];
+    }
+    return a.metric.localeCompare(b.metric);
+  });
+}
+
+function includesKeyword(text: string, keywords: string[]): boolean {
+  if (!text) return false;
+  const normalized = text.toLowerCase();
+  return keywords.some((keyword) => normalized.includes(keyword));
+}
+
+function isQueueRelevantTrait(trait: Snapshot["state_traits"][number]): boolean {
+  const traitId = asString(trait?.trait_id);
+  const focus = asString(trait?.focus);
+  if (includesKeyword(traitId, QUEUE_TRAIT_KEYWORDS) || includesKeyword(focus, QUEUE_TRAIT_KEYWORDS)) {
+    return true;
+  }
+  const evidence = asString(trait?.evidence);
+  if (!evidence) return false;
+  return includesKeyword(evidence, QUEUE_EVIDENCE_KEYWORDS);
+}
+
+export function parseJobFailureRateFromEvidence(evidence: string | null | undefined): number | null {
+  const text = asString(evidence);
+  if (!text) return null;
+  const match = text.match(
+    /job[_ ]?failure[_ ]?rate\s*[:=]?\s*([+-]?\d+(?:[.,]\d+)?)(?:\s*(%|percent|pct))?/i,
+  );
+  if (!match) return null;
+  const numericValue = Number(match[1].replace(/,/g, ""));
+  if (!Number.isFinite(numericValue)) return null;
+  const unit = match[2]?.toLowerCase() ?? "";
+  const isPercentUnit = unit.includes("%") || unit.includes("percent") || unit.includes("pct");
+  if (isPercentUnit || Math.abs(numericValue) > 1) {
+    return numericValue / 100;
+  }
+  return numericValue;
+}
+
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
@@ -1874,6 +2062,11 @@ export function adjacent_possible(params: {
   const recordTelemetry = (event: AdjacentPossibleTelemetryEvent): void => {
     telemetry.push(event);
   };
+  const formatEvidenceValue = (value: number): string => {
+    if (!Number.isFinite(value)) return "0";
+    const normalized = value.toFixed(4);
+    return normalized.replace(/\.?0+$/, "") || "0";
+  };
   const sanitizeIdList = (value: unknown): string[] => [...new Set(asStringArray(value))];
   const mergeUniqueStrings = (existing: string[], additions: string[]): string[] => {
     if (additions.length === 0) return existing;
@@ -1919,6 +2112,9 @@ export function adjacent_possible(params: {
   };
 
   const ruleByMotifId = new Map(COMMIT_MOTIF_RULES.map((rule) => [rule.motifId, rule]));
+  const ruleByMotifLabel = new Map(
+    COMMIT_MOTIF_RULES.map((rule) => [rule.label.toLowerCase(), rule]),
+  );
   type AggregatedMotifInput = {
     motifId: string;
     motifLabel: string;
@@ -2037,7 +2233,10 @@ export function adjacent_possible(params: {
   for (const hint of aggregatedMotifs) {
     const motifId = hint.motifId;
     const motifLabel = hint.motifLabel;
-    const rule = ruleByMotifId.get(motifId);
+    const normalizedLabel = motifLabel.toLowerCase();
+    const rule =
+      ruleByMotifId.get(motifId) ||
+      (normalizedLabel ? ruleByMotifLabel.get(normalizedLabel) : undefined);
     if (!rule) {
       recordTelemetry({
         step: "motif_screen",
@@ -2148,10 +2347,10 @@ export function adjacent_possible(params: {
           `Blend the ${motif.motifLabel.toLowerCase()} motif with ${gap.gapLabel.toLowerCase()} telemetry ` +
           "to relieve the active bottleneck without widening scope.",
         evidence: [
-          `motif_signal=${motif.signal.toFixed(2)}`,
-          `motif_novelty=${motif.novelty.toFixed(2)}`,
-          `gap_score=${gap.score.toFixed(2)}`,
-          `coverage_boost=${coverageBoost.toFixed(2)}`,
+          `motif_signal=${formatEvidenceValue(motif.signal)}`,
+          `motif_novelty=${formatEvidenceValue(motif.novelty)}`,
+          `gap_score=${formatEvidenceValue(gap.score)}`,
+          `coverage_boost=${formatEvidenceValue(coverageBoost)}`,
         ],
         candidate_shape: cloneCandidateShape(motif.candidateShape),
       };
@@ -2512,6 +2711,7 @@ function inferEngineTrialFromCandidate(
 export function buildEngineFallbackCandidates(params: {
   engineInspiration: EngineInspirationContext;
   snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
+  snapshotStateTraits?: EngineIdeaInputSnapshot["state_traits"];
   visionSectionRefs: string[];
   maxCandidates?: number;
 }): Array<Record<string, unknown>> {
@@ -2522,12 +2722,50 @@ export function buildEngineFallbackCandidates(params: {
     params.engineInspiration.compiled_objectives.map((objective) => [objective.id, objective.title]),
   );
   const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
+  const topSignals = Array.isArray(params.snapshotTopSignals) ? params.snapshotTopSignals : [];
+  const stateTraits = Array.isArray(params.snapshotStateTraits) ? params.snapshotStateTraits : [];
+  const queueMetricByKind = new Map<QueueHealthMetricKind, QueueHealthMetric>(
+    extractQueueHealthMetrics({
+      topSignals,
+      stateTraits,
+    }).map((metric) => [metric.metric, metric]),
+  );
+  const describeQueueMetricSource = (metric: QueueHealthMetric): string => {
+    const suffix = metric.sourceId ? ` ${metric.sourceId}` : "";
+    return `${metric.sourceType}${suffix}`.trim();
+  };
+  const formatLatencyValue = (value: number): string => {
+    if (!Number.isFinite(value)) return "unknown";
+    if (value >= 1) return `${Math.round(value)}ms`;
+    return `${Math.round(value * 1000)}us`;
+  };
+  const queueMetricContext =
+    queueMetricByKind.size > 0
+      ? (() => {
+          const lines: string[] = [];
+          const latencyMetric = queueMetricByKind.get("queue_latency_ms");
+          if (latencyMetric) {
+            lines.push(
+              `Queue latency p95 ≈ ${formatLatencyValue(latencyMetric.value)} (${describeQueueMetricSource(latencyMetric)}).`,
+            );
+          }
+          const failureMetric = queueMetricByKind.get("job_failure_rate");
+          if (failureMetric) {
+            const pct = clamp01(failureMetric.value) * 100;
+            const decimals = pct >= 10 ? 0 : 1;
+            lines.push(
+              `Worker job failure rate ≈ ${pct.toFixed(decimals)}% (${describeQueueMetricSource(failureMetric)}).`,
+            );
+          }
+          return lines;
+        })()
+      : [];
 
   return params.engineInspiration.building_blocks
     .filter((block) => block.score >= 0.42)
     .slice(0, maxCandidates)
     .map((block, idx) => {
-      const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, block.candidate_shape.trigger_type);
+      const signalIds = pickSignalIdsForTrigger(topSignals, block.candidate_shape.trigger_type);
       const objectiveTitles = block.objective_ids
         .map((id) => objectiveTitleById.get(id))
         .filter((value): value is string => typeof value === "string" && value.length > 0)
@@ -2547,6 +2785,8 @@ export function buildEngineFallbackCandidates(params: {
         sourceLabel: block.source_label,
         sourceUrl: block.source_url,
       });
+      const queueHypotheses =
+        block.candidate_shape.trigger_type === "queue_health" ? queueMetricContext : [];
       return {
         id: `cand_engine_${block.id}_${randomUUID().slice(0, 8)}`,
         title: `Engine building block: ${block.algorithm}`,
@@ -2570,6 +2810,7 @@ export function buildEngineFallbackCandidates(params: {
           `Prioritize ${primaryObjectiveTitle} using ${block.algorithm}; score=${block.score.toFixed(2)}.`,
         vision_section_refs: sectionRefs,
         feature_hypotheses: [
+          ...queueHypotheses,
           block.summary,
           block.hypothesis,
           ...(sourceAttribution ? [sourceAttribution] : []),
@@ -3086,13 +3327,28 @@ export class RemoteBuddyAutonomousEngine {
         );
         return;
       }
-      const data = (await res.json().catch(() => ({}))) as {
+      let data: {
         ok?: boolean;
         inserted?: unknown;
         updated?: unknown;
         skipped?: unknown;
-      };
-      if (data.ok === false) {
+      } | null = null;
+      try {
+        data = (await res.json()) as {
+          ok?: boolean;
+          inserted?: unknown;
+          updated?: unknown;
+          skipped?: unknown;
+        };
+      } catch (error) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: automatic inspiration ingest response JSON parse failed: ${String(
+            error,
+          )}`,
+        );
+        return;
+      }
+      if (!data || data.ok === false) {
         console.warn(
           `[RemoteBuddyAutonomousEngine] tick ${runId}: automatic inspiration ingest returned ok=false.`,
         );
@@ -3158,14 +3414,25 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   private async releaseDispatchLock(runId: string): Promise<void> {
-    await fetch(`${this.server}/autonomy/lock/release`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({
-        sessionId: this.sessionId,
-        runId,
-      }),
-    }).catch(() => {});
+    try {
+      const res = await fetch(`${this.server}/autonomy/lock/release`, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          sessionId: this.sessionId,
+          runId,
+        }),
+      });
+      if (!res.ok) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] releaseDispatchLock(${runId}) failed with HTTP ${res.status}`,
+        );
+      }
+    } catch (error) {
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] releaseDispatchLock(${runId}) threw: ${String(error)}`,
+      );
+    }
   }
 
   private async llmPhase(
@@ -3683,6 +3950,7 @@ export class RemoteBuddyAutonomousEngine {
         const synthesized = buildEngineFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: snapshot.top_signals,
+          snapshotStateTraits: snapshot.state_traits,
           visionSectionRefs: visionContext.section_numbers,
           maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
         });
@@ -3806,6 +4074,7 @@ export class RemoteBuddyAutonomousEngine {
         const synthesizedFallback = buildEngineFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: snapshot.top_signals,
+          snapshotStateTraits: snapshot.state_traits,
           visionSectionRefs: visionContext.section_numbers,
           maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
         });
