@@ -682,12 +682,14 @@ describe("server AutonomyStore policy gates", () => {
     expect(summary.callCount).toBe(3);
     expect(summary.totalTokens).toBe(500);
     expect(summary.avgTokensPerCall).toBeCloseTo(500 / 3, 5);
+    expect(summary.avgTokensPerHour).toBeCloseTo(500 / 24, 5);
     expect(summary.estimatedCallCount).toBe(1);
 
     const localbuddy = summary.services.find((row) => row.service === "localbuddy");
     expect(localbuddy).toBeDefined();
     expect(localbuddy?.callCount).toBe(2);
     expect(localbuddy?.totalTokens).toBe(250);
+    expect(localbuddy?.avgTokensPerHour).toBeCloseTo(250 / 24, 5);
     expect(localbuddy?.avgTokensPerCall).toBe(125);
     expect(localbuddy?.estimatedCallCount).toBe(1);
 
@@ -695,6 +697,7 @@ describe("server AutonomyStore policy gates", () => {
     expect(remotebuddy).toBeDefined();
     expect(remotebuddy?.callCount).toBe(1);
     expect(remotebuddy?.totalTokens).toBe(250);
+    expect(remotebuddy?.avgTokensPerHour).toBeCloseTo(250 / 24, 5);
     expect(remotebuddy?.avgTokensPerCall).toBe(250);
   });
 

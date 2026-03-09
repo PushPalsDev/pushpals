@@ -387,6 +387,7 @@ export interface LlmUsageServiceSummary {
   completionTokens: number;
   totalTokens: number;
   callCount: number;
+  avgTokensPerHour: number;
   avgTokensPerCall: number | null;
   estimatedCallCount: number;
   lastCallAt: string | null;
@@ -398,6 +399,7 @@ export interface LlmUsageSummary {
   completionTokens: number;
   totalTokens: number;
   callCount: number;
+  avgTokensPerHour: number;
   avgTokensPerCall: number | null;
   estimatedCallCount: number;
   services: LlmUsageServiceSummary[];
@@ -2208,6 +2210,7 @@ export class AutonomyStore {
         completionTokens,
         totalTokens,
         callCount,
+        avgTokensPerHour: windowHours > 0 ? totalTokens / windowHours : 0,
         avgTokensPerCall: callCount > 0 ? totalTokens / callCount : null,
         estimatedCallCount: Math.max(0, Math.floor(asNumber(row.estimated_call_count, 0))),
         lastCallAt: row.last_call_at || null,
@@ -2228,6 +2231,7 @@ export class AutonomyStore {
       completionTokens,
       totalTokens,
       callCount,
+      avgTokensPerHour: windowHours > 0 ? totalTokens / windowHours : 0,
       avgTokensPerCall: callCount > 0 ? totalTokens / callCount : null,
       estimatedCallCount: Math.max(0, Math.floor(asNumber(overall?.estimated_call_count, 0))),
       services: serviceRows.map(toServiceSummary),

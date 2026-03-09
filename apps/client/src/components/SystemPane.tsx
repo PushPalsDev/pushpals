@@ -14,6 +14,7 @@ import {
   formatDuration,
   formatPercent,
   formatTokenCount,
+  formatUptime,
   prettyTs,
   queueValue,
   relativeMs,
@@ -207,6 +208,7 @@ export function SystemPane({
   const requestSlo = systemSummary.slo?.requests;
   const jobSlo = systemSummary.slo?.jobs;
   const llmUsage = systemSummary.llmUsage;
+  const runtimeSummary = systemSummary.runtime;
   const autonomyOps = systemSummary.autonomy ?? autonomyInsights.opsSummary;
   const safety = autonomyOps?.safetyState ?? null;
   const evaluator = autonomyOps?.latestEvaluatorScorecard ?? autonomyInsights.latestEvaluatorScorecard;
@@ -241,6 +243,7 @@ export function SystemPane({
           completionTokens: 0,
           totalTokens: 0,
           callCount: 0,
+          avgTokensPerHour: 0,
           avgTokensPerCall: null,
           estimatedCallCount: 0,
           lastCallAt: null,
@@ -382,8 +385,15 @@ export function SystemPane({
         <MetricTile
           title={`LLM Tokens (${llmUsage?.windowHours ?? 24}h)`}
           value={formatTokenCount(llmUsage?.totalTokens)}
-          detail={`${llmUsage?.callCount ?? 0} calls | avg ${formatTokenCount(llmUsage?.avgTokensPerCall)}`}
+          detail={`${llmUsage?.callCount ?? 0} calls | ${formatTokenCount(llmUsage?.avgTokensPerHour)} /h`}
           tone={llmUsage && llmUsage.callCount > 0 ? "accent" : "warning"}
+          theme={theme}
+        />
+        <MetricTile
+          title="System Uptime"
+          value={formatUptime(runtimeSummary?.uptimeMs)}
+          detail={runtimeSummary?.startedAt ? `started ${prettyTs(runtimeSummary.startedAt)}` : "--"}
+          tone="accent"
           theme={theme}
         />
         <MetricTile
@@ -435,7 +445,8 @@ export function SystemPane({
           total {formatTokenCount(llmUsage?.totalTokens)} tokens | prompt{" "}
           {formatTokenCount(llmUsage?.promptTokens)} | completion{" "}
           {formatTokenCount(llmUsage?.completionTokens)} | avg{" "}
-          {formatTokenCount(llmUsage?.avgTokensPerCall)} per call
+          {formatTokenCount(llmUsage?.avgTokensPerCall)} per call |{" "}
+          {formatTokenCount(llmUsage?.avgTokensPerHour)} per hour
         </Text>
         {llmUsage && llmUsage.estimatedCallCount > 0 ? (
           <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
@@ -480,6 +491,9 @@ export function SystemPane({
               </Text>
               <Text style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
                 avg {formatTokenCount(row.avgTokensPerCall)} / call
+              </Text>
+              <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                {formatTokenCount(row.avgTokensPerHour)} / hour
               </Text>
               <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
                 in {formatTokenCount(row.promptTokens)} | out {formatTokenCount(row.completionTokens)}

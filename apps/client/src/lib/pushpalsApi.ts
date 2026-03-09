@@ -466,6 +466,7 @@ export interface LlmUsageServiceSummary {
   completionTokens: number;
   totalTokens: number;
   callCount: number;
+  avgTokensPerHour: number;
   avgTokensPerCall: number | null;
   estimatedCallCount: number;
   lastCallAt: string | null;
@@ -477,9 +478,15 @@ export interface LlmUsageSummary {
   completionTokens: number;
   totalTokens: number;
   callCount: number;
+  avgTokensPerHour: number;
   avgTokensPerCall: number | null;
   estimatedCallCount: number;
   services: LlmUsageServiceSummary[];
+}
+
+export interface SystemRuntimeSummary {
+  startedAt: string;
+  uptimeMs: number;
 }
 
 export interface SystemStatusSummary {
@@ -496,6 +503,7 @@ export interface SystemStatusSummary {
   llmUsage?: LlmUsageSummary;
   repo?: SystemRepoSummary;
   autonomy?: AutonomyOpsSummary;
+  runtime?: SystemRuntimeSummary;
   ts?: string;
 }
 
@@ -772,6 +780,7 @@ export async function fetchSystemStatus(
       llmUsage: payload.llmUsage,
       autonomy: payload.autonomy,
       repo: payload.repo,
+      runtime: payload.runtime,
       ts: payload.ts,
     };
   } catch (err) {
@@ -924,7 +933,7 @@ export async function fetchAutonomyQuestions(
     if (!response.ok) return [];
     const payload = (await response.json()) as {
       ok?: boolean;
-      questions?: Array<Record<string, unknown>>;
+      questions?: Record<string, unknown>[];
     };
     if (!payload.ok || !Array.isArray(payload.questions)) return [];
     return payload.questions

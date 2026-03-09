@@ -33,6 +33,8 @@ const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
 const autonomyStore = new AutonomyStore(sharedDbPath);
 const REPO_STATUS_CACHE_TTL_MS = 60_000;
+const SERVER_STARTED_AT_MS = Date.now();
+const SERVER_STARTED_AT_ISO = new Date(SERVER_STARTED_AT_MS).toISOString();
 const AUTONOMY_BUSY_QUEUE_MAX_REQUESTS = 5;
 const AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS = 10;
 const AUTONOMY_WORKER_TTL_MS = 15_000;
@@ -732,6 +734,10 @@ export function createRequestHandler() {
         return makeJson({
           ok: true,
           ts: new Date().toISOString(),
+          runtime: {
+            startedAt: SERVER_STARTED_AT_ISO,
+            uptimeMs: Math.max(0, Date.now() - SERVER_STARTED_AT_MS),
+          },
           workers: {
             total: workers.length,
             online: onlineWorkers.length,

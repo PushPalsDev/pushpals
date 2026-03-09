@@ -57,6 +57,20 @@ export function formatDuration(valueMs: number | null | undefined): string {
   return `${Math.round(valueMs / 1000)}s`;
 }
 
+export function formatUptime(valueMs: number | null | undefined): string {
+  if (typeof valueMs !== "number" || !Number.isFinite(valueMs) || valueMs < 0) return "--";
+  const totalSeconds = Math.floor(valueMs / 1000);
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 function trimTrailingZeroes(value: string): string {
   return value.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
 }
