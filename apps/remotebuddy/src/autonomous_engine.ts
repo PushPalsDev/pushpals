@@ -2570,10 +2570,10 @@ export function adjacent_possible(params: {
           `Blend the ${motif.motifLabel.toLowerCase()} motif with ${gap.gapLabel.toLowerCase()} telemetry ` +
           "to relieve the active bottleneck without widening scope.",
         evidence: [
-          `motif_signal=${motif.signal.toFixed(2)}`,
-          `motif_novelty=${motif.novelty.toFixed(2)}`,
-          `gap_score=${gap.score.toFixed(2)}`,
-          `coverage_boost=${coverageBoost.toFixed(2)}`,
+          `motif_signal=${motif.signal.toFixed(4)}`,
+          `motif_novelty=${motif.novelty.toFixed(4)}`,
+          `gap_score=${gap.score.toFixed(4)}`,
+          `coverage_boost=${coverageBoost.toFixed(4)}`,
         ],
         candidate_shape: cloneCandidateShape(motif.candidateShape),
       };
