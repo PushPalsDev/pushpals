@@ -698,6 +698,41 @@ describe("server AutonomyStore policy gates", () => {
     expect(remotebuddy?.avgTokensPerCall).toBe(250);
   });
 
+  test("llm usage inserts remain append-only even when client ids repeat", () => {
+    const store = makeStore();
+    expect(
+      store.recordLlmUsage({
+        id: "usage_shared",
+        service: "localbuddy",
+        promptTokens: 10,
+        completionTokens: 5,
+      }).ok,
+    ).toBe(true);
+    expect(
+      store.recordLlmUsage({
+        id: "usage_shared",
+        service: "localbuddy",
+        promptTokens: 20,
+        completionTokens: 10,
+      }).ok,
+    ).toBe(true);
+    const summary = store.getLlmUsageSummary({ windowHours: 24 });
+    expect(summary.callCount).toBe(2);
+    expect(summary.totalTokens).toBe(45);
+  });
+
+  test("recordLlmUsage rejects ids that exceed the allowed length", () => {
+    const store = makeStore();
+    const result = store.recordLlmUsage({
+      id: "x".repeat(130),
+      service: "localbuddy",
+      promptTokens: 5,
+      completionTokens: 5,
+    });
+    expect(result.ok).toBe(false);
+    expect(String(result.reason ?? "")).toContain("id must be <=128");
+  });
+
   test("persists candidates with run-scoped ids to prevent cross-run overwrites", () => {
     const store = makeStore();
     const snapshotA = store.createSnapshot({ sessionId: "s1", runId: "run_a" }).snapshot_id;

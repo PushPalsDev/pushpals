@@ -96,6 +96,38 @@ async function getRepoStatusSummary(repoPath: string, remote: string): Promise<R
   return value;
 }
 
+export function emitQuestionAnsweredEvent(params: {
+  sessionManager: SessionManager;
+  sessionId: string;
+  questionId: string;
+  objectiveId: string;
+  status: "valid" | "invalid";
+  answerSummary?: string;
+  correlationId?: string;
+  turnId?: string;
+  parentId?: string;
+}): void {
+  const session = params.sessionManager.getSession(params.sessionId);
+  if (!session) return;
+  session.emit({
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: params.sessionId,
+    type: "question_answered",
+    from: "server:autonomy",
+    ...(params.correlationId ? { correlationId: params.correlationId } : {}),
+    ...(params.turnId ? { turnId: params.turnId } : {}),
+    ...(params.parentId ? { parentId: params.parentId } : {}),
+    payload: {
+      questionId: params.questionId,
+      objectiveId: params.objectiveId || "unknown",
+      status: params.status,
+      ...(params.answerSummary ? { answerSummary: params.answerSummary } : {}),
+    },
+  });
+}
+
 /**
  * HTTP Middleware & Routes
  */
@@ -1225,23 +1257,17 @@ export function createRequestHandler() {
             resumeError = compactText(enqueueResult.message, 300) || "failed to enqueue autonomy resume request";
           }
         }
-        const session = sessionId ? sessionManager.getSession(sessionId) : null;
-        if (session) {
-          session.emit({
-            protocolVersion: PROTOCOL_VERSION,
-            id: randomUUID(),
-            ts: new Date().toISOString(),
+        if (sessionId) {
+          emitQuestionAnsweredEvent({
+            sessionManager,
             sessionId,
-            type: "question_answered",
-            from: "server:autonomy",
-            payload: {
-              questionId,
-              objectiveId: result.objectiveId || "unknown",
-              status: result.status === "valid" ? "valid" : "invalid",
-              ...(result.reason || resumeError
-                ? { answerSummary: compactText(result.reason || resumeError, 240) }
-                : {}),
-            },
+            questionId,
+            objectiveId: result.objectiveId || "unknown",
+            status: result.status === "valid" ? "valid" : "invalid",
+            answerSummary:
+              result.reason || resumeError
+                ? compactText(result.reason || resumeError, 240)
+                : undefined,
           });
         }
         return makeJson(

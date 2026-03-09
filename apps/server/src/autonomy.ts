@@ -2107,6 +2107,11 @@ export class AutonomyStore {
     const service = normalizeServiceName(body.service);
     if (!service) return { ok: false, reason: "service is required" };
 
+    const clientProvidedId = (asString(body.id) ?? "").trim();
+    if (clientProvidedId && clientProvidedId.length > 128) {
+      return { ok: false, reason: "id must be <=128 characters" };
+    }
+
     const promptTokens = asNonNegativeInt(body.promptTokens ?? body.prompt_tokens);
     const completionTokens = asNonNegativeInt(body.completionTokens ?? body.completion_tokens);
     const explicitTotal = asNonNegativeInt(body.totalTokens ?? body.total_tokens);
@@ -2115,13 +2120,13 @@ export class AutonomyStore {
 
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO llm_usage_events (
+        `INSERT INTO llm_usage_events (
           id, service, session_id, backend, model_id, prompt_tokens, completion_tokens,
           total_tokens, estimated, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        asString(body.id) || randomUUID(),
+        randomUUID(),
         service,
         asString(body.sessionId ?? body.session_id) || null,
         asString(body.backend) || null,

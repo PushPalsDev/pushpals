@@ -131,6 +131,25 @@ describe("StartupChecklist", () => {
     expect(dockerRecord?.status).toBe("fail");
   });
 
+  test("skips runtime version checks when Bun or Docker probes are unavailable", async () => {
+    const ctx = buildContext({
+      readBunVersion: undefined,
+      readDockerVersion: undefined,
+    });
+    const result = await runStartupPreflight(ctx);
+    expect(result.ok).toBe(true);
+    const bunRecord = result.history.find(
+      (entry) => entry.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
+    );
+    expect(bunRecord?.status).toBe("pass");
+    expect(bunRecord?.detail?.toLowerCase()).toContain("skipped");
+    const dockerRecord = result.history.find(
+      (entry) => entry.code === STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
+    );
+    expect(dockerRecord?.status).toBe("pass");
+    expect(dockerRecord?.detail?.toLowerCase()).toContain("skipped");
+  });
+
   test("supports explicit dirty-worktree bypass option", async () => {
     const ctx = buildContext({
       describeRepo: async () => ({
