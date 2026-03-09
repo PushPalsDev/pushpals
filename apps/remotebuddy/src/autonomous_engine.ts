@@ -1394,11 +1394,17 @@ function normalizeValidationIdeas(ideas: string[]): string[] {
   return [...new Set(out)].slice(0, 5);
 }
 
-function inferComponentAreaFromText(text: string): AutonomyComponentArea {
+function matchComponentAreaFromText(text: string): AutonomyComponentArea | null {
+  const haystack = String(text ?? "").toLowerCase();
+  if (!haystack) return null;
   for (const rule of INSPIRATION_COMPONENT_HINTS) {
-    if (rule.pattern.test(text)) return rule.area;
+    if (rule.pattern.test(haystack)) return rule.area;
   }
-  return "apps/remotebuddy";
+  return null;
+}
+
+function inferComponentAreaFromText(text: string): AutonomyComponentArea {
+  return matchComponentAreaFromText(text) ?? "apps/remotebuddy";
 }
 
 function inferObjectiveTypeFromText(text: string, tags: string[]): AutonomyObjectiveType {
@@ -1448,6 +1454,422 @@ function matchGapIdsFromText(text: string, fallback: EngineOpportunityGap[]): st
   }
   if (out.length > 0) return [...new Set(out)].slice(0, 4);
   return fallback.slice(0, 2).map((entry) => entry.id);
+}
+
+type WorkerLoadStat = {
+  load: number;
+  traitLoad: number;
+  openObjectives: number;
+  candidateDemand: number;
+};
+
+type TaskDemandStat = {
+  demand: number;
+  openObjectives: number;
+  candidateDemand: number;
+};
+
+type DependencyStat = {
+  path: string;
+  demand: number;
+  workerIds: AutonomyComponentArea[];
+  taskIds: AutonomyObjectiveType[];
+  normalizedLoad: number;
+};
+
+type WorkerTaskEdge = {
+  workerId: AutonomyComponentArea;
+  taskId: AutonomyObjectiveType;
+  samples: number;
+  congestion: number;
+};
+
+type TaskDependencyEdge = {
+  taskId: AutonomyObjectiveType;
+  dependencyId: string;
+  samples: number;
+  congestion: number;
+};
+
+type GraphEdgeAlert = {
+  edgeType: "worker_task" | "task_dependency";
+  id: string;
+  label: string;
+  congestion: number;
+  detail: string;
+};
+
+export type WorkerTaskDependencyGraph = {
+  observedAtMs: number;
+  workerLoads: Partial<Record<AutonomyComponentArea, WorkerLoadStat>>;
+  taskDemand: Partial<Record<AutonomyObjectiveType, TaskDemandStat>>;
+  dependencyDemand: Record<string, DependencyStat>;
+  workerTaskEdges: WorkerTaskEdge[];
+  taskDependencyEdges: TaskDependencyEdge[];
+  workerTaskEdgeIndex: Partial<Record<string, WorkerTaskEdge>>;
+  taskDependencyEdgeIndex: Partial<Record<string, TaskDependencyEdge>>;
+  congestedEdges: GraphEdgeAlert[];
+};
+
+const EDGE_ALERT_THRESHOLD = 0.55;
+const WORKER_TASK_CONGESTION_WEIGHTS = {
+  worker: 0.4,
+  sample: 0.25,
+  queue: 0.2,
+  task: 0.15,
+} as const;
+const TASK_DEP_CONGESTION_WEIGHTS = {
+  dependency: 0.35,
+  task: 0.2,
+  worker: 0.2,
+  queue: 0.15,
+  sample: 0.1,
+} as const;
+
+function parsePatternKeyShape(patternKey: string): {
+  objectiveType: AutonomyObjectiveType | null;
+  componentArea: AutonomyComponentArea | null;
+  triggerType: AutonomyCandidate["trigger_type"] | null;
+} {
+  const parts = String(patternKey ?? "")
+    .split("::")
+    .map((part) => part.trim());
+  if (parts.length !== 3) return { objectiveType: null, componentArea: null, triggerType: null };
+  const [objectiveTypeRaw, componentAreaRaw, triggerTypeRaw] = parts;
+  const objectiveType = OBJECTIVE_TYPES.has(objectiveTypeRaw as AutonomyObjectiveType)
+    ? (objectiveTypeRaw as AutonomyObjectiveType)
+    : null;
+  const componentArea = COMPONENT_AREAS.has(componentAreaRaw as AutonomyComponentArea)
+    ? (componentAreaRaw as AutonomyComponentArea)
+    : null;
+  const triggerType = isTriggerType(triggerTypeRaw) ? triggerTypeRaw : null;
+  return { objectiveType, componentArea, triggerType };
+}
+
+function normalizeDependencyKey(value: string, fallbackArea: AutonomyComponentArea): string {
+  const sanitized = String(value ?? "")
+    .replace(/\\/g, "/")
+    .replace(/\*+$/g, "")
+    .replace(/\/+/g, "/")
+    .replace(/^\.\/+/, "")
+    .trim();
+  if (sanitized) {
+    const parts = sanitized.split("/");
+    if (parts.length <= 4) return parts.join("/");
+    const head = parts.slice(0, 4).join("/");
+    const remainder = parts.slice(4).join("/");
+    const digest = createHash("sha1").update(`${head}/${remainder}`).digest("hex").slice(0, 8);
+    return `${head}#${digest}`;
+  }
+  const fallback = componentRootPrefix(fallbackArea).replace(/\/$/, "");
+  return fallback || fallbackArea;
+}
+
+function collectCandidateDependencies(candidate: AutonomyCandidate): string[] {
+  const roots = [
+    ...candidate.target_paths,
+    ...candidate.scope.write_globs,
+  ]
+    .map((entry) => normalizeDependencyKey(entry, candidate.component_area))
+    .filter(Boolean);
+  if (roots.length > 0) return [...new Set(roots)];
+  return [normalizeDependencyKey(componentRootPrefix(candidate.component_area), candidate.component_area)];
+}
+
+export function buildWorkerTaskDependencyGraph(params: {
+  snapshot: Snapshot;
+  candidates: AutonomyCandidate[];
+  maxEdgeAlerts?: number;
+  observedAtMs?: number;
+}): WorkerTaskDependencyGraph {
+  const snapshot = params.snapshot;
+  const candidates = Array.isArray(params.candidates) ? params.candidates : [];
+  const queueSignal = maxSignalScore(snapshot, ["queue_health"]);
+  const dispatchSaturation = clamp01(
+    asNumber(snapshot.dispatch_budget?.global_count_last_hour, 0) / 10,
+  );
+  const workerAcc = new Map<AutonomyComponentArea, WorkerLoadStat>();
+  for (const area of COMPONENT_AREAS) {
+    workerAcc.set(area, { load: 0, traitLoad: 0, openObjectives: 0, candidateDemand: 0 });
+  }
+  const taskAcc = new Map<AutonomyObjectiveType, TaskDemandStat>();
+  for (const type of OBJECTIVE_TYPES) {
+    taskAcc.set(type, { demand: 0, openObjectives: 0, candidateDemand: 0 });
+  }
+  const dependencyAcc = new Map<
+    string,
+    { path: string; demand: number; workerIds: Set<AutonomyComponentArea>; taskIds: Set<AutonomyObjectiveType> }
+  >();
+  const workerTaskEdgeAcc = new Map<
+    string,
+    { workerId: AutonomyComponentArea; taskId: AutonomyObjectiveType; samples: number }
+  >();
+  const taskDependencyEdgeAcc = new Map<
+    string,
+    { taskId: AutonomyObjectiveType; dependencyId: string; samples: number }
+  >();
+
+  for (const trait of snapshot.state_traits) {
+    const area =
+      matchComponentAreaFromText(
+        `${trait.focus ?? ""} ${trait.evidence ?? ""} ${trait.trait_id ?? ""}`.toLowerCase(),
+      ) ?? null;
+    if (!area) continue;
+    const entry = workerAcc.get(area);
+    if (!entry) continue;
+    entry.traitLoad = Math.max(entry.traitLoad, clamp01(asNumber(trait.score, 0)));
+  }
+
+  for (const objective of snapshot.open_objectives) {
+    const parsed = parsePatternKeyShape(objective.pattern_key);
+    if (parsed.componentArea) {
+      const entry = workerAcc.get(parsed.componentArea);
+      if (entry) entry.openObjectives += 1;
+    }
+    if (parsed.objectiveType) {
+      const entry = taskAcc.get(parsed.objectiveType);
+      if (entry) entry.openObjectives += 1;
+    }
+    if (parsed.componentArea && parsed.objectiveType) {
+      const key = `${parsed.componentArea}::${parsed.objectiveType}`;
+      const entry = workerTaskEdgeAcc.get(key) ?? {
+        workerId: parsed.componentArea,
+        taskId: parsed.objectiveType,
+        samples: 0,
+      };
+      entry.samples += 1;
+      workerTaskEdgeAcc.set(key, entry);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const workerEntry = workerAcc.get(candidate.component_area);
+    if (workerEntry) workerEntry.candidateDemand += 1;
+    const taskEntry = taskAcc.get(candidate.objective_type);
+    if (taskEntry) taskEntry.candidateDemand += 1;
+    const workerTaskKey = `${candidate.component_area}::${candidate.objective_type}`;
+    const wtEntry = workerTaskEdgeAcc.get(workerTaskKey) ?? {
+      workerId: candidate.component_area,
+      taskId: candidate.objective_type,
+      samples: 0,
+    };
+    wtEntry.samples += 1;
+    workerTaskEdgeAcc.set(workerTaskKey, wtEntry);
+    const dependencies = collectCandidateDependencies(candidate);
+    for (const dep of dependencies) {
+      const depEntry =
+        dependencyAcc.get(dep) ??
+        {
+          path: dep,
+          demand: 0,
+          workerIds: new Set<AutonomyComponentArea>(),
+          taskIds: new Set<AutonomyObjectiveType>(),
+        };
+      depEntry.demand += 1;
+      depEntry.workerIds.add(candidate.component_area);
+      depEntry.taskIds.add(candidate.objective_type);
+      dependencyAcc.set(dep, depEntry);
+      const tdKey = `${candidate.objective_type}::${dep}`;
+      const tdEntry =
+        taskDependencyEdgeAcc.get(tdKey) ?? {
+          taskId: candidate.objective_type,
+          dependencyId: dep,
+          samples: 0,
+        };
+      tdEntry.samples += 1;
+      taskDependencyEdgeAcc.set(tdKey, tdEntry);
+    }
+  }
+
+  const maxWorkerOpen = Math.max(0, ...[...workerAcc.values()].map((entry) => entry.openObjectives));
+  const maxWorkerCandidates = Math.max(0, ...[...workerAcc.values()].map((entry) => entry.candidateDemand));
+  const workerLoads: Partial<Record<AutonomyComponentArea, WorkerLoadStat>> = {};
+  for (const [area, entry] of workerAcc.entries()) {
+    const openPressure = maxWorkerOpen > 0 ? entry.openObjectives / maxWorkerOpen : entry.openObjectives > 0 ? 1 : 0;
+    const candidatePressure =
+      maxWorkerCandidates > 0 ? entry.candidateDemand / maxWorkerCandidates : entry.candidateDemand > 0 ? 1 : 0;
+    const load = clamp01(
+      0.45 * entry.traitLoad + 0.25 * openPressure + 0.15 * candidatePressure + 0.1 * queueSignal + 0.05 * dispatchSaturation,
+    );
+    workerLoads[area] = { ...entry, load };
+  }
+
+  const maxTaskDemand = Math.max(
+    0,
+    ...[...taskAcc.values()].map((entry) => entry.openObjectives + entry.candidateDemand),
+  );
+  const taskDemand: Partial<Record<AutonomyObjectiveType, TaskDemandStat>> = {};
+  for (const [task, entry] of taskAcc.entries()) {
+    const combined = entry.openObjectives + entry.candidateDemand;
+    const demand = maxTaskDemand > 0 ? combined / maxTaskDemand : combined > 0 ? 1 : 0;
+    taskDemand[task] = { ...entry, demand };
+  }
+
+  const maxDependencyDemand = Math.max(0, ...[...dependencyAcc.values()].map((entry) => entry.demand));
+  const dependencyDemand: Record<string, DependencyStat> = {};
+  for (const [dep, entry] of dependencyAcc.entries()) {
+    const normalizedLoad = maxDependencyDemand > 0 ? entry.demand / maxDependencyDemand : entry.demand > 0 ? 1 : 0;
+    dependencyDemand[dep] = {
+      path: entry.path,
+      demand: entry.demand,
+      workerIds: [...entry.workerIds],
+      taskIds: [...entry.taskIds],
+      normalizedLoad,
+    };
+  }
+
+  const maxWorkerTaskSamples = Math.max(0, ...[...workerTaskEdgeAcc.values()].map((entry) => entry.samples));
+  const workerTaskEdges: WorkerTaskEdge[] = [...workerTaskEdgeAcc.values()].map((entry) => {
+    const workerLoad = workerLoads[entry.workerId]?.load ?? 0.35;
+    const taskLoad = taskDemand[entry.taskId]?.demand ?? 0;
+    const samples = maxWorkerTaskSamples > 0 ? entry.samples / maxWorkerTaskSamples : 0;
+    const congestion = clamp01(
+      WORKER_TASK_CONGESTION_WEIGHTS.worker * workerLoad +
+        WORKER_TASK_CONGESTION_WEIGHTS.sample * samples +
+        WORKER_TASK_CONGESTION_WEIGHTS.queue * queueSignal +
+        WORKER_TASK_CONGESTION_WEIGHTS.task * taskLoad,
+    );
+    return {
+      workerId: entry.workerId,
+      taskId: entry.taskId,
+      samples: entry.samples,
+      congestion,
+    };
+  });
+
+  const maxTaskDependencySamples = Math.max(
+    0,
+    ...[...taskDependencyEdgeAcc.values()].map((entry) => entry.samples),
+  );
+  const taskDependencyEdges: TaskDependencyEdge[] = [...taskDependencyEdgeAcc.values()].map((entry) => {
+    const dependency = dependencyDemand[entry.dependencyId];
+    const dependencyLoad = dependency?.normalizedLoad ?? 0;
+    const taskLoad = taskDemand[entry.taskId]?.demand ?? 0;
+    const workerLoadsForDep = dependency
+      ? dependency.workerIds.map((workerId) => workerLoads[workerId]?.load ?? 0.35)
+      : [];
+    const avgWorkerLoad = workerLoadsForDep.length > 0 ? average(workerLoadsForDep) : 0.35;
+    const sampleLoad = maxTaskDependencySamples > 0 ? entry.samples / maxTaskDependencySamples : 0;
+    const congestion = clamp01(
+      TASK_DEP_CONGESTION_WEIGHTS.dependency * dependencyLoad +
+        TASK_DEP_CONGESTION_WEIGHTS.task * taskLoad +
+        TASK_DEP_CONGESTION_WEIGHTS.worker * avgWorkerLoad +
+        TASK_DEP_CONGESTION_WEIGHTS.queue * queueSignal +
+        TASK_DEP_CONGESTION_WEIGHTS.sample * sampleLoad,
+    );
+    return {
+      taskId: entry.taskId,
+      dependencyId: entry.dependencyId,
+      samples: entry.samples,
+      congestion,
+    };
+  });
+
+  const workerTaskEdgeIndex: Record<string, WorkerTaskEdge> = {};
+  for (const edge of workerTaskEdges) {
+    workerTaskEdgeIndex[`${edge.workerId}::${edge.taskId}`] = edge;
+  }
+  const taskDependencyEdgeIndex: Record<string, TaskDependencyEdge> = {};
+  for (const edge of taskDependencyEdges) {
+    taskDependencyEdgeIndex[`${edge.taskId}::${edge.dependencyId}`] = edge;
+  }
+
+  const alerts: GraphEdgeAlert[] = [];
+  for (const edge of workerTaskEdges
+    .filter((entry) => entry.congestion >= EDGE_ALERT_THRESHOLD)
+    .sort((a, b) => b.congestion - a.congestion)) {
+    alerts.push({
+      edgeType: "worker_task",
+      id: `${edge.workerId}->${edge.taskId}`,
+      label: `${edge.workerId}→${edge.taskId}`,
+      congestion: edge.congestion,
+      detail: `samples=${edge.samples}`,
+    });
+  }
+  for (const edge of taskDependencyEdges
+    .filter((entry) => entry.congestion >= EDGE_ALERT_THRESHOLD)
+    .sort((a, b) => b.congestion - a.congestion)) {
+    alerts.push({
+      edgeType: "task_dependency",
+      id: `${edge.taskId}->${edge.dependencyId}`,
+      label: `${edge.taskId}→${edge.dependencyId}`,
+      congestion: edge.congestion,
+      detail: `samples=${edge.samples}`,
+    });
+  }
+  const maxAlerts = Math.max(1, Math.min(10, Math.floor(asNumber(params.maxEdgeAlerts, 5))));
+
+  const observedAtMs =
+    Number.isFinite(params.observedAtMs) && params.observedAtMs
+      ? Math.floor(params.observedAtMs)
+      : Date.now();
+
+  return {
+    observedAtMs,
+    workerLoads,
+    taskDemand,
+    dependencyDemand,
+    workerTaskEdges,
+    taskDependencyEdges,
+    workerTaskEdgeIndex,
+    taskDependencyEdgeIndex,
+    congestedEdges: alerts.slice(0, maxAlerts),
+  };
+}
+
+export function computeCandidateAdjacencyBias(
+  graph: WorkerTaskDependencyGraph,
+  candidate: AutonomyCandidate,
+): {
+  bias: number;
+  workerLoad: number;
+  dependencyLoad: number;
+  idleNeighborLoad: number;
+} {
+  const workerStats = graph.workerLoads[candidate.component_area];
+  const workerLoad = clamp01(workerStats?.load ?? 0.35);
+  const dependencies = collectCandidateDependencies(candidate);
+  const dependencyLoads = dependencies
+    .map((dep) => graph.dependencyDemand[dep]?.normalizedLoad ?? 0)
+    .filter((value) => Number.isFinite(value));
+  const dependencyLoad = dependencyLoads.length > 0 ? average(dependencyLoads) : 0;
+  const neighborLoads: number[] = [];
+  for (const dep of dependencies) {
+    const stat = graph.dependencyDemand[dep];
+    if (!stat) continue;
+    for (const workerId of stat.workerIds) {
+      if (workerId === candidate.component_area) continue;
+      neighborLoads.push(clamp01(graph.workerLoads[workerId]?.load ?? 0.35));
+    }
+  }
+  const idleNeighborLoad = neighborLoads.length > 0 ? Math.min(...neighborLoads) : workerLoad;
+  const workerEdgeKey = `${candidate.component_area}::${candidate.objective_type}`;
+  const workerEdge = graph.workerTaskEdgeIndex[workerEdgeKey];
+  const edgeCongestion = workerEdge?.congestion ?? workerLoad;
+  const riskFactor = candidate.risk_level === "low" ? 1 : candidate.risk_level === "medium" ? 0.5 : 0.2;
+  const neighborPressure = Math.max(0, workerLoad - idleNeighborLoad);
+  const neighborRelief = Math.max(0, idleNeighborLoad - workerLoad);
+  const idleBonus = (1 - workerLoad) * 0.1 * riskFactor;
+  const adjacencyRelief = neighborRelief * 0.12 * riskFactor;
+  const congestionPenalty = (workerLoad * 0.18 + edgeCongestion * 0.08) * riskFactor;
+  const dependencyPenalty = dependencyLoad * 0.12 * riskFactor;
+  const reroutePressure = neighborPressure * 0.2 * riskFactor;
+  const hasCongestedDependency = dependencies.some((dep) => {
+    const depEdge = graph.taskDependencyEdgeIndex[`${candidate.objective_type}::${dep}`];
+    return Boolean(depEdge && depEdge.congestion >= EDGE_ALERT_THRESHOLD);
+  });
+  const congestedDependencyPenalty = hasCongestedDependency ? 0.04 * riskFactor : 0;
+  const bias = clampToRange(
+    idleBonus +
+      adjacencyRelief -
+      congestionPenalty -
+      dependencyPenalty -
+      reroutePressure -
+      congestedDependencyPenalty,
+    -0.25,
+    0.12,
+  );
+  return { bias, workerLoad, dependencyLoad, idleNeighborLoad };
 }
 
 function normalizeInspirationPattern(value: unknown): InspirationPatternInput | null {
@@ -2148,10 +2570,10 @@ export function adjacent_possible(params: {
           `Blend the ${motif.motifLabel.toLowerCase()} motif with ${gap.gapLabel.toLowerCase()} telemetry ` +
           "to relieve the active bottleneck without widening scope.",
         evidence: [
-          `motif_signal=${motif.signal.toFixed(2)}`,
-          `motif_novelty=${motif.novelty.toFixed(2)}`,
-          `gap_score=${gap.score.toFixed(2)}`,
-          `coverage_boost=${coverageBoost.toFixed(2)}`,
+          `motif_signal=${motif.signal.toFixed(4)}`,
+          `motif_novelty=${motif.novelty.toFixed(4)}`,
+          `gap_score=${gap.score.toFixed(4)}`,
+          `coverage_boost=${coverageBoost.toFixed(4)}`,
         ],
         candidate_shape: cloneCandidateShape(motif.candidateShape),
       };
@@ -3306,7 +3728,12 @@ export class RemoteBuddyAutonomousEngine {
     );
   }
 
-  private scoreCandidate(snapshot: Snapshot, candidate: AutonomyCandidate, llmScore: number) {
+  private scoreCandidate(
+    snapshot: Snapshot,
+    candidate: AutonomyCandidate,
+    llmScore: number,
+    graph?: WorkerTaskDependencyGraph,
+  ) {
     const patternKey = makePatternKey(
       candidate.objective_type,
       candidate.target_paths,
@@ -3385,7 +3812,11 @@ export class RemoteBuddyAutonomousEngine {
       });
     }
     const normalizedPenalties = normalizePenalties(penalties);
-    const finalScore =
+    const adjacency =
+      graph && candidate.risk_level
+        ? computeCandidateAdjacencyBias(graph, candidate)
+        : { bias: 0, workerLoad: 0.35, dependencyLoad: 0, idleNeighborLoad: 1 };
+    const baseScore =
       0.46 * clamp01(llmScore) +
       0.2 * clamp01(impactSignal) +
       priorSignal.priorScore +
@@ -3395,6 +3826,7 @@ export class RemoteBuddyAutonomousEngine {
       sourcePriorSignal.noveltyBonus +
       sourcePriorSignal.trustBoost -
       penaltyTotal(normalizedPenalties);
+    const finalScore = clamp01(baseScore + adjacency.bias);
     return {
       patternKey,
       impactSignal,
@@ -3417,6 +3849,10 @@ export class RemoteBuddyAutonomousEngine {
       engineSourceCurationStatus: sourcePriorSignal.curationStatus,
       engineSourceCurationReason: sourcePriorSignal.curationReason,
       engineSourceTrustBoost: sourcePriorSignal.trustBoost,
+      graphWorkerLoad: adjacency.workerLoad,
+      graphDependencyLoad: adjacency.dependencyLoad,
+      graphIdleNeighborLoad: adjacency.idleNeighborLoad,
+      graphAdjacencyBias: adjacency.bias,
     };
   }
 
@@ -3867,6 +4303,29 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "snapshot_expired_post_ideation_filter";
         return;
       }
+      const workerGraph = buildWorkerTaskDependencyGraph({
+        snapshot,
+        candidates: normalizedCandidates,
+        maxEdgeAlerts: 6,
+        observedAtMs: Date.now(),
+      });
+      await this.comm.emit("autonomy_graph_observed", {
+        runId,
+        snapshotId: snapshot.snapshot_id,
+        observedAtMs: workerGraph.observedAtMs,
+        workerLoads: workerGraph.workerLoads,
+        taskDemand: workerGraph.taskDemand,
+        congestedEdges: workerGraph.congestedEdges,
+      });
+      if (workerGraph.congestedEdges.length > 0) {
+        const alertSummary = workerGraph.congestedEdges
+          .slice(0, 3)
+          .map((edge) => `${edge.label}=${edge.congestion.toFixed(2)}`)
+          .join(", ");
+        console.log(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: congested dispatch edges detected at ${new Date(workerGraph.observedAtMs).toISOString()} (${alertSummary}).`,
+        );
+      }
       this.setPhase("renew_lock_before_scoring");
       if (!(await this.renewDispatchLock(runId))) {
         outcomeDetail = "lock_renew_failed_before_scoring";
@@ -3904,7 +4363,7 @@ export class RemoteBuddyAutonomousEngine {
 
       const scored = normalizedCandidates.map((candidate) => {
         const llmScore = scoreById.get(candidate.id) ?? 0;
-        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore);
+        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore, workerGraph);
         return { candidate, llmScore, ...scoredCandidate };
       });
       scored.sort((a, b) => {
@@ -3981,6 +4440,10 @@ export class RemoteBuddyAutonomousEngine {
         engine_source_curation_status: row.engineSourceCurationStatus,
         engine_source_curation_reason: row.engineSourceCurationReason,
         engine_source_trust_boost: row.engineSourceTrustBoost,
+        graph_worker_load: row.graphWorkerLoad,
+        graph_dependency_load: row.graphDependencyLoad,
+        graph_idle_neighbor_load: row.graphIdleNeighborLoad,
+        graph_adjacency_bias: row.graphAdjacencyBias,
         explore_rate_configured: adaptiveExplore.baseRate,
         effective_explore_rate: adaptiveExplore.effectiveRate,
         explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4040,6 +4503,10 @@ export class RemoteBuddyAutonomousEngine {
             vision_section_refs: selected.candidate.vision_section_refs,
             feature_hypotheses: selected.candidate.feature_hypotheses,
             ...(selected.candidate.engine_trial ? { engine_trial: selected.candidate.engine_trial } : {}),
+            graph_worker_load: selected.graphWorkerLoad,
+            graph_dependency_load: selected.graphDependencyLoad,
+            graph_idle_neighbor_load: selected.graphIdleNeighborLoad,
+            graph_adjacency_bias: selected.graphAdjacencyBias,
             selection_strategy: selectedStrategy,
             selection_roll: selection.roll,
             effective_explore_rate: adaptiveExplore.effectiveRate,
@@ -4059,6 +4526,10 @@ export class RemoteBuddyAutonomousEngine {
             vision_section_refs: top.candidate.vision_section_refs,
             feature_hypotheses: top.candidate.feature_hypotheses,
             ...(top.candidate.engine_trial ? { engine_trial: top.candidate.engine_trial } : {}),
+            graph_worker_load: top.graphWorkerLoad,
+            graph_dependency_load: top.graphDependencyLoad,
+            graph_idle_neighbor_load: top.graphIdleNeighborLoad,
+            graph_adjacency_bias: top.graphAdjacencyBias,
             selection_strategy: "none",
             selection_roll: null,
             effective_explore_rate: adaptiveExplore.effectiveRate,
@@ -4110,6 +4581,10 @@ export class RemoteBuddyAutonomousEngine {
               engine_source_curation_status: top.engineSourceCurationStatus,
               engine_source_curation_reason: top.engineSourceCurationReason,
               engine_source_trust_boost: top.engineSourceTrustBoost,
+              graph_worker_load: top.graphWorkerLoad,
+              graph_dependency_load: top.graphDependencyLoad,
+              graph_idle_neighbor_load: top.graphIdleNeighborLoad,
+              graph_adjacency_bias: top.graphAdjacencyBias,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4164,6 +4639,10 @@ export class RemoteBuddyAutonomousEngine {
               engine_source_curation_status: selected.engineSourceCurationStatus,
               engine_source_curation_reason: selected.engineSourceCurationReason,
               engine_source_trust_boost: selected.engineSourceTrustBoost,
+              graph_worker_load: selected.graphWorkerLoad,
+              graph_dependency_load: selected.graphDependencyLoad,
+              graph_idle_neighbor_load: selected.graphIdleNeighborLoad,
+              graph_adjacency_bias: selected.graphAdjacencyBias,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4312,6 +4791,10 @@ export class RemoteBuddyAutonomousEngine {
             engine_source_curation_status: selected.engineSourceCurationStatus,
             engine_source_curation_reason: selected.engineSourceCurationReason,
             engine_source_trust_boost: selected.engineSourceTrustBoost,
+            graph_worker_load: selected.graphWorkerLoad,
+            graph_dependency_load: selected.graphDependencyLoad,
+            graph_idle_neighbor_load: selected.graphIdleNeighborLoad,
+            graph_adjacency_bias: selected.graphAdjacencyBias,
             explore_rate_configured: adaptiveExplore.baseRate,
             effective_explore_rate: adaptiveExplore.effectiveRate,
             explore_rate_adjustment: adaptiveExplore.adjustment,

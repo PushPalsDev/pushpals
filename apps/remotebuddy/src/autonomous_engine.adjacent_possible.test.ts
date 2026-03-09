@@ -100,7 +100,6 @@ describe("adjacent_possible", () => {
   test("enforces motif and gap thresholds before pairing", () => {
     const weakMotif: EngineCommitHistoryHint = {
       ...queueMotif,
-      motif_id: "queue_backpressure_weak",
       signal: 0.05,
     };
     const weakGap: EngineOpportunityGap = {
@@ -212,7 +211,12 @@ describe("adjacent_possible", () => {
     expect(motifEvents).toHaveLength(1);
     expect(motifEvents[0]?.metrics?.signal).toBeCloseTo(0.9, 2);
     const idea = result.ideas[0];
-    expect(idea.evidence).toContain("coverage_boost=0.08");
+    const coverageEntry = idea.evidence.find((entry) => entry.startsWith("coverage_boost="));
+    expect(coverageEntry).toBeDefined();
+    if (coverageEntry) {
+      const [, value] = coverageEntry.split("=");
+      expect(Number(value)).toBeCloseTo(0.08, 4);
+    }
   });
 
   test("scores omit motif objective boosts for unrelated gaps", () => {
