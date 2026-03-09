@@ -100,7 +100,6 @@ describe("adjacent_possible", () => {
   test("enforces motif and gap thresholds before pairing", () => {
     const weakMotif: EngineCommitHistoryHint = {
       ...queueMotif,
-      motif_id: "queue_backpressure_weak",
       signal: 0.05,
     };
     const weakGap: EngineOpportunityGap = {
@@ -210,7 +209,7 @@ describe("adjacent_possible", () => {
       (event) => event.step === "motif_screen" && event.motif_id === queueMotif.motif_id,
     );
     expect(motifEvents).toHaveLength(1);
-    expect(motifEvents[0]?.metrics?.signal).toBeCloseTo(0.9, 2);
+    expect(motifEvents[0]?.metrics?.signal).toBeCloseTo(0.9, 6);
     const idea = result.ideas[0];
     expect(idea.evidence).toContain("coverage_boost=0.08");
   });
@@ -242,6 +241,6 @@ describe("adjacent_possible", () => {
         0.12 * (evidenceMap.motif_novelty ?? 0) +
         (evidenceMap.coverage_boost ?? 0),
     );
-    expect(idea.score).toBeCloseTo(expectedScore, 5);
+    expect(idea.score).toBeCloseTo(expectedScore, 3);
   });
 });

@@ -46,6 +46,7 @@ type AutonomyCandidate = {
   requires_user_input?: boolean;
   question_if_blocked?: string;
   candidate_created_at: string;
+  debug?: Record<string, unknown>;
   engine_trial?: {
     building_block_id: string;
     algorithm: string;
@@ -63,12 +64,40 @@ type AutonomyCandidate = {
   };
 };
 
-type Snapshot = {
+type ReliabilityGateMode = "normal" | "fallback";
+
+type QueueTelemetrySummary = {
+  queueP95Ms: number | null;
+  jobFailureRate: number | null;
+  sampleCount: number;
+  sources: string[];
+  hasTelemetry: boolean;
+};
+
+type ReliabilityGateDecision = {
+  allowed: boolean;
+  mode: ReliabilityGateMode;
+  reason?: string;
+  penalty?: number;
+  telemetry: QueueTelemetrySummary;
+};
+
+type SnapshotSignal = {
+  signal_id: string;
+  type: string;
+  value: number;
+  evidence: string;
+  metadata?: Record<string, unknown>;
+  sample_id?: string;
+  sampleId?: string;
+} & Record<string, unknown>;
+
+export type Snapshot = {
   snapshot_id: string;
   snapshot_created_at: string;
   snapshot_ttl_ms: number;
   impact_model_version: string;
-  top_signals: Array<{ signal_id: string; type: string; value: number; evidence: string }>;
+  top_signals: SnapshotSignal[];
   state_traits: Array<{
     trait_id: string;
     category: "strength" | "weakness" | "opportunity" | "risk";
@@ -147,6 +176,422 @@ type Snapshot = {
     created_at?: string | null;
   };
 };
+
+const TELEMETRY_UNIT_PATTERN = "(?:[a-z%]+)";
+const TELEMETRY_ENTRY_RE = new RegExp(
+  `\\s*([a-z][a-z0-9_]+)\\s*(?:[:=~]\\s*|\\s+)?([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))(?:\\s*(${TELEMETRY_UNIT_PATTERN})(?=[,;\\s]|$))?(?:[,;\\s]+)?`,
+  "gi",
+);
+const TELEMETRY_KEY_ALIASES: Record<string, "queueP95Ms" | "jobFailureRate" | "sampleCount"> = {
+  queue_p95: "queueP95Ms",
+  queue_p95_ms: "queueP95Ms",
+  queue_ms_p95: "queueP95Ms",
+  queue_latency_p95: "queueP95Ms",
+  job_failure_rate: "jobFailureRate",
+  failure_rate: "jobFailureRate",
+  failure_pct: "jobFailureRate",
+  job_failure_pct: "jobFailureRate",
+  sample_size: "sampleCount",
+  samples: "sampleCount",
+  sample_count: "sampleCount",
+};
+const TELEMETRY_SECOND_UNITS = new Set(["s", "sec", "secs", "second", "seconds"]);
+const TELEMETRY_MILLISECOND_UNITS = new Set(["ms", "millis", "millisecond", "milliseconds"]);
+const TELEMETRY_PERCENT_UNITS = new Set(["%", "percent", "pct", "perc"]);
+const TELEMETRY_ID_TIMESTAMP_FIELDS = [
+  "window_start",
+  "windowStart",
+  "window_started_at",
+  "windowStartedAt",
+  "window_start_ms",
+  "windowStartMs",
+  "window_end",
+  "windowEnd",
+  "window_ended_at",
+  "windowEndedAt",
+  "observed_at",
+  "observedAt",
+  "captured_at",
+  "capturedAt",
+  "collected_at",
+  "collectedAt",
+  "sample_timestamp",
+  "sampleTimestamp",
+  "timestamp",
+  "ts",
+];
+const TELEMETRY_ID_WINDOW_LABEL_FIELDS = [
+  "window_label",
+  "windowLabel",
+  "window_bucket",
+  "windowBucket",
+  "time_window",
+  "timeWindow",
+  "interval_label",
+  "intervalLabel",
+  "window",
+];
+const TELEMETRY_ID_WINDOW_DURATION_FIELDS = [
+  "window_duration_ms",
+  "windowDurationMs",
+  "window_ms",
+  "windowMs",
+  "duration_ms",
+  "durationMs",
+];
+const TELEMETRY_ID_WINDOW_INTERVAL_FIELDS = [
+  "window_minutes",
+  "windowMinutes",
+  "window_seconds",
+  "windowSeconds",
+  "window_size",
+  "windowSize",
+];
+const TELEMETRY_ID_SOURCE_FIELDS = [
+  "source",
+  "source_id",
+  "sourceId",
+  "source_queue",
+  "sourceQueue",
+  "queue",
+  "queue_name",
+  "queueName",
+  "stream",
+  "worker",
+  "service",
+];
+const TELEMETRY_ID_REGION_FIELDS = ["region", "cluster", "shard", "workspace", "deployment"];
+const TELEMETRY_ID_DIGEST_FIELDS = ["sample_hash", "sampleHash", "sample_digest", "sampleDigest", "digest", "checksum"];
+const FALLBACK_SLOT_THRESHOLDS: Array<{ saturation: number; slots: number }> = [
+  { saturation: 0.85, slots: 0 },
+  { saturation: 0.6, slots: 1 },
+];
+const FALLBACK_MAX_SLOTS = 2;
+const FALLBACK_MIN_PENALTY = 0.03;
+const FALLBACK_MAX_PENALTY = 0.07;
+const TELEMETRY_NESTED_METADATA_FIELDS = ["window", "interval", "context", "bucket", "range"];
+
+function parseTelemetryEvidence(evidence: string): {
+  queueP95Ms?: number;
+  jobFailureRate?: number;
+  sampleCount?: number;
+} {
+  TELEMETRY_ENTRY_RE.lastIndex = 0;
+  const summary: { queueP95Ms?: number; jobFailureRate?: number; sampleCount?: number } = {};
+  const normalized = evidence
+    .toLowerCase()
+    .replace(/(^|[\s,;])([a-z][a-z0-9\s/.-]+)(?=\s*[:=~])/gi, (match, prefix: string, segment: string) => {
+      return `${prefix}${segment.replace(/\s+/g, "_")}`;
+    });
+  let match: RegExpExecArray | null;
+  while ((match = TELEMETRY_ENTRY_RE.exec(normalized)) != null) {
+    const rawKey = match[1];
+    const key = rawKey.replace(/[^a-z0-9]+/g, "_");
+    const alias = TELEMETRY_KEY_ALIASES[key];
+    if (!alias) continue;
+    const rawValue = Number(match[2]);
+    if (!Number.isFinite(rawValue)) continue;
+    const unit = match[3]?.toLowerCase() ?? "";
+    if (alias === "queueP95Ms") {
+      const asMs = convertLatencyToMs(rawValue, unit);
+      if (asMs !== null && Number.isFinite(asMs)) summary.queueP95Ms = asMs;
+    } else if (alias === "jobFailureRate") {
+      summary.jobFailureRate = normalizeFailureRate(rawValue, unit);
+    } else if (alias === "sampleCount") {
+      summary.sampleCount = Math.max(0, Math.floor(rawValue));
+    }
+  }
+  return summary;
+}
+
+function convertLatencyToMs(value: number, unit: string): number | null {
+  const normalizedUnit = unit.trim().toLowerCase();
+  if (normalizedUnit.length === 0 || TELEMETRY_MILLISECOND_UNITS.has(normalizedUnit)) return value;
+  if (TELEMETRY_SECOND_UNITS.has(normalizedUnit)) return value * 1_000;
+  return null;
+}
+
+function normalizeFailureRate(value: number, unit: string): number {
+  const needsPercentConversion = TELEMETRY_PERCENT_UNITS.has(unit) || Math.abs(value) > 1;
+  const normalized = needsPercentConversion ? value / 100 : value;
+  return clamp01(normalized);
+}
+
+function fallbackSlotCapacity(dispatchSaturation: number): number {
+  for (const tier of FALLBACK_SLOT_THRESHOLDS) {
+    if (dispatchSaturation >= tier.saturation) return tier.slots;
+  }
+  return FALLBACK_MAX_SLOTS;
+}
+
+function fallbackPenalty(dispatchSaturation: number): number {
+  const normalized = clamp01(dispatchSaturation);
+  const penalty =
+    FALLBACK_MIN_PENALTY + (FALLBACK_MAX_PENALTY - FALLBACK_MIN_PENALTY) * normalized;
+  return Math.round(penalty * 1_000) / 1_000;
+}
+
+function normalizeTelemetryTimestampToken(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (Math.abs(value) > 1_000_000_000_000) return new Date(Math.trunc(value)).toISOString();
+    if (Math.abs(value) > 1_000_000_000) return new Date(Math.trunc(value) * 1_000).toISOString();
+    return Math.trunc(value).toString();
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return undefined;
+    if (/^[+-]?\d+$/.test(text)) {
+      const parsed = Number(text);
+      if (text.length >= 13) return new Date(parsed).toISOString();
+      if (text.length >= 10) return new Date(parsed * 1_000).toISOString();
+      return text;
+    }
+    const timestamp = Date.parse(text);
+    if (!Number.isNaN(timestamp)) return new Date(timestamp).toISOString();
+    return text.toLowerCase();
+  }
+  return undefined;
+}
+
+function normalizeTelemetryStringToken(value: unknown): string | undefined {
+  const text = asString(value);
+  return text ? text.toLowerCase() : undefined;
+}
+
+function normalizeTelemetryNumberToken(value: unknown): string | undefined {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return undefined;
+  return Math.round(num).toString();
+}
+
+function pickTelemetryIdentityToken(
+  sources: Record<string, unknown>[],
+  fields: readonly string[],
+  normalizer: (value: unknown) => string | undefined,
+): string | undefined {
+  for (const source of sources) {
+    for (const field of fields) {
+      if (!source) continue;
+      const raw = (source as Record<string, unknown>)[field];
+      const normalized = normalizer(raw);
+      if (normalized) return normalized;
+    }
+  }
+  return undefined;
+}
+
+function buildTelemetryIdentitySources(
+  metadata: Record<string, unknown>,
+  record: Record<string, unknown>,
+): Record<string, unknown>[] {
+  const sources: Record<string, unknown>[] = [metadata];
+  for (const key of TELEMETRY_NESTED_METADATA_FIELDS) {
+    const nested = asObject(metadata[key]);
+    if (Object.keys(nested).length > 0) sources.push(nested);
+  }
+  sources.push(record);
+  return sources;
+}
+
+function canonicalizeQueueSampleIdentity(signal: Snapshot["top_signals"][number]): string | null {
+  const record = signal as Record<string, unknown>;
+  const metadata = asObject(record.metadata);
+  const sampleId =
+    asString(record.sample_id ?? record.sampleId) || asString(metadata.sample_id ?? metadata.sampleId);
+  if (sampleId) return `sample:${sampleId}`;
+  const identitySources = buildTelemetryIdentitySources(metadata, record);
+  const timestampToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_TIMESTAMP_FIELDS,
+    normalizeTelemetryTimestampToken,
+  );
+  const windowToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_WINDOW_LABEL_FIELDS,
+    normalizeTelemetryStringToken,
+  );
+  const bucketToken = pickTelemetryIdentityToken(
+    identitySources,
+    ["bucket_label", "bucketLabel"],
+    normalizeTelemetryStringToken,
+  );
+  const durationToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_WINDOW_DURATION_FIELDS,
+    normalizeTelemetryNumberToken,
+  );
+  const intervalToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_WINDOW_INTERVAL_FIELDS,
+    normalizeTelemetryNumberToken,
+  );
+  const sourceToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_SOURCE_FIELDS,
+    normalizeTelemetryStringToken,
+  );
+  const regionToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_REGION_FIELDS,
+    normalizeTelemetryStringToken,
+  );
+  const digestToken = pickTelemetryIdentityToken(
+    identitySources,
+    TELEMETRY_ID_DIGEST_FIELDS,
+    normalizeTelemetryStringToken,
+  );
+  const tokens: string[] = [];
+  if (timestampToken) tokens.push(`ts=${timestampToken}`);
+  if (windowToken) tokens.push(`wl=${windowToken}`);
+  if (bucketToken) tokens.push(`wb=${bucketToken}`);
+  if (durationToken) tokens.push(`dur=${durationToken}`);
+  if (intervalToken) tokens.push(`span=${intervalToken}`);
+  if (sourceToken) tokens.push(`src=${sourceToken}`);
+  if (regionToken) tokens.push(`region=${regionToken}`);
+  if (digestToken) tokens.push(`hash=${digestToken}`);
+  const hasWindowContext = Boolean(windowToken || bucketToken || durationToken || intervalToken);
+  const hasStrongIdentity =
+    Boolean(digestToken) ||
+    (Boolean(timestampToken) && (Boolean(sourceToken) || hasWindowContext || Boolean(regionToken)));
+  if (hasStrongIdentity && tokens.length > 0) {
+    return `meta:${tokens.join("|")}`;
+  }
+  const signalId = asString(record.signal_id);
+  return signalId ? `signal:${signalId}` : null;
+}
+
+function conservativeMax(current?: number, next?: number): number | undefined {
+  if (!Number.isFinite(next ?? Number.NaN)) return current;
+  if (!Number.isFinite(current ?? Number.NaN)) return next;
+  return Math.max(current as number, next as number);
+}
+
+export function extractQueueTelemetryFromSignals(
+  signals: Snapshot["top_signals"],
+): QueueTelemetrySummary {
+  const dedup = new Map<string, { queueP95Ms?: number; jobFailureRate?: number; sampleCount: number }>();
+  const sourceIds = new Set<string>();
+  for (const signal of signals) {
+    if (String(signal.type ?? "").toLowerCase() !== "queue_health") continue;
+    const evidence = String(signal.evidence ?? "").trim();
+    if (!evidence) continue;
+    const parsed = parseTelemetryEvidence(evidence);
+    const hasQueueValue = Number.isFinite(parsed.queueP95Ms ?? Number.NaN);
+    const hasFailureValue = Number.isFinite(parsed.jobFailureRate ?? Number.NaN);
+    if (!hasQueueValue && !hasFailureValue) continue;
+    const identity = canonicalizeQueueSampleIdentity(signal);
+    if (!identity) continue;
+    const signalId = asString(signal.signal_id);
+    if (signalId) sourceIds.add(signalId);
+    const sampleCount = Math.max(1, parsed.sampleCount ?? 1);
+    const existing = dedup.get(identity);
+    if (!existing) {
+      dedup.set(identity, {
+        queueP95Ms: parsed.queueP95Ms,
+        jobFailureRate: parsed.jobFailureRate,
+        sampleCount,
+      });
+      continue;
+    }
+    existing.sampleCount = Math.max(existing.sampleCount, sampleCount);
+    existing.queueP95Ms = conservativeMax(existing.queueP95Ms, parsed.queueP95Ms);
+    existing.jobFailureRate = conservativeMax(existing.jobFailureRate, parsed.jobFailureRate);
+  }
+  const queueP95Values: number[] = [];
+  const jobFailureRateValues: number[] = [];
+  let sampleCount = 0;
+  for (const entry of dedup.values()) {
+    if (Number.isFinite(entry.queueP95Ms ?? Number.NaN)) queueP95Values.push(entry.queueP95Ms as number);
+    if (Number.isFinite(entry.jobFailureRate ?? Number.NaN))
+      jobFailureRateValues.push(entry.jobFailureRate as number);
+    sampleCount += entry.sampleCount;
+  }
+  const hasTelemetry = queueP95Values.length > 0 || jobFailureRateValues.length > 0;
+  return {
+    queueP95Ms: queueP95Values.length > 0 ? Math.max(...queueP95Values) : null,
+    jobFailureRate: jobFailureRateValues.length > 0 ? Math.max(...jobFailureRateValues) : null,
+    sampleCount,
+    sources: [...sourceIds].sort(),
+    hasTelemetry,
+  };
+}
+
+function normalizedQueuePressure(queueP95Ms: number | null): number {
+  if (!Number.isFinite(queueP95Ms ?? Number.NaN)) return 0;
+  // Treat <=90s as healthy, >=180s as saturated.
+  return clamp01((Number(queueP95Ms) - 90_000) / 90_000);
+}
+
+function isReliabilityCandidate(candidate: AutonomyCandidate): boolean {
+  if (candidate.trigger_type === "queue_health") return true;
+  if (candidate.engine_trial?.gap_ids?.some((gap) => gap === "delivery_reliability_gap")) return true;
+  if (candidate.why_now_signal_ids.some((id) => id.toLowerCase().includes("queue"))) return true;
+  return false;
+}
+
+export class ReliabilityCapacityGate {
+  private readonly telemetry: QueueTelemetrySummary;
+  private fallbackSlotsRemaining: number;
+  private readonly fallbackSlotBudget: number;
+  private readonly fallbackPenalty: number;
+  private readonly dispatchSaturation: number;
+
+  constructor(private readonly snapshot: Snapshot, private readonly config: PushPalsConfig["remotebuddy"]["autonomy"]) {
+    this.telemetry = extractQueueTelemetryFromSignals(snapshot.top_signals);
+    const maxDispatch = Math.max(1, config.maxDispatchPerHour);
+    this.dispatchSaturation = clamp01(snapshot.dispatch_budget.global_count_last_hour / maxDispatch);
+    if (this.telemetry.hasTelemetry) {
+      this.fallbackSlotBudget = Number.POSITIVE_INFINITY;
+      this.fallbackSlotsRemaining = Number.POSITIVE_INFINITY;
+      this.fallbackPenalty = 0;
+    } else {
+      this.fallbackSlotBudget = fallbackSlotCapacity(this.dispatchSaturation);
+      this.fallbackSlotsRemaining = this.fallbackSlotBudget;
+      this.fallbackPenalty = fallbackPenalty(this.dispatchSaturation);
+    }
+  }
+
+  evaluate(candidate: AutonomyCandidate): ReliabilityGateDecision {
+    const telemetry = this.telemetry;
+    if (!isReliabilityCandidate(candidate)) {
+      return { allowed: true, mode: telemetry.hasTelemetry ? "normal" : "fallback", telemetry };
+    }
+    if (!telemetry.hasTelemetry) {
+      if (this.fallbackSlotsRemaining <= 0) {
+        return {
+          allowed: false,
+          mode: "fallback",
+          reason:
+            this.fallbackSlotBudget <= 0
+              ? "reliability_dispatch_saturated"
+              : "reliability_gate_fallback_slot_exhausted",
+          telemetry,
+        };
+      }
+      this.fallbackSlotsRemaining -= 1;
+      return {
+        allowed: true,
+        mode: "fallback",
+        penalty: this.fallbackPenalty,
+        telemetry,
+      };
+    }
+    const queuePressure = normalizedQueuePressure(telemetry.queueP95Ms);
+    if (queuePressure >= 0.95 && this.dispatchSaturation >= 0.8) {
+      return {
+        allowed: false,
+        mode: "normal",
+        reason: "reliability_queue_capacity_saturated",
+        telemetry,
+      };
+    }
+    return { allowed: true, mode: "normal", telemetry };
+  }
+
+  summary(): QueueTelemetrySummary {
+    return this.telemetry;
+  }
+}
 
 type PolicyRule = {
   maxRisk: "low" | "medium" | "high";
@@ -800,81 +1245,6 @@ export interface EngineInspirationContext {
   commit_history_hints: EngineCommitHistoryHint[];
 }
 
-type OpportunityGraphNodeQueue = {
-  id: string;
-  kind: "queue_lane";
-  label: string;
-  pressure: number;
-  latencyMs: number | null;
-  pending: number | null;
-  slackHint: number | null;
-  evidence: string;
-};
-
-type OpportunityGraphNodeWorker = {
-  id: string;
-  kind: "worker_pool";
-  label: string;
-  component_area: AutonomyComponentArea;
-  load: number;
-  idleCapacity: number;
-  dispatchCount: number;
-  maxDispatchPerHour: number;
-};
-
-type OpportunityGraphNodeSlack = {
-  id: string;
-  kind: "slack";
-  label: string;
-  slack: number;
-};
-
-type OpportunityGraphNode = OpportunityGraphNodeQueue | OpportunityGraphNodeWorker | OpportunityGraphNodeSlack;
-
-type OpportunityGraphEdgeFocus = "queue_pressure" | "latency_slack";
-
-type OpportunityGraphEdge = {
-  id: string;
-  from: string;
-  to: string;
-  weight: number;
-  focus: OpportunityGraphEdgeFocus;
-  rationale: string[];
-};
-
-type OpportunityAdjacencyEntry = {
-  queueWeight: number;
-  slackWeight: number;
-  idleCapacity: number;
-  reasons: string[];
-};
-
-type QueueWorkerOpportunityGraph = {
-  nodes: OpportunityGraphNode[];
-  edges: OpportunityGraphEdge[];
-  adjacencyByArea: Map<AutonomyComponentArea, OpportunityAdjacencyEntry>;
-  queuePressure: number;
-  latencySlack: number;
-  latencySlackSource: "telemetry" | "fallback";
-  latencyEvidenceCount: number;
-  workerIdleCapacity: number;
-  reliabilityCapacityGate: ReliabilityCapacityGate;
-};
-
-type ReliabilityCapacityGate = {
-  allowed: boolean;
-  reason: "ok" | "latency_slack" | "queue_pressure" | "latency_and_queue";
-  slackOk: boolean;
-  queueOk: boolean;
-  latencySlack: number;
-  latencySlackThreshold: number;
-  queuePressure: number;
-  queuePressureThreshold: number;
-  latencySource: "telemetry" | "fallback";
-  latencyEvidenceCount: number;
-  latencyEvidenceOk: boolean;
-};
-
 type EngineIdeaInputSnapshot = Pick<
   Snapshot,
   "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget"
@@ -907,66 +1277,6 @@ function asStringArray(value: unknown): string[] {
 function asNumber(value: unknown, fallback = 0): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
-}
-
-function parseTelemetryEvidence(text: string): Record<string, number> {
-  const out: Record<string, number> = {};
-  const raw = asString(text);
-  if (!raw) return out;
-  const regex =
-    /([A-Za-z0-9_.-]+)\s*(?:=|:)\s*([-+]?(?:\d+(?:[,_]\d+)*(?:\.\d+)?|\.\d+)(?:e[-+]?\d+)?)(?:\s*(ms|millisecond|milliseconds|s|sec|secs|second|seconds|us|microsecond|microseconds|percent|pct|%))?/gi;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(raw))) {
-    const key = match[1]?.toLowerCase();
-    let numericText = match[2] ?? "";
-    if (!key || !numericText) continue;
-    numericText = numericText.replace(/[_\s,]/g, "");
-    const value = Number.parseFloat(numericText);
-    if (!Number.isFinite(value)) continue;
-    const unit = (match[3] ?? "").toLowerCase();
-    out[key] = normalizeTelemetryValue(value, unit);
-  }
-  return out;
-}
-
-function normalizeTelemetryValue(value: number, unit: string): number {
-  if (!unit) return value;
-  switch (unit) {
-    case "ms":
-    case "millisecond":
-    case "milliseconds":
-      return value;
-    case "s":
-    case "sec":
-    case "secs":
-    case "second":
-    case "seconds":
-      return value * 1000;
-    case "us":
-    case "microsecond":
-    case "microseconds":
-      return value / 1000;
-    case "%":
-    case "percent":
-    case "pct":
-      return value / 100;
-    default:
-      return value;
-  }
-}
-
-function meanOrNull(values: number[]): number | null {
-  if (!Array.isArray(values) || values.length === 0) return null;
-  const sum = values.reduce((acc, value) => acc + value, 0);
-  return sum / values.length;
-}
-
-function latencySlackFromMs(latencyMs: number): number {
-  if (!Number.isFinite(latencyMs) || latencyMs <= 0) return 1;
-  if (latencyMs >= LATENCY_TELEMETRY_MAX_MS) return 0;
-  const normalized = 1 - latencyMs / LATENCY_TELEMETRY_MAX_MS;
-  const targetBias = clamp01(1 - latencyMs / LATENCY_TELEMETRY_TARGET_MS);
-  return clamp01(0.5 * normalized + 0.5 * targetBias);
 }
 
 function uniqueLowercaseTokens(values: string[], max = 24): string[] {
@@ -1004,24 +1314,6 @@ const COMPONENT_AREAS = new Set<AutonomyComponentArea>([
   "tests/integration",
   "tests/unit",
 ]);
-
-const RELIABILITY_OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>(["flaky_test", "lint_fix", "type_fix", "small_refactor"]);
-
-const MIN_LATENCY_SLACK_FOR_RELIABILITY = 0.35;
-const MAX_QUEUE_PRESSURE_FOR_RELIABILITY = 0.65;
-const RELIABILITY_GATE_LOG_LIMIT = 3;
-const LATENCY_TELEMETRY_TARGET_MS = 900;
-const LATENCY_TELEMETRY_MAX_MS = 2400;
-const LATENCY_SLACK_HINT_WEIGHT = 0.65;
-const LATENCY_SLACK_LATENCY_WEIGHT = 0.35;
-const LATENCY_SLACK_FALLBACK = 0.2;
-const ADJACENCY_OPPORTUNITY_BOOST_WEIGHT = 0.12;
-const ADJACENCY_LOG_THRESHOLD = 0.02;
-const BREADTH_GUARDRAIL_FACTOR: Record<PolicyRule["maxBreadth"], number> = {
-  narrow: 0.45,
-  medium: 0.75,
-  broad: 1,
-};
 
 function asAutonomyObjectiveType(value: unknown): AutonomyObjectiveType | null {
   const normalized = asString(value) as AutonomyObjectiveType;
@@ -1584,97 +1876,6 @@ function inferRiskLevelFromText(text: string, tags: string[]): "low" | "medium" 
   if (/\b(auth|permission|security|credential|secret|encryption)\b/i.test(joined)) return "medium";
   if (/\b(migration|schema rewrite|large rewrite|breaking change)\b/i.test(joined)) return "high";
   return "low";
-}
-
-function isReliabilityObjectiveType(value: AutonomyObjectiveType): boolean {
-  return RELIABILITY_OBJECTIVE_TYPES.has(value);
-}
-
-type AdjacencyBiasResult = {
-  adjacencyWeight: number;
-  adjacencyFocus: "none" | OpportunityGraphEdgeFocus | "mixed";
-  adjacencyBoost: number;
-  adjacencyGuardrail: number;
-  adjacencyReasons: string[];
-};
-
-function computeAdjacencyBias(params: {
-  candidate: Pick<AutonomyCandidate, "objective_type" | "trigger_type" | "risk_level">;
-  adjacencyEntry?: OpportunityAdjacencyEntry | null;
-  policy?: PolicyRule;
-}): AdjacencyBiasResult {
-  const adjacencyEntry = params.adjacencyEntry ?? null;
-  const adjacencyReasons = adjacencyEntry ? [...adjacencyEntry.reasons] : [];
-  let adjacencyWeight = 0;
-  let adjacencyFocus: AdjacencyBiasResult["adjacencyFocus"] = "none";
-  if (adjacencyEntry) {
-    if (isReliabilityObjectiveType(params.candidate.objective_type)) {
-      adjacencyWeight = clamp01(0.2 * adjacencyEntry.queueWeight + 0.8 * adjacencyEntry.slackWeight);
-      adjacencyFocus =
-        adjacencyEntry.slackWeight > adjacencyEntry.queueWeight
-          ? "latency_slack"
-          : adjacencyEntry.queueWeight > adjacencyEntry.slackWeight
-            ? "queue_pressure"
-            : "mixed";
-    } else if (params.candidate.trigger_type === "queue_health") {
-      adjacencyWeight = clamp01(0.75 * adjacencyEntry.queueWeight + 0.25 * adjacencyEntry.slackWeight);
-      adjacencyFocus = "queue_pressure";
-    } else {
-      adjacencyWeight = clamp01(0.5 * adjacencyEntry.queueWeight + 0.5 * adjacencyEntry.slackWeight);
-      adjacencyFocus =
-        adjacencyEntry.queueWeight > adjacencyEntry.slackWeight
-          ? "queue_pressure"
-          : adjacencyEntry.slackWeight > adjacencyEntry.queueWeight
-            ? "latency_slack"
-            : "mixed";
-    }
-  }
-  let adjacencyGuardrail = adjacencyEntry ? 1 : 0;
-  const policyReasons: string[] = [];
-  if (params.policy) {
-    if (!params.policy.autonomousAllowed) {
-      adjacencyGuardrail = 0;
-      policyReasons.push("policy_autonomy_disabled");
-    } else {
-      const candidateRiskOrder = RISK_ORDER[params.candidate.risk_level];
-      const policyRiskOrder = RISK_ORDER[params.policy.maxRisk];
-      const riskHeadroom = policyRiskOrder - candidateRiskOrder;
-      if (riskHeadroom <= 0) {
-        adjacencyGuardrail = 0;
-        policyReasons.push("policy_risk_headroom_exhausted");
-      } else {
-        const normalizedHeadroom = clamp01(riskHeadroom / Math.max(1, policyRiskOrder));
-        const breadthFactor = BREADTH_GUARDRAIL_FACTOR[params.policy.maxBreadth];
-        adjacencyGuardrail = clamp01(normalizedHeadroom * breadthFactor);
-        policyReasons.push(`policy_headroom=${normalizedHeadroom.toFixed(2)}`);
-        policyReasons.push(`policy_breadth_cap=${breadthFactor.toFixed(2)}`);
-        if (params.candidate.risk_level === "high") {
-          adjacencyGuardrail = Math.min(adjacencyGuardrail, 0.25);
-          policyReasons.push("policy_high_risk_cap");
-        }
-      }
-    }
-  } else if (!adjacencyEntry) {
-    adjacencyGuardrail = 0;
-  }
-  const adjacencyBoost =
-    adjacencyWeight > 0
-      ? adjacencyWeight * ADJACENCY_OPPORTUNITY_BOOST_WEIGHT * adjacencyGuardrail
-      : 0;
-  if ((adjacencyWeight > 0 || adjacencyGuardrail < 1) && adjacencyReasons.length < 3) {
-    adjacencyReasons.push(`guardrail=${adjacencyGuardrail.toFixed(2)}`);
-  }
-  for (const reason of policyReasons) {
-    if (adjacencyReasons.length >= 3) break;
-    adjacencyReasons.push(reason);
-  }
-  return {
-    adjacencyWeight,
-    adjacencyFocus,
-    adjacencyBoost,
-    adjacencyGuardrail,
-    adjacencyReasons,
-  };
 }
 
 function matchObjectiveIdsFromText(text: string, fallback: CompiledVisionObjective[]): string[] {
@@ -2637,216 +2838,6 @@ export function buildEngineInspirationContext(params: {
   };
 }
 
-function evaluateReliabilityCapacityGate(params: {
-  latencySlack: number;
-  latencySource: "telemetry" | "fallback";
-  latencyEvidenceCount: number;
-  latencyEvidenceOk: boolean;
-  queuePressure: number;
-  minLatencySlack: number;
-  maxQueuePressure: number;
-}): ReliabilityCapacityGate {
-  const latencySlack = clamp01(params.latencySlack);
-  const queuePressure = clamp01(params.queuePressure);
-  const slackOk = params.latencyEvidenceOk && latencySlack >= params.minLatencySlack;
-  const queueOk = queuePressure <= params.maxQueuePressure;
-  let reason: ReliabilityCapacityGate["reason"] = "ok";
-  if (!slackOk && !queueOk) {
-    reason = "latency_and_queue";
-  } else if (!slackOk) {
-    reason = "latency_slack";
-  } else if (!queueOk) {
-    reason = "queue_pressure";
-  }
-  return {
-    allowed: slackOk && queueOk,
-    reason,
-    slackOk,
-    queueOk,
-    latencySlack,
-    latencySlackThreshold: params.minLatencySlack,
-    queuePressure,
-    queuePressureThreshold: params.maxQueuePressure,
-    latencySource: params.latencySource,
-    latencyEvidenceCount: params.latencyEvidenceCount,
-    latencyEvidenceOk: params.latencyEvidenceOk,
-  };
-}
-
-function buildQueueWorkerOpportunityGraph(params: {
-  snapshot: Snapshot;
-  dispatchLimits: {
-    global?: number;
-    byComponent?: Record<string, number>;
-  };
-  componentAreas?: AutonomyComponentArea[];
-}): QueueWorkerOpportunityGraph {
-  const componentAreas = params.componentAreas ?? Array.from(COMPONENT_AREAS);
-  const dispatchLimit = Math.max(1, Math.floor(asNumber(params.dispatchLimits.global, 6)));
-  const queueSignals = Array.isArray(params.snapshot.top_signals) ? params.snapshot.top_signals : [];
-  const queueNodes: OpportunityGraphNodeQueue[] = queueSignals
-    .filter((signal) => asString(signal.type).toLowerCase() === "queue_health")
-    .slice(0, 8)
-    .map((signal, index) => {
-      const evidence = asString(signal.evidence);
-      const telemetry = parseTelemetryEvidence(evidence);
-      const latencyRaw =
-        telemetry.latency_ms ??
-        telemetry.latency_p95 ??
-        telemetry.latency ??
-        telemetry.p95 ??
-        undefined;
-      const pendingRaw = telemetry.pending ?? telemetry.backlog ?? telemetry.inflight ?? undefined;
-      const saturationRaw = telemetry.saturation ?? telemetry.utilization ?? telemetry.load ?? undefined;
-      const slackHintRaw =
-        telemetry.slack ??
-        (typeof saturationRaw === "number" ? 1 - clamp01(saturationRaw) : undefined);
-      const slackHint =
-        typeof slackHintRaw === "number" && Number.isFinite(slackHintRaw) ? clamp01(slackHintRaw) : null;
-      return {
-        id: asString(signal.signal_id) || `queue_${index}`,
-        kind: "queue_lane",
-        label: asString(signal.signal_id) || `queue_signal_${index}`,
-        pressure: clamp01(asNumber(signal.value, 0)),
-        latencyMs: Number.isFinite(latencyRaw) ? Math.max(0, Math.floor(latencyRaw)) : null,
-        pending: Number.isFinite(pendingRaw) ? Math.max(0, Math.floor(pendingRaw)) : null,
-        slackHint,
-        evidence,
-      };
-    });
-  const queueSignalPressure = queueNodes.length > 0 ? Math.max(...queueNodes.map((node) => node.pressure)) : 0;
-  const queueTraitPressure = maxTraitScore(params.snapshot, /\b(queue|latency|throughput|pending|worker)\b/i);
-  const dispatchPressure = clamp01(
-    asNumber(params.snapshot.dispatch_budget?.global_count_last_hour, 0) / dispatchLimit,
-  );
-  const queuePressure = clamp01(
-    0.55 * queueSignalPressure + 0.25 * queueTraitPressure + 0.2 * dispatchPressure,
-  );
-  const slackHintValues = queueNodes
-    .map((node) => (typeof node.slackHint === "number" ? clamp01(node.slackHint) : null))
-    .filter((value): value is number => value !== null);
-  const latencyDerivedValues = queueNodes
-    .map((node) => (typeof node.latencyMs === "number" ? latencySlackFromMs(node.latencyMs) : null))
-    .filter((value): value is number => value !== null);
-  const slackHintAvg = meanOrNull(slackHintValues);
-  const latencyDerivedAvg = meanOrNull(latencyDerivedValues);
-  let telemetrySlack: number | null = null;
-  if (slackHintAvg !== null || latencyDerivedAvg !== null) {
-    const hintWeight = slackHintAvg !== null ? LATENCY_SLACK_HINT_WEIGHT : 0;
-    const latencyWeight = latencyDerivedAvg !== null ? LATENCY_SLACK_LATENCY_WEIGHT : 0;
-    const weightTotal = hintWeight + latencyWeight || 1;
-    telemetrySlack = clamp01(
-      ((slackHintAvg ?? latencyDerivedAvg ?? 0) * hintWeight +
-        (latencyDerivedAvg ?? slackHintAvg ?? 0) * latencyWeight) /
-        weightTotal,
-    );
-  }
-  const latencyEvidenceCount =
-    (slackHintAvg !== null ? slackHintValues.length : 0) +
-    (latencyDerivedAvg !== null ? latencyDerivedValues.length : 0);
-  const latencySlack = telemetrySlack ?? LATENCY_SLACK_FALLBACK;
-  const latencySlackSource: "telemetry" | "fallback" = telemetrySlack !== null ? "telemetry" : "fallback";
-  const latencyEvidenceOk = telemetrySlack !== null && latencyEvidenceCount > 0;
-  const reliabilityCapacityGate = evaluateReliabilityCapacityGate({
-    latencySlack,
-    latencySource: latencySlackSource,
-    latencyEvidenceCount,
-    latencyEvidenceOk,
-    queuePressure,
-    minLatencySlack: MIN_LATENCY_SLACK_FOR_RELIABILITY,
-    maxQueuePressure: MAX_QUEUE_PRESSURE_FOR_RELIABILITY,
-  });
-
-  const workerCounts = params.snapshot.dispatch_budget?.by_component_count_last_hour ?? {};
-  const workerNodes: OpportunityGraphNodeWorker[] = componentAreas.map((area) => {
-    const limit = Math.max(1, Math.floor(asNumber(params.dispatchLimits.byComponent?.[area], dispatchLimit)));
-    const dispatchCount = Math.max(0, Math.floor(asNumber((workerCounts as Record<string, number>)[area], 0)));
-    const load = clamp01(dispatchCount / limit);
-    const idleCapacity = clamp01(1 - load);
-    return {
-      id: `worker:${area}`,
-      kind: "worker_pool",
-      label: area,
-      component_area: area,
-      load,
-      idleCapacity,
-      dispatchCount,
-      maxDispatchPerHour: limit,
-    };
-  });
-  const workerIdleCapacity =
-    workerNodes.length > 0
-      ? workerNodes.reduce((sum, node) => sum + node.idleCapacity, 0) / workerNodes.length
-      : 0.5;
-
-  const adjacencyByArea = new Map<AutonomyComponentArea, OpportunityAdjacencyEntry>();
-  const edges: OpportunityGraphEdge[] = [];
-  const slackNode: OpportunityGraphNodeSlack = {
-    id: "slack:latency",
-    kind: "slack",
-    label: "latency_slack",
-    slack: latencySlack,
-  };
-
-  for (const worker of workerNodes) {
-    const reasons: string[] = [];
-    let queueWeight = 0;
-    for (const queueNode of queueNodes) {
-      const hint = INSPIRATION_COMPONENT_HINTS.find((entry) => entry.area === worker.component_area);
-      const focusMultiplier =
-        hint && (hint.pattern.test(queueNode.label) || hint.pattern.test(queueNode.evidence)) ? 1 : 0.5;
-      const weight = clamp01(queueNode.pressure * worker.idleCapacity * (0.7 + 0.3 * focusMultiplier));
-      if (weight <= 0.01) continue;
-      queueWeight = Math.max(queueWeight, weight);
-      edges.push({
-        id: `edge:${queueNode.id}->${worker.component_area}`,
-        from: queueNode.id,
-        to: worker.id,
-        weight,
-        focus: "queue_pressure",
-        rationale: [
-          `queue_pressure=${queueNode.pressure.toFixed(2)}`,
-          `idle=${worker.idleCapacity.toFixed(2)}`,
-        ],
-      });
-      if (reasons.length < 3) reasons.push(`${queueNode.label}:${weight.toFixed(2)}`);
-    }
-    const slackWeight = clamp01(latencySlack * worker.idleCapacity);
-    if (slackWeight > 0.01) {
-      edges.push({
-        id: `edge:slack->${worker.component_area}`,
-        from: slackNode.id,
-        to: worker.id,
-        weight: slackWeight,
-        focus: "latency_slack",
-        rationale: [
-          `latency_slack=${latencySlack.toFixed(2)}`,
-          `idle=${worker.idleCapacity.toFixed(2)}`,
-        ],
-      });
-      if (reasons.length < 3) reasons.push(`slack:${slackWeight.toFixed(2)}`);
-    }
-    adjacencyByArea.set(worker.component_area, {
-      queueWeight,
-      slackWeight,
-      idleCapacity: worker.idleCapacity,
-      reasons,
-    });
-  }
-  edges.sort((a, b) => b.weight - a.weight);
-  return {
-    nodes: [...queueNodes, ...workerNodes, slackNode],
-    edges,
-    adjacencyByArea,
-    queuePressure,
-    latencySlack,
-    latencySlackSource,
-    latencyEvidenceCount,
-    workerIdleCapacity,
-    reliabilityCapacityGate,
-  };
-}
-
 function selectVisionSectionRefs(sectionRefs: string[]): string[] {
   const preferred = ["6", "7", "8", "4", "3", "0", "5"];
   const normalized = sectionRefs.map((value) => asString(value)).filter(Boolean);
@@ -3760,19 +3751,13 @@ export class RemoteBuddyAutonomousEngine {
     );
   }
 
-  private scoreCandidate(
-    snapshot: Snapshot,
-    candidate: AutonomyCandidate,
-    llmScore: number,
-    opportunityGraph: QueueWorkerOpportunityGraph | null,
-  ) {
+  private scoreCandidate(snapshot: Snapshot, candidate: AutonomyCandidate, llmScore: number) {
     const patternKey = makePatternKey(
       candidate.objective_type,
       candidate.target_paths,
       candidate.trigger_type,
       candidate.component_area,
     );
-    const policy = POLICY[candidate.objective_type];
     const prior = snapshot.feedback_priors.find((entry) => entry.pattern_key === patternKey);
     const enginePrior = candidate.engine_trial
       ? (snapshot.engine_idea_priors ?? []).find(
@@ -3845,19 +3830,6 @@ export class RemoteBuddyAutonomousEngine {
       });
     }
     const normalizedPenalties = normalizePenalties(penalties);
-    const adjacencyEntry = opportunityGraph?.adjacencyByArea.get(candidate.component_area) ?? null;
-    const latencySlack = opportunityGraph?.latencySlack ?? 0.5;
-    const queuePressure = opportunityGraph?.queuePressure ?? 0;
-    const adjacencyBias = computeAdjacencyBias({
-      candidate,
-      adjacencyEntry,
-      policy,
-    });
-    if (adjacencyBias.adjacencyBoost >= ADJACENCY_LOG_THRESHOLD) {
-      console.log(
-        `[RemoteBuddyAutonomousEngine] adjacency_bias candidate=${candidate.id} area=${candidate.component_area} focus=${adjacencyBias.adjacencyFocus} weight=${adjacencyBias.adjacencyWeight.toFixed(2)} guardrail=${adjacencyBias.adjacencyGuardrail.toFixed(2)} reasons=${adjacencyBias.adjacencyReasons.join("|")}`,
-      );
-    }
     const finalScore =
       0.46 * clamp01(llmScore) +
       0.2 * clamp01(impactSignal) +
@@ -3866,8 +3838,7 @@ export class RemoteBuddyAutonomousEngine {
       sourcePriorSignal.priorScore +
       enginePriorSignal.noveltyBonus +
       sourcePriorSignal.noveltyBonus +
-      sourcePriorSignal.trustBoost +
-      adjacencyBias.adjacencyBoost -
+      sourcePriorSignal.trustBoost -
       penaltyTotal(normalizedPenalties);
     return {
       patternKey,
@@ -3891,13 +3862,6 @@ export class RemoteBuddyAutonomousEngine {
       engineSourceCurationStatus: sourcePriorSignal.curationStatus,
       engineSourceCurationReason: sourcePriorSignal.curationReason,
       engineSourceTrustBoost: sourcePriorSignal.trustBoost,
-      adjacencyWeight: adjacencyBias.adjacencyWeight,
-      adjacencyBoost: adjacencyBias.adjacencyBoost,
-      adjacencyFocus: adjacencyBias.adjacencyFocus,
-      adjacencyReasons: adjacencyBias.adjacencyReasons,
-      adjacencyGuardrail: adjacencyBias.adjacencyGuardrail,
-      latencySlack,
-      queuePressure,
     };
   }
 
@@ -4094,29 +4058,12 @@ export class RemoteBuddyAutonomousEngine {
         sourceInsights,
         commitHistoryHints,
       });
-      const opportunityGraph = buildQueueWorkerOpportunityGraph({
-        snapshot,
-        dispatchLimits: {
-          global: this.cfg.maxDispatchPerHour,
-          byComponent: this.cfg.maxDispatchPerHourByComponent ?? {},
-        },
-        componentAreas: Array.from(COMPONENT_AREAS),
-      });
-      const topOpportunityEdge = opportunityGraph.edges[0];
-      const reliabilityGateStatus = opportunityGraph.reliabilityCapacityGate.allowed
-        ? "allowed"
-        : `blocked:${opportunityGraph.reliabilityCapacityGate.reason}`;
-      console.log(
-        `[RemoteBuddyAutonomousEngine] opportunity_graph: queue_pressure=${opportunityGraph.queuePressure.toFixed(2)} latency_slack=${opportunityGraph.latencySlack.toFixed(2)} latency_source=${opportunityGraph.latencySlackSource} latency_samples=${opportunityGraph.latencyEvidenceCount} worker_idle=${opportunityGraph.workerIdleCapacity.toFixed(2)} reliability_gate=${reliabilityGateStatus} top_edge=${
-          topOpportunityEdge
-            ? `${topOpportunityEdge.focus}:${topOpportunityEdge.from}->${topOpportunityEdge.to}@${topOpportunityEdge.weight.toFixed(2)}`
-            : "none"
-        }`,
-      );
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
 
       const llmCalls: Record<string, unknown>[] = [];
+      const reliabilityGate = new ReliabilityCapacityGate(snapshot, this.cfg);
+      const reliabilityGateMeta = new Map<string, ReliabilityGateDecision>();
       let candidatesPayload: Array<Record<string, unknown>> = [];
       let selectedCandidatePayload: Record<string, unknown> | undefined;
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
@@ -4197,18 +4144,6 @@ export class RemoteBuddyAutonomousEngine {
       const dropReasonCounts = new Map<string, number>();
       const recordDropReason = (reason: string): void => {
         dropReasonCounts.set(reason, (dropReasonCounts.get(reason) ?? 0) + 1);
-      };
-      const reliabilityGate = opportunityGraph.reliabilityCapacityGate;
-      let reliabilityGateLogCount = 0;
-      let reliabilityGateAllowedLogged = false;
-      const logReliabilityGate = (status: "allowed" | "blocked", reason: string): void => {
-        if (reliabilityGateLogCount >= RELIABILITY_GATE_LOG_LIMIT) return;
-        console.log(
-          `[RemoteBuddyAutonomousEngine] reliability_capacity_gate status=${status} reason=${reason} slack=${reliabilityGate.latencySlack.toFixed(2)}/${reliabilityGate.latencySlackThreshold.toFixed(2)} queue_pressure=${reliabilityGate.queuePressure.toFixed(2)}/${reliabilityGate.queuePressureThreshold.toFixed(2)} latency_source=${reliabilityGate.latencySource} latency_samples=${reliabilityGate.latencyEvidenceCount} latency_evidence=${
-            reliabilityGate.latencyEvidenceOk ? "present" : "missing"
-          }`,
-        );
-        reliabilityGateLogCount += 1;
       };
       const ingestRawCandidates = (
         rawList: unknown[],
@@ -4310,19 +4245,19 @@ export class RemoteBuddyAutonomousEngine {
               };
             }
           }
-          if (isReliabilityObjectiveType(candidate.objective_type)) {
-            if (!reliabilityGate.allowed) {
-              if (candidate.requires_user_input) {
-                logReliabilityGate("blocked", `${reliabilityGate.reason}_question_only`);
-              } else {
-                recordDropReason(`${source}_capacity_gate_${reliabilityGate.reason}`);
-                logReliabilityGate("blocked", reliabilityGate.reason);
-                continue;
-              }
-            } else if (!reliabilityGateAllowedLogged) {
-              logReliabilityGate("allowed", "ok");
-              reliabilityGateAllowedLogged = true;
-            }
+          const gateDecision = reliabilityGate.evaluate(candidate);
+          if (!gateDecision.allowed) {
+            recordDropReason(`${source}_${gateDecision.reason ?? "reliability_gate_blocked"}`);
+            continue;
+          }
+          if (isReliabilityCandidate(candidate)) {
+            reliabilityGateMeta.set(candidate.id, gateDecision);
+            candidate.debug = {
+              ...(candidate.debug ?? {}),
+              reliability_gate_mode: gateDecision.mode,
+              ...(gateDecision.reason ? { reliability_gate_reason: gateDecision.reason } : {}),
+              queue_telemetry_sources: gateDecision.telemetry.sources,
+            };
           }
           normalizedCandidates.push(candidate);
         }
@@ -4357,6 +4292,7 @@ export class RemoteBuddyAutonomousEngine {
         vision_section_refs: candidate.vision_section_refs,
         feature_hypotheses: candidate.feature_hypotheses,
         ...(candidate.engine_trial ? { engine_trial: candidate.engine_trial } : {}),
+        ...(candidate.debug ? { debug: candidate.debug } : {}),
         gate_decision: "proposed",
         gate_reasons: [],
         candidate_created_at: candidate.candidate_created_at,
@@ -4430,8 +4366,12 @@ export class RemoteBuddyAutonomousEngine {
 
       const scored = normalizedCandidates.map((candidate) => {
         const llmScore = scoreById.get(candidate.id) ?? 0;
-        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore, opportunityGraph);
-        return { candidate, llmScore, ...scoredCandidate };
+        const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore);
+        const gateMeta = reliabilityGateMeta.get(candidate.id);
+        const adjustedScore = gateMeta?.penalty
+          ? clamp01(scoredCandidate.finalScore - gateMeta.penalty)
+          : scoredCandidate.finalScore;
+        return { candidate, llmScore, ...scoredCandidate, finalScore: adjustedScore, reliabilityGate: gateMeta };
       });
       scored.sort((a, b) => {
         if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
@@ -4490,6 +4430,7 @@ export class RemoteBuddyAutonomousEngine {
         vision_section_refs: row.candidate.vision_section_refs,
         feature_hypotheses: row.candidate.feature_hypotheses,
         ...(row.candidate.engine_trial ? { engine_trial: row.candidate.engine_trial } : {}),
+        ...(row.candidate.debug ? { debug: row.candidate.debug } : {}),
         llm_score: row.llmScore,
         impact_signal: row.impactSignal,
         ema_success: row.emaSuccess,
@@ -4507,13 +4448,6 @@ export class RemoteBuddyAutonomousEngine {
         engine_source_curation_status: row.engineSourceCurationStatus,
         engine_source_curation_reason: row.engineSourceCurationReason,
         engine_source_trust_boost: row.engineSourceTrustBoost,
-        adjacency_weight: row.adjacencyWeight,
-        adjacency_focus: row.adjacencyFocus,
-        adjacency_reasons: row.adjacencyReasons,
-        adjacency_boost: row.adjacencyBoost,
-        adjacency_guardrail: row.adjacencyGuardrail,
-        latency_slack: row.latencySlack,
-        queue_pressure: row.queuePressure,
         explore_rate_configured: adaptiveExplore.baseRate,
         effective_explore_rate: adaptiveExplore.effectiveRate,
         explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4576,12 +4510,6 @@ export class RemoteBuddyAutonomousEngine {
             selection_strategy: selectedStrategy,
             selection_roll: selection.roll,
             effective_explore_rate: adaptiveExplore.effectiveRate,
-            adjacency_weight: selected.adjacencyWeight,
-            adjacency_focus: selected.adjacencyFocus,
-            adjacency_reasons: selected.adjacencyReasons,
-            adjacency_guardrail: selected.adjacencyGuardrail,
-            latency_slack: selected.latencySlack,
-            queue_pressure: selected.queuePressure,
           }
         : {
             id: top.candidate.id,
@@ -4601,12 +4529,6 @@ export class RemoteBuddyAutonomousEngine {
             selection_strategy: "none",
             selection_roll: null,
             effective_explore_rate: adaptiveExplore.effectiveRate,
-            adjacency_weight: top.adjacencyWeight,
-            adjacency_focus: top.adjacencyFocus,
-            adjacency_reasons: top.adjacencyReasons,
-            adjacency_guardrail: top.adjacencyGuardrail,
-            latency_slack: top.latencySlack,
-            queue_pressure: top.queuePressure,
           };
       for (const row of candidatesPayload) {
         const isSelected = Boolean(row.id === selectedCandidatePayload.id);
@@ -4655,13 +4577,6 @@ export class RemoteBuddyAutonomousEngine {
               engine_source_curation_status: top.engineSourceCurationStatus,
               engine_source_curation_reason: top.engineSourceCurationReason,
               engine_source_trust_boost: top.engineSourceTrustBoost,
-              adjacency_weight: top.adjacencyWeight,
-              adjacency_focus: top.adjacencyFocus,
-              adjacency_reasons: top.adjacencyReasons,
-              adjacency_boost: top.adjacencyBoost,
-              adjacency_guardrail: top.adjacencyGuardrail,
-              latency_slack: top.latencySlack,
-              queue_pressure: top.queuePressure,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4716,13 +4631,6 @@ export class RemoteBuddyAutonomousEngine {
               engine_source_curation_status: selected.engineSourceCurationStatus,
               engine_source_curation_reason: selected.engineSourceCurationReason,
               engine_source_trust_boost: selected.engineSourceTrustBoost,
-              adjacency_weight: selected.adjacencyWeight,
-              adjacency_focus: selected.adjacencyFocus,
-              adjacency_reasons: selected.adjacencyReasons,
-              adjacency_boost: selected.adjacencyBoost,
-              adjacency_guardrail: selected.adjacencyGuardrail,
-              latency_slack: selected.latencySlack,
-              queue_pressure: selected.queuePressure,
               explore_rate_configured: adaptiveExplore.baseRate,
               effective_explore_rate: adaptiveExplore.effectiveRate,
               explore_rate_adjustment: adaptiveExplore.adjustment,
@@ -4871,13 +4779,6 @@ export class RemoteBuddyAutonomousEngine {
             engine_source_curation_status: selected.engineSourceCurationStatus,
             engine_source_curation_reason: selected.engineSourceCurationReason,
             engine_source_trust_boost: selected.engineSourceTrustBoost,
-            adjacency_weight: selected.adjacencyWeight,
-            adjacency_focus: selected.adjacencyFocus,
-            adjacency_reasons: selected.adjacencyReasons,
-            adjacency_boost: selected.adjacencyBoost,
-            adjacency_guardrail: selected.adjacencyGuardrail,
-            latency_slack: selected.latencySlack,
-            queue_pressure: selected.queuePressure,
             explore_rate_configured: adaptiveExplore.baseRate,
             effective_explore_rate: adaptiveExplore.effectiveRate,
             explore_rate_adjustment: adaptiveExplore.adjustment,
