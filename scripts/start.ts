@@ -664,6 +664,23 @@ type LocalConfigPaths = {
   localExampleTomlRel: string;
 };
 
+function quoteForPowerShell(value: string): string {
+  return `'${String(value ?? "").replace(/'/g, "''")}'`;
+}
+
+function quoteForBash(value: string): string {
+  return `'${String(value ?? "").replace(/'/g, "'\\''")}'`;
+}
+
+function printTemplateCopyCommands(templateRel: string, targetRel: string): void {
+  console.error(
+    `[start]   Windows (PowerShell): Copy-Item -Force ${quoteForPowerShell(templateRel)} ${quoteForPowerShell(targetRel)}`,
+  );
+  console.error(
+    `[start]   Linux/macOS (bash): cp -f ${quoteForBash(templateRel)} ${quoteForBash(targetRel)}`,
+  );
+}
+
 function resolveLocalConfigPaths(): {
   localTomlPath: string;
   localTomlRel: string;
@@ -802,6 +819,7 @@ function ensureLocalConfigTemplateKeyParity(localConfigPaths: LocalConfigPaths):
 
   console.error("[start] Template key-parity preflight failed:");
   for (const problem of problems) {
+    let shouldPrintCopyCommands = false;
     if (problem.missingKeys.length > 0) {
       console.error(
         `[start] - ${problem.label} is missing ${problem.missingKeys.length} key(s) from ${problem.templateLabel}:`,
@@ -809,6 +827,7 @@ function ensureLocalConfigTemplateKeyParity(localConfigPaths: LocalConfigPaths):
       for (const key of problem.missingKeys) {
         console.error(`[start]   ${key}`);
       }
+      shouldPrintCopyCommands = true;
     }
     if (problem.extraKeys.length > 0) {
       console.error(
@@ -817,6 +836,13 @@ function ensureLocalConfigTemplateKeyParity(localConfigPaths: LocalConfigPaths):
       for (const key of problem.extraKeys) {
         console.error(`[start]   ${key}`);
       }
+      shouldPrintCopyCommands = true;
+    }
+    if (shouldPrintCopyCommands) {
+      console.error(
+        `[start]   Quick template reset (overwrites ${problem.label}):`,
+      );
+      printTemplateCopyCommands(problem.templateLabel, problem.label);
     }
   }
   console.error(
