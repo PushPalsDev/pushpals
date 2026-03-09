@@ -121,6 +121,7 @@ type Snapshot = {
     dispatch_lock_held: boolean;
   };
   dispatch_budget: {
+    rolling_window_seconds?: number;
     global_count_last_hour: number;
     by_type_count_last_hour: Record<string, number>;
     by_component_count_last_hour?: Record<string, number>;
@@ -153,6 +154,103 @@ type PolicyRule = {
   maxBreadth: "narrow" | "medium" | "broad";
   autonomousAllowed: boolean;
   requireValidation: boolean;
+};
+
+type AdaptiveDispatchGuardConfig = {
+  enabled: boolean;
+  minIdleWorkers: number;
+  guardBand: number;
+  guardBandFloor: number;
+  completionRateLookbackMinutes: number;
+  completionRateSampleBasis: "success" | "total";
+  emaAlpha: number;
+  emaResetAfterSamples: number;
+  systemStatusTtlMs: number;
+  telemetryThrottleMs: number;
+  statusUnavailablePolicy: "allow" | "block";
+};
+
+type RemoteBuddyAutonomyConfig = PushPalsConfig["remotebuddy"]["autonomy"] & {
+  adaptiveDispatchGuard?: Partial<AdaptiveDispatchGuardConfig>;
+};
+
+type WorkerIdleSnapshot = {
+  total: number;
+  online: number;
+  busy: number;
+  idle: number;
+  ts: number | null;
+  completionWindowSeconds: number | null;
+  completionSuccessCount: number | null;
+  completionTotalCount: number | null;
+  completionSampleSource?: string;
+};
+
+type AdaptiveDispatchGuardTelemetry = {
+  runId: string;
+  status: "blocked" | "ok" | "skipped";
+  reason: string;
+  idle_workers: number;
+  idle_buffer: number;
+  buffer_computed: boolean;
+  completion_signal_valid: boolean;
+  completion_rate_per_min: number;
+  completion_rate_ema_per_min: number;
+  completion_rate_basis: "success" | "total";
+  guard_band: number;
+  guard_band_floor: number;
+  min_idle_workers: number;
+  lookback_minutes: number;
+  completion_window_seconds: number;
+  completion_window_effective_seconds: number;
+  system_status_age_ms: number;
+  status_unavailable_policy: "allow" | "block";
+  stale_sample_count: number;
+  ema_reset: boolean;
+  ema_reset_reason?: string;
+  completion_sample_source?: string;
+};
+
+/**
+ * Adaptive dispatch guard defaults (documented for operators tuning this gate):
+ * - `enabled`: turn guard on/off without redeploys.
+ * - `minIdleWorkers`: floor for allowable idle slots even when throughput is low.
+ * - `guardBand`: multiplier applied to recent completion rate (per-minute) to derive an extra buffer.
+ * - `guardBandFloor`: additive safety margin layered on top of the guard band calculation.
+ * - `completionRateLookbackMinutes`: clamps the rolling completion window we consider when deriving the buffer.
+ * - `completionRateSampleBasis`: prefer `success` (default) to base throughput on successful completions, or `total` to include failures.
+ * - `emaAlpha`: smoothing factor for the completion-rate EMA that damps oscillations.
+ * - `emaResetAfterSamples`: reset the EMA after this many consecutive stale/missing samples to avoid stale guard thresholds lingering.
+ * - `systemStatusTtlMs`: maximum age for `/system/status` samples before treating data as stale (enforced client-side even if the API misses the TTL).
+ * - `telemetryThrottleMs`: throttle for OK logs so ops only get every-N-ms snapshots, while block events always log.
+ * - `statusUnavailablePolicy`: choose `allow` to continue dispatching when `/system/status` or completion signals are stale, or `block` to fail closed.
+ *
+ * Telemetry fields emitted with the `[RemoteBuddyAutonomousEngine] dispatch_guard` prefix:
+ * - `idle_workers`: current idle WorkerPal slots from `/system/status`.
+ * - `idle_buffer`: guard threshold; dispatch pauses when idle < buffer.
+ * - `buffer_computed`: `true` when `idle_buffer` is derived from fresh throughput data, `false` when falling back to config floors.
+ * - `completion_signal_valid`: confirms whether recent completions powered the calculation.
+ * - `completion_rate_per_min` / `_ema_per_min`: instantaneous vs smoothed completion rate backing the buffer.
+ * - `completion_rate_basis`: indicates whether throughput used `success`-only or `total` counts; `completion_sample_source` mirrors the upstream metric name.
+ * - `guard_band`, `guard_band_floor`, `min_idle_workers`, `lookback_minutes`, `completion_window_seconds`, `completion_window_effective_seconds`: config context.
+ * - `stale_sample_count`: consecutive guard evaluations missing valid completion data.
+ * - `ema_reset` + optional `_reason`: highlight when the EMA resets due to config changes or stale data.
+ * - `system_status_age_ms`: freshness of the worker snapshot powering the decision.
+ * - `status_unavailable_policy`: indicates whether degraded data allows (`allow`) or blocks (`block`) dispatch.
+ * - `status` + `reason`: whether dispatch proceeded (`ok`), was blocked (`blocked`), or skipped due to missing data (`skipped`).
+ */
+const DEFAULT_ADAPTIVE_DISPATCH_GUARD: AdaptiveDispatchGuardConfig = {
+  enabled: true,
+  minIdleWorkers: 2,
+  guardBand: 1.4,
+  guardBandFloor: 0.6,
+  completionRateLookbackMinutes: 15,
+  completionRateSampleBasis: "success",
+  emaAlpha: 0.3,
+  emaResetAfterSamples: 4,
+  systemStatusTtlMs: 15_000,
+  telemetryThrottleMs: 45_000,
+  statusUnavailablePolicy: "allow",
 };
 
 const POLICY: Record<AutonomyObjectiveType, PolicyRule> = {
@@ -2713,7 +2811,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly baseBranch: string;
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
-  private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
+  private readonly cfg: RemoteBuddyAutonomyConfig;
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -2725,6 +2823,10 @@ export class RemoteBuddyAutonomousEngine {
   private lastOutcome: "none" | "success" | "skipped" | "failed" = "none";
   private lastDetail = "not_started";
   private lastCompletedAtMs = 0;
+  private idleGuardRateEma = 0;
+  private idleGuardRateEmaConfigKey: string | null = null;
+  private idleGuardConsecutiveStaleSamples = 0;
+  private lastIdleGuardTelemetryAtMs = 0;
 
   constructor(opts: {
     server: string;
@@ -3023,6 +3125,424 @@ export class RemoteBuddyAutonomousEngine {
     const trusted = Array.isArray(data.trustedInspirationShortlist) ? data.trustedInspirationShortlist : [];
     const archived = Array.isArray(data.archivedInspirationSources) ? data.archivedInspirationSources : [];
     return [...trusted, ...archived];
+  }
+
+  private adaptiveDispatchGuardConfig(): AdaptiveDispatchGuardConfig {
+    const raw = asObject(this.cfg.adaptiveDispatchGuard ?? {});
+    const enabled = asBoolean(raw.enabled, DEFAULT_ADAPTIVE_DISPATCH_GUARD.enabled);
+    const minIdleWorkers = Math.max(
+      0,
+      Math.floor(asNumber(raw.minIdleWorkers, DEFAULT_ADAPTIVE_DISPATCH_GUARD.minIdleWorkers)),
+    );
+    const guardBand = Math.max(0.1, asNumber(raw.guardBand, DEFAULT_ADAPTIVE_DISPATCH_GUARD.guardBand));
+    const guardBandFloor = Math.max(
+      0,
+      asNumber(raw.guardBandFloor, DEFAULT_ADAPTIVE_DISPATCH_GUARD.guardBandFloor),
+    );
+    const completionRateLookbackMinutes = Math.max(
+      1,
+      Math.floor(
+        asNumber(
+          raw.completionRateLookbackMinutes,
+          DEFAULT_ADAPTIVE_DISPATCH_GUARD.completionRateLookbackMinutes,
+        ),
+      ),
+    );
+    const completionRateSampleBasisRaw = asString(
+      raw.completionRateSampleBasis ?? raw.completionRateBasis,
+    ).toLowerCase();
+    const completionRateSampleBasis: "success" | "total" =
+      completionRateSampleBasisRaw === "total"
+        ? "total"
+        : DEFAULT_ADAPTIVE_DISPATCH_GUARD.completionRateSampleBasis;
+    const emaAlpha = Math.min(
+      1,
+      Math.max(0.05, asNumber(raw.emaAlpha, DEFAULT_ADAPTIVE_DISPATCH_GUARD.emaAlpha)),
+    );
+    const emaResetAfterSamples = Math.max(
+      1,
+      Math.floor(
+        asNumber(raw.emaResetAfterSamples, DEFAULT_ADAPTIVE_DISPATCH_GUARD.emaResetAfterSamples),
+      ),
+    );
+    const systemStatusTtlMs = Math.max(
+      2_000,
+      Math.floor(asNumber(raw.systemStatusTtlMs, DEFAULT_ADAPTIVE_DISPATCH_GUARD.systemStatusTtlMs)),
+    );
+    const telemetryThrottleMs = Math.max(
+      5_000,
+      Math.floor(
+        asNumber(raw.telemetryThrottleMs, DEFAULT_ADAPTIVE_DISPATCH_GUARD.telemetryThrottleMs),
+      ),
+    );
+    const statusUnavailableRaw = asString(raw.statusUnavailablePolicy).toLowerCase();
+    const statusUnavailablePolicy: "allow" | "block" =
+      statusUnavailableRaw === "block" ? "block" : DEFAULT_ADAPTIVE_DISPATCH_GUARD.statusUnavailablePolicy;
+    return {
+      enabled,
+      minIdleWorkers,
+      guardBand,
+      guardBandFloor,
+      completionRateLookbackMinutes,
+      completionRateSampleBasis,
+      emaAlpha,
+      emaResetAfterSamples,
+      systemStatusTtlMs,
+      telemetryThrottleMs,
+      statusUnavailablePolicy,
+    };
+  }
+
+  private async fetchWorkerIdleSnapshot(ttlMs: number): Promise<WorkerIdleSnapshot | null> {
+    const params = new URLSearchParams();
+    if (ttlMs > 0) params.set("ttlMs", String(Math.max(1_000, Math.floor(ttlMs))));
+    const url = `${this.server}/system/status${params.toString() ? `?${params.toString()}` : ""}`;
+    try {
+      const res = await fetch(url, { method: "GET", headers: this.headers() });
+      if (!res.ok) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] dispatch guard: /system/status returned HTTP ${res.status}.`,
+        );
+        return null;
+      }
+      const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      const workers = asObject(data.workers);
+      if (Object.keys(workers).length === 0) return null;
+      const idleRaw = asNumber(workers.idle, Number.NaN);
+      if (!Number.isFinite(idleRaw)) return null;
+      // Preserve any fractional idle capacity reported by /system/status to avoid off-by-one guard triggers.
+      const idle = Math.max(0, idleRaw);
+      const online = Math.max(0, Math.floor(asNumber(workers.online, 0)));
+      const total = Math.max(0, Math.floor(asNumber(workers.total, 0)));
+      const busy = Math.max(0, Math.floor(asNumber(workers.busy, 0)));
+      const tsText = asString(data.ts);
+      const parsedTs = tsText ? Date.parse(tsText) : Number.NaN;
+      const ts = Number.isFinite(parsedTs) ? parsedTs : null;
+      const slo = asObject(data.slo);
+      const jobSlo = asObject(slo.jobs);
+      const jobWindowHoursRaw = asNumber(jobSlo.windowHours ?? jobSlo.window_hours, Number.NaN);
+      const completionWindowSeconds = Number.isFinite(jobWindowHoursRaw)
+        ? Math.max(0, Math.floor(jobWindowHoursRaw * 60 * 60))
+        : null;
+      const completedRaw = asNumber(jobSlo.completed, Number.NaN);
+      const failedRaw = asNumber(jobSlo.failed, Number.NaN);
+      const completionSuccessCount = Number.isFinite(completedRaw)
+        ? Math.max(0, Math.floor(completedRaw))
+        : null;
+      const completionFailureCount = Number.isFinite(failedRaw)
+        ? Math.max(0, Math.floor(failedRaw))
+        : null;
+      const completionTotalCount =
+        completionSuccessCount == null
+          ? null
+          : completionFailureCount == null
+            ? completionSuccessCount
+            : completionSuccessCount + completionFailureCount;
+      const sampleSourceRaw = asString(jobSlo.sampleSource ?? jobSlo.sample_source);
+      const completionSampleSource =
+        completionSuccessCount == null && completionTotalCount == null
+          ? undefined
+          : sampleSourceRaw || "system_status.jobs_slo";
+      return {
+        idle,
+        online,
+        total,
+        busy,
+        ts,
+        completionWindowSeconds,
+        completionSuccessCount,
+        completionTotalCount,
+        completionSampleSource,
+      };
+    } catch (error) {
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] dispatch guard: failed to load /system/status: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return null;
+    }
+  }
+
+  private computeAdaptiveDispatchGuardBuffer(
+    workerSnapshot: WorkerIdleSnapshot,
+    cfg: AdaptiveDispatchGuardConfig,
+  ):
+    | {
+        idleBuffer: number;
+        completionRatePerMin: number;
+        completionRateEmaPerMin: number;
+        completionWindowSeconds: number;
+        completionWindowEffectiveSeconds: number;
+        completionRateBasis: "success" | "total";
+      }
+    | null {
+    const requestedBasis = cfg.completionRateSampleBasis;
+    const hasSuccess = workerSnapshot.completionSuccessCount != null;
+    const hasTotal = workerSnapshot.completionTotalCount != null;
+    let completionCount: number | null = null;
+    let completionRateBasis: "success" | "total" = requestedBasis;
+    if (requestedBasis === "total") {
+      if (hasTotal) {
+        completionCount = workerSnapshot.completionTotalCount!;
+        completionRateBasis = "total";
+      } else if (hasSuccess) {
+        completionCount = workerSnapshot.completionSuccessCount!;
+        completionRateBasis = "success";
+      }
+    } else if (hasSuccess) {
+      completionCount = workerSnapshot.completionSuccessCount!;
+      completionRateBasis = "success";
+    } else if (hasTotal) {
+      completionCount = workerSnapshot.completionTotalCount!;
+      completionRateBasis = "total";
+    }
+    const completionWindowSeconds =
+      workerSnapshot.completionWindowSeconds && workerSnapshot.completionWindowSeconds > 0
+        ? workerSnapshot.completionWindowSeconds
+        : null;
+    if (completionCount == null || completionWindowSeconds == null) {
+      return null;
+    }
+    const normalizedWindowSeconds = Math.max(60, completionWindowSeconds);
+    const targetWindowSeconds = Math.max(60, cfg.completionRateLookbackMinutes * 60);
+    const effectiveWindowSeconds = Math.min(normalizedWindowSeconds, targetWindowSeconds);
+    const normalizedCompletionCount =
+      normalizedWindowSeconds > 0
+        ? completionCount * (effectiveWindowSeconds / normalizedWindowSeconds)
+        : completionCount;
+    const ratePerSec =
+      effectiveWindowSeconds > 0 ? normalizedCompletionCount / effectiveWindowSeconds : 0;
+    const ratePerMin = ratePerSec * 60;
+    if (this.idleGuardRateEma <= 0) {
+      this.idleGuardRateEma = ratePerMin;
+    } else {
+      const alpha = Math.min(1, Math.max(0.05, cfg.emaAlpha));
+      this.idleGuardRateEma = alpha * ratePerMin + (1 - alpha) * this.idleGuardRateEma;
+    }
+    const idleBuffer = Math.max(
+      cfg.minIdleWorkers,
+      Math.ceil(this.idleGuardRateEma * cfg.guardBand + cfg.guardBandFloor),
+    );
+    return {
+      idleBuffer,
+      completionRatePerMin: ratePerMin,
+      completionRateEmaPerMin: this.idleGuardRateEma,
+      completionWindowSeconds: normalizedWindowSeconds,
+      completionWindowEffectiveSeconds: effectiveWindowSeconds,
+      completionRateBasis,
+    };
+  }
+
+  private logAdaptiveDispatchGuardTelemetry(
+    payload: AdaptiveDispatchGuardTelemetry,
+    throttleMs: number,
+  ): void {
+    const now = Date.now();
+    const shouldLog =
+      payload.status !== "ok" || now - this.lastIdleGuardTelemetryAtMs >= Math.max(1_000, throttleMs);
+    if (!shouldLog) return;
+    this.lastIdleGuardTelemetryAtMs = now;
+    console.log(`[RemoteBuddyAutonomousEngine] dispatch_guard ${JSON.stringify(payload)}`);
+  }
+
+  private async evaluateAdaptiveDispatchGuard(runId: string): Promise<{ blocked: boolean; detail: string }> {
+    const guardCfg = this.adaptiveDispatchGuardConfig();
+    const configKey = `${guardCfg.emaAlpha}:${guardCfg.completionRateLookbackMinutes}:${guardCfg.completionRateSampleBasis}`;
+    let emaResetReason: string | null = null;
+    const registerEmaReset = (reason: string): void => {
+      if (!emaResetReason) emaResetReason = reason;
+      this.idleGuardRateEma = 0;
+    };
+    if (this.idleGuardRateEmaConfigKey !== configKey) {
+      if (this.idleGuardRateEmaConfigKey !== null && this.idleGuardRateEma !== 0) {
+        registerEmaReset("config_changed");
+      } else {
+        this.idleGuardRateEma = 0;
+      }
+      this.idleGuardRateEmaConfigKey = configKey;
+      this.idleGuardConsecutiveStaleSamples = 0;
+    }
+    const recordStaleSample = (): void => {
+      this.idleGuardConsecutiveStaleSamples = Math.min(
+        guardCfg.emaResetAfterSamples,
+        this.idleGuardConsecutiveStaleSamples + 1,
+      );
+      if (
+        this.idleGuardConsecutiveStaleSamples >= guardCfg.emaResetAfterSamples &&
+        this.idleGuardRateEma !== 0
+      ) {
+        registerEmaReset("stale_samples");
+      }
+    };
+    const telemetryBase = (): Omit<
+      AdaptiveDispatchGuardTelemetry,
+      "status" | "reason" | "idle_workers" | "completion_sample_source"
+    > => ({
+      runId,
+      idle_buffer: guardCfg.minIdleWorkers,
+      buffer_computed: false,
+      completion_signal_valid: false,
+      completion_rate_per_min: 0,
+      completion_rate_ema_per_min: this.idleGuardRateEma,
+      completion_rate_basis: guardCfg.completionRateSampleBasis,
+      guard_band: guardCfg.guardBand,
+      guard_band_floor: guardCfg.guardBandFloor,
+      min_idle_workers: guardCfg.minIdleWorkers,
+      lookback_minutes: guardCfg.completionRateLookbackMinutes,
+      completion_window_seconds: 0,
+      completion_window_effective_seconds: 0,
+      system_status_age_ms: 0,
+      status_unavailable_policy: guardCfg.statusUnavailablePolicy,
+      stale_sample_count: this.idleGuardConsecutiveStaleSamples,
+      ema_reset: Boolean(emaResetReason),
+      ...(emaResetReason ? { ema_reset_reason: emaResetReason } : {}),
+    });
+
+    if (!guardCfg.enabled) {
+      this.idleGuardConsecutiveStaleSamples = 0;
+      this.logAdaptiveDispatchGuardTelemetry(
+        {
+          ...telemetryBase(),
+          status: "skipped",
+          reason: "guard_disabled",
+          idle_workers: -1,
+        },
+        guardCfg.telemetryThrottleMs,
+      );
+      return { blocked: false, detail: "idle_guard_disabled" };
+    }
+
+    const workerSnapshot = await this.fetchWorkerIdleSnapshot(guardCfg.systemStatusTtlMs);
+    if (!workerSnapshot) {
+      recordStaleSample();
+      const blocked = guardCfg.statusUnavailablePolicy === "block";
+      this.logAdaptiveDispatchGuardTelemetry(
+        {
+          ...telemetryBase(),
+          status: blocked ? "blocked" : "skipped",
+          reason: "system_status_unavailable",
+          idle_workers: -1,
+          system_status_age_ms: guardCfg.systemStatusTtlMs,
+        },
+        guardCfg.telemetryThrottleMs,
+      );
+      return {
+        blocked,
+        detail: blocked
+          ? "idle_guard_blocked_system_status_unavailable"
+          : "idle_guard_skipped_system_status_unavailable",
+      };
+    }
+
+    const snapshotTs = workerSnapshot.ts;
+    if (snapshotTs == null || !Number.isFinite(snapshotTs)) {
+      recordStaleSample();
+      const blocked = guardCfg.statusUnavailablePolicy === "block";
+      this.logAdaptiveDispatchGuardTelemetry(
+        {
+          ...telemetryBase(),
+          status: blocked ? "blocked" : "skipped",
+          reason: "system_status_timestamp_unavailable",
+          idle_workers: workerSnapshot.idle,
+          completion_window_seconds: workerSnapshot.completionWindowSeconds ?? 0,
+          system_status_age_ms: guardCfg.systemStatusTtlMs,
+          ...(workerSnapshot.completionSampleSource
+            ? { completion_sample_source: workerSnapshot.completionSampleSource }
+            : {}),
+        },
+        guardCfg.telemetryThrottleMs,
+      );
+      return {
+        blocked,
+        detail: blocked
+          ? "idle_guard_blocked_system_status_timestamp_unavailable"
+          : "idle_guard_skipped_system_status_timestamp_unavailable",
+      };
+    }
+
+    const systemStatusAgeMs = Math.max(0, Date.now() - snapshotTs);
+    if (systemStatusAgeMs > guardCfg.systemStatusTtlMs) {
+      recordStaleSample();
+      const blocked = guardCfg.statusUnavailablePolicy === "block";
+      this.logAdaptiveDispatchGuardTelemetry(
+        {
+          ...telemetryBase(),
+          status: blocked ? "blocked" : "skipped",
+          reason: "system_status_stale",
+          idle_workers: workerSnapshot.idle,
+          completion_window_seconds: workerSnapshot.completionWindowSeconds ?? 0,
+          system_status_age_ms: systemStatusAgeMs,
+          ...(workerSnapshot.completionSampleSource
+            ? { completion_sample_source: workerSnapshot.completionSampleSource }
+            : {}),
+        },
+        guardCfg.telemetryThrottleMs,
+      );
+      return {
+        blocked,
+        detail: blocked
+          ? "idle_guard_blocked_system_status_stale"
+          : "idle_guard_skipped_system_status_stale",
+      };
+    }
+
+    const buffer = this.computeAdaptiveDispatchGuardBuffer(workerSnapshot, guardCfg);
+    if (!buffer) {
+      recordStaleSample();
+      const blocked = guardCfg.statusUnavailablePolicy === "block";
+      this.logAdaptiveDispatchGuardTelemetry(
+        {
+          ...telemetryBase(),
+          status: blocked ? "blocked" : "skipped",
+          reason: "completion_signal_unavailable",
+          idle_workers: workerSnapshot.idle,
+          completion_window_seconds: workerSnapshot.completionWindowSeconds ?? 0,
+          system_status_age_ms: systemStatusAgeMs,
+          ...(workerSnapshot.completionSampleSource
+            ? { completion_sample_source: workerSnapshot.completionSampleSource }
+            : {}),
+        },
+        guardCfg.telemetryThrottleMs,
+      );
+      return {
+        blocked,
+        detail: blocked
+          ? "idle_guard_blocked_completion_signal_unavailable"
+          : "idle_guard_skipped_completion_signal_unavailable",
+      };
+    }
+
+    this.idleGuardConsecutiveStaleSamples = 0;
+    const {
+      idleBuffer,
+      completionRatePerMin,
+      completionRateEmaPerMin,
+      completionWindowSeconds,
+      completionWindowEffectiveSeconds,
+      completionRateBasis,
+    } = buffer;
+    const blocked = workerSnapshot.idle < idleBuffer;
+    this.logAdaptiveDispatchGuardTelemetry(
+      {
+        ...telemetryBase(),
+        status: blocked ? "blocked" : "ok",
+        reason: blocked ? "idle_capacity_below_buffer" : "idle_capacity_sufficient",
+        idle_workers: workerSnapshot.idle,
+        idle_buffer: idleBuffer,
+        buffer_computed: true,
+        completion_signal_valid: true,
+        completion_rate_per_min: completionRatePerMin,
+        completion_rate_ema_per_min: completionRateEmaPerMin,
+        completion_rate_basis: completionRateBasis,
+        completion_window_seconds: completionWindowSeconds,
+        completion_window_effective_seconds: completionWindowEffectiveSeconds,
+        system_status_age_ms: systemStatusAgeMs,
+        ...(workerSnapshot.completionSampleSource
+          ? { completion_sample_source: workerSnapshot.completionSampleSource }
+          : {}),
+      },
+      guardCfg.telemetryThrottleMs,
+    );
+    return { blocked, detail: blocked ? "idle_guard_blocked" : "idle_guard_ok" };
   }
 
   private buildAutoInspirationEntries(commitHistoryHints: EngineCommitHistoryHint[]): Array<Record<string, unknown>> {
@@ -3579,6 +4099,13 @@ export class RemoteBuddyAutonomousEngine {
       }
       if (asBoolean(snapshotResourceBudget.runtime_budget_exhausted, false)) {
         outcomeDetail = "resource_budget_runtime_exhausted";
+        return;
+      }
+
+      this.setPhase("dispatch_idle_guard");
+      const guardDecision = await this.evaluateAdaptiveDispatchGuard(runId);
+      if (guardDecision.blocked) {
+        outcomeDetail = guardDecision.detail;
         return;
       }
 
@@ -4400,4 +4927,267 @@ export class RemoteBuddyAutonomousEngine {
     }
     this.nextTickAtMs = 0;
   }
+}
+
+if (process.env.NODE_ENV === "test" || process.env.BUN_TEST === "1" || process.env.VITEST === "true") {
+  void (async () => {
+    const { describe, expect, test } = await import("bun:test");
+
+    const dummyLlm: LLMClient = {
+      async generate() {
+        return { text: "{}", usage: { promptTokens: 0, completionTokens: 0 } };
+      },
+    };
+    const dummyComm = {
+      async emit() {
+        return true;
+      },
+    } as CommunicationManager;
+
+    function makeTestConfig(): PushPalsConfig {
+      return {
+        sourceControlManager: {
+          remote: "origin",
+          mainBranch: "main_agents",
+          baseBranch: "main",
+        },
+        remotebuddy: {
+          autonomy: {
+            enabled: true,
+            killSwitchEnabled: false,
+            tickIntervalMs: 60_000,
+            heartbeatLogMs: 60_000,
+            visionContextMaxChars: 1_024,
+            ideationBudgetMs: 5_000,
+            llmTimeoutMs: 5_000,
+            allowDirtyWorktree: true,
+            ideationMaxCandidates: 1,
+            topK: 1,
+            exploreRate: 0,
+            minConfidence: 0.6,
+            maxConcurrentObjectives: 1,
+            maxDispatchPerHour: 10,
+            maxDispatchPerHourByType: {},
+            maxDispatchPerHourByComponent: {},
+            maxTokenUsagePerHour: 10_000,
+            maxRuntimeMsPerHour: 10_000,
+            cooldownFailStreakThreshold: 1,
+            cooldownMs: 60_000,
+            staleObjectiveTtlMs: 60_000,
+            staleObjectiveSweepIntervalMs: 60_000,
+            autoFreezeFailStreakThreshold: 1,
+            autoFreezeDurationMs: 60_000,
+            evaluatorWindowHours: 1,
+            evaluatorMinSamples: 1,
+            evaluatorMinSuccessRate: 0,
+            evaluatorMaxRegretRate: 1,
+            evaluatorRunIntervalMs: 60_000,
+            alertQueuePendingThreshold: 10,
+            alertJobFailureRateThreshold: 0.5,
+            alertAutonomyFailureRateThreshold: 0.5,
+            allowReadAnywhere: true,
+            prFeedbackCommentRows: 1,
+            prFeedbackCommentChars: 1,
+            prFeedbackSummaryChars: 1,
+            questionTtlMs: 60_000,
+            policyVersion: "policy-test",
+            impactModelVersion: "impact-test",
+            replay: {
+              storePromptPayloads: false,
+              maxRunsWithPayloads: 0,
+              maxPayloadBytes: 0,
+            },
+            adaptiveDispatchGuard: {},
+          },
+        },
+      } as unknown as PushPalsConfig;
+    }
+
+    const makeEngine = (): RemoteBuddyAutonomousEngine =>
+      new RemoteBuddyAutonomousEngine({
+        server: "http://localhost",
+        sessionId: "test",
+        authToken: null,
+        repo: ".",
+        llm: dummyLlm,
+        comm: dummyComm,
+        config: makeTestConfig(),
+      });
+
+    const makeWorkerSnapshot = (overrides?: Partial<WorkerIdleSnapshot>): WorkerIdleSnapshot => ({
+      total: 4,
+      online: 4,
+      busy: 1,
+      idle: 2,
+      ts: Date.now(),
+      completionWindowSeconds: 900,
+      completionSuccessCount: 30,
+      completionTotalCount: 30,
+      completionSampleSource: "test_harness",
+      ...overrides,
+    });
+
+    function buildGuardHarness(
+      overrides?: Partial<AdaptiveDispatchGuardConfig>,
+    ): {
+      engine: RemoteBuddyAutonomousEngine;
+      telemetry: AdaptiveDispatchGuardTelemetry[];
+      pushSnapshot(snapshot: WorkerIdleSnapshot | null): void;
+      evaluate(): Promise<{ blocked: boolean; detail: string }>;
+    } {
+      const engine = makeEngine();
+      const telemetry: AdaptiveDispatchGuardTelemetry[] = [];
+      const snapshots: Array<WorkerIdleSnapshot | null> = [];
+      (engine as any).adaptiveDispatchGuardConfig = (): AdaptiveDispatchGuardConfig => ({
+        ...DEFAULT_ADAPTIVE_DISPATCH_GUARD,
+        ...overrides,
+      });
+      (engine as any).fetchWorkerIdleSnapshot = async (): Promise<WorkerIdleSnapshot | null> =>
+        snapshots.length > 0 ? snapshots.shift() ?? null : null;
+      (engine as any).logAdaptiveDispatchGuardTelemetry = (payload: AdaptiveDispatchGuardTelemetry) => {
+        telemetry.push(payload);
+      };
+      return {
+        engine,
+        telemetry,
+        pushSnapshot(snapshot: WorkerIdleSnapshot | null) {
+          snapshots.push(snapshot);
+        },
+        evaluate(): Promise<{ blocked: boolean; detail: string }> {
+          return (engine as any).evaluateAdaptiveDispatchGuard("run_test");
+        },
+      };
+    }
+
+    describe("Adaptive dispatch guard", () => {
+      test("allows dispatch when idle capacity exceeds buffer", async () => {
+        const harness = buildGuardHarness({
+          minIdleWorkers: 1,
+          guardBand: 0.6,
+          guardBandFloor: 0.2,
+        });
+        harness.pushSnapshot(
+          makeWorkerSnapshot({
+            idle: 3,
+            completionSuccessCount: 6,
+            completionTotalCount: 6,
+            completionWindowSeconds: 600,
+          }),
+        );
+        const result = await harness.evaluate();
+        expect(result.blocked).toBe(false);
+        expect(result.detail).toBe("idle_guard_ok");
+        expect(harness.telemetry.at(-1)?.status).toBe("ok");
+        expect(harness.telemetry.at(-1)?.idle_buffer).toBeGreaterThan(0);
+      });
+
+      test("blocks dispatch when idle drops below buffer", async () => {
+        const harness = buildGuardHarness({
+          minIdleWorkers: 2,
+          guardBand: 1.2,
+          guardBandFloor: 1,
+        });
+        harness.pushSnapshot(
+          makeWorkerSnapshot({
+            idle: 1,
+            completionSuccessCount: 72,
+            completionTotalCount: 72,
+            completionWindowSeconds: 600,
+          }),
+        );
+        const result = await harness.evaluate();
+        expect(result.blocked).toBe(true);
+        expect(result.detail).toBe("idle_guard_blocked");
+        expect(harness.telemetry.at(-1)?.status).toBe("blocked");
+      });
+
+      test("applies status-unavailable policy", async () => {
+        const allowHarness = buildGuardHarness({ statusUnavailablePolicy: "allow" });
+        const allowResult = await allowHarness.evaluate();
+        expect(allowResult.blocked).toBe(false);
+        expect(allowResult.detail).toBe("idle_guard_skipped_system_status_unavailable");
+
+        const blockHarness = buildGuardHarness({ statusUnavailablePolicy: "block" });
+        blockHarness.pushSnapshot(null);
+        const blockResult = await blockHarness.evaluate();
+        expect(blockResult.blocked).toBe(true);
+        expect(blockResult.detail).toBe("idle_guard_blocked_system_status_unavailable");
+      });
+
+      test("treats stale system status snapshots according to policy", async () => {
+        const blockHarness = buildGuardHarness({
+          systemStatusTtlMs: 3_000,
+          statusUnavailablePolicy: "block",
+        });
+        blockHarness.pushSnapshot(
+          makeWorkerSnapshot({
+            ts: Date.now() - 12_000,
+          }),
+        );
+        const blockResult = await blockHarness.evaluate();
+        expect(blockResult.blocked).toBe(true);
+        expect(blockResult.detail).toBe("idle_guard_blocked_system_status_stale");
+        expect(blockHarness.telemetry.at(-1)?.reason).toBe("system_status_stale");
+
+        const allowHarness = buildGuardHarness({
+          systemStatusTtlMs: 3_000,
+          statusUnavailablePolicy: "allow",
+        });
+        allowHarness.pushSnapshot(
+          makeWorkerSnapshot({
+            ts: Date.now() - 12_000,
+          }),
+        );
+        const allowResult = await allowHarness.evaluate();
+        expect(allowResult.blocked).toBe(false);
+        expect(allowResult.detail).toBe("idle_guard_skipped_system_status_stale");
+      });
+
+      test("fails closed on missing completion signal when configured", async () => {
+        const allowHarness = buildGuardHarness({ statusUnavailablePolicy: "allow" });
+        allowHarness.pushSnapshot(
+          makeWorkerSnapshot({
+            completionSuccessCount: null,
+            completionTotalCount: null,
+            completionWindowSeconds: 900,
+          }),
+        );
+        const allowResult = await allowHarness.evaluate();
+        expect(allowResult.blocked).toBe(false);
+        expect(allowResult.detail).toBe("idle_guard_skipped_completion_signal_unavailable");
+
+        const blockHarness = buildGuardHarness({ statusUnavailablePolicy: "block" });
+        blockHarness.pushSnapshot(
+          makeWorkerSnapshot({
+            completionSuccessCount: null,
+            completionTotalCount: null,
+            completionWindowSeconds: 900,
+          }),
+        );
+        const blockResult = await blockHarness.evaluate();
+        expect(blockResult.blocked).toBe(true);
+        expect(blockResult.detail).toBe("idle_guard_blocked_completion_signal_unavailable");
+      });
+
+      test("treats zero completion throughput as valid when metrics exist", async () => {
+        const harness = buildGuardHarness({
+          minIdleWorkers: 1,
+          guardBand: 0.8,
+          guardBandFloor: 0.2,
+        });
+        harness.pushSnapshot(
+          makeWorkerSnapshot({
+            idle: 3,
+            completionSuccessCount: 0,
+            completionTotalCount: 0,
+            completionWindowSeconds: 600,
+          }),
+        );
+        const result = await harness.evaluate();
+        expect(result.blocked).toBe(false);
+        expect(result.detail).toBe("idle_guard_ok");
+        expect(harness.telemetry.at(-1)?.reason).toBe("idle_capacity_sufficient");
+      });
+    });
+  })();
 }
