@@ -3,13 +3,14 @@
 ## Release Metadata
 
 - version: `v1.0.2`
-- start_commit: `c8ae5b9dbcaec70fa0722db3ce4c6fc692d88e7f`
-- end_commit: `ceb293acc1c2fc85a739c4c54a6dc6994a23e4c2`
-- commits_in_range: `1`
+- start_commit: `4da141e0a7f26e7b99ba4f00611b93ae47385753`
+- end_commit: `2fc68cca8a305a2d714c1a0f6d64523d70fcd328`
+- commits_in_range: `2`
 
 ## Highlights
 
-- None.
+- Auto-start SourceControlManager as part of embedded CLI bootstrap when LocalBuddy is unavailable.
+- Release prep update for `v1.0.2`.
 
 ## Install
 
@@ -39,4 +40,5 @@ bun install -g @pushpalsdev/cli
 
 ## Release Checklist
 
-- None.
+- Confirm `release_log.md` content before tagging.
+- Tag and push: `git tag v1.0.2 && git push origin v1.0.2`.
