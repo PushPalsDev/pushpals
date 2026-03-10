@@ -161,11 +161,19 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
+Optional but recommended before tagging:
+
+```bash
+# update reusable release notes
+release_log.md
+```
+
 `Release CLI` workflow will:
 
 - publish `@pushpals/cli` to npm
 - build Windows/Linux/macOS standalone binaries
 - attach binaries + checksums to GitHub Releases
+- use `release_log.md` as release body when present
 
 ### VS Code extension client
 
