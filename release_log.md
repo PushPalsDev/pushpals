@@ -2,8 +2,8 @@
 
 ## Release Metadata
 
-- version: `v1.0.1`
-- start_commit: `7f59e1ea8760d95b4c768e484a5d8e7616e9f42e`
+- version: `v1.0.2`
+- start_commit: `c8ae5b9dbcaec70fa0722db3ce4c6fc692d88e7f`
 - end_commit: `ceb293acc1c2fc85a739c4c54a6dc6994a23e4c2`
 - commits_in_range: `1`
 
