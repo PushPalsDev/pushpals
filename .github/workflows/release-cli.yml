@@ -149,6 +149,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Build protocol workspace artifacts
+        run: bun run protocol:build
+
       - name: Build runtime binaries
         shell: bash
         run: |
