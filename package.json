@@ -6,6 +6,7 @@
     "packages/*"
   ],
   "scripts": {
+    "cli": "bun run scripts/pushpals-cli.ts",
     "protocol:build": "bun --cwd packages/protocol build",
     "protocol:typecheck": "bun --cwd packages/protocol typecheck",
     "server:only": "bun --cwd apps/server --env-file ../../.env dev",
@@ -49,6 +50,9 @@
     "vscode:client:lint": "bun run --cwd apps/vscode-client lint",
     "vscode:client:test": "bun run --cwd apps/vscode-client test",
     "vscode:client:package": "bun run --cwd apps/vscode-client package"
+  },
+  "bin": {
+    "pushpals": "./scripts/pushpals-cli.ts"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

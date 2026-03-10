@@ -116,6 +116,28 @@ Copy-Item configs/local.example.toml configs/local.toml
 - `bun run ios:only`
 - `bun run android:only`
 
+### Terminal CLI (`pushpals`)
+
+Use this for terminal-first chat routed through `LocalBuddy -> RemoteBuddy`.
+
+One-time local command install from repo root:
+
+```bash
+bun link
+```
+
+Then from any git repo:
+
+```bash
+pushpals
+```
+
+Notes:
+
+- `pushpals` hard-fails if current directory is not a git repo.
+- `pushpals` also validates LocalBuddy is attached to the same repo root.
+- It stores endpoint state in `.git/pushpals-cli-state.json`, including a copyable `monitoringHubUrl=...`.
+
 ### VS Code extension client
 
 PushPals also ships a VS Code extension client in `apps/vscode-client` that can:
