@@ -2714,6 +2714,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
+  private runtimeEnabled = true;
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -2749,6 +2750,20 @@ export class RemoteBuddyAutonomousEngine {
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
+    this.runtimeEnabled = this.cfg.enabled;
+  }
+
+  setRuntimeEnabled(enabled: boolean): void {
+    this.runtimeEnabled = Boolean(enabled);
+    if (!this.runtimeEnabled) {
+      this.nextTickAtMs = 0;
+      if (!this.currentRunId) {
+        this.lastOutcome = "skipped";
+        this.lastDetail = "disabled_by_runtime_config";
+        this.lastCompletedAtMs = Date.now();
+        this.setPhase("idle");
+      }
+    }
   }
 
   private setPhase(phase: string): void {
@@ -2776,7 +2791,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   private logHeartbeat(): void {
-    if (!this.cfg.enabled) return;
+    if (!this.runtimeEnabled) return;
     const now = Date.now();
     if (this.currentRunId) {
       const runElapsedMs = Math.max(0, now - this.currentRunStartedAtMs);
@@ -3233,6 +3248,7 @@ export class RemoteBuddyAutonomousEngine {
       writeGlobs: string[];
     },
   ): Promise<string | null> {
+    if (!this.runtimeEnabled) return null;
     const canonicalInstruction = canonicalizeInstructionTextForBun(instruction);
     const res = await fetch(`${this.server}/requests/enqueue`, {
       method: "POST",
@@ -3516,7 +3532,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   async tick(): Promise<void> {
-    if (!this.cfg.enabled || this.cfg.killSwitchEnabled || this.inFlight) return;
+    if (!this.runtimeEnabled || this.cfg.killSwitchEnabled || this.inFlight) return;
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
     this.markTickStart(runId);
@@ -4353,7 +4369,7 @@ export class RemoteBuddyAutonomousEngine {
     },
     originRequestId: string,
   ): Promise<string | null> {
-    if (!this.cfg.enabled) return null;
+    if (!this.runtimeEnabled) return null;
     const objectiveId = autonomyCtx.objectiveId ?? `obj_${originRequestId.slice(0, 8)}`;
     const runId = autonomyCtx.runId ?? `run_${Date.now()}_${originRequestId.slice(0, 8)}`;
     const snapshotId = autonomyCtx.snapshotId ?? `snap_analysis_${originRequestId.slice(0, 8)}`;
@@ -4373,7 +4389,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   start(): void {
-    if (!this.cfg.enabled || this.timer) return;
+    if (!this.runtimeEnabled || this.timer) return;
     console.log(
       `[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`,
     );

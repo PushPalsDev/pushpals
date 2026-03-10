@@ -439,4 +439,53 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(String(question.question ?? "")).toContain("Which server module should be prioritized first?");
     expect(calls.some((entry) => entry.url.endsWith("/requests/enqueue"))).toBe(false);
   });
+
+  test("runtime disable short-circuits tick and start", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-disabled-"));
+    tempDirs.push(root);
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return jsonResponse(200, { ok: true });
+    }) as typeof globalThis.fetch;
+
+    const llm = {
+      async generate() {
+        return {
+          text: JSON.stringify({ candidates: [] }),
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+    const comm = {
+      async emit() {
+        return true;
+      },
+    };
+
+    const cfg = makeConfig();
+    cfg.remotebuddy.autonomy.tickIntervalMs = 25;
+    cfg.remotebuddy.autonomy.heartbeatLogMs = 25;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_disabled",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: comm as any,
+      config: cfg,
+    });
+
+    engine.setRuntimeEnabled(false);
+    await engine.tick();
+    expect(fetchCalls).toBe(0);
+
+    engine.start();
+    await Bun.sleep(80);
+    expect(fetchCalls).toBe(0);
+
+    engine.stop();
+  });
 });

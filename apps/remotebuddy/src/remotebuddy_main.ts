@@ -710,6 +710,9 @@ class RemoteBuddyOrchestrator {
   private readonly executionBudgetBackgroundMs: number;
   private readonly finalizationBudgetMs: number;
   private readonly autonomousEngine: RemoteBuddyAutonomousEngine;
+  private autonomyRuntimeEnabled: boolean;
+  private readonly autonomyConfigPollMs: number;
+  private autonomyConfigPollTimer: ReturnType<typeof setInterval> | null = null;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private readonly comm: CommunicationManager;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -791,6 +794,11 @@ class RemoteBuddyOrchestrator {
     this.executionBudgetNormalMs = Math.max(120_000, remoteCfg.executionBudgetNormalMs);
     this.executionBudgetBackgroundMs = Math.max(180_000, remoteCfg.executionBudgetBackgroundMs);
     this.finalizationBudgetMs = Math.max(30_000, remoteCfg.finalizationBudgetMs);
+    this.autonomyRuntimeEnabled = remoteCfg.autonomy.enabled;
+    this.autonomyConfigPollMs = Math.max(
+      1_000,
+      Number.parseInt(process.env.REMOTEBUDDY_AUTONOMY_CONFIG_POLL_MS ?? "3000", 10) || 3_000,
+    );
     this.memoryEnabled = remoteCfg.memory.enabled;
     this.memoryIncludeCrossSession = remoteCfg.memory.includeCrossSession;
     this.memoryMaxRecallItems = Math.max(1, remoteCfg.memory.maxRecallItems);
@@ -818,6 +826,7 @@ class RemoteBuddyOrchestrator {
       comm: this.comm,
       config: CONFIG,
     });
+    this.autonomousEngine.setRuntimeEnabled(this.autonomyRuntimeEnabled);
     console.log(`[RemoteBuddy] Detected repo root: ${this.repo}`);
     console.log(
       `[RemoteBuddy] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
@@ -833,6 +842,9 @@ class RemoteBuddyOrchestrator {
     );
     console.log(
       `[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour} exploreRate=${CONFIG.remotebuddy.autonomy.exploreRate.toFixed(2)} allowDirtyWorktree=${CONFIG.remotebuddy.autonomy.allowDirtyWorktree ? "on" : "off"}`,
+    );
+    console.log(
+      `[RemoteBuddy] Autonomy runtime-config polling: every ${this.autonomyConfigPollMs}ms`,
     );
   }
 
@@ -2230,17 +2242,56 @@ class RemoteBuddyOrchestrator {
   }
 
   startAutonomy(): void {
-    if (!CONFIG.remotebuddy.autonomy.enabled) {
+    if (!this.autonomyRuntimeEnabled) {
       console.log(
         "[RemoteBuddy] Autonomous engine disabled by config (remotebuddy.autonomy.enabled=false).",
       );
+      this.autonomousEngine.setRuntimeEnabled(false);
       return;
     }
+    this.autonomousEngine.setRuntimeEnabled(true);
     this.autonomousEngine.start();
+  }
+
+  private applyAutonomyEnabledFromRuntimeConfig(enabled: boolean): void {
+    if (enabled === this.autonomyRuntimeEnabled) return;
+
+    this.autonomyRuntimeEnabled = enabled;
+    this.autonomousEngine.setRuntimeEnabled(enabled);
+    if (enabled) {
+      this.autonomousEngine.start();
+      console.log(
+        "[RemoteBuddy] Autonomous engine enabled via runtime config (remotebuddy.autonomy.enabled=true).",
+      );
+      return;
+    }
+
+    this.autonomousEngine.stop();
+    console.log(
+      "[RemoteBuddy] Autonomous engine disabled via runtime config (remotebuddy.autonomy.enabled=false).",
+    );
+  }
+
+  startAutonomyRuntimeConfigPolling(): void {
+    if (this.autonomyConfigPollTimer) return;
+    this.autonomyConfigPollTimer = setInterval(() => {
+      if (this.disposed) return;
+      try {
+        const latest = loadPushPalsConfig({ reload: true });
+        const enabled = Boolean(latest.remotebuddy.autonomy.enabled);
+        this.applyAutonomyEnabledFromRuntimeConfig(enabled);
+      } catch (err) {
+        console.warn(`[RemoteBuddy] Runtime config poll failed: ${String(err)}`);
+      }
+    }, this.autonomyConfigPollMs);
   }
 
   dispose(): void {
     this.disposed = true;
+    if (this.autonomyConfigPollTimer) {
+      clearInterval(this.autonomyConfigPollTimer);
+      this.autonomyConfigPollTimer = null;
+    }
     this.autonomousEngine.stop();
     if (this.statusHeartbeatTimer) {
       clearInterval(this.statusHeartbeatTimer);
@@ -2383,6 +2434,7 @@ async function main() {
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();
   orchestrator.startAutonomy();
+  orchestrator.startAutonomyRuntimeConfigPolling();
 
   // Start polling for requests from the Request Queue
   const pollMs = CONFIG.remotebuddy.pollMs;
