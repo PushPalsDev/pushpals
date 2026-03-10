@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "cli": "bun run scripts/pushpals-cli.ts",
+    "cli:bundle": "bun run --cwd packages/cli build",
     "protocol:build": "bun --cwd packages/protocol build",
     "protocol:typecheck": "bun --cwd packages/protocol typecheck",
     "server:only": "bun --cwd apps/server --env-file ../../.env dev",

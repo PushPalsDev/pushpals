@@ -120,7 +120,19 @@ Copy-Item configs/local.example.toml configs/local.toml
 
 Use this for terminal-first chat routed through `LocalBuddy -> RemoteBuddy`.
 
-One-time local command install from repo root:
+Install globally from npm:
+
+```bash
+npm i -g @pushpals/cli
+```
+
+or with Bun:
+
+```bash
+bun install -g @pushpals/cli
+```
+
+For local development, one-time local command install from repo root:
 
 ```bash
 bun link
@@ -137,6 +149,23 @@ Notes:
 - `pushpals` hard-fails if current directory is not a git repo.
 - `pushpals` also validates LocalBuddy is attached to the same repo root.
 - It stores endpoint state in `.git/pushpals-cli-state.json`, including a copyable `monitoringHubUrl=...`.
+- Direct OS binaries are published per release under:
+  `https://github.com/PushPalsDev/pushpals/releases`
+
+### CLI release flow (maintainers)
+
+Tag-based release:
+
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+`Release CLI` workflow will:
+
+- publish `@pushpals/cli` to npm
+- build Windows/Linux/macOS standalone binaries
+- attach binaries + checksums to GitHub Releases
 
 ### VS Code extension client
 

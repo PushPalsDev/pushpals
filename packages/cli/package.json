@@ -1,0 +1,33 @@
+{
+  "name": "@pushpals/cli",
+  "version": "0.0.0-dev",
+  "description": "PushPals terminal CLI for LocalBuddy -> RemoteBuddy orchestration",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PushPalsDev/pushpals.git"
+  },
+  "homepage": "https://github.com/PushPalsDev/pushpals#readme",
+  "bugs": {
+    "url": "https://github.com/PushPalsDev/pushpals/issues"
+  },
+  "bin": {
+    "pushpals": "./bin/pushpals.cjs"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun build ../../scripts/pushpals-cli.ts --target=bun --outfile ./dist/pushpals-cli.js",
+    "prepack": "bun run build"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "bun": ">=1.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
