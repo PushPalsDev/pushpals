@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { dirname, resolve } from "path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { dirname, join, resolve } from "path";
 import { createInterface, type Interface } from "readline";
 import { loadPushPalsConfig } from "../packages/shared/src/config.js";
 
@@ -10,6 +10,9 @@ type CliOptions = {
   localAgentUrl?: string;
   sessionId?: string;
   monitoringHubUrl?: string;
+  runtimeRoot?: string;
+  runtimeRepo?: string;
+  noAutoStart: boolean;
   noStream: boolean;
 };
 
@@ -40,11 +43,23 @@ type SessionStreamPayload = {
   cursor?: number;
 };
 
+type RuntimeServiceName = "server" | "localbuddy" | "remotebuddy" | "source_control_manager";
+
+type RuntimeServiceProcess = {
+  name: RuntimeServiceName;
+  proc: Bun.Subprocess;
+  exited: boolean;
+  exitCode: number | null;
+};
+
 const DEFAULT_MONITOR_PORT = 8081;
 const MONITOR_SCAN_PORTS = 32;
 const HTTP_TIMEOUT_MS = 2_500;
 const LOCALBUDDY_TIMEOUT_MS = 4_000;
 const SSE_RECONNECT_MS = 1_500;
+const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
+const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
+const DEFAULT_RUNTIME_REPO = "https://github.com/PushPalsDev/pushpals.git";
 const stateVersion = 1;
 
 function printUsage(): void {
@@ -58,6 +73,9 @@ function printUsage(): void {
   console.log("  --local-agent-url <url> Override LocalBuddy URL");
   console.log("  --session-id <id>      Override session ID");
   console.log("  --hub-url <url>        Override monitoring hub URL");
+  console.log("  --runtime-root <path>  Override embedded runtime directory for auto-start");
+  console.log("  --runtime-repo <url>   Override embedded runtime git clone URL");
+  console.log("  --no-auto-start        Disable runtime auto-start when LocalBuddy is down");
   console.log("  --no-stream            Disable live session event stream");
   console.log("  -h, --help             Show this help");
   console.log("");
@@ -69,11 +87,12 @@ function printUsage(): void {
   console.log("");
   console.log("Notes:");
   console.log("  - Must be run from inside a git repository.");
-  console.log("  - LocalBuddy must be running and attached to the same repo root.");
+  console.log("  - Auto-start can bootstrap server/localbuddy/remotebuddy/source_control_manager.");
+  console.log("  - LocalBuddy must be attached to the same repo root.");
 }
 
 function parseArgs(argv: string[]): CliOptions | null {
-  const options: CliOptions = { noStream: false };
+  const options: CliOptions = { noAutoStart: false, noStream: false };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -83,6 +102,10 @@ function parseArgs(argv: string[]): CliOptions | null {
     }
     if (arg === "--no-stream") {
       options.noStream = true;
+      continue;
+    }
+    if (arg === "--no-auto-start") {
+      options.noAutoStart = true;
       continue;
     }
     if (arg === "--server-url") {
@@ -99,6 +122,14 @@ function parseArgs(argv: string[]): CliOptions | null {
     }
     if (arg === "--hub-url") {
       options.monitoringHubUrl = argv[++i];
+      continue;
+    }
+    if (arg === "--runtime-root") {
+      options.runtimeRoot = argv[++i];
+      continue;
+    }
+    if (arg === "--runtime-repo") {
+      options.runtimeRepo = argv[++i];
       continue;
     }
     console.error(`[pushpals] Unknown argument: ${arg}`);
@@ -154,6 +185,149 @@ async function resolveCurrentGitRepoRoot(cwd: string): Promise<string | null> {
   return resolve(root.stdout);
 }
 
+async function runCommand(
+  command: string[],
+  cwd: string,
+  timeoutMs = 120_000,
+): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number }> {
+  const proc = Bun.spawn(command, {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const killTimer = setTimeout(() => {
+    try {
+      proc.kill();
+    } catch {
+      // ignore
+    }
+  }, timeoutMs);
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      ok: exitCode === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode,
+    };
+  } finally {
+    clearTimeout(killTimer);
+  }
+}
+
+function resolveDefaultRuntimeRoot(): string {
+  const home = process.env.USERPROFILE || process.env.HOME || process.cwd();
+  return resolve(home, ".pushpals", "runtime");
+}
+
+function copyFileIfMissing(fromPath: string, toPath: string): void {
+  if (existsSync(toPath) || !existsSync(fromPath)) return;
+  mkdirSync(dirname(toPath), { recursive: true });
+  copyFileSync(fromPath, toPath);
+}
+
+async function ensureRuntimeCheckout(runtimeRoot: string, runtimeRepo: string): Promise<boolean> {
+  if (existsSync(join(runtimeRoot, ".git"))) return false;
+  mkdirSync(dirname(runtimeRoot), { recursive: true });
+  const clone = await runCommand(
+    ["git", "clone", "--depth", "1", runtimeRepo, runtimeRoot],
+    dirname(runtimeRoot),
+    300_000,
+  );
+  if (!clone.ok) {
+    throw new Error(
+      `Failed to clone PushPals runtime from ${runtimeRepo} (exit ${clone.exitCode}): ${clone.stderr || clone.stdout || "unknown error"}`,
+    );
+  }
+  return true;
+}
+
+async function ensureRuntimePrepared(runtimeRoot: string): Promise<void> {
+  copyFileIfMissing(join(runtimeRoot, ".env.example"), join(runtimeRoot, ".env"));
+  copyFileIfMissing(join(runtimeRoot, "configs", "local.example.toml"), join(runtimeRoot, "configs", "local.toml"));
+
+  if (!existsSync(join(runtimeRoot, "node_modules"))) {
+    const install = await runCommand(["bun", "install"], runtimeRoot, 600_000);
+    if (!install.ok) {
+      throw new Error(
+        `Failed to install runtime dependencies (exit ${install.exitCode}): ${install.stderr || install.stdout || "unknown error"}`,
+      );
+    }
+  }
+
+  const protocolDist = join(runtimeRoot, "packages", "protocol", "dist", "index.js");
+  if (!existsSync(protocolDist)) {
+    const buildProtocol = await runCommand(
+      ["bun", "run", "--cwd", "packages/protocol", "build"],
+      runtimeRoot,
+      300_000,
+    );
+    if (!buildProtocol.ok) {
+      throw new Error(
+        `Failed to build protocol package (exit ${buildProtocol.exitCode}): ${buildProtocol.stderr || buildProtocol.stdout || "unknown error"}`,
+      );
+    }
+  }
+}
+
+function spawnRuntimeService(
+  name: RuntimeServiceName,
+  command: string[],
+  cwd: string,
+  env: Record<string, string>,
+): RuntimeServiceProcess {
+  const proc = Bun.spawn(command, {
+    cwd,
+    env,
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  const service: RuntimeServiceProcess = {
+    name,
+    proc,
+    exited: false,
+    exitCode: null,
+  };
+  void proc.exited.then((code) => {
+    service.exited = true;
+    service.exitCode = code;
+  });
+  return service;
+}
+
+function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
+  for (const service of services) {
+    try {
+      service.proc.kill();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function probeServer(serverUrl: string): Promise<boolean> {
+  try {
+    const response = await fetchWithTimeout(`${serverUrl}/healthz`, {}, HTTP_TIMEOUT_MS);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function probeSourceControlManager(port: number): Promise<boolean> {
+  if (!Number.isFinite(port) || port <= 0) return false;
+  try {
+    const response = await fetchWithTimeout(`http://127.0.0.1:${Math.floor(port)}/health`, {}, HTTP_TIMEOUT_MS);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function fetchWithTimeout(
   url: string,
   init: RequestInit = {},
@@ -195,6 +369,127 @@ async function probeLocalBuddy(
     `${localAgentUrl}/healthz`,
     { headers: authHeaders(authToken) },
     LOCALBUDDY_TIMEOUT_MS,
+  );
+}
+
+async function autoStartRuntimeServices(opts: {
+  repoRoot: string;
+  serverUrl: string;
+  localAgentUrl: string;
+  sourceControlManagerPort: number;
+  authToken: string | null;
+  runtimeRoot?: string;
+  runtimeRepo?: string;
+}): Promise<RuntimeServiceProcess[]> {
+  const runtimeRoot = resolve(opts.runtimeRoot || process.env.PUSHPALS_RUNTIME_ROOT || resolveDefaultRuntimeRoot());
+  const runtimeRepo = String(opts.runtimeRepo || process.env.PUSHPALS_RUNTIME_REPO || DEFAULT_RUNTIME_REPO).trim();
+
+  console.log(`[pushpals] LocalBuddy unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`);
+  console.log(`[pushpals] runtimeRoot=${runtimeRoot}`);
+
+  const cloned = await ensureRuntimeCheckout(runtimeRoot, runtimeRepo);
+  if (cloned) {
+    console.log(`[pushpals] Cloned runtime from ${runtimeRepo}`);
+  }
+  await ensureRuntimePrepared(runtimeRoot);
+
+  const runtimeEnv: Record<string, string> = {
+    ...process.env,
+    PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
+    PUSHPALS_PROMPTS_ROOT_OVERRIDE: runtimeRoot,
+  } as Record<string, string>;
+
+  const services: RuntimeServiceProcess[] = [];
+
+  const serverHealthy = await probeServer(opts.serverUrl);
+  if (!serverHealthy) {
+    console.log("[pushpals] Starting embedded server...");
+    services.push(
+      spawnRuntimeService(
+        "server",
+        ["bun", "--cwd", "apps/server", "--env-file", "../../.env", "dev"],
+        runtimeRoot,
+        runtimeEnv,
+      ),
+    );
+  } else {
+    console.log("[pushpals] Server already healthy; skipping embedded server start.");
+  }
+
+  console.log("[pushpals] Starting embedded LocalBuddy...");
+  services.push(
+    spawnRuntimeService(
+      "localbuddy",
+      ["bun", "--cwd", "apps/localbuddy", "--env-file", "../../.env", "dev"],
+      runtimeRoot,
+      runtimeEnv,
+    ),
+  );
+
+  console.log("[pushpals] Starting embedded RemoteBuddy...");
+  services.push(
+    spawnRuntimeService(
+      "remotebuddy",
+      ["bun", "--cwd", "apps/remotebuddy", "--env-file", "../../.env", "start"],
+      runtimeRoot,
+      runtimeEnv,
+    ),
+  );
+
+  const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
+  if (!scmHealthy) {
+    console.log("[pushpals] Starting embedded SourceControlManager...");
+    services.push(
+      spawnRuntimeService(
+        "source_control_manager",
+        [
+          "bun",
+          "--cwd",
+          "apps/source_control_manager",
+          "--env-file",
+          "../../.env",
+          "start",
+          "--",
+          "--skip-clean-check",
+        ],
+        runtimeRoot,
+        runtimeEnv,
+      ),
+    );
+  } else {
+    console.log("[pushpals] SourceControlManager already healthy; skipping embedded start.");
+  }
+
+  const deadline = Date.now() + DEFAULT_RUNTIME_BOOT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    for (let i = services.length - 1; i >= 0; i--) {
+      const service = services[i];
+      if (service.exited) {
+        if (service.name === "source_control_manager") {
+          console.warn(
+            `[pushpals] Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); continuing without SCM.`,
+          );
+          services.splice(i, 1);
+          continue;
+        }
+        stopRuntimeServices(services);
+        throw new Error(
+          `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"})`,
+        );
+      }
+    }
+
+    const health = await probeLocalBuddy(opts.localAgentUrl, opts.authToken);
+    if (health?.ok) {
+      console.log("[pushpals] Embedded runtime is ready.");
+      return services;
+    }
+    await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
+  }
+
+  stopRuntimeServices(services);
+  throw new Error(
+    `Timed out waiting for LocalBuddy at ${opts.localAgentUrl} after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
   );
 }
 
@@ -502,21 +797,50 @@ async function main(): Promise<void> {
   );
   const sessionId = String(parsed.sessionId ?? process.env.PUSHPALS_SESSION_ID ?? config.sessionId).trim();
   const authToken = config.authToken;
+  let autoStartedServices: RuntimeServiceProcess[] = [];
+  const stopAutoStartedServices = (): void => {
+    if (autoStartedServices.length === 0) return;
+    stopRuntimeServices(autoStartedServices);
+    autoStartedServices = [];
+  };
 
-  const health = await probeLocalBuddy(localAgentUrl, authToken);
+  let health = await probeLocalBuddy(localAgentUrl, authToken);
+  if (!health?.ok && !parsed.noAutoStart) {
+    try {
+      autoStartedServices = await autoStartRuntimeServices({
+        repoRoot,
+        serverUrl,
+        localAgentUrl,
+        sourceControlManagerPort: config.sourceControlManager.port,
+        authToken,
+        runtimeRoot: parsed.runtimeRoot,
+        runtimeRepo: parsed.runtimeRepo,
+      });
+      health = await probeLocalBuddy(localAgentUrl, authToken);
+    } catch (err) {
+      console.error(`[pushpals] Auto-start failed: ${String(err)}`);
+      stopAutoStartedServices();
+    }
+  }
   if (!health?.ok) {
     console.error(`[pushpals] LocalBuddy is unavailable at ${localAgentUrl}.`);
-    console.error("[pushpals] Start the stack first, then rerun `pushpals`.");
+    if (parsed.noAutoStart) {
+      console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
+    } else {
+      console.error("[pushpals] Auto-start could not bring LocalBuddy online.");
+    }
     process.exit(1);
   }
 
   const localBuddyRepo = health.repo ? resolve(health.repo) : "";
   if (!localBuddyRepo) {
+    stopAutoStartedServices();
     console.error("[pushpals] LocalBuddy health response did not include repo path.");
     process.exit(1);
   }
 
   if (normalizePath(localBuddyRepo) !== normalizePath(repoRoot)) {
+    stopAutoStartedServices();
     console.error("[pushpals] Repo mismatch detected.");
     console.error(`[pushpals] currentRepo=${repoRoot}`);
     console.error(`[pushpals] localBuddyRepo=${localBuddyRepo}`);
@@ -591,6 +915,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     streamAbort.abort();
     if (rl) rl.close();
+    stopAutoStartedServices();
   };
 
   process.once("SIGINT", requestStop);

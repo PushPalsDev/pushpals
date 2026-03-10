@@ -13,6 +13,17 @@ import { resolve } from "path";
  * @returns Absolute path to repository root
  */
 export function detectRepoRoot(startDir: string): string {
+  const override = String(process.env.PUSHPALS_REPO_ROOT_OVERRIDE ?? "").trim();
+  if (override) {
+    const resolvedOverride = resolve(override);
+    if (existsSync(resolve(resolvedOverride, ".git"))) {
+      return resolvedOverride;
+    }
+    console.warn(
+      `[repo] PUSHPALS_REPO_ROOT_OVERRIDE does not point to a git repository: ${resolvedOverride}`,
+    );
+  }
+
   let current = resolve(startDir);
   const root = resolve(current, "/"); // Drive root on Windows, "/" on Unix
 

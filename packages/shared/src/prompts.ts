@@ -1,5 +1,5 @@
 import { readFileSync } from "fs";
-import { join } from "path";
+import { join, resolve } from "path";
 import { detectRepoRoot } from "./repo.js";
 
 const TEMPLATE_TOKEN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
@@ -7,7 +7,8 @@ const promptTemplateCache = new Map<string, string>();
 const repoDocCache = new Map<string, string>();
 
 function resolvePromptPath(relativePath: string): string {
-  const repoRoot = detectRepoRoot(process.cwd());
+  const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
+  const repoRoot = promptRootOverride ? resolve(promptRootOverride) : detectRepoRoot(process.cwd());
   return join(repoRoot, "prompts", relativePath);
 }
 

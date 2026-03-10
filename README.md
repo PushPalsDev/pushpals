@@ -147,7 +147,9 @@ pushpals
 Notes:
 
 - `pushpals` hard-fails if current directory is not a git repo.
-- `pushpals` also validates LocalBuddy is attached to the same repo root.
+- If LocalBuddy is down, `pushpals` auto-starts embedded `server + localbuddy + remotebuddy + source_control_manager`.
+- Auto-start bootstraps a runtime clone in `~/.pushpals/runtime` by default.
+- `pushpals` validates LocalBuddy is attached to the same repo root.
 - It stores endpoint state in `.git/pushpals-cli-state.json`, including a copyable `monitoringHubUrl=...`.
 - Direct OS binaries are published per release under:
   `https://github.com/PushPalsDev/pushpals/releases`

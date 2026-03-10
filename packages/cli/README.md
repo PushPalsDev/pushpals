@@ -25,9 +25,15 @@ pushpals
 The CLI hard-fails if:
 
 - current directory is not a git repository
-- LocalBuddy is unavailable
 - LocalBuddy is attached to a different repo root
 - Bun runtime is not installed (for npm-installed entrypoint execution)
+
+Behavior:
+
+- If LocalBuddy is unavailable, CLI auto-start bootstraps embedded
+  `server + localbuddy + remotebuddy + source_control_manager`.
+- Runtime clone path defaults to `~/.pushpals/runtime`.
+- Disable auto-start with `pushpals --no-auto-start`.
 
 ## No npm/Bun install
 
