@@ -2,16 +2,15 @@
 
 ## Release Metadata
 
-- version: `v1.0.3`
-- start_commit: `7e6285e1cd2502c78d491d1523bcc0c85238d928`
-- end_commit: `7e6285e1cd2502c78d491d1523bcc0c85238d928`
+- version: `v1.0.4`
+- start_commit: `af4160c467a17016a5e351ad1e754c1300c076bc`
+- end_commit: `af4160c467a17016a5e351ad1e754c1300c076bc`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Replace runtime `git clone` bootstrap with release-tagged binary runtime services.
-- CLI auto-start now downloads runtime binaries/assets and launches server/localbuddy/remotebuddy/source_control_manager from binaries.
-- Add runtime tag selection (`--runtime-tag`) and release workflow support for publishing runtime service binaries.
+- Fix release workflow runtime binary builds by generating protocol workspace artifacts before compile.
+- Resolve CI failure where runtime service binary compile could not resolve `protocol` on clean runners.
 
 ## Install
 
@@ -42,4 +41,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.3 && git push origin v1.0.3`.
+- Tag and push: `git tag v1.0.4 && git push origin v1.0.4`.
