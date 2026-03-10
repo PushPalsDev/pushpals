@@ -30,17 +30,21 @@ addFormats(ajv);
 function loadSchema(filename: string): Record<string, unknown> {
   const distSchemasPath = join(__dirname, "schemas", filename); // dist/schemas when compiled
   const srcSchemasPath = join(__dirname, "..", "src", "schemas", filename); // src/schemas during development
-  try {
-    return JSON.parse(readFileSync(distSchemasPath, "utf-8"));
-  } catch (_e1) {
+  const envSchemasDir = String(process.env.PUSHPALS_PROTOCOL_SCHEMAS_DIR ?? "").trim();
+  const envSchemasPath = envSchemasDir ? join(envSchemasDir, filename) : "";
+  const candidates = [distSchemasPath, srcSchemasPath, envSchemasPath].filter(Boolean);
+
+  for (const pathValue of candidates) {
     try {
-      return JSON.parse(readFileSync(srcSchemasPath, "utf-8"));
-    } catch (_e2) {
-      throw new Error(
-        `Failed to load schema ${filename}. Expected at dist/schemas (build) or src/schemas (dev).`,
-      );
+      return JSON.parse(readFileSync(pathValue, "utf-8"));
+    } catch {
+      // try next path
     }
   }
+
+  throw new Error(
+    `Failed to load schema ${filename}. Expected at dist/schemas (build), src/schemas (dev), or PUSHPALS_PROTOCOL_SCHEMAS_DIR.`,
+  );
 }
 
 // Load schemas

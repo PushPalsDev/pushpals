@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { createInterface, type Interface } from "readline";
 import { loadPushPalsConfig } from "../packages/shared/src/config.js";
@@ -48,6 +48,7 @@ type RuntimeServiceName = "server" | "localbuddy" | "remotebuddy" | "source_cont
 type RuntimeServiceProcess = {
   name: RuntimeServiceName;
   proc: Bun.Subprocess;
+  logPath: string;
   exited: boolean;
   exitCode: number | null;
 };
@@ -66,6 +67,7 @@ const LOCALBUDDY_TIMEOUT_MS = 4_000;
 const SSE_RECONNECT_MS = 1_500;
 const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
+const DEFAULT_SERVER_BOOT_TIMEOUT_MS = 20_000;
 const GITHUB_OWNER = "PushPalsDev";
 const GITHUB_REPO = "pushpals";
 const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;
@@ -75,6 +77,17 @@ const GITHUB_HEADERS = {
   "User-Agent": "pushpals-cli",
 };
 const stateVersion = 1;
+
+function logCliInvocation(argv: string[]): void {
+  const startedAt = new Date().toISOString();
+  const cliVersion = String(process.env.PUSHPALS_CLI_PACKAGE_VERSION ?? "").trim() || "unknown";
+  const argsText = argv.length > 0 ? argv.join(" ") : "(none)";
+  console.log(`[pushpals] invocation=${startedAt}`);
+  console.log(`[pushpals] version=${cliVersion} runtime=bun@${Bun.version}`);
+  console.log(`[pushpals] platform=${process.platform}/${process.arch}`);
+  console.log(`[pushpals] cwd=${process.cwd()}`);
+  console.log(`[pushpals] args=${argsText}`);
+}
 
 function printUsage(): void {
   console.log("PushPals CLI");
@@ -245,9 +258,18 @@ async function resolveRuntimeReleaseTag(explicitTag?: string): Promise<string> {
   if (fromEnv) return fromEnv;
 
   const packageVersion = parseSemverFromPackageVersion(process.env.PUSHPALS_CLI_PACKAGE_VERSION);
-  if (packageVersion) return `v${packageVersion}`;
-
-  return await fetchLatestReleaseTag();
+  try {
+    return await fetchLatestReleaseTag();
+  } catch (err) {
+    if (packageVersion) {
+      const fallbackTag = `v${packageVersion}`;
+      console.warn(
+        `[pushpals] Could not resolve latest runtime tag; falling back to package version tag ${fallbackTag}: ${String(err)}`,
+      );
+      return fallbackTag;
+    }
+    throw err;
+  }
 }
 
 function writeTextFileIfMissing(pathValue: string, text: string): void {
@@ -287,7 +309,8 @@ async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: stri
       (pathValue) =>
         pathValue === ".env.example" ||
         pathValue.startsWith("configs/") ||
-        pathValue.startsWith("prompts/"),
+        pathValue.startsWith("prompts/") ||
+        pathValue.startsWith("packages/protocol/src/schemas/"),
     );
 
   if (paths.length === 0) {
@@ -298,7 +321,9 @@ async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: stri
   for (const pathValue of sorted) {
     const rawUrl = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${encodeURIComponent(tag)}/${pathValue}`;
     const body = await fetchTextFromUrl(rawUrl, 20_000);
-    const outPath = join(runtimeRoot, pathValue);
+    const outPath = pathValue.startsWith("packages/protocol/src/schemas/")
+      ? join(runtimeRoot, "protocol", "schemas", pathValue.slice("packages/protocol/src/schemas/".length))
+      : join(runtimeRoot, pathValue);
     mkdirSync(dirname(outPath), { recursive: true });
     writeFileSync(outPath, body, "utf8");
   }
@@ -307,13 +332,26 @@ async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: stri
 async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Promise<void> {
   const markerPath = join(runtimeRoot, ".runtime-assets-tag");
   const currentTag = existsSync(markerPath) ? readFileSync(markerPath, "utf8").trim() : "";
+  const protocolSchemasDir = join(runtimeRoot, "protocol", "schemas");
+  const hasProtocolSchemas =
+    existsSync(join(protocolSchemasDir, "envelope.schema.json")) &&
+    existsSync(join(protocolSchemasDir, "events.schema.json"));
   const hasAssets =
     existsSync(join(runtimeRoot, ".env.example")) &&
     existsSync(join(runtimeRoot, "configs", "default.toml")) &&
-    existsSync(join(runtimeRoot, "prompts"));
+    existsSync(join(runtimeRoot, "prompts")) &&
+    hasProtocolSchemas;
   if (!hasAssets || currentTag !== runtimeTag) {
-    const copied = copyBundledRuntimeAssets(runtimeRoot);
-    if (!copied) {
+    copyBundledRuntimeAssets(runtimeRoot);
+    const hasProtocolSchemasAfterCopy =
+      existsSync(join(protocolSchemasDir, "envelope.schema.json")) &&
+      existsSync(join(protocolSchemasDir, "events.schema.json"));
+    const hasAssetsAfterCopy =
+      existsSync(join(runtimeRoot, ".env.example")) &&
+      existsSync(join(runtimeRoot, "configs", "default.toml")) &&
+      existsSync(join(runtimeRoot, "prompts")) &&
+      hasProtocolSchemasAfterCopy;
+    if (!hasAssetsAfterCopy) {
       await downloadRuntimeAssetsFromSourceTag(runtimeRoot, runtimeTag);
     }
     writeFileSync(markerPath, `${runtimeTag}\n`, "utf8");
@@ -333,6 +371,21 @@ function runtimeBinaryFilename(serviceName: RuntimeServiceName, platformKey: str
     serviceName === "source_control_manager" ? "source-control-manager" : serviceName;
   const extension = platformKey.startsWith("windows-") ? ".exe" : "";
   return `pushpals-runtime-${serviceToken}-${platformKey}${extension}`;
+}
+
+function timestampFileToken(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function readLogTail(logPath: string, maxLines = 40): string {
+  if (!existsSync(logPath)) return "";
+  const raw = readFileSync(logPath, "utf8");
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return "";
+  return lines.slice(-maxLines).join("\n");
 }
 
 async function downloadBinaryAsset(tag: string, assetName: string, outPath: string): Promise<void> {
@@ -391,16 +444,55 @@ function spawnRuntimeService(
   command: string[],
   cwd: string,
   env: Record<string, string>,
+  logPath: string,
 ): RuntimeServiceProcess {
+  writeFileSync(
+    logPath,
+    `[pushpals] service=${name} command=${command.join(" ")} cwd=${cwd}\n`,
+    "utf8",
+  );
+
   const proc = Bun.spawn(command, {
     cwd,
     env,
-    stdout: "ignore",
-    stderr: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
   });
+
+  const pipeToLog = async (
+    stream: ReadableStream<Uint8Array> | null,
+    channel: "stdout" | "stderr",
+  ): Promise<void> => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      if (!chunk) continue;
+      pending += chunk;
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        appendFileSync(logPath, `[${channel}] ${line}\n`, "utf8");
+      }
+    }
+    const rest = decoder.decode();
+    if (rest) pending += rest;
+    if (pending.trim().length > 0) {
+      appendFileSync(logPath, `[${channel}] ${pending.trimEnd()}\n`, "utf8");
+    }
+  };
+
+  void pipeToLog(proc.stdout, "stdout");
+  void pipeToLog(proc.stderr, "stderr");
+
   const service: RuntimeServiceProcess = {
     name,
     proc,
+    logPath,
     exited: false,
     exitCode: null,
   };
@@ -508,44 +600,92 @@ async function autoStartRuntimeServices(opts: {
     PUSHPALS_PROJECT_ROOT_OVERRIDE: opts.repoRoot,
     PUSHPALS_CONFIG_DIR_OVERRIDE: join(runtimeRoot, "configs"),
     PUSHPALS_PROMPTS_ROOT_OVERRIDE: runtimeRoot,
+    PUSHPALS_PROTOCOL_SCHEMAS_DIR: join(runtimeRoot, "protocol", "schemas"),
   } as Record<string, string>;
 
   const services: RuntimeServiceProcess[] = [];
+  const runToken = timestampFileToken();
+  const logDir = join(runtimeRoot, "logs", "bootstrap");
+  mkdirSync(logDir, { recursive: true });
+  const logPathFor = (name: RuntimeServiceName): string => join(logDir, `${runToken}-${name}.log`);
 
   const serverHealthy = await probeServer(opts.serverUrl);
   if (!serverHealthy) {
     console.log("[pushpals] Starting embedded server...");
-    services.push(spawnRuntimeService("server", [runtimeBinaries.server], opts.repoRoot, runtimeEnv));
+    const serverService = spawnRuntimeService(
+      "server",
+      [runtimeBinaries.server],
+      opts.repoRoot,
+      runtimeEnv,
+      logPathFor("server"),
+    );
+    services.push(serverService);
+    console.log(`[pushpals] server log: ${serverService.logPath}`);
+
+    const serverDeadline = Date.now() + DEFAULT_SERVER_BOOT_TIMEOUT_MS;
+    let serverIsReady = false;
+    while (Date.now() < serverDeadline) {
+      if (serverService.exited) {
+        const tail = readLogTail(serverService.logPath);
+        stopRuntimeServices(services);
+        throw new Error(
+          `Embedded server exited during bootstrap (code=${serverService.exitCode ?? "unknown"}). ` +
+            `See ${serverService.logPath}${tail ? `\n--- server log tail ---\n${tail}` : ""}`,
+        );
+      }
+      if (await probeServer(opts.serverUrl)) {
+        serverIsReady = true;
+        break;
+      }
+      await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
+    }
+    if (!serverIsReady) {
+      const tail = readLogTail(serverService.logPath);
+      stopRuntimeServices(services);
+      throw new Error(
+        `Embedded server did not become healthy within ${DEFAULT_SERVER_BOOT_TIMEOUT_MS}ms. ` +
+          `See ${serverService.logPath}${tail ? `\n--- server log tail ---\n${tail}` : ""}`,
+      );
+    }
+    console.log("[pushpals] Embedded server is healthy.");
   } else {
     console.log("[pushpals] Server already healthy; skipping embedded server start.");
   }
 
   console.log("[pushpals] Starting embedded LocalBuddy...");
-  services.push(
-    spawnRuntimeService("localbuddy", [runtimeBinaries.localbuddy], opts.repoRoot, runtimeEnv),
+  const localbuddyService = spawnRuntimeService(
+    "localbuddy",
+    [runtimeBinaries.localbuddy],
+    opts.repoRoot,
+    runtimeEnv,
+    logPathFor("localbuddy"),
   );
+  services.push(localbuddyService);
+  console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath}`);
 
   console.log("[pushpals] Starting embedded RemoteBuddy...");
-  services.push(
-    spawnRuntimeService(
-      "remotebuddy",
-      [runtimeBinaries.remotebuddy],
-      opts.repoRoot,
-      runtimeEnv,
-    ),
+  const remotebuddyService = spawnRuntimeService(
+    "remotebuddy",
+    [runtimeBinaries.remotebuddy],
+    opts.repoRoot,
+    runtimeEnv,
+    logPathFor("remotebuddy"),
   );
+  services.push(remotebuddyService);
+  console.log(`[pushpals] remotebuddy log: ${remotebuddyService.logPath}`);
 
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
   if (!scmHealthy) {
     console.log("[pushpals] Starting embedded SourceControlManager...");
-    services.push(
-      spawnRuntimeService(
-        "source_control_manager",
-        [runtimeBinaries.sourceControlManager, "--skip-clean-check"],
-        opts.repoRoot,
-        runtimeEnv,
-      ),
+    const sourceControlManagerService = spawnRuntimeService(
+      "source_control_manager",
+      [runtimeBinaries.sourceControlManager, "--skip-clean-check"],
+      opts.repoRoot,
+      runtimeEnv,
+      logPathFor("source_control_manager"),
     );
+    services.push(sourceControlManagerService);
+    console.log(`[pushpals] source_control_manager log: ${sourceControlManagerService.logPath}`);
   } else {
     console.log("[pushpals] SourceControlManager already healthy; skipping embedded start.");
   }
@@ -559,12 +699,18 @@ async function autoStartRuntimeServices(opts: {
           console.warn(
             `[pushpals] Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); continuing without SCM.`,
           );
+          const tail = readLogTail(service.logPath);
+          if (tail) {
+            console.warn(`[pushpals] ${service.name} log tail:\n${tail}`);
+          }
           services.splice(i, 1);
           continue;
         }
+        const tail = readLogTail(service.logPath);
         stopRuntimeServices(services);
         throw new Error(
-          `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"})`,
+          `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}). ` +
+            `See ${service.logPath}${tail ? `\n--- ${service.name} log tail ---\n${tail}` : ""}`,
         );
       }
     }
@@ -867,7 +1013,9 @@ async function openMonitoringHub(url: string): Promise<boolean> {
 }
 
 async function main(): Promise<void> {
-  const parsed = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  logCliInvocation(argv);
+  const parsed = parseArgs(argv);
   if (!parsed) return;
 
   const config = loadPushPalsConfig();
