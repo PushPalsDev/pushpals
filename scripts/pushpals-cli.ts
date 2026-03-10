@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { createInterface, type Interface } from "readline";
 import { loadPushPalsConfig } from "../packages/shared/src/config.js";
@@ -11,7 +11,7 @@ type CliOptions = {
   sessionId?: string;
   monitoringHubUrl?: string;
   runtimeRoot?: string;
-  runtimeRepo?: string;
+  runtimeTag?: string;
   noAutoStart: boolean;
   noStream: boolean;
 };
@@ -52,6 +52,13 @@ type RuntimeServiceProcess = {
   exitCode: number | null;
 };
 
+type RuntimeBinarySet = {
+  server: string;
+  localbuddy: string;
+  remotebuddy: string;
+  sourceControlManager: string;
+};
+
 const DEFAULT_MONITOR_PORT = 8081;
 const MONITOR_SCAN_PORTS = 32;
 const HTTP_TIMEOUT_MS = 2_500;
@@ -59,7 +66,14 @@ const LOCALBUDDY_TIMEOUT_MS = 4_000;
 const SSE_RECONNECT_MS = 1_500;
 const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
-const DEFAULT_RUNTIME_REPO = "https://github.com/PushPalsDev/pushpals.git";
+const GITHUB_OWNER = "PushPalsDev";
+const GITHUB_REPO = "pushpals";
+const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;
+const GITHUB_RELEASE_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download`;
+const GITHUB_HEADERS = {
+  Accept: "application/vnd.github+json",
+  "User-Agent": "pushpals-cli",
+};
 const stateVersion = 1;
 
 function printUsage(): void {
@@ -74,7 +88,7 @@ function printUsage(): void {
   console.log("  --session-id <id>      Override session ID");
   console.log("  --hub-url <url>        Override monitoring hub URL");
   console.log("  --runtime-root <path>  Override embedded runtime directory for auto-start");
-  console.log("  --runtime-repo <url>   Override embedded runtime git clone URL");
+  console.log("  --runtime-tag <tag>    Override runtime release tag (e.g. v1.0.2)");
   console.log("  --no-auto-start        Disable runtime auto-start when LocalBuddy is down");
   console.log("  --no-stream            Disable live session event stream");
   console.log("  -h, --help             Show this help");
@@ -128,8 +142,8 @@ function parseArgs(argv: string[]): CliOptions | null {
       options.runtimeRoot = argv[++i];
       continue;
     }
-    if (arg === "--runtime-repo") {
-      options.runtimeRepo = argv[++i];
+    if (arg === "--runtime-tag") {
+      options.runtimeTag = argv[++i];
       continue;
     }
     console.error(`[pushpals] Unknown argument: ${arg}`);
@@ -185,93 +199,191 @@ async function resolveCurrentGitRepoRoot(cwd: string): Promise<string | null> {
   return resolve(root.stdout);
 }
 
-async function runCommand(
-  command: string[],
-  cwd: string,
-  timeoutMs = 120_000,
-): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number }> {
-  const proc = Bun.spawn(command, {
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const killTimer = setTimeout(() => {
-    try {
-      proc.kill();
-    } catch {
-      // ignore
-    }
-  }, timeoutMs);
-  try {
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode,
-    };
-  } finally {
-    clearTimeout(killTimer);
-  }
-}
-
 function resolveDefaultRuntimeRoot(): string {
   const home = process.env.USERPROFILE || process.env.HOME || process.cwd();
   return resolve(home, ".pushpals", "runtime");
 }
 
-function copyFileIfMissing(fromPath: string, toPath: string): void {
-  if (existsSync(toPath) || !existsSync(fromPath)) return;
-  mkdirSync(dirname(toPath), { recursive: true });
-  copyFileSync(fromPath, toPath);
+function parseSemverFromPackageVersion(value: string | undefined): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const match = raw.match(/^\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.-]+)?$/);
+  return match ? raw : "";
 }
 
-async function ensureRuntimeCheckout(runtimeRoot: string, runtimeRepo: string): Promise<boolean> {
-  if (existsSync(join(runtimeRoot, ".git"))) return false;
-  mkdirSync(dirname(runtimeRoot), { recursive: true });
-  const clone = await runCommand(
-    ["git", "clone", "--depth", "1", runtimeRepo, runtimeRoot],
-    dirname(runtimeRoot),
-    300_000,
-  );
-  if (!clone.ok) {
-    throw new Error(
-      `Failed to clone PushPals runtime from ${runtimeRepo} (exit ${clone.exitCode}): ${clone.stderr || clone.stdout || "unknown error"}`,
-    );
+function resolveRuntimePlatformKey(): string {
+  if (process.platform === "win32") return "windows-x64";
+  if (process.platform === "linux") return "linux-x64";
+  if (process.platform === "darwin") {
+    return process.arch === "arm64" ? "macos-arm64" : "macos-x64";
   }
+  throw new Error(
+    `Unsupported platform for embedded runtime binaries: ${process.platform}/${process.arch}`,
+  );
+}
+
+async function fetchLatestReleaseTag(): Promise<string> {
+  const response = await fetchWithTimeout(
+    `${GITHUB_API_URL}/releases/latest`,
+    { headers: GITHUB_HEADERS },
+    20_000,
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to resolve latest release tag (HTTP ${response.status})`);
+  }
+  const payload = (await response.json()) as { tag_name?: unknown };
+  const tagName = String(payload.tag_name ?? "").trim();
+  if (!tagName) throw new Error("Latest release payload did not include tag_name");
+  return tagName;
+}
+
+async function resolveRuntimeReleaseTag(explicitTag?: string): Promise<string> {
+  const fromArg = String(explicitTag ?? "").trim();
+  if (fromArg) return fromArg;
+
+  const fromEnv = String(process.env.PUSHPALS_RUNTIME_TAG ?? "").trim();
+  if (fromEnv) return fromEnv;
+
+  const packageVersion = parseSemverFromPackageVersion(process.env.PUSHPALS_CLI_PACKAGE_VERSION);
+  if (packageVersion) return `v${packageVersion}`;
+
+  return await fetchLatestReleaseTag();
+}
+
+function writeTextFileIfMissing(pathValue: string, text: string): void {
+  if (existsSync(pathValue)) return;
+  mkdirSync(dirname(pathValue), { recursive: true });
+  writeFileSync(pathValue, text, "utf8");
+}
+
+function copyBundledRuntimeAssets(runtimeRoot: string): boolean {
+  const bundledRoot = resolve(import.meta.dir, "..", "runtime");
+  if (!existsSync(bundledRoot)) return false;
+  cpSync(bundledRoot, runtimeRoot, { recursive: true, force: true });
   return true;
 }
 
-async function ensureRuntimePrepared(runtimeRoot: string): Promise<void> {
-  copyFileIfMissing(join(runtimeRoot, ".env.example"), join(runtimeRoot, ".env"));
-  copyFileIfMissing(join(runtimeRoot, "configs", "local.example.toml"), join(runtimeRoot, "configs", "local.toml"));
-
-  if (!existsSync(join(runtimeRoot, "node_modules"))) {
-    const install = await runCommand(["bun", "install"], runtimeRoot, 600_000);
-    if (!install.ok) {
-      throw new Error(
-        `Failed to install runtime dependencies (exit ${install.exitCode}): ${install.stderr || install.stdout || "unknown error"}`,
-      );
-    }
+async function fetchTextFromUrl(url: string, timeoutMs = 20_000): Promise<string> {
+  const response = await fetchWithTimeout(url, { headers: GITHUB_HEADERS }, timeoutMs);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} while fetching ${url}`);
   }
+  return await response.text();
+}
 
-  const protocolDist = join(runtimeRoot, "packages", "protocol", "dist", "index.js");
-  if (!existsSync(protocolDist)) {
-    const buildProtocol = await runCommand(
-      ["bun", "run", "--cwd", "packages/protocol", "build"],
-      runtimeRoot,
-      300_000,
+async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: string): Promise<void> {
+  const treeUrl = `${GITHUB_API_URL}/git/trees/${encodeURIComponent(tag)}?recursive=1`;
+  const treeResponse = await fetchWithTimeout(treeUrl, { headers: GITHUB_HEADERS }, 30_000);
+  if (!treeResponse.ok) {
+    throw new Error(`Failed to fetch runtime source tree for ${tag} (HTTP ${treeResponse.status})`);
+  }
+  const treePayload = (await treeResponse.json()) as {
+    tree?: Array<{ path?: string; type?: string }>;
+  };
+  const paths = (treePayload.tree ?? [])
+    .filter((entry) => entry.type === "blob" && typeof entry.path === "string")
+    .map((entry) => String(entry.path))
+    .filter(
+      (pathValue) =>
+        pathValue === ".env.example" ||
+        pathValue.startsWith("configs/") ||
+        pathValue.startsWith("prompts/"),
     );
-    if (!buildProtocol.ok) {
-      throw new Error(
-        `Failed to build protocol package (exit ${buildProtocol.exitCode}): ${buildProtocol.stderr || buildProtocol.stdout || "unknown error"}`,
-      );
+
+  if (paths.length === 0) {
+    throw new Error(`Runtime source tree for ${tag} did not include prompts/config assets`);
+  }
+
+  const sorted = [...paths].sort((a, b) => a.localeCompare(b));
+  for (const pathValue of sorted) {
+    const rawUrl = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${encodeURIComponent(tag)}/${pathValue}`;
+    const body = await fetchTextFromUrl(rawUrl, 20_000);
+    const outPath = join(runtimeRoot, pathValue);
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, body, "utf8");
+  }
+}
+
+async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Promise<void> {
+  const markerPath = join(runtimeRoot, ".runtime-assets-tag");
+  const currentTag = existsSync(markerPath) ? readFileSync(markerPath, "utf8").trim() : "";
+  const hasAssets =
+    existsSync(join(runtimeRoot, ".env.example")) &&
+    existsSync(join(runtimeRoot, "configs", "default.toml")) &&
+    existsSync(join(runtimeRoot, "prompts"));
+  if (!hasAssets || currentTag !== runtimeTag) {
+    const copied = copyBundledRuntimeAssets(runtimeRoot);
+    if (!copied) {
+      await downloadRuntimeAssetsFromSourceTag(runtimeRoot, runtimeTag);
+    }
+    writeFileSync(markerPath, `${runtimeTag}\n`, "utf8");
+  }
+
+  writeTextFileIfMissing(join(runtimeRoot, ".env"), "# Local PushPals runtime environment\n");
+  const localExamplePath = join(runtimeRoot, "configs", "local.example.toml");
+  if (existsSync(localExamplePath)) {
+    writeTextFileIfMissing(join(runtimeRoot, "configs", "local.toml"), readFileSync(localExamplePath, "utf8"));
+  } else {
+    writeTextFileIfMissing(join(runtimeRoot, "configs", "local.toml"), "# Local PushPals runtime overrides\n");
+  }
+}
+
+function runtimeBinaryFilename(serviceName: RuntimeServiceName, platformKey: string): string {
+  const serviceToken =
+    serviceName === "source_control_manager" ? "source-control-manager" : serviceName;
+  const extension = platformKey.startsWith("windows-") ? ".exe" : "";
+  return `pushpals-runtime-${serviceToken}-${platformKey}${extension}`;
+}
+
+async function downloadBinaryAsset(tag: string, assetName: string, outPath: string): Promise<void> {
+  const url = `${GITHUB_RELEASE_URL}/${encodeURIComponent(tag)}/${assetName}`;
+  const response = await fetchWithTimeout(url, { headers: GITHUB_HEADERS }, 60_000);
+  if (!response.ok) {
+    throw new Error(`Failed to download ${assetName} from ${tag} (HTTP ${response.status})`);
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  mkdirSync(dirname(outPath), { recursive: true });
+  await Bun.write(outPath, bytes);
+}
+
+async function ensureRuntimeBinaries(runtimeRoot: string, runtimeTag: string): Promise<RuntimeBinarySet> {
+  const platformKey = resolveRuntimePlatformKey();
+  const binDir = join(runtimeRoot, "bin", `${runtimeTag}-${platformKey}`);
+  mkdirSync(binDir, { recursive: true });
+
+  const runtimeBinaries: RuntimeBinarySet = {
+    server: join(binDir, runtimeBinaryFilename("server", platformKey)),
+    localbuddy: join(binDir, runtimeBinaryFilename("localbuddy", platformKey)),
+    remotebuddy: join(binDir, runtimeBinaryFilename("remotebuddy", platformKey)),
+    sourceControlManager: join(
+      binDir,
+      runtimeBinaryFilename("source_control_manager", platformKey),
+    ),
+  };
+
+  const requiredAssets = [
+    runtimeBinaries.server,
+    runtimeBinaries.localbuddy,
+    runtimeBinaries.remotebuddy,
+    runtimeBinaries.sourceControlManager,
+  ];
+  for (const binaryPath of requiredAssets) {
+    if (existsSync(binaryPath)) continue;
+    const assetName = binaryPath.split(/[\\/]/).pop() || "";
+    await downloadBinaryAsset(runtimeTag, assetName, binaryPath);
+  }
+
+  if (process.platform !== "win32") {
+    for (const binaryPath of requiredAssets) {
+      try {
+        chmodSync(binaryPath, 0o755);
+      } catch {
+        // best-effort
+      }
     }
   }
+
+  return runtimeBinaries;
 }
 
 function spawnRuntimeService(
@@ -379,23 +491,22 @@ async function autoStartRuntimeServices(opts: {
   sourceControlManagerPort: number;
   authToken: string | null;
   runtimeRoot?: string;
-  runtimeRepo?: string;
+  runtimeTag?: string;
 }): Promise<RuntimeServiceProcess[]> {
   const runtimeRoot = resolve(opts.runtimeRoot || process.env.PUSHPALS_RUNTIME_ROOT || resolveDefaultRuntimeRoot());
-  const runtimeRepo = String(opts.runtimeRepo || process.env.PUSHPALS_RUNTIME_REPO || DEFAULT_RUNTIME_REPO).trim();
+  const runtimeTag = await resolveRuntimeReleaseTag(opts.runtimeTag);
+  const runtimeBinaries = await ensureRuntimeBinaries(runtimeRoot, runtimeTag);
+  await ensureRuntimeAssets(runtimeRoot, runtimeTag);
 
   console.log(`[pushpals] LocalBuddy unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`);
   console.log(`[pushpals] runtimeRoot=${runtimeRoot}`);
-
-  const cloned = await ensureRuntimeCheckout(runtimeRoot, runtimeRepo);
-  if (cloned) {
-    console.log(`[pushpals] Cloned runtime from ${runtimeRepo}`);
-  }
-  await ensureRuntimePrepared(runtimeRoot);
+  console.log(`[pushpals] runtimeTag=${runtimeTag}`);
 
   const runtimeEnv: Record<string, string> = {
     ...process.env,
     PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
+    PUSHPALS_PROJECT_ROOT_OVERRIDE: opts.repoRoot,
+    PUSHPALS_CONFIG_DIR_OVERRIDE: join(runtimeRoot, "configs"),
     PUSHPALS_PROMPTS_ROOT_OVERRIDE: runtimeRoot,
   } as Record<string, string>;
 
@@ -404,34 +515,22 @@ async function autoStartRuntimeServices(opts: {
   const serverHealthy = await probeServer(opts.serverUrl);
   if (!serverHealthy) {
     console.log("[pushpals] Starting embedded server...");
-    services.push(
-      spawnRuntimeService(
-        "server",
-        ["bun", "--cwd", "apps/server", "--env-file", "../../.env", "dev"],
-        runtimeRoot,
-        runtimeEnv,
-      ),
-    );
+    services.push(spawnRuntimeService("server", [runtimeBinaries.server], opts.repoRoot, runtimeEnv));
   } else {
     console.log("[pushpals] Server already healthy; skipping embedded server start.");
   }
 
   console.log("[pushpals] Starting embedded LocalBuddy...");
   services.push(
-    spawnRuntimeService(
-      "localbuddy",
-      ["bun", "--cwd", "apps/localbuddy", "--env-file", "../../.env", "dev"],
-      runtimeRoot,
-      runtimeEnv,
-    ),
+    spawnRuntimeService("localbuddy", [runtimeBinaries.localbuddy], opts.repoRoot, runtimeEnv),
   );
 
   console.log("[pushpals] Starting embedded RemoteBuddy...");
   services.push(
     spawnRuntimeService(
       "remotebuddy",
-      ["bun", "--cwd", "apps/remotebuddy", "--env-file", "../../.env", "start"],
-      runtimeRoot,
+      [runtimeBinaries.remotebuddy],
+      opts.repoRoot,
       runtimeEnv,
     ),
   );
@@ -442,17 +541,8 @@ async function autoStartRuntimeServices(opts: {
     services.push(
       spawnRuntimeService(
         "source_control_manager",
-        [
-          "bun",
-          "--cwd",
-          "apps/source_control_manager",
-          "--env-file",
-          "../../.env",
-          "start",
-          "--",
-          "--skip-clean-check",
-        ],
-        runtimeRoot,
+        [runtimeBinaries.sourceControlManager, "--skip-clean-check"],
+        opts.repoRoot,
         runtimeEnv,
       ),
     );
@@ -814,7 +904,7 @@ async function main(): Promise<void> {
         sourceControlManagerPort: config.sourceControlManager.port,
         authToken,
         runtimeRoot: parsed.runtimeRoot,
-        runtimeRepo: parsed.runtimeRepo,
+        runtimeTag: parsed.runtimeTag,
       });
       health = await probeLocalBuddy(localAgentUrl, authToken);
     } catch (err) {

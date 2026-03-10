@@ -148,7 +148,8 @@ Notes:
 
 - `pushpals` hard-fails if current directory is not a git repo.
 - If LocalBuddy is down, `pushpals` auto-starts embedded `server + localbuddy + remotebuddy + source_control_manager`.
-- Auto-start bootstraps a runtime clone in `~/.pushpals/runtime` by default.
+- Auto-start does not clone this repository; it downloads release-tagged runtime binaries and runtime assets into `~/.pushpals/runtime`.
+- Override runtime tag when needed via `pushpals --runtime-tag vX.Y.Z`.
 - `pushpals` validates LocalBuddy is attached to the same repo root.
 - It stores endpoint state in `.git/pushpals-cli-state.json`, including a copyable `monitoringHubUrl=...`.
 - Direct OS binaries are published per release under:

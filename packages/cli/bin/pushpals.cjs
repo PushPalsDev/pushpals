@@ -2,11 +2,21 @@
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { existsSync, readFileSync } = require("node:fs");
 const { resolve } = require("node:path");
 
 const bundledCliPath = resolve(__dirname, "..", "dist", "pushpals-cli.js");
+const packageJsonPath = resolve(__dirname, "..", "package.json");
 const releaseUrl = "https://github.com/PushPalsDev/pushpals/releases";
+let packageVersion = "";
+if (existsSync(packageJsonPath)) {
+  try {
+    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    packageVersion = String(parsed?.version ?? "").trim();
+  } catch {
+    packageVersion = "";
+  }
+}
 
 function fail(lines) {
   for (const line of lines) {
@@ -41,10 +51,15 @@ if (!hasBunRuntime()) {
 }
 
 function spawnBunCli() {
+  const childEnv = {
+    ...process.env,
+    PUSHPALS_CLI_PACKAGE_VERSION: packageVersion || process.env.PUSHPALS_CLI_PACKAGE_VERSION || "",
+  };
+
   if (process.platform !== "win32") {
     return spawn("bun", [bundledCliPath, ...process.argv.slice(2)], {
       stdio: "inherit",
-      env: process.env,
+      env: childEnv,
     });
   }
 
@@ -57,7 +72,7 @@ function spawnBunCli() {
   return spawn(commandLine, {
     shell: true,
     stdio: "inherit",
-    env: process.env,
+    env: childEnv,
   });
 }
 

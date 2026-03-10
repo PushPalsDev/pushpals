@@ -554,11 +554,21 @@ function resolveLlmConfig(
 }
 
 export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
-  const projectRoot = resolve(options.projectRoot ?? PROJECT_ROOT);
-  const configDir = resolveRuntimeConfigDir(projectRoot, options.configDir);
+  const projectRootOverride = firstNonEmpty(
+    options.projectRoot,
+    process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE,
+    PROJECT_ROOT,
+  );
+  const projectRoot = resolve(projectRootOverride);
+  const configDirOverride = firstNonEmpty(
+    options.configDir,
+    process.env.PUSHPALS_CONFIG_DIR_OVERRIDE,
+    "",
+  );
+  const configDir = resolveRuntimeConfigDir(projectRoot, configDirOverride);
   const legacyConfigDir = resolvePathFromRoot(projectRoot, LEGACY_CONFIG_DIR);
   const fallbackConfigDir =
-    !options.configDir && configDir !== legacyConfigDir ? legacyConfigDir : "";
+    !configDirOverride && configDir !== legacyConfigDir ? legacyConfigDir : "";
   const cacheKey = `${projectRoot}::${configDir}::${process.env.PUSHPALS_PROFILE ?? ""}`;
   if (!options.reload && cachedConfig && cachedConfigKey === cacheKey) {
     return cachedConfig;

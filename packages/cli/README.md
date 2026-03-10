@@ -32,7 +32,9 @@ Behavior:
 
 - If LocalBuddy is unavailable, CLI auto-start bootstraps embedded
   `server + localbuddy + remotebuddy + source_control_manager`.
-- Runtime clone path defaults to `~/.pushpals/runtime`.
+- Auto-start does not clone the PushPals repo; it downloads release-tagged runtime binaries
+  and prompt/config assets into `~/.pushpals/runtime`.
+- Override runtime tag with `pushpals --runtime-tag vX.Y.Z`.
 - Disable auto-start with `pushpals --no-auto-start`.
 
 ## No npm/Bun install
