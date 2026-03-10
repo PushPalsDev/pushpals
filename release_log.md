@@ -2,15 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.2`
-- start_commit: `4da141e0a7f26e7b99ba4f00611b93ae47385753`
-- end_commit: `2fc68cca8a305a2d714c1a0f6d64523d70fcd328`
-- commits_in_range: `2`
+- version: `v1.0.3`
+- start_commit: `7e6285e1cd2502c78d491d1523bcc0c85238d928`
+- end_commit: `7e6285e1cd2502c78d491d1523bcc0c85238d928`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Auto-start SourceControlManager as part of embedded CLI bootstrap when LocalBuddy is unavailable.
-- Release prep update for `v1.0.2`.
+- Replace runtime `git clone` bootstrap with release-tagged binary runtime services.
+- CLI auto-start now downloads runtime binaries/assets and launches server/localbuddy/remotebuddy/source_control_manager from binaries.
+- Add runtime tag selection (`--runtime-tag`) and release workflow support for publishing runtime service binaries.
 
 ## Install
 
@@ -41,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.2 && git push origin v1.0.2`.
+- Tag and push: `git tag v1.0.3 && git push origin v1.0.3`.
