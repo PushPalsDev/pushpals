@@ -2,15 +2,15 @@
 
 ## Release Metadata
 
-- version: `v1.0.4`
-- start_commit: `af4160c467a17016a5e351ad1e754c1300c076bc`
-- end_commit: `af4160c467a17016a5e351ad1e754c1300c076bc`
+- version: `v1.0.5`
+- start_commit: `a1f7bcafa8d2506a433e5b6d0288083a1f5ffde4`
+- end_commit: `a1f7bcafa8d2506a433e5b6d0288083a1f5ffde4`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Fix release workflow runtime binary builds by generating protocol workspace artifacts before compile.
-- Resolve CI failure where runtime service binary compile could not resolve `protocol` on clean runners.
+- Add startup invocation telemetry in CLI for faster first-hop diagnostics.
+- Print CLI version/runtime/platform/cwd/args at process entry.
 
 ## Install
 
@@ -41,4 +41,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.4 && git push origin v1.0.4`.
+- Tag and push: `git tag v1.0.5 && git push origin v1.0.5`.
