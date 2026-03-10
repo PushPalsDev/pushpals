@@ -14,11 +14,11 @@
 ## Install
 
 ```bash
-npm i -g @pushpals/cli
+npm i -g @pushpalsdev/cli
 ```
 
 ```bash
-bun install -g @pushpals/cli
+bun install -g @pushpalsdev/cli
 ```
 
 ## Artifacts

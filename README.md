@@ -123,13 +123,13 @@ Use this for terminal-first chat routed through `LocalBuddy -> RemoteBuddy`.
 Install globally from npm:
 
 ```bash
-npm i -g @pushpals/cli
+npm i -g @pushpalsdev/cli
 ```
 
 or with Bun:
 
 ```bash
-bun install -g @pushpals/cli
+bun install -g @pushpalsdev/cli
 ```
 
 For local development, one-time local command install from repo root:
@@ -170,7 +170,7 @@ release_log.md
 
 `Release CLI` workflow will:
 
-- publish `@pushpals/cli` to npm
+- publish `@pushpalsdev/cli` to npm
 - build Windows/Linux/macOS standalone binaries
 - attach binaries + checksums to GitHub Releases
 - use `release_log.md` as release body when present

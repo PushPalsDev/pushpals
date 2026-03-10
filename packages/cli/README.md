@@ -1,17 +1,17 @@
-# @pushpals/cli
+# @pushpalsdev/cli
 
 Terminal-first PushPals client that routes chat through `LocalBuddy -> RemoteBuddy`.
 
 ## Install
 
 ```bash
-npm i -g @pushpals/cli
+npm i -g @pushpalsdev/cli
 ```
 
 or:
 
 ```bash
-bun install -g @pushpals/cli
+bun install -g @pushpalsdev/cli
 ```
 
 ## Run

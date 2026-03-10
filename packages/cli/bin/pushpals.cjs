@@ -18,7 +18,7 @@ function fail(lines) {
 if (!existsSync(bundledCliPath)) {
   fail([
     "[pushpals] CLI bundle is missing in this package install.",
-    "[pushpals] Reinstall @pushpals/cli, or download a direct binary from:",
+    "[pushpals] Reinstall @pushpalsdev/cli, or download a direct binary from:",
     `[pushpals] ${releaseUrl}`,
   ]);
 }

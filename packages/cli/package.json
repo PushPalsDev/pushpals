@@ -1,5 +1,5 @@
 {
-  "name": "@pushpals/cli",
+  "name": "@pushpalsdev/cli",
   "version": "0.0.0-dev",
   "description": "PushPals terminal CLI for LocalBuddy -> RemoteBuddy orchestration",
   "license": "MIT",
