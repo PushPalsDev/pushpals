@@ -552,9 +552,10 @@ export function buildEmbeddedRuntimeEnv(
   baseEnv: Record<string, string | undefined>,
   opts: { repoRoot: string; runtimeRoot: string; useRuntimeConfig?: boolean },
 ): Record<string, string> {
+  const env = normalizeChildProcessEnv(baseEnv);
   const useRuntimeConfig = opts.useRuntimeConfig !== false;
   return {
-    ...baseEnv,
+    ...env,
     PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
     PUSHPALS_PROJECT_ROOT_OVERRIDE: opts.repoRoot,
     ...(useRuntimeConfig
@@ -566,7 +567,86 @@ export function buildEmbeddedRuntimeEnv(
           PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.repoRoot,
         }),
     PUSHPALS_PROTOCOL_SCHEMAS_DIR: join(opts.runtimeRoot, "protocol", "schemas"),
-  } as Record<string, string>;
+    ...(typeof env.PUSHPALS_GIT_BIN === "string" && env.PUSHPALS_GIT_BIN.trim()
+      ? { PUSHPALS_GIT_BIN: env.PUSHPALS_GIT_BIN.trim() }
+      : {}),
+  };
+}
+
+export function normalizeChildProcessEnv(
+  baseEnv: Record<string, string | undefined>,
+  platform = process.platform,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (typeof value === "string") env[key] = value;
+  }
+
+  if (platform === "win32") {
+    const resolvedPath =
+      String(env.Path ?? env.PATH ?? process.env.Path ?? process.env.PATH ?? "").trim();
+    if (resolvedPath) {
+      env.Path = resolvedPath;
+      env.PATH = resolvedPath;
+    }
+
+    const systemRoot = String(
+      env.SystemRoot ?? env.SYSTEMROOT ?? process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "",
+    ).trim();
+    if (systemRoot) {
+      env.SystemRoot = systemRoot;
+      env.SYSTEMROOT = systemRoot;
+    }
+
+    const comSpec = String(
+      env.ComSpec ?? env.COMSPEC ?? process.env.ComSpec ?? process.env.COMSPEC ?? "",
+    ).trim();
+    if (comSpec) {
+      env.ComSpec = comSpec;
+      env.COMSPEC = comSpec;
+    }
+  }
+
+  return env;
+}
+
+export async function resolveCommandPath(
+  command: string,
+  cwd: string,
+  env: Record<string, string>,
+): Promise<string | null> {
+  const lookupCommands =
+    process.platform === "win32"
+      ? [
+          ["where.exe", command],
+          ["where", command],
+        ]
+      : [["which", command]];
+
+  for (const lookup of lookupCommands) {
+    try {
+      const proc = Bun.spawn(lookup, {
+        cwd,
+        env,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const [stdout, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        proc.exited,
+      ]);
+      if (exitCode !== 0) continue;
+      const resolved = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+      if (resolved) return resolved;
+    } catch {
+      // try the next lookup strategy
+    }
+  }
+
+  return null;
 }
 
 function timestampFileToken(): string {
@@ -699,11 +779,22 @@ function spawnRuntimeService(
   return service;
 }
 
+export function buildServiceStopCommand(
+  pid: number | undefined,
+  platform = process.platform,
+): string[] | null {
+  if (platform === "win32" && typeof pid === "number" && pid > 0) {
+    return ["taskkill", "/PID", String(pid), "/T", "/F"];
+  }
+  return null;
+}
+
 function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
   for (const service of services) {
     try {
-      if (process.platform === "win32" && typeof service.proc.pid === "number" && service.proc.pid > 0) {
-        Bun.spawnSync(["taskkill", "/PID", String(service.proc.pid), "/T", "/F"], {
+      const stopCommand = buildServiceStopCommand(service.proc.pid, process.platform);
+      if (stopCommand) {
+        Bun.spawnSync(stopCommand, {
           stdin: "ignore",
           stdout: "ignore",
           stderr: "ignore",
@@ -714,6 +805,30 @@ function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
     } catch {
       // ignore
     }
+  }
+}
+
+function isOptionalEmbeddedService(name: RuntimeServiceName): boolean {
+  return name === "source_control_manager";
+}
+
+async function canSpawnCommand(
+  command: string[],
+  cwd: string,
+  env: Record<string, string>,
+): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(command, {
+      cwd,
+      env,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const exitCode = await proc.exited;
+    return exitCode === 0;
+  } catch {
+    return false;
   }
 }
 
@@ -817,6 +932,14 @@ async function autoStartRuntimeServices(opts: {
     runtimeRoot,
     useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
   });
+  const resolvedGitBinary = await resolveCommandPath(
+    "git",
+    opts.repoRoot,
+    normalizeChildProcessEnv(process.env as Record<string, string | undefined>),
+  );
+  if (resolvedGitBinary) {
+    runtimeEnv.PUSHPALS_GIT_BIN = resolvedGitBinary;
+  }
 
   const services: RuntimeServiceProcess[] = [];
   const runToken = timestampFileToken();
@@ -891,21 +1014,35 @@ async function autoStartRuntimeServices(opts: {
 
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
   const scmRemoteAvailable = await repoHasRemote(opts.repoRoot, opts.sourceControlManagerRemote);
+  const gitProbeCommand =
+    typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
+      ? [runtimeEnv.PUSHPALS_GIT_BIN.trim(), "--version"]
+      : ["git", "--version"];
+  const gitAvailableForScm = await canSpawnCommand(gitProbeCommand, opts.repoRoot, runtimeEnv);
   if (!scmHealthy && scmRemoteAvailable) {
-    console.log("[pushpals] Starting embedded SourceControlManager...");
-    const sourceControlManagerService = spawnRuntimeService(
-      "source_control_manager",
-      [runtimeBinaries.sourceControlManager, "--skip-clean-check"],
-      opts.repoRoot,
-      runtimeEnv,
-      logPathFor("source_control_manager"),
-    );
-    services.push(sourceControlManagerService);
-    console.log(`[pushpals] source_control_manager log: ${sourceControlManagerService.logPath}`);
+    if (!gitAvailableForScm) {
+      console.warn("[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.");
+    } else {
+      if (runtimeEnv.PUSHPALS_GIT_BIN) {
+        console.log(`[pushpals] Embedded SourceControlManager git=${runtimeEnv.PUSHPALS_GIT_BIN}`);
+      }
+      console.log("[pushpals] Starting embedded SourceControlManager...");
+      const sourceControlManagerService = spawnRuntimeService(
+        "source_control_manager",
+        [runtimeBinaries.sourceControlManager, "--skip-clean-check"],
+        opts.repoRoot,
+        runtimeEnv,
+        logPathFor("source_control_manager"),
+      );
+      services.push(sourceControlManagerService);
+      console.log(`[pushpals] source_control_manager log: ${sourceControlManagerService.logPath}`);
+    }
   } else if (!scmRemoteAvailable) {
     console.log(
       `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
     );
+  } else if (!gitAvailableForScm) {
+    console.warn("[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.");
   } else {
     console.log("[pushpals] SourceControlManager already healthy; skipping embedded start.");
   }
@@ -915,7 +1052,7 @@ async function autoStartRuntimeServices(opts: {
     for (let i = services.length - 1; i >= 0; i--) {
       const service = services[i];
       if (service.exited) {
-        if (service.name === "source_control_manager") {
+        if (isOptionalEmbeddedService(service.name)) {
           console.warn(
             `[pushpals] Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); continuing without SCM.`,
           );
@@ -939,8 +1076,20 @@ async function autoStartRuntimeServices(opts: {
     if (health?.ok) {
       const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;
       while (Date.now() < stabilityDeadline) {
-        for (const service of services) {
+        for (let i = services.length - 1; i >= 0; i--) {
+          const service = services[i];
           if (!service.exited) continue;
+          if (isOptionalEmbeddedService(service.name)) {
+            const tail = readLogTail(service.logPath);
+            console.warn(
+              `[pushpals] Embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}); continuing without SCM.`,
+            );
+            if (tail) {
+              console.warn(`[pushpals] ${service.name} log tail:\n${tail}`);
+            }
+            services.splice(i, 1);
+            continue;
+          }
           const tail = readLogTail(service.logPath);
           stopRuntimeServices(services);
           throw new Error(
@@ -1470,16 +1619,21 @@ async function runSessionStream(
   }
 }
 
-async function openMonitoringHub(url: string): Promise<boolean> {
-  let cmd: string[] | null = null;
-  if (process.platform === "win32") {
-    cmd = ["cmd", "/c", "start", "", url];
-  } else if (process.platform === "darwin") {
-    cmd = ["open", url];
-  } else {
-    cmd = ["xdg-open", url];
+export function buildOpenMonitoringHubCommand(
+  url: string,
+  platform = process.platform,
+): string[] {
+  if (platform === "win32") {
+    return ["cmd", "/c", "start", "", url];
   }
+  if (platform === "darwin") {
+    return ["open", url];
+  }
+  return ["xdg-open", url];
+}
 
+async function openMonitoringHub(url: string): Promise<boolean> {
+  const cmd = buildOpenMonitoringHubCommand(url, process.platform);
   const proc = Bun.spawn(cmd, {
     stdin: "ignore",
     stdout: "ignore",

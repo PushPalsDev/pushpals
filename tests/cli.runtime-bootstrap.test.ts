@@ -3,9 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import {
+  buildOpenMonitoringHubCommand,
   buildEmbeddedMonitoringHubHtml,
   buildEmbeddedRuntimeEnv,
+  buildServiceStopCommand,
+  normalizeChildProcessEnv,
   prepareCliRuntime,
+  resolveCommandPath,
   startEmbeddedMonitoringHub,
 } from "../scripts/pushpals-cli.ts";
 
@@ -35,6 +39,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     const env = buildEmbeddedRuntimeEnv(
       {
         REMOTEBUDDY_AUTONOMY_ENABLED: "true",
+        PUSHPALS_GIT_BIN: "/custom/tools/git",
       },
       {
         repoRoot: "/repo/example",
@@ -43,6 +48,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
 
     expect(env.REMOTEBUDDY_AUTONOMY_ENABLED).toBe("true");
+    expect(env.PUSHPALS_GIT_BIN).toBe("/custom/tools/git");
   });
 
   test("buildEmbeddedRuntimeEnv can target repo config instead of embedded runtime config", () => {
@@ -61,6 +67,61 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PUSHPALS_PROMPTS_ROOT_OVERRIDE).toBe("/repo/example");
     expect("PUSHPALS_CONFIG_DIR_OVERRIDE" in env).toBe(false);
     expect(env.PUSHPALS_PROTOCOL_SCHEMAS_DIR).toBe(join("/runtime/pushpals", "protocol", "schemas"));
+  });
+
+  test("normalizeChildProcessEnv keeps Windows path and shell variables in both casings", () => {
+    const env = normalizeChildProcessEnv(
+      {
+        Path: "C:\\Program Files\\Git\\cmd;C:\\Windows\\System32",
+        SYSTEMROOT: "C:\\Windows",
+        COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+      },
+      "win32",
+    );
+
+    expect(env.Path).toBe("C:\\Program Files\\Git\\cmd;C:\\Windows\\System32");
+    expect(env.PATH).toBe("C:\\Program Files\\Git\\cmd;C:\\Windows\\System32");
+    expect(env.SystemRoot).toBe("C:\\Windows");
+    expect(env.SYSTEMROOT).toBe("C:\\Windows");
+    expect(env.ComSpec).toBe("C:\\Windows\\System32\\cmd.exe");
+    expect(env.COMSPEC).toBe("C:\\Windows\\System32\\cmd.exe");
+  });
+
+  test("resolveCommandPath finds git in the effective runtime environment", async () => {
+    const env = normalizeChildProcessEnv(process.env as Record<string, string | undefined>);
+    const resolved = await resolveCommandPath("git", process.cwd(), env);
+    expect(resolved).not.toBeNull();
+    expect(String(resolved).toLowerCase()).toContain("git");
+  });
+
+  test("buildOpenMonitoringHubCommand selects the right launcher per platform", () => {
+    expect(buildOpenMonitoringHubCommand("http://localhost:8081", "win32")).toEqual([
+      "cmd",
+      "/c",
+      "start",
+      "",
+      "http://localhost:8081",
+    ]);
+    expect(buildOpenMonitoringHubCommand("http://localhost:8081", "darwin")).toEqual([
+      "open",
+      "http://localhost:8081",
+    ]);
+    expect(buildOpenMonitoringHubCommand("http://localhost:8081", "linux")).toEqual([
+      "xdg-open",
+      "http://localhost:8081",
+    ]);
+  });
+
+  test("buildServiceStopCommand uses taskkill only on Windows", () => {
+    expect(buildServiceStopCommand(4321, "win32")).toEqual([
+      "taskkill",
+      "/PID",
+      "4321",
+      "/T",
+      "/F",
+    ]);
+    expect(buildServiceStopCommand(4321, "linux")).toBeNull();
+    expect(buildServiceStopCommand(undefined, "win32")).toBeNull();
   });
 
   test("buildEmbeddedMonitoringHubHtml renders monitor shell with server/session bootstrap", () => {

@@ -6,7 +6,7 @@ import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 import { resolveGitTokenForRemote } from "../../../packages/shared/src/git_backend.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
-import { GitOps } from "./git";
+import { GitOps, resolveGitExecutableFromEnv } from "./git";
 import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
@@ -742,8 +742,9 @@ async function promptYesNo(question: string): Promise<boolean> {
 }
 
 async function runGitCapture(args: string[], cwd = repoRoot): Promise<GitCmdResult> {
+  const gitExecutable = resolveGitExecutableFromEnv();
   try {
-    const proc = Bun.spawn(["git", ...args], {
+    const proc = Bun.spawn([gitExecutable, ...args], {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
@@ -763,7 +764,7 @@ async function runGitCapture(args: string[], cwd = repoRoot): Promise<GitCmdResu
     return {
       ok: false,
       stdout: "",
-      stderr: String(err),
+      stderr: `spawn ${gitExecutable} failed: ${err instanceof Error ? err.message : String(err)}`,
       exitCode: 127,
     };
   }

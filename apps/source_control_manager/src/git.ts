@@ -24,6 +24,11 @@ export interface TempBranchCleanupSummary {
   warnings: string[];
 }
 
+export function resolveGitExecutableFromEnv(): string {
+  const configured = String(process.env.PUSHPALS_GIT_BIN ?? "").trim();
+  return configured || "git";
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 async function git(
@@ -31,10 +36,11 @@ async function git(
   args: string[],
   opts?: { timeout?: number; githubToken?: string },
 ): Promise<GitResult> {
+  const gitExecutable = resolveGitExecutableFromEnv();
   const gitArgs =
     opts?.githubToken && opts.githubToken.length > 0
       ? [
-          "git",
+          gitExecutable,
           "-c",
           `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(
             `x-access-token:${opts.githubToken}`,
@@ -42,13 +48,23 @@ async function git(
           ).toString("base64")}`,
           ...args,
         ]
-      : ["git", ...args];
+      : [gitExecutable, ...args];
 
-  const proc = Bun.spawn(gitArgs, {
-    cwd: repoPath,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  let proc: Bun.Subprocess;
+  try {
+    proc = Bun.spawn(gitArgs, {
+      cwd: repoPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: `spawn ${gitExecutable} failed: ${err instanceof Error ? err.message : String(err)}`,
+      exitCode: 127,
+    };
+  }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   if (opts?.timeout) {
