@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "cli": "bun run scripts/pushpals-cli.ts",
+    "cli:integration": "bun run scripts/cli-integration.ts",
     "cli:bundle": "bun run --cwd packages/cli build",
     "protocol:build": "bun --cwd packages/protocol build",
     "protocol:typecheck": "bun --cwd packages/protocol typecheck",
@@ -41,6 +42,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test:prompt-policy": "bun test tests/prompt-policy.enforcement.test.ts",
+    "test:cli:integration": "bun test tests/cli.invocation-logging.test.ts tests/cli.runtime-bootstrap.test.ts tests/shared.client-preflight.test.ts",
     "test:root": "bun test tests",
     "test:protocol": "bun run tests/protocol.integration.ts",
     "test:integration": "python -u tests/integration/integration_controller.py --mode integration",

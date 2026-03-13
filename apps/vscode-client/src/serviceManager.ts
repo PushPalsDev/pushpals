@@ -1,5 +1,3 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as vscode from "vscode";
 import { formatCommandForLog, validateDockerImageName } from "./safety";
@@ -45,9 +43,9 @@ export class StackServiceManager implements vscode.Disposable {
     }
     assertWorkspaceTrusted(vscode.workspace.isTrusted);
 
-    this.validateLocalConfig(workspaceRoot);
     const workerImage = this.workerDockerImage();
     await this.runOneShot("bun", ["--version"], workspaceRoot, "Checking Bun runtime");
+    await this.runSharedPreflight(workspaceRoot);
     await this.runOneShot(
       "bun",
       ["run", "protocol:build"],
@@ -121,21 +119,13 @@ export class StackServiceManager implements vscode.Disposable {
     this.onDidChangeRunningEmitter.dispose();
   }
 
-  private validateLocalConfig(workspaceRoot: string): void {
-    const envPath = resolve(workspaceRoot, ".env");
-    const localConfigPath = resolve(workspaceRoot, "configs", "local.toml");
-    const legacyLocalConfigPath = resolve(workspaceRoot, "config", "local.toml");
-    const missing: string[] = [];
-    if (!existsSync(envPath)) {
-      missing.push(envPath);
-    }
-    if (!existsSync(localConfigPath) && !existsSync(legacyLocalConfigPath)) {
-      missing.push(localConfigPath);
-    }
-    if (missing.length === 0) return;
-
-    const rel = missing.map((entry) => entry.replace(`${workspaceRoot}\\`, "").replace(/\\/g, "/"));
-    throw new Error(`Missing required local config files: ${rel.join(", ")}`);
+  private async runSharedPreflight(workspaceRoot: string): Promise<void> {
+    await this.runOneShot(
+      "bun",
+      ["run", "scripts/client-preflight.ts", "--client", "vscode"],
+      workspaceRoot,
+      "Running shared startup preflight",
+    );
   }
 
   private includeSourceControlManager(): boolean {

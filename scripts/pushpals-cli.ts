@@ -3,7 +3,11 @@
 import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { createInterface, type Interface } from "readline";
-import { loadPushPalsConfig } from "../packages/shared/src/config.js";
+import {
+  evaluateClientRuntimePreflight,
+  formatClientRuntimePreflightLines,
+  type ClientRuntimePreflightResult,
+} from "../packages/shared/src/client_preflight.js";
 
 type CliOptions = {
   serverUrl?: string;
@@ -58,6 +62,22 @@ type RuntimeBinarySet = {
   localbuddy: string;
   remotebuddy: string;
   sourceControlManager: string;
+};
+
+type RuntimeAssetSource = {
+  root: string;
+  envExamplePath: string;
+  visionExamplePath: string;
+  configsDir: string;
+  promptsDir: string;
+  protocolSchemasDir: string;
+};
+
+type PreparedCliRuntime = {
+  runtimeRoot: string;
+  runtimeTag: string;
+  runtimePreflight: ClientRuntimePreflightResult;
+  preflightUsesEmbeddedRuntime: boolean;
 };
 
 type MonitoringHubHandle = {
@@ -230,6 +250,57 @@ function resolveDefaultRuntimeRoot(): string {
   return resolve(home, ".pushpals", "runtime");
 }
 
+function buildRuntimeAssetSource(root: string, protocolSchemasDir: string): RuntimeAssetSource {
+  return {
+    root,
+    envExamplePath: join(root, ".env.example"),
+    visionExamplePath: join(root, "vision.example.md"),
+    configsDir: join(root, "configs"),
+    promptsDir: join(root, "prompts"),
+    protocolSchemasDir,
+  };
+}
+
+function isCompleteRuntimeAssetSource(source: RuntimeAssetSource): boolean {
+  return (
+    existsSync(source.envExamplePath) &&
+    existsSync(source.visionExamplePath) &&
+    existsSync(join(source.configsDir, "default.toml")) &&
+    existsSync(source.promptsDir) &&
+    existsSync(join(source.protocolSchemasDir, "envelope.schema.json")) &&
+    existsSync(join(source.protocolSchemasDir, "events.schema.json"))
+  );
+}
+
+export function resolveBundledRuntimeAssetSource(): RuntimeAssetSource | null {
+  const candidates = [
+    buildRuntimeAssetSource(
+      resolve(import.meta.dir, "..", "runtime"),
+      resolve(import.meta.dir, "..", "runtime", "protocol", "schemas"),
+    ),
+    buildRuntimeAssetSource(
+      resolve(import.meta.dir, ".."),
+      resolve(import.meta.dir, "..", "packages", "protocol", "src", "schemas"),
+    ),
+    buildRuntimeAssetSource(
+      resolve(import.meta.dir, "..", "packages", "cli", "runtime"),
+      resolve(import.meta.dir, "..", "packages", "cli", "runtime", "protocol", "schemas"),
+    ),
+  ];
+
+  for (const candidate of candidates) {
+    if (isCompleteRuntimeAssetSource(candidate)) return candidate;
+  }
+  return null;
+}
+
+function repoLooksLikePushPalsSourceCheckout(repoRoot: string): boolean {
+  return (
+    existsSync(join(repoRoot, "configs", "default.toml")) ||
+    existsSync(join(repoRoot, "config", "default.toml"))
+  );
+}
+
 function parseSemverFromPackageVersion(value: string | undefined): string {
   const raw = String(value ?? "").trim();
   if (!raw) return "";
@@ -291,11 +362,53 @@ function writeTextFileIfMissing(pathValue: string, text: string): void {
   writeFileSync(pathValue, text, "utf8");
 }
 
-function copyBundledRuntimeAssets(runtimeRoot: string): boolean {
-  const bundledRoot = resolve(import.meta.dir, "..", "runtime");
-  if (!existsSync(bundledRoot)) return false;
-  cpSync(bundledRoot, runtimeRoot, { recursive: true, force: true });
+function copyRuntimeAssetBundle(
+  source: RuntimeAssetSource,
+  runtimeRoot: string,
+  force: boolean,
+): void {
+  mkdirSync(runtimeRoot, { recursive: true });
+  cpSync(source.envExamplePath, join(runtimeRoot, ".env.example"), {
+    force,
+    errorOnExist: false,
+  });
+  cpSync(source.visionExamplePath, join(runtimeRoot, "vision.example.md"), {
+    force,
+    errorOnExist: false,
+  });
+  cpSync(source.configsDir, join(runtimeRoot, "configs"), {
+    recursive: true,
+    force,
+    errorOnExist: false,
+  });
+  cpSync(source.promptsDir, join(runtimeRoot, "prompts"), {
+    recursive: true,
+    force,
+    errorOnExist: false,
+  });
+  cpSync(source.protocolSchemasDir, join(runtimeRoot, "protocol", "schemas"), {
+    recursive: true,
+    force,
+    errorOnExist: false,
+  });
+}
+
+function copyBundledRuntimeAssets(runtimeRoot: string, force = true): boolean {
+  const bundledSource = resolveBundledRuntimeAssetSource();
+  if (!bundledSource) return false;
+  copyRuntimeAssetBundle(bundledSource, runtimeRoot, force);
   return true;
+}
+
+function seedRuntimePreflightAssets(runtimeRoot: string): void {
+  copyBundledRuntimeAssets(runtimeRoot, false);
+  writeTextFileIfMissing(join(runtimeRoot, ".env"), "# Local PushPals runtime environment\n");
+  const localExamplePath = join(runtimeRoot, "configs", "local.example.toml");
+  if (existsSync(localExamplePath)) {
+    writeTextFileIfMissing(join(runtimeRoot, "configs", "local.toml"), readFileSync(localExamplePath, "utf8"));
+  } else {
+    writeTextFileIfMissing(join(runtimeRoot, "configs", "local.toml"), "# Local PushPals runtime overrides\n");
+  }
 }
 
 async function fetchTextFromUrl(url: string, timeoutMs = 20_000): Promise<string> {
@@ -321,6 +434,7 @@ async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: stri
     .filter(
       (pathValue) =>
         pathValue === ".env.example" ||
+        pathValue === "vision.example.md" ||
         pathValue.startsWith("configs/") ||
         pathValue.startsWith("prompts/") ||
         pathValue.startsWith("packages/protocol/src/schemas/"),
@@ -351,6 +465,7 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
     existsSync(join(protocolSchemasDir, "events.schema.json"));
   const hasAssets =
     existsSync(join(runtimeRoot, ".env.example")) &&
+    existsSync(join(runtimeRoot, "vision.example.md")) &&
     existsSync(join(runtimeRoot, "configs", "default.toml")) &&
     existsSync(join(runtimeRoot, "prompts")) &&
     hasProtocolSchemas;
@@ -361,6 +476,7 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
       existsSync(join(protocolSchemasDir, "events.schema.json"));
     const hasAssetsAfterCopy =
       existsSync(join(runtimeRoot, ".env.example")) &&
+      existsSync(join(runtimeRoot, "vision.example.md")) &&
       existsSync(join(runtimeRoot, "configs", "default.toml")) &&
       existsSync(join(runtimeRoot, "prompts")) &&
       hasProtocolSchemasAfterCopy;
@@ -379,6 +495,52 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
   }
 }
 
+function resolveDeferredRuntimeTagHint(explicitTag?: string): string {
+  return String(explicitTag || process.env.PUSHPALS_RUNTIME_TAG || "").trim();
+}
+
+export async function prepareCliRuntime(opts: {
+  repoRoot: string;
+  runtimeRoot?: string;
+  runtimeTag?: string;
+}): Promise<PreparedCliRuntime> {
+  const runtimeRoot = resolve(
+    opts.runtimeRoot || process.env.PUSHPALS_RUNTIME_ROOT || resolveDefaultRuntimeRoot(),
+  );
+
+  if (repoLooksLikePushPalsSourceCheckout(opts.repoRoot)) {
+    return {
+      runtimeRoot,
+      runtimeTag: "",
+      runtimePreflight: evaluateClientRuntimePreflight({
+        projectRoot: opts.repoRoot,
+      }),
+      preflightUsesEmbeddedRuntime: false,
+    };
+  }
+
+  seedRuntimePreflightAssets(runtimeRoot);
+  return {
+    runtimeRoot,
+    runtimeTag: resolveDeferredRuntimeTagHint(opts.runtimeTag),
+    runtimePreflight: evaluateClientRuntimePreflight({
+      projectRoot: opts.repoRoot,
+      runtimeRoot,
+      visionTemplateRoot: runtimeRoot,
+    }),
+    preflightUsesEmbeddedRuntime: true,
+  };
+}
+
+function emitCliRuntimePreflight(result: ClientRuntimePreflightResult): void {
+  const lines = formatClientRuntimePreflightLines(result, "[pushpals]");
+  if (result.ok) {
+    for (const line of lines) console.log(line);
+    return;
+  }
+  for (const line of lines) console.error(line);
+}
+
 function runtimeBinaryFilename(serviceName: RuntimeServiceName, platformKey: string): string {
   const serviceToken =
     serviceName === "source_control_manager" ? "source-control-manager" : serviceName;
@@ -388,17 +550,22 @@ function runtimeBinaryFilename(serviceName: RuntimeServiceName, platformKey: str
 
 export function buildEmbeddedRuntimeEnv(
   baseEnv: Record<string, string | undefined>,
-  opts: { repoRoot: string; runtimeRoot: string },
+  opts: { repoRoot: string; runtimeRoot: string; useRuntimeConfig?: boolean },
 ): Record<string, string> {
+  const useRuntimeConfig = opts.useRuntimeConfig !== false;
   return {
     ...baseEnv,
     PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
     PUSHPALS_PROJECT_ROOT_OVERRIDE: opts.repoRoot,
-    PUSHPALS_CONFIG_DIR_OVERRIDE: join(opts.runtimeRoot, "configs"),
-    PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.runtimeRoot,
+    ...(useRuntimeConfig
+      ? {
+          PUSHPALS_CONFIG_DIR_OVERRIDE: join(opts.runtimeRoot, "configs"),
+          PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.runtimeRoot,
+        }
+      : {
+          PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.repoRoot,
+        }),
     PUSHPALS_PROTOCOL_SCHEMAS_DIR: join(opts.runtimeRoot, "protocol", "schemas"),
-    REMOTEBUDDY_AUTONOMY_ENABLED:
-      String(baseEnv.REMOTEBUDDY_AUTONOMY_ENABLED ?? "").trim() || "false",
   } as Record<string, string>;
 }
 
@@ -627,21 +794,28 @@ async function autoStartRuntimeServices(opts: {
   sourceControlManagerPort: number;
   sourceControlManagerRemote: string;
   authToken: string | null;
-  runtimeRoot?: string;
-  runtimeTag?: string;
+  preparedRuntime: PreparedCliRuntime;
+  requestedRuntimeTag?: string;
 }): Promise<RuntimeServiceProcess[]> {
-  const runtimeRoot = resolve(opts.runtimeRoot || process.env.PUSHPALS_RUNTIME_ROOT || resolveDefaultRuntimeRoot());
-  const runtimeTag = await resolveRuntimeReleaseTag(opts.runtimeTag);
-  const runtimeBinaries = await ensureRuntimeBinaries(runtimeRoot, runtimeTag);
-  await ensureRuntimeAssets(runtimeRoot, runtimeTag);
+  const { runtimePreflight } = opts.preparedRuntime;
+  const runtimeRoot = opts.preparedRuntime.runtimeRoot;
+  const runtimeTag =
+    opts.preparedRuntime.runtimeTag || (await resolveRuntimeReleaseTag(opts.requestedRuntimeTag));
 
   console.log(`[pushpals] LocalBuddy unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`);
   console.log(`[pushpals] runtimeRoot=${runtimeRoot}`);
   console.log(`[pushpals] runtimeTag=${runtimeTag}`);
+  if (!runtimePreflight.ok) {
+    throw new Error("Embedded runtime preflight failed.");
+  }
+
+  await ensureRuntimeAssets(runtimeRoot, runtimeTag);
+  const runtimeBinaries = await ensureRuntimeBinaries(runtimeRoot, runtimeTag);
 
   const runtimeEnv = buildEmbeddedRuntimeEnv(process.env as Record<string, string | undefined>, {
     repoRoot: opts.repoRoot,
     runtimeRoot,
+    useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
   });
 
   const services: RuntimeServiceProcess[] = [];
@@ -1320,8 +1494,6 @@ async function main(): Promise<void> {
   logCliInvocation(argv);
   const parsed = parseArgs(argv);
   if (!parsed) return;
-
-  const config = loadPushPalsConfig();
   const cwd = process.cwd();
   const repoRoot = await resolveCurrentGitRepoRoot(cwd);
   if (!repoRoot) {
@@ -1331,6 +1503,26 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  const preparedRuntime = await prepareCliRuntime({
+    repoRoot,
+    runtimeRoot: parsed.runtimeRoot,
+    runtimeTag: parsed.runtimeTag,
+  });
+  console.log("[pushpals] Running runtime preflight...");
+  console.log(`[pushpals] runtimeRoot=${preparedRuntime.runtimeRoot}`);
+  if (preparedRuntime.runtimeTag) {
+    console.log(`[pushpals] runtimeTag=${preparedRuntime.runtimeTag}`);
+  } else if (!preparedRuntime.preflightUsesEmbeddedRuntime) {
+    console.log("[pushpals] runtimeTag=(deferred; using repo config for preflight)");
+  } else {
+    console.log("[pushpals] runtimeTag=(deferred until embedded auto-start is needed)");
+  }
+  emitCliRuntimePreflight(preparedRuntime.runtimePreflight);
+  if (!preparedRuntime.runtimePreflight.ok) {
+    process.exit(1);
+  }
+
+  const config = preparedRuntime.runtimePreflight.config;
   const serverUrl = normalizeUrl(parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL, config.server.url);
   const localAgentUrl = normalizeUrl(
     parsed.localAgentUrl ?? process.env.EXPO_PUBLIC_LOCAL_AGENT_URL,
@@ -1355,8 +1547,8 @@ async function main(): Promise<void> {
         sourceControlManagerPort: config.sourceControlManager.port,
         sourceControlManagerRemote: config.sourceControlManager.remote,
         authToken,
-        runtimeRoot: parsed.runtimeRoot,
-        runtimeTag: parsed.runtimeTag,
+        preparedRuntime,
+        requestedRuntimeTag: parsed.runtimeTag,
       });
       health = await probeLocalBuddy(localAgentUrl, authToken);
     } catch (err) {

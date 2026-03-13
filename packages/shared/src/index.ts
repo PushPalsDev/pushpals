@@ -6,6 +6,13 @@ export { detectRepoRoot, getRepoContext } from "./repo.js";
 export { CommunicationManager, type CommunicationManagerOptions } from "./communication.js";
 export { loadPromptTemplate, loadRepoDocText } from "./prompts.js";
 export {
+  evaluateClientRuntimePreflight,
+  formatClientRuntimePreflightLines,
+  type ClientPreflightCopyCommands,
+  type ClientPreflightIssue,
+  type ClientRuntimePreflightResult,
+} from "./client_preflight.js";
+export {
   extractVisionKeyItems,
   normalizeVisionSectionRef,
   normalizeVisionSectionRefs,

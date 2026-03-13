@@ -1,0 +1,124 @@
+# Copy this file to configs/local.toml for machine-specific, non-secret overrides.
+# Keep secrets in .env (or CI secret store), not in TOML.
+
+[localbuddy.llm]
+backend = "openai_codex"
+model = "gpt-5-codex"
+codex_auth_mode = "chatgpt"
+codex_bin = "bun x --yes @openai/codex"
+codex_timeout_ms = 120000
+reasoning_effort = "high"
+
+[remotebuddy.llm]
+backend = "openai_codex"
+model = "gpt-5-codex"
+codex_auth_mode = "chatgpt"
+codex_bin = "bun x --yes @openai/codex"
+codex_timeout_ms = 120000
+reasoning_effort = "high"
+
+[remotebuddy]
+max_workerpals = 10
+crash_restart_enabled = true
+crash_restart_max_restarts = 3
+crash_restart_backoff_ms = 3000
+
+[remotebuddy.autonomy]
+llm_timeout_ms = 60000
+allow_dirty_worktree = false
+
+[remotebuddy.memory]
+enabled = true
+include_cross_session = true
+max_recall_items = 12
+max_recall_chars = 2400
+max_summary_chars = 420
+retention_days = 30
+
+[workerpals.llm]
+backend = "openai_codex"
+model = "gpt-5-codex"
+codex_auth_mode = "chatgpt"
+codex_bin = "bun x --yes @openai/codex"
+codex_timeout_ms = 120000
+reasoning_effort = "high"
+
+[workerpals]
+executor = "openai_codex"
+docker_image = "pushpals-worker-sandbox:latest"
+openhands_timeout_ms = 1800000
+openai_codex_timeout_ms = 7200000
+docker_timeout_ms = 7260000
+openhands_stuck_guard_enabled = true
+openhands_stuck_guard_explore_limit = 18
+openhands_stuck_guard_min_elapsed_ms = 180000
+openhands_stuck_guard_broad_scan_limit = 2
+openhands_stuck_guard_no_progress_max_ms = 300000
+docker_warm_memory_mb = 2048
+docker_warm_cpus = 2
+file_modifying_jobs = ["task.execute"]
+output_max_chars = 196608
+output_max_lines = 600
+output_max_head_lines = 120
+quality_max_auto_revisions = 4
+quality_validation_step_timeout_ms = 180000
+quality_critic_timeout_ms = 45000
+quality_soft_pass_on_exhausted = true
+quality_critic_min_score = 8.0
+quality_critic_max_diff_chars = 16000
+quality_critic_max_validation_output_chars = 8000
+executor_result_prefix = "__PUSHPALS_OH_RESULT__ "
+
+[workerpals.openhands]
+prompt_profile = "minimal"
+llm_timeout_sec = 180
+llm_max_message_chars = 12000
+llm_timeout_recovery_attempts = 2
+llm_timeout_recovery_backoff_sec = 5
+agent_max_steps = 30
+auto_steer_enabled = true
+auto_steer_initial_delay_sec = 90
+auto_steer_interval_sec = 60
+auto_steer_max_nudges = 30
+
+[workerpals.openai_codex]
+auth_mode = "chatgpt"
+bin = "bun x --yes @openai/codex"
+timeout_ms = 7200000
+progress_log_interval_s = 30
+# timeout_s = 120  # optional; if set, overrides timeout_ms
+reasoning_effort = "high"
+approval_policy = "never"
+sandbox = "workspace-write"
+color = "never"
+json = true
+
+[llm.lmstudio]
+context_window = 4096
+min_output_tokens = 256
+batch_tail_messages = 3
+
+[source_control_manager]
+repo_path = ".worktrees/source_control_manager"
+pushpals_branch = "main_agents"
+base_branch = "main"
+checks = []
+
+[source_control_manager.review_agent]
+enabled = true
+poll_interval_ms = 60000
+reviewer_md_path = "prompts/review_agent/reviewer.md"
+pass_threshold = 8.1
+max_pr_comments_before_give_up = 10
+merge_method = "squash"
+codex_auth_mode = "chatgpt"
+codex_bin = "bun x --yes @openai/codex"
+codex_home_dir = ""
+codex_timeout_ms = 300000
+
+[startup]
+log_config_on_start = true
+startup_warmup = true
+lmstudio_ready_timeout_ms = 120000
+port_preflight = true
+port_conflict_policy = "terminate_pushpals"  # fail|terminate_pushpals
