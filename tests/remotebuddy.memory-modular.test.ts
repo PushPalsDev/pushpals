@@ -130,30 +130,45 @@ describe("remotebuddy memory modular composition", () => {
     const ok = new StubBackend();
     ok.recalls = ["[memory repo-history request] safe-path"];
     const composite = new CompositeSessionMemory([new ThrowingBackend(), ok]);
+    const originalWarn = console.warn;
+    const warnLines: string[] = [];
+    console.warn = (...args: unknown[]) => {
+      const line = args.map((value) => String(value)).join(" ");
+      warnLines.push(line);
+    };
 
-    composite.remember(
-      {
+    try {
+      composite.remember(
+        {
+          repoRoot: "C:/repo/pushpals",
+          sessionId: "session-a",
+          kind: "request",
+          summary: "hello",
+        },
+        { retentionDays: 30, maxSummaryChars: 420 },
+      );
+      const recalled = composite.recallForPlanning({
         repoRoot: "C:/repo/pushpals",
         sessionId: "session-a",
-        kind: "request",
-        summary: "hello",
-      },
-      { retentionDays: 30, maxSummaryChars: 420 },
-    );
-    const recalled = composite.recallForPlanning({
-      repoRoot: "C:/repo/pushpals",
-      sessionId: "session-a",
-      includeCurrentSession: true,
-      includeCrossSession: true,
-      maxItems: 5,
-      maxChars: 500,
-    });
-    const purged = composite.purgeExpired(30, "C:/repo/pushpals");
-    composite.close();
+        includeCurrentSession: true,
+        includeCrossSession: true,
+        maxItems: 5,
+        maxChars: 500,
+      });
+      const purged = composite.purgeExpired(30, "C:/repo/pushpals");
+      composite.close();
 
-    expect(recalled).toEqual(["[memory repo-history request] safe-path"]);
-    expect(purged).toBe(1);
-    expect(ok.closed).toBe(true);
+      expect(recalled).toEqual(["[memory repo-history request] safe-path"]);
+      expect(purged).toBe(1);
+      expect(ok.closed).toBe(true);
+      expect(warnLines.length).toBe(4);
+      expect(warnLines.some((line) => line.includes("Memory backend remember failed"))).toBe(true);
+      expect(warnLines.some((line) => line.includes("Memory backend recall failed"))).toBe(true);
+      expect(warnLines.some((line) => line.includes("Memory backend purge failed"))).toBe(true);
+      expect(warnLines.some((line) => line.includes("Memory backend close failed"))).toBe(true);
+    } finally {
+      console.warn = originalWarn;
+    }
   });
 
   test("in-memory backend supports cross-session repo recall", () => {
