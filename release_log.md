@@ -2,15 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.5`
-- start_commit: `a1f7bcafa8d2506a433e5b6d0288083a1f5ffde4`
-- end_commit: `a1f7bcafa8d2506a433e5b6d0288083a1f5ffde4`
-- commits_in_range: `1`
+- version: `v1.0.6`
+- start_commit: `bb7aa602055c732980cc15833b2a60ee3eea1f2c`
+- end_commit: `4d8e53670909dd88d118212930c64dd0e05e5c58`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Add startup invocation telemetry in CLI for faster first-hop diagnostics.
-- Print CLI version/runtime/platform/cwd/args at process entry.
+- Add CLI invocation logging regression coverage and harden CLI/remotebuddy tests.
+- Stabilize embedded runtime bootstrap and monitor hub behavior in CLI.
+- Improve shutdown lifecycle handling to reduce lingering embedded processes.
 
 ## Install
 
@@ -41,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.5 && git push origin v1.0.5`.
+- Tag and push: `git tag v1.0.6 && git push origin v1.0.6`.
