@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.7`
-- start_commit: `dbf6d854eab3d3d801a740278b7236435bb9f72c`
-- end_commit: `dbf6d854eab3d3d801a740278b7236435bb9f72c`
+- version: `v1.0.8`
+- start_commit: `0af4188bb8042b56072990c87212c7329e302b79`
+- end_commit: `0af4188bb8042b56072990c87212c7329e302b79`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Unify CLI runtime preflight and runtime config usage so startup probes and embedded bootstrap use the same resolved settings.
-- Defer embedded runtime tag lookup and release-asset downloads until auto-start is actually needed.
-- Add shared client preflight wiring, packaged CLI runtime assets, and a local CLI integration sandbox for repo-side debugging.
+- Add CLI regression coverage around external-tool seams including git command discovery, platform launcher selection, and Windows service stop handling.
+- Add SourceControlManager git executable override tests so embedded SCM honors the same `PUSHPALS_GIT_BIN` contract as CLI bootstrap.
+- Expose small CLI helper seams for deterministic testing of platform-specific process-launch behavior without brittle end-to-end mocking.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.7 && git push origin v1.0.7`.
+- Tag and push: `git tag v1.0.8 && git push origin v1.0.8`.
