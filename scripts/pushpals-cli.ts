@@ -60,14 +60,23 @@ type RuntimeBinarySet = {
   sourceControlManager: string;
 };
 
+type MonitoringHubHandle = {
+  url: string;
+  port: number;
+  stop: () => void;
+  embedded: boolean;
+};
+
 const DEFAULT_MONITOR_PORT = 8081;
 const MONITOR_SCAN_PORTS = 32;
+const MONITOR_POLL_MS = 2_000;
 const HTTP_TIMEOUT_MS = 2_500;
 const LOCALBUDDY_TIMEOUT_MS = 4_000;
 const SSE_RECONNECT_MS = 1_500;
 const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
 const DEFAULT_SERVER_BOOT_TIMEOUT_MS = 20_000;
+const DEFAULT_SERVICE_STABILITY_GRACE_MS = 4_000;
 const GITHUB_OWNER = "PushPalsDev";
 const GITHUB_REPO = "pushpals";
 const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;
@@ -183,6 +192,10 @@ function normalizePath(value: string): string {
   const normalized = resolve(value).replace(/\\/g, "/").replace(/\/+$/, "");
   if (process.platform === "win32") return normalized.toLowerCase();
   return normalized;
+}
+
+function jsonHtmlBootstrap(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, "\\u003c");
 }
 
 async function runGit(args: string[], cwd: string): Promise<{
@@ -373,6 +386,22 @@ function runtimeBinaryFilename(serviceName: RuntimeServiceName, platformKey: str
   return `pushpals-runtime-${serviceToken}-${platformKey}${extension}`;
 }
 
+export function buildEmbeddedRuntimeEnv(
+  baseEnv: Record<string, string | undefined>,
+  opts: { repoRoot: string; runtimeRoot: string },
+): Record<string, string> {
+  return {
+    ...baseEnv,
+    PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
+    PUSHPALS_PROJECT_ROOT_OVERRIDE: opts.repoRoot,
+    PUSHPALS_CONFIG_DIR_OVERRIDE: join(opts.runtimeRoot, "configs"),
+    PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.runtimeRoot,
+    PUSHPALS_PROTOCOL_SCHEMAS_DIR: join(opts.runtimeRoot, "protocol", "schemas"),
+    REMOTEBUDDY_AUTONOMY_ENABLED:
+      String(baseEnv.REMOTEBUDDY_AUTONOMY_ENABLED ?? "").trim() || "false",
+  } as Record<string, string>;
+}
+
 function timestampFileToken(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
@@ -506,11 +535,26 @@ function spawnRuntimeService(
 function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
   for (const service of services) {
     try {
-      service.proc.kill();
+      if (process.platform === "win32" && typeof service.proc.pid === "number" && service.proc.pid > 0) {
+        Bun.spawnSync(["taskkill", "/PID", String(service.proc.pid), "/T", "/F"], {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+      } else {
+        service.proc.kill();
+      }
     } catch {
       // ignore
     }
   }
+}
+
+async function repoHasRemote(repoRoot: string, remote: string): Promise<boolean> {
+  const normalizedRemote = remote.trim();
+  if (!normalizedRemote) return false;
+  const result = await runGit(["remote", "get-url", normalizedRemote], repoRoot);
+  return result.ok && Boolean(result.stdout);
 }
 
 async function probeServer(serverUrl: string): Promise<boolean> {
@@ -581,6 +625,7 @@ async function autoStartRuntimeServices(opts: {
   serverUrl: string;
   localAgentUrl: string;
   sourceControlManagerPort: number;
+  sourceControlManagerRemote: string;
   authToken: string | null;
   runtimeRoot?: string;
   runtimeTag?: string;
@@ -594,14 +639,10 @@ async function autoStartRuntimeServices(opts: {
   console.log(`[pushpals] runtimeRoot=${runtimeRoot}`);
   console.log(`[pushpals] runtimeTag=${runtimeTag}`);
 
-  const runtimeEnv: Record<string, string> = {
-    ...process.env,
-    PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
-    PUSHPALS_PROJECT_ROOT_OVERRIDE: opts.repoRoot,
-    PUSHPALS_CONFIG_DIR_OVERRIDE: join(runtimeRoot, "configs"),
-    PUSHPALS_PROMPTS_ROOT_OVERRIDE: runtimeRoot,
-    PUSHPALS_PROTOCOL_SCHEMAS_DIR: join(runtimeRoot, "protocol", "schemas"),
-  } as Record<string, string>;
+  const runtimeEnv = buildEmbeddedRuntimeEnv(process.env as Record<string, string | undefined>, {
+    repoRoot: opts.repoRoot,
+    runtimeRoot,
+  });
 
   const services: RuntimeServiceProcess[] = [];
   const runToken = timestampFileToken();
@@ -675,7 +716,8 @@ async function autoStartRuntimeServices(opts: {
   console.log(`[pushpals] remotebuddy log: ${remotebuddyService.logPath}`);
 
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
-  if (!scmHealthy) {
+  const scmRemoteAvailable = await repoHasRemote(opts.repoRoot, opts.sourceControlManagerRemote);
+  if (!scmHealthy && scmRemoteAvailable) {
     console.log("[pushpals] Starting embedded SourceControlManager...");
     const sourceControlManagerService = spawnRuntimeService(
       "source_control_manager",
@@ -686,6 +728,10 @@ async function autoStartRuntimeServices(opts: {
     );
     services.push(sourceControlManagerService);
     console.log(`[pushpals] source_control_manager log: ${sourceControlManagerService.logPath}`);
+  } else if (!scmRemoteAvailable) {
+    console.log(
+      `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
+    );
   } else {
     console.log("[pushpals] SourceControlManager already healthy; skipping embedded start.");
   }
@@ -717,6 +763,19 @@ async function autoStartRuntimeServices(opts: {
 
     const health = await probeLocalBuddy(opts.localAgentUrl, opts.authToken);
     if (health?.ok) {
+      const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;
+      while (Date.now() < stabilityDeadline) {
+        for (const service of services) {
+          if (!service.exited) continue;
+          const tail = readLogTail(service.logPath);
+          stopRuntimeServices(services);
+          throw new Error(
+            `Embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}). ` +
+              `See ${service.logPath}${tail ? `\n--- ${service.name} log tail ---\n${tail}` : ""}`,
+          );
+        }
+        await Bun.sleep(250);
+      }
       console.log("[pushpals] Embedded runtime is ready.");
       return services;
     }
@@ -777,19 +836,264 @@ async function looksLikeMonitoringHub(url: string): Promise<boolean> {
   }
 }
 
-async function resolveMonitoringHubUrl(
-  preferredUrl: string,
-  fallbackPort: number,
-): Promise<string> {
-  const explicit = normalizeUrl(preferredUrl);
-  if (explicit) return explicit;
+export function buildEmbeddedMonitoringHubHtml(opts: {
+  serverUrl: string;
+  localAgentUrl: string;
+  sessionId: string;
+}): string {
+  const bootstrap = jsonHtmlBootstrap(opts);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PushPals CLI Monitor</title>
+  <style>
+    :root { color-scheme: dark; --bg:#08111b; --panel:#112235; --panel2:#16324a; --line:#2b5876; --fg:#edf6ff; --muted:#90b5d6; --accent:#58d8c3; --warn:#ffbf5f; --bad:#ff7f7f; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Consolas, "SFMono-Regular", monospace; background:radial-gradient(circle at top, #0d2233, var(--bg) 56%); color:var(--fg); }
+    main { max-width:1200px; margin:0 auto; padding:24px; }
+    h1,h2 { margin:0 0 12px; }
+    p { color:var(--muted); }
+    .row { display:grid; gap:16px; margin-top:16px; }
+    .cards { grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
+    .panels { grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); }
+    .card, .panel { border:1px solid var(--line); background:linear-gradient(180deg,var(--panel),var(--panel2)); border-radius:16px; padding:16px; box-shadow:0 12px 40px rgba(0,0,0,.22); }
+    .label { font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); margin-bottom:10px; }
+    .value { font-size:32px; font-weight:700; color:var(--accent); }
+    .sub { margin-top:8px; color:var(--muted); white-space:pre-wrap; word-break:break-word; }
+    .list { display:grid; gap:10px; margin-top:12px; }
+    .item { border:1px solid rgba(88,216,195,.18); border-radius:12px; padding:12px; background:rgba(8,17,27,.42); }
+    .meta { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0 0; }
+    .pill { border:1px solid var(--line); border-radius:999px; padding:6px 10px; color:var(--muted); }
+    a { color:var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>PushPals CLI Monitor</h1>
+    <p>Lightweight embedded monitor for CLI-managed runtimes.</p>
+    <div class="meta" id="meta"></div>
+    <section class="row cards" id="cards"></section>
+    <section class="row panels">
+      <div class="panel">
+        <h2>Requests</h2>
+        <div id="requests" class="list"></div>
+      </div>
+      <div class="panel">
+        <h2>Jobs</h2>
+        <div id="jobs" class="list"></div>
+      </div>
+      <div class="panel">
+        <h2>Completions</h2>
+        <div id="completions" class="list"></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const boot = ${bootstrap};
+    const pollMs = ${MONITOR_POLL_MS};
+    const metaEl = document.getElementById("meta");
+    const cardsEl = document.getElementById("cards");
+    const requestsEl = document.getElementById("requests");
+    const jobsEl = document.getElementById("jobs");
+    const completionsEl = document.getElementById("completions");
 
-  const basePort = fallbackPort;
-  for (let port = basePort; port < basePort + MONITOR_SCAN_PORTS; port++) {
-    const candidate = `http://localhost:${port}`;
-    if (await looksLikeMonitoringHub(candidate)) return candidate;
+    function esc(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    async function fetchJson(path) {
+      const res = await fetch(path, { cache: "no-store" });
+      if (!res.ok) throw new Error(path + " -> HTTP " + res.status);
+      return await res.json();
+    }
+
+    function setList(target, rows, emptyLabel, formatter) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        target.innerHTML = '<div class="item">' + esc(emptyLabel) + "</div>";
+        return;
+      }
+      target.innerHTML = rows.map((row) => '<div class="item">' + formatter(row) + "</div>").join("");
+    }
+
+    function renderStatus(status) {
+      const workers = status?.workers ?? {};
+      const queues = status?.queues ?? {};
+      const runtime = status?.runtime ?? {};
+      const repo = status?.repo ?? {};
+      const llmUsage = status?.llmUsage ?? {};
+      const cards = [
+        { label: "Server uptime", value: Math.round((Number(runtime.uptimeMs ?? 0) / 60000)) + "m", sub: runtime.startedAt ?? "unknown" },
+        { label: "Workers online", value: String(workers.online ?? 0), sub: "busy " + String(workers.busy ?? 0) + " | idle " + String(workers.idle ?? 0) },
+        { label: "Pending requests", value: String(queues.requests?.pending ?? 0), sub: "claimed " + String(queues.requests?.claimed ?? 0) },
+        { label: "Pending jobs", value: String(queues.jobs?.pending ?? 0), sub: "claimed " + String(queues.jobs?.claimed ?? 0) },
+        { label: "Completions", value: String(queues.completions?.pending ?? 0), sub: "processed " + String(queues.completions?.processed ?? 0) },
+        { label: "LLM usage (24h)", value: String(llmUsage.totalTokens ?? 0), sub: "calls " + String(llmUsage.totalCalls ?? 0) }
+      ];
+      cardsEl.innerHTML = cards.map((card) => '<div class="card"><div class="label">' + esc(card.label) + '</div><div class="value">' + esc(card.value) + '</div><div class="sub">' + esc(card.sub) + '</div></div>').join("");
+      metaEl.innerHTML = [
+        '<span class="pill">server ' + esc(boot.serverUrl) + '</span>',
+        '<span class="pill">localbuddy ' + esc(boot.localAgentUrl) + '</span>',
+        '<span class="pill">session ' + esc(boot.sessionId) + '</span>',
+        '<span class="pill">repo ' + esc(repo?.root ?? repo?.remoteUrl ?? "current repo") + '</span>'
+      ].join("");
+    }
+
+    function render() {
+      Promise.all([
+        fetchJson('/api/status'),
+        fetchJson('/api/requests'),
+        fetchJson('/api/jobs'),
+        fetchJson('/api/completions')
+      ]).then(([status, requests, jobs, completions]) => {
+        renderStatus(status);
+        setList(requestsEl, requests?.requests?.slice(0, 8), 'No requests', (row) =>
+          '<strong>' + esc(row?.priority ?? 'request') + '</strong><div class="sub">' +
+          esc((row?.status ?? 'unknown') + ' | ' + (row?.id ?? '')) + '</div><div class="sub">' +
+          esc(String(row?.prompt ?? '').slice(0, 220)) + '</div>');
+        setList(jobsEl, jobs?.jobs?.slice(0, 8), 'No jobs', (row) =>
+          '<strong>' + esc(row?.kind ?? 'job') + '</strong><div class="sub">' +
+          esc((row?.status ?? 'unknown') + ' | worker ' + (row?.workerId ?? '--')) + '</div><div class="sub">' +
+          esc((row?.summary ?? row?.error ?? row?.id ?? '').slice(0, 220)) + '</div>');
+        setList(completionsEl, completions?.completions?.slice(0, 8), 'No completions', (row) =>
+          '<strong>' + esc(row?.status ?? 'completion') + '</strong><div class="sub">' +
+          esc((row?.jobId ?? '') + ' | ' + (row?.commitSha ?? '')) + '</div><div class="sub">' +
+          esc((row?.message ?? '').slice(0, 220)) + '</div>');
+      }).catch((err) => {
+        cardsEl.innerHTML = '<div class="card"><div class="label">Monitor error</div><div class="sub">' + esc(err?.message ?? err) + '</div></div>';
+      });
+    }
+
+    render();
+    setInterval(render, pollMs);
+  </script>
+</body>
+</html>`;
+}
+
+async function proxyMonitoringHubRequest(
+  serverUrl: string,
+  authToken: string | null,
+  pathValue: string,
+): Promise<Response> {
+  const target = `${serverUrl}${pathValue}`;
+  const upstream = await fetchWithTimeout(
+    target,
+    { headers: authHeaders(authToken) },
+    10_000,
+  );
+  const body = await upstream.text();
+  return new Response(body, {
+    status: upstream.status,
+    headers: {
+      "content-type": String(upstream.headers.get("content-type") ?? "application/json"),
+      "cache-control": "no-store",
+    },
+  });
+}
+
+export async function startEmbeddedMonitoringHub(opts: {
+  serverUrl: string;
+  localAgentUrl: string;
+  sessionId: string;
+  authToken: string | null;
+  preferredPort: number;
+}): Promise<MonitoringHubHandle | null> {
+  const html = buildEmbeddedMonitoringHubHtml({
+    serverUrl: opts.serverUrl,
+    localAgentUrl: opts.localAgentUrl,
+    sessionId: opts.sessionId,
+  });
+
+  const candidatePorts = Array.from(
+    { length: MONITOR_SCAN_PORTS },
+    (_, index) => opts.preferredPort + index,
+  ).concat(0);
+
+  for (const port of candidatePorts) {
+    try {
+      const server = Bun.serve({
+        port,
+        idleTimeout: 30,
+        fetch: async (req) => {
+          const url = new URL(req.url);
+          if (url.pathname === "/") {
+            return new Response(html, {
+              headers: {
+                "content-type": "text/html; charset=utf-8",
+                "cache-control": "no-store",
+              },
+            });
+          }
+          if (url.pathname === "/healthz") {
+            return Response.json({ ok: true, port, serverUrl: opts.serverUrl, sessionId: opts.sessionId });
+          }
+          if (url.pathname === "/api/status") {
+            return await proxyMonitoringHubRequest(opts.serverUrl, opts.authToken, "/system/status");
+          }
+          if (url.pathname === "/api/requests") {
+            return await proxyMonitoringHubRequest(opts.serverUrl, opts.authToken, "/requests?status=all&limit=20");
+          }
+          if (url.pathname === "/api/jobs") {
+            return await proxyMonitoringHubRequest(opts.serverUrl, opts.authToken, "/jobs?status=all&limit=20");
+          }
+          if (url.pathname === "/api/completions") {
+            return await proxyMonitoringHubRequest(
+              opts.serverUrl,
+              opts.authToken,
+              "/completions?status=all&limit=20",
+            );
+          }
+          return new Response("Not found", { status: 404 });
+        },
+      });
+      return {
+        url: `http://127.0.0.1:${server.port}`,
+        port: Number(server.port),
+        embedded: true,
+        stop: () => server.stop(true),
+      };
+    } catch {
+      // try next port
+    }
   }
-  return `http://localhost:${basePort}`;
+  return null;
+}
+
+async function resolveMonitoringHub(opts: {
+  preferredUrl: string;
+  fallbackPort: number;
+  serverUrl: string;
+  localAgentUrl: string;
+  sessionId: string;
+  authToken: string | null;
+}): Promise<MonitoringHubHandle | null> {
+  const explicit = normalizeUrl(opts.preferredUrl);
+  if (explicit) {
+    if (await looksLikeMonitoringHub(explicit)) {
+      return { url: explicit, port: 0, stop: () => {}, embedded: false };
+    }
+    console.warn(
+      `[pushpals] Preferred monitoring hub ${explicit} is unavailable; starting embedded monitor instead.`,
+    );
+  }
+
+  for (let port = opts.fallbackPort; port < opts.fallbackPort + MONITOR_SCAN_PORTS; port++) {
+    const candidate = `http://127.0.0.1:${port}`;
+    if (await looksLikeMonitoringHub(candidate)) {
+      return { url: candidate, port, stop: () => {}, embedded: false };
+    }
+  }
+
+  const embedded = await startEmbeddedMonitoringHub(opts);
+  if (!embedded) {
+    console.warn("[pushpals] Embedded monitoring hub could not start on any expected local port.");
+  }
+  return embedded;
 }
 
 async function sendMessageToLocalBuddy(localAgentUrl: string, text: string): Promise<boolean> {
@@ -995,8 +1299,7 @@ async function runSessionStream(
 async function openMonitoringHub(url: string): Promise<boolean> {
   let cmd: string[] | null = null;
   if (process.platform === "win32") {
-    const escaped = url.replace(/'/g, "''");
-    cmd = ["powershell", "-NoProfile", "-Command", `Start-Process '${escaped}'`];
+    cmd = ["cmd", "/c", "start", "", url];
   } else if (process.platform === "darwin") {
     cmd = ["open", url];
   } else {
@@ -1050,6 +1353,7 @@ async function main(): Promise<void> {
         serverUrl,
         localAgentUrl,
         sourceControlManagerPort: config.sourceControlManager.port,
+        sourceControlManagerRemote: config.sourceControlManager.remote,
         authToken,
         runtimeRoot: parsed.runtimeRoot,
         runtimeTag: parsed.runtimeTag,
@@ -1105,10 +1409,18 @@ async function main(): Promise<void> {
       "",
   );
   const monitorPort = parsePositiveInt(process.env.PUSHPALS_CLIENT_PORT, DEFAULT_MONITOR_PORT);
-  const monitoringHubUrl = await resolveMonitoringHubUrl(preferredHubUrl, monitorPort);
+  const monitoringHub = await resolveMonitoringHub({
+    preferredUrl: preferredHubUrl,
+    fallbackPort: monitorPort,
+    serverUrl,
+    localAgentUrl,
+    sessionId: localBuddySessionId,
+    authToken,
+  });
+  const monitoringHubUrl = monitoringHub?.url ?? "";
 
   writeCliState(statePath, {
-    monitoringHubUrl,
+    monitoringHubUrl: monitoringHubUrl || undefined,
     serverUrl,
     localAgentUrl,
     sessionId: localBuddySessionId,
@@ -1116,7 +1428,14 @@ async function main(): Promise<void> {
   });
 
   console.log("[pushpals] Connected.");
-  console.log(`monitoringHubUrl=${monitoringHubUrl}`);
+  if (monitoringHubUrl) {
+    console.log(`monitoringHubUrl=${monitoringHubUrl}`);
+    if (monitoringHub?.embedded) {
+      console.log("[pushpals] Embedded monitoring hub is running.");
+    }
+  } else {
+    console.log("monitoringHubUrl=unavailable");
+  }
   console.log(`serverUrl=${serverUrl}`);
   console.log(`localAgentUrl=${localAgentUrl}`);
   console.log(`sessionId=${localBuddySessionId}`);
@@ -1153,11 +1472,17 @@ async function main(): Promise<void> {
     shuttingDown = true;
     streamAbort.abort();
     if (rl) rl.close();
+    try {
+      monitoringHub?.stop();
+    } catch {
+      // ignore
+    }
     stopAutoStartedServices();
   };
 
   process.once("SIGINT", requestStop);
   process.once("SIGTERM", requestStop);
+  process.once("exit", requestStop);
 
   rl = createInterface({
     input: process.stdin,
@@ -1178,20 +1503,25 @@ async function main(): Promise<void> {
       break;
     }
     if (text === "/hub") {
-      console.log(`monitoringHubUrl=${monitoringHubUrl}`);
+      console.log(monitoringHubUrl ? `monitoringHubUrl=${monitoringHubUrl}` : "monitoringHubUrl=unavailable");
       rl.prompt();
       continue;
     }
     if (text === "/status") {
       console.log(`serverUrl=${serverUrl}`);
       console.log(`localAgentUrl=${localAgentUrl}`);
-      console.log(`sessionId=${sessionId}`);
+      console.log(`sessionId=${localBuddySessionId}`);
       console.log(`repoRoot=${repoRoot}`);
-      console.log(`monitoringHubUrl=${monitoringHubUrl}`);
+      console.log(monitoringHubUrl ? `monitoringHubUrl=${monitoringHubUrl}` : "monitoringHubUrl=unavailable");
       rl.prompt();
       continue;
     }
     if (text === "/open") {
+      if (!monitoringHubUrl) {
+        console.log("[pushpals] Monitoring hub is unavailable.");
+        rl.prompt();
+        continue;
+      }
       const opened = await openMonitoringHub(monitoringHubUrl);
       console.log(
         opened
@@ -1213,7 +1543,9 @@ async function main(): Promise<void> {
   await Promise.race([streamTask, Bun.sleep(2_000)]);
 }
 
-main().catch((err) => {
-  console.error(`[pushpals] Fatal: ${String(err)}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(`[pushpals] Fatal: ${String(err)}`);
+    process.exit(1);
+  });
+}

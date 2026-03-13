@@ -165,7 +165,7 @@ jobs:
 
           bun build apps/server/src/server_main.ts --compile --target=${{ matrix.target }} --outfile "dist/pushpals-runtime-server-${{ matrix.platform_key }}${ext}"
           bun build apps/localbuddy/src/localbuddy_main.ts --compile --target=${{ matrix.target }} --outfile "dist/pushpals-runtime-localbuddy-${{ matrix.platform_key }}${ext}"
-          bun build apps/remotebuddy/src/remotebuddy_supervisor.ts --compile --target=${{ matrix.target }} --outfile "dist/pushpals-runtime-remotebuddy-${{ matrix.platform_key }}${ext}"
+          bun build apps/remotebuddy/src/remotebuddy_main.ts --compile --target=${{ matrix.target }} --outfile "dist/pushpals-runtime-remotebuddy-${{ matrix.platform_key }}${ext}"
           bun build apps/source_control_manager/src/source_control_manager_main.ts --compile --target=${{ matrix.target }} --outfile "dist/pushpals-runtime-source-control-manager-${{ matrix.platform_key }}${ext}"
 
           if [[ "${{ matrix.platform_key }}" != windows-* ]]; then
