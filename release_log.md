@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.6`
-- start_commit: `bb7aa602055c732980cc15833b2a60ee3eea1f2c`
-- end_commit: `4d8e53670909dd88d118212930c64dd0e05e5c58`
-- commits_in_range: `3`
+- version: `v1.0.7`
+- start_commit: `dbf6d854eab3d3d801a740278b7236435bb9f72c`
+- end_commit: `dbf6d854eab3d3d801a740278b7236435bb9f72c`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Add CLI invocation logging regression coverage and harden CLI/remotebuddy tests.
-- Stabilize embedded runtime bootstrap and monitor hub behavior in CLI.
-- Improve shutdown lifecycle handling to reduce lingering embedded processes.
+- Unify CLI runtime preflight and runtime config usage so startup probes and embedded bootstrap use the same resolved settings.
+- Defer embedded runtime tag lookup and release-asset downloads until auto-start is actually needed.
+- Add shared client preflight wiring, packaged CLI runtime assets, and a local CLI integration sandbox for repo-side debugging.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.6 && git push origin v1.0.6`.
+- Tag and push: `git tag v1.0.7 && git push origin v1.0.7`.
