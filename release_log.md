@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.8`
-- start_commit: `0af4188bb8042b56072990c87212c7329e302b79`
-- end_commit: `0af4188bb8042b56072990c87212c7329e302b79`
+- version: `v1.0.9`
+- start_commit: `994b1a1d77b52d0440590bef938c1f94bfa5e779`
+- end_commit: `994b1a1d77b52d0440590bef938c1f94bfa5e779`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add CLI regression coverage around external-tool seams including git command discovery, platform launcher selection, and Windows service stop handling.
-- Add SourceControlManager git executable override tests so embedded SCM honors the same `PUSHPALS_GIT_BIN` contract as CLI bootstrap.
-- Expose small CLI helper seams for deterministic testing of platform-specific process-launch behavior without brittle end-to-end mocking.
+- Unify CLI monitoring on the packaged client hub and remove the legacy inline monitor fallback path.
+- Enforce auth consistently across session creation, SSE, WebSocket, and session message routes, with browser-safe query fallback for stream transports.
+- Add packaged CLI integration coverage so local debugging validates the built package path and package-relative monitor/runtime assets.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.8 && git push origin v1.0.8`.
+- Tag and push: `git tag v1.0.9 && git push origin v1.0.9`.
