@@ -25,12 +25,12 @@ describe("pushpals CLI invocation logging", () => {
       proc.exited,
     ]);
 
-    expect(code).toBe(0);
-    expect(stderr.trim()).toBe("");
-    expect(stdout).toContain("[pushpals] invocation=");
-    expect(stdout).toContain("[pushpals] version=1.0.5-test");
-    expect(stdout).toContain("[pushpals] platform=");
-    expect(stdout).toContain(`[pushpals] cwd=${repoRoot}`);
+      expect(code).toBe(0);
+      expect(stderr.trim()).toBe("");
+      expect(stdout).toMatch(/\[\d{4}-\d{2}-\d{2}T[^\]]+Z\]\[pushpals\] invocation=/);
+      expect(stdout).toContain("[pushpals] version=1.0.5-test");
+      expect(stdout).toContain("[pushpals] platform=");
+      expect(stdout).toContain(`[pushpals] cwd=${repoRoot}`);
     expect(stdout).toContain("[pushpals] args=--help");
     expect(stdout).toContain("PushPals CLI");
   });
@@ -53,7 +53,7 @@ describe("pushpals CLI invocation logging", () => {
       ]);
 
       expect(code).toBe(1);
-      expect(stdout).toContain("[pushpals] invocation=");
+      expect(stdout).toMatch(/\[\d{4}-\d{2}-\d{2}T[^\]]+Z\]\[pushpals\] invocation=/);
       expect(stdout).toContain("[pushpals] version=1.0.5-test");
       expect(stdout).toContain("[pushpals] args=--no-auto-start");
       expect(stdout).toContain(`[pushpals] cwd=${cwd}`);

@@ -121,6 +121,35 @@ const GITHUB_HEADERS = {
   "User-Agent": "pushpals-cli",
 };
 const stateVersion = 1;
+let cliTimestampedConsoleInstalled = false;
+
+export function formatTimestampedCliLine(line: string, at = new Date()): string {
+  const text = String(line ?? "");
+  if (!text.startsWith("[pushpals]") && !text.startsWith("[localbuddy]")) {
+    return text;
+  }
+  return `[${at.toISOString()}]${text}`;
+}
+
+function installTimestampedCliConsole(): void {
+  if (cliTimestampedConsoleInstalled) return;
+  cliTimestampedConsoleInstalled = true;
+
+  const patch =
+    <T extends (...args: any[]) => unknown>(original: T): T =>
+    ((...args: any[]) => {
+      if (args.length > 0 && typeof args[0] === "string") {
+        args[0] = formatTimestampedCliLine(args[0]);
+      }
+      return original(...args);
+    }) as T;
+
+  console.log = patch(console.log.bind(console)) as typeof console.log;
+  console.warn = patch(console.warn.bind(console)) as typeof console.warn;
+  console.error = patch(console.error.bind(console)) as typeof console.error;
+}
+
+installTimestampedCliConsole();
 
 function logCliInvocation(argv: string[]): void {
   const startedAt = new Date().toISOString();
@@ -422,6 +451,7 @@ async function resolveRuntimeReleaseTag(explicitTag?: string): Promise<string> {
   if (fromEnv) return fromEnv;
 
   const packageVersion = parseSemverFromPackageVersion(process.env.PUSHPALS_CLI_PACKAGE_VERSION);
+  console.log("[pushpals] Resolving embedded runtime release tag from GitHub...");
   try {
     return await fetchLatestReleaseTag();
   } catch (err) {
@@ -506,6 +536,7 @@ async function fetchTextFromUrl(url: string, timeoutMs = 20_000): Promise<string
 }
 
 async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: string): Promise<void> {
+  console.log(`[pushpals] Downloading embedded runtime assets from source tag ${tag}...`);
   const treeUrl = `${GITHUB_API_URL}/git/trees/${encodeURIComponent(tag)}?recursive=1`;
   const treeResponse = await fetchWithTimeout(treeUrl, { headers: GITHUB_HEADERS }, 30_000);
   if (!treeResponse.ok) {
@@ -548,6 +579,7 @@ async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: stri
 }
 
 async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Promise<void> {
+  console.log(`[pushpals] Preparing embedded runtime assets for ${runtimeTag}...`);
   const markerPath = join(runtimeRoot, ".runtime-assets-tag");
   const currentTag = existsSync(markerPath) ? readFileSync(markerPath, "utf8").trim() : "";
   const protocolSchemasDir = join(runtimeRoot, "protocol", "schemas");
@@ -561,6 +593,9 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
     existsSync(join(runtimeRoot, "prompts")) &&
     hasProtocolSchemas;
   if (!hasAssets || currentTag !== runtimeTag) {
+    console.log(
+      `[pushpals] Embedded runtime assets ${hasAssets ? "are stale" : "are missing"}; refreshing bundle...`,
+    );
     copyBundledRuntimeAssets(runtimeRoot);
     const hasProtocolSchemasAfterCopy =
       existsSync(join(protocolSchemasDir, "envelope.schema.json")) &&
@@ -572,6 +607,9 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
       existsSync(join(runtimeRoot, "prompts")) &&
       hasProtocolSchemasAfterCopy;
     if (!hasAssetsAfterCopy) {
+      console.log(
+        "[pushpals] Bundled runtime assets are incomplete; falling back to release source downloads...",
+      );
       await downloadRuntimeAssetsFromSourceTag(runtimeRoot, runtimeTag);
     }
     writeFileSync(markerPath, `${runtimeTag}\n`, "utf8");
@@ -590,6 +628,7 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
       "# Local PushPals runtime overrides\n",
     );
   }
+  console.log("[pushpals] Embedded runtime assets are ready.");
 }
 
 function resolveDeferredRuntimeTagHint(explicitTag?: string): string {
@@ -760,6 +799,7 @@ function readLogTail(logPath: string, maxLines = 40): string {
 }
 
 async function downloadBinaryAsset(tag: string, assetName: string, outPath: string): Promise<void> {
+  console.log(`[pushpals] Downloading embedded runtime binary ${assetName} from ${tag}...`);
   const url = `${GITHUB_RELEASE_URL}/${encodeURIComponent(tag)}/${assetName}`;
   const response = await fetchWithTimeout(url, { headers: GITHUB_HEADERS }, 60_000);
   if (!response.ok) {
@@ -775,6 +815,9 @@ async function ensureRuntimeBinaries(
   runtimeTag: string,
 ): Promise<RuntimeBinarySet> {
   const platformKey = resolveRuntimePlatformKey();
+  console.log(
+    `[pushpals] Preparing embedded runtime binaries for ${runtimeTag} (${platformKey})...`,
+  );
   const binDir = join(runtimeRoot, "bin", `${runtimeTag}-${platformKey}`);
   mkdirSync(binDir, { recursive: true });
 
@@ -794,10 +837,12 @@ async function ensureRuntimeBinaries(
     runtimeBinaries.remotebuddy,
     runtimeBinaries.sourceControlManager,
   ];
+  let downloadedCount = 0;
   for (const binaryPath of requiredAssets) {
     if (existsSync(binaryPath)) continue;
     const assetName = binaryPath.split(/[\\/]/).pop() || "";
     await downloadBinaryAsset(runtimeTag, assetName, binaryPath);
+    downloadedCount++;
   }
 
   if (process.platform !== "win32") {
@@ -810,6 +855,12 @@ async function ensureRuntimeBinaries(
     }
   }
 
+  if (downloadedCount === 0) {
+    console.log("[pushpals] Embedded runtime binaries are already present.");
+  } else {
+    console.log(`[pushpals] Embedded runtime binaries downloaded: ${downloadedCount}.`);
+  }
+  console.log("[pushpals] Embedded runtime binaries are ready.");
   return runtimeBinaries;
 }
 
@@ -2018,18 +2069,18 @@ async function main(): Promise<void> {
 
   console.log("[pushpals] Connected.");
   if (monitoringHubUrl) {
-    console.log(`monitoringHubUrl=${monitoringHubUrl}`);
+    console.log(`[pushpals] monitoringHubUrl=${monitoringHubUrl}`);
     if (monitoringHub?.embedded) {
       console.log("[pushpals] Embedded monitoring hub is running.");
     }
   } else {
-    console.log("monitoringHubUrl=unavailable");
+    console.log("[pushpals] monitoringHubUrl=unavailable");
   }
-  console.log(`serverUrl=${serverUrl}`);
-  console.log(`localAgentUrl=${localAgentUrl}`);
-  console.log(`sessionId=${localBuddySessionId}`);
-  console.log(`repoRoot=${repoRoot}`);
-  console.log(`cliStateFile=${statePath}`);
+  console.log(`[pushpals] serverUrl=${serverUrl}`);
+  console.log(`[pushpals] localAgentUrl=${localAgentUrl}`);
+  console.log(`[pushpals] sessionId=${localBuddySessionId}`);
+  console.log(`[pushpals] repoRoot=${repoRoot}`);
+  console.log(`[pushpals] cliStateFile=${statePath}`);
   console.log("[pushpals] Type a message and press Enter. Use /exit or exit to quit.");
 
   const streamAbort = new AbortController();
@@ -2097,18 +2148,22 @@ async function main(): Promise<void> {
     }
     if (text === "/hub") {
       console.log(
-        monitoringHubUrl ? `monitoringHubUrl=${monitoringHubUrl}` : "monitoringHubUrl=unavailable",
+        monitoringHubUrl
+          ? `[pushpals] monitoringHubUrl=${monitoringHubUrl}`
+          : "[pushpals] monitoringHubUrl=unavailable",
       );
       rl.prompt();
       continue;
     }
     if (text === "/status") {
-      console.log(`serverUrl=${serverUrl}`);
-      console.log(`localAgentUrl=${localAgentUrl}`);
-      console.log(`sessionId=${localBuddySessionId}`);
-      console.log(`repoRoot=${repoRoot}`);
+      console.log(`[pushpals] serverUrl=${serverUrl}`);
+      console.log(`[pushpals] localAgentUrl=${localAgentUrl}`);
+      console.log(`[pushpals] sessionId=${localBuddySessionId}`);
+      console.log(`[pushpals] repoRoot=${repoRoot}`);
       console.log(
-        monitoringHubUrl ? `monitoringHubUrl=${monitoringHubUrl}` : "monitoringHubUrl=unavailable",
+        monitoringHubUrl
+          ? `[pushpals] monitoringHubUrl=${monitoringHubUrl}`
+          : "[pushpals] monitoringHubUrl=unavailable",
       );
       rl.prompt();
       continue;

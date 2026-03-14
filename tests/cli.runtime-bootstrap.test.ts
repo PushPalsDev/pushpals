@@ -6,6 +6,7 @@ import {
   buildOpenMonitoringHubCommand,
   buildEmbeddedRuntimeEnv,
   buildServiceStopCommand,
+  formatTimestampedCliLine,
   injectMonitoringHubBootstrap,
   isCliExitCommand,
   normalizeChildProcessEnv,
@@ -134,6 +135,17 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(isCliExitCommand(" Quit ")).toBe(true);
     expect(isCliExitCommand("please exit this task")).toBe(false);
     expect(isCliExitCommand("/status")).toBe(false);
+  });
+
+  test("formatTimestampedCliLine prepends an ISO timestamp for CLI-scoped logs only", () => {
+    const at = new Date("2026-03-14T05:13:05.835Z");
+    expect(formatTimestampedCliLine("[pushpals] runtimeTag=v1.0.9", at)).toBe(
+      "[2026-03-14T05:13:05.835Z][pushpals] runtimeTag=v1.0.9",
+    );
+    expect(formatTimestampedCliLine("[localbuddy] Responded locally", at)).toBe(
+      "[2026-03-14T05:13:05.835Z][localbuddy] Responded locally",
+    );
+    expect(formatTimestampedCliLine("PushPals CLI", at)).toBe("PushPals CLI");
   });
 
   test("injectMonitoringHubBootstrap writes runtime config into exported client html", () => {
