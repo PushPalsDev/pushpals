@@ -17,11 +17,12 @@
   "files": [
     "bin",
     "dist",
+    "monitor-ui",
     "runtime",
     "README.md"
   ],
   "scripts": {
-    "build": "bun run ../../scripts/sync-cli-runtime-assets.ts && bun build ../../scripts/pushpals-cli.ts --target=bun --outfile ./dist/pushpals-cli.js",
+    "build": "bun run ../../scripts/sync-cli-runtime-assets.ts && bun run ../../scripts/sync-cli-monitor-ui.ts && bun build ../../scripts/pushpals-cli.ts --target=bun --outfile ./dist/pushpals-cli.js",
     "prepack": "bun run build"
   },
   "engines": {

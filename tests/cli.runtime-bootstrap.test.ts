@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import {
   buildOpenMonitoringHubCommand,
-  buildEmbeddedMonitoringHubHtml,
   buildEmbeddedRuntimeEnv,
   buildServiceStopCommand,
+  injectMonitoringHubBootstrap,
+  isCliExitCommand,
   normalizeChildProcessEnv,
   prepareCliRuntime,
   resolveCommandPath,
@@ -66,7 +67,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PUSHPALS_PROJECT_ROOT_OVERRIDE).toBe("/repo/example");
     expect(env.PUSHPALS_PROMPTS_ROOT_OVERRIDE).toBe("/repo/example");
     expect("PUSHPALS_CONFIG_DIR_OVERRIDE" in env).toBe(false);
-    expect(env.PUSHPALS_PROTOCOL_SCHEMAS_DIR).toBe(join("/runtime/pushpals", "protocol", "schemas"));
+    expect(env.PUSHPALS_PROTOCOL_SCHEMAS_DIR).toBe(
+      join("/runtime/pushpals", "protocol", "schemas"),
+    );
   });
 
   test("normalizeChildProcessEnv keeps Windows path and shell variables in both casings", () => {
@@ -124,52 +127,98 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(buildServiceStopCommand(undefined, "win32")).toBeNull();
   });
 
-  test("buildEmbeddedMonitoringHubHtml renders monitor shell with server/session bootstrap", () => {
-    const html = buildEmbeddedMonitoringHubHtml({
-      serverUrl: "http://localhost:3001",
-      localAgentUrl: "http://localhost:3003",
-      sessionId: "dev",
-    });
-
-    expect(html).toContain("PushPals CLI Monitor");
-    expect(html).toContain("Lightweight embedded monitor for CLI-managed runtimes.");
-    expect(html).toContain("http://localhost:3001");
-    expect(html).toContain("http://localhost:3003");
-    expect(html).toContain("\"sessionId\":\"dev\"");
-    expect(html).toContain("/api/status");
-    expect(html).toContain("/api/jobs");
+  test("isCliExitCommand treats bare exit aliases as local shutdown commands", () => {
+    expect(isCliExitCommand("/exit")).toBe(true);
+    expect(isCliExitCommand("/quit")).toBe(true);
+    expect(isCliExitCommand("exit")).toBe(true);
+    expect(isCliExitCommand(" Quit ")).toBe(true);
+    expect(isCliExitCommand("please exit this task")).toBe(false);
+    expect(isCliExitCommand("/status")).toBe(false);
   });
 
-  test("startEmbeddedMonitoringHub serves the monitor shell and health endpoint", async () => {
+  test("injectMonitoringHubBootstrap writes runtime config into exported client html", () => {
+    const html = injectMonitoringHubBootstrap(
+      '<html><head></head><body><div id="root"></div></body></html>',
+      {
+        serverUrl: "http://localhost:3001",
+        localAgentUrl: "http://localhost:3003",
+        sessionId: "dev",
+        authToken: "secret-token",
+      },
+    );
+
+    expect(html).toContain("__PUSHPALS_WEB_BOOTSTRAP__");
+    expect(html).toContain('"serverUrl":"http://localhost:3001"');
+    expect(html).toContain('"localAgentUrl":"http://localhost:3003"');
+    expect(html).toContain('"sessionId":"dev"');
+    expect(html).toContain('"authToken":"secret-token"');
+  });
+
+  test("startEmbeddedMonitoringHub returns null when packaged monitor assets are unavailable", async () => {
     const hub = await startEmbeddedMonitoringHub({
       serverUrl: "http://127.0.0.1:3001",
       localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
       authToken: null,
       preferredPort: 18981,
+      assetRoot: join(resolve(process.cwd(), "tmp-cli-monitor-missing"), "missing"),
     });
 
-    expect(hub).not.toBeNull();
-    if (!hub) return;
+    expect(hub).toBeNull();
+  });
+
+  test("startEmbeddedMonitoringHub serves the exported client monitor when packaged assets exist", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-monitor-ui-"));
+    const assetRoot = join(root, "monitor-ui");
+    mkdirSync(join(assetRoot, "_expo", "static", "js", "web"), { recursive: true });
+    writeFileSync(
+      join(assetRoot, "index.html"),
+      '<!doctype html><html><head><title>Client Hub</title></head><body><div id="root"></div><script src="/_expo/static/js/web/app.js" defer></script></body></html>',
+      "utf8",
+    );
+    writeFileSync(
+      join(assetRoot, "_expo", "static", "js", "web", "app.js"),
+      "globalThis.__TEST_MONITOR__ = true;\n",
+      "utf8",
+    );
+
+    const hub = await startEmbeddedMonitoringHub({
+      serverUrl: "http://127.0.0.1:3001",
+      localAgentUrl: "http://127.0.0.1:3003",
+      sessionId: "dev",
+      authToken: "test-token",
+      preferredPort: 18982,
+      assetRoot,
+    });
 
     try {
-      const [rootResponse, healthResponse] = await Promise.all([
+      expect(hub).not.toBeNull();
+      if (!hub) return;
+
+      const [rootResponse, assetResponse, routeResponse] = await Promise.all([
         fetch(`${hub.url}/`),
-        fetch(`${hub.url}/healthz`),
+        fetch(`${hub.url}/_expo/static/js/web/app.js`),
+        fetch(`${hub.url}/jobs/traces`),
       ]);
 
+      const rootHtml = await rootResponse.text();
       expect(rootResponse.ok).toBe(true);
-      expect(await rootResponse.text()).toContain("PushPals CLI Monitor");
-      expect(healthResponse.ok).toBe(true);
-      expect(await healthResponse.json()).toMatchObject({ ok: true, sessionId: "dev" });
+      expect(rootHtml).toContain("Client Hub");
+      expect(rootHtml).toContain("__PUSHPALS_WEB_BOOTSTRAP__");
+      expect(rootHtml).toContain('"authToken":"test-token"');
+      expect(assetResponse.ok).toBe(true);
+      expect(await assetResponse.text()).toContain("__TEST_MONITOR__");
+      expect(routeResponse.ok).toBe(true);
+      expect(await routeResponse.text()).toContain("Client Hub");
     } finally {
-      hub.stop();
+      hub?.stop();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
   test("startEmbeddedMonitoringHub falls back when the preferred port is occupied", async () => {
     const blocker = Bun.serve({
-      port: 0,
+      port: 18983,
       fetch: () => new Response("blocked"),
     });
     const blockedPort = Number(blocker.port);
@@ -186,8 +235,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(hub).not.toBeNull();
       if (!hub) return;
       expect(hub.port).not.toBe(blockedPort);
-      const healthResponse = await fetch(`${hub.url}/healthz`);
-      expect(healthResponse.ok).toBe(true);
     } finally {
       hub?.stop();
       blocker.stop(true);

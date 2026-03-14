@@ -1,7 +1,15 @@
 #!/usr/bin/env bun
 
-import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { dirname, join, resolve } from "path";
+import {
+  appendFileSync,
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "fs";
+import { dirname, extname, join, resolve } from "path";
 import { createInterface, type Interface } from "readline";
 import {
   evaluateClientRuntimePreflight,
@@ -85,6 +93,13 @@ type MonitoringHubHandle = {
   port: number;
   stop: () => void;
   embedded: boolean;
+};
+
+type MonitoringHubRuntimeBootstrap = {
+  serverUrl: string;
+  localAgentUrl: string;
+  sessionId: string;
+  authToken: string | null;
 };
 
 const DEFAULT_MONITOR_PORT = 8081;
@@ -218,7 +233,10 @@ function jsonHtmlBootstrap(value: unknown): string {
   return JSON.stringify(value).replace(/</g, "\\u003c");
 }
 
-async function runGit(args: string[], cwd: string): Promise<{
+async function runGit(
+  args: string[],
+  cwd: string,
+): Promise<{
   ok: boolean;
   stdout: string;
   stderr: string;
@@ -292,6 +310,68 @@ export function resolveBundledRuntimeAssetSource(): RuntimeAssetSource | null {
     if (isCompleteRuntimeAssetSource(candidate)) return candidate;
   }
   return null;
+}
+
+function looksLikeMonitoringHubBuild(root: string): boolean {
+  return existsSync(join(root, "index.html")) && existsSync(join(root, "_expo"));
+}
+
+export function resolveBundledMonitoringHubRoot(): string | null {
+  const candidates = [
+    resolve(import.meta.dir, "..", "monitor-ui"),
+    resolve(import.meta.dir, "..", "packages", "cli", "monitor-ui"),
+  ];
+
+  for (const candidate of candidates) {
+    if (looksLikeMonitoringHubBuild(candidate)) return candidate;
+  }
+  return null;
+}
+
+function resolveCliSourceCheckoutRoot(): string | null {
+  const candidates = [
+    resolve(import.meta.dir, ".."),
+    resolve(import.meta.dir, "..", ".."),
+    resolve(import.meta.dir, "..", "..", ".."),
+  ];
+
+  for (const candidate of candidates) {
+    if (
+      existsSync(join(candidate, "package.json")) &&
+      existsSync(join(candidate, "apps", "client", "app.json")) &&
+      existsSync(join(candidate, "scripts", "sync-cli-monitor-ui.ts"))
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function exportBundledMonitoringHubFromSourceCheckout(sourceRoot: string): void {
+  const exportScriptPath = join(sourceRoot, "scripts", "sync-cli-monitor-ui.ts");
+  console.log("[pushpals] Packaged monitor UI missing; exporting the shared client monitor...");
+  const proc = Bun.spawnSync([process.execPath, exportScriptPath], {
+    cwd: sourceRoot,
+    stdout: "inherit",
+    stderr: "inherit",
+    env: process.env,
+  });
+  if (proc.exitCode !== 0) {
+    throw new Error(
+      `Failed to export packaged monitor UI from source checkout (exit ${proc.exitCode || 1})`,
+    );
+  }
+}
+
+async function ensureBundledMonitoringHubRoot(): Promise<string | null> {
+  const existingRoot = resolveBundledMonitoringHubRoot();
+  if (existingRoot) return existingRoot;
+
+  const sourceRoot = resolveCliSourceCheckoutRoot();
+  if (!sourceRoot) return null;
+
+  exportBundledMonitoringHubFromSourceCheckout(sourceRoot);
+  return resolveBundledMonitoringHubRoot();
 }
 
 function repoLooksLikePushPalsSourceCheckout(repoRoot: string): boolean {
@@ -405,9 +485,15 @@ function seedRuntimePreflightAssets(runtimeRoot: string): void {
   writeTextFileIfMissing(join(runtimeRoot, ".env"), "# Local PushPals runtime environment\n");
   const localExamplePath = join(runtimeRoot, "configs", "local.example.toml");
   if (existsSync(localExamplePath)) {
-    writeTextFileIfMissing(join(runtimeRoot, "configs", "local.toml"), readFileSync(localExamplePath, "utf8"));
+    writeTextFileIfMissing(
+      join(runtimeRoot, "configs", "local.toml"),
+      readFileSync(localExamplePath, "utf8"),
+    );
   } else {
-    writeTextFileIfMissing(join(runtimeRoot, "configs", "local.toml"), "# Local PushPals runtime overrides\n");
+    writeTextFileIfMissing(
+      join(runtimeRoot, "configs", "local.toml"),
+      "# Local PushPals runtime overrides\n",
+    );
   }
 }
 
@@ -449,7 +535,12 @@ async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: stri
     const rawUrl = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${encodeURIComponent(tag)}/${pathValue}`;
     const body = await fetchTextFromUrl(rawUrl, 20_000);
     const outPath = pathValue.startsWith("packages/protocol/src/schemas/")
-      ? join(runtimeRoot, "protocol", "schemas", pathValue.slice("packages/protocol/src/schemas/".length))
+      ? join(
+          runtimeRoot,
+          "protocol",
+          "schemas",
+          pathValue.slice("packages/protocol/src/schemas/".length),
+        )
       : join(runtimeRoot, pathValue);
     mkdirSync(dirname(outPath), { recursive: true });
     writeFileSync(outPath, body, "utf8");
@@ -489,9 +580,15 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
   writeTextFileIfMissing(join(runtimeRoot, ".env"), "# Local PushPals runtime environment\n");
   const localExamplePath = join(runtimeRoot, "configs", "local.example.toml");
   if (existsSync(localExamplePath)) {
-    writeTextFileIfMissing(join(runtimeRoot, "configs", "local.toml"), readFileSync(localExamplePath, "utf8"));
+    writeTextFileIfMissing(
+      join(runtimeRoot, "configs", "local.toml"),
+      readFileSync(localExamplePath, "utf8"),
+    );
   } else {
-    writeTextFileIfMissing(join(runtimeRoot, "configs", "local.toml"), "# Local PushPals runtime overrides\n");
+    writeTextFileIfMissing(
+      join(runtimeRoot, "configs", "local.toml"),
+      "# Local PushPals runtime overrides\n",
+    );
   }
 }
 
@@ -583,8 +680,9 @@ export function normalizeChildProcessEnv(
   }
 
   if (platform === "win32") {
-    const resolvedPath =
-      String(env.Path ?? env.PATH ?? process.env.Path ?? process.env.PATH ?? "").trim();
+    const resolvedPath = String(
+      env.Path ?? env.PATH ?? process.env.Path ?? process.env.PATH ?? "",
+    ).trim();
     if (resolvedPath) {
       env.Path = resolvedPath;
       env.PATH = resolvedPath;
@@ -631,10 +729,7 @@ export async function resolveCommandPath(
         stdout: "pipe",
         stderr: "ignore",
       });
-      const [stdout, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        proc.exited,
-      ]);
+      const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
       if (exitCode !== 0) continue;
       const resolved = stdout
         .split(/\r?\n/)
@@ -675,7 +770,10 @@ async function downloadBinaryAsset(tag: string, assetName: string, outPath: stri
   await Bun.write(outPath, bytes);
 }
 
-async function ensureRuntimeBinaries(runtimeRoot: string, runtimeTag: string): Promise<RuntimeBinarySet> {
+async function ensureRuntimeBinaries(
+  runtimeRoot: string,
+  runtimeTag: string,
+): Promise<RuntimeBinarySet> {
   const platformKey = resolveRuntimePlatformKey();
   const binDir = join(runtimeRoot, "bin", `${runtimeTag}-${platformKey}`);
   mkdirSync(binDir, { recursive: true });
@@ -851,7 +949,11 @@ async function probeServer(serverUrl: string): Promise<boolean> {
 async function probeSourceControlManager(port: number): Promise<boolean> {
   if (!Number.isFinite(port) || port <= 0) return false;
   try {
-    const response = await fetchWithTimeout(`http://127.0.0.1:${Math.floor(port)}/health`, {}, HTTP_TIMEOUT_MS);
+    const response = await fetchWithTimeout(
+      `http://127.0.0.1:${Math.floor(port)}/health`,
+      {},
+      HTTP_TIMEOUT_MS,
+    );
     return response.ok;
   } catch {
     return false;
@@ -917,7 +1019,9 @@ async function autoStartRuntimeServices(opts: {
   const runtimeTag =
     opts.preparedRuntime.runtimeTag || (await resolveRuntimeReleaseTag(opts.requestedRuntimeTag));
 
-  console.log(`[pushpals] LocalBuddy unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`);
+  console.log(
+    `[pushpals] LocalBuddy unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`,
+  );
   console.log(`[pushpals] runtimeRoot=${runtimeRoot}`);
   console.log(`[pushpals] runtimeTag=${runtimeTag}`);
   if (!runtimePreflight.ok) {
@@ -1021,7 +1125,9 @@ async function autoStartRuntimeServices(opts: {
   const gitAvailableForScm = await canSpawnCommand(gitProbeCommand, opts.repoRoot, runtimeEnv);
   if (!scmHealthy && scmRemoteAvailable) {
     if (!gitAvailableForScm) {
-      console.warn("[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.");
+      console.warn(
+        "[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.",
+      );
     } else {
       if (runtimeEnv.PUSHPALS_GIT_BIN) {
         console.log(`[pushpals] Embedded SourceControlManager git=${runtimeEnv.PUSHPALS_GIT_BIN}`);
@@ -1042,7 +1148,9 @@ async function autoStartRuntimeServices(opts: {
       `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
     );
   } else if (!gitAvailableForScm) {
-    console.warn("[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.");
+    console.warn(
+      "[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.",
+    );
   } else {
     console.log("[pushpals] SourceControlManager already healthy; skipping embedded start.");
   }
@@ -1157,6 +1265,110 @@ async function looksLikeMonitoringHub(url: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function buildMonitoringHubRuntimeBootstrap(opts: {
+  serverUrl: string;
+  localAgentUrl: string;
+  sessionId: string;
+  authToken: string | null;
+}): MonitoringHubRuntimeBootstrap {
+  return {
+    serverUrl: opts.serverUrl,
+    localAgentUrl: opts.localAgentUrl,
+    sessionId: opts.sessionId,
+    authToken: opts.authToken,
+  };
+}
+
+export function injectMonitoringHubBootstrap(
+  html: string,
+  bootstrap: MonitoringHubRuntimeBootstrap,
+): string {
+  const payload = jsonHtmlBootstrap(bootstrap);
+  const script = `<script>globalThis.__PUSHPALS_WEB_BOOTSTRAP__=${payload};</script>`;
+  if (html.includes("</head>")) {
+    return html.replace("</head>", `${script}</head>`);
+  }
+  return `${script}${html}`;
+}
+
+function monitoringHubContentType(pathValue: string): string {
+  switch (extname(pathValue).toLowerCase()) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+      return "application/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".ico":
+      return "image/x-icon";
+    case ".woff2":
+      return "font/woff2";
+    case ".ttf":
+      return "font/ttf";
+    case ".map":
+      return "application/json; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function resolveMonitoringHubAssetPath(assetRoot: string, pathname: string): string | null {
+  const root = resolve(assetRoot);
+  const rootPrefix = `${root}${root.endsWith("\\") || root.endsWith("/") ? "" : process.platform === "win32" ? "\\" : "/"}`;
+  const decodedPath = decodeURIComponent(pathname);
+  const trimmedPath = decodedPath === "/" ? "/index.html" : decodedPath;
+  const relativePath = trimmedPath.replace(/^\/+/, "");
+  const candidatePath = resolve(root, relativePath);
+  if (candidatePath !== root && !candidatePath.startsWith(rootPrefix)) return null;
+  if (existsSync(candidatePath)) return candidatePath;
+
+  if (!extname(relativePath)) {
+    const nestedIndexPath = resolve(root, relativePath, "index.html");
+    if (
+      (nestedIndexPath === root || nestedIndexPath.startsWith(rootPrefix)) &&
+      existsSync(nestedIndexPath)
+    ) {
+      return nestedIndexPath;
+    }
+    return join(root, "index.html");
+  }
+
+  return null;
+}
+
+async function serveBundledMonitoringHub(
+  assetRoot: string,
+  pathname: string,
+  bootstrap: MonitoringHubRuntimeBootstrap,
+): Promise<Response | null> {
+  const assetPath = resolveMonitoringHubAssetPath(assetRoot, pathname);
+  if (!assetPath || !existsSync(assetPath)) return null;
+  if (assetPath.endsWith("index.html")) {
+    const html = injectMonitoringHubBootstrap(readFileSync(assetPath, "utf8"), bootstrap);
+    return new Response(html, {
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    });
+  }
+  return new Response(Bun.file(assetPath), {
+    headers: {
+      "content-type": monitoringHubContentType(assetPath),
+      "cache-control": "no-store",
+    },
+  });
 }
 
 export function buildEmbeddedMonitoringHubHtml(opts: {
@@ -1304,11 +1516,7 @@ async function proxyMonitoringHubRequest(
   pathValue: string,
 ): Promise<Response> {
   const target = `${serverUrl}${pathValue}`;
-  const upstream = await fetchWithTimeout(
-    target,
-    { headers: authHeaders(authToken) },
-    10_000,
-  );
+  const upstream = await fetchWithTimeout(target, { headers: authHeaders(authToken) }, 10_000);
   const body = await upstream.text();
   return new Response(body, {
     status: upstream.status,
@@ -1325,11 +1533,21 @@ export async function startEmbeddedMonitoringHub(opts: {
   sessionId: string;
   authToken: string | null;
   preferredPort: number;
+  assetRoot?: string | null;
 }): Promise<MonitoringHubHandle | null> {
-  const html = buildEmbeddedMonitoringHubHtml({
+  const monitoringHubAssetRoot =
+    opts.assetRoot === undefined ? await ensureBundledMonitoringHubRoot() : opts.assetRoot;
+  if (!monitoringHubAssetRoot || !looksLikeMonitoringHubBuild(monitoringHubAssetRoot)) {
+    console.error(
+      "[pushpals] Unified monitoring hub assets are unavailable; build or export the packaged client monitor first.",
+    );
+    return null;
+  }
+  const bootstrap = buildMonitoringHubRuntimeBootstrap({
     serverUrl: opts.serverUrl,
     localAgentUrl: opts.localAgentUrl,
     sessionId: opts.sessionId,
+    authToken: opts.authToken,
   });
 
   const candidatePorts = Array.from(
@@ -1344,25 +1562,34 @@ export async function startEmbeddedMonitoringHub(opts: {
         idleTimeout: 30,
         fetch: async (req) => {
           const url = new URL(req.url);
-          if (url.pathname === "/") {
-            return new Response(html, {
-              headers: {
-                "content-type": "text/html; charset=utf-8",
-                "cache-control": "no-store",
-              },
+          if (url.pathname === "/healthz") {
+            return Response.json({
+              ok: true,
+              port,
+              serverUrl: opts.serverUrl,
+              sessionId: opts.sessionId,
             });
           }
-          if (url.pathname === "/healthz") {
-            return Response.json({ ok: true, port, serverUrl: opts.serverUrl, sessionId: opts.sessionId });
-          }
           if (url.pathname === "/api/status") {
-            return await proxyMonitoringHubRequest(opts.serverUrl, opts.authToken, "/system/status");
+            return await proxyMonitoringHubRequest(
+              opts.serverUrl,
+              opts.authToken,
+              "/system/status",
+            );
           }
           if (url.pathname === "/api/requests") {
-            return await proxyMonitoringHubRequest(opts.serverUrl, opts.authToken, "/requests?status=all&limit=20");
+            return await proxyMonitoringHubRequest(
+              opts.serverUrl,
+              opts.authToken,
+              "/requests?status=all&limit=20",
+            );
           }
           if (url.pathname === "/api/jobs") {
-            return await proxyMonitoringHubRequest(opts.serverUrl, opts.authToken, "/jobs?status=all&limit=20");
+            return await proxyMonitoringHubRequest(
+              opts.serverUrl,
+              opts.authToken,
+              "/jobs?status=all&limit=20",
+            );
           }
           if (url.pathname === "/api/completions") {
             return await proxyMonitoringHubRequest(
@@ -1371,6 +1598,12 @@ export async function startEmbeddedMonitoringHub(opts: {
               "/completions?status=all&limit=20",
             );
           }
+          const bundledResponse = await serveBundledMonitoringHub(
+            monitoringHubAssetRoot,
+            url.pathname,
+            bootstrap,
+          );
+          if (bundledResponse) return bundledResponse;
           return new Response("Not found", { status: 404 });
         },
       });
@@ -1472,7 +1705,9 @@ async function sendMessageToLocalBuddy(localAgentUrl: string, text: string): Pro
           message?: string;
           data?: Record<string, unknown>;
         };
-        const type = String(payload.type ?? "").trim().toLowerCase();
+        const type = String(payload.type ?? "")
+          .trim()
+          .toLowerCase();
         const message = String(payload.message ?? "").trim();
         if (type === "status" && message) {
           console.log(`[localbuddy] ${message}`);
@@ -1500,7 +1735,9 @@ async function sendMessageToLocalBuddy(localAgentUrl: string, text: string): Pro
   return ok && complete;
 }
 
-function formatSessionEventLine(event: NonNullable<SessionStreamPayload["envelope"]>): string | null {
+function formatSessionEventLine(
+  event: NonNullable<SessionStreamPayload["envelope"]>,
+): string | null {
   const type = String(event.type ?? "").toLowerCase();
   const from = String(event.from ?? "");
   const payload = event.payload ?? {};
@@ -1619,10 +1856,7 @@ async function runSessionStream(
   }
 }
 
-export function buildOpenMonitoringHubCommand(
-  url: string,
-  platform = process.platform,
-): string[] {
+export function buildOpenMonitoringHubCommand(url: string, platform = process.platform): string[] {
   if (platform === "win32") {
     return ["cmd", "/c", "start", "", url];
   }
@@ -1641,6 +1875,11 @@ async function openMonitoringHub(url: string): Promise<boolean> {
   });
   const code = await proc.exited;
   return code === 0;
+}
+
+export function isCliExitCommand(text: string): boolean {
+  const normalized = String(text ?? "").trim().toLowerCase();
+  return normalized === "/exit" || normalized === "/quit" || normalized === "exit" || normalized === "quit";
 }
 
 async function main(): Promise<void> {
@@ -1677,12 +1916,17 @@ async function main(): Promise<void> {
   }
 
   const config = preparedRuntime.runtimePreflight.config;
-  const serverUrl = normalizeUrl(parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL, config.server.url);
+  const serverUrl = normalizeUrl(
+    parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL,
+    config.server.url,
+  );
   const localAgentUrl = normalizeUrl(
     parsed.localAgentUrl ?? process.env.EXPO_PUBLIC_LOCAL_AGENT_URL,
     config.client.localAgentUrl,
   );
-  const sessionId = String(parsed.sessionId ?? process.env.PUSHPALS_SESSION_ID ?? config.sessionId).trim();
+  const sessionId = String(
+    parsed.sessionId ?? process.env.PUSHPALS_SESSION_ID ?? config.sessionId,
+  ).trim();
   const authToken = config.authToken;
   let autoStartedServices: RuntimeServiceProcess[] = [];
   const stopAutoStartedServices = (): void => {
@@ -1739,7 +1983,9 @@ async function main(): Promise<void> {
   }
 
   const localBuddySessionId =
-    health.sessionId && String(health.sessionId).trim() ? String(health.sessionId).trim() : sessionId;
+    health.sessionId && String(health.sessionId).trim()
+      ? String(health.sessionId).trim()
+      : sessionId;
   if (sessionId && sessionId !== localBuddySessionId) {
     console.warn(
       `[pushpals] Requested sessionId=${sessionId}, but LocalBuddy is currently attached to sessionId=${localBuddySessionId}.`,
@@ -1749,10 +1995,7 @@ async function main(): Promise<void> {
   const statePath = resolve(repoRoot, ".git", "pushpals-cli-state.json");
   const saved = readCliState(statePath);
   const preferredHubUrl = normalizeUrl(
-    parsed.monitoringHubUrl ??
-      process.env.PUSHPALS_MONITOR_URL ??
-      saved.monitoringHubUrl ??
-      "",
+    parsed.monitoringHubUrl ?? process.env.PUSHPALS_MONITOR_URL ?? saved.monitoringHubUrl ?? "",
   );
   const monitorPort = parsePositiveInt(process.env.PUSHPALS_CLIENT_PORT, DEFAULT_MONITOR_PORT);
   const monitoringHub = await resolveMonitoringHub({
@@ -1787,7 +2030,7 @@ async function main(): Promise<void> {
   console.log(`sessionId=${localBuddySessionId}`);
   console.log(`repoRoot=${repoRoot}`);
   console.log(`cliStateFile=${statePath}`);
-  console.log("[pushpals] Type a message and press Enter. Use /exit to quit.");
+  console.log("[pushpals] Type a message and press Enter. Use /exit or exit to quit.");
 
   const streamAbort = new AbortController();
   let rl: Interface | null = null;
@@ -1816,12 +2059,16 @@ async function main(): Promise<void> {
   const requestStop = (): void => {
     if (shuttingDown) return;
     shuttingDown = true;
+    console.log("[pushpals] Shutting down CLI session...");
     streamAbort.abort();
     if (rl) rl.close();
     try {
       monitoringHub?.stop();
     } catch {
       // ignore
+    }
+    if (autoStartedServices.length > 0) {
+      console.log("[pushpals] Stopping embedded runtime services...");
     }
     stopAutoStartedServices();
   };
@@ -1844,12 +2091,14 @@ async function main(): Promise<void> {
       rl.prompt();
       continue;
     }
-    if (text === "/exit" || text === "/quit") {
+    if (isCliExitCommand(text)) {
       requestStop();
       break;
     }
     if (text === "/hub") {
-      console.log(monitoringHubUrl ? `monitoringHubUrl=${monitoringHubUrl}` : "monitoringHubUrl=unavailable");
+      console.log(
+        monitoringHubUrl ? `monitoringHubUrl=${monitoringHubUrl}` : "monitoringHubUrl=unavailable",
+      );
       rl.prompt();
       continue;
     }
@@ -1858,7 +2107,9 @@ async function main(): Promise<void> {
       console.log(`localAgentUrl=${localAgentUrl}`);
       console.log(`sessionId=${localBuddySessionId}`);
       console.log(`repoRoot=${repoRoot}`);
-      console.log(monitoringHubUrl ? `monitoringHubUrl=${monitoringHubUrl}` : "monitoringHubUrl=unavailable");
+      console.log(
+        monitoringHubUrl ? `monitoringHubUrl=${monitoringHubUrl}` : "monitoringHubUrl=unavailable",
+      );
       rl.prompt();
       continue;
     }

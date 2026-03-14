@@ -14,10 +14,6 @@ import { getItem, setItem } from "./storage";
 
 // Metro compile-time replaces EXPO_PUBLIC_* — falls back to "dev" so all apps
 // share the same session out of the box with zero config.
-const DEFAULT_SESSION_ID = process.env.EXPO_PUBLIC_PUSHPALS_SESSION_ID ?? "dev";
-
-// LocalBuddy URL for sending messages (new architecture)
-const LOCAL_AGENT_URL = process.env.EXPO_PUBLIC_LOCAL_AGENT_URL ?? "http://localhost:3003";
 
 // ─── Re-export reducer types for consumers ──────────────────────────────────
 export type { Task, Job, LogLine, ChatMessage, SessionState };
@@ -70,6 +66,13 @@ export interface PushPalsSessionActions {
   state: SessionState;
 }
 
+export interface PushPalsSessionOptions {
+  baseUrl?: string;
+  localAgentUrl?: string;
+  sessionId?: string;
+  authToken?: string | null;
+}
+
 // ─── Cursor persistence helpers (web: localStorage, native: AsyncStorage) ───
 async function loadCursor(sessionId: string): Promise<number> {
   const raw = await getItem(`pushpals:cursor:${sessionId}`);
@@ -82,8 +85,17 @@ async function loadCursor(sessionId: string): Promise<number> {
  * last cursor so reconnections replay only new events.
  */
 export function usePushPalsSession(
-  baseUrl: string = "http://localhost:3001",
+  options: string | PushPalsSessionOptions = "http://localhost:3001",
 ): PushPalsSessionActions {
+  const normalizedOptions = typeof options === "string" ? { baseUrl: options } : (options ?? {});
+  const baseUrl = String(normalizedOptions.baseUrl ?? "http://localhost:3001")
+    .trim()
+    .replace(/\/+$/, "");
+  const localAgentUrl = String(normalizedOptions.localAgentUrl ?? "http://localhost:3003")
+    .trim()
+    .replace(/\/+$/, "");
+  const defaultSessionId = String(normalizedOptions.sessionId ?? "dev").trim() || "dev";
+  const authToken = String(normalizedOptions.authToken ?? "").trim() || undefined;
   const [session, setSession] = useState<PushPalsSession>({
     sessionId: null,
     events: [],
@@ -103,7 +115,7 @@ export function usePushPalsSession(
   useEffect(() => {
     const init = async () => {
       try {
-        const session = await createSession(baseUrl, DEFAULT_SESSION_ID);
+        const session = await createSession(baseUrl, defaultSessionId, authToken);
         if (!session) {
           setSession((s) => ({
             ...s,
@@ -147,6 +159,7 @@ export function usePushPalsSession(
           },
           undefined, // transport
           afterCursor,
+          authToken,
         );
 
         unsubscribeRef.current = unsubscribe;
@@ -165,31 +178,31 @@ export function usePushPalsSession(
         unsubscribeRef.current();
       }
     };
-  }, [baseUrl]);
+  }, [authToken, baseUrl, defaultSessionId]);
 
   // ─── Send message via LocalBuddy ──────────────────────────────
   // Note: Messages now go to LocalBuddy (not directly to server)
   const send = useCallback(
     async (text: string) => {
       if (!session.sessionId) return false;
-      return sendMessage(LOCAL_AGENT_URL, text);
+      return sendMessage(localAgentUrl, text);
     },
-    [session.sessionId],
+    [localAgentUrl, session.sessionId],
   );
 
   // ─── Approve / Deny ────────────────────────────────────────────────────
   const approve = useCallback(
     async (approvalId: string) => {
-      return submitApprovalDecision(baseUrl, approvalId, "approve");
+      return submitApprovalDecision(baseUrl, approvalId, "approve", authToken);
     },
-    [baseUrl],
+    [authToken, baseUrl],
   );
 
   const deny = useCallback(
     async (approvalId: string) => {
-      return submitApprovalDecision(baseUrl, approvalId, "deny");
+      return submitApprovalDecision(baseUrl, approvalId, "deny", authToken);
     },
-    [baseUrl],
+    [authToken, baseUrl],
   );
 
   // ─── Computed: unique agent names ──────────────────────────────────────

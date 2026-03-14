@@ -6,6 +6,39 @@ type TransportType = "auto" | "sse" | "ws";
 /** Extended callback that also receives the server cursor for each event */
 export type CursorEventCallback = (event: EventEnvelope, cursor: number) => void;
 
+function buildSessionTransportQuery(afterCursor = 0, authToken?: string): string {
+  const params = new URLSearchParams();
+  if (afterCursor > 0) {
+    params.set("after", String(afterCursor));
+  }
+  const token = String(authToken ?? "").trim();
+  if (token) {
+    params.set("authToken", token);
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+export function buildSessionEventsUrl(
+  baseUrl: string,
+  sessionId: string,
+  afterCursor: number = 0,
+  authToken?: string,
+): string {
+  return `${baseUrl}/sessions/${encodeURIComponent(sessionId)}/events${buildSessionTransportQuery(afterCursor, authToken)}`;
+}
+
+export function buildSessionWebSocketUrl(
+  baseUrl: string,
+  sessionId: string,
+  afterCursor: number = 0,
+  authToken?: string,
+): string {
+  const protocol = baseUrl.startsWith("https") ? "wss" : "ws";
+  const host = baseUrl.replace(/^https?:\/\//, "");
+  return `${protocol}://${host}/sessions/${encodeURIComponent(sessionId)}/ws${buildSessionTransportQuery(afterCursor, authToken)}`;
+}
+
 function randomEventId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
@@ -51,6 +84,7 @@ function subscribeSSE(
   sessionId: string,
   onEvent: CursorEventCallback,
   afterCursor: number = 0,
+  authToken?: string,
 ): () => void {
   let disposed = false;
   let es: EventSource | null = null;
@@ -59,8 +93,7 @@ function subscribeSSE(
 
   function connect() {
     if (disposed) return;
-    const afterParam = latestCursor > 0 ? `?after=${latestCursor}` : "";
-    es = new EventSource(`${baseUrl}/sessions/${sessionId}/events${afterParam}`);
+    es = new EventSource(buildSessionEventsUrl(baseUrl, sessionId, latestCursor, authToken));
 
     es.addEventListener("message", (event) => {
       try {
@@ -119,6 +152,7 @@ function subscribeWebSocket(
   sessionId: string,
   onEvent: CursorEventCallback,
   afterCursor: number = 0,
+  authToken?: string,
 ): () => void {
   let disposed = false;
   let ws: WebSocket | null = null;
@@ -127,12 +161,7 @@ function subscribeWebSocket(
 
   function connect() {
     if (disposed) return;
-    const protocol = baseUrl.startsWith("https") ? "wss" : "ws";
-    const host = baseUrl.replace(/^https?:\/\//, "");
-    const afterParam = latestCursor > 0 ? `?after=${latestCursor}` : "";
-    const wsUrl = `${protocol}://${host}/sessions/${sessionId}/ws${afterParam}`;
-
-    ws = new WebSocket(wsUrl);
+    ws = new WebSocket(buildSessionWebSocketUrl(baseUrl, sessionId, latestCursor, authToken));
 
     ws.onmessage = (event) => {
       try {
@@ -203,6 +232,7 @@ export function subscribeEvents(
   onEvent: CursorEventCallback,
   transport: TransportType = "auto",
   afterCursor: number = 0,
+  authToken?: string,
 ): () => void {
   const selectedTransport = selectTransport(transport);
 
@@ -211,9 +241,9 @@ export function subscribeEvents(
   );
 
   if (selectedTransport === "sse") {
-    return subscribeSSE(baseUrl, sessionId, onEvent, afterCursor);
+    return subscribeSSE(baseUrl, sessionId, onEvent, afterCursor, authToken);
   } else {
-    return subscribeWebSocket(baseUrl, sessionId, onEvent, afterCursor);
+    return subscribeWebSocket(baseUrl, sessionId, onEvent, afterCursor, authToken);
   }
 }
 
@@ -223,11 +253,12 @@ export function subscribeEvents(
 export async function createSession(
   baseUrl: string,
   sessionId?: string,
+  authToken?: string,
 ): Promise<{ sessionId: string; created: boolean } | null> {
   try {
     const response = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(authToken) },
       body: JSON.stringify(sessionId ? { sessionId } : {}),
     });
 
@@ -320,11 +351,12 @@ export async function submitApprovalDecision(
   baseUrl: string,
   approvalId: string,
   decision: "approve" | "deny",
+  authToken?: string,
 ): Promise<boolean> {
   try {
     const response = await fetch(`${baseUrl}/approvals/${approvalId}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(authToken) },
       body: JSON.stringify({ decision }),
     });
 
@@ -828,14 +860,15 @@ export async function fetchAutonomyInsights(
           id: String(scorecardRaw.id ?? ""),
           windowHours: Number(scorecardRaw.windowHours ?? 0),
           sampleCount: Number(scorecardRaw.sampleCount ?? 0),
-          successRate:
-            Number.isFinite(Number(scorecardRaw.successRate)) ? Number(scorecardRaw.successRate) : null,
-          regretRate:
-            Number.isFinite(Number(scorecardRaw.regretRate)) ? Number(scorecardRaw.regretRate) : null,
-          avgLatencyMs:
-            Number.isFinite(Number(scorecardRaw.avgLatencyMs))
-              ? Number(scorecardRaw.avgLatencyMs)
-              : null,
+          successRate: Number.isFinite(Number(scorecardRaw.successRate))
+            ? Number(scorecardRaw.successRate)
+            : null,
+          regretRate: Number.isFinite(Number(scorecardRaw.regretRate))
+            ? Number(scorecardRaw.regretRate)
+            : null,
+          avgLatencyMs: Number.isFinite(Number(scorecardRaw.avgLatencyMs))
+            ? Number(scorecardRaw.avgLatencyMs)
+            : null,
           dispatchCount: Number(scorecardRaw.dispatchCount ?? 0),
           recommendation:
             String(scorecardRaw.recommendation ?? "").toLowerCase() === "pause"
@@ -846,7 +879,8 @@ export async function fetchAutonomyInsights(
           createdAt: String(scorecardRaw.createdAt ?? ""),
         }
       : null;
-    const opsRaw = payload.opsSummary && typeof payload.opsSummary === "object" ? payload.opsSummary : null;
+    const opsRaw =
+      payload.opsSummary && typeof payload.opsSummary === "object" ? payload.opsSummary : null;
     const opsSummary: AutonomyOpsSummary | null = opsRaw
       ? {
           safetyState: {
@@ -854,16 +888,21 @@ export async function fetchAutonomyInsights(
               (opsRaw.safetyState as Record<string, unknown> | undefined)?.killSwitchEnabled,
             ),
             freezeUntil:
-              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.freezeUntil === "string"
+              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.freezeUntil ===
+              "string"
                 ? String((opsRaw.safetyState as Record<string, unknown>).freezeUntil)
                 : null,
             freezeReason:
-              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.freezeReason === "string"
+              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.freezeReason ===
+              "string"
                 ? String((opsRaw.safetyState as Record<string, unknown>).freezeReason)
                 : null,
-            isFrozen: Boolean((opsRaw.safetyState as Record<string, unknown> | undefined)?.isFrozen),
+            isFrozen: Boolean(
+              (opsRaw.safetyState as Record<string, unknown> | undefined)?.isFrozen,
+            ),
             updatedAt:
-              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.updatedAt === "string"
+              typeof (opsRaw.safetyState as Record<string, unknown> | undefined)?.updatedAt ===
+              "string"
                 ? String((opsRaw.safetyState as Record<string, unknown>).updatedAt)
                 : null,
           },

@@ -150,6 +150,8 @@ tmp_*.mjs
 
 # Ignore compiled protocol runtime artifacts
 packages/protocol/dist/
+packages/cli/monitor-ui/
+tmp-cli-monitor-export/
 
 # api keys
 .env

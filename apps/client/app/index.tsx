@@ -30,6 +30,7 @@ import { SegmentedTabs } from "../src/components/SegmentedTabs";
 import { SystemPane } from "../src/components/SystemPane";
 import { ConfigPane } from "../src/components/ConfigPane";
 import { usePushPalsSession } from "../src/lib/usePushPalsSession";
+import { resolvePushPalsWebRuntimeConfig } from "../src/lib/runtimeBootstrap";
 import {
   type AutonomyInsightsSummary,
   type AutonomyQuestionRow,
@@ -54,9 +55,8 @@ import {
   updateAutonomySafety,
 } from "../src/lib/pushpalsApi";
 
-const DEFAULT_BASE = process.env.EXPO_PUBLIC_PUSHPALS_URL ?? "http://localhost:3001";
-const AUTH_TOKEN = process.env.EXPO_PUBLIC_PUSHPALS_AUTH_TOKEN;
 const POLL_INTERVAL_MS = 4000;
+const RUNTIME_CONFIG = resolvePushPalsWebRuntimeConfig();
 
 type UiTab = "coordination" | "chat" | "requests" | "jobs" | "system" | "config";
 
@@ -131,7 +131,12 @@ function createTheme(mode: ResolvedMode): DashboardTheme {
 }
 
 export default function DashboardScreen() {
-  const session = usePushPalsSession(DEFAULT_BASE);
+  const session = usePushPalsSession({
+    baseUrl: RUNTIME_CONFIG.serverUrl,
+    localAgentUrl: RUNTIME_CONFIG.localAgentUrl,
+    sessionId: RUNTIME_CONFIG.sessionId,
+    authToken: RUNTIME_CONFIG.authToken,
+  });
   const colorScheme = useColorScheme();
   const { width } = useWindowDimensions();
 
@@ -199,19 +204,26 @@ export default function DashboardScreen() {
     }).start();
   }, [activeTab, tabAnim]);
   const refreshObservability = useCallback(async () => {
-    const [workersData, requestData, jobData, completionData, systemData, autonomyData, autonomyQuestionData] =
-      await Promise.all([
-        fetchWorkers(DEFAULT_BASE, AUTH_TOKEN),
-        fetchRequestsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
-        fetchJobsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
-        fetchCompletionsSnapshot(DEFAULT_BASE, AUTH_TOKEN),
-        fetchSystemStatus(DEFAULT_BASE, AUTH_TOKEN),
-        fetchAutonomyInsights(DEFAULT_BASE, AUTH_TOKEN, 80),
-        fetchAutonomyQuestions(DEFAULT_BASE, AUTH_TOKEN, {
-          ...(session.sessionId ? { sessionId: session.sessionId } : {}),
-          limit: 120,
-        }),
-      ]);
+    const [
+      workersData,
+      requestData,
+      jobData,
+      completionData,
+      systemData,
+      autonomyData,
+      autonomyQuestionData,
+    ] = await Promise.all([
+      fetchWorkers(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
+      fetchRequestsSnapshot(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
+      fetchJobsSnapshot(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
+      fetchCompletionsSnapshot(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
+      fetchSystemStatus(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
+      fetchAutonomyInsights(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken, 80),
+      fetchAutonomyQuestions(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken, {
+        ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+        limit: 120,
+      }),
+    ]);
 
     setWorkers(workersData);
     setRequests(requestData.requests);
@@ -241,7 +253,10 @@ export default function DashboardScreen() {
     ): Promise<AnswerAutonomyQuestionResult> => {
       const text = String(rawAnswerText ?? "").trim();
       if (!text) {
-        const result: AnswerAutonomyQuestionResult = { ok: false, reason: "Answer cannot be empty." };
+        const result: AnswerAutonomyQuestionResult = {
+          ok: false,
+          reason: "Answer cannot be empty.",
+        };
         setAutonomyAnswerResults((prev) => ({ ...prev, [question.id]: result }));
         return result;
       }
@@ -256,10 +271,10 @@ export default function DashboardScreen() {
       setAutonomyAnswerInFlight((prev) => ({ ...prev, [question.id]: true }));
       try {
         const result = await answerAutonomyQuestion(
-          DEFAULT_BASE,
+          RUNTIME_CONFIG.serverUrl,
           question.id,
           answer,
-          AUTH_TOKEN,
+          RUNTIME_CONFIG.authToken,
           question.sessionId || session.sessionId || undefined,
         );
         setAutonomyAnswerResults((prev) => ({ ...prev, [question.id]: result }));
@@ -283,10 +298,10 @@ export default function DashboardScreen() {
       setAutonomyActionInFlight((prev) => ({ ...prev, [question.id]: true }));
       try {
         const result = await actOnAutonomyQuestion(
-          DEFAULT_BASE,
+          RUNTIME_CONFIG.serverUrl,
           question.id,
           action,
-          AUTH_TOKEN,
+          RUNTIME_CONFIG.authToken,
           note,
           question.sessionId || session.sessionId || undefined,
         );
@@ -310,7 +325,11 @@ export default function DashboardScreen() {
     }) => {
       setAutonomySafetyInFlight(true);
       try {
-        const result = await updateAutonomySafety(DEFAULT_BASE, update, AUTH_TOKEN);
+        const result = await updateAutonomySafety(
+          RUNTIME_CONFIG.serverUrl,
+          update,
+          RUNTIME_CONFIG.authToken,
+        );
         if (result.ok) await refreshObservability();
         return result;
       } finally {
@@ -576,7 +595,9 @@ export default function DashboardScreen() {
                   { backgroundColor: `${theme.danger}22`, borderColor: `${theme.danger}55` },
                 ]}
               >
-                <Text style={[styles.bannerText, { color: theme.danger, fontFamily: theme.fontSans }]}>
+                <Text
+                  style={[styles.bannerText, { color: theme.danger, fontFamily: theme.fontSans }]}
+                >
                   {session.error}
                 </Text>
               </View>
@@ -681,7 +702,11 @@ export default function DashboardScreen() {
                 />
               ) : null}
               {activeTab === "config" ? (
-                <ConfigPane baseUrl={DEFAULT_BASE} authToken={AUTH_TOKEN} theme={theme} />
+                <ConfigPane
+                  baseUrl={RUNTIME_CONFIG.serverUrl}
+                  authToken={RUNTIME_CONFIG.authToken}
+                  theme={theme}
+                />
               ) : null}
             </Animated.View>
           </Animated.View>

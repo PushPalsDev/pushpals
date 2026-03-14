@@ -20,6 +20,7 @@ import {
   getRuntimeConfigFiles,
   type RuntimeConfigMutation,
 } from "./runtime_config.js";
+import { resolveRequestAuthHeader } from "./request_auth.js";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
 const STARTUP_CONFIG = loadPushPalsConfig();
@@ -351,8 +352,14 @@ export function createRequestHandler() {
       }
 
       // ── Auth helper ──────────────────────────────────────────────────────
+      const requestAuthHeader = (): string | null =>
+        resolveRequestAuthHeader(
+          req.headers.get("authorization"),
+          url.searchParams.get("authToken"),
+        );
+
       const requireAuth = (): Response | null => {
-        const authHeader = req.headers.get("authorization");
+        const authHeader = requestAuthHeader();
         if (!sessionManager.validateAuth(authHeader)) {
           return makeJson({ ok: false, message: "Unauthorized" }, 401);
         }
@@ -463,6 +470,9 @@ export function createRequestHandler() {
 
       // POST /sessions - Create (or join) a session
       if (pathname === "/sessions" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const raw = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
         const requestedId = raw.length > 0 ? raw : undefined;
@@ -485,6 +495,9 @@ export function createRequestHandler() {
       // GET /sessions/:id/events - SSE endpoint (supports ?after=<cursor> for replay)
       const sseMatch = pathname.match(/^\/sessions\/([^/]+)\/events$/);
       if (sseMatch && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
         const sessionId = sseMatch[1];
         const session = sessionManager.getSession(sessionId);
         if (!session) {
@@ -567,6 +580,9 @@ export function createRequestHandler() {
       // GET /sessions/:id/ws - WebSocket endpoint (supports ?after=<cursor>)
       const wsMatch = pathname.match(/^\/sessions\/([^/]+)\/ws$/);
       if (wsMatch && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
         const sessionId = wsMatch[1];
         const session = sessionManager.getSession(sessionId);
         if (!session) {
@@ -599,6 +615,9 @@ export function createRequestHandler() {
       // POST /sessions/:id/message  (UI convenience)
       const msgMatch = pathname.match(/^\/sessions\/([^/]+)\/message$/);
       if (msgMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
         const sessionId = msgMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         sessionManager.handleMessage(sessionId, body);

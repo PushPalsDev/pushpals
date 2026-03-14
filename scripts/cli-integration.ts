@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
@@ -8,10 +8,11 @@ import { fileURLToPath } from "url";
 const thisFilePath = fileURLToPath(import.meta.url);
 const scriptsDir = dirname(thisFilePath);
 const repoRoot = resolve(scriptsDir, "..");
-const cliScriptPath = resolve(repoRoot, "scripts", "pushpals-cli.ts");
+const packagedCliPath = resolve(repoRoot, "packages", "cli", "dist", "pushpals-cli.js");
 
 type CliIntegrationOptions = {
   keepTemp: boolean;
+  skipBuild: boolean;
   withVision: boolean;
   cliArgs: string[];
 };
@@ -19,6 +20,7 @@ type CliIntegrationOptions = {
 function parseArgs(argv: string[]): CliIntegrationOptions {
   const cliArgs: string[] = [];
   let keepTemp = false;
+  let skipBuild = false;
   let withVision = true;
   let passthrough = false;
 
@@ -35,6 +37,10 @@ function parseArgs(argv: string[]): CliIntegrationOptions {
       keepTemp = true;
       continue;
     }
+    if (arg === "--skip-build") {
+      skipBuild = true;
+      continue;
+    }
     if (arg === "--without-vision") {
       withVision = false;
       continue;
@@ -46,7 +52,7 @@ function parseArgs(argv: string[]): CliIntegrationOptions {
     cliArgs.push(arg);
   }
 
-  return { keepTemp, withVision, cliArgs };
+  return { keepTemp, skipBuild, withVision, cliArgs };
 }
 
 function writeRuntimeConfig(runtimeRoot: string): void {
@@ -78,6 +84,24 @@ enabled = true
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
+  if (!options.skipBuild) {
+    console.log("[cli-integration] Building packaged CLI bundle...");
+    const build = Bun.spawnSync([process.execPath, "run", "cli:bundle"], {
+      cwd: repoRoot,
+      stdout: "inherit",
+      stderr: "inherit",
+      env: process.env,
+    });
+    if (build.exitCode !== 0) {
+      console.error("[cli-integration] Failed to build packaged CLI bundle.");
+      process.exit(build.exitCode || 1);
+    }
+  }
+  if (!existsSync(packagedCliPath)) {
+    console.error(`[cli-integration] Packaged CLI bundle not found at ${packagedCliPath}`);
+    process.exit(1);
+  }
+
   const root = mkdtempSync(join(tmpdir(), "pushpals-cli-integration-"));
   const sandboxRepoRoot = join(root, "repo");
   const runtimeRoot = join(root, "runtime");
@@ -106,7 +130,7 @@ async function main(): Promise<void> {
   }
 
   const cliArgs = [
-    cliScriptPath,
+    packagedCliPath,
     "--runtime-root",
     runtimeRoot,
     ...options.cliArgs,
@@ -114,6 +138,7 @@ async function main(): Promise<void> {
 
   console.log(`[cli-integration] repoRoot=${sandboxRepoRoot}`);
   console.log(`[cli-integration] runtimeRoot=${runtimeRoot}`);
+  console.log(`[cli-integration] packagedCli=${packagedCliPath}`);
   console.log(`[cli-integration] command=${process.execPath} ${cliArgs.join(" ")}`);
   if (!options.keepTemp) {
     console.log("[cli-integration] Temp sandbox will be removed after the CLI exits.");
