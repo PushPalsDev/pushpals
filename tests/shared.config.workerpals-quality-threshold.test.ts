@@ -5,6 +5,22 @@ import { tmpdir } from "os";
 import { loadPushPalsConfig } from "../packages/shared/src/config";
 
 describe("shared config workerpals quality critic threshold parsing", () => {
+  test("defaults workerpals.quality_max_auto_revisions to 1 when unset", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "config");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n', "utf8");
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.workerpals.qualityMaxAutoRevisions).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("loads workerpals runtime policy values from local.example.toml", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
     const configDir = join(root, "config");

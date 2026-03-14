@@ -13,6 +13,7 @@ const LEGACY_CONFIG_DIR = "config";
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const FALSY = new Set(["0", "false", "no", "off"]);
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE = 8;
+const DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS = 1;
 const DEFAULT_WORKERPALS_FILE_MODIFYING_JOBS = ["task.execute"];
 const DEFAULT_WORKERPALS_OUTPUT_MAX_CHARS = 192 * 1024;
 const DEFAULT_WORKERPALS_OUTPUT_MAX_LINES = 600;
@@ -903,7 +904,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       10,
       asInt(
         parseIntEnv("WORKERPALS_QUALITY_MAX_AUTO_REVISIONS") ?? workerNode.quality_max_auto_revisions,
-        4,
+        DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS,
       ),
     ),
   );
