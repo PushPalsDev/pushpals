@@ -1,6 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createServer } from "node:net";
 import * as vscode from "vscode";
 import { formatCommandForLog, validateDockerImageName } from "./safety";
+import {
+  computeLocalBuddyRestartBackoffMs,
+  DEFAULT_LOCALBUDDY_PORT,
+  loadRuntimeConfigSnapshotFromFiles,
+  resolveLocalBuddyRuntimeAction,
+  resolveLocalBuddyStartGate,
+  type RuntimeConfigSnapshot,
+} from "./runtimeServicePolicy";
 import { assertWorkspaceTrusted } from "./workspaceTrust";
 
 type ServiceDefinition = {
@@ -23,12 +32,25 @@ type CommandResult = {
 };
 
 const DEFAULT_WORKER_IMAGE = "pushpals-worker-sandbox:latest";
+const LOCALBUDDY_RUNTIME_CONFIG_POLL_MS = 2_000;
+const LOCALBUDDY_STABLE_UPTIME_MS = 10_000;
+const LOCALBUDDY_MAX_CONSECUTIVE_FAILURES = 5;
 
 export class StackServiceManager implements vscode.Disposable {
   private readonly running = new Map<string, RunningService>();
   private readonly onDidChangeRunningEmitter = new vscode.EventEmitter<boolean>();
   readonly onDidChangeRunning = this.onDidChangeRunningEmitter.event;
   private stopping = false;
+  private stackWorkspaceRoot: string | null = null;
+  private localBuddyRuntimeEnabled = false;
+  private localBuddyPort = DEFAULT_LOCALBUDDY_PORT;
+  private localBuddyConfigPollTimer: ReturnType<typeof setInterval> | null = null;
+  private localBuddyConfigPollInFlight = false;
+  private localBuddyStopRequested = false;
+  private localBuddyStabilityTimer: ReturnType<typeof setTimeout> | null = null;
+  private localBuddyConsecutiveFailures = 0;
+  private localBuddyRetryAfterMs = 0;
+  private localBuddyRestartLimitLogged = false;
 
   constructor(private readonly output: vscode.OutputChannel) {}
 
@@ -42,6 +64,7 @@ export class StackServiceManager implements vscode.Disposable {
       return;
     }
     assertWorkspaceTrusted(vscode.workspace.isTrusted);
+    this.stackWorkspaceRoot = workspaceRoot;
 
     const workerImage = this.workerDockerImage();
     await this.runOneShot("bun", ["--version"], workspaceRoot, "Checking Bun runtime");
@@ -53,10 +76,18 @@ export class StackServiceManager implements vscode.Disposable {
       "Building protocol package",
     );
     await this.ensureDockerReady(workspaceRoot, workerImage);
+    const runtimeSnapshot = await this.readRuntimeConfigSnapshot(workspaceRoot);
+    this.localBuddyRuntimeEnabled = runtimeSnapshot.localbuddy.enabled;
+    this.localBuddyPort = runtimeSnapshot.localbuddy.port;
+    this.localBuddyStopRequested = false;
+    this.clearLocalBuddyStabilityTimer();
+    this.resetLocalBuddyRestartBudget();
+    if (this.localBuddyRuntimeEnabled) {
+      await this.ensureLocalBuddyStartReady(workspaceRoot);
+    }
 
     const definitions: ServiceDefinition[] = [
       { id: "server", label: "Server", command: "bun", args: ["run", "server:only"] },
-      { id: "localbuddy", label: "LocalBuddy", command: "bun", args: ["run", "localbuddy:only"] },
       { id: "remotebuddy", label: "RemoteBuddy", command: "bun", args: ["run", "remotebuddy:only"] },
       {
         id: "workerpals",
@@ -66,6 +97,9 @@ export class StackServiceManager implements vscode.Disposable {
         env: { WORKERPALS_DOCKER_IMAGE: workerImage },
       },
     ];
+    if (this.localBuddyRuntimeEnabled) {
+      definitions.splice(1, 0, this.localBuddyServiceDefinition());
+    }
     if (this.includeSourceControlManager()) {
       definitions.push({
         id: "source_control_manager",
@@ -77,17 +111,25 @@ export class StackServiceManager implements vscode.Disposable {
 
     this.output.appendLine(`[stack] Starting ${definitions.length} services...`);
     for (const def of definitions) this.spawnService(def, workspaceRoot);
+    this.startLocalBuddyRuntimeConfigPolling(workspaceRoot);
     this.onDidChangeRunningEmitter.fire(true);
   }
 
   async stopStack(workspaceRoot: string, options?: { bypassTrust?: boolean }): Promise<void> {
     if (!options?.bypassTrust) assertWorkspaceTrusted(vscode.workspace.isTrusted);
     if (!this.isRunning()) {
+      this.stopLocalBuddyRuntimeConfigPolling();
+      this.clearLocalBuddyStabilityTimer();
+      this.stackWorkspaceRoot = null;
+      this.localBuddyStopRequested = false;
+      this.resetLocalBuddyRestartBudget();
       this.output.appendLine("[stack] Stop skipped: no running services.");
       return;
     }
 
     this.stopping = true;
+    this.stopLocalBuddyRuntimeConfigPolling();
+    this.clearLocalBuddyStabilityTimer();
     const services = [...this.running.values()].reverse();
     const failures: string[] = [];
     for (const service of services) {
@@ -104,6 +146,11 @@ export class StackServiceManager implements vscode.Disposable {
 
     if (this.running.size === 0) {
       this.onDidChangeRunningEmitter.fire(false);
+      this.stackWorkspaceRoot = null;
+      this.localBuddyRuntimeEnabled = false;
+      this.localBuddyPort = DEFAULT_LOCALBUDDY_PORT;
+      this.localBuddyStopRequested = false;
+      this.resetLocalBuddyRestartBudget();
       this.output.appendLine("[stack] All services stopped.");
       return;
     }
@@ -116,6 +163,8 @@ export class StackServiceManager implements vscode.Disposable {
   }
 
   dispose(): void {
+    this.stopLocalBuddyRuntimeConfigPolling();
+    this.clearLocalBuddyStabilityTimer();
     this.onDidChangeRunningEmitter.dispose();
   }
 
@@ -139,6 +188,175 @@ export class StackServiceManager implements vscode.Disposable {
       vscode.workspace.getConfiguration("pushpals").get<string>("workerDockerImage") ??
         DEFAULT_WORKER_IMAGE,
     );
+  }
+
+  private localBuddyServiceDefinition(): ServiceDefinition {
+    return {
+      id: "localbuddy",
+      label: "LocalBuddy",
+      command: "bun",
+      args: ["run", "localbuddy:only"],
+    };
+  }
+
+  private resetLocalBuddyRestartBudget(): void {
+    this.localBuddyConsecutiveFailures = 0;
+    this.localBuddyRetryAfterMs = 0;
+    this.localBuddyRestartLimitLogged = false;
+  }
+
+  private clearLocalBuddyStabilityTimer(): void {
+    if (!this.localBuddyStabilityTimer) return;
+    clearTimeout(this.localBuddyStabilityTimer);
+    this.localBuddyStabilityTimer = null;
+  }
+
+  private markLocalBuddyUnexpectedFailure(reason: string): void {
+    this.localBuddyConsecutiveFailures += 1;
+    this.clearLocalBuddyStabilityTimer();
+    this.localBuddyRetryAfterMs =
+      Date.now() + computeLocalBuddyRestartBackoffMs(this.localBuddyConsecutiveFailures);
+    if (this.localBuddyConsecutiveFailures >= LOCALBUDDY_MAX_CONSECUTIVE_FAILURES) {
+      if (!this.localBuddyRestartLimitLogged) {
+        this.localBuddyRestartLimitLogged = true;
+        this.output.appendLine(
+          `[stack] LocalBuddy restart limit reached after ${this.localBuddyConsecutiveFailures} consecutive failure(s). Toggle localbuddy.enabled off and on after fixing the cause to retry. Last failure: ${reason}`,
+        );
+      }
+      return;
+    }
+    const delayMs = Math.max(0, this.localBuddyRetryAfterMs - Date.now());
+    this.output.appendLine(
+      `[stack] LocalBuddy start/restart failed (${reason}). Retrying in ${delayMs}ms (failure ${this.localBuddyConsecutiveFailures}/${LOCALBUDDY_MAX_CONSECUTIVE_FAILURES}).`,
+    );
+  }
+
+  private async readRuntimeConfigSnapshot(workspaceRoot: string): Promise<RuntimeConfigSnapshot> {
+    return loadRuntimeConfigSnapshotFromFiles(workspaceRoot, process.env);
+  }
+
+  private async ensureLocalBuddyStartReady(workspaceRoot: string): Promise<void> {
+    await this.runOneShot(
+      "bun",
+      [
+        "--cwd",
+        "apps/localbuddy",
+        "--env-file",
+        "../../.env",
+        "run",
+        "src/localbuddy_main.ts",
+        "--validate-config",
+      ],
+      workspaceRoot,
+      "Validating LocalBuddy runtime config",
+    );
+  }
+
+  private async isPortAvailable(port: number): Promise<boolean> {
+    return await new Promise<boolean>((resolveAvailability) => {
+      const server = createServer();
+      let settled = false;
+
+      const settle = (available: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolveAvailability(available);
+      };
+
+      server.once("error", () => {
+        try {
+          server.close();
+        } catch {
+          // best effort
+        }
+        settle(false);
+      });
+
+      server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+        server.close(() => settle(true));
+      });
+    });
+  }
+
+  private startLocalBuddyRuntimeConfigPolling(workspaceRoot: string): void {
+    if (this.localBuddyConfigPollTimer) return;
+    this.localBuddyConfigPollTimer = setInterval(() => {
+      void this.syncLocalBuddyRuntimeConfig(workspaceRoot);
+    }, LOCALBUDDY_RUNTIME_CONFIG_POLL_MS);
+  }
+
+  private stopLocalBuddyRuntimeConfigPolling(): void {
+    if (!this.localBuddyConfigPollTimer) return;
+    clearInterval(this.localBuddyConfigPollTimer);
+    this.localBuddyConfigPollTimer = null;
+  }
+
+  private async syncLocalBuddyRuntimeConfig(workspaceRoot: string): Promise<void> {
+    if (this.localBuddyConfigPollInFlight || this.stopping || !this.isRunning()) return;
+    this.localBuddyConfigPollInFlight = true;
+    try {
+      const snapshot = await this.readRuntimeConfigSnapshot(workspaceRoot);
+      const previousEnabled = this.localBuddyRuntimeEnabled;
+      const nextEnabled = Boolean(snapshot.localbuddy.enabled);
+      if (previousEnabled !== nextEnabled) {
+        this.resetLocalBuddyRestartBudget();
+      }
+      this.localBuddyRuntimeEnabled = nextEnabled;
+      this.localBuddyPort = snapshot.localbuddy.port;
+
+      const action = resolveLocalBuddyRuntimeAction(this.running.has("localbuddy"), nextEnabled);
+      if (action === "start") {
+        const startGate = resolveLocalBuddyStartGate({
+          nowMs: Date.now(),
+          retryAfterMs: this.localBuddyRetryAfterMs,
+          consecutiveFailures: this.localBuddyConsecutiveFailures,
+          maxConsecutiveFailures: LOCALBUDDY_MAX_CONSECUTIVE_FAILURES,
+        });
+        if (startGate === "retry_exhausted" || startGate === "backoff") {
+          return;
+        }
+
+        const portAvailable = await this.isPortAvailable(this.localBuddyPort);
+        if (!portAvailable) {
+          this.markLocalBuddyUnexpectedFailure(`port ${this.localBuddyPort} is unavailable`);
+          return;
+        }
+
+        this.output.appendLine(
+          previousEnabled !== nextEnabled
+            ? "[stack] LocalBuddy enabled via runtime config (localbuddy.enabled=true); starting LocalBuddy."
+            : "[stack] LocalBuddy is enabled but not running; starting LocalBuddy.",
+        );
+        try {
+          await this.ensureLocalBuddyStartReady(workspaceRoot);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          this.output.appendLine(`[stack] LocalBuddy readiness preflight failed: ${detail}`);
+          this.markLocalBuddyUnexpectedFailure(`preflight failed: ${detail}`);
+          return;
+        }
+        this.spawnService(this.localBuddyServiceDefinition(), workspaceRoot);
+        return;
+      }
+
+      if (action === "stop") {
+        this.output.appendLine(
+          previousEnabled !== nextEnabled
+            ? "[stack] LocalBuddy disabled via runtime config (localbuddy.enabled=false); stopping LocalBuddy."
+            : "[stack] LocalBuddy is disabled but still running; stopping LocalBuddy.",
+        );
+        const service = this.running.get("localbuddy");
+        if (service) {
+          await this.stopService(workspaceRoot, service);
+        }
+        this.resetLocalBuddyRestartBudget();
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[stack] LocalBuddy runtime config poll failed: ${detail}`);
+    } finally {
+      this.localBuddyConfigPollInFlight = false;
+    }
   }
 
   private async ensureDockerReady(workspaceRoot: string, image: string): Promise<void> {
@@ -191,6 +409,17 @@ export class StackServiceManager implements vscode.Disposable {
     }) as ChildProcessWithoutNullStreams;
 
     this.running.set(def.id, { def, process: child });
+    if (def.id === "localbuddy") {
+      this.localBuddyStopRequested = false;
+      this.clearLocalBuddyStabilityTimer();
+      this.localBuddyStabilityTimer = setTimeout(() => {
+        const current = this.running.get("localbuddy");
+        if (current?.process === child && this.localBuddyRuntimeEnabled) {
+          this.resetLocalBuddyRestartBudget();
+        }
+        this.localBuddyStabilityTimer = null;
+      }, LOCALBUDDY_STABLE_UPTIME_MS);
+    }
     this.output.appendLine(`[stack] ${def.label} started (pid=${child.pid ?? "unknown"}).`);
 
     child.stdout.on("data", (chunk: Buffer) => this.appendStream(def.id, "stdout", chunk));
@@ -201,14 +430,31 @@ export class StackServiceManager implements vscode.Disposable {
     });
     child.on("exit", (code, signal) => {
       this.running.delete(def.id);
+      if (def.id === "localbuddy") {
+        this.clearLocalBuddyStabilityTimer();
+      }
       const reason = signal ? `signal=${signal}` : `code=${code ?? 0}`;
       this.output.appendLine(`[stack] ${def.label} exited (${reason}).`);
-      if (!this.stopping && (code ?? 0) !== 0) {
+      if (def.id === "localbuddy") {
+        const expectedExit =
+          this.stopping || this.localBuddyStopRequested || !this.localBuddyRuntimeEnabled;
+        if (!expectedExit) {
+          this.markLocalBuddyUnexpectedFailure(reason);
+          void vscode.window.showWarningMessage(
+            `PushPals ${def.label} stopped unexpectedly (${reason}). See output for details.`,
+          );
+        }
+      } else if (!this.stopping && (code ?? 0) !== 0) {
         void vscode.window.showWarningMessage(
           `PushPals ${def.label} stopped unexpectedly (${reason}). See output for details.`,
         );
       }
-      if (!this.isRunning()) this.onDidChangeRunningEmitter.fire(false);
+      if (!this.isRunning()) {
+        this.stopLocalBuddyRuntimeConfigPolling();
+        this.stackWorkspaceRoot = null;
+        this.localBuddyStopRequested = false;
+        this.onDidChangeRunningEmitter.fire(false);
+      }
     });
   }
 
@@ -223,6 +469,10 @@ export class StackServiceManager implements vscode.Disposable {
   private async stopService(workspaceRoot: string, service: RunningService): Promise<void> {
     const pid = service.process.pid;
     this.output.appendLine(`[stack] Stopping ${service.def.label}...`);
+    if (service.def.id === "localbuddy") {
+      this.localBuddyStopRequested = true;
+      this.clearLocalBuddyStabilityTimer();
+    }
     if (!pid) {
       service.process.kill();
       return;

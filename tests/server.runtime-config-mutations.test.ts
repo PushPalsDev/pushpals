@@ -57,6 +57,7 @@ function makeConfig(projectRoot: string): PushPalsConfig {
       staleClaimSweepIntervalMs: 5000,
     },
     localbuddy: {
+      enabled: false,
       port: 3003,
       statusHeartbeatMs: 120000,
       llm: {

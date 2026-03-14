@@ -65,6 +65,11 @@ export interface LLMClientOptions {
   apiKey?: string;
   model?: string;
   backend?: string;
+  reasoningEffort?: string;
+  codexAuthMode?: string;
+  codexBin?: string;
+  codexTimeoutMs?: number;
+  lmStudio?: PushPalsLmStudioConfig;
   serverUrl?: string;
   authToken?: string | null;
   usageReporter?: LLMUsageReporter;
@@ -454,6 +459,8 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
   let backend = configuredBackend(endpoint ?? "", explicitBackend);
 
   const model = firstNonEmpty(opts.model, serviceLlmConfig.model, DEFAULT_MODEL) ?? DEFAULT_MODEL;
+  const requestedCodexAuthMode =
+    firstNonEmpty(opts.codexAuthMode, serviceLlmConfig.codexAuthMode, "") ?? "";
   const openAiApiKey = (process.env.OPENAI_API_KEY ?? "").trim();
   const apiKey =
     firstNonEmpty(
@@ -467,7 +474,7 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
     ) ?? "";
   if (
     service !== "workerpals" &&
-    shouldUseCodexCliFallback(backend, model, apiKey, serviceLlmConfig.codexAuthMode)
+    shouldUseCodexCliFallback(backend, model, apiKey, requestedCodexAuthMode)
   ) {
     backend = "openai_codex";
   }
@@ -487,11 +494,11 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
     model,
     apiKey,
     sessionId,
-    reasoningEffort: serviceLlmConfig.reasoningEffort,
-    codexAuthMode: serviceLlmConfig.codexAuthMode,
-    codexBin: serviceLlmConfig.codexBin,
-    codexTimeoutMs: serviceLlmConfig.codexTimeoutMs,
-    lmStudio: config.llm.lmstudio,
+    reasoningEffort: firstNonEmpty(opts.reasoningEffort, serviceLlmConfig.reasoningEffort, "") ?? "",
+    codexAuthMode: requestedCodexAuthMode,
+    codexBin: firstNonEmpty(opts.codexBin, serviceLlmConfig.codexBin, "") ?? "",
+    codexTimeoutMs: opts.codexTimeoutMs ?? serviceLlmConfig.codexTimeoutMs,
+    lmStudio: opts.lmStudio ?? config.llm.lmstudio,
   };
 }
 
@@ -968,6 +975,26 @@ export class LmStudioClient implements LLMClient {
     }
   }
 
+  async preflightConfiguredModel(): Promise<void> {
+    const discovered = await this.discoverAvailableModels();
+    if (discovered.models.length === 0) {
+      throw new Error(
+        `${this.providerLabel} model preflight failed for ${this.endpoint}: ${discovered.detail}`,
+      );
+    }
+
+    const configuredModel = this.model.trim();
+    if (!configuredModel) return;
+
+    const selected = pickConfiguredOrAvailableModel(configuredModel, discovered.models);
+    if (selected.source !== "configured") {
+      const sample = discovered.models.slice(0, 12).join(", ");
+      throw new Error(
+        `Configured ${this.providerLabel} model "${configuredModel}" is unavailable at ${this.endpoint}. Available models: ${sample || "(none)"}`,
+      );
+    }
+  }
+
   private async runLmStudioCompletion(
     messages: Array<{ role: string; content: string }>,
     opts: {
@@ -1375,6 +1402,28 @@ export class OpenAiCodexCliClient implements LLMClient {
     );
   }
 
+  async preflight(): Promise<void> {
+    const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    env.PYTHONIOENCODING = "utf-8";
+
+    const authMode = this.effectiveAuthMode();
+    if (authMode === "chatgpt") {
+      delete env.OPENAI_API_KEY;
+      delete env.OPENAI_BASE_URL;
+      delete env.OPENAI_API_BASE;
+      await this.ensureChatGptLoginReady(commandPrefix, env);
+      return;
+    }
+
+    const finalApiKey = this.apiKey || (process.env.OPENAI_API_KEY ?? "").trim();
+    if (!finalApiKey) {
+      throw new Error(
+        "openai_codex API-key auth requires OPENAI_API_KEY (or service llm.api_key), but none is configured.",
+      );
+    }
+  }
+
   private async runCodexExec(prompt: string): Promise<{ text: string; stderr: string }> {
     const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
     const env: NodeJS.ProcessEnv = { ...process.env };
@@ -1525,6 +1574,60 @@ export class OllamaClient implements LLMClient {
     }
   }
 
+  private async discoverAvailableModels(): Promise<{ models: string[]; detail: string }> {
+    const base = this.endpoint.replace(/\/api\/chat$/, "");
+    const probes = uniqueNonEmptyStrings([`${base}/api/tags`, this.endpoint]);
+    let lastDetail = "model-list probe failed";
+
+    for (const url of probes) {
+      try {
+        const res = await fetch(url, { method: "GET", headers: { Accept: "application/json" } });
+        if (!res.ok) {
+          const body = await res.text();
+          const hint = body.trim().slice(0, 120);
+          lastDetail = `${url} -> HTTP ${res.status}${hint ? ` (${hint})` : ""}`;
+          continue;
+        }
+
+        const payload = (await res.json()) as {
+          models?: Array<{ name?: unknown }>;
+          message?: { content?: unknown };
+        };
+        const models = Array.isArray(payload.models)
+          ? payload.models
+              .map((item) => (typeof item?.name === "string" ? item.name.trim() : ""))
+              .filter((name) => name.length > 0)
+          : [];
+        if (models.length > 0) {
+          return { models: uniqueNonEmptyStrings(models), detail: `${url} -> ${res.status}` };
+        }
+        lastDetail = `${url} -> no models in payload`;
+      } catch (err) {
+        lastDetail = `${url}: ${String(err)}`;
+      }
+    }
+
+    return { models: [], detail: lastDetail };
+  }
+
+  async preflightConfiguredModel(): Promise<void> {
+    const discovered = await this.discoverAvailableModels();
+    if (discovered.models.length === 0) {
+      throw new Error(`Ollama model preflight failed for ${this.endpoint}: ${discovered.detail}`);
+    }
+
+    const configuredModel = this.model.trim();
+    if (!configuredModel) return;
+
+    const selected = pickConfiguredOrAvailableModel(configuredModel, discovered.models);
+    if (selected.source !== "configured") {
+      const sample = discovered.models.slice(0, 12).join(", ");
+      throw new Error(
+        `Configured Ollama model "${configuredModel}" is unavailable at ${this.endpoint}. Available models: ${sample || "(none)"}`,
+      );
+    }
+  }
+
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
     const body: Record<string, unknown> = {
       model: this.model,
@@ -1636,4 +1739,50 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
     lmStudio: resolved.lmStudio,
     usageReporter,
   });
+}
+
+export async function preflightServiceLlm(opts: LLMClientOptions = {}): Promise<void> {
+  const resolved = resolveServiceLlmConfig(opts);
+  const service = opts.service ?? "remotebuddy";
+
+  if (resolved.backend === "openai_codex") {
+    const client = new OpenAiCodexCliClient({
+      model: resolved.model,
+      apiKey: resolved.apiKey,
+      endpoint: resolved.endpoint,
+      codexAuthMode: resolved.codexAuthMode,
+      codexBin: resolved.codexBin,
+      codexTimeoutMs: resolved.codexTimeoutMs,
+      reasoningEffort: resolved.reasoningEffort,
+      service,
+      sessionId: resolved.sessionId,
+      usageReporter: null,
+    });
+    await client.preflight();
+    return;
+  }
+
+  if (resolved.backend === "ollama") {
+    const client = new OllamaClient({
+      endpoint: resolved.endpoint,
+      model: resolved.model,
+      service,
+      sessionId: resolved.sessionId,
+      usageReporter: null,
+    });
+    await client.preflightConfiguredModel();
+    return;
+  }
+
+  const client = new LmStudioClient({
+    endpoint: resolved.endpoint,
+    apiKey: resolved.apiKey,
+    model: resolved.model,
+    backend: resolved.backend === "openai" ? "openai" : "lmstudio",
+    service,
+    sessionId: resolved.sessionId,
+    lmStudio: resolved.lmStudio,
+    usageReporter: null,
+  });
+  await client.preflightConfiguredModel();
 }

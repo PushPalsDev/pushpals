@@ -84,6 +84,14 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
     setLoading(false);
   }, [authToken, baseUrl]);
 
+  const localBuddyEnabled = Boolean(
+    config &&
+      typeof config === "object" &&
+      (config as Record<string, unknown>).localbuddy &&
+      typeof (config as Record<string, unknown>).localbuddy === "object" &&
+      ((config as Record<string, unknown>).localbuddy as Record<string, unknown>).enabled,
+  );
+
   const apply = useCallback(async () => {
     const trimmedKey = key.trim();
     if (!trimmedKey) {
@@ -118,6 +126,43 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
       setSaving(false);
     }
   }, [authToken, baseUrl, key, parseAsJson, scope, valueText]);
+
+  const toggleLocalBuddy = useCallback(async () => {
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await updateRuntimeConfig(
+        baseUrl,
+        [
+          {
+            scope: "toml",
+            key: "localbuddy.enabled",
+            value: !localBuddyEnabled,
+          },
+        ],
+        authToken,
+      );
+      if (!result) {
+        setError("Failed to update runtime config.");
+        setSaving(false);
+        return;
+      }
+      setConfig(result.config);
+      setFiles(result.files ?? {});
+      const warningText =
+        result.warnings.length > 0 ? ` Warnings: ${result.warnings.join(" | ")}` : "";
+      setNotice(
+        `LocalBuddy ${!localBuddyEnabled ? "enabled" : "disabled"}.${
+          result.restartRequired
+            ? " Restart required for some keys."
+            : " Applies live when managed by bun run start or the VS Code stack manager."
+        }${warningText}`,
+      );
+    } finally {
+      setSaving(false);
+    }
+  }, [authToken, baseUrl, localBuddyEnabled]);
 
   const entries = useMemo(() => {
     const all = flattenConfig(config ?? {});
@@ -161,6 +206,30 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
           >
             <Text style={[styles.buttonText, { color: theme.text, fontFamily: theme.fontSans }]}>
               {loading ? "Loading..." : "Reload"}
+            </Text>
+          </Pressable>
+          <Pressable
+            onPress={toggleLocalBuddy}
+            style={[
+              styles.button,
+              {
+                backgroundColor: localBuddyEnabled ? theme.accentSoft : theme.panelAlt,
+                borderColor: localBuddyEnabled ? theme.accent : theme.border,
+              },
+              saving && styles.buttonDisabled,
+            ]}
+            disabled={saving || loading || !config}
+          >
+            <Text
+              style={[
+                styles.buttonText,
+                {
+                  color: localBuddyEnabled ? theme.accentText : theme.text,
+                  fontFamily: theme.fontSans,
+                },
+              ]}
+            >
+              {saving ? "Applying..." : localBuddyEnabled ? "Disable LocalBuddy" : "Enable LocalBuddy"}
             </Text>
           </Pressable>
         </View>

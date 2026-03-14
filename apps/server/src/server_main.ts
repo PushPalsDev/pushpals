@@ -20,6 +20,7 @@ import {
   getRuntimeConfigFiles,
   type RuntimeConfigMutation,
 } from "./runtime_config.js";
+import { deriveRuntimeConfigImpact } from "./runtime_config_policy.js";
 import { resolveRequestAuthHeader } from "./request_auth.js";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
@@ -425,42 +426,17 @@ export function createRequestHandler() {
         sessionManager.authToken = nextConfig.authToken;
         repoStatusCache = null;
 
-        const restartRequiredPrefixes = [
-          "server.host",
-          "server.port",
-          "paths.data_dir",
-          "paths.shared_db_path",
-          "paths.remotebuddy_db_path",
-          "source_control_manager.repo_path",
-        ];
-        const normalizePathKey = (raw: string): string =>
-          String(raw ?? "")
-            .split(".")
-            .map((segment) =>
-              segment
-                .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-                .replace(/[^A-Za-z0-9_]+/g, "_")
-                .replace(/^_+|_+$/g, "")
-                .toLowerCase(),
-            )
-            .filter(Boolean)
-            .join(".");
-        const restartRequiredFor = applyResult.applied
-          .map((change) => change.key)
-          .filter((key) =>
-            restartRequiredPrefixes.some((prefix) =>
-              normalizePathKey(key) === prefix || normalizePathKey(key).startsWith(`${prefix}.`),
-            ),
-          );
+        const impact = deriveRuntimeConfigImpact(applyResult.applied.map((change) => change.key));
+        const warnings = [...applyResult.warnings, ...impact.warnings];
 
         return makeJson(
           {
             ok: true,
             applied: applyResult.applied,
-            warnings: applyResult.warnings,
+            warnings,
             touchedFiles: applyResult.touchedFiles.map((entry) => entry.replace(/\\/g, "/")),
-            restartRequired: restartRequiredFor.length > 0,
-            restartRequiredKeys: restartRequiredFor,
+            restartRequired: impact.restartRequiredKeys.length > 0,
+            restartRequiredKeys: impact.restartRequiredKeys,
             config: sanitizePushPalsConfigForLogging(nextConfig),
             files: describeRuntimeConfigFiles(files),
           },

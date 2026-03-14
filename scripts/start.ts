@@ -4,7 +4,8 @@
  *
  * `bun run start` can be invoked with accidental extra CLI flags (e.g. `-c`)
  * from shell wrappers. This wrapper intentionally ignores forwarded args and
- * always launches `dev:full` with the canonical script options.
+ * always launches the configured managed service set with the canonical
+ * script options.
  *
  * Supported flags:
  * - `-c` / `--clean`: wipe runtime data dir (`PUSHPALS_DATA_DIR`, default `outputs/data`)
@@ -39,6 +40,7 @@ import {
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
 } from "../packages/shared/src/config.js";
+import { loadLocalBuddyRuntimeSnapshotFromFiles } from "../packages/shared/src/localbuddy_runtime.js";
 import {
   extraLocalKeys,
   missingTemplateKeys,
@@ -46,6 +48,13 @@ import {
   readTomlLeafKeys,
 } from "../packages/shared/src/config_template_parity.js";
 import { validateVisionDocStructure } from "../packages/shared/src/vision.js";
+import {
+  buildCoreManagedServiceSpecs,
+  computeLocalBuddyRestartBackoffMs,
+  resolveLocalBuddyRuntimeAction,
+  resolveLocalBuddyStartGate,
+  type ManagedServiceSpec,
+} from "./start_runtime_services.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -72,6 +81,10 @@ const DEFAULT_STARTUP_WARMUP_POLL_MS = 1_000;
 const SYSTEM_LOG_PATH = resolve(repoRoot, "system.log");
 const SYSTEM_LOG_TAIL_POLL_MS = 250;
 const SYSTEM_LOG_TAIL_READ_CHUNK_BYTES = 64 * 1024;
+const LOCALBUDDY_ENABLED = CONFIG.localbuddy.enabled;
+const LOCALBUDDY_RUNTIME_CONFIG_POLL_MS = 2_000;
+const LOCALBUDDY_STABLE_UPTIME_MS = 10_000;
+const LOCALBUDDY_MAX_CONSECUTIVE_FAILURES = 5;
 const ANSI_RESET = "\u001b[0m";
 const ANSI_CYAN = "\u001b[36m";
 const ANSI_MAGENTA = "\u001b[35m";
@@ -313,6 +326,43 @@ async function pipeProcStreamToOutputAndSystemLog(
           // best-effort terminal mirror
         }
       }
+    }
+  } catch {
+    // best-effort stream piping
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function formatManagedServiceLogPrefix(serviceName: string): string {
+  const stamp = new Date().toTimeString().slice(0, 8);
+  return `[${stamp}][${serviceName}]`;
+}
+
+async function pipeProcStreamToTaggedConsole(
+  stream: ReadableStream<Uint8Array> | number | null | undefined,
+  serviceName: string,
+): Promise<void> {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") return;
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      const parts = pending.split(/\r?\n/);
+      pending = parts.pop() ?? "";
+      for (const line of parts) {
+        const trimmed = line.trimEnd();
+        if (!trimmed) continue;
+        console.log(`${formatManagedServiceLogPrefix(serviceName)} ${trimmed}`);
+      }
+    }
+    const tail = pending.trim();
+    if (tail) {
+      console.log(`${formatManagedServiceLogPrefix(serviceName)} ${tail}`);
     }
   } catch {
     // best-effort stream piping
@@ -1308,7 +1358,7 @@ function normalizeCodexAuthMode(value: string | null | undefined): CodexAuthMode
 function codexAuthModeFromConfig(): string {
   return firstNonEmpty(
     CONFIG.remotebuddy.llm.codexAuthMode,
-    CONFIG.localbuddy.llm.codexAuthMode,
+    LOCALBUDDY_ENABLED ? CONFIG.localbuddy.llm.codexAuthMode : "",
     CONFIG.workerpals.llm.codexAuthMode,
     "auto",
   );
@@ -1330,14 +1380,16 @@ function codexBackendEnabled(): boolean {
     allowCodexFallback: true,
   });
   if (remoteBackend === "openai_codex") return true;
-  const localBackend = resolveServiceBackendForPreflight({
-    backend: CONFIG.localbuddy.llm.backend,
-    endpoint: firstNonEmpty(CONFIG.localbuddy.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT,
-    model: CONFIG.localbuddy.llm.model,
-    apiKey: CONFIG.localbuddy.llm.apiKey,
-    allowCodexFallback: true,
-  });
-  if (localBackend === "openai_codex") return true;
+  if (LOCALBUDDY_ENABLED) {
+    const localBackend = resolveServiceBackendForPreflight({
+      backend: CONFIG.localbuddy.llm.backend,
+      endpoint: firstNonEmpty(CONFIG.localbuddy.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT,
+      model: CONFIG.localbuddy.llm.model,
+      apiKey: CONFIG.localbuddy.llm.apiKey,
+      allowCodexFallback: true,
+    });
+    if (localBackend === "openai_codex") return true;
+  }
   const workerBackend = resolveServiceBackendForPreflight({
     backend: CONFIG.workerpals.llm.backend,
     endpoint: firstNonEmpty(CONFIG.workerpals.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT,
@@ -1353,7 +1405,7 @@ function codexApiKeyPresent(): boolean {
   const envKey = (process.env.OPENAI_API_KEY ?? "").trim();
   const cfgKeys = [
     CONFIG.remotebuddy.llm.apiKey,
-    CONFIG.localbuddy.llm.apiKey,
+    LOCALBUDDY_ENABLED ? CONFIG.localbuddy.llm.apiKey : "",
     CONFIG.workerpals.llm.apiKey,
   ]
     .map((value) => (value ?? "").trim())
@@ -1388,7 +1440,7 @@ function codexHostCommandPrefix(): string[] {
   const override = firstNonEmpty(
     process.env.PUSHPALS_OPENAI_CODEX_BIN,
     CONFIG.remotebuddy.llm.codexBin,
-    CONFIG.localbuddy.llm.codexBin,
+    LOCALBUDDY_ENABLED ? CONFIG.localbuddy.llm.codexBin : "",
     CONFIG.workerpals.llm.codexBin,
   );
   if (override) {
@@ -1891,7 +1943,9 @@ function resolveServiceBackendForPreflight(opts: {
 function llmPreflightTargets(): LlmPreflightTarget[] {
   const out: LlmPreflightTarget[] = [];
   const configuredRemoteRaw = firstNonEmpty(CONFIG.remotebuddy.llm.endpoint);
-  const configuredLocalRaw = firstNonEmpty(CONFIG.localbuddy.llm.endpoint);
+  const configuredLocalRaw = LOCALBUDDY_ENABLED
+    ? firstNonEmpty(CONFIG.localbuddy.llm.endpoint)
+    : "";
   const configuredWorkerRaw = firstNonEmpty(CONFIG.workerpals.llm.endpoint);
 
   const remoteBackend = resolveServiceBackendForPreflight({
@@ -1901,13 +1955,15 @@ function llmPreflightTargets(): LlmPreflightTarget[] {
     apiKey: CONFIG.remotebuddy.llm.apiKey,
     allowCodexFallback: true,
   });
-  const localBackend = resolveServiceBackendForPreflight({
-    backend: CONFIG.localbuddy.llm.backend,
-    endpoint: configuredLocalRaw || DEFAULT_LMSTUDIO_ENDPOINT,
-    model: CONFIG.localbuddy.llm.model,
-    apiKey: CONFIG.localbuddy.llm.apiKey,
-    allowCodexFallback: true,
-  });
+  const localBackend = LOCALBUDDY_ENABLED
+    ? resolveServiceBackendForPreflight({
+        backend: CONFIG.localbuddy.llm.backend,
+        endpoint: configuredLocalRaw || DEFAULT_LMSTUDIO_ENDPOINT,
+        model: CONFIG.localbuddy.llm.model,
+        apiKey: CONFIG.localbuddy.llm.apiKey,
+        allowCodexFallback: true,
+      })
+    : null;
   const workerBackend = resolveServiceBackendForPreflight({
     backend: CONFIG.workerpals.llm.backend,
     endpoint: configuredWorkerRaw || DEFAULT_LMSTUDIO_ENDPOINT,
@@ -1977,13 +2033,15 @@ function llmPreflightTargets(): LlmPreflightTarget[] {
     CONFIG.remotebuddy.llm.apiKey,
     normalizeEndpointForBackend(configuredRemoteRaw, remoteFallback, remoteBackend),
   );
-  addTarget(
-    "LocalBuddy LLM",
-    localBackend,
-    CONFIG.localbuddy.llm.model,
-    CONFIG.localbuddy.llm.apiKey,
-    normalizeEndpointForBackend(configuredLocalRaw, localFallback, localBackend),
-  );
+  if (localBackend) {
+    addTarget(
+      "LocalBuddy LLM",
+      localBackend,
+      CONFIG.localbuddy.llm.model,
+      CONFIG.localbuddy.llm.apiKey,
+      normalizeEndpointForBackend(configuredLocalRaw, localFallback, localBackend),
+    );
+  }
   const workerExecutorUsesCodex =
     (CONFIG.workerpals.executor ?? "").trim().toLowerCase() === "openai_codex";
   const skipWorkerLlmTarget = workerExecutorUsesCodex && codexEffectiveAuthMode() === "chatgpt";
@@ -2025,7 +2083,9 @@ function codexLlmPreflightSkippedServices(): string[] {
   const services: string[] = [];
   const remoteEndpoint =
     firstNonEmpty(CONFIG.remotebuddy.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT;
-  const localEndpoint = firstNonEmpty(CONFIG.localbuddy.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT;
+  const localEndpoint = LOCALBUDDY_ENABLED
+    ? firstNonEmpty(CONFIG.localbuddy.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT
+    : "";
   const workerEndpoint = firstNonEmpty(CONFIG.workerpals.llm.endpoint) || DEFAULT_LMSTUDIO_ENDPOINT;
 
   const remoteBackend = resolveServiceBackendForPreflight({
@@ -2035,13 +2095,15 @@ function codexLlmPreflightSkippedServices(): string[] {
     apiKey: CONFIG.remotebuddy.llm.apiKey,
     allowCodexFallback: true,
   });
-  const localBackend = resolveServiceBackendForPreflight({
-    backend: CONFIG.localbuddy.llm.backend,
-    endpoint: localEndpoint,
-    model: CONFIG.localbuddy.llm.model,
-    apiKey: CONFIG.localbuddy.llm.apiKey,
-    allowCodexFallback: true,
-  });
+  const localBackend = LOCALBUDDY_ENABLED
+    ? resolveServiceBackendForPreflight({
+        backend: CONFIG.localbuddy.llm.backend,
+        endpoint: localEndpoint,
+        model: CONFIG.localbuddy.llm.model,
+        apiKey: CONFIG.localbuddy.llm.apiKey,
+        allowCodexFallback: true,
+      })
+    : null;
   const workerBackend = resolveServiceBackendForPreflight({
     backend: CONFIG.workerpals.llm.backend,
     endpoint: workerEndpoint,
@@ -2533,6 +2595,300 @@ async function runInherited(cmd: string[], cwd?: string): Promise<number> {
   }
 }
 
+type SpawnedChild = ReturnType<typeof Bun.spawn>;
+
+let localBuddyProc: SpawnedChild | null = null;
+let localBuddyStdoutPump: Promise<void> | null = null;
+let localBuddyStderrPump: Promise<void> | null = null;
+let localBuddyConfigPollTimer: ReturnType<typeof setInterval> | null = null;
+let localBuddyStabilityTimer: ReturnType<typeof setTimeout> | null = null;
+let localBuddyRuntimeEnabled = LOCALBUDDY_ENABLED;
+let localBuddyConfigPollInFlight = false;
+let localBuddyStopRequested = false;
+let localBuddyConsecutiveFailures = 0;
+let localBuddyRetryAfterMs = 0;
+let localBuddyRestartLimitLogged = false;
+
+function resetLocalBuddyRestartBudget(): void {
+  localBuddyConsecutiveFailures = 0;
+  localBuddyRetryAfterMs = 0;
+  localBuddyRestartLimitLogged = false;
+}
+
+function clearLocalBuddyStabilityTimer(): void {
+  if (!localBuddyStabilityTimer) return;
+  clearTimeout(localBuddyStabilityTimer);
+  localBuddyStabilityTimer = null;
+}
+
+function markLocalBuddyUnexpectedFailure(reason: string): void {
+  localBuddyConsecutiveFailures += 1;
+  clearLocalBuddyStabilityTimer();
+  localBuddyRetryAfterMs =
+    Date.now() + computeLocalBuddyRestartBackoffMs(localBuddyConsecutiveFailures);
+  if (localBuddyConsecutiveFailures >= LOCALBUDDY_MAX_CONSECUTIVE_FAILURES) {
+    if (!localBuddyRestartLimitLogged) {
+      localBuddyRestartLimitLogged = true;
+      console.warn(
+        `[start] LocalBuddy restart limit reached after ${localBuddyConsecutiveFailures} consecutive failure(s). Toggle localbuddy.enabled off and on after fixing the cause to retry. Last failure: ${reason}`,
+      );
+    }
+    return;
+  }
+  const delayMs = Math.max(0, localBuddyRetryAfterMs - Date.now());
+  console.warn(
+    `[start] LocalBuddy start/restart failed (${reason}). Retrying in ${delayMs}ms (failure ${localBuddyConsecutiveFailures}/${LOCALBUDDY_MAX_CONSECUTIVE_FAILURES}).`,
+  );
+}
+
+async function waitForChildExit(
+  child: SpawnedChild,
+  timeoutMs: number,
+): Promise<number | "timeout"> {
+  return await Promise.race<number | "timeout">([
+    child.exited,
+    new Promise<"timeout">((resolveTimeout) =>
+      setTimeout(() => resolveTimeout("timeout"), timeoutMs),
+    ),
+  ]);
+}
+
+function summarizeLocalBuddyReadinessFailure(detail: string): string {
+  const compact = detail
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" | ");
+  if (!compact) return "unknown validation failure";
+  return compact.length <= 360 ? compact : `${compact.slice(0, 357)}...`;
+}
+
+async function ensureLocalBuddyManagedStartReady(bunExecPath: string): Promise<void> {
+  const snapshot = loadLocalBuddyRuntimeSnapshotFromFiles(repoRoot, process.env);
+  if (!snapshot.localbuddy.enabled) return;
+
+  console.log("[start] Running LocalBuddy readiness preflight...");
+  const result = await runCapture(
+    [
+      bunExecPath,
+      "--cwd",
+      "apps/localbuddy",
+      "--env-file",
+      "../../.env",
+      "run",
+      "src/localbuddy_main.ts",
+      "--validate-config",
+    ],
+    repoRoot,
+  );
+  if (!result.ok) {
+    const detail = summarizeLocalBuddyReadinessFailure(result.stderr || result.stdout);
+    throw new Error(detail);
+  }
+
+  console.log("[start] LocalBuddy readiness preflight passed.");
+}
+
+async function terminateManagedChildTree(
+  child: SpawnedChild,
+  label: string,
+): Promise<void> {
+  const pid = child.pid;
+  if (!pid) {
+    try {
+      child.kill();
+    } catch {}
+    return;
+  }
+
+  if (process.platform === "win32") {
+    const result = await runCapture(["taskkill", "/PID", String(pid), "/T", "/F"], repoRoot);
+    if (!result.ok) {
+      console.warn(
+        `[start] taskkill returned ${result.exitCode} for ${label}. Verifying process exit...`,
+      );
+    }
+    await waitForChildExit(child, 4_000);
+    if (child.exitCode == null && child.signalCode == null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      await waitForChildExit(child, 1_500);
+    }
+    return;
+  }
+
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      child.kill("SIGTERM");
+    } catch {}
+  }
+  await waitForChildExit(child, 5_000);
+  if (child.exitCode == null && child.signalCode == null) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    }
+    await waitForChildExit(child, 1_500);
+  }
+}
+
+async function startLocalBuddyManagedProcess(reason: string, bunExecPath: string): Promise<void> {
+  if (localBuddyProc) return;
+  console.log(`[start] Starting LocalBuddy (${reason}).`);
+  localBuddyStopRequested = false;
+  let child: SpawnedChild;
+  try {
+    child = Bun.spawn([bunExecPath, "run", "localbuddy:only"], {
+      cwd: repoRoot,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      detached: process.platform !== "win32",
+      windowsHide: true,
+      env: { ...process.env },
+    });
+  } catch (err) {
+    markLocalBuddyUnexpectedFailure(String(err));
+    throw err;
+  }
+
+  localBuddyProc = child;
+  localBuddyStdoutPump = pipeProcStreamToTaggedConsole(child.stdout, "localbuddy");
+  localBuddyStderrPump = pipeProcStreamToTaggedConsole(child.stderr, "localbuddy");
+  clearLocalBuddyStabilityTimer();
+  localBuddyStabilityTimer = setTimeout(() => {
+    if (localBuddyProc === child && localBuddyRuntimeEnabled) {
+      resetLocalBuddyRestartBudget();
+    }
+    localBuddyStabilityTimer = null;
+  }, LOCALBUDDY_STABLE_UPTIME_MS);
+
+  void child.exited.then(async (code) => {
+    const stdoutPump = localBuddyStdoutPump;
+    const stderrPump = localBuddyStderrPump;
+    clearLocalBuddyStabilityTimer();
+    if (localBuddyProc === child) {
+      localBuddyProc = null;
+      localBuddyStdoutPump = null;
+      localBuddyStderrPump = null;
+    }
+    await Promise.allSettled([
+      stdoutPump ?? Promise.resolve(),
+      stderrPump ?? Promise.resolve(),
+    ]);
+    const expectedExit = shuttingDown || localBuddyStopRequested || !localBuddyRuntimeEnabled;
+    if (expectedExit) {
+      console.log(`[start] LocalBuddy exited with code ${code}.`);
+      return;
+    }
+    markLocalBuddyUnexpectedFailure(`exit code ${code}`);
+    console.warn(
+      `[start] LocalBuddy exited unexpectedly with code ${code} while localbuddy.enabled=true.`,
+    );
+  });
+}
+
+async function stopLocalBuddyManagedProcess(reason: string): Promise<void> {
+  const child = localBuddyProc;
+  if (!child) return;
+
+  console.log(`[start] Stopping LocalBuddy (${reason}).`);
+  localBuddyStopRequested = true;
+  clearLocalBuddyStabilityTimer();
+  await terminateManagedChildTree(child, "LocalBuddy");
+  const exited = await waitForChildExit(child, 1_000);
+  if (exited === "timeout") {
+    console.warn("[start] LocalBuddy did not exit promptly; forcing shutdown.");
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+    await waitForChildExit(child, 2_000);
+  }
+}
+
+async function syncLocalBuddyRuntimeConfig(bunExecPath: string): Promise<void> {
+  if (localBuddyConfigPollInFlight || shuttingDown) return;
+  localBuddyConfigPollInFlight = true;
+  try {
+    const latest = loadLocalBuddyRuntimeSnapshotFromFiles(repoRoot, process.env);
+    const previousEnabled = localBuddyRuntimeEnabled;
+    const nextEnabled = Boolean(latest.localbuddy.enabled);
+    const nextPort = latest.localbuddy.port;
+    if (previousEnabled !== nextEnabled) {
+      resetLocalBuddyRestartBudget();
+    }
+    localBuddyRuntimeEnabled = nextEnabled;
+    const action = resolveLocalBuddyRuntimeAction(Boolean(localBuddyProc), nextEnabled);
+    if (action === "start") {
+      const startGate = resolveLocalBuddyStartGate({
+        nowMs: Date.now(),
+        retryAfterMs: localBuddyRetryAfterMs,
+        consecutiveFailures: localBuddyConsecutiveFailures,
+        maxConsecutiveFailures: LOCALBUDDY_MAX_CONSECUTIVE_FAILURES,
+      });
+      if (startGate === "retry_exhausted" || startGate === "backoff") {
+        return;
+      }
+      const portAvailable = await isPortAvailable(nextPort);
+      if (!portAvailable) {
+        markLocalBuddyUnexpectedFailure(`port ${nextPort} is unavailable`);
+        return;
+      }
+      if (previousEnabled !== nextEnabled) {
+        console.log(
+          "[start] LocalBuddy enabled via runtime config (localbuddy.enabled=true); starting LocalBuddy.",
+        );
+      } else {
+        console.log("[start] LocalBuddy is enabled but not running; starting LocalBuddy.");
+      }
+      try {
+        await ensureLocalBuddyManagedStartReady(bunExecPath);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        console.warn(`[start] LocalBuddy readiness preflight failed: ${detail}`);
+        markLocalBuddyUnexpectedFailure(`preflight failed: ${detail}`);
+        return;
+      }
+      await startLocalBuddyManagedProcess("runtime config enabled", bunExecPath);
+      return;
+    }
+    if (action === "stop") {
+      if (previousEnabled !== nextEnabled) {
+        console.log(
+          "[start] LocalBuddy disabled via runtime config (localbuddy.enabled=false); stopping LocalBuddy.",
+        );
+      } else {
+        console.log("[start] LocalBuddy is disabled but still running; stopping LocalBuddy.");
+      }
+      await stopLocalBuddyManagedProcess("runtime config disabled");
+      resetLocalBuddyRestartBudget();
+    }
+  } catch (err) {
+    console.warn(`[start] LocalBuddy runtime config poll failed: ${String(err)}`);
+  } finally {
+    localBuddyConfigPollInFlight = false;
+  }
+}
+
+function startLocalBuddyRuntimeConfigPolling(bunExecPath: string): void {
+  if (localBuddyConfigPollTimer) return;
+  localBuddyConfigPollTimer = setInterval(() => {
+    void syncLocalBuddyRuntimeConfig(bunExecPath);
+  }, LOCALBUDDY_RUNTIME_CONFIG_POLL_MS);
+}
+
+function stopLocalBuddyRuntimeConfigPolling(): void {
+  if (!localBuddyConfigPollTimer) return;
+  clearInterval(localBuddyConfigPollTimer);
+  localBuddyConfigPollTimer = null;
+}
+
 type CmdResult = {
   ok: boolean;
   exitCode: number;
@@ -2648,12 +3004,35 @@ function isLikelyWorkerPalsProcess(listener: ListeningProcess): boolean {
   );
 }
 
+function resolveConcurrentlyCommand(bunExecPath: string): string[] {
+  try {
+    const req = createRequire(resolve(repoRoot, "package.json"));
+    const packageJsonPath = req.resolve("concurrently/package.json");
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+      bin?: string | Record<string, string>;
+    };
+    const binField = packageJson.bin;
+    const binRelative =
+      typeof binField === "string"
+        ? binField
+        : typeof binField?.concurrently === "string"
+          ? binField.concurrently
+          : Object.values(binField ?? {}).find((value) => typeof value === "string");
+    if (typeof binRelative === "string" && binRelative.trim()) {
+      return [bunExecPath, resolve(dirname(packageJsonPath), binRelative)];
+    }
+  } catch {}
+  return [bunExecPath, "x", "concurrently"];
+}
+
 function requiredStartupPorts(): StartupPortSpec[] {
   const rawPorts: StartupPortSpec[] = [
     { name: "Server", port: CONFIG.server.port },
-    { name: "LocalBuddy", port: CONFIG.localbuddy.port },
     { name: "SourceControlManager", port: CONFIG.sourceControlManager.port },
   ];
+  if (LOCALBUDDY_ENABLED) {
+    rawPorts.splice(1, 0, { name: "LocalBuddy", port: CONFIG.localbuddy.port });
+  }
 
   const out: StartupPortSpec[] = [];
   const seen = new Set<number>();
@@ -4501,13 +4880,15 @@ async function ensureDockerImage(): Promise<void> {
 }
 
 let shuttingDown = false;
-let proc: ReturnType<typeof Bun.spawn> | null = null;
+let proc: SpawnedChild | null = null;
 const shutdown = async (code: number) => {
   if (shuttingDown) return;
   shuttingDown = true;
   try {
     proc?.kill();
   } catch {}
+  stopLocalBuddyRuntimeConfigPolling();
+  await stopLocalBuddyManagedProcess("shutdown");
   await cleanupWorkerWarmContainers("shutdown");
   await stopManagedLmStudio();
   await closeSystemLog();
@@ -4553,14 +4934,48 @@ try {
 }
 
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
+const serviceSpecs = buildCoreManagedServiceSpecs();
 console.log(`[start] Runtime logs are being written to ${relSystemLogPath()}.`);
-proc = Bun.spawn([bunExecPath, "run", "dev:full"], {
+if (!LOCALBUDDY_ENABLED) {
+  console.log(
+    "[start] LocalBuddy disabled (localbuddy.enabled=false); skipping LocalBuddy startup and LLM preflight.",
+  );
+}
+console.log("[start] Building protocol package before launching managed services...");
+const protocolBuildExit = await runInherited([bunExecPath, "run", "protocol:build"], repoRoot);
+if (protocolBuildExit !== 0) {
+  await cleanupWorkerWarmContainers("protocol build failure");
+  await stopManagedLmStudio();
+  await closeSystemLog();
+  process.exit(protocolBuildExit);
+}
+console.log(
+  `[start] Launching managed services: ${serviceSpecs.map((spec) => spec.name).join(", ")}.`,
+);
+const concurrentlyCommand = [
+  ...resolveConcurrentlyCommand(bunExecPath),
+  "-p",
+  "[{time}][{name}]",
+  "-t",
+  "HH:mm:ss",
+  "-n",
+  serviceSpecs.map((spec) => spec.name).join(","),
+  "-c",
+  serviceSpecs.map((spec) => spec.color).join(","),
+  ...serviceSpecs.map((spec) => spec.command),
+];
+proc = Bun.spawn(concurrentlyCommand, {
   stdin: "inherit",
   stdout: "pipe",
   stderr: "pipe",
   env: { ...process.env },
 });
 startSystemLogTail();
+
+if (LOCALBUDDY_ENABLED) {
+  await startLocalBuddyManagedProcess("startup config enabled", bunExecPath);
+}
+startLocalBuddyRuntimeConfigPolling(bunExecPath);
 
 const devStdoutPump = pipeProcStreamToSystemLog(proc.stdout);
 const devStderrPump = pipeProcStreamToSystemLog(proc.stderr);
@@ -4575,7 +4990,9 @@ await Promise.race([
   startupWarmupPromise,
   new Promise((resolveWait) => setTimeout(resolveWait, 500)),
 ]);
-await cleanupWorkerWarmContainers("dev:full exit");
+stopLocalBuddyRuntimeConfigPolling();
+await stopLocalBuddyManagedProcess("core services exit");
+await cleanupWorkerWarmContainers("managed services exit");
 await stopManagedLmStudio();
 await closeSystemLog();
 process.exit(exitCode);

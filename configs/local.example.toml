@@ -1,6 +1,11 @@
 # Copy this file to configs/local.toml for machine-specific, non-secret overrides.
 # Keep secrets in .env (or CI secret store), not in TOML.
 
+# Uncomment to enable LocalBuddy when using `bun run start`.
+# The `bun run start` supervisor applies `localbuddy.enabled` changes live.
+# [localbuddy]
+# enabled = true
+
 [localbuddy.llm]
 backend = "openai_codex"
 model = "gpt-5-codex"

@@ -18,7 +18,11 @@ import {
   loadPromptTemplate,
   loadPushPalsConfig,
 } from "shared";
-import { createLLMClient, type LLMClient } from "../../remotebuddy/src/llm.js";
+import {
+  createLLMClient,
+  preflightServiceLlm,
+  type LLMClient,
+} from "../../remotebuddy/src/llm.js";
 import {
   buildJobStatusReply,
   buildRequestStatusReply,
@@ -39,12 +43,14 @@ function parseArgs(): {
   port: number;
   sessionId: string;
   authToken: string | null;
+  validateConfig: boolean;
 } {
   const args = process.argv.slice(2);
   let server = CONFIG.server.url;
   let port = CONFIG.localbuddy.port;
   let sessionId = CONFIG.sessionId;
   let authToken = CONFIG.authToken;
+  let validateConfig = false;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -60,10 +66,13 @@ function parseArgs(): {
       case "--token":
         authToken = args[++i];
         break;
+      case "--validate-config":
+        validateConfig = true;
+        break;
     }
   }
 
-  return { server, port, sessionId, authToken };
+  return { server, port, sessionId, authToken, validateConfig };
 }
 
 function parseStatusHeartbeatMs(fallbackMs: number): number {
@@ -1044,6 +1053,12 @@ async function connectWithRetry(
 
 async function main() {
   const opts = parseArgs();
+
+  if (opts.validateConfig) {
+    await preflightServiceLlm({ service: "localbuddy" });
+    console.log("[LocalBuddy] Config preflight passed.");
+    return;
+  }
 
   console.log(`[LocalBuddy] PushPals LocalBuddy - HTTP Server`);
   console.log(`[LocalBuddy] Server: ${opts.server}`);

@@ -23,6 +23,7 @@ stale_claim_ttl_ms = 120000
 stale_claim_sweep_interval_ms = 5000
 
 [localbuddy]
+enabled = false
 port = 3003
 status_heartbeat_ms = 120000
 

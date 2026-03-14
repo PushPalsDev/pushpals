@@ -46,6 +46,17 @@ export {
   type PushPalsLmStudioConfig,
 } from "./config.js";
 export {
+  DEFAULT_LOCALBUDDY_PORT,
+  computeLocalBuddyRestartBackoffMs,
+  loadLocalBuddyRuntimeSnapshotFromFiles,
+  parseLocalBuddyRuntimeSnapshot,
+  resolveLocalBuddyRuntimeAction,
+  resolveLocalBuddyStartGate,
+  type LocalBuddyRuntimeAction,
+  type LocalBuddyRuntimeSnapshot,
+  type LocalBuddyStartGateReason,
+} from "./localbuddy_runtime.js";
+export {
   classifyGlobBreadth,
   componentRootPrefix,
   containsGlobMeta,

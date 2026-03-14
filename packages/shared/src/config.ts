@@ -81,6 +81,7 @@ export interface PushPalsConfig {
     staleClaimSweepIntervalMs: number;
   };
   localbuddy: {
+    enabled: boolean;
     port: number;
     statusHeartbeatMs: number;
     llm: PushPalsLlmConfig;
@@ -698,6 +699,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const globalStatusHeartbeatMs = parseIntEnv("PUSHPALS_STATUS_HEARTBEAT_MS");
 
   const localNode = getObject(merged, "localbuddy");
+  const localEnabled = parseBoolEnv("LOCALBUDDY_ENABLED") ?? asBoolean(localNode.enabled, false);
   const localPort = Math.max(1, asInt(parseIntEnv("LOCAL_AGENT_PORT") ?? localNode.port, 3003));
   const localStatusHeartbeatMs = Math.max(
     0,
@@ -1463,6 +1465,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       staleClaimSweepIntervalMs,
     },
     localbuddy: {
+      enabled: localEnabled,
       port: localPort,
       statusHeartbeatMs: localStatusHeartbeatMs,
       llm: localLlm,
