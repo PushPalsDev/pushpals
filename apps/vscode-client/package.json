@@ -41,12 +41,7 @@
         "pushpals.serverUrl": {
           "type": "string",
           "default": "http://127.0.0.1:3001",
-          "description": "PushPals server base URL used by the VS Code client."
-        },
-        "pushpals.authToken": {
-          "type": "string",
-          "default": "",
-          "description": "Optional bearer token for authenticated PushPals server routes."
+          "description": "PushPals server base URL used by the VS Code client. Hostnames are coerced to 127.0.0.1 in local-only mode."
         },
         "pushpals.workerDockerImage": {
           "type": "string",
@@ -62,6 +57,11 @@
           "type": "boolean",
           "default": false,
           "description": "Automatically start PushPals stack when this extension activates."
+        },
+        "pushpals.cliCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional command or absolute path for the installed PushPals CLI used when the workspace is not a PushPals source checkout. Defaults to pushpals (or pushpals.cmd on Windows)."
         }
       }
     }

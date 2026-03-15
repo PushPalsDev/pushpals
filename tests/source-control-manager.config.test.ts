@@ -21,6 +21,16 @@ describe("source_control_manager config", () => {
     expect(merged.pollIntervalSeconds).toBe(42);
   });
 
+  test("applyCliOverrides coerces server overrides back to loopback and strips auth tokens", () => {
+    const config = loadConfig();
+    const merged = applyCliOverrides(config, {
+      serverUrl: "https://pushpals.example:4551",
+      authToken: "secret-token",
+    });
+    expect(merged.serverUrl).toBe("http://127.0.0.1:4551");
+    expect(merged.authToken).toBeUndefined();
+  });
+
   test("loadConfig returns independent checks arrays", () => {
     const first = loadConfig();
     first.checks.push({ name: "temp", command: "echo temp", timeoutMs: 1000 });

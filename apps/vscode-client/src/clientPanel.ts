@@ -1,5 +1,7 @@
 import * as crypto from "node:crypto";
 import * as vscode from "vscode";
+import { resolveBrowserClientUrl } from "./browser_client_url";
+import { normalizeVscodeServerUrl } from "./local_server_url";
 import WebSocket from "ws";
 import { reconnectDelayMs } from "./reconnectPolicy";
 import { createSessionId, sessionStorageKeyForWorkspace } from "./session";
@@ -159,7 +161,9 @@ export class PushPalsClientPanel implements vscode.Disposable {
         return;
       }
       if (message.type === "openBrowserClient") {
-        await vscode.env.openExternal(vscode.Uri.parse("http://127.0.0.1:8081"));
+        const browserUrl = await resolveBrowserClientUrl(process.env, this.resolveWorkspaceRoot());
+        this.output.appendLine(`[client] opening browser client ${browserUrl}`);
+        await vscode.env.openExternal(vscode.Uri.parse(browserUrl));
       }
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -221,8 +225,11 @@ export class PushPalsClientPanel implements vscode.Disposable {
     this.output.appendLine(`[client] ensuring session ${this.sessionId} at ${url}`);
     const response = await fetch(url, {
       method: "POST",
-      headers: this.authHeaders(true),
-      body: JSON.stringify({ sessionId: this.sessionId }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: this.sessionId,
+        client: this.clientRegistration(),
+      }),
     });
     if (!response.ok) {
       const body = await response.text();
@@ -234,7 +241,7 @@ export class PushPalsClientPanel implements vscode.Disposable {
     const url = `${this.serverUrl()}/sessions/${encodeURIComponent(this.sessionId)}/message`;
     const response = await fetch(url, {
       method: "POST",
-      headers: this.authHeaders(true),
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
     if (!response.ok) {
@@ -258,13 +265,11 @@ export class PushPalsClientPanel implements vscode.Disposable {
   }
 
   private async connectWebSocket(): Promise<void> {
-    const wsUrl = `${this.wsUrlBase()}/sessions/${encodeURIComponent(this.sessionId)}/ws?after=0`;
+    const wsUrl = `${this.wsUrlBase()}/sessions/${encodeURIComponent(this.sessionId)}/ws${this.clientTransportQuery()}`;
     this.post({ type: "connection", connected: false, status: "connecting" });
     this.output.appendLine(`[client] connecting websocket ${wsUrl}`);
 
-    const ws = new WebSocket(wsUrl, {
-      headers: this.authHeaders(false),
-    });
+    const ws = new WebSocket(wsUrl);
     this.ws = ws;
 
     await new Promise<void>((resolvePromise, rejectPromise) => {
@@ -323,7 +328,7 @@ export class PushPalsClientPanel implements vscode.Disposable {
     const configured =
       vscode.workspace.getConfiguration("pushpals").get<string>("serverUrl") ??
       "http://127.0.0.1:3001";
-    return configured.replace(/\/+$/, "");
+    return normalizeVscodeServerUrl(configured);
   }
 
   private wsUrlBase(): string {
@@ -333,12 +338,39 @@ export class PushPalsClientPanel implements vscode.Disposable {
     return http;
   }
 
-  private authHeaders(includeJsonContentType: boolean): Record<string, string> {
-    const headers: Record<string, string> = {};
-    if (includeJsonContentType) headers["Content-Type"] = "application/json";
-    const token = (vscode.workspace.getConfiguration("pushpals").get<string>("authToken") ?? "").trim();
-    if (token) headers.Authorization = `Bearer ${token}`;
-    return headers;
+  private clientRegistration(): {
+    clientId: string;
+    kind: string;
+    label: string;
+    version: string;
+    platform: string;
+    repoRoot: string;
+  } {
+    const version =
+      String((this.context.extension.packageJSON as { version?: string } | undefined)?.version ?? "").trim() ||
+      "unknown";
+    return {
+      clientId: `vscode-${this.sessionId}`,
+      kind: "vscode",
+      label: "VS Code",
+      version,
+      platform: `${process.platform}/${process.arch}`,
+      repoRoot: this.resolveWorkspaceRoot(),
+    };
+  }
+
+  private clientTransportQuery(): string {
+    const client = this.clientRegistration();
+    const params = new URLSearchParams({
+      after: "0",
+      clientId: client.clientId,
+      clientKind: client.kind,
+      clientLabel: client.label,
+      clientVersion: client.version,
+      clientPlatform: client.platform,
+      clientRepoRoot: client.repoRoot,
+    });
+    return `?${params.toString()}`;
   }
 
   private getOrCreateSessionId(): string {

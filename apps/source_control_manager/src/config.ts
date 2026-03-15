@@ -1,5 +1,6 @@
 import { resolve } from "path";
 import { loadPushPalsConfig, type PushPalsConfig } from "../../../packages/shared/src/config.js";
+import { resolveLocalServerConnection } from "../../../packages/shared/src/local_network.js";
 
 export type ReviewAgentConfig = PushPalsConfig["sourceControlManager"]["reviewAgent"];
 type SharedSourceControlManagerConfig = PushPalsConfig["sourceControlManager"];
@@ -36,10 +37,15 @@ export interface SourceControlManagerConfig
 }
 
 const PUSH_CONFIG = loadPushPalsConfig();
+const DEFAULT_LOCAL_SERVER = resolveLocalServerConnection({
+  serverUrl: PUSH_CONFIG.server.url,
+  authToken: PUSH_CONFIG.authToken,
+  fallbackPort: PUSH_CONFIG.server.port,
+});
 
 const DEFAULTS: SourceControlManagerConfig = {
   repoPath: resolve(PUSH_CONFIG.sourceControlManager.repoPath),
-  serverUrl: PUSH_CONFIG.server.url,
+  serverUrl: DEFAULT_LOCAL_SERVER.serverUrl,
   remote: PUSH_CONFIG.sourceControlManager.remote,
   mainBranch: PUSH_CONFIG.sourceControlManager.mainBranch,
   integrationBaseBranch: PUSH_CONFIG.sourceControlManager.baseBranch,
@@ -57,7 +63,7 @@ const DEFAULTS: SourceControlManagerConfig = {
   prTitle: PUSH_CONFIG.sourceControlManager.prTitle,
   prBody: PUSH_CONFIG.sourceControlManager.prBody,
   prDraft: PUSH_CONFIG.sourceControlManager.prDraft,
-  authToken: PUSH_CONFIG.authToken ?? undefined,
+  authToken: undefined,
   gitToken: PUSH_CONFIG.gitToken,
   statusHeartbeatMs: PUSH_CONFIG.sourceControlManager.statusHeartbeatMs,
   skipCleanCheck: PUSH_CONFIG.sourceControlManager.skipCleanCheck,
@@ -92,6 +98,14 @@ export function applyCliOverrides(
       (merged as any)[key] = value;
     }
   }
+
+  const resolved = resolveLocalServerConnection({
+    serverUrl: merged.serverUrl,
+    authToken: merged.authToken ?? null,
+    fallbackPort: PUSH_CONFIG.server.port,
+  });
+  merged.serverUrl = resolved.serverUrl;
+  merged.authToken = undefined;
 
   return merged;
 }

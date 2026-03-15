@@ -4,11 +4,18 @@ import { JobQueue } from "./jobs.js";
 import { RequestQueue } from "./requests.js";
 import { CompletionQueue } from "./completions.js";
 import { AutonomyStore } from "./autonomy.js";
+import {
+  ClientPresenceRegistry,
+  readClientPresenceFromSessionBody,
+  readClientPresenceFromTransportRequest,
+} from "./client_presence.js";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import {
+  buildLocalCorsHeaders,
   invalidatePushPalsConfigCache,
   inferGitBackendFromRemote,
+  isLoopbackOrigin,
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,
   sanitizeGitRemoteUrl,
@@ -34,12 +41,22 @@ const jobQueue = new JobQueue(sharedDbPath);
 const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
 const autonomyStore = new AutonomyStore(sharedDbPath);
+const clientPresence = new ClientPresenceRegistry();
+const clientPresencePruneTimer = setInterval(() => {
+  const removed = clientPresence.pruneExpired();
+  if (removed > 0) {
+    console.log(`[Client] pruned ${removed} stale presence record(s)`);
+  }
+}, 60_000);
+clientPresencePruneTimer.unref?.();
+sessionManager.authToken = null;
 const REPO_STATUS_CACHE_TTL_MS = 60_000;
 const SERVER_STARTED_AT_MS = Date.now();
 const SERVER_STARTED_AT_ISO = new Date(SERVER_STARTED_AT_MS).toISOString();
 const AUTONOMY_BUSY_QUEUE_MAX_REQUESTS = 5;
 const AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS = 10;
 const AUTONOMY_WORKER_TTL_MS = 15_000;
+const CLIENT_TRANSPORT_HEARTBEAT_MS = 15_000;
 
 interface RepoStatusSummary {
   remote: string;
@@ -106,6 +123,9 @@ async function getRepoStatusSummary(repoPath: string, remote: string): Promise<R
 
 export function createRequestHandler() {
   const startupConfig = loadPushPalsConfig();
+  if (startupConfig.authToken) {
+    console.warn("[Server] Ignoring configured auth token; PushPals runs in local-only mode.");
+  }
   const port = startupConfig.server.port;
   const hostname = startupConfig.server.host;
   const isDebugHttpLogsEnabled = (): boolean => loadPushPalsConfig().server.debugHttp;
@@ -120,14 +140,26 @@ export function createRequestHandler() {
       const url = new URL(req.url);
       const pathname = url.pathname;
       const method = req.method;
+      const originHeader = req.headers.get("origin");
+      if (originHeader && !isLoopbackOrigin(originHeader)) {
+        return new Response(JSON.stringify({ ok: false, message: "Forbidden origin" }), {
+          status: 403,
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+      const corsHeaders = buildLocalCorsHeaders({
+        origin: originHeader,
+        allowAuthorizationHeader: true,
+      });
 
       // Common JSON headers (CORS + no-store cache)
       const jsonHeaders: Record<string, string> = {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "content-type, authorization",
         "Cache-Control": "no-store",
+        ...corsHeaders,
       };
 
       const makeJson = (body: unknown, status = 200) =>
@@ -354,10 +386,7 @@ export function createRequestHandler() {
 
       // ── Auth helper ──────────────────────────────────────────────────────
       const requestAuthHeader = (): string | null =>
-        resolveRequestAuthHeader(
-          req.headers.get("authorization"),
-          url.searchParams.get("authToken"),
-        );
+        resolveRequestAuthHeader(req.headers.get("authorization"));
 
       const requireAuth = (): Response | null => {
         const authHeader = requestAuthHeader();
@@ -423,11 +452,14 @@ export function createRequestHandler() {
         // Invalidate + reload so runtime reads pick up file/env changes immediately.
         invalidatePushPalsConfigCache();
         const nextConfig = loadPushPalsConfig({ reload: true });
-        sessionManager.authToken = nextConfig.authToken;
+        sessionManager.authToken = null;
         repoStatusCache = null;
 
         const impact = deriveRuntimeConfigImpact(applyResult.applied.map((change) => change.key));
         const warnings = [...applyResult.warnings, ...impact.warnings];
+        if (nextConfig.authToken) {
+          warnings.push("Server auth tokens are ignored because PushPals runs in local-only mode.");
+        }
 
         return makeJson(
           {
@@ -462,6 +494,10 @@ export function createRequestHandler() {
             400,
           );
         }
+        const client = readClientPresenceFromSessionBody(body, req.headers);
+        if (client && result.id) {
+          clientPresence.announce(result.id, client, "session");
+        }
         return makeJson(
           { sessionId: result.id, protocolVersion: PROTOCOL_VERSION },
           result.created ? 201 : 200,
@@ -495,20 +531,65 @@ export function createRequestHandler() {
         }
 
         const encoder = new TextEncoder();
+        const client = readClientPresenceFromTransportRequest(url, req.headers);
+        const clientConnectionId = client ? randomUUID() : null;
+        if (client) {
+          clientPresence.connect(sessionId, client, "sse", clientConnectionId!);
+        }
         let unsubscribe: (() => void) | null = null;
         let pingInterval: NodeJS.Timeout | null = null;
+        let cleanedUp = false;
+        const cleanupSse = () => {
+          if (cleanedUp) return;
+          cleanedUp = true;
+          if (pingInterval) {
+            clearInterval(pingInterval);
+            pingInterval = null;
+          }
+          if (unsubscribe) {
+            const fn = unsubscribe;
+            unsubscribe = null;
+            fn();
+          }
+          if (client) {
+            clientPresence.disconnect(client.clientId, "sse", clientConnectionId!);
+          }
+        };
 
         const readableStream = new ReadableStream<Uint8Array>({
           start(controller) {
             // Send initial keepalive
-            controller.enqueue(encoder.encode(": keepalive\n\n"));
+            try {
+              controller.enqueue(encoder.encode(": keepalive\n\n"));
+              if (client) {
+                clientPresence.touch(client.clientId, "sse", clientConnectionId!);
+              }
+            } catch {
+              cleanupSse();
+              try {
+                controller.close();
+              } catch {
+                // best effort
+              }
+              return;
+            }
 
             // Replay history from SQLite (cursor-based)
             session.replayHistory((envelope: EventEnvelope, eventId: number) => {
               const eventData = `id: ${eventId}\ndata: ${JSON.stringify({ envelope, cursor: eventId })}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
-              } catch (_e) {}
+                if (client) {
+                  clientPresence.touch(client.clientId, "sse", clientConnectionId!);
+                }
+              } catch (_e) {
+                cleanupSse();
+                try {
+                  controller.close();
+                } catch {
+                  // best effort
+                }
+              }
             }, afterEventId);
 
             // Subscribe to live events
@@ -516,28 +597,38 @@ export function createRequestHandler() {
               const eventData = `id: ${eventId}\ndata: ${JSON.stringify({ envelope, cursor: eventId })}\n\n`;
               try {
                 controller.enqueue(encoder.encode(eventData));
-              } catch (err) {
-                if (pingInterval) clearInterval(pingInterval);
-                if (unsubscribe) unsubscribe();
+                if (client) {
+                  clientPresence.touch(client.clientId, "sse", clientConnectionId!);
+                }
+              } catch (_err) {
+                cleanupSse();
                 try {
                   controller.close();
-                } catch (_e) {}
+                } catch {
+                  // best effort
+                }
               }
             });
 
-            // Keepalive ping every 15 seconds
+            // Keepalive ping keeps SSE connections observable for stale-client pruning.
             pingInterval = setInterval(() => {
               try {
                 controller.enqueue(encoder.encode(": keepalive\n\n"));
+                if (client) {
+                  clientPresence.touch(client.clientId, "sse", clientConnectionId!);
+                }
               } catch (_err) {
-                if (pingInterval) clearInterval(pingInterval);
-                if (unsubscribe) unsubscribe();
+                cleanupSse();
+                try {
+                  controller.close();
+                } catch {
+                  // best effort
+                }
               }
-            }, 15000);
+            }, CLIENT_TRANSPORT_HEARTBEAT_MS);
           },
           cancel() {
-            if (pingInterval) clearInterval(pingInterval);
-            if (unsubscribe) unsubscribe();
+            cleanupSse();
           },
         });
 
@@ -546,9 +637,7 @@ export function createRequestHandler() {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-            "Access-Control-Allow-Headers": "content-type, authorization",
+            ...corsHeaders,
           },
         });
       }
@@ -577,8 +666,15 @@ export function createRequestHandler() {
           );
         }
 
+        const client = readClientPresenceFromTransportRequest(url, req.headers);
+        const clientConnectionId = client ? randomUUID() : null;
         const success = server.upgrade(req, {
-          data: { sessionId, afterEventId } as any,
+          data: {
+            sessionId,
+            afterEventId,
+            client,
+            clientConnectionId,
+          } as any,
         });
 
         if (success) {
@@ -725,6 +821,7 @@ export function createRequestHandler() {
           jobFailureRate,
         });
         const llmUsage = autonomyStore.getLlmUsageSummary({ windowHours: 24 });
+        const clients = clientPresence.snapshot();
 
         return makeJson({
           ok: true,
@@ -768,6 +865,7 @@ export function createRequestHandler() {
           llmUsage,
           autonomy: autonomyOps,
           repo,
+          clients,
         });
       }
 
@@ -1662,8 +1760,24 @@ export function createRequestHandler() {
 
     websocket: {
       open(ws: any) {
-        const { sessionId, afterEventId = 0 } = ws.data || {};
+        const { sessionId, afterEventId = 0, client, clientConnectionId } = ws.data || {};
         console.log(`[WS] Session ${sessionId} connected (after=${afterEventId})`);
+        if (client) {
+          clientPresence.connect(sessionId, client, "ws", clientConnectionId);
+        }
+        const heartbeatTimer = setInterval(() => {
+          try {
+            ws.ping("pushpals");
+          } catch {
+            try {
+              clearInterval(heartbeatTimer);
+            } catch {
+              // best effort
+            }
+          }
+        }, CLIENT_TRANSPORT_HEARTBEAT_MS);
+        heartbeatTimer.unref?.();
+        ws.data = { ...(ws.data || {}), heartbeatTimer };
 
         const session = sessionManager.getSession(sessionId);
         if (!session) {
@@ -1702,11 +1816,17 @@ export function createRequestHandler() {
           }
         });
 
-        ws.data = { sessionId, unsubscribe };
+        ws.data = { sessionId, unsubscribe, client, clientConnectionId };
       },
       close(ws: any) {
-        const { sessionId, unsubscribe } = ws.data || {};
+        const { sessionId, unsubscribe, client, clientConnectionId, heartbeatTimer } = ws.data || {};
         console.log(`[WS] Session ${sessionId} disconnected`);
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+        }
+        if (client) {
+          clientPresence.disconnect(client.clientId, "ws", clientConnectionId);
+        }
         if (unsubscribe) {
           try {
             unsubscribe();
@@ -1714,8 +1834,17 @@ export function createRequestHandler() {
         }
       },
       message(ws: any, message: any) {
-        const { sessionId } = ws.data || {};
+        const { sessionId, client, clientConnectionId } = ws.data || {};
         console.log(`[WS] Session ${sessionId} message:`, message);
+        if (client) {
+          clientPresence.touch(client.clientId, "ws", clientConnectionId);
+        }
+      },
+      pong(ws: any) {
+        const { client, clientConnectionId } = ws.data || {};
+        if (client) {
+          clientPresence.touch(client.clientId, "ws", clientConnectionId);
+        }
       },
     },
   });

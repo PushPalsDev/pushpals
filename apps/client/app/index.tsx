@@ -135,7 +135,12 @@ export default function DashboardScreen() {
     baseUrl: RUNTIME_CONFIG.serverUrl,
     localAgentUrl: RUNTIME_CONFIG.localAgentUrl,
     sessionId: RUNTIME_CONFIG.sessionId,
-    authToken: RUNTIME_CONFIG.authToken,
+    clientInfo: {
+      clientId: RUNTIME_CONFIG.clientId ?? undefined,
+      kind: RUNTIME_CONFIG.clientKind,
+      label: RUNTIME_CONFIG.clientLabel,
+      platform: "web",
+    },
   });
   const colorScheme = useColorScheme();
   const { width } = useWindowDimensions();
@@ -213,13 +218,13 @@ export default function DashboardScreen() {
       autonomyData,
       autonomyQuestionData,
     ] = await Promise.all([
-      fetchWorkers(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
-      fetchRequestsSnapshot(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
-      fetchJobsSnapshot(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
-      fetchCompletionsSnapshot(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
-      fetchSystemStatus(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken),
-      fetchAutonomyInsights(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken, 80),
-      fetchAutonomyQuestions(RUNTIME_CONFIG.serverUrl, RUNTIME_CONFIG.authToken, {
+      fetchWorkers(RUNTIME_CONFIG.serverUrl),
+      fetchRequestsSnapshot(RUNTIME_CONFIG.serverUrl),
+      fetchJobsSnapshot(RUNTIME_CONFIG.serverUrl),
+      fetchCompletionsSnapshot(RUNTIME_CONFIG.serverUrl),
+      fetchSystemStatus(RUNTIME_CONFIG.serverUrl),
+      fetchAutonomyInsights(RUNTIME_CONFIG.serverUrl, undefined, 80),
+      fetchAutonomyQuestions(RUNTIME_CONFIG.serverUrl, undefined, {
         ...(session.sessionId ? { sessionId: session.sessionId } : {}),
         limit: 120,
       }),
@@ -274,7 +279,7 @@ export default function DashboardScreen() {
           RUNTIME_CONFIG.serverUrl,
           question.id,
           answer,
-          RUNTIME_CONFIG.authToken,
+          undefined,
           question.sessionId || session.sessionId || undefined,
         );
         setAutonomyAnswerResults((prev) => ({ ...prev, [question.id]: result }));
@@ -301,7 +306,7 @@ export default function DashboardScreen() {
           RUNTIME_CONFIG.serverUrl,
           question.id,
           action,
-          RUNTIME_CONFIG.authToken,
+          undefined,
           note,
           question.sessionId || session.sessionId || undefined,
         );
@@ -325,11 +330,11 @@ export default function DashboardScreen() {
     }) => {
       setAutonomySafetyInFlight(true);
       try {
-        const result = await updateAutonomySafety(
-          RUNTIME_CONFIG.serverUrl,
-          update,
-          RUNTIME_CONFIG.authToken,
-        );
+      const result = await updateAutonomySafety(
+        RUNTIME_CONFIG.serverUrl,
+        update,
+        undefined,
+      );
         if (result.ok) await refreshObservability();
         return result;
       } finally {
@@ -704,7 +709,6 @@ export default function DashboardScreen() {
               {activeTab === "config" ? (
                 <ConfigPane
                   baseUrl={RUNTIME_CONFIG.serverUrl}
-                  authToken={RUNTIME_CONFIG.authToken}
                   theme={theme}
                 />
               ) : null}

@@ -28,6 +28,7 @@ import {
   detectRepoRoot,
   loadPromptTemplate,
   loadPushPalsConfig,
+  resolveLocalServerConnection,
   resolveGitTokenForRemote,
 } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
@@ -227,13 +228,25 @@ function parseArgs(): {
     }
   }
 
+  const resolved = resolveLocalServerConnection({
+    serverUrl: server,
+    authToken,
+    fallbackPort: CONFIG.server.port,
+  });
+  if (resolved.serverWasNormalized) {
+    LOG.warn(`Coerced server URL to local-only endpoint: ${resolved.serverUrl}`);
+  }
+  if (resolved.authTokenWasIgnored) {
+    LOG.warn("Ignoring auth token in local-only mode.");
+  }
+
   return {
-    server,
+    server: resolved.serverUrl,
     pollMs,
     heartbeatMs: Number.isFinite(heartbeatMs) && heartbeatMs > 0 ? heartbeatMs : pollMs,
     repo,
     workerId,
-    authToken,
+    authToken: resolved.authToken,
     docker,
     requireDocker,
     dockerImage,

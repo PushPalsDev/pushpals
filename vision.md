@@ -122,6 +122,10 @@ These are tie-breakers. **Order matters.**
    - We will: make the 80% path fast and reliable; experts get escape hatches.
    - We won’t: design the system around edge-case flexibility first.
 
+6. **Local-only control plane**
+   - We will: run PushPals on the user’s machine, bind server/monitor/LocalBuddy interfaces to loopback only, and keep monitoring/log access local to that machine.
+   - We won’t: expose a hosted control plane, advertise non-local monitoring URLs, or rely on auth tokens for same-machine client access.
+
 ---
 
 ## 4) What “good” looks like (measures)

@@ -6,14 +6,53 @@ type TransportType = "auto" | "sse" | "ws";
 /** Extended callback that also receives the server cursor for each event */
 export type CursorEventCallback = (event: EventEnvelope, cursor: number) => void;
 
-function buildSessionTransportQuery(afterCursor = 0, authToken?: string): string {
+export interface ClientRegistration {
+  clientId: string;
+  kind: string;
+  label?: string;
+  version?: string;
+  platform?: string;
+  repoRoot?: string;
+}
+
+export interface SystemClientSummary {
+  clientId: string;
+  kind: string;
+  label?: string;
+  version?: string;
+  platform?: string;
+  repoRoot?: string;
+  userAgent?: string;
+  sessionId: string;
+  status: "connected" | "announced";
+  connectedTransports: Array<"session" | "sse" | "ws">;
+  announcedAt: string;
+  lastSeenAt: string;
+}
+
+export interface SystemClientsSummary {
+  total: number;
+  connected: number;
+  byKind: Record<string, number>;
+  items: SystemClientSummary[];
+}
+
+function buildSessionTransportQuery(
+  afterCursor = 0,
+  _authToken?: string,
+  client?: ClientRegistration,
+): string {
   const params = new URLSearchParams();
   if (afterCursor > 0) {
     params.set("after", String(afterCursor));
   }
-  const token = String(authToken ?? "").trim();
-  if (token) {
-    params.set("authToken", token);
+  if (client) {
+    params.set("clientId", client.clientId);
+    params.set("clientKind", client.kind);
+    if (client.label) params.set("clientLabel", client.label);
+    if (client.version) params.set("clientVersion", client.version);
+    if (client.platform) params.set("clientPlatform", client.platform);
+    if (client.repoRoot) params.set("clientRepoRoot", client.repoRoot);
   }
   const query = params.toString();
   return query ? `?${query}` : "";
@@ -24,8 +63,9 @@ export function buildSessionEventsUrl(
   sessionId: string,
   afterCursor: number = 0,
   authToken?: string,
+  client?: ClientRegistration,
 ): string {
-  return `${baseUrl}/sessions/${encodeURIComponent(sessionId)}/events${buildSessionTransportQuery(afterCursor, authToken)}`;
+  return `${baseUrl}/sessions/${encodeURIComponent(sessionId)}/events${buildSessionTransportQuery(afterCursor, authToken, client)}`;
 }
 
 export function buildSessionWebSocketUrl(
@@ -33,10 +73,11 @@ export function buildSessionWebSocketUrl(
   sessionId: string,
   afterCursor: number = 0,
   authToken?: string,
+  client?: ClientRegistration,
 ): string {
   const protocol = baseUrl.startsWith("https") ? "wss" : "ws";
   const host = baseUrl.replace(/^https?:\/\//, "");
-  return `${protocol}://${host}/sessions/${encodeURIComponent(sessionId)}/ws${buildSessionTransportQuery(afterCursor, authToken)}`;
+  return `${protocol}://${host}/sessions/${encodeURIComponent(sessionId)}/ws${buildSessionTransportQuery(afterCursor, authToken, client)}`;
 }
 
 function randomEventId(): string {
@@ -85,6 +126,7 @@ function subscribeSSE(
   onEvent: CursorEventCallback,
   afterCursor: number = 0,
   authToken?: string,
+  client?: ClientRegistration,
 ): () => void {
   let disposed = false;
   let es: EventSource | null = null;
@@ -93,7 +135,7 @@ function subscribeSSE(
 
   function connect() {
     if (disposed) return;
-    es = new EventSource(buildSessionEventsUrl(baseUrl, sessionId, latestCursor, authToken));
+    es = new EventSource(buildSessionEventsUrl(baseUrl, sessionId, latestCursor, authToken, client));
 
     es.addEventListener("message", (event) => {
       try {
@@ -153,6 +195,7 @@ function subscribeWebSocket(
   onEvent: CursorEventCallback,
   afterCursor: number = 0,
   authToken?: string,
+  client?: ClientRegistration,
 ): () => void {
   let disposed = false;
   let ws: WebSocket | null = null;
@@ -161,7 +204,7 @@ function subscribeWebSocket(
 
   function connect() {
     if (disposed) return;
-    ws = new WebSocket(buildSessionWebSocketUrl(baseUrl, sessionId, latestCursor, authToken));
+    ws = new WebSocket(buildSessionWebSocketUrl(baseUrl, sessionId, latestCursor, authToken, client));
 
     ws.onmessage = (event) => {
       try {
@@ -233,6 +276,7 @@ export function subscribeEvents(
   transport: TransportType = "auto",
   afterCursor: number = 0,
   authToken?: string,
+  client?: ClientRegistration,
 ): () => void {
   const selectedTransport = selectTransport(transport);
 
@@ -241,9 +285,9 @@ export function subscribeEvents(
   );
 
   if (selectedTransport === "sse") {
-    return subscribeSSE(baseUrl, sessionId, onEvent, afterCursor, authToken);
+    return subscribeSSE(baseUrl, sessionId, onEvent, afterCursor, authToken, client);
   } else {
-    return subscribeWebSocket(baseUrl, sessionId, onEvent, afterCursor, authToken);
+    return subscribeWebSocket(baseUrl, sessionId, onEvent, afterCursor, authToken, client);
   }
 }
 
@@ -254,12 +298,16 @@ export async function createSession(
   baseUrl: string,
   sessionId?: string,
   authToken?: string,
+  client?: ClientRegistration,
 ): Promise<{ sessionId: string; created: boolean } | null> {
   try {
     const response = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders(authToken) },
-      body: JSON.stringify(sessionId ? { sessionId } : {}),
+      body: JSON.stringify({
+        ...(sessionId ? { sessionId } : {}),
+        ...(client ? { client } : {}),
+      }),
     });
 
     if (!response.ok) {
@@ -536,6 +584,7 @@ export interface SystemStatusSummary {
   repo?: SystemRepoSummary;
   autonomy?: AutonomyOpsSummary;
   runtime?: SystemRuntimeSummary;
+  clients?: SystemClientsSummary;
   ts?: string;
 }
 
@@ -813,6 +862,7 @@ export async function fetchSystemStatus(
       autonomy: payload.autonomy,
       repo: payload.repo,
       runtime: payload.runtime,
+      clients: payload.clients,
       ts: payload.ts,
     };
   } catch (err) {

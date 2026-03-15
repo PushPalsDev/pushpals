@@ -1,7 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import * as vscode from "vscode";
 import { PushPalsClientPanel } from "./clientPanel";
+import { findWorkspaceRepoRoot } from "./repo";
 import { StackServiceManager } from "./serviceManager";
 import { WORKSPACE_TRUST_ERROR } from "./workspaceTrust";
 
@@ -22,23 +21,13 @@ async function ensureWorkspaceTrustedForStackOps(): Promise<void> {
 function resolveWorkspaceRoot(): string {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) {
-    throw new Error("Open the PushPals repository folder in VS Code before using this extension.");
+    throw new Error("Open a git repository folder in VS Code before using this extension.");
   }
-  const root = folder.uri.fsPath;
-  const packageJsonPath = resolve(root, "package.json");
-  if (!existsSync(packageJsonPath)) {
-    throw new Error("Workspace root does not contain package.json.");
+  const repoRoot = findWorkspaceRepoRoot(folder.uri.fsPath);
+  if (!repoRoot) {
+    throw new Error("Workspace is not inside a git repository.");
   }
-  try {
-    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { name?: string };
-    if (parsed.name !== "pushpals") {
-      throw new Error(`Expected workspace package name 'pushpals', got '${parsed.name ?? "unknown"}'.`);
-    }
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    throw new Error(`Invalid workspace package.json: ${detail}`);
-  }
-  return root;
+  return repoRoot;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {

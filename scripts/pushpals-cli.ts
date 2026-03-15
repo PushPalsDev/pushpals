@@ -16,6 +16,7 @@ import {
   formatClientRuntimePreflightLines,
   type ClientRuntimePreflightResult,
 } from "../packages/shared/src/client_preflight.js";
+import { resolveGitStateFilePath } from "../packages/shared/src/repo.js";
 
 type CliOptions = {
   serverUrl?: string;
@@ -26,6 +27,7 @@ type CliOptions = {
   runtimeTag?: string;
   noAutoStart: boolean;
   noStream: boolean;
+  runtimeOnly: boolean;
 };
 
 type LocalBuddyHealth = {
@@ -99,7 +101,18 @@ type MonitoringHubRuntimeBootstrap = {
   serverUrl: string;
   localAgentUrl: string;
   sessionId: string;
-  authToken: string | null;
+  clientId: string;
+  clientKind: string;
+  clientLabel: string;
+};
+
+type ClientStreamIdentity = {
+  clientId: string;
+  kind: string;
+  label: string;
+  version: string;
+  platform: string;
+  repoRoot: string;
 };
 
 const DEFAULT_MONITOR_PORT = 8081;
@@ -177,6 +190,7 @@ function printUsage(): void {
   console.log("  --runtime-tag <tag>    Override runtime release tag (e.g. v1.0.2)");
   console.log("  --no-auto-start        Disable runtime auto-start when LocalBuddy is down");
   console.log("  --no-stream            Disable live session event stream");
+  console.log("  --runtime-only         Start the local runtime and wait for shutdown without opening the interactive chat");
   console.log("  -h, --help             Show this help");
   console.log("");
   console.log("Chat commands:");
@@ -192,7 +206,7 @@ function printUsage(): void {
 }
 
 function parseArgs(argv: string[]): CliOptions | null {
-  const options: CliOptions = { noAutoStart: false, noStream: false };
+  const options: CliOptions = { noAutoStart: false, noStream: false, runtimeOnly: false };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -206,6 +220,10 @@ function parseArgs(argv: string[]): CliOptions | null {
     }
     if (arg === "--no-auto-start") {
       options.noAutoStart = true;
+      continue;
+    }
+    if (arg === "--runtime-only") {
+      options.runtimeOnly = true;
       continue;
     }
     if (arg === "--server-url") {
@@ -244,6 +262,31 @@ function normalizeUrl(value: string, fallback = ""): string {
   const text = String(value ?? "").trim();
   const selected = text || fallback;
   return selected.replace(/\/+$/, "");
+}
+
+function normalizeLoopbackUrl(value: string, fallback: string): string {
+  const selected = normalizeUrl(value, fallback);
+  if (!selected) return "";
+  try {
+    const parsed = new URL(selected);
+    parsed.protocol = "http:";
+    parsed.username = "";
+    parsed.password = "";
+    parsed.hostname = "127.0.0.1";
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return normalizeUrl(fallback);
+  }
+}
+
+function isLoopbackUrl(value: string): boolean {
+  try {
+    const parsed = new URL(normalizeUrl(value));
+    const hostname = String(parsed.hostname ?? "").trim().toLowerCase();
+    return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+  } catch {
+    return false;
+  }
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -1039,18 +1082,35 @@ async function fetchJsonWithTimeout<T>(
   }
 }
 
-function authHeaders(authToken: string | null): Record<string, string> {
-  if (!authToken) return {};
-  return { Authorization: `Bearer ${authToken}` };
+function buildClientTransportQuery(
+  cursor: number,
+  client: ClientStreamIdentity,
+): string {
+  const params = new URLSearchParams();
+  if (cursor > 0) params.set("after", String(cursor));
+  params.set("clientId", client.clientId);
+  params.set("clientKind", client.kind);
+  params.set("clientLabel", client.label);
+  params.set("clientVersion", client.version);
+  params.set("clientPlatform", client.platform);
+  params.set("clientRepoRoot", client.repoRoot);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function createRuntimeClientId(prefix: string): string {
+  if (typeof crypto?.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 async function probeLocalBuddy(
   localAgentUrl: string,
-  authToken: string | null,
 ): Promise<LocalBuddyHealth | null> {
   return await fetchJsonWithTimeout<LocalBuddyHealth>(
     `${localAgentUrl}/healthz`,
-    { headers: authHeaders(authToken) },
+    {},
     LOCALBUDDY_TIMEOUT_MS,
   );
 }
@@ -1061,14 +1121,16 @@ async function autoStartRuntimeServices(opts: {
   localAgentUrl: string;
   sourceControlManagerPort: number;
   sourceControlManagerRemote: string;
-  authToken: string | null;
   preparedRuntime: PreparedCliRuntime;
   requestedRuntimeTag?: string;
+  requireLocalBuddy?: boolean;
 }): Promise<RuntimeServiceProcess[]> {
   const { runtimePreflight } = opts.preparedRuntime;
   const runtimeRoot = opts.preparedRuntime.runtimeRoot;
   const runtimeTag =
     opts.preparedRuntime.runtimeTag || (await resolveRuntimeReleaseTag(opts.requestedRuntimeTag));
+  const localBuddyEnabled = Boolean(runtimePreflight.config.localbuddy.enabled);
+  const requireLocalBuddy = opts.requireLocalBuddy ?? true;
 
   console.log(
     `[pushpals] LocalBuddy unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`,
@@ -1145,16 +1207,20 @@ async function autoStartRuntimeServices(opts: {
     console.log("[pushpals] Server already healthy; skipping embedded server start.");
   }
 
-  console.log("[pushpals] Starting embedded LocalBuddy...");
-  const localbuddyService = spawnRuntimeService(
-    "localbuddy",
-    [runtimeBinaries.localbuddy],
-    opts.repoRoot,
-    runtimeEnv,
-    logPathFor("localbuddy"),
-  );
-  services.push(localbuddyService);
-  console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath}`);
+  if (localBuddyEnabled) {
+    console.log("[pushpals] Starting embedded LocalBuddy...");
+    const localbuddyService = spawnRuntimeService(
+      "localbuddy",
+      [runtimeBinaries.localbuddy],
+      opts.repoRoot,
+      runtimeEnv,
+      logPathFor("localbuddy"),
+    );
+    services.push(localbuddyService);
+    console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath}`);
+  } else {
+    console.log("[pushpals] Embedded LocalBuddy disabled by runtime config; skipping start.");
+  }
 
   console.log("[pushpals] Starting embedded RemoteBuddy...");
   const remotebuddyService = spawnRuntimeService(
@@ -1231,8 +1297,8 @@ async function autoStartRuntimeServices(opts: {
       }
     }
 
-    const health = await probeLocalBuddy(opts.localAgentUrl, opts.authToken);
-    if (health?.ok) {
+    const health = localBuddyEnabled ? await probeLocalBuddy(opts.localAgentUrl) : null;
+    if (!requireLocalBuddy || (localBuddyEnabled && health?.ok)) {
       const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;
       while (Date.now() < stabilityDeadline) {
         for (let i = services.length - 1; i >= 0; i--) {
@@ -1265,6 +1331,11 @@ async function autoStartRuntimeServices(opts: {
   }
 
   stopRuntimeServices(services);
+  if (!localBuddyEnabled) {
+    throw new Error(
+      `Timed out waiting for embedded runtime readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
+    );
+  }
   throw new Error(
     `Timed out waiting for LocalBuddy at ${opts.localAgentUrl} after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
   );
@@ -1300,6 +1371,10 @@ function writeCliState(pathValue: string, state: CliState): void {
   writeFileSync(pathValue, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
+export function resolveCliStatePath(repoRoot: string): string | null {
+  return resolveGitStateFilePath(repoRoot, "pushpals-cli-state.json");
+}
+
 async function looksLikeMonitoringHub(url: string): Promise<boolean> {
   try {
     const response = await fetchWithTimeout(url, {}, 700);
@@ -1322,13 +1397,14 @@ function buildMonitoringHubRuntimeBootstrap(opts: {
   serverUrl: string;
   localAgentUrl: string;
   sessionId: string;
-  authToken: string | null;
 }): MonitoringHubRuntimeBootstrap {
   return {
     serverUrl: opts.serverUrl,
     localAgentUrl: opts.localAgentUrl,
     sessionId: opts.sessionId,
-    authToken: opts.authToken,
+    clientId: `cli-monitor-${opts.sessionId}`,
+    clientKind: "cli_monitor",
+    clientLabel: "CLI Monitor",
   };
 }
 
@@ -1563,11 +1639,10 @@ export function buildEmbeddedMonitoringHubHtml(opts: {
 
 async function proxyMonitoringHubRequest(
   serverUrl: string,
-  authToken: string | null,
   pathValue: string,
 ): Promise<Response> {
   const target = `${serverUrl}${pathValue}`;
-  const upstream = await fetchWithTimeout(target, { headers: authHeaders(authToken) }, 10_000);
+  const upstream = await fetchWithTimeout(target, {}, 10_000);
   const body = await upstream.text();
   return new Response(body, {
     status: upstream.status,
@@ -1582,7 +1657,6 @@ export async function startEmbeddedMonitoringHub(opts: {
   serverUrl: string;
   localAgentUrl: string;
   sessionId: string;
-  authToken: string | null;
   preferredPort: number;
   assetRoot?: string | null;
 }): Promise<MonitoringHubHandle | null> {
@@ -1598,7 +1672,6 @@ export async function startEmbeddedMonitoringHub(opts: {
     serverUrl: opts.serverUrl,
     localAgentUrl: opts.localAgentUrl,
     sessionId: opts.sessionId,
-    authToken: opts.authToken,
   });
 
   const candidatePorts = Array.from(
@@ -1610,6 +1683,7 @@ export async function startEmbeddedMonitoringHub(opts: {
     try {
       const server = Bun.serve({
         port,
+        hostname: "127.0.0.1",
         idleTimeout: 30,
         fetch: async (req) => {
           const url = new URL(req.url);
@@ -1622,30 +1696,17 @@ export async function startEmbeddedMonitoringHub(opts: {
             });
           }
           if (url.pathname === "/api/status") {
-            return await proxyMonitoringHubRequest(
-              opts.serverUrl,
-              opts.authToken,
-              "/system/status",
-            );
+            return await proxyMonitoringHubRequest(opts.serverUrl, "/system/status");
           }
           if (url.pathname === "/api/requests") {
-            return await proxyMonitoringHubRequest(
-              opts.serverUrl,
-              opts.authToken,
-              "/requests?status=all&limit=20",
-            );
+            return await proxyMonitoringHubRequest(opts.serverUrl, "/requests?status=all&limit=20");
           }
           if (url.pathname === "/api/jobs") {
-            return await proxyMonitoringHubRequest(
-              opts.serverUrl,
-              opts.authToken,
-              "/jobs?status=all&limit=20",
-            );
+            return await proxyMonitoringHubRequest(opts.serverUrl, "/jobs?status=all&limit=20");
           }
           if (url.pathname === "/api/completions") {
             return await proxyMonitoringHubRequest(
               opts.serverUrl,
-              opts.authToken,
               "/completions?status=all&limit=20",
             );
           }
@@ -1677,16 +1738,20 @@ async function resolveMonitoringHub(opts: {
   serverUrl: string;
   localAgentUrl: string;
   sessionId: string;
-  authToken: string | null;
 }): Promise<MonitoringHubHandle | null> {
   const explicit = normalizeUrl(opts.preferredUrl);
   if (explicit) {
-    if (await looksLikeMonitoringHub(explicit)) {
+    if (!isLoopbackUrl(explicit)) {
+      console.warn(
+        `[pushpals] Preferred monitoring hub ${explicit} is not local; ignoring it and starting a local monitor instead.`,
+      );
+    } else if (await looksLikeMonitoringHub(explicit)) {
       return { url: explicit, port: 0, stop: () => {}, embedded: false };
+    } else {
+      console.warn(
+        `[pushpals] Preferred monitoring hub ${explicit} is unavailable; starting embedded monitor instead.`,
+      );
     }
-    console.warn(
-      `[pushpals] Preferred monitoring hub ${explicit} is unavailable; starting embedded monitor instead.`,
-    );
   }
 
   for (let port = opts.fallbackPort; port < opts.fallbackPort + MONITOR_SCAN_PORTS; port++) {
@@ -1837,18 +1902,17 @@ function formatSessionEventLine(
 async function runSessionStream(
   serverUrl: string,
   sessionId: string,
-  authToken: string | null,
+  client: ClientStreamIdentity,
   print: (line: string) => void,
   signal: AbortSignal,
 ): Promise<void> {
   let cursor = 0;
 
   while (!signal.aborted) {
-    const headers = authHeaders(authToken);
     try {
       const response = await fetchWithTimeout(
-        `${serverUrl}/sessions/${encodeURIComponent(sessionId)}/events${cursor > 0 ? `?after=${cursor}` : ""}`,
-        { headers },
+        `${serverUrl}/sessions/${encodeURIComponent(sessionId)}/events${buildClientTransportQuery(cursor, client)}`,
+        {},
         15_000,
       );
       if (!response.ok || !response.body) {
@@ -1967,18 +2031,17 @@ async function main(): Promise<void> {
   }
 
   const config = preparedRuntime.runtimePreflight.config;
-  const serverUrl = normalizeUrl(
+  const serverUrl = normalizeLoopbackUrl(
     parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL,
     config.server.url,
   );
-  const localAgentUrl = normalizeUrl(
+  const localAgentUrl = normalizeLoopbackUrl(
     parsed.localAgentUrl ?? process.env.EXPO_PUBLIC_LOCAL_AGENT_URL,
     config.client.localAgentUrl,
   );
   const sessionId = String(
     parsed.sessionId ?? process.env.PUSHPALS_SESSION_ID ?? config.sessionId,
   ).trim();
-  const authToken = config.authToken;
   let autoStartedServices: RuntimeServiceProcess[] = [];
   const stopAutoStartedServices = (): void => {
     if (autoStartedServices.length === 0) return;
@@ -1986,8 +2049,10 @@ async function main(): Promise<void> {
     autoStartedServices = [];
   };
 
-  let health = await probeLocalBuddy(localAgentUrl, authToken);
-  if (!health?.ok && !parsed.noAutoStart) {
+  let serverHealthy = await probeServer(serverUrl);
+  let health = await probeLocalBuddy(localAgentUrl);
+  const runtimeNeedsAutoStart = parsed.runtimeOnly ? !serverHealthy : !health?.ok;
+  if (runtimeNeedsAutoStart && !parsed.noAutoStart) {
     try {
       autoStartedServices = await autoStartRuntimeServices({
         repoRoot,
@@ -1995,17 +2060,27 @@ async function main(): Promise<void> {
         localAgentUrl,
         sourceControlManagerPort: config.sourceControlManager.port,
         sourceControlManagerRemote: config.sourceControlManager.remote,
-        authToken,
         preparedRuntime,
         requestedRuntimeTag: parsed.runtimeTag,
+        requireLocalBuddy: !parsed.runtimeOnly,
       });
-      health = await probeLocalBuddy(localAgentUrl, authToken);
+      serverHealthy = await probeServer(serverUrl);
+      health = await probeLocalBuddy(localAgentUrl);
     } catch (err) {
       console.error(`[pushpals] Auto-start failed: ${String(err)}`);
       stopAutoStartedServices();
     }
   }
-  if (!health?.ok) {
+  if (parsed.runtimeOnly && !serverHealthy) {
+    console.error(`[pushpals] Server is unavailable at ${serverUrl}.`);
+    if (parsed.noAutoStart) {
+      console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
+    } else {
+      console.error("[pushpals] Auto-start could not bring the embedded runtime online.");
+    }
+    process.exit(1);
+  }
+  if (!parsed.runtimeOnly && !health?.ok) {
     console.error(`[pushpals] LocalBuddy is unavailable at ${localAgentUrl}.`);
     if (parsed.noAutoStart) {
       console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
@@ -2015,36 +2090,39 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const localBuddyRepo = health.repo ? resolve(health.repo) : "";
-  if (!localBuddyRepo) {
-    stopAutoStartedServices();
-    console.error("[pushpals] LocalBuddy health response did not include repo path.");
-    process.exit(1);
+  let localBuddySessionId = sessionId;
+  if (!parsed.runtimeOnly) {
+    const localBuddyRepo = health?.repo ? resolve(health.repo) : "";
+    if (!localBuddyRepo) {
+      stopAutoStartedServices();
+      console.error("[pushpals] LocalBuddy health response did not include repo path.");
+      process.exit(1);
+    }
+
+    if (normalizePath(localBuddyRepo) !== normalizePath(repoRoot)) {
+      stopAutoStartedServices();
+      console.error("[pushpals] Repo mismatch detected.");
+      console.error(`[pushpals] currentRepo=${repoRoot}`);
+      console.error(`[pushpals] localBuddyRepo=${localBuddyRepo}`);
+      console.error(
+        "[pushpals] LocalBuddy must run against the same repo. Start PushPals from this repo and retry.",
+      );
+      process.exit(1);
+    }
+
+    localBuddySessionId =
+      health?.sessionId && String(health.sessionId).trim()
+        ? String(health.sessionId).trim()
+        : sessionId;
+    if (sessionId && sessionId !== localBuddySessionId) {
+      console.warn(
+        `[pushpals] Requested sessionId=${sessionId}, but LocalBuddy is currently attached to sessionId=${localBuddySessionId}.`,
+      );
+    }
   }
 
-  if (normalizePath(localBuddyRepo) !== normalizePath(repoRoot)) {
-    stopAutoStartedServices();
-    console.error("[pushpals] Repo mismatch detected.");
-    console.error(`[pushpals] currentRepo=${repoRoot}`);
-    console.error(`[pushpals] localBuddyRepo=${localBuddyRepo}`);
-    console.error(
-      "[pushpals] LocalBuddy must run against the same repo. Start PushPals from this repo and retry.",
-    );
-    process.exit(1);
-  }
-
-  const localBuddySessionId =
-    health.sessionId && String(health.sessionId).trim()
-      ? String(health.sessionId).trim()
-      : sessionId;
-  if (sessionId && sessionId !== localBuddySessionId) {
-    console.warn(
-      `[pushpals] Requested sessionId=${sessionId}, but LocalBuddy is currently attached to sessionId=${localBuddySessionId}.`,
-    );
-  }
-
-  const statePath = resolve(repoRoot, ".git", "pushpals-cli-state.json");
-  const saved = readCliState(statePath);
+  const statePath = resolveCliStatePath(repoRoot);
+  const saved = statePath ? readCliState(statePath) : {};
   const preferredHubUrl = normalizeUrl(
     parsed.monitoringHubUrl ?? process.env.PUSHPALS_MONITOR_URL ?? saved.monitoringHubUrl ?? "",
   );
@@ -2055,17 +2133,20 @@ async function main(): Promise<void> {
     serverUrl,
     localAgentUrl,
     sessionId: localBuddySessionId,
-    authToken,
   });
   const monitoringHubUrl = monitoringHub?.url ?? "";
 
-  writeCliState(statePath, {
-    monitoringHubUrl: monitoringHubUrl || undefined,
-    serverUrl,
-    localAgentUrl,
-    sessionId: localBuddySessionId,
-    repoRoot,
-  });
+  if (statePath) {
+    writeCliState(statePath, {
+      monitoringHubUrl: monitoringHubUrl || undefined,
+      serverUrl,
+      localAgentUrl,
+      sessionId: localBuddySessionId,
+      repoRoot,
+    });
+  } else {
+    console.warn("[pushpals] Could not resolve git metadata dir; skipping CLI state persistence.");
+  }
 
   console.log("[pushpals] Connected.");
   if (monitoringHubUrl) {
@@ -2080,9 +2161,22 @@ async function main(): Promise<void> {
   console.log(`[pushpals] localAgentUrl=${localAgentUrl}`);
   console.log(`[pushpals] sessionId=${localBuddySessionId}`);
   console.log(`[pushpals] repoRoot=${repoRoot}`);
-  console.log(`[pushpals] cliStateFile=${statePath}`);
-  console.log("[pushpals] Type a message and press Enter. Use /exit or exit to quit.");
+  console.log(`[pushpals] cliStateFile=${statePath ?? "unavailable"}`);
+  if (parsed.runtimeOnly) {
+    console.log("[pushpals] runtimeOnly=true");
+  } else {
+    console.log("[pushpals] Type a message and press Enter. Use /exit or exit to quit.");
+  }
 
+  const cliVersion = String(process.env.PUSHPALS_CLI_PACKAGE_VERSION ?? "").trim() || "unknown";
+  const cliClient: ClientStreamIdentity = {
+    clientId: createRuntimeClientId("cli"),
+    kind: "cli",
+    label: "CLI",
+    version: cliVersion,
+    platform: `${process.platform}/${process.arch}`,
+    repoRoot,
+  };
   const streamAbort = new AbortController();
   let rl: Interface | null = null;
 
@@ -2098,10 +2192,12 @@ async function main(): Promise<void> {
 
   const streamTask = parsed.noStream
     ? Promise.resolve()
+    : parsed.runtimeOnly
+    ? Promise.resolve()
     : runSessionStream(
         serverUrl,
         localBuddySessionId,
-        authToken,
+        cliClient,
         printIncoming,
         streamAbort.signal,
       );
@@ -2127,6 +2223,42 @@ async function main(): Promise<void> {
   process.once("SIGINT", requestStop);
   process.once("SIGTERM", requestStop);
   process.once("exit", requestStop);
+
+  if (parsed.runtimeOnly) {
+    console.log("[pushpals] Runtime-only mode is active. Send `exit` on stdin or terminate the process to stop.");
+
+    await new Promise<void>((resolveStop) => {
+      let resolved = false;
+      const finish = () => {
+        if (resolved) return;
+        resolved = true;
+        resolveStop();
+      };
+
+      process.once("SIGINT", finish);
+      process.once("SIGTERM", finish);
+
+      const runtimeOnlyInput = createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: false,
+      });
+      runtimeOnlyInput.on("line", (line) => {
+        if (!isCliExitCommand(line)) return;
+        requestStop();
+        runtimeOnlyInput.close();
+        finish();
+      });
+      runtimeOnlyInput.on("close", () => {
+        requestStop();
+        finish();
+      });
+    });
+
+    requestStop();
+    await Promise.race([streamTask, Bun.sleep(2_000)]);
+    return;
+  }
 
   rl = createInterface({
     input: process.stdin,

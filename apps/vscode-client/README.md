@@ -2,7 +2,8 @@
 
 `pushpals-vscode-client` is a VS Code extension client that can:
 
-- Start the local PushPals stack (`server`, `localbuddy`, `remotebuddy`, `workerpals` in Docker mode).
+- Start the local PushPals stack for the current git repo.
+- Use the installed `pushpals` CLI for arbitrary repos, or the repo-local Bun scripts when the workspace is a PushPals source checkout.
 - Build/check the worker Docker image if needed.
 - Open an in-editor client panel to send prompts and stream session events.
 
@@ -16,10 +17,10 @@
 ## Settings
 
 - `pushpals.serverUrl` (default: `http://127.0.0.1:3001`)
-- `pushpals.authToken` (optional)
 - `pushpals.workerDockerImage` (default: `pushpals-worker-sandbox:latest`)
 - `pushpals.includeSourceControlManager` (default: `false`)
 - `pushpals.autoStartStackOnActivate` (default: `false`)
+- `pushpals.cliCommand` (default: `pushpals`, or `pushpals.cmd` on Windows when unset)
 
 ## Packaging
 

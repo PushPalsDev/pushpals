@@ -209,6 +209,7 @@ export function SystemPane({
   const jobSlo = systemSummary.slo?.jobs;
   const llmUsage = systemSummary.llmUsage;
   const runtimeSummary = systemSummary.runtime;
+  const clientsSummary = systemSummary.clients;
   const autonomyOps = systemSummary.autonomy ?? autonomyInsights.opsSummary;
   const safety = autonomyOps?.safetyState ?? null;
   const evaluator = autonomyOps?.latestEvaluatorScorecard ?? autonomyInsights.latestEvaluatorScorecard;
@@ -255,6 +256,18 @@ export function SystemPane({
       return serviceLabel(a.service).localeCompare(serviceLabel(b.service));
     });
   }, [llmUsage]);
+  const clientRows = useMemo(
+    () => clientsSummary?.items ?? [],
+    [clientsSummary],
+  );
+  const clientKindsSummary = useMemo(() => {
+    const entries = Object.entries(clientsSummary?.byKind ?? {}).sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0].localeCompare(b[0]);
+    });
+    if (entries.length === 0) return "no clients";
+    return entries.map(([kind, count]) => `${kind} ${count}`).join(" | ");
+  }, [clientsSummary]);
 
   useEffect(() => {
     setQuestionDrafts((prev) => {
@@ -394,6 +407,13 @@ export function SystemPane({
           value={formatUptime(runtimeSummary?.uptimeMs)}
           detail={runtimeSummary?.startedAt ? `started ${prettyTs(runtimeSummary.startedAt)}` : "--"}
           tone="accent"
+          theme={theme}
+        />
+        <MetricTile
+          title="Connected Clients"
+          value={String(clientsSummary?.connected ?? 0)}
+          detail={`${clientsSummary?.total ?? 0} tracked | ${clientKindsSummary}`}
+          tone={(clientsSummary?.connected ?? 0) > 0 ? "accent" : "warning"}
           theme={theme}
         />
         <MetricTile
@@ -651,6 +671,98 @@ export function SystemPane({
             </View>
           );
         })}
+      </View>
+
+      <View
+        style={[styles.insightPanel, { borderColor: theme.border, backgroundColor: theme.panel }]}
+      >
+        <View style={styles.rowBetween}>
+          <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+            Connected Clients
+          </Text>
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            {clientsSummary?.connected ?? 0} connected / {clientsSummary?.total ?? 0} tracked
+          </Text>
+        </View>
+        <Text style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          {clientKindsSummary}
+        </Text>
+        {clientRows.length === 0 ? (
+          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            No client interfaces have registered yet.
+          </Text>
+        ) : (
+          <View style={styles.systemGrid}>
+            {clientRows.map((client) => {
+              const clientTone = statusColor(theme, client.status);
+              const transportText =
+                client.connectedTransports.length > 0
+                  ? client.connectedTransports.join(", ")
+                  : "no live transport";
+              return (
+                <View
+                  key={client.clientId}
+                  style={[
+                    styles.systemCard,
+                    { borderColor: theme.border, backgroundColor: theme.panelAlt },
+                  ]}
+                >
+                  <View style={styles.rowBetween}>
+                    <Text
+                      style={[styles.systemTitle, { color: theme.text, fontFamily: theme.fontSans }]}
+                    >
+                      {client.label || client.kind}
+                    </Text>
+                    <View
+                      style={[
+                        styles.statusPill,
+                        {
+                          backgroundColor: `${clientTone}22`,
+                          borderColor: `${clientTone}66`,
+                        },
+                      ]}
+                    >
+                      <Text
+                        style={[styles.statusPillText, { color: clientTone, fontFamily: theme.fontSans }]}
+                      >
+                        {client.status}
+                      </Text>
+                    </View>
+                  </View>
+                  <Text
+                    style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                  >
+                    {client.kind} | session {client.sessionId}
+                  </Text>
+                  <Text
+                    style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}
+                  >
+                    {transportText}
+                  </Text>
+                  {(client.version || client.platform) ? (
+                    <Text
+                      style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                    >
+                      {[client.version, client.platform].filter(Boolean).join(" | ")}
+                    </Text>
+                  ) : null}
+                  {client.repoRoot ? (
+                    <Text
+                      style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                    >
+                      {clip(client.repoRoot, 120)}
+                    </Text>
+                  ) : null}
+                  <Text
+                    style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                  >
+                    last seen {relativeMs(client.lastSeenAt)}
+                  </Text>
+                </View>
+              );
+            })}
+          </View>
+        )}
       </View>
 
       <View

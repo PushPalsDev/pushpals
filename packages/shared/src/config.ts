@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "fs";
 import { join, resolve, isAbsolute } from "path";
+import { normalizeLoopbackHost, normalizeLoopbackHttpUrl } from "./local_network.js";
 
 type TomlValue = string | number | boolean | null | TomlObject | TomlValue[];
 interface TomlObject {
@@ -677,12 +678,17 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
 
   const serverNode = getObject(merged, "server");
   const serverPort = Math.max(1, asInt(parseIntEnv("PUSHPALS_PORT") ?? serverNode.port, 3001));
-  const serverUrl = firstNonEmpty(
-    process.env.PUSHPALS_SERVER_URL,
-    asString(serverNode.url, `http://localhost:${serverPort}`),
-    `http://localhost:${serverPort}`,
+  const serverUrl = normalizeLoopbackHttpUrl(
+    firstNonEmpty(
+      process.env.PUSHPALS_SERVER_URL,
+      asString(serverNode.url, `http://127.0.0.1:${serverPort}`),
+      `http://127.0.0.1:${serverPort}`,
+    ),
+    serverPort,
   );
-  const serverHost = asString(serverNode.host, "0.0.0.0");
+  const serverHost = normalizeLoopbackHost(
+    firstNonEmpty(process.env.PUSHPALS_HOST, asString(serverNode.host, "127.0.0.1")),
+  );
   const debugHttp = parseBoolEnv("PUSHPALS_DEBUG_HTTP") ?? asBoolean(serverNode.debug_http, false);
   const staleClaimTtlMs = Math.max(
     5_000,
@@ -2098,10 +2104,13 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       portConflictPolicy: startupPortConflictPolicy,
     },
     client: {
-      localAgentUrl: firstNonEmpty(
-        process.env.EXPO_PUBLIC_LOCAL_AGENT_URL,
-        asString(clientNode.local_agent_url, `http://localhost:${localPort}`),
-        `http://localhost:${localPort}`,
+      localAgentUrl: normalizeLoopbackHttpUrl(
+        firstNonEmpty(
+          process.env.EXPO_PUBLIC_LOCAL_AGENT_URL,
+          asString(clientNode.local_agent_url, `http://127.0.0.1:${localPort}`),
+          `http://127.0.0.1:${localPort}`,
+        ),
+        localPort,
       ),
       traceTailLines: Math.max(
         10,

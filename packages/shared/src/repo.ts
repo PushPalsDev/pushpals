@@ -2,21 +2,18 @@
  * Repository utilities for detecting git root and reading context
  */
 
-import { existsSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
 import { resolve } from "path";
 
-/**
- * Detect git repository root by walking up from start directory.
- * Returns the directory containing .git/, or start directory if not found.
- *
- * @param startDir - Directory to start searching from (typically process.cwd())
- * @returns Absolute path to repository root
- */
-export function detectRepoRoot(startDir: string): string {
+function resolveDotGitEntry(repoRoot: string): string {
+  return resolve(repoRoot, ".git");
+}
+
+export function findGitRepoRoot(startDir: string): string | null {
   const override = String(process.env.PUSHPALS_REPO_ROOT_OVERRIDE ?? "").trim();
   if (override) {
     const resolvedOverride = resolve(override);
-    if (existsSync(resolve(resolvedOverride, ".git"))) {
+    if (resolveGitMetadataDir(resolvedOverride)) {
       return resolvedOverride;
     }
     console.warn(
@@ -25,18 +22,63 @@ export function detectRepoRoot(startDir: string): string {
   }
 
   let current = resolve(startDir);
-  const root = resolve(current, "/"); // Drive root on Windows, "/" on Unix
+  const root = resolve(current, "/");
 
   while (current !== root) {
-    if (existsSync(resolve(current, ".git"))) {
+    if (resolveGitMetadataDir(current)) {
       return current;
     }
     current = resolve(current, "..");
   }
 
-  // Check root itself
-  if (existsSync(resolve(root, ".git"))) {
-    return root;
+  return resolveGitMetadataDir(root) ? root : null;
+}
+
+export function resolveGitMetadataDir(repoRoot: string): string | null {
+  const dotGitPath = resolveDotGitEntry(repoRoot);
+  if (!existsSync(dotGitPath)) return null;
+
+  try {
+    const stat = statSync(dotGitPath);
+    if (stat.isDirectory()) {
+      return dotGitPath;
+    }
+    if (!stat.isFile()) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  try {
+    const firstLine = readFileSync(dotGitPath, "utf8").split(/\r?\n/, 1)[0] ?? "";
+    const match = firstLine.match(/^gitdir:\s*(.+)\s*$/i);
+    if (!match) return null;
+    const gitDir = resolve(repoRoot, match[1].trim());
+    return existsSync(gitDir) ? gitDir : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveGitStateFilePath(repoRoot: string, fileName: string): string | null {
+  const gitMetadataDir = resolveGitMetadataDir(repoRoot);
+  const normalizedFileName = String(fileName ?? "").trim();
+  if (!gitMetadataDir || !normalizedFileName) return null;
+  return resolve(gitMetadataDir, normalizedFileName);
+}
+
+/**
+ * Detect git repository root by walking up from start directory.
+ * Returns the directory containing git metadata, or start directory if not found.
+ *
+ * @param startDir - Directory to start searching from (typically process.cwd())
+ * @returns Absolute path to repository root
+ */
+export function detectRepoRoot(startDir: string): string {
+  const repoRoot = findGitRepoRoot(startDir);
+  if (repoRoot) {
+    return repoRoot;
   }
 
   // Fallback to start directory if no .git found

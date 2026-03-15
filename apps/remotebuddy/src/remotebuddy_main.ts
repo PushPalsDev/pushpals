@@ -27,6 +27,7 @@ import {
   CommunicationManager,
   detectRepoRoot,
   loadPushPalsConfig,
+  resolveLocalServerConnection,
   sanitizePushPalsConfigForLogging,
   matchesGlob,
   normalizeTargetPath,
@@ -74,7 +75,19 @@ function parseArgs(): {
     }
   }
 
-  return { server, sessionId, authToken };
+  const resolved = resolveLocalServerConnection({
+    serverUrl: server,
+    authToken,
+    fallbackPort: CONFIG.server.port,
+  });
+  if (resolved.serverWasNormalized) {
+    console.warn(`[RemoteBuddy] Coerced server URL to local-only endpoint: ${resolved.serverUrl}`);
+  }
+  if (resolved.authTokenWasIgnored) {
+    console.warn("[RemoteBuddy] Ignoring auth token in local-only mode.");
+  }
+
+  return { server: resolved.serverUrl, sessionId, authToken: resolved.authToken };
 }
 
 // ─── RemoteBuddy Orchestrator ───────────────────────────────────────────────

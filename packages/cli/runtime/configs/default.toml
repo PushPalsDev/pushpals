@@ -15,14 +15,15 @@ shared_db_path = "outputs/data/pushpals.db"
 remotebuddy_db_path = "outputs/data/remotebuddy-state.db"
 
 [server]
-url = "http://localhost:3001"
-host = "0.0.0.0"
+url = "http://127.0.0.1:3001"
+host = "127.0.0.1"
 port = 3001
 debug_http = false
 stale_claim_ttl_ms = 120000
 stale_claim_sweep_interval_ms = 5000
 
 [localbuddy]
+enabled = false
 port = 3003
 status_heartbeat_ms = 120000
 
@@ -255,5 +256,5 @@ port_preflight = true
 port_conflict_policy = "terminate_pushpals"
 
 [client]
-local_agent_url = "http://localhost:3003"
+local_agent_url = "http://127.0.0.1:3003"
 trace_tail_lines = 100

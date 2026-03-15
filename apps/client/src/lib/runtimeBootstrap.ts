@@ -2,14 +2,18 @@ type RuntimeBootstrapPayload = {
   serverUrl?: string;
   localAgentUrl?: string;
   sessionId?: string;
-  authToken?: string | null;
+  clientId?: string;
+  clientKind?: string;
+  clientLabel?: string;
 };
 
 export type PushPalsWebRuntimeConfig = {
   serverUrl: string;
   localAgentUrl: string;
   sessionId: string;
-  authToken: string | null;
+  clientId: string | null;
+  clientKind: string;
+  clientLabel: string;
 };
 
 declare global {
@@ -20,9 +24,21 @@ function normalizeString(value: unknown): string {
   return String(value ?? "").trim();
 }
 
-function normalizeUrl(value: unknown, fallback: string): string {
+function normalizeLocalUrl(value: unknown, fallback: string): string {
   const text = normalizeString(value) || fallback;
-  return text.replace(/\/+$/, "");
+  try {
+    const parsed = new URL(text);
+    parsed.protocol = "http:";
+    parsed.username = "";
+    parsed.password = "";
+    parsed.hostname = "127.0.0.1";
+    parsed.pathname = "/";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return fallback.replace(/\/+$/, "");
+  }
 }
 
 function readBootstrapPayload(): RuntimeBootstrapPayload {
@@ -40,21 +56,20 @@ export function resolvePushPalsWebRuntimeConfig(): PushPalsWebRuntimeConfig {
     normalizeString(payload.sessionId) ||
     normalizeString(env.EXPO_PUBLIC_PUSHPALS_SESSION_ID) ||
     "dev";
-  const authToken =
-    normalizeString(payload.authToken) ||
-    normalizeString(env.EXPO_PUBLIC_PUSHPALS_AUTH_TOKEN) ||
-    "";
+  const clientId = normalizeString(payload.clientId) || "";
 
   return {
-    serverUrl: normalizeUrl(
+    serverUrl: normalizeLocalUrl(
       payload.serverUrl || env.EXPO_PUBLIC_PUSHPALS_URL,
-      "http://localhost:3001",
+      "http://127.0.0.1:3001",
     ),
-    localAgentUrl: normalizeUrl(
+    localAgentUrl: normalizeLocalUrl(
       payload.localAgentUrl || env.EXPO_PUBLIC_LOCAL_AGENT_URL,
-      "http://localhost:3003",
+      "http://127.0.0.1:3003",
     ),
     sessionId,
-    authToken: authToken || null,
+    clientId: clientId || null,
+    clientKind: normalizeString(payload.clientKind) || "web",
+    clientLabel: normalizeString(payload.clientLabel) || "Web Client",
   };
 }

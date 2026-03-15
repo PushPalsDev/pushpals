@@ -11,9 +11,27 @@ import {
   isCliExitCommand,
   normalizeChildProcessEnv,
   prepareCliRuntime,
+  resolveCliStatePath,
   resolveCommandPath,
   startEmbeddedMonitoringHub,
 } from "../scripts/pushpals-cli.ts";
+
+function createMonitorAssetFixture(prefix: string) {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const assetRoot = join(root, "monitor-ui");
+  mkdirSync(join(assetRoot, "_expo", "static", "js", "web"), { recursive: true });
+  writeFileSync(
+    join(assetRoot, "index.html"),
+    '<!doctype html><html><head><title>Client Hub</title></head><body><div id="root"></div><script src="/_expo/static/js/web/app.js" defer></script></body></html>',
+    "utf8",
+  );
+  writeFileSync(
+    join(assetRoot, "_expo", "static", "js", "web", "app.js"),
+    "globalThis.__TEST_MONITOR__ = true;\n",
+    "utf8",
+  );
+  return { root, assetRoot };
+}
 
 describe("pushpals CLI runtime bootstrap helpers", () => {
   test("buildEmbeddedRuntimeEnv injects repo/config/schema overrides without forcing autonomy off", () => {
@@ -148,6 +166,19 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(formatTimestampedCliLine("PushPals CLI", at)).toBe("PushPals CLI");
   });
 
+  test("resolveCliStatePath follows worktree gitdir metadata instead of assuming .git is a directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-worktree-state-"));
+    const metadataDir = join(root, "gitdir-store", "worktrees", "demo");
+    mkdirSync(metadataDir, { recursive: true });
+    writeFileSync(join(root, ".git"), `gitdir: ${metadataDir}\n`, "utf8");
+
+    try {
+      expect(resolveCliStatePath(root)).toBe(join(metadataDir, "pushpals-cli-state.json"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("injectMonitoringHubBootstrap writes runtime config into exported client html", () => {
     const html = injectMonitoringHubBootstrap(
       '<html><head></head><body><div id="root"></div></body></html>',
@@ -155,7 +186,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         serverUrl: "http://localhost:3001",
         localAgentUrl: "http://localhost:3003",
         sessionId: "dev",
-        authToken: "secret-token",
+        clientId: "cli-monitor-dev",
+        clientKind: "cli_monitor",
+        clientLabel: "CLI Monitor",
       },
     );
 
@@ -163,7 +196,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(html).toContain('"serverUrl":"http://localhost:3001"');
     expect(html).toContain('"localAgentUrl":"http://localhost:3003"');
     expect(html).toContain('"sessionId":"dev"');
-    expect(html).toContain('"authToken":"secret-token"');
+    expect(html).toContain('"clientId":"cli-monitor-dev"');
+    expect(html).toContain('"clientKind":"cli_monitor"');
+    expect(html).toContain('"clientLabel":"CLI Monitor"');
   });
 
   test("startEmbeddedMonitoringHub returns null when packaged monitor assets are unavailable", async () => {
@@ -171,7 +206,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       serverUrl: "http://127.0.0.1:3001",
       localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
-      authToken: null,
       preferredPort: 18981,
       assetRoot: join(resolve(process.cwd(), "tmp-cli-monitor-missing"), "missing"),
     });
@@ -180,25 +214,12 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
   });
 
   test("startEmbeddedMonitoringHub serves the exported client monitor when packaged assets exist", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-monitor-ui-"));
-    const assetRoot = join(root, "monitor-ui");
-    mkdirSync(join(assetRoot, "_expo", "static", "js", "web"), { recursive: true });
-    writeFileSync(
-      join(assetRoot, "index.html"),
-      '<!doctype html><html><head><title>Client Hub</title></head><body><div id="root"></div><script src="/_expo/static/js/web/app.js" defer></script></body></html>',
-      "utf8",
-    );
-    writeFileSync(
-      join(assetRoot, "_expo", "static", "js", "web", "app.js"),
-      "globalThis.__TEST_MONITOR__ = true;\n",
-      "utf8",
-    );
+    const { root, assetRoot } = createMonitorAssetFixture("pushpals-cli-monitor-ui-");
 
     const hub = await startEmbeddedMonitoringHub({
       serverUrl: "http://127.0.0.1:3001",
       localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
-      authToken: "test-token",
       preferredPort: 18982,
       assetRoot,
     });
@@ -217,7 +238,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(rootResponse.ok).toBe(true);
       expect(rootHtml).toContain("Client Hub");
       expect(rootHtml).toContain("__PUSHPALS_WEB_BOOTSTRAP__");
-      expect(rootHtml).toContain('"authToken":"test-token"');
       expect(assetResponse.ok).toBe(true);
       expect(await assetResponse.text()).toContain("__TEST_MONITOR__");
       expect(routeResponse.ok).toBe(true);
@@ -229,6 +249,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
   });
 
   test("startEmbeddedMonitoringHub falls back when the preferred port is occupied", async () => {
+    const { root, assetRoot } = createMonitorAssetFixture("pushpals-cli-monitor-port-fallback-");
     const blocker = Bun.serve({
       port: 18983,
       fetch: () => new Response("blocked"),
@@ -239,8 +260,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       serverUrl: "http://127.0.0.1:3001",
       localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
-      authToken: null,
       preferredPort: blockedPort,
+      assetRoot,
     });
 
     try {
@@ -250,35 +271,40 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     } finally {
       hub?.stop();
       blocker.stop(true);
-    }
-  });
-
-  test("prepareCliRuntime seeds external runtime locally without network fetch", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-"));
-    const repoRoot = join(root, "repo");
-    const runtimeRoot = join(root, "runtime");
-    const originalFetch = globalThis.fetch;
-    let fetchCalls = 0;
-
-    mkdirSync(repoRoot, { recursive: true });
-    mkdirSync(runtimeRoot, { recursive: true });
-    globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
-      fetchCalls++;
-      throw new Error(`unexpected fetch: ${String(args[0])}`);
-    }) as typeof fetch;
-
-    try {
-      const prepared = await prepareCliRuntime({ repoRoot, runtimeRoot });
-
-      expect(fetchCalls).toBe(0);
-      expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
-      expect(prepared.runtimeTag).toBe("");
-      expect(prepared.runtimePreflight.issues.map((issue) => issue.code)).toEqual([
-        "missing_vision_doc",
-      ]);
-    } finally {
-      globalThis.fetch = originalFetch;
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test(
+    "prepareCliRuntime seeds external runtime locally without network fetch",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-"));
+      const repoRoot = join(root, "repo");
+      const runtimeRoot = join(root, "runtime");
+      const originalFetch = globalThis.fetch;
+      let fetchCalls = 0;
+
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(runtimeRoot, { recursive: true });
+      globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+        fetchCalls++;
+        throw new Error(`unexpected fetch: ${String(args[0])}`);
+      }) as typeof fetch;
+
+      try {
+        const prepared = await prepareCliRuntime({ repoRoot, runtimeRoot });
+
+        expect(fetchCalls).toBe(0);
+        expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+        expect(prepared.runtimeTag).toBe("");
+        expect(prepared.runtimePreflight.issues.map((issue) => issue.code)).toEqual([
+          "missing_vision_doc",
+        ]);
+      } finally {
+        globalThis.fetch = originalFetch;
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    15000,
+  );
 });

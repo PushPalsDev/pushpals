@@ -11,14 +11,13 @@
  *   3. bun run workerpals    (polls job queue)
  *
  * Usage:
- *   PUSHPALS_AUTH_TOKEN=<token> bun run scripts/smoke-test.ts
+ *   bun run scripts/smoke-test.ts
  *
  * The test creates a session, sends a message, and asserts that the expected
  * event types arrive within a timeout window.
  */
 
-const BASE = process.env.PUSHPALS_URL ?? "http://localhost:3001";
-const AUTH = process.env.PUSHPALS_AUTH_TOKEN ?? "";
+const BASE = process.env.PUSHPALS_URL ?? "http://127.0.0.1:3001";
 const TIMEOUT_MS = 30_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

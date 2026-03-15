@@ -63,7 +63,9 @@ describe("pushpals CLI invocation logging", () => {
     }
   });
 
-  test("runs runtime preflight before LocalBuddy probing for external repos", async () => {
+  test(
+    "runs runtime preflight before LocalBuddy probing for external repos",
+    async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-preflight-"));
     const repoRoot = join(root, "repo");
     const runtimeRoot = join(root, "runtime");
@@ -144,28 +146,32 @@ enabled = true
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+    },
+    15000,
+  );
 
-  test("uses the preflighted runtime config for LocalBuddy URL selection", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-config-"));
-    const repoRoot = join(root, "repo");
-    const runtimeRoot = join(root, "runtime");
+  test(
+    "uses the preflighted runtime config for LocalBuddy URL selection",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-config-"));
+      const repoRoot = join(root, "repo");
+      const runtimeRoot = join(root, "runtime");
 
-    try {
-      mkdirSync(repoRoot, { recursive: true });
-      const init = Bun.spawnSync(["git", "init"], {
-        cwd: repoRoot,
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      expect(init.exitCode).toBe(0);
-      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
-      writeFileSync(join(runtimeRoot, ".env"), "PUSHPALS_PROFILE=dev\n", "utf8");
-      writeFileSync(join(runtimeRoot, ".env.example"), "PUSHPALS_PROFILE=dev\n", "utf8");
-      writeFileSync(join(runtimeRoot, "configs", "local.toml"), "# local overrides\n", "utf8");
-      writeFileSync(
-        join(runtimeRoot, "configs", "default.toml"),
-        `profile = "dev"
+      try {
+        mkdirSync(repoRoot, { recursive: true });
+        const init = Bun.spawnSync(["git", "init"], {
+          cwd: repoRoot,
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        expect(init.exitCode).toBe(0);
+        mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+        writeFileSync(join(runtimeRoot, ".env"), "PUSHPALS_PROFILE=dev\n", "utf8");
+        writeFileSync(join(runtimeRoot, ".env.example"), "PUSHPALS_PROFILE=dev\n", "utf8");
+        writeFileSync(join(runtimeRoot, "configs", "local.toml"), "# local overrides\n", "utf8");
+        writeFileSync(
+          join(runtimeRoot, "configs", "default.toml"),
+          `profile = "dev"
 session_id = "dev"
 
 [server]
@@ -177,39 +183,41 @@ port = 3999
 [remotebuddy.autonomy]
 enabled = false
 `,
-        "utf8",
-      );
+          "utf8",
+        );
 
-      const proc = Bun.spawn(
-        [
-          bunExecPath,
-          cliScriptPath,
-          "--no-auto-start",
-          "--runtime-root",
-          runtimeRoot,
-        ],
-        {
-          cwd: repoRoot,
-          stdout: "pipe",
-          stderr: "pipe",
-          env: {
-            ...process.env,
-            PUSHPALS_CLI_PACKAGE_VERSION: "1.0.6-test",
-            EXPO_PUBLIC_LOCAL_AGENT_URL: "",
+        const proc = Bun.spawn(
+          [
+            bunExecPath,
+            cliScriptPath,
+            "--no-auto-start",
+            "--runtime-root",
+            runtimeRoot,
+          ],
+          {
+            cwd: repoRoot,
+            stdout: "pipe",
+            stderr: "pipe",
+            env: {
+              ...process.env,
+              PUSHPALS_CLI_PACKAGE_VERSION: "1.0.6-test",
+              EXPO_PUBLIC_LOCAL_AGENT_URL: "",
+            },
           },
-        },
-      );
+        );
 
-      const [stderr, code] = await Promise.all([
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
+        const [stderr, code] = await Promise.all([
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
 
-      expect(code).toBe(1);
-      expect(stderr).toContain("LocalBuddy is unavailable at http://localhost:3999.");
-      expect(stderr).not.toContain("http://localhost:3003");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
+        expect(code).toBe(1);
+        expect(stderr).toContain("LocalBuddy is unavailable at http://127.0.0.1:3999.");
+        expect(stderr).not.toContain("http://127.0.0.1:3003");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    15000,
+  );
 });

@@ -13,10 +13,13 @@
 
 import { randomUUID } from "crypto";
 import {
+  buildLocalCorsHeaders,
   CommunicationManager,
   detectRepoRoot,
+  isLoopbackOrigin,
   loadPromptTemplate,
   loadPushPalsConfig,
+  resolveLocalServerConnection,
 } from "shared";
 import {
   createLLMClient,
@@ -72,7 +75,25 @@ function parseArgs(): {
     }
   }
 
-  return { server, port, sessionId, authToken, validateConfig };
+  const resolved = resolveLocalServerConnection({
+    serverUrl: server,
+    authToken,
+    fallbackPort: CONFIG.server.port,
+  });
+  if (resolved.serverWasNormalized) {
+    console.warn(`[LocalBuddy] Coerced server URL to local-only endpoint: ${resolved.serverUrl}`);
+  }
+  if (resolved.authTokenWasIgnored) {
+    console.warn("[LocalBuddy] Ignoring auth token in local-only mode.");
+  }
+
+  return {
+    server: resolved.serverUrl,
+    port,
+    sessionId,
+    authToken: resolved.authToken,
+    validateConfig,
+  };
 }
 
 function parseStatusHeartbeatMs(fallbackMs: number): number {
@@ -747,19 +768,30 @@ class LocalBuddyServer {
       try {
         Bun.serve({
           port,
-          hostname: "0.0.0.0",
+          hostname: "127.0.0.1",
           idleTimeout: 120,
 
           async fetch(req: Request): Promise<Response> {
             const url = new URL(req.url);
             const pathname = url.pathname;
             const method = req.method;
+            const originHeader = req.headers.get("origin");
+            if (originHeader && !isLoopbackOrigin(originHeader)) {
+              return new Response(JSON.stringify({ ok: false, message: "Forbidden origin" }), {
+                status: 403,
+                headers: {
+                  "Content-Type": "application/json",
+                },
+              });
+            }
+            const corsHeaders = buildLocalCorsHeaders({
+              origin: originHeader,
+              allowAuthorizationHeader: true,
+            });
 
             const jsonHeaders = {
               "Content-Type": "application/json",
-              "Access-Control-Allow-Origin": "*",
-              "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-              "Access-Control-Allow-Headers": "content-type, authorization",
+              ...corsHeaders,
             };
 
             const makeJson = (body: unknown, status = 200) =>
@@ -963,7 +995,7 @@ class LocalBuddyServer {
                     "Content-Type": "text/event-stream",
                     "Cache-Control": "no-cache",
                     Connection: "keep-alive",
-                    "Access-Control-Allow-Origin": "*",
+                    ...corsHeaders,
                   },
                 });
               } catch (err) {
@@ -1012,8 +1044,8 @@ class LocalBuddyServer {
       }
     }
 
-    console.log(`[LocalBuddy] HTTP server listening on http://0.0.0.0:${port}`);
-    console.log(`[LocalBuddy] Ready to receive messages at POST http://localhost:${port}/message`);
+    console.log(`[LocalBuddy] HTTP server listening on http://127.0.0.1:${port}`);
+    console.log(`[LocalBuddy] Ready to receive messages at POST http://127.0.0.1:${port}/message`);
   }
 }
 

@@ -2,7 +2,13 @@
  * Shared utilities package
  */
 
-export { detectRepoRoot, getRepoContext } from "./repo.js";
+export {
+  detectRepoRoot,
+  findGitRepoRoot,
+  getRepoContext,
+  resolveGitMetadataDir,
+  resolveGitStateFilePath,
+} from "./repo.js";
 export { CommunicationManager, type CommunicationManagerOptions } from "./communication.js";
 export { loadPromptTemplate, loadRepoDocText } from "./prompts.js";
 export {
@@ -45,6 +51,14 @@ export {
   type PushPalsLlmConfig,
   type PushPalsLmStudioConfig,
 } from "./config.js";
+export {
+  buildLocalCorsHeaders,
+  isLoopbackOrigin,
+  isLoopbackHost,
+  normalizeLoopbackHost,
+  normalizeLoopbackHttpUrl,
+  resolveLocalServerConnection,
+} from "./local_network.js";
 export {
   DEFAULT_LOCALBUDDY_PORT,
   computeLocalBuddyRestartBackoffMs,

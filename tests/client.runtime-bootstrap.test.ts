@@ -6,7 +6,6 @@ const originalEnv = {
   EXPO_PUBLIC_PUSHPALS_URL: process.env.EXPO_PUBLIC_PUSHPALS_URL,
   EXPO_PUBLIC_LOCAL_AGENT_URL: process.env.EXPO_PUBLIC_LOCAL_AGENT_URL,
   EXPO_PUBLIC_PUSHPALS_SESSION_ID: process.env.EXPO_PUBLIC_PUSHPALS_SESSION_ID,
-  EXPO_PUBLIC_PUSHPALS_AUTH_TOKEN: process.env.EXPO_PUBLIC_PUSHPALS_AUTH_TOKEN,
 };
 
 function restoreEnv(): void {
@@ -29,19 +28,22 @@ describe("client runtime bootstrap", () => {
     process.env.EXPO_PUBLIC_PUSHPALS_URL = "http://localhost:3001";
     process.env.EXPO_PUBLIC_LOCAL_AGENT_URL = "http://localhost:3003";
     process.env.EXPO_PUBLIC_PUSHPALS_SESSION_ID = "env-session";
-    process.env.EXPO_PUBLIC_PUSHPALS_AUTH_TOKEN = "env-token";
     globalThis.__PUSHPALS_WEB_BOOTSTRAP__ = {
       serverUrl: "http://127.0.0.1:3901/",
       localAgentUrl: "http://127.0.0.1:3903/",
       sessionId: "cli-session",
-      authToken: "cli-token",
+      clientId: "cli-monitor-dev",
+      clientKind: "cli_monitor",
+      clientLabel: "CLI Monitor",
     };
 
     expect(resolvePushPalsWebRuntimeConfig()).toEqual({
       serverUrl: "http://127.0.0.1:3901",
       localAgentUrl: "http://127.0.0.1:3903",
       sessionId: "cli-session",
-      authToken: "cli-token",
+      clientId: "cli-monitor-dev",
+      clientKind: "cli_monitor",
+      clientLabel: "CLI Monitor",
     });
   });
 
@@ -49,14 +51,34 @@ describe("client runtime bootstrap", () => {
     delete process.env.EXPO_PUBLIC_PUSHPALS_URL;
     delete process.env.EXPO_PUBLIC_LOCAL_AGENT_URL;
     delete process.env.EXPO_PUBLIC_PUSHPALS_SESSION_ID;
-    delete process.env.EXPO_PUBLIC_PUSHPALS_AUTH_TOKEN;
     globalThis.__PUSHPALS_WEB_BOOTSTRAP__ = undefined;
 
     expect(resolvePushPalsWebRuntimeConfig()).toEqual({
-      serverUrl: "http://localhost:3001",
-      localAgentUrl: "http://localhost:3003",
+      serverUrl: "http://127.0.0.1:3001",
+      localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
-      authToken: null,
+      clientId: null,
+      clientKind: "web",
+      clientLabel: "Web Client",
+    });
+  });
+
+  test("normalizes bootstrap and env endpoints back to loopback", () => {
+    process.env.EXPO_PUBLIC_PUSHPALS_URL = "http://192.168.1.40:3001/path";
+    process.env.EXPO_PUBLIC_LOCAL_AGENT_URL = "http://pushpals.example:3003/path";
+    globalThis.__PUSHPALS_WEB_BOOTSTRAP__ = {
+      serverUrl: "http://10.0.0.2:3901/remote",
+      localAgentUrl: "http://remote-host:3903/remote",
+      sessionId: "cli-session",
+    };
+
+    expect(resolvePushPalsWebRuntimeConfig()).toEqual({
+      serverUrl: "http://127.0.0.1:3901",
+      localAgentUrl: "http://127.0.0.1:3903",
+      sessionId: "cli-session",
+      clientId: null,
+      clientKind: "web",
+      clientLabel: "Web Client",
     });
   });
 });

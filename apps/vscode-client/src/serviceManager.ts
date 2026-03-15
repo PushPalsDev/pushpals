@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:net";
 import * as vscode from "vscode";
+import { normalizeVscodeServerUrl } from "./local_server_url";
+import { looksLikePushPalsSourceCheckout } from "./repo";
 import { formatCommandForLog, validateDockerImageName } from "./safety";
 import {
   computeLocalBuddyRestartBackoffMs,
@@ -11,6 +13,8 @@ import {
   type RuntimeConfigSnapshot,
 } from "./runtimeServicePolicy";
 import { assertWorkspaceTrusted } from "./workspaceTrust";
+
+type StackLaunchMode = "source_checkout" | "installed_cli";
 
 type ServiceDefinition = {
   id: string;
@@ -31,7 +35,17 @@ type CommandResult = {
   stderr: string;
 };
 
+type CliManagedRuntime = {
+  command: string;
+  args: string[];
+  process: ChildProcessWithoutNullStreams;
+  workspaceRoot: string;
+  stopRequested: boolean;
+};
+
 const DEFAULT_WORKER_IMAGE = "pushpals-worker-sandbox:latest";
+const DEFAULT_SERVER_URL = "http://127.0.0.1:3001";
+const DEFAULT_CLI_BOOT_TIMEOUT_MS = 90_000;
 const LOCALBUDDY_RUNTIME_CONFIG_POLL_MS = 2_000;
 const LOCALBUDDY_STABLE_UPTIME_MS = 10_000;
 const LOCALBUDDY_MAX_CONSECUTIVE_FAILURES = 5;
@@ -42,6 +56,8 @@ export class StackServiceManager implements vscode.Disposable {
   readonly onDidChangeRunning = this.onDidChangeRunningEmitter.event;
   private stopping = false;
   private stackWorkspaceRoot: string | null = null;
+  private launchMode: StackLaunchMode | null = null;
+  private cliRuntime: CliManagedRuntime | null = null;
   private localBuddyRuntimeEnabled = false;
   private localBuddyPort = DEFAULT_LOCALBUDDY_PORT;
   private localBuddyConfigPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -55,7 +71,7 @@ export class StackServiceManager implements vscode.Disposable {
   constructor(private readonly output: vscode.OutputChannel) {}
 
   isRunning(): boolean {
-    return this.running.size > 0;
+    return this.running.size > 0 || this.cliRuntime !== null;
   }
 
   async startStack(workspaceRoot: string): Promise<void> {
@@ -65,6 +81,14 @@ export class StackServiceManager implements vscode.Disposable {
     }
     assertWorkspaceTrusted(vscode.workspace.isTrusted);
     this.stackWorkspaceRoot = workspaceRoot;
+    this.launchMode = looksLikePushPalsSourceCheckout(workspaceRoot)
+      ? "source_checkout"
+      : "installed_cli";
+
+    if (this.launchMode === "installed_cli") {
+      await this.startInstalledCliRuntime(workspaceRoot);
+      return;
+    }
 
     const workerImage = this.workerDockerImage();
     await this.runOneShot("bun", ["--version"], workspaceRoot, "Checking Bun runtime");
@@ -121,9 +145,15 @@ export class StackServiceManager implements vscode.Disposable {
       this.stopLocalBuddyRuntimeConfigPolling();
       this.clearLocalBuddyStabilityTimer();
       this.stackWorkspaceRoot = null;
+      this.launchMode = null;
       this.localBuddyStopRequested = false;
       this.resetLocalBuddyRestartBudget();
       this.output.appendLine("[stack] Stop skipped: no running services.");
+      return;
+    }
+
+    if (this.cliRuntime) {
+      await this.stopInstalledCliRuntime(workspaceRoot);
       return;
     }
 
@@ -147,6 +177,7 @@ export class StackServiceManager implements vscode.Disposable {
     if (this.running.size === 0) {
       this.onDidChangeRunningEmitter.fire(false);
       this.stackWorkspaceRoot = null;
+      this.launchMode = null;
       this.localBuddyRuntimeEnabled = false;
       this.localBuddyPort = DEFAULT_LOCALBUDDY_PORT;
       this.localBuddyStopRequested = false;
@@ -165,6 +196,8 @@ export class StackServiceManager implements vscode.Disposable {
   dispose(): void {
     this.stopLocalBuddyRuntimeConfigPolling();
     this.clearLocalBuddyStabilityTimer();
+    this.cliRuntime = null;
+    this.launchMode = null;
     this.onDidChangeRunningEmitter.dispose();
   }
 
@@ -175,6 +208,217 @@ export class StackServiceManager implements vscode.Disposable {
       workspaceRoot,
       "Running shared startup preflight",
     );
+  }
+
+  private cliCommand(): string {
+    const configured = String(
+      vscode.workspace.getConfiguration("pushpals").get<string>("cliCommand") ?? "",
+    ).trim();
+    if (configured) return configured;
+    return process.platform === "win32" ? "pushpals.cmd" : "pushpals";
+  }
+
+  private cliRuntimeArgs(): string[] {
+    return ["--runtime-only"];
+  }
+
+  private serverUrl(): string {
+    const configured =
+      vscode.workspace.getConfiguration("pushpals").get<string>("serverUrl") ??
+      DEFAULT_SERVER_URL;
+    return normalizeVscodeServerUrl(configured);
+  }
+
+  private async probeServerHealth(timeoutMs = 1_000): Promise<boolean> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`${this.serverUrl()}/healthz`, {
+        method: "GET",
+        signal: controller.signal,
+      });
+      return response.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async startInstalledCliRuntime(workspaceRoot: string): Promise<void> {
+    if (await this.probeServerHealth()) {
+      throw new Error(
+        `PushPals server is already listening at ${this.serverUrl()}. Stop the existing local runtime before starting a VS Code-managed runtime for this repo.`,
+      );
+    }
+
+    const command = this.cliCommand();
+    const args = this.cliRuntimeArgs();
+    this.output.appendLine(
+      `[stack] Starting installed PushPals CLI runtime: ${formatCommandForLog(command, args)}`,
+    );
+
+    const child = spawn(command, args, {
+      cwd: workspaceRoot,
+      shell: false,
+      stdio: "pipe",
+      windowsHide: true,
+      env: process.env,
+    }) as ChildProcessWithoutNullStreams;
+    const runtime: CliManagedRuntime = {
+      command,
+      args,
+      process: child,
+      workspaceRoot,
+      stopRequested: false,
+    };
+    this.cliRuntime = runtime;
+
+    child.stdout.on("data", (chunk: Buffer) => this.appendStream("pushpals-cli", "stdout", chunk));
+    child.stderr.on("data", (chunk: Buffer) => this.appendStream("pushpals-cli", "stderr", chunk));
+
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      let settled = false;
+      const settle = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (error) {
+          runtime.stopRequested = true;
+          try {
+            runtime.process.kill();
+          } catch {
+            // best effort
+          }
+          if (this.cliRuntime?.process === child) {
+            this.cliRuntime = null;
+          }
+          rejectPromise(error);
+          return;
+        }
+        resolvePromise();
+      };
+
+      child.once("error", (error) => {
+        const detail = error.message || String(error);
+        settle(
+          new Error(
+            `Failed to launch ${command}: ${detail}. Install the PushPals CLI and ensure \`${command}\` is available on PATH.`,
+          ),
+        );
+      });
+
+      child.once("exit", (code, signal) => {
+        const activeRuntime = this.cliRuntime;
+        if (activeRuntime?.process === child) {
+          this.cliRuntime = null;
+        }
+        const reason = signal ? `signal=${signal}` : `code=${code ?? 0}`;
+        this.output.appendLine(`[stack] Installed PushPals CLI runtime exited (${reason}).`);
+        const expectedExit = this.stopping || runtime.stopRequested;
+        if (!expectedExit) {
+          void vscode.window.showWarningMessage(
+            `PushPals CLI runtime stopped unexpectedly (${reason}). See extension output for details.`,
+          );
+        }
+        if (!this.isRunning()) {
+          this.stopLocalBuddyRuntimeConfigPolling();
+          this.stackWorkspaceRoot = null;
+          this.launchMode = null;
+          this.localBuddyStopRequested = false;
+          this.onDidChangeRunningEmitter.fire(false);
+        }
+        settle(new Error(`Installed PushPals CLI runtime exited before startup completed (${reason}).`));
+      });
+
+      const deadline = Date.now() + DEFAULT_CLI_BOOT_TIMEOUT_MS;
+      const poll = async () => {
+        while (!settled && Date.now() < deadline) {
+          if (await this.probeServerHealth()) {
+            this.output.appendLine("[stack] Installed PushPals CLI runtime is healthy.");
+            settle();
+            return;
+          }
+          await new Promise((resolveLater) => setTimeout(resolveLater, 250));
+        }
+        if (!settled) {
+          settle(
+            new Error(
+              `Installed PushPals CLI runtime did not become healthy within ${DEFAULT_CLI_BOOT_TIMEOUT_MS}ms.`,
+            ),
+          );
+        }
+      };
+      void poll();
+    });
+
+    this.onDidChangeRunningEmitter.fire(true);
+  }
+
+  private async stopInstalledCliRuntime(workspaceRoot: string): Promise<void> {
+    const runtime = this.cliRuntime;
+    if (!runtime) {
+      return;
+    }
+
+    this.stopping = true;
+    runtime.stopRequested = true;
+    this.output.appendLine("[stack] Stopping installed PushPals CLI runtime...");
+
+    try {
+      runtime.process.stdin.write("exit\n");
+      runtime.process.stdin.end();
+    } catch {
+      // best effort
+    }
+
+    await this.waitForExit(runtime.process, 8_000);
+    if (runtime.process.exitCode == null && runtime.process.signalCode == null) {
+      try {
+        if (process.platform === "win32" && runtime.process.pid) {
+          await this.runOneShot(
+            "taskkill",
+            ["/PID", String(runtime.process.pid), "/T", "/F"],
+            workspaceRoot,
+            "Stopping installed PushPals CLI runtime",
+            true,
+          );
+        } else {
+          runtime.process.kill("SIGTERM");
+        }
+      } catch {
+        // fall through to final verification
+      }
+      await this.waitForExit(runtime.process, 2_000);
+      if (
+        process.platform !== "win32" &&
+        runtime.process.exitCode == null &&
+        runtime.process.signalCode == null
+      ) {
+        try {
+          runtime.process.kill("SIGKILL");
+        } catch {
+          // best effort
+        }
+        await this.waitForExit(runtime.process, 1_000);
+      }
+    }
+
+    this.stopping = false;
+    if (runtime.process.exitCode == null && runtime.process.signalCode == null) {
+      throw new Error("Installed PushPals CLI runtime did not exit cleanly.");
+    }
+
+    if (this.cliRuntime?.process === runtime.process) {
+      this.cliRuntime = null;
+    }
+    this.stackWorkspaceRoot = null;
+    this.launchMode = null;
+    this.localBuddyRuntimeEnabled = false;
+    this.localBuddyPort = DEFAULT_LOCALBUDDY_PORT;
+    this.localBuddyStopRequested = false;
+    this.resetLocalBuddyRestartBudget();
+    this.onDidChangeRunningEmitter.fire(false);
+    this.output.appendLine("[stack] Installed PushPals CLI runtime stopped.");
   }
 
   private includeSourceControlManager(): boolean {

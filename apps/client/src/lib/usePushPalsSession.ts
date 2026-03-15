@@ -1,6 +1,13 @@
 import { useEffect, useState, useCallback, useRef, useMemo, useReducer } from "react";
 import type { EventEnvelope, EventType } from "protocol/browser";
-import { subscribeEvents, createSession, sendMessage, submitApprovalDecision } from "./pushpalsApi";
+import {
+  subscribeEvents,
+  createSession,
+  sendMessage,
+  submitApprovalDecision,
+  type ClientRegistration,
+} from "./pushpalsApi";
+import { resolveClientRegistration } from "./clientIdentity";
 import {
   eventReducer,
   initialState,
@@ -71,6 +78,7 @@ export interface PushPalsSessionOptions {
   localAgentUrl?: string;
   sessionId?: string;
   authToken?: string | null;
+  clientInfo?: Partial<ClientRegistration>;
 }
 
 // ─── Cursor persistence helpers (web: localStorage, native: AsyncStorage) ───
@@ -96,6 +104,7 @@ export function usePushPalsSession(
     .replace(/\/+$/, "");
   const defaultSessionId = String(normalizedOptions.sessionId ?? "dev").trim() || "dev";
   const authToken = String(normalizedOptions.authToken ?? "").trim() || undefined;
+  const clientInfo = normalizedOptions.clientInfo;
   const [session, setSession] = useState<PushPalsSession>({
     sessionId: null,
     events: [],
@@ -110,12 +119,15 @@ export function usePushPalsSession(
   const unsubscribeRef = useRef<(() => void) | null>(null);
   /** In-memory max-wins guard — authoritative during runtime, avoids async read races */
   const persistedCursorRef = useRef(0);
+  const clientRef = useRef<ClientRegistration | null>(null);
 
   // Initialize session on mount
   useEffect(() => {
     const init = async () => {
       try {
-        const session = await createSession(baseUrl, defaultSessionId, authToken);
+        const client = await resolveClientRegistration(clientInfo, defaultSessionId);
+        clientRef.current = client;
+        const session = await createSession(baseUrl, defaultSessionId, authToken, client);
         if (!session) {
           setSession((s) => ({
             ...s,
@@ -160,6 +172,7 @@ export function usePushPalsSession(
           undefined, // transport
           afterCursor,
           authToken,
+          client,
         );
 
         unsubscribeRef.current = unsubscribe;
