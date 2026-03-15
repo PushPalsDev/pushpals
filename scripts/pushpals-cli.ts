@@ -9,7 +9,7 @@ import {
   readFileSync,
   writeFileSync,
 } from "fs";
-import { dirname, extname, join, resolve } from "path";
+import { basename, delimiter, dirname, extname, join, resolve } from "path";
 import { createInterface, type Interface } from "readline";
 import {
   evaluateClientRuntimePreflight,
@@ -729,7 +729,12 @@ function runtimeBinaryFilename(serviceName: RuntimeServiceName, platformKey: str
 
 export function buildEmbeddedRuntimeEnv(
   baseEnv: Record<string, string | undefined>,
-  opts: { repoRoot: string; runtimeRoot: string; useRuntimeConfig?: boolean },
+  opts: {
+    repoRoot: string;
+    runtimeRoot: string;
+    useRuntimeConfig?: boolean;
+    forceLocalBuddyEnabled?: boolean;
+  },
 ): Record<string, string> {
   const env = normalizeChildProcessEnv(baseEnv);
   const useRuntimeConfig = opts.useRuntimeConfig !== false;
@@ -746,6 +751,7 @@ export function buildEmbeddedRuntimeEnv(
           PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.repoRoot,
         }),
     PUSHPALS_PROTOCOL_SCHEMAS_DIR: join(opts.runtimeRoot, "protocol", "schemas"),
+    ...(opts.forceLocalBuddyEnabled ? { LOCALBUDDY_ENABLED: "1" } : {}),
     ...(typeof env.PUSHPALS_GIT_BIN === "string" && env.PUSHPALS_GIT_BIN.trim()
       ? { PUSHPALS_GIT_BIN: env.PUSHPALS_GIT_BIN.trim() }
       : {}),
@@ -1000,6 +1006,52 @@ function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
   }
 }
 
+function prependExecutableDirToPath(
+  env: Record<string, string>,
+  executablePath: string,
+  platform = process.platform,
+): Record<string, string> {
+  const resolvedPath = String(executablePath ?? "").trim();
+  if (!resolvedPath) return env;
+  if (!resolvedPath.includes("/") && !resolvedPath.includes("\\")) {
+    return env;
+  }
+
+  const executableDir = dirname(resolvedPath);
+  const existingPath =
+    platform === "win32"
+      ? String(env.Path ?? env.PATH ?? "")
+      : String(env.PATH ?? "");
+  const pathEntries = existingPath
+    .split(delimiter)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  const hasDir = pathEntries.some(
+    (entry) => entry.toLowerCase() === executableDir.toLowerCase(),
+  );
+  const nextPath = hasDir ? existingPath : [executableDir, ...pathEntries].join(delimiter);
+
+  if (platform === "win32") {
+    env.Path = nextPath;
+    env.PATH = nextPath;
+  } else {
+    env.PATH = nextPath;
+  }
+  return env;
+}
+
+export function applyResolvedGitBinaryToRuntimeEnv(
+  env: Record<string, string>,
+  resolvedGitBinary: string,
+  platform = process.platform,
+): Record<string, string> {
+  const resolvedPath = String(resolvedGitBinary ?? "").trim();
+  if (!resolvedPath) return env;
+  prependExecutableDirToPath(env, resolvedPath, platform);
+  env.PUSHPALS_GIT_BIN = basename(resolvedPath);
+  return env;
+}
+
 function isOptionalEmbeddedService(name: RuntimeServiceName): boolean {
   return name === "source_control_manager";
 }
@@ -1129,8 +1181,8 @@ async function autoStartRuntimeServices(opts: {
   const runtimeRoot = opts.preparedRuntime.runtimeRoot;
   const runtimeTag =
     opts.preparedRuntime.runtimeTag || (await resolveRuntimeReleaseTag(opts.requestedRuntimeTag));
-  const localBuddyEnabled = Boolean(runtimePreflight.config.localbuddy.enabled);
   const requireLocalBuddy = opts.requireLocalBuddy ?? true;
+  const localBuddyEnabled = requireLocalBuddy || Boolean(runtimePreflight.config.localbuddy.enabled);
 
   console.log(
     `[pushpals] LocalBuddy unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`,
@@ -1148,14 +1200,18 @@ async function autoStartRuntimeServices(opts: {
     repoRoot: opts.repoRoot,
     runtimeRoot,
     useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
+    forceLocalBuddyEnabled: requireLocalBuddy,
   });
+  if (runtimeEnv.PUSHPALS_GIT_BIN) {
+    applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, runtimeEnv.PUSHPALS_GIT_BIN);
+  }
   const resolvedGitBinary = await resolveCommandPath(
     "git",
     opts.repoRoot,
     normalizeChildProcessEnv(process.env as Record<string, string | undefined>),
   );
   if (resolvedGitBinary) {
-    runtimeEnv.PUSHPALS_GIT_BIN = resolvedGitBinary;
+    applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, resolvedGitBinary);
   }
 
   const services: RuntimeServiceProcess[] = [];
@@ -1208,6 +1264,9 @@ async function autoStartRuntimeServices(opts: {
   }
 
   if (localBuddyEnabled) {
+    if (requireLocalBuddy && !runtimePreflight.config.localbuddy.enabled) {
+      console.log("[pushpals] LocalBuddy is disabled in config; forcing it on for this CLI session.");
+    }
     console.log("[pushpals] Starting embedded LocalBuddy...");
     const localbuddyService = spawnRuntimeService(
       "localbuddy",

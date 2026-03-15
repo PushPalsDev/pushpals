@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import {
+  applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
   buildEmbeddedRuntimeEnv,
   buildServiceStopCommand,
@@ -71,6 +72,21 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PUSHPALS_GIT_BIN).toBe("/custom/tools/git");
   });
 
+  test("buildEmbeddedRuntimeEnv can force LocalBuddy on for interactive CLI bootstrap", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+      },
+      {
+        repoRoot: "/repo/example",
+        runtimeRoot: "/runtime/pushpals",
+        forceLocalBuddyEnabled: true,
+      },
+    );
+
+    expect(env.LOCALBUDDY_ENABLED).toBe("1");
+  });
+
   test("buildEmbeddedRuntimeEnv can target repo config instead of embedded runtime config", () => {
     const env = buildEmbeddedRuntimeEnv(
       {
@@ -114,6 +130,21 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     const resolved = await resolveCommandPath("git", process.cwd(), env);
     expect(resolved).not.toBeNull();
     expect(String(resolved).toLowerCase()).toContain("git");
+  });
+
+  test("applyResolvedGitBinaryToRuntimeEnv rewrites Windows absolute git paths into PATH + basename", () => {
+    const env = applyResolvedGitBinaryToRuntimeEnv(
+      {
+        PATH: "C:\\Windows\\System32",
+        Path: "C:\\Windows\\System32",
+      },
+      "C:\\Program Files\\Git\\cmd\\git.exe",
+      "win32",
+    );
+
+    expect(env.PUSHPALS_GIT_BIN).toBe("git.exe");
+    expect(env.PATH).toContain("C:\\Program Files\\Git\\cmd");
+    expect(env.Path).toContain("C:\\Program Files\\Git\\cmd");
   });
 
   test("buildOpenMonitoringHubCommand selects the right launcher per platform", () => {
