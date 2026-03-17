@@ -80,6 +80,10 @@ export function buildSessionWebSocketUrl(
   return `${protocol}://${host}/sessions/${encodeURIComponent(sessionId)}/ws${buildSessionTransportQuery(afterCursor, authToken, client)}`;
 }
 
+export function buildSessionMessageUrl(baseUrl: string, sessionId: string): string {
+  return `${baseUrl}/sessions/${encodeURIComponent(sessionId)}/message`;
+}
+
 function randomEventId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
@@ -328,64 +332,30 @@ export async function createSession(
 }
 
 /**
- * Send a message to LocalBuddy with streaming status updates
- *
- * In the new architecture, messages are sent to LocalBuddy (not directly to server).
- * LocalBuddy enhances the prompt with repo context and enqueues it to the Request Queue,
- * streaming status updates back to the client via SSE.
+ * Send a message directly to the local PushPals server session.
+ * The server emits a `message` event onto the session stream and RemoteBuddy/other
+ * agents react from there.
  */
-export async function sendMessage(localAgentUrl: string, text: string): Promise<boolean> {
+export async function sendSessionMessage(
+  baseUrl: string,
+  sessionId: string,
+  text: string,
+): Promise<boolean> {
   try {
-    const response = await fetch(`${localAgentUrl}/message`, {
+    const response = await fetch(buildSessionMessageUrl(baseUrl, sessionId), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
 
     if (!response.ok) {
-      console.error(`Error sending message: ${response.status} ${response.statusText}`);
+      const detail = await response.text().catch(() => "");
+      console.error(
+        `Error sending message: ${response.status} ${response.statusText}${detail ? ` ${detail}` : ""}`,
+      );
       return false;
     }
-
-    // Handle SSE stream response
-    const reader = response.body?.getReader();
-    if (!reader) {
-      console.error("No response body");
-      return false;
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let success = false;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.trim() || !line.startsWith("data: ")) continue;
-
-        try {
-          const data = JSON.parse(line.slice(6));
-          console.log(`[LocalBuddy] ${data.type}: ${data.message}`);
-
-          if (data.type === "complete") {
-            success = true;
-          } else if (data.type === "error") {
-            console.error(`[LocalBuddy] Error: ${data.message}`);
-            success = false;
-          }
-        } catch (err) {
-          console.error("Failed to parse SSE message:", line, err);
-        }
-      }
-    }
-
-    return success;
+    return true;
   } catch (err) {
     console.error("Error sending message:", err);
     return false;
@@ -533,6 +503,7 @@ export interface JobSloSummary {
 }
 
 export interface SystemRepoSummary {
+  root?: string;
   remote: string;
   remoteUrl: string | null;
   browserUrl: string | null;

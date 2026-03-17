@@ -17,8 +17,8 @@ const QUICK_PROMPT_TEMPLATES = [
     text: "Plan this change with explicit file targets, acceptance criteria, and validation steps before execution:",
   },
   {
-    label: "Remote Execute",
-    text: "/ask_remote_buddy Implement this task and include a concise progress summary every major step:",
+    label: "Execute",
+    text: "Implement this task and include a concise progress summary every major step:",
   },
   {
     label: "Status Digest",
@@ -35,16 +35,14 @@ export function ChatComposer({
   input,
   setInput,
   connected,
-  onSendLocal,
-  onSendRemote,
+  onSend,
   onComposerKeyPress,
 }: {
   theme: DashboardTheme;
   input: string;
   setInput: React.Dispatch<React.SetStateAction<string>>;
   connected: boolean;
-  onSendLocal: () => void;
-  onSendRemote: (text: string) => void;
+  onSend: () => void;
   onComposerKeyPress: (event: NativeSyntheticEvent<TextInputKeyPressEventData>) => void;
 }) {
   const applyTemplate = useCallback(
@@ -112,7 +110,7 @@ export function ChatComposer({
         />
         <View style={styles.sendWrap}>
           <Pressable
-            onPress={onSendLocal}
+            onPress={onSend}
             disabled={!connected || !input.trim()}
             style={[
               styles.sendButton,
@@ -122,34 +120,10 @@ export function ChatComposer({
               },
             ]}
             accessibilityRole="button"
-            accessibilityLabel="Send message to LocalBuddy"
-            accessibilityHint="Submits the current prompt through local routing first."
+            accessibilityLabel="Send message"
+            accessibilityHint="Submits the current prompt through the local PushPals server session."
           >
-            <Text style={[styles.sendLabel, { fontFamily: theme.fontSans }]}>Send Local</Text>
-          </Pressable>
-          <Pressable
-            onPress={() => onSendRemote(input)}
-            disabled={!connected || !input.trim()}
-            style={[
-              styles.sendButtonSecondary,
-              {
-                borderColor: theme.accent,
-                backgroundColor: `${theme.accent}18`,
-                opacity: !connected || !input.trim() ? 0.45 : 1,
-              },
-            ]}
-            accessibilityRole="button"
-            accessibilityLabel="Send message directly to RemoteBuddy"
-            accessibilityHint="Submits this prompt as an immediate remote request."
-          >
-            <Text
-              style={[
-                styles.sendSecondaryLabel,
-                { color: theme.accent, fontFamily: theme.fontSans },
-              ]}
-            >
-              Send Remote
-            </Text>
+            <Text style={[styles.sendLabel, { fontFamily: theme.fontSans }]}>Send</Text>
           </Pressable>
           <Text
             style={[styles.shortcutHint, { color: theme.textMuted, fontFamily: theme.fontSans }]}
@@ -211,21 +185,6 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontWeight: "700",
     fontSize: 13,
-  },
-  sendButtonSecondary: {
-    marginTop: 6,
-    minHeight: 36,
-    borderWidth: 1,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  sendSecondaryLabel: {
-    fontSize: 11,
-    fontWeight: "700",
-    textTransform: "uppercase",
-    letterSpacing: 0.25,
   },
   shortcutHint: {
     marginTop: 4,

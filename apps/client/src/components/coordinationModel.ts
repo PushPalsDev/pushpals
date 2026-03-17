@@ -62,7 +62,7 @@ export function deriveCoordinationRows(
       linkedJobs.length > 0 || request.status === "claimed" || request.status === "completed";
 
     let stage: CoordinationStage = "awaiting_remote";
-    let stageDetail = "LocalBuddy has not delegated this to execution yet.";
+    let stageDetail = "This request has not been delegated to execution yet.";
 
     if (anyFailed) {
       stage = "failed";

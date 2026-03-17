@@ -1,0 +1,211 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { createServer } from "node:net";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+
+const repoRoot = resolve(import.meta.dir, "..");
+const bunExecPath = (process.execPath ?? "").trim() || "bun";
+
+type SpawnedServer = {
+  proc: ReturnType<typeof Bun.spawn>;
+  stdout: Promise<string>;
+  stderr: Promise<string>;
+  exitCode: number | null;
+};
+
+const tempDirs: string[] = [];
+const spawnedServers: SpawnedServer[] = [];
+
+afterEach(async () => {
+  while (spawnedServers.length > 0) {
+    const server = spawnedServers.pop();
+    if (!server) continue;
+    if (server.exitCode == null) {
+      try {
+        server.proc.kill();
+      } catch {
+        // best effort
+      }
+    }
+    try {
+      await server.proc.exited;
+    } catch {
+      // best effort
+    }
+    await Promise.allSettled([server.stdout, server.stderr]);
+  }
+
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (!dir) continue;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function makeTempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "pushpals-session-message-route-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+async function getFreePort(): Promise<number> {
+  return await new Promise<number>((resolvePort, rejectPort) => {
+    const server = createServer();
+    server.once("error", rejectPort);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close((error) => {
+        if (error) {
+          rejectPort(error);
+          return;
+        }
+        resolvePort(port);
+      });
+    });
+  });
+}
+
+function writeServerConfig(root: string, port: number): void {
+  const configDir = join(root, "configs");
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(
+    join(configDir, "default.toml"),
+    [
+      'profile = "dev"',
+      'session_id = "dev"',
+      "",
+      "[paths]",
+      'data_dir = "outputs/data"',
+      'shared_db_path = "outputs/data/pushpals.db"',
+      'remotebuddy_db_path = "outputs/data/remotebuddy-state.db"',
+      "",
+      "[server]",
+      'host = "127.0.0.1"',
+      `port = ${port}`,
+      `url = "http://127.0.0.1:${port}"`,
+      "",
+      "[localbuddy]",
+      "enabled = false",
+    ].join("\n"),
+    "utf8",
+  );
+  writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+  writeFileSync(join(configDir, "local.toml"), "", "utf8");
+  writeFileSync(join(root, ".env"), "", "utf8");
+}
+
+function spawnServer(root: string, port: number): SpawnedServer {
+  const proc = Bun.spawn([bunExecPath, "run", resolve(repoRoot, "apps/server/src/server_main.ts")], {
+    cwd: repoRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
+      PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
+      PUSHPALS_PORT: String(port),
+    },
+  });
+
+  const server: SpawnedServer = {
+    proc,
+    stdout: new Response(proc.stdout).text(),
+    stderr: new Response(proc.stderr).text(),
+    exitCode: null,
+  };
+  void proc.exited.then((code) => {
+    server.exitCode = code;
+  });
+  spawnedServers.push(server);
+  return server;
+}
+
+async function waitForHealth(server: SpawnedServer, port: number, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (server.exitCode != null) {
+      const [stdout, stderr] = await Promise.all([server.stdout, server.stderr]);
+      throw new Error(
+        `server exited before health check passed (code=${server.exitCode})\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+      );
+    }
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/healthz`);
+      if (response.ok) return;
+    } catch {
+      // retry
+    }
+    await Bun.sleep(100);
+  }
+
+  throw new Error(`server did not become healthy within ${timeoutMs}ms`);
+}
+
+describe("server session message route", () => {
+  test("returns non-2xx for missing sessions and invalid messages", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+
+    const missing = await fetch(`http://127.0.0.1:${port}/sessions/missing/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hello" }),
+    });
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toMatchObject({
+      ok: false,
+      code: "session_not_found",
+    });
+
+    const created = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: "dev" }),
+    });
+    expect(created.status).toBe(201);
+
+    const invalid = await fetch(`http://127.0.0.1:${port}/sessions/dev/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "/ask_remote_buddy" }),
+    });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({
+      ok: false,
+      code: "invalid",
+    });
+
+    const accepted = await fetch(`http://127.0.0.1:${port}/sessions/dev/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hello" }),
+    });
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toMatchObject({
+      ok: true,
+      code: "accepted",
+      requestId: expect.any(String),
+    });
+
+    const claimed = await fetch(`http://127.0.0.1:${port}/requests/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: "remotebuddy-orchestrator" }),
+    });
+    expect(claimed.status).toBe(200);
+    expect(await claimed.json()).toMatchObject({
+      ok: true,
+      request: {
+        sessionId: "dev",
+        prompt: "hello",
+      },
+    });
+  }, 15_000);
+});

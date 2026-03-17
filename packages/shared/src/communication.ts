@@ -15,6 +15,34 @@ type SessionEventsOptions = {
   onOpen?: () => void;
 };
 
+function stripPresenceSourcePrefix(value: string): string {
+  return value.replace(/^(agent|client)(?:[\s:./_-]+)+/i, "");
+}
+
+export function normalizePresenceClientId(value: unknown): string {
+  const raw = stripPresenceSourcePrefix(String(value ?? "").trim());
+  return raw.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").trim();
+}
+
+export function normalizePresenceClientLabel(value: unknown): string {
+  return stripPresenceSourcePrefix(String(value ?? ""))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function normalizePresenceLookupToken(value: unknown): string {
+  return normalizePresenceClientLabel(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+type SessionTransportPresence = {
+  clientId: string;
+  kind: string;
+  label: string;
+  version: string;
+  platform: string;
+  repoRoot: string;
+};
+
 export interface CommunicationManagerOptions {
   serverUrl: string;
   sessionId: string;
@@ -43,7 +71,35 @@ export class CommunicationManager {
     return headers;
   }
 
-  async emit<T extends EventType>(
+  private commandUrl(sessionId: string): string {
+    return `${this.serverUrl}/sessions/${encodeURIComponent(sessionId)}/command`;
+  }
+
+  private buildSessionTransportPresence(sessionId: string): SessionTransportPresence {
+    const normalizedFrom = normalizePresenceClientId(this.from);
+    const labelFrom = normalizePresenceClientLabel(this.from);
+    const normalizedSessionId = normalizePresenceClientId(sessionId);
+    const isDefaultSession = sessionId === this.sessionId;
+    const repoRoot = String(
+      process.env.PUSHPALS_REPO_ROOT_OVERRIDE ??
+        process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE ??
+        process.cwd(),
+    ).trim();
+    return {
+      clientId: isDefaultSession
+        ? normalizedFrom || "agent"
+        : `${normalizedFrom || "agent"}__${normalizedSessionId || "session"}`,
+      kind: "agent",
+      label: labelFrom || normalizedFrom || "Agent",
+      version: String(process.env.PUSHPALS_RUNTIME_TAG ?? process.env.npm_package_version ?? "")
+        .trim(),
+      platform: `${process.platform}/${process.arch}`,
+      repoRoot,
+    };
+  }
+
+  async emitToSession<T extends EventType>(
+    sessionId: string,
     type: T,
     payload: EventTypePayloadMap[T],
     meta: EventMeta = {},
@@ -59,7 +115,7 @@ export class CommunicationManager {
       if (meta.turnId) body.turnId = meta.turnId;
       if (meta.parentId) body.parentId = meta.parentId;
 
-      const response = await fetch(`${this.serverUrl}/sessions/${this.sessionId}/command`, {
+      const response = await fetch(this.commandUrl(sessionId), {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify(body),
@@ -70,12 +126,51 @@ export class CommunicationManager {
     }
   }
 
+  async emit<T extends EventType>(
+    type: T,
+    payload: EventTypePayloadMap[T],
+    meta: EventMeta = {},
+  ): Promise<boolean> {
+    return this.emitToSession(this.sessionId, type, payload, meta);
+  }
+
+  async assistantMessageToSession(
+    sessionId: string,
+    text: string,
+    meta: EventMeta = {},
+  ): Promise<boolean> {
+    return this.emitToSession(sessionId, "assistant_message", { text }, meta);
+  }
+
   async assistantMessage(text: string, meta: EventMeta = {}): Promise<boolean> {
-    return this.emit("assistant_message", { text }, meta);
+    return this.assistantMessageToSession(this.sessionId, text, meta);
+  }
+
+  async userMessageToSession(
+    sessionId: string,
+    text: string,
+    meta: EventMeta = {},
+  ): Promise<boolean> {
+    return this.emitToSession(sessionId, "message", { text }, {
+      ...meta,
+      from: meta.from ?? "client",
+    });
   }
 
   async userMessage(text: string, meta: EventMeta = {}): Promise<boolean> {
-    return this.emit("message", { text }, { ...meta, from: meta.from ?? "client" });
+    return this.userMessageToSession(this.sessionId, text, meta);
+  }
+
+  async taskProgressToSession(
+    sessionId: string,
+    taskId: string,
+    message: string,
+    percent?: number,
+    meta: EventMeta = {},
+  ): Promise<boolean> {
+    const payload: EventTypePayloadMap["task_progress"] =
+      percent == null ? { taskId, message } : { taskId, message, percent };
+    return this.emitToSession(sessionId, "task_progress", payload, meta);
   }
 
   async taskProgress(
@@ -84,9 +179,19 @@ export class CommunicationManager {
     percent?: number,
     meta: EventMeta = {},
   ): Promise<boolean> {
-    const payload: EventTypePayloadMap["task_progress"] =
-      percent == null ? { taskId, message } : { taskId, message, percent };
-    return this.emit("task_progress", payload, meta);
+    return this.taskProgressToSession(this.sessionId, taskId, message, percent, meta);
+  }
+
+  async statusToSession(
+    sessionId: string,
+    agentId: string,
+    state: EventTypePayloadMap["status"]["state"],
+    detail?: string,
+    meta: EventMeta = {},
+  ): Promise<boolean> {
+    const payload: EventTypePayloadMap["status"] =
+      detail == null ? { agentId, state } : { agentId, state, detail };
+    return this.emitToSession(sessionId, "status", payload, meta);
   }
 
   async status(
@@ -95,12 +200,11 @@ export class CommunicationManager {
     detail?: string,
     meta: EventMeta = {},
   ): Promise<boolean> {
-    const payload: EventTypePayloadMap["status"] =
-      detail == null ? { agentId, state } : { agentId, state, detail };
-    return this.emit("status", payload, meta);
+    return this.statusToSession(this.sessionId, agentId, state, detail, meta);
   }
 
-  subscribeSessionEvents(
+  subscribeSessionEventsForSession(
+    sessionId: string,
     onEvent: (envelope: EventEnvelope, cursor: number) => void,
     options: SessionEventsOptions = {},
   ): () => void {
@@ -125,8 +229,23 @@ export class CommunicationManager {
       try {
         const url = new URL(this.serverUrl);
         url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-        url.pathname = `/sessions/${this.sessionId}/ws`;
-        url.search = latestCursor > 0 ? `after=${latestCursor}` : "";
+        url.pathname = `/sessions/${encodeURIComponent(sessionId)}/ws`;
+        const presence = this.buildSessionTransportPresence(sessionId);
+        if (latestCursor > 0) {
+          url.searchParams.set("after", String(latestCursor));
+        }
+        url.searchParams.set("clientId", presence.clientId);
+        url.searchParams.set("clientKind", presence.kind);
+        url.searchParams.set("clientLabel", presence.label);
+        if (presence.version) {
+          url.searchParams.set("clientVersion", presence.version);
+        }
+        if (presence.platform) {
+          url.searchParams.set("clientPlatform", presence.platform);
+        }
+        if (presence.repoRoot) {
+          url.searchParams.set("clientRepoRoot", presence.repoRoot);
+        }
         ws = new WebSocket(url.toString());
       } catch (err) {
         onError(`[SessionEvents] Failed to connect: ${String(err)}`);
@@ -183,5 +302,12 @@ export class CommunicationManager {
       }
       ws = null;
     };
+  }
+
+  subscribeSessionEvents(
+    onEvent: (envelope: EventEnvelope, cursor: number) => void,
+    options: SessionEventsOptions = {},
+  ): () => void {
+    return this.subscribeSessionEventsForSession(this.sessionId, onEvent, options);
   }
 }

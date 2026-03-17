@@ -67,7 +67,7 @@ export function RequestsPane({
           <Text
             style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
           >
-            Requests from LocalBuddy will appear here with full lifecycle status.
+            Session requests will appear here with full lifecycle status.
           </Text>
         </View>
       ) : (

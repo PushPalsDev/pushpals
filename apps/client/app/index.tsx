@@ -31,6 +31,7 @@ import { SystemPane } from "../src/components/SystemPane";
 import { ConfigPane } from "../src/components/ConfigPane";
 import { usePushPalsSession } from "../src/lib/usePushPalsSession";
 import { resolvePushPalsWebRuntimeConfig } from "../src/lib/runtimeBootstrap";
+import { buildSendFailureMessage, restoreComposerDraft } from "../src/lib/composerSendState";
 import {
   type AutonomyInsightsSummary,
   type AutonomyQuestionRow,
@@ -133,7 +134,6 @@ function createTheme(mode: ResolvedMode): DashboardTheme {
 export default function DashboardScreen() {
   const session = usePushPalsSession({
     baseUrl: RUNTIME_CONFIG.serverUrl,
-    localAgentUrl: RUNTIME_CONFIG.localAgentUrl,
     sessionId: RUNTIME_CONFIG.sessionId,
     clientInfo: {
       clientId: RUNTIME_CONFIG.clientId ?? undefined,
@@ -152,7 +152,8 @@ export default function DashboardScreen() {
 
   const [activeTab, setActiveTab] = useState<UiTab>("coordination");
   const [input, setInput] = useState("");
-  const [pendingLocalResponses, setPendingLocalResponses] = useState(0);
+  const [pendingResponses, setPendingResponses] = useState(0);
+  const [sendError, setSendError] = useState<string | null>(null);
   const [workers, setWorkers] = useState<WorkerStatusRow[]>([]);
   const [requests, setRequests] = useState<RequestSnapshotRow[]>([]);
   const [requestCounts, setRequestCounts] = useState<QueueCounts>({});
@@ -347,46 +348,19 @@ export default function DashboardScreen() {
   const sendMessage = useCallback(async () => {
     const text = input.trim();
     if (!text) return;
+    setSendError(null);
     setInput("");
-    setPendingLocalResponses((count) => count + 1);
+    setPendingResponses((count) => count + 1);
     try {
-      await session.send(text);
+      const ok = await session.send(text);
+      if (!ok) {
+        setInput((current) => restoreComposerDraft(current, text));
+        setSendError(buildSendFailureMessage("session"));
+      }
     } finally {
-      setPendingLocalResponses((count) => Math.max(0, count - 1));
+      setPendingResponses((count) => Math.max(0, count - 1));
     }
   }, [input, session]);
-
-  const escalateToRemote = useCallback(
-    async (text: string) => {
-      const trimmed = String(text ?? "").trim();
-      if (!trimmed) return;
-      setPendingLocalResponses((count) => count + 1);
-      try {
-        await session.send(`/ask_remote_buddy ${trimmed}`);
-      } finally {
-        setPendingLocalResponses((count) => Math.max(0, count - 1));
-      }
-    },
-    [session],
-  );
-
-  const sendDirectRemote = useCallback(
-    async (text: string) => {
-      const trimmed = String(text ?? "").trim();
-      if (!trimmed) return;
-      const command = trimmed.startsWith("/ask_remote_buddy")
-        ? trimmed
-        : `/ask_remote_buddy ${trimmed}`;
-      setInput("");
-      setPendingLocalResponses((count) => count + 1);
-      try {
-        await session.send(command);
-      } finally {
-        setPendingLocalResponses((count) => Math.max(0, count - 1));
-      }
-    },
-    [session],
-  );
 
   const coordinationRows = useMemo(
     () =>
@@ -419,10 +393,10 @@ export default function DashboardScreen() {
       .find((message) => (message.from ?? "").toLowerCase().includes("client"));
     return latest?.ts;
   }, [session.state.messages]);
-  const lastLocalBuddyTs = useMemo(() => {
+  const lastAssistantTs = useMemo(() => {
     const latest = [...session.state.messages]
       .reverse()
-      .find((message) => (message.from ?? "").toLowerCase().includes("localbuddy"));
+      .find((message) => !(message.from ?? "").toLowerCase().includes("client"));
     return latest?.ts;
   }, [session.state.messages]);
 
@@ -456,15 +430,15 @@ export default function DashboardScreen() {
         tone: lastClientMessageTs ? "accent" : "warning",
       },
       {
-        key: "local",
-        label: "2. LocalBuddy",
+        key: "session",
+        label: "2. Session",
         detail:
-          pendingLocalResponses > 0
-            ? "Drafting or routing request"
-            : lastLocalBuddyTs
-              ? `Last reply ${relativeMs(lastLocalBuddyTs)}`
-              : "Idle",
-        tone: pendingLocalResponses > 0 ? "warning" : lastLocalBuddyTs ? "positive" : "accent",
+          pendingResponses > 0
+            ? "Submitting request to the local PushPals session"
+            : lastAssistantTs
+              ? `Last reply ${relativeMs(lastAssistantTs)}`
+              : "Ready",
+        tone: pendingResponses > 0 ? "warning" : lastAssistantTs ? "positive" : "accent",
       },
       {
         key: "remote",
@@ -498,8 +472,8 @@ export default function DashboardScreen() {
     ],
     [
       lastClientMessageTs,
-      pendingLocalResponses,
-      lastLocalBuddyTs,
+      pendingResponses,
+      lastAssistantTs,
       pendingRequestsCount,
       claimedRequestsCount,
       onlineWorkersCount,
@@ -608,6 +582,21 @@ export default function DashboardScreen() {
               </View>
             ) : null}
 
+            {sendError ? (
+              <View
+                style={[
+                  styles.banner,
+                  { backgroundColor: `${theme.warning}22`, borderColor: `${theme.warning}55` },
+                ]}
+              >
+                <Text
+                  style={[styles.bannerText, { color: theme.warning, fontFamily: theme.fontSans }]}
+                >
+                  {sendError}
+                </Text>
+              </View>
+            ) : null}
+
             <FlowRibbon theme={theme} steps={flowSteps} />
 
             <DashboardMetrics
@@ -657,10 +646,8 @@ export default function DashboardScreen() {
                   input={input}
                   setInput={setInput}
                   onSend={sendMessage}
-                  onSendRemote={sendDirectRemote}
-                  onEscalate={escalateToRemote}
                   connected={session.isConnected}
-                  localBuddyThinking={pendingLocalResponses > 0}
+                  pendingResponse={pendingResponses > 0}
                 />
               ) : null}
               {activeTab === "requests" ? (

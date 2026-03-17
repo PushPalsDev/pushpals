@@ -5,7 +5,9 @@ import {
   chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
 } from "fs";
@@ -16,7 +18,9 @@ import {
   formatClientRuntimePreflightLines,
   type ClientRuntimePreflightResult,
 } from "../packages/shared/src/client_preflight.js";
+import { normalizePresenceLookupToken } from "../packages/shared/src/communication.js";
 import { resolveGitStateFilePath } from "../packages/shared/src/repo.js";
+import { shouldDisplayInteractiveSessionEvent } from "../packages/shared/src/session_event_visibility.js";
 
 type CliOptions = {
   serverUrl?: string;
@@ -55,6 +59,22 @@ type SessionStreamPayload = {
     payload?: Record<string, unknown>;
   };
   cursor?: number;
+};
+
+type SystemStatusClientRow = {
+  clientId?: unknown;
+  kind?: unknown;
+  label?: unknown;
+  sessionId?: unknown;
+  status?: unknown;
+  connectedTransports?: unknown;
+};
+
+type RemoteBuddySessionConsumerHealth = {
+  ok: boolean;
+  detail: string;
+  clientId?: string;
+  sessionId?: string;
 };
 
 type RuntimeServiceName = "server" | "localbuddy" | "remotebuddy" | "source_control_manager";
@@ -99,7 +119,6 @@ type MonitoringHubHandle = {
 
 type MonitoringHubRuntimeBootstrap = {
   serverUrl: string;
-  localAgentUrl: string;
   sessionId: string;
   clientId: string;
   clientKind: string;
@@ -114,6 +133,8 @@ type ClientStreamIdentity = {
   platform: string;
   repoRoot: string;
 };
+
+type SessionClientRegistration = ClientStreamIdentity;
 
 const DEFAULT_MONITOR_PORT = 8081;
 const MONITOR_SCAN_PORTS = 32;
@@ -133,6 +154,7 @@ const GITHUB_HEADERS = {
   Accept: "application/vnd.github+json",
   "User-Agent": "pushpals-cli",
 };
+const ASK_REMOTE_BUDDY_COMMAND = "/ask_remote_buddy";
 const stateVersion = 1;
 let cliTimestampedConsoleInstalled = false;
 
@@ -142,6 +164,30 @@ export function formatTimestampedCliLine(line: string, at = new Date()): string 
     return text;
   }
   return `[${at.toISOString()}]${text}`;
+}
+
+export function normalizeCliInteractiveMessage(input: string): {
+  text: string;
+  usageMessage?: string;
+} {
+  const trimmed = String(input ?? "").trim();
+  const command = ASK_REMOTE_BUDDY_COMMAND.toLowerCase();
+  if (!trimmed.toLowerCase().startsWith(command)) {
+    return { text: trimmed };
+  }
+
+  const rest = trimmed
+    .slice(command.length)
+    .replace(/^[:\-]\s*/, "")
+    .trim();
+  if (!rest) {
+    return {
+      text: "",
+      usageMessage:
+        "Usage: /ask_remote_buddy <request>. Example: /ask_remote_buddy fix the failing job status in the dashboard.",
+    };
+  }
+  return { text: rest };
 }
 
 function installTimestampedCliConsole(): void {
@@ -183,12 +229,12 @@ function printUsage(): void {
   console.log("");
   console.log("Options:");
   console.log("  --server-url <url>     Override PushPals server URL");
-  console.log("  --local-agent-url <url> Override LocalBuddy URL");
+  console.log("  --local-agent-url <url> Override LocalBuddy URL for monitoring/runtime state");
   console.log("  --session-id <id>      Override session ID");
   console.log("  --hub-url <url>        Override monitoring hub URL");
   console.log("  --runtime-root <path>  Override embedded runtime directory for auto-start");
   console.log("  --runtime-tag <tag>    Override runtime release tag (e.g. v1.0.2)");
-  console.log("  --no-auto-start        Disable runtime auto-start when LocalBuddy is down");
+  console.log("  --no-auto-start        Disable runtime auto-start when the server is down");
   console.log("  --no-stream            Disable live session event stream");
   console.log("  --runtime-only         Start the local runtime and wait for shutdown without opening the interactive chat");
   console.log("  -h, --help             Show this help");
@@ -201,8 +247,10 @@ function printUsage(): void {
   console.log("");
   console.log("Notes:");
   console.log("  - Must be run from inside a git repository.");
-  console.log("  - Auto-start can bootstrap server/localbuddy/remotebuddy/source_control_manager.");
-  console.log("  - LocalBuddy must be attached to the same repo root.");
+  console.log(
+    "  - Auto-start can bootstrap server/remotebuddy/source_control_manager and LocalBuddy when runtime config enables it.",
+  );
+  console.log("  - Interactive CLI talks directly to server sessions; LocalBuddy is optional.");
 }
 
 function parseArgs(argv: string[]): CliOptions | null {
@@ -295,12 +343,6 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
-function normalizePath(value: string): string {
-  const normalized = resolve(value).replace(/\\/g, "/").replace(/\/+$/, "");
-  if (process.platform === "win32") return normalized.toLowerCase();
-  return normalized;
-}
-
 function jsonHtmlBootstrap(value: unknown): string {
   return JSON.stringify(value).replace(/</g, "\\u003c");
 }
@@ -388,6 +430,44 @@ function looksLikeMonitoringHubBuild(root: string): boolean {
   return existsSync(join(root, "index.html")) && existsSync(join(root, "_expo"));
 }
 
+function latestPathMtimeMs(pathValue: string): number {
+  if (!existsSync(pathValue)) return 0;
+  const stat = lstatSync(pathValue);
+  let latest = stat.mtimeMs;
+  if (!stat.isDirectory()) return latest;
+  for (const entry of readdirSync(pathValue)) {
+    latest = Math.max(latest, latestPathMtimeMs(join(pathValue, entry)));
+  }
+  return latest;
+}
+
+function bundledMonitoringHubSourceWatchPaths(sourceRoot: string): string[] {
+  return [
+    join(sourceRoot, "apps", "client", "app"),
+    join(sourceRoot, "apps", "client", "assets"),
+    join(sourceRoot, "apps", "client", "components"),
+    join(sourceRoot, "apps", "client", "constants"),
+    join(sourceRoot, "apps", "client", "hooks"),
+    join(sourceRoot, "apps", "client", "scripts"),
+    join(sourceRoot, "apps", "client", "src"),
+    join(sourceRoot, "apps", "client", "app.json"),
+    join(sourceRoot, "apps", "client", "package.json"),
+    join(sourceRoot, "packages", "shared", "src"),
+    join(sourceRoot, "scripts", "sync-cli-monitor-ui.ts"),
+  ];
+}
+
+export function bundledMonitoringHubNeedsRefresh(existingRoot: string, sourceRoot: string): boolean {
+  if (!looksLikeMonitoringHubBuild(existingRoot)) return true;
+  const bundleMtimeMs = latestPathMtimeMs(existingRoot);
+  if (bundleMtimeMs <= 0) return true;
+  const sourceMtimeMs = bundledMonitoringHubSourceWatchPaths(sourceRoot).reduce(
+    (latest, pathValue) => Math.max(latest, latestPathMtimeMs(pathValue)),
+    0,
+  );
+  return sourceMtimeMs > bundleMtimeMs;
+}
+
 export function resolveBundledMonitoringHubRoot(): string | null {
   const candidates = [
     resolve(import.meta.dir, "..", "monitor-ui"),
@@ -437,10 +517,16 @@ function exportBundledMonitoringHubFromSourceCheckout(sourceRoot: string): void 
 
 async function ensureBundledMonitoringHubRoot(): Promise<string | null> {
   const existingRoot = resolveBundledMonitoringHubRoot();
-  if (existingRoot) return existingRoot;
-
   const sourceRoot = resolveCliSourceCheckoutRoot();
-  if (!sourceRoot) return null;
+  if (!sourceRoot) return existingRoot;
+
+  if (existingRoot && !bundledMonitoringHubNeedsRefresh(existingRoot, sourceRoot)) {
+    return existingRoot;
+  }
+
+  if (existingRoot) {
+    console.log("[pushpals] Packaged monitor UI is stale; refreshing the exported client monitor...");
+  }
 
   exportBundledMonitoringHubFromSourceCheckout(sourceRoot);
   return resolveBundledMonitoringHubRoot();
@@ -733,7 +819,7 @@ export function buildEmbeddedRuntimeEnv(
     repoRoot: string;
     runtimeRoot: string;
     useRuntimeConfig?: boolean;
-    forceLocalBuddyEnabled?: boolean;
+    sessionId?: string;
   },
 ): Record<string, string> {
   const env = normalizeChildProcessEnv(baseEnv);
@@ -751,7 +837,9 @@ export function buildEmbeddedRuntimeEnv(
           PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.repoRoot,
         }),
     PUSHPALS_PROTOCOL_SCHEMAS_DIR: join(opts.runtimeRoot, "protocol", "schemas"),
-    ...(opts.forceLocalBuddyEnabled ? { LOCALBUDDY_ENABLED: "1" } : {}),
+    ...(typeof opts.sessionId === "string" && opts.sessionId.trim()
+      ? { PUSHPALS_SESSION_ID: opts.sessionId.trim() }
+      : {}),
     ...(typeof env.PUSHPALS_GIT_BIN === "string" && env.PUSHPALS_GIT_BIN.trim()
       ? { PUSHPALS_GIT_BIN: env.PUSHPALS_GIT_BIN.trim() }
       : {}),
@@ -1092,6 +1180,142 @@ async function probeServer(serverUrl: string): Promise<boolean> {
   }
 }
 
+export function normalizeRepoPathForComparison(repoPath: string): string {
+  const normalized = resolve(String(repoPath ?? ""))
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+async function fetchServerRepoRoot(serverUrl: string): Promise<string> {
+  const response = await fetchWithTimeout(`${serverUrl}/system/status`, {}, 10_000);
+  if (!response.ok) {
+    throw new Error(`status probe failed with HTTP ${response.status}`);
+  }
+
+  const payload = (await response.json().catch(() => ({}))) as {
+    repo?: { root?: unknown };
+  };
+  const repoRoot =
+    payload?.repo && typeof payload.repo.root === "string" ? payload.repo.root.trim() : "";
+  if (!repoRoot) {
+    throw new Error("server did not report repo.root in /system/status");
+  }
+
+  return repoRoot;
+}
+
+async function ensureServerRepoAffinity(serverUrl: string, currentRepoRoot: string): Promise<void> {
+  const serverRepoRoot = await fetchServerRepoRoot(serverUrl);
+  if (
+    normalizeRepoPathForComparison(serverRepoRoot) ===
+    normalizeRepoPathForComparison(currentRepoRoot)
+  ) {
+    return;
+  }
+
+  throw new Error(
+    `repo mismatch: currentRepo=${currentRepoRoot} serverRepo=${serverRepoRoot}. Stop the existing runtime or switch to the matching repo.`,
+  );
+}
+
+function isRemoteBuddyClientRow(row: SystemStatusClientRow): boolean {
+  const clientId = normalizePresenceLookupToken(row.clientId);
+  const label = normalizePresenceLookupToken(row.label);
+  return clientId.includes("remotebuddy") || label.includes("remotebuddy");
+}
+
+export function extractRemoteBuddySessionConsumerHealth(
+  statusPayload: unknown,
+  sessionId: string,
+): RemoteBuddySessionConsumerHealth {
+  const rows = Array.isArray((statusPayload as { clients?: { items?: unknown } })?.clients?.items)
+    ? (((statusPayload as { clients?: { items?: unknown } }).clients?.items as unknown[]) ?? [])
+    : [];
+  const sessionRows = rows.filter((row): row is SystemStatusClientRow => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+    return String((row as SystemStatusClientRow).sessionId ?? "").trim() === sessionId;
+  });
+  const remotebuddyRows = sessionRows.filter(isRemoteBuddyClientRow);
+  const connectedRow = remotebuddyRows.find(
+    (row) => String(row.status ?? "").trim().toLowerCase() === "connected",
+  );
+  if (connectedRow) {
+    return {
+      ok: true,
+      detail: `RemoteBuddy session consumer connected (${String(connectedRow.clientId ?? "").trim()})`,
+      clientId: String(connectedRow.clientId ?? "").trim() || undefined,
+      sessionId,
+    };
+  }
+  const anyRemoteBuddyRows = rows.filter((row): row is SystemStatusClientRow => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+    return isRemoteBuddyClientRow(row as SystemStatusClientRow);
+  });
+  const connectedOtherSession = anyRemoteBuddyRows.find((row) => {
+    const rowSessionId = String(row.sessionId ?? "").trim();
+    if (!rowSessionId || rowSessionId === sessionId) return false;
+    return String(row.status ?? "").trim().toLowerCase() === "connected";
+  });
+  if (connectedOtherSession) {
+    const otherSessionId = String(connectedOtherSession.sessionId ?? "").trim();
+    const otherClientId = String(connectedOtherSession.clientId ?? "").trim();
+    return {
+      ok: false,
+      detail:
+        `RemoteBuddy is connected to session ${otherSessionId || "unknown"} ` +
+        `(${otherClientId || "unknown client"}), not ${sessionId}`,
+      clientId: otherClientId || undefined,
+      sessionId: otherSessionId || undefined,
+    };
+  }
+  if (remotebuddyRows.length > 0) {
+    return {
+      ok: false,
+      detail: `RemoteBuddy session consumer exists for ${sessionId} but is not connected`,
+      clientId: String(remotebuddyRows[0]?.clientId ?? "").trim() || undefined,
+      sessionId,
+    };
+  }
+  if (anyRemoteBuddyRows.length > 0) {
+    const knownSessions = [...new Set(anyRemoteBuddyRows.map((row) => String(row.sessionId ?? "").trim()))]
+      .filter(Boolean)
+      .sort();
+    const suffix =
+      knownSessions.length > 0 ? ` Known RemoteBuddy sessions: ${knownSessions.join(", ")}.` : "";
+    return {
+      ok: false,
+      detail: `No connected RemoteBuddy session consumer found for session ${sessionId}.${suffix}`.trim(),
+    };
+  }
+  return {
+    ok: false,
+    detail: `No connected RemoteBuddy session consumer found for session ${sessionId}`,
+  };
+}
+
+async function probeRemoteBuddySessionConsumer(
+  serverUrl: string,
+  sessionId: string,
+): Promise<RemoteBuddySessionConsumerHealth> {
+  try {
+    const response = await fetchWithTimeout(`${serverUrl}/system/status`, {}, 10_000);
+    if (!response.ok) {
+      return {
+        ok: false,
+        detail: `system status probe failed with HTTP ${response.status}`,
+      };
+    }
+    const payload = (await response.json().catch(() => ({}))) as unknown;
+    return extractRemoteBuddySessionConsumerHealth(payload, sessionId);
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `system status probe failed: ${String(err)}`,
+    };
+  }
+}
+
 async function probeSourceControlManager(port: number): Promise<boolean> {
   if (!Number.isFinite(port) || port <= 0) return false;
   try {
@@ -1167,26 +1391,74 @@ async function probeLocalBuddy(
   );
 }
 
+export function resolveCliLocalBuddyAutostart(
+  runtimeOnly: boolean,
+  runtimeConfigEnabled: boolean,
+): boolean {
+  return runtimeOnly ? runtimeConfigEnabled : false;
+}
+
+async function ensureServerSession(
+  serverUrl: string,
+  requestedSessionId: string,
+  client: SessionClientRegistration,
+): Promise<string> {
+  const response = await fetchWithTimeout(
+    `${serverUrl}/sessions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: requestedSessionId,
+        client: {
+          clientId: client.clientId,
+          kind: client.kind,
+          label: client.label,
+          version: client.version,
+          platform: client.platform,
+          repoRoot: client.repoRoot,
+        },
+      }),
+    },
+    15_000,
+  );
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(
+      `Failed to create or join session ${requestedSessionId}: HTTP ${response.status}${detail ? ` ${detail}` : ""}`,
+    );
+  }
+
+  const payload = (await response.json().catch(() => ({}))) as { sessionId?: unknown };
+  const sessionId =
+    typeof payload.sessionId === "string" && payload.sessionId.trim()
+      ? payload.sessionId.trim()
+      : "";
+  if (!sessionId) {
+    throw new Error("Server session bootstrap returned no sessionId.");
+  }
+  return sessionId;
+}
+
 async function autoStartRuntimeServices(opts: {
   repoRoot: string;
   serverUrl: string;
   localAgentUrl: string;
+  sessionId: string;
   sourceControlManagerPort: number;
   sourceControlManagerRemote: string;
   preparedRuntime: PreparedCliRuntime;
   requestedRuntimeTag?: string;
-  requireLocalBuddy?: boolean;
+  startLocalBuddy?: boolean;
 }): Promise<RuntimeServiceProcess[]> {
   const { runtimePreflight } = opts.preparedRuntime;
   const runtimeRoot = opts.preparedRuntime.runtimeRoot;
   const runtimeTag =
     opts.preparedRuntime.runtimeTag || (await resolveRuntimeReleaseTag(opts.requestedRuntimeTag));
-  const requireLocalBuddy = opts.requireLocalBuddy ?? true;
-  const localBuddyEnabled = requireLocalBuddy || Boolean(runtimePreflight.config.localbuddy.enabled);
+  const startLocalBuddy = opts.startLocalBuddy ?? Boolean(runtimePreflight.config.localbuddy.enabled);
+  const localBuddyEnabled = startLocalBuddy;
 
-  console.log(
-    `[pushpals] LocalBuddy unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`,
-  );
+  console.log(`[pushpals] Runtime unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`);
   console.log(`[pushpals] runtimeRoot=${runtimeRoot}`);
   console.log(`[pushpals] runtimeTag=${runtimeTag}`);
   if (!runtimePreflight.ok) {
@@ -1200,7 +1472,7 @@ async function autoStartRuntimeServices(opts: {
     repoRoot: opts.repoRoot,
     runtimeRoot,
     useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
-    forceLocalBuddyEnabled: requireLocalBuddy,
+    sessionId: opts.sessionId,
   });
   if (runtimeEnv.PUSHPALS_GIT_BIN) {
     applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, runtimeEnv.PUSHPALS_GIT_BIN);
@@ -1264,9 +1536,6 @@ async function autoStartRuntimeServices(opts: {
   }
 
   if (localBuddyEnabled) {
-    if (requireLocalBuddy && !runtimePreflight.config.localbuddy.enabled) {
-      console.log("[pushpals] LocalBuddy is disabled in config; forcing it on for this CLI session.");
-    }
     console.log("[pushpals] Starting embedded LocalBuddy...");
     const localbuddyService = spawnRuntimeService(
       "localbuddy",
@@ -1278,7 +1547,7 @@ async function autoStartRuntimeServices(opts: {
     services.push(localbuddyService);
     console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath}`);
   } else {
-    console.log("[pushpals] Embedded LocalBuddy disabled by runtime config; skipping start.");
+    console.log("[pushpals] Embedded LocalBuddy disabled for this CLI session; skipping start.");
   }
 
   console.log("[pushpals] Starting embedded RemoteBuddy...");
@@ -1357,7 +1626,8 @@ async function autoStartRuntimeServices(opts: {
     }
 
     const health = localBuddyEnabled ? await probeLocalBuddy(opts.localAgentUrl) : null;
-    if (!requireLocalBuddy || (localBuddyEnabled && health?.ok)) {
+    const remoteBuddyHealth = await probeRemoteBuddySessionConsumer(opts.serverUrl, opts.sessionId);
+    if ((!localBuddyEnabled || health?.ok) && remoteBuddyHealth.ok) {
       const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;
       while (Date.now() < stabilityDeadline) {
         for (let i = services.length - 1; i >= 0; i--) {
@@ -1390,13 +1660,19 @@ async function autoStartRuntimeServices(opts: {
   }
 
   stopRuntimeServices(services);
+  const remoteBuddyHealth = await probeRemoteBuddySessionConsumer(opts.serverUrl, opts.sessionId);
+  if (!localBuddyEnabled && !remoteBuddyHealth.ok) {
+    throw new Error(
+      `Timed out waiting for RemoteBuddy session consumer readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms (${remoteBuddyHealth.detail})`,
+    );
+  }
   if (!localBuddyEnabled) {
     throw new Error(
       `Timed out waiting for embedded runtime readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
     );
   }
   throw new Error(
-    `Timed out waiting for LocalBuddy at ${opts.localAgentUrl} after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
+    `Timed out waiting for LocalBuddy at ${opts.localAgentUrl} and RemoteBuddy session consumer after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
   );
 }
 
@@ -1454,12 +1730,10 @@ async function looksLikeMonitoringHub(url: string): Promise<boolean> {
 
 function buildMonitoringHubRuntimeBootstrap(opts: {
   serverUrl: string;
-  localAgentUrl: string;
   sessionId: string;
 }): MonitoringHubRuntimeBootstrap {
   return {
     serverUrl: opts.serverUrl,
-    localAgentUrl: opts.localAgentUrl,
     sessionId: opts.sessionId,
     clientId: `cli-monitor-${opts.sessionId}`,
     clientKind: "cli_monitor",
@@ -1559,10 +1833,12 @@ async function serveBundledMonitoringHub(
 
 export function buildEmbeddedMonitoringHubHtml(opts: {
   serverUrl: string;
-  localAgentUrl: string;
   sessionId: string;
 }): string {
-  const bootstrap = jsonHtmlBootstrap(opts);
+  const bootstrap = jsonHtmlBootstrap({
+    serverUrl: opts.serverUrl,
+    sessionId: opts.sessionId,
+  });
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -1658,7 +1934,6 @@ export function buildEmbeddedMonitoringHubHtml(opts: {
       cardsEl.innerHTML = cards.map((card) => '<div class="card"><div class="label">' + esc(card.label) + '</div><div class="value">' + esc(card.value) + '</div><div class="sub">' + esc(card.sub) + '</div></div>').join("");
       metaEl.innerHTML = [
         '<span class="pill">server ' + esc(boot.serverUrl) + '</span>',
-        '<span class="pill">localbuddy ' + esc(boot.localAgentUrl) + '</span>',
         '<span class="pill">session ' + esc(boot.sessionId) + '</span>',
         '<span class="pill">repo ' + esc(repo?.root ?? repo?.remoteUrl ?? "current repo") + '</span>'
       ].join("");
@@ -1714,7 +1989,6 @@ async function proxyMonitoringHubRequest(
 
 export async function startEmbeddedMonitoringHub(opts: {
   serverUrl: string;
-  localAgentUrl: string;
   sessionId: string;
   preferredPort: number;
   assetRoot?: string | null;
@@ -1729,7 +2003,6 @@ export async function startEmbeddedMonitoringHub(opts: {
   }
   const bootstrap = buildMonitoringHubRuntimeBootstrap({
     serverUrl: opts.serverUrl,
-    localAgentUrl: opts.localAgentUrl,
     sessionId: opts.sessionId,
   });
 
@@ -1795,7 +2068,6 @@ async function resolveMonitoringHub(opts: {
   preferredUrl: string;
   fallbackPort: number;
   serverUrl: string;
-  localAgentUrl: string;
   sessionId: string;
 }): Promise<MonitoringHubHandle | null> {
   const explicit = normalizeUrl(opts.preferredUrl);
@@ -1827,96 +2099,45 @@ async function resolveMonitoringHub(opts: {
   return embedded;
 }
 
-async function sendMessageToLocalBuddy(localAgentUrl: string, text: string): Promise<boolean> {
-  let response: Response;
+async function sendMessageToServerSession(
+  serverUrl: string,
+  sessionId: string,
+  text: string,
+): Promise<boolean> {
   try {
-    response = await fetchWithTimeout(
-      `${localAgentUrl}/message`,
+    const response = await fetchWithTimeout(
+      `${serverUrl}/sessions/${encodeURIComponent(sessionId)}/message`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       },
-      30_000,
+      15_000,
     );
-  } catch (err) {
-    console.error(`[pushpals] Failed to reach LocalBuddy: ${String(err)}`);
-    return false;
-  }
 
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    console.error(`[pushpals] LocalBuddy rejected message: HTTP ${response.status} ${detail}`);
-    return false;
-  }
-
-  const reader = response.body?.getReader();
-  if (!reader) {
-    console.error("[pushpals] LocalBuddy response stream missing.");
-    return false;
-  }
-
-  let buffer = "";
-  const decoder = new TextDecoder();
-  let complete = false;
-  let ok = true;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop() ?? "";
-
-    for (const chunk of chunks) {
-      const dataLine = chunk
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find((line) => line.startsWith("data: "));
-      if (!dataLine) continue;
-      try {
-        const payload = JSON.parse(dataLine.slice(6)) as {
-          type?: string;
-          message?: string;
-          data?: Record<string, unknown>;
-        };
-        const type = String(payload.type ?? "")
-          .trim()
-          .toLowerCase();
-        const message = String(payload.message ?? "").trim();
-        if (type === "status" && message) {
-          console.log(`[localbuddy] ${message}`);
-        } else if (type === "error") {
-          ok = false;
-          console.log(`[localbuddy] ERROR: ${message || "Unknown failure"}`);
-        } else if (type === "complete") {
-          complete = true;
-          const requestId =
-            payload.data && typeof payload.data.requestId === "string"
-              ? payload.data.requestId
-              : "";
-          if (requestId) {
-            console.log(`[localbuddy] requestId=${requestId}`);
-          } else if (message) {
-            console.log(`[localbuddy] ${message}`);
-          }
-        }
-      } catch {
-        // Ignore malformed stream chunks.
-      }
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      console.error(
+        `[pushpals] Session message rejected: HTTP ${response.status}${detail ? ` ${detail}` : ""}`,
+      );
+      return false;
     }
-  }
 
-  return ok && complete;
+    return true;
+  } catch (err) {
+    console.error(`[pushpals] Failed to reach server session endpoint: ${String(err)}`);
+    return false;
+  }
 }
 
-function formatSessionEventLine(
+export function formatSessionEventLine(
   event: NonNullable<SessionStreamPayload["envelope"]>,
 ): string | null {
   const type = String(event.type ?? "").toLowerCase();
   const from = String(event.from ?? "");
   const payload = event.payload ?? {};
 
+  if (!shouldDisplayInteractiveSessionEvent(event)) return null;
   if (type === "message") return null;
   if (type === "assistant_message") {
     const text = String(payload.text ?? "").trim();
@@ -2101,6 +2322,15 @@ async function main(): Promise<void> {
   const sessionId = String(
     parsed.sessionId ?? process.env.PUSHPALS_SESSION_ID ?? config.sessionId,
   ).trim();
+  const cliVersion = String(process.env.PUSHPALS_CLI_PACKAGE_VERSION ?? "").trim() || "unknown";
+  const cliClient: ClientStreamIdentity = {
+    clientId: createRuntimeClientId("cli"),
+    kind: "cli",
+    label: "CLI",
+    version: cliVersion,
+    platform: `${process.platform}/${process.arch}`,
+    repoRoot,
+  };
   let autoStartedServices: RuntimeServiceProcess[] = [];
   const stopAutoStartedServices = (): void => {
     if (autoStartedServices.length === 0) return;
@@ -2109,75 +2339,84 @@ async function main(): Promise<void> {
   };
 
   let serverHealthy = await probeServer(serverUrl);
-  let health = await probeLocalBuddy(localAgentUrl);
-  const runtimeNeedsAutoStart = parsed.runtimeOnly ? !serverHealthy : !health?.ok;
-  if (runtimeNeedsAutoStart && !parsed.noAutoStart) {
-    try {
-      autoStartedServices = await autoStartRuntimeServices({
-        repoRoot,
-        serverUrl,
-        localAgentUrl,
-        sourceControlManagerPort: config.sourceControlManager.port,
-        sourceControlManagerRemote: config.sourceControlManager.remote,
-        preparedRuntime,
-        requestedRuntimeTag: parsed.runtimeTag,
-        requireLocalBuddy: !parsed.runtimeOnly,
-      });
-      serverHealthy = await probeServer(serverUrl);
-      health = await probeLocalBuddy(localAgentUrl);
-    } catch (err) {
-      console.error(`[pushpals] Auto-start failed: ${String(err)}`);
-      stopAutoStartedServices();
+  const serverWasAlreadyHealthy = serverHealthy;
+  let remoteBuddyConsumerHealth: RemoteBuddySessionConsumerHealth = {
+    ok: false,
+    detail: `No connected RemoteBuddy session consumer found for session ${sessionId}`,
+  };
+  if (!serverHealthy) {
+    if (!parsed.noAutoStart) {
+      try {
+        autoStartedServices = await autoStartRuntimeServices({
+          repoRoot,
+          serverUrl,
+          localAgentUrl,
+          sessionId,
+          sourceControlManagerPort: config.sourceControlManager.port,
+          sourceControlManagerRemote: config.sourceControlManager.remote,
+          preparedRuntime,
+          requestedRuntimeTag: parsed.runtimeTag,
+          startLocalBuddy: resolveCliLocalBuddyAutostart(
+            parsed.runtimeOnly,
+            Boolean(config.localbuddy.enabled),
+          ),
+        });
+        serverHealthy = await probeServer(serverUrl);
+      } catch (err) {
+        console.error(`[pushpals] Auto-start failed: ${String(err)}`);
+        stopAutoStartedServices();
+      }
+    }
+    if (!serverHealthy) {
+      console.error(`[pushpals] Server is unavailable at ${serverUrl}.`);
+      if (parsed.noAutoStart) {
+        console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
+      } else {
+        console.error("[pushpals] Auto-start could not bring the embedded runtime online.");
+      }
+      process.exit(1);
     }
   }
-  if (parsed.runtimeOnly && !serverHealthy) {
-    console.error(`[pushpals] Server is unavailable at ${serverUrl}.`);
-    if (parsed.noAutoStart) {
-      console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
-    } else {
-      console.error("[pushpals] Auto-start could not bring the embedded runtime online.");
-    }
+  try {
+    await ensureServerRepoAffinity(serverUrl, repoRoot);
+  } catch (err) {
+    stopAutoStartedServices();
+    console.error(`[pushpals] Repo affinity check failed: ${String(err)}`);
     process.exit(1);
   }
-  if (!parsed.runtimeOnly && !health?.ok) {
-    console.error(`[pushpals] LocalBuddy is unavailable at ${localAgentUrl}.`);
-    if (parsed.noAutoStart) {
-      console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
-    } else {
-      console.error("[pushpals] Auto-start could not bring LocalBuddy online.");
-    }
-    process.exit(1);
-  }
-
-  let localBuddySessionId = sessionId;
+  let activeSessionId = sessionId;
   if (!parsed.runtimeOnly) {
-    const localBuddyRepo = health?.repo ? resolve(health.repo) : "";
-    if (!localBuddyRepo) {
+    try {
+      activeSessionId = await ensureServerSession(serverUrl, sessionId, cliClient);
+    } catch (err) {
       stopAutoStartedServices();
-      console.error("[pushpals] LocalBuddy health response did not include repo path.");
+      console.error(`[pushpals] Session bootstrap failed: ${String(err)}`);
       process.exit(1);
     }
-
-    if (normalizePath(localBuddyRepo) !== normalizePath(repoRoot)) {
-      stopAutoStartedServices();
-      console.error("[pushpals] Repo mismatch detected.");
-      console.error(`[pushpals] currentRepo=${repoRoot}`);
-      console.error(`[pushpals] localBuddyRepo=${localBuddyRepo}`);
+  }
+  remoteBuddyConsumerHealth = await probeRemoteBuddySessionConsumer(serverUrl, activeSessionId);
+  if (!serverHealthy) {
+    console.error(`[pushpals] Server is unavailable at ${serverUrl}.`);
+    process.exit(1);
+  }
+  if (!remoteBuddyConsumerHealth.ok) {
+    stopAutoStartedServices();
+    console.error(
+      `[pushpals] RemoteBuddy is not ready for session ${activeSessionId}: ${remoteBuddyConsumerHealth.detail}`,
+    );
+    if (serverWasAlreadyHealthy) {
       console.error(
-        "[pushpals] LocalBuddy must run against the same repo. Start PushPals from this repo and retry.",
+        "[pushpals] A PushPals runtime is already serving this repo, but it does not have a connected RemoteBuddy consumer for this session.",
       );
-      process.exit(1);
-    }
-
-    localBuddySessionId =
-      health?.sessionId && String(health.sessionId).trim()
-        ? String(health.sessionId).trim()
-        : sessionId;
-    if (sessionId && sessionId !== localBuddySessionId) {
-      console.warn(
-        `[pushpals] Requested sessionId=${sessionId}, but LocalBuddy is currently attached to sessionId=${localBuddySessionId}.`,
+      console.error(
+        "[pushpals] Refusing to start another embedded RemoteBuddy against the same runtime. Restart or stop the existing runtime before retrying.",
       );
+    } else if (parsed.noAutoStart) {
+      console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
+    } else {
+      console.error("[pushpals] Auto-start could not bring the embedded runtime into a usable state.");
     }
+    process.exit(1);
   }
 
   const statePath = resolveCliStatePath(repoRoot);
@@ -2190,8 +2429,7 @@ async function main(): Promise<void> {
     preferredUrl: preferredHubUrl,
     fallbackPort: monitorPort,
     serverUrl,
-    localAgentUrl,
-    sessionId: localBuddySessionId,
+    sessionId: activeSessionId,
   });
   const monitoringHubUrl = monitoringHub?.url ?? "";
 
@@ -2200,7 +2438,7 @@ async function main(): Promise<void> {
       monitoringHubUrl: monitoringHubUrl || undefined,
       serverUrl,
       localAgentUrl,
-      sessionId: localBuddySessionId,
+      sessionId: activeSessionId,
       repoRoot,
     });
   } else {
@@ -2217,8 +2455,7 @@ async function main(): Promise<void> {
     console.log("[pushpals] monitoringHubUrl=unavailable");
   }
   console.log(`[pushpals] serverUrl=${serverUrl}`);
-  console.log(`[pushpals] localAgentUrl=${localAgentUrl}`);
-  console.log(`[pushpals] sessionId=${localBuddySessionId}`);
+  console.log(`[pushpals] sessionId=${activeSessionId}`);
   console.log(`[pushpals] repoRoot=${repoRoot}`);
   console.log(`[pushpals] cliStateFile=${statePath ?? "unavailable"}`);
   if (parsed.runtimeOnly) {
@@ -2227,15 +2464,6 @@ async function main(): Promise<void> {
     console.log("[pushpals] Type a message and press Enter. Use /exit or exit to quit.");
   }
 
-  const cliVersion = String(process.env.PUSHPALS_CLI_PACKAGE_VERSION ?? "").trim() || "unknown";
-  const cliClient: ClientStreamIdentity = {
-    clientId: createRuntimeClientId("cli"),
-    kind: "cli",
-    label: "CLI",
-    version: cliVersion,
-    platform: `${process.platform}/${process.arch}`,
-    repoRoot,
-  };
   const streamAbort = new AbortController();
   let rl: Interface | null = null;
 
@@ -2255,7 +2483,7 @@ async function main(): Promise<void> {
     ? Promise.resolve()
     : runSessionStream(
         serverUrl,
-        localBuddySessionId,
+        activeSessionId,
         cliClient,
         printIncoming,
         streamAbort.signal,
@@ -2348,8 +2576,7 @@ async function main(): Promise<void> {
     }
     if (text === "/status") {
       console.log(`[pushpals] serverUrl=${serverUrl}`);
-      console.log(`[pushpals] localAgentUrl=${localAgentUrl}`);
-      console.log(`[pushpals] sessionId=${localBuddySessionId}`);
+      console.log(`[pushpals] sessionId=${activeSessionId}`);
       console.log(`[pushpals] repoRoot=${repoRoot}`);
       console.log(
         monitoringHubUrl
@@ -2375,7 +2602,14 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const ok = await sendMessageToLocalBuddy(localAgentUrl, text);
+    const normalized = normalizeCliInteractiveMessage(text);
+    if (normalized.usageMessage) {
+      console.log(`[pushpals] ${normalized.usageMessage}`);
+      rl.prompt();
+      continue;
+    }
+
+    const ok = await sendMessageToServerSession(serverUrl, activeSessionId, normalized.text);
     if (!ok) {
       console.log("[pushpals] Message failed.");
     }

@@ -26,25 +26,6 @@ function prettyTs(iso?: string): string {
   return new Date(ts).toLocaleTimeString();
 }
 
-function localBuddyMessageAlreadyRoutedRemote(text: string | undefined): boolean {
-  const normalized = String(text ?? "")
-    .trim()
-    .toLowerCase();
-  if (!normalized) return false;
-  if (normalized.includes("/ask_remote_buddy")) return true;
-  if (!normalized.includes("remotebuddy")) return false;
-
-  return (
-    normalized.includes("queueing this to remotebuddy") ||
-    normalized.includes("routing this to remotebuddy") ||
-    normalized.includes("request queued") ||
-    normalized.includes("is planning and will assign a workerpal") ||
-    normalized.includes("delegating this to a workerpal") ||
-    normalized.includes("assigned this request to workerpal") ||
-    normalized.includes("no idle workerpal")
-  );
-}
-
 function CollapsibleMessage({ text, theme }: { text: string; theme: DashboardTheme }) {
   const [expanded, setExpanded] = useState(false);
   const threshold = 360;
@@ -103,20 +84,16 @@ export function ChatPane({
   input,
   setInput,
   onSend,
-  onSendRemote,
-  onEscalate,
   connected,
-  localBuddyThinking,
+  pendingResponse,
 }: {
   theme: DashboardTheme;
   messages: ChatPaneMessage[];
   input: string;
   setInput: React.Dispatch<React.SetStateAction<string>>;
   onSend: () => void;
-  onSendRemote: (text: string) => void;
-  onEscalate: (text: string) => void;
   connected: boolean;
-  localBuddyThinking: boolean;
+  pendingResponse: boolean;
 }) {
   const scrollRef = useRef<ScrollView | null>(null);
   const handleComposerKeyPress = useCallback(
@@ -138,7 +115,7 @@ export function ChatPane({
 
   useEffect(() => {
     scrollRef.current?.scrollToEnd({ animated: true });
-  }, [messages.length, localBuddyThinking]);
+  }, [messages.length, pendingResponse]);
 
   return (
     <View style={styles.tabFill}>
@@ -156,25 +133,13 @@ export function ChatPane({
             <Text
               style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
             >
-              Start with a task. LocalBuddy will enqueue and RemoteBuddy will coordinate execution.
+              Start with a task. PushPals will route it through the local server and RemoteBuddy will coordinate execution.
             </Text>
           </View>
         ) : (
           messages.map((message, index) => {
             const isUser = (message.from ?? "").toLowerCase().includes("client");
             const speaker = resolveChatSpeaker(message.from, theme);
-            const isLocalBuddy =
-              !isUser && (message.from ?? "").toLowerCase().includes("localbuddy");
-            const priorUserMessage = isLocalBuddy
-              ? [...messages.slice(0, index)]
-                  .reverse()
-                  .find((entry) => (entry.from ?? "").toLowerCase().includes("client"))
-              : null;
-            const priorPrompt = priorUserMessage?.text ?? "";
-            const showEscalateButton =
-              isLocalBuddy &&
-              Boolean(priorPrompt) &&
-              !localBuddyMessageAlreadyRoutedRemote(message.text);
             return (
               <View
                 key={message.id}
@@ -209,29 +174,11 @@ export function ChatPane({
                 >
                   {prettyTs(message.ts)}
                 </Text>
-                {showEscalateButton ? (
-                  <Pressable
-                    onPress={() => onEscalate(priorPrompt)}
-                    style={[styles.escalateButton, { borderColor: theme.accent }]}
-                    accessibilityRole="button"
-                    accessibilityLabel="Send this prompt to RemoteBuddy"
-                    accessibilityHint="Resubmits your prior user message as a remote request."
-                  >
-                    <Text
-                      style={[
-                        styles.escalateButtonLabel,
-                        { color: theme.accent, fontFamily: theme.fontSans },
-                      ]}
-                    >
-                      Send This To RemoteBuddy
-                    </Text>
-                  </Pressable>
-                ) : null}
               </View>
             );
           })
         )}
-        {localBuddyThinking ? (
+        {pendingResponse ? (
           <View
             style={[
               styles.chatBubble,
@@ -243,7 +190,7 @@ export function ChatPane({
             ]}
           >
             <Text style={[styles.chatFrom, { color: theme.accent, fontFamily: theme.fontSans }]}>
-              Local Buddy
+              PushPals
             </Text>
             <View style={styles.typingLine}>
               <Text
@@ -262,8 +209,7 @@ export function ChatPane({
         input={input}
         setInput={setInput}
         connected={connected}
-        onSendLocal={onSend}
-        onSendRemote={onSendRemote}
+        onSend={onSend}
         onComposerKeyPress={handleComposerKeyPress}
       />
     </View>
@@ -318,20 +264,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700",
     marginTop: 6,
-  },
-  escalateButton: {
-    marginTop: 8,
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-    alignSelf: "flex-start",
-  },
-  escalateButtonLabel: {
-    fontSize: 11,
-    fontWeight: "700",
-    textTransform: "uppercase",
-    letterSpacing: 0.2,
   },
   typingLine: {
     flexDirection: "row",

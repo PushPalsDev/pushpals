@@ -21,6 +21,7 @@ import {
   statusColor,
 } from "./dashboardFormatters";
 import { MetricTile } from "./MetricTile";
+import { shouldDisplayInteractiveSessionEvent } from "../lib/sessionEventVisibility";
 
 type SessionEvent = {
   id: string;
@@ -204,7 +205,10 @@ export function SystemPane({
   }, [events]);
 
   const onlineWorkers = workers.filter((worker) => worker.isOnline).length;
-  const recentEvents = useMemo(() => events.slice(-40).reverse(), [events]);
+  const recentEvents = useMemo(
+    () => events.filter((event) => shouldDisplayInteractiveSessionEvent(event)).slice(-40).reverse(),
+    [events],
+  );
   const requestSlo = systemSummary.slo?.requests;
   const jobSlo = systemSummary.slo?.jobs;
   const llmUsage = systemSummary.llmUsage;
@@ -234,7 +238,7 @@ export function SystemPane({
     [autonomyQuestions],
   );
   const llmUsageRows = useMemo(() => {
-    const defaults = ["localbuddy", "remotebuddy", "workerpals"];
+    const defaults = ["remotebuddy", "workerpals"];
     const byService = new Map((llmUsage?.services ?? []).map((row) => [row.service.toLowerCase(), row]));
     for (const service of defaults) {
       if (!byService.has(service)) {
@@ -260,6 +264,21 @@ export function SystemPane({
     () => clientsSummary?.items ?? [],
     [clientsSummary],
   );
+  const hasLocalBuddyActivity = useMemo(() => {
+    if (latestEventByComponent.LocalBuddy) return true;
+    if (
+      (llmUsage?.services ?? []).some((row) => {
+        const service = row.service.toLowerCase();
+        return service === "localbuddy" && (row.callCount > 0 || row.totalTokens > 0);
+      })
+    ) {
+      return true;
+    }
+    return clientRows.some((row) => {
+      const signal = `${String(row.clientId ?? "")} ${String(row.label ?? "")}`.toLowerCase();
+      return signal.includes("localbuddy") || signal.includes("local buddy");
+    });
+  }, [clientRows, latestEventByComponent.LocalBuddy, llmUsage?.services]);
   const clientKindsSummary = useMemo(() => {
     const entries = Object.entries(clientsSummary?.byKind ?? {}).sort((a, b) => {
       if (b[1] !== a[1]) return b[1] - a[1];
@@ -323,20 +342,24 @@ export function SystemPane({
       detail: connected ? "session event stream live" : "not connected",
       ts: systemSummary.ts,
     },
-    {
-      name: "LocalBuddy",
-      status: latestEventByComponent.LocalBuddy
-        ? "active"
-        : withinInitializingGrace
-          ? "initializing"
-          : "unknown",
-      detail: latestEventByComponent.LocalBuddy
-        ? `last event ${relativeMs(latestEventByComponent.LocalBuddy)}`
-        : withinInitializingGrace
-          ? "waiting for first status event"
-          : "no events yet",
-      ts: latestEventByComponent.LocalBuddy,
-    },
+    ...(hasLocalBuddyActivity
+      ? [
+          {
+            name: "LocalBuddy",
+            status: latestEventByComponent.LocalBuddy
+              ? "active"
+              : withinInitializingGrace
+                ? "initializing"
+                : "unknown",
+            detail: latestEventByComponent.LocalBuddy
+              ? `last event ${relativeMs(latestEventByComponent.LocalBuddy)}`
+              : withinInitializingGrace
+                ? "waiting for first status event"
+                : "no events yet",
+            ts: latestEventByComponent.LocalBuddy,
+          },
+        ]
+      : []),
     {
       name: "RemoteBuddy",
       status: latestEventByComponent.RemoteBuddy

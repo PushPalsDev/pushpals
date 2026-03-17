@@ -694,7 +694,7 @@ function extractClarificationFromJobFailure(
   return null;
 }
 
-class RemoteBuddyOrchestrator {
+export class RemoteBuddyOrchestrator {
   private static readonly SESSION_MONITOR_MAX_WS_ERRORS = Math.max(
     1,
     Number.parseInt(process.env.REMOTEBUDDY_SESSION_MONITOR_MAX_WS_ERRORS ?? "6", 10) || 6,
@@ -730,7 +730,8 @@ class RemoteBuddyOrchestrator {
   private readonly comm: CommunicationManager;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private statusSessionReady = false;
-  private stopSessionEvents: (() => void) | null = null;
+  private readonly sessionEventStops = new Map<string, () => void>();
+  private readonly fatalSessionMonitors = new Set<string>();
   private readonly seenJobFailures = new Set<string>();
   private readonly seenJobCompletions = new Set<string>();
   private readonly seenAutonomyFeedbackEvents = new Set<string>();
@@ -738,8 +739,7 @@ class RemoteBuddyOrchestrator {
   private readonly eventMonitorStartedAt = Date.now();
   private jobsDb: Database | null = null;
   private disposed = false;
-  private sessionMonitorWsErrorCount = 0;
-  private sessionMonitorFatal = false;
+  private readonly sessionMonitorWsErrorCounts = new Map<string, number>();
 
   /** Serialises async request handling to preserve ordering */
   private chain: Promise<void> = Promise.resolve();
@@ -750,8 +750,8 @@ class RemoteBuddyOrchestrator {
   private idempotency: IdempotencyStore;
   /** Durable planning memory store for cross-session repo context */
   private persistentMemory: SessionMemoryBackend;
-  /** Recent session context for LLM (bounded ring buffer) */
-  private recentContext: string[] = [];
+  /** Recent session context for LLM (bounded ring buffer per session) */
+  private readonly recentContextBySession = new Map<string, string[]>();
   private memoryEnabled = false;
   private memoryIncludeCrossSession = true;
   private memoryMaxRecallItems = 12;
@@ -903,6 +903,7 @@ class RemoteBuddyOrchestrator {
   }
 
   private async ensureSessionWithRetry(
+    sessionId: string = this.sessionId,
     maxRetries = 20,
     baseDelayMs = 500,
     maxDelayMs = 5000,
@@ -912,7 +913,7 @@ class RemoteBuddyOrchestrator {
         const res = await fetch(`${this.server}/sessions`, {
           method: "POST",
           headers: this.authHeaders(),
-          body: JSON.stringify({ sessionId: this.sessionId }),
+          body: JSON.stringify({ sessionId }),
         });
         if (res.ok) return true;
       } catch {
@@ -932,18 +933,52 @@ class RemoteBuddyOrchestrator {
     return h;
   }
 
-  /** Send a command event through the server */
-  private async sendCommand(cmd: Omit<CommandRequest, "from">): Promise<void> {
+  private async assistantMessage(
+    sessionId: string,
+    text: string,
+    meta: {
+      correlationId?: string;
+      turnId?: string;
+      parentId?: string;
+    } = {},
+  ): Promise<void> {
     try {
-      const ok = await this.comm.emit(cmd.type, cmd.payload as any, {
+      const ok = await this.comm.assistantMessageToSession(sessionId, text, meta);
+      if (!ok) {
+        console.error(
+          `[RemoteBuddy] assistant_message failed for session ${sessionId || "(unknown)"}`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `[RemoteBuddy] assistant_message error for session ${sessionId || "(unknown)"}:`,
+        err,
+      );
+    }
+  }
+
+  /** Send a command event through the server */
+  private async sendCommand(
+    sessionId: string,
+    cmd: Omit<CommandRequest, "from">,
+  ): Promise<void> {
+    try {
+      const ok = await this.comm.emitToSession(sessionId, cmd.type, cmd.payload as any, {
         to: cmd.to,
         correlationId: cmd.correlationId,
         turnId: cmd.turnId,
         parentId: cmd.parentId,
       });
-      if (!ok) console.error(`[RemoteBuddy] Command ${cmd.type} failed`);
+      if (!ok) {
+        console.error(
+          `[RemoteBuddy] Command ${cmd.type} failed for session ${sessionId || "(unknown)"}`,
+        );
+      }
     } catch (err) {
-      console.error(`[RemoteBuddy] Command ${cmd.type} error:`, err);
+      console.error(
+        `[RemoteBuddy] Command ${cmd.type} error for session ${sessionId || "(unknown)"}:`,
+        err,
+      );
     }
   }
 
@@ -1029,7 +1064,10 @@ class RemoteBuddyOrchestrator {
     }
   }
 
-  private async rememberAutonomyFeedbackFromEvent(payload: Record<string, unknown>): Promise<void> {
+  private async rememberAutonomyFeedbackFromEvent(
+    payload: Record<string, unknown>,
+    sessionId: string = this.sessionId,
+  ): Promise<void> {
     const objectiveId = toSingleLine(payload.objectiveId, 128) || "unknown";
     const patternKey = toSingleLine(payload.patternKey, 128) || "unknown";
     const outcome = toSingleLine(payload.outcome, 120) || "recorded";
@@ -1085,11 +1123,12 @@ class RemoteBuddyOrchestrator {
       parts.push(`examples=${commentExamples.join(" || ")}`);
     }
     const structured = parts.join(" | ");
-    this.pushContext(`[autonomy_feedback] ${toSingleLine(structured, 1100)}`);
-    this.rememberPersistentMemory("autonomy_feedback", structured);
+    this.pushContext(`[autonomy_feedback] ${toSingleLine(structured, 1100)}`, sessionId);
+    this.rememberPersistentMemory("autonomy_feedback", structured, null, sessionId);
   }
 
   private async handleObservedJobFailure(
+    sessionId: string,
     envelope: {
       id?: string;
       correlationId?: string;
@@ -1106,7 +1145,7 @@ class RemoteBuddyOrchestrator {
       const clarificationMsg =
         `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationQuestion}\n\n` +
         "Reply with the missing details and I will enqueue a focused follow-up request.";
-      await this.comm.assistantMessage(clarificationMsg, {
+      await this.assistantMessage(sessionId, clarificationMsg, {
         correlationId: envelope.correlationId,
         turnId: envelope.turnId,
         parentId: envelope.id,
@@ -1122,7 +1161,7 @@ class RemoteBuddyOrchestrator {
       : willFetchLogs
         ? `WorkerPal job ${shortJob} failed: ${message}${detail ? ` (${detail})` : ""} I got an error and I'm fetching logs now to diagnose what happened.`
         : `WorkerPal job ${shortJob} failed: ${message}${detail ? ` (${detail})` : ""}`;
-    await this.comm.assistantMessage(fetchMsg, {
+    await this.assistantMessage(sessionId, fetchMsg, {
       correlationId: envelope.correlationId,
       turnId: envelope.turnId,
       parentId: envelope.id,
@@ -1130,7 +1169,7 @@ class RemoteBuddyOrchestrator {
 
     if (!willFetchLogs) {
       const explanation = explainJobFailureFromLogs([], message, detail);
-      await this.comm.assistantMessage(`Diagnosis for job ${shortJob}: ${explanation}`, {
+      await this.assistantMessage(sessionId, `Diagnosis for job ${shortJob}: ${explanation}`, {
         correlationId: envelope.correlationId,
         turnId: envelope.turnId,
         parentId: envelope.id,
@@ -1151,7 +1190,7 @@ class RemoteBuddyOrchestrator {
         `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationFromLogs}\n\n` +
         "Reply with the missing details and I will enqueue a focused follow-up request." +
         tailText;
-      await this.comm.assistantMessage(clarificationMsg, {
+      await this.assistantMessage(sessionId, clarificationMsg, {
         correlationId: envelope.correlationId,
         turnId: envelope.turnId,
         parentId: envelope.id,
@@ -1167,164 +1206,220 @@ class RemoteBuddyOrchestrator {
       .filter(Boolean);
     const tailText = tail.length ? `\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\`` : "";
 
-    await this.comm.assistantMessage(`Diagnosis for job ${shortJob}: ${explanation}${tailText}`, {
+    await this.assistantMessage(
+      sessionId,
+      `Diagnosis for job ${shortJob}: ${explanation}${tailText}`,
+      {
+        correlationId: envelope.correlationId,
+        turnId: envelope.turnId,
+        parentId: envelope.id,
+      },
+    );
+  }
+
+  private handleSessionEvent(envelope: {
+    id?: string;
+    ts?: string;
+    sessionId?: string;
+    type?: string;
+    correlationId?: string;
+    turnId?: string;
+    payload?: unknown;
+  }): void {
+    if (
+      envelope.type !== "job_failed" &&
+      envelope.type !== "job_completed" &&
+      envelope.type !== "autonomy_feedback_recorded" &&
+      envelope.type !== "question_asked" &&
+      envelope.type !== "question_answered"
+    ) {
+      return;
+    }
+    const tsMs = Date.parse(String(envelope.ts ?? ""));
+    if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
+    const eventSessionId = String(envelope.sessionId ?? "").trim() || this.sessionId;
+
+    if (envelope.type === "question_asked") {
+      if (!this.markQuestionEventSeen(String(envelope.id ?? ""))) return;
+      const payload = asObject(envelope.payload);
+      if (!payload) return;
+      const questionId = toSingleLine(payload.questionId, 128);
+      const objectiveId = toSingleLine(payload.objectiveId, 128);
+      const question = toSingleLine(payload.question, 320);
+      if (!question) return;
+      this.pushContext(
+        `[autonomy_question] objective=${objectiveId || "unknown"} question=${question}`,
+        eventSessionId,
+      );
+      this.rememberPersistentMemory(
+        "autonomy_question",
+        `Objective ${objectiveId || "unknown"} requires clarification: ${question}`,
+        null,
+        eventSessionId,
+      );
+      void this.assistantMessage(
+        eventSessionId,
+        `Autonomy objective ${objectiveId || "unknown"} needs clarification${
+          questionId ? ` (${questionId})` : ""
+        }: ${question}`,
+        {
+          correlationId: envelope.correlationId,
+          turnId: envelope.turnId,
+          parentId: envelope.id,
+        },
+      );
+      return;
+    }
+
+    if (envelope.type === "question_answered") {
+      if (!this.markQuestionEventSeen(String(envelope.id ?? ""))) return;
+      const payload = asObject(envelope.payload);
+      if (!payload) return;
+      const questionId = toSingleLine(payload.questionId, 128);
+      const objectiveId = toSingleLine(payload.objectiveId, 128);
+      const status = toSingleLine(payload.status, 32).toLowerCase();
+      const answerSummary = toSingleLine(payload.answerSummary, 280);
+      const contextLine =
+        `[autonomy_question_answered] objective=${objectiveId || "unknown"} ` +
+        `question=${questionId || "unknown"} status=${status || "unknown"}` +
+        (answerSummary ? ` detail=${answerSummary}` : "");
+      this.pushContext(contextLine, eventSessionId);
+      this.rememberPersistentMemory(
+        "autonomy_question_answered",
+        contextLine,
+        null,
+        eventSessionId,
+      );
+      const note =
+        status === "valid"
+          ? `Captured clarification for autonomy objective ${objectiveId || "unknown"}; resuming execution.`
+          : `Clarification answer for autonomy objective ${objectiveId || "unknown"} was invalid${
+              answerSummary ? `: ${answerSummary}` : "."
+            }`;
+      void this.assistantMessage(eventSessionId, note, {
+        correlationId: envelope.correlationId,
+        turnId: envelope.turnId,
+        parentId: envelope.id,
+      });
+      return;
+    }
+
+    if (envelope.type === "autonomy_feedback_recorded") {
+      if (!this.markAutonomyFeedbackEventSeen(String(envelope.id ?? ""))) return;
+      const payload = asObject(envelope.payload);
+      if (!payload) return;
+      void this.rememberAutonomyFeedbackFromEvent(payload, eventSessionId);
+      return;
+    }
+
+    if (envelope.type === "job_failed") {
+      const payload = envelope.payload as {
+        jobId?: unknown;
+        message?: unknown;
+        detail?: unknown;
+      };
+      const jobId = String(payload.jobId ?? "").trim();
+      const message = toSingleLine(payload.message, 220);
+      const detail = toSingleLine(payload.detail, 220);
+      if (!jobId || !message) return;
+
+      const dedupeKey = `${jobId}:${message}`;
+      if (this.seenJobFailures.has(dedupeKey)) return;
+      this.seenJobFailures.add(dedupeKey);
+
+      const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
+      this.pushContext(failureLine, eventSessionId);
+      this.rememberPersistentMemory(
+        "job_failed",
+        `Job ${jobId.slice(0, 8)} failed: ${toSingleLine(`${message}${detail ? ` (${detail})` : ""}`, 360)}`,
+        null,
+        eventSessionId,
+      );
+      console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
+      void this.handleObservedJobFailure(eventSessionId, envelope, jobId, message, detail);
+      return;
+    }
+
+    const payload = envelope.payload as {
+      jobId?: unknown;
+      summary?: unknown;
+    };
+    const jobId = String(payload.jobId ?? "").trim();
+    const summary = toSingleLine(payload.summary, 240) || "Job completed";
+    if (!jobId) return;
+    if (/startup warmup completed/i.test(summary)) return;
+    if (this.seenJobCompletions.has(jobId)) return;
+    this.seenJobCompletions.add(jobId);
+
+    this.pushContext(`[job_completed ${jobId}] ${summary}`, eventSessionId);
+    this.rememberPersistentMemory(
+      "job_completed",
+      `Job ${jobId.slice(0, 8)} completed: ${toSingleLine(summary, 360)}`,
+      null,
+      eventSessionId,
+    );
+    const shortJob = jobId.slice(0, 8);
+    const clarificationQuestion = extractClarificationFromCompletionSummary(summary);
+    const note = clarificationQuestion
+      ? `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationQuestion}\n\nPlease reply with the missing details and I will enqueue a follow-up request.`
+      : isNoChangeCompletionSummary(summary)
+        ? `WorkerPal job ${shortJob} completed: ${summary}. No files were changed, so no commit was created.`
+        : `WorkerPal job ${shortJob} completed: ${summary}.`;
+    void this.assistantMessage(eventSessionId, note, {
       correlationId: envelope.correlationId,
       turnId: envelope.turnId,
       parentId: envelope.id,
     });
   }
 
-  startSessionEventMonitor(): void {
-    this.stopSessionEvents = this.comm.subscribeSessionEvents(
+  private ensureSessionEventMonitor(
+    sessionId: string,
+    options: { fatalOnWsBudgetExhaustion?: boolean } = {},
+  ): void {
+    const normalizedSessionId = String(sessionId ?? "").trim() || this.sessionId;
+    if (options.fatalOnWsBudgetExhaustion) {
+      this.fatalSessionMonitors.add(normalizedSessionId);
+    }
+    if (this.sessionEventStops.has(normalizedSessionId)) {
+      return;
+    }
+
+    const stop = this.comm.subscribeSessionEventsForSession(
+      normalizedSessionId,
       (envelope) => {
-        if (
-          envelope.type !== "job_failed" &&
-          envelope.type !== "job_completed" &&
-          envelope.type !== "autonomy_feedback_recorded" &&
-          envelope.type !== "question_asked" &&
-          envelope.type !== "question_answered"
-        ) {
-          return;
-        }
-        const tsMs = Date.parse(envelope.ts);
-        if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
-        if (envelope.type === "question_asked") {
-          if (!this.markQuestionEventSeen(String(envelope.id ?? ""))) return;
-          const payload = asObject(envelope.payload);
-          if (!payload) return;
-          const questionId = toSingleLine(payload.questionId, 128);
-          const objectiveId = toSingleLine(payload.objectiveId, 128);
-          const question = toSingleLine(payload.question, 320);
-          if (!question) return;
-          this.pushContext(
-            `[autonomy_question] objective=${objectiveId || "unknown"} question=${question}`,
-          );
-          this.rememberPersistentMemory(
-            "autonomy_question",
-            `Objective ${objectiveId || "unknown"} requires clarification: ${question}`,
-          );
-          void this.comm.assistantMessage(
-            `Autonomy objective ${objectiveId || "unknown"} needs clarification${questionId ? ` (${questionId})` : ""}: ${question}`,
-            {
-              correlationId: envelope.correlationId,
-              turnId: envelope.turnId,
-              parentId: envelope.id,
-            },
-          );
-          return;
-        }
-        if (envelope.type === "question_answered") {
-          if (!this.markQuestionEventSeen(String(envelope.id ?? ""))) return;
-          const payload = asObject(envelope.payload);
-          if (!payload) return;
-          const questionId = toSingleLine(payload.questionId, 128);
-          const objectiveId = toSingleLine(payload.objectiveId, 128);
-          const status = toSingleLine(payload.status, 32).toLowerCase();
-          const answerSummary = toSingleLine(payload.answerSummary, 280);
-          const contextLine =
-            `[autonomy_question_answered] objective=${objectiveId || "unknown"} ` +
-            `question=${questionId || "unknown"} status=${status || "unknown"}` +
-            (answerSummary ? ` detail=${answerSummary}` : "");
-          this.pushContext(contextLine);
-          this.rememberPersistentMemory("autonomy_question_answered", contextLine);
-          const note =
-            status === "valid"
-              ? `Captured clarification for autonomy objective ${objectiveId || "unknown"}; resuming execution.`
-              : `Clarification answer for autonomy objective ${objectiveId || "unknown"} was invalid${
-                  answerSummary ? `: ${answerSummary}` : "."
-                }`;
-          void this.comm.assistantMessage(note, {
-            correlationId: envelope.correlationId,
-            turnId: envelope.turnId,
-            parentId: envelope.id,
-          });
-          return;
-        }
-        if (envelope.type === "autonomy_feedback_recorded") {
-          if (!this.markAutonomyFeedbackEventSeen(String(envelope.id ?? ""))) return;
-          const payload = asObject(envelope.payload);
-          if (!payload) return;
-          void this.rememberAutonomyFeedbackFromEvent(payload);
-          return;
-        }
-        if (envelope.type === "job_failed") {
-          const payload = envelope.payload as {
-            jobId?: unknown;
-            message?: unknown;
-            detail?: unknown;
-          };
-          const jobId = String(payload.jobId ?? "").trim();
-          const message = toSingleLine(payload.message, 220);
-          const detail = toSingleLine(payload.detail, 220);
-          if (!jobId || !message) return;
-
-          const dedupeKey = `${jobId}:${message}`;
-          if (this.seenJobFailures.has(dedupeKey)) return;
-          this.seenJobFailures.add(dedupeKey);
-
-          const failureLine = `[job_failed ${jobId}] ${message}${detail ? ` | ${detail}` : ""}`;
-          this.pushContext(failureLine);
-          this.rememberPersistentMemory(
-            "job_failed",
-            `Job ${jobId.slice(0, 8)} failed: ${toSingleLine(`${message}${detail ? ` (${detail})` : ""}`, 360)}`,
-          );
-          console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
-          void this.handleObservedJobFailure(envelope, jobId, message, detail);
-          return;
-        }
-
-        const payload = envelope.payload as {
-          jobId?: unknown;
-          summary?: unknown;
-        };
-        const jobId = String(payload.jobId ?? "").trim();
-        const summary = toSingleLine(payload.summary, 240) || "Job completed";
-        if (!jobId) return;
-        if (/startup warmup completed/i.test(summary)) return;
-        if (this.seenJobCompletions.has(jobId)) return;
-        this.seenJobCompletions.add(jobId);
-
-        this.pushContext(`[job_completed ${jobId}] ${summary}`);
-        this.rememberPersistentMemory(
-          "job_completed",
-          `Job ${jobId.slice(0, 8)} completed: ${toSingleLine(summary, 360)}`,
-        );
-        const shortJob = jobId.slice(0, 8);
-        const clarificationQuestion = extractClarificationFromCompletionSummary(summary);
-        const note = clarificationQuestion
-          ? `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationQuestion}\n\nPlease reply with the missing details and I will enqueue a follow-up request.`
-          : isNoChangeCompletionSummary(summary)
-            ? `WorkerPal job ${shortJob} completed: ${summary}. No files were changed, so no commit was created.`
-            : `WorkerPal job ${shortJob} completed: ${summary}.`;
-        void this.comm.assistantMessage(note, {
-          correlationId: envelope.correlationId,
-          turnId: envelope.turnId,
-          parentId: envelope.id,
-        });
+        this.handleSessionEvent(envelope);
       },
       {
         onOpen: () => {
-          this.sessionMonitorWsErrorCount = 0;
+          this.sessionMonitorWsErrorCounts.set(normalizedSessionId, 0);
         },
         onError: (message) => {
-          console.warn(`[RemoteBuddy] Session monitor: ${message}`);
+          console.warn(
+            `[RemoteBuddy] Session monitor (${normalizedSessionId}) failed: ${message}`,
+          );
           if (!/\[SessionEvents\] (WebSocket error|Failed to connect)/.test(message)) return;
-          this.sessionMonitorWsErrorCount += 1;
+          const nextCount = (this.sessionMonitorWsErrorCounts.get(normalizedSessionId) ?? 0) + 1;
+          this.sessionMonitorWsErrorCounts.set(normalizedSessionId, nextCount);
           if (
-            this.sessionMonitorFatal ||
-            this.sessionMonitorWsErrorCount < RemoteBuddyOrchestrator.SESSION_MONITOR_MAX_WS_ERRORS
+            !this.fatalSessionMonitors.has(normalizedSessionId) ||
+            nextCount < RemoteBuddyOrchestrator.SESSION_MONITOR_MAX_WS_ERRORS
           ) {
             return;
           }
-          this.sessionMonitorFatal = true;
+          this.fatalSessionMonitors.delete(normalizedSessionId);
           console.error(
-            `[RemoteBuddy] Session monitor exceeded retry budget (${RemoteBuddyOrchestrator.SESSION_MONITOR_MAX_WS_ERRORS} transport errors). Bailing out.`,
+            `[RemoteBuddy] Session monitor ${normalizedSessionId} exceeded retry budget (${RemoteBuddyOrchestrator.SESSION_MONITOR_MAX_WS_ERRORS} transport errors). Bailing out.`,
           );
           this.dispose();
           setTimeout(() => process.exit(1), 0);
         },
       },
     );
+    this.sessionEventStops.set(normalizedSessionId, stop);
+  }
+
+  startSessionEventMonitor(): void {
+    this.ensureSessionEventMonitor(this.sessionId, { fatalOnWsBudgetExhaustion: true });
   }
 
   /**
@@ -1334,13 +1429,14 @@ class RemoteBuddyOrchestrator {
   private async enqueueJob(
     taskId: string,
     kind: "task.execute",
+    sessionId: string,
     params: TaskExecuteJobParams,
     targetWorkerId: string | null = null,
   ): Promise<string | null> {
     try {
       const payload: Record<string, unknown> = {
         taskId,
-        sessionId: this.sessionId,
+        sessionId,
         kind,
         params,
       };
@@ -1370,35 +1466,52 @@ class RemoteBuddyOrchestrator {
 
   // ── Context tracking ───────────────────────────────────────────────────
 
-  private pushContext(text: string): void {
+  private sessionContext(sessionId: string): string[] {
+    const normalizedSessionId = String(sessionId ?? "").trim() || this.sessionId;
+    let context = this.recentContextBySession.get(normalizedSessionId);
+    if (!context) {
+      context = [];
+      this.recentContextBySession.set(normalizedSessionId, context);
+    }
+    return context;
+  }
+
+  private pushContext(text: string, sessionId: string = this.sessionId): void {
     const normalized = String(text ?? "").trim();
     if (!normalized) return;
     const capped =
       normalized.length <= RemoteBuddyOrchestrator.MAX_CONTEXT_ENTRY_CHARS
         ? normalized
         : `${normalized.slice(0, RemoteBuddyOrchestrator.MAX_CONTEXT_ENTRY_CHARS - 16)}\n...[truncated]`;
-    this.recentContext.push(capped);
-    if (this.recentContext.length > RemoteBuddyOrchestrator.MAX_CONTEXT) {
-      this.recentContext.shift();
+    const context = this.sessionContext(sessionId);
+    context.push(capped);
+    if (context.length > RemoteBuddyOrchestrator.MAX_CONTEXT) {
+      context.shift();
     }
   }
 
-  private getChatContextSnapshot(): string[] {
-    const filtered = this.recentContext.filter((entry) => !entry.startsWith("[enhanced]"));
+  private getChatContextSnapshot(sessionId: string = this.sessionId): string[] {
+    const filtered = this.sessionContext(sessionId).filter((entry) => !entry.startsWith("[enhanced]"));
     return filtered
       .slice(-RemoteBuddyOrchestrator.CHAT_CONTEXT_MAX)
       .map((entry) => toSingleLine(entry, RemoteBuddyOrchestrator.CHAT_CONTEXT_ENTRY_CHARS));
   }
 
-  private planningContextSnapshot(priority: RequestPriority): string[] {
-    const filtered = this.recentContext.filter((entry) => !entry.startsWith("[enhanced]"));
+  private planningContextSnapshot(
+    priority: RequestPriority,
+    sessionId: string = this.sessionId,
+  ): string[] {
+    const filtered = this.sessionContext(sessionId).filter((entry) => !entry.startsWith("[enhanced]"));
     const limit = priority === "interactive" ? 6 : RemoteBuddyOrchestrator.CHAT_CONTEXT_MAX;
     return filtered
       .slice(-limit)
       .map((entry) => toSingleLine(entry, RemoteBuddyOrchestrator.CHAT_CONTEXT_ENTRY_CHARS));
   }
 
-  private persistentPlanningContextSnapshot(priority: RequestPriority): string[] {
+  private persistentPlanningContextSnapshot(
+    priority: RequestPriority,
+    sessionId: string = this.sessionId,
+  ): string[] {
     if (!this.memoryEnabled) return [];
     const maxItems =
       priority === "interactive"
@@ -1407,7 +1520,7 @@ class RemoteBuddyOrchestrator {
     try {
       return this.persistentMemory.recallForPlanning({
         repoRoot: this.repo,
-        sessionId: this.sessionId,
+        sessionId,
         includeCurrentSession: true,
         includeCrossSession: this.memoryIncludeCrossSession,
         maxItems,
@@ -1423,13 +1536,14 @@ class RemoteBuddyOrchestrator {
     kind: string,
     summary: string,
     requestId: string | null = null,
+    sessionId: string = this.sessionId,
   ): void {
     if (!this.memoryEnabled) return;
     try {
       this.persistentMemory.remember(
         {
           repoRoot: this.repo,
-          sessionId: this.sessionId,
+          sessionId,
           requestId,
           kind,
           summary,
@@ -1444,9 +1558,12 @@ class RemoteBuddyOrchestrator {
     }
   }
 
-  private buildPlanningContext(priority: RequestPriority): string[] {
-    const fromMemory = this.persistentPlanningContextSnapshot(priority);
-    const live = this.planningContextSnapshot(priority);
+  private buildPlanningContext(
+    priority: RequestPriority,
+    sessionId: string = this.sessionId,
+  ): string[] {
+    const fromMemory = this.persistentPlanningContextSnapshot(priority, sessionId);
+    const live = this.planningContextSnapshot(priority, sessionId);
     if (fromMemory.length === 0) return live;
     const merged = [...fromMemory, ...live];
     const out: string[] = [];
@@ -1458,6 +1575,10 @@ class RemoteBuddyOrchestrator {
       out.push(line);
     }
     return out;
+  }
+
+  private getRecentContextSnapshot(sessionId: string = this.sessionId): string[] {
+    return this.sessionContext(sessionId).slice(-RemoteBuddyOrchestrator.MAX_CONTEXT);
   }
 
   private executionBudgetForPriority(priority: RequestPriority): number {
@@ -1568,7 +1689,10 @@ class RemoteBuddyOrchestrator {
     );
   }
 
-  private getRecentJobContext(limit: number = 12): WorkerRecentJobSummary[] {
+  private getRecentJobContext(
+    limit: number = 12,
+    sessionId: string = this.sessionId,
+  ): WorkerRecentJobSummary[] {
     try {
       if (!this.jobsDb) {
         this.jobsDb = new Database(this.jobsDbPath);
@@ -1581,7 +1705,7 @@ class RemoteBuddyOrchestrator {
            ORDER BY updatedAt DESC
            LIMIT ?`,
         )
-        .all(this.sessionId, Math.max(1, Math.min(limit, 50))) as Array<{
+        .all(sessionId, Math.max(1, Math.min(limit, 50))) as Array<{
         id: string;
         taskId: string;
         kind: string;
@@ -1748,6 +1872,7 @@ class RemoteBuddyOrchestrator {
   private async processRequest(
     request: {
       id: string;
+      sessionId?: string;
       prompt: string;
       priority?: string;
       queueWaitBudgetMs?: number;
@@ -1760,12 +1885,16 @@ class RemoteBuddyOrchestrator {
   ): Promise<void> {
     const requestId = String(request.id ?? "").trim();
     if (!requestId) return;
+    const requestSessionId = String(request.sessionId ?? "").trim() || this.sessionId;
 
-    if (this.idempotency.hasHandled(this.sessionId, requestId)) {
+    await this.ensureSessionWithRetry(requestSessionId, 3, 250, 2_000);
+    this.ensureSessionEventMonitor(requestSessionId);
+
+    if (this.idempotency.hasHandled(requestSessionId, requestId)) {
       console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
       return;
     }
-    this.idempotency.markHandled(this.sessionId, requestId);
+    this.idempotency.markHandled(requestSessionId, requestId);
 
     const prompt = String(request.prompt ?? "").trim();
     if (!prompt) {
@@ -1805,16 +1934,17 @@ class RemoteBuddyOrchestrator {
             : 90_000,
     );
     const turnId = randomUUID();
-    const planningContext = this.buildPlanningContext(priority);
+    const planningContext = this.buildPlanningContext(priority, requestSessionId);
     this.rememberPersistentMemory(
       "request",
       `priority=${priority} prompt=${toSingleLine(prompt, 520)}`,
       requestId,
+      requestSessionId,
     );
 
     try {
       console.log(
-        `[RemoteBuddy] Planning request ${requestId.slice(0, 8)} priority=${priority} queueWait=${Math.max(
+        `[RemoteBuddy] Planning request ${requestId.slice(0, 8)} session=${requestSessionId} priority=${priority} queueWait=${Math.max(
           0,
           Math.floor(queueWaitMs),
         )}ms${forceWorker ? ` forceWorker=true forceLane=${forceLane ?? "worker"}` : ""}`,
@@ -1836,8 +1966,8 @@ class RemoteBuddyOrchestrator {
         plan.scope.write_allowed = true;
         plan.scope.write_globs = [...autonomyMetadata.writeGlobs];
       }
-      this.pushContext(`[user] ${toSingleLine(prompt, 700)}`);
-      this.pushContext(`[plan] ${toSingleLine(JSON.stringify(plan), 900)}`);
+      this.pushContext(`[user] ${toSingleLine(prompt, 700)}`, requestSessionId);
+      this.pushContext(`[plan] ${toSingleLine(JSON.stringify(plan), 900)}`, requestSessionId);
       const targetPaths =
         autonomyMetadata && autonomyMetadata.targetPaths.length > 0
           ? autonomyMetadata.targetPaths
@@ -1846,6 +1976,7 @@ class RemoteBuddyOrchestrator {
         "plan",
         `intent=${plan.intent} worker=${plan.requires_worker ? "yes" : "no"} lane=${plan.lane} risk=${plan.risk_level} targets=${targetPaths.slice(0, 6).join(",") || "(none)"}`,
         requestId,
+        requestSessionId,
       );
       const targetPath = targetPaths[0];
       // forceWorker overrides "direct reply" short-circuit + planner requires_worker,
@@ -1942,7 +2073,8 @@ class RemoteBuddyOrchestrator {
         .trim();
 
       if (queueWaitMs > queueWaitBudgetMs) {
-        await this.comm.assistantMessage(
+        await this.assistantMessage(
+          requestSessionId,
           `Request ${requestId.slice(0, 8)} waited ${Math.floor(
             queueWaitMs / 1000,
           )}s in queue (budget ${Math.floor(queueWaitBudgetMs / 1000)}s). Prioritizing execution now.`,
@@ -1951,7 +2083,7 @@ class RemoteBuddyOrchestrator {
       }
 
       if (!requiresWorker) {
-        await this.sendCommand({
+        await this.sendCommand(requestSessionId, {
           type: "assistant_message",
           payload: { text: plan.assistant_message },
           turnId,
@@ -1982,7 +2114,8 @@ class RemoteBuddyOrchestrator {
             }
           } else if (!autonomyMetadata) {
             // Option 2: user origin — ask if they want a worker to implement this.
-            await this.comm.assistantMessage(
+            await this.assistantMessage(
+              requestSessionId,
               "Should I have a WorkerPal implement this? Reply to confirm and I'll enqueue the work, or clarify what you'd like focused on.",
               { turnId, correlationId: requestId },
             );
@@ -2008,14 +2141,19 @@ class RemoteBuddyOrchestrator {
           "decision",
           `completed_without_worker intent=${plan.intent} lane=deterministic`,
           requestId,
+          requestSessionId,
         );
         return;
       }
 
-      await this.comm.assistantMessage("Understood. I am delegating this to a WorkerPal now.", {
-        turnId,
-        correlationId: requestId,
-      });
+      await this.assistantMessage(
+        requestSessionId,
+        "Understood. I am delegating this to a WorkerPal now.",
+        {
+          turnId,
+          correlationId: requestId,
+        },
+      );
 
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
@@ -2024,7 +2162,7 @@ class RemoteBuddyOrchestrator {
       const baseParams: BaseTaskExecuteJobParams = {
         schemaVersion: 2,
         requestId,
-        sessionId: this.sessionId,
+        sessionId: requestSessionId,
         instruction: canonicalInstruction,
         plannerWorkerInstruction:
           plannerWorkerInstruction && plannerWorkerInstruction !== canonicalInstruction
@@ -2070,8 +2208,8 @@ class RemoteBuddyOrchestrator {
           finalizationBudgetMs: this.finalizationBudgetMs,
         },
         targetPath,
-        recentContext: this.recentContext.slice(-RemoteBuddyOrchestrator.MAX_CONTEXT),
-        recentJobs: this.getRecentJobContext(),
+        recentContext: this.getRecentContextSnapshot(requestSessionId),
+        recentJobs: this.getRecentJobContext(12, requestSessionId),
       };
       const params: TaskExecuteJobParams = autonomyMetadata
         ? {
@@ -2093,7 +2231,7 @@ class RemoteBuddyOrchestrator {
             origin: "user",
           };
 
-      await this.sendCommand({
+      await this.sendCommand(requestSessionId, {
         type: "task_created",
         payload: {
           taskId,
@@ -2107,8 +2245,8 @@ class RemoteBuddyOrchestrator {
         },
         turnId,
       });
-      await this.sendCommand({ type: "task_started", payload: { taskId }, turnId });
-      await this.sendCommand({
+      await this.sendCommand(requestSessionId, { type: "task_started", payload: { taskId }, turnId });
+      await this.sendCommand(requestSessionId, {
         type: "task_progress",
         payload: {
           taskId,
@@ -2119,21 +2257,29 @@ class RemoteBuddyOrchestrator {
         turnId,
       });
 
-      await this.comm.assistantMessage(
+      await this.assistantMessage(
+        requestSessionId,
         targetWorkerId
           ? `Assigned this request to WorkerPal ${targetWorkerId} (${lane} lane).`
           : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.",
         { turnId, correlationId: requestId },
       );
 
-      const jobId = await this.enqueueJob(taskId, "task.execute", params, targetWorkerId);
+      const jobId = await this.enqueueJob(
+        taskId,
+        "task.execute",
+        requestSessionId,
+        params,
+        targetWorkerId,
+      );
       if (jobId) {
         this.rememberPersistentMemory(
           "job_enqueued",
           `job=${jobId.slice(0, 8)} lane=${lane} intent=${plan.intent} worker=${targetWorkerId ?? "queue"}`,
           requestId,
+          requestSessionId,
         );
-        await this.sendCommand({
+        await this.sendCommand(requestSessionId, {
           type: "job_enqueued",
           payload: {
             jobId,
@@ -2165,6 +2311,7 @@ class RemoteBuddyOrchestrator {
           "job_enqueue_failed",
           `enqueue_failed lane=${lane} intent=${plan.intent}`,
           requestId,
+          requestSessionId,
         );
       }
 
@@ -2193,8 +2340,8 @@ class RemoteBuddyOrchestrator {
     } catch (err) {
       const message = `RemoteBuddy planning failed: ${toSingleLine(err, 220) || "unknown error"}`;
       console.error(`[RemoteBuddy] ${message}`);
-      this.rememberPersistentMemory("planning_failed", message, requestId);
-      await this.comm.assistantMessage(message, { turnId, correlationId: requestId });
+      this.rememberPersistentMemory("planning_failed", message, requestId, requestSessionId);
+      await this.assistantMessage(requestSessionId, message, { turnId, correlationId: requestId });
       await fetch(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
@@ -2223,6 +2370,7 @@ class RemoteBuddyOrchestrator {
             ok: boolean;
             request?: {
               id: string;
+              sessionId?: string;
               prompt: string;
               priority?: string;
               queueWaitBudgetMs?: number;
@@ -2311,14 +2459,16 @@ class RemoteBuddyOrchestrator {
       this.statusHeartbeatTimer = null;
     }
     void this.comm.status(this.agentId, "shutting_down", "RemoteBuddy shutting down");
-    if (this.stopSessionEvents) {
+    for (const [sessionId, stop] of this.sessionEventStops.entries()) {
       try {
-        this.stopSessionEvents();
+        stop();
       } catch {
         // ignore unsubscribe errors on shutdown
       }
-      this.stopSessionEvents = null;
+      this.sessionEventStops.delete(sessionId);
     }
+    this.fatalSessionMonitors.clear();
+    this.sessionMonitorWsErrorCounts.clear();
     for (const [workerId, proc] of this.managedWorkers.entries()) {
       try {
         proc.kill();
@@ -2454,7 +2604,9 @@ async function main() {
   orchestrator.startPolling(pollMs);
 }
 
-main().catch((err) => {
-  console.error("[RemoteBuddy] Fatal:", err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("[RemoteBuddy] Fatal:", err);
+    process.exit(1);
+  });
+}

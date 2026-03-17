@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import { normalizeVscodeServerUrl } from "./local_server_url";
 import { looksLikePushPalsSourceCheckout } from "./repo";
 import { formatCommandForLog, validateDockerImageName } from "./safety";
+import { buildInstalledCliRuntimeArgs, buildSourceCheckoutRuntimeEnv } from "./session";
 import {
   computeLocalBuddyRestartBackoffMs,
   DEFAULT_LOCALBUDDY_PORT,
@@ -68,7 +69,10 @@ export class StackServiceManager implements vscode.Disposable {
   private localBuddyRetryAfterMs = 0;
   private localBuddyRestartLimitLogged = false;
 
-  constructor(private readonly output: vscode.OutputChannel) {}
+  constructor(
+    private readonly output: vscode.OutputChannel,
+    private readonly resolveSessionId?: () => string,
+  ) {}
 
   isRunning(): boolean {
     return this.running.size > 0 || this.cliRuntime !== null;
@@ -84,9 +88,10 @@ export class StackServiceManager implements vscode.Disposable {
     this.launchMode = looksLikePushPalsSourceCheckout(workspaceRoot)
       ? "source_checkout"
       : "installed_cli";
+    const sessionId = this.resolveSessionId?.();
 
     if (this.launchMode === "installed_cli") {
-      await this.startInstalledCliRuntime(workspaceRoot);
+      await this.startInstalledCliRuntime(workspaceRoot, sessionId);
       return;
     }
 
@@ -110,19 +115,32 @@ export class StackServiceManager implements vscode.Disposable {
       await this.ensureLocalBuddyStartReady(workspaceRoot);
     }
 
+    const runtimeEnv = buildSourceCheckoutRuntimeEnv(sessionId);
     const definitions: ServiceDefinition[] = [
-      { id: "server", label: "Server", command: "bun", args: ["run", "server:only"] },
-      { id: "remotebuddy", label: "RemoteBuddy", command: "bun", args: ["run", "remotebuddy:only"] },
+      {
+        id: "server",
+        label: "Server",
+        command: "bun",
+        args: ["run", "server:only"],
+        env: runtimeEnv,
+      },
+      {
+        id: "remotebuddy",
+        label: "RemoteBuddy",
+        command: "bun",
+        args: ["run", "remotebuddy:only"],
+        env: runtimeEnv,
+      },
       {
         id: "workerpals",
         label: "WorkerPals",
         command: "bun",
         args: ["run", "workerpals:only:docker"],
-        env: { WORKERPALS_DOCKER_IMAGE: workerImage },
+        env: buildSourceCheckoutRuntimeEnv(sessionId, { WORKERPALS_DOCKER_IMAGE: workerImage }),
       },
     ];
     if (this.localBuddyRuntimeEnabled) {
-      definitions.splice(1, 0, this.localBuddyServiceDefinition());
+      definitions.splice(1, 0, this.localBuddyServiceDefinition(sessionId));
     }
     if (this.includeSourceControlManager()) {
       definitions.push({
@@ -130,6 +148,7 @@ export class StackServiceManager implements vscode.Disposable {
         label: "Source Control Manager",
         command: "bun",
         args: ["run", "source_control_manager:only:dev"],
+        env: runtimeEnv,
       });
     }
 
@@ -218,8 +237,8 @@ export class StackServiceManager implements vscode.Disposable {
     return process.platform === "win32" ? "pushpals.cmd" : "pushpals";
   }
 
-  private cliRuntimeArgs(): string[] {
-    return ["--runtime-only"];
+  private cliRuntimeArgs(sessionId?: string): string[] {
+    return buildInstalledCliRuntimeArgs(sessionId);
   }
 
   private serverUrl(): string {
@@ -245,7 +264,7 @@ export class StackServiceManager implements vscode.Disposable {
     }
   }
 
-  private async startInstalledCliRuntime(workspaceRoot: string): Promise<void> {
+  private async startInstalledCliRuntime(workspaceRoot: string, sessionId?: string): Promise<void> {
     if (await this.probeServerHealth()) {
       throw new Error(
         `PushPals server is already listening at ${this.serverUrl()}. Stop the existing local runtime before starting a VS Code-managed runtime for this repo.`,
@@ -253,7 +272,7 @@ export class StackServiceManager implements vscode.Disposable {
     }
 
     const command = this.cliCommand();
-    const args = this.cliRuntimeArgs();
+    const args = this.cliRuntimeArgs(sessionId);
     this.output.appendLine(
       `[stack] Starting installed PushPals CLI runtime: ${formatCommandForLog(command, args)}`,
     );
@@ -434,12 +453,13 @@ export class StackServiceManager implements vscode.Disposable {
     );
   }
 
-  private localBuddyServiceDefinition(): ServiceDefinition {
+  private localBuddyServiceDefinition(sessionId?: string): ServiceDefinition {
     return {
       id: "localbuddy",
       label: "LocalBuddy",
       command: "bun",
       args: ["run", "localbuddy:only"],
+      env: buildSourceCheckoutRuntimeEnv(sessionId),
     };
   }
 
@@ -579,7 +599,7 @@ export class StackServiceManager implements vscode.Disposable {
           this.markLocalBuddyUnexpectedFailure(`preflight failed: ${detail}`);
           return;
         }
-        this.spawnService(this.localBuddyServiceDefinition(), workspaceRoot);
+        this.spawnService(this.localBuddyServiceDefinition(this.resolveSessionId?.()), workspaceRoot);
         return;
       }
 

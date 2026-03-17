@@ -60,6 +60,10 @@ export {
   resolveLocalServerConnection,
 } from "./local_network.js";
 export {
+  isHeartbeatStatusSessionEvent,
+  shouldDisplayInteractiveSessionEvent,
+} from "./session_event_visibility.js";
+export {
   DEFAULT_LOCALBUDDY_PORT,
   computeLocalBuddyRestartBackoffMs,
   loadLocalBuddyRuntimeSnapshotFromFiles,

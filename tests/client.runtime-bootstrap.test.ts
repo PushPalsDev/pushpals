@@ -39,7 +39,6 @@ describe("client runtime bootstrap", () => {
 
     expect(resolvePushPalsWebRuntimeConfig()).toEqual({
       serverUrl: "http://127.0.0.1:3901",
-      localAgentUrl: "http://127.0.0.1:3903",
       sessionId: "cli-session",
       clientId: "cli-monitor-dev",
       clientKind: "cli_monitor",
@@ -55,7 +54,6 @@ describe("client runtime bootstrap", () => {
 
     expect(resolvePushPalsWebRuntimeConfig()).toEqual({
       serverUrl: "http://127.0.0.1:3001",
-      localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
       clientId: null,
       clientKind: "web",
@@ -74,7 +72,6 @@ describe("client runtime bootstrap", () => {
 
     expect(resolvePushPalsWebRuntimeConfig()).toEqual({
       serverUrl: "http://127.0.0.1:3901",
-      localAgentUrl: "http://127.0.0.1:3903",
       sessionId: "cli-session",
       clientId: null,
       clientKind: "web",

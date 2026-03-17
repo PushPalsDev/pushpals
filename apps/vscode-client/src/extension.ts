@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { PushPalsClientPanel } from "./clientPanel";
 import { findWorkspaceRepoRoot } from "./repo";
 import { StackServiceManager } from "./serviceManager";
+import { ensureWorkspaceSessionId, resolveWorkspaceSessionId } from "./session";
 import { WORKSPACE_TRUST_ERROR } from "./workspaceTrust";
 
 let activeStackManager: StackServiceManager | undefined;
@@ -32,7 +33,23 @@ function resolveWorkspaceRoot(): string {
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel("PushPals VS Code Client");
-  const stackManager = new StackServiceManager(output);
+  const ensurePersistedVscodeSessionId = async (): Promise<string> => {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    return await ensureWorkspaceSessionId(
+      context.globalState,
+      folder?.uri.toString(true),
+      folder?.name,
+    );
+  };
+  const resolveVscodeSessionId = (): string => {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    return resolveWorkspaceSessionId(
+      context.globalState,
+      folder?.uri.toString(true),
+      folder?.name,
+    );
+  };
+  const stackManager = new StackServiceManager(output, resolveVscodeSessionId);
   activeStackManager = stackManager;
   context.subscriptions.push(output, stackManager);
   if (!vscode.workspace.isTrusted) {
@@ -58,8 +75,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("pushpals.openClient", () => {
-      PushPalsClientPanel.createOrShow(context, output, stackManager, resolveWorkspaceRoot);
+    vscode.commands.registerCommand("pushpals.openClient", async () => {
+      const sessionId = await ensurePersistedVscodeSessionId();
+      PushPalsClientPanel.createOrShow(
+        context,
+        output,
+        stackManager,
+        resolveWorkspaceRoot,
+        sessionId,
+      );
     }),
     vscode.commands.registerCommand("pushpals.showOutput", () => {
       output.show(true);
@@ -67,6 +91,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("pushpals.startStack", async () => {
       try {
         await ensureWorkspaceTrustedForStackOps();
+        await ensurePersistedVscodeSessionId();
         const root = resolveWorkspaceRoot();
         output.appendLine(`[extension] Starting stack in ${root}`);
         await stackManager.startStack(root);
@@ -100,6 +125,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (autoStart) {
     try {
       await ensureWorkspaceTrustedForStackOps();
+      await ensurePersistedVscodeSessionId();
       const root = resolveWorkspaceRoot();
       output.appendLine("[extension] auto-start enabled");
       await stackManager.startStack(root);

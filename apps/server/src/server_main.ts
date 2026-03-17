@@ -1,5 +1,5 @@
 import { EventEnvelope, PROTOCOL_VERSION } from "protocol";
-import { SessionManager } from "./events.js";
+import { SessionManager, type SessionMessageResult } from "./events.js";
 import { JobQueue } from "./jobs.js";
 import { RequestQueue } from "./requests.js";
 import { CompletionQueue } from "./completions.js";
@@ -50,6 +50,25 @@ const clientPresencePruneTimer = setInterval(() => {
 }, 60_000);
 clientPresencePruneTimer.unref?.();
 sessionManager.authToken = null;
+sessionManager.setClientMessageIngress((sessionId, accepted) => {
+  const enqueueResult = requestQueue.enqueue({
+    sessionId,
+    prompt: accepted.text,
+    priority: "interactive",
+  });
+  if (!enqueueResult.ok) {
+    return {
+      ok: false,
+      message: enqueueResult.message || "Failed to enqueue request",
+    };
+  }
+  return {
+    ok: true,
+    requestId: enqueueResult.requestId,
+    queuePosition: enqueueResult.queuePosition,
+    etaMs: enqueueResult.etaMs,
+  };
+});
 const REPO_STATUS_CACHE_TTL_MS = 60_000;
 const SERVER_STARTED_AT_MS = Date.now();
 const SERVER_STARTED_AT_ISO = new Date(SERVER_STARTED_AT_MS).toISOString();
@@ -58,7 +77,14 @@ const AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS = 10;
 const AUTONOMY_WORKER_TTL_MS = 15_000;
 const CLIENT_TRANSPORT_HEARTBEAT_MS = 15_000;
 
+export function sessionMessageResultStatus(result: SessionMessageResult): number {
+  if (result.ok) return 200;
+  if (result.code === "session_not_found") return 404;
+  return 400;
+}
+
 interface RepoStatusSummary {
+  root: string;
   remote: string;
   remoteUrl: string | null;
   browserUrl: string | null;
@@ -107,6 +133,7 @@ async function getRepoStatusSummary(repoPath: string, remote: string): Promise<R
   const browserUrl = provider === "github" ? toGitHubRepoWebUrl(remoteUrl ?? "") : null;
 
   const value: RepoStatusSummary = {
+    root: repoPath,
     remote,
     remoteUrl,
     browserUrl,
@@ -692,8 +719,8 @@ export function createRequestHandler() {
 
         const sessionId = msgMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        sessionManager.handleMessage(sessionId, body);
-        return makeJson({ ok: true });
+        const result: SessionMessageResult = sessionManager.handleMessage(sessionId, body);
+        return makeJson(result, sessionMessageResultStatus(result));
       }
 
       // POST /sessions/:id/command  (agent-friendly ingest — auth protected)

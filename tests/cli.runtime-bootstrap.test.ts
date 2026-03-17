@@ -1,17 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import {
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
   buildEmbeddedRuntimeEnv,
+  bundledMonitoringHubNeedsRefresh,
   buildServiceStopCommand,
+  extractRemoteBuddySessionConsumerHealth,
   formatTimestampedCliLine,
+  formatSessionEventLine,
   injectMonitoringHubBootstrap,
   isCliExitCommand,
+  normalizeCliInteractiveMessage,
   normalizeChildProcessEnv,
+  normalizeRepoPathForComparison,
   prepareCliRuntime,
+  resolveCliLocalBuddyAutostart,
   resolveCliStatePath,
   resolveCommandPath,
   startEmbeddedMonitoringHub,
@@ -54,6 +60,22 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       join(resolve("C:/runtime/pushpals"), "protocol", "schemas"),
     );
     expect("REMOTEBUDDY_AUTONOMY_ENABLED" in env).toBe(false);
+    expect("LOCALBUDDY_ENABLED" in env).toBe(false);
+  });
+
+  test("buildEmbeddedRuntimeEnv can force a shared runtime session id for embedded services", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+      },
+      {
+        repoRoot: "/repo/example",
+        runtimeRoot: "/runtime/pushpals",
+        sessionId: "cli-dev",
+      },
+    );
+
+    expect(env.PUSHPALS_SESSION_ID).toBe("cli-dev");
   });
 
   test("buildEmbeddedRuntimeEnv preserves explicit autonomy override", () => {
@@ -72,15 +94,15 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PUSHPALS_GIT_BIN).toBe("/custom/tools/git");
   });
 
-  test("buildEmbeddedRuntimeEnv can force LocalBuddy on for interactive CLI bootstrap", () => {
+  test("buildEmbeddedRuntimeEnv preserves explicit LocalBuddy env overrides without forcing them", () => {
     const env = buildEmbeddedRuntimeEnv(
       {
         PATH: process.env.PATH,
+        LOCALBUDDY_ENABLED: "1",
       },
       {
         repoRoot: "/repo/example",
         runtimeRoot: "/runtime/pushpals",
-        forceLocalBuddyEnabled: true,
       },
     );
 
@@ -197,6 +219,64 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(formatTimestampedCliLine("PushPals CLI", at)).toBe("PushPals CLI");
   });
 
+  test("formatSessionEventLine suppresses repetitive heartbeat status events", () => {
+    expect(
+      formatSessionEventLine({
+        id: "evt-heartbeat",
+        type: "status",
+        from: "agent:localbuddy-1",
+        ts: new Date().toISOString(),
+        payload: {
+          state: "idle",
+          detail: "LocalBuddy heartbeat",
+        },
+      }),
+    ).toBeNull();
+
+    expect(
+      formatSessionEventLine({
+        id: "evt-status",
+        type: "status",
+        from: "agent:localbuddy-1",
+        ts: new Date().toISOString(),
+        payload: {
+          state: "busy",
+          detail: "LocalBuddy evaluating request",
+        },
+      }),
+    ).toBe("[status agent:localbuddy-1] busy - LocalBuddy evaluating request");
+  });
+
+  test("normalizeCliInteractiveMessage treats /ask_remote_buddy as a compatibility alias", () => {
+    expect(normalizeCliInteractiveMessage("fix the dashboard")).toEqual({
+      text: "fix the dashboard",
+    });
+    expect(normalizeCliInteractiveMessage("/ask_remote_buddy fix the dashboard")).toEqual({
+      text: "fix the dashboard",
+    });
+    expect(normalizeCliInteractiveMessage("/ask_remote_buddy: fix the dashboard")).toEqual({
+      text: "fix the dashboard",
+    });
+    expect(normalizeCliInteractiveMessage("/ask_remote_buddy")).toEqual({
+      text: "",
+      usageMessage:
+        "Usage: /ask_remote_buddy <request>. Example: /ask_remote_buddy fix the failing job status in the dashboard.",
+    });
+  });
+
+  test("resolveCliLocalBuddyAutostart disables LocalBuddy for interactive CLI but honors runtime-only config", () => {
+    expect(resolveCliLocalBuddyAutostart(false, false)).toBe(false);
+    expect(resolveCliLocalBuddyAutostart(false, true)).toBe(false);
+    expect(resolveCliLocalBuddyAutostart(true, false)).toBe(false);
+    expect(resolveCliLocalBuddyAutostart(true, true)).toBe(true);
+  });
+
+  test("normalizeRepoPathForComparison compares repo roots safely across path casings and separators", () => {
+    expect(normalizeRepoPathForComparison("C:\\Repo\\Demo\\")).toBe(
+      normalizeRepoPathForComparison("C:/Repo/Demo"),
+    );
+  });
+
   test("resolveCliStatePath follows worktree gitdir metadata instead of assuming .git is a directory", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-worktree-state-"));
     const metadataDir = join(root, "gitdir-store", "worktrees", "demo");
@@ -210,12 +290,90 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
+  test("extractRemoteBuddySessionConsumerHealth recognizes the production RemoteBuddy agent identity", () => {
+    expect(
+      extractRemoteBuddySessionConsumerHealth(
+        {
+          clients: {
+            items: [
+              {
+                clientId: "remotebuddy-orchestrator",
+                label: "agent:remotebuddy-orchestrator",
+                sessionId: "dev",
+                status: "connected",
+              },
+            ],
+          },
+        },
+        "dev",
+      ),
+    ).toMatchObject({
+      ok: true,
+      clientId: "remotebuddy-orchestrator",
+    });
+
+    expect(
+      extractRemoteBuddySessionConsumerHealth(
+        {
+          clients: {
+            items: [
+              {
+                clientId: "remotebuddy-orchestrator",
+                label: "agent:remotebuddy-orchestrator",
+                sessionId: "dev",
+                status: "announced",
+              },
+            ],
+          },
+        },
+        "dev",
+      ),
+    ).toMatchObject({
+      ok: false,
+    });
+  });
+
+  test("bundledMonitoringHubNeedsRefresh detects stale exported monitor assets", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-monitor-refresh-"));
+    const sourceRoot = join(root, "repo");
+    const bundleRoot = join(sourceRoot, "packages", "cli", "monitor-ui");
+    const sourceFile = join(sourceRoot, "apps", "client", "src", "index.ts");
+    const sharedFile = join(sourceRoot, "packages", "shared", "src", "index.ts");
+    const exportScript = join(sourceRoot, "scripts", "sync-cli-monitor-ui.ts");
+    const bundleFile = join(bundleRoot, "index.html");
+
+    try {
+      mkdirSync(join(bundleRoot, "_expo"), { recursive: true });
+      mkdirSync(dirname(sourceFile), { recursive: true });
+      mkdirSync(dirname(sharedFile), { recursive: true });
+      mkdirSync(dirname(exportScript), { recursive: true });
+      writeFileSync(sourceFile, "export {};\n", "utf8");
+      writeFileSync(sharedFile, "export {};\n", "utf8");
+      writeFileSync(exportScript, "// export monitor\n", "utf8");
+      writeFileSync(bundleFile, "<!doctype html><html></html>\n", "utf8");
+
+      const now = new Date();
+      const stale = new Date(now.getTime() - 60_000);
+      const fresh = new Date(now.getTime() + 60_000);
+      utimesSync(bundleRoot, stale, stale);
+      utimesSync(bundleFile, stale, stale);
+      utimesSync(sourceFile, fresh, fresh);
+
+      expect(bundledMonitoringHubNeedsRefresh(bundleRoot, sourceRoot)).toBe(true);
+
+      utimesSync(bundleRoot, fresh, fresh);
+      utimesSync(bundleFile, fresh, fresh);
+      expect(bundledMonitoringHubNeedsRefresh(bundleRoot, sourceRoot)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("injectMonitoringHubBootstrap writes runtime config into exported client html", () => {
     const html = injectMonitoringHubBootstrap(
       '<html><head></head><body><div id="root"></div></body></html>',
       {
         serverUrl: "http://localhost:3001",
-        localAgentUrl: "http://localhost:3003",
         sessionId: "dev",
         clientId: "cli-monitor-dev",
         clientKind: "cli_monitor",
@@ -225,7 +383,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(html).toContain("__PUSHPALS_WEB_BOOTSTRAP__");
     expect(html).toContain('"serverUrl":"http://localhost:3001"');
-    expect(html).toContain('"localAgentUrl":"http://localhost:3003"');
     expect(html).toContain('"sessionId":"dev"');
     expect(html).toContain('"clientId":"cli-monitor-dev"');
     expect(html).toContain('"clientKind":"cli_monitor"');
@@ -235,7 +392,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
   test("startEmbeddedMonitoringHub returns null when packaged monitor assets are unavailable", async () => {
     const hub = await startEmbeddedMonitoringHub({
       serverUrl: "http://127.0.0.1:3001",
-      localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
       preferredPort: 18981,
       assetRoot: join(resolve(process.cwd(), "tmp-cli-monitor-missing"), "missing"),
@@ -249,7 +405,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     const hub = await startEmbeddedMonitoringHub({
       serverUrl: "http://127.0.0.1:3001",
-      localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
       preferredPort: 18982,
       assetRoot,
@@ -289,7 +444,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     const hub = await startEmbeddedMonitoringHub({
       serverUrl: "http://127.0.0.1:3001",
-      localAgentUrl: "http://127.0.0.1:3003",
       sessionId: "dev",
       preferredPort: blockedPort,
       assetRoot,

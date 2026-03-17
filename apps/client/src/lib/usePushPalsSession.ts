@@ -3,7 +3,7 @@ import type { EventEnvelope, EventType } from "protocol/browser";
 import {
   subscribeEvents,
   createSession,
-  sendMessage,
+  sendSessionMessage,
   submitApprovalDecision,
   type ClientRegistration,
 } from "./pushpalsApi";
@@ -18,6 +18,7 @@ import {
   type ChatMessage,
 } from "./eventReducer";
 import { getItem, setItem } from "./storage";
+import { shouldDisplayInteractiveSessionEvent } from "./sessionEventVisibility";
 
 // Metro compile-time replaces EXPO_PUBLIC_* — falls back to "dev" so all apps
 // share the same session out of the box with zero config.
@@ -75,7 +76,6 @@ export interface PushPalsSessionActions {
 
 export interface PushPalsSessionOptions {
   baseUrl?: string;
-  localAgentUrl?: string;
   sessionId?: string;
   authToken?: string | null;
   clientInfo?: Partial<ClientRegistration>;
@@ -97,9 +97,6 @@ export function usePushPalsSession(
 ): PushPalsSessionActions {
   const normalizedOptions = typeof options === "string" ? { baseUrl: options } : (options ?? {});
   const baseUrl = String(normalizedOptions.baseUrl ?? "http://localhost:3001")
-    .trim()
-    .replace(/\/+$/, "");
-  const localAgentUrl = String(normalizedOptions.localAgentUrl ?? "http://localhost:3003")
     .trim()
     .replace(/\/+$/, "");
   const defaultSessionId = String(normalizedOptions.sessionId ?? "dev").trim() || "dev";
@@ -193,14 +190,13 @@ export function usePushPalsSession(
     };
   }, [authToken, baseUrl, defaultSessionId]);
 
-  // ─── Send message via LocalBuddy ──────────────────────────────
-  // Note: Messages now go to LocalBuddy (not directly to server)
+  // ─── Send message via the local server session ─────────────────
   const send = useCallback(
     async (text: string) => {
       if (!session.sessionId) return false;
-      return sendMessage(localAgentUrl, text);
+      return sendSessionMessage(baseUrl, session.sessionId, text);
     },
-    [localAgentUrl, session.sessionId],
+    [baseUrl, session.sessionId],
   );
 
   // ─── Approve / Deny ────────────────────────────────────────────────────
@@ -287,6 +283,7 @@ export function usePushPalsSession(
   // ─── Filtered events ──────────────────────────────────────────────────
   const filteredEvents = useMemo(() => {
     return session.events.filter((ev) => {
+      if (!shouldDisplayInteractiveSessionEvent(ev)) return false;
       if (filters.agentFrom && ev.from !== filters.agentFrom) return false;
       if (filters.turnId && ev.turnId !== filters.turnId) return false;
       if (filters.taskId) {

@@ -1,6 +1,5 @@
 type RuntimeBootstrapPayload = {
   serverUrl?: string;
-  localAgentUrl?: string;
   sessionId?: string;
   clientId?: string;
   clientKind?: string;
@@ -9,7 +8,6 @@ type RuntimeBootstrapPayload = {
 
 export type PushPalsWebRuntimeConfig = {
   serverUrl: string;
-  localAgentUrl: string;
   sessionId: string;
   clientId: string | null;
   clientKind: string;
@@ -62,10 +60,6 @@ export function resolvePushPalsWebRuntimeConfig(): PushPalsWebRuntimeConfig {
     serverUrl: normalizeLocalUrl(
       payload.serverUrl || env.EXPO_PUBLIC_PUSHPALS_URL,
       "http://127.0.0.1:3001",
-    ),
-    localAgentUrl: normalizeLocalUrl(
-      payload.localAgentUrl || env.EXPO_PUBLIC_LOCAL_AGENT_URL,
-      "http://127.0.0.1:3003",
     ),
     sessionId,
     clientId: clientId || null,

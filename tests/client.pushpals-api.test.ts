@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildSessionEventsUrl,
+  buildSessionMessageUrl,
   buildSessionWebSocketUrl,
 } from "../apps/client/src/lib/pushpalsApi";
 
@@ -18,6 +19,11 @@ describe("pushpals client session transport URLs", () => {
   test("builds the WebSocket transport URL without auth query fallback", () => {
     const url = buildSessionWebSocketUrl("https://pushpals.dev", "dev", 7, "topsecret");
     expect(url).toBe("wss://pushpals.dev/sessions/dev/ws?after=7");
+  });
+
+  test("builds the session message URL against the local server session endpoint", () => {
+    const url = buildSessionMessageUrl("http://127.0.0.1:3001", "dev/session");
+    expect(url).toBe("http://127.0.0.1:3001/sessions/dev%2Fsession/message");
   });
 
   test("encodes client presence metadata into session transport URLs", () => {

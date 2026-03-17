@@ -3,6 +3,7 @@ import { createServer } from "node:net";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { CommunicationManager } from "../packages/shared/src/communication";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
@@ -379,6 +380,69 @@ describe("server client presence route integration", () => {
     });
     expect(shutdown.status).toBe(202);
     await server.proc.exited;
+    },
+    15_000,
+  );
+
+  test(
+    "system status tracks agent websocket presence from CommunicationManager subscribers",
+    async () => {
+      const root = makeTempDir();
+      const authToken = "presence-token-agent";
+      const port = await getFreePort();
+      writeServerConfig(root, port);
+
+      const server = spawnServer(root, port, authToken);
+      await waitForHealth(server, port);
+
+      const createResponse = await fetch(`http://127.0.0.1:${port}/sessions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ sessionId: "dev" }),
+      });
+      expect(createResponse.status).toBe(201);
+
+      const comm = new CommunicationManager({
+        serverUrl: `http://127.0.0.1:${port}`,
+        sessionId: "dev",
+        from: "agent:remotebuddy-orchestrator",
+      });
+      const stop = comm.subscribeSessionEvents(() => {});
+
+      const duringWs = await waitForConnectedClientCount(port, authToken, 1);
+      expect(
+        duringWs.clients.items.find((item: any) => item.clientId === "remotebuddy-orchestrator"),
+      ).toMatchObject({
+        clientId: "remotebuddy-orchestrator",
+        kind: "agent",
+        status: "connected",
+        sessionId: "dev",
+        connectedTransports: ["ws"],
+      });
+
+      stop();
+      const afterClose = await waitForConnectedClientCount(port, authToken, 0);
+      expect(
+        afterClose.clients.items.find((item: any) => item.clientId === "remotebuddy-orchestrator"),
+      ).toMatchObject({
+        clientId: "remotebuddy-orchestrator",
+        status: "announced",
+        connectedTransports: [],
+      });
+
+      const shutdown = await fetch(`http://127.0.0.1:${port}/admin/shutdown`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ reason: "test shutdown" }),
+      });
+      expect(shutdown.status).toBe(202);
+      await server.proc.exited;
     },
     15_000,
   );

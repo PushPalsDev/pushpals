@@ -14,12 +14,11 @@ import { EventStore } from "./db.js";
 type StartupReadyKey = "localbuddy" | "remotebuddy" | "source_control_manager";
 
 const STARTUP_READY_MESSAGE = "All systems online, feel free to send messages!";
+const ASK_REMOTE_BUDDY_COMMAND = "/ask_remote_buddy";
+const ASK_REMOTE_BUDDY_USAGE =
+  "Usage: /ask_remote_buddy <request>. Example: /ask_remote_buddy fix the failing job status in the dashboard.";
 
-const STARTUP_READY_KEYS: ReadonlyArray<StartupReadyKey> = [
-  "localbuddy",
-  "remotebuddy",
-  "source_control_manager",
-];
+const STARTUP_READY_REQUIRED_KEYS: ReadonlyArray<StartupReadyKey> = ["remotebuddy"];
 
 const STARTUP_READY_DETAIL_RE = /\bonline\b/i;
 
@@ -29,6 +28,30 @@ const startupReadyKeyForAgent = (agentId: string): StartupReadyKey | null => {
   if (agentId.startsWith("remotebuddy")) return "remotebuddy";
   return null;
 };
+
+function normalizeIncomingClientMessageText(text: string): {
+  text: string;
+  usageMessage?: string;
+} {
+  const trimmed = String(text ?? "").trim();
+  const command = ASK_REMOTE_BUDDY_COMMAND.toLowerCase();
+  if (!trimmed.toLowerCase().startsWith(command)) {
+    return { text: trimmed };
+  }
+
+  const rest = trimmed
+    .slice(command.length)
+    .replace(/^[:\-]\s*/, "")
+    .trim();
+  if (!rest) {
+    return {
+      text: "",
+      usageMessage: ASK_REMOTE_BUDDY_USAGE,
+    };
+  }
+
+  return { text: rest };
+}
 
 // ─── Task record stored per session ─────────────────────────────────────────
 
@@ -53,6 +76,61 @@ export interface PendingApproval {
   action: string;
   summary: string;
   details: Record<string, unknown>;
+}
+
+export interface SessionMessageResult {
+  ok: boolean;
+  code: "accepted" | "invalid" | "session_not_found" | "enqueue_failed";
+  eventId?: string;
+  requestId?: string;
+  queuePosition?: number;
+  etaMs?: number;
+  message?: string;
+}
+
+export interface AcceptedClientMessage {
+  text: string;
+  intent?: Record<string, unknown>;
+  turnId: string;
+}
+
+export function parseIncomingClientMessage(
+  body: unknown,
+): { ok: true; accepted: AcceptedClientMessage } | { ok: false; message: string } {
+  const validation = validateMessageRequest(body);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      message: validation.errors?.join("; ") || "Invalid message request",
+    };
+  }
+
+  const rawText = (body as Record<string, unknown>).text as string;
+  const intent = (body as Record<string, unknown>).intent as Record<string, unknown> | undefined;
+  const normalized = normalizeIncomingClientMessageText(rawText);
+  if (normalized.usageMessage) {
+    return {
+      ok: false,
+      message: normalized.usageMessage,
+    };
+  }
+
+  return {
+    ok: true,
+    accepted: {
+      text: normalized.text,
+      ...(intent ? { intent } : {}),
+      turnId: randomUUID(),
+    },
+  };
+}
+
+export interface ClientMessageIngressResult {
+  ok: boolean;
+  requestId?: string;
+  queuePosition?: number;
+  etaMs?: number;
+  message?: string;
 }
 
 /**
@@ -211,6 +289,9 @@ export class SessionManager {
     string,
     { readyKeys: Set<StartupReadyKey>; announced: boolean }
   > = new Map();
+  private clientMessageIngress:
+    | ((sessionId: string, accepted: AcceptedClientMessage) => ClientMessageIngressResult)
+    | null = null;
 
   /** Pending approvals: approvalId → PendingApproval */
   readonly pendingApprovals: Map<string, PendingApproval> = new Map();
@@ -223,6 +304,18 @@ export class SessionManager {
 
   constructor(dbPath?: string) {
     this.store = new EventStore(dbPath);
+  }
+
+  close(): void {
+    this.store.close();
+  }
+
+  setClientMessageIngress(
+    handler:
+      | ((sessionId: string, accepted: AcceptedClientMessage) => ClientMessageIngressResult)
+      | null,
+  ): void {
+    this.clientMessageIngress = handler;
   }
 
   private static readonly SESSION_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/;
@@ -256,33 +349,42 @@ export class SessionManager {
     return token === this.authToken;
   }
 
-  // ── handleMessage (UI convenience) ──────────────────────────────────────
+  emitClientMessageValidationError(sessionId: string, message: string): SessionMessageResult {
+    return this.emitClientMessageError(sessionId, message, "invalid");
+  }
 
-  handleMessage(sessionId: string, body: unknown): void {
+  emitClientMessageError(
+    sessionId: string,
+    message: string,
+    code: "invalid" | "enqueue_failed" = "invalid",
+  ): SessionMessageResult {
     const session = this.getSession(sessionId);
-    if (!session) return;
-
-    const validation = validateMessageRequest(body);
-    if (!validation.ok) {
-      session.emit({
-        protocolVersion: PROTOCOL_VERSION,
-        id: randomUUID(),
-        ts: new Date().toISOString(),
-        sessionId,
-        type: "error",
-        payload: {
-          message: "Invalid message request",
-          detail: validation.errors?.join("; "),
-        },
-      } as unknown as EventEnvelope);
-      return;
+    if (!session) {
+      return { ok: false, code: "session_not_found", message: "Session not found" };
     }
 
-    const text = (body as Record<string, unknown>).text as string;
-    const intent = (body as Record<string, unknown>).intent as Record<string, unknown> | undefined;
-    const turnId = randomUUID();
+    session.emit({
+      protocolVersion: PROTOCOL_VERSION,
+      id: randomUUID(),
+      ts: new Date().toISOString(),
+      sessionId,
+      type: "error",
+      payload: {
+        message,
+      },
+    } as unknown as EventEnvelope);
+    return { ok: false, code, message };
+  }
 
-    // Emit a `message` event — agents (remote / local) handle orchestration
+  emitAcceptedClientMessage(
+    sessionId: string,
+    accepted: AcceptedClientMessage,
+  ): SessionMessageResult {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      return { ok: false, code: "session_not_found", message: "Session not found" };
+    }
+
     const messageEnv: EventEnvelope<"message"> = {
       protocolVersion: PROTOCOL_VERSION,
       id: randomUUID(),
@@ -290,13 +392,57 @@ export class SessionManager {
       sessionId,
       type: "message",
       from: "client",
-      turnId,
+      turnId: accepted.turnId,
       payload: {
-        text,
-        ...(intent ? { intent } : {}),
+        text: accepted.text,
+        ...(accepted.intent ? { intent: accepted.intent } : {}),
       },
     };
     session.emit(messageEnv);
+    return { ok: true, code: "accepted", eventId: messageEnv.id };
+  }
+
+  // ── handleMessage (UI convenience) ──────────────────────────────────────
+
+  handleMessage(sessionId: string, body: unknown): SessionMessageResult {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      return { ok: false, code: "session_not_found", message: "Session not found" };
+    }
+
+    const parsed = parseIncomingClientMessage(body);
+    if (!parsed.ok) {
+      return this.emitClientMessageValidationError(sessionId, parsed.message);
+    }
+
+    if (this.clientMessageIngress) {
+      try {
+        const ingress = this.clientMessageIngress(sessionId, parsed.accepted);
+        if (!ingress.ok) {
+          return this.emitClientMessageError(
+            sessionId,
+            ingress.message || "Failed to enqueue request",
+            "enqueue_failed",
+          );
+        }
+        return {
+          ...this.emitAcceptedClientMessage(sessionId, parsed.accepted),
+          ...(ingress.requestId ? { requestId: ingress.requestId } : {}),
+          ...(typeof ingress.queuePosition === "number"
+            ? { queuePosition: ingress.queuePosition }
+            : {}),
+          ...(typeof ingress.etaMs === "number" ? { etaMs: ingress.etaMs } : {}),
+        };
+      } catch (err) {
+        return this.emitClientMessageError(
+          sessionId,
+          err instanceof Error ? err.message : String(err),
+          "enqueue_failed",
+        );
+      }
+    }
+
+    return this.emitAcceptedClientMessage(sessionId, parsed.accepted);
   }
 
   // ── handleCommand (agent-friendly ingest) ───────────────────────────────
@@ -360,7 +506,7 @@ export class SessionManager {
     state.readyKeys.add(readyKey);
     this.startupReadyBySession.set(sessionId, state);
 
-    const allReady = STARTUP_READY_KEYS.every((key) => state.readyKeys.has(key));
+    const allReady = STARTUP_READY_REQUIRED_KEYS.every((key) => state.readyKeys.has(key));
     if (!allReady) return;
 
     state.announced = true;
