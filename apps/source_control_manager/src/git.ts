@@ -25,6 +25,8 @@ export interface TempBranchCleanupSummary {
 }
 
 export function resolveGitExecutableFromEnv(): string {
+  const absoluteOverride = String(process.env.PUSHPALS_GIT_BIN_ABSOLUTE ?? "").trim();
+  if (absoluteOverride) return absoluteOverride;
   const configured = String(process.env.PUSHPALS_GIT_BIN ?? "").trim();
   return configured || "git";
 }

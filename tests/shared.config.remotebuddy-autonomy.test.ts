@@ -5,6 +5,30 @@ import { join } from "path";
 import { loadPushPalsConfig } from "../packages/shared/src/config";
 
 describe("shared config remotebuddy autonomy parsing", () => {
+  test("defaults autonomy.enabled to true when unset", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "config");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[remotebuddy]",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.remotebuddy.autonomy.enabled).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("defaults autonomy timing, safety, and PR-feedback limits when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
     const configDir = join(root, "config");

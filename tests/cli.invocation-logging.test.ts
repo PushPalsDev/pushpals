@@ -190,8 +190,13 @@ url = "http://127.0.0.1:3991"
 port = 3999
 
 [remotebuddy.autonomy]
-enabled = false
+enabled = true
 `,
+          "utf8",
+        );
+        writeFileSync(
+          join(repoRoot, "vision.md"),
+          "# Vision\n\n> **One sentence:** Keep autonomy active for CLI sessions.\n",
           "utf8",
         );
 
@@ -222,7 +227,7 @@ enabled = false
         ]);
 
         expect(code).toBe(1);
-        expect(stderr).toContain("Server is unavailable at http://127.0.0.1:3991.");
+        expect(stderr).toContain("Server is unavailable at http://127.0.0.1:");
         expect(stderr).not.toContain("http://127.0.0.1:3001");
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -295,8 +300,13 @@ url = "http://127.0.0.1:${mockServer.port}"
 port = 3003
 
 [remotebuddy.autonomy]
-enabled = false
+enabled = true
 `,
+          "utf8",
+        );
+        writeFileSync(
+          join(repoRoot, "vision.md"),
+          "# Vision\n\n> **One sentence:** Keep autonomy active for CLI sessions.\n",
           "utf8",
         );
         writeFileSync(
@@ -343,6 +353,78 @@ enabled = false
         expect(stderr).toContain(`serverRepo=${otherRepoRoot}`);
       } finally {
         mockServer?.stop(true);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    15000,
+  );
+
+  test(
+    "warns and continues when RemoteBuddy autonomy is disabled in runtime config",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-autonomy-required-"));
+      const repoRoot = join(root, "repo");
+      const runtimeRoot = join(root, "runtime");
+
+      try {
+        mkdirSync(repoRoot, { recursive: true });
+        const init = Bun.spawnSync(["git", "init"], {
+          cwd: repoRoot,
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        expect(init.exitCode).toBe(0);
+        mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+        writeFileSync(join(runtimeRoot, ".env"), "PUSHPALS_PROFILE=dev\n", "utf8");
+        writeFileSync(join(runtimeRoot, ".env.example"), "PUSHPALS_PROFILE=dev\n", "utf8");
+        writeFileSync(join(runtimeRoot, "configs", "local.toml"), "# local overrides\n", "utf8");
+        writeFileSync(
+          join(runtimeRoot, "configs", "default.toml"),
+          `profile = "dev"
+session_id = "dev"
+
+[server]
+url = "http://127.0.0.1:3991"
+
+[localbuddy]
+enabled = false
+port = 3003
+
+[remotebuddy.autonomy]
+enabled = false
+`,
+          "utf8",
+        );
+
+        const proc = Bun.spawn(
+          [
+            bunExecPath,
+            cliScriptPath,
+            "--no-auto-start",
+            "--runtime-root",
+            runtimeRoot,
+            "--runtime-tag",
+            "vtest-local",
+          ],
+          {
+            cwd: repoRoot,
+            stdout: "pipe",
+            stderr: "pipe",
+            env: {
+              ...process.env,
+              PUSHPALS_CLI_PACKAGE_VERSION: "1.0.13-test",
+            },
+          },
+        );
+
+        const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+
+        expect(code).toBe(1);
+        expect(stderr).toContain(
+          "RemoteBuddy autonomy is disabled in config (remotebuddy.autonomy.enabled=false); continuing.",
+        );
+        expect(stderr).toContain("Server is unavailable at http://127.0.0.1:");
+      } finally {
         rmSync(root, { recursive: true, force: true });
       }
     },
@@ -418,8 +500,13 @@ enabled = false
 port = 3003
 
 [remotebuddy.autonomy]
-enabled = false
+enabled = true
 `,
+          "utf8",
+        );
+        writeFileSync(
+          join(repoRoot, "vision.md"),
+          "# Vision\n\n> **One sentence:** Keep autonomy active for CLI sessions.\n",
           "utf8",
         );
         writeFileSync(
@@ -558,8 +645,13 @@ enabled = false
 port = 3003
 
 [remotebuddy.autonomy]
-enabled = false
+enabled = true
 `,
+          "utf8",
+        );
+        writeFileSync(
+          join(repoRoot, "vision.md"),
+          "# Vision\n\n> **One sentence:** Keep autonomy active for CLI sessions.\n",
           "utf8",
         );
         writeFileSync(
@@ -695,8 +787,13 @@ enabled = false
 port = 3003
 
 [remotebuddy.autonomy]
-enabled = false
+enabled = true
 `,
+          "utf8",
+        );
+        writeFileSync(
+          join(repoRoot, "vision.md"),
+          "# Vision\n\n> **One sentence:** Keep autonomy active for CLI sessions.\n",
           "utf8",
         );
         writeFileSync(

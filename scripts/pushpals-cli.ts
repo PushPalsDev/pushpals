@@ -77,7 +77,11 @@ type RemoteBuddySessionConsumerHealth = {
   sessionId?: string;
 };
 
+type RemoteBuddyAutonomousEngineState = "unknown" | "enabled" | "disabled";
+
 type RuntimeServiceName = "server" | "localbuddy" | "remotebuddy" | "source_control_manager";
+
+type RuntimeServiceLogPaths = Record<RuntimeServiceName, string>;
 
 type RuntimeServiceProcess = {
   name: RuntimeServiceName;
@@ -843,6 +847,9 @@ export function buildEmbeddedRuntimeEnv(
     ...(typeof env.PUSHPALS_GIT_BIN === "string" && env.PUSHPALS_GIT_BIN.trim()
       ? { PUSHPALS_GIT_BIN: env.PUSHPALS_GIT_BIN.trim() }
       : {}),
+    ...(typeof env.PUSHPALS_GIT_BIN_ABSOLUTE === "string" && env.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
+      ? { PUSHPALS_GIT_BIN_ABSOLUTE: env.PUSHPALS_GIT_BIN_ABSOLUTE.trim() }
+      : {}),
   };
 }
 
@@ -924,6 +931,28 @@ function timestampFileToken(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
+export function buildRuntimeServiceLogPaths(
+  logDir: string,
+  runToken: string,
+): RuntimeServiceLogPaths {
+  return {
+    server: join(logDir, `${runToken}-server.log`),
+    localbuddy: join(logDir, `${runToken}-localbuddy.log`),
+    remotebuddy: join(logDir, `${runToken}-remotebuddy.log`),
+    source_control_manager: join(logDir, `${runToken}-source_control_manager.log`),
+  };
+}
+
+function appendRuntimeServicesLogLine(logPath: string, line: string): void {
+  const text = String(line ?? "").trim();
+  if (!text) return;
+  try {
+    appendFileSync(logPath, `${new Date().toISOString()} ${text}\n`, "utf8");
+  } catch {
+    // best-effort diagnostics only
+  }
+}
+
 function readLogTail(logPath: string, maxLines = 40): string {
   if (!existsSync(logPath)) return "";
   const raw = readFileSync(logPath, "utf8");
@@ -933,6 +962,35 @@ function readLogTail(logPath: string, maxLines = 40): string {
     .filter((line) => line.length > 0);
   if (lines.length === 0) return "";
   return lines.slice(-maxLines).join("\n");
+}
+
+export function extractRemoteBuddyAutonomousEngineState(
+  logText: string,
+): RemoteBuddyAutonomousEngineState {
+  const text = String(logText ?? "");
+  if (!text) return "unknown";
+  let state: RemoteBuddyAutonomousEngineState = "unknown";
+  for (const line of text.split(/\r?\n/)) {
+    if (/Autonomous engine:\s*enabled\b/i.test(line)) {
+      state = "enabled";
+      continue;
+    }
+    if (/Autonomous engine:\s*disabled\b/i.test(line)) {
+      state = "disabled";
+    }
+  }
+  return state;
+}
+
+function readRemoteBuddyAutonomousEngineState(
+  logPath: string,
+): RemoteBuddyAutonomousEngineState {
+  if (!existsSync(logPath)) return "unknown";
+  try {
+    return extractRemoteBuddyAutonomousEngineState(readFileSync(logPath, "utf8"));
+  } catch {
+    return "unknown";
+  }
 }
 
 async function downloadBinaryAsset(tag: string, assetName: string, outPath: string): Promise<void> {
@@ -1007,12 +1065,13 @@ function spawnRuntimeService(
   cwd: string,
   env: Record<string, string>,
   logPath: string,
+  runtimeServicesLogPath?: string,
 ): RuntimeServiceProcess {
-  writeFileSync(
-    logPath,
-    `[pushpals] service=${name} command=${command.join(" ")} cwd=${cwd}\n`,
-    "utf8",
-  );
+  const header = `[pushpals] service=${name} command=${command.join(" ")} cwd=${cwd}`;
+  writeFileSync(logPath, `${header}\n`, "utf8");
+  if (runtimeServicesLogPath) {
+    appendRuntimeServicesLogLine(runtimeServicesLogPath, header);
+  }
 
   const proc = Bun.spawn(command, {
     cwd,
@@ -1038,13 +1097,21 @@ function spawnRuntimeService(
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() ?? "";
       for (const line of lines) {
-        appendFileSync(logPath, `[${channel}] ${line}\n`, "utf8");
+        const serviceLine = `[${channel}] ${line}`;
+        appendFileSync(logPath, `${serviceLine}\n`, "utf8");
+        if (runtimeServicesLogPath) {
+          appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
+        }
       }
     }
     const rest = decoder.decode();
     if (rest) pending += rest;
     if (pending.trim().length > 0) {
-      appendFileSync(logPath, `[${channel}] ${pending.trimEnd()}\n`, "utf8");
+      const serviceLine = `[${channel}] ${pending.trimEnd()}`;
+      appendFileSync(logPath, `${serviceLine}\n`, "utf8");
+      if (runtimeServicesLogPath) {
+        appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
+      }
     }
   };
 
@@ -1114,8 +1181,10 @@ function prependExecutableDirToPath(
     .split(delimiter)
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
-  const hasDir = pathEntries.some(
-    (entry) => entry.toLowerCase() === executableDir.toLowerCase(),
+  const hasDir = pathEntries.some((entry) =>
+    platform === "win32"
+      ? entry.toLowerCase() === executableDir.toLowerCase()
+      : entry === executableDir,
   );
   const nextPath = hasDir ? existingPath : [executableDir, ...pathEntries].join(delimiter);
 
@@ -1137,6 +1206,11 @@ export function applyResolvedGitBinaryToRuntimeEnv(
   if (!resolvedPath) return env;
   prependExecutableDirToPath(env, resolvedPath, platform);
   env.PUSHPALS_GIT_BIN = basename(resolvedPath);
+  if (resolvedPath.includes("/") || resolvedPath.includes("\\")) {
+    env.PUSHPALS_GIT_BIN_ABSOLUTE = resolvedPath;
+  } else {
+    delete env.PUSHPALS_GIT_BIN_ABSOLUTE;
+  }
   return env;
 }
 
@@ -1477,10 +1551,14 @@ async function autoStartRuntimeServices(opts: {
   if (runtimeEnv.PUSHPALS_GIT_BIN) {
     applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, runtimeEnv.PUSHPALS_GIT_BIN);
   }
+  const gitLookupCommand =
+    typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
+      ? runtimeEnv.PUSHPALS_GIT_BIN.trim()
+      : "git";
   const resolvedGitBinary = await resolveCommandPath(
-    "git",
+    gitLookupCommand,
     opts.repoRoot,
-    normalizeChildProcessEnv(process.env as Record<string, string | undefined>),
+    runtimeEnv,
   );
   if (resolvedGitBinary) {
     applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, resolvedGitBinary);
@@ -1490,7 +1568,19 @@ async function autoStartRuntimeServices(opts: {
   const runToken = timestampFileToken();
   const logDir = join(runtimeRoot, "logs", "bootstrap");
   mkdirSync(logDir, { recursive: true });
-  const logPathFor = (name: RuntimeServiceName): string => join(logDir, `${runToken}-${name}.log`);
+  const serviceLogPaths = buildRuntimeServiceLogPaths(logDir, runToken);
+  const runtimeServicesLogPath = join(logDir, `${runToken}-runtime-services.log`);
+  writeFileSync(runtimeServicesLogPath, "", "utf8");
+  appendRuntimeServicesLogLine(runtimeServicesLogPath, `[pushpals] runtimeRoot=${runtimeRoot}`);
+  appendRuntimeServicesLogLine(runtimeServicesLogPath, `[pushpals] runtimeTag=${runtimeTag}`);
+  appendRuntimeServicesLogLine(runtimeServicesLogPath, `[pushpals] repoRoot=${opts.repoRoot}`);
+  console.log(`[pushpals] runtime services log: ${runtimeServicesLogPath}`);
+  console.log(`[pushpals] service log (server)=${serviceLogPaths.server}`);
+  console.log(`[pushpals] service log (localbuddy)=${serviceLogPaths.localbuddy}`);
+  console.log(`[pushpals] service log (remotebuddy)=${serviceLogPaths.remotebuddy}`);
+  console.log(
+    `[pushpals] service log (source_control_manager)=${serviceLogPaths.source_control_manager}`,
+  );
 
   const serverHealthy = await probeServer(opts.serverUrl);
   if (!serverHealthy) {
@@ -1500,7 +1590,8 @@ async function autoStartRuntimeServices(opts: {
       [runtimeBinaries.server],
       opts.repoRoot,
       runtimeEnv,
-      logPathFor("server"),
+      serviceLogPaths.server,
+      runtimeServicesLogPath,
     );
     services.push(serverService);
     console.log(`[pushpals] server log: ${serverService.logPath}`);
@@ -1510,6 +1601,10 @@ async function autoStartRuntimeServices(opts: {
     while (Date.now() < serverDeadline) {
       if (serverService.exited) {
         const tail = readLogTail(serverService.logPath);
+        appendRuntimeServicesLogLine(
+          runtimeServicesLogPath,
+          `[pushpals] embedded server exited during bootstrap (code=${serverService.exitCode ?? "unknown"}).`,
+        );
         stopRuntimeServices(services);
         throw new Error(
           `Embedded server exited during bootstrap (code=${serverService.exitCode ?? "unknown"}). ` +
@@ -1524,6 +1619,10 @@ async function autoStartRuntimeServices(opts: {
     }
     if (!serverIsReady) {
       const tail = readLogTail(serverService.logPath);
+      appendRuntimeServicesLogLine(
+        runtimeServicesLogPath,
+        `[pushpals] embedded server did not become healthy within ${DEFAULT_SERVER_BOOT_TIMEOUT_MS}ms.`,
+      );
       stopRuntimeServices(services);
       throw new Error(
         `Embedded server did not become healthy within ${DEFAULT_SERVER_BOOT_TIMEOUT_MS}ms. ` +
@@ -1533,6 +1632,10 @@ async function autoStartRuntimeServices(opts: {
     console.log("[pushpals] Embedded server is healthy.");
   } else {
     console.log("[pushpals] Server already healthy; skipping embedded server start.");
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      "[pushpals] server already healthy; embedded server start skipped.",
+    );
   }
 
   if (localBuddyEnabled) {
@@ -1542,12 +1645,17 @@ async function autoStartRuntimeServices(opts: {
       [runtimeBinaries.localbuddy],
       opts.repoRoot,
       runtimeEnv,
-      logPathFor("localbuddy"),
+      serviceLogPaths.localbuddy,
+      runtimeServicesLogPath,
     );
     services.push(localbuddyService);
     console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath}`);
   } else {
     console.log("[pushpals] Embedded LocalBuddy disabled for this CLI session; skipping start.");
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      "[pushpals] localbuddy disabled for this CLI session; embedded localbuddy start skipped.",
+    );
   }
 
   console.log("[pushpals] Starting embedded RemoteBuddy...");
@@ -1556,34 +1664,66 @@ async function autoStartRuntimeServices(opts: {
     [runtimeBinaries.remotebuddy],
     opts.repoRoot,
     runtimeEnv,
-    logPathFor("remotebuddy"),
+    serviceLogPaths.remotebuddy,
+    runtimeServicesLogPath,
   );
   services.push(remotebuddyService);
   console.log(`[pushpals] remotebuddy log: ${remotebuddyService.logPath}`);
+  let lastReportedRemoteBuddyAutonomyState: RemoteBuddyAutonomousEngineState = "unknown";
+  const reportRemoteBuddyAutonomousEngineState = (): void => {
+    const autonomyState = readRemoteBuddyAutonomousEngineState(remotebuddyService.logPath);
+    if (autonomyState === "unknown" || autonomyState === lastReportedRemoteBuddyAutonomyState) {
+      return;
+    }
+    lastReportedRemoteBuddyAutonomyState = autonomyState;
+    if (autonomyState === "enabled") {
+      console.log("[pushpals] Embedded RemoteBuddy autonomous engine is enabled.");
+      appendRuntimeServicesLogLine(
+        runtimeServicesLogPath,
+        "[pushpals] embedded remotebuddy autonomous engine is enabled.",
+      );
+      return;
+    }
+    console.warn(
+      "[pushpals] Embedded RemoteBuddy autonomous engine is disabled (remotebuddy.autonomy.enabled=false).",
+    );
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      "[pushpals] embedded remotebuddy autonomous engine is disabled (remotebuddy.autonomy.enabled=false).",
+    );
+  };
+  reportRemoteBuddyAutonomousEngineState();
 
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
   const scmRemoteAvailable = await repoHasRemote(opts.repoRoot, opts.sourceControlManagerRemote);
-  const gitProbeCommand =
-    typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
-      ? [runtimeEnv.PUSHPALS_GIT_BIN.trim(), "--version"]
-      : ["git", "--version"];
+  const gitForScm =
+    typeof runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE === "string" &&
+    runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
+      ? runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
+      : typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
+        ? runtimeEnv.PUSHPALS_GIT_BIN.trim()
+        : "git";
+  const gitProbeCommand = [gitForScm, "--version"];
   const gitAvailableForScm = await canSpawnCommand(gitProbeCommand, opts.repoRoot, runtimeEnv);
   if (!scmHealthy && scmRemoteAvailable) {
     if (!gitAvailableForScm) {
       console.warn(
         "[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.",
       );
+      appendRuntimeServicesLogLine(
+        runtimeServicesLogPath,
+        "[pushpals] source_control_manager skipped: git is unavailable in embedded runtime env.",
+      );
     } else {
-      if (runtimeEnv.PUSHPALS_GIT_BIN) {
-        console.log(`[pushpals] Embedded SourceControlManager git=${runtimeEnv.PUSHPALS_GIT_BIN}`);
-      }
+      console.log(`[pushpals] Embedded SourceControlManager git=${gitForScm}`);
       console.log("[pushpals] Starting embedded SourceControlManager...");
       const sourceControlManagerService = spawnRuntimeService(
         "source_control_manager",
         [runtimeBinaries.sourceControlManager, "--skip-clean-check"],
         opts.repoRoot,
         runtimeEnv,
-        logPathFor("source_control_manager"),
+        serviceLogPaths.source_control_manager,
+        runtimeServicesLogPath,
       );
       services.push(sourceControlManagerService);
       console.log(`[pushpals] source_control_manager log: ${sourceControlManagerService.logPath}`);
@@ -1592,16 +1732,29 @@ async function autoStartRuntimeServices(opts: {
     console.log(
       `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
     );
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      `[pushpals] source_control_manager skipped: repo has no remote "${opts.sourceControlManagerRemote}".`,
+    );
   } else if (!gitAvailableForScm) {
     console.warn(
       "[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.",
     );
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      "[pushpals] source_control_manager skipped: git is unavailable in embedded runtime env.",
+    );
   } else {
     console.log("[pushpals] SourceControlManager already healthy; skipping embedded start.");
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      "[pushpals] source_control_manager already healthy; embedded start skipped.",
+    );
   }
 
   const deadline = Date.now() + DEFAULT_RUNTIME_BOOT_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    reportRemoteBuddyAutonomousEngineState();
     for (let i = services.length - 1; i >= 0; i--) {
       const service = services[i];
       if (service.exited) {
@@ -1609,14 +1762,26 @@ async function autoStartRuntimeServices(opts: {
           console.warn(
             `[pushpals] Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); continuing without SCM.`,
           );
+          appendRuntimeServicesLogLine(
+            runtimeServicesLogPath,
+            `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); continuing.`,
+          );
           const tail = readLogTail(service.logPath);
           if (tail) {
             console.warn(`[pushpals] ${service.name} log tail:\n${tail}`);
+            appendRuntimeServicesLogLine(
+              runtimeServicesLogPath,
+              `[pushpals] ${service.name} log tail:\n${tail}`,
+            );
           }
           services.splice(i, 1);
           continue;
         }
         const tail = readLogTail(service.logPath);
+        appendRuntimeServicesLogLine(
+          runtimeServicesLogPath,
+          `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}).`,
+        );
         stopRuntimeServices(services);
         throw new Error(
           `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}). ` +
@@ -1628,8 +1793,10 @@ async function autoStartRuntimeServices(opts: {
     const health = localBuddyEnabled ? await probeLocalBuddy(opts.localAgentUrl) : null;
     const remoteBuddyHealth = await probeRemoteBuddySessionConsumer(opts.serverUrl, opts.sessionId);
     if ((!localBuddyEnabled || health?.ok) && remoteBuddyHealth.ok) {
+      reportRemoteBuddyAutonomousEngineState();
       const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;
       while (Date.now() < stabilityDeadline) {
+        reportRemoteBuddyAutonomousEngineState();
         for (let i = services.length - 1; i >= 0; i--) {
           const service = services[i];
           if (!service.exited) continue;
@@ -1638,13 +1805,25 @@ async function autoStartRuntimeServices(opts: {
             console.warn(
               `[pushpals] Embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}); continuing without SCM.`,
             );
+            appendRuntimeServicesLogLine(
+              runtimeServicesLogPath,
+              `[pushpals] embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}); continuing.`,
+            );
             if (tail) {
               console.warn(`[pushpals] ${service.name} log tail:\n${tail}`);
+              appendRuntimeServicesLogLine(
+                runtimeServicesLogPath,
+                `[pushpals] ${service.name} log tail:\n${tail}`,
+              );
             }
             services.splice(i, 1);
             continue;
           }
           const tail = readLogTail(service.logPath);
+          appendRuntimeServicesLogLine(
+            runtimeServicesLogPath,
+            `[pushpals] embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}).`,
+          );
           stopRuntimeServices(services);
           throw new Error(
             `Embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}). ` +
@@ -1654,6 +1833,10 @@ async function autoStartRuntimeServices(opts: {
         await Bun.sleep(250);
       }
       console.log("[pushpals] Embedded runtime is ready.");
+      appendRuntimeServicesLogLine(
+        runtimeServicesLogPath,
+        "[pushpals] embedded runtime is ready.",
+      );
       return services;
     }
     await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
@@ -1662,15 +1845,27 @@ async function autoStartRuntimeServices(opts: {
   stopRuntimeServices(services);
   const remoteBuddyHealth = await probeRemoteBuddySessionConsumer(opts.serverUrl, opts.sessionId);
   if (!localBuddyEnabled && !remoteBuddyHealth.ok) {
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      `[pushpals] timed out waiting for RemoteBuddy session consumer readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms (${remoteBuddyHealth.detail}).`,
+    );
     throw new Error(
       `Timed out waiting for RemoteBuddy session consumer readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms (${remoteBuddyHealth.detail})`,
     );
   }
   if (!localBuddyEnabled) {
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      `[pushpals] timed out waiting for embedded runtime readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms.`,
+    );
     throw new Error(
       `Timed out waiting for embedded runtime readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
     );
   }
+  appendRuntimeServicesLogLine(
+    runtimeServicesLogPath,
+    `[pushpals] timed out waiting for LocalBuddy at ${opts.localAgentUrl} and RemoteBuddy session consumer after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms.`,
+  );
   throw new Error(
     `Timed out waiting for LocalBuddy at ${opts.localAgentUrl} and RemoteBuddy session consumer after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
   );
@@ -2311,6 +2506,13 @@ async function main(): Promise<void> {
   }
 
   const config = preparedRuntime.runtimePreflight.config;
+  if (config.remotebuddy.autonomy.enabled) {
+    console.log("[pushpals] RemoteBuddy autonomy is enabled for CLI.");
+  } else {
+    console.warn(
+      "[pushpals] RemoteBuddy autonomy is disabled in config (remotebuddy.autonomy.enabled=false); continuing.",
+    );
+  }
   const serverUrl = normalizeLoopbackUrl(
     parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL,
     config.server.url,

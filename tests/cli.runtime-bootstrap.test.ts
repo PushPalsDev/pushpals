@@ -6,8 +6,10 @@ import {
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
   buildEmbeddedRuntimeEnv,
+  buildRuntimeServiceLogPaths,
   bundledMonitoringHubNeedsRefresh,
   buildServiceStopCommand,
+  extractRemoteBuddyAutonomousEngineState,
   extractRemoteBuddySessionConsumerHealth,
   formatTimestampedCliLine,
   formatSessionEventLine,
@@ -165,8 +167,50 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
 
     expect(env.PUSHPALS_GIT_BIN).toBe("git.exe");
+    expect(env.PUSHPALS_GIT_BIN_ABSOLUTE).toBe("C:\\Program Files\\Git\\cmd\\git.exe");
     expect(env.PATH).toContain("C:\\Program Files\\Git\\cmd");
     expect(env.Path).toContain("C:\\Program Files\\Git\\cmd");
+  });
+
+  test("applyResolvedGitBinaryToRuntimeEnv rewrites Unix absolute git paths into PATH + basename", () => {
+    const env = applyResolvedGitBinaryToRuntimeEnv(
+      {
+        PATH: "/usr/local/bin:/usr/bin",
+      },
+      "/opt/homebrew/bin/git",
+      "darwin",
+    );
+
+    expect(env.PUSHPALS_GIT_BIN).toBe("git");
+    expect(env.PUSHPALS_GIT_BIN_ABSOLUTE).toBe("/opt/homebrew/bin/git");
+    expect(env.PATH).toContain("/opt/homebrew/bin");
+    expect(env.Path).toBeUndefined();
+  });
+
+  test("applyResolvedGitBinaryToRuntimeEnv clears absolute override when git is configured by command name", () => {
+    const env = applyResolvedGitBinaryToRuntimeEnv(
+      {
+        PATH: "/usr/local/bin:/usr/bin",
+        PUSHPALS_GIT_BIN_ABSOLUTE: "/tmp/old/git",
+      },
+      "git",
+      "linux",
+    );
+
+    expect(env.PUSHPALS_GIT_BIN).toBe("git");
+    expect(env.PUSHPALS_GIT_BIN_ABSOLUTE).toBeUndefined();
+    expect(env.PATH).toBe("/usr/local/bin:/usr/bin");
+  });
+
+  test("buildRuntimeServiceLogPaths returns deterministic per-service paths", () => {
+    const logDir = join(tmpdir(), "pushpals-cli-runtime-logs");
+    const paths = buildRuntimeServiceLogPaths(logDir, "2026-03-17T00-00-00-000Z");
+    expect(paths.server).toBe(join(logDir, "2026-03-17T00-00-00-000Z-server.log"));
+    expect(paths.localbuddy).toBe(join(logDir, "2026-03-17T00-00-00-000Z-localbuddy.log"));
+    expect(paths.remotebuddy).toBe(join(logDir, "2026-03-17T00-00-00-000Z-remotebuddy.log"));
+    expect(paths.source_control_manager).toBe(
+      join(logDir, "2026-03-17T00-00-00-000Z-source_control_manager.log"),
+    );
   });
 
   test("buildOpenMonitoringHubCommand selects the right launcher per platform", () => {
@@ -331,6 +375,20 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ).toMatchObject({
       ok: false,
     });
+  });
+
+  test("extractRemoteBuddyAutonomousEngineState parses enabled/disabled markers from runtime logs", () => {
+    expect(
+      extractRemoteBuddyAutonomousEngineState(
+        "[stdout] [RemoteBuddy] Autonomous engine: enabled tick=300000ms",
+      ),
+    ).toBe("enabled");
+    expect(
+      extractRemoteBuddyAutonomousEngineState(
+        "[stdout] [RemoteBuddy] Autonomous engine: disabled tick=300000ms",
+      ),
+    ).toBe("disabled");
+    expect(extractRemoteBuddyAutonomousEngineState("")).toBe("unknown");
   });
 
   test("bundledMonitoringHubNeedsRefresh detects stale exported monitor assets", () => {

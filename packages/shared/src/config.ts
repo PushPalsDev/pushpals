@@ -1593,7 +1593,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       autonomy: {
         enabled:
           parseBoolEnv("REMOTEBUDDY_AUTONOMY_ENABLED") ??
-          asBoolean(remoteAutonomyNode.enabled, false),
+          asBoolean(remoteAutonomyNode.enabled, true),
         killSwitchEnabled:
           parseBoolEnv("REMOTEBUDDY_AUTONOMY_KILL_SWITCH_ENABLED") ??
           asBoolean(remoteAutonomyNode.kill_switch_enabled, false),
