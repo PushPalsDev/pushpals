@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.11`
-- start_commit: `fc49858e45fa2b12165d36a1c1b5719d68149c53`
-- end_commit: `fc49858e45fa2b12165d36a1c1b5719d68149c53`
+- version: `v1.0.12`
+- start_commit: `1d1ad57cd1170350d4f9b8f02ca328980bf0f9d6`
+- end_commit: `1d1ad57cd1170350d4f9b8f02ca328980bf0f9d6`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Force-enable LocalBuddy for interactive embedded CLI sessions so `pushpals` still starts correctly even when `localbuddy.enabled=false` in runtime config.
-- Normalize discovered and configured Windows Git executables into `PATH` plus basename spawning so embedded SourceControlManager can reliably launch `git.exe` inside packaged runtime processes.
-- Add targeted CLI/runtime regression coverage for the LocalBuddy bootstrap contract and Windows Git path normalization.
+- Unify the server-side client message ingress so `/sessions/:id/message` and in-process `SessionManager.handleMessage()` share the same validation, enqueue, error, and event-emission contract.
+- Route RemoteBuddy request processing, assistant replies, task/job events, context, and persistent memory by the claimed request session instead of leaking everything through the runtime default session.
+- Add pooled multi-session RemoteBuddy event monitoring and regression coverage proving a request claimed for one session produces replies on that same session.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.11 && git push origin v1.0.11`.
+- Tag and push: `git tag v1.0.12 && git push origin v1.0.12`.
