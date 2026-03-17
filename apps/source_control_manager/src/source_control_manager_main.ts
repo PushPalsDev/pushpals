@@ -6,7 +6,7 @@ import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 import { resolveGitTokenForRemote } from "../../../packages/shared/src/git_backend.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
-import { GitOps, resolveGitExecutableFromEnv } from "./git";
+import { GitOps, runGitCommandCapture } from "./git";
 import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
@@ -742,32 +742,7 @@ async function promptYesNo(question: string): Promise<boolean> {
 }
 
 async function runGitCapture(args: string[], cwd = repoRoot): Promise<GitCmdResult> {
-  const gitExecutable = resolveGitExecutableFromEnv();
-  try {
-    const proc = Bun.spawn([gitExecutable, ...args], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      stdout: "",
-      stderr: `spawn ${gitExecutable} failed: ${err instanceof Error ? err.message : String(err)}`,
-      exitCode: 127,
-    };
-  }
+  return runGitCommandCapture(cwd, args);
 }
 
 async function resolveGitAuthToken(remoteUrl: string): Promise<string> {

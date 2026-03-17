@@ -1697,11 +1697,11 @@ async function autoStartRuntimeServices(opts: {
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
   const scmRemoteAvailable = await repoHasRemote(opts.repoRoot, opts.sourceControlManagerRemote);
   const gitForScm =
-    typeof runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE === "string" &&
-    runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
-      ? runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
-      : typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
-        ? runtimeEnv.PUSHPALS_GIT_BIN.trim()
+    typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
+      ? runtimeEnv.PUSHPALS_GIT_BIN.trim()
+      : typeof runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE === "string" &&
+          runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
+        ? runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
         : "git";
   const gitProbeCommand = [gitForScm, "--version"];
   const gitAvailableForScm = await canSpawnCommand(gitProbeCommand, opts.repoRoot, runtimeEnv);

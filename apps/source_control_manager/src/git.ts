@@ -24,11 +24,97 @@ export interface TempBranchCleanupSummary {
   warnings: string[];
 }
 
+export function resolveGitExecutableCandidatesFromEnv(): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const pushCandidate = (value: string): void => {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed) return;
+    const key = process.platform === "win32" ? trimmed.toLowerCase() : trimmed;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(trimmed);
+  };
+
+  // Prefer the PATH-based command first because compiled Windows runtimes can
+  // fail to spawn some absolute `git.exe` paths even when PATH lookup works.
+  pushCandidate(process.env.PUSHPALS_GIT_BIN ?? "");
+  pushCandidate(process.env.PUSHPALS_GIT_BIN_ABSOLUTE ?? "");
+  pushCandidate("git");
+
+  return candidates;
+}
+
 export function resolveGitExecutableFromEnv(): string {
-  const absoluteOverride = String(process.env.PUSHPALS_GIT_BIN_ABSOLUTE ?? "").trim();
-  if (absoluteOverride) return absoluteOverride;
-  const configured = String(process.env.PUSHPALS_GIT_BIN ?? "").trim();
-  return configured || "git";
+  return resolveGitExecutableCandidatesFromEnv()[0] ?? "git";
+}
+
+function formatGitSpawnFailure(gitExecutable: string, err: unknown): string {
+  return `spawn ${gitExecutable} failed: ${err instanceof Error ? err.message : String(err)}`;
+}
+
+export async function runGitCommandCapture(
+  repoPath: string,
+  args: string[],
+  opts?: { timeout?: number; githubToken?: string },
+): Promise<GitResult> {
+  const gitExecutables = resolveGitExecutableCandidatesFromEnv();
+  let lastSpawnFailure = "";
+
+  for (const gitExecutable of gitExecutables) {
+    const gitArgs =
+      opts?.githubToken && opts.githubToken.length > 0
+        ? [
+            gitExecutable,
+            "-c",
+            `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(
+              `x-access-token:${opts.githubToken}`,
+              "utf-8",
+            ).toString("base64")}`,
+            ...args,
+          ]
+        : [gitExecutable, ...args];
+
+    let proc: Bun.Subprocess;
+    try {
+      proc = Bun.spawn(gitArgs, {
+        cwd: repoPath,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    } catch (err) {
+      lastSpawnFailure = formatGitSpawnFailure(gitExecutable, err);
+      continue;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (opts?.timeout) {
+      timer = setTimeout(() => proc.kill(), opts.timeout);
+    }
+
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+
+    const exitCode = await proc.exited;
+    if (timer) clearTimeout(timer);
+
+    return {
+      ok: exitCode === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode,
+    };
+  }
+
+  return {
+    ok: false,
+    stdout: "",
+    stderr: lastSpawnFailure || "spawn git failed: no executable candidates were available",
+    exitCode: 127,
+  };
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -38,55 +124,7 @@ async function git(
   args: string[],
   opts?: { timeout?: number; githubToken?: string },
 ): Promise<GitResult> {
-  const gitExecutable = resolveGitExecutableFromEnv();
-  const gitArgs =
-    opts?.githubToken && opts.githubToken.length > 0
-      ? [
-          gitExecutable,
-          "-c",
-          `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(
-            `x-access-token:${opts.githubToken}`,
-            "utf-8",
-          ).toString("base64")}`,
-          ...args,
-        ]
-      : [gitExecutable, ...args];
-
-  let proc: Bun.Subprocess;
-  try {
-    proc = Bun.spawn(gitArgs, {
-      cwd: repoPath,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-  } catch (err) {
-    return {
-      ok: false,
-      stdout: "",
-      stderr: `spawn ${gitExecutable} failed: ${err instanceof Error ? err.message : String(err)}`,
-      exitCode: 127,
-    };
-  }
-
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  if (opts?.timeout) {
-    timer = setTimeout(() => proc.kill(), opts.timeout);
-  }
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-
-  const exitCode = await proc.exited;
-  if (timer) clearTimeout(timer);
-
-  return {
-    ok: exitCode === 0,
-    stdout: stdout.trim(),
-    stderr: stderr.trim(),
-    exitCode,
-  };
+  return runGitCommandCapture(repoPath, args, opts);
 }
 
 function assertOk(result: GitResult, context: string): void {
