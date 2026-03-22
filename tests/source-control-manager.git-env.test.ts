@@ -6,6 +6,8 @@ import {
   GitOps,
   resolveGitExecutableCandidatesFromEnv,
   resolveGitExecutableFromEnv,
+  resolveWindowsShellExecutableCandidates,
+  resolveWindowsWhereExecutableCandidates,
 } from "../apps/source_control_manager/src/git.ts";
 
 const originalGitBin = process.env.PUSHPALS_GIT_BIN;
@@ -80,5 +82,37 @@ describe("source_control_manager git executable resolution", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("resolves Windows shell candidates from ComSpec and SystemRoot before bare cmd.exe", () => {
+    const candidates = resolveWindowsShellExecutableCandidates(
+      {
+        COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+        SYSTEMROOT: "C:\\Windows",
+      },
+      "win32",
+    );
+
+    expect(candidates).toEqual([
+      "C:\\Windows\\System32\\cmd.exe",
+      "C:\\Windows\\Sysnative\\cmd.exe",
+      "cmd.exe",
+    ]);
+  });
+
+  test("resolves Windows where.exe candidates from SystemRoot before PATH lookup", () => {
+    const candidates = resolveWindowsWhereExecutableCandidates(
+      {
+        SYSTEMROOT: "C:\\Windows",
+      },
+      "win32",
+    );
+
+    expect(candidates).toEqual([
+      "C:\\Windows\\System32\\where.exe",
+      "C:\\Windows\\Sysnative\\where.exe",
+      "where.exe",
+      "where",
+    ]);
   });
 });

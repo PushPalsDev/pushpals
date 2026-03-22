@@ -1,3 +1,4 @@
+import { win32 as pathWin32 } from "path";
 import type { SourceControlManagerConfig } from "./config";
 
 /**
@@ -50,6 +51,77 @@ export function resolveGitExecutableFromEnv(): string {
   return resolveGitExecutableCandidatesFromEnv()[0] ?? "git";
 }
 
+function pushUniqueCandidate(
+  candidates: string[],
+  seen: Set<string>,
+  value: string,
+  platform = process.platform,
+): void {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return;
+  const key = platform === "win32" ? trimmed.toLowerCase() : trimmed;
+  if (seen.has(key)) return;
+  seen.add(key);
+  candidates.push(trimmed);
+}
+
+export function resolveWindowsShellExecutableCandidates(
+  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  platform = process.platform,
+): string[] {
+  if (platform !== "win32") return [];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const comSpec = String(env.ComSpec ?? env.COMSPEC ?? "").trim();
+  const systemRoot = String(env.SystemRoot ?? env.SYSTEMROOT ?? "").trim();
+
+  pushUniqueCandidate(candidates, seen, comSpec, platform);
+  if (systemRoot) {
+    pushUniqueCandidate(
+      candidates,
+      seen,
+      pathWin32.join(systemRoot, "System32", "cmd.exe"),
+      platform,
+    );
+    pushUniqueCandidate(
+      candidates,
+      seen,
+      pathWin32.join(systemRoot, "Sysnative", "cmd.exe"),
+      platform,
+    );
+  }
+  pushUniqueCandidate(candidates, seen, "cmd.exe", platform);
+  return candidates;
+}
+
+export function resolveWindowsWhereExecutableCandidates(
+  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  platform = process.platform,
+): string[] {
+  if (platform !== "win32") return [];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const systemRoot = String(env.SystemRoot ?? env.SYSTEMROOT ?? "").trim();
+
+  if (systemRoot) {
+    pushUniqueCandidate(
+      candidates,
+      seen,
+      pathWin32.join(systemRoot, "System32", "where.exe"),
+      platform,
+    );
+    pushUniqueCandidate(
+      candidates,
+      seen,
+      pathWin32.join(systemRoot, "Sysnative", "where.exe"),
+      platform,
+    );
+  }
+  pushUniqueCandidate(candidates, seen, "where.exe", platform);
+  pushUniqueCandidate(candidates, seen, "where", platform);
+  return candidates;
+}
+
 function formatGitSpawnFailure(gitExecutable: string, err: unknown): string {
   return `spawn ${gitExecutable} failed: ${err instanceof Error ? err.message : String(err)}`;
 }
@@ -73,31 +145,50 @@ async function runViaWindowsCmd(
   timeout?: number,
 ): Promise<GitResult> {
   const commandLine = commandArgs.map((arg) => quoteWindowsCmdArg(arg)).join(" ");
-  const proc = Bun.spawn(["cmd.exe", "/d", "/s", "/c", commandLine], {
-    cwd: repoPath,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const env = process.env as Record<string, string | undefined>;
+  const shellCandidates = resolveWindowsShellExecutableCandidates(env);
+  const spawnFailures: string[] = [];
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  if (timeout) {
-    timer = setTimeout(() => proc.kill(), timeout);
+  for (const shellExecutable of shellCandidates) {
+    let proc: Bun.Subprocess;
+    try {
+      proc = Bun.spawn([shellExecutable, "/d", "/s", "/c", commandLine], {
+        cwd: repoPath,
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    } catch (err) {
+      spawnFailures.push(formatGitSpawnFailure(shellExecutable, err));
+      continue;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (timeout) {
+      timer = setTimeout(() => proc.kill(), timeout);
+    }
+
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+
+    const exitCode = await proc.exited;
+    if (timer) clearTimeout(timer);
+
+    return {
+      ok: exitCode === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode,
+    };
   }
 
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-
-  const exitCode = await proc.exited;
-  if (timer) clearTimeout(timer);
-
-  return {
-    ok: exitCode === 0,
-    stdout: stdout.trim(),
-    stderr: stderr.trim(),
-    exitCode,
-  };
+  throw new Error(
+    spawnFailures.length > 0
+      ? spawnFailures.join(" | ")
+      : "spawn cmd.exe failed: no Windows shell candidates were available",
+  );
 }
 
 async function expandWindowsGitExecutableCandidates(
@@ -120,27 +211,33 @@ async function expandWindowsGitExecutableCandidates(
   for (const candidate of candidates) {
     const hasPath = /[\\/]/.test(candidate) || /^[A-Za-z]:/.test(candidate);
     if (!hasPath) {
-      try {
-        const proc = Bun.spawn(["where.exe", candidate], {
-          cwd: repoPath,
-          env: process.env as Record<string, string | undefined>,
-          stdout: "pipe",
-          stderr: "ignore",
-        });
-        const [stdout, exitCode] = await Promise.all([
-          new Response(proc.stdout).text(),
-          proc.exited,
-        ]);
-        if (exitCode === 0) {
-          for (const resolved of stdout
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter((line) => line.length > 0)) {
-            pushCandidate(resolved);
+      const whereCandidates = resolveWindowsWhereExecutableCandidates(
+        process.env as Record<string, string | undefined>,
+      );
+      for (const whereExecutable of whereCandidates) {
+        try {
+          const proc = Bun.spawn([whereExecutable, candidate], {
+            cwd: repoPath,
+            env: process.env as Record<string, string | undefined>,
+            stdout: "pipe",
+            stderr: "ignore",
+          });
+          const [stdout, exitCode] = await Promise.all([
+            new Response(proc.stdout).text(),
+            proc.exited,
+          ]);
+          if (exitCode === 0) {
+            for (const resolved of stdout
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter((line) => line.length > 0)) {
+              pushCandidate(resolved);
+            }
           }
+          break;
+        } catch {
+          // Try the next where.exe candidate.
         }
-      } catch {
-        // Keep the original candidate even if where lookup fails.
       }
     }
     pushCandidate(candidate);

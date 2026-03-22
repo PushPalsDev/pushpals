@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import {
+  buildCliClearTargets,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
   buildEmbeddedRuntimeEnv,
@@ -18,10 +19,14 @@ import {
   normalizeCliInteractiveMessage,
   normalizeChildProcessEnv,
   normalizeRepoPathForComparison,
+  precheckSourceControlManagerGitAvailability,
   prepareCliRuntime,
+  resolveRuntimeGitExecutableCandidates,
   resolveCliLocalBuddyAutostart,
   resolveCliStatePath,
   resolveCommandPath,
+  resolvePreferredRuntimeReleaseTag,
+  resolveWindowsShellExecutableCandidatesForEnv,
   startEmbeddedMonitoringHub,
 } from "../scripts/pushpals-cli.ts";
 
@@ -202,6 +207,120 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PATH).toBe("/usr/local/bin:/usr/bin");
   });
 
+  test("resolveRuntimeGitExecutableCandidates keeps basename and absolute fallback for SCM probing", () => {
+    expect(
+      resolveRuntimeGitExecutableCandidates(
+        {
+          PUSHPALS_GIT_BIN: "git.exe",
+          PUSHPALS_GIT_BIN_ABSOLUTE: "C:\\Program Files\\Git\\cmd\\git.exe",
+        },
+        "win32",
+      ),
+    ).toEqual(["git.exe", "C:\\Program Files\\Git\\cmd\\git.exe", "git"]);
+
+    expect(
+      resolveRuntimeGitExecutableCandidates(
+        {
+          PUSHPALS_GIT_BIN: "git",
+          PUSHPALS_GIT_BIN_ABSOLUTE: "/usr/local/bin/git",
+        },
+        "linux",
+      ),
+    ).toEqual(["git", "/usr/local/bin/git"]);
+  });
+
+  test("resolveWindowsShellExecutableCandidatesForEnv prefers ComSpec and SystemRoot fallbacks", () => {
+    expect(
+      resolveWindowsShellExecutableCandidatesForEnv(
+        {
+          COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+          SYSTEMROOT: "C:\\Windows",
+        },
+        "win32",
+      ),
+    ).toEqual([
+      "C:\\Windows\\System32\\cmd.exe",
+      "C:\\Windows\\Sysnative\\cmd.exe",
+      "cmd.exe",
+    ]);
+  });
+
+  test("precheckSourceControlManagerGitAvailability skips cleanly when the SCM remote is not configured", async () => {
+    const result = await precheckSourceControlManagerGitAvailability({
+      repoRoot: "/repo/example",
+      remote: "origin",
+      runtimeRoot: "/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      baseEnv: {
+        PATH: "/usr/bin",
+      },
+      gitRemoteCheckFn: async () => ({ status: "missing_remote", remote: "origin" }),
+      resolveCommandPathFn: async () => {
+        throw new Error("resolveCommandPath should not run when remote is missing");
+      },
+      gitProbeFn: async () => {
+        throw new Error("git probe should not run when remote is missing");
+      },
+      platform: "linux",
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.detail).toBe('git remote "origin" is not configured');
+  });
+
+  test("precheckSourceControlManagerGitAvailability fails when the SCM remote cannot be inspected", async () => {
+    const result = await precheckSourceControlManagerGitAvailability({
+      repoRoot: "/repo/example",
+      remote: "origin",
+      runtimeRoot: "/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      baseEnv: {
+        PATH: "/usr/bin",
+      },
+      gitRemoteCheckFn: async () => ({
+        status: "error",
+        remote: "origin",
+        detail: "spawn git failed: ENOENT",
+      }),
+      resolveCommandPathFn: async () => {
+        throw new Error("resolveCommandPath should not run when remote inspection fails");
+      },
+      gitProbeFn: async () => {
+        throw new Error("git probe should not run when remote inspection fails");
+      },
+      platform: "linux",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.detail).toContain('git remote "origin" could not be inspected');
+    expect(result.detail).toContain("spawn git failed: ENOENT");
+  });
+
+  test("precheckSourceControlManagerGitAvailability fails before startup when SCM git probing fails", async () => {
+    const result = await precheckSourceControlManagerGitAvailability({
+      repoRoot: "C:\\repo\\example",
+      remote: "origin",
+      runtimeRoot: "C:\\runtime\\pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      baseEnv: {
+        PATH: "C:\\Windows\\System32",
+        COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+        SYSTEMROOT: "C:\\Windows",
+      },
+      gitRemoteCheckFn: async () => ({ status: "ok", remote: "origin" }),
+      resolveCommandPathFn: async () => null,
+      gitProbeFn: async () => ({
+        ok: false,
+        detail: "git.exe, C:\\Program Files\\Git\\cmd\\git.exe",
+      }),
+      platform: "win32",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.detail).toBe("git.exe, C:\\Program Files\\Git\\cmd\\git.exe");
+    expect(result.env.PUSHPALS_REPO_ROOT_OVERRIDE).toBe("C:\\repo\\example");
+  });
+
   test("buildRuntimeServiceLogPaths returns deterministic per-service paths", () => {
     const logDir = join(tmpdir(), "pushpals-cli-runtime-logs");
     const paths = buildRuntimeServiceLogPaths(logDir, "2026-03-17T00-00-00-000Z");
@@ -241,6 +360,26 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
     expect(buildServiceStopCommand(4321, "linux")).toBeNull();
     expect(buildServiceStopCommand(undefined, "win32")).toBeNull();
+  });
+
+  test("resolvePreferredRuntimeReleaseTag prefers the installed CLI package version before GitHub latest", () => {
+    expect(
+      resolvePreferredRuntimeReleaseTag(undefined, {
+        PUSHPALS_CLI_PACKAGE_VERSION: "1.0.16",
+      }),
+    ).toBe("v1.0.16");
+    expect(
+      resolvePreferredRuntimeReleaseTag(undefined, {
+        PUSHPALS_RUNTIME_TAG: "vcustom-runtime",
+        PUSHPALS_CLI_PACKAGE_VERSION: "1.0.16",
+      }),
+    ).toBe("vcustom-runtime");
+    expect(
+      resolvePreferredRuntimeReleaseTag("vexplicit", {
+        PUSHPALS_RUNTIME_TAG: "vignored",
+        PUSHPALS_CLI_PACKAGE_VERSION: "1.0.16",
+      }),
+    ).toBe("vexplicit");
   });
 
   test("isCliExitCommand treats bare exit aliases as local shutdown commands", () => {
@@ -329,6 +468,55 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     try {
       expect(resolveCliStatePath(root)).toBe(join(metadataDir, "pushpals-cli-state.json"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("buildCliClearTargets removes repo-local runtime state without targeting the repo root", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-targets-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+    const gitDir = join(repoRoot, ".git");
+
+    try {
+      mkdirSync(join(repoRoot, "outputs", "data"), { recursive: true });
+      mkdirSync(join(repoRoot, ".worktrees", "source_control_manager"), { recursive: true });
+      mkdirSync(gitDir, { recursive: true });
+      writeFileSync(join(gitDir, "pushpals-cli-state.json"), "{}\n", "utf8");
+      writeFileSync(join(gitDir, "pushpals-client-state.json"), "{}\n", "utf8");
+
+      const targets = buildCliClearTargets({
+        repoRoot,
+        runtimeRoot,
+        cliStatePath: join(gitDir, "pushpals-cli-state.json"),
+        config: {
+          paths: {
+            dataDir: join(repoRoot, "outputs", "data"),
+          },
+          sourceControlManager: {
+            repoPath: join(repoRoot, ".worktrees", "source_control_manager"),
+            stateDir: join(repoRoot, "outputs", "data", "source_control_manager"),
+          },
+        } as any,
+      });
+
+      expect(targets).toEqual([
+        { label: "runtime data", path: join(repoRoot, "outputs", "data") },
+        {
+          label: "SourceControlManager worktree",
+          path: join(repoRoot, ".worktrees", "source_control_manager"),
+        },
+        { label: "CLI state file", path: join(gitDir, "pushpals-cli-state.json") },
+        {
+          label: "client monitor state file",
+          path: join(gitDir, "pushpals-client-state.json"),
+        },
+        {
+          label: "runtime bootstrap logs",
+          path: join(runtimeRoot, "logs", "bootstrap"),
+        },
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

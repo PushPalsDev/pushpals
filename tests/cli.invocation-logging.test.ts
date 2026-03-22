@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
@@ -318,6 +318,73 @@ enabled = false
         );
         expect(stderr).not.toContain("Server is unavailable");
         expect(stderr).not.toContain("Repo affinity check failed");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    15000,
+  );
+
+  test(
+    "pushpals --clear removes repo-local state and exits without requiring runtime preflight success",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-"));
+      const repoRoot = join(root, "repo");
+      const runtimeRoot = join(root, "runtime");
+      const gitDir = join(repoRoot, ".git");
+      const dataDir = join(repoRoot, "outputs", "data");
+      const scmWorktree = join(repoRoot, ".worktrees", "source_control_manager");
+
+      try {
+        mkdirSync(repoRoot, { recursive: true });
+        const init = Bun.spawnSync(["git", "init"], {
+          cwd: repoRoot,
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        expect(init.exitCode).toBe(0);
+        mkdirSync(dataDir, { recursive: true });
+        mkdirSync(scmWorktree, { recursive: true });
+        mkdirSync(runtimeRoot, { recursive: true });
+        writeFileSync(join(dataDir, "pushpals.db"), "placeholder\n", "utf8");
+        writeFileSync(join(gitDir, "pushpals-cli-state.json"), "{}\n", "utf8");
+        writeFileSync(join(gitDir, "pushpals-client-state.json"), "{}\n", "utf8");
+
+        const proc = Bun.spawn(
+          [
+            bunExecPath,
+            cliScriptPath,
+            "--clear",
+            "--runtime-root",
+            runtimeRoot,
+            "--server-url",
+            "http://127.0.0.1:65534",
+          ],
+          {
+            cwd: repoRoot,
+            stdout: "pipe",
+            stderr: "pipe",
+            env: {
+              ...process.env,
+              PUSHPALS_CLI_PACKAGE_VERSION: "1.0.16-test",
+            },
+          },
+        );
+
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+
+        expect(code).toBe(0);
+        expect(stderr.trim()).toBe("");
+        expect(stdout).toContain("[pushpals] Clear requested. Removing repo-local PushPals state.");
+        expect(stdout).toContain("[pushpals] Clear completed.");
+        expect(existsSync(dataDir)).toBe(false);
+        expect(existsSync(scmWorktree)).toBe(false);
+        expect(existsSync(join(gitDir, "pushpals-cli-state.json"))).toBe(false);
+        expect(existsSync(join(gitDir, "pushpals-client-state.json"))).toBe(false);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

@@ -9,9 +9,10 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "fs";
-import { basename, delimiter, dirname, extname, join, resolve } from "path";
+import { basename, delimiter, dirname, extname, join, resolve, win32 as pathWin32 } from "path";
 import { createInterface, type Interface } from "readline";
 import {
   evaluateClientRuntimePreflight,
@@ -32,6 +33,7 @@ type CliOptions = {
   noAutoStart: boolean;
   noStream: boolean;
   runtimeOnly: boolean;
+  clear: boolean;
 };
 
 type LocalBuddyHealth = {
@@ -49,6 +51,15 @@ type CliState = {
   repoRoot?: string;
   pushpalsLogPath?: string;
   updatedAt?: string;
+};
+
+type CliClearTarget = {
+  label: string;
+  path: string;
+};
+
+type CliClearFailure = CliClearTarget & {
+  detail: string;
 };
 
 type SessionStreamPayload = {
@@ -79,6 +90,20 @@ type RemoteBuddySessionConsumerHealth = {
 };
 
 type RemoteBuddyAutonomousEngineState = "unknown" | "enabled" | "disabled";
+type SourceControlManagerGitPrecheckResult =
+  | { status: "ok"; detail: string; env: Record<string, string> }
+  | { status: "skipped"; detail: string; env: Record<string, string> }
+  | { status: "failed"; detail: string; env: Record<string, string> };
+type GitCommandResult = {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+};
+type GitRemoteCheckResult =
+  | { status: "ok"; remote: string }
+  | { status: "missing_remote"; remote: string }
+  | { status: "error"; remote: string; detail: string };
 
 type RuntimeServiceName = "server" | "localbuddy" | "remotebuddy" | "source_control_manager";
 type RuntimeBinaryName = RuntimeServiceName | "workerpals";
@@ -249,6 +274,7 @@ function printUsage(): void {
   console.log("  --no-auto-start        Disable runtime auto-start when the server is down");
   console.log("  --no-stream            Disable live session event stream");
   console.log("  --runtime-only         Start the local runtime and wait for shutdown without opening the interactive chat");
+  console.log("  --clear                Remove repo-local PushPals state and exit");
   console.log("  -h, --help             Show this help");
   console.log("");
   console.log("Chat commands:");
@@ -266,7 +292,12 @@ function printUsage(): void {
 }
 
 function parseArgs(argv: string[]): CliOptions | null {
-  const options: CliOptions = { noAutoStart: false, noStream: false, runtimeOnly: false };
+  const options: CliOptions = {
+    noAutoStart: false,
+    noStream: false,
+    runtimeOnly: false,
+    clear: false,
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -284,6 +315,10 @@ function parseArgs(argv: string[]): CliOptions | null {
     }
     if (arg === "--runtime-only") {
       options.runtimeOnly = true;
+      continue;
+    }
+    if (arg === "--clear") {
+      options.clear = true;
       continue;
     }
     if (arg === "--server-url") {
@@ -359,31 +394,43 @@ function jsonHtmlBootstrap(value: unknown): string {
   return JSON.stringify(value).replace(/</g, "\\u003c");
 }
 
+async function runGitWithEnv(
+  args: string[],
+  cwd: string,
+  env: Record<string, string | undefined>,
+): Promise<GitCommandResult> {
+  try {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+  } catch (err) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: err instanceof Error ? err.message : String(err),
+      exitCode: -1,
+    };
+  }
+}
+
 async function runGit(
   args: string[],
   cwd: string,
-): Promise<{
-  ok: boolean;
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-}> {
-  const proc = Bun.spawn(["git", ...args], {
-    cwd,
-    env: {
-      ...(process.env as Record<string, string | undefined>),
-      GIT_TERMINAL_PROMPT: "0",
-      GCM_INTERACTIVE: "Never",
-    },
-    stdout: "pipe",
-    stderr: "pipe",
+): Promise<GitCommandResult> {
+  return await runGitWithEnv(args, cwd, {
+    ...(process.env as Record<string, string | undefined>),
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
   });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
 }
 
 async function resolveCurrentGitRepoRoot(cwd: string): Promise<string | null> {
@@ -589,27 +636,30 @@ async function fetchLatestReleaseTag(): Promise<string> {
   return tagName;
 }
 
-async function resolveRuntimeReleaseTag(explicitTag?: string): Promise<string> {
+export function resolvePreferredRuntimeReleaseTag(
+  explicitTag?: string,
+  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+): string {
   const fromArg = String(explicitTag ?? "").trim();
   if (fromArg) return fromArg;
 
-  const fromEnv = String(process.env.PUSHPALS_RUNTIME_TAG ?? "").trim();
+  const fromEnv = String(env.PUSHPALS_RUNTIME_TAG ?? "").trim();
   if (fromEnv) return fromEnv;
 
-  const packageVersion = parseSemverFromPackageVersion(process.env.PUSHPALS_CLI_PACKAGE_VERSION);
+  const packageVersion = parseSemverFromPackageVersion(env.PUSHPALS_CLI_PACKAGE_VERSION);
+  if (packageVersion) return `v${packageVersion}`;
+  return "";
+}
+
+async function resolveRuntimeReleaseTag(explicitTag?: string): Promise<string> {
+  const preferredTag = resolvePreferredRuntimeReleaseTag(
+    explicitTag,
+    process.env as Record<string, string | undefined>,
+  );
+  if (preferredTag) return preferredTag;
+
   console.log("[pushpals] Resolving embedded runtime release tag from GitHub...");
-  try {
-    return await fetchLatestReleaseTag();
-  } catch (err) {
-    if (packageVersion) {
-      const fallbackTag = `v${packageVersion}`;
-      console.warn(
-        `[pushpals] Could not resolve latest runtime tag; falling back to package version tag ${fallbackTag}: ${String(err)}`,
-      );
-      return fallbackTag;
-    }
-    throw err;
-  }
+  return await fetchLatestReleaseTag();
 }
 
 function writeTextFileIfMissing(pathValue: string, text: string): void {
@@ -911,10 +961,10 @@ export async function resolveCommandPath(
 ): Promise<string | null> {
   const lookupCommands =
     process.platform === "win32"
-      ? [
-          ["where.exe", command],
-          ["where", command],
-        ]
+      ? resolveWindowsWhereExecutableCandidatesForEnv(
+          env as Record<string, string | undefined>,
+          process.platform,
+        ).map((lookup) => [lookup, command])
       : [["which", command]];
 
   for (const lookup of lookupCommands) {
@@ -1229,6 +1279,96 @@ export function applyResolvedGitBinaryToRuntimeEnv(
   return env;
 }
 
+export function resolveRuntimeGitExecutableCandidates(
+  env: Record<string, string | undefined>,
+  platform = process.platform,
+): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (value: string): void => {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed) return;
+    const key = platform === "win32" ? trimmed.toLowerCase() : trimmed;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(trimmed);
+  };
+
+  pushCandidate(env.PUSHPALS_GIT_BIN ?? "");
+  pushCandidate(env.PUSHPALS_GIT_BIN_ABSOLUTE ?? "");
+  pushCandidate(platform === "win32" ? "git.exe" : "git");
+  pushCandidate("git");
+  return candidates;
+}
+
+export function resolveWindowsShellExecutableCandidatesForEnv(
+  env: Record<string, string | undefined>,
+  platform = process.platform,
+): string[] {
+  if (platform !== "win32") return [];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (value: string): void => {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed) return;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(trimmed);
+  };
+
+  const comSpec = String(
+    env.ComSpec ?? env.COMSPEC ?? process.env.ComSpec ?? process.env.COMSPEC ?? "",
+  ).trim();
+  const systemRoot = String(
+    env.SystemRoot ?? env.SYSTEMROOT ?? process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "",
+  ).trim();
+
+  pushCandidate(comSpec);
+  if (systemRoot) {
+    pushCandidate(pathWin32.join(systemRoot, "System32", "cmd.exe"));
+    pushCandidate(pathWin32.join(systemRoot, "Sysnative", "cmd.exe"));
+  }
+  pushCandidate("cmd.exe");
+  return candidates;
+}
+
+export function resolveWindowsWhereExecutableCandidatesForEnv(
+  env: Record<string, string | undefined>,
+  platform = process.platform,
+): string[] {
+  if (platform !== "win32") return [];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (value: string): void => {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed) return;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(trimmed);
+  };
+
+  const systemRoot = String(
+    env.SystemRoot ?? env.SYSTEMROOT ?? process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "",
+  ).trim();
+  if (systemRoot) {
+    pushCandidate(pathWin32.join(systemRoot, "System32", "where.exe"));
+    pushCandidate(pathWin32.join(systemRoot, "Sysnative", "where.exe"));
+  }
+  pushCandidate("where.exe");
+  pushCandidate("where");
+  return candidates;
+}
+
+function quoteWindowsCmdArg(value: string): string {
+  const text = String(value ?? "");
+  if (!text.length) return '""';
+  if (!/[ \t"]/.test(text)) return text;
+  const escaped = text.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/g, "$1$1");
+  return `"${escaped}"`;
+}
+
 function isOptionalEmbeddedService(name: RuntimeServiceName): boolean {
   return name === "source_control_manager";
 }
@@ -1253,11 +1393,177 @@ async function canSpawnCommand(
   }
 }
 
+async function canSpawnGitViaWindowsShell(
+  commandArgs: string[],
+  cwd: string,
+  env: Record<string, string>,
+  platform = process.platform,
+): Promise<boolean> {
+  if (platform !== "win32") return false;
+  const commandLine = commandArgs.map((arg) => quoteWindowsCmdArg(arg)).join(" ");
+  for (const shellExecutable of resolveWindowsShellExecutableCandidatesForEnv(env, platform)) {
+    try {
+      const proc = Bun.spawn([shellExecutable, "/d", "/s", "/c", commandLine], {
+        cwd,
+        env,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const exitCode = await proc.exited;
+      return exitCode === 0;
+    } catch {
+      // Try the next shell candidate.
+    }
+  }
+  return false;
+}
+
+async function resolveSourceControlManagerGitProbe(
+  cwd: string,
+  env: Record<string, string>,
+  platform = process.platform,
+): Promise<{ ok: boolean; detail: string }> {
+  const candidates = resolveRuntimeGitExecutableCandidates(env, platform);
+  for (const candidate of candidates) {
+    if (await canSpawnCommand([candidate, "--version"], cwd, env)) {
+      return { ok: true, detail: candidate };
+    }
+  }
+
+  if (platform === "win32") {
+    for (const candidate of candidates) {
+      if (await canSpawnGitViaWindowsShell([candidate, "--version"], cwd, env, platform)) {
+        return { ok: true, detail: `${candidate} via shell` };
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    detail: candidates.join(", ") || "git",
+  };
+}
+
+export async function precheckSourceControlManagerGitAvailability(opts: {
+  repoRoot: string;
+  remote: string;
+  runtimeRoot: string;
+  preflightUsesEmbeddedRuntime: boolean;
+  sessionId?: string;
+  baseEnv?: Record<string, string | undefined>;
+  repoHasRemoteFn?: typeof repoHasRemote;
+  gitRemoteCheckFn?: typeof checkGitRemoteConfigured;
+  resolveCommandPathFn?: typeof resolveCommandPath;
+  gitProbeFn?: typeof resolveSourceControlManagerGitProbe;
+  platform?: NodeJS.Platform;
+}): Promise<SourceControlManagerGitPrecheckResult> {
+  const platform = opts.platform ?? process.platform;
+  const env = buildEmbeddedRuntimeEnv(
+    (opts.baseEnv ?? (process.env as Record<string, string | undefined>)) as Record<
+      string,
+      string | undefined
+    >,
+    {
+      repoRoot: opts.repoRoot,
+      runtimeRoot: opts.runtimeRoot,
+      useRuntimeConfig: opts.preflightUsesEmbeddedRuntime,
+      sessionId: opts.sessionId,
+    },
+  );
+
+  if (env.PUSHPALS_GIT_BIN) {
+    applyResolvedGitBinaryToRuntimeEnv(env, env.PUSHPALS_GIT_BIN, platform);
+  }
+
+  const remoteStatus = opts.gitRemoteCheckFn
+    ? await opts.gitRemoteCheckFn(opts.repoRoot, opts.remote, env)
+    : opts.repoHasRemoteFn
+      ? (await opts.repoHasRemoteFn(opts.repoRoot, opts.remote))
+        ? { status: "ok", remote: opts.remote }
+        : { status: "missing_remote", remote: opts.remote }
+      : await checkGitRemoteConfigured(opts.repoRoot, opts.remote, env);
+  if (remoteStatus.status === "missing_remote") {
+    return {
+      status: "skipped",
+      detail: `git remote "${opts.remote}" is not configured`,
+      env,
+    };
+  }
+  if (remoteStatus.status === "error") {
+    return {
+      status: "failed",
+      detail: `git remote "${opts.remote}" could not be inspected: ${remoteStatus.detail}`,
+      env,
+    };
+  }
+
+  const gitLookupCommand =
+    typeof env.PUSHPALS_GIT_BIN === "string" && env.PUSHPALS_GIT_BIN.trim()
+      ? env.PUSHPALS_GIT_BIN.trim()
+      : platform === "win32"
+        ? "git.exe"
+        : "git";
+  const resolvedGitBinary = await (opts.resolveCommandPathFn ?? resolveCommandPath)(
+    gitLookupCommand,
+    opts.repoRoot,
+    env,
+  );
+  if (resolvedGitBinary) {
+    applyResolvedGitBinaryToRuntimeEnv(env, resolvedGitBinary, platform);
+  }
+
+  const gitProbe = await (opts.gitProbeFn ?? resolveSourceControlManagerGitProbe)(
+    opts.repoRoot,
+    env,
+    platform,
+  );
+  if (!gitProbe.ok) {
+    return {
+      status: "failed",
+      detail: gitProbe.detail,
+      env,
+    };
+  }
+
+  return {
+    status: "ok",
+    detail: gitProbe.detail,
+    env,
+  };
+}
+
+async function checkGitRemoteConfigured(
+  repoRoot: string,
+  remote: string,
+  env?: Record<string, string | undefined>,
+): Promise<GitRemoteCheckResult> {
+  const normalizedRemote = String(remote ?? "").trim();
+  if (!normalizedRemote) {
+    return { status: "missing_remote", remote: normalizedRemote };
+  }
+  const result = await runGitWithEnv(
+    ["remote", "get-url", normalizedRemote],
+    repoRoot,
+    env ?? {
+      ...(process.env as Record<string, string | undefined>),
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "Never",
+    },
+  );
+  if (result.ok && result.stdout) {
+    return { status: "ok", remote: normalizedRemote };
+  }
+  const detail = result.stderr || result.stdout || `exit ${result.exitCode}`;
+  if (/no such remote/i.test(detail)) {
+    return { status: "missing_remote", remote: normalizedRemote };
+  }
+  return { status: "error", remote: normalizedRemote, detail };
+}
+
 async function repoHasRemote(repoRoot: string, remote: string): Promise<boolean> {
-  const normalizedRemote = remote.trim();
-  if (!normalizedRemote) return false;
-  const result = await runGit(["remote", "get-url", normalizedRemote], repoRoot);
-  return result.ok && Boolean(result.stdout);
+  const remoteStatus = await checkGitRemoteConfigured(repoRoot, remote);
+  return remoteStatus.status === "ok";
 }
 
 type PushpalsRemoteBranchPrecheck =
@@ -1277,9 +1583,17 @@ async function checkPushpalsBranchOnRemote(
     return { status: "ok" };
   }
 
-  const hasRemote = await repoHasRemote(repoRoot, normalizedRemote);
-  if (!hasRemote) {
+  const remoteStatus = await checkGitRemoteConfigured(repoRoot, normalizedRemote);
+  if (remoteStatus.status === "missing_remote") {
     return { status: "missing_remote", remote: normalizedRemote };
+  }
+  if (remoteStatus.status === "error") {
+    return {
+      status: "error",
+      remote: normalizedRemote,
+      branch: normalizedBranch,
+      detail: remoteStatus.detail,
+    };
   }
 
   const ref = `refs/heads/${normalizedBranch}`;
@@ -1331,6 +1645,202 @@ async function enforcePushpalsRemoteBranchPrecheck(
     `[pushpals] Precheck failed: could not verify remote branch "${result.remote}/${result.branch}": ${result.detail}`,
   );
   return false;
+}
+
+function isPathEqualOrWithin(parentPath: string, childPath: string): boolean {
+  const parent = normalizeRepoPathForComparison(parentPath);
+  const child = normalizeRepoPathForComparison(childPath);
+  return child === parent || child.startsWith(`${parent}/`);
+}
+
+function appendCliClearTarget(
+  targets: CliClearTarget[],
+  label: string,
+  pathValue: string | null | undefined,
+): void {
+  const resolvedPath = String(pathValue ?? "").trim();
+  if (!resolvedPath) return;
+  const normalized = normalizeRepoPathForComparison(resolvedPath);
+  if (targets.some((target) => normalizeRepoPathForComparison(target.path) === normalized)) return;
+  targets.push({ label, path: resolve(resolvedPath) });
+}
+
+export function buildCliClearTargets(opts: {
+  repoRoot: string;
+  runtimeRoot: string;
+  config: ClientRuntimePreflightResult["config"];
+  cliStatePath?: string | null;
+}): CliClearTarget[] {
+  const targets: CliClearTarget[] = [];
+  const dataDir = resolve(opts.config.paths.dataDir);
+  appendCliClearTarget(targets, "runtime data", dataDir);
+
+  const scmStateDir = resolve(opts.config.sourceControlManager.stateDir);
+  if (!isPathEqualOrWithin(dataDir, scmStateDir)) {
+    appendCliClearTarget(targets, "SourceControlManager state", scmStateDir);
+  }
+
+  const scmRepoPath = resolve(opts.config.sourceControlManager.repoPath);
+  if (
+    normalizeRepoPathForComparison(scmRepoPath) !== normalizeRepoPathForComparison(opts.repoRoot) &&
+    isPathEqualOrWithin(opts.repoRoot, scmRepoPath)
+  ) {
+    appendCliClearTarget(targets, "SourceControlManager worktree", scmRepoPath);
+  }
+
+  appendCliClearTarget(targets, "CLI state file", opts.cliStatePath ?? null);
+  appendCliClearTarget(
+    targets,
+    "client monitor state file",
+    resolveGitStateFilePath(opts.repoRoot, "pushpals-client-state.json"),
+  );
+  appendCliClearTarget(
+    targets,
+    "runtime bootstrap logs",
+    join(opts.runtimeRoot, "logs", "bootstrap"),
+  );
+  return targets;
+}
+
+function removeCliClearTarget(target: CliClearTarget): "removed" | "missing" | CliClearFailure {
+  if (!existsSync(target.path)) return "missing";
+  try {
+    rmSync(target.path, { recursive: true, force: true });
+    return "removed";
+  } catch (err) {
+    return {
+      ...target,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+async function requestLocalRuntimeShutdownForClear(
+  serverUrl: string,
+  repoRoot: string,
+): Promise<{ attempted: boolean; accepted: boolean; detail?: string }> {
+  if (!(await probeServer(serverUrl))) {
+    return { attempted: false, accepted: false };
+  }
+  try {
+    await ensureServerRepoAffinity(serverUrl, repoRoot);
+  } catch (err) {
+    return {
+      attempted: false,
+      accepted: false,
+      detail: `skipping shutdown because ${String(err)}`,
+    };
+  }
+
+  try {
+    const response = await fetchWithTimeout(
+      `${serverUrl}/admin/shutdown`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "pushpals --clear" }),
+      },
+      5_000,
+    );
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      return {
+        attempted: true,
+        accepted: false,
+        detail: `HTTP ${response.status}${detail ? ` ${detail}` : ""}`,
+      };
+    }
+    return { attempted: true, accepted: true };
+  } catch (err) {
+    return {
+      attempted: true,
+      accepted: false,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+async function clearPushpalsState(opts: {
+  repoRoot: string;
+  runtimeRoot: string;
+  config: ClientRuntimePreflightResult["config"];
+  serverUrl: string;
+  cliStatePath?: string | null;
+}): Promise<number> {
+  console.log("[pushpals] Clear requested. Removing repo-local PushPals state.");
+
+  const shutdown = await requestLocalRuntimeShutdownForClear(opts.serverUrl, opts.repoRoot);
+  if (shutdown.attempted && shutdown.accepted) {
+    console.log("[pushpals] Local runtime shutdown accepted; waiting for services to exit...");
+    await Bun.sleep(1_500);
+  } else if (shutdown.attempted) {
+    console.warn(
+      `[pushpals] Local runtime shutdown request was not accepted${shutdown.detail ? `: ${shutdown.detail}` : "."}`,
+    );
+  } else if (shutdown.detail) {
+    console.warn(`[pushpals] ${shutdown.detail}`);
+  }
+
+  const targets = buildCliClearTargets({
+    repoRoot: opts.repoRoot,
+    runtimeRoot: opts.runtimeRoot,
+    config: opts.config,
+    cliStatePath: opts.cliStatePath,
+  });
+  const removed: CliClearTarget[] = [];
+  const missing: CliClearTarget[] = [];
+  let failed: CliClearFailure[] = [];
+
+  for (const target of targets) {
+    const result = removeCliClearTarget(target);
+    if (result === "removed") {
+      removed.push(target);
+      continue;
+    }
+    if (result === "missing") {
+      missing.push(target);
+      continue;
+    }
+    failed.push(result);
+  }
+
+  if (failed.length > 0 && shutdown.accepted) {
+    await Bun.sleep(1_000);
+    const retryFailures: CliClearFailure[] = [];
+    for (const failure of failed) {
+      const retry = removeCliClearTarget(failure);
+      if (retry === "removed") {
+        removed.push({ label: failure.label, path: failure.path });
+        continue;
+      }
+      if (retry === "missing") {
+        missing.push({ label: failure.label, path: failure.path });
+        continue;
+      }
+      retryFailures.push(retry);
+    }
+    failed = retryFailures;
+  }
+
+  for (const target of removed) {
+    console.log(`[pushpals] Cleared ${target.label}: ${target.path}`);
+  }
+  for (const target of missing) {
+    console.log(`[pushpals] Nothing to clear for ${target.label}: ${target.path}`);
+  }
+  for (const failure of failed) {
+    console.error(
+      `[pushpals] Failed to clear ${failure.label}: ${failure.path} (${failure.detail})`,
+    );
+  }
+
+  if (failed.length > 0) {
+    console.error("[pushpals] Clear completed with errors.");
+    return 1;
+  }
+
+  console.log("[pushpals] Clear completed.");
+  return 0;
 }
 
 async function probeServer(serverUrl: string): Promise<boolean> {
@@ -1785,27 +2295,35 @@ async function autoStartRuntimeServices(opts: {
   reportRemoteBuddyAutonomousEngineState();
 
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
-  const scmRemoteAvailable = await repoHasRemote(opts.repoRoot, opts.sourceControlManagerRemote);
-  const gitForScm =
-    typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
-      ? runtimeEnv.PUSHPALS_GIT_BIN.trim()
-      : typeof runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE === "string" &&
-          runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
-        ? runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
-        : "git";
-  const gitProbeCommand = [gitForScm, "--version"];
-  const gitAvailableForScm = await canSpawnCommand(gitProbeCommand, opts.repoRoot, runtimeEnv);
-  if (!scmHealthy && scmRemoteAvailable) {
-    if (!gitAvailableForScm) {
+  const scmGitProbe = await resolveSourceControlManagerGitProbe(
+    opts.repoRoot,
+    runtimeEnv,
+    process.platform,
+  );
+  const scmRemoteStatus = await checkGitRemoteConfigured(
+    opts.repoRoot,
+    opts.sourceControlManagerRemote,
+    runtimeEnv,
+  );
+  if (!scmHealthy) {
+    if (!scmGitProbe.ok) {
       console.warn(
         "[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.",
       );
       appendRuntimeServicesLogLine(
         runtimeServicesLogPath,
-        "[pushpals] source_control_manager skipped: git is unavailable in embedded runtime env.",
+        `[pushpals] source_control_manager skipped: git is unavailable in embedded runtime env (${scmGitProbe.detail}).`,
       );
-    } else {
-      console.log(`[pushpals] Embedded SourceControlManager git=${gitForScm}`);
+    } else if (scmRemoteStatus.status === "error") {
+      console.warn(
+        `[pushpals] Could not inspect SourceControlManager git remote "${opts.sourceControlManagerRemote}"; skipping SCM startup.`,
+      );
+      appendRuntimeServicesLogLine(
+        runtimeServicesLogPath,
+        `[pushpals] source_control_manager skipped: remote "${opts.sourceControlManagerRemote}" could not be inspected (${scmRemoteStatus.detail}).`,
+      );
+    } else if (scmRemoteStatus.status === "ok") {
+      console.log(`[pushpals] Embedded SourceControlManager git=${scmGitProbe.detail}`);
       console.log("[pushpals] Starting embedded SourceControlManager...");
       const sourceControlManagerService = spawnRuntimeService(
         "source_control_manager",
@@ -1817,23 +2335,15 @@ async function autoStartRuntimeServices(opts: {
       );
       services.push(sourceControlManagerService);
       console.log(`[pushpals] source_control_manager log: ${sourceControlManagerService.logPath}`);
+    } else {
+      console.log(
+        `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
+      );
+      appendRuntimeServicesLogLine(
+        runtimeServicesLogPath,
+        `[pushpals] source_control_manager skipped: repo has no remote "${opts.sourceControlManagerRemote}".`,
+      );
     }
-  } else if (!scmRemoteAvailable) {
-    console.log(
-      `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
-    );
-    appendRuntimeServicesLogLine(
-      runtimeServicesLogPath,
-      `[pushpals] source_control_manager skipped: repo has no remote "${opts.sourceControlManagerRemote}".`,
-    );
-  } else if (!gitAvailableForScm) {
-    console.warn(
-      "[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.",
-    );
-    appendRuntimeServicesLogLine(
-      runtimeServicesLogPath,
-      "[pushpals] source_control_manager skipped: git is unavailable in embedded runtime env.",
-    );
   } else {
     console.log("[pushpals] SourceControlManager already healthy; skipping embedded start.");
     appendRuntimeServicesLogLine(
@@ -2586,6 +3096,22 @@ async function main(): Promise<void> {
     runtimeRoot: parsed.runtimeRoot,
     runtimeTag: parsed.runtimeTag,
   });
+  const config = preparedRuntime.runtimePreflight.config;
+  const statePath = resolveCliStatePath(repoRoot);
+  if (parsed.clear) {
+    const serverUrl = normalizeLoopbackUrl(
+      parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL,
+      config.server.url,
+    );
+    const exitCode = await clearPushpalsState({
+      repoRoot,
+      runtimeRoot: preparedRuntime.runtimeRoot,
+      config,
+      serverUrl,
+      cliStatePath: statePath,
+    });
+    process.exit(exitCode);
+  }
   console.log("[pushpals] Running runtime preflight...");
   console.log(`[pushpals] runtimeRoot=${preparedRuntime.runtimeRoot}`);
   if (preparedRuntime.runtimeTag) {
@@ -2600,13 +3126,24 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const config = preparedRuntime.runtimePreflight.config;
   if (config.remotebuddy.autonomy.enabled) {
     console.log("[pushpals] RemoteBuddy autonomy is enabled for CLI.");
   } else {
     console.warn(
       "[pushpals] RemoteBuddy autonomy is disabled in config (remotebuddy.autonomy.enabled=false); continuing.",
     );
+  }
+  const scmGitPrecheck = await precheckSourceControlManagerGitAvailability({
+    repoRoot,
+    remote: config.sourceControlManager.remote,
+    runtimeRoot: preparedRuntime.runtimeRoot,
+    preflightUsesEmbeddedRuntime: preparedRuntime.preflightUsesEmbeddedRuntime,
+  });
+  if (scmGitPrecheck.status === "failed") {
+    console.error(
+      `[pushpals] Precheck failed: embedded SourceControlManager git command is unavailable (${scmGitPrecheck.detail}).`,
+    );
+    process.exit(1);
   }
   const precheckPassed = await enforcePushpalsRemoteBranchPrecheck(
     repoRoot,
@@ -2727,7 +3264,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const statePath = resolveCliStatePath(repoRoot);
   const saved = statePath ? readCliState(statePath) : {};
   pushpalsLogPath =
     pushpalsLogPath || (typeof saved.pushpalsLogPath === "string" ? saved.pushpalsLogPath : undefined);

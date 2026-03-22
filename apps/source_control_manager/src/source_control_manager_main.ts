@@ -13,6 +13,7 @@ import { deriveReviewPrHeadBranch } from "./review_pr_branch";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
 import { createStatusServer } from "./http";
+import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
 import {
   loadConfig,
   applyCliOverrides,
@@ -28,8 +29,8 @@ type GitCmdResult = {
   exitCode: number;
 };
 
-const repoRoot = resolve(import.meta.dir, "..", "..", "..");
 const PUSH_CONFIG = loadPushPalsConfig();
+const repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
 const defaultSourceControlManagerRepoPath = resolve(PUSH_CONFIG.sourceControlManager.repoPath);
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
