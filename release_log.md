@@ -2,16 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.14`
-- start_commit: `e62fd410887503ec88b440dd668996dea4aba548`
-- end_commit: `e62fd410887503ec88b440dd668996dea4aba548`
+- version: `v1.0.15`
+- start_commit: `58328498136a55998422f097e8fe2364ca320413`
+- end_commit: `58328498136a55998422f097e8fe2364ca320413`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Make embedded SourceControlManager resilient to Git resolution failures by retrying across Git executable candidates instead of hard-failing on one path.
-- Prefer PATH-based Git invocation first for SCM startup/runtime operations, with absolute Git path fallback for cross-platform robustness.
-- Add regression coverage proving SCM falls back to PATH Git when an absolute override cannot be spawned.
+- Harden SourceControlManager git command execution on Windows by expanding executable candidates, adding a `cmd.exe` fallback path, and surfacing aggregated spawn diagnostics.
+- Add a blocking CLI startup precheck that verifies the configured PushPals branch exists on `origin`, and fail fast when it is missing.
+- Make CLI git precheck non-interactive (`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=Never`) to avoid startup hangs during remote validation.
+- Add a clear startup alias log line (`pushpals log: ...`) pointing to the runtime services log for easier troubleshooting.
+- Extend CLI invocation logging tests for missing-branch fail-fast behavior and environment-dependent stderr output handling.
 
 ## Install
 
@@ -42,4 +44,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.14 && git push origin v1.0.14`.
+- Tag and push: `git tag v1.0.15 && git push origin v1.0.15`.
