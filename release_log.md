@@ -2,18 +2,19 @@
 
 ## Release Metadata
 
-- version: `v1.0.15`
-- start_commit: `58328498136a55998422f097e8fe2364ca320413`
-- end_commit: `58328498136a55998422f097e8fe2364ca320413`
+- version: `v1.0.16`
+- start_commit: `b7eccf752996cdaee64a396f8ecefc3bb01dc740`
+- end_commit: `b7eccf752996cdaee64a396f8ecefc3bb01dc740`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Harden SourceControlManager git command execution on Windows by expanding executable candidates, adding a `cmd.exe` fallback path, and surfacing aggregated spawn diagnostics.
-- Add a blocking CLI startup precheck that verifies the configured PushPals branch exists on `origin`, and fail fast when it is missing.
-- Make CLI git precheck non-interactive (`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=Never`) to avoid startup hangs during remote validation.
-- Add a clear startup alias log line (`pushpals log: ...`) pointing to the runtime services log for easier troubleshooting.
-- Extend CLI invocation logging tests for missing-branch fail-fast behavior and environment-dependent stderr output handling.
+- Add WorkerPal to the embedded CLI runtime artifact set so installed `pushpals` releases can bootstrap a WorkerPal backend instead of assuming a source checkout layout.
+- Update the release pipeline to compile and publish `pushpals-runtime-workerpals` binaries for Windows, macOS, and Linux alongside the existing runtime services.
+- Teach RemoteBuddy to prefer an embedded WorkerPal binary when available, while retaining source-checkout fallback for local development.
+- Correct the WorkerPal spawn contract so execution happens against the target repo root and passes `--repo` explicitly, rather than changing cwd to `apps/workerpals`.
+- Prevent false user-facing delegation confirmations by only announcing WorkerPal handoff after worker availability has been established.
+- Extend CLI/runtime tests to cover the embedded WorkerPal artifact path and the revised WorkerPal spawn command shape.
 
 ## Install
 
@@ -44,4 +45,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.15 && git push origin v1.0.15`.
+- Tag and push: `git tag v1.0.16 && git push origin v1.0.16`.
