@@ -237,6 +237,95 @@ enabled = true
   );
 
   test(
+    "fails fast when the configured pushpals branch is missing on remote origin",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-remote-branch-precheck-"));
+      const repoRoot = join(root, "repo");
+      const remoteRepoRoot = join(root, "remote.git");
+      const runtimeRoot = join(root, "runtime");
+
+      try {
+        mkdirSync(repoRoot, { recursive: true });
+        const init = Bun.spawnSync(["git", "init"], {
+          cwd: repoRoot,
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        expect(init.exitCode).toBe(0);
+        const initRemote = Bun.spawnSync(["git", "init", "--bare", remoteRepoRoot], {
+          cwd: root,
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        expect(initRemote.exitCode).toBe(0);
+        const addRemote = Bun.spawnSync(["git", "remote", "add", "origin", remoteRepoRoot], {
+          cwd: repoRoot,
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        expect(addRemote.exitCode).toBe(0);
+
+        mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+        writeFileSync(join(runtimeRoot, ".env"), "PUSHPALS_PROFILE=dev\n", "utf8");
+        writeFileSync(join(runtimeRoot, ".env.example"), "PUSHPALS_PROFILE=dev\n", "utf8");
+        writeFileSync(join(runtimeRoot, "configs", "local.toml"), "# local overrides\n", "utf8");
+        writeFileSync(
+          join(runtimeRoot, "configs", "default.toml"),
+          `profile = "dev"
+session_id = "dev"
+
+[server]
+url = "http://127.0.0.1:3991"
+
+[localbuddy]
+enabled = false
+port = 3003
+
+[source_control_manager]
+remote = "origin"
+pushpals_branch = "main_agents"
+
+[remotebuddy.autonomy]
+enabled = false
+`,
+          "utf8",
+        );
+
+        const proc = Bun.spawn(
+          [
+            bunExecPath,
+            cliScriptPath,
+            "--no-auto-start",
+            "--runtime-root",
+            runtimeRoot,
+          ],
+          {
+            cwd: repoRoot,
+            stdout: "pipe",
+            stderr: "pipe",
+            env: {
+              ...process.env,
+              PUSHPALS_CLI_PACKAGE_VERSION: "1.0.15-test",
+            },
+          },
+        );
+
+        const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+        expect(code).toBe(1);
+        expect(stderr).toContain('Precheck failed: remote branch "origin/main_agents" was not found.');
+        expect(stderr).toContain(
+          "Precheck failed: create/push that branch first or set source_control_manager.pushpals_branch to an existing remote branch.",
+        );
+        expect(stderr).not.toContain("Server is unavailable");
+        expect(stderr).not.toContain("Repo affinity check failed");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    15000,
+  );
+
+  test(
     "refuses to attach to a healthy server that belongs to a different repo",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-repo-affinity-"));
@@ -423,7 +512,10 @@ enabled = false
         expect(stderr).toContain(
           "RemoteBuddy autonomy is disabled in config (remotebuddy.autonomy.enabled=false); continuing.",
         );
-        expect(stderr).toContain("Server is unavailable at http://127.0.0.1:");
+        expect(
+          stderr.includes("Server is unavailable at http://127.0.0.1:") ||
+            stderr.includes("[pushpals] Repo affinity check failed:"),
+        ).toBe(true);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -702,7 +794,12 @@ enabled = true
         ]);
 
         expect(code).toBe(0);
-        expect(stderr.trim()).toBe("");
+        expect(
+          stderr.trim() === "" ||
+            stderr.includes(
+              'Precheck: git remote "origin" is not configured in this repo; cannot verify pushpals branch.',
+            ),
+        ).toBe(true);
         expect(stdout).toContain("[pushpals] Connected.");
         expect(stdout).toContain(`[pushpals] sessionId=${targetSessionId}`);
         expect(createdSessions.has(targetSessionId)).toBe(true);

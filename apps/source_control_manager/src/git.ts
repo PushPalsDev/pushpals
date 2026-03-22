@@ -54,13 +54,111 @@ function formatGitSpawnFailure(gitExecutable: string, err: unknown): string {
   return `spawn ${gitExecutable} failed: ${err instanceof Error ? err.message : String(err)}`;
 }
 
+function quoteWindowsCmdArg(value: string): string {
+  const str = String(value ?? "");
+  if (!str.length) return '""';
+  if (!/[ \t"]/.test(str)) return str;
+  const escaped = str.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/g, "$1$1");
+  return `"${escaped}"`;
+}
+
+function isWindowsCommandNotFound(output: string, exitCode: number): boolean {
+  if (exitCode === 9009) return true;
+  return /is not recognized as an internal or external command/i.test(output);
+}
+
+async function runViaWindowsCmd(
+  repoPath: string,
+  commandArgs: string[],
+  timeout?: number,
+): Promise<GitResult> {
+  const commandLine = commandArgs.map((arg) => quoteWindowsCmdArg(arg)).join(" ");
+  const proc = Bun.spawn(["cmd.exe", "/d", "/s", "/c", commandLine], {
+    cwd: repoPath,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (timeout) {
+    timer = setTimeout(() => proc.kill(), timeout);
+  }
+
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+
+  const exitCode = await proc.exited;
+  if (timer) clearTimeout(timer);
+
+  return {
+    ok: exitCode === 0,
+    stdout: stdout.trim(),
+    stderr: stderr.trim(),
+    exitCode,
+  };
+}
+
+async function expandWindowsGitExecutableCandidates(
+  repoPath: string,
+  candidates: string[],
+): Promise<string[]> {
+  if (process.platform !== "win32") return candidates;
+
+  const expanded: string[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (value: string): void => {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed) return;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    expanded.push(trimmed);
+  };
+
+  for (const candidate of candidates) {
+    const hasPath = /[\\/]/.test(candidate) || /^[A-Za-z]:/.test(candidate);
+    if (!hasPath) {
+      try {
+        const proc = Bun.spawn(["where.exe", candidate], {
+          cwd: repoPath,
+          env: process.env as Record<string, string | undefined>,
+          stdout: "pipe",
+          stderr: "ignore",
+        });
+        const [stdout, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          proc.exited,
+        ]);
+        if (exitCode === 0) {
+          for (const resolved of stdout
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)) {
+            pushCandidate(resolved);
+          }
+        }
+      } catch {
+        // Keep the original candidate even if where lookup fails.
+      }
+    }
+    pushCandidate(candidate);
+  }
+
+  return expanded.length > 0 ? expanded : candidates;
+}
+
 export async function runGitCommandCapture(
   repoPath: string,
   args: string[],
   opts?: { timeout?: number; githubToken?: string },
 ): Promise<GitResult> {
-  const gitExecutables = resolveGitExecutableCandidatesFromEnv();
-  let lastSpawnFailure = "";
+  const gitExecutables = await expandWindowsGitExecutableCandidates(
+    repoPath,
+    resolveGitExecutableCandidatesFromEnv(),
+  );
+  const spawnFailures: string[] = [];
 
   for (const gitExecutable of gitExecutables) {
     const gitArgs =
@@ -84,7 +182,21 @@ export async function runGitCommandCapture(
         stderr: "pipe",
       });
     } catch (err) {
-      lastSpawnFailure = formatGitSpawnFailure(gitExecutable, err);
+      spawnFailures.push(formatGitSpawnFailure(gitExecutable, err));
+      if (process.platform === "win32") {
+        try {
+          const shellResult = await runViaWindowsCmd(repoPath, gitArgs, opts?.timeout);
+          const output = [shellResult.stdout, shellResult.stderr].filter(Boolean).join("\n");
+          if (!isWindowsCommandNotFound(output, shellResult.exitCode)) {
+            return shellResult;
+          }
+          spawnFailures.push(
+            `spawn ${gitExecutable} via cmd.exe failed: ${shellResult.stderr || shellResult.stdout || `exit ${shellResult.exitCode}`}`,
+          );
+        } catch (shellErr) {
+          spawnFailures.push(formatGitSpawnFailure("cmd.exe", shellErr));
+        }
+      }
       continue;
     }
 
@@ -112,7 +224,10 @@ export async function runGitCommandCapture(
   return {
     ok: false,
     stdout: "",
-    stderr: lastSpawnFailure || "spawn git failed: no executable candidates were available",
+    stderr:
+      spawnFailures.length > 0
+        ? spawnFailures.join(" | ")
+        : "spawn git failed: no executable candidates were available",
     exitCode: 127,
   };
 }

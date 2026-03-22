@@ -362,6 +362,11 @@ async function runGit(
 }> {
   const proc = Bun.spawn(["git", ...args], {
     cwd,
+    env: {
+      ...(process.env as Record<string, string | undefined>),
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "Never",
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -1245,6 +1250,79 @@ async function repoHasRemote(repoRoot: string, remote: string): Promise<boolean>
   return result.ok && Boolean(result.stdout);
 }
 
+type PushpalsRemoteBranchPrecheck =
+  | { status: "ok" }
+  | { status: "missing_remote"; remote: string }
+  | { status: "missing_branch"; remote: string; branch: string }
+  | { status: "error"; remote: string; branch: string; detail: string };
+
+async function checkPushpalsBranchOnRemote(
+  repoRoot: string,
+  remote: string,
+  branch: string,
+): Promise<PushpalsRemoteBranchPrecheck> {
+  const normalizedRemote = String(remote ?? "").trim();
+  const normalizedBranch = String(branch ?? "").trim();
+  if (!normalizedRemote || !normalizedBranch) {
+    return { status: "ok" };
+  }
+
+  const hasRemote = await repoHasRemote(repoRoot, normalizedRemote);
+  if (!hasRemote) {
+    return { status: "missing_remote", remote: normalizedRemote };
+  }
+
+  const ref = `refs/heads/${normalizedBranch}`;
+  const result = await runGit(["ls-remote", "--heads", normalizedRemote, ref], repoRoot);
+  if (!result.ok) {
+    const detail = result.stderr || result.stdout || `exit ${result.exitCode}`;
+    return {
+      status: "error",
+      remote: normalizedRemote,
+      branch: normalizedBranch,
+      detail,
+    };
+  }
+
+  if (!result.stdout.trim()) {
+    return {
+      status: "missing_branch",
+      remote: normalizedRemote,
+      branch: normalizedBranch,
+    };
+  }
+
+  return { status: "ok" };
+}
+
+async function enforcePushpalsRemoteBranchPrecheck(
+  repoRoot: string,
+  remote: string,
+  branch: string,
+): Promise<boolean> {
+  const result = await checkPushpalsBranchOnRemote(repoRoot, remote, branch);
+  if (result.status === "ok") return true;
+  if (result.status === "missing_remote") {
+    console.warn(
+      `[pushpals] Precheck: git remote "${result.remote}" is not configured in this repo; cannot verify pushpals branch.`,
+    );
+    return true;
+  }
+  if (result.status === "missing_branch") {
+    console.error(
+      `[pushpals] Precheck failed: remote branch "${result.remote}/${result.branch}" was not found.`,
+    );
+    console.error(
+      "[pushpals] Precheck failed: create/push that branch first or set source_control_manager.pushpals_branch to an existing remote branch.",
+    );
+    return false;
+  }
+  console.error(
+    `[pushpals] Precheck failed: could not verify remote branch "${result.remote}/${result.branch}": ${result.detail}`,
+  );
+  return false;
+}
+
 async function probeServer(serverUrl: string): Promise<boolean> {
   try {
     const response = await fetchWithTimeout(`${serverUrl}/healthz`, {}, HTTP_TIMEOUT_MS);
@@ -1574,6 +1652,7 @@ async function autoStartRuntimeServices(opts: {
   appendRuntimeServicesLogLine(runtimeServicesLogPath, `[pushpals] runtimeRoot=${runtimeRoot}`);
   appendRuntimeServicesLogLine(runtimeServicesLogPath, `[pushpals] runtimeTag=${runtimeTag}`);
   appendRuntimeServicesLogLine(runtimeServicesLogPath, `[pushpals] repoRoot=${opts.repoRoot}`);
+  console.log(`[pushpals] pushpals log: ${runtimeServicesLogPath}`);
   console.log(`[pushpals] runtime services log: ${runtimeServicesLogPath}`);
   console.log(`[pushpals] service log (server)=${serviceLogPaths.server}`);
   console.log(`[pushpals] service log (localbuddy)=${serviceLogPaths.localbuddy}`);
@@ -2512,6 +2591,14 @@ async function main(): Promise<void> {
     console.warn(
       "[pushpals] RemoteBuddy autonomy is disabled in config (remotebuddy.autonomy.enabled=false); continuing.",
     );
+  }
+  const precheckPassed = await enforcePushpalsRemoteBranchPrecheck(
+    repoRoot,
+    config.sourceControlManager.remote,
+    config.sourceControlManager.mainBranch,
+  );
+  if (!precheckPassed) {
+    process.exit(1);
   }
   const serverUrl = normalizeLoopbackUrl(
     parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL,
