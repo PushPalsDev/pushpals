@@ -1,28 +1,38 @@
 export type WorkerSpawnCommandOptions = {
   server: string;
   workerId: string;
+  repoRoot: string;
   pollMs: number | null;
   heartbeatMs: number | null;
   labels: string[];
   docker: boolean;
   requireDocker: boolean;
   dockerImage: string | null;
+  binaryPath?: string | null;
+  envFile?: string | null;
+  entrypoint?: string | null;
 };
 
 export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): string[] {
-  const args = [
-    "bun",
-    "run",
-    "--cwd",
-    "apps/workerpals",
-    "--env-file",
-    "../../.env",
-    "src/workerpals_main.ts",
-    "--server",
-    options.server,
-    "--workerId",
-    options.workerId,
-  ];
+  const binaryPath = String(options.binaryPath ?? "").trim();
+  const envFile = String(options.envFile ?? "").trim() || ".env";
+  const entrypoint =
+    String(options.entrypoint ?? "").trim() || "apps/workerpals/src/workerpals_main.ts";
+  const args = binaryPath
+    ? [binaryPath, "--server", options.server, "--workerId", options.workerId, "--repo", options.repoRoot]
+    : [
+        "bun",
+        "run",
+        "--env-file",
+        envFile,
+        entrypoint,
+        "--server",
+        options.server,
+        "--workerId",
+        options.workerId,
+        "--repo",
+        options.repoRoot,
+      ];
   if (options.pollMs) {
     args.push("--poll", String(options.pollMs));
   }

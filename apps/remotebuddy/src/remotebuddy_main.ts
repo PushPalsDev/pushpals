@@ -34,7 +34,8 @@ import {
   normalizeWriteGlob,
 } from "shared";
 import type { AutonomyComponentArea } from "shared";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
+import { resolve } from "path";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {
   extractExplicitTargetPath,
@@ -707,7 +708,7 @@ export class RemoteBuddyOrchestrator {
   private readonly jobsDbPath: string;
   private readonly workerOnlineTtlMs: number;
   private readonly waitForWorkerMs: number;
-  private readonly autoSpawnWorkers: boolean;
+  private autoSpawnWorkers: boolean;
   private readonly maxWorkers: number;
   private readonly workerStartupTimeoutMs: number;
   private readonly spawnWorkerDocker: boolean;
@@ -716,6 +717,10 @@ export class RemoteBuddyOrchestrator {
   private readonly spawnWorkerPollMs: number | null;
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
+  private readonly workerpalsBinaryPath: string | null;
+  private readonly workerpalsEnvFile: string | null;
+  private readonly workerpalsEntrypoint: string | null;
+  private workerpalsUnavailableReason: string | null;
   private readonly statusHeartbeatMs: number;
   private readonly fetchFailureLogsOnJobFailure: boolean;
   private readonly executionBudgetInteractiveMs: number;
@@ -798,6 +803,10 @@ export class RemoteBuddyOrchestrator {
         ? remoteCfg.workerpalHeartbeatMs
         : null;
     this.spawnWorkerLabels = remoteCfg.workerpalLabels;
+    this.workerpalsBinaryPath = null;
+    this.workerpalsEnvFile = null;
+    this.workerpalsEntrypoint = null;
+    this.workerpalsUnavailableReason = null;
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
     this.fetchFailureLogsOnJobFailure = parseEnabledFlag(
       process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS,
@@ -821,6 +830,31 @@ export class RemoteBuddyOrchestrator {
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
+    const embeddedWorkerpalsBinary = String(process.env.PUSHPALS_WORKERPALS_BIN ?? "").trim();
+    const workerpalsEntrypoint = resolve(
+      this.repo,
+      "apps",
+      "workerpals",
+      "src",
+      "workerpals_main.ts",
+    );
+    if (embeddedWorkerpalsBinary && existsSync(embeddedWorkerpalsBinary)) {
+      this.workerpalsBinaryPath = embeddedWorkerpalsBinary;
+    } else if (existsSync(workerpalsEntrypoint)) {
+      this.workerpalsEntrypoint = workerpalsEntrypoint;
+      const envPath = resolve(this.repo, ".env");
+      this.workerpalsEnvFile = existsSync(envPath) ? envPath : null;
+    } else if (this.autoSpawnWorkers) {
+      this.autoSpawnWorkers = false;
+      this.workerpalsUnavailableReason =
+        embeddedWorkerpalsBinary
+          ? `WorkerPal embedded binary is missing (${embeddedWorkerpalsBinary}) and source entrypoint is missing (${workerpalsEntrypoint})`
+          : `WorkerPal source entrypoint is missing (${workerpalsEntrypoint})`;
+      console.warn(`[RemoteBuddy] Auto-spawn disabled: ${this.workerpalsUnavailableReason}.`);
+      console.warn(
+        "[RemoteBuddy] No embedded WorkerPal runtime is available for auto-spawn; start WorkerPals manually if execution workers are required.",
+      );
+    }
     if (this.memoryEnabled) {
       this.persistentMemory.purgeExpired(this.memoryRetentionDays, this.repo);
     }
@@ -1804,12 +1838,16 @@ export class RemoteBuddyOrchestrator {
     return buildWorkerSpawnCommand({
       server: this.server,
       workerId,
+      repoRoot: this.repo,
       pollMs: this.spawnWorkerPollMs,
       heartbeatMs: this.spawnWorkerHeartbeatMs,
       labels: this.spawnWorkerLabels,
       docker: this.spawnWorkerDocker,
       requireDocker: this.spawnWorkerRequireDocker,
       dockerImage: this.spawnWorkerImage,
+      binaryPath: this.workerpalsBinaryPath,
+      envFile: this.workerpalsEnvFile,
+      entrypoint: this.workerpalsEntrypoint,
     });
   }
 
@@ -2146,6 +2184,34 @@ export class RemoteBuddyOrchestrator {
         return;
       }
 
+      const taskId = randomUUID();
+      const targetWorkerId = await this.selectTargetWorkerForJob();
+      if (!targetWorkerId && !this.autoSpawnWorkers) {
+        const onlineWorkers = (await this.fetchWorkers()).filter(
+          (worker) => worker.isOnline && worker.status !== "offline",
+        );
+        if (onlineWorkers.length === 0) {
+          const detail =
+            this.workerpalsUnavailableReason ??
+            "No online WorkerPal backends and auto-spawn is disabled";
+          const userMessage =
+            "WorkerPal execution is currently unavailable in this runtime. " + detail;
+          console.warn(`[RemoteBuddy] ${userMessage}`);
+          await this.assistantMessage(requestSessionId, userMessage, {
+            turnId,
+            correlationId: requestId,
+          });
+          await fetch(`${this.server}/requests/${requestId}/fail`, {
+            method: "POST",
+            headers: this.authHeaders(),
+            body: JSON.stringify({
+              message: "WorkerPal backend unavailable",
+              detail,
+            }),
+          }).catch(() => {});
+          return;
+        }
+      }
       await this.assistantMessage(
         requestSessionId,
         "Understood. I am delegating this to a WorkerPal now.",
@@ -2154,9 +2220,6 @@ export class RemoteBuddyOrchestrator {
           correlationId: requestId,
         },
       );
-
-      const taskId = randomUUID();
-      const targetWorkerId = await this.selectTargetWorkerForJob();
       const executionBudgetMs = this.executionBudgetForPriority(priority);
       const strictTargetPaths = targetPaths.filter((entry) => entry && entry !== ".");
       const baseParams: BaseTaskExecuteJobParams = {

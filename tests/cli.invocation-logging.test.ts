@@ -916,6 +916,11 @@ enabled = true
           "utf8",
         );
         writeFileSync(
+          join(binDir, `pushpals-runtime-workerpals-${platformKey}${extension}`),
+          "",
+          "utf8",
+        );
+        writeFileSync(
           join(binDir, `pushpals-runtime-source-control-manager-${platformKey}${extension}`),
           "",
           "utf8",

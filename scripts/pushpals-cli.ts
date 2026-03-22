@@ -47,6 +47,7 @@ type CliState = {
   localAgentUrl?: string;
   sessionId?: string;
   repoRoot?: string;
+  pushpalsLogPath?: string;
   updatedAt?: string;
 };
 
@@ -80,6 +81,7 @@ type RemoteBuddySessionConsumerHealth = {
 type RemoteBuddyAutonomousEngineState = "unknown" | "enabled" | "disabled";
 
 type RuntimeServiceName = "server" | "localbuddy" | "remotebuddy" | "source_control_manager";
+type RuntimeBinaryName = RuntimeServiceName | "workerpals";
 
 type RuntimeServiceLogPaths = Record<RuntimeServiceName, string>;
 
@@ -95,6 +97,7 @@ type RuntimeBinarySet = {
   server: string;
   localbuddy: string;
   remotebuddy: string;
+  workerpals: string;
   sourceControlManager: string;
 };
 
@@ -112,6 +115,11 @@ type PreparedCliRuntime = {
   runtimeTag: string;
   runtimePreflight: ClientRuntimePreflightResult;
   preflightUsesEmbeddedRuntime: boolean;
+};
+
+type AutoStartedRuntime = {
+  services: RuntimeServiceProcess[];
+  pushpalsLogPath: string;
 };
 
 type MonitoringHubHandle = {
@@ -815,7 +823,7 @@ function emitCliRuntimePreflight(result: ClientRuntimePreflightResult): void {
   for (const line of lines) console.error(line);
 }
 
-function runtimeBinaryFilename(serviceName: RuntimeServiceName, platformKey: string): string {
+function runtimeBinaryFilename(serviceName: RuntimeBinaryName, platformKey: string): string {
   const serviceToken =
     serviceName === "source_control_manager" ? "source-control-manager" : serviceName;
   const extension = platformKey.startsWith("windows-") ? ".exe" : "";
@@ -1025,6 +1033,7 @@ async function ensureRuntimeBinaries(
     server: join(binDir, runtimeBinaryFilename("server", platformKey)),
     localbuddy: join(binDir, runtimeBinaryFilename("localbuddy", platformKey)),
     remotebuddy: join(binDir, runtimeBinaryFilename("remotebuddy", platformKey)),
+    workerpals: join(binDir, runtimeBinaryFilename("workerpals", platformKey)),
     sourceControlManager: join(
       binDir,
       runtimeBinaryFilename("source_control_manager", platformKey),
@@ -1035,6 +1044,7 @@ async function ensureRuntimeBinaries(
     runtimeBinaries.server,
     runtimeBinaries.localbuddy,
     runtimeBinaries.remotebuddy,
+    runtimeBinaries.workerpals,
     runtimeBinaries.sourceControlManager,
   ];
   let downloadedCount = 0;
@@ -1602,7 +1612,7 @@ async function autoStartRuntimeServices(opts: {
   preparedRuntime: PreparedCliRuntime;
   requestedRuntimeTag?: string;
   startLocalBuddy?: boolean;
-}): Promise<RuntimeServiceProcess[]> {
+}): Promise<AutoStartedRuntime> {
   const { runtimePreflight } = opts.preparedRuntime;
   const runtimeRoot = opts.preparedRuntime.runtimeRoot;
   const runtimeTag =
@@ -1626,6 +1636,7 @@ async function autoStartRuntimeServices(opts: {
     useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
     sessionId: opts.sessionId,
   });
+  runtimeEnv.PUSHPALS_WORKERPALS_BIN = runtimeBinaries.workerpals;
   if (runtimeEnv.PUSHPALS_GIT_BIN) {
     applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, runtimeEnv.PUSHPALS_GIT_BIN);
   }
@@ -1916,7 +1927,10 @@ async function autoStartRuntimeServices(opts: {
         runtimeServicesLogPath,
         "[pushpals] embedded runtime is ready.",
       );
-      return services;
+      return {
+        services,
+        pushpalsLogPath: runtimeServicesLogPath,
+      };
     }
     await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
   }
@@ -1963,6 +1977,8 @@ function readCliState(pathValue: string): CliState {
       localAgentUrl: typeof parsed.localAgentUrl === "string" ? parsed.localAgentUrl : undefined,
       sessionId: typeof parsed.sessionId === "string" ? parsed.sessionId : undefined,
       repoRoot: typeof parsed.repoRoot === "string" ? parsed.repoRoot : undefined,
+      pushpalsLogPath:
+        typeof parsed.pushpalsLogPath === "string" ? parsed.pushpalsLogPath : undefined,
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : undefined,
     };
   } catch {
@@ -2621,6 +2637,7 @@ async function main(): Promise<void> {
     repoRoot,
   };
   let autoStartedServices: RuntimeServiceProcess[] = [];
+  let pushpalsLogPath: string | undefined;
   const stopAutoStartedServices = (): void => {
     if (autoStartedServices.length === 0) return;
     stopRuntimeServices(autoStartedServices);
@@ -2636,7 +2653,7 @@ async function main(): Promise<void> {
   if (!serverHealthy) {
     if (!parsed.noAutoStart) {
       try {
-        autoStartedServices = await autoStartRuntimeServices({
+        const startedRuntime = await autoStartRuntimeServices({
           repoRoot,
           serverUrl,
           localAgentUrl,
@@ -2650,6 +2667,8 @@ async function main(): Promise<void> {
             Boolean(config.localbuddy.enabled),
           ),
         });
+        autoStartedServices = startedRuntime.services;
+        pushpalsLogPath = startedRuntime.pushpalsLogPath;
         serverHealthy = await probeServer(serverUrl);
       } catch (err) {
         console.error(`[pushpals] Auto-start failed: ${String(err)}`);
@@ -2710,6 +2729,8 @@ async function main(): Promise<void> {
 
   const statePath = resolveCliStatePath(repoRoot);
   const saved = statePath ? readCliState(statePath) : {};
+  pushpalsLogPath =
+    pushpalsLogPath || (typeof saved.pushpalsLogPath === "string" ? saved.pushpalsLogPath : undefined);
   const preferredHubUrl = normalizeUrl(
     parsed.monitoringHubUrl ?? process.env.PUSHPALS_MONITOR_URL ?? saved.monitoringHubUrl ?? "",
   );
@@ -2729,6 +2750,7 @@ async function main(): Promise<void> {
       localAgentUrl,
       sessionId: activeSessionId,
       repoRoot,
+      pushpalsLogPath,
     });
   } else {
     console.warn("[pushpals] Could not resolve git metadata dir; skipping CLI state persistence.");
@@ -2746,6 +2768,7 @@ async function main(): Promise<void> {
   console.log(`[pushpals] serverUrl=${serverUrl}`);
   console.log(`[pushpals] sessionId=${activeSessionId}`);
   console.log(`[pushpals] repoRoot=${repoRoot}`);
+  console.log(`[pushpals] pushpalsLog=${pushpalsLogPath ?? "unavailable"}`);
   console.log(`[pushpals] cliStateFile=${statePath ?? "unavailable"}`);
   if (parsed.runtimeOnly) {
     console.log("[pushpals] runtimeOnly=true");
@@ -2867,6 +2890,7 @@ async function main(): Promise<void> {
       console.log(`[pushpals] serverUrl=${serverUrl}`);
       console.log(`[pushpals] sessionId=${activeSessionId}`);
       console.log(`[pushpals] repoRoot=${repoRoot}`);
+      console.log(`[pushpals] pushpalsLog=${pushpalsLogPath ?? "unavailable"}`);
       console.log(
         monitoringHubUrl
           ? `[pushpals] monitoringHubUrl=${monitoringHubUrl}`
