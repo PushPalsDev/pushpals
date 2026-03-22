@@ -149,4 +149,30 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.ok).toBe(false);
     expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
+
+  test("allows autonomy-origin generic repo scope without declared componentArea", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      targetPaths: ["src/autonomy.ts"],
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["src/autonomy.ts"],
+      },
+      finalizationBudgetMs: 0,
+    };
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        origin: "autonomy",
+        instruction: "adjust the autonomy loop in src/autonomy.ts",
+        planning,
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).not.toContain("componentArea");
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
+  });
 });

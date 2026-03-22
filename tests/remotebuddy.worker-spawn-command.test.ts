@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { buildWorkerSpawnCommand } from "../apps/remotebuddy/src/worker_spawn";
+import {
+  buildWorkerSpawnCommand,
+  resolveWorkerStartupTimeoutMs,
+} from "../apps/remotebuddy/src/worker_spawn";
 
 describe("remotebuddy worker spawn command", () => {
   test("builds bun run command with valid argument ordering", () => {
@@ -106,5 +109,29 @@ describe("remotebuddy worker spawn command", () => {
     expect(command).toContain("--docker");
     expect(command).not.toContain("bun");
     expect(command).not.toContain("--env-file");
+  });
+
+  test("uses a higher startup timeout floor for Docker-backed workers", () => {
+    expect(
+      resolveWorkerStartupTimeoutMs({
+        configuredMs: 10_000,
+        docker: true,
+        dockerAgentStartupTimeoutMs: 45_000,
+      }),
+    ).toBe(60_000);
+    expect(
+      resolveWorkerStartupTimeoutMs({
+        configuredMs: 90_000,
+        docker: true,
+        dockerAgentStartupTimeoutMs: 45_000,
+      }),
+    ).toBe(90_000);
+    expect(
+      resolveWorkerStartupTimeoutMs({
+        configuredMs: 10_000,
+        docker: false,
+        dockerAgentStartupTimeoutMs: 45_000,
+      }),
+    ).toBe(10_000);
   });
 });

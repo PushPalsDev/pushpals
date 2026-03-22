@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { RemoteBuddyAutonomousEngine } from "../apps/remotebuddy/src/autonomous_engine";
@@ -117,6 +117,34 @@ function mockGitSpawnForTest(): void {
   };
 }
 
+function seedPushpalsAutonomyRepoLayout(root: string): void {
+  const markers = [
+    "apps/server/src/autonomy.ts",
+    "apps/remotebuddy/src/autonomous_engine.ts",
+    "apps/workerpals/src/workerpals_main.ts",
+    "packages/shared/src/autonomy_policy.ts",
+  ];
+  for (const marker of markers) {
+    const fullPath = join(root, marker);
+    mkdirSync(join(fullPath, ".."), { recursive: true });
+    writeFileSync(fullPath, "// test fixture\n", "utf8");
+  }
+}
+
+function seedGenericAutonomyRepoLayout(root: string): void {
+  const markers = [
+    "src/autonomy.ts",
+    "src/queue.ts",
+    "tests/autonomy.test.ts",
+    "README.md",
+  ];
+  for (const marker of markers) {
+    const fullPath = join(root, marker);
+    mkdirSync(join(fullPath, ".."), { recursive: true });
+    writeFileSync(fullPath, "// generic repo fixture\n", "utf8");
+  }
+}
+
 afterEach(() => {
   if (originalFetch) {
     globalThis.fetch = originalFetch;
@@ -141,6 +169,7 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     mockGitSpawnForTest();
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-tick-"));
     tempDirs.push(root);
+    seedPushpalsAutonomyRepoLayout(root);
     const calls: FetchCall[] = [];
     const objectivePosts: Array<Record<string, unknown>> = [];
     let llmCall = 0;
@@ -246,6 +275,7 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     (engine as any).ensureAutonomyRepoReady = async () => {
       const autonomyRepo = String((engine as any).autonomyRepo ?? "");
       mkdirSync(autonomyRepo, { recursive: true });
+      seedPushpalsAutonomyRepoLayout(autonomyRepo);
       return true;
     };
     (engine as any).loadVisionContext = () => ({
@@ -306,6 +336,7 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     mockGitSpawnForTest();
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-tick-blocked-"));
     tempDirs.push(root);
+    seedPushpalsAutonomyRepoLayout(root);
     const calls: FetchCall[] = [];
     const objectivePosts: Array<Record<string, unknown>> = [];
     let llmCall = 0;
@@ -405,6 +436,7 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     (engine as any).ensureAutonomyRepoReady = async () => {
       const autonomyRepo = String((engine as any).autonomyRepo ?? "");
       mkdirSync(autonomyRepo, { recursive: true });
+      seedPushpalsAutonomyRepoLayout(autonomyRepo);
       return true;
     };
     (engine as any).loadVisionContext = () => ({
@@ -487,5 +519,128 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(fetchCalls).toBe(0);
 
     engine.stop();
+  });
+
+  test("tick can dispatch generic repo autonomy work when vision.md is present", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-generic-repo-"));
+    tempDirs.push(root);
+    const calls: FetchCall[] = [];
+    const objectivePosts: Array<Record<string, unknown>> = [];
+    let llmCall = 0;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+
+      if (url.includes("/autonomy/lock/acquire")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/renew")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release")) return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot")) return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/autonomy/inspiration/ingest")) return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
+      if (url.includes("/autonomy/inspiration?")) return jsonResponse(200, { ok: true, patterns: [] });
+      if (url.includes("/autonomy/insights?")) return jsonResponse(200, { ok: true, engineSourceStats: [] });
+      if (url.endsWith("/autonomy/eligibility")) {
+        const candidates = Array.isArray((body as Record<string, unknown>).candidates)
+          ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
+          : [];
+        return jsonResponse(200, {
+          ok: true,
+          results: candidates.map((entry) => ({
+            candidate_id: String(entry.id ?? entry.candidate_id ?? ""),
+            ok: true,
+          })),
+        });
+      }
+      if (url.endsWith("/requests/enqueue")) return jsonResponse(201, { ok: true, requestId: "req_generic_1" });
+      if (url.endsWith("/autonomy/objectives")) {
+        objectivePosts.push(body as Record<string, unknown>);
+        return jsonResponse(200, { ok: true, objectiveId: "obj_generic_1", patternKey: "pk_generic_1" });
+      }
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const llm = {
+      async generate() {
+        llmCall += 1;
+        if (llmCall === 1) {
+          return {
+            text: JSON.stringify({ candidates: [] }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        }
+        if (llmCall === 2) {
+          return {
+            text: JSON.stringify({ scores: [] }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        }
+        return {
+          text: JSON.stringify({
+            instruction: "Improve src/autonomy.ts using the queue health signal and keep the change narrow.",
+          }),
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+    const comm = {
+      async emit() {
+        return true;
+      },
+    };
+
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_generic_repo",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: comm as any,
+      config: makeConfig(),
+    });
+    (engine as any).ensureAutonomyRepoReady = async () => {
+      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+      mkdirSync(autonomyRepo, { recursive: true });
+      seedGenericAutonomyRepoLayout(autonomyRepo);
+      return true;
+    };
+    (engine as any).loadVisionContext = () => ({
+      path: "vision.md",
+      markdown: "# Vision\n",
+      one_sentence: "Improve queue throughput safely for this repo.",
+      sections: [{ number: "1", title: "Reliability", markdown: "Favor narrow, deterministic fixes.", truncated: false }],
+      key_items: {
+        target_users: ["maintainers"],
+        priorities: ["queue reliability"],
+        objectives: ["reduce queue latency"],
+        guardrails: ["small scoped changes"],
+        constraints: ["only repo-relative targets"],
+        non_goals: [],
+        metrics: ["queue p95"],
+        risk_policy: ["low risk autonomous"],
+        operating_model: ["remotebuddy + workerpals"],
+        governance: ["review high risk manually"],
+      },
+      section_numbers: ["1"],
+      sha256: "visionhash",
+      truncated: false,
+    });
+    (engine as any).loadCommitHistoryHints = async () => [];
+
+    await engine.tick();
+
+    const enqueueCall = calls.find((entry) => entry.url.endsWith("/requests/enqueue"));
+    expect(enqueueCall).toBeDefined();
+    const autonomy = (((enqueueCall?.body as Record<string, unknown>).metadata ?? {}) as Record<string, unknown>)
+      .autonomy as Record<string, unknown>;
+    expect(Array.isArray(autonomy.targetPaths)).toBe(true);
+    expect(String((autonomy.targetPaths as string[])[0] ?? "")).toContain("src/");
+    expect(String((autonomy.targetPaths as string[])[0] ?? "")).not.toContain("apps/server");
+    expect(objectivePosts.length).toBeGreaterThan(0);
+    expect((engine as any).lastOutcome).toBe("success");
   });
 });

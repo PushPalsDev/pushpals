@@ -34,6 +34,7 @@ describe("shared autonomy policy", () => {
       { requireWriteGlobs: true },
     );
     expect(ok.ok).toBe(true);
+    expect(ok.componentArea).toBe("apps/server");
     expect(ok.errors.length).toBe(0);
 
     const bad = validateScopeInvariants(
@@ -45,5 +46,15 @@ describe("shared autonomy policy", () => {
     expect(bad.ok).toBe(false);
     expect(bad.errors.join(" ")).toContain("outside component root");
   });
-});
 
+  test("validateScopeInvariants derives component area from repo-relative scope", () => {
+    const derived = validateScopeInvariants(
+      null,
+      ["src/autonomy.ts"],
+      ["src/autonomy.ts"],
+      { requireWriteGlobs: true },
+    );
+    expect(derived.ok).toBe(true);
+    expect(derived.componentArea).toBe("src");
+  });
+});

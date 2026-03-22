@@ -13,6 +13,26 @@ export type WorkerSpawnCommandOptions = {
   entrypoint?: string | null;
 };
 
+export type WorkerStartupTimeoutOptions = {
+  configuredMs: number;
+  docker: boolean;
+  dockerAgentStartupTimeoutMs: number;
+};
+
+export function resolveWorkerStartupTimeoutMs(
+  options: WorkerStartupTimeoutOptions,
+): number {
+  const configuredMs = Math.max(1_000, Math.floor(options.configuredMs || 0));
+  if (!options.docker) {
+    return configuredMs;
+  }
+  const dockerFloorMs = Math.max(
+    30_000,
+    Math.floor(options.dockerAgentStartupTimeoutMs || 0) + 15_000,
+  );
+  return Math.max(configuredMs, dockerFloorMs);
+}
+
 export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): string[] {
   const binaryPath = String(options.binaryPath ?? "").trim();
   const envFile = String(options.envFile ?? "").trim() || ".env";

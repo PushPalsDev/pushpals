@@ -221,6 +221,67 @@ describe("shared config remotebuddy autonomy parsing", () => {
     }
   });
 
+  test("preserves arbitrary repo-relative per-component autonomy budgets", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "config");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[remotebuddy.autonomy]",
+        "enabled = true",
+        "",
+        "[remotebuddy.autonomy.max_dispatch_per_hour_by_component]",
+        '"src" = 5',
+        '"backend/api" = 2',
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByComponent["src"]).toBe(5);
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByComponent["backend/api"]).toBe(2);
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByComponent["apps/server"]).toBe(3);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("maps legacy monorepo component aliases onto canonical default keys", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "config");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[remotebuddy.autonomy]",
+        "enabled = true",
+        "",
+        "[remotebuddy.autonomy.max_dispatch_per_hour_by_component]",
+        '"apps_server" = 9',
+        '"apps-client" = 7',
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByComponent["apps/server"]).toBe(9);
+      expect(cfg.remotebuddy.autonomy.maxDispatchPerHourByComponent["apps/client"]).toBe(7);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("REMOTEBUDDY_AUTONOMY_KILL_SWITCH_ENABLED overrides TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
     const configDir = join(root, "config");

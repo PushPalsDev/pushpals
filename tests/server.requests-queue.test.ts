@@ -139,6 +139,27 @@ describe("server RequestQueue", () => {
     queue.close();
   });
 
+  test("derives autonomy componentArea from repo-relative scope when omitted", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({
+      sessionId: "dev",
+      prompt: "autonomy background objective",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          targetPaths: ["src/autonomy.ts"],
+          writeGlobs: ["src/autonomy.ts"],
+        },
+      },
+    });
+    expect(enqueued.ok).toBe(true);
+    const claimed = queue.claim("remotebuddy-orchestrator");
+    const metadata = (claimed.request?.metadata ?? {}) as Record<string, unknown>;
+    const autonomy = (metadata.autonomy ?? {}) as Record<string, unknown>;
+    expect(autonomy.componentArea).toBe("src");
+    queue.close();
+  });
+
   test("rejects autonomy metadata without writeGlobs", () => {
     const queue = new RequestQueue(":memory:");
     const enqueued = queue.enqueue({

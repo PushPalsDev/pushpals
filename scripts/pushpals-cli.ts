@@ -82,6 +82,13 @@ type SystemStatusClientRow = {
   connectedTransports?: unknown;
 };
 
+type WorkerStatusRow = {
+  workerId?: unknown;
+  status?: unknown;
+  isOnline?: unknown;
+  activeJobCount?: unknown;
+};
+
 type RemoteBuddySessionConsumerHealth = {
   ok: boolean;
   detail: string;
@@ -94,12 +101,16 @@ type SourceControlManagerGitPrecheckResult =
   | { status: "ok"; detail: string; env: Record<string, string> }
   | { status: "skipped"; detail: string; env: Record<string, string> }
   | { status: "failed"; detail: string; env: Record<string, string> };
-type GitCommandResult = {
+type CommandResult = {
   ok: boolean;
   stdout: string;
   stderr: string;
   exitCode: number;
 };
+type WorkerpalDockerPrecheckResult =
+  | { status: "ok"; detail: string; env: Record<string, string> }
+  | { status: "skipped"; detail: string; env: Record<string, string> }
+  | { status: "failed"; detail: string; env: Record<string, string> };
 type GitRemoteCheckResult =
   | { status: "ok"; remote: string }
   | { status: "missing_remote"; remote: string }
@@ -394,13 +405,13 @@ function jsonHtmlBootstrap(value: unknown): string {
   return JSON.stringify(value).replace(/</g, "\\u003c");
 }
 
-async function runGitWithEnv(
-  args: string[],
+async function runCommandWithEnv(
+  command: string[],
   cwd: string,
   env: Record<string, string | undefined>,
-): Promise<GitCommandResult> {
+): Promise<CommandResult> {
   try {
-    const proc = Bun.spawn(["git", ...args], {
+    const proc = Bun.spawn(command, {
       cwd,
       env,
       stdout: "pipe",
@@ -422,10 +433,18 @@ async function runGitWithEnv(
   }
 }
 
+async function runGitWithEnv(
+  args: string[],
+  cwd: string,
+  env: Record<string, string | undefined>,
+): Promise<CommandResult> {
+  return await runCommandWithEnv(["git", ...args], cwd, env);
+}
+
 async function runGit(
   args: string[],
   cwd: string,
-): Promise<GitCommandResult> {
+): Promise<CommandResult> {
   return await runGitWithEnv(args, cwd, {
     ...(process.env as Record<string, string | undefined>),
     GIT_TERMINAL_PROMPT: "0",
@@ -913,6 +932,12 @@ export function buildEmbeddedRuntimeEnv(
     ...(typeof env.PUSHPALS_GIT_BIN_ABSOLUTE === "string" && env.PUSHPALS_GIT_BIN_ABSOLUTE.trim()
       ? { PUSHPALS_GIT_BIN_ABSOLUTE: env.PUSHPALS_GIT_BIN_ABSOLUTE.trim() }
       : {}),
+    ...(typeof env.PUSHPALS_DOCKER_BIN === "string" && env.PUSHPALS_DOCKER_BIN.trim()
+      ? { PUSHPALS_DOCKER_BIN: env.PUSHPALS_DOCKER_BIN.trim() }
+      : {}),
+    ...(typeof env.PUSHPALS_DOCKER_BIN_ABSOLUTE === "string" && env.PUSHPALS_DOCKER_BIN_ABSOLUTE.trim()
+      ? { PUSHPALS_DOCKER_BIN_ABSOLUTE: env.PUSHPALS_DOCKER_BIN_ABSOLUTE.trim() }
+      : {}),
   };
 }
 
@@ -1279,6 +1304,23 @@ export function applyResolvedGitBinaryToRuntimeEnv(
   return env;
 }
 
+export function applyResolvedDockerBinaryToRuntimeEnv(
+  env: Record<string, string>,
+  resolvedDockerBinary: string,
+  platform = process.platform,
+): Record<string, string> {
+  const resolvedPath = String(resolvedDockerBinary ?? "").trim();
+  if (!resolvedPath) return env;
+  prependExecutableDirToPath(env, resolvedPath, platform);
+  env.PUSHPALS_DOCKER_BIN = basename(resolvedPath);
+  if (resolvedPath.includes("/") || resolvedPath.includes("\\")) {
+    env.PUSHPALS_DOCKER_BIN_ABSOLUTE = resolvedPath;
+  } else {
+    delete env.PUSHPALS_DOCKER_BIN_ABSOLUTE;
+  }
+  return env;
+}
+
 export function resolveRuntimeGitExecutableCandidates(
   env: Record<string, string | undefined>,
   platform = process.platform,
@@ -1298,6 +1340,28 @@ export function resolveRuntimeGitExecutableCandidates(
   pushCandidate(env.PUSHPALS_GIT_BIN_ABSOLUTE ?? "");
   pushCandidate(platform === "win32" ? "git.exe" : "git");
   pushCandidate("git");
+  return candidates;
+}
+
+export function resolveRuntimeDockerExecutableCandidates(
+  env: Record<string, string | undefined>,
+  platform = process.platform,
+): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (value: string): void => {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed) return;
+    const key = platform === "win32" ? trimmed.toLowerCase() : trimmed;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(trimmed);
+  };
+
+  pushCandidate(env.PUSHPALS_DOCKER_BIN ?? "");
+  pushCandidate(env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? "");
+  pushCandidate(platform === "win32" ? "docker.exe" : "docker");
+  pushCandidate("docker");
   return candidates;
 }
 
@@ -1445,6 +1509,47 @@ async function resolveSourceControlManagerGitProbe(
   };
 }
 
+async function resolveWorkerpalDockerProbe(
+  cwd: string,
+  env: Record<string, string>,
+  platform = process.platform,
+): Promise<{ ok: boolean; detail: string }> {
+  const resolvedDockerBinary = await resolveCommandPath(
+    platform === "win32" ? "docker.exe" : "docker",
+    cwd,
+    env,
+  );
+  if (resolvedDockerBinary) {
+    prependExecutableDirToPath(env, resolvedDockerBinary, platform);
+    env.PUSHPALS_DOCKER_BIN = basename(resolvedDockerBinary);
+    env.PUSHPALS_DOCKER_BIN_ABSOLUTE = resolvedDockerBinary;
+  }
+
+  const candidates = resolveRuntimeDockerExecutableCandidates(env, platform);
+  const failures: string[] = [];
+  for (const candidate of candidates) {
+    const result = await runCommandWithEnv(
+      [candidate, "version", "--format", "{{.Server.Version}}"],
+      cwd,
+      env,
+    );
+    if (result.ok) {
+      const version = result.stdout.trim();
+      return {
+        ok: true,
+        detail: version ? `${candidate} (${version})` : candidate,
+      };
+    }
+    const detail = result.stderr || result.stdout || `exit ${result.exitCode}`;
+    failures.push(`${candidate}: ${detail}`);
+  }
+
+  return {
+    ok: false,
+    detail: failures.join(" | ") || "docker",
+  };
+}
+
 export async function precheckSourceControlManagerGitAvailability(opts: {
   repoRoot: string;
   remote: string;
@@ -1472,8 +1577,9 @@ export async function precheckSourceControlManagerGitAvailability(opts: {
     },
   );
 
-  if (env.PUSHPALS_GIT_BIN) {
-    applyResolvedGitBinaryToRuntimeEnv(env, env.PUSHPALS_GIT_BIN, platform);
+  const preconfiguredGitBinary = env.PUSHPALS_GIT_BIN_ABSOLUTE ?? env.PUSHPALS_GIT_BIN;
+  if (preconfiguredGitBinary) {
+    applyResolvedGitBinaryToRuntimeEnv(env, preconfiguredGitBinary, platform);
   }
 
   const remoteStatus = opts.gitRemoteCheckFn
@@ -1531,6 +1637,93 @@ export async function precheckSourceControlManagerGitAvailability(opts: {
     detail: gitProbe.detail,
     env,
   };
+}
+
+export async function precheckWorkerpalDockerAvailability(opts: {
+  repoRoot: string;
+  runtimeRoot: string;
+  preflightUsesEmbeddedRuntime: boolean;
+  autoSpawnWorkerpals: boolean;
+  dockerEnabled: boolean;
+  requireDocker: boolean;
+  sessionId?: string;
+  baseEnv?: Record<string, string | undefined>;
+  dockerProbeFn?: typeof resolveWorkerpalDockerProbe;
+  platform?: NodeJS.Platform;
+}): Promise<WorkerpalDockerPrecheckResult> {
+  const env = buildEmbeddedRuntimeEnv(
+    (opts.baseEnv ?? (process.env as Record<string, string | undefined>)) as Record<
+      string,
+      string | undefined
+    >,
+    {
+      repoRoot: opts.repoRoot,
+      runtimeRoot: opts.runtimeRoot,
+      useRuntimeConfig: opts.preflightUsesEmbeddedRuntime,
+      sessionId: opts.sessionId,
+    },
+  );
+  const preconfiguredDockerBinary =
+    env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? env.PUSHPALS_DOCKER_BIN;
+  if (preconfiguredDockerBinary) {
+    applyResolvedDockerBinaryToRuntimeEnv(
+      env,
+      preconfiguredDockerBinary,
+      opts.platform ?? process.platform,
+    );
+  }
+
+  if (!opts.autoSpawnWorkerpals) {
+    return {
+      status: "skipped",
+      detail: "WorkerPal auto-spawn is disabled",
+      env,
+    };
+  }
+  if (!opts.dockerEnabled) {
+    return {
+      status: "skipped",
+      detail: "WorkerPal docker mode is disabled",
+      env,
+    };
+  }
+  if (!opts.requireDocker) {
+    return {
+      status: "skipped",
+      detail: "WorkerPal docker mode is optional",
+      env,
+    };
+  }
+
+  const dockerProbe = await (opts.dockerProbeFn ?? resolveWorkerpalDockerProbe)(
+    opts.repoRoot,
+    env,
+    opts.platform ?? process.platform,
+  );
+  if (!dockerProbe.ok) {
+    return {
+      status: "failed",
+      detail: dockerProbe.detail,
+      env,
+    };
+  }
+
+  return {
+    status: "ok",
+    detail: dockerProbe.detail,
+    env,
+  };
+}
+
+function resolveWorkerpalCapacityTimeoutMs(config: PushPalsConfig): number {
+  return Math.max(
+    config.remotebuddy.waitForWorkerpalMs,
+    config.remotebuddy.workerpalStartupTimeoutMs,
+    config.remotebuddy.workerpalDocker
+      ? config.workerpals.dockerAgentStartupTimeoutMs + 15_000
+      : 0,
+    10_000,
+  );
 }
 
 async function checkGitRemoteConfigured(
@@ -2002,6 +2195,69 @@ async function probeSourceControlManager(port: number): Promise<boolean> {
   }
 }
 
+async function fetchWorkerStatusRows(
+  serverUrl: string,
+  ttlMs: number,
+): Promise<WorkerStatusRow[]> {
+  const payload = await fetchJsonWithTimeout<{ ok?: boolean; workers?: WorkerStatusRow[] }>(
+    `${serverUrl}/workers?ttlMs=${Math.max(1_000, Math.floor(ttlMs))}`,
+    {},
+    10_000,
+  );
+  if (!payload?.ok || !Array.isArray(payload.workers)) {
+    return [];
+  }
+  return payload.workers;
+}
+
+export async function waitForWorkerpalCapacity(opts: {
+  serverUrl: string;
+  timeoutMs: number;
+  ttlMs: number;
+  fetchWorkersFn?: typeof fetchWorkerStatusRows;
+  sleepFn?: typeof Bun.sleep;
+}): Promise<{ ok: boolean; detail: string }> {
+  const deadline = Date.now() + Math.max(1_000, opts.timeoutMs);
+  let lastObservedOnline = 0;
+  while (Date.now() < deadline) {
+    const workers = await (opts.fetchWorkersFn ?? fetchWorkerStatusRows)(
+      opts.serverUrl,
+      opts.ttlMs,
+    );
+    const onlineWorkers = workers.filter(
+      (worker) =>
+        Boolean(worker?.isOnline) &&
+        String(worker?.status ?? "").trim().toLowerCase() !== "offline",
+    );
+    const idleWorkers = onlineWorkers.filter(
+      (worker) => Number(worker?.activeJobCount ?? 0) <= 0,
+    );
+    if (onlineWorkers.length > 0) {
+      lastObservedOnline = Math.max(lastObservedOnline, onlineWorkers.length);
+    }
+    if (idleWorkers.length > 0) {
+      return {
+        ok: true,
+        detail: `${idleWorkers.length} idle / ${onlineWorkers.length} online`,
+      };
+    }
+    await (opts.sleepFn ?? Bun.sleep)(DEFAULT_RUNTIME_BOOT_POLL_MS);
+  }
+  if (lastObservedOnline > 0) {
+    return {
+      ok: false,
+      detail: `${lastObservedOnline} online WorkerPal(s) reported but none became idle within ${Math.max(
+        1_000,
+        opts.timeoutMs,
+      )}ms`,
+    };
+  }
+  return {
+    ok: false,
+    detail: `no online WorkerPal reported within ${Math.max(1_000, opts.timeoutMs)}ms`,
+  };
+}
+
 async function fetchWithTimeout(
   url: string,
   init: RequestInit = {},
@@ -2122,6 +2378,7 @@ async function autoStartRuntimeServices(opts: {
   preparedRuntime: PreparedCliRuntime;
   requestedRuntimeTag?: string;
   startLocalBuddy?: boolean;
+  baseEnv?: Record<string, string | undefined>;
 }): Promise<AutoStartedRuntime> {
   const { runtimePreflight } = opts.preparedRuntime;
   const runtimeRoot = opts.preparedRuntime.runtimeRoot;
@@ -2140,15 +2397,28 @@ async function autoStartRuntimeServices(opts: {
   await ensureRuntimeAssets(runtimeRoot, runtimeTag);
   const runtimeBinaries = await ensureRuntimeBinaries(runtimeRoot, runtimeTag);
 
-  const runtimeEnv = buildEmbeddedRuntimeEnv(process.env as Record<string, string | undefined>, {
-    repoRoot: opts.repoRoot,
-    runtimeRoot,
-    useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
-    sessionId: opts.sessionId,
-  });
+  const runtimeEnv = buildEmbeddedRuntimeEnv(
+    (opts.baseEnv ?? (process.env as Record<string, string | undefined>)) as Record<
+      string,
+      string | undefined
+    >,
+    {
+      repoRoot: opts.repoRoot,
+      runtimeRoot,
+      useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
+      sessionId: opts.sessionId,
+    },
+  );
   runtimeEnv.PUSHPALS_WORKERPALS_BIN = runtimeBinaries.workerpals;
-  if (runtimeEnv.PUSHPALS_GIT_BIN) {
-    applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, runtimeEnv.PUSHPALS_GIT_BIN);
+  const preconfiguredRuntimeGitBinary =
+    runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE ?? runtimeEnv.PUSHPALS_GIT_BIN;
+  if (preconfiguredRuntimeGitBinary) {
+    applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, preconfiguredRuntimeGitBinary);
+  }
+  const preconfiguredRuntimeDockerBinary =
+    runtimeEnv.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? runtimeEnv.PUSHPALS_DOCKER_BIN;
+  if (preconfiguredRuntimeDockerBinary) {
+    applyResolvedDockerBinaryToRuntimeEnv(runtimeEnv, preconfiguredRuntimeDockerBinary);
   }
   const gitLookupCommand =
     typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
@@ -2293,6 +2563,32 @@ async function autoStartRuntimeServices(opts: {
     );
   };
   reportRemoteBuddyAutonomousEngineState();
+
+  if (runtimePreflight.config.remotebuddy.autoSpawnWorkerpals) {
+    const workerpalReadyTimeoutMs = resolveWorkerpalCapacityTimeoutMs(runtimePreflight.config);
+    const workerpalCapacity = await waitForWorkerpalCapacity({
+      serverUrl: opts.serverUrl,
+      timeoutMs: workerpalReadyTimeoutMs,
+      ttlMs: runtimePreflight.config.remotebuddy.workerpalOnlineTtlMs,
+    });
+    if (!workerpalCapacity.ok) {
+      const tail = readLogTail(remotebuddyService.logPath);
+      appendRuntimeServicesLogLine(
+        runtimeServicesLogPath,
+        `[pushpals] embedded workerpal capacity did not become available within ${workerpalReadyTimeoutMs}ms.`,
+      );
+      stopRuntimeServices(services);
+      throw new Error(
+        `Embedded WorkerPal capacity did not become available within ${workerpalReadyTimeoutMs}ms (${workerpalCapacity.detail}). ` +
+          `See ${remotebuddyService.logPath}${tail ? `\n--- remotebuddy log tail ---\n${tail}` : ""}`,
+      );
+    }
+    console.log(`[pushpals] Embedded WorkerPal capacity is ready (${workerpalCapacity.detail}).`);
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      `[pushpals] embedded workerpal capacity ready (${workerpalCapacity.detail}).`,
+    );
+  }
 
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
   const scmGitProbe = await resolveSourceControlManagerGitProbe(
@@ -3145,6 +3441,15 @@ async function main(): Promise<void> {
     );
     process.exit(1);
   }
+  const workerpalDockerPrecheck = await precheckWorkerpalDockerAvailability({
+    repoRoot,
+    runtimeRoot: preparedRuntime.runtimeRoot,
+    preflightUsesEmbeddedRuntime: preparedRuntime.preflightUsesEmbeddedRuntime,
+    autoSpawnWorkerpals: Boolean(config.remotebuddy.autoSpawnWorkerpals),
+    dockerEnabled: Boolean(config.remotebuddy.workerpalDocker),
+    requireDocker: Boolean(config.remotebuddy.workerpalRequireDocker),
+    baseEnv: scmGitPrecheck.env,
+  });
   const precheckPassed = await enforcePushpalsRemoteBranchPrecheck(
     repoRoot,
     config.sourceControlManager.remote,
@@ -3189,6 +3494,15 @@ async function main(): Promise<void> {
   };
   if (!serverHealthy) {
     if (!parsed.noAutoStart) {
+      if (workerpalDockerPrecheck.status === "failed") {
+        console.error(
+          `[pushpals] Precheck failed: Docker-backed WorkerPal auto-spawn is required but Docker is unavailable (${workerpalDockerPrecheck.detail}).`,
+        );
+        console.error(
+          "[pushpals] Precheck failed: start Docker Desktop or the Docker daemon, then retry pushpals.",
+        );
+        process.exit(1);
+      }
       try {
         const startedRuntime = await autoStartRuntimeServices({
           repoRoot,
@@ -3203,6 +3517,7 @@ async function main(): Promise<void> {
             parsed.runtimeOnly,
             Boolean(config.localbuddy.enabled),
           ),
+          baseEnv: workerpalDockerPrecheck.env,
         });
         autoStartedServices = startedRuntime.services;
         pushpalsLogPath = startedRuntime.pushpalsLogPath;
@@ -3260,6 +3575,30 @@ async function main(): Promise<void> {
       console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
     } else {
       console.error("[pushpals] Auto-start could not bring the embedded runtime into a usable state.");
+    }
+    process.exit(1);
+  }
+  const workerpalCapacity = await waitForWorkerpalCapacity({
+    serverUrl,
+    timeoutMs: resolveWorkerpalCapacityTimeoutMs(config),
+    ttlMs: config.remotebuddy.workerpalOnlineTtlMs,
+  });
+  if (!workerpalCapacity.ok) {
+    stopAutoStartedServices();
+    console.error(
+      `[pushpals] WorkerPal capacity is not ready for repo ${repoRoot}: ${workerpalCapacity.detail}.`,
+    );
+    if (workerpalDockerPrecheck.status === "failed") {
+      console.error(
+        `[pushpals] Docker precheck detail: ${workerpalDockerPrecheck.detail}`,
+      );
+    } else if (serverWasAlreadyHealthy) {
+      console.error(
+        "[pushpals] A PushPals runtime is already serving this repo, but it does not currently have an idle WorkerPal available.",
+      );
+      console.error(
+        "[pushpals] Wait for a worker to become idle or restart the runtime after fixing WorkerPal startup.",
+      );
     }
     process.exit(1);
   }

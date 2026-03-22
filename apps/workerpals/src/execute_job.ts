@@ -6,9 +6,11 @@
 import { readFileSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import {
+  deriveAutonomyComponentArea,
   loadPromptTemplate,
   loadPushPalsConfig,
   matchesGlob,
+  normalizeAutonomyComponentArea,
   normalizeTargetPath,
   validateScopeInvariants,
   type AutonomyComponentArea,
@@ -2326,46 +2328,8 @@ function hasInvalidRepoPathHint(values: string[]): boolean {
   return values.some((entry) => normalizeStagePath(entry) === null);
 }
 
-function inferComponentAreaFromPath(path: string): AutonomyComponentArea | null {
-  const normalized = path.replace(/\\/g, "/");
-  if (normalized.startsWith("apps/server/")) return "apps/server";
-  if (normalized.startsWith("apps/remotebuddy/")) return "apps/remotebuddy";
-  if (normalized.startsWith("apps/workerpals/")) return "apps/workerpals";
-  if (normalized.startsWith("apps/client/")) return "apps/client";
-  if (normalized.startsWith("packages/protocol/")) return "packages/protocol";
-  if (normalized.startsWith("packages/shared/")) return "packages/shared";
-  if (normalized.startsWith("tests/integration/")) return "tests/integration";
-  if (normalized.startsWith("tests/unit/")) return "tests/unit";
-  return null;
-}
-
-function inferComponentAreaFromTargets(targetPaths: string[]): AutonomyComponentArea | null {
-  let area: AutonomyComponentArea | null = null;
-  for (const path of targetPaths) {
-    const inferred = inferComponentAreaFromPath(path);
-    if (!inferred) return null;
-    if (!area) area = inferred;
-    else if (area !== inferred) return null;
-  }
-  return area;
-}
-
 function asAutonomyComponentArea(value: unknown): AutonomyComponentArea | null {
-  const text = String(value ?? "").trim();
-  if (!text) return null;
-  switch (text) {
-    case "apps/server":
-    case "apps/remotebuddy":
-    case "apps/workerpals":
-    case "apps/client":
-    case "packages/protocol":
-    case "packages/shared":
-    case "tests/integration":
-    case "tests/unit":
-      return text;
-    default:
-      return null;
-  }
+  return normalizeAutonomyComponentArea(value);
 }
 
 function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user" {
@@ -2542,12 +2506,15 @@ function validateTaskExecutePlanning(
       : [];
     if (origin === "autonomy") {
       const declaredComponentArea = asAutonomyComponentArea(options?.autonomyComponentArea);
-      const inferredComponentArea = inferComponentAreaFromTargets(normalizedTargetPaths);
+      const inferredComponentArea = deriveAutonomyComponentArea(
+        normalizedTargetPaths,
+        normalizedWriteGlobs,
+      );
       const componentArea = declaredComponentArea ?? inferredComponentArea;
       if (!componentArea) {
         return {
           ok: false,
-          message: "task.execute planning.targetPaths must map to one supported component area",
+          message: "task.execute planning.targetPaths must resolve to a repo-relative componentArea",
         };
       }
       if (

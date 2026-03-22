@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   buildEngineFallbackCandidates,
   buildEngineInspirationContext,
@@ -176,6 +179,82 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
     expect(externalBlock?.source_type).toBe("external_repo");
     expect(externalBlock?.candidate_shape.component_area).toBe("apps/server");
     expect(externalBlock?.score ?? 0).toBeGreaterThan(0.2);
+  });
+
+  test("buildEngineInspirationContext adapts building blocks to generic repo targets", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-ideas-"));
+    mkdirSync(join(root, "src"), { recursive: true });
+    mkdirSync(join(root, "tests"), { recursive: true });
+    writeFileSync(join(root, "src", "autonomy.ts"), "// fixture\n", "utf8");
+    writeFileSync(join(root, "src", "queue.ts"), "// fixture\n", "utf8");
+    writeFileSync(join(root, "tests", "autonomy.test.ts"), "// fixture\n", "utf8");
+    writeFileSync(join(root, "README.md"), "# fixture\n", "utf8");
+
+    try {
+      const repoTargets = [
+        {
+          component_area: "src",
+          target_paths: ["src/autonomy.ts"],
+          write_globs: ["src/autonomy.ts"],
+          label: "src/autonomy.ts",
+          keywords: ["src", "autonomy", "queue"],
+        },
+        {
+          component_area: "src",
+          target_paths: ["src/queue.ts"],
+          write_globs: ["src/queue.ts"],
+          label: "src/queue.ts",
+          keywords: ["src", "queue"],
+        },
+        {
+          component_area: "tests",
+          target_paths: ["tests/autonomy.test.ts"],
+          write_globs: ["tests/autonomy.test.ts"],
+          label: "tests/autonomy.test.ts",
+          keywords: ["tests", "autonomy"],
+        },
+      ];
+      const context = buildEngineInspirationContext({
+        vision,
+        snapshot,
+        repoRoot: root,
+        repoTargets,
+        inspirationPatterns: [
+          {
+            id: "ext_repo_generic_1",
+            sourceType: "external_repo",
+            sourceLabel: "acme/autonomy-lab",
+            sourceUrl: "https://example.com/acme/autonomy-lab",
+            sourceRefs: ["README#queue-bandit"],
+            algorithm: "queue_portfolio_bandit",
+            whenToUse: "queue backpressure and worker saturation are recurring",
+            summary: "Allocate autonomous work across lanes using queue pressure + regret loops.",
+            tags: ["queue", "backpressure", "worker", "portfolio"],
+            qualityScore: 0.92,
+            freshnessScore: 0.81,
+            seenCount: 7,
+            validationIdeas: ["bun run test:root"],
+            metadata: {
+              component_area: "apps/server",
+              target_paths: ["apps/server/src/autonomy.ts"],
+              write_globs: ["apps/server/src/*"],
+            },
+          },
+        ],
+      });
+
+      const opportunityGraphBlock = context.building_blocks.find((entry) => entry.id === "opportunity_graph_pipeline");
+      expect(opportunityGraphBlock?.candidate_shape.component_area).toBe("src");
+      expect(opportunityGraphBlock?.candidate_shape.target_paths[0]).toContain("src/");
+      expect(opportunityGraphBlock?.candidate_shape.target_paths[0]).not.toContain("apps/server");
+
+      const externalBlock = context.building_blocks.find((entry) => entry.id.startsWith("insp_"));
+      expect(externalBlock?.candidate_shape.component_area).toBe("src");
+      expect(externalBlock?.candidate_shape.target_paths[0]).toContain("src/");
+      expect(externalBlock?.candidate_shape.target_paths[0]).not.toContain("apps/server");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("filters archived inspiration sources and boosts trusted sources into fallback objective seeds", () => {

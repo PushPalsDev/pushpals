@@ -10,7 +10,11 @@
 
 import { Database } from "bun:sqlite";
 import { randomUUID } from "crypto";
-import { validateScopeInvariants, type AutonomyComponentArea } from "shared";
+import {
+  normalizeAutonomyComponentArea,
+  validateScopeInvariants,
+  type AutonomyComponentArea,
+} from "shared";
 
 export type RequestStatus = "pending" | "claimed" | "completed" | "failed";
 export type QueuePriority = "interactive" | "normal" | "background";
@@ -50,17 +54,6 @@ function asString(value: unknown): string {
   return String(value ?? "").trim();
 }
 
-const AUTONOMY_COMPONENT_AREAS = new Set<AutonomyComponentArea>([
-  "apps/server",
-  "apps/remotebuddy",
-  "apps/workerpals",
-  "apps/client",
-  "packages/protocol",
-  "packages/shared",
-  "tests/integration",
-  "tests/unit",
-]);
-
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((entry) => asString(entry)).filter(Boolean);
@@ -94,16 +87,11 @@ function sanitizeRequestMetadata(input: unknown): {
     return { metadata: null, error: "metadata.autonomy object is required for origin=autonomy" };
   }
   const componentAreaRaw = asString(autonomy.componentArea ?? autonomy.component_area);
-  if (!AUTONOMY_COMPONENT_AREAS.has(componentAreaRaw as AutonomyComponentArea)) {
-    return {
-      metadata: null,
-      error: `autonomy metadata requires valid componentArea; received "${componentAreaRaw}"`,
-    };
-  }
+  const componentArea = normalizeAutonomyComponentArea(componentAreaRaw);
   const targetPathsRaw = asStringArray(autonomy.targetPaths ?? autonomy.target_paths);
   const writeGlobsRaw = asStringArray(autonomy.writeGlobs ?? autonomy.write_globs);
   const scope = validateScopeInvariants(
-    componentAreaRaw as AutonomyComponentArea,
+    componentArea as AutonomyComponentArea | null,
     targetPathsRaw,
     writeGlobsRaw,
     { requireWriteGlobs: true },
@@ -122,7 +110,7 @@ function sanitizeRequestMetadata(input: unknown): {
         runId: asString(autonomy.runId ?? autonomy.run_id),
         snapshotId: asString(autonomy.snapshotId ?? autonomy.snapshot_id),
         patternKey: asString(autonomy.patternKey ?? autonomy.pattern_key),
-        componentArea: componentAreaRaw,
+        componentArea: scope.componentArea ?? componentAreaRaw,
         targetPaths: scope.normalizedTargetPaths,
         writeGlobs: scope.normalizedWriteGlobs,
       },

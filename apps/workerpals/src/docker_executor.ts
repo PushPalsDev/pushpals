@@ -65,6 +65,14 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+function resolveDockerExecutable(): string {
+  const absolute = String(process.env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? "").trim();
+  if (absolute) return absolute;
+  const configured = String(process.env.PUSHPALS_DOCKER_BIN ?? "").trim();
+  if (configured) return configured;
+  return process.platform === "win32" ? "docker.exe" : "docker";
+}
+
 type ParsedWorktreeRecord = {
   path: string;
   detached: boolean;
@@ -677,7 +685,7 @@ export class DockerExecutor {
 
     args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
 
-    const proc = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn([resolveDockerExecutable(), ...args], { stdout: "pipe", stderr: "pipe" });
     const [exitCode, stdout, stderr] = await Promise.all([
       proc.exited,
       new Response(proc.stdout).text(),
@@ -744,7 +752,7 @@ export class DockerExecutor {
   private async ensureWarmContainer(): Promise<void> {
     const inspect = Bun.spawn(
       [
-        "docker",
+        resolveDockerExecutable(),
         "inspect",
         "-f",
         "{{.State.Running}}|{{.HostConfig.NetworkMode}}",
@@ -778,7 +786,7 @@ export class DockerExecutor {
     stderr: string;
     exitCode: number;
   }> {
-    const proc = Bun.spawn(["docker", "exec", this.warmContainerName, "/bin/sh", "-lc", command], {
+    const proc = Bun.spawn([resolveDockerExecutable(), "exec", this.warmContainerName, "/bin/sh", "-lc", command], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -798,7 +806,7 @@ export class DockerExecutor {
   private async inspectWarmContainerState(): Promise<string> {
     const proc = Bun.spawn(
       [
-        "docker",
+        resolveDockerExecutable(),
         "inspect",
         "-f",
         "running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}} started={{.State.StartedAt}} finished={{.State.FinishedAt}} oom={{.State.OOMKilled}}",
@@ -818,7 +826,7 @@ export class DockerExecutor {
   }
 
   private async readWarmContainerLogs(tail = 160): Promise<string> {
-    const proc = Bun.spawn(["docker", "logs", "--tail", String(tail), this.warmContainerName], {
+    const proc = Bun.spawn([resolveDockerExecutable(), "logs", "--tail", String(tail), this.warmContainerName], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -978,7 +986,7 @@ export class DockerExecutor {
 
   private async stopWarmContainer(reason: string, quiet = false): Promise<void> {
     this.clearIdleTimer();
-    const stopProc = Bun.spawn(["docker", "rm", "-f", this.warmContainerName], {
+    const stopProc = Bun.spawn([resolveDockerExecutable(), "rm", "-f", this.warmContainerName], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -1028,7 +1036,7 @@ export class DockerExecutor {
       `[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary()})`,
     );
 
-    const proc = Bun.spawn(["docker", ...args], {
+    const proc = Bun.spawn([resolveDockerExecutable(), ...args], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -1059,7 +1067,7 @@ export class DockerExecutor {
       try {
         proc.kill();
         // Reset the warm container to clear any stuck in-container process.
-        Bun.spawn(["docker", "restart", "-t", "1", this.warmContainerName]);
+        Bun.spawn([resolveDockerExecutable(), "restart", "-t", "1", this.warmContainerName]);
       } catch {
         // Ignore kill errors
       }
@@ -1132,7 +1140,7 @@ export class DockerExecutor {
 
     const proc = Bun.spawn(
       [
-        "docker",
+        resolveDockerExecutable(),
         "run",
         "--rm",
         "--name",
@@ -1572,7 +1580,7 @@ export class DockerExecutor {
 
     const build = Bun.spawn(
       [
-        "docker",
+        resolveDockerExecutable(),
         "build",
         "--no-cache",
         "-f",
@@ -1670,7 +1678,7 @@ export class DockerExecutor {
     }
 
     console.log(`[DockerExecutor] Local image not found. Pulling: ${this.options.imageName}`);
-    const proc = Bun.spawn(["docker", "pull", this.options.imageName], {
+    const proc = Bun.spawn([resolveDockerExecutable(), "pull", this.options.imageName], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -1699,7 +1707,7 @@ export class DockerExecutor {
    * Check if the Docker image exists locally
    */
   private async imageExists(): Promise<boolean> {
-    const proc = Bun.spawn(["docker", "image", "inspect", this.options.imageName], {
+    const proc = Bun.spawn([resolveDockerExecutable(), "image", "inspect", this.options.imageName], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -1712,7 +1720,7 @@ export class DockerExecutor {
    */
   static async isDockerAvailable(): Promise<boolean> {
     try {
-      const proc = Bun.spawn(["docker", "version"], {
+      const proc = Bun.spawn([resolveDockerExecutable(), "version"], {
         stdout: "pipe",
         stderr: "pipe",
       });

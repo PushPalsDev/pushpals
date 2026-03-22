@@ -781,6 +781,21 @@ enabled = true
                 },
               });
             }
+            if (url.pathname === "/workers") {
+              return Response.json({
+                ok: true,
+                workers: [
+                  {
+                    workerId: "workerpal-1",
+                    sessionId: targetSessionId,
+                    isOnline: true,
+                    status: "online",
+                    activeJobCount: 0,
+                    lastSeenAt: new Date().toISOString(),
+                  },
+                ],
+              });
+            }
             return new Response("not found", { status: 404 });
           },
         });

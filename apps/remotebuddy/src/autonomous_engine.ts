@@ -1,13 +1,13 @@
 import { createHash, randomUUID } from "crypto";
-import { existsSync, mkdirSync, rmSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "fs";
 import { resolve } from "path";
 import type { CommunicationManager } from "shared";
 import {
-  componentRootPrefix,
   extractVisionKeyItems,
   loadRepoDocText,
   loadPromptTemplate,
   makePatternKey,
+  normalizeAutonomyComponentArea,
   normalizePenalties,
   normalizeVisionSectionRefs,
   penaltyTotal,
@@ -859,16 +859,278 @@ const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>([
   "dep_bump",
 ]);
 
-const COMPONENT_AREAS = new Set<AutonomyComponentArea>([
-  "apps/server",
-  "apps/remotebuddy",
-  "apps/workerpals",
-  "apps/client",
-  "packages/protocol",
-  "packages/shared",
-  "tests/integration",
-  "tests/unit",
+type RepoTargetProfile = {
+  component_area: AutonomyComponentArea;
+  target_paths: string[];
+  write_globs: string[];
+  label: string;
+  keywords: string[];
+};
+
+const COMMON_REPO_TARGET_DIRS = [
+  "src",
+  "app",
+  "apps",
+  "server",
+  "client",
+  "frontend",
+  "backend",
+  "web",
+  "api",
+  "lib",
+  "services",
+  "packages",
+  "cmd",
+  "internal",
+  "tests",
+  "test",
+  "docs",
+  "scripts",
+] as const;
+
+const COMMON_REPO_TARGET_FILES = [
+  "README.md",
+  "package.json",
+  "pyproject.toml",
+  "Cargo.toml",
+  "go.mod",
+  "pom.xml",
+  "build.gradle",
+  "Makefile",
+  "vision.md",
+] as const;
+
+const REPO_TARGET_SCAN_EXTENSIONS = new Set([
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".py",
+  ".go",
+  ".rs",
+  ".java",
+  ".kt",
+  ".swift",
+  ".cs",
+  ".rb",
+  ".php",
+  ".cpp",
+  ".c",
+  ".h",
+  ".md",
+  ".toml",
+  ".json",
+  ".yaml",
+  ".yml",
 ]);
+
+const IGNORED_REPO_TARGET_DIRS = new Set([
+  ".git",
+  ".worktrees",
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  "outputs",
+  ".next",
+  ".turbo",
+  ".idea",
+  ".vscode",
+  ".venv",
+  "venv",
+  "__pycache__",
+  "target",
+]);
+
+function pathBasename(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const idx = normalized.lastIndexOf("/");
+  return idx >= 0 ? normalized.slice(idx + 1) : normalized;
+}
+
+function pathDirname(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const idx = normalized.lastIndexOf("/");
+  return idx > 0 ? normalized.slice(0, idx) : "";
+}
+
+function pathExtname(path: string): string {
+  const base = pathBasename(path);
+  const idx = base.lastIndexOf(".");
+  return idx > 0 ? base.slice(idx).toLowerCase() : "";
+}
+
+function tokenizePath(value: string): string[] {
+  return value
+    .replace(/\\/g, "/")
+    .split(/[^A-Za-z0-9]+/g)
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function buildRepoTargetProfile(targetPath: string): RepoTargetProfile {
+  const normalized = asString(targetPath).replace(/\\/g, "/");
+  const componentArea = normalizeAutonomyComponentArea(pathDirname(normalized) || normalized) ?? normalized;
+  const keywords = [...new Set([...tokenizePath(componentArea), ...tokenizePath(normalized)])];
+  return {
+    component_area: componentArea,
+    target_paths: [normalized],
+    write_globs: [normalized],
+    label: normalized,
+    keywords,
+  };
+}
+
+function collectRepoTargetFiles(
+  repoRoot: string,
+  startRelativePath: string,
+  maxResults: number,
+  maxDepth = 3,
+): string[] {
+  const startPath = resolve(repoRoot, startRelativePath);
+  if (!existsSync(startPath)) return [];
+  const out: string[] = [];
+  const walk = (absolutePath: string, relativePath: string, depth: number): void => {
+    if (out.length >= maxResults) return;
+    let stat;
+    try {
+      stat = statSync(absolutePath);
+    } catch {
+      return;
+    }
+    if (stat.isDirectory()) {
+      if (depth > maxDepth) return;
+      let entries;
+      try {
+        entries = readdirSync(absolutePath, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (entry.isDirectory() && IGNORED_REPO_TARGET_DIRS.has(entry.name)) continue;
+        const childRelative = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+        const childAbsolute = resolve(absolutePath, entry.name);
+        if (entry.isDirectory()) {
+          walk(childAbsolute, childRelative, depth + 1);
+        } else if (REPO_TARGET_SCAN_EXTENSIONS.has(pathExtname(entry.name))) {
+          out.push(childRelative);
+          if (out.length >= maxResults) return;
+        }
+      }
+      return;
+    }
+    if (REPO_TARGET_SCAN_EXTENSIONS.has(pathExtname(relativePath))) {
+      out.push(relativePath);
+    }
+  };
+  walk(startPath, startRelativePath, 0);
+  return out;
+}
+
+function discoverRepoTargetProfiles(repoRoot: string, maxProfiles = 16): RepoTargetProfile[] {
+  const profiles: RepoTargetProfile[] = [];
+  const seen = new Set<string>();
+  const add = (targetPath: string | null | undefined): void => {
+    const finalPath = normalizeAutonomyComponentArea(targetPath);
+    if (!finalPath) return;
+    if (seen.has(finalPath)) return;
+    seen.add(finalPath);
+    profiles.push(buildRepoTargetProfile(finalPath));
+  };
+
+  for (const file of COMMON_REPO_TARGET_FILES) {
+    const absolutePath = resolve(repoRoot, file);
+    if (existsSync(absolutePath)) add(file);
+    if (profiles.length >= maxProfiles) return profiles;
+  }
+  for (const dir of COMMON_REPO_TARGET_DIRS) {
+    const files = collectRepoTargetFiles(repoRoot, dir, 2, 3);
+    for (const file of files) {
+      add(file);
+      if (profiles.length >= maxProfiles) return profiles;
+    }
+  }
+  if (profiles.length < maxProfiles) {
+    const rootFiles = collectRepoTargetFiles(repoRoot, "", Math.max(4, maxProfiles - profiles.length), 2);
+    for (const file of rootFiles) {
+      add(file);
+      if (profiles.length >= maxProfiles) return profiles;
+    }
+  }
+  return profiles;
+}
+
+function chooseRepoTargetProfile(
+  profiles: RepoTargetProfile[],
+  hints: string[],
+  triggerType?: EngineCandidateShape["trigger_type"],
+): RepoTargetProfile | null {
+  if (profiles.length === 0) return null;
+  const hintTokens = [...new Set(hints.flatMap((hint) => tokenizePath(hint)))];
+  let best: { profile: RepoTargetProfile; score: number } | null = null;
+  for (const profile of profiles) {
+    let score = 0;
+    for (const token of hintTokens) {
+      if (profile.keywords.includes(token)) score += 2;
+      if (profile.label.toLowerCase().includes(token)) score += 1;
+    }
+    if (triggerType === "test_failure" && /(^|\/)(test|tests)\//.test(profile.label)) score += 3;
+    if (triggerType === "queue_health" && /(server|api|queue|worker|job|task)/i.test(profile.label)) score += 2;
+    if (triggerType === "regret_signal" && /(src|app|lib|server|client|docs|readme)/i.test(profile.label)) score += 1;
+    if (!best || score > best.score) best = { profile, score };
+  }
+  return best?.profile ?? profiles[0] ?? null;
+}
+
+function adaptCandidateShapeToRepo(params: {
+  shape: EngineCandidateShape;
+  repoRoot?: string;
+  repoTargets?: RepoTargetProfile[];
+  hints?: string[];
+}): EngineCandidateShape {
+  const shape = params.shape;
+  const scopeValidation = validateScopeInvariants(shape.component_area, shape.target_paths, shape.write_globs, {
+    requireWriteGlobs: true,
+  });
+  const pathsExist =
+    params.repoRoot && scopeValidation.ok
+      ? findMissingRepoTargetPaths(params.repoRoot, scopeValidation.normalizedTargetPaths).length === 0
+      : scopeValidation.ok;
+  if (scopeValidation.ok && pathsExist) {
+    return {
+      ...shape,
+      component_area: scopeValidation.componentArea ?? shape.component_area,
+      target_paths: scopeValidation.normalizedTargetPaths,
+      write_globs: scopeValidation.normalizedWriteGlobs,
+    };
+  }
+  const selected = chooseRepoTargetProfile(
+    params.repoTargets ?? [],
+    [
+      shape.component_area,
+      ...shape.target_paths,
+      ...shape.write_globs,
+      ...(params.hints ?? []),
+    ],
+    shape.trigger_type,
+  );
+  if (!selected) return shape;
+  return {
+    ...shape,
+    component_area: selected.component_area,
+    target_paths: selected.target_paths,
+    write_globs: selected.write_globs,
+  };
+}
+
+function findMissingRepoTargetPaths(repoRoot: string, targetPaths: string[]): string[] {
+  return targetPaths
+    .map((targetPath) => asString(targetPath))
+    .filter(Boolean)
+    .filter((targetPath) => !existsSync(resolve(repoRoot, targetPath)));
+}
 
 function asAutonomyObjectiveType(value: unknown): AutonomyObjectiveType | null {
   const normalized = asString(value) as AutonomyObjectiveType;
@@ -876,8 +1138,7 @@ function asAutonomyObjectiveType(value: unknown): AutonomyObjectiveType | null {
 }
 
 function asAutonomyComponentArea(value: unknown): AutonomyComponentArea | null {
-  const normalized = asString(value) as AutonomyComponentArea;
-  return COMPONENT_AREAS.has(normalized) ? normalized : null;
+  return normalizeAutonomyComponentArea(value);
 }
 
 function defaultCandidateShapeForArea(area: AutonomyComponentArea): EngineCandidateShape {
@@ -961,6 +1222,16 @@ function defaultCandidateShapeForArea(area: AutonomyComponentArea): EngineCandid
         write_globs: ["tests/unit/*"],
         risk_level: "low",
         expected_validation: ["bun run test:root"],
+      };
+    default:
+      return {
+        objective_type: "small_refactor",
+        trigger_type: "regret_signal",
+        component_area: area,
+        target_paths: [area],
+        write_globs: [area],
+        risk_level: "low",
+        expected_validation: ["git status --porcelain"],
       };
   }
 }
@@ -1394,11 +1665,17 @@ function normalizeValidationIdeas(ideas: string[]): string[] {
   return [...new Set(out)].slice(0, 5);
 }
 
-function inferComponentAreaFromText(text: string): AutonomyComponentArea {
+function inferComponentAreaFromText(
+  text: string,
+  repoTargets?: RepoTargetProfile[],
+  triggerType?: EngineCandidateShape["trigger_type"],
+): AutonomyComponentArea {
+  const repoTargetMatch = chooseRepoTargetProfile(repoTargets ?? [], [text], triggerType);
+  if (repoTargetMatch) return repoTargetMatch.component_area;
   for (const rule of INSPIRATION_COMPONENT_HINTS) {
     if (rule.pattern.test(text)) return rule.area;
   }
-  return "apps/remotebuddy";
+  return "src";
 }
 
 function inferObjectiveTypeFromText(text: string, tags: string[]): AutonomyObjectiveType {
@@ -1600,7 +1877,12 @@ function applySourceCurationToPatterns(
   });
 }
 
-function buildCandidateShapeFromPattern(pattern: InspirationPatternInput): EngineCandidateShape {
+function buildCandidateShapeFromPattern(params: {
+  pattern: InspirationPatternInput;
+  repoRoot?: string;
+  repoTargets?: RepoTargetProfile[];
+}): EngineCandidateShape {
+  const pattern = params.pattern;
   const text = `${pattern.algorithm}\n${pattern.whenToUse}\n${pattern.summary}\n${pattern.tags.join(" ")}`.toLowerCase();
   const metadata = pattern.metadata;
   const metadataShape = asObject(metadata.candidate_shape ?? metadata.candidateShape);
@@ -1611,21 +1893,20 @@ function buildCandidateShapeFromPattern(pattern: InspirationPatternInput): Engin
         metadata.component_area ??
         metadata.componentArea,
     ) ?? null;
-  const componentArea = metadataArea ?? inferComponentAreaFromText(text);
-  const defaults = defaultCandidateShapeForArea(componentArea);
-  const objectiveType =
-    asAutonomyObjectiveType(metadataShape.objective_type ?? metadataShape.objectiveType ?? metadata.objective_type) ??
-    inferObjectiveTypeFromText(text, pattern.tags) ??
-    defaults.objective_type;
   const triggerTypeRaw = asString(
     metadataShape.trigger_type ?? metadataShape.triggerType ?? metadata.trigger_type,
   );
   const triggerType = isTriggerType(triggerTypeRaw)
     ? triggerTypeRaw
-    : inferTriggerTypeFromText(text) ?? defaults.trigger_type;
+    : inferTriggerTypeFromText(text);
+  const componentArea = metadataArea ?? inferComponentAreaFromText(text, params.repoTargets, triggerType);
+  const defaults = defaultCandidateShapeForArea(componentArea);
+  const objectiveType =
+    asAutonomyObjectiveType(metadataShape.objective_type ?? metadataShape.objectiveType ?? metadata.objective_type) ??
+    inferObjectiveTypeFromText(text, pattern.tags) ??
+    defaults.objective_type;
   const riskRaw = asString(metadataShape.risk_level ?? metadataShape.riskLevel ?? metadata.risk_level);
   const riskLevel = isRiskLevel(riskRaw) ? riskRaw : inferRiskLevelFromText(text, pattern.tags);
-  const rootPrefix = componentRootPrefix(componentArea).replace(/\/$/, "");
   const targetPaths = asStringArray(
     metadataShape.target_paths ?? metadataShape.targetPaths ?? metadata.target_paths,
   );
@@ -1644,15 +1925,28 @@ function buildCandidateShapeFromPattern(pattern: InspirationPatternInput): Engin
     writeGlobs.length > 0 ? writeGlobs : defaults.write_globs,
     { requireWriteGlobs: true },
   );
-  return {
-    objective_type: objectiveType,
-    trigger_type: triggerType,
-    component_area: componentArea,
-    target_paths: scopeCheck.ok ? scopeCheck.normalizedTargetPaths : [rootPrefix],
-    write_globs: scopeCheck.ok ? scopeCheck.normalizedWriteGlobs : defaults.write_globs,
-    risk_level: riskLevel,
-    expected_validation: normalizeValidationIdeas(validationIdeas),
-  };
+  return adaptCandidateShapeToRepo({
+    shape: {
+      objective_type: objectiveType,
+      trigger_type: triggerType,
+      component_area: scopeCheck.componentArea ?? componentArea,
+      target_paths: scopeCheck.ok ? scopeCheck.normalizedTargetPaths : defaults.target_paths,
+      write_globs: scopeCheck.ok ? scopeCheck.normalizedWriteGlobs : defaults.write_globs,
+      risk_level: riskLevel,
+      expected_validation: normalizeValidationIdeas(validationIdeas),
+    },
+    repoRoot: params.repoRoot,
+    repoTargets: params.repoTargets,
+    hints: [
+      pattern.algorithm,
+      pattern.whenToUse,
+      pattern.summary,
+      pattern.sourceLabel ?? "",
+      pattern.sourceType,
+      ...pattern.tags,
+      ...pattern.sourceRefs,
+    ],
+  });
 }
 
 function buildExternalInspirationBlocks(params: {
@@ -1661,6 +1955,8 @@ function buildExternalInspirationBlocks(params: {
   opportunityGaps: EngineOpportunityGap[];
   dispatchByType: Record<string, number>;
   dispatchSaturation: number;
+  repoRoot?: string;
+  repoTargets?: RepoTargetProfile[];
 }): EngineIdeaBuildingBlock[] {
   const objectiveWeightById = new Map(params.compiledObjectives.map((entry) => [entry.id, entry.weight]));
   const gapScoreById = new Map(params.opportunityGaps.map((entry) => [entry.id, entry.score]));
@@ -1669,7 +1965,11 @@ function buildExternalInspirationBlocks(params: {
       const text = `${pattern.algorithm}\n${pattern.whenToUse}\n${pattern.summary}\n${pattern.tags.join(" ")}`;
       const objectiveIds = matchObjectiveIdsFromText(text, params.compiledObjectives);
       const gapIds = matchGapIdsFromText(text, params.opportunityGaps);
-      const candidateShape = buildCandidateShapeFromPattern(pattern);
+      const candidateShape = buildCandidateShapeFromPattern({
+        pattern,
+        repoRoot: params.repoRoot,
+        repoTargets: params.repoTargets,
+      });
       const objectiveSignal = clamp01(
         average(objectiveIds.map((id) => objectiveWeightById.get(id) ?? 0).filter((value) => Number.isFinite(value))),
       );
@@ -1708,7 +2008,7 @@ function buildExternalInspirationBlocks(params: {
         summary: pattern.summary,
         hypothesis:
           `Apply ${pattern.algorithm} when ${pattern.whenToUse}. ` +
-          `Adapt conceptually to PushPals constraints; avoid direct code copying.`,
+          `Adapt the idea to the active repo constraints; avoid direct code copying.`,
         objective_ids: objectiveIds,
         gap_ids: gapIds,
         score,
@@ -1767,6 +2067,8 @@ function buildCommitHistoryBlocks(params: {
   opportunityGaps: EngineOpportunityGap[];
   dispatchByType: Record<string, number>;
   dispatchSaturation: number;
+  repoRoot?: string;
+  repoTargets?: RepoTargetProfile[];
 }): EngineIdeaBuildingBlock[] {
   const objectiveWeightById = new Map(params.compiledObjectives.map((entry) => [entry.id, entry.weight]));
   const gapScoreById = new Map(params.opportunityGaps.map((entry) => [entry.id, entry.score]));
@@ -1775,6 +2077,12 @@ function buildCommitHistoryBlocks(params: {
     .map((hint) => {
       const rule = COMMIT_MOTIF_RULES.find((entry) => entry.motifId === hint.motif_id);
       if (!rule) return null;
+      const candidateShape = adaptCandidateShapeToRepo({
+        shape: rule.shape,
+        repoRoot: params.repoRoot,
+        repoTargets: params.repoTargets,
+        hints: [hint.label, ...hint.sample_subjects],
+      });
       const objectiveSignal = clamp01(
         average(
           hint.objective_ids
@@ -1790,7 +2098,7 @@ function buildCommitHistoryBlocks(params: {
       );
       const recentTypeCount = Math.max(
         0,
-        Math.floor(asNumber(params.dispatchByType[rule.shape.objective_type], 0)),
+        Math.floor(asNumber(params.dispatchByType[candidateShape.objective_type], 0)),
       );
       const noveltySignal = clamp01(1 - recentTypeCount / 6);
       const score = clamp01(
@@ -1817,7 +2125,7 @@ function buildCommitHistoryBlocks(params: {
           `gap_signal=${gapSignal.toFixed(2)}`,
           ...hint.sample_subjects.map((subject) => `commit=${subject}`),
         ],
-        candidate_shape: rule.shape,
+        candidate_shape: candidateShape,
       } satisfies EngineIdeaBuildingBlock;
     })
     .filter((entry): entry is EngineIdeaBuildingBlock => Boolean(entry))
@@ -2200,6 +2508,8 @@ export function buildEngineInspirationContext(params: {
   inspirationPatterns?: unknown[];
   sourceInsights?: unknown[];
   commitHistoryHints?: EngineCommitHistoryHint[];
+  repoRoot?: string;
+  repoTargets?: RepoTargetProfile[];
 }): EngineInspirationContext {
   const oneSentence = asString(params.vision.one_sentence);
   const keyItems = params.vision.key_items;
@@ -2301,6 +2611,12 @@ export function buildEngineInspirationContext(params: {
   const dispatchByType = params.snapshot.dispatch_budget.by_type_count_last_hour ?? {};
 
   const staticBuildingBlocks: EngineIdeaBuildingBlock[] = ENGINE_IDEA_BLUEPRINTS.map((blueprint) => {
+    const candidateShape = adaptCandidateShapeToRepo({
+      shape: blueprint.candidate_shape,
+      repoRoot: params.repoRoot,
+      repoTargets: params.repoTargets,
+      hints: [blueprint.algorithm, blueprint.summary, blueprint.hypothesis, ...blueprint.objective_ids, ...blueprint.gap_ids],
+    });
     const objectiveWeights = blueprint.objective_ids
       .map((id) => objectiveWeightById.get(id) ?? 0)
       .filter((value) => Number.isFinite(value));
@@ -2311,7 +2627,7 @@ export function buildEngineInspirationContext(params: {
     const gapSignal = clamp01(Math.max(0, ...gapScores));
     const recentTypeCount = Math.max(
       0,
-      Math.floor(asNumber(dispatchByType[blueprint.candidate_shape.objective_type], 0)),
+      Math.floor(asNumber(dispatchByType[candidateShape.objective_type], 0)),
     );
     const noveltySignal = clamp01(1 - recentTypeCount / 6);
     const score = clamp01(
@@ -2322,6 +2638,7 @@ export function buildEngineInspirationContext(params: {
     );
     return {
       ...blueprint,
+      candidate_shape: candidateShape,
       score,
       evidence: [
         `objective_signal=${objectiveSignal.toFixed(2)}`,
@@ -2360,6 +2677,8 @@ export function buildEngineInspirationContext(params: {
     opportunityGaps,
     dispatchByType,
     dispatchSaturation,
+    repoRoot: params.repoRoot,
+    repoTargets: params.repoTargets,
   });
   const commitHistoryHints = Array.isArray(params.commitHistoryHints)
     ? params.commitHistoryHints.slice(0, 10)
@@ -2370,6 +2689,8 @@ export function buildEngineInspirationContext(params: {
     opportunityGaps,
     dispatchByType,
     dispatchSaturation,
+    repoRoot: params.repoRoot,
+    repoTargets: params.repoTargets,
   });
   const buildingBlockMap = new Map<string, EngineIdeaBuildingBlock>();
   for (const block of [...staticBuildingBlocks, ...externalBlocks, ...historyBlocks]) {
@@ -2514,6 +2835,8 @@ export function buildEngineFallbackCandidates(params: {
   snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
   visionSectionRefs: string[];
   maxCandidates?: number;
+  repoRoot?: string;
+  repoTargets?: RepoTargetProfile[];
 }): Array<Record<string, unknown>> {
   const maxCandidates = Number.isFinite(params.maxCandidates)
     ? Math.max(1, Math.min(6, Math.floor(params.maxCandidates as number)))
@@ -2527,6 +2850,12 @@ export function buildEngineFallbackCandidates(params: {
     .filter((block) => block.score >= 0.42)
     .slice(0, maxCandidates)
     .map((block, idx) => {
+      const candidateShape = adaptCandidateShapeToRepo({
+        shape: block.candidate_shape,
+        repoRoot: params.repoRoot,
+        repoTargets: params.repoTargets,
+        hints: [block.algorithm, block.summary, block.hypothesis, ...block.evidence],
+      });
       const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, block.candidate_shape.trigger_type);
       const objectiveTitles = block.objective_ids
         .map((id) => objectiveTitleById.get(id))
@@ -2550,19 +2879,19 @@ export function buildEngineFallbackCandidates(params: {
       return {
         id: `cand_engine_${block.id}_${randomUUID().slice(0, 8)}`,
         title: `Engine building block: ${block.algorithm}`,
-        objective_type: block.candidate_shape.objective_type,
+        objective_type: candidateShape.objective_type,
         problem_statement:
-          `Implement ${block.algorithm} in PushPals autonomy to improve ${primaryObjectiveTitle}. ` +
+          `Implement ${block.algorithm} in the active repo autonomy loop to improve ${primaryObjectiveTitle}. ` +
           `Deliver a small, test-backed change with clear operational telemetry.`,
-        trigger_type: block.candidate_shape.trigger_type,
-        component_area: block.candidate_shape.component_area,
-        target_paths: block.candidate_shape.target_paths,
+        trigger_type: candidateShape.trigger_type,
+        component_area: candidateShape.component_area,
+        target_paths: candidateShape.target_paths,
         scope: {
           read_anywhere: false,
-          write_globs: block.candidate_shape.write_globs,
+          write_globs: candidateShape.write_globs,
         },
-        risk_level: block.candidate_shape.risk_level,
-        expected_validation: block.candidate_shape.expected_validation,
+        risk_level: candidateShape.risk_level,
+        expected_validation: candidateShape.expected_validation,
         estimated_effort: idx === 0 ? "small" : "medium",
         why_now_signal_ids: signalIds,
         confidence: clamp01(0.45 + block.score * 0.5),
@@ -3572,6 +3901,9 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
 
+      this.setPhase("discover_repo_targets");
+      const repoTargets = discoverRepoTargetProfiles(this.autonomyRepo, 16);
+
       this.setPhase("fetch_snapshot");
       const snapshot = await this.fetchSnapshot(runId, preflight);
       if (!snapshot) {
@@ -3628,6 +3960,8 @@ export class RemoteBuddyAutonomousEngine {
         inspirationPatterns,
         sourceInsights,
         commitHistoryHints,
+        repoRoot: this.autonomyRepo,
+        repoTargets,
       });
       const visionSectionNumberSet = new Set(visionContext.section_numbers);
       const requireVisionSectionRefs = visionSectionNumberSet.size > 0;
@@ -3674,6 +4008,13 @@ export class RemoteBuddyAutonomousEngine {
                   active_cooldowns: snapshot.active_cooldowns.slice(0, 20),
                 },
                 vision: visionContext,
+                repo_targets: repoTargets.map((target) => ({
+                  component_area: target.component_area,
+                  target_paths: target.target_paths,
+                  write_globs: target.write_globs,
+                  label: target.label,
+                  keywords: target.keywords.slice(0, 8),
+                })),
                 engine_inspiration: engineInspiration,
                 limits: {
                   ideation_max_candidates: this.cfg.ideationMaxCandidates,
@@ -3701,6 +4042,8 @@ export class RemoteBuddyAutonomousEngine {
           snapshotTopSignals: snapshot.top_signals,
           visionSectionRefs: visionContext.section_numbers,
           maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+          repoRoot: this.autonomyRepo,
+          repoTargets,
         });
         if (synthesized.length > 0) {
           console.log(
@@ -3734,7 +4077,8 @@ export class RemoteBuddyAutonomousEngine {
             objective_type: asString(c.objective_type) as AutonomyObjectiveType,
             problem_statement: asString(c.problem_statement),
             trigger_type: triggerType,
-            component_area: asString(c.component_area) as AutonomyComponentArea,
+            component_area: (normalizeAutonomyComponentArea(c.component_area ?? c.componentArea) ??
+              "") as AutonomyComponentArea,
             target_paths: asStringArray(c.target_paths),
             scope: {
               read_anywhere: asBoolean(asObject(c.scope).read_anywhere, false),
@@ -3803,8 +4147,19 @@ export class RemoteBuddyAutonomousEngine {
             recordDropReason(`${source}_missing_vision_section_refs`);
             continue;
           }
+          candidate.component_area = (scopeValidation.componentArea ?? candidate.component_area) as AutonomyComponentArea;
           candidate.target_paths = scopeValidation.normalizedTargetPaths;
           candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
+          const missingTargetPaths = findMissingRepoTargetPaths(this.autonomyRepo, candidate.target_paths);
+          if (missingTargetPaths.length > 0) {
+            recordDropReason(`${source}_target_paths_missing_in_repo`);
+            console.warn(
+              `[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: target_paths missing in repo ${missingTargetPaths.join(
+                ", ",
+              )}`,
+            );
+            continue;
+          }
           if (!candidate.engine_trial) {
             const inferred = inferEngineTrialFromCandidate(candidate, engineInspiration);
             if (inferred) {
@@ -3824,6 +4179,8 @@ export class RemoteBuddyAutonomousEngine {
           snapshotTopSignals: snapshot.top_signals,
           visionSectionRefs: visionContext.section_numbers,
           maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+          repoRoot: this.autonomyRepo,
+          repoTargets,
         });
         if (synthesizedFallback.length > 0) {
           ingestRawCandidates(synthesizedFallback, "engine_fallback");

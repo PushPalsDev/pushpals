@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "crypto";
 import { loadPushPalsConfig, type PushPalsConfig } from "shared";
 import {
+  normalizeAutonomyComponentArea,
   makePatternKey,
   normalizePenalties,
   penaltyTotal,
@@ -174,16 +175,6 @@ const OBJECTIVE_POLICY: Record<AutonomyObjectiveType, ObjectivePolicy> = {
 const RISK_ORDER: Record<AutonomyRiskLevel, number> = { low: 0, medium: 1, high: 2 };
 const BREADTH_ORDER: Record<AutonomyGlobBreadth, number> = { narrow: 0, medium: 1, broad: 2 };
 const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>(Object.keys(OBJECTIVE_POLICY) as AutonomyObjectiveType[]);
-const COMPONENT_AREAS = new Set<AutonomyComponentArea>([
-  "apps/server",
-  "apps/remotebuddy",
-  "apps/workerpals",
-  "apps/client",
-  "packages/protocol",
-  "packages/shared",
-  "tests/integration",
-  "tests/unit",
-]);
 const TRIGGER_TYPES = new Set<SignalValue["type"]>([
   "test_failure",
   "lint_failure",
@@ -623,9 +614,7 @@ function asObjectiveType(value: unknown): AutonomyObjectiveType | null {
 }
 
 function asComponentArea(value: unknown): AutonomyComponentArea | null {
-  const text = asString(value);
-  if (!text) return null;
-  return COMPONENT_AREAS.has(text as AutonomyComponentArea) ? (text as AutonomyComponentArea) : null;
+  return normalizeAutonomyComponentArea(value);
 }
 
 function asTriggerType(value: unknown): SignalValue["type"] | null {
@@ -3367,15 +3356,9 @@ export class AutonomyStore {
       const expectedValidation = asStringArray(record.expectedValidation ?? record.expected_validation);
       const readAnywhere = asBoolean(scopeRecord.readAnywhere ?? scopeRecord.read_anywhere, false);
       const writeGlobs = asStringArray(scopeRecord.writeGlobs ?? scopeRecord.write_globs);
-      const scopeValidation = componentArea
-        ? validateScopeInvariants(componentArea, targetPaths, writeGlobs, { requireWriteGlobs: true })
-        : {
-            ok: false,
-            normalizedTargetPaths: targetPaths,
-            normalizedWriteGlobs: writeGlobs,
-            breadth: "broad" as AutonomyGlobBreadth,
-            errors: [`invalid component_area "${componentAreaRaw}"`],
-          };
+      const scopeValidation = validateScopeInvariants(componentArea, targetPaths, writeGlobs, {
+        requireWriteGlobs: true,
+      });
       const enumErrors: string[] = [];
       if (!objectiveType) enumErrors.push(`invalid objective_type "${objectiveTypeRaw}"`);
       if (!triggerType) enumErrors.push(`invalid trigger_type "${triggerTypeRaw}"`);
@@ -3413,7 +3396,7 @@ export class AutonomyStore {
           : 0.55 * llmScore + 0.2 * impactSignal + 0.15 * emaSuccess + 0.1 * emaUserAccept - penaltyTotal(penalties);
       const objectiveTypePersist = (objectiveType ?? objectiveTypeRaw) || "invalid";
       const triggerTypePersist = (triggerType ?? triggerTypeRaw) || "invalid";
-      const componentAreaPersist = (componentArea ?? componentAreaRaw) || "invalid";
+      const componentAreaPersist = scopeValidation.componentArea ?? componentAreaRaw ?? "invalid";
       const candidateExternalId = asString(record.id) || randomUUID();
       const candidateStorageId = scopedCandidateStorageId(runId, candidateExternalId);
       const engineTrialMeta = extractEngineTrialCandidateMeta(record);
@@ -3526,9 +3509,6 @@ export class AutonomyStore {
     }
     const componentAreaRaw = asString(objective.componentArea ?? objective.component_area);
     const componentArea = asComponentArea(componentAreaRaw);
-    if (!componentArea) {
-      return { ok: false, objectiveId, reason: `invalid component_area "${componentAreaRaw}"` };
-    }
     const triggerTypeRaw = asString(objective.triggerType ?? objective.trigger_type);
     const triggerType = asTriggerType(triggerTypeRaw);
     if (!triggerType) {
@@ -3546,6 +3526,7 @@ export class AutonomyStore {
       { requireWriteGlobs: true },
     );
     if (!scopeValidation.ok) return { ok: false, objectiveId, reason: scopeValidation.errors.join("; ") };
+    const normalizedComponentArea = scopeValidation.componentArea ?? componentAreaRaw;
     const expectedValidation = asStringArray(
       objective.expectedValidation ??
         objective.expected_validation ??
@@ -3568,7 +3549,7 @@ export class AutonomyStore {
       objectiveType,
       scopeValidation.normalizedTargetPaths,
       triggerType,
-      componentArea,
+      normalizedComponentArea,
     );
     const objectiveCandidateRaw = asString(objective.candidateId ?? objective.candidate_id);
     const objectiveCandidateId = objectiveCandidateRaw
@@ -3626,7 +3607,7 @@ export class AutonomyStore {
         asString(objective.title),
         asString(objective.instruction),
         objectiveType,
-        componentArea,
+        normalizedComponentArea,
         triggerType,
         patternKey,
         objectiveStatus,

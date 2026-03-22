@@ -14,15 +14,7 @@ export type AutonomyObjectiveType =
 
 export type AutonomyRiskLevel = "low" | "medium" | "high";
 export type AutonomyGlobBreadth = "narrow" | "medium" | "broad";
-export type AutonomyComponentArea =
-  | "apps/server"
-  | "apps/remotebuddy"
-  | "apps/workerpals"
-  | "apps/client"
-  | "packages/protocol"
-  | "packages/shared"
-  | "tests/integration"
-  | "tests/unit";
+export type AutonomyComponentArea = string;
 
 export type AutonomyPenaltyKind =
   | "duplicate_pattern"
@@ -42,6 +34,7 @@ export interface AutonomyPenalty {
 
 export interface ScopeValidationResult {
   ok: boolean;
+  componentArea: string | null;
   normalizedTargetPaths: string[];
   normalizedWriteGlobs: string[];
   breadth: AutonomyGlobBreadth;
@@ -53,19 +46,78 @@ const PATH_META_RE = /[*?\[\]{}()!]/;
 const DRIVE_RE = /^[A-Za-z]:\//;
 const SLASH_RE = /\/+/g;
 
-const COMPONENT_ROOT_PREFIX: Record<AutonomyComponentArea, string> = {
-  "apps/server": "apps/server/",
-  "apps/remotebuddy": "apps/remotebuddy/",
-  "apps/workerpals": "apps/workerpals/",
-  "apps/client": "apps/client/",
-  "packages/protocol": "packages/protocol/",
-  "packages/shared": "packages/shared/",
-  "tests/integration": "tests/integration/",
-  "tests/unit": "tests/unit/",
-};
+function parentPath(path: string): string {
+  const idx = path.lastIndexOf("/");
+  if (idx <= 0) return path;
+  return path.slice(0, idx);
+}
+
+function isProbablyFilePath(path: string): boolean {
+  const lastSegment = path.split("/").at(-1) ?? "";
+  return lastSegment.includes(".");
+}
+
+function scopeSeedPath(path: string): string {
+  return isProbablyFilePath(path) ? parentPath(path) : path;
+}
+
+function commonRepoAncestor(paths: string[]): string | null {
+  const normalized = paths
+    .map((entry) => normalizeRepoRelativePath(entry))
+    .filter((entry): entry is string => Boolean(entry));
+  if (normalized.length === 0) return null;
+  const segments = normalized.map((entry) => entry.split("/"));
+  const shared: string[] = [];
+  const first = segments[0] ?? [];
+  for (let idx = 0; idx < first.length; idx += 1) {
+    const segment = first[idx];
+    if (!segment) break;
+    if (segments.every((parts) => parts[idx] === segment)) {
+      shared.push(segment);
+      continue;
+    }
+    break;
+  }
+  if (shared.length === 0) return normalized[0] ?? null;
+  return shared.join("/");
+}
+
+export function normalizeAutonomyComponentArea(value: unknown): string | null {
+  const normalized = normalizeRepoRelativePath(value);
+  if (!normalized) return null;
+  return normalized;
+}
+
+export function deriveAutonomyComponentArea(
+  targetPathsInput: unknown[],
+  writeGlobsInput?: unknown[],
+): string | null {
+  const writePrefixes = Array.isArray(writeGlobsInput)
+    ? writeGlobsInput
+        .map((entry) => normalizeWriteGlob(entry))
+        .filter((entry): entry is string => Boolean(entry))
+        .map((entry) => literalPrefix(entry))
+        .map((entry) => scopeSeedPath(entry))
+        .filter(Boolean)
+    : [];
+  if (writePrefixes.length > 0) {
+    return commonRepoAncestor(writePrefixes);
+  }
+  const targetSeeds = Array.isArray(targetPathsInput)
+    ? targetPathsInput
+        .map((entry) => normalizeTargetPath(entry))
+        .filter((entry): entry is string => Boolean(entry))
+        .map((entry) => scopeSeedPath(entry))
+        .filter(Boolean)
+    : [];
+  if (targetSeeds.length === 0) return null;
+  return commonRepoAncestor(targetSeeds);
+}
 
 export function componentRootPrefix(area: AutonomyComponentArea): string {
-  return COMPONENT_ROOT_PREFIX[area];
+  const normalized = normalizeAutonomyComponentArea(area);
+  if (!normalized) return "";
+  return `${normalized}/`;
 }
 
 export function containsGlobMeta(value: string): boolean {
@@ -239,13 +291,16 @@ function hasForbiddenBroadGlob(glob: string): boolean {
 }
 
 export function validateScopeInvariants(
-  componentArea: AutonomyComponentArea,
+  componentArea: AutonomyComponentArea | null | undefined,
   targetPathsInput: unknown[],
   writeGlobsInput: unknown[],
   options?: { requireWriteGlobs?: boolean },
 ): ScopeValidationResult {
   const errors: string[] = [];
-  const rootPrefix = componentRootPrefix(componentArea);
+  const normalizedComponentArea =
+    normalizeAutonomyComponentArea(componentArea) ??
+    deriveAutonomyComponentArea(targetPathsInput, writeGlobsInput);
+  const rootPrefix = normalizedComponentArea ? componentRootPrefix(normalizedComponentArea) : "";
   const normalizedTargetPaths: string[] = [];
   const targetSeen = new Set<string>();
   for (const raw of targetPathsInput) {
@@ -254,7 +309,7 @@ export function validateScopeInvariants(
       errors.push(`invalid target_path: ${String(raw ?? "")}`);
       continue;
     }
-    if (!underRoot(normalized, rootPrefix)) {
+    if (rootPrefix && !underRoot(normalized, rootPrefix)) {
       errors.push(`target_path outside component root: ${normalized}`);
       continue;
     }
@@ -284,7 +339,7 @@ export function validateScopeInvariants(
       errors.push(`write_glob literal prefix cannot be empty: ${normalized}`);
       continue;
     }
-    if (!underRoot(prefix, rootPrefix)) {
+    if (rootPrefix && !underRoot(prefix, rootPrefix)) {
       errors.push(`write_glob outside component root: ${normalized}`);
       continue;
     }
@@ -308,10 +363,14 @@ export function validateScopeInvariants(
       if (!covered) errors.push(`target_path not covered by write_globs: ${targetPath}`);
     }
   }
+  if (!normalizedComponentArea) {
+    errors.push("component_area could not be derived from scope");
+  }
 
   const breadth = classifyGlobBreadth(normalizedWriteGlobs);
   return {
     ok: errors.length === 0,
+    componentArea: normalizedComponentArea,
     normalizedTargetPaths,
     normalizedWriteGlobs,
     breadth,

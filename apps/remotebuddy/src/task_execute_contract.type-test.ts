@@ -17,7 +17,6 @@ type Equal<A, B> =
       : false
     : false;
 type Assert<T extends true> = T;
-type AssertFalse<T extends false> = T;
 
 type WorkerTaskExecutePlanningContract = Parameters<
   InferFallbackValidationCommandsForTestTask
@@ -137,13 +136,6 @@ type _WorkerComponentAreaNarrowing = Assert<
   NonNullable<
     Extract<TaskExecuteJobParams, { origin: "autonomy" }>["autonomy"]["componentArea"]
   > extends AutonomyJobMetadata["componentArea"]
-    ? true
-    : false
->;
-type _WorkerComponentAreaRejectsPlainString = AssertFalse<
-  string extends NonNullable<
-    Extract<TaskExecuteJobParams, { origin: "autonomy" }>["autonomy"]["componentArea"]
-  >
     ? true
     : false
 >;

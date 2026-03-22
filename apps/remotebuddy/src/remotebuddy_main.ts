@@ -27,6 +27,7 @@ import {
   CommunicationManager,
   detectRepoRoot,
   loadPushPalsConfig,
+  normalizeAutonomyComponentArea,
   resolveLocalServerConnection,
   sanitizePushPalsConfigForLogging,
   matchesGlob,
@@ -46,7 +47,7 @@ import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
-import { buildWorkerSpawnCommand } from "./worker_spawn.js";
+import { buildWorkerSpawnCommand, resolveWorkerStartupTimeoutMs } from "./worker_spawn.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -256,28 +257,8 @@ export type RequestAutonomyMetadata = AutonomyJobMetadata & {
   writeGlobs: string[];
 };
 
-const AUTONOMY_COMPONENT_AREAS = new Set<AutonomyComponentArea>([
-  "apps/server",
-  "apps/remotebuddy",
-  "apps/workerpals",
-  "apps/client",
-  "packages/protocol",
-  "packages/shared",
-  "tests/integration",
-  "tests/unit",
-]);
-
 function asAutonomyComponentArea(value: unknown): AutonomyComponentArea | undefined {
-  const text = String(value ?? "")
-    .trim()
-    .toLowerCase();
-  if (!text) return undefined;
-  for (const area of AUTONOMY_COMPONENT_AREAS) {
-    if (area.toLowerCase() === text) {
-      return area;
-    }
-  }
-  return undefined;
+  return normalizeAutonomyComponentArea(value) ?? undefined;
 }
 
 function normalizeRequestPriority(value: unknown): RequestPriority {
@@ -790,9 +771,13 @@ export class RemoteBuddyOrchestrator {
     this.waitForWorkerMs = Math.max(0, remoteCfg.waitForWorkerpalMs);
     this.autoSpawnWorkers = remoteCfg.autoSpawnWorkerpals;
     this.maxWorkers = Math.max(1, remoteCfg.maxWorkerpals);
-    this.workerStartupTimeoutMs = Math.max(1_000, remoteCfg.workerpalStartupTimeoutMs);
     this.spawnWorkerDocker = remoteCfg.workerpalDocker;
     this.spawnWorkerRequireDocker = remoteCfg.workerpalRequireDocker;
+    this.workerStartupTimeoutMs = resolveWorkerStartupTimeoutMs({
+      configuredMs: remoteCfg.workerpalStartupTimeoutMs,
+      docker: this.spawnWorkerDocker,
+      dockerAgentStartupTimeoutMs: CONFIG.workerpals.dockerAgentStartupTimeoutMs,
+    });
     this.spawnWorkerImage = remoteCfg.workerpalImage;
     this.spawnWorkerPollMs =
       typeof remoteCfg.workerpalPollMs === "number" && remoteCfg.workerpalPollMs > 0
@@ -1834,6 +1819,23 @@ export class RemoteBuddyOrchestrator {
     }
   }
 
+  private onlineWorkers(workers: WorkerSnapshot[]): WorkerSnapshot[] {
+    return workers.filter((worker) => worker.isOnline && worker.status !== "offline");
+  }
+
+  private currentWorkerUnavailableReason(): string {
+    if (this.workerpalsUnavailableReason) {
+      return this.workerpalsUnavailableReason;
+    }
+    if (this.autoSpawnWorkers) {
+      if (this.spawnWorkerDocker && this.spawnWorkerRequireDocker) {
+        return "Docker-backed WorkerPal auto-spawn did not produce an online worker. Verify Docker is installed and running, then retry.";
+      }
+      return "WorkerPal auto-spawn did not produce an online worker.";
+    }
+    return "No online WorkerPal backends and auto-spawn is disabled.";
+  }
+
   private buildWorkerSpawnCommand(workerId: string): string[] {
     return buildWorkerSpawnCommand({
       server: this.server,
@@ -1855,6 +1857,7 @@ export class RemoteBuddyOrchestrator {
     if (this.managedWorkers.size >= this.maxWorkers) {
       return null;
     }
+    this.workerpalsUnavailableReason = null;
     const workerId = `workerpal-${randomUUID().substring(0, 8)}`;
     const cmd = this.buildWorkerSpawnCommand(workerId);
     console.log(
@@ -1875,12 +1878,69 @@ export class RemoteBuddyOrchestrator {
 
       const ready = await this.waitForIdleWorker(this.workerStartupTimeoutMs, workerId);
       if (ready) return ready.workerId;
-      console.warn(`[RemoteBuddy] WorkerPal ${workerId} did not report ready within timeout`);
+      this.workerpalsUnavailableReason =
+        this.spawnWorkerDocker && this.spawnWorkerRequireDocker
+          ? `WorkerPal ${workerId} did not report ready within ${this.workerStartupTimeoutMs}ms. Verify Docker is installed, running, and able to start the WorkerPal sandbox image.`
+          : `WorkerPal ${workerId} did not report ready within ${this.workerStartupTimeoutMs}ms.`;
+      console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
       return null;
     } catch (err) {
+      this.workerpalsUnavailableReason =
+        this.spawnWorkerDocker && this.spawnWorkerRequireDocker
+          ? `Failed to spawn Docker-backed WorkerPal: ${String(err)}`
+          : `Failed to spawn WorkerPal: ${String(err)}`;
       console.error(`[RemoteBuddy] Failed to spawn WorkerPal ${workerId}:`, err);
       return null;
     }
+  }
+
+  async ensureWorkerCapacityOnStartup(): Promise<void> {
+    const workers = await this.fetchWorkers();
+    if (this.pickIdleWorker(workers)) {
+      return;
+    }
+    const onlineWorkers = this.onlineWorkers(workers);
+    if (!this.autoSpawnWorkers) {
+      if (onlineWorkers.length > 0) {
+        const idleWorker = await this.waitForIdleWorker(Math.max(this.waitForWorkerMs, 5_000));
+        if (idleWorker) {
+          console.log(`[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`);
+          return;
+        }
+        this.workerpalsUnavailableReason = `${onlineWorkers.length} online WorkerPal(s) reported but none became idle within ${Math.max(
+          this.waitForWorkerMs,
+          5_000,
+        )}ms.`;
+        console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+      }
+      return;
+    }
+    if (onlineWorkers.length < this.maxWorkers) {
+      console.log("[RemoteBuddy] Prewarming initial WorkerPal capacity...");
+      const spawned = await this.spawnWorker();
+      if (spawned) {
+        console.log(`[RemoteBuddy] Initial WorkerPal capacity ready via ${spawned}.`);
+        return;
+      }
+    }
+
+    const idleWorker = await this.waitForIdleWorker(Math.max(this.waitForWorkerMs, this.workerStartupTimeoutMs));
+    if (idleWorker) {
+      console.log(`[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`);
+      return;
+    }
+    const after = await this.fetchWorkers();
+    const onlineAfter = this.onlineWorkers(after);
+    if (onlineAfter.length > 0) {
+      this.workerpalsUnavailableReason = `${onlineAfter.length} online WorkerPal(s) reported but none became idle within ${Math.max(
+        this.waitForWorkerMs,
+        this.workerStartupTimeoutMs,
+      )}ms.`;
+      console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+      return;
+    }
+
+    console.warn(`[RemoteBuddy] ${this.currentWorkerUnavailableReason()}`);
   }
 
   private async selectTargetWorkerForJob(): Promise<string | null> {
@@ -2186,14 +2246,10 @@ export class RemoteBuddyOrchestrator {
 
       const taskId = randomUUID();
       const targetWorkerId = await this.selectTargetWorkerForJob();
-      if (!targetWorkerId && !this.autoSpawnWorkers) {
-        const onlineWorkers = (await this.fetchWorkers()).filter(
-          (worker) => worker.isOnline && worker.status !== "offline",
-        );
+      if (!targetWorkerId) {
+        const onlineWorkers = this.onlineWorkers(await this.fetchWorkers());
         if (onlineWorkers.length === 0) {
-          const detail =
-            this.workerpalsUnavailableReason ??
-            "No online WorkerPal backends and auto-spawn is disabled";
+          const detail = this.currentWorkerUnavailableReason();
           const userMessage =
             "WorkerPal execution is currently unavailable in this runtime. " + detail;
           console.warn(`[RemoteBuddy] ${userMessage}`);
@@ -2661,6 +2717,7 @@ async function main() {
   orchestrator.startSessionEventMonitor();
   orchestrator.startAutonomy();
   orchestrator.startAutonomyRuntimeConfigPolling();
+  await orchestrator.ensureWorkerCapacityOnStartup();
 
   // Start polling for requests from the Request Queue
   const pollMs = CONFIG.remotebuddy.pollMs;

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "fs";
 import { join, resolve, isAbsolute } from "path";
+import { normalizeAutonomyComponentArea } from "./autonomy_policy.js";
 import { normalizeLoopbackHost, normalizeLoopbackHttpUrl } from "./local_network.js";
 
 type TomlValue = string | number | boolean | null | TomlObject | TomlValue[];
@@ -830,23 +831,40 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const remoteAutonomyDispatchByComponentRaw = asStringNumberRecord(
     remoteAutonomyNode.max_dispatch_per_hour_by_component,
   );
-  const remoteAutonomyDispatchByComponent: Record<string, number> = {
-    ...remoteAutonomyDispatchByComponentCfg,
-  };
-  const normalizeAutonomyComponentKey = (value: string): string =>
-    value
-      .trim()
-      .toLowerCase()
-      .replace(/\\/g, "/")
-      .replace(/_+/g, "/")
-      .replace(/-+/g, "/")
-      .replace(/\/+/g, "/");
-  const canonicalComponentByNormalized = new Map<string, string>(
-    Object.keys(remoteAutonomyDispatchByComponentCfg).map((key) => [normalizeAutonomyComponentKey(key), key]),
+  const legacyAutonomyComponentAliasMap = new Map<string, string>(
+    Object.keys(remoteAutonomyDispatchByComponentCfg).flatMap((key) => {
+      const direct = normalizeAutonomyComponentArea(key);
+      const legacyUnderscore = normalizeAutonomyComponentArea(key.replace(/\//g, "_"));
+      const legacyHyphen = normalizeAutonomyComponentArea(key.replace(/\//g, "-"));
+      return [direct, legacyUnderscore, legacyHyphen]
+        .filter((value): value is string => Boolean(value))
+        .map((value) => [value, key] as const);
+    }),
   );
+  const coerceAutonomyComponentConfigKey = (value: string): string | null => {
+    const direct = normalizeAutonomyComponentArea(value);
+    const legacyAliasCandidate = normalizeAutonomyComponentArea(
+      value
+        .trim()
+        .toLowerCase()
+        .replace(/\\/g, "/")
+        .replace(/_+/g, "/")
+        .replace(/-+/g, "/")
+        .replace(/\/+/g, "/"),
+    );
+    if (legacyAliasCandidate && legacyAutonomyComponentAliasMap.has(legacyAliasCandidate)) {
+      return legacyAutonomyComponentAliasMap.get(legacyAliasCandidate) ?? legacyAliasCandidate;
+    }
+    return direct;
+  };
+  const remoteAutonomyDispatchByComponent = Object.fromEntries(
+    Object.entries(remoteAutonomyDispatchByComponentCfg).map(([key, value]) => [
+      coerceAutonomyComponentConfigKey(key) ?? key,
+      value,
+    ]),
+  ) as Record<string, number>;
   for (const [rawKey, rawValue] of Object.entries(remoteAutonomyDispatchByComponentRaw)) {
-    const normalized = normalizeAutonomyComponentKey(rawKey);
-    const canonical = canonicalComponentByNormalized.get(normalized);
+    const canonical = coerceAutonomyComponentConfigKey(rawKey);
     if (!canonical) continue;
     const parsed =
       typeof rawValue === "number"

@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import {
   buildCliClearTargets,
+  applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
   buildEmbeddedRuntimeEnv,
@@ -19,8 +20,10 @@ import {
   normalizeCliInteractiveMessage,
   normalizeChildProcessEnv,
   normalizeRepoPathForComparison,
+  precheckWorkerpalDockerAvailability,
   precheckSourceControlManagerGitAvailability,
   prepareCliRuntime,
+  resolveRuntimeDockerExecutableCandidates,
   resolveRuntimeGitExecutableCandidates,
   resolveCliLocalBuddyAutostart,
   resolveCliStatePath,
@@ -28,6 +31,7 @@ import {
   resolvePreferredRuntimeReleaseTag,
   resolveWindowsShellExecutableCandidatesForEnv,
   startEmbeddedMonitoringHub,
+  waitForWorkerpalCapacity,
 } from "../scripts/pushpals-cli.ts";
 
 function createMonitorAssetFixture(prefix: string) {
@@ -99,6 +103,25 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(env.REMOTEBUDDY_AUTONOMY_ENABLED).toBe("true");
     expect(env.PUSHPALS_GIT_BIN).toBe("/custom/tools/git");
+  });
+
+  test("buildEmbeddedRuntimeEnv preserves explicit docker overrides", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PUSHPALS_DOCKER_BIN: "docker.exe",
+        PUSHPALS_DOCKER_BIN_ABSOLUTE:
+          "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      },
+      {
+        repoRoot: "C:/repo/example",
+        runtimeRoot: "C:/runtime/pushpals",
+      },
+    );
+
+    expect(env.PUSHPALS_DOCKER_BIN).toBe("docker.exe");
+    expect(env.PUSHPALS_DOCKER_BIN_ABSOLUTE).toBe(
+      "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+    );
   });
 
   test("buildEmbeddedRuntimeEnv preserves explicit LocalBuddy env overrides without forcing them", () => {
@@ -207,6 +230,39 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PATH).toBe("/usr/local/bin:/usr/bin");
   });
 
+  test("applyResolvedDockerBinaryToRuntimeEnv rewrites Windows absolute docker paths into PATH + basename", () => {
+    const env = applyResolvedDockerBinaryToRuntimeEnv(
+      {
+        PATH: "C:\\Windows\\System32",
+        Path: "C:\\Windows\\System32",
+      },
+      "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      "win32",
+    );
+
+    expect(env.PUSHPALS_DOCKER_BIN).toBe("docker.exe");
+    expect(env.PUSHPALS_DOCKER_BIN_ABSOLUTE).toBe(
+      "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+    );
+    expect(env.PATH).toContain("C:\\Program Files\\Docker\\Docker\\resources\\bin");
+    expect(env.Path).toContain("C:\\Program Files\\Docker\\Docker\\resources\\bin");
+  });
+
+  test("applyResolvedDockerBinaryToRuntimeEnv clears absolute override when docker is configured by command name", () => {
+    const env = applyResolvedDockerBinaryToRuntimeEnv(
+      {
+        PATH: "/usr/local/bin:/usr/bin",
+        PUSHPALS_DOCKER_BIN_ABSOLUTE: "/tmp/old/docker",
+      },
+      "docker",
+      "linux",
+    );
+
+    expect(env.PUSHPALS_DOCKER_BIN).toBe("docker");
+    expect(env.PUSHPALS_DOCKER_BIN_ABSOLUTE).toBeUndefined();
+    expect(env.PATH).toBe("/usr/local/bin:/usr/bin");
+  });
+
   test("resolveRuntimeGitExecutableCandidates keeps basename and absolute fallback for SCM probing", () => {
     expect(
       resolveRuntimeGitExecutableCandidates(
@@ -227,6 +283,32 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         "linux",
       ),
     ).toEqual(["git", "/usr/local/bin/git"]);
+  });
+
+  test("resolveRuntimeDockerExecutableCandidates keeps basename and absolute fallback for docker probing", () => {
+    expect(
+      resolveRuntimeDockerExecutableCandidates(
+        {
+          PUSHPALS_DOCKER_BIN: "docker.exe",
+          PUSHPALS_DOCKER_BIN_ABSOLUTE: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+        },
+        "win32",
+      ),
+    ).toEqual([
+      "docker.exe",
+      "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      "docker",
+    ]);
+
+    expect(
+      resolveRuntimeDockerExecutableCandidates(
+        {
+          PUSHPALS_DOCKER_BIN: "docker",
+          PUSHPALS_DOCKER_BIN_ABSOLUTE: "/usr/local/bin/docker",
+        },
+        "linux",
+      ),
+    ).toEqual(["docker", "/usr/local/bin/docker"]);
   });
 
   test("resolveWindowsShellExecutableCandidatesForEnv prefers ComSpec and SystemRoot fallbacks", () => {
@@ -319,6 +401,172 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(result.status).toBe("failed");
     expect(result.detail).toBe("git.exe, C:\\Program Files\\Git\\cmd\\git.exe");
     expect(result.env.PUSHPALS_REPO_ROOT_OVERRIDE).toBe("C:\\repo\\example");
+  });
+
+  test("precheckWorkerpalDockerAvailability skips when Docker-backed auto-spawn is not required", async () => {
+    const result = await precheckWorkerpalDockerAvailability({
+      repoRoot: "/repo/example",
+      runtimeRoot: "/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      autoSpawnWorkerpals: false,
+      dockerEnabled: true,
+      requireDocker: true,
+      baseEnv: {
+        PATH: "/usr/bin",
+      },
+      dockerProbeFn: async () => {
+        throw new Error("docker probe should not run when auto-spawn is disabled");
+      },
+      platform: "linux",
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.detail).toBe("WorkerPal auto-spawn is disabled");
+  });
+
+  test("precheckWorkerpalDockerAvailability fails when required Docker-backed WorkerPal capacity is unavailable", async () => {
+    const result = await precheckWorkerpalDockerAvailability({
+      repoRoot: "/repo/example",
+      runtimeRoot: "/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      autoSpawnWorkerpals: true,
+      dockerEnabled: true,
+      requireDocker: true,
+      baseEnv: {
+        PATH: "/usr/bin",
+      },
+      dockerProbeFn: async () => ({
+        ok: false,
+        detail: "docker: Cannot connect to the Docker daemon",
+      }),
+      platform: "linux",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.detail).toContain("Cannot connect to the Docker daemon");
+  });
+
+  test("precheckWorkerpalDockerAvailability reports resolved Docker version when available", async () => {
+    const result = await precheckWorkerpalDockerAvailability({
+      repoRoot: "/repo/example",
+      runtimeRoot: "/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      autoSpawnWorkerpals: true,
+      dockerEnabled: true,
+      requireDocker: true,
+      baseEnv: {
+        PATH: "/usr/bin",
+      },
+      dockerProbeFn: async () => ({
+        ok: true,
+        detail: "docker (26.1.1)",
+      }),
+      platform: "linux",
+    });
+
+    expect(result.status).toBe("ok");
+    expect(result.detail).toBe("docker (26.1.1)");
+  });
+
+  test("precheckWorkerpalDockerAvailability preserves a resolved docker binary in the returned env", async () => {
+    const result = await precheckWorkerpalDockerAvailability({
+      repoRoot: "C:\\repo\\example",
+      runtimeRoot: "C:\\runtime\\pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      autoSpawnWorkerpals: true,
+      dockerEnabled: true,
+      requireDocker: true,
+      baseEnv: {
+        PATH: "C:\\Windows\\System32",
+        Path: "C:\\Windows\\System32",
+        PUSHPALS_DOCKER_BIN: "docker.exe",
+        PUSHPALS_DOCKER_BIN_ABSOLUTE:
+          "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+      },
+      dockerProbeFn: async (_cwd, env) => ({
+        ok: true,
+        detail: String(env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? env.PUSHPALS_DOCKER_BIN ?? ""),
+      }),
+      platform: "win32",
+    });
+
+    expect(result.status).toBe("ok");
+    expect(result.detail).toBe("C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe");
+    expect(result.env.PUSHPALS_DOCKER_BIN).toBe("docker.exe");
+    expect(result.env.PUSHPALS_DOCKER_BIN_ABSOLUTE).toBe(
+      "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+    );
+    expect(result.env.PATH).toContain("C:\\Program Files\\Docker\\Docker\\resources\\bin");
+  });
+
+  test("waitForWorkerpalCapacity only succeeds when an idle worker is available", async () => {
+    let polls = 0;
+    const result = await waitForWorkerpalCapacity({
+      serverUrl: "http://127.0.0.1:3001",
+      timeoutMs: 1_000,
+      ttlMs: 60_000,
+      fetchWorkersFn: async () => {
+        polls += 1;
+        if (polls === 1) {
+          return [
+            {
+              workerId: "workerpal-1",
+              isOnline: true,
+              activeJobCount: 1,
+              status: "online",
+              lastSeenAt: new Date().toISOString(),
+            },
+          ];
+        }
+        return [
+          {
+            workerId: "workerpal-1",
+            isOnline: true,
+            activeJobCount: 0,
+            status: "online",
+            lastSeenAt: new Date().toISOString(),
+          },
+        ];
+      },
+      sleepFn: async () => {},
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "1 idle / 1 online",
+    });
+  });
+
+  test("waitForWorkerpalCapacity fails when workers stay online but busy", async () => {
+    const originalNow = Date.now;
+    let now = 0;
+    Date.now = () => now;
+    try {
+      const result = await waitForWorkerpalCapacity({
+        serverUrl: "http://127.0.0.1:3001",
+        timeoutMs: 1_000,
+        ttlMs: 60_000,
+        fetchWorkersFn: async () => [
+          {
+            workerId: "workerpal-1",
+            isOnline: true,
+            activeJobCount: 2,
+            status: "online",
+            lastSeenAt: new Date().toISOString(),
+          },
+        ],
+        sleepFn: async () => {
+          now += 1_000;
+        },
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        detail: "1 online WorkerPal(s) reported but none became idle within 1000ms",
+      });
+    } finally {
+      Date.now = originalNow;
+    }
   });
 
   test("buildRuntimeServiceLogPaths returns deterministic per-service paths", () => {
