@@ -30,6 +30,16 @@ afterEach(() => {
 });
 
 describe("localbuddy live runtime config integration", () => {
+  test("requires configs/default.toml for live runtime snapshots", () => {
+    const root = makeTempDir();
+    const configDir = join(root, "configs");
+    mkdirSync(configDir, { recursive: true });
+
+    expect(() => loadLocalBuddyRuntimeSnapshotFromFiles(root, {})).toThrow(
+      `Missing required runtime config file: ${join(configDir, "default.toml")}`,
+    );
+  });
+
   test("env mutations become visible to live supervisors through the on-disk .env file", () => {
     const root = makeTempDir();
     const configDir = join(root, "configs");

@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, resolve } from "path";
+import { DEFAULT_WORKERPALS_EXECUTOR } from "../packages/shared/src/config";
 import {
   collectDotEnvKeys,
   collectTomlLeafKeys,
@@ -76,6 +77,52 @@ describe("config template key parity helpers", () => {
       expect([...readTomlLeafKeys(tomlPath)].sort()).toEqual(["section.value"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("worker executor defaults stay aligned across source, packaged runtime, and sandbox configs", () => {
+    const configPaths = [
+      resolve(import.meta.dir, "..", "configs", "default.toml"),
+      resolve(import.meta.dir, "..", "packages", "cli", "runtime", "configs", "default.toml"),
+      resolve(
+        import.meta.dir,
+        "..",
+        "packages",
+        "cli",
+        "runtime",
+        "sandbox",
+        "configs",
+        "default.toml",
+      ),
+    ];
+
+    for (const path of configPaths) {
+      const parsed = Bun.TOML.parse(readFileSync(path, "utf8")) as {
+        workerpals?: { executor?: string };
+      };
+      expect(parsed.workerpals?.executor).toBe(DEFAULT_WORKERPALS_EXECUTOR);
+    }
+  });
+
+  test("backend defaults stay aligned across source, packaged runtime, and sandbox configs", () => {
+    const backendPaths = [
+      resolve(import.meta.dir, "..", "configs", "backend.toml"),
+      resolve(import.meta.dir, "..", "packages", "cli", "runtime", "configs", "backend.toml"),
+      resolve(
+        import.meta.dir,
+        "..",
+        "packages",
+        "cli",
+        "runtime",
+        "sandbox",
+        "configs",
+        "backend.toml",
+      ),
+    ];
+
+    for (const path of backendPaths) {
+      const parsed = Bun.TOML.parse(readFileSync(path, "utf8")) as { default_backend?: string };
+      expect(parsed.default_backend).toBe(DEFAULT_WORKERPALS_EXECUTOR);
     }
   });
 });

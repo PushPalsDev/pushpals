@@ -97,7 +97,7 @@ RemoteBuddy reuses the repo-wide toolchain (Bun + `.env`). Work through the step
 - Windows PowerShell:
   ```powershell
   Copy-Item .env.example .env
-  Copy-Item config\local.example.toml config\local.toml
+  Copy-Item configs\local.example.toml configs\local.toml
   ```
 
 ### Step 4: Install `jq` for status checks (`curl ... | jq`)

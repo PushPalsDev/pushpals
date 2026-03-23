@@ -1,6 +1,6 @@
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { resolve } from "path";
-import { loadPushPalsConfig } from "shared";
+import { DEFAULT_WORKERPALS_EXECUTOR, loadPushPalsConfig } from "shared";
 import type { ExecutorBackend } from "../common/types.js";
 import { MINISWE_BACKEND } from "./miniswe_backend.js";
 import { OPENAI_CODEX_BACKEND } from "./openai_codex_backend.js";
@@ -8,7 +8,7 @@ import { OPENHANDS_BACKEND } from "./openhands_backend.js";
 import type { BackendTaskExecutor, DockerBackendSpec } from "./types.js";
 import { registerBackendTaskExecutor } from "./task_execute_registry.js";
 
-const FALLBACK_DEFAULT_EXECUTOR: ExecutorBackend = "miniswe";
+const FALLBACK_DEFAULT_EXECUTOR: ExecutorBackend = DEFAULT_WORKERPALS_EXECUTOR;
 
 interface BackendTomlShape {
   default_backend?: string;
@@ -32,16 +32,22 @@ function toStrings(value: unknown): string[] {
     .filter(Boolean);
 }
 
+export function parseRequiredBackendToml(path: string): BackendTomlShape {
+  if (!existsSync(path)) {
+    throw new Error(`Missing required runtime backend config file: ${path}`);
+  }
+
+  const parsed = Bun.TOML.parse(readFileSync(path, "utf-8")) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid runtime backend config file: ${path}`);
+  }
+  return parsed as BackendTomlShape;
+}
+
 function loadBackendToml(): BackendTomlShape {
   const projectRoot = loadPushPalsConfig().projectRoot;
   const path = resolve(projectRoot, "configs", "backend.toml");
-  try {
-    const parsed = Bun.TOML.parse(readFileSync(path, "utf-8")) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed as BackendTomlShape;
-  } catch {
-    return {};
-  }
+  return parseRequiredBackendToml(path);
 }
 
 const config = loadBackendToml();
@@ -58,7 +64,9 @@ export const DEFAULT_EXECUTOR = (
   typeof config.default_backend === "string" &&
   EXECUTOR_BACKENDS.includes(config.default_backend as ExecutorBackend)
     ? config.default_backend
-    : (EXECUTOR_BACKENDS[0] ?? FALLBACK_DEFAULT_EXECUTOR)
+    : EXECUTOR_BACKENDS.includes(FALLBACK_DEFAULT_EXECUTOR)
+      ? FALLBACK_DEFAULT_EXECUTOR
+      : (EXECUTOR_BACKENDS[0] ?? FALLBACK_DEFAULT_EXECUTOR)
 ) as ExecutorBackend;
 
 export const SHARED_DOCKER_PASSTHROUGH_ENV = toStrings(config.env?.shared_passthrough);

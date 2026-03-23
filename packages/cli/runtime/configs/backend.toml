@@ -1,4 +1,4 @@
-default_backend = "miniswe"
+default_backend = "openai_codex"
 
 [env]
 shared_passthrough = [

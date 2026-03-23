@@ -736,25 +736,16 @@ function resolveLocalConfigPaths(): {
   localTomlRel: string;
   localExampleTomlPath: string;
   localExampleTomlRel: string;
-  usingLegacyLocalTomlFallback: boolean;
 } {
   const configDirRel = relative(repoRoot, CONFIG.configDir).replace(/\\/g, "/");
   const normalizedConfigDirRel = configDirRel && configDirRel !== "." ? configDirRel : "configs";
   const localTomlRel = `${normalizedConfigDirRel}/local.toml`;
   const localExampleTomlRel = `${normalizedConfigDirRel}/local.example.toml`;
-  const canonicalLocalTomlPath = resolve(CONFIG.configDir, "local.toml");
-  const localExampleTomlPath = resolve(CONFIG.configDir, "local.example.toml");
-  const legacyLocalTomlPath = resolve(repoRoot, "config", "local.toml");
-  const usingLegacyLocalTomlFallback =
-    canonicalLocalTomlPath !== legacyLocalTomlPath &&
-    !existsSync(canonicalLocalTomlPath) &&
-    existsSync(legacyLocalTomlPath);
   return {
-    localTomlPath: usingLegacyLocalTomlFallback ? legacyLocalTomlPath : canonicalLocalTomlPath,
+    localTomlPath: resolve(CONFIG.configDir, "local.toml"),
     localTomlRel,
-    localExampleTomlPath,
+    localExampleTomlPath: resolve(CONFIG.configDir, "local.example.toml"),
     localExampleTomlRel,
-    usingLegacyLocalTomlFallback,
   };
 }
 
@@ -765,14 +756,7 @@ function ensureRequiredLocalConfigFiles(): LocalConfigPaths {
     localTomlRel,
     localExampleTomlPath,
     localExampleTomlRel,
-    usingLegacyLocalTomlFallback,
   } = localConfigPaths;
-
-  if (usingLegacyLocalTomlFallback) {
-    console.warn(
-      `[start] Legacy local config detected at config/local.toml; migrate to ${localTomlRel} (legacy fallback will be removed in a future release).`,
-    );
-  }
 
   const required: Array<{ path: string; hint: string; windowsCopy: string; linuxCopy: string }> = [
     {

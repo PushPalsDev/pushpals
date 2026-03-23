@@ -5,9 +5,44 @@ import { tmpdir } from "os";
 import { loadPushPalsConfig } from "../packages/shared/src/config";
 
 describe("shared config workerpals quality critic threshold parsing", () => {
+  test("requires configs/default.toml", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "configs");
+    mkdirSync(configDir, { recursive: true });
+
+    try {
+      expect(() => loadPushPalsConfig({ projectRoot: root, reload: true })).toThrow(
+        `Missing required runtime config file: ${join(configDir, "default.toml")}`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("defaults workerpals.executor to openai_codex when unset", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "configs");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n', "utf8");
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    const priorExecutor = process.env.WORKERPALS_EXECUTOR;
+    delete process.env.WORKERPALS_EXECUTOR;
+
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.workerpals.executor).toBe("openai_codex");
+    } finally {
+      if (priorExecutor == null) delete process.env.WORKERPALS_EXECUTOR;
+      else process.env.WORKERPALS_EXECUTOR = priorExecutor;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("defaults workerpals.quality_max_auto_revisions to 1 when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n', "utf8");
@@ -23,7 +58,7 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
   test("loads workerpals runtime policy values from local.example.toml", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -92,7 +127,7 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
   test("uses workerpals.quality_critic_min_score from local.example.toml when local.toml is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -125,7 +160,7 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
   test("uses numeric workerpals.quality_critic_min_score from local.toml", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -167,7 +202,7 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
   test("WORKERPALS_QUALITY_CRITIC_MIN_SCORE overrides TOML values", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -214,7 +249,7 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
   test("WORKERPALS_* env overrides take precedence for workerpals runtime policy values", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(

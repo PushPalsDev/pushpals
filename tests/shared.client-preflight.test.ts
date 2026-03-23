@@ -93,45 +93,28 @@ describe("client runtime preflight", () => {
     expect(result.visionSummary).toBeNull();
   });
 
-  test("resolves legacy config/ runtime layout before evaluating autonomy vision requirements", () => {
+  test("does not accept legacy config/ runtime layout", () => {
     const root = makeTempRoot();
     const projectRoot = join(root, "repo");
     const runtimeRoot = join(root, "runtime");
     mkdirSync(projectRoot, { recursive: true });
     mkdirSync(join(runtimeRoot, "config"), { recursive: true });
     writeFileSync(join(runtimeRoot, ".env"), "PUSHPALS_PROFILE=dev\n", "utf8");
-    writeFileSync(join(runtimeRoot, "config", "local.toml"), "# local overrides\n", "utf8");
+    writeFileSync(join(runtimeRoot, "config", "local.toml"), "# legacy local overrides\n", "utf8");
     writeFileSync(
       join(runtimeRoot, "config", "default.toml"),
-      `profile = "dev"
-session_id = "dev"
-
-[server]
-url = "http://127.0.0.1:3001"
-
-[localbuddy]
-port = 3003
-
-[remotebuddy.autonomy]
-enabled = true
-`,
-      "utf8",
-    );
-    writeFileSync(
-      join(runtimeRoot, "vision.example.md"),
-      "# Vision\n\n> **One sentence:** Ship better automation.\n",
+      ['profile = "dev"', "", "[remotebuddy.autonomy]", "enabled = true", ""].join("\n"),
       "utf8",
     );
 
-    const result = evaluateClientRuntimePreflight({
-      projectRoot,
-      runtimeRoot,
-      visionTemplateRoot: runtimeRoot,
-    });
-
-    expect(result.autonomyEnabled).toBe(true);
-    expect(result.ok).toBe(false);
-    expect(result.issues.map((issue) => issue.code)).toContain("missing_vision_doc");
+    expect(() =>
+      evaluateClientRuntimePreflight({
+        projectRoot,
+        runtimeRoot,
+      }),
+    ).toThrow(
+      `Missing required runtime config file: ${join(runtimeRoot, "configs", "default.toml")}`,
+    );
   });
 
   test("accepts a populated vision.md when autonomy is enabled", () => {

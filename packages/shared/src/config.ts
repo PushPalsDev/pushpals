@@ -10,7 +10,6 @@ interface TomlObject {
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
 const DEFAULT_CONFIG_DIR = "configs";
-const LEGACY_CONFIG_DIR = "config";
 
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const FALSY = new Set(["0", "false", "no", "off"]);
@@ -24,6 +23,7 @@ const DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180_000;
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 45_000;
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16_000;
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8_000;
+export const DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
 const DEFAULT_WORKERPALS_EXECUTOR_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
 const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
@@ -320,6 +320,13 @@ function parseTomlFile(path: string): TomlObject {
   return parsed as TomlObject;
 }
 
+function parseRequiredTomlFile(path: string): TomlObject {
+  if (!existsSync(path)) {
+    throw new Error(`Missing required runtime config file: ${path}`);
+  }
+  return parseTomlFile(path);
+}
+
 function isObject(value: unknown): value is TomlObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -424,20 +431,7 @@ function resolveRuntimeConfigDir(projectRoot: string, configuredDir?: string): s
     return resolvePathFromRoot(projectRoot, configuredDir);
   }
 
-  const canonicalDir = resolvePathFromRoot(projectRoot, DEFAULT_CONFIG_DIR);
-  const legacyDir = resolvePathFromRoot(projectRoot, LEGACY_CONFIG_DIR);
-  if (existsSync(join(canonicalDir, "default.toml"))) return canonicalDir;
-  if (existsSync(join(legacyDir, "default.toml"))) return legacyDir;
-  return canonicalDir;
-}
-
-function parseTomlWithLegacyFallback(
-  primaryPath: string,
-  fallbackPath?: string,
-): TomlObject {
-  if (existsSync(primaryPath)) return parseTomlFile(primaryPath);
-  if (fallbackPath && existsSync(fallbackPath)) return parseTomlFile(fallbackPath);
-  return {};
+  return resolvePathFromRoot(projectRoot, DEFAULT_CONFIG_DIR);
 }
 
 function normalizeBackend(value: string): string {
@@ -570,35 +564,20 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     "",
   );
   const configDir = resolveRuntimeConfigDir(projectRoot, configDirOverride);
-  const legacyConfigDir = resolvePathFromRoot(projectRoot, LEGACY_CONFIG_DIR);
-  const fallbackConfigDir =
-    !configDirOverride && configDir !== legacyConfigDir ? legacyConfigDir : "";
   const cacheKey = `${projectRoot}::${configDir}::${process.env.PUSHPALS_PROFILE ?? ""}`;
   if (!options.reload && cachedConfig && cachedConfigKey === cacheKey) {
     return cachedConfig;
   }
 
-  const defaultToml = parseTomlWithLegacyFallback(
-    join(configDir, "default.toml"),
-    fallbackConfigDir ? join(fallbackConfigDir, "default.toml") : undefined,
-  );
+  const defaultToml = parseRequiredTomlFile(join(configDir, "default.toml"));
   const preferredProfile = firstNonEmpty(
     process.env.PUSHPALS_PROFILE,
     asString(defaultToml.profile, "dev"),
     "dev",
   );
-  const profileToml = parseTomlWithLegacyFallback(
-    join(configDir, `${preferredProfile}.toml`),
-    fallbackConfigDir ? join(fallbackConfigDir, `${preferredProfile}.toml`) : undefined,
-  );
-  const localExampleToml = parseTomlWithLegacyFallback(
-    join(configDir, "local.example.toml"),
-    fallbackConfigDir ? join(fallbackConfigDir, "local.example.toml") : undefined,
-  );
-  const localToml = parseTomlWithLegacyFallback(
-    join(configDir, "local.toml"),
-    fallbackConfigDir ? join(fallbackConfigDir, "local.toml") : undefined,
-  );
+  const profileToml = parseTomlFile(join(configDir, `${preferredProfile}.toml`));
+  const localExampleToml = parseTomlFile(join(configDir, "local.example.toml"));
+  const localToml = parseTomlFile(join(configDir, "local.toml"));
   const merged = mergeDeep(
     mergeDeep(mergeDeep(defaultToml, profileToml), localExampleToml),
     localToml,
@@ -889,8 +868,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
   const workerExecutor = firstNonEmpty(
     process.env.WORKERPALS_EXECUTOR,
-    asString(workerNode.executor, "openhands"),
-    "openhands",
+    asString(workerNode.executor, DEFAULT_WORKERPALS_EXECUTOR),
+    DEFAULT_WORKERPALS_EXECUTOR,
   ).toLowerCase();
   const workerOpenHandsPython = firstNonEmpty(
     process.env.WORKERPALS_OPENHANDS_PYTHON,

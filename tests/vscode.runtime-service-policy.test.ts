@@ -28,6 +28,16 @@ function makeTempDir(): string {
 }
 
 describe("vscode runtime service policy", () => {
+  test("requires configs/default.toml for runtime snapshots", () => {
+    const root = makeTempDir();
+    const configDir = join(root, "configs");
+    mkdirSync(configDir, { recursive: true });
+
+    expect(() => loadRuntimeConfigSnapshotFromFiles(root, {})).toThrow(
+      `Missing required runtime config file: ${join(configDir, "default.toml")}`,
+    );
+  });
+
   test("parses runtime snapshot with localbuddy enabled state and port", () => {
     const snapshot = parseRuntimeConfigSnapshot(
       JSON.stringify({
@@ -173,7 +183,7 @@ describe("vscode runtime service policy", () => {
     });
   });
 
-  test("falls back to legacy config/ when configs/default.toml is absent", () => {
+  test("ignores legacy config/ runtime layout", () => {
     const root = makeTempDir();
     const legacyDir = join(root, "config");
     mkdirSync(legacyDir, { recursive: true });
@@ -183,8 +193,9 @@ describe("vscode runtime service policy", () => {
       "utf8",
     );
 
-    const snapshot = loadRuntimeConfigSnapshotFromFiles(root, {});
-    expect(snapshot.localbuddy.enabled).toBe(true);
-    expect(snapshot.localbuddy.port).toBe(3555);
+    expect(() => loadRuntimeConfigSnapshotFromFiles(root, {})).toThrow(
+      `Missing required runtime config file: ${join(root, "configs", "default.toml")}`,
+    );
   });
+
 });

@@ -67,19 +67,9 @@ function resolveClientConfigDir(
     return runtimeCanonical;
   }
 
-  const runtimeLegacy = resolve(runtimeRoot, "config");
-  if (runtimeHasConfigDir(runtimeRoot, "config")) {
-    return runtimeLegacy;
-  }
-
   const projectCanonical = resolve(projectRoot, "configs");
   if (runtimeHasConfigDir(projectRoot, "configs")) {
     return projectCanonical;
-  }
-
-  const projectLegacy = resolve(projectRoot, "config");
-  if (runtimeHasConfigDir(projectRoot, "config")) {
-    return projectLegacy;
   }
 
   return runtimeCanonical;
@@ -145,8 +135,7 @@ export function evaluateClientRuntimePreflight(
   }
 
   const localTomlPath = resolve(runtimeRoot, "configs", "local.toml");
-  const legacyLocalTomlPath = resolve(runtimeRoot, "config", "local.toml");
-  if (!existsSync(localTomlPath) && !existsSync(legacyLocalTomlPath)) {
+  if (!existsSync(localTomlPath)) {
     const localExamplePath = resolve(runtimeRoot, "configs", "local.example.toml");
     issues.push({
       code: "missing_local_toml",

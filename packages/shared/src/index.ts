@@ -44,6 +44,7 @@ export {
   type ResolveGitTokenOptions,
 } from "./git_backend.js";
 export {
+  DEFAULT_WORKERPALS_EXECUTOR,
   invalidatePushPalsConfigCache,
   loadPushPalsConfig,
   sanitizePushPalsConfigForLogging,

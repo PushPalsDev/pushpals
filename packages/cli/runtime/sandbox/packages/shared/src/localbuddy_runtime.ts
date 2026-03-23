@@ -14,7 +14,6 @@ export type LocalBuddyRuntimeSnapshot = {
 export const DEFAULT_LOCALBUDDY_PORT = 3003;
 
 const DEFAULT_CONFIG_DIR = "configs";
-const LEGACY_CONFIG_DIR = "config";
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const FALSY = new Set(["0", "false", "no", "off"]);
 
@@ -71,27 +70,11 @@ export function loadLocalBuddyRuntimeSnapshotFromFiles(
 
   const configDirOverride = firstNonEmpty(mergedEnv.PUSHPALS_CONFIG_DIR_OVERRIDE);
   const configDir = resolveRuntimeConfigDir(workspaceRoot, configDirOverride);
-  const legacyConfigDir = resolvePathFromRoot(workspaceRoot, LEGACY_CONFIG_DIR);
-  const fallbackConfigDir =
-    !configDirOverride && configDir !== legacyConfigDir ? legacyConfigDir : "";
-
-  const defaultToml = readTomlSliceWithFallback(
-    join(configDir, "default.toml"),
-    fallbackConfigDir ? join(fallbackConfigDir, "default.toml") : undefined,
-  );
+  const defaultToml = readRequiredTomlSlice(join(configDir, "default.toml"));
   const preferredProfile = firstNonEmpty(mergedEnv.PUSHPALS_PROFILE, defaultToml.profile, "dev");
-  const profileToml = readTomlSliceWithFallback(
-    join(configDir, `${preferredProfile}.toml`),
-    fallbackConfigDir ? join(fallbackConfigDir, `${preferredProfile}.toml`) : undefined,
-  );
-  const localExampleToml = readTomlSliceWithFallback(
-    join(configDir, "local.example.toml"),
-    fallbackConfigDir ? join(fallbackConfigDir, "local.example.toml") : undefined,
-  );
-  const localToml = readTomlSliceWithFallback(
-    join(configDir, "local.toml"),
-    fallbackConfigDir ? join(fallbackConfigDir, "local.toml") : undefined,
-  );
+  const profileToml = readTomlSlice(join(configDir, `${preferredProfile}.toml`));
+  const localExampleToml = readTomlSlice(join(configDir, "local.example.toml"));
+  const localToml = readTomlSlice(join(configDir, "local.toml"));
 
   const mergedLocalbuddy = {
     ...defaultToml.localbuddy,
@@ -168,11 +151,7 @@ function resolveRuntimeConfigDir(workspaceRoot: string, configuredDir?: string):
     return resolvePathFromRoot(workspaceRoot, configuredDir);
   }
 
-  const canonicalDir = resolvePathFromRoot(workspaceRoot, DEFAULT_CONFIG_DIR);
-  const legacyDir = resolvePathFromRoot(workspaceRoot, LEGACY_CONFIG_DIR);
-  if (existsSync(join(canonicalDir, "default.toml"))) return canonicalDir;
-  if (existsSync(join(legacyDir, "default.toml"))) return legacyDir;
-  return canonicalDir;
+  return resolvePathFromRoot(workspaceRoot, DEFAULT_CONFIG_DIR);
 }
 
 function parseBoolEnv(value: string | undefined): boolean | undefined {
@@ -190,10 +169,16 @@ function parseIntEnv(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function readTomlSliceWithFallback(primaryPath: string, fallbackPath?: string): LocalBuddyTomlSlice {
-  if (existsSync(primaryPath)) return parseTomlSlice(primaryPath);
-  if (fallbackPath && existsSync(fallbackPath)) return parseTomlSlice(fallbackPath);
+function readTomlSlice(path: string): LocalBuddyTomlSlice {
+  if (existsSync(path)) return parseTomlSlice(path);
   return {};
+}
+
+function readRequiredTomlSlice(path: string): LocalBuddyTomlSlice {
+  if (!existsSync(path)) {
+    throw new Error(`Missing required runtime config file: ${path}`);
+  }
+  return parseTomlSlice(path);
 }
 
 function parseTomlSlice(path: string): LocalBuddyTomlSlice {
