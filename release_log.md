@@ -2,21 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.0.19`
-- start_commit: `17350c390e108bac71f0815c8c3d8cd17aa19112`
-- end_commit: `17350c390e108bac71f0815c8c3d8cd17aa19112`
+- version: `v1.0.20`
+- start_commit: `dce10e380f0d73c33af0cb71ed635196be2c5469`
+- end_commit: `dce10e380f0d73c33af0cb71ed635196be2c5469`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Move embedded WorkerPal sandbox image preparation out of the cold-start-only path so the CLI also repairs or validates the local Docker image before attaching to an already-healthy same-repo runtime.
-- Add a shared embedded WorkerPal image precheck helper that resolves the runtime tag once, reuses the Docker precheck environment, and keeps startup and attach behavior on the same contract.
-- Propagate `PUSHPALS_RUNTIME_TAG` into embedded runtime child environments so WorkerPals can verify whether a local sandbox image matches the active runtime release.
-- Teach DockerExecutor to rebuild the local WorkerPal sandbox image when the local image is missing, unlabeled, or stale for the current runtime tag before falling back to registry pulls.
-- Stop treating `bun.lockb` as a text runtime asset in GitHub source-tag downloads to avoid corrupting binary lockfiles in the sandbox build context.
-- Replace recursive sandbox source copying with tracked-file-only copies so packaged runtime assets do not pick up ignored local artifacts such as `__pycache__` or other machine-specific junk.
-- Update `sync-cli-runtime-assets` to build the packaged sandbox tree from tracked repo files and only include `bun.lock` when present.
-- Extend CLI runtime bootstrap coverage for runtime-tag propagation, tracked-only sandbox copying, embedded image prep on attached runtimes, and source-download behavior that skips `bun.lockb`.
+- Remove active support for the legacy `config/` runtime layout so `configs/` is the single supported config location across shared config loading, client preflight, VS Code runtime policy, and startup local-config resolution.
+- Align source-checkout, packaged CLI runtime, and sandbox runtime WorkerPal executor defaults on `openai_codex`.
+- Centralize the defensive WorkerPal executor fallback through the shared config constant instead of duplicating string literals across loaders and backend selection.
+- Make shared runtime config loading fail fast when `configs/default.toml` is missing instead of silently reconstructing behavior from hardcoded code defaults.
+- Make WorkerPal backend metadata loading fail fast when `configs/backend.toml` is missing or invalid instead of silently falling back to implicit backend ordering.
+- Regenerate embedded CLI runtime and sandbox assets so the packaged runtime matches the canonical source config and shared loader behavior.
+- Add parity tests that assert source config, packaged runtime config, and sandbox config stay aligned on executor and backend defaults.
+- Add regression coverage that verifies legacy `config/` layouts are rejected and missing required runtime config files raise explicit errors.
+- Update stale Windows setup documentation to use `configs\local.example.toml` -> `configs\local.toml`.
 
 ## Install
 
@@ -47,5 +48,5 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.19 && git push origin v1.0.19`.
+- Tag and push: `git tag v1.0.20 && git push origin v1.0.20`.
 
