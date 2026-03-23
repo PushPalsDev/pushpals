@@ -1,0 +1,71 @@
+# PushPals Worker Sandbox Dockerfile
+# This image provides an isolated environment for job execution
+# The entire monorepo is available in the container for job execution
+
+FROM oven/bun:1-debian AS base
+
+# Install git and other essential tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    ca-certificates \
+    openssh-client \
+    grep \
+    jq \
+    ripgrep \
+    fd-find \
+    less \
+    unzip \
+    zip \
+    procps \
+    dnsutils \
+    iputils-ping \
+    python3 \
+    python3-venv \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Worker runtime in one shared venv (uv default layout).
+# Keep the venv at /workspace/.venv so all backends use the same Python runtime.
+RUN mkdir -p /workspace \
+    && python3 -m venv /workspace/.venv \
+    && /workspace/.venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /workspace/.venv/bin/pip install --no-cache-dir \
+        openhands-sdk \
+        openhands-agent-server \
+        openhands-workspace \
+        openhands-tools \
+        mini-swe-agent \
+        playwright \
+    && bun add -g @openai/codex \
+    && /workspace/.venv/bin/playwright install --with-deps chromium
+
+ENV PATH="/workspace/.venv/bin:/root/.bun/bin:${PATH}"
+ENV WORKERPALS_OPENHANDS_PYTHON="/workspace/.venv/bin/python"
+ENV WORKERPALS_OPENHANDS_WORKSPACE_PYTHON="/workspace/.venv/bin/python"
+ENV WORKERPALS_MINISWE_PYTHON="/workspace/.venv/bin/python"
+ENV PUSHPALS_OPENAI_CODEX_PYTHON="/workspace/.venv/bin/python"
+
+# Configure git for the worker
+RUN git config --global user.name "PushPals Worker" \
+    && git config --global user.email "worker@pushpals.local" \
+    && git config --global safe.directory '*' \
+    && git config --global core.autocrlf input
+
+# Set up the full monorepo structure
+WORKDIR /workspace
+
+# Copy entire repository (build context should be repo root)
+COPY . .
+
+# Install workspace dependencies (including devDeps needed for protocol build)
+RUN bun install
+
+# Build protocol package (needed by worker)
+RUN cd packages/protocol && bun run build
+
+# Set working directory for job execution
+WORKDIR /workspace
+
+# Default entrypoint runs the job runner with base64-encoded job spec
+ENTRYPOINT ["bun", "run", "/workspace/apps/workerpals/src/job_runner.ts"]

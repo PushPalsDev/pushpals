@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import {
@@ -8,9 +8,13 @@ import {
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
   buildEmbeddedRuntimeEnv,
+  copyTrackedRepoPath,
+  buildWorkerpalSandboxPaths,
   buildRuntimeServiceLogPaths,
   bundledMonitoringHubNeedsRefresh,
   buildServiceStopCommand,
+  downloadRuntimeAssetsFromSourceTag,
+  ensureWorkerpalDockerImageReady,
   extractRemoteBuddyAutonomousEngineState,
   extractRemoteBuddySessionConsumerHealth,
   formatTimestampedCliLine,
@@ -20,6 +24,7 @@ import {
   normalizeCliInteractiveMessage,
   normalizeChildProcessEnv,
   normalizeRepoPathForComparison,
+  prepareEmbeddedWorkerpalDockerImageIfNeeded,
   precheckWorkerpalDockerAvailability,
   precheckSourceControlManagerGitAvailability,
   prepareCliRuntime,
@@ -70,6 +75,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PUSHPALS_PROTOCOL_SCHEMAS_DIR).toBe(
       join(resolve("C:/runtime/pushpals"), "protocol", "schemas"),
     );
+    expect(env.PUSHPALS_WORKERPALS_SANDBOX_ROOT).toBe(
+      join(resolve("C:/runtime/pushpals"), "sandbox"),
+    );
     expect("REMOTEBUDDY_AUTONOMY_ENABLED" in env).toBe(false);
     expect("LOCALBUDDY_ENABLED" in env).toBe(false);
   });
@@ -87,6 +95,21 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
 
     expect(env.PUSHPALS_SESSION_ID).toBe("cli-dev");
+  });
+
+  test("buildEmbeddedRuntimeEnv preserves the embedded runtime tag for child services", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+      },
+      {
+        repoRoot: "/repo/example",
+        runtimeRoot: "/runtime/pushpals",
+        runtimeTag: "v1.0.19",
+      },
+    );
+
+    expect(env.PUSHPALS_RUNTIME_TAG).toBe("v1.0.19");
   });
 
   test("buildEmbeddedRuntimeEnv preserves explicit autonomy override", () => {
@@ -154,6 +177,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PUSHPALS_PROJECT_ROOT_OVERRIDE).toBe("/repo/example");
     expect(env.PUSHPALS_PROMPTS_ROOT_OVERRIDE).toBe("/repo/example");
     expect("PUSHPALS_CONFIG_DIR_OVERRIDE" in env).toBe(false);
+    expect("PUSHPALS_WORKERPALS_SANDBOX_ROOT" in env).toBe(false);
     expect(env.PUSHPALS_PROTOCOL_SCHEMAS_DIR).toBe(
       join("/runtime/pushpals", "protocol", "schemas"),
     );
@@ -569,6 +593,42 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
+  test("copyTrackedRepoPath copies only tracked sandbox files from a repo subtree", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-tracked-copy-"));
+    const repoRoot = join(root, "repo");
+    const outRoot = join(root, "out");
+    mkdirSync(join(repoRoot, "apps", "workerpals", "src", "__pycache__"), { recursive: true });
+    writeFileSync(join(repoRoot, ".gitignore"), "__pycache__/\n", "utf8");
+    writeFileSync(join(repoRoot, "apps", "workerpals", "src", "worker.ts"), "export {};\n", "utf8");
+    writeFileSync(
+      join(repoRoot, "apps", "workerpals", "src", "__pycache__", "junk.pyc"),
+      "ignored",
+      "utf8",
+    );
+
+    try {
+      const init = Bun.spawnSync(["git", "init"], {
+        cwd: repoRoot,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      expect(init.exitCode).toBe(0);
+      const add = Bun.spawnSync(["git", "add", ".gitignore", "apps/workerpals/src/worker.ts"], {
+        cwd: repoRoot,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      expect(add.exitCode).toBe(0);
+
+      copyTrackedRepoPath(repoRoot, "apps/workerpals", outRoot, true);
+
+      expect(existsSync(join(outRoot, "src", "worker.ts"))).toBe(true);
+      expect(existsSync(join(outRoot, "src", "__pycache__", "junk.pyc"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("buildRuntimeServiceLogPaths returns deterministic per-service paths", () => {
     const logDir = join(tmpdir(), "pushpals-cli-runtime-logs");
     const paths = buildRuntimeServiceLogPaths(logDir, "2026-03-17T00-00-00-000Z");
@@ -578,6 +638,289 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(paths.source_control_manager).toBe(
       join(logDir, "2026-03-17T00-00-00-000Z-source_control_manager.log"),
     );
+  });
+
+  test("buildWorkerpalSandboxPaths returns the packaged sandbox layout under the runtime root", () => {
+    const paths = buildWorkerpalSandboxPaths("/runtime/pushpals");
+
+    expect(paths.root).toBe(join("/runtime/pushpals", "sandbox"));
+    expect(paths.dockerfilePath).toBe(
+      join("/runtime/pushpals", "sandbox", "apps", "workerpals", "Dockerfile.sandbox"),
+    );
+    expect(paths.packageJsonPath).toBe(join("/runtime/pushpals", "sandbox", "package.json"));
+    expect(paths.configsDir).toBe(join("/runtime/pushpals", "sandbox", "configs"));
+    expect(paths.workerpalsPromptsDir).toBe(
+      join("/runtime/pushpals", "sandbox", "prompts", "workerpals"),
+    );
+    expect(paths.protocolSchemasDir).toBe(
+      join("/runtime/pushpals", "sandbox", "protocol", "schemas"),
+    );
+  });
+
+  test("ensureWorkerpalDockerImageReady builds the local sandbox image when it is missing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-worker-image-"));
+    const sandbox = buildWorkerpalSandboxPaths(root);
+    mkdirSync(join(sandbox.workerpalsDir, "src"), { recursive: true });
+    mkdirSync(sandbox.sharedDir, { recursive: true });
+    mkdirSync(sandbox.protocolDir, { recursive: true });
+    mkdirSync(sandbox.configsDir, { recursive: true });
+    mkdirSync(sandbox.workerpalsPromptsDir, { recursive: true });
+    mkdirSync(sandbox.protocolSchemasDir, { recursive: true });
+    writeFileSync(sandbox.packageJsonPath, '{"name":"pushpals-sandbox"}\n', "utf8");
+    writeFileSync(sandbox.dockerfilePath, "FROM oven/bun:1-debian\n", "utf8");
+    writeFileSync(join(sandbox.sharedDir, "package.json"), '{"name":"shared"}\n', "utf8");
+    writeFileSync(join(sandbox.protocolDir, "package.json"), '{"name":"protocol"}\n', "utf8");
+    writeFileSync(join(sandbox.configsDir, "default.toml"), 'profile = "dev"\n', "utf8");
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "workerpals_system_prompt.md"),
+      "# workerpals\n",
+      "utf8",
+    );
+    writeFileSync(join(sandbox.protocolSchemasDir, "envelope.schema.json"), "{}\n", "utf8");
+    writeFileSync(join(sandbox.protocolSchemasDir, "events.schema.json"), "{}\n", "utf8");
+
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    try {
+      const result = await ensureWorkerpalDockerImageReady({
+        runtimeRoot: root,
+        runtimeTag: "v1.0.19",
+        dockerImage: "pushpals-worker-sandbox:latest",
+        env: {
+          PUSHPALS_DOCKER_BIN_ABSOLUTE: "/usr/local/bin/docker",
+        },
+        ensureRuntimeAssetsFn: async () => {},
+        inspectImageRuntimeTagFn: async () => "",
+        runCommandWithEnvFn: async (command, cwd) => {
+          calls.push({ command, cwd });
+          return { ok: true, stdout: "ok", stderr: "", exitCode: 0 };
+        },
+      });
+
+      expect(result).toEqual({
+        ok: true,
+        detail: "built local WorkerPal sandbox image pushpals-worker-sandbox:latest for runtimeTag=v1.0.19",
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.cwd).toBe(sandbox.root);
+      expect(calls[0]?.command).toEqual([
+        "/usr/local/bin/docker",
+        "build",
+        "-f",
+        "apps/workerpals/Dockerfile.sandbox",
+        "--label",
+        "pushpals.runtime_tag=v1.0.19",
+        "--label",
+        "pushpals.component=workerpals-sandbox",
+        "-t",
+        "pushpals-worker-sandbox:latest",
+        ".",
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ensureWorkerpalDockerImageReady skips the build when the local sandbox image already matches the runtime tag", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-worker-image-ready-"));
+    const sandbox = buildWorkerpalSandboxPaths(root);
+    mkdirSync(join(sandbox.workerpalsDir, "src"), { recursive: true });
+    mkdirSync(sandbox.sharedDir, { recursive: true });
+    mkdirSync(sandbox.protocolDir, { recursive: true });
+    mkdirSync(sandbox.configsDir, { recursive: true });
+    mkdirSync(sandbox.workerpalsPromptsDir, { recursive: true });
+    mkdirSync(sandbox.protocolSchemasDir, { recursive: true });
+    writeFileSync(sandbox.packageJsonPath, '{"name":"pushpals-sandbox"}\n', "utf8");
+    writeFileSync(sandbox.dockerfilePath, "FROM oven/bun:1-debian\n", "utf8");
+    writeFileSync(join(sandbox.sharedDir, "package.json"), '{"name":"shared"}\n', "utf8");
+    writeFileSync(join(sandbox.protocolDir, "package.json"), '{"name":"protocol"}\n', "utf8");
+    writeFileSync(join(sandbox.configsDir, "default.toml"), 'profile = "dev"\n', "utf8");
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "workerpals_system_prompt.md"),
+      "# workerpals\n",
+      "utf8",
+    );
+    writeFileSync(join(sandbox.protocolSchemasDir, "envelope.schema.json"), "{}\n", "utf8");
+    writeFileSync(join(sandbox.protocolSchemasDir, "events.schema.json"), "{}\n", "utf8");
+
+    try {
+      const result = await ensureWorkerpalDockerImageReady({
+        runtimeRoot: root,
+        runtimeTag: "v1.0.19",
+        dockerImage: "pushpals-worker-sandbox:latest",
+        env: {
+          PUSHPALS_DOCKER_BIN: "docker",
+        },
+        ensureRuntimeAssetsFn: async () => {},
+        inspectImageRuntimeTagFn: async () => "v1.0.19",
+        runCommandWithEnvFn: async () => {
+          throw new Error("docker build should not run when the local image already matches");
+        },
+      });
+
+      expect(result).toEqual({
+        ok: true,
+        detail: "WorkerPal sandbox image is ready locally (pushpals-worker-sandbox:latest, runtimeTag=v1.0.19)",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareEmbeddedWorkerpalDockerImageIfNeeded resolves and prepares the embedded sandbox image", async () => {
+    const result = await prepareEmbeddedWorkerpalDockerImageIfNeeded({
+      preparedRuntime: {
+        runtimeRoot: "/runtime/pushpals",
+        runtimeTag: "",
+        runtimePreflight: {} as Awaited<ReturnType<typeof prepareCliRuntime>>["runtimePreflight"],
+        preflightUsesEmbeddedRuntime: true,
+      },
+      config: {
+        remotebuddy: {
+          autoSpawnWorkerpals: true,
+          workerpalDocker: true,
+          workerpalRequireDocker: true,
+          workerpalImage: "pushpals-worker-sandbox:latest",
+        },
+        workerpals: {
+          dockerImage: "pushpals-worker-sandbox:fallback",
+        },
+      } as Awaited<ReturnType<typeof prepareCliRuntime>>["runtimePreflight"]["config"],
+      dockerPrecheck: {
+        status: "ok",
+        detail: "docker (26.1.1)",
+        env: {
+          PUSHPALS_DOCKER_BIN: "docker",
+        },
+      },
+      runtimeTagHint: "v1.0.19",
+      resolveRuntimeReleaseTagFn: async () => {
+        throw new Error("runtime tag should come from the explicit hint");
+      },
+      ensureWorkerpalDockerImageReadyFn: async (opts) => {
+        expect(opts.runtimeTag).toBe("v1.0.19");
+        expect(opts.dockerImage).toBe("pushpals-worker-sandbox:latest");
+        expect(opts.env.PUSHPALS_DOCKER_BIN).toBe("docker");
+        return {
+          ok: true,
+          detail: "built local WorkerPal sandbox image pushpals-worker-sandbox:latest for runtimeTag=v1.0.19",
+        };
+      },
+    });
+
+    expect(result).toEqual({
+      status: "ok",
+      detail:
+        "built local WorkerPal sandbox image pushpals-worker-sandbox:latest for runtimeTag=v1.0.19",
+      runtimeTag: "v1.0.19",
+    });
+  });
+
+  test("prepareEmbeddedWorkerpalDockerImageIfNeeded skips source-checkout runtimes", async () => {
+    const result = await prepareEmbeddedWorkerpalDockerImageIfNeeded({
+      preparedRuntime: {
+        runtimeRoot: "/runtime/pushpals",
+        runtimeTag: "",
+        runtimePreflight: {} as Awaited<ReturnType<typeof prepareCliRuntime>>["runtimePreflight"],
+        preflightUsesEmbeddedRuntime: false,
+      },
+      config: {
+        remotebuddy: {
+          autoSpawnWorkerpals: true,
+          workerpalDocker: true,
+          workerpalRequireDocker: true,
+          workerpalImage: "pushpals-worker-sandbox:latest",
+        },
+        workerpals: {
+          dockerImage: "pushpals-worker-sandbox:fallback",
+        },
+      } as Awaited<ReturnType<typeof prepareCliRuntime>>["runtimePreflight"]["config"],
+      dockerPrecheck: {
+        status: "ok",
+        detail: "docker (26.1.1)",
+        env: {},
+      },
+      ensureWorkerpalDockerImageReadyFn: async () => {
+        throw new Error("embedded image precheck should be skipped for source-checkout runtimes");
+      },
+    });
+
+    expect(result).toEqual({
+      status: "skipped",
+      detail: "repo is using source-checkout runtime assets",
+      runtimeTag: "",
+    });
+  });
+
+  test("downloadRuntimeAssetsFromSourceTag skips bun.lockb and populates sandbox assets", async () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-download-"));
+    const originalFetch = globalThis.fetch;
+    const tag = "v1.0.19";
+    const treeUrl = `https://api.github.com/repos/PushPalsDev/pushpals/git/trees/${encodeURIComponent(tag)}?recursive=1`;
+    const fetchedUrls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url === treeUrl) {
+        return Response.json({
+          tree: [
+            { path: "package.json", type: "blob" },
+            { path: "bun.lock", type: "blob" },
+            { path: "bun.lockb", type: "blob" },
+            { path: "configs/default.toml", type: "blob" },
+            { path: "prompts/workerpals/workerpals_system_prompt.md", type: "blob" },
+            { path: "apps/workerpals/Dockerfile.sandbox", type: "blob" },
+            { path: "packages/shared/package.json", type: "blob" },
+            { path: "packages/protocol/package.json", type: "blob" },
+            { path: "packages/protocol/src/schemas/envelope.schema.json", type: "blob" },
+            { path: "packages/protocol/src/schemas/events.schema.json", type: "blob" },
+          ],
+        });
+      }
+      if (url.endsWith("/package.json")) {
+        return new Response('{"name":"pushpals"}\n');
+      }
+      if (url.endsWith("/bun.lock")) {
+        return new Response("lockfileVersion = 1\n");
+      }
+      if (url.endsWith("/configs/default.toml")) {
+        return new Response('profile = "dev"\n');
+      }
+      if (url.endsWith("/prompts/workerpals/workerpals_system_prompt.md")) {
+        return new Response("# workerpals\n");
+      }
+      if (url.endsWith("/apps/workerpals/Dockerfile.sandbox")) {
+        return new Response("FROM oven/bun:1-debian\n");
+      }
+      if (url.endsWith("/packages/shared/package.json")) {
+        return new Response('{"name":"shared"}\n');
+      }
+      if (url.endsWith("/packages/protocol/package.json")) {
+        return new Response('{"name":"protocol"}\n');
+      }
+      if (url.endsWith("/packages/protocol/src/schemas/envelope.schema.json")) {
+        return new Response("{}\n");
+      }
+      if (url.endsWith("/packages/protocol/src/schemas/events.schema.json")) {
+        return new Response("{}\n");
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      await downloadRuntimeAssetsFromSourceTag(runtimeRoot, tag);
+
+      expect(readFileSync(join(runtimeRoot, "sandbox", "bun.lock"), "utf8")).toContain(
+        "lockfileVersion",
+      );
+      expect(existsSync(join(runtimeRoot, "sandbox", "bun.lockb"))).toBe(false);
+      expect(readFileSync(join(runtimeRoot, "protocol", "schemas", "events.schema.json"), "utf8")).toBe(
+        "{}\n",
+      );
+      expect(fetchedUrls.some((url) => url.endsWith("/bun.lockb"))).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
   });
 
   test("buildOpenMonitoringHubCommand selects the right launcher per platform", () => {

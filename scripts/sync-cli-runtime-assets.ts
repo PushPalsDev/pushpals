@@ -2,7 +2,7 @@
 
 import { cpSync, existsSync, mkdirSync, rmSync } from "fs";
 import { dirname, join, resolve } from "path";
-import { resolveBundledRuntimeAssetSource } from "./pushpals-cli.ts";
+import { copyTrackedRepoPath, resolveBundledRuntimeAssetSource } from "./pushpals-cli.ts";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const outDir = join(repoRoot, "packages", "cli", "runtime");
@@ -22,6 +22,15 @@ const copyPairs: Array<[string, string]> = [
   [source.configsDir, join(outDir, "configs")],
   [source.promptsDir, join(outDir, "prompts")],
   [source.protocolSchemasDir, join(outDir, "protocol", "schemas")],
+  [source.configsDir, join(outDir, "sandbox", "configs")],
+  [join(source.promptsDir, "workerpals"), join(outDir, "sandbox", "prompts", "workerpals")],
+  [source.protocolSchemasDir, join(outDir, "sandbox", "protocol", "schemas")],
+];
+const trackedSandboxCopyPairs: Array<[string, string]> = [
+  ["package.json", join(outDir, "sandbox", "package.json")],
+  ["apps/workerpals", join(outDir, "sandbox", "apps", "workerpals")],
+  ["packages/shared", join(outDir, "sandbox", "packages", "shared")],
+  ["packages/protocol", join(outDir, "sandbox", "packages", "protocol")],
 ];
 
 for (const [fromPath, toPath] of copyPairs) {
@@ -37,6 +46,14 @@ for (const [fromPath, toPath] of copyPairs) {
     recursive: true,
     force: true,
   });
+}
+
+for (const [fromPath, toPath] of trackedSandboxCopyPairs) {
+  copyTrackedRepoPath(repoRoot, fromPath, toPath, true);
+}
+
+if (existsSync(join(repoRoot, "bun.lock"))) {
+  copyTrackedRepoPath(repoRoot, "bun.lock", join(outDir, "sandbox", "bun.lock"), true);
 }
 
 console.log(`[cli-runtime-assets] Synced runtime assets into ${outDir}`);

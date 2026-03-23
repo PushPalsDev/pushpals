@@ -1,0 +1,233 @@
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ajv = new Ajv({ strict: true });
+
+// Add format validators for date-time, etc.
+addFormats(ajv);
+
+/**
+ * Expected runtime layout (after `npm run build` / `bun --cwd packages/protocol build`):
+ *
+ * packages/protocol/dist/index.js
+ * packages/protocol/dist/validate.js
+ * packages/protocol/dist/schemas/*.json
+ *
+ * The loader below prefers `dist/schemas` when running compiled JS and falls
+ * back to `../src/schemas` during development. The `scripts/copy-schemas.js`
+ * build step copies `src/schemas` into `dist/schemas` to satisfy runtime loads.
+ */
+
+/**
+ * Load schema from file. Deterministic order:
+ * 1. Built/runtime: `dist/schemas` (when running compiled JS)
+ * 2. Development: `src/schemas` (when running from source)
+ */
+function loadSchema(filename: string): Record<string, unknown> {
+  const distSchemasPath = join(__dirname, "schemas", filename); // dist/schemas when compiled
+  const srcSchemasPath = join(__dirname, "..", "src", "schemas", filename); // src/schemas during development
+  const envSchemasDir = String(process.env.PUSHPALS_PROTOCOL_SCHEMAS_DIR ?? "").trim();
+  const envSchemasPath = envSchemasDir ? join(envSchemasDir, filename) : "";
+  const candidates = [distSchemasPath, srcSchemasPath, envSchemasPath].filter(Boolean);
+
+  for (const pathValue of candidates) {
+    try {
+      return JSON.parse(readFileSync(pathValue, "utf-8"));
+    } catch {
+      // try next path
+    }
+  }
+
+  throw new Error(
+    `Failed to load schema ${filename}. Expected at dist/schemas (build), src/schemas (dev), or PUSHPALS_PROTOCOL_SCHEMAS_DIR.`,
+  );
+}
+
+// Load schemas
+const envelopeSchema = loadSchema("envelope.schema.json");
+const eventsSchema = loadSchema("events.schema.json");
+
+// Register schemas with AJV (helps with $ref resolution across files)
+try {
+  ajv.addSchema(envelopeSchema as object, "envelope.schema.json");
+  ajv.addSchema(eventsSchema as object, "events.schema.json");
+} catch (_e) {
+  // addSchema may throw in strict modes for malformed schemas; compilation below
+  // will still attempt to compile standalone validators.
+}
+
+// Compile validators
+const validateEnvelopeBase = ajv.compile(envelopeSchema as object);
+const validateEventPayload = ajv.compile(eventsSchema as object);
+const validateMessageRequestSchema = ajv.compile({
+  type: "object",
+  required: ["text"],
+  properties: {
+    text: { type: "string" },
+    intent: { type: "object", additionalProperties: true },
+  },
+  additionalProperties: false,
+});
+const validateMessageResponseSchema = ajv.compile({
+  type: "object",
+  required: ["ok"],
+  properties: {
+    ok: { type: "boolean" },
+  },
+  additionalProperties: false,
+});
+const validateApprovalDecisionRequestSchema = ajv.compile({
+  type: "object",
+  required: ["decision"],
+  properties: {
+    decision: {
+      type: "string",
+      enum: ["approve", "deny"],
+    },
+  },
+  additionalProperties: false,
+});
+const validateApprovalDecisionResponseSchema = ajv.compile({
+  type: "object",
+  required: ["ok"],
+  properties: {
+    ok: { type: "boolean" },
+  },
+  additionalProperties: false,
+});
+
+export interface ValidationResult {
+  ok: boolean;
+  errors?: string[];
+}
+
+/**
+ * Validate an EventEnvelope against the full schema
+ */
+export function validateEventEnvelope(data: unknown): ValidationResult {
+  const baseValid = validateEnvelopeBase(data);
+  if (!baseValid) {
+    const errors = (validateEnvelopeBase.errors ?? []).map((e) =>
+      `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),
+    );
+    return { ok: false, errors };
+  }
+
+  // Validate only the `{ type, payload }` pairing against the events schema.
+  // This ensures branch validation focuses on the event discriminant and
+  // its payload shape, while envelope-level fields are handled above.
+  const maybe = data as any;
+  const pair = { type: maybe?.type, payload: maybe?.payload };
+
+  const payloadValid = validateEventPayload(pair);
+  if (!payloadValid) {
+    const errors = (validateEventPayload.errors ?? []).map((e) =>
+      `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),
+    );
+    return { ok: false, errors };
+  }
+
+  return { ok: true };
+}
+
+export function validateMessageRequest(data: unknown): ValidationResult {
+  const valid = validateMessageRequestSchema(data);
+  return {
+    ok: valid,
+    errors: valid ? undefined : ajv.errorsText(validateMessageRequestSchema.errors).split(", "),
+  };
+}
+
+export function validateMessageResponse(data: unknown): ValidationResult {
+  const valid = validateMessageResponseSchema(data);
+  return {
+    ok: valid,
+    errors: valid ? undefined : ajv.errorsText(validateMessageResponseSchema.errors).split(", "),
+  };
+}
+
+export function validateApprovalDecisionRequest(data: unknown): ValidationResult {
+  const valid = validateApprovalDecisionRequestSchema(data);
+  return {
+    ok: valid,
+    errors: valid
+      ? undefined
+      : ajv.errorsText(validateApprovalDecisionRequestSchema.errors).split(", "),
+  };
+}
+
+export function validateApprovalDecisionResponse(data: unknown): ValidationResult {
+  const valid = validateApprovalDecisionResponseSchema(data);
+  return {
+    ok: valid,
+    errors: valid
+      ? undefined
+      : ajv.errorsText(validateApprovalDecisionResponseSchema.errors).split(", "),
+  };
+}
+
+// Command request schema (agent-friendly ingest)
+const allEventTypes = [
+  "log",
+  "scan_result",
+  "suggestions",
+  "diff_ready",
+  "approval_required",
+  "approved",
+  "denied",
+  "committed",
+  "assistant_message",
+  "error",
+  "done",
+  "agent_status",
+  "task_created",
+  "task_started",
+  "task_progress",
+  "task_completed",
+  "task_failed",
+  "tool_call",
+  "tool_result",
+  "delegate_request",
+  "delegate_response",
+  "job_enqueued",
+  "job_claimed",
+  "job_completed",
+  "job_failed",
+  "message",
+  "job_log",
+  "status",
+  "autonomy_cycle_started",
+  "autonomy_candidates_generated",
+  "autonomy_objective_dispatched",
+  "autonomy_objective_blocked",
+  "autonomy_feedback_recorded",
+  "question_asked",
+  "question_answered",
+];
+
+const validateCommandRequestSchema = ajv.compile({
+  type: "object",
+  required: ["type", "payload"],
+  properties: {
+    type: { type: "string", enum: allEventTypes },
+    payload: { type: "object", additionalProperties: true },
+    from: { type: "string" },
+    to: { type: "string" },
+    correlationId: { type: "string" },
+    turnId: { type: "string" },
+    parentId: { type: "string" },
+  },
+  additionalProperties: false,
+});
+
+export function validateCommandRequest(data: unknown): ValidationResult {
+  const valid = validateCommandRequestSchema(data);
+  return {
+    ok: valid,
+    errors: valid ? undefined : ajv.errorsText(validateCommandRequestSchema.errors).split(", "),
+  };
+}

@@ -1,0 +1,37 @@
+{
+  "name": "protocol",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.browser.js"
+    },
+    "./react-native": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.browser.js"
+    }
+  },
+  "scripts": {
+    "build": "bun x --bun tsc && node scripts/copy-schemas.js",
+    "tsc": "bun x --bun tsc",
+    "test": "bun run ../../tests/protocol.integration.ts",
+    "typecheck": "bun x --bun tsc --noEmit"
+  },
+  "dependencies": {
+    "ajv": "^8.12.0",
+    "ajv-formats": "^3.0.1"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2",
+    "json-schema-to-ts": "^3.1.0",
+    "@types/node": "^20.0.0"
+  },
+  "private": true
+}

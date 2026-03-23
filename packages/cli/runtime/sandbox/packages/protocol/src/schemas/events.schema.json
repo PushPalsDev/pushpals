@@ -1,0 +1,679 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EventTypePayloads",
+  "definitions": {
+    "artifact": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string" },
+        "uri": { "type": "string" },
+        "text": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "log" },
+        "payload": {
+          "type": "object",
+          "required": ["level", "message"],
+          "properties": {
+            "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "scan_result" },
+        "payload": {
+          "type": "object",
+          "required": ["summary", "filesRead", "gitStatusPorcelain", "gitDiff"],
+          "properties": {
+            "summary": { "type": "string" },
+            "filesRead": { "type": "array", "items": { "type": "string" } },
+            "gitStatusPorcelain": { "type": "string" },
+            "gitDiff": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "suggestions" },
+        "payload": {
+          "type": "object",
+          "required": ["items"],
+          "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "title", "detail", "effort"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "title": { "type": "string" },
+                  "detail": { "type": "string" },
+                  "effort": { "type": "string", "enum": ["S", "M", "L"] }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "assistant_message" },
+        "payload": {
+          "type": "object",
+          "required": ["text"],
+          "properties": { "text": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "diff_ready" },
+        "payload": {
+          "type": "object",
+          "required": ["unifiedDiff", "diffStat", "branch"],
+          "properties": {
+            "unifiedDiff": { "type": "string" },
+            "diffStat": { "type": "string" },
+            "branch": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "approval_required" },
+        "payload": {
+          "type": "object",
+          "required": ["approvalId", "action", "summary", "details"],
+          "properties": {
+            "approvalId": { "type": "string" },
+            "action": { "type": "string", "enum": ["git.commit", "git.push", "other"] },
+            "summary": { "type": "string" },
+            "details": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "approved" },
+        "payload": {
+          "type": "object",
+          "required": ["approvalId"],
+          "properties": { "approvalId": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "denied" },
+        "payload": {
+          "type": "object",
+          "required": ["approvalId"],
+          "properties": { "approvalId": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "committed" },
+        "payload": {
+          "type": "object",
+          "required": ["branch", "commitHash", "message"],
+          "properties": {
+            "branch": { "type": "string" },
+            "commitHash": { "type": "string" },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "error" },
+        "payload": {
+          "type": "object",
+          "required": ["message"],
+          "properties": { "message": { "type": "string" }, "detail": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "done" },
+        "payload": {
+          "type": "object",
+          "required": ["ok"],
+          "properties": { "ok": { "type": "boolean" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "agent_status" },
+        "payload": {
+          "type": "object",
+          "required": ["agentId", "status"],
+          "properties": {
+            "agentId": { "type": "string" },
+            "status": { "type": "string", "enum": ["idle", "busy", "error"] },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_created" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "title", "description", "createdBy"],
+          "properties": {
+            "taskId": { "type": "string" },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "createdBy": { "type": "string" },
+            "priority": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_started" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId"],
+          "properties": { "taskId": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_progress" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "message"],
+          "properties": {
+            "taskId": { "type": "string" },
+            "message": { "type": "string" },
+            "percent": { "type": "number", "minimum": 0, "maximum": 100 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_completed" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "summary"],
+          "properties": {
+            "taskId": { "type": "string" },
+            "summary": { "type": "string" },
+            "artifacts": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/artifact" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "task_failed" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "message"],
+          "properties": {
+            "taskId": { "type": "string" },
+            "message": { "type": "string" },
+            "detail": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "tool_call" },
+        "payload": {
+          "type": "object",
+          "required": ["toolCallId", "tool", "args"],
+          "properties": {
+            "toolCallId": { "type": "string" },
+            "taskId": { "type": "string" },
+            "tool": { "type": "string" },
+            "args": { "type": "object", "additionalProperties": true },
+            "requiresApproval": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "tool_result" },
+        "payload": {
+          "type": "object",
+          "required": ["toolCallId", "ok"],
+          "properties": {
+            "toolCallId": { "type": "string" },
+            "taskId": { "type": "string" },
+            "ok": { "type": "boolean" },
+            "stdout": { "type": "string" },
+            "stderr": { "type": "string" },
+            "exitCode": { "type": "integer" },
+            "artifacts": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/artifact" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "delegate_request" },
+        "payload": {
+          "type": "object",
+          "required": ["requestId", "toAgentId", "input"],
+          "properties": {
+            "requestId": { "type": "string" },
+            "toAgentId": { "type": "string" },
+            "input": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "delegate_response" },
+        "payload": {
+          "type": "object",
+          "required": ["requestId", "ok"],
+          "properties": {
+            "requestId": { "type": "string" },
+            "ok": { "type": "boolean" },
+            "output": { "type": "object", "additionalProperties": true },
+            "error": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_enqueued" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId", "taskId", "kind", "params"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "taskId": { "type": "string" },
+            "kind": { "type": "string" },
+            "params": { "type": "object", "additionalProperties": true },
+            "origin": { "type": "string", "enum": ["user", "autonomy"] },
+            "autonomy": {
+              "type": "object",
+              "properties": {
+                "objectiveId": { "type": "string" },
+                "runId": { "type": "string" },
+                "snapshotId": { "type": "string" },
+                "patternKey": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_claimed" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId", "workerId"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "workerId": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_completed" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "summary": { "type": "string" },
+            "artifacts": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/artifact" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_failed" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId", "message"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "message": { "type": "string" },
+            "detail": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "message" },
+        "payload": {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "text": { "type": "string" },
+            "intent": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "job_log" },
+        "payload": {
+          "type": "object",
+          "required": ["jobId", "stream", "seq", "line"],
+          "properties": {
+            "jobId": { "type": "string" },
+            "stream": { "type": "string", "enum": ["stdout", "stderr"] },
+            "seq": { "type": "integer", "minimum": 1 },
+            "line": { "type": "string" },
+            "ts": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "status" },
+        "payload": {
+          "type": "object",
+          "required": ["agentId", "state"],
+          "properties": {
+            "agentId": { "type": "string" },
+            "state": { "type": "string", "enum": ["idle", "busy", "error", "shutting_down"] },
+            "uptimeMs": { "type": "number" },
+            "detail": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_cycle_started" },
+        "payload": {
+          "type": "object",
+          "required": ["runId", "snapshotId"],
+          "properties": {
+            "runId": { "type": "string" },
+            "snapshotId": { "type": "string" },
+            "phase": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_candidates_generated" },
+        "payload": {
+          "type": "object",
+          "required": ["runId", "snapshotId", "candidateCount"],
+          "properties": {
+            "runId": { "type": "string" },
+            "snapshotId": { "type": "string" },
+            "candidateCount": { "type": "integer", "minimum": 0 },
+            "topCandidateIds": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_objective_dispatched" },
+        "payload": {
+          "type": "object",
+          "required": ["runId", "snapshotId", "objectiveId", "requestId", "patternKey"],
+          "properties": {
+            "runId": { "type": "string" },
+            "snapshotId": { "type": "string" },
+            "objectiveId": { "type": "string" },
+            "requestId": { "type": "string" },
+            "patternKey": { "type": "string" },
+            "origin": { "type": "string", "enum": ["autonomy"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_objective_blocked" },
+        "payload": {
+          "type": "object",
+          "required": ["runId", "snapshotId", "objectiveId", "reason"],
+          "properties": {
+            "runId": { "type": "string" },
+            "snapshotId": { "type": "string" },
+            "objectiveId": { "type": "string" },
+            "reason": { "type": "string" },
+            "questionId": { "type": "string" },
+            "patternKey": { "type": "string" },
+            "origin": { "type": "string", "enum": ["autonomy"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "autonomy_feedback_recorded" },
+        "payload": {
+          "type": "object",
+          "required": ["objectiveId", "patternKey", "outcome", "success"],
+          "properties": {
+            "objectiveId": { "type": "string" },
+            "patternKey": { "type": "string" },
+            "outcome": { "type": "string" },
+            "success": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "question_asked" },
+        "payload": {
+          "type": "object",
+          "required": ["questionId", "objectiveId", "question", "questionType"],
+          "properties": {
+            "questionId": { "type": "string" },
+            "objectiveId": { "type": "string" },
+            "question": { "type": "string" },
+            "questionType": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "const": "question_answered" },
+        "payload": {
+          "type": "object",
+          "required": ["questionId", "objectiveId", "status"],
+          "properties": {
+            "questionId": { "type": "string" },
+            "objectiveId": { "type": "string" },
+            "status": { "type": "string", "enum": ["valid", "invalid"] },
+            "answerSummary": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

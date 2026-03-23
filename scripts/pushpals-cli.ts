@@ -146,6 +146,18 @@ type RuntimeAssetSource = {
   protocolSchemasDir: string;
 };
 
+type WorkerpalSandboxPaths = {
+  root: string;
+  dockerfilePath: string;
+  packageJsonPath: string;
+  workerpalsDir: string;
+  sharedDir: string;
+  protocolDir: string;
+  configsDir: string;
+  workerpalsPromptsDir: string;
+  protocolSchemasDir: string;
+};
+
 type PreparedCliRuntime = {
   runtimeRoot: string;
   runtimeTag: string;
@@ -476,6 +488,179 @@ function buildRuntimeAssetSource(root: string, protocolSchemasDir: string): Runt
   };
 }
 
+export function buildWorkerpalSandboxPaths(runtimeRoot: string): WorkerpalSandboxPaths {
+  const root = join(runtimeRoot, "sandbox");
+  return {
+    root,
+    dockerfilePath: join(root, "apps", "workerpals", "Dockerfile.sandbox"),
+    packageJsonPath: join(root, "package.json"),
+    workerpalsDir: join(root, "apps", "workerpals"),
+    sharedDir: join(root, "packages", "shared"),
+    protocolDir: join(root, "packages", "protocol"),
+    configsDir: join(root, "configs"),
+    workerpalsPromptsDir: join(root, "prompts", "workerpals"),
+    protocolSchemasDir: join(root, "protocol", "schemas"),
+  };
+}
+
+function normalizeGitTrackedPath(pathValue: string): string {
+  return String(pathValue ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "");
+}
+
+function listTrackedRepoFilesForPath(repoRoot: string, sourcePath: string): string[] {
+  const normalizedSource = normalizeGitTrackedPath(sourcePath);
+  if (!normalizedSource) return [];
+  const proc = Bun.spawnSync(["git", "ls-files", "-z", "--", normalizedSource], {
+    cwd: repoRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...(process.env as Record<string, string | undefined>),
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "Never",
+    },
+  });
+  if (proc.exitCode !== 0) {
+    const stderr = Buffer.from(proc.stderr ?? []).toString("utf8").trim();
+    throw new Error(
+      `git ls-files failed for ${normalizedSource}${stderr ? `: ${stderr}` : ""}`,
+    );
+  }
+  return Buffer.from(proc.stdout ?? [])
+    .toString("utf8")
+    .split("\0")
+    .map(normalizeGitTrackedPath)
+    .filter(Boolean);
+}
+
+export function copyTrackedRepoPath(
+  repoRoot: string,
+  sourcePath: string,
+  destinationPath: string,
+  force = true,
+): void {
+  const normalizedSource = normalizeGitTrackedPath(sourcePath);
+  if (!normalizedSource) {
+    throw new Error("sourcePath is required");
+  }
+  const absoluteSource = resolve(repoRoot, normalizedSource);
+  if (!existsSync(absoluteSource)) {
+    throw new Error(`tracked repo source is missing: ${absoluteSource}`);
+  }
+
+  const trackedFiles = listTrackedRepoFilesForPath(repoRoot, normalizedSource);
+  const sourceStat = lstatSync(absoluteSource);
+  if (!sourceStat.isDirectory()) {
+    if (!trackedFiles.includes(normalizedSource)) {
+      throw new Error(`tracked repo file is not tracked by git: ${normalizedSource}`);
+    }
+    mkdirSync(dirname(destinationPath), { recursive: true });
+    cpSync(absoluteSource, destinationPath, {
+      recursive: false,
+      force,
+      errorOnExist: false,
+    });
+    return;
+  }
+
+  if (trackedFiles.length === 0) {
+    throw new Error(`tracked repo directory has no tracked files: ${normalizedSource}`);
+  }
+  for (const trackedFile of trackedFiles) {
+    const relativePath =
+      trackedFile === normalizedSource
+        ? basename(trackedFile)
+        : trackedFile.slice(normalizedSource.length + 1);
+    const sourceFile = resolve(repoRoot, trackedFile);
+    const targetFile = join(destinationPath, relativePath);
+    mkdirSync(dirname(targetFile), { recursive: true });
+    cpSync(sourceFile, targetFile, {
+      recursive: false,
+      force,
+      errorOnExist: false,
+    });
+  }
+}
+
+function isCompleteWorkerpalSandboxRoot(root: string): boolean {
+  return (
+    existsSync(join(root, "package.json")) &&
+    existsSync(join(root, "apps", "workerpals", "Dockerfile.sandbox")) &&
+    existsSync(join(root, "packages", "shared", "package.json")) &&
+    existsSync(join(root, "packages", "protocol", "package.json")) &&
+    existsSync(join(root, "configs", "default.toml")) &&
+    existsSync(join(root, "prompts", "workerpals")) &&
+    existsSync(join(root, "protocol", "schemas", "envelope.schema.json")) &&
+    existsSync(join(root, "protocol", "schemas", "events.schema.json"))
+  );
+}
+
+function populateWorkerpalSandboxRuntimeAssets(
+  runtimeRoot: string,
+  force: boolean,
+): void {
+  const sandbox = buildWorkerpalSandboxPaths(runtimeRoot);
+  cpSync(join(runtimeRoot, "configs"), sandbox.configsDir, {
+    recursive: true,
+    force,
+    errorOnExist: false,
+  });
+  cpSync(join(runtimeRoot, "prompts", "workerpals"), sandbox.workerpalsPromptsDir, {
+    recursive: true,
+    force,
+    errorOnExist: false,
+  });
+  cpSync(join(runtimeRoot, "protocol", "schemas"), sandbox.protocolSchemasDir, {
+    recursive: true,
+    force,
+    errorOnExist: false,
+  });
+}
+
+function copySourceCheckoutWorkerpalSandboxBuildContext(
+  sourceRoot: string,
+  runtimeRoot: string,
+  force: boolean,
+): void {
+  const sandbox = buildWorkerpalSandboxPaths(runtimeRoot);
+  const copyPairs: Array<[string, string]> = [
+    ["package.json", sandbox.packageJsonPath],
+    ["apps/workerpals", sandbox.workerpalsDir],
+    ["packages/shared", sandbox.sharedDir],
+    ["packages/protocol", sandbox.protocolDir],
+  ];
+
+  for (const [fromPath, toPath] of copyPairs) {
+    copyTrackedRepoPath(sourceRoot, fromPath, toPath, force);
+  }
+  if (existsSync(join(sourceRoot, "bun.lock"))) {
+    copyTrackedRepoPath(sourceRoot, "bun.lock", join(sandbox.root, "bun.lock"), force);
+  }
+  populateWorkerpalSandboxRuntimeAssets(runtimeRoot, force);
+}
+
+function copyWorkerpalSandboxBuildContext(
+  source: RuntimeAssetSource,
+  runtimeRoot: string,
+  force: boolean,
+): void {
+  const packagedSandboxRoot = join(source.root, "sandbox");
+  if (isCompleteWorkerpalSandboxRoot(packagedSandboxRoot)) {
+    cpSync(packagedSandboxRoot, join(runtimeRoot, "sandbox"), {
+      recursive: true,
+      force,
+      errorOnExist: false,
+    });
+    return;
+  }
+
+  copySourceCheckoutWorkerpalSandboxBuildContext(source.root, runtimeRoot, force);
+}
+
 function isCompleteRuntimeAssetSource(source: RuntimeAssetSource): boolean {
   return (
     existsSync(source.envExamplePath) &&
@@ -716,6 +901,7 @@ function copyRuntimeAssetBundle(
     force,
     errorOnExist: false,
   });
+  copyWorkerpalSandboxBuildContext(source, runtimeRoot, force);
 }
 
 function copyBundledRuntimeAssets(runtimeRoot: string, force = true): boolean {
@@ -750,7 +936,10 @@ async function fetchTextFromUrl(url: string, timeoutMs = 20_000): Promise<string
   return await response.text();
 }
 
-async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: string): Promise<void> {
+export async function downloadRuntimeAssetsFromSourceTag(
+  runtimeRoot: string,
+  tag: string,
+): Promise<void> {
   console.log(`[pushpals] Downloading embedded runtime assets from source tag ${tag}...`);
   const treeUrl = `${GITHUB_API_URL}/git/trees/${encodeURIComponent(tag)}?recursive=1`;
   const treeResponse = await fetchWithTimeout(treeUrl, { headers: GITHUB_HEADERS }, 30_000);
@@ -767,8 +956,14 @@ async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: stri
       (pathValue) =>
         pathValue === ".env.example" ||
         pathValue === "vision.example.md" ||
+        pathValue === "package.json" ||
+        pathValue === "bun.lock" ||
         pathValue.startsWith("configs/") ||
+        pathValue.startsWith("prompts/workerpals/") ||
         pathValue.startsWith("prompts/") ||
+        pathValue.startsWith("apps/workerpals/") ||
+        pathValue.startsWith("packages/shared/") ||
+        pathValue.startsWith("packages/protocol/") ||
         pathValue.startsWith("packages/protocol/src/schemas/"),
     );
 
@@ -780,17 +975,28 @@ async function downloadRuntimeAssetsFromSourceTag(runtimeRoot: string, tag: stri
   for (const pathValue of sorted) {
     const rawUrl = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${encodeURIComponent(tag)}/${pathValue}`;
     const body = await fetchTextFromUrl(rawUrl, 20_000);
-    const outPath = pathValue.startsWith("packages/protocol/src/schemas/")
-      ? join(
-          runtimeRoot,
-          "protocol",
-          "schemas",
-          pathValue.slice("packages/protocol/src/schemas/".length),
-        )
-      : join(runtimeRoot, pathValue);
+    const outPath =
+      pathValue === "package.json" || pathValue === "bun.lock"
+        ? join(runtimeRoot, "sandbox", pathValue)
+        : pathValue.startsWith("apps/workerpals/") ||
+            pathValue.startsWith("packages/shared/") ||
+            pathValue.startsWith("packages/protocol/")
+          ? join(runtimeRoot, "sandbox", pathValue)
+          : join(runtimeRoot, pathValue);
     mkdirSync(dirname(outPath), { recursive: true });
     writeFileSync(outPath, body, "utf8");
+    if (pathValue.startsWith("packages/protocol/src/schemas/")) {
+      const runtimeSchemaPath = join(
+        runtimeRoot,
+        "protocol",
+        "schemas",
+        pathValue.slice("packages/protocol/src/schemas/".length),
+      );
+      mkdirSync(dirname(runtimeSchemaPath), { recursive: true });
+      writeFileSync(runtimeSchemaPath, body, "utf8");
+    }
   }
+  populateWorkerpalSandboxRuntimeAssets(runtimeRoot, true);
 }
 
 async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Promise<void> {
@@ -806,7 +1012,8 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
     existsSync(join(runtimeRoot, "vision.example.md")) &&
     existsSync(join(runtimeRoot, "configs", "default.toml")) &&
     existsSync(join(runtimeRoot, "prompts")) &&
-    hasProtocolSchemas;
+    hasProtocolSchemas &&
+    isCompleteWorkerpalSandboxRoot(join(runtimeRoot, "sandbox"));
   if (!hasAssets || currentTag !== runtimeTag) {
     console.log(
       `[pushpals] Embedded runtime assets ${hasAssets ? "are stale" : "are missing"}; refreshing bundle...`,
@@ -820,7 +1027,8 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
       existsSync(join(runtimeRoot, "vision.example.md")) &&
       existsSync(join(runtimeRoot, "configs", "default.toml")) &&
       existsSync(join(runtimeRoot, "prompts")) &&
-      hasProtocolSchemasAfterCopy;
+      hasProtocolSchemasAfterCopy &&
+      isCompleteWorkerpalSandboxRoot(join(runtimeRoot, "sandbox"));
     if (!hasAssetsAfterCopy) {
       console.log(
         "[pushpals] Bundled runtime assets are incomplete; falling back to release source downloads...",
@@ -906,6 +1114,7 @@ export function buildEmbeddedRuntimeEnv(
     runtimeRoot: string;
     useRuntimeConfig?: boolean;
     sessionId?: string;
+    runtimeTag?: string;
   },
 ): Record<string, string> {
   const env = normalizeChildProcessEnv(baseEnv);
@@ -918,6 +1127,10 @@ export function buildEmbeddedRuntimeEnv(
       ? {
           PUSHPALS_CONFIG_DIR_OVERRIDE: join(opts.runtimeRoot, "configs"),
           PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.runtimeRoot,
+          PUSHPALS_WORKERPALS_SANDBOX_ROOT: join(opts.runtimeRoot, "sandbox"),
+          ...(typeof opts.runtimeTag === "string" && opts.runtimeTag.trim()
+            ? { PUSHPALS_RUNTIME_TAG: opts.runtimeTag.trim() }
+            : {}),
         }
       : {
           PUSHPALS_PROMPTS_ROOT_OVERRIDE: opts.repoRoot,
@@ -1548,6 +1761,186 @@ async function resolveWorkerpalDockerProbe(
     ok: false,
     detail: failures.join(" | ") || "docker",
   };
+}
+
+const WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL = "pushpals.runtime_tag";
+const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox";
+
+function resolveConfiguredDockerExecutable(
+  env: Record<string, string | undefined>,
+  platform = process.platform,
+): string {
+  const configured = String(
+    env.PUSHPALS_DOCKER_BIN_ABSOLUTE ??
+      env.PUSHPALS_DOCKER_BIN ??
+      (platform === "win32" ? "docker.exe" : "docker"),
+  ).trim();
+  return configured || (platform === "win32" ? "docker.exe" : "docker");
+}
+
+async function inspectDockerImageRuntimeTag(
+  dockerExecutable: string,
+  imageName: string,
+  cwd: string,
+  env: Record<string, string>,
+): Promise<string> {
+  const inspect = await runCommandWithEnv(
+    [
+      dockerExecutable,
+      "image",
+      "inspect",
+      "--format",
+      `{{ index .Config.Labels "${WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL}" }}`,
+      imageName,
+    ],
+    cwd,
+    env,
+  );
+  if (!inspect.ok) return "";
+  const value = inspect.stdout.trim();
+  return value === "<no value>" ? "" : value;
+}
+
+export async function ensureWorkerpalDockerImageReady(opts: {
+  runtimeRoot: string;
+  runtimeTag: string;
+  dockerImage: string;
+  env: Record<string, string>;
+  platform?: NodeJS.Platform;
+  ensureRuntimeAssetsFn?: typeof ensureRuntimeAssets;
+  inspectImageRuntimeTagFn?: typeof inspectDockerImageRuntimeTag;
+  runCommandWithEnvFn?: typeof runCommandWithEnv;
+}): Promise<{ ok: boolean; detail: string }> {
+  const runtimeTag = String(opts.runtimeTag ?? "").trim();
+  if (!runtimeTag) {
+    return {
+      ok: false,
+      detail: "embedded runtime tag is required to prepare the WorkerPal sandbox image",
+    };
+  }
+
+  await (opts.ensureRuntimeAssetsFn ?? ensureRuntimeAssets)(opts.runtimeRoot, runtimeTag);
+  const sandbox = buildWorkerpalSandboxPaths(opts.runtimeRoot);
+  if (!isCompleteWorkerpalSandboxRoot(sandbox.root)) {
+    return {
+      ok: false,
+      detail: `embedded WorkerPal sandbox assets are incomplete at ${sandbox.root}`,
+    };
+  }
+
+  const dockerExecutable = resolveConfiguredDockerExecutable(
+    opts.env,
+    opts.platform ?? process.platform,
+  );
+  const inspectImageRuntimeTagFn =
+    opts.inspectImageRuntimeTagFn ?? inspectDockerImageRuntimeTag;
+  const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
+  const existingRuntimeTag = await inspectImageRuntimeTagFn(
+    dockerExecutable,
+    opts.dockerImage,
+    sandbox.root,
+    opts.env,
+  );
+  if (existingRuntimeTag === runtimeTag) {
+    return {
+      ok: true,
+      detail: `WorkerPal sandbox image is ready locally (${opts.dockerImage}, runtimeTag=${runtimeTag})`,
+    };
+  }
+
+  console.log(
+    existingRuntimeTag
+      ? `[pushpals] WorkerPal sandbox image ${opts.dockerImage} is stale (runtimeTag=${existingRuntimeTag}); rebuilding locally...`
+      : `[pushpals] WorkerPal sandbox image ${opts.dockerImage} is missing; building locally...`,
+  );
+  const build = await runCommandWithEnvFn(
+    [
+      dockerExecutable,
+      "build",
+      "-f",
+      "apps/workerpals/Dockerfile.sandbox",
+      "--label",
+      `${WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL}=${runtimeTag}`,
+      "--label",
+      WORKERPAL_SANDBOX_COMPONENT_LABEL,
+      "-t",
+      opts.dockerImage,
+      ".",
+    ],
+    sandbox.root,
+    opts.env,
+  );
+  if (!build.ok) {
+    const detail = build.stderr || build.stdout || `docker build exited ${build.exitCode}`;
+    return {
+      ok: false,
+      detail: `failed to build local WorkerPal sandbox image ${opts.dockerImage}: ${detail}`,
+    };
+  }
+
+  return {
+    ok: true,
+    detail: `built local WorkerPal sandbox image ${opts.dockerImage} for runtimeTag=${runtimeTag}`,
+  };
+}
+
+export async function prepareEmbeddedWorkerpalDockerImageIfNeeded(opts: {
+  preparedRuntime: PreparedCliRuntime;
+  config: ClientRuntimePreflightResult["config"];
+  dockerPrecheck: WorkerpalDockerPrecheck;
+  runtimeTagHint?: string;
+  resolveRuntimeReleaseTagFn?: typeof resolveRuntimeReleaseTag;
+  ensureWorkerpalDockerImageReadyFn?: typeof ensureWorkerpalDockerImageReady;
+}): Promise<{ status: "skipped" | "ok" | "failed"; detail: string; runtimeTag: string }> {
+  if (!opts.preparedRuntime.preflightUsesEmbeddedRuntime) {
+    return {
+      status: "skipped",
+      detail: "repo is using source-checkout runtime assets",
+      runtimeTag: "",
+    };
+  }
+  if (
+    !opts.config.remotebuddy.autoSpawnWorkerpals ||
+    !opts.config.remotebuddy.workerpalDocker ||
+    !opts.config.remotebuddy.workerpalRequireDocker
+  ) {
+    return {
+      status: "skipped",
+      detail: "embedded docker-backed WorkerPal auto-spawn is not required",
+      runtimeTag: "",
+    };
+  }
+  if (opts.dockerPrecheck.status === "failed") {
+    return {
+      status: "failed",
+      detail: opts.dockerPrecheck.detail,
+      runtimeTag: "",
+    };
+  }
+
+  const runtimeTag =
+    opts.preparedRuntime.runtimeTag ||
+    String(opts.runtimeTagHint ?? "").trim() ||
+    (await (opts.resolveRuntimeReleaseTagFn ?? resolveRuntimeReleaseTag)(opts.runtimeTagHint));
+  if (!runtimeTag) {
+    return {
+      status: "failed",
+      detail: "embedded runtime tag is required to prepare the WorkerPal sandbox image",
+      runtimeTag: "",
+    };
+  }
+
+  const ensureResult = await (
+    opts.ensureWorkerpalDockerImageReadyFn ?? ensureWorkerpalDockerImageReady
+  )({
+    runtimeRoot: opts.preparedRuntime.runtimeRoot,
+    runtimeTag,
+    dockerImage: opts.config.remotebuddy.workerpalImage ?? opts.config.workerpals.dockerImage,
+    env: opts.dockerPrecheck.env,
+  });
+  return ensureResult.ok
+    ? { status: "ok", detail: ensureResult.detail, runtimeTag }
+    : { status: "failed", detail: ensureResult.detail, runtimeTag };
 }
 
 export async function precheckSourceControlManagerGitAvailability(opts: {
@@ -2407,6 +2800,7 @@ async function autoStartRuntimeServices(opts: {
       runtimeRoot,
       useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
       sessionId: opts.sessionId,
+      runtimeTag,
     },
   );
   runtimeEnv.PUSHPALS_WORKERPALS_BIN = runtimeBinaries.workerpals;
@@ -3480,6 +3874,7 @@ async function main(): Promise<void> {
   };
   let autoStartedServices: RuntimeServiceProcess[] = [];
   let pushpalsLogPath: string | undefined;
+  let resolvedRuntimeTagForAutoStart = preparedRuntime.runtimeTag || parsed.runtimeTag || "";
   const stopAutoStartedServices = (): void => {
     if (autoStartedServices.length === 0) return;
     stopRuntimeServices(autoStartedServices);
@@ -3488,21 +3883,36 @@ async function main(): Promise<void> {
 
   let serverHealthy = await probeServer(serverUrl);
   const serverWasAlreadyHealthy = serverHealthy;
+  if (!serverHealthy && workerpalDockerPrecheck.status === "failed") {
+    console.error(
+      `[pushpals] Precheck failed: Docker-backed WorkerPal auto-spawn is required but Docker is unavailable (${workerpalDockerPrecheck.detail}).`,
+    );
+    console.error(
+      "[pushpals] Precheck failed: start Docker Desktop or the Docker daemon, then retry pushpals.",
+    );
+    process.exit(1);
+  }
+  if (workerpalDockerPrecheck.status !== "failed") {
+    const workerpalImagePrecheck = await prepareEmbeddedWorkerpalDockerImageIfNeeded({
+      preparedRuntime,
+      config,
+      dockerPrecheck: workerpalDockerPrecheck,
+      runtimeTagHint: resolvedRuntimeTagForAutoStart || parsed.runtimeTag,
+    });
+    if (workerpalImagePrecheck.status === "failed") {
+      console.error(`[pushpals] Precheck failed: ${workerpalImagePrecheck.detail}.`);
+      process.exit(1);
+    }
+    if (workerpalImagePrecheck.runtimeTag) {
+      resolvedRuntimeTagForAutoStart = workerpalImagePrecheck.runtimeTag;
+    }
+  }
   let remoteBuddyConsumerHealth: RemoteBuddySessionConsumerHealth = {
     ok: false,
     detail: `No connected RemoteBuddy session consumer found for session ${sessionId}`,
   };
   if (!serverHealthy) {
     if (!parsed.noAutoStart) {
-      if (workerpalDockerPrecheck.status === "failed") {
-        console.error(
-          `[pushpals] Precheck failed: Docker-backed WorkerPal auto-spawn is required but Docker is unavailable (${workerpalDockerPrecheck.detail}).`,
-        );
-        console.error(
-          "[pushpals] Precheck failed: start Docker Desktop or the Docker daemon, then retry pushpals.",
-        );
-        process.exit(1);
-      }
       try {
         const startedRuntime = await autoStartRuntimeServices({
           repoRoot,
@@ -3512,7 +3922,7 @@ async function main(): Promise<void> {
           sourceControlManagerPort: config.sourceControlManager.port,
           sourceControlManagerRemote: config.sourceControlManager.remote,
           preparedRuntime,
-          requestedRuntimeTag: parsed.runtimeTag,
+          requestedRuntimeTag: resolvedRuntimeTagForAutoStart || parsed.runtimeTag,
           startLocalBuddy: resolveCliLocalBuddyAutostart(
             parsed.runtimeOnly,
             Boolean(config.localbuddy.enabled),
