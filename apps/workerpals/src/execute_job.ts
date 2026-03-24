@@ -2024,17 +2024,19 @@ export function shouldUseCodexCliForExecutor(executor: string): boolean {
 
 function normalizeCodexReasoningEffort(
   value: unknown,
+  model = "",
 ): "low" | "medium" | "high" | "xhigh" {
   const normalized = String(value ?? "")
     .trim()
     .toLowerCase();
+  const supportsExtraHigh = !/^(gpt-5\.4(?:$|-)|codex-1p(?:$|-))/i.test(String(model ?? "").trim());
   if (
     normalized === "low" ||
     normalized === "medium" ||
     normalized === "high" ||
     normalized === "xhigh"
   ) {
-    return normalized;
+    return normalized === "xhigh" && !supportsExtraHigh ? "high" : normalized;
   }
   if (
     normalized === "extra high" ||
@@ -2042,9 +2044,9 @@ function normalizeCodexReasoningEffort(
     normalized === "extrahigh" ||
     normalized === "x-high"
   ) {
-    return "xhigh";
+    return supportsExtraHigh ? "xhigh" : "high";
   }
-  return "xhigh";
+  return "high";
 }
 
 async function generateCommitMessageFromDiff(
@@ -2105,6 +2107,7 @@ async function generateCommitMessageFromDiffViaCodex(
   })();
   const reasoningEffort = normalizeCodexReasoningEffort(
     runtimeConfig.workerpals.llm.reasoningEffort,
+    model,
   );
   const tmpOutputPath = resolve(
     Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp",

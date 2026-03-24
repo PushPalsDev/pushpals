@@ -80,6 +80,23 @@ describe("workerpals docker executor internals", () => {
     );
   });
 
+  test("retry matching treats docker cwd races as transient", () => {
+    const executor = createExecutor() as unknown as {
+      matchesRetryablePattern: (text: string) => boolean;
+    };
+
+    expect(
+      executor.matchesRetryablePattern(
+        'OCI runtime exec failed: exec failed: unable to start container process: chdir to cwd ("/repo/.worktrees/job-123") set in config.json failed: no such file or directory: unknown',
+      ),
+    ).toBe(true);
+    expect(
+      executor.matchesRetryablePattern(
+        "worktree path not visible inside warm container after 5000ms: /repo/.worktrees/job-123",
+      ),
+    ).toBe(true);
+  });
+
   test("parseGitWorktreeListPorcelain extracts detached and prunable flags", () => {
     const parsed = parseGitWorktreeListPorcelain(
       [

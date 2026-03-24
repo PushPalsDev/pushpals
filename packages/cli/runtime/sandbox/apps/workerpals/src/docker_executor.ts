@@ -1048,6 +1048,7 @@ export class DockerExecutor {
 
     const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
+    await this.waitForWorktreePathInWarmContainer(containerWorktreePath);
 
     const args: string[] = [
       "exec",
@@ -1122,6 +1123,26 @@ export class DockerExecutor {
     });
 
     return result;
+  }
+
+  private async waitForWorktreePathInWarmContainer(
+    containerWorktreePath: string,
+    timeoutMs = 5_000,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let lastDetail = "";
+    const command = `test -d ${shellSingleQuote(containerWorktreePath)}`;
+    while (Date.now() < deadline) {
+      const result = await this.runWarmShell(command);
+      if (result.ok) return;
+      lastDetail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+      await this.sleep(100);
+    }
+    throw new Error(
+      `worktree path not visible inside warm container after ${timeoutMs}ms: ${containerWorktreePath}${
+        lastDetail ? ` (${lastDetail})` : ""
+      }`,
+    );
   }
 
   private normalizeProvider(raw: string): string {
@@ -1450,6 +1471,9 @@ export class DockerExecutor {
       /\btemporary failure\b/i,
       /\bopenhands wrapper timed out\b/i,
       /\bjob timed out in docker executor\b/i,
+      /\bworktree path not visible inside warm container\b/i,
+      /\bchdir to cwd\b/i,
+      /\bunable to start container process\b/i,
     ];
     return transientPatterns.some((pattern) => pattern.test(text));
   }

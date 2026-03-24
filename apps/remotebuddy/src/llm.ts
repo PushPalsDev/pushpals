@@ -238,13 +238,17 @@ function codexTimeoutMs(configuredTimeoutMs?: number | null): number {
 
 function codexReasoningEffort(
   configured: string | null | undefined,
+  model: string,
 ): "low" | "medium" | "high" | "xhigh" {
   const raw = (configured ?? "").trim().toLowerCase();
-  if (raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh") return raw;
-  if (raw === "extra high" || raw === "extra-high" || raw === "extrahigh" || raw === "x-high") {
-    return "xhigh";
+  const supportsExtraHigh = !/^(gpt-5\.4(?:$|-)|codex-1p(?:$|-))/i.test(model.trim());
+  if (raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh") {
+    return raw === "xhigh" && !supportsExtraHigh ? "high" : raw;
   }
-  return "xhigh";
+  if (raw === "extra high" || raw === "extra-high" || raw === "extrahigh" || raw === "x-high") {
+    return supportsExtraHigh ? "xhigh" : "high";
+  }
+  return "high";
 }
 
 function normalizeCodexModel(rawModel: string): string {
@@ -1467,7 +1471,7 @@ export class OpenAiCodexCliClient implements LLMClient {
       const command: string[] = [
         ...commandPrefix,
         "-c",
-        `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort)}"`,
+        `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort, this.model)}"`,
         "-a",
         "never",
         "-s",

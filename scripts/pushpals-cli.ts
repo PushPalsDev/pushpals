@@ -1461,6 +1461,65 @@ function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
   }
 }
 
+function resolveGracefulShutdownPriority(name: RuntimeServiceName): number {
+  if (name === "source_control_manager") return 0;
+  if (name === "remotebuddy") return 1;
+  if (name === "localbuddy") return 2;
+  return 3;
+}
+
+async function waitForRuntimeServicesExit(
+  services: RuntimeServiceProcess[],
+  timeoutMs: number,
+): Promise<boolean> {
+  if (services.length === 0) return true;
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() < deadline) {
+    if (services.every((service) => service.exited)) return true;
+    await Bun.sleep(100);
+  }
+  return services.every((service) => service.exited);
+}
+
+async function stopRuntimeServicesGracefully(
+  services: RuntimeServiceProcess[],
+  timeoutMs = 10_000,
+): Promise<void> {
+  if (services.length === 0) return;
+  const running = services.filter((service) => !service.exited);
+  if (running.length === 0) return;
+  const ordered = [...running].sort(
+    (a, b) => resolveGracefulShutdownPriority(a.name) - resolveGracefulShutdownPriority(b.name),
+  );
+  const nonServer = ordered.filter((service) => service.name !== "server");
+  const server = ordered.filter((service) => service.name === "server");
+
+  for (const service of nonServer) {
+    try {
+      service.proc.kill("SIGTERM");
+    } catch {
+      // Ignore and rely on force-stop fallback.
+    }
+  }
+
+  await waitForRuntimeServicesExit(nonServer, Math.max(1_000, timeoutMs - 2_000));
+
+  for (const service of server) {
+    try {
+      service.proc.kill("SIGTERM");
+    } catch {
+      // Ignore and rely on force-stop fallback.
+    }
+  }
+
+  await waitForRuntimeServicesExit(server, Math.min(3_000, timeoutMs));
+
+  const remaining = ordered.filter((service) => !service.exited);
+  if (remaining.length > 0) {
+    stopRuntimeServices(remaining);
+  }
+}
+
 function prependExecutableDirToPath(
   env: Record<string, string>,
   executablePath: string,
@@ -2298,9 +2357,10 @@ function removeCliClearTarget(target: CliClearTarget): "removed" | "missing" | C
   }
 }
 
-async function requestLocalRuntimeShutdownForClear(
+async function requestLocalRuntimeShutdown(
   serverUrl: string,
   repoRoot: string,
+  reason: string,
 ): Promise<{ attempted: boolean; accepted: boolean; detail?: string }> {
   if (!(await probeServer(serverUrl))) {
     return { attempted: false, accepted: false };
@@ -2321,7 +2381,7 @@ async function requestLocalRuntimeShutdownForClear(
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: "pushpals --clear" }),
+        body: JSON.stringify({ reason }),
       },
       5_000,
     );
@@ -2352,7 +2412,11 @@ async function clearPushpalsState(opts: {
 }): Promise<number> {
   console.log("[pushpals] Clear requested. Removing repo-local PushPals state.");
 
-  const shutdown = await requestLocalRuntimeShutdownForClear(opts.serverUrl, opts.repoRoot);
+  const shutdown = await requestLocalRuntimeShutdown(
+    opts.serverUrl,
+    opts.repoRoot,
+    "pushpals --clear",
+  );
   if (shutdown.attempted && shutdown.accepted) {
     console.log("[pushpals] Local runtime shutdown accepted; waiting for services to exit...");
     await Bun.sleep(1_500);
@@ -3877,6 +3941,23 @@ async function main(): Promise<void> {
     stopRuntimeServices(autoStartedServices);
     autoStartedServices = [];
   };
+  const stopAutoStartedServicesGracefully = async (reason: string): Promise<void> => {
+    if (autoStartedServices.length === 0) return;
+    const services = autoStartedServices;
+    autoStartedServices = [];
+    const shutdown = await requestLocalRuntimeShutdown(serverUrl, repoRoot, reason);
+    if (shutdown.attempted && shutdown.accepted) {
+      console.log("[pushpals] Local runtime shutdown accepted; waiting for services to exit...");
+      await Bun.sleep(1_500);
+    } else if (shutdown.attempted) {
+      console.warn(
+        `[pushpals] Local runtime shutdown request was not accepted${shutdown.detail ? `: ${shutdown.detail}` : "."}`,
+      );
+    } else if (shutdown.detail) {
+      console.warn(`[pushpals] ${shutdown.detail}`);
+    }
+    await stopRuntimeServicesGracefully(services);
+  };
 
   let serverHealthy = await probeServer(serverUrl);
   const serverWasAlreadyHealthy = serverHealthy;
@@ -4083,27 +4164,37 @@ async function main(): Promise<void> {
         streamAbort.signal,
       );
 
-  let shuttingDown = false;
-  const requestStop = (): void => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log("[pushpals] Shutting down CLI session...");
-    streamAbort.abort();
-    if (rl) rl.close();
-    try {
-      monitoringHub?.stop();
-    } catch {
-      // ignore
-    }
-    if (autoStartedServices.length > 0) {
-      console.log("[pushpals] Stopping embedded runtime services...");
-    }
-    stopAutoStartedServices();
+  let stopPromise: Promise<void> | null = null;
+  const requestStop = (): Promise<void> => {
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      console.log("[pushpals] Shutting down CLI session...");
+      streamAbort.abort();
+      const activeRl = rl;
+      rl = null;
+      if (activeRl) activeRl.close();
+      try {
+        monitoringHub?.stop();
+      } catch {
+        // ignore
+      }
+      if (autoStartedServices.length > 0) {
+        console.log("[pushpals] Stopping embedded runtime services...");
+      }
+      await stopAutoStartedServicesGracefully("pushpals CLI exit");
+    })();
+    return stopPromise;
   };
 
-  process.once("SIGINT", requestStop);
-  process.once("SIGTERM", requestStop);
-  process.once("exit", requestStop);
+  process.once("SIGINT", () => {
+    void requestStop();
+  });
+  process.once("SIGTERM", () => {
+    void requestStop();
+  });
+  process.once("exit", () => {
+    stopAutoStartedServices();
+  });
 
   if (parsed.runtimeOnly) {
     console.log("[pushpals] Runtime-only mode is active. Send `exit` on stdin or terminate the process to stop.");
@@ -4126,17 +4217,17 @@ async function main(): Promise<void> {
       });
       runtimeOnlyInput.on("line", (line) => {
         if (!isCliExitCommand(line)) return;
-        requestStop();
+        void requestStop();
         runtimeOnlyInput.close();
         finish();
       });
       runtimeOnlyInput.on("close", () => {
-        requestStop();
+        void requestStop();
         finish();
       });
     });
 
-    requestStop();
+    await requestStop();
     await Promise.race([streamTask, Bun.sleep(2_000)]);
     return;
   }
@@ -4156,7 +4247,7 @@ async function main(): Promise<void> {
       continue;
     }
     if (isCliExitCommand(text)) {
-      requestStop();
+      await requestStop();
       break;
     }
     if (text === "/hub") {
@@ -4211,7 +4302,7 @@ async function main(): Promise<void> {
     rl.prompt();
   }
 
-  requestStop();
+  await requestStop();
   await Promise.race([streamTask, Bun.sleep(2_000)]);
 }
 

@@ -83,6 +83,18 @@ _VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
 _VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 
 
+def _model_supports_xhigh_reasoning(model: str) -> bool:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return False
+    return not (
+        normalized == "gpt-5.4"
+        or normalized.startswith("gpt-5.4-")
+        or normalized == "codex-1p"
+        or normalized.startswith("codex-1p-")
+    )
+
+
 @dataclass(frozen=True)
 class OpenAICodexRuntimeConfig:
     codex_bin_json: str
@@ -152,7 +164,7 @@ class OpenAICodexRuntimeConfig:
             reasoning_effort=cfg.get_str(
                 env_names=("WORKERPALS_LLM_REASONING_EFFORT", "WORKERPALS_OPENAI_CODEX_REASONING_EFFORT"),
                 config_paths=("workerpals.llm.reasoning_effort", "workerpals.openai_codex.reasoning_effort"),
-                default="xhigh",
+                default="high",
             ),
             approval_policy=cfg.get_str(
                 env_names=("WORKERPALS_OPENAI_CODEX_APPROVAL_POLICY",),
@@ -316,18 +328,23 @@ def _resolve_communicate_timeout_seconds(config: OpenAICodexRuntimeConfig) -> Op
     return max(1, timeout_ms // 1000)
 
 
-def _resolve_reasoning_effort(config: OpenAICodexRuntimeConfig) -> str:
+def _resolve_reasoning_effort(config: OpenAICodexRuntimeConfig, model: str = DEFAULT_CODEX_MODEL) -> str:
     raw = config.reasoning_effort
     normalized = str(raw).strip().lower()
     if normalized in {"extra high", "extra-high", "extrahigh", "x-high"}:
         normalized = "xhigh"
+    if normalized == "xhigh" and not _model_supports_xhigh_reasoning(model):
+        log.info(
+            f"Downgrading workerpals.openai_codex.reasoning_effort='xhigh' to 'high' for model {model!r}."
+        )
+        return "high"
     if normalized in _VALID_REASONING_EFFORTS:
         return normalized
     log.info(
         "Invalid workerpals.openai_codex.reasoning_effort="
-        f"{raw!r}; using default 'xhigh'. Allowed: low, medium, high, xhigh."
+        f"{raw!r}; using default 'high'. Allowed: low, medium, high, xhigh."
     )
-    return "xhigh"
+    return "high"
 
 
 def _resolve_progress_log_interval_seconds(config: OpenAICodexRuntimeConfig) -> int:
@@ -1006,7 +1023,7 @@ def _run_codex_task(
     )
     # JSON event output is noisy by default; prefer plain text + output-last-message.
     use_json = runtime_config.json_output
-    reasoning_effort = _resolve_reasoning_effort(runtime_config)
+    reasoning_effort = _resolve_reasoning_effort(runtime_config, model)
     communicate_timeout_s = _resolve_communicate_timeout_seconds(runtime_config)
     prompt = _build_instruction(instruction, supplemental_guidance)
     baseline_changes = summarize_git_changes(repo)
