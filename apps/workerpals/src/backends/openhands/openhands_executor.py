@@ -28,7 +28,7 @@ from executor_base import (
     log_git_status,
     looks_local_base_url,
     parse_task_execute_payload,
-    repo_root_for_runtime_config,
+    prompts_root_for_runtime_assets,
     resolve_llm_config,
     setting_int,
     setting_str,
@@ -78,7 +78,7 @@ def _session_hint_headers(session_user: str) -> Dict[str, str]:
 
 
 def _repo_root_for_prompt_loading() -> Path:
-    return repo_root_for_runtime_config()
+    return prompts_root_for_runtime_assets()
 
 
 def _resolve_prompt_file(relative_path: str) -> Path:

@@ -1,5 +1,7 @@
+import os
 import sys
 import unittest
+import tempfile
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -8,7 +10,7 @@ for path in (_HERE, _SHARED):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from executor_base import SettingsResolver
+from executor_base import SettingsResolver, config_dir_for_runtime_config, runtime_config
 from openai_codex_executor import (
     OpenAICodexRuntimeConfig,
     _build_instruction,
@@ -56,6 +58,48 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.sandbox, "workspace-write")
         self.assertEqual(cfg.color, "never")
         self.assertFalse(cfg.json_output)
+
+    def test_runtime_config_prefers_explicit_config_dir_override(self) -> None:
+        import executor_base
+
+        with tempfile.TemporaryDirectory(prefix="pushpals-openai-codex-config-") as root:
+            repo_root = Path(root) / "repo"
+            runtime_config_dir = Path(root) / "runtime" / "configs"
+            repo_config_dir = repo_root / "configs"
+            runtime_config_dir.mkdir(parents=True, exist_ok=True)
+            repo_config_dir.mkdir(parents=True, exist_ok=True)
+
+            (runtime_config_dir / "default.toml").write_text(
+                'profile = "dev"\n[workerpals.openai_codex]\njson = true\n',
+                encoding="utf-8",
+            )
+            (repo_config_dir / "default.toml").write_text(
+                'profile = "dev"\n[workerpals.openai_codex]\njson = false\n',
+                encoding="utf-8",
+            )
+
+            previous_env = {
+                "PUSHPALS_REPO_PATH": os.environ.get("PUSHPALS_REPO_PATH"),
+                "PUSHPALS_CONFIG_DIR_OVERRIDE": os.environ.get("PUSHPALS_CONFIG_DIR_OVERRIDE"),
+                "PUSHPALS_PROFILE": os.environ.get("PUSHPALS_PROFILE"),
+            }
+            previous_cache = executor_base._CONFIG_CACHE
+            try:
+                os.environ["PUSHPALS_REPO_PATH"] = str(repo_root)
+                os.environ["PUSHPALS_CONFIG_DIR_OVERRIDE"] = str(runtime_config_dir)
+                os.environ["PUSHPALS_PROFILE"] = "dev"
+                executor_base._CONFIG_CACHE = None
+
+                self.assertEqual(config_dir_for_runtime_config(), runtime_config_dir)
+                cfg = runtime_config()
+                self.assertTrue(cfg["workerpals"]["openai_codex"]["json"])
+            finally:
+                executor_base._CONFIG_CACHE = previous_cache
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
     def test_build_instruction_includes_codex_runtime_invariants(self) -> None:
         prompt = _build_instruction("Add two tests for localbuddy", [])

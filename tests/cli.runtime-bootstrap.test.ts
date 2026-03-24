@@ -33,6 +33,7 @@ import {
   resolveCliLocalBuddyAutostart,
   resolveCliStatePath,
   resolveCommandPath,
+  repoLooksLikePushPalsSourceCheckout,
   resolvePreferredRuntimeReleaseTag,
   resolveWindowsShellExecutableCandidatesForEnv,
   startEmbeddedMonitoringHub,
@@ -110,6 +111,26 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
 
     expect(env.PUSHPALS_RUNTIME_TAG).toBe("v1.0.19");
+  });
+
+  test("repoLooksLikePushPalsSourceCheckout only accepts configs/default.toml", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-source-checkout-"));
+    const configsDir = join(root, "configs");
+    const legacyDir = join(root, "config");
+    mkdirSync(configsDir, { recursive: true });
+    mkdirSync(legacyDir, { recursive: true });
+
+    try {
+      expect(repoLooksLikePushPalsSourceCheckout(root)).toBe(false);
+
+      writeFileSync(join(legacyDir, "default.toml"), 'profile = "dev"\n', "utf8");
+      expect(repoLooksLikePushPalsSourceCheckout(root)).toBe(false);
+
+      writeFileSync(join(configsDir, "default.toml"), 'profile = "dev"\n', "utf8");
+      expect(repoLooksLikePushPalsSourceCheckout(root)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("buildEmbeddedRuntimeEnv preserves explicit autonomy override", () => {

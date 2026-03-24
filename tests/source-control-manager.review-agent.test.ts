@@ -453,6 +453,68 @@ describe("ReviewAgent", () => {
     expect(emittedCommandTypes).toEqual(["task_created", "task_started", "job_enqueued"]);
   });
 
+  test("rejection comment includes fallback reasoning when reviewer omits issues", async () => {
+    const pr = makePr({ number: 71, html_url: "https://example.com/pr/71" });
+    let rejectionCommentBody = "";
+    let enqueuedRecentContext: string[] = [];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 6.9,
+            summary: "Not production-ready yet",
+            issues: [],
+            fix_instruction:
+              "Add deterministic failure-path assertions for malformed board ops.\nValidate the telemetry hook payloads with explicit expectations.",
+          }),
+        addPullRequestComment: async (opts) => {
+          rejectionCommentBody = opts.body;
+        },
+        listPullRequestComments: async () => [],
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (url.endsWith("/jobs/enqueue")) {
+            const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            const params =
+              payload.params && typeof payload.params === "object"
+                ? (payload.params as Record<string, unknown>)
+                : {};
+            enqueuedRecentContext = Array.isArray(params.recentContext)
+              ? params.recentContext.map((entry) => String(entry))
+              : [];
+            return new Response(JSON.stringify({ ok: true, jobId: "job-fix-71" }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        now: () => 456,
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(rejectionCommentBody).toContain("ReviewAgent: Changes Rejected");
+    expect(rejectionCommentBody).toContain("Why this was rejected:");
+    expect(rejectionCommentBody).toContain(
+      "Add deterministic failure-path assertions for malformed board ops.",
+    );
+    expect(rejectionCommentBody).toContain(
+      "Validate the telemetry hook payloads with explicit expectations.",
+    );
+    expect(enqueuedRecentContext.join("\n")).toContain(
+      "Issues: Add deterministic failure-path assertions for malformed board ops.; Validate the telemetry hook payloads with explicit expectations.",
+    );
+  });
+
   test("does not emit duplicate session task events when fix enqueue is deduped", async () => {
     const pr = makePr({ number: 8, html_url: "https://example.com/pr/8" });
     let enqueueCalls = 0;
@@ -625,6 +687,87 @@ describe("ReviewAgent", () => {
     expect(enqueueCalls).toBe(0);
     expect(branchDeleteCalls).toBe(1);
     expect(deletedBranchRef).toBe("agent/test-branch");
+  });
+
+  test("approval comment includes fallback improvement guidance when reviewer omits issues", async () => {
+    const pr = makePr({ number: 72, html_url: "https://example.com/pr/72" });
+    let approvalCommentBody = "";
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 8.9,
+            summary: "Ready to merge with one minor follow-up",
+            issues: [],
+            fix_instruction:
+              "Consider tightening malformed payload assertions in a follow-up cleanup.",
+          }),
+        addPullRequestComment: async (opts) => {
+          approvalCommentBody = opts.body;
+        },
+        getCommitMessage: async () => "feat(client): improve board-op fallback handling",
+        mergePullRequest: async () => ({ merged: true, sha: "deadbeef", message: "merged" }),
+      },
+    );
+
+    await agent.poll();
+
+    expect(approvalCommentBody).toContain("ReviewAgent: Changes Approved");
+    expect(approvalCommentBody).toContain("Potential Improvements:");
+    expect(approvalCommentBody).toContain(
+      "Consider tightening malformed payload assertions in a follow-up cleanup.",
+    );
+    expect(approvalCommentBody).not.toContain("None noted by reviewer.");
+  });
+
+  test("approval comment falls back to reviewer notes when summary is the only guidance", async () => {
+    const pr = makePr({ number: 73, html_url: "https://example.com/pr/73" });
+    let approvalCommentBody = "";
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 9.0,
+            summary: "Ready to merge; consider broadening malformed payload coverage later",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async (opts) => {
+          approvalCommentBody = opts.body;
+        },
+        getCommitMessage: async () => "feat(client): keep adapter telemetry stable",
+        mergePullRequest: async () => ({ merged: true, sha: "deadbeef", message: "merged" }),
+      },
+    );
+
+    await agent.poll();
+
+    expect(approvalCommentBody).toContain("ReviewAgent: Changes Approved");
+    expect(approvalCommentBody).toContain("Reviewer Notes:");
+    expect(approvalCommentBody).toContain(
+      "Ready to merge; consider broadening malformed payload coverage later",
+    );
+    expect(approvalCommentBody).not.toContain("None noted by reviewer.");
   });
 
   test("does not delete protected branch main after merge", async () => {

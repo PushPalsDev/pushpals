@@ -203,6 +203,24 @@ def repo_root_for_runtime_config() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def config_dir_for_runtime_config() -> Path:
+    explicit = (os.environ.get("PUSHPALS_CONFIG_DIR_OVERRIDE") or "").strip()
+    if explicit:
+        return Path(explicit)
+    return repo_root_for_runtime_config() / "configs"
+
+
+def prompts_root_for_runtime_assets() -> Path:
+    explicit = (os.environ.get("PUSHPALS_PROMPTS_ROOT_OVERRIDE") or "").strip()
+    if explicit:
+        return Path(explicit)
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "prompts").is_dir():
+            return parent
+    return repo_root_for_runtime_config()
+
+
 def _parse_toml_file(path: Path) -> Dict[str, Any]:
     if not path.exists() or not tomllib:
         return {}
@@ -217,12 +235,7 @@ def runtime_config() -> Dict[str, Any]:
     global _CONFIG_CACHE
     if _CONFIG_CACHE is not None:
         return _CONFIG_CACHE
-    repo_root = repo_root_for_runtime_config()
-    legacy_config_dir = repo_root / "config"
-    config_dir = repo_root / "configs"
-    if not (config_dir / "default.toml").exists():
-        if (legacy_config_dir / "default.toml").exists():
-            config_dir = legacy_config_dir
+    config_dir = config_dir_for_runtime_config()
     default_cfg = _parse_toml_file(config_dir / "default.toml")
     profile = (
         (os.environ.get("PUSHPALS_PROFILE") or "").strip()
@@ -231,12 +244,6 @@ def runtime_config() -> Dict[str, Any]:
     )
     profile_cfg = _parse_toml_file(config_dir / f"{profile}.toml")
     local_cfg = _parse_toml_file(config_dir / "local.toml")
-    if (
-        not local_cfg
-        and config_dir != legacy_config_dir
-        and (legacy_config_dir / "local.toml").exists()
-    ):
-        local_cfg = _parse_toml_file(legacy_config_dir / "local.toml")
     _CONFIG_CACHE = _deep_merge(_deep_merge(default_cfg, profile_cfg), local_cfg)
     return _CONFIG_CACHE
 

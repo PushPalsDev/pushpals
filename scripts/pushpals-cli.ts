@@ -800,11 +800,8 @@ async function ensureBundledMonitoringHubRoot(): Promise<string | null> {
   return resolveBundledMonitoringHubRoot();
 }
 
-function repoLooksLikePushPalsSourceCheckout(repoRoot: string): boolean {
-  return (
-    existsSync(join(repoRoot, "configs", "default.toml")) ||
-    existsSync(join(repoRoot, "config", "default.toml"))
-  );
+export function repoLooksLikePushPalsSourceCheckout(repoRoot: string): boolean {
+  return existsSync(join(repoRoot, "configs", "default.toml"));
 }
 
 function parseSemverFromPackageVersion(value: string | undefined): string {

@@ -57,6 +57,7 @@ from executor_base import (
     log_git_status,
     looks_local_base_url,
     parse_task_execute_payload,
+    prompts_root_for_runtime_assets,
     resolve_llm_config,
     setting_int,
     setting_str,
@@ -992,11 +993,7 @@ def _is_git_porcelain_status_command(cmd: str) -> bool:
 
 
 def _repo_root_for_prompt_loading() -> Path:
-    current = Path(__file__).resolve()
-    for parent in current.parents:
-        if (parent / "prompts").is_dir():
-            return parent
-    return current.parents[5]
+    return prompts_root_for_runtime_assets()
 
 
 def _resolve_prompt_file(relative_path: str) -> Path:

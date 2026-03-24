@@ -322,6 +322,7 @@ export function buildReviewPrompt(
 }
 
 function formatRejectionComment(verdict: ReviewVerdict): string {
+  const reasoning = deriveReviewGuidance(verdict).items;
   const lines = [
     `## ReviewAgent: Changes Rejected (score ${verdict.score.toFixed(1)}/10)`,
     "",
@@ -329,9 +330,9 @@ function formatRejectionComment(verdict: ReviewVerdict): string {
     "",
   ];
 
-  if (verdict.issues.length > 0) {
-    lines.push("**Issues:**");
-    for (const issue of verdict.issues) {
+  if (reasoning.length > 0) {
+    lines.push("**Why this was rejected:**");
+    for (const issue of reasoning) {
       lines.push(`- ${issue}`);
     }
     lines.push("");
@@ -358,6 +359,7 @@ function formatGiveUpComment(verdict: ReviewVerdict, maxCommentsBeforeGiveUp: nu
 
 function formatApprovalComment(verdict: ReviewVerdict, passThreshold: number): string {
   const normalizedThreshold = Math.max(1, Math.min(10, passThreshold));
+  const guidance = deriveReviewGuidance(verdict);
   const lines = [
     `## ReviewAgent: Changes Approved (score ${verdict.score.toFixed(1)}/10)`,
     "",
@@ -365,14 +367,15 @@ function formatApprovalComment(verdict: ReviewVerdict, passThreshold: number): s
     `**Threshold:** ${normalizedThreshold.toFixed(1)}/10`,
     `**Why this passed:** Score ${verdict.score.toFixed(1)}/10 is >= ${normalizedThreshold.toFixed(1)}/10.`,
     "",
-    "**Potential Improvements:**",
   ];
 
-  if (verdict.issues.length > 0) {
-    for (const issue of verdict.issues) {
+  if (guidance.items.length > 0) {
+    lines.push(guidance.source === "summary" ? "**Reviewer Notes:**" : "**Potential Improvements:**");
+    for (const issue of guidance.items) {
       lines.push(`- ${issue}`);
     }
   } else {
+    lines.push("**Potential Improvements:**");
     lines.push("- None noted by reviewer.");
   }
 
@@ -427,9 +430,10 @@ function buildMergeCommitText(args: {
 }
 
 function buildFallbackFixInstruction(pr: GitHubPR, verdict: ReviewVerdict): string {
+  const reasoning = deriveReviewGuidance(verdict).items;
   const issueBlock =
-    verdict.issues.length > 0
-      ? verdict.issues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")
+    reasoning.length > 0
+      ? reasoning.map((issue, index) => `${index + 1}. ${issue}`).join("\n")
       : verdict.summary || "Address all review issues and raise quality to the required threshold.";
 
   return [
@@ -459,6 +463,40 @@ function truncateText(value: string, maxChars: number): string {
 
 function summarizeFeedbackText(value: string): string {
   return truncateText(collapseWhitespace(value), MAX_AUTONOMY_FEEDBACK_SUMMARY_CHARS);
+}
+
+function deriveReviewGuidance(verdict: ReviewVerdict): {
+  items: string[];
+  source: "issues" | "fix_instruction" | "summary" | "none";
+} {
+  const explicitIssues = verdict.issues
+    .map((issue) => collapseWhitespace(String(issue ?? "")))
+    .filter(Boolean);
+  if (explicitIssues.length > 0) {
+    return { items: explicitIssues, source: "issues" };
+  }
+
+  const instructionLines = String(verdict.fix_instruction ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => collapseWhitespace(line))
+    .filter(Boolean)
+    .filter(
+      (line) =>
+        !/^address reviewagent feedback\b/i.test(line) &&
+        !/^fix all issues listed below\b/i.test(line) &&
+        !/^run relevant tests\b/i.test(line),
+    );
+  if (instructionLines.length > 0) {
+    return { items: instructionLines, source: "fix_instruction" };
+  }
+
+  const summary = collapseWhitespace(verdict.summary);
+  if (summary) {
+    return { items: [summary], source: "summary" };
+  }
+
+  return { items: [], source: "none" };
 }
 
 export function buildReviewFeedbackContext(
@@ -1436,7 +1474,9 @@ export class ReviewAgent {
     prefetchedComments?: PullRequestComment[],
   ): Promise<boolean> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
-    const issuesSummary = verdict.issues.length > 0 ? verdict.issues.join("; ") : "see summary";
+    const rejectionReasoning = deriveReviewGuidance(verdict).items;
+    const issuesSummary =
+      rejectionReasoning.length > 0 ? rejectionReasoning.join("; ") : "see summary";
     const fixInstruction =
       verdict.fix_instruction.trim() || buildFallbackFixInstruction(pr, verdict);
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);

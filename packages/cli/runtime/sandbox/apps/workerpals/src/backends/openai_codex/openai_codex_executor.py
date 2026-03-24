@@ -35,6 +35,7 @@ from executor_base import (
     log_git_status,
     looks_local_base_url,
     parse_task_execute_payload,
+    prompts_root_for_runtime_assets,
     resolve_llm_config,
     summarize_git_changes,
     to_int,
@@ -188,12 +189,7 @@ def _truncate(text: str, max_chars: int = 4000) -> str:
 
 
 def _repo_root_for_prompt_loading() -> Path:
-    current = Path(__file__).resolve()
-    for parent in current.parents:
-        if (parent / "prompts").is_dir():
-            return parent
-    # Fallback to historical layout depth if prompts/ cannot be discovered.
-    return current.parents[5]
+    return prompts_root_for_runtime_assets()
 
 
 def _resolve_prompt_file(relative_path: str) -> Path:
