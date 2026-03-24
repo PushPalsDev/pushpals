@@ -67,7 +67,7 @@ async function getFreePort(): Promise<number> {
   });
 }
 
-function writeServerConfig(root: string, port: number): void {
+function writeServerConfig(root: string, port: number, serverExtras: string[] = []): void {
   const configDir = join(root, "configs");
   mkdirSync(configDir, { recursive: true });
   writeFileSync(
@@ -85,6 +85,7 @@ function writeServerConfig(root: string, port: number): void {
       'host = "127.0.0.1"',
       `port = ${port}`,
       `url = "http://127.0.0.1:${port}"`,
+      ...serverExtras,
       "",
       "[localbuddy]",
       "enabled = false",
@@ -206,6 +207,69 @@ describe("server session message route", () => {
         sessionId: "dev",
         prompt: "hello",
       },
+    });
+  }, 15_000);
+
+  test("blocks new session work after the token budget is exceeded", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port, ["session_token_budget = 100"]);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+
+    const created = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: "dev" }),
+    });
+    expect(created.status).toBe(201);
+
+    const usage = await fetch(`http://127.0.0.1:${port}/telemetry/llm-usage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service: "workerpals",
+        sessionId: "dev",
+        promptTokens: 70,
+        completionTokens: 40,
+      }),
+    });
+    expect(usage.status).toBe(200);
+    expect(await usage.json()).toMatchObject({
+      ok: true,
+      crossedLimit: true,
+      sessionBudget: {
+        sessionId: "dev",
+        totalTokens: 110,
+        exceeded: true,
+      },
+    });
+
+    const blockedMessage = await fetch(`http://127.0.0.1:${port}/sessions/dev/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "please keep going" }),
+    });
+    expect(blockedMessage.status).toBe(400);
+    expect(await blockedMessage.json()).toMatchObject({
+      ok: false,
+      code: "enqueue_failed",
+      message: expect.stringContaining("Session token budget exceeded"),
+    });
+
+    const blockedEnqueue = await fetch(`http://127.0.0.1:${port}/requests/enqueue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: "dev",
+        prompt: "please keep going",
+      }),
+    });
+    expect(blockedEnqueue.status).toBe(429);
+    expect(await blockedEnqueue.json()).toMatchObject({
+      ok: false,
+      code: "session_token_budget_exceeded",
     });
   }, 15_000);
 });

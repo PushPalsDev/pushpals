@@ -92,7 +92,7 @@ const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "local-model";
-const DEFAULT_CODEX_MODEL = "gpt-5-codex";
+const DEFAULT_CODEX_MODEL = "gpt-5.4";
 const DEFAULT_CODEX_TIMEOUT_MS = 120_000;
 const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
@@ -236,10 +236,15 @@ function codexTimeoutMs(configuredTimeoutMs?: number | null): number {
   return DEFAULT_CODEX_TIMEOUT_MS;
 }
 
-function codexReasoningEffort(configured: string | null | undefined): "low" | "medium" | "high" {
+function codexReasoningEffort(
+  configured: string | null | undefined,
+): "low" | "medium" | "high" | "xhigh" {
   const raw = (configured ?? "").trim().toLowerCase();
-  if (raw === "low" || raw === "medium" || raw === "high") return raw;
-  return "high";
+  if (raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh") return raw;
+  if (raw === "extra high" || raw === "extra-high" || raw === "extrahigh" || raw === "x-high") {
+    return "xhigh";
+  }
+  return "xhigh";
 }
 
 function normalizeCodexModel(rawModel: string): string {

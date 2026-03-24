@@ -43,7 +43,7 @@ from executor_base import (
 )
 
 LOG_PREFIX = "[OpenAICodexExecutor]"
-DEFAULT_CODEX_MODEL = "gpt-5-codex"
+DEFAULT_CODEX_MODEL = "gpt-5.4"
 _ACTIVE_CHILD: Optional[subprocess.Popen[str]] = None
 _INTERRUPTED_SIGNAL: Optional[int] = None
 log = Logger(LOG_PREFIX)
@@ -80,7 +80,7 @@ _VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
 _VALID_SANDBOX_POLICIES = {"read-only", "workspace-write", "danger-full-access"}
 _VALID_COLORS = {"always", "never", "auto"}
 _VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
-_VALID_REASONING_EFFORTS = {"low", "medium", "high"}
+_VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ class OpenAICodexRuntimeConfig:
             reasoning_effort=cfg.get_str(
                 env_names=("WORKERPALS_LLM_REASONING_EFFORT", "WORKERPALS_OPENAI_CODEX_REASONING_EFFORT"),
                 config_paths=("workerpals.llm.reasoning_effort", "workerpals.openai_codex.reasoning_effort"),
-                default="high",
+                default="xhigh",
             ),
             approval_policy=cfg.get_str(
                 env_names=("WORKERPALS_OPENAI_CODEX_APPROVAL_POLICY",),
@@ -319,13 +319,15 @@ def _resolve_communicate_timeout_seconds(config: OpenAICodexRuntimeConfig) -> Op
 def _resolve_reasoning_effort(config: OpenAICodexRuntimeConfig) -> str:
     raw = config.reasoning_effort
     normalized = str(raw).strip().lower()
+    if normalized in {"extra high", "extra-high", "extrahigh", "x-high"}:
+        normalized = "xhigh"
     if normalized in _VALID_REASONING_EFFORTS:
         return normalized
     log.info(
         "Invalid workerpals.openai_codex.reasoning_effort="
-        f"{raw!r}; using default 'high'. Allowed: low, medium, high."
+        f"{raw!r}; using default 'xhigh'. Allowed: low, medium, high, xhigh."
     )
-    return "high"
+    return "xhigh"
 
 
 def _resolve_progress_log_interval_seconds(config: OpenAICodexRuntimeConfig) -> int:
@@ -413,6 +415,88 @@ def _contains_reasoning_marker(value: str) -> bool:
     if not lowered:
         return False
     return "reasoning" in lowered or "thinking" in lowered
+
+
+def _coerce_non_negative_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _normalize_usage_counts(
+    prompt_tokens: Optional[int],
+    completion_tokens: Optional[int],
+    total_tokens: Optional[int],
+) -> Optional[Dict[str, int]]:
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    prompt = prompt_tokens if prompt_tokens is not None else 0
+    completion = completion_tokens if completion_tokens is not None else 0
+    total = total_tokens if total_tokens is not None else prompt + completion
+    if prompt_tokens is None and total_tokens is not None and completion_tokens is not None:
+        prompt = max(0, total - completion)
+    if completion_tokens is None and total_tokens is not None and prompt_tokens is not None:
+        completion = max(0, total - prompt)
+    total = max(total, prompt + completion)
+    if total <= 0:
+        return None
+    return {
+        "prompt_tokens": int(prompt),
+        "completion_tokens": int(completion),
+        "total_tokens": int(total),
+    }
+
+
+def _extract_usage_counts(value: Any) -> Optional[Dict[str, int]]:
+    best: Optional[Dict[str, int]] = None
+    stack: List[Any] = [value]
+    visited = 0
+    max_nodes = 256
+
+    while stack and visited < max_nodes:
+        current = stack.pop()
+        visited += 1
+        if isinstance(current, list):
+            for item in reversed(current[:80]):
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+            continue
+        if not isinstance(current, dict):
+            continue
+
+        prompt_tokens = _coerce_non_negative_int(
+            current.get("prompt_tokens")
+            or current.get("promptTokens")
+            or current.get("input_tokens")
+            or current.get("inputTokens")
+        )
+        completion_tokens = _coerce_non_negative_int(
+            current.get("completion_tokens")
+            or current.get("completionTokens")
+            or current.get("output_tokens")
+            or current.get("outputTokens")
+        )
+        total_tokens = _coerce_non_negative_int(
+            current.get("total_tokens") or current.get("totalTokens")
+        )
+        normalized = _normalize_usage_counts(prompt_tokens, completion_tokens, total_tokens)
+        if normalized is not None:
+            if best is None or normalized["total_tokens"] > best["total_tokens"]:
+                best = normalized
+
+        usage_node = current.get("usage")
+        if isinstance(usage_node, (dict, list)):
+            stack.append(usage_node)
+
+        for nested in current.values():
+            if isinstance(nested, (dict, list)):
+                stack.append(nested)
+
+    return best
 
 
 def _event_contains_reasoning(value: Any) -> bool:
@@ -577,6 +661,9 @@ def _empty_codex_trace() -> Dict[str, Any]:
         "raw_logged": 0,
         "raw_omitted": 0,
         "reasoning_events": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
     }
 
 
@@ -607,6 +694,17 @@ def _record_live_codex_stdout_line(line: str, use_json: bool, trace: Dict[str, A
             return
 
         if isinstance(parsed, dict):
+            usage = _extract_usage_counts(parsed)
+            if usage is not None:
+                trace["prompt_tokens"] = max(
+                    to_int(trace.get("prompt_tokens"), 0), usage["prompt_tokens"]
+                )
+                trace["completion_tokens"] = max(
+                    to_int(trace.get("completion_tokens"), 0), usage["completion_tokens"]
+                )
+                trace["total_tokens"] = max(
+                    to_int(trace.get("total_tokens"), 0), usage["total_tokens"]
+                )
             event_type = (
                 str(parsed.get("type") or parsed.get("event") or parsed.get("kind") or "event")
                 .strip()
@@ -673,10 +771,17 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
     if raw_omitted > 0:
         log.info(f"[codex/raw] ... {raw_omitted} additional line(s) omitted.")
     reasoning_events = to_int(trace.get("reasoning_events"), 0)
+    prompt_tokens = to_int(trace.get("prompt_tokens"), 0)
+    completion_tokens = to_int(trace.get("completion_tokens"), 0)
+    total_tokens = to_int(trace.get("total_tokens"), 0)
     if reasoning_events > 0:
         log.info(f"[codex] Reasoning-like event(s): {reasoning_events}")
     elif use_json and valid_json > 0:
         log.info("[codex] No reasoning-like events observed in this run.")
+    if total_tokens > 0:
+        log.info(
+            f"[codex] Usage observed: prompt={prompt_tokens} completion={completion_tokens} total={total_tokens}"
+        )
 
     if not summaries and event_type_counts:
         ranked = sorted(event_type_counts.items(), key=lambda item: item[1], reverse=True)
@@ -690,7 +795,39 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
         "summaries": summaries,
         "event_type_counts": event_type_counts,
         "reasoning_events": reasoning_events,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
     }
+
+
+def _estimated_usage(prompt: str, output_text: str, *, model: str) -> Dict[str, Any]:
+    prompt_tokens = max(0, int(len(str(prompt or "")) / 3 + 0.999999))
+    completion_tokens = max(0, int(len(str(output_text or "")) / 3 + 0.999999))
+    return {
+        "promptTokens": prompt_tokens,
+        "completionTokens": completion_tokens,
+        "totalTokens": prompt_tokens + completion_tokens,
+        "estimated": True,
+        "backend": "openai_codex",
+        "modelId": model,
+    }
+
+
+def _usage_from_trace_or_estimate(trace: Dict[str, Any], prompt: str, output_text: str, *, model: str) -> Dict[str, Any]:
+    total_tokens = to_int(trace.get("total_tokens"), 0)
+    if total_tokens > 0:
+        prompt_tokens = to_int(trace.get("prompt_tokens"), 0)
+        completion_tokens = to_int(trace.get("completion_tokens"), 0)
+        return {
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "totalTokens": max(total_tokens, prompt_tokens + completion_tokens),
+            "estimated": False,
+            "backend": "openai_codex",
+            "modelId": model,
+        }
+    return _estimated_usage(prompt, output_text, model=model)
 
 
 def _log_stderr(stderr: str) -> None:
@@ -1121,6 +1258,10 @@ def _run_codex_task(
         stdout_trace = _finalize_codex_stdout_trace(stdout_trace_state, use_json)
         trace_excerpt = _format_codex_trace_excerpt(stdout_trace)
         _log_stderr(stderr)
+        usage_output_text = "\n\n".join(
+            part for part in (stdout, stderr, trace_excerpt) if str(part or "").strip()
+        )
+        usage = _usage_from_trace_or_estimate(stdout_trace, prompt, usage_output_text, model=model)
 
         if timed_out:
             detail = (
@@ -1136,6 +1277,7 @@ def _run_codex_task(
                 "stdout": _truncate(stdout),
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
+                "usage": usage,
             }
 
         last_message = _read_text_if_exists(last_message_path)
@@ -1148,6 +1290,7 @@ def _run_codex_task(
                 "stdout": _truncate(stdout),
                 "stderr": _truncate(stderr),
                 "exitCode": 128 + int(_INTERRUPTED_SIGNAL),
+                "usage": usage,
             }
 
         if return_code is None:
@@ -1157,6 +1300,7 @@ def _run_codex_task(
                 "stdout": _truncate(stdout),
                 "stderr": _truncate(stderr),
                 "exitCode": 1,
+                "usage": usage,
             }
 
         exit_code = int(return_code)
@@ -1173,6 +1317,7 @@ def _run_codex_task(
                 "stdout": _truncate(stdout),
                 "stderr": _truncate(detail),
                 "exitCode": exit_code,
+                "usage": usage,
             }
 
         policy_signal = _detect_codex_workaround_signal(last_message)
@@ -1195,6 +1340,7 @@ def _run_codex_task(
                 "stdout": _truncate(stdout),
                 "stderr": _truncate(detail),
                 "exitCode": 5,
+                "usage": usage,
             }
 
         changed_paths = summarize_git_changes(repo)
@@ -1216,6 +1362,7 @@ def _run_codex_task(
                 "stdout": "\n\n".join(stdout_parts),
                 "stderr": "",
                 "exitCode": 0,
+                "usage": usage,
             }
 
         if not stdout_parts:
@@ -1226,6 +1373,7 @@ def _run_codex_task(
             "stdout": "\n\n".join(stdout_parts),
             "stderr": "",
             "exitCode": 0,
+            "usage": usage,
         }
 
 

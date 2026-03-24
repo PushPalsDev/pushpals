@@ -396,6 +396,22 @@ export interface LlmUsageSummary {
   services: LlmUsageServiceSummary[];
 }
 
+export interface SessionLlmUsageSummary {
+  sessionId: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  callCount: number;
+  estimatedCallCount: number;
+}
+
+export interface SessionTokenBudgetStatus extends SessionLlmUsageSummary {
+  limit: number;
+  remainingTokens: number;
+  exceeded: boolean;
+  action: "pause";
+}
+
 export interface AutonomyInsights {
   patternStats: AutonomyPatternStatsInsight[];
   recentPrFeedback: AutonomyPrFeedbackInsight[];
@@ -1381,6 +1397,8 @@ export class AutonomyStore {
         ON llm_usage_events(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_llm_usage_events_service_created
         ON llm_usage_events(service, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_llm_usage_events_session_created
+        ON llm_usage_events(session_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS autonomy_dispatch_lock (
         lock_id TEXT PRIMARY KEY,
         owner_session_id TEXT NOT NULL,
@@ -2094,7 +2112,73 @@ export class AutonomyStore {
     };
   }
 
-  recordLlmUsage(body: Record<string, unknown>): { ok: boolean; reason?: string } {
+  getSessionLlmUsageSummary(sessionIdRaw: string): SessionLlmUsageSummary | null {
+    const sessionId = asString(sessionIdRaw).trim();
+    if (!sessionId) return null;
+    const row = this.db
+      .prepare(
+        `SELECT
+           SUM(prompt_tokens) AS prompt_tokens,
+           SUM(completion_tokens) AS completion_tokens,
+           SUM(total_tokens) AS total_tokens,
+           COUNT(*) AS call_count,
+           SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END) AS estimated_call_count
+         FROM llm_usage_events
+         WHERE session_id = ?`,
+      )
+      .get(sessionId) as
+      | {
+          prompt_tokens: number | null;
+          completion_tokens: number | null;
+          total_tokens: number | null;
+          call_count: number | null;
+          estimated_call_count: number | null;
+        }
+      | undefined;
+    const promptTokens = Math.max(0, Math.floor(asNumber(row?.prompt_tokens, 0)));
+    const completionTokens = Math.max(0, Math.floor(asNumber(row?.completion_tokens, 0)));
+    const totalTokens = Math.max(
+      0,
+      Math.floor(asNumber(row?.total_tokens, promptTokens + completionTokens)),
+    );
+    return {
+      sessionId,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      callCount: Math.max(0, Math.floor(asNumber(row?.call_count, 0))),
+      estimatedCallCount: Math.max(0, Math.floor(asNumber(row?.estimated_call_count, 0))),
+    };
+  }
+
+  getSessionTokenBudgetStatus(
+    sessionIdRaw: string,
+    limit: number,
+    action: "pause" = "pause",
+  ): SessionTokenBudgetStatus | null {
+    const sessionId = asString(sessionIdRaw).trim();
+    const normalizedLimit = Math.max(0, Math.floor(asNumber(limit, 0)));
+    if (!sessionId || normalizedLimit <= 0) return null;
+    const usage = this.getSessionLlmUsageSummary(sessionId);
+    if (!usage) return null;
+    return {
+      ...usage,
+      limit: normalizedLimit,
+      remainingTokens: Math.max(0, normalizedLimit - usage.totalTokens),
+      exceeded: usage.totalTokens >= normalizedLimit,
+      action,
+    };
+  }
+
+  recordLlmUsage(
+    body: Record<string, unknown>,
+    opts?: { sessionTokenBudget?: number; sessionTokenBudgetAction?: "pause" },
+  ): {
+    ok: boolean;
+    reason?: string;
+    sessionBudget?: SessionTokenBudgetStatus | null;
+    crossedLimit?: boolean;
+  } {
     const service = normalizeServiceName(body.service);
     if (!service) return { ok: false, reason: "service is required" };
 
@@ -2103,6 +2187,13 @@ export class AutonomyStore {
     const explicitTotal = asNonNegativeInt(body.totalTokens ?? body.total_tokens);
     const totalTokens = explicitTotal > 0 ? explicitTotal : promptTokens + completionTokens;
     if (totalTokens <= 0) return { ok: false, reason: "token usage is required" };
+    const sessionId = asString(body.sessionId ?? body.session_id).trim();
+    const sessionBudgetLimit = Math.max(0, Math.floor(asNumber(opts?.sessionTokenBudget, 0)));
+    const sessionBudgetAction = opts?.sessionTokenBudgetAction ?? "pause";
+    const beforeBudget =
+      sessionId && sessionBudgetLimit > 0
+        ? this.getSessionTokenBudgetStatus(sessionId, sessionBudgetLimit, sessionBudgetAction)
+        : null;
 
     this.db
       .prepare(
@@ -2114,7 +2205,7 @@ export class AutonomyStore {
       .run(
         asString(body.id) || randomUUID(),
         service,
-        asString(body.sessionId ?? body.session_id) || null,
+        sessionId || null,
         asString(body.backend) || null,
         asString(body.modelId ?? body.model_id) || null,
         promptTokens,
@@ -2124,7 +2215,18 @@ export class AutonomyStore {
         asIsoNow(),
       );
 
-    return { ok: true };
+    const sessionBudget =
+      sessionId && sessionBudgetLimit > 0
+        ? this.getSessionTokenBudgetStatus(sessionId, sessionBudgetLimit, sessionBudgetAction)
+        : null;
+
+    return {
+      ok: true,
+      sessionBudget,
+      crossedLimit: Boolean(
+        sessionBudget?.exceeded && (!beforeBudget || beforeBudget.totalTokens < sessionBudget.limit),
+      ),
+    };
   }
 
   getLlmUsageSummary(params?: { windowHours?: number }): LlmUsageSummary {

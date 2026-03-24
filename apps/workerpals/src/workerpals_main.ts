@@ -91,6 +91,99 @@ function workerLlmConfig(runtimeConfig: ReturnType<typeof loadPushPalsConfig>): 
   };
 }
 
+function estimateTokensFromText(text: string): number {
+  return Math.max(0, Math.ceil(String(text ?? "").length / 3));
+}
+
+function buildWorkerLlmUsageEvent(
+  job: {
+    kind: string;
+    sessionId?: string | null;
+    params?: Record<string, unknown> | null;
+  },
+  result: WorkerJobResult,
+): Record<string, unknown> | null {
+  const sessionId = String(job.sessionId ?? CONFIG.sessionId ?? "").trim();
+  if (!sessionId) return null;
+  const llmConfig = workerLlmConfig(CONFIG);
+  const explicitUsage = result.usage;
+  if (
+    explicitUsage &&
+    Number.isFinite(explicitUsage.promptTokens) &&
+    explicitUsage.promptTokens >= 0 &&
+    Number.isFinite(explicitUsage.completionTokens) &&
+    explicitUsage.completionTokens >= 0
+  ) {
+    const promptTokens = Math.round(explicitUsage.promptTokens);
+    const completionTokens = Math.round(explicitUsage.completionTokens);
+    const totalTokens =
+      Number.isFinite(explicitUsage.totalTokens) && (explicitUsage.totalTokens ?? 0) >= 0
+        ? Math.round(explicitUsage.totalTokens ?? promptTokens + completionTokens)
+        : promptTokens + completionTokens;
+    return {
+      service: "workerpals",
+      sessionId,
+      backend: String(explicitUsage.backend ?? resolveExecutor(CONFIG)).trim() || resolveExecutor(CONFIG),
+      modelId: String(explicitUsage.modelId ?? llmConfig.model).trim() || llmConfig.model,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      estimated: explicitUsage.estimated === true,
+    };
+  }
+
+  const promptSource = (() => {
+    try {
+      return JSON.stringify({
+        kind: job.kind,
+        params: job.params ?? {},
+      });
+    } catch {
+      return `${job.kind}\n${String(job.params?.instruction ?? job.params?.prompt ?? "")}`.trim();
+    }
+  })();
+  const completionSource = [result.summary, result.stdout ?? "", result.stderr ?? ""]
+    .filter(Boolean)
+    .join("\n\n");
+  const promptTokens = estimateTokensFromText(promptSource);
+  const completionTokens = estimateTokensFromText(completionSource);
+  return {
+    service: "workerpals",
+    sessionId,
+    backend: resolveExecutor(CONFIG),
+    modelId: llmConfig.model,
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    estimated: true,
+  };
+}
+
+async function reportWorkerLlmUsage(
+  server: string,
+  headers: Record<string, string>,
+  job: {
+    kind: string;
+    sessionId?: string | null;
+    params?: Record<string, unknown> | null;
+  },
+  result: WorkerJobResult,
+): Promise<void> {
+  const payload = buildWorkerLlmUsageEvent(job, result);
+  if (!payload) return;
+  const response = await fetch(`${server}/telemetry/llm-usage`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(
+      `usage telemetry rejected (${response.status})${detail ? `: ${detail.trim()}` : ""}`,
+    );
+  }
+}
+
 function integrationBranchName(): string {
   const configuredBaseRef = CONFIG.workerpals.baseRef.trim();
   if (!configuredBaseRef) return "main_agents";
@@ -1047,6 +1140,15 @@ async function workerLoop(
             const jobDurationMs = Math.max(0, Date.now() - jobStartedAtMs);
 
             await logChain;
+            try {
+              await reportWorkerLlmUsage(opts.server, headers, jobData, result);
+            } catch (err) {
+              console.warn(
+                `[WorkerPals] Failed to report LLM usage for job ${job.id}: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
 
             let completionCommit: CommitRef | null = null;
             if (result.ok && shouldCommit(job.kind, CONFIG)) {

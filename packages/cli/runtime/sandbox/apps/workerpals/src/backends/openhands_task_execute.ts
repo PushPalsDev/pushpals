@@ -8,7 +8,7 @@
 
 import { existsSync } from "fs";
 import { resolve } from "path";
-import type { JobResult } from "../common/types.js";
+import type { JobResult, JobTokenUsage } from "../common/types.js";
 import type { WorkerpalsRuntimeConfig } from "../common/executor_backend.js";
 import {
   truncate,
@@ -23,6 +23,83 @@ import { computeTimeoutWarningWindow } from "../timeout_policy.js";
 const OPENHANDS_SCRIPT_PATH = resolve(import.meta.dir, "openhands", "openhands_executor.py");
 
 // ---- OpenHands-specific helpers ----------------------------------------------
+
+function estimateTokensFromText(text: string): number {
+  return Math.max(0, Math.ceil(String(text ?? "").length / 3));
+}
+
+function estimateJobTokenUsage(
+  runtimeConfig: WorkerpalsRuntimeConfig,
+  params: Record<string, unknown>,
+  summary: string,
+  stdout: string,
+  stderr: string,
+): JobTokenUsage {
+  const promptSource = (() => {
+    try {
+      return JSON.stringify(params);
+    } catch {
+      return String(params?.instruction ?? params?.prompt ?? "");
+    }
+  })();
+  const completionSource = [summary, stdout, stderr].filter(Boolean).join("\n\n");
+  const promptTokens = estimateTokensFromText(promptSource);
+  const completionTokens = estimateTokensFromText(completionSource);
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    estimated: true,
+    backend: "openhands",
+    modelId: runtimeConfig.workerpals.llm.model.trim(),
+  };
+}
+
+function coerceJobTokenUsage(
+  value: unknown,
+  fallback: JobTokenUsage,
+): JobTokenUsage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallback;
+  }
+  const raw = value as Record<string, unknown>;
+  const promptTokens = Number(raw.promptTokens ?? raw.prompt_tokens);
+  const completionTokens = Number(raw.completionTokens ?? raw.completion_tokens);
+  const totalTokens = Number(raw.totalTokens ?? raw.total_tokens);
+  const hasPrompt = Number.isFinite(promptTokens) && promptTokens >= 0;
+  const hasCompletion = Number.isFinite(completionTokens) && completionTokens >= 0;
+  const hasTotal = Number.isFinite(totalTokens) && totalTokens >= 0;
+  if (!hasPrompt && !hasCompletion && !hasTotal) {
+    return fallback;
+  }
+  const normalizedPrompt = hasPrompt
+    ? Math.round(promptTokens)
+    : hasTotal
+      ? Math.max(0, Math.round(totalTokens) - fallback.completionTokens)
+      : fallback.promptTokens;
+  const normalizedCompletion = hasCompletion
+    ? Math.round(completionTokens)
+    : hasTotal
+      ? Math.max(0, Math.round(totalTokens) - normalizedPrompt)
+      : fallback.completionTokens;
+  const normalizedTotal = hasTotal
+    ? Math.round(totalTokens)
+    : normalizedPrompt + normalizedCompletion;
+  return {
+    promptTokens: normalizedPrompt,
+    completionTokens: normalizedCompletion,
+    totalTokens: normalizedTotal,
+    estimated: typeof raw.estimated === "boolean" ? raw.estimated : false,
+    backend:
+      typeof raw.backend === "string" && raw.backend.trim().length > 0
+        ? raw.backend.trim()
+        : fallback.backend,
+    modelId:
+      typeof raw.modelId === "string" && raw.modelId.trim().length > 0
+        ? raw.modelId.trim()
+        : fallback.modelId,
+  };
+}
 
 function classifyShellCommand(cmd: string): "explore" | "progress" {
   const trimmed = cmd.trim().toLowerCase();
@@ -450,6 +527,7 @@ export async function executeWithOpenHands(
 
     const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
     const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);
+    const fallbackUsage = estimateJobTokenUsage(runtimeConfig, params, "", filteredStdout, stderr);
 
     if (!parsed) {
       if (timedOut) {
@@ -464,6 +542,7 @@ export async function executeWithOpenHands(
           stdout: truncate(filteredStdout, outputPolicy),
           stderr: truncate(stderr, outputPolicy),
           exitCode: exitCode === 0 ? 124 : exitCode,
+          usage: fallbackUsage,
         };
       }
       return {
@@ -472,6 +551,7 @@ export async function executeWithOpenHands(
         stdout: truncate(filteredStdout, outputPolicy),
         stderr: truncate(stderr, outputPolicy),
         exitCode,
+        usage: fallbackUsage,
       };
     }
 
@@ -483,6 +563,10 @@ export async function executeWithOpenHands(
           : `${kind} failed via OpenHands (exit ${exitCode})`;
     const parsedStdout = typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout;
     const parsedStderr = typeof parsed.stderr === "string" ? parsed.stderr : stderr;
+    const usage = coerceJobTokenUsage(
+      parsed.usage,
+      estimateJobTokenUsage(runtimeConfig, params, summary, parsedStdout, parsedStderr),
+    );
     const parsedExitCode =
       typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
         ? parsed.exitCode
@@ -502,6 +586,7 @@ export async function executeWithOpenHands(
           stdout: truncate(filteredStdout || String(parsedStdout ?? ""), outputPolicy),
           stderr: truncate(`Clarification needed: ${clarificationQuestion}`, outputPolicy),
           exitCode: 0,
+          usage,
         };
       }
     }
@@ -512,12 +597,20 @@ export async function executeWithOpenHands(
       stdout: truncate(parsedStdout ?? "", outputPolicy),
       stderr: truncate(parsedStderr ?? "", outputPolicy),
       exitCode: parsedExitCode,
+      usage,
     };
   } catch (err) {
     return {
       ok: false,
       summary: `OpenHands wrapper execution error for ${kind}: ${String(err)}`,
       exitCode: 1,
+      usage: estimateJobTokenUsage(
+        runtimeConfig,
+        params,
+        `OpenHands wrapper execution error for ${kind}: ${String(err)}`,
+        "",
+        "",
+      ),
     };
   } finally {
     if (warningTimer) {

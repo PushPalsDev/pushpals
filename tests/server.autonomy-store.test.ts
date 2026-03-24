@@ -701,6 +701,48 @@ describe("server AutonomyStore policy gates", () => {
     expect(remotebuddy?.avgTokensPerCall).toBe(250);
   });
 
+  test("tracks session token budget crossings from llm usage telemetry", () => {
+    const store = makeStore();
+
+    const first = store.recordLlmUsage(
+      {
+        id: "usage_worker_1",
+        service: "workerpals",
+        sessionId: "dev",
+        promptTokens: 40,
+        completionTokens: 20,
+      },
+      { sessionTokenBudget: 100, sessionTokenBudgetAction: "pause" },
+    );
+    expect(first.ok).toBe(true);
+    expect(first.crossedLimit).toBe(false);
+    expect(first.sessionBudget?.exceeded).toBe(false);
+    expect(first.sessionBudget?.remainingTokens).toBe(40);
+
+    const second = store.recordLlmUsage(
+      {
+        id: "usage_worker_2",
+        service: "workerpals",
+        sessionId: "dev",
+        promptTokens: 30,
+        completionTokens: 20,
+      },
+      { sessionTokenBudget: 100, sessionTokenBudgetAction: "pause" },
+    );
+    expect(second.ok).toBe(true);
+    expect(second.crossedLimit).toBe(true);
+    expect(second.sessionBudget?.exceeded).toBe(true);
+    expect(second.sessionBudget?.totalTokens).toBe(110);
+    expect(second.sessionBudget?.remainingTokens).toBe(0);
+    expect(second.sessionBudget?.action).toBe("pause");
+
+    const sessionSummary = store.getSessionLlmUsageSummary("dev");
+    expect(sessionSummary).toBeDefined();
+    expect(sessionSummary?.totalTokens).toBe(110);
+    expect(sessionSummary?.callCount).toBe(2);
+    expect(sessionSummary?.sessionId).toBe("dev");
+  });
+
   test("persists candidates with run-scoped ids to prevent cross-run overwrites", () => {
     const store = makeStore();
     const snapshotA = store.createSnapshot({ sessionId: "s1", runId: "run_a" }).snapshot_id;

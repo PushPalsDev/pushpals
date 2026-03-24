@@ -2022,14 +2022,29 @@ export function shouldUseCodexCliForExecutor(executor: string): boolean {
   return executor.trim().toLowerCase() === "openai_codex";
 }
 
-function normalizeCodexReasoningEffort(value: unknown): "low" | "medium" | "high" {
+function normalizeCodexReasoningEffort(
+  value: unknown,
+): "low" | "medium" | "high" | "xhigh" {
   const normalized = String(value ?? "")
     .trim()
     .toLowerCase();
-  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+  if (
+    normalized === "low" ||
+    normalized === "medium" ||
+    normalized === "high" ||
+    normalized === "xhigh"
+  ) {
     return normalized;
   }
-  return "high";
+  if (
+    normalized === "extra high" ||
+    normalized === "extra-high" ||
+    normalized === "extrahigh" ||
+    normalized === "x-high"
+  ) {
+    return "xhigh";
+  }
+  return "xhigh";
 }
 
 async function generateCommitMessageFromDiff(

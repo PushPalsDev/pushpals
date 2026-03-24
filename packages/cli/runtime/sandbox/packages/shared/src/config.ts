@@ -82,6 +82,8 @@ export interface PushPalsConfig {
     debugHttp: boolean;
     staleClaimTtlMs: number;
     staleClaimSweepIntervalMs: number;
+    sessionTokenBudget: number;
+    sessionTokenBudgetAction: "pause";
   };
   localbuddy: {
     enabled: boolean;
@@ -682,6 +684,14 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       5_000,
     ),
   );
+  const sessionTokenBudget = Math.max(
+    0,
+    asInt(
+      parseIntEnv("PUSHPALS_SESSION_TOKEN_BUDGET") ?? serverNode.session_token_budget,
+      1_000_000,
+    ),
+  );
+  const sessionTokenBudgetAction: "pause" = "pause";
 
   const globalStatusHeartbeatMs = parseIntEnv("PUSHPALS_STATUS_HEARTBEAT_MS");
 
@@ -1467,6 +1477,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       debugHttp,
       staleClaimTtlMs,
       staleClaimSweepIntervalMs,
+      sessionTokenBudget,
+      sessionTokenBudgetAction,
     },
     localbuddy: {
       enabled: localEnabled,

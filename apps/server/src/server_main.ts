@@ -51,6 +51,13 @@ const clientPresencePruneTimer = setInterval(() => {
 clientPresencePruneTimer.unref?.();
 sessionManager.authToken = null;
 sessionManager.setClientMessageIngress((sessionId, accepted) => {
+  const budgetStatus = getSessionTokenBudgetStatus(sessionId);
+  if (budgetStatus?.exceeded) {
+    return {
+      ok: false,
+      message: sessionTokenBudgetMessage(budgetStatus),
+    };
+  }
   const enqueueResult = requestQueue.enqueue({
     sessionId,
     prompt: accepted.text,
@@ -76,6 +83,60 @@ const AUTONOMY_BUSY_QUEUE_MAX_REQUESTS = 5;
 const AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS = 10;
 const AUTONOMY_WORKER_TTL_MS = 15_000;
 const CLIENT_TRANSPORT_HEARTBEAT_MS = 15_000;
+const SESSION_TOKEN_BUDGET = Math.max(0, STARTUP_CONFIG.server.sessionTokenBudget);
+
+function getSessionTokenBudgetStatus(sessionIdRaw: unknown) {
+  const sessionId = String(sessionIdRaw ?? "").trim();
+  if (!sessionId || SESSION_TOKEN_BUDGET <= 0) return null;
+  return autonomyStore.getSessionTokenBudgetStatus(
+    sessionId,
+    SESSION_TOKEN_BUDGET,
+    STARTUP_CONFIG.server.sessionTokenBudgetAction,
+  );
+}
+
+function sessionTokenBudgetMessage(
+  status: NonNullable<ReturnType<typeof getSessionTokenBudgetStatus>>,
+): string {
+  return (
+    `Session token budget exceeded for ${status.sessionId}: ` +
+    `${status.totalTokens}/${status.limit} tokens used. ` +
+    "PushPals is pausing new work for this session."
+  );
+}
+
+function emitSessionBudgetPauseNotice(
+  sessionIdRaw: unknown,
+  status: NonNullable<ReturnType<typeof getSessionTokenBudgetStatus>>,
+): void {
+  const sessionId = String(sessionIdRaw ?? "").trim();
+  if (!sessionId) return;
+  const session = sessionManager.getSession(sessionId);
+  if (!session) return;
+  const message = sessionTokenBudgetMessage(status);
+  session.emit({
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId,
+    type: "assistant_message",
+    from: "system",
+    payload: { text: message },
+  });
+  session.emit({
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId,
+    type: "status",
+    from: "system",
+    payload: {
+      agentId: "pushpals-budget",
+      state: "idle",
+      detail: message,
+    },
+  });
+}
 
 export function sessionMessageResultStatus(result: SessionMessageResult): number {
   if (result.ok) return 200;
@@ -764,6 +825,18 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const budgetStatus = getSessionTokenBudgetStatus(body.sessionId);
+        if (budgetStatus?.exceeded) {
+          return makeJson(
+            {
+              ok: false,
+              code: "session_token_budget_exceeded",
+              message: sessionTokenBudgetMessage(budgetStatus),
+              sessionBudget: budgetStatus,
+            },
+            429,
+          );
+        }
         const result = jobQueue.enqueue(body);
         return makeJson(result, result.ok ? 201 : 400);
       }
@@ -776,7 +849,19 @@ export function createRequestHandler() {
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const workerId = (body.workerId as string) || "unknown";
-        const result = jobQueue.claim(workerId);
+        let result = jobQueue.claim(workerId);
+        let skipped = 0;
+        while (result.ok && result.job?.id && skipped < 64) {
+          const budgetStatus = getSessionTokenBudgetStatus(result.job.sessionId);
+          if (!budgetStatus?.exceeded) break;
+          emitSessionBudgetPauseNotice(result.job.sessionId, budgetStatus);
+          jobQueue.fail(result.job.id, {
+            message: "Session token budget exceeded",
+            detail: sessionTokenBudgetMessage(budgetStatus),
+          });
+          skipped += 1;
+          result = jobQueue.claim(workerId);
+        }
         if (result.ok && result.job?.id) {
           const params = parseJsonRecord(result.job.params ?? "");
           const requestId = compactText(params.requestId, 128);
@@ -901,7 +986,13 @@ export function createRequestHandler() {
         const denied = requireAuth();
         if (denied) return denied;
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = autonomyStore.recordLlmUsage(body);
+        const result = autonomyStore.recordLlmUsage(body, {
+          sessionTokenBudget: SESSION_TOKEN_BUDGET,
+          sessionTokenBudgetAction: STARTUP_CONFIG.server.sessionTokenBudgetAction,
+        });
+        if (result.ok && result.crossedLimit && result.sessionBudget?.sessionId) {
+          emitSessionBudgetPauseNotice(result.sessionBudget.sessionId, result.sessionBudget);
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
 
@@ -1604,6 +1695,18 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const budgetStatus = getSessionTokenBudgetStatus(body.sessionId);
+        if (budgetStatus?.exceeded) {
+          return makeJson(
+            {
+              ok: false,
+              code: "session_token_budget_exceeded",
+              message: sessionTokenBudgetMessage(budgetStatus),
+              sessionBudget: budgetStatus,
+            },
+            429,
+          );
+        }
         if (isAutonomyRequestPayload(body)) {
           const workers = jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS);
           const schedulableWorkers = workers.filter((worker) => worker.isOnline && worker.status !== "offline");
@@ -1660,7 +1763,19 @@ export function createRequestHandler() {
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const agentId = (body.agentId as string) || "unknown";
-        const result = requestQueue.claim(agentId);
+        let result = requestQueue.claim(agentId);
+        let skipped = 0;
+        while (result.ok && result.request?.id && skipped < 64) {
+          const budgetStatus = getSessionTokenBudgetStatus(result.request.sessionId);
+          if (!budgetStatus?.exceeded) break;
+          emitSessionBudgetPauseNotice(result.request.sessionId, budgetStatus);
+          requestQueue.fail(result.request.id, {
+            message: "Session token budget exceeded",
+            detail: sessionTokenBudgetMessage(budgetStatus),
+          });
+          skipped += 1;
+          result = requestQueue.claim(agentId);
+        }
         return makeJson(result, result.ok ? 200 : 404);
       }
 

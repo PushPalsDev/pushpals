@@ -13,10 +13,13 @@ for path in (_HERE, _SHARED):
 from executor_base import SettingsResolver, config_dir_for_runtime_config, runtime_config
 from openai_codex_executor import (
     OpenAICodexRuntimeConfig,
+    _resolve_reasoning_effort,
     _build_instruction,
     _detect_codex_workaround_signal,
+    _extract_usage_counts,
     _load_prompt_template,
     _repo_root_for_prompt_loading,
+    _usage_from_trace_or_estimate,
 )
 
 
@@ -57,7 +60,17 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.approval_policy, "never")
         self.assertEqual(cfg.sandbox, "workspace-write")
         self.assertEqual(cfg.color, "never")
+        self.assertEqual(cfg.reasoning_effort, "xhigh")
         self.assertFalse(cfg.json_output)
+
+    def test_reasoning_effort_accepts_extra_high_alias(self) -> None:
+        cfg = OpenAICodexRuntimeConfig.from_sources(
+            SettingsResolver(
+                env={"WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": "extra high"},
+                config_loader=lambda: {},
+            ),
+        )
+        self.assertEqual(_resolve_reasoning_effort(cfg), "xhigh")
 
     def test_runtime_config_prefers_explicit_config_dir_override(self) -> None:
         import executor_base
@@ -148,6 +161,32 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
     def test_loads_openai_codex_task_prompt_template(self) -> None:
         template = _load_prompt_template("workerpals/openai_codex_task_execute_system_prompt.md")
         self.assertIn("Codex CLI is required infrastructure", template)
+
+    def test_extracts_usage_counts_from_nested_json_event(self) -> None:
+        usage = _extract_usage_counts(
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 30,
+                        "total_tokens": 150,
+                    }
+                },
+            }
+        )
+        self.assertEqual(
+            usage,
+            {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+        )
+
+    def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:
+        usage = _usage_from_trace_or_estimate({}, "abc" * 30, "done", model="gpt-5.4")
+        self.assertTrue(usage["estimated"])
+        self.assertEqual(usage["backend"], "openai_codex")
+        self.assertEqual(usage["modelId"], "gpt-5.4")
+        self.assertGreater(usage["promptTokens"], 0)
+        self.assertGreater(usage["totalTokens"], usage["completionTokens"])
 
 
 if __name__ == "__main__":
