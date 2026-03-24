@@ -2,19 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.23`
-- start_commit: `a6ca3702621fcbe01262f52e2b165e6f530bd5f6`
-- end_commit: `c6c43e73ffbab35fa848b916b6fa54c6a1233f0b`
-- commits_in_range: `2`
+- version: `v1.0.24`
+- start_commit: `e09ed19c6e0bf8cd1cab3447f91b0baab8db068a`
+- end_commit: `ed7666d4445534207a92200f7b357abba79035a5`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Harden packaged WorkerPal runtime path resolution so OpenHands, OpenAI Codex, and MiniSWE load prompts from the effective embedded runtime prompt root when `pushpals` runs against external repos.
-- Remove the last legacy `config/` source-checkout probe from CLI bootstrap so `configs/` remains the only supported source layout.
-- Improve ReviewAgent PR comments so both rejected and accepted reviews surface fallback reasoning from `fix_instruction` or `summary` when `issues[]` is empty.
-- Add WorkerPal LLM usage reporting into the shared telemetry pipeline so the monitoring hub shows WorkerPal token totals instead of `0 calls / 0 tokens`.
-- Add per-session token budget tracking and enforce a global session token cap that pauses new work once a session exceeds the configured limit.
-- Raise the shipped default `server.session_token_budget` to `2,000,000` tokens and regenerate the packaged CLI runtime/sandbox assets to keep source and installed CLI behavior aligned.
+- Gracefully stop CLI auto-started runtime services on exit so WorkerPal Docker cleanup can finish instead of being force-killed immediately.
+- Wait for per-job worktree paths to become visible inside warm Docker containers before running `docker exec -w ...`, and retry transient `chdir to cwd` startup races instead of failing jobs with exit `126`.
+- Downgrade unsupported Codex `reasoning_effort = "xhigh"` requests to `high` for `gpt-5.4` and related `codex-1p*` model paths.
+- Align repo, packaged runtime, and packaged sandbox config defaults to `reasoning_effort = "high"` so installed CLI behavior matches the source tree.
+- Add regression coverage for Docker worktree visibility races and Codex reasoning-effort normalization.
 
 ## Install
 
@@ -45,5 +44,5 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.23 && git push origin v1.0.23`.
+- Tag and push: `git tag v1.0.24 && git push origin v1.0.24`.
 
