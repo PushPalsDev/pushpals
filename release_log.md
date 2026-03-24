@@ -2,18 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.0.21`
-- start_commit: `8906f269ae7c69a5586f22cc586f89dc85b5ba55`
-- end_commit: `8906f269ae7c69a5586f22cc586f89dc85b5ba55`
+- version: `v1.0.22`
+- start_commit: `2da4c7565d3f532a99c009eef507a5c15f9ef790`
+- end_commit: `2da4c7565d3f532a99c009eef507a5c15f9ef790`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Fix embedded WorkerPal backend metadata loading so it resolves `backend.toml` from `loadPushPalsConfig().configDir` instead of reconstructing `projectRoot/configs/backend.toml`.
-- Preserve the strict fail-fast behavior for missing runtime backend config while making the embedded WorkerPal binary work correctly against arbitrary external repos.
-- Add an explicit backend-config path helper so runtime config resolution is shared and testable.
-- Regenerate the packaged CLI sandbox runtime snapshot so the embedded WorkerPal backend loader matches the source tree fix.
-- Add regression coverage proving backend config resolution follows the effective runtime config directory rather than the target repo root.
+- Reorder the CLI release workflow so GitHub release assets and embedded runtime binaries are published before `@pushpalsdev/cli` is published to npm.
+- Remove the release sequencing window where npm could publish a new CLI version before the matching `pushpals-runtime-*` assets existed for that tag.
+- Prevent installed CLI versions from resolving a fresh runtime tag and immediately hitting GitHub 404s during embedded runtime bootstrap.
+- Keep the standalone CLI binary build flow unchanged while making npm publication explicitly depend on successful GitHub release asset publication.
 
 ## Install
 
@@ -44,5 +43,5 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.21 && git push origin v1.0.21`.
+- Tag and push: `git tag v1.0.22 && git push origin v1.0.22`.
 
