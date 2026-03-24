@@ -2,22 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.20`
-- start_commit: `dce10e380f0d73c33af0cb71ed635196be2c5469`
-- end_commit: `dce10e380f0d73c33af0cb71ed635196be2c5469`
+- version: `v1.0.21`
+- start_commit: `8906f269ae7c69a5586f22cc586f89dc85b5ba55`
+- end_commit: `8906f269ae7c69a5586f22cc586f89dc85b5ba55`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Remove active support for the legacy `config/` runtime layout so `configs/` is the single supported config location across shared config loading, client preflight, VS Code runtime policy, and startup local-config resolution.
-- Align source-checkout, packaged CLI runtime, and sandbox runtime WorkerPal executor defaults on `openai_codex`.
-- Centralize the defensive WorkerPal executor fallback through the shared config constant instead of duplicating string literals across loaders and backend selection.
-- Make shared runtime config loading fail fast when `configs/default.toml` is missing instead of silently reconstructing behavior from hardcoded code defaults.
-- Make WorkerPal backend metadata loading fail fast when `configs/backend.toml` is missing or invalid instead of silently falling back to implicit backend ordering.
-- Regenerate embedded CLI runtime and sandbox assets so the packaged runtime matches the canonical source config and shared loader behavior.
-- Add parity tests that assert source config, packaged runtime config, and sandbox config stay aligned on executor and backend defaults.
-- Add regression coverage that verifies legacy `config/` layouts are rejected and missing required runtime config files raise explicit errors.
-- Update stale Windows setup documentation to use `configs\local.example.toml` -> `configs\local.toml`.
+- Fix embedded WorkerPal backend metadata loading so it resolves `backend.toml` from `loadPushPalsConfig().configDir` instead of reconstructing `projectRoot/configs/backend.toml`.
+- Preserve the strict fail-fast behavior for missing runtime backend config while making the embedded WorkerPal binary work correctly against arbitrary external repos.
+- Add an explicit backend-config path helper so runtime config resolution is shared and testable.
+- Regenerate the packaged CLI sandbox runtime snapshot so the embedded WorkerPal backend loader matches the source tree fix.
+- Add regression coverage proving backend config resolution follows the effective runtime config directory rather than the target repo root.
 
 ## Install
 
@@ -48,5 +44,5 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.20 && git push origin v1.0.20`.
+- Tag and push: `git tag v1.0.21 && git push origin v1.0.21`.
 
