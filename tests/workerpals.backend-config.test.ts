@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { parseRequiredBackendToml } from "../apps/workerpals/src/backends/backend_config";
+import {
+  parseRequiredBackendToml,
+  resolveBackendTomlPath,
+} from "../apps/workerpals/src/backends/backend_config";
 
 describe("workerpals backend config", () => {
   test("requires configs/backend.toml", () => {
@@ -38,6 +41,23 @@ describe("workerpals backend config", () => {
       const parsed = parseRequiredBackendToml(join(configDir, "backend.toml"));
       expect(parsed.default_backend).toBe("openai_codex");
       expect(parsed.backends?.openai_codex).toBeDefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolves backend metadata from the effective runtime config dir", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-backend-config-"));
+    const repoRoot = join(root, "repo");
+    const runtimeConfigDir = join(root, "runtime", "configs");
+    mkdirSync(repoRoot, { recursive: true });
+    mkdirSync(runtimeConfigDir, { recursive: true });
+
+    try {
+      expect(resolveBackendTomlPath(runtimeConfigDir)).toBe(join(runtimeConfigDir, "backend.toml"));
+      expect(resolveBackendTomlPath(join(repoRoot, "configs"))).not.toBe(
+        join(runtimeConfigDir, "backend.toml"),
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "fs";
-import { resolve } from "path";
+import { join } from "path";
 import { DEFAULT_WORKERPALS_EXECUTOR, loadPushPalsConfig } from "shared";
 import type { ExecutorBackend } from "../common/types.js";
 import { MINISWE_BACKEND } from "./miniswe_backend.js";
@@ -44,9 +44,12 @@ export function parseRequiredBackendToml(path: string): BackendTomlShape {
   return parsed as BackendTomlShape;
 }
 
+export function resolveBackendTomlPath(configDir: string): string {
+  return join(configDir, "backend.toml");
+}
+
 function loadBackendToml(): BackendTomlShape {
-  const projectRoot = loadPushPalsConfig().projectRoot;
-  const path = resolve(projectRoot, "configs", "backend.toml");
+  const path = resolveBackendTomlPath(loadPushPalsConfig().configDir);
   return parseRequiredBackendToml(path);
 }
 

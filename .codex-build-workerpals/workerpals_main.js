@@ -4,7 +4,7 @@
 // apps/workerpals/src/workerpals_main.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdirSync as mkdirSync2 } from "fs";
-import { resolve as resolve11 } from "path";
+import { resolve as resolve10 } from "path";
 
 // packages/shared/src/repo.ts
 import { existsSync, readFileSync, statSync } from "fs";
@@ -435,7 +435,6 @@ function resolveLocalServerConnection(options) {
 // packages/shared/src/config.ts
 var PROJECT_ROOT = resolve3(import.meta.dir, "..", "..", "..");
 var DEFAULT_CONFIG_DIR = "configs";
-var LEGACY_CONFIG_DIR = "config";
 var TRUTHY = new Set(["1", "true", "yes", "on"]);
 var FALSY = new Set(["0", "false", "no", "off"]);
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE = 8;
@@ -448,6 +447,7 @@ var DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 45000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8000;
+var DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
 var DEFAULT_WORKERPALS_EXECUTOR_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 var DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
 var DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
@@ -488,6 +488,12 @@ function parseTomlFile(path) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
     return {};
   return parsed;
+}
+function parseRequiredTomlFile(path) {
+  if (!existsSync2(path)) {
+    throw new Error(`Missing required runtime config file: ${path}`);
+  }
+  return parseTomlFile(path);
 }
 function isObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -594,20 +600,7 @@ function resolveRuntimeConfigDir(projectRoot, configuredDir) {
   if (configuredDir && configuredDir.trim()) {
     return resolvePathFromRoot(projectRoot, configuredDir);
   }
-  const canonicalDir = resolvePathFromRoot(projectRoot, DEFAULT_CONFIG_DIR);
-  const legacyDir = resolvePathFromRoot(projectRoot, LEGACY_CONFIG_DIR);
-  if (existsSync2(join2(canonicalDir, "default.toml")))
-    return canonicalDir;
-  if (existsSync2(join2(legacyDir, "default.toml")))
-    return legacyDir;
-  return canonicalDir;
-}
-function parseTomlWithLegacyFallback(primaryPath, fallbackPath) {
-  if (existsSync2(primaryPath))
-    return parseTomlFile(primaryPath);
-  if (fallbackPath && existsSync2(fallbackPath))
-    return parseTomlFile(fallbackPath);
-  return {};
+  return resolvePathFromRoot(projectRoot, DEFAULT_CONFIG_DIR);
 }
 function normalizeBackend(value) {
   const text = value.trim().toLowerCase();
@@ -679,17 +672,15 @@ function loadPushPalsConfig(options = {}) {
   const projectRoot = resolve3(projectRootOverride);
   const configDirOverride = firstNonEmpty(options.configDir, process.env.PUSHPALS_CONFIG_DIR_OVERRIDE, "");
   const configDir = resolveRuntimeConfigDir(projectRoot, configDirOverride);
-  const legacyConfigDir = resolvePathFromRoot(projectRoot, LEGACY_CONFIG_DIR);
-  const fallbackConfigDir = !configDirOverride && configDir !== legacyConfigDir ? legacyConfigDir : "";
   const cacheKey = `${projectRoot}::${configDir}::${process.env.PUSHPALS_PROFILE ?? ""}`;
   if (!options.reload && cachedConfig && cachedConfigKey === cacheKey) {
     return cachedConfig;
   }
-  const defaultToml = parseTomlWithLegacyFallback(join2(configDir, "default.toml"), fallbackConfigDir ? join2(fallbackConfigDir, "default.toml") : undefined);
+  const defaultToml = parseRequiredTomlFile(join2(configDir, "default.toml"));
   const preferredProfile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(defaultToml.profile, "dev"), "dev");
-  const profileToml = parseTomlWithLegacyFallback(join2(configDir, `${preferredProfile}.toml`), fallbackConfigDir ? join2(fallbackConfigDir, `${preferredProfile}.toml`) : undefined);
-  const localExampleToml = parseTomlWithLegacyFallback(join2(configDir, "local.example.toml"), fallbackConfigDir ? join2(fallbackConfigDir, "local.example.toml") : undefined);
-  const localToml = parseTomlWithLegacyFallback(join2(configDir, "local.toml"), fallbackConfigDir ? join2(fallbackConfigDir, "local.toml") : undefined);
+  const profileToml = parseTomlFile(join2(configDir, `${preferredProfile}.toml`));
+  const localExampleToml = parseTomlFile(join2(configDir, "local.example.toml"));
+  const localToml = parseTomlFile(join2(configDir, "local.toml"));
   const merged = mergeDeep(mergeDeep(mergeDeep(defaultToml, profileToml), localExampleToml), localToml);
   const profile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(merged.profile, preferredProfile), preferredProfile);
   const sessionId = firstNonEmpty(process.env.PUSHPALS_SESSION_ID, asString(merged.session_id, "dev"), "dev");
@@ -796,7 +787,7 @@ function loadPushPalsConfig(options = {}) {
   const workerOpenHandsNode = getObject(workerNode, "openhands");
   const workerPollMs = Math.max(200, asInt(parseIntEnv("WORKERPALS_POLL_MS") ?? workerNode.poll_ms, 2000));
   const workerHeartbeatMs = Math.max(200, asInt(parseIntEnv("WORKERPALS_HEARTBEAT_MS") ?? workerNode.heartbeat_ms, 5000));
-  const workerExecutor = firstNonEmpty(process.env.WORKERPALS_EXECUTOR, asString(workerNode.executor, "openhands"), "openhands").toLowerCase();
+  const workerExecutor = firstNonEmpty(process.env.WORKERPALS_EXECUTOR, asString(workerNode.executor, DEFAULT_WORKERPALS_EXECUTOR), DEFAULT_WORKERPALS_EXECUTOR).toLowerCase();
   const workerOpenHandsPython = firstNonEmpty(process.env.WORKERPALS_OPENHANDS_PYTHON, asString(workerNode.openhands_python, "python"), "python");
   const workerOpenHandsTimeoutMs = Math.max(1e4, asInt(parseIntEnv("WORKERPALS_OPENHANDS_TIMEOUT_MS") ?? workerNode.openhands_timeout_ms, 1800000));
   const workerMiniswePython = firstNonEmpty(process.env.WORKERPALS_MINISWE_PYTHON, asString(workerNode.miniswe_python, "python"), "python");
@@ -1289,8 +1280,8 @@ async function resolveGitTokenForRemote(options) {
 var TRUTHY2 = new Set(["1", "true", "yes", "on"]);
 var FALSY2 = new Set(["0", "false", "no", "off"]);
 // apps/workerpals/src/backends/backend_config.ts
-import { readFileSync as readFileSync4 } from "fs";
-import { resolve as resolve8 } from "path";
+import { existsSync as existsSync5, readFileSync as readFileSync4 } from "fs";
+import { join as join3 } from "path";
 
 // apps/workerpals/src/backends/miniswe_backend.ts
 import { resolve as resolve5 } from "path";
@@ -2071,29 +2062,34 @@ function getBackendTaskExecutor(backend) {
 }
 
 // apps/workerpals/src/backends/backend_config.ts
-var FALLBACK_DEFAULT_EXECUTOR = "miniswe";
+var FALLBACK_DEFAULT_EXECUTOR = DEFAULT_WORKERPALS_EXECUTOR;
 function toStrings(value) {
   if (!Array.isArray(value))
     return [];
   return value.filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean);
 }
-function loadBackendToml() {
-  const projectRoot = loadPushPalsConfig().projectRoot;
-  const path = resolve8(projectRoot, "configs", "backend.toml");
-  try {
-    const parsed = Bun.TOML.parse(readFileSync4(path, "utf-8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-      return {};
-    return parsed;
-  } catch {
-    return {};
+function parseRequiredBackendToml(path) {
+  if (!existsSync5(path)) {
+    throw new Error(`Missing required runtime backend config file: ${path}`);
   }
+  const parsed = Bun.TOML.parse(readFileSync4(path, "utf-8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid runtime backend config file: ${path}`);
+  }
+  return parsed;
+}
+function resolveBackendTomlPath(configDir) {
+  return join3(configDir, "backend.toml");
+}
+function loadBackendToml() {
+  const path = resolveBackendTomlPath(loadPushPalsConfig().configDir);
+  return parseRequiredBackendToml(path);
 }
 var config = loadBackendToml();
 var backendEntries = Object.entries(config.backends ?? {});
 var BACKEND_EXECUTOR_SCRIPT_SEGMENTS = Object.fromEntries(backendEntries.map(([name, spec]) => [name, toStrings(spec?.script_segments)]));
 var EXECUTOR_BACKENDS = Object.keys(BACKEND_EXECUTOR_SCRIPT_SEGMENTS);
-var DEFAULT_EXECUTOR = typeof config.default_backend === "string" && EXECUTOR_BACKENDS.includes(config.default_backend) ? config.default_backend : EXECUTOR_BACKENDS[0] ?? FALLBACK_DEFAULT_EXECUTOR;
+var DEFAULT_EXECUTOR = typeof config.default_backend === "string" && EXECUTOR_BACKENDS.includes(config.default_backend) ? config.default_backend : EXECUTOR_BACKENDS.includes(FALLBACK_DEFAULT_EXECUTOR) ? FALLBACK_DEFAULT_EXECUTOR : EXECUTOR_BACKENDS[0] ?? FALLBACK_DEFAULT_EXECUTOR;
 var SHARED_DOCKER_PASSTHROUGH_ENV = toStrings(config.env?.shared_passthrough);
 var BACKEND_DOCKER_PASSTHROUGH_ENV = Object.fromEntries(backendEntries.map(([name, spec]) => [name, toStrings(spec?.passthrough_env)]));
 var BACKEND_RUNTIME_CONFIG_KEYS = Object.fromEntries(backendEntries.map(([name, spec]) => [
@@ -2191,7 +2187,7 @@ class Logger {
 
 // apps/workerpals/src/execute_job.ts
 import { readFileSync as readFileSync5, unlinkSync } from "fs";
-import { resolve as resolve9 } from "path";
+import { resolve as resolve8 } from "path";
 var DEFAULT_CONFIG3 = loadPushPalsConfig();
 function shouldCommit(kind, runtimeConfig = DEFAULT_CONFIG3) {
   const configured = Array.isArray(runtimeConfig.workerpals.fileModifyingJobs) ? runtimeConfig.workerpals.fileModifyingJobs : [];
@@ -2578,7 +2574,7 @@ function hasBalancedPositiveNegativeAssertions(paths, repo) {
   let positiveAssertions = 0;
   let negativeAssertions = 0;
   for (const rel of paths) {
-    const fullPath = resolve9(repo, rel);
+    const fullPath = resolve8(repo, rel);
     let content = "";
     try {
       content = readFileSync5(fullPath, "utf-8");
@@ -3648,7 +3644,7 @@ async function generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtime
     return Math.max(1e4, Math.min(600000, Math.floor(value)));
   })();
   const reasoningEffort = normalizeCodexReasoningEffort(runtimeConfig.workerpals.llm.reasoningEffort);
-  const tmpOutputPath = resolve9(Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp", `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+  const tmpOutputPath = resolve8(Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp", `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
   const cmd = [
     ...codexPrefix,
     "-c",
@@ -4354,14 +4350,14 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
 
 // apps/workerpals/src/docker_executor.ts
 import { randomUUID } from "crypto";
-import { existsSync as existsSync6, mkdirSync, readFileSync as readFileSync6, writeFileSync } from "fs";
+import { existsSync as existsSync7, mkdirSync, readFileSync as readFileSync6, writeFileSync } from "fs";
 import { homedir } from "os";
-import { isAbsolute as isAbsolute2, relative, resolve as resolve10 } from "path";
+import { isAbsolute as isAbsolute2, relative, resolve as resolve9 } from "path";
 
 // apps/workerpals/src/common/worktree_cleanup.ts
-import { existsSync as existsSync5, rmSync } from "fs";
+import { existsSync as existsSync6, rmSync } from "fs";
 function defaultSleep(ms) {
-  return new Promise((resolve10) => setTimeout(resolve10, ms));
+  return new Promise((resolve9) => setTimeout(resolve9, ms));
 }
 function windowsDeletionCandidates(worktreePath) {
   const seen = new Set;
@@ -4383,7 +4379,7 @@ async function forceDeleteWorktreePath(worktreePath, options = {}) {
   const delayMs = Math.max(0, Math.floor(options.delayMs ?? 120));
   const sleep = options.sleepFn ?? defaultSleep;
   const removePath = options.removeFn ?? ((targetPath) => rmSync(targetPath, { recursive: true, force: true }));
-  const pathExists = options.existsFn ?? ((targetPath) => existsSync5(targetPath));
+  const pathExists = options.existsFn ?? ((targetPath) => existsSync6(targetPath));
   let lastError = "";
   for (let attempt = 1;attempt <= retries; attempt++) {
     if (!pathExists(worktreePath))
@@ -4439,7 +4435,7 @@ function resolveDockerExecutable() {
 function resolveWorkerpalSandboxBuildContext(repoRoot) {
   const configuredRoot = String(process.env.PUSHPALS_WORKERPALS_SANDBOX_ROOT ?? "").trim();
   const sandboxRoot = configuredRoot || repoRoot;
-  const dockerfilePath = configuredRoot ? resolve10(sandboxRoot, "apps", "workerpals", "Dockerfile.sandbox") : resolve10(repoRoot, "apps", "workerpals", "Dockerfile.sandbox");
+  const dockerfilePath = configuredRoot ? resolve9(sandboxRoot, "apps", "workerpals", "Dockerfile.sandbox") : resolve9(repoRoot, "apps", "workerpals", "Dockerfile.sandbox");
   return {
     root: sandboxRoot,
     dockerfilePath
@@ -4544,7 +4540,7 @@ class DockerExecutor {
       networkMode: "bridge",
       ...optionValues
     };
-    this.worktreeDir = resolve10(this.options.repo, ".worktrees");
+    this.worktreeDir = resolve9(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
     this.warmSetupMaxAttempts = parseClampedInt(this.config.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
@@ -4560,7 +4556,7 @@ class DockerExecutor {
     this.activeJobs += 1;
     this.clearIdleTimer();
     const worktreeName = this.buildEphemeralWorktreeName("job", job.id);
-    const worktreePath = resolve10(this.worktreeDir, worktreeName);
+    const worktreePath = resolve9(this.worktreeDir, worktreeName);
     try {
       await this.ensureFreshImageForMergeConflictJob(job, onLog);
       const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog);
@@ -4626,7 +4622,7 @@ class DockerExecutor {
   }
   async validateWorktreeGitInterop() {
     const worktreeName = this.buildEphemeralWorktreeName("selfcheck", "startup");
-    const worktreePath = resolve10(this.worktreeDir, worktreeName);
+    const worktreePath = resolve9(this.worktreeDir, worktreeName);
     try {
       await this.createWorktree(worktreePath, this.options.baseRef);
       await this.runGitSelfCheckContainer(worktreePath);
@@ -4673,7 +4669,7 @@ class DockerExecutor {
   }
   rewriteWorktreeGitdirToRelative(worktreePath) {
     try {
-      const gitFilePath = resolve10(worktreePath, ".git");
+      const gitFilePath = resolve9(worktreePath, ".git");
       const raw = readFileSync6(gitFilePath, "utf-8").trim();
       const match = raw.match(/^gitdir:\s*(.+)$/i);
       if (!match)
@@ -4883,10 +4879,10 @@ class DockerExecutor {
     if (backend !== "openai_codex")
       return [];
     const hostCodexHomeRaw = (process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
-    const hostCodexHome = (hostCodexHomeRaw ? isAbsolute2(hostCodexHomeRaw) ? hostCodexHomeRaw : resolve10(this.options.repo, hostCodexHomeRaw) : resolve10(homedir(), ".codex")).trim();
+    const hostCodexHome = (hostCodexHomeRaw ? isAbsolute2(hostCodexHomeRaw) ? hostCodexHomeRaw : resolve9(this.options.repo, hostCodexHomeRaw) : resolve9(homedir(), ".codex")).trim();
     if (!hostCodexHome)
       return [];
-    if (!existsSync6(hostCodexHome)) {
+    if (!existsSync7(hostCodexHome)) {
       try {
         mkdirSync(hostCodexHome, { recursive: true });
       } catch (err) {
@@ -5522,7 +5518,7 @@ ${result.stderr ?? ""}`.toLowerCase();
     return normalized.slice(0, maxLength);
   }
   async ensureFreshWorktreePath(worktreePath) {
-    if (!existsSync6(worktreePath))
+    if (!existsSync7(worktreePath))
       return;
     console.warn(`[DockerExecutor] Worktree path already exists; forcing cleanup before create: ${worktreePath}`);
     const unregister = Bun.spawn(["git", "worktree", "remove", "--force", "--force", worktreePath], {
@@ -5566,7 +5562,7 @@ ${result.stderr ?? ""}`.toLowerCase();
   async rebuildImageForMergeConflictJob(job, onLog) {
     const sandboxContext = resolveWorkerpalSandboxBuildContext(this.options.repo);
     const dockerfilePath = sandboxContext.dockerfilePath;
-    if (!existsSync6(dockerfilePath)) {
+    if (!existsSync7(dockerfilePath)) {
       throw new Error(`Merge-conflict job ${job.id} requires Docker image refresh, but Dockerfile is missing at ${dockerfilePath}.`);
     }
     const startMsg = `[DockerExecutor] Merge-conflict job ${job.id}: rebuilding ${this.options.imageName} with --no-cache and restarting warm runtime.`;
@@ -5708,7 +5704,7 @@ ${result.stderr ?? ""}`.toLowerCase();
   }
   async buildLocalImage(runtimeTag) {
     const sandboxContext = resolveWorkerpalSandboxBuildContext(this.options.repo);
-    if (!existsSync6(sandboxContext.dockerfilePath)) {
+    if (!existsSync7(sandboxContext.dockerfilePath)) {
       return false;
     }
     const dockerfileArg = dockerBuildFileArg(sandboxContext.root, sandboxContext.dockerfilePath);
@@ -5980,9 +5976,9 @@ async function resolveWorktreeBaseRef(repo, requestedRef) {
   return "HEAD";
 }
 async function createIsolatedWorktree(repo, jobId, baseRef) {
-  const worktreeRoot = resolve11(repo, ".worktrees");
+  const worktreeRoot = resolve10(repo, ".worktrees");
   mkdirSync2(worktreeRoot, { recursive: true });
-  const worktreePath = resolve11(worktreeRoot, `host-job-${jobId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
+  const worktreePath = resolve10(worktreeRoot, `host-job-${jobId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
   const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
   if (!addResult.ok) {
     throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
