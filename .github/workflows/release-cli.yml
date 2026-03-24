@@ -35,7 +35,9 @@ jobs:
   publish_npm:
     name: Publish @pushpalsdev/cli to npm
     runs-on: ubuntu-latest
-    needs: meta
+    needs:
+      - meta
+      - publish_release
     permissions:
       contents: read
       id-token: write
@@ -184,7 +186,6 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - meta
-      - publish_npm
       - build_binaries
       - build_runtime_binaries
     permissions:
