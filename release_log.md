@@ -2,18 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.26`
-- start_commit: `40a5e24a53d0ab08f9826e0e3cf12774d6efd104`
-- end_commit: `454f07ab8f5a0d502787724aa70b0fc07473e49b`
-- commits_in_range: `2`
+- version: `v1.0.27`
+- start_commit: `7afbb45dd3b6a95527483275236ce4d917866cfc`
+- end_commit: `7afbb45dd3b6a95527483275236ce4d917866cfc`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Reuse one stable embedded runtime binary directory per platform and track the active runtime version with a `.runtime-tag` marker instead of rotating executable paths on every release.
-- Clean up legacy per-tag runtime binary directories after successful refresh so stale executable trees do not accumulate across upgrades.
-- Add optional cross-platform release signing hooks: Authenticode for Windows artifacts, `codesign` for macOS artifacts, and detached GPG signatures for Linux release assets.
-- Migrate stale embedded runtime `configs/local.toml` autonomy overrides back to `remotebuddy.autonomy.enabled = true` so the autonomous engine stays enabled by default after CLI upgrades.
-- Add regression coverage for stable runtime binary layout reuse and embedded autonomy migration during CLI runtime preparation.
+- Fix the GitHub Actions release workflow so optional signing gates no longer reference `secrets.*` directly in `if:` expressions, which GitHub rejects during workflow parsing.
+- Move release signing inputs to job-level environment variables and gate Windows, macOS, and Linux signing steps through `env.*` checks instead.
+- Preserve the existing behavior where missing signing credentials simply skip signing while still allowing the release workflow to publish unsigned artifacts successfully.
 
 ## Install
 
@@ -44,5 +42,5 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.26 && git push origin v1.0.26`.
+- Tag and push: `git tag v1.0.27 && git push origin v1.0.27`.
 
