@@ -81,6 +81,13 @@ jobs:
   build_binaries:
     name: Build standalone CLI binaries
     needs: meta
+    env:
+      WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+      WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
+      MACOS_CODESIGN_CERT_P12_BASE64: ${{ secrets.MACOS_CODESIGN_CERT_P12_BASE64 }}
+      MACOS_CODESIGN_CERT_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERT_PASSWORD }}
+      MACOS_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CODESIGN_KEYCHAIN_PASSWORD }}
+      MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
     strategy:
       fail-fast: false
       matrix:
@@ -122,17 +129,15 @@ jobs:
           fi
 
       - name: Install Windows signing tool
-        if: matrix.target == 'bun-windows-x64' && secrets.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        if: matrix.target == 'bun-windows-x64' && env.WINDOWS_CODESIGN_PFX_BASE64 != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y osslsigncode
 
       - name: Sign Windows CLI binary
-        if: matrix.target == 'bun-windows-x64' && secrets.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        if: matrix.target == 'bun-windows-x64' && env.WINDOWS_CODESIGN_PFX_BASE64 != ''
         shell: bash
         env:
-          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
-          WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
           WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
         run: |
           set -euo pipefail
@@ -154,12 +159,8 @@ jobs:
           rm -f "$cert_path"
 
       - name: Import macOS signing certificate
-        if: startsWith(matrix.target, 'bun-darwin-') && secrets.MACOS_CODESIGN_CERT_P12_BASE64 != ''
+        if: startsWith(matrix.target, 'bun-darwin-') && env.MACOS_CODESIGN_CERT_P12_BASE64 != ''
         shell: bash
-        env:
-          MACOS_CODESIGN_CERT_P12_BASE64: ${{ secrets.MACOS_CODESIGN_CERT_P12_BASE64 }}
-          MACOS_CODESIGN_CERT_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERT_PASSWORD }}
-          MACOS_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CODESIGN_KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
           cert_path="$RUNNER_TEMP/pushpals-codesign-cert.p12"
@@ -186,10 +187,8 @@ jobs:
           security list-keychains -d user -s "$keychain_path"
 
       - name: Sign macOS CLI binary
-        if: startsWith(matrix.target, 'bun-darwin-') && secrets.MACOS_CODESIGN_CERT_P12_BASE64 != ''
+        if: startsWith(matrix.target, 'bun-darwin-') && env.MACOS_CODESIGN_CERT_P12_BASE64 != ''
         shell: bash
-        env:
-          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
         run: |
           set -euo pipefail
           output="dist/${{ matrix.output_name }}"
@@ -205,6 +204,13 @@ jobs:
   build_runtime_binaries:
     name: Build standalone runtime service binaries
     needs: meta
+    env:
+      WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+      WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
+      MACOS_CODESIGN_CERT_P12_BASE64: ${{ secrets.MACOS_CODESIGN_CERT_P12_BASE64 }}
+      MACOS_CODESIGN_CERT_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERT_PASSWORD }}
+      MACOS_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CODESIGN_KEYCHAIN_PASSWORD }}
+      MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
     strategy:
       fail-fast: false
       matrix:
@@ -259,17 +265,15 @@ jobs:
           fi
 
       - name: Install Windows signing tool
-        if: startsWith(matrix.platform_key, 'windows-') && secrets.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        if: startsWith(matrix.platform_key, 'windows-') && env.WINDOWS_CODESIGN_PFX_BASE64 != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y osslsigncode
 
       - name: Sign Windows runtime binaries
-        if: startsWith(matrix.platform_key, 'windows-') && secrets.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        if: startsWith(matrix.platform_key, 'windows-') && env.WINDOWS_CODESIGN_PFX_BASE64 != ''
         shell: bash
         env:
-          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
-          WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
           WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
         run: |
           set -euo pipefail
@@ -292,12 +296,8 @@ jobs:
           rm -f "$cert_path"
 
       - name: Import macOS signing certificate
-        if: startsWith(matrix.platform_key, 'macos-') && secrets.MACOS_CODESIGN_CERT_P12_BASE64 != ''
+        if: startsWith(matrix.platform_key, 'macos-') && env.MACOS_CODESIGN_CERT_P12_BASE64 != ''
         shell: bash
-        env:
-          MACOS_CODESIGN_CERT_P12_BASE64: ${{ secrets.MACOS_CODESIGN_CERT_P12_BASE64 }}
-          MACOS_CODESIGN_CERT_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERT_PASSWORD }}
-          MACOS_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CODESIGN_KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
           cert_path="$RUNNER_TEMP/pushpals-codesign-cert.p12"
@@ -324,10 +324,8 @@ jobs:
           security list-keychains -d user -s "$keychain_path"
 
       - name: Sign macOS runtime binaries
-        if: startsWith(matrix.platform_key, 'macos-') && secrets.MACOS_CODESIGN_CERT_P12_BASE64 != ''
+        if: startsWith(matrix.platform_key, 'macos-') && env.MACOS_CODESIGN_CERT_P12_BASE64 != ''
         shell: bash
-        env:
-          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
         run: |
           set -euo pipefail
           for output in dist/pushpals-runtime-*-${{ matrix.platform_key }}; do
@@ -348,6 +346,9 @@ jobs:
       - meta
       - build_binaries
       - build_runtime_binaries
+    env:
+      LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64: ${{ secrets.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 }}
+      LINUX_RELEASE_GPG_PASSPHRASE: ${{ secrets.LINUX_RELEASE_GPG_PASSPHRASE }}
     permissions:
       contents: write
     steps:
@@ -364,10 +365,8 @@ jobs:
           sha256sum pushpals-* > SHA256SUMS.txt
 
       - name: Import Linux release signing key
-        if: secrets.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 != ''
+        if: env.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 != ''
         shell: bash
-        env:
-          LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64: ${{ secrets.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 }}
         run: |
           set -euo pipefail
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
@@ -382,10 +381,8 @@ jobs:
           gpg --batch --import "$RUNNER_TEMP/pushpals-linux-release.key"
 
       - name: Sign Linux release artifacts
-        if: secrets.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 != ''
+        if: env.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 != ''
         shell: bash
-        env:
-          LINUX_RELEASE_GPG_PASSPHRASE: ${{ secrets.LINUX_RELEASE_GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
