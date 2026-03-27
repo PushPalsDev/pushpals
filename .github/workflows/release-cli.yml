@@ -87,13 +87,17 @@ jobs:
         include:
           - target: bun-linux-x64
             output_name: pushpals-linux-x64
+            runs_on: ubuntu-latest
           - target: bun-windows-x64
             output_name: pushpals-windows-x64.exe
+            runs_on: ubuntu-latest
           - target: bun-darwin-x64
             output_name: pushpals-macos-x64
+            runs_on: macos-14
           - target: bun-darwin-arm64
             output_name: pushpals-macos-arm64
-    runs-on: ubuntu-latest
+            runs_on: macos-14
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -117,6 +121,81 @@ jobs:
             chmod +x "$output"
           fi
 
+      - name: Install Windows signing tool
+        if: matrix.target == 'bun-windows-x64' && secrets.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osslsigncode
+
+      - name: Sign Windows CLI binary
+        if: matrix.target == 'bun-windows-x64' && secrets.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        shell: bash
+        env:
+          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+          WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
+          WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
+        run: |
+          set -euo pipefail
+          cert_path="$(mktemp)"
+          printf '%s' "$WINDOWS_CODESIGN_PFX_BASE64" | base64 -d > "$cert_path"
+          output="dist/${{ matrix.output_name }}"
+          signed_output="${output}.signed"
+          timestamp_url="${WINDOWS_CODESIGN_TIMESTAMP_URL:-http://timestamp.digicert.com}"
+          osslsigncode sign \
+            -pkcs12 "$cert_path" \
+            -pass "$WINDOWS_CODESIGN_PFX_PASSWORD" \
+            -h sha256 \
+            -n "PushPals CLI" \
+            -i "https://github.com/PushPalsDev/pushpals" \
+            -ts "$timestamp_url" \
+            -in "$output" \
+            -out "$signed_output"
+          mv "$signed_output" "$output"
+          rm -f "$cert_path"
+
+      - name: Import macOS signing certificate
+        if: startsWith(matrix.target, 'bun-darwin-') && secrets.MACOS_CODESIGN_CERT_P12_BASE64 != ''
+        shell: bash
+        env:
+          MACOS_CODESIGN_CERT_P12_BASE64: ${{ secrets.MACOS_CODESIGN_CERT_P12_BASE64 }}
+          MACOS_CODESIGN_CERT_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERT_PASSWORD }}
+          MACOS_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CODESIGN_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cert_path="$RUNNER_TEMP/pushpals-codesign-cert.p12"
+          keychain_path="$RUNNER_TEMP/pushpals-signing.keychain-db"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          pathlib.Path(os.environ["RUNNER_TEMP"], "pushpals-codesign-cert.p12").write_bytes(
+              base64.b64decode(os.environ["MACOS_CODESIGN_CERT_P12_BASE64"])
+          )
+          PY
+          security create-keychain -p "$MACOS_CODESIGN_KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$MACOS_CODESIGN_KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$cert_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_CODESIGN_CERT_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$MACOS_CODESIGN_KEYCHAIN_PASSWORD" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+
+      - name: Sign macOS CLI binary
+        if: startsWith(matrix.target, 'bun-darwin-') && secrets.MACOS_CODESIGN_CERT_P12_BASE64 != ''
+        shell: bash
+        env:
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          output="dist/${{ matrix.output_name }}"
+          codesign --force --sign "$MACOS_CODESIGN_IDENTITY" --timestamp --options runtime "$output"
+          codesign --verify --verbose "$output"
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
@@ -132,13 +211,17 @@ jobs:
         include:
           - target: bun-linux-x64
             platform_key: linux-x64
+            runs_on: ubuntu-latest
           - target: bun-windows-x64
             platform_key: windows-x64
+            runs_on: ubuntu-latest
           - target: bun-darwin-x64
             platform_key: macos-x64
+            runs_on: macos-14
           - target: bun-darwin-arm64
             platform_key: macos-arm64
-    runs-on: ubuntu-latest
+            runs_on: macos-14
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -175,6 +258,83 @@ jobs:
             chmod +x dist/pushpals-runtime-*-${{ matrix.platform_key }}
           fi
 
+      - name: Install Windows signing tool
+        if: startsWith(matrix.platform_key, 'windows-') && secrets.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osslsigncode
+
+      - name: Sign Windows runtime binaries
+        if: startsWith(matrix.platform_key, 'windows-') && secrets.WINDOWS_CODESIGN_PFX_BASE64 != ''
+        shell: bash
+        env:
+          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+          WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
+          WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
+        run: |
+          set -euo pipefail
+          cert_path="$(mktemp)"
+          printf '%s' "$WINDOWS_CODESIGN_PFX_BASE64" | base64 -d > "$cert_path"
+          timestamp_url="${WINDOWS_CODESIGN_TIMESTAMP_URL:-http://timestamp.digicert.com}"
+          for output in dist/pushpals-runtime-*-${{ matrix.platform_key }}.exe; do
+            signed_output="${output}.signed"
+            osslsigncode sign \
+              -pkcs12 "$cert_path" \
+              -pass "$WINDOWS_CODESIGN_PFX_PASSWORD" \
+              -h sha256 \
+              -n "PushPals Runtime" \
+              -i "https://github.com/PushPalsDev/pushpals" \
+              -ts "$timestamp_url" \
+              -in "$output" \
+              -out "$signed_output"
+            mv "$signed_output" "$output"
+          done
+          rm -f "$cert_path"
+
+      - name: Import macOS signing certificate
+        if: startsWith(matrix.platform_key, 'macos-') && secrets.MACOS_CODESIGN_CERT_P12_BASE64 != ''
+        shell: bash
+        env:
+          MACOS_CODESIGN_CERT_P12_BASE64: ${{ secrets.MACOS_CODESIGN_CERT_P12_BASE64 }}
+          MACOS_CODESIGN_CERT_PASSWORD: ${{ secrets.MACOS_CODESIGN_CERT_PASSWORD }}
+          MACOS_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CODESIGN_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cert_path="$RUNNER_TEMP/pushpals-codesign-cert.p12"
+          keychain_path="$RUNNER_TEMP/pushpals-signing.keychain-db"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          pathlib.Path(os.environ["RUNNER_TEMP"], "pushpals-codesign-cert.p12").write_bytes(
+              base64.b64decode(os.environ["MACOS_CODESIGN_CERT_P12_BASE64"])
+          )
+          PY
+          security create-keychain -p "$MACOS_CODESIGN_KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$MACOS_CODESIGN_KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$cert_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_CODESIGN_CERT_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$MACOS_CODESIGN_KEYCHAIN_PASSWORD" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+
+      - name: Sign macOS runtime binaries
+        if: startsWith(matrix.platform_key, 'macos-') && secrets.MACOS_CODESIGN_CERT_P12_BASE64 != ''
+        shell: bash
+        env:
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          for output in dist/pushpals-runtime-*-${{ matrix.platform_key }}; do
+            codesign --force --sign "$MACOS_CODESIGN_IDENTITY" --timestamp --options runtime "$output"
+            codesign --verify --verbose "$output"
+          done
+
       - name: Upload runtime artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -203,6 +363,41 @@ jobs:
           cd dist
           sha256sum pushpals-* > SHA256SUMS.txt
 
+      - name: Import Linux release signing key
+        if: secrets.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 != ''
+        shell: bash
+        env:
+          LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64: ${{ secrets.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          pathlib.Path(os.environ["RUNNER_TEMP"], "pushpals-linux-release.key").write_bytes(
+              base64.b64decode(os.environ["LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64"])
+          )
+          PY
+          gpg --batch --import "$RUNNER_TEMP/pushpals-linux-release.key"
+
+      - name: Sign Linux release artifacts
+        if: secrets.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 != ''
+        shell: bash
+        env:
+          LINUX_RELEASE_GPG_PASSPHRASE: ${{ secrets.LINUX_RELEASE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          shopt -s nullglob
+          for artifact in dist/*linux* dist/SHA256SUMS.txt; do
+            if [[ -f "$artifact" ]]; then
+              gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$LINUX_RELEASE_GPG_PASSPHRASE" \
+                --armor --detach-sign "$artifact"
+            fi
+          done
+
       - name: Resolve release log file
         id: release_log
         shell: bash
@@ -230,6 +425,7 @@ jobs:
           files: |
             dist/pushpals-*
             dist/SHA256SUMS.txt
+            dist/*.asc
 
       - name: Create GitHub release (default body)
         if: steps.release_log.outputs.found != 'true'
@@ -251,3 +447,4 @@ jobs:
           files: |
             dist/pushpals-*
             dist/SHA256SUMS.txt
+            dist/*.asc

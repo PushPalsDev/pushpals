@@ -900,7 +900,7 @@ enabled = true
       const repoRoot = join(root, "repo");
       const runtimeRoot = join(root, "runtime");
       const platformKey = currentRuntimePlatformKey();
-      const binDir = join(runtimeRoot, "bin", `vtest-local-${platformKey}`);
+      const binDir = join(runtimeRoot, "bin", platformKey);
       const extension = platformKey.startsWith("windows-") ? ".exe" : "";
       let mockServer: ReturnType<typeof Bun.serve> | null = null;
 
@@ -950,6 +950,7 @@ enabled = true
         mkdirSync(join(runtimeRoot, "prompts"), { recursive: true });
         mkdirSync(join(runtimeRoot, "protocol", "schemas"), { recursive: true });
         mkdirSync(binDir, { recursive: true });
+        writeFileSync(join(binDir, ".runtime-tag"), "vtest-local\n", "utf8");
         writeFileSync(join(runtimeRoot, ".env"), "PUSHPALS_PROFILE=dev\n", "utf8");
         writeFileSync(join(runtimeRoot, ".env.example"), "PUSHPALS_PROFILE=dev\n", "utf8");
         writeFileSync(join(runtimeRoot, "configs", "local.toml"), "# local overrides\n", "utf8");

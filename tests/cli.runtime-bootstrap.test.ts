@@ -15,6 +15,7 @@ import {
   bundledMonitoringHubNeedsRefresh,
   buildServiceStopCommand,
   downloadRuntimeAssetsFromSourceTag,
+  ensureRuntimeBinaries,
   ensureWorkerpalDockerImageReady,
   extractRemoteBuddyAutonomousEngineState,
   extractRemoteBuddySessionConsumerHealth,
@@ -1016,6 +1017,45 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         "{}\n",
       );
       expect(fetchedUrls.some((url) => url.endsWith("/bun.lockb"))).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("ensureRuntimeBinaries reuses a stable platform install directory and records the active tag", async () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-bin-layout-"));
+    const platformKey =
+      process.platform === "win32"
+        ? "windows-x64"
+        : process.platform === "darwin"
+          ? process.arch === "arm64"
+            ? "macos-arm64"
+            : "macos-x64"
+          : "linux-x64";
+    const extension = platformKey.startsWith("windows-") ? ".exe" : "";
+    const legacyDir = join(runtimeRoot, "bin", `v0.9.0-${platformKey}`);
+    const stableDir = join(runtimeRoot, "bin", platformKey);
+    const originalFetch = globalThis.fetch;
+    const requestedAssets: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedAssets.push(url);
+      return new Response(new Uint8Array([0x50, 0x4b]));
+    }) as typeof fetch;
+
+    try {
+      mkdirSync(legacyDir, { recursive: true });
+      writeFileSync(join(legacyDir, "stale.txt"), "legacy\n", "utf8");
+
+      const binaries = await ensureRuntimeBinaries(runtimeRoot, "v1.2.3");
+
+      expect(binaries.server).toBe(join(stableDir, `pushpals-runtime-server-${platformKey}${extension}`));
+      expect(readFileSync(join(stableDir, ".runtime-tag"), "utf8")).toBe("v1.2.3\n");
+      expect(existsSync(legacyDir)).toBe(false);
+      expect(requestedAssets).toHaveLength(5);
+      expect(existsSync(binaries.server)).toBe(true);
+      expect(existsSync(binaries.workerpals)).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
       rmSync(runtimeRoot, { recursive: true, force: true });

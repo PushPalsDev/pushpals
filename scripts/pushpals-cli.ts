@@ -137,6 +137,12 @@ type RuntimeBinarySet = {
   sourceControlManager: string;
 };
 
+type RuntimeBinaryInstallState = {
+  binDir: string;
+  tagMarkerPath: string;
+  installedTag: string;
+};
+
 type RuntimeAssetSource = {
   root: string;
   envExamplePath: string;
@@ -1104,6 +1110,44 @@ function runtimeBinaryFilename(serviceName: RuntimeBinaryName, platformKey: stri
   return `pushpals-runtime-${serviceToken}-${platformKey}${extension}`;
 }
 
+function resolveRuntimeBinaryInstallState(
+  runtimeRoot: string,
+  platformKey: string,
+): RuntimeBinaryInstallState {
+  const binDir = join(runtimeRoot, "bin", platformKey);
+  const tagMarkerPath = join(binDir, ".runtime-tag");
+  const installedTag = existsSync(tagMarkerPath)
+    ? readFileSync(tagMarkerPath, "utf8").trim()
+    : "";
+  return { binDir, tagMarkerPath, installedTag };
+}
+
+function cleanupLegacyRuntimeBinaryLayouts(
+  runtimeRoot: string,
+  platformKey: string,
+  activeBinDir: string,
+): void {
+  const legacyRoot = join(runtimeRoot, "bin");
+  if (!existsSync(legacyRoot)) return;
+  let entries: ReturnType<typeof readdirSync>;
+  try {
+    entries = readdirSync(legacyRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidateDir = join(legacyRoot, entry.name);
+    if (candidateDir === activeBinDir) continue;
+    if (!entry.name.endsWith(`-${platformKey}`)) continue;
+    try {
+      rmSync(candidateDir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup of the legacy per-tag install layout
+    }
+  }
+}
+
 export function buildEmbeddedRuntimeEnv(
   baseEnv: Record<string, string | undefined>,
   opts: {
@@ -1303,7 +1347,7 @@ async function downloadBinaryAsset(tag: string, assetName: string, outPath: stri
   await Bun.write(outPath, bytes);
 }
 
-async function ensureRuntimeBinaries(
+export async function ensureRuntimeBinaries(
   runtimeRoot: string,
   runtimeTag: string,
 ): Promise<RuntimeBinarySet> {
@@ -1311,7 +1355,8 @@ async function ensureRuntimeBinaries(
   console.log(
     `[pushpals] Preparing embedded runtime binaries for ${runtimeTag} (${platformKey})...`,
   );
-  const binDir = join(runtimeRoot, "bin", `${runtimeTag}-${platformKey}`);
+  const installState = resolveRuntimeBinaryInstallState(runtimeRoot, platformKey);
+  const { binDir, tagMarkerPath, installedTag } = installState;
   mkdirSync(binDir, { recursive: true });
 
   const runtimeBinaries: RuntimeBinarySet = {
@@ -1332,13 +1377,17 @@ async function ensureRuntimeBinaries(
     runtimeBinaries.workerpals,
     runtimeBinaries.sourceControlManager,
   ];
+  const shouldRefreshAll = installedTag !== runtimeTag;
   let downloadedCount = 0;
   for (const binaryPath of requiredAssets) {
-    if (existsSync(binaryPath)) continue;
+    if (!shouldRefreshAll && existsSync(binaryPath)) continue;
     const assetName = binaryPath.split(/[\\/]/).pop() || "";
     await downloadBinaryAsset(runtimeTag, assetName, binaryPath);
     downloadedCount++;
   }
+
+  writeFileSync(tagMarkerPath, `${runtimeTag}\n`, "utf8");
+  cleanupLegacyRuntimeBinaryLayouts(runtimeRoot, platformKey, binDir);
 
   if (process.platform !== "win32") {
     for (const binaryPath of requiredAssets) {
