@@ -2,17 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.25`
-- start_commit: `ed7666d4445534207a92200f7b357abba79035a5`
-- end_commit: `eca182889064478cad33b0f865574248295631ec`
-- commits_in_range: `1`
+- version: `v1.0.26`
+- start_commit: `40a5e24a53d0ab08f9826e0e3cf12774d6efd104`
+- end_commit: `454f07ab8f5a0d502787724aa70b0fc07473e49b`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Harden RemoteBuddy WorkerPal lifecycle cleanup so failed or unready workers do not accumulate after startup failures, Codex recycle paths, or CLI shutdown.
-- Clean lingering WorkerPal warm Docker containers for the active repo during CLI startup preflight and embedded-runtime shutdown.
-- Add an explicit `REMOTEBUDDY_MAX_WORKERPALS` override and reduce default WorkerPal concurrency plus warm-container CPU and memory limits to avoid workstation lockups.
-- Add regression coverage for lingering warm-container cleanup and synchronous worker spawn failures.
+- Reuse one stable embedded runtime binary directory per platform and track the active runtime version with a `.runtime-tag` marker instead of rotating executable paths on every release.
+- Clean up legacy per-tag runtime binary directories after successful refresh so stale executable trees do not accumulate across upgrades.
+- Add optional cross-platform release signing hooks: Authenticode for Windows artifacts, `codesign` for macOS artifacts, and detached GPG signatures for Linux release assets.
+- Migrate stale embedded runtime `configs/local.toml` autonomy overrides back to `remotebuddy.autonomy.enabled = true` so the autonomous engine stays enabled by default after CLI upgrades.
+- Add regression coverage for stable runtime binary layout reuse and embedded autonomy migration during CLI runtime preparation.
 
 ## Install
 
@@ -43,5 +44,5 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.25 && git push origin v1.0.25`.
+- Tag and push: `git tag v1.0.26 && git push origin v1.0.26`.
 
