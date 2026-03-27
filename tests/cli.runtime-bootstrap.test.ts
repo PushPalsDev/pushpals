@@ -874,6 +874,35 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     });
   });
 
+  test("prepareCliRuntime migrates stale embedded local autonomy overrides back to the default-on state", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-autonomy-migrate-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "configs", "local.toml"),
+        ['[remotebuddy.autonomy]', 'enabled = false', 'llm_timeout_ms = 60000', ""].join("\n"),
+        "utf8",
+      );
+
+      const prepared = await prepareCliRuntime({
+        repoRoot,
+        runtimeRoot,
+      });
+
+      expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+      expect(prepared.runtimePreflight.config?.remotebuddy.autonomy.enabled).toBe(true);
+      expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8")).toContain(
+        "enabled = true",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("cleanupLingeringWorkerpalWarmContainers no-ops when no warm containers are present", async () => {
     const calls: Array<{ command: string[]; cwd: string }> = [];
     const result = await cleanupLingeringWorkerpalWarmContainers({

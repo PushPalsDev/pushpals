@@ -875,6 +875,23 @@ function writeTextFileIfMissing(pathValue: string, text: string): void {
   writeFileSync(pathValue, text, "utf8");
 }
 
+function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
+  if (!existsSync(localTomlPath)) return;
+  let original: string;
+  try {
+    original = readFileSync(localTomlPath, "utf8");
+  } catch {
+    return;
+  }
+  const updated = original.replace(
+    /^(\[remotebuddy\.autonomy\]\r?\n)(enabled\s*=\s*false\s*\r?\n)/m,
+    "$1enabled = true\n",
+  );
+  if (updated !== original) {
+    writeFileSync(localTomlPath, updated, "utf8");
+  }
+}
+
 function copyRuntimeAssetBundle(
   source: RuntimeAssetSource,
   runtimeRoot: string,
@@ -918,17 +935,13 @@ function seedRuntimePreflightAssets(runtimeRoot: string): void {
   copyBundledRuntimeAssets(runtimeRoot, false);
   writeTextFileIfMissing(join(runtimeRoot, ".env"), "# Local PushPals runtime environment\n");
   const localExamplePath = join(runtimeRoot, "configs", "local.example.toml");
+  const localTomlPath = join(runtimeRoot, "configs", "local.toml");
   if (existsSync(localExamplePath)) {
-    writeTextFileIfMissing(
-      join(runtimeRoot, "configs", "local.toml"),
-      readFileSync(localExamplePath, "utf8"),
-    );
+    writeTextFileIfMissing(localTomlPath, readFileSync(localExamplePath, "utf8"));
   } else {
-    writeTextFileIfMissing(
-      join(runtimeRoot, "configs", "local.toml"),
-      "# Local PushPals runtime overrides\n",
-    );
+    writeTextFileIfMissing(localTomlPath, "# Local PushPals runtime overrides\n");
   }
+  migrateEmbeddedRuntimeLocalToml(localTomlPath);
 }
 
 async function fetchTextFromUrl(url: string, timeoutMs = 20_000): Promise<string> {
@@ -1043,17 +1056,13 @@ async function ensureRuntimeAssets(runtimeRoot: string, runtimeTag: string): Pro
 
   writeTextFileIfMissing(join(runtimeRoot, ".env"), "# Local PushPals runtime environment\n");
   const localExamplePath = join(runtimeRoot, "configs", "local.example.toml");
+  const localTomlPath = join(runtimeRoot, "configs", "local.toml");
   if (existsSync(localExamplePath)) {
-    writeTextFileIfMissing(
-      join(runtimeRoot, "configs", "local.toml"),
-      readFileSync(localExamplePath, "utf8"),
-    );
+    writeTextFileIfMissing(localTomlPath, readFileSync(localExamplePath, "utf8"));
   } else {
-    writeTextFileIfMissing(
-      join(runtimeRoot, "configs", "local.toml"),
-      "# Local PushPals runtime overrides\n",
-    );
+    writeTextFileIfMissing(localTomlPath, "# Local PushPals runtime overrides\n");
   }
+  migrateEmbeddedRuntimeLocalToml(localTomlPath);
   console.log("[pushpals] Embedded runtime assets are ready.");
 }
 
