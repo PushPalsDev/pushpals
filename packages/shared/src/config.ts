@@ -1508,7 +1508,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         asBoolean(remoteNode.auto_spawn_workerpals, true),
       maxWorkerpals: Math.max(
         1,
-        asInt(remoteNode.max_workerpals, 20),
+        asInt(
+          parseIntEnv("REMOTEBUDDY_MAX_WORKERPALS") ?? remoteNode.max_workerpals,
+          20,
+        ),
       ),
       workerpalStartupTimeoutMs: Math.max(
         1_000,

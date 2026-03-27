@@ -1821,6 +1821,7 @@ async function resolveWorkerpalDockerProbe(
 
 const WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL = "pushpals.runtime_tag";
 const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox";
+const WORKERPAL_WARM_COMPONENT_LABEL = "pushpals.component=workerpals-warm";
 
 function resolveConfiguredDockerExecutable(
   env: Record<string, string | undefined>,
@@ -1832,6 +1833,71 @@ function resolveConfiguredDockerExecutable(
       (platform === "win32" ? "docker.exe" : "docker"),
   ).trim();
   return configured || (platform === "win32" ? "docker.exe" : "docker");
+}
+
+export async function cleanupLingeringWorkerpalWarmContainers(opts: {
+  repoRoot: string;
+  env: Record<string, string>;
+  platform?: NodeJS.Platform;
+  runCommandWithEnvFn?: typeof runCommandWithEnv;
+}): Promise<{ ok: boolean; detail: string; removed: number }> {
+  const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
+  const dockerExecutable = resolveConfiguredDockerExecutable(
+    opts.env,
+    opts.platform ?? process.platform,
+  );
+  const list = await runCommandWithEnvFn(
+    [
+      dockerExecutable,
+      "ps",
+      "-aq",
+      "--filter",
+      `label=${WORKERPAL_WARM_COMPONENT_LABEL}`,
+      "--filter",
+      `label=pushpals.repo=${opts.repoRoot}`,
+    ],
+    opts.repoRoot,
+    opts.env,
+  );
+  if (!list.ok) {
+    const detail = list.stderr || list.stdout || `exit ${list.exitCode}`;
+    return {
+      ok: false,
+      detail: `failed to inspect lingering WorkerPal warm containers: ${detail}`,
+      removed: 0,
+    };
+  }
+
+  const containerIds = list.stdout
+    .split(/\s+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (containerIds.length === 0) {
+    return {
+      ok: true,
+      detail: "no lingering WorkerPal warm containers found",
+      removed: 0,
+    };
+  }
+
+  const remove = await runCommandWithEnvFn(
+    [dockerExecutable, "rm", "-f", ...containerIds],
+    opts.repoRoot,
+    opts.env,
+  );
+  if (!remove.ok) {
+    const detail = remove.stderr || remove.stdout || `exit ${remove.exitCode}`;
+    return {
+      ok: false,
+      detail: `failed to remove lingering WorkerPal warm containers: ${detail}`,
+      removed: 0,
+    };
+  }
+  return {
+    ok: true,
+    detail: `removed ${containerIds.length} lingering WorkerPal warm container(s)`,
+    removed: containerIds.length,
+  };
 }
 
 async function inspectDockerImageRuntimeTag(
@@ -3936,6 +4002,27 @@ async function main(): Promise<void> {
   let autoStartedServices: RuntimeServiceProcess[] = [];
   let pushpalsLogPath: string | undefined;
   let resolvedRuntimeTagForAutoStart = preparedRuntime.runtimeTag || parsed.runtimeTag || "";
+  const cleanupWorkerpalWarmContainersIfNeeded = async (phase: string): Promise<void> => {
+    if (workerpalDockerPrecheck.status === "failed") return;
+    if (
+      !config.remotebuddy.autoSpawnWorkerpals ||
+      !config.remotebuddy.workerpalDocker ||
+      !config.remotebuddy.workerpalRequireDocker
+    ) {
+      return;
+    }
+    const cleanup = await cleanupLingeringWorkerpalWarmContainers({
+      repoRoot,
+      env: workerpalDockerPrecheck.env,
+    });
+    if (!cleanup.ok) {
+      console.warn(`[pushpals] WorkerPal warm-container cleanup warning (${phase}): ${cleanup.detail}`);
+      return;
+    }
+    if (cleanup.removed > 0) {
+      console.log(`[pushpals] ${cleanup.detail} (${phase}).`);
+    }
+  };
   const stopAutoStartedServices = (): void => {
     if (autoStartedServices.length === 0) return;
     stopRuntimeServices(autoStartedServices);
@@ -3957,6 +4044,7 @@ async function main(): Promise<void> {
       console.warn(`[pushpals] ${shutdown.detail}`);
     }
     await stopRuntimeServicesGracefully(services);
+    await cleanupWorkerpalWarmContainersIfNeeded("cli shutdown");
   };
 
   let serverHealthy = await probeServer(serverUrl);
@@ -3990,6 +4078,7 @@ async function main(): Promise<void> {
     detail: `No connected RemoteBuddy session consumer found for session ${sessionId}`,
   };
   if (!serverHealthy) {
+    await cleanupWorkerpalWarmContainersIfNeeded("startup preflight");
     if (!parsed.noAutoStart) {
       try {
         const startedRuntime = await autoStartRuntimeServices({

@@ -350,7 +350,43 @@ describe("RemoteBuddy session routing", () => {
         ),
       ).toBe(false);
     } finally {
-      orchestrator.dispose();
+      await orchestrator.dispose();
+    }
+  }, 20_000);
+
+  test("spawnWorker clears in-flight state when Bun.spawn throws synchronously", async () => {
+    const root = makeTempDir();
+    mkdirSync(join(root, "outputs", "data"), { recursive: true });
+    const idempotency = new IdempotencyStore(join(root, "outputs", "data", "remotebuddy-sync-throw.db"));
+    openStores.push(idempotency);
+    const orchestrator = new RemoteBuddyOrchestrator({
+      server: "http://127.0.0.1:3001",
+      sessionId: "dev",
+      authToken: null,
+      brain: {
+        think: async () => createDirectReplyPlan("unused"),
+      } as any,
+      llm: {} as any,
+      idempotency,
+      persistentMemory: new NoopSessionMemory(),
+      jobsDbPath: join(root, "outputs", "data", "pushpals.db"),
+    });
+
+    const originalSpawn = Bun.spawn;
+    (Bun as any).spawn = () => {
+      throw new Error("synthetic spawn failure");
+    };
+
+    try {
+      const result = await (orchestrator as any).spawnWorker();
+      expect(result).toBeNull();
+      expect((orchestrator as any).workerSpawnInFlight).toBeNull();
+      expect(String((orchestrator as any).workerpalsUnavailableReason ?? "")).toContain(
+        "synthetic spawn failure",
+      );
+    } finally {
+      (Bun as any).spawn = originalSpawn;
+      await orchestrator.dispose();
     }
   }, 20_000);
 });

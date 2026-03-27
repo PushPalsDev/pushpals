@@ -7,6 +7,7 @@ import {
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
+  cleanupLingeringWorkerpalWarmContainers,
   buildEmbeddedRuntimeEnv,
   copyTrackedRepoPath,
   buildWorkerpalSandboxPaths,
@@ -870,6 +871,83 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       detail: "repo is using source-checkout runtime assets",
       runtimeTag: "",
     });
+  });
+
+  test("cleanupLingeringWorkerpalWarmContainers no-ops when no warm containers are present", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    const result = await cleanupLingeringWorkerpalWarmContainers({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "no lingering WorkerPal warm containers found",
+      removed: 0,
+    });
+    expect(calls).toEqual([
+      {
+        command: [
+          "docker",
+          "ps",
+          "-aq",
+          "--filter",
+          "label=pushpals.component=workerpals-warm",
+          "--filter",
+          "label=pushpals.repo=/repo/example",
+        ],
+        cwd: "/repo/example",
+      },
+    ]);
+  });
+
+  test("cleanupLingeringWorkerpalWarmContainers removes matching warm containers", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    let phase = 0;
+    const result = await cleanupLingeringWorkerpalWarmContainers({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        phase += 1;
+        if (phase === 1) {
+          return { ok: true, stdout: "abc123\ndef456\n", stderr: "", exitCode: 0 };
+        }
+        return { ok: true, stdout: "abc123\ndef456\n", stderr: "", exitCode: 0 };
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "removed 2 lingering WorkerPal warm container(s)",
+      removed: 2,
+    });
+    expect(calls).toEqual([
+      {
+        command: [
+          "docker",
+          "ps",
+          "-aq",
+          "--filter",
+          "label=pushpals.component=workerpals-warm",
+          "--filter",
+          "label=pushpals.repo=/repo/example",
+        ],
+        cwd: "/repo/example",
+      },
+      {
+        command: ["docker", "rm", "-f", "abc123", "def456"],
+        cwd: "/repo/example",
+      },
+    ]);
   });
 
   test("downloadRuntimeAssetsFromSourceTag skips bun.lockb and populates sandbox assets", async () => {
