@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PlannerOutput } from "../apps/remotebuddy/src/brain";
@@ -30,7 +30,7 @@ afterEach(async () => {
     const dir = tempDirs.pop();
     if (!dir) continue;
     let lastError: unknown;
-    for (let attempt = 1; attempt <= 10; attempt++) {
+    for (let attempt = 1; attempt <= 20; attempt++) {
       try {
         rmSync(dir, { recursive: true, force: true });
         lastError = null;
@@ -40,7 +40,7 @@ afterEach(async () => {
         await Bun.sleep(50 * attempt);
       }
     }
-    if (lastError) throw lastError;
+    if (lastError && existsSync(dir)) throw lastError;
   }
 });
 
@@ -104,6 +104,14 @@ function createUserTaskParams(targetPaths: string[]): TaskExecuteJobParams {
   };
 }
 
+function createAutonomyTaskParams(targetPaths: string[]): TaskExecuteJobParams {
+  return {
+    ...createUserTaskParams(targetPaths),
+    origin: "autonomy",
+    autonomy: { origin: "autonomy" },
+  };
+}
+
 function createOrchestrator(root: string): RemoteBuddyOrchestrator {
   mkdirSync(join(root, "outputs", "data"), { recursive: true });
   const idempotency = new IdempotencyStore(join(root, "outputs", "data", "remotebuddy-dedupe.db"));
@@ -136,7 +144,7 @@ describe("RemoteBuddy task.execute dedupe", () => {
     );
   });
 
-  test("buildTaskExecuteDedupeKey skips broad or non-user tasks", () => {
+  test("buildTaskExecuteDedupeKey skips only broad tasks and keeps origin-specific keys", () => {
     const broad = createUserTaskParams([
       "a.ts",
       "b.ts",
@@ -144,14 +152,14 @@ describe("RemoteBuddy task.execute dedupe", () => {
       "d.ts",
       "e.ts",
     ]);
-    const autonomy: TaskExecuteJobParams = {
-      ...createUserTaskParams(["components/__tests__/AnimatedSelectionRing.test.ts"]),
-      origin: "autonomy",
-      autonomy: { origin: "autonomy" },
-    };
+    const autonomy = createAutonomyTaskParams([
+      "components/__tests__/AnimatedSelectionRing.test.ts",
+    ]);
 
     expect(buildTaskExecuteDedupeKey("dev", broad)).toBeNull();
-    expect(buildTaskExecuteDedupeKey("dev", autonomy)).toBeNull();
+    expect(buildTaskExecuteDedupeKey("dev", autonomy)).toBe(
+      "task.execute:autonomy:dev:components/__tests__/animatedselectionring.test.ts",
+    );
   });
 
   test("processRequest reuses the existing task when enqueue dedupes same-file work", async () => {
@@ -229,6 +237,101 @@ describe("RemoteBuddy task.execute dedupe", () => {
     expect(assistantMessages.some((message) => message.includes("Reusing that task"))).toBe(true);
     expect(requestCompletions).toHaveLength(2);
   });
+
+  test(
+    "processRequest reuses the existing task for same-file autonomy work",
+    async () => {
+      const root = makeTempDir();
+      const orchestrator = createOrchestrator(root);
+      const commands: Array<{ type: string; payload: Record<string, unknown> }> = [];
+      let firstTaskId = "";
+      let enqueueCount = 0;
+
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/requests/auto-1/complete") || url.endsWith("/requests/auto-2/complete")) {
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        throw new Error(`Unexpected fetch in test: ${url}`);
+      }) as typeof fetch;
+
+      (orchestrator as any).ensureSessionWithRetry = async () => {};
+      (orchestrator as any).ensureSessionEventMonitor = () => {};
+      (orchestrator as any).getRecentJobContext = () => [];
+      (orchestrator as any).selectTargetWorkerForJob = async () => "workerpal-1";
+      (orchestrator as any).sendCommand = async (
+        _sessionId: string,
+        command: { type: string; payload: Record<string, unknown> },
+      ) => {
+        commands.push(command);
+      };
+      (orchestrator as any).assistantMessage = async () => {};
+      (orchestrator as any).enqueueJob = async (taskId: string) => {
+        enqueueCount += 1;
+        if (enqueueCount === 1) {
+          firstTaskId = taskId;
+          return { jobId: "job-auto-1", taskId, deduped: false };
+        }
+        return { jobId: "job-auto-1", taskId: firstTaskId, deduped: true };
+      };
+
+      try {
+        await (orchestrator as any).processRequest({
+          id: "auto-1",
+          sessionId: "dev",
+          prompt:
+            "Update scripts/fix-baseline-browser-mapping.js to centralize baseline browser metadata",
+          priority: "background",
+          metadata: {
+            origin: "autonomy",
+            autonomy: {
+              objectiveId: "obj-1",
+              runId: "run-1",
+              snapshotId: "snap-1",
+              patternKey: "pk-1",
+              componentArea: "scripts",
+              targetPaths: ["scripts/fix-baseline-browser-mapping.js"],
+              writeGlobs: ["scripts/fix-baseline-browser-mapping.js"],
+            },
+          },
+          forceWorker: true,
+          forceLane: "worker",
+        });
+        await (orchestrator as any).processRequest({
+          id: "auto-2",
+          sessionId: "dev",
+          prompt:
+            "Extend scripts/fix-baseline-browser-mapping.js with capability planner guardrails",
+          priority: "background",
+          metadata: {
+            origin: "autonomy",
+            autonomy: {
+              objectiveId: "obj-2",
+              runId: "run-2",
+              snapshotId: "snap-2",
+              patternKey: "pk-2",
+              componentArea: "scripts",
+              targetPaths: ["scripts/fix-baseline-browser-mapping.js"],
+              writeGlobs: ["scripts/fix-baseline-browser-mapping.js"],
+            },
+          },
+          forceWorker: true,
+          forceLane: "worker",
+        });
+      } finally {
+        await orchestrator.dispose();
+      }
+
+      expect(commands.filter((command) => command.type === "task_created")).toHaveLength(1);
+      expect(commands.filter((command) => command.type === "task_started")).toHaveLength(1);
+      expect(commands.filter((command) => command.type === "job_enqueued")).toHaveLength(1);
+      const taskProgress = commands.filter((command) => command.type === "task_progress");
+      expect(taskProgress).toHaveLength(2);
+      expect(String(taskProgress[1]?.payload.taskId ?? "")).toBe(firstTaskId);
+      expect(String(taskProgress[1]?.payload.message ?? "")).toContain("Reused active WorkerPal task");
+    },
+    15000,
+  );
 
   test("processRequest does not create an orphan task when enqueue fails", async () => {
     const root = makeTempDir();

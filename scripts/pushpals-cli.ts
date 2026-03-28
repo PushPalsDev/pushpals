@@ -73,6 +73,10 @@ type SessionStreamPayload = {
   cursor?: number;
 };
 
+type SessionEventReplayFilter = {
+  shouldRender: (event: NonNullable<SessionStreamPayload["envelope"]>) => boolean;
+};
+
 type SystemStatusClientRow = {
   clientId?: unknown;
   kind?: unknown;
@@ -4008,6 +4012,44 @@ export function formatSessionEventLine(
   return null;
 }
 
+function buildSessionEventReplayFingerprint(
+  event: NonNullable<SessionStreamPayload["envelope"]>,
+): { source: string; fingerprint: string } | null {
+  const type = String(event.type ?? "").trim().toLowerCase();
+  if (type !== "status") return null;
+  const payload = event.payload ?? {};
+  const source = String(event.from ?? payload.agentId ?? "status").trim().toLowerCase();
+  const state = String(payload.state ?? "").trim().toLowerCase();
+  const detail = String(payload.detail ?? "").trim().toLowerCase();
+  const message = String(payload.message ?? "").trim().toLowerCase();
+  return {
+    source,
+    fingerprint: `${type}:${source}:${state}:${detail}:${message}`,
+  };
+}
+
+export function createSessionEventReplayFilter(): SessionEventReplayFilter {
+  const seenEventIds = new Set<string>();
+  const lastStatusFingerprintBySource = new Map<string, string>();
+
+  return {
+    shouldRender(event) {
+      const eventId = String(event.id ?? "").trim();
+      if (eventId) {
+        if (seenEventIds.has(eventId)) return false;
+        seenEventIds.add(eventId);
+      }
+
+      const replayStatus = buildSessionEventReplayFingerprint(event);
+      if (!replayStatus) return true;
+      const previous = lastStatusFingerprintBySource.get(replayStatus.source);
+      if (previous === replayStatus.fingerprint) return false;
+      lastStatusFingerprintBySource.set(replayStatus.source, replayStatus.fingerprint);
+      return true;
+    },
+  };
+}
+
 async function runSessionStream(
   serverUrl: string,
   sessionId: string,
@@ -4016,6 +4058,7 @@ async function runSessionStream(
   signal: AbortSignal,
 ): Promise<void> {
   let cursor = 0;
+  const replayFilter = createSessionEventReplayFilter();
 
   while (!signal.aborted) {
     try {
@@ -4067,6 +4110,7 @@ async function runSessionStream(
             typeof parsed.cursor === "number" && Number.isFinite(parsed.cursor) ? parsed.cursor : 0;
           cursor = Math.max(cursor, blockCursor, serverCursor);
           if (!parsed.envelope) continue;
+          if (!replayFilter.shouldRender(parsed.envelope)) continue;
           const line = formatSessionEventLine(parsed.envelope);
           if (line) print(line);
         }

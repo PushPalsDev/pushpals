@@ -322,9 +322,9 @@ export function buildTaskExecuteDedupeKey(
   sessionId: string,
   params: TaskExecuteJobParams,
 ): string | null {
-  if (params.origin !== "user") return null;
   const normalizedSessionId = String(sessionId ?? "").trim().toLowerCase();
   if (!normalizedSessionId) return null;
+  const normalizedOrigin = params.origin === "autonomy" ? "autonomy" : "user";
 
   const rawTargetPaths = Array.isArray(params.planning.targetPaths) ? params.planning.targetPaths : [];
   const normalizedTargets = rawTargetPaths
@@ -346,7 +346,7 @@ export function buildTaskExecuteDedupeKey(
     return null;
   }
 
-  return `task.execute:user:${normalizedSessionId}:${uniqueTargets.join("|")}`.toLowerCase();
+  return `task.execute:${normalizedOrigin}:${normalizedSessionId}:${uniqueTargets.join("|")}`.toLowerCase();
 }
 
 function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata | null {

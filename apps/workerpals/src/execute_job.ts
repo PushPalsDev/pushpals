@@ -130,14 +130,51 @@ export function redactSensitiveText(value: string): string {
 }
 
 export function buildCriticRevisionIssues(
-  critic: { score: number; mustFix: string[] } | null | undefined,
+  critic:
+    | {
+        score: number;
+        findings?: string[];
+        mustFix?: string[];
+        revisionGuidance?: string;
+      }
+    | null
+    | undefined,
   qualityCriticMinScore: number,
 ): string[] {
   if (!critic) return [];
   if (critic.score >= qualityCriticMinScore) return [];
-  return [
+  const issues = [
     `Critic score ${critic.score.toFixed(1)} is below required threshold ${qualityCriticMinScore}.`,
   ];
+  const mustFix = Array.isArray(critic.mustFix) ? critic.mustFix : [];
+  const findings = Array.isArray(critic.findings) ? critic.findings : [];
+  const revisionGuidance = String(critic.revisionGuidance ?? "").trim();
+  const actionableItems = (mustFix.length > 0 ? mustFix : findings)
+    .map((entry) => toSingleLine(entry, 180))
+    .filter(Boolean)
+    .slice(0, 3);
+  for (const item of actionableItems) {
+    issues.push(mustFix.length > 0 ? `Critic must-fix: ${item}` : `Critic finding: ${item}`);
+  }
+  if (revisionGuidance) {
+    issues.push(`Critic revision guidance: ${toSingleLine(revisionGuidance, 220)}`);
+  }
+  return issues;
+}
+
+export function buildQualityGateRevisionIssues(
+  qualityIssues: string[],
+  critic: CriticReview | null,
+  qualityCriticMinScore: number,
+): string[] {
+  const normalizedQualityIssues = qualityIssues
+    .map((entry) => String(entry ?? "").trim())
+    .filter(Boolean);
+  if (!critic || critic.score >= qualityCriticMinScore) {
+    return [...normalizedQualityIssues];
+  }
+  const merged = [...normalizedQualityIssues, ...buildCriticRevisionIssues(critic, qualityCriticMinScore)];
+  return [...new Set(merged)];
 }
 
 export function resolveReviewFixCompletionBranch(
@@ -3006,9 +3043,10 @@ export async function executeJob(
       : executor === "openai_codex"
         ? await runCodexCriticReview(repo, attemptParams, quality, runtimeConfig, onLog)
         : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
+    const deterministicRequiresRevision = !quality.ok;
     const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
 
-    if (!criticRequiresRevision) {
+    if (!deterministicRequiresRevision && !criticRequiresRevision) {
       if (critic) {
         onLog?.(
           "stdout",
@@ -3018,10 +3056,11 @@ export async function executeJob(
       return result;
     }
 
-    const issues: string[] = [];
-    if (criticRequiresRevision && critic) {
-      issues.push(...buildCriticRevisionIssues(critic, qualityCriticMinScore));
-    }
+    const issues = buildQualityGateRevisionIssues(
+      quality.issues,
+      critic,
+      qualityCriticMinScore,
+    );
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
     if (revisionAttempt >= qualityMaxAutoRevisions) {
       if (qualitySoftPassOnExhausted) {

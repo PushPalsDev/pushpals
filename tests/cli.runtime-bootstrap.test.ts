@@ -7,6 +7,7 @@ import {
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
+  createSessionEventReplayFilter,
   cleanupLingeringPushPalsGitWorktrees,
   cleanupLingeringWorkerpalWarmContainers,
   buildEmbeddedRuntimeEnv,
@@ -1459,6 +1460,77 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         },
       }),
     ).toBe("[status agent:localbuddy-1] busy - LocalBuddy evaluating request");
+  });
+
+  test("createSessionEventReplayFilter suppresses replayed status events with the same event id", () => {
+    const filter = createSessionEventReplayFilter();
+    const event = {
+      id: "evt-status-1",
+      type: "status",
+      from: "agent:remotebuddy-orchestrator",
+      ts: new Date().toISOString(),
+      payload: {
+        state: "idle",
+        detail: "RemoteBuddy online and waiting for requests",
+      },
+    };
+
+    expect(filter.shouldRender(event)).toBe(true);
+    expect(filter.shouldRender(event)).toBe(false);
+  });
+
+  test("createSessionEventReplayFilter suppresses consecutive identical status updates by content", () => {
+    const filter = createSessionEventReplayFilter();
+    const baseTs = new Date().toISOString();
+
+    expect(
+      filter.shouldRender({
+        id: "evt-status-1",
+        type: "status",
+        from: "agent:source_control_manager",
+        ts: baseTs,
+        payload: {
+          state: "online",
+          detail: "SourceControlManager online and monitoring completions",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      filter.shouldRender({
+        id: "evt-status-2",
+        type: "status",
+        from: "agent:source_control_manager",
+        ts: baseTs,
+        payload: {
+          state: "online",
+          detail: "SourceControlManager online and monitoring completions",
+        },
+      }),
+    ).toBe(false);
+    expect(
+      filter.shouldRender({
+        id: "evt-status-3",
+        type: "status",
+        from: "agent:source_control_manager",
+        ts: baseTs,
+        payload: {
+          state: "busy",
+          detail: "SourceControlManager applying completion",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      filter.shouldRender({
+        id: "evt-status-4",
+        type: "status",
+        from: "agent:source_control_manager",
+        ts: baseTs,
+        payload: {
+          state: "online",
+          detail: "SourceControlManager online and monitoring completions",
+        },
+      }),
+    ).toBe(true);
   });
 
   test("normalizeCliInteractiveMessage treats /ask_remote_buddy as a compatibility alias", () => {
