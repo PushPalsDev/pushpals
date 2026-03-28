@@ -21,6 +21,7 @@ import {
   ensureWorkerpalDockerImageReady,
   extractRemoteBuddyAutonomousEngineState,
   extractRemoteBuddySessionConsumerHealth,
+  formatRuntimeStartupTimingSummary,
   formatTimestampedCliLine,
   formatSessionEventLine,
   injectMonitoringHubBootstrap,
@@ -170,6 +171,65 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.PUSHPALS_DOCKER_BIN_ABSOLUTE).toBe(
       "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
     );
+  });
+
+  test("buildEmbeddedRuntimeEnv applies conservative embedded Windows worker caps by default", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+      },
+      {
+        repoRoot: "C:/repo/example",
+        runtimeRoot: "C:/runtime/pushpals",
+        platform: "win32",
+      },
+    );
+
+    expect("REMOTEBUDDY_MAX_WORKERPALS" in env).toBe(false);
+    expect(env.REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS).toBe("120000");
+    expect(env.WORKERPALS_DOCKER_AGENT_STARTUP_TIMEOUT_MS).toBe("90000");
+    expect(env.WORKERPALS_SKIP_DOCKER_SELF_CHECK).toBe("1");
+    expect(env.WORKERPALS_DOCKER_WARM_MEMORY_MB).toBe("1024");
+    expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("1");
+  });
+
+  test("buildEmbeddedRuntimeEnv preserves explicit worker cap env overrides", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        REMOTEBUDDY_MAX_WORKERPALS: "8",
+        WORKERPALS_SKIP_DOCKER_SELF_CHECK: "0",
+        WORKERPALS_DOCKER_WARM_MEMORY_MB: "3072",
+      },
+      {
+        repoRoot: "C:/repo/example",
+        runtimeRoot: "C:/runtime/pushpals",
+        platform: "win32",
+      },
+    );
+
+    expect(env.REMOTEBUDDY_MAX_WORKERPALS).toBe("8");
+    expect(env.WORKERPALS_SKIP_DOCKER_SELF_CHECK).toBe("0");
+    expect(env.WORKERPALS_DOCKER_WARM_MEMORY_MB).toBe("3072");
+    expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("1");
+  });
+
+  test("buildEmbeddedRuntimeEnv can disable embedded Windows worker caps", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PUSHPALS_DISABLE_EMBEDDED_SAFETY_CAPS: "1",
+      },
+      {
+        repoRoot: "C:/repo/example",
+        runtimeRoot: "C:/runtime/pushpals",
+        platform: "win32",
+      },
+    );
+
+    expect("REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS" in env).toBe(false);
+    expect("WORKERPALS_DOCKER_AGENT_STARTUP_TIMEOUT_MS" in env).toBe(false);
+    expect("WORKERPALS_SKIP_DOCKER_SELF_CHECK" in env).toBe(false);
+    expect("WORKERPALS_DOCKER_WARM_MEMORY_MB" in env).toBe(false);
+    expect("WORKERPALS_DOCKER_WARM_CPUS" in env).toBe(false);
   });
 
   test("buildEmbeddedRuntimeEnv preserves explicit LocalBuddy env overrides without forcing them", () => {
@@ -1432,6 +1492,35 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "[2026-03-14T05:13:05.835Z][localbuddy] Responded locally",
     );
     expect(formatTimestampedCliLine("PushPals CLI", at)).toBe("PushPals CLI");
+  });
+
+  test("formatRuntimeStartupTimingSummary emits compact per-phase timing details", () => {
+    const summary = formatRuntimeStartupTimingSummary({
+      outcome: "ready",
+      totalDurationMs: 18432,
+      phases: [
+        { name: "server", durationMs: 912, status: "started" },
+        { name: "workerpal", durationMs: 15000, status: "deferred" },
+        { name: "readiness", durationMs: 2520, status: "ready" },
+      ],
+    });
+
+    expect(summary).toBe(
+      "[pushpals] startup timing summary: outcome=ready total=18432ms server=912ms(started) workerpal=15000ms(deferred) readiness=2520ms(ready)",
+    );
+  });
+
+  test("formatRuntimeStartupTimingSummary includes failure detail when provided", () => {
+    const summary = formatRuntimeStartupTimingSummary({
+      outcome: "failed",
+      totalDurationMs: 20001,
+      detail: "server health timeout",
+      phases: [{ name: "server", durationMs: 20000.9, status: "timeout" }],
+    });
+
+    expect(summary).toBe(
+      "[pushpals] startup timing summary: outcome=failed total=20001ms detail=server health timeout server=20000ms(timeout)",
+    );
   });
 
   test("formatSessionEventLine suppresses repetitive heartbeat status events", () => {

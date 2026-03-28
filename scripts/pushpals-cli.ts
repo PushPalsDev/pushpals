@@ -206,6 +206,20 @@ type ClientStreamIdentity = {
 
 type SessionClientRegistration = ClientStreamIdentity;
 
+type RuntimeStartupPhaseName =
+  | "server"
+  | "localbuddy"
+  | "remotebuddy"
+  | "workerpal"
+  | "source_control_manager"
+  | "readiness";
+
+type RuntimeStartupPhaseTiming = {
+  name: RuntimeStartupPhaseName;
+  durationMs: number;
+  status: string;
+};
+
 const DEFAULT_MONITOR_PORT = 8081;
 const MONITOR_SCAN_PORTS = 32;
 const MONITOR_POLL_MS = 2_000;
@@ -216,6 +230,15 @@ const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
 const DEFAULT_SERVER_BOOT_TIMEOUT_MS = 20_000;
 const DEFAULT_SERVICE_STABILITY_GRACE_MS = 4_000;
+const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS = 15_000;
+const EMBEDDED_RUNTIME_SAFETY_CAP_DISABLE_ENV = "PUSHPALS_DISABLE_EMBEDDED_SAFETY_CAPS";
+const EMBEDDED_RUNTIME_WINDOWS_SAFETY_CAPS: Readonly<Record<string, string>> = {
+  REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS: "120000",
+  WORKERPALS_DOCKER_AGENT_STARTUP_TIMEOUT_MS: "90000",
+  WORKERPALS_SKIP_DOCKER_SELF_CHECK: "1",
+  WORKERPALS_DOCKER_WARM_MEMORY_MB: "1024",
+  WORKERPALS_DOCKER_WARM_CPUS: "1",
+};
 const GITHUB_OWNER = "PushPalsDev";
 const GITHUB_REPO = "pushpals";
 const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;
@@ -234,6 +257,29 @@ export function formatTimestampedCliLine(line: string, at = new Date()): string 
     return text;
   }
   return `[${at.toISOString()}]${text}`;
+}
+
+export function formatRuntimeStartupTimingSummary(input: {
+  outcome: "ready" | "failed";
+  totalDurationMs: number;
+  phases: RuntimeStartupPhaseTiming[];
+  detail?: string;
+}): string {
+  const phaseSummary = input.phases
+    .map(
+      (phase) =>
+        `${phase.name}=${Math.max(0, Math.floor(phase.durationMs))}ms(${phase.status.trim() || "unknown"})`,
+    )
+    .join(" ");
+  const detail =
+    typeof input.detail === "string" && input.detail.trim()
+      ? ` detail=${input.detail.trim()}`
+      : "";
+  return (
+    `[pushpals] startup timing summary: outcome=${input.outcome} ` +
+    `total=${Math.max(0, Math.floor(input.totalDurationMs))}ms${detail}` +
+    (phaseSummary ? ` ${phaseSummary}` : "")
+  );
 }
 
 export function normalizeCliInteractiveMessage(input: string): {
@@ -1169,16 +1215,30 @@ export function buildEmbeddedRuntimeEnv(
     useRuntimeConfig?: boolean;
     sessionId?: string;
     runtimeTag?: string;
+    platform?: NodeJS.Platform;
   },
 ): Record<string, string> {
   const env = normalizeChildProcessEnv(baseEnv);
   const useRuntimeConfig = opts.useRuntimeConfig !== false;
+  const platform = opts.platform ?? process.platform;
   const inherited = { ...env };
   if (!useRuntimeConfig) {
     delete inherited.PUSHPALS_CONFIG_DIR_OVERRIDE;
     delete inherited.PUSHPALS_WORKERPALS_SANDBOX_ROOT;
     delete inherited.PUSHPALS_RUNTIME_TAG;
   }
+  const disableEmbeddedSafetyCaps =
+    parseBooleanFlag(env[EMBEDDED_RUNTIME_SAFETY_CAP_DISABLE_ENV]) === true;
+  const shouldApplyEmbeddedWindowsSafetyCaps =
+    useRuntimeConfig && platform === "win32" && !disableEmbeddedSafetyCaps;
+  const embeddedWindowsSafetyCaps = shouldApplyEmbeddedWindowsSafetyCaps
+    ? Object.fromEntries(
+        Object.entries(EMBEDDED_RUNTIME_WINDOWS_SAFETY_CAPS).filter(([key]) => {
+          const existing = env[key];
+          return typeof existing !== "string" || existing.trim().length === 0;
+        }),
+      )
+    : {};
   return {
     ...inherited,
     PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
@@ -1199,6 +1259,7 @@ export function buildEmbeddedRuntimeEnv(
     ...(typeof opts.sessionId === "string" && opts.sessionId.trim()
       ? { PUSHPALS_SESSION_ID: opts.sessionId.trim() }
       : {}),
+    ...embeddedWindowsSafetyCaps,
     ...(typeof env.PUSHPALS_GIT_BIN === "string" && env.PUSHPALS_GIT_BIN.trim()
       ? { PUSHPALS_GIT_BIN: env.PUSHPALS_GIT_BIN.trim() }
       : {}),
@@ -1212,6 +1273,14 @@ export function buildEmbeddedRuntimeEnv(
       ? { PUSHPALS_DOCKER_BIN_ABSOLUTE: env.PUSHPALS_DOCKER_BIN_ABSOLUTE.trim() }
       : {}),
   };
+}
+
+function parseBooleanFlag(raw: string | undefined): boolean | null {
+  const normalized = String(raw ?? "").trim().toLowerCase();
+  if (!normalized) return null;
+  if (["1", "true", "yes", "on", "y"].includes(normalized)) return true;
+  if (["0", "false", "no", "off", "n"].includes(normalized)) return false;
+  return null;
 }
 
 export function normalizeChildProcessEnv(
@@ -2457,6 +2526,13 @@ function resolveWorkerpalCapacityTimeoutMs(config: PushPalsConfig): number {
   );
 }
 
+function resolveWorkerpalStartupReadinessProbeTimeoutMs(config: PushPalsConfig): number {
+  return Math.max(
+    5_000,
+    Math.min(resolveWorkerpalCapacityTimeoutMs(config), WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS),
+  );
+}
+
 async function checkGitRemoteConfigured(
   repoRoot: string,
   remote: string,
@@ -3171,6 +3247,36 @@ async function autoStartRuntimeServices(opts: {
   }
 
   const services: RuntimeServiceProcess[] = [];
+  const startupStartedAt = Date.now();
+  const startupPhases: RuntimeStartupPhaseTiming[] = [];
+  const recordStartupPhase = (
+    name: RuntimeStartupPhaseName,
+    startedAt: number,
+    status: string,
+  ): void => {
+    startupPhases.push({
+      name,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      status,
+    });
+  };
+  const emitStartupTimingSummary = (
+    outcome: "ready" | "failed",
+    detail?: string,
+  ): void => {
+    const summary = formatRuntimeStartupTimingSummary({
+      outcome,
+      totalDurationMs: Date.now() - startupStartedAt,
+      phases: startupPhases,
+      detail,
+    });
+    if (outcome === "failed") {
+      console.warn(summary);
+    } else {
+      console.log(summary);
+    }
+    appendRuntimeServicesLogLine(runtimeServicesLogPath, summary);
+  };
   const runToken = timestampFileToken();
   const logDir = join(runtimeRoot, "logs", "bootstrap");
   mkdirSync(logDir, { recursive: true });
@@ -3191,6 +3297,7 @@ async function autoStartRuntimeServices(opts: {
 
   const serverHealthy = await probeServer(opts.serverUrl);
   if (!serverHealthy) {
+    const serverPhaseStartedAt = Date.now();
     console.log("[pushpals] Starting embedded server...");
     const serverService = spawnRuntimeService(
       "server",
@@ -3212,6 +3319,8 @@ async function autoStartRuntimeServices(opts: {
           runtimeServicesLogPath,
           `[pushpals] embedded server exited during bootstrap (code=${serverService.exitCode ?? "unknown"}).`,
         );
+        recordStartupPhase("server", serverPhaseStartedAt, "exited");
+        emitStartupTimingSummary("failed", "server exited during bootstrap");
         stopRuntimeServices(services);
         throw new Error(
           `Embedded server exited during bootstrap (code=${serverService.exitCode ?? "unknown"}). ` +
@@ -3230,14 +3339,18 @@ async function autoStartRuntimeServices(opts: {
         runtimeServicesLogPath,
         `[pushpals] embedded server did not become healthy within ${DEFAULT_SERVER_BOOT_TIMEOUT_MS}ms.`,
       );
+      recordStartupPhase("server", serverPhaseStartedAt, "timeout");
+      emitStartupTimingSummary("failed", "server health timeout");
       stopRuntimeServices(services);
       throw new Error(
         `Embedded server did not become healthy within ${DEFAULT_SERVER_BOOT_TIMEOUT_MS}ms. ` +
           `See ${serverService.logPath}${tail ? `\n--- server log tail ---\n${tail}` : ""}`,
       );
     }
+    recordStartupPhase("server", serverPhaseStartedAt, "started");
     console.log("[pushpals] Embedded server is healthy.");
   } else {
+    recordStartupPhase("server", Date.now(), "reused");
     console.log("[pushpals] Server already healthy; skipping embedded server start.");
     appendRuntimeServicesLogLine(
       runtimeServicesLogPath,
@@ -3246,6 +3359,7 @@ async function autoStartRuntimeServices(opts: {
   }
 
   if (localBuddyEnabled) {
+    const localBuddyPhaseStartedAt = Date.now();
     console.log("[pushpals] Starting embedded LocalBuddy...");
     const localbuddyService = spawnRuntimeService(
       "localbuddy",
@@ -3257,7 +3371,9 @@ async function autoStartRuntimeServices(opts: {
     );
     services.push(localbuddyService);
     console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath}`);
+    recordStartupPhase("localbuddy", localBuddyPhaseStartedAt, "started");
   } else {
+    recordStartupPhase("localbuddy", Date.now(), "skipped");
     console.log("[pushpals] Embedded LocalBuddy disabled for this CLI session; skipping start.");
     appendRuntimeServicesLogLine(
       runtimeServicesLogPath,
@@ -3265,6 +3381,7 @@ async function autoStartRuntimeServices(opts: {
     );
   }
 
+  const remoteBuddyPhaseStartedAt = Date.now();
   console.log("[pushpals] Starting embedded RemoteBuddy...");
   const remotebuddyService = spawnRuntimeService(
     "remotebuddy",
@@ -3276,6 +3393,7 @@ async function autoStartRuntimeServices(opts: {
   );
   services.push(remotebuddyService);
   console.log(`[pushpals] remotebuddy log: ${remotebuddyService.logPath}`);
+  recordStartupPhase("remotebuddy", remoteBuddyPhaseStartedAt, "started");
   let lastReportedRemoteBuddyAutonomyState: RemoteBuddyAutonomousEngineState = "unknown";
   const reportRemoteBuddyAutonomousEngineState = (): void => {
     const autonomyState = readRemoteBuddyAutonomousEngineState(remotebuddyService.logPath);
@@ -3302,29 +3420,35 @@ async function autoStartRuntimeServices(opts: {
   reportRemoteBuddyAutonomousEngineState();
 
   if (runtimePreflight.config.remotebuddy.autoSpawnWorkerpals) {
-    const workerpalReadyTimeoutMs = resolveWorkerpalCapacityTimeoutMs(runtimePreflight.config);
+    const workerpalPhaseStartedAt = Date.now();
+    const workerpalReadinessProbeTimeoutMs = resolveWorkerpalStartupReadinessProbeTimeoutMs(
+      runtimePreflight.config,
+    );
     const workerpalCapacity = await waitForWorkerpalCapacity({
       serverUrl: opts.serverUrl,
-      timeoutMs: workerpalReadyTimeoutMs,
+      timeoutMs: workerpalReadinessProbeTimeoutMs,
       ttlMs: runtimePreflight.config.remotebuddy.workerpalOnlineTtlMs,
     });
     if (!workerpalCapacity.ok) {
-      const tail = readLogTail(remotebuddyService.logPath);
+      const startupProbeWarning =
+        `embedded workerpal readiness probe did not find idle capacity within ${workerpalReadinessProbeTimeoutMs}ms ` +
+        `(${workerpalCapacity.detail}); continuing startup while WorkerPal warmup finishes in the background.`;
+      console.warn(`[pushpals] ${startupProbeWarning}`);
       appendRuntimeServicesLogLine(
         runtimeServicesLogPath,
-        `[pushpals] embedded workerpal capacity did not become available within ${workerpalReadyTimeoutMs}ms.`,
+        `[pushpals] ${startupProbeWarning}`,
       );
-      stopRuntimeServices(services);
-      throw new Error(
-        `Embedded WorkerPal capacity did not become available within ${workerpalReadyTimeoutMs}ms (${workerpalCapacity.detail}). ` +
-          `See ${remotebuddyService.logPath}${tail ? `\n--- remotebuddy log tail ---\n${tail}` : ""}`,
+      recordStartupPhase("workerpal", workerpalPhaseStartedAt, "deferred");
+    } else {
+      console.log(`[pushpals] Embedded WorkerPal capacity is ready (${workerpalCapacity.detail}).`);
+      appendRuntimeServicesLogLine(
+        runtimeServicesLogPath,
+        `[pushpals] embedded workerpal capacity ready (${workerpalCapacity.detail}).`,
       );
+      recordStartupPhase("workerpal", workerpalPhaseStartedAt, "ready");
     }
-    console.log(`[pushpals] Embedded WorkerPal capacity is ready (${workerpalCapacity.detail}).`);
-    appendRuntimeServicesLogLine(
-      runtimeServicesLogPath,
-      `[pushpals] embedded workerpal capacity ready (${workerpalCapacity.detail}).`,
-    );
+  } else {
+    recordStartupPhase("workerpal", Date.now(), "disabled");
   }
 
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
@@ -3339,6 +3463,7 @@ async function autoStartRuntimeServices(opts: {
     runtimeEnv,
   );
   if (!scmHealthy) {
+    const scmPhaseStartedAt = Date.now();
     if (!scmGitProbe.ok) {
       console.warn(
         "[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.",
@@ -3347,6 +3472,7 @@ async function autoStartRuntimeServices(opts: {
         runtimeServicesLogPath,
         `[pushpals] source_control_manager skipped: git is unavailable in embedded runtime env (${scmGitProbe.detail}).`,
       );
+      recordStartupPhase("source_control_manager", scmPhaseStartedAt, "skipped_no_git");
     } else if (scmRemoteStatus.status === "error") {
       console.warn(
         `[pushpals] Could not inspect SourceControlManager git remote "${opts.sourceControlManagerRemote}"; skipping SCM startup.`,
@@ -3355,6 +3481,7 @@ async function autoStartRuntimeServices(opts: {
         runtimeServicesLogPath,
         `[pushpals] source_control_manager skipped: remote "${opts.sourceControlManagerRemote}" could not be inspected (${scmRemoteStatus.detail}).`,
       );
+      recordStartupPhase("source_control_manager", scmPhaseStartedAt, "skipped_remote_error");
     } else if (scmRemoteStatus.status === "ok") {
       console.log(`[pushpals] Embedded SourceControlManager git=${scmGitProbe.detail}`);
       console.log("[pushpals] Starting embedded SourceControlManager...");
@@ -3368,6 +3495,7 @@ async function autoStartRuntimeServices(opts: {
       );
       services.push(sourceControlManagerService);
       console.log(`[pushpals] source_control_manager log: ${sourceControlManagerService.logPath}`);
+      recordStartupPhase("source_control_manager", scmPhaseStartedAt, "started");
     } else {
       console.log(
         `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
@@ -3376,8 +3504,10 @@ async function autoStartRuntimeServices(opts: {
         runtimeServicesLogPath,
         `[pushpals] source_control_manager skipped: repo has no remote "${opts.sourceControlManagerRemote}".`,
       );
+      recordStartupPhase("source_control_manager", scmPhaseStartedAt, "skipped_no_remote");
     }
   } else {
+    recordStartupPhase("source_control_manager", Date.now(), "reused");
     console.log("[pushpals] SourceControlManager already healthy; skipping embedded start.");
     appendRuntimeServicesLogLine(
       runtimeServicesLogPath,
@@ -3386,6 +3516,7 @@ async function autoStartRuntimeServices(opts: {
   }
 
   const deadline = Date.now() + DEFAULT_RUNTIME_BOOT_TIMEOUT_MS;
+  const readinessPhaseStartedAt = Date.now();
   while (Date.now() < deadline) {
     reportRemoteBuddyAutonomousEngineState();
     for (let i = services.length - 1; i >= 0; i--) {
@@ -3411,13 +3542,15 @@ async function autoStartRuntimeServices(opts: {
           continue;
         }
         const tail = readLogTail(service.logPath);
-        appendRuntimeServicesLogLine(
-          runtimeServicesLogPath,
-          `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}).`,
-        );
-        stopRuntimeServices(services);
-        throw new Error(
-          `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}). ` +
+          appendRuntimeServicesLogLine(
+            runtimeServicesLogPath,
+            `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}).`,
+          );
+          recordStartupPhase("readiness", readinessPhaseStartedAt, "failed");
+          emitStartupTimingSummary("failed", `${service.name} exited during startup`);
+          stopRuntimeServices(services);
+          throw new Error(
+            `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}). ` +
             `See ${service.logPath}${tail ? `\n--- ${service.name} log tail ---\n${tail}` : ""}`,
         );
       }
@@ -3457,6 +3590,8 @@ async function autoStartRuntimeServices(opts: {
             runtimeServicesLogPath,
             `[pushpals] embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}).`,
           );
+          recordStartupPhase("readiness", readinessPhaseStartedAt, "failed");
+          emitStartupTimingSummary("failed", `${service.name} exited immediately after bootstrap`);
           stopRuntimeServices(services);
           throw new Error(
             `Embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}). ` +
@@ -3466,6 +3601,8 @@ async function autoStartRuntimeServices(opts: {
         await Bun.sleep(250);
       }
       console.log("[pushpals] Embedded runtime is ready.");
+      recordStartupPhase("readiness", readinessPhaseStartedAt, "ready");
+      emitStartupTimingSummary("ready");
       appendRuntimeServicesLogLine(
         runtimeServicesLogPath,
         "[pushpals] embedded runtime is ready.",
@@ -3485,6 +3622,8 @@ async function autoStartRuntimeServices(opts: {
       runtimeServicesLogPath,
       `[pushpals] timed out waiting for RemoteBuddy session consumer readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms (${remoteBuddyHealth.detail}).`,
     );
+    recordStartupPhase("readiness", readinessPhaseStartedAt, "timeout");
+    emitStartupTimingSummary("failed", "remotebuddy readiness timeout");
     throw new Error(
       `Timed out waiting for RemoteBuddy session consumer readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms (${remoteBuddyHealth.detail})`,
     );
@@ -3494,6 +3633,8 @@ async function autoStartRuntimeServices(opts: {
       runtimeServicesLogPath,
       `[pushpals] timed out waiting for embedded runtime readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms.`,
     );
+    recordStartupPhase("readiness", readinessPhaseStartedAt, "timeout");
+    emitStartupTimingSummary("failed", "embedded runtime readiness timeout");
     throw new Error(
       `Timed out waiting for embedded runtime readiness after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
     );
@@ -3502,6 +3643,8 @@ async function autoStartRuntimeServices(opts: {
     runtimeServicesLogPath,
     `[pushpals] timed out waiting for LocalBuddy at ${opts.localAgentUrl} and RemoteBuddy session consumer after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms.`,
   );
+  recordStartupPhase("readiness", readinessPhaseStartedAt, "timeout");
+  emitStartupTimingSummary("failed", "localbuddy and remotebuddy readiness timeout");
   throw new Error(
     `Timed out waiting for LocalBuddy at ${opts.localAgentUrl} and RemoteBuddy session consumer after ${DEFAULT_RUNTIME_BOOT_TIMEOUT_MS}ms`,
   );
@@ -4428,27 +4571,28 @@ async function main(): Promise<void> {
   }
   const workerpalCapacity = await waitForWorkerpalCapacity({
     serverUrl,
-    timeoutMs: resolveWorkerpalCapacityTimeoutMs(config),
+    timeoutMs: resolveWorkerpalStartupReadinessProbeTimeoutMs(config),
     ttlMs: config.remotebuddy.workerpalOnlineTtlMs,
   });
   if (!workerpalCapacity.ok) {
-    stopAutoStartedServices();
-    console.error(
-      `[pushpals] WorkerPal capacity is not ready for repo ${repoRoot}: ${workerpalCapacity.detail}.`,
+    console.warn(
+      `[pushpals] WorkerPal readiness probe did not find idle capacity yet (${workerpalCapacity.detail}).`,
+    );
+    console.warn(
+      "[pushpals] Continuing startup; WorkerPal warmup may still be in progress and first task dispatch can be delayed.",
     );
     if (workerpalDockerPrecheck.status === "failed") {
-      console.error(
+      console.warn(
         `[pushpals] Docker precheck detail: ${workerpalDockerPrecheck.detail}`,
       );
     } else if (serverWasAlreadyHealthy) {
-      console.error(
+      console.warn(
         "[pushpals] A PushPals runtime is already serving this repo, but it does not currently have an idle WorkerPal available.",
       );
-      console.error(
+      console.warn(
         "[pushpals] Wait for a worker to become idle or restart the runtime after fixing WorkerPal startup.",
       );
     }
-    process.exit(1);
   }
 
   const saved = statePath ? readCliState(statePath) : {};
