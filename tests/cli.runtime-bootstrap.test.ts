@@ -7,6 +7,7 @@ import {
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
+  cleanupLingeringPushPalsGitWorktrees,
   cleanupLingeringWorkerpalWarmContainers,
   buildEmbeddedRuntimeEnv,
   copyTrackedRepoPath,
@@ -1083,6 +1084,169 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       },
       {
         command: ["docker", "rm", "-f", "abc123", "def456"],
+        cwd: "/repo/example",
+      },
+    ]);
+  });
+
+  test("cleanupLingeringPushPalsGitWorktrees no-ops when no stale git artifacts are present", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    const result = await cleanupLingeringPushPalsGitWorktrees({
+      repoRoot: "/repo/example",
+      env: {},
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        if (command[2] === "list") {
+          return {
+            ok: true,
+            stdout: [
+              "worktree /repo/example",
+              "HEAD abcdef1234567890",
+              "branch refs/heads/main",
+              "",
+              "worktree /repo/example/.worktrees/source_control_manager",
+              "HEAD feedface12345678",
+              "branch refs/heads/main_agents",
+            ].join("\n"),
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command[2] === "prune") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        if (command[1] === "for-each-ref") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        throw new Error(`unexpected command: ${command.join(" ")}`);
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "no lingering PushPals git artifacts found",
+      removed: 0,
+    });
+    expect(calls).toEqual([
+      {
+        command: ["git", "worktree", "list", "--porcelain"],
+        cwd: "/repo/example",
+      },
+      {
+        command: ["git", "worktree", "prune"],
+        cwd: "/repo/example",
+      },
+      {
+        command: [
+          "git",
+          "for-each-ref",
+          "--format=%(refname:short)",
+          "refs/heads/_source_control_manager/",
+        ],
+        cwd: "/repo/example",
+      },
+    ]);
+  });
+
+  test("cleanupLingeringPushPalsGitWorktrees removes stale workerpal worktrees and temp branches", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    const result = await cleanupLingeringPushPalsGitWorktrees({
+      repoRoot: "/repo/example",
+      env: {},
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        if (command[2] === "list") {
+          return {
+            ok: true,
+            stdout: [
+              "worktree /repo/example",
+              "HEAD abcdef1234567890",
+              "branch refs/heads/main",
+              "",
+              "worktree /repo/example/.worktrees/job-123-workerpal-abcd-1",
+              "HEAD feedface12345678",
+              "detached",
+              "",
+              "worktree /repo/example/.worktrees/source_control_manager",
+              "HEAD deadbeef12345678",
+              "branch refs/heads/_source_control_manager/leftover",
+            ].join("\n"),
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command[2] === "remove") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        if (command[2] === "prune") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        if (command[1] === "for-each-ref") {
+          return {
+            ok: true,
+            stdout: "_source_control_manager/leftover\n_source_control_manager/other\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command[1] === "branch") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        throw new Error(`unexpected command: ${command.join(" ")}`);
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "removed 4 lingering PushPals git artifact(s)",
+      removed: 4,
+    });
+    expect(calls).toEqual([
+      {
+        command: ["git", "worktree", "list", "--porcelain"],
+        cwd: "/repo/example",
+      },
+      {
+        command: [
+          "git",
+          "worktree",
+          "remove",
+          "--force",
+          "--force",
+          "/repo/example/.worktrees/job-123-workerpal-abcd-1",
+        ],
+        cwd: "/repo/example",
+      },
+      {
+        command: [
+          "git",
+          "worktree",
+          "remove",
+          "--force",
+          "--force",
+          "/repo/example/.worktrees/source_control_manager",
+        ],
+        cwd: "/repo/example",
+      },
+      {
+        command: ["git", "worktree", "prune"],
+        cwd: "/repo/example",
+      },
+      {
+        command: [
+          "git",
+          "for-each-ref",
+          "--format=%(refname:short)",
+          "refs/heads/_source_control_manager/",
+        ],
+        cwd: "/repo/example",
+      },
+      {
+        command: ["git", "branch", "-D", "_source_control_manager/leftover"],
+        cwd: "/repo/example",
+      },
+      {
+        command: ["git", "branch", "-D", "_source_control_manager/other"],
         cwd: "/repo/example",
       },
     ]);

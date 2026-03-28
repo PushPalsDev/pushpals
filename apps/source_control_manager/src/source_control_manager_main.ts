@@ -827,6 +827,22 @@ async function tick(): Promise<void> {
         completion.id,
       );
     } finally {
+      try {
+        await gitOps.resetToClean();
+      } catch (err: any) {
+        console.warn(
+          `[${ts()}] Failed to reset SourceControlManager worktree after completion ${completion.id}: ${err?.message ?? err}`,
+        );
+      }
+      try {
+        if (await gitOps.revParse(tempBranch)) {
+          await gitOps.deleteTempBranch(tempBranch);
+        }
+      } catch (err: any) {
+        console.warn(
+          `[${ts()}] Failed to delete temp branch ${tempBranch} during final cleanup: ${err?.message ?? err}`,
+        );
+      }
       if (cleanupHiddenCompletionRef) {
         try {
           await gitOps.deleteLocalRef(completion.branch);
@@ -1169,6 +1185,13 @@ async function shutdown(): Promise<void> {
 
     try {
       const cleanup = await gitOps.cleanupLocalTempBranches("_source_control_manager/");
+      if (cleanup.removedWorktrees.length > 0) {
+        console.log(
+          `[${ts()}] Shutdown cleanup removed ${cleanup.removedWorktrees.length} temp worktree(s): ${summarizeBranchNames(
+            cleanup.removedWorktrees,
+          )}`,
+        );
+      }
       if (cleanup.deletedBranches.length > 0) {
         console.log(
           `[${ts()}] Shutdown cleanup removed ${cleanup.deletedBranches.length} temp branch(es): ${summarizeBranchNames(

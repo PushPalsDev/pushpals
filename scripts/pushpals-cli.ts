@@ -1886,6 +1886,48 @@ async function resolveWorkerpalDockerProbe(
 const WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL = "pushpals.runtime_tag";
 const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox";
 const WORKERPAL_WARM_COMPONENT_LABEL = "pushpals.component=workerpals-warm";
+const SOURCE_CONTROL_MANAGER_TEMP_BRANCH_PREFIX = "_source_control_manager/";
+
+type GitWorktreeEntry = {
+  path: string;
+  branch: string | null;
+  detached: boolean;
+};
+
+function normalizeFsPathForComparison(value: string): string {
+  const resolved = resolve(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function parseGitWorktreeListPorcelain(stdout: string): GitWorktreeEntry[] {
+  const entries: GitWorktreeEntry[] = [];
+  const blocks = String(stdout ?? "")
+    .split(/\r?\n\r?\n/g)
+    .map((block) => block.trim())
+    .filter(Boolean);
+
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/g);
+    const pathLine = lines.find((line) => line.startsWith("worktree "));
+    if (!pathLine) continue;
+    const branchLine = lines.find((line) => line.startsWith("branch "));
+    entries.push({
+      path: pathLine.slice("worktree ".length).trim(),
+      branch: branchLine ? branchLine.slice("branch ".length).trim() : null,
+      detached: lines.includes("detached"),
+    });
+  }
+
+  return entries;
+}
+
+function isWorkerpalEphemeralWorktreePath(repoRoot: string, worktreePath: string): boolean {
+  const expectedPrefix = `${normalizeFsPathForComparison(join(repoRoot, ".worktrees"))}/`;
+  const normalizedPath = normalizeFsPathForComparison(worktreePath);
+  if (!normalizedPath.startsWith(expectedPrefix)) return false;
+  const leaf = basename(normalizedPath);
+  return /^(job|selfcheck)-.*-workerpal-[a-z0-9._-]+/i.test(leaf);
+}
 
 function resolveConfiguredDockerExecutable(
   env: Record<string, string | undefined>,
@@ -1961,6 +2003,112 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
     ok: true,
     detail: `removed ${containerIds.length} lingering WorkerPal warm container(s)`,
     removed: containerIds.length,
+  };
+}
+
+export async function cleanupLingeringPushPalsGitWorktrees(opts: {
+  repoRoot: string;
+  env: Record<string, string>;
+  runCommandWithEnvFn?: typeof runCommandWithEnv;
+}): Promise<{ ok: boolean; detail: string; removed: number }> {
+  const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
+  const list = await runCommandWithEnvFn(
+    ["git", "worktree", "list", "--porcelain"],
+    opts.repoRoot,
+    opts.env,
+  );
+  if (!list.ok) {
+    const detail = list.stderr || list.stdout || `exit ${list.exitCode}`;
+    return {
+      ok: false,
+      detail: `failed to inspect lingering PushPals git artifacts: ${detail}`,
+      removed: 0,
+    };
+  }
+
+  const currentRepoPath = normalizeFsPathForComparison(opts.repoRoot);
+  const removable = parseGitWorktreeListPorcelain(list.stdout).filter((entry) => {
+    const normalizedPath = normalizeFsPathForComparison(entry.path);
+    if (normalizedPath === currentRepoPath) return false;
+    if (entry.branch?.startsWith(`refs/heads/${SOURCE_CONTROL_MANAGER_TEMP_BRANCH_PREFIX}`)) {
+      return true;
+    }
+    return isWorkerpalEphemeralWorktreePath(opts.repoRoot, entry.path);
+  });
+
+  let removed = 0;
+  const failures: string[] = [];
+  for (const entry of removable) {
+    const remove = await runCommandWithEnvFn(
+      ["git", "worktree", "remove", "--force", "--force", entry.path],
+      opts.repoRoot,
+      opts.env,
+    );
+    if (remove.ok) {
+      removed += 1;
+      continue;
+    }
+    failures.push(`${entry.path}: ${remove.stderr || remove.stdout || `exit ${remove.exitCode}`}`);
+  }
+
+  const prune = await runCommandWithEnvFn(["git", "worktree", "prune"], opts.repoRoot, opts.env);
+  if (!prune.ok) {
+    failures.push(`prune: ${prune.stderr || prune.stdout || `exit ${prune.exitCode}`}`);
+  }
+
+  const deleteTempBranches = await runCommandWithEnvFn(
+    [
+      "git",
+      "for-each-ref",
+      "--format=%(refname:short)",
+      `refs/heads/${SOURCE_CONTROL_MANAGER_TEMP_BRANCH_PREFIX}`,
+    ],
+    opts.repoRoot,
+    opts.env,
+  );
+  if (!deleteTempBranches.ok) {
+    failures.push(
+      `list temp branches: ${deleteTempBranches.stderr || deleteTempBranches.stdout || `exit ${deleteTempBranches.exitCode}`}`,
+    );
+  } else {
+    const branches = deleteTempBranches.stdout
+      .split(/\r?\n/g)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    for (const branch of branches) {
+      const deleteResult = await runCommandWithEnvFn(
+        ["git", "branch", "-D", branch],
+        opts.repoRoot,
+        opts.env,
+      );
+      if (!deleteResult.ok) {
+        failures.push(`${branch}: ${deleteResult.stderr || deleteResult.stdout || `exit ${deleteResult.exitCode}`}`);
+      } else {
+        removed += 1;
+      }
+    }
+  }
+
+  if (removed === 0 && failures.length === 0) {
+    return {
+      ok: true,
+      detail: "no lingering PushPals git artifacts found",
+      removed: 0,
+    };
+  }
+
+  if (failures.length > 0) {
+    return {
+      ok: false,
+      detail: `removed ${removed} lingering PushPals git artifact(s), but cleanup was incomplete: ${failures.join(" | ")}`,
+      removed,
+    };
+  }
+
+  return {
+    ok: true,
+    detail: `removed ${removed} lingering PushPals git artifact(s)`,
+    removed,
   };
 }
 
@@ -4087,6 +4235,19 @@ async function main(): Promise<void> {
       console.log(`[pushpals] ${cleanup.detail} (${phase}).`);
     }
   };
+  const cleanupPushPalsGitWorktreesIfNeeded = async (phase: string): Promise<void> => {
+    const cleanup = await cleanupLingeringPushPalsGitWorktrees({
+      repoRoot,
+      env: workerpalDockerPrecheck.env,
+    });
+    if (!cleanup.ok) {
+      console.warn(`[pushpals] PushPals worktree cleanup warning (${phase}): ${cleanup.detail}`);
+      return;
+    }
+    if (cleanup.removed > 0) {
+      console.log(`[pushpals] ${cleanup.detail} (${phase}).`);
+    }
+  };
   const stopAutoStartedServices = (): void => {
     if (autoStartedServices.length === 0) return;
     stopRuntimeServices(autoStartedServices);
@@ -4109,6 +4270,7 @@ async function main(): Promise<void> {
     }
     await stopRuntimeServicesGracefully(services);
     await cleanupWorkerpalWarmContainersIfNeeded("cli shutdown");
+    await cleanupPushPalsGitWorktreesIfNeeded("cli shutdown");
   };
 
   let serverHealthy = await probeServer(serverUrl);
@@ -4143,6 +4305,7 @@ async function main(): Promise<void> {
   };
   if (!serverHealthy) {
     await cleanupWorkerpalWarmContainersIfNeeded("startup preflight");
+    await cleanupPushPalsGitWorktreesIfNeeded("startup preflight");
     if (!parsed.noAutoStart) {
       try {
         const startedRuntime = await autoStartRuntimeServices({

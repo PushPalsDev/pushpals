@@ -1,4 +1,4 @@
-import { win32 as pathWin32 } from "path";
+import { resolve, win32 as pathWin32 } from "path";
 import type { SourceControlManagerConfig } from "./config";
 
 /**
@@ -21,8 +21,42 @@ export interface DiscoveredBranch {
 
 export interface TempBranchCleanupSummary {
   deletedBranches: string[];
+  removedWorktrees: string[];
   failedBranches: string[];
   warnings: string[];
+}
+
+type GitWorktreeEntry = {
+  path: string;
+  branch: string | null;
+  detached: boolean;
+};
+
+function normalizeFsPathForComparison(value: string): string {
+  const resolved = resolve(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function parseGitWorktreeListPorcelain(stdout: string): GitWorktreeEntry[] {
+  const entries: GitWorktreeEntry[] = [];
+  const blocks = String(stdout ?? "")
+    .split(/\r?\n\r?\n/g)
+    .map((block) => block.trim())
+    .filter(Boolean);
+
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/g);
+    const pathLine = lines.find((line) => line.startsWith("worktree "));
+    if (!pathLine) continue;
+    const branchLine = lines.find((line) => line.startsWith("branch "));
+    entries.push({
+      path: pathLine.slice("worktree ".length).trim(),
+      branch: branchLine ? branchLine.slice("branch ".length).trim() : null,
+      detached: lines.includes("detached"),
+    });
+  }
+
+  return entries;
 }
 
 export function resolveGitExecutableCandidatesFromEnv(): string[] {
@@ -672,9 +706,10 @@ export class GitOps {
     const normalizedPrefix = prefix.trim().replace(/^\/+/, "");
     const warnings: string[] = [];
     const deletedBranches: string[] = [];
+    const removedWorktrees: string[] = [];
     const failedBranches: string[] = [];
     if (!normalizedPrefix) {
-      return { deletedBranches, failedBranches, warnings };
+      return { deletedBranches, removedWorktrees, failedBranches, warnings };
     }
 
     // Move off temp branches first so deletion does not fail due to "branch checked out".
@@ -691,7 +726,36 @@ export class GitOps {
     );
     if (!listResult.ok) {
       warnings.push(`for-each-ref failed: ${listResult.stderr || listResult.stdout}`);
-      return { deletedBranches, failedBranches, warnings };
+      return { deletedBranches, removedWorktrees, failedBranches, warnings };
+    }
+
+    const worktreeList = await git(this.repoPath, ["worktree", "list", "--porcelain"], {
+      timeout: 15_000,
+    });
+    if (!worktreeList.ok) {
+      warnings.push(`worktree list failed: ${worktreeList.stderr || worktreeList.stdout}`);
+    } else {
+      const currentRepoPath = normalizeFsPathForComparison(this.repoPath);
+      const linkedWorktrees = parseGitWorktreeListPorcelain(worktreeList.stdout).filter((entry) => {
+        if (!entry.branch) return false;
+        if (!entry.branch.startsWith(`refs/heads/${normalizedPrefix}`)) return false;
+        return normalizeFsPathForComparison(entry.path) !== currentRepoPath;
+      });
+
+      for (const entry of linkedWorktrees) {
+        const removeResult = await git(
+          this.repoPath,
+          ["worktree", "remove", "--force", "--force", entry.path],
+          { timeout: 15_000 },
+        );
+        if (removeResult.ok) {
+          removedWorktrees.push(entry.path);
+          continue;
+        }
+        warnings.push(
+          `failed to remove linked temp worktree ${entry.path}: ${removeResult.stderr || removeResult.stdout}`,
+        );
+      }
     }
 
     const branches = listResult.stdout
@@ -713,7 +777,7 @@ export class GitOps {
       warnings.push(`worktree prune failed: ${pruneResult.stderr || pruneResult.stdout}`);
     }
 
-    return { deletedBranches, failedBranches, warnings };
+    return { deletedBranches, removedWorktrees, failedBranches, warnings };
   }
 
   /**
