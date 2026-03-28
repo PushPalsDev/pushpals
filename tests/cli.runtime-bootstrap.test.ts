@@ -206,6 +206,28 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
   });
 
+  test("buildEmbeddedRuntimeEnv clears stale embedded config overrides when targeting repo config", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+        PUSHPALS_CONFIG_DIR_OVERRIDE: "/runtime/stale/configs",
+        PUSHPALS_WORKERPALS_SANDBOX_ROOT: "/runtime/stale/sandbox",
+        PUSHPALS_RUNTIME_TAG: "vstale",
+        PUSHPALS_PROMPTS_ROOT_OVERRIDE: "/runtime/stale",
+      },
+      {
+        repoRoot: "/repo/example",
+        runtimeRoot: "/runtime/pushpals",
+        useRuntimeConfig: false,
+      },
+    );
+
+    expect(env.PUSHPALS_PROMPTS_ROOT_OVERRIDE).toBe("/repo/example");
+    expect("PUSHPALS_CONFIG_DIR_OVERRIDE" in env).toBe(false);
+    expect("PUSHPALS_WORKERPALS_SANDBOX_ROOT" in env).toBe(false);
+    expect("PUSHPALS_RUNTIME_TAG" in env).toBe(false);
+  });
+
   test("normalizeChildProcessEnv keeps Windows path and shell variables in both casings", () => {
     const env = normalizeChildProcessEnv(
       {
@@ -898,6 +920,92 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8")).toContain(
         "enabled = true",
       );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareCliRuntime ensures embedded local.toml exists for external runtimes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-local-seed-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "configs", "local.example.toml"),
+        ["[startup]", "log_config_on_start = false", ""].join("\n"),
+        "utf8",
+      );
+
+      const prepared = await prepareCliRuntime({
+        repoRoot,
+        runtimeRoot,
+      });
+
+      expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+      expect(existsSync(join(runtimeRoot, "configs", "local.toml"))).toBe(true);
+      expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8").trim().length).toBeGreaterThan(0);
+      expect(prepared.runtimePreflight.config).toBeDefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareCliRuntime preserves an existing embedded local.toml override", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-local-preserve-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "configs", "local.example.toml"),
+        ["[startup]", "log_config_on_start = true", ""].join("\n"),
+        "utf8",
+      );
+      writeFileSync(
+        join(runtimeRoot, "configs", "local.toml"),
+        ["[startup]", "log_config_on_start = false", ""].join("\n"),
+        "utf8",
+      );
+
+      const prepared = await prepareCliRuntime({
+        repoRoot,
+        runtimeRoot,
+      });
+
+      expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+      expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8")).toBe(
+        ["[startup]", "log_config_on_start = false", ""].join("\n"),
+      );
+      expect(prepared.runtimePreflight.config?.startup.logConfigOnStart).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareCliRuntime does not seed embedded runtime configs for source checkouts", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-source-checkout-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(join(repoRoot, "configs"), { recursive: true });
+      mkdirSync(runtimeRoot, { recursive: true });
+      writeFileSync(join(repoRoot, "configs", "default.toml"), 'profile = "dev"\n', "utf8");
+
+      const prepared = await prepareCliRuntime({
+        repoRoot,
+        runtimeRoot,
+        runtimeTag: "v1.2.3",
+      });
+
+      expect(prepared.preflightUsesEmbeddedRuntime).toBe(false);
+      expect(prepared.runtimeTag).toBe("");
+      expect(existsSync(join(runtimeRoot, "configs", "local.toml"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -1169,8 +1169,14 @@ export function buildEmbeddedRuntimeEnv(
 ): Record<string, string> {
   const env = normalizeChildProcessEnv(baseEnv);
   const useRuntimeConfig = opts.useRuntimeConfig !== false;
+  const inherited = { ...env };
+  if (!useRuntimeConfig) {
+    delete inherited.PUSHPALS_CONFIG_DIR_OVERRIDE;
+    delete inherited.PUSHPALS_WORKERPALS_SANDBOX_ROOT;
+    delete inherited.PUSHPALS_RUNTIME_TAG;
+  }
   return {
-    ...env,
+    ...inherited,
     PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
     PUSHPALS_PROJECT_ROOT_OVERRIDE: opts.repoRoot,
     ...(useRuntimeConfig
