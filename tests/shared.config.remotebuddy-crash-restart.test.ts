@@ -7,7 +7,7 @@ import { loadPushPalsConfig } from "../packages/shared/src/config";
 describe("shared config remotebuddy crash restart parsing", () => {
   test("defaults to enabled with bounded restart values when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -34,7 +34,7 @@ describe("shared config remotebuddy crash restart parsing", () => {
 
   test("supports TOML and env overrides", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(

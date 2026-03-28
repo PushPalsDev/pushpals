@@ -7,7 +7,7 @@ import { loadPushPalsConfig } from "../packages/shared/src/config";
 describe("shared config remotebuddy autonomy parsing", () => {
   test("defaults autonomy.enabled to true when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -31,7 +31,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("defaults autonomy timing, safety, and PR-feedback limits when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -69,7 +69,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("REMOTEBUDDY_AUTONOMY_ALLOW_DIRTY_WORKTREE overrides TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -100,7 +100,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("REMOTEBUDDY_AUTONOMY_HEARTBEAT_LOG_MS overrides TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -131,7 +131,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("REMOTEBUDDY_AUTONOMY_VISION_CONTEXT_MAX_CHARS overrides TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -162,7 +162,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("REMOTEBUDDY_AUTONOMY_EXPLORE_RATE overrides TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -193,7 +193,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("defaults per-type autonomy dispatch budgets when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -223,7 +223,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("preserves arbitrary repo-relative per-component autonomy budgets", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -254,7 +254,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("maps legacy monorepo component aliases onto canonical default keys", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -284,7 +284,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("REMOTEBUDDY_AUTONOMY_KILL_SWITCH_ENABLED overrides TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -315,7 +315,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
   test("REMOTEBUDDY_AUTONOMY_MAX_TOKEN_USAGE_PER_HOUR overrides TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(

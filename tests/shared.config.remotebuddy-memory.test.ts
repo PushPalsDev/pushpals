@@ -7,7 +7,7 @@ import { loadPushPalsConfig } from "../packages/shared/src/config";
 describe("shared config remotebuddy memory parsing", () => {
   test("uses [remotebuddy.memory] from local.example.toml when local.toml is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -55,7 +55,7 @@ describe("shared config remotebuddy memory parsing", () => {
 
   test("REMOTEBUDDY_MEMORY_* env overrides TOML values", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(

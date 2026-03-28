@@ -7,7 +7,7 @@ import { loadPushPalsConfig } from "../packages/shared/src/config";
 describe("shared config startup log_config_on_start parsing", () => {
   test("defaults startup.logConfigOnStart to true when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n', "utf8");
@@ -23,7 +23,7 @@ describe("shared config startup log_config_on_start parsing", () => {
 
   test("reads startup.log_config_on_start from local.example.toml when local.toml is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n[startup]\nlog_config_on_start = true\n', "utf8");
@@ -39,7 +39,7 @@ describe("shared config startup log_config_on_start parsing", () => {
 
   test("PUSHPALS_LOG_CONFIG_ON_START overrides TOML values", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n[startup]\nlog_config_on_start = false\n', "utf8");

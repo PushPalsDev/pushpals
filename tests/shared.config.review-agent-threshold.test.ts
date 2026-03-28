@@ -7,7 +7,7 @@ import { loadPushPalsConfig } from "../packages/shared/src/config";
 describe("shared config review_agent threshold parsing", () => {
   test("uses source_control_manager.review_agent.pass_threshold from local.example.toml when local.toml is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -41,7 +41,7 @@ describe("shared config review_agent threshold parsing", () => {
 
   test("uses numeric source_control_manager.review_agent.pass_threshold from local.toml", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -87,7 +87,7 @@ describe("shared config review_agent threshold parsing", () => {
 
   test("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_PASS_THRESHOLD overrides TOML values", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -137,7 +137,7 @@ describe("shared config review_agent threshold parsing", () => {
 
   test("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MAX_PR_COMMENTS_BEFORE_GIVE_UP overrides TOML values", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(

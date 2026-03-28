@@ -20,7 +20,7 @@ afterEach(() => {
 
 function createConfigRoot(defaultToml: string): string {
   const root = mkdtempSync(join(tmpdir(), "pushpals-local-only-config-"));
-  const configDir = join(root, "config");
+  const configDir = join(root, "configs");
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, "default.toml"), defaultToml, "utf8");
   writeFileSync(join(configDir, "local.example.toml"), "", "utf8");

@@ -7,7 +7,7 @@ import { loadPushPalsConfig } from "../packages/shared/src/config";
 describe("shared config localbuddy enabled parsing", () => {
   test("defaults localbuddy.enabled to false when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n', "utf8");
@@ -23,7 +23,7 @@ describe("shared config localbuddy enabled parsing", () => {
 
   test("reads localbuddy.enabled from TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
@@ -43,7 +43,7 @@ describe("shared config localbuddy enabled parsing", () => {
 
   test("LOCALBUDDY_ENABLED overrides TOML", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
-    const configDir = join(root, "config");
+    const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
     writeFileSync(
