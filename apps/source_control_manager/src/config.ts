@@ -36,50 +36,57 @@ export interface SourceControlManagerConfig
   reviewAgent: ReviewAgentConfig;
 }
 
-const PUSH_CONFIG = loadPushPalsConfig();
-const DEFAULT_LOCAL_SERVER = resolveLocalServerConnection({
-  serverUrl: PUSH_CONFIG.server.url,
-  authToken: PUSH_CONFIG.authToken,
-  fallbackPort: PUSH_CONFIG.server.port,
-});
-
-const DEFAULTS: SourceControlManagerConfig = {
-  repoPath: resolve(PUSH_CONFIG.sourceControlManager.repoPath),
-  serverUrl: DEFAULT_LOCAL_SERVER.serverUrl,
-  remote: PUSH_CONFIG.sourceControlManager.remote,
-  mainBranch: PUSH_CONFIG.sourceControlManager.mainBranch,
-  integrationBaseBranch: PUSH_CONFIG.sourceControlManager.baseBranch,
-  branchPrefix: PUSH_CONFIG.sourceControlManager.branchPrefix,
-  pollIntervalSeconds: PUSH_CONFIG.sourceControlManager.pollIntervalSeconds,
-  checks: PUSH_CONFIG.sourceControlManager.checks.map((check) => ({ ...check })),
-  stateDir: resolve(PUSH_CONFIG.sourceControlManager.stateDir),
-  port: PUSH_CONFIG.sourceControlManager.port,
-  deleteAfterMerge: PUSH_CONFIG.sourceControlManager.deleteAfterMerge,
-  maxAttempts: PUSH_CONFIG.sourceControlManager.maxAttempts,
-  mergeStrategy: PUSH_CONFIG.sourceControlManager.mergeStrategy,
-  pushMainAfterMerge: PUSH_CONFIG.sourceControlManager.pushMainAfterMerge,
-  openPrAfterPush: PUSH_CONFIG.sourceControlManager.openPrAfterPush,
-  prBaseBranch: PUSH_CONFIG.sourceControlManager.prBaseBranch,
-  prTitle: PUSH_CONFIG.sourceControlManager.prTitle,
-  prBody: PUSH_CONFIG.sourceControlManager.prBody,
-  prDraft: PUSH_CONFIG.sourceControlManager.prDraft,
-  authToken: undefined,
-  gitToken: PUSH_CONFIG.gitToken,
-  statusHeartbeatMs: PUSH_CONFIG.sourceControlManager.statusHeartbeatMs,
-  skipCleanCheck: PUSH_CONFIG.sourceControlManager.skipCleanCheck,
-  autoCreateMainBranch: PUSH_CONFIG.sourceControlManager.autoCreateMainBranch,
-  reviewAgent: PUSH_CONFIG.sourceControlManager.reviewAgent,
+type LoadConfigOptions = {
+  reload?: boolean;
 };
+
+function buildDefaults(options: LoadConfigOptions = {}): SourceControlManagerConfig {
+  const pushConfig = loadPushPalsConfig({ reload: options.reload });
+  const defaultLocalServer = resolveLocalServerConnection({
+    serverUrl: pushConfig.server.url,
+    authToken: pushConfig.authToken,
+    fallbackPort: pushConfig.server.port,
+  });
+
+  return {
+    repoPath: resolve(pushConfig.sourceControlManager.repoPath),
+    serverUrl: defaultLocalServer.serverUrl,
+    remote: pushConfig.sourceControlManager.remote,
+    mainBranch: pushConfig.sourceControlManager.mainBranch,
+    integrationBaseBranch: pushConfig.sourceControlManager.baseBranch,
+    branchPrefix: pushConfig.sourceControlManager.branchPrefix,
+    pollIntervalSeconds: pushConfig.sourceControlManager.pollIntervalSeconds,
+    checks: pushConfig.sourceControlManager.checks.map((check) => ({ ...check })),
+    stateDir: resolve(pushConfig.sourceControlManager.stateDir),
+    port: pushConfig.sourceControlManager.port,
+    deleteAfterMerge: pushConfig.sourceControlManager.deleteAfterMerge,
+    maxAttempts: pushConfig.sourceControlManager.maxAttempts,
+    mergeStrategy: pushConfig.sourceControlManager.mergeStrategy,
+    pushMainAfterMerge: pushConfig.sourceControlManager.pushMainAfterMerge,
+    openPrAfterPush: pushConfig.sourceControlManager.openPrAfterPush,
+    prBaseBranch: pushConfig.sourceControlManager.prBaseBranch,
+    prTitle: pushConfig.sourceControlManager.prTitle,
+    prBody: pushConfig.sourceControlManager.prBody,
+    prDraft: pushConfig.sourceControlManager.prDraft,
+    authToken: undefined,
+    gitToken: pushConfig.gitToken,
+    statusHeartbeatMs: pushConfig.sourceControlManager.statusHeartbeatMs,
+    skipCleanCheck: pushConfig.sourceControlManager.skipCleanCheck,
+    autoCreateMainBranch: pushConfig.sourceControlManager.autoCreateMainBranch,
+    reviewAgent: { ...pushConfig.sourceControlManager.reviewAgent },
+  };
+}
 
 /**
  * Load SourceControlManager config strictly from shared PushPals config.
  */
-export function loadConfig(): SourceControlManagerConfig {
+export function loadConfig(options: LoadConfigOptions = {}): SourceControlManagerConfig {
+  const defaults = buildDefaults(options);
   return {
-    ...DEFAULTS,
-    checks: DEFAULTS.checks.map((check) => ({ ...check })),
+    ...defaults,
+    checks: defaults.checks.map((check) => ({ ...check })),
     reviewAgent: {
-      ...DEFAULTS.reviewAgent,
+      ...defaults.reviewAgent,
     },
   };
 }
@@ -99,10 +106,11 @@ export function applyCliOverrides(
     }
   }
 
+  const pushConfig = loadPushPalsConfig();
   const resolved = resolveLocalServerConnection({
     serverUrl: merged.serverUrl,
     authToken: merged.authToken ?? null,
-    fallbackPort: PUSH_CONFIG.server.port,
+    fallbackPort: pushConfig.server.port,
   });
   merged.serverUrl = resolved.serverUrl;
   merged.authToken = undefined;

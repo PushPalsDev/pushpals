@@ -12,6 +12,10 @@ import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
+import {
+  cloneSourceControlManagerConfigSnapshot,
+  createSingleFlightExecutor,
+} from "./runtime_helpers";
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
 import {
@@ -205,9 +209,94 @@ try {
 let running = true;
 let statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentPollTimer: ReturnType<typeof setInterval> | null = null;
+let reviewAgentConfigPollTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentInstance: ReviewAgent | null = null;
 let statusSessionReady = false;
 let shutdownPromise: Promise<void> | null = null;
+let reviewAgentRuntimeStateKey = "startup";
+let reviewAgentRuntimeFingerprint = "";
+
+const reviewAgentConfigPollMs = 3_000;
+const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(async () => {
+  const latestConfig = applyCliOverrides(loadConfig({ reload: true }), cliOverrides);
+  validateConfig(latestConfig);
+  config.reviewAgent = { ...latestConfig.reviewAgent };
+  config.prBaseBranch = latestConfig.prBaseBranch;
+  config.gitToken = latestConfig.gitToken;
+
+  if (!config.reviewAgent.enabled) {
+    clearReviewAgentPollLoop();
+    logReviewAgentRuntimeState(
+      "disabled",
+      `[${ts()}] ReviewAgent disabled via runtime config (source_control_manager.review_agent.enabled=false).`,
+    );
+    return;
+  }
+
+  const remoteUrlResult = await runGitCapture(
+    ["-C", config.repoPath, "remote", "get-url", config.remote],
+    repoRoot,
+  );
+  const remoteUrl = remoteUrlResult.ok ? remoteUrlResult.stdout.trim() : "";
+  if (!remoteUrl) {
+    clearReviewAgentPollLoop();
+    logReviewAgentRuntimeState(
+      "blocked:missing_remote",
+      `[${ts()}] ReviewAgent enabled but could not resolve remote URL; waiting for runtime config or git remote changes before starting.`,
+      "warn",
+    );
+    return;
+  }
+
+  const gitProviderToken = await resolveGitAuthToken(remoteUrl, config.gitToken ?? "");
+  if (!gitProviderToken) {
+    clearReviewAgentPollLoop();
+    logReviewAgentRuntimeState(
+      "blocked:missing_token",
+      `[${ts()}] ReviewAgent enabled but no git provider token found (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN); waiting for credentials before starting.`,
+      "warn",
+    );
+    return;
+  }
+
+  const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
+  const fingerprint = JSON.stringify({
+    serverUrl: config.serverUrl,
+    remoteUrl,
+    prBaseBranch,
+    reviewAgent: config.reviewAgent,
+    gitProviderToken,
+  });
+  if (reviewAgentInstance && reviewAgentPollTimer && reviewAgentRuntimeFingerprint === fingerprint) {
+    return;
+  }
+
+  clearReviewAgentPollLoop();
+  const reviewAgent = new ReviewAgent(
+    config.reviewAgent,
+    config.serverUrl,
+    gitProviderToken,
+    remoteUrl,
+    prBaseBranch,
+    config.authToken,
+  );
+  reviewAgentInstance = reviewAgent;
+  reviewAgentRuntimeFingerprint = fingerprint;
+  reviewAgentPollTimer = setInterval(
+    () =>
+      reviewAgent.poll().catch((err: any) => {
+        console.error(`[${ts()}] [ReviewAgent] Poll error: ${err?.message ?? err}`);
+      }),
+    config.reviewAgent.pollIntervalMs,
+  );
+  logReviewAgentRuntimeState(
+    `running:${fingerprint}`,
+    `[${ts()}] ReviewAgent started (poll interval: ${config.reviewAgent.pollIntervalMs}ms, pass threshold: ${config.reviewAgent.passThreshold}/10)`,
+  );
+  void reviewAgent.poll().catch((err: any) => {
+    console.error(`[${ts()}] [ReviewAgent] Initial poll error: ${err?.message ?? err}`);
+  });
+});
 
 function summarizeBranchNames(names: string[], max = 5): string {
   if (names.length <= max) return names.join(", ");
@@ -314,6 +403,48 @@ function startStatusHeartbeat(): void {
   }, statusHeartbeatMs);
 }
 
+function clearReviewAgentPollLoop(): void {
+  if (reviewAgentPollTimer) {
+    clearInterval(reviewAgentPollTimer);
+    reviewAgentPollTimer = null;
+  }
+  reviewAgentInstance = null;
+  reviewAgentRuntimeFingerprint = "";
+}
+
+function logReviewAgentRuntimeState(
+  key: string,
+  message: string,
+  level: "log" | "warn" = "log",
+): void {
+  if (reviewAgentRuntimeStateKey === key) return;
+  reviewAgentRuntimeStateKey = key;
+  if (level === "warn") {
+    console.warn(message);
+    return;
+  }
+  console.log(message);
+}
+
+async function syncReviewAgentRuntimeConfig(): Promise<void> {
+  await syncReviewAgentRuntimeConfigSingleFlight();
+}
+
+function startReviewAgentRuntimeConfigPolling(): void {
+  if (reviewAgentConfigPollTimer) return;
+  reviewAgentConfigPollTimer = setInterval(() => {
+    if (!running) return;
+    void syncReviewAgentRuntimeConfig().catch((err: any) => {
+      const detail = err?.message ?? String(err);
+      logReviewAgentRuntimeState(
+        `config-error:${detail}`,
+        `[${ts()}] ReviewAgent runtime config poll failed: ${detail}`,
+        "warn",
+      );
+    });
+  }, reviewAgentConfigPollMs);
+}
+
 async function emitPusherMessage(
   comm: CommunicationManager,
   text: string,
@@ -327,15 +458,17 @@ async function emitPusherMessage(
 
 async function tick(): Promise<void> {
   try {
+    const runtimeConfig = cloneSourceControlManagerConfigSnapshot(config);
+    const reviewAgentForTick = reviewAgentInstance;
     // ── Poll Completion Queue ──────────────────────────────────────────
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (config.authToken) {
-      headers["Authorization"] = `Bearer ${config.authToken}`;
+    if (runtimeConfig.authToken) {
+      headers["Authorization"] = `Bearer ${runtimeConfig.authToken}`;
     }
 
     const pusherId = `source_control_manager-${Math.random().toString(36).substring(2, 10)}`;
 
-    const response = await fetch(`${config.serverUrl}/completions/claim`, {
+    const response = await fetch(`${runtimeConfig.serverUrl}/completions/claim`, {
       method: "POST",
       headers,
       body: JSON.stringify({ pusherId }),
@@ -421,7 +554,7 @@ async function tick(): Promise<void> {
       let skipLocalApplyDueConflict = false;
 
       const applyResult =
-        config.mergeStrategy === "cherry-pick"
+        runtimeConfig.mergeStrategy === "cherry-pick"
           ? await (async () => {
               console.log(
                 `[${ts()}] Cherry-picking ${completion.commitSha.slice(0, 8)} onto ${tempBranch}...`,
@@ -430,7 +563,7 @@ async function tick(): Promise<void> {
             })()
           : await (async () => {
               console.log(`[${ts()}] Merging ${completion.branch} into ${tempBranch}...`);
-              return config.mergeStrategy === "no-ff"
+              return runtimeConfig.mergeStrategy === "no-ff"
                 ? gitOps.mergeNoFF(completion.branch, `Merge ${completion.branch}`)
                 : gitOps.mergeFFOnly(completion.branch);
             })();
@@ -438,8 +571,8 @@ async function tick(): Promise<void> {
       if (!applyResult.ok) {
         if (
           shouldBypassApplyFailureInReviewMode({
-            reviewAgentEnabled: config.reviewAgent.enabled,
-            mergeStrategy: config.mergeStrategy,
+            reviewAgentEnabled: runtimeConfig.reviewAgent.enabled,
+            mergeStrategy: runtimeConfig.mergeStrategy,
             applyStdout: applyResult.stdout,
             applyStderr: applyResult.stderr,
           })
@@ -467,9 +600,9 @@ async function tick(): Promise<void> {
         );
       } else {
         console.log(`[${ts()}] Running checks...`);
-        for (const check of config.checks) {
+        for (const check of runtimeConfig.checks) {
           console.log(`[${ts()}]   - Running check: ${check.name}`);
-          const checkResult = await runCheck(config.repoPath, check);
+          const checkResult = await runCheck(runtimeConfig.repoPath, check);
 
           if (!checkResult.ok) {
             throw new Error(`Check "${check.name}" failed: ${checkResult.output}`);
@@ -480,7 +613,7 @@ async function tick(): Promise<void> {
       }
 
       // 5. Merge to main OR create individual PR (ReviewAgent mode)
-      if (config.reviewAgent.enabled) {
+      if (runtimeConfig.reviewAgent.enabled) {
         // ReviewAgent mode: create individual PR from agent branch to prBaseBranch.
         // The agent branch already exists on remote (pushed by the worker).
         // Checks have passed; we skip merging into main_agents entirely.
@@ -488,15 +621,18 @@ async function tick(): Promise<void> {
           `[${ts()}] ReviewAgent mode - creating individual PR for ${completion.branch}`,
         );
         const remoteUrlResult = await runGitCapture(
-          ["-C", config.repoPath, "remote", "get-url", config.remote],
+          ["-C", runtimeConfig.repoPath, "remote", "get-url", runtimeConfig.remote],
           repoRoot,
         );
         if (!remoteUrlResult.ok || !remoteUrlResult.stdout) {
           throw new Error(
-            `Unable to resolve git remote URL for ${config.remote}: ${remoteUrlResult.stderr || remoteUrlResult.stdout}`,
+            `Unable to resolve git remote URL for ${runtimeConfig.remote}: ${remoteUrlResult.stderr || remoteUrlResult.stdout}`,
           );
         }
-        const token = await resolveGitAuthToken(remoteUrlResult.stdout.trim());
+        const token = await resolveGitAuthToken(
+          remoteUrlResult.stdout.trim(),
+          runtimeConfig.gitToken ?? "",
+        );
         if (!token) {
           throw new Error(
             "No git provider token available for individual PR creation (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN).",
@@ -512,7 +648,13 @@ async function tick(): Promise<void> {
             `[${ts()}] ReviewAgent mode - materializing hidden completion ref ${completion.branch} -> refs/heads/${prHeadBranch}`,
           );
           let pushResult = await runGitCapture(
-            ["-C", config.repoPath, "push", config.remote, `${publishRef}:refs/heads/${prHeadBranch}`],
+            [
+              "-C",
+              runtimeConfig.repoPath,
+              "push",
+              runtimeConfig.remote,
+              `${publishRef}:refs/heads/${prHeadBranch}`,
+            ],
             repoRoot,
           );
           if (!pushResult.ok) {
@@ -528,10 +670,10 @@ async function tick(): Promise<void> {
               pushResult = await runGitCapture(
                 [
                   "-C",
-                  config.repoPath,
+                  runtimeConfig.repoPath,
                   "push",
                   "--force-with-lease",
-                  config.remote,
+                  runtimeConfig.remote,
                   `${publishRef}:refs/heads/${prHeadBranch}`,
                 ],
                 repoRoot,
@@ -574,7 +716,7 @@ async function tick(): Promise<void> {
         ].join("\n");
 
         const remoteUrl = remoteUrlResult.stdout.trim();
-        const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
+        const prBaseBranch = (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
 
         const pr = await ensureIntegrationPullRequest({
           token,
@@ -586,7 +728,7 @@ async function tick(): Promise<void> {
           draft: false,
         });
         if (!pr.created) {
-          reviewAgentInstance?.requestReReview(pr.number, completion.commitSha);
+          reviewAgentForTick?.requestReReview(pr.number, completion.commitSha);
         }
         const prMessage = pr.created
           ? `Opened individual PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`
@@ -596,7 +738,7 @@ async function tick(): Promise<void> {
         await emitPusherMessage(comm, prMessage, completion.id);
       } else {
         // Normal mode: merge temp branch into main_agents, push, open aggregated PR.
-        console.log(`[${ts()}] Merging ${tempBranch} to ${config.mainBranch}...`);
+        console.log(`[${ts()}] Merging ${tempBranch} to ${runtimeConfig.mainBranch}...`);
         await gitOps.checkoutMain();
         const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
 
@@ -616,7 +758,7 @@ async function tick(): Promise<void> {
           console.log(`[${ts()}] Push succeeded for ${config.mainBranch}`);
           if (config.openPrAfterPush) {
             try {
-              const pr = await ensureMainPullRequest(completion);
+              const pr = await ensureMainPullRequest(completion, runtimeConfig);
               const prMessage = pr.created
                 ? `Opened PR #${pr.number}: ${pr.htmlUrl}`
                 : `Reused existing PR #${pr.number}: ${pr.htmlUrl}`;
@@ -651,7 +793,7 @@ async function tick(): Promise<void> {
         console.error(`[${ts()}] Failed to mark completion processed: ${markResponse.status}`);
       } else {
         console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
-        const pushMessage = config.reviewAgent.enabled
+        const pushMessage = runtimeConfig.reviewAgent.enabled
           ? skipLocalApplyDueConflict
             ? `Local apply/checks were bypassed for ${completion.commitSha.slice(0, 8)} due cherry-pick conflict; individual PR flow continued for ReviewAgent.`
             : `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.`
@@ -746,10 +888,13 @@ async function runGitCapture(args: string[], cwd = repoRoot): Promise<GitCmdResu
   return runGitCommandCapture(cwd, args);
 }
 
-async function resolveGitAuthToken(remoteUrl: string): Promise<string> {
+async function resolveGitAuthToken(
+  remoteUrl: string,
+  configuredToken = config.gitToken ?? "",
+): Promise<string> {
   const resolved = await resolveGitTokenForRemote({
     remoteUrl,
-    configuredToken: config.gitToken ?? "",
+    configuredToken,
     cwd: repoRoot,
   });
   return resolved.token;
@@ -770,33 +915,33 @@ async function ensureMainPullRequest(completion: {
   branch: string;
   prTitle?: string | null;
   prBody?: string | null;
-}) {
+}, runtimeConfig: SourceControlManagerConfig = config) {
   const remoteUrlResult = await runGitCapture(
-    ["-C", config.repoPath, "remote", "get-url", config.remote],
+    ["-C", runtimeConfig.repoPath, "remote", "get-url", runtimeConfig.remote],
     repoRoot,
   );
   if (!remoteUrlResult.ok || !remoteUrlResult.stdout) {
     throw new Error(
-      `Unable to resolve git remote URL for ${config.remote}: ${
+      `Unable to resolve git remote URL for ${runtimeConfig.remote}: ${
         remoteUrlResult.stderr || remoteUrlResult.stdout
       }`,
     );
   }
   const remoteUrl = remoteUrlResult.stdout.trim();
-  const token = await resolveGitAuthToken(remoteUrl);
+  const token = await resolveGitAuthToken(remoteUrl, runtimeConfig.gitToken ?? "");
   if (!token) {
     throw new Error(
       "No git provider token available for PR creation (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN).",
     );
   }
 
-  const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
+  const prBaseBranch = (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
   const completionPrTitle = (completion.prTitle ?? "").trim();
   const completionPrBody = (completion.prBody ?? "").trim();
   const prTitleCandidate =
     completionPrTitle ||
-    (config.prTitle ?? "").trim() ||
-    `PushPals: merge ${config.mainBranch} into ${prBaseBranch}`;
+    (runtimeConfig.prTitle ?? "").trim() ||
+    `PushPals: merge ${runtimeConfig.mainBranch} into ${prBaseBranch}`;
   const prTitle = normalizePrTitleCandidate(prTitleCandidate);
   const prBody =
     completionPrBody ||
@@ -804,7 +949,7 @@ async function ensureMainPullRequest(completion: {
     [
       "Automated PR opened by SourceControlManager.",
       "",
-      `- Integration branch: \`${config.mainBranch}\``,
+      `- Integration branch: \`${runtimeConfig.mainBranch}\``,
       `- Base branch: \`${prBaseBranch}\``,
       `- Latest merged completion: \`${completion.id}\``,
       `- Latest commit: \`${completion.commitSha}\``,
@@ -815,11 +960,11 @@ async function ensureMainPullRequest(completion: {
   return ensureIntegrationPullRequest({
     token,
     remoteUrl,
-    headBranch: config.mainBranch,
+    headBranch: runtimeConfig.mainBranch,
     baseBranch: prBaseBranch,
     title: prTitle,
     body: prBody,
-    draft: config.prDraft,
+    draft: runtimeConfig.prDraft,
   });
 }
 
@@ -963,50 +1108,13 @@ async function main(): Promise<void> {
   await emitStartupStatus();
   startStatusHeartbeat();
 
-  // Start ReviewAgent poll loop if enabled
-  if (config.reviewAgent.enabled) {
-    const remoteUrlResult = await runGitCapture(
-      ["-C", config.repoPath, "remote", "get-url", config.remote],
-      repoRoot,
-    );
-    const remoteUrl = remoteUrlResult.ok ? remoteUrlResult.stdout.trim() : "";
-    const gitProviderToken = remoteUrl ? await resolveGitAuthToken(remoteUrl) : "";
+  await syncReviewAgentRuntimeConfig();
+  startReviewAgentRuntimeConfigPolling();
 
-    if (!remoteUrl) {
-      console.warn(
-        `[${ts()}] ReviewAgent enabled but could not resolve remote URL — polling disabled`,
-      );
-    } else if (!gitProviderToken) {
-      console.warn(
-        `[${ts()}] ReviewAgent enabled but no git provider token found (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN) — polling disabled`,
-      );
-    } else {
-      const reviewAgent = new ReviewAgent(
-        config.reviewAgent,
-        config.serverUrl,
-        gitProviderToken,
-        remoteUrl,
-        (config.prBaseBranch || integrationBaseBranch).trim(),
-        config.authToken,
-      );
-      reviewAgentInstance = reviewAgent;
-      console.log(
-        `[${ts()}] ReviewAgent started (poll interval: ${config.reviewAgent.pollIntervalMs}ms, pass threshold: ${config.reviewAgent.passThreshold}/10)`,
-      );
-      reviewAgentPollTimer = setInterval(
-        () =>
-          reviewAgent.poll().catch((err: any) => {
-            console.error(`[${ts()}] [ReviewAgent] Poll error: ${err?.message ?? err}`);
-          }),
-        config.reviewAgent.pollIntervalMs,
-      );
-      void reviewAgent.poll().catch((err: any) => {
-        console.error(`[${ts()}] [ReviewAgent] Initial poll error: ${err?.message ?? err}`);
-      });
-    }
-  }
+  // ReviewAgent startup is managed by runtime config polling above.
 
   // Initial tick — retry on transient errors (e.g. remote unreachable)
+
   for (let attempt = 1; ; attempt++) {
     try {
       await tick();
@@ -1040,11 +1148,11 @@ async function shutdown(): Promise<void> {
       clearInterval(statusHeartbeatTimer);
       statusHeartbeatTimer = null;
     }
-    if (reviewAgentPollTimer) {
-      clearInterval(reviewAgentPollTimer);
-      reviewAgentPollTimer = null;
+    if (reviewAgentConfigPollTimer) {
+      clearInterval(reviewAgentConfigPollTimer);
+      reviewAgentConfigPollTimer = null;
     }
-    reviewAgentInstance = null;
+    clearReviewAgentPollLoop();
     void createSessionComm(statusSessionId).status(
       "source_control_manager",
       "shutting_down",

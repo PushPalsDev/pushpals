@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { join, resolve } from "path";
+import { tmpdir } from "os";
 import { applyCliOverrides, loadConfig, validateConfig } from "../apps/source_control_manager/src/config";
 
 describe("source_control_manager config", () => {
@@ -44,5 +47,39 @@ describe("source_control_manager config", () => {
     config.reviewAgent.pollIntervalMs = 100;
 
     expect(() => validateConfig(config)).toThrow("reviewAgent.pollIntervalMs");
+  });
+
+  test("loadConfig reloads updated shared runtime config", () => {
+    const originalConfigDir = process.env.PUSHPALS_CONFIG_DIR_OVERRIDE;
+    const tempRoot = mkdtempSync(join(tmpdir(), "pushpals-scm-config-"));
+    const configDir = join(tempRoot, "configs");
+    mkdirSync(configDir, { recursive: true });
+    cpSync(resolve(import.meta.dir, "..", "configs", "default.toml"), join(configDir, "default.toml"));
+    cpSync(
+      resolve(import.meta.dir, "..", "configs", "local.example.toml"),
+      join(configDir, "local.example.toml"),
+    );
+    writeFileSync(
+      join(configDir, "local.toml"),
+      "[source_control_manager.review_agent]\nenabled = false\n",
+      "utf8",
+    );
+    process.env.PUSHPALS_CONFIG_DIR_OVERRIDE = configDir;
+
+    try {
+      expect(loadConfig({ reload: true }).reviewAgent.enabled).toBe(false);
+
+      writeFileSync(
+        join(configDir, "local.toml"),
+        "[source_control_manager.review_agent]\nenabled = true\n",
+        "utf8",
+      );
+
+      expect(loadConfig({ reload: true }).reviewAgent.enabled).toBe(true);
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.PUSHPALS_CONFIG_DIR_OVERRIDE;
+      else process.env.PUSHPALS_CONFIG_DIR_OVERRIDE = originalConfigDir;
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });
