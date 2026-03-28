@@ -14,6 +14,7 @@ import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title
 import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
 import {
   cloneSourceControlManagerConfigSnapshot,
+  createStartupStatusTracker,
   createSingleFlightExecutor,
 } from "./runtime_helpers";
 import { createStatusServer } from "./http";
@@ -213,6 +214,7 @@ let reviewAgentConfigPollTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentInstance: ReviewAgent | null = null;
 let statusSessionReady = false;
 let shutdownPromise: Promise<void> | null = null;
+const startupStatusTracker = createStartupStatusTracker();
 let reviewAgentRuntimeStateKey = "startup";
 let reviewAgentRuntimeFingerprint = "";
 
@@ -344,8 +346,10 @@ async function ensureSessionWithRetry(
 }
 
 async function emitStartupStatus(): Promise<void> {
+  if (!startupStatusTracker.canEmitInitializing(running)) return;
   const sessionReady = await ensureSessionWithRetry(statusSessionId);
   if (!sessionReady) return;
+  if (!startupStatusTracker.beginOnlineTransition()) return;
   statusSessionReady = true;
   const comm = createSessionComm(statusSessionId);
   const ok = await comm.status(
@@ -355,6 +359,7 @@ async function emitStartupStatus(): Promise<void> {
   );
   if (!ok) {
     statusSessionReady = false;
+    startupStatusTracker.revertOnlineTransition();
     console.warn(`[${ts()}] Failed to emit source_control_manager startup status event`);
   }
 }
@@ -362,12 +367,13 @@ async function emitStartupStatus(): Promise<void> {
 async function emitInitializingStatus(): Promise<void> {
   // Keep retrying in the background so UI gets an initializing signal even if
   // server/session startup races SourceControlManager boot checks.
-  while (running && !statusSessionReady) {
+  while (startupStatusTracker.canEmitInitializing(running) && !statusSessionReady) {
     const sessionReady = await ensureSessionWithRetry(statusSessionId, 6, 400, 2_500);
     if (!sessionReady) {
       await Bun.sleep(1_000);
       continue;
     }
+    if (!startupStatusTracker.canEmitInitializing(running)) return;
     statusSessionReady = true;
     const comm = createSessionComm(statusSessionId);
     const ok = await comm.status(
@@ -1143,6 +1149,7 @@ async function shutdown(): Promise<void> {
   shutdownPromise = (async () => {
     if (!running) return;
     running = false;
+    startupStatusTracker.markShutdown();
     console.log(`\n[${ts()}] Shutting down...`);
     if (statusHeartbeatTimer) {
       clearInterval(statusHeartbeatTimer);

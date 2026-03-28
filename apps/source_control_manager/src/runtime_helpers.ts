@@ -1,5 +1,7 @@
 import type { SourceControlManagerConfig } from "./config";
 
+export type SourceControlManagerStartupStatusPhase = "startup" | "online" | "shutdown";
+
 export function cloneSourceControlManagerConfigSnapshot(
   config: SourceControlManagerConfig,
 ): SourceControlManagerConfig {
@@ -21,5 +23,35 @@ export function createSingleFlightExecutor<T>(worker: () => Promise<T>): () => P
       inFlight = null;
     });
     return inFlight;
+  };
+}
+
+export function createStartupStatusTracker(
+  initialPhase: SourceControlManagerStartupStatusPhase = "startup",
+): {
+  getPhase: () => SourceControlManagerStartupStatusPhase;
+  canEmitInitializing: (running: boolean) => boolean;
+  beginOnlineTransition: () => boolean;
+  revertOnlineTransition: () => void;
+  markShutdown: () => void;
+} {
+  let phase = initialPhase;
+
+  return {
+    getPhase: () => phase,
+    canEmitInitializing: (running: boolean) => running && phase === "startup",
+    beginOnlineTransition: () => {
+      if (phase !== "startup") return false;
+      phase = "online";
+      return true;
+    },
+    revertOnlineTransition: () => {
+      if (phase === "online") {
+        phase = "startup";
+      }
+    },
+    markShutdown: () => {
+      phase = "shutdown";
+    },
   };
 }

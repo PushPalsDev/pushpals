@@ -27,6 +27,7 @@ describe("server JobQueue dedupe", () => {
     expect(second.ok).toBe(true);
     expect(second.deduped).toBe(true);
     expect(second.jobId).toBe(firstJobId);
+    expect(second.taskId).toBe("task-dup-1");
     queue.close();
   });
 
@@ -61,6 +62,7 @@ describe("server JobQueue dedupe", () => {
     expect(second.ok).toBe(true);
     expect(second.deduped).toBe(true);
     expect(second.jobId).toBe(firstJobId);
+    expect(second.taskId).toBe("task-cooldown-1");
     queue.close();
   });
 

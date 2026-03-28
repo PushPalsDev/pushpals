@@ -553,6 +553,7 @@ export class JobQueue {
   enqueue(body: Record<string, unknown>): {
     ok: boolean;
     jobId?: string;
+    taskId?: string;
     queuePosition?: number;
     etaMs?: number;
     deduped?: boolean;
@@ -599,18 +600,19 @@ export class JobQueue {
     if (dedupeKey) {
       const active = this.db
         .prepare(
-          `SELECT id
+          `SELECT id, taskId
            FROM jobs
            WHERE dedupeKey = ?
              AND status IN ('pending', 'claimed')
            ORDER BY createdAt DESC
            LIMIT 1`,
         )
-        .get(dedupeKey) as { id: string } | undefined;
+        .get(dedupeKey) as { id: string; taskId: string } | undefined;
       if (active?.id) {
         return {
           ok: true,
           jobId: active.id,
+          taskId: active.taskId,
           deduped: true,
           message: `Active job already exists for dedupeKey ${dedupeKey}`,
         };
@@ -619,19 +621,20 @@ export class JobQueue {
       if (dedupeCooldownMs > 0) {
         const latest = this.db
           .prepare(
-            `SELECT id, createdAt
+            `SELECT id, taskId, createdAt
              FROM jobs
              WHERE dedupeKey = ?
              ORDER BY createdAt DESC
              LIMIT 1`,
           )
-          .get(dedupeKey) as { id: string; createdAt: string } | undefined;
+          .get(dedupeKey) as { id: string; taskId: string; createdAt: string } | undefined;
         if (latest?.id) {
           const createdAtMs = parseIsoMs(latest.createdAt);
           if (createdAtMs != null && Date.now() - createdAtMs < dedupeCooldownMs) {
             return {
               ok: true,
               jobId: latest.id,
+              taskId: latest.taskId,
               deduped: true,
               message: `Dedupe cooldown active for dedupeKey ${dedupeKey}`,
             };
@@ -683,18 +686,19 @@ export class JobQueue {
       if (dedupeKey && /UNIQUE constraint failed/i.test(message)) {
         const active = this.db
           .prepare(
-            `SELECT id
+            `SELECT id, taskId
              FROM jobs
              WHERE dedupeKey = ?
                AND status IN ('pending', 'claimed')
              ORDER BY createdAt DESC
              LIMIT 1`,
           )
-          .get(dedupeKey) as { id: string } | undefined;
+          .get(dedupeKey) as { id: string; taskId: string } | undefined;
         if (active?.id) {
           return {
             ok: true,
             jobId: active.id,
+            taskId: active.taskId,
             deduped: true,
             message: `Active job already exists for dedupeKey ${dedupeKey}`,
           };
@@ -708,6 +712,7 @@ export class JobQueue {
     return {
       ok: true,
       jobId,
+      taskId,
       queuePosition: queuePosition ?? undefined,
       etaMs: etaMs ?? undefined,
     };

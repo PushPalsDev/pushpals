@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { loadConfig } from "../apps/source_control_manager/src/config";
 import {
   cloneSourceControlManagerConfigSnapshot,
+  createStartupStatusTracker,
   createSingleFlightExecutor,
 } from "../apps/source_control_manager/src/runtime_helpers";
 
@@ -37,5 +38,30 @@ describe("source_control_manager runtime helpers", () => {
     await expect(first).resolves.toBe(1);
     await expect(second).resolves.toBe(1);
     await expect(run()).resolves.toBe(2);
+  });
+
+  test("createStartupStatusTracker prevents stale initializing emissions after online", () => {
+    const tracker = createStartupStatusTracker();
+
+    expect(tracker.getPhase()).toBe("startup");
+    expect(tracker.canEmitInitializing(true)).toBe(true);
+    expect(tracker.beginOnlineTransition()).toBe(true);
+    expect(tracker.getPhase()).toBe("online");
+    expect(tracker.canEmitInitializing(true)).toBe(false);
+    expect(tracker.beginOnlineTransition()).toBe(false);
+  });
+
+  test("createStartupStatusTracker can revert a failed online transition before shutdown", () => {
+    const tracker = createStartupStatusTracker();
+
+    expect(tracker.beginOnlineTransition()).toBe(true);
+    tracker.revertOnlineTransition();
+    expect(tracker.getPhase()).toBe("startup");
+    expect(tracker.canEmitInitializing(true)).toBe(true);
+
+    tracker.markShutdown();
+    expect(tracker.getPhase()).toBe("shutdown");
+    expect(tracker.canEmitInitializing(true)).toBe(false);
+    expect(tracker.beginOnlineTransition()).toBe(false);
   });
 });

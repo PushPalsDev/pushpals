@@ -257,6 +257,12 @@ export type RequestAutonomyMetadata = AutonomyJobMetadata & {
   writeGlobs: string[];
 };
 
+type EnqueueJobResult = {
+  jobId: string;
+  taskId: string;
+  deduped: boolean;
+};
+
 function asAutonomyComponentArea(value: unknown): AutonomyComponentArea | undefined {
   return normalizeAutonomyComponentArea(value) ?? undefined;
 }
@@ -310,6 +316,37 @@ function normalizeMetadataWriteGlobs(value: unknown, maxItems = 48): string[] {
     if (out.length >= maxItems) break;
   }
   return out;
+}
+
+export function buildTaskExecuteDedupeKey(
+  sessionId: string,
+  params: TaskExecuteJobParams,
+): string | null {
+  if (params.origin !== "user") return null;
+  const normalizedSessionId = String(sessionId ?? "").trim().toLowerCase();
+  if (!normalizedSessionId) return null;
+
+  const rawTargetPaths = Array.isArray(params.planning.targetPaths) ? params.planning.targetPaths : [];
+  const normalizedTargets = rawTargetPaths
+    .map((entry) => normalizeTargetPath(entry))
+    .filter((entry): entry is string => Boolean(entry))
+    .filter((entry) => entry !== ".")
+    .slice(0, 8);
+  if (normalizedTargets.length === 0) return null;
+
+  const uniqueTargets = [...new Set(normalizedTargets)].sort((a, b) => a.localeCompare(b));
+  if (uniqueTargets.length > 4) return null;
+
+  const maxFilesToEdit = params.planning.scope.maxFilesToEdit;
+  if (
+    typeof maxFilesToEdit === "number" &&
+    Number.isFinite(maxFilesToEdit) &&
+    maxFilesToEdit > 4
+  ) {
+    return null;
+  }
+
+  return `task.execute:user:${normalizedSessionId}:${uniqueTargets.join("|")}`.toLowerCase();
 }
 
 function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata | null {
@@ -1461,7 +1498,7 @@ export class RemoteBuddyOrchestrator {
     sessionId: string,
     params: TaskExecuteJobParams,
     targetWorkerId: string | null = null,
-  ): Promise<string | null> {
+  ): Promise<EnqueueJobResult | null> {
     try {
       const payload: Record<string, unknown> = {
         taskId,
@@ -1469,6 +1506,8 @@ export class RemoteBuddyOrchestrator {
         kind,
         params,
       };
+      const dedupeKey = buildTaskExecuteDedupeKey(sessionId, params);
+      if (dedupeKey) payload.dedupeKey = dedupeKey;
       if (targetWorkerId) payload.targetWorkerId = targetWorkerId;
 
       const res = await fetch(`${this.server}/jobs/enqueue`, {
@@ -1481,12 +1520,22 @@ export class RemoteBuddyOrchestrator {
         console.error(`[RemoteBuddy] Enqueue failed: ${res.status} ${err}`);
         return null;
       }
-      const data = (await res.json()) as { ok: boolean; jobId?: string };
-      if (!data.ok || !data.jobId) {
+      const data = (await res.json()) as {
+        ok: boolean;
+        jobId?: string;
+        taskId?: string;
+        deduped?: boolean;
+      };
+      const resolvedTaskId = String(data.taskId ?? taskId).trim();
+      if (!data.ok || !data.jobId || !resolvedTaskId) {
         console.error(`[RemoteBuddy] Enqueue response missing jobId:`, data);
         return null;
       }
-      return data.jobId;
+      return {
+        jobId: data.jobId,
+        taskId: resolvedTaskId,
+        deduped: data.deduped === true,
+      };
     } catch (err) {
       console.error(`[RemoteBuddy] Enqueue error:`, err);
       return null;
@@ -2434,82 +2483,100 @@ export class RemoteBuddyOrchestrator {
             origin: "user",
           };
 
-      await this.sendCommand(requestSessionId, {
-        type: "task_created",
-        payload: {
-          taskId,
-          title: `Execute request: ${toSingleLine(prompt, 64) || "user request"}`,
-          description:
-            lane === "deterministic"
-              ? "Deterministic execution lane (fast path)"
-              : "Agentic worker execution lane",
-          createdBy: `agent:${this.agentId}`,
-          priority,
-        },
-        turnId,
-      });
-      await this.sendCommand(requestSessionId, { type: "task_started", payload: { taskId }, turnId });
-      await this.sendCommand(requestSessionId, {
-        type: "task_progress",
-        payload: {
-          taskId,
-          message: targetWorkerId
-            ? `Assigned to WorkerPal ${targetWorkerId} (${lane} lane)`
-            : "No idle WorkerPal available; queued for first available WorkerPal",
-        },
-        turnId,
-      });
-
-      await this.assistantMessage(
-        requestSessionId,
-        targetWorkerId
-          ? `Assigned this request to WorkerPal ${targetWorkerId} (${lane} lane).`
-          : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.",
-        { turnId, correlationId: requestId },
-      );
-
-      const jobId = await this.enqueueJob(
+      const enqueueResult = await this.enqueueJob(
         taskId,
         "task.execute",
         requestSessionId,
         params,
         targetWorkerId,
       );
-      if (jobId) {
-        this.rememberPersistentMemory(
-          "job_enqueued",
-          `job=${jobId.slice(0, 8)} lane=${lane} intent=${plan.intent} worker=${targetWorkerId ?? "queue"}`,
-          requestId,
-          requestSessionId,
-        );
+      if (enqueueResult) {
+        const effectiveTaskId = enqueueResult.taskId;
+        if (!enqueueResult.deduped) {
+          await this.sendCommand(requestSessionId, {
+            type: "task_created",
+            payload: {
+              taskId: effectiveTaskId,
+              title: `Execute request: ${toSingleLine(prompt, 64) || "user request"}`,
+              description:
+                lane === "deterministic"
+                  ? "Deterministic execution lane (fast path)"
+                  : "Agentic worker execution lane",
+              createdBy: `agent:${this.agentId}`,
+              priority,
+            },
+            turnId,
+          });
+          await this.sendCommand(requestSessionId, {
+            type: "task_started",
+            payload: { taskId: effectiveTaskId },
+            turnId,
+          });
+        }
         await this.sendCommand(requestSessionId, {
-          type: "job_enqueued",
+          type: "task_progress",
           payload: {
-            jobId,
-            taskId,
-            kind: "task.execute",
-            params,
-            origin: autonomyMetadata ? "autonomy" : "user",
-            ...(autonomyMetadata
-              ? {
-                  autonomy: {
-                    ...(autonomyMetadata.objectiveId
-                      ? { objectiveId: autonomyMetadata.objectiveId }
-                      : {}),
-                    ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
-                    ...(autonomyMetadata.snapshotId
-                      ? { snapshotId: autonomyMetadata.snapshotId }
-                      : {}),
-                    ...(autonomyMetadata.patternKey
-                      ? { patternKey: autonomyMetadata.patternKey }
-                      : {}),
-                  },
-                }
-              : {}),
+            taskId: effectiveTaskId,
+            message: enqueueResult.deduped
+              ? "Reused active WorkerPal task for the same targeted file scope"
+              : targetWorkerId
+                ? `Assigned to WorkerPal ${targetWorkerId} (${lane} lane)`
+                : "No idle WorkerPal available; queued for first available WorkerPal",
           },
           turnId,
         });
+
+        await this.assistantMessage(
+          requestSessionId,
+          enqueueResult.deduped
+            ? "A matching WorkerPal task is already in progress for the same targeted file scope. Reusing that task instead of queuing a duplicate."
+            : targetWorkerId
+              ? `Assigned this request to WorkerPal ${targetWorkerId} (${lane} lane).`
+              : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.",
+          { turnId, correlationId: requestId },
+        );
+
+        this.rememberPersistentMemory(
+          enqueueResult.deduped ? "job_reused" : "job_enqueued",
+          `job=${enqueueResult.jobId.slice(0, 8)} lane=${lane} intent=${plan.intent} worker=${targetWorkerId ?? "queue"} deduped=${enqueueResult.deduped ? "yes" : "no"}`,
+          requestId,
+          requestSessionId,
+        );
+        if (!enqueueResult.deduped) {
+          await this.sendCommand(requestSessionId, {
+            type: "job_enqueued",
+            payload: {
+              jobId: enqueueResult.jobId,
+              taskId: effectiveTaskId,
+              kind: "task.execute",
+              params,
+              origin: autonomyMetadata ? "autonomy" : "user",
+              ...(autonomyMetadata
+                ? {
+                    autonomy: {
+                      ...(autonomyMetadata.objectiveId
+                        ? { objectiveId: autonomyMetadata.objectiveId }
+                        : {}),
+                      ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
+                      ...(autonomyMetadata.snapshotId
+                        ? { snapshotId: autonomyMetadata.snapshotId }
+                        : {}),
+                      ...(autonomyMetadata.patternKey
+                        ? { patternKey: autonomyMetadata.patternKey }
+                        : {}),
+                    },
+                  }
+                : {}),
+            },
+            turnId,
+          });
+        }
       } else {
+        await this.assistantMessage(
+          requestSessionId,
+          "I could not queue this WorkerPal task. No task was started.",
+          { turnId, correlationId: requestId },
+        );
         this.rememberPersistentMemory(
           "job_enqueue_failed",
           `enqueue_failed lane=${lane} intent=${plan.intent}`,
