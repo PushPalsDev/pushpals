@@ -1596,6 +1596,244 @@ const COMMIT_MOTIF_RULES: CommitMotifRule[] = [
   },
 ];
 
+const ENGINE_DIVERSITY_MOTIF_IDS = new Set(COMMIT_MOTIF_RULES.map((rule) => rule.motifId));
+export const ENGINE_DIVERSITY_MAX_MOTIF_ROWS = 16;
+export const ENGINE_DIVERSITY_MAX_ADJACENCY_ROWS = 48;
+const ENGINE_DIVERSITY_MAX_WINDOW_MINUTES = 14 * 24 * 60;
+const ENGINE_DIVERSITY_MAX_SAMPLE_COUNT = 50_000;
+const ENGINE_DIVERSITY_MAX_OVERLAP = 50_000;
+const ENGINE_DIVERSITY_DEFAULT_UPDATED_AT = "1970-01-01T00:00:00.000Z";
+const ENGINE_DIVERSITY_WEIGHT_PRECISION = 1_000_000;
+
+export type EngineDiversityMotifMetric = {
+  motif_id: string;
+  sample_count: number;
+  novelty_ratio: number;
+  regret_ratio: number;
+  tuning_weight: number;
+};
+
+export type EngineDiversityAdjacencyMetric = {
+  motif_id: string;
+  neighbor_motif_id: string;
+  sample_overlap: number;
+  novelty_delta: number;
+  regret_delta: number;
+  tuning_weight: number;
+};
+
+export type EngineDiversityMetrics = {
+  updated_at: string;
+  window_minutes: number;
+  motif_metrics: EngineDiversityMotifMetric[];
+  adjacency_pool: EngineDiversityAdjacencyMetric[];
+  truncated: boolean;
+};
+
+export function ensureEngineDiversityMetrics(value: unknown): EngineDiversityMetrics {
+  const raw = asObject(value);
+  const windowMs = asNumber(raw.window_ms, Number.NaN);
+  const windowMinutes = sanitizeEngineDiversityWindowMinutes(
+    raw.window_minutes ??
+      raw.sample_window_minutes ??
+      raw.window_mins ??
+      (Number.isFinite(windowMs) ? windowMs / 60_000 : undefined),
+  );
+  const updatedAt = sanitizeEngineDiversityTimestamp(
+    raw.updated_at ?? raw.window_ended_at ?? raw.generated_at,
+  );
+
+  const motifSource = Array.isArray(raw.motif_metrics)
+    ? raw.motif_metrics
+    : Array.isArray(raw.motifs)
+      ? raw.motifs
+      : [];
+  const adjacencySource = Array.isArray(raw.adjacency_pool) ? raw.adjacency_pool : [];
+
+  const motifResult = sanitizeEngineMotifMetrics(motifSource);
+  const adjacencyResult = sanitizeEngineAdjacencyMetrics(adjacencySource);
+  normalizeEngineAdjacencyWeights(adjacencyResult.items);
+
+  return {
+    updated_at: updatedAt,
+    window_minutes: windowMinutes,
+    motif_metrics: motifResult.items,
+    adjacency_pool: adjacencyResult.items,
+    truncated: motifResult.truncated || adjacencyResult.truncated,
+  };
+}
+
+function sanitizeEngineMotifMetrics(source: unknown[]): {
+  items: EngineDiversityMotifMetric[];
+  truncated: boolean;
+} {
+  const items: EngineDiversityMotifMetric[] = [];
+  let accepted = 0;
+  for (const entry of source) {
+    const metric = sanitizeEngineMotifMetric(entry);
+    if (!metric) continue;
+    accepted++;
+    if (items.length < ENGINE_DIVERSITY_MAX_MOTIF_ROWS) {
+      items.push(metric);
+    }
+  }
+  items.sort((a, b) => {
+    if (b.sample_count !== a.sample_count) return b.sample_count - a.sample_count;
+    return a.motif_id.localeCompare(b.motif_id);
+  });
+  return { items, truncated: accepted > items.length };
+}
+
+function sanitizeEngineAdjacencyMetrics(source: unknown[]): {
+  items: EngineDiversityAdjacencyMetric[];
+  truncated: boolean;
+} {
+  const items: EngineDiversityAdjacencyMetric[] = [];
+  let accepted = 0;
+  for (const entry of source) {
+    const metric = sanitizeEngineAdjacencyMetric(entry);
+    if (!metric) continue;
+    accepted++;
+    if (items.length < ENGINE_DIVERSITY_MAX_ADJACENCY_ROWS) {
+      items.push(metric);
+    }
+  }
+  items.sort((a, b) => {
+    if (b.sample_overlap !== a.sample_overlap) return b.sample_overlap - a.sample_overlap;
+    const aKey = `${a.motif_id}:${a.neighbor_motif_id}`;
+    const bKey = `${b.motif_id}:${b.neighbor_motif_id}`;
+    return aKey.localeCompare(bKey);
+  });
+  return { items, truncated: accepted > items.length };
+}
+
+function sanitizeEngineMotifMetric(entry: unknown): EngineDiversityMotifMetric | null {
+  const obj = asObject(entry);
+  const motifId = asString(obj.motif_id ?? obj.motifId ?? obj.id);
+  if (!motifId || !ENGINE_DIVERSITY_MOTIF_IDS.has(motifId)) return null;
+  return {
+    motif_id: motifId,
+    sample_count: sanitizeEngineCount(
+      obj.sample_count ?? obj.sampleCount ?? obj.samples,
+      ENGINE_DIVERSITY_MAX_SAMPLE_COUNT,
+    ),
+    novelty_ratio: sanitizeEngineRatio(obj.novelty_ratio ?? obj.novelty ?? obj.novelty_bias),
+    regret_ratio: sanitizeEngineRatio(obj.regret_ratio ?? obj.regret ?? obj.regret_bias),
+    tuning_weight: sanitizeEngineRatio(obj.tuning_weight ?? obj.weight ?? obj.bias_weight),
+  };
+}
+
+function sanitizeEngineAdjacencyMetric(entry: unknown): EngineDiversityAdjacencyMetric | null {
+  const obj = asObject(entry);
+  const motifId = asString(obj.motif_id ?? obj.source_motif_id ?? obj.motif);
+  const neighborId = asString(obj.neighbor_motif_id ?? obj.target_motif_id ?? obj.neighbor);
+  if (!motifId || !neighborId) return null;
+  if (!ENGINE_DIVERSITY_MOTIF_IDS.has(motifId) || !ENGINE_DIVERSITY_MOTIF_IDS.has(neighborId)) return null;
+  return {
+    motif_id: motifId,
+    neighbor_motif_id: neighborId,
+    sample_overlap: sanitizeEngineCount(
+      obj.sample_overlap ?? obj.sampleCount ?? obj.samples ?? obj.overlap,
+      ENGINE_DIVERSITY_MAX_OVERLAP,
+    ),
+    novelty_delta: sanitizeEngineDelta(obj.novelty_delta ?? obj.novelty ?? obj.novelty_bias),
+    regret_delta: sanitizeEngineDelta(obj.regret_delta ?? obj.regret ?? obj.regret_bias),
+    tuning_weight: sanitizeEngineRatio(obj.tuning_weight ?? obj.weight ?? obj.bias_weight),
+  };
+}
+
+function coerceEngineNumber(value: unknown): number | null {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    if (!normalized) return null;
+    const parsed = Number(normalized);
+    if (!Number.isNaN(parsed)) return parsed;
+    return null;
+  }
+  return null;
+}
+
+function sanitizeEngineCount(value: unknown, max: number): number {
+  const raw = coerceEngineNumber(value);
+  if (raw === null) return 0;
+  if (Number.isNaN(raw)) return 0;
+  if (!Number.isFinite(raw)) return raw < 0 ? 0 : max;
+  const n = Math.floor(raw);
+  if (n <= 0) return 0;
+  if (n >= max) return max;
+  return n;
+}
+
+function sanitizeEngineDelta(value: unknown): number {
+  const raw = coerceEngineNumber(value);
+  if (raw === null) return 0;
+  if (Number.isNaN(raw)) return 0;
+  if (!Number.isFinite(raw)) return raw < 0 ? -1 : 1;
+  if (raw <= -1) return -1;
+  if (raw >= 1) return 1;
+  return raw;
+}
+
+function sanitizeEngineDiversityWindowMinutes(value: unknown): number {
+  return sanitizeEngineCount(value, ENGINE_DIVERSITY_MAX_WINDOW_MINUTES);
+}
+
+function sanitizeEngineDiversityTimestamp(value: unknown): string {
+  const text = asString(value);
+  if (text) {
+    const parsed = Date.parse(text);
+    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+  }
+  return ENGINE_DIVERSITY_DEFAULT_UPDATED_AT;
+}
+
+function normalizeEngineAdjacencyWeights(
+  rows: Array<Pick<EngineDiversityAdjacencyMetric, "motif_id" | "neighbor_motif_id" | "tuning_weight">>,
+): void {
+  if (rows.length === 0) return;
+  const clamped = rows.map((row) => sanitizeEngineRatio(row.tuning_weight));
+  const total = clamped.reduce((sum, value) => sum + value, 0);
+  const normalized =
+    total > 0 ? clamped.map((value) => value / total) : clamped.map(() => 1 / rows.length);
+  const scaled = normalized.map((value) => clampToRange(value, 0, 1) * ENGINE_DIVERSITY_WEIGHT_PRECISION);
+  const baseShares = scaled.map((value) => Math.floor(value));
+  let remainder = ENGINE_DIVERSITY_WEIGHT_PRECISION - baseShares.reduce((sum, share) => sum + share, 0);
+  const ranked = scaled.map((value, index) => ({
+    index,
+    fraction: value - baseShares[index],
+    key: `${rows[index].motif_id}:${rows[index].neighbor_motif_id}`,
+  }));
+  ranked.sort((a, b) => {
+    if (b.fraction !== a.fraction) return b.fraction - a.fraction;
+    const keyCompare = a.key.localeCompare(b.key);
+    if (keyCompare !== 0) return keyCompare;
+    return a.index - b.index;
+  });
+  while (remainder > 0) {
+    for (const entry of ranked) {
+      if (remainder <= 0) break;
+      baseShares[entry.index]++;
+      remainder--;
+    }
+  }
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].tuning_weight = Number(
+      (baseShares[i] / ENGINE_DIVERSITY_WEIGHT_PRECISION).toFixed(6),
+    );
+  }
+}
+
+function sanitizeEngineRatio(value: unknown): number {
+  const raw = coerceEngineNumber(value);
+  if (raw === null) return 0;
+  if (Number.isNaN(raw)) return 0;
+  if (!Number.isFinite(raw)) return raw < 0 ? 0 : 1;
+  if (raw <= 0) return 0;
+  if (raw >= 1) return 1;
+  return raw;
+}
+
 function bucketLines(items: VisionKeyItems, keys: Array<keyof VisionKeyItems>): string[] {
   return keys.flatMap((key) => (Array.isArray(items[key]) ? items[key] : [])).filter(Boolean);
 }
