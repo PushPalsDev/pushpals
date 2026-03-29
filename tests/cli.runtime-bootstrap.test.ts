@@ -22,6 +22,7 @@ import {
   extractRemoteBuddyAutonomousEngineState,
   extractRemoteBuddySessionConsumerHealth,
   formatRuntimeStartupTimingSummary,
+  formatWorkerExecutionReadinessLines,
   formatTimestampedCliLine,
   formatSessionEventLine,
   injectMonitoringHubBootstrap,
@@ -36,9 +37,11 @@ import {
   resolveRuntimeDockerExecutableCandidates,
   resolveRuntimeGitExecutableCandidates,
   resolveCliLocalBuddyAutostart,
+  resolveWorkerExecutionReadiness,
   resolveCliStatePath,
   resolveCommandPath,
   repoLooksLikePushPalsSourceCheckout,
+  shouldRunEmbeddedRuntimeStartupPrechecks,
   resolvePreferredRuntimeReleaseTag,
   resolveWindowsShellExecutableCandidatesForEnv,
   startEmbeddedMonitoringHub,
@@ -698,6 +701,141 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     } finally {
       Date.now = originalNow;
     }
+  });
+
+  test("resolveWorkerExecutionReadiness reports blocked when required Docker-backed auto-spawn cannot start", async () => {
+    const result = await resolveWorkerExecutionReadiness({
+      serverUrl: "http://127.0.0.1:3001",
+      ttlMs: 60_000,
+      autoSpawnWorkerpals: true,
+      dockerEnabled: true,
+      requireDocker: true,
+      repoRoot: "C:/repo/example",
+      runtimeRoot: "C:/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      sessionId: "dev",
+      fetchWorkersFn: async () => [],
+      precheckDockerAvailabilityFn: async () => ({
+        status: "failed",
+        detail: "docker daemon is not running",
+        env: { PATH: process.env.PATH ?? "" },
+      }),
+    });
+
+    expect(result).toEqual({
+      state: "blocked",
+      detail: "Docker-backed WorkerPal auto-spawn is unavailable: docker daemon is not running",
+      action: "Start Docker Desktop or the Docker daemon, then retry startup or rerun /status.",
+    });
+    expect(formatWorkerExecutionReadinessLines(result)).toEqual([
+      "[pushpals] workerExecution=blocked detail=Docker-backed WorkerPal auto-spawn is unavailable: docker daemon is not running",
+      "[pushpals] workerExecutionAction=Start Docker Desktop or the Docker daemon, then retry startup or rerun /status.",
+    ]);
+  });
+
+  test("resolveWorkerExecutionReadiness reports warming from live worker status without re-running Docker checks", async () => {
+    let dockerChecks = 0;
+    const result = await resolveWorkerExecutionReadiness({
+      serverUrl: "http://127.0.0.1:3001",
+      ttlMs: 60_000,
+      autoSpawnWorkerpals: true,
+      dockerEnabled: true,
+      requireDocker: true,
+      repoRoot: "C:/repo/example",
+      runtimeRoot: "C:/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      sessionId: "dev",
+      fetchWorkersFn: async () => [
+        {
+          workerId: "workerpal-1",
+          isOnline: true,
+          activeJobCount: 2,
+          status: "online",
+        },
+      ],
+      precheckDockerAvailabilityFn: async () => {
+        dockerChecks += 1;
+        return {
+          status: "ok",
+          detail: "docker ok",
+          env: { PATH: process.env.PATH ?? "" },
+        };
+      },
+    });
+
+    expect(result).toEqual({
+      state: "warming",
+      detail: "0 idle / 1 online",
+      action:
+        "Wait for WorkerPal warmup or active jobs to finish, then retry /status or send the request again.",
+    });
+    expect(dockerChecks).toBe(0);
+  });
+
+  test("resolveWorkerExecutionReadiness does not infer blocked Docker state from a skipped precheck", async () => {
+    let dockerChecks = 0;
+    const result = await resolveWorkerExecutionReadiness({
+      serverUrl: "http://127.0.0.1:3001",
+      ttlMs: 60_000,
+      autoSpawnWorkerpals: true,
+      dockerEnabled: true,
+      requireDocker: true,
+      repoRoot: "C:/repo/example",
+      runtimeRoot: "C:/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      sessionId: "dev",
+      dockerPrecheck: {
+        status: "skipped",
+        detail: "embedded WorkerPal Docker startup precheck skipped because runtime is already healthy",
+        env: { PATH: process.env.PATH ?? "" },
+      },
+      fetchWorkersFn: async () => [],
+      precheckDockerAvailabilityFn: async () => {
+        dockerChecks += 1;
+        return {
+          status: "failed",
+          detail: "docker daemon is not running",
+          env: { PATH: process.env.PATH ?? "" },
+        };
+      },
+    });
+
+    expect(result).toEqual({
+      state: "warming",
+      detail: "No online WorkerPals are reported yet.",
+      action: "Wait for WorkerPal auto-spawn/warmup to finish, then rerun /status.",
+    });
+    expect(dockerChecks).toBe(0);
+  });
+
+  test("shouldRunEmbeddedRuntimeStartupPrechecks only runs when auto-start is needed", () => {
+    expect(
+      shouldRunEmbeddedRuntimeStartupPrechecks({
+        serverHealthy: false,
+        noAutoStart: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRunEmbeddedRuntimeStartupPrechecks({
+        serverHealthy: true,
+        noAutoStart: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRunEmbeddedRuntimeStartupPrechecks({
+        serverHealthy: false,
+        noAutoStart: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("shouldRunEmbeddedRuntimeStartupPrechecks stays false for already-healthy runtimes regardless of auto-start", () => {
+    expect(
+      shouldRunEmbeddedRuntimeStartupPrechecks({
+        serverHealthy: true,
+        noAutoStart: true,
+      }),
+    ).toBe(false);
   });
 
   test("copyTrackedRepoPath copies only tracked sandbox files from a repo subtree", () => {
