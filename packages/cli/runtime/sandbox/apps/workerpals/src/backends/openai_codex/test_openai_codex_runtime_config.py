@@ -60,17 +60,26 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.approval_policy, "never")
         self.assertEqual(cfg.sandbox, "workspace-write")
         self.assertEqual(cfg.color, "never")
-        self.assertEqual(cfg.reasoning_effort, "xhigh")
+        self.assertEqual(cfg.reasoning_effort, "high")
         self.assertFalse(cfg.json_output)
 
-    def test_reasoning_effort_accepts_extra_high_alias(self) -> None:
+    def test_reasoning_effort_caps_extra_high_for_gpt_5_4(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(
             SettingsResolver(
                 env={"WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": "extra high"},
                 config_loader=lambda: {},
             ),
         )
-        self.assertEqual(_resolve_reasoning_effort(cfg), "xhigh")
+        self.assertEqual(_resolve_reasoning_effort(cfg), "high")
+
+    def test_reasoning_effort_preserves_extra_high_for_future_models(self) -> None:
+        cfg = OpenAICodexRuntimeConfig.from_sources(
+            SettingsResolver(
+                env={"WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": "extra high"},
+                config_loader=lambda: {},
+            ),
+        )
+        self.assertEqual(_resolve_reasoning_effort(cfg, model="gpt-6-preview"), "xhigh")
 
     def test_runtime_config_prefers_explicit_config_dir_override(self) -> None:
         import executor_base
