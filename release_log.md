@@ -2,16 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.0.30`
-- start_commit: `52a653b558994cfcc31bff76369079e9706d3662`
-- end_commit: `7060604fbbaf0716175db309ee50d0b945e71dd2`
-- commits_in_range: `1`
+- version: `v1.0.31`
+- start_commit: `c5cebf4260c4689f593696ad7f8e433bb866a3dd`
+- end_commit: `03ce70d300542d4c92fe1103f8150e65e1544f4b`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Extend narrow file-targeted `task.execute` dedupe to autonomy-origin WorkerPal jobs so background autonomy work reuses an active same-file task instead of dispatching overlapping edits to the same target path.
-- Add a stateful CLI session-event replay filter that suppresses duplicated `status` events during SSE reconnect/replay so RemoteBuddy and SourceControlManager status lines are not re-rendered repeatedly in the interactive CLI.
-- Fix the WorkerPal quality-gate revision loop so deterministic validation failures independently trigger revision, and enrich revision guidance with critic `must_fix`, fallback `findings`, and `revision_guidance` details.
+- Harden embedded CLI startup on Windows by removing wasted prechecks from the attach path, making slow WorkerPal warmup non-fatal, and emitting compact per-phase startup timing summaries for faster diagnosis when Docker or runtime boot is slow.
+- Add explicit WorkerPal execution readiness reporting in the CLI with `ready`, `warming`, and `blocked` states plus actionable guidance, so users can distinguish normal warmup from hard startup blockers like Docker being unavailable.
+- Add packaged CLI end-to-end coverage that exercises the real bundled CLI against a temp local git repo, local bare `origin`, real Docker happy-path startup, and deterministic Docker-unavailable failure handling.
+- Wire packaged CLI E2E smoke coverage into GitHub Actions with a hosted Linux lane and an optional self-hosted Windows Docker smoke lane for release confidence on the actual shipped artifact.
 
 ## Install
 
@@ -42,5 +43,5 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.30 && git push origin v1.0.30`.
+- Tag and push: `git tag v1.0.31 && git push origin v1.0.31`.
 
