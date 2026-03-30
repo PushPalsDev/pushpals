@@ -66,6 +66,25 @@ describe("ReviewAgent", () => {
     expect(reviewerPath).toBe(resolve(workspaceRoot, "prompts/review_agent/reviewer.md"));
   });
 
+  test("resolves reviewer markdown path from embedded prompts root override", () => {
+    const previous = process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE;
+    const runtimeRoot = resolve(import.meta.dir, "..", "packages", "cli", "runtime");
+    process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE = runtimeRoot;
+    try {
+      const reviewerPath = resolveReviewerMdPath("prompts/review_agent/reviewer.md", {
+        workspaceRoot: "B:/compiled/runtime",
+        cwd: "C:/Users/data_pi/Documents/programming/SectorCommand",
+      });
+      expect(reviewerPath).toBe(resolve(runtimeRoot, "prompts", "review_agent", "reviewer.md"));
+    } finally {
+      if (typeof previous === "string") {
+        process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE = previous;
+      } else {
+        delete process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE;
+      }
+    }
+  });
+
   test("normalizes bun and bunx codex commands to current Bun executable", () => {
     const bunExec = process.execPath;
     const bunCmd = resolveCodexCmd("bun x --yes @openai/codex");
@@ -75,6 +94,22 @@ describe("ReviewAgent", () => {
     const bunxCmd = resolveCodexCmd("bunx --yes @openai/codex");
     expect(bunxCmd[0]).toBe(bunExec);
     expect(bunxCmd.slice(1)).toEqual(["x", "--yes", "@openai/codex"]);
+  });
+
+  test("prefers embedded runtime bun executable when provided", () => {
+    const previous = process.env.PUSHPALS_BUN_BIN;
+    process.env.PUSHPALS_BUN_BIN = "C:/runtime/bin/bun.exe";
+    try {
+      const bunCmd = resolveCodexCmd("bun x --yes @openai/codex");
+      expect(bunCmd[0]).toBe("C:/runtime/bin/bun.exe");
+      expect(bunCmd.slice(1)).toEqual(["x", "--yes", "@openai/codex"]);
+    } finally {
+      if (typeof previous === "string") {
+        process.env.PUSHPALS_BUN_BIN = previous;
+      } else {
+        delete process.env.PUSHPALS_BUN_BIN;
+      }
+    }
   });
 
   test("builds review codex args using CLI-compatible approval/sandbox flags", () => {

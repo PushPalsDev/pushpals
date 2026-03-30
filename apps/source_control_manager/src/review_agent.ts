@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
-import { basename, isAbsolute, join, resolve } from "path";
+import { basename, delimiter, isAbsolute, join, resolve } from "path";
 import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import {
   addPullRequestComment,
@@ -123,10 +123,33 @@ function splitArgs(raw: string): string[] {
 }
 
 function currentBunExecPath(): string {
+  const explicit = String(process.env.PUSHPALS_BUN_BIN ?? "").trim();
+  if (explicit) {
+    const leaf = basename(explicit).toLowerCase();
+    if (leaf === "bun" || leaf === "bun.exe") return explicit;
+  }
   const execPath = (process.execPath ?? "").trim();
   if (!execPath) return "";
   const leaf = basename(execPath).toLowerCase();
   if (leaf === "bun" || leaf === "bun.exe") return execPath;
+
+  const pathValue =
+    process.platform === "win32"
+      ? String(process.env.PATH ?? process.env.Path ?? "").trim()
+      : String(process.env.PATH ?? "").trim();
+  if (!pathValue) return "";
+  const candidates =
+    process.platform === "win32"
+      ? ["bun.exe", "bun", "bun.cmd", "bun.bat"]
+      : ["bun"];
+  for (const rawDir of pathValue.split(delimiter)) {
+    const dir = rawDir.trim();
+    if (!dir) continue;
+    for (const candidate of candidates) {
+      const fullPath = join(dir, candidate);
+      if (existsSync(fullPath)) return fullPath;
+    }
+  }
   return "";
 }
 
@@ -176,7 +199,8 @@ export function resolveReviewerMdPath(
   const raw = reviewerMdPath.trim();
   if (!raw) return "";
 
-  const workspaceRoot = resolve(options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
+  const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
+  const workspaceRoot = resolve(promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
   const cwd = resolve(options?.cwd || process.cwd());
   if (isAbsolute(raw)) return raw;
 

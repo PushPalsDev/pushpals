@@ -34,6 +34,7 @@ import {
   precheckWorkerpalDockerAvailability,
   precheckSourceControlManagerGitAvailability,
   prepareCliRuntime,
+  resolveEmbeddedBunExecutableFromEnv,
   resolveRuntimeDockerExecutableCandidates,
   resolveRuntimeGitExecutableCandidates,
   resolveCliLocalBuddyAutostart,
@@ -119,6 +120,40 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
 
     expect(env.PUSHPALS_RUNTIME_TAG).toBe("v1.0.19");
+  });
+
+  test("buildEmbeddedRuntimeEnv propagates the current Bun executable for embedded runtime services", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+      },
+      {
+        repoRoot: "/repo/example",
+        runtimeRoot: "/runtime/pushpals",
+      },
+    );
+
+    expect(env.PUSHPALS_BUN_BIN).toBe(process.execPath);
+  });
+
+  test("resolveEmbeddedBunExecutableFromEnv finds bun on PATH for standalone CLI binaries", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-bun-path-"));
+    try {
+      const fakeBinDir = join(root, "bin");
+      mkdirSync(fakeBinDir, { recursive: true });
+      const bunPath = join(fakeBinDir, process.platform === "win32" ? "bun.exe" : "bun");
+      writeFileSync(bunPath, "", "utf8");
+      const resolved = resolveEmbeddedBunExecutableFromEnv(
+        {
+          PATH: fakeBinDir,
+        },
+        process.platform,
+        join(root, process.platform === "win32" ? "pushpals.exe" : "pushpals"),
+      );
+      expect(resolved).toBe(bunPath);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("repoLooksLikePushPalsSourceCheckout only accepts configs/default.toml", () => {

@@ -544,12 +544,13 @@ async function tick(): Promise<void> {
         typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0
           ? completion.prUrl.trim()
           : null;
+      let tempBranch = "";
       // 1. Refresh refs before applying completion commit/ref
       console.log(`[${ts()}] Refreshing refs before applying ${completion.branch}...`);
       await gitOps.fetchPrune();
 
       // 2. Create temp branch and apply worker completion
-      const tempBranch = `_source_control_manager/${completion.id}`;
+      tempBranch = `_source_control_manager/${completion.id}`;
       console.log(`[${ts()}] Creating temp branch ${tempBranch}...`);
 
       await gitOps.resetToClean();
@@ -835,7 +836,7 @@ async function tick(): Promise<void> {
         );
       }
       try {
-        if (await gitOps.revParse(tempBranch)) {
+        if (tempBranch && (await gitOps.revParse(tempBranch))) {
           await gitOps.deleteTempBranch(tempBranch);
         }
       } catch (err: any) {

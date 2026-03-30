@@ -1379,6 +1379,7 @@ export function buildEmbeddedRuntimeEnv(
   const env = normalizeChildProcessEnv(baseEnv);
   const useRuntimeConfig = opts.useRuntimeConfig !== false;
   const platform = opts.platform ?? process.platform;
+  const embeddedBunBin = resolveEmbeddedBunExecutableFromEnv(env, platform);
   const inherited = { ...env };
   if (!useRuntimeConfig) {
     delete inherited.PUSHPALS_CONFIG_DIR_OVERRIDE;
@@ -1417,6 +1418,7 @@ export function buildEmbeddedRuntimeEnv(
     ...(typeof opts.sessionId === "string" && opts.sessionId.trim()
       ? { PUSHPALS_SESSION_ID: opts.sessionId.trim() }
       : {}),
+    ...(embeddedBunBin ? { PUSHPALS_BUN_BIN: embeddedBunBin } : {}),
     ...embeddedWindowsSafetyCaps,
     ...(typeof env.PUSHPALS_GIT_BIN === "string" && env.PUSHPALS_GIT_BIN.trim()
       ? { PUSHPALS_GIT_BIN: env.PUSHPALS_GIT_BIN.trim() }
@@ -1439,6 +1441,44 @@ function parseBooleanFlag(raw: string | undefined): boolean | null {
   if (["1", "true", "yes", "on", "y"].includes(normalized)) return true;
   if (["0", "false", "no", "off", "n"].includes(normalized)) return false;
   return null;
+}
+
+export function resolveEmbeddedBunExecutableFromEnv(
+  env: Record<string, string | undefined>,
+  platform = process.platform,
+  currentExecPathOverride?: string,
+): string {
+  const explicit = String(env.PUSHPALS_BUN_BIN ?? "").trim();
+  if (explicit) return explicit;
+
+  const currentExecPath = String(currentExecPathOverride ?? process.execPath ?? "").trim();
+  const currentExecLeaf = basename(currentExecPath).toLowerCase();
+  if (currentExecLeaf === "bun" || currentExecLeaf === "bun.exe") {
+    return currentExecPath;
+  }
+
+  const pathValue =
+    platform === "win32"
+      ? String(env.PATH ?? env.Path ?? "").trim()
+      : String(env.PATH ?? "").trim();
+  if (!pathValue) return "";
+
+  const candidates =
+    platform === "win32"
+      ? ["bun.exe", "bun", "bun.cmd", "bun.bat"]
+      : ["bun"];
+  for (const rawDir of pathValue.split(delimiter)) {
+    const dir = rawDir.trim();
+    if (!dir) continue;
+    for (const candidate of candidates) {
+      const fullPath = join(dir, candidate);
+      if (existsSync(fullPath)) {
+        return fullPath;
+      }
+    }
+  }
+
+  return "";
 }
 
 export function normalizeChildProcessEnv(
