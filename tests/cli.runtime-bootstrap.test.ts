@@ -156,6 +156,49 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
+  test("resolveEmbeddedBunExecutableFromEnv prefers explicit PUSHPALS_BUN_BIN override", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-bun-explicit-"));
+    try {
+      const fakeBinDir = join(root, "bin");
+      mkdirSync(fakeBinDir, { recursive: true });
+      const discoveredBun = join(fakeBinDir, process.platform === "win32" ? "bun.exe" : "bun");
+      writeFileSync(discoveredBun, "", "utf8");
+      const explicitBun = join(root, process.platform === "win32" ? "embedded-bun.exe" : "embedded-bun");
+      const resolved = resolveEmbeddedBunExecutableFromEnv(
+        {
+          PUSHPALS_BUN_BIN: explicitBun,
+          PATH: fakeBinDir,
+        },
+        process.platform,
+        join(root, process.platform === "win32" ? "pushpals.exe" : "pushpals"),
+      );
+      expect(resolved).toBe(explicitBun);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveEmbeddedBunExecutableFromEnv supports Windows Path casing", () => {
+    if (process.platform !== "win32") return;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-bun-winpath-"));
+    try {
+      const fakeBinDir = join(root, "bin");
+      mkdirSync(fakeBinDir, { recursive: true });
+      const bunPath = join(fakeBinDir, "bun.exe");
+      writeFileSync(bunPath, "", "utf8");
+      const resolved = resolveEmbeddedBunExecutableFromEnv(
+        {
+          Path: fakeBinDir,
+        },
+        "win32",
+        join(root, "pushpals.exe"),
+      );
+      expect(resolved).toBe(bunPath);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("repoLooksLikePushPalsSourceCheckout only accepts configs/default.toml", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-source-checkout-"));
     const configsDir = join(root, "configs");
