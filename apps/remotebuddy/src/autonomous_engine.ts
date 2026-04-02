@@ -805,6 +805,19 @@ type EngineIdeaInputSnapshot = Pick<
   "top_signals" | "state_traits" | "open_objectives" | "dispatch_budget"
 >;
 
+type EngineSignalType =
+  | "test_failure"
+  | "lint_failure"
+  | "typecheck_failure"
+  | "queue_health"
+  | "regret_signal";
+type FailureSignalType = Extract<EngineSignalType, "test_failure" | "lint_failure" | "typecheck_failure">;
+const FAILURE_SIGNAL_TYPES = new Set<FailureSignalType>([
+  "test_failure",
+  "lint_failure",
+  "typecheck_failure",
+]);
+
 type EngineIdeaBlueprint = {
   id: string;
   algorithm: string;
@@ -1609,23 +1622,77 @@ function average(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function normalizeFailureRateValue(value: unknown): number {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    const percentMatch = trimmed.match(/^(-?\d+(?:\.\d+)?)\s*%$/);
+    if (percentMatch) {
+      const percent = Number(percentMatch[1]);
+      if (Number.isFinite(percent)) return clamp01(percent / 100);
+    }
+  }
+  const numeric = asNumber(value, Number.NaN);
+  if (!Number.isFinite(numeric)) return 0;
+  if (numeric <= 0) return 0;
+  if (numeric <= 1) return clamp01(numeric);
+  if (numeric <= 100) return clamp01(numeric / 100);
+  return 1;
+}
+
+function aggregateFailureRateSamples(samples: number[]): number {
+  if (samples.length === 0) return 0;
+  if (samples.length === 1) return clamp01(samples[0]);
+  const normalized = samples.map((value) => clamp01(value));
+  if (normalized.length === 2) {
+    return clamp01((normalized[0] + normalized[1]) / 2);
+  }
+  const sorted = [...normalized].sort((a, b) => a - b);
+  const medianIndex = Math.floor(sorted.length / 2);
+  const median =
+    sorted.length % 2 === 0
+      ? (sorted[medianIndex - 1] + sorted[medianIndex]) / 2
+      : sorted[medianIndex];
+  const upperHalf = sorted.slice(medianIndex);
+  const upperAverage = upperHalf.reduce((sum, value) => sum + value, 0) / upperHalf.length;
+  return clamp01(0.6 * upperAverage + 0.4 * median);
+}
+
+function asFailureSignalType(value: unknown): FailureSignalType | null {
+  const normalized = asString(value);
+  if (normalized === "test_failure" || normalized === "lint_failure" || normalized === "typecheck_failure") {
+    return normalized;
+  }
+  return null;
+}
+
+function failureRateSignalScore(snapshot: EngineIdeaInputSnapshot, types: FailureSignalType[]): number {
+  if (types.length === 0) return 0;
+  const allowed = new Set(types);
+  const samples = snapshot.top_signals
+    .filter((signal) => {
+      const failureType = asFailureSignalType(signal.type);
+      return failureType ? allowed.has(failureType) : false;
+    })
+    .map((signal) => normalizeFailureRateValue(signal.value));
+  return aggregateFailureRateSamples(samples);
+}
+
 function maxSignalScore(
   snapshot: EngineIdeaInputSnapshot,
-  types: Array<"test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal">,
+  types: EngineSignalType[],
 ): number {
+  if (types.length === 0) return 0;
+  const failureOnly = types.every((type) => FAILURE_SIGNAL_TYPES.has(type as FailureSignalType));
+  if (failureOnly) {
+    return failureRateSignalScore(snapshot, types as FailureSignalType[]);
+  }
   return clamp01(
     Math.max(
       0,
       ...snapshot.top_signals
-        .filter((signal) =>
-          types.includes(
-            String(signal.type ?? "").trim() as
-              | "test_failure"
-              | "lint_failure"
-              | "typecheck_failure"
-              | "queue_health"
-              | "regret_signal",
-          ),
+        .filter(
+          (signal): signal is typeof signal & { type: EngineSignalType } =>
+            isTriggerType(signal.type) && types.includes(signal.type),
         )
         .map((signal) => asNumber(signal.value, 0)),
     ),
@@ -2965,6 +3032,30 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+const SENSITIVE_TELEMETRY_KEYS = new Set(["queue_evidence_b64"]);
+
+export function redactTelemetryPayload<T>(value: T): T {
+  return redactTelemetryPayloadInternal(value, SENSITIVE_TELEMETRY_KEYS) as T;
+}
+
+function redactTelemetryPayloadInternal(value: unknown, keysToRedact: Set<string>): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactTelemetryPayloadInternal(item, keysToRedact));
+  }
+  if (!value || typeof value !== "object") return value;
+  const tag = Object.prototype.toString.call(value);
+  if (tag !== "[object Object]") return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+    if (keysToRedact.has(key)) {
+      result[key] = "[redacted]";
+    } else {
+      result[key] = redactTelemetryPayloadInternal(val, keysToRedact);
+    }
+  }
+  return result;
+}
+
 function isRiskLevel(value: string): value is "low" | "medium" | "high" {
   return value === "low" || value === "medium" || value === "high";
 }
@@ -3530,6 +3621,11 @@ export class RemoteBuddyAutonomousEngine {
       maxTokens: input.maxTokens ?? null,
       temperature: input.temperature ?? null,
     };
+    const redactedRequestPayload = redactTelemetryPayload(requestPayload);
+    const redactedPromptInputs = redactTelemetryPayload({
+      system: input.system,
+      messages: input.messages ?? [],
+    });
     const startedAt = Date.now();
     const output = await withTimeout(
       this.llm.generate(input),
@@ -3548,12 +3644,9 @@ export class RemoteBuddyAutonomousEngine {
         phase,
         promptTemplateVersion: "autonomy-v3.3",
         promptHash: sha256(`${input.system}\n${JSON.stringify(input.messages ?? [])}`),
-        requestPayloadHash: sha256(JSON.stringify(requestPayload)),
-        requestPayload,
-        promptInputs: {
-          system: input.system,
-          messages: input.messages ?? [],
-        },
+        requestPayloadHash: sha256(JSON.stringify(redactedRequestPayload)),
+        requestPayload: redactedRequestPayload,
+        promptInputs: redactedPromptInputs,
         modelId: "configured",
         temperature: input.temperature ?? null,
         timeoutMs: this.cfg.llmTimeoutMs,
@@ -3621,25 +3714,34 @@ export class RemoteBuddyAutonomousEngine {
         .filter((entry): entry is { signal_id: string; type: string; value: number; evidence: string } => Boolean(entry))
         .slice(0, 16) || [];
     const signals = signalPool.length > 0 ? signalPool : snapshot.top_signals.slice(0, 20);
-    const maxType = (types: string[]) =>
-      clamp01(
-        Math.max(
-          0,
-          ...signals
-            .filter((entry) => types.includes(entry.type))
-            .map((entry) => asNumber(entry.value, 0)),
-        ),
+    const maxType = (
+      types: EngineSignalType[],
+      options?: { treatAsFailureRates?: boolean; evidenceFilter?: (entry: (typeof signals)[number]) => boolean },
+    ) => {
+      const filtered = signals.filter(
+        (entry): entry is typeof entry & { type: EngineSignalType } =>
+          isTriggerType(entry.type) && types.includes(entry.type),
       );
-    const fTestFailRecurrence = maxType(["test_failure"]);
-    const fLintTypeErrorDensity = maxType(["lint_failure", "typecheck_failure"]);
-    const fFlakeRate = clamp01(
-      Math.max(
-        0,
-        ...signals
-          .filter((entry) => entry.type === "test_failure")
-          .map((entry) => (/flake|flaky/i.test(entry.evidence) ? asNumber(entry.value, 0) : 0)),
-      ),
-    );
+      const considered = options?.evidenceFilter ? filtered.filter(options.evidenceFilter) : filtered;
+      if (considered.length === 0) return 0;
+      if (
+        options?.treatAsFailureRates ||
+        types.every((type) => FAILURE_SIGNAL_TYPES.has(type as FailureSignalType))
+      ) {
+        return aggregateFailureRateSamples(
+          considered.map((entry) => normalizeFailureRateValue(entry.value)),
+        );
+      }
+      return clamp01(Math.max(0, ...considered.map((entry) => asNumber(entry.value, 0))));
+    };
+    const fTestFailRecurrence = maxType(["test_failure"], { treatAsFailureRates: true });
+    const fLintTypeErrorDensity = maxType(["lint_failure", "typecheck_failure"], {
+      treatAsFailureRates: true,
+    });
+    const fFlakeRate = maxType(["test_failure"], {
+      treatAsFailureRates: true,
+      evidenceFilter: (entry) => /flake|flaky/i.test(asString(entry.evidence)),
+    });
     const fQueueHealthDegradation = maxType(["queue_health"]);
     const fRegretRate24h = maxType(["regret_signal"]);
     return clamp01(
