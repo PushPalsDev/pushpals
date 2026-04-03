@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { AutonomyStore } from "../apps/server/src/autonomy";
+import { JobQueue } from "../apps/server/src/jobs";
 
 const stores: AutonomyStore[] = [];
 const tempDirs: string[] = [];
@@ -105,6 +106,262 @@ describe("server AutonomyStore policy gates", () => {
     expect(
       enriched.state_traits.some((trait) => trait.trait_id === "component_strong_apps/client"),
     ).toBe(true);
+  });
+
+  test("createSnapshot emits execution-health signals for stalled, blocked, and failing autonomy work", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-execution-health-");
+    const jobQueue = new JobQueue(dbPath);
+    const sessionId = "s1";
+    const runId = "run_execution_health";
+    const snapshotId = store.createSnapshot({ sessionId, runId }).snapshot_id;
+
+    try {
+      const stalledDecision = store.recordObjectiveDecision({
+        runId,
+        snapshotId,
+        sessionId,
+        objective: {
+          id: "obj_stalled",
+          title: "Stalled objective",
+          instruction: "Seed stalled objective telemetry",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          trigger_type: "queue_health",
+          target_paths: ["apps/server/src/autonomy.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/*"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun run test:root"],
+          status: "running",
+        },
+      });
+      expect(stalledDecision.ok).toBe(true);
+
+      const blockedDecision = store.recordObjectiveDecision({
+        runId,
+        snapshotId,
+        sessionId,
+        objective: {
+          id: "obj_blocked",
+          title: "Blocked objective",
+          instruction: "Seed blocked objective telemetry",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          trigger_type: "regret_signal",
+          target_paths: ["apps/server/src/autonomy.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/*"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun run test:root"],
+          status: "blocked",
+        },
+      });
+      expect(blockedDecision.ok).toBe(true);
+
+      const failedDecision = store.recordObjectiveDecision({
+        runId,
+        snapshotId,
+        sessionId,
+        objective: {
+          id: "obj_failed",
+          title: "Failed objective",
+          instruction: "Seed failed objective telemetry",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          trigger_type: "lint_failure",
+          target_paths: ["apps/server/src/autonomy.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/*"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun run test:root"],
+          status: "rejected",
+        },
+      });
+      expect(failedDecision.ok).toBe(true);
+      expect(
+        store.recordOutcome({
+          objectiveId: "obj_failed",
+          patternKey: failedDecision.patternKey,
+          success: false,
+          userAction: "no_change",
+          regressionFlag: true,
+        }).ok,
+      ).toBe(true);
+
+      const staleJobId = String(
+        jobQueue.enqueue({
+          taskId: "task_worker_stale",
+          sessionId,
+          kind: "task.execute",
+          params: {},
+          priority: "background",
+        }).jobId ?? "",
+      );
+      expect(staleJobId.length).toBeGreaterThan(0);
+      expect(jobQueue.claim("workerpal-a").ok).toBe(true);
+      expect(
+        jobQueue.fail(staleJobId, {
+          message: "Job auto-failed after stale worker claim",
+          detail: "worker=workerpal-a; lastHeartbeat=2026-03-29T22:36:28.894Z",
+        }).ok,
+      ).toBe(true);
+      const staleWorkerDecision = store.recordObjectiveDecision({
+        runId,
+        snapshotId,
+        sessionId,
+        objective: {
+          id: "obj_worker_stale",
+          title: "Worker stale claim objective",
+          instruction: "Seed worker stale claim telemetry",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          trigger_type: "queue_health",
+          target_paths: ["apps/server/src/autonomy.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/*"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun run test:root"],
+          status: "failed",
+          job_id: staleJobId,
+        },
+      });
+      expect(staleWorkerDecision.ok).toBe(true);
+
+      const softPassJobId = String(
+        jobQueue.enqueue({
+          taskId: "task_quality_softpass",
+          sessionId,
+          kind: "task.execute",
+          params: {},
+          priority: "background",
+        }).jobId ?? "",
+      );
+      expect(softPassJobId.length).toBeGreaterThan(0);
+      expect(jobQueue.claim("workerpal-b").ok).toBe(true);
+      expect(
+        jobQueue.complete(softPassJobId, {
+          summary:
+            "Executed task and modified 1 file(s) (quality gate soft-pass after 1 auto-revision attempt(s)).",
+          artifacts: [],
+        }).ok,
+      ).toBe(true);
+      const softPassDecision = store.recordObjectiveDecision({
+        runId,
+        snapshotId,
+        sessionId,
+        objective: {
+          id: "obj_quality_softpass",
+          title: "Quality gate soft-pass objective",
+          instruction: "Seed quality gate soft-pass telemetry",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          trigger_type: "lint_failure",
+          target_paths: ["apps/server/src/autonomy.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/*"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun run test:root"],
+          status: "completed",
+          job_id: softPassJobId,
+        },
+      });
+      expect(softPassDecision.ok).toBe(true);
+
+      const failedRevisionJobId = String(
+        jobQueue.enqueue({
+          taskId: "task_quality_failed",
+          sessionId,
+          kind: "task.execute",
+          params: {},
+          priority: "background",
+        }).jobId ?? "",
+      );
+      expect(failedRevisionJobId.length).toBeGreaterThan(0);
+      expect(jobQueue.claim("workerpal-c").ok).toBe(true);
+      expect(
+        jobQueue.fail(failedRevisionJobId, {
+          message:
+            "Quality gate failed after 1 auto-revision attempt(s): Critic score 2.0 is below required threshold 8.",
+          detail: "[QualityGate] Codex critic score: 2/10",
+        }).ok,
+      ).toBe(true);
+      const failedRevisionDecision = store.recordObjectiveDecision({
+        runId,
+        snapshotId,
+        sessionId,
+        objective: {
+          id: "obj_quality_failed",
+          title: "Quality gate failed objective",
+          instruction: "Seed quality gate failure telemetry",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          trigger_type: "lint_failure",
+          target_paths: ["apps/server/src/autonomy.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/*"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun run test:root"],
+          status: "failed",
+          job_id: failedRevisionJobId,
+        },
+      });
+      expect(failedRevisionDecision.ok).toBe(true);
+
+      (store as any).db
+        .prepare(
+          `UPDATE autonomy_objectives
+           SET updated_at = datetime('now', '-90 minutes')
+           WHERE id IN ('obj_stalled', 'obj_blocked')`,
+        )
+        .run();
+
+      const snapshot = store.createSnapshot({ sessionId, runId });
+
+      expect(
+        snapshot.top_signals.some(
+          (signal) => signal.signal_id === "sig_objective_stall" && signal.type === "queue_health",
+        ),
+      ).toBe(true);
+      expect(
+        snapshot.top_signals.some(
+          (signal) =>
+            signal.signal_id === "sig_objective_blocked" && signal.type === "regret_signal",
+        ),
+      ).toBe(true);
+      expect(
+        snapshot.top_signals.some(
+          (signal) =>
+            signal.signal_id.startsWith("sig_objective_failure_") && signal.type === "lint_failure",
+        ),
+      ).toBe(true);
+      expect(
+        snapshot.top_signals.some(
+          (signal) =>
+            signal.signal_id === "sig_worker_stale_claims" && signal.type === "queue_health",
+        ),
+      ).toBe(true);
+      expect(
+        snapshot.top_signals.some(
+          (signal) =>
+            signal.signal_id === "sig_quality_revision_churn" && signal.type === "regret_signal",
+        ),
+      ).toBe(true);
+      expect(
+        snapshot.state_traits.some((trait) => trait.trait_id === "open_objectives_stalled"),
+      ).toBe(true);
+      expect(
+        snapshot.state_traits.some((trait) => trait.trait_id === "blocked_objectives_waiting"),
+      ).toBe(true);
+      expect(
+        snapshot.state_traits.some((trait) => trait.trait_id === "worker_stale_claim_pressure"),
+      ).toBe(true);
+      expect(
+        snapshot.state_traits.some((trait) => trait.trait_id === "quality_revision_churn"),
+      ).toBe(true);
+    } finally {
+      jobQueue.close();
+      closeTrackedStore(store);
+    }
   });
 
   test("rejects objective risk above policy ceiling", () => {

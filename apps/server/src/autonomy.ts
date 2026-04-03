@@ -83,6 +83,29 @@ interface PrFeedbackSignalRow {
   comment_count: number | null;
 }
 
+interface ObjectiveStatusSignalRow {
+  status: string | null;
+  count: number | null;
+  oldest_minutes: number | null;
+}
+
+interface ObjectiveFailureSignalRow {
+  trigger_type: string | null;
+  failure_count: number | null;
+  regression_count: number | null;
+  clarification_count: number | null;
+  no_change_count: number | null;
+}
+
+interface ExecutionHealthSummary {
+  staleClaimFailures: number;
+  staleClaimOldestMinutes: number;
+  qualityRevisionJobs: number;
+  qualityRevisionTotalAttempts: number;
+  qualityRevisionFailures: number;
+  qualityRevisionSoftPasses: number;
+}
+
 interface PrFeedbackComment {
   body: string;
   user_login: string;
@@ -610,11 +633,46 @@ function norm(x: number, min: number, max: number): number {
 
 function normalizeSignalType(value: string): SignalValue["type"] {
   const text = value.toLowerCase();
-  if (/\blint\b/.test(text)) return "lint_failure";
-  if (/\btype(check)?\b/.test(text)) return "typecheck_failure";
-  if (/\btest|pytest|vitest|jest\b/.test(text)) return "test_failure";
-  if (/\bregret|reopen|re-open\b/.test(text)) return "regret_signal";
+  if (text === "lint_failure" || /\blint\b/.test(text)) return "lint_failure";
+  if (text === "typecheck_failure" || /\btype(check)?\b/.test(text)) return "typecheck_failure";
+  if (text === "test_failure" || /\btest|pytest|vitest|jest\b/.test(text)) return "test_failure";
+  if (text === "regret_signal" || /\bregret|reopen|re-open\b/.test(text)) return "regret_signal";
+  if (text === "queue_health") return "queue_health";
   return "queue_health";
+}
+
+function parseJobPayloadText(raw: string | null): string {
+  if (!raw) return "";
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      return `${asString(record.summary)} ${asString(record.message)} ${asString(record.detail)}`.trim();
+    }
+  } catch {
+    // fall back to the raw stored payload
+  }
+  return String(raw).trim();
+}
+
+function isStaleClaimFailureText(value: string): boolean {
+  return /\b(stale worker claim|heartbeat stale|watchdog|job auto-failed after stale worker claim)\b/i.test(
+    value,
+  );
+}
+
+function extractQualityGateRevisionInfo(
+  value: string,
+): { attempts: number; failed: boolean; softPass: boolean } | null {
+  const match = value.match(/quality gate (soft-pass after|failed after) (\d+) auto-revision attempt/i);
+  if (!match) return null;
+  const attempts = Math.max(0, Math.floor(asNumber(match[2], 0)));
+  const mode = asString(match[1]).toLowerCase();
+  return {
+    attempts,
+    failed: mode.includes("failed"),
+    softPass: mode.includes("soft-pass"),
+  };
 }
 
 function asRiskLevel(value: unknown): AutonomyRiskLevel | null {
@@ -2329,7 +2387,82 @@ export class AutonomyStore {
     };
   }
 
-  private buildTopSignals(requestSlo?: QueueSloSummary, jobSlo?: QueueSloSummary): SignalValue[] {
+  private recentExecutionHealthSummary(): ExecutionHealthSummary {
+    let rows: Array<{
+      result: string | null;
+      error: string | null;
+      activity_at: string | null;
+    }> = [];
+    try {
+      rows = this.db
+        .prepare(
+          `SELECT j.result,
+                  j.error,
+                  COALESCE(j.failedAt, j.completedAt, j.updatedAt, j.createdAt) AS activity_at
+           FROM jobs j
+           JOIN autonomy_objectives obj ON obj.job_id = j.id
+           WHERE LOWER(COALESCE(obj.source, 'autonomous')) = 'autonomous'
+             AND datetime(COALESCE(j.failedAt, j.completedAt, j.updatedAt, j.createdAt)) >= datetime('now', '-24 hours')
+           ORDER BY activity_at DESC
+           LIMIT 200`,
+        )
+        .all() as Array<{
+        result: string | null;
+        error: string | null;
+        activity_at: string | null;
+      }>;
+    } catch {
+      rows = [];
+    }
+
+    const nowMs = Date.now();
+    let staleClaimFailures = 0;
+    let staleClaimOldestMinutes = 0;
+    let qualityRevisionJobs = 0;
+    let qualityRevisionTotalAttempts = 0;
+    let qualityRevisionFailures = 0;
+    let qualityRevisionSoftPasses = 0;
+
+    for (const row of rows) {
+      const errorText = parseJobPayloadText(row.error);
+      const resultText = parseJobPayloadText(row.result);
+      const combined = `${resultText}\n${errorText}`.trim();
+
+      if (errorText && isStaleClaimFailureText(errorText)) {
+        staleClaimFailures += 1;
+        const activityAtMs = Date.parse(asString(row.activity_at));
+        if (Number.isFinite(activityAtMs)) {
+          staleClaimOldestMinutes = Math.max(
+            staleClaimOldestMinutes,
+            Math.floor(Math.max(0, nowMs - activityAtMs) / 60_000),
+          );
+        }
+      }
+
+      const revisionInfo = combined ? extractQualityGateRevisionInfo(combined) : null;
+      if (revisionInfo) {
+        qualityRevisionJobs += 1;
+        qualityRevisionTotalAttempts += revisionInfo.attempts;
+        if (revisionInfo.failed) qualityRevisionFailures += 1;
+        if (revisionInfo.softPass) qualityRevisionSoftPasses += 1;
+      }
+    }
+
+    return {
+      staleClaimFailures,
+      staleClaimOldestMinutes,
+      qualityRevisionJobs,
+      qualityRevisionTotalAttempts,
+      qualityRevisionFailures,
+      qualityRevisionSoftPasses,
+    };
+  }
+
+  private buildTopSignals(
+    requestSlo?: QueueSloSummary,
+    jobSlo?: QueueSloSummary,
+    executionHealth?: ExecutionHealthSummary,
+  ): SignalValue[] {
     const topSignals: SignalValue[] = [];
     let failedRows: Array<{ kind: string | null; error: string | null; count: number }> = [];
     try {
@@ -2389,6 +2522,140 @@ export class AutonomyStore {
       value: clamp01(regretCount / 6),
       evidence: `reopened_within_24h=${regretCount}`,
     });
+
+    let stalledObjectiveRows: ObjectiveStatusSignalRow[] = [];
+    try {
+      stalledObjectiveRows = this.db
+        .prepare(
+          `SELECT status,
+                  COUNT(*) AS count,
+                  MAX((julianday('now') - julianday(updated_at)) * 24 * 60) AS oldest_minutes
+           FROM autonomy_objectives
+           WHERE status IN ('dispatched','running','blocked','needs_clarification')
+             AND datetime(updated_at) <= datetime('now', '-15 minutes')
+           GROUP BY status
+           ORDER BY count DESC, oldest_minutes DESC`,
+        )
+        .all() as ObjectiveStatusSignalRow[];
+    } catch {
+      stalledObjectiveRows = [];
+    }
+    if (stalledObjectiveRows.length > 0) {
+      const queueStalledStatuses = new Set(["dispatched", "running"]);
+      const queueStalledRows = stalledObjectiveRows.filter((row) =>
+        queueStalledStatuses.has(asString(row.status).toLowerCase()),
+      );
+      if (queueStalledRows.length > 0) {
+        const stalledCount = queueStalledRows.reduce(
+          (sum, row) => sum + Math.max(0, Math.floor(asNumber(row.count, 0))),
+          0,
+        );
+        const oldestMinutes = queueStalledRows.reduce(
+          (max, row) => Math.max(max, Math.max(0, Math.floor(asNumber(row.oldest_minutes, 0)))),
+          0,
+        );
+        topSignals.push({
+          signal_id: "sig_objective_stall",
+          type: "queue_health",
+          value: clamp01(0.65 * clamp01(stalledCount / 3) + 0.35 * clamp01(oldestMinutes / 120)),
+          evidence: `stalled_open_objectives=${stalledCount} oldest_age_min=${oldestMinutes}`,
+        });
+      }
+
+      const blockedStatuses = new Set(["blocked", "needs_clarification"]);
+      const blockedRows = stalledObjectiveRows.filter((row) =>
+        blockedStatuses.has(asString(row.status).toLowerCase()),
+      );
+      if (blockedRows.length > 0) {
+        const blockedCount = blockedRows.reduce(
+          (sum, row) => sum + Math.max(0, Math.floor(asNumber(row.count, 0))),
+          0,
+        );
+        const oldestMinutes = blockedRows.reduce(
+          (max, row) => Math.max(max, Math.max(0, Math.floor(asNumber(row.oldest_minutes, 0)))),
+          0,
+        );
+        topSignals.push({
+          signal_id: "sig_objective_blocked",
+          type: "regret_signal",
+          value: clamp01(0.6 * clamp01(blockedCount / 3) + 0.4 * clamp01(oldestMinutes / 180)),
+          evidence: `blocked_objectives=${blockedCount} oldest_age_min=${oldestMinutes}`,
+        });
+      }
+    }
+
+    let failedOutcomeRows: ObjectiveFailureSignalRow[] = [];
+    try {
+      failedOutcomeRows = this.db
+        .prepare(
+          `SELECT obj.trigger_type AS trigger_type,
+                  COUNT(*) AS failure_count,
+                  SUM(CASE WHEN o.regression_flag = 1 THEN 1 ELSE 0 END) AS regression_count,
+                  SUM(CASE WHEN LOWER(COALESCE(o.user_action, '')) = 'needs_clarification' THEN 1 ELSE 0 END) AS clarification_count,
+                  SUM(CASE WHEN LOWER(COALESCE(o.user_action, '')) = 'no_change' THEN 1 ELSE 0 END) AS no_change_count
+           FROM autonomy_outcomes o
+           JOIN autonomy_objectives obj ON obj.id = o.objective_id
+           WHERE o.success = 0
+             AND datetime(o.created_at) >= datetime('now', '-24 hours')
+           GROUP BY obj.trigger_type
+           ORDER BY failure_count DESC
+           LIMIT 5`,
+        )
+        .all() as ObjectiveFailureSignalRow[];
+    } catch {
+      failedOutcomeRows = [];
+    }
+    for (let i = 0; i < Math.min(failedOutcomeRows.length, 3); i++) {
+      const row = failedOutcomeRows[i];
+      const triggerType = normalizeSignalType(asString(row.trigger_type));
+      const failureCount = Math.max(0, Math.floor(asNumber(row.failure_count, 0)));
+      const regressionCount = Math.max(0, Math.floor(asNumber(row.regression_count, 0)));
+      const clarificationCount = Math.max(0, Math.floor(asNumber(row.clarification_count, 0)));
+      const noChangeCount = Math.max(0, Math.floor(asNumber(row.no_change_count, 0)));
+      topSignals.push({
+        signal_id: `sig_objective_failure_${i + 1}`,
+        type: triggerType,
+        value: clamp01(
+          0.5 * clamp01(failureCount / 4) +
+            0.3 * clamp01(regressionCount / 3) +
+            0.2 * clamp01((clarificationCount + noChangeCount) / 3),
+        ),
+        evidence:
+          `autonomy_failures=${failureCount} regressions=${regressionCount} ` +
+          `clarifications=${clarificationCount} no_change=${noChangeCount}`,
+      });
+    }
+
+    const workerHealth = executionHealth ?? this.recentExecutionHealthSummary();
+    if (workerHealth.staleClaimFailures > 0) {
+      topSignals.push({
+        signal_id: "sig_worker_stale_claims",
+        type: "queue_health",
+        value: clamp01(
+          0.7 * clamp01(workerHealth.staleClaimFailures / 3) +
+            0.3 * clamp01(workerHealth.staleClaimOldestMinutes / 180),
+        ),
+        evidence:
+          `stale_claim_failures=${workerHealth.staleClaimFailures} ` +
+          `oldest_age_min=${workerHealth.staleClaimOldestMinutes}`,
+      });
+    }
+    if (workerHealth.qualityRevisionJobs > 0) {
+      topSignals.push({
+        signal_id: "sig_quality_revision_churn",
+        type: "regret_signal",
+        value: clamp01(
+          0.45 * clamp01(workerHealth.qualityRevisionJobs / 3) +
+            0.3 * clamp01(workerHealth.qualityRevisionTotalAttempts / 4) +
+            0.25 * clamp01(workerHealth.qualityRevisionFailures / 2),
+        ),
+        evidence:
+          `revision_jobs=${workerHealth.qualityRevisionJobs} ` +
+          `revision_attempts=${workerHealth.qualityRevisionTotalAttempts} ` +
+          `revision_failures=${workerHealth.qualityRevisionFailures} ` +
+          `soft_passes=${workerHealth.qualityRevisionSoftPasses}`,
+      });
+    }
 
     let prFeedbackRows: PrFeedbackSignalRow[] = [];
     try {
@@ -2472,6 +2739,7 @@ export class AutonomyStore {
     requestSlo?: QueueSloSummary;
     jobSlo?: QueueSloSummary;
     topSignals: SignalValue[];
+    executionHealth?: ExecutionHealthSummary;
     dispatchBudget: { globalCount: number; byType: Record<string, number> };
     openObjectives: OpenObjective[];
     repoHealthFlags?: { is_worktree_dirty?: boolean; is_merge_in_progress?: boolean };
@@ -2666,6 +2934,93 @@ export class AutonomyStore {
         focus: "objective_concurrency",
         score: activePressure,
         evidence: `active objectives ${activeCount}/${concurrentLimit}`,
+      });
+    }
+
+    const stalledOpenObjectives = params.openObjectives.filter((objective) => {
+      const status = asString(objective.status).toLowerCase();
+      if (status !== "dispatched" && status !== "running") return false;
+      const updatedAtMs = Date.parse(asString(objective.updated_at));
+      const nowMs = Date.parse(params.nowIso);
+      if (!Number.isFinite(updatedAtMs) || !Number.isFinite(nowMs)) return false;
+      return nowMs - updatedAtMs >= 15 * 60 * 1000;
+    });
+    if (stalledOpenObjectives.length > 0) {
+      const oldestAgeMinutes = stalledOpenObjectives.reduce((max, objective) => {
+        const updatedAtMs = Date.parse(asString(objective.updated_at));
+        const nowMs = Date.parse(params.nowIso);
+        if (!Number.isFinite(updatedAtMs) || !Number.isFinite(nowMs)) return max;
+        return Math.max(max, Math.floor((nowMs - updatedAtMs) / 60_000));
+      }, 0);
+      pushTrait({
+        trait_id: "open_objectives_stalled",
+        category: "risk",
+        focus: "objective_progress",
+        score: clamp01(
+          0.65 * clamp01(stalledOpenObjectives.length / Math.max(1, concurrentLimit)) +
+            0.35 * clamp01(oldestAgeMinutes / 120),
+        ),
+        evidence: `stalled objectives=${stalledOpenObjectives.length} oldest_age_min=${oldestAgeMinutes}`,
+      });
+    }
+
+    const blockedOpenObjectives = params.openObjectives.filter((objective) => {
+      const status = asString(objective.status).toLowerCase();
+      if (status !== "blocked" && status !== "needs_clarification") return false;
+      const updatedAtMs = Date.parse(asString(objective.updated_at));
+      const nowMs = Date.parse(params.nowIso);
+      if (!Number.isFinite(updatedAtMs) || !Number.isFinite(nowMs)) return false;
+      return nowMs - updatedAtMs >= 15 * 60 * 1000;
+    });
+    if (blockedOpenObjectives.length > 0) {
+      const oldestAgeMinutes = blockedOpenObjectives.reduce((max, objective) => {
+        const updatedAtMs = Date.parse(asString(objective.updated_at));
+        const nowMs = Date.parse(params.nowIso);
+        if (!Number.isFinite(updatedAtMs) || !Number.isFinite(nowMs)) return max;
+        return Math.max(max, Math.floor((nowMs - updatedAtMs) / 60_000));
+      }, 0);
+      pushTrait({
+        trait_id: "blocked_objectives_waiting",
+        category: "risk",
+        focus: "objective_progress",
+        score: clamp01(
+          0.6 * clamp01(blockedOpenObjectives.length / Math.max(1, concurrentLimit)) +
+            0.4 * clamp01(oldestAgeMinutes / 180),
+        ),
+        evidence: `blocked objectives=${blockedOpenObjectives.length} oldest_age_min=${oldestAgeMinutes}`,
+      });
+    }
+
+    const workerHealth = params.executionHealth;
+    if (workerHealth && workerHealth.staleClaimFailures > 0) {
+      pushTrait({
+        trait_id: "worker_stale_claim_pressure",
+        category: "risk",
+        focus: "worker_reliability",
+        score: clamp01(
+          0.7 * clamp01(workerHealth.staleClaimFailures / 3) +
+            0.3 * clamp01(workerHealth.staleClaimOldestMinutes / 180),
+        ),
+        evidence:
+          `stale claim failures=${workerHealth.staleClaimFailures} ` +
+          `oldest_age_min=${workerHealth.staleClaimOldestMinutes}`,
+      });
+    }
+    if (workerHealth && workerHealth.qualityRevisionJobs > 0) {
+      pushTrait({
+        trait_id: "quality_revision_churn",
+        category: "risk",
+        focus: "execution_quality",
+        score: clamp01(
+          0.45 * clamp01(workerHealth.qualityRevisionJobs / 3) +
+            0.3 * clamp01(workerHealth.qualityRevisionTotalAttempts / 4) +
+            0.25 * clamp01(workerHealth.qualityRevisionFailures / 2),
+        ),
+        evidence:
+          `revision jobs=${workerHealth.qualityRevisionJobs} ` +
+          `attempts=${workerHealth.qualityRevisionTotalAttempts} ` +
+          `failures=${workerHealth.qualityRevisionFailures} ` +
+          `soft_passes=${workerHealth.qualityRevisionSoftPasses}`,
       });
     }
 
@@ -3091,7 +3446,8 @@ export class AutonomyStore {
     const safetyState = this.getSafetyState(now);
     const snapshotId = `snap_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const ttlMs = this.config.remotebuddy.autonomy.tickIntervalMs * 2;
-    const topSignals = this.buildTopSignals(params.requestSlo, params.jobSlo);
+    const executionHealth = this.recentExecutionHealthSummary();
+    const topSignals = this.buildTopSignals(params.requestSlo, params.jobSlo, executionHealth);
 
     const feedbackPriors = this.db
       .prepare(
@@ -3143,6 +3499,7 @@ export class AutonomyStore {
       requestSlo: params.requestSlo,
       jobSlo: params.jobSlo,
       topSignals,
+      executionHealth,
       dispatchBudget,
       openObjectives,
       repoHealthFlags: params.repoHealthFlags,
