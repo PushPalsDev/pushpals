@@ -97,6 +97,88 @@ describe("workerpals docker executor internals", () => {
     ).toBe(true);
   });
 
+  test("ensureWorktreeAccessibleInWarmContainer recycles the warm container after a visibility race", async () => {
+    const executor = createExecutor() as unknown as {
+      ensureWorktreeAccessibleInWarmContainer: (
+        worktreePath: string,
+        onLog?: (stream: "stdout" | "stderr", line: string) => void,
+      ) => Promise<string>;
+      ensureWarmContainer: () => Promise<void>;
+      waitForWorktreePathInWarmContainer: (
+        containerWorktreePath: string,
+        timeoutMs?: number,
+      ) => Promise<void>;
+      runWarmWorktreeProbe: (containerWorktreePath: string) => Promise<{
+        ok: boolean;
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+      }>;
+      stopWarmContainer: (reason: string, quiet?: boolean) => Promise<void>;
+      inspectWarmContainerState: () => Promise<string>;
+    };
+
+    let visibilityAttempts = 0;
+    let stopCalls = 0;
+    executor.ensureWarmContainer = async () => {};
+    executor.waitForWorktreePathInWarmContainer = async () => {
+      visibilityAttempts += 1;
+      if (visibilityAttempts === 1) {
+        throw new Error(
+          "worktree path not visible inside warm container after 15000ms: /repo/.worktrees/job-123",
+        );
+      }
+    };
+    executor.runWarmWorktreeProbe = async () => ({
+      ok: true,
+      stdout: "true\n.git",
+      stderr: "",
+      exitCode: 0,
+    });
+    executor.stopWarmContainer = async () => {
+      stopCalls += 1;
+    };
+    executor.inspectWarmContainerState = async () => "running=true";
+
+    const result = await executor.ensureWorktreeAccessibleInWarmContainer(
+      `${process.cwd()}\\.worktrees\\job-123`,
+    );
+
+    expect(result).toContain("/repo/.worktrees/job-123");
+    expect(visibilityAttempts).toBe(2);
+    expect(stopCalls).toBe(1);
+  });
+
+  test("validateWorktreeGitInterop validates warm-container accessibility too", async () => {
+    const executor = createExecutor() as unknown as {
+      validateWorktreeGitInterop: () => Promise<void>;
+      createWorktree: (worktreePath: string, baseRef: string) => Promise<void>;
+      runGitSelfCheckContainer: (worktreePath: string) => Promise<void>;
+      ensureWorktreeAccessibleInWarmContainer: (worktreePath: string) => Promise<string>;
+      removeWorktree: (worktreePath: string) => Promise<void>;
+      options: { baseRef: string };
+    };
+
+    const calls: string[] = [];
+    executor.createWorktree = async () => {
+      calls.push("create");
+    };
+    executor.runGitSelfCheckContainer = async () => {
+      calls.push("fresh");
+    };
+    executor.ensureWorktreeAccessibleInWarmContainer = async () => {
+      calls.push("warm");
+      return "/repo/.worktrees/selfcheck-startup";
+    };
+    executor.removeWorktree = async () => {
+      calls.push("cleanup");
+    };
+
+    await executor.validateWorktreeGitInterop();
+
+    expect(calls).toEqual(["create", "fresh", "warm", "cleanup"]);
+  });
+
   test("parseGitWorktreeListPorcelain extracts detached and prunable flags", () => {
     const parsed = parseGitWorktreeListPorcelain(
       [

@@ -215,6 +215,14 @@ function isNoisyProgressLine(line: string): boolean {
   return /^(📦 Installing \[\d+\/\d+\]|🔍 Resolving\.\.\.|🔒 Saving lockfile\.\.\.)$/.test(line);
 }
 
+export function shouldEmitDirectSessionJobEvent(options: {
+  ok: boolean;
+  statusPersistedToServer: boolean;
+}): boolean {
+  if (options.ok) return true;
+  return !options.statusPersistedToServer;
+}
+
 function shouldRecycleWorkerForCodexUnavailableFailure(
   summary: string,
   stderr?: string | null,
@@ -950,13 +958,15 @@ async function failActiveJobOnShutdown(
 
   const message = "Worker process shutting down during claimed job";
   const detail = `worker=${opts.workerId}; signal=${signalName}; action=fail-claimed-job-on-shutdown`;
+  let statusPersistedToServer = false;
 
   try {
-    await fetch(`${opts.server}/jobs/${activeJobId}/fail`, {
+    const response = await fetch(`${opts.server}/jobs/${activeJobId}/fail`, {
       method: "POST",
       headers,
       body: JSON.stringify({ message, detail }),
     });
+    statusPersistedToServer = response.ok;
   } catch (err) {
     console.error(
       `[WorkerPals] Failed to mark active job ${activeJobId} as failed during shutdown:`,
@@ -964,7 +974,10 @@ async function failActiveJobOnShutdown(
     );
   }
 
-  if (runtimeState.currentSessionId) {
+  if (
+    runtimeState.currentSessionId &&
+    shouldEmitDirectSessionJobEvent({ ok: false, statusPersistedToServer })
+  ) {
     await sendCommand(opts.server, runtimeState.currentSessionId, headers, {
       type: "job_failed",
       payload: {
@@ -1242,6 +1255,7 @@ async function workerLoop(
               }
             }
 
+            let statusPersistedToServer = false;
             if (result.ok) {
               const reviewAgent =
                 parsedParams.reviewAgent && typeof parsedParams.reviewAgent === "object"
@@ -1253,7 +1267,7 @@ async function workerLoop(
                 reviewAgent.prUrl.trim().length > 0
                   ? reviewAgent.prUrl.trim()
                   : null;
-              await fetch(`${opts.server}/jobs/${job.id}/complete`, {
+              const response = await fetch(`${opts.server}/jobs/${job.id}/complete`, {
                 method: "POST",
                 headers,
                 body: JSON.stringify({
@@ -1266,11 +1280,12 @@ async function workerLoop(
                   ],
                 }),
               });
+              statusPersistedToServer = response.ok;
               console.log(
                 `[WorkerPals] Job ${job.id} completed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
               );
             } else {
-              await fetch(`${opts.server}/jobs/${job.id}/fail`, {
+              const response = await fetch(`${opts.server}/jobs/${job.id}/fail`, {
                 method: "POST",
                 headers,
                 body: JSON.stringify({
@@ -1279,6 +1294,7 @@ async function workerLoop(
                   durationMs: jobDurationMs,
                 }),
               });
+              statusPersistedToServer = response.ok;
               console.log(
                 `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
               );
@@ -1319,29 +1335,31 @@ async function workerLoop(
                 }
               }
 
-              const eventCmd = result.ok
-                ? {
-                    type: "job_completed" as const,
-                    payload: {
-                      jobId: job.id,
-                      summary: result.summary,
-                      artifacts: result.stdout
-                        ? [{ kind: "log" as const, text: result.stdout }]
-                        : undefined,
-                    },
-                    from: `worker:${opts.workerId}`,
-                  }
-                : {
-                    type: "job_failed" as const,
-                    payload: {
-                      jobId: job.id,
-                      message: result.summary,
-                      detail: redactSensitiveText(result.stderr ?? ""),
-                    },
-                    from: `worker:${opts.workerId}`,
-                  };
+              if (shouldEmitDirectSessionJobEvent({ ok: result.ok, statusPersistedToServer })) {
+                const eventCmd = result.ok
+                  ? {
+                      type: "job_completed" as const,
+                      payload: {
+                        jobId: job.id,
+                        summary: result.summary,
+                        artifacts: result.stdout
+                          ? [{ kind: "log" as const, text: result.stdout }]
+                          : undefined,
+                      },
+                      from: `worker:${opts.workerId}`,
+                    }
+                  : {
+                      type: "job_failed" as const,
+                      payload: {
+                        jobId: job.id,
+                        message: result.summary,
+                        detail: redactSensitiveText(result.stderr ?? ""),
+                      },
+                      from: `worker:${opts.workerId}`,
+                    };
 
-              await sendCommand(opts.server, job.sessionId, headers, eventCmd);
+                await sendCommand(opts.server, job.sessionId, headers, eventCmd);
+              }
             }
           } finally {
             clearInterval(busyHeartbeat);
