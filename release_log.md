@@ -2,15 +2,15 @@
 
 ## Release Metadata
 
-- version: `v1.0.34`
-- start_commit: `8d01b605606f0cc58b384c203500c5d04fb4864c`
-- end_commit: `5aeaeea22bbd4bd548efba28ffe6d0f93998edc4`
+- version: `v1.0.35`
+- start_commit: `cc8243f6701759e71b783d6d167fbddeb7a97b37`
+- end_commit: `10ebb243436328c1a60cc1687d1730a945e178b3`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Harden WorkerPal Docker warm-container startup on Windows and Docker Desktop by validating that new worktrees are visible inside the long-lived warm container, recycling that container once when bind-mount propagation lags, and tightening startup self-check coverage around the real execution path.
-- Remove duplicate `job_failed` session output when the server already accepted the worker failure hook, while preserving direct fallback emission when server-side persistence does not succeed.
+- Prevent workers from claiming a second job while another claim is still active, which stops stale orphaned claimed rows from being auto-failed later by the server watchdog.
+- Add regression coverage for the single-active-claim invariant and stale-recovery interaction so worker/job state cannot drift out of sync unnoticed.
 
 ## Install
 
@@ -41,4 +41,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.34 && git push origin v1.0.34`.
+- Tag and push: `git tag v1.0.35 && git push origin v1.0.35`.
