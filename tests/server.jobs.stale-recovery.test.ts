@@ -47,8 +47,8 @@ describe("JobQueue stale recovery", () => {
     expect(interactive.etaMs).toBe(0);
 
     const claim1 = queue.claim("worker-a");
-    const claim2 = queue.claim("worker-a");
-    const claim3 = queue.claim("worker-a");
+    const claim2 = queue.claim("worker-b");
+    const claim3 = queue.claim("worker-c");
     expect(claim1.ok).toBe(true);
     expect(claim2.ok).toBe(true);
     expect(claim3.ok).toBe(true);
@@ -72,6 +72,38 @@ describe("JobQueue stale recovery", () => {
 
     expect(recovered.length).toBe(0);
     expect(queue.getJob(jobId)?.status).toBe("claimed");
+  });
+
+  test("does not let a worker claim a second job while another claim is still active", () => {
+    const queue = new JobQueue(":memory:");
+
+    const first = queue.enqueue({
+      taskId: "task-first",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    const second = queue.enqueue({
+      taskId: "task-second",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+
+    const firstClaim = queue.claim("worker-serial");
+    expect(firstClaim.ok).toBe(true);
+    expect(firstClaim.job?.id).toBe(first.jobId);
+
+    const secondClaim = queue.claim("worker-serial");
+    expect(secondClaim.ok).toBe(false);
+    expect(secondClaim.message).toContain("already has claimed job");
+
+    const queuedJob = queue.getJob(second.jobId!);
+    expect(queuedJob?.status).toBe("pending");
+    expect(queue.listWorkers()[0]?.currentJobId).toBe(first.jobId);
   });
 
   test("recovers a claimed job when both heartbeat and log activity are stale", () => {

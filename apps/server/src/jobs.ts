@@ -749,6 +749,34 @@ export class JobQueue {
         )
         .run(workerId, now, now, now);
 
+      const existingClaim = this.db
+        .prepare(
+          `SELECT * FROM jobs
+           WHERE workerId = ?
+             AND status = 'claimed'
+           ORDER BY COALESCE(startedAt, claimedAt, updatedAt, createdAt) ASC
+           LIMIT 1`,
+        )
+        .get(workerId) as JobRow | undefined;
+
+      if (existingClaim) {
+        this.db
+          .prepare(
+            `UPDATE workers SET status = 'busy', currentJobId = ?, lastHeartbeat = ?, updatedAt = ?
+             WHERE workerId = ?`,
+          )
+          .run(existingClaim.id, now, now, workerId);
+        return {
+          job: {
+            ...existingClaim,
+            workerId,
+            status: "claimed" as JobStatus,
+          },
+          queueWaitMs: 0,
+          reusedActiveClaim: true as const,
+        };
+      }
+
       const row = this.db
         .prepare(
           `SELECT * FROM jobs
@@ -823,6 +851,12 @@ export class JobQueue {
 
     const claimed = tx();
     if (!claimed) return { ok: false, message: "No pending jobs" };
+    if ("reusedActiveClaim" in claimed) {
+      return {
+        ok: false,
+        message: `Worker ${workerId} already has claimed job ${claimed.job.id}`,
+      };
+    }
     return { ok: true, job: claimed.job, queueWaitMs: claimed.queueWaitMs };
   }
 
