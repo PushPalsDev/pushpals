@@ -78,7 +78,8 @@ function trimTrailingZeroes(value: string): string {
 export function formatTokenCount(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "--";
   if (value < 1_000) return Math.round(value).toLocaleString();
-  if (value < 1_000_000) return `${trimTrailingZeroes((value / 1_000).toFixed(value < 10_000 ? 1 : 0))}k`;
+  if (value < 1_000_000)
+    return `${trimTrailingZeroes((value / 1_000).toFixed(value < 10_000 ? 1 : 0))}k`;
   if (value < 1_000_000_000) {
     return `${trimTrailingZeroes((value / 1_000_000).toFixed(value < 10_000_000 ? 1 : 0))}M`;
   }

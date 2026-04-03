@@ -21,11 +21,7 @@ import {
   loadPushPalsConfig,
   resolveLocalServerConnection,
 } from "shared";
-import {
-  createLLMClient,
-  preflightServiceLlm,
-  type LLMClient,
-} from "../../remotebuddy/src/llm.js";
+import { createLLMClient, preflightServiceLlm, type LLMClient } from "../../remotebuddy/src/llm.js";
 import {
   buildJobStatusReply,
   buildRequestStatusReply,

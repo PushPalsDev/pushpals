@@ -20,8 +20,10 @@ export interface CheckConfig {
 /**
  * SourceControlManager configuration.
  */
-export interface SourceControlManagerConfig
-  extends Omit<SharedSourceControlManagerConfig, "baseBranch" | "reviewAgent" | "checks"> {
+export interface SourceControlManagerConfig extends Omit<
+  SharedSourceControlManagerConfig,
+  "baseBranch" | "reviewAgent" | "checks"
+> {
   /** PushPals server URL. */
   serverUrl: string;
   /** Base branch used for integration bootstrap/sync. */

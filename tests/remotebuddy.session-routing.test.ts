@@ -136,17 +136,20 @@ function writeServerConfig(root: string, port: number): void {
 }
 
 function spawnServer(root: string, port: number): SpawnedServer {
-  const proc = Bun.spawn([bunExecPath, "run", resolve(repoRoot, "apps/server/src/server_main.ts")], {
-    cwd: repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
-      PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
-      PUSHPALS_PORT: String(port),
+  const proc = Bun.spawn(
+    [bunExecPath, "run", resolve(repoRoot, "apps/server/src/server_main.ts")],
+    {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
+        PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
+        PUSHPALS_PORT: String(port),
+      },
     },
-  });
+  );
 
   const server: SpawnedServer = {
     proc,
@@ -161,7 +164,11 @@ function spawnServer(root: string, port: number): SpawnedServer {
   return server;
 }
 
-async function waitForHealth(server: SpawnedServer, port: number, timeoutMs = 10_000): Promise<void> {
+async function waitForHealth(
+  server: SpawnedServer,
+  port: number,
+  timeoutMs = 10_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (server.exitCode != null) {
@@ -206,7 +213,11 @@ async function waitForOpen(ws: WebSocket, timeoutMs = 5_000): Promise<void> {
   });
 }
 
-function connectSessionSocket(port: number, sessionId: string, clientId: string): {
+function connectSessionSocket(
+  port: number,
+  sessionId: string,
+  clientId: string,
+): {
   ws: WebSocket;
   events: EventEnvelope[];
 } {
@@ -332,7 +343,10 @@ describe("RemoteBuddy session routing", () => {
     });
 
     try {
-      await (orchestrator as any).processRequest(claimedBody.request, Number(claimedBody.queueWaitMs ?? 0));
+      await (orchestrator as any).processRequest(
+        claimedBody.request,
+        Number(claimedBody.queueWaitMs ?? 0),
+      );
       const replyEvent = await waitForEvent(
         requestSocket.events,
         (event) =>
@@ -346,7 +360,8 @@ describe("RemoteBuddy session routing", () => {
         defaultSocket.events.some(
           (event) =>
             event.type === "assistant_message" &&
-            String((event.payload as { text?: unknown })?.text ?? "") === "reply routed to session a",
+            String((event.payload as { text?: unknown })?.text ?? "") ===
+              "reply routed to session a",
         ),
       ).toBe(false);
     } finally {
@@ -357,7 +372,9 @@ describe("RemoteBuddy session routing", () => {
   test("spawnWorker clears in-flight state when Bun.spawn throws synchronously", async () => {
     const root = makeTempDir();
     mkdirSync(join(root, "outputs", "data"), { recursive: true });
-    const idempotency = new IdempotencyStore(join(root, "outputs", "data", "remotebuddy-sync-throw.db"));
+    const idempotency = new IdempotencyStore(
+      join(root, "outputs", "data", "remotebuddy-sync-throw.db"),
+    );
     openStores.push(idempotency);
     const orchestrator = new RemoteBuddyOrchestrator({
       server: "http://127.0.0.1:3001",

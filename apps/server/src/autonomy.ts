@@ -197,7 +197,9 @@ const OBJECTIVE_POLICY: Record<AutonomyObjectiveType, ObjectivePolicy> = {
 
 const RISK_ORDER: Record<AutonomyRiskLevel, number> = { low: 0, medium: 1, high: 2 };
 const BREADTH_ORDER: Record<AutonomyGlobBreadth, number> = { narrow: 0, medium: 1, broad: 2 };
-const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>(Object.keys(OBJECTIVE_POLICY) as AutonomyObjectiveType[]);
+const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>(
+  Object.keys(OBJECTIVE_POLICY) as AutonomyObjectiveType[],
+);
 const TRIGGER_TYPES = new Set<SignalValue["type"]>([
   "test_failure",
   "lint_failure",
@@ -226,7 +228,12 @@ function isNegativePrFeedbackVerdict(value: string): boolean {
 
 function deriveOutcomeFromPrFeedbackVerdict(
   verdict: string,
-): { success: boolean; userAction: string; reopenedWithin24h: boolean; regressionFlag: boolean } | null {
+): {
+  success: boolean;
+  userAction: string;
+  reopenedWithin24h: boolean;
+  regressionFlag: boolean;
+} | null {
   const text = verdict.toLowerCase();
   if (isNegativePrFeedbackVerdict(text)) {
     return {
@@ -572,9 +579,14 @@ function extractTokenUsage(value: unknown): number {
   const record = asObject(value);
   const directTotal = asNonNegativeInt(record.totalTokens ?? record.total_tokens ?? record.total);
   if (directTotal > 0) return directTotal;
-  const prompt = asNonNegativeInt(record.promptTokens ?? record.prompt_tokens ?? record.inputTokens ?? record.input_tokens);
+  const prompt = asNonNegativeInt(
+    record.promptTokens ?? record.prompt_tokens ?? record.inputTokens ?? record.input_tokens,
+  );
   const completion = asNonNegativeInt(
-    record.completionTokens ?? record.completion_tokens ?? record.outputTokens ?? record.output_tokens,
+    record.completionTokens ??
+      record.completion_tokens ??
+      record.outputTokens ??
+      record.output_tokens,
   );
   if (prompt > 0 || completion > 0) return prompt + completion;
   const nestedUsage = asObject(record.usage);
@@ -583,7 +595,10 @@ function extractTokenUsage(value: unknown): number {
   );
   if (nestedTotal > 0) return nestedTotal;
   const nestedPrompt = asNonNegativeInt(
-    nestedUsage.promptTokens ?? nestedUsage.prompt_tokens ?? nestedUsage.inputTokens ?? nestedUsage.input_tokens,
+    nestedUsage.promptTokens ??
+      nestedUsage.prompt_tokens ??
+      nestedUsage.inputTokens ??
+      nestedUsage.input_tokens,
   );
   const nestedCompletion = asNonNegativeInt(
     nestedUsage.completionTokens ??
@@ -664,7 +679,9 @@ function isStaleClaimFailureText(value: string): boolean {
 function extractQualityGateRevisionInfo(
   value: string,
 ): { attempts: number; failed: boolean; softPass: boolean } | null {
-  const match = value.match(/quality gate (soft-pass after|failed after) (\d+) auto-revision attempt/i);
+  const match = value.match(
+    /quality gate (soft-pass after|failed after) (\d+) auto-revision attempt/i,
+  );
   if (!match) return null;
   const attempts = Math.max(0, Math.floor(asNumber(match[2], 0)));
   const mode = asString(match[1]).toLowerCase();
@@ -684,7 +701,9 @@ function asRiskLevel(value: unknown): AutonomyRiskLevel | null {
 function asObjectiveType(value: unknown): AutonomyObjectiveType | null {
   const text = asString(value);
   if (!text) return null;
-  return OBJECTIVE_TYPES.has(text as AutonomyObjectiveType) ? (text as AutonomyObjectiveType) : null;
+  return OBJECTIVE_TYPES.has(text as AutonomyObjectiveType)
+    ? (text as AutonomyObjectiveType)
+    : null;
 }
 
 function asComponentArea(value: unknown): AutonomyComponentArea | null {
@@ -835,7 +854,9 @@ function deriveEngineAlgorithmFromTitle(title: string): string {
   return text.slice(prefix.length).trim();
 }
 
-function extractEngineTrialCandidateMeta(record: Record<string, unknown>): EngineTrialCandidateMeta | null {
+function extractEngineTrialCandidateMeta(
+  record: Record<string, unknown>,
+): EngineTrialCandidateMeta | null {
   const candidateId = asString(record.id);
   const title = asString(record.title);
   const trial = asObject(
@@ -859,8 +880,11 @@ function extractEngineTrialCandidateMeta(record: Record<string, unknown>): Engin
   if (!buildingBlockId) return null;
 
   const explicitAlgorithm = asString(trial.algorithm ?? trial.algo ?? trial.name);
-  const algorithm = explicitAlgorithm || deriveEngineAlgorithmFromTitle(title) || "engine_building_block";
-  const score = Number.isFinite(asNumber(trial.score, Number.NaN)) ? asNumber(trial.score, 0) : null;
+  const algorithm =
+    explicitAlgorithm || deriveEngineAlgorithmFromTitle(title) || "engine_building_block";
+  const score = Number.isFinite(asNumber(trial.score, Number.NaN))
+    ? asNumber(trial.score, 0)
+    : null;
   const source = asString(trial.source) || (fallbackBlockId ? "engine_fallback" : "llm");
   const objectiveIds = asStringArray(trial.objective_ids ?? trial.objectiveIds);
   const gapIds = asStringArray(trial.gap_ids ?? trial.gapIds ?? trial.opportunity_gap_ids);
@@ -970,10 +994,13 @@ function normalizeInspirationPatternEntry(raw: unknown): NormalizedInspirationPa
   );
   const sourceLabel =
     truncateText(
-      asString(record.source_label ?? record.sourceLabel ?? record.source_name ?? record.sourceName),
+      asString(
+        record.source_label ?? record.sourceLabel ?? record.source_name ?? record.sourceName,
+      ),
       240,
     ) || null;
-  const sourceUrl = truncateText(asString(record.source_url ?? record.sourceUrl ?? record.url), 1000) || null;
+  const sourceUrl =
+    truncateText(asString(record.source_url ?? record.sourceUrl ?? record.url), 1000) || null;
   const explicitSourceRef =
     truncateText(asString(record.source_ref ?? record.sourceRef ?? record.reference), 1000) || null;
   const sourceRefs = normalizeTextList(
@@ -1004,12 +1031,7 @@ function normalizeInspirationPatternEntry(raw: unknown): NormalizedInspirationPa
 
   const metadata = asObject(record.metadata);
   if (sourceRefs.length > 0) metadata.source_refs = sourceRefs;
-  const fingerprint = sha256Hex(
-    [
-      algorithm.toLowerCase(),
-      whenToUse.toLowerCase(),
-    ].join("\n"),
-  );
+  const fingerprint = sha256Hex([algorithm.toLowerCase(), whenToUse.toLowerCase()].join("\n"));
 
   return {
     fingerprint,
@@ -1088,7 +1110,11 @@ function validateAnswerAgainstSchema(
     const selected = asString(answer);
     if (!selected) return { valid: false, normalized: answer, error: "Answer is required." };
     if (choices.length > 0 && !choices.includes(selected)) {
-      return { valid: false, normalized: answer, error: "Answer is not one of the allowed choices." };
+      return {
+        valid: false,
+        normalized: answer,
+        error: "Answer is not one of the allowed choices.",
+      };
     }
     return { valid: true, normalized: selected };
   }
@@ -1101,7 +1127,11 @@ function validateAnswerAgainstSchema(
       return { valid: false, normalized: answer, error: "Expected one or more selected choices." };
     }
     if (choices.length > 0 && selected.some((entry) => !choices.includes(entry))) {
-      return { valid: false, normalized: answer, error: "One or more selected choices are invalid." };
+      return {
+        valid: false,
+        normalized: answer,
+        error: "One or more selected choices are invalid.",
+      };
     }
     return { valid: true, normalized: selected };
   }
@@ -1478,7 +1508,10 @@ export class AutonomyStore {
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_label TEXT");
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_url TEXT");
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_fingerprint TEXT");
-    ensureColumn("autonomy_engine_source_stats", "curation_status TEXT NOT NULL DEFAULT 'candidate'");
+    ensureColumn(
+      "autonomy_engine_source_stats",
+      "curation_status TEXT NOT NULL DEFAULT 'candidate'",
+    );
     ensureColumn("autonomy_engine_source_stats", "curation_reason TEXT");
     ensureColumn("autonomy_engine_source_stats", "trust_score REAL NOT NULL DEFAULT 0");
     ensureColumn("autonomy_engine_source_stats", "freshness_score REAL NOT NULL DEFAULT 0.5");
@@ -1665,7 +1698,10 @@ export class AutonomyStore {
     let freezeUntil = asString(current.freeze_until) || null;
     let freezeReason = asString(current.freeze_reason) || null;
 
-    if (typeof body.killSwitchEnabled === "boolean" || typeof body.kill_switch_enabled === "boolean") {
+    if (
+      typeof body.killSwitchEnabled === "boolean" ||
+      typeof body.kill_switch_enabled === "boolean"
+    ) {
       killSwitchEnabled = asBoolean(body.killSwitchEnabled ?? body.kill_switch_enabled, false);
     }
     if (asBoolean(body.unfreeze ?? body.clearFreeze ?? body.clear_freeze, false)) {
@@ -1690,7 +1726,8 @@ export class AutonomyStore {
         };
       }
       freezeUntil = new Date(freezeUntilMs).toISOString();
-      freezeReason = asString(body.freezeReason ?? body.freeze_reason) || freezeReason || "manual_freeze";
+      freezeReason =
+        asString(body.freezeReason ?? body.freeze_reason) || freezeReason || "manual_freeze";
     }
 
     this.db
@@ -2009,7 +2046,12 @@ export class AutonomyStore {
       this.lastStaleObjectiveSweepAtMs > 0 &&
       nowMs - this.lastStaleObjectiveSweepAtMs < intervalMs
     ) {
-      return { ok: true, deadLettered: 0, scanned: 0, sweepAt: this.lastStaleObjectiveSweepAtIso ?? nowIso };
+      return {
+        ok: true,
+        deadLettered: 0,
+        scanned: 0,
+        sweepAt: this.lastStaleObjectiveSweepAtIso ?? nowIso,
+      };
     }
     this.lastStaleObjectiveSweepAtMs = nowMs;
     this.lastStaleObjectiveSweepAtIso = nowIso;
@@ -2282,7 +2324,8 @@ export class AutonomyStore {
       ok: true,
       sessionBudget,
       crossedLimit: Boolean(
-        sessionBudget?.exceeded && (!beforeBudget || beforeBudget.totalTokens < sessionBudget.limit),
+        sessionBudget?.exceeded &&
+        (!beforeBudget || beforeBudget.totalTokens < sessionBudget.limit),
       ),
     };
   }
@@ -2729,9 +2772,7 @@ export class AutonomyStore {
       }
     }
 
-    return topSignals
-      .sort((a, b) => b.value - a.value)
-      .slice(0, 20);
+    return topSignals.sort((a, b) => b.value - a.value).slice(0, 20);
   }
 
   private buildStateTraits(params: {
@@ -3095,7 +3136,9 @@ export class AutonomyStore {
     const expiresAtMs = Date.parse(asString(row.expires_at));
     const nowMs = Date.parse(nowIso);
     if (!Number.isFinite(expiresAtMs) || !Number.isFinite(nowMs) || expiresAtMs <= nowMs) {
-      this.db.prepare(`DELETE FROM autonomy_dispatch_lock WHERE lock_id = 'autonomy_dispatch'`).run();
+      this.db
+        .prepare(`DELETE FROM autonomy_dispatch_lock WHERE lock_id = 'autonomy_dispatch'`)
+        .run();
       return null;
     }
     return row;
@@ -3112,11 +3155,11 @@ export class AutonomyStore {
     return normalizedRunId.length === 0 || row.owner_run_id !== normalizedRunId;
   }
 
-  acquireDispatchLock(params: {
-    sessionId: string;
-    runId: string;
-    ttlMs?: number;
-  }): { ok: boolean; reason?: string; lockUntil?: string } {
+  acquireDispatchLock(params: { sessionId: string; runId: string; ttlMs?: number }): {
+    ok: boolean;
+    reason?: string;
+    lockUntil?: string;
+  } {
     const sessionId = asString(params.sessionId);
     const runId = asString(params.runId);
     if (!sessionId || !runId) return { ok: false, reason: "sessionId and runId are required" };
@@ -3169,11 +3212,11 @@ export class AutonomyStore {
     }
   }
 
-  renewDispatchLock(params: {
-    sessionId: string;
-    runId: string;
-    ttlMs?: number;
-  }): { ok: boolean; reason?: string; lockUntil?: string } {
+  renewDispatchLock(params: { sessionId: string; runId: string; ttlMs?: number }): {
+    ok: boolean;
+    reason?: string;
+    lockUntil?: string;
+  } {
     const sessionId = asString(params.sessionId);
     const runId = asString(params.runId);
     if (!sessionId || !runId) return { ok: false, reason: "sessionId and runId are required" };
@@ -3189,7 +3232,10 @@ export class AutonomyStore {
     return this.acquireDispatchLock(params);
   }
 
-  releaseDispatchLock(params: { sessionId: string; runId: string }): { ok: boolean; released: boolean } {
+  releaseDispatchLock(params: { sessionId: string; runId: string }): {
+    ok: boolean;
+    released: boolean;
+  } {
     const sessionId = asString(params.sessionId);
     const runId = asString(params.runId);
     if (!sessionId || !runId) return { ok: true, released: false };
@@ -3289,14 +3335,19 @@ export class AutonomyStore {
     }
     const placeholders = keepIds.map(() => "?").join(", ");
     this.db
-      .prepare(`UPDATE autonomy_llm_calls SET response_json = NULL WHERE run_id NOT IN (${placeholders})`)
+      .prepare(
+        `UPDATE autonomy_llm_calls SET response_json = NULL WHERE run_id NOT IN (${placeholders})`,
+      )
       .run(...keepIds);
   }
 
   private maybeRunInspirationMaintenance(nowIso = asIsoNow()): void {
     const nowMs = Date.parse(nowIso);
     if (!Number.isFinite(nowMs)) return;
-    if (this.lastInspirationMaintenanceAtMs > 0 && nowMs - this.lastInspirationMaintenanceAtMs < 300_000) {
+    if (
+      this.lastInspirationMaintenanceAtMs > 0 &&
+      nowMs - this.lastInspirationMaintenanceAtMs < 300_000
+    ) {
       return;
     }
     this.applyInspirationFreshnessDecay(nowIso);
@@ -3482,7 +3533,10 @@ export class AutonomyStore {
           row.cooldown_until.length > 0 &&
           Date.parse(row.cooldown_until) > Date.parse(now),
       )
-      .map((row) => ({ pattern_key: row.pattern_key, cooldown_until: row.cooldown_until as string }));
+      .map((row) => ({
+        pattern_key: row.pattern_key,
+        cooldown_until: row.cooldown_until as string,
+      }));
     const openObjectives = this.db
       .prepare(
         `SELECT id AS objective_id, status, objective_type, pattern_key, updated_at
@@ -3634,8 +3688,10 @@ export class AutonomyStore {
     ) {
       return "repo preflight blocked: worktree is dirty";
     }
-    if (asBoolean(flags.is_merge_in_progress, false)) return "repo preflight blocked: merge/rebase in progress";
-    if (asBoolean(flags.dispatch_lock_held, false)) return "repo preflight blocked: dispatch lock held";
+    if (asBoolean(flags.is_merge_in_progress, false))
+      return "repo preflight blocked: merge/rebase in progress";
+    if (asBoolean(flags.dispatch_lock_held, false))
+      return "repo preflight blocked: dispatch lock held";
     const safety = asObject(payload.safety_state);
     if (asBoolean(safety.kill_switch_enabled, false)) {
       return "autonomy kill switch enabled";
@@ -3653,7 +3709,10 @@ export class AutonomyStore {
     }
     if (asBoolean(resourceBudget.runtime_budget_exhausted, false)) {
       const usage = Math.max(0, Math.floor(asNumber(resourceBudget.runtime_ms_last_hour, 0)));
-      const budget = Math.max(0, Math.floor(asNumber(resourceBudget.runtime_budget_ms_per_hour, 0)));
+      const budget = Math.max(
+        0,
+        Math.floor(asNumber(resourceBudget.runtime_budget_ms_per_hour, 0)),
+      );
       return `hourly runtime budget exceeded (${usage}/${budget} ms)`;
     }
     return null;
@@ -3693,17 +3752,20 @@ export class AutonomyStore {
       )
       .all() as Array<{ patternKey: string }>;
     const activePatternKeys = new Set(
-      activePatternRows
-        .map((row) => asString(row.patternKey))
-        .filter(Boolean),
+      activePatternRows.map((row) => asString(row.patternKey)).filter(Boolean),
     );
     const results = candidates.map((raw) => {
       const record = asObject(raw);
-      const candidateId = asString(record.id ?? record.candidateId ?? record.candidate_id) || randomUUID();
+      const candidateId =
+        asString(record.id ?? record.candidateId ?? record.candidate_id) || randomUUID();
       const objectiveTypeRaw = asString(record.objectiveType ?? record.objective_type);
       const objectiveType = asObjectiveType(objectiveTypeRaw);
       if (!objectiveType) {
-        return { candidate_id: candidateId, ok: false, reason: `invalid objective_type "${objectiveTypeRaw}"` };
+        return {
+          candidate_id: candidateId,
+          ok: false,
+          reason: `invalid objective_type "${objectiveTypeRaw}"`,
+        };
       }
       const patternKey = asString(record.patternKey ?? record.pattern_key);
       const componentArea = asComponentArea(record.componentArea ?? record.component_area);
@@ -3727,7 +3789,9 @@ export class AutonomyStore {
       if (componentArea) {
         const perComponentLimit = Math.max(
           0,
-          Math.floor(limits.maxDispatchPerHourByComponent[componentArea] ?? limits.maxDispatchPerHour),
+          Math.floor(
+            limits.maxDispatchPerHourByComponent[componentArea] ?? limits.maxDispatchPerHour,
+          ),
         );
         const perComponentCount = Math.max(0, Math.floor(byComponentCounts[componentArea] ?? 0));
         if (perComponentCount >= perComponentLimit) {
@@ -3739,7 +3803,11 @@ export class AutonomyStore {
         }
       }
       if (activeCount >= maxConcurrent) {
-        return { candidate_id: candidateId, ok: false, reason: "max concurrent objectives reached" };
+        return {
+          candidate_id: candidateId,
+          ok: false,
+          reason: "max concurrent objectives reached",
+        };
       }
       const cooldownErr = this.cooldownReason(patternKey, now);
       if (cooldownErr) {
@@ -3764,7 +3832,11 @@ export class AutonomyStore {
         return { candidate_id: candidateId, ok: false, reason: resourceBudgetErr };
       }
       if (patternKey && activePatternKeys.has(patternKey)) {
-        return { candidate_id: candidateId, ok: false, reason: "pattern already has active objective" };
+        return {
+          candidate_id: candidateId,
+          ok: false,
+          reason: "pattern already has active objective",
+        };
       }
       if (confidence < limits.minConfidence) {
         return {
@@ -3775,7 +3847,8 @@ export class AutonomyStore {
       }
       if (applySequentialAccounting) {
         byTypeCounts[objectiveType] = perTypeCount + 1;
-        if (componentArea) byComponentCounts[componentArea] = Math.max(0, byComponentCounts[componentArea] ?? 0) + 1;
+        if (componentArea)
+          byComponentCounts[componentArea] = Math.max(0, byComponentCounts[componentArea] ?? 0) + 1;
         globalCount += 1;
         activeCount += 1;
         if (patternKey) activePatternKeys.add(patternKey);
@@ -3812,7 +3885,9 @@ export class AutonomyStore {
       const targetPaths = asStringArray(record.targetPaths ?? record.target_paths);
       const scopeRecord = asObject(record.scope);
       const riskLevel = asString(record.riskLevel ?? record.risk_level);
-      const expectedValidation = asStringArray(record.expectedValidation ?? record.expected_validation);
+      const expectedValidation = asStringArray(
+        record.expectedValidation ?? record.expected_validation,
+      );
       const readAnywhere = asBoolean(scopeRecord.readAnywhere ?? scopeRecord.read_anywhere, false);
       const writeGlobs = asStringArray(scopeRecord.writeGlobs ?? scopeRecord.write_globs);
       const scopeValidation = validateScopeInvariants(componentArea, targetPaths, writeGlobs, {
@@ -3849,10 +3924,15 @@ export class AutonomyStore {
       const impactSignal = asNumber(record.impactSignal ?? record.impact_signal, 0);
       const emaSuccess = asNumber(record.emaSuccess ?? record.ema_success, 0);
       const emaUserAccept = asNumber(record.emaUserAccept ?? record.ema_user_accept, 0);
-      const finalScore =
-        Number.isFinite(asNumber(record.finalScore ?? record.final_score, Number.NaN))
-          ? asNumber(record.finalScore ?? record.final_score, 0)
-          : 0.55 * llmScore + 0.2 * impactSignal + 0.15 * emaSuccess + 0.1 * emaUserAccept - penaltyTotal(penalties);
+      const finalScore = Number.isFinite(
+        asNumber(record.finalScore ?? record.final_score, Number.NaN),
+      )
+        ? asNumber(record.finalScore ?? record.final_score, 0)
+        : 0.55 * llmScore +
+          0.2 * impactSignal +
+          0.15 * emaSuccess +
+          0.1 * emaUserAccept -
+          penaltyTotal(penalties);
       const objectiveTypePersist = (objectiveType ?? objectiveTypeRaw) || "invalid";
       const triggerTypePersist = (triggerType ?? triggerTypeRaw) || "invalid";
       const componentAreaPersist = scopeValidation.componentArea ?? componentAreaRaw ?? "invalid";
@@ -3914,7 +3994,9 @@ export class AutonomyStore {
           asString(record.gateDecision ?? record.gate_decision) ||
             (gateReasons.length === 0 ? "approved" : "rejected"),
           JSON.stringify(
-            gateReasons.length === 0 ? asStringArray(record.gateReasons ?? record.gate_reasons) : gateReasons,
+            gateReasons.length === 0
+              ? asStringArray(record.gateReasons ?? record.gate_reasons)
+              : gateReasons,
           ),
           JSON.stringify(debugRecord),
           asIsoNow(),
@@ -3942,7 +4024,9 @@ export class AutonomyStore {
           asString(call.promptHash ?? call.prompt_hash) || null,
           asString(call.requestPayloadHash ?? call.request_payload_hash) || null,
           asString(call.modelId ?? call.model_id) || null,
-          Number.isFinite(asNumber(call.temperature, Number.NaN)) ? asNumber(call.temperature, 0) : null,
+          Number.isFinite(asNumber(call.temperature, Number.NaN))
+            ? asNumber(call.temperature, 0)
+            : null,
           Number.isFinite(asNumber(call.timeoutMs ?? call.timeout_ms, Number.NaN))
             ? Math.floor(asNumber(call.timeoutMs ?? call.timeout_ms, 0))
             : null,
@@ -3984,7 +4068,8 @@ export class AutonomyStore {
       asStringArray(scopeRecord.writeGlobs ?? scopeRecord.write_globs),
       { requireWriteGlobs: true },
     );
-    if (!scopeValidation.ok) return { ok: false, objectiveId, reason: scopeValidation.errors.join("; ") };
+    if (!scopeValidation.ok)
+      return { ok: false, objectiveId, reason: scopeValidation.errors.join("; ") };
     const normalizedComponentArea = scopeValidation.componentArea ?? componentAreaRaw;
     const expectedValidation = asStringArray(
       objective.expectedValidation ??
@@ -4016,7 +4101,10 @@ export class AutonomyStore {
       : null;
     if (objectiveStatus === "dispatched") {
       const overrideCooldown = asBoolean(
-        objective.overrideCooldown ?? objective.override_cooldown ?? body.overrideCooldown ?? body.override_cooldown,
+        objective.overrideCooldown ??
+          objective.override_cooldown ??
+          body.overrideCooldown ??
+          body.override_cooldown,
         false,
       );
       const eligibility = this.evaluateEligibility({
@@ -4032,7 +4120,11 @@ export class AutonomyStore {
         ],
       });
       if (!eligibility.ok) {
-        return { ok: false, objectiveId, reason: eligibility.reason ?? "eligibility evaluation failed" };
+        return {
+          ok: false,
+          objectiveId,
+          reason: eligibility.reason ?? "eligibility evaluation failed",
+        };
       }
       const decision = eligibility.results?.[0];
       if (!decision?.ok) {
@@ -4093,7 +4185,8 @@ export class AutonomyStore {
         now,
       );
     const trialMeta =
-      (objectiveCandidateId ? candidateEngineTrialMetaById.get(objectiveCandidateId) : undefined) ?? null;
+      (objectiveCandidateId ? candidateEngineTrialMetaById.get(objectiveCandidateId) : undefined) ??
+      null;
     if (trialMeta) {
       const trialId = `trial_${objectiveId}`;
       this.db
@@ -4151,11 +4244,15 @@ export class AutonomyStore {
           sessionId,
           asString(question.question),
           asString(question.questionType ?? question.question_type),
-          JSON.stringify(asObject(question.expectedAnswerSchema ?? question.expected_answer_schema)),
+          JSON.stringify(
+            asObject(question.expectedAnswerSchema ?? question.expected_answer_schema),
+          ),
           JSON.stringify(asObject(question.context)),
           now,
           asString(question.expiresAt ?? question.expires_at) ||
-            new Date(Date.parse(now) + this.config.remotebuddy.autonomy.questionTtlMs).toISOString(),
+            new Date(
+              Date.parse(now) + this.config.remotebuddy.autonomy.questionTtlMs,
+            ).toISOString(),
         );
       this.db
         .prepare(`UPDATE autonomy_objectives SET question_id = ?, updated_at = ? WHERE id = ?`)
@@ -4170,7 +4267,12 @@ export class AutonomyStore {
     requestId?: string | null;
     jobId?: string | null;
     prUrl?: string | null;
-  }): { objectiveId: string | null; requestId: string | null; jobId: string | null; patternKey: string | null } | null {
+  }): {
+    objectiveId: string | null;
+    requestId: string | null;
+    jobId: string | null;
+    patternKey: string | null;
+  } | null {
     const objectiveId = asString(params.objectiveId);
     const requestId = asString(params.requestId);
     const jobId = asString(params.jobId);
@@ -4347,11 +4449,16 @@ export class AutonomyStore {
           html_url: asString(row.htmlUrl ?? row.html_url),
         };
       })
-      .filter((entry): entry is { body: string; user_login: string; created_at: string; html_url: string } =>
-        Boolean(entry),
+      .filter(
+        (
+          entry,
+        ): entry is { body: string; user_login: string; created_at: string; html_url: string } =>
+          Boolean(entry),
       )
       .slice(0, prFeedbackCommentRows);
-    const payloadCommentCount = Number.isFinite(asNumber(body.commentCount ?? body.comment_count, Number.NaN))
+    const payloadCommentCount = Number.isFinite(
+      asNumber(body.commentCount ?? body.comment_count, Number.NaN),
+    )
       ? Math.max(0, Math.floor(asNumber(body.commentCount ?? body.comment_count, 0)))
       : 0;
     const commentCount = Math.max(payloadCommentCount, comments.length);
@@ -4453,10 +4560,7 @@ export class AutonomyStore {
       ? Math.max(0, Math.floor(asNumber(body.latencyMs ?? body.latency_ms, 0)))
       : null;
     const userAction = asString(body.userAction ?? body.user_action) || null;
-    const reopenedWithin24h = asBoolean(
-      body.reopenedWithin24h ?? body.reopened_within_24h,
-      false,
-    );
+    const reopenedWithin24h = asBoolean(body.reopenedWithin24h ?? body.reopened_within_24h, false);
     const regressionFlag = asBoolean(body.regressionFlag ?? body.regression_flag, false);
     const normalizedUserAction = userAction ? userAction.toLowerCase() : "";
 
@@ -4879,7 +4983,12 @@ export class AutonomyStore {
     inserted: number;
     updated: number;
     skipped: number;
-    results: Array<{ fingerprint: string; status: "inserted" | "updated" | "skipped"; id?: number; reason?: string }>;
+    results: Array<{
+      fingerprint: string;
+      status: "inserted" | "updated" | "skipped";
+      id?: number;
+      reason?: string;
+    }>;
     reason?: string;
   } {
     const rawEntries = Array.isArray(body.entries)
@@ -5025,13 +5134,17 @@ export class AutonomyStore {
       );
       const existingSummary = asString(existing.summary);
       const mergedSummary =
-        normalized.summary.length > existingSummary.length ? normalized.summary : existingSummary || normalized.summary;
+        normalized.summary.length > existingSummary.length
+          ? normalized.summary
+          : existingSummary || normalized.summary;
       const mergedQuality = clamp01(
-        (clamp01(asNumber(existing.quality_score, 0.5)) * previousSeenCount + normalized.qualityScore) /
+        (clamp01(asNumber(existing.quality_score, 0.5)) * previousSeenCount +
+          normalized.qualityScore) /
           nextSeenCount,
       );
       const mergedFreshness = clamp01(
-        (clamp01(asNumber(existing.freshness_score, 0.5)) * previousSeenCount + normalized.freshnessScore) /
+        (clamp01(asNumber(existing.freshness_score, 0.5)) * previousSeenCount +
+          normalized.freshnessScore) /
           nextSeenCount,
       );
       const existingMetadata = parseJsonObject(existing.metadata_json);
@@ -5096,7 +5209,9 @@ export class AutonomyStore {
       args.push(sourceType);
     }
     if (q) {
-      where.push("(LOWER(p.algorithm) LIKE ? OR LOWER(p.when_to_use) LIKE ? OR LOWER(p.summary) LIKE ?)");
+      where.push(
+        "(LOWER(p.algorithm) LIKE ? OR LOWER(p.when_to_use) LIKE ? OR LOWER(p.summary) LIKE ?)",
+      );
       const like = `%${q}%`;
       args.push(like, like, like);
     }
@@ -5151,11 +5266,13 @@ export class AutonomyStore {
       const tags = uniqueLowercaseTokens(parseJsonArray(row.tags_json), 24);
       const metadata = parseJsonObject(row.metadata_json);
       const curationStatus = normalizeEngineSourceCurationStatus(row.source_curation_status);
-      if (curationStatus && curationStatus !== "candidate") metadata.source_curation_status = curationStatus;
+      if (curationStatus && curationStatus !== "candidate")
+        metadata.source_curation_status = curationStatus;
       const curationReason = asString(row.source_curation_reason);
       if (curationReason) metadata.source_curation_reason = curationReason;
       const trustScore = clamp01(asNumber(row.source_trust_score, Number.NaN));
-      if (Number.isFinite(asNumber(row.source_trust_score, Number.NaN))) metadata.source_trust_score = trustScore;
+      if (Number.isFinite(asNumber(row.source_trust_score, Number.NaN)))
+        metadata.source_trust_score = trustScore;
       return {
         id: Math.max(0, Math.floor(asNumber(row.id, 0))),
         fingerprint: asString(row.fingerprint),
@@ -5170,7 +5287,9 @@ export class AutonomyStore {
         validationIdeas: normalizeTextList(parseJsonArray(row.validation_json), 20, 320),
         tags,
         qualityScore: clamp01(asNumber(row.quality_score, 0.5)),
-        freshnessScore: clamp01(asNumber(row.source_freshness_score, asNumber(row.freshness_score, 0.5))),
+        freshnessScore: clamp01(
+          asNumber(row.source_freshness_score, asNumber(row.freshness_score, 0.5)),
+        ),
         seenCount: Math.max(0, Math.floor(asNumber(row.seen_count, 0))),
         firstSeenAt: asString(row.first_seen_at),
         lastSeenAt: asString(row.last_seen_at),
@@ -5609,9 +5728,16 @@ export class AutonomyStore {
         )
         .run(JSON.stringify(answer), validation.error ?? "Invalid answer", now, questionId);
       this.db
-        .prepare(`UPDATE autonomy_objectives SET status = 'needs_clarification', updated_at = ? WHERE id = ?`)
+        .prepare(
+          `UPDATE autonomy_objectives SET status = 'needs_clarification', updated_at = ? WHERE id = ?`,
+        )
         .run(now, row.objective_id);
-      return { ok: true, status: "invalid", reason: validation.error, objectiveId: row.objective_id };
+      return {
+        ok: true,
+        status: "invalid",
+        reason: validation.error,
+        objectiveId: row.objective_id,
+      };
     }
 
     this.db
@@ -5734,7 +5860,8 @@ export class AutonomyStore {
     }
     const now = asIsoNow();
     const note = truncateText(asString(noteRaw), 400);
-    const closeReason = action === "escalate" ? "escalated_to_human" : action === "skip" ? "skipped" : "closed";
+    const closeReason =
+      action === "escalate" ? "escalated_to_human" : action === "skip" ? "skipped" : "closed";
     const validationError =
       action === "escalate"
         ? note || "Escalated to human review."

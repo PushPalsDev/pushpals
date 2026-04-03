@@ -153,12 +153,10 @@ interface RepoStatusSummary {
   refreshedAt: string;
 }
 
-let repoStatusCache:
-  | {
-      value: RepoStatusSummary;
-      fetchedAtMs: number;
-    }
-  | null = null;
+let repoStatusCache: {
+  value: RepoStatusSummary;
+  fetchedAtMs: number;
+} | null = null;
 
 async function resolveRemoteUrl(repoPath: string, remote: string): Promise<string> {
   const proc = Bun.spawn(["git", "-C", repoPath, "remote", "get-url", remote], {
@@ -1181,7 +1179,8 @@ export function createRequestHandler() {
           return makeJson(result, 400);
         }
 
-        const objective = body.objective && typeof body.objective === "object" ? body.objective : null;
+        const objective =
+          body.objective && typeof body.objective === "object" ? body.objective : null;
         const sessionId = compactText(body.sessionId, 128);
         const runId = compactText(body.runId, 128);
         const snapshotId = compactText(body.snapshotId, 128);
@@ -1194,7 +1193,10 @@ export function createRequestHandler() {
           const objectiveRecord = objective as Record<string, unknown>;
           const objectiveId = compactText(objectiveRecord.id ?? result.objectiveId, 128);
           const status = compactText(objectiveRecord.status, 64);
-          const requestId = compactText(objectiveRecord.requestId ?? objectiveRecord.request_id, 128);
+          const requestId = compactText(
+            objectiveRecord.requestId ?? objectiveRecord.request_id,
+            128,
+          );
           const patternKey = compactText(
             result.patternKey ??
               (objectiveRecord as Record<string, unknown>).patternKey ??
@@ -1244,7 +1246,10 @@ export function createRequestHandler() {
             }
           }
           if (session && result.questionId) {
-            const q = body.question && typeof body.question === "object" ? (body.question as Record<string, unknown>) : {};
+            const q =
+              body.question && typeof body.question === "object"
+                ? (body.question as Record<string, unknown>)
+                : {};
             session.emit({
               protocolVersion: PROTOCOL_VERSION,
               id: randomUUID(),
@@ -1354,12 +1359,11 @@ export function createRequestHandler() {
                 compactText(body.patternKey ?? body.pattern_key ?? result.patternKey, 128) ||
                 "unknown",
               outcome:
-                compactText(body.verdict ?? body.userAction ?? body.user_action ?? "pr_feedback", 120) ||
-                "pr_feedback",
-              success:
-                typeof result.success === "boolean"
-                  ? result.success
-                  : Boolean(body.success),
+                compactText(
+                  body.verdict ?? body.userAction ?? body.user_action ?? "pr_feedback",
+                  120,
+                ) || "pr_feedback",
+              success: typeof result.success === "boolean" ? result.success : Boolean(body.success),
             },
           });
         }
@@ -1418,7 +1422,10 @@ export function createRequestHandler() {
           });
           if (enqueueResult.ok && enqueueResult.requestId) {
             resumedRequestId = enqueueResult.requestId;
-            autonomyStore.markObjectiveDispatched(result.resume.objectiveId, enqueueResult.requestId);
+            autonomyStore.markObjectiveDispatched(
+              result.resume.objectiveId,
+              enqueueResult.requestId,
+            );
             const dispatchSession = sessionManager.getSession(result.resume.sessionId);
             if (dispatchSession) {
               dispatchSession.emit({
@@ -1439,7 +1446,9 @@ export function createRequestHandler() {
               });
             }
           } else {
-            resumeError = compactText(enqueueResult.message, 300) || "failed to enqueue autonomy resume request";
+            resumeError =
+              compactText(enqueueResult.message, 300) ||
+              "failed to enqueue autonomy resume request";
           }
         }
         const session = sessionId ? sessionManager.getSession(sessionId) : null;
@@ -1709,7 +1718,9 @@ export function createRequestHandler() {
         }
         if (isAutonomyRequestPayload(body)) {
           const workers = jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS);
-          const schedulableWorkers = workers.filter((worker) => worker.isOnline && worker.status !== "offline");
+          const schedulableWorkers = workers.filter(
+            (worker) => worker.isOnline && worker.status !== "offline",
+          );
           const idleWorkers = schedulableWorkers.filter(
             (worker) => worker.status === "idle" && worker.activeJobCount === 0,
           );
@@ -1961,7 +1972,8 @@ export function createRequestHandler() {
         ws.data = { sessionId, unsubscribe, client, clientConnectionId };
       },
       close(ws: any) {
-        const { sessionId, unsubscribe, client, clientConnectionId, heartbeatTimer } = ws.data || {};
+        const { sessionId, unsubscribe, client, clientConnectionId, heartbeatTimer } =
+          ws.data || {};
         console.log(`[WS] Session ${sessionId} disconnected`);
         if (heartbeatTimer) {
           clearInterval(heartbeatTimer);

@@ -53,9 +53,7 @@ describe("adjacent_possible", () => {
     );
     expect(pairTelemetry?.accepted).toBe(true);
     expect(pairTelemetry?.metrics?.score).toBeGreaterThan(0.5);
-    expect(pairTelemetry?.attempt_id).toBe(
-      `${queueMotif.motif_id}::${throughputGap.id}`,
-    );
+    expect(pairTelemetry?.attempt_id).toBe(`${queueMotif.motif_id}::${throughputGap.id}`);
     const emissionTelemetry = result.telemetry.find(
       (event) =>
         event.step === "idea_emitted" &&
@@ -86,9 +84,7 @@ describe("adjacent_possible", () => {
         event.gap_id === governanceGap.id,
     );
     expect(rejectionTelemetry?.accepted).toBe(false);
-    expect(rejectionTelemetry?.attempt_id).toBe(
-      `${queueMotif.motif_id}::${governanceGap.id}`,
-    );
+    expect(rejectionTelemetry?.attempt_id).toBe(`${queueMotif.motif_id}::${governanceGap.id}`);
     const guardrailEvent = result.telemetry.find(
       (event) => event.step === "guardrail_drop" && event.reason === "gap_not_supported",
     );
@@ -117,12 +113,12 @@ describe("adjacent_possible", () => {
     });
 
     expect(result.ideas).toHaveLength(0);
-    expect(
-      result.telemetry.some((event) => event.reason === "motif_signal_below_threshold"),
-    ).toBe(true);
-    expect(
-      result.telemetry.some((event) => event.reason === "gap_score_below_threshold"),
-    ).toBe(true);
+    expect(result.telemetry.some((event) => event.reason === "motif_signal_below_threshold")).toBe(
+      true,
+    );
+    expect(result.telemetry.some((event) => event.reason === "gap_score_below_threshold")).toBe(
+      true,
+    );
     expect(result.telemetry.filter((event) => event.step === "pair_attempt")).toHaveLength(0);
   });
 

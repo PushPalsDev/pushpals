@@ -11,9 +11,9 @@ describe("source-control-manager review apply fallback", () => {
       'hint: After resolving the conflicts, mark them with "git add/rm <pathspec>", then run "git cherry-pick --continue".',
     ].join("\n");
     expect(isCherryPickConflictOutput(message)).toBe(true);
-    expect(isCherryPickConflictOutput("fatal: could not read Username for 'https://github.com'")).toBe(
-      false,
-    );
+    expect(
+      isCherryPickConflictOutput("fatal: could not read Username for 'https://github.com'"),
+    ).toBe(false);
   });
 
   test("bypasses apply failure only in ReviewAgent cherry-pick mode", () => {

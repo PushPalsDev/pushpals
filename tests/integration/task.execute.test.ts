@@ -5,9 +5,7 @@ import { loadPushPalsConfig } from "../../packages/shared/src/config";
 import { executeJob } from "../../apps/workerpals/src/execute_job";
 import type { WorkerpalsRuntimeConfig } from "../../apps/workerpals/src/common/executor_backend";
 import type { ExecutorBackend } from "../../apps/workerpals/src/common/types";
-import {
-  BACKEND_EXECUTOR_SCRIPT_SEGMENTS,
-} from "../../apps/workerpals/src/backends/backend_config";
+import { BACKEND_EXECUTOR_SCRIPT_SEGMENTS } from "../../apps/workerpals/src/backends/backend_config";
 import {
   getBackendTaskExecutor,
   registerBackendTaskExecutor,
@@ -26,10 +24,7 @@ function stubBackendScriptSegmentsForTesting(
   backend: ExecutorBackend,
   segments: readonly string[] = [],
 ): Cleanup {
-  const hadEntry = Object.prototype.hasOwnProperty.call(
-    BACKEND_EXECUTOR_SCRIPT_SEGMENTS,
-    backend,
-  );
+  const hadEntry = Object.prototype.hasOwnProperty.call(BACKEND_EXECUTOR_SCRIPT_SEGMENTS, backend);
   const previousSegments = BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend];
   BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend] = segments;
   return () => {
@@ -103,7 +98,8 @@ describe("task.execute integration harness", () => {
     const forwardedLogs: ForwardedLog[] = [];
     let observedRepo: string | null = null;
     let observedRuntime: WorkerpalsRuntimeConfig | null = null;
-    let observedBudgets: { executionBudgetMs?: number; finalizationBudgetMs?: number } | null = null;
+    let observedBudgets: { executionBudgetMs?: number; finalizationBudgetMs?: number } | null =
+      null;
 
     const stubExecutor: BackendTaskExecutor = async (
       kind,
@@ -151,9 +147,7 @@ describe("task.execute integration harness", () => {
         ),
       ).toBe(true);
       expect(
-        forwardedLogs.some(
-          (entry) => entry.stream === "stderr" && entry.line.includes("budgets="),
-        ),
+        forwardedLogs.some((entry) => entry.stream === "stderr" && entry.line.includes("budgets=")),
       ).toBe(true);
     } finally {
       restoreExecutor();

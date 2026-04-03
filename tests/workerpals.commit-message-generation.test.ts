@@ -126,13 +126,15 @@ describe("workerpals commit message generation helpers", () => {
   });
 
   test("parses changed paths from git name-only output without '.' or duplicates", () => {
-    const parsed = parseChangedPathsFromNameOnlyOutput([
-      ".",
-      "apps/localbuddy/src/request_status.ts",
-      "apps/localbuddy/src/request_status.ts",
-      "wiki/05-localbuddy.md",
-      "",
-    ].join("\n"));
+    const parsed = parseChangedPathsFromNameOnlyOutput(
+      [
+        ".",
+        "apps/localbuddy/src/request_status.ts",
+        "apps/localbuddy/src/request_status.ts",
+        "wiki/05-localbuddy.md",
+        "",
+      ].join("\n"),
+    );
 
     expect(parsed).toEqual(["apps/localbuddy/src/request_status.ts", "wiki/05-localbuddy.md"]);
   });
@@ -153,9 +155,13 @@ describe("workerpals commit message generation helpers", () => {
       ["apps/localbuddy/src/request_status.ts", "apps/localbuddy/tests/request_status.test.ts"],
     );
 
-    expect(message).toContain("feat(local_agent): update localbuddy implementation and test coverage");
+    expect(message).toContain(
+      "feat(local_agent): update localbuddy implementation and test coverage",
+    );
     expect(message).toContain("- update apps/localbuddy/src/request_status.ts");
-    expect(message).toContain("- add or update tests in apps/localbuddy/tests/request_status.test.ts");
+    expect(message).toContain(
+      "- add or update tests in apps/localbuddy/tests/request_status.test.ts",
+    );
     expect(message).toContain("Tests:\n- bun --cwd apps/localbuddy test");
     expect(message).not.toContain("updated path: .");
     expect(message).not.toContain("can you add 1 more test case for localbuddy");
@@ -192,8 +198,9 @@ describe("workerpals commit message generation helpers", () => {
     expect(
       isRebaseConflictOutput("error: could not apply 1234abcd... add tests for request status"),
     ).toBe(true);
-    expect(isRebaseConflictOutput("fatal: could not read Username for 'https://github.com'"))
-      .toBe(false);
+    expect(isRebaseConflictOutput("fatal: could not read Username for 'https://github.com'")).toBe(
+      false,
+    );
   });
 
   test("detects rebase editor prompt output", () => {

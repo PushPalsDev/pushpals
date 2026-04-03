@@ -28,12 +28,7 @@ describe("client metro config", () => {
   });
 
   test("blocks repo-root workspace links under node_modules", () => {
-    const sampleWorkspaceLink = resolve(
-      import.meta.dir,
-      "..",
-      "node_modules",
-      "client",
-    );
+    const sampleWorkspaceLink = resolve(import.meta.dir, "..", "node_modules", "client");
     const blockList = metroConfig.resolver?.blockList;
     const patterns = Array.isArray(blockList) ? blockList : blockList ? [blockList] : [];
     expect(patterns.some((pattern) => pattern.test(sampleWorkspaceLink))).toBe(true);

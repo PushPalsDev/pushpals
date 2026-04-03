@@ -18,11 +18,7 @@ export function collectDotEnvKeys(raw: string): Set<string> {
   return keys;
 }
 
-function collectTomlLeafKeysFromNode(
-  node: unknown,
-  prefix: string,
-  out: Set<string>,
-): void {
+function collectTomlLeafKeysFromNode(node: unknown, prefix: string, out: Set<string>): void {
   if (!isObject(node)) return;
   for (const [rawKey, value] of Object.entries(node)) {
     const key = rawKey.trim();
@@ -43,7 +39,10 @@ export function collectTomlLeafKeys(raw: string): Set<string> {
   return keys;
 }
 
-export function missingTemplateKeys(templateKeys: Iterable<string>, localKeys: Set<string>): string[] {
+export function missingTemplateKeys(
+  templateKeys: Iterable<string>,
+  localKeys: Set<string>,
+): string[] {
   const templateSet = new Set(templateKeys);
   const missing: string[] = [];
   for (const key of templateSet) {

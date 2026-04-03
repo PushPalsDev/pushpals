@@ -10,6 +10,7 @@ Output only the raw commit message text — no markdown fences, no explanation, 
 - <specific implementation detail>
 
 Tests:
+
 - <test runner command>
 
 ## Writing rules
@@ -25,12 +26,14 @@ Background context: "can you add one more unit test for localbuddy"
 
 Bad (copies instruction / uses planning language):
 {{type}}({{area}}): lets add one more unit test for localbuddy
+
 - At least one new unit test is added validating a meaningful LocalBuddy behavior.
 - All existing and new tests pass.
 - No unrelated files are modified.
 
 Good (reads the diff):
 {{type}}({{area}}): add unit test for LocalBuddy request routing and error response handling
+
 - add test case in localbuddy.test.ts asserting router returns 404 for unknown tool calls
 - add negative test for malformed request payload returning 400 with error message
 - extract shared test fixtures into testHelpers.ts to reduce duplication

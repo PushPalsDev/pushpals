@@ -41,4 +41,3 @@ bun install -g @pushpalsdev/cli
 
 - Confirm `release_log.md` content before tagging.
 - Tag and push: `git tag v1.0.32 && git push origin v1.0.32`.
-

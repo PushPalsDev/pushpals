@@ -4,7 +4,7 @@
 > Make it easy for engineering teams to ship high‑quality software faster by delegating routine development work to **safe, auditable autonomous agents**.
 
 > **North Star:**  
-> *A repo can continuously improve itself (within guardrails) with minimal human coordination.*
+> _A repo can continuously improve itself (within guardrails) with minimal human coordination._
 
 ---
 
@@ -13,6 +13,7 @@
 PushPals is an **engineering workforce** with clear roles, scopes, and escalation rules.
 
 ### Roles
+
 - **CTO (you):** Sets direction, approves high‑risk changes, defines constraints, and chooses what “success” means.
 - **RemoteAgent (the foreman / chief of staff):** Turns direction into an executable plan, decomposes work, delegates to workers, integrates results, and ships **real code changes**.
 - **WorkerPals (specialists):** Execute scoped tasks (bugfix, refactor, conflict resolution, migrations, performance, CI reliability).
@@ -20,35 +21,40 @@ PushPals is an **engineering workforce** with clear roles, scopes, and escalatio
 - **ReviewAgent:** Performs automated review and gates progress (style, safety, policy, correctness signals).
 
 ### What “autonomous” means here
+
 RemoteAgent is expected to:
+
 - **Ship working changes** (code/config) that move the repo toward the vision.
-- Use docs/tests as *tools* (when they unblock shipping), **not as the default output**.
+- Use docs/tests as _tools_ (when they unblock shipping), **not as the default output**.
 - Prefer a merged PR over an essay; prefer a small merged PR over a large stalled PR.
 
 ### How RemoteAgent should use this document (required behavior)
+
 RemoteAgent should treat this file as **policy + compass**, and follow this loop:
 
 1. **Select next work** from (in order):
-   1) CTO directives (explicit tasks)  
-   2) Failing builds / regressions / production incidents  
-   3) High-signal backlog labeled `agent:ready` / `good first issue` / `bug` (or configured equivalent)  
-   4) PR review follow-ups / merge conflicts / CI flakiness  
-   5) Onboarding friction (time-to-first-success)  
+   1. CTO directives (explicit tasks)
+   2. Failing builds / regressions / production incidents
+   3. High-signal backlog labeled `agent:ready` / `good first issue` / `bug` (or configured equivalent)
+   4. PR review follow-ups / merge conflicts / CI flakiness
+   5. Onboarding friction (time-to-first-success)
 2. **Classify risk** (Low / Medium / High) and apply the correct gates (see §5).
 3. **Decompose** into small tasks with acceptance criteria, then delegate.
 4. **Execute + integrate**: run checks, fix failures, open PR(s), iterate.
 5. **Report**: what shipped, what improved, what failed, what’s next (with evidence/metrics).
 
 ### Standard “work order” format (what the CTO sends RemoteAgent)
+
 When you assign work, use this format (RemoteAgent should request missing items only when necessary):
 
-- **Goal:** (user outcome, not implementation)  
-- **Constraints:** (files/areas to avoid, time budget, dependencies, style rules)  
-- **Risk tier:** Low / Medium / High (or let RemoteAgent propose)  
-- **Definition of done:** (tests passing, behavior change verified, rollout notes)  
+- **Goal:** (user outcome, not implementation)
+- **Constraints:** (files/areas to avoid, time budget, dependencies, style rules)
+- **Risk tier:** Low / Medium / High (or let RemoteAgent propose)
+- **Definition of done:** (tests passing, behavior change verified, rollout notes)
 - **Notes / context:** (links to issues, prior PRs, logs)
 
 ### Standard “completion report” format (what RemoteAgent returns)
+
 - **Shipped:** PR links + one-line summary each
 - **Evidence:** tests, benchmarks, screenshots/log excerpts (as applicable)
 - **Risk notes:** what could go wrong + rollback plan (if needed)
@@ -59,23 +65,27 @@ When you assign work, use this format (RemoteAgent should request missing items 
 ## 1) Who this is for
 
 ### Primary users
+
 - **Engineering leads, maintainers, and on-call owners**
   - Jobs-to-be-done: Keep delivery moving, keep quality high, reduce coordination overhead.
   - Pain today: Too much manual triage, repetitive fixes, PR churn, and “stuck” work.
   - Success looks like: Predictable throughput, fewer regressions, clear operational visibility.
 
 ### Secondary users
+
 - **Contributors and reviewers**
   - Jobs-to-be-done: Implement scoped changes quickly and review with confidence.
   - Pain today: Slow setup, unclear guardrails, inconsistent change quality.
   - Success looks like: Fast startup, consistent PR quality, clearer reasoning + diffs.
 
 ### “Mass audience” targets (explicit growth wedge)
+
 - **Small/medium engineering teams and OSS maintainers** who want:
   - Fast wins: dependency bumps, CI fixes, flaky test repair, safe refactors, conflict resolution
   - Strong governance: scoped access, audit trails, predictable behavior
 
-### Non-users (explicitly *not* optimizing for)
+### Non-users (explicitly _not_ optimizing for)
+
 - Teams looking for a **generic no-code automation platform** or “do anything agent.”
   - Why: PushPals is optimized for **repo workflows**, **Git-based collaboration**, and **engineering governance**.
 
@@ -84,15 +94,18 @@ When you assign work, use this format (RemoteAgent should request missing items 
 ## 2) The problem we solve
 
 ### Today’s reality
+
 - Shipping code requires too much manual orchestration across planning → execution → review → merge.
 - Failure modes repeat: flaky startup paths, merge conflicts, retries, drift between environments, “works on my machine.”
 - Operational cost is high: context switching, debugging churn, and on-call toil.
 
 ### The change we want
-- **In 6–12 months:** routine repo work is mostly autonomous *with safety boundaries* and high merge confidence.
+
+- **In 6–12 months:** routine repo work is mostly autonomous _with safety boundaries_ and high merge confidence.
 - **In 2–3 years:** autonomous execution is the trusted default for a large share of low/medium-risk engineering work.
 
 ### Before / after story (what “better” feels like)
+
 - Before: A maintainer spends a morning chasing CI flakes, updating dependencies, and resolving conflicts.
 - After: RemoteAgent proposes a plan, delegates, ships PRs, and the maintainer only approves the small set of high-risk decisions.
 
@@ -131,17 +144,20 @@ These are tie-breakers. **Order matters.**
 ## 4) What “good” looks like (measures)
 
 ### User-facing outcomes (value + trust)
+
 - **Time-to-first-value:** median time from install → first successful autonomous PR opened.
 - **Time-to-success:** median time from `bun run start -c` → stable “all systems online.”
 - **Autonomous merge rate:** % of autonomous PRs merged with no human edits.
 - **Rework rate:** % of autonomous PRs requiring >1 fix-loop due to correctness/review issues.
 
 ### Reliability & ops outcomes
+
 - **Job success rate:** % jobs completing without manual intervention, by job type.
 - **Queue health:** median wait time, stuck-job rate, retry storm rate.
 - **Incident load:** pages/alerts per week attributable to PushPals.
 
 ### Growth / mass audience outcomes (non-vanity)
+
 - **Activation:** % repos reaching “first PR opened” within 30 minutes.
 - **Retention:** % repos still using PushPals weekly after 4 weeks.
 - **Support burden:** support requests per active repo (should go down over time).
@@ -153,32 +169,40 @@ These are tie-breakers. **Order matters.**
 ## 5) Scope, boundaries, and autonomy gates
 
 ### In scope (what PushPals is)
+
 - Autonomous orchestration: planning, delegation, execution, and Git integration.
 - Guardrailed task execution in scoped worktrees/containers.
 - Unified visibility across clients (CLI first; web/VS Code/mobile as control surfaces).
 
 ### Out of scope / non-goals
+
 - Unbounded autonomous architecture redesign without human direction.
 - Automating every class of software work without constraints.
 - Non-Git / non-repo-centered workflows as the primary target.
 
 ### Risk tiers (required)
+
 RemoteAgent must classify work and apply gates:
 
 #### Low risk (RemoteAgent can ship autonomously)
+
 - CI fixes, flaky tests, small bug fixes with clear repro, dependency updates within policy, refactors that preserve behavior, docs that unblock onboarding.
 - **Gate:** tests pass + policy checks pass + rollback is obvious.
 
 #### Medium risk (RemoteAgent can proceed, but requires explicit “merge approval”)
+
 - Public API changes with backwards-compat, migrations with tooling, performance-critical changes, security-adjacent changes.
 - **Gate:** tests + targeted validation + clear migration notes + reviewer/CTO approval.
 
 #### High risk (RemoteAgent must propose, not implement, until approved)
+
 - Auth/permissions model changes, data model migrations without rollback, large rewrites, changing default safety boundaries, adding broad new execution capabilities.
 - **Gate:** RFC + explicit approval before code lands.
 
 ### Definition of “done” (default)
+
 A task is not done unless:
+
 - It results in a **PR** (or merged commit) OR a concrete executable artifact (script/tooling) that unblocks a PR.
 - It includes **verification** appropriate to risk (tests, reproducible steps, benchmarks, or staged rollout notes).
 
@@ -211,18 +235,21 @@ A task is not done unless:
 ## 7) Near-term objectives (1–2 quarters)
 
 ### Objective A: Reliable autonomous delivery loop
+
 - Problem: jobs fail due to drift, policy mismatches, lifecycle races.
 - Approach: harden preflight, standardize executor policy handling, improve recovery.
 - Deliverables: failure taxonomy + retries that converge, cleanup/recovery playbooks, deterministic worktree lifecycle.
 - Exit criteria: measurable drop in infra/runtime-caused job failures.
 
 ### Objective B: High-confidence review and merge automation
+
 - Problem: approved work still stalls on mergeability and review loops.
 - Approach: dedupe/locking, conflict workflows, review-agent coordination.
 - Deliverables: deterministic dedupe keys, conflict-specific execution path, merge telemetry.
 - Exit criteria: higher approved→merged conversion; fewer manual conflict interventions.
 
 ### Objective C: Mass audience activation + distribution wedge
+
 - Problem: users don’t adopt what they can’t reliably start.
 - Approach: make onboarding friction a first-class reliability surface.
 - Deliverables:
@@ -232,6 +259,7 @@ A task is not done unless:
 - Exit criteria: activation and retention metrics improve; support burden per repo drops.
 
 ### Objective D: Workforce-grade delegation
+
 - Problem: RemoteAgent can’t scale without consistent decomposition and specialization.
 - Approach: worker role taxonomy + dispatch policies + integration discipline.
 - Deliverables: worker capability registry, standard task schema, integration strategy (many small PRs vs one).
@@ -242,6 +270,7 @@ A task is not done unless:
 ## 8) Long-term direction (1–3 years)
 
 ### Strategic bets
+
 - **Bet 1: Autonomous-first maintenance for bounded work**
   - Build: objective generation, policy engines, remediation loops, repo “health” automation.
   - Don’t build: unbounded autonomy without explicit human constraints.
@@ -255,6 +284,7 @@ A task is not done unless:
   - Don’t build: “black box” behavior that cannot be explained or reversed.
 
 ### If we’re right…
+
 - Teams delegate a meaningful % of low/medium-risk work to PushPals confidently.
 - Maintainers spend less time on toil, retries, conflict babysitting, and CI drift.
 - PushPals becomes a reference implementation for safe autonomous repo operations.
@@ -264,6 +294,7 @@ A task is not done unless:
 ## 9) Guardrails and constraints
 
 ### Guardrails (how we avoid harm)
+
 - Prefer reversible changes or feature flags.
 - Default secure: least privilege, explicit scopes, no silent escalation.
 - No “cosmetic-only” PRs unless they unblock shipping or reduce measurable toil.
@@ -271,6 +302,7 @@ A task is not done unless:
 - Pay down operational toil before expanding surface area.
 
 ### Constraints (reality checks)
+
 - Small team: automation must reduce operator load, not create a new on-call burden.
 - Hard requirements: repo safety boundaries, predictable runtime behavior, audit trails.
 - External dependencies: Bun runtime, Docker/sandboxing, Git provider auth, model backend availability.
@@ -296,12 +328,14 @@ A task is not done unless:
 ## Appendix
 
 ### A) Glossary
+
 - **RemoteAgent:** Orchestrating agent that plans, delegates, integrates, and ships.
 - **WorkerPals:** Execution agents that implement scoped tasks.
 - **SourceControlManager:** Applies changes safely and manages PR lifecycle.
 - **ReviewAgent:** Automated reviewer/gate that scores and enforces policies.
 
 ### B) Worker capability taxonomy (starter set)
+
 - **CI Medic:** fix flaky tests, stabilize pipelines
 - **Conflict Resolver:** resolve merge conflicts safely
 - **Dependency Steward:** upgrades within policy, manages changelogs
@@ -311,6 +345,7 @@ A task is not done unless:
 - **Security Sentinel:** static checks, permission boundary audits (proposal-first for high risk)
 
 ### C) Escalation triggers (RemoteAgent must stop + ask)
+
 - Requirements are ambiguous in a way that affects user-facing behavior
 - Change touches high-risk areas (auth, permissions, data model) without explicit approval
 - Tests are failing due to unrelated repo state and cannot be isolated safely

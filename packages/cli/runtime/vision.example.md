@@ -9,18 +9,21 @@
 ## 1) Who this is for
 
 ### Primary users
+
 - **User type A:** (e.g., app developers, SREs, analysts, end-users)
   - Jobs-to-be-done: …
   - Pain today: …
   - Success looks like: …
 
 ### Secondary users
+
 - **User type B:** …
   - Jobs-to-be-done: …
   - Pain today: …
   - Success looks like: …
 
-### Non-users (explicitly *not* optimizing for)
+### Non-users (explicitly _not_ optimizing for)
+
 - **Not for:** …
   - Why: …
 
@@ -31,13 +34,15 @@
 ## 2) The problem we solve
 
 ### Today’s reality
+
 - What is hard / slow / risky today?
 - What failures happen repeatedly? (bugs, incidents, misconfig, confusion)
 - What is expensive? (time, money, cognitive load, coordination)
 
 ### The change we want
-- In 6–12 months, what should feel *meaningfully easier*?
-- In 2–3 years, what should be *obviously different*?
+
+- In 6–12 months, what should feel _meaningfully easier_?
+- In 2–3 years, what should be _obviously different_?
 
 > **Optional:** Add a 3–5 line “story” of a user before vs after.
 
@@ -66,11 +71,13 @@ These are **tie-breakers** when tradeoffs happen. Put them in priority order.
 Pick a small set of metrics you can actually track.
 
 ### User-facing outcomes
+
 - **Time-to-success:** e.g., median time from install → first successful use
 - **Quality:** e.g., bug rate / support tickets per active user
 - **Trust:** e.g., SLO compliance, error rate, crash-free sessions
 
 ### Developer / maintainer outcomes
+
 - **Change velocity:** PR cycle time, lead time to release
 - **Operational burden:** pages/alerts per week, toil hours
 - **Maintainability:** test coverage for critical paths, build time, flake rate
@@ -81,17 +88,20 @@ Pick a small set of metrics you can actually track.
 
 ## 5) Scope and boundaries
 
-### In scope (what we *are*)
+### In scope (what we _are_)
+
 - Core capability A: …
 - Core capability B: …
 - Core capability C: …
 
-### Out of scope / non-goals (what we are *not*)
+### Out of scope / non-goals (what we are _not_)
+
 - Not a replacement for: …
 - Not trying to support: …
 - Not optimizing for: …
 
 ### Compatibility & support policy (optional)
+
 - Supported platforms / versions: …
 - Breaking changes policy: …
 - Deprecation timeline: …
@@ -120,6 +130,7 @@ Pick 3–5 items max. Each should be **outcome-oriented**.
 These are “bets” with explicit results.
 
 ### Objective A: <name>
+
 - **Problem:** …
 - **Approach:** …
 - **Deliverables:** …
@@ -127,6 +138,7 @@ These are “bets” with explicit results.
 - **Exit criteria:** How we’ll know it worked (measurable)
 
 ### Objective B: <name>
+
 - …
 
 ---
@@ -136,6 +148,7 @@ These are “bets” with explicit results.
 Describe where this repo is going, without over-promising.
 
 ### Strategic bets
+
 - **Bet 1:** …
   - Why it matters: …
   - What we’ll likely build: …
@@ -143,6 +156,7 @@ Describe where this repo is going, without over-promising.
 - **Bet 2:** …
 
 ### “If we’re right, then…”
+
 - Users will be able to: …
 - Maintainers will spend less time on: …
 - The ecosystem will have: …
@@ -152,6 +166,7 @@ Describe where this repo is going, without over-promising.
 ## 9) Guardrails and constraints
 
 ### Guardrails (how we avoid harm / churn)
+
 - Prefer changes that are **reversible** or behind flags.
 - Default to **secure / safe** settings.
 - Optimize for the **common path**; support escape hatches for experts.
@@ -159,6 +174,7 @@ Describe where this repo is going, without over-promising.
 - Pay down operational toil before adding big surface area.
 
 ### Constraints (reality checks)
+
 - Staffing level / maintainer bandwidth: …
 - Hard requirements (privacy, compliance, perf, cost): …
 - External dependencies: …
@@ -181,11 +197,14 @@ Describe where this repo is going, without over-promising.
 ## Appendix (optional but powerful)
 
 ### A) Glossary
+
 - Term: definition…
 
 ### B) Personas (one-page each)
+
 - Persona, environment, constraints, success criteria…
 
 ### C) Example “no” responses (template)
+
 - “Thanks — this is valuable, but it conflicts with our non-goal X…”
 - “We’d reconsider if metric Y becomes a problem…”

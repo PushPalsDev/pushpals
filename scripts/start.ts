@@ -751,12 +751,8 @@ function resolveLocalConfigPaths(): {
 
 function ensureRequiredLocalConfigFiles(): LocalConfigPaths {
   const localConfigPaths = resolveLocalConfigPaths();
-  const {
-    localTomlPath,
-    localTomlRel,
-    localExampleTomlPath,
-    localExampleTomlRel,
-  } = localConfigPaths;
+  const { localTomlPath, localTomlRel, localExampleTomlPath, localExampleTomlRel } =
+    localConfigPaths;
 
   const required: Array<{ path: string; hint: string; windowsCopy: string; linuxCopy: string }> = [
     {
@@ -873,15 +869,11 @@ function ensureLocalConfigTemplateKeyParity(localConfigPaths: LocalConfigPaths):
       shouldPrintCopyCommands = true;
     }
     if (shouldPrintCopyCommands) {
-      console.error(
-        `[start]   Quick template reset (overwrites ${problem.label}):`,
-      );
+      console.error(`[start]   Quick template reset (overwrites ${problem.label}):`);
       printTemplateCopyCommands(problem.templateLabel, problem.label);
     }
   }
-  console.error(
-    "[start] Keep local files in strict key parity with templates before startup.",
-  );
+  console.error("[start] Keep local files in strict key parity with templates before startup.");
   abortStart(1);
 }
 
@@ -2673,10 +2665,7 @@ async function ensureLocalBuddyManagedStartReady(bunExecPath: string): Promise<v
   console.log("[start] LocalBuddy readiness preflight passed.");
 }
 
-async function terminateManagedChildTree(
-  child: SpawnedChild,
-  label: string,
-): Promise<void> {
+async function terminateManagedChildTree(child: SpawnedChild, label: string): Promise<void> {
   const pid = child.pid;
   if (!pid) {
     try {
@@ -2762,10 +2751,7 @@ async function startLocalBuddyManagedProcess(reason: string, bunExecPath: string
       localBuddyStdoutPump = null;
       localBuddyStderrPump = null;
     }
-    await Promise.allSettled([
-      stdoutPump ?? Promise.resolve(),
-      stderrPump ?? Promise.resolve(),
-    ]);
+    await Promise.allSettled([stdoutPump ?? Promise.resolve(), stderrPump ?? Promise.resolve()]);
     const expectedExit = shuttingDown || localBuddyStopRequested || !localBuddyRuntimeEnabled;
     if (expectedExit) {
       console.log(`[start] LocalBuddy exited with code ${code}.`);

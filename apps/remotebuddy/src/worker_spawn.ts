@@ -19,9 +19,7 @@ export type WorkerStartupTimeoutOptions = {
   dockerAgentStartupTimeoutMs: number;
 };
 
-export function resolveWorkerStartupTimeoutMs(
-  options: WorkerStartupTimeoutOptions,
-): number {
+export function resolveWorkerStartupTimeoutMs(options: WorkerStartupTimeoutOptions): number {
   const configuredMs = Math.max(1_000, Math.floor(options.configuredMs || 0));
   if (!options.docker) {
     return configuredMs;
@@ -39,7 +37,15 @@ export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): str
   const entrypoint =
     String(options.entrypoint ?? "").trim() || "apps/workerpals/src/workerpals_main.ts";
   const args = binaryPath
-    ? [binaryPath, "--server", options.server, "--workerId", options.workerId, "--repo", options.repoRoot]
+    ? [
+        binaryPath,
+        "--server",
+        options.server,
+        "--workerId",
+        options.workerId,
+        "--repo",
+        options.repoRoot,
+      ]
     : [
         "bun",
         "run",

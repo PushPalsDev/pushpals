@@ -122,7 +122,9 @@ describe("workerpals task.execute strict schema", () => {
     );
 
     expect(result.ok).toBe(false);
-    expect(result.summary).not.toContain("autonomy task.execute requires planning.scope.writeGlobs");
+    expect(result.summary).not.toContain(
+      "autonomy task.execute requires planning.scope.writeGlobs",
+    );
     expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
 

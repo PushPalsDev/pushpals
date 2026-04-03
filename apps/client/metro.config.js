@@ -27,7 +27,10 @@ config.resolver.disableHierarchicalLookup = true;
 // Bun workspace installs can create repo-root workspace links under node_modules
 // that trigger EACCES on lstat() for Metro's fallback watcher on Windows.
 // Keep Metro scoped to app-level node_modules and ignore those root links.
-const escapedWorkspaceNodeModulesRoot = workspaceNodeModulesRoot.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+const escapedWorkspaceNodeModulesRoot = workspaceNodeModulesRoot.replace(
+  /[\\^$.*+?()[\]{}|]/g,
+  "\\$&",
+);
 config.resolver.blockList = [
   new RegExp(
     `^${escapedWorkspaceNodeModulesRoot}[\\\\/](?:client|localbuddy|remotebuddy|server|source_control_manager|workerpals|protocol|shared|pushpals-vscode-client)(?:[\\\\/].*)?$`,

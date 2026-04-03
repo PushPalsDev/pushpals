@@ -139,7 +139,9 @@ function subscribeSSE(
 
   function connect() {
     if (disposed) return;
-    es = new EventSource(buildSessionEventsUrl(baseUrl, sessionId, latestCursor, authToken, client));
+    es = new EventSource(
+      buildSessionEventsUrl(baseUrl, sessionId, latestCursor, authToken, client),
+    );
 
     es.addEventListener("message", (event) => {
       try {
@@ -208,7 +210,9 @@ function subscribeWebSocket(
 
   function connect() {
     if (disposed) return;
-    ws = new WebSocket(buildSessionWebSocketUrl(baseUrl, sessionId, latestCursor, authToken, client));
+    ws = new WebSocket(
+      buildSessionWebSocketUrl(baseUrl, sessionId, latestCursor, authToken, client),
+    );
 
     ws.onmessage = (event) => {
       try {

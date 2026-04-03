@@ -14,24 +14,16 @@ describe("client identity resolution", () => {
       store.set(key, value);
     };
 
-    const first = await resolveClientRegistration(
-      { kind: "web", label: "Web Client" },
-      "dev",
-      {
-        read,
-        write,
-        createId: (kind) => `${kind}-generated`,
-      },
-    );
-    const second = await resolveClientRegistration(
-      { kind: "web", label: "Web Client" },
-      "dev",
-      {
-        read,
-        write,
-        createId: (kind) => `${kind}-different`,
-      },
-    );
+    const first = await resolveClientRegistration({ kind: "web", label: "Web Client" }, "dev", {
+      read,
+      write,
+      createId: (kind) => `${kind}-generated`,
+    });
+    const second = await resolveClientRegistration({ kind: "web", label: "Web Client" }, "dev", {
+      read,
+      write,
+      createId: (kind) => `${kind}-different`,
+    });
 
     expect(buildClientIdentityStorageKey("web", "dev")).toBe("pushpals:client-id:web:dev");
     expect(first.clientId).toBe("web-generated");

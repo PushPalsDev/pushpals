@@ -81,12 +81,7 @@ function resolveRuntimeTarget(): { target: string; platformKey: string; extensio
 }
 
 function runtimeBinaryFilename(
-  service:
-    | "server"
-    | "localbuddy"
-    | "remotebuddy"
-    | "workerpals"
-    | "source_control_manager",
+  service: "server" | "localbuddy" | "remotebuddy" | "workerpals" | "source_control_manager",
   platformKey: string,
   extension: string,
 ): string {
@@ -98,8 +93,16 @@ async function ensureBuildArtifacts(): Promise<BuildArtifacts> {
   if (buildArtifactsPromise) return await buildArtifactsPromise;
   buildArtifactsPromise = (async () => {
     runChecked(["docker", "version", "--format", "{{.Server.Version}}"], repoRoot);
-    runChecked([process.execPath, "run", "cli:bundle"], repoRoot, process.env as Record<string, string>);
-    runChecked([process.execPath, "run", "protocol:build"], repoRoot, process.env as Record<string, string>);
+    runChecked(
+      [process.execPath, "run", "cli:bundle"],
+      repoRoot,
+      process.env as Record<string, string>,
+    );
+    runChecked(
+      [process.execPath, "run", "protocol:build"],
+      repoRoot,
+      process.env as Record<string, string>,
+    );
 
     const target = resolveRuntimeTarget();
     const cacheDir = join(buildCacheRoot, target.platformKey);
@@ -107,12 +110,7 @@ async function ensureBuildArtifacts(): Promise<BuildArtifacts> {
 
     const serviceBuilds: Array<{
       source: string;
-      service:
-        | "server"
-        | "localbuddy"
-        | "remotebuddy"
-        | "workerpals"
-        | "source_control_manager";
+      service: "server" | "localbuddy" | "remotebuddy" | "workerpals" | "source_control_manager";
     }> = [
       { source: "apps/server/src/server_main.ts", service: "server" },
       { source: "apps/localbuddy/src/localbuddy_main.ts", service: "localbuddy" },
@@ -316,7 +314,10 @@ async function createFailingDockerExecutable(root: string): Promise<string> {
   return outputPath;
 }
 
-async function waitForExitWithTimeout(proc: ReturnType<typeof Bun.spawn>, timeoutMs: number): Promise<number> {
+async function waitForExitWithTimeout(
+  proc: ReturnType<typeof Bun.spawn>,
+  timeoutMs: number,
+): Promise<number> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
     return await Promise.race([
@@ -397,8 +398,12 @@ describe("packaged CLI end-to-end", () => {
         expect(combined).toContain("[pushpals] startup timing summary: outcome=ready");
         expect(combined).toContain("[pushpals] Embedded runtime is ready.");
         expect(combined).toContain("[pushpals] Connected.");
-        expect(combined).toContain("[pushpals] Type a message and press Enter. Use /exit or exit to quit.");
-        expect((combined.match(/\[pushpals\] workerExecution=/g) ?? []).length).toBeGreaterThanOrEqual(2);
+        expect(combined).toContain(
+          "[pushpals] Type a message and press Enter. Use /exit or exit to quit.",
+        );
+        expect(
+          (combined.match(/\[pushpals\] workerExecution=/g) ?? []).length,
+        ).toBeGreaterThanOrEqual(2);
         expect(combined).not.toContain("[pushpals] workerExecution=blocked");
         expect(combined).not.toContain("[pushpals] Precheck failed:");
         expect(combined).not.toContain("[pushpals] Auto-start failed:");

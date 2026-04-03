@@ -4,10 +4,10 @@ RemoteBuddy is the always-on planner/orchestrator. It claims requests from the S
 
 ## Boundary & Responsibilities
 
-| Component | Responsibilities | APIs touched |
-| --- | --- | --- |
-| **LocalBuddy** (`apps/localbuddy`) | User ingress on `POST /message`, handles status/lookups/lightweight chat, enqueues heavier prompts. | `POST /requests/enqueue` |
-| **RemoteBuddy** (`apps/remotebuddy`) | Claims queued requests, plans tasks, emits `assistant_message`, `task_*`, `job_enqueued`, optionally spawns WorkerPals, completes requests or escalates failures. | `POST /requests/claim`, `POST /jobs/enqueue`, `POST /requests/:id/(complete|fail)` |
+| Component                            | Responsibilities                                                                                                                                                  | APIs touched                                                                |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------ |
+| **LocalBuddy** (`apps/localbuddy`)   | User ingress on `POST /message`, handles status/lookups/lightweight chat, enqueues heavier prompts.                                                               | `POST /requests/enqueue`                                                    |
+| **RemoteBuddy** (`apps/remotebuddy`) | Claims queued requests, plans tasks, emits `assistant_message`, `task_*`, `job_enqueued`, optionally spawns WorkerPals, completes requests or escalates failures. | `POST /requests/claim`, `POST /jobs/enqueue`, `POST /requests/:id/(complete | fail)` |
 
 ### Dependency Snapshot
 
@@ -152,10 +152,10 @@ Troubleshooting – If Bun crashes, loops on cache errors, or still reports miss
 - **Telemetry watchlist** – Keep `/system/status` tailing so you can see `slo.requests.queueWaitMs.p95` (aka `queue_p95`) alongside `queues.requests.pending`, and pin Grafana’s WorkerPals Job Outcomes panel for `job_failure_rate` (task.execute failures / total jobs in the last 10 minutes). Pair those with `sig_queue_health` logs so autonomous spikes are surfaced even when dashboards lag.
 - **Alert thresholds** – Treat the table below as additive to the [queue-health doc](apps/remotebuddy/docs/queue-health.md); hit the warning column as soon as either signal drifts for ≥3 polls so you can stop background traffic before pages fire.
 
-| Signal | Warning (self-triage) | Page-worthy | Immediate action |
-| --- | --- | --- | --- |
-| `queue_p95` | ≥ 1.0 s for 3 polls **or** pending interactive ≥ 15 | ≥ 1.5 s for 5 min **or** queue depth > 60 / < 2 idle workers for 5 polls | Freeze background/eval submissions, confirm automation injected remediation jobs, and add WorkerPal capacity until idle ≥ 2 per lane. |
-| `job_failure_rate` | ≥ 0.25 rolling 10 min | ≥ 0.40 rolling 10 min | Pull the most recent WorkerPals logs, look for retry storms/regressions, and prep the worker restart flow if failure spikes persist. |
+| Signal             | Warning (self-triage)                               | Page-worthy                                                              | Immediate action                                                                                                                      |
+| ------------------ | --------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `queue_p95`        | ≥ 1.0 s for 3 polls **or** pending interactive ≥ 15 | ≥ 1.5 s for 5 min **or** queue depth > 60 / < 2 idle workers for 5 polls | Freeze background/eval submissions, confirm automation injected remediation jobs, and add WorkerPal capacity until idle ≥ 2 per lane. |
+| `job_failure_rate` | ≥ 0.25 rolling 10 min                               | ≥ 0.40 rolling 10 min                                                    | Pull the most recent WorkerPals logs, look for retry storms/regressions, and prep the worker restart flow if failure spikes persist.  |
 
 - **Fast load-spike detection tips** – Run `watch -n 5 curl -sS $SERVER/system/status | jq '{p95: .slo.requests.queueWaitMs.p95, pending: .queues.requests.pending, jobs: .queues.jobPendingSnapshot}'` during incidents so you catch >0.5 s jumps before alerts aggregate, and keep `tail -f logs/remotebuddy.log | rg sig_queue_health` open to spot remediation bursts. When `queue_p95` jumps ≥0.3 s between polls, immediately check `/requests?status=pending&limit=20` for aging interactive prompts and manually re-prioritize them.
 - **Escalation steps** – 1) Announce the metric breach with snapshots in `#pushpals-ops`; 2) loop WorkerPals/Platform on-call if warning bands last >10 minutes or `job_failure_rate` crosses 0.4; 3) page Infrastructure/SRE if worker restarts do not clear the spike or shared services look unhealthy. Keep time-stamped updates every 15 minutes until `queue_p95` < 1.0 s and `job_failure_rate` < 0.2 for two consecutive polls.
@@ -175,12 +175,12 @@ Troubleshooting – If Bun crashes, loops on cache errors, or still reports miss
 
 ### Guardrails for queue_p95 ≈ 0
 
-| Condition (rolling 5 min) | Target behavior | Required action |
-| --- | --- | --- |
-| `queue_p95` ≤ 1.0 s and pending interactive < 10 | Healthy “≈0” wait time | No action; keep `/system/status` tailing hourly. |
-| `queue_p95` 1.0–1.5 s or pending interactive ≥ 15 | Early warning | Trigger queue-playbook diagnostics, verify automation already injected remediation requests, and pause new background/eval submissions. |
-| `queue_p95` ≥ 1.5 s for > 5 min **or** pending interactive ≥ 30 | Degradation | Announce in `#pushpals-ops`, throttle enqueueing to interactive-only, add WorkerPal capacity, and watch `jobPendingSnapshot` for stalled jobs. |
-| `queue_p95` ≥ 2.0 s **or** queue depth > 60 **or** < 2 idle workers for 5 polls | Incident | Page platform on-call, hand over `/system/status` snapshot + worker logs, and keep posting updates every 15 min until p95 drops below 1.0 s. |
+| Condition (rolling 5 min)                                                       | Target behavior        | Required action                                                                                                                                |
+| ------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `queue_p95` ≤ 1.0 s and pending interactive < 10                                | Healthy “≈0” wait time | No action; keep `/system/status` tailing hourly.                                                                                               |
+| `queue_p95` 1.0–1.5 s or pending interactive ≥ 15                               | Early warning          | Trigger queue-playbook diagnostics, verify automation already injected remediation requests, and pause new background/eval submissions.        |
+| `queue_p95` ≥ 1.5 s for > 5 min **or** pending interactive ≥ 30                 | Degradation            | Announce in `#pushpals-ops`, throttle enqueueing to interactive-only, add WorkerPal capacity, and watch `jobPendingSnapshot` for stalled jobs. |
+| `queue_p95` ≥ 2.0 s **or** queue depth > 60 **or** < 2 idle workers for 5 polls | Incident               | Page platform on-call, hand over `/system/status` snapshot + worker logs, and keep posting updates every 15 min until p95 drops below 1.0 s.   |
 
 ### Operator checkpoints (per rotation)
 
@@ -211,20 +211,20 @@ Use this path any time you need to redeploy RemoteBuddy because of a regression,
 
 ### Repo Root Scripts (validated against `package.json`)
 
-| Use case | Run from repo root | Script body | Working directory during execution |
-| --- | --- | --- | --- |
-| Build protocol + start RemoteBuddy (recommended path) | `bun run remotebuddy` | `protocol:build` → `remotebuddy:only` | Root during build, then `apps/remotebuddy` via `--cwd` |
-| Start RemoteBuddy with `.env` wiring only | `bun run remotebuddy:only` | `bun --cwd apps/remotebuddy --env-file ../../.env start` | `apps/remotebuddy` |
-| Hot reload/watch mode | `bun run remotebuddy:only:watch` | `bun --cwd apps/remotebuddy --env-file ../../.env dev` | `apps/remotebuddy` |
+| Use case                                              | Run from repo root               | Script body                                              | Working directory during execution                     |
+| ----------------------------------------------------- | -------------------------------- | -------------------------------------------------------- | ------------------------------------------------------ |
+| Build protocol + start RemoteBuddy (recommended path) | `bun run remotebuddy`            | `protocol:build` → `remotebuddy:only`                    | Root during build, then `apps/remotebuddy` via `--cwd` |
+| Start RemoteBuddy with `.env` wiring only             | `bun run remotebuddy:only`       | `bun --cwd apps/remotebuddy --env-file ../../.env start` | `apps/remotebuddy`                                     |
+| Hot reload/watch mode                                 | `bun run remotebuddy:only:watch` | `bun --cwd apps/remotebuddy --env-file ../../.env dev`   | `apps/remotebuddy`                                     |
 
 > Tip: Keep `bun run server:only` running in another terminal so the claim/complete round-trip works.
 
 ### App-Local Scripts (`cd apps/remotebuddy` first)
 
-| Command | Working directory | Description |
-| --- | --- | --- |
+| Command         | Working directory  | Description                                                                   |
+| --------------- | ------------------ | ----------------------------------------------------------------------------- |
 | `bun run start` | `apps/remotebuddy` | Runs `src/remotebuddy_main.ts` once (root `remotebuddy:only` delegates here). |
-| `bun run dev` | `apps/remotebuddy` | `bun --watch --no-clear-screen src/remotebuddy_main.ts` for rapid iteration. |
+| `bun run dev`   | `apps/remotebuddy` | `bun --watch --no-clear-screen src/remotebuddy_main.ts` for rapid iteration.  |
 
 ### Direct CLI Invocation
 
@@ -330,6 +330,7 @@ Run this checklist after `bun run lint` passes so you confirm queue + auth paths
      # Expect HTTP 200 + payload containing the queued request
      ```
 3. **Check queue status transitions**
+
    ```bash
    curl -sS "http://localhost:3001/requests?status=claimed&limit=5" \
      -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests[0].status'
@@ -339,6 +340,7 @@ Run this checklist after `bun run lint` passes so you confirm queue + auth paths
      -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" | jq '.requests[].durationMs'
    # Expect the same requestId listed with durationMs populated once planning completes
    ```
+
 4. **Inspect overall runtime health**
    ```bash
    curl -sS "http://localhost:3001/system/status" \

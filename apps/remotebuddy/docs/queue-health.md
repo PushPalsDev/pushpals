@@ -8,10 +8,10 @@ alert triggers, restart order, and verification checks for `task.execute` in one
 
 ## Alert Thresholds
 
-| Trigger | Metric + surface | Immediate action |
-| --- | --- | --- |
-| `queue_p95` ≥ **1.5 s** for 5 minutes (interactive lane, 15 min rollup) | Grafana › RemoteBuddy Queue Overview (`queue_p95` panel), `/system/status.slo.requests.queueWaitMs` | Page RemoteBuddy Platform, confirm autopause of background/eval submissions, prep restart steps below. |
-| `job_failure_rate` ≥ **0.4** (failures / total `task.execute` jobs in last 10 minutes) | Grafana › WorkerPals Job Outcomes (`job_failure_rate` panel), PromQL `sum(rate(remote_jobs_failed_total{kind="task.execute"}[10m])) / sum(rate(remote_jobs_total{kind="task.execute"}[10m]))` | Page WorkerPals Runtime secondary, capture most recent WorkerPals logs, then run the restart flow. |
+| Trigger                                                                                | Metric + surface                                                                                                                                                                              | Immediate action                                                                                       |
+| -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `queue_p95` ≥ **1.5 s** for 5 minutes (interactive lane, 15 min rollup)                | Grafana › RemoteBuddy Queue Overview (`queue_p95` panel), `/system/status.slo.requests.queueWaitMs`                                                                                           | Page RemoteBuddy Platform, confirm autopause of background/eval submissions, prep restart steps below. |
+| `job_failure_rate` ≥ **0.4** (failures / total `task.execute` jobs in last 10 minutes) | Grafana › WorkerPals Job Outcomes (`job_failure_rate` panel), PromQL `sum(rate(remote_jobs_failed_total{kind="task.execute"}[10m])) / sum(rate(remote_jobs_total{kind="task.execute"}[10m]))` | Page WorkerPals Runtime secondary, capture most recent WorkerPals logs, then run the restart flow.     |
 
 Treat either condition as a full queue-health incident. Always acknowledge alerts in `#pushpals-ops`
 within 5 minutes and start the steps below before experimenting with additional levers.

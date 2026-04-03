@@ -269,7 +269,11 @@ const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(asyn
     reviewAgent: config.reviewAgent,
     gitProviderToken,
   });
-  if (reviewAgentInstance && reviewAgentPollTimer && reviewAgentRuntimeFingerprint === fingerprint) {
+  if (
+    reviewAgentInstance &&
+    reviewAgentPollTimer &&
+    reviewAgentRuntimeFingerprint === fingerprint
+  ) {
     return;
   }
 
@@ -624,9 +628,7 @@ async function tick(): Promise<void> {
         // ReviewAgent mode: create individual PR from agent branch to prBaseBranch.
         // The agent branch already exists on remote (pushed by the worker).
         // Checks have passed; we skip merging into main_agents entirely.
-        console.log(
-          `[${ts()}] ReviewAgent mode - creating individual PR for ${completion.branch}`,
-        );
+        console.log(`[${ts()}] ReviewAgent mode - creating individual PR for ${completion.branch}`);
         const remoteUrlResult = await runGitCapture(
           ["-C", runtimeConfig.repoPath, "remote", "get-url", runtimeConfig.remote],
           repoRoot,
@@ -753,9 +755,7 @@ async function tick(): Promise<void> {
           throw new Error(`FF merge to main failed: ${ffResult.stderr || ffResult.stdout}`);
         }
 
-        console.log(
-          `[${ts()}] ✓ Successfully merged ${completion.branch} to ${config.mainBranch}`,
-        );
+        console.log(`[${ts()}] ✓ Successfully merged ${completion.branch} to ${config.mainBranch}`);
         if (config.pushMainAfterMerge) {
           console.log(`[${ts()}] Pushing ${config.mainBranch} to ${config.remote}...`);
           const pushResult = await gitOps.pushMain();
@@ -932,13 +932,16 @@ async function resolveCommitSubject(commitSha: string): Promise<string> {
   return (showResult.stdout.split(/\r?\n/, 1)[0] ?? "").trim();
 }
 
-async function ensureMainPullRequest(completion: {
-  id: string;
-  commitSha: string;
-  branch: string;
-  prTitle?: string | null;
-  prBody?: string | null;
-}, runtimeConfig: SourceControlManagerConfig = config) {
+async function ensureMainPullRequest(
+  completion: {
+    id: string;
+    commitSha: string;
+    branch: string;
+    prTitle?: string | null;
+    prBody?: string | null;
+  },
+  runtimeConfig: SourceControlManagerConfig = config,
+) {
   const remoteUrlResult = await runGitCapture(
     ["-C", runtimeConfig.repoPath, "remote", "get-url", runtimeConfig.remote],
     repoRoot,

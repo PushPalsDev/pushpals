@@ -12,10 +12,7 @@ describe("deriveReviewPrHeadBranch", () => {
   });
 
   test("falls back to scm branch when hidden ref does not map to agent prefix", () => {
-    const resolved = deriveReviewPrHeadBranch(
-      "refs/pushpals/internal/path",
-      "completion-xyz",
-    );
+    const resolved = deriveReviewPrHeadBranch("refs/pushpals/internal/path", "completion-xyz");
     expect(resolved.requiresMaterialize).toBe(true);
     expect(resolved.headBranch).toBe("agent/source_control_manager/completion-xyz");
   });

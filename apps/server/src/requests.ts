@@ -384,15 +384,14 @@ export class RequestQueue {
            ORDER BY createdAt DESC
            LIMIT 1`,
         )
-        .get(idempotencyKey) as
-        | {
-            id: string;
-            priority: QueuePriority;
-            status: RequestStatus;
-          }
-        | null;
+        .get(idempotencyKey) as {
+        id: string;
+        priority: QueuePriority;
+        status: RequestStatus;
+      } | null;
       if (existing?.id) {
-        const queuePosition = existing.status === "pending" ? this.queuePosition(existing.id) : null;
+        const queuePosition =
+          existing.status === "pending" ? this.queuePosition(existing.id) : null;
         const etaMs = this.estimateEtaMs(normalizePriority(existing.priority), queuePosition);
         return {
           ok: true,
@@ -672,7 +671,11 @@ export class RequestQueue {
     const normalized = Array.from(
       new Set(
         statuses
-          .map((status) => String(status ?? "").trim().toLowerCase())
+          .map((status) =>
+            String(status ?? "")
+              .trim()
+              .toLowerCase(),
+          )
           .filter(
             (status): status is RequestStatus =>
               status === "pending" ||

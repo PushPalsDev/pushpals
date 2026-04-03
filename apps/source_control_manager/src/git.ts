@@ -33,7 +33,9 @@ type GitWorktreeEntry = {
 };
 
 function normalizeFsPathForComparison(value: string): string {
-  const resolved = resolve(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
+  const resolved = resolve(String(value ?? "").trim())
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
@@ -164,7 +166,7 @@ function quoteWindowsCmdArg(value: string): string {
   const str = String(value ?? "");
   if (!str.length) return '""';
   if (!/[ \t"]/.test(str)) return str;
-  const escaped = str.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/g, "$1$1");
+  const escaped = str.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, "$1$1");
   return `"${escaped}"`;
 }
 
@@ -702,7 +704,9 @@ export class GitOps {
    * Delete all local temp branches with the given prefix.
    * Intended for daemon shutdown cleanup after interrupted runs.
    */
-  async cleanupLocalTempBranches(prefix = "_source_control_manager/"): Promise<TempBranchCleanupSummary> {
+  async cleanupLocalTempBranches(
+    prefix = "_source_control_manager/",
+  ): Promise<TempBranchCleanupSummary> {
     const normalizedPrefix = prefix.trim().replace(/^\/+/, "");
     const warnings: string[] = [];
     const deletedBranches: string[] = [];

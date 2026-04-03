@@ -23,6 +23,7 @@ Intent taxonomy (choose the single best fit):
 - `other` — do NOT use `other` with `requires_worker=false`. `other` must always have `requires_worker=true`. When in doubt, prefer `code_change`.
 
 Classification rules (applied in order):
+
 1. Action verb present (add, fix, update, implement, create, remove, test, run, build, configure, refactor, improve, etc.) → `code_change` + `requires_worker=true`
 2. File/test/config/component reference + no explicit read-only ask → `code_change` + `requires_worker=true`
 3. Read-only analysis explicitly requested → `analysis` + `requires_worker=false`

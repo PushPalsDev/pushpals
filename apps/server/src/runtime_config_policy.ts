@@ -27,7 +27,9 @@ export function normalizeRuntimeConfigKey(raw: string): string {
 }
 
 function normalizeRuntimeConfigEnvAlias(raw: string): string {
-  const key = String(raw ?? "").trim().toUpperCase();
+  const key = String(raw ?? "")
+    .trim()
+    .toUpperCase();
   if (!key) return "";
   if (key === "LOCALBUDDY_ENABLED") return "localbuddy.enabled";
   if (key === "LOCAL_AGENT_PORT") return "localbuddy.port";
@@ -59,8 +61,7 @@ export function deriveRuntimeConfigImpact(appliedKeys: string[]): RuntimeConfigI
       (prefix) => normalized === prefix || normalized.startsWith(`${prefix}.`),
     );
     const isLocalBuddyEnabled = normalized === "localbuddy.enabled";
-    const isLocalBuddyRestartOnly =
-      normalized.startsWith("localbuddy.") && !isLocalBuddyEnabled;
+    const isLocalBuddyRestartOnly = normalized.startsWith("localbuddy.") && !isLocalBuddyEnabled;
 
     if (needsBaseRestart || isLocalBuddyRestartOnly) {
       restartRequiredKeys.push(rawKey);

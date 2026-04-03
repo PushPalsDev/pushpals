@@ -101,18 +101,21 @@ function writeServerConfig(root: string, port: number): void {
 }
 
 function spawnServer(root: string, port: number, authToken: string): SpawnedServer {
-  const proc = Bun.spawn([bunExecPath, "run", resolve(repoRoot, "apps/server/src/server_main.ts")], {
-    cwd: repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
-      PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
-      PUSHPALS_PORT: String(port),
-      PUSHPALS_AUTH_TOKEN: authToken,
+  const proc = Bun.spawn(
+    [bunExecPath, "run", resolve(repoRoot, "apps/server/src/server_main.ts")],
+    {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
+        PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
+        PUSHPALS_PORT: String(port),
+        PUSHPALS_AUTH_TOKEN: authToken,
+      },
     },
-  });
+  );
 
   const server: SpawnedServer = {
     proc,
@@ -127,7 +130,11 @@ function spawnServer(root: string, port: number, authToken: string): SpawnedServ
   return server;
 }
 
-async function waitForHealth(server: SpawnedServer, port: number, timeoutMs = 10_000): Promise<void> {
+async function waitForHealth(
+  server: SpawnedServer,
+  port: number,
+  timeoutMs = 10_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (server.exitCode != null) {

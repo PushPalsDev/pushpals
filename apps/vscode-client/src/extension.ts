@@ -43,17 +43,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   const resolveVscodeSessionId = (): string => {
     const folder = vscode.workspace.workspaceFolders?.[0];
-    return resolveWorkspaceSessionId(
-      context.globalState,
-      folder?.uri.toString(true),
-      folder?.name,
-    );
+    return resolveWorkspaceSessionId(context.globalState, folder?.uri.toString(true), folder?.name);
   };
   const stackManager = new StackServiceManager(output, resolveVscodeSessionId);
   activeStackManager = stackManager;
   context.subscriptions.push(output, stackManager);
   if (!vscode.workspace.isTrusted) {
-    output.appendLine("[extension] Workspace is untrusted. Start/stop/auto-start operations are blocked.");
+    output.appendLine(
+      "[extension] Workspace is untrusted. Start/stop/auto-start operations are blocked.",
+    );
   }
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);

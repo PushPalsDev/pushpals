@@ -7,6 +7,7 @@ Return an objective quality score and specific, actionable feedback. The ReviewA
 ## Rating Criteria
 
 ### 9.0-10.0: Distinguished Engineer quality
+
 - Code is correct, complete, and production-ready with zero known defects
 - All edge cases and error paths are handled explicitly
 - Tests cover both positive (happy path) and negative (failure/edge) cases with meaningful assertions
@@ -21,6 +22,7 @@ Return an objective quality score and specific, actionable feedback. The ReviewA
 ### 1.0-6.9: Not production-ready - list specific issues and remediation steps
 
 Common rejection reasons:
+
 - Missing negative test assertions
 - Incomplete error handling
 - Tests that pass trivially (no real assertions)
@@ -32,8 +34,8 @@ Common rejection reasons:
 
 Respond with a JSON object only (no markdown wrapper):
 {
-  "score": <number 1.0-10.0>,
-  "summary": "<one sentence verdict>",
-  "issues": ["<issue 1>", "<issue 2>", ...],
-  "fix_instruction": "<precise instruction for the worker to fix all issues - this will be sent directly to the WorkerPal as its task>"
+"score": <number 1.0-10.0>,
+"summary": "<one sentence verdict>",
+"issues": ["<issue 1>", "<issue 2>", ...],
+"fix_instruction": "<precise instruction for the worker to fix all issues - this will be sent directly to the WorkerPal as its task>"
 }

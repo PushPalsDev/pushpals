@@ -14,7 +14,10 @@ function makeStore(): AutonomyStore {
   return store;
 }
 
-function makePersistentStore(prefix = "pushpals-autonomy-store-"): { store: AutonomyStore; dbPath: string } {
+function makePersistentStore(prefix = "pushpals-autonomy-store-"): {
+  store: AutonomyStore;
+  dbPath: string;
+} {
   const root = mkdtempSync(join(tmpdir(), prefix));
   const dbPath = join(root, "autonomy.sqlite");
   tempDirs.push(root);
@@ -60,9 +63,15 @@ describe("server AutonomyStore policy gates", () => {
 
     expect(snapshot.top_signals.length).toBeGreaterThan(0);
     expect(snapshot.state_traits.length).toBeGreaterThan(0);
-    expect(snapshot.state_traits.some((trait) => trait.trait_id === "queue_latency_high")).toBe(true);
-    expect(snapshot.state_traits.some((trait) => trait.trait_id === "job_failure_rate_high")).toBe(true);
-    expect(snapshot.state_traits.some((trait) => trait.trait_id === "repo_dirty_worktree")).toBe(true);
+    expect(snapshot.state_traits.some((trait) => trait.trait_id === "queue_latency_high")).toBe(
+      true,
+    );
+    expect(snapshot.state_traits.some((trait) => trait.trait_id === "job_failure_rate_high")).toBe(
+      true,
+    );
+    expect(snapshot.state_traits.some((trait) => trait.trait_id === "repo_dirty_worktree")).toBe(
+      true,
+    );
   });
 
   test("createSnapshot derives component strength traits from outcomes", () => {
@@ -421,7 +430,12 @@ describe("server AutonomyStore policy gates", () => {
 
   test("applies read_anywhere policy gate based on config allowlist", () => {
     const store = makeStore();
-    const allowReadAnywhere = (store as unknown as { config?: { remotebuddy?: { autonomy?: { allowReadAnywhere?: boolean } } } }).config?.remotebuddy?.autonomy?.allowReadAnywhere ?? false;
+    const allowReadAnywhere =
+      (
+        store as unknown as {
+          config?: { remotebuddy?: { autonomy?: { allowReadAnywhere?: boolean } } };
+        }
+      ).config?.remotebuddy?.autonomy?.allowReadAnywhere ?? false;
     const snapshotId = store.createSnapshot({ sessionId: "s1" }).snapshot_id;
 
     const result = store.recordObjectiveDecision({
@@ -836,7 +850,8 @@ describe("server AutonomyStore policy gates", () => {
       expect(result.results?.[0]?.ok).toBe(false);
       expect(String(result.results?.[0]?.reason ?? "")).toContain("token budget exceeded");
     } finally {
-      if (autonomyCfg && typeof priorLimit === "number") autonomyCfg.maxTokenUsagePerHour = priorLimit;
+      if (autonomyCfg && typeof priorLimit === "number")
+        autonomyCfg.maxTokenUsagePerHour = priorLimit;
     }
   });
 
@@ -901,7 +916,8 @@ describe("server AutonomyStore policy gates", () => {
       expect(result.results?.[0]?.ok).toBe(false);
       expect(String(result.results?.[0]?.reason ?? "")).toContain("runtime budget exceeded");
     } finally {
-      if (autonomyCfg && typeof priorLimit === "number") autonomyCfg.maxRuntimeMsPerHour = priorLimit;
+      if (autonomyCfg && typeof priorLimit === "number")
+        autonomyCfg.maxRuntimeMsPerHour = priorLimit;
     }
   });
 
@@ -1066,7 +1082,8 @@ describe("server AutonomyStore policy gates", () => {
           id: "cand_engine_trial_seed",
           title: "Engine building block: novelty curriculum scheduler",
           objective_type: "lint_fix",
-          problem_statement: "Prototype novelty curriculum scheduling for autonomous objective selection.",
+          problem_statement:
+            "Prototype novelty curriculum scheduling for autonomous objective selection.",
           trigger_type: "lint_failure",
           component_area: "apps/remotebuddy",
           target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
@@ -1239,7 +1256,10 @@ describe("server AutonomyStore policy gates", () => {
       };
     }
     const sessionId = "s1";
-    const snapshotId = store.createSnapshot({ sessionId, runId: "run_source_curation_seed" }).snapshot_id;
+    const snapshotId = store.createSnapshot({
+      sessionId,
+      runId: "run_source_curation_seed",
+    }).snapshot_id;
     const seedObjective = (params: {
       n: number;
       sourceFingerprint: string;
@@ -1262,7 +1282,9 @@ describe("server AutonomyStore policy gates", () => {
             problem_statement: `Exercise source curation path for ${params.sourceFingerprint}`,
             trigger_type: "lint_failure",
             component_area: "apps/remotebuddy",
-            target_paths: [`apps/remotebuddy/src/source_${params.sourceFingerprint}_${params.n}.ts`],
+            target_paths: [
+              `apps/remotebuddy/src/source_${params.sourceFingerprint}_${params.n}.ts`,
+            ],
             scope: { read_anywhere: false, write_globs: ["apps/remotebuddy/src/*.ts"] },
             risk_level: "low",
             expected_validation: ["bun run test"],
@@ -1346,13 +1368,17 @@ describe("server AutonomyStore policy gates", () => {
     expect(archived).toBeDefined();
     expect(trusted?.curationStatus).toBe("trusted");
     expect(archived?.curationStatus).toBe("archived");
-    expect((trusted?.trustScore ?? 0)).toBeGreaterThan(0.6);
-    expect((archived?.trustScore ?? 1)).toBeLessThan(0.5);
+    expect(trusted?.trustScore ?? 0).toBeGreaterThan(0.6);
+    expect(archived?.trustScore ?? 1).toBeLessThan(0.5);
     expect(
-      insights.trustedInspirationShortlist.some((row) => row.sourceFingerprint === "fp_trusted_source"),
+      insights.trustedInspirationShortlist.some(
+        (row) => row.sourceFingerprint === "fp_trusted_source",
+      ),
     ).toBe(true);
     expect(
-      insights.archivedInspirationSources.some((row) => row.sourceFingerprint === "fp_archived_source"),
+      insights.archivedInspirationSources.some(
+        (row) => row.sourceFingerprint === "fp_archived_source",
+      ),
     ).toBe(true);
   });
 
@@ -1474,7 +1500,9 @@ describe("server AutonomyStore policy gates", () => {
     });
     expect(before.ok).toBe(true);
     expect(before.results?.[0]?.ok).toBe(false);
-    expect(String(before.results?.[0]?.reason ?? "")).toContain("max concurrent objectives reached");
+    expect(String(before.results?.[0]?.reason ?? "")).toContain(
+      "max concurrent objectives reached",
+    );
 
     const completed = store.recordOutcome({
       objectiveId: "obj_terminal_1",
@@ -1507,7 +1535,10 @@ describe("server AutonomyStore policy gates", () => {
 
   test("recordOutcome clears active pattern lock after terminal failure", () => {
     const store = makeStore();
-    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_pattern_release" }).snapshot_id;
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_pattern_release",
+    }).snapshot_id;
 
     const seeded = store.recordObjectiveDecision({
       runId: "run_pattern_release",
@@ -1545,7 +1576,9 @@ describe("server AutonomyStore policy gates", () => {
     });
     expect(blocked.ok).toBe(true);
     expect(blocked.results?.[0]?.ok).toBe(false);
-    expect(String(blocked.results?.[0]?.reason ?? "")).toContain("pattern already has active objective");
+    expect(String(blocked.results?.[0]?.reason ?? "")).toContain(
+      "pattern already has active objective",
+    );
 
     const failed = store.recordOutcome({
       objectiveId: "obj_pattern_release",
@@ -1713,7 +1746,10 @@ describe("server AutonomyStore policy gates", () => {
 
   test("answerQuestion returns resume context and objective can be re-dispatched automatically", () => {
     const store = makeStore();
-    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_question_resume" }).snapshot_id;
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_question_resume",
+    }).snapshot_id;
     const decision = store.recordObjectiveDecision({
       runId: "run_question_resume",
       snapshotId,
@@ -1759,7 +1795,9 @@ describe("server AutonomyStore policy gates", () => {
     expect(answered.resume?.targetPaths).toEqual(["apps/server/src/autonomy.ts"]);
     expect(answered.resume?.writeGlobs).toEqual(["apps/server/src/*"]);
     expect(answered.resume?.idempotencyKey).toBe("autonomy_resume:q_question_resume");
-    expect(String(answered.resume?.instruction ?? "")).toContain("Prioritize interactive tasks first");
+    expect(String(answered.resume?.instruction ?? "")).toContain(
+      "Prioritize interactive tasks first",
+    );
 
     const db = (store as unknown as { db: any }).db;
     const gatedBeforeDispatch = db
@@ -1777,7 +1815,10 @@ describe("server AutonomyStore policy gates", () => {
 
   test("markObjectiveRunningByJobId promotes linked objectives to running", () => {
     const store = makeStore();
-    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_running_state" }).snapshot_id;
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_running_state",
+    }).snapshot_id;
     const decision = store.recordObjectiveDecision({
       runId: "run_running_state",
       snapshotId,
@@ -1814,7 +1855,10 @@ describe("server AutonomyStore policy gates", () => {
 
   test("safety state kill switch blocks eligibility", () => {
     const store = makeStore();
-    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_safety_gate" }).snapshot_id;
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_safety_gate",
+    }).snapshot_id;
     const toggled = store.updateSafetyState({ killSwitchEnabled: true });
     expect(toggled.ok).toBe(true);
     expect(toggled.state.killSwitchEnabled).toBe(true);
@@ -1839,7 +1883,10 @@ describe("server AutonomyStore policy gates", () => {
 
   test("question actions support skip/close/escalate", () => {
     const store = makeStore();
-    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_question_actions" }).snapshot_id;
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_question_actions",
+    }).snapshot_id;
     const decision = store.recordObjectiveDecision({
       runId: "run_question_actions",
       snapshotId,
@@ -1887,7 +1934,10 @@ describe("server AutonomyStore policy gates", () => {
 
   test("stale objective sweeper dead-letters stale active objectives", () => {
     const store = makeStore();
-    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_stale_sweep" }).snapshot_id;
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_stale_sweep",
+    }).snapshot_id;
     const decision = store.recordObjectiveDecision({
       runId: "run_stale_sweep",
       snapshotId,
@@ -1910,9 +1960,9 @@ describe("server AutonomyStore policy gates", () => {
     });
     expect(decision.ok).toBe(true);
     const db = (store as unknown as { db: any }).db;
-    db.prepare(`UPDATE autonomy_objectives SET updated_at = datetime('now', '-5 hours') WHERE id = ?`).run(
-      "obj_stale_sweep",
-    );
+    db.prepare(
+      `UPDATE autonomy_objectives SET updated_at = datetime('now', '-5 hours') WHERE id = ?`,
+    ).run("obj_stale_sweep");
 
     const sweep = store.maybeSweepStaleObjectives(new Date(Date.now() + 120_000).toISOString());
     expect(sweep.ok).toBe(true);
@@ -1926,7 +1976,10 @@ describe("server AutonomyStore policy gates", () => {
 
   test("restart recovery sweep closes stale blocked objective + question without orphans", () => {
     const { store: firstStore, dbPath } = makePersistentStore("pushpals-autonomy-recovery-");
-    const snapshotId = firstStore.createSnapshot({ sessionId: "s1", runId: "run_restart_recovery" }).snapshot_id;
+    const snapshotId = firstStore.createSnapshot({
+      sessionId: "s1",
+      runId: "run_restart_recovery",
+    }).snapshot_id;
     const created = firstStore.recordObjectiveDecision({
       runId: "run_restart_recovery",
       snapshotId,
@@ -1958,14 +2011,18 @@ describe("server AutonomyStore policy gates", () => {
 
     const firstDb = (firstStore as unknown as { db: any }).db;
     firstDb
-      .prepare(`UPDATE autonomy_objectives SET updated_at = datetime('now', '-6 hours') WHERE id = ?`)
+      .prepare(
+        `UPDATE autonomy_objectives SET updated_at = datetime('now', '-6 hours') WHERE id = ?`,
+      )
       .run("obj_restart_recovery");
 
     closeTrackedStore(firstStore);
     const resumedStore = new AutonomyStore(dbPath);
     stores.push(resumedStore);
 
-    const sweep = resumedStore.maybeSweepStaleObjectives(new Date(Date.now() + 120_000).toISOString());
+    const sweep = resumedStore.maybeSweepStaleObjectives(
+      new Date(Date.now() + 120_000).toISOString(),
+    );
     expect(sweep.ok).toBe(true);
     expect(sweep.deadLettered).toBeGreaterThanOrEqual(1);
 

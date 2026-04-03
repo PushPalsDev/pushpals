@@ -67,10 +67,13 @@ echo "password=${token}"
     writeFileSync(helperPath, helperScript, { mode: 0o755 });
 
     // Remove any legacy URL rewrite rules that may have embedded token credentials.
-    const urlRules = Bun.spawnSync(["git", "config", "--global", "--get-regexp", "^url\\..*\\.insteadOf$"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const urlRules = Bun.spawnSync(
+      ["git", "config", "--global", "--get-regexp", "^url\\..*\\.insteadOf$"],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
     if (urlRules.exitCode === 0) {
       const lines = String(urlRules.stdout ?? "")
         .split(/\r?\n/)

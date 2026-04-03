@@ -68,7 +68,8 @@ describe("workerpals quality gate critic issue formatting", () => {
         score: 6.5,
         findings: ["The updated tests still do not cover the negative assertion path."],
         mustFix: ["Add negative-path assertions for the updated behavior."],
-        revisionGuidance: "Fix the failing test command, then add the missing negative-path assertion coverage.",
+        revisionGuidance:
+          "Fix the failing test command, then add the missing negative-path assertion coverage.",
         raw: "{}",
       },
       8,

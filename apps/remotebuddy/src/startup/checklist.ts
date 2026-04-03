@@ -11,8 +11,7 @@ export const STARTUP_FAILURE_CODES = {
   DISPATCH_FAILED: "startup.dispatch_failed",
 } as const;
 
-export type StartupFailureCode =
-  (typeof STARTUP_FAILURE_CODES)[keyof typeof STARTUP_FAILURE_CODES];
+export type StartupFailureCode = (typeof STARTUP_FAILURE_CODES)[keyof typeof STARTUP_FAILURE_CODES];
 
 type StartupCheckStatus = "pass" | "fail";
 
@@ -43,9 +42,7 @@ export interface SyntheticStartupTestResult {
 }
 
 export interface SyntheticStartupTester {
-  runSyntheticJob: (
-    options: SyntheticStartupTestOptions,
-  ) => Promise<SyntheticStartupTestResult>;
+  runSyntheticJob: (options: SyntheticStartupTestOptions) => Promise<SyntheticStartupTestResult>;
 }
 
 export interface StartupCheckRecord {
@@ -112,8 +109,7 @@ const DISPATCH_CHECK_LABEL = "Job dispatch must succeed.";
 const DISPATCH_CHECK_ACTION =
   "Inspect RemoteBuddy + WorkerPals logs, repair dependencies, then rerun dispatch.";
 
-const defaultChecks = Object.freeze(
-  [
+const defaultChecks = Object.freeze([
   {
     code: STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
     label: "Git merge or rebase must be resolved.",
@@ -124,8 +120,7 @@ const defaultChecks = Object.freeze(
       if (status.isMergeInProgress) {
         const branchHint = status.branch ? ` on ${status.branch}` : "";
         const detail =
-          status.detail ??
-          `Merge or rebase detected${branchHint}; startup cannot continue.`;
+          status.detail ?? `Merge or rebase detected${branchHint}; startup cannot continue.`;
         return { ok: false, detail };
       }
       return {
@@ -186,8 +181,7 @@ const defaultChecks = Object.freeze(
       "Re-run the synthetic probe (`bun run test --filter startup`) and repair LM Studio / remote dependencies if it keeps failing.",
     category: "synthetic",
     run: async (ctx, options) => {
-      const maxLatencyMs =
-        options.syntheticMaxLatencyMs ?? DEFAULT_SYNTHETIC_LATENCY_MS;
+      const maxLatencyMs = options.syntheticMaxLatencyMs ?? DEFAULT_SYNTHETIC_LATENCY_MS;
       const probeName = options.syntheticProbeName ?? DEFAULT_SYNTHETIC_PROBE;
       const result = await ctx.syntheticTester.runSyntheticJob({
         maxLatencyMs,
@@ -200,43 +194,35 @@ const defaultChecks = Object.freeze(
         };
       }
       const latencyDetail = `${result.latencyMs} ms`;
-      const failureDetail = result.failureDetail
-        ? `: ${result.failureDetail}`
-        : "";
+      const failureDetail = result.failureDetail ? `: ${result.failureDetail}` : "";
       const detail = result.ok
         ? `${probeName} breached latency SLO (${latencyDetail} > ${maxLatencyMs} ms).`
         : `${probeName} failed${failureDetail} (observed ${latencyDetail}).`;
       return { ok: false, detail };
     },
   },
-  ] satisfies readonly StartupCheckDefinition[],
-);
+] satisfies readonly StartupCheckDefinition[]);
 
-export const STARTUP_CHECK_STRUCTURE = Object.freeze(
-  [
-    ...defaultChecks.map((check, index) => ({
-      code: check.code,
-      label: check.label,
-      action: check.action,
-      category: check.category,
-      step: index + 1,
-    })),
-    {
-      code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
-      label: DISPATCH_CHECK_LABEL,
-      action: DISPATCH_CHECK_ACTION,
-      category: "dispatch",
-      step: defaultChecks.length + 1,
-    },
-  ] satisfies readonly StartupCheckStructure[],
-);
+export const STARTUP_CHECK_STRUCTURE = Object.freeze([
+  ...defaultChecks.map((check, index) => ({
+    code: check.code,
+    label: check.label,
+    action: check.action,
+    category: check.category,
+    step: index + 1,
+  })),
+  {
+    code: STARTUP_FAILURE_CODES.DISPATCH_FAILED,
+    label: DISPATCH_CHECK_LABEL,
+    action: DISPATCH_CHECK_ACTION,
+    category: "dispatch",
+    step: defaultChecks.length + 1,
+  },
+] satisfies readonly StartupCheckStructure[]);
 
-const nowMs = (ctx: StartupChecklistContext) =>
-  ctx.now ? ctx.now() : Date.now();
+const nowMs = (ctx: StartupChecklistContext) => (ctx.now ? ctx.now() : Date.now());
 
-const memoizeContext = (
-  ctx: StartupChecklistContext,
-): StartupChecklistContext => {
+const memoizeContext = (ctx: StartupChecklistContext): StartupChecklistContext => {
   let repoStatusPromise: Promise<RepoStatus> | undefined;
   return {
     ...ctx,
@@ -269,10 +255,7 @@ export class StartupChecklist {
         detail = outcome.detail ?? check.label;
       } catch (error) {
         status = "fail";
-        detail =
-          error instanceof Error
-            ? error.message
-            : "Unknown error running startup check.";
+        detail = error instanceof Error ? error.message : "Unknown error running startup check.";
         if (error instanceof Error) {
           failureErrorMessage = error.message;
         } else if (typeof error === "string" && error.trim()) {
@@ -293,7 +276,8 @@ export class StartupChecklist {
         durationMs,
         startedAtMs,
         endedAtMs,
-        error: status === "fail" && failureErrorMessage ? { message: failureErrorMessage } : undefined,
+        error:
+          status === "fail" && failureErrorMessage ? { message: failureErrorMessage } : undefined,
       };
       history.push(record);
       ctx.log?.(record);

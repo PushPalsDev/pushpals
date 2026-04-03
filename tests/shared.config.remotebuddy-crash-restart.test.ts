@@ -12,12 +12,7 @@ describe("shared config remotebuddy crash restart parsing", () => {
 
     writeFileSync(
       join(configDir, "default.toml"),
-      [
-        'profile = "dev"',
-        "",
-        "[remotebuddy]",
-        "poll_ms = 2000",
-      ].join("\n"),
+      ['profile = "dev"', "", "[remotebuddy]", "poll_ms = 2000"].join("\n"),
       "utf8",
     );
     writeFileSync(join(configDir, "local.example.toml"), "", "utf8");

@@ -205,7 +205,8 @@ export async function getCommitMessage(opts: {
   }
 
   const data = (await response.json()) as { commit?: { message?: unknown } | null };
-  const message = data && data.commit && typeof data.commit.message === "string" ? data.commit.message : "";
+  const message =
+    data && data.commit && typeof data.commit.message === "string" ? data.commit.message : "";
   if (!message) {
     throw new Error(`GitHub API commit ${opts.sha} missing commit.message`);
   }
@@ -277,9 +278,7 @@ export async function getPullRequestCommitMessage(opts: {
   }
 
   if (latestMessage) return latestMessage;
-  throw new Error(
-    `Could not resolve commit message from PR #${opts.prNumber} for sha ${opts.sha}`,
-  );
+  throw new Error(`Could not resolve commit message from PR #${opts.prNumber} for sha ${opts.sha}`);
 }
 
 export async function mergePullRequest(opts: {
@@ -429,9 +428,7 @@ export async function listPullRequestComments(opts: {
     html_url?: unknown;
     user?: { login?: unknown } | null;
   }>;
-  const normalizedIssueComments = Array.isArray(issueComments)
-    ? issueComments
-    : [];
+  const normalizedIssueComments = Array.isArray(issueComments) ? issueComments : [];
 
   const reviewUrl = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}/comments?sort=created&direction=desc&per_page=${perPage}`;
   let normalizedReviewComments: Array<{

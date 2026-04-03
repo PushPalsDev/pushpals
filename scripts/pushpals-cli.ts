@@ -278,9 +278,7 @@ export function formatRuntimeStartupTimingSummary(input: {
     )
     .join(" ");
   const detail =
-    typeof input.detail === "string" && input.detail.trim()
-      ? ` detail=${input.detail.trim()}`
-      : "";
+    typeof input.detail === "string" && input.detail.trim() ? ` detail=${input.detail.trim()}` : "";
   return (
     `[pushpals] startup timing summary: outcome=${input.outcome} ` +
     `total=${Math.max(0, Math.floor(input.totalDurationMs))}ms${detail}` +
@@ -332,12 +330,8 @@ export function describeWorkerExecutionReadiness(opts: {
   };
 }
 
-export function formatWorkerExecutionReadinessLines(
-  readiness: WorkerExecutionReadiness,
-): string[] {
-  const lines = [
-    `[pushpals] workerExecution=${readiness.state} detail=${readiness.detail}`,
-  ];
+export function formatWorkerExecutionReadinessLines(readiness: WorkerExecutionReadiness): string[] {
+  const lines = [`[pushpals] workerExecution=${readiness.state} detail=${readiness.detail}`];
   if (readiness.action) {
     lines.push(`[pushpals] workerExecutionAction=${readiness.action}`);
   }
@@ -351,11 +345,11 @@ function summarizeWorkerStatusRows(workers: WorkerStatusRow[]): {
   const onlineWorkers = workers.filter(
     (worker) =>
       Boolean(worker?.isOnline) &&
-      String(worker?.status ?? "").trim().toLowerCase() !== "offline",
+      String(worker?.status ?? "")
+        .trim()
+        .toLowerCase() !== "offline",
   );
-  const idleWorkers = onlineWorkers.filter(
-    (worker) => Number(worker?.activeJobCount ?? 0) <= 0,
-  );
+  const idleWorkers = onlineWorkers.filter((worker) => Number(worker?.activeJobCount ?? 0) <= 0);
   return {
     onlineWorkers: onlineWorkers.length,
     idleWorkers: idleWorkers.length,
@@ -402,7 +396,9 @@ export async function resolveWorkerExecutionReadiness(opts: {
     opts.runtimeRoot.trim().length > 0 &&
     typeof opts.preflightUsesEmbeddedRuntime === "boolean";
   if (shouldProbeDockerAvailability) {
-    dockerPrecheck = await (opts.precheckDockerAvailabilityFn ?? precheckWorkerpalDockerAvailability)({
+    dockerPrecheck = await (
+      opts.precheckDockerAvailabilityFn ?? precheckWorkerpalDockerAvailability
+    )({
       repoRoot: opts.repoRoot!,
       runtimeRoot: opts.runtimeRoot!,
       preflightUsesEmbeddedRuntime: opts.preflightUsesEmbeddedRuntime!,
@@ -451,8 +447,7 @@ function installTimestampedCliConsole(): void {
   if (cliTimestampedConsoleInstalled) return;
   cliTimestampedConsoleInstalled = true;
 
-  const patch =
-    <T extends (...args: any[]) => unknown>(original: T): T =>
+  const patch = <T extends (...args: any[]) => unknown>(original: T): T =>
     ((...args: any[]) => {
       if (args.length > 0 && typeof args[0] === "string") {
         args[0] = formatTimestampedCliLine(args[0]);
@@ -493,7 +488,9 @@ function printUsage(): void {
   console.log("  --runtime-tag <tag>    Override runtime release tag (e.g. v1.0.2)");
   console.log("  --no-auto-start        Disable runtime auto-start when the server is down");
   console.log("  --no-stream            Disable live session event stream");
-  console.log("  --runtime-only         Start the local runtime and wait for shutdown without opening the interactive chat");
+  console.log(
+    "  --runtime-only         Start the local runtime and wait for shutdown without opening the interactive chat",
+  );
   console.log("  --clear                Remove repo-local PushPals state and exit");
   console.log("  -h, --help             Show this help");
   console.log("");
@@ -597,7 +594,9 @@ function normalizeLoopbackUrl(value: string, fallback: string): string {
 function isLoopbackUrl(value: string): boolean {
   try {
     const parsed = new URL(normalizeUrl(value));
-    const hostname = String(parsed.hostname ?? "").trim().toLowerCase();
+    const hostname = String(parsed.hostname ?? "")
+      .trim()
+      .toLowerCase();
     return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
   } catch {
     return false;
@@ -650,10 +649,7 @@ async function runGitWithEnv(
   return await runCommandWithEnv(["git", ...args], cwd, env);
 }
 
-async function runGit(
-  args: string[],
-  cwd: string,
-): Promise<CommandResult> {
+async function runGit(args: string[], cwd: string): Promise<CommandResult> {
   return await runGitWithEnv(args, cwd, {
     ...(process.env as Record<string, string | undefined>),
     GIT_TERMINAL_PROMPT: "0",
@@ -722,10 +718,10 @@ function listTrackedRepoFilesForPath(repoRoot: string, sourcePath: string): stri
     },
   });
   if (proc.exitCode !== 0) {
-    const stderr = Buffer.from(proc.stderr ?? []).toString("utf8").trim();
-    throw new Error(
-      `git ls-files failed for ${normalizedSource}${stderr ? `: ${stderr}` : ""}`,
-    );
+    const stderr = Buffer.from(proc.stderr ?? [])
+      .toString("utf8")
+      .trim();
+    throw new Error(`git ls-files failed for ${normalizedSource}${stderr ? `: ${stderr}` : ""}`);
   }
   return Buffer.from(proc.stdout ?? [])
     .toString("utf8")
@@ -796,10 +792,7 @@ function isCompleteWorkerpalSandboxRoot(root: string): boolean {
   );
 }
 
-function populateWorkerpalSandboxRuntimeAssets(
-  runtimeRoot: string,
-  force: boolean,
-): void {
+function populateWorkerpalSandboxRuntimeAssets(runtimeRoot: string, force: boolean): void {
   const sandbox = buildWorkerpalSandboxPaths(runtimeRoot);
   cpSync(join(runtimeRoot, "configs"), sandbox.configsDir, {
     recursive: true,
@@ -922,7 +915,10 @@ function bundledMonitoringHubSourceWatchPaths(sourceRoot: string): string[] {
   ];
 }
 
-export function bundledMonitoringHubNeedsRefresh(existingRoot: string, sourceRoot: string): boolean {
+export function bundledMonitoringHubNeedsRefresh(
+  existingRoot: string,
+  sourceRoot: string,
+): boolean {
   if (!looksLikeMonitoringHubBuild(existingRoot)) return true;
   const bundleMtimeMs = latestPathMtimeMs(existingRoot);
   if (bundleMtimeMs <= 0) return true;
@@ -990,7 +986,9 @@ async function ensureBundledMonitoringHubRoot(): Promise<string | null> {
   }
 
   if (existingRoot) {
-    console.log("[pushpals] Packaged monitor UI is stale; refreshing the exported client monitor...");
+    console.log(
+      "[pushpals] Packaged monitor UI is stale; refreshing the exported client monitor...",
+    );
   }
 
   exportBundledMonitoringHubFromSourceCheckout(sourceRoot);
@@ -1333,9 +1331,7 @@ function resolveRuntimeBinaryInstallState(
 ): RuntimeBinaryInstallState {
   const binDir = join(runtimeRoot, "bin", platformKey);
   const tagMarkerPath = join(binDir, ".runtime-tag");
-  const installedTag = existsSync(tagMarkerPath)
-    ? readFileSync(tagMarkerPath, "utf8").trim()
-    : "";
+  const installedTag = existsSync(tagMarkerPath) ? readFileSync(tagMarkerPath, "utf8").trim() : "";
   return { binDir, tagMarkerPath, installedTag };
 }
 
@@ -1429,14 +1425,17 @@ export function buildEmbeddedRuntimeEnv(
     ...(typeof env.PUSHPALS_DOCKER_BIN === "string" && env.PUSHPALS_DOCKER_BIN.trim()
       ? { PUSHPALS_DOCKER_BIN: env.PUSHPALS_DOCKER_BIN.trim() }
       : {}),
-    ...(typeof env.PUSHPALS_DOCKER_BIN_ABSOLUTE === "string" && env.PUSHPALS_DOCKER_BIN_ABSOLUTE.trim()
+    ...(typeof env.PUSHPALS_DOCKER_BIN_ABSOLUTE === "string" &&
+    env.PUSHPALS_DOCKER_BIN_ABSOLUTE.trim()
       ? { PUSHPALS_DOCKER_BIN_ABSOLUTE: env.PUSHPALS_DOCKER_BIN_ABSOLUTE.trim() }
       : {}),
   };
 }
 
 function parseBooleanFlag(raw: string | undefined): boolean | null {
-  const normalized = String(raw ?? "").trim().toLowerCase();
+  const normalized = String(raw ?? "")
+    .trim()
+    .toLowerCase();
   if (!normalized) return null;
   if (["1", "true", "yes", "on", "y"].includes(normalized)) return true;
   if (["0", "false", "no", "off", "n"].includes(normalized)) return false;
@@ -1463,10 +1462,7 @@ export function resolveEmbeddedBunExecutableFromEnv(
       : String(env.PATH ?? "").trim();
   if (!pathValue) return "";
 
-  const candidates =
-    platform === "win32"
-      ? ["bun.exe", "bun", "bun.cmd", "bun.bat"]
-      : ["bun"];
+  const candidates = platform === "win32" ? ["bun.exe", "bun", "bun.cmd", "bun.bat"] : ["bun"];
   for (const rawDir of pathValue.split(delimiter)) {
     const dir = rawDir.trim();
     if (!dir) continue;
@@ -1610,9 +1606,7 @@ export function extractRemoteBuddyAutonomousEngineState(
   return state;
 }
 
-function readRemoteBuddyAutonomousEngineState(
-  logPath: string,
-): RemoteBuddyAutonomousEngineState {
+function readRemoteBuddyAutonomousEngineState(logPath: string): RemoteBuddyAutonomousEngineState {
   if (!existsSync(logPath)) return "unknown";
   try {
     return extractRemoteBuddyAutonomousEngineState(readFileSync(logPath, "utf8"));
@@ -1868,9 +1862,7 @@ function prependExecutableDirToPath(
 
   const executableDir = dirname(resolvedPath);
   const existingPath =
-    platform === "win32"
-      ? String(env.Path ?? env.PATH ?? "")
-      : String(env.PATH ?? "");
+    platform === "win32" ? String(env.Path ?? env.PATH ?? "") : String(env.PATH ?? "");
   const pathEntries = existingPath
     .split(delimiter)
     .map((entry) => entry.trim())
@@ -2033,7 +2025,7 @@ function quoteWindowsCmdArg(value: string): string {
   const text = String(value ?? "");
   if (!text.length) return '""';
   if (!/[ \t"]/.test(text)) return text;
-  const escaped = text.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/g, "$1$1");
+  const escaped = text.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, "$1$1");
   return `"${escaped}"`;
 }
 
@@ -2166,7 +2158,9 @@ type GitWorktreeEntry = {
 };
 
 function normalizeFsPathForComparison(value: string): string {
-  const resolved = resolve(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
+  const resolved = resolve(String(value ?? "").trim())
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
@@ -2353,7 +2347,9 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
         opts.env,
       );
       if (!deleteResult.ok) {
-        failures.push(`${branch}: ${deleteResult.stderr || deleteResult.stdout || `exit ${deleteResult.exitCode}`}`);
+        failures.push(
+          `${branch}: ${deleteResult.stderr || deleteResult.stdout || `exit ${deleteResult.exitCode}`}`,
+        );
       } else {
         removed += 1;
       }
@@ -2437,8 +2433,7 @@ export async function ensureWorkerpalDockerImageReady(opts: {
     opts.env,
     opts.platform ?? process.platform,
   );
-  const inspectImageRuntimeTagFn =
-    opts.inspectImageRuntimeTagFn ?? inspectDockerImageRuntimeTag;
+  const inspectImageRuntimeTagFn = opts.inspectImageRuntimeTagFn ?? inspectDockerImageRuntimeTag;
   const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
   const existingRuntimeTag = await inspectImageRuntimeTagFn(
     dockerExecutable,
@@ -2661,8 +2656,7 @@ export async function precheckWorkerpalDockerAvailability(opts: {
       sessionId: opts.sessionId,
     },
   );
-  const preconfiguredDockerBinary =
-    env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? env.PUSHPALS_DOCKER_BIN;
+  const preconfiguredDockerBinary = env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? env.PUSHPALS_DOCKER_BIN;
   if (preconfiguredDockerBinary) {
     applyResolvedDockerBinaryToRuntimeEnv(
       env,
@@ -2717,9 +2711,7 @@ function resolveWorkerpalCapacityTimeoutMs(config: PushPalsConfig): number {
   return Math.max(
     config.remotebuddy.waitForWorkerpalMs,
     config.remotebuddy.workerpalStartupTimeoutMs,
-    config.remotebuddy.workerpalDocker
-      ? config.workerpals.dockerAgentStartupTimeoutMs + 15_000
-      : 0,
+    config.remotebuddy.workerpalDocker ? config.workerpals.dockerAgentStartupTimeoutMs + 15_000 : 0,
     10_000,
   );
 }
@@ -3120,7 +3112,10 @@ export function extractRemoteBuddySessionConsumerHealth(
   });
   const remotebuddyRows = sessionRows.filter(isRemoteBuddyClientRow);
   const connectedRow = remotebuddyRows.find(
-    (row) => String(row.status ?? "").trim().toLowerCase() === "connected",
+    (row) =>
+      String(row.status ?? "")
+        .trim()
+        .toLowerCase() === "connected",
   );
   if (connectedRow) {
     return {
@@ -3137,7 +3132,11 @@ export function extractRemoteBuddySessionConsumerHealth(
   const connectedOtherSession = anyRemoteBuddyRows.find((row) => {
     const rowSessionId = String(row.sessionId ?? "").trim();
     if (!rowSessionId || rowSessionId === sessionId) return false;
-    return String(row.status ?? "").trim().toLowerCase() === "connected";
+    return (
+      String(row.status ?? "")
+        .trim()
+        .toLowerCase() === "connected"
+    );
   });
   if (connectedOtherSession) {
     const otherSessionId = String(connectedOtherSession.sessionId ?? "").trim();
@@ -3160,14 +3159,17 @@ export function extractRemoteBuddySessionConsumerHealth(
     };
   }
   if (anyRemoteBuddyRows.length > 0) {
-    const knownSessions = [...new Set(anyRemoteBuddyRows.map((row) => String(row.sessionId ?? "").trim()))]
+    const knownSessions = [
+      ...new Set(anyRemoteBuddyRows.map((row) => String(row.sessionId ?? "").trim())),
+    ]
       .filter(Boolean)
       .sort();
     const suffix =
       knownSessions.length > 0 ? ` Known RemoteBuddy sessions: ${knownSessions.join(", ")}.` : "";
     return {
       ok: false,
-      detail: `No connected RemoteBuddy session consumer found for session ${sessionId}.${suffix}`.trim(),
+      detail:
+        `No connected RemoteBuddy session consumer found for session ${sessionId}.${suffix}`.trim(),
     };
   }
   return {
@@ -3212,10 +3214,7 @@ async function probeSourceControlManager(port: number): Promise<boolean> {
   }
 }
 
-async function fetchWorkerStatusRows(
-  serverUrl: string,
-  ttlMs: number,
-): Promise<WorkerStatusRow[]> {
+async function fetchWorkerStatusRows(serverUrl: string, ttlMs: number): Promise<WorkerStatusRow[]> {
   const payload = await fetchJsonWithTimeout<{ ok?: boolean; workers?: WorkerStatusRow[] }>(
     `${serverUrl}/workers?ttlMs=${Math.max(1_000, Math.floor(ttlMs))}`,
     {},
@@ -3237,7 +3236,10 @@ export async function waitForWorkerpalCapacity(opts: {
   const deadline = Date.now() + Math.max(1_000, opts.timeoutMs);
   let lastObservedOnline = 0;
   while (Date.now() < deadline) {
-    const workers = await (opts.fetchWorkersFn ?? fetchWorkerStatusRows)(opts.serverUrl, opts.ttlMs);
+    const workers = await (opts.fetchWorkersFn ?? fetchWorkerStatusRows)(
+      opts.serverUrl,
+      opts.ttlMs,
+    );
     const summary = summarizeWorkerStatusRows(workers);
     if (summary.onlineWorkers > 0) {
       lastObservedOnline = Math.max(lastObservedOnline, summary.onlineWorkers);
@@ -3293,10 +3295,7 @@ async function fetchJsonWithTimeout<T>(
   }
 }
 
-function buildClientTransportQuery(
-  cursor: number,
-  client: ClientStreamIdentity,
-): string {
+function buildClientTransportQuery(cursor: number, client: ClientStreamIdentity): string {
   const params = new URLSearchParams();
   if (cursor > 0) params.set("after", String(cursor));
   params.set("clientId", client.clientId);
@@ -3316,9 +3315,7 @@ function createRuntimeClientId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function probeLocalBuddy(
-  localAgentUrl: string,
-): Promise<LocalBuddyHealth | null> {
+async function probeLocalBuddy(localAgentUrl: string): Promise<LocalBuddyHealth | null> {
   return await fetchJsonWithTimeout<LocalBuddyHealth>(
     `${localAgentUrl}/healthz`,
     {},
@@ -3391,7 +3388,8 @@ async function autoStartRuntimeServices(opts: {
   const runtimeRoot = opts.preparedRuntime.runtimeRoot;
   const runtimeTag =
     opts.preparedRuntime.runtimeTag || (await resolveRuntimeReleaseTag(opts.requestedRuntimeTag));
-  const startLocalBuddy = opts.startLocalBuddy ?? Boolean(runtimePreflight.config.localbuddy.enabled);
+  const startLocalBuddy =
+    opts.startLocalBuddy ?? Boolean(runtimePreflight.config.localbuddy.enabled);
   const localBuddyEnabled = startLocalBuddy;
 
   console.log(`[pushpals] Runtime unavailable. Auto-starting runtime for repo: ${opts.repoRoot}`);
@@ -3432,11 +3430,7 @@ async function autoStartRuntimeServices(opts: {
     typeof runtimeEnv.PUSHPALS_GIT_BIN === "string" && runtimeEnv.PUSHPALS_GIT_BIN.trim()
       ? runtimeEnv.PUSHPALS_GIT_BIN.trim()
       : "git";
-  const resolvedGitBinary = await resolveCommandPath(
-    gitLookupCommand,
-    opts.repoRoot,
-    runtimeEnv,
-  );
+  const resolvedGitBinary = await resolveCommandPath(gitLookupCommand, opts.repoRoot, runtimeEnv);
   if (resolvedGitBinary) {
     applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, resolvedGitBinary);
   }
@@ -3455,10 +3449,7 @@ async function autoStartRuntimeServices(opts: {
       status,
     });
   };
-  const emitStartupTimingSummary = (
-    outcome: "ready" | "failed",
-    detail?: string,
-  ): void => {
+  const emitStartupTimingSummary = (outcome: "ready" | "failed", detail?: string): void => {
     const summary = formatRuntimeStartupTimingSummary({
       outcome,
       totalDurationMs: Date.now() - startupStartedAt,
@@ -3629,10 +3620,7 @@ async function autoStartRuntimeServices(opts: {
         `embedded workerpal readiness probe did not find idle capacity within ${workerpalReadinessProbeTimeoutMs}ms ` +
         `(${workerpalCapacity.detail}); continuing startup while WorkerPal warmup finishes in the background.`;
       console.warn(`[pushpals] ${startupProbeWarning}`);
-      appendRuntimeServicesLogLine(
-        runtimeServicesLogPath,
-        `[pushpals] ${startupProbeWarning}`,
-      );
+      appendRuntimeServicesLogLine(runtimeServicesLogPath, `[pushpals] ${startupProbeWarning}`);
       recordStartupPhase("workerpal", workerpalPhaseStartedAt, "deferred");
     } else {
       console.log(`[pushpals] Embedded WorkerPal capacity is ready (${workerpalCapacity.detail}).`);
@@ -3737,15 +3725,15 @@ async function autoStartRuntimeServices(opts: {
           continue;
         }
         const tail = readLogTail(service.logPath);
-          appendRuntimeServicesLogLine(
-            runtimeServicesLogPath,
-            `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}).`,
-          );
-          recordStartupPhase("readiness", readinessPhaseStartedAt, "failed");
-          emitStartupTimingSummary("failed", `${service.name} exited during startup`);
-          stopRuntimeServices(services);
-          throw new Error(
-            `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}). ` +
+        appendRuntimeServicesLogLine(
+          runtimeServicesLogPath,
+          `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}).`,
+        );
+        recordStartupPhase("readiness", readinessPhaseStartedAt, "failed");
+        emitStartupTimingSummary("failed", `${service.name} exited during startup`);
+        stopRuntimeServices(services);
+        throw new Error(
+          `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}). ` +
             `See ${service.logPath}${tail ? `\n--- ${service.name} log tail ---\n${tail}` : ""}`,
         );
       }
@@ -3798,10 +3786,7 @@ async function autoStartRuntimeServices(opts: {
       console.log("[pushpals] Embedded runtime is ready.");
       recordStartupPhase("readiness", readinessPhaseStartedAt, "ready");
       emitStartupTimingSummary("ready");
-      appendRuntimeServicesLogLine(
-        runtimeServicesLogPath,
-        "[pushpals] embedded runtime is ready.",
-      );
+      appendRuntimeServicesLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.");
       return {
         services,
         pushpalsLogPath: runtimeServicesLogPath,
@@ -4142,10 +4127,7 @@ export function buildEmbeddedMonitoringHubHtml(opts: {
 </html>`;
 }
 
-async function proxyMonitoringHubRequest(
-  serverUrl: string,
-  pathValue: string,
-): Promise<Response> {
+async function proxyMonitoringHubRequest(serverUrl: string, pathValue: string): Promise<Response> {
   const target = `${serverUrl}${pathValue}`;
   const upstream = await fetchWithTimeout(target, {}, 10_000);
   const body = await upstream.text();
@@ -4353,13 +4335,23 @@ export function formatSessionEventLine(
 function buildSessionEventReplayFingerprint(
   event: NonNullable<SessionStreamPayload["envelope"]>,
 ): { source: string; fingerprint: string } | null {
-  const type = String(event.type ?? "").trim().toLowerCase();
+  const type = String(event.type ?? "")
+    .trim()
+    .toLowerCase();
   if (type !== "status") return null;
   const payload = event.payload ?? {};
-  const source = String(event.from ?? payload.agentId ?? "status").trim().toLowerCase();
-  const state = String(payload.state ?? "").trim().toLowerCase();
-  const detail = String(payload.detail ?? "").trim().toLowerCase();
-  const message = String(payload.message ?? "").trim().toLowerCase();
+  const source = String(event.from ?? payload.agentId ?? "status")
+    .trim()
+    .toLowerCase();
+  const state = String(payload.state ?? "")
+    .trim()
+    .toLowerCase();
+  const detail = String(payload.detail ?? "")
+    .trim()
+    .toLowerCase();
+  const message = String(payload.message ?? "")
+    .trim()
+    .toLowerCase();
   return {
     source,
     fingerprint: `${type}:${source}:${state}:${detail}:${message}`,
@@ -4484,8 +4476,15 @@ async function openMonitoringHub(url: string): Promise<boolean> {
 }
 
 export function isCliExitCommand(text: string): boolean {
-  const normalized = String(text ?? "").trim().toLowerCase();
-  return normalized === "/exit" || normalized === "/quit" || normalized === "exit" || normalized === "quit";
+  const normalized = String(text ?? "")
+    .trim()
+    .toLowerCase();
+  return (
+    normalized === "/exit" ||
+    normalized === "/quit" ||
+    normalized === "exit" ||
+    normalized === "quit"
+  );
 }
 
 async function main(): Promise<void> {
@@ -4645,7 +4644,9 @@ async function main(): Promise<void> {
       env: workerpalDockerPrecheck.env,
     });
     if (!cleanup.ok) {
-      console.warn(`[pushpals] WorkerPal warm-container cleanup warning (${phase}): ${cleanup.detail}`);
+      console.warn(
+        `[pushpals] WorkerPal warm-container cleanup warning (${phase}): ${cleanup.detail}`,
+      );
       return;
     }
     if (cleanup.removed > 0) {
@@ -4826,7 +4827,9 @@ async function main(): Promise<void> {
     } else if (parsed.noAutoStart) {
       console.error("[pushpals] Auto-start is disabled (--no-auto-start).");
     } else {
-      console.error("[pushpals] Auto-start could not bring the embedded runtime into a usable state.");
+      console.error(
+        "[pushpals] Auto-start could not bring the embedded runtime into a usable state.",
+      );
     }
     process.exit(1);
   }
@@ -4843,9 +4846,7 @@ async function main(): Promise<void> {
       "[pushpals] Continuing startup; WorkerPal warmup may still be in progress and first task dispatch can be delayed.",
     );
     if (workerpalDockerPrecheck.status === "failed") {
-      console.warn(
-        `[pushpals] Docker precheck detail: ${workerpalDockerPrecheck.detail}`,
-      );
+      console.warn(`[pushpals] Docker precheck detail: ${workerpalDockerPrecheck.detail}`);
     } else if (serverWasAlreadyHealthy) {
       console.warn(
         "[pushpals] A PushPals runtime is already serving this repo, but it does not currently have an idle WorkerPal available.",
@@ -4877,7 +4878,8 @@ async function main(): Promise<void> {
         };
   const saved = statePath ? readCliState(statePath) : {};
   pushpalsLogPath =
-    pushpalsLogPath || (typeof saved.pushpalsLogPath === "string" ? saved.pushpalsLogPath : undefined);
+    pushpalsLogPath ||
+    (typeof saved.pushpalsLogPath === "string" ? saved.pushpalsLogPath : undefined);
   const preferredHubUrl = normalizeUrl(
     parsed.monitoringHubUrl ?? process.env.PUSHPALS_MONITOR_URL ?? saved.monitoringHubUrl ?? "",
   );
@@ -4940,14 +4942,8 @@ async function main(): Promise<void> {
   const streamTask = parsed.noStream
     ? Promise.resolve()
     : parsed.runtimeOnly
-    ? Promise.resolve()
-    : runSessionStream(
-        serverUrl,
-        activeSessionId,
-        cliClient,
-        printIncoming,
-        streamAbort.signal,
-      );
+      ? Promise.resolve()
+      : runSessionStream(serverUrl, activeSessionId, cliClient, printIncoming, streamAbort.signal);
 
   let stopPromise: Promise<void> | null = null;
   const requestStop = (): Promise<void> => {
@@ -4982,7 +4978,9 @@ async function main(): Promise<void> {
   });
 
   if (parsed.runtimeOnly) {
-    console.log("[pushpals] Runtime-only mode is active. Send `exit` on stdin or terminate the process to stop.");
+    console.log(
+      "[pushpals] Runtime-only mode is active. Send `exit` on stdin or terminate the process to stop.",
+    );
 
     await new Promise<void>((resolveStop) => {
       let resolved = false;

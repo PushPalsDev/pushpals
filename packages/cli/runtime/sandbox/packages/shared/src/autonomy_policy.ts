@@ -263,8 +263,9 @@ export function globBreadthScore(glob: string): number {
   const rootWide = /^[\*]/.test(glob) || glob.startsWith("**/") ? 1 : 0;
   const literalSegments = glob
     .split("/")
-    .filter((segment) => segment.length > 0 && !segment.includes("*") && !segment.includes("?"))
-    .length;
+    .filter(
+      (segment) => segment.length > 0 && !segment.includes("*") && !segment.includes("?"),
+    ).length;
   const shallowPenalty = Math.max(0, 2 - Math.min(literalSegments, 2));
   return 4 * hasGlobStar + 2 * rootWide + Math.min(4, wildcardCount) + shallowPenalty;
 }
@@ -343,7 +344,11 @@ export function validateScopeInvariants(
       errors.push(`write_glob outside component root: ${normalized}`);
       continue;
     }
-    if (!normalizedTargetPaths.some((targetPath) => targetPath === prefix || targetPath.startsWith(`${prefix}/`))) {
+    if (
+      !normalizedTargetPaths.some(
+        (targetPath) => targetPath === prefix || targetPath.startsWith(`${prefix}/`),
+      )
+    ) {
       errors.push(`write_glob prefix does not align with target_paths: ${normalized}`);
       continue;
     }

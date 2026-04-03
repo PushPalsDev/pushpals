@@ -50,6 +50,6 @@ describe("formatCommandForLog", () => {
       formatCommandForLog("taskkill", ["/PID", "123", "/T", "/F"]),
       "taskkill /PID 123 /T /F",
     );
-    assert.equal(formatCommandForLog("echo", ["hello world"]), "echo \"hello world\"");
+    assert.equal(formatCommandForLog("echo", ["hello world"]), 'echo "hello world"');
   });
 });

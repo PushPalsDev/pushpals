@@ -155,15 +155,13 @@ describe("workerpals docker executor internals", () => {
 
   test("execute decrements activeJobs when base ref resolution fails", async () => {
     const executor = createExecutor() as unknown as {
-      execute: (
-        job: {
-          id: string;
-          taskId: string;
-          kind: string;
-          params: Record<string, unknown>;
-          sessionId: string;
-        },
-      ) => Promise<unknown>;
+      execute: (job: {
+        id: string;
+        taskId: string;
+        kind: string;
+        params: Record<string, unknown>;
+        sessionId: string;
+      }) => Promise<unknown>;
       activeJobs: number;
       resolveWorktreeBaseRefForJob: () => Promise<string>;
       removeWorktree: () => Promise<void>;
@@ -188,15 +186,13 @@ describe("workerpals docker executor internals", () => {
 
   test("rebuilds Docker image only for merge-conflict jobs", async () => {
     const executor = createExecutor() as unknown as {
-      execute: (
-        job: {
-          id: string;
-          taskId: string;
-          kind: string;
-          params: Record<string, unknown>;
-          sessionId: string;
-        },
-      ) => Promise<{ ok: boolean; summary: string }>;
+      execute: (job: {
+        id: string;
+        taskId: string;
+        kind: string;
+        params: Record<string, unknown>;
+        sessionId: string;
+      }) => Promise<{ ok: boolean; summary: string }>;
       rebuildImageForMergeConflictJob: () => Promise<void>;
       resolveWorktreeBaseRefForJob: () => Promise<string>;
       createWorktree: () => Promise<void>;

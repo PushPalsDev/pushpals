@@ -65,16 +65,19 @@ describe("runtime config snapshot script", () => {
       "utf8",
     );
 
-    const proc = Bun.spawn([bunExecPath, "run", resolve(repoRoot, "scripts/runtime_config_snapshot.ts")], {
-      cwd: root,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...process.env,
-        LOCALBUDDY_ENABLED: "false",
-        LOCAL_AGENT_PORT: "3003",
+    const proc = Bun.spawn(
+      [bunExecPath, "run", resolve(repoRoot, "scripts/runtime_config_snapshot.ts")],
+      {
+        cwd: root,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          LOCALBUDDY_ENABLED: "false",
+          LOCAL_AGENT_PORT: "3003",
+        },
       },
-    });
+    );
 
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),

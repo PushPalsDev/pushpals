@@ -84,7 +84,9 @@ describe("server JobQueue PR URL persistence", () => {
       ).toBe(true);
 
       const before = queue.listWorkerPrBacklog();
-      const prBefore = before.find((entry) => entry.prUrl === "https://github.com/org/repo/pull/99");
+      const prBefore = before.find(
+        (entry) => entry.prUrl === "https://github.com/org/repo/pull/99",
+      );
       expect(prBefore?.mergeState).toBe("open_unmerged");
       expect(queue.countOpenUnmergedWorkerPrs()).toBe(1);
 

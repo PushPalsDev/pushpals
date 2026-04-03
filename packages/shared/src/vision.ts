@@ -40,7 +40,9 @@ export type VisionDocValidation = {
 const MAX_KEY_ITEMS_PER_BUCKET = 8;
 
 function toLines(markdown: string): string[] {
-  return String(markdown ?? "").replace(/\r\n/g, "\n").split("\n");
+  return String(markdown ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n");
 }
 
 function extractOneSentence(lines: string[]): string {
@@ -75,7 +77,9 @@ function extractOneSentence(lines: string[]): string {
 }
 
 function normalizeItem(value: string): string {
-  return String(value ?? "").replace(/\s+/g, " ").trim();
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function dedupeAndClamp(values: string[]): string[] {

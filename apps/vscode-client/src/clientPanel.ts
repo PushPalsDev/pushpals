@@ -213,7 +213,9 @@ export class PushPalsClientPanel implements vscode.Disposable {
     if (!this.reconnectEnabled || this.reconnectTimer) return;
     const delayMs = reconnectDelayMs(this.reconnectAttempt);
     this.reconnectAttempt += 1;
-    this.output.appendLine(`[client] scheduling reconnect in ${delayMs}ms (attempt ${this.reconnectAttempt})`);
+    this.output.appendLine(
+      `[client] scheduling reconnect in ${delayMs}ms (attempt ${this.reconnectAttempt})`,
+    );
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       void this.bootstrapConnection().catch((err) => this.handleBootstrapFailure(err, "auto"));
@@ -357,8 +359,9 @@ export class PushPalsClientPanel implements vscode.Disposable {
     repoRoot: string;
   } {
     const version =
-      String((this.context.extension.packageJSON as { version?: string } | undefined)?.version ?? "").trim() ||
-      "unknown";
+      String(
+        (this.context.extension.packageJSON as { version?: string } | undefined)?.version ?? "",
+      ).trim() || "unknown";
     return {
       clientId: `vscode-${this.sessionId}`,
       kind: "vscode",

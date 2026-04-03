@@ -14,7 +14,7 @@ function isGitSpawnPermissionDenied(error: unknown): boolean {
   return (
     code === "EPERM" &&
     message.includes("uv_spawn") &&
-    (message.includes("'git'") || message.includes("\"git\""))
+    (message.includes("'git'") || message.includes('"git"'))
   );
 }
 
@@ -74,84 +74,104 @@ describe("workerpals rebase sync", () => {
       const maintainer = join(root, "maintainer");
       const worker = join(root, "worker");
       const branch = "agent/workerpal-test/job-branch";
-    const file = "apps/localbuddy/tests/request_status.test.ts";
-    const hiddenRef = "refs/pushpals/agent/workerpal-test/job-123";
+      const file = "apps/localbuddy/tests/request_status.test.ts";
+      const hiddenRef = "refs/pushpals/agent/workerpal-test/job-123";
 
-    try {
-      await mustGit(root, ["init", "--bare", remote], "init bare remote");
-      await mustGit(root, ["clone", remote, maintainer], "clone maintainer");
-      await mustGit(root, ["clone", remote, worker], "clone worker");
+      try {
+        await mustGit(root, ["init", "--bare", remote], "init bare remote");
+        await mustGit(root, ["clone", remote, maintainer], "clone maintainer");
+        await mustGit(root, ["clone", remote, worker], "clone worker");
 
-      await mustGit(maintainer, ["config", "user.name", "PushPals Test"], "set maintainer name");
-      await mustGit(
-        maintainer,
-        ["config", "user.email", "pushpals-test@example.com"],
-        "set maintainer email",
-      );
-      await mustGit(worker, ["config", "user.name", "PushPals Worker"], "set worker name");
-      await mustGit(
-        worker,
-        ["config", "user.email", "pushpals-worker@example.com"],
-        "set worker email",
-      );
+        await mustGit(maintainer, ["config", "user.name", "PushPals Test"], "set maintainer name");
+        await mustGit(
+          maintainer,
+          ["config", "user.email", "pushpals-test@example.com"],
+          "set maintainer email",
+        );
+        await mustGit(worker, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          worker,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
 
-      mkdirSync(join(maintainer, "apps", "localbuddy", "tests"), { recursive: true });
-      writeFileSync(join(maintainer, file), "status: base\n", "utf8");
-      await mustGit(maintainer, ["add", "-A"], "stage base");
-      await mustGit(maintainer, ["commit", "-m", "base"], "commit base");
-      await mustGit(
-        maintainer,
-        ["push", "origin", `HEAD:refs/heads/${branch}`],
-        "push base branch",
-      );
+        mkdirSync(join(maintainer, "apps", "localbuddy", "tests"), { recursive: true });
+        writeFileSync(join(maintainer, file), "status: base\n", "utf8");
+        await mustGit(maintainer, ["add", "-A"], "stage base");
+        await mustGit(maintainer, ["commit", "-m", "base"], "commit base");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push base branch",
+        );
 
-      await mustGit(worker, ["fetch", "origin", branch], "worker fetch");
-      await mustGit(worker, ["checkout", "-B", branch, `origin/${branch}`], "worker checkout");
+        await mustGit(worker, ["fetch", "origin", branch], "worker fetch");
+        await mustGit(worker, ["checkout", "-B", branch, `origin/${branch}`], "worker checkout");
 
-      writeFileSync(join(worker, file), "status: worker\n", "utf8");
-      await mustGit(worker, ["add", "-A"], "stage worker commit");
-      await mustGit(worker, ["commit", "-m", "worker change"], "worker commit");
-      const workerSha = await mustGit(worker, ["rev-parse", "HEAD"], "worker sha");
-      await mustGit(worker, ["update-ref", hiddenRef, workerSha], "update hidden ref");
-      mkdirSync(join(worker, "workspace"), { recursive: true });
-      writeFileSync(join(worker, "workspace", "should-stay-untracked.txt"), "transient\n", "utf8");
+        writeFileSync(join(worker, file), "status: worker\n", "utf8");
+        await mustGit(worker, ["add", "-A"], "stage worker commit");
+        await mustGit(worker, ["commit", "-m", "worker change"], "worker commit");
+        const workerSha = await mustGit(worker, ["rev-parse", "HEAD"], "worker sha");
+        await mustGit(worker, ["update-ref", hiddenRef, workerSha], "update hidden ref");
+        mkdirSync(join(worker, "workspace"), { recursive: true });
+        writeFileSync(
+          join(worker, "workspace", "should-stay-untracked.txt"),
+          "transient\n",
+          "utf8",
+        );
 
-      await mustGit(maintainer, ["checkout", "-B", branch, `origin/${branch}`], "maintainer checkout");
-      writeFileSync(join(maintainer, file), "status: remote\n", "utf8");
-      await mustGit(maintainer, ["add", "-A"], "stage remote commit");
-      await mustGit(maintainer, ["commit", "-m", "remote change"], "remote commit");
-      await mustGit(maintainer, ["push", "origin", `HEAD:refs/heads/${branch}`], "push remote change");
+        await mustGit(
+          maintainer,
+          ["checkout", "-B", branch, `origin/${branch}`],
+          "maintainer checkout",
+        );
+        writeFileSync(join(maintainer, file), "status: remote\n", "utf8");
+        await mustGit(maintainer, ["add", "-A"], "stage remote commit");
+        await mustGit(maintainer, ["commit", "-m", "remote change"], "remote commit");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push remote change",
+        );
 
-      const sync = await syncHiddenRefWithRemoteBranchByRebase(
-        worker,
-        hiddenRef,
-        branch,
-        "job-12345678",
-      );
-      expect(sync.ok).toBe(true);
-      if (!sync.ok) {
-        throw new Error(sync.error);
+        const sync = await syncHiddenRefWithRemoteBranchByRebase(
+          worker,
+          hiddenRef,
+          branch,
+          "job-12345678",
+        );
+        expect(sync.ok).toBe(true);
+        if (!sync.ok) {
+          throw new Error(sync.error);
+        }
+
+        const resolvedSha = await mustGit(
+          worker,
+          ["rev-parse", hiddenRef],
+          "resolved hidden ref sha",
+        );
+        expect(resolvedSha).toBe(sync.sha);
+        const resolvedFile = await mustGit(
+          worker,
+          ["show", `${sync.sha}:${file}`],
+          "show resolved file",
+        );
+        expect(resolvedFile).toContain("status: worker");
+        const transientLookup = await git(worker, [
+          "show",
+          `${sync.sha}:workspace/should-stay-untracked.txt`,
+        ]);
+        expect(transientLookup.ok).toBe(false);
+
+        const rebaseTempBranches = await mustGit(
+          worker,
+          ["branch", "--list", "_pushpals/rebase-*"],
+          "list temp rebase branches",
+        );
+        expect(rebaseTempBranches).toBe("");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
       }
-
-      const resolvedSha = await mustGit(worker, ["rev-parse", hiddenRef], "resolved hidden ref sha");
-      expect(resolvedSha).toBe(sync.sha);
-      const resolvedFile = await mustGit(worker, ["show", `${sync.sha}:${file}`], "show resolved file");
-      expect(resolvedFile).toContain("status: worker");
-      const transientLookup = await git(worker, [
-        "show",
-        `${sync.sha}:workspace/should-stay-untracked.txt`,
-      ]);
-      expect(transientLookup.ok).toBe(false);
-
-      const rebaseTempBranches = await mustGit(
-        worker,
-        ["branch", "--list", "_pushpals/rebase-*"],
-        "list temp rebase branches",
-      );
-      expect(rebaseTempBranches).toBe("");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
     },
   );
 });

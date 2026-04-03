@@ -132,21 +132,13 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
     writeFileSync(
       join(configDir, "default.toml"),
-      [
-        'profile = "dev"',
-        "",
-        "[workerpals]",
-        "quality_critic_min_score = 8.0",
-      ].join("\n"),
+      ['profile = "dev"', "", "[workerpals]", "quality_critic_min_score = 8.0"].join("\n"),
       "utf8",
     );
 
     writeFileSync(
       join(configDir, "local.example.toml"),
-      [
-        "[workerpals]",
-        "quality_critic_min_score = 7.5",
-      ].join("\n"),
+      ["[workerpals]", "quality_critic_min_score = 7.5"].join("\n"),
       "utf8",
     );
 
@@ -165,30 +157,19 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
     writeFileSync(
       join(configDir, "default.toml"),
-      [
-        'profile = "dev"',
-        "",
-        "[workerpals]",
-        "quality_critic_min_score = 8.0",
-      ].join("\n"),
+      ['profile = "dev"', "", "[workerpals]", "quality_critic_min_score = 8.0"].join("\n"),
       "utf8",
     );
 
     writeFileSync(
       join(configDir, "local.example.toml"),
-      [
-        "[workerpals]",
-        "quality_critic_min_score = 7.5",
-      ].join("\n"),
+      ["[workerpals]", "quality_critic_min_score = 7.5"].join("\n"),
       "utf8",
     );
 
     writeFileSync(
       join(configDir, "local.toml"),
-      [
-        "[workerpals]",
-        "quality_critic_min_score = 8.8",
-      ].join("\n"),
+      ["[workerpals]", "quality_critic_min_score = 8.8"].join("\n"),
       "utf8",
     );
 
@@ -207,30 +188,19 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
     writeFileSync(
       join(configDir, "default.toml"),
-      [
-        'profile = "dev"',
-        "",
-        "[workerpals]",
-        "quality_critic_min_score = 8.0",
-      ].join("\n"),
+      ['profile = "dev"', "", "[workerpals]", "quality_critic_min_score = 8.0"].join("\n"),
       "utf8",
     );
 
     writeFileSync(
       join(configDir, "local.example.toml"),
-      [
-        "[workerpals]",
-        "quality_critic_min_score = 7.5",
-      ].join("\n"),
+      ["[workerpals]", "quality_critic_min_score = 7.5"].join("\n"),
       "utf8",
     );
 
     writeFileSync(
       join(configDir, "local.toml"),
-      [
-        "[workerpals]",
-        "quality_critic_min_score = 8.8",
-      ].join("\n"),
+      ["[workerpals]", "quality_critic_min_score = 8.8"].join("\n"),
       "utf8",
     );
 

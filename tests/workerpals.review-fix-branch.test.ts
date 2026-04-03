@@ -6,7 +6,10 @@ import {
 
 describe("workerpals review fix completion branch resolution", () => {
   test("uses ReviewAgent-provided PR head branch when valid", () => {
-    const resolved = resolveReviewFixCompletionBranch("refs/heads/agent/workerpal-1/job-abc", "agent/default");
+    const resolved = resolveReviewFixCompletionBranch(
+      "refs/heads/agent/workerpal-1/job-abc",
+      "agent/default",
+    );
     expect(resolved).toEqual({
       branch: "agent/workerpal-1/job-abc",
       overridden: true,

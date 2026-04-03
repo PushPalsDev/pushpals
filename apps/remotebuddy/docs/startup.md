@@ -16,14 +16,14 @@ safe and auditable.
 
 ## High-level flow (15 minute target)
 
-| Minute | Owner | Action | Evidence to capture |
-| --- | --- | --- | --- |
-| 0 | Platform on-call | Confirm repo state + config parity (`git status`, `configs/*.toml`). | Screenshot or paste of clean diff summary. |
-| 2 | Server on-call | Start Server + WorkerPals lanes; watch `/system/status`. | `curl .../system/status` JSON snippet with worker idle counts. |
-| 5 | RemoteBuddy on-call | Launch RemoteBuddy process with `PUSHPALS_AUTH_TOKEN` loaded. | Process log tail sent to `#pushpals-ops`. |
-| 7 | Platform on-call | Perform telemetry gates (table below). | Grafana snapshot + Alertmanager screenshot. |
-| 10 | RemoteBuddy on-call | Run verification RPC + synthetic end-to-end request. | `request_id` link + resulting transcript. |
-| 13 | Platform on-call | Announce green state or rollback trigger with explicit timestamps. | Thread update referencing evidence artifacts. |
+| Minute | Owner               | Action                                                               | Evidence to capture                                            |
+| ------ | ------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------- |
+| 0      | Platform on-call    | Confirm repo state + config parity (`git status`, `configs/*.toml`). | Screenshot or paste of clean diff summary.                     |
+| 2      | Server on-call      | Start Server + WorkerPals lanes; watch `/system/status`.             | `curl .../system/status` JSON snippet with worker idle counts. |
+| 5      | RemoteBuddy on-call | Launch RemoteBuddy process with `PUSHPALS_AUTH_TOKEN` loaded.        | Process log tail sent to `#pushpals-ops`.                      |
+| 7      | Platform on-call    | Perform telemetry gates (table below).                               | Grafana snapshot + Alertmanager screenshot.                    |
+| 10     | RemoteBuddy on-call | Run verification RPC + synthetic end-to-end request.                 | `request_id` link + resulting transcript.                      |
+| 13     | Platform on-call    | Announce green state or rollback trigger with explicit timestamps.   | Thread update referencing evidence artifacts.                  |
 
 Always attach the captured evidence to your PagerDuty incident or the on-call log so the next
 startup can reference a single source of truth.
@@ -53,13 +53,13 @@ startup can reference a single source of truth.
 
 ## Telemetry gates (block startup if any fail)
 
-| Signal | Pass criteria | Source or command | Rollback / block trigger |
-| --- | --- | --- | --- |
-| Remote queue latency `queue_p95` (interactive, 5 min) | ≤ 0.65 s while traffic ≤ 35 RPS. | Grafana › RemoteBuddy Queue Overview › `queue_p95`. | ≥ 0.8 s for 5 min or upward trend immediately after RemoteBuddy launch. Roll back to previous build or pause RemoteBuddy start. |
-| Pending interactive requests | < 10 steady; zero monotonic growth. | `/system/status` → `queues.requests.pending`. | ≥ 15 pending with flat traffic: stop RemoteBuddy and re-check WorkerPals allocation. |
-| Worker idle slots | ≥ 3 per lane; no `busy` workers > queue budget. | Worker Backends Latency dashboard + `/system/status.workers`. | ≤ 1 idle slot for 3 polls: tear down RemoteBuddy, scale WorkerPals up, retry. |
-| Synthetic probe `probe.remote_startup` | < 700 ms, 0 drops in 10 samples. | Grafana › Synthetic Probes › `probe.remote_startup`. | ≥ 850 ms or probe failures: roll back RemoteBuddy or mute traffic sources. |
-| Alertmanager `remote-*` group | No active warning/page alerts. | Alertmanager quick view filtered by `remote`. | Any warning still firing after dependency start: block startup until cleared. |
+| Signal                                                | Pass criteria                                   | Source or command                                             | Rollback / block trigger                                                                                                        |
+| ----------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Remote queue latency `queue_p95` (interactive, 5 min) | ≤ 0.65 s while traffic ≤ 35 RPS.                | Grafana › RemoteBuddy Queue Overview › `queue_p95`.           | ≥ 0.8 s for 5 min or upward trend immediately after RemoteBuddy launch. Roll back to previous build or pause RemoteBuddy start. |
+| Pending interactive requests                          | < 10 steady; zero monotonic growth.             | `/system/status` → `queues.requests.pending`.                 | ≥ 15 pending with flat traffic: stop RemoteBuddy and re-check WorkerPals allocation.                                            |
+| Worker idle slots                                     | ≥ 3 per lane; no `busy` workers > queue budget. | Worker Backends Latency dashboard + `/system/status.workers`. | ≤ 1 idle slot for 3 polls: tear down RemoteBuddy, scale WorkerPals up, retry.                                                   |
+| Synthetic probe `probe.remote_startup`                | < 700 ms, 0 drops in 10 samples.                | Grafana › Synthetic Probes › `probe.remote_startup`.          | ≥ 850 ms or probe failures: roll back RemoteBuddy or mute traffic sources.                                                      |
+| Alertmanager `remote-*` group                         | No active warning/page alerts.                  | Alertmanager quick view filtered by `remote`.                 | Any warning still firing after dependency start: block startup until cleared.                                                   |
 
 Record each check with timestamp, screenshot link, and the PromQL/command you used. Without stored
 evidence the preflight is considered incomplete.
@@ -73,6 +73,7 @@ evidence the preflight is considered incomplete.
      http://localhost:3001/requests/enqueue \
      -d '{"prompt":"startup smoke","priority":"interactive","metadata":{"source":"startup-preflight"}}'
    ```
+
    - Confirm response includes `requestId`.
    - Watch RemoteBuddy logs for the matching ID finishing with status `completed`.
 2. **Planner loop check**

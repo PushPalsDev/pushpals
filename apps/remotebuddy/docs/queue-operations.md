@@ -6,11 +6,11 @@ Use this reference whenever RemoteBuddy’s request queues drift from the ≤1.0
 
 ## Metric checkpoints
 
-| Signal | Healthy | Monitor band | Alert band | Prompt |
-| --- | --- | --- | --- | --- |
-| `queue_p95` (interactive lane, 15 min rollup) | ≤ 1.0 s | 1.0–1.5 s for ≥ 3 polls (~6 min) | ≥ 1.5 s for 5 min **or** ≥ 2.0 s for 2 polls | Validate backlog shape, idle workers, and worker recycle history. |
-| Pending interactive requests | < 10 per lane | 10–25 for ≥ 3 polls | ≥ 30 for ≥ 5 min | Pause background/eval submissions, prioritize interactive. |
-| `job_failure_rate` | ≤ 0.2 | 0.2–0.4 | ≥ 0.4 | Combine with queue metrics to determine severity; this doc focuses on the queue-only case. |
+| Signal                                        | Healthy       | Monitor band                     | Alert band                                   | Prompt                                                                                     |
+| --------------------------------------------- | ------------- | -------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `queue_p95` (interactive lane, 15 min rollup) | ≤ 1.0 s       | 1.0–1.5 s for ≥ 3 polls (~6 min) | ≥ 1.5 s for 5 min **or** ≥ 2.0 s for 2 polls | Validate backlog shape, idle workers, and worker recycle history.                          |
+| Pending interactive requests                  | < 10 per lane | 10–25 for ≥ 3 polls              | ≥ 30 for ≥ 5 min                             | Pause background/eval submissions, prioritize interactive.                                 |
+| `job_failure_rate`                            | ≤ 0.2         | 0.2–0.4                          | ≥ 0.4                                        | Combine with queue metrics to determine severity; this doc focuses on the queue-only case. |
 
 ## Elevated `queue_p95` with zero failures
 

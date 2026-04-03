@@ -18,10 +18,7 @@
     "instance_id": "pushpals.autonomy.config_readme_bundle.hard",
     "title": "Add quality-prioritization notes to config and README",
     "problem_statement": "Apply both updates exactly and keep all other content unchanged: 1) In configs/local.example.toml append the comment line '# Guardrail: keep autonomy write scope narrow, explicit, and auditable.' 2) In README.md append the bullet line '- Eval benchmarks prioritize correctness and code quality over raw speed.'",
-    "expected_paths": [
-      "configs/local.example.toml",
-      "README.md"
-    ],
+    "expected_paths": ["configs/local.example.toml", "README.md"],
     "must_contain": {
       "configs/local.example.toml": "(?m)^# Guardrail: keep autonomy write scope narrow, explicit, and auditable\\.$",
       "README.md": "(?m)^- Eval benchmarks prioritize correctness and code quality over raw speed\\.$"
@@ -33,9 +30,7 @@
     "instance_id": "pushpals.autonomy.scoring_clause.medium",
     "title": "Add explicit performance tradeoff guidance to scoring prompt",
     "problem_statement": "In prompts/remotebuddy/autonomy_scoring_system_prompt.md append exactly one bullet line '- Penalize latency only lightly when correctness and safety are strong.' and keep all other content unchanged.",
-    "expected_paths": [
-      "prompts/remotebuddy/autonomy_scoring_system_prompt.md"
-    ],
+    "expected_paths": ["prompts/remotebuddy/autonomy_scoring_system_prompt.md"],
     "must_contain": {
       "prompts/remotebuddy/autonomy_scoring_system_prompt.md": "(?m)^- Penalize latency only lightly when correctness and safety are strong\\.$"
     },

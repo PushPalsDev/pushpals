@@ -11,16 +11,14 @@ type InferFallbackValidationCommandsForTestTask =
   WorkerExecuteJobModule["inferFallbackValidationCommandsForTestTask"];
 
 type Equal<A, B> =
-  (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
-    ? (<T>() => T extends B ? 1 : 2) extends (<T>() => T extends A ? 1 : 2)
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+    ? (<T>() => T extends B ? 1 : 2) extends <T>() => T extends A ? 1 : 2
       ? true
       : false
     : false;
 type Assert<T extends true> = T;
 
-type WorkerTaskExecutePlanningContract = Parameters<
-  InferFallbackValidationCommandsForTestTask
->[2];
+type WorkerTaskExecutePlanningContract = Parameters<InferFallbackValidationCommandsForTestTask>[2];
 
 type WorkerRecentJobSummaryContract = {
   jobId: string;
@@ -89,17 +87,14 @@ type _WorkerRecentJobsRequired = Assert<
   TaskExecuteJobParams extends { recentJobs: WorkerRecentJobSummary[] } ? true : false
 >;
 type _WorkerRecentJobsRejectOptional = AssertFalse<
-  (
-    (Omit<BaseTaskExecuteJobParams, "recentJobs"> & {
-      recentJobs?: WorkerRecentJobSummary[];
-    }) &
-      { origin: "user" }
-  ) extends TaskExecuteJobParams
+  (Omit<BaseTaskExecuteJobParams, "recentJobs"> & {
+    recentJobs?: WorkerRecentJobSummary[];
+  }) & { origin: "user" } extends TaskExecuteJobParams
     ? true
     : false
 >;
 type _WorkerUserPayloadAssignable = Assert<
-  (BaseTaskExecuteJobParams & { origin: "user" }) extends Extract<
+  BaseTaskExecuteJobParams & { origin: "user" } extends Extract<
     TaskExecuteJobParams,
     { origin: "user" }
   >
@@ -107,28 +102,27 @@ type _WorkerUserPayloadAssignable = Assert<
     : false
 >;
 type _WorkerUserPayloadRejectsAutonomy = AssertFalse<
-  (
-    BaseTaskExecuteJobParams & { origin: "user"; autonomy: AutonomyJobMetadata }
-  ) extends TaskExecuteJobParams
+  BaseTaskExecuteJobParams & {
+    origin: "user";
+    autonomy: AutonomyJobMetadata;
+  } extends TaskExecuteJobParams
     ? true
     : false
 >;
 type _WorkerAutonomyPayloadAssignable = Assert<
-  (BaseTaskExecuteJobParams & {
+  BaseTaskExecuteJobParams & {
     origin: "autonomy";
     autonomy: AutonomyJobMetadata;
-  }) extends Extract<TaskExecuteJobParams, { origin: "autonomy" }>
+  } extends Extract<TaskExecuteJobParams, { origin: "autonomy" }>
     ? true
     : false
 >;
 type _WorkerAutonomyRequiresMetadata = AssertFalse<
-  (
-    Omit<BaseTaskExecuteJobParams, "recentJobs"> & {
-      origin: "autonomy";
-      autonomy?: undefined;
-      recentJobs: WorkerRecentJobSummary[];
-    }
-  ) extends TaskExecuteJobParams
+  Omit<BaseTaskExecuteJobParams, "recentJobs"> & {
+    origin: "autonomy";
+    autonomy?: undefined;
+    recentJobs: WorkerRecentJobSummary[];
+  } extends TaskExecuteJobParams
     ? true
     : false
 >;

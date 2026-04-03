@@ -206,7 +206,11 @@ export function SystemPane({
 
   const onlineWorkers = workers.filter((worker) => worker.isOnline).length;
   const recentEvents = useMemo(
-    () => events.filter((event) => shouldDisplayInteractiveSessionEvent(event)).slice(-40).reverse(),
+    () =>
+      events
+        .filter((event) => shouldDisplayInteractiveSessionEvent(event))
+        .slice(-40)
+        .reverse(),
     [events],
   );
   const requestSlo = systemSummary.slo?.requests;
@@ -216,7 +220,8 @@ export function SystemPane({
   const clientsSummary = systemSummary.clients;
   const autonomyOps = systemSummary.autonomy ?? autonomyInsights.opsSummary;
   const safety = autonomyOps?.safetyState ?? null;
-  const evaluator = autonomyOps?.latestEvaluatorScorecard ?? autonomyInsights.latestEvaluatorScorecard;
+  const evaluator =
+    autonomyOps?.latestEvaluatorScorecard ?? autonomyInsights.latestEvaluatorScorecard;
   const recentAlerts = autonomyOps?.recentAlerts ?? [];
   const trustedSources = autonomyInsights.trustedInspirationShortlist.slice(0, 6);
   const archivedSources = autonomyInsights.archivedInspirationSources.slice(0, 4);
@@ -232,14 +237,14 @@ export function SystemPane({
   ).length;
   const visibleQuestions = useMemo(
     () =>
-      [...autonomyQuestions]
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        .slice(0, 20),
+      [...autonomyQuestions].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20),
     [autonomyQuestions],
   );
   const llmUsageRows = useMemo(() => {
     const defaults = ["remotebuddy", "workerpals"];
-    const byService = new Map((llmUsage?.services ?? []).map((row) => [row.service.toLowerCase(), row]));
+    const byService = new Map(
+      (llmUsage?.services ?? []).map((row) => [row.service.toLowerCase(), row]),
+    );
     for (const service of defaults) {
       if (!byService.has(service)) {
         byService.set(service, {
@@ -260,10 +265,7 @@ export function SystemPane({
       return serviceLabel(a.service).localeCompare(serviceLabel(b.service));
     });
   }, [llmUsage]);
-  const clientRows = useMemo(
-    () => clientsSummary?.items ?? [],
-    [clientsSummary],
-  );
+  const clientRows = useMemo(() => clientsSummary?.items ?? [], [clientsSummary]);
   const hasLocalBuddyActivity = useMemo(() => {
     if (latestEventByComponent.LocalBuddy) return true;
     if (
@@ -428,7 +430,9 @@ export function SystemPane({
         <MetricTile
           title="System Uptime"
           value={formatUptime(runtimeSummary?.uptimeMs)}
-          detail={runtimeSummary?.startedAt ? `started ${prettyTs(runtimeSummary.startedAt)}` : "--"}
+          detail={
+            runtimeSummary?.startedAt ? `started ${prettyTs(runtimeSummary.startedAt)}` : "--"
+          }
           tone="accent"
           theme={theme}
         />
@@ -493,7 +497,8 @@ export function SystemPane({
         </Text>
         {llmUsage && llmUsage.estimatedCallCount > 0 ? (
           <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-            {llmUsage.estimatedCallCount} call{llmUsage.estimatedCallCount === 1 ? "" : "s"} using estimated token counts.
+            {llmUsage.estimatedCallCount} call{llmUsage.estimatedCallCount === 1 ? "" : "s"} using
+            estimated token counts.
           </Text>
         ) : null}
         <View style={styles.systemGrid}>
@@ -506,7 +511,9 @@ export function SystemPane({
               ]}
             >
               <View style={styles.rowBetween}>
-                <Text style={[styles.systemTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
+                <Text
+                  style={[styles.systemTitle, { color: theme.text, fontFamily: theme.fontSans }]}
+                >
                   {serviceLabel(row.service)}
                 </Text>
                 <Text
@@ -532,20 +539,37 @@ export function SystemPane({
               >
                 {formatTokenCount(row.totalTokens)}
               </Text>
-              <Text style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[
+                  styles.systemDetail,
+                  { color: theme.textMuted, fontFamily: theme.fontSans },
+                ]}
+              >
                 avg {formatTokenCount(row.avgTokensPerCall)} / call
               </Text>
-              <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+              >
                 {formatTokenCount(row.avgTokensPerHour)} / hour
               </Text>
-              <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
-                in {formatTokenCount(row.promptTokens)} | out {formatTokenCount(row.completionTokens)}
+              <Text
+                style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}
+              >
+                in {formatTokenCount(row.promptTokens)} | out{" "}
+                {formatTokenCount(row.completionTokens)}
               </Text>
-              <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+              >
                 {row.lastCallAt ? `last call ${relativeMs(row.lastCallAt)}` : "no usage recorded"}
               </Text>
               {row.estimatedCallCount > 0 ? (
-                <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                <Text
+                  style={[
+                    styles.systemMeta,
+                    { color: theme.textMuted, fontFamily: theme.fontSans },
+                  ]}
+                >
                   estimated {row.estimatedCallCount} call{row.estimatedCallCount === 1 ? "" : "s"}
                 </Text>
               ) : null}
@@ -577,10 +601,14 @@ export function SystemPane({
         ) : null}
         <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
           evaluator {evaluator?.recommendation ?? "unknown"} | success{" "}
-          {typeof evaluator?.successRate === "number" ? `${(evaluator.successRate * 100).toFixed(1)}%` : "--"} |
-          regret{" "}
-          {typeof evaluator?.regretRate === "number" ? `${(evaluator.regretRate * 100).toFixed(1)}%` : "--"} | samples{" "}
-          {evaluator?.sampleCount ?? 0}
+          {typeof evaluator?.successRate === "number"
+            ? `${(evaluator.successRate * 100).toFixed(1)}%`
+            : "--"}{" "}
+          | regret{" "}
+          {typeof evaluator?.regretRate === "number"
+            ? `${(evaluator.regretRate * 100).toFixed(1)}%`
+            : "--"}{" "}
+          | samples {evaluator?.sampleCount ?? 0}
         </Text>
         <View style={styles.safetyActionsRow}>
           <Pressable
@@ -588,7 +616,11 @@ export function SystemPane({
               styles.answerButton,
               {
                 borderColor: theme.border,
-                backgroundColor: autonomySafetyInFlight ? theme.panelAlt : safety?.killSwitchEnabled ? `${theme.warning}33` : theme.accentSoft,
+                backgroundColor: autonomySafetyInFlight
+                  ? theme.panelAlt
+                  : safety?.killSwitchEnabled
+                    ? `${theme.warning}33`
+                    : theme.accentSoft,
                 opacity: autonomySafetyInFlight ? 0.7 : 1,
               },
             ]}
@@ -599,7 +631,12 @@ export function SystemPane({
               });
             }}
           >
-            <Text style={[styles.answerButtonText, { color: theme.accentText, fontFamily: theme.fontSans }]}>
+            <Text
+              style={[
+                styles.answerButtonText,
+                { color: theme.accentText, fontFamily: theme.fontSans },
+              ]}
+            >
               {safety?.killSwitchEnabled ? "Disable Kill Switch" : "Enable Kill Switch"}
             </Text>
           </Pressable>
@@ -608,7 +645,11 @@ export function SystemPane({
               styles.answerButton,
               {
                 borderColor: theme.border,
-                backgroundColor: autonomySafetyInFlight ? theme.panelAlt : safety?.isFrozen ? `${theme.positive}22` : `${theme.warning}22`,
+                backgroundColor: autonomySafetyInFlight
+                  ? theme.panelAlt
+                  : safety?.isFrozen
+                    ? `${theme.positive}22`
+                    : `${theme.warning}22`,
                 opacity: autonomySafetyInFlight ? 0.7 : 1,
               },
             ]}
@@ -621,7 +662,12 @@ export function SystemPane({
               );
             }}
           >
-            <Text style={[styles.answerButtonText, { color: theme.accentText, fontFamily: theme.fontSans }]}>
+            <Text
+              style={[
+                styles.answerButtonText,
+                { color: theme.accentText, fontFamily: theme.fontSans },
+              ]}
+            >
               {safety?.isFrozen ? "Unfreeze" : "Freeze 30m"}
             </Text>
           </Pressable>
@@ -711,7 +757,9 @@ export function SystemPane({
           {clientKindsSummary}
         </Text>
         {clientRows.length === 0 ? (
-          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          <Text
+            style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+          >
             No client interfaces have registered yet.
           </Text>
         ) : (
@@ -732,7 +780,10 @@ export function SystemPane({
                 >
                   <View style={styles.rowBetween}>
                     <Text
-                      style={[styles.systemTitle, { color: theme.text, fontFamily: theme.fontSans }]}
+                      style={[
+                        styles.systemTitle,
+                        { color: theme.text, fontFamily: theme.fontSans },
+                      ]}
                     >
                       {client.label || client.kind}
                     </Text>
@@ -746,38 +797,56 @@ export function SystemPane({
                       ]}
                     >
                       <Text
-                        style={[styles.statusPillText, { color: clientTone, fontFamily: theme.fontSans }]}
+                        style={[
+                          styles.statusPillText,
+                          { color: clientTone, fontFamily: theme.fontSans },
+                        ]}
                       >
                         {client.status}
                       </Text>
                     </View>
                   </View>
                   <Text
-                    style={[styles.systemDetail, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                    style={[
+                      styles.systemDetail,
+                      { color: theme.textMuted, fontFamily: theme.fontSans },
+                    ]}
                   >
                     {client.kind} | session {client.sessionId}
                   </Text>
                   <Text
-                    style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}
+                    style={[
+                      styles.systemMeta,
+                      { color: theme.textMuted, fontFamily: theme.fontMono },
+                    ]}
                   >
                     {transportText}
                   </Text>
-                  {(client.version || client.platform) ? (
+                  {client.version || client.platform ? (
                     <Text
-                      style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                      style={[
+                        styles.systemMeta,
+                        { color: theme.textMuted, fontFamily: theme.fontSans },
+                      ]}
                     >
                       {[client.version, client.platform].filter(Boolean).join(" | ")}
                     </Text>
                   ) : null}
                   {client.repoRoot ? (
                     <Text
-                      style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                      style={[
+                        styles.systemMeta,
+                        { color: theme.textMuted, fontFamily: theme.fontSans },
+                      ]}
                     >
                       {clip(client.repoRoot, 120)}
                     </Text>
                   ) : null}
                   <Text
-                    style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                    style={[
+                      styles.systemMeta,
+                      { color: theme.textMuted, fontFamily: theme.fontSans },
+                    ]}
                   >
                     last seen {relativeMs(client.lastSeenAt)}
                   </Text>
@@ -801,25 +870,50 @@ export function SystemPane({
         </View>
         <View style={styles.insightColumns}>
           <View style={styles.insightCol}>
-            <Text style={[styles.insightSectionTitle, { color: theme.positive, fontFamily: theme.fontSans }]}>
+            <Text
+              style={[
+                styles.insightSectionTitle,
+                { color: theme.positive, fontFamily: theme.fontSans },
+              ]}
+            >
               Trusted Shortlist
             </Text>
             {trustedSources.length === 0 ? (
-              <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[
+                  styles.emptySubtitle,
+                  { color: theme.textMuted, fontFamily: theme.fontSans },
+                ]}
+              >
                 No trusted sources yet.
               </Text>
             ) : (
               trustedSources.map((row) => (
-                <View key={`trusted-${row.sourceKey}`} style={[styles.insightRow, { borderColor: theme.border }]}>
-                  <Text style={[styles.insightLabel, { color: theme.text, fontFamily: theme.fontSans }]}>
+                <View
+                  key={`trusted-${row.sourceKey}`}
+                  style={[styles.insightRow, { borderColor: theme.border }]}
+                >
+                  <Text
+                    style={[styles.insightLabel, { color: theme.text, fontFamily: theme.fontSans }]}
+                  >
                     {row.sourceLabel || row.algorithm}
                   </Text>
-                  <Text style={[styles.insightMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
-                    trust {row.trustScore.toFixed(2)} | fresh {row.freshnessScore.toFixed(2)} | samples{" "}
-                    {row.sampleCount}
+                  <Text
+                    style={[
+                      styles.insightMeta,
+                      { color: theme.textMuted, fontFamily: theme.fontMono },
+                    ]}
+                  >
+                    trust {row.trustScore.toFixed(2)} | fresh {row.freshnessScore.toFixed(2)} |
+                    samples {row.sampleCount}
                   </Text>
                   {row.curationReason ? (
-                    <Text style={[styles.insightReason, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                    <Text
+                      style={[
+                        styles.insightReason,
+                        { color: theme.textMuted, fontFamily: theme.fontSans },
+                      ]}
+                    >
                       {row.curationReason}
                     </Text>
                   ) : null}
@@ -828,25 +922,50 @@ export function SystemPane({
             )}
           </View>
           <View style={styles.insightCol}>
-            <Text style={[styles.insightSectionTitle, { color: theme.warning, fontFamily: theme.fontSans }]}>
+            <Text
+              style={[
+                styles.insightSectionTitle,
+                { color: theme.warning, fontFamily: theme.fontSans },
+              ]}
+            >
               Archived Sources
             </Text>
             {archivedSources.length === 0 ? (
-              <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+              <Text
+                style={[
+                  styles.emptySubtitle,
+                  { color: theme.textMuted, fontFamily: theme.fontSans },
+                ]}
+              >
                 No archived sources.
               </Text>
             ) : (
               archivedSources.map((row) => (
-                <View key={`archived-${row.sourceKey}`} style={[styles.insightRow, { borderColor: theme.border }]}>
-                  <Text style={[styles.insightLabel, { color: theme.text, fontFamily: theme.fontSans }]}>
+                <View
+                  key={`archived-${row.sourceKey}`}
+                  style={[styles.insightRow, { borderColor: theme.border }]}
+                >
+                  <Text
+                    style={[styles.insightLabel, { color: theme.text, fontFamily: theme.fontSans }]}
+                  >
                     {row.sourceLabel || row.algorithm}
                   </Text>
-                  <Text style={[styles.insightMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
-                    trust {row.trustScore.toFixed(2)} | fresh {row.freshnessScore.toFixed(2)} | samples{" "}
-                    {row.sampleCount}
+                  <Text
+                    style={[
+                      styles.insightMeta,
+                      { color: theme.textMuted, fontFamily: theme.fontMono },
+                    ]}
+                  >
+                    trust {row.trustScore.toFixed(2)} | fresh {row.freshnessScore.toFixed(2)} |
+                    samples {row.sampleCount}
                   </Text>
                   {row.curationReason ? (
-                    <Text style={[styles.insightReason, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+                    <Text
+                      style={[
+                        styles.insightReason,
+                        { color: theme.textMuted, fontFamily: theme.fontSans },
+                      ]}
+                    >
                       {row.curationReason}
                     </Text>
                   ) : null}
@@ -869,7 +988,9 @@ export function SystemPane({
           </Text>
         </View>
         {visibleQuestions.length === 0 ? (
-          <Text style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+          <Text
+            style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+          >
             No autonomy questions available yet.
           </Text>
         ) : (
@@ -898,14 +1019,23 @@ export function SystemPane({
                     if (!Number.isFinite(ms)) return null;
                     return Math.max(0, ms - Date.now());
                   })();
-            const isExpired = Boolean(question.isExpired) || (typeof expiresInMs === "number" && expiresInMs <= 0);
-            const expiringSoon = !isExpired && typeof expiresInMs === "number" && expiresInMs <= 15 * 60 * 1000;
-            const expiryTone = isExpired ? theme.danger : expiringSoon ? theme.warning : theme.textMuted;
+            const isExpired =
+              Boolean(question.isExpired) || (typeof expiresInMs === "number" && expiresInMs <= 0);
+            const expiringSoon =
+              !isExpired && typeof expiresInMs === "number" && expiresInMs <= 15 * 60 * 1000;
+            const expiryTone = isExpired
+              ? theme.danger
+              : expiringSoon
+                ? theme.warning
+                : theme.textMuted;
             return (
               <View key={question.id} style={[styles.questionRow, { borderColor: theme.border }]}>
                 <View style={styles.rowBetween}>
                   <Text
-                    style={[styles.questionTitle, { color: theme.text, fontFamily: theme.fontSans }]}
+                    style={[
+                      styles.questionTitle,
+                      { color: theme.text, fontFamily: theme.fontSans },
+                    ]}
                   >
                     {question.question || "Untitled question"}
                   </Text>
@@ -919,20 +1049,29 @@ export function SystemPane({
                     ]}
                   >
                     <Text
-                      style={[styles.statusPillText, { color: statusTone, fontFamily: theme.fontSans }]}
+                      style={[
+                        styles.statusPillText,
+                        { color: statusTone, fontFamily: theme.fontSans },
+                      ]}
                     >
                       {question.status}
                     </Text>
                   </View>
                 </View>
                 <Text
-                  style={[styles.questionMeta, { color: theme.textMuted, fontFamily: theme.fontMono }]}
+                  style={[
+                    styles.questionMeta,
+                    { color: theme.textMuted, fontFamily: theme.fontMono },
+                  ]}
                 >
                   {question.id.slice(0, 8)} | type {question.questionType || "unknown"} | objective{" "}
                   {question.objectiveId.slice(0, 8) || "--"}
                 </Text>
                 <Text
-                  style={[styles.questionMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                  style={[
+                    styles.questionMeta,
+                    { color: theme.textMuted, fontFamily: theme.fontSans },
+                  ]}
                 >
                   created {prettyTs(question.createdAt)} | expires{" "}
                   {question.expiresAt ? prettyTs(question.expiresAt) : "--"}
@@ -1047,7 +1186,12 @@ export function SystemPane({
                           void applyQuestionAction(question, "skip");
                         }}
                       >
-                        <Text style={[styles.miniActionText, { color: theme.warning, fontFamily: theme.fontSans }]}>
+                        <Text
+                          style={[
+                            styles.miniActionText,
+                            { color: theme.warning, fontFamily: theme.fontSans },
+                          ]}
+                        >
                           Skip
                         </Text>
                       </Pressable>
@@ -1066,7 +1210,10 @@ export function SystemPane({
                         }}
                       >
                         <Text
-                          style={[styles.miniActionText, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+                          style={[
+                            styles.miniActionText,
+                            { color: theme.textMuted, fontFamily: theme.fontSans },
+                          ]}
                         >
                           Close
                         </Text>
@@ -1085,7 +1232,12 @@ export function SystemPane({
                           void applyQuestionAction(question, "escalate");
                         }}
                       >
-                        <Text style={[styles.miniActionText, { color: theme.danger, fontFamily: theme.fontSans }]}>
+                        <Text
+                          style={[
+                            styles.miniActionText,
+                            { color: theme.danger, fontFamily: theme.fontSans },
+                          ]}
+                        >
                           Escalate
                         </Text>
                       </Pressable>
@@ -1110,7 +1262,10 @@ export function SystemPane({
                     <Text
                       style={[
                         styles.answerResultLine,
-                        { color: result.ok ? theme.text : theme.danger, fontFamily: theme.fontSans },
+                        {
+                          color: result.ok ? theme.text : theme.danger,
+                          fontFamily: theme.fontSans,
+                        },
                       ]}
                     >
                       {result.ok
@@ -1155,14 +1310,19 @@ export function SystemPane({
                       styles.answerResult,
                       {
                         borderColor: theme.border,
-                        backgroundColor: actionResult.ok ? `${theme.positive}22` : `${theme.danger}22`,
+                        backgroundColor: actionResult.ok
+                          ? `${theme.positive}22`
+                          : `${theme.danger}22`,
                       },
                     ]}
                   >
                     <Text
                       style={[
                         styles.answerResultLine,
-                        { color: actionResult.ok ? theme.text : theme.danger, fontFamily: theme.fontSans },
+                        {
+                          color: actionResult.ok ? theme.text : theme.danger,
+                          fontFamily: theme.fontSans,
+                        },
                       ]}
                     >
                       {actionResult.ok

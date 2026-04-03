@@ -68,7 +68,12 @@ describe("buildJobStatusReply", () => {
     });
     const logs: JobLogApiRow[] = [
       { id: 1, jobId: failedJob.id, ts: failedJob.updatedAt, message: "Processed chunk" },
-      { id: 2, jobId: failedJob.id, ts: failedJob.updatedAt, message: "Thinking: re-evaluating fix" },
+      {
+        id: 2,
+        jobId: failedJob.id,
+        ts: failedJob.updatedAt,
+        message: "Thinking: re-evaluating fix",
+      },
       { id: 3, jobId: completedJob.id, ts: completedJob.updatedAt, message: "Completed work" },
     ];
 
@@ -96,9 +101,21 @@ describe("buildJobStatusReply", () => {
   test("lists recent job ids when the referenced token is missing", () => {
     const sessionId = "session-c";
     const jobs = [
-      makeJob({ id: "aaaaaaaa-1111-2222-3333-444444444444", sessionId, updatedAt: "2025-02-02T08:00:00.000Z" }),
-      makeJob({ id: "bbbbbbbb-1111-2222-3333-555555555555", sessionId, updatedAt: "2025-02-02T09:00:00.000Z" }),
-      makeJob({ id: "cccccccc-1111-2222-3333-666666666666", sessionId, updatedAt: "2025-02-02T10:00:00.000Z" }),
+      makeJob({
+        id: "aaaaaaaa-1111-2222-3333-444444444444",
+        sessionId,
+        updatedAt: "2025-02-02T08:00:00.000Z",
+      }),
+      makeJob({
+        id: "bbbbbbbb-1111-2222-3333-555555555555",
+        sessionId,
+        updatedAt: "2025-02-02T09:00:00.000Z",
+      }),
+      makeJob({
+        id: "cccccccc-1111-2222-3333-666666666666",
+        sessionId,
+        updatedAt: "2025-02-02T10:00:00.000Z",
+      }),
     ];
 
     const reply = buildJobStatusReply({
@@ -348,7 +365,9 @@ describe("buildRequestStatusReply", () => {
     expect(message).toContain(
       `Request ${request.id.slice(0, 8)} is claimed by ${request.agentId} (updated ${request.updatedAt}). Priority: ${request.priority}.`,
     );
-    expect(message).toContain("RemoteBuddy is still planning and has not enqueued a WorkerPal job yet.");
+    expect(message).toContain(
+      "RemoteBuddy is still planning and has not enqueued a WorkerPal job yet.",
+    );
   });
 
   test("lists recent request ids when the referenced token is missing", () => {
@@ -404,6 +423,8 @@ describe("buildRequestStatusReply", () => {
     expect(message).toContain(
       `Request ${request.id.slice(0, 8)} is completed (updated ${request.updatedAt}).`,
     );
-    expect(message).toContain("RemoteBuddy finished orchestration; no WorkerPal job is linked yet.");
+    expect(message).toContain(
+      "RemoteBuddy finished orchestration; no WorkerPal job is linked yet.",
+    );
   });
 });

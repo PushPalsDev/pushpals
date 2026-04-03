@@ -322,11 +322,15 @@ export function buildTaskExecuteDedupeKey(
   sessionId: string,
   params: TaskExecuteJobParams,
 ): string | null {
-  const normalizedSessionId = String(sessionId ?? "").trim().toLowerCase();
+  const normalizedSessionId = String(sessionId ?? "")
+    .trim()
+    .toLowerCase();
   if (!normalizedSessionId) return null;
   const normalizedOrigin = params.origin === "autonomy" ? "autonomy" : "user";
 
-  const rawTargetPaths = Array.isArray(params.planning.targetPaths) ? params.planning.targetPaths : [];
+  const rawTargetPaths = Array.isArray(params.planning.targetPaths)
+    ? params.planning.targetPaths
+    : [];
   const normalizedTargets = rawTargetPaths
     .map((entry) => normalizeTargetPath(entry))
     .filter((entry): entry is string => Boolean(entry))
@@ -338,11 +342,7 @@ export function buildTaskExecuteDedupeKey(
   if (uniqueTargets.length > 4) return null;
 
   const maxFilesToEdit = params.planning.scope.maxFilesToEdit;
-  if (
-    typeof maxFilesToEdit === "number" &&
-    Number.isFinite(maxFilesToEdit) &&
-    maxFilesToEdit > 4
-  ) {
+  if (typeof maxFilesToEdit === "number" && Number.isFinite(maxFilesToEdit) && maxFilesToEdit > 4) {
     return null;
   }
 
@@ -877,10 +877,9 @@ export class RemoteBuddyOrchestrator {
       this.workerpalsEnvFile = existsSync(envPath) ? envPath : null;
     } else if (this.autoSpawnWorkers) {
       this.autoSpawnWorkers = false;
-      this.workerpalsUnavailableReason =
-        embeddedWorkerpalsBinary
-          ? `WorkerPal embedded binary is missing (${embeddedWorkerpalsBinary}) and source entrypoint is missing (${workerpalsEntrypoint})`
-          : `WorkerPal source entrypoint is missing (${workerpalsEntrypoint})`;
+      this.workerpalsUnavailableReason = embeddedWorkerpalsBinary
+        ? `WorkerPal embedded binary is missing (${embeddedWorkerpalsBinary}) and source entrypoint is missing (${workerpalsEntrypoint})`
+        : `WorkerPal source entrypoint is missing (${workerpalsEntrypoint})`;
       console.warn(`[RemoteBuddy] Auto-spawn disabled: ${this.workerpalsUnavailableReason}.`);
       console.warn(
         "[RemoteBuddy] No embedded WorkerPal runtime is available for auto-spawn; start WorkerPals manually if execution workers are required.",
@@ -1023,10 +1022,7 @@ export class RemoteBuddyOrchestrator {
   }
 
   /** Send a command event through the server */
-  private async sendCommand(
-    sessionId: string,
-    cmd: Omit<CommandRequest, "from">,
-  ): Promise<void> {
+  private async sendCommand(sessionId: string, cmd: Omit<CommandRequest, "from">): Promise<void> {
     try {
       const ok = await this.comm.emitToSession(sessionId, cmd.type, cmd.payload as any, {
         to: cmd.to,
@@ -1106,13 +1102,10 @@ export class RemoteBuddyOrchestrator {
     query.set("feedbackLimit", "3");
     const suffix = query.toString();
     try {
-      const res = await fetch(
-        `${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`,
-        {
-          method: "GET",
-          headers: this.authHeaders(),
-        },
-      );
+      const res = await fetch(`${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`, {
+        method: "GET",
+        headers: this.authHeaders(),
+      });
       if (!res.ok) return null;
       const data = (await res.json()) as {
         ok?: boolean;
@@ -1152,7 +1145,9 @@ export class RemoteBuddyOrchestrator {
     const reviewScore = Number.isFinite(reviewScoreRaw) ? reviewScoreRaw : null;
     const reviewThreshold = Number.isFinite(reviewThresholdRaw) ? reviewThresholdRaw : null;
     const commentCountRaw = Number(insight?.commentCount);
-    const commentCount = Number.isFinite(commentCountRaw) ? Math.max(0, Math.floor(commentCountRaw)) : 0;
+    const commentCount = Number.isFinite(commentCountRaw)
+      ? Math.max(0, Math.floor(commentCountRaw))
+      : 0;
     const commentExamples = Array.isArray(insight?.comments)
       ? insight.comments
           .slice(0, 2)
@@ -1459,9 +1454,7 @@ export class RemoteBuddyOrchestrator {
           this.sessionMonitorWsErrorCounts.set(normalizedSessionId, 0);
         },
         onError: (message) => {
-          console.warn(
-            `[RemoteBuddy] Session monitor (${normalizedSessionId}) failed: ${message}`,
-          );
+          console.warn(`[RemoteBuddy] Session monitor (${normalizedSessionId}) failed: ${message}`);
           if (!/\[SessionEvents\] (WebSocket error|Failed to connect)/.test(message)) return;
           const nextCount = (this.sessionMonitorWsErrorCounts.get(normalizedSessionId) ?? 0) + 1;
           this.sessionMonitorWsErrorCounts.set(normalizedSessionId, nextCount);
@@ -1569,7 +1562,9 @@ export class RemoteBuddyOrchestrator {
   }
 
   private getChatContextSnapshot(sessionId: string = this.sessionId): string[] {
-    const filtered = this.sessionContext(sessionId).filter((entry) => !entry.startsWith("[enhanced]"));
+    const filtered = this.sessionContext(sessionId).filter(
+      (entry) => !entry.startsWith("[enhanced]"),
+    );
     return filtered
       .slice(-RemoteBuddyOrchestrator.CHAT_CONTEXT_MAX)
       .map((entry) => toSingleLine(entry, RemoteBuddyOrchestrator.CHAT_CONTEXT_ENTRY_CHARS));
@@ -1579,7 +1574,9 @@ export class RemoteBuddyOrchestrator {
     priority: RequestPriority,
     sessionId: string = this.sessionId,
   ): string[] {
-    const filtered = this.sessionContext(sessionId).filter((entry) => !entry.startsWith("[enhanced]"));
+    const filtered = this.sessionContext(sessionId).filter(
+      (entry) => !entry.startsWith("[enhanced]"),
+    );
     const limit = priority === "interactive" ? 6 : RemoteBuddyOrchestrator.CHAT_CONTEXT_MAX;
     return filtered
       .slice(-limit)
@@ -2037,7 +2034,9 @@ export class RemoteBuddyOrchestrator {
       if (onlineWorkers.length > 0) {
         const idleWorker = await this.waitForIdleWorker(Math.max(this.waitForWorkerMs, 5_000));
         if (idleWorker) {
-          console.log(`[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`);
+          console.log(
+            `[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`,
+          );
           return;
         }
         this.workerpalsUnavailableReason = `${onlineWorkers.length} online WorkerPal(s) reported but none became idle within ${Math.max(
@@ -2057,9 +2056,13 @@ export class RemoteBuddyOrchestrator {
       }
     }
 
-    const idleWorker = await this.waitForIdleWorker(Math.max(this.waitForWorkerMs, this.workerStartupTimeoutMs));
+    const idleWorker = await this.waitForIdleWorker(
+      Math.max(this.waitForWorkerMs, this.workerStartupTimeoutMs),
+    );
     if (idleWorker) {
-      console.log(`[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`);
+      console.log(
+        `[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`,
+      );
       return;
     }
     const after = await this.fetchWorkers();
@@ -2469,7 +2472,9 @@ export class RemoteBuddyOrchestrator {
             origin: "autonomy",
             autonomy: {
               origin: "autonomy",
-              ...(autonomyMetadata.objectiveId ? { objectiveId: autonomyMetadata.objectiveId } : {}),
+              ...(autonomyMetadata.objectiveId
+                ? { objectiveId: autonomyMetadata.objectiveId }
+                : {}),
               ...(autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {}),
               ...(autonomyMetadata.snapshotId ? { snapshotId: autonomyMetadata.snapshotId } : {}),
               ...(autonomyMetadata.patternKey ? { patternKey: autonomyMetadata.patternKey } : {}),

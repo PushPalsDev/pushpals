@@ -25,14 +25,13 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
         "Workforce-grade delegation",
       ],
       guardrails: ["Safe by default", "Small reversible steps", "No silent scope escalation"],
-      constraints: ["Predictable runtime behavior", "Audit trails", "Avoid operational toil expansion"],
-      non_goals: ["Unbounded autonomous architecture redesign"],
-      metrics: [
-        "Autonomous merge rate",
-        "Rework rate",
-        "Queue health",
-        "Time-to-first-value",
+      constraints: [
+        "Predictable runtime behavior",
+        "Audit trails",
+        "Avoid operational toil expansion",
       ],
+      non_goals: ["Unbounded autonomous architecture redesign"],
+      metrics: ["Autonomous merge rate", "Rework rate", "Queue health", "Time-to-first-value"],
       risk_policy: ["Low risk can ship autonomously", "High risk requires explicit approval"],
       operating_model: ["RemoteAgent delegates to specialized WorkerPals"],
       governance: ["RFC for high-risk architecture changes"],
@@ -44,7 +43,12 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
     top_signals: [
       { signal_id: "sig_queue", type: "queue_health", value: 0.82, evidence: "queue_p95=210000" },
       { signal_id: "sig_regret", type: "regret_signal", value: 0.7, evidence: "reopened=4" },
-      { signal_id: "sig_test", type: "test_failure", value: 0.45, evidence: "flaky tests recurring" },
+      {
+        signal_id: "sig_test",
+        type: "test_failure",
+        value: 0.45,
+        evidence: "flaky tests recurring",
+      },
     ],
     state_traits: [
       {
@@ -89,11 +93,13 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
     expect(context.opportunity_gaps.length).toBeGreaterThan(0);
     expect(context.building_blocks.length).toBeGreaterThan(0);
     expect(
-      context.compiled_objectives.some((objective) => objective.id === "reliable_autonomous_delivery"),
+      context.compiled_objectives.some(
+        (objective) => objective.id === "reliable_autonomous_delivery",
+      ),
     ).toBe(true);
-    expect(
-      context.building_blocks.some((block) => block.algorithm === "portfolio_bandit"),
-    ).toBe(true);
+    expect(context.building_blocks.some((block) => block.algorithm === "portfolio_bandit")).toBe(
+      true,
+    );
     expect(context.building_blocks[0].score).toBeGreaterThanOrEqual(
       context.building_blocks[context.building_blocks.length - 1].score,
     );
@@ -134,9 +140,13 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
         ].includes(objectiveType),
       ).toBe(true);
       expect(
-        ["test_failure", "lint_failure", "typecheck_failure", "queue_health", "regret_signal"].includes(
-          triggerType,
-        ),
+        [
+          "test_failure",
+          "lint_failure",
+          "typecheck_failure",
+          "queue_health",
+          "regret_signal",
+        ].includes(triggerType),
       ).toBe(true);
       expect(targetPaths.length).toBeGreaterThan(0);
       expect(sectionRefs.length).toBeGreaterThan(0);
@@ -243,7 +253,9 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
         ],
       });
 
-      const opportunityGraphBlock = context.building_blocks.find((entry) => entry.id === "opportunity_graph_pipeline");
+      const opportunityGraphBlock = context.building_blocks.find(
+        (entry) => entry.id === "opportunity_graph_pipeline",
+      );
       expect(opportunityGraphBlock?.candidate_shape.component_area).toBe("src");
       expect(opportunityGraphBlock?.candidate_shape.target_paths[0]).toContain("src/");
       expect(opportunityGraphBlock?.candidate_shape.target_paths[0]).not.toContain("apps/server");
@@ -271,7 +283,8 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
           sourceRefs: ["README#adaptive-queue-scheduler"],
           algorithm: "trusted_queue_scheduler",
           whenToUse: "queue backpressure and worker throughput are unstable",
-          summary: "Prioritize autonomous work by trust-weighted queue pressure and regret feedback.",
+          summary:
+            "Prioritize autonomous work by trust-weighted queue pressure and regret feedback.",
           tags: ["queue", "backpressure", "worker", "regret"],
           qualityScore: 0.56,
           freshnessScore: 0.48,
@@ -327,16 +340,22 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
       ],
     });
 
-    expect(context.source_patterns.some((pattern) => pattern.algorithm === "archived_retry_loop")).toBe(false);
+    expect(
+      context.source_patterns.some((pattern) => pattern.algorithm === "archived_retry_loop"),
+    ).toBe(false);
     const trustedSourcePattern = context.source_patterns.find(
       (pattern) => pattern.algorithm === "trusted_queue_scheduler",
     );
     expect(trustedSourcePattern).toBeDefined();
     expect(trustedSourcePattern?.source_curation_status).toBe("trusted");
-    const trustedBlock = context.building_blocks.find((block) => block.algorithm === "trusted_queue_scheduler");
+    const trustedBlock = context.building_blocks.find(
+      (block) => block.algorithm === "trusted_queue_scheduler",
+    );
     expect(trustedBlock).toBeDefined();
     expect(trustedBlock?.source_curation_status).toBe("trusted");
-    expect(context.building_blocks.some((block) => block.algorithm === "archived_retry_loop")).toBe(false);
+    expect(context.building_blocks.some((block) => block.algorithm === "archived_retry_loop")).toBe(
+      false,
+    );
 
     const fallback = buildEngineFallbackCandidates({
       engineInspiration: context,
@@ -346,16 +365,24 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
     });
     expect(
       fallback.some((candidate) => {
-        const trial = (candidate as Record<string, unknown>).engine_trial as Record<string, unknown> | undefined;
+        const trial = (candidate as Record<string, unknown>).engine_trial as
+          | Record<string, unknown>
+          | undefined;
         return (
-          String(candidate.title ?? "").toLowerCase().includes("trusted_queue_scheduler") ||
-          String(trial?.algorithm ?? "").toLowerCase().includes("trusted_queue_scheduler")
+          String(candidate.title ?? "")
+            .toLowerCase()
+            .includes("trusted_queue_scheduler") ||
+          String(trial?.algorithm ?? "")
+            .toLowerCase()
+            .includes("trusted_queue_scheduler")
         );
       }),
     ).toBe(true);
     expect(
       fallback.some((candidate) =>
-        String(candidate.title ?? "").toLowerCase().includes("archived_retry_loop"),
+        String(candidate.title ?? "")
+          .toLowerCase()
+          .includes("archived_retry_loop"),
       ),
     ).toBe(false);
   });

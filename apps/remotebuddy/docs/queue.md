@@ -12,21 +12,21 @@ Need a concrete walkthrough of how a user request flows across LocalBuddy, Remot
 
 ### Dashboards and tools in rotation
 
-| Surface | What to watch | Access / Notes |
-| --- | --- | --- |
-| Grafana › RemoteBuddy Queue Overview | `queue_p95`, per-lane backlog, retry spikes (panels: `queue_p95`, `requests_pending`, `jobs_pending`) | Auto-refresh 30 s. Pin compare window (last 4 h vs 24 h) to confirm trend reversals. |
-| Grafana › Worker Backends Latency | Worker RPC p95/p99, upstream saturation | Helps prove whether queue inflation started upstream (LLM/storage) before spending time on workers. |
-| Server `/system/status` API | `slo.requests.queueWaitMs`, `queues.requestPendingSnapshot`, `queues.jobPendingSnapshot`, worker idle counts | Run `curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status | jq '{queues, slo}'`. Bookmark per-priority depth. |
-| Client Ops board (`bun run client:only` → Ops tab) | Real-time session ETA + backlog overlay | Highlights user-facing retries and which sessions are waiting longest. |
-| WorkerPals logs (`bun run workerpals:only[:docker]`) | `task.execute` retries, wrapper timeouts | Use alongside `/workers` to ensure idle slots exist; match timestamps with Grafana spikes. |
+| Surface                                              | What to watch                                                                                                | Access / Notes                                                                                      |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| Grafana › RemoteBuddy Queue Overview                 | `queue_p95`, per-lane backlog, retry spikes (panels: `queue_p95`, `requests_pending`, `jobs_pending`)        | Auto-refresh 30 s. Pin compare window (last 4 h vs 24 h) to confirm trend reversals.                |
+| Grafana › Worker Backends Latency                    | Worker RPC p95/p99, upstream saturation                                                                      | Helps prove whether queue inflation started upstream (LLM/storage) before spending time on workers. |
+| Server `/system/status` API                          | `slo.requests.queueWaitMs`, `queues.requestPendingSnapshot`, `queues.jobPendingSnapshot`, worker idle counts | Run `curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status   | jq '{queues, slo}'`. Bookmark per-priority depth. |
+| Client Ops board (`bun run client:only` → Ops tab)   | Real-time session ETA + backlog overlay                                                                      | Highlights user-facing retries and which sessions are waiting longest.                              |
+| WorkerPals logs (`bun run workerpals:only[:docker]`) | `task.execute` retries, wrapper timeouts                                                                     | Use alongside `/workers` to ensure idle slots exist; match timestamps with Grafana spikes.          |
 
 ### Thresholds that matter (current baseline 0.7 s–0.9 s p95)
 
-| Signal | Warning (Slack) | Paging (PagerDuty) | Expectation |
-| --- | --- | --- | --- |
-| `queue_p95` 15 min rolling | ≥ 1.5 s sustained for 2 minutes → Grafana alert `queue_p95_spike_warning` posts in `#pushpals-ops` and tags `@remote-queue-oc`. | ≥ 2.0 s for 5 minutes → `queue_p95_sustained` pages the **RemoteBuddy Platform** schedule and mirrors the message into `#pushpals-ops`. | Acknowledge in ≤5 minutes, start mitigation, post status thread until resolved. |
-| Interactive backlog (`requests.pending.interactive`) | > 40 requests for 3 consecutive polls → Slack reminder in `#pushpals-ops`. | > 60 requests or any request older than 10 minutes → auto-page RemoteBuddy Platform on-call. | Throttle new background/eval traffic within 5 minutes, document deferrals. |
-| Worker idle slots | < 2 idle workers per queue lane for 3 polls → Slack ping to `@workerpals-oc`. | ≤ 1 idle worker across cluster for 5 minutes → WorkerPals Runtime schedule secondary page. | Add capacity or shed load before queue wait breaches escalate further. |
+| Signal                                               | Warning (Slack)                                                                                                                 | Paging (PagerDuty)                                                                                                                      | Expectation                                                                     |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `queue_p95` 15 min rolling                           | ≥ 1.5 s sustained for 2 minutes → Grafana alert `queue_p95_spike_warning` posts in `#pushpals-ops` and tags `@remote-queue-oc`. | ≥ 2.0 s for 5 minutes → `queue_p95_sustained` pages the **RemoteBuddy Platform** schedule and mirrors the message into `#pushpals-ops`. | Acknowledge in ≤5 minutes, start mitigation, post status thread until resolved. |
+| Interactive backlog (`requests.pending.interactive`) | > 40 requests for 3 consecutive polls → Slack reminder in `#pushpals-ops`.                                                      | > 60 requests or any request older than 10 minutes → auto-page RemoteBuddy Platform on-call.                                            | Throttle new background/eval traffic within 5 minutes, document deferrals.      |
+| Worker idle slots                                    | < 2 idle workers per queue lane for 3 polls → Slack ping to `@workerpals-oc`.                                                   | ≤ 1 idle worker across cluster for 5 minutes → WorkerPals Runtime schedule secondary page.                                              | Add capacity or shed load before queue wait breaches escalate further.          |
 
 ### Alert routing
 
@@ -60,11 +60,11 @@ Need a concrete walkthrough of how a user request flows across LocalBuddy, Remot
 
 ## Owners and Escalation Path
 
-| Role | Contact | Responsibility |
-| --- | --- | --- |
-| Primary owner | Slack `@remote-queue-oc`, PagerDuty **RemoteBuddy Platform** | Owns queue SLO, triage, comms, mitigation coordination. |
-| Backup / capacity | Slack `@workerpals-oc`, PagerDuty **WorkerPals Runtime** | Adds or repairs workers, inspects job-level failures. |
-| Reliability lead | Slack `@reliability-lead` (duty manager), phone tree step 3 | Decides on broader customer comms, coordinates multi-service incidents. |
+| Role              | Contact                                                      | Responsibility                                                          |
+| ----------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| Primary owner     | Slack `@remote-queue-oc`, PagerDuty **RemoteBuddy Platform** | Owns queue SLO, triage, comms, mitigation coordination.                 |
+| Backup / capacity | Slack `@workerpals-oc`, PagerDuty **WorkerPals Runtime**     | Adds or repairs workers, inspects job-level failures.                   |
+| Reliability lead  | Slack `@reliability-lead` (duty manager), phone tree step 3  | Decides on broader customer comms, coordinates multi-service incidents. |
 
 Escalate in this order if recovery stalls: Primary on-call → WorkerPals Runtime →
 Reliability lead → Eng director (auto-notified once PD incident hits priority P1).

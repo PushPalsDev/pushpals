@@ -13,9 +13,7 @@ function parsePositiveInt(value: string | null | undefined): number | null {
   return parsed;
 }
 
-export function resolveBrowserClientPortBase(
-  env: NodeJS.ProcessEnv = process.env,
-): number {
+export function resolveBrowserClientPortBase(env: NodeJS.ProcessEnv = process.env): number {
   return (
     parsePositiveInt(env.EXPO_DEV_SERVER_PORT) ??
     parsePositiveInt(env.PUSHPALS_CLIENT_PORT) ??
@@ -23,9 +21,7 @@ export function resolveBrowserClientPortBase(
   );
 }
 
-export function buildBrowserClientPortCandidates(
-  env: NodeJS.ProcessEnv = process.env,
-): number[] {
+export function buildBrowserClientPortCandidates(env: NodeJS.ProcessEnv = process.env): number[] {
   const basePort = resolveBrowserClientPortBase(env);
   const maxScan = parsePositiveInt(env.PUSHPALS_CLIENT_PORT_SCAN_MAX) ?? DEFAULT_MAX_SCAN;
   const candidates: number[] = [];
@@ -116,10 +112,7 @@ function normalizeLoopbackUrl(value: unknown): string | null {
   }
 }
 
-async function probePushPalsClientUrl(
-  url: string,
-  fetchImpl: typeof fetch,
-): Promise<boolean> {
+async function probePushPalsClientUrl(url: string, fetchImpl: typeof fetch): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   try {

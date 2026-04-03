@@ -133,7 +133,8 @@ export function ChatPane({
             <Text
               style={[styles.emptySubtitle, { color: theme.textMuted, fontFamily: theme.fontSans }]}
             >
-              Start with a task. PushPals will route it through the local server and RemoteBuddy will coordinate execution.
+              Start with a task. PushPals will route it through the local server and RemoteBuddy
+              will coordinate execution.
             </Text>
           </View>
         ) : (

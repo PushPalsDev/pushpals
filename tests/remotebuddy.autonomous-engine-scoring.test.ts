@@ -170,10 +170,7 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
             sample_count: 24,
           },
         ],
-        engine_idea_priors: [
-          { sample_count: 20 },
-          { sample_count: 1 },
-        ],
+        engine_idea_priors: [{ sample_count: 20 }, { sample_count: 1 }],
         engine_source_priors: [{ sample_count: 24 }],
       },
     });
@@ -241,4 +238,3 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
     expect(low.effectiveRate).toBe(0.1);
   });
 });
-

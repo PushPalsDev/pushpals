@@ -9,8 +9,8 @@ describe("workerpals execution utils config-aware behavior", () => {
   test("parseStructuredResult supports a custom executor prefix", () => {
     const stdout = [
       "normal line",
-      "__CUSTOM_PREFIX__ {\"ok\":false}",
-      "__CUSTOM_PREFIX__ {\"ok\":true,\"summary\":\"done\"}",
+      '__CUSTOM_PREFIX__ {"ok":false}',
+      '__CUSTOM_PREFIX__ {"ok":true,"summary":"done"}',
     ].join("\n");
 
     const parsed = parseStructuredResult(stdout, "__CUSTOM_PREFIX__ ");
@@ -20,11 +20,7 @@ describe("workerpals execution utils config-aware behavior", () => {
   });
 
   test("filterResultLines removes only lines with the configured prefix", () => {
-    const stdout = [
-      "keep this",
-      "__CUSTOM_PREFIX__ {\"ok\":true}",
-      "keep this too",
-    ].join("\n");
+    const stdout = ["keep this", '__CUSTOM_PREFIX__ {"ok":true}', "keep this too"].join("\n");
 
     const filtered = filterResultLines(stdout, "__CUSTOM_PREFIX__ ");
     expect(filtered).toContain("keep this");

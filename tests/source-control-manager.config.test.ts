@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
-import { applyCliOverrides, loadConfig, validateConfig } from "../apps/source_control_manager/src/config";
+import {
+  applyCliOverrides,
+  loadConfig,
+  validateConfig,
+} from "../apps/source_control_manager/src/config";
 
 describe("source_control_manager config", () => {
   test("loadConfig reads defaults from shared PushPals config", () => {
@@ -54,7 +58,10 @@ describe("source_control_manager config", () => {
     const tempRoot = mkdtempSync(join(tmpdir(), "pushpals-scm-config-"));
     const configDir = join(tempRoot, "configs");
     mkdirSync(configDir, { recursive: true });
-    cpSync(resolve(import.meta.dir, "..", "configs", "default.toml"), join(configDir, "default.toml"));
+    cpSync(
+      resolve(import.meta.dir, "..", "configs", "default.toml"),
+      join(configDir, "default.toml"),
+    );
     cpSync(
       resolve(import.meta.dir, "..", "configs", "local.example.toml"),
       join(configDir, "local.example.toml"),

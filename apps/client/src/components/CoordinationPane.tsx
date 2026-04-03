@@ -2,13 +2,7 @@ import React from "react";
 import { Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { QueueCounts } from "../lib/pushpalsApi";
 import type { CoordinationRow, CoordinationStage, DashboardTheme, Tone } from "./dashboardTypes";
-import {
-  clip,
-  prettyTs,
-  queueValue,
-  relativeMs,
-  toneColor,
-} from "./dashboardFormatters";
+import { clip, prettyTs, queueValue, relativeMs, toneColor } from "./dashboardFormatters";
 import { MetricTile } from "./MetricTile";
 
 function stageLabel(stage: CoordinationStage): string {

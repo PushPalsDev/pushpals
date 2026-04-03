@@ -99,7 +99,10 @@ describe("JobQueue stale recovery", () => {
     const onlyThreeMinutesOld = new Date(Date.now() - 3 * 60 * 1000).toISOString();
     const freshHeartbeat = new Date(Date.now() - 60 * 1000).toISOString();
 
-    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(freshHeartbeat, "worker-c");
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
+      freshHeartbeat,
+      "worker-c",
+    );
     db.prepare("UPDATE jobs SET updatedAt = ?, startedAt = ?, claimedAt = ? WHERE id = ?").run(
       onlyThreeMinutesOld,
       onlyThreeMinutesOld,

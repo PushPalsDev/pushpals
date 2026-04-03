@@ -32,7 +32,9 @@ function parseArgs(argv: string[]): Options {
       continue;
     }
     if (arg === "-h" || arg === "--help") {
-      console.log("Usage: bun run scripts/client-preflight.ts [--client <name>] [--project-root <path>] [--runtime-root <path>]");
+      console.log(
+        "Usage: bun run scripts/client-preflight.ts [--client <name>] [--project-root <path>] [--runtime-root <path>]",
+      );
       process.exit(0);
     }
     console.error(`[preflight] Unknown argument: ${arg}`);

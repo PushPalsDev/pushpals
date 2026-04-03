@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { makePatternKey, normalizeTargetPath, validateScopeInvariants } from "../packages/shared/src/autonomy_policy";
+import {
+  makePatternKey,
+  normalizeTargetPath,
+  validateScopeInvariants,
+} from "../packages/shared/src/autonomy_policy";
 
 describe("shared autonomy policy", () => {
   test("makePatternKey is deterministic and sha256-shaped", () => {
@@ -48,12 +52,9 @@ describe("shared autonomy policy", () => {
   });
 
   test("validateScopeInvariants derives component area from repo-relative scope", () => {
-    const derived = validateScopeInvariants(
-      null,
-      ["src/autonomy.ts"],
-      ["src/autonomy.ts"],
-      { requireWriteGlobs: true },
-    );
+    const derived = validateScopeInvariants(null, ["src/autonomy.ts"], ["src/autonomy.ts"], {
+      requireWriteGlobs: true,
+    });
     expect(derived.ok).toBe(true);
     expect(derived.componentArea).toBe("src");
   });

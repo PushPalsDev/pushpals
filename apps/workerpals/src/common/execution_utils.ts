@@ -16,8 +16,7 @@ export function resolveOutputCompactionPolicy(
   const maxOutputChars = Number(overrides.maxOutputChars ?? worker.outputMaxChars);
   const maxOutputLines = Number(overrides.maxOutputLines ?? worker.outputMaxLines);
   const maxOutputHeadLines = Number(overrides.maxOutputHeadLines ?? worker.outputMaxHeadLines);
-  const executorResultPrefixRaw =
-    overrides.executorResultPrefix ?? worker.executorResultPrefix;
+  const executorResultPrefixRaw = overrides.executorResultPrefix ?? worker.executorResultPrefix;
   const executorResultPrefix =
     typeof executorResultPrefixRaw === "string" && executorResultPrefixRaw.length > 0
       ? executorResultPrefixRaw
@@ -42,7 +41,10 @@ export function resolveOutputCompactionPolicy(
 
 // ---- Output truncation -------------------------------------------------------
 
-export function compactJobOutput(text: string, policyOverrides: Partial<OutputCompactionPolicy> = {}): string {
+export function compactJobOutput(
+  text: string,
+  policyOverrides: Partial<OutputCompactionPolicy> = {},
+): string {
   if (!text) return "";
   const policy = resolveOutputCompactionPolicy(policyOverrides);
   const maxOutputChars = policy.maxOutputChars;

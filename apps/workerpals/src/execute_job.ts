@@ -173,7 +173,10 @@ export function buildQualityGateRevisionIssues(
   if (!critic || critic.score >= qualityCriticMinScore) {
     return [...normalizedQualityIssues];
   }
-  const merged = [...normalizedQualityIssues, ...buildCriticRevisionIssues(critic, qualityCriticMinScore)];
+  const merged = [
+    ...normalizedQualityIssues,
+    ...buildCriticRevisionIssues(critic, qualityCriticMinScore),
+  ];
   return [...new Set(merged)];
 }
 
@@ -2569,7 +2572,8 @@ function validateTaskExecutePlanning(
       if (!componentArea) {
         return {
           ok: false,
-          message: "task.execute planning.targetPaths must resolve to a repo-relative componentArea",
+          message:
+            "task.execute planning.targetPaths must resolve to a repo-relative componentArea",
         };
       }
       if (
@@ -3056,11 +3060,7 @@ export async function executeJob(
       return result;
     }
 
-    const issues = buildQualityGateRevisionIssues(
-      quality.issues,
-      critic,
-      qualityCriticMinScore,
-    );
+    const issues = buildQualityGateRevisionIssues(quality.issues, critic, qualityCriticMinScore);
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
     if (revisionAttempt >= qualityMaxAutoRevisions) {
       if (qualitySoftPassOnExhausted) {

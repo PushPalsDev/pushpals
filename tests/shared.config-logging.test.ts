@@ -30,7 +30,8 @@ describe("shared config logging sanitization", () => {
 
   test("redacts embedded credentials and bearer tokens inside strings", () => {
     const input = {
-      remoteUrl: "https://oauth2:ghp_abcdefghijklmnopqrstuvwxyz012345@github.com/PushPalsDev/pushpals.git",
+      remoteUrl:
+        "https://oauth2:ghp_abcdefghijklmnopqrstuvwxyz012345@github.com/PushPalsDev/pushpals.git",
       authHeader: "Bearer sk-supersecretopenaitoken0123456789",
       plain: "https://github.com/PushPalsDev/pushpals.git",
     };
@@ -46,10 +47,7 @@ describe("shared config logging sanitization", () => {
   test("handles arrays recursively", () => {
     const input = {
       labels: ["ci", "worker"],
-      endpoints: [
-        "https://user:pass@example.com/path",
-        "Bearer abcdefghijklmnopqrstuvwxyz123456",
-      ],
+      endpoints: ["https://user:pass@example.com/path", "Bearer abcdefghijklmnopqrstuvwxyz123456"],
       tokens: ["abc", "def"],
     };
 

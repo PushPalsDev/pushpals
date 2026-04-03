@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import {
@@ -163,7 +171,10 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       mkdirSync(fakeBinDir, { recursive: true });
       const discoveredBun = join(fakeBinDir, process.platform === "win32" ? "bun.exe" : "bun");
       writeFileSync(discoveredBun, "", "utf8");
-      const explicitBun = join(root, process.platform === "win32" ? "embedded-bun.exe" : "embedded-bun");
+      const explicitBun = join(
+        root,
+        process.platform === "win32" ? "embedded-bun.exe" : "embedded-bun",
+      );
       const resolved = resolveEmbeddedBunExecutableFromEnv(
         {
           PUSHPALS_BUN_BIN: explicitBun,
@@ -502,7 +513,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       resolveRuntimeDockerExecutableCandidates(
         {
           PUSHPALS_DOCKER_BIN: "docker.exe",
-          PUSHPALS_DOCKER_BIN_ABSOLUTE: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+          PUSHPALS_DOCKER_BIN_ABSOLUTE:
+            "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
         },
         "win32",
       ),
@@ -532,11 +544,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         },
         "win32",
       ),
-    ).toEqual([
-      "C:\\Windows\\System32\\cmd.exe",
-      "C:\\Windows\\Sysnative\\cmd.exe",
-      "cmd.exe",
-    ]);
+    ).toEqual(["C:\\Windows\\System32\\cmd.exe", "C:\\Windows\\Sysnative\\cmd.exe", "cmd.exe"]);
   });
 
   test("precheckSourceControlManagerGitAvailability skips cleanly when the SCM remote is not configured", async () => {
@@ -864,7 +872,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       sessionId: "dev",
       dockerPrecheck: {
         status: "skipped",
-        detail: "embedded WorkerPal Docker startup precheck skipped because runtime is already healthy",
+        detail:
+          "embedded WorkerPal Docker startup precheck skipped because runtime is already healthy",
         env: { PATH: process.env.PATH ?? "" },
       },
       fetchWorkersFn: async () => [],
@@ -1021,7 +1030,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
       expect(result).toEqual({
         ok: true,
-        detail: "built local WorkerPal sandbox image pushpals-worker-sandbox:latest for runtimeTag=v1.0.19",
+        detail:
+          "built local WorkerPal sandbox image pushpals-worker-sandbox:latest for runtimeTag=v1.0.19",
       });
       expect(calls).toHaveLength(1);
       expect(calls[0]?.cwd).toBe(sandbox.root);
@@ -1082,7 +1092,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
       expect(result).toEqual({
         ok: true,
-        detail: "WorkerPal sandbox image is ready locally (pushpals-worker-sandbox:latest, runtimeTag=v1.0.19)",
+        detail:
+          "WorkerPal sandbox image is ready locally (pushpals-worker-sandbox:latest, runtimeTag=v1.0.19)",
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1125,7 +1136,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         expect(opts.env.PUSHPALS_DOCKER_BIN).toBe("docker");
         return {
           ok: true,
-          detail: "built local WorkerPal sandbox image pushpals-worker-sandbox:latest for runtimeTag=v1.0.19",
+          detail:
+            "built local WorkerPal sandbox image pushpals-worker-sandbox:latest for runtimeTag=v1.0.19",
         };
       },
     });
@@ -1184,7 +1196,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
       writeFileSync(
         join(runtimeRoot, "configs", "local.toml"),
-        ['[remotebuddy.autonomy]', 'enabled = false', 'llm_timeout_ms = 60000', ""].join("\n"),
+        ["[remotebuddy.autonomy]", "enabled = false", "llm_timeout_ms = 60000", ""].join("\n"),
         "utf8",
       );
 
@@ -1224,7 +1236,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
       expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
       expect(existsSync(join(runtimeRoot, "configs", "local.toml"))).toBe(true);
-      expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8").trim().length).toBeGreaterThan(0);
+      expect(
+        readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8").trim().length,
+      ).toBeGreaterThan(0);
       expect(prepared.runtimePreflight.config).toBeDefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1591,9 +1605,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         "lockfileVersion",
       );
       expect(existsSync(join(runtimeRoot, "sandbox", "bun.lockb"))).toBe(false);
-      expect(readFileSync(join(runtimeRoot, "protocol", "schemas", "events.schema.json"), "utf8")).toBe(
-        "{}\n",
-      );
+      expect(
+        readFileSync(join(runtimeRoot, "protocol", "schemas", "events.schema.json"), "utf8"),
+      ).toBe("{}\n");
       expect(fetchedUrls.some((url) => url.endsWith("/bun.lockb"))).toBe(false);
     } finally {
       globalThis.fetch = originalFetch;
@@ -1628,7 +1642,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
       const binaries = await ensureRuntimeBinaries(runtimeRoot, "v1.2.3");
 
-      expect(binaries.server).toBe(join(stableDir, `pushpals-runtime-server-${platformKey}${extension}`));
+      expect(binaries.server).toBe(
+        join(stableDir, `pushpals-runtime-server-${platformKey}${extension}`),
+      );
       expect(readFileSync(join(stableDir, ".runtime-tag"), "utf8")).toBe("v1.2.3\n");
       expect(existsSync(legacyDir)).toBe(false);
       expect(requestedAssets).toHaveLength(5);
@@ -2114,36 +2130,32 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
-  test(
-    "prepareCliRuntime seeds external runtime locally without network fetch",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-"));
-      const repoRoot = join(root, "repo");
-      const runtimeRoot = join(root, "runtime");
-      const originalFetch = globalThis.fetch;
-      let fetchCalls = 0;
+  test("prepareCliRuntime seeds external runtime locally without network fetch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
 
-      mkdirSync(repoRoot, { recursive: true });
-      mkdirSync(runtimeRoot, { recursive: true });
-      globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
-        fetchCalls++;
-        throw new Error(`unexpected fetch: ${String(args[0])}`);
-      }) as typeof fetch;
+    mkdirSync(repoRoot, { recursive: true });
+    mkdirSync(runtimeRoot, { recursive: true });
+    globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+      fetchCalls++;
+      throw new Error(`unexpected fetch: ${String(args[0])}`);
+    }) as typeof fetch;
 
-      try {
-        const prepared = await prepareCliRuntime({ repoRoot, runtimeRoot });
+    try {
+      const prepared = await prepareCliRuntime({ repoRoot, runtimeRoot });
 
-        expect(fetchCalls).toBe(0);
-        expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
-        expect(prepared.runtimeTag).toBe("");
-        expect(prepared.runtimePreflight.issues.map((issue) => issue.code)).toEqual([
-          "missing_vision_doc",
-        ]);
-      } finally {
-        globalThis.fetch = originalFetch;
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    15000,
-  );
+      expect(fetchCalls).toBe(0);
+      expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+      expect(prepared.runtimeTag).toBe("");
+      expect(prepared.runtimePreflight.issues.map((issue) => issue.code)).toEqual([
+        "missing_vision_doc",
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
 });

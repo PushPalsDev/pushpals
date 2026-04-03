@@ -39,7 +39,9 @@ export async function forceDeleteWorktreePath(
   const retries = Math.max(1, Math.floor(options.retries ?? 5));
   const delayMs = Math.max(0, Math.floor(options.delayMs ?? 120));
   const sleep = options.sleepFn ?? defaultSleep;
-  const removePath = options.removeFn ?? ((targetPath: string) => rmSync(targetPath, { recursive: true, force: true }));
+  const removePath =
+    options.removeFn ??
+    ((targetPath: string) => rmSync(targetPath, { recursive: true, force: true }));
   const pathExists = options.existsFn ?? ((targetPath: string) => existsSync(targetPath));
   let lastError = "";
 
@@ -63,4 +65,3 @@ export async function forceDeleteWorktreePath(
     ...(lastError ? { lastError } : {}),
   };
 }
-

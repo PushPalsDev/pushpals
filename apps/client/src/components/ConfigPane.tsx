@@ -1,13 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Switch,
-  Text,
-  TextInput,
-  View,
-} from "react-native";
+import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import type { DashboardTheme } from "./dashboardTypes";
 import {
   fetchRuntimeConfig,
@@ -86,10 +78,10 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
 
   const localBuddyEnabled = Boolean(
     config &&
-      typeof config === "object" &&
-      (config as Record<string, unknown>).localbuddy &&
-      typeof (config as Record<string, unknown>).localbuddy === "object" &&
-      ((config as Record<string, unknown>).localbuddy as Record<string, unknown>).enabled,
+    typeof config === "object" &&
+    (config as Record<string, unknown>).localbuddy &&
+    typeof (config as Record<string, unknown>).localbuddy === "object" &&
+    ((config as Record<string, unknown>).localbuddy as Record<string, unknown>).enabled,
   );
 
   const apply = useCallback(async () => {
@@ -116,7 +108,8 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
       }
       setConfig(result.config);
       setFiles(result.files ?? {});
-      const warningText = result.warnings.length > 0 ? ` Warnings: ${result.warnings.join(" | ")}` : "";
+      const warningText =
+        result.warnings.length > 0 ? ` Warnings: ${result.warnings.join(" | ")}` : "";
       const restartText = result.restartRequired ? " Restart required for some keys." : "";
       setNotice(`Applied ${result.applied.length} update(s).${restartText}${warningText}`);
     } catch (err) {
@@ -229,7 +222,11 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
                 },
               ]}
             >
-              {saving ? "Applying..." : localBuddyEnabled ? "Disable LocalBuddy" : "Enable LocalBuddy"}
+              {saving
+                ? "Applying..."
+                : localBuddyEnabled
+                  ? "Disable LocalBuddy"
+                  : "Enable LocalBuddy"}
             </Text>
           </Pressable>
         </View>
@@ -271,7 +268,10 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
             <Text
               style={[
                 styles.scopeText,
-                { color: scope === "toml" ? theme.accentText : theme.textMuted, fontFamily: theme.fontSans },
+                {
+                  color: scope === "toml" ? theme.accentText : theme.textMuted,
+                  fontFamily: theme.fontSans,
+                },
               ]}
             >
               TOML
@@ -290,14 +290,19 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
             <Text
               style={[
                 styles.scopeText,
-                { color: scope === "env" ? theme.accentText : theme.textMuted, fontFamily: theme.fontSans },
+                {
+                  color: scope === "env" ? theme.accentText : theme.textMuted,
+                  fontFamily: theme.fontSans,
+                },
               ]}
             >
               ENV
             </Text>
           </Pressable>
           <View style={styles.switchWrap}>
-            <Text style={[styles.switchLabel, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            <Text
+              style={[styles.switchLabel, { color: theme.textMuted, fontFamily: theme.fontSans }]}
+            >
               JSON parse
             </Text>
             <Switch value={parseAsJson} onValueChange={setParseAsJson} />
@@ -306,7 +311,9 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
         <TextInput
           value={key}
           onChangeText={setKey}
-          placeholder={scope === "env" ? "PUSHPALS_SERVER_URL" : "remotebuddy.autonomy.tick_interval_ms"}
+          placeholder={
+            scope === "env" ? "PUSHPALS_SERVER_URL" : "remotebuddy.autonomy.tick_interval_ms"
+          }
           placeholderTextColor={theme.textMuted}
           style={[
             styles.input,
@@ -322,7 +329,7 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
         <TextInput
           value={valueText}
           onChangeText={setValueText}
-          placeholder={parseAsJson ? "\"string\" | 120000 | true | [1,2]" : "raw string"}
+          placeholder={parseAsJson ? '"string" | 120000 | true | [1,2]' : "raw string"}
           placeholderTextColor={theme.textMuted}
           style={[
             styles.input,
@@ -350,7 +357,9 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
             ]}
             disabled={saving}
           >
-            <Text style={[styles.buttonText, { color: theme.accentText, fontFamily: theme.fontSans }]}>
+            <Text
+              style={[styles.buttonText, { color: theme.accentText, fontFamily: theme.fontSans }]}
+            >
               {saving ? "Applying..." : "Apply"}
             </Text>
           </Pressable>
@@ -401,7 +410,9 @@ export function ConfigPane({ baseUrl, authToken, theme }: ConfigPaneProps) {
               <Text style={[styles.entryKey, { color: theme.text, fontFamily: theme.fontMono }]}>
                 {entry.key}
               </Text>
-              <Text style={[styles.entryValue, { color: theme.textMuted, fontFamily: theme.fontMono }]}>
+              <Text
+                style={[styles.entryValue, { color: theme.textMuted, fontFamily: theme.fontMono }]}
+              >
                 {displayValue(entry.value)}
               </Text>
             </Pressable>

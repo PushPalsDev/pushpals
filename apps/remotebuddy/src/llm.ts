@@ -503,7 +503,8 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
     model,
     apiKey,
     sessionId,
-    reasoningEffort: firstNonEmpty(opts.reasoningEffort, serviceLlmConfig.reasoningEffort, "") ?? "",
+    reasoningEffort:
+      firstNonEmpty(opts.reasoningEffort, serviceLlmConfig.reasoningEffort, "") ?? "",
     codexAuthMode: requestedCodexAuthMode,
     codexBin: firstNonEmpty(opts.codexBin, serviceLlmConfig.codexBin, "") ?? "",
     codexTimeoutMs: opts.codexTimeoutMs ?? serviceLlmConfig.codexTimeoutMs,
@@ -1368,9 +1369,11 @@ export class OpenAiCodexCliClient implements LLMClient {
     this.usageReporter = opts?.usageReporter ?? null;
   }
 
-  private async maybeReportUsage(
-    usage: { promptTokens: number; completionTokens: number; estimated: boolean },
-  ): Promise<void> {
+  private async maybeReportUsage(usage: {
+    promptTokens: number;
+    completionTokens: number;
+    estimated: boolean;
+  }): Promise<void> {
     if (!this.usageReporter) return;
     try {
       await this.usageReporter.reportUsage({
@@ -1563,9 +1566,11 @@ export class OllamaClient implements LLMClient {
     this.usageReporter = opts?.usageReporter ?? null;
   }
 
-  private async maybeReportUsage(
-    usage: { promptTokens: number; completionTokens: number; estimated: boolean },
-  ): Promise<void> {
+  private async maybeReportUsage(usage: {
+    promptTokens: number;
+    completionTokens: number;
+    estimated: boolean;
+  }): Promise<void> {
     if (!this.usageReporter) return;
     try {
       await this.usageReporter.reportUsage({
@@ -1671,7 +1676,10 @@ export class OllamaClient implements LLMClient {
 
     const data = (await res.json()) as any;
     const text = data.message?.content ?? "";
-    const usage = normalizeTokenUsage(undefined, tokenUsageFromEstimate(body.messages as Array<{ role: string; content: string }>, text));
+    const usage = normalizeTokenUsage(
+      undefined,
+      tokenUsageFromEstimate(body.messages as Array<{ role: string; content: string }>, text),
+    );
     await this.maybeReportUsage(usage);
     return {
       text,

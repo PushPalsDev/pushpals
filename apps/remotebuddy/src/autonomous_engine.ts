@@ -28,7 +28,12 @@ type AutonomyCandidate = {
   title: string;
   objective_type: AutonomyObjectiveType;
   problem_statement: string;
-  trigger_type: "test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal";
+  trigger_type:
+    | "test_failure"
+    | "lint_failure"
+    | "typecheck_failure"
+    | "queue_health"
+    | "regret_signal";
   component_area: AutonomyComponentArea;
   target_paths: string[];
   scope: {
@@ -265,7 +270,9 @@ const AUTO_INGEST_SEED_PATTERNS: Array<{
       "Throttle autonomous dispatch based on queue pressure and available idle worker capacity to reduce thrash.",
     tags: ["queue", "backpressure", "scheduling", "autonomy"],
     risks: ["Over-throttling can starve high-value opportunities."],
-    validation: ["Replay queue snapshots and confirm p95 latency improves without collapsing throughput."],
+    validation: [
+      "Replay queue snapshots and confirm p95 latency improves without collapsing throughput.",
+    ],
     qualityScore: 0.78,
     freshnessScore: 0.82,
   },
@@ -287,7 +294,9 @@ const AUTO_INGEST_SEED_PATTERNS: Array<{
       "Adapt exploration rate using recent regret pressure and prior diversity to balance reliability with novelty.",
     tags: ["bandit", "explore-exploit", "novelty", "engine"],
     risks: ["Too much exploration can increase failed dispatches."],
-    validation: ["Track novelty diversity and successful dispatch rate across rolling 24h windows."],
+    validation: [
+      "Track novelty diversity and successful dispatch rate across rolling 24h windows.",
+    ],
     qualityScore: 0.76,
     freshnessScore: 0.79,
   },
@@ -342,7 +351,8 @@ export function docsWeakEvidencePenaltyForImpact(
   const normalizedImpact = clamp01(impactSignal);
   if (normalizedImpact >= DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY) return 0;
   const gapRatio =
-    (DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY - normalizedImpact) / DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY;
+    (DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY - normalizedImpact) /
+    DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY;
   const penalty = DOCS_WEAK_EVIDENCE_MAX_PENALTY * clamp01(gapRatio);
   return Math.round(penalty * 1_000_000) / 1_000_000;
 }
@@ -359,10 +369,7 @@ export function feedbackPriorSignalForScoring(prior: FeedbackPriorForScoring): {
   const emaLatency = clamp01(asNumber(prior?.ema_latency, 0));
   const emaRegret = clamp01(asNumber(prior?.ema_regret, 0));
   const priorScore =
-    0.12 * emaSuccess +
-    0.08 * emaUserAccept +
-    0.06 * emaLatency +
-    0.04 * (1 - emaRegret);
+    0.12 * emaSuccess + 0.08 * emaUserAccept + 0.06 * emaLatency + 0.04 * (1 - emaRegret);
   return {
     emaSuccess,
     emaUserAccept,
@@ -401,10 +408,7 @@ export function engineIdeaPriorSignalForScoring(prior: EngineIdeaPriorForScoring
   const emaRegret = clamp01(asNumber(prior?.ema_regret, 0));
   const noveltyScore = 1 - clamp01(sampleCount / ENGINE_NOVELTY_SAMPLE_SATURATION);
   const priorScore =
-    0.08 * emaSuccess +
-    0.05 * emaUserAccept +
-    0.03 * emaLatency +
-    0.02 * (1 - emaRegret);
+    0.08 * emaSuccess + 0.05 * emaUserAccept + 0.03 * emaLatency + 0.02 * (1 - emaRegret);
   return {
     emaSuccess,
     emaUserAccept,
@@ -453,7 +457,8 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
       trustScore,
       freshnessScore,
       trustBoost: 0,
-      curationPenalty: curationStatus === "archived" ? 0.14 : curationStatus === "watchlist" ? 0.05 : 0,
+      curationPenalty:
+        curationStatus === "archived" ? 0.14 : curationStatus === "watchlist" ? 0.05 : 0,
     };
   }
   const emaSuccess = clamp01(asNumber(prior?.ema_success, 0));
@@ -462,13 +467,11 @@ export function engineSourcePriorSignalForScoring(prior: EngineSourcePriorForSco
   const emaRegret = clamp01(asNumber(prior?.ema_regret, 0));
   const noveltyScore = 1 - clamp01(sampleCount / ENGINE_NOVELTY_SAMPLE_SATURATION);
   const rawPriorScore =
-    0.06 * emaSuccess +
-    0.04 * emaUserAccept +
-    0.03 * emaLatency +
-    0.02 * (1 - emaRegret);
+    0.06 * emaSuccess + 0.04 * emaUserAccept + 0.03 * emaLatency + 0.02 * (1 - emaRegret);
   const priorScore = rawPriorScore * (0.45 + 0.55 * freshnessScore);
   const trustBoost = curationStatus === "trusted" ? 0.04 * Math.max(trustScore, 0.6) : 0;
-  const curationPenalty = curationStatus === "archived" ? 0.14 : curationStatus === "watchlist" ? 0.05 : 0;
+  const curationPenalty =
+    curationStatus === "archived" ? 0.14 : curationStatus === "watchlist" ? 0.05 : 0;
   const noveltyBonus = curationStatus === "archived" ? 0 : 0.03 * noveltyScore;
   return {
     emaSuccess,
@@ -558,7 +561,9 @@ export function computeAdaptiveExploreRate(params: {
     ),
   );
 
-  const feedback = Array.isArray(params.snapshot.feedback_priors) ? params.snapshot.feedback_priors : [];
+  const feedback = Array.isArray(params.snapshot.feedback_priors)
+    ? params.snapshot.feedback_priors
+    : [];
   let weightedTotal = 0;
   let weightedSuccess = 0;
   let weightedUserAccept = 0;
@@ -706,7 +711,12 @@ export interface EngineOpportunityGap {
 
 export interface EngineCandidateShape {
   objective_type: AutonomyObjectiveType;
-  trigger_type: "test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal";
+  trigger_type:
+    | "test_failure"
+    | "lint_failure"
+    | "typecheck_failure"
+    | "queue_health"
+    | "regret_signal";
   component_area: AutonomyComponentArea;
   target_paths: string[];
   write_globs: string[];
@@ -972,7 +982,8 @@ function tokenizePath(value: string): string[] {
 
 function buildRepoTargetProfile(targetPath: string): RepoTargetProfile {
   const normalized = asString(targetPath).replace(/\\/g, "/");
-  const componentArea = normalizeAutonomyComponentArea(pathDirname(normalized) || normalized) ?? normalized;
+  const componentArea =
+    normalizeAutonomyComponentArea(pathDirname(normalized) || normalized) ?? normalized;
   const keywords = [...new Set([...tokenizePath(componentArea), ...tokenizePath(normalized)])];
   return {
     component_area: componentArea,
@@ -1053,7 +1064,12 @@ function discoverRepoTargetProfiles(repoRoot: string, maxProfiles = 16): RepoTar
     }
   }
   if (profiles.length < maxProfiles) {
-    const rootFiles = collectRepoTargetFiles(repoRoot, "", Math.max(4, maxProfiles - profiles.length), 2);
+    const rootFiles = collectRepoTargetFiles(
+      repoRoot,
+      "",
+      Math.max(4, maxProfiles - profiles.length),
+      2,
+    );
     for (const file of rootFiles) {
       add(file);
       if (profiles.length >= maxProfiles) return profiles;
@@ -1077,8 +1093,13 @@ function chooseRepoTargetProfile(
       if (profile.label.toLowerCase().includes(token)) score += 1;
     }
     if (triggerType === "test_failure" && /(^|\/)(test|tests)\//.test(profile.label)) score += 3;
-    if (triggerType === "queue_health" && /(server|api|queue|worker|job|task)/i.test(profile.label)) score += 2;
-    if (triggerType === "regret_signal" && /(src|app|lib|server|client|docs|readme)/i.test(profile.label)) score += 1;
+    if (triggerType === "queue_health" && /(server|api|queue|worker|job|task)/i.test(profile.label))
+      score += 2;
+    if (
+      triggerType === "regret_signal" &&
+      /(src|app|lib|server|client|docs|readme)/i.test(profile.label)
+    )
+      score += 1;
     if (!best || score > best.score) best = { profile, score };
   }
   return best?.profile ?? profiles[0] ?? null;
@@ -1091,12 +1112,18 @@ function adaptCandidateShapeToRepo(params: {
   hints?: string[];
 }): EngineCandidateShape {
   const shape = params.shape;
-  const scopeValidation = validateScopeInvariants(shape.component_area, shape.target_paths, shape.write_globs, {
-    requireWriteGlobs: true,
-  });
+  const scopeValidation = validateScopeInvariants(
+    shape.component_area,
+    shape.target_paths,
+    shape.write_globs,
+    {
+      requireWriteGlobs: true,
+    },
+  );
   const pathsExist =
     params.repoRoot && scopeValidation.ok
-      ? findMissingRepoTargetPaths(params.repoRoot, scopeValidation.normalizedTargetPaths).length === 0
+      ? findMissingRepoTargetPaths(params.repoRoot, scopeValidation.normalizedTargetPaths)
+          .length === 0
       : scopeValidation.ok;
   if (scopeValidation.ok && pathsExist) {
     return {
@@ -1108,12 +1135,7 @@ function adaptCandidateShapeToRepo(params: {
   }
   const selected = chooseRepoTargetProfile(
     params.repoTargets ?? [],
-    [
-      shape.component_area,
-      ...shape.target_paths,
-      ...shape.write_globs,
-      ...(params.hints ?? []),
-    ],
+    [shape.component_area, ...shape.target_paths, ...shape.write_globs, ...(params.hints ?? [])],
     shape.trigger_type,
   );
   if (!selected) return shape;
@@ -1307,7 +1329,8 @@ const ENGINE_IDEA_BLUEPRINTS: EngineIdeaBlueprint[] = [
   {
     id: "opportunity_graph_pipeline",
     algorithm: "opportunity_graph",
-    summary: "Model queue/review/runtime friction as an opportunity graph and prioritize highest leverage edges.",
+    summary:
+      "Model queue/review/runtime friction as an opportunity graph and prioritize highest leverage edges.",
     hypothesis:
       "Graph-ranked bottlenecks improve throughput without increasing risk by focusing on high-friction links.",
     objective_ids: ["reliable_autonomous_delivery", "workforce_scaling"],
@@ -1325,7 +1348,8 @@ const ENGINE_IDEA_BLUEPRINTS: EngineIdeaBlueprint[] = [
   {
     id: "motif_miner_learning_loop",
     algorithm: "motif_miner",
-    summary: "Mine successful local commit/PR motifs and bias candidate generation toward those patterns.",
+    summary:
+      "Mine successful local commit/PR motifs and bias candidate generation toward those patterns.",
     hypothesis:
       "Learning from accepted local motifs lowers review churn and improves merge conversion.",
     objective_ids: ["merge_conversion_and_rework", "workforce_scaling"],
@@ -1379,7 +1403,8 @@ const ENGINE_IDEA_BLUEPRINTS: EngineIdeaBlueprint[] = [
   {
     id: "portfolio_bandit_dispatch",
     algorithm: "portfolio_bandit",
-    summary: "Allocate dispatch budget across reliability, mergeability, activation, and governance idea portfolios.",
+    summary:
+      "Allocate dispatch budget across reliability, mergeability, activation, and governance idea portfolios.",
     hypothesis:
       "Portfolio-based dispatch improves aggregate repo outcomes versus single-metric greedy selection.",
     objective_ids: [
@@ -1402,7 +1427,8 @@ const ENGINE_IDEA_BLUEPRINTS: EngineIdeaBlueprint[] = [
   {
     id: "counterfactual_impact_estimator",
     algorithm: "counterfactual_impact",
-    summary: "Estimate prevented incidents/rework if a proposed feature had existed over recent runs.",
+    summary:
+      "Estimate prevented incidents/rework if a proposed feature had existed over recent runs.",
     hypothesis:
       "Counterfactual scoring improves prioritization of ideas with measurable practical payoff.",
     objective_ids: ["reliable_autonomous_delivery", "merge_conversion_and_rework"],
@@ -1474,8 +1500,14 @@ type SourceCurationInsightInput = {
 };
 
 const INSPIRATION_COMPONENT_HINTS: Array<{ area: AutonomyComponentArea; pattern: RegExp }> = [
-  { area: "apps/server", pattern: /\b(server|queue|backpressure|dispatch|snapshot|lock|db|sqlite|status)\b/i },
-  { area: "apps/remotebuddy", pattern: /\b(remotebuddy|autonomous engine|ideation|planner|scoring)\b/i },
+  {
+    area: "apps/server",
+    pattern: /\b(server|queue|backpressure|dispatch|snapshot|lock|db|sqlite|status)\b/i,
+  },
+  {
+    area: "apps/remotebuddy",
+    pattern: /\b(remotebuddy|autonomous engine|ideation|planner|scoring)\b/i,
+  },
   { area: "apps/workerpals", pattern: /\b(worker|workerpal|sandbox|executor|task\.execute)\b/i },
   { area: "apps/client", pattern: /\b(client|ui|frontend|dashboard|react)\b/i },
   { area: "packages/protocol", pattern: /\b(protocol|schema|contract|wire format)\b/i },
@@ -1487,7 +1519,8 @@ const INSPIRATION_COMPONENT_HINTS: Array<{ area: AutonomyComponentArea; pattern:
 const GAP_TEXT_RULES: Array<{ gapId: string; pattern: RegExp }> = [
   {
     gapId: "delivery_reliability_gap",
-    pattern: /\b(reliab|stability|startup|failure|flake|retry|incident|runtime|preflight|timeout)\b/i,
+    pattern:
+      /\b(reliab|stability|startup|failure|flake|retry|incident|runtime|preflight|timeout)\b/i,
   },
   {
     gapId: "merge_rework_gap",
@@ -1611,7 +1644,9 @@ function average(values: number[]): number {
 
 function maxSignalScore(
   snapshot: EngineIdeaInputSnapshot,
-  types: Array<"test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal">,
+  types: Array<
+    "test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal"
+  >,
 ): number {
   return clamp01(
     Math.max(
@@ -1644,7 +1679,7 @@ function maxTraitScore(snapshot: EngineIdeaInputSnapshot, pattern: RegExp): numb
             pattern.test(String(trait.trait_id ?? "")),
         )
         .map((trait) => asNumber(trait.score, 0)),
-      ),
+    ),
   );
 }
 
@@ -1680,14 +1715,19 @@ function inferComponentAreaFromText(
 
 function inferObjectiveTypeFromText(text: string, tags: string[]): AutonomyObjectiveType {
   const tagSet = new Set(tags);
-  if (tagSet.has("flaky_test") || tagSet.has("flake") || /\b(flaky|flake)\b/i.test(text)) return "flaky_test";
+  if (tagSet.has("flaky_test") || tagSet.has("flake") || /\b(flaky|flake)\b/i.test(text))
+    return "flaky_test";
   if (tagSet.has("lint_fix") || /\b(lint|format)\b/i.test(text)) return "lint_fix";
-  if (tagSet.has("type_fix") || /\b(typecheck|typing|typescript|type error)\b/i.test(text)) return "type_fix";
+  if (tagSet.has("type_fix") || /\b(typecheck|typing|typescript|type error)\b/i.test(text))
+    return "type_fix";
   if (tagSet.has("docs") || /\b(doc|readme|onboarding guide)\b/i.test(text)) return "docs";
   if (tagSet.has("small_refactor") || /\b(refactor|cleanup|simplify|hardening)\b/i.test(text)) {
     return "small_refactor";
   }
-  if (tagSet.has("feature_medium") || /\b(portfolio|planner|bandit|framework|capability)\b/i.test(text)) {
+  if (
+    tagSet.has("feature_medium") ||
+    /\b(portfolio|planner|bandit|framework|capability)\b/i.test(text)
+  ) {
     return "feature_medium";
   }
   return "feature_small";
@@ -1696,7 +1736,8 @@ function inferObjectiveTypeFromText(text: string, tags: string[]): AutonomyObjec
 function inferTriggerTypeFromText(
   text: string,
 ): "test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal" {
-  if (/\b(queue|backpressure|throughput|latency|pending|capacity)\b/i.test(text)) return "queue_health";
+  if (/\b(queue|backpressure|throughput|latency|pending|capacity)\b/i.test(text))
+    return "queue_health";
   if (/\b(lint|format)\b/i.test(text)) return "lint_failure";
   if (/\b(typecheck|type error|typing|typescript)\b/i.test(text)) return "typecheck_failure";
   if (/\b(test|flake|flaky|failing test)\b/i.test(text)) return "test_failure";
@@ -1711,9 +1752,9 @@ function inferRiskLevelFromText(text: string, tags: string[]): "low" | "medium" 
 }
 
 function matchObjectiveIdsFromText(text: string, fallback: CompiledVisionObjective[]): string[] {
-  const matched = ENGINE_OBJECTIVE_BLUEPRINTS.filter((entry) => entry.keywordPattern.test(text)).map(
-    (entry) => entry.id,
-  );
+  const matched = ENGINE_OBJECTIVE_BLUEPRINTS.filter((entry) =>
+    entry.keywordPattern.test(text),
+  ).map((entry) => entry.id);
   if (matched.length > 0) return matched.slice(0, 4);
   return fallback.slice(0, 2).map((entry) => entry.id);
 }
@@ -1754,7 +1795,9 @@ function normalizeInspirationPattern(value: unknown): InspirationPatternInput | 
     raw.sourceCurationStatus ?? raw.source_curation_status ?? metadata.source_curation_status,
   );
   const sourceCurationReason =
-    asString(raw.sourceCurationReason ?? raw.source_curation_reason ?? metadata.source_curation_reason) || null;
+    asString(
+      raw.sourceCurationReason ?? raw.source_curation_reason ?? metadata.source_curation_reason,
+    ) || null;
   const sourceTrustScore = clamp01(
     asNumber(raw.sourceTrustScore ?? raw.source_trust_score ?? metadata.source_trust_score, 0),
   );
@@ -1827,7 +1870,8 @@ function applySourceCurationToPatterns(
 
   const curated = patterns
     .map((pattern) => {
-      const insight = insightBySourceKey.get(pattern.sourceKey) ?? insightByFingerprint.get(pattern.fingerprint);
+      const insight =
+        insightBySourceKey.get(pattern.sourceKey) ?? insightByFingerprint.get(pattern.fingerprint);
       if (!insight) {
         if (pattern.sourceCurationStatus === "archived") return null;
         return pattern;
@@ -1883,7 +1927,8 @@ function buildCandidateShapeFromPattern(params: {
   repoTargets?: RepoTargetProfile[];
 }): EngineCandidateShape {
   const pattern = params.pattern;
-  const text = `${pattern.algorithm}\n${pattern.whenToUse}\n${pattern.summary}\n${pattern.tags.join(" ")}`.toLowerCase();
+  const text =
+    `${pattern.algorithm}\n${pattern.whenToUse}\n${pattern.summary}\n${pattern.tags.join(" ")}`.toLowerCase();
   const metadata = pattern.metadata;
   const metadataShape = asObject(metadata.candidate_shape ?? metadata.candidateShape);
   const metadataArea =
@@ -1899,13 +1944,18 @@ function buildCandidateShapeFromPattern(params: {
   const triggerType = isTriggerType(triggerTypeRaw)
     ? triggerTypeRaw
     : inferTriggerTypeFromText(text);
-  const componentArea = metadataArea ?? inferComponentAreaFromText(text, params.repoTargets, triggerType);
+  const componentArea =
+    metadataArea ?? inferComponentAreaFromText(text, params.repoTargets, triggerType);
   const defaults = defaultCandidateShapeForArea(componentArea);
   const objectiveType =
-    asAutonomyObjectiveType(metadataShape.objective_type ?? metadataShape.objectiveType ?? metadata.objective_type) ??
+    asAutonomyObjectiveType(
+      metadataShape.objective_type ?? metadataShape.objectiveType ?? metadata.objective_type,
+    ) ??
     inferObjectiveTypeFromText(text, pattern.tags) ??
     defaults.objective_type;
-  const riskRaw = asString(metadataShape.risk_level ?? metadataShape.riskLevel ?? metadata.risk_level);
+  const riskRaw = asString(
+    metadataShape.risk_level ?? metadataShape.riskLevel ?? metadata.risk_level,
+  );
   const riskLevel = isRiskLevel(riskRaw) ? riskRaw : inferRiskLevelFromText(text, pattern.tags);
   const targetPaths = asStringArray(
     metadataShape.target_paths ?? metadataShape.targetPaths ?? metadata.target_paths,
@@ -1958,7 +2008,9 @@ function buildExternalInspirationBlocks(params: {
   repoRoot?: string;
   repoTargets?: RepoTargetProfile[];
 }): EngineIdeaBuildingBlock[] {
-  const objectiveWeightById = new Map(params.compiledObjectives.map((entry) => [entry.id, entry.weight]));
+  const objectiveWeightById = new Map(
+    params.compiledObjectives.map((entry) => [entry.id, entry.weight]),
+  );
   const gapScoreById = new Map(params.opportunityGaps.map((entry) => [entry.id, entry.score]));
   return params.patterns
     .map((pattern) => {
@@ -1971,10 +2023,19 @@ function buildExternalInspirationBlocks(params: {
         repoTargets: params.repoTargets,
       });
       const objectiveSignal = clamp01(
-        average(objectiveIds.map((id) => objectiveWeightById.get(id) ?? 0).filter((value) => Number.isFinite(value))),
+        average(
+          objectiveIds
+            .map((id) => objectiveWeightById.get(id) ?? 0)
+            .filter((value) => Number.isFinite(value)),
+        ),
       );
       const gapSignal = clamp01(
-        Math.max(0, ...gapIds.map((id) => gapScoreById.get(id) ?? 0).filter((value) => Number.isFinite(value))),
+        Math.max(
+          0,
+          ...gapIds
+            .map((id) => gapScoreById.get(id) ?? 0)
+            .filter((value) => Number.isFinite(value)),
+        ),
       );
       const sourceSignal = clamp01(
         0.42 * pattern.qualityScore +
@@ -2001,7 +2062,9 @@ function buildExternalInspirationBlocks(params: {
           0.16 * noveltySignal -
           0.08 * params.dispatchSaturation,
       );
-      const sourceLabel = pattern.sourceLabel ? `source=${pattern.sourceLabel}` : `source=${pattern.sourceType}`;
+      const sourceLabel = pattern.sourceLabel
+        ? `source=${pattern.sourceLabel}`
+        : `source=${pattern.sourceType}`;
       return {
         id: `insp_${pattern.fingerprint.slice(0, 12)}`,
         algorithm: pattern.algorithm,
@@ -2038,7 +2101,10 @@ function buildExternalInspirationBlocks(params: {
 }
 
 export function summarizeCommitHistoryHints(subjects: string[]): EngineCommitHistoryHint[] {
-  const normalizedSubjects = subjects.map((entry) => asString(entry)).filter(Boolean).slice(0, 240);
+  const normalizedSubjects = subjects
+    .map((entry) => asString(entry))
+    .filter(Boolean)
+    .slice(0, 240);
   if (normalizedSubjects.length === 0) return [];
   const denominator = Math.max(6, Math.min(24, normalizedSubjects.length));
   const hints: EngineCommitHistoryHint[] = [];
@@ -2070,7 +2136,9 @@ function buildCommitHistoryBlocks(params: {
   repoRoot?: string;
   repoTargets?: RepoTargetProfile[];
 }): EngineIdeaBuildingBlock[] {
-  const objectiveWeightById = new Map(params.compiledObjectives.map((entry) => [entry.id, entry.weight]));
+  const objectiveWeightById = new Map(
+    params.compiledObjectives.map((entry) => [entry.id, entry.weight]),
+  );
   const gapScoreById = new Map(params.opportunityGaps.map((entry) => [entry.id, entry.score]));
   return params.hints
     .slice(0, 6)
@@ -2093,7 +2161,9 @@ function buildCommitHistoryBlocks(params: {
       const gapSignal = clamp01(
         Math.max(
           0,
-          ...hint.gap_ids.map((id) => gapScoreById.get(id) ?? 0).filter((value) => Number.isFinite(value)),
+          ...hint.gap_ids
+            .map((id) => gapScoreById.get(id) ?? 0)
+            .filter((value) => Number.isFinite(value)),
         ),
       );
       const recentTypeCount = Math.max(
@@ -2162,10 +2232,7 @@ export function adjacent_possible(params: {
   const hints = Array.isArray(params.hints) ? params.hints : [];
   const gaps = Array.isArray(params.gaps) ? params.gaps : [];
   const configuredMax = Number.isFinite(params.maxIdeas)
-    ? Math.max(
-        0,
-        Math.min(ADJACENT_POSSIBLE_MAX_IDEAS, Math.floor(Number(params.maxIdeas))),
-      )
+    ? Math.max(0, Math.min(ADJACENT_POSSIBLE_MAX_IDEAS, Math.floor(Number(params.maxIdeas))))
     : ADJACENT_POSSIBLE_DEFAULT_MAX_IDEAS;
   const maxIdeas = configuredMax;
   const minSignal = clamp01(
@@ -2275,7 +2342,9 @@ export function adjacent_possible(params: {
     const shouldReplace =
       signal > aggregated.signal ||
       (signal === aggregated.signal && count > aggregated.count) ||
-      (signal === aggregated.signal && count === aggregated.count && index > aggregated.sourceIndex);
+      (signal === aggregated.signal &&
+        count === aggregated.count &&
+        index > aggregated.sourceIndex);
     if (shouldReplace) {
       aggregatedMotifMap.set(motifId, {
         motifId,
@@ -2376,9 +2445,7 @@ export function adjacent_possible(params: {
       });
       continue;
     }
-    const novelty = clamp01(
-      1 - clamp01(hint.count / ADJACENT_POSSIBLE_NOVELTY_DIVISOR),
-    );
+    const novelty = clamp01(1 - clamp01(hint.count / ADJACENT_POSSIBLE_NOVELTY_DIVISOR));
     eligibleMotifs.push({
       rule,
       motifId,
@@ -2527,7 +2594,11 @@ export function buildEngineInspirationContext(params: {
     } satisfies CompiledVisionObjective;
   }).sort((a, b) => b.weight - a.weight);
 
-  const failureSignal = maxSignalScore(params.snapshot, ["test_failure", "lint_failure", "typecheck_failure"]);
+  const failureSignal = maxSignalScore(params.snapshot, [
+    "test_failure",
+    "lint_failure",
+    "typecheck_failure",
+  ]);
   const queueSignal = maxSignalScore(params.snapshot, ["queue_health"]);
   const regretSignal = maxSignalScore(params.snapshot, ["regret_signal"]);
   const reliabilityTrait = maxTraitScore(
@@ -2557,7 +2628,9 @@ export function buildEngineInspirationContext(params: {
     {
       id: "delivery_reliability_gap",
       label: "Delivery reliability gap",
-      score: clamp01(0.5 * failureSignal + 0.25 * reliabilityTrait + 0.15 * queueSignal + 0.1 * regretSignal),
+      score: clamp01(
+        0.5 * failureSignal + 0.25 * reliabilityTrait + 0.15 * queueSignal + 0.1 * regretSignal,
+      ),
       evidence: [
         `failure_signal=${failureSignal.toFixed(2)}`,
         `reliability_trait=${reliabilityTrait.toFixed(2)}`,
@@ -2610,50 +2683,60 @@ export function buildEngineInspirationContext(params: {
   const gapScoreById = new Map(opportunityGaps.map((entry) => [entry.id, entry.score]));
   const dispatchByType = params.snapshot.dispatch_budget.by_type_count_last_hour ?? {};
 
-  const staticBuildingBlocks: EngineIdeaBuildingBlock[] = ENGINE_IDEA_BLUEPRINTS.map((blueprint) => {
-    const candidateShape = adaptCandidateShapeToRepo({
-      shape: blueprint.candidate_shape,
-      repoRoot: params.repoRoot,
-      repoTargets: params.repoTargets,
-      hints: [blueprint.algorithm, blueprint.summary, blueprint.hypothesis, ...blueprint.objective_ids, ...blueprint.gap_ids],
-    });
-    const objectiveWeights = blueprint.objective_ids
-      .map((id) => objectiveWeightById.get(id) ?? 0)
-      .filter((value) => Number.isFinite(value));
-    const gapScores = blueprint.gap_ids
-      .map((id) => gapScoreById.get(id) ?? 0)
-      .filter((value) => Number.isFinite(value));
-    const objectiveSignal = clamp01(average(objectiveWeights));
-    const gapSignal = clamp01(Math.max(0, ...gapScores));
-    const recentTypeCount = Math.max(
-      0,
-      Math.floor(asNumber(dispatchByType[candidateShape.objective_type], 0)),
-    );
-    const noveltySignal = clamp01(1 - recentTypeCount / 6);
-    const score = clamp01(
-      0.52 * objectiveSignal +
-        0.33 * gapSignal +
-        0.2 * noveltySignal -
-        0.08 * dispatchSaturation,
-    );
-    return {
-      ...blueprint,
-      candidate_shape: candidateShape,
-      score,
-      evidence: [
-        `objective_signal=${objectiveSignal.toFixed(2)}`,
-        `gap_signal=${gapSignal.toFixed(2)}`,
-        `novelty_signal=${noveltySignal.toFixed(2)}`,
-        `dispatch_saturation=${dispatchSaturation.toFixed(2)}`,
-      ],
-    };
-  });
+  const staticBuildingBlocks: EngineIdeaBuildingBlock[] = ENGINE_IDEA_BLUEPRINTS.map(
+    (blueprint) => {
+      const candidateShape = adaptCandidateShapeToRepo({
+        shape: blueprint.candidate_shape,
+        repoRoot: params.repoRoot,
+        repoTargets: params.repoTargets,
+        hints: [
+          blueprint.algorithm,
+          blueprint.summary,
+          blueprint.hypothesis,
+          ...blueprint.objective_ids,
+          ...blueprint.gap_ids,
+        ],
+      });
+      const objectiveWeights = blueprint.objective_ids
+        .map((id) => objectiveWeightById.get(id) ?? 0)
+        .filter((value) => Number.isFinite(value));
+      const gapScores = blueprint.gap_ids
+        .map((id) => gapScoreById.get(id) ?? 0)
+        .filter((value) => Number.isFinite(value));
+      const objectiveSignal = clamp01(average(objectiveWeights));
+      const gapSignal = clamp01(Math.max(0, ...gapScores));
+      const recentTypeCount = Math.max(
+        0,
+        Math.floor(asNumber(dispatchByType[candidateShape.objective_type], 0)),
+      );
+      const noveltySignal = clamp01(1 - recentTypeCount / 6);
+      const score = clamp01(
+        0.52 * objectiveSignal + 0.33 * gapSignal + 0.2 * noveltySignal - 0.08 * dispatchSaturation,
+      );
+      return {
+        ...blueprint,
+        candidate_shape: candidateShape,
+        score,
+        evidence: [
+          `objective_signal=${objectiveSignal.toFixed(2)}`,
+          `gap_signal=${gapSignal.toFixed(2)}`,
+          `novelty_signal=${noveltySignal.toFixed(2)}`,
+          `dispatch_saturation=${dispatchSaturation.toFixed(2)}`,
+        ],
+      };
+    },
+  );
 
-  const normalizedPatterns = (Array.isArray(params.inspirationPatterns) ? params.inspirationPatterns : [])
+  const normalizedPatterns = (
+    Array.isArray(params.inspirationPatterns) ? params.inspirationPatterns : []
+  )
     .map((entry) => normalizeInspirationPattern(entry))
     .filter((entry): entry is InspirationPatternInput => Boolean(entry));
   const sourceInsights = Array.isArray(params.sourceInsights) ? params.sourceInsights : [];
-  const curatedPatterns = applySourceCurationToPatterns(normalizedPatterns, sourceInsights).slice(0, 80);
+  const curatedPatterns = applySourceCurationToPatterns(normalizedPatterns, sourceInsights).slice(
+    0,
+    80,
+  );
   const sourcePatterns: EngineInspirationSourcePattern[] = curatedPatterns.map((pattern) => ({
     id: pattern.id,
     source_type: pattern.sourceType,
@@ -2756,7 +2839,9 @@ function normalizeEngineTrialMetadata(
   const sourceRaw = asString(raw.source).toLowerCase();
   const source =
     sourceRaw === "engine_fallback" || sourceRaw === "engine_mapped" ? sourceRaw : "llm";
-  const score = Number.isFinite(asNumber(raw.score, Number.NaN)) ? asNumber(raw.score, 0) : undefined;
+  const score = Number.isFinite(asNumber(raw.score, Number.NaN))
+    ? asNumber(raw.score, 0)
+    : undefined;
   const sourceType = asString(raw.source_type ?? raw.sourceType);
   const sourceLabel = asString(raw.source_label ?? raw.sourceLabel);
   const sourceUrl = asString(raw.source_url ?? raw.sourceUrl);
@@ -2842,7 +2927,10 @@ export function buildEngineFallbackCandidates(params: {
     ? Math.max(1, Math.min(6, Math.floor(params.maxCandidates as number)))
     : 3;
   const objectiveTitleById = new Map(
-    params.engineInspiration.compiled_objectives.map((objective) => [objective.id, objective.title]),
+    params.engineInspiration.compiled_objectives.map((objective) => [
+      objective.id,
+      objective.title,
+    ]),
   );
   const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
 
@@ -2856,7 +2944,10 @@ export function buildEngineFallbackCandidates(params: {
         repoTargets: params.repoTargets,
         hints: [block.algorithm, block.summary, block.hypothesis, ...block.evidence],
       });
-      const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, block.candidate_shape.trigger_type);
+      const signalIds = pickSignalIdsForTrigger(
+        params.snapshotTopSignals,
+        block.candidate_shape.trigger_type,
+      );
       const objectiveTitles = block.objective_ids
         .map((id) => objectiveTitleById.get(id))
         .filter((value): value is string => typeof value === "string" && value.length > 0)
@@ -2895,8 +2986,7 @@ export function buildEngineFallbackCandidates(params: {
         estimated_effort: idx === 0 ? "small" : "medium",
         why_now_signal_ids: signalIds,
         confidence: clamp01(0.45 + block.score * 0.5),
-        vision_alignment_reason:
-          `Prioritize ${primaryObjectiveTitle} using ${block.algorithm}; score=${block.score.toFixed(2)}.`,
+        vision_alignment_reason: `Prioritize ${primaryObjectiveTitle} using ${block.algorithm}; score=${block.score.toFixed(2)}.`,
         vision_section_refs: sectionRefs,
         feature_hypotheses: [
           block.summary,
@@ -2971,7 +3061,12 @@ function isRiskLevel(value: string): value is "low" | "medium" | "high" {
 
 function isTriggerType(
   value: string,
-): value is "test_failure" | "lint_failure" | "typecheck_failure" | "queue_health" | "regret_signal" {
+): value is
+  | "test_failure"
+  | "lint_failure"
+  | "typecheck_failure"
+  | "queue_health"
+  | "regret_signal" {
   return (
     value === "test_failure" ||
     value === "lint_failure" ||
@@ -3075,7 +3170,8 @@ export class RemoteBuddyAutonomousEngine {
     this.gitRemote = String(opts.config.sourceControlManager.remote || "origin").trim() || "origin";
     this.integrationBranch =
       String(opts.config.sourceControlManager.mainBranch || "main_agents").trim() || "main_agents";
-    this.baseBranch = String(opts.config.sourceControlManager.baseBranch || "main").trim() || "main";
+    this.baseBranch =
+      String(opts.config.sourceControlManager.baseBranch || "main").trim() || "main";
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.cfg = opts.config.remotebuddy.autonomy;
@@ -3107,10 +3203,7 @@ export class RemoteBuddyAutonomousEngine {
     this.setPhase("acquire_lock");
   }
 
-  private markTickDone(
-    outcome: "success" | "skipped" | "failed",
-    detail: string,
-  ): void {
+  private markTickDone(outcome: "success" | "skipped" | "failed", detail: string): void {
     this.currentRunId = null;
     this.currentRunStartedAtMs = 0;
     this.lastOutcome = outcome;
@@ -3133,8 +3226,7 @@ export class RemoteBuddyAutonomousEngine {
 
     const nextTickInMs =
       this.timer && this.nextTickAtMs > 0 ? Math.max(0, this.nextTickAtMs - now) : 0;
-    const lastAgeMs =
-      this.lastCompletedAtMs > 0 ? Math.max(0, now - this.lastCompletedAtMs) : -1;
+    const lastAgeMs = this.lastCompletedAtMs > 0 ? Math.max(0, now - this.lastCompletedAtMs) : -1;
     console.log(
       `[RemoteBuddyAutonomousEngine] heartbeat: status=idle last_outcome=${this.lastOutcome} detail=${this.lastDetail} last_tick_age_ms=${lastAgeMs} next_tick_in_ms=${nextTickInMs}`,
     );
@@ -3329,7 +3421,7 @@ export class RemoteBuddyAutonomousEngine {
     });
     if (!res.ok) return null;
     const data = (await res.json()) as { ok?: boolean; snapshot?: Snapshot };
-    return data.ok ? data.snapshot ?? null : null;
+    return data.ok ? (data.snapshot ?? null) : null;
   }
 
   private async fetchInspirationPatterns(limit = 60): Promise<unknown[]> {
@@ -3364,12 +3456,18 @@ export class RemoteBuddyAutonomousEngine {
     if (!data.ok) return [];
     const rows = Array.isArray(data.engineSourceStats) ? data.engineSourceStats : [];
     if (rows.length > 0) return rows;
-    const trusted = Array.isArray(data.trustedInspirationShortlist) ? data.trustedInspirationShortlist : [];
-    const archived = Array.isArray(data.archivedInspirationSources) ? data.archivedInspirationSources : [];
+    const trusted = Array.isArray(data.trustedInspirationShortlist)
+      ? data.trustedInspirationShortlist
+      : [];
+    const archived = Array.isArray(data.archivedInspirationSources)
+      ? data.archivedInspirationSources
+      : [];
     return [...trusted, ...archived];
   }
 
-  private buildAutoInspirationEntries(commitHistoryHints: EngineCommitHistoryHint[]): Array<Record<string, unknown>> {
+  private buildAutoInspirationEntries(
+    commitHistoryHints: EngineCommitHistoryHint[],
+  ): Array<Record<string, unknown>> {
     const staticEntries = AUTO_INGEST_SEED_PATTERNS.map((seed) => ({
       source_type: "internal_doc",
       source_label: "pushpals:autonomy-engine",
@@ -3618,7 +3716,10 @@ export class RemoteBuddyAutonomousEngine {
     const signalPool =
       candidate.why_now_signal_ids
         .map((id) => signalsById.get(id))
-        .filter((entry): entry is { signal_id: string; type: string; value: number; evidence: string } => Boolean(entry))
+        .filter(
+          (entry): entry is { signal_id: string; type: string; value: number; evidence: string } =>
+            Boolean(entry),
+        )
         .slice(0, 16) || [];
     const signals = signalPool.length > 0 ? signalPool : snapshot.top_signals.slice(0, 20);
     const maxType = (types: string[]) =>
@@ -3681,11 +3782,13 @@ export class RemoteBuddyAutonomousEngine {
           if (sourceKey && entryKey === sourceKey) return true;
           const candidateFingerprint = asString(candidate.engine_trial?.source_fingerprint);
           const entryFingerprint = asString(entry.source_fingerprint);
-          if (candidateFingerprint && entryFingerprint && candidateFingerprint === entryFingerprint) return true;
+          if (candidateFingerprint && entryFingerprint && candidateFingerprint === entryFingerprint)
+            return true;
           return false;
         })
       : null;
-    const penalties: Array<{ kind: any; weight: number; reason: string; evidence_ids: string[] }> = [];
+    const penalties: Array<{ kind: any; weight: number; reason: string; evidence_ids: string[] }> =
+      [];
     if (candidate.confidence < this.cfg.minConfidence) {
       penalties.push({
         kind: "low_confidence",
@@ -3795,7 +3898,12 @@ export class RemoteBuddyAutonomousEngine {
     }
     const data = (await res.json()) as {
       ok?: boolean;
-      results?: Array<{ candidate_id?: string; candidateId?: string; ok?: boolean; reason?: string }>;
+      results?: Array<{
+        candidate_id?: string;
+        candidateId?: string;
+        ok?: boolean;
+        reason?: string;
+      }>;
     };
     if (!data.ok || !Array.isArray(data.results)) {
       for (const candidate of candidates) {
@@ -4057,10 +4165,7 @@ export class RemoteBuddyAutonomousEngine {
       const recordDropReason = (reason: string): void => {
         dropReasonCounts.set(reason, (dropReasonCounts.get(reason) ?? 0) + 1);
       };
-      const ingestRawCandidates = (
-        rawList: unknown[],
-        source: "llm" | "engine_fallback",
-      ): void => {
+      const ingestRawCandidates = (rawList: unknown[], source: "llm" | "engine_fallback"): void => {
         const candidateCreatedBaseMs = Date.now();
         for (const [candidateIndex, rawCandidate] of rawList
           .slice(0, this.cfg.ideationMaxCandidates)
@@ -4101,8 +4206,9 @@ export class RemoteBuddyAutonomousEngine {
             question_if_blocked: asString(c.question_if_blocked),
             candidate_created_at: new Date(candidateCreatedBaseMs + candidateIndex).toISOString(),
             engine_trial:
-              normalizeEngineTrialMetadata(c.engine_trial ?? c.engineTrial ?? asObject(c.debug).engine_trial) ??
-              undefined,
+              normalizeEngineTrialMetadata(
+                c.engine_trial ?? c.engineTrial ?? asObject(c.debug).engine_trial,
+              ) ?? undefined,
           };
           const policy = POLICY[candidate.objective_type];
           if (!policy || !policy.autonomousAllowed) {
@@ -4147,10 +4253,14 @@ export class RemoteBuddyAutonomousEngine {
             recordDropReason(`${source}_missing_vision_section_refs`);
             continue;
           }
-          candidate.component_area = (scopeValidation.componentArea ?? candidate.component_area) as AutonomyComponentArea;
+          candidate.component_area = (scopeValidation.componentArea ??
+            candidate.component_area) as AutonomyComponentArea;
           candidate.target_paths = scopeValidation.normalizedTargetPaths;
           candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
-          const missingTargetPaths = findMissingRepoTargetPaths(this.autonomyRepo, candidate.target_paths);
+          const missingTargetPaths = findMissingRepoTargetPaths(
+            this.autonomyRepo,
+            candidate.target_paths,
+          );
           if (missingTargetPaths.length > 0) {
             recordDropReason(`${source}_target_paths_missing_in_repo`);
             console.warn(
@@ -4412,7 +4522,9 @@ export class RemoteBuddyAutonomousEngine {
             vision_alignment_reason: selected.candidate.vision_alignment_reason,
             vision_section_refs: selected.candidate.vision_section_refs,
             feature_hypotheses: selected.candidate.feature_hypotheses,
-            ...(selected.candidate.engine_trial ? { engine_trial: selected.candidate.engine_trial } : {}),
+            ...(selected.candidate.engine_trial
+              ? { engine_trial: selected.candidate.engine_trial }
+              : {}),
             selection_strategy: selectedStrategy,
             selection_roll: selection.roll,
             effective_explore_rate: adaptiveExplore.effectiveRate,

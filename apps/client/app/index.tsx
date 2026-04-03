@@ -331,11 +331,7 @@ export default function DashboardScreen() {
     }) => {
       setAutonomySafetyInFlight(true);
       try {
-      const result = await updateAutonomySafety(
-        RUNTIME_CONFIG.serverUrl,
-        update,
-        undefined,
-      );
+        const result = await updateAutonomySafety(RUNTIME_CONFIG.serverUrl, update, undefined);
         if (result.ok) await refreshObservability();
         return result;
       } finally {
@@ -694,10 +690,7 @@ export default function DashboardScreen() {
                 />
               ) : null}
               {activeTab === "config" ? (
-                <ConfigPane
-                  baseUrl={RUNTIME_CONFIG.serverUrl}
-                  theme={theme}
-                />
+                <ConfigPane baseUrl={RUNTIME_CONFIG.serverUrl} theme={theme} />
               ) : null}
             </Animated.View>
           </Animated.View>

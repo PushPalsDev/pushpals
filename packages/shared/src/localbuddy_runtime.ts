@@ -50,10 +50,7 @@ export function parseLocalBuddyRuntimeSnapshot(raw: string): LocalBuddyRuntimeSn
   return {
     localbuddy: {
       enabled,
-      port:
-        Number.isFinite(port) && port >= 1 && port <= 65_535
-          ? port
-          : DEFAULT_LOCALBUDDY_PORT,
+      port: Number.isFinite(port) && port >= 1 && port <= 65_535 ? port : DEFAULT_LOCALBUDDY_PORT,
     },
   };
 }
@@ -155,7 +152,9 @@ function resolveRuntimeConfigDir(workspaceRoot: string, configuredDir?: string):
 }
 
 function parseBoolEnv(value: string | undefined): boolean | undefined {
-  const text = String(value ?? "").trim().toLowerCase();
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase();
   if (!text) return undefined;
   if (TRUTHY.has(text)) return true;
   if (FALSY.has(text)) return false;

@@ -123,7 +123,8 @@ function buildWorkerLlmUsageEvent(
     return {
       service: "workerpals",
       sessionId,
-      backend: String(explicitUsage.backend ?? resolveExecutor(CONFIG)).trim() || resolveExecutor(CONFIG),
+      backend:
+        String(explicitUsage.backend ?? resolveExecutor(CONFIG)).trim() || resolveExecutor(CONFIG),
       modelId: String(explicitUsage.modelId ?? llmConfig.model).trim() || llmConfig.model,
       promptTokens,
       completionTokens,

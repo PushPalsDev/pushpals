@@ -29,7 +29,10 @@ export function sessionStorageKeyForWorkspace(workspaceIdentifier: string | unde
   return `${SESSION_KEY_PREFIX}.${fingerprint}`;
 }
 
-export function createSessionId(workspaceName: string | undefined, uuid: string = crypto.randomUUID()): string {
+export function createSessionId(
+  workspaceName: string | undefined,
+  uuid: string = crypto.randomUUID(),
+): string {
   return `vscode-${sanitizeWorkspaceSlug(workspaceName)}-${uuid.slice(0, 8)}`;
 }
 

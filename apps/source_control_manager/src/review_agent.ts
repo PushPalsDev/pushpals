@@ -139,9 +139,7 @@ function currentBunExecPath(): string {
       : String(process.env.PATH ?? "").trim();
   if (!pathValue) return "";
   const candidates =
-    process.platform === "win32"
-      ? ["bun.exe", "bun", "bun.cmd", "bun.bat"]
-      : ["bun"];
+    process.platform === "win32" ? ["bun.exe", "bun", "bun.cmd", "bun.bat"] : ["bun"];
   for (const rawDir of pathValue.split(delimiter)) {
     const dir = rawDir.trim();
     if (!dir) continue;
@@ -200,7 +198,9 @@ export function resolveReviewerMdPath(
   if (!raw) return "";
 
   const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
-  const workspaceRoot = resolve(promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
+  const workspaceRoot = resolve(
+    promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT,
+  );
   const cwd = resolve(options?.cwd || process.cwd());
   if (isAbsolute(raw)) return raw;
 
@@ -394,7 +394,9 @@ function formatApprovalComment(verdict: ReviewVerdict, passThreshold: number): s
   ];
 
   if (guidance.items.length > 0) {
-    lines.push(guidance.source === "summary" ? "**Reviewer Notes:**" : "**Potential Improvements:**");
+    lines.push(
+      guidance.source === "summary" ? "**Reviewer Notes:**" : "**Potential Improvements:**",
+    );
     for (const issue of guidance.items) {
       lines.push(`- ${issue}`);
     }
@@ -1061,7 +1063,14 @@ export class ReviewAgent {
       return true;
     }
 
-    const handled = await this.enqueueMergeConflictJob(pr, verdict, sessionId, jobId, diff, mergeError);
+    const handled = await this.enqueueMergeConflictJob(
+      pr,
+      verdict,
+      sessionId,
+      jobId,
+      diff,
+      mergeError,
+    );
     if (handled) {
       const comments = await this.listRecentPrComments(pr.number);
       await this.postAutonomyPrFeedback({
@@ -1436,7 +1445,9 @@ export class ReviewAgent {
     sessionId: string | null;
     comments?: PullRequestComment[];
   }): Promise<void> {
-    const normalizedVerdict = String(args.verdict ?? "").trim().toLowerCase();
+    const normalizedVerdict = String(args.verdict ?? "")
+      .trim()
+      .toLowerCase();
     if (!normalizedVerdict) return;
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };

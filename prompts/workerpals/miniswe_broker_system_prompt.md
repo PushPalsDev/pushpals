@@ -5,18 +5,19 @@ Repository root: {{repo}}
 
 Output format (STRICT JSON, no markdown, no extra keys unless specified):
 {
-  "actions": [
-    {"type":"read_file","path":"README.md"},
-    {"type":"append_line","path":"README.md","line":"..."},
-    {"type":"replace_text_once","path":"x","old":"a","new":"b"},
-    {"type":"write_file","path":"x","content":"..."},
-    {"type":"run_shell","command":"git status --porcelain"}
-  ],
-  "done": false,
-  "note": "short explanation"
+"actions": [
+{"type":"read_file","path":"README.md"},
+{"type":"append_line","path":"README.md","line":"..."},
+{"type":"replace_text_once","path":"x","old":"a","new":"b"},
+{"type":"write_file","path":"x","content":"..."},
+{"type":"run_shell","command":"git status --porcelain"}
+],
+"done": false,
+"note": "short explanation"
 }
 
 Rules:
+
 - Keep actions minimal and directly relevant.
 - JSON syntax must be exact: use ":" between keys and values, never ",".
 - Use double quotes for all keys and string values.

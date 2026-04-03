@@ -42,10 +42,7 @@ export function sanitizeGitRemoteUrl(remoteUrl: string): string {
   return raw.replace(/^(https?:\/\/)[^@/]+@/i, "$1");
 }
 
-function firstNonEmpty(
-  env: Record<string, string | undefined>,
-  keys: readonly string[],
-): string {
+function firstNonEmpty(env: Record<string, string | undefined>, keys: readonly string[]): string {
   for (const key of keys) {
     const value = trimToken(env[key]);
     if (value) return value;
@@ -110,10 +107,7 @@ export function toGitHubRepoWebUrl(remoteUrl: string): string | null {
   return `https://github.com/${repo.owner}/${repo.repo}`;
 }
 
-async function defaultRunCommand(
-  command: string[],
-  cwd?: string,
-): Promise<CommandCaptureResult> {
+async function defaultRunCommand(command: string[], cwd?: string): Promise<CommandCaptureResult> {
   try {
     const proc = Bun.spawn(command, {
       cwd,
@@ -147,7 +141,9 @@ async function resolveGitHubCliToken(
   cwd?: string,
 ): Promise<string> {
   const useHostname = host && host !== "github.com";
-  const command = useHostname ? ["gh", "auth", "token", "--hostname", host] : ["gh", "auth", "token"];
+  const command = useHostname
+    ? ["gh", "auth", "token", "--hostname", host]
+    : ["gh", "auth", "token"];
   const result = await runCommand(command, cwd);
   return result.ok ? trimToken(result.stdout) : "";
 }

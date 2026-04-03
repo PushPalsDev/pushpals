@@ -21,7 +21,10 @@ function stripPresenceSourcePrefix(value: string): string {
 
 export function normalizePresenceClientId(value: unknown): string {
   const raw = stripPresenceSourcePrefix(String(value ?? "").trim());
-  return raw.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").trim();
+  return raw
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .trim();
 }
 
 export function normalizePresenceClientLabel(value: unknown): string {
@@ -31,7 +34,9 @@ export function normalizePresenceClientLabel(value: unknown): string {
 }
 
 export function normalizePresenceLookupToken(value: unknown): string {
-  return normalizePresenceClientLabel(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return normalizePresenceClientLabel(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
 }
 
 type SessionTransportPresence = {
@@ -91,8 +96,9 @@ export class CommunicationManager {
         : `${normalizedFrom || "agent"}__${normalizedSessionId || "session"}`,
       kind: "agent",
       label: labelFrom || normalizedFrom || "Agent",
-      version: String(process.env.PUSHPALS_RUNTIME_TAG ?? process.env.npm_package_version ?? "")
-        .trim(),
+      version: String(
+        process.env.PUSHPALS_RUNTIME_TAG ?? process.env.npm_package_version ?? "",
+      ).trim(),
       platform: `${process.platform}/${process.arch}`,
       repoRoot,
     };
@@ -151,10 +157,15 @@ export class CommunicationManager {
     text: string,
     meta: EventMeta = {},
   ): Promise<boolean> {
-    return this.emitToSession(sessionId, "message", { text }, {
-      ...meta,
-      from: meta.from ?? "client",
-    });
+    return this.emitToSession(
+      sessionId,
+      "message",
+      { text },
+      {
+        ...meta,
+        from: meta.from ?? "client",
+      },
+    );
   }
 
   async userMessage(text: string, meta: EventMeta = {}): Promise<boolean> {

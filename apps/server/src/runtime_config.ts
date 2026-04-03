@@ -42,7 +42,9 @@ export function applyRuntimeConfigMutations(
   const tomlChanges: Array<{ path: string[]; value: unknown; rawKey: string }> = [];
 
   for (const mutation of inputMutations) {
-    const scope = String(mutation.scope ?? "").trim().toLowerCase();
+    const scope = String(mutation.scope ?? "")
+      .trim()
+      .toLowerCase();
     if (scope !== "env" && scope !== "toml") {
       warnings.push(`Skipped unknown scope "${mutation.scope}"`);
       continue;
@@ -82,7 +84,10 @@ export function applyRuntimeConfigMutations(
   }
 
   if (tomlChanges.length > 0) {
-    patchTomlFile(files.localTomlPath, tomlChanges.map((entry) => ({ path: entry.path, value: entry.value })));
+    patchTomlFile(
+      files.localTomlPath,
+      tomlChanges.map((entry) => ({ path: entry.path, value: entry.value })),
+    );
     touchedFiles.add(files.localTomlPath);
   }
 
@@ -174,10 +179,7 @@ function serializeEnvValue(value: unknown): string {
   return JSON.stringify(text);
 }
 
-function patchTomlFile(
-  path: string,
-  changes: Array<{ path: string[]; value: unknown }>,
-): void {
+function patchTomlFile(path: string, changes: Array<{ path: string[]; value: unknown }>): void {
   ensureParentDir(path);
   const original = existsSync(path) ? readFileSync(path, "utf8") : "";
   const eol = detectEol(original);

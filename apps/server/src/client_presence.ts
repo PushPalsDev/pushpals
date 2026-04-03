@@ -79,10 +79,7 @@ function readParam(url: URL, name: string): string {
   return compactText(url.searchParams.get(name), 512);
 }
 
-function normalizeMetadata(
-  value: unknown,
-  userAgent: string,
-): ClientPresenceMetadata | null {
+function normalizeMetadata(value: unknown, userAgent: string): ClientPresenceMetadata | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   const clientId = compactText(record.clientId, 128);
@@ -122,8 +119,7 @@ export function readClientPresenceFromTransportRequest(
       clientId: readParam(url, "clientId") || readHeader(headers, "x-pushpals-client-id"),
       kind: readParam(url, "clientKind") || readHeader(headers, "x-pushpals-client-kind"),
       label: readParam(url, "clientLabel") || readHeader(headers, "x-pushpals-client-label"),
-      version:
-        readParam(url, "clientVersion") || readHeader(headers, "x-pushpals-client-version"),
+      version: readParam(url, "clientVersion") || readHeader(headers, "x-pushpals-client-version"),
       platform:
         readParam(url, "clientPlatform") || readHeader(headers, "x-pushpals-client-platform"),
       repoRoot:
@@ -141,10 +137,7 @@ export class ClientPresenceRegistry {
 
   constructor(options: ClientPresenceRegistryOptions = {}) {
     this.retentionMs = Math.max(1, options.retentionMs ?? DISCONNECTED_RETENTION_MS);
-    this.connectedRetentionMs = Math.max(
-      1,
-      options.connectedRetentionMs ?? CONNECTED_RETENTION_MS,
-    );
+    this.connectedRetentionMs = Math.max(1, options.connectedRetentionMs ?? CONNECTED_RETENTION_MS);
     this.now = options.now ?? Date.now;
   }
 
@@ -209,20 +202,22 @@ export class ClientPresenceRegistry {
   snapshot(): ClientPresenceSnapshot {
     this.pruneExpired();
     const rows = [...this.records.values()]
-      .map((record): ClientPresenceSnapshotRow => ({
-        clientId: record.clientId,
-        kind: record.kind,
-        ...(record.label ? { label: record.label } : {}),
-        ...(record.version ? { version: record.version } : {}),
-        ...(record.platform ? { platform: record.platform } : {}),
-        ...(record.repoRoot ? { repoRoot: record.repoRoot } : {}),
-        ...(record.userAgent ? { userAgent: record.userAgent } : {}),
-        sessionId: record.sessionId,
-        status: this.connectedTransportKeys(record).length > 0 ? "connected" : "announced",
-        connectedTransports: this.connectedTransportKeys(record),
-        announcedAt: new Date(record.announcedAtMs).toISOString(),
-        lastSeenAt: new Date(record.lastSeenAtMs).toISOString(),
-      }))
+      .map(
+        (record): ClientPresenceSnapshotRow => ({
+          clientId: record.clientId,
+          kind: record.kind,
+          ...(record.label ? { label: record.label } : {}),
+          ...(record.version ? { version: record.version } : {}),
+          ...(record.platform ? { platform: record.platform } : {}),
+          ...(record.repoRoot ? { repoRoot: record.repoRoot } : {}),
+          ...(record.userAgent ? { userAgent: record.userAgent } : {}),
+          sessionId: record.sessionId,
+          status: this.connectedTransportKeys(record).length > 0 ? "connected" : "announced",
+          connectedTransports: this.connectedTransportKeys(record),
+          announcedAt: new Date(record.announcedAtMs).toISOString(),
+          lastSeenAt: new Date(record.lastSeenAtMs).toISOString(),
+        }),
+      )
       .sort((a, b) => {
         if (a.status !== b.status) return a.status === "connected" ? -1 : 1;
         return b.lastSeenAt.localeCompare(a.lastSeenAt);
@@ -270,10 +265,7 @@ export class ClientPresenceRegistry {
     return created;
   }
 
-  private connectionSet(
-    record: ClientPresenceRecord,
-    transport: ClientTransport,
-  ): Set<string> {
+  private connectionSet(record: ClientPresenceRecord, transport: ClientTransport): Set<string> {
     let connections = record.transportConnections.get(transport);
     if (!connections) {
       connections = new Set<string>();

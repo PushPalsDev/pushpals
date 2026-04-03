@@ -79,8 +79,18 @@ function makeSnapshot() {
     snapshot_created_at: new Date().toISOString(),
     snapshot_ttl_ms: 120_000,
     impact_model_version: "impact-v1",
-    top_signals: [{ signal_id: "sig_queue", type: "queue_health", value: 0.8, evidence: "p95 high" }],
-    state_traits: [{ trait_id: "queue_latency_high", category: "weakness", focus: "queue", score: 0.7, evidence: "p95 high" }],
+    top_signals: [
+      { signal_id: "sig_queue", type: "queue_health", value: 0.8, evidence: "p95 high" },
+    ],
+    state_traits: [
+      {
+        trait_id: "queue_latency_high",
+        category: "weakness",
+        focus: "queue",
+        score: 0.7,
+        evidence: "p95 high",
+      },
+    ],
     feedback_priors: [],
     engine_idea_priors: [],
     engine_source_priors: [],
@@ -157,12 +167,7 @@ function seedPushpalsAutonomyRepoLayout(root: string): void {
 }
 
 function seedGenericAutonomyRepoLayout(root: string): void {
-  const markers = [
-    "src/autonomy.ts",
-    "src/queue.ts",
-    "tests/autonomy.test.ts",
-    "README.md",
-  ];
+  const markers = ["src/autonomy.ts", "src/queue.ts", "tests/autonomy.test.ts", "README.md"];
   for (const marker of markers) {
     const fullPath = join(root, marker);
     mkdirSync(join(fullPath, ".."), { recursive: true });
@@ -200,19 +205,27 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     let llmCall = 0;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       const method = String(init?.method ?? "GET").toUpperCase();
       const bodyRaw = typeof init?.body === "string" ? init.body : "";
       const body = bodyRaw ? JSON.parse(bodyRaw) : {};
       calls.push({ url, method, body });
 
-      if (url.includes("/autonomy/lock/acquire")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/renew")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/release")) return jsonResponse(200, { ok: true, released: true });
-      if (url.includes("/autonomy/snapshot")) return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
-      if (url.includes("/autonomy/inspiration/ingest")) return jsonResponse(200, { ok: true, inserted: 2, updated: 0, skipped: 0 });
-      if (url.includes("/autonomy/inspiration?")) return jsonResponse(200, { ok: true, patterns: [] });
-      if (url.includes("/autonomy/insights?")) return jsonResponse(200, { ok: true, engineSourceStats: [] });
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/renew"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot"))
+        return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/autonomy/inspiration/ingest"))
+        return jsonResponse(200, { ok: true, inserted: 2, updated: 0, skipped: 0 });
+      if (url.includes("/autonomy/inspiration?"))
+        return jsonResponse(200, { ok: true, patterns: [] });
+      if (url.includes("/autonomy/insights?"))
+        return jsonResponse(200, { ok: true, engineSourceStats: [] });
       if (url.endsWith("/autonomy/eligibility")) {
         const candidates = Array.isArray((body as Record<string, unknown>).candidates)
           ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
@@ -225,10 +238,15 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
           })),
         });
       }
-      if (url.endsWith("/requests/enqueue")) return jsonResponse(201, { ok: true, requestId: "req_tick_1" });
+      if (url.endsWith("/requests/enqueue"))
+        return jsonResponse(201, { ok: true, requestId: "req_tick_1" });
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
-        return jsonResponse(200, { ok: true, objectiveId: "obj_tick_1", patternKey: "lint_fix::apps/server::lint_failure" });
+        return jsonResponse(200, {
+          ok: true,
+          objectiveId: "obj_tick_1",
+          patternKey: "lint_fix::apps/server::lint_failure",
+        });
       }
       throw new Error(`Unhandled fetch in test: ${method} ${url}`);
     }) as typeof globalThis.fetch;
@@ -274,7 +292,8 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         }
         return {
           text: JSON.stringify({
-            instruction: "Tighten queue guardrail scoring in apps/server/src/autonomy.ts and verify with tests.",
+            instruction:
+              "Tighten queue guardrail scoring in apps/server/src/autonomy.ts and verify with tests.",
           }),
           usage: { promptTokens: 1, completionTokens: 1 },
         };
@@ -307,7 +326,14 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       path: "vision.md",
       markdown: "# Vision\n",
       one_sentence: "Improve autonomous throughput safely.",
-      sections: [{ number: "1", title: "Reliability", markdown: "Focus queue and reliability", truncated: false }],
+      sections: [
+        {
+          number: "1",
+          title: "Reliability",
+          markdown: "Focus queue and reliability",
+          truncated: false,
+        },
+      ],
       key_items: {
         target_users: ["maintainers"],
         priorities: ["reliability"],
@@ -346,7 +372,10 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
 
     const enqueueCall = calls.find((entry) => entry.url.endsWith("/requests/enqueue"));
     expect(enqueueCall).toBeDefined();
-    const enqueueMetadata = (enqueueCall?.body as Record<string, unknown>).metadata as Record<string, unknown>;
+    const enqueueMetadata = (enqueueCall?.body as Record<string, unknown>).metadata as Record<
+      string,
+      unknown
+    >;
     expect(String(enqueueMetadata.origin ?? "")).toBe("autonomy");
 
     expect(objectivePosts.length).toBeGreaterThan(0);
@@ -367,19 +396,27 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     let llmCall = 0;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       const method = String(init?.method ?? "GET").toUpperCase();
       const bodyRaw = typeof init?.body === "string" ? init.body : "";
       const body = bodyRaw ? JSON.parse(bodyRaw) : {};
       calls.push({ url, method, body });
 
-      if (url.includes("/autonomy/lock/acquire")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/renew")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/release")) return jsonResponse(200, { ok: true, released: true });
-      if (url.includes("/autonomy/snapshot")) return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
-      if (url.includes("/autonomy/inspiration/ingest")) return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
-      if (url.includes("/autonomy/inspiration?")) return jsonResponse(200, { ok: true, patterns: [] });
-      if (url.includes("/autonomy/insights?")) return jsonResponse(200, { ok: true, engineSourceStats: [] });
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/renew"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot"))
+        return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/autonomy/inspiration/ingest"))
+        return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
+      if (url.includes("/autonomy/inspiration?"))
+        return jsonResponse(200, { ok: true, patterns: [] });
+      if (url.includes("/autonomy/insights?"))
+        return jsonResponse(200, { ok: true, engineSourceStats: [] });
       if (url.endsWith("/autonomy/eligibility")) {
         const candidates = Array.isArray((body as Record<string, unknown>).candidates)
           ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
@@ -394,7 +431,12 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       }
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
-        return jsonResponse(200, { ok: true, objectiveId: "obj_tick_blocked", questionId: "q_tick_1", patternKey: "pk_blocked" });
+        return jsonResponse(200, {
+          ok: true,
+          objectiveId: "obj_tick_blocked",
+          questionId: "q_tick_1",
+          patternKey: "pk_blocked",
+        });
       }
       if (url.endsWith("/requests/enqueue")) {
         throw new Error("requests/enqueue should not be called for requires_user_input candidates");
@@ -468,7 +510,14 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       path: "vision.md",
       markdown: "# Vision\n",
       one_sentence: "Improve autonomous throughput safely.",
-      sections: [{ number: "1", title: "Reliability", markdown: "Focus queue and reliability", truncated: false }],
+      sections: [
+        {
+          number: "1",
+          title: "Reliability",
+          markdown: "Focus queue and reliability",
+          truncated: false,
+        },
+      ],
       key_items: {
         target_users: ["maintainers"],
         priorities: ["reliability"],
@@ -490,10 +539,18 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     await engine.tick();
 
     expect(objectivePosts.length).toBeGreaterThan(0);
-    const objective = (objectivePosts[objectivePosts.length - 1]?.objective ?? {}) as Record<string, unknown>;
+    const objective = (objectivePosts[objectivePosts.length - 1]?.objective ?? {}) as Record<
+      string,
+      unknown
+    >;
     expect(String(objective.status ?? "")).toBe("blocked");
-    const question = (objectivePosts[objectivePosts.length - 1]?.question ?? {}) as Record<string, unknown>;
-    expect(String(question.question ?? "")).toContain("Which server module should be prioritized first?");
+    const question = (objectivePosts[objectivePosts.length - 1]?.question ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(String(question.question ?? "")).toContain(
+      "Which server module should be prioritized first?",
+    );
     expect(calls.some((entry) => entry.url.endsWith("/requests/enqueue"))).toBe(false);
   });
 
@@ -555,14 +612,17 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     let llmCalls = 0;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       const method = String(init?.method ?? "GET").toUpperCase();
       const bodyRaw = typeof init?.body === "string" ? init.body : "";
       const body = bodyRaw ? JSON.parse(bodyRaw) : {};
       calls.push({ url, method, body });
 
-      if (url.includes("/autonomy/lock/acquire")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/release")) return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
       if (url.includes("/autonomy/snapshot")) {
         const snapshot = makeSnapshot();
         return jsonResponse(200, {
@@ -625,14 +685,17 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     let llmCalls = 0;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       const method = String(init?.method ?? "GET").toUpperCase();
       const bodyRaw = typeof init?.body === "string" ? init.body : "";
       const body = bodyRaw ? JSON.parse(bodyRaw) : {};
       calls.push({ url, method, body });
 
-      if (url.includes("/autonomy/lock/acquire")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/release")) return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
       throw new Error(`Unhandled fetch in test: ${method} ${url}`);
     }) as typeof globalThis.fetch;
 
@@ -688,19 +751,27 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     let llmCall = 0;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       const method = String(init?.method ?? "GET").toUpperCase();
       const bodyRaw = typeof init?.body === "string" ? init.body : "";
       const body = bodyRaw ? JSON.parse(bodyRaw) : {};
       calls.push({ url, method, body });
 
-      if (url.includes("/autonomy/lock/acquire")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/renew")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/release")) return jsonResponse(200, { ok: true, released: true });
-      if (url.includes("/autonomy/snapshot")) return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
-      if (url.includes("/autonomy/inspiration/ingest")) return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
-      if (url.includes("/autonomy/inspiration?")) return jsonResponse(200, { ok: true, patterns: [] });
-      if (url.includes("/autonomy/insights?")) return jsonResponse(200, { ok: true, engineSourceStats: [] });
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/renew"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot"))
+        return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/autonomy/inspiration/ingest"))
+        return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
+      if (url.includes("/autonomy/inspiration?"))
+        return jsonResponse(200, { ok: true, patterns: [] });
+      if (url.includes("/autonomy/insights?"))
+        return jsonResponse(200, { ok: true, engineSourceStats: [] });
       if (url.endsWith("/autonomy/eligibility")) {
         const candidates = Array.isArray((body as Record<string, unknown>).candidates)
           ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
@@ -713,10 +784,15 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
           })),
         });
       }
-      if (url.endsWith("/requests/enqueue")) return jsonResponse(201, { ok: true, requestId: "req_generic_1" });
+      if (url.endsWith("/requests/enqueue"))
+        return jsonResponse(201, { ok: true, requestId: "req_generic_1" });
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
-        return jsonResponse(200, { ok: true, objectiveId: "obj_generic_1", patternKey: "pk_generic_1" });
+        return jsonResponse(200, {
+          ok: true,
+          objectiveId: "obj_generic_1",
+          patternKey: "pk_generic_1",
+        });
       }
       throw new Error(`Unhandled fetch in test: ${method} ${url}`);
     }) as typeof globalThis.fetch;
@@ -738,7 +814,8 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         }
         return {
           text: JSON.stringify({
-            instruction: "Improve src/autonomy.ts using the queue health signal and keep the change narrow.",
+            instruction:
+              "Improve src/autonomy.ts using the queue health signal and keep the change narrow.",
           }),
           usage: { promptTokens: 1, completionTokens: 1 },
         };
@@ -769,7 +846,14 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       path: "vision.md",
       markdown: "# Vision\n",
       one_sentence: "Improve queue throughput safely for this repo.",
-      sections: [{ number: "1", title: "Reliability", markdown: "Favor narrow, deterministic fixes.", truncated: false }],
+      sections: [
+        {
+          number: "1",
+          title: "Reliability",
+          markdown: "Favor narrow, deterministic fixes.",
+          truncated: false,
+        },
+      ],
       key_items: {
         target_users: ["maintainers"],
         priorities: ["queue reliability"],
@@ -792,8 +876,9 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
 
     const enqueueCall = calls.find((entry) => entry.url.endsWith("/requests/enqueue"));
     expect(enqueueCall).toBeDefined();
-    const autonomy = (((enqueueCall?.body as Record<string, unknown>).metadata ?? {}) as Record<string, unknown>)
-      .autonomy as Record<string, unknown>;
+    const autonomy = (
+      ((enqueueCall?.body as Record<string, unknown>).metadata ?? {}) as Record<string, unknown>
+    ).autonomy as Record<string, unknown>;
     expect(Array.isArray(autonomy.targetPaths)).toBe(true);
     expect(String((autonomy.targetPaths as string[])[0] ?? "")).toContain("src/");
     expect(String((autonomy.targetPaths as string[])[0] ?? "")).not.toContain("apps/server");

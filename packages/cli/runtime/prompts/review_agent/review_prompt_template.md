@@ -11,6 +11,7 @@ Pull Request: #{{pr_number}} - {{pr_title}}
 Branch: {{head_ref}} -> {{base_ref}}
 
 Diff:
+
 ```diff
 {{diff}}
 ```

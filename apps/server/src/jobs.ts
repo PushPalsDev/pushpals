@@ -427,7 +427,9 @@ export class JobQueue {
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`,
     );
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_created ON jobs(dedupeKey, createdAt);`);
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_created ON jobs(dedupeKey, createdAt);`,
+    );
     this.db.exec(
       `CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_active
          ON jobs(dedupeKey)
@@ -468,14 +470,23 @@ export class JobQueue {
       .prepare(`SELECT status, lastHeartbeat FROM workers WHERE workerId = ?`)
       .get(workerId) as { status: string | null; lastHeartbeat: string | null } | undefined;
     if (!worker) return null;
-    if (String(worker.status ?? "").trim().toLowerCase() === "offline") return null;
+    if (
+      String(worker.status ?? "")
+        .trim()
+        .toLowerCase() === "offline"
+    )
+      return null;
     const heartbeatMs = parseIsoMs(worker.lastHeartbeat);
     if (heartbeatMs == null) return null;
     if (Date.now() - heartbeatMs > PR_WORKER_ASSIGNMENT_MAX_AGE_MS) return null;
     return workerId ? workerId : null;
   }
 
-  private upsertPrWorkerAssignment(prUrl: string | null, workerId: string | null, now: string): void {
+  private upsertPrWorkerAssignment(
+    prUrl: string | null,
+    workerId: string | null,
+    now: string,
+  ): void {
     const normalizedPrUrl = normalizePrUrl(prUrl);
     const normalizedWorkerId = typeof workerId === "string" ? workerId.trim() : "";
     if (!normalizedPrUrl || !normalizedWorkerId) return;
@@ -491,9 +502,9 @@ export class JobQueue {
   }
 
   private refreshPrWorkerAssignmentForJob(jobId: string, now: string): void {
-    const row = this.db
-      .prepare(`SELECT prUrl, workerId FROM jobs WHERE id = ?`)
-      .get(jobId) as { prUrl: string | null; workerId: string | null } | undefined;
+    const row = this.db.prepare(`SELECT prUrl, workerId FROM jobs WHERE id = ?`).get(jobId) as
+      | { prUrl: string | null; workerId: string | null }
+      | undefined;
     if (!row) return;
     this.upsertPrWorkerAssignment(row.prUrl, row.workerId, now);
   }

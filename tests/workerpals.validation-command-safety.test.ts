@@ -87,4 +87,3 @@ describe("workerpals validation command safety", () => {
     expect(commands).toEqual(["bun test"]);
   });
 });
-

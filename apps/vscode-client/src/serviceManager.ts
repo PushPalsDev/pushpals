@@ -243,8 +243,7 @@ export class StackServiceManager implements vscode.Disposable {
 
   private serverUrl(): string {
     const configured =
-      vscode.workspace.getConfiguration("pushpals").get<string>("serverUrl") ??
-      DEFAULT_SERVER_URL;
+      vscode.workspace.getConfiguration("pushpals").get<string>("serverUrl") ?? DEFAULT_SERVER_URL;
     return normalizeVscodeServerUrl(configured);
   }
 
@@ -346,7 +345,9 @@ export class StackServiceManager implements vscode.Disposable {
           this.localBuddyStopRequested = false;
           this.onDidChangeRunningEmitter.fire(false);
         }
-        settle(new Error(`Installed PushPals CLI runtime exited before startup completed (${reason}).`));
+        settle(
+          new Error(`Installed PushPals CLI runtime exited before startup completed (${reason}).`),
+        );
       });
 
       const deadline = Date.now() + DEFAULT_CLI_BOOT_TIMEOUT_MS;
@@ -599,7 +600,10 @@ export class StackServiceManager implements vscode.Disposable {
           this.markLocalBuddyUnexpectedFailure(`preflight failed: ${detail}`);
           return;
         }
-        this.spawnService(this.localBuddyServiceDefinition(this.resolveSessionId?.()), workspaceRoot);
+        this.spawnService(
+          this.localBuddyServiceDefinition(this.resolveSessionId?.()),
+          workspaceRoot,
+        );
         return;
       }
 
@@ -796,7 +800,10 @@ export class StackServiceManager implements vscode.Disposable {
     }
   }
 
-  private waitForExit(processRef: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<void> {
+  private waitForExit(
+    processRef: ChildProcessWithoutNullStreams,
+    timeoutMs: number,
+  ): Promise<void> {
     if (processRef.exitCode != null || processRef.signalCode != null) return Promise.resolve();
 
     return new Promise((resolvePromise) => {

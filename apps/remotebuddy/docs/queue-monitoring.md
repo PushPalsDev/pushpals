@@ -6,25 +6,25 @@ Use this doc when you are staring at Grafana, Alertmanager, or `/system/status` 
 
 ## Core Metrics to Track Every 5 Minutes
 
-| Metric | Healthy Range | Surface / How to Pull | Why it matters |
-| --- | --- | --- | --- |
-| `queue_p95` (RemoteBuddy request queue wait) | 0.7 s–0.9 s baseline, ≤1.0 s SLO | Grafana › RemoteBuddy Queue Overview (`queue_p95` panel), `/system/status.slo.requests.queueWaitMs` | Primary SLO indicator; rising trends hint at worker starvation or upstream slowness.
-| Interactive backlog (`requests.pending.interactive`) | < 40 requests, ≤2 min oldest request | Grafana backlog panel, `/system/status.queues.requestPendingSnapshot.interactive` | Direct impact on user-facing latency; determines when to throttle background lanes.
-| Background/eval backlog | < 80 combined, ≤5 min oldest | Same panel + API snapshot | Swells silently; pausing these lanes protects interactive work.
-| Job queue depth (`queues.jobPendingSnapshot`) | Spikes cleared in < 3 min | `/system/status` (job snapshot), WorkerPals Ops board | Detects job stuck loops or scheduling gaps even when request backlog looks normal.
-| Worker idle slots per lane | ≥3 interactive, ≥1 background | `/workers`, WorkerPals dashboard, worker logs | Ensures the planner can immediately claim work; anything lower means add capacity or investigate hung workers.
-| Worker error rate (`job_failure_rate`) | ≤0.2 sustained | Grafana › WorkerPals Job Outcomes (`job_failure_rate` panel) | Rising failures reduce effective capacity and precede queue inflation.
+| Metric                                               | Healthy Range                        | Surface / How to Pull                                                                               | Why it matters                                                                                                 |
+| ---------------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `queue_p95` (RemoteBuddy request queue wait)         | 0.7 s–0.9 s baseline, ≤1.0 s SLO     | Grafana › RemoteBuddy Queue Overview (`queue_p95` panel), `/system/status.slo.requests.queueWaitMs` | Primary SLO indicator; rising trends hint at worker starvation or upstream slowness.                           |
+| Interactive backlog (`requests.pending.interactive`) | < 40 requests, ≤2 min oldest request | Grafana backlog panel, `/system/status.queues.requestPendingSnapshot.interactive`                   | Direct impact on user-facing latency; determines when to throttle background lanes.                            |
+| Background/eval backlog                              | < 80 combined, ≤5 min oldest         | Same panel + API snapshot                                                                           | Swells silently; pausing these lanes protects interactive work.                                                |
+| Job queue depth (`queues.jobPendingSnapshot`)        | Spikes cleared in < 3 min            | `/system/status` (job snapshot), WorkerPals Ops board                                               | Detects job stuck loops or scheduling gaps even when request backlog looks normal.                             |
+| Worker idle slots per lane                           | ≥3 interactive, ≥1 background        | `/workers`, WorkerPals dashboard, worker logs                                                       | Ensures the planner can immediately claim work; anything lower means add capacity or investigate hung workers. |
+| Worker error rate (`job_failure_rate`)               | ≤0.2 sustained                       | Grafana › WorkerPals Job Outcomes (`job_failure_rate` panel)                                        | Rising failures reduce effective capacity and precede queue inflation.                                         |
 
 Always capture Grafana + `/system/status` snapshots before intervening so you can prove whether actions helped and so later handoffs stay grounded in data.
 
 ## Alert Thresholds and Expectations
 
-| Signal | Warning channel / trigger | Paging trigger | Immediate expectation |
-| --- | --- | --- | --- |
-| `queue_p95` (15 min rollup) | ≥1.5 s for 2 min → Grafana `queue_p95_spike_warning` posts in `#pushpals-ops`. | ≥2.0 s for 5 min → PagerDuty **RemoteBuddy Platform** incident + Slack mirror. | Acknowledge ≤5 min, post status thread, begin remediation workflow below.
-| Interactive backlog | >40 requests for 3 polls → Slack reminder. | >60 requests or any request >10 min old → PagerDuty page. | Throttle/stop background submissions immediately, note ticket IDs deferred.
-| Worker idle slots | <2 idle workers per lane for 3 polls → Slack ping `@workerpals-oc`. | ≤1 idle worker overall for 5 min → WorkerPals Runtime page. | Launch additional WorkerPals pools or restart hung workers.
-| `job_failure_rate` | ≥0.3 for 5 min → Grafana note in `#pushpals-ops`. | ≥0.4 → WorkerPals Runtime secondary page. | Capture failing job IDs/logs and prep restarts before retriggering queue traffic.
+| Signal                      | Warning channel / trigger                                                      | Paging trigger                                                                 | Immediate expectation                                                             |
+| --------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| `queue_p95` (15 min rollup) | ≥1.5 s for 2 min → Grafana `queue_p95_spike_warning` posts in `#pushpals-ops`. | ≥2.0 s for 5 min → PagerDuty **RemoteBuddy Platform** incident + Slack mirror. | Acknowledge ≤5 min, post status thread, begin remediation workflow below.         |
+| Interactive backlog         | >40 requests for 3 polls → Slack reminder.                                     | >60 requests or any request >10 min old → PagerDuty page.                      | Throttle/stop background submissions immediately, note ticket IDs deferred.       |
+| Worker idle slots           | <2 idle workers per lane for 3 polls → Slack ping `@workerpals-oc`.            | ≤1 idle worker overall for 5 min → WorkerPals Runtime page.                    | Launch additional WorkerPals pools or restart hung workers.                       |
+| `job_failure_rate`          | ≥0.3 for 5 min → Grafana note in `#pushpals-ops`.                              | ≥0.4 → WorkerPals Runtime secondary page.                                      | Capture failing job IDs/logs and prep restarts before retriggering queue traffic. |
 
 - **Acknowledgement discipline:** All alerts hitting `#pushpals-ops` get an acknowledgement emoji + thread reply within 5 minutes. Paging alerts require PagerDuty ack and a thread status post (timestamp, owner, next update time).
 - **Escalation ladder:** RemoteBuddy Platform → WorkerPals Runtime → Reliability Lead. Use `/pd escalate` if remediation stalls or queue_p95 ≥2.0 s for >10 minutes after initial actions.

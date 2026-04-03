@@ -129,12 +129,7 @@ async function main(): Promise<void> {
     process.exit(init.exitCode || 1);
   }
 
-  const cliArgs = [
-    packagedCliPath,
-    "--runtime-root",
-    runtimeRoot,
-    ...options.cliArgs,
-  ];
+  const cliArgs = [packagedCliPath, "--runtime-root", runtimeRoot, ...options.cliArgs];
 
   console.log(`[cli-integration] repoRoot=${sandboxRepoRoot}`);
   console.log(`[cli-integration] runtimeRoot=${runtimeRoot}`);

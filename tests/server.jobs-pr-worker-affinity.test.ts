@@ -136,7 +136,11 @@ describe("server JobQueue PR worker affinity", () => {
     expect(queue.claim("worker-stale").job?.id).toBe(firstJobId);
     expect(queue.complete(firstJobId, { summary: "done" }).ok).toBe(true);
 
-    const db = (queue as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } } }).db;
+    const db = (
+      queue as unknown as {
+        db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+      }
+    ).db;
     db.prepare(`UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?`).run(
       "2001-01-01T00:00:00.000Z",
       "worker-stale",

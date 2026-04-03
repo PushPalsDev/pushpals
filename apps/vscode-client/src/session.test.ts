@@ -49,7 +49,9 @@ describe("resolveWorkspaceSessionId", () => {
   it("reuses the stored session id when one already exists", () => {
     const store = {
       get: (key: string) =>
-        key === sessionStorageKeyForWorkspace("file:///repo-a") ? "vscode-existing-1234" : undefined,
+        key === sessionStorageKeyForWorkspace("file:///repo-a")
+          ? "vscode-existing-1234"
+          : undefined,
       update: () => undefined,
     };
 
@@ -129,9 +131,12 @@ describe("buildSourceCheckoutRuntimeEnv", () => {
   });
 
   it("merges extra env values without inventing a session id", () => {
-    assert.deepEqual(buildSourceCheckoutRuntimeEnv("", { WORKERPALS_DOCKER_IMAGE: "demo:latest" }), {
-      WORKERPALS_DOCKER_IMAGE: "demo:latest",
-    });
+    assert.deepEqual(
+      buildSourceCheckoutRuntimeEnv("", { WORKERPALS_DOCKER_IMAGE: "demo:latest" }),
+      {
+        WORKERPALS_DOCKER_IMAGE: "demo:latest",
+      },
+    );
   });
 });
 

@@ -44,43 +44,36 @@ const actionFor = (code: StartupFailureCode): string => {
 };
 
 describe("StartupChecklist", () => {
-  test(
-    "surfaces actionable failure codes for merge or dirty states",
-    async () => {
-      const ctx = buildContext({
-        describeRepo: async () => ({
-          isDirty: false,
-          isMergeInProgress: true,
-          detail: "rebase in progress",
-        }),
-      });
-      const mergeBlocked = await runStartupPreflight(ctx);
-      expect(mergeBlocked.ok).toBe(false);
-      expect(mergeBlocked.failure?.code).toBe(
-        STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
-      );
-      expect(mergeBlocked.failure?.action).toContain("Resolve");
-      expect(mergeBlocked.failure?.category).toBe("repo");
-      expect(mergeBlocked.failure?.step).toBe(3);
+  test("surfaces actionable failure codes for merge or dirty states", async () => {
+    const ctx = buildContext({
+      describeRepo: async () => ({
+        isDirty: false,
+        isMergeInProgress: true,
+        detail: "rebase in progress",
+      }),
+    });
+    const mergeBlocked = await runStartupPreflight(ctx);
+    expect(mergeBlocked.ok).toBe(false);
+    expect(mergeBlocked.failure?.code).toBe(STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS);
+    expect(mergeBlocked.failure?.action).toContain("Resolve");
+    expect(mergeBlocked.failure?.category).toBe("repo");
+    expect(mergeBlocked.failure?.step).toBe(3);
 
-      const dirtyCtx = buildContext({
-        describeRepo: async () => ({
-          isDirty: true,
-          isMergeInProgress: false,
-          branch: "feature/foo",
-          detail: "src/startup.ts",
-        }),
-      });
-      const dirtyBlocked = await runStartupPreflight(dirtyCtx);
-      expect(dirtyBlocked.ok).toBe(false);
-      expect(dirtyBlocked.failure?.code).toBe(
-        STARTUP_FAILURE_CODES.REPO_DIRTY,
-      );
-      expect(dirtyBlocked.failure?.detail.includes("feature/foo")).toBeTruthy();
-      expect(dirtyBlocked.failure?.category).toBe("repo");
-      expect(dirtyBlocked.failure?.step).toBe(4);
-    },
-  );
+    const dirtyCtx = buildContext({
+      describeRepo: async () => ({
+        isDirty: true,
+        isMergeInProgress: false,
+        branch: "feature/foo",
+        detail: "src/startup.ts",
+      }),
+    });
+    const dirtyBlocked = await runStartupPreflight(dirtyCtx);
+    expect(dirtyBlocked.ok).toBe(false);
+    expect(dirtyBlocked.failure?.code).toBe(STARTUP_FAILURE_CODES.REPO_DIRTY);
+    expect(dirtyBlocked.failure?.detail.includes("feature/foo")).toBeTruthy();
+    expect(dirtyBlocked.failure?.category).toBe("repo");
+    expect(dirtyBlocked.failure?.step).toBe(4);
+  });
 
   test("fails when Bun runtime is below the required version", async () => {
     const telemetry: StartupTelemetryEvent[] = [];
@@ -90,9 +83,7 @@ describe("StartupChecklist", () => {
     });
     const result = await runStartupPreflight(ctx);
     expect(result.ok).toBe(false);
-    expect(result.failure?.code).toBe(
-      STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
-    );
+    expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED);
     expect(result.failure?.step).toBe(1);
     expect(result.failure?.category).toBe("runtime");
     expect(result.failure?.detail).toContain("1.0.9");
@@ -117,9 +108,7 @@ describe("StartupChecklist", () => {
     });
     const result = await runStartupPreflight(ctx);
     expect(result.ok).toBe(false);
-    expect(result.failure?.code).toBe(
-      STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
-    );
+    expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED);
     expect(result.failure?.step).toBe(2);
     expect(result.failure?.category).toBe("infrastructure");
     expect(result.failure?.detail).toContain("23.0.5");
@@ -164,16 +153,11 @@ describe("StartupChecklist", () => {
     const successDispatch = async () => {
       successOrder.push("dispatch");
     };
-    const success = await gateDispatchWithStartupPreflight(
-      successCtx,
-      successDispatch,
-      { syntheticProbeName: "startup.synthetic" },
-    );
+    const success = await gateDispatchWithStartupPreflight(successCtx, successDispatch, {
+      syntheticProbeName: "startup.synthetic",
+    });
     expect(success.ok).toBe(true);
-    expect(successOrder).toEqual([
-      "synthetic:startup.synthetic",
-      "dispatch",
-    ]);
+    expect(successOrder).toEqual(["synthetic:startup.synthetic", "dispatch"]);
     const lastEntry = success.history.at(-1);
     expect(lastEntry?.category).toBe("dispatch");
     expect(lastEntry?.status).toBe("pass");
@@ -196,55 +180,46 @@ describe("StartupChecklist", () => {
     const blockedDispatch = async () => {
       failureDispatchCalls.push("dispatch");
     };
-    const failed = await gateDispatchWithStartupPreflight(
-      failureCtx,
-      blockedDispatch,
-    );
+    const failed = await gateDispatchWithStartupPreflight(failureCtx, blockedDispatch);
     expect(failed.ok).toBe(false);
     expect(failed.failure?.code).toBe(STARTUP_FAILURE_CODES.SYNTHETIC_FAILED);
     expect(failureOrder).toEqual(["synthetic:probe.remote_startup"]);
     expect(failureDispatchCalls).toHaveLength(0);
   });
 
-  test(
-    "gate aborts dispatch when deterministic checks fail before alerts",
-    async () => {
-      const dispatchCalls: string[] = [];
-      let alertChecks = 0;
-      let syntheticChecks = 0;
-      const ctx = buildContext({
-        describeRepo: async () => ({
-          isDirty: true,
-          isMergeInProgress: false,
-          branch: "feature/dirty",
-          detail: "README.md",
-        }),
-        listFiringAlerts: async () => {
-          alertChecks += 1;
-          return [];
+  test("gate aborts dispatch when deterministic checks fail before alerts", async () => {
+    const dispatchCalls: string[] = [];
+    let alertChecks = 0;
+    let syntheticChecks = 0;
+    const ctx = buildContext({
+      describeRepo: async () => ({
+        isDirty: true,
+        isMergeInProgress: false,
+        branch: "feature/dirty",
+        detail: "README.md",
+      }),
+      listFiringAlerts: async () => {
+        alertChecks += 1;
+        return [];
+      },
+      syntheticTester: {
+        runSyntheticJob: async () => {
+          syntheticChecks += 1;
+          return { ok: true, latencyMs: 210 };
         },
-        syntheticTester: {
-          runSyntheticJob: async () => {
-            syntheticChecks += 1;
-            return { ok: true, latencyMs: 210 };
-          },
-        },
-      });
-      const result = await gateDispatchWithStartupPreflight(
-        ctx,
-        async () => {
-          dispatchCalls.push("dispatch");
-        },
-      );
-      expect(result.ok).toBe(false);
-      expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.REPO_DIRTY);
-      expect(result.failure?.category).toBe("repo");
-      expect(result.failure?.step).toBe(4);
-      expect(dispatchCalls).toHaveLength(0);
-      expect(alertChecks).toBe(0);
-      expect(syntheticChecks).toBe(0);
-    },
-  );
+      },
+    });
+    const result = await gateDispatchWithStartupPreflight(ctx, async () => {
+      dispatchCalls.push("dispatch");
+    });
+    expect(result.ok).toBe(false);
+    expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.REPO_DIRTY);
+    expect(result.failure?.category).toBe("repo");
+    expect(result.failure?.step).toBe(4);
+    expect(dispatchCalls).toHaveLength(0);
+    expect(alertChecks).toBe(0);
+    expect(syntheticChecks).toBe(0);
+  });
 
   test("synthetic probe failure surfaces actionable guidance", async () => {
     const ctx = buildContext({
@@ -298,9 +273,7 @@ describe("StartupChecklist", () => {
   });
 
   test("exports structured checklist metadata", () => {
-    expect(STARTUP_CHECK_STRUCTURE.map((item) => item.step)).toEqual([
-      1, 2, 3, 4, 5, 6, 7,
-    ]);
+    expect(STARTUP_CHECK_STRUCTURE.map((item) => item.step)).toEqual([1, 2, 3, 4, 5, 6, 7]);
     expect(STARTUP_CHECK_STRUCTURE.map((item) => item.category)).toEqual([
       "runtime",
       "infrastructure",
@@ -322,14 +295,10 @@ describe("StartupChecklist", () => {
     const ctx = buildContext({
       telemetry: (event) => telemetry.push(event),
     });
-    const result = await gateDispatchWithStartupPreflight(
-      ctx,
-      async () => undefined,
-    );
+    const result = await gateDispatchWithStartupPreflight(ctx, async () => undefined);
     expect(result.ok).toBe(true);
     const phaseEvents = telemetry.filter(
-      (event): event is StartupTelemetryPhaseEvent =>
-        event.type === "startup_phase",
+      (event): event is StartupTelemetryPhaseEvent => event.type === "startup_phase",
     );
     expect(phaseEvents).toHaveLength(7);
     expect(phaseEvents.map((event) => event.code)).toEqual([
@@ -350,9 +319,7 @@ describe("StartupChecklist", () => {
     expect(dispatchEvent?.code).toBe(STARTUP_FAILURE_CODES.DISPATCH_FAILED);
     expect(dispatchEvent?.status).toBe("pass");
     expect(dispatchEvent?.detail).toContain("Dispatch completed");
-    const unknownEvents = telemetry.filter(
-      (event) => event.type === "startup_unknown_failure",
-    );
+    const unknownEvents = telemetry.filter((event) => event.type === "startup_unknown_failure");
     expect(unknownEvents).toHaveLength(0);
   });
 
@@ -366,20 +333,15 @@ describe("StartupChecklist", () => {
     });
     const result = await runStartupPreflight(ctx);
     expect(result.ok).toBe(false);
-    const unknownEvent = telemetry.find(
-      (event) => event.type === "startup_unknown_failure",
-    );
+    const unknownEvent = telemetry.find((event) => event.type === "startup_unknown_failure");
     expect(unknownEvent?.code).toBe(STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS);
     expect(unknownEvent?.error.message).toContain("git status panic");
     const phaseEvent = telemetry.find(
       (event): event is StartupTelemetryPhaseEvent =>
-        event.type === "startup_phase" &&
-        event.code === STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
+        event.type === "startup_phase" && event.code === STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
     );
     expect(phaseEvent?.status).toBe("fail");
-    expect(phaseEvent?.error?.message ?? phaseEvent?.detail).toContain(
-      "git status panic",
-    );
+    expect(phaseEvent?.error?.message ?? phaseEvent?.detail).toContain("git status panic");
   });
 
   test("bun version probe exceptions surface telemetry payloads", async () => {
@@ -393,9 +355,7 @@ describe("StartupChecklist", () => {
     });
     const result = await runStartupPreflight(ctx);
     expect(result.ok).toBe(false);
-    expect(result.failure?.code).toBe(
-      STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
-    );
+    expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED);
     expect(result.failure?.detail).toContain("Bun version probe failed");
     const bunHistory = result.history.find(
       (entry) => entry.code === STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
@@ -430,9 +390,7 @@ describe("StartupChecklist", () => {
 
   test("docker version probe exceptions emit telemetry detail", async () => {
     const telemetry: StartupTelemetryEvent[] = [];
-    const dockerProbeError = new Error(
-      "docker version returned unexpected payload: (empty)",
-    );
+    const dockerProbeError = new Error("docker version returned unexpected payload: (empty)");
     const ctx = buildContext({
       readDockerVersion: async () => {
         throw dockerProbeError;
@@ -441,9 +399,7 @@ describe("StartupChecklist", () => {
     });
     const result = await runStartupPreflight(ctx);
     expect(result.ok).toBe(false);
-    expect(result.failure?.code).toBe(
-      STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED,
-    );
+    expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.DOCKER_VERSION_UNSUPPORTED);
     expect(result.failure?.detail).toContain("Docker version probe failed");
     expect(result.failure?.step).toBe(2);
     const dockerPhase = telemetry.find(
@@ -454,13 +410,9 @@ describe("StartupChecklist", () => {
     expect(dockerPhase).toBeDefined();
     if (dockerPhase) {
       expect(dockerPhase.status).toBe("fail");
-      expect(dockerPhase.error?.message).toContain(
-        "Docker version probe failed",
-      );
+      expect(dockerPhase.error?.message).toContain("Docker version probe failed");
       expect(dockerPhase.error?.raw).toBe(dockerProbeError);
-      expect(dockerPhase.startedAtMs).toBeLessThanOrEqual(
-        dockerPhase.endedAtMs,
-      );
+      expect(dockerPhase.startedAtMs).toBeLessThanOrEqual(dockerPhase.endedAtMs);
       expect(dockerPhase.error?.stack).toBeDefined();
     }
     const unknownEvent = telemetry.find(
@@ -470,9 +422,7 @@ describe("StartupChecklist", () => {
     );
     expect(unknownEvent).toBeDefined();
     if (unknownEvent) {
-      expect(unknownEvent.error.message).toContain(
-        "Docker version probe failed",
-      );
+      expect(unknownEvent.error.message).toContain("Docker version probe failed");
       expect(unknownEvent.error.raw).toBe(dockerProbeError);
       expect(unknownEvent.step).toBe(2);
     }
@@ -504,9 +454,7 @@ describe("StartupChecklist", () => {
     expect(result.failure?.category).toBe("synthetic");
     expect(result.failure?.step).toBe(6);
     const lastHistoryEntry = result.history.at(-1);
-    expect(lastHistoryEntry?.code).toBe(
-      STARTUP_FAILURE_CODES.SYNTHETIC_FAILED,
-    );
+    expect(lastHistoryEntry?.code).toBe(STARTUP_FAILURE_CODES.SYNTHETIC_FAILED);
     expect(lastHistoryEntry?.category).toBe("synthetic");
     expect(lastHistoryEntry?.status).toBe("fail");
     expect(dispatchCalls).toHaveLength(0);
@@ -520,9 +468,7 @@ describe("StartupChecklist", () => {
     });
     const result = await runStartupPreflight(ctx);
     expect(result.ok).toBe(false);
-    expect(result.failure?.code).toBe(
-      STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
-    );
+    expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS);
     const mergeRecord = result.history.find(
       (entry) => entry.code === STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
     );
@@ -595,12 +541,9 @@ describe("StartupChecklist", () => {
         logEntries.push(entry);
       },
     });
-    const result = await gateDispatchWithStartupPreflight(
-      ctx,
-      async () => {
-        // dispatch succeeds
-      },
-    );
+    const result = await gateDispatchWithStartupPreflight(ctx, async () => {
+      // dispatch succeeds
+    });
     expect(result.ok).toBe(true);
     expect(logEntries).toHaveLength(result.history.length);
     expect(logEntries.map((entry) => entry.code)).toEqual(
@@ -639,12 +582,8 @@ describe("StartupChecklist", () => {
       });
       const result = await runStartupPreflight(ctx);
       expect(result.ok).toBe(false);
-      expect(result.failure?.code).toBe(
-        STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
-      );
-      const expectedAction = actionFor(
-        STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
-      );
+      expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS);
+      const expectedAction = actionFor(STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS);
       const record = result.history.find(
         (entry) => entry.code === STARTUP_FAILURE_CODES.MERGE_IN_PROGRESS,
       );

@@ -1,8 +1,4 @@
-import type {
-  CompletionSnapshotRow,
-  JobSnapshotRow,
-  RequestSnapshotRow,
-} from "../lib/pushpalsApi";
+import type { CompletionSnapshotRow, JobSnapshotRow, RequestSnapshotRow } from "../lib/pushpalsApi";
 import type { CoordinationRow, CoordinationStage } from "./dashboardTypes";
 
 function parseJsonRecord(value: string | null): Record<string, unknown> | null {

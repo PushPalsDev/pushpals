@@ -26,8 +26,16 @@ describe("shared config startup log_config_on_start parsing", () => {
     const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
-    writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n[startup]\nlog_config_on_start = true\n', "utf8");
-    writeFileSync(join(configDir, "local.example.toml"), "[startup]\nlog_config_on_start = false\n", "utf8");
+    writeFileSync(
+      join(configDir, "default.toml"),
+      'profile = "dev"\n[startup]\nlog_config_on_start = true\n',
+      "utf8",
+    );
+    writeFileSync(
+      join(configDir, "local.example.toml"),
+      "[startup]\nlog_config_on_start = false\n",
+      "utf8",
+    );
 
     try {
       const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
@@ -42,7 +50,11 @@ describe("shared config startup log_config_on_start parsing", () => {
     const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
 
-    writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n[startup]\nlog_config_on_start = false\n', "utf8");
+    writeFileSync(
+      join(configDir, "default.toml"),
+      'profile = "dev"\n[startup]\nlog_config_on_start = false\n',
+      "utf8",
+    );
     writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
 
     const prior = process.env.PUSHPALS_LOG_CONFIG_ON_START;

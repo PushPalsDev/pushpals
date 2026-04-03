@@ -8,22 +8,22 @@ queue latency only; deeper debugging steps still live in `apps/remotebuddy/docs/
 
 ## Current Metrics
 
-| Signal | Baseline expectation | Notes |
-| --- | --- | --- |
-| `queue_p95` (interactive lane) | 0 ms | Treat any >0 reading as regression; use Grafana “RemoteBuddy Queue Overview” side-by-side (last 15 m vs 24 h) to confirm. |
-| Pending interactive requests | < 10 | Healthy empty queue mirrors 0 ms wait. Rising backlog almost always precedes latency before alerts page. |
-| Worker idle slots | ≥ 3 per lane | Maintains runway should automated enqueues (autonomy `forceWorker`) surge. Below this threshold run step 3 in the runbook. |
+| Signal                         | Baseline expectation | Notes                                                                                                                      |
+| ------------------------------ | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `queue_p95` (interactive lane) | 0 ms                 | Treat any >0 reading as regression; use Grafana “RemoteBuddy Queue Overview” side-by-side (last 15 m vs 24 h) to confirm.  |
+| Pending interactive requests   | < 10                 | Healthy empty queue mirrors 0 ms wait. Rising backlog almost always precedes latency before alerts page.                   |
+| Worker idle slots              | ≥ 3 per lane         | Maintains runway should automated enqueues (autonomy `forceWorker`) surge. Below this threshold run step 3 in the runbook. |
 
 ## Alert Thresholds
 
 These thresholds align with the **guardrails for queue_p95 ≈ 0** published in README.
 
-| Condition | Alert surface | Immediate action |
-| --- | --- | --- |
-| `queue_p95` ≤ 1.0 s **and** pending interactive < 10 | Healthy (no alert) | Keep `/system/status` tailing hourly; capture baseline snapshots once per shift. |
-| `queue_p95` 1.0–1.5 s **or** pending interactive ≥ 15 | Slack `queue_p95_spike_warning` thread in `#pushpals-ops` | Run diagnostics in queue-playbook, verify automation injected `forceWorker` requests, pause new eval/background submissions. |
-| `queue_p95` ≥ 1.5 s for >5 m **or** pending interactive ≥ 30 | PagerDuty: RemoteBuddy Platform (`queue_p95_sustained`) | Acknowledge ≤5 m, shift enqueueing to interactive-only, add WorkerPal capacity, post updates every 15 m. |
-| `queue_p95` ≥ 2.0 s **or** queue depth > 60 **or** <2 idle workers for 5 polls | PagerDuty escalation + mirrored Slack incident | Page WorkerPals Runtime, throttle background work entirely, prep leadership/status comms until p95 drops below 1.0 s. |
+| Condition                                                                      | Alert surface                                             | Immediate action                                                                                                             |
+| ------------------------------------------------------------------------------ | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `queue_p95` ≤ 1.0 s **and** pending interactive < 10                           | Healthy (no alert)                                        | Keep `/system/status` tailing hourly; capture baseline snapshots once per shift.                                             |
+| `queue_p95` 1.0–1.5 s **or** pending interactive ≥ 15                          | Slack `queue_p95_spike_warning` thread in `#pushpals-ops` | Run diagnostics in queue-playbook, verify automation injected `forceWorker` requests, pause new eval/background submissions. |
+| `queue_p95` ≥ 1.5 s for >5 m **or** pending interactive ≥ 30                   | PagerDuty: RemoteBuddy Platform (`queue_p95_sustained`)   | Acknowledge ≤5 m, shift enqueueing to interactive-only, add WorkerPal capacity, post updates every 15 m.                     |
+| `queue_p95` ≥ 2.0 s **or** queue depth > 60 **or** <2 idle workers for 5 polls | PagerDuty escalation + mirrored Slack incident            | Page WorkerPals Runtime, throttle background work entirely, prep leadership/status comms until p95 drops below 1.0 s.        |
 
 ## Recovery / Runbook
 

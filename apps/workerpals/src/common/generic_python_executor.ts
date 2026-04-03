@@ -58,10 +58,7 @@ function estimateJobTokenUsage(
   };
 }
 
-function coerceJobTokenUsage(
-  value: unknown,
-  fallback: JobTokenUsage,
-): JobTokenUsage {
+function coerceJobTokenUsage(value: unknown, fallback: JobTokenUsage): JobTokenUsage {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return fallback;
   }

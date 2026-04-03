@@ -99,18 +99,21 @@ function writeServerConfig(root: string, port: number): void {
 }
 
 function spawnServer(root: string, port: number, authToken: string): SpawnedServer {
-  const proc = Bun.spawn([bunExecPath, "run", resolve(repoRoot, "apps/server/src/server_main.ts")], {
-    cwd: repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
-      PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
-      PUSHPALS_PORT: String(port),
-      PUSHPALS_AUTH_TOKEN: authToken,
+  const proc = Bun.spawn(
+    [bunExecPath, "run", resolve(repoRoot, "apps/server/src/server_main.ts")],
+    {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
+        PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
+        PUSHPALS_PORT: String(port),
+        PUSHPALS_AUTH_TOKEN: authToken,
+      },
     },
-  });
+  );
 
   const server: SpawnedServer = {
     proc,
@@ -125,7 +128,11 @@ function spawnServer(root: string, port: number, authToken: string): SpawnedServ
   return server;
 }
 
-async function waitForHealth(server: SpawnedServer, port: number, timeoutMs = 10_000): Promise<void> {
+async function waitForHealth(
+  server: SpawnedServer,
+  port: number,
+  timeoutMs = 10_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (server.exitCode != null) {
@@ -196,7 +203,10 @@ async function waitForConnectedClientCount(
   return await fetchSystemStatus(port, authToken);
 }
 
-async function openSseStream(url: string, authToken: string): Promise<{
+async function openSseStream(
+  url: string,
+  authToken: string,
+): Promise<{
   reader: ReadableStreamDefaultReader<Uint8Array>;
   abort: () => void;
 }> {
@@ -219,9 +229,7 @@ async function openSseStream(url: string, authToken: string): Promise<{
 }
 
 describe("server client presence route integration", () => {
-  test(
-    "system status exposes unified client presence across SSE connect and disconnect",
-    async () => {
+  test("system status exposes unified client presence across SSE connect and disconnect", async () => {
     const root = makeTempDir();
     const authToken = "presence-token-sse";
     const port = await getFreePort();
@@ -260,7 +268,9 @@ describe("server client presence route integration", () => {
     );
 
     const duringSse = await waitForConnectedClientCount(port, authToken, 1);
-    expect(duringSse.clients.items.find((item: any) => item.clientId === "web-stream-1")).toMatchObject({
+    expect(
+      duringSse.clients.items.find((item: any) => item.clientId === "web-stream-1"),
+    ).toMatchObject({
       clientId: "web-stream-1",
       kind: "web",
       status: "connected",
@@ -270,7 +280,9 @@ describe("server client presence route integration", () => {
     await reader.cancel();
     abort();
     const afterClose = await waitForConnectedClientCount(port, authToken, 0);
-    expect(afterClose.clients.items.find((item: any) => item.clientId === "web-stream-1")).toMatchObject({
+    expect(
+      afterClose.clients.items.find((item: any) => item.clientId === "web-stream-1"),
+    ).toMatchObject({
       clientId: "web-stream-1",
       status: "announced",
       connectedTransports: [],
@@ -286,13 +298,9 @@ describe("server client presence route integration", () => {
     });
     expect(shutdown.status).toBe(202);
     await server.proc.exited;
-    },
-    15_000,
-  );
+  }, 15_000);
 
-  test(
-    "system status exposes unified client presence across session announce and websocket connect",
-    async () => {
+  test("system status exposes unified client presence across session announce and websocket connect", async () => {
     const root = makeTempDir();
     const authToken = "presence-token";
     const port = await getFreePort();
@@ -350,7 +358,9 @@ describe("server client presence route integration", () => {
     expect(duringWs.clients.total).toBe(2);
     expect(duringWs.clients.connected).toBe(1);
     expect(duringWs.clients.byKind).toEqual({ vscode: 1, web: 1 });
-    expect(duringWs.clients.items.find((item: any) => item.clientId === "vscode-demo")).toMatchObject({
+    expect(
+      duringWs.clients.items.find((item: any) => item.clientId === "vscode-demo"),
+    ).toMatchObject({
       clientId: "vscode-demo",
       kind: "vscode",
       status: "connected",
@@ -364,7 +374,9 @@ describe("server client presence route integration", () => {
     const afterClose = await waitForConnectedClientCount(port, authToken, 0);
     expect(afterClose.clients.total).toBe(2);
     expect(afterClose.clients.connected).toBe(0);
-    expect(afterClose.clients.items.find((item: any) => item.clientId === "vscode-demo")).toMatchObject({
+    expect(
+      afterClose.clients.items.find((item: any) => item.clientId === "vscode-demo"),
+    ).toMatchObject({
       clientId: "vscode-demo",
       status: "announced",
       connectedTransports: [],
@@ -380,70 +392,64 @@ describe("server client presence route integration", () => {
     });
     expect(shutdown.status).toBe(202);
     await server.proc.exited;
-    },
-    15_000,
-  );
+  }, 15_000);
 
-  test(
-    "system status tracks agent websocket presence from CommunicationManager subscribers",
-    async () => {
-      const root = makeTempDir();
-      const authToken = "presence-token-agent";
-      const port = await getFreePort();
-      writeServerConfig(root, port);
+  test("system status tracks agent websocket presence from CommunicationManager subscribers", async () => {
+    const root = makeTempDir();
+    const authToken = "presence-token-agent";
+    const port = await getFreePort();
+    writeServerConfig(root, port);
 
-      const server = spawnServer(root, port, authToken);
-      await waitForHealth(server, port);
+    const server = spawnServer(root, port, authToken);
+    await waitForHealth(server, port);
 
-      const createResponse = await fetch(`http://127.0.0.1:${port}/sessions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({ sessionId: "dev" }),
-      });
-      expect(createResponse.status).toBe(201);
+    const createResponse = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ sessionId: "dev" }),
+    });
+    expect(createResponse.status).toBe(201);
 
-      const comm = new CommunicationManager({
-        serverUrl: `http://127.0.0.1:${port}`,
-        sessionId: "dev",
-        from: "agent:remotebuddy-orchestrator",
-      });
-      const stop = comm.subscribeSessionEvents(() => {});
+    const comm = new CommunicationManager({
+      serverUrl: `http://127.0.0.1:${port}`,
+      sessionId: "dev",
+      from: "agent:remotebuddy-orchestrator",
+    });
+    const stop = comm.subscribeSessionEvents(() => {});
 
-      const duringWs = await waitForConnectedClientCount(port, authToken, 1);
-      expect(
-        duringWs.clients.items.find((item: any) => item.clientId === "remotebuddy-orchestrator"),
-      ).toMatchObject({
-        clientId: "remotebuddy-orchestrator",
-        kind: "agent",
-        status: "connected",
-        sessionId: "dev",
-        connectedTransports: ["ws"],
-      });
+    const duringWs = await waitForConnectedClientCount(port, authToken, 1);
+    expect(
+      duringWs.clients.items.find((item: any) => item.clientId === "remotebuddy-orchestrator"),
+    ).toMatchObject({
+      clientId: "remotebuddy-orchestrator",
+      kind: "agent",
+      status: "connected",
+      sessionId: "dev",
+      connectedTransports: ["ws"],
+    });
 
-      stop();
-      const afterClose = await waitForConnectedClientCount(port, authToken, 0);
-      expect(
-        afterClose.clients.items.find((item: any) => item.clientId === "remotebuddy-orchestrator"),
-      ).toMatchObject({
-        clientId: "remotebuddy-orchestrator",
-        status: "announced",
-        connectedTransports: [],
-      });
+    stop();
+    const afterClose = await waitForConnectedClientCount(port, authToken, 0);
+    expect(
+      afterClose.clients.items.find((item: any) => item.clientId === "remotebuddy-orchestrator"),
+    ).toMatchObject({
+      clientId: "remotebuddy-orchestrator",
+      status: "announced",
+      connectedTransports: [],
+    });
 
-      const shutdown = await fetch(`http://127.0.0.1:${port}/admin/shutdown`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({ reason: "test shutdown" }),
-      });
-      expect(shutdown.status).toBe(202);
-      await server.proc.exited;
-    },
-    15_000,
-  );
+    const shutdown = await fetch(`http://127.0.0.1:${port}/admin/shutdown`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ reason: "test shutdown" }),
+    });
+    expect(shutdown.status).toBe(202);
+    await server.proc.exited;
+  }, 15_000);
 });

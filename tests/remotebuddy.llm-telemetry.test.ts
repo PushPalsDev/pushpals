@@ -52,9 +52,14 @@ describe("remotebuddy llm telemetry", () => {
     expect(output.usage?.promptTokens).toBeGreaterThan(0);
     expect(output.usage?.completionTokens).toBeGreaterThan(0);
 
-    const telemetryCall = calls.find((entry) => entry.url === "http://server.test/telemetry/llm-usage");
+    const telemetryCall = calls.find(
+      (entry) => entry.url === "http://server.test/telemetry/llm-usage",
+    );
     expect(telemetryCall).toBeDefined();
-    const payload = JSON.parse(String(telemetryCall?.init?.body ?? "{}")) as Record<string, unknown>;
+    const payload = JSON.parse(String(telemetryCall?.init?.body ?? "{}")) as Record<
+      string,
+      unknown
+    >;
     expect(payload.service).toBe("localbuddy");
     expect(payload.backend).toBe("ollama");
     expect(payload.modelId).toBe("tiny-model");

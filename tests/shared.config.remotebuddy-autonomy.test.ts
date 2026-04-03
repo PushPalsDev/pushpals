@@ -12,11 +12,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
     writeFileSync(
       join(configDir, "default.toml"),
-      [
-        'profile = "dev"',
-        "",
-        "[remotebuddy]",
-      ].join("\n"),
+      ['profile = "dev"', "", "[remotebuddy]"].join("\n"),
       "utf8",
     );
     writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
@@ -36,12 +32,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
     writeFileSync(
       join(configDir, "default.toml"),
-      [
-        'profile = "dev"',
-        "",
-        "[remotebuddy.autonomy]",
-        "enabled = true",
-      ].join("\n"),
+      ['profile = "dev"', "", "[remotebuddy.autonomy]", "enabled = true"].join("\n"),
       "utf8",
     );
     writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
@@ -198,12 +189,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
 
     writeFileSync(
       join(configDir, "default.toml"),
-      [
-        'profile = "dev"',
-        "",
-        "[remotebuddy.autonomy]",
-        "enabled = true",
-      ].join("\n"),
+      ['profile = "dev"', "", "[remotebuddy.autonomy]", "enabled = true"].join("\n"),
       "utf8",
     );
     writeFileSync(join(configDir, "local.example.toml"), "", "utf8");

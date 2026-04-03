@@ -457,11 +457,7 @@ function normalizeWorkerImageRebuildMode(value: string): "auto" | "always" | "ne
 
 function normalizeStartupPortConflictPolicy(value: string): "fail" | "terminate_pushpals" {
   const text = value.trim().toLowerCase().replace(/-/g, "_");
-  if (
-    text === "terminate_pushpals" ||
-    text === "kill_pushpals" ||
-    text === "auto_kill_pushpals"
-  ) {
+  if (text === "terminate_pushpals" || text === "kill_pushpals" || text === "auto_kill_pushpals") {
     return "terminate_pushpals";
   }
   return "fail";
@@ -535,10 +531,7 @@ function resolveLlmConfig(
   );
   const codexTimeoutMs = Math.max(
     10_000,
-    asInt(
-      parseIntEnv(`${envPrefix}_LLM_CODEX_TIMEOUT_MS`) ?? llmNode.codex_timeout_ms,
-      120_000,
-    ),
+    asInt(parseIntEnv(`${envPrefix}_LLM_CODEX_TIMEOUT_MS`) ?? llmNode.codex_timeout_ms, 120_000),
   );
   return {
     backend,
@@ -916,7 +909,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     Math.min(
       10,
       asInt(
-        parseIntEnv("WORKERPALS_QUALITY_MAX_AUTO_REVISIONS") ?? workerNode.quality_max_auto_revisions,
+        parseIntEnv("WORKERPALS_QUALITY_MAX_AUTO_REVISIONS") ??
+          workerNode.quality_max_auto_revisions,
         DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS,
       ),
     ),
@@ -973,8 +967,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const workerQualityCriticTimeoutMs = Math.max(
     1_000,
     asInt(
-      parseIntEnv("WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS") ??
-        workerNode.quality_critic_timeout_ms,
+      parseIntEnv("WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS") ?? workerNode.quality_critic_timeout_ms,
       DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS,
     ),
   );
@@ -1431,8 +1424,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     parseBoolEnv("PUSHPALS_ALLOW_EXTERNAL_CLEAN") ??
     asBoolean(startupNode.allow_external_clean, false);
   const startupPortPreflight =
-    parseBoolEnv("PUSHPALS_STARTUP_PORT_PREFLIGHT") ??
-    asBoolean(startupNode.port_preflight, true);
+    parseBoolEnv("PUSHPALS_STARTUP_PORT_PREFLIGHT") ?? asBoolean(startupNode.port_preflight, true);
   const startupPortConflictPolicy = normalizeStartupPortConflictPolicy(
     firstNonEmpty(
       process.env.PUSHPALS_STARTUP_PORT_CONFLICT_POLICY,
@@ -1508,10 +1500,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         asBoolean(remoteNode.auto_spawn_workerpals, true),
       maxWorkerpals: Math.max(
         1,
-        asInt(
-          parseIntEnv("REMOTEBUDDY_MAX_WORKERPALS") ?? remoteNode.max_workerpals,
-          20,
-        ),
+        asInt(parseIntEnv("REMOTEBUDDY_MAX_WORKERPALS") ?? remoteNode.max_workerpals, 20),
       ),
       workerpalStartupTimeoutMs: Math.max(
         1_000,
@@ -1647,8 +1636,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         llmTimeoutMs: Math.max(
           1_000,
           asInt(
-            parseIntEnv("REMOTEBUDDY_AUTONOMY_LLM_TIMEOUT_MS") ??
-              remoteAutonomyNode.llm_timeout_ms,
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_LLM_TIMEOUT_MS") ?? remoteAutonomyNode.llm_timeout_ms,
             12_000,
           ),
         ),
@@ -2156,10 +2144,7 @@ function sanitizeConfigString(value: string): string {
   return out;
 }
 
-function sanitizeConfigValueForLogging(
-  value: unknown,
-  parentKey = "",
-): unknown {
+function sanitizeConfigValueForLogging(value: unknown, parentKey = ""): unknown {
   if (
     typeof value === "string" ||
     typeof value === "number" ||

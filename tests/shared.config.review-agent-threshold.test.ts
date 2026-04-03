@@ -12,21 +12,15 @@ describe("shared config review_agent threshold parsing", () => {
 
     writeFileSync(
       join(configDir, "default.toml"),
-      [
-        'profile = "dev"',
-        "",
-        "[source_control_manager.review_agent]",
-        "pass_threshold = 9.5",
-      ].join("\n"),
+      ['profile = "dev"', "", "[source_control_manager.review_agent]", "pass_threshold = 9.5"].join(
+        "\n",
+      ),
       "utf8",
     );
 
     writeFileSync(
       join(configDir, "local.example.toml"),
-      [
-        "[source_control_manager.review_agent]",
-        "pass_threshold = 8.5",
-      ].join("\n"),
+      ["[source_control_manager.review_agent]", "pass_threshold = 8.5"].join("\n"),
       "utf8",
     );
 
@@ -154,19 +148,13 @@ describe("shared config review_agent threshold parsing", () => {
 
     writeFileSync(
       join(configDir, "local.example.toml"),
-      [
-        "[source_control_manager.review_agent]",
-        "max_pr_comments_before_give_up = 8",
-      ].join("\n"),
+      ["[source_control_manager.review_agent]", "max_pr_comments_before_give_up = 8"].join("\n"),
       "utf8",
     );
 
     writeFileSync(
       join(configDir, "local.toml"),
-      [
-        "[source_control_manager.review_agent]",
-        "max_pr_comments_before_give_up = 7",
-      ].join("\n"),
+      ["[source_control_manager.review_agent]", "max_pr_comments_before_give_up = 7"].join("\n"),
       "utf8",
     );
 

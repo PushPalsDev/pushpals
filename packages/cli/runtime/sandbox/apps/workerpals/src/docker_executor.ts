@@ -75,7 +75,10 @@ function resolveDockerExecutable(): string {
   return process.platform === "win32" ? "docker.exe" : "docker";
 }
 
-function resolveWorkerpalSandboxBuildContext(repoRoot: string): { root: string; dockerfilePath: string } {
+function resolveWorkerpalSandboxBuildContext(repoRoot: string): {
+  root: string;
+  dockerfilePath: string;
+} {
   const configuredRoot = String(process.env.PUSHPALS_WORKERPALS_SANDBOX_ROOT ?? "").trim();
   const sandboxRoot = configuredRoot || repoRoot;
   const dockerfilePath = configuredRoot
@@ -446,14 +449,11 @@ export class DockerExecutor {
       });
       await prune.exited;
 
-      proc = Bun.spawn(
-        ["git", "worktree", "add", "--force", "--detach", worktreePath, baseRef],
-        {
-          cwd: this.options.repo,
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
+      proc = Bun.spawn(["git", "worktree", "add", "--force", "--detach", worktreePath, baseRef], {
+        cwd: this.options.repo,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
       exitCode = await proc.exited;
       stdout = await new Response(proc.stdout).text();
       stderr = await new Response(proc.stderr).text();
@@ -713,7 +713,10 @@ export class DockerExecutor {
 
     args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
 
-    const proc = Bun.spawn([resolveDockerExecutable(), ...args], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn([resolveDockerExecutable(), ...args], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     const [exitCode, stdout, stderr] = await Promise.all([
       proc.exited,
       new Response(proc.stdout).text(),
@@ -814,10 +817,13 @@ export class DockerExecutor {
     stderr: string;
     exitCode: number;
   }> {
-    const proc = Bun.spawn([resolveDockerExecutable(), "exec", this.warmContainerName, "/bin/sh", "-lc", command], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const proc = Bun.spawn(
+      [resolveDockerExecutable(), "exec", this.warmContainerName, "/bin/sh", "-lc", command],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -854,10 +860,13 @@ export class DockerExecutor {
   }
 
   private async readWarmContainerLogs(tail = 160): Promise<string> {
-    const proc = Bun.spawn([resolveDockerExecutable(), "logs", "--tail", String(tail), this.warmContainerName], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const proc = Bun.spawn(
+      [resolveDockerExecutable(), "logs", "--tail", String(tail), this.warmContainerName],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -1555,11 +1564,14 @@ export class DockerExecutor {
       `[DockerExecutor] Worktree path already exists; forcing cleanup before create: ${worktreePath}`,
     );
 
-    const unregister = Bun.spawn(["git", "worktree", "remove", "--force", "--force", worktreePath], {
-      cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const unregister = Bun.spawn(
+      ["git", "worktree", "remove", "--force", "--force", worktreePath],
+      {
+        cwd: this.options.repo,
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
     await unregister.exited;
 
     const prune = Bun.spawn(["git", "worktree", "prune"], {
@@ -1777,10 +1789,13 @@ export class DockerExecutor {
    * Check if the Docker image exists locally
    */
   private async imageExists(): Promise<boolean> {
-    const proc = Bun.spawn([resolveDockerExecutable(), "image", "inspect", this.options.imageName], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const proc = Bun.spawn(
+      [resolveDockerExecutable(), "image", "inspect", this.options.imageName],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
     const exitCode = await proc.exited;
     return exitCode === 0;
   }

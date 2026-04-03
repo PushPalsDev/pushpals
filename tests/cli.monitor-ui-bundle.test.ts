@@ -30,6 +30,8 @@ describe("packaged CLI monitor bundle", () => {
     expect(bundleText).not.toContain("localAgentUrl");
     expect(bundleText).not.toContain("Send Local");
     expect(bundleText).not.toContain("LocalBuddy has not delegated this to execution yet.");
-    expect(bundleText).not.toContain("Requests from LocalBuddy will appear here with full lifecycle status.");
+    expect(bundleText).not.toContain(
+      "Requests from LocalBuddy will appear here with full lifecycle status.",
+    );
   });
 });

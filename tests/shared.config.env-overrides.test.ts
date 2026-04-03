@@ -12,7 +12,11 @@ describe("shared config env path overrides", () => {
     mkdirSync(projectRoot, { recursive: true });
     mkdirSync(configDir, { recursive: true });
 
-    writeFileSync(join(configDir, "default.toml"), 'profile = "dev"\n[server]\nport = 4123\n', "utf8");
+    writeFileSync(
+      join(configDir, "default.toml"),
+      'profile = "dev"\n[server]\nport = 4123\n',
+      "utf8",
+    );
     writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
 
     const previousProjectRoot = process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE;

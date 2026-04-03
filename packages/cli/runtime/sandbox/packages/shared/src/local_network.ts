@@ -89,7 +89,9 @@ export function resolveLocalServerConnection(options: {
   serverWasNormalized: boolean;
   authTokenWasIgnored: boolean;
 } {
-  const rawServer = String(options.serverUrl ?? "").trim().replace(/\/+$/, "");
+  const rawServer = String(options.serverUrl ?? "")
+    .trim()
+    .replace(/\/+$/, "");
   const normalizedServer = normalizeLoopbackHttpUrl(rawServer, options.fallbackPort);
   const authToken = String(options.authToken ?? "").trim();
   return {

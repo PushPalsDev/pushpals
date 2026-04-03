@@ -9,7 +9,8 @@ import {
 
 describe("workerpals worktree cleanup helpers", () => {
   test("windowsDeletionCandidates includes long-path literal only on Windows", () => {
-    const p = process.platform === "win32" ? "C:\\repo\\.worktrees\\job-1" : "/tmp/repo/.worktrees/job-1";
+    const p =
+      process.platform === "win32" ? "C:\\repo\\.worktrees\\job-1" : "/tmp/repo/.worktrees/job-1";
     const candidates = windowsDeletionCandidates(p);
     expect(candidates[0]).toBe(p);
     if (process.platform === "win32") {

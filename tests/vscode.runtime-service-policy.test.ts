@@ -197,5 +197,4 @@ describe("vscode runtime service policy", () => {
       `Missing required runtime config file: ${join(root, "configs", "default.toml")}`,
     );
   });
-
 });

@@ -70,7 +70,9 @@ describe("client runtime preflight", () => {
     expect(result.issues.map((issue) => issue.code)).toContain("missing_vision_doc");
 
     const lines = formatClientRuntimePreflightLines(result, "[pushpals]");
-    expect(lines.some((line) => line.includes("Missing required autonomy vision file: vision.md"))).toBe(true);
+    expect(
+      lines.some((line) => line.includes("Missing required autonomy vision file: vision.md")),
+    ).toBe(true);
     expect(lines.some((line) => line.includes("vision.example.md"))).toBe(true);
   });
 
