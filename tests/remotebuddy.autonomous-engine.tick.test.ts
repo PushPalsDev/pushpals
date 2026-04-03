@@ -117,6 +117,31 @@ function mockGitSpawnForTest(): void {
   };
 }
 
+function mockGitSpawnWithDirtyWorktree(): void {
+  originalSpawn = Bun.spawn;
+  (Bun as any).spawn = (cmd: string[], opts?: unknown) => {
+    if (Array.isArray(cmd) && cmd[0] === "git") {
+      const args = cmd.slice(1).join(" ");
+      if (/status --porcelain/.test(args)) {
+        return {
+          stdout: new Response(" M apps/server/src/autonomy.ts\n").body,
+          stderr: new Response("").body,
+          exited: Promise.resolve(0),
+          kill() {},
+        };
+      }
+      const exitCode = /rev-parse -q --verify MERGE_HEAD/.test(args) ? 1 : 0;
+      return {
+        stdout: new Response("").body,
+        stderr: new Response("").body,
+        exited: Promise.resolve(exitCode),
+        kill() {},
+      };
+    }
+    return originalSpawn(cmd as any, opts as any);
+  };
+}
+
 function seedPushpalsAutonomyRepoLayout(root: string): void {
   const markers = [
     "apps/server/src/autonomy.ts",
@@ -519,6 +544,138 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(fetchCalls).toBe(0);
 
     engine.stop();
+  });
+
+  test("tick short-circuits when snapshot kill switch is enabled", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-killswitch-"));
+    tempDirs.push(root);
+    const calls: FetchCall[] = [];
+    let llmCalls = 0;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+
+      if (url.includes("/autonomy/lock/acquire")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release")) return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot")) {
+        const snapshot = makeSnapshot();
+        return jsonResponse(200, {
+          ok: true,
+          snapshot: {
+            ...snapshot,
+            safety_state: { kill_switch_enabled: true },
+          },
+        });
+      }
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const llm = {
+      async generate() {
+        llmCalls += 1;
+        return {
+          text: JSON.stringify({ candidates: [] }),
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+    const comm = {
+      async emit() {
+        return true;
+      },
+    };
+
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_killswitch",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: comm as any,
+      config: makeConfig(),
+    });
+    (engine as any).ensureAutonomyRepoReady = async () => {
+      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+      mkdirSync(autonomyRepo, { recursive: true });
+      seedPushpalsAutonomyRepoLayout(autonomyRepo);
+      return true;
+    };
+
+    await engine.tick();
+
+    expect(llmCalls).toBe(0);
+    expect(calls.some((entry) => entry.url.includes("/autonomy/snapshot"))).toBe(true);
+    expect(calls.some((entry) => entry.url.includes("/autonomy/lock/release"))).toBe(true);
+    expect((engine as any).lastOutcome).toBe("skipped");
+    expect((engine as any).lastDetail).toBe("kill_switch_enabled");
+  });
+
+  test("tick stops at repo preflight when worktree is dirty and allowDirtyWorktree is false", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnWithDirtyWorktree();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-dirty-preflight-"));
+    tempDirs.push(root);
+    const calls: FetchCall[] = [];
+    let llmCalls = 0;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+
+      if (url.includes("/autonomy/lock/acquire")) return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release")) return jsonResponse(200, { ok: true, released: true });
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const llm = {
+      async generate() {
+        llmCalls += 1;
+        return {
+          text: JSON.stringify({ candidates: [] }),
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+    const comm = {
+      async emit() {
+        return true;
+      },
+    };
+
+    const cfg = makeConfig();
+    cfg.remotebuddy.autonomy.allowDirtyWorktree = false;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_dirty_preflight",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: comm as any,
+      config: cfg,
+    });
+    (engine as any).ensureAutonomyRepoReady = async () => {
+      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+      mkdirSync(autonomyRepo, { recursive: true });
+      seedPushpalsAutonomyRepoLayout(autonomyRepo);
+      return true;
+    };
+
+    await engine.tick();
+
+    expect(llmCalls).toBe(0);
+    expect(calls.some((entry) => entry.url.includes("/autonomy/snapshot"))).toBe(false);
+    expect(calls.some((entry) => entry.url.includes("/autonomy/lock/release"))).toBe(true);
+    expect((engine as any).lastOutcome).toBe("skipped");
+    expect((engine as any).lastDetail).toBe("repo_preflight_dirty_worktree");
   });
 
   test("tick can dispatch generic repo autonomy work when vision.md is present", async () => {
