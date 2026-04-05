@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -56,6 +57,12 @@ import {
   startEmbeddedMonitoringHub,
   waitForWorkerpalCapacity,
 } from "../scripts/pushpals-cli.ts";
+import {
+  ServiceManager,
+  computeServiceRestartBackoffMs,
+  formatEmbeddedRuntimeHealthLines,
+  shouldRestartService,
+} from "../scripts/start_runtime_services.ts";
 
 function createMonitorAssetFixture(prefix: string) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -142,6 +149,149 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
 
     expect(env.PUSHPALS_BUN_BIN).toBe(process.execPath);
+  });
+
+  test("computeServiceRestartBackoffMs uses exponential backoff and clamps to max", () => {
+    expect(computeServiceRestartBackoffMs(0)).toBe(2_000);
+    expect(computeServiceRestartBackoffMs(-3)).toBe(2_000);
+    expect(computeServiceRestartBackoffMs(1)).toBe(2_000);
+    expect(computeServiceRestartBackoffMs(2)).toBe(4_000);
+    expect(computeServiceRestartBackoffMs(3)).toBe(8_000);
+    expect(computeServiceRestartBackoffMs(10)).toBe(30_000);
+  });
+
+  test("shouldRestartService enforces max restart attempts", () => {
+    expect(shouldRestartService(0)).toBe(true);
+    expect(shouldRestartService(3)).toBe(true);
+    expect(shouldRestartService(4)).toBe(false);
+    expect(shouldRestartService(1, 2)).toBe(true);
+    expect(shouldRestartService(2, 2)).toBe(false);
+    expect(shouldRestartService(-1, 2)).toBe(true);
+    expect(shouldRestartService(1.9, 2)).toBe(true);
+    expect(shouldRestartService(2.1, 2)).toBe(false);
+  });
+
+  test("formatEmbeddedRuntimeHealthLines renders degraded state with action", () => {
+    expect(
+      formatEmbeddedRuntimeHealthLines({
+        state: "degraded",
+        detail: "source_control_manager: reached restart limit",
+        action: "Restart pushpals after fixing the runtime failure.",
+      }),
+    ).toEqual([
+      "[pushpals] embeddedRuntime=degraded detail=source_control_manager: reached restart limit",
+      "[pushpals] embeddedRuntimeAction=Restart pushpals after fixing the runtime failure.",
+    ]);
+  });
+
+  test("ServiceManager reports degraded runtime health after restart exhaustion", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-supervisor-degraded-"));
+    try {
+      const runtimeServicesLogPath = join(root, "runtime-services.log");
+      const serviceLogPath = join(root, "source-control-manager.log");
+      writeFileSync(runtimeServicesLogPath, "", "utf8");
+      writeFileSync(serviceLogPath, "", "utf8");
+
+      let spawnCalls = 0;
+      const supervisor = new ServiceManager({
+        pollMs: 50,
+        maxRestartAttempts: 1,
+        computeRestartBackoffMs: () => 50,
+        degradedAction: "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
+        spawnService: (spec) => {
+          spawnCalls += 1;
+          return {
+            name: spec.name,
+            proc: {} as any,
+            command: [...spec.command],
+            cwd: spec.cwd,
+            env: { ...(spec.env ?? {}) },
+            logPath: serviceLogPath,
+            exited: true,
+            exitCode: spawnCalls === 1 ? 23 : 99,
+            launchedAtMs: Date.now(),
+          };
+        },
+        onEvent: (level, line) => {
+          appendFileSync(runtimeServicesLogPath, `[${level}] ${line}\n`, "utf8");
+        },
+        onHealthChange: (health) => {
+          for (const line of formatEmbeddedRuntimeHealthLines(health)) {
+            appendFileSync(runtimeServicesLogPath, `${line}\n`, "utf8");
+          }
+        },
+      });
+      supervisor.startService({
+        name: "source_control_manager",
+        color: "",
+        command: ["fake-scm"],
+        cwd: root,
+        env: {},
+        logPath: serviceLogPath,
+      });
+
+      try {
+        await Bun.sleep(220);
+        const health = supervisor.getHealth();
+        expect(spawnCalls).toBe(2);
+        expect(health?.state).toBe("degraded");
+        expect(health?.detail).toContain("source_control_manager");
+        expect(health?.detail).toContain("reached restart limit");
+        expect(health?.action).toContain("Inspect the embedded service log");
+        const logText = readFileSync(runtimeServicesLogPath, "utf8");
+        expect(logText).toContain("[pushpals] embeddedRuntime=degraded detail=");
+      } finally {
+        supervisor.stop();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ServiceManager stop cancels pending restart timers", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-supervisor-stop-"));
+    try {
+      const runtimeServicesLogPath = join(root, "runtime-services.log");
+      const serviceLogPath = join(root, "source-control-manager.log");
+      writeFileSync(runtimeServicesLogPath, "", "utf8");
+      writeFileSync(serviceLogPath, "", "utf8");
+
+      let spawnCalls = 0;
+      const supervisor = new ServiceManager({
+        pollMs: 50,
+        computeRestartBackoffMs: () => 150,
+        spawnService: (spec) => {
+          spawnCalls += 1;
+          return {
+            name: spec.name,
+            proc: {} as any,
+            command: [...spec.command],
+            cwd: spec.cwd,
+            env: { ...(spec.env ?? {}) },
+            logPath: serviceLogPath,
+            exited: true,
+            exitCode: 17,
+            launchedAtMs: Date.now(),
+          };
+        },
+      });
+      supervisor.startService({
+        name: "source_control_manager",
+        color: "",
+        command: ["fake-scm"],
+        cwd: root,
+        env: {},
+        logPath: serviceLogPath,
+      });
+
+      await Bun.sleep(80);
+      supervisor.stop();
+      await Bun.sleep(220);
+      expect(spawnCalls).toBe(1);
+      expect(supervisor.getHealth()).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("resolveEmbeddedBunExecutableFromEnv finds bun on PATH for standalone CLI binaries", () => {

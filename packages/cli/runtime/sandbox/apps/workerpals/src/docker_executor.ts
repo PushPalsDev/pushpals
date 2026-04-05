@@ -236,6 +236,7 @@ export class DockerExecutor {
   private readonly jobRetryMaxAttempts: number;
   private readonly jobRetryBackoffMs: number;
   private readonly failureCooldownMs: number;
+  private readonly worktreeVisibilityTimeoutMs: number;
   private lastLoggedExecutionConfig = "";
   private lastLoggedEndpointRewrite = "";
   private warmedBackends = new Set<string>();
@@ -294,6 +295,7 @@ export class DockerExecutor {
       20_000,
       300_000,
     );
+    this.worktreeVisibilityTimeoutMs = process.platform === "win32" ? 15_000 : 5_000;
 
     // Ensure worktrees directory exists
     try {
@@ -416,7 +418,10 @@ export class DockerExecutor {
     try {
       await this.createWorktree(worktreePath, this.options.baseRef);
       await this.runGitSelfCheckContainer(worktreePath);
-      console.log(`[DockerExecutor] Startup self-check passed (git/worktree in container).`);
+      await this.ensureWorktreeAccessibleInWarmContainer(worktreePath);
+      console.log(
+        `[DockerExecutor] Startup self-check passed (git/worktree in container and warm container).`,
+      );
     } finally {
       await this.removeWorktree(worktreePath).catch(() => {
         // Ignore cleanup failures for startup self-check artifacts.
@@ -837,6 +842,41 @@ export class DockerExecutor {
     };
   }
 
+  private async runWarmWorktreeProbe(containerWorktreePath: string): Promise<{
+    ok: boolean;
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+  }> {
+    const proc = Bun.spawn(
+      [
+        resolveDockerExecutable(),
+        "exec",
+        "-w",
+        containerWorktreePath,
+        this.warmContainerName,
+        "/bin/sh",
+        "-lc",
+        "git rev-parse --is-inside-work-tree && git rev-parse --git-dir",
+      ],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      ok: exitCode === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode,
+    };
+  }
+
   private async inspectWarmContainerState(): Promise<string> {
     const proc = Bun.spawn(
       [
@@ -1054,10 +1094,10 @@ export class DockerExecutor {
   ): Promise<DockerJobResult> {
     await this.ensureWarmRuntimeReady(job, onLog);
     const startedAtMs = Date.now();
-
-    const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
-    const containerWorktreePath = `/repo/${worktreeRelPath}`;
-    await this.waitForWorktreePathInWarmContainer(containerWorktreePath);
+    const containerWorktreePath = await this.ensureWorktreeAccessibleInWarmContainer(
+      worktreePath,
+      onLog,
+    );
 
     const args: string[] = [
       "exec",
@@ -1152,6 +1192,51 @@ export class DockerExecutor {
         lastDetail ? ` (${lastDetail})` : ""
       }`,
     );
+  }
+
+  private async ensureWorktreeAccessibleInWarmContainer(
+    worktreePath: string,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<string> {
+    const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
+    const containerWorktreePath = `/repo/${worktreeRelPath}`;
+    let lastError: unknown = null;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await this.ensureWarmContainer();
+        await this.waitForWorktreePathInWarmContainer(
+          containerWorktreePath,
+          this.worktreeVisibilityTimeoutMs,
+        );
+        const probe = await this.runWarmWorktreeProbe(containerWorktreePath);
+        if (probe.ok) {
+          return containerWorktreePath;
+        }
+        const detail = [probe.stderr, probe.stdout].filter(Boolean).join("\n").trim();
+        throw new Error(
+          `warm container git probe failed (exit ${probe.exitCode})${detail ? `: ${detail}` : ""}`,
+        );
+      } catch (err) {
+        lastError = err;
+        if (attempt >= 2) {
+          const diagnostics = await this.inspectWarmContainerState().catch(() => "");
+          throw new Error(
+            `worktree not accessible inside warm container after ${attempt} attempts: ${containerWorktreePath}${
+              lastError ? ` (${this.compactError(lastError)})` : ""
+            }${diagnostics ? ` | container=${diagnostics}` : ""}`,
+          );
+        }
+        const note =
+          `[DockerExecutor] Warm container could not access worktree ${containerWorktreePath}; ` +
+          `recycling container and retrying once (${this.compactError(err)}).`;
+        console.warn(note);
+        onLog?.("stderr", note);
+        await this.stopWarmContainer("worktree visibility retry", true);
+      }
+    }
+
+    return containerWorktreePath;
   }
 
   private normalizeProvider(raw: string): string {

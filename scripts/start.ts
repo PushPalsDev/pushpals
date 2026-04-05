@@ -51,9 +51,10 @@ import { validateVisionDocStructure } from "../packages/shared/src/vision.js";
 import {
   buildCoreManagedServiceSpecs,
   computeLocalBuddyRestartBackoffMs,
+  formatEmbeddedRuntimeHealthLines,
   resolveLocalBuddyRuntimeAction,
   resolveLocalBuddyStartGate,
-  type ManagedServiceSpec,
+  ServiceManager,
 } from "./start_runtime_services.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -94,6 +95,7 @@ const ANSI_YELLOW = "\u001b[33m";
 const ANSI_GREEN = "\u001b[32m";
 const ANSI_BLUE = "\u001b[34m";
 const ANSI_BRIGHT_WHITE = "\u001b[97m";
+const FATAL_MANAGED_SERVICE_NAMES = new Set(["server", "remotebuddy"]);
 
 const systemLogStream = createWriteStream(SYSTEM_LOG_PATH, { flags: "w" });
 
@@ -286,26 +288,6 @@ function stopSystemLogTail(): void {
     systemLogTail = null;
   }
   consolePassthroughEnabled = true;
-}
-
-async function pipeProcStreamToSystemLog(
-  stream: ReadableStream<Uint8Array> | number | null | undefined,
-): Promise<void> {
-  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") return;
-  const reader = stream.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value && value.byteLength > 0) {
-        writeSystemLog(value);
-      }
-    }
-  } catch {
-    // best-effort stream piping
-  } finally {
-    reader.releaseLock();
-  }
 }
 
 async function pipeProcStreamToOutputAndSystemLog(
@@ -2974,27 +2956,6 @@ function isLikelyWorkerPalsProcess(listener: ListeningProcess): boolean {
   );
 }
 
-function resolveConcurrentlyCommand(bunExecPath: string): string[] {
-  try {
-    const req = createRequire(resolve(repoRoot, "package.json"));
-    const packageJsonPath = req.resolve("concurrently/package.json");
-    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
-      bin?: string | Record<string, string>;
-    };
-    const binField = packageJson.bin;
-    const binRelative =
-      typeof binField === "string"
-        ? binField
-        : typeof binField?.concurrently === "string"
-          ? binField.concurrently
-          : Object.values(binField ?? {}).find((value) => typeof value === "string");
-    if (typeof binRelative === "string" && binRelative.trim()) {
-      return [bunExecPath, resolve(dirname(packageJsonPath), binRelative)];
-    }
-  } catch {}
-  return [bunExecPath, "x", "concurrently"];
-}
-
 function requiredStartupPorts(): StartupPortSpec[] {
   const rawPorts: StartupPortSpec[] = [
     { name: "Server", port: CONFIG.server.port },
@@ -4850,12 +4811,12 @@ async function ensureDockerImage(): Promise<void> {
 }
 
 let shuttingDown = false;
-let proc: SpawnedChild | null = null;
+let serviceManager: ServiceManager | null = null;
 const shutdown = async (code: number) => {
   if (shuttingDown) return;
   shuttingDown = true;
   try {
-    proc?.kill();
+    serviceManager?.stop();
   } catch {}
   stopLocalBuddyRuntimeConfigPolling();
   await stopLocalBuddyManagedProcess("shutdown");
@@ -4904,7 +4865,7 @@ try {
 }
 
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
-const serviceSpecs = buildCoreManagedServiceSpecs();
+const serviceSpecs = buildCoreManagedServiceSpecs(bunExecPath, repoRoot, { ...process.env });
 console.log(`[start] Runtime logs are being written to ${relSystemLogPath()}.`);
 if (!LOCALBUDDY_ENABLED) {
   console.log(
@@ -4922,47 +4883,52 @@ if (protocolBuildExit !== 0) {
 console.log(
   `[start] Launching managed services: ${serviceSpecs.map((spec) => spec.name).join(", ")}.`,
 );
-const concurrentlyCommand = [
-  ...resolveConcurrentlyCommand(bunExecPath),
-  "-p",
-  "[{time}][{name}]",
-  "-t",
-  "HH:mm:ss",
-  "-n",
-  serviceSpecs.map((spec) => spec.name).join(","),
-  "-c",
-  serviceSpecs.map((spec) => spec.color).join(","),
-  ...serviceSpecs.map((spec) => spec.command),
-];
-proc = Bun.spawn(concurrentlyCommand, {
-  stdin: "inherit",
-  stdout: "pipe",
-  stderr: "pipe",
-  env: { ...process.env },
-});
 startSystemLogTail();
+serviceManager = new ServiceManager({
+  degradedAction: "Inspect the affected service logs or restart the managed runtime after fixing the failure.",
+  onEvent: (level, line) => {
+    const formatted = `[start] ${line}`;
+    if (level === "error") {
+      console.error(formatted);
+    } else if (level === "warn") {
+      console.warn(formatted);
+    } else {
+      console.log(formatted);
+    }
+  },
+  onHealthChange: (health) => {
+    for (const line of formatEmbeddedRuntimeHealthLines(health)) {
+      console.error(line.replace(/^\[pushpals\]/, "[start]"));
+    }
+  },
+  onServiceDegraded: (name, reason) => {
+    if (!FATAL_MANAGED_SERVICE_NAMES.has(name)) return;
+    console.error(
+      `[start] Critical managed service ${name} reached restart exhaustion: ${reason}. Exiting host.`,
+    );
+    queueMicrotask(() => {
+      void shutdown(1);
+    });
+  },
+});
+for (const spec of serviceSpecs) {
+  serviceManager.startService({
+    ...spec,
+    onStdoutLine: (line) => {
+      console.log(`${formatManagedServiceLogPrefix(spec.name)} ${line}`);
+    },
+    onStderrLine: (line) => {
+      console.log(`${formatManagedServiceLogPrefix(spec.name)} ${line}`);
+    },
+  });
+}
 
 if (LOCALBUDDY_ENABLED) {
   await startLocalBuddyManagedProcess("startup config enabled", bunExecPath);
 }
 startLocalBuddyRuntimeConfigPolling(bunExecPath);
 
-const devStdoutPump = pipeProcStreamToSystemLog(proc.stdout);
-const devStderrPump = pipeProcStreamToSystemLog(proc.stderr);
-
-const startupWarmupPromise = runStartupWarmup().catch((err) => {
+void runStartupWarmup().catch((err) => {
   console.warn(`[start] Startup warmup failed: ${String(err)}`);
 });
-
-const exitCode = await proc.exited;
-await Promise.allSettled([devStdoutPump, devStderrPump]);
-await Promise.race([
-  startupWarmupPromise,
-  new Promise((resolveWait) => setTimeout(resolveWait, 500)),
-]);
-stopLocalBuddyRuntimeConfigPolling();
-await stopLocalBuddyManagedProcess("core services exit");
-await cleanupWorkerWarmContainers("managed services exit");
-await stopManagedLmStudio();
-await closeSystemLog();
-process.exit(exitCode);
+await new Promise<never>(() => {});

@@ -15,6 +15,14 @@ import {
 import { basename, delimiter, dirname, extname, join, resolve, win32 as pathWin32 } from "path";
 import { createInterface, type Interface } from "readline";
 import {
+  ServiceManager,
+  computeServiceRestartBackoffMs,
+  formatEmbeddedRuntimeHealthLines as formatSharedEmbeddedRuntimeHealthLines,
+  shouldRestartService,
+  type EmbeddedRuntimeHealth,
+  type ManagedServiceProcess,
+} from "./start_runtime_services.js";
+import {
   evaluateClientRuntimePreflight,
   formatClientRuntimePreflightLines,
   type ClientRuntimePreflightResult,
@@ -125,13 +133,7 @@ type RuntimeBinaryName = RuntimeServiceName | "workerpals";
 
 type RuntimeServiceLogPaths = Record<RuntimeServiceName, string>;
 
-type RuntimeServiceProcess = {
-  name: RuntimeServiceName;
-  proc: Bun.Subprocess;
-  logPath: string;
-  exited: boolean;
-  exitCode: number | null;
-};
+type RuntimeServiceProcess = ManagedServiceProcess;
 
 type RuntimeBinarySet = {
   server: string;
@@ -176,7 +178,7 @@ type PreparedCliRuntime = {
 };
 
 type AutoStartedRuntime = {
-  services: RuntimeServiceProcess[];
+  serviceManager: ServiceManager;
   pushpalsLogPath: string;
 };
 
@@ -236,6 +238,11 @@ const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
 const DEFAULT_SERVER_BOOT_TIMEOUT_MS = 20_000;
 const DEFAULT_SERVICE_STABILITY_GRACE_MS = 4_000;
+const DEFAULT_EMBEDDED_SERVICE_SUPERVISOR_POLL_MS = 1_000;
+const EMBEDDED_SERVICE_RESTART_MAX_ATTEMPTS = 4;
+const EMBEDDED_SERVICE_RESTART_STABLE_WINDOW_MS = 60_000;
+const EMBEDDED_SERVICE_RESTART_BASE_BACKOFF_MS = 2_000;
+const EMBEDDED_SERVICE_RESTART_MAX_BACKOFF_MS = 30_000;
 const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS = 15_000;
 const EMBEDDED_RUNTIME_SAFETY_CAP_DISABLE_ENV = "PUSHPALS_DISABLE_EMBEDDED_SAFETY_CAPS";
 const EMBEDDED_RUNTIME_WINDOWS_SAFETY_CAPS: Readonly<Record<string, string>> = {
@@ -336,6 +343,10 @@ export function formatWorkerExecutionReadinessLines(readiness: WorkerExecutionRe
     lines.push(`[pushpals] workerExecutionAction=${readiness.action}`);
   }
   return lines;
+}
+
+export function formatEmbeddedRuntimeHealthLines(health: EmbeddedRuntimeHealth | null): string[] {
+  return formatSharedEmbeddedRuntimeHealthLines(health);
 }
 
 function summarizeWorkerStatusRows(workers: WorkerStatusRow[]): {
@@ -1688,79 +1699,6 @@ export async function ensureRuntimeBinaries(
   return runtimeBinaries;
 }
 
-function spawnRuntimeService(
-  name: RuntimeServiceName,
-  command: string[],
-  cwd: string,
-  env: Record<string, string>,
-  logPath: string,
-  runtimeServicesLogPath?: string,
-): RuntimeServiceProcess {
-  const header = `[pushpals] service=${name} command=${command.join(" ")} cwd=${cwd}`;
-  writeFileSync(logPath, `${header}\n`, "utf8");
-  if (runtimeServicesLogPath) {
-    appendRuntimeServicesLogLine(runtimeServicesLogPath, header);
-  }
-
-  const proc = Bun.spawn(command, {
-    cwd,
-    env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  const pipeToLog = async (
-    stream: ReadableStream<Uint8Array> | null,
-    channel: "stdout" | "stderr",
-  ): Promise<void> => {
-    if (!stream) return;
-    const reader = stream.getReader();
-    const decoder = new TextDecoder();
-    let pending = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      if (!chunk) continue;
-      pending += chunk;
-      const lines = pending.split(/\r?\n/);
-      pending = lines.pop() ?? "";
-      for (const line of lines) {
-        const serviceLine = `[${channel}] ${line}`;
-        appendFileSync(logPath, `${serviceLine}\n`, "utf8");
-        if (runtimeServicesLogPath) {
-          appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
-        }
-      }
-    }
-    const rest = decoder.decode();
-    if (rest) pending += rest;
-    if (pending.trim().length > 0) {
-      const serviceLine = `[${channel}] ${pending.trimEnd()}`;
-      appendFileSync(logPath, `${serviceLine}\n`, "utf8");
-      if (runtimeServicesLogPath) {
-        appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
-      }
-    }
-  };
-
-  void pipeToLog(proc.stdout, "stdout");
-  void pipeToLog(proc.stderr, "stderr");
-
-  const service: RuntimeServiceProcess = {
-    name,
-    proc,
-    logPath,
-    exited: false,
-    exitCode: null,
-  };
-  void proc.exited.then((code) => {
-    service.exited = true;
-    service.exitCode = code;
-  });
-  return service;
-}
-
 export function buildServiceStopCommand(
   pid: number | undefined,
   platform = process.platform,
@@ -1818,7 +1756,9 @@ async function stopRuntimeServicesGracefully(
   const running = services.filter((service) => !service.exited);
   if (running.length === 0) return;
   const ordered = [...running].sort(
-    (a, b) => resolveGracefulShutdownPriority(a.name) - resolveGracefulShutdownPriority(b.name),
+    (a, b) =>
+      resolveGracefulShutdownPriority(a.name as RuntimeServiceName) -
+      resolveGracefulShutdownPriority(b.name as RuntimeServiceName),
   );
   const nonServer = ordered.filter((service) => service.name !== "server");
   const server = ordered.filter((service) => service.name === "server");
@@ -2031,6 +1971,17 @@ function quoteWindowsCmdArg(value: string): string {
 
 function isOptionalEmbeddedService(name: RuntimeServiceName): boolean {
   return name === "source_control_manager";
+}
+
+export function computeEmbeddedServiceRestartBackoffMs(attempt: number): number {
+  return computeServiceRestartBackoffMs(attempt);
+}
+
+export function shouldRestartEmbeddedService(
+  attempts: number,
+  maxAttempts = EMBEDDED_SERVICE_RESTART_MAX_ATTEMPTS,
+): boolean {
+  return shouldRestartService(attempts, maxAttempts);
 }
 
 async function canSpawnCommand(
@@ -3435,7 +3386,6 @@ async function autoStartRuntimeServices(opts: {
     applyResolvedGitBinaryToRuntimeEnv(runtimeEnv, resolvedGitBinary);
   }
 
-  const services: RuntimeServiceProcess[] = [];
   const startupStartedAt = Date.now();
   const startupPhases: RuntimeStartupPhaseTiming[] = [];
   const recordStartupPhase = (
@@ -3480,37 +3430,74 @@ async function autoStartRuntimeServices(opts: {
   console.log(
     `[pushpals] service log (source_control_manager)=${serviceLogPaths.source_control_manager}`,
   );
+  const serviceManager = new ServiceManager({
+    degradedAction: "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
+    onEvent: (level, line) => {
+      const cliLine = `[pushpals] ${line.replace(/^Managed /, "Embedded ").replace(/^Restarted managed /, "Restarted embedded ")}`;
+      if (level === "error") {
+        console.error(cliLine);
+      } else if (level === "warn") {
+        console.warn(cliLine);
+      } else {
+        console.log(cliLine);
+      }
+      appendRuntimeServicesLogLine(runtimeServicesLogPath, cliLine);
+    },
+    onHealthChange: (health) => {
+      for (const line of formatEmbeddedRuntimeHealthLines(health)) {
+        console.error(line);
+        appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
+      }
+    },
+  });
+  const launchService = (name: RuntimeServiceName, command: string[]): RuntimeServiceProcess => {
+    const logPath = serviceLogPaths[name];
+    const header = `[pushpals] service=${name} command=${command.join(" ")} cwd=${opts.repoRoot}`;
+    writeFileSync(logPath, `${header}\n`, "utf8");
+    appendRuntimeServicesLogLine(runtimeServicesLogPath, header);
+    return serviceManager.startService({
+      name,
+      color: "",
+      command,
+      cwd: opts.repoRoot,
+      env: runtimeEnv,
+      logPath,
+      onStdoutLine: (line) => {
+        const serviceLine = `[stdout] ${line}`;
+        appendFileSync(logPath, `${serviceLine}\n`, "utf8");
+        appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
+      },
+      onStderrLine: (line) => {
+        const serviceLine = `[stderr] ${line}`;
+        appendFileSync(logPath, `${serviceLine}\n`, "utf8");
+        appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
+      },
+    });
+  };
 
   const serverHealthy = await probeServer(opts.serverUrl);
   if (!serverHealthy) {
     const serverPhaseStartedAt = Date.now();
     console.log("[pushpals] Starting embedded server...");
-    const serverService = spawnRuntimeService(
-      "server",
-      [runtimeBinaries.server],
-      opts.repoRoot,
-      runtimeEnv,
-      serviceLogPaths.server,
-      runtimeServicesLogPath,
-    );
-    services.push(serverService);
-    console.log(`[pushpals] server log: ${serverService.logPath}`);
+    const serverService = launchService("server", [runtimeBinaries.server]);
+    const serverLogPath = serverService.logPath ?? serviceLogPaths.server;
+    console.log(`[pushpals] server log: ${serverLogPath}`);
 
     const serverDeadline = Date.now() + DEFAULT_SERVER_BOOT_TIMEOUT_MS;
     let serverIsReady = false;
     while (Date.now() < serverDeadline) {
       if (serverService.exited) {
-        const tail = readLogTail(serverService.logPath);
+        const tail = readLogTail(serverLogPath);
         appendRuntimeServicesLogLine(
           runtimeServicesLogPath,
           `[pushpals] embedded server exited during bootstrap (code=${serverService.exitCode ?? "unknown"}).`,
         );
         recordStartupPhase("server", serverPhaseStartedAt, "exited");
         emitStartupTimingSummary("failed", "server exited during bootstrap");
-        stopRuntimeServices(services);
+        stopRuntimeServices(serviceManager.getServices());
         throw new Error(
           `Embedded server exited during bootstrap (code=${serverService.exitCode ?? "unknown"}). ` +
-            `See ${serverService.logPath}${tail ? `\n--- server log tail ---\n${tail}` : ""}`,
+            `See ${serverLogPath}${tail ? `\n--- server log tail ---\n${tail}` : ""}`,
         );
       }
       if (await probeServer(opts.serverUrl)) {
@@ -3520,17 +3507,17 @@ async function autoStartRuntimeServices(opts: {
       await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
     }
     if (!serverIsReady) {
-      const tail = readLogTail(serverService.logPath);
+      const tail = readLogTail(serverLogPath);
       appendRuntimeServicesLogLine(
         runtimeServicesLogPath,
         `[pushpals] embedded server did not become healthy within ${DEFAULT_SERVER_BOOT_TIMEOUT_MS}ms.`,
       );
       recordStartupPhase("server", serverPhaseStartedAt, "timeout");
       emitStartupTimingSummary("failed", "server health timeout");
-      stopRuntimeServices(services);
+      stopRuntimeServices(serviceManager.getServices());
       throw new Error(
         `Embedded server did not become healthy within ${DEFAULT_SERVER_BOOT_TIMEOUT_MS}ms. ` +
-          `See ${serverService.logPath}${tail ? `\n--- server log tail ---\n${tail}` : ""}`,
+          `See ${serverLogPath}${tail ? `\n--- server log tail ---\n${tail}` : ""}`,
       );
     }
     recordStartupPhase("server", serverPhaseStartedAt, "started");
@@ -3547,16 +3534,8 @@ async function autoStartRuntimeServices(opts: {
   if (localBuddyEnabled) {
     const localBuddyPhaseStartedAt = Date.now();
     console.log("[pushpals] Starting embedded LocalBuddy...");
-    const localbuddyService = spawnRuntimeService(
-      "localbuddy",
-      [runtimeBinaries.localbuddy],
-      opts.repoRoot,
-      runtimeEnv,
-      serviceLogPaths.localbuddy,
-      runtimeServicesLogPath,
-    );
-    services.push(localbuddyService);
-    console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath}`);
+    const localbuddyService = launchService("localbuddy", [runtimeBinaries.localbuddy]);
+    console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath ?? serviceLogPaths.localbuddy}`);
     recordStartupPhase("localbuddy", localBuddyPhaseStartedAt, "started");
   } else {
     recordStartupPhase("localbuddy", Date.now(), "skipped");
@@ -3569,20 +3548,13 @@ async function autoStartRuntimeServices(opts: {
 
   const remoteBuddyPhaseStartedAt = Date.now();
   console.log("[pushpals] Starting embedded RemoteBuddy...");
-  const remotebuddyService = spawnRuntimeService(
-    "remotebuddy",
-    [runtimeBinaries.remotebuddy],
-    opts.repoRoot,
-    runtimeEnv,
-    serviceLogPaths.remotebuddy,
-    runtimeServicesLogPath,
-  );
-  services.push(remotebuddyService);
-  console.log(`[pushpals] remotebuddy log: ${remotebuddyService.logPath}`);
+  const remotebuddyService = launchService("remotebuddy", [runtimeBinaries.remotebuddy]);
+  const remotebuddyLogPath = remotebuddyService.logPath ?? serviceLogPaths.remotebuddy;
+  console.log(`[pushpals] remotebuddy log: ${remotebuddyLogPath}`);
   recordStartupPhase("remotebuddy", remoteBuddyPhaseStartedAt, "started");
   let lastReportedRemoteBuddyAutonomyState: RemoteBuddyAutonomousEngineState = "unknown";
   const reportRemoteBuddyAutonomousEngineState = (): void => {
-    const autonomyState = readRemoteBuddyAutonomousEngineState(remotebuddyService.logPath);
+    const autonomyState = readRemoteBuddyAutonomousEngineState(remotebuddyLogPath);
     if (autonomyState === "unknown" || autonomyState === lastReportedRemoteBuddyAutonomyState) {
       return;
     }
@@ -3668,16 +3640,13 @@ async function autoStartRuntimeServices(opts: {
     } else if (scmRemoteStatus.status === "ok") {
       console.log(`[pushpals] Embedded SourceControlManager git=${scmGitProbe.detail}`);
       console.log("[pushpals] Starting embedded SourceControlManager...");
-      const sourceControlManagerService = spawnRuntimeService(
-        "source_control_manager",
-        [runtimeBinaries.sourceControlManager, "--skip-clean-check"],
-        opts.repoRoot,
-        runtimeEnv,
-        serviceLogPaths.source_control_manager,
-        runtimeServicesLogPath,
+      const sourceControlManagerService = launchService("source_control_manager", [
+        runtimeBinaries.sourceControlManager,
+        "--skip-clean-check",
+      ]);
+      console.log(
+        `[pushpals] source_control_manager log: ${sourceControlManagerService.logPath ?? serviceLogPaths.source_control_manager}`,
       );
-      services.push(sourceControlManagerService);
-      console.log(`[pushpals] source_control_manager log: ${sourceControlManagerService.logPath}`);
       recordStartupPhase("source_control_manager", scmPhaseStartedAt, "started");
     } else {
       console.log(
@@ -3700,41 +3669,47 @@ async function autoStartRuntimeServices(opts: {
 
   const deadline = Date.now() + DEFAULT_RUNTIME_BOOT_TIMEOUT_MS;
   const readinessPhaseStartedAt = Date.now();
+  const optionalServiceExitWarned = new Set<RuntimeServiceName>();
   while (Date.now() < deadline) {
     reportRemoteBuddyAutonomousEngineState();
-    for (let i = services.length - 1; i >= 0; i--) {
-      const service = services[i];
+    for (const service of serviceManager.getServices()) {
       if (service.exited) {
         if (isOptionalEmbeddedService(service.name)) {
-          console.warn(
-            `[pushpals] Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); continuing without SCM.`,
-          );
-          appendRuntimeServicesLogLine(
-            runtimeServicesLogPath,
-            `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); continuing.`,
-          );
-          const tail = readLogTail(service.logPath);
-          if (tail) {
-            console.warn(`[pushpals] ${service.name} log tail:\n${tail}`);
+          const runtimeServiceName = service.name as RuntimeServiceName;
+          const serviceLogPath = service.logPath ?? serviceLogPaths[runtimeServiceName];
+          if (!optionalServiceExitWarned.has(runtimeServiceName)) {
+            console.warn(
+              `[pushpals] Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); startup will continue and host supervisor will attempt recovery.`,
+            );
             appendRuntimeServicesLogLine(
               runtimeServicesLogPath,
-              `[pushpals] ${service.name} log tail:\n${tail}`,
+              `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}); startup will continue and host supervisor will attempt recovery.`,
             );
+            const tail = readLogTail(serviceLogPath);
+            if (tail) {
+              console.warn(`[pushpals] ${service.name} log tail:\n${tail}`);
+              appendRuntimeServicesLogLine(
+                runtimeServicesLogPath,
+                `[pushpals] ${service.name} log tail:\n${tail}`,
+              );
+            }
+            optionalServiceExitWarned.add(runtimeServiceName);
           }
-          services.splice(i, 1);
           continue;
         }
-        const tail = readLogTail(service.logPath);
+        const runtimeServiceName = service.name as RuntimeServiceName;
+        const serviceLogPath = service.logPath ?? serviceLogPaths[runtimeServiceName];
+        const tail = readLogTail(serviceLogPath);
         appendRuntimeServicesLogLine(
           runtimeServicesLogPath,
           `[pushpals] embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}).`,
         );
         recordStartupPhase("readiness", readinessPhaseStartedAt, "failed");
         emitStartupTimingSummary("failed", `${service.name} exited during startup`);
-        stopRuntimeServices(services);
+        stopRuntimeServices(serviceManager.getServices());
         throw new Error(
           `Embedded ${service.name} exited during startup (code=${service.exitCode ?? "unknown"}). ` +
-            `See ${service.logPath}${tail ? `\n--- ${service.name} log tail ---\n${tail}` : ""}`,
+            `See ${serviceLogPath}${tail ? `\n--- ${service.name} log tail ---\n${tail}` : ""}`,
         );
       }
     }
@@ -3746,39 +3721,44 @@ async function autoStartRuntimeServices(opts: {
       const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;
       while (Date.now() < stabilityDeadline) {
         reportRemoteBuddyAutonomousEngineState();
-        for (let i = services.length - 1; i >= 0; i--) {
-          const service = services[i];
+        for (const service of serviceManager.getServices()) {
           if (!service.exited) continue;
           if (isOptionalEmbeddedService(service.name)) {
-            const tail = readLogTail(service.logPath);
-            console.warn(
-              `[pushpals] Embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}); continuing without SCM.`,
-            );
-            appendRuntimeServicesLogLine(
-              runtimeServicesLogPath,
-              `[pushpals] embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}); continuing.`,
-            );
-            if (tail) {
-              console.warn(`[pushpals] ${service.name} log tail:\n${tail}`);
+            const runtimeServiceName = service.name as RuntimeServiceName;
+            const serviceLogPath = service.logPath ?? serviceLogPaths[runtimeServiceName];
+            if (!optionalServiceExitWarned.has(runtimeServiceName)) {
+              const tail = readLogTail(serviceLogPath);
+              console.warn(
+                `[pushpals] Embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}); startup will continue and host supervisor will attempt recovery.`,
+              );
               appendRuntimeServicesLogLine(
                 runtimeServicesLogPath,
-                `[pushpals] ${service.name} log tail:\n${tail}`,
+                `[pushpals] embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}); startup will continue and host supervisor will attempt recovery.`,
               );
+              if (tail) {
+                console.warn(`[pushpals] ${service.name} log tail:\n${tail}`);
+                appendRuntimeServicesLogLine(
+                  runtimeServicesLogPath,
+                  `[pushpals] ${service.name} log tail:\n${tail}`,
+                );
+              }
+              optionalServiceExitWarned.add(runtimeServiceName);
             }
-            services.splice(i, 1);
             continue;
           }
-          const tail = readLogTail(service.logPath);
+          const runtimeServiceName = service.name as RuntimeServiceName;
+          const serviceLogPath = service.logPath ?? serviceLogPaths[runtimeServiceName];
+          const tail = readLogTail(serviceLogPath);
           appendRuntimeServicesLogLine(
             runtimeServicesLogPath,
             `[pushpals] embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}).`,
           );
           recordStartupPhase("readiness", readinessPhaseStartedAt, "failed");
           emitStartupTimingSummary("failed", `${service.name} exited immediately after bootstrap`);
-          stopRuntimeServices(services);
+          stopRuntimeServices(serviceManager.getServices());
           throw new Error(
             `Embedded ${service.name} exited immediately after bootstrap (code=${service.exitCode ?? "unknown"}). ` +
-              `See ${service.logPath}${tail ? `\n--- ${service.name} log tail ---\n${tail}` : ""}`,
+              `See ${serviceLogPath}${tail ? `\n--- ${service.name} log tail ---\n${tail}` : ""}`,
           );
         }
         await Bun.sleep(250);
@@ -3788,14 +3768,14 @@ async function autoStartRuntimeServices(opts: {
       emitStartupTimingSummary("ready");
       appendRuntimeServicesLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.");
       return {
-        services,
+        serviceManager,
         pushpalsLogPath: runtimeServicesLogPath,
       };
     }
     await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
   }
 
-  stopRuntimeServices(services);
+  stopRuntimeServices(serviceManager.getServices());
   const remoteBuddyHealth = await probeRemoteBuddySessionConsumer(opts.serverUrl, opts.sessionId);
   if (!localBuddyEnabled && !remoteBuddyHealth.ok) {
     appendRuntimeServicesLogLine(
@@ -4627,7 +4607,7 @@ async function main(): Promise<void> {
     platform: `${process.platform}/${process.arch}`,
     repoRoot,
   };
-  let autoStartedServices: RuntimeServiceProcess[] = [];
+  let autoStartedServiceManager: ServiceManager | null = null;
   let pushpalsLogPath: string | undefined;
   let resolvedRuntimeTagForAutoStart = preparedRuntime.runtimeTag || parsed.runtimeTag || "";
   const cleanupWorkerpalWarmContainersIfNeeded = async (phase: string): Promise<void> => {
@@ -4693,15 +4673,22 @@ async function main(): Promise<void> {
     }
     return readiness;
   };
+  const reportEmbeddedRuntimeHealth = (): EmbeddedRuntimeHealth | null => {
+    const health = autoStartedServiceManager?.getHealth() ?? null;
+    for (const line of formatEmbeddedRuntimeHealthLines(health)) {
+      console.log(line);
+    }
+    return health;
+  };
   const stopAutoStartedServices = (): void => {
-    if (autoStartedServices.length === 0) return;
-    stopRuntimeServices(autoStartedServices);
-    autoStartedServices = [];
+    if (!autoStartedServiceManager) return;
+    autoStartedServiceManager.stop();
+    autoStartedServiceManager = null;
   };
   const stopAutoStartedServicesGracefully = async (reason: string): Promise<void> => {
-    if (autoStartedServices.length === 0) return;
-    const services = autoStartedServices;
-    autoStartedServices = [];
+    if (!autoStartedServiceManager) return;
+    const serviceManager = autoStartedServiceManager;
+    autoStartedServiceManager = null;
     const shutdown = await requestLocalRuntimeShutdown(serverUrl, repoRoot, reason);
     if (shutdown.attempted && shutdown.accepted) {
       console.log("[pushpals] Local runtime shutdown accepted; waiting for services to exit...");
@@ -4713,6 +4700,8 @@ async function main(): Promise<void> {
     } else if (shutdown.detail) {
       console.warn(`[pushpals] ${shutdown.detail}`);
     }
+    serviceManager.stop();
+    const services = serviceManager.getServices();
     await stopRuntimeServicesGracefully(services);
     await cleanupWorkerpalWarmContainersIfNeeded("cli shutdown");
     await cleanupPushPalsGitWorktreesIfNeeded("cli shutdown");
@@ -4768,7 +4757,7 @@ async function main(): Promise<void> {
           ),
           baseEnv: workerpalDockerPrecheck.env,
         });
-        autoStartedServices = startedRuntime.services;
+        autoStartedServiceManager = startedRuntime.serviceManager;
         pushpalsLogPath = startedRuntime.pushpalsLogPath;
         serverHealthy = await probeServer(serverUrl);
       } catch (err) {
@@ -4920,6 +4909,7 @@ async function main(): Promise<void> {
   console.log(`[pushpals] pushpalsLog=${pushpalsLogPath ?? "unavailable"}`);
   console.log(`[pushpals] cliStateFile=${statePath ?? "unavailable"}`);
   reportWorkerExecutionReadinessFromSnapshot(startupWorkerExecutionReadiness);
+  reportEmbeddedRuntimeHealth();
   if (parsed.runtimeOnly) {
     console.log("[pushpals] runtimeOnly=true");
   } else {
@@ -4959,7 +4949,7 @@ async function main(): Promise<void> {
       } catch {
         // ignore
       }
-      if (autoStartedServices.length > 0) {
+      if (autoStartedServiceManager) {
         console.log("[pushpals] Stopping embedded runtime services...");
       }
       await stopAutoStartedServicesGracefully("pushpals CLI exit");
@@ -5053,6 +5043,7 @@ async function main(): Promise<void> {
           : "[pushpals] monitoringHubUrl=unavailable",
       );
       await reportWorkerExecutionReadiness();
+      reportEmbeddedRuntimeHealth();
       rl.prompt();
       continue;
     }

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  ServiceManager,
   buildCoreManagedServiceSpecs,
   computeLocalBuddyRestartBackoffMs,
   resolveLocalBuddyRuntimeAction,
@@ -57,5 +58,48 @@ describe("start runtime service helpers", () => {
         maxConsecutiveFailures: 5,
       }),
     ).toBe("retry_exhausted");
+  });
+
+  test("ServiceManager notifies when a service reaches restart exhaustion", async () => {
+    let degraded: { name: string; reason: string; detail: string } | null = null;
+    const manager = new ServiceManager({
+      pollMs: 25,
+      maxRestartAttempts: 1,
+      computeRestartBackoffMs: () => 25,
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: {} as any,
+        command: [...spec.command],
+        cwd: spec.cwd,
+        env: { ...(spec.env ?? {}) },
+        exited: true,
+        exitCode: 42,
+        launchedAtMs: Date.now(),
+        logPath: spec.logPath,
+      }),
+      onServiceDegraded: (name, reason, health) => {
+        degraded = {
+          name,
+          reason,
+          detail: health.detail,
+        };
+      },
+    });
+    try {
+      manager.startService({
+        name: "server",
+        color: "blue",
+        command: ["fake-server"],
+        cwd: process.cwd(),
+      });
+
+      await Bun.sleep(150);
+      expect(degraded).not.toBeNull();
+      expect(degraded?.name).toBe("server");
+      expect(degraded?.reason).toContain("reached restart limit");
+      expect(degraded?.detail).toContain("server:");
+    } finally {
+      manager.stop();
+    }
   });
 });

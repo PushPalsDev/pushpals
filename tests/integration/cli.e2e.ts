@@ -4,8 +4,10 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
   chmodSync,
 } from "fs";
@@ -350,6 +352,121 @@ async function removeTreeWithRetries(path: string, attempts = 8): Promise<void> 
   if (lastError) throw lastError;
 }
 
+function findLatestRuntimeServicesLogPath(runtimeRoot: string): string | null {
+  const logDir = join(runtimeRoot, "logs", "bootstrap");
+  if (!existsSync(logDir)) return null;
+  const candidates = readdirSync(logDir)
+    .filter((name) => name.endsWith("-runtime-services.log"))
+    .map((name) => join(logDir, name));
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  return candidates[0] ?? null;
+}
+
+async function waitForRuntimeServicesLogPath(runtimeRoot: string, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const logPath = findLatestRuntimeServicesLogPath(runtimeRoot);
+    if (logPath) return logPath;
+    await Bun.sleep(250);
+  }
+  throw new Error(`Timed out waiting for runtime-services log path under ${runtimeRoot}`);
+}
+
+async function waitForLogLine(logPath: string, needle: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(logPath)) {
+      const content = readFileSync(logPath, "utf8");
+      if (content.includes(needle)) return;
+    }
+    await Bun.sleep(300);
+  }
+  throw new Error(`Timed out waiting for log line "${needle}" in ${logPath}`);
+}
+
+function parsePidList(text: string): number[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => Number.parseInt(line.trim(), 10))
+    .filter((value) => Number.isFinite(value) && value > 0);
+}
+
+function findProcessIdsByCommandNeedle(commandNeedle: string): number[] {
+  if (process.platform === "win32") {
+    const proc = Bun.spawnSync(
+      [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "$needle = $env:PUSHPALS_PROC_NEEDLE; " +
+          "Get-CimInstance Win32_Process | " +
+          "Where-Object { $_.CommandLine -and $_.CommandLine.Contains($needle) } | " +
+          "ForEach-Object { $_.ProcessId }",
+      ],
+      {
+        env: {
+          ...process.env,
+          PUSHPALS_PROC_NEEDLE: commandNeedle,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    if (proc.exitCode !== 0) {
+      const stderr = decodeOutput(proc.stderr);
+      throw new Error(`Failed to enumerate processes by command line on Windows: ${stderr}`);
+    }
+    return parsePidList(decodeOutput(proc.stdout));
+  }
+
+  const proc = Bun.spawnSync(["ps", "-eo", "pid=,args="], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (proc.exitCode !== 0) {
+    const stderr = decodeOutput(proc.stderr);
+    throw new Error(`Failed to enumerate processes via ps: ${stderr}`);
+  }
+  const lines = decodeOutput(proc.stdout).split(/\r?\n/);
+  const pids: number[] = [];
+  for (const line of lines) {
+    const match = /^(\d+)\s+(.*)$/.exec(line.trim());
+    if (!match) continue;
+    const pid = Number.parseInt(match[1], 10);
+    const args = match[2] ?? "";
+    if (!args.includes(commandNeedle)) continue;
+    pids.push(pid);
+  }
+  return pids;
+}
+
+async function terminateProcessByCommandNeedle(commandNeedle: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pids = findProcessIdsByCommandNeedle(commandNeedle);
+    if (pids.length > 0) {
+      for (const pid of pids) {
+        if (process.platform === "win32") {
+          Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+        } else {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // best-effort terminate only
+          }
+        }
+      }
+      return;
+    }
+    await Bun.sleep(250);
+  }
+  throw new Error(`Timed out waiting for process matching command needle: ${commandNeedle}`);
+}
+
 describe("packaged CLI end-to-end", () => {
   test(
     "boots embedded runtime in a temp repo with real Docker and reports readiness via /status",
@@ -420,7 +537,11 @@ describe("packaged CLI end-to-end", () => {
             stderr: "ignore",
           });
         } catch {}
-        await removeTreeWithRetries(root);
+        try {
+          await removeTreeWithRetries(root);
+        } catch (err) {
+          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        }
       }
     },
     20 * 60_000,
@@ -483,9 +604,104 @@ describe("packaged CLI end-to-end", () => {
             proc.kill();
           } catch {}
         }
-        await removeTreeWithRetries(root);
+        try {
+          await removeTreeWithRetries(root);
+        } catch (err) {
+          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        }
       }
     },
     10 * 60_000,
+  );
+
+  test(
+    "supervisor restarts source_control_manager after crash and CLI stays usable",
+    async () => {
+      const artifacts = await ensureBuildArtifacts();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-supervisor-"));
+      const dockerImage = `pushpals-worker-sandbox:cli-e2e-supervisor-${Date.now()}`;
+      let proc: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        const { repoPath } = initializeTempRepo(root);
+        const runtimeRoot = join(root, "runtime");
+        const portBase = await findAvailablePortBlock();
+        prepareRuntimeRoot(runtimeRoot, artifacts, dockerImage, portBase);
+
+        proc = Bun.spawn(
+          [
+            process.execPath,
+            artifacts.cliPath,
+            "--runtime-root",
+            runtimeRoot,
+            "--runtime-tag",
+            runtimeTag,
+          ],
+          {
+            cwd: repoPath,
+            stdin: "pipe",
+            stdout: "pipe",
+            stderr: "pipe",
+            env: buildCliE2EEnv(),
+          },
+        );
+
+        const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
+        await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
+
+        const extension = artifacts.platformKey.startsWith("windows-") ? ".exe" : "";
+        const scmBinaryPath = join(
+          runtimeRoot,
+          "bin",
+          artifacts.platformKey,
+          runtimeBinaryFilename("source_control_manager", artifacts.platformKey, extension),
+        );
+        await terminateProcessByCommandNeedle(scmBinaryPath, 30_000);
+        await waitForLogLine(
+          runtimeServicesLogPath,
+          "[pushpals] Embedded source_control_manager exited",
+          45_000,
+        );
+        await waitForLogLine(
+          runtimeServicesLogPath,
+          "[pushpals] Restarted embedded source_control_manager.",
+          60_000,
+        );
+
+        proc.stdin.write("/status\nquit\n");
+        proc.stdin.end();
+
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          waitForExitWithTimeout(proc, 15 * 60_000),
+        ]);
+        const combined = `${stdout}\n${stderr}`;
+
+        if (exitCode !== 0) {
+          throw new Error(`CLI E2E exited ${exitCode}\n${combined}`);
+        }
+        expect(combined).toContain("[pushpals] Connected.");
+        expect(combined).toContain("[pushpals] Embedded runtime is ready.");
+        expect(combined).not.toContain("[pushpals] Fatal:");
+      } finally {
+        if (proc) {
+          try {
+            proc.kill();
+          } catch {}
+        }
+        try {
+          Bun.spawnSync(["docker", "image", "rm", "-f", dockerImage], {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+        } catch {}
+        try {
+          await removeTreeWithRetries(root);
+        } catch (err) {
+          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        }
+      }
+    },
+    25 * 60_000,
   );
 });
