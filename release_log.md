@@ -2,15 +2,15 @@
 
 ## Release Metadata
 
-- version: `v1.0.35`
-- start_commit: `cc8243f6701759e71b783d6d167fbddeb7a97b37`
-- end_commit: `10ebb243436328c1a60cc1687d1730a945e178b3`
+- version: `v1.0.36`
+- start_commit: `ba05a49f830887c840ff8caf47e3a88922cff9fd`
+- end_commit: `56d3defb250475543a9454604b00b13f67fa1a4f`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Prevent workers from claiming a second job while another claim is still active, which stops stale orphaned claimed rows from being auto-failed later by the server watchdog.
-- Add regression coverage for the single-active-claim invariant and stale-recovery interaction so worker/job state cannot drift out of sync unnoticed.
+- Add end-to-end coverage for host-managed service recovery, including a full-stack `bun run start` failure path that exits non-zero after repeated fatal server crashes.
+- Add dedicated service-manager integration coverage for restart exhaustion and package a `bun run test:start:e2e` command so host-mode reliability checks are easy to run.
 
 ## Install
 
@@ -41,4 +41,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.35 && git push origin v1.0.35`.
+- Tag and push: `git tag v1.0.36 && git push origin v1.0.36`.
