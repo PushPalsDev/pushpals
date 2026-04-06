@@ -2,15 +2,15 @@
 
 ## Release Metadata
 
-- version: `v1.0.37`
-- start_commit: `e47fc72c05cc7ac629f9120979f4831ab4d38783`
-- end_commit: `254ca106a6d5e12e3a5c8ce24386f05c9daba53b`
+- version: `v1.0.38`
+- start_commit: `8b1a4d956f11c8475603f4882fb835094fddd2cb`
+- end_commit: `0052ef4f8ea3638899dfe132f3a64fdfe0af13d7`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Fix CLI shutdown cleanup on Windows by falling back to forced worktree deletion when `git worktree remove` hits `Filename too long`.
-- Reuse the shared long-path worktree cleanup behavior for lingering WorkerPal worktrees and add regression coverage for the shutdown cleanup path.
+- Make the CLI npm publish workflow idempotent by detecting already-published versions before attempting `npm publish`.
+- Keep release reruns green under npm immutable version rules by skipping duplicate package builds and publishes for the same tagged CLI version.
 
 ## Install
 
@@ -41,4 +41,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.37 && git push origin v1.0.37`.
+- Tag and push: `git tag v1.0.38 && git push origin v1.0.38`.
