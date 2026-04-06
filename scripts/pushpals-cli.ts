@@ -22,6 +22,7 @@ import {
   type EmbeddedRuntimeHealth,
   type ManagedServiceProcess,
 } from "./start_runtime_services.js";
+import { forceDeleteWorktreePath } from "../apps/workerpals/src/common/worktree_cleanup.js";
 import {
   evaluateClientRuntimePreflight,
   formatClientRuntimePreflightLines,
@@ -2226,8 +2227,10 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
   repoRoot: string;
   env: Record<string, string>;
   runCommandWithEnvFn?: typeof runCommandWithEnv;
+  forceDeleteWorktreePathFn?: typeof forceDeleteWorktreePath;
 }): Promise<{ ok: boolean; detail: string; removed: number }> {
   const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
+  const forceDeleteWorktreePathFn = opts.forceDeleteWorktreePathFn ?? forceDeleteWorktreePath;
   const list = await runCommandWithEnvFn(
     ["git", "worktree", "list", "--porcelain"],
     opts.repoRoot,
@@ -2264,7 +2267,15 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
       removed += 1;
       continue;
     }
-    failures.push(`${entry.path}: ${remove.stderr || remove.stdout || `exit ${remove.exitCode}`}`);
+    const forced = await forceDeleteWorktreePathFn(entry.path);
+    if (forced.removed) {
+      removed += 1;
+      continue;
+    }
+    const removeDetail = remove.stderr || remove.stdout || `exit ${remove.exitCode}`;
+    failures.push(
+      `${entry.path}: ${removeDetail}${forced.lastError ? ` | fallback: ${forced.lastError}` : ""}`,
+    );
   }
 
   const prune = await runCommandWithEnvFn(["git", "worktree", "prune"], opts.repoRoot, opts.env);

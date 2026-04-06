@@ -1693,6 +1693,91 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
   });
 
+  test("cleanupLingeringPushPalsGitWorktrees falls back to forced delete when git remove hits long paths", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    const forcedDeletes: string[] = [];
+    const result = await cleanupLingeringPushPalsGitWorktrees({
+      repoRoot: "C:/repo/example",
+      env: {},
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        if (command[2] === "list") {
+          return {
+            ok: true,
+            stdout: [
+              "worktree C:/repo/example",
+              "HEAD abcdef1234567890",
+              "branch refs/heads/main",
+              "",
+              "worktree C:/repo/example/.worktrees/job-123-workerpal-abcd-1",
+              "HEAD feedface12345678",
+              "detached",
+            ].join("\n"),
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command[2] === "remove") {
+          return {
+            ok: false,
+            stdout: "",
+            stderr:
+              "error: failed to delete 'C:/repo/example/.worktrees/job-123-workerpal-abcd-1': Filename too long",
+            exitCode: 128,
+          };
+        }
+        if (command[2] === "prune") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        if (command[1] === "for-each-ref") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        throw new Error(`unexpected command: ${command.join(" ")}`);
+      },
+      forceDeleteWorktreePathFn: async (worktreePath) => {
+        forcedDeletes.push(worktreePath);
+        return { removed: true };
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "removed 1 lingering PushPals git artifact(s)",
+      removed: 1,
+    });
+    expect(forcedDeletes).toEqual(["C:/repo/example/.worktrees/job-123-workerpal-abcd-1"]);
+    expect(calls).toEqual([
+      {
+        command: ["git", "worktree", "list", "--porcelain"],
+        cwd: "C:/repo/example",
+      },
+      {
+        command: [
+          "git",
+          "worktree",
+          "remove",
+          "--force",
+          "--force",
+          "C:/repo/example/.worktrees/job-123-workerpal-abcd-1",
+        ],
+        cwd: "C:/repo/example",
+      },
+      {
+        command: ["git", "worktree", "prune"],
+        cwd: "C:/repo/example",
+      },
+      {
+        command: [
+          "git",
+          "for-each-ref",
+          "--format=%(refname:short)",
+          "refs/heads/_source_control_manager/",
+        ],
+        cwd: "C:/repo/example",
+      },
+    ]);
+  });
+
   test("downloadRuntimeAssetsFromSourceTag skips bun.lockb and populates sandbox assets", async () => {
     const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-download-"));
     const originalFetch = globalThis.fetch;
