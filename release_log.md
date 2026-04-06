@@ -2,15 +2,15 @@
 
 ## Release Metadata
 
-- version: `v1.0.36`
-- start_commit: `ba05a49f830887c840ff8caf47e3a88922cff9fd`
-- end_commit: `56d3defb250475543a9454604b00b13f67fa1a4f`
+- version: `v1.0.37`
+- start_commit: `e47fc72c05cc7ac629f9120979f4831ab4d38783`
+- end_commit: `254ca106a6d5e12e3a5c8ce24386f05c9daba53b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add end-to-end coverage for host-managed service recovery, including a full-stack `bun run start` failure path that exits non-zero after repeated fatal server crashes.
-- Add dedicated service-manager integration coverage for restart exhaustion and package a `bun run test:start:e2e` command so host-mode reliability checks are easy to run.
+- Fix CLI shutdown cleanup on Windows by falling back to forced worktree deletion when `git worktree remove` hits `Filename too long`.
+- Reuse the shared long-path worktree cleanup behavior for lingering WorkerPal worktrees and add regression coverage for the shutdown cleanup path.
 
 ## Install
 
@@ -41,4 +41,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.36 && git push origin v1.0.36`.
+- Tag and push: `git tag v1.0.37 && git push origin v1.0.37`.
