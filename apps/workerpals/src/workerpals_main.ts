@@ -20,7 +20,6 @@
  * JobRunner executes a single job, streams logs, and outputs a final result with a sentinel line.
  */
 
-import type { CommandRequest } from "protocol";
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import { resolve } from "path";
@@ -44,6 +43,7 @@ import {
 } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
+import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 
 type CommitRef = {
@@ -93,6 +93,31 @@ function workerLlmConfig(runtimeConfig: ReturnType<typeof loadPushPalsConfig>): 
 
 function estimateTokensFromText(text: string): number {
   return Math.max(0, Math.ceil(String(text ?? "").length / 3));
+}
+
+async function postJsonWithTimeout(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  timeoutMs = 10_000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
+  try {
+    return await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`request timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function buildWorkerLlmUsageEvent(
@@ -172,11 +197,7 @@ async function reportWorkerLlmUsage(
 ): Promise<void> {
   const payload = buildWorkerLlmUsageEvent(job, result);
   if (!payload) return;
-  const response = await fetch(`${server}/telemetry/llm-usage`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  });
+  const response = await postJsonWithTimeout(`${server}/telemetry/llm-usage`, headers, payload);
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     throw new Error(
@@ -221,6 +242,16 @@ export function shouldEmitDirectSessionJobEvent(options: {
 }): boolean {
   if (options.ok) return true;
   return !options.statusPersistedToServer;
+}
+
+export function shouldRecycleWorkerForHeartbeatDegradation(options: {
+  heartbeatDelivered: boolean;
+  allowHeartbeatRecycle: boolean;
+  transportStale: boolean;
+}): boolean {
+  if (options.heartbeatDelivered) return false;
+  if (!options.allowHeartbeatRecycle) return false;
+  return options.transportStale;
 }
 
 function shouldRecycleWorkerForCodexUnavailableFailure(
@@ -853,19 +884,15 @@ async function enqueueCompletion(
       resultSummary,
     });
 
-    const response = await fetch(`${server}/completions/enqueue`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        jobId: job.id,
-        sessionId: job.sessionId,
-        commitSha: commit.sha,
-        branch: commit.branch,
-        message: `${job.kind}: ${job.taskId} (worker PR metadata attached)`,
-        prUrl,
-        prTitle: pr.title,
-        prBody: pr.body,
-      }),
+    const response = await postJsonWithTimeout(`${server}/completions/enqueue`, headers, {
+      jobId: job.id,
+      sessionId: job.sessionId,
+      commitSha: commit.sha,
+      branch: commit.branch,
+      message: `${job.kind}: ${job.taskId} (worker PR metadata attached)`,
+      prUrl,
+      prTitle: pr.title,
+      prBody: pr.body,
     });
 
     if (response.ok) {
@@ -883,24 +910,6 @@ async function enqueueCompletion(
   }
 }
 
-function sendCommand(
-  server: string,
-  sessionId: string,
-  headers: Record<string, string>,
-  cmd: CommandRequest,
-): Promise<void> {
-  return fetch(`${server}/sessions/${sessionId}/command`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(cmd),
-  })
-    .then((res) => {
-      if (!res.ok) console.error(`[WorkerPals] Command ${cmd.type} failed: ${res.status}`);
-    })
-    .catch((err) => console.error(`[WorkerPals] Command ${cmd.type} error:`, err));
-}
-
-type WorkerHeartbeatStatus = "idle" | "busy" | "error" | "offline";
 type WorkerRuntimeState = {
   currentJobId: string | null;
   currentSessionId: string | null;
@@ -913,44 +922,11 @@ function buildWorkerHeaders(authToken: string | null): Record<string, string> {
   return headers;
 }
 
-async function sendWorkerHeartbeat(
-  opts: ReturnType<typeof parseArgs>,
-  headers: Record<string, string>,
-  status: WorkerHeartbeatStatus,
-  currentJobId: string | null = null,
-): Promise<void> {
-  try {
-    await fetch(`${opts.server}/workers/heartbeat`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        workerId: opts.workerId,
-        status,
-        currentJobId,
-        pollMs: opts.pollMs,
-        capabilities: {
-          docker: opts.docker,
-          labels: opts.labels,
-          executor: resolveExecutor(CONFIG),
-          requireDocker: opts.requireDocker,
-        },
-        details: {
-          repo: opts.repo,
-          baseRef: opts.worktreeBaseRef,
-          dockerImage: opts.docker ? opts.dockerImage : null,
-          dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
-        },
-      }),
-    });
-  } catch (err) {
-    console.error(`[WorkerPals] Heartbeat error:`, err);
-  }
-}
-
 async function failActiveJobOnShutdown(
   opts: ReturnType<typeof parseArgs>,
   headers: Record<string, string>,
   runtimeState: WorkerRuntimeState,
+  transport: WorkerServerTransport,
   signalName: string,
 ): Promise<void> {
   const activeJobId = runtimeState.currentJobId;
@@ -961,10 +937,9 @@ async function failActiveJobOnShutdown(
   let statusPersistedToServer = false;
 
   try {
-    const response = await fetch(`${opts.server}/jobs/${activeJobId}/fail`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ message, detail }),
+    const response = await postJsonWithTimeout(`${opts.server}/jobs/${activeJobId}/fail`, headers, {
+      message,
+      detail,
     });
     statusPersistedToServer = response.ok;
   } catch (err) {
@@ -978,7 +953,7 @@ async function failActiveJobOnShutdown(
     runtimeState.currentSessionId &&
     shouldEmitDirectSessionJobEvent({ ok: false, statusPersistedToServer })
   ) {
-    await sendCommand(opts.server, runtimeState.currentSessionId, headers, {
+    await transport.queueSessionCommand(runtimeState.currentSessionId, {
       type: "job_failed",
       payload: {
         jobId: activeJobId,
@@ -986,7 +961,7 @@ async function failActiveJobOnShutdown(
         detail,
       },
       from: `worker:${opts.workerId}`,
-    });
+    }, { priority: "high" });
   }
 }
 
@@ -994,6 +969,8 @@ async function workerLoop(
   opts: ReturnType<typeof parseArgs>,
   dockerExecutor: DockerExecutor | null,
   runtimeState: WorkerRuntimeState,
+  transport: WorkerServerTransport,
+  requestWorkerRestart: (reason: string) => void,
 ): Promise<void> {
   const headers = buildWorkerHeaders(opts.authToken);
 
@@ -1007,17 +984,37 @@ async function workerLoop(
   }
   console.log(`[WorkerPals ${opts.workerId}] Executor backend: ${resolveExecutor(CONFIG)}`);
   const heartbeatEveryMs = Math.max(1000, opts.heartbeatMs);
+  const claimTimeoutMs = Math.max(4_000, Math.min(15_000, opts.pollMs * 3));
   let lastHeartbeatAt = 0;
+  const buildHeartbeatPayload = (
+    status: WorkerHeartbeatPayload["status"],
+    currentJobId: string | null,
+  ): WorkerHeartbeatPayload => ({
+    status,
+    currentJobId,
+    capabilities: {
+      docker: opts.docker,
+      labels: opts.labels,
+      executor: resolveExecutor(CONFIG),
+      requireDocker: opts.requireDocker,
+    },
+    details: {
+      repo: opts.repo,
+      baseRef: opts.worktreeBaseRef,
+      dockerImage: opts.docker ? opts.dockerImage : null,
+      dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
+    },
+  });
 
   const maybeHeartbeat = async (
-    status: WorkerHeartbeatStatus,
+    status: WorkerHeartbeatPayload["status"],
     currentJobId: string | null = null,
     force = false,
   ) => {
     const now = Date.now();
     if (!force && now - lastHeartbeatAt < heartbeatEveryMs) return;
-    await sendWorkerHeartbeat(opts, headers, status, currentJobId);
-    lastHeartbeatAt = now;
+    const ok = await transport.sendHeartbeat(buildHeartbeatPayload(status, currentJobId));
+    if (ok) lastHeartbeatAt = now;
   };
 
   await maybeHeartbeat("idle", null, true);
@@ -1025,11 +1022,12 @@ async function workerLoop(
   while (!runtimeState.shutdownRequested) {
     try {
       await maybeHeartbeat("idle");
-      const claimRes = await fetch(`${opts.server}/jobs/claim`, {
-        method: "POST",
+      const claimRes = await postJsonWithTimeout(
+        `${opts.server}/jobs/claim`,
         headers,
-        body: JSON.stringify({ workerId: opts.workerId }),
-      });
+        { workerId: opts.workerId },
+        claimTimeoutMs,
+      );
 
       if (claimRes.ok) {
         const data = (await claimRes.json()) as any;
@@ -1040,22 +1038,35 @@ async function workerLoop(
           runtimeState.currentSessionId = job.sessionId ?? null;
           console.log(`[WorkerPals] Claimed job ${job.id} (${job.kind})`);
           await maybeHeartbeat("busy", job.id, true);
+          let allowHeartbeatRecycle = true;
 
           const busyHeartbeat = setInterval(() => {
-            void sendWorkerHeartbeat(opts, headers, "busy", job.id);
+            void transport.sendHeartbeat(buildHeartbeatPayload("busy", job.id)).then((ok) => {
+              if (
+                !shouldRecycleWorkerForHeartbeatDegradation({
+                  heartbeatDelivered: ok,
+                  allowHeartbeatRecycle,
+                  transportStale: transport.shouldRecycleBusyWorker(),
+                })
+              ) {
+                return;
+              }
+              requestWorkerRestart(
+                `heartbeat transport stale while claimed job ${job.id} is still running`,
+              );
+            });
           }, heartbeatEveryMs);
 
           if (job.sessionId) {
-            await sendCommand(opts.server, job.sessionId, headers, {
+            await transport.queueSessionCommand(job.sessionId, {
               type: "job_claimed",
               payload: { jobId: job.id, workerId: opts.workerId },
               from: `worker:${opts.workerId}`,
-            });
+            }, { priority: "high" });
           }
 
           let stdoutSeq = 0;
           let stderrSeq = 0;
-          let logChain: Promise<void> = Promise.resolve();
           let lastCleanLog = "";
           let lastCleanLogAt = 0;
 
@@ -1077,20 +1088,17 @@ async function workerLoop(
                 const logTs = new Date(now).toISOString();
 
                 const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
-                logChain = logChain.then(() =>
-                  Promise.allSettled([
-                    sendCommand(opts.server, job.sessionId, headers, {
-                      type: "job_log",
-                      payload: { jobId: job.id, stream, seq, line: cleaned, ts: logTs },
-                      from: `worker:${opts.workerId}`,
-                    }),
-                    fetch(`${opts.server}/jobs/${job.id}/log`, {
-                      method: "POST",
-                      headers,
-                      body: JSON.stringify({ stream, seq, message: cleaned, ts: logTs }),
-                    }),
-                  ]).then(() => undefined),
-                );
+                void transport.queueSessionCommand(job.sessionId, {
+                  type: "job_log",
+                  payload: { jobId: job.id, stream, seq, line: cleaned, ts: logTs },
+                  from: `worker:${opts.workerId}`,
+                }, { droppable: true });
+                void transport.queueJobLog(job.id, {
+                  stream,
+                  seq,
+                  message: cleaned,
+                  ts: logTs,
+                });
               }
             : undefined;
 
@@ -1153,7 +1161,8 @@ async function workerLoop(
             }
             const jobDurationMs = Math.max(0, Date.now() - jobStartedAtMs);
 
-            await logChain;
+            allowHeartbeatRecycle = false;
+            await transport.flush();
             try {
               await reportWorkerLlmUsage(opts.server, headers, jobData, result);
             } catch (err) {
@@ -1267,10 +1276,10 @@ async function workerLoop(
                 reviewAgent.prUrl.trim().length > 0
                   ? reviewAgent.prUrl.trim()
                   : null;
-              const response = await fetch(`${opts.server}/jobs/${job.id}/complete`, {
-                method: "POST",
+              const response = await postJsonWithTimeout(
+                `${opts.server}/jobs/${job.id}/complete`,
                 headers,
-                body: JSON.stringify({
+                {
                   summary: result.summary,
                   durationMs: jobDurationMs,
                   prUrl: jobPrUrl,
@@ -1278,21 +1287,17 @@ async function workerLoop(
                     ...(result.stdout ? [{ kind: "stdout", text: result.stdout }] : []),
                     ...(result.stderr ? [{ kind: "stderr", text: result.stderr }] : []),
                   ],
-                }),
-              });
+                },
+              );
               statusPersistedToServer = response.ok;
               console.log(
                 `[WorkerPals] Job ${job.id} completed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
               );
             } else {
-              const response = await fetch(`${opts.server}/jobs/${job.id}/fail`, {
-                method: "POST",
-                headers,
-                body: JSON.stringify({
-                  message: result.summary,
-                  detail: redactSensitiveText(result.stderr ?? ""),
-                  durationMs: jobDurationMs,
-                }),
+              const response = await postJsonWithTimeout(`${opts.server}/jobs/${job.id}/fail`, headers, {
+                message: result.summary,
+                detail: redactSensitiveText(result.stderr ?? ""),
+                durationMs: jobDurationMs,
               });
               statusPersistedToServer = response.ok;
               console.log(
@@ -1327,11 +1332,11 @@ async function workerLoop(
                     ? `${rawText.slice(0, maxResponseChars - 3)}...`
                     : rawText;
                 if (assistantText) {
-                  await sendCommand(opts.server, job.sessionId, headers, {
+                  await transport.queueSessionCommand(job.sessionId, {
                     type: "assistant_message",
                     payload: { text: assistantText },
                     from: `worker:${opts.workerId}`,
-                  });
+                  }, { priority: "high" });
                 }
               }
 
@@ -1358,7 +1363,9 @@ async function workerLoop(
                       from: `worker:${opts.workerId}`,
                     };
 
-                await sendCommand(opts.server, job.sessionId, headers, eventCmd);
+                await transport.queueSessionCommand(job.sessionId, eventCmd, {
+                  priority: "high",
+                });
               }
             }
           } finally {
@@ -1369,13 +1376,13 @@ async function workerLoop(
               result?.cooldownMs &&
               result.cooldownMs > 0
             ) {
-              await sendCommand(opts.server, job.sessionId, headers, {
+              await transport.queueSessionCommand(job.sessionId, {
                 type: "assistant_message",
                 payload: {
                   text: `WorkerPal is cooling down for ${formatDurationMs(result.cooldownMs)} after transient infrastructure failures.`,
                 },
                 from: `worker:${opts.workerId}`,
-              });
+              }, { priority: "high" });
             }
             if (!recycleWorkerAfterJob && result?.cooldownMs && result.cooldownMs > 0) {
               const cooldownMs = Math.max(0, Math.floor(result.cooldownMs));
@@ -1501,6 +1508,14 @@ async function main(): Promise<void> {
     shutdownRequested: false,
   };
   const headers = buildWorkerHeaders(opts.authToken);
+  const transport = new WorkerServerTransport({
+    server: opts.server,
+    headers,
+    workerId: opts.workerId,
+    pollMs: opts.pollMs,
+    heartbeatMs: opts.heartbeatMs,
+    staleClaimTtlMs: CONFIG.server.staleClaimTtlMs,
+  });
   let shutdownTriggered = false;
   const shutdownAndExit = (signalName: string, code: number) => {
     if (shutdownTriggered) return;
@@ -1517,9 +1532,25 @@ async function main(): Promise<void> {
 
     void (async () => {
       await withTimeout(
-        sendWorkerHeartbeat(opts, headers, "offline", runtimeState.currentJobId ?? null),
+        transport.sendHeartbeat({
+          status: "offline",
+          currentJobId: runtimeState.currentJobId ?? null,
+          capabilities: {
+            docker: opts.docker,
+            labels: opts.labels,
+            executor: resolveExecutor(CONFIG),
+            requireDocker: opts.requireDocker,
+          },
+          details: {
+            repo: opts.repo,
+            baseRef: opts.worktreeBaseRef,
+            dockerImage: opts.docker ? opts.dockerImage : null,
+            dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
+          },
+        }),
       );
-      await withTimeout(failActiveJobOnShutdown(opts, headers, runtimeState, signalName));
+      await withTimeout(failActiveJobOnShutdown(opts, headers, runtimeState, transport, signalName));
+      await withTimeout(transport.flush());
       if (dockerExecutor) {
         await withTimeout(
           dockerExecutor.shutdown().catch((err) => {
@@ -1548,7 +1579,13 @@ async function main(): Promise<void> {
     }
   });
 
-  workerLoop(opts, dockerExecutor, runtimeState).catch((err) => {
+  const requestWorkerRestart = (reason: string) => {
+    if (shutdownTriggered) return;
+    console.error(`[WorkerPals] Control plane unhealthy: ${reason}. Recycling worker.`);
+    shutdownAndExit("CONTROL_PLANE_UNHEALTHY", 91);
+  };
+
+  workerLoop(opts, dockerExecutor, runtimeState, transport, requestWorkerRestart).catch((err) => {
     console.error("[WorkerPals] Fatal:", err);
     process.exit(1);
   });

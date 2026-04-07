@@ -1,0 +1,429 @@
+import { expect, test } from "bun:test";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "http";
+import { tmpdir } from "os";
+import { dirname, join, resolve } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const sourceRepoRoot = resolve(__dirname, "..", "..");
+const workerMainPath = resolve(sourceRepoRoot, "apps", "workerpals", "src", "workerpals_main.ts");
+
+function decodeOutput(data: string | Uint8Array | null | undefined): string {
+  if (typeof data === "string") return data;
+  if (!data) return "";
+  return Buffer.from(data).toString("utf8");
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<any> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  return text ? JSON.parse(text) : {};
+}
+
+async function startJsonServer(
+  handler: (req: IncomingMessage, res: ServerResponse, body: any) => Promise<void> | void,
+): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  const server = createServer(async (req, res) => {
+    try {
+      const body = await readJsonBody(req);
+      await handler(req, res, body);
+    } catch (error) {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      res.end(
+        JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  });
+
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", () => resolveListen());
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Failed to bind integration HTTP server");
+  }
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    },
+  };
+}
+
+function initializeMinimalRepo(root: string): string {
+  const repoPath = join(root, "repo");
+  mkdirSync(repoPath, { recursive: true });
+  mkdirSync(join(repoPath, "configs"), { recursive: true });
+  cpSync(join(sourceRepoRoot, "configs", "default.toml"), join(repoPath, "configs", "default.toml"), {
+    force: true,
+  });
+  if (existsSync(join(sourceRepoRoot, "configs", "local.example.toml"))) {
+    cpSync(
+      join(sourceRepoRoot, "configs", "local.example.toml"),
+      join(repoPath, "configs", "local.example.toml"),
+      { force: true },
+    );
+  }
+  if (existsSync(join(sourceRepoRoot, ".env.example"))) {
+    cpSync(join(sourceRepoRoot, ".env.example"), join(repoPath, ".env.example"), { force: true });
+  }
+  writeFileSync(join(repoPath, "README.md"), "# workerpals control-plane integration\n", "utf8");
+
+  const gitInit = Bun.spawnSync(["git", "init"], {
+    cwd: repoPath,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (gitInit.exitCode !== 0) {
+    throw new Error(`git init failed: ${decodeOutput(gitInit.stderr)}`);
+  }
+  Bun.spawnSync(["git", "branch", "-M", "main"], {
+    cwd: repoPath,
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  Bun.spawnSync(["git", "config", "user.name", "PushPals Control Plane E2E"], {
+    cwd: repoPath,
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  Bun.spawnSync(["git", "config", "user.email", "pushpals-control-plane@example.com"], {
+    cwd: repoPath,
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  Bun.spawnSync(["git", "add", "."], {
+    cwd: repoPath,
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  Bun.spawnSync(["git", "commit", "-m", "chore: seed control plane integration repo"], {
+    cwd: repoPath,
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  return repoPath;
+}
+
+async function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs: number,
+  message: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await Bun.sleep(50);
+  }
+  throw new Error(message);
+}
+
+async function expectProcessRunning(proc: ReturnType<typeof Bun.spawn>, timeoutMs: number): Promise<void> {
+  const outcome = await Promise.race([
+    proc.exited.then((code) => ({ exited: true as const, code })),
+    Bun.sleep(timeoutMs).then(() => ({ exited: false as const, code: null })),
+  ]);
+  if (outcome.exited) {
+    throw new Error(`Worker exited unexpectedly with code ${outcome.code}`);
+  }
+}
+
+async function stopWorker(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
+  try {
+    proc.kill();
+  } catch {}
+  await Promise.race([proc.exited, Bun.sleep(5_000)]);
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return `${stdout}\n${stderr}`;
+}
+
+test(
+  "worker keeps heartbeating while a claimed-job session command is blocked",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-worker-control-plane-"));
+    let serverHandle: Awaited<ReturnType<typeof startJsonServer>> | null = null;
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const repoPath = initializeMinimalRepo(root);
+      const jobId = "job-heartbeat-survives";
+      let claimCount = 0;
+      let busyHeartbeatsWhileBlocked = 0;
+      let completionSeen = false;
+      let failureSeen = false;
+      let releaseBlockedCommand: (() => void) | null = null;
+      let blockedCommandReleased = false;
+      const requestTrace: string[] = [];
+
+      serverHandle = await startJsonServer(async (req, res, body) => {
+        const url = req.url ?? "/";
+        requestTrace.push(`${req.method ?? "GET"} ${url} ${JSON.stringify(body)}`);
+        if (req.method !== "POST") {
+          res.statusCode = 404;
+          res.end("{}");
+          return;
+        }
+        if (url === "/jobs/claim") {
+          claimCount += 1;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              job:
+                claimCount === 1
+                  ? {
+                      id: jobId,
+                      taskId: "warmup-heartbeat-survives",
+                      kind: "warmup.execute",
+                      params: {},
+                      sessionId: "session-blocked",
+                    }
+                  : null,
+            }),
+          );
+          return;
+        }
+        if (url === "/workers/heartbeat") {
+          if (body.currentJobId === jobId && !blockedCommandReleased) {
+            busyHeartbeatsWhileBlocked += 1;
+            if (busyHeartbeatsWhileBlocked >= 2) {
+              blockedCommandReleased = true;
+              releaseBlockedCommand?.();
+            }
+          }
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === "/sessions/session-blocked/command") {
+          if (!blockedCommandReleased && body?.type === "job_claimed") {
+            await new Promise<void>((resolveBlocked) => {
+              releaseBlockedCommand = resolveBlocked;
+            });
+          }
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === `/jobs/${jobId}/complete`) {
+          completionSeen = true;
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === `/jobs/${jobId}/fail`) {
+          failureSeen = true;
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url.startsWith(`/jobs/${jobId}/log`)) {
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        res.statusCode = 200;
+        res.end("{}");
+      });
+
+      proc = Bun.spawn(
+        [
+          process.execPath,
+          "run",
+          workerMainPath,
+          "--server",
+          serverHandle.baseUrl,
+          "--poll",
+          "250",
+          "--heartbeat",
+          "500",
+          "--repo",
+          repoPath,
+          "--base-ref",
+          "HEAD",
+          "--workerId",
+          "workerpal-control-plane-it-1",
+        ],
+        {
+          cwd: repoPath,
+          stdout: "pipe",
+          stderr: "pipe",
+          env: { ...process.env },
+        },
+      );
+
+      await waitForCondition(
+        () => blockedCommandReleased,
+        10_000,
+        "Timed out waiting for blocked command release via busy heartbeats",
+      );
+      expect(busyHeartbeatsWhileBlocked).toBeGreaterThanOrEqual(2);
+
+      try {
+        await waitForCondition(() => completionSeen, 10_000, "Timed out waiting for warmup completion");
+      } catch (error) {
+        const output = proc ? await stopWorker(proc) : "";
+        proc = null;
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\n` +
+            `failureSeen=${failureSeen}\n` +
+            `requestTrace=\n${requestTrace.join("\n")}\n` +
+            `workerOutput=\n${output}`,
+        );
+      }
+      await expectProcessRunning(proc, 500);
+
+      const output = await stopWorker(proc);
+      proc = null;
+      expect(output).not.toContain("Control plane unhealthy");
+    } finally {
+      if (proc) {
+        await stopWorker(proc);
+      }
+      if (serverHandle) {
+        await serverHandle.close();
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+test(
+  "worker does not recycle during finalization when heartbeats fail after execution completes",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-worker-control-plane-"));
+    let serverHandle: Awaited<ReturnType<typeof startJsonServer>> | null = null;
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const repoPath = initializeMinimalRepo(root);
+      const jobId = "job-finalization-survives";
+      let claimCount = 0;
+      let finalizationBlocked = false;
+      let releaseCompletion: (() => void) | null = null;
+      let completionSeen = false;
+      let failingHeartbeatsDuringFinalization = 0;
+
+      serverHandle = await startJsonServer(async (req, res, body) => {
+        const url = req.url ?? "/";
+        if (req.method !== "POST") {
+          res.statusCode = 404;
+          res.end("{}");
+          return;
+        }
+        if (url === "/jobs/claim") {
+          claimCount += 1;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              job:
+                claimCount === 1
+                  ? {
+                      id: jobId,
+                      taskId: "warmup-finalization-survives",
+                      kind: "warmup.execute",
+                      params: {},
+                      sessionId: null,
+                    }
+                  : null,
+            }),
+          );
+          return;
+        }
+        if (url === "/workers/heartbeat") {
+          if (finalizationBlocked && body.currentJobId === jobId) {
+            failingHeartbeatsDuringFinalization += 1;
+            res.statusCode = 503;
+            res.end('{"error":"heartbeat degraded during finalization"}');
+            return;
+          }
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === `/jobs/${jobId}/complete`) {
+          finalizationBlocked = true;
+          await new Promise<void>((resolveBlocked) => {
+            releaseCompletion = resolveBlocked;
+          });
+          completionSeen = true;
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === `/jobs/${jobId}/fail`) {
+          res.statusCode = 500;
+          res.end('{"error":"unexpected fail"}');
+          return;
+        }
+        res.statusCode = 200;
+        res.end("{}");
+      });
+
+      proc = Bun.spawn(
+        [
+          process.execPath,
+          "run",
+          workerMainPath,
+          "--server",
+          serverHandle.baseUrl,
+          "--poll",
+          "250",
+          "--heartbeat",
+          "500",
+          "--repo",
+          repoPath,
+          "--base-ref",
+          "HEAD",
+          "--workerId",
+          "workerpal-control-plane-it-2",
+        ],
+        {
+          cwd: repoPath,
+          stdout: "pipe",
+          stderr: "pipe",
+          env: {
+            ...process.env,
+            PUSHPALS_STALE_CLAIM_TTL_MS: "4000",
+          },
+        },
+      );
+
+      await waitForCondition(
+        () => finalizationBlocked && failingHeartbeatsDuringFinalization >= 3,
+        10_000,
+        "Timed out waiting for failing finalization heartbeats",
+      );
+      await expectProcessRunning(proc, 1_000);
+
+      releaseCompletion?.();
+      await waitForCondition(() => completionSeen, 10_000, "Timed out waiting for completion after release");
+      await expectProcessRunning(proc, 500);
+
+      const output = await stopWorker(proc);
+      proc = null;
+      expect(output).not.toContain("Control plane unhealthy");
+      expect(output).not.toContain("Fatal:");
+    } finally {
+      if (proc) {
+        await stopWorker(proc);
+      }
+      if (serverHandle) {
+        await serverHandle.close();
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
