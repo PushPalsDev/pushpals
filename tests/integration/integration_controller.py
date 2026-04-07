@@ -87,8 +87,16 @@ def _stream_harness_output(
         assert proc.stdout is not None
         try:
             for line in proc.stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except UnicodeEncodeError:
+                    safe_line = line.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+                        sys.stdout.encoding or "utf-8",
+                        errors="replace",
+                    )
+                    sys.stdout.write(safe_line)
+                    sys.stdout.flush()
                 log_file.write(line)
                 log_file.flush()
             return int(proc.wait())

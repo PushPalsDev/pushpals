@@ -102,4 +102,51 @@ describe("start runtime service helpers", () => {
       manager.stop();
     }
   });
+
+  test("ServiceManager beginShutdown suppresses restart scheduling without killing services", async () => {
+    let killCalls = 0;
+    let spawnCalls = 0;
+    let managedService: ReturnType<ServiceManager["startService"]> | null = null;
+    const manager = new ServiceManager({
+      pollMs: 25,
+      computeRestartBackoffMs: () => 25,
+      spawnService: (spec) => {
+        spawnCalls += 1;
+        return {
+          name: spec.name,
+          proc: {
+            pid: 123,
+            kill: () => {
+              killCalls += 1;
+            },
+          } as any,
+          command: [...spec.command],
+          cwd: spec.cwd,
+          env: { ...(spec.env ?? {}) },
+          exited: false,
+          exitCode: null,
+          launchedAtMs: Date.now(),
+          logPath: spec.logPath,
+        };
+      },
+    });
+    try {
+      managedService = manager.startService({
+        name: "server",
+        color: "blue",
+        command: ["fake-server"],
+        cwd: process.cwd(),
+      });
+      manager.beginShutdown();
+      managedService.exited = true;
+      managedService.exitCode = 0;
+
+      await Bun.sleep(125);
+      expect(spawnCalls).toBe(1);
+      expect(killCalls).toBe(0);
+      expect(manager.getHealth()).toBeNull();
+    } finally {
+      manager.stop();
+    }
+  });
 });

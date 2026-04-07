@@ -630,7 +630,26 @@ def _kill_existing_sidecar_processes() -> None:
 
 def _create_isolated_worker_repo(source_repo: Path) -> tuple[Path, Path]:
     """Create an isolated git clone for WorkerPals so E2E edits never touch the source workspace."""
-    temp_root = Path(tempfile.mkdtemp(prefix="pushpals-e2e-worker-repo-"))
+    temp_parent_override = (os.environ.get("WORKERPALS_E2E_TMP_ROOT") or "").strip()
+    if temp_parent_override:
+        temp_parent = Path(temp_parent_override)
+    elif os.name == "nt":
+        temp_parent = Path("C:/pp-e2e")
+    else:
+        temp_parent = Path(tempfile.gettempdir())
+    try:
+        temp_parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if temp_parent_override or os.name != "nt":
+            raise RuntimeError(f"Failed to create isolated worker temp root {temp_parent}: {exc}") from exc
+        fallback_parent = Path(tempfile.gettempdir())
+        print(
+            "[WARN] Unable to create Windows E2E temp root "
+            f"{temp_parent}; falling back to {fallback_parent}: {exc}"
+        )
+        fallback_parent.mkdir(parents=True, exist_ok=True)
+        temp_parent = fallback_parent
+    temp_root = Path(tempfile.mkdtemp(prefix="pp-e2e-", dir=str(temp_parent)))
     clone_path = temp_root / "repo"
     proc = subprocess.run(
         ["git", "clone", "--local", "--quiet", "--no-hardlinks", str(source_repo), str(clone_path)],
@@ -644,6 +663,20 @@ def _create_isolated_worker_repo(source_repo: Path) -> tuple[Path, Path]:
         detail = (proc.stderr or proc.stdout or "").strip()
         shutil.rmtree(temp_root, ignore_errors=True)
         raise RuntimeError(f"Failed to create isolated worker repo clone: {detail}")
+    longpaths_proc = subprocess.run(
+        ["git", "config", "core.longpaths", "true"],
+        cwd=str(clone_path),
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if longpaths_proc.returncode != 0:
+        detail = (longpaths_proc.stderr or longpaths_proc.stdout or "").strip()
+        print(
+            "[WARN] Failed to enable git core.longpaths in isolated worker repo "
+            f"{clone_path}: {detail or f'rc={longpaths_proc.returncode}'}"
+        )
     return clone_path, temp_root
 
 
@@ -2547,10 +2580,12 @@ def main():
         else:
             raise RuntimeError(f"server start timeout (url={SERVER_URL})")
         _print_duration("server health wait", server_health_started_at)
+        http_post("/sessions", {"sessionId": run_session_id})
 
         # Start RemoteBuddy only after server health is confirmed.
         remotebuddy_env = {
             "REMOTEBUDDY_FETCH_FAILURE_LOGS": E2E_REMOTEBUDDY_FETCH_FAILURE_LOGS,
+            "REMOTEBUDDY_AUTO_SPAWN_WORKERPALS": "0",
         }
         remotebuddy_proc = start_process(
             [
@@ -3168,4 +3203,3 @@ if __name__ == "__main__":
     except Exception as e:
         print("Error:", e)
         sys.exit(1)
-

@@ -4700,6 +4700,7 @@ async function main(): Promise<void> {
     if (!autoStartedServiceManager) return;
     const serviceManager = autoStartedServiceManager;
     autoStartedServiceManager = null;
+    serviceManager.beginShutdown();
     const shutdown = await requestLocalRuntimeShutdown(serverUrl, repoRoot, reason);
     if (shutdown.attempted && shutdown.accepted) {
       console.log("[pushpals] Local runtime shutdown accepted; waiting for services to exit...");

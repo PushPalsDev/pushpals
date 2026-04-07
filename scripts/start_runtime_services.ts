@@ -164,6 +164,7 @@ export class ServiceManager {
   private readonly onServiceDegraded?: (name: string, reason: string, health: EmbeddedRuntimeHealth) => void;
   private readonly onEvent?: (level: "log" | "warn" | "error", line: string) => void;
   private readonly timer: ReturnType<typeof setInterval>;
+  private shutdownBegun = false;
   private stopped = false;
 
   constructor(options: ServiceManagerOptions = {}) {
@@ -218,15 +219,21 @@ export class ServiceManager {
     };
   }
 
-  stop(): void {
-    if (this.stopped) return;
-    this.stopped = true;
+  beginShutdown(): void {
+    if (this.shutdownBegun || this.stopped) return;
+    this.shutdownBegun = true;
     clearInterval(this.timer);
     for (const state of this.stateByService.values()) {
       if (!state.pendingRestartTimer) continue;
       clearTimeout(state.pendingRestartTimer);
       state.pendingRestartTimer = null;
     }
+  }
+
+  stop(): void {
+    if (this.stopped) return;
+    this.beginShutdown();
+    this.stopped = true;
     for (const service of this.services.values()) {
       try {
         const pid = service.proc.pid;
@@ -267,7 +274,7 @@ export class ServiceManager {
   }
 
   private tick(): void {
-    if (this.stopped) return;
+    if (this.shutdownBegun || this.stopped) return;
     const now = Date.now();
     for (const [name, service] of this.services.entries()) {
       const launchSpec = this.launchSpecs.get(name);
@@ -314,7 +321,7 @@ export class ServiceManager {
       state.pendingRestartTimer = setTimeout(() => {
         state.pendingRestartTimer = null;
         state.nextRestartAtMs = 0;
-        if (this.stopped) return;
+        if (this.shutdownBegun || this.stopped) return;
         const current = this.services.get(name);
         if (!current || !current.exited) return;
         const spec = this.launchSpecs.get(name);
