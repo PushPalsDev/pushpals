@@ -2,15 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.0.38`
-- start_commit: `8b1a4d956f11c8475603f4882fb835094fddd2cb`
-- end_commit: `0052ef4f8ea3638899dfe132f3a64fdfe0af13d7`
-- commits_in_range: `1`
+- version: `v1.0.39`
+- start_commit: `b9f904291ccd875edda75723fb80ff232917eca2`
+- end_commit: `6c890c6ccad84f7f4a38eb31af53c75905641ed1`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Make the CLI npm publish workflow idempotent by detecting already-published versions before attempting `npm publish`.
-- Keep release reruns green under npm immutable version rules by skipping duplicate package builds and publishes for the same tagged CLI version.
+- Isolate WorkerPal heartbeats from queued progress delivery, add control-plane request timeouts, and recycle unhealthy workers before stale-claim failures cascade.
+- Add live integration coverage for blocked control-plane and finalization-heartbeat scenarios to keep WorkerPal reliability pinned down.
+- Quiesce service supervision before graceful CLI shutdown so managed services do not schedule restarts while the runtime is intentionally exiting.
+- Harden the full-stack integration harness for Windows temp paths and `git core.longpaths` while preserving strict single-worker isolation.
 
 ## Install
 
@@ -41,4 +43,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.38 && git push origin v1.0.38`.
+- Tag and push: `git tag v1.0.39 && git push origin v1.0.39`.
