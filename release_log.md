@@ -2,17 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.39`
-- start_commit: `b9f904291ccd875edda75723fb80ff232917eca2`
-- end_commit: `6c890c6ccad84f7f4a38eb31af53c75905641ed1`
-- commits_in_range: `2`
+- version: `v1.0.40`
+- start_commit: `60f3bdf9fc0d7d04583c55b13c6d376dc39d74ca`
+- end_commit: `a09ed11fb10395e52f8739967bfc1688c4187b34`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Isolate WorkerPal heartbeats from queued progress delivery, add control-plane request timeouts, and recycle unhealthy workers before stale-claim failures cascade.
-- Add live integration coverage for blocked control-plane and finalization-heartbeat scenarios to keep WorkerPal reliability pinned down.
-- Quiesce service supervision before graceful CLI shutdown so managed services do not schedule restarts while the runtime is intentionally exiting.
-- Harden the full-stack integration harness for Windows temp paths and `git core.longpaths` while preserving strict single-worker isolation.
+- Move merge-conflict Docker image refresh out of claimed-job lifetime by deferring the job, performing maintenance under idle heartbeats, and reclaiming only after the environment is ready.
+- Retarget deferred maintenance jobs to the worker actually performing prep, add guarded deferred-failure handling, and prevent reclaim races when the original worker comes back.
+- Add real-Docker integration coverage for the full `claim -> defer -> rebuild -> reclaim -> execute` WorkerPal flow so the merge-conflict path is pinned down end to end.
 
 ## Install
 
@@ -43,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.39 && git push origin v1.0.39`.
+- Tag and push: `git tag v1.0.40 && git push origin v1.0.40`.
