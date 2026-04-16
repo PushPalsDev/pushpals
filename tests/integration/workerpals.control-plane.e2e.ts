@@ -115,6 +115,32 @@ function initializeMinimalRepo(root: string): string {
   return repoPath;
 }
 
+function dockerAvailable(): boolean {
+  const proc = Bun.spawnSync(["docker", "version", "--format", "{{.Server.Version}}"], {
+    cwd: sourceRepoRoot,
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  return proc.exitCode === 0;
+}
+
+function cleanupDockerArtifacts(imageName: string, workerId: string): void {
+  try {
+    Bun.spawnSync(["docker", "rm", "-f", `pushpals-${workerId}-warm`], {
+      cwd: sourceRepoRoot,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+  } catch {}
+  try {
+    Bun.spawnSync(["docker", "image", "rm", "-f", imageName], {
+      cwd: sourceRepoRoot,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+  } catch {}
+}
+
 async function waitForCondition(
   predicate: () => boolean,
   timeoutMs: number,
@@ -426,4 +452,199 @@ test(
     }
   },
   30_000,
+);
+
+test(
+  "worker defers merge-conflict jobs, rebuilds the Docker image, reclaims, and completes execution",
+  async () => {
+    if (!dockerAvailable()) {
+      console.warn("[workerpals.control-plane.e2e] Skipping real-Docker merge-conflict test because Docker is unavailable.");
+      return;
+    }
+
+    const root = mkdtempSync(join(tmpdir(), "pushpals-worker-merge-conflict-"));
+    let serverHandle: Awaited<ReturnType<typeof startJsonServer>> | null = null;
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    const workerId = `workerpal-merge-conflict-it-${Date.now()}`;
+    const dockerImage = `pushpals-worker-sandbox:merge-conflict-e2e-${Date.now()}`;
+    try {
+      const repoPath = initializeMinimalRepo(root);
+      const jobId = "job-merge-conflict-docker";
+      const requestTrace: string[] = [];
+      const sessionCommands: string[] = [];
+      let servedClaimCount = 0;
+      let deferCount = 0;
+      let completionSeen = false;
+      let failureSeen = false;
+      let deferredFailureSeen = false;
+      let maintenanceHeartbeatCount = 0;
+
+      serverHandle = await startJsonServer(async (req, res, body) => {
+        const url = req.url ?? "/";
+        requestTrace.push(`${req.method ?? "GET"} ${url} ${JSON.stringify(body)}`);
+        if (req.method !== "POST") {
+          res.statusCode = 404;
+          res.end("{}");
+          return;
+        }
+        if (url === "/jobs/claim") {
+          const shouldServeJob =
+            servedClaimCount === 0 || (servedClaimCount === 1 && deferCount > 0);
+          if (shouldServeJob) {
+            servedClaimCount += 1;
+          }
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              job: shouldServeJob
+                ? {
+                    id: jobId,
+                    taskId: "merge-conflict-docker-warmup",
+                    kind: "warmup.execute",
+                    params: {
+                      reviewAgent: {
+                        resolutionType: "merge_conflict",
+                      },
+                    },
+                    sessionId: "session-merge-conflict",
+                  }
+                : null,
+            }),
+          );
+          return;
+        }
+        if (url === `/jobs/${jobId}/defer`) {
+          deferCount += 1;
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              ok: true,
+              availableAt: new Date(Date.now() + 60_000).toISOString(),
+            }),
+          );
+          return;
+        }
+        if (url === "/workers/heartbeat") {
+          if (body?.details?.maintenance === "merge_conflict_image_refresh") {
+            maintenanceHeartbeatCount += 1;
+          }
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === `/jobs/${jobId}/complete`) {
+          completionSeen = true;
+          res.statusCode = 200;
+          res.end('{"ok":true}');
+          return;
+        }
+        if (url === `/jobs/${jobId}/fail`) {
+          failureSeen = true;
+          res.statusCode = 200;
+          res.end('{"ok":true}');
+          return;
+        }
+        if (url === `/jobs/${jobId}/fail-deferred`) {
+          deferredFailureSeen = true;
+          res.statusCode = 200;
+          res.end('{"ok":true}');
+          return;
+        }
+        if (url.startsWith(`/jobs/${jobId}/log`)) {
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === "/sessions/session-merge-conflict/command") {
+          if (typeof body?.type === "string") {
+            sessionCommands.push(body.type);
+          }
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        res.statusCode = 200;
+        res.end("{}");
+      });
+
+      proc = Bun.spawn(
+        [
+          process.execPath,
+          "run",
+          workerMainPath,
+          "--server",
+          serverHandle.baseUrl,
+          "--poll",
+          "250",
+          "--heartbeat",
+          "500",
+          "--repo",
+          repoPath,
+          "--base-ref",
+          "HEAD",
+          "--workerId",
+          workerId,
+          "--docker",
+          "--docker-image",
+          dockerImage,
+        ],
+        {
+          cwd: repoPath,
+          stdout: "pipe",
+          stderr: "pipe",
+          env: {
+            ...process.env,
+            PUSHPALS_WORKERPALS_SANDBOX_ROOT: sourceRepoRoot,
+          },
+        },
+      );
+
+      try {
+        await waitForCondition(
+          () => completionSeen,
+          10 * 60_000,
+          "Timed out waiting for merge-conflict Docker job completion",
+        );
+      } catch (error) {
+        const output = proc ? await stopWorker(proc) : "";
+        proc = null;
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\n` +
+            `servedClaimCount=${servedClaimCount}\n` +
+            `deferCount=${deferCount}\n` +
+            `maintenanceHeartbeatCount=${maintenanceHeartbeatCount}\n` +
+            `failureSeen=${failureSeen}\n` +
+            `deferredFailureSeen=${deferredFailureSeen}\n` +
+            `sessionCommands=${JSON.stringify(sessionCommands)}\n` +
+            `requestTrace=\n${requestTrace.join("\n")}\n` +
+            `workerOutput=\n${output}`,
+        );
+      }
+
+      await expectProcessRunning(proc, 1_000);
+      const output = await stopWorker(proc);
+      proc = null;
+
+      expect(servedClaimCount).toBe(2);
+      expect(deferCount).toBe(1);
+      expect(maintenanceHeartbeatCount).toBeGreaterThan(0);
+      expect(failureSeen).toBe(false);
+      expect(deferredFailureSeen).toBe(false);
+      expect(sessionCommands).toContain("job_claimed");
+      expect(output).toContain("rebuilding");
+      expect(output).toContain("Docker image refresh complete");
+      expect(output).toContain(`Claimed job ${jobId}`);
+    } finally {
+      if (proc) {
+        await stopWorker(proc);
+      }
+      if (serverHandle) {
+        await serverHandle.close();
+      }
+      cleanupDockerArtifacts(dockerImage, workerId);
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  15 * 60_000,
 );

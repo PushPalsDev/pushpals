@@ -266,7 +266,7 @@ describe("workerpals docker executor internals", () => {
     expect(executor.activeJobs).toBe(0);
   });
 
-  test("rebuilds Docker image only for merge-conflict jobs", async () => {
+  test("prepares Docker image only for merge-conflict jobs and not inside execute", async () => {
     const executor = createExecutor() as unknown as {
       execute: (job: {
         id: string;
@@ -275,6 +275,20 @@ describe("workerpals docker executor internals", () => {
         params: Record<string, unknown>;
         sessionId: string;
       }) => Promise<{ ok: boolean; summary: string }>;
+      shouldPrepareMergeConflictJobBeforeExecution: (job: {
+        id: string;
+        taskId: string;
+        kind: string;
+        params: Record<string, unknown>;
+        sessionId: string;
+      }) => boolean;
+      prepareMergeConflictJobEnvironment: (job: {
+        id: string;
+        taskId: string;
+        kind: string;
+        params: Record<string, unknown>;
+        sessionId: string;
+      }) => Promise<void>;
       rebuildImageForMergeConflictJob: () => Promise<void>;
       resolveWorktreeBaseRefForJob: () => Promise<string>;
       createWorktree: () => Promise<void>;
@@ -295,7 +309,7 @@ describe("workerpals docker executor internals", () => {
     executor.removeWorktree = async () => {};
     executor.scheduleIdleShutdown = () => {};
 
-    const mergeConflictResult = await executor.execute({
+    const mergeConflictJob = {
       id: "job-merge",
       taskId: "task-merge",
       kind: "task.execute",
@@ -305,8 +319,10 @@ describe("workerpals docker executor internals", () => {
         },
       },
       sessionId: "dev",
-    });
-    expect(mergeConflictResult.ok).toBe(true);
+    };
+    expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(true);
+    await executor.prepareMergeConflictJobEnvironment(mergeConflictJob);
+    expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(false);
     expect(rebuildCalls).toBe(1);
 
     const regularResult = await executor.execute({
@@ -318,5 +334,10 @@ describe("workerpals docker executor internals", () => {
     });
     expect(regularResult.ok).toBe(true);
     expect(rebuildCalls).toBe(1);
+
+    const mergeConflictExecuteResult = await executor.execute(mergeConflictJob);
+    expect(mergeConflictExecuteResult.ok).toBe(true);
+    expect(rebuildCalls).toBe(1);
+    expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(true);
   });
 });

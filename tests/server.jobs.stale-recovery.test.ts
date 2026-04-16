@@ -106,6 +106,169 @@ describe("JobQueue stale recovery", () => {
     expect(queue.listWorkers()[0]?.currentJobId).toBe(first.jobId);
   });
 
+  test("deferred claimed jobs return to pending and stay pinned to the deferring worker", () => {
+    const queue = new JobQueue(":memory:");
+    const enqueue = queue.enqueue({
+      taskId: "task-deferred",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    expect(enqueue.ok).toBe(true);
+
+    const claim = queue.claim("worker-merge");
+    expect(claim.ok).toBe(true);
+    const jobId = claim.job!.id;
+
+    const deferred = queue.defer(jobId, {
+      workerId: "worker-merge",
+      deferMs: 120_000,
+    });
+    expect(deferred.ok).toBe(true);
+
+    const pending = queue.getJob(jobId);
+    expect(pending?.status).toBe("pending");
+    expect(pending?.workerId).toBeNull();
+    expect(pending?.targetWorkerId).toBe("worker-merge");
+    expect(typeof pending?.availableAt).toBe("string");
+
+    const wrongWorkerClaim = queue.claim("worker-other");
+    expect(wrongWorkerClaim.ok).toBe(false);
+
+    const rightWorkerClaim = queue.claim("worker-merge");
+    expect(rightWorkerClaim.ok).toBe(true);
+    expect(rightWorkerClaim.job?.id).toBe(jobId);
+  });
+
+  test("deferred jobs become claimable by another worker once the pinned worker is stale", () => {
+    const queue = new JobQueue(":memory:");
+    const enqueue = queue.enqueue({
+      taskId: "task-deferred-stale",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    expect(enqueue.ok).toBe(true);
+
+    const claim = queue.claim("worker-stale-target");
+    expect(claim.ok).toBe(true);
+    const jobId = claim.job!.id;
+    expect(
+      queue.defer(jobId, {
+        workerId: "worker-stale-target",
+        deferMs: 120_000,
+      }).ok,
+    ).toBe(true);
+
+    const db = (queue as unknown as { db: any }).db as any;
+    const staleIso = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
+      staleIso,
+      "worker-stale-target",
+    );
+
+    const claimByReplacement = queue.claim("worker-replacement");
+    expect(claimByReplacement.ok).toBe(true);
+    expect(claimByReplacement.job?.id).toBe(jobId);
+  });
+
+  test("deferring maintenance retargets the job to the worker performing the prep", () => {
+    const queue = new JobQueue(":memory:");
+    const enqueue = queue.enqueue({
+      taskId: "task-deferred-retarget",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+      targetWorkerId: "worker-original",
+    });
+    expect(enqueue.ok).toBe(true);
+
+    const db = (queue as unknown as { db: any }).db as any;
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO workers (workerId, status, currentJobId, pollMs, capabilities, details, lastHeartbeat, createdAt, updatedAt)
+       VALUES (?, 'idle', NULL, NULL, '{}', '{}', ?, ?, ?)`,
+    ).run("worker-original", now, now, now);
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
+      new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      "worker-original",
+    );
+
+    const claimByReplacement = queue.claim("worker-replacement");
+    expect(claimByReplacement.ok).toBe(true);
+    const jobId = claimByReplacement.job!.id;
+
+    const deferred = queue.defer(jobId, {
+      workerId: "worker-replacement",
+      deferMs: 120_000,
+    });
+    expect(deferred.ok).toBe(true);
+
+    const pending = queue.getJob(jobId);
+    expect(pending?.status).toBe("pending");
+    expect(pending?.targetWorkerId).toBe("worker-replacement");
+
+    const originalWorkerClaim = queue.claim("worker-original");
+    expect(originalWorkerClaim.ok).toBe(false);
+
+    const replacementClaim = queue.claim("worker-replacement");
+    expect(replacementClaim.ok).toBe(true);
+    expect(replacementClaim.job?.id).toBe(jobId);
+  });
+
+  test("generic fail does not allow failing pending deferred jobs", () => {
+    const queue = new JobQueue(":memory:");
+    const enqueue = queue.enqueue({
+      taskId: "task-deferred-fail-guard",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    expect(enqueue.ok).toBe(true);
+
+    const claim = queue.claim("worker-owner");
+    expect(claim.ok).toBe(true);
+    const jobId = claim.job!.id;
+    expect(queue.defer(jobId, { workerId: "worker-owner", deferMs: 60_000 }).ok).toBe(true);
+
+    const fail = queue.fail(jobId, {
+      message: "should not work",
+      detail: "pending jobs must not be failed generically",
+    });
+    expect(fail.ok).toBe(false);
+    expect(queue.getJob(jobId)?.status).toBe("pending");
+  });
+
+  test("failDeferred only allows the owning worker to fail a deferred job", () => {
+    const queue = new JobQueue(":memory:");
+    const enqueue = queue.enqueue({
+      taskId: "task-deferred-fail",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    expect(enqueue.ok).toBe(true);
+
+    const claim = queue.claim("worker-owner");
+    expect(claim.ok).toBe(true);
+    const jobId = claim.job!.id;
+    expect(queue.defer(jobId, { workerId: "worker-owner", deferMs: 60_000 }).ok).toBe(true);
+
+    const wrongWorkerFail = queue.failDeferred(jobId, {
+      workerId: "worker-other",
+      message: "nope",
+    });
+    expect(wrongWorkerFail.ok).toBe(false);
+    expect(queue.getJob(jobId)?.status).toBe("pending");
+
+    const rightWorkerFail = queue.failDeferred(jobId, {
+      workerId: "worker-owner",
+      message: "prep failed",
+    });
+    expect(rightWorkerFail.ok).toBe(true);
+    expect(queue.getJob(jobId)?.status).toBe("failed");
+  });
+
   test("recovers a claimed job when both heartbeat and log activity are stale", () => {
     const queue = new JobQueue(":memory:");
     const jobId = enqueueAndClaim(queue, "worker-b");

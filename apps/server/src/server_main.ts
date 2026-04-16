@@ -1673,6 +1673,38 @@ export function createRequestHandler() {
         return makeJson(result, result.ok ? 200 : 400);
       }
 
+      // POST /jobs/:id/fail-deferred
+      const jobFailDeferredMatch = pathname.match(/^\/jobs\/([^/]+)\/fail-deferred$/);
+      if (jobFailDeferredMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobFailDeferredMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = jobQueue.failDeferred(jobId, body);
+        if (result.ok) {
+          console.log(`[Server] Deferred job ${jobId} failed during pre-execution maintenance`);
+        }
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // POST /jobs/:id/defer
+      const jobDeferMatch = pathname.match(/^\/jobs\/([^/]+)\/defer$/);
+      if (jobDeferMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobDeferMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = jobQueue.defer(jobId, body);
+        if (result.ok) {
+          console.log(
+            `[Server] Job ${jobId} deferred until ${result.availableAt ?? "unknown"} by worker ${String(body.workerId ?? "unknown")}`,
+          );
+        }
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
       // POST /jobs/:id/log
       const jobLogMatch = pathname.match(/^\/jobs\/([^/]+)\/log$/);
       if (jobLogMatch && method === "POST") {

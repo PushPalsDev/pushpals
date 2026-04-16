@@ -965,6 +965,40 @@ async function failActiveJobOnShutdown(
   }
 }
 
+async function deferClaimedJobForMaintenance(
+  opts: ReturnType<typeof parseArgs>,
+  headers: Record<string, string>,
+  jobId: string,
+  deferMs: number,
+): Promise<{ ok: boolean; availableAt?: string; message?: string }> {
+  try {
+    const response = await postJsonWithTimeout(`${opts.server}/jobs/${jobId}/defer`, headers, {
+      workerId: opts.workerId,
+      deferMs,
+    });
+    const payload = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      availableAt?: string;
+      message?: string;
+    };
+    if (!response.ok || !payload.ok) {
+      return {
+        ok: false,
+        message: payload.message || `HTTP ${response.status}`,
+      };
+    }
+    return {
+      ok: true,
+      availableAt: payload.availableAt,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 async function workerLoop(
   opts: ReturnType<typeof parseArgs>,
   dockerExecutor: DockerExecutor | null,
@@ -1034,6 +1068,83 @@ async function workerLoop(
         const job = data.job;
 
         if (job) {
+          if (
+            dockerExecutor &&
+            dockerExecutor.shouldPrepareMergeConflictJobBeforeExecution(job)
+          ) {
+            const deferMs = dockerExecutor.recommendedMergeConflictDeferMs();
+            const deferred = await deferClaimedJobForMaintenance(opts, headers, job.id, deferMs);
+            if (!deferred.ok) {
+              console.warn(
+                `[WorkerPals] Failed to defer merge-conflict job ${job.id} for image refresh; falling back to claimed execution path: ${
+                  deferred.message || "unknown error"
+                }`,
+              );
+            } else {
+              console.log(
+                `[WorkerPals] Deferred merge-conflict job ${job.id} until ${
+                  deferred.availableAt ?? "maintenance complete"
+                } while refreshing Docker image outside claimed-job lifetime.`,
+              );
+              const maintenanceHeartbeat = setInterval(() => {
+                void transport.sendHeartbeat({
+                  ...buildHeartbeatPayload("idle", null),
+                  details: {
+                    repo: opts.repo,
+                    baseRef: opts.worktreeBaseRef,
+                    dockerImage: opts.docker ? opts.dockerImage : null,
+                    dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
+                    maintenance: "merge_conflict_image_refresh",
+                    deferredJobId: job.id,
+                  },
+                });
+              }, heartbeatEveryMs);
+              try {
+                await maybeHeartbeat("idle", null, true);
+                await dockerExecutor.prepareMergeConflictJobEnvironment(job);
+              } catch (error) {
+                const detail = redactSensitiveText(
+                  error instanceof Error ? error.stack || error.message : String(error),
+                );
+                console.error(
+                  `[WorkerPals] Merge-conflict environment preparation failed for ${job.id}: ${detail}`,
+                );
+                try {
+                  const failResponse = await postJsonWithTimeout(
+                    `${opts.server}/jobs/${job.id}/fail-deferred`,
+                    headers,
+                    {
+                      workerId: opts.workerId,
+                      message: "Merge-conflict environment preparation failed",
+                      detail,
+                    },
+                  );
+                  const failPayload = (await failResponse.json().catch(() => ({}))) as {
+                    ok?: boolean;
+                    message?: string;
+                  };
+                  if (!failResponse.ok || !failPayload.ok) {
+                    console.error(
+                      `[WorkerPals] Failed to mark deferred job ${job.id} as failed: ${
+                        failPayload.message || `HTTP ${failResponse.status}`
+                      }`,
+                    );
+                  }
+                } catch (failErr) {
+                  console.error(
+                    `[WorkerPals] Failed to mark deferred job ${job.id} as failed: ${
+                      failErr instanceof Error ? failErr.message : String(failErr)
+                    }`,
+                  );
+                }
+              } finally {
+                clearInterval(maintenanceHeartbeat);
+              }
+              await maybeHeartbeat("idle", null, true);
+              continue;
+            }
+          }
+
           runtimeState.currentJobId = job.id;
           runtimeState.currentSessionId = job.sessionId ?? null;
           console.log(`[WorkerPals] Claimed job ${job.id} (${job.kind})`);

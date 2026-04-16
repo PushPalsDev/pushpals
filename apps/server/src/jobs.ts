@@ -37,6 +37,7 @@ export interface JobRow {
   result: string | null;
   prUrl: string | null;
   error: string | null;
+  availableAt: string | null;
   enqueuedAt: string;
   claimedAt: string | null;
   startedAt: string | null;
@@ -315,6 +316,7 @@ export class JobQueue {
           result              TEXT,
           prUrl               TEXT,
           error               TEXT,
+          availableAt         TEXT,
           enqueuedAt          TEXT,
           claimedAt           TEXT,
           startedAt           TEXT,
@@ -421,12 +423,16 @@ export class JobQueue {
     if (!jobColumns.some((col) => col.name === "prUrl")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN prUrl TEXT;`);
     }
+    if (!jobColumns.some((col) => col.name === "availableAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN availableAt TEXT;`);
+    }
 
     // Column-dependent indexes are created after legacy column backfills complete.
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);`);
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`,
     );
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_available_at ON jobs(status, availableAt);`);
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_created ON jobs(dedupeKey, createdAt);`,
     );
@@ -510,12 +516,51 @@ export class JobQueue {
   }
 
   private pendingOrderedIds(targetWorkerId: string | null = null): string[] {
+    const now = new Date().toISOString();
+    const targetWorkerCutoff = new Date(Date.now() - PR_WORKER_ASSIGNMENT_MAX_AGE_MS).toISOString();
     if (targetWorkerId) {
       const rows = this.db
         .prepare(
           `SELECT id
            FROM jobs
-           WHERE status = 'pending' AND (targetWorkerId IS NULL OR targetWorkerId = ?)
+           WHERE status = 'pending'
+             AND (
+               targetWorkerId IS NULL
+               OR targetWorkerId = ?
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM workers tw
+                 WHERE tw.workerId = jobs.targetWorkerId
+                   AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND tw.lastHeartbeat >= ?
+               )
+             )
+             AND (
+               availableAt IS NULL
+               OR availableAt <= ?
+               OR targetWorkerId = ?
+               OR (
+                 targetWorkerId IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM workers tw
+                   WHERE tw.workerId = jobs.targetWorkerId
+                     AND COALESCE(tw.status, 'idle') <> 'offline'
+                     AND tw.lastHeartbeat >= ?
+                 )
+               )
+             )
+             AND (
+               targetWorkerId IS NULL
+               OR targetWorkerId = ?
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM workers tw
+                 WHERE tw.workerId = jobs.targetWorkerId
+                   AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND tw.lastHeartbeat >= ?
+               )
+             )
            ORDER BY
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
              CASE LOWER(priority)
@@ -526,7 +571,16 @@ export class JobQueue {
              END ASC,
              createdAt ASC`,
         )
-        .all(targetWorkerId, targetWorkerId) as Array<{ id: string }>;
+        .all(
+          targetWorkerId,
+          targetWorkerCutoff,
+          now,
+          targetWorkerId,
+          targetWorkerCutoff,
+          targetWorkerId,
+          targetWorkerCutoff,
+          targetWorkerId,
+        ) as Array<{ id: string }>;
       return rows.map((row) => row.id);
     }
 
@@ -535,6 +589,30 @@ export class JobQueue {
         `SELECT id
          FROM jobs
          WHERE status = 'pending'
+           AND (
+             availableAt IS NULL
+             OR availableAt <= ?
+             OR (
+               targetWorkerId IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM workers tw
+                 WHERE tw.workerId = jobs.targetWorkerId
+                   AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND tw.lastHeartbeat >= ?
+               )
+             )
+           )
+           AND (
+             targetWorkerId IS NULL
+             OR NOT EXISTS (
+               SELECT 1
+               FROM workers tw
+               WHERE tw.workerId = jobs.targetWorkerId
+                 AND COALESCE(tw.status, 'idle') <> 'offline'
+                 AND tw.lastHeartbeat >= ?
+             )
+           )
          ORDER BY
            CASE LOWER(priority)
              WHEN 'interactive' THEN 0
@@ -544,7 +622,7 @@ export class JobQueue {
            END ASC,
            createdAt ASC`,
       )
-      .all() as Array<{ id: string }>;
+      .all(now, targetWorkerCutoff, targetWorkerCutoff) as Array<{ id: string }>;
     return rows.map((row) => row.id);
   }
 
@@ -737,6 +815,7 @@ export class JobQueue {
   } {
     const workerId = workerIdRaw.trim() || "unknown";
     const now = new Date().toISOString();
+    const targetWorkerCutoff = new Date(Date.now() - PR_WORKER_ASSIGNMENT_MAX_AGE_MS).toISOString();
 
     const tx = this.db.transaction(() => {
       this.db
@@ -781,7 +860,43 @@ export class JobQueue {
         .prepare(
           `SELECT * FROM jobs
            WHERE status = 'pending'
-             AND (targetWorkerId IS NULL OR targetWorkerId = ?)
+             AND (
+               targetWorkerId IS NULL
+               OR targetWorkerId = ?
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM workers tw
+                 WHERE tw.workerId = jobs.targetWorkerId
+                   AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND tw.lastHeartbeat >= ?
+               )
+             )
+             AND (
+               availableAt IS NULL
+               OR availableAt <= ?
+               OR targetWorkerId = ?
+               OR (
+                 targetWorkerId IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM workers tw
+                   WHERE tw.workerId = jobs.targetWorkerId
+                     AND COALESCE(tw.status, 'idle') <> 'offline'
+                     AND tw.lastHeartbeat >= ?
+                 )
+               )
+             )
+             AND (
+               targetWorkerId IS NULL
+               OR targetWorkerId = ?
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM workers tw
+                 WHERE tw.workerId = jobs.targetWorkerId
+                   AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND tw.lastHeartbeat >= ?
+               )
+             )
            ORDER BY
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
              CASE LOWER(priority)
@@ -793,7 +908,16 @@ export class JobQueue {
              createdAt ASC
            LIMIT 1`,
         )
-        .get(workerId, workerId) as JobRow | undefined;
+        .get(
+          workerId,
+          targetWorkerCutoff,
+          now,
+          workerId,
+          targetWorkerCutoff,
+          workerId,
+          targetWorkerCutoff,
+          workerId,
+        ) as JobRow | undefined;
 
       if (!row) {
         this.db
@@ -812,6 +936,7 @@ export class JobQueue {
                workerId = ?,
                claimedAt = ?,
                startedAt = COALESCE(startedAt, ?),
+               availableAt = NULL,
                failedAt = NULL,
                completedAt = NULL,
                durationMs = NULL,
@@ -1025,6 +1150,7 @@ export class JobQueue {
          SET status = 'failed',
              error = ?,
              failedAt = ?,
+             availableAt = NULL,
              completedAt = NULL,
              durationMs = MAX(
                0,
@@ -1055,6 +1181,81 @@ export class JobQueue {
       durationMs: failed?.durationMs ?? undefined,
       failedAt: failed?.failedAt ?? undefined,
     };
+  }
+
+  defer(
+    jobId: string,
+    body: Record<string, unknown>,
+  ): { ok: boolean; message?: string; availableAt?: string } {
+    const workerId = String(body.workerId ?? "").trim();
+    if (!workerId) {
+      return { ok: false, message: "workerId is required" };
+    }
+    const now = new Date().toISOString();
+    const deferMsRaw = Number.parseInt(String(body.deferMs ?? ""), 10);
+    const deferMs = Number.isFinite(deferMsRaw) ? Math.max(1_000, Math.min(deferMsRaw, 30 * 60_000)) : 60_000;
+    const availableAt = new Date(Date.now() + deferMs).toISOString();
+
+    const info = this.db
+      .prepare(
+        `UPDATE jobs
+         SET status = 'pending',
+             workerId = NULL,
+             targetWorkerId = ?,
+             claimedAt = NULL,
+             startedAt = NULL,
+             firstLogAt = NULL,
+             availableAt = ?,
+             updatedAt = ?
+         WHERE id = ?
+           AND status = 'claimed'
+           AND workerId = ?`,
+      )
+      .run(workerId, availableAt, now, jobId, workerId);
+
+    if (info.changes === 0) {
+      return { ok: false, message: "Job not found, not claimed, or not owned by worker" };
+    }
+
+    this.setWorkerIdleIfNoClaimedJobs(workerId, now);
+    return { ok: true, availableAt };
+  }
+
+  failDeferred(
+    jobId: string,
+    body: Record<string, unknown>,
+  ): { ok: boolean; message?: string; failedAt?: string } {
+    const workerId = String(body.workerId ?? "").trim();
+    if (!workerId) {
+      return { ok: false, message: "workerId is required" };
+    }
+    const now = new Date().toISOString();
+    const message = String(body.message ?? "Unknown error");
+    const detail = body.detail == null ? null : String(body.detail);
+
+    const info = this.db
+      .prepare(
+        `UPDATE jobs
+         SET status = 'failed',
+             error = ?,
+             failedAt = ?,
+             availableAt = NULL,
+             targetWorkerId = NULL,
+             completedAt = NULL,
+             durationMs = NULL,
+             updatedAt = ?
+         WHERE id = ?
+           AND status = 'pending'
+           AND targetWorkerId = ?
+           AND availableAt IS NOT NULL`,
+      )
+      .run(JSON.stringify({ message, detail }), now, now, jobId, workerId);
+
+    if (info.changes === 0) {
+      return { ok: false, message: "Deferred job not found or not owned by worker" };
+    }
+
+    return { ok: true, failedAt: now };
   }
 
   recoverStaleClaimedJobs(staleAfterMs: number, limit = 100): RecoveredStaleJob[] {

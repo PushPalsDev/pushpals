@@ -240,6 +240,7 @@ export class DockerExecutor {
   private lastLoggedExecutionConfig = "";
   private lastLoggedEndpointRewrite = "";
   private warmedBackends = new Set<string>();
+  private preparedMergeConflictJobs = new Set<string>();
   private mergeConflictRefreshPromise: Promise<void> | null = null;
   private readonly config: WorkerpalsRuntimeConfig;
 
@@ -318,7 +319,6 @@ export class DockerExecutor {
     const worktreePath = resolve(this.worktreeDir, worktreeName);
 
     try {
-      await this.ensureFreshImageForMergeConflictJob(job, onLog);
       const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog);
       // Step 1: Create isolated git worktree
       await this.createWorktree(worktreePath, worktreeBaseRef);
@@ -398,6 +398,7 @@ export class DockerExecutor {
         stderr: `Retries exhausted after ${this.jobRetryMaxAttempts} attempts`,
       };
     } finally {
+      this.preparedMergeConflictJobs.delete(job.id);
       this.activeJobs = Math.max(0, this.activeJobs - 1);
       // Step 4: Clean up worktree (always cleanup)
       await this.removeWorktree(worktreePath).catch((err) => {
@@ -1688,6 +1689,22 @@ export class DockerExecutor {
         ? reviewAgent.resolutionType.trim().toLowerCase()
         : "";
     return resolutionType === "merge_conflict";
+  }
+
+  shouldPrepareMergeConflictJobBeforeExecution(job: Job): boolean {
+    return this.isMergeConflictResolutionJob(job) && !this.preparedMergeConflictJobs.has(job.id);
+  }
+
+  async prepareMergeConflictJobEnvironment(
+    job: Job,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<void> {
+    await this.ensureFreshImageForMergeConflictJob(job, onLog);
+    this.preparedMergeConflictJobs.add(job.id);
+  }
+
+  recommendedMergeConflictDeferMs(): number {
+    return Math.max(60_000, Math.min(this.options.timeoutMs, 5 * 60_000));
   }
 
   private async ensureFreshImageForMergeConflictJob(
