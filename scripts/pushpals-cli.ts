@@ -1766,7 +1766,7 @@ function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
           stderr: "ignore",
         });
       } else {
-        service.proc.kill();
+        service.proc.kill("SIGKILL");
       }
     } catch {
       // ignore

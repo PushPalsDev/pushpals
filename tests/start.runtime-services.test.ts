@@ -149,4 +149,37 @@ describe("start runtime service helpers", () => {
       manager.stop();
     }
   });
+
+  test("ServiceManager stop force-kills managed services on Unix", () => {
+    if (process.platform === "win32") return;
+    let killSignal: string | undefined;
+    const manager = new ServiceManager({
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: {
+          pid: 123,
+          kill: (signal?: string) => {
+            killSignal = signal;
+          },
+        } as any,
+        command: [...spec.command],
+        cwd: spec.cwd,
+        env: { ...(spec.env ?? {}) },
+        exited: false,
+        exitCode: null,
+        launchedAtMs: Date.now(),
+        logPath: spec.logPath,
+      }),
+    });
+
+    manager.startService({
+      name: "workerpals",
+      color: "yellow",
+      command: ["fake-workerpals"],
+      cwd: process.cwd(),
+    });
+    manager.stop();
+
+    expect(killSignal).toBe("SIGKILL");
+  });
 });
