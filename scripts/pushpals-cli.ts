@@ -636,6 +636,7 @@ async function runCommandWithEnv(
   command: string[],
   cwd: string,
   env: Record<string, string | undefined>,
+  timeoutMs?: number,
 ): Promise<CommandResult> {
   try {
     const proc = Bun.spawn(command, {
@@ -644,12 +645,49 @@ async function runCommandWithEnv(
       stdout: "pipe",
       stderr: "pipe",
     });
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        try {
+          const stopCommand = buildServiceStopCommand(proc.pid, process.platform);
+          if (stopCommand) {
+            Bun.spawnSync(stopCommand, {
+              stdin: "ignore",
+              stdout: "ignore",
+              stderr: "ignore",
+            });
+          } else {
+            proc.kill("SIGKILL");
+          }
+        } catch {
+          // best-effort timeout termination only
+        }
+      }, timeoutMs);
+    }
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
-    return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+    if (timer) clearTimeout(timer);
+    const normalizedStdout = stdout.trim();
+    const normalizedStderr = stderr.trim();
+    if (timedOut) {
+      return {
+        ok: false,
+        stdout: normalizedStdout,
+        stderr: `timed out after ${timeoutMs}ms${normalizedStderr ? ` | ${normalizedStderr}` : ""}`,
+        exitCode,
+      };
+    }
+    return {
+      ok: exitCode === 0,
+      stdout: normalizedStdout,
+      stderr: normalizedStderr,
+      exitCode,
+    };
   } catch (err) {
     return {
       ok: false,
@@ -2170,8 +2208,13 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
   env: Record<string, string>;
   platform?: NodeJS.Platform;
   runCommandWithEnvFn?: typeof runCommandWithEnv;
+  commandTimeoutMs?: number;
 }): Promise<{ ok: boolean; detail: string; removed: number }> {
   const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
+  const commandTimeoutMs =
+    typeof opts.commandTimeoutMs === "number" && Number.isFinite(opts.commandTimeoutMs)
+      ? Math.max(1, Math.floor(opts.commandTimeoutMs))
+      : 5_000;
   const dockerExecutable = resolveConfiguredDockerExecutable(
     opts.env,
     opts.platform ?? process.platform,
@@ -2188,6 +2231,7 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
     ],
     opts.repoRoot,
     opts.env,
+    commandTimeoutMs,
   );
   if (!list.ok) {
     const detail = list.stderr || list.stdout || `exit ${list.exitCode}`;
@@ -2214,6 +2258,7 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
     [dockerExecutable, "rm", "-f", ...containerIds],
     opts.repoRoot,
     opts.env,
+    commandTimeoutMs,
   );
   if (!remove.ok) {
     const detail = remove.stderr || remove.stdout || `exit ${remove.exitCode}`;
@@ -2235,13 +2280,19 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
   env: Record<string, string>;
   runCommandWithEnvFn?: typeof runCommandWithEnv;
   forceDeleteWorktreePathFn?: typeof forceDeleteWorktreePath;
+  commandTimeoutMs?: number;
 }): Promise<{ ok: boolean; detail: string; removed: number }> {
   const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
   const forceDeleteWorktreePathFn = opts.forceDeleteWorktreePathFn ?? forceDeleteWorktreePath;
+  const commandTimeoutMs =
+    typeof opts.commandTimeoutMs === "number" && Number.isFinite(opts.commandTimeoutMs)
+      ? Math.max(1, Math.floor(opts.commandTimeoutMs))
+      : 5_000;
   const list = await runCommandWithEnvFn(
     ["git", "worktree", "list", "--porcelain"],
     opts.repoRoot,
     opts.env,
+    commandTimeoutMs,
   );
   if (!list.ok) {
     const detail = list.stderr || list.stdout || `exit ${list.exitCode}`;
@@ -2269,6 +2320,7 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
       ["git", "worktree", "remove", "--force", "--force", entry.path],
       opts.repoRoot,
       opts.env,
+      commandTimeoutMs,
     );
     if (remove.ok) {
       removed += 1;
@@ -2285,7 +2337,12 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
     );
   }
 
-  const prune = await runCommandWithEnvFn(["git", "worktree", "prune"], opts.repoRoot, opts.env);
+  const prune = await runCommandWithEnvFn(
+    ["git", "worktree", "prune"],
+    opts.repoRoot,
+    opts.env,
+    commandTimeoutMs,
+  );
   if (!prune.ok) {
     failures.push(`prune: ${prune.stderr || prune.stdout || `exit ${prune.exitCode}`}`);
   }
@@ -2299,6 +2356,7 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
     ],
     opts.repoRoot,
     opts.env,
+    commandTimeoutMs,
   );
   if (!deleteTempBranches.ok) {
     failures.push(
@@ -2314,6 +2372,7 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
         ["git", "branch", "-D", branch],
         opts.repoRoot,
         opts.env,
+        commandTimeoutMs,
       );
       if (!deleteResult.ok) {
         failures.push(

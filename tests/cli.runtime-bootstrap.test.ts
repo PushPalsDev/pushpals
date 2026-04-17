@@ -1778,6 +1778,86 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
   });
 
+  test("cleanupLingeringPushPalsGitWorktrees propagates bounded command timeouts", async () => {
+    const calls: Array<{ command: string[]; cwd: string; timeoutMs?: number }> = [];
+    const result = await cleanupLingeringPushPalsGitWorktrees({
+      repoRoot: "/repo/example",
+      env: {},
+      commandTimeoutMs: 4321,
+      runCommandWithEnvFn: async (command, cwd, _env, timeoutMs) => {
+        calls.push({ command, cwd, timeoutMs });
+        if (command[2] === "list") {
+          return {
+            ok: true,
+            stdout: [
+              "worktree /repo/example",
+              "HEAD abcdef1234567890",
+              "branch refs/heads/main",
+              "",
+              "worktree /repo/example/.worktrees/job-123-workerpal-abcd-1",
+              "HEAD feedface12345678",
+              "detached",
+            ].join("\n"),
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command[2] === "remove") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        if (command[2] === "prune") {
+          return {
+            ok: false,
+            stdout: "",
+            stderr: "timed out after 4321ms",
+            exitCode: 137,
+          };
+        }
+        if (command[1] === "for-each-ref") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        throw new Error(`unexpected command: ${command.join(" ")}`);
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("timed out after 4321ms");
+    expect(calls).toEqual([
+      {
+        command: ["git", "worktree", "list", "--porcelain"],
+        cwd: "/repo/example",
+        timeoutMs: 4321,
+      },
+      {
+        command: [
+          "git",
+          "worktree",
+          "remove",
+          "--force",
+          "--force",
+          "/repo/example/.worktrees/job-123-workerpal-abcd-1",
+        ],
+        cwd: "/repo/example",
+        timeoutMs: 4321,
+      },
+      {
+        command: ["git", "worktree", "prune"],
+        cwd: "/repo/example",
+        timeoutMs: 4321,
+      },
+      {
+        command: [
+          "git",
+          "for-each-ref",
+          "--format=%(refname:short)",
+          "refs/heads/_source_control_manager/",
+        ],
+        cwd: "/repo/example",
+        timeoutMs: 4321,
+      },
+    ]);
+  });
+
   test("downloadRuntimeAssetsFromSourceTag skips bun.lockb and populates sandbox assets", async () => {
     const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-download-"));
     const originalFetch = globalThis.fetch;
