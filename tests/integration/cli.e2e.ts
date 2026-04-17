@@ -27,15 +27,28 @@ type BuildArtifacts = {
   cliPath: string;
   runtimeBinaryDir: string;
   platformKey: string;
+  dockerImage: string;
 };
 
 let buildArtifactsPromise: Promise<BuildArtifacts> | null = null;
+const sharedDockerImageTag = `pushpals-worker-sandbox:cli-e2e-shared-${Date.now()}`;
+let sharedDockerImageBuilt = false;
 
 process.on("exit", () => {
   try {
     rmSync(buildCacheRoot, { recursive: true, force: true });
   } catch {
     // best-effort temp cleanup only
+  }
+  if (sharedDockerImageBuilt) {
+    try {
+      Bun.spawnSync(["docker", "image", "rm", "-f", sharedDockerImageTag], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+    } catch {
+      // best-effort cleanup only
+    }
   }
 });
 
@@ -105,6 +118,12 @@ async function ensureBuildArtifacts(): Promise<BuildArtifacts> {
       repoRoot,
       process.env as Record<string, string>,
     );
+    runChecked(
+      ["docker", "build", "-f", "apps/workerpals/Dockerfile.sandbox", "-t", sharedDockerImageTag, "."],
+      repoRoot,
+      process.env as Record<string, string>,
+    );
+    sharedDockerImageBuilt = true;
 
     const target = resolveRuntimeTarget();
     const cacheDir = join(buildCacheRoot, target.platformKey);
@@ -148,6 +167,7 @@ async function ensureBuildArtifacts(): Promise<BuildArtifacts> {
       cliPath: packagedCliPath,
       runtimeBinaryDir: cacheDir,
       platformKey: target.platformKey,
+      dockerImage: sharedDockerImageTag,
     };
   })();
   return await buildArtifactsPromise;
@@ -473,13 +493,12 @@ describe("packaged CLI end-to-end", () => {
     async () => {
       const artifacts = await ensureBuildArtifacts();
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-"));
-      const dockerImage = `pushpals-worker-sandbox:cli-e2e-${Date.now()}`;
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {
         const { repoPath } = initializeTempRepo(root);
         const runtimeRoot = join(root, "runtime");
         const portBase = await findAvailablePortBlock();
-        prepareRuntimeRoot(runtimeRoot, artifacts, dockerImage, portBase);
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase);
 
         proc = Bun.spawn(
           [
@@ -532,12 +551,6 @@ describe("packaged CLI end-to-end", () => {
           } catch {}
         }
         try {
-          Bun.spawnSync(["docker", "image", "rm", "-f", dockerImage], {
-            stdout: "ignore",
-            stderr: "ignore",
-          });
-        } catch {}
-        try {
           await removeTreeWithRetries(root);
         } catch (err) {
           console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
@@ -552,14 +565,13 @@ describe("packaged CLI end-to-end", () => {
     async () => {
       const artifacts = await ensureBuildArtifacts();
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-docker-fail-"));
-      const dockerImage = `pushpals-worker-sandbox:cli-e2e-fail-${Date.now()}`;
       const failingDockerPath = await createFailingDockerExecutable(root);
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {
         const { repoPath } = initializeTempRepo(root);
         const runtimeRoot = join(root, "runtime");
         const portBase = await findAvailablePortBlock();
-        prepareRuntimeRoot(runtimeRoot, artifacts, dockerImage, portBase);
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase);
 
         proc = Bun.spawn(
           [
@@ -619,13 +631,12 @@ describe("packaged CLI end-to-end", () => {
     async () => {
       const artifacts = await ensureBuildArtifacts();
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-supervisor-"));
-      const dockerImage = `pushpals-worker-sandbox:cli-e2e-supervisor-${Date.now()}`;
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {
         const { repoPath } = initializeTempRepo(root);
         const runtimeRoot = join(root, "runtime");
         const portBase = await findAvailablePortBlock();
-        prepareRuntimeRoot(runtimeRoot, artifacts, dockerImage, portBase);
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase);
 
         proc = Bun.spawn(
           [
@@ -689,12 +700,6 @@ describe("packaged CLI end-to-end", () => {
             proc.kill();
           } catch {}
         }
-        try {
-          Bun.spawnSync(["docker", "image", "rm", "-f", dockerImage], {
-            stdout: "ignore",
-            stderr: "ignore",
-          });
-        } catch {}
         try {
           await removeTreeWithRetries(root);
         } catch (err) {
