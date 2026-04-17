@@ -5020,7 +5020,7 @@ async function main(): Promise<void> {
   rl = createInterface({
     input: process.stdin,
     output: process.stdout,
-    terminal: true,
+    terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
   });
   rl.setPrompt("you> ");
   rl.prompt();
