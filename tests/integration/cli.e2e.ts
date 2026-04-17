@@ -358,6 +358,32 @@ async function waitForExitWithTimeout(
   }
 }
 
+function startTextCapture(
+  stream: ReadableStream<Uint8Array> | null | undefined,
+): { promise: Promise<string>; getSnapshot: () => string } {
+  let buffer = "";
+  const promise = (async () => {
+    if (!stream) return buffer;
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) buffer += decoder.decode(value, { stream: true });
+      }
+      buffer += decoder.decode();
+      return buffer;
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+  return {
+    promise,
+    getSnapshot: () => buffer,
+  };
+}
+
 async function removeTreeWithRetries(path: string, attempts = 8): Promise<void> {
   let lastError: unknown = null;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -518,12 +544,16 @@ describe("packaged CLI end-to-end", () => {
           },
         );
 
+        const stdoutCapture = startTextCapture(proc.stdout);
+        const stderrCapture = startTextCapture(proc.stderr);
+        const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
+        await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
         proc.stdin.write("/status\nquit\n");
         proc.stdin.end();
 
         const [stdout, stderr, exitCode] = await Promise.all([
-          new Response(proc.stdout).text(),
-          new Response(proc.stderr).text(),
+          stdoutCapture.promise,
+          stderrCapture.promise,
           waitForExitWithTimeout(proc, 15 * 60_000),
         ]);
         const combined = `${stdout}\n${stderr}`;
@@ -593,9 +623,11 @@ describe("packaged CLI end-to-end", () => {
           },
         );
 
+        const stdoutCapture = startTextCapture(proc.stdout);
+        const stderrCapture = startTextCapture(proc.stderr);
         const [stdout, stderr, exitCode] = await Promise.all([
-          new Response(proc.stdout).text(),
-          new Response(proc.stderr).text(),
+          stdoutCapture.promise,
+          stderrCapture.promise,
           waitForExitWithTimeout(proc, 5 * 60_000),
         ]);
         const combined = `${stdout}\n${stderr}`;
@@ -656,6 +688,8 @@ describe("packaged CLI end-to-end", () => {
           },
         );
 
+        const stdoutCapture = startTextCapture(proc.stdout);
+        const stderrCapture = startTextCapture(proc.stderr);
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
         await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
 
@@ -682,8 +716,8 @@ describe("packaged CLI end-to-end", () => {
         proc.stdin.end();
 
         const [stdout, stderr, exitCode] = await Promise.all([
-          new Response(proc.stdout).text(),
-          new Response(proc.stderr).text(),
+          stdoutCapture.promise,
+          stderrCapture.promise,
           waitForExitWithTimeout(proc, 15 * 60_000),
         ]);
         const combined = `${stdout}\n${stderr}`;
