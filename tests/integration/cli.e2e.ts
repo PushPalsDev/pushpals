@@ -336,9 +336,16 @@ async function createFailingDockerExecutable(root: string): Promise<string> {
   return outputPath;
 }
 
+function summarizeCapturedOutput(text: string, maxChars = 16_000): string {
+  const normalized = text.trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `...[truncated]...\n${normalized.slice(-maxChars)}`;
+}
+
 async function waitForExitWithTimeout(
   proc: ReturnType<typeof Bun.spawn>,
   timeoutMs: number,
+  getCapturedOutput?: () => string,
 ): Promise<number> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
@@ -349,7 +356,9 @@ async function waitForExitWithTimeout(
           try {
             proc.kill();
           } catch {}
-          reject(new Error(`CLI E2E timed out after ${timeoutMs}ms`));
+          const captured = summarizeCapturedOutput(getCapturedOutput?.() ?? "");
+          const suffix = captured ? `\nCaptured output:\n${captured}` : "";
+          reject(new Error(`CLI E2E timed out after ${timeoutMs}ms${suffix}`));
         }, timeoutMs);
       }),
     ]);
@@ -382,6 +391,27 @@ function startTextCapture(
     promise,
     getSnapshot: () => buffer,
   };
+}
+
+async function waitForCapturedOutput(
+  getSnapshot: () => string,
+  predicate: (text: string) => boolean,
+  timeoutMs: number,
+  label: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate(getSnapshot())) return;
+    await Bun.sleep(100);
+  }
+  throw new Error(
+    `Timed out waiting for captured output: ${label}\n${summarizeCapturedOutput(getSnapshot())}`,
+  );
+}
+
+function countMatches(text: string, pattern: RegExp): number {
+  const matches = text.match(pattern);
+  return matches ? matches.length : 0;
 }
 
 async function removeTreeWithRetries(path: string, attempts = 8): Promise<void> {
@@ -530,6 +560,7 @@ describe("packaged CLI end-to-end", () => {
           [
             process.execPath,
             artifacts.cliPath,
+            "--status-once",
             "--runtime-root",
             runtimeRoot,
             "--runtime-tag",
@@ -537,7 +568,7 @@ describe("packaged CLI end-to-end", () => {
           ],
           {
             cwd: repoPath,
-            stdin: "pipe",
+            stdin: "ignore",
             stdout: "pipe",
             stderr: "pipe",
             env: buildCliE2EEnv(),
@@ -548,13 +579,15 @@ describe("packaged CLI end-to-end", () => {
         const stderrCapture = startTextCapture(proc.stderr);
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
         await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
-        proc.stdin.write("/status\nquit\n");
-        proc.stdin.end();
 
         const [stdout, stderr, exitCode] = await Promise.all([
           stdoutCapture.promise,
           stderrCapture.promise,
-          waitForExitWithTimeout(proc, 15 * 60_000),
+          waitForExitWithTimeout(
+            proc,
+            15 * 60_000,
+            () => `${stdoutCapture.getSnapshot()}\n${stderrCapture.getSnapshot()}`,
+          ),
         ]);
         const combined = `${stdout}\n${stderr}`;
 
@@ -564,9 +597,7 @@ describe("packaged CLI end-to-end", () => {
         expect(combined).toContain("[pushpals] startup timing summary: outcome=ready");
         expect(combined).toContain("[pushpals] Embedded runtime is ready.");
         expect(combined).toContain("[pushpals] Connected.");
-        expect(combined).toContain(
-          "[pushpals] Type a message and press Enter. Use /exit or exit to quit.",
-        );
+        expect(combined).toContain("[pushpals] Shutting down CLI session...");
         expect(
           (combined.match(/\[pushpals\] workerExecution=/g) ?? []).length,
         ).toBeGreaterThanOrEqual(2);
@@ -663,17 +694,19 @@ describe("packaged CLI end-to-end", () => {
     async () => {
       const artifacts = await ensureBuildArtifacts();
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-supervisor-"));
-      let proc: ReturnType<typeof Bun.spawn> | null = null;
+      let runtimeProc: ReturnType<typeof Bun.spawn> | null = null;
+      let statusProc: ReturnType<typeof Bun.spawn> | null = null;
       try {
         const { repoPath } = initializeTempRepo(root);
         const runtimeRoot = join(root, "runtime");
         const portBase = await findAvailablePortBlock();
         prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase);
 
-        proc = Bun.spawn(
+        runtimeProc = Bun.spawn(
           [
             process.execPath,
             artifacts.cliPath,
+            "--runtime-only",
             "--runtime-root",
             runtimeRoot,
             "--runtime-tag",
@@ -688,8 +721,8 @@ describe("packaged CLI end-to-end", () => {
           },
         );
 
-        const stdoutCapture = startTextCapture(proc.stdout);
-        const stderrCapture = startTextCapture(proc.stderr);
+        const runtimeStdoutCapture = startTextCapture(runtimeProc.stdout);
+        const runtimeStderrCapture = startTextCapture(runtimeProc.stderr);
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
         await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
 
@@ -712,13 +745,36 @@ describe("packaged CLI end-to-end", () => {
           60_000,
         );
 
-        proc.stdin.write("/status\nquit\n");
-        proc.stdin.end();
+        statusProc = Bun.spawn(
+          [
+            process.execPath,
+            artifacts.cliPath,
+            "--status-once",
+            "--no-auto-start",
+            "--server-url",
+            `http://127.0.0.1:${portBase}`,
+            "--session-id",
+            "dev",
+          ],
+          {
+            cwd: repoPath,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            env: buildCliE2EEnv(),
+          },
+        );
 
+        const statusStdoutCapture = startTextCapture(statusProc.stdout);
+        const statusStderrCapture = startTextCapture(statusProc.stderr);
         const [stdout, stderr, exitCode] = await Promise.all([
-          stdoutCapture.promise,
-          stderrCapture.promise,
-          waitForExitWithTimeout(proc, 15 * 60_000),
+          statusStdoutCapture.promise,
+          statusStderrCapture.promise,
+          waitForExitWithTimeout(
+            statusProc,
+            10 * 60_000,
+            () => `${statusStdoutCapture.getSnapshot()}\n${statusStderrCapture.getSnapshot()}`,
+          ),
         ]);
         const combined = `${stdout}\n${stderr}`;
 
@@ -726,12 +782,30 @@ describe("packaged CLI end-to-end", () => {
           throw new Error(`CLI E2E exited ${exitCode}\n${combined}`);
         }
         expect(combined).toContain("[pushpals] Connected.");
-        expect(combined).toContain("[pushpals] Embedded runtime is ready.");
+        expect(combined).toContain(`[pushpals] serverUrl=http://127.0.0.1:${portBase}`);
+        expect(combined).toContain("[pushpals] Shutting down CLI session...");
+        expect(combined).toContain("[pushpals] workerExecution=");
         expect(combined).not.toContain("[pushpals] Fatal:");
+
+        runtimeProc.stdin.end();
+        await Promise.all([
+          runtimeStdoutCapture.promise,
+          runtimeStderrCapture.promise,
+          waitForExitWithTimeout(
+            runtimeProc,
+            10 * 60_000,
+            () => `${runtimeStdoutCapture.getSnapshot()}\n${runtimeStderrCapture.getSnapshot()}`,
+          ),
+        ]);
       } finally {
-        if (proc) {
+        if (statusProc) {
           try {
-            proc.kill();
+            statusProc.kill();
+          } catch {}
+        }
+        if (runtimeProc) {
+          try {
+            runtimeProc.kill();
           } catch {}
         }
         try {

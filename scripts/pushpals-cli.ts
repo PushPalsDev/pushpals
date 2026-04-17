@@ -42,6 +42,7 @@ type CliOptions = {
   noAutoStart: boolean;
   noStream: boolean;
   runtimeOnly: boolean;
+  statusOnce: boolean;
   clear: boolean;
 };
 
@@ -503,6 +504,7 @@ function printUsage(): void {
   console.log(
     "  --runtime-only         Start the local runtime and wait for shutdown without opening the interactive chat",
   );
+  console.log("  --status-once          Print active endpoints once and exit");
   console.log("  --clear                Remove repo-local PushPals state and exit");
   console.log("  -h, --help             Show this help");
   console.log("");
@@ -525,6 +527,7 @@ function parseArgs(argv: string[]): CliOptions | null {
     noAutoStart: false,
     noStream: false,
     runtimeOnly: false,
+    statusOnce: false,
     clear: false,
   };
 
@@ -544,6 +547,10 @@ function parseArgs(argv: string[]): CliOptions | null {
     }
     if (arg === "--runtime-only") {
       options.runtimeOnly = true;
+      continue;
+    }
+    if (arg === "--status-once") {
+      options.statusOnce = true;
       continue;
     }
     if (arg === "--clear") {
@@ -4943,7 +4950,7 @@ async function main(): Promise<void> {
 
   const streamTask = parsed.noStream
     ? Promise.resolve()
-    : parsed.runtimeOnly
+    : parsed.runtimeOnly || parsed.statusOnce
       ? Promise.resolve()
       : runSessionStream(serverUrl, activeSessionId, cliClient, printIncoming, streamAbort.signal);
 
@@ -5017,6 +5024,27 @@ async function main(): Promise<void> {
     return;
   }
 
+  const printStatusSnapshot = async (): Promise<void> => {
+    console.log(`[pushpals] serverUrl=${serverUrl}`);
+    console.log(`[pushpals] sessionId=${activeSessionId}`);
+    console.log(`[pushpals] repoRoot=${repoRoot}`);
+    console.log(`[pushpals] pushpalsLog=${pushpalsLogPath ?? "unavailable"}`);
+    console.log(
+      monitoringHubUrl
+        ? `[pushpals] monitoringHubUrl=${monitoringHubUrl}`
+        : "[pushpals] monitoringHubUrl=unavailable",
+    );
+    await reportWorkerExecutionReadiness();
+    reportEmbeddedRuntimeHealth();
+  };
+
+  if (parsed.statusOnce) {
+    await printStatusSnapshot();
+    await requestStop();
+    await Promise.race([streamTask, Bun.sleep(2_000)]);
+    return;
+  }
+
   rl = createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -5045,17 +5073,7 @@ async function main(): Promise<void> {
       continue;
     }
     if (text === "/status") {
-      console.log(`[pushpals] serverUrl=${serverUrl}`);
-      console.log(`[pushpals] sessionId=${activeSessionId}`);
-      console.log(`[pushpals] repoRoot=${repoRoot}`);
-      console.log(`[pushpals] pushpalsLog=${pushpalsLogPath ?? "unavailable"}`);
-      console.log(
-        monitoringHubUrl
-          ? `[pushpals] monitoringHubUrl=${monitoringHubUrl}`
-          : "[pushpals] monitoringHubUrl=unavailable",
-      );
-      await reportWorkerExecutionReadiness();
-      reportEmbeddedRuntimeHealth();
+      await printStatusSnapshot();
       rl.prompt();
       continue;
     }
