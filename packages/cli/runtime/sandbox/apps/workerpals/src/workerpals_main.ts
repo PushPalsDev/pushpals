@@ -39,6 +39,7 @@ import {
   git,
   redactSensitiveText,
   resolveReviewNoChangeCompletionBranch,
+  shouldEnqueueNoChangeReviewCompletion,
   type JobResult,
 } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
@@ -852,6 +853,19 @@ async function resolveReReviewNoChangeCommit(
   return null;
 }
 
+function failNoChangeReviewFixJob(jobId: string, result: WorkerJobResult): WorkerJobResult {
+  return {
+    ...result,
+    ok: false,
+    summary:
+      `Rejected review-fix job ${jobId} produced no code changes; refusing unchanged branch re-review.`,
+    stderr: [result.stderr, "Apply at least one concrete fix before requesting another review."]
+      .filter(Boolean)
+      .join("\n"),
+    exitCode: typeof result.exitCode === "number" ? result.exitCode : 4,
+  };
+}
+
 async function enqueueCompletion(
   server: string,
   headers: Record<string, string>,
@@ -1289,6 +1303,11 @@ async function workerLoop(
               if (result.commit) {
                 if (result.commit.sha !== "no-changes") {
                   completionCommit = result.commit;
+                } else if (!shouldEnqueueNoChangeReviewCompletion(parsedParams)) {
+                  console.warn(
+                    `[WorkerPals] Job ${job.id} produced no code changes for a rejected review-fix request; marking the job failed instead of enqueueing unchanged branch re-review.`,
+                  );
+                  result = failNoChangeReviewFixJob(job.id, result);
                 } else {
                   const reReviewCommit = await resolveReReviewNoChangeCommit(
                     executionRepo,
@@ -1336,6 +1355,11 @@ async function workerLoop(
                       branch: commitResult.branch,
                       sha: commitResult.sha,
                     };
+                  } else if (!shouldEnqueueNoChangeReviewCompletion(parsedParams)) {
+                    console.warn(
+                      `[WorkerPals] Job ${job.id} produced no staged review-fix changes; marking the job failed instead of enqueueing unchanged branch re-review.`,
+                    );
+                    result = failNoChangeReviewFixJob(job.id, result);
                   }
                 } else if (commitResult.error) {
                   console.error(`[WorkerPals] Failed to create commit: ${commitResult.error}`);

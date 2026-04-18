@@ -730,11 +730,11 @@ export function deriveFixWriteGlobsFromDiff(diff: string): string[] {
   return [...globs].slice(0, 16);
 }
 
-function deriveMergeConflictTargetPathsFromDiff(diff: string): string[] {
+function deriveReviewTaskTargetPathsFromDiff(diff: string): string[] {
   return parseChangedPathsFromDiff(diff).slice(0, 24);
 }
 
-function deriveMergeConflictLikelyDirs(paths: string[]): string[] {
+function deriveReviewTaskLikelyDirs(paths: string[]): string[] {
   const dirs = new Set<string>();
   for (const path of paths) {
     const normalized = path.replace(/\\/g, "/");
@@ -746,7 +746,7 @@ function deriveMergeConflictLikelyDirs(paths: string[]): string[] {
   return [...dirs];
 }
 
-function deriveMergeConflictValidationSteps(paths: string[]): string[] {
+function deriveReviewTaskValidationSteps(paths: string[]): string[] {
   const targeted = paths
     .filter(
       (path) =>
@@ -755,6 +755,48 @@ function deriveMergeConflictValidationSteps(paths: string[]): string[] {
     .slice(0, 4)
     .map((path) => `bun test ${path}`);
   return targeted.length > 0 ? targeted : ["bun test"];
+}
+
+function buildReviewFixPlannerWorkerInstruction(options: {
+  prNumber: number;
+  prUrl: string;
+  prHeadRef: string;
+  prBaseRef: string;
+  reviewScore: number;
+  reviewThreshold: number;
+  reviewerFindings: string[];
+  changedPaths: string[];
+  feedbackHighlights: string[];
+}): string {
+  const lines = [
+    "Rejected PR revision brief:",
+    `- PR: #${options.prNumber} (${options.prUrl})`,
+    `- Existing PR branch: ${options.prHeadRef}`,
+    `- Base branch: ${options.prBaseRef}`,
+    `- Previous ReviewAgent score: ${options.reviewScore.toFixed(1)} / 10`,
+    `- Required approval threshold: ${options.reviewThreshold.toFixed(1)} / 10`,
+    `- Minimum score improvement needed: +${Math.max(0, options.reviewThreshold - options.reviewScore).toFixed(1)}`,
+    `- Push target after fixes: ${options.prHeadRef} (update the existing PR branch only).`,
+  ];
+  if (options.reviewerFindings.length > 0) {
+    lines.push("- Current reviewer must-fix items:");
+    for (const finding of options.reviewerFindings.slice(0, 6)) {
+      lines.push(`  - ${finding}`);
+    }
+  }
+  if (options.changedPaths.length > 0) {
+    lines.push(`- Candidate changed paths from the current PR: ${options.changedPaths.join(", ")}`);
+  }
+  if (options.feedbackHighlights.length > 0) {
+    lines.push("- Recent reviewer comment excerpts:");
+    for (const item of options.feedbackHighlights.slice(0, 4)) {
+      lines.push(`  - ${item}`);
+    }
+  }
+  lines.push(
+    "- Keep the patch focused on the rejected areas, preserve already accepted behavior, and prefer targeted validation before broader test runs.",
+  );
+  return lines.join("\n").slice(0, 6000);
 }
 
 function buildMergeConflictPlannerWorkerInstruction(options: {
@@ -1568,18 +1610,41 @@ export class ReviewAgent {
     prefetchedComments?: PullRequestComment[],
   ): Promise<boolean> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
-    const rejectionReasoning = deriveReviewGuidance(verdict).items;
+    const reviewGuidance = deriveReviewGuidance(verdict);
+    const rejectionReasoning = reviewGuidance.items;
     const issuesSummary =
       rejectionReasoning.length > 0 ? rejectionReasoning.join("; ") : "see summary";
     const fixInstruction =
       verdict.fix_instruction.trim() || buildFallbackFixInstruction(pr, verdict);
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
+    const changedPaths = deriveReviewTaskTargetPathsFromDiff(diff);
+    const likelyDirs = deriveReviewTaskLikelyDirs(changedPaths);
+    const validationSteps = deriveReviewTaskValidationSteps(changedPaths);
     const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
     const feedbackContext = await this.getRecentFeedbackContext(
       pr,
       excludedBodies,
       prefetchedComments,
     );
+    const feedbackHighlights = feedbackContext
+      .filter((line) => line.trim().startsWith("- "))
+      .map((line) => line.trim().replace(/^- /, ""))
+      .slice(0, 4);
+    const plannerWorkerInstruction = buildReviewFixPlannerWorkerInstruction({
+      prNumber: pr.number,
+      prUrl: pr.html_url,
+      prHeadRef: prHeadRef ?? pr.head.ref,
+      prBaseRef: pr.base.ref,
+      reviewScore: verdict.score,
+      reviewThreshold: this.config.passThreshold,
+      reviewerFindings: rejectionReasoning,
+      changedPaths,
+      feedbackHighlights,
+    });
+    const discoveryKeywords = [...new Set([...rejectionReasoning, ...feedbackHighlights])]
+      .map((entry) => truncateText(collapseWhitespace(entry), 180))
+      .filter(Boolean)
+      .slice(0, 8);
 
     const payload = {
       taskId,
@@ -1592,6 +1657,7 @@ export class ReviewAgent {
         schemaVersion: 2,
         origin: "autonomy",
         instruction: fixInstruction,
+        plannerWorkerInstruction,
         recentContext: [
           loadPromptTemplate("review_agent/fix_job_intro_line.md", {
             pr_number: String(pr.number),
@@ -1599,22 +1665,30 @@ export class ReviewAgent {
             pr_head_ref: String(pr.head?.ref ?? ""),
           }),
           "The branch already exists on the remote. Checkout the branch, make required fixes, and push.",
+          `Raise this PR from ${verdict.score.toFixed(1)}/10 to at least ${this.config.passThreshold.toFixed(1)}/10 without reopening already accepted behavior.`,
           `Reviewer score was ${verdict.score.toFixed(1)}/10. Issues: ${issuesSummary}`,
           ...feedbackContext,
         ],
         planning: {
           intent: "code_change",
           riskLevel: "medium",
+          ...(changedPaths.length > 0 ? { targetPaths: changedPaths } : {}),
           acceptanceCriteria: [
             `Reviewer scores >= ${this.config.passThreshold}/10`,
+            "Address the latest reviewer must-fix items without regressing accepted behavior",
             "All relevant tests pass",
           ],
-          validationSteps: ["bun test"],
+          validationSteps,
           queuePriority: "normal",
           queueWaitBudgetMs: 90_000,
           executionBudgetMs: 1_800_000,
           finalizationBudgetMs: 120_000,
           scope: { readAnywhere: true, writeAllowed: true, writeGlobs },
+          discovery: {
+            ripgrepQueries: [...changedPaths.slice(0, 6), ...rejectionReasoning.slice(0, 2)],
+            likelyDirs,
+            keywords: discoveryKeywords,
+          },
         },
         completionBranch: prHeadRef ?? undefined,
         reviewAgent: {
@@ -1623,8 +1697,12 @@ export class ReviewAgent {
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
           prHeadRef: prHeadRef ?? pr.head.ref,
           prBaseRef: pr.base.ref,
+          resolutionType: "review_fix",
           previousReviewScore: verdict.score,
+          reviewThreshold: this.config.passThreshold,
           previousReviewSummary: verdict.summary,
+          reviewerFindings: rejectionReasoning.slice(0, 8),
+          reviewerFindingsSource: reviewGuidance.source,
           rejectedAt: new Date().toISOString(),
           sourceJobId: jobId,
         },
@@ -1668,6 +1746,8 @@ export class ReviewAgent {
             pr,
             verdict,
             headers,
+            taskDescription: `Raise PR #${pr.number} from ${verdict.score.toFixed(1)}/10 to >= ${this.config.passThreshold.toFixed(1)}/10 on the existing branch.`,
+            taskTags: ["review-agent", "review-fix"],
           });
         } catch (emitErr: any) {
           this.deps.logWarn(
@@ -1704,9 +1784,9 @@ export class ReviewAgent {
   ): Promise<boolean> {
     const taskId = `review-merge-conflict-pr${pr.number}-${this.deps.now()}`;
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
-    const changedPaths = deriveMergeConflictTargetPathsFromDiff(diff);
-    const likelyDirs = deriveMergeConflictLikelyDirs(changedPaths);
-    const validationSteps = deriveMergeConflictValidationSteps(changedPaths);
+    const changedPaths = deriveReviewTaskTargetPathsFromDiff(diff);
+    const likelyDirs = deriveReviewTaskLikelyDirs(changedPaths);
+    const validationSteps = deriveReviewTaskValidationSteps(changedPaths);
     const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
     const mergeErrorSummary = truncateText(
       collapseWhitespace(

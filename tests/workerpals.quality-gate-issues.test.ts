@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
 } from "../apps/workerpals/src/execute_job";
@@ -82,5 +83,38 @@ describe("workerpals quality gate critic issue formatting", () => {
       "Critic must-fix: Add negative-path assertions for the updated behavior.",
       "Critic revision guidance: Fix the failing test command, then add the missing negative-path assertion coverage.",
     ]);
+  });
+
+  test("includes prior review-fix requirements in quality revision hints", () => {
+    const hint = buildQualityRevisionHint(
+      ["Validation commands were executed but none passed."],
+      null,
+      {
+        intent: "code_change",
+        riskLevel: "medium",
+        scope: { readAnywhere: true, writeAllowed: true },
+        acceptanceCriteria: ["Reviewer scores >= 8.5/10", "All relevant tests pass"],
+        validationSteps: ["bun test tests/api/review.test.ts"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      {
+        resolutionType: "review_fix",
+        prHeadRef: "agent/workerpal-1/job-xyz",
+        prBaseRef: "main",
+        previousReviewScore: 7.8,
+        reviewThreshold: 8.5,
+        previousReviewSummary: "Tests need stronger failure-path coverage",
+        reviewerFindings: ["Add negative-path assertions"],
+      },
+    );
+
+    expect(hint).toContain("Rejected PR retry requirements:");
+    expect(hint).toContain("Previous ReviewAgent score: 7.8 / 10");
+    expect(hint).toContain("Required approval threshold: 8.5 / 10");
+    expect(hint).toContain("Previous reviewer must-fix items:");
+    expect(hint).toContain("- Add negative-path assertions");
   });
 });

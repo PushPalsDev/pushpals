@@ -81,6 +81,23 @@ interface CriticReview {
   raw: string;
 }
 
+export interface ReviewFixContext {
+  resolutionType: "review_fix";
+  prHeadRef: string | null;
+  prBaseRef: string | null;
+  previousReviewScore: number | null;
+  reviewThreshold: number | null;
+  previousReviewSummary: string;
+  reviewerFindings: string[];
+}
+
+export interface QualityGatePolicy {
+  mode: "default" | "review_fix";
+  maxAutoRevisions: number;
+  softPassOnExhausted: boolean;
+  criticMinScore: number;
+}
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 export function shouldCommit(
@@ -222,6 +239,102 @@ export function resolveReviewNoChangeCompletionBranch(
   const candidate = params.completionBranch ?? reviewAgentHeadRef;
   const resolved = resolveReviewFixCompletionBranch(candidate, "");
   return resolved.overridden ? resolved.branch : null;
+}
+
+function toFiniteReviewScore(value: unknown): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, Math.min(10, parsed));
+}
+
+function toNonEmptyReviewStringArray(value: unknown, limit: number = 8): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => String(entry ?? "").trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+export function extractReviewFixContext(
+  params: Record<string, unknown> | null | undefined,
+): ReviewFixContext | null {
+  if (!params || typeof params !== "object" || Array.isArray(params)) return null;
+  const reviewAgent =
+    params.reviewAgent &&
+    typeof params.reviewAgent === "object" &&
+    !Array.isArray(params.reviewAgent)
+      ? (params.reviewAgent as Record<string, unknown>)
+      : null;
+  if (!reviewAgent) return null;
+  const resolutionType = String(reviewAgent.resolutionType ?? "")
+    .trim()
+    .toLowerCase();
+  if (resolutionType === "merge_conflict") return null;
+  const looksLikeLegacyReviewFix =
+    typeof reviewAgent.prHeadRef === "string" ||
+    typeof reviewAgent.previousReviewSummary === "string" ||
+    Number.isFinite(Number(reviewAgent.previousReviewScore)) ||
+    Array.isArray(reviewAgent.reviewerFindings);
+  if (resolutionType && resolutionType !== "review_fix") return null;
+  if (!resolutionType && !looksLikeLegacyReviewFix) return null;
+  return {
+    resolutionType: "review_fix",
+    prHeadRef: typeof reviewAgent.prHeadRef === "string" ? reviewAgent.prHeadRef.trim() || null : null,
+    prBaseRef: typeof reviewAgent.prBaseRef === "string" ? reviewAgent.prBaseRef.trim() || null : null,
+    previousReviewScore: toFiniteReviewScore(reviewAgent.previousReviewScore),
+    reviewThreshold: toFiniteReviewScore(reviewAgent.reviewThreshold),
+    previousReviewSummary: String(reviewAgent.previousReviewSummary ?? "").trim(),
+    reviewerFindings: toNonEmptyReviewStringArray(reviewAgent.reviewerFindings),
+  };
+}
+
+export function shouldEnqueueNoChangeReviewCompletion(
+  params: Record<string, unknown> | null | undefined,
+): boolean {
+  return extractReviewFixContext(params) == null;
+}
+
+export function deriveQualityGatePolicy(
+  params: Record<string, unknown> | null | undefined,
+  runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
+): QualityGatePolicy {
+  const baseMaxAutoRevisions = Math.max(
+    0,
+    Math.min(
+      10,
+      Number.isFinite(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
+        ? Math.floor(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
+        : 4,
+    ),
+  );
+  const baseSoftPassOnExhausted =
+    typeof runtimeConfig.workerpals.qualitySoftPassOnExhausted === "boolean"
+      ? runtimeConfig.workerpals.qualitySoftPassOnExhausted
+      : true;
+  const baseCriticMinScore = (() => {
+    const value = Number(runtimeConfig.workerpals.qualityCriticMinScore);
+    if (!Number.isFinite(value)) return 8;
+    return Math.max(0, Math.min(10, value));
+  })();
+  const reviewFix = extractReviewFixContext(params);
+  if (!reviewFix) {
+    return {
+      mode: "default",
+      maxAutoRevisions: baseMaxAutoRevisions,
+      softPassOnExhausted: baseSoftPassOnExhausted,
+      criticMinScore: baseCriticMinScore,
+    };
+  }
+  const tightenedCriticMinScore =
+    reviewFix.reviewThreshold != null
+      ? Math.max(baseCriticMinScore, Math.max(0, Math.min(10, reviewFix.reviewThreshold - 0.2)))
+      : baseCriticMinScore;
+  return {
+    mode: "review_fix",
+    maxAutoRevisions: Math.max(baseMaxAutoRevisions, 2),
+    softPassOnExhausted: false,
+    criticMinScore: tightenedCriticMinScore,
+  };
 }
 
 function normalizeChatCompletionsEndpoint(endpoint: string): string {
@@ -908,13 +1021,39 @@ async function runTaskCriticReview(
   }
 }
 
-function buildQualityRevisionHint(
+export function buildQualityRevisionHint(
   issues: string[],
   critic: CriticReview | null,
   planning: TaskExecutePlanning,
+  reviewFixContext?: ReviewFixContext | null,
 ): string {
   const lines: string[] = [];
   lines.push("Quality revision required before completion.");
+  if (reviewFixContext) {
+    lines.push("Rejected PR retry requirements:");
+    if (reviewFixContext.previousReviewScore != null) {
+      lines.push(
+        `Previous ReviewAgent score: ${reviewFixContext.previousReviewScore.toFixed(1)} / 10`,
+      );
+    }
+    if (reviewFixContext.reviewThreshold != null) {
+      lines.push(
+        `Required approval threshold: ${reviewFixContext.reviewThreshold.toFixed(1)} / 10`,
+      );
+    }
+    if (reviewFixContext.previousReviewSummary) {
+      lines.push(
+        `Previous reviewer summary: ${toSingleLine(reviewFixContext.previousReviewSummary, 220)}`,
+      );
+    }
+    if (reviewFixContext.reviewerFindings.length > 0) {
+      lines.push("Previous reviewer must-fix items:");
+      for (const finding of reviewFixContext.reviewerFindings.slice(0, 5)) {
+        lines.push(`- ${finding}`);
+      }
+    }
+    lines.push("Raise the score above the approval threshold without reopening already accepted behavior.");
+  }
   if (issues.length > 0) {
     lines.push("Deterministic quality issues:");
     for (const issue of issues) lines.push(`- ${issue}`);
@@ -3201,29 +3340,30 @@ export async function executeJob(
   };
   const executionBudgetMs = Number(planning.executionBudgetMs);
   const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
-  const qualityMaxAutoRevisions = Math.max(
-    0,
-    Math.min(
-      10,
-      Number.isFinite(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
-        ? Math.floor(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
-        : 4,
-    ),
-  );
-  const qualitySoftPassOnExhausted =
-    typeof runtimeConfig.workerpals.qualitySoftPassOnExhausted === "boolean"
-      ? runtimeConfig.workerpals.qualitySoftPassOnExhausted
-      : true;
-  const qualityCriticMinScore = (() => {
-    const value = Number(runtimeConfig.workerpals.qualityCriticMinScore);
-    if (!Number.isFinite(value)) return 8;
-    return Math.max(0, Math.min(10, value));
-  })();
+  const reviewFixContext = extractReviewFixContext(normalizedParams);
+  const qualityGatePolicy = deriveQualityGatePolicy(normalizedParams, runtimeConfig);
+  const qualityMaxAutoRevisions = qualityGatePolicy.maxAutoRevisions;
+  const qualitySoftPassOnExhausted = qualityGatePolicy.softPassOnExhausted;
+  const qualityCriticMinScore = qualityGatePolicy.criticMinScore;
 
   onLog?.(
     "stdout",
     `[QualityGate] Policy: max_auto_revisions=${qualityMaxAutoRevisions}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}, critic_min_score=${qualityCriticMinScore}`,
   );
+  if (qualityGatePolicy.mode === "review_fix") {
+    const priorScore =
+      reviewFixContext?.previousReviewScore != null
+        ? reviewFixContext.previousReviewScore.toFixed(1)
+        : "unknown";
+    const threshold =
+      reviewFixContext?.reviewThreshold != null
+        ? reviewFixContext.reviewThreshold.toFixed(1)
+        : qualityCriticMinScore.toFixed(1);
+    onLog?.(
+      "stdout",
+      `[QualityGate] review_fix override active: prior_score=${priorScore}, target_threshold=${threshold}, soft_pass_on_exhausted=false.`,
+    );
+  }
 
   let revisionAttempt = 0;
   let revisionHint = "";
@@ -3320,7 +3460,7 @@ export async function executeJob(
     }
 
     revisionAttempt += 1;
-    revisionHint = buildQualityRevisionHint(issues, critic, planning);
+    revisionHint = buildQualityRevisionHint(issues, critic, planning, reviewFixContext);
     onLog?.(
       "stderr",
       `[QualityGate] Quality gate requested revision ${revisionAttempt}/${qualityMaxAutoRevisions}: ${toSingleLine(
