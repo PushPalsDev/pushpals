@@ -1,17 +1,17 @@
-﻿# PushPals CLI Release Log
+# PushPals CLI Release Log
 
 ## Release Metadata
 
-- version: `v1.0.40`
-- start_commit: `60f3bdf9fc0d7d04583c55b13c6d376dc39d74ca`
-- end_commit: `a09ed11fb10395e52f8739967bfc1688c4187b34`
-- commits_in_range: `1`
+- version: `v1.0.41`
+- start_commit: `d3822d4eab19688ce8378db63c147f588f5892d2`
+- end_commit: `6fcf92dc5084d84c052dbd371d53ae336f75f622`
+- commits_in_range: `8`
 
 ## Highlights
 
-- Move merge-conflict Docker image refresh out of claimed-job lifetime by deferring the job, performing maintenance under idle heartbeats, and reclaiming only after the environment is ready.
-- Retarget deferred maintenance jobs to the worker actually performing prep, add guarded deferred-failure handling, and prevent reclaim races when the original worker comes back.
-- Add real-Docker integration coverage for the full `claim -> defer -> rebuild -> reclaim -> execute` WorkerPal flow so the merge-conflict path is pinned down end to end.
+- Fix packaged CLI shutdown on Unix by preserving graceful embedded runtime shutdown ordering so RemoteBuddy can clean up auto-spawned WorkerPals before the CLI falls back to force-stop.
+- Harden packaged CLI Linux E2E coverage with bounded cleanup, drained child output, non-TTY-safe interaction, and a dedicated supervisor restart/status probe path.
+- Improve embedded runtime reliability by stabilizing WorkerPal control-plane behavior and reusing the shared Docker image across the CLI E2E suite for faster, less flaky runs.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.40 && git push origin v1.0.40`.
+- Tag and push: `git tag v1.0.41 && git push origin v1.0.41`.
