@@ -51,6 +51,7 @@ import {
   resolveCliStatePath,
   resolveCommandPath,
   repoLooksLikePushPalsSourceCheckout,
+  shutdownEmbeddedServiceManagerGracefully,
   shouldRunEmbeddedRuntimeStartupPrechecks,
   resolvePreferredRuntimeReleaseTag,
   resolveWindowsShellExecutableCandidatesForEnv,
@@ -79,6 +80,31 @@ function createMonitorAssetFixture(prefix: string) {
     "utf8",
   );
   return { root, assetRoot };
+}
+
+const testOnUnix = process.platform === "win32" ? test.skip : test;
+
+function isPidAlive(pid: number | null | undefined): boolean {
+  if (!Number.isFinite(pid ?? Number.NaN) || (pid ?? 0) <= 0) return false;
+  try {
+    process.kill(pid as number, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs: number,
+  message: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await Bun.sleep(50);
+  }
+  throw new Error(message);
 }
 
 describe("pushpals CLI runtime bootstrap helpers", () => {
@@ -293,6 +319,105 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  testOnUnix(
+    "shutdownEmbeddedServiceManagerGracefully preserves SIGTERM cleanup for managed descendants",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-shutdown-"));
+      let supervisor: ServiceManager | null = null;
+      let parentPid: number | null = null;
+      let childPid: number | null = null;
+      try {
+        const childScriptPath = join(root, "worker-child.ts");
+        const parentScriptPath = join(root, "remotebuddy-parent.ts");
+        writeFileSync(
+          childScriptPath,
+          ["process.on('SIGTERM', () => process.exit(0));", "setInterval(() => {}, 1000);"].join(
+            "\n",
+          ),
+          "utf8",
+        );
+        writeFileSync(
+          parentScriptPath,
+          [
+            `const child = Bun.spawn([process.execPath, ${JSON.stringify(childScriptPath)}], {`,
+            "  stdin: 'ignore',",
+            "  stdout: 'inherit',",
+            "  stderr: 'inherit',",
+            "});",
+            "console.log(`CHILD_PID=${child.pid ?? ''}`);",
+            "process.on('SIGTERM', () => {",
+            "  try {",
+            "    child.kill('SIGTERM');",
+            "  } catch {}",
+            "  setTimeout(() => process.exit(0), 0);",
+            "});",
+            "setInterval(() => {}, 1000);",
+          ].join("\n"),
+          "utf8",
+        );
+
+        supervisor = new ServiceManager({
+          pollMs: 50,
+          maxRestartAttempts: 1,
+        });
+        const service = supervisor.startService({
+          name: "remotebuddy",
+          color: "",
+          command: [process.execPath, parentScriptPath],
+          cwd: root,
+          env: { ...process.env } as Record<string, string>,
+          onStdoutLine: (line) => {
+            const match = /CHILD_PID=(\d+)/.exec(line);
+            if (match) {
+              childPid = Number.parseInt(match[1] ?? "", 10);
+            }
+          },
+        });
+        parentPid = service.proc.pid ?? null;
+
+        await waitForCondition(
+          () => isPidAlive(parentPid) && isPidAlive(childPid),
+          5_000,
+          "Expected managed parent and inherited child processes to start.",
+        );
+
+        await shutdownEmbeddedServiceManagerGracefully({
+          serviceManager: supervisor,
+          serverUrl: "http://127.0.0.1:0",
+          repoRoot: root,
+          reason: "unit test shutdown",
+          requestShutdown: async () => ({ attempted: false, accepted: false }),
+          shutdownAcceptedDelayMs: 0,
+          onLog: () => {},
+          onWarn: () => {},
+        });
+
+        await waitForCondition(
+          () => !isPidAlive(parentPid) && !isPidAlive(childPid),
+          5_000,
+          "Expected graceful embedded shutdown to terminate managed descendants.",
+        );
+      } finally {
+        if (isPidAlive(childPid)) {
+          try {
+            process.kill(childPid as number, "SIGKILL");
+          } catch {
+            // best-effort cleanup only
+          }
+        }
+        if (isPidAlive(parentPid)) {
+          try {
+            process.kill(parentPid as number, "SIGKILL");
+          } catch {
+            // best-effort cleanup only
+          }
+        }
+        supervisor?.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("resolveEmbeddedBunExecutableFromEnv finds bun on PATH for standalone CLI binaries", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-bun-path-"));

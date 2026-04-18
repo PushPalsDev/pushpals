@@ -1835,6 +1835,59 @@ async function stopRuntimeServicesGracefully(
   }
 }
 
+type LocalRuntimeShutdownAttempt = {
+  attempted: boolean;
+  accepted: boolean;
+  detail?: string;
+};
+
+export async function shutdownEmbeddedServiceManagerGracefully(options: {
+  serviceManager: ServiceManager;
+  serverUrl: string;
+  repoRoot: string;
+  reason: string;
+  requestShutdown?: (
+    serverUrl: string,
+    repoRoot: string,
+    reason: string,
+  ) => Promise<LocalRuntimeShutdownAttempt>;
+  shutdownAcceptedDelayMs?: number;
+  onLog?: (line: string) => void;
+  onWarn?: (line: string) => void;
+  cleanupTasks?: Array<() => Promise<void> | void>;
+}): Promise<void> {
+  const {
+    serviceManager,
+    serverUrl,
+    repoRoot,
+    reason,
+    requestShutdown = requestLocalRuntimeShutdown,
+    shutdownAcceptedDelayMs = 1_500,
+    onLog = (line) => console.log(line),
+    onWarn = (line) => console.warn(line),
+    cleanupTasks = [],
+  } = options;
+
+  serviceManager.beginShutdown();
+  const services = serviceManager.getServices();
+  const shutdown = await requestShutdown(serverUrl, repoRoot, reason);
+  if (shutdown.attempted && shutdown.accepted) {
+    onLog("[pushpals] Local runtime shutdown accepted; waiting for services to exit...");
+    await Bun.sleep(Math.max(0, shutdownAcceptedDelayMs));
+  } else if (shutdown.attempted) {
+    onWarn(
+      `[pushpals] Local runtime shutdown request was not accepted${shutdown.detail ? `: ${shutdown.detail}` : "."}`,
+    );
+  } else if (shutdown.detail) {
+    onWarn(`[pushpals] ${shutdown.detail}`);
+  }
+
+  await stopRuntimeServicesGracefully(services);
+  for (const task of cleanupTasks) {
+    await task();
+  }
+}
+
 function prependExecutableDirToPath(
   env: Record<string, string>,
   executablePath: string,
@@ -4766,23 +4819,16 @@ async function main(): Promise<void> {
     if (!autoStartedServiceManager) return;
     const serviceManager = autoStartedServiceManager;
     autoStartedServiceManager = null;
-    serviceManager.beginShutdown();
-    const shutdown = await requestLocalRuntimeShutdown(serverUrl, repoRoot, reason);
-    if (shutdown.attempted && shutdown.accepted) {
-      console.log("[pushpals] Local runtime shutdown accepted; waiting for services to exit...");
-      await Bun.sleep(1_500);
-    } else if (shutdown.attempted) {
-      console.warn(
-        `[pushpals] Local runtime shutdown request was not accepted${shutdown.detail ? `: ${shutdown.detail}` : "."}`,
-      );
-    } else if (shutdown.detail) {
-      console.warn(`[pushpals] ${shutdown.detail}`);
-    }
-    serviceManager.stop();
-    const services = serviceManager.getServices();
-    await stopRuntimeServicesGracefully(services);
-    await cleanupWorkerpalWarmContainersIfNeeded("cli shutdown");
-    await cleanupPushPalsGitWorktreesIfNeeded("cli shutdown");
+    await shutdownEmbeddedServiceManagerGracefully({
+      serviceManager,
+      serverUrl,
+      repoRoot,
+      reason,
+      cleanupTasks: [
+        () => cleanupWorkerpalWarmContainersIfNeeded("cli shutdown"),
+        () => cleanupPushPalsGitWorktreesIfNeeded("cli shutdown"),
+      ],
+    });
   };
 
   if (!serverHealthy && workerpalDockerPrecheck.status === "failed") {
