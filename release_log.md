@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.41`
-- start_commit: `d3822d4eab19688ce8378db63c147f588f5892d2`
-- end_commit: `6fcf92dc5084d84c052dbd371d53ae336f75f622`
-- commits_in_range: `8`
+- version: `v1.0.42`
+- start_commit: `2a7b1b0da2779500913c6ae3c1c79868caebc240`
+- end_commit: `d82ee7d5f3d9feb26fa172c49c5b4dee7d6b2a79`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Fix packaged CLI shutdown on Unix by preserving graceful embedded runtime shutdown ordering so RemoteBuddy can clean up auto-spawned WorkerPals before the CLI falls back to force-stop.
-- Harden packaged CLI Linux E2E coverage with bounded cleanup, drained child output, non-TTY-safe interaction, and a dedicated supervisor restart/status probe path.
-- Improve embedded runtime reliability by stabilizing WorkerPal control-plane behavior and reusing the shared Docker image across the CLI E2E suite for faster, less flaky runs.
+- Isolate merge-conflict repair work inside a WorkerPal sandbox clone so rebases and force-pushes update the PR branch without switching or mutating the user's active checkout.
+- Specialize rejected ReviewAgent follow-up jobs with `review_fix` metadata, targeted validation, focused planner guidance, and stricter local quality gating so retries are more surgical and more likely to clear the approval threshold in one pass.
+- Prevent wasted re-review churn by failing rejected review-fix retries that produce no code changes instead of re-enqueueing an unchanged branch for another ReviewAgent pass.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.41 && git push origin v1.0.41`.
+- Tag and push: `git tag v1.0.42 && git push origin v1.0.42`.
