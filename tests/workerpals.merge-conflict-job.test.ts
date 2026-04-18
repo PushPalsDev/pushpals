@@ -1,0 +1,263 @@
+import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { createJobCommit } from "../apps/workerpals/src/execute_job";
+import { prepareMergeConflictTaskRepo } from "../apps/workerpals/src/merge_conflict_job";
+import { loadPushPalsConfig } from "shared";
+
+function isGitSpawnPermissionDenied(error: unknown): boolean {
+  const code = String((error as { code?: unknown } | null)?.code ?? "")
+    .trim()
+    .toUpperCase();
+  const message = String((error as { message?: unknown } | null)?.message ?? "")
+    .trim()
+    .toLowerCase();
+  return (
+    code === "EPERM" &&
+    message.includes("uv_spawn") &&
+    (message.includes("'git'") || message.includes('"git"'))
+  );
+}
+
+async function shouldSkipForGitSpawnPermission(): Promise<boolean> {
+  try {
+    const probe = await git(process.cwd(), ["--version"]);
+    return !probe.ok && probe.stderr.toLowerCase().includes("eperm");
+  } catch (error) {
+    if (isGitSpawnPermissionDenied(error)) return true;
+    throw error;
+  }
+}
+
+async function git(
+  cwd: string,
+  args: string[],
+): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(["git", ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return {
+    ok: exitCode === 0,
+    stdout: stdout.trim(),
+    stderr: stderr.trim(),
+  };
+}
+
+async function mustGit(cwd: string, args: string[], label: string): Promise<string> {
+  const result = await git(cwd, args);
+  if (!result.ok) {
+    throw new Error(`${label} failed: git ${args.join(" ")}\n${result.stderr || result.stdout}`);
+  }
+  return result.stdout;
+}
+
+type ConflictFixture = {
+  root: string;
+  remote: string;
+  sourceRepo: string;
+  publicBranch: string;
+  baseBranch: string;
+  prHeadSha: string;
+  conflictFile: string;
+  params: Record<string, unknown>;
+};
+
+async function createConflictFixture(): Promise<ConflictFixture> {
+  const root = mkdtempSync(join(tmpdir(), "pushpals-merge-conflict-job-"));
+  const remote = join(root, "remote.git");
+  const maintainer = join(root, "maintainer");
+  const sourceRepo = join(root, "source");
+  const publicBranch = "agent/test-branch";
+  const baseBranch = "main";
+  const conflictFile = "apps/client/src/conflict.tsx";
+
+  await mustGit(root, ["init", "--bare", remote], "init bare remote");
+  await mustGit(root, ["clone", remote, maintainer], "clone maintainer");
+  await mustGit(root, ["clone", remote, sourceRepo], "clone source repo");
+
+  for (const repo of [maintainer, sourceRepo]) {
+    await mustGit(repo, ["config", "user.name", "PushPals Test"], "set user.name");
+    await mustGit(repo, ["config", "user.email", "pushpals-test@example.com"], "set user.email");
+  }
+
+  await mustGit(maintainer, ["checkout", "-B", baseBranch], "checkout main");
+  mkdirSync(join(maintainer, "apps", "client", "src"), { recursive: true });
+  writeFileSync(join(maintainer, conflictFile), "export const conflict = 'base';\n", "utf8");
+  await mustGit(maintainer, ["add", "-A"], "stage base");
+  await mustGit(maintainer, ["commit", "-m", "base"], "commit base");
+  await mustGit(maintainer, ["push", "origin", `HEAD:refs/heads/${baseBranch}`], "push main");
+
+  await mustGit(
+    maintainer,
+    ["checkout", "-B", publicBranch, `origin/${baseBranch}`],
+    "checkout public branch",
+  );
+  writeFileSync(join(maintainer, conflictFile), "export const conflict = 'branch';\n", "utf8");
+  await mustGit(maintainer, ["add", "-A"], "stage branch change");
+  await mustGit(maintainer, ["commit", "-m", "branch change"], "commit branch change");
+  await mustGit(
+    maintainer,
+    ["push", "origin", `HEAD:refs/heads/${publicBranch}`],
+    "push branch change",
+  );
+  const prHeadSha = await mustGit(maintainer, ["rev-parse", "HEAD"], "resolve branch HEAD");
+
+  await mustGit(maintainer, ["checkout", "-B", baseBranch, `origin/${baseBranch}`], "return to main");
+  writeFileSync(join(maintainer, conflictFile), "export const conflict = 'main';\n", "utf8");
+  await mustGit(maintainer, ["add", "-A"], "stage main conflict");
+  await mustGit(maintainer, ["commit", "-m", "main conflict"], "commit main conflict");
+  await mustGit(maintainer, ["push", "origin", `HEAD:refs/heads/${baseBranch}`], "push main conflict");
+
+  await mustGit(sourceRepo, ["fetch", "origin", baseBranch, publicBranch], "fetch source refs");
+  await mustGit(sourceRepo, ["checkout", "-B", baseBranch, `origin/${baseBranch}`], "source checkout main");
+
+  return {
+    root,
+    remote,
+    sourceRepo,
+    publicBranch,
+    baseBranch,
+    prHeadSha,
+    conflictFile,
+    params: {
+      instruction: "Resolve the merge conflict and update the approved PR branch.",
+      planning: {
+        intent: "code_change",
+        riskLevel: "medium",
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+        scope: {
+          readAnywhere: true,
+          writeAllowed: true,
+          writeGlobs: ["apps/client/**"],
+        },
+        acceptanceCriteria: ["PR branch rebases cleanly onto main."],
+        validationSteps: ["bun test"],
+      },
+      completionBranch: publicBranch,
+      reviewAgent: {
+        prHeadRef: publicBranch,
+        prBaseRef: baseBranch,
+        prHeadSha,
+        resolutionType: "merge_conflict",
+        mergeError: "Pull Request is not mergeable",
+      },
+    },
+  };
+}
+
+const skipMergeConflictTests = await shouldSkipForGitSpawnPermission();
+const runMergeConflictTest = skipMergeConflictTests ? test.skip : test;
+
+describe("workerpals merge-conflict sandbox", () => {
+  runMergeConflictTest("prepares merge-conflict repo in isolated sandbox without switching source checkout", async () => {
+    const fixture = await createConflictFixture();
+    try {
+      const sourceBranchBefore = await mustGit(
+        fixture.sourceRepo,
+        ["branch", "--show-current"],
+        "source branch before preparation",
+      );
+      const prepared = await prepareMergeConflictTaskRepo(
+        fixture.sourceRepo,
+        "job-merge-conflict",
+        fixture.params,
+      );
+      try {
+        expect(prepared.repoPath).not.toBe(fixture.sourceRepo);
+        expect(prepared.plannerGuidance).toContain("isolated container-local clone");
+        expect(prepared.conflictPaths).toEqual([fixture.conflictFile]);
+        const sandboxBranchList = await mustGit(
+          prepared.repoPath,
+          ["branch", "--list", fixture.publicBranch],
+          "list sandbox branch",
+        );
+        expect(sandboxBranchList).toContain(fixture.publicBranch);
+        const unresolved = await mustGit(
+          prepared.repoPath,
+          ["diff", "--name-only", "--diff-filter=U"],
+          "list unresolved files",
+        );
+        expect(unresolved).toBe(fixture.conflictFile);
+        const sourceBranchAfter = await mustGit(
+          fixture.sourceRepo,
+          ["branch", "--show-current"],
+          "source branch after preparation",
+        );
+        expect(sourceBranchAfter).toBe(sourceBranchBefore);
+      } finally {
+        prepared.cleanup();
+      }
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  runMergeConflictTest(
+    "createJobCommit force-pushes a completed merge-conflict rebase back to the same PR branch",
+    async () => {
+      const fixture = await createConflictFixture();
+      try {
+        const prepared = await prepareMergeConflictTaskRepo(
+          fixture.sourceRepo,
+          "job-merge-conflict",
+          fixture.params,
+        );
+        try {
+          writeFileSync(
+            join(prepared.repoPath, fixture.conflictFile),
+            "export const conflict = 'resolved';\n",
+            "utf8",
+          );
+          await mustGit(prepared.repoPath, ["add", fixture.conflictFile], "stage resolved conflict");
+          await mustGit(
+            prepared.repoPath,
+            ["-c", "core.editor=true", "rebase", "--continue"],
+            "continue rebase",
+          );
+
+          const runtimeConfig = loadPushPalsConfig();
+          const commitResult = await createJobCommit(
+            prepared.repoPath,
+            "workerpal-test",
+            {
+              id: "job-merge-conflict",
+              taskId: "task-merge-conflict",
+              kind: "task.execute",
+              params: fixture.params,
+              context: "docker",
+            },
+            runtimeConfig,
+          );
+          expect(commitResult.ok).toBe(true);
+          expect(commitResult.branch).toBe(fixture.publicBranch);
+          expect(commitResult.sha).toBeTruthy();
+          expect(commitResult.sha).not.toBe(fixture.prHeadSha);
+
+          const lsRemote = await mustGit(
+            fixture.sourceRepo,
+            ["ls-remote", "--heads", "origin", `refs/heads/${fixture.publicBranch}`],
+            "inspect remote branch",
+          );
+          expect(lsRemote.startsWith(`${commitResult.sha}\t`)).toBe(true);
+          const resolvedFile = readFileSync(join(prepared.repoPath, fixture.conflictFile), "utf8");
+          expect(resolvedFile).toContain("resolved");
+        } finally {
+          prepared.cleanup();
+        }
+      } finally {
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+});

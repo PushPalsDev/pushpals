@@ -18,6 +18,11 @@
 import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
 import { loadPushPalsConfig } from "shared";
 import { writeFileSync } from "fs";
+import {
+  applyMergeConflictExecutionHints,
+  isMergeConflictResolutionParams,
+  prepareMergeConflictTaskRepo,
+} from "./merge_conflict_job.js";
 
 const CONFIG = loadPushPalsConfig();
 
@@ -125,69 +130,91 @@ async function main(): Promise<void> {
   // Setup git credentials for pushing
   setupGitCredentials();
   // Execute inside the mounted job worktree (docker -w), not the baked image copy.
-  const jobRepo = process.cwd();
-  const result = await executeJob(
-    spec.kind,
-    spec.params,
-    jobRepo,
-    (stream, line) => {
-      log(stream, line);
-    },
-    CONFIG,
-  );
-  // Build result object
-  const jobResult: JobResult = {
-    ok: result.ok,
-    summary: result.summary,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    exitCode: result.exitCode,
-  };
-  // Create commit for file-modifying jobs
-  if (result.ok && shouldCommit(spec.kind, CONFIG)) {
-    log("stdout", `[JobRunner] Job modified files, creating commit...`);
-    const commitResult = await createJobCommit(
+  const mountedJobRepo = process.cwd();
+  let jobRepo = mountedJobRepo;
+  let cleanupJobRepo: (() => void) | null = null;
+  let effectiveParams = spec.params;
+  try {
+    if (isMergeConflictResolutionParams(spec.params)) {
+      const prepared = await prepareMergeConflictTaskRepo(
+        mountedJobRepo,
+        spec.jobId,
+        spec.params,
+        log,
+      );
+      jobRepo = prepared.repoPath;
+      cleanupJobRepo = prepared.cleanup;
+      effectiveParams = applyMergeConflictExecutionHints(spec.params, prepared);
+      log(
+        "stdout",
+        `[JobRunner] Merge-conflict job ${spec.jobId} is running in isolated sandbox repo ${jobRepo}`,
+      );
+    }
+    const result = await executeJob(
+      spec.kind,
+      effectiveParams,
       jobRepo,
-      spec.workerId,
-      {
-        id: spec.jobId,
-        taskId: spec.taskId,
-        kind: spec.kind,
-        params: spec.params,
-        context: "docker",
+      (stream, line) => {
+        log(stream, line);
       },
       CONFIG,
     );
+    // Build result object
+    const jobResult: JobResult = {
+      ok: result.ok,
+      summary: result.summary,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+    };
+    // Create commit for file-modifying jobs
+    if (result.ok && shouldCommit(spec.kind, CONFIG)) {
+      log("stdout", `[JobRunner] Job modified files, creating commit...`);
+      const commitResult = await createJobCommit(
+        jobRepo,
+        spec.workerId,
+        {
+          id: spec.jobId,
+          taskId: spec.taskId,
+          kind: spec.kind,
+          params: effectiveParams,
+          context: "docker",
+        },
+        CONFIG,
+      );
 
-    if (commitResult.ok && commitResult.sha && commitResult.branch) {
-      jobResult.commit = {
-        branch: commitResult.branch!,
-        sha: commitResult.sha,
-      };
-      if (commitResult.sha === "no-changes") {
-        log("stdout", `[JobRunner] No changes to commit for ${spec.jobId}`);
+      if (commitResult.ok && commitResult.sha && commitResult.branch) {
+        jobResult.commit = {
+          branch: commitResult.branch!,
+          sha: commitResult.sha,
+        };
+        if (commitResult.sha === "no-changes") {
+          log("stdout", `[JobRunner] No changes to commit for ${spec.jobId}`);
+        } else {
+          log("stdout", `[JobRunner] Created commit ${commitResult.sha} on ${commitResult.branch}`);
+        }
       } else {
-        log("stdout", `[JobRunner] Created commit ${commitResult.sha} on ${commitResult.branch}`);
+        const commitError =
+          commitResult.error ??
+          `Commit metadata missing for ${spec.kind} (${spec.jobId}) while running in Docker mode`;
+        jobResult.ok = false;
+        jobResult.summary = `Failed to create commit for ${spec.kind}`;
+        jobResult.stderr = [jobResult.stderr, commitError].filter(Boolean).join("\n");
+        jobResult.exitCode = jobResult.exitCode && jobResult.exitCode !== 0 ? jobResult.exitCode : 1;
+        log("stderr", `[JobRunner] Failed to create commit: ${commitError}`);
       }
-    } else {
-      const commitError =
-        commitResult.error ??
-        `Commit metadata missing for ${spec.kind} (${spec.jobId}) while running in Docker mode`;
-      jobResult.ok = false;
-      jobResult.summary = `Failed to create commit for ${spec.kind}`;
-      jobResult.stderr = [jobResult.stderr, commitError].filter(Boolean).join("\n");
-      jobResult.exitCode = jobResult.exitCode && jobResult.exitCode !== 0 ? jobResult.exitCode : 1;
-      log("stderr", `[JobRunner] Failed to create commit: ${commitError}`);
     }
+
+    // Output result with sentinel
+    const resultJson = JSON.stringify(jobResult);
+    // eslint-disable-next-line no-console
+    console.log(`___RESULT___ ${resultJson}`);
+
+    // Exit with appropriate code
+    process.exit(jobResult.exitCode ?? (jobResult.ok ? 0 : 1));
+  } finally {
+    cleanupJobRepo?.();
   }
-
-  // Output result with sentinel
-  const resultJson = JSON.stringify(jobResult);
-  // eslint-disable-next-line no-console
-  console.log(`___RESULT___ ${resultJson}`);
-
-  // Exit with appropriate code
-  process.exit(jobResult.exitCode ?? (jobResult.ok ? 0 : 1));
 }
 
 main().catch((err) => {

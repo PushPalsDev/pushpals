@@ -1120,6 +1120,9 @@ describe("ReviewAgent", () => {
     let enqueuedDedupeKey = "";
     let enqueuedResolutionType = "";
     let enqueuedInstruction = "";
+    let enqueuedPlannerWorkerInstruction = "";
+    let enqueuedTargetPaths: string[] = [];
+    let enqueuedValidationSteps: string[] = [];
     let createdTaskTitle = "";
     let createdTaskTags: string[] = [];
     const emittedCommandTypes: string[] = [];
@@ -1167,6 +1170,17 @@ describe("ReviewAgent", () => {
                 ? (payload.params as Record<string, unknown>)
                 : {};
             enqueuedInstruction = String(params.instruction ?? "");
+            enqueuedPlannerWorkerInstruction = String(params.plannerWorkerInstruction ?? "");
+            const planning =
+              params.planning && typeof params.planning === "object"
+                ? (params.planning as Record<string, unknown>)
+                : {};
+            enqueuedTargetPaths = Array.isArray(planning.targetPaths)
+              ? planning.targetPaths.map((entry) => String(entry))
+              : [];
+            enqueuedValidationSteps = Array.isArray(planning.validationSteps)
+              ? planning.validationSteps.map((entry) => String(entry))
+              : [];
             const reviewAgent =
               params.reviewAgent && typeof params.reviewAgent === "object"
                 ? (params.reviewAgent as Record<string, unknown>)
@@ -1208,6 +1222,11 @@ describe("ReviewAgent", () => {
     expect(enqueuedResolutionType).toBe("merge_conflict");
     expect(enqueuedInstruction).toContain("Resolve merge conflicts for PR #70");
     expect(enqueuedInstruction).toContain("Do not create a new PR");
+    expect(enqueuedPlannerWorkerInstruction).toContain("Existing PR branch: agent/test-branch");
+    expect(enqueuedPlannerWorkerInstruction).toContain("Rebase target: main");
+    expect(enqueuedPlannerWorkerInstruction).toContain("Expected remote lease SHA: abc123def456");
+    expect(enqueuedTargetPaths).toEqual(["apps/remotebuddy/README.md"]);
+    expect(enqueuedValidationSteps).toEqual(["bun test"]);
     expect(createdTaskTitle).toBe("Resolve merge conflicts for PR #70 @ abc123de");
     expect(createdTaskTags).toEqual(["review-agent", "merge-conflict"]);
     expect(emittedCommandTypes).toEqual(["task_created", "task_started", "job_enqueued"]);

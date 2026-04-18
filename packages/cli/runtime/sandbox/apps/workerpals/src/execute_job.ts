@@ -3,7 +3,7 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { readFileSync, unlinkSync } from "fs";
+import { existsSync, readFileSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import {
   deriveAutonomyComponentArea,
@@ -26,6 +26,7 @@ import {
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
 import { getBackendTaskExecutor } from "./backends/task_execute_registry.js";
+import { extractMergeConflictReviewContext } from "./merge_conflict_job.js";
 
 const DEFAULT_CONFIG = loadPushPalsConfig();
 
@@ -1200,6 +1201,9 @@ export async function createJobCommit(
     defaultPublicBranchName,
   );
   const publicBranchName = resolvedPublicBranch.branch;
+  if (extractMergeConflictReviewContext(job.params ?? null)) {
+    return createMergeConflictJobCommit(repo, workerId, job, publicBranchName, runtimeConfig);
+  }
   const requirePush = runtimeConfig.workerpals.requirePush || resolvedPublicBranch.overridden;
   const pushAgentBranch =
     requirePush || runtimeConfig.workerpals.pushAgentBranch || resolvedPublicBranch.overridden;
@@ -1863,6 +1867,220 @@ async function currentRefSha(repo: string, ref: string): Promise<string | null> 
   const result = await git(repo, ["rev-parse", ref]);
   if (!result.ok) return null;
   return result.stdout.trim() || null;
+}
+
+async function currentBranchName(repo: string): Promise<string | null> {
+  const result = await git(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (!result.ok) return null;
+  return result.stdout.trim() || null;
+}
+
+async function gitDirPath(repo: string): Promise<string | null> {
+  const result = await git(repo, ["rev-parse", "--git-dir"]);
+  if (!result.ok) return null;
+  const gitDir = result.stdout.trim();
+  if (!gitDir) return null;
+  return resolve(repo, gitDir);
+}
+
+async function activeGitOperation(repo: string): Promise<"rebase" | "merge" | "cherry-pick" | null> {
+  const gitDir = await gitDirPath(repo);
+  if (!gitDir) return null;
+  if (existsSync(resolve(gitDir, "rebase-merge")) || existsSync(resolve(gitDir, "rebase-apply"))) {
+    return "rebase";
+  }
+  if (existsSync(resolve(gitDir, "MERGE_HEAD"))) return "merge";
+  if (existsSync(resolve(gitDir, "CHERRY_PICK_HEAD"))) return "cherry-pick";
+  return null;
+}
+
+async function isAncestorRef(repo: string, ancestor: string, descendant: string): Promise<boolean> {
+  const result = await git(repo, ["merge-base", "--is-ancestor", ancestor, descendant]);
+  return result.ok;
+}
+
+async function refreshMergeConflictTrackingRefs(
+  repo: string,
+  publicBranchName: string,
+  baseBranchName: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const refspecs = [
+    `+refs/heads/${publicBranchName}:refs/remotes/origin/${publicBranchName}`,
+    `+refs/heads/${baseBranchName}:refs/remotes/origin/${baseBranchName}`,
+  ];
+  const fetch = await git(repo, ["fetch", "--quiet", "origin", ...new Set(refspecs)]);
+  if (!fetch.ok) {
+    return {
+      ok: false,
+      error: `Failed to refresh merge-conflict refs for ${publicBranchName}: ${redactSensitiveText(fetch.stderr || fetch.stdout)}`,
+    };
+  }
+  return { ok: true };
+}
+
+async function createMergeConflictJobCommit(
+  repo: string,
+  workerId: string,
+  job: {
+    id: string;
+    taskId: string;
+    kind: string;
+    params?: Record<string, unknown>;
+  },
+  publicBranchName: string,
+  runtimeConfig: WorkerpalsRuntimeConfig,
+): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
+  const mergeConflictContext = extractMergeConflictReviewContext(job.params ?? null);
+  if (!mergeConflictContext) {
+    return { ok: false, error: "Merge-conflict context is missing required branch metadata." };
+  }
+
+  const sequencer = await activeGitOperation(repo);
+  if (sequencer) {
+    return {
+      ok: false,
+      error: `Merge-conflict job ${job.id} left a git ${sequencer} in progress. Finish the ${sequencer} before returning control to WorkerPals.`,
+    };
+  }
+
+  const refreshed = await refreshMergeConflictTrackingRefs(
+    repo,
+    publicBranchName,
+    mergeConflictContext.baseBranch,
+  );
+  if (!refreshed.ok) return refreshed;
+
+  const currentBranch = await currentBranchName(repo);
+  if (!currentBranch) {
+    return {
+      ok: false,
+      error: `Merge-conflict job ${job.id} must finish on a local branch inside the isolated sandbox, but HEAD is detached.`,
+    };
+  }
+
+  const remoteHeadSha = await currentRefSha(repo, `refs/remotes/origin/${publicBranchName}`);
+  if (
+    mergeConflictContext.expectedHeadSha &&
+    remoteHeadSha &&
+    remoteHeadSha !== mergeConflictContext.expectedHeadSha
+  ) {
+    return {
+      ok: false,
+      error:
+        `origin/${publicBranchName} moved from expected ${mergeConflictContext.expectedHeadSha.slice(0, 8)} ` +
+        `to ${remoteHeadSha.slice(0, 8)} while the job was running. Requeue on the newer branch head instead of overwriting it.`,
+    };
+  }
+
+  let result: { ok: boolean; stdout: string; stderr: string };
+  const stageArgs = buildStageCommand(job.kind, job.params);
+  if (!stageArgs) {
+    return {
+      ok: false,
+      error: `Unable to determine files to stage for merge-conflict job kind: ${job.kind}`,
+    };
+  }
+  result = await git(repo, stageArgs);
+  if (!result.ok) {
+    const stageErr = result.stderr || result.stdout;
+    if (
+      /pathspec .* did not match any files/i.test(stageErr) ||
+      /invalid path/i.test(stageErr) ||
+      /outside repository/i.test(stageErr)
+    ) {
+      console.warn(
+        `[WorkerPals] Stage target invalid/missing for merge-conflict job ${job.id}; retrying with fallback "git add -A".`,
+      );
+      result = await git(repo, [
+        "add",
+        "-A",
+        "--",
+        ".",
+        ":(exclude)workspace/**",
+        ":(exclude)outputs/**",
+      ]);
+    }
+    if (!result.ok) {
+      return { ok: false, error: `Failed to stage merge-conflict changes: ${result.stderr || result.stdout}` };
+    }
+  }
+
+  const cachedDiffQuiet = await git(repo, ["diff", "--cached", "--quiet"]);
+  let headSha = await currentRefSha(repo, "HEAD");
+  if (!headSha) {
+    return { ok: false, error: `Failed to resolve HEAD SHA for merge-conflict job ${job.id}.` };
+  }
+
+  if (!cachedDiffQuiet.ok) {
+    const cachedDiff = await git(repo, ["diff", "--cached"]);
+    const diff = cachedDiff.ok ? cachedDiff.stdout : "";
+    const cachedNameOnly = await git(repo, ["diff", "--cached", "--name-only"]);
+    const changedPaths = cachedNameOnly.ok
+      ? parseChangedPathsFromNameOnlyOutput(cachedNameOnly.stdout)
+      : [];
+    const jobPlanning = job.params?.planning as Record<string, unknown> | undefined;
+    const jobValidationSteps = toNonEmptyStringArray(
+      jobPlanning?.validationSteps ?? job.params?.validationSteps,
+    );
+    const llmCommitMsg = await generateCommitMessageFromDiff(
+      diff,
+      {
+        instruction: String(job.params?.instruction ?? ""),
+        type: normalizeCommitType(job.kind, job.params),
+        area: inferCommitArea(job.kind, job.params, changedPaths),
+        validationSteps: jobValidationSteps,
+      },
+      repo,
+      runtimeConfig,
+    ).catch(() => null);
+    if (!llmCommitMsg) {
+      console.warn(
+        `[WorkerPals] Commit message generator unavailable for merge-conflict job ${job.id}; using deterministic fallback.`,
+      );
+    }
+    const commitMsg = llmCommitMsg ?? buildWorkerCommitMessage(workerId, job, changedPaths);
+    const commit = await git(repo, ["commit", "-m", commitMsg]);
+    if (!commit.ok) {
+      return { ok: false, error: `Failed to commit merge-conflict resolution: ${commit.stderr}` };
+    }
+    headSha = await currentRefSha(repo, "HEAD");
+    if (!headSha) {
+      return { ok: false, error: `Failed to resolve committed HEAD SHA for merge-conflict job ${job.id}.` };
+    }
+  }
+
+  const baseRemoteRef = `refs/remotes/origin/${mergeConflictContext.baseBranch}`;
+  const rebasedOntoBase = await isAncestorRef(repo, baseRemoteRef, "HEAD");
+  if (!rebasedOntoBase) {
+    return {
+      ok: false,
+      error:
+        `Merge-conflict job ${job.id} did not finish rebased onto origin/${mergeConflictContext.baseBranch}. ` +
+        `Current branch ${currentBranch} must be a descendant of ${baseRemoteRef} before WorkerPals will push it.`,
+    };
+  }
+
+  if (remoteHeadSha && remoteHeadSha === headSha) {
+    return { ok: true, branch: publicBranchName, sha: headSha };
+  }
+
+  const pushArgs = [
+    "push",
+    mergeConflictContext.expectedHeadSha
+      ? `--force-with-lease=refs/heads/${publicBranchName}:${mergeConflictContext.expectedHeadSha}`
+      : "--force-with-lease",
+    "origin",
+    `HEAD:refs/heads/${publicBranchName}`,
+  ];
+  const push = await git(repo, pushArgs);
+  if (!push.ok) {
+    return {
+      ok: false,
+      error: `Failed to push rebased merge-conflict branch ${publicBranchName}: ${redactSensitiveText(push.stderr || push.stdout)}`,
+    };
+  }
+
+  return { ok: true, branch: publicBranchName, sha: headSha };
 }
 
 async function autoResolveRebaseConflicts(

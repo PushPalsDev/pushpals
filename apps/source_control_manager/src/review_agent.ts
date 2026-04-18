@@ -730,6 +730,65 @@ export function deriveFixWriteGlobsFromDiff(diff: string): string[] {
   return [...globs].slice(0, 16);
 }
 
+function deriveMergeConflictTargetPathsFromDiff(diff: string): string[] {
+  return parseChangedPathsFromDiff(diff).slice(0, 24);
+}
+
+function deriveMergeConflictLikelyDirs(paths: string[]): string[] {
+  const dirs = new Set<string>();
+  for (const path of paths) {
+    const normalized = path.replace(/\\/g, "/");
+    const slash = normalized.lastIndexOf("/");
+    if (slash <= 0) continue;
+    dirs.add(normalized.slice(0, slash));
+    if (dirs.size >= 12) break;
+  }
+  return [...dirs];
+}
+
+function deriveMergeConflictValidationSteps(paths: string[]): string[] {
+  const targeted = paths
+    .filter(
+      (path) =>
+        /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
+    )
+    .slice(0, 4)
+    .map((path) => `bun test ${path}`);
+  return targeted.length > 0 ? targeted : ["bun test"];
+}
+
+function buildMergeConflictPlannerWorkerInstruction(options: {
+  prNumber: number;
+  prUrl: string;
+  prHeadRef: string;
+  prBaseRef: string;
+  prHeadSha: string;
+  mergeErrorSummary: string;
+  changedPaths: string[];
+}): string {
+  const lines = [
+    "Merge-conflict resolution brief:",
+    `- PR: #${options.prNumber} (${options.prUrl})`,
+    `- Existing PR branch: ${options.prHeadRef}`,
+    `- Rebase target: ${options.prBaseRef}`,
+    `- Push target after resolution: ${options.prHeadRef} (update the existing PR branch only).`,
+    `- Expected remote lease SHA: ${options.prHeadSha}`,
+  ];
+  if (options.mergeErrorSummary) {
+    lines.push(`- GitHub mergeability error: ${options.mergeErrorSummary}`);
+  }
+  if (options.changedPaths.length > 0) {
+    lines.push(`- Candidate changed paths from the approved PR: ${options.changedPaths.join(", ")}`);
+  }
+  lines.push(
+    "- If the worker preloads an isolated sandbox branch or an in-progress rebase state, treat that current repo state as authoritative instead of re-discovering branch topology.",
+  );
+  lines.push(
+    `- Finish with ${options.prHeadRef} cleanly rebased onto ${options.prBaseRef}, validated, and ready to push back with force-with-lease if history changed.`,
+  );
+  return lines.join("\n");
+}
+
 function normalizeReviewFixHeadSha(value: string): string {
   return String(value ?? "")
     .trim()
@@ -1645,6 +1704,9 @@ export class ReviewAgent {
   ): Promise<boolean> {
     const taskId = `review-merge-conflict-pr${pr.number}-${this.deps.now()}`;
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
+    const changedPaths = deriveMergeConflictTargetPathsFromDiff(diff);
+    const likelyDirs = deriveMergeConflictLikelyDirs(changedPaths);
+    const validationSteps = deriveMergeConflictValidationSteps(changedPaths);
     const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
     const mergeErrorSummary = truncateText(
       collapseWhitespace(
@@ -1652,6 +1714,15 @@ export class ReviewAgent {
       ),
       360,
     );
+    const plannerWorkerInstruction = buildMergeConflictPlannerWorkerInstruction({
+      prNumber: pr.number,
+      prUrl: pr.html_url,
+      prHeadRef: prHeadRef ?? pr.head.ref,
+      prBaseRef: pr.base.ref,
+      prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
+      mergeErrorSummary,
+      changedPaths,
+    });
     const instruction = loadPromptTemplate("review_agent/merge_conflict_instruction.md", {
       pr_number: String(pr.number),
       pr_url: pr.html_url,
@@ -1671,6 +1742,7 @@ export class ReviewAgent {
         schemaVersion: 2,
         origin: "autonomy",
         instruction,
+        plannerWorkerInstruction,
         recentContext: [
           loadPromptTemplate("review_agent/merge_conflict_context_intro_line.md", {
             pr_number: String(pr.number),
@@ -1684,17 +1756,23 @@ export class ReviewAgent {
         planning: {
           intent: "code_change",
           riskLevel: "medium",
+          ...(changedPaths.length > 0 ? { targetPaths: changedPaths } : {}),
           acceptanceCriteria: [
             `Branch ${pr.head.ref} rebases cleanly onto ${pr.base.ref} with conflicts resolved.`,
             `PR #${pr.number} becomes mergeable without manual GitHub conflict edits.`,
             "Validation commands relevant to changed files pass.",
           ],
-          validationSteps: ["bun test"],
+          validationSteps,
           queuePriority: "normal",
           queueWaitBudgetMs: 90_000,
           executionBudgetMs: 1_800_000,
           finalizationBudgetMs: 120_000,
           scope: { readAnywhere: true, writeAllowed: true, writeGlobs },
+          discovery: {
+            ripgrepQueries: changedPaths.slice(0, 8),
+            likelyDirs,
+            keywords: ["merge conflict", pr.head.ref, pr.base.ref],
+          },
         },
         completionBranch: prHeadRef ?? undefined,
         reviewAgent: {

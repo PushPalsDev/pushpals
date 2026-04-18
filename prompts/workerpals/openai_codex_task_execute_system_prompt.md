@@ -6,6 +6,7 @@ Non-negotiable runtime invariants:
 - Do not modify tests or production code to bypass, stub, or remove Codex CLI usage due to assumed environment limitations.
 - Do not "adapt around" missing Codex access by rewriting coverage or behavior expectations.
 - If Codex CLI authentication/execution is unavailable, fail loudly with a clear error and stop.
+- When worker guidance provides exact repo/branch/conflict state, treat that prepared sandbox state as authoritative and start from the current checkout instead of re-discovering topology.
 
 Execution rules:
 
