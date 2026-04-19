@@ -204,7 +204,11 @@ function prepareRuntimeRoot(
   artifacts: BuildArtifacts,
   dockerImage: string,
   portBase: number,
+  options: {
+    autonomyEnabled?: boolean;
+  } = {},
 ): void {
+  const autonomyEnabled = options.autonomyEnabled ?? false;
   cpSync(packagedRuntimeAssetRoot, runtimeRoot, { recursive: true, force: true });
   const runtimeBinDir = join(runtimeRoot, "bin", artifacts.platformKey);
   mkdirSync(runtimeBinDir, { recursive: true });
@@ -243,7 +247,7 @@ wait_for_workerpal_ms = 30000
 workerpal_startup_timeout_ms = 30000
 
 [remotebuddy.autonomy]
-enabled = false
+enabled = ${autonomyEnabled ? "true" : "false"}
 
 [workerpals]
 docker_image = "${dockerImage}"
@@ -605,6 +609,87 @@ describe("packaged CLI end-to-end", () => {
         expect(combined).not.toContain("[pushpals] Precheck failed:");
         expect(combined).not.toContain("[pushpals] Auto-start failed:");
         expect(combined).not.toContain("[pushpals] Fatal:");
+      } finally {
+        if (proc) {
+          try {
+            proc.kill();
+          } catch {}
+        }
+        try {
+          await removeTreeWithRetries(root);
+        } catch (err) {
+          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        }
+      }
+    },
+    20 * 60_000,
+  );
+
+  test(
+    "boots packaged Windows runtime with autonomy enabled",
+    async () => {
+      if (process.platform !== "win32") return;
+      const artifacts = await ensureBuildArtifacts();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-autonomy-win-"));
+      let proc: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        const { repoPath } = initializeTempRepo(root);
+        const runtimeRoot = join(root, "runtime");
+        const portBase = await findAvailablePortBlock();
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase, {
+          autonomyEnabled: true,
+        });
+
+        proc = Bun.spawn(
+          [
+            process.execPath,
+            artifacts.cliPath,
+            "--status-once",
+            "--runtime-root",
+            runtimeRoot,
+            "--runtime-tag",
+            runtimeTag,
+          ],
+          {
+            cwd: repoPath,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            env: buildCliE2EEnv(),
+          },
+        );
+
+        const stdoutCapture = startTextCapture(proc.stdout);
+        const stderrCapture = startTextCapture(proc.stderr);
+        const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
+        await waitForLogLine(
+          runtimeServicesLogPath,
+          "[pushpals] embedded remotebuddy autonomous engine is enabled.",
+          180_000,
+        );
+
+        const [stdout, stderr, exitCode] = await Promise.all([
+          stdoutCapture.promise,
+          stderrCapture.promise,
+          waitForExitWithTimeout(
+            proc,
+            15 * 60_000,
+            () => `${stdoutCapture.getSnapshot()}\n${stderrCapture.getSnapshot()}`,
+          ),
+        ]);
+        const combined = `${stdout}\n${stderr}`;
+
+        if (exitCode !== 0) {
+          throw new Error(`CLI E2E exited ${exitCode}\n${combined}`);
+        }
+        expect(combined).toContain("[pushpals] startup timing summary: outcome=ready");
+        expect(combined).toContain("[pushpals] Embedded runtime is ready.");
+        expect(combined).toContain("[pushpals] Embedded RemoteBuddy autonomous engine is enabled.");
+        expect(combined).toContain("[pushpals] Connected.");
+        expect(combined).not.toContain("[pushpals] Auto-start failed:");
+        expect(combined).not.toContain("[pushpals] Fatal:");
+        expect(combined).not.toContain("panic(main thread):");
+        expect(combined).not.toContain("Segmentation fault");
       } finally {
         if (proc) {
           try {
