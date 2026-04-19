@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.44`
-- start_commit: `d3a5ff6075594c2ca512a3c9fd0d4ad81a23c71a`
-- end_commit: `f56edd0d429523d110bb6772f630c4793ef3b319`
+- version: `v1.0.45`
+- start_commit: `cb304e3e6c6059f7e49380d9dfd002c6483716ad`
+- end_commit: `71a507f6e6bc34674792d2e9d0770d2379ef1472`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Treat merge-conflict repair jobs as a stricter quality-gate mode so they can no longer soft-pass exhausted auto-revisions while an unfinished rebase is still active.
-- Fail merge-conflict executions immediately when the worker returns with an in-progress git sequencer instead of drifting into validation and later dying during commit finalization.
-- Add regression coverage for the merge-conflict quality policy override and the fail-fast execution path when a sandbox repo is still paused mid-rebase.
+- Tighten the OpenAI Codex worker prompt and runtime policy so merge-conflict repairs prefer direct git commands instead of shell wrappers like `/bin/bash -lc`, `sh -lc`, `cmd /c`, or `powershell -Command`.
+- Extend merge-conflict sandbox planner guidance with explicit `git add` plus `git -c core.editor=true rebase --continue` instructions for prepared mid-rebase workspaces.
+- Add regression coverage confirming the direct-command rule is present in the Codex prompt and merge-conflict planner guidance.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.44 && git push origin v1.0.44`.
+- Tag and push: `git tag v1.0.45 && git push origin v1.0.45`.
