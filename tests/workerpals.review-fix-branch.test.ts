@@ -103,6 +103,35 @@ describe("workerpals review fix completion branch resolution", () => {
     expect(policy.criticMinScore).toBeCloseTo(8.3, 5);
   });
 
+  test("disables soft-pass for merge-conflict jobs", () => {
+    const base = loadPushPalsConfig({ reload: true });
+    const runtimeConfig = {
+      ...base,
+      workerpals: {
+        ...base.workerpals,
+        qualityMaxAutoRevisions: 1,
+        qualitySoftPassOnExhausted: true,
+        qualityCriticMinScore: 8,
+      },
+    };
+
+    const policy = deriveQualityGatePolicy(
+      {
+        reviewAgent: {
+          resolutionType: "merge_conflict",
+          prHeadRef: "refs/heads/agent/workerpal-1/job-xyz",
+          prBaseRef: "main",
+        },
+      },
+      runtimeConfig,
+    );
+
+    expect(policy.mode).toBe("merge_conflict");
+    expect(policy.maxAutoRevisions).toBe(1);
+    expect(policy.softPassOnExhausted).toBe(false);
+    expect(policy.criticMinScore).toBe(8);
+  });
+
   test("suppresses unchanged branch re-review for rejected review-fix jobs", () => {
     expect(
       shouldEnqueueNoChangeReviewCompletion({

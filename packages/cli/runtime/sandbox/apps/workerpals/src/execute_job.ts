@@ -92,7 +92,7 @@ export interface ReviewFixContext {
 }
 
 export interface QualityGatePolicy {
-  mode: "default" | "review_fix";
+  mode: "default" | "review_fix" | "merge_conflict";
   maxAutoRevisions: number;
   softPassOnExhausted: boolean;
   criticMinScore: number;
@@ -318,6 +318,15 @@ export function deriveQualityGatePolicy(
   })();
   const reviewFix = extractReviewFixContext(params);
   if (!reviewFix) {
+    const mergeConflict = extractMergeConflictReviewContext(params);
+    if (mergeConflict) {
+      return {
+        mode: "merge_conflict",
+        maxAutoRevisions: baseMaxAutoRevisions,
+        softPassOnExhausted: false,
+        criticMinScore: baseCriticMinScore,
+      };
+    }
     return {
       mode: "default",
       maxAutoRevisions: baseMaxAutoRevisions,
@@ -3340,6 +3349,7 @@ export async function executeJob(
   };
   const executionBudgetMs = Number(planning.executionBudgetMs);
   const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
+  const mergeConflictContext = extractMergeConflictReviewContext(normalizedParams);
   const reviewFixContext = extractReviewFixContext(normalizedParams);
   const qualityGatePolicy = deriveQualityGatePolicy(normalizedParams, runtimeConfig);
   const qualityMaxAutoRevisions = qualityGatePolicy.maxAutoRevisions;
@@ -3362,6 +3372,11 @@ export async function executeJob(
     onLog?.(
       "stdout",
       `[QualityGate] review_fix override active: prior_score=${priorScore}, target_threshold=${threshold}, soft_pass_on_exhausted=false.`,
+    );
+  } else if (qualityGatePolicy.mode === "merge_conflict") {
+    onLog?.(
+      "stdout",
+      "[QualityGate] merge_conflict override active: soft_pass_on_exhausted=false until the sandbox rebase is fully completed.",
     );
   }
 
@@ -3393,6 +3408,22 @@ export async function executeJob(
       executeBudgets,
     );
     if (!result.ok) return result;
+    if (mergeConflictContext) {
+      const sequencer = await activeGitOperation(repo);
+      if (sequencer) {
+        const detail =
+          `Merge-conflict job returned with git ${sequencer} still in progress. ` +
+          `Finish the ${sequencer} before returning control to WorkerPals.`;
+        onLog?.("stderr", `[MergeConflict] ${detail}`);
+        return {
+          ok: false,
+          summary: detail,
+          stdout: result.stdout,
+          stderr: [result.stderr ?? "", detail].filter(Boolean).join("\n"),
+          exitCode: 4,
+        };
+      }
+    }
 
     const scopeCheck = await collectWriteScopeWarnings(repo, planning);
     for (const warning of scopeCheck.warnings) {

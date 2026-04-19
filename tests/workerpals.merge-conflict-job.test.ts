@@ -2,9 +2,51 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createJobCommit } from "../apps/workerpals/src/execute_job";
+import {
+  createJobCommit,
+  executeJob,
+} from "../apps/workerpals/src/execute_job";
 import { prepareMergeConflictTaskRepo } from "../apps/workerpals/src/merge_conflict_job";
 import { loadPushPalsConfig } from "shared";
+import type { WorkerpalsRuntimeConfig } from "../apps/workerpals/src/common/executor_backend";
+import type { ExecutorBackend } from "../apps/workerpals/src/common/types";
+import { BACKEND_EXECUTOR_SCRIPT_SEGMENTS } from "../apps/workerpals/src/backends/backend_config";
+import {
+  getBackendTaskExecutor,
+  registerBackendTaskExecutor,
+  unregisterBackendTaskExecutor,
+  type BackendTaskExecutor,
+} from "../apps/workerpals/src/backends/task_execute_registry";
+
+const TEST_BACKEND = "__test_merge_conflict_backend__" as ExecutorBackend;
+
+function stubBackendScriptSegmentsForTesting(
+  backend: ExecutorBackend,
+  segments: readonly string[] = [],
+): () => void {
+  const hadEntry = Object.prototype.hasOwnProperty.call(BACKEND_EXECUTOR_SCRIPT_SEGMENTS, backend);
+  const previousSegments = BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend];
+  BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend] = segments;
+  return () => {
+    if (!hadEntry) {
+      delete BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend];
+    } else {
+      BACKEND_EXECUTOR_SCRIPT_SEGMENTS[backend] = previousSegments ?? [];
+    }
+  };
+}
+
+function installTestBackendExecutor(executor: BackendTaskExecutor): () => void {
+  const previousExecutor = getBackendTaskExecutor(TEST_BACKEND);
+  registerBackendTaskExecutor(TEST_BACKEND, executor);
+  return () => {
+    if (previousExecutor) {
+      registerBackendTaskExecutor(TEST_BACKEND, previousExecutor);
+    } else {
+      unregisterBackendTaskExecutor(TEST_BACKEND);
+    }
+  };
+}
 
 function isGitSpawnPermissionDenied(error: unknown): boolean {
   const code = String((error as { code?: unknown } | null)?.code ?? "")
@@ -128,6 +170,7 @@ async function createConflictFixture(): Promise<ConflictFixture> {
     prHeadSha,
     conflictFile,
     params: {
+      schemaVersion: 2,
       instruction: "Resolve the merge conflict and update the approved PR branch.",
       planning: {
         intent: "code_change",
@@ -144,6 +187,7 @@ async function createConflictFixture(): Promise<ConflictFixture> {
         acceptanceCriteria: ["PR branch rebases cleanly onto main."],
         validationSteps: ["bun test"],
       },
+      lane: "deterministic",
       completionBranch: publicBranch,
       reviewAgent: {
         prHeadRef: publicBranch,
@@ -256,6 +300,74 @@ describe("workerpals merge-conflict sandbox", () => {
           prepared.cleanup();
         }
       } finally {
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  runMergeConflictTest(
+    "executeJob fails before quality validation when a merge-conflict rebase is still active",
+    async () => {
+      const fixture = await createConflictFixture();
+      const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
+      const restoreExecutor = installTestBackendExecutor(async (_kind, _params, _repo, _runtime, onLog) => {
+        onLog?.("stdout", "[stub] merge-conflict executor returned without finishing the rebase");
+        return {
+          ok: true,
+          summary: "stub executor completed",
+          stdout: "__stub_stdout__",
+          stderr: "__stub_stderr__",
+          exitCode: 0,
+        };
+      });
+      try {
+        const prepared = await prepareMergeConflictTaskRepo(
+          fixture.sourceRepo,
+          "job-merge-conflict-active-rebase",
+          fixture.params,
+        );
+        try {
+          const base = loadPushPalsConfig({ reload: true });
+          const runtimeConfig: WorkerpalsRuntimeConfig = {
+            ...base,
+            workerpals: {
+              ...base.workerpals,
+              executor: TEST_BACKEND,
+              qualityMaxAutoRevisions: 1,
+              qualitySoftPassOnExhausted: true,
+            },
+          };
+          const forwardedLogs: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+
+          const result = await executeJob(
+            "task.execute",
+            fixture.params,
+            prepared.repoPath,
+            (stream, line) => {
+              forwardedLogs.push({ stream, line });
+            },
+            runtimeConfig,
+          );
+
+          expect(result.ok).toBe(false);
+          expect(result.exitCode).toBe(4);
+          expect(result.summary).toContain("git rebase still in progress");
+          expect(result.stderr).toContain("git rebase still in progress");
+          expect(
+            forwardedLogs.some((entry) => entry.line.includes("merge_conflict override active")),
+          ).toBe(true);
+          expect(
+            forwardedLogs.some((entry) => entry.line.includes("Soft-pass after")),
+          ).toBe(false);
+          expect(
+            forwardedLogs.some((entry) => entry.line.includes("Quality gate validation failed")),
+          ).toBe(false);
+        } finally {
+          prepared.cleanup();
+        }
+      } finally {
+        restoreExecutor();
+        restoreSegments();
         rmSync(fixture.root, { recursive: true, force: true });
       }
     },
