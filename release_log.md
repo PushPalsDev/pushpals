@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.42`
-- start_commit: `2a7b1b0da2779500913c6ae3c1c79868caebc240`
-- end_commit: `d82ee7d5f3d9feb26fa172c49c5b4dee7d6b2a79`
-- commits_in_range: `2`
+- version: `v1.0.43`
+- start_commit: `09c40ae7756616de6929b73cd691ff700adffd4c`
+- end_commit: `a578abef20aa27df407d489168114875f7210940`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Isolate merge-conflict repair work inside a WorkerPal sandbox clone so rebases and force-pushes update the PR branch without switching or mutating the user's active checkout.
-- Specialize rejected ReviewAgent follow-up jobs with `review_fix` metadata, targeted validation, focused planner guidance, and stricter local quality gating so retries are more surgical and more likely to clear the approval threshold in one pass.
-- Prevent wasted re-review churn by failing rejected review-fix retries that produce no code changes instead of re-enqueueing an unchanged branch for another ReviewAgent pass.
+- Build Windows CLI and embedded runtime binaries natively on `windows-2022` instead of cross-compiling them on Ubuntu before release.
+- Add a release-blocking Windows smoke test that boots the compiled `server` and `remotebuddy` binaries with autonomy enabled against a temp repo containing `vision.md`.
+- Expand packaged CLI Windows E2E coverage to verify autonomy-enabled startup and ensure the release workflow consistently reads `release_log.md` when publishing GitHub Releases.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.42 && git push origin v1.0.42`.
+- Tag and push: `git tag v1.0.43 && git push origin v1.0.43`.
