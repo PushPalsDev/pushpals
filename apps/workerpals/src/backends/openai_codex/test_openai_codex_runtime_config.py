@@ -170,6 +170,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
     def test_loads_openai_codex_task_prompt_template(self) -> None:
         template = _load_prompt_template("workerpals/openai_codex_task_execute_system_prompt.md")
         self.assertIn("Codex CLI is required infrastructure", template)
+        self.assertIn("Use direct commands without shell wrappers", template)
 
     def test_extracts_usage_counts_from_nested_json_event(self) -> None:
         usage = _extract_usage_counts(

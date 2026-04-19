@@ -175,6 +175,9 @@ function buildPlannerGuidance(
       lines.push(`- Unresolved conflict files: ${conflictPaths.join(", ")}`);
     }
     lines.push(
+      "- Use direct commands only while resolving this rebase. Prefer `git diff -- <path>`, `git add <path>`, and `git -c core.editor=true rebase --continue` instead of `/bin/bash -lc`, `sh -lc`, `awk`, or chained shell snippets.",
+    );
+    lines.push(
       "- After editing, run `git add <files>` and `git -c core.editor=true rebase --continue` until the rebase completes.",
     );
   }

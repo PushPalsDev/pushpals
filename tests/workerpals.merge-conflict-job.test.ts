@@ -217,12 +217,13 @@ describe("workerpals merge-conflict sandbox", () => {
         "job-merge-conflict",
         fixture.params,
       );
-      try {
-        expect(prepared.repoPath).not.toBe(fixture.sourceRepo);
-        expect(prepared.plannerGuidance).toContain("isolated container-local clone");
-        expect(prepared.conflictPaths).toEqual([fixture.conflictFile]);
-        const sandboxBranchList = await mustGit(
-          prepared.repoPath,
+        try {
+          expect(prepared.repoPath).not.toBe(fixture.sourceRepo);
+          expect(prepared.plannerGuidance).toContain("isolated container-local clone");
+          expect(prepared.plannerGuidance).toContain("Use direct commands only while resolving this rebase");
+          expect(prepared.conflictPaths).toEqual([fixture.conflictFile]);
+          const sandboxBranchList = await mustGit(
+            prepared.repoPath,
           ["branch", "--list", fixture.publicBranch],
           "list sandbox branch",
         );

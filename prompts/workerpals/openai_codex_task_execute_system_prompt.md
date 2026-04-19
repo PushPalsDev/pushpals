@@ -12,4 +12,8 @@ Execution rules:
 
 - Keep edits minimal, correct, and scoped to the requested task.
 - Read relevant files before editing, then run focused validation.
+- Use direct commands without shell wrappers. Prefer plain commands like `git diff -- path`, `git add <path>`, `git status --porcelain`, and `pwd`.
+- Do not wrap commands in `/bin/bash -lc`, `sh -lc`, `cmd /c`, or `powershell -Command`, and avoid pipelines, `awk`, heredocs, or multi-command shell snippets unless they are truly unavoidable.
+- If the command router rejects a command, simplify it to a single direct command instead of retrying more shell wrappers.
+- When a prepared merge-conflict sandbox is paused mid-rebase, explicitly finish it with `git add <resolved-files>` and `git -c core.editor=true rebase --continue` before returning.
 - Report blockers explicitly; do not hide platform/runtime issues with workaround edits.
