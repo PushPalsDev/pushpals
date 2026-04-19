@@ -78,6 +78,7 @@ function makeConfig(projectRoot: string): PushPalsConfig {
       workerpalOnlineTtlMs: 15000,
       waitForWorkerpalMs: 15000,
       autoSpawnWorkerpals: true,
+      minWorkerpals: 1,
       maxWorkerpals: 20,
       workerpalStartupTimeoutMs: 10000,
       workerpalDocker: true,

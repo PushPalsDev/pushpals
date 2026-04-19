@@ -97,6 +97,7 @@ export interface PushPalsConfig {
     workerpalOnlineTtlMs: number;
     waitForWorkerpalMs: number;
     autoSpawnWorkerpals: boolean;
+    minWorkerpals: number;
     maxWorkerpals: number;
     workerpalStartupTimeoutMs: number;
     workerpalDocker: boolean;
@@ -725,6 +726,17 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const remotePollMs = Math.max(
     200,
     asInt(parseIntEnv("REMOTEBUDDY_POLL_MS") ?? remoteNode.poll_ms, 2_000),
+  );
+  const remoteMaxWorkerpals = Math.max(
+    1,
+    asInt(parseIntEnv("REMOTEBUDDY_MAX_WORKERPALS") ?? remoteNode.max_workerpals, 20),
+  );
+  const remoteMinWorkerpals = Math.max(
+    1,
+    Math.min(
+      remoteMaxWorkerpals,
+      asInt(parseIntEnv("REMOTEBUDDY_MIN_WORKERPALS") ?? remoteNode.min_workerpals, 1),
+    ),
   );
   const remoteLlm = resolveLlmConfig(
     remoteNode,
@@ -1498,10 +1510,8 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       autoSpawnWorkerpals:
         parseBoolEnv("REMOTEBUDDY_AUTO_SPAWN_WORKERPALS") ??
         asBoolean(remoteNode.auto_spawn_workerpals, true),
-      maxWorkerpals: Math.max(
-        1,
-        asInt(parseIntEnv("REMOTEBUDDY_MAX_WORKERPALS") ?? remoteNode.max_workerpals, 20),
-      ),
+      minWorkerpals: remoteMinWorkerpals,
+      maxWorkerpals: remoteMaxWorkerpals,
       workerpalStartupTimeoutMs: Math.max(
         1_000,
         asInt(

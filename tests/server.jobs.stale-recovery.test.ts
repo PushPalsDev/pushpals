@@ -172,6 +172,37 @@ describe("JobQueue stale recovery", () => {
     expect(claimByReplacement.job?.id).toBe(jobId);
   });
 
+  test("autoscale backlog counts pending task.execute jobs once the pinned worker is stale", () => {
+    const queue = new JobQueue(":memory:");
+    const enqueue = queue.enqueue({
+      taskId: "task-autoscale-stale-target",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    expect(enqueue.ok).toBe(true);
+
+    const claim = queue.claim("worker-stale-autoscale");
+    expect(claim.ok).toBe(true);
+    const jobId = claim.job!.id;
+    expect(
+      queue.defer(jobId, {
+        workerId: "worker-stale-autoscale",
+        deferMs: 120_000,
+      }).ok,
+    ).toBe(true);
+
+    const db = (queue as unknown as { db: any }).db as any;
+    const staleIso = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
+      staleIso,
+      "worker-stale-autoscale",
+    );
+
+    expect(queue.countByKindAndStatus("task.execute", "pending")).toBe(1);
+    expect(queue.countAutoscalablePendingByKind("task.execute")).toBe(1);
+  });
+
   test("deferring maintenance retargets the job to the worker performing the prep", () => {
     const queue = new JobQueue(":memory:");
     const enqueue = queue.enqueue({

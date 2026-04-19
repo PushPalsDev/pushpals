@@ -160,4 +160,37 @@ describe("server JobQueue PR worker affinity", () => {
     expect(secondJob?.targetWorkerId).toBeNull();
     queue.close();
   });
+
+  test("autoscale backlog ignores jobs pinned to a healthy worker", () => {
+    const queue = new JobQueue(":memory:");
+    const prUrl = "https://github.com/org/repo/pull/127";
+
+    const first = queue.enqueue({
+      taskId: "task-pr-affinity-autoscale-1",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {
+        reviewAgent: { prUrl },
+      },
+      dedupeKey: "pr:127:sha-a",
+    });
+    expect(first.ok).toBe(true);
+    const firstJobId = String(first.jobId ?? "");
+    expect(queue.claim("worker-affinity").job?.id).toBe(firstJobId);
+    expect(queue.complete(firstJobId, { summary: "done" }).ok).toBe(true);
+
+    const second = queue.enqueue({
+      taskId: "task-pr-affinity-autoscale-2",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {
+        reviewAgent: { prUrl },
+      },
+      dedupeKey: "pr:127:sha-b",
+    });
+    expect(second.ok).toBe(true);
+    expect(queue.countByKindAndStatus("task.execute", "pending")).toBe(1);
+    expect(queue.countAutoscalablePendingByKind("task.execute")).toBe(0);
+    queue.close();
+  });
 });

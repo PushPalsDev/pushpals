@@ -587,6 +587,20 @@ interface WorkerSnapshot {
   isOnline: boolean;
 }
 
+interface WorkerAutoscaleSnapshot {
+  workers: {
+    total: number;
+    online: number;
+    busy: number;
+    idle: number;
+  };
+  jobs: {
+    pending: number;
+    claimed: number;
+    autoscalablePending: number;
+  };
+}
+
 interface JobLogEntry {
   id: number;
   jobId: string;
@@ -727,6 +741,7 @@ export class RemoteBuddyOrchestrator {
   private readonly workerOnlineTtlMs: number;
   private readonly waitForWorkerMs: number;
   private autoSpawnWorkers: boolean;
+  private readonly minWorkers: number;
   private readonly maxWorkers: number;
   private readonly workerStartupTimeoutMs: number;
   private readonly spawnWorkerDocker: boolean;
@@ -753,6 +768,8 @@ export class RemoteBuddyOrchestrator {
   private workerSpawnInFlight: Promise<string | null> | null = null;
   private workerSpawnCooldownUntil = 0;
   private readonly workerSpawnBackoffMs: number;
+  private readonly workerAutoscalePollMs: number;
+  private lastWorkerAutoscaleAt = 0;
   private readonly comm: CommunicationManager;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private statusSessionReady = false;
@@ -810,6 +827,7 @@ export class RemoteBuddyOrchestrator {
     this.workerOnlineTtlMs = Math.max(1_000, remoteCfg.workerpalOnlineTtlMs);
     this.waitForWorkerMs = Math.max(0, remoteCfg.waitForWorkerpalMs);
     this.autoSpawnWorkers = remoteCfg.autoSpawnWorkerpals;
+    this.minWorkers = Math.max(1, Math.min(remoteCfg.minWorkerpals, remoteCfg.maxWorkerpals));
     this.maxWorkers = Math.max(1, remoteCfg.maxWorkerpals);
     this.spawnWorkerDocker = remoteCfg.workerpalDocker;
     this.spawnWorkerRequireDocker = remoteCfg.workerpalRequireDocker;
@@ -838,6 +856,7 @@ export class RemoteBuddyOrchestrator {
         ? remoteCfg.crashRestartBackoffMs
         : 3_000,
     );
+    this.workerAutoscalePollMs = Math.max(1_000, remoteCfg.pollMs);
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
     this.fetchFailureLogsOnJobFailure = parseEnabledFlag(
       process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS,
@@ -906,7 +925,7 @@ export class RemoteBuddyOrchestrator {
     this.autonomousEngine.setRuntimeEnabled(this.autonomyRuntimeEnabled);
     console.log(`[RemoteBuddy] Detected repo root: ${this.repo}`);
     console.log(
-      `[RemoteBuddy] Worker scheduler: max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
+      `[RemoteBuddy] Worker scheduler: min=${this.minWorkers} max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
     );
     console.log(
       `[RemoteBuddy] Budgets: interactive=${this.executionBudgetInteractiveMs}ms normal=${this.executionBudgetNormalMs}ms background=${this.executionBudgetBackgroundMs}ms finalization=${this.finalizationBudgetMs}ms`,
@@ -1887,6 +1906,25 @@ export class RemoteBuddyOrchestrator {
     }
   }
 
+  private async fetchWorkerAutoscaleSnapshot(): Promise<WorkerAutoscaleSnapshot | null> {
+    try {
+      const res = await fetch(`${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`, {
+        method: "GET",
+        headers: this.authHeaders(),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        ok: boolean;
+        workers?: WorkerAutoscaleSnapshot["workers"];
+        jobs?: WorkerAutoscaleSnapshot["jobs"];
+      };
+      if (!data.ok || !data.workers || !data.jobs) return null;
+      return { workers: data.workers, jobs: data.jobs };
+    } catch {
+      return null;
+    }
+  }
+
   private pickIdleWorker(workers: WorkerSnapshot[]): WorkerSnapshot | null {
     const idle = workers
       .filter(
@@ -1936,6 +1974,47 @@ export class RemoteBuddyOrchestrator {
       return "WorkerPal auto-spawn did not produce an online worker.";
     }
     return "No online WorkerPal backends and auto-spawn is disabled.";
+  }
+
+  private desiredWorkerCountFromAutoscaleSnapshot(snapshot: WorkerAutoscaleSnapshot): number {
+    return Math.max(
+      this.minWorkers,
+      Math.min(
+        this.maxWorkers,
+        Math.max(
+          snapshot.workers.online,
+          snapshot.workers.busy + Math.max(0, snapshot.jobs.autoscalablePending),
+        ),
+      ),
+    );
+  }
+
+  private async ensureAutoscaledWorkerCapacity(reason = "background"): Promise<void> {
+    if (!this.autoSpawnWorkers || this.disposed) return;
+    const snapshot = await this.fetchWorkerAutoscaleSnapshot();
+    if (!snapshot) return;
+
+    const desiredOnline = this.desiredWorkerCountFromAutoscaleSnapshot(snapshot);
+    let online = Math.max(0, snapshot.workers.online);
+    if (online >= desiredOnline) return;
+
+    console.log(
+      `[RemoteBuddy] Worker autoscaler (${reason}): online=${snapshot.workers.online} busy=${snapshot.workers.busy} pending=${snapshot.jobs.pending} autoscalablePending=${snapshot.jobs.autoscalablePending} target=${desiredOnline}.`,
+    );
+
+    while (!this.disposed && online < desiredOnline) {
+      const spawned = await this.spawnWorker();
+      if (!spawned) break;
+      online += 1;
+    }
+  }
+
+  private async maybeAutoscaleWorkers(): Promise<void> {
+    if (!this.autoSpawnWorkers || this.disposed) return;
+    const now = Date.now();
+    if (now - this.lastWorkerAutoscaleAt < this.workerAutoscalePollMs) return;
+    this.lastWorkerAutoscaleAt = now;
+    await this.ensureAutoscaledWorkerCapacity("poll");
   }
 
   private buildWorkerSpawnCommand(workerId: string): string[] {
@@ -2052,6 +2131,7 @@ export class RemoteBuddyOrchestrator {
       const spawned = await this.spawnWorker();
       if (spawned) {
         console.log(`[RemoteBuddy] Initial WorkerPal capacity ready via ${spawned}.`);
+        void this.ensureAutoscaledWorkerCapacity("startup warm pool");
         return;
       }
     }
@@ -2063,6 +2143,7 @@ export class RemoteBuddyOrchestrator {
       console.log(
         `[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`,
       );
+      void this.ensureAutoscaledWorkerCapacity("startup warm pool");
       return;
     }
     const after = await this.fetchWorkers();
@@ -2634,6 +2715,7 @@ export class RemoteBuddyOrchestrator {
 
     while (!this.disposed) {
       try {
+        await this.maybeAutoscaleWorkers();
         const res = await fetch(`${this.server}/requests/claim`, {
           method: "POST",
           headers: this.authHeaders(),

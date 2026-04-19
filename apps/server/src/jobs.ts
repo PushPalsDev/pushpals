@@ -1547,6 +1547,70 @@ export class JobQueue {
     return counts;
   }
 
+  countByKindAndStatus(
+    kind: string,
+    statuses: JobStatus | JobStatus[],
+  ): number {
+    const normalizedKind = String(kind ?? "").trim();
+    if (!normalizedKind) return 0;
+    const requestedStatuses = Array.isArray(statuses) ? statuses : [statuses];
+    const normalizedStatuses = [...new Set(requestedStatuses.map((status) => String(status).trim()))]
+      .filter((status) => status === "pending" || status === "claimed" || status === "completed" || status === "failed");
+    if (normalizedStatuses.length === 0) return 0;
+    const placeholders = normalizedStatuses.map(() => "?").join(", ");
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM jobs
+         WHERE kind = ?
+           AND status IN (${placeholders})`,
+      )
+      .get(normalizedKind, ...normalizedStatuses) as { count: number } | undefined;
+    return Number(row?.count || 0);
+  }
+
+  countAutoscalablePendingByKind(kind: string): number {
+    const normalizedKind = String(kind ?? "").trim();
+    if (!normalizedKind) return 0;
+    const now = new Date().toISOString();
+    const targetWorkerCutoff = new Date(Date.now() - PR_WORKER_ASSIGNMENT_MAX_AGE_MS).toISOString();
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM jobs
+         WHERE kind = ?
+           AND status = 'pending'
+           AND (
+             availableAt IS NULL
+             OR availableAt <= ?
+             OR (
+               targetWorkerId IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM workers tw
+                 WHERE tw.workerId = jobs.targetWorkerId
+                   AND COALESCE(tw.status, 'idle') <> 'offline'
+                   AND tw.lastHeartbeat >= ?
+               )
+             )
+           )
+           AND (
+             targetWorkerId IS NULL
+             OR NOT EXISTS (
+               SELECT 1
+               FROM workers tw
+               WHERE tw.workerId = jobs.targetWorkerId
+                 AND COALESCE(tw.status, 'idle') <> 'offline'
+                 AND tw.lastHeartbeat >= ?
+             )
+           )`,
+      )
+      .get(normalizedKind, now, targetWorkerCutoff, targetWorkerCutoff) as
+      | { count: number }
+      | undefined;
+    return Number(row?.count || 0);
+  }
+
   listWorkerPrBacklog(limit = 200): WorkerPrBacklogEntry[] {
     const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(2_000, Math.floor(limit))) : 200;
     const scanRows = Math.max(50, maxRows * 8);

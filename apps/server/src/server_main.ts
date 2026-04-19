@@ -461,7 +461,7 @@ export function createRequestHandler() {
             pathname,
           )) ||
         (method === "GET" &&
-          /^\/+(workers|system\/status|requests|jobs|completions|questions|autonomy\/insights|requests\/[^/]+|jobs\/[^/]+|completions\/[^/]+|jobs\/[^/]+\/logs)(\/)?$/.test(
+          /^\/+(workers|workers\/autoscale|system\/status|requests|jobs|completions|questions|autonomy\/insights|requests\/[^/]+|jobs\/[^/]+|completions\/[^/]+|jobs\/[^/]+\/logs)(\/)?$/.test(
             pathname,
           ));
       if (isNoisyPoll) {
@@ -889,6 +889,38 @@ export function createRequestHandler() {
         const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
         const workers = jobQueue.listWorkers(ttlMs);
         return makeJson({ ok: true, workers });
+      }
+
+      // GET /workers/autoscale
+      if (pathname === "/workers/autoscale" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        maybeRecoverStaleClaims();
+
+        const ttlMsRaw = parseInt(url.searchParams.get("ttlMs") ?? "", 10);
+        const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw > 0 ? ttlMsRaw : 15000;
+        const workers = jobQueue.listWorkers(ttlMs);
+        const onlineWorkers = workers.filter((worker) => worker.isOnline);
+        const busyWorkers = onlineWorkers.filter((worker) => worker.activeJobCount > 0).length;
+        const taskExecutePending = jobQueue.countByKindAndStatus("task.execute", "pending");
+        const taskExecuteClaimed = jobQueue.countByKindAndStatus("task.execute", "claimed");
+        const autoscalableTaskExecutePending = jobQueue.countAutoscalablePendingByKind(
+          "task.execute",
+        );
+        return makeJson({
+          ok: true,
+          workers: {
+            total: workers.length,
+            online: onlineWorkers.length,
+            busy: busyWorkers,
+            idle: Math.max(0, onlineWorkers.length - busyWorkers),
+          },
+          jobs: {
+            pending: taskExecutePending,
+            claimed: taskExecuteClaimed,
+            autoscalablePending: autoscalableTaskExecutePending,
+          },
+        });
       }
 
       // GET /system/status
