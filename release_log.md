@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.43`
-- start_commit: `09c40ae7756616de6929b73cd691ff700adffd4c`
-- end_commit: `a578abef20aa27df407d489168114875f7210940`
+- version: `v1.0.44`
+- start_commit: `d3a5ff6075594c2ca512a3c9fd0d4ad81a23c71a`
+- end_commit: `f56edd0d429523d110bb6772f630c4793ef3b319`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Build Windows CLI and embedded runtime binaries natively on `windows-2022` instead of cross-compiling them on Ubuntu before release.
-- Add a release-blocking Windows smoke test that boots the compiled `server` and `remotebuddy` binaries with autonomy enabled against a temp repo containing `vision.md`.
-- Expand packaged CLI Windows E2E coverage to verify autonomy-enabled startup and ensure the release workflow consistently reads `release_log.md` when publishing GitHub Releases.
+- Treat merge-conflict repair jobs as a stricter quality-gate mode so they can no longer soft-pass exhausted auto-revisions while an unfinished rebase is still active.
+- Fail merge-conflict executions immediately when the worker returns with an in-progress git sequencer instead of drifting into validation and later dying during commit finalization.
+- Add regression coverage for the merge-conflict quality policy override and the fail-fast execution path when a sandbox repo is still paused mid-rebase.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.43 && git push origin v1.0.43`.
+- Tag and push: `git tag v1.0.44 && git push origin v1.0.44`.
