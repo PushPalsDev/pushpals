@@ -62,7 +62,6 @@ _CODEX_WORKAROUND_PATTERNS = (
     ),
     re.compile(r"\bwithout requiring\b.{0,120}\bcodex\b", re.IGNORECASE),
     re.compile(r"\bavoid(?:ing)?\b.{0,120}\bcodex\b.{0,120}\bcall", re.IGNORECASE),
-    re.compile(r"\b(fell back|fallback|worked around|workaround|bypass(?:ed)?|switched to)\b.{0,120}\bcodex\b", re.IGNORECASE),
 )
 _CODEX_WORKAROUND_NEGATION_HINTS = (
     "do not",
@@ -74,6 +73,15 @@ _CODEX_WORKAROUND_NEGATION_HINTS = (
     "hard fail",
     "explicit failure",
     "codex cli is required infrastructure",
+)
+_REJECTED_EXEC_COMMAND_PATTERN = re.compile(r"exec_command failed for `([^`]+)`", re.IGNORECASE)
+_DISALLOWED_SHELL_WRAPPER_PREFIXES = (
+    "/bin/bash -lc ",
+    "bash -lc ",
+    "sh -lc ",
+    "cmd /c ",
+    "powershell -command ",
+    "pwsh -command ",
 )
 
 _VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
@@ -942,6 +950,37 @@ def _detect_codex_workaround_signal(*texts: str) -> Optional[str]:
     return None
 
 
+def _normalize_command_text(command: str) -> str:
+    return re.sub(r"\s+", " ", str(command or "")).strip()
+
+
+def _is_disallowed_shell_wrapper_command(command: str) -> bool:
+    normalized = _normalize_command_text(command).lower()
+    return any(normalized.startswith(prefix) for prefix in _DISALLOWED_SHELL_WRAPPER_PREFIXES)
+
+
+def _extract_rejected_exec_command(text: str) -> str:
+    match = _REJECTED_EXEC_COMMAND_PATTERN.search(str(text or ""))
+    if not match:
+        return ""
+    return _normalize_command_text(match.group(1))
+
+
+def _collect_disallowed_shell_wrapper_rejections(*texts: str) -> List[str]:
+    rejected: List[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        command = _extract_rejected_exec_command(str(text or ""))
+        if not command or not _is_disallowed_shell_wrapper_command(command):
+            continue
+        lowered = command.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        rejected.append(command)
+    return rejected
+
+
 def _read_text_if_exists(path: Path) -> str:
     try:
         if not path.exists():
@@ -1166,6 +1205,7 @@ def _run_codex_task(
         stdout_trace_state = _empty_codex_trace()
         trace_lock = threading.Lock()
         last_activity_at = {"ts": started_at}
+        wrapper_rejection_state: Dict[str, Any] = {"count": 0, "commands": []}
 
         def _drain_stdout() -> None:
             stream = proc.stdout
@@ -1199,6 +1239,21 @@ def _run_codex_task(
                     if chunk == "":
                         break
                     stderr_chunks.append(chunk)
+                    rejected_commands = _collect_disallowed_shell_wrapper_rejections(chunk)
+                    if rejected_commands:
+                        with trace_lock:
+                            wrapper_rejection_state["count"] = to_int(
+                                wrapper_rejection_state.get("count"), 0
+                            ) + len(rejected_commands)
+                            tracked = wrapper_rejection_state.get("commands")
+                            if not isinstance(tracked, list):
+                                tracked = []
+                            for command in rejected_commands:
+                                lowered = command.lower()
+                                if any(str(item).lower() == lowered for item in tracked):
+                                    continue
+                                tracked.append(command)
+                            wrapper_rejection_state["commands"] = tracked[:6]
             except Exception:
                 pass
             finally:
@@ -1226,11 +1281,19 @@ def _run_codex_task(
         )
         next_progress_at = started_at + float(progress_interval_s)
         timed_out = False
+        command_policy_rejection_loop = False
 
         while proc.poll() is None:
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 timed_out = True
+                _terminate_active_child()
+                break
+
+            with trace_lock:
+                wrapper_rejections = to_int(wrapper_rejection_state.get("count"), 0)
+            if wrapper_rejections >= 3:
+                command_policy_rejection_loop = True
                 _terminate_active_child()
                 break
 
@@ -1279,6 +1342,18 @@ def _run_codex_task(
             part for part in (stdout, stderr, trace_excerpt) if str(part or "").strip()
         )
         usage = _usage_from_trace_or_estimate(stdout_trace, prompt, usage_output_text, model=model)
+        rejected_shell_wrappers = _collect_disallowed_shell_wrapper_rejections(stdout, stderr)
+        with trace_lock:
+            tracked = wrapper_rejection_state.get("commands")
+            if isinstance(tracked, list):
+                for command in tracked:
+                    text = _normalize_command_text(str(command))
+                    if not text:
+                        continue
+                    lowered = text.lower()
+                    if any(entry.lower() == lowered for entry in rejected_shell_wrappers):
+                        continue
+                    rejected_shell_wrappers.append(text)
 
         if timed_out:
             detail = (
@@ -1299,6 +1374,30 @@ def _run_codex_task(
 
         last_message = _read_text_if_exists(last_message_path)
         log_git_status(repo, log)
+
+        if command_policy_rejection_loop:
+            command_lines = (
+                "\n".join(f"- {command}" for command in rejected_shell_wrappers[:6])
+                if rejected_shell_wrappers
+                else "- (no command details captured)"
+            )
+            detail = (
+                "Codex repeatedly attempted disallowed shell-wrapper commands that the command "
+                "router rejected. Switch to direct commands only and avoid wrapper retries.\n"
+                f"Rejected commands:\n{command_lines}"
+            )
+            if last_message:
+                detail = f"{detail}\nLast assistant message:\n{last_message}"
+            if trace_excerpt:
+                detail = f"{detail}\n{trace_excerpt}"
+            return {
+                "ok": False,
+                "summary": "openai_codex command policy rejection loop",
+                "stdout": _truncate(stdout),
+                "stderr": _truncate(detail),
+                "exitCode": 6,
+                "usage": usage,
+            }
 
         if _INTERRUPTED_SIGNAL is not None:
             return {

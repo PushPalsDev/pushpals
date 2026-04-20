@@ -15,6 +15,7 @@ from openai_codex_executor import (
     OpenAICodexRuntimeConfig,
     _resolve_reasoning_effort,
     _build_instruction,
+    _collect_disallowed_shell_wrapper_rejections,
     _detect_codex_workaround_signal,
     _extract_usage_counts,
     _load_prompt_template,
@@ -163,6 +164,12 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         )
         self.assertIsNone(signal)
 
+    def test_ignores_generic_workaround_language_without_unavailable_codex_context(self) -> None:
+        signal = _detect_codex_workaround_signal(
+            "This is a workaround case, so I am stopping here until the command router issue is fixed.",
+        )
+        self.assertIsNone(signal)
+
     def test_discovers_repo_root_for_prompt_loading(self) -> None:
         repo_root = _repo_root_for_prompt_loading()
         self.assertTrue((repo_root / "prompts").is_dir())
@@ -189,6 +196,14 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             usage,
             {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
         )
+
+    def test_collects_disallowed_shell_wrapper_rejections(self) -> None:
+        commands = _collect_disallowed_shell_wrapper_rejections(
+            "error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess { message: \"Rejected\" }",
+            "error=exec_command failed for `sh -lc \"git diff\"`: Rejected",
+            "error=exec_command failed for `pwd`: Rejected",
+        )
+        self.assertEqual(commands, ["/bin/bash -lc pwd", 'sh -lc "git diff"'])
 
     def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:
         usage = _usage_from_trace_or_estimate({}, "abc" * 30, "done", model="gpt-5.4")
