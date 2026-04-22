@@ -236,6 +236,9 @@ const MONITOR_POLL_MS = 2_000;
 const HTTP_TIMEOUT_MS = 2_500;
 const LOCALBUDDY_TIMEOUT_MS = 4_000;
 const SSE_RECONNECT_MS = 1_500;
+const DOCKER_VERSION_PROBE_TIMEOUT_MS = 10_000;
+const WORKERPAL_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
+const WORKERPAL_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
 const DEFAULT_SERVER_BOOT_TIMEOUT_MS = 20_000;
@@ -2178,6 +2181,7 @@ async function resolveWorkerpalDockerProbe(
       [candidate, "version", "--format", "{{.Server.Version}}"],
       cwd,
       env,
+      DOCKER_VERSION_PROBE_TIMEOUT_MS,
     );
     if (result.ok) {
       const version = result.stdout.trim();
@@ -2206,6 +2210,11 @@ type GitWorktreeEntry = {
   branch: string | null;
   detached: boolean;
 };
+
+type DockerImageRuntimeTagInspection =
+  | { status: "ok"; runtimeTag: string }
+  | { status: "missing"; runtimeTag: "" }
+  | { status: "failed"; runtimeTag: ""; detail: string };
 
 function normalizeFsPathForComparison(value: string): string {
   const resolved = resolve(String(value ?? "").trim())
@@ -2460,12 +2469,17 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
   };
 }
 
+function isMissingDockerImageDetail(detail: string): boolean {
+  return /\b(no such object|no such image|not found)\b/i.test(String(detail ?? ""));
+}
+
 async function inspectDockerImageRuntimeTag(
   dockerExecutable: string,
   imageName: string,
   cwd: string,
   env: Record<string, string>,
-): Promise<string> {
+  timeoutMs = WORKERPAL_IMAGE_INSPECT_TIMEOUT_MS,
+): Promise<DockerImageRuntimeTagInspection> {
   const inspect = await runCommandWithEnv(
     [
       dockerExecutable,
@@ -2477,10 +2491,24 @@ async function inspectDockerImageRuntimeTag(
     ],
     cwd,
     env,
+    timeoutMs,
   );
-  if (!inspect.ok) return "";
+  if (!inspect.ok) {
+    const detail = inspect.stderr || inspect.stdout || `exit ${inspect.exitCode}`;
+    if (isMissingDockerImageDetail(detail)) {
+      return { status: "missing", runtimeTag: "" };
+    }
+    return {
+      status: "failed",
+      runtimeTag: "",
+      detail: `failed to inspect local WorkerPal sandbox image ${imageName}: ${detail}`,
+    };
+  }
   const value = inspect.stdout.trim();
-  return value === "<no value>" ? "" : value;
+  return {
+    status: "ok",
+    runtimeTag: value === "<no value>" ? "" : value,
+  };
 }
 
 export async function ensureWorkerpalDockerImageReady(opts: {
@@ -2516,12 +2544,22 @@ export async function ensureWorkerpalDockerImageReady(opts: {
   );
   const inspectImageRuntimeTagFn = opts.inspectImageRuntimeTagFn ?? inspectDockerImageRuntimeTag;
   const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
-  const existingRuntimeTag = await inspectImageRuntimeTagFn(
+  console.log(
+    `[pushpals] Checking WorkerPal sandbox image ${opts.dockerImage} for runtimeTag=${runtimeTag}...`,
+  );
+  const inspection = await inspectImageRuntimeTagFn(
     dockerExecutable,
     opts.dockerImage,
     sandbox.root,
     opts.env,
   );
+  if (inspection.status === "failed") {
+    return {
+      ok: false,
+      detail: inspection.detail,
+    };
+  }
+  const existingRuntimeTag = inspection.runtimeTag;
   if (existingRuntimeTag === runtimeTag) {
     return {
       ok: true,
@@ -2550,6 +2588,7 @@ export async function ensureWorkerpalDockerImageReady(opts: {
     ],
     sandbox.root,
     opts.env,
+    WORKERPAL_IMAGE_BUILD_TIMEOUT_MS,
   );
   if (!build.ok) {
     const detail = build.stderr || build.stdout || `docker build exited ${build.exitCode}`;

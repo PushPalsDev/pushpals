@@ -1296,7 +1296,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           PUSHPALS_DOCKER_BIN_ABSOLUTE: "/usr/local/bin/docker",
         },
         ensureRuntimeAssetsFn: async () => {},
-        inspectImageRuntimeTagFn: async () => "",
+        inspectImageRuntimeTagFn: async () => ({ status: "missing", runtimeTag: "" }),
         runCommandWithEnvFn: async (command, cwd) => {
           calls.push({ command, cwd });
           return { ok: true, stdout: "ok", stderr: "", exitCode: 0 };
@@ -1359,7 +1359,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           PUSHPALS_DOCKER_BIN: "docker",
         },
         ensureRuntimeAssetsFn: async () => {},
-        inspectImageRuntimeTagFn: async () => "v1.0.19",
+        inspectImageRuntimeTagFn: async () => ({ status: "ok", runtimeTag: "v1.0.19" }),
         runCommandWithEnvFn: async () => {
           throw new Error("docker build should not run when the local image already matches");
         },
@@ -1369,6 +1369,58 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         ok: true,
         detail:
           "WorkerPal sandbox image is ready locally (pushpals-worker-sandbox:latest, runtimeTag=v1.0.19)",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ensureWorkerpalDockerImageReady fails fast when inspecting the local sandbox image times out", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-worker-image-timeout-"));
+    const sandbox = buildWorkerpalSandboxPaths(root);
+    mkdirSync(join(sandbox.workerpalsDir, "src"), { recursive: true });
+    mkdirSync(sandbox.sharedDir, { recursive: true });
+    mkdirSync(sandbox.protocolDir, { recursive: true });
+    mkdirSync(sandbox.configsDir, { recursive: true });
+    mkdirSync(sandbox.workerpalsPromptsDir, { recursive: true });
+    mkdirSync(sandbox.protocolSchemasDir, { recursive: true });
+    writeFileSync(sandbox.packageJsonPath, '{"name":"pushpals-sandbox"}\n', "utf8");
+    writeFileSync(sandbox.dockerfilePath, "FROM oven/bun:1-debian\n", "utf8");
+    writeFileSync(join(sandbox.sharedDir, "package.json"), '{"name":"shared"}\n', "utf8");
+    writeFileSync(join(sandbox.protocolDir, "package.json"), '{"name":"protocol"}\n', "utf8");
+    writeFileSync(join(sandbox.configsDir, "default.toml"), 'profile = "dev"\n', "utf8");
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "workerpals_system_prompt.md"),
+      "# workerpals\n",
+      "utf8",
+    );
+    writeFileSync(join(sandbox.protocolSchemasDir, "envelope.schema.json"), "{}\n", "utf8");
+    writeFileSync(join(sandbox.protocolSchemasDir, "events.schema.json"), "{}\n", "utf8");
+
+    try {
+      const result = await ensureWorkerpalDockerImageReady({
+        runtimeRoot: root,
+        runtimeTag: "v1.0.47",
+        dockerImage: "pushpals-worker-sandbox:latest",
+        env: {
+          PUSHPALS_DOCKER_BIN: "docker",
+        },
+        ensureRuntimeAssetsFn: async () => {},
+        inspectImageRuntimeTagFn: async () => ({
+          status: "failed",
+          runtimeTag: "",
+          detail:
+            "failed to inspect local WorkerPal sandbox image pushpals-worker-sandbox:latest: timed out after 15000ms",
+        }),
+        runCommandWithEnvFn: async () => {
+          throw new Error("docker build should not run when image inspect already failed");
+        },
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        detail:
+          "failed to inspect local WorkerPal sandbox image pushpals-worker-sandbox:latest: timed out after 15000ms",
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
