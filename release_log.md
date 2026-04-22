@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.48`
-- start_commit: `0e528e542c0976b7a969299fb60344704849c969`
-- end_commit: `727a69631da497550cefced2c41cd84aa90d08cd`
+- version: `v1.0.49`
+- start_commit: `aaf83eff4065c7549b13d502581801fadf6ade55`
+- end_commit: `dcdfad4f149a52fbc483ef2c02fca6ff0b09215b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add explicit timeout bounds for Docker version probing, WorkerPal sandbox image inspection, and sandbox image rebuilds during CLI startup.
-- Surface progress logging before the WorkerPal sandbox image precheck so Docker Desktop or WSL stalls no longer look like a frozen `pushpals` startup.
-- Fail fast with a direct sandbox-image inspection error when the local Docker daemon hangs instead of waiting indefinitely after embedded runtime assets are prepared.
+- Recover from stuck WorkerPal sandbox image inspection by treating timed-out local image metadata checks as rebuild signals instead of startup-stopping failures.
+- Keep the runtime Docker executor on the same bounded image-inspection/build logic so RemoteBuddy and WorkerPals do not hang later on the same Docker image state.
+- Preserve direct diagnostics when Docker commands still fail, but allow healthy rebuilds to repair a wedged local `pushpals-worker-sandbox:latest` automatically.
 
 ## Install
 
