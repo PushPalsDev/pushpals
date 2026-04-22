@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.47`
-- start_commit: `5f868d89563bc11712aa6489dd3692be43effea3`
-- end_commit: `fcdac97b3a680637f1a94907f3007dddfc95e398`
+- version: `v1.0.48`
+- start_commit: `0e528e542c0976b7a969299fb60344704849c969`
+- end_commit: `727a69631da497550cefced2c41cd84aa90d08cd`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Narrow OpenAI Codex workaround detection so generic "workaround" language does not trigger false policy violations.
-- Fail OpenAI Codex jobs quickly when the command router keeps rejecting disallowed shell-wrapper commands instead of letting them drift into stale worker claims.
-- Include rejected wrapper command samples in worker failure details so merge-conflict and review-fix diagnostics are easier to act on.
+- Add explicit timeout bounds for Docker version probing, WorkerPal sandbox image inspection, and sandbox image rebuilds during CLI startup.
+- Surface progress logging before the WorkerPal sandbox image precheck so Docker Desktop or WSL stalls no longer look like a frozen `pushpals` startup.
+- Fail fast with a direct sandbox-image inspection error when the local Docker daemon hangs instead of waiting indefinitely after embedded runtime assets are prepared.
 
 ## Install
 
