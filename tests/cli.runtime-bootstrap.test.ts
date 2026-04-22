@@ -1375,7 +1375,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
-  test("ensureWorkerpalDockerImageReady fails fast when inspecting the local sandbox image times out", async () => {
+  test("ensureWorkerpalDockerImageReady rebuilds when inspecting the local sandbox image times out", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-worker-image-timeout-"));
     const sandbox = buildWorkerpalSandboxPaths(root);
     mkdirSync(join(sandbox.workerpalsDir, "src"), { recursive: true });
@@ -1412,15 +1412,16 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           detail:
             "failed to inspect local WorkerPal sandbox image pushpals-worker-sandbox:latest: timed out after 15000ms",
         }),
-        runCommandWithEnvFn: async () => {
-          throw new Error("docker build should not run when image inspect already failed");
+        runCommandWithEnvFn: async (command) => {
+          expect(command).toContain("build");
+          return { ok: true, stdout: "ok", stderr: "", exitCode: 0 };
         },
       });
 
       expect(result).toEqual({
-        ok: false,
+        ok: true,
         detail:
-          "failed to inspect local WorkerPal sandbox image pushpals-worker-sandbox:latest: timed out after 15000ms",
+          "rebuilt local WorkerPal sandbox image pushpals-worker-sandbox:latest for runtimeTag=v1.0.47 after image inspection failed",
       });
     } finally {
       rmSync(root, { recursive: true, force: true });

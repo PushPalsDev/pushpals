@@ -97,6 +97,48 @@ describe("workerpals docker executor internals", () => {
     ).toBe(true);
   });
 
+  test("imageExists treats inspection timeouts as unavailable instead of hanging", async () => {
+    const executor = createExecutor() as unknown as {
+      imageExists: () => Promise<boolean>;
+      runDockerCommandCapture: () => Promise<{
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+        timedOut: boolean;
+      }>;
+    };
+
+    executor.runDockerCommandCapture = async () => ({
+      stdout: "",
+      stderr: "",
+      exitCode: -1,
+      timedOut: true,
+    });
+
+    await expect(executor.imageExists()).resolves.toBe(false);
+  });
+
+  test("inspectImageRuntimeTag treats inspection timeouts as stale so rebuild can proceed", async () => {
+    const executor = createExecutor() as unknown as {
+      inspectImageRuntimeTag: () => Promise<string>;
+      runDockerCommandCapture: () => Promise<{
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+        timedOut: boolean;
+      }>;
+    };
+
+    executor.runDockerCommandCapture = async () => ({
+      stdout: "",
+      stderr: "",
+      exitCode: -1,
+      timedOut: true,
+    });
+
+    await expect(executor.inspectImageRuntimeTag()).resolves.toBe("");
+  });
+
   test("ensureWorktreeAccessibleInWarmContainer recycles the warm container after a visibility race", async () => {
     const executor = createExecutor() as unknown as {
       ensureWorktreeAccessibleInWarmContainer: (

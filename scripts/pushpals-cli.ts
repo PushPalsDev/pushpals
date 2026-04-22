@@ -2553,22 +2553,22 @@ export async function ensureWorkerpalDockerImageReady(opts: {
     sandbox.root,
     opts.env,
   );
-  if (inspection.status === "failed") {
-    return {
-      ok: false,
-      detail: inspection.detail,
-    };
-  }
-  const existingRuntimeTag = inspection.runtimeTag;
-  if (existingRuntimeTag === runtimeTag) {
+  const inspectFailureDetail = inspection.status === "failed" ? inspection.detail : "";
+  const existingRuntimeTag = inspection.status === "ok" ? inspection.runtimeTag : "";
+  if (inspection.status === "ok" && existingRuntimeTag === runtimeTag) {
     return {
       ok: true,
       detail: `WorkerPal sandbox image is ready locally (${opts.dockerImage}, runtimeTag=${runtimeTag})`,
     };
   }
+  if (inspectFailureDetail) {
+    console.warn(`[pushpals] ${inspectFailureDetail}`);
+  }
 
   console.log(
-    existingRuntimeTag
+    inspectFailureDetail
+      ? `[pushpals] WorkerPal sandbox image ${opts.dockerImage} could not be inspected; attempting local rebuild...`
+      : existingRuntimeTag
       ? `[pushpals] WorkerPal sandbox image ${opts.dockerImage} is stale (runtimeTag=${existingRuntimeTag}); rebuilding locally...`
       : `[pushpals] WorkerPal sandbox image ${opts.dockerImage} is missing; building locally...`,
   );
@@ -2594,13 +2594,17 @@ export async function ensureWorkerpalDockerImageReady(opts: {
     const detail = build.stderr || build.stdout || `docker build exited ${build.exitCode}`;
     return {
       ok: false,
-      detail: `failed to build local WorkerPal sandbox image ${opts.dockerImage}: ${detail}`,
+      detail: inspectFailureDetail
+        ? `${inspectFailureDetail}; failed to build local WorkerPal sandbox image ${opts.dockerImage}: ${detail}`
+        : `failed to build local WorkerPal sandbox image ${opts.dockerImage}: ${detail}`,
     };
   }
 
   return {
     ok: true,
-    detail: `built local WorkerPal sandbox image ${opts.dockerImage} for runtimeTag=${runtimeTag}`,
+    detail: inspectFailureDetail
+      ? `rebuilt local WorkerPal sandbox image ${opts.dockerImage} for runtimeTag=${runtimeTag} after image inspection failed`
+      : `built local WorkerPal sandbox image ${opts.dockerImage} for runtimeTag=${runtimeTag}`,
   };
 }
 

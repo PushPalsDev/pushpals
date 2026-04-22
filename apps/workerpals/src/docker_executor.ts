@@ -40,6 +40,9 @@ const DEFAULT_CONFIG = loadPushPalsConfig();
 const SHARED_CONTAINER_VENV_PYTHON = "/workspace/.venv/bin/python";
 const WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL = "pushpals.runtime_tag";
 const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox";
+const DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
+const DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
+const DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60_000;
 
 function parseClampedInt(value: unknown, defaultValue: number, min: number, max: number): number {
   const parsed =
@@ -97,6 +100,10 @@ function resolveWorkerpalRuntimeTag(): string {
 function dockerBuildFileArg(root: string, dockerfilePath: string): string {
   const relativePath = relative(root, dockerfilePath).replace(/\\/g, "/").trim();
   return relativePath || "apps/workerpals/Dockerfile.sandbox";
+}
+
+function isMissingDockerImageDetail(detail: string): boolean {
+  return /\b(no such object|no such image|not found)\b/i.test(String(detail ?? ""));
 }
 
 type ParsedWorktreeRecord = {
@@ -1530,6 +1537,45 @@ export class DockerExecutor {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
   }
 
+  private async runDockerCommandCapture(
+    command: string[],
+    opts: { cwd?: string; timeoutMs?: number } = {},
+  ): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut: boolean }> {
+    const proc = Bun.spawn(command, {
+      cwd: opts.cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (
+      typeof opts.timeoutMs === "number" &&
+      Number.isFinite(opts.timeoutMs) &&
+      opts.timeoutMs > 0
+    ) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        try {
+          proc.kill();
+        } catch {
+          // best-effort timeout termination only
+        }
+      }, opts.timeoutMs);
+    }
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (timer) clearTimeout(timer);
+    return {
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode,
+      timedOut,
+    };
+  }
+
   private compactError(err: unknown): string {
     const text = err instanceof Error ? err.message : String(err);
     const normalized = text.replace(/\s+/g, " ").trim();
@@ -1862,19 +1908,21 @@ export class DockerExecutor {
     console.log(
       `[DockerExecutor] Local image is unavailable or unsuitable. Pulling: ${this.options.imageName}`,
     );
-    const proc = Bun.spawn([resolveDockerExecutable(), "pull", this.options.imageName], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-
-    const exitCode = await proc.exited;
-    if (exitCode === 0) {
+    const pull = await this.runDockerCommandCapture(
+      [resolveDockerExecutable(), "pull", this.options.imageName],
+      { timeoutMs: DOCKER_IMAGE_PULL_TIMEOUT_MS },
+    );
+    if (!pull.timedOut && pull.exitCode === 0) {
       console.log(`[DockerExecutor] Image pulled successfully`);
       return true;
     }
 
-    const stderr = (await new Response(proc.stderr).text()).trim();
-    console.error(`[DockerExecutor] Failed to pull image: ${stderr}`);
+    const detail = pull.stderr || pull.stdout || `docker pull exited ${pull.exitCode}`;
+    console.error(
+      `[DockerExecutor] Failed to pull image: ${
+        pull.timedOut ? `timed out after ${DOCKER_IMAGE_PULL_TIMEOUT_MS}ms` : detail
+      }`,
+    );
 
     // Another process may have built/pulled the image while this pull was running.
     if (await this.imageExists()) {
@@ -1891,19 +1939,21 @@ export class DockerExecutor {
    * Check if the Docker image exists locally
    */
   private async imageExists(): Promise<boolean> {
-    const proc = Bun.spawn(
+    const result = await this.runDockerCommandCapture(
       [resolveDockerExecutable(), "image", "inspect", this.options.imageName],
-      {
-        stdout: "pipe",
-        stderr: "pipe",
-      },
+      { timeoutMs: DOCKER_IMAGE_INSPECT_TIMEOUT_MS },
     );
-    const exitCode = await proc.exited;
-    return exitCode === 0;
+    if (result.timedOut) {
+      console.warn(
+        `[DockerExecutor] Timed out checking local image ${this.options.imageName}; treating it as unavailable and attempting rebuild.`,
+      );
+      return false;
+    }
+    return result.exitCode === 0;
   }
 
   private async inspectImageRuntimeTag(): Promise<string> {
-    const proc = Bun.spawn(
+    const result = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
         "image",
@@ -1912,14 +1962,24 @@ export class DockerExecutor {
         `{{ index .Config.Labels "${WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL}" }}`,
         this.options.imageName,
       ],
-      {
-        stdout: "pipe",
-        stderr: "pipe",
-      },
+      { timeoutMs: DOCKER_IMAGE_INSPECT_TIMEOUT_MS },
     );
-    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    if (exitCode !== 0) return "";
-    const value = stdout.trim();
+    if (result.timedOut) {
+      console.warn(
+        `[DockerExecutor] Timed out inspecting runtime tag for ${this.options.imageName}; treating the local image as stale and attempting rebuild.`,
+      );
+      return "";
+    }
+    if (result.exitCode !== 0) {
+      const detail = result.stderr || result.stdout || `exit ${result.exitCode}`;
+      if (!isMissingDockerImageDetail(detail)) {
+        console.warn(
+          `[DockerExecutor] Failed to inspect runtime tag for ${this.options.imageName}: ${detail}`,
+        );
+      }
+      return "";
+    }
+    const value = result.stdout.trim();
     return value === "<no value>" ? "" : value;
   }
 
@@ -1947,21 +2007,19 @@ export class DockerExecutor {
       this.options.imageName,
       ".",
     ];
-    const proc = Bun.spawn(args, {
+    const build = await this.runDockerCommandCapture(args, {
       cwd: sandboxContext.root,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: DOCKER_IMAGE_BUILD_TIMEOUT_MS,
     });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    if (exitCode === 0) {
+    if (!build.timedOut && build.exitCode === 0) {
       return true;
     }
-    const detail = stderr.trim() || stdout.trim() || `docker build exited ${exitCode}`;
-    console.error(`[DockerExecutor] Failed to build local image: ${detail}`);
+    const detail = build.stderr || build.stdout || `docker build exited ${build.exitCode}`;
+    console.error(
+      `[DockerExecutor] Failed to build local image: ${
+        build.timedOut ? `timed out after ${DOCKER_IMAGE_BUILD_TIMEOUT_MS}ms` : detail
+      }`,
+    );
     return false;
   }
 
