@@ -115,6 +115,66 @@ function initializeMinimalRepo(root: string): string {
   return repoPath;
 }
 
+function createTaskExecuteParams(instruction: string): Record<string, unknown> {
+  return {
+    schemaVersion: 2,
+    lane: "worker",
+    instruction,
+    planning: {
+      intent: "code_change",
+      riskLevel: "medium",
+      targetPaths: ["README.md"],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["README.md"],
+        maxFilesToEdit: 1,
+      },
+      discovery: {
+        ripgrepQueries: ["README"],
+        likelyDirs: ["."],
+        keywords: ["readme"],
+      },
+      acceptanceCriteria: ["Update the requested repository file and report the result."],
+      validationSteps: ["git status --short"],
+      queuePriority: "normal",
+      queueWaitBudgetMs: 60_000,
+      executionBudgetMs: 120_000,
+      finalizationBudgetMs: 60_000,
+    },
+  };
+}
+
+function writeCodexWorkaroundStub(repoPath: string): string {
+  const helperDir = join(repoPath, ".pushpals-e2e");
+  mkdirSync(helperDir, { recursive: true });
+  const scriptPath = join(helperDir, "fake-codex-workaround.py");
+  const script = [
+    "from pathlib import Path",
+    "import sys",
+    "import time",
+    "",
+    "last_message_path = None",
+    "argv = sys.argv[1:]",
+    "for index, arg in enumerate(argv):",
+    '    if arg == "--output-last-message" and index + 1 < len(argv):',
+    "        last_message_path = argv[index + 1]",
+    "        break",
+    "",
+    'message = "Codex CLI isn\'t available here, so I\'m using a workaround instead."',
+    "if last_message_path:",
+    '    Path(last_message_path).write_text(message, encoding="utf-8")',
+    "time.sleep(1)",
+    "",
+  ].join("\n");
+  writeFileSync(
+    scriptPath,
+    script,
+    "utf8",
+  );
+  return scriptPath;
+}
+
 function dockerAvailable(): boolean {
   const proc = Bun.spawnSync(["docker", "version", "--format", "{{.Server.Version}}"], {
     cwd: sourceRepoRoot,
@@ -635,6 +695,176 @@ test(
       expect(output).toContain("rebuilding");
       expect(output).toContain("Docker image refresh complete");
       expect(output).toContain(`Claimed job ${jobId}`);
+    } finally {
+      if (proc) {
+        await stopWorker(proc);
+      }
+      if (serverHandle) {
+        await serverHandle.close();
+      }
+      cleanupDockerArtifacts(dockerImage, workerId);
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  15 * 60_000,
+);
+
+test(
+  "worker reports a codex policy violation for docker task.execute jobs",
+  async () => {
+    if (!dockerAvailable()) {
+      console.warn(
+        "[workerpals.control-plane.e2e] Skipping codex rejection-loop test because Docker is unavailable.",
+      );
+      return;
+    }
+
+    const root = mkdtempSync(join(tmpdir(), "pushpals-worker-codex-rejection-"));
+    let serverHandle: Awaited<ReturnType<typeof startJsonServer>> | null = null;
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    const workerId = `workerpal-codex-loop-it-${Date.now()}`;
+    const dockerImage = `pushpals-worker-sandbox:codex-loop-e2e-${Date.now()}`;
+    try {
+      const repoPath = initializeMinimalRepo(root);
+      writeCodexWorkaroundStub(repoPath);
+      const containerStubPath = "/repo/.pushpals-e2e/fake-codex-workaround.py";
+      const jobId = "job-codex-command-policy-loop";
+      const requestTrace: string[] = [];
+      let claimCount = 0;
+      let completionSeen = false;
+      let failurePayload: { message?: string; detail?: string } | null = null;
+
+      serverHandle = await startJsonServer(async (req, res, body) => {
+        const url = req.url ?? "/";
+        requestTrace.push(`${req.method ?? "GET"} ${url} ${JSON.stringify(body)}`);
+        if (req.method !== "POST") {
+          res.statusCode = 404;
+          res.end("{}");
+          return;
+        }
+        if (url === "/jobs/claim") {
+          claimCount += 1;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              job:
+                claimCount === 1
+                  ? {
+                      id: jobId,
+                      taskId: "codex-command-policy-loop",
+                      kind: "task.execute",
+                      params: createTaskExecuteParams(
+                        "Update the README with a short note about adjacent possible hooks.",
+                      ),
+                      sessionId: null,
+                    }
+                  : null,
+            }),
+          );
+          return;
+        }
+        if (url === "/workers/heartbeat") {
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === `/jobs/${jobId}/complete`) {
+          completionSeen = true;
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url === `/jobs/${jobId}/fail`) {
+          failurePayload = {
+            message: typeof body?.message === "string" ? body.message : "",
+            detail: typeof body?.detail === "string" ? body.detail : "",
+          };
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        if (url.startsWith(`/jobs/${jobId}/log`)) {
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        res.statusCode = 200;
+        res.end("{}");
+      });
+
+      proc = Bun.spawn(
+        [
+          process.execPath,
+          "run",
+          workerMainPath,
+          "--server",
+          serverHandle.baseUrl,
+          "--poll",
+          "250",
+          "--heartbeat",
+          "500",
+          "--repo",
+          repoPath,
+          "--base-ref",
+          "HEAD",
+          "--workerId",
+          workerId,
+          "--docker",
+          "--docker-image",
+          dockerImage,
+        ],
+        {
+          cwd: repoPath,
+          stdout: "pipe",
+          stderr: "pipe",
+          env: {
+            ...process.env,
+            OPENAI_API_KEY: "pushpals-e2e-openai-key",
+            PUSHPALS_OPENAI_CODEX_AUTH_MODE: "api_key",
+            PUSHPALS_OPENAI_CODEX_BIN_JSON: JSON.stringify([
+              "/workspace/.venv/bin/python",
+              containerStubPath,
+            ]),
+            PUSHPALS_WORKERPALS_SANDBOX_ROOT: sourceRepoRoot,
+          },
+        },
+      );
+
+      try {
+        await waitForCondition(
+          () => failurePayload !== null,
+          2 * 60_000,
+          "Timed out waiting for codex policy-violation failure",
+        );
+      } catch (error) {
+        const output = proc ? await stopWorker(proc) : "";
+        proc = null;
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\n` +
+            `claimCount=${claimCount}\n` +
+            `completionSeen=${completionSeen}\n` +
+            `failurePayload=${JSON.stringify(failurePayload)}\n` +
+            `requestTrace=\n${requestTrace.join("\n")}\n` +
+            `workerOutput=\n${output}`,
+        );
+      }
+
+      const exitCode = await Promise.race([
+        proc.exited,
+        Bun.sleep(10_000).then(() => Number.NaN),
+      ]);
+      if (!Number.isFinite(exitCode)) {
+        throw new Error("Timed out waiting for worker recycle after codex policy violation");
+      }
+      const output = await stopWorker(proc);
+      proc = null;
+
+      expect(claimCount).toBeGreaterThanOrEqual(1);
+      expect(completionSeen).toBe(false);
+      expect(failurePayload?.message).toBe("openai_codex policy violation: Codex CLI workaround detected");
+      expect(String(failurePayload?.detail ?? "")).toContain("Codex CLI is mandatory in this backend");
+      expect(exitCode).toBe(86);
+      expect(output).toContain("Codex backend unavailable");
     } finally {
       if (proc) {
         await stopWorker(proc);

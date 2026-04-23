@@ -16,6 +16,7 @@ on:
       - "apps/workerpals/**"
       - "apps/source_control_manager/**"
       - "tests/integration/cli.e2e.ts"
+      - "tests/integration/workerpals.control-plane.e2e.ts"
   push:
     branches:
       - main
@@ -34,13 +35,8 @@ on:
       - "apps/workerpals/**"
       - "apps/source_control_manager/**"
       - "tests/integration/cli.e2e.ts"
+      - "tests/integration/workerpals.control-plane.e2e.ts"
   workflow_dispatch:
-    inputs:
-      run_windows_smoke:
-        description: "Run the optional Windows self-hosted Docker smoke lane"
-        required: false
-        default: false
-        type: boolean
   schedule:
     - cron: "0 10 * * *"
 
@@ -73,15 +69,38 @@ jobs:
       - name: Run packaged CLI E2E suite
         run: bun run test:cli:e2e
 
-  packaged_cli_e2e_windows:
-    name: Packaged CLI E2E (Windows Smoke)
-    if: ${{ vars.PUSHPALS_WINDOWS_SMOKE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.run_windows_smoke) }}
+  workerpals_control_plane_e2e_linux:
+    name: WorkerPals Control Plane E2E (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify Docker engine
+        run: docker version
+
+      - name: Run WorkerPals control-plane E2E suite
+        run: bun run test:workerpals:e2e
+
+  windows_host_docker_e2e:
+    name: Windows Host Docker E2E
     runs-on:
       - self-hosted
       - windows
       - x64
       - docker
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -101,3 +120,6 @@ jobs:
 
       - name: Run packaged CLI E2E suite
         run: bun run test:cli:e2e
+
+      - name: Run WorkerPals control-plane E2E suite
+        run: bun run test:workerpals:e2e

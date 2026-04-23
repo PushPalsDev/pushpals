@@ -340,6 +340,58 @@ async function createFailingDockerExecutable(root: string): Promise<string> {
   return outputPath;
 }
 
+function shSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function resolveDockerExecutablePath(): string {
+  if (process.platform === "win32") {
+    return (
+      runChecked(["where.exe", "docker"], repoRoot)
+        .stdout.split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean) ?? "docker.exe"
+    );
+  }
+  return (
+    runChecked(["which", "docker"], repoRoot)
+      .stdout.split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) ?? "docker"
+  );
+}
+
+async function createTimedOutInspectDockerExecutable(root: string, targetImage: string): Promise<string> {
+  if (process.platform === "win32") {
+    throw new Error("Timed-out docker inspect wrapper is not implemented for Windows");
+  }
+  const outputPath = join(root, "docker-timeout");
+  const statePath = join(root, "docker-inspect-timeout.once");
+  const realDockerPath = resolveDockerExecutablePath();
+  writeFileSync(
+    outputPath,
+    `#!/usr/bin/env sh
+set -eu
+REAL_DOCKER=${shSingleQuote(realDockerPath)}
+STATE_FILE=${shSingleQuote(statePath)}
+TARGET_IMAGE=${shSingleQuote(targetImage)}
+last_arg=""
+for arg in "$@"; do
+  last_arg="$arg"
+done
+if [ "$#" -ge 2 ] && [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$last_arg" = "$TARGET_IMAGE" ] && [ ! -f "$STATE_FILE" ]; then
+  : > "$STATE_FILE"
+  sleep 20
+  exit 124
+fi
+exec "$REAL_DOCKER" "$@"
+`,
+    "utf8",
+  );
+  chmodSync(outputPath, 0o755);
+  return outputPath;
+}
+
 function summarizeCapturedOutput(text: string, maxChars = 16_000): string {
   const normalized = text.trim();
   if (normalized.length <= maxChars) return normalized;
@@ -772,6 +824,83 @@ describe("packaged CLI end-to-end", () => {
       }
     },
     10 * 60_000,
+  );
+
+  test(
+    "recovers from a timed-out sandbox image inspect by rebuilding and continuing startup",
+    async () => {
+      if (process.platform === "win32") return;
+      const artifacts = await ensureBuildArtifacts();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-docker-timeout-"));
+      const timedOutDockerPath = await createTimedOutInspectDockerExecutable(root, artifacts.dockerImage);
+      let proc: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        const { repoPath } = initializeTempRepo(root);
+        const runtimeRoot = join(root, "runtime");
+        const portBase = await findAvailablePortBlock();
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase);
+
+        proc = Bun.spawn(
+          [
+            process.execPath,
+            artifacts.cliPath,
+            "--status-once",
+            "--runtime-root",
+            runtimeRoot,
+            "--runtime-tag",
+            runtimeTag,
+          ],
+          {
+            cwd: repoPath,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            env: buildCliE2EEnv({
+              PUSHPALS_DOCKER_BIN_ABSOLUTE: timedOutDockerPath,
+            }),
+          },
+        );
+
+        const stdoutCapture = startTextCapture(proc.stdout);
+        const stderrCapture = startTextCapture(proc.stderr);
+        const [stdout, stderr, exitCode] = await Promise.all([
+          stdoutCapture.promise,
+          stderrCapture.promise,
+          waitForExitWithTimeout(
+            proc,
+            20 * 60_000,
+            () => `${stdoutCapture.getSnapshot()}\n${stderrCapture.getSnapshot()}`,
+          ),
+        ]);
+        const combined = `${stdout}\n${stderr}`;
+
+        if (exitCode !== 0) {
+          throw new Error(`CLI E2E exited ${exitCode}\n${combined}`);
+        }
+        expect(combined).toContain(
+          `[pushpals] failed to inspect local WorkerPal sandbox image ${artifacts.dockerImage}: timed out after 15000ms`,
+        );
+        expect(combined).toContain(
+          `[pushpals] WorkerPal sandbox image ${artifacts.dockerImage} could not be inspected; attempting local rebuild...`,
+        );
+        expect(combined).toContain("[pushpals] Embedded runtime is ready.");
+        expect(combined).toContain("[pushpals] Connected.");
+        expect(combined).not.toContain("[pushpals] Precheck failed:");
+        expect(combined).not.toContain("[pushpals] Auto-start failed:");
+      } finally {
+        if (proc) {
+          try {
+            proc.kill();
+          } catch {}
+        }
+        try {
+          await removeTreeWithRetries(root);
+        } catch (err) {
+          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        }
+      }
+    },
+    25 * 60_000,
   );
 
   test(

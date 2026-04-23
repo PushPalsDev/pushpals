@@ -45,6 +45,7 @@
     "test:prompt-policy": "bun test tests/prompt-policy.enforcement.test.ts",
     "test:cli:integration": "bun test tests/cli.invocation-logging.test.ts tests/cli.runtime-bootstrap.test.ts tests/client.runtime-bootstrap.test.ts tests/shared.client-preflight.test.ts",
     "test:cli:e2e": "bun test ./tests/integration/cli.e2e.ts",
+    "test:workerpals:e2e": "bun test ./tests/integration/workerpals.control-plane.e2e.ts",
     "test:start:e2e": "bun test ./tests/integration/start.e2e.ts",
     "test:root": "bun test tests",
     "test:protocol": "bun run tests/protocol.integration.ts",
