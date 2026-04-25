@@ -13,6 +13,7 @@ for path in (_HERE, _SHARED):
 from executor_base import SettingsResolver, config_dir_for_runtime_config, runtime_config
 from openai_codex_executor import (
     OpenAICodexRuntimeConfig,
+    _augment_supplemental_guidance,
     _resolve_reasoning_effort,
     _build_instruction,
     _collect_disallowed_shell_wrapper_rejections,
@@ -20,6 +21,7 @@ from openai_codex_executor import (
     _extract_usage_counts,
     _load_prompt_template,
     _repo_root_for_prompt_loading,
+    _unwrap_shell_wrapper_command,
     _usage_from_trace_or_estimate,
 )
 
@@ -200,10 +202,35 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
     def test_collects_disallowed_shell_wrapper_rejections(self) -> None:
         commands = _collect_disallowed_shell_wrapper_rejections(
             "error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess { message: \"Rejected\" }",
+            "error=exec_command failed for `/bin/bash -c \"git status --porcelain\"`: Rejected",
             "error=exec_command failed for `sh -lc \"git diff\"`: Rejected",
             "error=exec_command failed for `pwd`: Rejected",
         )
-        self.assertEqual(commands, ["/bin/bash -lc pwd", 'sh -lc "git diff"'])
+        self.assertEqual(
+            commands,
+            ["/bin/bash -lc pwd", '/bin/bash -c "git status --porcelain"', 'sh -lc "git diff"'],
+        )
+
+    def test_unwraps_disallowed_shell_wrapper_commands_to_direct_commands(self) -> None:
+        self.assertEqual(
+            _unwrap_shell_wrapper_command("/bin/bash -lc 'git diff --name-only'"),
+            "git diff --name-only",
+        )
+        self.assertEqual(
+            _unwrap_shell_wrapper_command('cmd /c dir /b'),
+            "dir /b",
+        )
+        self.assertEqual(
+            _unwrap_shell_wrapper_command('pwsh -Command "Get-ChildItem src"'),
+            "Get-ChildItem src",
+        )
+
+    def test_augments_guidance_with_direct_command_policy_once(self) -> None:
+        guidance = _augment_supplemental_guidance(["Run bun test tests/example.test.ts"])
+        self.assertGreaterEqual(len(guidance), 2)
+        self.assertIn("direct commands only", guidance[0].lower())
+        guidance_again = _augment_supplemental_guidance(guidance)
+        self.assertEqual(guidance_again, guidance)
 
     def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:
         usage = _usage_from_trace_or_estimate({}, "abc" * 30, "done", model="gpt-5.4")

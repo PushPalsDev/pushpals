@@ -102,6 +102,7 @@ describe("RemoteBuddy worker autoscaling", () => {
             ok: true,
             workers: { total: 1, online: 1, busy: 0, idle: 1 },
             jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+            prs: { openUnmerged: 0 },
           }),
           { status: 200 },
         );
@@ -135,6 +136,7 @@ describe("RemoteBuddy worker autoscaling", () => {
             ok: true,
             workers: { total: 1, online: 1, busy: 1, idle: 0 },
             jobs: { pending: 5, claimed: 1, autoscalablePending: 5 },
+            prs: { openUnmerged: 0 },
           }),
           { status: 200 },
         );
@@ -152,6 +154,40 @@ describe("RemoteBuddy worker autoscaling", () => {
     try {
       await (orchestrator as any).ensureAutoscaledWorkerCapacity("test backlog");
       expect(spawnCalls).toEqual(["workerpal-1", "workerpal-2", "workerpal-3"]);
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
+
+  test("prewarms a second worker when open PR backlog exists", async () => {
+    const orchestrator = createOrchestrator(makeTempDir());
+    const spawnCalls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/workers/autoscale") {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            workers: { total: 1, online: 1, busy: 0, idle: 1 },
+            jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+            prs: { openUnmerged: 3 },
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`Unexpected fetch in test: ${url.pathname}`);
+    }) as typeof fetch;
+    (orchestrator as any).minWorkers = 1;
+    (orchestrator as any).maxWorkers = 4;
+    (orchestrator as any).spawnWorker = async () => {
+      const workerId = `workerpal-${spawnCalls.length + 1}`;
+      spawnCalls.push(workerId);
+      return workerId;
+    };
+
+    try {
+      await (orchestrator as any).ensureAutoscaledWorkerCapacity("test pr backlog");
+      expect(spawnCalls).toEqual(["workerpal-1"]);
     } finally {
       await orchestrator.dispose();
     }

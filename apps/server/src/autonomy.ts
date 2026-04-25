@@ -4352,11 +4352,75 @@ export class AutonomyStore {
           }
         | undefined;
 
+    const readContextFromJobRow = (
+      whereSql: string,
+      ...args: Array<string>
+    ):
+      | {
+          objectiveId: string | null;
+          requestId: string | null;
+          jobId: string | null;
+          patternKey: string | null;
+        }
+      | undefined => {
+      const row = this.db
+        .prepare(
+          `SELECT id AS jobId, params AS paramsJson
+           FROM jobs
+           WHERE ${whereSql}
+           ORDER BY COALESCE(completedAt, failedAt, updatedAt, createdAt) DESC
+           LIMIT 1`,
+        )
+        .get(...args) as
+        | {
+            jobId: string | null;
+            paramsJson: string | null;
+          }
+        | undefined;
+      if (!row) return undefined;
+      const paramsRecord = parseJsonObject(row.paramsJson);
+      const autonomyRecord = asObject(paramsRecord.autonomy);
+      const resolvedFromObjective =
+        (asString(autonomyRecord.objectiveId ?? paramsRecord.objectiveId ?? paramsRecord.objective_id)
+          ? readByObjective(
+              asString(
+                autonomyRecord.objectiveId ?? paramsRecord.objectiveId ?? paramsRecord.objective_id,
+              ),
+            )
+          : undefined) ??
+        (asString(paramsRecord.requestId ?? paramsRecord.request_id)
+          ? readByRequest(asString(paramsRecord.requestId ?? paramsRecord.request_id))
+          : undefined);
+      return {
+        objectiveId:
+          asString(
+            autonomyRecord.objectiveId ?? paramsRecord.objectiveId ?? paramsRecord.objective_id,
+          ) ||
+          asString(resolvedFromObjective?.objectiveId) ||
+          null,
+        requestId:
+          asString(paramsRecord.requestId ?? paramsRecord.request_id) ||
+          asString(resolvedFromObjective?.requestId) ||
+          null,
+        jobId: asString(row.jobId) || asString(resolvedFromObjective?.jobId) || null,
+        patternKey:
+          asString(autonomyRecord.patternKey ?? paramsRecord.patternKey ?? paramsRecord.pattern_key) ||
+          asString(resolvedFromObjective?.patternKey) ||
+          null,
+      };
+    };
+
+    const readJobById = (id: string) => readContextFromJobRow("id = ?", id);
+    const readJobByPrUrl = (url: string) =>
+      readContextFromJobRow("prUrl = ? OR LOWER(prUrl) = LOWER(?)", url, url);
+
     const row =
       (objectiveId ? readByObjective(objectiveId) : undefined) ??
       (jobId ? readByJob(jobId) : undefined) ??
       (requestId ? readByRequest(requestId) : undefined) ??
-      (prUrl ? readByPrUrl(prUrl) : undefined);
+      (prUrl ? readByPrUrl(prUrl) : undefined) ??
+      (jobId ? readJobById(jobId) : undefined) ??
+      (prUrl ? readJobByPrUrl(prUrl) : undefined);
 
     if (!row) return null;
     return {

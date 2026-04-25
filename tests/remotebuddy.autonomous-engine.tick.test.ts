@@ -220,6 +220,13 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         return jsonResponse(200, { ok: true, released: true });
       if (url.includes("/autonomy/snapshot"))
         return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 1, online: 1, busy: 0, idle: 1 },
+          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+          prs: { openUnmerged: 0 },
+        });
       if (url.includes("/autonomy/inspiration/ingest"))
         return jsonResponse(200, { ok: true, inserted: 2, updated: 0, skipped: 0 });
       if (url.includes("/autonomy/inspiration?"))
@@ -411,6 +418,13 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         return jsonResponse(200, { ok: true, released: true });
       if (url.includes("/autonomy/snapshot"))
         return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 1, online: 1, busy: 0, idle: 1 },
+          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+          prs: { openUnmerged: 0 },
+        });
       if (url.includes("/autonomy/inspiration/ingest"))
         return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
       if (url.includes("/autonomy/inspiration?"))
@@ -633,6 +647,13 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
           },
         });
       }
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 1, online: 1, busy: 0, idle: 1 },
+          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+          prs: { openUnmerged: 0 },
+        });
       throw new Error(`Unhandled fetch in test: ${method} ${url}`);
     }) as typeof globalThis.fetch;
 
@@ -674,6 +695,78 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(calls.some((entry) => entry.url.includes("/autonomy/lock/release"))).toBe(true);
     expect((engine as any).lastOutcome).toBe("skipped");
     expect((engine as any).lastDetail).toBe("kill_switch_enabled");
+  });
+
+  test("tick defers ideation while worker load is active", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-worker-load-"));
+    tempDirs.push(root);
+    const calls: FetchCall[] = [];
+    let llmCalls = 0;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot"))
+        return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 2, online: 2, busy: 1, idle: 1 },
+          jobs: { pending: 2, claimed: 1, autoscalablePending: 1 },
+          prs: { openUnmerged: 2 },
+        });
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const llm = {
+      async generate() {
+        llmCalls += 1;
+        return {
+          text: JSON.stringify({ candidates: [] }),
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+    const comm = {
+      async emit() {
+        return true;
+      },
+    };
+
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_worker_load",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: comm as any,
+      config: makeConfig(),
+    });
+    (engine as any).ensureAutonomyRepoReady = async () => {
+      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+      mkdirSync(autonomyRepo, { recursive: true });
+      seedPushpalsAutonomyRepoLayout(autonomyRepo);
+      return true;
+    };
+
+    await engine.tick();
+
+    expect(llmCalls).toBe(0);
+    expect(calls.some((entry) => entry.url.includes("/workers/autoscale"))).toBe(true);
+    expect(calls.some((entry) => entry.url.includes("/autonomy/inspiration"))).toBe(false);
+    expect((engine as any).lastOutcome).toBe("skipped");
+    expect((engine as any).lastDetail).toBe("worker_load_busy_1_pending_2_autoscalable_1");
   });
 
   test("tick stops at repo preflight when worktree is dirty and allowDirtyWorktree is false", async () => {
@@ -766,6 +859,13 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         return jsonResponse(200, { ok: true, released: true });
       if (url.includes("/autonomy/snapshot"))
         return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 1, online: 1, busy: 0, idle: 1 },
+          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+          prs: { openUnmerged: 0 },
+        });
       if (url.includes("/autonomy/inspiration/ingest"))
         return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
       if (url.includes("/autonomy/inspiration?"))

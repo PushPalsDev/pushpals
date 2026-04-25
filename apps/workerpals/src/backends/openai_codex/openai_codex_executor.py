@@ -77,11 +77,16 @@ _CODEX_WORKAROUND_NEGATION_HINTS = (
 _REJECTED_EXEC_COMMAND_PATTERN = re.compile(r"exec_command failed for `([^`]+)`", re.IGNORECASE)
 _DISALLOWED_SHELL_WRAPPER_PREFIXES = (
     "/bin/bash -lc ",
+    "/bin/bash -c ",
     "bash -lc ",
+    "bash -c ",
     "sh -lc ",
+    "sh -c ",
     "cmd /c ",
     "powershell -command ",
+    "powershell.exe -command ",
     "pwsh -command ",
+    "pwsh.exe -command ",
 )
 
 _VALID_APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
@@ -89,6 +94,12 @@ _VALID_SANDBOX_POLICIES = {"read-only", "workspace-write", "danger-full-access"}
 _VALID_COLORS = {"always", "never", "auto"}
 _VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
 _VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+_DIRECT_COMMAND_POLICY_GUIDANCE = (
+    "Command-router policy: use direct commands only. Do not invoke `/bin/bash -lc`, `bash -c`, "
+    "`sh -lc`, `cmd /c`, `powershell -Command`, or `pwsh -Command`. Run the direct command "
+    "instead, such as `pwd`, `git status --porcelain`, `git diff -- path`, `ls dir`, "
+    "`cat file`, `sed -n '1,160p' file`, or `bun test <path>`."
+)
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -981,6 +992,81 @@ def _collect_disallowed_shell_wrapper_rejections(*texts: str) -> List[str]:
     return rejected
 
 
+def _unwrap_shell_wrapper_command(command: str) -> str:
+    normalized = _normalize_command_text(command)
+    if not normalized:
+        return ""
+    try:
+        parts = shlex.split(normalized, posix=True)
+    except ValueError:
+        return ""
+    if len(parts) < 3:
+        return ""
+    executable = str(parts[0] or "").strip().lower()
+    flag = str(parts[1] or "").strip().lower()
+    if executable in {"/bin/bash", "bash", "sh"} and flag in {"-lc", "-c"}:
+        return _normalize_command_text(" ".join(parts[2:]))
+    if executable == "cmd" and flag == "/c":
+        return _normalize_command_text(" ".join(parts[2:]))
+    if executable in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"} and flag == "-command":
+        return _normalize_command_text(" ".join(parts[2:]))
+    return ""
+
+
+def _build_wrapper_recovery_guidance(rejected_commands: List[str]) -> str:
+    direct_equivalents: List[str] = []
+    seen: set[str] = set()
+    for command in rejected_commands:
+        direct = _unwrap_shell_wrapper_command(command)
+        lowered = direct.lower()
+        if not direct or lowered in seen:
+            continue
+        seen.add(lowered)
+        direct_equivalents.append(f"- `{command}` -> `{direct}`")
+    guidance_lines = [
+        "Command-router recovery: the previous attempt retried disallowed shell wrappers.",
+        "Retry once using direct commands only. Do not use `/bin/bash -lc`, `bash -c`, `sh -lc`, `cmd /c`, `powershell -Command`, `pwsh -Command`, pipelines, or chained shell snippets.",
+        "If you need to inspect files or git state, run the direct command itself (for example `git diff --name-only`, `git status --porcelain`, `ls path`, `cat file`, or `sed -n '1,120p' file`).",
+    ]
+    if direct_equivalents:
+        guidance_lines.append("Use these direct replacements for the rejected commands:")
+        guidance_lines.extend(direct_equivalents[:6])
+    return "\n".join(guidance_lines)
+
+
+def _merge_usage_records(first: Any, second: Any) -> Dict[str, Any]:
+    first_record = first if isinstance(first, dict) else {}
+    second_record = second if isinstance(second, dict) else {}
+    if not first_record:
+        return dict(second_record)
+    if not second_record:
+        return dict(first_record)
+    prompt_tokens = to_int(first_record.get("promptTokens"), 0) + to_int(
+        second_record.get("promptTokens"), 0
+    )
+    completion_tokens = to_int(first_record.get("completionTokens"), 0) + to_int(
+        second_record.get("completionTokens"), 0
+    )
+    merged = dict(second_record)
+    merged["promptTokens"] = prompt_tokens
+    merged["completionTokens"] = completion_tokens
+    merged["totalTokens"] = prompt_tokens + completion_tokens
+    merged["estimated"] = bool(first_record.get("estimated")) or bool(second_record.get("estimated"))
+    if not merged.get("backend"):
+        merged["backend"] = first_record.get("backend")
+    if not merged.get("modelId"):
+        merged["modelId"] = first_record.get("modelId")
+    return merged
+
+
+def _augment_supplemental_guidance(supplemental_guidance: List[str]) -> List[str]:
+    normalized = [str(item or "").strip() for item in supplemental_guidance if str(item or "").strip()]
+    joined = "\n".join(normalized).lower()
+    if "direct commands only" in joined or "shell-wrapper" in joined or "/bin/bash -lc" in joined:
+        return normalized
+    return [_DIRECT_COMMAND_POLICY_GUIDANCE, *normalized]
+
+
 def _read_text_if_exists(path: Path) -> str:
     try:
         if not path.exists():
@@ -1008,6 +1094,9 @@ def _run_codex_task(
     repo: str,
     instruction: str,
     supplemental_guidance: List[str],
+    *,
+    wrapper_recovery_attempt: int = 0,
+    baseline_changes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     global _ACTIVE_CHILD, _INTERRUPTED_SIGNAL
     _INTERRUPTED_SIGNAL = None
@@ -1064,8 +1153,9 @@ def _run_codex_task(
     use_json = runtime_config.json_output
     reasoning_effort = _resolve_reasoning_effort(runtime_config, model)
     communicate_timeout_s = _resolve_communicate_timeout_seconds(runtime_config)
-    prompt = _build_instruction(instruction, supplemental_guidance)
-    baseline_changes = summarize_git_changes(repo)
+    effective_supplemental_guidance = _augment_supplemental_guidance(supplemental_guidance)
+    prompt = _build_instruction(instruction, effective_supplemental_guidance)
+    baseline_snapshot = list(baseline_changes) if baseline_changes is not None else summarize_git_changes(repo)
 
     with tempfile.TemporaryDirectory(prefix="pushpals-codex-") as tmp_dir:
         last_message_path = Path(tmp_dir) / "codex-last-message.txt"
@@ -1376,6 +1466,37 @@ def _run_codex_task(
         log_git_status(repo, log)
 
         if command_policy_rejection_loop:
+            if wrapper_recovery_attempt < 1:
+                recovery_guidance = _build_wrapper_recovery_guidance(rejected_shell_wrappers)
+                if recovery_guidance:
+                    log.warning(
+                        "Codex hit a shell-wrapper rejection loop; retrying once with direct-command recovery guidance."
+                    )
+                    retry_result = _run_codex_task(
+                        repo,
+                        instruction,
+                        [*effective_supplemental_guidance, recovery_guidance],
+                        wrapper_recovery_attempt=wrapper_recovery_attempt + 1,
+                        baseline_changes=baseline_snapshot,
+                    )
+                    retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
+                    if retry_result.get("ok"):
+                        recovered_stdout = str(retry_result.get("stdout") or "").strip()
+                        retry_result["stdout"] = _truncate(
+                            (
+                                "Recovered after the first Codex attempt hit command-router shell-wrapper rejections.\n\n"
+                                f"{recovered_stdout}"
+                            ).strip()
+                        )
+                    else:
+                        retry_stderr = str(retry_result.get("stderr") or "").strip()
+                        retry_result["stderr"] = _truncate(
+                            (
+                                "The first Codex attempt hit command-router shell-wrapper rejections and was retried once with direct-command recovery guidance.\n\n"
+                                f"{retry_stderr}"
+                            ).strip()
+                        )
+                    return retry_result
             command_lines = (
                 "\n".join(f"- {command}" for command in rejected_shell_wrappers[:6])
                 if rejected_shell_wrappers
@@ -1460,7 +1581,7 @@ def _run_codex_task(
             }
 
         changed_paths = summarize_git_changes(repo)
-        delta = [p for p in changed_paths if p not in baseline_changes]
+        delta = [p for p in changed_paths if p not in baseline_snapshot]
         effective = delta if delta else changed_paths
         stdout_parts: List[str] = []
         if last_message:

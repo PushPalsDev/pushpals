@@ -599,6 +599,9 @@ interface WorkerAutoscaleSnapshot {
     claimed: number;
     autoscalablePending: number;
   };
+  prs: {
+    openUnmerged: number;
+  };
 }
 
 interface JobLogEntry {
@@ -1917,9 +1920,16 @@ export class RemoteBuddyOrchestrator {
         ok: boolean;
         workers?: WorkerAutoscaleSnapshot["workers"];
         jobs?: WorkerAutoscaleSnapshot["jobs"];
+        prs?: Partial<WorkerAutoscaleSnapshot["prs"]>;
       };
       if (!data.ok || !data.workers || !data.jobs) return null;
-      return { workers: data.workers, jobs: data.jobs };
+      return {
+        workers: data.workers,
+        jobs: data.jobs,
+        prs: {
+          openUnmerged: Math.max(0, Math.floor(Number(data.prs?.openUnmerged ?? 0))),
+        },
+      };
     } catch {
       return null;
     }
@@ -1977,11 +1987,14 @@ export class RemoteBuddyOrchestrator {
   }
 
   private desiredWorkerCountFromAutoscaleSnapshot(snapshot: WorkerAutoscaleSnapshot): number {
+    const prBacklogFloor =
+      Math.max(0, snapshot.prs.openUnmerged) > 0 ? Math.min(2, this.maxWorkers) : 0;
     return Math.max(
       this.minWorkers,
       Math.min(
         this.maxWorkers,
         Math.max(
+          prBacklogFloor,
           snapshot.workers.online,
           snapshot.workers.busy + Math.max(0, snapshot.jobs.autoscalablePending),
         ),
@@ -1999,7 +2012,7 @@ export class RemoteBuddyOrchestrator {
     if (online >= desiredOnline) return;
 
     console.log(
-      `[RemoteBuddy] Worker autoscaler (${reason}): online=${snapshot.workers.online} busy=${snapshot.workers.busy} pending=${snapshot.jobs.pending} autoscalablePending=${snapshot.jobs.autoscalablePending} target=${desiredOnline}.`,
+      `[RemoteBuddy] Worker autoscaler (${reason}): online=${snapshot.workers.online} busy=${snapshot.workers.busy} pending=${snapshot.jobs.pending} autoscalablePending=${snapshot.jobs.autoscalablePending} openUnmergedPrs=${snapshot.prs.openUnmerged} target=${desiredOnline}.`,
     );
 
     while (!this.disposed && online < desiredOnline) {

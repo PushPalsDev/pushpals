@@ -1679,6 +1679,55 @@ describe("server AutonomyStore policy gates", () => {
     expect(insights.recentPrFeedback[0]?.comments.length).toBeGreaterThan(0);
   });
 
+  test("recordPrFeedback resolves autonomy pattern context from queued job params", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-pr-feedback-context-");
+    const jobQueue = new JobQueue(dbPath);
+
+    try {
+      const enqueued = jobQueue.enqueue({
+        taskId: "task_autonomy_feedback",
+        kind: "task.execute",
+        sessionId: "s1",
+        params: {
+          requestId: "req_autonomy_feedback",
+          instruction: "Fix the targeted queue assertions.",
+          autonomy: {
+            origin: "autonomy",
+            objectiveId: "obj_autonomy_feedback",
+            patternKey: "flaky_test::components::__tests__",
+          },
+        },
+      });
+      expect(enqueued.ok).toBe(true);
+      expect(typeof enqueued.jobId).toBe("string");
+
+      const feedback = store.recordPrFeedback({
+        jobId: enqueued.jobId,
+        prUrl: "https://github.com/example/repo/pull/123",
+        verdict: "rejected",
+        summary: "Still missing coverage for stale-claim recovery.",
+        reviewScore: 7.4,
+        reviewThreshold: 8.1,
+      });
+
+      expect(feedback.ok).toBe(true);
+      expect(feedback.patternKey).toBe("flaky_test::components::__tests__");
+      expect(feedback.objectiveId).toBe("obj_autonomy_feedback");
+
+      const insights = store.listInsights({
+        patternKey: "flaky_test::components::__tests__",
+        objectiveId: "obj_autonomy_feedback",
+        limit: 5,
+        feedbackLimit: 5,
+      });
+      expect(insights.recentPrFeedback.length).toBeGreaterThan(0);
+      expect(insights.recentPrFeedback[0]?.objectiveId).toBe("obj_autonomy_feedback");
+      expect(insights.recentPrFeedback[0]?.summary).toContain("stale-claim recovery");
+    } finally {
+      jobQueue.close();
+    }
+  });
+
   test("ingestInspirationPatterns dedupes fingerprints and tracks source attribution", () => {
     const store = makeStore();
     const firstIngest = store.ingestInspirationPatterns({

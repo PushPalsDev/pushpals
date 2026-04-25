@@ -153,6 +153,23 @@ type Snapshot = {
   };
 };
 
+type WorkerLoadSnapshot = {
+  workers: {
+    total: number;
+    online: number;
+    busy: number;
+    idle: number;
+  };
+  jobs: {
+    pending: number;
+    claimed: number;
+    autoscalablePending: number;
+  };
+  prs: {
+    openUnmerged: number;
+  };
+};
+
 type PolicyRule = {
   maxRisk: "low" | "medium" | "high";
   maxBreadth: "narrow" | "medium" | "broad";
@@ -3424,6 +3441,45 @@ export class RemoteBuddyAutonomousEngine {
     return data.ok ? (data.snapshot ?? null) : null;
   }
 
+  private async fetchWorkerLoadSnapshot(): Promise<WorkerLoadSnapshot | null> {
+    try {
+      const res = await fetch(`${this.server}/workers/autoscale?ttlMs=15000`, {
+        method: "GET",
+        headers: this.headers(),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        ok?: boolean;
+        workers?: WorkerLoadSnapshot["workers"];
+        jobs?: WorkerLoadSnapshot["jobs"];
+        prs?: Partial<WorkerLoadSnapshot["prs"]>;
+      };
+      if (!data.ok || !data.workers || !data.jobs) return null;
+      return {
+        workers: data.workers,
+        jobs: data.jobs,
+        prs: {
+          openUnmerged: Math.max(0, Math.floor(asNumber(asObject(data.prs).openUnmerged, 0))),
+        },
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private deferReasonForWorkerLoad(snapshot: WorkerLoadSnapshot): string | null {
+    const busyWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.busy, 0)));
+    const pendingJobs = Math.max(0, Math.floor(asNumber(snapshot.jobs.pending, 0)));
+    const autoscalablePending = Math.max(
+      0,
+      Math.floor(asNumber(snapshot.jobs.autoscalablePending, 0)),
+    );
+    if (busyWorkers <= 0 && pendingJobs <= 0 && autoscalablePending <= 0) {
+      return null;
+    }
+    return `worker_load_busy_${busyWorkers}_pending_${pendingJobs}_autoscalable_${autoscalablePending}`;
+  }
+
   private async fetchInspirationPatterns(limit = 60): Promise<unknown[]> {
     const qs = new URLSearchParams({
       limit: String(Math.max(1, Math.min(400, Math.floor(limit)))),
@@ -4035,6 +4091,19 @@ export class RemoteBuddyAutonomousEngine {
       }
       if (asBoolean(snapshotResourceBudget.runtime_budget_exhausted, false)) {
         outcomeDetail = "resource_budget_runtime_exhausted";
+        return;
+      }
+
+      this.setPhase("check_worker_load");
+      const workerLoad = await this.fetchWorkerLoadSnapshot();
+      const workerLoadDeferReason = workerLoad
+        ? this.deferReasonForWorkerLoad(workerLoad)
+        : null;
+      if (workerLoad && workerLoadDeferReason) {
+        console.log(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: deferring ideation due to active worker load (busy=${workerLoad.workers.busy} pending=${workerLoad.jobs.pending} autoscalablePending=${workerLoad.jobs.autoscalablePending}).`,
+        );
+        outcomeDetail = workerLoadDeferReason;
         return;
       }
 

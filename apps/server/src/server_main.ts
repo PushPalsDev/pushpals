@@ -907,6 +907,7 @@ export function createRequestHandler() {
         const autoscalableTaskExecutePending = jobQueue.countAutoscalablePendingByKind(
           "task.execute",
         );
+        const openUnmergedWorkerPrs = jobQueue.countOpenUnmergedWorkerPrs();
         return makeJson({
           ok: true,
           workers: {
@@ -919,6 +920,9 @@ export function createRequestHandler() {
             pending: taskExecutePending,
             claimed: taskExecuteClaimed,
             autoscalablePending: autoscalableTaskExecutePending,
+          },
+          prs: {
+            openUnmerged: openUnmergedWorkerPrs,
           },
         });
       }
