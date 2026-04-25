@@ -204,6 +204,30 @@ export function buildQualityGateRevisionIssues(
   return [...new Set(merged)];
 }
 
+const TEST_ASSERTION_BALANCE_ISSUE =
+  "Changed test files do not show both positive and negative assertion coverage (expected both).";
+
+export function relaxAdvisoryQualityIssues(
+  qualityIssues: string[],
+  validationRuns: Array<{ ok: boolean }>,
+  critic: CriticReview | null,
+  qualityCriticMinScore: number,
+): string[] {
+  const normalizedQualityIssues = qualityIssues
+    .map((entry) => String(entry ?? "").trim())
+    .filter(Boolean);
+  if (normalizedQualityIssues.length === 0) return [];
+
+  const hasPassingValidation = validationRuns.some((run) => Boolean(run?.ok));
+  const criticPasses = !critic || critic.score >= qualityCriticMinScore;
+  if (!hasPassingValidation || !criticPasses) {
+    return normalizedQualityIssues;
+  }
+
+  const relaxed = normalizedQualityIssues.filter((issue) => issue !== TEST_ASSERTION_BALANCE_ISSUE);
+  return relaxed;
+}
+
 export function resolveReviewFixCompletionBranch(
   value: unknown,
   fallbackBranch: string,
@@ -782,7 +806,7 @@ function isTestFocusedTask(
 
 function hasBalancedPositiveNegativeAssertions(paths: string[], repo: string): boolean {
   const negativeSignal =
-    /\b(invalid|negative|error|throw|reject|null|undefined|non[- ]?existent|toThrow|toBeNull|toBeUndefined|<\s*0|<=\s*0)\b/i;
+    /(\.not\b|\b(invalid|negative|error|throw|reject|null|undefined|non[- ]?existent|toThrow|toBeNull|toBeUndefined|without|missing|absent|unchanged|same|remains?|stays?|prevent|avoid|zero|none)\b|<\s*0|<=\s*0)/i;
   let positiveAssertions = 0;
   let negativeAssertions = 0;
 
@@ -3635,7 +3659,20 @@ export async function executeJob(
       : executor === "openai_codex"
         ? await runCodexCriticReview(repo, attemptParams, quality, runtimeConfig, onLog)
         : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
-    const deterministicRequiresRevision = !quality.ok;
+    const effectiveQualityIssues = relaxAdvisoryQualityIssues(
+      quality.issues,
+      quality.validationRuns,
+      critic,
+      qualityCriticMinScore,
+    );
+    if (effectiveQualityIssues.length !== quality.issues.length) {
+      onLog?.(
+        "stdout",
+        "[QualityGate] Assertion-balance heuristic downgraded to advisory because validation passed and critic score met threshold.",
+      );
+    }
+    const deterministicRequiresRevision =
+      effectiveQualityIssues.length > 0 || quality.blocker !== null;
     const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
 
     if (!deterministicRequiresRevision && !criticRequiresRevision) {
@@ -3648,7 +3685,11 @@ export async function executeJob(
       return result;
     }
 
-    const issues = buildQualityGateRevisionIssues(quality.issues, critic, qualityCriticMinScore);
+    const issues = buildQualityGateRevisionIssues(
+      effectiveQualityIssues,
+      critic,
+      qualityCriticMinScore,
+    );
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
     if (quality.blocker) {
       const blockerSummary = `Quality gate blocked by ${quality.blocker.category} issue: ${quality.blocker.detail}`;

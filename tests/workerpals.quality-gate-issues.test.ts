@@ -3,6 +3,7 @@ import {
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
+  relaxAdvisoryQualityIssues,
 } from "../apps/workerpals/src/execute_job";
 
 describe("workerpals quality gate critic issue formatting", () => {
@@ -116,5 +117,60 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("Required approval threshold: 8.5 / 10");
     expect(hint).toContain("Previous reviewer must-fix items:");
     expect(hint).toContain("- Add negative-path assertions");
+  });
+
+  test("downgrades assertion-balance failures when validation passed and critic score meets threshold", () => {
+    const issues = relaxAdvisoryQualityIssues(
+      [
+        "Changed test files do not show both positive and negative assertion coverage (expected both).",
+        "Validation steps did not execute a recognizable test command.",
+      ],
+      [{ ok: false }, { ok: true }],
+      {
+        score: 8.8,
+        findings: [],
+        mustFix: [],
+        revisionGuidance: "",
+        raw: "{}",
+      },
+      8,
+    );
+
+    expect(issues).toEqual(["Validation steps did not execute a recognizable test command."]);
+  });
+
+  test("keeps assertion-balance failures blocking when validation did not pass or critic score is low", () => {
+    const issue =
+      "Changed test files do not show both positive and negative assertion coverage (expected both).";
+
+    expect(
+      relaxAdvisoryQualityIssues(
+        [issue],
+        [{ ok: false }],
+        {
+          score: 8.8,
+          findings: [],
+          mustFix: [],
+          revisionGuidance: "",
+          raw: "{}",
+        },
+        8,
+      ),
+    ).toEqual([issue]);
+
+    expect(
+      relaxAdvisoryQualityIssues(
+        [issue],
+        [{ ok: true }],
+        {
+          score: 7.9,
+          findings: [],
+          mustFix: [],
+          revisionGuidance: "",
+          raw: "{}",
+        },
+        8,
+      ),
+    ).toEqual([issue]);
   });
 });
