@@ -1944,6 +1944,33 @@ export class RemoteBuddyOrchestrator {
     return idle[0] ?? null;
   }
 
+  private pickOnlineWorker(
+    workers: WorkerSnapshot[],
+    preferredWorkerId?: string,
+  ): WorkerSnapshot | null {
+    const online = workers
+      .filter((worker) => worker.isOnline && worker.status !== "offline")
+      .sort((a, b) => Date.parse(b.lastHeartbeat) - Date.parse(a.lastHeartbeat));
+    if (preferredWorkerId) {
+      return online.find((worker) => worker.workerId === preferredWorkerId) ?? null;
+    }
+    return online[0] ?? null;
+  }
+
+  private async waitForOnlineWorker(
+    timeoutMs: number,
+    preferredWorkerId?: string,
+  ): Promise<WorkerSnapshot | null> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (true) {
+      const workers = await this.fetchWorkers();
+      const online = this.pickOnlineWorker(workers, preferredWorkerId);
+      if (online) return online;
+      if (Date.now() >= deadline) return null;
+      await Bun.sleep(500);
+    }
+  }
+
   private async waitForIdleWorker(
     timeoutMs: number,
     preferredWorkerId?: string,
@@ -2082,15 +2109,20 @@ export class RemoteBuddyOrchestrator {
           console.warn(`[RemoteBuddy] WorkerPal process ${workerId} exited with code ${code}`);
         });
 
-        const ready = await this.waitForIdleWorker(this.workerStartupTimeoutMs, workerId);
+        const ready = await this.waitForOnlineWorker(this.workerStartupTimeoutMs, workerId);
         if (ready) {
           this.workerSpawnCooldownUntil = 0;
+          if (ready.activeJobCount > 0 || ready.status === "busy") {
+            console.log(
+              `[RemoteBuddy] WorkerPal ${ready.workerId} came online and is already busy; treating startup as healthy.`,
+            );
+          }
           return ready.workerId;
         }
         this.workerpalsUnavailableReason =
           this.spawnWorkerDocker && this.spawnWorkerRequireDocker
-            ? `WorkerPal ${workerId} did not report ready within ${this.workerStartupTimeoutMs}ms. Verify Docker is installed, running, and able to start the WorkerPal sandbox image.`
-            : `WorkerPal ${workerId} did not report ready within ${this.workerStartupTimeoutMs}ms.`;
+            ? `WorkerPal ${workerId} did not report online within ${this.workerStartupTimeoutMs}ms. Verify Docker is installed, running, and able to start the WorkerPal sandbox image.`
+            : `WorkerPal ${workerId} did not report online within ${this.workerStartupTimeoutMs}ms.`;
         console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
         await this.terminateManagedWorkerProcess(workerId, child, "startup timeout");
         this.workerSpawnCooldownUntil = Date.now() + this.workerSpawnBackoffMs;

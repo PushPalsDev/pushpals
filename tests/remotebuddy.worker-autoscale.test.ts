@@ -10,9 +10,11 @@ import { RemoteBuddyOrchestrator } from "../apps/remotebuddy/src/remotebuddy_mai
 const tempDirs: string[] = [];
 const openStores: IdempotencyStore[] = [];
 const originalFetch = globalThis.fetch;
+const originalSpawn = Bun.spawn;
 
 afterEach(async () => {
   globalThis.fetch = originalFetch;
+  (Bun as any).spawn = originalSpawn;
 
   while (openStores.length > 0) {
     try {
@@ -188,6 +190,43 @@ describe("RemoteBuddy worker autoscaling", () => {
     try {
       await (orchestrator as any).ensureAutoscaledWorkerCapacity("test pr backlog");
       expect(spawnCalls).toEqual(["workerpal-1"]);
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
+
+  test("treats a freshly spawned busy worker as startup-ready", async () => {
+    const orchestrator = createOrchestrator(makeTempDir());
+    let waitForOnlineCalls = 0;
+    (orchestrator as any).waitForOnlineWorker = async (_timeoutMs: number, workerId: string) => {
+      waitForOnlineCalls += 1;
+      return {
+        workerId,
+        status: "busy",
+        currentJobId: "job-123",
+        lastHeartbeat: new Date().toISOString(),
+        pollMs: 2000,
+        capabilities: {},
+        details: {},
+        activeJobCount: 1,
+        isOnline: true,
+      };
+    };
+    (orchestrator as any).waitForIdleWorker = async () => {
+      throw new Error("spawnWorker should not wait for idle capacity");
+    };
+    (Bun as any).spawn = () =>
+      ({
+        pid: 12345,
+        kill() {},
+        exited: Promise.resolve(0),
+      }) as any;
+
+    try {
+      const workerId = await (orchestrator as any).spawnWorker();
+      expect(workerId).toMatch(/^workerpal-/);
+      expect(waitForOnlineCalls).toBe(1);
+      expect(String((orchestrator as any).workerpalsUnavailableReason ?? "")).toBe("");
     } finally {
       await orchestrator.dispose();
     }
