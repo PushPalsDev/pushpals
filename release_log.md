@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.53`
-- start_commit: `3c74ec86ab8f29f420d2387588a7dc796746e921`
-- end_commit: `00c601ea5d30378f34f8b2edd28a638e6b83ed1f`
-- commits_in_range: `1`
+- version: `v1.0.54`
+- start_commit: `0790d2c147334f959146ee5dfdbd7046ac6b6fa9`
+- end_commit: `009ed9e7ad5b5096b7616df36438191dd475a217`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Fix `RemoteBuddy` worker startup so a freshly spawned WorkerPal that comes online already `busy` is treated as healthy instead of being killed as "not ready."
-- Prevent queued work from being stranded behind false startup timeouts that later surface as stale-claim job failures.
-- Add regression coverage for the busy-on-startup worker path so startup readiness stays separate from idle-capacity selection.
+- Fix merge-conflict quality gating so prepared conflict paths still count after the sandbox rebase auto-continues, and classify missing dependencies/imports as repo blockers instead of wasting revision retries.
+- Relax the test assertion-balance heuristic after focused validation really passes, preventing false failures when negative coverage is expressed through invariants like unchanged counts or `.not` assertions.
+- Soft-pass exhausted quality revisions for publishable review-fix and merge-conflict PR updates so WorkerPals still pushes the revision while keeping unfinished rebases and real repo/environment blockers as hard failures.
 
 ## Install
 
@@ -38,8 +38,3 @@ bun install -g @pushpalsdev/cli
 ## Known Issues
 
 - None.
-
-## Release Checklist
-
-- Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.53 && git push origin v1.0.53`.
