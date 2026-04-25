@@ -353,7 +353,7 @@ export function deriveQualityGatePolicy(
       return {
         mode: "merge_conflict",
         maxAutoRevisions: baseMaxAutoRevisions,
-        softPassOnExhausted: false,
+        softPassOnExhausted: baseSoftPassOnExhausted,
         criticMinScore: baseCriticMinScore,
       };
     }
@@ -371,7 +371,7 @@ export function deriveQualityGatePolicy(
   return {
     mode: "review_fix",
     maxAutoRevisions: Math.max(baseMaxAutoRevisions, 2),
-    softPassOnExhausted: false,
+    softPassOnExhausted: baseSoftPassOnExhausted,
     criticMinScore: tightenedCriticMinScore,
   };
 }
@@ -3583,12 +3583,12 @@ export async function executeJob(
         : qualityCriticMinScore.toFixed(1);
     onLog?.(
       "stdout",
-      `[QualityGate] review_fix override active: prior_score=${priorScore}, target_threshold=${threshold}, soft_pass_on_exhausted=false.`,
+      `[QualityGate] review_fix policy active: prior_score=${priorScore}, target_threshold=${threshold}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}; repo/environment blockers still fail hard.`,
     );
   } else if (qualityGatePolicy.mode === "merge_conflict") {
     onLog?.(
       "stdout",
-      "[QualityGate] merge_conflict override active: soft_pass_on_exhausted=false until the sandbox rebase is fully completed.",
+      `[QualityGate] merge_conflict policy active: soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}; unfinished rebases and repo/environment blockers still fail hard.`,
     );
   }
 

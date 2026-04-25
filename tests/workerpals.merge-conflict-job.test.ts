@@ -356,7 +356,7 @@ describe("workerpals merge-conflict sandbox", () => {
           expect(result.summary).toContain("git rebase still in progress");
           expect(result.stderr).toContain("git rebase still in progress");
           expect(
-            forwardedLogs.some((entry) => entry.line.includes("merge_conflict override active")),
+            forwardedLogs.some((entry) => entry.line.includes("merge_conflict policy active")),
           ).toBe(true);
           expect(
             forwardedLogs.some((entry) => entry.line.includes("Soft-pass after")),
@@ -423,6 +423,103 @@ describe("workerpals merge-conflict sandbox", () => {
         }
       } finally {
         rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  runMergeConflictTest(
+    "executeJob soft-passes exhausted quality revisions for merge-conflict jobs once branch state is publishable",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-merge-conflict-soft-pass-"));
+      const repo = join(root, "repo");
+      mkdirSync(join(repo, "components", "__tests__"), { recursive: true });
+      const testPath = "components/__tests__/AnimatedSelectionRing.test.tsx";
+      const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
+      const restoreExecutor = installTestBackendExecutor(async () => ({
+        ok: true,
+        summary: "stub merge-conflict resolution completed",
+        stdout: "__stub_stdout__",
+        stderr: "",
+        exitCode: 0,
+      }));
+      try {
+        await mustGit(root, ["init", repo], "init merge-conflict soft-pass repo");
+        await mustGit(repo, ["config", "user.name", "PushPals Test"], "set user.name");
+        await mustGit(repo, ["config", "user.email", "pushpals-test@example.com"], "set user.email");
+        writeFileSync(
+          join(repo, testPath),
+          "test('placeholder', () => { expect(true).toBe(true); expect(null).toBeNull(); });\n",
+          "utf8",
+        );
+        await mustGit(repo, ["add", "-A"], "stage soft-pass repo");
+        await mustGit(repo, ["commit", "-m", "seed soft-pass repo"], "commit soft-pass repo");
+
+        const base = loadPushPalsConfig({ reload: true });
+        const runtimeConfig: WorkerpalsRuntimeConfig = {
+          ...base,
+          workerpals: {
+            ...base.workerpals,
+            executor: TEST_BACKEND,
+            qualityMaxAutoRevisions: 1,
+            qualitySoftPassOnExhausted: true,
+          },
+        };
+        const params = {
+          schemaVersion: 2,
+          instruction: `Resolve the merge conflict in ${testPath} and validate the test file.`,
+          planning: {
+            intent: "code_change",
+            riskLevel: "medium",
+            scope: {
+              readAnywhere: true,
+              writeAllowed: true,
+              writeGlobs: ["components/**"],
+            },
+            discovery: {
+              ripgrepQueries: ["AnimatedSelectionRing"],
+              likelyDirs: ["components/__tests__"],
+            },
+            acceptanceCriteria: ["Resolve the merge conflict and keep the test healthy."],
+            validationSteps: ['python -c "raise SystemExit(1)"'],
+            queuePriority: "normal",
+            queueWaitBudgetMs: 90_000,
+            executionBudgetMs: 1_800_000,
+            finalizationBudgetMs: 120_000,
+          },
+          lane: "deterministic",
+          completionBranch: "agent/test-branch",
+          reviewAgent: {
+            prHeadRef: "agent/test-branch",
+            prBaseRef: "main",
+            prHeadSha: "1234567890abcdef",
+            resolutionType: "merge_conflict",
+            mergeError: "Pull Request has merge conflicts",
+            preparedConflictPaths: [testPath],
+            preparedRebaseState: "clean",
+          },
+        };
+        const forwardedLogs: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+
+        const result = await executeJob(
+          "task.execute",
+          params,
+          repo,
+          (stream, line) => forwardedLogs.push({ stream, line }),
+          runtimeConfig,
+        );
+
+        expect(result.ok).toBe(true);
+        expect(result.summary).toContain("quality gate soft-pass after 1 auto-revision attempt(s)");
+        expect(
+          forwardedLogs.some((entry) => entry.line.includes("Quality gate requested revision 1/1")),
+        ).toBe(true);
+        expect(
+          forwardedLogs.some((entry) => entry.line.includes("Soft-pass after 1 auto-revision attempt(s)")),
+        ).toBe(true);
+      } finally {
+        restoreExecutor();
+        restoreSegments();
+        rmSync(root, { recursive: true, force: true });
       }
     },
   );

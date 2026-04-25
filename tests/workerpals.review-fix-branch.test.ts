@@ -74,7 +74,7 @@ describe("workerpals review fix completion branch resolution", () => {
     });
   });
 
-  test("tightens the quality gate only for review-fix jobs", () => {
+  test("tightens the quality gate only for review-fix jobs while preserving exhausted soft-pass policy", () => {
     const base = loadPushPalsConfig({ reload: true });
     const runtimeConfig = {
       ...base,
@@ -99,11 +99,11 @@ describe("workerpals review fix completion branch resolution", () => {
 
     expect(policy.mode).toBe("review_fix");
     expect(policy.maxAutoRevisions).toBe(2);
-    expect(policy.softPassOnExhausted).toBe(false);
+    expect(policy.softPassOnExhausted).toBe(true);
     expect(policy.criticMinScore).toBeCloseTo(8.3, 5);
   });
 
-  test("disables soft-pass for merge-conflict jobs", () => {
+  test("preserves exhausted soft-pass for merge-conflict jobs", () => {
     const base = loadPushPalsConfig({ reload: true });
     const runtimeConfig = {
       ...base,
@@ -128,7 +128,7 @@ describe("workerpals review fix completion branch resolution", () => {
 
     expect(policy.mode).toBe("merge_conflict");
     expect(policy.maxAutoRevisions).toBe(1);
-    expect(policy.softPassOnExhausted).toBe(false);
+    expect(policy.softPassOnExhausted).toBe(true);
     expect(policy.criticMinScore).toBe(8);
   });
 
