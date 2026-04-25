@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -50,6 +51,15 @@ KNOWN_LITELLM_PROVIDER_PREFIXES: Set[str] = {
 }
 
 DEFAULT_TOOLCALL_RETRY_MAX = 1
+LOGGER_STANDARD_METHODS: Tuple[str, ...] = (
+    "debug",
+    "info",
+    "warn",
+    "warning",
+    "error",
+    "exception",
+    "critical",
+)
 
 # Superset of signals from both executors indicating the model failed to
 # emit tool calls / tool actions.
@@ -100,12 +110,43 @@ class Logger:
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
 
-    def info(self, message: str) -> None:
-        executor_log(f"{self.prefix} {message}")
+    def _coerce_message(self, message: Any, args: Tuple[Any, ...]) -> str:
+        text = str(message)
+        if not args:
+            return text
+        try:
+            return text % args
+        except Exception:
+            pieces = [text, *(str(arg) for arg in args)]
+            return " ".join(piece for piece in pieces if piece)
 
-    def debug(self, message: str) -> None:
+    def _emit(self, _level: str, message: Any, *args: Any) -> None:
+        executor_log(f"{self.prefix} {self._coerce_message(message, args)}")
+
+    def info(self, message: Any, *args: Any) -> None:
+        self._emit("info", message, *args)
+
+    def debug(self, message: Any, *args: Any) -> None:
         if _debug_enabled():
-            executor_log(f"{self.prefix} {message}")
+            self._emit("debug", message, *args)
+
+    def warn(self, message: Any, *args: Any) -> None:
+        self._emit("warn", message, *args)
+
+    def warning(self, message: Any, *args: Any) -> None:
+        self.warn(message, *args)
+
+    def error(self, message: Any, *args: Any) -> None:
+        self._emit("error", message, *args)
+
+    def critical(self, message: Any, *args: Any) -> None:
+        self._emit("critical", message, *args)
+
+    def exception(self, message: Any, *args: Any, exc_info: Any = True) -> None:
+        detail = self._coerce_message(message, args)
+        if exc_info:
+            detail = f"{detail}\n{traceback.format_exc().strip()}"
+        self._emit("exception", detail)
 
 
 def fail(summary: str, stderr: Optional[str] = None, exit_code: int = 1) -> int:

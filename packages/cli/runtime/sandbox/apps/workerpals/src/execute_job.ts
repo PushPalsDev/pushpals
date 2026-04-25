@@ -2042,6 +2042,126 @@ async function activeGitOperation(repo: string): Promise<"rebase" | "merge" | "c
   return null;
 }
 
+export async function resumePreparedMergeConflictRebase(
+  repo: string,
+  kind: string,
+  params?: Record<string, unknown>,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<
+  | { ok: true; resumed: boolean; sequencer: "rebase" | "merge" | "cherry-pick" | null; detail?: string }
+  | { ok: false; error: string }
+> {
+  const sequencer = await activeGitOperation(repo);
+  if (sequencer !== "rebase") {
+    return { ok: true, resumed: false, sequencer };
+  }
+
+  const unresolved = await git(repo, ["diff", "--name-only", "--diff-filter=U"]);
+  if (!unresolved.ok) {
+    return {
+      ok: false,
+      error: `Failed to inspect unresolved merge-conflict paths: ${combinedGitOutput(unresolved)}`,
+    };
+  }
+  const unresolvedPaths = parseChangedPathsFromNameOnlyOutput(unresolved.stdout);
+  if (unresolvedPaths.length > 0) {
+    const stillMarked = unresolvedPaths.filter((relativePath) => {
+      try {
+        const contents = readFileSync(resolve(repo, relativePath), "utf8");
+        return /^(<{7}|={7}|>{7})( .*)?$/m.test(contents);
+      } catch {
+        return true;
+      }
+    });
+    if (stillMarked.length > 0) {
+      return {
+        ok: true,
+        resumed: false,
+        sequencer,
+        detail: `rebase still has ${stillMarked.length} unresolved conflict marker file(s)`,
+      };
+    }
+    onLog?.(
+      "stdout",
+      `[MergeConflict] Found ${unresolvedPaths.length} resolved-but-unstaged conflict file(s); staging them before continuing the rebase.`,
+    );
+  }
+
+  let stageResult: { ok: boolean; stdout: string; stderr: string };
+  const stageArgs = buildStageCommand(kind, params);
+  if (stageArgs) {
+    stageResult = await git(repo, stageArgs);
+    if (!stageResult.ok) {
+      const stageErr = stageResult.stderr || stageResult.stdout;
+      if (
+        /pathspec .* did not match any files/i.test(stageErr) ||
+        /invalid path/i.test(stageErr) ||
+        /outside repository/i.test(stageErr)
+      ) {
+        onLog?.(
+          "stdout",
+          `[MergeConflict] Stage target invalid/missing for ${kind}; retrying with fallback "git add -A".`,
+        );
+        stageResult = await git(repo, [
+          "add",
+          "-A",
+          "--",
+          ".",
+          ":(exclude)workspace/**",
+          ":(exclude)outputs/**",
+        ]);
+      }
+    }
+  } else {
+    stageResult = await git(repo, [
+      "add",
+      "-A",
+      "--",
+      ".",
+      ":(exclude)workspace/**",
+      ":(exclude)outputs/**",
+    ]);
+  }
+  if (!stageResult.ok) {
+    return {
+      ok: false,
+      error:
+        "Failed to stage resolved merge-conflict changes before continuing rebase: " +
+        combinedGitOutput(stageResult),
+    };
+  }
+
+  let rebaseContinue = await git(repo, ["-c", "core.editor=true", "rebase", "--continue"]);
+  let continueOutput = combinedGitOutput(rebaseContinue);
+  if (!rebaseContinue.ok && isRebaseEditorPromptOutput(continueOutput)) {
+    rebaseContinue = await git(repo, ["-c", "core.editor=true", "rebase", "--continue"]);
+    continueOutput = combinedGitOutput(rebaseContinue);
+  }
+  if (!rebaseContinue.ok) {
+    return {
+      ok: false,
+      error: `Failed to continue prepared merge-conflict rebase: ${continueOutput}`,
+    };
+  }
+
+  const remainingSequencer = await activeGitOperation(repo);
+  if (!remainingSequencer) {
+    onLog?.(
+      "stdout",
+      "[MergeConflict] Auto-continued the prepared rebase after the executor returned with no unresolved conflicts.",
+    );
+  }
+  return {
+    ok: true,
+    resumed: true,
+    sequencer: remainingSequencer,
+    detail:
+      remainingSequencer === "rebase"
+        ? "rebase advanced but another continuation step is still required"
+        : undefined,
+  };
+}
+
 async function isAncestorRef(repo: string, ancestor: string, descendant: string): Promise<boolean> {
   const result = await git(repo, ["merge-base", "--is-ancestor", ancestor, descendant]);
   return result.ok;
@@ -3409,7 +3529,18 @@ export async function executeJob(
     );
     if (!result.ok) return result;
     if (mergeConflictContext) {
-      const sequencer = await activeGitOperation(repo);
+      const resume = await resumePreparedMergeConflictRebase(repo, kind, attemptParams, onLog);
+      if (!resume.ok) {
+        onLog?.("stderr", `[MergeConflict] ${resume.error}`);
+        return {
+          ok: false,
+          summary: "Merge-conflict rebase continuation failed",
+          stdout: result.stdout,
+          stderr: [result.stderr ?? "", resume.error].filter(Boolean).join("\n"),
+          exitCode: 4,
+        };
+      }
+      const sequencer = resume.sequencer;
       if (sequencer) {
         const detail =
           `Merge-conflict job returned with git ${sequencer} still in progress. ` +

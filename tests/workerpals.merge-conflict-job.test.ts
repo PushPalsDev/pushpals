@@ -5,6 +5,7 @@ import { join } from "path";
 import {
   createJobCommit,
   executeJob,
+  resumePreparedMergeConflictRebase,
 } from "../apps/workerpals/src/execute_job";
 import { prepareMergeConflictTaskRepo } from "../apps/workerpals/src/merge_conflict_job";
 import { loadPushPalsConfig } from "shared";
@@ -369,6 +370,58 @@ describe("workerpals merge-conflict sandbox", () => {
       } finally {
         restoreExecutor();
         restoreSegments();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  runMergeConflictTest(
+    "resumePreparedMergeConflictRebase stages a resolved conflict and continues the prepared rebase",
+    async () => {
+      const fixture = await createConflictFixture();
+      try {
+        const prepared = await prepareMergeConflictTaskRepo(
+          fixture.sourceRepo,
+          "job-merge-conflict-resume",
+          fixture.params,
+        );
+        try {
+          writeFileSync(
+            join(prepared.repoPath, fixture.conflictFile),
+            "export const conflict = 'resolved-by-helper';\n",
+            "utf8",
+          );
+
+          const forwardedLogs: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+          const resume = await resumePreparedMergeConflictRebase(
+            prepared.repoPath,
+            "task.execute",
+            fixture.params,
+            (stream, line) => forwardedLogs.push({ stream, line }),
+          );
+
+          expect(resume.ok).toBe(true);
+          if (!resume.ok) return;
+          expect(resume.resumed).toBe(true);
+          expect(resume.sequencer).toBe(null);
+          expect(
+            forwardedLogs.some((entry) =>
+              entry.line.includes("Auto-continued the prepared rebase"),
+            ),
+          ).toBe(true);
+
+          const status = await mustGit(
+            prepared.repoPath,
+            ["status", "--porcelain"],
+            "inspect working tree after auto-continue",
+          );
+          expect(status).not.toContain("UU ");
+          const resolvedFile = readFileSync(join(prepared.repoPath, fixture.conflictFile), "utf8");
+          expect(resolvedFile).toContain("resolved-by-helper");
+        } finally {
+          prepared.cleanup();
+        }
+      } finally {
         rmSync(fixture.root, { recursive: true, force: true });
       }
     },
