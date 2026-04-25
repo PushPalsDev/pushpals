@@ -64,6 +64,11 @@ interface ValidationExecutionResult {
   elapsedMs: number;
 }
 
+interface ValidationBlocker {
+  category: "repo" | "environment";
+  detail: string;
+}
+
 interface DeterministicQualityResult {
   ok: boolean;
   skipped: boolean;
@@ -71,6 +76,7 @@ interface DeterministicQualityResult {
   changedPaths: string[];
   changedTestPaths: string[];
   validationRuns: ValidationExecutionResult[];
+  blocker: ValidationBlocker | null;
 }
 
 interface CriticReview {
@@ -533,6 +539,60 @@ async function runValidationCommand(
   };
 }
 
+function extractPreparedMergeConflictPaths(params: Record<string, unknown>): string[] {
+  const reviewAgent =
+    params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent)
+      ? (params.reviewAgent as Record<string, unknown>)
+      : null;
+  const preparedPaths = Array.isArray(reviewAgent?.preparedConflictPaths)
+    ? reviewAgent.preparedConflictPaths
+    : [];
+  return preparedPaths
+    .map((entry) => String(entry ?? "").trim().replace(/\\/g, "/"))
+    .filter(Boolean);
+}
+
+function detectValidationBlocker(runs: ValidationExecutionResult[]): ValidationBlocker | null {
+  const combined = runs
+    .flatMap((run) => [run.stdout, run.stderr])
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+  if (!combined) return null;
+
+  if (
+    combined.includes("cannot find module") ||
+    combined.includes("module not found") ||
+    combined.includes("failed to resolve import") ||
+    combined.includes("could not resolve") ||
+    combined.includes("no such file or directory") ||
+    combined.includes("package not found")
+  ) {
+    return {
+      category: "repo",
+      detail:
+        "Validation is blocked by missing repo dependencies or imported files. Fix the repository test/runtime setup before retrying this job.",
+    };
+  }
+
+  if (
+    combined.includes("read-only file system") ||
+    combined.includes("permission denied") ||
+    combined.includes("network access") ||
+    combined.includes("connection refused") ||
+    combined.includes("getaddrinfo") ||
+    combined.includes("eacces")
+  ) {
+    return {
+      category: "environment",
+      detail:
+        "Validation is blocked by sandbox environment restrictions (filesystem, permissions, or network). Retry only after the worker environment is fixed.",
+    };
+  }
+
+  return null;
+}
+
 function stripAnsiControlSequences(value: string): string {
   return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
@@ -762,12 +822,18 @@ async function runDeterministicQualityGate(
       changedPaths: [],
       changedTestPaths: [],
       validationRuns: [],
+      blocker: null,
     };
   }
 
   const statusResult = await git(repo, ["status", "--porcelain"]);
   const changedPaths = statusResult.ok ? parseChangedPathsFromStatus(statusResult.stdout) : [];
-  const changedTestPaths = changedPaths.filter((path) => isLikelyTestPath(path));
+  const preparedMergeConflictPaths = extractPreparedMergeConflictPaths(params);
+  const changedTestPaths = Array.from(
+    new Set(
+      [...changedPaths, ...preparedMergeConflictPaths].filter((path) => isLikelyTestPath(path)),
+    ),
+  );
   const issues: string[] = [];
   if (changedTestPaths.length === 0) {
     issues.push("No relevant test file was modified for this test-focused task.");
@@ -848,14 +914,16 @@ async function runDeterministicQualityGate(
       issues.push("Validation steps did not execute a recognizable test command.");
     }
   }
+  const blocker = detectValidationBlocker(validationRuns);
 
   return {
-    ok: issues.length === 0,
+    ok: issues.length === 0 && blocker === null,
     skipped: false,
     issues,
     changedPaths,
     changedTestPaths,
     validationRuns,
+    blocker,
   };
 }
 
@@ -3582,6 +3650,23 @@ export async function executeJob(
 
     const issues = buildQualityGateRevisionIssues(quality.issues, critic, qualityCriticMinScore);
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
+    if (quality.blocker) {
+      const blockerSummary = `Quality gate blocked by ${quality.blocker.category} issue: ${quality.blocker.detail}`;
+      onLog?.("stderr", `[QualityGate] ${blockerSummary}`);
+      return {
+        ok: false,
+        summary: blockerSummary,
+        stdout: result.stdout,
+        stderr: truncate(
+          [
+            result.stderr ?? "",
+            ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
+          ].join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
+        ),
+        exitCode: 4,
+      };
+    }
     if (revisionAttempt >= qualityMaxAutoRevisions) {
       if (qualitySoftPassOnExhausted) {
         const diagnostics = truncate(
