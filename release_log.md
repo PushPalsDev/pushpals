@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.52`
-- start_commit: `395a17a37919fb6574dc04b4f234b4e850b53f63`
-- end_commit: `dc40f0a40646eb4728563f4c55640133990084dc`
-- commits_in_range: `2`
+- version: `v1.0.53`
+- start_commit: `3c74ec86ab8f29f420d2387588a7dc796746e921`
+- end_commit: `00c601ea5d30378f34f8b2edd28a638e6b83ed1f`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Extend `pushpals --clear` to remove PushPals-owned stale Docker artifacts, including repo-scoped warm containers and the local WorkerPal sandbox image tag.
-- Standardize the shared Python worker logger contract so backend recovery paths can safely use Python-style logger methods without wrapper crashes.
-- Auto-stage resolved merge-conflict files and continue prepared rebases when no conflict markers remain, while still failing fast on truly unresolved conflicts.
+- Fix `RemoteBuddy` worker startup so a freshly spawned WorkerPal that comes online already `busy` is treated as healthy instead of being killed as "not ready."
+- Prevent queued work from being stranded behind false startup timeouts that later surface as stale-claim job failures.
+- Add regression coverage for the busy-on-startup worker path so startup readiness stays separate from idle-capacity selection.
 
 ## Install
 
@@ -42,4 +42,4 @@ bun install -g @pushpalsdev/cli
 ## Release Checklist
 
 - Confirm `release_log.md` content before tagging.
-- Tag and push: `git tag v1.0.50 && git push origin v1.0.50`.
+- Tag and push: `git tag v1.0.53 && git push origin v1.0.53`.
