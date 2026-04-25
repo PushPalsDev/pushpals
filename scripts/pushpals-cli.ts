@@ -2337,6 +2337,65 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
   };
 }
 
+export async function cleanupLocalWorkerpalSandboxImage(opts: {
+  repoRoot: string;
+  env: Record<string, string>;
+  dockerImage: string | null | undefined;
+  platform?: NodeJS.Platform;
+  runCommandWithEnvFn?: typeof runCommandWithEnv;
+  commandTimeoutMs?: number;
+}): Promise<{ ok: boolean; detail: string; removed: boolean; imageName: string }> {
+  const imageName = String(opts.dockerImage ?? "").trim();
+  if (!imageName) {
+    return {
+      ok: true,
+      detail: "no local WorkerPal sandbox image configured",
+      removed: false,
+      imageName: "",
+    };
+  }
+
+  const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
+  const commandTimeoutMs =
+    typeof opts.commandTimeoutMs === "number" && Number.isFinite(opts.commandTimeoutMs)
+      ? Math.max(1, Math.floor(opts.commandTimeoutMs))
+      : WORKERPAL_IMAGE_INSPECT_TIMEOUT_MS;
+  const dockerExecutable = resolveConfiguredDockerExecutable(
+    opts.env,
+    opts.platform ?? process.platform,
+  );
+  const remove = await runCommandWithEnvFn(
+    [dockerExecutable, "image", "rm", "-f", imageName],
+    opts.repoRoot,
+    opts.env,
+    commandTimeoutMs,
+  );
+  if (!remove.ok) {
+    const detail = remove.stderr || remove.stdout || `exit ${remove.exitCode}`;
+    if (isMissingDockerImageDetail(detail)) {
+      return {
+        ok: true,
+        detail: `no local WorkerPal sandbox image found for ${imageName}`,
+        removed: false,
+        imageName,
+      };
+    }
+    return {
+      ok: false,
+      detail: `failed to remove local WorkerPal sandbox image ${imageName}: ${detail}`,
+      removed: false,
+      imageName,
+    };
+  }
+
+  return {
+    ok: true,
+    detail: `removed local WorkerPal sandbox image ${imageName}`,
+    removed: true,
+    imageName,
+  };
+}
+
 export async function cleanupLingeringPushPalsGitWorktrees(opts: {
   repoRoot: string;
   env: Record<string, string>;
@@ -3154,6 +3213,47 @@ async function clearPushpalsState(opts: {
   for (const target of missing) {
     console.log(`[pushpals] Nothing to clear for ${target.label}: ${target.path}`);
   }
+
+  if (opts.config.remotebuddy.workerpalDocker || opts.config.remotebuddy.workerpalRequireDocker) {
+    const dockerEnv = normalizeChildProcessEnv(process.env as Record<string, string | undefined>);
+    const warmCleanup = await cleanupLingeringWorkerpalWarmContainers({
+      repoRoot: opts.repoRoot,
+      env: dockerEnv,
+    });
+    if (warmCleanup.ok) {
+      console.log(
+        warmCleanup.removed > 0
+          ? `[pushpals] Cleared WorkerPal warm containers: ${warmCleanup.detail}`
+          : `[pushpals] Nothing to clear for WorkerPal warm containers: ${warmCleanup.detail}`,
+      );
+    } else {
+      failed.push({
+        label: "WorkerPal warm containers",
+        path: opts.repoRoot,
+        detail: warmCleanup.detail,
+      });
+    }
+
+    const imageCleanup = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: opts.repoRoot,
+      env: dockerEnv,
+      dockerImage: opts.config.remotebuddy.workerpalImage ?? opts.config.workerpals.dockerImage,
+    });
+    if (imageCleanup.ok) {
+      console.log(
+        imageCleanup.removed
+          ? `[pushpals] Cleared WorkerPal sandbox image: ${imageCleanup.imageName}`
+          : `[pushpals] Nothing to clear for WorkerPal sandbox image: ${imageCleanup.detail}`,
+      );
+    } else {
+      failed.push({
+        label: "WorkerPal sandbox image",
+        path: imageCleanup.imageName || opts.repoRoot,
+        detail: imageCleanup.detail,
+      });
+    }
+  }
+
   for (const failure of failed) {
     console.error(
       `[pushpals] Failed to clear ${failure.label}: ${failure.path} (${failure.detail})`,

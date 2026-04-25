@@ -16,6 +16,7 @@ import {
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenMonitoringHubCommand,
+  cleanupLocalWorkerpalSandboxImage,
   createSessionEventReplayFilter,
   cleanupLingeringPushPalsGitWorktrees,
   cleanupLingeringWorkerpalWarmContainers,
@@ -1703,6 +1704,95 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       },
       {
         command: ["docker", "rm", "-f", "abc123", "def456"],
+        cwd: "/repo/example",
+      },
+    ]);
+  });
+
+  test("cleanupLocalWorkerpalSandboxImage no-ops when no image is configured", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    const result = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      dockerImage: "",
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "no local WorkerPal sandbox image configured",
+      removed: false,
+      imageName: "",
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("cleanupLocalWorkerpalSandboxImage no-ops when the image is already missing", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    const result = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      dockerImage: "pushpals-worker-sandbox:latest",
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        return {
+          ok: false,
+          stdout: "",
+          stderr: "Error response from daemon: No such image: pushpals-worker-sandbox:latest",
+          exitCode: 1,
+        };
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "no local WorkerPal sandbox image found for pushpals-worker-sandbox:latest",
+      removed: false,
+      imageName: "pushpals-worker-sandbox:latest",
+    });
+    expect(calls).toEqual([
+      {
+        command: ["docker", "image", "rm", "-f", "pushpals-worker-sandbox:latest"],
+        cwd: "/repo/example",
+      },
+    ]);
+  });
+
+  test("cleanupLocalWorkerpalSandboxImage removes the configured sandbox image", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    const result = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      dockerImage: "pushpals-worker-sandbox:latest",
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        return {
+          ok: true,
+          stdout: "Untagged: pushpals-worker-sandbox:latest\nDeleted: sha256:deadbeef\n",
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "removed local WorkerPal sandbox image pushpals-worker-sandbox:latest",
+      removed: true,
+      imageName: "pushpals-worker-sandbox:latest",
+    });
+    expect(calls).toEqual([
+      {
+        command: ["docker", "image", "rm", "-f", "pushpals-worker-sandbox:latest"],
         cwd: "/repo/example",
       },
     ]);
