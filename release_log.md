@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.50`
-- start_commit: `a7282aa2e7f3a46d471c19b9c108e52550e1faed`
-- end_commit: `94595c8f8e6927d4ab2ab76b63d109901c4e30c0`
+- version: `v1.0.51`
+- start_commit: `83ca619610077a1ae4937ca3865b34d12538f293`
+- end_commit: `9ec9cbf1448571fda9fa4945d711abb36bfc17f6`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Promote the Windows host Docker path into always-on CLI E2E coverage on self-hosted `windows/x64/docker` runners.
-- Run both packaged CLI E2E and WorkerPals control-plane E2E on the Windows Docker host path so Docker Desktop/WSL regressions are exercised before release.
-- Keep Linux packaged CLI and WorkerPals control-plane lanes active, giving the workflow coverage across both native Linux Docker and Windows-hosted Docker sandbox paths.
+- Recover OpenAI Codex worker runs from disallowed shell-wrapper retries by injecting direct-command guidance up front and retrying once with unwrapped direct commands when safe.
+- Restore autonomy PR feedback learning by resolving `patternKey` and objective context from queued job metadata when direct objective linkage is missing.
+- Defer background autonomy ideation while WorkerPals are busy, and prewarm a second worker when open unmerged PR backlog exists so active user and PR work gets priority.
 
 ## Install
 
