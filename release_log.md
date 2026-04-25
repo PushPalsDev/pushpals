@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.51`
-- start_commit: `83ca619610077a1ae4937ca3865b34d12538f293`
-- end_commit: `9ec9cbf1448571fda9fa4945d711abb36bfc17f6`
-- commits_in_range: `1`
+- version: `v1.0.52`
+- start_commit: `395a17a37919fb6574dc04b4f234b4e850b53f63`
+- end_commit: `dc40f0a40646eb4728563f4c55640133990084dc`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Recover OpenAI Codex worker runs from disallowed shell-wrapper retries by injecting direct-command guidance up front and retrying once with unwrapped direct commands when safe.
-- Restore autonomy PR feedback learning by resolving `patternKey` and objective context from queued job metadata when direct objective linkage is missing.
-- Defer background autonomy ideation while WorkerPals are busy, and prewarm a second worker when open unmerged PR backlog exists so active user and PR work gets priority.
+- Extend `pushpals --clear` to remove PushPals-owned stale Docker artifacts, including repo-scoped warm containers and the local WorkerPal sandbox image tag.
+- Standardize the shared Python worker logger contract so backend recovery paths can safely use Python-style logger methods without wrapper crashes.
+- Auto-stage resolved merge-conflict files and continue prepared rebases when no conflict markers remain, while still failing fast on truly unresolved conflicts.
 
 ## Install
 
