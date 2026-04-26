@@ -13,7 +13,7 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { createServer } from "net";
-import { dirname, join, resolve } from "path";
+import { delimiter, dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -31,6 +31,7 @@ type BuildArtifacts = {
 };
 
 let buildArtifactsPromise: Promise<BuildArtifacts> | null = null;
+let cliPackageTarballPromise: Promise<string> | null = null;
 const sharedDockerImageTag = `pushpals-worker-sandbox:cli-e2e-shared-${Date.now()}`;
 let sharedDockerImageBuilt = false;
 
@@ -173,6 +174,37 @@ async function ensureBuildArtifacts(): Promise<BuildArtifacts> {
   return await buildArtifactsPromise;
 }
 
+async function ensureCliPackageTarball(): Promise<string> {
+  if (cliPackageTarballPromise) return await cliPackageTarballPromise;
+  cliPackageTarballPromise = (async () => {
+    runChecked(
+      [process.execPath, "run", "cli:bundle"],
+      repoRoot,
+      process.env as Record<string, string>,
+    );
+    const packageDir = join(repoRoot, "packages", "cli");
+    for (const entry of readdirSync(packageDir)) {
+      if (entry.startsWith("pushpalsdev-cli-") && entry.endsWith(".tgz")) {
+        rmSync(join(packageDir, entry), { force: true });
+      }
+    }
+    runChecked(["npm", "pack"], packageDir, process.env as Record<string, string>);
+    const filename =
+      readdirSync(packageDir)
+        .filter((entry) => entry.startsWith("pushpalsdev-cli-") && entry.endsWith(".tgz"))
+        .sort()[0] ?? "";
+    if (!filename) {
+      throw new Error(`npm pack did not produce a tarball under ${packageDir}`);
+    }
+    const sourceTarballPath = join(packageDir, filename);
+    const cachedTarballPath = join(buildCacheRoot, filename);
+    cpSync(sourceTarballPath, cachedTarballPath, { force: true });
+    rmSync(sourceTarballPath, { force: true });
+    return cachedTarballPath;
+  })();
+  return await cliPackageTarballPromise;
+}
+
 async function isPortAvailable(port: number): Promise<boolean> {
   return await new Promise<boolean>((resolvePort) => {
     const server = createServer();
@@ -312,6 +344,42 @@ function buildCliE2EEnv(extra: Record<string, string> = {}): Record<string, stri
     PUSHPALS_RUNTIME_ROOT: "",
     ...extra,
   } as Record<string, string>;
+}
+
+function resolveInstalledPushpalsPath(globalBinDir: string): string {
+  const candidates =
+    process.platform === "win32"
+      ? ["pushpals.exe", "pushpals.cmd", "pushpals"]
+      : ["pushpals"];
+  for (const candidate of candidates) {
+    const candidatePath = join(globalBinDir, candidate);
+    if (existsSync(candidatePath)) return candidatePath;
+  }
+  throw new Error(`Installed pushpals entrypoint was not found under ${globalBinDir}`);
+}
+
+async function installCliTarballGlobally(root: string): Promise<{
+  bunInstallRoot: string;
+  globalBinDir: string;
+  pushpalsPath: string;
+}> {
+  const bunInstallRoot = join(root, "bun-install");
+  mkdirSync(bunInstallRoot, { recursive: true });
+  const tarballPath = await ensureCliPackageTarball();
+  const installEnv = {
+    ...process.env,
+    BUN_INSTALL: bunInstallRoot,
+  } as Record<string, string>;
+  runChecked([process.execPath, "install", "-g", tarballPath], root, installEnv);
+  const globalBinDir = runChecked([process.execPath, "pm", "bin", "-g"], root, installEnv).stdout.trim();
+  if (!globalBinDir) {
+    throw new Error("bun pm bin -g returned an empty global bin directory.");
+  }
+  return {
+    bunInstallRoot,
+    globalBinDir,
+    pushpalsPath: resolveInstalledPushpalsPath(globalBinDir),
+  };
 }
 
 function shouldKeepE2ETempRoot(): boolean {
@@ -635,6 +703,123 @@ async function terminateProcessByCommandNeedle(commandNeedle: string, timeoutMs:
 }
 
 describe("packaged CLI end-to-end", () => {
+  test(
+    "boots from a bun-installed package entrypoint with an isolated runtime root",
+    async () => {
+      const artifacts = await ensureBuildArtifacts();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-installed-"));
+      let clearProc: ReturnType<typeof Bun.spawn> | null = null;
+      let statusProc: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        const { repoPath } = initializeTempRepo(root);
+        const runtimeRoot = join(root, "runtime");
+        const portBase = await findAvailablePortBlock();
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase, {
+          autonomyEnabled: process.platform === "win32",
+        });
+        const installed = await installCliTarballGlobally(root);
+        const env = buildCliE2EEnv({
+          BUN_INSTALL: installed.bunInstallRoot,
+          PATH: `${installed.globalBinDir}${delimiter}${process.env.PATH ?? ""}`,
+          OPENAI_API_KEY: "cli-e2e-installed-package-key",
+          PUSHPALS_OPENAI_CODEX_AUTH_MODE: "api_key",
+          PUSHPALS_DATA_DIR_OVERRIDE: join(root, "data"),
+          REMOTEBUDDY_AUTO_SPAWN_WORKERPALS: "false",
+          REMOTEBUDDY_AUTONOMY_ENABLED: process.platform === "win32" ? "true" : "false",
+        });
+
+        clearProc = Bun.spawn(
+          [installed.pushpalsPath, "--clear", "--runtime-root", runtimeRoot],
+          {
+            cwd: repoPath,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            env,
+          },
+        );
+        const clearStdoutCapture = startTextCapture(clearProc.stdout);
+        const clearStderrCapture = startTextCapture(clearProc.stderr);
+        const [clearStdout, clearStderr, clearExitCode] = await Promise.all([
+          clearStdoutCapture.promise,
+          clearStderrCapture.promise,
+          waitForExitWithTimeout(
+            clearProc,
+            5 * 60_000,
+            () => `${clearStdoutCapture.getSnapshot()}\n${clearStderrCapture.getSnapshot()}`,
+          ),
+        ]);
+        if (clearExitCode !== 0) {
+          throw new Error(`Installed-package clear exited ${clearExitCode}\n${clearStdout}\n${clearStderr}`);
+        }
+
+        statusProc = Bun.spawn(
+          [
+            installed.pushpalsPath,
+            "--status-once",
+            "--runtime-root",
+            runtimeRoot,
+            "--runtime-tag",
+            runtimeTag,
+          ],
+          {
+            cwd: repoPath,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            env,
+          },
+        );
+
+        const stdoutCapture = startTextCapture(statusProc.stdout);
+        const stderrCapture = startTextCapture(statusProc.stderr);
+        const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
+        await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
+
+        const [stdout, stderr, exitCode] = await Promise.all([
+          stdoutCapture.promise,
+          stderrCapture.promise,
+          waitForExitWithTimeout(
+            statusProc,
+            10 * 60_000,
+            () => `${stdoutCapture.getSnapshot()}\n${stderrCapture.getSnapshot()}`,
+          ),
+        ]);
+        const combined = `${stdout}\n${stderr}`;
+
+        if (exitCode !== 0) {
+          throw new Error(`Installed-package CLI E2E exited ${exitCode}\n${combined}`);
+        }
+        expect(combined).toContain("[pushpals] startup timing summary: outcome=ready");
+        expect(combined).toContain("[pushpals] Embedded runtime is ready.");
+        expect(combined).toContain("[pushpals] Connected.");
+        expect(combined).not.toContain("[pushpals] Auto-start failed:");
+        expect(combined).not.toContain("[pushpals] Fatal:");
+        expect(combined).not.toContain("panic(main thread):");
+        expect(combined).not.toContain("Segmentation fault");
+      } finally {
+        if (clearProc) {
+          try {
+            clearProc.kill();
+          } catch {}
+        }
+        if (statusProc) {
+          try {
+            statusProc.kill();
+          } catch {}
+        }
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
+        }
+      }
+    },
+    20 * 60_000,
+  );
+
   test(
     "boots embedded runtime in a temp repo with real Docker and reports readiness via /status",
     async () => {

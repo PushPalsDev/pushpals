@@ -92,6 +92,51 @@ jobs:
           fi
           npm publish --access public --provenance
 
+  smoke_published_cli_linux:
+    name: Smoke published CLI package on Linux
+    runs-on: ubuntu-latest
+    needs:
+      - meta
+      - publish_npm
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+
+      - name: Run installed-package Linux smoke
+        run: |
+          bun run scripts/release-installed-cli-smoke.ts \
+            --package-spec @pushpalsdev/cli@${{ needs.meta.outputs.version }}
+
+  smoke_published_cli_windows:
+    name: Smoke published CLI package on Windows
+    runs-on: windows-2022
+    needs:
+      - meta
+      - publish_npm
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+
+      - name: Run installed-package Windows smoke
+        shell: pwsh
+        run: |
+          bun run scripts/release-installed-cli-smoke.ts `
+            --package-spec @pushpalsdev/cli@${{ needs.meta.outputs.version }}
+
   build_binaries:
     name: Build standalone CLI binaries
     needs: meta
