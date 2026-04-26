@@ -104,6 +104,15 @@ export interface QualityGatePolicy {
   criticMinScore: number;
 }
 
+function shouldSoftPassValidationBlocker(
+  policy: QualityGatePolicy,
+  blocker: ValidationBlocker | null,
+): boolean {
+  if (!blocker) return false;
+  if (!policy.softPassOnExhausted) return false;
+  return policy.mode === "review_fix" || policy.mode === "merge_conflict";
+}
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 export function shouldCommit(
@@ -2140,7 +2149,13 @@ export async function resumePreparedMergeConflictRebase(
   params?: Record<string, unknown>,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<
-  | { ok: true; resumed: boolean; sequencer: "rebase" | "merge" | "cherry-pick" | null; detail?: string }
+  | {
+      ok: true;
+      resumed: boolean;
+      sequencer: "rebase" | "merge" | "cherry-pick" | null;
+      detail?: string;
+      advancedToNextConflict?: boolean;
+    }
   | { ok: false; error: string }
 > {
   const sequencer = await activeGitOperation(repo);
@@ -2230,6 +2245,26 @@ export async function resumePreparedMergeConflictRebase(
     continueOutput = combinedGitOutput(rebaseContinue);
   }
   if (!rebaseContinue.ok) {
+    const continuingSequencer = await activeGitOperation(repo);
+    if (continuingSequencer === "rebase") {
+      const nextUnresolved = await git(repo, ["diff", "--name-only", "--diff-filter=U"]);
+      if (nextUnresolved.ok) {
+        const nextPaths = parseChangedPathsFromNameOnlyOutput(nextUnresolved.stdout);
+        if (nextPaths.length > 0) {
+          onLog?.(
+            "stdout",
+            `[MergeConflict] Rebase advanced into another conflicted commit with ${nextPaths.length} unresolved file(s); rerunning the resolver on updated sandbox state.`,
+          );
+          return {
+            ok: true,
+            resumed: true,
+            sequencer: "rebase",
+            detail: `rebase advanced into another conflicted commit with ${nextPaths.length} unresolved file(s)`,
+            advancedToNextConflict: true,
+          };
+        }
+      }
+    }
     return {
       ok: false,
       error: `Failed to continue prepared merge-conflict rebase: ${continueOutput}`,
@@ -2951,6 +2986,7 @@ export function buildWorkerCommitMessage(
 export type { JobResult } from "./common/types.js";
 
 const SUPPORTED_JOB_KINDS = new Set(["warmup.execute", "task.execute"]);
+const MAX_MERGE_CONFLICT_RESOLUTION_PASSES = 8;
 
 type TaskExecutePriority = "interactive" | "normal" | "background";
 type TaskExecuteIntent = "chat" | "status" | "code_change" | "analysis" | "other";
@@ -3583,12 +3619,12 @@ export async function executeJob(
         : qualityCriticMinScore.toFixed(1);
     onLog?.(
       "stdout",
-      `[QualityGate] review_fix policy active: prior_score=${priorScore}, target_threshold=${threshold}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}; repo/environment blockers still fail hard.`,
+      `[QualityGate] review_fix policy active: prior_score=${priorScore}, target_threshold=${threshold}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}; unfinished branch-state blockers fail hard, but repo/environment validation blockers soft-pass once the update is publishable.`,
     );
   } else if (qualityGatePolicy.mode === "merge_conflict") {
     onLog?.(
       "stdout",
-      `[QualityGate] merge_conflict policy active: soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}; unfinished rebases and repo/environment blockers still fail hard.`,
+      `[QualityGate] merge_conflict policy active: soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}; unfinished rebases still fail hard, but repo/environment validation blockers soft-pass once the rebase is publishable.`,
     );
   }
 
@@ -3611,41 +3647,75 @@ export async function executeJob(
         exitCode: 1,
       };
     }
-    const result = await runExecutor(
-      kind,
-      attemptParams,
-      repo,
-      runtimeConfig,
-      onLog,
-      executeBudgets,
-    );
-    if (!result.ok) return result;
-    if (mergeConflictContext) {
+    let result: Awaited<ReturnType<typeof runExecutor>> | null = null;
+    let mergeConflictPass = 0;
+    while (true) {
+      const currentResult = await runExecutor(
+        kind,
+        attemptParams,
+        repo,
+        runtimeConfig,
+        onLog,
+        executeBudgets,
+      );
+      if (!currentResult.ok) return currentResult;
+      result = currentResult;
+      if (!mergeConflictContext) break;
+
       const resume = await resumePreparedMergeConflictRebase(repo, kind, attemptParams, onLog);
       if (!resume.ok) {
         onLog?.("stderr", `[MergeConflict] ${resume.error}`);
         return {
           ok: false,
           summary: "Merge-conflict rebase continuation failed",
-          stdout: result.stdout,
-          stderr: [result.stderr ?? "", resume.error].filter(Boolean).join("\n"),
+          stdout: currentResult.stdout,
+          stderr: [currentResult.stderr ?? "", resume.error].filter(Boolean).join("\n"),
           exitCode: 4,
         };
       }
       const sequencer = resume.sequencer;
-      if (sequencer) {
-        const detail =
-          `Merge-conflict job returned with git ${sequencer} still in progress. ` +
-          `Finish the ${sequencer} before returning control to WorkerPals.`;
-        onLog?.("stderr", `[MergeConflict] ${detail}`);
-        return {
-          ok: false,
-          summary: detail,
-          stdout: result.stdout,
-          stderr: [result.stderr ?? "", detail].filter(Boolean).join("\n"),
-          exitCode: 4,
-        };
+      if (!sequencer) break;
+      if (sequencer === "rebase" && resume.resumed && resume.advancedToNextConflict) {
+        mergeConflictPass += 1;
+        if (mergeConflictPass >= MAX_MERGE_CONFLICT_RESOLUTION_PASSES) {
+          const detail =
+            `Merge-conflict rebase required more than ${MAX_MERGE_CONFLICT_RESOLUTION_PASSES} resolver passes. ` +
+            "Stopping to avoid an infinite conflict-resolution loop.";
+          onLog?.("stderr", `[MergeConflict] ${detail}`);
+          return {
+            ok: false,
+            summary: detail,
+            stdout: currentResult.stdout,
+            stderr: [currentResult.stderr ?? "", resume.detail ?? detail].filter(Boolean).join("\n"),
+            exitCode: 4,
+          };
+        }
+        onLog?.(
+          "stdout",
+          `[MergeConflict] Rebase surfaced another conflicted commit after auto-continue; rerunning resolver pass ${
+            mergeConflictPass + 1
+          }.`,
+        );
+        continue;
       }
+      const detail =
+        `Merge-conflict job returned with git ${sequencer} still in progress. ` +
+        `Finish the ${sequencer} before returning control to WorkerPals.`;
+      onLog?.("stderr", `[MergeConflict] ${detail}`);
+      return {
+        ok: false,
+        summary: detail,
+        stdout: currentResult.stdout,
+        stderr: [currentResult.stderr ?? "", detail].filter(Boolean).join("\n"),
+        exitCode: 4,
+      };
+    }
+    if (!result) {
+      return {
+        ok: false,
+        summary: "Merge-conflict execution ended without an executor result.",
+        exitCode: 4,
+      };
     }
 
     const scopeCheck = await collectWriteScopeWarnings(repo, planning);
@@ -3693,18 +3763,36 @@ export async function executeJob(
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
     if (quality.blocker) {
       const blockerSummary = `Quality gate blocked by ${quality.blocker.category} issue: ${quality.blocker.detail}`;
+      const blockerDiagnostics = truncate(
+        [
+          result.stderr ?? "",
+          ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
+        ].join("\n"),
+        outputPolicyForRuntime(runtimeConfig),
+      );
+      if (shouldSoftPassValidationBlocker(qualityGatePolicy, quality.blocker)) {
+        onLog?.(
+          "stderr",
+          `[QualityGate] Soft-pass on ${quality.blocker.category} blocker for publishable ${qualityGatePolicy.mode} job: ${toSingleLine(
+            quality.blocker.detail,
+            260,
+          )}`,
+        );
+        return {
+          ...result,
+          summary:
+            `${result.summary} ` +
+            `(quality gate soft-pass on ${quality.blocker.category} blocker after publishable ${qualityGatePolicy.mode} update)`,
+          stderr: blockerDiagnostics,
+          exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
+        };
+      }
       onLog?.("stderr", `[QualityGate] ${blockerSummary}`);
       return {
         ok: false,
         summary: blockerSummary,
         stdout: result.stdout,
-        stderr: truncate(
-          [
-            result.stderr ?? "",
-            ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
-          ].join("\n"),
-          outputPolicyForRuntime(runtimeConfig),
-        ),
+        stderr: blockerDiagnostics,
         exitCode: 4,
       };
     }
