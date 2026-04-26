@@ -2,17 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.59`
-- start_commit: `cec8e75eb0c4807e24184f89621bd91b2a50fa93`
-- end_commit: `7b1b22ec80928c60d13f9da736264ce7b5393d27`
-- commits_in_range: `4`
+- version: `v1.0.60`
+- start_commit: `3cc70920dee7751184ebfb7958d0d20ee6dece30`
+- end_commit: `a8f3dcff239cae2633c34f42b32538c6c56f24a8`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Recover Windows embedded CLI startup when the standalone `RemoteBuddy` runtime crashes with a Bun panic by swapping the managed service in place and rerunning a prebundled fallback asset under Bun instead of aborting the whole session.
-- Ship the bundled `RemoteBuddy` fallback JS inside the CLI runtime asset set so the recovery path works from the extracted runtime tree without requiring a workspace install or `bun install`.
-- Harden Windows runtime asset sync against transient `EBUSY` cleanup races during bundle and test cycles, and add forced-crash CLI E2E coverage for the exact fallback path on both Windows and WSL Ubuntu.
-- Stabilize the hosted Windows release smoke by using deterministic OpenAI Codex API-key auth and accepting a logged WorkerPal warmup attempt with known Docker limitations as a valid runner outcome while still proving RemoteBuddy and server startup health.
+- Add a real installed-package smoke runner that verifies the published `@pushpalsdev/cli` package cold-starts the embedded runtime, survives `pushpals --clear`, and reaches `--status-once` readiness on both Windows and Linux.
+- Extend packaged CLI end-to-end coverage to install the freshly packed CLI tarball into an isolated global Bun prefix and boot the installed `pushpals` entrypoint instead of only testing the source-tree bundle.
+- Wire post-publish release canaries into the release workflow so every tagged release now validates the actual npm package install path on both `windows-2022` and `ubuntu-latest` after publish, closing the gap that let installed-package startup regressions escape earlier releases.
 
 ## Install
 
@@ -38,4 +37,4 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- Docker-backed end-to-end coverage and hosted Windows smoke still depend on the underlying Docker daemon being healthy; when Docker Desktop itself is wedged, real-Docker integration runs will stall or downgrade until Docker is restarted.
+- Native WSL source-tree `cli:bundle` runs can still hang in the Expo monitor export path when building from a Windows-mounted checkout under `/mnt/c/...`; the published CLI package cold-start path is covered separately and passes on native WSL Bun.
