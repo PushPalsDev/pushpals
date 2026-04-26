@@ -49,8 +49,11 @@ function deriveJobElapsedMs(job: JobSnapshotRow): number | null {
 
   const end =
     parseIsoMs(job.completedAt) ??
+    parseIsoMs(job.abandonedAt) ??
     parseIsoMs(job.failedAt) ??
-    (job.status === "completed" || job.status === "failed" ? parseIsoMs(job.updatedAt) : null);
+    (job.status === "completed" || job.status === "failed" || job.status === "abandoned"
+      ? parseIsoMs(job.updatedAt)
+      : null);
   const start =
     parseIsoMs(job.startedAt) ?? parseIsoMs(job.claimedAt) ?? parseIsoMs(job.enqueuedAt);
   if (start == null || end == null || end < start) return null;
@@ -125,8 +128,8 @@ export function JobsPane({
           theme={theme}
         />
         <MetricTile
-          title="Failed Jobs"
-          value={String(queueValue(jobCounts, "failed"))}
+          title="Failed / Abandoned"
+          value={String(queueValue(jobCounts, "failed") + queueValue(jobCounts, "abandoned"))}
           tone="danger"
           theme={theme}
         />
@@ -188,9 +191,13 @@ export function JobsPane({
                   item.startedAt ? `start ${prettyTs(item.startedAt)}` : null,
                   item.firstLogAt ? `first-log ${prettyTs(item.firstLogAt)}` : null,
                   item.completedAt ? `done ${prettyTs(item.completedAt)}` : null,
+                  item.abandonedAt ? `abandon ${prettyTs(item.abandonedAt)}` : null,
                   item.failedAt ? `fail ${prettyTs(item.failedAt)}` : null,
                 ].filter(Boolean) as string[];
-                const isTerminal = item.status === "completed" || item.status === "failed";
+                const isTerminal =
+                  item.status === "completed" ||
+                  item.status === "failed" ||
+                  item.status === "abandoned";
                 if (isTerminal && elapsedMs != null) {
                   phaseBits.push(`elapsed ${formatDuration(elapsedMs)}`);
                 }
@@ -199,6 +206,8 @@ export function JobsPane({
                     ? `queue #${queueMeta.position} (eta ${formatEtaMs(queueMeta.etaMs)})`
                     : item.status === "claimed"
                       ? "running"
+                      : item.status === "abandoned"
+                        ? "abandoned"
                       : elapsedMs != null
                         ? `elapsed ${formatDuration(elapsedMs)}`
                         : "terminal";

@@ -432,7 +432,7 @@ export interface JobSnapshotRow {
   queueWaitBudgetMs?: number | null;
   executionBudgetMs?: number | null;
   finalizationBudgetMs?: number | null;
-  status: "pending" | "claimed" | "completed" | "failed";
+  status: "pending" | "claimed" | "completed" | "failed" | "abandoned";
   workerId: string | null;
   targetWorkerId: string | null;
   result: string | null;
@@ -443,8 +443,11 @@ export interface JobSnapshotRow {
   startedAt?: string | null;
   firstLogAt?: string | null;
   failedAt?: string | null;
+  abandonedAt?: string | null;
   completedAt?: string | null;
   durationMs?: number | null;
+  resumeOfJobId?: string | null;
+  attempt?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -499,6 +502,7 @@ export interface JobSloSummary {
   terminal: number;
   completed: number;
   failed: number;
+  abandoned: number;
   timeoutFailures: number;
   successRate: number | null;
   timeoutRate: number | null;

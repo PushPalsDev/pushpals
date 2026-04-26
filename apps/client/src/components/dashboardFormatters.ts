@@ -32,6 +32,7 @@ export function relativeMs(iso?: string): string {
 export function statusColor(theme: DashboardTheme, status: string): string {
   const normalized = status.toLowerCase();
   if (normalized.includes("complete") || normalized.includes("processed")) return theme.positive;
+  if (normalized.includes("abandon")) return theme.warning;
   if (
     normalized.includes("fail") ||
     normalized.includes("error") ||

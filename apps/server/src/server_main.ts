@@ -401,26 +401,47 @@ export function createRequestHandler() {
         if (recovered.length === 0) return;
 
         for (const item of recovered) {
-          console.warn(
-            `[Server] Recovered stale claimed job ${item.jobId} (worker=${item.workerId ?? "unknown"})`,
-          );
+          if (item.action === "requeued") {
+            console.warn(
+              `[Server] Requeued retry-safe stale claimed job ${item.jobId} as ${item.replacementJobId ?? "unknown"} (worker=${item.workerId ?? "unknown"})`,
+            );
+          } else {
+            console.warn(
+              `[Server] Recovered stale claimed job ${item.jobId} (worker=${item.workerId ?? "unknown"})`,
+            );
+          }
           const session = sessionManager.getSession(item.sessionId);
           if (!session) continue;
 
-          const envelope: EventEnvelope<"job_failed"> = {
-            protocolVersion: PROTOCOL_VERSION,
-            id: randomUUID(),
-            ts: item.recoveredAt,
-            sessionId: item.sessionId,
-            type: "job_failed",
-            from: "server:stale-claim-recovery",
-            payload: {
-              jobId: item.jobId,
-              message: item.message,
-              detail: item.detail,
-            },
-          };
-          session.emit(envelope);
+          if (item.action === "requeued") {
+            session.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID(),
+              ts: item.recoveredAt,
+              sessionId: item.sessionId,
+              type: "log",
+              from: "server:stale-claim-recovery",
+              payload: {
+                level: "warn",
+                message: `job ${item.jobId} was abandoned after a stale claim and requeued as ${item.replacementJobId ?? "unknown"} (${item.detail})`,
+              },
+            });
+          } else {
+            const envelope: EventEnvelope<"job_failed"> = {
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID(),
+              ts: item.recoveredAt,
+              sessionId: item.sessionId,
+              type: "job_failed",
+              from: "server:stale-claim-recovery",
+              payload: {
+                jobId: item.jobId,
+                message: item.message,
+                detail: item.detail,
+              },
+            };
+            session.emit(envelope);
+          }
         }
       };
       const initiateShutdown = (reason: string): void => {
@@ -960,8 +981,10 @@ export function createRequestHandler() {
         const jobPendingSnapshot = jobQueue.nextPendingSnapshot(10);
         const jobSlo = jobQueue.sloSummary(24);
         const completionCounts = completionQueue.countByStatus();
-        const jobTerminal = Math.max(0, Number(jobSlo.completed ?? 0) + Number(jobSlo.failed ?? 0));
-        const jobFailureRate = jobTerminal > 0 ? Number(jobSlo.failed ?? 0) / jobTerminal : 0;
+        const abandonedJobs = Math.max(0, Number(jobSlo.abandoned ?? 0));
+        const failedJobs = Math.max(0, Number(jobSlo.failed ?? 0));
+        const jobTerminal = Math.max(0, Number(jobSlo.completed ?? 0) + failedJobs + abandonedJobs);
+        const jobFailureRate = jobTerminal > 0 ? (failedJobs + abandonedJobs) / jobTerminal : 0;
         const autonomyOps = autonomyStore.getOpsSummary({
           requestPending: Math.max(0, Number(requestCounts.pending ?? 0)),
           jobFailureRate,
@@ -1557,12 +1580,12 @@ export function createRequestHandler() {
 
         const status = (url.searchParams.get("status") ?? "all").trim().toLowerCase();
         const limit = parseLimit(url.searchParams.get("limit"));
-        if (!["all", "pending", "claimed", "completed", "failed"].includes(status)) {
+        if (!["all", "pending", "claimed", "completed", "failed", "abandoned"].includes(status)) {
           return makeJson({ ok: false, message: "Invalid status filter" }, 400);
         }
 
         const jobs = jobQueue.listJobs({
-          status: status as "all" | "pending" | "claimed" | "completed" | "failed",
+          status: status as "all" | "pending" | "claimed" | "completed" | "failed" | "abandoned",
           limit,
         });
 

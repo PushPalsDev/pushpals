@@ -14,6 +14,24 @@ function enqueueAndClaim(queue: JobQueue, workerId: string): string {
   return claim.job!.id;
 }
 
+function enqueueKindAndClaim(
+  queue: JobQueue,
+  workerId: string,
+  kind: string,
+  params: Record<string, unknown> = {},
+): string {
+  const enqueue = queue.enqueue({
+    taskId: `task-${workerId}-${kind.replace(/[^a-z0-9]+/gi, "-")}`,
+    sessionId: "dev",
+    kind,
+    params,
+  });
+  expect(enqueue.ok).toBe(true);
+  const claim = queue.claim(workerId);
+  expect(claim.ok).toBe(true);
+  return claim.job!.id;
+}
+
 describe("JobQueue stale recovery", () => {
   test("claims pending jobs by priority order and exposes queue metadata", () => {
     const queue = new JobQueue(":memory:");
@@ -364,6 +382,54 @@ describe("JobQueue stale recovery", () => {
     expect(queue.getJob(jobId)?.status).toBe("failed");
   });
 
+  test("requeues retry-safe stale claims as abandoned successors with resume metadata", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueKindAndClaim(queue, "worker-warmup-stale", "warmup.execute", {
+      bootReason: "prewarm",
+    });
+    const db = (queue as unknown as { db: any }).db as any;
+    const staleIso = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
+      staleIso,
+      "worker-warmup-stale",
+    );
+    db.prepare(
+      "UPDATE jobs SET updatedAt = ?, claimedAt = ?, startedAt = ?, firstLogAt = NULL WHERE id = ?",
+    ).run(staleIso, staleIso, staleIso, jobId);
+
+    const recovered = queue.recoverStaleClaimedJobs(120_000);
+
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.action).toBe("requeued");
+    expect(recovered[0]?.finalStatus).toBe("abandoned");
+    expect(recovered[0]?.retrySafety).toBe("retry_safe");
+    expect(recovered[0]?.replacementJobId).toBeTruthy();
+
+    const abandoned = queue.getJob(jobId);
+    expect(abandoned?.status).toBe("abandoned");
+    expect(abandoned?.error).toContain("replacementJobId");
+
+    const replacement = queue.getPendingJobs().find((row) => row.resumeOfJobId === jobId);
+    expect(replacement?.status).toBe("pending");
+    expect(replacement?.attempt).toBe(2);
+    expect(replacement?.kind).toBe("warmup.execute");
+
+    const replacementParams = JSON.parse(String(replacement?.params ?? "{}")) as Record<
+      string,
+      unknown
+    >;
+    const resume = replacementParams.resume as Record<string, unknown> | undefined;
+    expect(resume?.previousJobId).toBe(jobId);
+    expect(resume?.reason).toBe("stale_worker_claim");
+    expect(queue.countByStatus().abandoned).toBe(1);
+    expect(queue.countByStatus().pending).toBe(1);
+
+    const slo = queue.sloSummary(24);
+    expect(slo.abandoned).toBe(1);
+    expect(slo.timeoutFailures).toBe(1);
+  });
+
   test("heartbeat fails orphaned claimed jobs once the worker reports idle past grace", () => {
     const queue = new JobQueue(":memory:");
     const jobId = enqueueAndClaim(queue, "worker-heartbeat-orphan");
@@ -386,6 +452,43 @@ describe("JobQueue stale recovery", () => {
     expect(heartbeat.ok).toBe(true);
     expect(queue.getJob(jobId)?.status).toBe("failed");
     expect(queue.getJob(jobId)?.error).toContain("worker heartbeat dropped claimed job");
+    expect(queue.listWorkers()[0]?.currentJobId).toBeNull();
+  });
+
+  test("heartbeat requeues retry-safe orphaned claims instead of failing them", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueKindAndClaim(queue, "worker-heartbeat-warmup", "warmup.execute", {
+      bootReason: "heartbeat-restart",
+    });
+    const db = (queue as unknown as { db: any }).db as any;
+    const staleIso = new Date(Date.now() - 60 * 1000).toISOString();
+
+    db.prepare("UPDATE jobs SET updatedAt = ?, claimedAt = ?, startedAt = ? WHERE id = ?").run(
+      staleIso,
+      staleIso,
+      staleIso,
+      jobId,
+    );
+
+    const heartbeat = queue.heartbeat({
+      workerId: "worker-heartbeat-warmup",
+      status: "idle",
+      currentJobId: null,
+    });
+
+    expect(heartbeat.ok).toBe(true);
+    expect(queue.getJob(jobId)?.status).toBe("abandoned");
+
+    const replacement = queue.getPendingJobs().find((row) => row.resumeOfJobId === jobId);
+    expect(replacement?.status).toBe("pending");
+    expect(replacement?.attempt).toBe(2);
+
+    const replacementParams = JSON.parse(String(replacement?.params ?? "{}")) as Record<
+      string,
+      unknown
+    >;
+    const resume = replacementParams.resume as Record<string, unknown> | undefined;
+    expect(resume?.reason).toBe("worker_heartbeat_mismatch");
     expect(queue.listWorkers()[0]?.currentJobId).toBeNull();
   });
 

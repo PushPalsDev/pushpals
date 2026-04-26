@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "crypto";
 
-export type JobStatus = "pending" | "claimed" | "completed" | "failed";
+export type JobStatus = "pending" | "claimed" | "completed" | "failed" | "abandoned";
 export type WorkerStatus = "idle" | "busy" | "error" | "offline";
 export type JobPriority = "interactive" | "normal" | "background";
+export type JobRetrySafety = "retry_safe" | "manual_retry_required";
+type JobRecoveryReason = "worker_heartbeat_mismatch" | "stale_worker_claim";
 
 const JOB_PRIORITY_ORDER: JobPriority[] = ["interactive", "normal", "background"];
 const JOB_PRIORITY_QUEUE_SLA_MS: Record<JobPriority, number> = {
@@ -19,6 +21,7 @@ const JOB_EXECUTION_BUDGET_MS: Record<JobPriority, number> = {
 const JOB_FINALIZATION_BUDGET_MS_DEFAULT = 120_000;
 const PR_WORKER_ASSIGNMENT_MAX_AGE_MS = 120_000;
 const ORPHANED_CLAIM_HEARTBEAT_GRACE_MS = 15_000;
+const RETRY_SAFE_REQUEUE_DELAY_MS = 5_000;
 
 export interface JobRow {
   id: string;
@@ -44,8 +47,11 @@ export interface JobRow {
   startedAt: string | null;
   firstLogAt: string | null;
   failedAt: string | null;
+  abandonedAt: string | null;
   completedAt: string | null;
   durationMs: number | null;
+  resumeOfJobId: string | null;
+  attempt: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -103,6 +109,11 @@ export interface RecoveredStaleJob {
   workerId: string | null;
   message: string;
   detail: string;
+  action: "failed" | "requeued";
+  finalStatus: "failed" | "abandoned";
+  retrySafety: JobRetrySafety;
+  replacementJobId?: string;
+  replacementAvailableAt?: string | null;
   recoveredAt: string;
 }
 
@@ -118,6 +129,7 @@ export interface JobSloSummary {
   terminal: number;
   completed: number;
   failed: number;
+  abandoned: number;
   timeoutFailures: number;
   successRate: number | null;
   timeoutRate: number | null;
@@ -232,6 +244,119 @@ function isTimeoutFailureError(errorPayload: string | null): boolean {
   );
 }
 
+function parseJobParamsRecord(value: string | null): Record<string, unknown> {
+  return parseObjectJson(value);
+}
+
+function extractResolutionType(params: Record<string, unknown>): string | null {
+  const direct = params.resolutionType;
+  if (typeof direct === "string" && direct.trim()) return direct.trim().toLowerCase();
+  const reviewAgent = params.reviewAgent;
+  if (reviewAgent && typeof reviewAgent === "object" && !Array.isArray(reviewAgent)) {
+    const nested = (reviewAgent as Record<string, unknown>).resolutionType;
+    if (typeof nested === "string" && nested.trim()) return nested.trim().toLowerCase();
+  }
+  return null;
+}
+
+function classifyJobRetrySafety(
+  kind: string,
+  params: Record<string, unknown>,
+): { retrySafety: JobRetrySafety; reason: string } {
+  const explicit = String(params.retrySafety ?? "")
+    .trim()
+    .toLowerCase();
+  if (explicit === "retry_safe" || explicit === "retry-safe" || explicit === "safe") {
+    return {
+      retrySafety: "retry_safe",
+      reason: "params.retrySafety explicitly marked this job retry-safe",
+    };
+  }
+  if (
+    explicit === "manual_retry_required" ||
+    explicit === "manual-retry-required" ||
+    explicit === "unsafe" ||
+    explicit === "non_idempotent"
+  ) {
+    return {
+      retrySafety: "manual_retry_required",
+      reason: "params.retrySafety explicitly marked this job non-idempotent",
+    };
+  }
+  if (kind === "warmup.execute") {
+    return {
+      retrySafety: "retry_safe",
+      reason: "warmup.execute is side-effect free and safe to restart from scratch",
+    };
+  }
+  if (kind === "task.execute") {
+    const resolutionType = extractResolutionType(params);
+    if (resolutionType === "merge_conflict") {
+      return {
+        retrySafety: "manual_retry_required",
+        reason: "merge_conflict task.execute may rewrite rebase or branch state before abandonment",
+      };
+    }
+    if (resolutionType === "review_fix") {
+      return {
+        retrySafety: "manual_retry_required",
+        reason: "review_fix task.execute may create follow-up commit or PR side effects",
+      };
+    }
+    return {
+      retrySafety: "manual_retry_required",
+      reason: "task.execute may mutate repository or publish side effects and is not auto-requeue safe",
+    };
+  }
+  return {
+    retrySafety: "manual_retry_required",
+    reason: `${kind || "unknown"} is not classified as retry-safe`,
+  };
+}
+
+function buildResumeParams(
+  params: Record<string, unknown>,
+  recovery: {
+    previousJobId: string;
+    previousWorkerId: string | null;
+    recoveredAt: string;
+    reason: JobRecoveryReason;
+    detail: string;
+    retrySafety: JobRetrySafety;
+    classificationReason: string;
+    attempt: number;
+  },
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...params };
+  const rawHistory = Array.isArray(next.resumeHistory) ? next.resumeHistory : [];
+  const history = rawHistory
+    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+    .slice(-7) as Record<string, unknown>[];
+  history.push({
+    previousJobId: recovery.previousJobId,
+    previousWorkerId: recovery.previousWorkerId,
+    recoveredAt: recovery.recoveredAt,
+    reason: recovery.reason,
+    detail: recovery.detail,
+    retrySafety: recovery.retrySafety,
+    classificationReason: recovery.classificationReason,
+    attempt: recovery.attempt,
+  });
+  next.resume = {
+    strategy: "restart_after_abandonment",
+    previousJobId: recovery.previousJobId,
+    previousWorkerId: recovery.previousWorkerId,
+    recoveredAt: recovery.recoveredAt,
+    reason: recovery.reason,
+    detail: recovery.detail,
+    retrySafety: recovery.retrySafety,
+    classificationReason: recovery.classificationReason,
+    attempt: recovery.attempt,
+  };
+  next.resumeHistory = history;
+  return next;
+}
+
 function extractPlanningField(params: unknown, key: string): unknown {
   if (!params || typeof params !== "object" || Array.isArray(params)) return undefined;
   const planning = (params as Record<string, unknown>).planning;
@@ -335,8 +460,11 @@ export class JobQueue {
           startedAt           TEXT,
           firstLogAt          TEXT,
           failedAt            TEXT,
+          abandonedAt         TEXT,
           completedAt         TEXT,
           durationMs          INTEGER,
+          resumeOfJobId       TEXT,
+          attempt             INTEGER NOT NULL DEFAULT 1,
           createdAt           TEXT NOT NULL,
           updatedAt           TEXT NOT NULL
         );
@@ -427,11 +555,20 @@ export class JobQueue {
     if (!jobColumns.some((col) => col.name === "failedAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN failedAt TEXT;`);
     }
+    if (!jobColumns.some((col) => col.name === "abandonedAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN abandonedAt TEXT;`);
+    }
     if (!jobColumns.some((col) => col.name === "completedAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN completedAt TEXT;`);
     }
     if (!jobColumns.some((col) => col.name === "durationMs")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN durationMs INTEGER;`);
+    }
+    if (!jobColumns.some((col) => col.name === "resumeOfJobId")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN resumeOfJobId TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "attempt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;`);
     }
     if (!jobColumns.some((col) => col.name === "prUrl")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN prUrl TEXT;`);
@@ -469,6 +606,7 @@ export class JobQueue {
           WHEN dedupeCooldownMs IS NULL OR dedupeCooldownMs < 0 THEN 0
           ELSE dedupeCooldownMs
         END,
+        attempt = CASE WHEN attempt IS NULL OR attempt <= 0 THEN 1 ELSE attempt END,
         queueWaitBudgetMs = CASE WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90000 ELSE queueWaitBudgetMs END,
         executionBudgetMs = CASE WHEN executionBudgetMs IS NULL OR executionBudgetMs <= 0 THEN 900000 ELSE executionBudgetMs END,
         finalizationBudgetMs = CASE WHEN finalizationBudgetMs IS NULL OR finalizationBudgetMs <= 0 THEN 120000 ELSE finalizationBudgetMs END,
@@ -951,6 +1089,7 @@ export class JobQueue {
                startedAt = COALESCE(startedAt, ?),
                availableAt = NULL,
                failedAt = NULL,
+               abandonedAt = NULL,
                completedAt = NULL,
                durationMs = NULL,
                updatedAt = ?
@@ -996,6 +1135,184 @@ export class JobQueue {
       };
     }
     return { ok: true, job: claimed.job, queueWaitMs: claimed.queueWaitMs };
+  }
+
+  private recoverClaimedJob(
+    jobId: string,
+    now: string,
+    options: {
+      expectedWorkerId?: string | null;
+      recoveryReason: JobRecoveryReason;
+      failureMessage: string;
+      abandonmentMessage: string;
+      detail: string;
+    },
+  ): RecoveredStaleJob | null {
+    const job = this.getJob(jobId);
+    if (!job || job.status !== "claimed") return null;
+    if (options.expectedWorkerId && job.workerId !== options.expectedWorkerId) return null;
+
+    const params = parseJobParamsRecord(job.params);
+    const { retrySafety, reason: classificationReason } = classifyJobRetrySafety(job.kind, params);
+    const detailWithClassification = [
+      options.detail,
+      `retrySafety=${retrySafety}`,
+      `classificationReason=${classificationReason}`,
+    ].join("; ");
+
+    if (retrySafety === "retry_safe") {
+      const replacementJobId = randomUUID();
+      const attempt = Math.max(1, Math.floor(Number(job.attempt || 1))) + 1;
+      const replacementAvailableAt = new Date(
+        Date.parse(now) + RETRY_SAFE_REQUEUE_DELAY_MS,
+      ).toISOString();
+      const replacementParams = buildResumeParams(params, {
+        previousJobId: job.id,
+        previousWorkerId: job.workerId,
+        recoveredAt: now,
+        reason: options.recoveryReason,
+        detail: options.detail,
+        retrySafety,
+        classificationReason,
+        attempt,
+      });
+      const nextTargetWorkerId =
+        job.targetWorkerId && job.targetWorkerId !== job.workerId ? job.targetWorkerId : null;
+      const abandonmentError = JSON.stringify({
+        message: options.abandonmentMessage,
+        detail: detailWithClassification,
+        replacementJobId,
+        replacementAvailableAt,
+      });
+      const abandonedInfo = this.db
+        .prepare(
+          `UPDATE jobs
+           SET status = 'abandoned',
+               error = ?,
+               failedAt = NULL,
+               abandonedAt = ?,
+               availableAt = NULL,
+               completedAt = NULL,
+               durationMs = MAX(
+                 0,
+                 CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+               ),
+               updatedAt = ?
+           WHERE id = ?
+             AND status = 'claimed'
+             AND (? IS NULL OR workerId = ?)` ,
+        )
+        .run(
+          abandonmentError,
+          now,
+          now,
+          now,
+          job.id,
+          options.expectedWorkerId ?? null,
+          options.expectedWorkerId ?? null,
+        );
+      if (abandonedInfo.changes === 0) return null;
+
+      this.db
+        .prepare(
+          `INSERT INTO jobs (
+             id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
+             queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+             status, workerId, targetWorkerId, result, prUrl, error, availableAt,
+             enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
+             durationMs, resumeOfJobId, attempt, createdAt, updatedAt
+           )
+           VALUES (
+             ?, ?, ?, ?, ?, ?, ?, ?,
+             ?, ?, ?,
+             'pending', NULL, ?, NULL, ?, NULL, ?,
+             ?, NULL, NULL, NULL, NULL, NULL, NULL,
+             NULL, ?, ?, ?, ?
+           )`,
+        )
+        .run(
+          replacementJobId,
+          job.taskId,
+          job.sessionId,
+          job.kind,
+          JSON.stringify(replacementParams),
+          job.dedupeKey,
+          job.dedupeCooldownMs,
+          job.priority,
+          job.queueWaitBudgetMs,
+          job.executionBudgetMs,
+          job.finalizationBudgetMs,
+          nextTargetWorkerId,
+          job.prUrl,
+          replacementAvailableAt,
+          now,
+          job.id,
+          attempt,
+          now,
+          now,
+        );
+
+      return {
+        jobId: job.id,
+        taskId: job.taskId,
+        sessionId: job.sessionId,
+        workerId: job.workerId,
+        message: options.abandonmentMessage,
+        detail: detailWithClassification,
+        action: "requeued",
+        finalStatus: "abandoned",
+        retrySafety,
+        replacementJobId,
+        replacementAvailableAt,
+        recoveredAt: now,
+      };
+    }
+
+    const failureError = JSON.stringify({
+      message: options.failureMessage,
+      detail: detailWithClassification,
+    });
+    const failedInfo = this.db
+      .prepare(
+        `UPDATE jobs
+         SET status = 'failed',
+             error = ?,
+             failedAt = ?,
+             abandonedAt = NULL,
+             availableAt = NULL,
+             completedAt = NULL,
+             durationMs = MAX(
+               0,
+               CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+             ),
+             updatedAt = ?
+         WHERE id = ?
+           AND status = 'claimed'
+           AND (? IS NULL OR workerId = ?)` ,
+      )
+      .run(
+        failureError,
+        now,
+        now,
+        now,
+        job.id,
+        options.expectedWorkerId ?? null,
+        options.expectedWorkerId ?? null,
+      );
+    if (failedInfo.changes === 0) return null;
+
+    return {
+      jobId: job.id,
+      taskId: job.taskId,
+      sessionId: job.sessionId,
+      workerId: job.workerId,
+      message: options.failureMessage,
+      detail: detailWithClassification,
+      action: "failed",
+      finalStatus: "failed",
+      retrySafety,
+      recoveredAt: now,
+    };
   }
 
   heartbeat(body: Record<string, unknown>): { ok: boolean; message?: string } {
@@ -1099,7 +1416,8 @@ export class JobQueue {
         const activityAgeMs = Math.max(0, nowMs - activityMs);
         if (activityAgeMs < ORPHANED_CLAIM_HEARTBEAT_GRACE_MS) continue;
 
-        const message = "Job auto-failed after worker heartbeat dropped claimed job";
+        const failureMessage = "Job auto-failed after worker heartbeat dropped claimed job";
+        const abandonmentMessage = "Job auto-abandoned after worker heartbeat dropped claimed job";
         const detailParts = [
           `worker=${workerId}`,
           `workerStatus=${status}`,
@@ -1112,25 +1430,14 @@ export class JobQueue {
           `graceMs=${ORPHANED_CLAIM_HEARTBEAT_GRACE_MS}`,
         ];
         const detail = detailParts.join("; ");
-
-        const info = this.db
-          .prepare(
-            `UPDATE jobs
-             SET status = 'failed',
-                 error = ?,
-                 failedAt = ?,
-                 availableAt = NULL,
-                 completedAt = NULL,
-                 durationMs = MAX(
-                   0,
-                   CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
-                 ),
-                 updatedAt = ?
-             WHERE id = ? AND status = 'claimed' AND workerId = ?`,
-          )
-          .run(JSON.stringify({ message, detail }), now, now, now, row.jobId, workerId);
-        if (info.changes === 0) continue;
-        this.refreshPrWorkerAssignmentForJob(row.jobId, now);
+        const recovered = this.recoverClaimedJob(row.jobId, now, {
+          expectedWorkerId: workerId,
+          recoveryReason: "worker_heartbeat_mismatch",
+          failureMessage,
+          abandonmentMessage,
+          detail,
+        });
+        if (!recovered) continue;
       }
     });
 
@@ -1463,7 +1770,8 @@ export class JobQueue {
         if (activityAgeMs < effectiveStaleAfterMs) continue;
         if (workerAligned && heartbeatAgeMs < effectiveStaleAfterMs) continue;
 
-        const message = "Job auto-failed after stale worker claim";
+        const failureMessage = "Job auto-failed after stale worker claim";
+        const abandonmentMessage = "Job auto-abandoned after stale worker claim";
         const detailParts = [
           row.workerId ? `worker=${row.workerId}` : "worker=missing",
           row.workerStatus ? `workerStatus=${row.workerStatus}` : "workerStatus=missing",
@@ -1484,24 +1792,14 @@ export class JobQueue {
           `effectiveStaleAfterMs=${effectiveStaleAfterMs}`,
         ];
         const detail = detailParts.join("; ");
-
-        const info = this.db
-          .prepare(
-            `UPDATE jobs
-             SET status = 'failed',
-                 error = ?,
-                 failedAt = ?,
-                 completedAt = NULL,
-                 durationMs = MAX(
-                   0,
-                   CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
-                 ),
-                 updatedAt = ?
-             WHERE id = ? AND status = 'claimed'`,
-          )
-          .run(JSON.stringify({ message, detail }), now, now, now, row.jobId);
-
-        if (info.changes === 0) continue;
+        const recoveredItem = this.recoverClaimedJob(row.jobId, now, {
+          expectedWorkerId: row.workerId,
+          recoveryReason: "stale_worker_claim",
+          failureMessage,
+          abandonmentMessage,
+          detail,
+        });
+        if (!recoveredItem) continue;
 
         if (row.workerId) {
           const staleHeartbeat =
@@ -1521,15 +1819,7 @@ export class JobQueue {
             .run(nextStatus, row.jobId, now, row.workerId);
         }
 
-        recovered.push({
-          jobId: row.jobId,
-          taskId: row.taskId,
-          sessionId: row.sessionId,
-          workerId: row.workerId,
-          message,
-          detail,
-          recoveredAt: now,
-        });
+        recovered.push(recoveredItem);
       }
     });
 
@@ -1623,6 +1913,7 @@ export class JobQueue {
       claimed: 0,
       completed: 0,
       failed: 0,
+      abandoned: 0,
     };
     for (const row of rows) {
       if (row.status in counts) counts[row.status] = Number(row.count || 0);
@@ -1660,7 +1951,14 @@ export class JobQueue {
     if (!normalizedKind) return 0;
     const requestedStatuses = Array.isArray(statuses) ? statuses : [statuses];
     const normalizedStatuses = [...new Set(requestedStatuses.map((status) => String(status).trim()))]
-      .filter((status) => status === "pending" || status === "claimed" || status === "completed" || status === "failed");
+      .filter(
+        (status) =>
+          status === "pending" ||
+          status === "claimed" ||
+          status === "completed" ||
+          status === "failed" ||
+          status === "abandoned",
+      );
     if (normalizedStatuses.length === 0) return 0;
     const placeholders = normalizedStatuses.map(() => "?").join(", ");
     const row = this.db
@@ -1850,7 +2148,7 @@ export class JobQueue {
       .prepare(
         `SELECT status, durationMs, enqueuedAt, claimedAt, createdAt, updatedAt, error
          FROM jobs
-         WHERE status IN ('completed', 'failed')
+         WHERE status IN ('completed', 'failed', 'abandoned')
            AND updatedAt >= ?`,
       )
       .all(cutoffIso) as Array<{
@@ -1865,14 +2163,16 @@ export class JobQueue {
 
     let completed = 0;
     let failed = 0;
+    let abandoned = 0;
     let timeoutFailures = 0;
     const durationSamples: number[] = [];
     const queueWaitSamples: number[] = [];
 
     for (const row of rows) {
       if (row.status === "completed") completed += 1;
-      if (row.status === "failed") {
-        failed += 1;
+      if (row.status === "failed" || row.status === "abandoned") {
+        if (row.status === "failed") failed += 1;
+        if (row.status === "abandoned") abandoned += 1;
         if (isTimeoutFailureError(row.error)) timeoutFailures += 1;
       }
       if (
@@ -1889,7 +2189,7 @@ export class JobQueue {
       }
     }
 
-    const terminal = completed + failed;
+    const terminal = completed + failed + abandoned;
     const successRate = terminal > 0 ? Number((completed / terminal).toFixed(4)) : null;
     const timeoutRate = terminal > 0 ? Number((timeoutFailures / terminal).toFixed(4)) : null;
 
@@ -1898,6 +2198,7 @@ export class JobQueue {
       terminal,
       completed,
       failed,
+      abandoned,
       timeoutFailures,
       successRate,
       timeoutRate,
