@@ -655,6 +655,8 @@ test(
           stderr: "pipe",
           env: {
             ...process.env,
+            OPENAI_API_KEY: "pushpals-e2e-openai-key",
+            PUSHPALS_OPENAI_CODEX_AUTH_MODE: "api_key",
             PUSHPALS_WORKERPALS_SANDBOX_ROOT: sourceRepoRoot,
           },
         },

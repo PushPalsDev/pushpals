@@ -375,11 +375,20 @@ set -eu
 REAL_DOCKER=${shSingleQuote(realDockerPath)}
 STATE_FILE=${shSingleQuote(statePath)}
 TARGET_IMAGE=${shSingleQuote(targetImage)}
-last_arg=""
+is_inspect="0"
+has_target="0"
+if [ "$#" -ge 2 ] && [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  is_inspect="1"
+fi
+if [ "$#" -ge 1 ] && [ "$1" = "inspect" ]; then
+  is_inspect="1"
+fi
 for arg in "$@"; do
-  last_arg="$arg"
+  if [ "$arg" = "$TARGET_IMAGE" ]; then
+    has_target="1"
+  fi
 done
-if [ "$#" -ge 2 ] && [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$last_arg" = "$TARGET_IMAGE" ] && [ ! -f "$STATE_FILE" ]; then
+if [ "$is_inspect" = "1" ] && [ "$has_target" = "1" ] && [ ! -f "$STATE_FILE" ]; then
   : > "$STATE_FILE"
   sleep 20
   exit 124
@@ -878,8 +887,9 @@ describe("packaged CLI end-to-end", () => {
           throw new Error(`CLI E2E exited ${exitCode}\n${combined}`);
         }
         expect(combined).toContain(
-          `[pushpals] failed to inspect local WorkerPal sandbox image ${artifacts.dockerImage}: timed out after 15000ms`,
+          `[pushpals] failed to inspect local WorkerPal sandbox image ${artifacts.dockerImage}:`,
         );
+        expect(combined).toContain("timed out after 15000ms");
         expect(combined).toContain(
           `[pushpals] WorkerPal sandbox image ${artifacts.dockerImage} could not be inspected; attempting local rebuild...`,
         );
