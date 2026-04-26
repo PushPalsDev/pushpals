@@ -1256,6 +1256,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       join("/runtime/pushpals", "sandbox", "apps", "workerpals", "Dockerfile.sandbox"),
     );
     expect(paths.packageJsonPath).toBe(join("/runtime/pushpals", "sandbox", "package.json"));
+    expect(paths.remotebuddyFallbackBundlePath).toBe(
+      join("/runtime/pushpals", "sandbox", ".pushpals-remotebuddy-fallback.js"),
+    );
     expect(paths.configsDir).toBe(join("/runtime/pushpals", "sandbox", "configs"));
     expect(paths.workerpalsPromptsDir).toBe(
       join("/runtime/pushpals", "sandbox", "prompts", "workerpals"),

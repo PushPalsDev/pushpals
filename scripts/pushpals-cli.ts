@@ -165,6 +165,7 @@ type WorkerpalSandboxPaths = {
   dockerfilePath: string;
   packageJsonPath: string;
   workerpalsDir: string;
+  remotebuddyFallbackBundlePath: string;
   sharedDir: string;
   protocolDir: string;
   configsDir: string;
@@ -748,6 +749,7 @@ export function buildWorkerpalSandboxPaths(runtimeRoot: string): WorkerpalSandbo
     dockerfilePath: join(root, "apps", "workerpals", "Dockerfile.sandbox"),
     packageJsonPath: join(root, "package.json"),
     workerpalsDir: join(root, "apps", "workerpals"),
+    remotebuddyFallbackBundlePath: join(root, ".pushpals-remotebuddy-fallback.js"),
     sharedDir: join(root, "packages", "shared"),
     protocolDir: join(root, "packages", "protocol"),
     configsDir: join(root, "configs"),
@@ -1646,6 +1648,12 @@ function readLogTail(logPath: string, maxLines = 40): string {
     .filter((line) => line.length > 0);
   if (lines.length === 0) return "";
   return lines.slice(-maxLines).join("\n");
+}
+
+function hasStandaloneBunCrashSignature(text: string): boolean {
+  return /\bpanic\(main thread\)|\bsegmentation fault\b|oh no:\s*bun has crashed\b/i.test(
+    String(text ?? ""),
+  );
 }
 
 export function extractRemoteBuddyAutonomousEngineState(
@@ -3723,16 +3731,28 @@ async function autoStartRuntimeServices(opts: {
       }
     },
   });
-  const launchService = (name: RuntimeServiceName, command: string[]): RuntimeServiceProcess => {
+  const buildManagedServiceSpec = (
+    name: RuntimeServiceName,
+    command: string[],
+    launchOpts: {
+      cwd?: string;
+      appendLog?: boolean;
+    } = {},
+  ): ManagedServiceSpec => {
+    const cwd = launchOpts.cwd ?? opts.repoRoot;
     const logPath = serviceLogPaths[name];
-    const header = `[pushpals] service=${name} command=${command.join(" ")} cwd=${opts.repoRoot}`;
-    writeFileSync(logPath, `${header}\n`, "utf8");
+    const header = `[pushpals] service=${name} command=${command.join(" ")} cwd=${cwd}`;
+    if (launchOpts.appendLog && existsSync(logPath)) {
+      appendFileSync(logPath, `${header}\n`, "utf8");
+    } else {
+      writeFileSync(logPath, `${header}\n`, "utf8");
+    }
     appendRuntimeServicesLogLine(runtimeServicesLogPath, header);
-    return serviceManager.startService({
+    return {
       name,
       color: "",
       command,
-      cwd: opts.repoRoot,
+      cwd,
       env: runtimeEnv,
       logPath,
       onStdoutLine: (line) => {
@@ -3745,7 +3765,73 @@ async function autoStartRuntimeServices(opts: {
         appendFileSync(logPath, `${serviceLine}\n`, "utf8");
         appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
       },
-    });
+    };
+  };
+  const launchService = (
+    name: RuntimeServiceName,
+    command: string[],
+    launchOpts?: {
+      cwd?: string;
+      appendLog?: boolean;
+    },
+  ): RuntimeServiceProcess => {
+    return serviceManager.startService(buildManagedServiceSpec(name, command, launchOpts));
+  };
+  const replaceService = (
+    name: RuntimeServiceName,
+    command: string[],
+    launchOpts?: {
+      cwd?: string;
+      appendLog?: boolean;
+    },
+  ): RuntimeServiceProcess => {
+    return serviceManager.replaceService(buildManagedServiceSpec(name, command, launchOpts));
+  };
+  const sandboxPaths = buildWorkerpalSandboxPaths(runtimeRoot);
+  const remoteBuddyFallbackBun =
+    process.platform === "win32"
+      ? resolveEmbeddedBunExecutableFromEnv(runtimeEnv, process.platform, process.execPath)
+      : "";
+  const remoteBuddySourceFallback =
+    process.platform === "win32" &&
+    remoteBuddyFallbackBun &&
+    existsSync(sandboxPaths.remotebuddyFallbackBundlePath)
+      ? {
+          cwd: sandboxPaths.root,
+          bunBin: remoteBuddyFallbackBun,
+          bundlePath: sandboxPaths.remotebuddyFallbackBundlePath,
+        }
+      : null;
+  let remoteBuddyFallbackActivated = false;
+  const maybeActivateRemoteBuddyWindowsFallback = (): boolean => {
+    if (remoteBuddyFallbackActivated || !remoteBuddySourceFallback) return false;
+    const tail = readLogTail(serviceLogPaths.remotebuddy, 120);
+    if (!hasStandaloneBunCrashSignature(tail)) return false;
+    remoteBuddyFallbackActivated = true;
+    lastReportedRemoteBuddyAutonomyState = "unknown";
+    console.warn(
+      "[pushpals] Embedded RemoteBuddy standalone binary crashed on Windows; retrying with source fallback under bun.",
+    );
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      "[pushpals] embedded remotebuddy standalone binary crashed on Windows; retrying with source fallback under bun.",
+    );
+    replaceService(
+      "remotebuddy",
+      [
+        remoteBuddySourceFallback.bunBin,
+        remoteBuddySourceFallback.bundlePath,
+        "--server",
+        opts.serverUrl,
+        "--sessionId",
+        opts.sessionId,
+      ],
+      {
+      cwd: remoteBuddySourceFallback.cwd,
+      appendLog: true,
+      },
+    );
+    return true;
   };
 
   const serverHealthy = await probeServer(opts.serverUrl);
@@ -3947,6 +4033,10 @@ async function autoStartRuntimeServices(opts: {
     reportRemoteBuddyAutonomousEngineState();
     for (const service of serviceManager.getServices()) {
       if (service.exited) {
+        if (service.name === "remotebuddy" && maybeActivateRemoteBuddyWindowsFallback()) {
+          await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
+          continue;
+        }
         if (isOptionalEmbeddedService(service.name)) {
           const runtimeServiceName = service.name as RuntimeServiceName;
           const serviceLogPath = service.logPath ?? serviceLogPaths[runtimeServiceName];
@@ -3996,6 +4086,10 @@ async function autoStartRuntimeServices(opts: {
         reportRemoteBuddyAutonomousEngineState();
         for (const service of serviceManager.getServices()) {
           if (!service.exited) continue;
+          if (service.name === "remotebuddy" && maybeActivateRemoteBuddyWindowsFallback()) {
+            await Bun.sleep(250);
+            continue;
+          }
           if (isOptionalEmbeddedService(service.name)) {
             const runtimeServiceName = service.name as RuntimeServiceName;
             const serviceLogPath = service.logPath ?? serviceLogPaths[runtimeServiceName];

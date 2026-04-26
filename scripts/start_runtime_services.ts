@@ -199,6 +199,41 @@ export class ServiceManager {
     return service;
   }
 
+  replaceService(spec: ManagedServiceSpec, options: { resetAttempts?: boolean } = {}): ManagedServiceProcess {
+    const existing = this.services.get(spec.name);
+    if (existing && !existing.exited) {
+      try {
+        const pid = existing.proc.pid;
+        if (process.platform === "win32" && typeof pid === "number" && pid > 0) {
+          Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+        } else {
+          existing.proc.kill("SIGKILL");
+        }
+      } catch {
+        // ignore best-effort replacement shutdown failures
+      }
+    }
+
+    const state = this.ensureState(spec.name);
+    if (state.pendingRestartTimer) {
+      clearTimeout(state.pendingRestartTimer);
+      state.pendingRestartTimer = null;
+    }
+    state.nextRestartAtMs = 0;
+    state.lastRestartReason = "";
+    if (options.resetAttempts !== false) {
+      state.attempts = 0;
+    }
+    this.degradedServiceReasons.delete(spec.name);
+    this.emitHealthChange();
+
+    return this.startService(spec);
+  }
+
   getServices(): ManagedServiceProcess[] {
     return Array.from(this.services.values());
   }

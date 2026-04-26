@@ -10,6 +10,8 @@ type SmokeOptions = {
   runtimeBinDir: string;
   promptsRoot: string;
   durationMs: number;
+  repoPath: string | null;
+  useRepoDataDir: boolean;
 };
 
 type SpawnedProc = ReturnType<typeof Bun.spawn>;
@@ -22,6 +24,8 @@ function parseArgs(argv: string[]): SmokeOptions {
   let runtimeBinDir = "";
   let promptsRoot = repoRoot;
   let durationMs = 60_000;
+  let repoPath: string | null = null;
+  let useRepoDataDir = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     switch (arg) {
@@ -34,6 +38,12 @@ function parseArgs(argv: string[]): SmokeOptions {
       case "--duration-ms":
         durationMs = Math.max(10_000, Number.parseInt(String(argv[++index] ?? "60000"), 10) || 60_000);
         break;
+      case "--repo-path":
+        repoPath = String(argv[++index] ?? "").trim() || null;
+        break;
+      case "--use-repo-data-dir":
+        useRepoDataDir = true;
+        break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
     }
@@ -45,6 +55,8 @@ function parseArgs(argv: string[]): SmokeOptions {
     runtimeBinDir: resolve(runtimeBinDir),
     promptsRoot: resolve(promptsRoot),
     durationMs,
+    repoPath: repoPath ? resolve(repoPath) : null,
+    useRepoDataDir,
   };
 }
 
@@ -80,7 +92,9 @@ function buildServiceEnv(options: {
   repoPath: string;
   promptsRoot: string;
   protocolSchemasDir: string;
-  dataDir: string;
+  dataDir?: string | null;
+  workerpalBin?: string | null;
+  sandboxRoot?: string | null;
 }): Record<string, string> {
   return {
     ...process.env,
@@ -90,12 +104,37 @@ function buildServiceEnv(options: {
     PUSHPALS_REPO_ROOT_OVERRIDE: options.repoPath,
     PUSHPALS_PROMPTS_ROOT_OVERRIDE: options.promptsRoot,
     PUSHPALS_PROTOCOL_SCHEMAS_DIR: options.protocolSchemasDir,
-    PUSHPALS_DATA_DIR_OVERRIDE: options.dataDir,
+    ...(options.dataDir ? { PUSHPALS_DATA_DIR_OVERRIDE: options.dataDir } : {}),
+    ...(options.workerpalBin ? { PUSHPALS_WORKERPALS_BIN: options.workerpalBin } : {}),
+    ...(options.sandboxRoot ? { PUSHPALS_WORKERPALS_SANDBOX_ROOT: options.sandboxRoot } : {}),
   } as Record<string, string>;
 }
 
-function writeRuntimeConfig(configDir: string, portBase: number): void {
-  const sourceDir = join(repoRoot, "packages", "cli", "runtime", "configs");
+function resolveRuntimeConfigSourceDir(promptsRoot: string): string {
+  const candidates = [
+    join(promptsRoot, "configs"),
+    join(repoRoot, "packages", "cli", "runtime", "configs"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, "default.toml"))) return candidate;
+  }
+  throw new Error(`Could not locate runtime configs under ${promptsRoot} or ${repoRoot}.`);
+}
+
+function resolveProtocolSchemasDir(promptsRoot: string): string {
+  const candidates = [
+    join(promptsRoot, "protocol", "schemas"),
+    join(promptsRoot, "packages", "cli", "runtime", "protocol", "schemas"),
+    join(repoRoot, "packages", "cli", "runtime", "protocol", "schemas"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, "envelope.schema.json"))) return candidate;
+  }
+  throw new Error(`Could not locate protocol schemas under ${promptsRoot} or ${repoRoot}.`);
+}
+
+function writeRuntimeConfig(configDir: string, promptsRoot: string, portBase: number): void {
+  const sourceDir = resolveRuntimeConfigSourceDir(promptsRoot);
   cpSync(sourceDir, configDir, { recursive: true, force: true });
   writeFileSync(
     join(configDir, "local.toml"),
@@ -193,6 +232,16 @@ function initializeTempRepo(root: string): string {
   return repoPath;
 }
 
+function resolveRepoPath(root: string, repoPath: string | null): string {
+  if (!repoPath) {
+    return initializeTempRepo(root);
+  }
+  if (!existsSync(join(repoPath, ".git")) && !existsSync(join(repoPath, ".git", "HEAD"))) {
+    throw new Error(`--repo-path is not a git repository: ${repoPath}`);
+  }
+  return repoPath;
+}
+
 function startTextCapture(stream: ReadableStream<Uint8Array> | null | undefined): {
   promise: Promise<string>;
   getSnapshot: () => string;
@@ -282,6 +331,20 @@ async function ensureProcessStable(
   );
 }
 
+async function removeTreeWithRetries(root: string, attempts = 10, delayMs = 500): Promise<void> {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      await Bun.sleep(delayMs);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 function ensureBinaryExists(pathValue: string): void {
   if (!existsSync(pathValue)) {
     throw new Error(`Required binary missing: ${pathValue}`);
@@ -295,6 +358,7 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   const serverBin = join(options.runtimeBinDir, "pushpals-runtime-server-windows-x64.exe");
   const remoteBuddyBin = join(options.runtimeBinDir, "pushpals-runtime-remotebuddy-windows-x64.exe");
+  const workerpalBin = join(options.runtimeBinDir, "pushpals-runtime-workerpals-windows-x64.exe");
   ensureBinaryExists(serverBin);
   ensureBinaryExists(remoteBuddyBin);
 
@@ -302,19 +366,24 @@ async function main(): Promise<void> {
   let serverProc: SpawnedProc | null = null;
   let remoteBuddyProc: SpawnedProc | null = null;
   try {
-    const repoPath = initializeTempRepo(root);
+    const repoPath = resolveRepoPath(root, options.repoPath);
     const configDir = join(root, "configs");
-    const dataDir = join(root, "data");
     mkdirSync(configDir, { recursive: true });
-    mkdirSync(dataDir, { recursive: true });
+    const dataDir = options.useRepoDataDir ? null : join(root, "data");
+    if (dataDir) mkdirSync(dataDir, { recursive: true });
     const portBase = await findAvailablePortBlock();
-    writeRuntimeConfig(configDir, portBase);
+    writeRuntimeConfig(configDir, options.promptsRoot, portBase);
+    const protocolSchemasDir = resolveProtocolSchemasDir(options.promptsRoot);
     const env = buildServiceEnv({
       configDir,
       repoPath,
       promptsRoot: options.promptsRoot,
-      protocolSchemasDir: join(options.promptsRoot, "packages", "cli", "runtime", "protocol", "schemas"),
+      protocolSchemasDir,
       dataDir,
+      workerpalBin: existsSync(workerpalBin) ? workerpalBin : null,
+      sandboxRoot: existsSync(join(repoRoot, "apps", "workerpals", "Dockerfile.sandbox"))
+        ? repoRoot
+        : null,
     });
 
     serverProc = spawnService(serverBin, repoPath, env);
@@ -341,6 +410,14 @@ async function main(): Promise<void> {
       30_000,
       "RemoteBuddy autonomy-enabled startup log",
     );
+    if (existsSync(workerpalBin)) {
+      await waitForCapturedOutput(
+        remoteSnapshot,
+        /Initial WorkerPal capacity ready via|Auto-spawn disabled:/i,
+        45_000,
+        "RemoteBuddy worker warmup log",
+      );
+    }
     await ensureProcessStable(serverProc, "server", options.durationMs, () => {
       return `${serverStdoutCapture.getSnapshot()}\n${serverStderrCapture.getSnapshot()}`;
     });
@@ -350,7 +427,9 @@ async function main(): Promise<void> {
     if (/Segmentation fault|oh no: Bun has crashed|panic\(main thread\)/i.test(finalRemoteOutput)) {
       throw new Error(`RemoteBuddy emitted a Bun crash signature.\n${summarizeTail(finalRemoteOutput)}`);
     }
-    console.log("[windows-runtime-smoke] Embedded server and RemoteBuddy remained healthy with autonomy enabled.");
+    console.log(
+      `[windows-runtime-smoke] Embedded server and RemoteBuddy remained healthy with autonomy enabled${existsSync(workerpalBin) ? " and WorkerPal warmup active" : ""}.`,
+    );
   } finally {
     for (const proc of [remoteBuddyProc, serverProc]) {
       if (!proc) continue;
@@ -361,7 +440,11 @@ async function main(): Promise<void> {
       }
     }
     await Bun.sleep(500);
-    rmSync(root, { recursive: true, force: true });
+    try {
+      await removeTreeWithRetries(root);
+    } catch (error) {
+      console.warn(`[windows-runtime-smoke] Temp cleanup warning for ${root}: ${String(error)}`);
+    }
   }
 }
 

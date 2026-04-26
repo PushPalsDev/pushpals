@@ -314,6 +314,10 @@ function buildCliE2EEnv(extra: Record<string, string> = {}): Record<string, stri
   } as Record<string, string>;
 }
 
+function shouldKeepE2ETempRoot(): boolean {
+  return String(process.env.PUSHPALS_KEEP_E2E_TMP ?? "").trim() === "1";
+}
+
 async function createFailingDockerExecutable(root: string): Promise<string> {
   if (process.platform === "win32") {
     const sourcePath = join(root, "docker-fail.ts");
@@ -337,6 +341,28 @@ async function createFailingDockerExecutable(root: string): Promise<string> {
     "utf8",
   );
   chmodSync(outputPath, 0o755);
+  return outputPath;
+}
+
+async function createCrashingRemoteBuddyExecutable(root: string): Promise<string> {
+  const sourcePath = join(root, "remotebuddy-crash.ts");
+  const extension = process.platform === "win32" ? ".exe" : "";
+  const outputPath = join(root, `pushpals-runtime-remotebuddy-crash${extension}`);
+  writeFileSync(
+    sourcePath,
+    [
+      "console.error('panic(main thread): Segmentation fault at address 0xFFFFFFFFFFFFFFFF');",
+      "console.error('oh no: Bun has crashed. This indicates a bug in Bun, not your code.');",
+      "process.exit(3);",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const buildArgs = [process.execPath, "build", sourcePath, "--compile", `--outfile=${outputPath}`];
+  if (process.platform === "win32") {
+    buildArgs.splice(3, 0, "--target=bun-windows-x64");
+  }
+  runChecked(buildArgs, root, process.env as Record<string, string>);
   return outputPath;
 }
 
@@ -676,10 +702,12 @@ describe("packaged CLI end-to-end", () => {
             proc.kill();
           } catch {}
         }
-        try {
-          await removeTreeWithRetries(root);
-        } catch (err) {
-          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
         }
       }
     },
@@ -723,18 +751,12 @@ describe("packaged CLI end-to-end", () => {
         const stdoutCapture = startTextCapture(proc.stdout);
         const stderrCapture = startTextCapture(proc.stderr);
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
-        await waitForLogLine(
-          runtimeServicesLogPath,
-          "[pushpals] embedded remotebuddy autonomous engine is enabled.",
-          180_000,
-        );
-
         const [stdout, stderr, exitCode] = await Promise.all([
           stdoutCapture.promise,
           stderrCapture.promise,
           waitForExitWithTimeout(
             proc,
-            15 * 60_000,
+            5 * 60_000,
             () => `${stdoutCapture.getSnapshot()}\n${stderrCapture.getSnapshot()}`,
           ),
         ]);
@@ -757,10 +779,103 @@ describe("packaged CLI end-to-end", () => {
             proc.kill();
           } catch {}
         }
-        try {
-          await removeTreeWithRetries(root);
-        } catch (err) {
-          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
+        }
+      }
+    },
+    20 * 60_000,
+  );
+
+  test(
+    "falls back to bundled RemoteBuddy source when the packaged Windows binary crashes with a Bun panic",
+    async () => {
+      if (process.platform !== "win32") return;
+      const artifacts = await ensureBuildArtifacts();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-remotebuddy-fallback-"));
+      let proc: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        const { repoPath } = initializeTempRepo(root);
+        const runtimeRoot = join(root, "runtime");
+        const portBase = await findAvailablePortBlock();
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase, {
+          autonomyEnabled: true,
+        });
+
+        const crashingRemoteBuddyPath = await createCrashingRemoteBuddyExecutable(root);
+        cpSync(
+          crashingRemoteBuddyPath,
+          join(runtimeRoot, "bin", artifacts.platformKey, runtimeBinaryFilename("remotebuddy", artifacts.platformKey, ".exe")),
+          { force: true },
+        );
+
+        proc = Bun.spawn(
+          [
+            process.execPath,
+            artifacts.cliPath,
+            "--status-once",
+            "--runtime-root",
+            runtimeRoot,
+            "--runtime-tag",
+            runtimeTag,
+          ],
+          {
+            cwd: repoPath,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            env: buildCliE2EEnv(),
+          },
+        );
+
+        const stdoutCapture = startTextCapture(proc.stdout);
+        const stderrCapture = startTextCapture(proc.stderr);
+        const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
+        await waitForLogLine(
+          runtimeServicesLogPath,
+          "source fallback under bun.",
+          180_000,
+        );
+
+        const [stdout, stderr, exitCode] = await Promise.all([
+          stdoutCapture.promise,
+          stderrCapture.promise,
+          waitForExitWithTimeout(
+            proc,
+            5 * 60_000,
+            () => `${stdoutCapture.getSnapshot()}\n${stderrCapture.getSnapshot()}`,
+          ),
+        ]);
+        const combined = `${stdout}\n${stderr}`;
+
+        if (exitCode !== 0) {
+          throw new Error(`CLI E2E exited ${exitCode}\n${combined}`);
+        }
+        expect(combined).toContain(
+          "[pushpals] Embedded RemoteBuddy standalone binary crashed on Windows; retrying with source fallback under bun.",
+        );
+        expect(combined).toContain("[pushpals] startup timing summary: outcome=ready");
+        expect(combined).toContain("[pushpals] Embedded runtime is ready.");
+        expect(combined).toContain("[pushpals] Embedded RemoteBuddy autonomous engine is enabled.");
+        expect(combined).toContain("[pushpals] Connected.");
+        expect(combined).not.toContain("[pushpals] Auto-start failed:");
+        expect(combined).not.toContain("[pushpals] Fatal:");
+      } finally {
+        if (proc) {
+          try {
+            proc.kill();
+          } catch {}
+        }
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
         }
       }
     },
@@ -825,10 +940,12 @@ describe("packaged CLI end-to-end", () => {
             proc.kill();
           } catch {}
         }
-        try {
-          await removeTreeWithRetries(root);
-        } catch (err) {
-          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
         }
       }
     },
@@ -903,10 +1020,12 @@ describe("packaged CLI end-to-end", () => {
             proc.kill();
           } catch {}
         }
-        try {
-          await removeTreeWithRetries(root);
-        } catch (err) {
-          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
         }
       }
     },
@@ -1032,10 +1151,12 @@ describe("packaged CLI end-to-end", () => {
             runtimeProc.kill();
           } catch {}
         }
-        try {
-          await removeTreeWithRetries(root);
-        } catch (err) {
-          console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
         }
       }
     },
