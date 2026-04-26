@@ -104,6 +104,8 @@ function buildServiceEnv(options: {
     PUSHPALS_REPO_ROOT_OVERRIDE: options.repoPath,
     PUSHPALS_PROMPTS_ROOT_OVERRIDE: options.promptsRoot,
     PUSHPALS_PROTOCOL_SCHEMAS_DIR: options.protocolSchemasDir,
+    PUSHPALS_OPENAI_CODEX_AUTH_MODE: "api_key",
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY || "pushpals-release-smoke-openai-key",
     ...(options.dataDir ? { PUSHPALS_DATA_DIR_OVERRIDE: options.dataDir } : {}),
     ...(options.workerpalBin ? { PUSHPALS_WORKERPALS_BIN: options.workerpalBin } : {}),
     ...(options.sandboxRoot ? { PUSHPALS_WORKERPALS_SANDBOX_ROOT: options.sandboxRoot } : {}),
@@ -413,9 +415,9 @@ async function main(): Promise<void> {
     if (existsSync(workerpalBin)) {
       await waitForCapturedOutput(
         remoteSnapshot,
-        /Initial WorkerPal capacity ready via|Auto-spawn disabled:/i,
+        /Initial WorkerPal capacity ready via|Auto-spawn disabled:|WorkerPal process .* exited with code|Failed to prepare Docker image/i,
         45_000,
-        "RemoteBuddy worker warmup log",
+        "RemoteBuddy worker warmup outcome log",
       );
     }
     await ensureProcessStable(serverProc, "server", options.durationMs, () => {
@@ -428,7 +430,7 @@ async function main(): Promise<void> {
       throw new Error(`RemoteBuddy emitted a Bun crash signature.\n${summarizeTail(finalRemoteOutput)}`);
     }
     console.log(
-      `[windows-runtime-smoke] Embedded server and RemoteBuddy remained healthy with autonomy enabled${existsSync(workerpalBin) ? " and WorkerPal warmup active" : ""}.`,
+      `[windows-runtime-smoke] Embedded server and RemoteBuddy remained healthy with autonomy enabled${existsSync(workerpalBin) ? " after exercising the WorkerPal warmup path" : ""}.`,
     );
   } finally {
     for (const proc of [remoteBuddyProc, serverProc]) {
