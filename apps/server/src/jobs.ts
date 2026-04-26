@@ -18,6 +18,7 @@ const JOB_EXECUTION_BUDGET_MS: Record<JobPriority, number> = {
 };
 const JOB_FINALIZATION_BUDGET_MS_DEFAULT = 120_000;
 const PR_WORKER_ASSIGNMENT_MAX_AGE_MS = 120_000;
+const ORPHANED_CLAIM_HEARTBEAT_GRACE_MS = 15_000;
 
 export interface JobRow {
   id: string;
@@ -67,6 +68,18 @@ interface WorkerDbRow {
   createdAt: string;
   updatedAt: string;
   activeJobCount: number;
+}
+
+interface ClaimedJobActivityRow {
+  jobId: string;
+  taskId: string;
+  sessionId: string;
+  updatedAt: string;
+  claimedAt: string | null;
+  startedAt: string | null;
+  firstLogAt: string | null;
+  lastLogTs: string | null;
+  activityAt: string;
 }
 
 export interface WorkerRow {
@@ -1029,7 +1042,99 @@ export class JobQueue {
       )
       .run(workerId, status, currentJobId, pollMs, capabilities, details, now, now, now);
 
+    this.reconcileWorkerHeartbeatMismatch(workerId, status, currentJobId, now);
+
     return { ok: true };
+  }
+
+  private reconcileWorkerHeartbeatMismatch(
+    workerId: string,
+    status: WorkerStatus,
+    currentJobId: string | null,
+    now: string,
+  ): void {
+    const rows = this.db
+      .prepare(
+        `SELECT
+           j.id AS jobId,
+           j.taskId AS taskId,
+           j.sessionId AS sessionId,
+           j.updatedAt AS updatedAt,
+           j.claimedAt AS claimedAt,
+           j.startedAt AS startedAt,
+           j.firstLogAt AS firstLogAt,
+           (
+             SELECT MAX(jl.ts)
+             FROM job_logs jl
+             WHERE jl.jobId = j.id
+           ) AS lastLogTs,
+           COALESCE(
+             (
+               SELECT MAX(jl.ts)
+               FROM job_logs jl
+               WHERE jl.jobId = j.id
+             ),
+             j.firstLogAt,
+             j.startedAt,
+             j.claimedAt,
+             j.updatedAt
+           ) AS activityAt
+         FROM jobs j
+         WHERE j.status = 'claimed'
+           AND j.workerId = ?`,
+      )
+      .all(workerId) as ClaimedJobActivityRow[];
+    if (rows.length === 0) return;
+
+    const mismatchedRows =
+      status === "busy" && currentJobId
+        ? rows.filter((row) => row.jobId !== currentJobId)
+        : rows;
+    if (mismatchedRows.length === 0) return;
+
+    const nowMs = Date.parse(now);
+    const tx = this.db.transaction((claimedRows: ClaimedJobActivityRow[]) => {
+      for (const row of claimedRows) {
+        const activityMs = parseIsoMs(row.activityAt) ?? parseIsoMs(row.updatedAt) ?? nowMs;
+        const activityAgeMs = Math.max(0, nowMs - activityMs);
+        if (activityAgeMs < ORPHANED_CLAIM_HEARTBEAT_GRACE_MS) continue;
+
+        const message = "Job auto-failed after worker heartbeat dropped claimed job";
+        const detailParts = [
+          `worker=${workerId}`,
+          `workerStatus=${status}`,
+          currentJobId ? `workerCurrentJobId=${currentJobId}` : "workerCurrentJobId=missing",
+          `jobId=${row.jobId}`,
+          row.lastLogTs ? `lastLogTs=${row.lastLogTs}` : "lastLogTs=none",
+          `activityAt=${row.activityAt}`,
+          `jobUpdatedAt=${row.updatedAt}`,
+          `activityAgeMs=${activityAgeMs}`,
+          `graceMs=${ORPHANED_CLAIM_HEARTBEAT_GRACE_MS}`,
+        ];
+        const detail = detailParts.join("; ");
+
+        const info = this.db
+          .prepare(
+            `UPDATE jobs
+             SET status = 'failed',
+                 error = ?,
+                 failedAt = ?,
+                 availableAt = NULL,
+                 completedAt = NULL,
+                 durationMs = MAX(
+                   0,
+                   CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+                 ),
+                 updatedAt = ?
+             WHERE id = ? AND status = 'claimed' AND workerId = ?`,
+          )
+          .run(JSON.stringify({ message, detail }), now, now, now, row.jobId, workerId);
+        if (info.changes === 0) continue;
+        this.refreshPrWorkerAssignmentForJob(row.jobId, now);
+      }
+    });
+
+    tx(mismatchedRows);
   }
 
   listWorkers(onlineTtlMs: number = 15_000): WorkerRow[] {

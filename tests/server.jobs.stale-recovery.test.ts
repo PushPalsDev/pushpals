@@ -364,6 +364,45 @@ describe("JobQueue stale recovery", () => {
     expect(queue.getJob(jobId)?.status).toBe("failed");
   });
 
+  test("heartbeat fails orphaned claimed jobs once the worker reports idle past grace", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueAndClaim(queue, "worker-heartbeat-orphan");
+    const db = (queue as unknown as { db: any }).db as any;
+    const staleIso = new Date(Date.now() - 60 * 1000).toISOString();
+
+    db.prepare("UPDATE jobs SET updatedAt = ?, claimedAt = ?, startedAt = ? WHERE id = ?").run(
+      staleIso,
+      staleIso,
+      staleIso,
+      jobId,
+    );
+
+    const heartbeat = queue.heartbeat({
+      workerId: "worker-heartbeat-orphan",
+      status: "idle",
+      currentJobId: null,
+    });
+
+    expect(heartbeat.ok).toBe(true);
+    expect(queue.getJob(jobId)?.status).toBe("failed");
+    expect(queue.getJob(jobId)?.error).toContain("worker heartbeat dropped claimed job");
+    expect(queue.listWorkers()[0]?.currentJobId).toBeNull();
+  });
+
+  test("heartbeat keeps freshly-claimed jobs during orphaned-claim grace window", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueAndClaim(queue, "worker-heartbeat-grace");
+
+    const heartbeat = queue.heartbeat({
+      workerId: "worker-heartbeat-grace",
+      status: "idle",
+      currentJobId: null,
+    });
+
+    expect(heartbeat.ok).toBe(true);
+    expect(queue.getJob(jobId)?.status).toBe("claimed");
+  });
+
   test("computes job SLO summary including timeout failures", () => {
     const queue = new JobQueue(":memory:");
 
