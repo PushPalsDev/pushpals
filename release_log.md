@@ -2,16 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.0.56`
-- start_commit: `2ffc0781fde084d73580b9d09b170e6719073ffd`
-- end_commit: `e7bf8cfeea47ea7564fc9d1072afc76992ef2129`
-- commits_in_range: `1`
+- version: `v1.0.57`
+- start_commit: `80366bb5fea608b22de7227f0823cb3c33b4a823`
+- end_commit: `ccd327875e68d008291e368bfada30f7f5e63082`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Continue through chained merge-conflict rebases when `git rebase --continue` advances into the next conflicted commit instead of treating that forward progress as a terminal failure.
-- Rerun the merge-conflict resolver on updated paused-rebase sandbox state with a bounded pass count so multi-commit conflict chains can finish without risking infinite loops.
-- Revalidate WorkerPals merge-conflict policy and control-plane execution paths before release.
+- Fail orphaned claimed jobs as soon as the server can prove a worker heartbeat has dropped ownership, instead of leaving the job stuck in `claimed` until the stale-claim watchdog fires minutes later.
+- Add an explicit `abandoned` recovery state for retry-safe lost claims and preserve successor lineage through `resumeOfJobId`, attempt tracking, and `params.resume` metadata instead of flattening every recovery into a hard failure.
+- Auto-requeue only retry-safe work such as `warmup.execute`, while keeping non-idempotent `task.execute` jobs as hard failures with clearer diagnostics and updated queue-health telemetry.
+- Update server and dashboard surfaces to expose `abandoned` jobs in queue snapshots, lifecycle timing, and failure-rate style health signals, with regression coverage for both heartbeat-mismatch and stale-watchdog recovery paths.
 
 ## Install
 
@@ -37,4 +38,4 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- None.
+- `task.execute` resume metadata is preserved for future continuation logic, but non-idempotent abandoned jobs still restart via explicit retry rather than automatic in-place continuation.
