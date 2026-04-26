@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.55`
-- start_commit: `a0f6d18600f9880e5bb91f2961e783784c5b66f3`
-- end_commit: `3e94b41e61a9c4a26d643bf9528d4b7303453f29`
+- version: `v1.0.56`
+- start_commit: `2ffc0781fde084d73580b9d09b170e6719073ffd`
+- end_commit: `e7bf8cfeea47ea7564fc9d1072afc76992ef2129`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Harden cross-platform CLI Docker timeout recovery coverage so the timed-out inspect rebuild path still triggers when Docker inspect command shape changes between environments.
-- Pin the merge-conflict WorkerPals end-to-end lane to deterministic Codex API-key auth so Linux and Windows CI no longer depend on interactive login state inside Docker-backed test runs.
-- Revalidate the packaged CLI and WorkerPals control-plane E2E suites on both Windows and Linux to reduce stuck-job regressions before release.
+- Continue through chained merge-conflict rebases when `git rebase --continue` advances into the next conflicted commit instead of treating that forward progress as a terminal failure.
+- Rerun the merge-conflict resolver on updated paused-rebase sandbox state with a bounded pass count so multi-commit conflict chains can finish without risking infinite loops.
+- Revalidate WorkerPals merge-conflict policy and control-plane execution paths before release.
 
 ## Install
 
