@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.60`
-- start_commit: `3cc70920dee7751184ebfb7958d0d20ee6dece30`
-- end_commit: `a8f3dcff239cae2633c34f42b32538c6c56f24a8`
+- version: `v1.0.61`
+- start_commit: `d6a3750cc903aebff16de37df09d0b40179799f8`
+- end_commit: `93c51bc177e9e36177bc51b2edfc0639ea267fe7`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add a real installed-package smoke runner that verifies the published `@pushpalsdev/cli` package cold-starts the embedded runtime, survives `pushpals --clear`, and reaches `--status-once` readiness on both Windows and Linux.
-- Extend packaged CLI end-to-end coverage to install the freshly packed CLI tarball into an isolated global Bun prefix and boot the installed `pushpals` entrypoint instead of only testing the source-tree bundle.
-- Wire post-publish release canaries into the release workflow so every tagged release now validates the actual npm package install path on both `windows-2022` and `ubuntu-latest` after publish, closing the gap that let installed-package startup regressions escape earlier releases.
+- Preserve successful local WorkerPal task commits as a distinct `publish_blocked` terminal state when final branch sync or push fails, instead of misreporting them as generic commit-creation failures.
+- Surface branch-finalization diagnostics through the worker, Docker job runner, server API, and dashboard so stuck publish races now report the exact sync/push failure along with the saved hidden ref and commit SHA.
+- Harden rebase-based branch sync to resolve add/add and delete-vs-modify conflicts in worker favor without accidentally staging unrelated untracked files, and add regression coverage for those finalization races.
 
 ## Install
 
@@ -38,3 +38,4 @@ bun install -g @pushpalsdev/cli
 ## Known Issues
 
 - Native WSL source-tree `cli:bundle` runs can still hang in the Expo monitor export path when building from a Windows-mounted checkout under `/mnt/c/...`; the published CLI package cold-start path is covered separately and passes on native WSL Bun.
+- Per-app `tsc --noEmit` still trips over the existing unrelated shared-config typing issue in `packages/shared/src/config.ts`; release validation for this change relied on WorkerPals/server compile checks and targeted end-to-end suites instead.
