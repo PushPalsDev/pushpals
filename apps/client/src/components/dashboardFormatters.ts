@@ -33,6 +33,9 @@ export function statusColor(theme: DashboardTheme, status: string): string {
   const normalized = status.toLowerCase();
   if (normalized.includes("complete") || normalized.includes("processed")) return theme.positive;
   if (normalized.includes("abandon")) return theme.warning;
+  if (normalized.includes("publish_blocked") || normalized.includes("publish blocked")) {
+    return theme.danger;
+  }
   if (
     normalized.includes("fail") ||
     normalized.includes("error") ||

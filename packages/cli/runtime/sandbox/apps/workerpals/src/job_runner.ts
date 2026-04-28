@@ -46,6 +46,14 @@ interface JobResult {
     branch: string;
     sha: string;
   };
+  publishBlocked?: {
+    summary: string;
+    detail: string;
+    publicBranch: string;
+    localRef: string;
+    sha: string;
+    stage: "sync" | "push";
+  };
 }
 
 // ─── Logging helpers ────────────────────────────────────────────────────────
@@ -198,10 +206,19 @@ async function main(): Promise<void> {
           commitResult.error ??
           `Commit metadata missing for ${spec.kind} (${spec.jobId}) while running in Docker mode`;
         jobResult.ok = false;
-        jobResult.summary = `Failed to create commit for ${spec.kind}`;
+        jobResult.summary =
+          commitResult.publishBlocked?.summary ?? `Failed to create commit for ${spec.kind}`;
         jobResult.stderr = [jobResult.stderr, commitError].filter(Boolean).join("\n");
+        if (commitResult.publishBlocked) {
+          jobResult.publishBlocked = commitResult.publishBlocked;
+        }
         jobResult.exitCode = jobResult.exitCode && jobResult.exitCode !== 0 ? jobResult.exitCode : 1;
-        log("stderr", `[JobRunner] Failed to create commit: ${commitError}`);
+        log(
+          "stderr",
+          commitResult.publishBlocked
+            ? `[JobRunner] Publish blocked: ${commitError}`
+            : `[JobRunner] Failed to create commit: ${commitError}`,
+        );
       }
     }
 

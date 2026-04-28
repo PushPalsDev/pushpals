@@ -17,6 +17,7 @@ type QueueSloSummary = {
   queueWaitMs?: { p95: number | null };
   failed?: number;
   abandoned?: number;
+  publishBlocked?: number;
   completed?: number;
 };
 
@@ -2514,7 +2515,7 @@ export class AutonomyStore {
         .prepare(
           `SELECT kind, error, COUNT(*) AS count
            FROM jobs
-           WHERE status IN ('failed', 'abandoned')
+           WHERE status IN ('failed', 'abandoned', 'publish_blocked')
              AND datetime(COALESCE(failedAt, updatedAt, createdAt)) >= datetime('now', '-24 hours')
            GROUP BY kind, error
            ORDER BY count DESC
@@ -2538,7 +2539,10 @@ export class AutonomyStore {
     }
 
     const requestP95 = Number(requestSlo?.queueWaitMs?.p95 ?? 0);
-    const jobFailures = Number(jobSlo?.failed ?? 0) + Number(jobSlo?.abandoned ?? 0);
+    const jobFailures =
+      Number(jobSlo?.failed ?? 0) +
+      Number(jobSlo?.abandoned ?? 0) +
+      Number(jobSlo?.publishBlocked ?? 0);
     const jobTerminal = Number(jobSlo?.completed ?? 0) + jobFailures;
     const jobFailureRate = jobTerminal > 0 ? jobFailures / jobTerminal : 0;
     const queueHealthDegradation = clamp01(

@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { syncHiddenRefWithRemoteBranchByRebase } from "../apps/workerpals/src/execute_job";
+import { loadPushPalsConfig } from "shared";
+import { createJobCommit, syncHiddenRefWithRemoteBranchByRebase } from "../apps/workerpals/src/execute_job";
 
 function isGitSpawnPermissionDenied(error: unknown): boolean {
   const code = String((error as { code?: unknown } | null)?.code ?? "")
@@ -173,5 +174,215 @@ describe("workerpals rebase sync", () => {
         rmSync(root, { recursive: true, force: true });
       }
     },
+  );
+
+  runRebaseSyncTest(
+    "syncs hidden ref through add/add conflicts and keeps the worker version",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-rebase-sync-add-add-"));
+      const remote = join(root, "remote.git");
+      const maintainer = join(root, "maintainer");
+      const worker = join(root, "worker");
+      const branch = "agent/workerpal-test/add-add";
+      const file = "components/__tests__/AnimatedSelectionRing.test.tsx";
+      const hiddenRef = "refs/pushpals/agent/workerpal-test/job-add-add";
+
+      try {
+        await mustGit(root, ["init", "--bare", remote], "init bare remote");
+        await mustGit(root, ["clone", remote, maintainer], "clone maintainer");
+        await mustGit(root, ["clone", remote, worker], "clone worker");
+
+        await mustGit(maintainer, ["config", "user.name", "PushPals Test"], "set maintainer name");
+        await mustGit(
+          maintainer,
+          ["config", "user.email", "pushpals-test@example.com"],
+          "set maintainer email",
+        );
+        await mustGit(worker, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          worker,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
+
+        writeFileSync(join(maintainer, "README.md"), "base\n", "utf8");
+        await mustGit(maintainer, ["add", "README.md"], "stage base");
+        await mustGit(maintainer, ["commit", "-m", "base"], "commit base");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push base branch",
+        );
+
+        await mustGit(worker, ["fetch", "origin", branch], "worker fetch");
+        await mustGit(worker, ["checkout", "-B", branch, `origin/${branch}`], "worker checkout");
+        mkdirSync(join(worker, "components", "__tests__"), { recursive: true });
+        writeFileSync(join(worker, file), "export const source = 'worker';\n", "utf8");
+        await mustGit(worker, ["add", file], "stage worker add");
+        await mustGit(worker, ["commit", "-m", "worker add"], "worker commit");
+        const workerSha = await mustGit(worker, ["rev-parse", "HEAD"], "worker sha");
+        await mustGit(worker, ["update-ref", hiddenRef, workerSha], "update hidden ref");
+
+        await mustGit(
+          maintainer,
+          ["checkout", "-B", branch, `origin/${branch}`],
+          "maintainer checkout",
+        );
+        mkdirSync(join(maintainer, "components", "__tests__"), { recursive: true });
+        writeFileSync(join(maintainer, file), "export const source = 'remote';\n", "utf8");
+        await mustGit(maintainer, ["add", file], "stage remote add");
+        await mustGit(maintainer, ["commit", "-m", "remote add"], "remote commit");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push remote add",
+        );
+
+        const sync = await syncHiddenRefWithRemoteBranchByRebase(worker, hiddenRef, branch, "job-addadd");
+        expect(sync.ok).toBe(true);
+        if (!sync.ok) throw new Error(sync.error);
+
+        const resolvedFile = await mustGit(worker, ["show", `${sync.sha}:${file}`], "show resolved file");
+        expect(resolvedFile).toContain("worker");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  runRebaseSyncTest(
+    "syncs hidden ref through remote delete versus worker modify conflicts and keeps the worker file",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-rebase-sync-mod-del-"));
+      const remote = join(root, "remote.git");
+      const maintainer = join(root, "maintainer");
+      const worker = join(root, "worker");
+      const branch = "agent/workerpal-test/modify-delete";
+      const file = "apps/localbuddy/tests/request_status.test.ts";
+      const hiddenRef = "refs/pushpals/agent/workerpal-test/job-modify-delete";
+
+      try {
+        await mustGit(root, ["init", "--bare", remote], "init bare remote");
+        await mustGit(root, ["clone", remote, maintainer], "clone maintainer");
+        await mustGit(root, ["clone", remote, worker], "clone worker");
+
+        await mustGit(maintainer, ["config", "user.name", "PushPals Test"], "set maintainer name");
+        await mustGit(
+          maintainer,
+          ["config", "user.email", "pushpals-test@example.com"],
+          "set maintainer email",
+        );
+        await mustGit(worker, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          worker,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
+
+        mkdirSync(join(maintainer, "apps", "localbuddy", "tests"), { recursive: true });
+        writeFileSync(join(maintainer, file), "status: base\n", "utf8");
+        await mustGit(maintainer, ["add", "-A"], "stage base");
+        await mustGit(maintainer, ["commit", "-m", "base"], "commit base");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push base branch",
+        );
+
+        await mustGit(worker, ["fetch", "origin", branch], "worker fetch");
+        await mustGit(worker, ["checkout", "-B", branch, `origin/${branch}`], "worker checkout");
+        writeFileSync(join(worker, file), "status: worker\n", "utf8");
+        await mustGit(worker, ["add", file], "stage worker modify");
+        await mustGit(worker, ["commit", "-m", "worker modify"], "worker commit");
+        const workerSha = await mustGit(worker, ["rev-parse", "HEAD"], "worker sha");
+        await mustGit(worker, ["update-ref", hiddenRef, workerSha], "update hidden ref");
+
+        await mustGit(
+          maintainer,
+          ["checkout", "-B", branch, `origin/${branch}`],
+          "maintainer checkout",
+        );
+        await mustGit(maintainer, ["rm", file], "remove remote file");
+        await mustGit(maintainer, ["commit", "-m", "remote delete"], "remote delete commit");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push remote delete",
+        );
+
+        const sync = await syncHiddenRefWithRemoteBranchByRebase(
+          worker,
+          hiddenRef,
+          branch,
+          "job-moddel",
+        );
+        expect(sync.ok).toBe(true);
+        if (!sync.ok) throw new Error(sync.error);
+
+        const resolvedFile = await mustGit(worker, ["show", `${sync.sha}:${file}`], "show resolved file");
+        expect(resolvedFile).toContain("worker");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  runRebaseSyncTest(
+    "preserves the hidden commit ref and returns publish-blocked diagnostics when required push sync cannot reach origin",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-publish-blocked-"));
+      const repo = join(root, "repo");
+
+      try {
+        mkdirSync(repo, { recursive: true });
+        await mustGit(root, ["init", repo], "init repo");
+        await mustGit(repo, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          repo,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
+        writeFileSync(join(repo, "README.md"), "base\n", "utf8");
+        await mustGit(repo, ["add", "README.md"], "stage base");
+        await mustGit(repo, ["commit", "-m", "base"], "commit base");
+        await mustGit(repo, ["remote", "add", "origin", join(root, "missing-remote.git")], "add broken origin");
+
+        writeFileSync(join(repo, "README.md"), "updated\n", "utf8");
+        const runtimeConfig = loadPushPalsConfig();
+        runtimeConfig.workerpals.llm.model = "";
+
+        const commitResult = await createJobCommit(
+          repo,
+          "workerpal-test",
+          {
+            id: "job-publish-blocked",
+            taskId: "task-publish-blocked",
+            kind: "task.execute",
+            params: {
+              instruction: "Update README",
+              completionBranch: "agent/workerpal-test/publish-blocked",
+            },
+            context: "host",
+          },
+          runtimeConfig,
+        );
+
+        expect(commitResult.ok).toBe(false);
+        expect(commitResult.publishBlocked?.stage).toBe("sync");
+        expect(commitResult.publishBlocked?.summary).toBe("Failed to sync and push task.execute commit");
+        expect(commitResult.branch).toContain("refs/pushpals/agent/workerpal-test/job-publish-blocked");
+        expect(commitResult.sha).toBeTruthy();
+
+        const hiddenSha = await mustGit(
+          repo,
+          ["rev-parse", "refs/pushpals/agent/workerpal-test/job-publish-blocked"],
+          "resolve hidden ref",
+        );
+        expect(hiddenSha).toBe(commitResult.sha);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
   );
 });

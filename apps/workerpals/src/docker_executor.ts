@@ -215,6 +215,14 @@ export interface DockerJobResult {
   stderr?: string;
   exitCode?: number;
   cooldownMs?: number;
+  publishBlocked?: {
+    summary: string;
+    detail: string;
+    publicBranch: string;
+    localRef: string;
+    sha: string;
+    stage: "sync" | "push";
+  };
   commit?: {
     branch: string;
     sha: string;

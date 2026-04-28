@@ -564,4 +564,31 @@ describe("JobQueue stale recovery", () => {
     expect(slo.timeoutFailures).toBe(1);
     expect(slo.timeoutRate).toBe(1);
   });
+
+  test("records publish-blocked jobs as a distinct terminal status", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueAndClaim(queue, "worker-publish-blocked");
+
+    const blocked = queue.publishBlocked(jobId, {
+      message: "Failed to sync and push task.execute commit",
+      detail: "Failed to sync branch before push: git pull --rebase failed",
+      publishBlocked: {
+        publicBranch: "agent/worker/test",
+        localRef: "refs/pushpals/agent/worker/test",
+        sha: "abc123",
+        stage: "sync",
+      },
+    });
+    expect(blocked.ok).toBe(true);
+
+    const job = queue.getJob(jobId);
+    expect(job?.status).toBe("publish_blocked");
+    expect(job?.error).toContain("publish");
+    expect(queue.countByStatus().publish_blocked).toBe(1);
+
+    const slo = queue.sloSummary(24);
+    expect(slo.publishBlocked).toBe(1);
+    expect(slo.terminal).toBe(1);
+    expect(slo.completed).toBe(0);
+  });
 });

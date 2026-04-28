@@ -50,8 +50,12 @@ function deriveJobElapsedMs(job: JobSnapshotRow): number | null {
   const end =
     parseIsoMs(job.completedAt) ??
     parseIsoMs(job.abandonedAt) ??
+    parseIsoMs(job.publishBlockedAt) ??
     parseIsoMs(job.failedAt) ??
-    (job.status === "completed" || job.status === "failed" || job.status === "abandoned"
+    (job.status === "completed" ||
+    job.status === "failed" ||
+    job.status === "abandoned" ||
+    job.status === "publish_blocked"
       ? parseIsoMs(job.updatedAt)
       : null);
   const start =
@@ -128,8 +132,12 @@ export function JobsPane({
           theme={theme}
         />
         <MetricTile
-          title="Failed / Abandoned"
-          value={String(queueValue(jobCounts, "failed") + queueValue(jobCounts, "abandoned"))}
+          title="Failed / Abandoned / Blocked"
+          value={String(
+            queueValue(jobCounts, "failed") +
+              queueValue(jobCounts, "abandoned") +
+              queueValue(jobCounts, "publish_blocked"),
+          )}
           tone="danger"
           theme={theme}
         />
@@ -192,12 +200,14 @@ export function JobsPane({
                   item.firstLogAt ? `first-log ${prettyTs(item.firstLogAt)}` : null,
                   item.completedAt ? `done ${prettyTs(item.completedAt)}` : null,
                   item.abandonedAt ? `abandon ${prettyTs(item.abandonedAt)}` : null,
+                  item.publishBlockedAt ? `blocked ${prettyTs(item.publishBlockedAt)}` : null,
                   item.failedAt ? `fail ${prettyTs(item.failedAt)}` : null,
                 ].filter(Boolean) as string[];
                 const isTerminal =
                   item.status === "completed" ||
                   item.status === "failed" ||
-                  item.status === "abandoned";
+                  item.status === "abandoned" ||
+                  item.status === "publish_blocked";
                 if (isTerminal && elapsedMs != null) {
                   phaseBits.push(`elapsed ${formatDuration(elapsedMs)}`);
                 }
@@ -208,6 +218,8 @@ export function JobsPane({
                       ? "running"
                       : item.status === "abandoned"
                         ? "abandoned"
+                      : item.status === "publish_blocked"
+                        ? "publish blocked"
                       : elapsedMs != null
                         ? `elapsed ${formatDuration(elapsedMs)}`
                         : "terminal";

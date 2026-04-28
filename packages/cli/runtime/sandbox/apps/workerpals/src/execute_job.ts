@@ -16,7 +16,7 @@ import {
   type AutonomyComponentArea,
 } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
-import type { JobResult } from "./common/types.js";
+import type { JobPublishBlockedInfo, JobResult } from "./common/types.js";
 import {
   compactJobOutput,
   truncate,
@@ -1425,6 +1425,38 @@ export async function git(
 // ─── Git commit creation ─────────────────────────────────────────────────────
 
 /** Create commit for job result and return commit info */
+export interface CreateJobCommitResult {
+  ok: boolean;
+  branch?: string;
+  sha?: string;
+  error?: string;
+  publishBlocked?: JobPublishBlockedInfo;
+}
+
+function buildPublishBlockedCommitResult(options: {
+  summary: string;
+  detail: string;
+  publicBranch: string;
+  localRef: string;
+  sha: string;
+  stage: "sync" | "push";
+}): CreateJobCommitResult {
+  return {
+    ok: false,
+    branch: options.localRef,
+    sha: options.sha,
+    error: options.detail,
+    publishBlocked: {
+      summary: options.summary,
+      detail: options.detail,
+      publicBranch: options.publicBranch,
+      localRef: options.localRef,
+      sha: options.sha,
+      stage: options.stage,
+    },
+  };
+}
+
 export async function createJobCommit(
   repo: string,
   workerId: string,
@@ -1437,7 +1469,7 @@ export async function createJobCommit(
     context?: "host" | "docker";
   },
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
-): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
+): Promise<CreateJobCommitResult> {
   const defaultPublicBranchName = `agent/${workerId}/${job.id}`;
   const reviewAgentHeadRef =
     job.params?.reviewAgent &&
@@ -1569,7 +1601,14 @@ export async function createJobCommit(
         );
         if (!sync.ok) {
           pushError = `Failed to sync branch before push: ${redactSensitiveText(sync.error)}`;
-          break;
+          return buildPublishBlockedCommitResult({
+            summary: `Failed to sync and push ${job.kind} commit`,
+            detail: pushError,
+            publicBranch: publicBranchName,
+            localRef: hiddenCommitRef,
+            sha,
+            stage: "sync",
+          });
         }
         sha = sync.sha;
 
@@ -1596,10 +1635,14 @@ export async function createJobCommit(
 
       if (!pushed) {
         if (requirePush) {
-          if (hiddenRefCreated) {
-            await git(repo, ["update-ref", "-d", hiddenCommitRef]);
-          }
-          return { ok: false, error: pushError };
+          return buildPublishBlockedCommitResult({
+            summary: `Failed to sync and push ${job.kind} commit`,
+            detail: pushError || `Failed to push ${publicBranchName}`,
+            publicBranch: publicBranchName,
+            localRef: hiddenCommitRef,
+            sha,
+            stage: "push",
+          });
         }
         console.warn(
           `[WorkerPals] ${pushError}. Continuing with local commit ref only (set WORKERPALS_REQUIRE_PUSH=1 to enforce push).`,
@@ -2501,15 +2544,19 @@ async function autoResolveRebaseConflicts(
         if (!checkout.ok) {
           checkout = await git(repo, ["checkout", "--ours", "--", path]);
           if (!checkout.ok) {
-            return {
-              ok: false,
-              error: `Failed to resolve rebase conflict for ${path}: ${combinedGitOutput(checkout)}`,
-            };
+            const rm = await git(repo, ["rm", "--force", "--", path]);
+            if (!rm.ok) {
+              return {
+                ok: false,
+                error: `Failed to resolve rebase conflict for ${path}: ${combinedGitOutput(checkout)}`,
+              };
+            }
           }
         }
       }
-      // Stage resolved tracked files before continuing rebase, without pulling in unrelated untracked artifacts.
-      const addAll = await git(repo, ["add", "--update", "--", "."]);
+      // Stage only the conflicted paths so worker-side resolution can include add/add files
+      // without accidentally sweeping unrelated untracked artifacts into the replayed commit.
+      const addAll = await git(repo, ["add", "-A", "--", ...unresolvedPaths]);
       if (!addAll.ok) {
         return {
           ok: false,
@@ -2632,10 +2679,16 @@ export async function syncHiddenRefWithRemoteBranchByRebase(
       }
       const resolved = await autoResolveRebaseConflicts(repo);
       if (!resolved.ok) {
+        const unresolved = await git(repo, ["diff", "--name-only", "--diff-filter=U"]);
+        const unresolvedPaths = unresolved.ok
+          ? parseChangedPathsFromNameOnlyOutput(unresolved.stdout).join(", ")
+          : "";
         await git(repo, ["rebase", "--abort"]);
         return {
           ok: false,
-          error: `Rebase conflict resolution failed for ${publicBranchName}: ${resolved.error}`,
+          error: `Rebase conflict resolution failed for ${publicBranchName}: ${resolved.error}${
+            unresolvedPaths ? ` | unresolved=${unresolvedPaths}` : ""
+          }`,
         };
       }
       if (attempt < maxPullRebaseAttempts) {

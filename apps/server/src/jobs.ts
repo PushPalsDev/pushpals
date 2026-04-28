@@ -1,7 +1,13 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "crypto";
 
-export type JobStatus = "pending" | "claimed" | "completed" | "failed" | "abandoned";
+export type JobStatus =
+  | "pending"
+  | "claimed"
+  | "completed"
+  | "failed"
+  | "abandoned"
+  | "publish_blocked";
 export type WorkerStatus = "idle" | "busy" | "error" | "offline";
 export type JobPriority = "interactive" | "normal" | "background";
 export type JobRetrySafety = "retry_safe" | "manual_retry_required";
@@ -48,6 +54,7 @@ export interface JobRow {
   firstLogAt: string | null;
   failedAt: string | null;
   abandonedAt: string | null;
+  publishBlockedAt: string | null;
   completedAt: string | null;
   durationMs: number | null;
   resumeOfJobId: string | null;
@@ -130,6 +137,7 @@ export interface JobSloSummary {
   completed: number;
   failed: number;
   abandoned: number;
+  publishBlocked: number;
   timeoutFailures: number;
   successRate: number | null;
   timeoutRate: number | null;
@@ -461,6 +469,7 @@ export class JobQueue {
           firstLogAt          TEXT,
           failedAt            TEXT,
           abandonedAt         TEXT,
+          publishBlockedAt    TEXT,
           completedAt         TEXT,
           durationMs          INTEGER,
           resumeOfJobId       TEXT,
@@ -557,6 +566,9 @@ export class JobQueue {
     }
     if (!jobColumns.some((col) => col.name === "abandonedAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN abandonedAt TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "publishBlockedAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN publishBlockedAt TEXT;`);
     }
     if (!jobColumns.some((col) => col.name === "completedAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN completedAt TEXT;`);
@@ -1090,6 +1102,7 @@ export class JobQueue {
                availableAt = NULL,
                failedAt = NULL,
                abandonedAt = NULL,
+               publishBlockedAt = NULL,
                completedAt = NULL,
                durationMs = NULL,
                updatedAt = ?
@@ -1118,6 +1131,7 @@ export class JobQueue {
           claimedAt: now,
           startedAt: row.startedAt || now,
           failedAt: null,
+          publishBlockedAt: null,
           completedAt: null,
           durationMs: null,
           updatedAt: now,
@@ -1191,6 +1205,7 @@ export class JobQueue {
                error = ?,
                failedAt = NULL,
                abandonedAt = ?,
+               publishBlockedAt = NULL,
                availableAt = NULL,
                completedAt = NULL,
                durationMs = MAX(
@@ -1279,6 +1294,7 @@ export class JobQueue {
              error = ?,
              failedAt = ?,
              abandonedAt = NULL,
+             publishBlockedAt = NULL,
              availableAt = NULL,
              completedAt = NULL,
              durationMs = MAX(
@@ -1513,6 +1529,8 @@ export class JobQueue {
              prUrl = COALESCE(?, prUrl),
              completedAt = ?,
              failedAt = NULL,
+             abandonedAt = NULL,
+             publishBlockedAt = NULL,
              durationMs = MAX(
                0,
                CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
@@ -1564,6 +1582,8 @@ export class JobQueue {
              failedAt = ?,
              availableAt = NULL,
              completedAt = NULL,
+             abandonedAt = NULL,
+             publishBlockedAt = NULL,
              durationMs = MAX(
                0,
                CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
@@ -1592,6 +1612,60 @@ export class JobQueue {
       ok: true,
       durationMs: failed?.durationMs ?? undefined,
       failedAt: failed?.failedAt ?? undefined,
+    };
+  }
+
+  publishBlocked(
+    jobId: string,
+    body: Record<string, unknown>,
+  ): { ok: boolean; message?: string; durationMs?: number; publishBlockedAt?: string } {
+    const now = new Date().toISOString();
+    const message = String(body.message ?? "Publish blocked");
+    const detail = body.detail == null ? null : String(body.detail);
+    const publishBlocked = body.publishBlocked ?? null;
+
+    const jobRow = this.db.prepare(`SELECT workerId FROM jobs WHERE id = ?`).get(jobId) as
+      | { workerId: string | null }
+      | undefined;
+
+    const info = this.db
+      .prepare(
+        `UPDATE jobs
+         SET status = 'publish_blocked',
+             error = ?,
+             publishBlockedAt = ?,
+             availableAt = NULL,
+             completedAt = NULL,
+             failedAt = NULL,
+             abandonedAt = NULL,
+             durationMs = MAX(
+               0,
+               CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+             ),
+             updatedAt = ?
+         WHERE id = ? AND status = 'claimed'`,
+      )
+      .run(JSON.stringify({ message, detail, publishBlocked }), now, now, now, jobId);
+
+    if (info.changes === 0) {
+      return { ok: false, message: "Job not found or not in claimed state" };
+    }
+
+    const blocked = this.db
+      .prepare(`SELECT durationMs, publishBlockedAt FROM jobs WHERE id = ?`)
+      .get(jobId) as
+      | {
+          durationMs: number | null;
+          publishBlockedAt: string | null;
+        }
+      | undefined;
+
+    this.refreshPrWorkerAssignmentForJob(jobId, now);
+    this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
+    return {
+      ok: true,
+      durationMs: blocked?.durationMs ?? undefined,
+      publishBlockedAt: blocked?.publishBlockedAt ?? undefined,
     };
   }
 
@@ -1914,6 +1988,7 @@ export class JobQueue {
       completed: 0,
       failed: 0,
       abandoned: 0,
+      publish_blocked: 0,
     };
     for (const row of rows) {
       if (row.status in counts) counts[row.status] = Number(row.count || 0);
@@ -1957,7 +2032,8 @@ export class JobQueue {
           status === "claimed" ||
           status === "completed" ||
           status === "failed" ||
-          status === "abandoned",
+          status === "abandoned" ||
+          status === "publish_blocked",
       );
     if (normalizedStatuses.length === 0) return 0;
     const placeholders = normalizedStatuses.map(() => "?").join(", ");
@@ -2148,7 +2224,7 @@ export class JobQueue {
       .prepare(
         `SELECT status, durationMs, enqueuedAt, claimedAt, createdAt, updatedAt, error
          FROM jobs
-         WHERE status IN ('completed', 'failed', 'abandoned')
+         WHERE status IN ('completed', 'failed', 'abandoned', 'publish_blocked')
            AND updatedAt >= ?`,
       )
       .all(cutoffIso) as Array<{
@@ -2164,15 +2240,21 @@ export class JobQueue {
     let completed = 0;
     let failed = 0;
     let abandoned = 0;
+    let publishBlocked = 0;
     let timeoutFailures = 0;
     const durationSamples: number[] = [];
     const queueWaitSamples: number[] = [];
 
     for (const row of rows) {
       if (row.status === "completed") completed += 1;
-      if (row.status === "failed" || row.status === "abandoned") {
+      if (
+        row.status === "failed" ||
+        row.status === "abandoned" ||
+        row.status === "publish_blocked"
+      ) {
         if (row.status === "failed") failed += 1;
         if (row.status === "abandoned") abandoned += 1;
+        if (row.status === "publish_blocked") publishBlocked += 1;
         if (isTimeoutFailureError(row.error)) timeoutFailures += 1;
       }
       if (
@@ -2189,7 +2271,7 @@ export class JobQueue {
       }
     }
 
-    const terminal = completed + failed + abandoned;
+    const terminal = completed + failed + abandoned + publishBlocked;
     const successRate = terminal > 0 ? Number((completed / terminal).toFixed(4)) : null;
     const timeoutRate = terminal > 0 ? Number((timeoutFailures / terminal).toFixed(4)) : null;
 
@@ -2199,6 +2281,7 @@ export class JobQueue {
       completed,
       failed,
       abandoned,
+      publishBlocked,
       timeoutFailures,
       successRate,
       timeoutRate,

@@ -983,8 +983,15 @@ export function createRequestHandler() {
         const completionCounts = completionQueue.countByStatus();
         const abandonedJobs = Math.max(0, Number(jobSlo.abandoned ?? 0));
         const failedJobs = Math.max(0, Number(jobSlo.failed ?? 0));
-        const jobTerminal = Math.max(0, Number(jobSlo.completed ?? 0) + failedJobs + abandonedJobs);
-        const jobFailureRate = jobTerminal > 0 ? (failedJobs + abandonedJobs) / jobTerminal : 0;
+        const publishBlockedJobs = Math.max(0, Number(jobSlo.publishBlocked ?? 0));
+        const jobTerminal = Math.max(
+          0,
+          Number(jobSlo.completed ?? 0) + failedJobs + abandonedJobs + publishBlockedJobs,
+        );
+        const jobFailureRate =
+          jobTerminal > 0
+            ? (failedJobs + abandonedJobs + publishBlockedJobs) / jobTerminal
+            : 0;
         const autonomyOps = autonomyStore.getOpsSummary({
           requestPending: Math.max(0, Number(requestCounts.pending ?? 0)),
           jobFailureRate,
@@ -1580,12 +1587,29 @@ export function createRequestHandler() {
 
         const status = (url.searchParams.get("status") ?? "all").trim().toLowerCase();
         const limit = parseLimit(url.searchParams.get("limit"));
-        if (!["all", "pending", "claimed", "completed", "failed", "abandoned"].includes(status)) {
+        if (
+          ![
+            "all",
+            "pending",
+            "claimed",
+            "completed",
+            "failed",
+            "abandoned",
+            "publish_blocked",
+          ].includes(status)
+        ) {
           return makeJson({ ok: false, message: "Invalid status filter" }, 400);
         }
 
         const jobs = jobQueue.listJobs({
-          status: status as "all" | "pending" | "claimed" | "completed" | "failed" | "abandoned",
+          status: status as
+            | "all"
+            | "pending"
+            | "claimed"
+            | "completed"
+            | "failed"
+            | "abandoned"
+            | "publish_blocked",
           limit,
         });
 
@@ -1719,6 +1743,64 @@ export function createRequestHandler() {
                 sessionId: job.sessionId,
                 type: "job_failed",
                 from: "server:job-fail-hook",
+                payload: {
+                  jobId,
+                  message,
+                  ...(detail ? { detail } : {}),
+                },
+              };
+              session.emit(envelope);
+            }
+          }
+        }
+        return makeJson(result, result.ok ? 200 : 400);
+      }
+
+      // POST /jobs/:id/publish-blocked
+      const jobPublishBlockedMatch = pathname.match(/^\/jobs\/([^/]+)\/publish-blocked$/);
+      if (jobPublishBlockedMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobPublishBlockedMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = jobQueue.publishBlocked(jobId, body);
+        if (result.ok) {
+          const durationText =
+            typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
+          console.log(`[Server] Job ${jobId} publish-blocked (${durationText})`);
+
+          const job = jobQueue.getJob(jobId);
+          const params = parseJsonRecord(job?.params ?? "");
+          const requestId = compactText(params.requestId, 128);
+          if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
+          const matched = autonomyStore.findObjectiveByJobId(jobId);
+          if (matched) {
+            autonomyStore.recordOutcome({
+              objectiveId: matched.objectiveId,
+              requestId,
+              jobId,
+              patternKey: matched.patternKey,
+              success: false,
+              latencyMs: result.durationMs ?? null,
+              userAction: "failed",
+              reopenedWithin24h: false,
+              regressionFlag: true,
+            });
+          }
+
+          if (job?.sessionId) {
+            const session = sessionManager.getSession(job.sessionId);
+            if (session) {
+              const message = compactText(body.message, 240) || "WorkerPal job publish-blocked";
+              const detail = compactText(body.detail, 600);
+              const envelope: EventEnvelope<"job_failed"> = {
+                protocolVersion: PROTOCOL_VERSION,
+                id: randomUUID(),
+                ts: new Date().toISOString(),
+                sessionId: job.sessionId,
+                type: "job_failed",
+                from: "server:job-publish-blocked",
                 payload: {
                   jobId,
                   message,

@@ -432,7 +432,7 @@ export interface JobSnapshotRow {
   queueWaitBudgetMs?: number | null;
   executionBudgetMs?: number | null;
   finalizationBudgetMs?: number | null;
-  status: "pending" | "claimed" | "completed" | "failed" | "abandoned";
+  status: "pending" | "claimed" | "completed" | "failed" | "abandoned" | "publish_blocked";
   workerId: string | null;
   targetWorkerId: string | null;
   result: string | null;
@@ -444,6 +444,7 @@ export interface JobSnapshotRow {
   firstLogAt?: string | null;
   failedAt?: string | null;
   abandonedAt?: string | null;
+  publishBlockedAt?: string | null;
   completedAt?: string | null;
   durationMs?: number | null;
   resumeOfJobId?: string | null;
@@ -503,6 +504,7 @@ export interface JobSloSummary {
   completed: number;
   failed: number;
   abandoned: number;
+  publishBlocked: number;
   timeoutFailures: number;
   successRate: number | null;
   timeoutRate: number | null;

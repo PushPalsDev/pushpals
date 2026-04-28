@@ -9,6 +9,15 @@ export interface JobTokenUsage {
   modelId?: string;
 }
 
+export interface JobPublishBlockedInfo {
+  summary: string;
+  detail: string;
+  publicBranch: string;
+  localRef: string;
+  sha: string;
+  stage: "sync" | "push";
+}
+
 export interface JobResult {
   ok: boolean;
   summary: string;
@@ -16,4 +25,5 @@ export interface JobResult {
   stderr?: string;
   exitCode?: number;
   usage?: JobTokenUsage;
+  publishBlocked?: JobPublishBlockedInfo;
 }

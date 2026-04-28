@@ -450,6 +450,7 @@ async function runJob(
       stdout: result.stdout,
       stderr: result.stderr,
       exitCode: result.exitCode,
+      publishBlocked: result.publishBlocked,
       commit: result.commit,
     };
   }
@@ -1361,6 +1362,15 @@ async function workerLoop(
                     );
                     result = failNoChangeReviewFixJob(job.id, result);
                   }
+                } else if (commitResult.publishBlocked) {
+                  result = {
+                    ...result,
+                    ok: false,
+                    summary: commitResult.publishBlocked.summary,
+                    stderr: [result.stderr, commitResult.error].filter(Boolean).join("\n"),
+                    publishBlocked: commitResult.publishBlocked,
+                  };
+                  console.error(`[WorkerPals] Publish blocked: ${commitResult.error}`);
                 } else if (commitResult.error) {
                   console.error(`[WorkerPals] Failed to create commit: ${commitResult.error}`);
                 }
@@ -1400,7 +1410,22 @@ async function workerLoop(
             }
 
             let statusPersistedToServer = false;
-            if (result.ok) {
+            if (result.publishBlocked) {
+              const response = await postJsonWithTimeout(
+                `${opts.server}/jobs/${job.id}/publish-blocked`,
+                headers,
+                {
+                  message: result.summary,
+                  detail: redactSensitiveText(result.stderr ?? ""),
+                  publishBlocked: result.publishBlocked,
+                  durationMs: jobDurationMs,
+                },
+              );
+              statusPersistedToServer = response.ok;
+              console.log(
+                `[WorkerPals] Job ${job.id} publish-blocked in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
+              );
+            } else if (result.ok) {
               const reviewAgent =
                 parsedParams.reviewAgent && typeof parsedParams.reviewAgent === "object"
                   ? (parsedParams.reviewAgent as Record<string, unknown>)
