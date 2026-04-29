@@ -385,4 +385,86 @@ describe("workerpals rebase sync", () => {
     },
     20_000,
   );
+
+  runRebaseSyncTest(
+    "scrubs transient untracked .codex artifacts before pull --rebase sync",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-rebase-sync-codex-"));
+      const remote = join(root, "remote.git");
+      const maintainer = join(root, "maintainer");
+      const worker = join(root, "worker");
+      const branch = "agent/workerpal-test/codex-artifact";
+      const file = "README.md";
+      const hiddenRef = "refs/pushpals/agent/workerpal-test/job-codex-artifact";
+
+      try {
+        await mustGit(root, ["init", "--bare", remote], "init bare remote");
+        await mustGit(root, ["clone", remote, maintainer], "clone maintainer");
+        await mustGit(root, ["clone", remote, worker], "clone worker");
+
+        await mustGit(maintainer, ["config", "user.name", "PushPals Test"], "set maintainer name");
+        await mustGit(
+          maintainer,
+          ["config", "user.email", "pushpals-test@example.com"],
+          "set maintainer email",
+        );
+        await mustGit(worker, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          worker,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
+
+        writeFileSync(join(maintainer, file), "base\n", "utf8");
+        await mustGit(maintainer, ["add", file], "stage base");
+        await mustGit(maintainer, ["commit", "-m", "base"], "commit base");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push base branch",
+        );
+
+        await mustGit(worker, ["fetch", "origin", branch], "worker fetch");
+        await mustGit(worker, ["checkout", "-B", branch, `origin/${branch}`], "worker checkout");
+        writeFileSync(join(worker, file), "worker change\n", "utf8");
+        await mustGit(worker, ["add", file], "stage worker change");
+        await mustGit(worker, ["commit", "-m", "worker change"], "worker commit");
+        const workerSha = await mustGit(worker, ["rev-parse", "HEAD"], "worker sha");
+        await mustGit(worker, ["update-ref", hiddenRef, workerSha], "update hidden ref");
+        writeFileSync(join(worker, ".codex"), "transient codex state\n", "utf8");
+
+        await mustGit(
+          maintainer,
+          ["checkout", "-B", branch, `origin/${branch}`],
+          "maintainer checkout",
+        );
+        writeFileSync(join(maintainer, ".codex"), "tracked remote codex file\n", "utf8");
+        await mustGit(maintainer, ["add", ".codex"], "stage remote codex");
+        await mustGit(maintainer, ["commit", "-m", "remote codex"], "remote codex commit");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push remote codex",
+        );
+
+        const sync = await syncHiddenRefWithRemoteBranchByRebase(
+          worker,
+          hiddenRef,
+          branch,
+          "job-codex",
+        );
+        expect(sync.ok).toBe(true);
+        if (!sync.ok) throw new Error(sync.error);
+
+        expect(git(worker, ["status", "--porcelain", "--", ".codex"])).resolves.toMatchObject({
+          stdout: "",
+        });
+        const syncedCodex = await mustGit(worker, ["show", `${sync.sha}:.codex`], "show synced .codex");
+        expect(syncedCodex).toContain("tracked remote codex file");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
 });

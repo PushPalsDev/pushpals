@@ -21,6 +21,7 @@ from executor_base import (
 from openai_codex_executor import (
     OpenAICodexRuntimeConfig,
     _augment_supplemental_guidance,
+    _build_wrapper_recovery_guidance,
     _resolve_reasoning_effort,
     _build_instruction,
     _collect_disallowed_shell_wrapper_rejections,
@@ -266,9 +267,18 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
     def test_augments_guidance_with_direct_command_policy_once(self) -> None:
         guidance = _augment_supplemental_guidance(["Run bun test tests/example.test.ts"])
         self.assertGreaterEqual(len(guidance), 2)
-        self.assertIn("direct commands only", guidance[0].lower())
+        self.assertIn("shell commands are allowed", guidance[0].lower())
         guidance_again = _augment_supplemental_guidance(guidance)
         self.assertEqual(guidance_again, guidance)
+
+    def test_wrapper_recovery_guidance_allows_arbitrary_shell_commands_without_wrappers(self) -> None:
+        guidance = _build_wrapper_recovery_guidance(
+            ["/bin/bash -lc 'git status --porcelain'", "/bin/bash -lc pwd"]
+        )
+        lowered = guidance.lower()
+        self.assertIn("shell commands normally", lowered)
+        self.assertIn("not limited to a fixed allowlist", lowered)
+        self.assertIn("`/bin/bash -lc 'git status --porcelain'` -> `git status --porcelain`", guidance)
 
     def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:
         usage = _usage_from_trace_or_estimate({}, "abc" * 30, "done", model="gpt-5.4")

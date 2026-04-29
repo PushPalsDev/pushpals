@@ -757,11 +757,17 @@ export class DockerExecutor {
     if (backend !== "openai_codex") return [];
 
     const hostCodexHomeRaw = (process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
+    if (hostCodexHomeRaw && !isAbsolute(hostCodexHomeRaw)) {
+      console.warn(
+        `[DockerExecutor] Ignoring relative PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME=${hostCodexHomeRaw}; using ${resolve(
+          homedir(),
+          ".codex",
+        )} so Codex state stays outside the repo worktree.`,
+      );
+    }
     const hostCodexHome = (
-      hostCodexHomeRaw
-        ? isAbsolute(hostCodexHomeRaw)
-          ? hostCodexHomeRaw
-          : resolve(this.options.repo, hostCodexHomeRaw)
+      hostCodexHomeRaw && isAbsolute(hostCodexHomeRaw)
+        ? hostCodexHomeRaw
         : resolve(homedir(), ".codex")
     ).trim();
     if (!hostCodexHome) return [];

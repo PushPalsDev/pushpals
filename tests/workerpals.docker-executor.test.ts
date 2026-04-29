@@ -191,6 +191,27 @@ describe("workerpals docker executor internals", () => {
     expect(stopCalls).toBe(1);
   });
 
+  test("openaiCodexAuthMountArgs ignores relative CODEX_HOME overrides that point into the repo", () => {
+    const original = process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME;
+    process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME = ".codex";
+    try {
+      const executor = createExecutor() as unknown as {
+        openaiCodexAuthMountArgs: (backend: string) => string[];
+      };
+      const args = executor.openaiCodexAuthMountArgs("openai_codex");
+      expect(args).toContain("-e");
+      expect(args).toContain("CODEX_HOME=/root/.codex");
+      const mountArg = args[1] ?? "";
+      expect(mountArg.includes(`${process.cwd()}\\.codex`)).toBe(false);
+    } finally {
+      if (original === undefined) {
+        delete process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME;
+      } else {
+        process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME = original;
+      }
+    }
+  });
+
   test("validateWorktreeGitInterop validates warm-container accessibility too", async () => {
     const executor = createExecutor() as unknown as {
       validateWorktreeGitInterop: () => Promise<void>;

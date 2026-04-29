@@ -3,7 +3,7 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { existsSync, readFileSync, unlinkSync } from "fs";
+import { existsSync, readFileSync, rmSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import {
   deriveAutonomyComponentArea,
@@ -2606,6 +2606,41 @@ export async function syncHiddenRefWithRemoteBranchByRebase(
   publicBranchName: string,
   jobId: string,
 ): Promise<{ ok: true; sha: string } | { ok: false; error: string }> {
+  const scrubKnownPreSyncArtifacts = async (): Promise<
+    { ok: true } | { ok: false; error: string }
+  > => {
+    const codexPath = resolve(repo, ".codex");
+    if (!existsSync(codexPath)) return { ok: true };
+
+    const trackedCodex = await git(repo, ["ls-files", "--error-unmatch", "--", ".codex"]);
+    if (trackedCodex.ok) {
+      return {
+        ok: false,
+        error:
+          "Tracked .codex path blocks branch sync. Move Codex state outside the repo worktree before retrying.",
+      };
+    }
+
+    try {
+      rmSync(codexPath, { recursive: true, force: true });
+    } catch (error) {
+      return {
+        ok: false,
+        error: `Failed to scrub transient .codex artifact before branch sync: ${String(error)}`,
+      };
+    }
+
+    if (existsSync(codexPath)) {
+      return {
+        ok: false,
+        error: "Failed to scrub transient .codex artifact before branch sync: path still exists.",
+      };
+    }
+
+    console.warn("[WorkerPals] Removed transient .codex artifact before branch sync.");
+    return { ok: true };
+  };
+
   const pullRebaseNonInteractive = () =>
     git(repo, [
       "-c",
@@ -2652,6 +2687,10 @@ export async function syncHiddenRefWithRemoteBranchByRebase(
     const maxPullRebaseAttempts = 5;
     let syncedWithRemote = false;
     for (let attempt = 1; attempt <= maxPullRebaseAttempts; attempt++) {
+      const preSyncGuard = await scrubKnownPreSyncArtifacts();
+      if (!preSyncGuard.ok) {
+        return { ok: false, error: preSyncGuard.error };
+      }
       let pullRebase = await pullRebaseNonInteractive();
       if (!pullRebase.ok && isPullRebaseDirtyWorkingTreeOutput(combinedGitOutput(pullRebase))) {
         // Recover from dirty index/worktree left by previous attempts and retry non-interactively.

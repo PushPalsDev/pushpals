@@ -55,6 +55,7 @@ _DEFAULT_TASK_SYSTEM_PROMPT_PATH = "workerpals/openai_codex_default_system_promp
 _MANDATORY_RUNTIME_POLICY_APPENDIX_PATH = "workerpals/openai_codex_runtime_policy_appendix.md"
 _INSTRUCTION_WRAPPER_PROMPT_PATH = "workerpals/openai_codex_instruction_wrapper.md"
 _SUPPLEMENTAL_GUIDANCE_SECTION_PATH = "workerpals/openai_codex_supplemental_guidance_section.md"
+_COMMAND_ROUTER_POLICY_PATH = "workerpals/openai_codex_command_router_policy.md"
 _CODEX_WORKAROUND_PATTERNS = (
     re.compile(
         r"\bcodex cli\b.{0,120}\b(isn't|is not|not)\b.{0,120}\bavailable\b.{0,120}\b(so|therefore|instead|fallback|workaround|without|using)\b",
@@ -94,12 +95,6 @@ _VALID_SANDBOX_POLICIES = {"read-only", "workspace-write", "danger-full-access"}
 _VALID_COLORS = {"always", "never", "auto"}
 _VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
 _VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
-_DIRECT_COMMAND_POLICY_GUIDANCE = (
-    "Command-router policy: use direct commands only. Do not invoke `/bin/bash -lc`, `bash -c`, "
-    "`sh -lc`, `cmd /c`, `powershell -Command`, or `pwsh -Command`. Run the direct command "
-    "instead, such as `pwd`, `git status --porcelain`, `git diff -- path`, `ls dir`, "
-    "`cat file`, `sed -n '1,160p' file`, or `bun test <path>`."
-)
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -252,6 +247,64 @@ def _load_prompt_template(
         return value
 
     return _PROMPT_TOKEN_REGEX.sub(_replace, template)
+
+
+def _load_markdown_h2_section(relative_path: str, heading: str) -> str:
+    document = _load_prompt_template(relative_path)
+    if not document:
+        return ""
+    lines = document.splitlines()
+    needle = f"## {heading}".strip().lower()
+    start: Optional[int] = None
+    for idx, line in enumerate(lines):
+        if line.strip().lower() == needle:
+            start = idx + 1
+            break
+    if start is None:
+        return ""
+    collected: List[str] = []
+    for line in lines[start:]:
+        if line.startswith("## "):
+            break
+        collected.append(line)
+    return "\n".join(collected).strip()
+
+
+def _command_router_policy_guidance() -> str:
+    guidance = _load_markdown_h2_section(_COMMAND_ROUTER_POLICY_PATH, "Base Guidance")
+    if guidance:
+        return guidance
+    return (
+        "Command-router policy: shell commands are allowed, but invoke the actual command directly "
+        "instead of wrapping it with `/bin/bash -lc`, `bash -c`, `sh -lc`, `cmd /c`, "
+        "`powershell -Command`, or `pwsh -Command`. If a wrapper command is rejected, rerun its "
+        "inner command directly through the command tool."
+    )
+
+
+def _command_router_recovery_guidance() -> str:
+    guidance = _load_markdown_h2_section(_COMMAND_ROUTER_POLICY_PATH, "Recovery Guidance")
+    if guidance:
+        return guidance
+    return (
+        "Command-router recovery: the previous attempt retried disallowed shell wrappers.\n"
+        "Retry once using shell commands normally, but invoke the inner command directly instead of "
+        "wrapping it in `/bin/bash -lc`, `bash -c`, `sh -lc`, `cmd /c`, `powershell -Command`, or "
+        "`pwsh -Command`.\n"
+        "You are not limited to a fixed allowlist of commands. The constraint is only that command "
+        "execution must target the actual program/argv directly rather than a wrapper shell."
+    )
+
+
+def _command_router_rejection_detail_intro() -> str:
+    guidance = _load_markdown_h2_section(_COMMAND_ROUTER_POLICY_PATH, "Rejection Detail")
+    if guidance:
+        return guidance
+    return (
+        "Codex repeatedly attempted disallowed shell-wrapper commands that the command router "
+        "rejected. Shell commands are allowed, but wrapper shells are not; invoke the inner "
+        "command directly and avoid wrapper retries."
+    )
 
 
 def _to_positive_int(raw: str) -> Optional[int]:
@@ -1023,11 +1076,7 @@ def _build_wrapper_recovery_guidance(rejected_commands: List[str]) -> str:
             continue
         seen.add(lowered)
         direct_equivalents.append(f"- `{command}` -> `{direct}`")
-    guidance_lines = [
-        "Command-router recovery: the previous attempt retried disallowed shell wrappers.",
-        "Retry once using direct commands only. Do not use `/bin/bash -lc`, `bash -c`, `sh -lc`, `cmd /c`, `powershell -Command`, `pwsh -Command`, pipelines, or chained shell snippets.",
-        "If you need to inspect files or git state, run the direct command itself (for example `git diff --name-only`, `git status --porcelain`, `ls path`, `cat file`, or `sed -n '1,120p' file`).",
-    ]
+    guidance_lines = [_command_router_recovery_guidance()]
     if direct_equivalents:
         guidance_lines.append("Use these direct replacements for the rejected commands:")
         guidance_lines.extend(direct_equivalents[:6])
@@ -1064,7 +1113,7 @@ def _augment_supplemental_guidance(supplemental_guidance: List[str]) -> List[str
     joined = "\n".join(normalized).lower()
     if "direct commands only" in joined or "shell-wrapper" in joined or "/bin/bash -lc" in joined:
         return normalized
-    return [_DIRECT_COMMAND_POLICY_GUIDANCE, *normalized]
+    return [_command_router_policy_guidance(), *normalized]
 
 
 def _read_text_if_exists(path: Path) -> str:
@@ -1503,8 +1552,7 @@ def _run_codex_task(
                 else "- (no command details captured)"
             )
             detail = (
-                "Codex repeatedly attempted disallowed shell-wrapper commands that the command "
-                "router rejected. Switch to direct commands only and avoid wrapper retries.\n"
+                f"{_command_router_rejection_detail_intro()}\n"
                 f"Rejected commands:\n{command_lines}"
             )
             if last_message:
