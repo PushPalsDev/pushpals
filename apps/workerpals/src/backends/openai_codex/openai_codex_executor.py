@@ -95,6 +95,7 @@ _VALID_SANDBOX_POLICIES = {"read-only", "workspace-write", "danger-full-access"}
 _VALID_COLORS = {"always", "never", "auto"}
 _VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
 _VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+_MAX_WRAPPER_RECOVERY_ATTEMPTS = 2
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -293,6 +294,21 @@ def _command_router_recovery_guidance() -> str:
         "`pwsh -Command`.\n"
         "You are not limited to a fixed allowlist of commands. The constraint is only that command "
         "execution must target the actual program/argv directly rather than a wrapper shell."
+    )
+
+
+def _command_router_hard_recovery_guidance() -> str:
+    guidance = _load_markdown_h2_section(_COMMAND_ROUTER_POLICY_PATH, "Hard Recovery Guidance")
+    if guidance:
+        return guidance
+    return (
+        "Command-router escalation: the previous retry still attempted disallowed shell wrappers.\n"
+        "Do not invoke `bash`, `/bin/bash`, `sh`, `cmd`, `powershell`, `powershell.exe`, `pwsh`, "
+        "or `pwsh.exe` as the command itself on this attempt.\n"
+        "Your first command invocation on this retry must be one of the direct replacements listed "
+        "below, with no wrapper shell around it.\n"
+        "After you re-establish repo context, continue using ordinary shell commands directly "
+        "without wrapper shells."
     )
 
 
@@ -1066,7 +1082,7 @@ def _unwrap_shell_wrapper_command(command: str) -> str:
     return ""
 
 
-def _build_wrapper_recovery_guidance(rejected_commands: List[str]) -> str:
+def _build_wrapper_direct_replacements(rejected_commands: List[str]) -> List[str]:
     direct_equivalents: List[str] = []
     seen: set[str] = set()
     for command in rejected_commands:
@@ -1076,7 +1092,16 @@ def _build_wrapper_recovery_guidance(rejected_commands: List[str]) -> str:
             continue
         seen.add(lowered)
         direct_equivalents.append(f"- `{command}` -> `{direct}`")
-    guidance_lines = [_command_router_recovery_guidance()]
+    return direct_equivalents
+
+
+def _build_wrapper_recovery_guidance(rejected_commands: List[str], *, hard: bool = False) -> str:
+    guidance_lines = [
+        _command_router_hard_recovery_guidance()
+        if hard
+        else _command_router_recovery_guidance()
+    ]
+    direct_equivalents = _build_wrapper_direct_replacements(rejected_commands)
     if direct_equivalents:
         guidance_lines.append("Use these direct replacements for the rejected commands:")
         guidance_lines.extend(direct_equivalents[:6])
@@ -1515,11 +1540,20 @@ def _run_codex_task(
         log_git_status(repo, log)
 
         if command_policy_rejection_loop:
-            if wrapper_recovery_attempt < 1:
-                recovery_guidance = _build_wrapper_recovery_guidance(rejected_shell_wrappers)
+            if wrapper_recovery_attempt < _MAX_WRAPPER_RECOVERY_ATTEMPTS:
+                hard_recovery = wrapper_recovery_attempt >= 1
+                recovery_guidance = _build_wrapper_recovery_guidance(
+                    rejected_shell_wrappers,
+                    hard=hard_recovery,
+                )
                 if recovery_guidance:
                     log.warning(
-                        "Codex hit a shell-wrapper rejection loop; retrying once with direct-command recovery guidance."
+                        "Codex hit a shell-wrapper rejection loop; retrying once with "
+                        + (
+                            "strict no-wrapper recovery guidance."
+                            if hard_recovery
+                            else "direct-command recovery guidance."
+                        )
                     )
                     retry_result = _run_codex_task(
                         repo,
@@ -1529,19 +1563,19 @@ def _run_codex_task(
                         baseline_changes=baseline_snapshot,
                     )
                     retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
-                    if retry_result.get("ok"):
+                    if wrapper_recovery_attempt == 0 and retry_result.get("ok"):
                         recovered_stdout = str(retry_result.get("stdout") or "").strip()
                         retry_result["stdout"] = _truncate(
                             (
-                                "Recovered after the first Codex attempt hit command-router shell-wrapper rejections.\n\n"
+                                "Recovered after Codex attempts hit command-router shell-wrapper rejections.\n\n"
                                 f"{recovered_stdout}"
                             ).strip()
                         )
-                    else:
+                    elif wrapper_recovery_attempt == 0:
                         retry_stderr = str(retry_result.get("stderr") or "").strip()
                         retry_result["stderr"] = _truncate(
                             (
-                                "The first Codex attempt hit command-router shell-wrapper rejections and was retried once with direct-command recovery guidance.\n\n"
+                                "Earlier Codex attempts hit command-router shell-wrapper rejections and were retried with stricter recovery guidance.\n\n"
                                 f"{retry_stderr}"
                             ).strip()
                         )

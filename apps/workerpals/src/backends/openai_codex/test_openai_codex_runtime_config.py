@@ -1,8 +1,11 @@
 import os
 import re
+import json
+import subprocess
 import sys
 import unittest
 import tempfile
+from unittest import mock
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -22,6 +25,7 @@ from openai_codex_executor import (
     OpenAICodexRuntimeConfig,
     _augment_supplemental_guidance,
     _build_wrapper_recovery_guidance,
+    _run_codex_task,
     _resolve_reasoning_effort,
     _build_instruction,
     _collect_disallowed_shell_wrapper_rejections,
@@ -279,6 +283,103 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("shell commands normally", lowered)
         self.assertIn("not limited to a fixed allowlist", lowered)
         self.assertIn("`/bin/bash -lc 'git status --porcelain'` -> `git status --porcelain`", guidance)
+
+    def test_wrapper_hard_recovery_guidance_requires_direct_replacements_first(self) -> None:
+        guidance = _build_wrapper_recovery_guidance(
+            ["/bin/bash -lc 'git status --porcelain'", "/bin/bash -lc pwd"],
+            hard=True,
+        )
+        lowered = guidance.lower()
+        self.assertIn("previous retry still attempted disallowed shell wrappers", lowered)
+        self.assertIn("do not invoke `bash`", lowered)
+        self.assertIn("first command invocation on this retry must be one of the direct replacements", lowered)
+        self.assertIn("`/bin/bash -lc 'git status --porcelain'` -> `git status --porcelain`", guidance)
+
+    def test_run_codex_task_escalates_wrapper_recovery_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-recovery-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# wrapper recovery test\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed wrapper recovery repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_wrapper_recovery.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "hard_marker = 'Your first command invocation on this retry must be one of the direct replacements listed below'",
+                        "if hard_marker in prompt:",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text(",
+                        "            'Recovered by switching to direct commands after strict wrapper recovery.',",
+                        "            encoding='utf-8',",
+                        "        )",
+                        "    print('item.completed | Used direct commands after strict recovery guidance.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "for line in (",
+                        "    'error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess { message: \"Rejected\" }',",
+                        "    'error=exec_command failed for `/bin/bash -lc \\'git branch --show-current\\'`: CreateProcess { message: \"Rejected\" }',",
+                        "    'error=exec_command failed for `/bin/bash -lc ls`: CreateProcess { message: \"Rejected\" }',",
+                        "    'error=exec_command failed for `/bin/bash -lc \\'git status --porcelain\\'`: CreateProcess { message: \"Rejected\" }',",
+                        "):",
+                        "    print(line, file=sys.stderr, flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-wrapper-recovery-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "10",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Inspect the repo and report the current branch.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertIn("Recovered after Codex attempts hit command-router shell-wrapper rejections.", str(result.get("stdout") or ""))
+        self.assertIn("strict wrapper recovery", str(result.get("stdout") or "").lower())
 
     def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:
         usage = _usage_from_trace_or_estimate({}, "abc" * 30, "done", model="gpt-5.4")
