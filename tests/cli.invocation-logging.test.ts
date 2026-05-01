@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { createServer } from "net";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
@@ -17,6 +18,29 @@ function currentRuntimePlatformKey(): string {
     return process.arch === "arm64" ? "macos-arm64" : "macos-x64";
   }
   throw new Error(`Unsupported test platform: ${process.platform}/${process.arch}`);
+}
+
+async function findAvailablePort(): Promise<number> {
+  return await new Promise<number>((resolvePort, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("Failed to resolve temporary test port."));
+        return;
+      }
+      const port = address.port;
+      server.close((closeErr) => {
+        if (closeErr) {
+          reject(closeErr);
+          return;
+        }
+        resolvePort(port);
+      });
+    });
+  });
 }
 
 describe("pushpals CLI invocation logging", () => {
@@ -199,7 +223,15 @@ enabled = true
       );
 
       const proc = Bun.spawn(
-        [bunExecPath, cliScriptPath, "--no-auto-start", "--runtime-root", runtimeRoot],
+        [
+          bunExecPath,
+          cliScriptPath,
+          "--no-auto-start",
+          "--runtime-root",
+          runtimeRoot,
+          "--server-url",
+          "http://127.0.0.1:65534",
+        ],
         {
           cwd: repoRoot,
           stdout: "pipe",
@@ -223,11 +255,13 @@ enabled = true
     }
   }, 15000);
 
-  test("fails fast when the configured pushpals branch is missing on remote origin", async () => {
+  test("reports an unavailable runtime and exits cleanly when --no-auto-start is set", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-remote-branch-precheck-"));
     const repoRoot = join(root, "repo");
     const remoteRepoRoot = join(root, "remote.git");
     const runtimeRoot = join(root, "runtime");
+    const unavailablePort = await findAvailablePort();
+    const unavailableServerUrl = `http://127.0.0.1:${unavailablePort}`;
 
     try {
       mkdirSync(repoRoot, { recursive: true });
@@ -260,7 +294,7 @@ enabled = true
 session_id = "dev"
 
 [server]
-url = "http://127.0.0.1:3991"
+url = "${unavailableServerUrl}"
 
 [localbuddy]
 enabled = false
@@ -277,7 +311,15 @@ enabled = false
       );
 
       const proc = Bun.spawn(
-        [bunExecPath, cliScriptPath, "--no-auto-start", "--runtime-root", runtimeRoot],
+        [
+          bunExecPath,
+          cliScriptPath,
+          "--no-auto-start",
+          "--runtime-root",
+          runtimeRoot,
+          "--server-url",
+          unavailableServerUrl,
+        ],
         {
           cwd: repoRoot,
           stdout: "pipe",
@@ -291,13 +333,9 @@ enabled = false
 
       const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
       expect(code).toBe(1);
-      expect(stderr).toContain(
-        'Precheck failed: remote branch "origin/main_agents" was not found.',
-      );
-      expect(stderr).toContain(
-        "Precheck failed: create/push that branch first or set source_control_manager.pushpals_branch to an existing remote branch.",
-      );
-      expect(stderr).not.toContain("Server is unavailable");
+      expect(stderr).toContain(`Server is unavailable at ${unavailableServerUrl}.`);
+      expect(stderr).toContain("Auto-start is disabled (--no-auto-start).");
+      expect(stderr).not.toContain('Precheck failed: remote branch "origin/main_agents" was not found.');
       expect(stderr).not.toContain("Repo affinity check failed");
     } finally {
       rmSync(root, { recursive: true, force: true });

@@ -307,7 +307,13 @@ startup_warmup_timeout_ms = 120000
   );
 }
 
-function initializeTempRepo(root: string): { repoPath: string; remotePath: string } {
+function initializeTempRepo(
+  root: string,
+  options: {
+    pushpalsBranch?: boolean;
+  } = {},
+): { repoPath: string; remotePath: string } {
+  const createPushpalsBranch = options.pushpalsBranch ?? true;
   const repoPath = join(root, "repo");
   const remotePath = join(root, "origin.git");
   mkdirSync(repoPath, { recursive: true });
@@ -326,9 +332,11 @@ function initializeTempRepo(root: string): { repoPath: string; remotePath: strin
   runChecked(["git", "init", "--bare", remotePath], root);
   runChecked(["git", "remote", "add", "origin", remotePath], repoPath);
   runChecked(["git", "push", "-u", "origin", "main"], repoPath);
-  runChecked(["git", "checkout", "-b", "main_agents"], repoPath);
-  runChecked(["git", "push", "-u", "origin", "main_agents"], repoPath);
-  runChecked(["git", "checkout", "main"], repoPath);
+  if (createPushpalsBranch) {
+    runChecked(["git", "checkout", "-b", "main_agents"], repoPath);
+    runChecked(["git", "push", "-u", "origin", "main_agents"], repoPath);
+    runChecked(["git", "checkout", "main"], repoPath);
+  }
   return { repoPath, remotePath };
 }
 
@@ -821,6 +829,131 @@ describe("packaged CLI end-to-end", () => {
   );
 
   test(
+    "reuses an already-running installed-package runtime via --no-auto-start without relaunching services",
+    async () => {
+      const artifacts = await ensureBuildArtifacts();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-installed-runtime-only-"));
+      let runtimeProc: ReturnType<typeof Bun.spawn> | null = null;
+      let statusProc: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        const { repoPath } = initializeTempRepo(root);
+        const runtimeRoot = join(root, "runtime");
+        const portBase = await findAvailablePortBlock();
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase, {
+          autonomyEnabled: process.platform === "win32",
+        });
+        const installed = await installCliTarballGlobally(root);
+        const env = buildCliE2EEnv({
+          BUN_INSTALL: installed.bunInstallRoot,
+          PATH: `${installed.globalBinDir}${delimiter}${process.env.PATH ?? ""}`,
+          OPENAI_API_KEY: "cli-e2e-installed-runtime-only-key",
+          PUSHPALS_OPENAI_CODEX_AUTH_MODE: "api_key",
+          PUSHPALS_DATA_DIR_OVERRIDE: join(root, "data"),
+          REMOTEBUDDY_AUTO_SPAWN_WORKERPALS: "false",
+          REMOTEBUDDY_AUTONOMY_ENABLED: process.platform === "win32" ? "true" : "false",
+        });
+
+        runtimeProc = Bun.spawn(
+          [
+            installed.pushpalsPath,
+            "--runtime-only",
+            "--runtime-root",
+            runtimeRoot,
+            "--runtime-tag",
+            runtimeTag,
+          ],
+          {
+            cwd: repoPath,
+            stdin: "pipe",
+            stdout: "pipe",
+            stderr: "pipe",
+            env,
+          },
+        );
+
+        const runtimeStdoutCapture = startTextCapture(runtimeProc.stdout);
+        const runtimeStderrCapture = startTextCapture(runtimeProc.stderr);
+        const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
+        await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
+
+        statusProc = Bun.spawn(
+          [
+            installed.pushpalsPath,
+            "--status-once",
+            "--no-auto-start",
+            "--server-url",
+            `http://127.0.0.1:${portBase}`,
+            "--session-id",
+            "dev",
+          ],
+          {
+            cwd: repoPath,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            env,
+          },
+        );
+
+        const statusStdoutCapture = startTextCapture(statusProc.stdout);
+        const statusStderrCapture = startTextCapture(statusProc.stderr);
+        const [stdout, stderr, exitCode] = await Promise.all([
+          statusStdoutCapture.promise,
+          statusStderrCapture.promise,
+          waitForExitWithTimeout(
+            statusProc,
+            10 * 60_000,
+            () => `${statusStdoutCapture.getSnapshot()}\n${statusStderrCapture.getSnapshot()}`,
+          ),
+        ]);
+        const combined = `${stdout}\n${stderr}`;
+
+        if (exitCode !== 0) {
+          throw new Error(`Installed-package no-auto-start CLI E2E exited ${exitCode}\n${combined}`);
+        }
+        expect(combined).toContain("[pushpals] Connected.");
+        expect(combined).toContain(`[pushpals] serverUrl=http://127.0.0.1:${portBase}`);
+        expect(combined).toContain("[pushpals] workerExecution=");
+        expect(combined).toContain("[pushpals] Shutting down CLI session...");
+        expect(combined).not.toContain("[pushpals] Runtime unavailable. Auto-starting runtime");
+        expect(combined).not.toContain("[pushpals] Starting embedded server...");
+        expect(combined).not.toContain("[pushpals] Auto-start failed:");
+        expect(combined).not.toContain("[pushpals] Fatal:");
+
+        runtimeProc.stdin.end();
+        await Promise.all([
+          runtimeStdoutCapture.promise,
+          runtimeStderrCapture.promise,
+          waitForExitWithTimeout(
+            runtimeProc,
+            10 * 60_000,
+            () => `${runtimeStdoutCapture.getSnapshot()}\n${runtimeStderrCapture.getSnapshot()}`,
+          ),
+        ]);
+      } finally {
+        if (statusProc) {
+          try {
+            statusProc.kill();
+          } catch {}
+        }
+        if (runtimeProc) {
+          try {
+            runtimeProc.kill();
+          } catch {}
+        }
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
+        }
+      }
+    },
+    20 * 60_000,
+  );
+
+  test(
     "boots embedded runtime in a temp repo with real Docker and reports readiness via /status",
     async () => {
       const artifacts = await ensureBuildArtifacts();
@@ -897,6 +1030,75 @@ describe("packaged CLI end-to-end", () => {
       }
     },
     20 * 60_000,
+  );
+
+  test(
+    "reports an unavailable runtime and does not auto-start when --no-auto-start is set",
+    async () => {
+      const artifacts = await ensureBuildArtifacts();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-missing-branch-"));
+      let proc: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        const { repoPath } = initializeTempRepo(root, { pushpalsBranch: false });
+        const runtimeRoot = join(root, "runtime");
+        const portBase = await findAvailablePortBlock();
+        prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase);
+
+        proc = Bun.spawn(
+          [
+            process.execPath,
+            artifacts.cliPath,
+            "--no-auto-start",
+            "--runtime-root",
+            runtimeRoot,
+            "--runtime-tag",
+            runtimeTag,
+          ],
+          {
+            cwd: repoPath,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            env: buildCliE2EEnv(),
+          },
+        );
+
+        const stdoutCapture = startTextCapture(proc.stdout);
+        const stderrCapture = startTextCapture(proc.stderr);
+        const [stdout, stderr, exitCode] = await Promise.all([
+          stdoutCapture.promise,
+          stderrCapture.promise,
+          waitForExitWithTimeout(
+            proc,
+            5 * 60_000,
+            () => `${stdoutCapture.getSnapshot()}\n${stderrCapture.getSnapshot()}`,
+          ),
+        ]);
+        const combined = `${stdout}\n${stderr}`;
+
+        expect(exitCode).toBe(1);
+        expect(combined).toContain(`[pushpals] Server is unavailable at http://127.0.0.1:${portBase}.`);
+        expect(combined).toContain("[pushpals] Auto-start is disabled (--no-auto-start).");
+        expect(combined).not.toContain("[pushpals] Starting embedded server...");
+        expect(combined).not.toContain("[pushpals] Runtime unavailable. Auto-starting runtime");
+        expect(combined).not.toContain("[pushpals] Connected.");
+        expect(combined).not.toContain('Precheck failed: remote branch "origin/main_agents" was not found.');
+      } finally {
+        if (proc) {
+          try {
+            proc.kill();
+          } catch {}
+        }
+        if (!shouldKeepE2ETempRoot()) {
+          try {
+            await removeTreeWithRetries(root);
+          } catch (err) {
+            console.warn(`[cli.e2e] Temp cleanup warning for ${root}: ${String(err)}`);
+          }
+        }
+      }
+    },
+    10 * 60_000,
   );
 
   test(
