@@ -2,16 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.0.62`
-- start_commit: `4b50ff571db53ad548ff8b87921ec383e74de86d`
-- end_commit: `a988ec892e2e21fc6f5a880307f83c2fdbdd2954`
-- commits_in_range: `1`
+- version: `v1.0.63`
+- start_commit: `78645d04f8b1458d671ef727a5742f1e515ef7f4`
+- end_commit: `ad4aeb8afe9b4f6c0747e358dcbf7d23c6c6cd59`
+- commits_in_range: `4`
 
 ## Highlights
 
-- Scrub transient untracked `.codex` artifacts out of WorkerPal job worktrees before rebase-based branch sync so successful task commits do not get blocked by Git checkout protection during finalization.
-- Keep Codex state outside repo worktrees even when `PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME` is set to a relative path, and log the fallback to the user home Codex directory for visibility.
-- Move command-router wrapper policy guidance into [prompts/workerpals/openai_codex_command_router_policy.md] so the base guidance, recovery message, and rejection detail stay editable in one prompt-managed place while preserving mirrored runtime behavior.
+- Harden the CLI integration suite with installed-runtime reuse coverage and a `--no-auto-start` unavailable-runtime path so reconnect and cold-status behavior are exercised the way users actually invoke the packaged CLI.
+- Mirror the Codex command-router policy prompt into packaged runtime prompt directories so the source prompt, embedded runtime, and sandbox runtime all ship the same wrapper-shell guidance text.
+- Add stronger WorkerPals Codex wrapper-shell recovery so repeated `/bin/bash -lc ...` style rejections escalate into a stricter second retry instead of failing immediately in a rejection loop.
+- Make RemoteBuddy autonomy ideation more resilient under Codex latency by expanding the effective ideation timeout for Codex-backed runs, logging prompt-size and phase-duration metrics, and adding a one-shot “fit within the time budget” recovery instruction on the next ideation round after a timeout.
 
 ## Install
 
