@@ -29,6 +29,17 @@ function makeConfig(): any {
       baseBranch: "main",
     },
     remotebuddy: {
+      llm: {
+        backend: "openai_codex",
+        endpoint: "http://127.0.0.1:1234",
+        model: "gpt-5.4",
+        sessionId: "remotebuddy-dev",
+        apiKey: "",
+        reasoningEffort: "high",
+        codexAuthMode: "chatgpt",
+        codexBin: "bun x --yes @openai/codex",
+        codexTimeoutMs: 120_000,
+      },
       autonomy: {
         enabled: true,
         tickIntervalMs: 120_000,
@@ -832,6 +843,233 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(calls.some((entry) => entry.url.includes("/autonomy/lock/release"))).toBe(true);
     expect((engine as any).lastOutcome).toBe("skipped");
     expect((engine as any).lastDetail).toBe("repo_preflight_dirty_worktree");
+  });
+
+  test("ideation timeout schedules one-shot recovery guidance for the next ideation round", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-timeout-recovery-"));
+    tempDirs.push(root);
+    seedPushpalsAutonomyRepoLayout(root);
+    const objectivePosts: Array<Record<string, unknown>> = [];
+    const llmInputs: Array<Record<string, unknown>> = [];
+    let llmCall = 0;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/renew"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot"))
+        return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 1, online: 1, busy: 0, idle: 1 },
+          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+          prs: { openUnmerged: 0 },
+        });
+      if (url.includes("/autonomy/inspiration/ingest"))
+        return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
+      if (url.includes("/autonomy/inspiration?"))
+        return jsonResponse(200, { ok: true, patterns: [] });
+      if (url.includes("/autonomy/insights?"))
+        return jsonResponse(200, { ok: true, engineSourceStats: [] });
+      if (url.endsWith("/autonomy/eligibility")) {
+        const candidates = Array.isArray((body as Record<string, unknown>).candidates)
+          ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
+          : [];
+        return jsonResponse(200, {
+          ok: true,
+          results: candidates.map((entry) => ({
+            candidate_id: String(entry.id ?? entry.candidate_id ?? ""),
+            ok: true,
+          })),
+        });
+      }
+      if (url.endsWith("/requests/enqueue"))
+        return jsonResponse(201, { ok: true, requestId: "req_timeout_recovery_1" });
+      if (url.endsWith("/autonomy/objectives")) {
+        objectivePosts.push(body as Record<string, unknown>);
+        return jsonResponse(200, {
+          ok: true,
+          objectiveId: "obj_timeout_recovery_1",
+          patternKey: "pk_timeout_recovery_1",
+        });
+      }
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const llm = {
+      async generate(input: Record<string, unknown>) {
+        llmInputs.push(input);
+        llmCall += 1;
+        if (llmCall === 1) {
+          await Bun.sleep(1_100);
+          return {
+            text: JSON.stringify({ candidates: [] }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        }
+        if (llmCall === 2) {
+          const recoveryMessage = String(
+            ((input.messages as Array<Record<string, unknown>>)?.[0]?.content ?? "") as string,
+          );
+          expect(recoveryMessage).toContain(
+            "Previous ideation timed out before you returned JSON.",
+          );
+          expect(recoveryMessage).toContain("Timeout budget for this round: 1000ms.");
+          expect(input.maxTokens).toBe(1400);
+          return {
+            text: JSON.stringify({
+              candidates: [
+                {
+                  id: "cand_timeout_recovery_1",
+                  title: "Recover from ideation timeout",
+                  objective_type: "lint_fix",
+                  problem_statement: "Keep ideation responsive under codex latency.",
+                  trigger_type: "queue_health",
+                  component_area: "apps/remotebuddy",
+                  target_paths: ["apps/remotebuddy/src/autonomous_engine.ts"],
+                  scope: {
+                    read_anywhere: false,
+                    write_globs: ["apps/remotebuddy/src/autonomous_engine.ts"],
+                  },
+                  risk_level: "low",
+                  expected_validation: ["bun test tests/remotebuddy.autonomous-engine.tick.test.ts"],
+                  estimated_effort: "small",
+                  why_now_signal_ids: ["sig_queue"],
+                  confidence: 0.9,
+                  vision_alignment_reason: "Improve autonomy reliability under timeout pressure.",
+                  vision_section_refs: ["1"],
+                  feature_hypotheses: ["One-shot recovery reduces repeated empty autonomy cycles."],
+                  requires_user_input: false,
+                },
+              ],
+            }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        }
+        if (llmCall === 3) {
+          return {
+            text: JSON.stringify({
+              scores: [{ id: "cand_timeout_recovery_1", llm_score: 0.92 }],
+            }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        }
+        return {
+          text: JSON.stringify({
+            instruction: "Keep autonomy ideation responsive and well-instrumented.",
+          }),
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+
+    const comm = {
+      async emit() {
+        return true;
+      },
+    };
+
+    const cfg = makeConfig();
+    cfg.remotebuddy.autonomy.llmTimeoutMs = 15;
+    cfg.remotebuddy.llm.codexTimeoutMs = 15;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_timeout_recovery",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: comm as any,
+      config: cfg,
+    });
+    (engine as any).ensureAutonomyRepoReady = async () => {
+      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+      mkdirSync(autonomyRepo, { recursive: true });
+      seedPushpalsAutonomyRepoLayout(autonomyRepo);
+      return true;
+    };
+    (engine as any).loadVisionContext = () => ({
+      path: "vision.md",
+      markdown: "# Vision\n",
+      one_sentence: "Keep autonomy responsive.",
+      sections: [
+        {
+          number: "1",
+          title: "Reliability",
+          markdown: "Favor reliable small fixes.",
+          truncated: false,
+        },
+      ],
+      key_items: {
+        target_users: ["maintainers"],
+        priorities: ["reliability"],
+        objectives: ["avoid repeated autonomy stalls"],
+        guardrails: ["small scoped changes"],
+        constraints: ["stay within time budgets"],
+        non_goals: [],
+        metrics: ["autonomy completion rate"],
+        risk_policy: ["low risk autonomous"],
+        operating_model: ["remotebuddy + workerpals"],
+        governance: ["review high risk manually"],
+      },
+      section_numbers: ["1"],
+      sha256: "visionhash",
+      truncated: false,
+    });
+    (engine as any).loadCommitHistoryHints = async () => [];
+
+    await engine.tick();
+    expect((engine as any).lastOutcome).toBe("failed");
+    expect((engine as any).lastDetail).toContain("autonomy ideation phase timeout");
+    expect((engine as any).pendingIdeationTimeoutRecovery).not.toBeNull();
+
+    await engine.tick();
+    expect((engine as any).lastOutcome).toBe("success");
+    expect((engine as any).pendingIdeationTimeoutRecovery).toBeNull();
+    expect(objectivePosts.length).toBeGreaterThan(0);
+  });
+
+  test("ideation timeout budget expands to match Codex-backed autonomy needs", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-timeout-budget-"));
+    tempDirs.push(root);
+    const cfg = makeConfig();
+    cfg.remotebuddy.autonomy.llmTimeoutMs = 60_000;
+    cfg.remotebuddy.llm.codexTimeoutMs = 120_000;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_timeout_budget",
+      authToken: "tok",
+      repo: root,
+      llm: {
+        async generate() {
+          return {
+            text: JSON.stringify({ candidates: [] }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        },
+      } as any,
+      comm: {
+        async emit() {
+          return true;
+        },
+      } as any,
+      config: cfg,
+    });
+
+    expect((engine as any).phaseTimeoutMs("ideation")).toBe(90_000);
+    expect((engine as any).phaseTimeoutMs("scoring")).toBe(60_000);
+    expect((engine as any).phaseTimeoutMs("planning")).toBe(60_000);
   });
 
   test("tick can dispatch generic repo autonomy work when vision.md is present", async () => {

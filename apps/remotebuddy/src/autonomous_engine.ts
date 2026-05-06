@@ -170,6 +170,12 @@ type WorkerLoadSnapshot = {
   };
 };
 
+type IdeationTimeoutRecovery = {
+  previousRunId: string;
+  timedOutAt: string;
+  timeoutMs: number;
+};
+
 type PolicyRule = {
   maxRisk: "low" | "medium" | "high";
   maxBreadth: "narrow" | "medium" | "broad";
@@ -252,6 +258,8 @@ const SCORING_SYSTEM_PROMPT = loadPromptTemplate(
 const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/autonomy_planning_system_prompt.md",
 ).trim();
+const IDEATION_TIMEOUT_RECOVERY_INSTRUCTION =
+  "Previous ideation timed out before you returned JSON. For this round only, stay within the time budget: prioritize the top 1-3 highest-confidence candidates, keep reasoning brief, avoid exhaustive exploration, and return valid JSON as soon as possible.";
 const VISION_DOC_FNAME = "vision.md";
 const MAX_VISION_SECTION_CHARS = 1_200;
 const DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
@@ -3154,6 +3162,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly baseBranch: string;
   private readonly llm: LLMClient;
   private readonly comm: CommunicationManager;
+  private readonly llmCfg: PushPalsConfig["remotebuddy"]["llm"];
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
   private runtimeEnabled = true;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -3167,6 +3176,7 @@ export class RemoteBuddyAutonomousEngine {
   private lastOutcome: "none" | "success" | "skipped" | "failed" = "none";
   private lastDetail = "not_started";
   private lastCompletedAtMs = 0;
+  private pendingIdeationTimeoutRecovery: IdeationTimeoutRecovery | null = null;
 
   constructor(opts: {
     server: string;
@@ -3191,6 +3201,7 @@ export class RemoteBuddyAutonomousEngine {
       String(opts.config.sourceControlManager.baseBranch || "main").trim() || "main";
     this.llm = opts.llm;
     this.comm = opts.comm;
+    this.llmCfg = opts.config.remotebuddy.llm;
     this.cfg = opts.config.remotebuddy.autonomy;
     this.runtimeEnabled = this.cfg.enabled;
   }
@@ -3256,20 +3267,45 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   private lockTtlMs(): number {
+    const maxPhaseTimeoutMs = Math.max(
+      this.phaseTimeoutMs("ideation"),
+      this.phaseTimeoutMs("scoring"),
+      this.phaseTimeoutMs("planning"),
+    );
     return Math.max(
       this.cfg.tickIntervalMs * 3,
-      this.cfg.ideationBudgetMs * 2 + this.cfg.llmTimeoutMs * 6,
+      this.cfg.ideationBudgetMs * 2 + maxPhaseTimeoutMs * 6,
       30_000,
     );
   }
 
   private cycleBudgetMs(): number {
+    const ideationTimeoutMs = this.phaseTimeoutMs("ideation");
+    const scoringTimeoutMs = this.phaseTimeoutMs("scoring");
+    const planningTimeoutMs = this.phaseTimeoutMs("planning");
+    const maxPhaseTimeoutMs = Math.max(ideationTimeoutMs, scoringTimeoutMs, planningTimeoutMs);
     // One cycle includes ideation + scoring + planning LLM phases plus dispatch work.
     return Math.max(
-      this.cfg.ideationBudgetMs + this.cfg.llmTimeoutMs * 3,
-      this.cfg.llmTimeoutMs * 4,
+      this.cfg.ideationBudgetMs + ideationTimeoutMs + scoringTimeoutMs + planningTimeoutMs,
+      maxPhaseTimeoutMs * 4,
       20_000,
     );
+  }
+
+  private phaseTimeoutMs(phase: "ideation" | "scoring" | "planning"): number {
+    const configuredTimeoutMs = Math.max(1_000, this.cfg.llmTimeoutMs);
+    if (phase !== "ideation") return configuredTimeoutMs;
+    if (String(this.llmCfg.backend || "").trim().toLowerCase() !== "openai_codex") {
+      return configuredTimeoutMs;
+    }
+    const codexTimeoutMs = Math.max(configuredTimeoutMs, this.llmCfg.codexTimeoutMs || 0);
+    return Math.min(codexTimeoutMs, Math.max(configuredTimeoutMs, 90_000));
+  }
+
+  private consumeIdeationTimeoutRecovery(): IdeationTimeoutRecovery | null {
+    const recovery = this.pendingIdeationTimeoutRecovery;
+    this.pendingIdeationTimeoutRecovery = null;
+    return recovery;
   }
 
   private loadVisionContext(runId: string): VisionContext | null {
@@ -3676,6 +3712,7 @@ export class RemoteBuddyAutonomousEngine {
     json: Record<string, unknown>;
     llmCall: Record<string, unknown>;
   }> {
+    const timeoutMs = this.phaseTimeoutMs(phase);
     const requestPayload = {
       phase,
       system: input.system,
@@ -3684,14 +3721,47 @@ export class RemoteBuddyAutonomousEngine {
       maxTokens: input.maxTokens ?? null,
       temperature: input.temperature ?? null,
     };
-    const startedAt = Date.now();
-    const output = await withTimeout(
-      this.llm.generate(input),
-      this.cfg.llmTimeoutMs,
-      `autonomy ${phase} phase timeout`,
+    const systemChars = input.system.length;
+    const messageChars = (input.messages ?? []).reduce(
+      (sum, message) => sum + (message.content?.length ?? 0),
+      0,
     );
+    const requestBytes = Buffer.byteLength(JSON.stringify(requestPayload), "utf8");
+    const startedAt = Date.now();
+    console.log(
+      `[RemoteBuddyAutonomousEngine] ${phase} phase start: timeout_ms=${timeoutMs} system_chars=${systemChars} message_chars=${messageChars} request_bytes=${requestBytes} max_tokens=${input.maxTokens ?? "default"} temperature=${input.temperature ?? "default"}`,
+    );
+    let output: Awaited<ReturnType<LLMClient["generate"]>>;
+    try {
+      output = await withTimeout(
+        this.llm.generate(input),
+        timeoutMs,
+        `autonomy ${phase} phase timeout`,
+      );
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt;
+      if (
+        phase === "ideation" &&
+        error instanceof Error &&
+        error.message === "autonomy ideation phase timeout"
+      ) {
+        this.pendingIdeationTimeoutRecovery = {
+          previousRunId: runId,
+          timedOutAt: new Date().toISOString(),
+          timeoutMs,
+        };
+      }
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] ${phase} phase failed: elapsed_ms=${elapsedMs} timeout_ms=${timeoutMs} system_chars=${systemChars} message_chars=${messageChars} request_bytes=${requestBytes} error=${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    }
     const responseJson = parseJsonObject(output.text);
     const tokenUsage = output.usage ?? null;
+    const latencyMs = Date.now() - startedAt;
+    console.log(
+      `[RemoteBuddyAutonomousEngine] ${phase} phase completed: elapsed_ms=${latencyMs} timeout_ms=${timeoutMs} response_chars=${output.text.length} prompt_tokens=${tokenUsage?.promptTokens ?? "unknown"} completion_tokens=${tokenUsage?.completionTokens ?? "unknown"}`,
+    );
     return {
       json: responseJson,
       llmCall: {
@@ -3710,11 +3780,11 @@ export class RemoteBuddyAutonomousEngine {
         },
         modelId: "configured",
         temperature: input.temperature ?? null,
-        timeoutMs: this.cfg.llmTimeoutMs,
+        timeoutMs,
         response: responseJson,
         responseHash: sha256(output.text),
         tokenUsage,
-        latencyMs: Date.now() - startedAt,
+        latencyMs,
       },
     };
   }
@@ -4165,27 +4235,54 @@ export class RemoteBuddyAutonomousEngine {
       }
 
       this.setPhase("ideation");
+      const ideationRecovery = this.consumeIdeationTimeoutRecovery();
+      if (ideationRecovery) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: applying one-shot ideation timeout recovery from ${ideationRecovery.previousRunId} after ${ideationRecovery.timeoutMs}ms timeout.`,
+        );
+      }
+      const ideationTopSignals = snapshot.top_signals.slice(0, ideationRecovery ? 10 : 16);
+      const ideationStateTraits = snapshot.state_traits.slice(0, ideationRecovery ? 14 : 24);
+      const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, ideationRecovery ? 12 : 20);
+      const ideationEngineIdeaPriors = (snapshot.engine_idea_priors ?? []).slice(
+        0,
+        ideationRecovery ? 12 : 20,
+      );
+      const ideationOpenObjectives = snapshot.open_objectives.slice(0, ideationRecovery ? 12 : 20);
+      const ideationActiveCooldowns = snapshot.active_cooldowns.slice(
+        0,
+        ideationRecovery ? 12 : 20,
+      );
+      const ideationRepoTargets = repoTargets.slice(0, ideationRecovery ? 8 : repoTargets.length);
       const ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, {
         system: IDEATION_SYSTEM_PROMPT,
         json: true,
-        maxTokens: 2800,
+        maxTokens: ideationRecovery ? 1400 : 2800,
         temperature: 0.2,
         messages: [
+          ...(ideationRecovery
+            ? [
+                {
+                  role: "user" as const,
+                  content: `${IDEATION_TIMEOUT_RECOVERY_INSTRUCTION} Previous timed-out run: ${ideationRecovery.previousRunId}. Timeout budget for this round: ${this.phaseTimeoutMs("ideation")}ms.`,
+                },
+              ]
+            : []),
           {
             role: "user",
             content: JSON.stringify(
               {
                 snapshot: {
                   snapshot_id: snapshot.snapshot_id,
-                  top_signals: snapshot.top_signals.slice(0, 16),
-                  state_traits: snapshot.state_traits.slice(0, 24),
-                  feedback_priors: snapshot.feedback_priors.slice(0, 20),
-                  engine_idea_priors: (snapshot.engine_idea_priors ?? []).slice(0, 20),
-                  open_objectives: snapshot.open_objectives.slice(0, 20),
-                  active_cooldowns: snapshot.active_cooldowns.slice(0, 20),
+                  top_signals: ideationTopSignals,
+                  state_traits: ideationStateTraits,
+                  feedback_priors: ideationFeedbackPriors,
+                  engine_idea_priors: ideationEngineIdeaPriors,
+                  open_objectives: ideationOpenObjectives,
+                  active_cooldowns: ideationActiveCooldowns,
                 },
                 vision: visionContext,
-                repo_targets: repoTargets.map((target) => ({
+                repo_targets: ideationRepoTargets.map((target) => ({
                   component_area: target.component_area,
                   target_paths: target.target_paths,
                   write_globs: target.write_globs,
