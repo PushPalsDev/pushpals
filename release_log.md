@@ -2,17 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.63`
-- start_commit: `78645d04f8b1458d671ef727a5742f1e515ef7f4`
-- end_commit: `ad4aeb8afe9b4f6c0747e358dcbf7d23c6c6cd59`
-- commits_in_range: `4`
+- version: `v1.0.64`
+- start_commit: `c8ad6017bbce79e1ba15cac84385827ad8f8a7e1`
+- end_commit: `7dd9406dd34c98c7d3e821ac349758f07708cd05`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Harden the CLI integration suite with installed-runtime reuse coverage and a `--no-auto-start` unavailable-runtime path so reconnect and cold-status behavior are exercised the way users actually invoke the packaged CLI.
-- Mirror the Codex command-router policy prompt into packaged runtime prompt directories so the source prompt, embedded runtime, and sandbox runtime all ship the same wrapper-shell guidance text.
-- Add stronger WorkerPals Codex wrapper-shell recovery so repeated `/bin/bash -lc ...` style rejections escalate into a stricter second retry instead of failing immediately in a rejection loop.
-- Make RemoteBuddy autonomy ideation more resilient under Codex latency by expanding the effective ideation timeout for Codex-backed runs, logging prompt-size and phase-duration metrics, and adding a one-shot “fit within the time budget” recovery instruction on the next ideation round after a timeout.
+- Preserve tracked `.codex` sentinel files during WorkerPals rebase-based branch sync by restoring them to `HEAD` and continuing publish retries instead of treating every tracked `.codex` path as a terminal publish blocker.
+- Keep the packaged sandbox runtime in sync with the source WorkerPals branch-finalization fix so released CLI builds handle tracked `.codex` PR branches the same way as source-tree tests.
+- Add regression coverage for the exact tracked-`.codex` retry path: a remote branch that introduces `.codex` plus a content conflict now completes sync successfully while preserving the tracked sentinel.
 
 ## Install
 
