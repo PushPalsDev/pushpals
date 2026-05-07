@@ -2614,11 +2614,43 @@ export async function syncHiddenRefWithRemoteBranchByRebase(
 
     const trackedCodex = await git(repo, ["ls-files", "--error-unmatch", "--", ".codex"]);
     if (trackedCodex.ok) {
-      return {
-        ok: false,
-        error:
-          "Tracked .codex path blocks branch sync. Move Codex state outside the repo worktree before retrying.",
-      };
+      const restoreTrackedCodex = await git(repo, [
+        "restore",
+        "--source=HEAD",
+        "--staged",
+        "--worktree",
+        "--",
+        ".codex",
+      ]);
+      if (!restoreTrackedCodex.ok) {
+        return {
+          ok: false,
+          error:
+            `Tracked .codex path blocks branch sync and could not be restored to HEAD: ` +
+            `${combinedGitOutput(restoreTrackedCodex)}`,
+        };
+      }
+
+      const trackedCodexStatus = await git(repo, ["status", "--porcelain", "--", ".codex"]);
+      if (!trackedCodexStatus.ok) {
+        return {
+          ok: false,
+          error:
+            `Tracked .codex path blocks branch sync and its status could not be verified: ` +
+            `${combinedGitOutput(trackedCodexStatus)}`,
+        };
+      }
+      if (trackedCodexStatus.stdout.trim().length > 0) {
+        return {
+          ok: false,
+          error:
+            "Tracked .codex path blocks branch sync because local changes remain after restore. " +
+            "Move Codex state outside the repo worktree before retrying.",
+        };
+      }
+
+      console.warn("[WorkerPals] Preserved tracked .codex sentinel before branch sync.");
+      return { ok: true };
     }
 
     try {
