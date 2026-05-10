@@ -463,12 +463,17 @@ function resolveDockerExecutablePath(): string {
   );
 }
 
-async function createTimedOutInspectDockerExecutable(root: string, targetImage: string): Promise<string> {
+async function createTimedOutInspectDockerExecutable(root: string, targetImage: string): Promise<{
+  executablePath: string;
+  statePath: string;
+  commandLogPath: string;
+}> {
   if (process.platform === "win32") {
     throw new Error("Timed-out docker inspect wrapper is not implemented for Windows");
   }
   const outputPath = join(root, "docker-timeout");
   const statePath = join(root, "docker-inspect-timeout.once");
+  const commandLogPath = join(root, "docker-command-log.txt");
   const realDockerPath = resolveDockerExecutablePath();
   writeFileSync(
     outputPath,
@@ -476,7 +481,9 @@ async function createTimedOutInspectDockerExecutable(root: string, targetImage: 
 set -eu
 REAL_DOCKER=${shSingleQuote(realDockerPath)}
 STATE_FILE=${shSingleQuote(statePath)}
+COMMAND_LOG=${shSingleQuote(commandLogPath)}
 TARGET_IMAGE=${shSingleQuote(targetImage)}
+printf '%s\\n' "$*" >> "$COMMAND_LOG"
 is_inspect="0"
 has_target="0"
 if [ "$#" -ge 2 ] && [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
@@ -500,7 +507,11 @@ exec "$REAL_DOCKER" "$@"
     "utf8",
   );
   chmodSync(outputPath, 0o755);
-  return outputPath;
+  return {
+    executablePath: outputPath,
+    statePath,
+    commandLogPath,
+  };
 }
 
 function summarizeCapturedOutput(text: string, maxChars = 16_000): string {
@@ -1345,7 +1356,7 @@ describe("packaged CLI end-to-end", () => {
       if (process.platform === "win32") return;
       const artifacts = await ensureBuildArtifacts();
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-docker-timeout-"));
-      const timedOutDockerPath = await createTimedOutInspectDockerExecutable(root, artifacts.dockerImage);
+      const timedOutDocker = await createTimedOutInspectDockerExecutable(root, artifacts.dockerImage);
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {
         const { repoPath } = initializeTempRepo(root);
@@ -1369,7 +1380,7 @@ describe("packaged CLI end-to-end", () => {
             stdout: "pipe",
             stderr: "pipe",
             env: buildCliE2EEnv({
-              PUSHPALS_DOCKER_BIN_ABSOLUTE: timedOutDockerPath,
+              PUSHPALS_DOCKER_BIN_ABSOLUTE: timedOutDocker.executablePath,
             }),
           },
         );
@@ -1390,15 +1401,16 @@ describe("packaged CLI end-to-end", () => {
         if (exitCode !== 0) {
           throw new Error(`CLI E2E exited ${exitCode}\n${combined}`);
         }
-        expect(combined).toContain(
-          `[pushpals] failed to inspect local WorkerPal sandbox image ${artifacts.dockerImage}:`,
-        );
-        expect(combined).toContain("timed out after 15000ms");
-        expect(combined).toContain(
-          `[pushpals] WorkerPal sandbox image ${artifacts.dockerImage} could not be inspected; attempting local rebuild...`,
-        );
+        const dockerCommandLog = readFileSync(timedOutDocker.commandLogPath, "utf8");
+        expect(existsSync(timedOutDocker.statePath)).toBe(true);
+        expect(dockerCommandLog).toContain("image inspect");
+        expect(dockerCommandLog).toContain(artifacts.dockerImage);
+        expect(dockerCommandLog).toContain("build -f apps/workerpals/Dockerfile.sandbox");
         expect(combined).toContain("[pushpals] Embedded runtime is ready.");
         expect(combined).toContain("[pushpals] Connected.");
+        expect(combined).toContain(
+          `[pushpals] Checking WorkerPal sandbox image ${artifacts.dockerImage} for runtimeTag=${runtimeTag}...`,
+        );
         expect(combined).not.toContain("[pushpals] Precheck failed:");
         expect(combined).not.toContain("[pushpals] Auto-start failed:");
       } finally {

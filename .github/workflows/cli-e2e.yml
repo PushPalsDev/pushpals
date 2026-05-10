@@ -95,6 +95,9 @@ jobs:
 
   windows_host_docker_e2e:
     name: Windows Host Docker E2E
+    needs:
+      - packaged_cli_e2e_linux
+      - workerpals_control_plane_e2e_linux
     runs-on:
       - self-hosted
       - windows

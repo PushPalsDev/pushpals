@@ -335,6 +335,8 @@ function commonRepoAncestor(paths) {
   const normalized = paths.map((entry) => normalizeRepoRelativePath(entry)).filter((entry) => Boolean(entry));
   if (normalized.length === 0)
     return null;
+  if (normalized.length === 1)
+    return normalized[0] ?? null;
   const segments = normalized.map((entry) => entry.split("/"));
   const shared = [];
   const first = segments[0] ?? [];
@@ -349,7 +351,7 @@ function commonRepoAncestor(paths) {
     break;
   }
   if (shared.length === 0)
-    return normalized[0] ?? null;
+    return null;
   return shared.join("/");
 }
 function normalizeAutonomyComponentArea(value) {
@@ -367,6 +369,33 @@ function deriveAutonomyComponentArea(targetPathsInput, writeGlobsInput) {
   if (targetSeeds.length === 0)
     return null;
   return commonRepoAncestor(targetSeeds);
+}
+function collectScopeSeedPaths(targetPathsInput, writeGlobsInput) {
+  const seeds = new Set;
+  if (Array.isArray(writeGlobsInput)) {
+    for (const raw of writeGlobsInput) {
+      const normalized = normalizeWriteGlob(raw);
+      if (!normalized)
+        continue;
+      const prefix = literalPrefix(normalized);
+      if (!prefix)
+        continue;
+      const seed = scopeSeedPath(prefix);
+      if (seed)
+        seeds.add(seed);
+    }
+  }
+  if (Array.isArray(targetPathsInput)) {
+    for (const raw of targetPathsInput) {
+      const normalized = normalizeTargetPath(raw);
+      if (!normalized)
+        continue;
+      const seed = scopeSeedPath(normalized);
+      if (seed)
+        seeds.add(seed);
+    }
+  }
+  return [...seeds];
 }
 function componentRootPrefix(area) {
   const normalized = normalizeAutonomyComponentArea(area);
@@ -556,7 +585,12 @@ function hasForbiddenBroadGlob(glob) {
 }
 function validateScopeInvariants(componentArea, targetPathsInput, writeGlobsInput, options) {
   const errors = [];
+  const scopeSeeds = collectScopeSeedPaths(targetPathsInput, writeGlobsInput);
   const normalizedComponentArea = normalizeAutonomyComponentArea(componentArea) ?? deriveAutonomyComponentArea(targetPathsInput, writeGlobsInput);
+  const allowMultipleComponentRoots = options?.allowMultipleComponentRoots === true;
+  if (!normalizedComponentArea && scopeSeeds.length > 1 && !allowMultipleComponentRoots) {
+    errors.push(`scope spans multiple component roots: ${scopeSeeds.slice(0, 6).join(", ")}`);
+  }
   const rootPrefix = normalizedComponentArea ? componentRootPrefix(normalizedComponentArea) : "";
   const normalizedTargetPaths = [];
   const targetSeen = new Set;
@@ -620,7 +654,7 @@ function validateScopeInvariants(componentArea, targetPathsInput, writeGlobsInpu
         errors.push(`target_path not covered by write_globs: ${targetPath}`);
     }
   }
-  if (!normalizedComponentArea) {
+  if (!normalizedComponentArea && !allowMultipleComponentRoots) {
     errors.push("component_area could not be derived from scope");
   }
   const breadth = classifyGlobBreadth(normalizedWriteGlobs);
@@ -4018,6 +4052,7 @@ var BREADTH_ORDER = {
 var IDEATION_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_ideation_system_prompt.md").trim();
 var SCORING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_scoring_system_prompt.md").trim();
 var PLANNING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_planning_system_prompt.md").trim();
+var IDEATION_TIMEOUT_RECOVERY_INSTRUCTION = "Previous ideation timed out before you returned JSON. For this round only, stay within the time budget: prioritize the top 1-3 highest-confidence candidates, keep reasoning brief, avoid exhaustive exploration, and return valid JSON as soon as possible.";
 var VISION_DOC_FNAME = "vision.md";
 var MAX_VISION_SECTION_CHARS = 1200;
 var DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
@@ -5779,6 +5814,7 @@ class RemoteBuddyAutonomousEngine {
   baseBranch;
   llm;
   comm;
+  llmCfg;
   cfg;
   runtimeEnabled = true;
   timer = null;
@@ -5792,6 +5828,7 @@ class RemoteBuddyAutonomousEngine {
   lastOutcome = "none";
   lastDetail = "not_started";
   lastCompletedAtMs = 0;
+  pendingIdeationTimeoutRecovery = null;
   constructor(opts) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
@@ -5805,6 +5842,7 @@ class RemoteBuddyAutonomousEngine {
     this.baseBranch = String(opts.config.sourceControlManager.baseBranch || "main").trim() || "main";
     this.llm = opts.llm;
     this.comm = opts.comm;
+    this.llmCfg = opts.config.remotebuddy.llm;
     this.cfg = opts.config.remotebuddy.autonomy;
     this.runtimeEnabled = this.cfg.enabled;
   }
@@ -5859,10 +5897,30 @@ class RemoteBuddyAutonomousEngine {
     return headers;
   }
   lockTtlMs() {
-    return Math.max(this.cfg.tickIntervalMs * 3, this.cfg.ideationBudgetMs * 2 + this.cfg.llmTimeoutMs * 6, 30000);
+    const maxPhaseTimeoutMs = Math.max(this.phaseTimeoutMs("ideation"), this.phaseTimeoutMs("scoring"), this.phaseTimeoutMs("planning"));
+    return Math.max(this.cfg.tickIntervalMs * 3, this.cfg.ideationBudgetMs * 2 + maxPhaseTimeoutMs * 6, 30000);
   }
   cycleBudgetMs() {
-    return Math.max(this.cfg.ideationBudgetMs + this.cfg.llmTimeoutMs * 3, this.cfg.llmTimeoutMs * 4, 20000);
+    const ideationTimeoutMs = this.phaseTimeoutMs("ideation");
+    const scoringTimeoutMs = this.phaseTimeoutMs("scoring");
+    const planningTimeoutMs = this.phaseTimeoutMs("planning");
+    const maxPhaseTimeoutMs = Math.max(ideationTimeoutMs, scoringTimeoutMs, planningTimeoutMs);
+    return Math.max(this.cfg.ideationBudgetMs + ideationTimeoutMs + scoringTimeoutMs + planningTimeoutMs, maxPhaseTimeoutMs * 4, 20000);
+  }
+  phaseTimeoutMs(phase) {
+    const configuredTimeoutMs = Math.max(1000, this.cfg.llmTimeoutMs);
+    if (phase !== "ideation")
+      return configuredTimeoutMs;
+    if (String(this.llmCfg.backend || "").trim().toLowerCase() !== "openai_codex") {
+      return configuredTimeoutMs;
+    }
+    const codexTimeoutMs2 = Math.max(configuredTimeoutMs, this.llmCfg.codexTimeoutMs || 0);
+    return Math.min(codexTimeoutMs2, Math.max(configuredTimeoutMs, 90000));
+  }
+  consumeIdeationTimeoutRecovery() {
+    const recovery = this.pendingIdeationTimeoutRecovery;
+    this.pendingIdeationTimeoutRecovery = null;
+    return recovery;
   }
   loadVisionContext(runId) {
     const maxVisionContextChars = this.cfg.visionContextMaxChars;
@@ -6180,6 +6238,7 @@ class RemoteBuddyAutonomousEngine {
     }).catch(() => {});
   }
   async llmPhase(phase, runId, snapshotId, input, objectiveId) {
+    const timeoutMs = this.phaseTimeoutMs(phase);
     const requestPayload = {
       phase,
       system: input.system,
@@ -6188,10 +6247,30 @@ class RemoteBuddyAutonomousEngine {
       maxTokens: input.maxTokens ?? null,
       temperature: input.temperature ?? null
     };
+    const systemChars = input.system.length;
+    const messageChars = (input.messages ?? []).reduce((sum, message) => sum + (message.content?.length ?? 0), 0);
+    const requestBytes = Buffer.byteLength(JSON.stringify(requestPayload), "utf8");
     const startedAt = Date.now();
-    const output = await withTimeout(this.llm.generate(input), this.cfg.llmTimeoutMs, `autonomy ${phase} phase timeout`);
+    console.log(`[RemoteBuddyAutonomousEngine] ${phase} phase start: timeout_ms=${timeoutMs} system_chars=${systemChars} message_chars=${messageChars} request_bytes=${requestBytes} max_tokens=${input.maxTokens ?? "default"} temperature=${input.temperature ?? "default"}`);
+    let output;
+    try {
+      output = await withTimeout(this.llm.generate(input), timeoutMs, `autonomy ${phase} phase timeout`);
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt;
+      if (phase === "ideation" && error instanceof Error && error.message === "autonomy ideation phase timeout") {
+        this.pendingIdeationTimeoutRecovery = {
+          previousRunId: runId,
+          timedOutAt: new Date().toISOString(),
+          timeoutMs
+        };
+      }
+      console.warn(`[RemoteBuddyAutonomousEngine] ${phase} phase failed: elapsed_ms=${elapsedMs} timeout_ms=${timeoutMs} system_chars=${systemChars} message_chars=${messageChars} request_bytes=${requestBytes} error=${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
     const responseJson = parseJsonObject(output.text);
     const tokenUsage = output.usage ?? null;
+    const latencyMs = Date.now() - startedAt;
+    console.log(`[RemoteBuddyAutonomousEngine] ${phase} phase completed: elapsed_ms=${latencyMs} timeout_ms=${timeoutMs} response_chars=${output.text.length} prompt_tokens=${tokenUsage?.promptTokens ?? "unknown"} completion_tokens=${tokenUsage?.completionTokens ?? "unknown"}`);
     return {
       json: responseJson,
       llmCall: {
@@ -6211,11 +6290,11 @@ ${JSON.stringify(input.messages ?? [])}`),
         },
         modelId: "configured",
         temperature: input.temperature ?? null,
-        timeoutMs: this.cfg.llmTimeoutMs,
+        timeoutMs,
         response: responseJson,
         responseHash: sha256(output.text),
         tokenUsage,
-        latencyMs: Date.now() - startedAt
+        latencyMs
       }
     };
   }
@@ -6550,26 +6629,43 @@ ${JSON.stringify(input.messages ?? [])}`),
         return;
       }
       this.setPhase("ideation");
+      const ideationRecovery = this.consumeIdeationTimeoutRecovery();
+      if (ideationRecovery) {
+        console.warn(`[RemoteBuddyAutonomousEngine] tick ${runId}: applying one-shot ideation timeout recovery from ${ideationRecovery.previousRunId} after ${ideationRecovery.timeoutMs}ms timeout.`);
+      }
+      const ideationTopSignals = snapshot.top_signals.slice(0, ideationRecovery ? 10 : 16);
+      const ideationStateTraits = snapshot.state_traits.slice(0, ideationRecovery ? 14 : 24);
+      const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, ideationRecovery ? 12 : 20);
+      const ideationEngineIdeaPriors = (snapshot.engine_idea_priors ?? []).slice(0, ideationRecovery ? 12 : 20);
+      const ideationOpenObjectives = snapshot.open_objectives.slice(0, ideationRecovery ? 12 : 20);
+      const ideationActiveCooldowns = snapshot.active_cooldowns.slice(0, ideationRecovery ? 12 : 20);
+      const ideationRepoTargets = repoTargets.slice(0, ideationRecovery ? 8 : repoTargets.length);
       const ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, {
         system: IDEATION_SYSTEM_PROMPT,
         json: true,
-        maxTokens: 2800,
+        maxTokens: ideationRecovery ? 1400 : 2800,
         temperature: 0.2,
         messages: [
+          ...ideationRecovery ? [
+            {
+              role: "user",
+              content: `${IDEATION_TIMEOUT_RECOVERY_INSTRUCTION} Previous timed-out run: ${ideationRecovery.previousRunId}. Timeout budget for this round: ${this.phaseTimeoutMs("ideation")}ms.`
+            }
+          ] : [],
           {
             role: "user",
             content: JSON.stringify({
               snapshot: {
                 snapshot_id: snapshot.snapshot_id,
-                top_signals: snapshot.top_signals.slice(0, 16),
-                state_traits: snapshot.state_traits.slice(0, 24),
-                feedback_priors: snapshot.feedback_priors.slice(0, 20),
-                engine_idea_priors: (snapshot.engine_idea_priors ?? []).slice(0, 20),
-                open_objectives: snapshot.open_objectives.slice(0, 20),
-                active_cooldowns: snapshot.active_cooldowns.slice(0, 20)
+                top_signals: ideationTopSignals,
+                state_traits: ideationStateTraits,
+                feedback_priors: ideationFeedbackPriors,
+                engine_idea_priors: ideationEngineIdeaPriors,
+                open_objectives: ideationOpenObjectives,
+                active_cooldowns: ideationActiveCooldowns
               },
               vision: visionContext,
-              repo_targets: repoTargets.map((target) => ({
+              repo_targets: ideationRepoTargets.map((target) => ({
                 component_area: target.component_area,
                 target_paths: target.target_paths,
                 write_globs: target.write_globs,
