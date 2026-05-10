@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.65`
-- start_commit: `aeba3f47f05a727c7c0bf032ffd8579115cb43ef`
-- end_commit: `862e927fd6863b6d083c205c090bea9d40257d33`
+- version: `v1.0.66`
+- start_commit: `d242307c651b848010a5233bcb7b670fbdbc8695`
+- end_commit: `31fdbdc843b280d45dda8c36f77a01a63ec62dfd`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Fail true autonomy tasks honestly when their `targetPaths` span disjoint repo roots instead of deriving a fake single component root from the first path, while still allowing multi-root `review_fix` and `merge_conflict` tasks under the normal write-scope hygiene checks.
-- Recover repeated OpenAI Codex wrapper-shell inspection loops by injecting backend-run, read-only direct-command bootstrap context on the strict retry, so simple `pwd` / `git branch --show-current` / `ls` wrapper retries do not keep dying on command-router policy rejections.
-- Keep the packaged sandbox runtime in sync with both the autonomy-scope validation change and the stricter Codex wrapper recovery path, with regression coverage for disjoint-root validation and backend bootstrap-assisted recovery.
+- Harden the packaged CLI Docker-timeout E2E to verify the real recovery contract instead of brittle exact warning strings by recording timed-out inspect/build invocations and asserting startup still reaches ready/connected.
+- Prevent the `Windows Host Docker E2E` workflow lane from sitting queued pointlessly when Linux is already red by making the self-hosted Windows lane depend on the two Linux CLI/WorkerPals E2E jobs.
+- Sync the generated bundled RemoteBuddy fallback asset with the current autonomy-scope and ideation-timeout recovery behavior so packaged fallback runtime assets stay aligned with source logic.
 
 ## Install
 
