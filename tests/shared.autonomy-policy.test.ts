@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  deriveAutonomyComponentArea,
   makePatternKey,
   normalizeTargetPath,
   validateScopeInvariants,
@@ -57,5 +58,45 @@ describe("shared autonomy policy", () => {
     });
     expect(derived.ok).toBe(true);
     expect(derived.componentArea).toBe("src");
+  });
+
+  test("deriveAutonomyComponentArea returns null for disjoint roots", () => {
+    expect(
+      deriveAutonomyComponentArea(
+        ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+        ["app/**", "scripts/**"],
+      ),
+    ).toBeNull();
+  });
+
+  test("validateScopeInvariants rejects mixed-root autonomy scope when component area is absent", () => {
+    const invalid = validateScopeInvariants(
+      null,
+      ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+      ["app/**", "scripts/**"],
+      { requireWriteGlobs: true },
+    );
+    expect(invalid.ok).toBe(false);
+    expect(invalid.errors.join(" ")).toContain("scope spans multiple component roots");
+  });
+
+  test("validateScopeInvariants can allow multiple component roots without allowing broad globs", () => {
+    const valid = validateScopeInvariants(
+      null,
+      ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+      ["app/**", "scripts/**"],
+      { requireWriteGlobs: true, allowMultipleComponentRoots: true },
+    );
+    expect(valid.ok).toBe(true);
+    expect(valid.componentArea).toBeNull();
+
+    const broad = validateScopeInvariants(
+      null,
+      ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+      ["**"],
+      { requireWriteGlobs: true, allowMultipleComponentRoots: true },
+    );
+    expect(broad.ok).toBe(false);
+    expect(broad.errors.join(" ")).toContain("forbidden broad write_glob");
   });
 });

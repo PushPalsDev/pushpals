@@ -96,6 +96,8 @@ _VALID_COLORS = {"always", "never", "auto"}
 _VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
 _VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 _MAX_WRAPPER_RECOVERY_ATTEMPTS = 2
+_MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS = 1_200
+_MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS = 5_000
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -1108,6 +1110,177 @@ def _build_wrapper_recovery_guidance(rejected_commands: List[str], *, hard: bool
     return "\n".join(guidance_lines)
 
 
+def _truncate_wrapper_bootstrap_output(text: str) -> str:
+    value = str(text or "").replace("\r\n", "\n").strip()
+    if len(value) <= _MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS:
+        return value
+    return f"{value[:_MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS].rstrip()}\n...(truncated)"
+
+
+def _resolve_repo_scoped_path(repo: str, raw_path: str) -> Optional[Path]:
+    candidate = str(raw_path or "").strip()
+    if not candidate:
+        return None
+    repo_root = Path(repo).resolve()
+    resolved = (repo_root / candidate).resolve()
+    try:
+        common = os.path.commonpath([str(repo_root), str(resolved)])
+    except ValueError:
+        return None
+    if common != str(repo_root):
+        return None
+    return resolved
+
+
+def _run_wrapper_bootstrap_command(repo: str, command: str) -> str:
+    normalized = _normalize_command_text(command)
+    if not normalized:
+        return ""
+    try:
+        args = shlex.split(normalized, posix=True)
+    except ValueError:
+        return ""
+    if not args:
+        return ""
+    program = str(args[0] or "").strip().lower()
+    if program == "pwd" and len(args) == 1:
+        return repo
+    if program == "ls":
+        target = Path(repo).resolve()
+        if len(args) == 2 and not str(args[1]).startswith("-"):
+            resolved = _resolve_repo_scoped_path(repo, str(args[1]))
+            if not resolved:
+                return ""
+            target = resolved
+        elif len(args) > 1:
+            return ""
+        if not target.exists():
+            return f"{target.name or str(target)} (missing)"
+        if target.is_file():
+            return target.name
+        entries = sorted(child.name for child in target.iterdir())
+        return "\n".join(entries[:120])
+    if program == "git" and len(args) >= 2:
+        safe_git_args: Optional[List[str]] = None
+        if args[1:] == ["branch", "--show-current"]:
+            safe_git_args = ["git", "--no-pager", "branch", "--show-current"]
+        elif args[1:] == ["status", "--porcelain"]:
+            safe_git_args = ["git", "--no-pager", "status", "--porcelain"]
+        elif len(args) >= 3 and args[1] == "diff":
+            diff_args = list(args[2:])
+            sanitized_paths: List[str] = []
+            if diff_args == ["--name-only"]:
+                safe_git_args = [
+                    "git",
+                    "--no-pager",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--name-only",
+                ]
+            elif len(diff_args) >= 2 and diff_args[0] == "--name-only" and diff_args[1] == "--":
+                for raw_path in diff_args[2:]:
+                    resolved = _resolve_repo_scoped_path(repo, str(raw_path))
+                    if not resolved:
+                        return ""
+                    sanitized_paths.append(os.path.relpath(str(resolved), repo))
+                safe_git_args = [
+                    "git",
+                    "--no-pager",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--name-only",
+                    "--",
+                    *sanitized_paths,
+                ]
+            elif diff_args and diff_args[0] == "--":
+                for raw_path in diff_args[1:]:
+                    resolved = _resolve_repo_scoped_path(repo, str(raw_path))
+                    if not resolved:
+                        return ""
+                    sanitized_paths.append(os.path.relpath(str(resolved), repo))
+                safe_git_args = [
+                    "git",
+                    "--no-pager",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--",
+                    *sanitized_paths,
+                ]
+        if not safe_git_args:
+            return ""
+        proc = subprocess.run(
+            safe_git_args,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        output = proc.stdout.strip()
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or output
+            return f"(command failed: {detail})" if detail else "(command failed)"
+        return output
+    if program == "cat" and len(args) == 2:
+        resolved = _resolve_repo_scoped_path(repo, str(args[1]))
+        if not resolved or not resolved.is_file():
+            return ""
+        return resolved.read_text(encoding="utf-8", errors="replace")
+    if program == "sed" and len(args) == 4 and args[1] == "-n":
+        match = re.fullmatch(r"(\d+),(\d+)p", str(args[2] or "").strip())
+        if not match:
+            return ""
+        start = max(1, int(match.group(1)))
+        end = max(start, int(match.group(2)))
+        resolved = _resolve_repo_scoped_path(repo, str(args[3]))
+        if not resolved or not resolved.is_file():
+            return ""
+        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[start - 1 : end])
+    return ""
+
+
+def _build_wrapper_bootstrap_context(repo: str, rejected_commands: List[str]) -> str:
+    blocks: List[str] = []
+    total_chars = 0
+    seen: set[str] = set()
+    for rejected in rejected_commands:
+        direct = _unwrap_shell_wrapper_command(rejected)
+        key = direct.lower()
+        if not direct or key in seen:
+            continue
+        seen.add(key)
+        output = _run_wrapper_bootstrap_command(repo, direct)
+        if not output:
+            continue
+        truncated = _truncate_wrapper_bootstrap_output(output)
+        block = (
+            f"- Direct command: `{direct}`\n"
+            f"  Rejected wrapper: `{rejected}`\n"
+            "  Output:\n"
+            "  ```text\n"
+            f"{truncated}\n"
+            "  ```"
+        )
+        if total_chars + len(block) > _MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS and blocks:
+            break
+        blocks.append(block)
+        total_chars += len(block)
+    if not blocks:
+        return ""
+    return "\n".join(
+        [
+            "Direct command context bootstrap:",
+            "The backend already ran safe read-only direct replacements for some rejected wrapper commands.",
+            "Use these outputs as current repo context and do not rerun the wrapped variants.",
+            *blocks[:6],
+        ]
+    )
+
+
 def _merge_usage_records(first: Any, second: Any) -> Dict[str, Any]:
     first_record = first if isinstance(first, dict) else {}
     second_record = second if isinstance(second, dict) else {}
@@ -1547,10 +1720,16 @@ def _run_codex_task(
                     hard=hard_recovery,
                 )
                 if recovery_guidance:
+                    bootstrap_context = (
+                        _build_wrapper_bootstrap_context(repo, rejected_shell_wrappers)
+                        if hard_recovery
+                        else ""
+                    )
                     log.warning(
                         "Codex hit a shell-wrapper rejection loop; retrying once with "
                         + (
                             "strict no-wrapper recovery guidance."
+                            + (" Added direct-command context bootstrap." if bootstrap_context else "")
                             if hard_recovery
                             else "direct-command recovery guidance."
                         )
@@ -1558,7 +1737,11 @@ def _run_codex_task(
                     retry_result = _run_codex_task(
                         repo,
                         instruction,
-                        [*effective_supplemental_guidance, recovery_guidance],
+                        [
+                            *effective_supplemental_guidance,
+                            *( [bootstrap_context] if bootstrap_context else [] ),
+                            recovery_guidance,
+                        ],
                         wrapper_recovery_attempt=wrapper_recovery_attempt + 1,
                         baseline_changes=baseline_snapshot,
                     )

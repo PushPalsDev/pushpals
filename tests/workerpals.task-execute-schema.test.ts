@@ -177,4 +177,117 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.summary).not.toContain("componentArea");
     expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
+
+  test("rejects generic autonomy-origin mixed-root scope", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      targetPaths: ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["app/**", "scripts/**"],
+      },
+      finalizationBudgetMs: 0,
+    };
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        origin: "autonomy",
+        instruction: "fix mixed scope task",
+        planning,
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("componentArea");
+  });
+
+  test("allows review_fix autonomy-origin tasks to use multi-root PR scope", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      targetPaths: ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["app/**", "scripts/**"],
+      },
+      finalizationBudgetMs: 0,
+    };
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        origin: "autonomy",
+        instruction: "fix PR feedback across app and scripts",
+        planning,
+        reviewAgent: {
+          resolutionType: "review_fix",
+        },
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).not.toContain("scope invariants");
+    expect(result.summary).not.toContain("componentArea");
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
+  });
+
+  test("allows merge_conflict autonomy-origin tasks to use multi-root branch scope", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      targetPaths: ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["app/**", "scripts/**"],
+      },
+      finalizationBudgetMs: 0,
+    };
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        origin: "autonomy",
+        instruction: "resolve branch conflicts across app and scripts",
+        planning,
+        reviewAgent: {
+          resolutionType: "merge_conflict",
+        },
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).not.toContain("scope invariants");
+    expect(result.summary).not.toContain("componentArea");
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
+  });
+
+  test("still rejects broad write globs for review_fix multi-root scope", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      targetPaths: ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["**"],
+      },
+      finalizationBudgetMs: 0,
+    };
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        origin: "autonomy",
+        instruction: "fix PR feedback across app and scripts",
+        planning,
+        reviewAgent: {
+          resolutionType: "review_fix",
+        },
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("forbidden broad write_glob");
+  });
 });

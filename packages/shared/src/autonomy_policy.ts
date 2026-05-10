@@ -66,6 +66,7 @@ function commonRepoAncestor(paths: string[]): string | null {
     .map((entry) => normalizeRepoRelativePath(entry))
     .filter((entry): entry is string => Boolean(entry));
   if (normalized.length === 0) return null;
+  if (normalized.length === 1) return normalized[0] ?? null;
   const segments = normalized.map((entry) => entry.split("/"));
   const shared: string[] = [];
   const first = segments[0] ?? [];
@@ -78,7 +79,7 @@ function commonRepoAncestor(paths: string[]): string | null {
     }
     break;
   }
-  if (shared.length === 0) return normalized[0] ?? null;
+  if (shared.length === 0) return null;
   return shared.join("/");
 }
 
@@ -112,6 +113,29 @@ export function deriveAutonomyComponentArea(
     : [];
   if (targetSeeds.length === 0) return null;
   return commonRepoAncestor(targetSeeds);
+}
+
+function collectScopeSeedPaths(targetPathsInput: unknown[], writeGlobsInput?: unknown[]): string[] {
+  const seeds = new Set<string>();
+  if (Array.isArray(writeGlobsInput)) {
+    for (const raw of writeGlobsInput) {
+      const normalized = normalizeWriteGlob(raw);
+      if (!normalized) continue;
+      const prefix = literalPrefix(normalized);
+      if (!prefix) continue;
+      const seed = scopeSeedPath(prefix);
+      if (seed) seeds.add(seed);
+    }
+  }
+  if (Array.isArray(targetPathsInput)) {
+    for (const raw of targetPathsInput) {
+      const normalized = normalizeTargetPath(raw);
+      if (!normalized) continue;
+      const seed = scopeSeedPath(normalized);
+      if (seed) seeds.add(seed);
+    }
+  }
+  return [...seeds];
 }
 
 export function componentRootPrefix(area: AutonomyComponentArea): string {
@@ -295,12 +319,19 @@ export function validateScopeInvariants(
   componentArea: AutonomyComponentArea | null | undefined,
   targetPathsInput: unknown[],
   writeGlobsInput: unknown[],
-  options?: { requireWriteGlobs?: boolean },
+  options?: { requireWriteGlobs?: boolean; allowMultipleComponentRoots?: boolean },
 ): ScopeValidationResult {
   const errors: string[] = [];
+  const scopeSeeds = collectScopeSeedPaths(targetPathsInput, writeGlobsInput);
   const normalizedComponentArea =
     normalizeAutonomyComponentArea(componentArea) ??
     deriveAutonomyComponentArea(targetPathsInput, writeGlobsInput);
+  const allowMultipleComponentRoots = options?.allowMultipleComponentRoots === true;
+  if (!normalizedComponentArea && scopeSeeds.length > 1 && !allowMultipleComponentRoots) {
+    errors.push(
+      `scope spans multiple component roots: ${scopeSeeds.slice(0, 6).join(", ")}`,
+    );
+  }
   const rootPrefix = normalizedComponentArea ? componentRootPrefix(normalizedComponentArea) : "";
   const normalizedTargetPaths: string[] = [];
   const targetSeen = new Set<string>();
@@ -368,7 +399,7 @@ export function validateScopeInvariants(
       if (!covered) errors.push(`target_path not covered by write_globs: ${targetPath}`);
     }
   }
-  if (!normalizedComponentArea) {
+  if (!normalizedComponentArea && !allowMultipleComponentRoots) {
     errors.push("component_area could not be derived from scope");
   }
 

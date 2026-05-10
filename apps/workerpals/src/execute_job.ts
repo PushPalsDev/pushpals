@@ -333,6 +333,13 @@ export function shouldEnqueueNoChangeReviewCompletion(
   return extractReviewFixContext(params) == null;
 }
 
+function reviewAgentAllowsMultiRootScope(value: unknown): boolean {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return normalized === "review_fix" || normalized === "merge_conflict";
+}
+
 export function deriveQualityGatePolicy(
   params: Record<string, unknown> | null | undefined,
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
@@ -3217,6 +3224,7 @@ function validateTaskExecutePlanning(
   options?: {
     origin?: "autonomy" | "user";
     autonomyComponentArea?: unknown;
+    reviewAgentResolutionType?: unknown;
   },
 ): { ok: true } | { ok: false; message: string } {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -3300,14 +3308,18 @@ function validateTaskExecutePlanning(
     const normalizedWriteGlobs = isStringArray(scope.writeGlobs)
       ? toStringArray(scope.writeGlobs)
       : [];
+    const allowMultiRootAutonomyScope =
+      origin === "autonomy" &&
+      reviewAgentAllowsMultiRootScope(options?.reviewAgentResolutionType);
     if (origin === "autonomy") {
       const declaredComponentArea = asAutonomyComponentArea(options?.autonomyComponentArea);
-      const inferredComponentArea = deriveAutonomyComponentArea(
-        normalizedTargetPaths,
-        normalizedWriteGlobs,
-      );
-      const componentArea = declaredComponentArea ?? inferredComponentArea;
-      if (!componentArea) {
+      const inferredComponentArea = allowMultiRootAutonomyScope
+        ? null
+        : deriveAutonomyComponentArea(normalizedTargetPaths, normalizedWriteGlobs);
+      const componentArea = allowMultiRootAutonomyScope
+        ? declaredComponentArea
+        : declaredComponentArea ?? inferredComponentArea;
+      if (!allowMultiRootAutonomyScope && !componentArea) {
         return {
           ok: false,
           message:
@@ -3315,6 +3327,7 @@ function validateTaskExecutePlanning(
         };
       }
       if (
+        !allowMultiRootAutonomyScope &&
         declaredComponentArea &&
         inferredComponentArea &&
         declaredComponentArea !== inferredComponentArea
@@ -3328,7 +3341,7 @@ function validateTaskExecutePlanning(
         componentArea,
         normalizedTargetPaths,
         normalizedWriteGlobs,
-        { requireWriteGlobs: false },
+        { requireWriteGlobs: false, allowMultipleComponentRoots: allowMultiRootAutonomyScope },
       );
       if (!validatedScope.ok) {
         return {
@@ -3686,9 +3699,14 @@ export async function executeJob(
     params.autonomy && typeof params.autonomy === "object" && !Array.isArray(params.autonomy)
       ? (params.autonomy as Record<string, unknown>)
       : null;
+  const reviewAgent =
+    params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent)
+      ? (params.reviewAgent as Record<string, unknown>)
+      : null;
   const planningValidation = validateTaskExecutePlanning(params.planning, {
     origin,
     autonomyComponentArea: autonomyScope?.componentArea ?? autonomyScope?.component_area,
+    reviewAgentResolutionType: reviewAgent?.resolutionType,
   });
   if (!planningValidation.ok) {
     return {

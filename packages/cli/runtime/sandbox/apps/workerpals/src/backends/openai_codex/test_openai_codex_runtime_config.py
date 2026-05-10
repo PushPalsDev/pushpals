@@ -24,6 +24,7 @@ from executor_base import (
 from openai_codex_executor import (
     OpenAICodexRuntimeConfig,
     _augment_supplemental_guidance,
+    _build_wrapper_bootstrap_context,
     _build_wrapper_recovery_guidance,
     _run_codex_task,
     _resolve_reasoning_effort,
@@ -295,6 +296,56 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("first command invocation on this retry must be one of the direct replacements", lowered)
         self.assertIn("`/bin/bash -lc 'git status --porcelain'` -> `git status --porcelain`", guidance)
 
+    def test_build_wrapper_bootstrap_context_runs_safe_direct_replacements(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-bootstrap-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# wrapper bootstrap test\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed wrapper bootstrap repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            guidance = _build_wrapper_bootstrap_context(
+                str(repo),
+                [
+                    "/bin/bash -lc pwd",
+                    "/bin/bash -c pwd",
+                    "/bin/bash -lc ls",
+                    "/bin/bash -lc 'git branch --show-current'",
+                    "/bin/bash -lc 'cat README.md'",
+                    "/bin/bash -lc 'git diff --output=leak.txt'",
+                ],
+            )
+
+        self.assertIn("Direct command context bootstrap:", guidance)
+        self.assertIn("Direct command: `pwd`", guidance)
+        self.assertIn("Direct command: `ls`", guidance)
+        self.assertIn("Direct command: `git branch --show-current`", guidance)
+        self.assertIn("Direct command: `cat README.md`", guidance)
+        self.assertIn("README.md", guidance)
+        self.assertIn("# wrapper bootstrap test", guidance)
+        self.assertNotIn("git diff --output=leak.txt", guidance)
+
     def test_run_codex_task_escalates_wrapper_recovery_and_recovers(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-recovery-") as temp_dir:
             repo = Path(temp_dir) / "repo"
@@ -341,13 +392,16 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "",
                         "prompt = sys.stdin.read()",
                         "hard_marker = 'Your first command invocation on this retry must be one of the direct replacements listed below'",
-                        "if hard_marker in prompt:",
+                        "bootstrap_marker = 'Direct command context bootstrap:'",
+                        "pwd_marker = 'Direct command: `pwd`'",
+                        "branch_marker = 'Direct command: `git branch --show-current`'",
+                        "if hard_marker in prompt and bootstrap_marker in prompt and pwd_marker in prompt and branch_marker in prompt:",
                         "    if last_message_path:",
                         "        Path(last_message_path).write_text(",
-                        "            'Recovered by switching to direct commands after strict wrapper recovery.',",
+                        "            'Recovered by using backend-supplied direct command bootstrap after strict wrapper recovery.',",
                         "            encoding='utf-8',",
                         "        )",
-                        "    print('item.completed | Used direct commands after strict recovery guidance.', flush=True)",
+                        "    print('item.completed | Used backend bootstrap context after strict recovery guidance.', flush=True)",
                         "    sys.exit(0)",
                         "",
                         "for line in (",
@@ -380,6 +434,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertTrue(result.get("ok"), result)
         self.assertIn("Recovered after Codex attempts hit command-router shell-wrapper rejections.", str(result.get("stdout") or ""))
         self.assertIn("strict wrapper recovery", str(result.get("stdout") or "").lower())
+        self.assertIn("backend-supplied direct command bootstrap", str(result.get("stdout") or ""))
 
     def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:
         usage = _usage_from_trace_or_estimate({}, "abc" * 30, "done", model="gpt-5.4")

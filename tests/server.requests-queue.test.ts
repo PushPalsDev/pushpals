@@ -198,6 +198,24 @@ describe("server RequestQueue", () => {
     queue.close();
   });
 
+  test("rejects autonomy metadata that spans multiple component roots", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({
+      sessionId: "dev",
+      prompt: "autonomy background objective",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          targetPaths: ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+          writeGlobs: ["app/**", "scripts/**"],
+        },
+      },
+    });
+    expect(enqueued.ok).toBe(false);
+    expect(String(enqueued.message ?? "")).toContain("multiple component roots");
+    queue.close();
+  });
+
   test("counts autonomy requests by status", () => {
     const queue = new RequestQueue(":memory:");
 
