@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.64`
-- start_commit: `c8ad6017bbce79e1ba15cac84385827ad8f8a7e1`
-- end_commit: `7dd9406dd34c98c7d3e821ac349758f07708cd05`
+- version: `v1.0.65`
+- start_commit: `aeba3f47f05a727c7c0bf032ffd8579115cb43ef`
+- end_commit: `862e927fd6863b6d083c205c090bea9d40257d33`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve tracked `.codex` sentinel files during WorkerPals rebase-based branch sync by restoring them to `HEAD` and continuing publish retries instead of treating every tracked `.codex` path as a terminal publish blocker.
-- Keep the packaged sandbox runtime in sync with the source WorkerPals branch-finalization fix so released CLI builds handle tracked `.codex` PR branches the same way as source-tree tests.
-- Add regression coverage for the exact tracked-`.codex` retry path: a remote branch that introduces `.codex` plus a content conflict now completes sync successfully while preserving the tracked sentinel.
+- Fail true autonomy tasks honestly when their `targetPaths` span disjoint repo roots instead of deriving a fake single component root from the first path, while still allowing multi-root `review_fix` and `merge_conflict` tasks under the normal write-scope hygiene checks.
+- Recover repeated OpenAI Codex wrapper-shell inspection loops by injecting backend-run, read-only direct-command bootstrap context on the strict retry, so simple `pwd` / `git branch --show-current` / `ls` wrapper retries do not keep dying on command-router policy rejections.
+- Keep the packaged sandbox runtime in sync with both the autonomy-scope validation change and the stricter Codex wrapper recovery path, with regression coverage for disjoint-root validation and backend bootstrap-assisted recovery.
 
 ## Install
 
