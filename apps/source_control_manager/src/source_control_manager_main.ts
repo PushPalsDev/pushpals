@@ -6,7 +6,7 @@ import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 import { resolveGitTokenForRemote } from "../../../packages/shared/src/git_backend.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
-import { GitOps, runGitCommandCapture } from "./git";
+import { createSourceControlApi, runGitCommandCapture, type SourceControlApi } from "./git";
 import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
@@ -187,7 +187,7 @@ if (recovered > 0) {
 
 // ── Git Operations ─────────────────────────────────────────────────────────
 
-const gitOps = new GitOps(config);
+const gitOps: SourceControlApi = createSourceControlApi(config);
 
 // ── HTTP server ─────────────────────────────────────────────────────────────
 

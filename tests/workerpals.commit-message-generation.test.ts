@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
+  buildGitCommitArgs,
   buildWorkerCommitMessage,
   buildCommitMessageGeneratorUserMessage,
+  explicitWorkerCommitIdentityFromEnv,
   isNonFastForwardPushOutput,
   isPullRebaseDirtyWorkingTreeOutput,
   isRebaseConflictOutput,
@@ -11,7 +16,25 @@ import {
   redactSensitiveText,
   sanitizeGeneratedCommitMessage,
   shouldUseCodexCliForExecutor,
+  resolveWorkerCommitIdentity,
 } from "../apps/workerpals/src/execute_job";
+
+async function runGit(repo: string, args: string[]): Promise<string> {
+  const proc = Bun.spawn(["git", ...args], {
+    cwd: repo,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${stderr || stdout}`);
+  }
+  return stdout.trim();
+}
 
 describe("workerpals commit message generation helpers", () => {
   test("builds user prompt with background context, filtered test commands, and staged diff", () => {
@@ -231,5 +254,106 @@ describe("workerpals commit message generation helpers", () => {
     expect(shouldUseCodexCliForExecutor("openai_codex")).toBe(true);
     expect(shouldUseCodexCliForExecutor(" OPENAI_CODEX ")).toBe(true);
     expect(shouldUseCodexCliForExecutor("openhands")).toBe(false);
+  });
+
+  test("resolves commit identity from git config instead of GitHub user APIs", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-worker-identity-"));
+    const previousEnv = {
+      WORKERPALS_GIT_AUTHOR_NAME: process.env.WORKERPALS_GIT_AUTHOR_NAME,
+      WORKERPALS_GIT_AUTHOR_EMAIL: process.env.WORKERPALS_GIT_AUTHOR_EMAIL,
+      PUSHPALS_GIT_AUTHOR_NAME: process.env.PUSHPALS_GIT_AUTHOR_NAME,
+      PUSHPALS_GIT_AUTHOR_EMAIL: process.env.PUSHPALS_GIT_AUTHOR_EMAIL,
+      GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME,
+      GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL,
+    };
+    try {
+      delete process.env.WORKERPALS_GIT_AUTHOR_NAME;
+      delete process.env.WORKERPALS_GIT_AUTHOR_EMAIL;
+      delete process.env.PUSHPALS_GIT_AUTHOR_NAME;
+      delete process.env.PUSHPALS_GIT_AUTHOR_EMAIL;
+      delete process.env.GIT_AUTHOR_NAME;
+      delete process.env.GIT_AUTHOR_EMAIL;
+
+      await runGit(repo, ["init"]);
+      await runGit(repo, ["config", "user.name", "PiyushDatta"]);
+      await runGit(repo, ["config", "user.email", "piyushdattaca@gmail.com"]);
+
+      await expect(resolveWorkerCommitIdentity(repo)).resolves.toEqual({
+        name: "PiyushDatta",
+        email: "piyushdattaca@gmail.com",
+        source: "source-control-config",
+      });
+    } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("builds git commit args with resolved author identity", () => {
+    expect(
+      buildGitCommitArgs("feat(worker): test", {
+        name: "PiyushDatta",
+        email: "piyushdattaca@gmail.com",
+        source: "source-control-config",
+      }),
+    ).toEqual([
+      "-c",
+      "user.name=PiyushDatta",
+      "-c",
+      "user.email=piyushdattaca@gmail.com",
+      "commit",
+      "--author",
+      "PiyushDatta <piyushdattaca@gmail.com>",
+      "-m",
+      "feat(worker): test",
+    ]);
+  });
+
+  test("explicit commit author env sanitizes unsafe fields and can reuse fallback email", () => {
+    expect(
+      explicitWorkerCommitIdentityFromEnv(
+        {
+          PUSHPALS_GIT_AUTHOR_NAME: " PushPals <Bot>\n",
+        },
+        "bot@example.com",
+      ),
+    ).toEqual({
+      name: "PushPals Bot",
+      email: "bot@example.com",
+      source: "env",
+    });
+  });
+
+  test("git commit args set author and committer identity", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-worker-commit-author-"));
+    try {
+      await runGit(repo, ["init"]);
+      await runGit(repo, ["config", "user.name", "Host User"]);
+      await runGit(repo, ["config", "user.email", "host@example.com"]);
+      writeFileSync(join(repo, "README.md"), "hello\n", "utf8");
+      await runGit(repo, ["add", "README.md"]);
+      await runGit(
+        repo,
+        buildGitCommitArgs("feat(worker): author identity", {
+          name: "PiyushDatta",
+          email: "piyushdattaca@gmail.com",
+          source: "source-control-config",
+        }),
+      );
+
+      const identity = await runGit(repo, [
+        "log",
+        "-1",
+        "--format=%an <%ae>|%cn <%ce>",
+      ]);
+      expect(identity).toBe(
+        "PiyushDatta <piyushdattaca@gmail.com>|PiyushDatta <piyushdattaca@gmail.com>",
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

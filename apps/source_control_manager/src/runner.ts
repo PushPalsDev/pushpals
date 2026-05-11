@@ -1,6 +1,6 @@
 import type { MergeJob, MergeQueueDB } from "./db";
 import type { CheckConfig, SourceControlManagerConfig } from "./config";
-import { GitOps } from "./git";
+import { createSourceControlApi, type SourceControlApi } from "./git";
 
 /**
  * Result of processing a single merge job.
@@ -56,12 +56,12 @@ async function runCheck(
 // ─── Job runner ─────────────────────────────────────────────────────────────
 
 export class JobRunner {
-  private gitOps: GitOps;
+  private gitOps: SourceControlApi;
   private config: SourceControlManagerConfig;
 
   constructor(config: SourceControlManagerConfig) {
     this.config = config;
-    this.gitOps = new GitOps(config);
+    this.gitOps = createSourceControlApi(config);
   }
 
   /**

@@ -44,6 +44,17 @@ export {
   type ResolveGitTokenOptions,
 } from "./git_backend.js";
 export {
+  assertSupportedSourceControlProvider,
+  buildGitCommitArgs,
+  explicitSourceControlCommitIdentityFromEnv,
+  normalizeSourceControlProvider,
+  resolveSourceControlProvider,
+  sanitizeSourceControlIdentityField,
+  type SourceControlCommitIdentity,
+  type SourceControlCommitIdentitySource,
+  type SourceControlProvider,
+} from "./source_control_api.js";
+export {
   DEFAULT_WORKERPALS_EXECUTOR,
   invalidatePushPalsConfigCache,
   loadPushPalsConfig,

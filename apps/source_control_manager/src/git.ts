@@ -1,4 +1,12 @@
 import { resolve, win32 as pathWin32 } from "path";
+import {
+  assertSupportedSourceControlProvider,
+  explicitSourceControlCommitIdentityFromEnv,
+  resolveSourceControlProvider,
+  sanitizeSourceControlIdentityField,
+  type SourceControlCommitIdentity,
+  type SourceControlProvider,
+} from "shared";
 import type { SourceControlManagerConfig } from "./config";
 
 /**
@@ -24,6 +32,36 @@ export interface TempBranchCleanupSummary {
   removedWorktrees: string[];
   failedBranches: string[];
   warnings: string[];
+}
+
+export interface SourceControlApi {
+  readonly provider: SourceControlProvider;
+  readonly repoPath: string;
+
+  getCommitIdentity(): Promise<SourceControlCommitIdentity | null>;
+  fetchPrune(): Promise<void>;
+  bootstrapMainBranchFromBase(): Promise<void>;
+  discoverAgentBranches(): Promise<DiscoveredBranch[]>;
+  getMainHeadSha(): Promise<string>;
+  checkoutMain(): Promise<void>;
+  pullMainFF(): Promise<void>;
+  syncMainWithBaseBranch(): Promise<void>;
+  createTempBranch(name: string): Promise<void>;
+  mergeNoFF(agentBranch: string, message: string): Promise<GitResult>;
+  mergeFFOnly(agentBranch: string): Promise<GitResult>;
+  mergeFFOnlyRef(ref: string): Promise<GitResult>;
+  cherryPickRef(ref: string): Promise<GitResult>;
+  pushMain(): Promise<GitResult>;
+  deleteTempBranch(name: string): Promise<void>;
+  cleanupLocalTempBranches(prefix?: string): Promise<TempBranchCleanupSummary>;
+  deleteRemoteBranch(branch: string): Promise<void>;
+  deleteLocalRef(ref: string): Promise<void>;
+  resetToClean(): Promise<void>;
+  isRepoClean(): Promise<boolean>;
+  revParse(ref: string): Promise<string | null>;
+  isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+  shortLog(from: string, to: string): Promise<string>;
+  isMerged(branch: string): Promise<boolean>;
 }
 
 type GitWorktreeEntry = {
@@ -392,10 +430,20 @@ function sanitizeBranchComponent(value: string): string {
   return cleaned || "integration";
 }
 
-// ─── Git Operations ─────────────────────────────────────────────────────────
+// ─── Source Control API ─────────────────────────────────────────────────────
 
-export class GitOps {
-  private repoPath: string;
+export function createSourceControlApi(
+  config: SourceControlManagerConfig,
+  options: { provider?: unknown } = {},
+): SourceControlApi {
+  const provider = resolveSourceControlProvider(options.provider);
+  assertSupportedSourceControlProvider(provider);
+  return new GitSourceControlApi(config);
+}
+
+export class GitSourceControlApi implements SourceControlApi {
+  readonly provider = "git" as const;
+  readonly repoPath: string;
   private remote: string;
   private mainBranch: string;
   private localMainRef: string;
@@ -411,6 +459,23 @@ export class GitOps {
     this.integrationBaseBranch = config.integrationBaseBranch;
     this.branchPrefix = config.branchPrefix;
     this.githubToken = config.gitToken ?? null;
+  }
+
+  private async gitConfigValue(key: string): Promise<string> {
+    const result = await git(this.repoPath, ["config", "--get", key]);
+    return result.ok ? sanitizeSourceControlIdentityField(result.stdout) : "";
+  }
+
+  async getCommitIdentity(): Promise<SourceControlCommitIdentity | null> {
+    const fallbackEmail = await this.gitConfigValue("user.email");
+    const explicit = explicitSourceControlCommitIdentityFromEnv(process.env, fallbackEmail);
+    if (explicit) return explicit;
+
+    const name = await this.gitConfigValue("user.name");
+    if (name && fallbackEmail) {
+      return { name, email: fallbackEmail, source: "source-control-config" };
+    }
+    return null;
   }
 
   private remoteMainRef(): string {
@@ -877,3 +942,9 @@ export class GitOps {
     return this.isAncestor(branchTip, mainTip);
   }
 }
+
+/**
+ * Backward-compatible name while call sites migrate from Git-specific naming
+ * to the source-control API abstraction.
+ */
+export class GitOps extends GitSourceControlApi {}

@@ -7,13 +7,17 @@ import { existsSync, readFileSync, rmSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import {
   deriveAutonomyComponentArea,
+  buildGitCommitArgs as buildSourceControlGitCommitArgs,
+  explicitSourceControlCommitIdentityFromEnv,
   loadPromptTemplate,
   loadPushPalsConfig,
   matchesGlob,
   normalizeAutonomyComponentArea,
   normalizeTargetPath,
+  sanitizeSourceControlIdentityField,
   validateScopeInvariants,
   type AutonomyComponentArea,
+  type SourceControlCommitIdentity,
 } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { JobPublishBlockedInfo, JobResult } from "./common/types.js";
@@ -1432,6 +1436,35 @@ export async function git(
 // ─── Git commit creation ─────────────────────────────────────────────────────
 
 /** Create commit for job result and return commit info */
+export type WorkerGitCommitIdentity = SourceControlCommitIdentity;
+
+export const explicitWorkerCommitIdentityFromEnv = explicitSourceControlCommitIdentityFromEnv;
+
+async function resolveGitConfigValue(repo: string, key: string): Promise<string> {
+  const value = await git(repo, ["config", "--get", key]);
+  return value.ok ? sanitizeSourceControlIdentityField(value.stdout) : "";
+}
+
+export async function resolveWorkerCommitIdentity(
+  repo: string,
+  _runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
+): Promise<WorkerGitCommitIdentity | null> {
+  const fallbackEmail = await resolveGitConfigValue(repo, "user.email");
+  const explicit = explicitWorkerCommitIdentityFromEnv(process.env, fallbackEmail);
+  if (explicit) return explicit;
+
+  const name = await resolveGitConfigValue(repo, "user.name");
+  if (name && fallbackEmail) return { name, email: fallbackEmail, source: "source-control-config" };
+  return null;
+}
+
+export function buildGitCommitArgs(
+  commitMsg: string,
+  identity: WorkerGitCommitIdentity | null,
+): string[] {
+  return buildSourceControlGitCommitArgs(commitMsg, identity);
+}
+
 export interface CreateJobCommitResult {
   ok: boolean;
   branch?: string;
@@ -1574,8 +1607,10 @@ export async function createJobCommit(
     }
     const commitMsg = llmCommitMsg ?? buildWorkerCommitMessage(workerId, job, changedPaths);
 
-    // Commit changes
-    result = await git(repo, ["commit", "-m", commitMsg]);
+    // Commit changes with a PushPals-resolved author so generated commits use
+    // source-control identity instead of falling through to the host account.
+    const commitIdentity = await resolveWorkerCommitIdentity(repo, runtimeConfig);
+    result = await git(repo, buildGitCommitArgs(commitMsg, commitIdentity));
     if (!result.ok) {
       return { ok: false, error: `Failed to commit: ${result.stderr}` };
     }
@@ -2484,7 +2519,8 @@ async function createMergeConflictJobCommit(
       );
     }
     const commitMsg = llmCommitMsg ?? buildWorkerCommitMessage(workerId, job, changedPaths);
-    const commit = await git(repo, ["commit", "-m", commitMsg]);
+    const commitIdentity = await resolveWorkerCommitIdentity(repo, runtimeConfig);
+    const commit = await git(repo, buildGitCommitArgs(commitMsg, commitIdentity));
     if (!commit.ok) {
       return { ok: false, error: `Failed to commit merge-conflict resolution: ${commit.stderr}` };
     }
