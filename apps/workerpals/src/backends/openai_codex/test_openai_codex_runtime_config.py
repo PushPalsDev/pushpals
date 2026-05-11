@@ -34,6 +34,7 @@ from openai_codex_executor import (
     _extract_usage_counts,
     _load_prompt_template,
     _repo_root_for_prompt_loading,
+    _resolve_codex_command_prefix,
     _unwrap_shell_wrapper_command,
     _usage_from_trace_or_estimate,
 )
@@ -79,14 +80,52 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.reasoning_effort, "high")
         self.assertFalse(cfg.json_output)
 
-    def test_reasoning_effort_caps_extra_high_for_gpt_5_4(self) -> None:
+    def test_resolve_codex_command_prefix_resolves_configured_executable(self) -> None:
+        cfg = OpenAICodexRuntimeConfig.from_sources(
+            SettingsResolver(
+                env={"PUSHPALS_OPENAI_CODEX_BIN": "bun x --yes @openai/codex"},
+                config_loader=lambda: {},
+            ),
+        )
+        with mock.patch(
+            "openai_codex_executor.shutil_which",
+            side_effect=lambda binary: {"bun": r"C:\Tools\bun.CMD"}.get(binary, ""),
+        ):
+            self.assertEqual(
+                _resolve_codex_command_prefix(cfg),
+                [r"C:\Tools\bun.CMD", "x", "--yes", "@openai/codex"],
+            )
+
+    def test_resolve_codex_command_prefix_resolves_fallback_executable(self) -> None:
+        cfg = OpenAICodexRuntimeConfig.from_sources(
+            SettingsResolver(env={}, config_loader=lambda: {}),
+        )
+        with mock.patch(
+            "openai_codex_executor.shutil_which",
+            side_effect=lambda binary: {"bunx": "/usr/local/bin/bunx" }.get(binary, ""),
+        ):
+            self.assertEqual(
+                _resolve_codex_command_prefix(cfg),
+                ["/usr/local/bin/bunx", "--yes", "@openai/codex"],
+            )
+
+    def test_reasoning_effort_caps_extra_high_for_legacy_gpt_5_4(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(
             SettingsResolver(
                 env={"WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": "extra high"},
                 config_loader=lambda: {},
             ),
         )
-        self.assertEqual(_resolve_reasoning_effort(cfg), "high")
+        self.assertEqual(_resolve_reasoning_effort(cfg, model="gpt-5.4"), "high")
+
+    def test_reasoning_effort_preserves_extra_high_for_default_gpt_5_5(self) -> None:
+        cfg = OpenAICodexRuntimeConfig.from_sources(
+            SettingsResolver(
+                env={"WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": "extra high"},
+                config_loader=lambda: {},
+            ),
+        )
+        self.assertEqual(_resolve_reasoning_effort(cfg), "xhigh")
 
     def test_reasoning_effort_preserves_extra_high_for_future_models(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(
@@ -435,6 +474,88 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Recovered after Codex attempts hit command-router shell-wrapper rejections.", str(result.get("stdout") or ""))
         self.assertIn("strict wrapper recovery", str(result.get("stdout") or "").lower())
         self.assertIn("backend-supplied direct command bootstrap", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_recovers_when_default_model_requires_newer_codex(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-model-compat-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# model compatibility test\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed model compatibility repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_model_compat.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "model = ''",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '-m' and index + 1 < len(argv):",
+                        "        model = argv[index + 1]",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "",
+                        "if model == 'gpt-5.5':",
+                        "    print(\"ERROR: {'detail': \\\"The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\\\"}\", file=sys.stderr)",
+                        "    sys.exit(1)",
+                        "",
+                        "if model == 'gpt-5.4':",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Recovered on legacy model fallback.', encoding='utf-8')",
+                        "    print('item.completed | Used legacy model fallback.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "print(f'unexpected model {model}', file=sys.stderr)",
+                        "sys.exit(2)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-model-compat-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "10",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Use the configured Codex model.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        stdout = str(result.get("stdout") or "")
+        self.assertIn("rejected default model gpt-5.5", stdout.lower())
+        self.assertIn("gpt-5.4", stdout)
+        self.assertIn("Recovered on legacy model fallback.", stdout)
 
     def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:
         usage = _usage_from_trace_or_estimate({}, "abc" * 30, "done", model="gpt-5.4")

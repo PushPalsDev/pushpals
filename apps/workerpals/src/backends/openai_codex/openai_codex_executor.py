@@ -43,7 +43,8 @@ from executor_base import (
 )
 
 LOG_PREFIX = "[OpenAICodexExecutor]"
-DEFAULT_CODEX_MODEL = "gpt-5.4"
+DEFAULT_CODEX_MODEL = "gpt-5.5"
+LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.4"
 _ACTIVE_CHILD: Optional[subprocess.Popen[str]] = None
 _INTERRUPTED_SIGNAL: Optional[int] = None
 log = Logger(LOG_PREFIX)
@@ -76,6 +77,10 @@ _CODEX_WORKAROUND_NEGATION_HINTS = (
     "codex cli is required infrastructure",
 )
 _REJECTED_EXEC_COMMAND_PATTERN = re.compile(r"exec_command failed for `([^`]+)`", re.IGNORECASE)
+_MODEL_REQUIRES_NEWER_CODEX_PATTERN = re.compile(
+    r"model requires a newer version of codex|requires a newer version of codex|upgrade to the latest app or cli",
+    re.IGNORECASE,
+)
 _DISALLOWED_SHELL_WRAPPER_PREFIXES = (
     "/bin/bash -lc ",
     "/bin/bash -c ",
@@ -208,6 +213,19 @@ class OpenAICodexRuntimeConfig:
 
 def shutil_which(binary: str) -> str:
     return which(binary) or ""
+
+
+def _resolve_command_executable(binary: str) -> str:
+    value = str(binary or "").strip()
+    if not value or os.path.dirname(value) or os.path.isabs(value):
+        return value
+    return shutil_which(value) or value
+
+
+def _normalize_command_prefix(parts: List[str]) -> List[str]:
+    if not parts:
+        return []
+    return [_resolve_command_executable(parts[0]), *parts[1:]]
 
 
 def _truncate(text: str, max_chars: int = 4000) -> str:
@@ -376,7 +394,7 @@ def _resolve_codex_command_prefix(config: OpenAICodexRuntimeConfig) -> List[str]
             if isinstance(parsed, list):
                 parts = [str(p).strip() for p in parsed if str(p).strip()]
                 if parts:
-                    return parts
+                    return _normalize_command_prefix(parts)
         except Exception:
             log.info(
                 "Invalid PUSHPALS_OPENAI_CODEX_BIN_JSON; expected JSON array of command segments."
@@ -391,13 +409,15 @@ def _resolve_codex_command_prefix(config: OpenAICodexRuntimeConfig) -> List[str]
                 "Invalid PUSHPALS_OPENAI_CODEX_BIN value; expected a command string parseable by shlex."
             )
             return []
-        return parts
+        return _normalize_command_prefix(parts)
 
     # Prefer bunx to avoid requiring a separate node runtime in the container.
-    if shutil_which("bunx"):
-        return ["bunx", "--yes", "@openai/codex"]
-    if shutil_which("codex"):
-        return ["codex"]
+    bunx = shutil_which("bunx")
+    if bunx:
+        return [bunx, "--yes", "@openai/codex"]
+    codex = shutil_which("codex")
+    if codex:
+        return [codex]
     return []
 
 
@@ -964,6 +984,10 @@ def _safe_model_for_codex(raw_model: str, base_url: str) -> str:
     return DEFAULT_CODEX_MODEL
 
 
+def _requires_newer_codex_for_model(*texts: str) -> bool:
+    return any(_MODEL_REQUIRES_NEWER_CODEX_PATTERN.search(str(text or "")) for text in texts)
+
+
 def _build_instruction(instruction: str, supplemental_guidance: List[str]) -> str:
     system_prompt = (_load_prompt_template(_TASK_SYSTEM_PROMPT_PATH) or "").strip()
     if not system_prompt:
@@ -1343,6 +1367,8 @@ def _run_codex_task(
     supplemental_guidance: List[str],
     *,
     wrapper_recovery_attempt: int = 0,
+    model_compatibility_recovery_attempt: int = 0,
+    model_override: Optional[str] = None,
     baseline_changes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     global _ACTIVE_CHILD, _INTERRUPTED_SIGNAL
@@ -1377,7 +1403,12 @@ def _run_codex_task(
     configured_model, api_key, base_url = resolve_llm_config(DEFAULT_CODEX_MODEL, logger=log)
     auth_mode_raw = runtime_config.auth_mode
     auth_mode_configured = _normalize_auth_mode(auth_mode_raw)
-    model = _safe_model_for_codex(configured_model, base_url)
+    model = str(model_override or "").strip() or _safe_model_for_codex(configured_model, base_url)
+    if model_override:
+        log.info(
+            f"Using Codex model compatibility override {model!r} instead of configured/default "
+            f"model {configured_model!r}."
+        )
     approval = _normalize_choice(
         runtime_config.approval_policy,
         _VALID_APPROVAL_POLICIES,
@@ -1743,6 +1774,8 @@ def _run_codex_task(
                             recovery_guidance,
                         ],
                         wrapper_recovery_attempt=wrapper_recovery_attempt + 1,
+                        model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
+                        model_override=model_override,
                         baseline_changes=baseline_snapshot,
                     )
                     retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
@@ -1808,6 +1841,36 @@ def _run_codex_task(
         exit_code = int(return_code)
 
         if exit_code != 0:
+            if (
+                model_compatibility_recovery_attempt < 1
+                and model.strip().lower() == DEFAULT_CODEX_MODEL.lower()
+                and LEGACY_CODEX_MODEL_FALLBACK.strip().lower() != DEFAULT_CODEX_MODEL.lower()
+                and _requires_newer_codex_for_model(stdout, stderr)
+            ):
+                log.warning(
+                    f"Codex CLI rejected default model {DEFAULT_CODEX_MODEL}; retrying once with "
+                    f"{LEGACY_CODEX_MODEL_FALLBACK}. Upgrade Codex CLI to use {DEFAULT_CODEX_MODEL}."
+                )
+                retry_result = _run_codex_task(
+                    repo,
+                    instruction,
+                    effective_supplemental_guidance,
+                    wrapper_recovery_attempt=wrapper_recovery_attempt,
+                    model_compatibility_recovery_attempt=model_compatibility_recovery_attempt + 1,
+                    model_override=LEGACY_CODEX_MODEL_FALLBACK,
+                    baseline_changes=baseline_snapshot,
+                )
+                retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
+                if retry_result.get("ok"):
+                    recovered_stdout = str(retry_result.get("stdout") or "").strip()
+                    retry_result["stdout"] = _truncate(
+                        (
+                            f"Codex CLI rejected default model {DEFAULT_CODEX_MODEL} because it "
+                            "requires a newer Codex version; recovered by retrying with "
+                            f"{LEGACY_CODEX_MODEL_FALLBACK}.\n\n{recovered_stdout}"
+                        ).strip()
+                    )
+                return retry_result
             detail = stderr.strip() or stdout.strip() or "codex exec exited with a non-zero status"
             if last_message:
                 detail = f"{detail}\nLast assistant message:\n{last_message}"

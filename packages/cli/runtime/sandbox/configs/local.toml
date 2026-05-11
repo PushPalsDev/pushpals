@@ -8,7 +8,7 @@
 
 [localbuddy.llm]
 backend = "openai_codex"
-model = "gpt-5.4"
+model = "gpt-5.5"
 codex_auth_mode = "chatgpt"
 codex_bin = "bun x --yes @openai/codex"
 codex_timeout_ms = 120000
@@ -16,7 +16,7 @@ reasoning_effort = "high"
 
 [remotebuddy.llm]
 backend = "openai_codex"
-model = "gpt-5.4"
+model = "gpt-5.5"
 codex_auth_mode = "chatgpt"
 codex_bin = "bun x --yes @openai/codex"
 codex_timeout_ms = 120000
@@ -43,7 +43,7 @@ retention_days = 30
 
 [workerpals.llm]
 backend = "openai_codex"
-model = "gpt-5.4"
+model = "gpt-5.5"
 codex_auth_mode = "chatgpt"
 codex_bin = "bun x --yes @openai/codex"
 codex_timeout_ms = 120000
