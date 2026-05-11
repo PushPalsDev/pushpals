@@ -1,18 +1,19 @@
-﻿# PushPals CLI Release Log
+# PushPals CLI Release Log
 
 ## Release Metadata
 
-- version: `v1.0.67`
-- start_commit: `905aed55f14782f9ac73dde447f3e9a5e51ae139`
-- end_commit: `ce1e9d28c0739949717c67c93e3f177816c63b6a`
+- version: `v1.0.68`
+- start_commit: `1998f4064b01d61bfa5cbacf1e9fb63f6581b40b`
+- end_commit: `089ce6dd6aeaf7daec50e4bf065f8d5253a0e72f`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Default the OpenAI Codex WorkerPal backend and shipped CLI/runtime configs to `gpt-5.5`.
-- Keep older Codex CLI installs from hard-failing by retrying once on `gpt-5.4` only when Codex reports that `gpt-5.5` requires a newer CLI.
-- Fix Windows Codex command launching by resolving configured `bun`/`bunx` command prefixes to executable paths before Python subprocess execution.
-- Add source and packaged runtime regression coverage for `gpt-5.5` reasoning behavior, model-compatibility fallback, and Windows command-prefix resolution.
+- Add a `SourceControlApi` abstraction with a Git-backed implementation and provider normalization for future Sapling/Mercurial support.
+- Route SourceControlManager merge operations through the source-control API factory while preserving `GitOps` compatibility for existing callers.
+- Resolve WorkerPal commit author/committer identity from explicit PushPals/Git env values or `git config user.name` / `user.email`, instead of GitHub user APIs.
+- Set both author and committer identity on WorkerPal commits so commits can attribute to the configured user email and count toward GitHub contribution graphs when that email is linked to the account.
+- Add regression coverage for provider selection, unsupported provider rejection, Git config identity lookup, and WorkerPal commit identity behavior.
 
 ## Install
 
@@ -38,6 +39,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- Codex may still emit non-fatal local state/plugin sync warnings on Windows, including local state DB migration warnings and plugin sync certificate/403 warnings; WorkerPal execution continues when Codex itself succeeds.
+- Sapling and Mercurial provider names are recognized for planning/configuration, but runtime operations still intentionally support Git only.
+- GitHub contribution credit requires the configured commit email to be associated with the target GitHub account.
 - Native WSL source-tree `cli:bundle` runs can still hang in the Expo monitor export path when building from a Windows-mounted checkout under `/mnt/c/...`; the published CLI package cold-start path is covered separately.
-- Per-app `tsc --noEmit` still trips over the existing unrelated shared-config typing issue in `packages/shared/src/config.ts`; release validation for this change used focused WorkerPal backend tests and live Codex smoke coverage.
+- Per-app `tsc --noEmit` still trips over existing unrelated shared-config typing issues; release validation for this change used focused SourceControlManager and WorkerPal tests.
