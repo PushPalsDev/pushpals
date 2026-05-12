@@ -19,6 +19,7 @@ export interface CompletionRow {
   id: string;
   jobId: string;
   sessionId: string;
+  origin: "user" | "autonomy";
   commitSha: string | null;
   branch: string | null;
   message: string;
@@ -47,6 +48,7 @@ export class CompletionQueue {
         id         TEXT PRIMARY KEY,
         jobId      TEXT NOT NULL,
         sessionId  TEXT NOT NULL,
+        origin     TEXT NOT NULL DEFAULT 'user',
         commitSha  TEXT,
         branch     TEXT,
         message    TEXT NOT NULL,
@@ -76,6 +78,9 @@ export class CompletionQueue {
     if (!columns.some((col) => col.name === "prUrl")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN prUrl TEXT;`);
     }
+    if (!columns.some((col) => col.name === "origin")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN origin TEXT NOT NULL DEFAULT 'user';`);
+    }
   }
 
   /**
@@ -87,6 +92,7 @@ export class CompletionQueue {
     const commitSha = body.commitSha as string | undefined;
     const branch = body.branch as string | undefined;
     const message = body.message as string;
+    const origin = body.origin === "autonomy" ? "autonomy" : "user";
     const prUrl =
       typeof body.prUrl === "string" && body.prUrl.trim().length > 0 ? body.prUrl.trim() : null;
     const prTitle =
@@ -105,13 +111,14 @@ export class CompletionQueue {
 
     this.db
       .prepare(
-        `INSERT INTO completions (id, jobId, sessionId, commitSha, branch, message, prUrl, prTitle, prBody, status, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        `INSERT INTO completions (id, jobId, sessionId, origin, commitSha, branch, message, prUrl, prTitle, prBody, status, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       )
       .run(
         completionId,
         jobId,
         sessionId,
+        origin,
         commitSha ?? null,
         branch ?? null,
         message,

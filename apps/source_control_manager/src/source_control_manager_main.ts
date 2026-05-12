@@ -459,8 +459,9 @@ async function emitPusherMessage(
   comm: CommunicationManager,
   text: string,
   correlationId: string,
+  meta: Parameters<CommunicationManager["assistantMessage"]>[1] = {},
 ): Promise<void> {
-  const ok = await comm.assistantMessage(text, { correlationId });
+  const ok = await comm.assistantMessage(text, { ...meta, correlationId });
   if (!ok) {
     console.error(`[${ts()}] Failed to emit source_control_manager message: ${text}`);
   }
@@ -497,6 +498,7 @@ async function tick(): Promise<void> {
         id: string;
         jobId: string;
         sessionId: string;
+        origin?: "user" | "autonomy";
         commitSha: string;
         branch: string;
         message: string;
@@ -517,6 +519,10 @@ async function tick(): Promise<void> {
 
     const completion = data.completion;
     const comm = createSessionComm(completion.sessionId);
+    const completionEventMeta =
+      completion.origin === "autonomy"
+        ? { from: "agent:source_control_manager/autonomy" }
+        : undefined;
     const cleanupHiddenCompletionRef = completion.branch.startsWith("refs/pushpals/");
     console.log(
       `[${ts()}] Claimed completion ${completion.id}: ${completion.branch} (${completion.commitSha.slice(0, 8)})`,
@@ -530,6 +536,7 @@ async function tick(): Promise<void> {
       comm,
       `SourceControlManager claimed WorkerPal completion ${completion.id.slice(0, 8)} from ${completion.branch}.`,
       completion.id,
+      completionEventMeta,
     );
 
     if (dryRun) {
@@ -538,6 +545,7 @@ async function tick(): Promise<void> {
         comm,
         `SourceControlManager is in dry-run mode, so completion ${completion.id.slice(0, 8)} was not applied.`,
         completion.id,
+        completionEventMeta,
       );
       return;
     }
@@ -597,6 +605,7 @@ async function tick(): Promise<void> {
             comm,
             `ReviewAgent mode: local apply conflicted (${completion.commitSha.slice(0, 8)}), so SourceControlManager continued with branch-based PR flow. Detail: ${applyDetail}`,
             completion.id,
+            completionEventMeta,
           );
           await gitOps.resetToClean();
         } else {
@@ -744,7 +753,7 @@ async function tick(): Promise<void> {
           : `Reused existing PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`;
         processedPrUrl = pr.htmlUrl;
         console.log(`[${ts()}] ${prMessage}`);
-        await emitPusherMessage(comm, prMessage, completion.id);
+        await emitPusherMessage(comm, prMessage, completion.id, completionEventMeta);
       } else {
         // Normal mode: merge temp branch into main_agents, push, open aggregated PR.
         console.log(`[${ts()}] Merging ${tempBranch} to ${runtimeConfig.mainBranch}...`);
@@ -771,11 +780,11 @@ async function tick(): Promise<void> {
                 : `Reused existing PR #${pr.number}: ${pr.htmlUrl}`;
               processedPrUrl = pr.htmlUrl;
               console.log(`[${ts()}] ${prMessage}`);
-              await emitPusherMessage(comm, prMessage, completion.id);
+              await emitPusherMessage(comm, prMessage, completion.id, completionEventMeta);
             } catch (prErr: any) {
               const warning = `Push succeeded, but PR auto-open failed: ${prErr?.message ?? prErr}`;
               console.error(`[${ts()}] ${warning}`);
-              await emitPusherMessage(comm, warning, completion.id);
+              await emitPusherMessage(comm, warning, completion.id, completionEventMeta);
             }
           }
         } else {
@@ -807,7 +816,7 @@ async function tick(): Promise<void> {
           : config.pushMainAfterMerge
             ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.`
             : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
-        await emitPusherMessage(comm, pushMessage, completion.id);
+        await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err: any) {
       console.error(`[${ts()}] Failed to process completion ${completion.id}: ${err.message}`);
@@ -826,6 +835,7 @@ async function tick(): Promise<void> {
         comm,
         `Failed to apply completion ${completion.id.slice(0, 8)} from ${completion.branch}: ${err.message}`,
         completion.id,
+        completionEventMeta,
       );
     } finally {
       try {

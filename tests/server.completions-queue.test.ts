@@ -17,6 +17,7 @@ describe("server CompletionQueue PR URL persistence", () => {
     const claimed = queue.claim("scm-1");
     expect(claimed.ok).toBe(true);
     expect(claimed.completion?.prUrl).toBe("https://github.com/org/repo/pull/12");
+    expect(claimed.completion?.origin).toBe("user");
 
     queue.close();
   });
@@ -43,6 +44,25 @@ describe("server CompletionQueue PR URL persistence", () => {
     const saved = queue.getCompletion(completionId);
     expect(saved?.status).toBe("processed");
     expect(saved?.prUrl).toBe("https://github.com/org/repo/pull/34");
+
+    queue.close();
+  });
+
+  test("stores autonomy origin for SourceControlManager event filtering", () => {
+    const queue = new CompletionQueue(":memory:");
+    const enqueued = queue.enqueue({
+      jobId: "job-3",
+      sessionId: "dev",
+      origin: "autonomy",
+      commitSha: "abc789",
+      branch: "refs/pushpals/agent/worker/job",
+      message: "done",
+    });
+    expect(enqueued.ok).toBe(true);
+
+    const claimed = queue.claim("scm-3");
+    expect(claimed.ok).toBe(true);
+    expect(claimed.completion?.origin).toBe("autonomy");
 
     queue.close();
   });

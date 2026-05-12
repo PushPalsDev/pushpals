@@ -288,6 +288,17 @@ function asObject(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+function sessionEventOrigin(payload: unknown): "user" | "autonomy" {
+  const record = asObject(payload);
+  if (!record) return "user";
+  if (record.origin === "autonomy") return "autonomy";
+  if (asObject(record.autonomy)) return "autonomy";
+  if (asObject(record.params) && sessionEventOrigin(record.params) === "autonomy") {
+    return "autonomy";
+  }
+  return "user";
+}
+
 function normalizeMetadataTargetPaths(value: unknown, maxItems = 48): string[] {
   if (!Array.isArray(value)) return [];
   const out: string[] = [];
@@ -780,6 +791,7 @@ export class RemoteBuddyOrchestrator {
   private readonly fatalSessionMonitors = new Set<string>();
   private readonly seenJobFailures = new Set<string>();
   private readonly seenJobCompletions = new Set<string>();
+  private readonly jobOriginById = new Map<string, "user" | "autonomy">();
   private readonly seenAutonomyFeedbackEvents = new Set<string>();
   private readonly seenQuestionEvents = new Set<string>();
   private readonly eventMonitorStartedAt = Date.now();
@@ -965,7 +977,7 @@ export class RemoteBuddyOrchestrator {
       this.statusSessionReady = false;
       if (Date.now() >= startupDeadlineMs) break;
       await Bun.sleep(1_000);
-      this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2_500);
+      this.statusSessionReady = await this.ensureSessionWithRetry(undefined, 3, 400, 2_500);
     }
     if (!startupStatusOk) {
       console.warn("[RemoteBuddy] Failed to emit startup status event");
@@ -978,7 +990,7 @@ export class RemoteBuddyOrchestrator {
       if (this.disposed) return;
       void (async () => {
         if (!this.statusSessionReady) {
-          this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2500);
+          this.statusSessionReady = await this.ensureSessionWithRetry(undefined, 3, 400, 2500);
         }
         const ok = await this.comm.status(this.agentId, "idle", "RemoteBuddy heartbeat");
         if (!ok) {
@@ -1026,6 +1038,7 @@ export class RemoteBuddyOrchestrator {
       correlationId?: string;
       turnId?: string;
       parentId?: string;
+      from?: string;
     } = {},
   ): Promise<void> {
     try {
@@ -1044,9 +1057,10 @@ export class RemoteBuddyOrchestrator {
   }
 
   /** Send a command event through the server */
-  private async sendCommand(sessionId: string, cmd: Omit<CommandRequest, "from">): Promise<void> {
+  private async sendCommand(sessionId: string, cmd: CommandRequest): Promise<void> {
     try {
       const ok = await this.comm.emitToSession(sessionId, cmd.type, cmd.payload as any, {
+        from: cmd.from,
         to: cmd.to,
         correlationId: cmd.correlationId,
         turnId: cmd.turnId,
@@ -1311,6 +1325,7 @@ export class RemoteBuddyOrchestrator {
     if (
       envelope.type !== "job_failed" &&
       envelope.type !== "job_completed" &&
+      envelope.type !== "job_enqueued" &&
       envelope.type !== "autonomy_feedback_recorded" &&
       envelope.type !== "question_asked" &&
       envelope.type !== "question_answered"
@@ -1320,6 +1335,13 @@ export class RemoteBuddyOrchestrator {
     const tsMs = Date.parse(String(envelope.ts ?? ""));
     if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt) return;
     const eventSessionId = String(envelope.sessionId ?? "").trim() || this.sessionId;
+
+    if (envelope.type === "job_enqueued") {
+      const payload = envelope.payload as { jobId?: unknown };
+      const jobId = String(payload.jobId ?? "").trim();
+      if (jobId) this.jobOriginById.set(jobId, sessionEventOrigin(payload));
+      return;
+    }
 
     if (envelope.type === "question_asked") {
       if (!this.markQuestionEventSeen(String(envelope.id ?? ""))) return;
@@ -1399,11 +1421,16 @@ export class RemoteBuddyOrchestrator {
         jobId?: unknown;
         message?: unknown;
         detail?: unknown;
+        origin?: unknown;
       };
       const jobId = String(payload.jobId ?? "").trim();
       const message = toSingleLine(payload.message, 220);
       const detail = toSingleLine(payload.detail, 220);
       if (!jobId || !message) return;
+      const origin =
+        sessionEventOrigin(payload) === "autonomy" || this.jobOriginById.get(jobId) === "autonomy"
+          ? "autonomy"
+          : "user";
 
       const dedupeKey = `${jobId}:${message}`;
       if (this.seenJobFailures.has(dedupeKey)) return;
@@ -1418,6 +1445,7 @@ export class RemoteBuddyOrchestrator {
         eventSessionId,
       );
       console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId}: ${message}`);
+      if (origin === "autonomy") return;
       void this.handleObservedJobFailure(eventSessionId, envelope, jobId, message, detail);
       return;
     }
@@ -1425,10 +1453,15 @@ export class RemoteBuddyOrchestrator {
     const payload = envelope.payload as {
       jobId?: unknown;
       summary?: unknown;
+      origin?: unknown;
     };
     const jobId = String(payload.jobId ?? "").trim();
     const summary = toSingleLine(payload.summary, 240) || "Job completed";
     if (!jobId) return;
+    const origin =
+      sessionEventOrigin(payload) === "autonomy" || this.jobOriginById.get(jobId) === "autonomy"
+        ? "autonomy"
+        : "user";
     if (/startup warmup completed/i.test(summary)) return;
     if (this.seenJobCompletions.has(jobId)) return;
     this.seenJobCompletions.add(jobId);
@@ -1440,6 +1473,7 @@ export class RemoteBuddyOrchestrator {
       null,
       eventSessionId,
     );
+    if (origin === "autonomy") return;
     const shortJob = jobId.slice(0, 8);
     const clarificationQuestion = extractClarificationFromCompletionSummary(summary);
     const note = clarificationQuestion
@@ -2294,6 +2328,7 @@ export class RemoteBuddyOrchestrator {
             : 90_000,
     );
     const turnId = randomUUID();
+    const eventFrom = autonomyMetadata ? `agent:${this.agentId}/autonomy` : undefined;
     const planningContext = this.buildPlanningContext(priority, requestSessionId);
     this.rememberPersistentMemory(
       "request",
@@ -2438,16 +2473,18 @@ export class RemoteBuddyOrchestrator {
           `Request ${requestId.slice(0, 8)} waited ${Math.floor(
             queueWaitMs / 1000,
           )}s in queue (budget ${Math.floor(queueWaitBudgetMs / 1000)}s). Prioritizing execution now.`,
-          { turnId, correlationId: requestId },
+          { turnId, correlationId: requestId, from: eventFrom },
         );
       }
 
       if (!requiresWorker) {
-        await this.sendCommand(requestSessionId, {
-          type: "assistant_message",
-          payload: { text: plan.assistant_message },
-          turnId,
-        });
+        if (!autonomyMetadata) {
+          await this.sendCommand(requestSessionId, {
+            type: "assistant_message",
+            payload: { text: plan.assistant_message },
+            turnId,
+          });
+        }
 
         // For any intent that isn't a pure conversational reply (chat/status), the planner
         // returning requires_worker=false is ambiguous — ask the user or re-route to the engine.
@@ -2477,7 +2514,7 @@ export class RemoteBuddyOrchestrator {
             await this.assistantMessage(
               requestSessionId,
               "Should I have a WorkerPal implement this? Reply to confirm and I'll enqueue the work, or clarify what you'd like focused on.",
-              { turnId, correlationId: requestId },
+              { turnId, correlationId: requestId, from: eventFrom },
             );
           }
         }
@@ -2518,6 +2555,7 @@ export class RemoteBuddyOrchestrator {
           await this.assistantMessage(requestSessionId, userMessage, {
             turnId,
             correlationId: requestId,
+            from: eventFrom,
           });
           await fetch(`${this.server}/requests/${requestId}/fail`, {
             method: "POST",
@@ -2530,14 +2568,16 @@ export class RemoteBuddyOrchestrator {
           return;
         }
       }
-      await this.assistantMessage(
-        requestSessionId,
-        "Understood. I am delegating this to a WorkerPal now.",
-        {
-          turnId,
-          correlationId: requestId,
-        },
-      );
+      if (!autonomyMetadata) {
+        await this.assistantMessage(
+          requestSessionId,
+          "Understood. I am delegating this to a WorkerPal now.",
+          {
+            turnId,
+            correlationId: requestId,
+          },
+        );
+      }
       const executionBudgetMs = this.executionBudgetForPriority(priority);
       const strictTargetPaths = targetPaths.filter((entry) => entry && entry !== ".");
       const baseParams: BaseTaskExecuteJobParams = {
@@ -2633,15 +2673,18 @@ export class RemoteBuddyOrchestrator {
                 lane === "deterministic"
                   ? "Deterministic execution lane (fast path)"
                   : "Agentic worker execution lane",
-              createdBy: `agent:${this.agentId}`,
+              createdBy: autonomyMetadata ? "autonomy" : `agent:${this.agentId}`,
+              ...(autonomyMetadata ? { tags: ["autonomy"] } : {}),
               priority,
             },
             turnId,
+            from: eventFrom,
           });
           await this.sendCommand(requestSessionId, {
             type: "task_started",
             payload: { taskId: effectiveTaskId },
             turnId,
+            from: eventFrom,
           });
         }
         await this.sendCommand(requestSessionId, {
@@ -2655,17 +2698,20 @@ export class RemoteBuddyOrchestrator {
                 : "No idle WorkerPal available; queued for first available WorkerPal",
           },
           turnId,
+          from: eventFrom,
         });
 
-        await this.assistantMessage(
-          requestSessionId,
-          enqueueResult.deduped
-            ? "A matching WorkerPal task is already in progress for the same targeted file scope. Reusing that task instead of queuing a duplicate."
-            : targetWorkerId
-              ? `Assigned this request to WorkerPal ${targetWorkerId} (${lane} lane).`
-              : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.",
-          { turnId, correlationId: requestId },
-        );
+        if (!autonomyMetadata) {
+          await this.assistantMessage(
+            requestSessionId,
+            enqueueResult.deduped
+              ? "A matching WorkerPal task is already in progress for the same targeted file scope. Reusing that task instead of queuing a duplicate."
+              : targetWorkerId
+                ? `Assigned this request to WorkerPal ${targetWorkerId} (${lane} lane).`
+                : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.",
+            { turnId, correlationId: requestId },
+          );
+        }
 
         this.rememberPersistentMemory(
           enqueueResult.deduped ? "job_reused" : "job_enqueued",
@@ -2700,13 +2746,14 @@ export class RemoteBuddyOrchestrator {
                 : {}),
             },
             turnId,
+            from: eventFrom,
           });
         }
       } else {
         await this.assistantMessage(
           requestSessionId,
           "I could not queue this WorkerPal task. No task was started.",
-          { turnId, correlationId: requestId },
+          { turnId, correlationId: requestId, from: eventFrom },
         );
         this.rememberPersistentMemory(
           "job_enqueue_failed",
@@ -2742,7 +2789,11 @@ export class RemoteBuddyOrchestrator {
       const message = `RemoteBuddy planning failed: ${toSingleLine(err, 220) || "unknown error"}`;
       console.error(`[RemoteBuddy] ${message}`);
       this.rememberPersistentMemory("planning_failed", message, requestId, requestSessionId);
-      await this.assistantMessage(requestSessionId, message, { turnId, correlationId: requestId });
+      await this.assistantMessage(requestSessionId, message, {
+        turnId,
+        correlationId: requestId,
+        from: eventFrom,
+      });
       await fetch(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),

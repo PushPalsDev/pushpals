@@ -286,6 +286,7 @@
           "properties": {
             "taskId": { "type": "string" },
             "summary": { "type": "string" },
+            "origin": { "type": "string", "enum": ["user", "autonomy"] },
             "artifacts": {
               "type": "array",
               "items": { "$ref": "#/definitions/artifact" }
@@ -454,6 +455,7 @@
           "properties": {
             "jobId": { "type": "string" },
             "summary": { "type": "string" },
+            "origin": { "type": "string", "enum": ["user", "autonomy"] },
             "artifacts": {
               "type": "array",
               "items": { "$ref": "#/definitions/artifact" }
@@ -475,7 +477,8 @@
           "properties": {
             "jobId": { "type": "string" },
             "message": { "type": "string" },
-            "detail": { "type": "string" }
+            "detail": { "type": "string" },
+            "origin": { "type": "string", "enum": ["user", "autonomy"] }
           },
           "additionalProperties": false
         }

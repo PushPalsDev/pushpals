@@ -2527,6 +2527,34 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ).toBe("[status agent:localbuddy-1] busy - LocalBuddy evaluating request");
   });
 
+  test("formatSessionEventLine suppresses autonomy-origin worker chatter", () => {
+    expect(
+      formatSessionEventLine({
+        id: "evt-autonomy-assistant",
+        type: "assistant_message",
+        from: "agent:remotebuddy-orchestrator/autonomy",
+        ts: new Date().toISOString(),
+        payload: {
+          text: "Understood. I am delegating this to a WorkerPal now.",
+        },
+      }),
+    ).toBeNull();
+
+    expect(
+      formatSessionEventLine({
+        id: "evt-autonomy-job",
+        type: "job_completed",
+        from: "worker:workerpal-1",
+        ts: new Date().toISOString(),
+        payload: {
+          jobId: "job-1",
+          summary: "Executed task and modified 1 file(s).",
+          origin: "autonomy",
+        },
+      }),
+    ).toBeNull();
+  });
+
   test("createSessionEventReplayFilter suppresses replayed status events with the same event id", () => {
     const filter = createSessionEventReplayFilter();
     const event = {

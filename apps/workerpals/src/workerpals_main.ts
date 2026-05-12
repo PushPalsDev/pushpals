@@ -867,6 +867,15 @@ function failNoChangeReviewFixJob(jobId: string, result: WorkerJobResult): Worke
   };
 }
 
+function taskExecuteOrigin(params: Record<string, unknown> | undefined): "user" | "autonomy" {
+  if (!params) return "user";
+  if (params.origin === "autonomy") return "autonomy";
+  const autonomy = params.autonomy;
+  return autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)
+    ? "autonomy"
+    : "user";
+}
+
 async function enqueueCompletion(
   server: string,
   headers: Record<string, string>,
@@ -902,6 +911,7 @@ async function enqueueCompletion(
     const response = await postJsonWithTimeout(`${server}/completions/enqueue`, headers, {
       jobId: job.id,
       sessionId: job.sessionId,
+      origin: taskExecuteOrigin(job.params),
       commitSha: commit.sha,
       branch: commit.branch,
       message: `${job.kind}: ${job.taskId} (worker PR metadata attached)`,
@@ -1475,6 +1485,7 @@ async function workerLoop(
             }
 
             if (job.sessionId) {
+              const jobOrigin = taskExecuteOrigin(parsedParams);
               const responseMode = String(parsedParams.responseMode ?? "")
                 .trim()
                 .toLowerCase();
@@ -1492,11 +1503,18 @@ async function workerLoop(
                     ? `${rawText.slice(0, maxResponseChars - 3)}...`
                     : rawText;
                 if (assistantText) {
-                  await transport.queueSessionCommand(job.sessionId, {
-                    type: "assistant_message",
-                    payload: { text: assistantText },
-                    from: `worker:${opts.workerId}`,
-                  }, { priority: "high" });
+                  await transport.queueSessionCommand(
+                    job.sessionId,
+                    {
+                      type: "assistant_message",
+                      payload: { text: assistantText },
+                      from:
+                        jobOrigin === "autonomy"
+                          ? `worker:${opts.workerId}/autonomy`
+                          : `worker:${opts.workerId}`,
+                    },
+                    { priority: "high" },
+                  );
                 }
               }
 
@@ -1507,11 +1525,15 @@ async function workerLoop(
                       payload: {
                         jobId: job.id,
                         summary: result.summary,
+                        origin: jobOrigin,
                         artifacts: result.stdout
                           ? [{ kind: "log" as const, text: result.stdout }]
                           : undefined,
                       },
-                      from: `worker:${opts.workerId}`,
+                      from:
+                        jobOrigin === "autonomy"
+                          ? `worker:${opts.workerId}/autonomy`
+                          : `worker:${opts.workerId}`,
                     }
                   : {
                       type: "job_failed" as const,
@@ -1519,8 +1541,12 @@ async function workerLoop(
                         jobId: job.id,
                         message: result.summary,
                         detail: redactSensitiveText(result.stderr ?? ""),
+                        origin: jobOrigin,
                       },
-                      from: `worker:${opts.workerId}`,
+                      from:
+                        jobOrigin === "autonomy"
+                          ? `worker:${opts.workerId}/autonomy`
+                          : `worker:${opts.workerId}`,
                     };
 
                 await transport.queueSessionCommand(job.sessionId, eventCmd, {

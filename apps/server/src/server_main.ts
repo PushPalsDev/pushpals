@@ -289,6 +289,13 @@ export function createRequestHandler() {
         }
         return {};
       };
+      const deriveJobOrigin = (params: Record<string, unknown>): "user" | "autonomy" => {
+        if (params.origin === "autonomy") return "autonomy";
+        const autonomy = params.autonomy;
+        return autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)
+          ? "autonomy"
+          : "user";
+      };
       const hasClarificationSignal = (value: string): boolean => {
         const text = value.toLowerCase();
         return (
@@ -1714,6 +1721,7 @@ export function createRequestHandler() {
 
           const job = jobQueue.getJob(jobId);
           const params = parseJsonRecord(job?.params ?? "");
+          const origin = deriveJobOrigin(params);
           const requestId = compactText(params.requestId, 128);
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           const matched = autonomyStore.findObjectiveByJobId(jobId);
@@ -1746,6 +1754,7 @@ export function createRequestHandler() {
                 payload: {
                   jobId,
                   message,
+                  origin,
                   ...(detail ? { detail } : {}),
                 },
               };
@@ -1772,6 +1781,7 @@ export function createRequestHandler() {
 
           const job = jobQueue.getJob(jobId);
           const params = parseJsonRecord(job?.params ?? "");
+          const origin = deriveJobOrigin(params);
           const requestId = compactText(params.requestId, 128);
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           const matched = autonomyStore.findObjectiveByJobId(jobId);
@@ -1804,6 +1814,7 @@ export function createRequestHandler() {
                 payload: {
                   jobId,
                   message,
+                  origin,
                   ...(detail ? { detail } : {}),
                 },
               };

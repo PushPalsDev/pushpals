@@ -543,6 +543,7 @@ test("Event type 'job_completed' validates", () => {
     payload: {
       jobId: randomUUID(),
       summary: "All 12 tests passed",
+      origin: "autonomy",
       artifacts: [{ kind: "log", text: "output…" }],
     },
   };
@@ -558,7 +559,7 @@ test("Event type 'job_failed' validates", () => {
     ts: new Date().toISOString(),
     sessionId: randomUUID(),
     type: "job_failed",
-    payload: { jobId: randomUUID(), message: "Timeout after 30s" },
+    payload: { jobId: randomUUID(), message: "Timeout after 30s", origin: "autonomy" },
   };
   return validateEventEnvelope(event).ok === true;
 });

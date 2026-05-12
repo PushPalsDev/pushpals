@@ -111,8 +111,9 @@ export interface EventTypePayloadMap {
     jobId: string;
     summary?: string;
     artifacts?: Artifact[];
+    origin?: "user" | "autonomy";
   };
-  job_failed: { jobId: string; message: string; detail?: string };
+  job_failed: { jobId: string; message: string; detail?: string; origin?: "user" | "autonomy" };
   // ── Streaming / lifecycle events ──────────────────────────────────────
   /** User-facing chat message (from client to server) */
   message: { text: string; intent?: Record<string, unknown> };

@@ -1725,6 +1725,8 @@ function extractVisionKeyItems(markdown) {
     governance: dedupeAndClamp(buckets.governance)
   };
 }
+// packages/shared/src/session_event_visibility.ts
+var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 // packages/shared/src/localbuddy_runtime.ts
 var TRUTHY2 = new Set(["1", "true", "yes", "on"]);
 var FALSY2 = new Set(["0", "false", "no", "off"]);
@@ -7521,6 +7523,19 @@ function asObject2(value) {
     return null;
   return value;
 }
+function sessionEventOrigin(payload) {
+  const record = asObject2(payload);
+  if (!record)
+    return "user";
+  if (record.origin === "autonomy")
+    return "autonomy";
+  if (asObject2(record.autonomy))
+    return "autonomy";
+  if (asObject2(record.params) && sessionEventOrigin(record.params) === "autonomy") {
+    return "autonomy";
+  }
+  return "user";
+}
 function normalizeMetadataTargetPaths(value, maxItems = 48) {
   if (!Array.isArray(value))
     return [];
@@ -7898,6 +7913,7 @@ class RemoteBuddyOrchestrator {
   fatalSessionMonitors = new Set;
   seenJobFailures = new Set;
   seenJobCompletions = new Set;
+  jobOriginById = new Map;
   seenAutonomyFeedbackEvents = new Set;
   seenQuestionEvents = new Set;
   eventMonitorStartedAt = Date.now();
@@ -8022,7 +8038,7 @@ class RemoteBuddyOrchestrator {
       if (Date.now() >= startupDeadlineMs)
         break;
       await Bun.sleep(1000);
-      this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2500);
+      this.statusSessionReady = await this.ensureSessionWithRetry(undefined, 3, 400, 2500);
     }
     if (!startupStatusOk) {
       console.warn("[RemoteBuddy] Failed to emit startup status event");
@@ -8036,7 +8052,7 @@ class RemoteBuddyOrchestrator {
         return;
       (async () => {
         if (!this.statusSessionReady) {
-          this.statusSessionReady = await this.ensureSessionWithRetry(3, 400, 2500);
+          this.statusSessionReady = await this.ensureSessionWithRetry(undefined, 3, 400, 2500);
         }
         const ok = await this.comm.status(this.agentId, "idle", "RemoteBuddy heartbeat");
         if (!ok) {
@@ -8080,6 +8096,7 @@ class RemoteBuddyOrchestrator {
   async sendCommand(sessionId, cmd) {
     try {
       const ok = await this.comm.emitToSession(sessionId, cmd.type, cmd.payload, {
+        from: cmd.from,
         to: cmd.to,
         correlationId: cmd.correlationId,
         turnId: cmd.turnId,
@@ -8287,13 +8304,20 @@ ${tail.join(`
     });
   }
   handleSessionEvent(envelope) {
-    if (envelope.type !== "job_failed" && envelope.type !== "job_completed" && envelope.type !== "autonomy_feedback_recorded" && envelope.type !== "question_asked" && envelope.type !== "question_answered") {
+    if (envelope.type !== "job_failed" && envelope.type !== "job_completed" && envelope.type !== "job_enqueued" && envelope.type !== "autonomy_feedback_recorded" && envelope.type !== "question_asked" && envelope.type !== "question_answered") {
       return;
     }
     const tsMs = Date.parse(String(envelope.ts ?? ""));
     if (Number.isFinite(tsMs) && tsMs + 2000 < this.eventMonitorStartedAt)
       return;
     const eventSessionId = String(envelope.sessionId ?? "").trim() || this.sessionId;
+    if (envelope.type === "job_enqueued") {
+      const payload2 = envelope.payload;
+      const jobId2 = String(payload2.jobId ?? "").trim();
+      if (jobId2)
+        this.jobOriginById.set(jobId2, sessionEventOrigin(payload2));
+      return;
+    }
     if (envelope.type === "question_asked") {
       if (!this.markQuestionEventSeen(String(envelope.id ?? "")))
         return;
@@ -8351,6 +8375,7 @@ ${tail.join(`
       const detail = toSingleLine(payload2.detail, 220);
       if (!jobId2 || !message)
         return;
+      const origin2 = sessionEventOrigin(payload2) === "autonomy" || this.jobOriginById.get(jobId2) === "autonomy" ? "autonomy" : "user";
       const dedupeKey = `${jobId2}:${message}`;
       if (this.seenJobFailures.has(dedupeKey))
         return;
@@ -8359,6 +8384,8 @@ ${tail.join(`
       this.pushContext(failureLine, eventSessionId);
       this.rememberPersistentMemory("job_failed", `Job ${jobId2.slice(0, 8)} failed: ${toSingleLine(`${message}${detail ? ` (${detail})` : ""}`, 360)}`, null, eventSessionId);
       console.warn(`[RemoteBuddy] Observed WorkerPal failure ${jobId2}: ${message}`);
+      if (origin2 === "autonomy")
+        return;
       this.handleObservedJobFailure(eventSessionId, envelope, jobId2, message, detail);
       return;
     }
@@ -8367,6 +8394,7 @@ ${tail.join(`
     const summary = toSingleLine(payload.summary, 240) || "Job completed";
     if (!jobId)
       return;
+    const origin = sessionEventOrigin(payload) === "autonomy" || this.jobOriginById.get(jobId) === "autonomy" ? "autonomy" : "user";
     if (/startup warmup completed/i.test(summary))
       return;
     if (this.seenJobCompletions.has(jobId))
@@ -8374,6 +8402,8 @@ ${tail.join(`
     this.seenJobCompletions.add(jobId);
     this.pushContext(`[job_completed ${jobId}] ${summary}`, eventSessionId);
     this.rememberPersistentMemory("job_completed", `Job ${jobId.slice(0, 8)} completed: ${toSingleLine(summary, 360)}`, null, eventSessionId);
+    if (origin === "autonomy")
+      return;
     const shortJob = jobId.slice(0, 8);
     const clarificationQuestion = extractClarificationFromCompletionSummary(summary);
     const note = clarificationQuestion ? `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationQuestion}
@@ -8977,6 +9007,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     const priority = normalizeRequestPriority(request.priority);
     const queueWaitBudgetMs = Math.max(5000, Number.isFinite(Number(request.queueWaitBudgetMs)) ? Number(request.queueWaitBudgetMs) : priority === "interactive" ? 20000 : priority === "background" ? 240000 : 90000);
     const turnId = randomUUID2();
+    const eventFrom = autonomyMetadata ? `agent:${this.agentId}/autonomy` : undefined;
     const planningContext = this.buildPlanningContext(priority, requestSessionId);
     this.rememberPersistentMemory("request", `priority=${priority} prompt=${toSingleLine(prompt, 520)}`, requestId, requestSessionId);
     try {
@@ -9058,14 +9089,16 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
 
 `).trim();
       if (queueWaitMs > queueWaitBudgetMs) {
-        await this.assistantMessage(requestSessionId, `Request ${requestId.slice(0, 8)} waited ${Math.floor(queueWaitMs / 1000)}s in queue (budget ${Math.floor(queueWaitBudgetMs / 1000)}s). Prioritizing execution now.`, { turnId, correlationId: requestId });
+        await this.assistantMessage(requestSessionId, `Request ${requestId.slice(0, 8)} waited ${Math.floor(queueWaitMs / 1000)}s in queue (budget ${Math.floor(queueWaitBudgetMs / 1000)}s). Prioritizing execution now.`, { turnId, correlationId: requestId, from: eventFrom });
       }
       if (!requiresWorker) {
-        await this.sendCommand(requestSessionId, {
-          type: "assistant_message",
-          payload: { text: plan.assistant_message },
-          turnId
-        });
+        if (!autonomyMetadata) {
+          await this.sendCommand(requestSessionId, {
+            type: "assistant_message",
+            payload: { text: plan.assistant_message },
+            turnId
+          });
+        }
         if (plan.intent !== "chat" && plan.intent !== "status") {
           if (autonomyMetadata && CONFIG.remotebuddy.autonomy.enabled) {
             const workerInstruction = canonicalizeInstructionTextForBun(String(plan.worker_instruction ?? "").trim() || plan.assistant_message);
@@ -9076,7 +9109,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
               console.warn(`[RemoteBuddy] Non-chat intent (${plan.intent}) from engine: enqueueFromAnalysis returned null (engine disabled or enqueue failed)`);
             }
           } else if (!autonomyMetadata) {
-            await this.assistantMessage(requestSessionId, "Should I have a WorkerPal implement this? Reply to confirm and I'll enqueue the work, or clarify what you'd like focused on.", { turnId, correlationId: requestId });
+            await this.assistantMessage(requestSessionId, "Should I have a WorkerPal implement this? Reply to confirm and I'll enqueue the work, or clarify what you'd like focused on.", { turnId, correlationId: requestId, from: eventFrom });
           }
         }
         await fetch(`${this.server}/requests/${requestId}/complete`, {
@@ -9107,7 +9140,8 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           console.warn(`[RemoteBuddy] ${userMessage}`);
           await this.assistantMessage(requestSessionId, userMessage, {
             turnId,
-            correlationId: requestId
+            correlationId: requestId,
+            from: eventFrom
           });
           await fetch(`${this.server}/requests/${requestId}/fail`, {
             method: "POST",
@@ -9120,10 +9154,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           return;
         }
       }
-      await this.assistantMessage(requestSessionId, "Understood. I am delegating this to a WorkerPal now.", {
-        turnId,
-        correlationId: requestId
-      });
+      if (!autonomyMetadata) {
+        await this.assistantMessage(requestSessionId, "Understood. I am delegating this to a WorkerPal now.", {
+          turnId,
+          correlationId: requestId
+        });
+      }
       const executionBudgetMs = this.executionBudgetForPriority(priority);
       const strictTargetPaths = targetPaths.filter((entry) => entry && entry !== ".");
       const baseParams = {
@@ -9188,15 +9224,18 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
               taskId: effectiveTaskId,
               title: `Execute request: ${toSingleLine(prompt, 64) || "user request"}`,
               description: lane === "deterministic" ? "Deterministic execution lane (fast path)" : "Agentic worker execution lane",
-              createdBy: `agent:${this.agentId}`,
+              createdBy: autonomyMetadata ? "autonomy" : `agent:${this.agentId}`,
+              ...autonomyMetadata ? { tags: ["autonomy"] } : {},
               priority
             },
-            turnId
+            turnId,
+            from: eventFrom
           });
           await this.sendCommand(requestSessionId, {
             type: "task_started",
             payload: { taskId: effectiveTaskId },
-            turnId
+            turnId,
+            from: eventFrom
           });
         }
         await this.sendCommand(requestSessionId, {
@@ -9205,9 +9244,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
             taskId: effectiveTaskId,
             message: enqueueResult.deduped ? "Reused active WorkerPal task for the same targeted file scope" : targetWorkerId ? `Assigned to WorkerPal ${targetWorkerId} (${lane} lane)` : "No idle WorkerPal available; queued for first available WorkerPal"
           },
-          turnId
+          turnId,
+          from: eventFrom
         });
-        await this.assistantMessage(requestSessionId, enqueueResult.deduped ? "A matching WorkerPal task is already in progress for the same targeted file scope. Reusing that task instead of queuing a duplicate." : targetWorkerId ? `Assigned this request to WorkerPal ${targetWorkerId} (${lane} lane).` : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.", { turnId, correlationId: requestId });
+        if (!autonomyMetadata) {
+          await this.assistantMessage(requestSessionId, enqueueResult.deduped ? "A matching WorkerPal task is already in progress for the same targeted file scope. Reusing that task instead of queuing a duplicate." : targetWorkerId ? `Assigned this request to WorkerPal ${targetWorkerId} (${lane} lane).` : "No idle WorkerPal right now; request is queued and waiting for the next available WorkerPal.", { turnId, correlationId: requestId });
+        }
         this.rememberPersistentMemory(enqueueResult.deduped ? "job_reused" : "job_enqueued", `job=${enqueueResult.jobId.slice(0, 8)} lane=${lane} intent=${plan.intent} worker=${targetWorkerId ?? "queue"} deduped=${enqueueResult.deduped ? "yes" : "no"}`, requestId, requestSessionId);
         if (!enqueueResult.deduped) {
           await this.sendCommand(requestSessionId, {
@@ -9227,11 +9269,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
                 }
               } : {}
             },
-            turnId
+            turnId,
+            from: eventFrom
           });
         }
       } else {
-        await this.assistantMessage(requestSessionId, "I could not queue this WorkerPal task. No task was started.", { turnId, correlationId: requestId });
+        await this.assistantMessage(requestSessionId, "I could not queue this WorkerPal task. No task was started.", { turnId, correlationId: requestId, from: eventFrom });
         this.rememberPersistentMemory("job_enqueue_failed", `enqueue_failed lane=${lane} intent=${plan.intent}`, requestId, requestSessionId);
       }
       await fetch(`${this.server}/requests/${requestId}/complete`, {
@@ -9260,7 +9303,11 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       const message = `RemoteBuddy planning failed: ${toSingleLine(err, 220) || "unknown error"}`;
       console.error(`[RemoteBuddy] ${message}`);
       this.rememberPersistentMemory("planning_failed", message, requestId, requestSessionId);
-      await this.assistantMessage(requestSessionId, message, { turnId, correlationId: requestId });
+      await this.assistantMessage(requestSessionId, message, {
+        turnId,
+        correlationId: requestId,
+        from: eventFrom
+      });
       await fetch(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
