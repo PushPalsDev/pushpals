@@ -2,18 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.68`
-- start_commit: `1998f4064b01d61bfa5cbacf1e9fb63f6581b40b`
-- end_commit: `089ce6dd6aeaf7daec50e4bf065f8d5253a0e72f`
+- version: `v1.0.69`
+- start_commit: `e382b45f72b63d0594f39791cbf8b9e8285af6b3`
+- end_commit: `65e0e26d9a6bb2ee8c2c9e5d4ccf98ee58e040f6`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add a `SourceControlApi` abstraction with a Git-backed implementation and provider normalization for future Sapling/Mercurial support.
-- Route SourceControlManager merge operations through the source-control API factory while preserving `GitOps` compatibility for existing callers.
-- Resolve WorkerPal commit author/committer identity from explicit PushPals/Git env values or `git config user.name` / `user.email`, instead of GitHub user APIs.
-- Set both author and committer identity on WorkerPal commits so commits can attribute to the configured user email and count toward GitHub contribution graphs when that email is linked to the account.
-- Add regression coverage for provider selection, unsupported provider rejection, Git config identity lookup, and WorkerPal commit identity behavior.
+- Make `pushpals --clear` treat unavailable Docker as a best-effort cleanup skip instead of a hard failure.
+- Fix the published Windows CLI smoke failure when Docker Desktop is not present on the runner.
+- Add Docker-unavailable classification for common Windows named-pipe and Linux daemon connection errors.
+- Shut down the embedded runtime with a final best-effort `pushpals --clear` after installed-package smoke readiness checks, reducing lingering startup/runtime processes.
+- Ignore local dev package version `0.0.0-dev` when resolving embedded runtime release tags, so local tarball smoke does not target a non-existent `v0.0.0-dev` runtime release.
 
 ## Install
 
@@ -39,7 +39,6 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- Sapling and Mercurial provider names are recognized for planning/configuration, but runtime operations still intentionally support Git only.
-- GitHub contribution credit requires the configured commit email to be associated with the target GitHub account.
+- Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; this release only makes cleanup tolerate Docker being unavailable.
+- GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
 - Native WSL source-tree `cli:bundle` runs can still hang in the Expo monitor export path when building from a Windows-mounted checkout under `/mnt/c/...`; the published CLI package cold-start path is covered separately.
-- Per-app `tsc --noEmit` still trips over existing unrelated shared-config typing issues; release validation for this change used focused SourceControlManager and WorkerPal tests.
