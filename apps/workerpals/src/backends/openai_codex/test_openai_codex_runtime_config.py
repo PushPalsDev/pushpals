@@ -77,8 +77,14 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.approval_policy, "never")
         self.assertEqual(cfg.sandbox, "workspace-write")
         self.assertEqual(cfg.color, "never")
-        self.assertEqual(cfg.reasoning_effort, "high")
+        self.assertEqual(cfg.reasoning_effort, "xhigh")
         self.assertFalse(cfg.json_output)
+
+    def test_reasoning_effort_defaults_to_extra_high_for_default_gpt_5_5(self) -> None:
+        cfg = OpenAICodexRuntimeConfig.from_sources(
+            SettingsResolver(env={}, config_loader=lambda: {}),
+        )
+        self.assertEqual(_resolve_reasoning_effort(cfg), "xhigh")
 
     def test_resolve_codex_command_prefix_resolves_configured_executable(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(

@@ -29,6 +29,8 @@ const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
 const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
 const DEFAULT_REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS = 420;
 const DEFAULT_REMOTEBUDDY_MEMORY_RETENTION_DAYS = 30;
+const DEFAULT_OPENAI_CODEX_MODEL = "gpt-5.5";
+const DEFAULT_OPENAI_CODEX_REASONING_EFFORT = "xhigh";
 const REDACTED_LOG_VALUE = "[REDACTED]";
 const SENSITIVE_CONFIG_KEY_PATTERN =
   /(token|secret|password|api[_-]?key|private[_-]?key|access[_-]?key)/i;
@@ -317,7 +319,7 @@ function parseIntEnv(name: string): number | null {
 
 function parseTomlFile(path: string): TomlObject {
   if (!existsSync(path)) return {};
-  const raw = readFileSync(path, "utf-8");
+  const raw = readFileSync(path, "utf-8").replace(/^\uFEFF/, "");
   const parsed = Bun.TOML.parse(raw) as unknown;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
   return parsed as TomlObject;
@@ -503,11 +505,16 @@ function resolveLlmConfig(
     asString(llmNode.endpoint, defaults.endpoint),
     defaults.endpoint,
   );
-  const model = firstNonEmpty(
-    process.env[`${envPrefix}_LLM_MODEL`],
-    asString(llmNode.model, defaults.model),
-    defaults.model,
-  );
+  const envModel = firstNonEmpty(process.env[`${envPrefix}_LLM_MODEL`]);
+  const configuredFileModel = firstNonEmpty(asString(llmNode.model, ""));
+  const configuredModel = firstNonEmpty(envModel, configuredFileModel);
+  const modelFallback = backend === "openai_codex" ? DEFAULT_OPENAI_CODEX_MODEL : defaults.model;
+  const model =
+    backend === "openai_codex" &&
+    !envModel &&
+    (!configuredFileModel || configuredFileModel === defaults.model)
+      ? DEFAULT_OPENAI_CODEX_MODEL
+      : (firstNonEmpty(configuredModel, modelFallback) ?? modelFallback);
   const sessionId = firstNonEmpty(
     process.env[`${envPrefix}_LLM_SESSION_ID`],
     asString(llmNode.session_id, defaults.sessionId),
@@ -521,6 +528,7 @@ function resolveLlmConfig(
   const reasoningEffort = firstNonEmpty(
     process.env[`${envPrefix}_LLM_REASONING_EFFORT`],
     asString(llmNode.reasoning_effort, ""),
+    backend === "openai_codex" ? DEFAULT_OPENAI_CODEX_REASONING_EFFORT : "",
   );
   const codexAuthMode = firstNonEmpty(
     process.env[`${envPrefix}_LLM_CODEX_AUTH_MODE`],

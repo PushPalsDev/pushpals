@@ -92,7 +92,8 @@ const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "local-model";
-const DEFAULT_CODEX_MODEL = "gpt-5.4";
+const DEFAULT_CODEX_MODEL = "gpt-5.5";
+const DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_TIMEOUT_MS = 120_000;
 const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
@@ -242,13 +243,14 @@ function codexReasoningEffort(
 ): "low" | "medium" | "high" | "xhigh" {
   const raw = (configured ?? "").trim().toLowerCase();
   const supportsExtraHigh = !/^(gpt-5\.4(?:$|-)|codex-1p(?:$|-))/i.test(model.trim());
+  const defaultEffort = supportsExtraHigh ? DEFAULT_CODEX_REASONING_EFFORT : "high";
   if (raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh") {
     return raw === "xhigh" && !supportsExtraHigh ? "high" : raw;
   }
   if (raw === "extra high" || raw === "extra-high" || raw === "extrahigh" || raw === "x-high") {
     return supportsExtraHigh ? "xhigh" : "high";
   }
-  return "high";
+  return defaultEffort;
 }
 
 function normalizeCodexModel(rawModel: string): string {
@@ -467,7 +469,15 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
   const endpoint = firstNonEmpty(opts.endpoint, serviceLlmConfig.endpoint, fallbackEndpoint);
   let backend = configuredBackend(endpoint ?? "", explicitBackend);
 
-  const model = firstNonEmpty(opts.model, serviceLlmConfig.model, DEFAULT_MODEL) ?? DEFAULT_MODEL;
+  const configuredModel = firstNonEmpty(opts.model, serviceLlmConfig.model, "");
+  let model =
+    firstNonEmpty(
+      configuredModel,
+      backend === "openai_codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL,
+    ) ?? DEFAULT_MODEL;
+  if (backend === "openai_codex" && model === DEFAULT_MODEL) {
+    model = DEFAULT_CODEX_MODEL;
+  }
   const requestedCodexAuthMode =
     firstNonEmpty(opts.codexAuthMode, serviceLlmConfig.codexAuthMode, "") ?? "";
   const openAiApiKey = (process.env.OPENAI_API_KEY ?? "").trim();
@@ -504,7 +514,11 @@ function resolveServiceLlmConfig(opts: LLMClientOptions = {}): ResolvedServiceLl
     apiKey,
     sessionId,
     reasoningEffort:
-      firstNonEmpty(opts.reasoningEffort, serviceLlmConfig.reasoningEffort, "") ?? "",
+      firstNonEmpty(
+        opts.reasoningEffort,
+        serviceLlmConfig.reasoningEffort,
+        backend === "openai_codex" ? DEFAULT_CODEX_REASONING_EFFORT : "",
+      ) ?? "",
     codexAuthMode: requestedCodexAuthMode,
     codexBin: firstNonEmpty(opts.codexBin, serviceLlmConfig.codexBin, "") ?? "",
     codexTimeoutMs: opts.codexTimeoutMs ?? serviceLlmConfig.codexTimeoutMs,

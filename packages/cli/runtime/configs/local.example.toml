@@ -12,7 +12,7 @@ model = "gpt-5.5"
 codex_auth_mode = "chatgpt"
 codex_bin = "bun x --yes @openai/codex"
 codex_timeout_ms = 120000
-reasoning_effort = "high"
+reasoning_effort = "xhigh"
 
 [remotebuddy.llm]
 backend = "openai_codex"
@@ -20,7 +20,7 @@ model = "gpt-5.5"
 codex_auth_mode = "chatgpt"
 codex_bin = "bun x --yes @openai/codex"
 codex_timeout_ms = 120000
-reasoning_effort = "high"
+reasoning_effort = "xhigh"
 
 [remotebuddy]
 min_workerpals = 1
@@ -47,7 +47,7 @@ model = "gpt-5.5"
 codex_auth_mode = "chatgpt"
 codex_bin = "bun x --yes @openai/codex"
 codex_timeout_ms = 120000
-reasoning_effort = "high"
+reasoning_effort = "xhigh"
 
 [workerpals]
 executor = "openai_codex"
@@ -93,7 +93,7 @@ bin = "bun x --yes @openai/codex"
 timeout_ms = 7200000
 progress_log_interval_s = 30
 # timeout_s = 120  # optional; if set, overrides timeout_ms
-reasoning_effort = "high"
+reasoning_effort = "xhigh"
 approval_policy = "never"
 sandbox = "workspace-write"
 color = "never"

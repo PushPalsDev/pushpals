@@ -2850,6 +2850,7 @@ function normalizeCodexReasoningEffort(
     .trim()
     .toLowerCase();
   const supportsExtraHigh = !/^(gpt-5\.4(?:$|-)|codex-1p(?:$|-))/i.test(String(model ?? "").trim());
+  const defaultEffort = supportsExtraHigh ? "xhigh" : "high";
   if (
     normalized === "low" ||
     normalized === "medium" ||
@@ -2866,7 +2867,7 @@ function normalizeCodexReasoningEffort(
   ) {
     return supportsExtraHigh ? "xhigh" : "high";
   }
-  return "high";
+  return defaultEffort;
 }
 
 async function generateCommitMessageFromDiff(

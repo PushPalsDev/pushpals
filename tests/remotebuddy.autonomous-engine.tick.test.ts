@@ -32,10 +32,10 @@ function makeConfig(): any {
       llm: {
         backend: "openai_codex",
         endpoint: "http://127.0.0.1:1234",
-        model: "gpt-5.4",
+        model: "gpt-5.5",
         sessionId: "remotebuddy-dev",
         apiKey: "",
-        reasoningEffort: "high",
+        reasoningEffort: "xhigh",
         codexAuthMode: "chatgpt",
         codexBin: "bun x --yes @openai/codex",
         codexTimeoutMs: 120_000,

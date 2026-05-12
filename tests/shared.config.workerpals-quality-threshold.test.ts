@@ -40,6 +40,65 @@ describe("shared config workerpals quality critic threshold parsing", () => {
     }
   });
 
+  test("defaults openai_codex LLM services to gpt-5.5 with extra-high reasoning", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "configs");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[localbuddy.llm]",
+        'backend = "openai_codex"',
+        "",
+        "[remotebuddy.llm]",
+        'backend = "openai_codex"',
+        "",
+        "[workerpals.llm]",
+        'backend = "openai_codex"',
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.localbuddy.llm.model).toBe("gpt-5.5");
+      expect(cfg.remotebuddy.llm.model).toBe("gpt-5.5");
+      expect(cfg.workerpals.llm.model).toBe("gpt-5.5");
+      expect(cfg.localbuddy.llm.reasoningEffort).toBe("xhigh");
+      expect(cfg.remotebuddy.llm.reasoningEffort).toBe("xhigh");
+      expect(cfg.workerpals.llm.reasoningEffort).toBe("xhigh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("parses BOM-prefixed TOML config files", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "configs");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(join(configDir, "default.toml"), '\uFEFFprofile = "dev"\n', "utf8");
+    writeFileSync(
+      join(configDir, "local.example.toml"),
+      '\uFEFF[workerpals.llm]\nbackend = "openai_codex"\n',
+      "utf8",
+    );
+
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.profile).toBe("dev");
+      expect(cfg.workerpals.llm.backend).toBe("openai_codex");
+      expect(cfg.workerpals.llm.model).toBe("gpt-5.5");
+      expect(cfg.workerpals.llm.reasoningEffort).toBe("xhigh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("defaults workerpals.quality_max_auto_revisions to 1 when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
     const configDir = join(root, "configs");

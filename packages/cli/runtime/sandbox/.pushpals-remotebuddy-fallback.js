@@ -749,6 +749,8 @@ var DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
 var DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
 var DEFAULT_REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS = 420;
 var DEFAULT_REMOTEBUDDY_MEMORY_RETENTION_DAYS = 30;
+var DEFAULT_OPENAI_CODEX_MODEL = "gpt-5.5";
+var DEFAULT_OPENAI_CODEX_REASONING_EFFORT = "xhigh";
 var REDACTED_LOG_VALUE = "[REDACTED]";
 var SENSITIVE_CONFIG_KEY_PATTERN = /(token|secret|password|api[_-]?key|private[_-]?key|access[_-]?key)/i;
 var cachedConfig = null;
@@ -781,7 +783,7 @@ function parseIntEnv(name) {
 function parseTomlFile(path) {
   if (!existsSync2(path))
     return {};
-  const raw = readFileSync3(path, "utf-8");
+  const raw = readFileSync3(path, "utf-8").replace(/^\uFEFF/, "");
   const parsed = Bun.TOML.parse(raw);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
     return {};
@@ -946,10 +948,14 @@ function resolveLlmConfig(serviceNode, envPrefix, defaults, globalSessionId) {
   const llmNode = getObject(serviceNode, "llm");
   const backend = normalizeBackend(firstNonEmpty(process.env[`${envPrefix}_LLM_BACKEND`], asString(llmNode.backend, defaults.backend), defaults.backend));
   const endpoint = firstNonEmpty(process.env[`${envPrefix}_LLM_ENDPOINT`], asString(llmNode.endpoint, defaults.endpoint), defaults.endpoint);
-  const model = firstNonEmpty(process.env[`${envPrefix}_LLM_MODEL`], asString(llmNode.model, defaults.model), defaults.model);
+  const envModel = firstNonEmpty(process.env[`${envPrefix}_LLM_MODEL`]);
+  const configuredFileModel = firstNonEmpty(asString(llmNode.model, ""));
+  const configuredModel = firstNonEmpty(envModel, configuredFileModel);
+  const modelFallback = backend === "openai_codex" ? DEFAULT_OPENAI_CODEX_MODEL : defaults.model;
+  const model = backend === "openai_codex" && !envModel && (!configuredFileModel || configuredFileModel === defaults.model) ? DEFAULT_OPENAI_CODEX_MODEL : firstNonEmpty(configuredModel, modelFallback) ?? modelFallback;
   const sessionId = firstNonEmpty(process.env[`${envPrefix}_LLM_SESSION_ID`], asString(llmNode.session_id, defaults.sessionId), process.env.PUSHPALS_LLM_SESSION_ID, globalSessionId);
   const apiKey = firstNonEmpty(process.env[`${envPrefix}_LLM_API_KEY`], defaultApiKeyForBackend(backend, endpoint));
-  const reasoningEffort = firstNonEmpty(process.env[`${envPrefix}_LLM_REASONING_EFFORT`], asString(llmNode.reasoning_effort, ""));
+  const reasoningEffort = firstNonEmpty(process.env[`${envPrefix}_LLM_REASONING_EFFORT`], asString(llmNode.reasoning_effort, ""), backend === "openai_codex" ? DEFAULT_OPENAI_CODEX_REASONING_EFFORT : "");
   const codexAuthMode = firstNonEmpty(process.env[`${envPrefix}_LLM_CODEX_AUTH_MODE`], asString(llmNode.codex_auth_mode, ""));
   const codexBin = firstNonEmpty(process.env[`${envPrefix}_LLM_CODEX_BIN`], asString(llmNode.codex_bin, ""));
   const codexTimeoutMs = Math.max(1e4, asInt(parseIntEnv(`${envPrefix}_LLM_CODEX_TIMEOUT_MS`) ?? llmNode.codex_timeout_ms, 120000));
@@ -1727,7 +1733,8 @@ var DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 var DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 var DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 var DEFAULT_MODEL = "local-model";
-var DEFAULT_CODEX_MODEL = "gpt-5.4";
+var DEFAULT_CODEX_MODEL = "gpt-5.5";
+var DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 var DEFAULT_CODEX_TIMEOUT_MS = 120000;
 var DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 var DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
@@ -1842,13 +1849,14 @@ function codexTimeoutMs(configuredTimeoutMs) {
 function codexReasoningEffort(configured, model) {
   const raw = (configured ?? "").trim().toLowerCase();
   const supportsExtraHigh = !/^(gpt-5\.4(?:$|-)|codex-1p(?:$|-))/i.test(model.trim());
+  const defaultEffort = supportsExtraHigh ? DEFAULT_CODEX_REASONING_EFFORT : "high";
   if (raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh") {
     return raw === "xhigh" && !supportsExtraHigh ? "high" : raw;
   }
   if (raw === "extra high" || raw === "extra-high" || raw === "extrahigh" || raw === "x-high") {
     return supportsExtraHigh ? "xhigh" : "high";
   }
-  return "high";
+  return defaultEffort;
 }
 function normalizeCodexModel(rawModel) {
   const model = rawModel.trim();
@@ -2046,7 +2054,11 @@ function resolveServiceLlmConfig(opts = {}) {
   const fallbackEndpoint = explicitBackend === "ollama" ? DEFAULT_OLLAMA_ENDPOINT : explicitBackend === "openai" || explicitBackend === "openai_codex" ? DEFAULT_OPENAI_ENDPOINT : DEFAULT_LMSTUDIO_ENDPOINT;
   const endpoint = firstNonEmpty2(opts.endpoint, serviceLlmConfig.endpoint, fallbackEndpoint);
   let backend = configuredBackend(endpoint ?? "", explicitBackend);
-  const model = firstNonEmpty2(opts.model, serviceLlmConfig.model, DEFAULT_MODEL) ?? DEFAULT_MODEL;
+  const configuredModel = firstNonEmpty2(opts.model, serviceLlmConfig.model, "");
+  let model = firstNonEmpty2(configuredModel, backend === "openai_codex" ? DEFAULT_CODEX_MODEL : DEFAULT_MODEL) ?? DEFAULT_MODEL;
+  if (backend === "openai_codex" && model === DEFAULT_MODEL) {
+    model = DEFAULT_CODEX_MODEL;
+  }
   const requestedCodexAuthMode = firstNonEmpty2(opts.codexAuthMode, serviceLlmConfig.codexAuthMode, "") ?? "";
   const openAiApiKey = (process.env.OPENAI_API_KEY ?? "").trim();
   const apiKey = firstNonEmpty2(opts.apiKey, serviceLlmConfig.apiKey, backend === "lmstudio" ? "lmstudio" : backend === "openai" || backend === "openai_codex" ? openAiApiKey : "") ?? "";
@@ -2061,7 +2073,7 @@ function resolveServiceLlmConfig(opts = {}) {
     model,
     apiKey,
     sessionId,
-    reasoningEffort: firstNonEmpty2(opts.reasoningEffort, serviceLlmConfig.reasoningEffort, "") ?? "",
+    reasoningEffort: firstNonEmpty2(opts.reasoningEffort, serviceLlmConfig.reasoningEffort, backend === "openai_codex" ? DEFAULT_CODEX_REASONING_EFFORT : "") ?? "",
     codexAuthMode: requestedCodexAuthMode,
     codexBin: firstNonEmpty2(opts.codexBin, serviceLlmConfig.codexBin, "") ?? "",
     codexTimeoutMs: opts.codexTimeoutMs ?? serviceLlmConfig.codexTimeoutMs,

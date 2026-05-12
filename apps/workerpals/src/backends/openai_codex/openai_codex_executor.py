@@ -186,7 +186,7 @@ class OpenAICodexRuntimeConfig:
             reasoning_effort=cfg.get_str(
                 env_names=("WORKERPALS_LLM_REASONING_EFFORT", "WORKERPALS_OPENAI_CODEX_REASONING_EFFORT"),
                 config_paths=("workerpals.llm.reasoning_effort", "workerpals.openai_codex.reasoning_effort"),
-                default="high",
+                default="xhigh",
             ),
             approval_policy=cfg.get_str(
                 env_names=("WORKERPALS_OPENAI_CODEX_APPROVAL_POLICY",),
@@ -441,6 +441,7 @@ def _resolve_communicate_timeout_seconds(config: OpenAICodexRuntimeConfig) -> Op
 def _resolve_reasoning_effort(config: OpenAICodexRuntimeConfig, model: str = DEFAULT_CODEX_MODEL) -> str:
     raw = config.reasoning_effort
     normalized = str(raw).strip().lower()
+    default_effort = "xhigh" if _model_supports_xhigh_reasoning(model) else "high"
     if normalized in {"extra high", "extra-high", "extrahigh", "x-high"}:
         normalized = "xhigh"
     if normalized == "xhigh" and not _model_supports_xhigh_reasoning(model):
@@ -452,9 +453,9 @@ def _resolve_reasoning_effort(config: OpenAICodexRuntimeConfig, model: str = DEF
         return normalized
     log.info(
         "Invalid workerpals.openai_codex.reasoning_effort="
-        f"{raw!r}; using default 'high'. Allowed: low, medium, high, xhigh."
+        f"{raw!r}; using default {default_effort!r}. Allowed: low, medium, high, xhigh."
     )
-    return "high"
+    return default_effort
 
 
 def _resolve_progress_log_interval_seconds(config: OpenAICodexRuntimeConfig) -> int:

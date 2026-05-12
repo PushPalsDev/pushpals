@@ -199,7 +199,7 @@ session_id = "workerpals-dev"
 [workerpals.openai_codex]
 timeout_ms = 7200000
 progress_log_interval_s = 30
-reasoning_effort = "high"
+reasoning_effort = "xhigh"
 approval_policy = "never"
 sandbox = "workspace-write"
 color = "never"
