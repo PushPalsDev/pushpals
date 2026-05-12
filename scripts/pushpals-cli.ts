@@ -1064,6 +1064,7 @@ export function repoLooksLikePushPalsSourceCheckout(repoRoot: string): boolean {
 function parseSemverFromPackageVersion(value: string | undefined): string {
   const raw = String(value ?? "").trim();
   if (!raw) return "";
+  if (raw === "0.0.0-dev") return "";
   const match = raw.match(/^\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.-]+)?$/);
   return match ? raw : "";
 }
@@ -2305,6 +2306,13 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
   );
   if (!list.ok) {
     const detail = list.stderr || list.stdout || `exit ${list.exitCode}`;
+    if (isDockerUnavailableDetail(detail)) {
+      return {
+        ok: true,
+        detail: `docker unavailable; skipped WorkerPal warm-container cleanup: ${detail}`,
+        removed: 0,
+      };
+    }
     return {
       ok: false,
       detail: `failed to inspect lingering WorkerPal warm containers: ${detail}`,
@@ -2384,6 +2392,14 @@ export async function cleanupLocalWorkerpalSandboxImage(opts: {
       return {
         ok: true,
         detail: `no local WorkerPal sandbox image found for ${imageName}`,
+        removed: false,
+        imageName,
+      };
+    }
+    if (isDockerUnavailableDetail(detail)) {
+      return {
+        ok: true,
+        detail: `docker unavailable; skipped WorkerPal sandbox image cleanup: ${detail}`,
         removed: false,
         imageName,
       };
@@ -2538,6 +2554,20 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
 
 function isMissingDockerImageDetail(detail: string): boolean {
   return /\b(no such object|no such image|not found)\b/i.test(String(detail ?? ""));
+}
+
+export function isDockerUnavailableDetail(detail: string): boolean {
+  const text = String(detail ?? "");
+  return (
+    /cannot connect to (the )?docker daemon/i.test(text) ||
+    /docker daemon is not running/i.test(text) ||
+    /failed to connect to the docker api/i.test(text) ||
+    /docker_engine/i.test(text) ||
+    /is the docker daemon running/i.test(text) ||
+    /docker(?:\.exe)?: command not found/i.test(text) ||
+    /spawn\s+docker(?:\.exe)?\s+ENOENT/i.test(text) ||
+    /docker(?:\.exe)?'?\s+is not recognized as an internal or external command/i.test(text)
+  );
 }
 
 async function inspectDockerImageRuntimeTag(

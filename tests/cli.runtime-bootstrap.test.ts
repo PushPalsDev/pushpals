@@ -36,6 +36,7 @@ import {
   formatTimestampedCliLine,
   formatSessionEventLine,
   injectMonitoringHubBootstrap,
+  isDockerUnavailableDetail,
   isCliExitCommand,
   normalizeCliInteractiveMessage,
   normalizeChildProcessEnv,
@@ -1669,6 +1670,26 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
   });
 
+  test("cleanupLingeringWorkerpalWarmContainers treats unavailable Docker as a no-op", async () => {
+    const result = await cleanupLingeringWorkerpalWarmContainers({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      runCommandWithEnvFn: async () => ({
+        ok: false,
+        stdout: "",
+        stderr:
+          "failed to connect to the docker API at npipe:////./pipe/docker_engine; open //./pipe/docker_engine: The system cannot find the file specified.",
+        exitCode: 1,
+      }),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.removed).toBe(0);
+    expect(result.detail).toContain("docker unavailable; skipped WorkerPal warm-container cleanup");
+  });
+
   test("cleanupLingeringWorkerpalWarmContainers removes matching warm containers", async () => {
     const calls: Array<{ command: string[]; cwd: string }> = [];
     let phase = 0;
@@ -1766,6 +1787,34 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         cwd: "/repo/example",
       },
     ]);
+  });
+
+  test("cleanupLocalWorkerpalSandboxImage treats unavailable Docker as a no-op", async () => {
+    const result = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      dockerImage: "pushpals-worker-sandbox:latest",
+      runCommandWithEnvFn: async () => ({
+        ok: false,
+        stdout: "",
+        stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.",
+        exitCode: 1,
+      }),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.removed).toBe(false);
+    expect(result.detail).toContain("docker unavailable; skipped WorkerPal sandbox image cleanup");
+  });
+
+  test("isDockerUnavailableDetail classifies common Docker daemon failures", () => {
+    expect(isDockerUnavailableDetail("Cannot connect to the Docker daemon")).toBe(true);
+    expect(
+      isDockerUnavailableDetail("failed to connect to the docker API at npipe:////./pipe/docker_engine"),
+    ).toBe(true);
+    expect(isDockerUnavailableDetail("Error response from daemon: No such image")).toBe(false);
   });
 
   test("cleanupLocalWorkerpalSandboxImage removes the configured sandbox image", async () => {
@@ -2290,6 +2339,11 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         PUSHPALS_CLI_PACKAGE_VERSION: "1.0.16",
       }),
     ).toBe("vexplicit");
+    expect(
+      resolvePreferredRuntimeReleaseTag(undefined, {
+        PUSHPALS_CLI_PACKAGE_VERSION: "0.0.0-dev",
+      }),
+    ).toBe("");
   });
 
   test("isCliExitCommand treats bare exit aliases as local shutdown commands", () => {

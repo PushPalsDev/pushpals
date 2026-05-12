@@ -218,6 +218,29 @@ function assertNoStartupFailure(text: string): void {
   }
 }
 
+async function runBestEffortClear(
+  pushpalsPath: string,
+  repoPath: string,
+  runtimeRoot: string,
+  env: Record<string, string | undefined>,
+): Promise<void> {
+  try {
+    const result = await runWithTimeout(
+      [pushpalsPath, "--clear", "--runtime-root", runtimeRoot],
+      repoPath,
+      env,
+      2 * 60_000,
+    );
+    if (result.exitCode !== 0) {
+      console.warn(
+        `[installed-cli-smoke] Final clear warning: exit ${result.exitCode}\n${summarizeTail(`${result.stdout}\n${result.stderr}`)}`,
+      );
+    }
+  } catch (error) {
+    console.warn(`[installed-cli-smoke] Final clear warning: ${String(error)}`);
+  }
+}
+
 async function removeTreeWithRetries(root: string, attempts = 10, delayMs = 500): Promise<void> {
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -241,6 +264,13 @@ async function main(): Promise<void> {
   mkdirSync(bunInstallRoot, { recursive: true });
   mkdirSync(runtimeRoot, { recursive: true });
   mkdirSync(dataDir, { recursive: true });
+  let finalClear:
+    | {
+        pushpalsPath: string;
+        repoPath: string;
+        commandEnv: Record<string, string>;
+      }
+    | null = null;
 
   try {
     const repoPath = resolveRepoPath(root, options.repoPath);
@@ -265,6 +295,7 @@ async function main(): Promise<void> {
       ...(options.workerpalAutospawn ? {} : { REMOTEBUDDY_AUTO_SPAWN_WORKERPALS: "false" }),
       ...(options.useRepoDataDir ? {} : { PUSHPALS_DATA_DIR_OVERRIDE: dataDir }),
     } as Record<string, string>;
+    finalClear = { pushpalsPath, repoPath, commandEnv };
 
     const clearResult = await runWithTimeout(
       [pushpalsPath, "--clear", "--runtime-root", runtimeRoot],
@@ -300,6 +331,14 @@ async function main(): Promise<void> {
     if (options.keepTemp) {
       console.log(`[installed-cli-smoke] Preserved temp root at ${root}`);
     } else {
+      if (finalClear) {
+        await runBestEffortClear(
+          finalClear.pushpalsPath,
+          finalClear.repoPath,
+          runtimeRoot,
+          finalClear.commandEnv,
+        );
+      }
       try {
         await removeTreeWithRetries(root);
       } catch (error) {
