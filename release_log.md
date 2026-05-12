@@ -2,17 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.71`
-- start_commit: `3a00331826085622641c0583d51688ea559a813c`
-- end_commit: `f2d964f698f41db2545105187c2034e8131196d8`
+- version: `v1.0.72`
+- start_commit: `981e8d8333fd87b43005deef7ee845f75e433c48`
+- end_commit: `aa2479d1c46dfc6d2514dde7b5c3843a146eb341`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Treat Docker command timeouts during `pushpals --clear` WorkerPal cleanup as best-effort skips instead of fatal errors.
-- Keep warm-container inspection and removal cleanup useful when Docker responds, while avoiding installed CLI smoke failures when Docker is slow or wedged.
-- Apply the same timeout skip behavior to WorkerPal sandbox image cleanup.
-- Add regression coverage for Docker cleanup timeout classification and the affected clear helpers.
+- Honor an explicit `PUSHPALS_DOCKER_BIN_ABSOLUTE` or `PUSHPALS_DOCKER_BIN` override before resolving `docker` from `PATH` during WorkerPal Docker preflight.
+- Preserve the configured Docker binary through the preflight environment so sandbox image checks, rebuilds, and runtime services use the intended executable.
+- Add regression coverage for configured Docker probe binary precedence.
 
 ## Install
 
