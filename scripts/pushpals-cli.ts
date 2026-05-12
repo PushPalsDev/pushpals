@@ -2313,6 +2313,13 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
         removed: 0,
       };
     }
+    if (isDockerCleanupTimeoutDetail(detail)) {
+      return {
+        ok: true,
+        detail: `docker cleanup timed out; skipped WorkerPal warm-container cleanup: ${detail}`,
+        removed: 0,
+      };
+    }
     return {
       ok: false,
       detail: `failed to inspect lingering WorkerPal warm containers: ${detail}`,
@@ -2340,6 +2347,20 @@ export async function cleanupLingeringWorkerpalWarmContainers(opts: {
   );
   if (!remove.ok) {
     const detail = remove.stderr || remove.stdout || `exit ${remove.exitCode}`;
+    if (isDockerUnavailableDetail(detail)) {
+      return {
+        ok: true,
+        detail: `docker unavailable; skipped WorkerPal warm-container cleanup: ${detail}`,
+        removed: 0,
+      };
+    }
+    if (isDockerCleanupTimeoutDetail(detail)) {
+      return {
+        ok: true,
+        detail: `docker cleanup timed out; skipped WorkerPal warm-container cleanup: ${detail}`,
+        removed: 0,
+      };
+    }
     return {
       ok: false,
       detail: `failed to remove lingering WorkerPal warm containers: ${detail}`,
@@ -2400,6 +2421,14 @@ export async function cleanupLocalWorkerpalSandboxImage(opts: {
       return {
         ok: true,
         detail: `docker unavailable; skipped WorkerPal sandbox image cleanup: ${detail}`,
+        removed: false,
+        imageName,
+      };
+    }
+    if (isDockerCleanupTimeoutDetail(detail)) {
+      return {
+        ok: true,
+        detail: `docker cleanup timed out; skipped WorkerPal sandbox image cleanup: ${detail}`,
         removed: false,
         imageName,
       };
@@ -2554,6 +2583,10 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
 
 function isMissingDockerImageDetail(detail: string): boolean {
   return /\b(no such object|no such image|not found)\b/i.test(String(detail ?? ""));
+}
+
+export function isDockerCleanupTimeoutDetail(detail: string): boolean {
+  return /\btimed out after \d+ms\b/i.test(String(detail ?? ""));
 }
 
 export function isDockerUnavailableDetail(detail: string): boolean {

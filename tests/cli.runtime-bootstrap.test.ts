@@ -36,6 +36,7 @@ import {
   formatTimestampedCliLine,
   formatSessionEventLine,
   injectMonitoringHubBootstrap,
+  isDockerCleanupTimeoutDetail,
   isDockerUnavailableDetail,
   isCliExitCommand,
   normalizeCliInteractiveMessage,
@@ -1690,6 +1691,55 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(result.detail).toContain("docker unavailable; skipped WorkerPal warm-container cleanup");
   });
 
+  test("cleanupLingeringWorkerpalWarmContainers treats Docker inspect timeouts as a no-op", async () => {
+    const result = await cleanupLingeringWorkerpalWarmContainers({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      runCommandWithEnvFn: async () => ({
+        ok: false,
+        stdout: "",
+        stderr: "timed out after 5000ms",
+        exitCode: null,
+      }),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.removed).toBe(0);
+    expect(result.detail).toContain(
+      "docker cleanup timed out; skipped WorkerPal warm-container cleanup",
+    );
+  });
+
+  test("cleanupLingeringWorkerpalWarmContainers treats Docker remove timeouts as a no-op", async () => {
+    let phase = 0;
+    const result = await cleanupLingeringWorkerpalWarmContainers({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      runCommandWithEnvFn: async () => {
+        phase += 1;
+        if (phase === 1) {
+          return { ok: true, stdout: "abc123\n", stderr: "", exitCode: 0 };
+        }
+        return {
+          ok: false,
+          stdout: "",
+          stderr: "timed out after 5000ms",
+          exitCode: null,
+        };
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.removed).toBe(0);
+    expect(result.detail).toContain(
+      "docker cleanup timed out; skipped WorkerPal warm-container cleanup",
+    );
+  });
+
   test("cleanupLingeringWorkerpalWarmContainers removes matching warm containers", async () => {
     const calls: Array<{ command: string[]; cwd: string }> = [];
     let phase = 0;
@@ -1807,6 +1857,33 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(result.ok).toBe(true);
     expect(result.removed).toBe(false);
     expect(result.detail).toContain("docker unavailable; skipped WorkerPal sandbox image cleanup");
+  });
+
+  test("cleanupLocalWorkerpalSandboxImage treats Docker timeouts as a no-op", async () => {
+    const result = await cleanupLocalWorkerpalSandboxImage({
+      repoRoot: "/repo/example",
+      env: {
+        PUSHPALS_DOCKER_BIN: "docker",
+      },
+      dockerImage: "pushpals-worker-sandbox:latest",
+      runCommandWithEnvFn: async () => ({
+        ok: false,
+        stdout: "",
+        stderr: "timed out after 5000ms",
+        exitCode: null,
+      }),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.removed).toBe(false);
+    expect(result.detail).toContain(
+      "docker cleanup timed out; skipped WorkerPal sandbox image cleanup",
+    );
+  });
+
+  test("isDockerCleanupTimeoutDetail classifies Docker command timeout failures", () => {
+    expect(isDockerCleanupTimeoutDetail("timed out after 5000ms")).toBe(true);
+    expect(isDockerCleanupTimeoutDetail("Cannot connect to the Docker daemon")).toBe(false);
   });
 
   test("isDockerUnavailableDetail classifies common Docker daemon failures", () => {
