@@ -58,6 +58,7 @@ import {
   shouldRunEmbeddedRuntimeStartupPrechecks,
   resolvePreferredRuntimeReleaseTag,
   resolveWindowsShellExecutableCandidatesForEnv,
+  resolveWorkerpalDockerProbe,
   startEmbeddedMonitoringHub,
   waitForWorkerpalCapacity,
 } from "../scripts/pushpals-cli.ts";
@@ -995,6 +996,32 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
     );
     expect(result.env.PATH).toContain("C:\\Program Files\\Docker\\Docker\\resources\\bin");
+  });
+
+  test("resolveWorkerpalDockerProbe honors a configured absolute Docker binary first", async () => {
+    const env: Record<string, string> = {
+      PATH: "/usr/bin",
+      PUSHPALS_DOCKER_BIN_ABSOLUTE: "/tmp/pushpals/fake-docker",
+    };
+    const calls: string[][] = [];
+
+    const result = await resolveWorkerpalDockerProbe(
+      "/repo/example",
+      env,
+      "linux",
+      async (command) => {
+        calls.push(command);
+        return { ok: true, stdout: "fake-26.1.1\n", stderr: "", exitCode: 0 };
+      },
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "fake-docker (fake-26.1.1)",
+    });
+    expect(calls[0]?.[0]).toBe("fake-docker");
+    expect(env.PUSHPALS_DOCKER_BIN).toBe("fake-docker");
+    expect(env.PUSHPALS_DOCKER_BIN_ABSOLUTE).toBe("/tmp/pushpals/fake-docker");
   });
 
   test("waitForWorkerpalCapacity only succeeds when an idle worker is available", async () => {

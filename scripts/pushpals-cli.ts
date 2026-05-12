@@ -2167,26 +2167,30 @@ async function resolveSourceControlManagerGitProbe(
   };
 }
 
-async function resolveWorkerpalDockerProbe(
+export async function resolveWorkerpalDockerProbe(
   cwd: string,
   env: Record<string, string>,
   platform = process.platform,
+  runCommandWithEnvFn: typeof runCommandWithEnv = runCommandWithEnv,
 ): Promise<{ ok: boolean; detail: string }> {
-  const resolvedDockerBinary = await resolveCommandPath(
-    platform === "win32" ? "docker.exe" : "docker",
-    cwd,
-    env,
-  );
-  if (resolvedDockerBinary) {
-    prependExecutableDirToPath(env, resolvedDockerBinary, platform);
-    env.PUSHPALS_DOCKER_BIN = basename(resolvedDockerBinary);
-    env.PUSHPALS_DOCKER_BIN_ABSOLUTE = resolvedDockerBinary;
+  const preconfiguredDockerBinary = env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? env.PUSHPALS_DOCKER_BIN;
+  if (preconfiguredDockerBinary) {
+    applyResolvedDockerBinaryToRuntimeEnv(env, preconfiguredDockerBinary, platform);
+  } else {
+    const resolvedDockerBinary = await resolveCommandPath(
+      platform === "win32" ? "docker.exe" : "docker",
+      cwd,
+      env,
+    );
+    if (resolvedDockerBinary) {
+      applyResolvedDockerBinaryToRuntimeEnv(env, resolvedDockerBinary, platform);
+    }
   }
 
   const candidates = resolveRuntimeDockerExecutableCandidates(env, platform);
   const failures: string[] = [];
   for (const candidate of candidates) {
-    const result = await runCommandWithEnv(
+    const result = await runCommandWithEnvFn(
       [candidate, "version", "--format", "{{.Server.Version}}"],
       cwd,
       env,
