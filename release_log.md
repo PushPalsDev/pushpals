@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.0.72`
-- start_commit: `981e8d8333fd87b43005deef7ee845f75e433c48`
-- end_commit: `aa2479d1c46dfc6d2514dde7b5c3843a146eb341`
+- version: `v1.0.73`
+- start_commit: `f341f6d7b8ac605a6e5771dbf3e23e68dd49034e`
+- end_commit: `4741080e356cb044135fc44d121c860cae15ac48`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Honor an explicit `PUSHPALS_DOCKER_BIN_ABSOLUTE` or `PUSHPALS_DOCKER_BIN` override before resolving `docker` from `PATH` during WorkerPal Docker preflight.
-- Preserve the configured Docker binary through the preflight environment so sandbox image checks, rebuilds, and runtime services use the intended executable.
-- Add regression coverage for configured Docker probe binary precedence.
+- Suppress autonomy-origin RemoteBuddy, WorkerPal, and SourceControlManager chatter from the interactive CLI session stream while preserving user-directed assistant messages and clarification prompts.
+- Carry autonomy origin metadata through server queues, completions, protocol schemas, packaged runtime assets, and client visibility filters so web, VS Code, and CLI timelines stay consistent.
+- Add a packaged CLI session-stream end-to-end regression that starts a real server, connects the CLI, fakes RemoteBuddy and WorkerPal presence, injects hidden autonomy events, and verifies only user-facing events reach stdout.
 
 ## Install
 
