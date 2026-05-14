@@ -3069,9 +3069,9 @@ async function main() {
   await orchestrator.emitStartupStatus();
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();
+  await orchestrator.ensureWorkerCapacityOnStartup();
   orchestrator.startAutonomy();
   orchestrator.startAutonomyRuntimeConfigPolling();
-  await orchestrator.ensureWorkerCapacityOnStartup();
 
   // Start polling for requests from the Request Queue
   const pollMs = CONFIG.remotebuddy.pollMs;
