@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { AutonomyStore } from "../apps/server/src/autonomy";
+import { AutonomyStore, type AutonomyEvaluatorScorecard } from "../apps/server/src/autonomy";
 import { JobQueue } from "../apps/server/src/jobs";
 
 const stores: AutonomyStore[] = [];
@@ -30,6 +30,36 @@ function closeTrackedStore(store: AutonomyStore): void {
   const idx = stores.indexOf(store);
   if (idx >= 0) stores.splice(idx, 1);
   store.close();
+}
+
+function runEvaluatorNow(store: AutonomyStore): AutonomyEvaluatorScorecard {
+  return (
+    store as unknown as { runEvaluator: (nowIso?: string) => AutonomyEvaluatorScorecard }
+  ).runEvaluator(new Date(Date.now() + 1000).toISOString());
+}
+
+function autonomyOutcomeCount(store: AutonomyStore, objectiveId: string): number {
+  const db = (store as unknown as { db: any }).db;
+  const row = db
+    .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE objective_id = ?`)
+    .get(objectiveId) as { count: number };
+  return Math.max(0, Math.floor(Number(row.count ?? 0)));
+}
+
+function autonomyObjectiveStatus(store: AutonomyStore, objectiveId: string): string | null {
+  const db = (store as unknown as { db: any }).db;
+  const row = db
+    .prepare(`SELECT status FROM autonomy_objectives WHERE id = ? LIMIT 1`)
+    .get(objectiveId) as { status: string | null } | undefined;
+  return typeof row?.status === "string" ? row.status : null;
+}
+
+function autonomyPatternSampleCount(store: AutonomyStore, patternKey: string): number {
+  const db = (store as unknown as { db: any }).db;
+  const row = db
+    .prepare(`SELECT sample_count FROM autonomy_pattern_stats WHERE pattern_key = ? LIMIT 1`)
+    .get(patternKey) as { sample_count: number | null } | undefined;
+  return Math.max(0, Math.floor(Number(row?.sample_count ?? 0)));
 }
 
 afterEach(() => {
@@ -1726,6 +1756,162 @@ describe("server AutonomyStore policy gates", () => {
     } finally {
       jobQueue.close();
     }
+  });
+
+  test("recordPrFeedback keeps approved_unmergeable feedback non-terminal", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_merge_conflict_feedback",
+    }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_merge_conflict_feedback",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_merge_conflict_feedback",
+        title: "Seed merge-conflict PR feedback objective",
+        instruction: "Exercise approved-unmergeable feedback handling.",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/autonomy.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun test tests/server.autonomy-store.test.ts"],
+        status: "dispatched",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const feedback = store.recordPrFeedback({
+      feedbackKey: "review_agent:pr:42:head:abc123:verdict:approved_unmergeable",
+      objectiveId: "obj_merge_conflict_feedback",
+      requestId: "req_merge_conflict_feedback",
+      jobId: "job_merge_conflict_feedback",
+      patternKey: decision.patternKey,
+      prNumber: 42,
+      verdict: "approved_unmergeable",
+      summary: "Approved by ReviewAgent, but GitHub reported a merge conflict.",
+      reviewScore: 8.3,
+      reviewThreshold: 8.1,
+    });
+
+    expect(feedback.ok).toBe(true);
+    expect(feedback.success).toBeUndefined();
+    expect(autonomyOutcomeCount(store, "obj_merge_conflict_feedback")).toBe(0);
+  });
+
+  test("evaluator scores iterative PR feedback as one latest objective sample", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_review_loop" })
+      .snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_review_loop",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_review_loop",
+        title: "Seed iterative PR review objective",
+        instruction: "Exercise iterative review feedback handling.",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps/server/src/autonomy.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun test tests/server.autonomy-store.test.ts"],
+        status: "dispatched",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    for (let i = 0; i < 7; i += 1) {
+      const feedback = store.recordPrFeedback({
+        feedbackKey: `review_agent:pr:42:head:reject-${i}:verdict:rejected`,
+        objectiveId: "obj_review_loop",
+        requestId: "req_review_loop",
+        jobId: "job_review_loop",
+        patternKey: decision.patternKey,
+        prNumber: 42,
+        verdict: "rejected",
+        summary: `Review iteration ${i + 1} still needs fixes.`,
+        reviewScore: 7.5,
+        reviewThreshold: 8.1,
+      });
+      expect(feedback.ok).toBe(true);
+    }
+
+    const rejectedCard = runEvaluatorNow(store);
+    expect(rejectedCard.sampleCount).toBe(1);
+    expect(rejectedCard.successRate).toBe(0);
+    expect(rejectedCard.regretRate).toBe(1);
+    expect(rejectedCard.recommendation).toBe("constrain");
+    expect(autonomyObjectiveStatus(store, "obj_review_loop")).toBe("dispatched");
+    expect(autonomyPatternSampleCount(store, decision.patternKey)).toBe(0);
+
+    const frozen = store.updateSafetyState({
+      freezeForMs: 600_000,
+      freezeReason: "auto_freeze:evaluator_pause",
+    });
+    expect(frozen.ok).toBe(true);
+    expect(frozen.state.isFrozen).toBe(true);
+
+    const recheckedCard = runEvaluatorNow(store);
+    expect(recheckedCard.sampleCount).toBe(1);
+    expect(recheckedCard.recommendation).toBe("constrain");
+    expect(store.getSafetyState().isFrozen).toBe(false);
+
+    const merged = store.recordPrFeedback({
+      feedbackKey: "review_agent:pr:42:head:merged:verdict:approved_merged",
+      objectiveId: "obj_review_loop",
+      requestId: "req_review_loop",
+      jobId: "job_review_loop",
+      patternKey: decision.patternKey,
+      prNumber: 42,
+      verdict: "approved_merged",
+      summary: "ReviewAgent approved and merged the PR.",
+      reviewScore: 8.4,
+      reviewThreshold: 8.1,
+    });
+    expect(merged.ok).toBe(true);
+    expect(merged.success).toBe(true);
+
+    const mergedCard = runEvaluatorNow(store);
+    expect(mergedCard.sampleCount).toBe(1);
+    expect(mergedCard.successRate).toBe(1);
+    expect(mergedCard.regretRate).toBe(0);
+    expect(mergedCard.recommendation).toBe("constrain");
+    expect(autonomyObjectiveStatus(store, "obj_review_loop")).toBe("completed");
+    expect(autonomyPatternSampleCount(store, decision.patternKey)).toBe(1);
+  });
+
+  test("evaluator still pauses on independent failed objective samples", () => {
+    const store = makeStore();
+
+    for (let i = 0; i < 6; i += 1) {
+      const outcome = store.recordOutcome({
+        objectiveId: `obj_independent_failure_${i}`,
+        requestId: `req_independent_failure_${i}`,
+        jobId: `job_independent_failure_${i}`,
+        patternKey: `pk_independent_failure_${i}`,
+        success: false,
+        userAction: "failed",
+        reopenedWithin24h: false,
+        regressionFlag: true,
+      });
+      expect(outcome.ok).toBe(true);
+    }
+
+    const card = runEvaluatorNow(store);
+    expect(card.sampleCount).toBe(6);
+    expect(card.successRate).toBe(0);
+    expect(card.regretRate).toBe(1);
+    expect(card.recommendation).toBe("pause");
+    expect(store.getSafetyState().isFrozen).toBe(true);
+    expect(store.getSafetyState().freezeReason).toBe("auto_freeze:evaluator_pause");
   });
 
   test("ingestInspirationPatterns dedupes fingerprints and tracks source attribution", () => {

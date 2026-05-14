@@ -221,8 +221,6 @@ function isNegativePrFeedbackVerdict(value: string): boolean {
   const text = value.toLowerCase();
   return (
     text.includes("reject") ||
-    text.includes("unmergeable") ||
-    text.includes("merge_conflict") ||
     text.includes("merge_failed") ||
     text.includes("failed")
   );
@@ -235,14 +233,32 @@ function deriveOutcomeFromPrFeedbackVerdict(
   userAction: string;
   reopenedWithin24h: boolean;
   regressionFlag: boolean;
+  terminal: boolean;
 } | null {
   const text = verdict.toLowerCase();
+  if (
+    text.includes("approved_unmergeable") ||
+    (text.includes("approved") &&
+      (text.includes("unmergeable") || text.includes("merge_conflict")))
+  ) {
+    return null;
+  }
+  if (text.includes("rejected_comment_cap_closed") || text.includes("closed")) {
+    return {
+      success: false,
+      userAction: "rejected",
+      reopenedWithin24h: true,
+      regressionFlag: true,
+      terminal: true,
+    };
+  }
   if (isNegativePrFeedbackVerdict(text)) {
     return {
       success: false,
       userAction: "rejected",
       reopenedWithin24h: true,
       regressionFlag: true,
+      terminal: !text.includes("reject"),
     };
   }
   if (text.includes("approved") || text.includes("merged")) {
@@ -251,6 +267,7 @@ function deriveOutcomeFromPrFeedbackVerdict(
       userAction: "accepted",
       reopenedWithin24h: false,
       regressionFlag: false,
+      terminal: true,
     };
   }
   return null;
@@ -1890,15 +1907,37 @@ export class AutonomyStore {
     const windowHours = Math.max(1, Math.floor(asNumber(cfg.evaluatorWindowHours, 24)));
     const rows = this.db
       .prepare(
-        `SELECT COUNT(*) AS sample_count,
+        `WITH windowed AS (
+           SELECT id, success, latency_ms, reopened_within_24h, regression_flag,
+                  CASE
+                    WHEN NULLIF(objective_id, '') IS NOT NULL THEN 'objective:' || objective_id
+                    WHEN NULLIF(job_id, '') IS NOT NULL THEN 'job:' || job_id
+                    WHEN NULLIF(request_id, '') IS NOT NULL THEN 'request:' || request_id
+                    ELSE 'outcome:' || id
+                  END AS sample_key
+           FROM autonomy_outcomes
+           WHERE datetime(created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')
+         ),
+         latest_ids AS (
+           SELECT sample_key, MAX(id) AS latest_id
+           FROM windowed
+           GROUP BY sample_key
+         ),
+         latest AS (
+           SELECT w.*
+           FROM windowed w
+           INNER JOIN latest_ids l ON l.latest_id = w.id
+         )
+         SELECT (SELECT COUNT(*) FROM windowed) AS raw_sample_count,
+                COUNT(*) AS sample_count,
                 SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count,
                 SUM(CASE WHEN reopened_within_24h = 1 OR regression_flag = 1 THEN 1 ELSE 0 END) AS regret_count,
                 AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS avg_latency_ms
-         FROM autonomy_outcomes
-         WHERE datetime(created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')`,
+         FROM latest`,
       )
       .get(nowIso) as
       | {
+          raw_sample_count: number;
           sample_count: number;
           success_count: number | null;
           regret_count: number | null;
@@ -1925,6 +1964,7 @@ export class AutonomyStore {
     const minSamples = Math.max(1, Math.floor(asNumber(cfg.evaluatorMinSamples, 1)));
     const minSuccessRate = clamp01(asNumber(cfg.evaluatorMinSuccessRate, 0.45));
     const maxRegretRate = clamp01(asNumber(cfg.evaluatorMaxRegretRate, 0.35));
+    const rawSampleCount = Math.max(0, Math.floor(asNumber(rows?.raw_sample_count, sampleCount)));
 
     let recommendation: "healthy" | "constrain" | "pause" = "healthy";
     if (sampleCount < minSamples) {
@@ -1945,6 +1985,7 @@ export class AutonomyStore {
       minSamples,
       minSuccessRate,
       maxRegretRate,
+      rawSampleCount,
       sampleCount,
       successRate,
       regretRate,
@@ -1999,6 +2040,12 @@ export class AutonomyStore {
         details: payload,
         nowIso,
       });
+    }
+    if (recommendation !== "pause") {
+      const safety = this.getSafetyState(nowIso);
+      if (safety.isFrozen && safety.freezeReason === "auto_freeze:evaluator_pause") {
+        this.updateSafetyState({ clearFreeze: true });
+      }
     }
 
     return {
@@ -4586,6 +4633,7 @@ export class AutonomyStore {
       userAction: mappedOutcome.userAction,
       reopenedWithin24h: mappedOutcome.reopenedWithin24h,
       regressionFlag: mappedOutcome.regressionFlag,
+      terminal: mappedOutcome.terminal,
     });
     if (!outcome.ok) {
       return {
@@ -4631,6 +4679,10 @@ export class AutonomyStore {
     const userAction = asString(body.userAction ?? body.user_action) || null;
     const reopenedWithin24h = asBoolean(body.reopenedWithin24h ?? body.reopened_within_24h, false);
     const regressionFlag = asBoolean(body.regressionFlag ?? body.regression_flag, false);
+    const terminal = asBoolean(
+      body.terminal ?? body.isTerminal ?? body.is_terminal ?? body.terminal_outcome,
+      true,
+    );
     const normalizedUserAction = userAction ? userAction.toLowerCase() : "";
 
     // RemoteBuddy marks delegated requests complete after enqueueing a worker job.
@@ -4677,6 +4729,10 @@ export class AutonomyStore {
         now,
       );
     const outcomeId = Math.max(0, Math.floor(asNumber(outcomeInsert.lastInsertRowid, 0)));
+    if (!terminal) {
+      this.maybeRunEvaluator(now);
+      return { ok: true };
+    }
 
     if (objectiveId) {
       const terminalStatus = success ? "completed" : "failed";
