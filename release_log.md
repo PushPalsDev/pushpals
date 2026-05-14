@@ -2,16 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.73`
-- start_commit: `f341f6d7b8ac605a6e5771dbf3e23e68dd49034e`
-- end_commit: `4741080e356cb044135fc44d121c860cae15ac48`
+- version: `v1.0.74`
+- start_commit: `0d63581774fa74cb9037a705a381ed4f42f9482d`
+- end_commit: `0a2f186c3169f0f0921d69004fa51bf44810755e`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Suppress autonomy-origin RemoteBuddy, WorkerPal, and SourceControlManager chatter from the interactive CLI session stream while preserving user-directed assistant messages and clarification prompts.
-- Carry autonomy origin metadata through server queues, completions, protocol schemas, packaged runtime assets, and client visibility filters so web, VS Code, and CLI timelines stay consistent.
-- Add a packaged CLI session-stream end-to-end regression that starts a real server, connects the CLI, fakes RemoteBuddy and WorkerPal presence, injects hidden autonomy events, and verifies only user-facing events reach stdout.
+- Fix autonomy evaluator freeze scoring by collapsing repeated outcome rows to the latest sample per objective, job, or request before calculating success and regret rates.
+- Keep ReviewAgent `approved_unmergeable` feedback as non-terminal merge-conflict handoff state instead of recording it as a failed autonomy outcome.
+- Prevent intermediate PR rejection feedback from prematurely closing objectives or incrementing pattern fail streak learning while preserving real pauses for independent failed objectives.
+- Automatically clear stale `auto_freeze:evaluator_pause` freezes once the corrected evaluator no longer recommends pause.
+- Add regression coverage for noisy ReviewAgent loops, approved-unmergeable feedback, stale evaluator-freeze clearing, and independent failure pause behavior.
 
 ## Install
 
