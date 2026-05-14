@@ -1127,6 +1127,36 @@ function writeTextFileIfMissing(pathValue: string, text: string): void {
   writeFileSync(pathValue, text, "utf8");
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function migrateEmbeddedRuntimeTomlSection(
+  text: string,
+  sectionName: string,
+  transform: (sectionBody: string) => string,
+): string {
+  const sectionPattern = new RegExp(
+    `(^\\[${escapeRegExp(sectionName)}\\]\\r?\\n)([\\s\\S]*?)(?=\\r?\\n\\[|(?![\\s\\S]))`,
+    "m",
+  );
+  return text.replace(sectionPattern, (_match, header: string, body: string) => {
+    return `${header}${transform(body)}`;
+  });
+}
+
+function migrateLegacyOpenAICodexDefaults(sectionBody: string, opts: { includeModel: boolean }) {
+  const backendIsOpenAICodex = /^\s*backend\s*=\s*"openai_codex"\s*$/m.test(sectionBody);
+  if (!backendIsOpenAICodex && opts.includeModel) return sectionBody;
+
+  let updated = sectionBody;
+  if (opts.includeModel) {
+    updated = updated.replace(/^(\s*model\s*=\s*)"gpt-5\.4"\s*$/m, '$1"gpt-5.5"');
+  }
+  updated = updated.replace(/^(\s*reasoning_effort\s*=\s*)"high"\s*$/m, '$1"xhigh"');
+  return updated;
+}
+
 function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
   if (!existsSync(localTomlPath)) return;
   let original: string;
@@ -1139,8 +1169,19 @@ function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
     /^(\[remotebuddy\.autonomy\]\r?\n)(enabled\s*=\s*false\s*\r?\n)/m,
     "$1enabled = true\n",
   );
-  if (updated !== original) {
-    writeFileSync(localTomlPath, updated, "utf8");
+  let migrated = updated;
+  for (const sectionName of ["localbuddy.llm", "remotebuddy.llm", "workerpals.llm"]) {
+    migrated = migrateEmbeddedRuntimeTomlSection(migrated, sectionName, (sectionBody) =>
+      migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: true }),
+    );
+  }
+  migrated = migrateEmbeddedRuntimeTomlSection(
+    migrated,
+    "workerpals.openai_codex",
+    (sectionBody) => migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),
+  );
+  if (migrated !== original) {
+    writeFileSync(localTomlPath, migrated, "utf8");
   }
 }
 

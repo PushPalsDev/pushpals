@@ -1576,6 +1576,96 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
+  test("prepareCliRuntime migrates stale embedded Codex defaults to gpt-5.5 xhigh", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-default-migrate-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "configs", "local.toml"),
+        [
+          "[localbuddy.llm]",
+          'backend = "openai_codex"',
+          'model = "gpt-5.4"',
+          'reasoning_effort = "high"',
+          "",
+          "[remotebuddy.llm]",
+          'backend = "openai_codex"',
+          'model = "gpt-5.4"',
+          'reasoning_effort = "high"',
+          "",
+          "[workerpals.llm]",
+          'backend = "openai_codex"',
+          'model = "gpt-5.4"',
+          'reasoning_effort = "high"',
+          "",
+          "[workerpals.openai_codex]",
+          'reasoning_effort = "high"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const prepared = await prepareCliRuntime({
+        repoRoot,
+        runtimeRoot,
+      });
+
+      const migratedLocalToml = readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8");
+      expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+      expect(prepared.runtimePreflight.config?.localbuddy.llm.model).toBe("gpt-5.5");
+      expect(prepared.runtimePreflight.config?.remotebuddy.llm.model).toBe("gpt-5.5");
+      expect(prepared.runtimePreflight.config?.workerpals.llm.model).toBe("gpt-5.5");
+      expect(prepared.runtimePreflight.config?.localbuddy.llm.reasoningEffort).toBe("xhigh");
+      expect(prepared.runtimePreflight.config?.remotebuddy.llm.reasoningEffort).toBe("xhigh");
+      expect(prepared.runtimePreflight.config?.workerpals.llm.reasoningEffort).toBe("xhigh");
+      expect(migratedLocalToml).toContain('model = "gpt-5.5"');
+      expect(migratedLocalToml).toContain('reasoning_effort = "xhigh"');
+      expect(migratedLocalToml).not.toContain("gpt-5.4");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareCliRuntime preserves custom embedded Codex model overrides", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-custom-preserve-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "configs", "local.toml"),
+        [
+          "[remotebuddy.llm]",
+          'backend = "openai_codex"',
+          'model = "gpt-5.5-mini"',
+          'reasoning_effort = "medium"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const prepared = await prepareCliRuntime({
+        repoRoot,
+        runtimeRoot,
+      });
+
+      expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+      expect(prepared.runtimePreflight.config?.remotebuddy.llm.model).toBe("gpt-5.5-mini");
+      expect(prepared.runtimePreflight.config?.remotebuddy.llm.reasoningEffort).toBe("medium");
+      expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8")).toContain(
+        'model = "gpt-5.5-mini"',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("prepareCliRuntime ensures embedded local.toml exists for external runtimes", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-local-seed-"));
     const repoRoot = join(root, "repo");
