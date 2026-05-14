@@ -2,17 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.0.76`
-- start_commit: `a4ab117d52c1970e65207aac59b21866a63d9fed`
-- end_commit: `9c7982f28e5aae82e8c84ee1c37be4ce49071193`
+- version: `v1.0.77`
+- start_commit: `2d8603c9dc4928d7a49c3bfbdde35c778c71aae6`
+- end_commit: `e02b92ec81c729227a3acd727b41d2a7cbd807f4`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Sync the packaged RemoteBuddy fallback bundle with the source startup order so crash fallback warms initial WorkerPal capacity before starting autonomy.
-- Preserve the v1.0.75 autonomy startup fix when the Windows packaged binary falls back to bundled source after a Bun runtime panic.
-- Confirm Codex CLI `gpt-5.5` with `xhigh` reasoning works through the same `model_reasoning_effort` config shape PushPals passes to Codex.
-- Re-run CLI E2E and integration coverage for packaged runtime boot, autonomy-enabled Windows boot, crash fallback, Docker guidance, supervisor restart, session-stream filtering, and runtime bootstrap behavior.
+- Migrate stale embedded runtime `local.toml` Codex defaults from `gpt-5.4`/`high` to `gpt-5.5`/`xhigh` during CLI runtime preparation.
+- Preserve custom non-legacy Codex model and reasoning overrides while updating only exact legacy default values.
+- Add regression coverage for stale generated runtime config migration and custom override preservation.
+- Verify the CLI bootstrap, shared config, and packaged CLI end-to-end suites after the migration fix.
 
 ## Install
 
