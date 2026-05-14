@@ -9506,9 +9506,9 @@ async function main() {
   await orchestrator.emitStartupStatus();
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();
+  await orchestrator.ensureWorkerCapacityOnStartup();
   orchestrator.startAutonomy();
   orchestrator.startAutonomyRuntimeConfigPolling();
-  await orchestrator.ensureWorkerCapacityOnStartup();
   const pollMs = CONFIG.remotebuddy.pollMs;
   orchestrator.startPolling(pollMs);
 }
