@@ -2,19 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.0.75`
-- start_commit: `0d63581774fa74cb9037a705a381ed4f42f9482d`
-- end_commit: `fa55e177a1851e7db29bd837d0d43c50597da277`
-- commits_in_range: `3`
+- version: `v1.0.76`
+- start_commit: `a4ab117d52c1970e65207aac59b21866a63d9fed`
+- end_commit: `9c7982f28e5aae82e8c84ee1c37be4ce49071193`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Fix autonomy evaluator freeze scoring by collapsing repeated outcome rows to the latest sample per objective, job, or request before calculating success and regret rates.
-- Keep ReviewAgent `approved_unmergeable` feedback as non-terminal merge-conflict handoff state instead of recording it as a failed autonomy outcome.
-- Prevent intermediate PR rejection feedback from prematurely closing objectives or incrementing pattern fail streak learning while preserving real pauses for independent failed objectives.
-- Automatically clear stale `auto_freeze:evaluator_pause` freezes once the corrected evaluator no longer recommends pause.
-- Start initial WorkerPal capacity warmup before RemoteBuddy enables the autonomous engine's immediate first tick, preventing long ideation from racing startup readiness in Windows runtime smoke.
-- Add regression coverage for noisy ReviewAgent loops, approved-unmergeable feedback, stale evaluator-freeze clearing, and independent failure pause behavior.
+- Sync the packaged RemoteBuddy fallback bundle with the source startup order so crash fallback warms initial WorkerPal capacity before starting autonomy.
+- Preserve the v1.0.75 autonomy startup fix when the Windows packaged binary falls back to bundled source after a Bun runtime panic.
+- Confirm Codex CLI `gpt-5.5` with `xhigh` reasoning works through the same `model_reasoning_effort` config shape PushPals passes to Codex.
+- Re-run CLI E2E and integration coverage for packaged runtime boot, autonomy-enabled Windows boot, crash fallback, Docker guidance, supervisor restart, session-stream filtering, and runtime bootstrap behavior.
 
 ## Install
 
