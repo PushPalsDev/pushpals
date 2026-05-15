@@ -1416,6 +1416,48 @@ function persistResolvedCodexCommandPrefix(commandPrefix: string[]): void {
   process.env.PUSHPALS_OPENAI_CODEX_BIN_JSON = json;
 }
 
+type CodexCliVersion = {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string;
+};
+
+function isDefaultCodexCommandPrefix(commandPrefix: string[]): boolean {
+  const normalized = commandPrefix.map((part) => part.trim().toLowerCase()).filter(Boolean);
+  return (
+    normalized.length === 0 ||
+    normalized.join("\u0000") === ["bun", "x", "--yes", "@openai/codex"].join("\u0000") ||
+    normalized.join("\u0000") === ["bunx", "--yes", "@openai/codex"].join("\u0000")
+  );
+}
+
+function parseCodexCliVersion(text: string): CodexCliVersion | null {
+  const match = text.match(
+    /(?:codex(?:-cli)?|openai\s+codex)?\s*v?(\d+)\.(\d+)\.(\d+)(?:-([0-9a-z.-]+))?/i,
+  );
+  if (!match) return null;
+  return {
+    major: Number.parseInt(match[1]!, 10),
+    minor: Number.parseInt(match[2]!, 10),
+    patch: Number.parseInt(match[3]!, 10),
+    prerelease: match[4] ?? "",
+  };
+}
+
+function compareCodexCliVersions(a: CodexCliVersion | null, b: CodexCliVersion | null): number {
+  if (a && !b) return 1;
+  if (!a && b) return -1;
+  if (!a || !b) return 0;
+  for (const key of ["major", "minor", "patch"] as const) {
+    if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
+  }
+  if (a.prerelease === b.prerelease) return 0;
+  if (!a.prerelease) return 1;
+  if (!b.prerelease) return -1;
+  return a.prerelease.localeCompare(b.prerelease);
+}
+
 async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<string[]> {
   const candidates: string[][] = [];
   const pushCandidate = (cmd: string[]) => {
@@ -1438,11 +1480,37 @@ async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<s
   pushCandidate(["codex"]);
 
   const attempted: string[] = [];
+  const successful: Array<{ command: string[]; version: CodexCliVersion | null; versionText: string }> = [];
+  const preferNewestCompatible = isDefaultCodexCommandPrefix(commandPrefix);
   for (const candidate of candidates) {
     const renderedCandidate = candidate.join(" ");
     attempted.push(`${renderedCandidate} --version`);
-    const versionExit = await runQuiet([...candidate, "--version"]);
-    if (versionExit === 0) return candidate;
+    const versionProbe = await runQuietOutput([...candidate, "--version"]);
+    if (versionProbe.code === 0) {
+      const versionText = (versionProbe.stdout || versionProbe.stderr || "")
+        .trim()
+        .split(/\r?\n/, 1)[0] ?? "";
+      successful.push({
+        command: candidate,
+        version: parseCodexCliVersion(versionText),
+        versionText,
+      });
+      if (!preferNewestCompatible) break;
+    }
+  }
+
+  if (successful.length > 0) {
+    const selected = preferNewestCompatible
+      ? successful.reduce((best, probe) =>
+          compareCodexCliVersions(probe.version, best.version) > 0 ? probe : best,
+        )
+      : successful[0]!;
+    console.log(
+      `[start] Codex CLI command resolved: ${selected.command.join(" ")}${
+        selected.versionText ? ` (${selected.versionText})` : ""
+      }`,
+    );
+    return selected.command;
   }
 
   console.error("[start] openai_codex backend selected but Codex CLI is unavailable.");
@@ -2532,6 +2600,22 @@ async function runQuiet(cmd: string[]): Promise<number> {
     return proc.exited;
   } catch {
     return 127;
+  }
+}
+
+async function runQuietOutput(cmd: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const proc = Bun.spawn(cmd, {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdoutPromise = new Response(proc.stdout).text();
+    const stderrPromise = new Response(proc.stderr).text();
+    const code = await proc.exited;
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    return { code, stdout, stderr };
+  } catch {
+    return { code: 127, stdout: "", stderr: "" };
   }
 }
 

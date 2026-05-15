@@ -93,6 +93,7 @@ const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "local-model";
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
+const LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.4";
 const DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_TIMEOUT_MS = 120_000;
 const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
@@ -134,6 +135,19 @@ type ProcessRunResult = {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+};
+
+type CodexVersion = {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string;
+};
+
+type CodexCommandProbe = {
+  command: string[];
+  version: CodexVersion | null;
+  versionText: string;
 };
 
 function splitArgs(raw: string): string[] {
@@ -253,6 +267,64 @@ function codexReasoningEffort(
   return defaultEffort;
 }
 
+function isDefaultCodexLauncher(command: string[]): boolean {
+  const normalized = command.map((part) => part.trim().toLowerCase()).filter(Boolean);
+  return (
+    normalized.length === 0 ||
+    normalized.join("\u0000") === ["bun", "x", "--yes", "@openai/codex"].join("\u0000") ||
+    normalized.join("\u0000") === ["bunx", "--yes", "@openai/codex"].join("\u0000")
+  );
+}
+
+function parseCodexCliVersion(text: string): CodexVersion | null {
+  const match = text.match(
+    /(?:codex(?:-cli)?|openai\s+codex)?\s*v?(\d+)\.(\d+)\.(\d+)(?:-([0-9a-z.-]+))?/i,
+  );
+  if (!match) return null;
+  return {
+    major: Number.parseInt(match[1]!, 10),
+    minor: Number.parseInt(match[2]!, 10),
+    patch: Number.parseInt(match[3]!, 10),
+    prerelease: match[4] ?? "",
+  };
+}
+
+function compareCodexVersions(a: CodexVersion | null, b: CodexVersion | null): number {
+  if (a && !b) return 1;
+  if (!a && b) return -1;
+  if (!a || !b) return 0;
+  for (const key of ["major", "minor", "patch"] as const) {
+    if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
+  }
+  if (a.prerelease === b.prerelease) return 0;
+  if (!a.prerelease) return 1;
+  if (!b.prerelease) return -1;
+  return a.prerelease.localeCompare(b.prerelease);
+}
+
+function chooseCodexCommandProbe(
+  probes: CodexCommandProbe[],
+  opts: { preferNewestCompatible: boolean },
+): CodexCommandProbe | null {
+  if (probes.length === 0) return null;
+  if (!opts.preferNewestCompatible) return probes[0]!;
+  return probes.reduce((best, probe) =>
+    compareCodexVersions(probe.version, best.version) > 0 ? probe : best,
+  );
+}
+
+function requiresNewerCodexForModel(stdout: string, stderr: string): boolean {
+  const combined = `${stdout}\n${stderr}`.toLowerCase();
+  return (
+    combined.includes("requires a newer version of codex") ||
+    (combined.includes("requires newer") && combined.includes("codex"))
+  );
+}
+
+function isDefaultCodexModel(model: string): boolean {
+  return model.trim().toLowerCase() === DEFAULT_CODEX_MODEL.toLowerCase();
+}
+
 function normalizeCodexModel(rawModel: string): string {
   const model = rawModel.trim();
   if (!model) return DEFAULT_CODEX_MODEL;
@@ -279,6 +351,75 @@ function normalizeOpenAiBaseFromEndpoint(rawEndpoint: string): string {
 }
 
 async function runProcess(
+  command: string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+): Promise<ProcessRunResult> {
+  const bunRuntime = (globalThis as { Bun?: { spawn?: unknown } }).Bun;
+  if (typeof bunRuntime?.spawn === "function") {
+    return runProcessWithBun(command, opts);
+  }
+  return runProcessWithNode(command, opts);
+}
+
+async function runProcessWithBun(
+  command: string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+): Promise<ProcessRunResult> {
+  const bunRuntime = (globalThis as any).Bun;
+  const timeoutMs = opts.timeoutMs ?? 0;
+  let timedOut = false;
+  let timeout: NodeJS.Timeout | null = null;
+  let killTimeout: NodeJS.Timeout | null = null;
+  const proc = bunRuntime.spawn(command, {
+    cwd: opts.cwd,
+    env: opts.env,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stdoutPromise = new Response(proc.stdout).text();
+  const stderrPromise = new Response(proc.stderr).text();
+
+  if (timeoutMs > 0) {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // best effort
+      }
+      killTimeout = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // best effort
+        }
+      }, 1_000);
+      killTimeout.unref?.();
+    }, timeoutMs);
+  }
+
+  try {
+    if (typeof opts.stdin === "string") {
+      proc.stdin?.write(opts.stdin);
+    }
+    proc.stdin?.end();
+    const code = await proc.exited;
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    return {
+      code,
+      signal: null,
+      stdout,
+      stderr,
+      timedOut,
+    };
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (killTimeout) clearTimeout(killTimeout);
+  }
+}
+
+async function runProcessWithNode(
   command: string[],
   opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
 ): Promise<ProcessRunResult> {
@@ -354,6 +495,7 @@ async function resolveCodexCommandPrefix(configuredCommand?: string | null): Pro
   const cached = cachedCodexCommandPrefix.get(cacheKey);
   if (cached) return cached;
   const preferred = override.length > 0 ? override : ["bun", "x", "--yes", "@openai/codex"];
+  const preferNewestCompatible = isDefaultCodexLauncher(preferred);
   const candidates: string[][] = [];
   const pushCandidate = (cmd: string[]) => {
     if (cmd.length === 0) return;
@@ -375,6 +517,7 @@ async function resolveCodexCommandPrefix(configuredCommand?: string | null): Pro
   const cwd = process.cwd();
   const env = process.env;
   const attemptErrors: string[] = [];
+  const successfulProbes: CodexCommandProbe[] = [];
   for (const candidate of candidates) {
     if (candidate.length === 0) continue;
     const rendered = `${candidate.join(" ")} --version`;
@@ -385,8 +528,14 @@ async function resolveCodexCommandPrefix(configuredCommand?: string | null): Pro
         timeoutMs: 15_000,
       });
       if (probe.code === 0) {
-        cachedCodexCommandPrefix.set(cacheKey, candidate);
-        return candidate;
+        const versionText = (probe.stdout || probe.stderr || "").trim().split(/\r?\n/, 1)[0] ?? "";
+        successfulProbes.push({
+          command: candidate,
+          version: parseCodexCliVersion(versionText),
+          versionText,
+        });
+        if (!preferNewestCompatible) break;
+        continue;
       }
       const detail = (probe.stderr || probe.stdout || "").trim();
       attemptErrors.push(
@@ -395,6 +544,16 @@ async function resolveCodexCommandPrefix(configuredCommand?: string | null): Pro
     } catch (err) {
       attemptErrors.push(`${rendered} -> ${String(err)}`);
     }
+  }
+  const selected = chooseCodexCommandProbe(successfulProbes, { preferNewestCompatible });
+  if (selected) {
+    cachedCodexCommandPrefix.set(cacheKey, selected.command);
+    console.log(
+      `[LLM] Resolved Codex CLI command: ${selected.command.join(" ")}${
+        selected.versionText ? ` (${selected.versionText})` : ""
+      }.`,
+    );
+    return selected.command;
   }
   const details = attemptErrors.length > 0 ? ` Tried: ${attemptErrors.join("; ")}` : "";
   throw new Error(
@@ -1387,6 +1546,7 @@ export class OpenAiCodexCliClient implements LLMClient {
     promptTokens: number;
     completionTokens: number;
     estimated: boolean;
+    modelId?: string;
   }): Promise<void> {
     if (!this.usageReporter) return;
     try {
@@ -1394,7 +1554,7 @@ export class OpenAiCodexCliClient implements LLMClient {
         service: this.service,
         sessionId: this.sessionTag || undefined,
         backend: "openai_codex",
-        modelId: this.model,
+        modelId: usage.modelId ?? this.model,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         totalTokens: usage.promptTokens + usage.completionTokens,
@@ -1450,7 +1610,20 @@ export class OpenAiCodexCliClient implements LLMClient {
     }
   }
 
-  private async runCodexExec(prompt: string): Promise<{ text: string; stderr: string }> {
+  private async runCodexExec(
+    prompt: string,
+  ): Promise<{ text: string; stderr: string; model: string }> {
+    return this.runCodexExecAttempt(prompt, {
+      model: this.model,
+      modelCompatibilityRecoveryAttempt: 0,
+    });
+  }
+
+  private async runCodexExecAttempt(
+    prompt: string,
+    opts: { model: string; modelCompatibilityRecoveryAttempt: number },
+  ): Promise<{ text: string; stderr: string; model: string }> {
+    const model = normalizeCodexModel(opts.model);
     const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
     const env: NodeJS.ProcessEnv = { ...process.env };
     env.PYTHONIOENCODING = "utf-8";
@@ -1488,7 +1661,7 @@ export class OpenAiCodexCliClient implements LLMClient {
       const command: string[] = [
         ...commandPrefix,
         "-c",
-        `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort, this.model)}"`,
+        `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort, model)}"`,
         "-a",
         "never",
         "-s",
@@ -1499,8 +1672,8 @@ export class OpenAiCodexCliClient implements LLMClient {
         "--output-last-message",
         lastMessagePath,
       ];
-      if (this.model) {
-        command.push("-m", this.model);
+      if (model) {
+        command.push("-m", model);
       }
       command.push("-");
 
@@ -1522,13 +1695,27 @@ export class OpenAiCodexCliClient implements LLMClient {
         : "";
       if (result.code !== 0) {
         const detail = stderr || stdout || "codex exec exited with non-zero status";
+        if (
+          opts.modelCompatibilityRecoveryAttempt < 1 &&
+          isDefaultCodexModel(model) &&
+          LEGACY_CODEX_MODEL_FALLBACK.trim().toLowerCase() !== DEFAULT_CODEX_MODEL.toLowerCase() &&
+          requiresNewerCodexForModel(stdout, stderr)
+        ) {
+          console.warn(
+            `[LLM] Codex CLI rejected default model ${DEFAULT_CODEX_MODEL}; retrying once with ${LEGACY_CODEX_MODEL_FALLBACK}. Upgrade Codex CLI to use ${DEFAULT_CODEX_MODEL}.`,
+          );
+          return this.runCodexExecAttempt(prompt, {
+            model: LEGACY_CODEX_MODEL_FALLBACK,
+            modelCompatibilityRecoveryAttempt: opts.modelCompatibilityRecoveryAttempt + 1,
+          });
+        }
         throw new Error(`Codex CLI request failed (exit ${result.code ?? "unknown"}): ${detail}`);
       }
       const text = lastMessage || stdout;
       if (!text) {
         throw new Error("Codex CLI completed without producing a response.");
       }
-      return { text, stderr };
+      return { text, stderr, model };
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -1547,7 +1734,7 @@ export class OpenAiCodexCliClient implements LLMClient {
       promptTokens: estimateTokensFromText(prompt),
       completionTokens: estimateTokensFromText(result.text),
     });
-    await this.maybeReportUsage(usage);
+    await this.maybeReportUsage({ ...usage, modelId: result.model });
     return {
       text: result.text,
       usage: {
@@ -1817,3 +2004,10 @@ export async function preflightServiceLlm(opts: LLMClientOptions = {}): Promise<
   });
   await client.preflightConfiguredModel();
 }
+
+export const __TEST_ONLY__ = {
+  chooseCodexCommandProbe,
+  compareCodexVersions,
+  parseCodexCliVersion,
+  requiresNewerCodexForModel,
+};

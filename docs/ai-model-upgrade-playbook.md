@@ -43,6 +43,12 @@ If `codex` is new enough but `bun x --yes @openai/codex` resolves an older CLI, 
 or document that separately. PushPals services often launch Codex through the
 configured `codex_bin`, not necessarily the global `codex` executable.
 
+On Windows, also test the service launcher path rather than only PowerShell command
+resolution. PowerShell may resolve `codex` through a `.ps1` or `.cmd` shim, while a
+long-running Bun/Node service may resolve a different extensionless executable or
+global package cache. A good regression test should exercise the same spawn path
+used by RemoteBuddy/WorkerPal, not just an interactive shell command.
+
 ## Source Defaults To Update
 
 Update these first:
