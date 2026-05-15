@@ -82,6 +82,14 @@ describe("RemoteBuddy OpenAI Codex CLI client", () => {
     ).toEqual(["old-codex"]);
   });
 
+  test("builds a Codex launcher from the embedded Bun executable", () => {
+    expect(
+      __TEST_ONLY__.bunCodexCommandFromEnv({
+        PUSHPALS_BUN_BIN: "C:/tools/bun/bin/bun.exe",
+      } as NodeJS.ProcessEnv),
+    ).toEqual(["C:/tools/bun/bin/bun.exe", "x", "--yes", "@openai/codex"]);
+  });
+
   test("retries default gpt-5.5 requests with the legacy model when Codex is too old", async () => {
     const scriptPath = createFakeCodexScript();
     const usageEvents: Array<{ modelId?: string | null }> = [];

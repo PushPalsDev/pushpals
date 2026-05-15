@@ -527,6 +527,60 @@ describe("server AutonomyStore policy gates", () => {
     expect(Date.parse(renewedUntil)).toBeGreaterThan(Date.parse(firstUntil));
   });
 
+  test("acquireDispatchLock can replace a stale same-session owner", () => {
+    const store = makeStore();
+    const acquired = store.acquireDispatchLock({ sessionId: "s1", runId: "run_1", ttlMs: 900_000 });
+    expect(acquired.ok).toBe(true);
+
+    const db = (store as unknown as { db: any }).db;
+    db.prepare(
+      `UPDATE autonomy_dispatch_lock
+       SET updated_at = ?
+       WHERE lock_id = 'autonomy_dispatch'`,
+    ).run(new Date(Date.now() - 300_000).toISOString());
+
+    const replaced = store.acquireDispatchLock({
+      sessionId: "s1",
+      runId: "run_2",
+      ttlMs: 60_000,
+      staleAfterMs: 120_000,
+    });
+    expect(replaced.ok).toBe(true);
+    expect(replaced.replacedStale).toBe(true);
+
+    const ownSnapshot = store.createSnapshot({ sessionId: "s1", runId: "run_2" });
+    expect(ownSnapshot.repo_health_flags.dispatch_lock_held).toBe(false);
+  });
+
+  test("acquireDispatchLock does not replace fresh or cross-session owners", () => {
+    const store = makeStore();
+    const acquired = store.acquireDispatchLock({ sessionId: "s1", runId: "run_1", ttlMs: 900_000 });
+    expect(acquired.ok).toBe(true);
+
+    const freshSameSession = store.acquireDispatchLock({
+      sessionId: "s1",
+      runId: "run_2",
+      ttlMs: 60_000,
+      staleAfterMs: 120_000,
+    });
+    expect(freshSameSession.ok).toBe(false);
+
+    const db = (store as unknown as { db: any }).db;
+    db.prepare(
+      `UPDATE autonomy_dispatch_lock
+       SET updated_at = ?
+       WHERE lock_id = 'autonomy_dispatch'`,
+    ).run(new Date(Date.now() - 300_000).toISOString());
+
+    const staleDifferentSession = store.acquireDispatchLock({
+      sessionId: "s2",
+      runId: "run_3",
+      ttlMs: 60_000,
+      staleAfterMs: 120_000,
+    });
+    expect(staleDifferentSession.ok).toBe(false);
+  });
+
   test("rejects invalid objective enums before persistence", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({ sessionId: "s1" }).snapshot_id;

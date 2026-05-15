@@ -489,6 +489,11 @@ async function runProcessWithNode(
 
 const cachedCodexCommandPrefix = new Map<string, string[]>();
 
+function bunCodexCommandFromEnv(env: NodeJS.ProcessEnv): string[] {
+  const bunBin = (env.PUSHPALS_BUN_BIN ?? "").trim();
+  return bunBin ? [bunBin, "x", "--yes", "@openai/codex"] : [];
+}
+
 async function resolveCodexCommandPrefix(configuredCommand?: string | null): Promise<string[]> {
   const override = codexCommandOverrideParts(configuredCommand);
   const cacheKey = override.join("\u0000");
@@ -504,6 +509,7 @@ async function resolveCodexCommandPrefix(configuredCommand?: string | null): Pro
     candidates.push(cmd);
   };
   pushCandidate(preferred);
+  pushCandidate(bunCodexCommandFromEnv(process.env));
   const execPath = (process.execPath ?? "").trim();
   if (execPath) {
     const lower = execPath.toLowerCase();
@@ -2006,6 +2012,7 @@ export async function preflightServiceLlm(opts: LLMClientOptions = {}): Promise<
 }
 
 export const __TEST_ONLY__ = {
+  bunCodexCommandFromEnv,
   chooseCodexCommandProbe,
   compareCodexVersions,
   parseCodexCliVersion,

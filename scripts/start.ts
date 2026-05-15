@@ -1468,6 +1468,10 @@ async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<s
   };
 
   pushCandidate(commandPrefix);
+  const envBunBin = String(process.env.PUSHPALS_BUN_BIN ?? "").trim();
+  if (envBunBin) {
+    pushCandidate([envBunBin, "x", "--yes", "@openai/codex"]);
+  }
   const execPath = (process.execPath ?? "").trim();
   if (execPath) {
     const lower = execPath.toLowerCase();

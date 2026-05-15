@@ -1102,6 +1102,7 @@ export function createRequestHandler() {
         const sessionId = compactText(body.sessionId, 128);
         const runId = compactText(body.runId, 128);
         const ttlMs = Number(body.ttlMs);
+        const staleAfterMs = Number(body.staleAfterMs);
         if (!sessionId || !runId) {
           return makeJson({ ok: false, message: "sessionId and runId are required" }, 400);
         }
@@ -1109,6 +1110,7 @@ export function createRequestHandler() {
           sessionId,
           runId,
           ttlMs: Number.isFinite(ttlMs) ? ttlMs : undefined,
+          staleAfterMs: Number.isFinite(staleAfterMs) ? staleAfterMs : undefined,
         });
         if (!result.ok) return makeJson(result, 409);
         return makeJson(result, 200);

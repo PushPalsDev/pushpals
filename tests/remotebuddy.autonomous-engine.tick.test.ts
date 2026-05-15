@@ -382,6 +382,11 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
 
     await engine.tick();
 
+    const acquireCall = calls.find((entry) => entry.url.includes("/autonomy/lock/acquire"));
+    expect(Number((acquireCall?.body as Record<string, unknown> | undefined)?.staleAfterMs)).toBe(
+      120_000,
+    );
+
     const ingestCall = calls.find((entry) => entry.url.includes("/autonomy/inspiration/ingest"));
     expect(ingestCall).toBeDefined();
     const ingestBody = ingestCall?.body as Record<string, unknown>;

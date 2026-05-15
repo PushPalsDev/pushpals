@@ -869,6 +869,12 @@ function asNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function compactStatusDetail(value: string, max = 240): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, Math.max(0, max - 3))}...`;
+}
+
 function uniqueLowercaseTokens(values: string[], max = 24): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -3279,6 +3285,16 @@ export class RemoteBuddyAutonomousEngine {
     );
   }
 
+  private lockStaleAfterMs(): number {
+    // Same-session retries are safe to recover sooner: a healthy in-process cycle is guarded
+    // by `inFlight`, while a restarted process needs a bounded way past an orphaned lease.
+    return Math.max(
+      this.phaseTimeoutMs("ideation") + 30_000,
+      this.cfg.heartbeatLogMs * 2,
+      120_000,
+    );
+  }
+
   private cycleBudgetMs(): number {
     const ideationTimeoutMs = this.phaseTimeoutMs("ideation");
     const scoringTimeoutMs = this.phaseTimeoutMs("scoring");
@@ -3664,7 +3680,7 @@ export class RemoteBuddyAutonomousEngine {
     return res.ok;
   }
 
-  private async acquireDispatchLock(runId: string): Promise<boolean> {
+  private async acquireDispatchLock(runId: string): Promise<{ ok: boolean; reason?: string }> {
     const ttlMs = this.lockTtlMs();
     const res = await fetch(`${this.server}/autonomy/lock/acquire`, {
       method: "POST",
@@ -3673,9 +3689,13 @@ export class RemoteBuddyAutonomousEngine {
         sessionId: this.sessionId,
         runId,
         ttlMs,
+        staleAfterMs: this.lockStaleAfterMs(),
       }),
     });
-    return res.ok;
+    if (res.ok) return { ok: true };
+    const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const reason = asString(payload.reason ?? payload.message);
+    return { ok: false, reason };
   }
 
   private async renewDispatchLock(runId: string): Promise<boolean> {
@@ -4105,9 +4125,12 @@ export class RemoteBuddyAutonomousEngine {
     let outcomeDetail = "not_dispatched";
     try {
       this.setPhase("acquire_lock");
-      lockAcquired = await this.acquireDispatchLock(runId);
+      const lockResult = await this.acquireDispatchLock(runId);
+      lockAcquired = lockResult.ok;
       if (!lockAcquired) {
-        outcomeDetail = "lock_not_acquired";
+        outcomeDetail = lockResult.reason
+          ? compactStatusDetail(`lock_not_acquired:${lockResult.reason}`)
+          : "lock_not_acquired";
         return;
       }
 

@@ -3207,15 +3207,22 @@ export class AutonomyStore {
     return normalizedRunId.length === 0 || row.owner_run_id !== normalizedRunId;
   }
 
-  acquireDispatchLock(params: { sessionId: string; runId: string; ttlMs?: number }): {
+  acquireDispatchLock(params: {
+    sessionId: string;
+    runId: string;
+    ttlMs?: number;
+    staleAfterMs?: number;
+  }): {
     ok: boolean;
     reason?: string;
     lockUntil?: string;
+    replacedStale?: boolean;
   } {
     const sessionId = asString(params.sessionId);
     const runId = asString(params.runId);
     if (!sessionId || !runId) return { ok: false, reason: "sessionId and runId are required" };
     const now = asIsoNow();
+    const nowMs = Date.parse(now);
     const ttlMs = Math.max(
       5_000,
       Math.floor(
@@ -3228,16 +3235,29 @@ export class AutonomyStore {
         ),
       ),
     );
+    const staleAfterMs = Math.max(0, Math.floor(asNumber(params.staleAfterMs, 0)));
     const lockUntil = new Date(Date.parse(now) + ttlMs).toISOString();
+    let replacedStale = false;
     try {
       this.db.exec("BEGIN IMMEDIATE TRANSACTION");
       const existing = this.lockRow(now);
       if (existing && existing.owner_run_id !== runId) {
-        this.db.exec("ROLLBACK");
-        return {
-          ok: false,
-          reason: `dispatch lock held by ${existing.owner_run_id} until ${existing.expires_at}`,
-        };
+        const updatedAtMs = Date.parse(asString(existing.updated_at));
+        const sameSession = existing.owner_session_id === sessionId;
+        const staleForSameSession =
+          sameSession &&
+          staleAfterMs > 0 &&
+          Number.isFinite(nowMs) &&
+          Number.isFinite(updatedAtMs) &&
+          nowMs - updatedAtMs >= staleAfterMs;
+        if (!staleForSameSession) {
+          this.db.exec("ROLLBACK");
+          return {
+            ok: false,
+            reason: `dispatch lock held by ${existing.owner_run_id} until ${existing.expires_at}`,
+          };
+        }
+        replacedStale = true;
       }
       this.db
         .prepare(
@@ -3253,7 +3273,7 @@ export class AutonomyStore {
         )
         .run(sessionId, runId, now, lockUntil, now);
       this.db.exec("COMMIT");
-      return { ok: true, lockUntil };
+      return { ok: true, lockUntil, ...(replacedStale ? { replacedStale: true } : {}) };
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
