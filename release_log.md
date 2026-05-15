@@ -2,17 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.78`
-- start_commit: `305a2bfc53770db5bac50a6a917b82d15fe9bfe9`
-- end_commit: `6aa7e4fa818bdea73c88ea0481c3173dcdfd73f9`
-- commits_in_range: `2`
+- version: `v1.0.79`
+- start_commit: `197fc4376941b7f7312214d70c53370c637f5d95`
+- end_commit: `f4939f4bc92b6cb0e7c16133c036eee80c05cf7c`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Resolve the actual Codex CLI command/version used by RemoteBuddy and startup preflight, avoiding stale Windows shim/package resolution when `gpt-5.5` is enabled.
-- Prefer the newest compatible Codex CLI probe for default launchers and log the selected command/version for future diagnosis.
-- Add a one-shot RemoteBuddy fallback from default `gpt-5.5` to `gpt-5.4` only when Codex reports that the model requires a newer CLI.
-- Add RemoteBuddy Codex regression tests and document Windows service-launcher checks in the AI model upgrade playbook.
+- Fix RemoteBuddy autonomy liveness when an orphaned same-session dispatch lock blocks the next idea-generation tick.
+- Add bounded same-session stale-lock takeover for autonomy dispatch while preserving cross-session lock protection.
+- Make `lock_not_acquired` heartbeat diagnostics include the server denial reason so future stalls are visible in logs.
+- Prefer the concrete Bun launcher from `PUSHPALS_BUN_BIN` when resolving default Codex CLI commands, avoiding stale service PATH shims.
+- Add regression coverage for stale autonomy lock replacement, Codex launcher resolution, and tick lock-acquire payloads.
 
 ## Install
 
