@@ -32,12 +32,14 @@ import { ConfigPane } from "../src/components/ConfigPane";
 import { usePushPalsSession } from "../src/lib/usePushPalsSession";
 import { resolvePushPalsWebRuntimeConfig } from "../src/lib/runtimeBootstrap";
 import { buildSendFailureMessage, restoreComposerDraft } from "../src/lib/composerSendState";
+import { hydrateMonitorTraceState } from "../src/lib/monitorTraceHydration";
 import {
   type AutonomyInsightsSummary,
   type AutonomyQuestionRow,
   type ActOnAutonomyQuestionResult,
   type AnswerAutonomyQuestionResult,
   type CompletionSnapshotRow,
+  type JobLogSnapshotRow,
   type JobSnapshotRow,
   type PendingQueueSnapshot,
   type QueueCounts,
@@ -49,6 +51,7 @@ import {
   fetchAutonomyInsights,
   fetchAutonomyQuestions,
   fetchCompletionsSnapshot,
+  fetchJobLogsSnapshot,
   fetchJobsSnapshot,
   fetchRequestsSnapshot,
   fetchSystemStatus,
@@ -57,9 +60,28 @@ import {
 } from "../src/lib/pushpalsApi";
 
 const POLL_INTERVAL_MS = 4000;
+const TRACE_LOG_JOB_LIMIT = 20;
+const TRACE_LOG_LINE_LIMIT = 100;
 const RUNTIME_CONFIG = resolvePushPalsWebRuntimeConfig();
 
 type UiTab = "coordination" | "chat" | "requests" | "jobs" | "system" | "config";
+
+function selectTraceLogJobIds(jobs: JobSnapshotRow[], focusedJobId?: string | null): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  const add = (id: string | null | undefined) => {
+    const value = String(id ?? "").trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    ids.push(value);
+  };
+
+  add(focusedJobId);
+  for (const job of jobs.slice(0, TRACE_LOG_JOB_LIMIT)) {
+    add(job.id);
+  }
+  return ids;
+}
 
 function createTheme(mode: ResolvedMode): DashboardTheme {
   if (mode === "dark") {
@@ -186,6 +208,7 @@ export default function DashboardScreen() {
     requestId: string | null;
     jobId: string | null;
   }>({ requestId: null, jobId: null });
+  const [jobLogsById, setJobLogsById] = useState<Record<string, JobLogSnapshotRow[]>>({});
 
   const mountAnim = useRef(new Animated.Value(0)).current;
   const tabAnim = useRef(new Animated.Value(1)).current;
@@ -235,7 +258,21 @@ export default function DashboardScreen() {
     setRequests(requestData.requests);
     setRequestCounts(requestData.counts);
     setRequestPendingSnapshot(requestData.pendingSnapshot);
+    const traceLogJobIds = selectTraceLogJobIds(jobData.jobs, jobsFilter.jobId);
+    const traceLogEntries = await Promise.all(
+      traceLogJobIds.map(async (jobId) => {
+        const logs = await fetchJobLogsSnapshot(
+          RUNTIME_CONFIG.serverUrl,
+          jobId,
+          undefined,
+          TRACE_LOG_LINE_LIMIT,
+        );
+        return [jobId, logs] as const;
+      }),
+    );
+
     setJobs(jobData.jobs);
+    setJobLogsById(Object.fromEntries(traceLogEntries));
     setJobCounts(jobData.counts);
     setJobPendingSnapshot(jobData.pendingSnapshot);
     setCompletions(completionData.completions);
@@ -244,7 +281,7 @@ export default function DashboardScreen() {
     setAutonomyInsights(autonomyData);
     setAutonomyQuestions(autonomyQuestionData);
     setLastRefresh(new Date().toISOString());
-  }, [session.sessionId]);
+  }, [jobsFilter.jobId, session.sessionId]);
 
   useEffect(() => {
     refreshObservability();
@@ -365,6 +402,11 @@ export default function DashboardScreen() {
       ),
     [requests, jobs, completions],
   );
+  const effectiveTraceState = useMemo(
+    () => hydrateMonitorTraceState(session.state, jobs, jobLogsById),
+    [session.state, jobs, jobLogsById],
+  );
+  const traceJobCount = Math.max(effectiveTraceState.jobs.size, jobs.length);
 
   const reusePromptInComposer = useCallback((prompt: string) => {
     setInput(prompt);
@@ -488,7 +530,7 @@ export default function DashboardScreen() {
       { id: "coordination" as const, label: "Coordination", count: coordinationRows.length },
       { id: "chat" as const, label: "Chat", count: session.state.messages.length },
       { id: "requests" as const, label: "Requests", count: requests.length },
-      { id: "jobs" as const, label: "Jobs & Traces", count: session.state.jobs.size },
+      { id: "jobs" as const, label: "Jobs & Traces", count: traceJobCount },
       { id: "system" as const, label: "System", count: workers.length },
       { id: "config" as const, label: "Config" },
     ],
@@ -496,7 +538,7 @@ export default function DashboardScreen() {
       coordinationRows.length,
       session.state.messages.length,
       requests.length,
-      session.state.jobs.size,
+      traceJobCount,
       workers.length,
     ],
   );
@@ -663,7 +705,7 @@ export default function DashboardScreen() {
                   pendingSnapshot={jobPendingSnapshot}
                   completions={completions}
                   completionCounts={completionCounts}
-                  sessionState={session.state}
+                  sessionState={effectiveTraceState}
                   requestFilterId={jobsFilter.requestId}
                   jobFilterId={jobsFilter.jobId}
                   onClearFilter={() => setJobsFilter({ requestId: null, jobId: null })}

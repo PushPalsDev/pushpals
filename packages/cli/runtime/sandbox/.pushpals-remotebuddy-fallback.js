@@ -2,7 +2,7 @@
 // @bun
 
 // apps/remotebuddy/src/remotebuddy_main.ts
-import { randomUUID as randomUUID2 } from "crypto";
+import { randomUUID as randomUUID3 } from "crypto";
 import { Database as Database3 } from "bun:sqlite";
 
 // apps/remotebuddy/src/llm.ts
@@ -7920,6 +7920,14 @@ Scope:
 }
 
 // apps/remotebuddy/src/worker_spawn.ts
+import { randomUUID as randomUUID2 } from "crypto";
+function createWorkerPalId(options = {}) {
+  const randomPart = String(options.randomId ?? randomUUID2()).replace(/[^a-z0-9]/gi, "");
+  const timePart = Math.max(0, Math.floor(options.nowMs ?? Date.now())).toString(36);
+  const pidPart = Math.max(0, Math.floor(options.processId ?? process.pid)).toString(36);
+  const suffix = `${timePart}${pidPart}${randomPart}`.toLowerCase().slice(0, 12);
+  return `workerpal-${suffix || "worker"}`;
+}
 function resolveWorkerStartupTimeoutMs(options) {
   const configuredMs = Math.max(1000, Math.floor(options.configuredMs || 0));
   if (!options.docker) {
@@ -8537,6 +8545,7 @@ class RemoteBuddyOrchestrator {
   autonomyConfigPollTimer = null;
   managedWorkers = new Map;
   workerSpawnInFlight = null;
+  workerStartupPrewarmInFlight = null;
   workerSpawnCooldownUntil = 0;
   workerSpawnBackoffMs;
   workerAutoscalePollMs;
@@ -9539,7 +9548,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     }
     const spawnPromise = (async () => {
       this.workerpalsUnavailableReason = null;
-      const workerId = `workerpal-${randomUUID2().substring(0, 8)}`;
+      const workerId = createWorkerPalId();
       const cmd = this.buildWorkerSpawnCommand(workerId);
       console.log(`[RemoteBuddy] Spawning WorkerPal ${workerId} (${this.managedWorkers.size + 1}/${this.maxWorkers})`);
       try {
@@ -9625,6 +9634,16 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     }
     console.warn(`[RemoteBuddy] ${this.currentWorkerUnavailableReason()}`);
   }
+  startWorkerCapacityPrewarmOnStartup() {
+    if (this.workerStartupPrewarmInFlight || this.disposed)
+      return;
+    this.workerStartupPrewarmInFlight = this.ensureWorkerCapacityOnStartup().catch((err) => {
+      this.workerpalsUnavailableReason = `WorkerPal startup prewarm failed: ${String(err)}`;
+      console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+    }).finally(() => {
+      this.workerStartupPrewarmInFlight = null;
+    });
+  }
   async selectTargetWorkerForJob() {
     const workers = await this.fetchWorkers();
     const idleNow = this.pickIdleWorker(workers);
@@ -9673,7 +9692,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     }
     const priority = normalizeRequestPriority(request.priority);
     const queueWaitBudgetMs = Math.max(5000, Number.isFinite(Number(request.queueWaitBudgetMs)) ? Number(request.queueWaitBudgetMs) : priority === "interactive" ? 20000 : priority === "background" ? 240000 : 90000);
-    const turnId = randomUUID2();
+    const turnId = randomUUID3();
     const eventFrom = autonomyMetadata ? `agent:${this.agentId}/autonomy` : undefined;
     const planningContext = this.buildPlanningContext(priority, requestSessionId);
     this.rememberPersistentMemory("request", `priority=${priority} prompt=${toSingleLine(prompt, 520)}`, requestId, requestSessionId);
@@ -9802,7 +9821,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         this.rememberPersistentMemory("decision", `completed_without_worker intent=${plan.intent} lane=deterministic`, requestId, requestSessionId);
         return;
       }
-      const taskId = randomUUID2();
+      const taskId = randomUUID3();
       const targetWorkerId = await this.selectTargetWorkerForJob();
       if (!targetWorkerId) {
         const onlineWorkers = this.onlineWorkers(await this.fetchWorkers());
@@ -10179,7 +10198,7 @@ async function main() {
   await orchestrator.emitStartupStatus();
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();
-  await orchestrator.ensureWorkerCapacityOnStartup();
+  orchestrator.startWorkerCapacityPrewarmOnStartup();
   orchestrator.startAutonomy();
   orchestrator.startAutonomyRuntimeConfigPolling();
   const pollMs = CONFIG.remotebuddy.pollMs;

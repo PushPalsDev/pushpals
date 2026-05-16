@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  fetchJobLogsSnapshot,
   buildSessionEventsUrl,
   buildSessionMessageUrl,
   buildSessionWebSocketUrl,
@@ -42,5 +43,57 @@ describe("pushpals client session transport URLs", () => {
     expect(buildSessionWebSocketUrl("http://localhost:3001", "dev", 2, undefined, client)).toBe(
       "ws://localhost:3001/sessions/dev/ws?after=2&clientId=web-123&clientKind=web&clientLabel=Web+Client&clientVersion=1.2.3&clientPlatform=web&clientRepoRoot=C%3A%2Frepo%2Fdemo",
     );
+  });
+
+  test("fetchJobLogsSnapshot fetches bounded persisted job logs", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestedUrl = "";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requestedUrl = String(input);
+      return Response.json({
+        ok: true,
+        logs: [
+          {
+            id: 7,
+            jobId: "job/abc",
+            ts: "2026-05-16T09:00:00.000Z",
+            message: "hello from durable logs",
+          },
+        ],
+      });
+    }) as typeof fetch;
+
+    try {
+      const logs = await fetchJobLogsSnapshot("http://localhost:3001", "job/abc", undefined, 100);
+
+      expect(requestedUrl).toBe("http://localhost:3001/jobs/job%2Fabc/logs?limit=100");
+      expect(logs).toEqual([
+        {
+          id: 7,
+          jobId: "job/abc",
+          ts: "2026-05-16T09:00:00.000Z",
+          message: "hello from durable logs",
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("fetchJobLogsSnapshot returns empty logs on non-OK or malformed responses", async () => {
+    const originalFetch = globalThis.fetch;
+    const responses = [
+      new Response("server error", { status: 500 }),
+      Response.json({ ok: true, logs: "not an array" }),
+    ];
+    globalThis.fetch = (async () =>
+      responses.shift() ?? Response.json({ ok: true, logs: [] })) as typeof fetch;
+
+    try {
+      await expect(fetchJobLogsSnapshot("http://localhost:3001", "job-1")).resolves.toEqual([]);
+      await expect(fetchJobLogsSnapshot("http://localhost:3001", "job-1")).resolves.toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

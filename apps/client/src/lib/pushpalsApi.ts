@@ -453,6 +453,13 @@ export interface JobSnapshotRow {
   updatedAt: string;
 }
 
+export interface JobLogSnapshotRow {
+  id: number;
+  jobId: string;
+  ts: string;
+  message: string;
+}
+
 export interface CompletionSnapshotRow {
   id: string;
   jobId: string;
@@ -798,6 +805,43 @@ export async function fetchJobsSnapshot(
   } catch (err) {
     console.error("Error fetching jobs snapshot:", err);
     return { jobs: [], counts: {}, priorityCounts: {}, pendingSnapshot: [] };
+  }
+}
+
+export async function fetchJobLogsSnapshot(
+  baseUrl: string,
+  jobId: string,
+  authToken?: string,
+  limit = 100,
+): Promise<JobLogSnapshotRow[]> {
+  const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
+  try {
+    const response = await fetch(
+      `${baseUrl}/jobs/${encodeURIComponent(jobId)}/logs?limit=${safeLimit}`,
+      {
+        headers: authHeaders(authToken),
+      },
+    );
+    if (!response.ok) return [];
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      logs?: unknown;
+    };
+    if (payload.ok !== true || !Array.isArray(payload.logs)) return [];
+    return payload.logs
+      .filter((entry): entry is Record<string, unknown> => {
+        return Boolean(entry) && typeof entry === "object" && !Array.isArray(entry);
+      })
+      .map((entry) => ({
+        id: Number(entry.id),
+        jobId: String(entry.jobId ?? jobId),
+        ts: String(entry.ts ?? ""),
+        message: String(entry.message ?? ""),
+      }))
+      .filter((entry) => Number.isFinite(entry.id) && entry.message.trim().length > 0);
+  } catch (err) {
+    console.error("Error fetching job logs snapshot:", err);
+    return [];
   }
 }
 

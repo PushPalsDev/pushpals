@@ -130,11 +130,14 @@ function statusColor(status: string, palette: TracePalette): string {
     case "completed":
       return palette.success;
     case "failed":
+    case "abandoned":
+    case "publish_blocked":
       return palette.danger;
     case "claimed":
     case "started":
     case "in_progress":
       return palette.warning;
+    case "pending":
     case "enqueued":
     case "created":
     default:
@@ -880,9 +883,12 @@ export function TasksJobsLogs({
               .filter(Boolean) as Job[];
             const jobOrder: Record<string, number> = {
               claimed: 0,
-              enqueued: 1,
-              completed: 2,
-              failed: 3,
+              pending: 1,
+              enqueued: 2,
+              completed: 3,
+              publish_blocked: 4,
+              abandoned: 5,
+              failed: 6,
             };
             taskJobs.sort((a, b) => {
               const orderA = jobOrder[a.status] ?? 9;

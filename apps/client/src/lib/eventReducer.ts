@@ -36,7 +36,14 @@ export interface Task {
   ts: string;
 }
 
-export type JobStatus = "enqueued" | "claimed" | "completed" | "failed";
+export type JobStatus =
+  | "pending"
+  | "enqueued"
+  | "claimed"
+  | "completed"
+  | "failed"
+  | "abandoned"
+  | "publish_blocked";
 
 export interface Job {
   jobId: string;
