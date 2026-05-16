@@ -12,7 +12,16 @@ import {
   rmSync,
   writeFileSync,
 } from "fs";
-import { basename, delimiter, dirname, extname, join, resolve, win32 as pathWin32 } from "path";
+import {
+  basename,
+  delimiter,
+  dirname,
+  extname,
+  join,
+  relative,
+  resolve,
+  win32 as pathWin32,
+} from "path";
 import { createInterface, type Interface } from "readline";
 import {
   ServiceManager,
@@ -44,6 +53,7 @@ type CliOptions = {
   runtimeOnly: boolean;
   statusOnce: boolean;
   clear: boolean;
+  createVisionMd: boolean;
 };
 
 type LocalBuddyHealth = {
@@ -510,6 +520,7 @@ function printUsage(): void {
   );
   console.log("  --status-once          Print active endpoints once and exit");
   console.log("  --clear                Remove repo-local PushPals state and exit");
+  console.log("  --create_vision_md     Create a starter vision.md in the current repo and exit");
   console.log("  -h, --help             Show this help");
   console.log("");
   console.log("Chat commands:");
@@ -533,6 +544,7 @@ function parseArgs(argv: string[]): CliOptions | null {
     runtimeOnly: false,
     statusOnce: false,
     clear: false,
+    createVisionMd: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -559,6 +571,10 @@ function parseArgs(argv: string[]): CliOptions | null {
     }
     if (arg === "--clear") {
       options.clear = true;
+      continue;
+    }
+    if (arg === "--create_vision_md" || arg === "--create-vision-md") {
+      options.createVisionMd = true;
       continue;
     }
     if (arg === "--server-url") {
@@ -1420,6 +1436,60 @@ function emitCliRuntimePreflight(result: ClientRuntimePreflightResult): void {
     return;
   }
   for (const line of lines) console.error(line);
+}
+
+function displayPath(fromRoot: string, pathValue: string): string {
+  const rel = relative(fromRoot, pathValue);
+  if (!rel || rel === "") return ".";
+  if (rel.startsWith("..")) return pathValue;
+  return rel.replace(/\\/g, "/");
+}
+
+function resolveVisionTemplatePathForCreate(opts: {
+  repoRoot: string;
+  runtimeRoot: string;
+}): string | null {
+  const candidates = [
+    join(opts.runtimeRoot, "vision.example.md"),
+    join(opts.repoRoot, "vision.example.md"),
+    resolve(import.meta.dir, "..", "runtime", "vision.example.md"),
+    resolve(import.meta.dir, "..", "packages", "cli", "runtime", "vision.example.md"),
+    resolve(import.meta.dir, "..", "vision.example.md"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function createVisionMdFromTemplate(opts: { repoRoot: string; runtimeRoot: string }): number {
+  const visionPath = join(opts.repoRoot, "vision.md");
+  if (existsSync(visionPath)) {
+    console.log(
+      `[pushpals] vision.md already exists at ${displayPath(opts.repoRoot, visionPath)}; leaving it unchanged.`,
+    );
+    return 0;
+  }
+
+  const templatePath = resolveVisionTemplatePathForCreate(opts);
+  if (!templatePath) {
+    console.error(
+      "[pushpals] Could not create vision.md: bundled vision.example.md template was not found.",
+    );
+    return 1;
+  }
+
+  const template = readFileSync(templatePath, "utf8");
+  writeFileSync(visionPath, template, "utf8");
+  console.log(
+    `[pushpals] Created ${displayPath(opts.repoRoot, visionPath)} from ${displayPath(
+      opts.repoRoot,
+      templatePath,
+    )}.`,
+  );
+  console.log("[pushpals] Edit vision.md with this repo's users, priorities, guardrails, and validation path.");
+  console.log("[pushpals] Then run `pushpals` again.");
+  return 0;
 }
 
 function runtimeBinaryFilename(serviceName: RuntimeBinaryName, platformKey: string): string {
@@ -4963,6 +5033,13 @@ async function main(): Promise<void> {
   });
   const config = preparedRuntime.runtimePreflight.config;
   const statePath = resolveCliStatePath(repoRoot);
+  if (parsed.createVisionMd) {
+    const exitCode = createVisionMdFromTemplate({
+      repoRoot,
+      runtimeRoot: preparedRuntime.runtimeRoot,
+    });
+    process.exit(exitCode);
+  }
   if (parsed.clear) {
     const serverUrl = normalizeLoopbackUrl(
       parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL,

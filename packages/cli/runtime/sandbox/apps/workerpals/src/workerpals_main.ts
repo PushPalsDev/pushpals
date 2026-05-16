@@ -692,10 +692,15 @@ function inferChangedPaths(params: Record<string, unknown> | undefined): string[
 function inferValidationSteps(params: Record<string, unknown> | undefined): string[] {
   if (!params || !params.planning || typeof params.planning !== "object") return [];
   const planning = params.planning as Record<string, unknown>;
-  if (!Array.isArray(planning.validationSteps)) return [];
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const raw of planning.validationSteps) {
+  const candidates = [
+    ...(Array.isArray(planning.validationSteps) ? planning.validationSteps : []),
+    ...(Array.isArray(planning.requiredValidationSteps)
+      ? planning.requiredValidationSteps.map((step) => `${step} (required by vision.md)`)
+      : []),
+  ];
+  for (const raw of candidates) {
     if (typeof raw !== "string") continue;
     const step = sanitizePrText(raw, 200);
     if (!step || seen.has(step)) continue;

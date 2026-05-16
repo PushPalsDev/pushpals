@@ -59,6 +59,7 @@ describe("shared vision doc parsing", () => {
     expect(items.objectives.length).toBeGreaterThan(0);
     expect(items.guardrails.length).toBeGreaterThan(0);
     expect(items.constraints.length).toBeGreaterThan(0);
+    expect(items.testingCriteria.length).toBeGreaterThan(0);
   });
 
   test("extractVisionKeyItems captures PushPals-specific priorities and guardrails", () => {
@@ -69,5 +70,26 @@ describe("shared vision doc parsing", () => {
     expect(items.nonGoals.length).toBeGreaterThan(0);
     expect(items.guardrails.length).toBeGreaterThan(0);
     expect(items.riskPolicy.length).toBeGreaterThan(0);
+  });
+
+  test("extractVisionKeyItems captures testing criteria as its own bucket", () => {
+    const markdown = [
+      "# Vision",
+      "> **One sentence:** Keep required validation visible.",
+      "",
+      "## 8) Metrics",
+      "- Test pass rate improves",
+      "",
+      "## 12) Testing criteria",
+      "- `bun run test:root`",
+      "- `bun run smoke:web`",
+      "",
+      "## 13) Risk policy",
+      "- Validation failures block release",
+    ].join("\n");
+    const items = extractVisionKeyItems(markdown);
+    expect(items.testingCriteria).toEqual(["`bun run test:root`", "`bun run smoke:web`"]);
+    expect(items.metrics).toEqual(["Test pass rate improves"]);
+    expect(items.riskPolicy).toEqual(["Validation failures block release"]);
   });
 });

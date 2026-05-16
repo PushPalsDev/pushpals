@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { createServer } from "net";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
@@ -173,11 +173,64 @@ enabled = true
       expect(stdout).toContain("[pushpals] Running runtime preflight...");
       expect(stdout).toContain("[pushpals] runtimeRoot=");
       expect(combined).toContain("Missing required autonomy vision file: vision.md");
+      expect(combined).toContain("pushpals --create_vision_md");
       expect(combined.indexOf("[pushpals] Running runtime preflight...")).toBeGreaterThanOrEqual(0);
       expect(combined.indexOf("Missing required autonomy vision file: vision.md")).toBeGreaterThan(
         combined.indexOf("[pushpals] Running runtime preflight..."),
       );
       expect(combined).not.toContain("LocalBuddy is unavailable");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("pushpals --create_vision_md creates a starter vision document and exits before preflight", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-create-vision-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      const init = Bun.spawnSync(["git", "init"], {
+        cwd: repoRoot,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      expect(init.exitCode).toBe(0);
+
+      const proc = Bun.spawn(
+        [
+          bunExecPath,
+          cliScriptPath,
+          "--create_vision_md",
+          "--runtime-root",
+          runtimeRoot,
+          "--runtime-tag",
+          "vtest-local",
+        ],
+        {
+          cwd: repoRoot,
+          stdout: "pipe",
+          stderr: "pipe",
+          env: { ...process.env, PUSHPALS_CLI_PACKAGE_VERSION: "1.0.6-test" },
+        },
+      );
+
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+
+      const visionPath = join(repoRoot, "vision.md");
+      expect(code).toBe(0);
+      expect(stderr.trim()).toBe("");
+      expect(existsSync(visionPath)).toBe(true);
+      expect(readFileSync(visionPath, "utf8")).toContain("# Vision");
+      expect(stdout).toContain("[pushpals] args=--create_vision_md");
+      expect(stdout).toContain("[pushpals] Created vision.md");
+      expect(stdout).toContain("Then run `pushpals` again.");
+      expect(stdout).not.toContain("[pushpals] Running runtime preflight...");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

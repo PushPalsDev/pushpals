@@ -26,6 +26,7 @@ import { PersistentSessionMemory } from "./persistent_memory.js";
 import {
   CommunicationManager,
   detectRepoRoot,
+  extractVisionKeyItems,
   loadPushPalsConfig,
   normalizeAutonomyComponentArea,
   resolveLocalServerConnection,
@@ -35,7 +36,7 @@ import {
   normalizeWriteGlob,
 } from "shared";
 import type { AutonomyComponentArea } from "shared";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { resolve } from "path";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
 import {
@@ -211,6 +212,7 @@ export type TaskExecutePlanning = {
   discovery?: TaskExecutePlanningDiscovery;
   acceptanceCriteria: string[];
   validationSteps: string[];
+  requiredValidationSteps?: string[];
   queuePriority: RequestPriority;
   queueWaitBudgetMs: number;
   executionBudgetMs: number;
@@ -438,7 +440,11 @@ function ensureWriteGlobsCoverTargetPaths(
   return { normalizedWriteGlobs, uncoveredTargets, addedGlobs };
 }
 
-function buildExecutionGuidance(plan: PlannerOutput, targetPaths: string[]): string {
+function buildExecutionGuidance(
+  plan: PlannerOutput,
+  targetPaths: string[],
+  requiredValidationSteps: string[] = [],
+): string {
   const lines: string[] = [];
   const targets = normalizePathHints(
     targetPaths.length > 0 ? targetPaths : (plan.scope.write_globs ?? []),
@@ -486,11 +492,18 @@ function buildExecutionGuidance(plan: PlannerOutput, targetPaths: string[]): str
     lines.push("Validation steps:");
     for (const step of plan.validation_steps) lines.push(`- ${step}`);
   }
+  if (requiredValidationSteps.length > 0) {
+    lines.push("Required vision.md testing criteria:");
+    for (const step of requiredValidationSteps) lines.push(`- ${step}`);
+    lines.push(
+      "- These repo-level checks are mandatory before reporting completion or publishing a PR.",
+    );
+  }
   return lines.join("\n").trim();
 }
 
 const VALIDATION_COMMAND_PREFIX =
-  /^(git|bun|bunx|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
+  /^(git|bun|bunx|npm|npx|pnpm|yarn|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
 const VALIDATION_GENERIC_SAFE = /^(git\s+status\s+--porcelain|git\s+diff\b)/i;
 const PATH_TOKEN_REGEX = /\b([A-Za-z0-9._/\-\\]+\.[A-Za-z0-9._-]+)\b/g;
 
@@ -533,6 +546,31 @@ function normalizeValidationSteps(steps: string[], targetPaths: string[]): strin
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(value);
+  }
+  return out;
+}
+
+function extractCommandFromValidationCriterion(value: string): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const fenced = raw.match(/`([^`]+)`/)?.[1]?.trim();
+  const candidate = fenced || raw.replace(/^(run|execute|verify|validate|check)\s+/i, "").trim();
+  return candidate.trim();
+}
+
+export function extractRequiredValidationStepsFromVisionMarkdown(markdown: string): string[] {
+  const criteria = extractVisionKeyItems(markdown).testingCriteria;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const criterion of criteria) {
+    const command = extractCommandFromValidationCriterion(criterion);
+    if (!command) continue;
+    if (!isCommandLikeValidationStep(command)) continue;
+    const key = command.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(command);
+    if (out.length >= 12) break;
   }
   return out;
 }
@@ -1788,6 +1826,17 @@ export class RemoteBuddyOrchestrator {
     return out;
   }
 
+  private loadVisionRequiredValidationSteps(): string[] {
+    const visionPath = resolve(this.repo, "vision.md");
+    if (!existsSync(visionPath)) return [];
+    try {
+      return extractRequiredValidationStepsFromVisionMarkdown(readFileSync(visionPath, "utf8"));
+    } catch (err) {
+      console.warn("[RemoteBuddy] Could not read vision.md testing criteria:", err);
+      return [];
+    }
+  }
+
   private getRecentContextSnapshot(sessionId: string = this.sessionId): string[] {
     return this.sessionContext(sessionId).slice(-RemoteBuddyOrchestrator.MAX_CONTEXT);
   }
@@ -2465,8 +2514,15 @@ export class RemoteBuddyOrchestrator {
             ? false
             : plan.requires_worker;
       console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
+      let requiredValidationSteps: string[] = [];
       // when forcing worker, don't fail on "planner contract incomplete" — fill safe defaults.
       if (requiresWorker) {
+        requiredValidationSteps = this.loadVisionRequiredValidationSteps();
+        if (requiredValidationSteps.length > 0) {
+          console.log(
+            `[RemoteBuddy] Loaded ${requiredValidationSteps.length} required validation step(s) from vision.md testing criteria.`,
+          );
+        }
         const scopeCoverage = ensureWriteGlobsCoverTargetPaths(targetPaths, plan.scope.write_globs);
         if (scopeCoverage.normalizedWriteGlobs.length > 0) {
           plan.scope.write_globs = scopeCoverage.normalizedWriteGlobs;
@@ -2541,7 +2597,7 @@ export class RemoteBuddyOrchestrator {
         String(plan.worker_instruction ?? ""),
         canonicalInstruction,
       );
-      const executionGuidance = buildExecutionGuidance(plan, targetPaths);
+      const executionGuidance = buildExecutionGuidance(plan, targetPaths, requiredValidationSteps);
       const plannerWorkerInstruction = [rawPlannerInstruction, executionGuidance]
         .filter(Boolean)
         .join("\n\n")
@@ -2703,6 +2759,7 @@ export class RemoteBuddyOrchestrator {
             : {}),
           acceptanceCriteria: plan.acceptance_criteria,
           validationSteps: plan.validation_steps,
+          ...(requiredValidationSteps.length > 0 ? { requiredValidationSteps } : {}),
           queuePriority: priority,
           queueWaitBudgetMs,
           executionBudgetMs,

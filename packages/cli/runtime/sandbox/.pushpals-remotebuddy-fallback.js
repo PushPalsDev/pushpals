@@ -1603,6 +1603,9 @@ function classifyHeadingBucket(heading) {
   if (text.includes("non-goal") || text.includes("out of scope") || text.includes("not ")) {
     return "nonGoals";
   }
+  if (text.includes("testing criteria") || text.includes("test criteria") || text.includes("required tests") || text.includes("required validation") || text.includes("validation criteria")) {
+    return "testingCriteria";
+  }
   if (text.includes("measure") || text.includes("metric") || text.includes("good looks like")) {
     return "metrics";
   }
@@ -1694,6 +1697,7 @@ function extractVisionKeyItems(markdown) {
     constraints: [],
     nonGoals: [],
     metrics: [],
+    testingCriteria: [],
     riskPolicy: [],
     operatingModel: [],
     governance: []
@@ -1720,6 +1724,7 @@ function extractVisionKeyItems(markdown) {
     constraints: dedupeAndClamp(buckets.constraints),
     nonGoals: dedupeAndClamp(buckets.nonGoals),
     metrics: dedupeAndClamp(buckets.metrics),
+    testingCriteria: dedupeAndClamp(buckets.testingCriteria),
     riskPolicy: dedupeAndClamp(buckets.riskPolicy),
     operatingModel: dedupeAndClamp(buckets.operatingModel),
     governance: dedupeAndClamp(buckets.governance)
@@ -4071,7 +4076,7 @@ class PersistentSessionMemory {
 }
 
 // apps/remotebuddy/src/remotebuddy_main.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync2 } from "fs";
+import { existsSync as existsSync5, mkdirSync as mkdirSync2, readFileSync as readFileSync5 } from "fs";
 import { resolve as resolve5 } from "path";
 
 // apps/remotebuddy/src/autonomous_engine.ts
@@ -4528,6 +4533,144 @@ function uniqueLowercaseTokens(values, max = 24) {
   }
   return out;
 }
+var CATEGORY_KEYWORD_RULES = [
+  {
+    category: "product_core",
+    pattern: /\b(core|primary|match|game|gameplay|battle|battlefield|player|decision|territor|combat|strategy|mission|workflow|editor|dashboard|api)\b/i
+  },
+  {
+    category: "user_experience",
+    pattern: /\b(user experience|ux|ui|readab|legib|clarity|clear|shell|screen|navigation|control|input|touch|mobile|visual|presentation|feedback|discoverable|usable)\b/i
+  },
+  {
+    category: "onboarding",
+    pattern: /\b(onboard|new user|first[- ]?time|tutorial|learn|help|guide|activation|setup)\b/i
+  },
+  {
+    category: "reliability",
+    pattern: /\b(reliab|stable|stability|startup|trust|regression|failure|resilien|recover|fallback|safe|crash|broken|blocker)\b/i
+  },
+  {
+    category: "validation",
+    pattern: /\b(validation|validate|test|smoke|coverage|browser|e2e|end[- ]?to[- ]?end|ci|check|quality)\b/i
+  },
+  {
+    category: "performance",
+    pattern: /\b(performance|latency|smooth|jitter|lag|throughput|fps|render|memory|speed|fast|responsive)\b/i
+  },
+  {
+    category: "maintainability",
+    pattern: /\b(maintain|refactor|cleanup|architecture|structure|modular|debt|simplify|consistency|coherent)\b/i
+  },
+  {
+    category: "delivery_loop",
+    pattern: /\b(autonom|agent|worker|delivery loop|reliable autonomous delivery|merge|review|pr|pull request|dispatch|orchestrat|planner|compiler|ideation)\b/i
+  },
+  {
+    category: "governance",
+    pattern: /\b(policy|permission|scope|guardrail|risk|constraint|governance|approval|audit|security|non[- ]?goal)\b/i
+  },
+  {
+    category: "growth",
+    pattern: /\b(growth|retention|conversion|activation|adoption|audience|returning|replay|engagement)\b/i
+  },
+  {
+    category: "content",
+    pattern: /\b(content|variety|skin|cosmetic|faction|map|ship|projectile|enemy|level|mode|character)\b/i
+  }
+];
+var META_OBJECTIVE_CATEGORIES = new Set([
+  "delivery_loop",
+  "governance",
+  "maintainability"
+]);
+function slugifyObjectiveId(value, fallback) {
+  const slug = asString2(value).toLowerCase().replace(/`([^`]+)`/g, "$1").replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80);
+  return slug || fallback;
+}
+function categorizeVisionText(text) {
+  const matched = [];
+  for (const rule of CATEGORY_KEYWORD_RULES) {
+    if (rule.pattern.test(text))
+      matched.push(rule.category);
+  }
+  if (matched.length === 0) {
+    return { primary: "unknown", secondary: [] };
+  }
+  const [primary, ...secondary] = matched;
+  return {
+    primary,
+    secondary: [...new Set(secondary)].slice(0, 4)
+  };
+}
+function sourceBucketSectionRef(sourceBucket, sectionNumbers) {
+  const preferredByBucket = {
+    priorities: ["6", "5", "4"],
+    objectives: ["7", "6", "5"],
+    metrics: ["4", "6"],
+    testing_criteria: ["12", "9", "4"],
+    guardrails: ["9", "10", "3"],
+    constraints: ["9", "5"],
+    risk_policy: ["9", "10"],
+    operating_model: ["11", "7"],
+    governance: ["10", "9"],
+    target_users: ["1"],
+    non_goals: ["5", "9"],
+    section: ["6", "7", "4", "3"]
+  };
+  const available = new Set(sectionNumbers);
+  for (const ref of preferredByBucket[sourceBucket] ?? []) {
+    if (available.has(ref))
+      return ref;
+  }
+  return sectionNumbers[0] ?? "";
+}
+function categoryObjectiveType(category) {
+  switch (category) {
+    case "product_core":
+    case "user_experience":
+    case "onboarding":
+    case "content":
+    case "growth":
+      return "feature_small";
+    case "performance":
+    case "reliability":
+    case "maintainability":
+    case "delivery_loop":
+    case "governance":
+      return "small_refactor";
+    case "validation":
+      return "flaky_test";
+    default:
+      return "small_refactor";
+  }
+}
+function categoryTriggerType(category, topSignals) {
+  const allowed = [
+    "test_failure",
+    "lint_failure",
+    "typecheck_failure",
+    "queue_health",
+    "regret_signal"
+  ];
+  const strongestSignal = topSignals.map((signal) => ({
+    type: asString2(signal.type),
+    value: clamp012(asNumber(signal.value, 0))
+  })).filter((signal) => allowed.includes(signal.type)).sort((a, b) => b.value - a.value)[0];
+  if (category === "validation") {
+    return strongestSignal?.type === "test_failure" ? "test_failure" : "queue_health";
+  }
+  if (category === "performance" || category === "reliability") {
+    return strongestSignal?.type ?? "queue_health";
+  }
+  if (category === "delivery_loop" || category === "governance" || category === "maintainability") {
+    return strongestSignal?.type === "regret_signal" ? "regret_signal" : "queue_health";
+  }
+  return "queue_health";
+}
+function isMetaRepoObjective(objective) {
+  return META_OBJECTIVE_CATEGORIES.has(objective.category);
+}
 var OBJECTIVE_TYPES = new Set([
   "flaky_test",
   "lint_fix",
@@ -4747,6 +4890,67 @@ function chooseRepoTargetProfile(profiles, hints, triggerType) {
       best = { profile, score };
   }
   return best?.profile ?? profiles[0] ?? null;
+}
+function chooseRepoObjectiveTargetProfile(profiles, objective) {
+  if (profiles.length === 0)
+    return null;
+  const hintTokens = [...new Set([...objective.keywords, ...tokenizePath(objective.title)])];
+  const categories = new Set([
+    objective.category,
+    ...objective.secondary_categories
+  ]);
+  let best = null;
+  for (const profile of profiles) {
+    const label = profile.label.toLowerCase();
+    const profileTokens = new Set(profile.keywords);
+    let score = 0;
+    for (const token of hintTokens) {
+      if (profileTokens.has(token))
+        score += 3;
+      if (label.includes(token))
+        score += 1;
+    }
+    const productSurface = /(^|\/)(app|src|components|component|screens|pages|routes|styles|assets)\b/i.test(label) || /\b(client|frontend|web|ui|ux|game|screen|view|layout)\b/i.test(label);
+    const validationSurface = /(^|\/)(__tests__|tests?|e2e|smoke|specs?)\b/i.test(label) || /\b(test|smoke|spec)\b/i.test(label);
+    const docsSurface = /\b(readme|vision|docs?)\b/i.test(label);
+    const scriptSurface = /(^|\/)(scripts?|tools?)\b/i.test(label);
+    const packageSurface = /\b(package\.json|tsconfig|eslint|prettier|config)\b/i.test(label);
+    if (categories.has("product_core") || categories.has("user_experience") || categories.has("onboarding") || categories.has("content") || categories.has("growth")) {
+      if (productSurface)
+        score += 5;
+      if (/\b(game|play|screen|route|layout|index|style|component)\b/i.test(label))
+        score += 3;
+      if (validationSurface)
+        score -= 7;
+      if (docsSurface || packageSurface || scriptSurface)
+        score -= 4;
+    }
+    if (categories.has("validation")) {
+      if (validationSurface || scriptSurface)
+        score += 5;
+      if (productSurface)
+        score += 1;
+    }
+    if (categories.has("performance")) {
+      if (productSurface || /\b(perf|render|animation|worker|server)\b/i.test(label))
+        score += 4;
+      if (docsSurface)
+        score -= 3;
+    }
+    if (categories.has("reliability")) {
+      if (productSurface || scriptSurface || packageSurface || /\b(config|startup|server)\b/i.test(label)) {
+        score += 3;
+      }
+    }
+    if (categories.has("delivery_loop") || categories.has("governance") || categories.has("maintainability")) {
+      if (scriptSurface || packageSurface || /\b(src|utils?|lib|server|shared|policy)\b/i.test(label)) {
+        score += 3;
+      }
+    }
+    if (!best || score > best.score)
+      best = { profile, score };
+  }
+  return best?.profile ?? chooseRepoTargetProfile(profiles, [objective.title], "queue_health");
 }
 function adaptCandidateShapeToRepo(params) {
   const shape = params.shape;
@@ -5190,12 +5394,117 @@ function maxSignalScore(snapshot, types) {
 function maxTraitScore(snapshot, pattern) {
   return clamp012(Math.max(0, ...snapshot.state_traits.filter((trait) => pattern.test(String(trait.focus ?? "")) || pattern.test(String(trait.evidence ?? "")) || pattern.test(String(trait.trait_id ?? ""))).map((trait) => asNumber(trait.score, 0))));
 }
+function repoObjectiveWeight(params) {
+  const rank = params.priorityRank ?? 12;
+  const sourceBase = params.sourceBucket === "priorities" ? 0.86 : params.sourceBucket === "objectives" ? 0.78 : params.sourceBucket === "metrics" ? 0.58 : params.sourceBucket === "section" ? 0.5 : 0.42;
+  const rankPenalty = Math.min(0.28, Math.max(0, rank - 1) * 0.045);
+  const metaPenalty = META_OBJECTIVE_CATEGORIES.has(params.category) ? 0.08 : 0;
+  const explicitValidationBoost = params.category === "validation" || /\b(smoke|browser|validation|test)\b/i.test(params.text) ? 0.04 : 0;
+  return clamp012(sourceBase - rankPenalty - metaPenalty + explicitValidationBoost);
+}
+function compileRepoVisionObjectives(params) {
+  const sectionNumbers = params.vision.section_numbers ?? [];
+  const keyItems = params.vision.key_items;
+  const constraints = bucketLines(keyItems, [
+    "guardrails",
+    "constraints",
+    "risk_policy",
+    "non_goals"
+  ]).slice(0, 12);
+  const validationExpectations = [
+    ...bucketLines(keyItems, ["testing_criteria"]),
+    ...bucketLines(keyItems, ["metrics", "constraints", "risk_policy"]).filter((line) => /\b(validation|validate|test|smoke|browser|ci|check)\b/i.test(line))
+  ].slice(0, 8);
+  const successCriteria = bucketLines(keyItems, ["metrics", "objectives", "priorities"]).slice(0, 8);
+  const entries = [];
+  const seen = new Set;
+  const addEntry = (rawTitle, sourceBucket, priorityRank, explicitSectionRef) => {
+    const title = asString2(rawTitle);
+    if (!title)
+      return;
+    const key = title.toLowerCase();
+    if (seen.has(key))
+      return;
+    seen.add(key);
+    const titleCategory = categorizeVisionText(title);
+    const contextCategory = categorizeVisionText([constraints.join(" "), validationExpectations.join(" ")].join(`
+`));
+    const secondaryCategories = [
+      ...titleCategory.secondary,
+      contextCategory.primary,
+      ...contextCategory.secondary
+    ].filter((category) => category !== "unknown" && category !== titleCategory.primary);
+    const primaryCategory = titleCategory.primary === "unknown" && (sourceBucket === "priorities" || sourceBucket === "objectives") ? "product_core" : titleCategory.primary;
+    const categorized = {
+      primary: primaryCategory,
+      secondary: [
+        ...new Set(secondaryCategories.filter((category) => category !== primaryCategory))
+      ].slice(0, 4)
+    };
+    const id = slugifyObjectiveId(title, `vision_objective_${entries.length + 1}`);
+    const sectionRef = explicitSectionRef || sourceBucketSectionRef(sourceBucket, sectionNumbers) || "";
+    const keywords = uniqueLowercaseTokens([
+      ...tokenizePath(title),
+      categorized.primary,
+      ...categorized.secondary
+    ]);
+    const weight = repoObjectiveWeight({
+      sourceBucket,
+      priorityRank,
+      category: categorized.primary,
+      text: title
+    });
+    entries.push({
+      id,
+      title,
+      category: categorized.primary,
+      secondary_categories: categorized.secondary,
+      priority_rank: priorityRank,
+      source_bucket: sourceBucket,
+      section_ref: sectionRef,
+      weight,
+      keywords,
+      success_criteria: successCriteria,
+      constraints,
+      validation_expectations: validationExpectations,
+      evidence: [
+        `source_bucket=${sourceBucket}`,
+        priorityRank != null ? `priority_rank=${priorityRank}` : "priority_rank=none",
+        `category=${categorized.primary}`,
+        `section_ref=${sectionRef || "none"}`
+      ]
+    });
+  };
+  keyItems.priorities.forEach((title, index) => addEntry(title, "priorities", index + 1));
+  keyItems.objectives.forEach((title, index) => addEntry(title, "objectives", index + 1));
+  keyItems.metrics.filter((title) => /\b(validation|smoke|browser|performance|reliab|startup)\b/i.test(title)).forEach((title, index) => addEntry(title, "metrics", index + 1));
+  for (const section of params.vision.sections ?? []) {
+    const sectionTitle = asString2(section.title);
+    if (!sectionTitle)
+      continue;
+    if (/^(who this is for|the problem|scope|long-term|how decisions|get made)$/i.test(sectionTitle)) {
+      continue;
+    }
+    const sectionNumber = asString2(section.number);
+    const priorityRank = Number.isFinite(Number(sectionNumber)) ? Number(sectionNumber) : null;
+    addEntry(sectionTitle, "section", priorityRank, sectionNumber);
+  }
+  return entries.sort((a, b) => {
+    if (b.weight !== a.weight)
+      return b.weight - a.weight;
+    const aRank = a.priority_rank ?? Number.MAX_SAFE_INTEGER;
+    const bRank = b.priority_rank ?? Number.MAX_SAFE_INTEGER;
+    if (aRank !== bRank)
+      return aRank - bRank;
+    return a.id.localeCompare(b.id);
+  });
+}
 function normalizeValidationIdeas(ideas) {
   const out = [];
   for (const idea of ideas) {
-    const canonical = canonicalizeValidationCommandForBun(idea);
-    if (canonical.startsWith("bun ")) {
-      out.push(canonical);
+    const command = extractValidationCommandFromIdea(idea);
+    if (isRepoNativeValidationCommand(command)) {
+      out.push(command);
       continue;
     }
     const lower = idea.toLowerCase();
@@ -5209,6 +5518,16 @@ function normalizeValidationIdeas(ideas) {
   if (out.length === 0)
     out.push("bun run test:root");
   return [...new Set(out)].slice(0, 5);
+}
+function extractValidationCommandFromIdea(value) {
+  const raw = asString2(value);
+  if (!raw)
+    return "";
+  const fenced = raw.match(/`([^`]+)`/)?.[1]?.trim();
+  return (fenced || raw.replace(/^(run|execute|verify|validate|check)\s+/i, "")).trim();
+}
+function isRepoNativeValidationCommand(value) {
+  return /^(bun|bunx|npm|npx|pnpm|yarn|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i.test(value);
 }
 function inferComponentAreaFromText(text, repoTargets, triggerType) {
   const repoTargetMatch = chooseRepoTargetProfile(repoTargets ?? [], [text], triggerType);
@@ -5566,6 +5885,7 @@ function buildCommitHistoryBlocks(params) {
 function buildEngineInspirationContext(params) {
   const oneSentence = asString2(params.vision.one_sentence);
   const keyItems = params.vision.key_items;
+  const compiledRepoObjectives = compileRepoVisionObjectives({ vision: params.vision });
   const compiledObjectives = ENGINE_OBJECTIVE_BLUEPRINTS.map((blueprint) => {
     const lines = bucketLines(keyItems, blueprint.buckets);
     const evidence = keywordEvidence(lines, blueprint.keywordPattern);
@@ -5732,6 +6052,7 @@ function buildEngineInspirationContext(params) {
   }
   const buildingBlocks = [...buildingBlockMap.values()].sort((a, b) => b.score - a.score);
   return {
+    compiled_repo_objectives: compiledRepoObjectives,
     compiled_objectives: compiledObjectives,
     opportunity_gaps: opportunityGaps,
     building_blocks: buildingBlocks,
@@ -5817,6 +6138,63 @@ function inferEngineTrialFromCandidate(candidate, engineInspiration) {
     summary: fallback.summary,
     hypothesis: fallback.hypothesis
   };
+}
+function buildRepoVisionFallbackCandidates(params) {
+  const maxCandidates = Number.isFinite(params.maxCandidates) ? Math.max(1, Math.min(6, Math.floor(params.maxCandidates))) : 3;
+  const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
+  const objectives = params.engineInspiration.compiled_repo_objectives.filter((objective) => objective.weight >= 0.42).sort((a, b) => {
+    if (b.weight !== a.weight)
+      return b.weight - a.weight;
+    const aRank = a.priority_rank ?? Number.MAX_SAFE_INTEGER;
+    const bRank = b.priority_rank ?? Number.MAX_SAFE_INTEGER;
+    if (aRank !== bRank)
+      return aRank - bRank;
+    const aMeta = isMetaRepoObjective(a) ? 1 : 0;
+    const bMeta = isMetaRepoObjective(b) ? 1 : 0;
+    if (aMeta !== bMeta)
+      return aMeta - bMeta;
+    return a.id.localeCompare(b.id);
+  }).slice(0, maxCandidates);
+  return objectives.map((objective, idx) => {
+    const target = chooseRepoObjectiveTargetProfile(params.repoTargets ?? [], objective);
+    const targetPaths = target?.target_paths ?? [objective.section_ref ? `vision.md` : "README.md"];
+    const writeGlobs = target?.write_globs ?? targetPaths;
+    const componentArea = target?.component_area ?? (normalizeAutonomyComponentArea(pathDirname(targetPaths[0]) || targetPaths[0]) ?? "docs");
+    const triggerType = categoryTriggerType(objective.category, params.snapshotTopSignals);
+    const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, triggerType);
+    const sectionRef = objective.section_ref || sectionRefs[0] || "";
+    const categorySummary = [
+      objective.category,
+      ...objective.secondary_categories.slice(0, 2)
+    ].join(", ");
+    return {
+      id: `cand_repo_${objective.id}_${randomUUID().slice(0, 8)}`,
+      title: `Vision objective: ${objective.title}`,
+      objective_type: categoryObjectiveType(objective.category),
+      problem_statement: `Advance the repo vision objective "${objective.title}" (${categorySummary}). ` + "Deliver one small, observable improvement using the repo's own product/domain language.",
+      trigger_type: triggerType,
+      component_area: componentArea,
+      target_paths: targetPaths,
+      scope: {
+        read_anywhere: false,
+        write_globs: writeGlobs
+      },
+      risk_level: "low",
+      expected_validation: normalizeValidationIdeas(objective.validation_expectations.length > 0 ? objective.validation_expectations : ["bun run test:root"]),
+      estimated_effort: idx === 0 ? "small" : "medium",
+      why_now_signal_ids: signalIds,
+      confidence: clamp012(0.5 + objective.weight * 0.45),
+      vision_alignment_reason: `Highest repo vision category ${objective.category}; source=${objective.source_bucket}; ` + `priority=${objective.priority_rank ?? "n/a"}; section=${sectionRef || "n/a"}.`,
+      vision_section_refs: sectionRef ? [sectionRef] : sectionRefs,
+      feature_hypotheses: [
+        objective.success_criteria[0] ? `Success signal: ${objective.success_criteria[0]}` : `Improve ${objective.title} without widening scope.`,
+        objective.constraints[0] ? `Guardrail: ${objective.constraints[0]}` : "",
+        objective.validation_expectations[0] ? `Validation expectation: ${objective.validation_expectations[0]}` : "Validate through the smallest repo-supported check."
+      ].filter(Boolean),
+      requires_user_input: false,
+      question_if_blocked: ""
+    };
+  });
 }
 function buildEngineFallbackCandidates(params) {
   const maxCandidates = Number.isFinite(params.maxCandidates) ? Math.max(1, Math.min(6, Math.floor(params.maxCandidates))) : 3;
@@ -6142,6 +6520,7 @@ class RemoteBuddyAutonomousEngine {
         constraints: keyItems.constraints,
         non_goals: keyItems.nonGoals,
         metrics: keyItems.metrics,
+        testing_criteria: keyItems.testingCriteria,
         risk_policy: keyItems.riskPolicy,
         operating_model: keyItems.operatingModel,
         governance: keyItems.governance
@@ -6872,8 +7251,16 @@ ${JSON.stringify(input.messages ?? [])}`),
         return;
       }
       let rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
+      let rawCandidatesSource = "llm";
       if (rawCandidates.length === 0) {
-        const synthesized = buildEngineFallbackCandidates({
+        const repoSynthesized = buildRepoVisionFallbackCandidates({
+          engineInspiration,
+          snapshotTopSignals: snapshot.top_signals,
+          visionSectionRefs: visionContext.section_numbers,
+          maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+          repoTargets
+        });
+        const synthesized = repoSynthesized.length > 0 ? repoSynthesized : buildEngineFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: snapshot.top_signals,
           visionSectionRefs: visionContext.section_numbers,
@@ -6882,8 +7269,9 @@ ${JSON.stringify(input.messages ?? [])}`),
           repoTargets
         });
         if (synthesized.length > 0) {
-          console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: ideation returned no candidates; using ${synthesized.length} deterministic engine-inspiration fallback candidates.`);
+          console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: ideation returned no candidates; using ${synthesized.length} deterministic ${repoSynthesized.length > 0 ? "repo-vision" : "engine-inspiration"} fallback candidates.`);
           rawCandidates = synthesized;
+          rawCandidatesSource = repoSynthesized.length > 0 ? "repo_vision_fallback" : "engine_fallback";
         }
       }
       const normalizedCandidates = [];
@@ -6972,7 +7360,7 @@ ${JSON.stringify(input.messages ?? [])}`),
             console.warn(`[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: target_paths missing in repo ${missingTargetPaths.join(", ")}`);
             continue;
           }
-          if (!candidate.engine_trial) {
+          if (!candidate.engine_trial && source !== "repo_vision_fallback") {
             const inferred = inferEngineTrialFromCandidate(candidate, engineInspiration);
             if (inferred) {
               candidate.engine_trial = {
@@ -6984,9 +7372,16 @@ ${JSON.stringify(input.messages ?? [])}`),
           normalizedCandidates.push(candidate);
         }
       };
-      ingestRawCandidates(rawCandidates, "llm");
+      ingestRawCandidates(rawCandidates, rawCandidatesSource);
       if (normalizedCandidates.length === 0) {
-        const synthesizedFallback = buildEngineFallbackCandidates({
+        const repoSynthesizedFallback = buildRepoVisionFallbackCandidates({
+          engineInspiration,
+          snapshotTopSignals: snapshot.top_signals,
+          visionSectionRefs: visionContext.section_numbers,
+          maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+          repoTargets
+        });
+        const synthesizedFallback = repoSynthesizedFallback.length > 0 ? repoSynthesizedFallback : buildEngineFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: snapshot.top_signals,
           visionSectionRefs: visionContext.section_numbers,
@@ -6995,7 +7390,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           repoTargets
         });
         if (synthesizedFallback.length > 0) {
-          ingestRawCandidates(synthesizedFallback, "engine_fallback");
+          ingestRawCandidates(synthesizedFallback, repoSynthesizedFallback.length > 0 ? "repo_vision_fallback" : "engine_fallback");
         }
       }
       candidatesPayload = normalizedCandidates.map((candidate) => ({
@@ -7818,7 +8213,7 @@ function ensureWriteGlobsCoverTargetPaths(targetPaths, writeGlobs) {
   }
   return { normalizedWriteGlobs, uncoveredTargets, addedGlobs };
 }
-function buildExecutionGuidance(plan, targetPaths) {
+function buildExecutionGuidance(plan, targetPaths, requiredValidationSteps = []) {
   const lines = [];
   const targets = normalizePathHints(targetPaths.length > 0 ? targetPaths : plan.scope.write_globs ?? []);
   if (targets.length > 0) {
@@ -7872,10 +8267,16 @@ function buildExecutionGuidance(plan, targetPaths) {
     for (const step of plan.validation_steps)
       lines.push(`- ${step}`);
   }
+  if (requiredValidationSteps.length > 0) {
+    lines.push("Required vision.md testing criteria:");
+    for (const step of requiredValidationSteps)
+      lines.push(`- ${step}`);
+    lines.push("- These repo-level checks are mandatory before reporting completion or publishing a PR.");
+  }
   return lines.join(`
 `).trim();
 }
-var VALIDATION_COMMAND_PREFIX = /^(git|bun|bunx|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
+var VALIDATION_COMMAND_PREFIX = /^(git|bun|bunx|npm|npx|pnpm|yarn|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
 var VALIDATION_GENERIC_SAFE = /^(git\s+status\s+--porcelain|git\s+diff\b)/i;
 var PATH_TOKEN_REGEX = /\b([A-Za-z0-9._/\-\\]+\.[A-Za-z0-9._-]+)\b/g;
 function isCommandLikeValidationStep(step) {
@@ -7921,6 +8322,34 @@ function normalizeValidationSteps(steps, targetPaths) {
       continue;
     seen.add(key);
     out.push(value);
+  }
+  return out;
+}
+function extractCommandFromValidationCriterion(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw)
+    return "";
+  const fenced = raw.match(/`([^`]+)`/)?.[1]?.trim();
+  const candidate = fenced || raw.replace(/^(run|execute|verify|validate|check)\s+/i, "").trim();
+  return candidate.trim();
+}
+function extractRequiredValidationStepsFromVisionMarkdown(markdown) {
+  const criteria = extractVisionKeyItems(markdown).testingCriteria;
+  const out = [];
+  const seen = new Set;
+  for (const criterion of criteria) {
+    const command = extractCommandFromValidationCriterion(criterion);
+    if (!command)
+      continue;
+    if (!isCommandLikeValidationStep(command))
+      continue;
+    const key = command.toLowerCase();
+    if (seen.has(key))
+      continue;
+    seen.add(key);
+    out.push(command);
+    if (out.length >= 12)
+      break;
   }
   return out;
 }
@@ -8799,6 +9228,17 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     }
     return out;
   }
+  loadVisionRequiredValidationSteps() {
+    const visionPath = resolve5(this.repo, "vision.md");
+    if (!existsSync5(visionPath))
+      return [];
+    try {
+      return extractRequiredValidationStepsFromVisionMarkdown(readFileSync5(visionPath, "utf8"));
+    } catch (err) {
+      console.warn("[RemoteBuddy] Could not read vision.md testing criteria:", err);
+      return [];
+    }
+  }
   getRecentContextSnapshot(sessionId = this.sessionId) {
     return this.sessionContext(sessionId).slice(-RemoteBuddyOrchestrator.MAX_CONTEXT);
   }
@@ -9261,7 +9701,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       const isAnalysisFromEngine = plan.intent === "analysis" && Boolean(autonomyMetadata);
       const requiresWorker = forceWorker && !isAnalysisFromEngine ? true : this.shouldForceDirectReply(prompt, plan.intent) ? false : plan.requires_worker;
       console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
+      let requiredValidationSteps = [];
       if (requiresWorker) {
+        requiredValidationSteps = this.loadVisionRequiredValidationSteps();
+        if (requiredValidationSteps.length > 0) {
+          console.log(`[RemoteBuddy] Loaded ${requiredValidationSteps.length} required validation step(s) from vision.md testing criteria.`);
+        }
         const scopeCoverage = ensureWriteGlobsCoverTargetPaths(targetPaths, plan.scope.write_globs);
         if (scopeCoverage.normalizedWriteGlobs.length > 0) {
           plan.scope.write_globs = scopeCoverage.normalizedWriteGlobs;
@@ -9311,7 +9756,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       }
       const canonicalInstruction = prompt.trim();
       const rawPlannerInstruction = sanitizePlannerWorkerInstruction(String(plan.worker_instruction ?? ""), canonicalInstruction);
-      const executionGuidance = buildExecutionGuidance(plan, targetPaths);
+      const executionGuidance = buildExecutionGuidance(plan, targetPaths, requiredValidationSteps);
       const plannerWorkerInstruction = [rawPlannerInstruction, executionGuidance].filter(Boolean).join(`
 
 `).trim();
@@ -9417,6 +9862,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           } : {},
           acceptanceCriteria: plan.acceptance_criteria,
           validationSteps: plan.validation_steps,
+          ...requiredValidationSteps.length > 0 ? { requiredValidationSteps } : {},
           queuePriority: priority,
           queueWaitBudgetMs,
           executionBudgetMs,
@@ -9746,6 +10192,7 @@ if (import.meta.main) {
   });
 }
 export {
+  extractRequiredValidationStepsFromVisionMarkdown,
   buildTaskExecuteDedupeKey,
   RemoteBuddyOrchestrator
 };

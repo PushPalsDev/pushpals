@@ -5,6 +5,7 @@ import { join } from "path";
 import {
   buildEngineFallbackCandidates,
   buildEngineInspirationContext,
+  buildRepoVisionFallbackCandidates,
   summarizeCommitHistoryHints,
 } from "../apps/remotebuddy/src/autonomous_engine";
 
@@ -32,6 +33,7 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
       ],
       non_goals: ["Unbounded autonomous architecture redesign"],
       metrics: ["Autonomous merge rate", "Rework rate", "Queue health", "Time-to-first-value"],
+      testing_criteria: ["bun run test:root"],
       risk_policy: ["Low risk can ship autonomously", "High risk requires explicit approval"],
       operating_model: ["RemoteAgent delegates to specialized WorkerPals"],
       governance: ["RFC for high-risk architecture changes"],
@@ -153,6 +155,180 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
       expect(validation.length).toBeGreaterThan(0);
       expect(validation.every((command) => command.startsWith("bun "))).toBe(true);
     }
+  });
+
+  test("repo vision fallback preserves repo-native priority headings before meta engine work", () => {
+    const sectorVision = {
+      one_sentence:
+        "SectorCommand is a fast, readable real-time planet conquest game with short high-pressure matches.",
+      key_items: {
+        target_users: ["Players who want readable real-time strategy without RTS control burden"],
+        priorities: [
+          "Improve battlefield readability during heavier action",
+          "Make the player control panel clearer, faster, and harder to misuse",
+          "Strengthen onboarding for expand, defend, and win behavior",
+          "Polish the game shell so it matches the in-match quality bar",
+          "Make web delivery and navigation trustworthy",
+          "Preserve performance while effects, units, and shell polish increase",
+          "Add the vision_compiler building block to the active repo autonomy loop",
+        ],
+        objectives: [
+          "Sharpen the core match presentation",
+          "Tighten player decision surfaces",
+          "Make the web review path easy to trust",
+          "Use vision_compiler to keep autonomous delivery aligned",
+        ],
+        guardrails: [
+          "Protect readability before adding spectacle",
+          "Keep critical actions accessible in one click or tap",
+        ],
+        constraints: [
+          "Desktop and smaller touch-device usability both matter",
+          "Browser validation is required for UI-affecting work",
+        ],
+        non_goals: ["Bloated RTS systems that slow the core loop"],
+        metrics: [
+          "Battlefield remains readable during high-action moments",
+          "Browser smoke coverage exercises the main shell path",
+        ],
+        testing_criteria: ["bun run test:root", "bun run smoke:web"],
+        risk_policy: ["Do not ship visual changes that make the battlefield harder to parse"],
+        operating_model: ["Worker agents should validate rendered UI for UI-affecting work"],
+        governance: ["Source of truth is the match-quality north star"],
+      },
+      section_numbers: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
+    };
+    const repoTargets = [
+      {
+        component_area: "app",
+        target_paths: ["app/autonomyGraph.ts"],
+        write_globs: ["app/autonomyGraph.ts"],
+        label: "app/autonomyGraph.ts",
+        keywords: ["app", "autonomy", "graph"],
+      },
+      {
+        component_area: "app",
+        target_paths: ["app/game.tsx"],
+        write_globs: ["app/game.tsx"],
+        label: "app/game.tsx",
+        keywords: ["app", "game", "tsx"],
+      },
+      {
+        component_area: "app/__tests__",
+        target_paths: ["app/__tests__/_layout.autonomy.test.ts"],
+        write_globs: ["app/__tests__/_layout.autonomy.test.ts"],
+        label: "app/__tests__/_layout.autonomy.test.ts",
+        keywords: ["app", "tests", "layout", "autonomy"],
+      },
+    ];
+
+    const context = buildEngineInspirationContext({
+      vision: sectorVision,
+      snapshot,
+      repoTargets,
+    });
+    const topRepoObjective = context.compiled_repo_objectives[0];
+    expect(topRepoObjective.title).toBe("Improve battlefield readability during heavier action");
+    expect(topRepoObjective.category).toBe("product_core");
+
+    const candidates = buildRepoVisionFallbackCandidates({
+      engineInspiration: context,
+      snapshotTopSignals: snapshot.top_signals,
+      visionSectionRefs: sectorVision.section_numbers,
+      repoTargets,
+      maxCandidates: 3,
+    });
+
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(String(candidates[0].title)).toContain("Improve battlefield readability");
+    expect(candidates[0].target_paths).toEqual(["app/game.tsx"]);
+    expect(candidates[0].component_area).toBe("app");
+    expect(candidates[0].expected_validation).toContain("bun run test:root");
+    expect(candidates[0].engine_trial).toBeUndefined();
+    expect(String(candidates[0].vision_alignment_reason)).toContain("priority=1");
+    expect(
+      candidates.some((candidate) =>
+        String(candidate.title).includes("vision_compiler building block"),
+      ),
+    ).toBe(false);
+  });
+
+  test("repo vision fallback uses generic heading categories without repo-specific blueprints", () => {
+    const genericVision = {
+      one_sentence:
+        "DocPilot helps teams search, import, and validate shared knowledge with predictable workflows.",
+      key_items: {
+        target_users: ["Support teams", "Operations leads"],
+        priorities: [
+          "Improve query answer accuracy for imported documents",
+          "Reduce onboarding mistakes in the first workspace setup",
+          "Preserve performance during large document imports",
+          "Strengthen validation for parser regressions",
+        ],
+        objectives: [
+          "Make search results easier to trust",
+          "Keep imports reversible and observable",
+        ],
+        guardrails: ["Do not hide source citations", "Avoid broad rewrites of parser behavior"],
+        constraints: ["Validation must cover import and search flows"],
+        non_goals: ["Do not add a new collaboration surface"],
+        metrics: ["Answer accuracy improves", "Import validation catches malformed files"],
+        testing_criteria: ["bun test tests/parser-regressions.test.ts"],
+        risk_policy: ["Parser regressions are release blockers"],
+        operating_model: ["Prefer small, test-backed changes"],
+        governance: ["Document high-risk parser changes"],
+      },
+      section_numbers: ["1", "4", "6", "7", "9"],
+    };
+    const repoTargets = [
+      {
+        component_area: "src/search",
+        target_paths: ["src/search/rankAnswers.ts"],
+        write_globs: ["src/search/rankAnswers.ts"],
+        label: "src/search/rankAnswers.ts",
+        keywords: ["src", "search", "rank", "answers", "query", "accuracy", "documents"],
+      },
+      {
+        component_area: "src/import",
+        target_paths: ["src/import/parser.ts"],
+        write_globs: ["src/import/parser.ts"],
+        label: "src/import/parser.ts",
+        keywords: ["src", "import", "parser", "documents", "large"],
+      },
+      {
+        component_area: "tests",
+        target_paths: ["tests/parser-regressions.test.ts"],
+        write_globs: ["tests/parser-regressions.test.ts"],
+        label: "tests/parser-regressions.test.ts",
+        keywords: ["tests", "parser", "regressions", "validation"],
+      },
+    ];
+
+    const context = buildEngineInspirationContext({
+      vision: genericVision,
+      snapshot,
+      repoTargets,
+    });
+    const topRepoObjective = context.compiled_repo_objectives[0];
+    expect(topRepoObjective.title).toBe("Improve query answer accuracy for imported documents");
+    expect(topRepoObjective.category).toBe("product_core");
+
+    const candidates = buildRepoVisionFallbackCandidates({
+      engineInspiration: context,
+      snapshotTopSignals: snapshot.top_signals,
+      visionSectionRefs: genericVision.section_numbers,
+      repoTargets,
+      maxCandidates: 3,
+    });
+
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(String(candidates[0].title)).toContain("Improve query answer accuracy");
+    expect(candidates[0].target_paths).toEqual(["src/search/rankAnswers.ts"]);
+    expect(candidates[0].expected_validation).toContain(
+      "bun test tests/parser-regressions.test.ts",
+    );
+    expect(String(candidates[0].problem_statement)).toContain("repo's own product/domain language");
+    expect(candidates[0].engine_trial).toBeUndefined();
   });
 
   test("buildEngineInspirationContext merges external inspiration patterns with source attribution", () => {

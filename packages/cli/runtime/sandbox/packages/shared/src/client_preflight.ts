@@ -167,6 +167,8 @@ export function evaluateClientRuntimePreflight(
       message:
         "Missing required autonomy vision file: vision.md " +
         "(required when remotebuddy.autonomy.enabled=true).",
+      detail:
+        "Run `pushpals --create_vision_md` to create a starter vision.md, then edit it for this repo.",
       copyCommands: existsSync(visionTemplatePath)
         ? buildCopyCommands(projectRoot, visionTemplatePath, visionPath)
         : undefined,

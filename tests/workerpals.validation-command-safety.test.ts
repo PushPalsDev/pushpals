@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  collectRequiredValidationFailures,
+  collectQualityGateValidationCommands,
+  extractRequiredValidationStepsFromVisionMarkdown,
   inferFallbackValidationCommandsForTestTask,
   isTestLikeValidationStep,
   tokenizeValidationCommandArgv,
@@ -85,5 +88,78 @@ describe("workerpals validation command safety", () => {
       [],
     );
     expect(commands).toEqual(["bun test"]);
+  });
+
+  test("runs required vision criteria without classifying normal work as test-focused", () => {
+    const planning = planningFixture({
+      validationSteps: ["git diff -- app/game.tsx"],
+      requiredValidationSteps: ["`bun run test:root`", "Run `bun run smoke:web`"],
+    }) as any;
+
+    const commands = collectQualityGateValidationCommands({
+      instruction: "Improve the game shell polish",
+      targetPath: "app/game.tsx",
+      planning,
+      changedTestPaths: [],
+      isTestTask: false,
+    });
+
+    expect(commands.requiredRunnableSteps).toEqual(["bun run test:root", "bun run smoke:web"]);
+    expect(commands.commandsToRun).toEqual([
+      "bun run test:root",
+      "bun run smoke:web",
+      "git diff -- app/game.tsx",
+    ]);
+    expect(commands.fallbackValidationSteps).toEqual([]);
+  });
+
+  test("keeps focused fallback validation for test-focused work when planner omits a runnable step", () => {
+    const planning = planningFixture({
+      validationSteps: ["Inspect the changed test"],
+      requiredValidationSteps: ["bun run test:root"],
+    }) as any;
+
+    const commands = collectQualityGateValidationCommands({
+      instruction: "add regression tests",
+      targetPath: "tests/localbuddy.request-status.test.ts",
+      planning,
+      changedTestPaths: ["tests/localbuddy.request-status.test.ts"],
+      isTestTask: true,
+    });
+
+    expect(commands.commandsToRun[0]).toBe("bun run test:root");
+    expect(commands.fallbackValidationSteps[0]).toContain("tests/localbuddy.request-status.test.ts");
+  });
+
+  test("extracts repo-native required validation commands from vision markdown", () => {
+    const markdown = [
+      "# Vision",
+      "> **One sentence:** Keep every PR validated.",
+      "",
+      "## 12) Testing criteria",
+      "- `go test ./...`",
+      "- Run `cargo test --workspace`",
+      "- `node --test`",
+      "- `tsc --noEmit`",
+      "- `sh scripts/smoke.sh`",
+      "- Manual QA after release",
+    ].join("\n");
+
+    expect(extractRequiredValidationStepsFromVisionMarkdown(markdown)).toEqual([
+      "go test ./...",
+      "cargo test --workspace",
+      "node --test",
+      "tsc --noEmit",
+      "sh scripts/smoke.sh",
+    ]);
+  });
+
+  test("treats failed vision-required validation commands as publish blockers", () => {
+    expect(
+      collectRequiredValidationFailures(["bun run test:root"], [
+        { command: "bun run test:root", ok: false, exitCode: 1 },
+        { command: "bun test tests/focused.test.ts", ok: true, exitCode: 0 },
+      ]),
+    ).toEqual(["bun run test:root exited 1"]);
   });
 });

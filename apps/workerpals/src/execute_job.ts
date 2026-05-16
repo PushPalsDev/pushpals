@@ -11,6 +11,7 @@ import {
   explicitSourceControlCommitIdentityFromEnv,
   loadPromptTemplate,
   loadPushPalsConfig,
+  extractVisionKeyItems,
   matchesGlob,
   normalizeAutonomyComponentArea,
   normalizeTargetPath,
@@ -34,7 +35,7 @@ import { extractMergeConflictReviewContext } from "./merge_conflict_job.js";
 
 const DEFAULT_CONFIG = loadPushPalsConfig();
 
-interface TaskExecutePlanning {
+export interface TaskExecutePlanning {
   intent: TaskExecuteIntent;
   riskLevel: TaskExecuteRisk;
   targetPaths?: string[];
@@ -52,6 +53,7 @@ interface TaskExecutePlanning {
   };
   acceptanceCriteria: string[];
   validationSteps: string[];
+  requiredValidationSteps?: string[];
   queuePriority: TaskExecutePriority;
   queueWaitBudgetMs: number;
   executionBudgetMs: number;
@@ -80,6 +82,7 @@ interface DeterministicQualityResult {
   changedPaths: string[];
   changedTestPaths: string[];
   validationRuns: ValidationExecutionResult[];
+  requiredValidationFailures: string[];
   blocker: ValidationBlocker | null;
 }
 
@@ -728,9 +731,159 @@ function extractRunnableValidationCommand(step: string): string | null {
       ? trimmed.slice(8).trim()
       : trimmed;
   const firstToken = maybeStripped.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
-  const runnable = new Set(["bun", "npm", "pnpm", "yarn", "pytest", "python", "uv", "coverage"]);
+  const runnable = new Set([
+    "bun",
+    "bunx",
+    "git",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "node",
+    "pytest",
+    "python",
+    "python3",
+    "uv",
+    "coverage",
+    "vitest",
+    "jest",
+    "tsc",
+    "eslint",
+    "ruff",
+    "mypy",
+    "go",
+    "cargo",
+    "make",
+    "docker",
+    "pwsh",
+    "powershell",
+    "sh",
+    "bash",
+  ]);
   if (runnable.has(firstToken)) return maybeStripped;
   return null;
+}
+
+function validationCommandKey(command: string): string {
+  return command.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+export function collectRequiredValidationFailures(
+  requiredCommands: string[],
+  validationRuns: Array<{ command: string; ok: boolean; exitCode?: number }>,
+): string[] {
+  const requiredKeys = new Set(requiredCommands.map(validationCommandKey).filter(Boolean));
+  if (requiredKeys.size === 0) return [];
+  return validationRuns
+    .filter((run) => requiredKeys.has(validationCommandKey(run.command)) && !run.ok)
+    .map((run) => {
+      const exitCode = Number.isFinite(Number(run.exitCode)) ? Number(run.exitCode) : "unknown";
+      return `${run.command} exited ${exitCode}`;
+    });
+}
+
+export function extractRequiredValidationStepsFromVisionMarkdown(markdown: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const criterion of extractVisionKeyItems(markdown).testingCriteria) {
+    const command = extractRunnableValidationCommand(String(criterion ?? ""));
+    if (!command) continue;
+    const key = command.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(command);
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
+function loadRequiredValidationStepsFromVision(repo: string): string[] {
+  const visionPath = resolve(repo, "vision.md");
+  if (!existsSync(visionPath)) return [];
+  try {
+    return extractRequiredValidationStepsFromVisionMarkdown(readFileSync(visionPath, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+function resolveRequiredValidationSteps(
+  repo: string,
+  planning: TaskExecutePlanning,
+): string[] {
+  return dedupeValidationCommands(
+    runnableValidationCommandsFromSteps(planning.requiredValidationSteps),
+    loadRequiredValidationStepsFromVision(repo),
+  ).slice(0, 12);
+}
+
+function runnableValidationCommandsFromSteps(steps: string[] | undefined): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const step of steps ?? []) {
+    const command = extractRunnableValidationCommand(String(step ?? ""));
+    if (!command) continue;
+    const key = command.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(command);
+  }
+  return out;
+}
+
+function dedupeValidationCommands(...groups: string[][]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    for (const command of group) {
+      const trimmed = command.trim();
+      if (!trimmed) continue;
+      const key = trimmed.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+export function collectQualityGateValidationCommands(params: {
+  instruction: string;
+  targetPath?: string;
+  planning: TaskExecutePlanning;
+  changedTestPaths: string[];
+  isTestTask: boolean;
+}): {
+  commandsToRun: string[];
+  requiredRunnableSteps: string[];
+  plannerRunnableSteps: string[];
+  fallbackValidationSteps: string[];
+} {
+  const requiredRunnableSteps = runnableValidationCommandsFromSteps(
+    params.planning.requiredValidationSteps,
+  ).slice(0, 12);
+  const plannerRunnableSteps = runnableValidationCommandsFromSteps(
+    params.planning.validationSteps,
+  ).slice(0, 4);
+  const fallbackValidationSteps =
+    params.isTestTask && plannerRunnableSteps.length === 0
+      ? inferFallbackValidationCommandsForTestTask(
+          params.instruction,
+          params.targetPath,
+          params.planning,
+          params.changedTestPaths,
+        )
+      : [];
+  const commandsToRun = dedupeValidationCommands(
+    requiredRunnableSteps,
+    plannerRunnableSteps.length > 0 ? plannerRunnableSteps : fallbackValidationSteps,
+  ).slice(0, 16);
+  return {
+    commandsToRun,
+    requiredRunnableSteps,
+    plannerRunnableSteps,
+    fallbackValidationSteps,
+  };
 }
 
 export function inferFallbackValidationCommandsForTestTask(
@@ -808,13 +961,6 @@ function isTestFocusedTask(
   ];
   if (pathHints.some((entry) => isLikelyTestPath(entry))) return true;
   if (
-    planning.validationSteps.some((entry) =>
-      /\b(test|tests|coverage|pytest|vitest|jest|bun test)\b/i.test(entry),
-    )
-  ) {
-    return true;
-  }
-  if (
     planning.acceptanceCriteria.some((entry) =>
       /\b(test|tests|coverage|unit|integration|negative|invalid|valid)\b/i.test(entry),
     )
@@ -857,8 +1003,13 @@ async function runDeterministicQualityGate(
   const instruction = String(params.instruction ?? "");
   const targetPath = String(params.targetPath ?? params.path ?? "").trim() || undefined;
   const planning = params.planning as TaskExecutePlanning;
+  const requiredValidationSteps = resolveRequiredValidationSteps(repo, planning);
+  if (requiredValidationSteps.length > 0) {
+    planning.requiredValidationSteps = requiredValidationSteps;
+  }
   const isTestTask = isTestFocusedTask(instruction, planning, targetPath);
-  if (!isTestTask) {
+  const hasRequiredValidationCriteria = requiredValidationSteps.length > 0;
+  if (!isTestTask && !hasRequiredValidationCriteria) {
     return {
       ok: true,
       skipped: true,
@@ -866,6 +1017,7 @@ async function runDeterministicQualityGate(
       changedPaths: [],
       changedTestPaths: [],
       validationRuns: [],
+      requiredValidationFailures: [],
       blocker: null,
     };
   }
@@ -891,20 +1043,18 @@ async function runDeterministicQualityGate(
     );
   }
 
-  const runnableSteps = planning.validationSteps
-    .map((step) => extractRunnableValidationCommand(step))
-    .filter((entry): entry is string => Boolean(entry))
-    .slice(0, 4);
-  const fallbackValidationSteps =
-    runnableSteps.length === 0
-      ? inferFallbackValidationCommandsForTestTask(
-          instruction,
-          targetPath,
-          planning,
-          changedTestPaths,
-        )
-      : [];
-  const commandsToRun = runnableSteps.length > 0 ? runnableSteps : fallbackValidationSteps;
+  const {
+    commandsToRun,
+    requiredRunnableSteps,
+    plannerRunnableSteps,
+    fallbackValidationSteps,
+  } = collectQualityGateValidationCommands({
+    instruction,
+    targetPath,
+    planning,
+    changedTestPaths,
+    isTestTask,
+  });
   const validationRuns: ValidationExecutionResult[] = [];
   const outputPolicy = outputPolicyForRuntime(runtimeConfig);
   const qualityValidationStepTimeoutMs = (() => {
@@ -912,12 +1062,25 @@ async function runDeterministicQualityGate(
     if (!Number.isFinite(value)) return 180_000;
     return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
   })();
+  if (hasRequiredValidationCriteria && requiredRunnableSteps.length === 0) {
+    issues.push(
+      "vision.md testing criteria were provided, but none contained a runnable validation command.",
+    );
+  }
   if (commandsToRun.length === 0) {
     issues.push(
-      "No runnable validation command was provided in planning.validationSteps (expected at least one test command).",
+      hasRequiredValidationCriteria
+        ? "No runnable validation command was available from vision.md testing criteria or planning.validationSteps."
+        : "No runnable validation command was provided in planning.validationSteps (expected at least one test command).",
     );
   } else {
-    if (runnableSteps.length === 0) {
+    if (requiredRunnableSteps.length > 0) {
+      onLog?.(
+        "stdout",
+        `[QualityGate] Running required vision.md testing criteria: ${requiredRunnableSteps.join(" | ")}`,
+      );
+    }
+    if (isTestTask && plannerRunnableSteps.length === 0 && fallbackValidationSteps.length > 0) {
       onLog?.(
         "stdout",
         `[QualityGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
@@ -953,10 +1116,20 @@ async function runDeterministicQualityGate(
       );
     }
     if (
+      isTestTask &&
       !validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))
     ) {
       issues.push("Validation steps did not execute a recognizable test command.");
     }
+  }
+  const requiredValidationFailures = collectRequiredValidationFailures(
+    requiredRunnableSteps,
+    validationRuns,
+  );
+  if (requiredValidationFailures.length > 0) {
+    issues.push(
+      `Required vision.md validation failed: ${requiredValidationFailures.join("; ")}`,
+    );
   }
   const blocker = detectValidationBlocker(validationRuns);
 
@@ -967,6 +1140,7 @@ async function runDeterministicQualityGate(
     changedPaths,
     changedTestPaths,
     validationRuns,
+    requiredValidationFailures,
     blocker,
   };
 }
@@ -1029,7 +1203,14 @@ async function runTaskCriticReview(
   const acceptanceCriteriaText =
     planning.acceptanceCriteria.map((entry) => `- ${entry}`).join("\n") || "- (none)";
   const validationStepsText =
-    planning.validationSteps.map((entry) => `- ${entry}`).join("\n") || "- (none)";
+    [
+      ...planning.validationSteps,
+      ...(planning.requiredValidationSteps ?? []).map(
+        (entry) => `${entry} (required by vision.md testing criteria)`,
+      ),
+    ]
+      .map((entry) => `- ${entry}`)
+      .join("\n") || "- (none)";
   const changedPathsText =
     quality.changedPaths.map((entry) => `- ${entry}`).join("\n") || "- (none)";
   const criticSystem = loadPromptTemplate("workerpals/task_quality_critic_system_prompt.md").trim();
@@ -1198,6 +1379,10 @@ export function buildQualityRevisionHint(
   if (planning.validationSteps.length > 0) {
     lines.push("Required validation steps:");
     for (const step of planning.validationSteps) lines.push(`- ${step}`);
+  }
+  if ((planning.requiredValidationSteps ?? []).length > 0) {
+    lines.push("Required vision.md testing criteria:");
+    for (const step of planning.requiredValidationSteps ?? []) lines.push(`- ${step}`);
   }
   lines.push("Apply a minimal corrective patch, run focused validation, then finish.");
   return lines.join("\n").slice(0, 6000);
@@ -1586,9 +1771,13 @@ export async function createJobCommit(
       ? parseChangedPathsFromNameOnlyOutput(cachedNameOnly.stdout)
       : [];
     const jobPlanning = job.params?.planning as Record<string, unknown> | undefined;
-    const jobValidationSteps = toNonEmptyStringArray(
-      jobPlanning?.validationSteps ?? job.params?.validationSteps,
-    );
+    const jobValidationSteps = [
+      ...toNonEmptyStringArray(job.params?.validationSteps),
+      ...toNonEmptyStringArray(job.params?.requiredValidationSteps),
+      ...toNonEmptyStringArray(jobPlanning?.validationSteps),
+      ...toNonEmptyStringArray(jobPlanning?.requiredValidationSteps),
+      ...loadRequiredValidationStepsFromVision(repo),
+    ];
     const llmCommitMsg = await generateCommitMessageFromDiff(
       diff,
       {
@@ -2022,11 +2211,17 @@ export function isTestLikeValidationStep(step: string): boolean {
 
     switch (tool) {
       case "bun":
+      case "bunx":
       case "npm":
+      case "npx":
       case "pnpm":
       case "yarn": {
         // "bun test", "npm test", "yarn test"
         if (hasToken("test")) return true;
+        if (["bunx", "npx"].includes(tool)) {
+          const runner = argv[1]?.toLowerCase() ?? "";
+          if (runner === "vitest" || runner === "jest" || runner === "playwright") return true;
+        }
         const sub = argv[1]?.toLowerCase() ?? "";
         // "bun run test:root", "npm run test:unit", "pnpm run test:integration"
         if (sub === "run" && argv[2]?.toLowerCase().startsWith("test")) return true;
@@ -2045,9 +2240,14 @@ export function isTestLikeValidationStep(step: string): boolean {
       case "jest":
         return true;
       case "python":
+      case "python3":
         return (
           argv.length >= 3 && argv[1].toLowerCase() === "-m" && argv[2].toLowerCase() === "pytest"
         );
+      case "go":
+      case "cargo":
+      case "make":
+        return hasToken("test");
       case "coverage":
         return hasToken("pytest");
       default:
@@ -2069,9 +2269,13 @@ function buildCommitTestsBlock(params?: Record<string, unknown>): string {
 
   const candidates = [
     ...toNonEmptyStringArray(params?.validationSteps),
+    ...toNonEmptyStringArray(params?.requiredValidationSteps),
     ...toNonEmptyStringArray(params?.validation_steps),
+    ...toNonEmptyStringArray(params?.required_validation_steps),
     ...toNonEmptyStringArray(planning?.validationSteps),
+    ...toNonEmptyStringArray(planning?.requiredValidationSteps),
     ...toNonEmptyStringArray(planning?.validation_steps),
+    ...toNonEmptyStringArray(planning?.required_validation_steps),
   ];
 
   const seen = new Set<string>();
@@ -2499,9 +2703,13 @@ async function createMergeConflictJobCommit(
       ? parseChangedPathsFromNameOnlyOutput(cachedNameOnly.stdout)
       : [];
     const jobPlanning = job.params?.planning as Record<string, unknown> | undefined;
-    const jobValidationSteps = toNonEmptyStringArray(
-      jobPlanning?.validationSteps ?? job.params?.validationSteps,
-    );
+    const jobValidationSteps = [
+      ...toNonEmptyStringArray(job.params?.validationSteps),
+      ...toNonEmptyStringArray(job.params?.requiredValidationSteps),
+      ...toNonEmptyStringArray(jobPlanning?.validationSteps),
+      ...toNonEmptyStringArray(jobPlanning?.requiredValidationSteps),
+      ...loadRequiredValidationStepsFromVision(repo),
+    ];
     const llmCommitMsg = await generateCommitMessageFromDiff(
       diff,
       {
@@ -3443,6 +3651,15 @@ function validateTaskExecutePlanning(
   if (!isStringArray(planning.validationSteps)) {
     return { ok: false, message: "task.execute planning.validationSteps must be a string array" };
   }
+  if (
+    planning.requiredValidationSteps !== undefined &&
+    !isStringArray(planning.requiredValidationSteps)
+  ) {
+    return {
+      ok: false,
+      message: "task.execute planning.requiredValidationSteps must be a string array",
+    };
+  }
   if ((planning.acceptanceCriteria as string[]).length === 0) {
     return {
       ok: false,
@@ -3949,6 +4166,17 @@ export async function executeJob(
         ].join("\n"),
         outputPolicyForRuntime(runtimeConfig),
       );
+      if (quality.requiredValidationFailures.length > 0) {
+        const requiredSummary = `Required vision.md validation blocked publishing: ${quality.requiredValidationFailures.join("; ")}`;
+        onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
+        return {
+          ok: false,
+          summary: requiredSummary,
+          stdout: result.stdout,
+          stderr: blockerDiagnostics,
+          exitCode: 4,
+        };
+      }
       if (shouldSoftPassValidationBlocker(qualityGatePolicy, quality.blocker)) {
         onLog?.(
           "stderr",
@@ -3976,6 +4204,27 @@ export async function executeJob(
       };
     }
     if (revisionAttempt >= qualityMaxAutoRevisions) {
+      if (quality.requiredValidationFailures.length > 0) {
+        const diagnostics = truncate(
+          [
+            result.stderr ?? "",
+            ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
+            critic ? `Critic raw: ${critic.raw}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
+        );
+        const requiredSummary = `Required vision.md validation failed after ${revisionAttempt} auto-revision attempt(s): ${quality.requiredValidationFailures.join("; ")}`;
+        onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
+        return {
+          ok: false,
+          summary: requiredSummary,
+          stdout: result.stdout,
+          stderr: diagnostics,
+          exitCode: 4,
+        };
+      }
       if (qualitySoftPassOnExhausted) {
         const diagnostics = truncate(
           [result.stderr ?? "", critic ? `Critic raw: ${critic.raw}` : ""]

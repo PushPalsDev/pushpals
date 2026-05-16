@@ -73,6 +73,7 @@ describe("client runtime preflight", () => {
     expect(
       lines.some((line) => line.includes("Missing required autonomy vision file: vision.md")),
     ).toBe(true);
+    expect(lines.some((line) => line.includes("pushpals --create_vision_md"))).toBe(true);
     expect(lines.some((line) => line.includes("vision.example.md"))).toBe(true);
   });
 

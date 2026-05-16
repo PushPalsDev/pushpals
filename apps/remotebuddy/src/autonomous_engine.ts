@@ -334,7 +334,7 @@ type FeedbackPriorForScoring = {
   ema_user_accept?: unknown;
   ema_latency?: unknown;
   ema_regret?: unknown;
-} | null;
+} | null | undefined;
 
 type EngineIdeaPriorForScoring = {
   ema_success?: unknown;
@@ -342,7 +342,7 @@ type EngineIdeaPriorForScoring = {
   ema_latency?: unknown;
   ema_regret?: unknown;
   sample_count?: unknown;
-} | null;
+} | null | undefined;
 
 type EngineSourcePriorForScoring = {
   ema_success?: unknown;
@@ -354,7 +354,7 @@ type EngineSourcePriorForScoring = {
   curation_reason?: unknown;
   trust_score?: unknown;
   freshness_score?: unknown;
-} | null;
+} | null | undefined;
 
 type AdaptiveExploreRateSnapshot = {
   top_signals?: Array<{ type?: unknown; value?: unknown }>;
@@ -709,6 +709,7 @@ type VisionContext = {
     constraints: string[];
     non_goals: string[];
     metrics: string[];
+    testing_criteria: string[];
     risk_policy: string[];
     operating_model: string[];
     governance: string[];
@@ -724,6 +725,36 @@ export interface CompiledVisionObjective {
   id: string;
   title: string;
   weight: number;
+  evidence: string[];
+}
+
+export type AutonomyObjectiveCategory =
+  | "product_core"
+  | "user_experience"
+  | "onboarding"
+  | "reliability"
+  | "validation"
+  | "performance"
+  | "maintainability"
+  | "delivery_loop"
+  | "governance"
+  | "growth"
+  | "content"
+  | "unknown";
+
+export interface CompiledRepoObjective {
+  id: string;
+  title: string;
+  category: AutonomyObjectiveCategory;
+  secondary_categories: AutonomyObjectiveCategory[];
+  priority_rank: number | null;
+  source_bucket: keyof VisionKeyItems | "section";
+  section_ref: string;
+  weight: number;
+  keywords: string[];
+  success_criteria: string[];
+  constraints: string[];
+  validation_expectations: string[];
   evidence: string[];
 }
 
@@ -828,6 +859,7 @@ export interface EngineInspirationSourcePattern {
 }
 
 export interface EngineInspirationContext {
+  compiled_repo_objectives: CompiledRepoObjective[];
   compiled_objectives: CompiledVisionObjective[];
   opportunity_gaps: EngineOpportunityGap[];
   building_blocks: EngineIdeaBuildingBlock[];
@@ -886,6 +918,180 @@ function uniqueLowercaseTokens(values: string[], max = 24): string[] {
     if (out.length >= max) break;
   }
   return out;
+}
+
+const CATEGORY_KEYWORD_RULES: Array<{
+  category: AutonomyObjectiveCategory;
+  pattern: RegExp;
+}> = [
+  {
+    category: "product_core",
+    pattern:
+      /\b(core|primary|match|game|gameplay|battle|battlefield|player|decision|territor|combat|strategy|mission|workflow|editor|dashboard|api)\b/i,
+  },
+  {
+    category: "user_experience",
+    pattern:
+      /\b(user experience|ux|ui|readab|legib|clarity|clear|shell|screen|navigation|control|input|touch|mobile|visual|presentation|feedback|discoverable|usable)\b/i,
+  },
+  {
+    category: "onboarding",
+    pattern: /\b(onboard|new user|first[- ]?time|tutorial|learn|help|guide|activation|setup)\b/i,
+  },
+  {
+    category: "reliability",
+    pattern:
+      /\b(reliab|stable|stability|startup|trust|regression|failure|resilien|recover|fallback|safe|crash|broken|blocker)\b/i,
+  },
+  {
+    category: "validation",
+    pattern:
+      /\b(validation|validate|test|smoke|coverage|browser|e2e|end[- ]?to[- ]?end|ci|check|quality)\b/i,
+  },
+  {
+    category: "performance",
+    pattern:
+      /\b(performance|latency|smooth|jitter|lag|throughput|fps|render|memory|speed|fast|responsive)\b/i,
+  },
+  {
+    category: "maintainability",
+    pattern:
+      /\b(maintain|refactor|cleanup|architecture|structure|modular|debt|simplify|consistency|coherent)\b/i,
+  },
+  {
+    category: "delivery_loop",
+    pattern:
+      /\b(autonom|agent|worker|delivery loop|reliable autonomous delivery|merge|review|pr|pull request|dispatch|orchestrat|planner|compiler|ideation)\b/i,
+  },
+  {
+    category: "governance",
+    pattern:
+      /\b(policy|permission|scope|guardrail|risk|constraint|governance|approval|audit|security|non[- ]?goal)\b/i,
+  },
+  {
+    category: "growth",
+    pattern:
+      /\b(growth|retention|conversion|activation|adoption|audience|returning|replay|engagement)\b/i,
+  },
+  {
+    category: "content",
+    pattern:
+      /\b(content|variety|skin|cosmetic|faction|map|ship|projectile|enemy|level|mode|character)\b/i,
+  },
+];
+
+const META_OBJECTIVE_CATEGORIES = new Set<AutonomyObjectiveCategory>([
+  "delivery_loop",
+  "governance",
+  "maintainability",
+]);
+
+function slugifyObjectiveId(value: string, fallback: string): string {
+  const slug = asString(value)
+    .toLowerCase()
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+  return slug || fallback;
+}
+
+function categorizeVisionText(text: string): {
+  primary: AutonomyObjectiveCategory;
+  secondary: AutonomyObjectiveCategory[];
+} {
+  const matched: AutonomyObjectiveCategory[] = [];
+  for (const rule of CATEGORY_KEYWORD_RULES) {
+    if (rule.pattern.test(text)) matched.push(rule.category);
+  }
+  if (matched.length === 0) {
+    return { primary: "unknown", secondary: [] };
+  }
+  const [primary, ...secondary] = matched;
+  return {
+    primary,
+    secondary: [...new Set(secondary)].slice(0, 4),
+  };
+}
+
+function sourceBucketSectionRef(
+  sourceBucket: keyof VisionKeyItems | "section",
+  sectionNumbers: string[],
+): string {
+  const preferredByBucket: Partial<Record<keyof VisionKeyItems | "section", string[]>> = {
+    priorities: ["6", "5", "4"],
+    objectives: ["7", "6", "5"],
+    metrics: ["4", "6"],
+    testing_criteria: ["12", "9", "4"],
+    guardrails: ["9", "10", "3"],
+    constraints: ["9", "5"],
+    risk_policy: ["9", "10"],
+    operating_model: ["11", "7"],
+    governance: ["10", "9"],
+    target_users: ["1"],
+    non_goals: ["5", "9"],
+    section: ["6", "7", "4", "3"],
+  };
+  const available = new Set(sectionNumbers);
+  for (const ref of preferredByBucket[sourceBucket] ?? []) {
+    if (available.has(ref)) return ref;
+  }
+  return sectionNumbers[0] ?? "";
+}
+
+function categoryObjectiveType(category: AutonomyObjectiveCategory): AutonomyObjectiveType {
+  switch (category) {
+    case "product_core":
+    case "user_experience":
+    case "onboarding":
+    case "content":
+    case "growth":
+      return "feature_small";
+    case "performance":
+    case "reliability":
+    case "maintainability":
+    case "delivery_loop":
+    case "governance":
+      return "small_refactor";
+    case "validation":
+      return "flaky_test";
+    default:
+      return "small_refactor";
+  }
+}
+
+function categoryTriggerType(
+  category: AutonomyObjectiveCategory,
+  topSignals: EngineIdeaInputSnapshot["top_signals"],
+): EngineCandidateShape["trigger_type"] {
+  const allowed: EngineCandidateShape["trigger_type"][] = [
+    "test_failure",
+    "lint_failure",
+    "typecheck_failure",
+    "queue_health",
+    "regret_signal",
+  ];
+  const strongestSignal = topSignals
+    .map((signal) => ({
+      type: asString(signal.type) as EngineCandidateShape["trigger_type"],
+      value: clamp01(asNumber(signal.value, 0)),
+    }))
+    .filter((signal) => allowed.includes(signal.type))
+    .sort((a, b) => b.value - a.value)[0];
+  if (category === "validation") {
+    return strongestSignal?.type === "test_failure" ? "test_failure" : "queue_health";
+  }
+  if (category === "performance" || category === "reliability") {
+    return strongestSignal?.type ?? "queue_health";
+  }
+  if (category === "delivery_loop" || category === "governance" || category === "maintainability") {
+    return strongestSignal?.type === "regret_signal" ? "regret_signal" : "queue_health";
+  }
+  return "queue_health";
+}
+
+function isMetaRepoObjective(objective: CompiledRepoObjective): boolean {
+  return META_OBJECTIVE_CATEGORIES.has(objective.category);
 }
 
 const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>([
@@ -1134,6 +1340,72 @@ function chooseRepoTargetProfile(
     if (!best || score > best.score) best = { profile, score };
   }
   return best?.profile ?? profiles[0] ?? null;
+}
+
+function chooseRepoObjectiveTargetProfile(
+  profiles: RepoTargetProfile[],
+  objective: CompiledRepoObjective,
+): RepoTargetProfile | null {
+  if (profiles.length === 0) return null;
+  const hintTokens = [...new Set([...objective.keywords, ...tokenizePath(objective.title)])];
+  const categories = new Set<AutonomyObjectiveCategory>([
+    objective.category,
+    ...objective.secondary_categories,
+  ]);
+  let best: { profile: RepoTargetProfile; score: number } | null = null;
+  for (const profile of profiles) {
+    const label = profile.label.toLowerCase();
+    const profileTokens = new Set(profile.keywords);
+    let score = 0;
+    for (const token of hintTokens) {
+      if (profileTokens.has(token)) score += 3;
+      if (label.includes(token)) score += 1;
+    }
+
+    const productSurface =
+      /(^|\/)(app|src|components|component|screens|pages|routes|styles|assets)\b/i.test(label) ||
+      /\b(client|frontend|web|ui|ux|game|screen|view|layout)\b/i.test(label);
+    const validationSurface =
+      /(^|\/)(__tests__|tests?|e2e|smoke|specs?)\b/i.test(label) ||
+      /\b(test|smoke|spec)\b/i.test(label);
+    const docsSurface = /\b(readme|vision|docs?)\b/i.test(label);
+    const scriptSurface = /(^|\/)(scripts?|tools?)\b/i.test(label);
+    const packageSurface = /\b(package\.json|tsconfig|eslint|prettier|config)\b/i.test(label);
+
+    if (
+      categories.has("product_core") ||
+      categories.has("user_experience") ||
+      categories.has("onboarding") ||
+      categories.has("content") ||
+      categories.has("growth")
+    ) {
+      if (productSurface) score += 5;
+      if (/\b(game|play|screen|route|layout|index|style|component)\b/i.test(label)) score += 3;
+      if (validationSurface) score -= 7;
+      if (docsSurface || packageSurface || scriptSurface) score -= 4;
+    }
+    if (categories.has("validation")) {
+      if (validationSurface || scriptSurface) score += 5;
+      if (productSurface) score += 1;
+    }
+    if (categories.has("performance")) {
+      if (productSurface || /\b(perf|render|animation|worker|server)\b/i.test(label)) score += 4;
+      if (docsSurface) score -= 3;
+    }
+    if (categories.has("reliability")) {
+      if (productSurface || scriptSurface || packageSurface || /\b(config|startup|server)\b/i.test(label)) {
+        score += 3;
+      }
+    }
+    if (categories.has("delivery_loop") || categories.has("governance") || categories.has("maintainability")) {
+      if (scriptSurface || packageSurface || /\b(src|utils?|lib|server|shared|policy)\b/i.test(label)) {
+        score += 3;
+      }
+    }
+
+    if (!best || score > best.score) best = { profile, score };
+  }
+  return best?.profile ?? chooseRepoTargetProfile(profiles, [objective.title], "queue_health");
 }
 
 function adaptCandidateShapeToRepo(params: {
@@ -1714,12 +1986,160 @@ function maxTraitScore(snapshot: EngineIdeaInputSnapshot, pattern: RegExp): numb
   );
 }
 
+function repoObjectiveWeight(params: {
+  sourceBucket: keyof VisionKeyItems | "section";
+  priorityRank: number | null;
+  category: AutonomyObjectiveCategory;
+  text: string;
+}): number {
+  const rank = params.priorityRank ?? 12;
+  const sourceBase =
+    params.sourceBucket === "priorities"
+      ? 0.86
+      : params.sourceBucket === "objectives"
+        ? 0.78
+        : params.sourceBucket === "metrics"
+          ? 0.58
+          : params.sourceBucket === "section"
+            ? 0.5
+            : 0.42;
+  const rankPenalty = Math.min(0.28, Math.max(0, rank - 1) * 0.045);
+  const metaPenalty = META_OBJECTIVE_CATEGORIES.has(params.category) ? 0.08 : 0;
+  const explicitValidationBoost =
+    params.category === "validation" || /\b(smoke|browser|validation|test)\b/i.test(params.text)
+      ? 0.04
+      : 0;
+  return clamp01(sourceBase - rankPenalty - metaPenalty + explicitValidationBoost);
+}
+
+function compileRepoVisionObjectives(params: {
+  vision: Pick<VisionContext, "key_items" | "section_numbers"> & {
+    sections?: VisionContext["sections"];
+  };
+}): CompiledRepoObjective[] {
+  const sectionNumbers = params.vision.section_numbers ?? [];
+  const keyItems = params.vision.key_items;
+  const constraints = bucketLines(keyItems, [
+    "guardrails",
+    "constraints",
+    "risk_policy",
+    "non_goals",
+  ]).slice(0, 12);
+  const validationExpectations = [
+    ...bucketLines(keyItems, ["testing_criteria"]),
+    ...bucketLines(keyItems, ["metrics", "constraints", "risk_policy"]).filter((line) =>
+      /\b(validation|validate|test|smoke|browser|ci|check)\b/i.test(line),
+    ),
+  ].slice(0, 8);
+  const successCriteria = bucketLines(keyItems, ["metrics", "objectives", "priorities"]).slice(
+    0,
+    8,
+  );
+  const entries: CompiledRepoObjective[] = [];
+  const seen = new Set<string>();
+
+  const addEntry = (
+    rawTitle: string,
+    sourceBucket: keyof VisionKeyItems | "section",
+    priorityRank: number | null,
+    explicitSectionRef?: string,
+  ): void => {
+    const title = asString(rawTitle);
+    if (!title) return;
+    const key = title.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    const titleCategory = categorizeVisionText(title);
+    const contextCategory = categorizeVisionText(
+      [constraints.join(" "), validationExpectations.join(" ")].join("\n"),
+    );
+    const secondaryCategories = [
+      ...titleCategory.secondary,
+      contextCategory.primary,
+      ...contextCategory.secondary,
+    ].filter(
+      (category): category is AutonomyObjectiveCategory =>
+        category !== "unknown" && category !== titleCategory.primary,
+    );
+    const primaryCategory =
+      titleCategory.primary === "unknown" &&
+      (sourceBucket === "priorities" || sourceBucket === "objectives")
+        ? "product_core"
+        : titleCategory.primary;
+    const categorized = {
+      primary: primaryCategory,
+      secondary: [
+        ...new Set(secondaryCategories.filter((category) => category !== primaryCategory)),
+      ].slice(0, 4),
+    };
+    const id = slugifyObjectiveId(title, `vision_objective_${entries.length + 1}`);
+    const sectionRef =
+      explicitSectionRef || sourceBucketSectionRef(sourceBucket, sectionNumbers) || "";
+    const keywords = uniqueLowercaseTokens([
+      ...tokenizePath(title),
+      categorized.primary,
+      ...categorized.secondary,
+    ]);
+    const weight = repoObjectiveWeight({
+      sourceBucket,
+      priorityRank,
+      category: categorized.primary,
+      text: title,
+    });
+    entries.push({
+      id,
+      title,
+      category: categorized.primary,
+      secondary_categories: categorized.secondary,
+      priority_rank: priorityRank,
+      source_bucket: sourceBucket,
+      section_ref: sectionRef,
+      weight,
+      keywords,
+      success_criteria: successCriteria,
+      constraints,
+      validation_expectations: validationExpectations,
+      evidence: [
+        `source_bucket=${sourceBucket}`,
+        priorityRank != null ? `priority_rank=${priorityRank}` : "priority_rank=none",
+        `category=${categorized.primary}`,
+        `section_ref=${sectionRef || "none"}`,
+      ],
+    });
+  };
+
+  keyItems.priorities.forEach((title, index) => addEntry(title, "priorities", index + 1));
+  keyItems.objectives.forEach((title, index) => addEntry(title, "objectives", index + 1));
+  keyItems.metrics
+    .filter((title) => /\b(validation|smoke|browser|performance|reliab|startup)\b/i.test(title))
+    .forEach((title, index) => addEntry(title, "metrics", index + 1));
+
+  for (const section of params.vision.sections ?? []) {
+    const sectionTitle = asString(section.title);
+    if (!sectionTitle) continue;
+    if (/^(who this is for|the problem|scope|long-term|how decisions|get made)$/i.test(sectionTitle)) {
+      continue;
+    }
+    const sectionNumber = asString(section.number);
+    const priorityRank = Number.isFinite(Number(sectionNumber)) ? Number(sectionNumber) : null;
+    addEntry(sectionTitle, "section", priorityRank, sectionNumber);
+  }
+
+  return entries.sort((a, b) => {
+    if (b.weight !== a.weight) return b.weight - a.weight;
+    const aRank = a.priority_rank ?? Number.MAX_SAFE_INTEGER;
+    const bRank = b.priority_rank ?? Number.MAX_SAFE_INTEGER;
+    if (aRank !== bRank) return aRank - bRank;
+    return a.id.localeCompare(b.id);
+  });
+}
+
 function normalizeValidationIdeas(ideas: string[]): string[] {
   const out: string[] = [];
   for (const idea of ideas) {
-    const canonical = canonicalizeValidationCommandForBun(idea);
-    if (canonical.startsWith("bun ")) {
-      out.push(canonical);
+    const command = extractValidationCommandFromIdea(idea);
+    if (isRepoNativeValidationCommand(command)) {
+      out.push(command);
       continue;
     }
     const lower = idea.toLowerCase();
@@ -1729,6 +2149,19 @@ function normalizeValidationIdeas(ideas: string[]): string[] {
   }
   if (out.length === 0) out.push("bun run test:root");
   return [...new Set(out)].slice(0, 5);
+}
+
+function extractValidationCommandFromIdea(value: string): string {
+  const raw = asString(value);
+  if (!raw) return "";
+  const fenced = raw.match(/`([^`]+)`/)?.[1]?.trim();
+  return (fenced || raw.replace(/^(run|execute|verify|validate|check)\s+/i, "")).trim();
+}
+
+function isRepoNativeValidationCommand(value: string): boolean {
+  return /^(bun|bunx|npm|npx|pnpm|yarn|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i.test(
+    value,
+  );
 }
 
 function inferComponentAreaFromText(
@@ -2601,7 +3034,9 @@ export function adjacent_possible(params: {
 }
 
 export function buildEngineInspirationContext(params: {
-  vision: Pick<VisionContext, "one_sentence" | "key_items" | "section_numbers">;
+  vision: Pick<VisionContext, "one_sentence" | "key_items" | "section_numbers"> & {
+    sections?: VisionContext["sections"];
+  };
   snapshot: EngineIdeaInputSnapshot;
   inspirationPatterns?: unknown[];
   sourceInsights?: unknown[];
@@ -2611,6 +3046,7 @@ export function buildEngineInspirationContext(params: {
 }): EngineInspirationContext {
   const oneSentence = asString(params.vision.one_sentence);
   const keyItems = params.vision.key_items;
+  const compiledRepoObjectives = compileRepoVisionObjectives({ vision: params.vision });
   const compiledObjectives = ENGINE_OBJECTIVE_BLUEPRINTS.map((blueprint) => {
     const lines = bucketLines(keyItems, blueprint.buckets);
     const evidence = keywordEvidence(lines, blueprint.keywordPattern);
@@ -2820,6 +3256,7 @@ export function buildEngineInspirationContext(params: {
   const buildingBlocks = [...buildingBlockMap.values()].sort((a, b) => b.score - a.score);
 
   return {
+    compiled_repo_objectives: compiledRepoObjectives,
     compiled_objectives: compiledObjectives,
     opportunity_gaps: opportunityGaps,
     building_blocks: buildingBlocks,
@@ -2944,6 +3381,88 @@ function inferEngineTrialFromCandidate(
     summary: fallback.summary,
     hypothesis: fallback.hypothesis,
   };
+}
+
+export function buildRepoVisionFallbackCandidates(params: {
+  engineInspiration: EngineInspirationContext;
+  snapshotTopSignals: EngineIdeaInputSnapshot["top_signals"];
+  visionSectionRefs: string[];
+  maxCandidates?: number;
+  repoTargets?: RepoTargetProfile[];
+}): Array<Record<string, unknown>> {
+  const maxCandidates = Number.isFinite(params.maxCandidates)
+    ? Math.max(1, Math.min(6, Math.floor(params.maxCandidates as number)))
+    : 3;
+  const sectionRefs = selectVisionSectionRefs(params.visionSectionRefs);
+  const objectives = params.engineInspiration.compiled_repo_objectives
+    .filter((objective) => objective.weight >= 0.42)
+    .sort((a, b) => {
+      if (b.weight !== a.weight) return b.weight - a.weight;
+      const aRank = a.priority_rank ?? Number.MAX_SAFE_INTEGER;
+      const bRank = b.priority_rank ?? Number.MAX_SAFE_INTEGER;
+      if (aRank !== bRank) return aRank - bRank;
+      const aMeta = isMetaRepoObjective(a) ? 1 : 0;
+      const bMeta = isMetaRepoObjective(b) ? 1 : 0;
+      if (aMeta !== bMeta) return aMeta - bMeta;
+      return a.id.localeCompare(b.id);
+    })
+    .slice(0, maxCandidates);
+
+  return objectives.map((objective, idx) => {
+    const target = chooseRepoObjectiveTargetProfile(params.repoTargets ?? [], objective);
+    const targetPaths = target?.target_paths ?? [objective.section_ref ? `vision.md` : "README.md"];
+    const writeGlobs = target?.write_globs ?? targetPaths;
+    const componentArea =
+      target?.component_area ??
+      (normalizeAutonomyComponentArea(pathDirname(targetPaths[0]) || targetPaths[0]) ??
+        "docs");
+    const triggerType = categoryTriggerType(objective.category, params.snapshotTopSignals);
+    const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, triggerType);
+    const sectionRef = objective.section_ref || sectionRefs[0] || "";
+    const categorySummary = [
+      objective.category,
+      ...objective.secondary_categories.slice(0, 2),
+    ].join(", ");
+    return {
+      id: `cand_repo_${objective.id}_${randomUUID().slice(0, 8)}`,
+      title: `Vision objective: ${objective.title}`,
+      objective_type: categoryObjectiveType(objective.category),
+      problem_statement:
+        `Advance the repo vision objective "${objective.title}" (${categorySummary}). ` +
+        "Deliver one small, observable improvement using the repo's own product/domain language.",
+      trigger_type: triggerType,
+      component_area: componentArea,
+      target_paths: targetPaths,
+      scope: {
+        read_anywhere: false,
+        write_globs: writeGlobs,
+      },
+      risk_level: "low",
+      expected_validation: normalizeValidationIdeas(
+        objective.validation_expectations.length > 0
+          ? objective.validation_expectations
+          : ["bun run test:root"],
+      ),
+      estimated_effort: idx === 0 ? "small" : "medium",
+      why_now_signal_ids: signalIds,
+      confidence: clamp01(0.5 + objective.weight * 0.45),
+      vision_alignment_reason:
+        `Highest repo vision category ${objective.category}; source=${objective.source_bucket}; ` +
+        `priority=${objective.priority_rank ?? "n/a"}; section=${sectionRef || "n/a"}.`,
+      vision_section_refs: sectionRef ? [sectionRef] : sectionRefs,
+      feature_hypotheses: [
+        objective.success_criteria[0]
+          ? `Success signal: ${objective.success_criteria[0]}`
+          : `Improve ${objective.title} without widening scope.`,
+        objective.constraints[0] ? `Guardrail: ${objective.constraints[0]}` : "",
+        objective.validation_expectations[0]
+          ? `Validation expectation: ${objective.validation_expectations[0]}`
+          : "Validate through the smallest repo-supported check.",
+      ].filter(Boolean),
+      requires_user_input: false,
+      question_if_blocked: "",
+    } as Record<string, unknown>;
+  });
 }
 
 export function buildEngineFallbackCandidates(params: {
@@ -3380,6 +3899,7 @@ export class RemoteBuddyAutonomousEngine {
         constraints: keyItems.constraints,
         non_goals: keyItems.nonGoals,
         metrics: keyItems.metrics,
+        testing_criteria: keyItems.testingCriteria,
         risk_policy: keyItems.riskPolicy,
         operating_model: keyItems.operatingModel,
         governance: keyItems.governance,
@@ -4333,20 +4853,35 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       let rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
+      let rawCandidatesSource: "llm" | "repo_vision_fallback" | "engine_fallback" = "llm";
       if (rawCandidates.length === 0) {
-        const synthesized = buildEngineFallbackCandidates({
+        const repoSynthesized = buildRepoVisionFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: snapshot.top_signals,
           visionSectionRefs: visionContext.section_numbers,
           maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
-          repoRoot: this.autonomyRepo,
           repoTargets,
         });
+        const synthesized =
+          repoSynthesized.length > 0
+            ? repoSynthesized
+            : buildEngineFallbackCandidates({
+                engineInspiration,
+                snapshotTopSignals: snapshot.top_signals,
+                visionSectionRefs: visionContext.section_numbers,
+                maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+                repoRoot: this.autonomyRepo,
+                repoTargets,
+              });
         if (synthesized.length > 0) {
           console.log(
-            `[RemoteBuddyAutonomousEngine] tick ${runId}: ideation returned no candidates; using ${synthesized.length} deterministic engine-inspiration fallback candidates.`,
+            `[RemoteBuddyAutonomousEngine] tick ${runId}: ideation returned no candidates; using ${synthesized.length} deterministic ${
+              repoSynthesized.length > 0 ? "repo-vision" : "engine-inspiration"
+            } fallback candidates.`,
           );
           rawCandidates = synthesized;
+          rawCandidatesSource =
+            repoSynthesized.length > 0 ? "repo_vision_fallback" : "engine_fallback";
         }
       }
       const normalizedCandidates: AutonomyCandidate[] = [];
@@ -4354,7 +4889,10 @@ export class RemoteBuddyAutonomousEngine {
       const recordDropReason = (reason: string): void => {
         dropReasonCounts.set(reason, (dropReasonCounts.get(reason) ?? 0) + 1);
       };
-      const ingestRawCandidates = (rawList: unknown[], source: "llm" | "engine_fallback"): void => {
+      const ingestRawCandidates = (
+        rawList: unknown[],
+        source: "llm" | "repo_vision_fallback" | "engine_fallback",
+      ): void => {
         const candidateCreatedBaseMs = Date.now();
         for (const [candidateIndex, rawCandidate] of rawList
           .slice(0, this.cfg.ideationMaxCandidates)
@@ -4459,7 +4997,7 @@ export class RemoteBuddyAutonomousEngine {
             );
             continue;
           }
-          if (!candidate.engine_trial) {
+          if (!candidate.engine_trial && source !== "repo_vision_fallback") {
             const inferred = inferEngineTrialFromCandidate(candidate, engineInspiration);
             if (inferred) {
               candidate.engine_trial = {
@@ -4471,18 +5009,31 @@ export class RemoteBuddyAutonomousEngine {
           normalizedCandidates.push(candidate);
         }
       };
-      ingestRawCandidates(rawCandidates, "llm");
+      ingestRawCandidates(rawCandidates, rawCandidatesSource);
       if (normalizedCandidates.length === 0) {
-        const synthesizedFallback = buildEngineFallbackCandidates({
+        const repoSynthesizedFallback = buildRepoVisionFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: snapshot.top_signals,
           visionSectionRefs: visionContext.section_numbers,
           maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
-          repoRoot: this.autonomyRepo,
           repoTargets,
         });
+        const synthesizedFallback =
+          repoSynthesizedFallback.length > 0
+            ? repoSynthesizedFallback
+            : buildEngineFallbackCandidates({
+                engineInspiration,
+                snapshotTopSignals: snapshot.top_signals,
+                visionSectionRefs: visionContext.section_numbers,
+                maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+                repoRoot: this.autonomyRepo,
+                repoTargets,
+              });
         if (synthesizedFallback.length > 0) {
-          ingestRawCandidates(synthesizedFallback, "engine_fallback");
+          ingestRawCandidates(
+            synthesizedFallback,
+            repoSynthesizedFallback.length > 0 ? "repo_vision_fallback" : "engine_fallback",
+          );
         }
       }
       candidatesPayload = normalizedCandidates.map((candidate) => ({

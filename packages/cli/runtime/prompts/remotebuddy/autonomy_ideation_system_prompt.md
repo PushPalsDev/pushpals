@@ -37,17 +37,19 @@ Constraints:
 
 - You will receive `vision.markdown`; use it as inspiration and prioritize candidates that clearly advance that vision.
 - You will also receive `vision.sections`; if numbered sections are present, cite at least one section number in `vision_section_refs`.
-- You will also receive `vision.key_items`; prioritize alignment with `priorities` + `objectives`, respect `guardrails` + `constraints`, and avoid `non_goals`.
+- You will also receive `vision.key_items`; prioritize alignment with `priorities` + `objectives`, respect `guardrails` + `constraints`, avoid `non_goals`, and reflect `testing_criteria` in expected validation when present.
+- You will also receive `engine_inspiration.compiled_repo_objectives`: generic categories compiled from the repo's own headings and priority/order signals. Prefer these repo-native objectives first, preserving their wording in titles/problems instead of inventing product-specific categories.
 - You will also receive `snapshot.state_traits`; use these strengths/weaknesses/opportunities/risks to characterize repo health and choose high-leverage objectives.
 - You will also receive `engine_inspiration` with:
   - `compiled_objectives`: weighted priorities derived from `vision.md`
+  - `compiled_repo_objectives`: repo-native headings categorized into reusable orchestration categories
   - `opportunity_gaps`: quantified delivery/merge/activation/governance/workforce gaps
   - `building_blocks`: candidate algorithms for improving the autonomous workforce itself
   - `source_patterns`: normalized external repo/doc inspirations with source attribution
   - `commit_history_hints`: motifs extracted from local commit history
 - You may also receive `snapshot.engine_idea_priors` with learned outcomes for previously tried building blocks.
 - Prefer high-sample/high-success `snapshot.engine_idea_priors` entries when selecting among similar ideas, while still keeping some novelty.
-- Prefer candidates that implement or operationalize one or more `engine_inspiration.building_blocks` when their score is high.
+- Prefer candidates that advance high-weight `engine_inspiration.compiled_repo_objectives`. Use `engine_inspiration.building_blocks` as supporting meta-infrastructure ideas, not as the default lane, unless the repo vision explicitly prioritizes autonomy/delivery-loop work or active repo signals show a delivery-loop incident.
 - Treat `engine_inspiration.source_patterns` as conceptual inspiration only: do not copy external code verbatim.
 - When possible, include `engine_trial` metadata that points to the building block the candidate is implementing.
 - `vision_alignment_reason` must be concrete and explain how the candidate advances the cited sections.
@@ -58,4 +60,4 @@ Constraints:
 - do not invent evidence ids.
 - If all signals are low/noisy, it is valid to return zero candidates.
 - Treat a low `sig_queue_health` value as maintenance-window evidence for safe proactive work, not only incident response.
-- `expected_validation` commands must use Bun-style commands (`bun ...` / `bunx ...`), never `npm`, `npx`, `pnpm`, or `yarn`.
+- `expected_validation` commands should use repo-native commands from `vision.key_items.testing_criteria` or local package scripts. Do not rewrite explicit testing criteria to another package manager.

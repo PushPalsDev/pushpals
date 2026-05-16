@@ -78,6 +78,50 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.summary).toContain("planning.acceptanceCriteria");
   });
 
+  test("rejects malformed requiredValidationSteps in planning", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      requiredValidationSteps: "bun run test:root",
+    };
+
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        lane: "deterministic",
+        instruction: "run a bounded task",
+        planning,
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("planning.requiredValidationSteps");
+  });
+
+  test("accepts requiredValidationSteps in planning", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      requiredValidationSteps: ["bun run test:root"],
+      finalizationBudgetMs: 0,
+    };
+
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        lane: "deterministic",
+        instruction: "run a bounded task",
+        planning,
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
+    expect(result.summary).not.toContain("planning.requiredValidationSteps");
+  });
+
   test("rejects absolute/path-escape writeGlobs hints", async () => {
     const planning = {
       ...VALID_PLANNING,

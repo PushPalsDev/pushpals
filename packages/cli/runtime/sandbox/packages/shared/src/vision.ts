@@ -24,6 +24,7 @@ export type VisionKeyItems = {
   constraints: string[];
   nonGoals: string[];
   metrics: string[];
+  testingCriteria: string[];
   riskPolicy: string[];
   operatingModel: string[];
   governance: string[];
@@ -106,6 +107,15 @@ function classifyHeadingBucket(heading: string): keyof VisionKeyItems | null {
   if (text.includes("constraint")) return "constraints";
   if (text.includes("non-goal") || text.includes("out of scope") || text.includes("not ")) {
     return "nonGoals";
+  }
+  if (
+    text.includes("testing criteria") ||
+    text.includes("test criteria") ||
+    text.includes("required tests") ||
+    text.includes("required validation") ||
+    text.includes("validation criteria")
+  ) {
+    return "testingCriteria";
   }
   if (text.includes("measure") || text.includes("metric") || text.includes("good looks like")) {
     return "metrics";
@@ -199,6 +209,7 @@ export function extractVisionKeyItems(markdown: string): VisionKeyItems {
     constraints: [],
     nonGoals: [],
     metrics: [],
+    testingCriteria: [],
     riskPolicy: [],
     operatingModel: [],
     governance: [],
@@ -226,6 +237,7 @@ export function extractVisionKeyItems(markdown: string): VisionKeyItems {
     constraints: dedupeAndClamp(buckets.constraints),
     nonGoals: dedupeAndClamp(buckets.nonGoals),
     metrics: dedupeAndClamp(buckets.metrics),
+    testingCriteria: dedupeAndClamp(buckets.testingCriteria),
     riskPolicy: dedupeAndClamp(buckets.riskPolicy),
     operatingModel: dedupeAndClamp(buckets.operatingModel),
     governance: dedupeAndClamp(buckets.governance),
