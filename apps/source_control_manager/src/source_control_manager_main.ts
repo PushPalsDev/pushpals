@@ -16,6 +16,7 @@ import {
   cloneSourceControlManagerConfigSnapshot,
   createStartupStatusTracker,
   createSingleFlightExecutor,
+  probeReviewAgentRuntimeReadiness,
 } from "./runtime_helpers";
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
@@ -231,6 +232,22 @@ const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(asyn
     logReviewAgentRuntimeState(
       "disabled",
       `[${ts()}] ReviewAgent disabled via runtime config (source_control_manager.review_agent.enabled=false).`,
+    );
+    return;
+  }
+
+  const runtimeReadiness = await probeReviewAgentRuntimeReadiness({
+    serverUrl: config.serverUrl,
+    sessionId: statusSessionId,
+    authToken: config.authToken,
+    timeoutMs: 2_500,
+  });
+  if (!runtimeReadiness.ready) {
+    clearReviewAgentPollLoop();
+    logReviewAgentRuntimeState(
+      `blocked:runtime_not_ready:${runtimeReadiness.detail}`,
+      `[${ts()}] ReviewAgent waiting for embedded runtime readiness before polling PRs (${runtimeReadiness.detail}).`,
+      "warn",
     );
     return;
   }
