@@ -48,7 +48,11 @@ import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
 } from "./command_policy.js";
-import { buildWorkerSpawnCommand, resolveWorkerStartupTimeoutMs } from "./worker_spawn.js";
+import {
+  buildWorkerSpawnCommand,
+  createWorkerPalId,
+  resolveWorkerStartupTimeoutMs,
+} from "./worker_spawn.js";
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -873,6 +877,7 @@ export class RemoteBuddyOrchestrator {
   private autonomyConfigPollTimer: ReturnType<typeof setInterval> | null = null;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
   private workerSpawnInFlight: Promise<string | null> | null = null;
+  private workerStartupPrewarmInFlight: Promise<void> | null = null;
   private workerSpawnCooldownUntil = 0;
   private readonly workerSpawnBackoffMs: number;
   private readonly workerAutoscalePollMs: number;
@@ -2254,7 +2259,7 @@ export class RemoteBuddyOrchestrator {
 
     const spawnPromise = (async () => {
       this.workerpalsUnavailableReason = null;
-      const workerId = `workerpal-${randomUUID().substring(0, 8)}`;
+      const workerId = createWorkerPalId();
       const cmd = this.buildWorkerSpawnCommand(workerId);
       console.log(
         `[RemoteBuddy] Spawning WorkerPal ${workerId} (${this.managedWorkers.size + 1}/${this.maxWorkers})`,
@@ -2366,6 +2371,18 @@ export class RemoteBuddyOrchestrator {
     }
 
     console.warn(`[RemoteBuddy] ${this.currentWorkerUnavailableReason()}`);
+  }
+
+  startWorkerCapacityPrewarmOnStartup(): void {
+    if (this.workerStartupPrewarmInFlight || this.disposed) return;
+    this.workerStartupPrewarmInFlight = this.ensureWorkerCapacityOnStartup()
+      .catch((err) => {
+        this.workerpalsUnavailableReason = `WorkerPal startup prewarm failed: ${String(err)}`;
+        console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+      })
+      .finally(() => {
+        this.workerStartupPrewarmInFlight = null;
+      });
   }
 
   private async selectTargetWorkerForJob(): Promise<string | null> {
@@ -3206,7 +3223,7 @@ async function main() {
   await orchestrator.emitStartupStatus();
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();
-  await orchestrator.ensureWorkerCapacityOnStartup();
+  orchestrator.startWorkerCapacityPrewarmOnStartup();
   orchestrator.startAutonomy();
   orchestrator.startAutonomyRuntimeConfigPolling();
 

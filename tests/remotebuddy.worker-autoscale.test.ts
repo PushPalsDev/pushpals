@@ -231,4 +231,28 @@ describe("RemoteBuddy worker autoscaling", () => {
       await orchestrator.dispose();
     }
   });
+
+  test("starts initial WorkerPal prewarm without blocking RemoteBuddy startup", async () => {
+    const orchestrator = createOrchestrator(makeTempDir());
+    let prewarmStarted = false;
+    let releasePrewarm!: () => void;
+    const prewarmGate = new Promise<void>((resolve) => {
+      releasePrewarm = resolve;
+    });
+    (orchestrator as any).ensureWorkerCapacityOnStartup = async () => {
+      prewarmStarted = true;
+      await prewarmGate;
+    };
+
+    try {
+      (orchestrator as any).startWorkerCapacityPrewarmOnStartup();
+      expect(prewarmStarted).toBe(true);
+      expect((orchestrator as any).workerStartupPrewarmInFlight).toBeInstanceOf(Promise);
+      releasePrewarm();
+      await (orchestrator as any).workerStartupPrewarmInFlight;
+      expect((orchestrator as any).workerStartupPrewarmInFlight).toBeNull();
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
 });

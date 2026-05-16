@@ -1,3 +1,5 @@
+import { randomUUID } from "crypto";
+
 export type WorkerSpawnCommandOptions = {
   server: string;
   workerId: string;
@@ -18,6 +20,20 @@ export type WorkerStartupTimeoutOptions = {
   docker: boolean;
   dockerAgentStartupTimeoutMs: number;
 };
+
+export function createWorkerPalId(
+  options: {
+    nowMs?: number;
+    processId?: number;
+    randomId?: string;
+  } = {},
+): string {
+  const randomPart = String(options.randomId ?? randomUUID()).replace(/[^a-z0-9]/gi, "");
+  const timePart = Math.max(0, Math.floor(options.nowMs ?? Date.now())).toString(36);
+  const pidPart = Math.max(0, Math.floor(options.processId ?? process.pid)).toString(36);
+  const suffix = `${timePart}${pidPart}${randomPart}`.toLowerCase().slice(0, 12);
+  return `workerpal-${suffix || "worker"}`;
+}
 
 export function resolveWorkerStartupTimeoutMs(options: WorkerStartupTimeoutOptions): number {
   const configuredMs = Math.max(1_000, Math.floor(options.configuredMs || 0));

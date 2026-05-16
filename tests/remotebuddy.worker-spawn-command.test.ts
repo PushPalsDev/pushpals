@@ -1,10 +1,33 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildWorkerSpawnCommand,
+  createWorkerPalId,
   resolveWorkerStartupTimeoutMs,
 } from "../apps/remotebuddy/src/worker_spawn";
 
 describe("remotebuddy worker spawn command", () => {
+  test("creates WorkerPal IDs with process and time entropy", () => {
+    expect(
+      createWorkerPalId({
+        randomId: "bac8c903-0000-0000-0000-000000000000",
+        nowMs: 1_779_000_000_000,
+        processId: 42,
+      }),
+    ).toBe("workerpal-mp9eo16o16ba");
+
+    const first = createWorkerPalId({
+      randomId: "same-random",
+      nowMs: 1_779_000_000_000,
+      processId: 42,
+    });
+    const second = createWorkerPalId({
+      randomId: "same-random",
+      nowMs: 1_779_000_001_000,
+      processId: 42,
+    });
+    expect(first).not.toBe(second);
+  });
+
   test("builds bun run command with valid argument ordering", () => {
     const command = buildWorkerSpawnCommand({
       server: "http://localhost:3001",
