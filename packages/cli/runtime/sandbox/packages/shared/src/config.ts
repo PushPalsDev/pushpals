@@ -869,12 +869,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   for (const [rawKey, rawValue] of Object.entries(remoteAutonomyDispatchByComponentRaw)) {
     const canonical = coerceAutonomyComponentConfigKey(rawKey);
     if (!canonical) continue;
-    const parsed =
-      typeof rawValue === "number"
-        ? rawValue
-        : typeof rawValue === "string"
-          ? Number.parseInt(rawValue.trim(), 10)
-          : Number.NaN;
+    const parsed = rawValue;
     remoteAutonomyDispatchByComponent[canonical] = Number.isFinite(parsed)
       ? Math.max(0, Math.floor(parsed))
       : 0;

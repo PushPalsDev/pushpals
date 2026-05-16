@@ -1088,7 +1088,7 @@ function loadPushPalsConfig(options = {}) {
     const canonical = coerceAutonomyComponentConfigKey(rawKey);
     if (!canonical)
       continue;
-    const parsed = typeof rawValue === "number" ? rawValue : typeof rawValue === "string" ? Number.parseInt(rawValue.trim(), 10) : Number.NaN;
+    const parsed = rawValue;
     remoteAutonomyDispatchByComponent[canonical] = Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
   }
   const workerNode = getObject(merged, "workerpals");
@@ -1725,6 +1725,18 @@ function extractVisionKeyItems(markdown) {
     governance: dedupeAndClamp(buckets.governance)
   };
 }
+// packages/shared/src/tooling.ts
+var KNOWN_TOOL_NAMES = new Set([
+  "bun",
+  "codex",
+  "docker",
+  "gh",
+  "git",
+  "node",
+  "npm",
+  "python",
+  "shell"
+]);
 // packages/shared/src/session_event_visibility.ts
 var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 // packages/shared/src/localbuddy_runtime.ts
@@ -1736,6 +1748,7 @@ var DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 var DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 var DEFAULT_MODEL = "local-model";
 var DEFAULT_CODEX_MODEL = "gpt-5.5";
+var LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.4";
 var DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 var DEFAULT_CODEX_TIMEOUT_MS = 120000;
 var DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
@@ -1860,6 +1873,55 @@ function codexReasoningEffort(configured, model) {
   }
   return defaultEffort;
 }
+function isDefaultCodexLauncher(command) {
+  const normalized = command.map((part) => part.trim().toLowerCase()).filter(Boolean);
+  return normalized.length === 0 || normalized.join("\x00") === ["bun", "x", "--yes", "@openai/codex"].join("\x00") || normalized.join("\x00") === ["bunx", "--yes", "@openai/codex"].join("\x00");
+}
+function parseCodexCliVersion(text) {
+  const match = text.match(/(?:codex(?:-cli)?|openai\s+codex)?\s*v?(\d+)\.(\d+)\.(\d+)(?:-([0-9a-z.-]+))?/i);
+  if (!match)
+    return null;
+  return {
+    major: Number.parseInt(match[1], 10),
+    minor: Number.parseInt(match[2], 10),
+    patch: Number.parseInt(match[3], 10),
+    prerelease: match[4] ?? ""
+  };
+}
+function compareCodexVersions(a, b) {
+  if (a && !b)
+    return 1;
+  if (!a && b)
+    return -1;
+  if (!a || !b)
+    return 0;
+  for (const key of ["major", "minor", "patch"]) {
+    if (a[key] !== b[key])
+      return a[key] > b[key] ? 1 : -1;
+  }
+  if (a.prerelease === b.prerelease)
+    return 0;
+  if (!a.prerelease)
+    return 1;
+  if (!b.prerelease)
+    return -1;
+  return a.prerelease.localeCompare(b.prerelease);
+}
+function chooseCodexCommandProbe(probes, opts) {
+  if (probes.length === 0)
+    return null;
+  if (!opts.preferNewestCompatible)
+    return probes[0];
+  return probes.reduce((best, probe) => compareCodexVersions(probe.version, best.version) > 0 ? probe : best);
+}
+function requiresNewerCodexForModel(stdout, stderr) {
+  const combined = `${stdout}
+${stderr}`.toLowerCase();
+  return combined.includes("requires a newer version of codex") || combined.includes("requires newer") && combined.includes("codex");
+}
+function isDefaultCodexModel(model) {
+  return model.trim().toLowerCase() === DEFAULT_CODEX_MODEL.toLowerCase();
+}
 function normalizeCodexModel(rawModel) {
   const model = rawModel.trim();
   if (!model)
@@ -1888,6 +1950,63 @@ function normalizeOpenAiBaseFromEndpoint(rawEndpoint) {
   return trimmed;
 }
 async function runProcess(command, opts) {
+  const bunRuntime = globalThis.Bun;
+  if (typeof bunRuntime?.spawn === "function") {
+    return runProcessWithBun(command, opts);
+  }
+  return runProcessWithNode(command, opts);
+}
+async function runProcessWithBun(command, opts) {
+  const bunRuntime = globalThis.Bun;
+  const timeoutMs = opts.timeoutMs ?? 0;
+  let timedOut = false;
+  let timeout = null;
+  let killTimeout = null;
+  const proc = bunRuntime.spawn(command, {
+    cwd: opts.cwd,
+    env: opts.env,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const stdoutPromise = new Response(proc.stdout).text();
+  const stderrPromise = new Response(proc.stderr).text();
+  if (timeoutMs > 0) {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGTERM");
+      } catch {}
+      killTimeout = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {}
+      }, 1000);
+      killTimeout.unref?.();
+    }, timeoutMs);
+  }
+  try {
+    if (typeof opts.stdin === "string") {
+      proc.stdin?.write(opts.stdin);
+    }
+    proc.stdin?.end();
+    const code = await proc.exited;
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    return {
+      code,
+      signal: null,
+      stdout,
+      stderr,
+      timedOut
+    };
+  } finally {
+    if (timeout)
+      clearTimeout(timeout);
+    if (killTimeout)
+      clearTimeout(killTimeout);
+  }
+}
+async function runProcessWithNode(command, opts) {
   const timeoutMs = opts.timeoutMs ?? 0;
   return new Promise((resolve4, reject) => {
     const child = spawn(command[0], command.slice(1), {
@@ -1946,6 +2065,10 @@ async function runProcess(command, opts) {
   });
 }
 var cachedCodexCommandPrefix = new Map;
+function bunCodexCommandFromEnv(env) {
+  const bunBin = (env.PUSHPALS_BUN_BIN ?? "").trim();
+  return bunBin ? [bunBin, "x", "--yes", "@openai/codex"] : [];
+}
 async function resolveCodexCommandPrefix(configuredCommand) {
   const override = codexCommandOverrideParts(configuredCommand);
   const cacheKey = override.join("\x00");
@@ -1953,6 +2076,7 @@ async function resolveCodexCommandPrefix(configuredCommand) {
   if (cached)
     return cached;
   const preferred = override.length > 0 ? override : ["bun", "x", "--yes", "@openai/codex"];
+  const preferNewestCompatible = isDefaultCodexLauncher(preferred);
   const candidates = [];
   const pushCandidate = (cmd) => {
     if (cmd.length === 0)
@@ -1963,6 +2087,7 @@ async function resolveCodexCommandPrefix(configuredCommand) {
     candidates.push(cmd);
   };
   pushCandidate(preferred);
+  pushCandidate(bunCodexCommandFromEnv(process.env));
   const execPath = (process.execPath ?? "").trim();
   if (execPath) {
     const lower = execPath.toLowerCase();
@@ -1976,6 +2101,7 @@ async function resolveCodexCommandPrefix(configuredCommand) {
   const cwd = process.cwd();
   const env = process.env;
   const attemptErrors = [];
+  const successfulProbes = [];
   for (const candidate of candidates) {
     if (candidate.length === 0)
       continue;
@@ -1987,14 +2113,27 @@ async function resolveCodexCommandPrefix(configuredCommand) {
         timeoutMs: 15000
       });
       if (probe.code === 0) {
-        cachedCodexCommandPrefix.set(cacheKey, candidate);
-        return candidate;
+        const versionText = (probe.stdout || probe.stderr || "").trim().split(/\r?\n/, 1)[0] ?? "";
+        successfulProbes.push({
+          command: candidate,
+          version: parseCodexCliVersion(versionText),
+          versionText
+        });
+        if (!preferNewestCompatible)
+          break;
+        continue;
       }
       const detail = (probe.stderr || probe.stdout || "").trim();
       attemptErrors.push(`${rendered} -> exit ${probe.code ?? "unknown"}${detail ? ` (${detail.split(/\r?\n/, 1)[0]})` : ""}`);
     } catch (err) {
       attemptErrors.push(`${rendered} -> ${String(err)}`);
     }
+  }
+  const selected = chooseCodexCommandProbe(successfulProbes, { preferNewestCompatible });
+  if (selected) {
+    cachedCodexCommandPrefix.set(cacheKey, selected.command);
+    console.log(`[LLM] Resolved Codex CLI command: ${selected.command.join(" ")}${selected.versionText ? ` (${selected.versionText})` : ""}.`);
+    return selected.command;
   }
   const details = attemptErrors.length > 0 ? ` Tried: ${attemptErrors.join("; ")}` : "";
   throw new Error("OpenAI Codex CLI is unavailable. Install/use Codex CLI (`bun x --yes @openai/codex` or `codex`) and retry." + details);
@@ -2742,7 +2881,7 @@ class OpenAiCodexCliClient {
         service: this.service,
         sessionId: this.sessionTag || undefined,
         backend: "openai_codex",
-        modelId: this.model,
+        modelId: usage.modelId ?? this.model,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         totalTokens: usage.promptTokens + usage.completionTokens,
@@ -2788,6 +2927,13 @@ class OpenAiCodexCliClient {
     }
   }
   async runCodexExec(prompt) {
+    return this.runCodexExecAttempt(prompt, {
+      model: this.model,
+      modelCompatibilityRecoveryAttempt: 0
+    });
+  }
+  async runCodexExecAttempt(prompt, opts) {
+    const model = normalizeCodexModel(opts.model);
     const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
     const env = { ...process.env };
     env.PYTHONIOENCODING = "utf-8";
@@ -2821,7 +2967,7 @@ class OpenAiCodexCliClient {
       const command = [
         ...commandPrefix,
         "-c",
-        `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort, this.model)}"`,
+        `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort, model)}"`,
         "-a",
         "never",
         "-s",
@@ -2832,8 +2978,8 @@ class OpenAiCodexCliClient {
         "--output-last-message",
         lastMessagePath
       ];
-      if (this.model) {
-        command.push("-m", this.model);
+      if (model) {
+        command.push("-m", model);
       }
       command.push("-");
       const result = await runProcess(command, {
@@ -2850,13 +2996,20 @@ class OpenAiCodexCliClient {
       const lastMessage = existsSync3(lastMessagePath) ? readFileSync4(lastMessagePath, "utf8").trim() : "";
       if (result.code !== 0) {
         const detail = stderr || stdout || "codex exec exited with non-zero status";
+        if (opts.modelCompatibilityRecoveryAttempt < 1 && isDefaultCodexModel(model) && LEGACY_CODEX_MODEL_FALLBACK.trim().toLowerCase() !== DEFAULT_CODEX_MODEL.toLowerCase() && requiresNewerCodexForModel(stdout, stderr)) {
+          console.warn(`[LLM] Codex CLI rejected default model ${DEFAULT_CODEX_MODEL}; retrying once with ${LEGACY_CODEX_MODEL_FALLBACK}. Upgrade Codex CLI to use ${DEFAULT_CODEX_MODEL}.`);
+          return this.runCodexExecAttempt(prompt, {
+            model: LEGACY_CODEX_MODEL_FALLBACK,
+            modelCompatibilityRecoveryAttempt: opts.modelCompatibilityRecoveryAttempt + 1
+          });
+        }
         throw new Error(`Codex CLI request failed (exit ${result.code ?? "unknown"}): ${detail}`);
       }
       const text = lastMessage || stdout;
       if (!text) {
         throw new Error("Codex CLI completed without producing a response.");
       }
-      return { text, stderr };
+      return { text, stderr, model };
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -2874,7 +3027,7 @@ class OpenAiCodexCliClient {
       promptTokens: estimateTokensFromText(prompt),
       completionTokens: estimateTokensFromText(result.text)
     });
-    await this.maybeReportUsage(usage);
+    await this.maybeReportUsage({ ...usage, modelId: result.model });
     return {
       text: result.text,
       usage: {
@@ -4354,6 +4507,12 @@ function asStringArray2(value) {
 function asNumber(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+function compactStatusDetail(value, max = 240) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= max)
+    return normalized;
+  return `${normalized.slice(0, Math.max(0, max - 3))}...`;
 }
 function uniqueLowercaseTokens(values, max = 24) {
   const out = [];
@@ -5914,6 +6073,9 @@ class RemoteBuddyAutonomousEngine {
     const maxPhaseTimeoutMs = Math.max(this.phaseTimeoutMs("ideation"), this.phaseTimeoutMs("scoring"), this.phaseTimeoutMs("planning"));
     return Math.max(this.cfg.tickIntervalMs * 3, this.cfg.ideationBudgetMs * 2 + maxPhaseTimeoutMs * 6, 30000);
   }
+  lockStaleAfterMs() {
+    return Math.max(this.phaseTimeoutMs("ideation") + 30000, this.cfg.heartbeatLogMs * 2, 120000);
+  }
   cycleBudgetMs() {
     const ideationTimeoutMs = this.phaseTimeoutMs("ideation");
     const scoringTimeoutMs = this.phaseTimeoutMs("scoring");
@@ -6224,10 +6386,15 @@ class RemoteBuddyAutonomousEngine {
       body: JSON.stringify({
         sessionId: this.sessionId,
         runId,
-        ttlMs
+        ttlMs,
+        staleAfterMs: this.lockStaleAfterMs()
       })
     });
-    return res.ok;
+    if (res.ok)
+      return { ok: true };
+    const payload = await res.json().catch(() => ({}));
+    const reason = asString2(payload.reason ?? payload.message);
+    return { ok: false, reason };
   }
   async renewDispatchLock(runId) {
     const res = await fetch(`${this.server}/autonomy/lock/renew`, {
@@ -6530,9 +6697,10 @@ ${JSON.stringify(input.messages ?? [])}`),
     let outcomeDetail = "not_dispatched";
     try {
       this.setPhase("acquire_lock");
-      lockAcquired = await this.acquireDispatchLock(runId);
+      const lockResult = await this.acquireDispatchLock(runId);
+      lockAcquired = lockResult.ok;
       if (!lockAcquired) {
-        outcomeDetail = "lock_not_acquired";
+        outcomeDetail = lockResult.reason ? compactStatusDetail(`lock_not_acquired:${lockResult.reason}`) : "lock_not_acquired";
         return;
       }
       this.setPhase("prepare_worktree");
@@ -7789,6 +7957,44 @@ function sanitizePlannerWorkerInstruction(workerInstruction, canonicalInstructio
   }
   return value;
 }
+function summarizeToolRun(toolRun) {
+  const command = toSingleLine(toolRun.commandLine, 160) || (Array.isArray(toolRun.argv) ? toSingleLine(toolRun.argv.join(" "), 160) : "");
+  const parts = [
+    `tool=${toSingleLine(toolRun.tool, 40) || "unknown"}`,
+    toolRun.phase ? `phase=${toSingleLine(toolRun.phase, 60)}` : "",
+    command ? `cmd=${command}` : "",
+    toolRun.failureClass ? `class=${toSingleLine(toolRun.failureClass, 60)}` : "",
+    typeof toolRun.retryable === "boolean" ? `retryable=${toolRun.retryable ? "yes" : "no"}` : "",
+    typeof toolRun.exitCode === "number" ? `exit=${toolRun.exitCode}` : "",
+    toolRun.remediation ? `fix=${toSingleLine(toolRun.remediation, 220)}` : ""
+  ].filter(Boolean);
+  return parts.join(" | ");
+}
+function explainJobFailureFromToolRuns(toolRuns) {
+  const failed = toolRuns.find((entry) => entry && entry.ok === false);
+  if (!failed)
+    return null;
+  const tool = toSingleLine(failed.tool, 40) || "unknown tool";
+  const failureClass = toSingleLine(failed.failureClass, 80) || "tool failure";
+  const remediation = toSingleLine(failed.remediation, 260);
+  const command = toSingleLine(failed.commandLine, 140) || (Array.isArray(failed.argv) ? toSingleLine(failed.argv.join(" "), 140) : "");
+  return [
+    `Latest tool failure: ${tool} reported ${failureClass}`,
+    command ? `while running ${command}` : "",
+    remediation ? `Recommended fix: ${remediation}` : ""
+  ].filter(Boolean).join(". ");
+}
+function formatToolRunDiagnostics(toolRuns) {
+  const failed = toolRuns.filter((entry) => entry && entry.ok === false).slice(0, 4);
+  if (failed.length === 0)
+    return "";
+  return `
+Tool diagnostics:
+\`\`\`
+${failed.map(summarizeToolRun).join(`
+`)}
+\`\`\``;
+}
 function explainJobFailureFromLogs(logs, fallbackMessage, fallbackDetail) {
   const lines = logs.map((row) => toSingleLine(row.message, 420)).filter(Boolean);
   const joined = lines.join(`
@@ -8125,6 +8331,22 @@ class RemoteBuddyOrchestrator {
       return [];
     }
   }
+  async fetchJobToolRuns(jobId, limit = 20) {
+    try {
+      const res = await fetch(`${this.server}/jobs/${jobId}/tool-runs?limit=${Math.max(1, Math.min(100, limit))}`, {
+        method: "GET",
+        headers: this.authHeaders()
+      });
+      if (!res.ok)
+        return [];
+      const data = await res.json();
+      if (!data.ok || !Array.isArray(data.toolRuns))
+        return [];
+      return data.toolRuns.filter((row) => row && typeof row.tool === "string").slice(0, 20);
+    } catch {
+      return [];
+    }
+  }
   markAutonomyFeedbackEventSeen(eventId) {
     const id = String(eventId ?? "").trim();
     if (!id)
@@ -8269,7 +8491,10 @@ class RemoteBuddyOrchestrator {
       return;
     }
     console.warn(`[RemoteBuddy] Fetching failure logs for job ${jobId}...`);
-    const logs = await this.fetchJobLogs(jobId, 80);
+    const [logs, toolRuns] = await Promise.all([
+      this.fetchJobLogs(jobId, 80),
+      this.fetchJobToolRuns(jobId, 20)
+    ]);
     const clarificationFromLogs = extractClarificationFromJobFailure(message, detail, logs);
     if (clarificationFromLogs) {
       const tail2 = logs.slice(-6).map((row) => toSingleLine(row.message, 220)).filter(Boolean);
@@ -8279,9 +8504,10 @@ Recent logs:
 ${tail2.join(`
 `)}
 \`\`\`` : "";
+      const toolText2 = formatToolRunDiagnostics(toolRuns);
       const clarificationMsg = `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationFromLogs}
 
-` + "Reply with the missing details and I will enqueue a focused follow-up request." + tailText2;
+` + "Reply with the missing details and I will enqueue a focused follow-up request." + toolText2 + tailText2;
       await this.assistantMessage(sessionId, clarificationMsg, {
         correlationId: envelope.correlationId,
         turnId: envelope.turnId,
@@ -8289,7 +8515,7 @@ ${tail2.join(`
       });
       return;
     }
-    const explanation = explainJobFailureFromLogs(logs, message, detail);
+    const explanation = explainJobFailureFromToolRuns(toolRuns) ?? explainJobFailureFromLogs(logs, message, detail);
     const tail = logs.slice(-6).map((row) => toSingleLine(row.message, 220)).filter(Boolean);
     const tailText = tail.length ? `
 Recent logs:
@@ -8297,7 +8523,8 @@ Recent logs:
 ${tail.join(`
 `)}
 \`\`\`` : "";
-    await this.assistantMessage(sessionId, `Diagnosis for job ${shortJob}: ${explanation}${tailText}`, {
+    const toolText = formatToolRunDiagnostics(toolRuns);
+    await this.assistantMessage(sessionId, `Diagnosis for job ${shortJob}: ${explanation}${toolText}${tailText}`, {
       correlationId: envelope.correlationId,
       turnId: envelope.turnId,
       parentId: envelope.id

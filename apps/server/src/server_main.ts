@@ -1632,6 +1632,16 @@ export function createRequestHandler() {
         });
       }
 
+      // POST /tool-runs
+      if (pathname === "/tool-runs" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = jobQueue.recordToolRun(body);
+        return makeJson(result, result.ok ? 201 : 400);
+      }
+
       // GET /jobs/:id/logs
       const jobLogsMatch = pathname.match(/^\/jobs\/([^/]+)\/logs$/);
       if (jobLogsMatch && method === "GET") {
@@ -1645,6 +1655,18 @@ export function createRequestHandler() {
         const logs = jobQueue.listJobLogs(jobId, limit, afterId ?? undefined);
         const nextCursor = logs.length > 0 ? (logs[logs.length - 1]?.id ?? null) : afterId;
         return makeJson({ ok: true, jobId, logs, cursor: nextCursor });
+      }
+
+      // GET /jobs/:id/tool-runs
+      const jobToolRunsMatch = pathname.match(/^\/jobs\/([^/]+)\/tool-runs$/);
+      if (jobToolRunsMatch && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobToolRunsMatch[1];
+        const limit = parseLimit(url.searchParams.get("limit"), 50);
+        const toolRuns = jobQueue.listJobToolRuns(jobId, limit);
+        return makeJson({ ok: true, jobId, toolRuns });
       }
 
       // GET /completions

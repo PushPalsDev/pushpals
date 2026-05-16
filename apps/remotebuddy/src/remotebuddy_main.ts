@@ -622,6 +622,61 @@ interface JobLogEntry {
   message: string;
 }
 
+interface JobToolRunEntry {
+  id: string;
+  tool: string;
+  phase?: string | null;
+  commandLine?: string | null;
+  argv?: string[] | null;
+  ok: boolean;
+  exitCode?: number | null;
+  failureClass?: string | null;
+  retryable?: boolean | null;
+  remediation?: string | null;
+  stdoutTail?: string | null;
+  stderrTail?: string | null;
+}
+
+function summarizeToolRun(toolRun: JobToolRunEntry): string {
+  const command =
+    toSingleLine(toolRun.commandLine, 160) ||
+    (Array.isArray(toolRun.argv) ? toSingleLine(toolRun.argv.join(" "), 160) : "");
+  const parts = [
+    `tool=${toSingleLine(toolRun.tool, 40) || "unknown"}`,
+    toolRun.phase ? `phase=${toSingleLine(toolRun.phase, 60)}` : "",
+    command ? `cmd=${command}` : "",
+    toolRun.failureClass ? `class=${toSingleLine(toolRun.failureClass, 60)}` : "",
+    typeof toolRun.retryable === "boolean" ? `retryable=${toolRun.retryable ? "yes" : "no"}` : "",
+    typeof toolRun.exitCode === "number" ? `exit=${toolRun.exitCode}` : "",
+    toolRun.remediation ? `fix=${toSingleLine(toolRun.remediation, 220)}` : "",
+  ].filter(Boolean);
+  return parts.join(" | ");
+}
+
+function explainJobFailureFromToolRuns(toolRuns: JobToolRunEntry[]): string | null {
+  const failed = toolRuns.find((entry) => entry && entry.ok === false);
+  if (!failed) return null;
+  const tool = toSingleLine(failed.tool, 40) || "unknown tool";
+  const failureClass = toSingleLine(failed.failureClass, 80) || "tool failure";
+  const remediation = toSingleLine(failed.remediation, 260);
+  const command =
+    toSingleLine(failed.commandLine, 140) ||
+    (Array.isArray(failed.argv) ? toSingleLine(failed.argv.join(" "), 140) : "");
+  return [
+    `Latest tool failure: ${tool} reported ${failureClass}`,
+    command ? `while running ${command}` : "",
+    remediation ? `Recommended fix: ${remediation}` : "",
+  ]
+    .filter(Boolean)
+    .join(". ");
+}
+
+function formatToolRunDiagnostics(toolRuns: JobToolRunEntry[]): string {
+  const failed = toolRuns.filter((entry) => entry && entry.ok === false).slice(0, 4);
+  if (failed.length === 0) return "";
+  return `\nTool diagnostics:\n\`\`\`\n${failed.map(summarizeToolRun).join("\n")}\n\`\`\``;
+}
+
 function explainJobFailureFromLogs(
   logs: JobLogEntry[],
   fallbackMessage: string,
@@ -1097,6 +1152,24 @@ export class RemoteBuddyOrchestrator {
     }
   }
 
+  private async fetchJobToolRuns(jobId: string, limit = 20): Promise<JobToolRunEntry[]> {
+    try {
+      const res = await fetch(
+        `${this.server}/jobs/${jobId}/tool-runs?limit=${Math.max(1, Math.min(100, limit))}`,
+        {
+          method: "GET",
+          headers: this.authHeaders(),
+        },
+      );
+      if (!res.ok) return [];
+      const data = (await res.json()) as { ok?: boolean; toolRuns?: JobToolRunEntry[] };
+      if (!data.ok || !Array.isArray(data.toolRuns)) return [];
+      return data.toolRuns.filter((row) => row && typeof row.tool === "string").slice(0, 20);
+    } catch {
+      return [];
+    }
+  }
+
   private markAutonomyFeedbackEventSeen(eventId: string): boolean {
     const id = String(eventId ?? "").trim();
     if (!id) return true;
@@ -1274,7 +1347,10 @@ export class RemoteBuddyOrchestrator {
     }
 
     console.warn(`[RemoteBuddy] Fetching failure logs for job ${jobId}...`);
-    const logs = await this.fetchJobLogs(jobId, 80);
+    const [logs, toolRuns] = await Promise.all([
+      this.fetchJobLogs(jobId, 80),
+      this.fetchJobToolRuns(jobId, 20),
+    ]);
     const clarificationFromLogs = extractClarificationFromJobFailure(message, detail, logs);
     if (clarificationFromLogs) {
       const tail = logs
@@ -1282,9 +1358,11 @@ export class RemoteBuddyOrchestrator {
         .map((row) => toSingleLine(row.message, 220))
         .filter(Boolean);
       const tailText = tail.length ? `\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\`` : "";
+      const toolText = formatToolRunDiagnostics(toolRuns);
       const clarificationMsg =
         `WorkerPal job ${shortJob} needs clarification before making changes: ${clarificationFromLogs}\n\n` +
         "Reply with the missing details and I will enqueue a focused follow-up request." +
+        toolText +
         tailText;
       await this.assistantMessage(sessionId, clarificationMsg, {
         correlationId: envelope.correlationId,
@@ -1294,17 +1372,19 @@ export class RemoteBuddyOrchestrator {
       return;
     }
 
-    const explanation = explainJobFailureFromLogs(logs, message, detail);
+    const explanation =
+      explainJobFailureFromToolRuns(toolRuns) ?? explainJobFailureFromLogs(logs, message, detail);
 
     const tail = logs
       .slice(-6)
       .map((row) => toSingleLine(row.message, 220))
       .filter(Boolean);
     const tailText = tail.length ? `\nRecent logs:\n\`\`\`\n${tail.join("\n")}\n\`\`\`` : "";
+    const toolText = formatToolRunDiagnostics(toolRuns);
 
     await this.assistantMessage(
       sessionId,
-      `Diagnosis for job ${shortJob}: ${explanation}${tailText}`,
+      `Diagnosis for job ${shortJob}: ${explanation}${toolText}${tailText}`,
       {
         correlationId: envelope.correlationId,
         turnId: envelope.turnId,

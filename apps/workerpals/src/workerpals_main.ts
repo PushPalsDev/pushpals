@@ -29,6 +29,7 @@ import {
   loadPushPalsConfig,
   resolveLocalServerConnection,
   resolveGitTokenForRemote,
+  createToolRunRecordFromFailure,
 } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
 import { Logger } from "./common/logger.js";
@@ -118,6 +119,95 @@ async function postJsonWithTimeout(
     throw error;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+function inferFailureToolInvocation(result: JobResult): {
+  tool?: string;
+  argv?: string[];
+  commandLine?: string;
+  exitCode?: number | null;
+} {
+  const combined = [result.summary, result.stdout, result.stderr, result.publishBlocked?.detail]
+    .map((part) => String(part ?? ""))
+    .join("\n");
+  if (/codex\s+--version/i.test(combined) || /openai_codex/i.test(combined)) {
+    return {
+      tool: "codex",
+      argv: /codex\s+--version/i.test(combined) ? ["codex", "--version"] : [],
+      commandLine: /codex\s+--version/i.test(combined) ? "codex --version" : undefined,
+      exitCode: result.exitCode ?? (/exit\s+127/i.test(combined) ? 127 : null),
+    };
+  }
+  if (/git\s+pull\s+--rebase/i.test(combined)) {
+    return {
+      tool: "git",
+      argv: ["git", "pull", "--rebase"],
+      commandLine: "git pull --rebase",
+      exitCode: result.exitCode ?? null,
+    };
+  }
+  if (/\bgit\b/i.test(combined) && /\b(rebase|cherry-pick|checkout|push)\b/i.test(combined)) {
+    return { tool: "git", argv: [], exitCode: result.exitCode ?? null };
+  }
+  if (/\bdocker\b/i.test(combined) || /docker_engine/i.test(combined)) {
+    return { tool: "docker", argv: [], exitCode: result.exitCode ?? null };
+  }
+  if (/\bbun\b/i.test(combined)) {
+    return { tool: "bun", argv: [], exitCode: result.exitCode ?? null };
+  }
+  return { exitCode: result.exitCode ?? null };
+}
+
+async function reportToolRunForUnsuccessfulJob(args: {
+  opts: ReturnType<typeof parseArgs>;
+  headers: Record<string, string>;
+  job: { id: string; kind: string; sessionId?: string | null };
+  result: JobResult;
+  durationMs: number;
+  phase: string;
+}): Promise<void> {
+  const invocation = inferFailureToolInvocation(args.result);
+  const record = createToolRunRecordFromFailure({
+    id: randomUUID(),
+    jobId: args.job.id,
+    workerId: args.opts.workerId,
+    sessionId: args.job.sessionId ?? null,
+    phase: args.phase || args.job.kind,
+    tool: invocation.tool,
+    argv: invocation.argv,
+    commandLine: invocation.commandLine,
+    stdout: args.result.stdout,
+    stderr: args.result.stderr ?? args.result.publishBlocked?.detail,
+    summary: args.result.summary,
+    detail: args.result.publishBlocked?.detail,
+    exitCode: invocation.exitCode,
+    durationMs: args.durationMs,
+    finishedAt: new Date().toISOString(),
+    envProfile: args.opts.docker ? "worker-container" : "worker-host",
+    cwd: args.opts.repo,
+    metadata: {
+      publishBlocked: Boolean(args.result.publishBlocked),
+      publishStage: args.result.publishBlocked?.stage ?? null,
+    },
+  });
+
+  if (record.failureClass === "unknown" && record.tool === "shell") return;
+
+  try {
+    const response = await postJsonWithTimeout(`${args.opts.server}/tool-runs`, args.headers, record, 5_000);
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      console.warn(
+        `[WorkerPals] Failed to record tool run telemetry for job ${args.job.id}: ${response.status} ${detail}`,
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `[WorkerPals] Failed to record tool run telemetry for job ${args.job.id}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
 }
 
@@ -1421,6 +1511,14 @@ async function workerLoop(
 
             let statusPersistedToServer = false;
             if (result.publishBlocked) {
+              await reportToolRunForUnsuccessfulJob({
+                opts,
+                headers,
+                job,
+                result,
+                durationMs: jobDurationMs,
+                phase: `publish:${result.publishBlocked.stage}`,
+              });
               const response = await postJsonWithTimeout(
                 `${opts.server}/jobs/${job.id}/publish-blocked`,
                 headers,
@@ -1464,6 +1562,14 @@ async function workerLoop(
                 `[WorkerPals] Job ${job.id} completed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
               );
             } else {
+              await reportToolRunForUnsuccessfulJob({
+                opts,
+                headers,
+                job,
+                result,
+                durationMs: jobDurationMs,
+                phase: job.kind,
+              });
               const response = await postJsonWithTimeout(`${opts.server}/jobs/${job.id}/fail`, headers, {
                 message: result.summary,
                 detail: redactSensitiveText(result.stderr ?? ""),

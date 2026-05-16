@@ -55,6 +55,25 @@ export {
   type SourceControlProvider,
 } from "./source_control_api.js";
 export {
+  DEFAULT_TOOL_REGISTRY,
+  TOOL_RUN_TAIL_CHARS,
+  classifyToolFailure,
+  createToolRunRecordFromFailure,
+  inferToolNameFromFailureText,
+  normalizeToolName,
+  redactToolText,
+  resolveToolKind,
+  truncateToolText,
+  type ToolAdapter,
+  type ToolEffect,
+  type ToolFailureClass,
+  type ToolFailureClassification,
+  type ToolFailureInput,
+  type ToolKind,
+  type ToolRegistry,
+  type ToolRunRecord,
+} from "./tooling.js";
+export {
   DEFAULT_WORKERPALS_EXECUTOR,
   invalidatePushPalsConfigCache,
   loadPushPalsConfig,

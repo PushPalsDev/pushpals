@@ -1,5 +1,17 @@
 import { Database } from "bun:sqlite";
 import { randomUUID } from "crypto";
+import {
+  classifyToolFailure,
+  inferToolNameFromFailureText,
+  normalizeToolName,
+  redactToolText,
+  resolveToolKind,
+  truncateToolText,
+  type ToolEffect,
+  type ToolFailureClass,
+  type ToolKind,
+  type ToolRunRecord,
+} from "shared";
 
 export type JobStatus =
   | "pending"
@@ -68,6 +80,34 @@ export interface JobLogRow {
   jobId: string;
   ts: string;
   message: string;
+}
+
+interface ToolRunDbRow {
+  id: string;
+  jobId: string | null;
+  workerId: string | null;
+  sessionId: string | null;
+  phase: string | null;
+  tool: string;
+  kind: ToolKind;
+  capability: string | null;
+  envProfile: string | null;
+  cwd: string | null;
+  argvJson: string;
+  commandLine: string | null;
+  allowedEffectsJson: string;
+  ok: number;
+  exitCode: number | null;
+  failureClass: ToolFailureClass | null;
+  retryable: number;
+  remediation: string | null;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  stdoutTail: string | null;
+  stderrTail: string | null;
+  metadataJson: string;
+  createdAt: string;
 }
 
 interface WorkerDbRow {
@@ -167,6 +207,86 @@ function parseObjectJson(value: string | null): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function parseStringArrayJson(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function parseToolEffectsJson(value: string | null): ToolEffect[] {
+  const allowed = new Set<ToolEffect>(["read", "write", "network", "git", "process"]);
+  return parseStringArrayJson(value).filter((entry): entry is ToolEffect =>
+    allowed.has(entry as ToolEffect),
+  );
+}
+
+const TOOL_FAILURE_CLASSES: ToolFailureClass[] = [
+  "missing_binary",
+  "missing_runtime",
+  "auth",
+  "network",
+  "permission",
+  "policy_denied",
+  "timeout",
+  "nonzero_exit",
+  "repo_state",
+  "sandbox_mount",
+  "unknown",
+];
+
+function normalizeToolFailureClass(value: unknown): ToolFailureClass | null {
+  const text = String(value ?? "").trim();
+  return TOOL_FAILURE_CLASSES.includes(text as ToolFailureClass)
+    ? (text as ToolFailureClass)
+    : null;
+}
+
+function shouldAcceptClientToolFailureClass(
+  serverClass: ToolFailureClass | null | undefined,
+  clientClass: ToolFailureClass | null,
+): boolean {
+  if (!clientClass) return false;
+  return !serverClass || serverClass === "unknown" || serverClass === "nonzero_exit";
+}
+
+function compactDbText(value: unknown, maxChars: number): string | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars);
+}
+
+function boolFromUnknown(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const text = String(value ?? "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(text);
+}
+
+function sanitizeToolRunMetadata(value: unknown, depth = 0): unknown {
+  if (value == null) return null;
+  if (typeof value === "string") return compactDbText(redactToolText(value), 1000) ?? "";
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "boolean") return value;
+  if (depth >= 4) return "[truncated]";
+  if (Array.isArray(value)) {
+    return value.slice(0, 50).map((entry) => sanitizeToolRunMetadata(entry, depth + 1));
+  }
+  if (typeof value !== "object") return String(value);
+  const out: Record<string, unknown> = {};
+  for (const [rawKey, rawValue] of Object.entries(value).slice(0, 100)) {
+    const key = compactDbText(rawKey, 120);
+    if (!key) continue;
+    out[key] = sanitizeToolRunMetadata(rawValue, depth + 1);
+  }
+  return out;
 }
 
 function normalizeWorkerStatus(value: unknown): WorkerStatus {
@@ -490,6 +610,38 @@ export class JobQueue {
         FOREIGN KEY (jobId) REFERENCES jobs(id)
       );
       CREATE INDEX IF NOT EXISTS idx_job_logs_job_id ON job_logs(jobId, id);
+
+      CREATE TABLE IF NOT EXISTS tool_runs (
+        id                 TEXT PRIMARY KEY,
+        jobId              TEXT,
+        workerId           TEXT,
+        sessionId          TEXT,
+        phase              TEXT,
+        tool               TEXT NOT NULL,
+        kind               TEXT NOT NULL DEFAULT 'discovered',
+        capability         TEXT,
+        envProfile         TEXT,
+        cwd                TEXT,
+        argvJson           TEXT NOT NULL DEFAULT '[]',
+        commandLine        TEXT,
+        allowedEffectsJson TEXT NOT NULL DEFAULT '[]',
+        ok                 INTEGER NOT NULL DEFAULT 0,
+        exitCode           INTEGER,
+        failureClass       TEXT,
+        retryable          INTEGER NOT NULL DEFAULT 0,
+        remediation        TEXT,
+        startedAt          TEXT NOT NULL,
+        finishedAt         TEXT NOT NULL,
+        durationMs         INTEGER NOT NULL DEFAULT 0,
+        stdoutTail         TEXT,
+        stderrTail         TEXT,
+        metadataJson       TEXT NOT NULL DEFAULT '{}',
+        createdAt          TEXT NOT NULL,
+        FOREIGN KEY (jobId) REFERENCES jobs(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_tool_runs_job_id ON tool_runs(jobId, finishedAt);
+      CREATE INDEX IF NOT EXISTS idx_tool_runs_tool ON tool_runs(tool, finishedAt);
+      CREATE INDEX IF NOT EXISTS idx_tool_runs_failure_class ON tool_runs(failureClass, finishedAt);
 
       CREATE TABLE IF NOT EXISTS job_artifacts (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2337,6 +2489,184 @@ export class JobQueue {
       )
       .all(jobId, maxRows) as JobLogRow[];
     return rows.reverse();
+  }
+
+  recordToolRun(body: Partial<ToolRunRecord> & Record<string, unknown>): {
+    ok: boolean;
+    id?: string;
+    message?: string;
+  } {
+    const now = new Date().toISOString();
+    const id = compactDbText(body.id, 128) ?? randomUUID();
+    const jobId = compactDbText(body.jobId, 128);
+    const workerId = compactDbText(body.workerId, 128);
+    const sessionId = compactDbText(body.sessionId, 128);
+    const phase = compactDbText(body.phase, 128);
+    const capability = compactDbText(body.capability, 128);
+    const envProfile = compactDbText(body.envProfile, 128);
+    const cwd = compactDbText(body.cwd, 1000);
+    const argv = Array.isArray(body.argv)
+      ? body.argv.map((arg) => String(arg ?? "").trim()).filter(Boolean).slice(0, 80)
+      : [];
+    const commandLine = compactDbText(body.commandLine, 2000);
+    const allowedEffects = Array.isArray(body.allowedEffects)
+      ? body.allowedEffects
+          .map((entry) => String(entry ?? "").trim())
+          .filter((entry): entry is ToolEffect =>
+            ["read", "write", "network", "git", "process"].includes(entry),
+          )
+      : [];
+    const ok = boolFromUnknown(body.ok);
+    const exitCodeRaw = Number(body.exitCode);
+    const exitCode = Number.isFinite(exitCodeRaw) ? Math.trunc(exitCodeRaw) : null;
+    const stdoutTail = truncateToolText(redactToolText(body.stdoutTail ?? body.stdout), 8_000);
+    const stderrTail = truncateToolText(redactToolText(body.stderrTail ?? body.stderr ?? body.detail), 8_000);
+    const tool = inferToolNameFromFailureText({
+      tool: normalizeToolName(body.tool ?? "shell"),
+      argv,
+      commandLine,
+      stdout: stdoutTail,
+      stderr: stderrTail,
+      summary: body.summary as string | undefined,
+      detail: body.detail as string | undefined,
+      exitCode,
+      timedOut: boolFromUnknown(body.timedOut),
+    });
+    const kindRaw = compactDbText(body.kind, 32);
+    const kind: ToolKind =
+      kindRaw === "known" || kindRaw === "discovered" || kindRaw === "shell"
+        ? kindRaw
+        : resolveToolKind(tool);
+    const classification = ok
+      ? null
+      : classifyToolFailure({
+          tool,
+          argv,
+          commandLine,
+          stdout: stdoutTail,
+          stderr: stderrTail,
+          summary: body.summary as string | undefined,
+          detail: body.detail as string | undefined,
+          exitCode,
+          timedOut: boolFromUnknown(body.timedOut),
+        });
+    const clientFailureClass = normalizeToolFailureClass(body.failureClass);
+    const serverFailureClass = classification?.failureClass ?? "unknown";
+    const acceptsClientFailureClass = shouldAcceptClientToolFailureClass(
+      serverFailureClass,
+      clientFailureClass,
+    );
+    const failureClass: ToolFailureClass | null = ok
+      ? null
+      : acceptsClientFailureClass
+        ? clientFailureClass
+        : serverFailureClass;
+    const retryable = ok
+      ? false
+      : failureClass === clientFailureClass &&
+          body.retryable !== undefined &&
+          body.retryable !== null &&
+          acceptsClientFailureClass
+        ? boolFromUnknown(body.retryable)
+        : classification?.retryable ?? false;
+    const clientRemediation = compactDbText(body.remediation, 1000);
+    const remediation =
+      ok || (failureClass === clientFailureClass && acceptsClientFailureClass)
+        ? clientRemediation ?? classification?.remediation ?? null
+        : classification?.remediation ?? clientRemediation ?? null;
+    const finishedAt = coerceIsoTimestamp(body.finishedAt) ?? now;
+    const startedAt = coerceIsoTimestamp(body.startedAt) ?? finishedAt;
+    const durationRaw = Number(body.durationMs);
+    const durationMs =
+      Number.isFinite(durationRaw) && durationRaw >= 0 ? Math.min(Math.trunc(durationRaw), 86_400_000) : 0;
+    const metadata =
+      body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+        ? (sanitizeToolRunMetadata(body.metadata) as Record<string, unknown>)
+        : {};
+
+    try {
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO tool_runs (
+            id, jobId, workerId, sessionId, phase, tool, kind, capability, envProfile, cwd,
+            argvJson, commandLine, allowedEffectsJson, ok, exitCode, failureClass, retryable,
+            remediation, startedAt, finishedAt, durationMs, stdoutTail, stderrTail, metadataJson, createdAt
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          jobId,
+          workerId,
+          sessionId,
+          phase,
+          tool,
+          kind,
+          capability,
+          envProfile,
+          cwd,
+          JSON.stringify(argv),
+          commandLine,
+          JSON.stringify(allowedEffects),
+          ok ? 1 : 0,
+          exitCode,
+          failureClass,
+          retryable ? 1 : 0,
+          remediation,
+          startedAt,
+          finishedAt,
+          durationMs,
+          stdoutTail || null,
+          stderrTail || null,
+          JSON.stringify(metadata),
+          now,
+        );
+      return { ok: true, id };
+    } catch (error) {
+      return {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  listJobToolRuns(jobId: string, limit = 50): ToolRunRecord[] {
+    const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(500, Math.floor(limit))) : 50;
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM tool_runs
+         WHERE jobId = ?
+         ORDER BY finishedAt DESC, createdAt DESC
+         LIMIT ?`,
+      )
+      .all(jobId, maxRows) as ToolRunDbRow[];
+    return rows.map((row) => ({
+      id: row.id,
+      jobId: row.jobId,
+      workerId: row.workerId,
+      sessionId: row.sessionId,
+      phase: row.phase,
+      tool: row.tool,
+      kind: row.kind,
+      capability: row.capability,
+      envProfile: row.envProfile,
+      cwd: row.cwd,
+      argv: parseStringArrayJson(row.argvJson),
+      commandLine: row.commandLine,
+      allowedEffects: parseToolEffectsJson(row.allowedEffectsJson),
+      ok: row.ok === 1,
+      exitCode: row.exitCode,
+      failureClass: row.failureClass,
+      retryable: row.retryable === 1,
+      remediation: row.remediation,
+      startedAt: row.startedAt,
+      finishedAt: row.finishedAt,
+      durationMs: row.durationMs,
+      stdoutTail: row.stdoutTail,
+      stderrTail: row.stderrTail,
+      metadata: parseObjectJson(row.metadataJson),
+    }));
   }
 
   close(): void {
