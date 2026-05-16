@@ -2,18 +2,19 @@
 
 ## Release Metadata
 
-- version: `v1.0.79`
-- start_commit: `197fc4376941b7f7312214d70c53370c637f5d95`
-- end_commit: `f4939f4bc92b6cb0e7c16133c036eee80c05cf7c`
-- commits_in_range: `1`
+- version: `v1.0.80`
+- start_commit: `991b7bf8cf7644d7733588ab25514341ce39265c`
+- end_commit: `3a68ee936334630cd922dc41b7da9949321e5e10`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Fix RemoteBuddy autonomy liveness when an orphaned same-session dispatch lock blocks the next idea-generation tick.
-- Add bounded same-session stale-lock takeover for autonomy dispatch while preserving cross-session lock protection.
-- Make `lock_not_acquired` heartbeat diagnostics include the server denial reason so future stalls are visible in logs.
-- Prefer the concrete Bun launcher from `PUSHPALS_BUN_BIN` when resolving default Codex CLI commands, avoiding stale service PATH shims.
-- Add regression coverage for stale autonomy lock replacement, Codex launcher resolution, and tick lock-acquire payloads.
+- Add shared tool-run diagnostics so WorkerPal and server paths can classify tool failures, preserve retry guidance, and expose tool-run records through the control plane.
+- Record WorkerPal tool failure diagnostics for Git, Codex, Bun, Docker, GitHub CLI, Node, shell, and discovered tools without forcing every tool into a fixed enum.
+- Add `vision.md` testing criteria as a user-owned validation contract and include it in the generated starter vision document.
+- Require WorkerPals to run repo-authored testing criteria before PR or revision publication, preserving repo-native commands such as `bun`, `npm`, `node`, `tsc`, `go`, `cargo`, and script-shell checks.
+- Make failed required validation criteria a hard publish blocker while still surfacing repo or environment blockers with diagnostics.
+- Improve autonomy vision processing with generic repo objective categories instead of repo-specific blueprints, keeping autonomous work aligned across arbitrary repositories.
 
 ## Install
 
