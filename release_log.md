@@ -2,19 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.80`
-- start_commit: `991b7bf8cf7644d7733588ab25514341ce39265c`
-- end_commit: `3a68ee936334630cd922dc41b7da9949321e5e10`
-- commits_in_range: `2`
+- version: `v1.0.81`
+- start_commit: `8afe2d4b404e3ec4a066281bf9472c28574b5181`
+- end_commit: `95ae513d9c1791292b91f8c2f4cbe99e3d469124`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Add shared tool-run diagnostics so WorkerPal and server paths can classify tool failures, preserve retry guidance, and expose tool-run records through the control plane.
-- Record WorkerPal tool failure diagnostics for Git, Codex, Bun, Docker, GitHub CLI, Node, shell, and discovered tools without forcing every tool into a fixed enum.
-- Add `vision.md` testing criteria as a user-owned validation contract and include it in the generated starter vision document.
-- Require WorkerPals to run repo-authored testing criteria before PR or revision publication, preserving repo-native commands such as `bun`, `npm`, `node`, `tsc`, `go`, `cargo`, and script-shell checks.
-- Make failed required validation criteria a hard publish blocker while still surfacing repo or environment blockers with diagnostics.
-- Improve autonomy vision processing with generic repo objective categories instead of repo-specific blueprints, keeping autonomous work aligned across arbitrary repositories.
+- Defer SourceControlManager ReviewAgent polling until the runtime is fully ready so startup no longer begins Codex reviews before dependent services and environment setup have settled.
+- Move RemoteBuddy WorkerPal prewarming into a non-blocking startup path and keep the packaged sandbox fallback in sync, avoiding duplicate startup stalls while preserving worker capacity warmup.
+- Fix the Mission Control Jobs & Traces refresh path by hydrating trace cards from durable job snapshots and persisted `/jobs/:id/logs` rows when live SSE events are no longer replayed.
+- Preserve live trace state when available while filling refresh gaps from snapshots, including completed, failed, abandoned, and publish-blocked job diagnostics.
+- Add focused monitor hydration and job-log API coverage so refresh-visible running jobs, persisted logs, and parsed result/error summaries stay regression-tested.
 
 ## Install
 
