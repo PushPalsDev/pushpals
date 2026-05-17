@@ -2,18 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.82`
-- start_commit: `0eee94aa255548a89c9434f6e6efb772205ff1d4`
-- end_commit: `62d9c4f6c5246e72ebff7a6c37524e2a1366a04b`
+- version: `v1.0.83`
+- start_commit: `6f066bb0ac6394eda3359e3cd384028001b8742d`
+- end_commit: `4e13eee6de5d8d8990c63f4177d6aeb542ae69c5`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add WorkerPal validation toolchain preflight so required `vision.md` validation fails fast when commands need missing executables instead of waiting through long per-command timeouts.
-- Infer validation dependencies from runnable commands, package scripts, repo-native build signals, and declared environment files such as devcontainers, Dockerfiles, mise/asdf, and Nix files.
-- Expand the WorkerPal sandbox baseline with Node/npm and native build tooling (`build-essential`, `cmake`, `pkg-config`) so common JavaScript, Expo, TypeScript, and native-build validation paths work out of the box.
-- Classify missing toolchain executables as environment blockers with explicit skipped-command diagnostics, while preserving normal repo/test failures as real validation failures.
-- Add shared toolchain inference tests covering Bun, Node-backed CLIs, package-manager script routing, native compiler detection, and declared repo environment detection.
+- Make WorkerPal validation tooling inference workspace-aware so package scripts such as `bun run lint` do not require globally installed Node CLIs like `expo`, `vite`, or `tsc`.
+- Scan referenced validation scripts, including workspace-relative scripts under `bun --cwd`, so hidden tool dependencies inside commands such as `bun scripts/web-e2e.ts` are detected before validation runs.
+- Run WorkerPal validation commands with writable temp `HOME`, cache, npm, and Expo directories plus non-interactive CI defaults, reducing false sandbox failures from CLIs that write user-level state.
+- Preserve real repo validation failures while reducing false missing-tool blockers for repo-local JavaScript tooling.
+- Add regression coverage for package-script Node CLI inference, hidden validation script scanning, and package-cwd script path resolution.
 
 ## Install
 
