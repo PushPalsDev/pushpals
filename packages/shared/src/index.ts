@@ -74,6 +74,17 @@ export {
   type ToolRunRecord,
 } from "./tooling.js";
 export {
+  buildToolchainPlan,
+  formatToolRequirement,
+  inferToolRequirementsForValidationCommand,
+  requirementsForValidationCommand,
+  tokenizeToolchainCommand,
+  type BuildToolchainPlanOptions,
+  type ToolRequirement,
+  type ToolchainEnvironmentSource,
+  type ToolchainPlan,
+} from "./toolchain.js";
+export {
   DEFAULT_WORKERPALS_EXECUTOR,
   invalidatePushPalsConfigCache,
   loadPushPalsConfig,

@@ -11,14 +11,18 @@ import {
   explicitSourceControlCommitIdentityFromEnv,
   loadPromptTemplate,
   loadPushPalsConfig,
+  buildToolchainPlan,
   extractVisionKeyItems,
+  formatToolRequirement,
   matchesGlob,
   normalizeAutonomyComponentArea,
   normalizeTargetPath,
+  requirementsForValidationCommand,
   sanitizeSourceControlIdentityField,
   validateScopeInvariants,
   type AutonomyComponentArea,
   type SourceControlCommitIdentity,
+  type ToolRequirement,
 } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { JobPublishBlockedInfo, JobResult } from "./common/types.js";
@@ -586,6 +590,99 @@ async function runValidationCommand(
   };
 }
 
+interface ToolAvailabilityResult {
+  requirement: ToolRequirement;
+  ok: boolean;
+  candidate: string | null;
+  detail: string;
+}
+
+function toolProbeArgv(candidate: string): string[] {
+  const normalized = candidate.toLowerCase();
+  if (normalized === "sh") {
+    return [candidate, "-c", "exit 0"];
+  }
+  if (normalized === "cmd") {
+    return [candidate, "/c", "exit 0"];
+  }
+  if (normalized === "bash") {
+    return [candidate, "-lc", "exit 0"];
+  }
+  if (normalized === "powershell" || normalized === "pwsh") {
+    return [candidate, "-NoProfile", "-Command", "exit 0"];
+  }
+  return [candidate, "--version"];
+}
+
+async function checkToolCandidate(candidate: string, timeoutMs = 5_000): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(toolProbeArgv(candidate), {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill();
+      } catch {
+        // ignore
+      }
+    }, Math.max(1_000, timeoutMs));
+    try {
+      const [exitCode] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text().catch(() => ""),
+        new Response(proc.stderr).text().catch(() => ""),
+      ]);
+      return !timedOut && exitCode === 0;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function checkToolAvailability(
+  requirements: ToolRequirement[],
+): Promise<ToolAvailabilityResult[]> {
+  const cache = new Map<string, Promise<boolean>>();
+  const check = (candidate: string) => {
+    const key = candidate.toLowerCase();
+    let cached = cache.get(key);
+    if (!cached) {
+      cached = checkToolCandidate(candidate);
+      cache.set(key, cached);
+    }
+    return cached;
+  };
+
+  const out: ToolAvailabilityResult[] = [];
+  for (const requirement of requirements) {
+    let availableCandidate: string | null = null;
+    for (const candidate of requirement.candidates) {
+      if (await check(candidate)) {
+        availableCandidate = candidate;
+        break;
+      }
+    }
+    out.push({
+      requirement,
+      ok: Boolean(availableCandidate),
+      candidate: availableCandidate,
+      detail: availableCandidate
+        ? `${availableCandidate} is available`
+        : `missing ${formatToolRequirement(requirement)}`,
+    });
+  }
+  return out;
+}
+
+function formatMissingToolRequirements(requirements: ToolRequirement[]): string {
+  return requirements.map(formatToolRequirement).join(", ");
+}
+
 function extractPreparedMergeConflictPaths(params: Record<string, unknown>): string[] {
   const reviewAgent =
     params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent)
@@ -606,6 +703,20 @@ function detectValidationBlocker(runs: ValidationExecutionResult[]): ValidationB
     .join("\n")
     .toLowerCase();
   if (!combined) return null;
+
+  if (
+    combined.includes("validation skipped before execution because required tool") ||
+    combined.includes("missing required tool") ||
+    combined.includes("command not found") ||
+    combined.includes("executable not found") ||
+    combined.includes("not recognized as an internal or external command")
+  ) {
+    return {
+      category: "environment",
+      detail:
+        "Validation is blocked by missing required toolchain executables in the worker environment. Install/provision the missing tools or declare a supported repo toolchain before retrying this job.",
+    };
+  }
 
   if (
     combined.includes("cannot find module") ||
@@ -1086,7 +1197,54 @@ async function runDeterministicQualityGate(
         `[QualityGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
       );
     }
+    const toolchainPlan = buildToolchainPlan({
+      repoRoot: repo,
+      validationCommands: commandsToRun,
+    });
+    if (toolchainPlan.requirements.length > 0) {
+      onLog?.(
+        "stdout",
+        `[QualityGate] Toolchain preflight: source=${toolchainPlan.environmentSource}, required=${toolchainPlan.requirements
+          .map((requirement) => requirement.tool)
+          .join(", ")}`,
+      );
+    }
+    const toolAvailability = await checkToolAvailability(toolchainPlan.requirements);
+    const missingToolRequirements = toolAvailability
+      .filter((entry) => !entry.ok)
+      .map((entry) => entry.requirement);
+    if (missingToolRequirements.length > 0) {
+      onLog?.(
+        "stderr",
+        `[QualityGate] Toolchain preflight blocked dependent validation command(s): ${formatMissingToolRequirements(
+          missingToolRequirements,
+        )}`,
+      );
+    }
     for (const command of commandsToRun) {
+      const commandMissingTools = requirementsForValidationCommand(toolchainPlan, command).filter(
+        (requirement) =>
+          missingToolRequirements.some((missing) => missing.tool === requirement.tool),
+      );
+      if (commandMissingTools.length > 0) {
+        const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
+          commandMissingTools,
+        )}.`;
+        validationRuns.push({
+          step: command,
+          command,
+          ok: false,
+          exitCode: 127,
+          stdout: "",
+          stderr,
+          elapsedMs: 1,
+        });
+        onLog?.(
+          "stderr",
+          `[QualityGate] Quality gate validation skipped (missing toolchain): ${command}`,
+        );
+        continue;
+      }
       onLog?.("stdout", `[QualityGate] Quality gate validation: running "${command}"`);
       const run = await runValidationCommand(
         repo,

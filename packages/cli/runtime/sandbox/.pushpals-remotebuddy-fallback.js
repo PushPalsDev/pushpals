@@ -1742,6 +1742,27 @@ var KNOWN_TOOL_NAMES = new Set([
   "python",
   "shell"
 ]);
+// packages/shared/src/toolchain.ts
+var SHELL_CONTROL_TOKENS = new Set(["|", "||", "&", "&&", ";", ">", ">>", "<", "<<"]);
+var NODE_BACKED_CLI_NAMES = new Set([
+  "astro",
+  "babel",
+  "cypress",
+  "eslint",
+  "expo",
+  "jest",
+  "metro",
+  "next",
+  "nuxt",
+  "playwright",
+  "react-native",
+  "rollup",
+  "tsc",
+  "tsx",
+  "vite",
+  "vitest",
+  "webpack"
+]);
 // packages/shared/src/session_event_visibility.ts
 var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 // packages/shared/src/localbuddy_runtime.ts
