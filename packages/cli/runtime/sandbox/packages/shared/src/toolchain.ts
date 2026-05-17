@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
-import { join, normalize } from "path";
+import { isAbsolute, join, normalize } from "path";
 
 export type ToolchainEnvironmentSource =
   | "devcontainer"
@@ -27,6 +27,7 @@ export interface BuildToolchainPlanOptions {
   repoRoot: string;
   validationCommands: string[];
   maxNativeScanEntries?: number;
+  maxScriptScanChars?: number;
 }
 
 const SHELL_CONTROL_TOKENS = new Set(["|", "||", "&", "&&", ";", ">", ">>", "<", "<<"]);
@@ -144,7 +145,14 @@ export function buildToolchainPlan(options: BuildToolchainPlanOptions): Toolchai
   const nativeSignals = detectNativeSignals(repoRoot, options.maxNativeScanEntries ?? 1_000);
   const requirements: ToolRequirement[] = [];
   for (const command of options.validationCommands) {
-    requirements.push(...inferToolRequirementsForValidationCommand(repoRoot, command, nativeSignals));
+    requirements.push(
+      ...inferToolRequirementsForValidationCommand(
+        repoRoot,
+        command,
+        nativeSignals,
+        options.maxScriptScanChars ?? 64_000,
+      ),
+    );
   }
   return {
     requirements: dedupeToolRequirements(requirements),
@@ -156,6 +164,7 @@ export function inferToolRequirementsForValidationCommand(
   repoRoot: string,
   command: string,
   nativeSignals: NativeSignals = detectNativeSignals(repoRoot),
+  maxScriptScanChars = 64_000,
 ): ToolRequirement[] {
   const tokens = tokenizeToolchainCommand(command);
   if (!tokens) return [];
@@ -177,7 +186,18 @@ export function inferToolRequirementsForValidationCommand(
 
   const script = resolvePackageScript(repoRoot, tokens);
   if (script) {
-    addScriptRequirements(requirements, script.script, script.detectedFrom, command);
+    addScriptRequirements(
+      requirements,
+      repoRoot,
+      script.scriptCwd,
+      script.script,
+      script.detectedFrom,
+      command,
+      {
+        maxScriptScanChars,
+        depth: 0,
+      },
+    );
   }
 
   if (usesNativeBuildCommand(tokens)) {
@@ -257,16 +277,33 @@ function addNodeBackedCliRequirement(
 
 function addScriptRequirements(
   requirements: ToolRequirement[],
+  repoRoot: string,
+  scriptCwd: string,
   script: string,
   detectedFrom: string,
   command: string,
+  options: { maxScriptScanChars: number; depth: number },
 ): void {
   const tokens = tokenizeToolchainCommand(script) ?? script.split(/\s+/).filter(Boolean);
   const first = normalizeToolToken(tokens[0] ?? "");
-  addDirectExecutableRequirement(requirements, first, command);
+  // Package-manager scripts resolve Node CLIs from local node_modules/.bin. Requiring a
+  // global expo/vite/tsc binary creates false environment blockers for normal JS repos.
+  if (!NODE_BACKED_CLI_NAMES.has(first)) {
+    addDirectExecutableRequirement(requirements, first, command);
+  }
   addNodeBackedCliRequirement(requirements, first, detectedFrom, command);
   for (const token of tokens) {
     addNodeBackedCliRequirement(requirements, normalizeToolToken(token), detectedFrom, command);
+  }
+  for (const scriptPath of inferReferencedScriptPaths(repoRoot, scriptCwd, tokens)) {
+    const scanned = scanScriptFileForToolRequirements(
+      requirements,
+      repoRoot,
+      scriptPath,
+      command,
+      options,
+    );
+    if (scanned) continue;
   }
   if (/\bnode\b/.test(script)) {
     requirements.push({
@@ -286,6 +323,50 @@ function addScriptRequirements(
       requiredFor: [command],
     });
   }
+}
+
+function scanScriptFileForToolRequirements(
+  requirements: ToolRequirement[],
+  repoRoot: string,
+  scriptPath: string,
+  command: string,
+  options: { maxScriptScanChars: number; depth: number },
+): boolean {
+  if (options.depth > 2 || !existsSync(scriptPath)) return false;
+  let text = "";
+  try {
+    const stats = statSync(scriptPath);
+    if (!stats.isFile() || stats.size > options.maxScriptScanChars) return false;
+    text = readFileSync(scriptPath, "utf8");
+  } catch {
+    return false;
+  }
+  const detectedFrom = `${repoRelativePath(repoRoot, scriptPath)} referenced by validation command "${command}"`;
+  for (const cliName of NODE_BACKED_CLI_NAMES) {
+    const pattern = new RegExp(`(?:^|[^A-Za-z0-9_-])${escapeRegExp(cliName)}(?:$|[^A-Za-z0-9_-])`);
+    if (pattern.test(text)) {
+      addNodeBackedCliRequirement(requirements, cliName, detectedFrom, command);
+    }
+  }
+  if (/\bnode\b/.test(text)) {
+    requirements.push({
+      tool: "node",
+      candidates: ["node"],
+      reason: "referenced validation script invokes node directly",
+      detectedFrom,
+      requiredFor: [command],
+    });
+  }
+  if (/\bbun\b/.test(text)) {
+    requirements.push({
+      tool: "bun",
+      candidates: ["bun"],
+      reason: "referenced validation script invokes bun",
+      detectedFrom,
+      requiredFor: [command],
+    });
+  }
+  return true;
 }
 
 function resolveBunSubcommand(tokens: string[]): { kind: "run" | "x"; value: string } | null {
@@ -313,7 +394,7 @@ function resolveBunSubcommand(tokens: string[]): { kind: "run" | "x"; value: str
 function resolvePackageScript(
   repoRoot: string,
   tokens: string[],
-): { script: string; detectedFrom: string } | null {
+): { script: string; scriptCwd: string; detectedFrom: string } | null {
   const first = normalizeToolToken(tokens[0] ?? "");
   let cwd = repoRoot;
   let scriptName = "";
@@ -379,11 +460,39 @@ function resolvePackageScript(
     if (typeof script !== "string" || !script.trim()) return null;
     return {
       script,
+      scriptCwd: cwd,
       detectedFrom: `${repoRelativePath(repoRoot, packagePath)} script "${scriptName}"`,
     };
   } catch {
     return null;
   }
+}
+
+function inferReferencedScriptPaths(repoRoot: string, scriptCwd: string, tokens: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const token of tokens) {
+    const normalized = normalizeReferencedScriptToken(token);
+    if (!normalized) continue;
+    const resolved = isAbsolute(normalized) ? normalized : join(scriptCwd, normalized);
+    const key = normalize(resolved);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(resolved);
+  }
+  return out;
+}
+
+function normalizeReferencedScriptToken(token: string): string | null {
+  let normalized = token.replace(/\\/g, "/");
+  if (normalized.startsWith("-")) {
+    const equalsIndex = normalized.indexOf("=");
+    if (equalsIndex === -1) return null;
+    normalized = normalized.slice(equalsIndex + 1);
+  }
+  if (!/\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$/i.test(normalized)) return null;
+  if (normalized.includes("://")) return null;
+  return normalized;
 }
 
 function detectToolchainEnvironmentSource(repoRoot: string): ToolchainEnvironmentSource {
@@ -499,6 +608,10 @@ function canonicalToolName(tool: string): string {
 function normalizeToolToken(token: string): string {
   const normalizedToken = token.trim().replace(/\\/g, "/").split("/").pop() ?? token;
   return normalizedToken.toLowerCase().replace(/\.(cmd|exe|ps1)$/i, "");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function repoRelativePath(repoRoot: string, pathValue: string): string {

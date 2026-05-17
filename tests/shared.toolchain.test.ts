@@ -67,6 +67,7 @@ describe("toolchain inference", () => {
 
     expect(plan.requirements.map((entry) => entry.tool)).toContain("bun");
     expect(plan.requirements.map((entry) => entry.tool)).toContain("node");
+    expect(plan.requirements.map((entry) => entry.tool)).not.toContain("expo");
     expect(
       requirementsForValidationCommand(plan, "bun run lint").map((entry) => entry.tool),
     ).toContain("node");
@@ -120,6 +121,64 @@ describe("toolchain inference", () => {
     expect(plan.requirements.find((entry) => entry.tool === "node")?.detectedFrom).toContain(
       "apps/client/package.json",
     );
+  });
+
+  test("scans referenced validation scripts for hidden Node-backed CLIs", () => {
+    const repo = makeRepo();
+    mkdirSync(join(repo, "scripts"), { recursive: true });
+    writeJson(join(repo, "package.json"), {
+      scripts: { "web:e2e": "bun scripts/web-e2e.ts" },
+    });
+    writeFileSync(
+      join(repo, "scripts", "web-e2e.ts"),
+      'Bun.spawn(["bun", "x", "expo", "start", "--web"]);\n',
+      "utf8",
+    );
+
+    const plan = buildToolchainPlan({
+      repoRoot: repo,
+      validationCommands: ["bun run web:e2e"],
+    });
+
+    const tools = requirementsForValidationCommand(plan, "bun run web:e2e").map(
+      (entry) => entry.tool,
+    );
+    expect(tools).toContain("bun");
+    expect(tools).toContain("node");
+    expect(tools).not.toContain("expo");
+    expect(plan.requirements.find((entry) => entry.tool === "node")?.detectedFrom).toContain(
+      "scripts/web-e2e.ts",
+    );
+  });
+
+  test("resolves referenced validation scripts relative to package cwd", () => {
+    const repo = makeRepo();
+    mkdirSync(join(repo, "apps", "client", "scripts"), { recursive: true });
+    writeJson(join(repo, "apps", "client", "package.json"), {
+      scripts: { "web:e2e": "bun scripts/web-e2e.ts" },
+    });
+    writeFileSync(
+      join(repo, "apps", "client", "scripts", "web-e2e.ts"),
+      'await Bun.spawn(["bun", "x", "expo", "start", "--web"]).exited;\n',
+      "utf8",
+    );
+
+    const plan = buildToolchainPlan({
+      repoRoot: repo,
+      validationCommands: ["bun --cwd apps/client run web:e2e"],
+    });
+
+    const nodeRequirement = requirementsForValidationCommand(
+      plan,
+      "bun --cwd apps/client run web:e2e",
+    ).find((entry) => entry.tool === "node");
+
+    expect(nodeRequirement?.detectedFrom).toContain("apps/client/scripts/web-e2e.ts");
+    expect(
+      requirementsForValidationCommand(plan, "bun --cwd apps/client run web:e2e").map(
+        (entry) => entry.tool,
+      ),
+    ).not.toContain("expo");
   });
 
   test("infers compiler requirements for native make validation", () => {

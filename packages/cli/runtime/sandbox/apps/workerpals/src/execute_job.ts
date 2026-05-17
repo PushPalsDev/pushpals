@@ -3,7 +3,8 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { existsSync, readFileSync, rmSync, unlinkSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync } from "fs";
+import { tmpdir } from "os";
 import { resolve } from "path";
 import {
   deriveAutonomyComponentArea,
@@ -556,6 +557,7 @@ async function runValidationCommand(
   const startedAt = Date.now();
   const proc = Bun.spawn(argv, {
     cwd: repo,
+    env: buildValidationCommandEnv(repo),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -587,6 +589,38 @@ async function runValidationCommand(
     stdout: compactJobOutput(stdout.trim(), outputPolicy),
     stderr: compactJobOutput(stderr.trim(), outputPolicy),
     elapsedMs: Math.max(1, Date.now() - startedAt),
+  };
+}
+
+function buildValidationCommandEnv(repo: string): Record<string, string> {
+  const homeDir = resolve(tmpdir(), "pushpals-validation-home");
+  const cacheDir = resolve(tmpdir(), "pushpals-validation-cache");
+  const expoDir = resolve(tmpdir(), "pushpals-validation-expo");
+  for (const dir of [homeDir, cacheDir, expoDir]) {
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      // Keep validation best-effort; the command output will expose any real env blocker.
+    }
+  }
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === "string") env[key] = value;
+  }
+  return {
+    ...env,
+    HOME: homeDir,
+    USERPROFILE: homeDir,
+    XDG_CACHE_HOME: cacheDir,
+    npm_config_cache: resolve(cacheDir, "npm"),
+    EXPO_HOME: expoDir,
+    EXPO_NO_TELEMETRY: process.env.EXPO_NO_TELEMETRY ?? "1",
+    EXPO_NO_INTERACTIVE: process.env.EXPO_NO_INTERACTIVE ?? "1",
+    CI: process.env.CI ?? "1",
+    BROWSER: process.env.BROWSER ?? "none",
+    EXPO_DEV_SERVER_PORT: process.env.EXPO_DEV_SERVER_PORT ?? "19006",
+    RCT_METRO_PORT: process.env.RCT_METRO_PORT ?? "19006",
+    PUSHPALS_VALIDATION_REPO: repo,
   };
 }
 
