@@ -2,18 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.83`
-- start_commit: `6f066bb0ac6394eda3359e3cd384028001b8742d`
-- end_commit: `4e13eee6de5d8d8990c63f4177d6aeb542ae69c5`
+- version: `v1.0.84`
+- start_commit: `76cdd6a4a75ff63e9ee476c5b62bbdd02d02a8ed`
+- end_commit: `14dab8fff72fd12fc1ed2c267875dbbfd182be0f`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Make WorkerPal validation tooling inference workspace-aware so package scripts such as `bun run lint` do not require globally installed Node CLIs like `expo`, `vite`, or `tsc`.
-- Scan referenced validation scripts, including workspace-relative scripts under `bun --cwd`, so hidden tool dependencies inside commands such as `bun scripts/web-e2e.ts` are detected before validation runs.
-- Run WorkerPal validation commands with writable temp `HOME`, cache, npm, and Expo directories plus non-interactive CI defaults, reducing false sandbox failures from CLIs that write user-level state.
-- Preserve real repo validation failures while reducing false missing-tool blockers for repo-local JavaScript tooling.
-- Add regression coverage for package-script Node CLI inference, hidden validation script scanning, and package-cwd script path resolution.
+- Harden WorkerPal validation tooling inference for JavaScript workspaces that use npm, pnpm, yarn, and Bun workspace command forms.
+- Avoid misclassifying package-manager option values such as `pnpm --filter apps/client test` as script names, while preserving correct root-script inference.
+- Resolve workspace package paths and package names for commands such as `npm --workspace @scope/app run lint`, `npm -w apps/app run lint`, and `yarn workspace @scope/app lint`.
+- Preserve pnpm workspace-root semantics for `pnpm -w test` so `-w` no longer consumes the actual script name.
+- Add regression coverage for workspace path options, equals-form options, scoped workspace package names, pnpm root flags, and generated packaged runtime parity.
 
 ## Install
 
