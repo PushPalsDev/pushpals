@@ -1763,6 +1763,16 @@ var NODE_BACKED_CLI_NAMES = new Set([
   "vitest",
   "webpack"
 ]);
+var BUN_OPTIONS_WITH_VALUE = new Set(["--cwd", "-C"]);
+var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
+  "--cwd",
+  "--dir",
+  "--filter",
+  "--prefix",
+  "--workspace",
+  "-C",
+  "-F"
+]);
 // packages/shared/src/session_event_visibility.ts
 var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 // packages/shared/src/localbuddy_runtime.ts

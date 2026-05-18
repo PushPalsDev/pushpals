@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
-import { isAbsolute, join, normalize } from "path";
+import { isAbsolute, join, normalize, resolve } from "path";
 
 export type ToolchainEnvironmentSource =
   | "devcontainer"
@@ -92,6 +92,17 @@ const DIRECT_TOOL_CANDIDATES: Record<string, string[]> = {
   vitest: ["vitest"],
   yarn: ["yarn"],
 };
+
+const BUN_OPTIONS_WITH_VALUE = new Set(["--cwd", "-C"]);
+const PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
+  "--cwd",
+  "--dir",
+  "--filter",
+  "--prefix",
+  "--workspace",
+  "-C",
+  "-F",
+]);
 
 interface NativeSignals {
   hasC: boolean;
@@ -374,8 +385,9 @@ function resolveBunSubcommand(tokens: string[]): { kind: "run" | "x"; value: str
   let index = 1;
   while (index < tokens.length) {
     const token = tokens[index] ?? "";
-    if (token === "--cwd" || token === "-C") {
-      index += 2;
+    const bunOption = parseOptionWithValue(token, BUN_OPTIONS_WITH_VALUE, tokens[index + 1]);
+    if (bunOption) {
+      index += bunOption.consumed;
       continue;
     }
     if (token.startsWith("--")) {
@@ -402,9 +414,10 @@ function resolvePackageScript(
     let index = 1;
     while (index < tokens.length) {
       const token = tokens[index] ?? "";
-      if ((token === "--cwd" || token === "-C") && tokens[index + 1]) {
-        cwd = join(repoRoot, tokens[index + 1] ?? "");
-        index += 2;
+      const bunOption = parseOptionWithValue(token, BUN_OPTIONS_WITH_VALUE, tokens[index + 1]);
+      if (bunOption) {
+        cwd = resolveWorkspacePath(repoRoot, bunOption.value);
+        index += bunOption.consumed;
         continue;
       }
       if (token.startsWith("--")) {
@@ -426,16 +439,30 @@ function resolvePackageScript(
     while (index < tokens.length) {
       const token = tokens[index] ?? "";
       const normalized = normalizeToolToken(token);
-      if (
-        (token === "--prefix" ||
-          token === "--dir" ||
-          token === "--cwd" ||
-          token === "-C") &&
-        tokens[index + 1]
-      ) {
-        cwd = join(repoRoot, tokens[index + 1] ?? "");
-        index += 2;
+      const packageOption = parseOptionWithValue(
+        token,
+        packageManagerOptionsWithValue(first),
+        tokens[index + 1],
+      );
+      if (packageOption) {
+        if (packageOption.name !== "--filter" && packageOption.name !== "-F") {
+          const optionCwd = resolvePackageOptionCwd(
+            repoRoot,
+            packageOption.name,
+            packageOption.value,
+          );
+          if (!optionCwd && isWorkspacePackageOption(packageOption.name)) return null;
+          if (optionCwd) cwd = optionCwd;
+        }
+        index += packageOption.consumed;
         continue;
+      }
+      if (first === "yarn" && normalized === "workspace" && tokens[index + 2]) {
+        const workspaceCwd = resolveWorkspacePackageCwd(repoRoot, tokens[index + 1] ?? "");
+        if (!workspaceCwd) return null;
+        cwd = workspaceCwd;
+        scriptName = tokens[index + 2] ?? "";
+        break;
       }
       if (normalized === "run") {
         scriptName = tokens[index + 1] ?? "";
@@ -481,6 +508,171 @@ function inferReferencedScriptPaths(repoRoot: string, scriptCwd: string, tokens:
     out.push(resolved);
   }
   return out;
+}
+
+function resolveWorkspacePath(repoRoot: string, pathValue: string): string {
+  return isAbsolute(pathValue) ? normalize(pathValue) : resolve(repoRoot, pathValue);
+}
+
+function resolvePackageOptionCwd(
+  repoRoot: string,
+  optionName: string,
+  optionValue: string,
+): string | null {
+  if (isWorkspacePackageOption(optionName)) {
+    return resolveWorkspacePackageCwd(repoRoot, optionValue);
+  }
+  const optionCwd = resolveWorkspacePath(repoRoot, optionValue);
+  return existsSync(join(optionCwd, "package.json")) ? optionCwd : null;
+}
+
+function resolveWorkspacePackageCwd(repoRoot: string, workspaceRef: string): string | null {
+  const directCwd = resolveWorkspacePath(repoRoot, workspaceRef);
+  if (existsSync(join(directCwd, "package.json"))) return directCwd;
+  for (const candidate of expandWorkspacePackageDirs(repoRoot)) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(candidate, "package.json"), "utf8")) as {
+        name?: unknown;
+      };
+      if (parsed.name === workspaceRef) return candidate;
+    } catch {
+      // Ignore malformed workspace packages; validation will report real repo failures.
+    }
+  }
+  return null;
+}
+
+function expandWorkspacePackageDirs(repoRoot: string, maxPackages = 200): string[] {
+  const packageJsonPath = join(repoRoot, "package.json");
+  if (!existsSync(packageJsonPath)) return [];
+  let patterns: string[] = [];
+  try {
+    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+      workspaces?: unknown;
+    };
+    if (Array.isArray(parsed.workspaces)) {
+      patterns = parsed.workspaces.filter((entry): entry is string => typeof entry === "string");
+    } else if (
+      parsed.workspaces &&
+      typeof parsed.workspaces === "object" &&
+      Array.isArray((parsed.workspaces as { packages?: unknown }).packages)
+    ) {
+      patterns = (parsed.workspaces as { packages: unknown[] }).packages.filter(
+        (entry): entry is string => typeof entry === "string",
+      );
+    }
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const pattern of patterns) {
+    if (out.length >= maxPackages) break;
+    for (const candidate of expandWorkspacePattern(repoRoot, pattern, maxPackages - out.length)) {
+      const key = normalize(candidate);
+      if (seen.has(key) || !existsSync(join(candidate, "package.json"))) continue;
+      seen.add(key);
+      out.push(candidate);
+      if (out.length >= maxPackages) break;
+    }
+  }
+  return out;
+}
+
+function expandWorkspacePattern(repoRoot: string, pattern: string, maxPackages: number): string[] {
+  const normalizedPattern = pattern.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (!normalizedPattern || normalizedPattern.startsWith("!")) return [];
+  const segments = normalizedPattern.split("/").filter(Boolean);
+  let dirs = [repoRoot];
+  for (const segment of segments) {
+    const next: string[] = [];
+    for (const dir of dirs) {
+      if (next.length >= maxPackages) break;
+      if (segment === "**") {
+        next.push(...collectDescendantDirs(dir, Math.max(0, maxPackages - next.length), 3));
+        continue;
+      }
+      if (segment.includes("*")) {
+        const patternRegex = wildcardSegmentRegex(segment);
+        for (const entry of safeReadDir(dir)) {
+          if (next.length >= maxPackages) break;
+          if (!patternRegex.test(entry)) continue;
+          const candidate = join(dir, entry);
+          if (safeIsDirectory(candidate)) next.push(candidate);
+        }
+        continue;
+      }
+      const candidate = join(dir, segment);
+      if (safeIsDirectory(candidate)) next.push(candidate);
+    }
+    dirs = next;
+    if (dirs.length === 0) break;
+  }
+  return dirs;
+}
+
+function collectDescendantDirs(dir: string, limit: number, maxDepth: number): string[] {
+  const out: string[] = [];
+  const visit = (current: string, depth: number) => {
+    if (out.length >= limit || depth > maxDepth) return;
+    for (const entry of safeReadDir(current)) {
+      if (entry === "node_modules" || entry === ".git") continue;
+      const candidate = join(current, entry);
+      if (!safeIsDirectory(candidate)) continue;
+      out.push(candidate);
+      visit(candidate, depth + 1);
+      if (out.length >= limit) return;
+    }
+  };
+  visit(dir, 0);
+  return out;
+}
+
+function safeReadDir(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+function safeIsDirectory(pathValue: string): boolean {
+  try {
+    return statSync(pathValue).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function wildcardSegmentRegex(segment: string): RegExp {
+  return new RegExp(`^${segment.split("*").map(escapeRegExp).join(".*")}$`);
+}
+
+function isWorkspacePackageOption(optionName: string): boolean {
+  return optionName === "--workspace" || optionName === "-w";
+}
+
+function parseOptionWithValue(
+  token: string,
+  optionsWithValue: Set<string>,
+  nextToken?: string,
+): { name: string; value: string; consumed: number } | null {
+  const equalsIndex = token.indexOf("=");
+  if (equalsIndex > 0) {
+    const name = token.slice(0, equalsIndex);
+    if (!optionsWithValue.has(name)) return null;
+    const value = token.slice(equalsIndex + 1);
+    return value ? { name, value, consumed: 1 } : null;
+  }
+  if (!optionsWithValue.has(token) || !nextToken) return null;
+  return { name: token, value: nextToken, consumed: 2 };
+}
+
+function packageManagerOptionsWithValue(packageManager: string): Set<string> {
+  if (packageManager === "npm") {
+    return new Set([...PACKAGE_MANAGER_OPTIONS_WITH_VALUE, "-w"]);
+  }
+  return PACKAGE_MANAGER_OPTIONS_WITH_VALUE;
 }
 
 function normalizeReferencedScriptToken(token: string): string | null {
