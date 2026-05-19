@@ -4,7 +4,9 @@ import {
   collectQualityGateValidationCommands,
   extractRequiredValidationStepsFromVisionMarkdown,
   inferFallbackValidationCommandsForTestTask,
+  isLongRunningBrowserValidationCommand,
   isTestLikeValidationStep,
+  resolveValidationCommandTimeoutMs,
   tokenizeValidationCommandArgv,
 } from "../apps/workerpals/src/execute_job";
 
@@ -161,5 +163,17 @@ describe("workerpals validation command safety", () => {
         { command: "bun test tests/focused.test.ts", ok: true, exitCode: 0 },
       ]),
     ).toEqual(["bun run test:root exited 1"]);
+  });
+
+  test("uses a longer timeout for browser e2e validation commands", () => {
+    expect(isLongRunningBrowserValidationCommand("bun run web:e2e")).toBe(true);
+    expect(isLongRunningBrowserValidationCommand("bunx playwright test")).toBe(true);
+    expect(isLongRunningBrowserValidationCommand("npx cypress run")).toBe(true);
+    expect(isLongRunningBrowserValidationCommand("bun test")).toBe(false);
+    expect(isLongRunningBrowserValidationCommand("bun run lint")).toBe(false);
+
+    expect(resolveValidationCommandTimeoutMs("bun run web:e2e", 180_000)).toBe(600_000);
+    expect(resolveValidationCommandTimeoutMs("bun run lint", 180_000)).toBe(180_000);
+    expect(resolveValidationCommandTimeoutMs("bun run web:e2e", 900_000)).toBe(900_000);
   });
 });

@@ -16,6 +16,7 @@ import {
   parseStructuredResult,
   filterResultLines,
 } from "../common/execution_utils.js";
+import { buildWorkerSandboxWritableEnv } from "../common/sandbox_env.js";
 import { computeTimeoutWarningWindow } from "../timeout_policy.js";
 
 // ---- Script path (resolved relative to this file) ----------------------------
@@ -286,7 +287,7 @@ export async function executeWithOpenHands(
       stdout: "pipe",
       stderr: "pipe",
       env: {
-        ...process.env,
+        ...buildWorkerSandboxWritableEnv(repo),
         PUSHPALS_REPO_PATH: repo,
         PUSHPALS_ASSIGNED_REPO_ROOT: repo,
         PYTHONIOENCODING: "utf-8",

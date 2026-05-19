@@ -18,6 +18,7 @@ import {
   filterResultLines,
   streamLines,
 } from "./execution_utils.js";
+import { buildWorkerSandboxWritableEnv } from "./sandbox_env.js";
 
 interface GenericPythonExecutorConfig {
   backendName: string;
@@ -180,7 +181,7 @@ export function createGenericPythonExecutor(
         stdout: "pipe",
         stderr: "pipe",
         env: {
-          ...process.env,
+          ...buildWorkerSandboxWritableEnv(repo),
           PUSHPALS_REPO_PATH: repo,
           PUSHPALS_ASSIGNED_REPO_ROOT: repo,
           PYTHONIOENCODING: "utf-8",

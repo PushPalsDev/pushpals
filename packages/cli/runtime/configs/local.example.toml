@@ -72,6 +72,8 @@ quality_scope_gate_enabled = true
 quality_validation_gate_enabled = true
 quality_critic_gate_enabled = true
 quality_publish_gate_enabled = true
+# Browser/e2e validation commands get a longer built-in floor (10m) because they
+# may need to start a dev server and run browser automation.
 quality_validation_step_timeout_ms = 180000
 quality_critic_timeout_ms = 45000
 quality_soft_pass_on_exhausted = true

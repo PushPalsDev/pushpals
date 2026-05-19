@@ -3,8 +3,7 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync } from "fs";
-import { tmpdir } from "os";
+import { existsSync, readFileSync, rmSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import {
   deriveAutonomyComponentArea,
@@ -32,6 +31,7 @@ import {
   truncate,
   type OutputCompactionPolicy,
 } from "./common/execution_utils.js";
+import { buildWorkerSandboxWritableEnv } from "./common/sandbox_env.js";
 // Re-export shared utilities for backward compatibility with external consumers.
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
@@ -631,7 +631,7 @@ async function runValidationCommand(
   const startedAt = Date.now();
   const proc = Bun.spawn(argv, {
     cwd: repo,
-    env: buildValidationCommandEnv(repo),
+    env: buildWorkerSandboxWritableEnv(repo),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -661,41 +661,39 @@ async function runValidationCommand(
     ok: !timedOut && exitCode === 0,
     exitCode: timedOut ? 124 : exitCode,
     stdout: compactJobOutput(stdout.trim(), outputPolicy),
-    stderr: compactJobOutput(stderr.trim(), outputPolicy),
+    stderr: compactJobOutput(
+      [
+        stderr.trim(),
+        timedOut
+          ? `Validation command timed out after ${Math.max(1_000, timeoutMs)}ms. Captured output is the process output emitted before PushPals terminated the command.`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      outputPolicy,
+    ),
     elapsedMs: Math.max(1, Date.now() - startedAt),
   };
 }
 
-function buildValidationCommandEnv(repo: string): Record<string, string> {
-  const homeDir = resolve(tmpdir(), "pushpals-validation-home");
-  const cacheDir = resolve(tmpdir(), "pushpals-validation-cache");
-  const expoDir = resolve(tmpdir(), "pushpals-validation-expo");
-  for (const dir of [homeDir, cacheDir, expoDir]) {
-    try {
-      mkdirSync(dir, { recursive: true });
-    } catch {
-      // Keep validation best-effort; the command output will expose any real env blocker.
-    }
-  }
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === "string") env[key] = value;
-  }
-  return {
-    ...env,
-    HOME: homeDir,
-    USERPROFILE: homeDir,
-    XDG_CACHE_HOME: cacheDir,
-    npm_config_cache: resolve(cacheDir, "npm"),
-    EXPO_HOME: expoDir,
-    EXPO_NO_TELEMETRY: process.env.EXPO_NO_TELEMETRY ?? "1",
-    EXPO_NO_INTERACTIVE: process.env.EXPO_NO_INTERACTIVE ?? "1",
-    CI: process.env.CI ?? "1",
-    BROWSER: process.env.BROWSER ?? "none",
-    EXPO_DEV_SERVER_PORT: process.env.EXPO_DEV_SERVER_PORT ?? "19006",
-    RCT_METRO_PORT: process.env.RCT_METRO_PORT ?? "19006",
-    PUSHPALS_VALIDATION_REPO: repo,
-  };
+export function isLongRunningBrowserValidationCommand(command: string): boolean {
+  const normalized = validationCommandKey(command);
+  if (!normalized) return false;
+  const tokens = tokenizeValidationCommandArgv(command)?.map((token) => token.toLowerCase()) ?? [];
+  const joined = tokens.join(" ");
+  return (
+    /\b(web:e2e|e2e:web|browser:e2e|smoke:web|web:smoke|browser:smoke)\b/.test(normalized) ||
+    /\b(playwright|cypress)\b/.test(joined) ||
+    (/\bexpo\b/.test(joined) && /\b(web|start)\b/.test(joined))
+  );
+}
+
+export function resolveValidationCommandTimeoutMs(command: string, baseTimeoutMs: number): number {
+  const normalizedBase = Number.isFinite(Number(baseTimeoutMs))
+    ? Math.max(1_000, Math.min(7_200_000, Math.floor(Number(baseTimeoutMs))))
+    : 180_000;
+  if (!isLongRunningBrowserValidationCommand(command)) return normalizedBase;
+  return Math.max(normalizedBase, 600_000);
 }
 
 interface ToolAvailabilityResult {
@@ -1400,7 +1398,7 @@ async function runDeterministicQualityGate(
       const run = await runValidationCommand(
         repo,
         command,
-        qualityValidationStepTimeoutMs,
+        resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
         outputPolicy,
       );
       validationRuns.push(run);
@@ -3499,6 +3497,7 @@ async function generateCommitMessageFromDiffViaCodex(
     const stdinText = `${prompt.systemPrompt}\n\n${prompt.userMessage}`;
     const proc = Bun.spawn(cmd, {
       cwd: repo,
+      env: buildWorkerSandboxWritableEnv(repo),
       stdout: "pipe",
       stderr: "pipe",
       stdin: new Blob([stdinText]),
@@ -4163,6 +4162,7 @@ async function runCodexCriticReview(
   try {
     const proc = Bun.spawn(cmd, {
       cwd: repo,
+      env: buildWorkerSandboxWritableEnv(repo),
       stdout: "pipe",
       stderr: "pipe",
       stdin: new Blob([criticInstruction]),
