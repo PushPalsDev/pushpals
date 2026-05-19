@@ -182,6 +182,16 @@ describe("workerpals quality gate critic issue formatting", () => {
 
     expect(
       shouldReviseRequiredValidationBlocker({
+        requiredValidationFailures: ["bun test exited 1"],
+        blocker: { category: "repo", detail: "missing imported file" },
+        revisionAttempt: 0,
+        maxAutoRevisions: 3,
+        outsideTaskScope: true,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldReviseRequiredValidationBlocker({
         requiredValidationFailures: ["bun run web:e2e exited 124"],
         blocker: { category: "environment", detail: "missing browser runtime" },
         revisionAttempt: 0,

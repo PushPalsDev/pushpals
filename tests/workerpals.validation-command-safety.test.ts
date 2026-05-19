@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
+  classifyValidationFailureScope,
   collectRequiredValidationFailures,
   collectQualityGateValidationCommands,
   extractRequiredValidationStepsFromVisionMarkdown,
+  extractValidationFailureDigest,
   inferFallbackValidationCommandsForTestTask,
   isLongRunningBrowserValidationCommand,
+  isTestFocusedTask,
   isTestLikeValidationStep,
+  prepareValidationCommandArgv,
   resolveValidationCommandTimeoutMs,
   tokenizeValidationCommandArgv,
 } from "../apps/workerpals/src/execute_job";
@@ -115,6 +119,23 @@ describe("workerpals validation command safety", () => {
     expect(commands.fallbackValidationSteps).toEqual([]);
   });
 
+  test("dedupes equivalent bun x and bunx validation commands", () => {
+    const planning = planningFixture({
+      validationSteps: ["bunx tsc --noEmit"],
+      requiredValidationSteps: ["bun x tsc --noEmit"],
+    }) as any;
+
+    const commands = collectQualityGateValidationCommands({
+      instruction: "Improve a UI surface",
+      targetPath: "app/game.tsx",
+      planning,
+      changedTestPaths: [],
+      isTestTask: false,
+    });
+
+    expect(commands.commandsToRun).toEqual(["bun x tsc --noEmit"]);
+  });
+
   test("keeps focused fallback validation for test-focused work when planner omits a runnable step", () => {
     const planning = planningFixture({
       validationSteps: ["Inspect the changed test"],
@@ -159,10 +180,81 @@ describe("workerpals validation command safety", () => {
   test("treats failed vision-required validation commands as publish blockers", () => {
     expect(
       collectRequiredValidationFailures(["bun run test:root"], [
-        { command: "bun run test:root", ok: false, exitCode: 1 },
+        {
+          command: "bun run test:root",
+          ok: false,
+          exitCode: 1,
+          stderr: "Cannot find module '../../tests/reactNativeMock'",
+        },
         { command: "bun test tests/focused.test.ts", ok: true, exitCode: 0 },
-      ]),
-    ).toEqual(["bun run test:root exited 1"]);
+      ] as any),
+    ).toEqual([
+      "bun run test:root exited 1 (Cannot find module '../../tests/reactNativeMock')",
+    ]);
+  });
+
+  test("extracts actionable validation failure digests", () => {
+    expect(
+      extractValidationFailureDigest({
+        command: "bun run web:e2e",
+        step: "bun run web:e2e",
+        ok: false,
+        exitCode: 1,
+        stdout: "",
+        stderr: "Error: ERR_SOCKET_BAD_PORT at port 65536",
+        elapsedMs: 20,
+      }),
+    ).toBe("ERR_SOCKET_BAD_PORT at port 65536");
+  });
+
+  test("classifies validation failures outside the task write scope", () => {
+    const planning = planningFixture({
+      targetPaths: ["app/game.tsx"],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["app/game.tsx"],
+      },
+    }) as any;
+
+    expect(
+      classifyValidationFailureScope(
+        [
+          {
+            step: "bun test",
+            command: "bun test",
+            ok: false,
+            exitCode: 1,
+            stdout: "",
+            stderr:
+              "components/__tests__/AnimatedSelectionRing.test.tsx: Cannot find module '../../tests/reactNativeMock'",
+            elapsedMs: 100,
+          },
+        ],
+        planning,
+        ["app/game.tsx"],
+        "app/game.tsx",
+      ),
+    ).toBe("outside_task_scope");
+
+    expect(
+      classifyValidationFailureScope(
+        [
+          {
+            step: "bun x tsc --noEmit",
+            command: "bun x tsc --noEmit",
+            ok: false,
+            exitCode: 2,
+            stdout: "",
+            stderr: "app/game.tsx(12,7): error TS2322: Type 'string' is not assignable.",
+            elapsedMs: 100,
+          },
+        ],
+        planning,
+        ["app/game.tsx"],
+        "app/game.tsx",
+      ),
+    ).toBe("task_scope");
   });
 
   test("uses a longer timeout for browser e2e validation commands", () => {
@@ -175,5 +267,51 @@ describe("workerpals validation command safety", () => {
     expect(resolveValidationCommandTimeoutMs("bun run web:e2e", 180_000)).toBe(600_000);
     expect(resolveValidationCommandTimeoutMs("bun run lint", 180_000)).toBe(180_000);
     expect(resolveValidationCommandTimeoutMs("bun run web:e2e", 900_000)).toBe(900_000);
+  });
+
+  test("injects the sandbox Expo port into browser script validation commands", () => {
+    expect(
+      prepareValidationCommandArgv("bun run web:e2e", {
+        EXPO_DEV_SERVER_PORT: "19444",
+      }),
+    ).toEqual(["bun", "run", "web:e2e", "--", "--port", "19444"]);
+
+    expect(
+      prepareValidationCommandArgv("bun run web:e2e -- --port 19111", {
+        EXPO_DEV_SERVER_PORT: "19444",
+      }),
+    ).toEqual(["bun", "run", "web:e2e", "--", "--port", "19111"]);
+
+    expect(
+      prepareValidationCommandArgv("bunx playwright test", {
+        EXPO_DEV_SERVER_PORT: "19444",
+      }),
+    ).toEqual(["bunx", "playwright", "test"]);
+  });
+
+  test("does not classify ordinary UI work with validation criteria as test-focused", () => {
+    expect(
+      isTestFocusedTask(
+        "Modify only app/game.tsx. Deliver one small, observable battlefield readability improvement. Validate with the required repo checks.",
+        planningFixture({
+          acceptanceCriteria: [
+            "Improve battlefield readability",
+            "Run the required validation checks",
+          ],
+          validationSteps: ["bun test", "bun run web:e2e"],
+        }) as any,
+        "app/game.tsx",
+      ),
+    ).toBe(false);
+
+    expect(
+      isTestFocusedTask(
+        "Add regression tests for the worker validation runner",
+        planningFixture({
+          acceptanceCriteria: ["Add coverage for validation command handling"],
+        }) as any,
+        "tests/workerpals.validation-command-safety.test.ts",
+      ),
+    ).toBe(true);
   });
 });

@@ -65,7 +65,7 @@ export interface TaskExecutePlanning {
   finalizationBudgetMs: number;
 }
 
-interface ValidationExecutionResult {
+export interface ValidationExecutionResult {
   step: string;
   command: string;
   ok: boolean;
@@ -91,6 +91,7 @@ interface DeterministicQualityResult {
   validationRuns: ValidationExecutionResult[];
   requiredValidationFailures: string[];
   blocker: ValidationBlocker | null;
+  validationFailureScope: "none" | "task_scope" | "outside_task_scope";
 }
 
 interface CriticReview {
@@ -137,9 +138,11 @@ export function shouldReviseRequiredValidationBlocker(opts: {
   blocker: ValidationBlocker | null;
   revisionAttempt: number;
   maxAutoRevisions: number;
+  outsideTaskScope?: boolean;
 }): boolean {
   if (opts.requiredValidationFailures.length === 0) return false;
   if (!opts.blocker) return false;
+  if (opts.outsideTaskScope) return false;
   if (opts.blocker.category !== "repo") return false;
   return opts.revisionAttempt < opts.maxAutoRevisions;
 }
@@ -615,7 +618,8 @@ async function runValidationCommand(
   timeoutMs: number,
   outputPolicy: Partial<OutputCompactionPolicy>,
 ): Promise<ValidationExecutionResult> {
-  const argv = tokenizeValidationCommandArgv(command);
+  const env = buildWorkerSandboxWritableEnv(repo);
+  const argv = prepareValidationCommandArgv(command, env);
   if (!argv) {
     return {
       step: command,
@@ -631,7 +635,7 @@ async function runValidationCommand(
   const startedAt = Date.now();
   const proc = Bun.spawn(argv, {
     cwd: repo,
-    env: buildWorkerSandboxWritableEnv(repo),
+    env,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -694,6 +698,35 @@ export function resolveValidationCommandTimeoutMs(command: string, baseTimeoutMs
     : 180_000;
   if (!isLongRunningBrowserValidationCommand(command)) return normalizedBase;
   return Math.max(normalizedBase, 600_000);
+}
+
+function commandHasPortArg(argv: string[]): boolean {
+  return argv.some((token) => token === "--port" || token.startsWith("--port="));
+}
+
+function shouldInjectBrowserValidationPort(command: string, argv: string[]): boolean {
+  if (commandHasPortArg(argv)) return false;
+  if (!isLongRunningBrowserValidationCommand(command)) return false;
+  return /\b(web:e2e|e2e:web|browser:e2e|smoke:web|web:smoke|browser:smoke)\b/.test(
+    validationCommandKey(command),
+  );
+}
+
+export function prepareValidationCommandArgv(
+  command: string,
+  env: Record<string, string>,
+): string[] | null {
+  const argv = tokenizeValidationCommandArgv(command);
+  if (!argv) return null;
+  const port = String(env.EXPO_DEV_SERVER_PORT ?? "").trim();
+  if (!port || !shouldInjectBrowserValidationPort(command, argv)) return argv;
+  return [...argv, "--", "--port", port];
+}
+
+function isBrowserValidationInfrastructureDigest(digest: string): boolean {
+  return /\b(ERR_SOCKET_BAD_PORT|EADDRINUSE|ECONNREFUSED|ECONNRESET|ETIMEDOUT|timed out|timeout|port|browser runtime|playwright install|executable doesn't exist)\b/i.test(
+    digest,
+  );
 }
 
 interface ToolAvailabilityResult {
@@ -800,6 +833,96 @@ function extractPreparedMergeConflictPaths(params: Record<string, unknown>): str
   return preparedPaths
     .map((entry) => String(entry ?? "").trim().replace(/\\/g, "/"))
     .filter(Boolean);
+}
+
+function normalizeValidationPathToken(value: string): string | null {
+  const normalized = value
+    .trim()
+    .replace(/^['"`(<[]+/, "")
+    .replace(/[>'"`)\],.;:]+$/, "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/");
+  if (!normalized || normalized.startsWith("../") || normalized.includes("/../")) return null;
+  if (!/[./]/.test(normalized)) return null;
+  if (/^(https?|file):/i.test(normalized)) return null;
+  return normalized;
+}
+
+function extractPathTokensFromValidationOutput(value: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const add = (raw: string | undefined) => {
+    if (!raw) return;
+    const normalized = normalizeValidationPathToken(raw);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push(normalized);
+  };
+  const normalized = stripAnsiControlSequences(value);
+  for (const match of normalized.matchAll(/[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+(?:\.[A-Za-z0-9_.-]+)?/g)) {
+    add(match[0]);
+  }
+  for (const match of normalized.matchAll(/(?:from|in|at)\s+['"`]?([^'"`\s]+\/[^'"`\s]+)['"`]?/gi)) {
+    add(match[1]);
+  }
+  return out;
+}
+
+function literalScopePrefix(value: string): string | null {
+  const normalized = normalizeValidationPathToken(value.replace(/\*\*?.*$/, "").replace(/\/+$/, ""));
+  if (!normalized || normalized === ".") return null;
+  return normalized;
+}
+
+function pathMatchesScopeHint(path: string, hint: string): boolean {
+  const normalizedPath = normalizeValidationPathToken(path);
+  const normalizedHint = hint.trim().replace(/\\/g, "/").replace(/^\.\/+/, "");
+  if (!normalizedPath || !normalizedHint) return false;
+  if (matchesGlob(normalizedPath, normalizedHint)) return true;
+  const prefix = literalScopePrefix(normalizedHint);
+  if (!prefix) return false;
+  return normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`);
+}
+
+export function classifyValidationFailureScope(
+  runs: ValidationExecutionResult[],
+  planning: TaskExecutePlanning,
+  changedPaths: string[],
+  targetPath?: string,
+): "none" | "task_scope" | "outside_task_scope" {
+  const failedRuns = runs.filter((run) => !run.ok && run.exitCode !== 127);
+  if (failedRuns.length === 0) return "none";
+  const scopeHints = [
+    targetPath ?? "",
+    ...changedPaths,
+    ...(planning.targetPaths ?? []),
+    ...(planning.scope.writeGlobs ?? []),
+  ]
+    .map((entry) => entry.trim().replace(/\\/g, "/"))
+    .filter(Boolean);
+  if (scopeHints.length === 0) return "none";
+
+  const combined = failedRuns
+    .flatMap((run) => [run.stdout, run.stderr])
+    .filter(Boolean)
+    .join("\n");
+  const lowerCombined = combined.toLowerCase().replace(/\\/g, "/");
+  for (const hint of scopeHints) {
+    const normalized = literalScopePrefix(hint);
+    if (normalized && normalized.length >= 4 && lowerCombined.includes(normalized.toLowerCase())) {
+      return "task_scope";
+    }
+  }
+
+  const pathTokens = extractPathTokensFromValidationOutput(combined).filter(
+    (token) => !/^(node_modules|\.bun|bun|npm|pnpm|yarn)\//i.test(token),
+  );
+  if (pathTokens.length === 0) return "none";
+  if (pathTokens.some((token) => scopeHints.some((hint) => pathMatchesScopeHint(token, hint)))) {
+    return "task_scope";
+  }
+  return "outside_task_scope";
 }
 
 function detectValidationBlocker(runs: ValidationExecutionResult[]): ValidationBlocker | null {
@@ -982,7 +1105,51 @@ function extractRunnableValidationCommand(step: string): string | null {
 }
 
 function validationCommandKey(command: string): string {
-  return command.trim().replace(/\s+/g, " ").toLowerCase();
+  const argv = tokenizeValidationCommandArgv(command);
+  if (argv && argv.length > 0) {
+    const normalized = argv.map((entry) => entry.trim()).filter(Boolean);
+    if (normalized[0]?.toLowerCase() === "bunx") {
+      normalized.splice(0, 1, "bun", "x");
+    }
+    return normalized.join(" ").replace(/\s+/g, " ").toLowerCase();
+  }
+  return command
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/^bunx\b/i, "bun x")
+    .toLowerCase();
+}
+
+export function extractValidationFailureDigest(run: {
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  elapsedMs?: number;
+}): string {
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  const patterns = [
+    /\bCannot find module\s+['"`][^'"`\r\n]+['"`][^\r\n]*/i,
+    /\bFailed to resolve import\s+['"`][^'"`\r\n]+['"`][^\r\n]*/i,
+    /\bCould not resolve\s+['"`]?[^'"`\r\n]+['"`]?[^\r\n]*/i,
+    /\bModule not found[^\r\n]*/i,
+    /\bERR_SOCKET_BAD_PORT[^\r\n]*/i,
+    /\berror TS\d+:[^\r\n]*/i,
+    /\bError:\s+[^\r\n]*/i,
+  ];
+  for (const pattern of patterns) {
+    const match = combined.match(pattern);
+    if (match?.[0]) return toSingleLine(match[0], 180);
+  }
+  const firstMeaningfulLine = combined
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /\b(error|failed|cannot|could not|timeout|timed out)\b/i.test(line));
+  if (firstMeaningfulLine) return toSingleLine(firstMeaningfulLine, 180);
+  if (Number(run.exitCode) === 124) {
+    const elapsed = Number.isFinite(Number(run.elapsedMs)) ? ` after ${Number(run.elapsedMs)}ms` : "";
+    return `timed out${elapsed}`;
+  }
+  return "";
 }
 
 export function collectRequiredValidationFailures(
@@ -995,7 +1162,8 @@ export function collectRequiredValidationFailures(
     .filter((run) => requiredKeys.has(validationCommandKey(run.command)) && !run.ok)
     .map((run) => {
       const exitCode = Number.isFinite(Number(run.exitCode)) ? Number(run.exitCode) : "unknown";
-      return `${run.command} exited ${exitCode}`;
+      const digest = extractValidationFailureDigest(run);
+      return `${run.command} exited ${exitCode}${digest ? ` (${digest})` : ""}`;
     });
 }
 
@@ -1055,7 +1223,7 @@ function dedupeValidationCommands(...groups: string[][]): string[] {
     for (const command of group) {
       const trimmed = command.trim();
       if (!trimmed) continue;
-      const key = trimmed.toLowerCase();
+      const key = validationCommandKey(trimmed);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(trimmed);
@@ -1160,14 +1328,19 @@ export function inferFallbackValidationCommandsForTestTask(
   return candidates.slice(0, 4);
 }
 
-function isTestFocusedTask(
+export function isTestFocusedTask(
   instruction: string,
   planning: TaskExecutePlanning,
   targetPath?: string,
 ): boolean {
   const lowerInstruction = instruction.toLowerCase();
   if (
-    /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/.test(lowerInstruction)
+    /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/.test(
+      lowerInstruction,
+    ) ||
+    /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b.{0,80}\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b/.test(
+      lowerInstruction,
+    )
   ) {
     return true;
   }
@@ -1179,7 +1352,9 @@ function isTestFocusedTask(
   if (pathHints.some((entry) => isLikelyTestPath(entry))) return true;
   if (
     planning.acceptanceCriteria.some((entry) =>
-      /\b(test|tests|coverage|unit|integration|negative|invalid|valid)\b/i.test(entry),
+      /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/i.test(
+        entry,
+      ),
     )
   ) {
     return true;
@@ -1217,6 +1392,10 @@ async function runDeterministicQualityGate(
   runtimeConfig: WorkerpalsRuntimeConfig,
   qualityGatePolicy: QualityGatePolicy,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  validationRetryState?: {
+    previousFailureDigests?: Map<string, string>;
+    revisionAttempt?: number;
+  },
 ): Promise<DeterministicQualityResult> {
   const instruction = String(params.instruction ?? "");
   const targetPath = String(params.targetPath ?? params.path ?? "").trim() || undefined;
@@ -1245,6 +1424,7 @@ async function runDeterministicQualityGate(
       validationRuns: [],
       requiredValidationFailures: [],
       blocker: null,
+      validationFailureScope: "none",
     };
   }
 
@@ -1394,6 +1574,33 @@ async function runDeterministicQualityGate(
         );
         continue;
       }
+      const previousDigest = validationRetryState?.previousFailureDigests?.get(
+        validationCommandKey(command),
+      );
+      if (
+        previousDigest &&
+        Number(validationRetryState?.revisionAttempt ?? 0) > 0 &&
+        isLongRunningBrowserValidationCommand(command) &&
+        isBrowserValidationInfrastructureDigest(previousDigest)
+      ) {
+        const stderr =
+          `Skipped repeated browser validation after the same command failed in an earlier revision: ${previousDigest}. ` +
+          "Run it once after the underlying blocker changes.";
+        validationRuns.push({
+          step: command,
+          command,
+          ok: false,
+          exitCode: 124,
+          stdout: "",
+          stderr,
+          elapsedMs: 1,
+        });
+        onLog?.(
+          "stderr",
+          `[ValidationGate] Skipped repeated long browser validation: ${command} (${previousDigest})`,
+        );
+        continue;
+      }
       onLog?.("stdout", `[ValidationGate] Running "${command}"`);
       const run = await runValidationCommand(
         repo,
@@ -1402,7 +1609,8 @@ async function runDeterministicQualityGate(
         outputPolicy,
       );
       validationRuns.push(run);
-      const runSummary = `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
+      const digest = run.ok ? "" : extractValidationFailureDigest(run);
+      const runSummary = `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`;
       onLog?.(run.ok ? "stdout" : "stderr", runSummary);
     }
     // exit 127 = command not found: separate tool-availability issues from real test failures.
@@ -1442,6 +1650,15 @@ async function runDeterministicQualityGate(
   const blocker = qualityGatePolicy.validationGateEnabled
     ? detectValidationBlocker(validationRuns)
     : null;
+  const scopedValidationFailure = qualityGatePolicy.validationGateEnabled
+    ? classifyValidationFailureScope(validationRuns, planning, changedPaths, targetPath)
+    : "none";
+  if (scopedValidationFailure === "outside_task_scope") {
+    onLog?.(
+      "stderr",
+      "[ValidationGate] Required validation failures appear outside the task write scope; treating them as publish blockers, not repair instructions.",
+    );
+  }
 
   return {
     ok: issues.length === 0 && blocker === null,
@@ -1454,6 +1671,7 @@ async function runDeterministicQualityGate(
     validationRuns,
     requiredValidationFailures,
     blocker,
+    validationFailureScope: scopedValidationFailure,
   };
 }
 
@@ -3460,9 +3678,10 @@ async function generateCommitMessageFromDiffViaCodex(
   repo: string,
   runtimeConfig: WorkerpalsRuntimeConfig,
 ): Promise<string | null> {
+  const model = runtimeConfig.workerpals.llm.model.trim();
+  if (!model) return null;
   const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
   if (!codexPrefix) return null;
-  const model = runtimeConfig.workerpals.llm.model.trim();
   const timeoutMs = (() => {
     const value = Number(runtimeConfig.workerpals.llm.codexTimeoutMs);
     if (!Number.isFinite(value)) return 120_000;
@@ -4368,6 +4587,7 @@ export async function executeJob(
 
   let revisionAttempt = 0;
   let revisionHint = "";
+  const previousValidationFailureDigests = new Map<string, string>();
   while (revisionAttempt <= qualityRevisionLoopMax) {
     const attemptParams: Record<string, unknown> = { ...normalizedParams };
     if (revisionHint) {
@@ -4462,30 +4682,66 @@ export async function executeJob(
       runtimeConfig,
       qualityGatePolicy,
       onLog,
+      {
+        previousFailureDigests: previousValidationFailureDigests,
+        revisionAttempt,
+      },
     );
+    for (const run of quality.validationRuns) {
+      if (run.ok) continue;
+      const digest = extractValidationFailureDigest(run);
+      if (digest) previousValidationFailureDigests.set(validationCommandKey(run.command), digest);
+    }
+    const validationOutsideTaskScope =
+      quality.validationFailureScope === "outside_task_scope";
+    const qualityForCritic: DeterministicQualityResult = validationOutsideTaskScope
+      ? {
+          ...quality,
+          issues: quality.issues.filter((issue) => !issue.startsWith("ValidationGate:")),
+          validationIssues: [],
+          validationRuns: [],
+          blocker: null,
+        }
+      : quality;
     const critic =
       quality.skipped || !qualityGatePolicy.criticGateEnabled
         ? null
         : executor === "openai_codex"
-          ? await runCodexCriticReview(repo, attemptParams, quality, runtimeConfig, onLog)
-          : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
+          ? await runCodexCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog)
+          : await runTaskCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog);
     if (!qualityGatePolicy.criticGateEnabled) {
       onLog?.("stdout", "[CriticGate] Disabled by workerpals.quality_critic_gate_enabled=false.");
     }
-    const effectiveQualityIssues = relaxAdvisoryQualityIssues(
+    const advisoryRelaxedQualityIssues = relaxAdvisoryQualityIssues(
       quality.issues,
       quality.validationRuns,
       critic,
       qualityCriticMinScore,
     );
-    if (effectiveQualityIssues.length !== quality.issues.length) {
+    let effectiveQualityIssues = advisoryRelaxedQualityIssues;
+    if (validationOutsideTaskScope) {
+      effectiveQualityIssues = effectiveQualityIssues.filter(
+        (issue) => !issue.startsWith("ValidationGate:"),
+      );
+      if (effectiveQualityIssues.length !== quality.issues.length) {
+        onLog?.(
+          "stderr",
+          "[ValidationGate] Validation failures are outside the task scope; they will block publishing but will not drive another code revision.",
+        );
+      }
+    }
+    if (
+      !validationOutsideTaskScope &&
+      advisoryRelaxedQualityIssues.length !== quality.issues.length
+    ) {
       onLog?.(
         "stdout",
         "[QualityGate] Assertion-balance heuristic downgraded to advisory because validation passed and critic score met threshold.",
       );
     }
     const deterministicRequiresRevision =
-      effectiveQualityIssues.length > 0 || quality.blocker !== null;
+      effectiveQualityIssues.length > 0 ||
+      (quality.blocker !== null && !validationOutsideTaskScope);
     const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
     if (
       !qualityGatePolicy.publishGateEnabled &&
@@ -4513,6 +4769,29 @@ export async function executeJob(
     }
 
     if (!deterministicRequiresRevision && !criticRequiresRevision) {
+      if (quality.requiredValidationFailures.length > 0) {
+        const requiredSummary = `Required vision.md validation blocked publishing: ${quality.requiredValidationFailures.join("; ")}`;
+        const diagnostics = truncate(
+          [
+            result.stderr ?? "",
+            validationOutsideTaskScope
+              ? "Validation failures appear outside the task write scope and are treated as pre-existing repo blockers."
+              : "",
+            ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
+        );
+        onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
+        return {
+          ok: false,
+          summary: requiredSummary,
+          stdout: result.stdout,
+          stderr: diagnostics,
+          exitCode: 4,
+        };
+      }
       if (critic) {
         onLog?.(
           "stdout",
@@ -4538,11 +4817,13 @@ export async function executeJob(
     const activeMaxAutoRevisions = revisionLimitForQualityGateFailures({
       policy: qualityGatePolicy,
       qualityIssues: effectiveQualityIssues,
-      requiredValidationFailures: quality.requiredValidationFailures,
-      blocker: quality.blocker,
+      requiredValidationFailures: validationOutsideTaskScope
+        ? []
+        : quality.requiredValidationFailures,
+      blocker: validationOutsideTaskScope ? null : quality.blocker,
     });
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
-    if (quality.blocker) {
+    if (quality.blocker && !validationOutsideTaskScope) {
       const blockerSummary = `Quality gate blocked by ${quality.blocker.category} issue: ${quality.blocker.detail}`;
       const blockerDiagnostics = truncate(
         [
@@ -4556,6 +4837,7 @@ export async function executeJob(
         blocker: quality.blocker,
         revisionAttempt,
         maxAutoRevisions: qualityValidationMaxAutoRevisions,
+        outsideTaskScope: validationOutsideTaskScope,
       });
       if (requiredValidationCanRevise) {
         onLog?.(
@@ -4669,8 +4951,8 @@ export async function executeJob(
       critic,
       planning,
       reviewFixContext,
-      quality.validationRuns,
-      quality.blocker,
+      validationOutsideTaskScope ? [] : quality.validationRuns,
+      validationOutsideTaskScope ? null : quality.blocker,
     );
     onLog?.(
       "stderr",

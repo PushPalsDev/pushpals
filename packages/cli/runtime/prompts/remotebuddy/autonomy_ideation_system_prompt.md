@@ -57,6 +57,8 @@ Constraints:
 - `feature_hypotheses` may contain any suitable product/engineering features; keep each item concise and actionable.
 - target_paths must be literal repo-relative paths.
 - write_globs must be repo-relative globs.
+- Choose target_paths that own the behavior being improved, not thin route wrappers, re-export files, or shell components, unless the requested change is explicitly at that wrapper boundary.
+- For UI/game/product-surface objectives, prefer files that render or compute the relevant state directly; use wrapper files only for navigation, mounting, or screen-level chrome work.
 - do not invent evidence ids.
 - If all signals are low/noisy, it is valid to return zero candidates.
 - Treat a low `sig_queue_health` value as maintenance-window evidence for safe proactive work, not only incident response.
