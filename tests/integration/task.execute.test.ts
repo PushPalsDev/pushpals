@@ -48,6 +48,22 @@ function installTestBackendExecutor(executor: BackendTaskExecutor): Cleanup {
   };
 }
 
+function disableQualityGates(
+  runtimeConfig: ReturnType<typeof loadPushPalsConfig>,
+): WorkerpalsRuntimeConfig {
+  return {
+    ...runtimeConfig,
+    workerpals: {
+      ...runtimeConfig.workerpals,
+      executor: TEST_BACKEND,
+      qualityScopeGateEnabled: false,
+      qualityValidationGateEnabled: false,
+      qualityCriticGateEnabled: false,
+      qualityPublishGateEnabled: false,
+    },
+  };
+}
+
 function createTaskExecuteParams(): Record<string, unknown> {
   return {
     schemaVersion: 2,
@@ -79,13 +95,7 @@ describe("task.execute integration harness", () => {
   test("returns executor result and forwards logs", async () => {
     const runtimeConfig = loadPushPalsConfig({ reload: true });
 
-    const testRuntimeConfig: WorkerpalsRuntimeConfig = {
-      ...runtimeConfig,
-      workerpals: {
-        ...runtimeConfig.workerpals,
-        executor: TEST_BACKEND,
-      },
-    };
+    const testRuntimeConfig = disableQualityGates(runtimeConfig);
 
     const stubResult = {
       ok: true,
@@ -158,13 +168,7 @@ describe("task.execute integration harness", () => {
   test("unregister backend executors removes the binding", async () => {
     const runtimeConfig = loadPushPalsConfig({ reload: true });
 
-    const testRuntimeConfig: WorkerpalsRuntimeConfig = {
-      ...runtimeConfig,
-      workerpals: {
-        ...runtimeConfig.workerpals,
-        executor: TEST_BACKEND,
-      },
-    };
+    const testRuntimeConfig = disableQualityGates(runtimeConfig);
 
     const stubResult = {
       ok: true,

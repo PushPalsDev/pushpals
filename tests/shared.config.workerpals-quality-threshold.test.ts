@@ -99,7 +99,7 @@ describe("shared config workerpals quality critic threshold parsing", () => {
     }
   });
 
-  test("defaults workerpals.quality_max_auto_revisions to 1 when unset", () => {
+  test("defaults workerpals.quality_max_auto_revisions to 3 when unset", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
     const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
@@ -109,7 +109,12 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
     try {
       const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
-      expect(cfg.workerpals.qualityMaxAutoRevisions).toBe(1);
+      expect(cfg.workerpals.qualityMaxAutoRevisions).toBe(3);
+      expect(cfg.workerpals.qualityValidationMaxAutoRevisions).toBe(3);
+      expect(cfg.workerpals.qualityScopeGateEnabled).toBe(true);
+      expect(cfg.workerpals.qualityValidationGateEnabled).toBe(true);
+      expect(cfg.workerpals.qualityCriticGateEnabled).toBe(true);
+      expect(cfg.workerpals.qualityPublishGateEnabled).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -135,6 +140,11 @@ describe("shared config workerpals quality critic threshold parsing", () => {
         "output_max_lines = 900",
         "output_max_head_lines = 90",
         "quality_validation_step_timeout_ms = 210000",
+        "quality_validation_max_auto_revisions = 3",
+        "quality_scope_gate_enabled = false",
+        "quality_validation_gate_enabled = true",
+        "quality_critic_gate_enabled = false",
+        "quality_publish_gate_enabled = true",
         "quality_critic_timeout_ms = 55000",
         "quality_critic_min_score = 8.7",
         "quality_critic_max_diff_chars = 32000",
@@ -150,6 +160,11 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       "WORKERPALS_OUTPUT_MAX_LINES",
       "WORKERPALS_OUTPUT_MAX_HEAD_LINES",
       "WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS",
+      "WORKERPALS_QUALITY_VALIDATION_MAX_AUTO_REVISIONS",
+      "WORKERPALS_QUALITY_SCOPE_GATE_ENABLED",
+      "WORKERPALS_QUALITY_VALIDATION_GATE_ENABLED",
+      "WORKERPALS_QUALITY_CRITIC_GATE_ENABLED",
+      "WORKERPALS_QUALITY_PUBLISH_GATE_ENABLED",
       "WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS",
       "WORKERPALS_QUALITY_CRITIC_MIN_SCORE",
       "WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS",
@@ -169,6 +184,11 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       expect(cfg.workerpals.outputMaxLines).toBe(900);
       expect(cfg.workerpals.outputMaxHeadLines).toBe(90);
       expect(cfg.workerpals.qualityValidationStepTimeoutMs).toBe(210000);
+      expect(cfg.workerpals.qualityValidationMaxAutoRevisions).toBe(3);
+      expect(cfg.workerpals.qualityScopeGateEnabled).toBe(false);
+      expect(cfg.workerpals.qualityValidationGateEnabled).toBe(true);
+      expect(cfg.workerpals.qualityCriticGateEnabled).toBe(false);
+      expect(cfg.workerpals.qualityPublishGateEnabled).toBe(true);
       expect(cfg.workerpals.qualityCriticTimeoutMs).toBe(55000);
       expect(cfg.workerpals.qualityCriticMinScore).toBe(8.7);
       expect(cfg.workerpals.qualityCriticMaxDiffChars).toBe(32000);
@@ -292,6 +312,11 @@ describe("shared config workerpals quality critic threshold parsing", () => {
         "output_max_lines = 600",
         "output_max_head_lines = 120",
         "quality_validation_step_timeout_ms = 180000",
+        "quality_validation_max_auto_revisions = 3",
+        "quality_scope_gate_enabled = true",
+        "quality_validation_gate_enabled = true",
+        "quality_critic_gate_enabled = true",
+        "quality_publish_gate_enabled = true",
         "quality_critic_timeout_ms = 45000",
         "quality_critic_min_score = 8.0",
         "quality_critic_max_diff_chars = 16000",
@@ -309,6 +334,11 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       WORKERPALS_OUTPUT_MAX_LINES: "700",
       WORKERPALS_OUTPUT_MAX_HEAD_LINES: "70",
       WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS: "222000",
+      WORKERPALS_QUALITY_VALIDATION_MAX_AUTO_REVISIONS: "2",
+      WORKERPALS_QUALITY_SCOPE_GATE_ENABLED: "false",
+      WORKERPALS_QUALITY_VALIDATION_GATE_ENABLED: "false",
+      WORKERPALS_QUALITY_CRITIC_GATE_ENABLED: "false",
+      WORKERPALS_QUALITY_PUBLISH_GATE_ENABLED: "false",
       WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS: "56000",
       WORKERPALS_QUALITY_CRITIC_MIN_SCORE: "9.3",
       WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS: "24000",
@@ -328,6 +358,11 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       expect(cfg.workerpals.outputMaxLines).toBe(700);
       expect(cfg.workerpals.outputMaxHeadLines).toBe(70);
       expect(cfg.workerpals.qualityValidationStepTimeoutMs).toBe(222000);
+      expect(cfg.workerpals.qualityValidationMaxAutoRevisions).toBe(2);
+      expect(cfg.workerpals.qualityScopeGateEnabled).toBe(false);
+      expect(cfg.workerpals.qualityValidationGateEnabled).toBe(false);
+      expect(cfg.workerpals.qualityCriticGateEnabled).toBe(false);
+      expect(cfg.workerpals.qualityPublishGateEnabled).toBe(false);
       expect(cfg.workerpals.qualityCriticTimeoutMs).toBe(56000);
       expect(cfg.workerpals.qualityCriticMinScore).toBe(9.3);
       expect(cfg.workerpals.qualityCriticMaxDiffChars).toBe(24000);

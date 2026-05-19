@@ -75,7 +75,7 @@ interface ValidationExecutionResult {
   elapsedMs: number;
 }
 
-interface ValidationBlocker {
+export interface ValidationBlocker {
   category: "repo" | "environment";
   detail: string;
 }
@@ -84,6 +84,8 @@ interface DeterministicQualityResult {
   ok: boolean;
   skipped: boolean;
   issues: string[];
+  scopeIssues: string[];
+  validationIssues: string[];
   changedPaths: string[];
   changedTestPaths: string[];
   validationRuns: ValidationExecutionResult[];
@@ -112,6 +114,11 @@ export interface ReviewFixContext {
 export interface QualityGatePolicy {
   mode: "default" | "review_fix" | "merge_conflict";
   maxAutoRevisions: number;
+  validationMaxAutoRevisions: number;
+  scopeGateEnabled: boolean;
+  validationGateEnabled: boolean;
+  criticGateEnabled: boolean;
+  publishGateEnabled: boolean;
   softPassOnExhausted: boolean;
   criticMinScore: number;
 }
@@ -123,6 +130,33 @@ function shouldSoftPassValidationBlocker(
   if (!blocker) return false;
   if (!policy.softPassOnExhausted) return false;
   return policy.mode === "review_fix" || policy.mode === "merge_conflict";
+}
+
+export function shouldReviseRequiredValidationBlocker(opts: {
+  requiredValidationFailures: string[];
+  blocker: ValidationBlocker | null;
+  revisionAttempt: number;
+  maxAutoRevisions: number;
+}): boolean {
+  if (opts.requiredValidationFailures.length === 0) return false;
+  if (!opts.blocker) return false;
+  if (opts.blocker.category !== "repo") return false;
+  return opts.revisionAttempt < opts.maxAutoRevisions;
+}
+
+export function revisionLimitForQualityGateFailures(opts: {
+  policy: Pick<QualityGatePolicy, "maxAutoRevisions" | "validationMaxAutoRevisions">;
+  qualityIssues: string[];
+  requiredValidationFailures: string[];
+  blocker: ValidationBlocker | null;
+}): number {
+  const hasValidationGateFailure =
+    opts.requiredValidationFailures.length > 0 ||
+    opts.blocker !== null ||
+    opts.qualityIssues.some((issue) => issue.startsWith("ValidationGate:"));
+  return hasValidationGateFailure
+    ? opts.policy.validationMaxAutoRevisions
+    : opts.policy.maxAutoRevisions;
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -228,6 +262,13 @@ export function buildQualityGateRevisionIssues(
 const TEST_ASSERTION_BALANCE_ISSUE =
   "Changed test files do not show both positive and negative assertion coverage (expected both).";
 
+function isAssertionBalanceIssue(issue: string): boolean {
+  return (
+    issue === TEST_ASSERTION_BALANCE_ISSUE ||
+    issue.includes("positive and negative assertion coverage")
+  );
+}
+
 export function relaxAdvisoryQualityIssues(
   qualityIssues: string[],
   validationRuns: Array<{ ok: boolean }>,
@@ -245,7 +286,7 @@ export function relaxAdvisoryQualityIssues(
     return normalizedQualityIssues;
   }
 
-  const relaxed = normalizedQualityIssues.filter((issue) => issue !== TEST_ASSERTION_BALANCE_ISSUE);
+  const relaxed = normalizedQualityIssues.filter((issue) => !isAssertionBalanceIssue(issue));
   return relaxed;
 }
 
@@ -362,13 +403,40 @@ export function deriveQualityGatePolicy(
       10,
       Number.isFinite(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
         ? Math.floor(Number(runtimeConfig.workerpals.qualityMaxAutoRevisions))
-        : 4,
+        : 3,
+    ),
+  );
+  const baseValidationMaxAutoRevisions = Math.max(
+    0,
+    Math.min(
+      10,
+      Number.isFinite(Number(runtimeConfig.workerpals.qualityValidationMaxAutoRevisions))
+        ? Math.floor(Number(runtimeConfig.workerpals.qualityValidationMaxAutoRevisions))
+        : 3,
     ),
   );
   const baseSoftPassOnExhausted =
     typeof runtimeConfig.workerpals.qualitySoftPassOnExhausted === "boolean"
       ? runtimeConfig.workerpals.qualitySoftPassOnExhausted
       : true;
+  const gateSwitches = {
+    scopeGateEnabled:
+      typeof runtimeConfig.workerpals.qualityScopeGateEnabled === "boolean"
+        ? runtimeConfig.workerpals.qualityScopeGateEnabled
+        : true,
+    validationGateEnabled:
+      typeof runtimeConfig.workerpals.qualityValidationGateEnabled === "boolean"
+        ? runtimeConfig.workerpals.qualityValidationGateEnabled
+        : true,
+    criticGateEnabled:
+      typeof runtimeConfig.workerpals.qualityCriticGateEnabled === "boolean"
+        ? runtimeConfig.workerpals.qualityCriticGateEnabled
+        : true,
+    publishGateEnabled:
+      typeof runtimeConfig.workerpals.qualityPublishGateEnabled === "boolean"
+        ? runtimeConfig.workerpals.qualityPublishGateEnabled
+        : true,
+  };
   const baseCriticMinScore = (() => {
     const value = Number(runtimeConfig.workerpals.qualityCriticMinScore);
     if (!Number.isFinite(value)) return 8;
@@ -379,18 +447,22 @@ export function deriveQualityGatePolicy(
     const mergeConflict = extractMergeConflictReviewContext(params);
     if (mergeConflict) {
       return {
-        mode: "merge_conflict",
-        maxAutoRevisions: baseMaxAutoRevisions,
-        softPassOnExhausted: baseSoftPassOnExhausted,
-        criticMinScore: baseCriticMinScore,
-      };
-    }
-    return {
-      mode: "default",
+      mode: "merge_conflict",
       maxAutoRevisions: baseMaxAutoRevisions,
+      validationMaxAutoRevisions: baseValidationMaxAutoRevisions,
+      ...gateSwitches,
       softPassOnExhausted: baseSoftPassOnExhausted,
       criticMinScore: baseCriticMinScore,
     };
+  }
+  return {
+    mode: "default",
+    maxAutoRevisions: baseMaxAutoRevisions,
+    validationMaxAutoRevisions: baseValidationMaxAutoRevisions,
+    ...gateSwitches,
+    softPassOnExhausted: baseSoftPassOnExhausted,
+    criticMinScore: baseCriticMinScore,
+  };
   }
   const tightenedCriticMinScore =
     reviewFix.reviewThreshold != null
@@ -399,6 +471,8 @@ export function deriveQualityGatePolicy(
   return {
     mode: "review_fix",
     maxAutoRevisions: Math.max(baseMaxAutoRevisions, 2),
+    validationMaxAutoRevisions: baseValidationMaxAutoRevisions,
+    ...gateSwitches,
     softPassOnExhausted: baseSoftPassOnExhausted,
     criticMinScore: tightenedCriticMinScore,
   };
@@ -1143,6 +1217,7 @@ async function runDeterministicQualityGate(
   repo: string,
   params: Record<string, unknown>,
   runtimeConfig: WorkerpalsRuntimeConfig,
+  qualityGatePolicy: QualityGatePolicy,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<DeterministicQualityResult> {
   const instruction = String(params.instruction ?? "");
@@ -1154,11 +1229,19 @@ async function runDeterministicQualityGate(
   }
   const isTestTask = isTestFocusedTask(instruction, planning, targetPath);
   const hasRequiredValidationCriteria = requiredValidationSteps.length > 0;
-  if (!isTestTask && !hasRequiredValidationCriteria) {
+  if (
+    !qualityGatePolicy.scopeGateEnabled &&
+    !qualityGatePolicy.validationGateEnabled &&
+    !qualityGatePolicy.criticGateEnabled &&
+    !isTestTask &&
+    !hasRequiredValidationCriteria
+  ) {
     return {
       ok: true,
       skipped: true,
       issues: [],
+      scopeIssues: [],
+      validationIssues: [],
       changedPaths: [],
       changedTestPaths: [],
       validationRuns: [],
@@ -1176,15 +1259,47 @@ async function runDeterministicQualityGate(
     ),
   );
   const issues: string[] = [];
-  if (changedTestPaths.length === 0) {
-    issues.push("No relevant test file was modified for this test-focused task.");
+  const scopeIssues: string[] = [];
+  const validationIssues: string[] = [];
+  const addScopeIssue = (issue: string): void => {
+    scopeIssues.push(issue);
+    issues.push(`ScopeGate: ${issue}`);
+  };
+  const addValidationIssue = (issue: string): void => {
+    validationIssues.push(issue);
+    issues.push(`ValidationGate: ${issue}`);
+  };
+
+  if (qualityGatePolicy.scopeGateEnabled) {
+    if (!statusResult.ok) {
+      addScopeIssue("could not evaluate changed paths from git status.");
+    }
+    for (const issue of collectWriteScopeIssuesFromChangedPaths(changedPaths, planning)) {
+      addScopeIssue(issue);
+    }
+    if (isTestTask && changedTestPaths.length === 0) {
+      addScopeIssue("found no relevant test file modified for this test-focused task.");
+    }
+    if (
+      isTestTask &&
+      changedTestPaths.length > 0 &&
+      !hasBalancedPositiveNegativeAssertions(changedTestPaths, repo)
+    ) {
+      addScopeIssue(
+        "found changed test files without both positive and negative assertion coverage (expected both).",
+      );
+    }
+    for (const issue of scopeIssues) {
+      onLog?.("stderr", `[ScopeGate] ${issue}`);
+    }
+  } else {
+    onLog?.("stdout", "[ScopeGate] Disabled by workerpals.quality_scope_gate_enabled=false.");
   }
-  if (
-    changedTestPaths.length > 0 &&
-    !hasBalancedPositiveNegativeAssertions(changedTestPaths, repo)
-  ) {
-    issues.push(
-      "Changed test files do not show both positive and negative assertion coverage (expected both).",
+
+  if (!qualityGatePolicy.validationGateEnabled) {
+    onLog?.(
+      "stdout",
+      "[ValidationGate] Disabled by workerpals.quality_validation_gate_enabled=false.",
     );
   }
 
@@ -1207,28 +1322,30 @@ async function runDeterministicQualityGate(
     if (!Number.isFinite(value)) return 180_000;
     return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
   })();
+  let requiredValidationFailures: string[] = [];
+  if (qualityGatePolicy.validationGateEnabled) {
   if (hasRequiredValidationCriteria && requiredRunnableSteps.length === 0) {
-    issues.push(
-      "vision.md testing criteria were provided, but none contained a runnable validation command.",
+    addValidationIssue(
+      "found vision.md testing criteria, but none contained a runnable validation command.",
     );
   }
   if (commandsToRun.length === 0) {
-    issues.push(
+    addValidationIssue(
       hasRequiredValidationCriteria
-        ? "No runnable validation command was available from vision.md testing criteria or planning.validationSteps."
-        : "No runnable validation command was provided in planning.validationSteps (expected at least one test command).",
+        ? "found no runnable validation command from vision.md testing criteria or planning.validationSteps."
+        : "found no runnable validation command in planning.validationSteps (expected at least one test command).",
     );
   } else {
     if (requiredRunnableSteps.length > 0) {
       onLog?.(
         "stdout",
-        `[QualityGate] Running required vision.md testing criteria: ${requiredRunnableSteps.join(" | ")}`,
+        `[ValidationGate] Running required vision.md testing criteria: ${requiredRunnableSteps.join(" | ")}`,
       );
     }
     if (isTestTask && plannerRunnableSteps.length === 0 && fallbackValidationSteps.length > 0) {
       onLog?.(
         "stdout",
-        `[QualityGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
+        `[ValidationGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
       );
     }
     const toolchainPlan = buildToolchainPlan({
@@ -1238,7 +1355,7 @@ async function runDeterministicQualityGate(
     if (toolchainPlan.requirements.length > 0) {
       onLog?.(
         "stdout",
-        `[QualityGate] Toolchain preflight: source=${toolchainPlan.environmentSource}, required=${toolchainPlan.requirements
+        `[ValidationGate] Toolchain preflight: source=${toolchainPlan.environmentSource}, required=${toolchainPlan.requirements
           .map((requirement) => requirement.tool)
           .join(", ")}`,
       );
@@ -1250,7 +1367,7 @@ async function runDeterministicQualityGate(
     if (missingToolRequirements.length > 0) {
       onLog?.(
         "stderr",
-        `[QualityGate] Toolchain preflight blocked dependent validation command(s): ${formatMissingToolRequirements(
+        `[ValidationGate] Toolchain preflight blocked dependent validation command(s): ${formatMissingToolRequirements(
           missingToolRequirements,
         )}`,
       );
@@ -1275,11 +1392,11 @@ async function runDeterministicQualityGate(
         });
         onLog?.(
           "stderr",
-          `[QualityGate] Quality gate validation skipped (missing toolchain): ${command}`,
+          `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
         );
         continue;
       }
-      onLog?.("stdout", `[QualityGate] Quality gate validation: running "${command}"`);
+      onLog?.("stdout", `[ValidationGate] Running "${command}"`);
       const run = await runValidationCommand(
         repo,
         command,
@@ -1287,7 +1404,7 @@ async function runDeterministicQualityGate(
         outputPolicy,
       );
       validationRuns.push(run);
-      const runSummary = `[QualityGate] Quality gate validation ${run.ok ? "passed" : "failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
+      const runSummary = `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}`;
       onLog?.(run.ok ? "stdout" : "stderr", runSummary);
     }
     // exit 127 = command not found: separate tool-availability issues from real test failures.
@@ -1297,38 +1414,43 @@ async function runDeterministicQualityGate(
       const cmds = notFoundRuns.map((run) => run.command).join(", ");
       onLog?.(
         "stderr",
-        `[QualityGate] Some validation commands not found (exit 127 — wrong tool?): ${cmds}. This project uses Bun: prefer "bun test".`,
+        `[ValidationGate] Some validation commands not found (exit 127 - wrong tool?): ${cmds}. This project uses Bun: prefer "bun test".`,
       );
     }
     if (executedRuns.length > 0 && executedRuns.every((run) => !run.ok)) {
-      issues.push("Validation commands were executed but none passed.");
+      addValidationIssue("executed validation commands, but none passed.");
     } else if (executedRuns.length === 0 && notFoundRuns.length > 0) {
-      issues.push(
-        'No validation command could be run (command not found). Use "bun test" or another available test runner.',
+      addValidationIssue(
+        'could not run any validation command (command not found). Use "bun test" or another available test runner.',
       );
     }
     if (
       isTestTask &&
       !validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))
     ) {
-      issues.push("Validation steps did not execute a recognizable test command.");
+      addValidationIssue("did not execute a recognizable test command.");
     }
   }
-  const requiredValidationFailures = collectRequiredValidationFailures(
+  requiredValidationFailures = collectRequiredValidationFailures(
     requiredRunnableSteps,
     validationRuns,
   );
   if (requiredValidationFailures.length > 0) {
-    issues.push(
+    addValidationIssue(
       `Required vision.md validation failed: ${requiredValidationFailures.join("; ")}`,
     );
   }
-  const blocker = detectValidationBlocker(validationRuns);
+  }
+  const blocker = qualityGatePolicy.validationGateEnabled
+    ? detectValidationBlocker(validationRuns)
+    : null;
 
   return {
     ok: issues.length === 0 && blocker === null,
     skipped: false,
     issues,
+    scopeIssues,
+    validationIssues,
     changedPaths,
     changedTestPaths,
     validationRuns,
@@ -1456,7 +1578,7 @@ async function runTaskCriticReview(
       if (lowered.includes("response_format")) {
         onLog?.(
           "stdout",
-          "[QualityGate] Critic fallback: response_format json_object unsupported; retrying without strict response_format.",
+          "[CriticGate] fallback: response_format json_object unsupported; retrying without strict response_format.",
         );
         request = await runCriticRequest(null);
       }
@@ -1464,7 +1586,7 @@ async function runTaskCriticReview(
     if (!request.response.ok) {
       onLog?.(
         "stderr",
-        `[QualityGate] Critic review request failed (${request.response.status}): ${toSingleLine(request.text, 240)}`,
+        `[CriticGate] review request failed (${request.response.status}): ${toSingleLine(request.text, 240)}`,
       );
       return null;
     }
@@ -1480,7 +1602,7 @@ async function runTaskCriticReview(
     if (!reviewObj) {
       onLog?.(
         "stderr",
-        `[QualityGate] Critic produced non-JSON content; skipping critic gate. Raw: ${toSingleLine(
+        `[CriticGate] produced non-JSON content; skipping critic gate. Raw: ${toSingleLine(
           content,
           220,
         )}`,
@@ -1509,7 +1631,7 @@ async function runTaskCriticReview(
   } catch (err) {
     onLog?.(
       "stderr",
-      `[QualityGate] Critic review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`,
+      `[CriticGate] review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`,
     );
     return null;
   }
@@ -1520,6 +1642,8 @@ export function buildQualityRevisionHint(
   critic: CriticReview | null,
   planning: TaskExecutePlanning,
   reviewFixContext?: ReviewFixContext | null,
+  validationRuns: ValidationExecutionResult[] = [],
+  validationBlocker: ValidationBlocker | null = null,
 ): string {
   const lines: string[] = [];
   lines.push("Quality revision required before completion.");
@@ -1551,6 +1675,26 @@ export function buildQualityRevisionHint(
   if (issues.length > 0) {
     lines.push("Deterministic quality issues:");
     for (const issue of issues) lines.push(`- ${issue}`);
+  }
+  if (validationBlocker) {
+    lines.push(
+      `Validation blocker: ${validationBlocker.category} - ${toSingleLine(
+        validationBlocker.detail,
+        300,
+      )}`,
+    );
+  }
+  const failedValidationRuns = validationRuns.filter((run) => !run.ok);
+  if (failedValidationRuns.length > 0) {
+    lines.push("Validation failure diagnostics:");
+    for (const run of failedValidationRuns.slice(0, 5)) {
+      lines.push(`- ${run.command} failed with exit ${run.exitCode} after ${run.elapsedMs}ms.`);
+      const output = toSingleLine(
+        stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n")),
+        700,
+      );
+      if (output) lines.push(`  Output: ${output}`);
+    }
   }
   if (critic) {
     lines.push(`Critic score: ${critic.score.toFixed(1)} / 10`);
@@ -3587,40 +3731,33 @@ function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user"
   return "user";
 }
 
-async function collectWriteScopeWarnings(
-  repo: string,
+function collectWriteScopeIssuesFromChangedPaths(
+  changedPaths: string[],
   planning: TaskExecutePlanning,
-): Promise<{ warnings: string[] }> {
+): string[] {
   const writeGlobs = toStringArray(planning.scope.writeGlobs ?? []);
-  if (writeGlobs.length === 0) return { warnings: [] };
+  if (writeGlobs.length === 0) return [];
 
-  const statusResult = await git(repo, ["status", "--porcelain"]);
-  if (!statusResult.ok) {
-    return { warnings: ["Unable to evaluate changed paths for scope suggestion check."] };
-  }
-
-  const changedPaths = parseChangedPathsFromStatus(statusResult.stdout)
+  const normalizedChangedPaths = changedPaths
     .map((entry) => normalizeStagePath(entry))
     .filter((entry): entry is string => Boolean(entry) && entry !== ".");
-  if (changedPaths.length === 0) return { warnings: [] };
+  if (normalizedChangedPaths.length === 0) return [];
 
   const forbidden = toStringArray(planning.scope.forbiddenGlobs ?? []);
-  const warnings: string[] = [];
-  const outOfScope = changedPaths.filter(
+  const issues: string[] = [];
+  const outOfScope = normalizedChangedPaths.filter(
     (path) => !writeGlobs.some((glob) => matchesGlob(path, glob)),
   );
   if (outOfScope.length > 0) {
-    warnings.push(`Scope suggestion: modified paths outside writeGlobs: ${outOfScope.join(", ")}`);
+    issues.push(`modified paths outside writeGlobs: ${outOfScope.join(", ")}`);
   }
-  const forbiddenTouched = changedPaths.filter((path) =>
+  const forbiddenTouched = normalizedChangedPaths.filter((path) =>
     forbidden.some((glob) => matchesGlob(path, glob)),
   );
   if (forbiddenTouched.length > 0) {
-    warnings.push(
-      `Scope suggestion: modified paths matching forbiddenGlobs: ${forbiddenTouched.join(", ")}`,
-    );
+    issues.push(`modified paths matching forbiddenGlobs: ${forbiddenTouched.join(", ")}`);
   }
-  return { warnings };
+  return issues;
 }
 
 function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
@@ -3945,7 +4082,7 @@ async function runCodexCriticReview(
   if (!codexPrefix) {
     onLog?.(
       "stderr",
-      "[QualityGate] Codex critic: unable to resolve Codex CLI command (workerpals.llm.codex_bin/PATH); skipping.",
+      "[CriticGate] Codex: unable to resolve Codex CLI command (workerpals.llm.codex_bin/PATH); skipping.",
     );
     return null;
   }
@@ -4045,14 +4182,14 @@ async function runCodexCriticReview(
     clearTimeout(timer);
 
     if (timedOut) {
-      onLog?.("stderr", "[QualityGate] Codex critic timed out; skipping.");
+      onLog?.("stderr", "[CriticGate] Codex timed out; skipping.");
       return null;
     }
     if (exitCode !== 0) {
       const stderrText = await new Response(proc.stderr).text();
       onLog?.(
         "stderr",
-        `[QualityGate] Codex critic exited ${exitCode}: ${toSingleLine(stderrText, 220)}`,
+        `[CriticGate] Codex exited ${exitCode}: ${toSingleLine(stderrText, 220)}`,
       );
       return null;
     }
@@ -4070,7 +4207,7 @@ async function runCodexCriticReview(
     }
 
     if (!lastMessage) {
-      onLog?.("stderr", "[QualityGate] Codex critic: no output message captured; skipping.");
+      onLog?.("stderr", "[CriticGate] Codex: no output message captured; skipping.");
       return null;
     }
 
@@ -4078,7 +4215,7 @@ async function runCodexCriticReview(
     if (!reviewObj) {
       onLog?.(
         "stderr",
-        `[QualityGate] Codex critic returned non-JSON: ${toSingleLine(lastMessage, 220)}`,
+        `[CriticGate] Codex returned non-JSON: ${toSingleLine(lastMessage, 220)}`,
       );
       return null;
     }
@@ -4094,7 +4231,7 @@ async function runCodexCriticReview(
     const revisionGuidance = String(reviewObj.revision_guidance ?? "")
       .trim()
       .slice(0, 2000);
-    onLog?.("stdout", `[QualityGate] Codex critic score: ${score}/10`);
+    onLog?.("stdout", `[CriticGate] Codex score: ${score}/10`);
     return {
       score,
       findings,
@@ -4103,7 +4240,7 @@ async function runCodexCriticReview(
       raw: compactJobOutput(lastMessage, outputPolicyForRuntime(runtimeConfig)),
     };
   } catch (err) {
-    onLog?.("stderr", `[QualityGate] Codex critic error: ${toSingleLine(err, 220)} (skipping).`);
+    onLog?.("stderr", `[CriticGate] Codex error: ${toSingleLine(err, 220)} (skipping).`);
     return null;
   }
 }
@@ -4189,12 +4326,25 @@ export async function executeJob(
   const reviewFixContext = extractReviewFixContext(normalizedParams);
   const qualityGatePolicy = deriveQualityGatePolicy(normalizedParams, runtimeConfig);
   const qualityMaxAutoRevisions = qualityGatePolicy.maxAutoRevisions;
+  const qualityValidationMaxAutoRevisions = qualityGatePolicy.validationMaxAutoRevisions;
+  const qualityRevisionLoopMax = Math.max(
+    qualityMaxAutoRevisions,
+    qualityValidationMaxAutoRevisions,
+  );
   const qualitySoftPassOnExhausted = qualityGatePolicy.softPassOnExhausted;
   const qualityCriticMinScore = qualityGatePolicy.criticMinScore;
 
   onLog?.(
     "stdout",
-    `[QualityGate] Policy: max_auto_revisions=${qualityMaxAutoRevisions}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}, critic_min_score=${qualityCriticMinScore}`,
+    `[QualityGate] Policy: max_auto_revisions=${qualityMaxAutoRevisions}, validation_max_auto_revisions=${qualityValidationMaxAutoRevisions}, soft_pass_on_exhausted=${qualitySoftPassOnExhausted ? "true" : "false"}, critic_min_score=${qualityCriticMinScore}`,
+  );
+  onLog?.(
+    "stdout",
+    `[QualityGate] Gates: scope=${qualityGatePolicy.scopeGateEnabled ? "on" : "off"}, validation=${
+      qualityGatePolicy.validationGateEnabled ? "on" : "off"
+    }, critic=${qualityGatePolicy.criticGateEnabled ? "on" : "off"}, publish=${
+      qualityGatePolicy.publishGateEnabled ? "on" : "off"
+    }`,
   );
   if (qualityGatePolicy.mode === "review_fix") {
     const priorScore =
@@ -4218,7 +4368,7 @@ export async function executeJob(
 
   let revisionAttempt = 0;
   let revisionHint = "";
-  while (revisionAttempt <= qualityMaxAutoRevisions) {
+  while (revisionAttempt <= qualityRevisionLoopMax) {
     const attemptParams: Record<string, unknown> = { ...normalizedParams };
     if (revisionHint) {
       attemptParams.qualityRevisionHint = revisionHint;
@@ -4306,17 +4456,22 @@ export async function executeJob(
       };
     }
 
-    const scopeCheck = await collectWriteScopeWarnings(repo, planning);
-    for (const warning of scopeCheck.warnings) {
-      onLog?.("stdout", `[TaskExecute] ${warning}`);
+    const quality = await runDeterministicQualityGate(
+      repo,
+      attemptParams,
+      runtimeConfig,
+      qualityGatePolicy,
+      onLog,
+    );
+    const critic =
+      quality.skipped || !qualityGatePolicy.criticGateEnabled
+        ? null
+        : executor === "openai_codex"
+          ? await runCodexCriticReview(repo, attemptParams, quality, runtimeConfig, onLog)
+          : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
+    if (!qualityGatePolicy.criticGateEnabled) {
+      onLog?.("stdout", "[CriticGate] Disabled by workerpals.quality_critic_gate_enabled=false.");
     }
-
-    const quality = await runDeterministicQualityGate(repo, attemptParams, runtimeConfig, onLog);
-    const critic = quality.skipped
-      ? null
-      : executor === "openai_codex"
-        ? await runCodexCriticReview(repo, attemptParams, quality, runtimeConfig, onLog)
-        : await runTaskCriticReview(repo, attemptParams, quality, runtimeConfig, onLog);
     const effectiveQualityIssues = relaxAdvisoryQualityIssues(
       quality.issues,
       quality.validationRuns,
@@ -4332,22 +4487,60 @@ export async function executeJob(
     const deterministicRequiresRevision =
       effectiveQualityIssues.length > 0 || quality.blocker !== null;
     const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
+    if (
+      !qualityGatePolicy.publishGateEnabled &&
+      (deterministicRequiresRevision || criticRequiresRevision)
+    ) {
+      onLog?.(
+        "stderr",
+        "[PublishGate] Disabled by workerpals.quality_publish_gate_enabled=false; returning worker result despite gate failures.",
+      );
+      return {
+        ...result,
+        summary: `${result.summary} (publish gate disabled; quality gate findings were advisory)`,
+        stderr: truncate(
+          [
+            result.stderr ?? "",
+            ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
+            critic ? `Critic raw: ${critic.raw}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
+        ),
+        exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
+      };
+    }
 
     if (!deterministicRequiresRevision && !criticRequiresRevision) {
       if (critic) {
         onLog?.(
           "stdout",
-          `[QualityGate] Critic review score ${critic.score.toFixed(1)}/10 (threshold ${qualityCriticMinScore}).`,
+          `[CriticGate] review score ${critic.score.toFixed(1)}/10 (threshold ${qualityCriticMinScore}).`,
         );
       }
       return result;
     }
 
+    const blockerIssue = quality.blocker
+      ? [
+          `Validation blocker (${quality.blocker.category}): ${toSingleLine(
+            quality.blocker.detail,
+            240,
+          )}`,
+        ]
+      : [];
     const issues = buildQualityGateRevisionIssues(
-      effectiveQualityIssues,
+      [...effectiveQualityIssues, ...blockerIssue],
       critic,
       qualityCriticMinScore,
     );
+    const activeMaxAutoRevisions = revisionLimitForQualityGateFailures({
+      policy: qualityGatePolicy,
+      qualityIssues: effectiveQualityIssues,
+      requiredValidationFailures: quality.requiredValidationFailures,
+      blocker: quality.blocker,
+    });
     const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
     if (quality.blocker) {
       const blockerSummary = `Quality gate blocked by ${quality.blocker.category} issue: ${quality.blocker.detail}`;
@@ -4358,7 +4551,22 @@ export async function executeJob(
         ].join("\n"),
         outputPolicyForRuntime(runtimeConfig),
       );
-      if (quality.requiredValidationFailures.length > 0) {
+      const requiredValidationCanRevise = shouldReviseRequiredValidationBlocker({
+        requiredValidationFailures: quality.requiredValidationFailures,
+        blocker: quality.blocker,
+        revisionAttempt,
+        maxAutoRevisions: qualityValidationMaxAutoRevisions,
+      });
+      if (requiredValidationCanRevise) {
+        onLog?.(
+          "stderr",
+          `[QualityGate] Required vision.md validation hit a repo blocker; requesting revision ${
+            revisionAttempt + 1
+          }/${qualityValidationMaxAutoRevisions} instead of failing immediately: ${quality.requiredValidationFailures.join(
+            "; ",
+          )}`,
+        );
+      } else if (quality.requiredValidationFailures.length > 0) {
         const requiredSummary = `Required vision.md validation blocked publishing: ${quality.requiredValidationFailures.join("; ")}`;
         onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
         return {
@@ -4368,8 +4576,7 @@ export async function executeJob(
           stderr: blockerDiagnostics,
           exitCode: 4,
         };
-      }
-      if (shouldSoftPassValidationBlocker(qualityGatePolicy, quality.blocker)) {
+      } else if (shouldSoftPassValidationBlocker(qualityGatePolicy, quality.blocker)) {
         onLog?.(
           "stderr",
           `[QualityGate] Soft-pass on ${quality.blocker.category} blocker for publishable ${qualityGatePolicy.mode} job: ${toSingleLine(
@@ -4385,17 +4592,18 @@ export async function executeJob(
           stderr: blockerDiagnostics,
           exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
         };
+      } else {
+        onLog?.("stderr", `[QualityGate] ${blockerSummary}`);
+        return {
+          ok: false,
+          summary: blockerSummary,
+          stdout: result.stdout,
+          stderr: blockerDiagnostics,
+          exitCode: 4,
+        };
       }
-      onLog?.("stderr", `[QualityGate] ${blockerSummary}`);
-      return {
-        ok: false,
-        summary: blockerSummary,
-        stdout: result.stdout,
-        stderr: blockerDiagnostics,
-        exitCode: 4,
-      };
     }
-    if (revisionAttempt >= qualityMaxAutoRevisions) {
+    if (revisionAttempt >= activeMaxAutoRevisions) {
       if (quality.requiredValidationFailures.length > 0) {
         const diagnostics = truncate(
           [
@@ -4456,10 +4664,17 @@ export async function executeJob(
     }
 
     revisionAttempt += 1;
-    revisionHint = buildQualityRevisionHint(issues, critic, planning, reviewFixContext);
+    revisionHint = buildQualityRevisionHint(
+      issues,
+      critic,
+      planning,
+      reviewFixContext,
+      quality.validationRuns,
+      quality.blocker,
+    );
     onLog?.(
       "stderr",
-      `[QualityGate] Quality gate requested revision ${revisionAttempt}/${qualityMaxAutoRevisions}: ${toSingleLine(
+      `[QualityGate] Quality gate requested revision ${revisionAttempt}/${activeMaxAutoRevisions}: ${toSingleLine(
         issueSummary,
         260,
       )}`,

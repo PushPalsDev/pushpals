@@ -734,7 +734,7 @@ var DEFAULT_CONFIG_DIR = "configs";
 var TRUTHY = new Set(["1", "true", "yes", "on"]);
 var FALSY = new Set(["0", "false", "no", "off"]);
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE = 8;
-var DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS = 1;
+var DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS = 3;
 var DEFAULT_WORKERPALS_FILE_MODIFYING_JOBS = ["task.execute"];
 var DEFAULT_WORKERPALS_OUTPUT_MAX_CHARS = 192 * 1024;
 var DEFAULT_WORKERPALS_OUTPUT_MAX_LINES = 600;
@@ -1103,6 +1103,7 @@ function loadPushPalsConfig(options = {}) {
   const workerOpenAICodexPython = firstNonEmpty(process.env.PUSHPALS_OPENAI_CODEX_PYTHON, asString(workerNode.openai_codex_python, "python"), "python");
   const workerOpenAICodexTimeoutMs = Math.max(1e4, asInt(workerNode.openai_codex_timeout_ms, 7200000));
   const workerQualityMaxAutoRevisions = Math.max(0, Math.min(10, asInt(parseIntEnv("WORKERPALS_QUALITY_MAX_AUTO_REVISIONS") ?? workerNode.quality_max_auto_revisions, DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS)));
+  const workerQualityValidationMaxAutoRevisions = Math.max(0, Math.min(10, asInt(parseIntEnv("WORKERPALS_QUALITY_VALIDATION_MAX_AUTO_REVISIONS") ?? workerNode.quality_validation_max_auto_revisions, DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS)));
   const workerFileModifyingJobs = (() => {
     const envRaw = firstNonEmpty(process.env.WORKERPALS_FILE_MODIFYING_JOBS);
     const parsed = envRaw ? envRaw.split(",").map((entry) => entry.trim()).filter(Boolean) : asStringArray(workerNode.file_modifying_jobs);
@@ -1115,6 +1116,10 @@ function loadPushPalsConfig(options = {}) {
   const workerQualityValidationStepTimeoutMs = Math.max(1000, asInt(parseIntEnv("WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS") ?? workerNode.quality_validation_step_timeout_ms, DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS));
   const workerQualityCriticTimeoutMs = Math.max(1000, asInt(parseIntEnv("WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS") ?? workerNode.quality_critic_timeout_ms, DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS));
   const workerQualitySoftPassOnExhausted = parseBoolEnv("WORKERPALS_QUALITY_SOFT_PASS_ON_EXHAUSTED") ?? asBoolean(workerNode.quality_soft_pass_on_exhausted, true);
+  const workerQualityScopeGateEnabled = parseBoolEnv("WORKERPALS_QUALITY_SCOPE_GATE_ENABLED") ?? asBoolean(workerNode.quality_scope_gate_enabled, true);
+  const workerQualityValidationGateEnabled = parseBoolEnv("WORKERPALS_QUALITY_VALIDATION_GATE_ENABLED") ?? asBoolean(workerNode.quality_validation_gate_enabled, true);
+  const workerQualityCriticGateEnabled = parseBoolEnv("WORKERPALS_QUALITY_CRITIC_GATE_ENABLED") ?? asBoolean(workerNode.quality_critic_gate_enabled, true);
+  const workerQualityPublishGateEnabled = parseBoolEnv("WORKERPALS_QUALITY_PUBLISH_GATE_ENABLED") ?? asBoolean(workerNode.quality_publish_gate_enabled, true);
   const workerQualityCriticMinScore = (() => {
     const configThresholdRaw = workerNode.quality_critic_min_score == null ? "" : String(workerNode.quality_critic_min_score);
     const raw = firstNonEmpty(process.env.WORKERPALS_QUALITY_CRITIC_MIN_SCORE, configThresholdRaw, String(DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE));
@@ -1405,6 +1410,11 @@ function loadPushPalsConfig(options = {}) {
       outputMaxLines: workerOutputMaxLines,
       outputMaxHeadLines: workerOutputMaxHeadLines,
       qualityMaxAutoRevisions: workerQualityMaxAutoRevisions,
+      qualityValidationMaxAutoRevisions: workerQualityValidationMaxAutoRevisions,
+      qualityScopeGateEnabled: workerQualityScopeGateEnabled,
+      qualityValidationGateEnabled: workerQualityValidationGateEnabled,
+      qualityCriticGateEnabled: workerQualityCriticGateEnabled,
+      qualityPublishGateEnabled: workerQualityPublishGateEnabled,
       qualityValidationStepTimeoutMs: workerQualityValidationStepTimeoutMs,
       qualityCriticTimeoutMs: workerQualityCriticTimeoutMs,
       qualitySoftPassOnExhausted: workerQualitySoftPassOnExhausted,

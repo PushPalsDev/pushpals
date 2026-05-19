@@ -619,12 +619,12 @@ describe("workerpals merge-conflict sandbox", () => {
         );
 
         expect(result.ok).toBe(true);
-        expect(result.summary).toContain("quality gate soft-pass after 1 auto-revision attempt(s)");
+        expect(result.summary).toContain("quality gate soft-pass after 3 auto-revision attempt(s)");
         expect(
-          forwardedLogs.some((entry) => entry.line.includes("Quality gate requested revision 1/1")),
+          forwardedLogs.some((entry) => entry.line.includes("Quality gate requested revision 1/3")),
         ).toBe(true);
         expect(
-          forwardedLogs.some((entry) => entry.line.includes("Soft-pass after 1 auto-revision attempt(s)")),
+          forwardedLogs.some((entry) => entry.line.includes("Soft-pass after 3 auto-revision attempt(s)")),
         ).toBe(true);
       } finally {
         restoreExecutor();

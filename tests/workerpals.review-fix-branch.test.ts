@@ -81,6 +81,11 @@ describe("workerpals review fix completion branch resolution", () => {
       workerpals: {
         ...base.workerpals,
         qualityMaxAutoRevisions: 1,
+        qualityValidationMaxAutoRevisions: 3,
+        qualityScopeGateEnabled: false,
+        qualityValidationGateEnabled: true,
+        qualityCriticGateEnabled: false,
+        qualityPublishGateEnabled: true,
         qualitySoftPassOnExhausted: true,
         qualityCriticMinScore: 8,
       },
@@ -99,6 +104,11 @@ describe("workerpals review fix completion branch resolution", () => {
 
     expect(policy.mode).toBe("review_fix");
     expect(policy.maxAutoRevisions).toBe(2);
+    expect(policy.validationMaxAutoRevisions).toBe(3);
+    expect(policy.scopeGateEnabled).toBe(false);
+    expect(policy.validationGateEnabled).toBe(true);
+    expect(policy.criticGateEnabled).toBe(false);
+    expect(policy.publishGateEnabled).toBe(true);
     expect(policy.softPassOnExhausted).toBe(true);
     expect(policy.criticMinScore).toBeCloseTo(8.3, 5);
   });
@@ -110,6 +120,7 @@ describe("workerpals review fix completion branch resolution", () => {
       workerpals: {
         ...base.workerpals,
         qualityMaxAutoRevisions: 1,
+        qualityValidationMaxAutoRevisions: 3,
         qualitySoftPassOnExhausted: true,
         qualityCriticMinScore: 8,
       },
@@ -128,6 +139,7 @@ describe("workerpals review fix completion branch resolution", () => {
 
     expect(policy.mode).toBe("merge_conflict");
     expect(policy.maxAutoRevisions).toBe(1);
+    expect(policy.validationMaxAutoRevisions).toBe(3);
     expect(policy.softPassOnExhausted).toBe(true);
     expect(policy.criticMinScore).toBe(8);
   });

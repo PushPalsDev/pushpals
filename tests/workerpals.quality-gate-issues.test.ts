@@ -3,6 +3,8 @@ import {
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
+  shouldReviseRequiredValidationBlocker,
+  revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
 } from "../apps/workerpals/src/execute_job";
 
@@ -119,12 +121,106 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("- Add negative-path assertions");
   });
 
+  test("includes failed validation output in quality revision hints", () => {
+    const hint = buildQualityRevisionHint(
+      ["Required vision.md validation failed: bun test exited 1."],
+      null,
+      {
+        intent: "code_change",
+        riskLevel: "medium",
+        scope: { readAnywhere: true, writeAllowed: true },
+        acceptanceCriteria: [],
+        validationSteps: [],
+        requiredValidationSteps: ["bun test"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [
+        {
+          step: "bun test",
+          command: "bun test",
+          ok: false,
+          exitCode: 1,
+          stdout: "1 tests failed",
+          stderr: "Cannot find module '../../tests/reactNativeMock'",
+          elapsedMs: 123,
+        },
+      ],
+      {
+        category: "repo",
+        detail: "Validation is blocked by missing repo dependencies or imported files.",
+      },
+    );
+
+    expect(hint).toContain("Validation blocker: repo");
+    expect(hint).toContain("Validation failure diagnostics:");
+    expect(hint).toContain("- bun test failed with exit 1 after 123ms.");
+    expect(hint).toContain("Cannot find module '../../tests/reactNativeMock'");
+  });
+
+  test("revises required validation repo blockers until the auto-revision budget is exhausted", () => {
+    expect(
+      shouldReviseRequiredValidationBlocker({
+        requiredValidationFailures: ["bun test exited 1"],
+        blocker: { category: "repo", detail: "missing imported file" },
+        revisionAttempt: 0,
+        maxAutoRevisions: 3,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldReviseRequiredValidationBlocker({
+        requiredValidationFailures: ["bun test exited 1"],
+        blocker: { category: "repo", detail: "missing imported file" },
+        revisionAttempt: 3,
+        maxAutoRevisions: 3,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldReviseRequiredValidationBlocker({
+        requiredValidationFailures: ["bun run web:e2e exited 124"],
+        blocker: { category: "environment", detail: "missing browser runtime" },
+        revisionAttempt: 0,
+        maxAutoRevisions: 3,
+      }),
+    ).toBe(false);
+  });
+
+  test("uses the ValidationGate retry budget for validation failures", () => {
+    const policy = {
+      maxAutoRevisions: 1,
+      validationMaxAutoRevisions: 3,
+    };
+
+    expect(
+      revisionLimitForQualityGateFailures({
+        policy,
+        qualityIssues: ["ValidationGate: executed validation commands, but none passed."],
+        requiredValidationFailures: [],
+        blocker: null,
+      }),
+    ).toBe(3);
+
+    expect(
+      revisionLimitForQualityGateFailures({
+        policy,
+        qualityIssues: ["ScopeGate: target_path outside component root"],
+        requiredValidationFailures: [],
+        blocker: null,
+      }),
+    ).toBe(1);
+  });
+
   test("downgrades assertion-balance failures when validation passed and critic score meets threshold", () => {
     const issues = relaxAdvisoryQualityIssues(
-      [
-        "Changed test files do not show both positive and negative assertion coverage (expected both).",
-        "Validation steps did not execute a recognizable test command.",
-      ],
+        [
+          "ScopeGate: found changed test files without both positive and negative assertion coverage (expected both).",
+          "Validation steps did not execute a recognizable test command.",
+        ],
       [{ ok: false }, { ok: true }],
       {
         score: 8.8,
@@ -141,7 +237,7 @@ describe("workerpals quality gate critic issue formatting", () => {
 
   test("keeps assertion-balance failures blocking when validation did not pass or critic score is low", () => {
     const issue =
-      "Changed test files do not show both positive and negative assertion coverage (expected both).";
+      "ScopeGate: found changed test files without both positive and negative assertion coverage (expected both).";
 
     expect(
       relaxAdvisoryQualityIssues(

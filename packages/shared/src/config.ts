@@ -14,7 +14,7 @@ const DEFAULT_CONFIG_DIR = "configs";
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
 const FALSY = new Set(["0", "false", "no", "off"]);
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE = 8;
-const DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS = 1;
+const DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS = 3;
 const DEFAULT_WORKERPALS_FILE_MODIFYING_JOBS = ["task.execute"];
 const DEFAULT_WORKERPALS_OUTPUT_MAX_CHARS = 192 * 1024;
 const DEFAULT_WORKERPALS_OUTPUT_MAX_LINES = 600;
@@ -210,6 +210,11 @@ export interface PushPalsConfig {
     outputMaxLines: number;
     outputMaxHeadLines: number;
     qualityMaxAutoRevisions: number;
+    qualityValidationMaxAutoRevisions: number;
+    qualityScopeGateEnabled: boolean;
+    qualityValidationGateEnabled: boolean;
+    qualityCriticGateEnabled: boolean;
+    qualityPublishGateEnabled: boolean;
     qualityValidationStepTimeoutMs: number;
     qualityCriticTimeoutMs: number;
     qualitySoftPassOnExhausted: boolean;
@@ -931,6 +936,17 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       ),
     ),
   );
+  const workerQualityValidationMaxAutoRevisions = Math.max(
+    0,
+    Math.min(
+      10,
+      asInt(
+        parseIntEnv("WORKERPALS_QUALITY_VALIDATION_MAX_AUTO_REVISIONS") ??
+          workerNode.quality_validation_max_auto_revisions,
+        DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS,
+      ),
+    ),
+  );
   const workerFileModifyingJobs = (() => {
     const envRaw = firstNonEmpty(process.env.WORKERPALS_FILE_MODIFYING_JOBS);
     const parsed = envRaw
@@ -990,6 +1006,18 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   const workerQualitySoftPassOnExhausted =
     parseBoolEnv("WORKERPALS_QUALITY_SOFT_PASS_ON_EXHAUSTED") ??
     asBoolean(workerNode.quality_soft_pass_on_exhausted, true);
+  const workerQualityScopeGateEnabled =
+    parseBoolEnv("WORKERPALS_QUALITY_SCOPE_GATE_ENABLED") ??
+    asBoolean(workerNode.quality_scope_gate_enabled, true);
+  const workerQualityValidationGateEnabled =
+    parseBoolEnv("WORKERPALS_QUALITY_VALIDATION_GATE_ENABLED") ??
+    asBoolean(workerNode.quality_validation_gate_enabled, true);
+  const workerQualityCriticGateEnabled =
+    parseBoolEnv("WORKERPALS_QUALITY_CRITIC_GATE_ENABLED") ??
+    asBoolean(workerNode.quality_critic_gate_enabled, true);
+  const workerQualityPublishGateEnabled =
+    parseBoolEnv("WORKERPALS_QUALITY_PUBLISH_GATE_ENABLED") ??
+    asBoolean(workerNode.quality_publish_gate_enabled, true);
   const workerQualityCriticMinScore = (() => {
     const configThresholdRaw =
       workerNode.quality_critic_min_score == null
@@ -2032,6 +2060,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       outputMaxLines: workerOutputMaxLines,
       outputMaxHeadLines: workerOutputMaxHeadLines,
       qualityMaxAutoRevisions: workerQualityMaxAutoRevisions,
+      qualityValidationMaxAutoRevisions: workerQualityValidationMaxAutoRevisions,
+      qualityScopeGateEnabled: workerQualityScopeGateEnabled,
+      qualityValidationGateEnabled: workerQualityValidationGateEnabled,
+      qualityCriticGateEnabled: workerQualityCriticGateEnabled,
+      qualityPublishGateEnabled: workerQualityPublishGateEnabled,
       qualityValidationStepTimeoutMs: workerQualityValidationStepTimeoutMs,
       qualityCriticTimeoutMs: workerQualityCriticTimeoutMs,
       qualitySoftPassOnExhausted: workerQualitySoftPassOnExhausted,
