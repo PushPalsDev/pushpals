@@ -66,6 +66,7 @@ type WorkerJobResult = JobResult & {
 const DEFAULT_LLM_MODEL = "local-model";
 const CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
 const CODEX_UNAVAILABLE_DOCKER_SHUTDOWN_GRACE_MS = 5_000;
+const CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS = 4_000;
 const CONFIG = loadPushPalsConfig();
 const LOG = new Logger("WorkerPals");
 
@@ -1698,21 +1699,46 @@ async function workerLoop(
             }
           } finally {
             clearInterval(busyHeartbeat);
-            if (
-              !recycleWorkerAfterJob &&
-              job.sessionId &&
-              result?.cooldownMs &&
-              result.cooldownMs > 0
-            ) {
-              await transport.queueSessionCommand(job.sessionId, {
-                type: "assistant_message",
-                payload: {
-                  text: `WorkerPal is cooling down for ${formatDurationMs(result.cooldownMs)} after transient infrastructure failures.`,
-                },
-                from: `worker:${opts.workerId}`,
-              }, { priority: "high" });
+            if (recycleWorkerAfterJob) {
+              runtimeState.shutdownRequested = true;
+              const forceExitTimer = setTimeout(() => {
+                console.warn(
+                  `[WorkerPals] Forcing worker recycle ${CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS}ms after Codex backend failure.`,
+                );
+                process.exit(CODEX_UNAVAILABLE_WORKER_EXIT_CODE);
+              }, CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS);
+              try {
+                await maybeHeartbeat("offline", null, true);
+                if (directWorktreePath) {
+                  await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
+                    console.error(
+                      `[WorkerPals] Failed to remove isolated worktree before Codex recycle: ${String(
+                        err,
+                      )}`,
+                    );
+                  });
+                  directWorktreePath = null;
+                }
+                await shutdownDockerExecutorBeforeCodexRecycle(dockerExecutor);
+              } finally {
+                clearTimeout(forceExitTimer);
+                process.exit(CODEX_UNAVAILABLE_WORKER_EXIT_CODE);
+              }
             }
-            if (!recycleWorkerAfterJob && result?.cooldownMs && result.cooldownMs > 0) {
+            if (job.sessionId && result?.cooldownMs && result.cooldownMs > 0) {
+              await transport.queueSessionCommand(
+                job.sessionId,
+                {
+                  type: "assistant_message",
+                  payload: {
+                    text: `WorkerPal is cooling down for ${formatDurationMs(result.cooldownMs)} after transient infrastructure failures.`,
+                  },
+                  from: `worker:${opts.workerId}`,
+                },
+                { priority: "high" },
+              );
+            }
+            if (result?.cooldownMs && result.cooldownMs > 0) {
               const cooldownMs = Math.max(0, Math.floor(result.cooldownMs));
               console.warn(
                 `[WorkerPals] Entering cooldown for ${formatDurationMs(cooldownMs)} after retry exhaustion.`,
@@ -1727,12 +1753,6 @@ async function workerLoop(
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                 console.error(`[WorkerPals] Failed to remove isolated worktree: ${String(err)}`);
               });
-            }
-            if (recycleWorkerAfterJob) {
-              runtimeState.shutdownRequested = true;
-              await maybeHeartbeat("offline", null, true);
-              await shutdownDockerExecutorBeforeCodexRecycle(dockerExecutor);
-              process.exit(CODEX_UNAVAILABLE_WORKER_EXIT_CODE);
             }
           }
         }
