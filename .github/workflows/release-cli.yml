@@ -37,7 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - meta
-      - publish_release
+      - build_binaries
+      - build_runtime_binaries
+      - smoke_windows_runtime
     permissions:
       contents: read
       id-token: write
@@ -98,6 +100,7 @@ jobs:
     needs:
       - meta
       - publish_npm
+      - publish_release
     permissions:
       contents: read
     steps:
@@ -120,6 +123,7 @@ jobs:
     needs:
       - meta
       - publish_npm
+      - publish_release
     permissions:
       contents: read
     steps:
@@ -510,6 +514,7 @@ jobs:
       - build_binaries
       - build_runtime_binaries
       - smoke_windows_runtime
+      - publish_npm
     env:
       LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64: ${{ secrets.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 }}
       LINUX_RELEASE_GPG_PASSPHRASE: ${{ secrets.LINUX_RELEASE_GPG_PASSPHRASE }}
