@@ -19,6 +19,8 @@ type SpawnedProc = ReturnType<typeof Bun.spawn>;
 const thisFilePath = fileURLToPath(import.meta.url);
 const scriptsDir = dirname(thisFilePath);
 const repoRoot = resolve(scriptsDir, "..");
+export const WORKERPAL_WARMUP_OUTCOME_PATTERN =
+  /Initial WorkerPal capacity ready via|Auto-spawn disabled:|WorkerPal process .* exited with code|Failed to prepare Docker image|Direct mode with isolated worktrees enabled|\[WorkerPals workerpal-[^\]]+\] Polling/i;
 
 function parseArgs(argv: string[]): SmokeOptions {
   let runtimeBinDir = "";
@@ -135,52 +137,56 @@ function resolveProtocolSchemasDir(promptsRoot: string): string {
   throw new Error(`Could not locate protocol schemas under ${promptsRoot} or ${repoRoot}.`);
 }
 
+export function buildRuntimeConfigToml(portBase: number): string {
+  return [
+    'profile = "dev"',
+    'session_id = "dev"',
+    "",
+    "[server]",
+    `url = "http://127.0.0.1:${portBase}"`,
+    `port = ${portBase}`,
+    "",
+    "[localbuddy]",
+    "enabled = false",
+    `port = ${portBase + 2}`,
+    "",
+    "[remotebuddy]",
+    "auto_spawn_workerpals = true",
+    "min_workerpals = 1",
+    "max_workerpals = 1",
+    "wait_for_workerpal_ms = 5000",
+    "workerpal_startup_timeout_ms = 5000",
+    "workerpal_docker = false",
+    "workerpal_require_docker = false",
+    "",
+    "[remotebuddy.autonomy]",
+    "enabled = true",
+    "tick_interval_ms = 300000",
+    "",
+    "[source_control_manager]",
+    `port = ${portBase + 1}`,
+    'remote = "origin"',
+    'pushpals_branch = "main_agents"',
+    'base_branch = "main"',
+    "skip_clean_check = true",
+    "",
+    "[source_control_manager.review_agent]",
+    "enabled = false",
+    "",
+    "[startup]",
+    "log_config_on_start = false",
+    "sync_integration_with_main = false",
+    "skip_llm_preflight = true",
+    "auto_start_lmstudio = false",
+    "startup_warmup = false",
+    "",
+  ].join("\n");
+}
+
 function writeRuntimeConfig(configDir: string, promptsRoot: string, portBase: number): void {
   const sourceDir = resolveRuntimeConfigSourceDir(promptsRoot);
   cpSync(sourceDir, configDir, { recursive: true, force: true });
-  writeFileSync(
-    join(configDir, "local.toml"),
-    [
-      'profile = "dev"',
-      'session_id = "dev"',
-      "",
-      "[server]",
-      `url = "http://127.0.0.1:${portBase}"`,
-      `port = ${portBase}`,
-      "",
-      "[localbuddy]",
-      "enabled = false",
-      `port = ${portBase + 2}`,
-      "",
-      "[remotebuddy]",
-      "max_workerpals = 1",
-      "wait_for_workerpal_ms = 5000",
-      "workerpal_startup_timeout_ms = 5000",
-      "",
-      "[remotebuddy.autonomy]",
-      "enabled = true",
-      "tick_interval_ms = 300000",
-      "",
-      "[source_control_manager]",
-      `port = ${portBase + 1}`,
-      'remote = "origin"',
-      'pushpals_branch = "main_agents"',
-      'base_branch = "main"',
-      "skip_clean_check = true",
-      "",
-      "[source_control_manager.review_agent]",
-      "enabled = false",
-      "",
-      "[startup]",
-      "log_config_on_start = false",
-      "sync_integration_with_main = false",
-      "skip_llm_preflight = true",
-      "auto_start_lmstudio = false",
-      "startup_warmup = false",
-      "",
-    ].join("\n"),
-    "utf8",
-  );
+  writeFileSync(join(configDir, "local.toml"), buildRuntimeConfigToml(portBase), "utf8");
 }
 
 async function isPortAvailable(port: number): Promise<boolean> {
@@ -415,7 +421,7 @@ async function main(): Promise<void> {
     if (existsSync(workerpalBin)) {
       await waitForCapturedOutput(
         remoteSnapshot,
-        /Initial WorkerPal capacity ready via|Auto-spawn disabled:|WorkerPal process .* exited with code|Failed to prepare Docker image/i,
+        WORKERPAL_WARMUP_OUTCOME_PATTERN,
         45_000,
         "RemoteBuddy worker warmup outcome log",
       );
@@ -450,4 +456,6 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+if (import.meta.main) {
+  await main();
+}
