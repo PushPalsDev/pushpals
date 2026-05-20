@@ -2,23 +2,21 @@
 
 ## Release Metadata
 
-- version: `v1.0.89`
-- start_commit: `928bb745812c6e572594627774a5d761ea4fd1f3`
-- end_commit: `e6cca7ab71bdcd835a8f2ff7910c09589dae6769`
+- version: `v1.0.90`
+- start_commit: `72215fc85d6e3330537129b7ec00dca6db2c4129`
+- end_commit: `8c9741cd09affd30f7b3e7c59d5ac72e7ce5c855`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Fix the Windows runtime release smoke so it does not require Docker-backed WorkerPal startup on GitHub's Windows runner, where the Linux sandbox image cannot be built from Windows-container mode.
-- Keep the smoke exercising real compiled runtime services by starting WorkerPal through the packaged Windows executable in direct mode.
-- Teach the smoke to recognize direct WorkerPal child startup logs as a valid warmup outcome instead of waiting only for Docker-oriented or RemoteBuddy warmup summary messages.
-- Add a regression test for the generated Windows smoke config so future release changes do not accidentally reintroduce Docker-required WorkerPal startup.
+- Gate GitHub release asset publication behind a successful npm publish, so a bad `NPM_TOKEN` or npm authorization issue no longer creates a half-published GitHub release.
+- Keep binary builds and the Windows runtime smoke ahead of npm publish, preventing npm publication when runtime artifacts or the Windows autonomy smoke are broken.
+- Keep installed-package Linux and Windows smokes after both npm publish and GitHub release asset publication, matching the real installed CLI path that may download runtime binaries from the release.
 
 ## Validation
 
+- `bun x prettier --check .github/workflows/release-cli.yml`
 - `bun test tests/release-windows-runtime-smoke.test.ts`
-- `bun run scripts/release-windows-runtime-smoke.ts --runtime-bin-dir dist/runtime-windows-x64 --prompts-root . --duration-ms 10000`
-- `bun run test:root`
 - `git diff --check`
 
 ## Install
@@ -45,7 +43,8 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- `v1.0.88` was tagged but did not publish because the Windows runtime smoke required Docker-backed WorkerPal startup; `v1.0.89` contains the follow-up release-smoke fix.
+- `v1.0.87`, `v1.0.88`, and `v1.0.89` were tagged but did not publish to npm; `v1.0.89` did publish GitHub release assets before the npm token failure.
+- npm publication still requires the repository `NPM_TOKEN` secret to have publish rights for `@pushpalsdev/cli` under the `@pushpalsdev` scope.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
