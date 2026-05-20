@@ -2,24 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.0.87`
-- start_commit: `0bd477557f562fd9662b3d52dde176dce4320881`
-- end_commit: `99f3bba80f631ef88fc5b2d565f7acd48075a532`
+- version: `v1.0.88`
+- start_commit: `31be2277d4dff1b55e4a581a62a9b5e695e36f31`
+- end_commit: `c5e10446591ae0b61168b2bb6238cb0e1a7488e1`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Treat WorkerPal `target_paths` and `write_globs` as review/relevance hints instead of hard write boundaries, so workers can edit the behavior-owning files needed to complete a task inside their isolated sandbox.
-- Allow autonomy-generated work to use repo-wide reads and mixed-root/broad scope hints while preserving repo-relative path validation and review-based relevance checks.
-- Stage the full WorkerPal sandbox diff for `task.execute` commits while explicitly excluding transient workspace, output, and `.codex` artifacts.
-- Update OpenAI Codex, OpenHands, and MiniSWE prompts/backends to explain the new full-sandbox write model and require workers to justify any expansion beyond target hints.
-- Keep forbidden/transient artifact protections and validation/review gates in place so ReviewAgent and quality gates decide whether broad edits are relevant and shippable.
-- Sync packaged CLI runtime and sandbox assets so installed CLI users receive the updated autonomy, prompt, and WorkerPal behavior.
+- Bound Docker cleanup during Codex-unavailable WorkerPal recycle so policy-violation and incompatible-Codex workers exit promptly with the expected recycle code instead of hanging behind slow container shutdown.
+- Preserve best-effort Docker cleanup while allowing RemoteBuddy to replace a known-bad WorkerPal quickly after the job failure has already been reported.
+- Add an injectable fetch path for RemoteBuddy orchestration and shared communication so tests no longer fight over process-global `fetch` mocks during full root-suite runs.
+- Harden RemoteBuddy session routing, task dedupe, and autoscale tests to use scoped fetch implementations, removing cross-test flakiness exposed by the release baseline.
+- Sync packaged CLI runtime and sandbox assets so installed CLI users receive the WorkerPal recycle and RemoteBuddy communication updates.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
+- `bun run test:workerpals:e2e`
 - `git diff --check`
 
 ## Install
