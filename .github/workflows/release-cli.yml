@@ -78,6 +78,61 @@ jobs:
             echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify npm publish token
+        if: steps.npm_publish_check.outputs.already_published != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN secret is required to publish @pushpalsdev/cli." >&2
+            exit 1
+          fi
+
+          whoami_stderr="$RUNNER_TEMP/npm-whoami.stderr"
+          token_user="$(npm whoami --registry=https://registry.npmjs.org 2>"$whoami_stderr" || true)"
+          if [ -z "$token_user" ]; then
+            echo "::error::NPM_TOKEN is set, but npm whoami failed. The token is invalid, expired, or not accepted by registry.npmjs.org." >&2
+            cat "$whoami_stderr" >&2 || true
+            exit 1
+          fi
+          echo "NPM_TOKEN authenticates as npm user: ${token_user}"
+
+          owners_stderr="$RUNNER_TEMP/npm-owner-ls.stderr"
+          owners="$(npm owner ls @pushpalsdev/cli --registry=https://registry.npmjs.org 2>"$owners_stderr" || true)"
+          if [ -z "$owners" ]; then
+            echo "::error::Could not read @pushpalsdev/cli npm owners. The token may not be able to access the package." >&2
+            cat "$owners_stderr" >&2 || true
+            exit 1
+          fi
+          if ! printf '%s\n' "$owners" | awk '{print $1}' | grep -Fxq "$token_user"; then
+            echo "::error::NPM_TOKEN authenticates as '${token_user}', but that user is not listed as an owner for @pushpalsdev/cli. Create the secret from a package owner or grant this npm user publish rights." >&2
+            echo "Current @pushpalsdev/cli owners:" >&2
+            printf '%s\n' "$owners" >&2
+            exit 1
+          fi
+
+          access_json="$RUNNER_TEMP/npm-access-packages.json"
+          access_stderr="$RUNNER_TEMP/npm-access-packages.stderr"
+          if ! npm access ls-packages @pushpalsdev --json --registry=https://registry.npmjs.org >"$access_json" 2>"$access_stderr"; then
+            echo "::error::NPM_TOKEN authenticates as '${token_user}', but cannot list package access for @pushpalsdev. This token likely lacks org/package publish permissions." >&2
+            cat "$access_stderr" >&2 || true
+            exit 1
+          fi
+          ACCESS_JSON="$access_json" node <<'JS'
+          const fs = require("fs");
+          const access = JSON.parse(fs.readFileSync(process.env.ACCESS_JSON, "utf8"));
+          const permission = access["@pushpalsdev/cli"];
+          if (!permission || !String(permission).includes("write")) {
+            console.error(
+              `::error::NPM_TOKEN does not have write access to @pushpalsdev/cli. Observed permission: ${permission || "(none)"}.`,
+            );
+            process.exit(1);
+          }
+          console.log(`Verified npm write access for @pushpalsdev/cli: ${permission}`);
+          JS
+
       - name: Build CLI package payload
         if: steps.npm_publish_check.outputs.already_published != 'true'
         run: bun run --cwd packages/cli build

@@ -12,7 +12,7 @@
     "url": "https://github.com/PushPalsDev/pushpals/issues"
   },
   "bin": {
-    "pushpals": "./bin/pushpals.cjs"
+    "pushpals": "bin/pushpals.cjs"
   },
   "files": [
     "bin",
