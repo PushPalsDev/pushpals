@@ -352,9 +352,10 @@ def _build_path_handling_message(target_paths: List[str], repo: str) -> str:
         "- Prefer the repo-relative paths for shell commands.\n"
         "- If FileEditor rejects a repo-relative path, retry with the matching absolute path.\n"
         "- Do not run broad filesystem scans when concrete target paths are listed.\n"
-        "Concrete target paths (repo-relative):\n"
+        "- These paths are starting points, not hard write boundaries; edit other behavior-owning files when needed and explain why.\n"
+        "Target path hints (repo-relative):\n"
         f"{listed_rel}\n"
-        "Concrete target paths (absolute):\n"
+        "Target path hints (absolute):\n"
         f"{listed_abs}"
     )
 

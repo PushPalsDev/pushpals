@@ -319,7 +319,11 @@ export function validateScopeInvariants(
   componentArea: AutonomyComponentArea | null | undefined,
   targetPathsInput: unknown[],
   writeGlobsInput: unknown[],
-  options?: { requireWriteGlobs?: boolean; allowMultipleComponentRoots?: boolean },
+  options?: {
+    requireWriteGlobs?: boolean;
+    allowMultipleComponentRoots?: boolean;
+    hintsOnly?: boolean;
+  },
 ): ScopeValidationResult {
   const errors: string[] = [];
   const scopeSeeds = collectScopeSeedPaths(targetPathsInput, writeGlobsInput);
@@ -327,7 +331,8 @@ export function validateScopeInvariants(
     normalizeAutonomyComponentArea(componentArea) ??
     deriveAutonomyComponentArea(targetPathsInput, writeGlobsInput);
   const allowMultipleComponentRoots = options?.allowMultipleComponentRoots === true;
-  if (!normalizedComponentArea && scopeSeeds.length > 1 && !allowMultipleComponentRoots) {
+  const hintsOnly = options?.hintsOnly === true;
+  if (!hintsOnly && !normalizedComponentArea && scopeSeeds.length > 1 && !allowMultipleComponentRoots) {
     errors.push(
       `scope spans multiple component roots: ${scopeSeeds.slice(0, 6).join(", ")}`,
     );
@@ -341,7 +346,7 @@ export function validateScopeInvariants(
       errors.push(`invalid target_path: ${String(raw ?? "")}`);
       continue;
     }
-    if (rootPrefix && !underRoot(normalized, rootPrefix)) {
+    if (!hintsOnly && rootPrefix && !underRoot(normalized, rootPrefix)) {
       errors.push(`target_path outside component root: ${normalized}`);
       continue;
     }
@@ -362,20 +367,21 @@ export function validateScopeInvariants(
       errors.push(`invalid write_glob: ${String(raw ?? "")}`);
       continue;
     }
-    if (hasForbiddenBroadGlob(normalized)) {
+    if (!hintsOnly && hasForbiddenBroadGlob(normalized)) {
       errors.push(`forbidden broad write_glob: ${normalized}`);
       continue;
     }
     const prefix = literalPrefix(normalized);
-    if (!prefix) {
+    if (!hintsOnly && !prefix) {
       errors.push(`write_glob literal prefix cannot be empty: ${normalized}`);
       continue;
     }
-    if (rootPrefix && !underRoot(prefix, rootPrefix)) {
+    if (!hintsOnly && rootPrefix && !underRoot(prefix, rootPrefix)) {
       errors.push(`write_glob outside component root: ${normalized}`);
       continue;
     }
     if (
+      !hintsOnly &&
       !normalizedTargetPaths.some(
         (targetPath) => targetPath === prefix || targetPath.startsWith(`${prefix}/`),
       )
@@ -393,13 +399,13 @@ export function validateScopeInvariants(
     errors.push("write_globs must be provided and non-empty");
   }
 
-  if (normalizedTargetPaths.length > 0 && normalizedWriteGlobs.length > 0) {
+  if (!hintsOnly && normalizedTargetPaths.length > 0 && normalizedWriteGlobs.length > 0) {
     for (const targetPath of normalizedTargetPaths) {
       const covered = normalizedWriteGlobs.some((glob) => matchesGlob(targetPath, glob));
       if (!covered) errors.push(`target_path not covered by write_globs: ${targetPath}`);
     }
   }
-  if (!normalizedComponentArea && !allowMultipleComponentRoots) {
+  if (!hintsOnly && !normalizedComponentArea && !allowMultipleComponentRoots) {
     errors.push("component_area could not be derived from scope");
   }
 

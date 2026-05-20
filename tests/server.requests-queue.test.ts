@@ -198,7 +198,7 @@ describe("server RequestQueue", () => {
     queue.close();
   });
 
-  test("rejects autonomy metadata that spans multiple component roots", () => {
+  test("preserves mixed-root autonomy metadata as review hints", () => {
     const queue = new RequestQueue(":memory:");
     const enqueued = queue.enqueue({
       sessionId: "dev",
@@ -211,8 +211,16 @@ describe("server RequestQueue", () => {
         },
       },
     });
-    expect(enqueued.ok).toBe(false);
-    expect(String(enqueued.message ?? "")).toContain("multiple component roots");
+    expect(enqueued.ok).toBe(true);
+    const claimed = queue.claim("remotebuddy-orchestrator");
+    expect(claimed.ok).toBe(true);
+    const metadata = (claimed.request?.metadata ?? {}) as Record<string, unknown>;
+    const autonomy = (metadata.autonomy ?? {}) as Record<string, unknown>;
+    expect(autonomy.targetPaths).toEqual([
+      "app/_layout.tsx",
+      "scripts/fix-baseline-browser-mapping.js",
+    ]);
+    expect(autonomy.writeGlobs).toEqual(["app/**", "scripts/**"]);
     queue.close();
   });
 

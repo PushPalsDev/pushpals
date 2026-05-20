@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   buildGitCommitArgs,
+  buildStageCommand,
   buildWorkerCommitMessage,
   buildCommitMessageGeneratorUserMessage,
   explicitWorkerCommitIdentityFromEnv,
@@ -37,6 +38,28 @@ async function runGit(repo: string, args: string[]): Promise<string> {
 }
 
 describe("workerpals commit message generation helpers", () => {
+  test("task.execute stages the full sandbox diff instead of only target hints", () => {
+    expect(
+      buildStageCommand("task.execute", {
+        paths: ["app/game.tsx"],
+        planning: {
+          scope: {
+            writeGlobs: ["app/game.tsx"],
+          },
+        },
+      }),
+    ).toEqual([
+      "add",
+      "-A",
+      "--",
+      ".",
+      ":(exclude)workspace/**",
+      ":(exclude)outputs/**",
+      ":(exclude).codex",
+      ":(exclude).codex/**",
+    ]);
+  });
+
   test("builds user prompt with background context, filtered test commands, and staged diff", () => {
     const prompt = buildCommitMessageGeneratorUserMessage(
       "can you add more tests for localbuddy",

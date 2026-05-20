@@ -494,6 +494,33 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("accepts broad repo scope hints without treating them as write permissions", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({ sessionId: "s1" }).snapshot_id;
+
+    const result = store.recordObjectiveDecision({
+      runId: "run_broad_hints",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_broad_hints",
+        title: "Improve repo behavior across owning files",
+        instruction: "Use the target paths as starting points and edit the owning files.",
+        objective_type: "small_refactor",
+        component_area: "apps/server",
+        trigger_type: "queue_health",
+        target_paths: ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+        scope: { read_anywhere: true, write_globs: ["**/*"] },
+        confidence: 0.8,
+        risk_level: "medium",
+        expected_validation: ["bun run test:root"],
+        status: "dispatched",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
   test("dispatch lock is visible only to other runs", () => {
     const store = makeStore();
     const acquired = store.acquireDispatchLock({ sessionId: "s1", runId: "run_1", ttlMs: 60_000 });

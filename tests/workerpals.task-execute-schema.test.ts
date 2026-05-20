@@ -222,7 +222,7 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
 
-  test("rejects generic autonomy-origin mixed-root scope", async () => {
+  test("allows autonomy-origin mixed-root scope as review intent hints", async () => {
     const planning = {
       ...VALID_PLANNING,
       targetPaths: ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
@@ -244,7 +244,9 @@ describe("workerpals task.execute strict schema", () => {
     );
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toContain("componentArea");
+    expect(result.summary).not.toContain("scope invariants");
+    expect(result.summary).not.toContain("componentArea");
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
 
   test("allows review_fix autonomy-origin tasks to use multi-root PR scope", async () => {
@@ -307,7 +309,7 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
 
-  test("still rejects broad write globs for review_fix multi-root scope", async () => {
+  test("allows broad write globs as sandbox review hints for review_fix scope", async () => {
     const planning = {
       ...VALID_PLANNING,
       targetPaths: ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
@@ -332,6 +334,7 @@ describe("workerpals task.execute strict schema", () => {
     );
 
     expect(result.ok).toBe(false);
-    expect(result.summary).toContain("forbidden broad write_glob");
+    expect(result.summary).not.toContain("forbidden broad write_glob");
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
 });

@@ -465,25 +465,9 @@ def _extract_write_globs_from_payload(payload: Optional[Dict[str, Any]]) -> List
 
 
 def _assert_write_allowed(repo: str, path: str, write_globs: Optional[List[str]]) -> None:
-    if not write_globs:
-        return
-    normalized = _normalize_concrete_repo_path(repo, path)
-    if not normalized:
-        raise RuntimeError(f"Invalid write path for scope enforcement: {path!r}")
-    for glob in write_globs:
-        pattern = str(glob or "").strip()
-        if not pattern:
-            continue
-        if any(ch in pattern for ch in "*?[]"):
-            if fnmatch.fnmatchcase(normalized, pattern):
-                return
-            continue
-        if normalized == pattern or normalized.startswith(pattern + "/"):
-            return
-    raise RuntimeError(
-        "Scope violation: attempted write outside writeGlobs. "
-        f"path={normalized!r} write_globs={write_globs!r}"
-    )
+    # WorkerPal jobs run in isolated sandboxes. Scope hints are used for review
+    # relevance, not per-write filesystem enforcement.
+    return
 
 
 def _read_text_file(repo: str, path: str, max_chars: int = 60000) -> str:
@@ -1587,11 +1571,6 @@ def _broker_run(
     if expected_targets and changed_paths:
         changed_set = {str(p).strip().replace("\\", "/") for p in changed_paths}
         expected_set = {str(p).strip().replace("\\", "/") for p in expected_targets}
-        strict_target_match = bool(
-            explicit_target_set
-            and not any(t in {".", "/"} for t in explicit_target_set)
-            and not any(any(ch in t for ch in "*?[]") for t in explicit_target_set)
-        )
         matched = any(
             _target_hint_matches_changed_path(expected, changed)
             for expected in expected_set
@@ -1602,14 +1581,6 @@ def _broker_run(
                 "Expected one of target paths to change, but observed different files. "
                 f"expected={sorted(expected_set)} observed={sorted(changed_set)}"
             )
-            if strict_target_match:
-                return {
-                    "ok": False,
-                    "summary": "tool broker failed: changed files do not match explicit target paths",
-                    "stdout": stdout + "\n\nChanged files:\n" + "\n".join(f"- {p}" for p in changed_paths),
-                    "stderr": msg,
-                    "exitCode": 3,
-                }
             stdout += "\n\nTarget-path mismatch (heuristic, non-fatal):\n" + msg
     if edits_made and not shell_validation_ran:
         stdout += (
@@ -1786,10 +1757,10 @@ def _run_miniswe_task(
     agent = None
     agent_messages: List[Dict[str, Any]] = []
     broker_enabled = _tool_broker_enabled(base_url)
-    prefer_broker_for_scoped_writes = bool(explicit_write_globs)
+    prefer_broker_for_scoped_writes = False
     ran_primary_broker = False
     if prefer_broker_for_scoped_writes and broker_enabled:
-        log.info("Using tool broker shim for strict per-write scope enforcement.")
+        log.info("Using tool broker shim for task execution.")
         broker_result = _run_broker_with_recovery()
         if not bool(broker_result.get("ok")):
             return {

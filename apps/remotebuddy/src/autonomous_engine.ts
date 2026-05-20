@@ -241,12 +241,6 @@ const POLICY: Record<AutonomyObjectiveType, PolicyRule> = {
 };
 
 const RISK_ORDER: Record<"low" | "medium" | "high", number> = { low: 0, medium: 1, high: 2 };
-const BREADTH_ORDER: Record<"narrow" | "medium" | "broad", number> = {
-  narrow: 0,
-  medium: 1,
-  broad: 2,
-};
-
 const IDEATION_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/autonomy_ideation_system_prompt.md",
 ).trim();
@@ -1421,6 +1415,7 @@ function adaptCandidateShapeToRepo(params: {
     shape.write_globs,
     {
       requireWriteGlobs: true,
+      hintsOnly: true,
     },
   );
   const pathsExist =
@@ -2437,7 +2432,7 @@ function buildCandidateShapeFromPattern(params: {
     componentArea,
     targetPaths.length > 0 ? targetPaths : defaults.target_paths,
     writeGlobs.length > 0 ? writeGlobs : defaults.write_globs,
-    { requireWriteGlobs: true },
+    { requireWriteGlobs: true, hintsOnly: true },
   );
   return adaptCandidateShapeToRepo({
     shape: {
@@ -3434,7 +3429,7 @@ export function buildRepoVisionFallbackCandidates(params: {
       component_area: componentArea,
       target_paths: targetPaths,
       scope: {
-        read_anywhere: false,
+        read_anywhere: true,
         write_globs: writeGlobs,
       },
       risk_level: "low",
@@ -3528,7 +3523,7 @@ export function buildEngineFallbackCandidates(params: {
         component_area: candidateShape.component_area,
         target_paths: candidateShape.target_paths,
         scope: {
-          read_anywhere: false,
+          read_anywhere: true,
           write_globs: candidateShape.write_globs,
         },
         risk_level: candidateShape.risk_level,
@@ -4954,14 +4949,10 @@ export class RemoteBuddyAutonomousEngine {
             candidate.component_area,
             candidate.target_paths,
             candidate.scope.write_globs,
-            { requireWriteGlobs: true },
+            { requireWriteGlobs: true, hintsOnly: true },
           );
           if (!scopeValidation.ok) {
             recordDropReason(`${source}_scope_validation_failed`);
-            continue;
-          }
-          if (BREADTH_ORDER[scopeValidation.breadth] > BREADTH_ORDER[policy.maxBreadth]) {
-            recordDropReason(`${source}_scope_breadth_exceeds_policy`);
             continue;
           }
           if (candidate.scope.read_anywhere && !this.cfg.allowReadAnywhere) {

@@ -454,11 +454,14 @@ function buildExecutionGuidance(
     targetPaths.length > 0 ? targetPaths : (plan.scope.write_globs ?? []),
   );
   if (targets.length > 0) {
-    lines.push("Target paths:");
+    lines.push("Target paths / starting points:");
     for (const path of targets) lines.push(`- ${path}`);
     lines.push("Path handling:");
     lines.push("- Treat all target paths as repo-relative to the current working directory.");
     lines.push("- Do not prepend a leading slash to target paths.");
+    lines.push(
+      "- These paths are relevance hints, not hard write boundaries; edit the behavior-owning files needed for the task and explain any expansion.",
+    );
   }
   lines.push("Scope:");
   lines.push(`- read_anywhere: ${plan.scope.read_anywhere ? "true" : "false"}`);
@@ -467,7 +470,7 @@ function buildExecutionGuidance(
     lines.push(`- max_files_to_edit: ${plan.scope.max_files_to_edit}`);
   }
   if (Array.isArray(plan.scope.write_globs) && plan.scope.write_globs.length > 0) {
-    lines.push("Write globs:");
+    lines.push("Write intent hints:");
     for (const glob of plan.scope.write_globs) lines.push(`- ${glob}`);
   }
   if (Array.isArray(plan.scope.forbidden_globs) && plan.scope.forbidden_globs.length > 0) {
@@ -2503,7 +2506,7 @@ export class RemoteBuddyOrchestrator {
           plan.job_kind = "task.execute";
           plan.lane = "worker";
         }
-        plan.scope.read_anywhere = false;
+        plan.scope.read_anywhere = true;
         plan.scope.write_allowed = true;
         plan.scope.write_globs = [...autonomyMetadata.writeGlobs];
       }
@@ -2551,7 +2554,7 @@ export class RemoteBuddyOrchestrator {
             )}`,
           );
         }
-        if (forceWorker) {
+        if (forceWorker && !autonomyMetadata) {
           const concreteTargetCount = targetPaths.filter((entry) => entry && entry !== ".").length;
           if (concreteTargetCount > 0) {
             const currentMax =
@@ -2563,11 +2566,6 @@ export class RemoteBuddyOrchestrator {
               plan.scope.max_files_to_edit = concreteTargetCount;
             }
           }
-        }
-        if (autonomyMetadata && (!plan.scope.write_globs || plan.scope.write_globs.length === 0)) {
-          throw new Error(
-            "Autonomy-origin request requires non-empty planning.scope.write_globs before task dispatch.",
-          );
         }
         if (plan.acceptance_criteria.length === 0) {
           plan.acceptance_criteria = ["Produce a correct and helpful result for the user request."];

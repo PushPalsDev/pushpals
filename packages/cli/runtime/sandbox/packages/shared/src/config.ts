@@ -1929,7 +1929,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         ),
         allowReadAnywhere:
           parseBoolEnv("REMOTEBUDDY_AUTONOMY_ALLOW_READ_ANYWHERE") ??
-          asBoolean(remoteAutonomyNode.allow_read_anywhere, false),
+          asBoolean(remoteAutonomyNode.allow_read_anywhere, true),
         prFeedbackCommentRows: Math.max(
           1,
           Math.min(

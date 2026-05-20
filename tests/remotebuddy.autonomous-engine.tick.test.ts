@@ -67,7 +67,7 @@ function makeConfig(): any {
         },
         cooldownFailStreakThreshold: 2,
         cooldownMs: 1_800_000,
-        allowReadAnywhere: false,
+        allowReadAnywhere: true,
         prFeedbackCommentRows: 16,
         prFeedbackCommentChars: 600,
         prFeedbackSummaryChars: 600,

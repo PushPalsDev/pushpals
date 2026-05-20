@@ -1,2 +1,2 @@
-Explicit target paths:
+Target path hints:
 {{targets_block}}

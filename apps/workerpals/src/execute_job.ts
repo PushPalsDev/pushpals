@@ -19,7 +19,6 @@ import {
   normalizeTargetPath,
   requirementsForValidationCommand,
   sanitizeSourceControlIdentityField,
-  validateScopeInvariants,
   type AutonomyComponentArea,
   type SourceControlCommitIdentity,
   type ToolRequirement,
@@ -2503,12 +2502,21 @@ function buildStageTargets(kind: string, params?: Record<string, unknown>): stri
   }
 }
 
-function buildStageCommand(kind: string, params?: Record<string, unknown>): string[] | null {
+export function buildStageCommand(kind: string, params?: Record<string, unknown>): string[] | null {
+  if (kind === "task.execute") {
+    return [
+      "add",
+      "-A",
+      "--",
+      ".",
+      ":(exclude)workspace/**",
+      ":(exclude)outputs/**",
+      ":(exclude).codex",
+      ":(exclude).codex/**",
+    ];
+  }
   const targets = buildStageTargets(kind, params);
   if (targets.length === 0) {
-    if (kind === "task.execute") {
-      return ["add", "-A", "--", ".", ":(exclude)workspace/**", ":(exclude)outputs/**"];
-    }
     return null;
   }
   return ["add", "-A", "--", ...targets];
@@ -3949,13 +3957,10 @@ function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user"
   return "user";
 }
 
-function collectWriteScopeIssuesFromChangedPaths(
+export function collectWriteScopeIssuesFromChangedPaths(
   changedPaths: string[],
   planning: TaskExecutePlanning,
 ): string[] {
-  const writeGlobs = toStringArray(planning.scope.writeGlobs ?? []);
-  if (writeGlobs.length === 0) return [];
-
   const normalizedChangedPaths = changedPaths
     .map((entry) => normalizeStagePath(entry))
     .filter((entry): entry is string => Boolean(entry) && entry !== ".");
@@ -3963,12 +3968,6 @@ function collectWriteScopeIssuesFromChangedPaths(
 
   const forbidden = toStringArray(planning.scope.forbiddenGlobs ?? []);
   const issues: string[] = [];
-  const outOfScope = normalizedChangedPaths.filter(
-    (path) => !writeGlobs.some((glob) => matchesGlob(path, glob)),
-  );
-  if (outOfScope.length > 0) {
-    issues.push(`modified paths outside writeGlobs: ${outOfScope.join(", ")}`);
-  }
   const forbiddenTouched = normalizedChangedPaths.filter((path) =>
     forbidden.some((glob) => matchesGlob(path, glob)),
   );
@@ -4105,41 +4104,17 @@ function validateTaskExecutePlanning(
       reviewAgentAllowsMultiRootScope(options?.reviewAgentResolutionType);
     if (origin === "autonomy") {
       const declaredComponentArea = asAutonomyComponentArea(options?.autonomyComponentArea);
-      const inferredComponentArea = allowMultiRootAutonomyScope
-        ? null
-        : deriveAutonomyComponentArea(normalizedTargetPaths, normalizedWriteGlobs);
-      const componentArea = allowMultiRootAutonomyScope
-        ? declaredComponentArea
-        : declaredComponentArea ?? inferredComponentArea;
-      if (!allowMultiRootAutonomyScope && !componentArea) {
-        return {
-          ok: false,
-          message:
-            "task.execute planning.targetPaths must resolve to a repo-relative componentArea",
-        };
-      }
-      if (
-        !allowMultiRootAutonomyScope &&
-        declaredComponentArea &&
-        inferredComponentArea &&
-        declaredComponentArea !== inferredComponentArea
-      ) {
-        return {
-          ok: false,
-          message: "task.execute planning.targetPaths do not match autonomy componentArea",
-        };
-      }
-      const validatedScope = validateScopeInvariants(
-        componentArea,
-        normalizedTargetPaths,
-        normalizedWriteGlobs,
-        { requireWriteGlobs: false, allowMultipleComponentRoots: allowMultiRootAutonomyScope },
-      );
-      if (!validatedScope.ok) {
-        return {
-          ok: false,
-          message: `task.execute scope invariants failed: ${validatedScope.errors.join("; ")}`,
-        };
+      if (!allowMultiRootAutonomyScope && declaredComponentArea) {
+        const inferredComponentArea = deriveAutonomyComponentArea(
+          normalizedTargetPaths,
+          normalizedWriteGlobs,
+        );
+        if (inferredComponentArea && declaredComponentArea !== inferredComponentArea) {
+          return {
+            ok: false,
+            message: "task.execute planning.targetPaths do not match autonomy componentArea",
+          };
+        }
       }
     } else if (normalizedWriteGlobs.length > 0) {
       const uncoveredPaths = normalizedTargetPaths.filter(

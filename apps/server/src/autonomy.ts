@@ -198,7 +198,6 @@ const OBJECTIVE_POLICY: Record<AutonomyObjectiveType, ObjectivePolicy> = {
 };
 
 const RISK_ORDER: Record<AutonomyRiskLevel, number> = { low: 0, medium: 1, high: 2 };
-const BREADTH_ORDER: Record<AutonomyGlobBreadth, number> = { narrow: 0, medium: 1, broad: 2 };
 const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>(
   Object.keys(OBJECTIVE_POLICY) as AutonomyObjectiveType[],
 );
@@ -1073,7 +1072,6 @@ function normalizeInspirationPatternEntry(raw: unknown): NormalizedInspirationPa
 function policyViolations(params: {
   objectiveType: string;
   riskLevel: string;
-  breadth: AutonomyGlobBreadth;
   readAnywhere: boolean;
   expectedValidation: string[];
   allowReadAnywhere: boolean;
@@ -1093,11 +1091,6 @@ function policyViolations(params: {
     reasons.push(`risk_level "${riskLevel}" exceeds policy max "${policy.maxRisk}"`);
   }
 
-  if (BREADTH_ORDER[params.breadth] > BREADTH_ORDER[policy.maxGlobBreadth]) {
-    reasons.push(
-      `write_glob breadth "${params.breadth}" exceeds policy max "${policy.maxGlobBreadth}"`,
-    );
-  }
   if (params.readAnywhere && !params.allowReadAnywhere) {
     reasons.push("read_anywhere=true is not allowlisted");
   }
@@ -3964,6 +3957,7 @@ export class AutonomyStore {
       const writeGlobs = asStringArray(scopeRecord.writeGlobs ?? scopeRecord.write_globs);
       const scopeValidation = validateScopeInvariants(componentArea, targetPaths, writeGlobs, {
         requireWriteGlobs: true,
+        hintsOnly: true,
       });
       const enumErrors: string[] = [];
       if (!objectiveType) enumErrors.push(`invalid objective_type "${objectiveTypeRaw}"`);
@@ -3971,7 +3965,6 @@ export class AutonomyStore {
       const policyErrors = policyViolations({
         objectiveType: objectiveType ?? objectiveTypeRaw,
         riskLevel,
-        breadth: scopeValidation.breadth,
         readAnywhere,
         expectedValidation,
         allowReadAnywhere: this.config.remotebuddy.autonomy.allowReadAnywhere,
@@ -4138,7 +4131,7 @@ export class AutonomyStore {
       componentArea,
       targetPaths,
       asStringArray(scopeRecord.writeGlobs ?? scopeRecord.write_globs),
-      { requireWriteGlobs: true },
+      { requireWriteGlobs: true, hintsOnly: true },
     );
     if (!scopeValidation.ok)
       return { ok: false, objectiveId, reason: scopeValidation.errors.join("; ") };
@@ -4152,7 +4145,6 @@ export class AutonomyStore {
     const policyErrors = policyViolations({
       objectiveType,
       riskLevel,
-      breadth: scopeValidation.breadth,
       readAnywhere,
       expectedValidation,
       allowReadAnywhere: this.config.remotebuddy.autonomy.allowReadAnywhere,

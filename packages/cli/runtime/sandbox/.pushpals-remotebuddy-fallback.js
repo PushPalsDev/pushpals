@@ -588,7 +588,8 @@ function validateScopeInvariants(componentArea, targetPathsInput, writeGlobsInpu
   const scopeSeeds = collectScopeSeedPaths(targetPathsInput, writeGlobsInput);
   const normalizedComponentArea = normalizeAutonomyComponentArea(componentArea) ?? deriveAutonomyComponentArea(targetPathsInput, writeGlobsInput);
   const allowMultipleComponentRoots = options?.allowMultipleComponentRoots === true;
-  if (!normalizedComponentArea && scopeSeeds.length > 1 && !allowMultipleComponentRoots) {
+  const hintsOnly = options?.hintsOnly === true;
+  if (!hintsOnly && !normalizedComponentArea && scopeSeeds.length > 1 && !allowMultipleComponentRoots) {
     errors.push(`scope spans multiple component roots: ${scopeSeeds.slice(0, 6).join(", ")}`);
   }
   const rootPrefix = normalizedComponentArea ? componentRootPrefix(normalizedComponentArea) : "";
@@ -600,7 +601,7 @@ function validateScopeInvariants(componentArea, targetPathsInput, writeGlobsInpu
       errors.push(`invalid target_path: ${String(raw ?? "")}`);
       continue;
     }
-    if (rootPrefix && !underRoot(normalized, rootPrefix)) {
+    if (!hintsOnly && rootPrefix && !underRoot(normalized, rootPrefix)) {
       errors.push(`target_path outside component root: ${normalized}`);
       continue;
     }
@@ -621,20 +622,20 @@ function validateScopeInvariants(componentArea, targetPathsInput, writeGlobsInpu
       errors.push(`invalid write_glob: ${String(raw ?? "")}`);
       continue;
     }
-    if (hasForbiddenBroadGlob(normalized)) {
+    if (!hintsOnly && hasForbiddenBroadGlob(normalized)) {
       errors.push(`forbidden broad write_glob: ${normalized}`);
       continue;
     }
     const prefix = literalPrefix(normalized);
-    if (!prefix) {
+    if (!hintsOnly && !prefix) {
       errors.push(`write_glob literal prefix cannot be empty: ${normalized}`);
       continue;
     }
-    if (rootPrefix && !underRoot(prefix, rootPrefix)) {
+    if (!hintsOnly && rootPrefix && !underRoot(prefix, rootPrefix)) {
       errors.push(`write_glob outside component root: ${normalized}`);
       continue;
     }
-    if (!normalizedTargetPaths.some((targetPath) => targetPath === prefix || targetPath.startsWith(`${prefix}/`))) {
+    if (!hintsOnly && !normalizedTargetPaths.some((targetPath) => targetPath === prefix || targetPath.startsWith(`${prefix}/`))) {
       errors.push(`write_glob prefix does not align with target_paths: ${normalized}`);
       continue;
     }
@@ -647,14 +648,14 @@ function validateScopeInvariants(componentArea, targetPathsInput, writeGlobsInpu
   if ((options?.requireWriteGlobs ?? true) && normalizedWriteGlobs.length === 0) {
     errors.push("write_globs must be provided and non-empty");
   }
-  if (normalizedTargetPaths.length > 0 && normalizedWriteGlobs.length > 0) {
+  if (!hintsOnly && normalizedTargetPaths.length > 0 && normalizedWriteGlobs.length > 0) {
     for (const targetPath of normalizedTargetPaths) {
       const covered = normalizedWriteGlobs.some((glob) => matchesGlob(targetPath, glob));
       if (!covered)
         errors.push(`target_path not covered by write_globs: ${targetPath}`);
     }
   }
-  if (!normalizedComponentArea && !allowMultipleComponentRoots) {
+  if (!hintsOnly && !normalizedComponentArea && !allowMultipleComponentRoots) {
     errors.push("component_area could not be derived from scope");
   }
   const breadth = classifyGlobBreadth(normalizedWriteGlobs);
@@ -1357,7 +1358,7 @@ function loadPushPalsConfig(options = {}) {
           const parsed = Number.parseFloat(String(firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_ALERT_AUTONOMY_FAILURE_RATE_THRESHOLD, asString(remoteAutonomyNode.alert_autonomy_failure_rate_threshold, "0.45"), "0.45")));
           return Number.isFinite(parsed) ? parsed : 0.45;
         })())),
-        allowReadAnywhere: parseBoolEnv("REMOTEBUDDY_AUTONOMY_ALLOW_READ_ANYWHERE") ?? asBoolean(remoteAutonomyNode.allow_read_anywhere, false),
+        allowReadAnywhere: parseBoolEnv("REMOTEBUDDY_AUTONOMY_ALLOW_READ_ANYWHERE") ?? asBoolean(remoteAutonomyNode.allow_read_anywhere, true),
         prFeedbackCommentRows: Math.max(1, Math.min(200, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_PR_FEEDBACK_COMMENT_ROWS") ?? remoteAutonomyNode.pr_feedback_comment_rows, 16))),
         prFeedbackCommentChars: Math.max(32, Math.min(20000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_PR_FEEDBACK_COMMENT_CHARS") ?? remoteAutonomyNode.pr_feedback_comment_chars, 600))),
         prFeedbackSummaryChars: Math.max(32, Math.min(20000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_PR_FEEDBACK_SUMMARY_CHARS") ?? remoteAutonomyNode.pr_feedback_summary_chars, 600))),
@@ -4257,11 +4258,6 @@ var POLICY = {
   }
 };
 var RISK_ORDER = { low: 0, medium: 1, high: 2 };
-var BREADTH_ORDER = {
-  narrow: 0,
-  medium: 1,
-  broad: 2
-};
 var IDEATION_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_ideation_system_prompt.md").trim();
 var SCORING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_scoring_system_prompt.md").trim();
 var PLANNING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_planning_system_prompt.md").trim();
@@ -4996,7 +4992,8 @@ function chooseRepoObjectiveTargetProfile(profiles, objective) {
 function adaptCandidateShapeToRepo(params) {
   const shape = params.shape;
   const scopeValidation = validateScopeInvariants(shape.component_area, shape.target_paths, shape.write_globs, {
-    requireWriteGlobs: true
+    requireWriteGlobs: true,
+    hintsOnly: true
   });
   const pathsExist = params.repoRoot && scopeValidation.ok ? findMissingRepoTargetPaths(params.repoRoot, scopeValidation.normalizedTargetPaths).length === 0 : scopeValidation.ok;
   if (scopeValidation.ok && pathsExist) {
@@ -5782,7 +5779,7 @@ ${pattern.tags.join(" ")}`.toLowerCase();
   const targetPaths = asStringArray2(metadataShape.target_paths ?? metadataShape.targetPaths ?? metadata.target_paths);
   const writeGlobs = asStringArray2(metadataShape.write_globs ?? metadataShape.writeGlobs ?? metadata.write_globs);
   const validationIdeas = asStringArray2(metadataShape.expected_validation ?? metadataShape.expectedValidation ?? metadata.expected_validation ?? pattern.validationIdeas);
-  const scopeCheck = validateScopeInvariants(componentArea, targetPaths.length > 0 ? targetPaths : defaults.target_paths, writeGlobs.length > 0 ? writeGlobs : defaults.write_globs, { requireWriteGlobs: true });
+  const scopeCheck = validateScopeInvariants(componentArea, targetPaths.length > 0 ? targetPaths : defaults.target_paths, writeGlobs.length > 0 ? writeGlobs : defaults.write_globs, { requireWriteGlobs: true, hintsOnly: true });
   return adaptCandidateShapeToRepo({
     shape: {
       objective_type: objectiveType,
@@ -6217,7 +6214,7 @@ function buildRepoVisionFallbackCandidates(params) {
       component_area: componentArea,
       target_paths: targetPaths,
       scope: {
-        read_anywhere: false,
+        read_anywhere: true,
         write_globs: writeGlobs
       },
       risk_level: "low",
@@ -6271,7 +6268,7 @@ function buildEngineFallbackCandidates(params) {
       component_area: candidateShape.component_area,
       target_paths: candidateShape.target_paths,
       scope: {
-        read_anywhere: false,
+        read_anywhere: true,
         write_globs: candidateShape.write_globs
       },
       risk_level: candidateShape.risk_level,
@@ -7367,13 +7364,9 @@ ${JSON.stringify(input.messages ?? [])}`),
             recordDropReason(`${source}_risk_exceeds_policy`);
             continue;
           }
-          const scopeValidation = validateScopeInvariants(candidate.component_area, candidate.target_paths, candidate.scope.write_globs, { requireWriteGlobs: true });
+          const scopeValidation = validateScopeInvariants(candidate.component_area, candidate.target_paths, candidate.scope.write_globs, { requireWriteGlobs: true, hintsOnly: true });
           if (!scopeValidation.ok) {
             recordDropReason(`${source}_scope_validation_failed`);
-            continue;
-          }
-          if (BREADTH_ORDER[scopeValidation.breadth] > BREADTH_ORDER[policy.maxBreadth]) {
-            recordDropReason(`${source}_scope_breadth_exceeds_policy`);
             continue;
           }
           if (candidate.scope.read_anywhere && !this.cfg.allowReadAnywhere) {
@@ -8266,12 +8259,13 @@ function buildExecutionGuidance(plan, targetPaths, requiredValidationSteps = [])
   const lines = [];
   const targets = normalizePathHints(targetPaths.length > 0 ? targetPaths : plan.scope.write_globs ?? []);
   if (targets.length > 0) {
-    lines.push("Target paths:");
+    lines.push("Target paths / starting points:");
     for (const path of targets)
       lines.push(`- ${path}`);
     lines.push("Path handling:");
     lines.push("- Treat all target paths as repo-relative to the current working directory.");
     lines.push("- Do not prepend a leading slash to target paths.");
+    lines.push("- These paths are relevance hints, not hard write boundaries; edit the behavior-owning files needed for the task and explain any expansion.");
   }
   lines.push("Scope:");
   lines.push(`- read_anywhere: ${plan.scope.read_anywhere ? "true" : "false"}`);
@@ -8280,7 +8274,7 @@ function buildExecutionGuidance(plan, targetPaths, requiredValidationSteps = [])
     lines.push(`- max_files_to_edit: ${plan.scope.max_files_to_edit}`);
   }
   if (Array.isArray(plan.scope.write_globs) && plan.scope.write_globs.length > 0) {
-    lines.push("Write globs:");
+    lines.push("Write intent hints:");
     for (const glob of plan.scope.write_globs)
       lines.push(`- ${glob}`);
   }
@@ -9749,7 +9743,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           plan.job_kind = "task.execute";
           plan.lane = "worker";
         }
-        plan.scope.read_anywhere = false;
+        plan.scope.read_anywhere = true;
         plan.scope.write_allowed = true;
         plan.scope.write_globs = [...autonomyMetadata.writeGlobs];
       }
@@ -9774,7 +9768,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         if (scopeCoverage.addedGlobs.length > 0) {
           console.warn(`[RemoteBuddy] Planner write_globs did not cover target paths. Added scope globs: ${scopeCoverage.addedGlobs.join(", ")}`);
         }
-        if (forceWorker) {
+        if (forceWorker && !autonomyMetadata) {
           const concreteTargetCount = targetPaths.filter((entry) => entry && entry !== ".").length;
           if (concreteTargetCount > 0) {
             const currentMax = Number.isFinite(Number(plan.scope.max_files_to_edit)) && Number(plan.scope.max_files_to_edit) > 0 ? Math.floor(Number(plan.scope.max_files_to_edit)) : 0;
@@ -9782,9 +9776,6 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
               plan.scope.max_files_to_edit = concreteTargetCount;
             }
           }
-        }
-        if (autonomyMetadata && (!plan.scope.write_globs || plan.scope.write_globs.length === 0)) {
-          throw new Error("Autonomy-origin request requires non-empty planning.scope.write_globs before task dispatch.");
         }
         if (plan.acceptance_criteria.length === 0) {
           plan.acceptance_criteria = ["Produce a correct and helpful result for the user request."];

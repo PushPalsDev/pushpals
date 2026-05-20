@@ -99,4 +99,22 @@ describe("shared autonomy policy", () => {
     expect(broad.ok).toBe(false);
     expect(broad.errors.join(" ")).toContain("forbidden broad write_glob");
   });
+
+  test("validateScopeInvariants treats autonomy hint scope as non-permission metadata", () => {
+    const hints = validateScopeInvariants(
+      "apps/server",
+      ["app/_layout.tsx", "scripts/fix-baseline-browser-mapping.js"],
+      ["**/*"],
+      { requireWriteGlobs: true, hintsOnly: true },
+    );
+
+    expect(hints.ok).toBe(true);
+    expect(hints.componentArea).toBe("apps/server");
+    expect(hints.normalizedTargetPaths).toEqual([
+      "app/_layout.tsx",
+      "scripts/fix-baseline-browser-mapping.js",
+    ]);
+    expect(hints.normalizedWriteGlobs).toEqual(["**/*"]);
+    expect(hints.breadth).toBe("broad");
+  });
 });

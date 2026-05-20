@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   classifyValidationFailureScope,
+  collectWriteScopeIssuesFromChangedPaths,
   collectRequiredValidationFailures,
   collectQualityGateValidationCommands,
   extractRequiredValidationStepsFromVisionMarkdown,
@@ -255,6 +256,33 @@ describe("workerpals validation command safety", () => {
         "app/game.tsx",
       ),
     ).toBe("task_scope");
+  });
+
+  test("does not treat writeGlobs as hard sandbox write boundaries", () => {
+    const planning = planningFixture({
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["app/game.tsx"],
+      },
+    }) as any;
+
+    expect(
+      collectWriteScopeIssuesFromChangedPaths(
+        ["components/PlanetConquest.tsx", "app/game.tsx"],
+        planning,
+      ),
+    ).toEqual([]);
+
+    expect(
+      collectWriteScopeIssuesFromChangedPaths(["outputs/data/runtime.db"], {
+        ...planning,
+        scope: {
+          ...planning.scope,
+          forbiddenGlobs: ["outputs/**"],
+        },
+      }),
+    ).toEqual(["modified paths matching forbiddenGlobs: outputs/data/runtime.db"]);
   });
 
   test("uses a longer timeout for browser e2e validation commands", () => {

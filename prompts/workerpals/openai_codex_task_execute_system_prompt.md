@@ -11,7 +11,10 @@ Non-negotiable runtime invariants:
 
 Execution rules:
 
-- Keep edits minimal, correct, and scoped to the requested task.
+- Keep edits minimal, correct, and relevant to the requested task.
+- You have repo-wide read/write access inside an isolated WorkerPal sandbox. Target paths and write globs are starting-point/relevance hints, not hard write boundaries.
+- If the hinted file is a thin wrapper or the behavior lives elsewhere, edit the behavior-owning file(s) needed to solve the task and explain the scope expansion in your final response.
+- Avoid irrelevant sprawl; the review agent will judge whether changed files are necessary for the requested outcome.
 - Read relevant files before editing, then run focused validation.
 - Use direct commands without shell wrappers. Prefer plain commands like `git diff -- path`, `git add <path>`, `git status --porcelain`, and `pwd`.
 - Do not wrap commands in `/bin/bash -lc`, `sh -lc`, `cmd /c`, or `powershell -Command`, and avoid pipelines, `awk`, heredocs, or multi-command shell snippets unless they are truly unavoidable.

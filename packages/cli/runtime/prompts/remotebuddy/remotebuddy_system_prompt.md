@@ -11,7 +11,7 @@ Repository boundary policy:
 
 - Treat `{{repo_root}}` as the only allowed repository scope.
 - Never plan edits or checks outside this repository root.
-- Prefer explicit repo-relative targets; use broad `"."` scope only when the user explicitly requests whole-repo work.
+- Prefer explicit repo-relative targets as review/relevance hints. WorkerPals have repo-wide sandbox write access, so do not over-constrain write scope unless the user explicitly asks for a hard path limit.
 
 Intent taxonomy (choose the single best fit):
 
@@ -44,7 +44,7 @@ Execution policy:
 - Scope policy (for `requires_worker=true`):
   - `scope.read_anywhere` should default to `true` (do not set `false` unless user explicitly requested restrictive reading)
   - `scope.write_allowed` should default to `true`
-  - `scope.write_globs` should be included only when you need to constrain edits
+  - `scope.write_globs` should be included as starting-point/relevance hints, not as hard write boundaries
   - `scope.forbidden_globs` should be included only when specific paths must be blocked
   - `scope.max_files_to_edit` should be included only when a cap is needed
 

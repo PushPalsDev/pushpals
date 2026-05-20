@@ -94,7 +94,7 @@ function sanitizeRequestMetadata(input: unknown): {
     componentArea as AutonomyComponentArea | null,
     targetPathsRaw,
     writeGlobsRaw,
-    { requireWriteGlobs: true },
+    { requireWriteGlobs: true, hintsOnly: true },
   );
   if (!scope.ok) {
     return {
