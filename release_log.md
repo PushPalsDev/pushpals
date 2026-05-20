@@ -2,21 +2,19 @@
 
 ## Release Metadata
 
-- version: `v1.0.86`
-- start_commit: `22e29816c0a4db8ca751812e890425094661ea1e`
-- end_commit: `b3aff604c307eaa7963c1941b36b9deb978d9c2a`
+- version: `v1.0.87`
+- start_commit: `0bd477557f562fd9662b3d52dde176dce4320881`
+- end_commit: `99f3bba80f631ef88fc5b2d565f7acd48075a532`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Classify WorkerPal ValidationGate failures as task-scoped, outside-task-scope, or infrastructure-like so pre-existing repo failures no longer consume all auto-revision attempts for unrelated small tasks.
-- Treat outside-task-scope required validation failures as publish blockers with direct diagnostics instead of repeatedly asking Codex to revise files it was not allowed to touch.
-- Add actionable validation summaries that preserve the important error line for each failing command while avoiding noisy full-output dumps.
-- Avoid rerunning long browser validation after an earlier infrastructure-like E2E failure, reducing repeated ten-minute stalls during auto-revision cycles.
-- Inject the sandbox Expo port into `bun run web:e2e` style commands and normalize duplicate `bunx`/`bun x` validation commands.
-- Improve autonomy ideation guidance so generated work targets behavior-owning implementation files instead of thin route wrappers when the vision calls for product-visible improvements.
-- Skip Codex commit-message generation immediately when no Codex model is configured, keeping SourceControlManager publish flow deterministic in that configuration.
-- Sync the packaged CLI runtime and sandbox assets so installed CLI users receive the updated WorkerPal validation and ideation behavior.
+- Treat WorkerPal `target_paths` and `write_globs` as review/relevance hints instead of hard write boundaries, so workers can edit the behavior-owning files needed to complete a task inside their isolated sandbox.
+- Allow autonomy-generated work to use repo-wide reads and mixed-root/broad scope hints while preserving repo-relative path validation and review-based relevance checks.
+- Stage the full WorkerPal sandbox diff for `task.execute` commits while explicitly excluding transient workspace, output, and `.codex` artifacts.
+- Update OpenAI Codex, OpenHands, and MiniSWE prompts/backends to explain the new full-sandbox write model and require workers to justify any expansion beyond target hints.
+- Keep forbidden/transient artifact protections and validation/review gates in place so ReviewAgent and quality gates decide whether broad edits are relevant and shippable.
+- Sync packaged CLI runtime and sandbox assets so installed CLI users receive the updated autonomy, prompt, and WorkerPal behavior.
 
 ## Validation
 
