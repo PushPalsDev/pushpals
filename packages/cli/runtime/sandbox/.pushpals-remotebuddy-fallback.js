@@ -86,11 +86,13 @@ class CommunicationManager {
   sessionId;
   from;
   authToken;
+  fetchImpl;
   constructor(opts) {
     this.serverUrl = opts.serverUrl;
     this.sessionId = opts.sessionId;
     this.from = opts.from;
     this.authToken = opts.authToken ?? null;
+    this.fetchImpl = opts.fetchImpl ?? fetch;
   }
   headers() {
     const headers = { "Content-Type": "application/json" };
@@ -132,7 +134,7 @@ class CommunicationManager {
         body.turnId = meta.turnId;
       if (meta.parentId)
         body.parentId = meta.parentId;
-      const response = await fetch(this.commandUrl(sessionId), {
+      const response = await this.fetchImpl(this.commandUrl(sessionId), {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify(body)
@@ -8550,6 +8552,7 @@ class RemoteBuddyOrchestrator {
   server;
   sessionId;
   authToken;
+  fetchImpl;
   repo;
   jobsDbPath;
   workerOnlineTtlMs;
@@ -8618,6 +8621,7 @@ class RemoteBuddyOrchestrator {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
+    this.fetchImpl = opts.fetchImpl ?? fetch;
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
     this.persistentMemory = opts.persistentMemory;
@@ -8681,7 +8685,8 @@ class RemoteBuddyOrchestrator {
       serverUrl: this.server,
       sessionId: this.sessionId,
       authToken: this.authToken,
-      from: `agent:${this.agentId}`
+      from: `agent:${this.agentId}`,
+      fetchImpl: this.fetchImpl
     });
     this.autonomousEngine = new RemoteBuddyAutonomousEngine({
       server: this.server,
@@ -8743,7 +8748,7 @@ class RemoteBuddyOrchestrator {
   async ensureSessionWithRetry(sessionId = this.sessionId, maxRetries = 20, baseDelayMs = 500, maxDelayMs = 5000) {
     for (let attempt = 1;attempt <= maxRetries && !this.disposed; attempt++) {
       try {
-        const res = await fetch(`${this.server}/sessions`, {
+        const res = await this.fetchImpl(`${this.server}/sessions`, {
           method: "POST",
           headers: this.authHeaders(),
           body: JSON.stringify({ sessionId })
@@ -8790,7 +8795,7 @@ class RemoteBuddyOrchestrator {
   }
   async fetchJobLogs(jobId, limit = 80) {
     try {
-      const res = await fetch(`${this.server}/jobs/${jobId}/logs?limit=${Math.max(1, Math.min(500, limit))}`, {
+      const res = await this.fetchImpl(`${this.server}/jobs/${jobId}/logs?limit=${Math.max(1, Math.min(500, limit))}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -8806,7 +8811,7 @@ class RemoteBuddyOrchestrator {
   }
   async fetchJobToolRuns(jobId, limit = 20) {
     try {
-      const res = await fetch(`${this.server}/jobs/${jobId}/tool-runs?limit=${Math.max(1, Math.min(100, limit))}`, {
+      const res = await this.fetchImpl(`${this.server}/jobs/${jobId}/tool-runs?limit=${Math.max(1, Math.min(100, limit))}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -8862,7 +8867,7 @@ class RemoteBuddyOrchestrator {
     query.set("feedbackLimit", "3");
     const suffix = query.toString();
     try {
-      const res = await fetch(`${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`, {
+      const res = await this.fetchImpl(`${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -9163,7 +9168,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         payload.dedupeKey = dedupeKey;
       if (targetWorkerId)
         payload.targetWorkerId = targetWorkerId;
-      const res = await fetch(`${this.server}/jobs/enqueue`, {
+      const res = await this.fetchImpl(`${this.server}/jobs/enqueue`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify(payload)
@@ -9433,7 +9438,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
   }
   async fetchWorkers() {
     try {
-      const res = await fetch(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
+      const res = await this.fetchImpl(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -9447,7 +9452,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
   }
   async fetchWorkerAutoscaleSnapshot() {
     try {
-      const res = await fetch(`${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`, {
+      const res = await this.fetchImpl(`${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -9709,7 +9714,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     const prompt = String(request.prompt ?? "").trim();
     if (!prompt) {
       console.warn(`[RemoteBuddy] Request ${requestId} missing prompt; marking failed`);
-      await fetch(`${this.server}/requests/${requestId}/fail`, {
+      await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({ message: "Request missing prompt" })
@@ -9835,7 +9840,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
             await this.assistantMessage(requestSessionId, "Should I have a WorkerPal implement this? Reply to confirm and I'll enqueue the work, or clarify what you'd like focused on.", { turnId, correlationId: requestId, from: eventFrom });
           }
         }
-        await fetch(`${this.server}/requests/${requestId}/complete`, {
+        await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
           method: "POST",
           headers: this.authHeaders(),
           body: JSON.stringify({
@@ -9866,7 +9871,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
             correlationId: requestId,
             from: eventFrom
           });
-          await fetch(`${this.server}/requests/${requestId}/fail`, {
+          await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
             method: "POST",
             headers: this.authHeaders(),
             body: JSON.stringify({
@@ -10001,7 +10006,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         await this.assistantMessage(requestSessionId, "I could not queue this WorkerPal task. No task was started.", { turnId, correlationId: requestId, from: eventFrom });
         this.rememberPersistentMemory("job_enqueue_failed", `enqueue_failed lane=${lane} intent=${plan.intent}`, requestId, requestSessionId);
       }
-      await fetch(`${this.server}/requests/${requestId}/complete`, {
+      await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({
@@ -10032,7 +10037,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         correlationId: requestId,
         from: eventFrom
       });
-      await fetch(`${this.server}/requests/${requestId}/fail`, {
+      await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({
@@ -10047,7 +10052,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     while (!this.disposed) {
       try {
         await this.maybeAutoscaleWorkers();
-        const res = await fetch(`${this.server}/requests/claim`, {
+        const res = await this.fetchImpl(`${this.server}/requests/claim`, {
           method: "POST",
           headers: this.authHeaders(),
           body: JSON.stringify({ agentId: this.agentId })

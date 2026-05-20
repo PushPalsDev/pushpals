@@ -65,6 +65,7 @@ type WorkerJobResult = JobResult & {
 
 const DEFAULT_LLM_MODEL = "local-model";
 const CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
+const CODEX_UNAVAILABLE_DOCKER_SHUTDOWN_GRACE_MS = 5_000;
 const CONFIG = loadPushPalsConfig();
 const LOG = new Logger("WorkerPals");
 
@@ -358,6 +359,36 @@ function shouldRecycleWorkerForCodexUnavailableFailure(
     "codex cli isn't available",
     "codex cli is mandatory in this backend",
   ].some((needle) => text.includes(needle));
+}
+
+async function shutdownDockerExecutorBeforeCodexRecycle(
+  dockerExecutor: DockerExecutor | null,
+): Promise<void> {
+  if (!dockerExecutor) return;
+
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
+  try {
+    await Promise.race([
+      dockerExecutor.shutdown(),
+      new Promise<void>((resolvePromise) => {
+        timeout = setTimeout(() => {
+          timedOut = true;
+          resolvePromise();
+        }, CODEX_UNAVAILABLE_DOCKER_SHUTDOWN_GRACE_MS);
+      }),
+    ]);
+  } catch (err) {
+    console.error(`[WorkerPals] Docker shutdown cleanup failed: ${String(err)}`);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+
+  if (timedOut) {
+    console.warn(
+      `[WorkerPals] Docker shutdown cleanup exceeded ${CODEX_UNAVAILABLE_DOCKER_SHUTDOWN_GRACE_MS}ms; exiting worker for Codex recycle anyway.`,
+    );
+  }
 }
 
 function parseArgs(): {
@@ -1700,13 +1731,7 @@ async function workerLoop(
             if (recycleWorkerAfterJob) {
               runtimeState.shutdownRequested = true;
               await maybeHeartbeat("offline", null, true);
-              if (dockerExecutor) {
-                try {
-                  await dockerExecutor.shutdown();
-                } catch (err) {
-                  console.error(`[WorkerPals] Docker shutdown cleanup failed: ${String(err)}`);
-                }
-              }
+              await shutdownDockerExecutorBeforeCodexRecycle(dockerExecutor);
               process.exit(CODEX_UNAVAILABLE_WORKER_EXIT_CODE);
             }
           }

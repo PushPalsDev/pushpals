@@ -850,6 +850,7 @@ export class RemoteBuddyOrchestrator {
   private readonly server: string;
   private readonly sessionId: string;
   private readonly authToken: string | null;
+  private readonly fetchImpl: typeof fetch;
   private readonly repo: string;
   private readonly jobsDbPath: string;
   private readonly workerOnlineTtlMs: number;
@@ -931,10 +932,12 @@ export class RemoteBuddyOrchestrator {
     idempotency: IdempotencyStore;
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
+    fetchImpl?: typeof fetch;
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
+    this.fetchImpl = opts.fetchImpl ?? fetch;
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
     this.persistentMemory = opts.persistentMemory;
@@ -1028,6 +1031,7 @@ export class RemoteBuddyOrchestrator {
       sessionId: this.sessionId,
       authToken: this.authToken,
       from: `agent:${this.agentId}`,
+      fetchImpl: this.fetchImpl,
     });
     this.autonomousEngine = new RemoteBuddyAutonomousEngine({
       server: this.server,
@@ -1109,7 +1113,7 @@ export class RemoteBuddyOrchestrator {
   ): Promise<boolean> {
     for (let attempt = 1; attempt <= maxRetries && !this.disposed; attempt++) {
       try {
-        const res = await fetch(`${this.server}/sessions`, {
+        const res = await this.fetchImpl(`${this.server}/sessions`, {
           method: "POST",
           headers: this.authHeaders(),
           body: JSON.stringify({ sessionId }),
@@ -1182,7 +1186,7 @@ export class RemoteBuddyOrchestrator {
 
   private async fetchJobLogs(jobId: string, limit = 80): Promise<JobLogEntry[]> {
     try {
-      const res = await fetch(
+      const res = await this.fetchImpl(
         `${this.server}/jobs/${jobId}/logs?limit=${Math.max(1, Math.min(500, limit))}`,
         {
           method: "GET",
@@ -1200,7 +1204,7 @@ export class RemoteBuddyOrchestrator {
 
   private async fetchJobToolRuns(jobId: string, limit = 20): Promise<JobToolRunEntry[]> {
     try {
-      const res = await fetch(
+      const res = await this.fetchImpl(
         `${this.server}/jobs/${jobId}/tool-runs?limit=${Math.max(1, Math.min(100, limit))}`,
         {
           method: "GET",
@@ -1257,7 +1261,7 @@ export class RemoteBuddyOrchestrator {
     query.set("feedbackLimit", "3");
     const suffix = query.toString();
     try {
-      const res = await fetch(`${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`, {
+      const res = await this.fetchImpl(`${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`, {
         method: "GET",
         headers: this.authHeaders(),
       });
@@ -1685,7 +1689,7 @@ export class RemoteBuddyOrchestrator {
       if (dedupeKey) payload.dedupeKey = dedupeKey;
       if (targetWorkerId) payload.targetWorkerId = targetWorkerId;
 
-      const res = await fetch(`${this.server}/jobs/enqueue`, {
+      const res = await this.fetchImpl(`${this.server}/jobs/enqueue`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify(payload),
@@ -2068,7 +2072,7 @@ export class RemoteBuddyOrchestrator {
 
   private async fetchWorkers(): Promise<WorkerSnapshot[]> {
     try {
-      const res = await fetch(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
+      const res = await this.fetchImpl(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
         method: "GET",
         headers: this.authHeaders(),
       });
@@ -2082,7 +2086,7 @@ export class RemoteBuddyOrchestrator {
 
   private async fetchWorkerAutoscaleSnapshot(): Promise<WorkerAutoscaleSnapshot | null> {
     try {
-      const res = await fetch(`${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`, {
+      const res = await this.fetchImpl(`${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`, {
         method: "GET",
         headers: this.authHeaders(),
       });
@@ -2442,7 +2446,7 @@ export class RemoteBuddyOrchestrator {
     const prompt = String(request.prompt ?? "").trim();
     if (!prompt) {
       console.warn(`[RemoteBuddy] Request ${requestId} missing prompt; marking failed`);
-      await fetch(`${this.server}/requests/${requestId}/fail`, {
+      await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({ message: "Request missing prompt" }),
@@ -2670,7 +2674,7 @@ export class RemoteBuddyOrchestrator {
           }
         }
 
-        await fetch(`${this.server}/requests/${requestId}/complete`, {
+        await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
           method: "POST",
           headers: this.authHeaders(),
           body: JSON.stringify({
@@ -2708,7 +2712,7 @@ export class RemoteBuddyOrchestrator {
             correlationId: requestId,
             from: eventFrom,
           });
-          await fetch(`${this.server}/requests/${requestId}/fail`, {
+          await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
             method: "POST",
             headers: this.authHeaders(),
             body: JSON.stringify({
@@ -2915,7 +2919,7 @@ export class RemoteBuddyOrchestrator {
         );
       }
 
-      await fetch(`${this.server}/requests/${requestId}/complete`, {
+      await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({
@@ -2946,7 +2950,7 @@ export class RemoteBuddyOrchestrator {
         correlationId: requestId,
         from: eventFrom,
       });
-      await fetch(`${this.server}/requests/${requestId}/fail`, {
+      await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({
@@ -2964,7 +2968,7 @@ export class RemoteBuddyOrchestrator {
     while (!this.disposed) {
       try {
         await this.maybeAutoscaleWorkers();
-        const res = await fetch(`${this.server}/requests/claim`, {
+        const res = await this.fetchImpl(`${this.server}/requests/claim`, {
           method: "POST",
           headers: this.authHeaders(),
           body: JSON.stringify({ agentId: this.agentId }),

@@ -12,6 +12,7 @@ import type { EventEnvelope } from "protocol";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
+const nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch;
 
 type SpawnedServer = {
   proc: ReturnType<typeof Bun.spawn>;
@@ -179,7 +180,7 @@ async function waitForHealth(
     }
 
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/healthz`);
+      const response = await nativeFetch(`http://127.0.0.1:${port}/healthz`);
       if (response.ok) return;
     } catch {
       // retry
@@ -191,7 +192,7 @@ async function waitForHealth(
 }
 
 async function createSession(port: number, sessionId: string): Promise<void> {
-  const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
+  const response = await nativeFetch(`http://127.0.0.1:${port}/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionId }),
@@ -297,14 +298,14 @@ describe("RemoteBuddy session routing", () => {
     const requestSocket = connectSessionSocket(port, "session-a", "test-session-a");
     await Promise.all([waitForOpen(defaultSocket.ws), waitForOpen(requestSocket.ws)]);
 
-    const accepted = await fetch(`http://127.0.0.1:${port}/sessions/session-a/message`, {
+    const accepted = await nativeFetch(`http://127.0.0.1:${port}/sessions/session-a/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: "hello from session a" }),
     });
     expect(accepted.status).toBe(200);
 
-    const claimed = await fetch(`http://127.0.0.1:${port}/requests/claim`, {
+    const claimed = await nativeFetch(`http://127.0.0.1:${port}/requests/claim`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ agentId: "remotebuddy-orchestrator" }),
@@ -340,6 +341,7 @@ describe("RemoteBuddy session routing", () => {
       idempotency,
       persistentMemory: new NoopSessionMemory(),
       jobsDbPath: join(root, "outputs", "data", "pushpals.db"),
+      fetchImpl: nativeFetch,
     });
 
     try {

@@ -13,11 +13,8 @@ import {
 
 const tempDirs: string[] = [];
 const openStores: IdempotencyStore[] = [];
-const originalFetch = globalThis.fetch;
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch;
-
   while (openStores.length > 0) {
     try {
       openStores.pop()?.close();
@@ -112,7 +109,7 @@ function createAutonomyTaskParams(targetPaths: string[]): TaskExecuteJobParams {
   };
 }
 
-function createOrchestrator(root: string): RemoteBuddyOrchestrator {
+function createOrchestrator(root: string, fetchImpl?: typeof fetch): RemoteBuddyOrchestrator {
   mkdirSync(join(root, "outputs", "data"), { recursive: true });
   const idempotency = new IdempotencyStore(join(root, "outputs", "data", "remotebuddy-dedupe.db"));
   openStores.push(idempotency);
@@ -127,6 +124,7 @@ function createOrchestrator(root: string): RemoteBuddyOrchestrator {
     idempotency,
     persistentMemory: new NoopSessionMemory(),
     jobsDbPath: join(root, "outputs", "data", "pushpals.db"),
+    fetchImpl,
   });
 }
 
@@ -158,14 +156,13 @@ describe("RemoteBuddy task.execute dedupe", () => {
 
   test("processRequest reuses the existing task when enqueue dedupes same-file work", async () => {
     const root = makeTempDir();
-    const orchestrator = createOrchestrator(root);
     const commands: Array<{ type: string; payload: Record<string, unknown> }> = [];
     const assistantMessages: string[] = [];
     const requestCompletions: Array<Record<string, unknown>> = [];
     let firstTaskId = "";
     let enqueueCount = 0;
 
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/requests/req-1/complete") || url.endsWith("/requests/req-2/complete")) {
         requestCompletions.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
@@ -173,6 +170,7 @@ describe("RemoteBuddy task.execute dedupe", () => {
       }
       throw new Error(`Unexpected fetch in test: ${url}`);
     }) as typeof fetch;
+    const orchestrator = createOrchestrator(root, fetchImpl);
 
     (orchestrator as any).ensureSessionWithRetry = async () => {};
     (orchestrator as any).ensureSessionEventMonitor = () => {};
@@ -232,18 +230,18 @@ describe("RemoteBuddy task.execute dedupe", () => {
 
   test("processRequest reuses the existing task for same-file autonomy work", async () => {
     const root = makeTempDir();
-    const orchestrator = createOrchestrator(root);
     const commands: Array<{ type: string; payload: Record<string, unknown> }> = [];
     let firstTaskId = "";
     let enqueueCount = 0;
 
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/requests/auto-1/complete") || url.endsWith("/requests/auto-2/complete")) {
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
       }
       throw new Error(`Unexpected fetch in test: ${url}`);
     }) as typeof fetch;
+    const orchestrator = createOrchestrator(root, fetchImpl);
 
     (orchestrator as any).ensureSessionWithRetry = async () => {};
     (orchestrator as any).ensureSessionEventMonitor = () => {};
@@ -324,17 +322,17 @@ describe("RemoteBuddy task.execute dedupe", () => {
 
   test("processRequest does not create an orphan task when enqueue fails", async () => {
     const root = makeTempDir();
-    const orchestrator = createOrchestrator(root);
     const commands: Array<{ type: string; payload: Record<string, unknown> }> = [];
     const assistantMessages: string[] = [];
 
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/requests/req-fail/complete")) {
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
       }
       throw new Error(`Unexpected fetch in test: ${url}`);
     }) as typeof fetch;
+    const orchestrator = createOrchestrator(root, fetchImpl);
 
     (orchestrator as any).ensureSessionWithRetry = async () => {};
     (orchestrator as any).ensureSessionEventMonitor = () => {};

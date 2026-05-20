@@ -9,11 +9,9 @@ import { RemoteBuddyOrchestrator } from "../apps/remotebuddy/src/remotebuddy_mai
 
 const tempDirs: string[] = [];
 const openStores: IdempotencyStore[] = [];
-const originalFetch = globalThis.fetch;
 const originalSpawn = Bun.spawn;
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch;
   (Bun as any).spawn = originalSpawn;
 
   while (openStores.length > 0) {
@@ -72,7 +70,7 @@ function createWorkerPlan(): PlannerOutput {
   };
 }
 
-function createOrchestrator(root: string): RemoteBuddyOrchestrator {
+function createOrchestrator(root: string, fetchImpl?: typeof fetch): RemoteBuddyOrchestrator {
   mkdirSync(join(root, "outputs", "data"), { recursive: true });
   const idempotency = new IdempotencyStore(
     join(root, "outputs", "data", "remotebuddy-autoscale.db"),
@@ -89,14 +87,14 @@ function createOrchestrator(root: string): RemoteBuddyOrchestrator {
     idempotency,
     persistentMemory: new NoopSessionMemory(),
     jobsDbPath: join(root, "outputs", "data", "pushpals.db"),
+    fetchImpl,
   });
 }
 
 describe("RemoteBuddy worker autoscaling", () => {
   test("maintains the configured warm pool floor", async () => {
-    const orchestrator = createOrchestrator(makeTempDir());
     const spawnCalls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
       if (url.pathname === "/workers/autoscale") {
         return new Response(
@@ -111,6 +109,7 @@ describe("RemoteBuddy worker autoscaling", () => {
       }
       throw new Error(`Unexpected fetch in test: ${url.pathname}`);
     }) as typeof fetch;
+    const orchestrator = createOrchestrator(makeTempDir(), fetchImpl);
     (orchestrator as any).minWorkers = 3;
     (orchestrator as any).maxWorkers = 4;
     (orchestrator as any).spawnWorker = async () => {
@@ -128,9 +127,8 @@ describe("RemoteBuddy worker autoscaling", () => {
   });
 
   test("scales to claimable queued task.execute backlog up to maxWorkers", async () => {
-    const orchestrator = createOrchestrator(makeTempDir());
     const spawnCalls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
       if (url.pathname === "/workers/autoscale") {
         return new Response(
@@ -145,6 +143,7 @@ describe("RemoteBuddy worker autoscaling", () => {
       }
       throw new Error(`Unexpected fetch in test: ${url.pathname}`);
     }) as typeof fetch;
+    const orchestrator = createOrchestrator(makeTempDir(), fetchImpl);
     (orchestrator as any).minWorkers = 1;
     (orchestrator as any).maxWorkers = 4;
     (orchestrator as any).spawnWorker = async () => {
@@ -162,9 +161,8 @@ describe("RemoteBuddy worker autoscaling", () => {
   });
 
   test("prewarms a second worker when open PR backlog exists", async () => {
-    const orchestrator = createOrchestrator(makeTempDir());
     const spawnCalls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
       if (url.pathname === "/workers/autoscale") {
         return new Response(
@@ -179,6 +177,7 @@ describe("RemoteBuddy worker autoscaling", () => {
       }
       throw new Error(`Unexpected fetch in test: ${url.pathname}`);
     }) as typeof fetch;
+    const orchestrator = createOrchestrator(makeTempDir(), fetchImpl);
     (orchestrator as any).minWorkers = 1;
     (orchestrator as any).maxWorkers = 4;
     (orchestrator as any).spawnWorker = async () => {

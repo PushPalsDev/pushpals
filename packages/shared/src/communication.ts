@@ -53,6 +53,7 @@ export interface CommunicationManagerOptions {
   sessionId: string;
   from: string;
   authToken?: string | null;
+  fetchImpl?: typeof fetch;
 }
 
 export class CommunicationManager {
@@ -60,12 +61,14 @@ export class CommunicationManager {
   private readonly sessionId: string;
   private readonly from: string;
   private readonly authToken: string | null;
+  private readonly fetchImpl: typeof fetch;
 
   constructor(opts: CommunicationManagerOptions) {
     this.serverUrl = opts.serverUrl;
     this.sessionId = opts.sessionId;
     this.from = opts.from;
     this.authToken = opts.authToken ?? null;
+    this.fetchImpl = opts.fetchImpl ?? fetch;
   }
 
   private headers(): Record<string, string> {
@@ -121,7 +124,7 @@ export class CommunicationManager {
       if (meta.turnId) body.turnId = meta.turnId;
       if (meta.parentId) body.parentId = meta.parentId;
 
-      const response = await fetch(this.commandUrl(sessionId), {
+      const response = await this.fetchImpl(this.commandUrl(sessionId), {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify(body),
