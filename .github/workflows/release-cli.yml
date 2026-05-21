@@ -113,25 +113,26 @@ jobs:
             exit 1
           fi
 
-          access_json="$RUNNER_TEMP/npm-access-packages.json"
-          access_stderr="$RUNNER_TEMP/npm-access-packages.stderr"
-          if ! npm access list packages @pushpalsdev --json --registry=https://registry.npmjs.org >"$access_json" 2>"$access_stderr"; then
-            echo "::error::NPM_TOKEN authenticates as '${token_user}', but cannot list package access for @pushpalsdev. This token likely lacks org/package publish permissions." >&2
-            cat "$access_stderr" >&2 || true
-            exit 1
-          fi
-          ACCESS_JSON="$access_json" node <<'JS'
+          access_json="$RUNNER_TEMP/npm-access-collaborators.json"
+          access_stderr="$RUNNER_TEMP/npm-access-collaborators.stderr"
+          if npm access list collaborators @pushpalsdev/cli --json --registry=https://registry.npmjs.org >"$access_json" 2>"$access_stderr"; then
+            ACCESS_JSON="$access_json" TOKEN_USER="$token_user" node <<'JS'
           const fs = require("fs");
-          const access = JSON.parse(fs.readFileSync(process.env.ACCESS_JSON, "utf8"));
-          const permission = access["@pushpalsdev/cli"];
+          const raw = fs.readFileSync(process.env.ACCESS_JSON, "utf8").replace(/^\uFEFF/, "");
+          const access = JSON.parse(raw);
+          const permission = access[process.env.TOKEN_USER];
           if (!permission || !String(permission).includes("write")) {
             console.error(
-              `::error::NPM_TOKEN does not have write access to @pushpalsdev/cli. Observed permission: ${permission || "(none)"}.`,
+              `::error::NPM_TOKEN user ${process.env.TOKEN_USER} does not have write access to @pushpalsdev/cli. Observed permission: ${permission || "(none)"}.`,
             );
             process.exit(1);
           }
           console.log(`Verified npm write access for @pushpalsdev/cli: ${permission}`);
           JS
+          else
+            echo "::warning::Could not verify @pushpalsdev/cli collaborator permissions through npm access. Package-scoped granular tokens can be blocked from metadata endpoints; continuing to npm publish after owner verification." >&2
+            cat "$access_stderr" >&2 || true
+          fi
 
       - name: Build CLI package payload
         if: steps.npm_publish_check.outputs.already_published != 'true'
