@@ -115,7 +115,7 @@ jobs:
 
           access_json="$RUNNER_TEMP/npm-access-packages.json"
           access_stderr="$RUNNER_TEMP/npm-access-packages.stderr"
-          if ! npm access ls-packages @pushpalsdev --json --registry=https://registry.npmjs.org >"$access_json" 2>"$access_stderr"; then
+          if ! npm access list packages @pushpalsdev --json --registry=https://registry.npmjs.org >"$access_json" 2>"$access_stderr"; then
             echo "::error::NPM_TOKEN authenticates as '${token_user}', but cannot list package access for @pushpalsdev. This token likely lacks org/package publish permissions." >&2
             cat "$access_stderr" >&2 || true
             exit 1
