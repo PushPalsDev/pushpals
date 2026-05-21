@@ -2,25 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.0.91`
-- start_commit: `bde7cc36581c41616a49f6567d8cfb5aa038f4e9`
-- end_commit: `73d5e15f2ea2e86c4e8e47ce6562c829deaa99ec`
-- commits_in_range: `2`
+- version: `v1.0.92`
+- start_commit: `15382700dbb2cd894fb629396cce950ca95a05e8`
+- end_commit: `a9e94d02d7b4764240fa3769af7a4fb4bc99816d`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Force WorkerPal recycle promptly after known-bad Codex backend failures, including command-policy/workaround failures, so CI and runtime supervisors do not wait behind Docker cleanup before replacing the worker.
-- Skip the misleading idle heartbeat on Codex recycle paths; the worker now reports offline best-effort and exits with the expected recycle code.
-- Keep Docker/worktree cleanup best-effort during Codex recycle while bounding replacement latency with a hard force-exit timer.
-- Add npm publish-token preflight diagnostics so release runs fail early with a concrete token/package-access message instead of spending time building a tarball and failing with npm's opaque scoped-package `E404`.
-- Clean the CLI package `bin` path so npm no longer auto-corrects `bin[pushpals]` during publish.
+- Fix the npm publish-token preflight to use the supported `npm access list packages` command form, matching the npm CLI version used by GitHub Actions.
+- Preserve the existing package owner and read-write permission checks, but avoid failing valid publish tokens because of an invalid npm access subcommand.
+- Keep GitHub release asset publication gated behind successful npm publication so failed npm auth/preflight runs do not create partial releases.
 
 ## Validation
 
-- `bun x prettier --check .github/workflows/release-cli.yml packages/cli/package.json`
-- `npm pack --dry-run --ignore-scripts` from `packages/cli`
-- `bun test ./tests/integration/workerpals.control-plane.e2e.ts -t "worker reports a codex policy violation"`
-- `bun run test:workerpals:e2e`
+- `bun x prettier --check .github/workflows/release-cli.yml`
+- `npm access list packages '@pushpalsdev' --json --registry=https://registry.npmjs.org`
+- `bun run cli:bundle`
+- `bun run test:root`
 - `git diff --check`
 
 ## Install
@@ -47,7 +45,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- `v1.0.87`, `v1.0.88`, `v1.0.89`, and `v1.0.90` were tagged but did not publish to npm; `v1.0.89` did publish GitHub release assets before the npm token failure.
+- `v1.0.87`, `v1.0.88`, `v1.0.89`, `v1.0.90`, and `v1.0.91` were tagged but did not publish to npm; `v1.0.89` did publish GitHub release assets before the npm token failure, while later releases were blocked before GitHub release asset publication.
 - npm publication requires the repository `NPM_TOKEN` secret to have publish rights for `@pushpalsdev/cli` under the `@pushpalsdev` scope.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
