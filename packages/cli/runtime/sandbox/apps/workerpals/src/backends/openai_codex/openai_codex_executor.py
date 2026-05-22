@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from shutil import which
+from shutil import rmtree, which
 import shlex
 import signal
 import subprocess
@@ -21,7 +21,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _SHARED_DIR = Path(__file__).resolve().parents[1] / "shared"
 if str(_SHARED_DIR) not in sys.path:
@@ -386,6 +386,87 @@ def _is_git_repo(repo: str) -> bool:
         return False
 
 
+def _codex_project_config_roots(repo: str, env: Dict[str, str]) -> List[Path]:
+    roots: List[Path] = []
+    seen: set[str] = set()
+
+    def add(raw: object) -> None:
+        text = str(raw or "").strip()
+        if not text:
+            return
+        try:
+            path = Path(text).resolve()
+        except Exception:
+            return
+        key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(path)
+
+    add(repo)
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode == 0:
+            add((proc.stdout or "").strip())
+    except Exception:
+        pass
+
+    for key in (
+        "PUSHPALS_REPO_ROOT_OVERRIDE",
+        "PUSHPALS_PROJECT_ROOT_OVERRIDE",
+        "PUSHPALS_ASSIGNED_REPO_ROOT",
+        "PUSHPALS_REPO_PATH",
+    ):
+        add(env.get(key))
+    return roots
+
+
+def _mask_repo_local_codex_files(repo: str, env: Dict[str, str]) -> List[Tuple[Path, Path]]:
+    masked: List[Tuple[Path, Path]] = []
+    for root in _codex_project_config_roots(repo, env):
+        codex_path = root / ".codex"
+        if not os.path.lexists(codex_path):
+            continue
+        if codex_path.is_dir():
+            continue
+        backup = root / f".codex.pushpals-masked-{os.getpid()}-{len(masked)}"
+        suffix = 0
+        while os.path.lexists(backup):
+            suffix += 1
+            backup = root / f".codex.pushpals-masked-{os.getpid()}-{len(masked)}-{suffix}"
+        try:
+            os.replace(codex_path, backup)
+            masked.append((codex_path, backup))
+            log.info(
+                f"Temporarily masked repo-local .codex file so Codex CLI can use CODEX_HOME: {codex_path}"
+            )
+        except Exception as exc:
+            log.warning(f"Failed to mask repo-local .codex file {codex_path}: {exc}")
+    return masked
+
+
+def _restore_repo_local_codex_files(masked: List[Tuple[Path, Path]]) -> None:
+    for codex_path, backup in reversed(masked):
+        try:
+            if os.path.lexists(codex_path):
+                if codex_path.is_dir() and not codex_path.is_symlink():
+                    rmtree(codex_path)
+                else:
+                    codex_path.unlink()
+            if os.path.lexists(backup):
+                os.replace(backup, codex_path)
+        except Exception as exc:
+            log.warning(f"Failed to restore repo-local .codex file {codex_path}: {exc}")
+
+
 def _resolve_codex_command_prefix(config: OpenAICodexRuntimeConfig) -> List[str]:
     override_json = config.codex_bin_json
     if override_json:
@@ -698,7 +779,7 @@ def _summarize_json_event(obj: Dict[str, Any]) -> str:
         event_type = "event"
     # Skip noisy streaming deltas unless they contain meaningful text fragments.
     delta_like = event_type.endswith(".delta") or event_type.endswith("_delta")
-    # Reasoning/thinking events are always surfaced — they show the model's reasoning process.
+    # Reasoning/thinking events are always surfaced because they show the model's reasoning process.
     reasoning_like = _contains_reasoning_marker(event_type) or _event_contains_reasoning(obj)
 
     tool_name = ""
@@ -1487,7 +1568,11 @@ def _run_codex_task(
             env.pop("OPENAI_API_KEY", None)
             env.pop("OPENAI_BASE_URL", None)
             env.pop("OPENAI_API_BASE", None)
-            login_status = _run_codex_login_status(codex_cmd_prefix, repo, env)
+            codex_project_mask = _mask_repo_local_codex_files(repo, env)
+            try:
+                login_status = _run_codex_login_status(codex_cmd_prefix, repo, env)
+            finally:
+                _restore_repo_local_codex_files(codex_project_mask)
             if not login_status.get("ok"):
                 detail = (
                     str(login_status.get("stderr") or "").strip()
@@ -1554,148 +1639,152 @@ def _run_codex_task(
         if communicate_timeout_s:
             log.debug(f"communicate timeout: {communicate_timeout_s}s")
 
-        proc = subprocess.Popen(
-            cmd,
-            cwd=repo,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        _ACTIVE_CHILD = proc
-        started_at = time.monotonic()
-        progress_interval_s = _resolve_progress_log_interval_seconds(runtime_config)
-
-        stdout_chunks: List[str] = []
-        stderr_chunks: List[str] = []
-        stdout_trace_state = _empty_codex_trace()
-        trace_lock = threading.Lock()
-        last_activity_at = {"ts": started_at}
-        wrapper_rejection_state: Dict[str, Any] = {"count": 0, "commands": []}
-
-        def _drain_stdout() -> None:
-            stream = proc.stdout
-            if stream is None:
-                return
-            try:
-                for chunk in iter(stream.readline, ""):
-                    if chunk == "":
-                        break
-                    stdout_chunks.append(chunk)
-                    line = chunk.strip()
-                    if not line:
-                        continue
-                    with trace_lock:
-                        last_activity_at["ts"] = time.monotonic()
-                        _record_live_codex_stdout_line(line, use_json, stdout_trace_state)
-            except Exception:
-                pass
-            finally:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-
-        def _drain_stderr() -> None:
-            stream = proc.stderr
-            if stream is None:
-                return
-            try:
-                for chunk in iter(stream.readline, ""):
-                    if chunk == "":
-                        break
-                    stderr_chunks.append(chunk)
-                    rejected_commands = _collect_disallowed_shell_wrapper_rejections(chunk)
-                    if rejected_commands:
-                        with trace_lock:
-                            wrapper_rejection_state["count"] = to_int(
-                                wrapper_rejection_state.get("count"), 0
-                            ) + len(rejected_commands)
-                            tracked = wrapper_rejection_state.get("commands")
-                            if not isinstance(tracked, list):
-                                tracked = []
-                            for command in rejected_commands:
-                                lowered = command.lower()
-                                if any(str(item).lower() == lowered for item in tracked):
-                                    continue
-                                tracked.append(command)
-                            wrapper_rejection_state["commands"] = tracked[:6]
-            except Exception:
-                pass
-            finally:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-
-        stdout_thread = threading.Thread(target=_drain_stdout, daemon=True)
-        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        stdout_thread.start()
-        stderr_thread.start()
-
-        if proc.stdin is not None:
-            try:
-                proc.stdin.write(prompt)
-                proc.stdin.close()
-            except Exception:
-                pass
-
-        deadline = (
-            started_at + float(communicate_timeout_s)
-            if communicate_timeout_s and communicate_timeout_s > 0
-            else None
-        )
-        next_progress_at = started_at + float(progress_interval_s)
-        timed_out = False
-        command_policy_rejection_loop = False
-
-        while proc.poll() is None:
-            now = time.monotonic()
-            if deadline is not None and now >= deadline:
-                timed_out = True
-                _terminate_active_child()
-                break
-
-            with trace_lock:
-                wrapper_rejections = to_int(wrapper_rejection_state.get("count"), 0)
-            if wrapper_rejections >= 3:
-                command_policy_rejection_loop = True
-                _terminate_active_child()
-                break
-
-            if now >= next_progress_at:
-                elapsed = int(max(0.0, now - started_at))
-                with trace_lock:
-                    last_event = float(last_activity_at.get("ts", started_at))
-                    valid_json = to_int(stdout_trace_state.get("valid_json"), 0)
-                    total_lines = to_int(stdout_trace_state.get("line_count"), 0)
-                idle_for = int(max(0.0, now - last_event))
-                if use_json:
-                    log.info(
-                        f"codex exec still running ({elapsed}s elapsed, json_events={valid_json}, idle={idle_for}s)"
-                    )
-                else:
-                    log.info(
-                        f"codex exec still running ({elapsed}s elapsed, stdout_lines={total_lines}, idle={idle_for}s)"
-                    )
-                next_progress_at = now + float(progress_interval_s)
-
-            time.sleep(1.0)
-
+        codex_project_mask = _mask_repo_local_codex_files(repo, env)
         try:
-            proc.wait(timeout=5)
-        except Exception:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=repo,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            _ACTIVE_CHILD = proc
+            started_at = time.monotonic()
+            progress_interval_s = _resolve_progress_log_interval_seconds(runtime_config)
+
+            stdout_chunks: List[str] = []
+            stderr_chunks: List[str] = []
+            stdout_trace_state = _empty_codex_trace()
+            trace_lock = threading.Lock()
+            last_activity_at = {"ts": started_at}
+            wrapper_rejection_state: Dict[str, Any] = {"count": 0, "commands": []}
+
+            def _drain_stdout() -> None:
+                stream = proc.stdout
+                if stream is None:
+                    return
+                try:
+                    for chunk in iter(stream.readline, ""):
+                        if chunk == "":
+                            break
+                        stdout_chunks.append(chunk)
+                        line = chunk.strip()
+                        if not line:
+                            continue
+                        with trace_lock:
+                            last_activity_at["ts"] = time.monotonic()
+                            _record_live_codex_stdout_line(line, use_json, stdout_trace_state)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+            def _drain_stderr() -> None:
+                stream = proc.stderr
+                if stream is None:
+                    return
+                try:
+                    for chunk in iter(stream.readline, ""):
+                        if chunk == "":
+                            break
+                        stderr_chunks.append(chunk)
+                        rejected_commands = _collect_disallowed_shell_wrapper_rejections(chunk)
+                        if rejected_commands:
+                            with trace_lock:
+                                wrapper_rejection_state["count"] = to_int(
+                                    wrapper_rejection_state.get("count"), 0
+                                ) + len(rejected_commands)
+                                tracked = wrapper_rejection_state.get("commands")
+                                if not isinstance(tracked, list):
+                                    tracked = []
+                                for command in rejected_commands:
+                                    lowered = command.lower()
+                                    if any(str(item).lower() == lowered for item in tracked):
+                                        continue
+                                    tracked.append(command)
+                                wrapper_rejection_state["commands"] = tracked[:6]
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+            stdout_thread = threading.Thread(target=_drain_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.write(prompt)
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            deadline = (
+                started_at + float(communicate_timeout_s)
+                if communicate_timeout_s and communicate_timeout_s > 0
+                else None
+            )
+            next_progress_at = started_at + float(progress_interval_s)
+            timed_out = False
+            command_policy_rejection_loop = False
+
+            while proc.poll() is None:
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    timed_out = True
+                    _terminate_active_child()
+                    break
+
+                with trace_lock:
+                    wrapper_rejections = to_int(wrapper_rejection_state.get("count"), 0)
+                if wrapper_rejections >= 3:
+                    command_policy_rejection_loop = True
+                    _terminate_active_child()
+                    break
+
+                if now >= next_progress_at:
+                    elapsed = int(max(0.0, now - started_at))
+                    with trace_lock:
+                        last_event = float(last_activity_at.get("ts", started_at))
+                        valid_json = to_int(stdout_trace_state.get("valid_json"), 0)
+                        total_lines = to_int(stdout_trace_state.get("line_count"), 0)
+                    idle_for = int(max(0.0, now - last_event))
+                    if use_json:
+                        log.info(
+                            f"codex exec still running ({elapsed}s elapsed, json_events={valid_json}, idle={idle_for}s)"
+                        )
+                    else:
+                        log.info(
+                            f"codex exec still running ({elapsed}s elapsed, stdout_lines={total_lines}, idle={idle_for}s)"
+                        )
+                    next_progress_at = now + float(progress_interval_s)
+
+                time.sleep(1.0)
+
             try:
-                proc.kill()
                 proc.wait(timeout=5)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
 
-        stdout_thread.join(timeout=2)
-        stderr_thread.join(timeout=2)
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+        finally:
+            _restore_repo_local_codex_files(codex_project_mask)
 
         return_code = proc.returncode
         _ACTIVE_CHILD = None

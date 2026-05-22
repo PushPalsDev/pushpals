@@ -6,7 +6,6 @@
 import { existsSync, lstatSync, readFileSync, renameSync, rmSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import {
-  deriveAutonomyComponentArea,
   buildGitCommitArgs as buildSourceControlGitCommitArgs,
   explicitSourceControlCommitIdentityFromEnv,
   loadPromptTemplate,
@@ -15,11 +14,9 @@ import {
   extractVisionKeyItems,
   formatToolRequirement,
   matchesGlob,
-  normalizeAutonomyComponentArea,
   normalizeTargetPath,
   requirementsForValidationCommand,
   sanitizeSourceControlIdentityField,
-  type AutonomyComponentArea,
   type SourceControlCommitIdentity,
   type ToolRequirement,
 } from "shared";
@@ -386,13 +383,6 @@ export function shouldEnqueueNoChangeReviewCompletion(
   params: Record<string, unknown> | null | undefined,
 ): boolean {
   return extractReviewFixContext(params) == null;
-}
-
-function reviewAgentAllowsMultiRootScope(value: unknown): boolean {
-  const normalized = String(value ?? "")
-    .trim()
-    .toLowerCase();
-  return normalized === "review_fix" || normalized === "merge_conflict";
 }
 
 export function deriveQualityGatePolicy(
@@ -1655,7 +1645,7 @@ async function runDeterministicQualityGate(
   if (scopedValidationFailure === "outside_task_scope") {
     onLog?.(
       "stderr",
-      "[ValidationGate] Required validation failures appear outside the task write scope; treating them as publish blockers, not repair instructions.",
+      "[ValidationGate] Required validation failures appear outside the task target/relevance hints; treating them as publish blockers, not repair instructions.",
     );
   }
 
@@ -4020,10 +4010,6 @@ function hasInvalidRepoPathHint(values: string[]): boolean {
   return values.some((entry) => normalizeStagePath(entry) === null);
 }
 
-function asAutonomyComponentArea(value: unknown): AutonomyComponentArea | null {
-  return normalizeAutonomyComponentArea(value);
-}
-
 function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user" {
   const explicit = String(params.origin ?? "")
     .trim()
@@ -4043,20 +4029,11 @@ export function collectWriteScopeIssuesFromChangedPaths(
   changedPaths: string[],
   planning: TaskExecutePlanning,
 ): string[] {
-  const normalizedChangedPaths = changedPaths
-    .map((entry) => normalizeStagePath(entry))
-    .filter((entry): entry is string => Boolean(entry) && entry !== ".");
-  if (normalizedChangedPaths.length === 0) return [];
-
-  const forbidden = toStringArray(planning.scope.forbiddenGlobs ?? []);
-  const issues: string[] = [];
-  const forbiddenTouched = normalizedChangedPaths.filter((path) =>
-    forbidden.some((glob) => matchesGlob(path, glob)),
-  );
-  if (forbiddenTouched.length > 0) {
-    issues.push(`modified paths matching forbiddenGlobs: ${forbiddenTouched.join(", ")}`);
-  }
-  return issues;
+  void changedPaths;
+  void planning;
+  // WorkerPals run in isolated worktrees and may write anywhere in that repo sandbox.
+  // Scope hints guide planning/review, but they are not hard write privileges.
+  return [];
 }
 
 function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
@@ -4177,37 +4154,6 @@ function validateTaskExecutePlanning(
         ok: false,
         message: "task.execute planning.targetPaths must contain literal repo-relative paths",
       };
-    }
-    const normalizedWriteGlobs = isStringArray(scope.writeGlobs)
-      ? toStringArray(scope.writeGlobs)
-      : [];
-    const allowMultiRootAutonomyScope =
-      origin === "autonomy" &&
-      reviewAgentAllowsMultiRootScope(options?.reviewAgentResolutionType);
-    if (origin === "autonomy") {
-      const declaredComponentArea = asAutonomyComponentArea(options?.autonomyComponentArea);
-      if (!allowMultiRootAutonomyScope && declaredComponentArea) {
-        const inferredComponentArea = deriveAutonomyComponentArea(
-          normalizedTargetPaths,
-          normalizedWriteGlobs,
-        );
-        if (inferredComponentArea && declaredComponentArea !== inferredComponentArea) {
-          return {
-            ok: false,
-            message: "task.execute planning.targetPaths do not match autonomy componentArea",
-          };
-        }
-      }
-    } else if (normalizedWriteGlobs.length > 0) {
-      const uncoveredPaths = normalizedTargetPaths.filter(
-        (targetPath) => !normalizedWriteGlobs.some((glob) => matchesGlob(targetPath, glob)),
-      );
-      if (uncoveredPaths.length > 0) {
-        return {
-          ok: false,
-          message: `task.execute planning.targetPaths must be covered by planning.scope.writeGlobs: ${uncoveredPaths.join(", ")}`,
-        };
-      }
     }
   }
 
@@ -4841,7 +4787,7 @@ export async function executeJob(
           [
             result.stderr ?? "",
             validationOutsideTaskScope
-              ? "Validation failures appear outside the task write scope and are treated as pre-existing repo blockers."
+              ? "Validation failures appear outside the task target/relevance hints and are treated as pre-existing repo blockers."
               : "",
             ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
           ]

@@ -33,7 +33,9 @@ from openai_codex_executor import (
     _detect_codex_workaround_signal,
     _extract_usage_counts,
     _load_prompt_template,
+    _mask_repo_local_codex_files,
     _repo_root_for_prompt_loading,
+    _restore_repo_local_codex_files,
     _resolve_codex_command_prefix,
     _unwrap_shell_wrapper_command,
     _usage_from_trace_or_estimate,
@@ -79,6 +81,61 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.color, "never")
         self.assertEqual(cfg.reasoning_effort, "xhigh")
         self.assertFalse(cfg.json_output)
+
+    def test_masks_and_restores_repo_local_codex_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-mask-") as root:
+            repo = Path(root) / "repo"
+            repo.mkdir()
+            codex_file = repo / ".codex"
+            codex_file.write_text("tracked repo sentinel\n", encoding="utf-8")
+
+            masked = _mask_repo_local_codex_files(str(repo), {})
+            try:
+                self.assertFalse(codex_file.exists())
+                self.assertEqual(len(masked), 1)
+                self.assertTrue(masked[0][1].exists())
+            finally:
+                _restore_repo_local_codex_files(masked)
+
+            self.assertEqual(codex_file.read_text(encoding="utf-8"), "tracked repo sentinel\n")
+
+    def test_masks_project_root_override_codex_file_for_worktree_runs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-mask-root-") as root:
+            project_root = Path(root) / "project"
+            worktree = project_root / ".worktrees" / "job-123"
+            worktree.mkdir(parents=True)
+            root_codex_file = project_root / ".codex"
+            worktree_codex_file = worktree / ".codex"
+            root_codex_file.write_text("root sentinel\n", encoding="utf-8")
+            worktree_codex_file.write_text("worktree sentinel\n", encoding="utf-8")
+
+            masked = _mask_repo_local_codex_files(
+                str(worktree),
+                {"PUSHPALS_REPO_ROOT_OVERRIDE": str(project_root)},
+            )
+            try:
+                self.assertFalse(root_codex_file.exists())
+                self.assertFalse(worktree_codex_file.exists())
+                self.assertEqual(len(masked), 2)
+            finally:
+                _restore_repo_local_codex_files(masked)
+
+            self.assertEqual(root_codex_file.read_text(encoding="utf-8"), "root sentinel\n")
+            self.assertEqual(worktree_codex_file.read_text(encoding="utf-8"), "worktree sentinel\n")
+
+    def test_does_not_mask_repo_local_codex_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-mask-dir-") as root:
+            repo = Path(root) / "repo"
+            codex_dir = repo / ".codex"
+            codex_dir.mkdir(parents=True)
+            (codex_dir / "config.toml").write_text("[hooks]\n", encoding="utf-8")
+
+            masked = _mask_repo_local_codex_files(str(repo), {})
+            try:
+                self.assertEqual(masked, [])
+                self.assertTrue((codex_dir / "config.toml").exists())
+            finally:
+                _restore_repo_local_codex_files(masked)
 
     def test_reasoning_effort_defaults_to_extra_high_for_default_gpt_5_5(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(

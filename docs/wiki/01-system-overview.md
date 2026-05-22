@@ -68,7 +68,7 @@ These assumptions should remain true unless we intentionally redesign the platfo
 - Requests and jobs are queue-mediated, not direct ad-hoc calls.
 - Event history is replayable for session recovery.
 - Execution and integration are separate responsibilities.
-- Write scope is bounded by planning/policy metadata.
+- Worker execution is isolated to a per-job repo worktree/sandbox; planning scope metadata guides relevance and review rather than acting as a filesystem write boundary.
 - Human-guided and autonomous flows converge into the same control plane.
 
 ## Explicit Non-Goals

@@ -208,7 +208,7 @@ describe("workerpals validation command safety", () => {
     ).toBe("ERR_SOCKET_BAD_PORT at port 65536");
   });
 
-  test("classifies validation failures outside the task write scope", () => {
+  test("classifies validation failures outside the task target/relevance hints", () => {
     const planning = planningFixture({
       targetPaths: ["app/game.tsx"],
       scope: {
@@ -258,7 +258,7 @@ describe("workerpals validation command safety", () => {
     ).toBe("task_scope");
   });
 
-  test("does not treat writeGlobs as hard sandbox write boundaries", () => {
+  test("does not treat scope globs as hard sandbox write boundaries", () => {
     const planning = planningFixture({
       scope: {
         readAnywhere: true,
@@ -282,7 +282,7 @@ describe("workerpals validation command safety", () => {
           forbiddenGlobs: ["outputs/**"],
         },
       }),
-    ).toEqual(["modified paths matching forbiddenGlobs: outputs/data/runtime.db"]);
+    ).toEqual([]);
   });
 
   test("uses a longer timeout for browser e2e validation commands", () => {

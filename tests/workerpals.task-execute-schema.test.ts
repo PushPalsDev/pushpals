@@ -196,6 +196,31 @@ describe("workerpals task.execute strict schema", () => {
     expect(result.summary).toContain("planning.finalizationBudgetMs");
   });
 
+  test("allows user-origin targetPaths outside writeGlobs as review hints", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      targetPaths: ["app/game.tsx", "README.md"],
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["app/game.tsx"],
+      },
+      finalizationBudgetMs: 0,
+    };
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        instruction: "inspect the game route and README context",
+        planning,
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).not.toContain("targetPaths must be covered");
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
+  });
+
   test("allows autonomy-origin generic repo scope without declared componentArea", async () => {
     const planning = {
       ...VALID_PLANNING,
@@ -245,6 +270,41 @@ describe("workerpals task.execute strict schema", () => {
 
     expect(result.ok).toBe(false);
     expect(result.summary).not.toContain("scope invariants");
+    expect(result.summary).not.toContain("componentArea");
+    expect(result.summary).toContain("planning.finalizationBudgetMs");
+  });
+
+  test("allows autonomy-origin componentArea mismatches as scope hints", async () => {
+    const planning = {
+      ...VALID_PLANNING,
+      targetPaths: [
+        "app/__tests__/_layout.autonomy.test.ts",
+        "app/_layout.tsx",
+        "app/index.tsx",
+        "app/game.tsx",
+      ],
+      scope: {
+        ...(VALID_PLANNING.scope ?? {}),
+        writeGlobs: ["app/**"],
+      },
+      finalizationBudgetMs: 0,
+    };
+    const result = await executeJob(
+      "task.execute",
+      {
+        schemaVersion: 2,
+        origin: "autonomy",
+        instruction: "harden app shell and web review path",
+        planning,
+        autonomy: {
+          componentArea: "app/__tests__",
+        },
+      },
+      process.cwd(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).not.toContain("planning.targetPaths do not match autonomy componentArea");
     expect(result.summary).not.toContain("componentArea");
     expect(result.summary).toContain("planning.finalizationBudgetMs");
   });

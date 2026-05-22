@@ -22,9 +22,9 @@ export interface PlannerOutput {
   scope: {
     read_anywhere: boolean; // usually true, default: true
     write_allowed: boolean; // often false unless requested, default: true
-    write_globs?: string[]; // if you want to constrain edits, default: true
-    forbidden_globs?: string[]; // never touch, default: none
-    max_files_to_edit?: number; // blast radius cap, default: unlimited
+    write_globs?: string[]; // starting-point/relevance hints, not hard write boundaries
+    forbidden_globs?: string[]; // review guardrail hints, not hard write blockers
+    max_files_to_edit?: number; // planning/review hint, default: unlimited
   };
   discovery?: {
     ripgrep_queries: string[]; // worker uses these

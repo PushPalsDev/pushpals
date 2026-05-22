@@ -474,7 +474,7 @@ function buildExecutionGuidance(
     for (const glob of plan.scope.write_globs) lines.push(`- ${glob}`);
   }
   if (Array.isArray(plan.scope.forbidden_globs) && plan.scope.forbidden_globs.length > 0) {
-    lines.push("Forbidden globs:");
+    lines.push("Review guardrail hints:");
     for (const glob of plan.scope.forbidden_globs) lines.push(`- ${glob}`);
   }
   if (plan.discovery) {

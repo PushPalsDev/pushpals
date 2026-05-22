@@ -45,8 +45,8 @@ Execution policy:
   - `scope.read_anywhere` should default to `true` (do not set `false` unless user explicitly requested restrictive reading)
   - `scope.write_allowed` should default to `true`
   - `scope.write_globs` should be included as starting-point/relevance hints, not as hard write boundaries
-  - `scope.forbidden_globs` should be included only when specific paths must be blocked
-  - `scope.max_files_to_edit` should be included only when a cap is needed
+  - `scope.forbidden_globs` should be included only as review guardrail hints, not as hard write blockers
+  - `scope.max_files_to_edit` should be included only as a planning/review hint; WorkerPal write access is repo-sandbox-wide
 
 Quality gates:
 
