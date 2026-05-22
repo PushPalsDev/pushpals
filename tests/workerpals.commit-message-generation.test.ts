@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -48,16 +48,31 @@ describe("workerpals commit message generation helpers", () => {
           },
         },
       }),
-    ).toEqual([
-      "add",
-      "-A",
-      "--",
-      ".",
-      ":(exclude)workspace/**",
-      ":(exclude)outputs/**",
-      ":(exclude).codex",
-      ":(exclude).codex/**",
-    ]);
+    ).toEqual(["add", "-A"]);
+  });
+
+  test("task.execute stage pathspec ignores runtime artifact directories cleanly", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-stage-ignore-"));
+    try {
+      await runGit(repo, ["init"]);
+      writeFileSync(join(repo, ".gitignore"), "outputs/\nworkspace/\n");
+      writeFileSync(join(repo, "README.md"), "hello\n");
+      mkdirSync(join(repo, "outputs"), { recursive: true });
+      mkdirSync(join(repo, "workspace", "bash_events"), { recursive: true });
+      writeFileSync(join(repo, "outputs", "runtime.db"), "ignored\n");
+      writeFileSync(join(repo, "workspace", "bash_events", "event.log"), "ignored\n");
+
+      const stageArgs = buildStageCommand("task.execute", {
+        planning: { scope: { writeGlobs: ["README.md"] } },
+      });
+      expect(stageArgs).not.toBeNull();
+      await runGit(repo, stageArgs!);
+
+      const staged = await runGit(repo, ["diff", "--cached", "--name-only"]);
+      expect(staged.split(/\r?\n/).filter(Boolean).sort()).toEqual([".gitignore", "README.md"]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   test("builds user prompt with background context, filtered test commands, and staged diff", () => {

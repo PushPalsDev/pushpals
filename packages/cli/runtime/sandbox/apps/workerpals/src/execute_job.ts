@@ -2166,6 +2166,12 @@ export type WorkerGitCommitIdentity = SourceControlCommitIdentity;
 
 export const explicitWorkerCommitIdentityFromEnv = explicitSourceControlCommitIdentityFromEnv;
 
+async function unstageSandboxArtifactPaths(
+  repo: string,
+): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return git(repo, ["reset", "-q", "--", ...SANDBOX_STAGE_ARTIFACT_PATHS]);
+}
+
 async function resolveGitConfigValue(repo: string, key: string): Promise<string> {
   const value = await git(repo, ["config", "--get", key]);
   return value.ok ? sanitizeSourceControlIdentityField(value.stdout) : "";
@@ -2282,17 +2288,19 @@ export async function createJobCommit(
         console.warn(
           `[WorkerPals] Stage target invalid/missing for ${job.kind}; retrying with fallback "git add -A".`,
         );
-        result = await git(repo, [
-          "add",
-          "-A",
-          "--",
-          ".",
-          ":(exclude)workspace/**",
-          ":(exclude)outputs/**",
-        ]);
+        result = await git(repo, ["add", "-A"]);
       }
       if (!result.ok) {
         return { ok: false, error: `Failed to stage changes: ${result.stderr || result.stdout}` };
+      }
+    }
+    if (job.kind === "task.execute") {
+      const unstageArtifacts = await unstageSandboxArtifactPaths(repo);
+      if (!unstageArtifacts.ok) {
+        return {
+          ok: false,
+          error: `Failed to unstage sandbox artifact paths: ${unstageArtifacts.stderr || unstageArtifacts.stdout}`,
+        };
       }
     }
 
@@ -2494,16 +2502,7 @@ function buildStageTargets(kind: string, params?: Record<string, unknown>): stri
 
 export function buildStageCommand(kind: string, params?: Record<string, unknown>): string[] | null {
   if (kind === "task.execute") {
-    return [
-      "add",
-      "-A",
-      "--",
-      ".",
-      ":(exclude)workspace/**",
-      ":(exclude)outputs/**",
-      ":(exclude).codex",
-      ":(exclude).codex/**",
-    ];
+    return ["add", "-A"];
   }
   const targets = buildStageTargets(kind, params);
   if (targets.length === 0) {
@@ -3048,25 +3047,11 @@ export async function resumePreparedMergeConflictRebase(
           "stdout",
           `[MergeConflict] Stage target invalid/missing for ${kind}; retrying with fallback "git add -A".`,
         );
-        stageResult = await git(repo, [
-          "add",
-          "-A",
-          "--",
-          ".",
-          ":(exclude)workspace/**",
-          ":(exclude)outputs/**",
-        ]);
+        stageResult = await git(repo, ["add", "-A"]);
       }
     }
   } else {
-    stageResult = await git(repo, [
-      "add",
-      "-A",
-      "--",
-      ".",
-      ":(exclude)workspace/**",
-      ":(exclude)outputs/**",
-    ]);
+    stageResult = await git(repo, ["add", "-A"]);
   }
   if (!stageResult.ok) {
     return {
@@ -3074,6 +3059,15 @@ export async function resumePreparedMergeConflictRebase(
       error:
         "Failed to stage resolved merge-conflict changes before continuing rebase: " +
         combinedGitOutput(stageResult),
+    };
+  }
+  const unstageArtifacts = await unstageSandboxArtifactPaths(repo);
+  if (!unstageArtifacts.ok) {
+    return {
+      ok: false,
+      error:
+        "Failed to unstage sandbox artifact paths before continuing rebase: " +
+        combinedGitOutput(unstageArtifacts),
     };
   }
 
@@ -3225,18 +3219,18 @@ async function createMergeConflictJobCommit(
       console.warn(
         `[WorkerPals] Stage target invalid/missing for merge-conflict job ${job.id}; retrying with fallback "git add -A".`,
       );
-      result = await git(repo, [
-        "add",
-        "-A",
-        "--",
-        ".",
-        ":(exclude)workspace/**",
-        ":(exclude)outputs/**",
-      ]);
+      result = await git(repo, ["add", "-A"]);
     }
     if (!result.ok) {
       return { ok: false, error: `Failed to stage merge-conflict changes: ${result.stderr || result.stdout}` };
     }
+  }
+  const unstageArtifacts = await unstageSandboxArtifactPaths(repo);
+  if (!unstageArtifacts.ok) {
+    return {
+      ok: false,
+      error: `Failed to unstage sandbox artifact paths: ${unstageArtifacts.stderr || unstageArtifacts.stdout}`,
+    };
   }
 
   const cachedDiffQuiet = await git(repo, ["diff", "--cached", "--quiet"]);
@@ -4009,6 +4003,8 @@ function isStringArray(value: unknown): value is string[] {
 function hasInvalidRepoPathHint(values: string[]): boolean {
   return values.some((entry) => normalizeStagePath(entry) === null);
 }
+
+const SANDBOX_STAGE_ARTIFACT_PATHS = ["workspace", "outputs", ".codex"];
 
 function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user" {
   const explicit = String(params.origin ?? "")
