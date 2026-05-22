@@ -254,6 +254,9 @@ const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
 ).trim();
 const IDEATION_TIMEOUT_RECOVERY_INSTRUCTION =
   "Previous ideation timed out before you returned JSON. For this round only, stay within the time budget: prioritize the top 1-3 highest-confidence candidates, keep reasoning brief, avoid exhaustive exploration, and return valid JSON as soon as possible.";
+const STARTUP_FAST_TICK_MAX_ATTEMPTS = 4;
+const STARTUP_FAST_TICK_MAX_DELAY_MS = 15_000;
+const STARTUP_STALE_LOCK_AFTER_MS = 30_000;
 const VISION_DOC_FNAME = "vision.md";
 const MAX_VISION_SECTION_CHARS = 1_200;
 const DOCS_MIN_IMPACT_SIGNAL_FOR_NO_PENALTY = 0.45;
@@ -323,32 +326,41 @@ const AUTO_INGEST_SEED_PATTERNS: Array<{
 
 type SourceCurationStatus = "candidate" | "trusted" | "watchlist" | "archived";
 
-type FeedbackPriorForScoring = {
-  ema_success?: unknown;
-  ema_user_accept?: unknown;
-  ema_latency?: unknown;
-  ema_regret?: unknown;
-} | null | undefined;
+type FeedbackPriorForScoring =
+  | {
+      ema_success?: unknown;
+      ema_user_accept?: unknown;
+      ema_latency?: unknown;
+      ema_regret?: unknown;
+    }
+  | null
+  | undefined;
 
-type EngineIdeaPriorForScoring = {
-  ema_success?: unknown;
-  ema_user_accept?: unknown;
-  ema_latency?: unknown;
-  ema_regret?: unknown;
-  sample_count?: unknown;
-} | null | undefined;
+type EngineIdeaPriorForScoring =
+  | {
+      ema_success?: unknown;
+      ema_user_accept?: unknown;
+      ema_latency?: unknown;
+      ema_regret?: unknown;
+      sample_count?: unknown;
+    }
+  | null
+  | undefined;
 
-type EngineSourcePriorForScoring = {
-  ema_success?: unknown;
-  ema_user_accept?: unknown;
-  ema_latency?: unknown;
-  ema_regret?: unknown;
-  sample_count?: unknown;
-  curation_status?: unknown;
-  curation_reason?: unknown;
-  trust_score?: unknown;
-  freshness_score?: unknown;
-} | null | undefined;
+type EngineSourcePriorForScoring =
+  | {
+      ema_success?: unknown;
+      ema_user_accept?: unknown;
+      ema_latency?: unknown;
+      ema_regret?: unknown;
+      sample_count?: unknown;
+      curation_status?: unknown;
+      curation_reason?: unknown;
+      trust_score?: unknown;
+      freshness_score?: unknown;
+    }
+  | null
+  | undefined;
 
 type AdaptiveExploreRateSnapshot = {
   top_signals?: Array<{ type?: unknown; value?: unknown }>;
@@ -1387,12 +1399,25 @@ function chooseRepoObjectiveTargetProfile(
       if (docsSurface) score -= 3;
     }
     if (categories.has("reliability")) {
-      if (productSurface || scriptSurface || packageSurface || /\b(config|startup|server)\b/i.test(label)) {
+      if (
+        productSurface ||
+        scriptSurface ||
+        packageSurface ||
+        /\b(config|startup|server)\b/i.test(label)
+      ) {
         score += 3;
       }
     }
-    if (categories.has("delivery_loop") || categories.has("governance") || categories.has("maintainability")) {
-      if (scriptSurface || packageSurface || /\b(src|utils?|lib|server|shared|policy)\b/i.test(label)) {
+    if (
+      categories.has("delivery_loop") ||
+      categories.has("governance") ||
+      categories.has("maintainability")
+    ) {
+      if (
+        scriptSurface ||
+        packageSurface ||
+        /\b(src|utils?|lib|server|shared|policy)\b/i.test(label)
+      ) {
         score += 3;
       }
     }
@@ -2112,7 +2137,9 @@ function compileRepoVisionObjectives(params: {
   for (const section of params.vision.sections ?? []) {
     const sectionTitle = asString(section.title);
     if (!sectionTitle) continue;
-    if (/^(who this is for|the problem|scope|long-term|how decisions|get made)$/i.test(sectionTitle)) {
+    if (
+      /^(who this is for|the problem|scope|long-term|how decisions|get made)$/i.test(sectionTitle)
+    ) {
       continue;
     }
     const sectionNumber = asString(section.number);
@@ -3260,6 +3287,104 @@ export function buildEngineInspirationContext(params: {
   };
 }
 
+function compactIdeationText(value: unknown, maxChars: number): string {
+  const text = asString(value).trim();
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
+}
+
+function compactIdeationTextList(values: unknown[], maxItems: number, maxChars: number): string[] {
+  return values
+    .slice(0, maxItems)
+    .map((value) => compactIdeationText(value, maxChars))
+    .filter(Boolean);
+}
+
+function compactVisionContextForIdeationRetry(vision: VisionContext): Record<string, unknown> {
+  const compactKeyItems = Object.fromEntries(
+    Object.entries(vision.key_items).map(([key, value]) => [
+      key,
+      Array.isArray(value)
+        ? compactIdeationTextList(value, 6, 260)
+        : compactIdeationText(value, 260),
+    ]),
+  );
+  return {
+    one_sentence: compactIdeationText(vision.one_sentence, 360),
+    sections: vision.sections.slice(0, 4).map((section) => ({
+      number: section.number,
+      title: compactIdeationText(section.title, 160),
+      markdown: compactIdeationText(section.markdown, 500),
+      truncated: section.truncated || section.markdown.length > 500,
+    })),
+    key_items: compactKeyItems,
+    section_numbers: vision.section_numbers.slice(0, 8),
+    truncated: vision.truncated,
+  };
+}
+
+function compactEngineInspirationForIdeationRetry(
+  context: EngineInspirationContext,
+): Record<string, unknown> {
+  return {
+    compiled_repo_objectives: context.compiled_repo_objectives.slice(0, 4).map((objective) => ({
+      id: objective.id,
+      title: objective.title,
+      weight: objective.weight,
+      section_ref: objective.section_ref,
+      category: objective.category,
+      success_criteria: compactIdeationTextList(objective.success_criteria, 3, 220),
+      validation_expectations: compactIdeationTextList(objective.validation_expectations, 3, 220),
+    })),
+    compiled_objectives: context.compiled_objectives.slice(0, 4).map((objective) => ({
+      id: objective.id,
+      title: compactIdeationText(objective.title, 220),
+      weight: objective.weight,
+      evidence: compactIdeationTextList(objective.evidence, 3, 220),
+    })),
+    opportunity_gaps: context.opportunity_gaps.slice(0, 4).map((gap) => ({
+      id: gap.id,
+      label: compactIdeationText(gap.label, 220),
+      score: gap.score,
+      evidence: compactIdeationTextList(gap.evidence, 3, 220),
+    })),
+    building_blocks: context.building_blocks.slice(0, 6).map((block) => ({
+      id: block.id,
+      algorithm: block.algorithm,
+      summary: compactIdeationText(block.summary, 260),
+      hypothesis: compactIdeationText(block.hypothesis, 260),
+      score: block.score,
+      objective_ids: block.objective_ids.slice(0, 3),
+      gap_ids: block.gap_ids.slice(0, 3),
+      candidate_shape: {
+        objective_type: block.candidate_shape.objective_type,
+        trigger_type: block.candidate_shape.trigger_type,
+        component_area: block.candidate_shape.component_area,
+        target_paths: block.candidate_shape.target_paths.slice(0, 4),
+        write_globs: block.candidate_shape.write_globs.slice(0, 4),
+      },
+    })),
+    source_patterns: context.source_patterns.slice(0, 4).map((pattern) => ({
+      id: pattern.id,
+      algorithm: pattern.algorithm,
+      summary: compactIdeationText(pattern.summary, 260),
+      tags: compactIdeationTextList(pattern.tags, 5, 80),
+      quality_score: pattern.quality_score,
+      freshness_score: pattern.freshness_score,
+      source_trust_score: pattern.source_trust_score,
+    })),
+    commit_history_hints: context.commit_history_hints.slice(0, 4).map((hint) => ({
+      motif_id: hint.motif_id,
+      label: compactIdeationText(hint.label, 220),
+      count: hint.count,
+      signal: hint.signal,
+      objective_ids: hint.objective_ids.slice(0, 3),
+      gap_ids: hint.gap_ids.slice(0, 3),
+      sample_subjects: compactIdeationTextList(hint.sample_subjects, 3, 180),
+    })),
+  };
+}
+
 function selectVisionSectionRefs(sectionRefs: string[]): string[] {
   const preferred = ["6", "7", "8", "4", "3", "0", "5"];
   const normalized = sectionRefs.map((value) => asString(value)).filter(Boolean);
@@ -3409,8 +3534,8 @@ export function buildRepoVisionFallbackCandidates(params: {
     const writeGlobs = target?.write_globs ?? targetPaths;
     const componentArea =
       target?.component_area ??
-      (normalizeAutonomyComponentArea(pathDirname(targetPaths[0]) || targetPaths[0]) ??
-        "docs");
+      normalizeAutonomyComponentArea(pathDirname(targetPaths[0]) || targetPaths[0]) ??
+      "docs";
     const triggerType = categoryTriggerType(objective.category, params.snapshotTopSignals);
     const signalIds = pickSignalIdsForTrigger(params.snapshotTopSignals, triggerType);
     const sectionRef = objective.section_ref || sectionRefs[0] || "";
@@ -3686,9 +3811,11 @@ export class RemoteBuddyAutonomousEngine {
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
   private runtimeEnabled = true;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private startupFastTickTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
   private nextTickAtMs = 0;
+  private startupFastTickAttemptsRemaining = 0;
   private currentRunId: string | null = null;
   private currentPhase = "idle";
   private currentPhaseStartedAtMs = 0;
@@ -3730,6 +3857,8 @@ export class RemoteBuddyAutonomousEngine {
     this.runtimeEnabled = Boolean(enabled);
     if (!this.runtimeEnabled) {
       this.nextTickAtMs = 0;
+      this.startupFastTickAttemptsRemaining = 0;
+      this.clearStartupFastTickTimer();
       if (!this.currentRunId) {
         this.lastOutcome = "skipped";
         this.lastDetail = "disabled_by_runtime_config";
@@ -3802,11 +3931,54 @@ export class RemoteBuddyAutonomousEngine {
   private lockStaleAfterMs(): number {
     // Same-session retries are safe to recover sooner: a healthy in-process cycle is guarded
     // by `inFlight`, while a restarted process needs a bounded way past an orphaned lease.
-    return Math.max(
-      this.phaseTimeoutMs("ideation") + 30_000,
-      this.cfg.heartbeatLogMs * 2,
-      120_000,
+    return Math.max(this.phaseTimeoutMs("ideation") + 30_000, this.cfg.heartbeatLogMs * 2, 120_000);
+  }
+
+  private startupLockStaleAfterMs(): number {
+    return Math.min(
+      this.lockStaleAfterMs(),
+      Math.max(
+        5_000,
+        Math.min(STARTUP_STALE_LOCK_AFTER_MS, Math.floor(this.cfg.tickIntervalMs / 4)),
+      ),
     );
+  }
+
+  private lockStaleAfterMsForAcquire(): number {
+    return this.startupFastTickAttemptsRemaining > 0
+      ? this.startupLockStaleAfterMs()
+      : this.lockStaleAfterMs();
+  }
+
+  private startupFastTickDelayMs(): number {
+    return Math.max(
+      1_000,
+      Math.min(STARTUP_FAST_TICK_MAX_DELAY_MS, Math.floor(this.cfg.tickIntervalMs / 10)),
+    );
+  }
+
+  private clearStartupFastTickTimer(): void {
+    if (this.startupFastTickTimer) {
+      clearTimeout(this.startupFastTickTimer);
+      this.startupFastTickTimer = null;
+    }
+  }
+
+  private scheduleStartupFastTick(reason: string): void {
+    if (!this.runtimeEnabled || !this.timer || this.startupFastTickTimer) return;
+    if (this.startupFastTickAttemptsRemaining <= 0) return;
+    const delayMs = this.startupFastTickDelayMs();
+    this.startupFastTickAttemptsRemaining -= 1;
+    this.nextTickAtMs = Date.now() + delayMs;
+    console.log(
+      `[RemoteBuddyAutonomousEngine] startup fast tick scheduled in ${delayMs}ms after ${reason} (remaining=${this.startupFastTickAttemptsRemaining}).`,
+    );
+    this.startupFastTickTimer = setTimeout(() => {
+      this.startupFastTickTimer = null;
+      if (!this.runtimeEnabled || !this.timer) return;
+      this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+      void this.tick();
+    }, delayMs);
   }
 
   private cycleBudgetMs(): number {
@@ -3825,7 +3997,11 @@ export class RemoteBuddyAutonomousEngine {
   private phaseTimeoutMs(phase: "ideation" | "scoring" | "planning"): number {
     const configuredTimeoutMs = Math.max(1_000, this.cfg.llmTimeoutMs);
     if (phase !== "ideation") return configuredTimeoutMs;
-    if (String(this.llmCfg.backend || "").trim().toLowerCase() !== "openai_codex") {
+    if (
+      String(this.llmCfg.backend || "")
+        .trim()
+        .toLowerCase() !== "openai_codex"
+    ) {
       return configuredTimeoutMs;
     }
     const codexTimeoutMs = Math.max(configuredTimeoutMs, this.llmCfg.codexTimeoutMs || 0);
@@ -4204,7 +4380,7 @@ export class RemoteBuddyAutonomousEngine {
         sessionId: this.sessionId,
         runId,
         ttlMs,
-        staleAfterMs: this.lockStaleAfterMs(),
+        staleAfterMs: this.lockStaleAfterMsForAcquire(),
       }),
     });
     if (res.ok) return { ok: true };
@@ -4648,6 +4824,8 @@ export class RemoteBuddyAutonomousEngine {
           : "lock_not_acquired";
         return;
       }
+      this.startupFastTickAttemptsRemaining = 0;
+      this.clearStartupFastTickTimer();
 
       this.setPhase("prepare_worktree");
       const ready = await this.ensureAutonomyRepoReady(runId);
@@ -4704,9 +4882,7 @@ export class RemoteBuddyAutonomousEngine {
 
       this.setPhase("check_worker_load");
       const workerLoad = await this.fetchWorkerLoadSnapshot();
-      const workerLoadDeferReason = workerLoad
-        ? this.deferReasonForWorkerLoad(workerLoad)
-        : null;
+      const workerLoadDeferReason = workerLoad ? this.deferReasonForWorkerLoad(workerLoad) : null;
       if (workerLoad && workerLoadDeferReason) {
         console.log(
           `[RemoteBuddyAutonomousEngine] tick ${runId}: deferring ideation due to active worker load (busy=${workerLoad.workers.busy} pending=${workerLoad.jobs.pending} autoscalablePending=${workerLoad.jobs.autoscalablePending}).`,
@@ -4773,72 +4949,115 @@ export class RemoteBuddyAutonomousEngine {
       }
 
       this.setPhase("ideation");
-      const ideationRecovery = this.consumeIdeationTimeoutRecovery();
+      const buildIdeationInput = (
+        ideationRecovery: IdeationTimeoutRecovery | null,
+        compactRetry: boolean,
+      ): Parameters<LLMClient["generate"]>[0] => {
+        const reduced = compactRetry || Boolean(ideationRecovery);
+        const ideationTopSignals = snapshot.top_signals.slice(0, reduced ? 5 : 16);
+        const ideationStateTraits = snapshot.state_traits.slice(0, reduced ? 6 : 24);
+        const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, reduced ? 4 : 20);
+        const ideationEngineIdeaPriors = (snapshot.engine_idea_priors ?? []).slice(
+          0,
+          reduced ? 4 : 20,
+        );
+        const ideationOpenObjectives = snapshot.open_objectives.slice(0, reduced ? 4 : 20);
+        const ideationActiveCooldowns = snapshot.active_cooldowns.slice(0, reduced ? 4 : 20);
+        const ideationRepoTargets = repoTargets.slice(0, reduced ? 4 : repoTargets.length);
+        return {
+          system: IDEATION_SYSTEM_PROMPT,
+          json: true,
+          maxTokens: reduced ? 900 : 2800,
+          temperature: 0.2,
+          messages: [
+            ...(ideationRecovery
+              ? [
+                  {
+                    role: "user" as const,
+                    content: `${IDEATION_TIMEOUT_RECOVERY_INSTRUCTION} Previous timed-out run: ${ideationRecovery.previousRunId}. Timeout budget for this round: ${this.phaseTimeoutMs("ideation")}ms.`,
+                  },
+                ]
+              : []),
+            {
+              role: "user",
+              content: JSON.stringify(
+                {
+                  snapshot: {
+                    snapshot_id: snapshot.snapshot_id,
+                    top_signals: ideationTopSignals,
+                    state_traits: ideationStateTraits,
+                    feedback_priors: ideationFeedbackPriors,
+                    engine_idea_priors: ideationEngineIdeaPriors,
+                    open_objectives: ideationOpenObjectives,
+                    active_cooldowns: ideationActiveCooldowns,
+                  },
+                  vision: reduced
+                    ? compactVisionContextForIdeationRetry(visionContext)
+                    : visionContext,
+                  repo_targets: ideationRepoTargets.map((target) => ({
+                    component_area: target.component_area,
+                    target_paths: target.target_paths,
+                    write_globs: target.write_globs,
+                    label: target.label,
+                    keywords: target.keywords.slice(0, reduced ? 4 : 8),
+                  })),
+                  engine_inspiration: reduced
+                    ? compactEngineInspirationForIdeationRetry(engineInspiration)
+                    : engineInspiration,
+                  limits: {
+                    ideation_max_candidates: reduced
+                      ? Math.max(1, Math.min(3, this.cfg.ideationMaxCandidates))
+                      : this.cfg.ideationMaxCandidates,
+                    min_confidence: this.cfg.minConfidence,
+                  },
+                },
+                null,
+                reduced ? 0 : 2,
+              ),
+            },
+          ],
+        };
+      };
+      let ideationRecovery = this.consumeIdeationTimeoutRecovery();
       if (ideationRecovery) {
         console.warn(
           `[RemoteBuddyAutonomousEngine] tick ${runId}: applying one-shot ideation timeout recovery from ${ideationRecovery.previousRunId} after ${ideationRecovery.timeoutMs}ms timeout.`,
         );
       }
-      const ideationTopSignals = snapshot.top_signals.slice(0, ideationRecovery ? 10 : 16);
-      const ideationStateTraits = snapshot.state_traits.slice(0, ideationRecovery ? 14 : 24);
-      const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, ideationRecovery ? 12 : 20);
-      const ideationEngineIdeaPriors = (snapshot.engine_idea_priors ?? []).slice(
-        0,
-        ideationRecovery ? 12 : 20,
-      );
-      const ideationOpenObjectives = snapshot.open_objectives.slice(0, ideationRecovery ? 12 : 20);
-      const ideationActiveCooldowns = snapshot.active_cooldowns.slice(
-        0,
-        ideationRecovery ? 12 : 20,
-      );
-      const ideationRepoTargets = repoTargets.slice(0, ideationRecovery ? 8 : repoTargets.length);
-      const ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, {
-        system: IDEATION_SYSTEM_PROMPT,
-        json: true,
-        maxTokens: ideationRecovery ? 1400 : 2800,
-        temperature: 0.2,
-        messages: [
-          ...(ideationRecovery
-            ? [
-                {
-                  role: "user" as const,
-                  content: `${IDEATION_TIMEOUT_RECOVERY_INSTRUCTION} Previous timed-out run: ${ideationRecovery.previousRunId}. Timeout budget for this round: ${this.phaseTimeoutMs("ideation")}ms.`,
-                },
-              ]
-            : []),
-          {
-            role: "user",
-            content: JSON.stringify(
-              {
-                snapshot: {
-                  snapshot_id: snapshot.snapshot_id,
-                  top_signals: ideationTopSignals,
-                  state_traits: ideationStateTraits,
-                  feedback_priors: ideationFeedbackPriors,
-                  engine_idea_priors: ideationEngineIdeaPriors,
-                  open_objectives: ideationOpenObjectives,
-                  active_cooldowns: ideationActiveCooldowns,
-                },
-                vision: visionContext,
-                repo_targets: ideationRepoTargets.map((target) => ({
-                  component_area: target.component_area,
-                  target_paths: target.target_paths,
-                  write_globs: target.write_globs,
-                  label: target.label,
-                  keywords: target.keywords.slice(0, 8),
-                })),
-                engine_inspiration: engineInspiration,
-                limits: {
-                  ideation_max_candidates: this.cfg.ideationMaxCandidates,
-                  min_confidence: this.cfg.minConfidence,
-                },
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      });
+      let ideationPhase: { json: Record<string, unknown>; llmCall: Record<string, unknown> };
+      try {
+        ideationPhase = await this.llmPhase(
+          "ideation",
+          runId,
+          snapshot.snapshot_id,
+          buildIdeationInput(ideationRecovery, Boolean(ideationRecovery)),
+        );
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message === "autonomy ideation phase timeout" &&
+          !ideationRecovery
+        ) {
+          ideationRecovery = {
+            previousRunId: runId,
+            timedOutAt: new Date().toISOString(),
+            timeoutMs: this.phaseTimeoutMs("ideation"),
+          };
+          this.pendingIdeationTimeoutRecovery = null;
+          console.warn(
+            `[RemoteBuddyAutonomousEngine] tick ${runId}: ideation timed out; retrying once immediately with reduced context and budget-focused guidance.`,
+          );
+          ideationPhase = await this.llmPhase(
+            "ideation",
+            runId,
+            snapshot.snapshot_id,
+            buildIdeationInput(ideationRecovery, true),
+          );
+          this.pendingIdeationTimeoutRecovery = null;
+        } else {
+          throw error;
+        }
+      }
       llmCalls.push(ideationPhase.llmCall);
       const ideationJson = ideationPhase.json;
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
@@ -5548,6 +5767,9 @@ export class RemoteBuddyAutonomousEngine {
       if (lockAcquired) await this.releaseDispatchLock(runId);
       this.inFlight = false;
       this.markTickDone(outcome, outcomeDetail);
+      if (!lockAcquired && outcomeDetail.startsWith("lock_not_acquired")) {
+        this.scheduleStartupFastTick("dispatch lock contention");
+      }
     }
   }
 
@@ -5593,7 +5815,8 @@ export class RemoteBuddyAutonomousEngine {
     console.log(
       `[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`,
     );
-    this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+    this.startupFastTickAttemptsRemaining = STARTUP_FAST_TICK_MAX_ATTEMPTS;
+    this.nextTickAtMs = Date.now();
     this.timer = setInterval(() => {
       this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
       void this.tick();
@@ -5606,6 +5829,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   stop(): void {
+    this.clearStartupFastTickTimer();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -5614,6 +5838,7 @@ export class RemoteBuddyAutonomousEngine {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+    this.startupFastTickAttemptsRemaining = 0;
     this.nextTickAtMs = 0;
   }
 }

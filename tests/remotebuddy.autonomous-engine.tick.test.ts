@@ -633,6 +633,61 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     engine.stop();
   });
 
+  test("startup lock contention retries quickly with aggressive stale lock threshold", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-startup-lock-"));
+    tempDirs.push(root);
+    const calls: FetchCall[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+      if (url.includes("/autonomy/lock/acquire")) {
+        return jsonResponse(409, {
+          ok: false,
+          reason: "dispatch lock held by run_previous until 2099-01-01T00:00:00.000Z",
+        });
+      }
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const cfg = makeConfig();
+    cfg.remotebuddy.autonomy.tickIntervalMs = 10_000;
+    cfg.remotebuddy.autonomy.heartbeatLogMs = 10_000;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_startup_lock",
+      authToken: "tok",
+      repo: root,
+      llm: {
+        async generate() {
+          return {
+            text: JSON.stringify({ candidates: [] }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        },
+      } as any,
+      comm: {
+        async emit() {
+          return true;
+        },
+      } as any,
+      config: cfg,
+    });
+
+    engine.start();
+    await Bun.sleep(2_400);
+    engine.stop();
+
+    const acquireCalls = calls.filter((entry) => entry.url.includes("/autonomy/lock/acquire"));
+    expect(acquireCalls.length).toBeGreaterThanOrEqual(2);
+    expect(Number((acquireCalls[0].body as Record<string, unknown>).staleAfterMs)).toBe(5_000);
+  });
+
   test("tick short-circuits when snapshot kill switch is enabled", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnForTest();
@@ -850,7 +905,7 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect((engine as any).lastDetail).toBe("repo_preflight_dirty_worktree");
   });
 
-  test("ideation timeout schedules one-shot recovery guidance for the next ideation round", async () => {
+  test("ideation timeout retries once immediately with reduced recovery guidance", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnForTest();
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-timeout-recovery-"));
@@ -932,7 +987,16 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
             "Previous ideation timed out before you returned JSON.",
           );
           expect(recoveryMessage).toContain("Timeout budget for this round: 1000ms.");
-          expect(input.maxTokens).toBe(1400);
+          expect(input.maxTokens).toBe(900);
+          const retryPayload = JSON.parse(
+            String(
+              ((input.messages as Array<Record<string, unknown>>)?.[1]?.content ?? "") as string,
+            ),
+          ) as Record<string, unknown>;
+          expect(JSON.stringify(retryPayload).length).toBeLessThan(12_000);
+          expect(
+            Number((retryPayload.limits as Record<string, unknown>).ideation_max_candidates),
+          ).toBeLessThanOrEqual(3);
           return {
             text: JSON.stringify({
               candidates: [
@@ -949,7 +1013,9 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
                     write_globs: ["apps/remotebuddy/src/autonomous_engine.ts"],
                   },
                   risk_level: "low",
-                  expected_validation: ["bun test tests/remotebuddy.autonomous-engine.tick.test.ts"],
+                  expected_validation: [
+                    "bun test tests/remotebuddy.autonomous-engine.tick.test.ts",
+                  ],
                   estimated_effort: "small",
                   why_now_signal_ids: ["sig_queue"],
                   confidence: 0.9,
@@ -1035,13 +1101,9 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     (engine as any).loadCommitHistoryHints = async () => [];
 
     await engine.tick();
-    expect((engine as any).lastOutcome).toBe("failed");
-    expect((engine as any).lastDetail).toContain("autonomy ideation phase timeout");
-    expect((engine as any).pendingIdeationTimeoutRecovery).not.toBeNull();
-
-    await engine.tick();
     expect((engine as any).lastOutcome).toBe("success");
     expect((engine as any).pendingIdeationTimeoutRecovery).toBeNull();
+    expect(llmCall).toBe(4);
     expect(objectivePosts.length).toBeGreaterThan(0);
   });
 
