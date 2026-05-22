@@ -3,7 +3,7 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { existsSync, readFileSync, rmSync, unlinkSync } from "fs";
+import { existsSync, lstatSync, readFileSync, renameSync, rmSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import {
   deriveAutonomyComponentArea,
@@ -3610,6 +3610,85 @@ export function shouldUseCodexCliForExecutor(executor: string): boolean {
   return executor.trim().toLowerCase() === "openai_codex";
 }
 
+type MaskedRepoLocalCodexFile = {
+  codexPath: string;
+  backupPath: string;
+};
+
+function codexProjectConfigRoots(repo: string, env: Record<string, string>): string[] {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: unknown) => {
+    const text = String(raw ?? "").trim();
+    if (!text) return;
+    const root = resolve(text);
+    const key = root.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    roots.push(root);
+  };
+  add(repo);
+  for (const key of [
+    "PUSHPALS_REPO_ROOT_OVERRIDE",
+    "PUSHPALS_PROJECT_ROOT_OVERRIDE",
+    "PUSHPALS_ASSIGNED_REPO_ROOT",
+    "PUSHPALS_REPO_PATH",
+  ]) {
+    add(env[key]);
+  }
+  return roots;
+}
+
+function maskRepoLocalCodexFilesForCodexCli(
+  repo: string,
+  env: Record<string, string>,
+): MaskedRepoLocalCodexFile[] {
+  const masked: MaskedRepoLocalCodexFile[] = [];
+  for (const root of codexProjectConfigRoots(repo, env)) {
+    const codexPath = resolve(root, ".codex");
+    if (!existsSync(codexPath)) continue;
+    try {
+      if (lstatSync(codexPath).isDirectory()) continue;
+      let backupPath = resolve(root, `.codex.pushpals-masked-${process.pid}-${masked.length}`);
+      let suffix = 0;
+      while (existsSync(backupPath)) {
+        suffix += 1;
+        backupPath = resolve(
+          root,
+          `.codex.pushpals-masked-${process.pid}-${masked.length}-${suffix}`,
+        );
+      }
+      renameSync(codexPath, backupPath);
+      masked.push({ codexPath, backupPath });
+      console.warn(
+        `[WorkerPals] Temporarily masked repo-local .codex file so Codex CLI can use CODEX_HOME: ${codexPath}`,
+      );
+    } catch (error) {
+      console.warn(
+        `[WorkerPals] Failed to mask repo-local .codex file ${codexPath}: ${String(error)}`,
+      );
+    }
+  }
+  return masked;
+}
+
+function restoreRepoLocalCodexFilesForCodexCli(masked: MaskedRepoLocalCodexFile[]): void {
+  for (const entry of [...masked].reverse()) {
+    try {
+      if (existsSync(entry.codexPath)) {
+        rmSync(entry.codexPath, { recursive: true, force: true });
+      }
+      if (existsSync(entry.backupPath)) {
+        renameSync(entry.backupPath, entry.codexPath);
+      }
+    } catch (error) {
+      console.warn(
+        `[WorkerPals] Failed to restore repo-local .codex file ${entry.codexPath}: ${String(error)}`,
+      );
+    }
+  }
+}
+
 function normalizeCodexReasoningEffort(
   value: unknown,
   model = "",
@@ -3720,11 +3799,13 @@ async function generateCommitMessageFromDiffViaCodex(
   if (model) cmd.push("-m", model);
   cmd.push("-");
 
+  const env = buildWorkerSandboxWritableEnv(repo);
+  const codexMask = maskRepoLocalCodexFilesForCodexCli(repo, env);
   try {
     const stdinText = `${prompt.systemPrompt}\n\n${prompt.userMessage}`;
     const proc = Bun.spawn(cmd, {
       cwd: repo,
-      env: buildWorkerSandboxWritableEnv(repo),
+      env,
       stdout: "pipe",
       stderr: "pipe",
       stdin: new Blob([stdinText]),
@@ -3759,6 +3840,7 @@ async function generateCommitMessageFromDiffViaCodex(
   } catch {
     return null;
   } finally {
+    restoreRepoLocalCodexFilesForCodexCli(codexMask);
     try {
       unlinkSync(tmpOutputPath);
     } catch {
@@ -4353,10 +4435,12 @@ async function runCodexCriticReview(
     "-",
   ];
 
+  const env = buildWorkerSandboxWritableEnv(repo);
+  const codexMask = maskRepoLocalCodexFilesForCodexCli(repo, env);
   try {
     const proc = Bun.spawn(cmd, {
       cwd: repo,
-      env: buildWorkerSandboxWritableEnv(repo),
+      env,
       stdout: "pipe",
       stderr: "pipe",
       stdin: new Blob([criticInstruction]),
@@ -4436,6 +4520,13 @@ async function runCodexCriticReview(
   } catch (err) {
     onLog?.("stderr", `[CriticGate] Codex error: ${toSingleLine(err, 220)} (skipping).`);
     return null;
+  } finally {
+    restoreRepoLocalCodexFilesForCodexCli(codexMask);
+    try {
+      unlinkSync(tmpOutputPath);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
