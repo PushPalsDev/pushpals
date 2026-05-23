@@ -17,6 +17,14 @@ function safeRepoSlug(repo: string): string {
   return `${leaf}-${hash}`;
 }
 
+function browserCacheRepoKey(repo: string): string {
+  const normalized = resolve(repo).replace(/\\/g, "/");
+  const marker = "/.worktrees/";
+  const markerIndex = normalized.lastIndexOf(marker);
+  if (markerIndex < 0) return resolve(repo);
+  return normalized.slice(0, markerIndex);
+}
+
 function defaultExpoPortForRepo(repo: string): string {
   const hashPrefix = createHash("sha256").update(resolve(repo)).digest("hex").slice(0, 8);
   const offset = Number.parseInt(hashPrefix, 16) % 1_000;
@@ -66,8 +74,17 @@ export function buildWorkerSandboxWritableEnv(
   const homeDir = resolve(baseDir, "home");
   const cacheDir = resolve(baseDir, "cache");
   const expoDir = resolve(baseDir, "expo");
+  const playwrightBrowsersDir =
+    env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0"
+      ? env.PLAYWRIGHT_BROWSERS_PATH
+      : resolve(
+          tmpdir(),
+          "pushpals-worker-env",
+          safeRepoSlug(browserCacheRepoKey(repo)),
+          "playwright-browsers",
+        );
   const defaultExpoPort = defaultExpoPortForRepo(repo);
-  ensureDirs([homeDir, cacheDir, expoDir, resolve(cacheDir, "npm")]);
+  ensureDirs([homeDir, cacheDir, expoDir, resolve(cacheDir, "npm"), playwrightBrowsersDir]);
   ensureSandboxGitConfig(homeDir);
 
   return {
@@ -77,6 +94,7 @@ export function buildWorkerSandboxWritableEnv(
     USERPROFILE: homeDir,
     XDG_CACHE_HOME: cacheDir,
     npm_config_cache: resolve(cacheDir, "npm"),
+    PLAYWRIGHT_BROWSERS_PATH: env.PLAYWRIGHT_BROWSERS_PATH ?? playwrightBrowsersDir,
     EXPO_HOME: expoDir,
     EXPO_NO_TELEMETRY: env.EXPO_NO_TELEMETRY ?? "1",
     EXPO_NO_INTERACTIVE: env.EXPO_NO_INTERACTIVE ?? "1",

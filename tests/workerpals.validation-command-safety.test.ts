@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   classifyValidationFailureScope,
   collectWriteScopeIssuesFromChangedPaths,
@@ -10,8 +13,10 @@ import {
   isLongRunningBrowserValidationCommand,
   isTestFocusedTask,
   isTestLikeValidationStep,
+  playwrightBrowserInstallArgv,
   prepareValidationCommandArgv,
   resolveValidationCommandTimeoutMs,
+  shouldEnsurePlaywrightBrowserRuntime,
   tokenizeValidationCommandArgv,
 } from "../apps/workerpals/src/execute_job";
 
@@ -152,7 +157,9 @@ describe("workerpals validation command safety", () => {
     });
 
     expect(commands.commandsToRun[0]).toBe("bun run test:root");
-    expect(commands.fallbackValidationSteps[0]).toContain("tests/localbuddy.request-status.test.ts");
+    expect(commands.fallbackValidationSteps[0]).toContain(
+      "tests/localbuddy.request-status.test.ts",
+    );
   });
 
   test("extracts repo-native required validation commands from vision markdown", () => {
@@ -189,9 +196,7 @@ describe("workerpals validation command safety", () => {
         },
         { command: "bun test tests/focused.test.ts", ok: true, exitCode: 0 },
       ] as any),
-    ).toEqual([
-      "bun run test:root exited 1 (Cannot find module '../../tests/reactNativeMock')",
-    ]);
+    ).toEqual(["bun run test:root exited 1 (Cannot find module '../../tests/reactNativeMock')"]);
   });
 
   test("extracts actionable validation failure digests", () => {
@@ -206,6 +211,22 @@ describe("workerpals validation command safety", () => {
         elapsedMs: 20,
       }),
     ).toBe("ERR_SOCKET_BAD_PORT at port 65536");
+
+    expect(
+      extractValidationFailureDigest({
+        command: "bun run web:e2e",
+        step: "bun run web:e2e",
+        ok: false,
+        exitCode: 124,
+        stdout:
+          "Browser launch failed for bundled Chromium: browserType.launch: Executable doesn't exist at /tmp/cache/ms-playwright/chromium/chrome",
+        stderr:
+          "Please run the following command to download new browsers:\n    npx playwright install",
+        elapsedMs: 600_000,
+      }),
+    ).toBe(
+      "browserType.launch: Executable doesn't exist at /tmp/cache/ms-playwright/chromium/chrome",
+    );
   });
 
   test("classifies validation failures outside the task target/relevance hints", () => {
@@ -315,6 +336,39 @@ describe("workerpals validation command safety", () => {
         EXPO_DEV_SERVER_PORT: "19444",
       }),
     ).toEqual(["bunx", "playwright", "test"]);
+  });
+
+  test("detects repo Playwright browser runtime needs for web smoke commands", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-browser-"));
+    const scriptsDir = join(root, "scripts");
+    mkdirSync(scriptsDir, { recursive: true });
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify(
+        {
+          scripts: {
+            "web:e2e": "node scripts/test-web-e2e.js",
+          },
+          devDependencies: {
+            playwright: "^1.0.0",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    writeFileSync(
+      join(scriptsDir, "test-web-e2e.js"),
+      "const { chromium } = require('playwright');\n",
+    );
+
+    try {
+      expect(shouldEnsurePlaywrightBrowserRuntime(root, "bun run web:e2e")).toBe(true);
+      expect(shouldEnsurePlaywrightBrowserRuntime(root, "bun test")).toBe(false);
+      expect(playwrightBrowserInstallArgv()).toEqual(["bunx", "playwright", "install", "chromium"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("does not classify ordinary UI work with validation criteria as test-focused", () => {

@@ -601,42 +601,75 @@ export function tokenizeValidationCommandArgv(command: string): string[] | null 
   return out;
 }
 
-async function runValidationCommand(
+async function terminateValidationProcessTree(
+  proc: ReturnType<typeof Bun.spawn>,
+): Promise<void> {
+  const pid = Number(proc.pid);
+  if (process.platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return;
+    } catch {
+      // Fall through to Bun's process handle.
+    }
+  }
+
+  if (process.platform !== "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+    }
+    await Bun.sleep(2_000);
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+    }
+    return;
+  }
+
+  try {
+    proc.kill();
+  } catch {
+    // ignore
+  }
+}
+
+async function runValidationArgv(
   repo: string,
   command: string,
+  argv: string[],
+  env: Record<string, string>,
   timeoutMs: number,
   outputPolicy: Partial<OutputCompactionPolicy>,
+  timeoutMessage: string,
 ): Promise<ValidationExecutionResult> {
-  const env = buildWorkerSandboxWritableEnv(repo);
-  const argv = prepareValidationCommandArgv(command, env);
-  if (!argv) {
-    return {
-      step: command,
-      command,
-      ok: false,
-      exitCode: 2,
-      stdout: "",
-      stderr:
-        "Validation command could not be parsed safely. Use a plain command without shell chaining/pipes.",
-      elapsedMs: 1,
-    };
-  }
   const startedAt = Date.now();
   const proc = Bun.spawn(argv, {
     cwd: repo,
     env,
+    stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    detached: process.platform !== "win32",
   });
   let timedOut = false;
   const timer = setTimeout(
     () => {
       timedOut = true;
-      try {
-        proc.kill();
-      } catch {
-        // ignore
-      }
+      void terminateValidationProcessTree(proc);
     },
     Math.max(1_000, timeoutMs),
   );
@@ -657,9 +690,7 @@ async function runValidationCommand(
     stderr: compactJobOutput(
       [
         stderr.trim(),
-        timedOut
-          ? `Validation command timed out after ${Math.max(1_000, timeoutMs)}ms. Captured output is the process output emitted before PushPals terminated the command.`
-          : "",
+        timedOut ? timeoutMessage : "",
       ]
         .filter(Boolean)
         .join("\n"),
@@ -667,6 +698,38 @@ async function runValidationCommand(
     ),
     elapsedMs: Math.max(1, Date.now() - startedAt),
   };
+}
+
+async function runValidationCommand(
+  repo: string,
+  command: string,
+  timeoutMs: number,
+  outputPolicy: Partial<OutputCompactionPolicy>,
+): Promise<ValidationExecutionResult> {
+  const env = buildWorkerSandboxWritableEnv(repo);
+  const argv = prepareValidationCommandArgv(command, env);
+  if (!argv) {
+    return {
+      step: command,
+      command,
+      ok: false,
+      exitCode: 2,
+      stdout: "",
+      stderr:
+        "Validation command could not be parsed safely. Use a plain command without shell chaining/pipes.",
+      elapsedMs: 1,
+    };
+  }
+
+  return runValidationArgv(
+    repo,
+    command,
+    argv,
+    env,
+    timeoutMs,
+    outputPolicy,
+    `Validation command timed out after ${Math.max(1_000, timeoutMs)}ms. Captured output is the process output emitted before PushPals terminated the command and its process tree.`,
+  );
 }
 
 export function isLongRunningBrowserValidationCommand(command: string): boolean {
@@ -678,6 +741,168 @@ export function isLongRunningBrowserValidationCommand(command: string): boolean 
     /\b(web:e2e|e2e:web|browser:e2e|smoke:web|web:smoke|browser:smoke)\b/.test(normalized) ||
     /\b(playwright|cypress)\b/.test(joined) ||
     (/\bexpo\b/.test(joined) && /\b(web|start)\b/.test(joined))
+  );
+}
+
+function readPackageJson(repo: string): {
+  scripts?: Record<string, unknown>;
+  dependencies?: Record<string, unknown>;
+  devDependencies?: Record<string, unknown>;
+  optionalDependencies?: Record<string, unknown>;
+  peerDependencies?: Record<string, unknown>;
+} | null {
+  const packagePath = resolve(repo, "package.json");
+  if (!existsSync(packagePath)) return null;
+  try {
+    return JSON.parse(readFileSync(packagePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function packageJsonDeclaresPlaywright(repo: string): boolean {
+  const parsed = readPackageJson(repo);
+  if (!parsed) return false;
+  const dependencyGroups = [
+    parsed.dependencies,
+    parsed.devDependencies,
+    parsed.optionalDependencies,
+    parsed.peerDependencies,
+  ];
+  return dependencyGroups.some((group) =>
+    Boolean(group && (group.playwright || group["@playwright/test"])),
+  );
+}
+
+function resolvePackageScriptForValidationCommand(
+  repo: string,
+  command: string,
+): { script: string; cwd: string } | null {
+  const argv = tokenizeValidationCommandArgv(command);
+  if (!argv || argv.length === 0) return null;
+  const first = argv[0]?.toLowerCase();
+  let cwd = repo;
+  let scriptName = "";
+
+  const consumeCwdOption = (index: number): number | null => {
+    const token = argv[index] ?? "";
+    if ((token === "--cwd" || token === "-C" || token === "--prefix") && argv[index + 1]) {
+      cwd = resolve(repo, argv[index + 1] ?? "");
+      return index + 2;
+    }
+    for (const prefix of ["--cwd=", "-C=", "--prefix="]) {
+      if (token.startsWith(prefix)) {
+        cwd = resolve(repo, token.slice(prefix.length));
+        return index + 1;
+      }
+    }
+    return null;
+  };
+
+  if (first === "bun") {
+    let index = 1;
+    while (index < argv.length) {
+      const consumed = consumeCwdOption(index);
+      if (consumed !== null) {
+        index = consumed;
+        continue;
+      }
+      if ((argv[index] ?? "").startsWith("--")) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+    if ((argv[index] ?? "").toLowerCase() === "run") {
+      scriptName = argv[index + 1] ?? "";
+    } else {
+      const candidate = argv[index] ?? "";
+      if (candidate && !["install", "test", "x"].includes(candidate.toLowerCase())) {
+        scriptName = candidate;
+      }
+    }
+  } else if (first === "npm" || first === "pnpm" || first === "yarn") {
+    let index = 1;
+    while (index < argv.length) {
+      const consumed = consumeCwdOption(index);
+      if (consumed !== null) {
+        index = consumed;
+        continue;
+      }
+      if ((argv[index] ?? "").toLowerCase() === "run") {
+        scriptName = argv[index + 1] ?? "";
+        break;
+      }
+      if (!(argv[index] ?? "").startsWith("-")) {
+        scriptName = argv[index] ?? "";
+        break;
+      }
+      index += 1;
+    }
+  }
+
+  if (!scriptName) return null;
+  const script = readPackageJson(cwd)?.scripts?.[scriptName];
+  if (typeof script !== "string" || !script.trim()) return null;
+  return { script, cwd };
+}
+
+function readReferencedValidationScriptText(cwd: string, script: string): string {
+  const texts: string[] = [];
+  const tokens = tokenizeValidationCommandArgv(script) ?? script.split(/\s+/).filter(Boolean);
+  for (const rawToken of tokens) {
+    const token = rawToken
+      .trim()
+      .replace(/^['"`]+|['"`]+$/g, "")
+      .replace(/\\/g, "/");
+    if (!/\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$/i.test(token)) continue;
+    if (token.includes("://") || token.includes("node_modules/")) continue;
+    const scriptPath = resolve(cwd, token);
+    if (!existsSync(scriptPath)) continue;
+    try {
+      texts.push(readFileSync(scriptPath, "utf8").slice(0, 64_000));
+    } catch {
+      // Best effort: the validation command will surface unreadable files.
+    }
+  }
+  return texts.join("\n");
+}
+
+export function shouldEnsurePlaywrightBrowserRuntime(repo: string, command: string): boolean {
+  if (!isLongRunningBrowserValidationCommand(command)) return false;
+  if (/\bplaywright\b/i.test(command)) return true;
+
+  const script = resolvePackageScriptForValidationCommand(repo, command);
+  const scriptCwd = script?.cwd ?? repo;
+  if (packageJsonDeclaresPlaywright(repo) || packageJsonDeclaresPlaywright(scriptCwd)) {
+    return true;
+  }
+  if (!script) return false;
+  return /(?:^|[^A-Za-z0-9_-])(?:@playwright\/test|playwright)(?:$|[^A-Za-z0-9_-])/i.test(
+    `${script.script}\n${readReferencedValidationScriptText(script.cwd, script.script)}`,
+  );
+}
+
+export function playwrightBrowserInstallArgv(): string[] {
+  return ["bunx", "playwright", "install", "chromium"];
+}
+
+async function runPlaywrightBrowserRuntimePreflight(
+  repo: string,
+  command: string,
+  timeoutMs: number,
+  outputPolicy: Partial<OutputCompactionPolicy>,
+): Promise<ValidationExecutionResult> {
+  const env = buildWorkerSandboxWritableEnv(repo);
+  const timeout = Math.max(120_000, Math.min(600_000, timeoutMs));
+  return runValidationArgv(
+    repo,
+    command,
+    playwrightBrowserInstallArgv(),
+    env,
+    timeout,
+    outputPolicy,
+    `Browser runtime preflight timed out after ${timeout}ms while ensuring Playwright Chromium. Captured output is the process output emitted before PushPals terminated the installer process tree.`,
   );
 }
 
@@ -927,12 +1152,16 @@ function detectValidationBlocker(runs: ValidationExecutionResult[]): ValidationB
     combined.includes("missing required tool") ||
     combined.includes("command not found") ||
     combined.includes("executable not found") ||
+    combined.includes("browser runtime preflight failed") ||
+    combined.includes("playwright install") ||
+    combined.includes("executable doesn't exist") ||
+    combined.includes("please run the following command to download new browsers") ||
     combined.includes("not recognized as an internal or external command")
   ) {
     return {
       category: "environment",
       detail:
-        "Validation is blocked by missing required toolchain executables in the worker environment. Install/provision the missing tools or declare a supported repo toolchain before retrying this job.",
+        "Validation is blocked by missing required toolchain executables or browser runtime support in the worker environment. Install/provision the missing tools or browser runtime before retrying this job.",
     };
   }
 
@@ -1121,6 +1350,10 @@ export function extractValidationFailureDigest(run: {
     /\bFailed to resolve import\s+['"`][^'"`\r\n]+['"`][^\r\n]*/i,
     /\bCould not resolve\s+['"`]?[^'"`\r\n]+['"`]?[^\r\n]*/i,
     /\bModule not found[^\r\n]*/i,
+    /\bbrowserType\.launch:[^\r\n]*/i,
+    /\bExecutable doesn't exist[^\r\n]*/i,
+    /\bPlease run the following command to download new browsers:[^\r\n]*(?:\r?\n\s+[^\r\n]+)?/i,
+    /\bRun ["`]?npx playwright install[^'"`\r\n]*["`]?[^\r\n]*/i,
     /\bERR_SOCKET_BAD_PORT[^\r\n]*/i,
     /\berror TS\d+:[^\r\n]*/i,
     /\bError:\s+[^\r\n]*/i,
@@ -1539,6 +1772,7 @@ async function runDeterministicQualityGate(
         )}`,
       );
     }
+    let playwrightBrowserRuntimeReady = false;
     for (const command of commandsToRun) {
       const commandMissingTools = requirementsForValidationCommand(toolchainPlan, command).filter(
         (requirement) =>
@@ -1563,6 +1797,48 @@ async function runDeterministicQualityGate(
         );
         continue;
       }
+      const commandNeedsPlaywrightBrowserRuntime = shouldEnsurePlaywrightBrowserRuntime(
+        repo,
+        command,
+      );
+      let commandBrowserRuntimeEnsured =
+        playwrightBrowserRuntimeReady && commandNeedsPlaywrightBrowserRuntime;
+      if (!playwrightBrowserRuntimeReady && commandNeedsPlaywrightBrowserRuntime) {
+        const browserEnv = buildWorkerSandboxWritableEnv(repo);
+        onLog?.(
+          "stdout",
+          `[ValidationGate] Browser runtime preflight: ensuring Playwright Chromium for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
+        );
+        const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
+          repo,
+          command,
+          resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+          outputPolicy,
+        );
+        if (!browserPreflight.ok) {
+          const digest = extractValidationFailureDigest(browserPreflight);
+          validationRuns.push({
+            ...browserPreflight,
+            stderr: [
+              `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright Chromium in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
+              browserPreflight.stderr,
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          });
+          onLog?.(
+            "stderr",
+            `[ValidationGate] Browser runtime preflight failed for "${command}"${digest ? ` - ${digest}` : ""}`,
+          );
+          continue;
+        }
+        playwrightBrowserRuntimeReady = true;
+        onLog?.(
+          "stdout",
+          `[ValidationGate] Browser runtime preflight passed for "${command}"`,
+        );
+        commandBrowserRuntimeEnsured = true;
+      }
       const previousDigest = validationRetryState?.previousFailureDigests?.get(
         validationCommandKey(command),
       );
@@ -1570,7 +1846,8 @@ async function runDeterministicQualityGate(
         previousDigest &&
         Number(validationRetryState?.revisionAttempt ?? 0) > 0 &&
         isLongRunningBrowserValidationCommand(command) &&
-        isBrowserValidationInfrastructureDigest(previousDigest)
+        isBrowserValidationInfrastructureDigest(previousDigest) &&
+        !commandBrowserRuntimeEnsured
       ) {
         const stderr =
           `Skipped repeated browser validation after the same command failed in an earlier revision: ${previousDigest}. ` +

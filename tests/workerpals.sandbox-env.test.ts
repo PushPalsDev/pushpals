@@ -22,6 +22,8 @@ describe("workerpals sandbox writable env", () => {
       expect(env.EXPO_HOME).toContain("pushpals-worker-env");
       expect(env.XDG_CACHE_HOME).toContain("pushpals-worker-env");
       expect(env.npm_config_cache).toContain("npm");
+      expect(env.PLAYWRIGHT_BROWSERS_PATH).toContain("playwright-browsers");
+      expect(env.PLAYWRIGHT_BROWSERS_PATH).not.toBe(env.XDG_CACHE_HOME);
       expect(env.EXPO_NO_TELEMETRY).toBe("1");
       expect(env.EXPO_NO_INTERACTIVE).toBe("1");
       expect(env.CI).toBe("1");
@@ -33,6 +35,7 @@ describe("workerpals sandbox writable env", () => {
       expect(existsSync(env.HOME)).toBe(true);
       expect(existsSync(env.EXPO_HOME)).toBe(true);
       expect(existsSync(env.npm_config_cache)).toBe(true);
+      expect(existsSync(env.PLAYWRIGHT_BROWSERS_PATH)).toBe(true);
       expect(readFileSync(join(env.HOME, ".gitconfig"), "utf8")).toContain("directory = *");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -91,6 +94,48 @@ describe("workerpals sandbox writable env", () => {
 
       expect(env.EXPO_DEV_SERVER_PORT).toBe("23001");
       expect(env.RCT_METRO_PORT).toBe("23002");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an explicit Playwright browser cache path", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
+    const repo = join(root, "repo");
+    const browserPath = join(root, "browser-cache");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(repo, {
+        HOME: join(root, "home"),
+        PLAYWRIGHT_BROWSERS_PATH: browserPath,
+      });
+
+      expect(env.PLAYWRIGHT_BROWSERS_PATH).toBe(browserPath);
+      expect(existsSync(browserPath)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps Playwright browser cache stable across ephemeral worktrees", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
+    const repo = join(root, "repo");
+    const firstWorktree = join(repo, ".worktrees", "job-one");
+    const secondWorktree = join(repo, ".worktrees", "job-two");
+    mkdirSync(firstWorktree, { recursive: true });
+    mkdirSync(secondWorktree, { recursive: true });
+
+    try {
+      const firstEnv = buildWorkerSandboxWritableEnv(firstWorktree, {
+        HOME: join(root, "home"),
+      });
+      const secondEnv = buildWorkerSandboxWritableEnv(secondWorktree, {
+        HOME: join(root, "home"),
+      });
+
+      expect(firstEnv.HOME).not.toBe(secondEnv.HOME);
+      expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).toBe(secondEnv.PLAYWRIGHT_BROWSERS_PATH);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
