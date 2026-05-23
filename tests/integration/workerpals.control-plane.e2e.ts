@@ -224,6 +224,16 @@ async function expectProcessRunning(proc: ReturnType<typeof Bun.spawn>, timeoutM
   }
 }
 
+async function waitForProcessExit(
+  proc: ReturnType<typeof Bun.spawn>,
+  timeoutMs: number,
+): Promise<number> {
+  return await Promise.race([
+    proc.exited,
+    Bun.sleep(timeoutMs).then(() => Number.NaN),
+  ]);
+}
+
 async function stopWorker(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
   try {
     proc.kill();
@@ -851,20 +861,27 @@ test(
         );
       }
 
-      const exitCode = await Promise.race([
-        proc.exited,
-        Bun.sleep(10_000).then(() => Number.NaN),
-      ]);
+      expect(failurePayload?.message).toBe("openai_codex policy violation: Codex CLI workaround detected");
+      expect(String(failurePayload?.detail ?? "")).toContain("Codex CLI is mandatory in this backend");
+
+      const exitCode = await waitForProcessExit(proc, 45_000);
       if (!Number.isFinite(exitCode)) {
-        throw new Error("Timed out waiting for worker recycle after codex policy violation");
+        const output = await stopWorker(proc);
+        proc = null;
+        throw new Error(
+          "Timed out waiting for worker recycle after codex policy violation\n" +
+            `claimCount=${claimCount}\n` +
+            `completionSeen=${completionSeen}\n` +
+            `failurePayload=${JSON.stringify(failurePayload)}\n` +
+            `requestTrace=\n${requestTrace.join("\n")}\n` +
+            `workerOutput=\n${output}`,
+        );
       }
       const output = await stopWorker(proc);
       proc = null;
 
       expect(claimCount).toBeGreaterThanOrEqual(1);
       expect(completionSeen).toBe(false);
-      expect(failurePayload?.message).toBe("openai_codex policy violation: Codex CLI workaround detected");
-      expect(String(failurePayload?.detail ?? "")).toContain("Codex CLI is mandatory in this backend");
       expect(exitCode).toBe(86);
       expect(output).toContain("Codex backend unavailable");
     } finally {
