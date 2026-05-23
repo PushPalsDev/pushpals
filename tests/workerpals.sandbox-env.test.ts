@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { buildWorkerSandboxWritableEnv } from "../apps/workerpals/src/common/sandbox_env";
@@ -33,6 +33,7 @@ describe("workerpals sandbox writable env", () => {
       expect(existsSync(env.HOME)).toBe(true);
       expect(existsSync(env.EXPO_HOME)).toBe(true);
       expect(existsSync(env.npm_config_cache)).toBe(true);
+      expect(readFileSync(join(env.HOME, ".gitconfig"), "utf8")).toContain("directory = *");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
