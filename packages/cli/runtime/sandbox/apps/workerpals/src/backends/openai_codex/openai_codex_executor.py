@@ -369,21 +369,41 @@ def _normalize_choice(
     return default
 
 
-def _is_git_repo(repo: str) -> bool:
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if proc.returncode != 0:
+def _is_git_repo(repo: str, timeout_seconds: float = 5.0, poll_seconds: float = 0.1) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    last_detail = ""
+    attempts = 0
+
+    while True:
+        attempts += 1
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode == 0 and (proc.stdout or "").strip().lower() == "true":
+                return True
+            last_detail = "\n".join(
+                part.strip()
+                for part in [proc.stderr or "", proc.stdout or ""]
+                if part and part.strip()
+            )
+        except Exception as exc:
+            last_detail = str(exc)
+
+        if time.monotonic() >= deadline:
+            if last_detail:
+                log.warning(
+                    "Git repository preflight failed "
+                    f"after {attempts} attempt(s) for {repo}: {to_single_line(last_detail, 240)}"
+                )
             return False
-        return (proc.stdout or "").strip().lower() == "true"
-    except Exception:
-        return False
+
+        time.sleep(max(0.01, poll_seconds))
 
 
 def _codex_project_config_roots(repo: str, env: Dict[str, str]) -> List[Path]:

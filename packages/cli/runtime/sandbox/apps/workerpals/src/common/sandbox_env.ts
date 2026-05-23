@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { basename, resolve } from "path";
 
@@ -33,6 +33,18 @@ function ensureDirs(paths: string[]): void {
   }
 }
 
+function ensureSandboxGitConfig(homeDir: string): void {
+  const gitConfigPath = resolve(homeDir, ".gitconfig");
+  try {
+    const existing = existsSync(gitConfigPath) ? readFileSync(gitConfigPath, "utf8") : "";
+    if (/(^|\n)\s*directory\s*=\s*\*/.test(existing)) return;
+    const prefix = existing.trim() ? `${existing.replace(/\s+$/, "")}\n\n` : "";
+    writeFileSync(gitConfigPath, `${prefix}[safe]\n\tdirectory = *\n`, "utf8");
+  } catch {
+    // Best effort: git will surface any remaining safe.directory blocker.
+  }
+}
+
 function resolveOriginalHome(env: Record<string, string>): string {
   return env.HOME || env.USERPROFILE || homedir();
 }
@@ -56,6 +68,7 @@ export function buildWorkerSandboxWritableEnv(
   const expoDir = resolve(baseDir, "expo");
   const defaultExpoPort = defaultExpoPortForRepo(repo);
   ensureDirs([homeDir, cacheDir, expoDir, resolve(cacheDir, "npm")]);
+  ensureSandboxGitConfig(homeDir);
 
   return {
     ...env,

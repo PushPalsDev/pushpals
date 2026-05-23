@@ -2,26 +2,28 @@
 
 ## Release Metadata
 
-- version: `v1.0.95`
-- start_commit: `32567e810b8abc3c7342a0fdb94a0f2af722e988`
-- end_commit: `444394df96c8678647351877891f0145e5d284f3`
-- commits_in_range: `1`
+- version: `v1.0.96`
+- start_commit: `bd646503dfd6ced4dab1efb3b2867ed2f2818f7d`
+- end_commit: `fe6aec25794ab3ef668e666e7c7ff91994106af8`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Harden Windows startup when local Git/Bun certificate verification cannot use the right Windows trust path.
-- Make CLI Git commands and embedded runtime child services inherit `http.sslBackend=schannel` on Windows.
-- Fall back from Bun GitHub release/API fetches to Windows-native paths when certificate verification fails: Git for latest tag resolution and `curl.exe --ssl-no-revoke` for runtime binary downloads.
-- Keep Docker-backed WorkerPal startup moving after certificate fallback; local bundled CLI smoke reached ready state with WorkerPal capacity online.
+- Preserve Git trust config inside WorkerPal sandbox `HOME` so Docker-backed Codex workers can inspect mounted Linux CI worktrees after sandbox HOME/cache redirection.
+- Retry the OpenAI Codex backend git-repository preflight briefly, with clearer diagnostics for transient worktree visibility/trust failures.
+- Stabilize the WorkerPals Codex policy-violation E2E path by waiting for recycle deterministically and dumping worker/request diagnostics on unexpected payloads.
+- Sync packaged CLI runtime assets so the published sandbox includes the WorkerPal Codex and sandbox HOME fixes.
 
 ## Validation
 
 - `bun run cli:bundle`
-- `bun test tests/cli.runtime-bootstrap.test.ts`
 - `bun run test:root`
 - `git diff --check`
-- Bundled Windows startup smoke: `bun packages/cli/dist/pushpals-cli.js --runtime-root <temp> --runtime-tag v1.0.94 --status-once`
-- Source-checkout Windows startup smoke: `bun scripts/pushpals-cli.ts --status-once`
+- `python tests/openai_codex_executor_streaming.test.py`
+- `bun test tests/workerpals.sandbox-env.test.ts`
+- `bun test ./tests/integration/workerpals.control-plane.e2e.ts --test-name-pattern "worker reports a codex policy violation"`
+- `bun run test:workerpals:e2e`
+- GitHub Actions CLI E2E on `fe6aec25794ab3ef668e666e7c7ff91994106af8`: Linux Packaged CLI E2E and Linux WorkerPals Control Plane E2E passed (`26330092293`).
 
 ## Install
 
@@ -47,7 +49,6 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- npm publication requires the repository `NPM_TOKEN` secret to have publish rights for `@pushpalsdev/cli` under the `@pushpalsdev` scope.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
