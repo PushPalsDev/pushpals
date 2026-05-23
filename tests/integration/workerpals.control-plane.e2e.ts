@@ -861,8 +861,27 @@ test(
         );
       }
 
-      expect(failurePayload?.message).toBe("openai_codex policy violation: Codex CLI workaround detected");
-      expect(String(failurePayload?.detail ?? "")).toContain("Codex CLI is mandatory in this backend");
+      const expectedFailureMessage =
+        "openai_codex policy violation: Codex CLI workaround detected";
+      const failureDetail = String(failurePayload?.detail ?? "");
+      if (
+        failurePayload?.message !== expectedFailureMessage ||
+        !failureDetail.includes("Codex CLI is mandatory in this backend")
+      ) {
+        const output = await stopWorker(proc);
+        proc = null;
+        throw new Error(
+          "Unexpected codex policy-violation failure payload\n" +
+            `expectedMessage=${expectedFailureMessage}\n` +
+            `failurePayload=${JSON.stringify(failurePayload)}\n` +
+            `claimCount=${claimCount}\n` +
+            `completionSeen=${completionSeen}\n` +
+            `requestTrace=\n${requestTrace.join("\n")}\n` +
+            `workerOutput=\n${output}`,
+        );
+      }
+      expect(failurePayload?.message).toBe(expectedFailureMessage);
+      expect(failureDetail).toContain("Codex CLI is mandatory in this backend");
 
       const exitCode = await waitForProcessExit(proc, 45_000);
       if (!Number.isFinite(exitCode)) {

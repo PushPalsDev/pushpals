@@ -25,6 +25,43 @@ spec.loader.exec_module(module)
 
 
 class OpenAICodexExecutorStreamingTests(unittest.TestCase):
+    def test_git_repo_probe_retries_transient_failure(self) -> None:
+        calls = []
+        original_run = module.subprocess.run
+        original_sleep = module.time.sleep
+
+        def fake_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) == 1:
+                return module.subprocess.CompletedProcess(
+                    args=args[0],
+                    returncode=128,
+                    stdout="",
+                    stderr="fatal: not a git repository",
+                )
+            return module.subprocess.CompletedProcess(
+                args=args[0],
+                returncode=0,
+                stdout="true\n",
+                stderr="",
+            )
+
+        try:
+            module.subprocess.run = fake_run
+            module.time.sleep = lambda _seconds: None
+
+            self.assertTrue(
+                module._is_git_repo(
+                    "/repo/.worktrees/job-123",
+                    timeout_seconds=1,
+                    poll_seconds=0.01,
+                )
+            )
+            self.assertEqual(len(calls), 2)
+        finally:
+            module.subprocess.run = original_run
+            module.time.sleep = original_sleep
+
     def test_records_and_finalizes_json_events(self) -> None:
         trace = module._empty_codex_trace()
         module._record_live_codex_stdout_line(
