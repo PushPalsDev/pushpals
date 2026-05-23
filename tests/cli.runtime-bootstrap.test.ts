@@ -564,6 +564,45 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("1");
   });
 
+  test("buildEmbeddedRuntimeEnv makes child Git commands use the Windows certificate store", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+      },
+      {
+        repoRoot: "C:/repo/example",
+        runtimeRoot: "C:/runtime/pushpals",
+        platform: "win32",
+      },
+    );
+
+    expect(env.GIT_CONFIG_COUNT).toBe("1");
+    expect(env.GIT_CONFIG_KEY_0).toBe("http.sslBackend");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("schannel");
+  });
+
+  test("buildEmbeddedRuntimeEnv preserves existing Git config env while appending schannel", () => {
+    const env = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "safe.directory",
+        GIT_CONFIG_VALUE_0: "*",
+      },
+      {
+        repoRoot: "C:/repo/example",
+        runtimeRoot: "C:/runtime/pushpals",
+        platform: "win32",
+      },
+    );
+
+    expect(env.GIT_CONFIG_COUNT).toBe("2");
+    expect(env.GIT_CONFIG_KEY_0).toBe("safe.directory");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("*");
+    expect(env.GIT_CONFIG_KEY_1).toBe("http.sslBackend");
+    expect(env.GIT_CONFIG_VALUE_1).toBe("schannel");
+  });
+
   test("buildEmbeddedRuntimeEnv preserves explicit worker cap env overrides", () => {
     const env = buildEmbeddedRuntimeEnv(
       {

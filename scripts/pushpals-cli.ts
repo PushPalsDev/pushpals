@@ -9,6 +9,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "fs";
@@ -718,12 +719,39 @@ async function runCommandWithEnv(
   }
 }
 
+function appendGitConfigEnv(
+  env: Record<string, string | undefined>,
+  key: string,
+  value: string,
+): Record<string, string | undefined> {
+  const existingCount = Number.parseInt(String(env.GIT_CONFIG_COUNT ?? "0").trim(), 10);
+  const count = Number.isFinite(existingCount) && existingCount >= 0 ? existingCount : 0;
+  for (let index = 0; index < count; index++) {
+    if (String(env[`GIT_CONFIG_KEY_${index}`] ?? "") === key) return env;
+  }
+  return {
+    ...env,
+    GIT_CONFIG_COUNT: String(count + 1),
+    [`GIT_CONFIG_KEY_${count}`]: key,
+    [`GIT_CONFIG_VALUE_${count}`]: value,
+  };
+}
+
+function withWindowsGitSchannelEnv(
+  env: Record<string, string | undefined>,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string | undefined> {
+  if (platform !== "win32") return env;
+  if (parseBooleanFlag(env.PUSHPALS_DISABLE_WINDOWS_GIT_SCHANNEL) === true) return env;
+  return appendGitConfigEnv(env, "http.sslBackend", "schannel");
+}
+
 async function runGitWithEnv(
   args: string[],
   cwd: string,
   env: Record<string, string | undefined>,
 ): Promise<CommandResult> {
-  return await runCommandWithEnv(["git", ...args], cwd, env);
+  return await runCommandWithEnv(["git", ...args], cwd, withWindowsGitSchannelEnv(env));
 }
 
 async function runGit(args: string[], cwd: string): Promise<CommandResult> {
@@ -1097,18 +1125,80 @@ function resolveRuntimePlatformKey(): string {
 }
 
 async function fetchLatestReleaseTag(): Promise<string> {
-  const response = await fetchWithTimeout(
-    `${GITHUB_API_URL}/releases/latest`,
-    { headers: GITHUB_HEADERS },
-    20_000,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to resolve latest release tag (HTTP ${response.status})`);
+  try {
+    const response = await fetchWithTimeout(
+      `${GITHUB_API_URL}/releases/latest`,
+      { headers: GITHUB_HEADERS },
+      20_000,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to resolve latest release tag (HTTP ${response.status})`);
+    }
+    const payload = (await response.json()) as { tag_name?: unknown };
+    const tagName = String(payload.tag_name ?? "").trim();
+    if (!tagName) throw new Error("Latest release payload did not include tag_name");
+    return tagName;
+  } catch (err) {
+    const fallback = await fetchLatestReleaseTagWithGitFallback(err);
+    if (fallback) return fallback;
+    throw err;
   }
-  const payload = (await response.json()) as { tag_name?: unknown };
-  const tagName = String(payload.tag_name ?? "").trim();
-  if (!tagName) throw new Error("Latest release payload did not include tag_name");
-  return tagName;
+}
+
+async function fetchLatestReleaseTagWithGitFallback(cause: unknown): Promise<string | null> {
+  const message = String(cause instanceof Error ? cause.message : cause ?? "");
+  if (
+    process.platform !== "win32" ||
+    (!/certificate|cert_|unable to verify|self[- ]signed|tls|ssl/i.test(message) &&
+      !/fetch failed/i.test(message))
+  ) {
+    return null;
+  }
+  console.warn(
+    "[pushpals] Bun could not verify the GitHub API certificate; resolving latest release tag with Git instead.",
+  );
+  const result = await runGitWithEnv(
+    [
+      "ls-remote",
+      "--tags",
+      "--refs",
+      `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git`,
+      "refs/tags/v*",
+    ],
+    process.cwd(),
+    {
+      ...(process.env as Record<string, string | undefined>),
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "Never",
+    },
+  );
+  if (!result.ok) return null;
+  const tags = result.stdout
+    .split(/\r?\n/g)
+    .map((line) => line.trim().match(/refs\/tags\/(v\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.-]+)?)$/)?.[1])
+    .filter((tag): tag is string => Boolean(tag));
+  return sortReleaseTagsDescending(tags)[0] ?? null;
+}
+
+function sortReleaseTagsDescending(tags: string[]): string[] {
+  return [...new Set(tags)].sort((a, b) => compareReleaseTags(b, a));
+}
+
+function compareReleaseTags(a: string, b: string): number {
+  const parse = (value: string) =>
+    String(value)
+      .replace(/^v/i, "")
+      .split(/[.-]/g)
+      .map((part) => Number.parseInt(part, 10))
+      .map((part) => (Number.isFinite(part) ? part : 0));
+  const left = parse(a);
+  const right = parse(b);
+  const max = Math.max(left.length, right.length, 3);
+  for (let index = 0; index < max; index++) {
+    const delta = (left[index] ?? 0) - (right[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return a.localeCompare(b);
 }
 
 export function resolvePreferredRuntimeReleaseTag(
@@ -1568,7 +1658,7 @@ export function buildEmbeddedRuntimeEnv(
         }),
       )
     : {};
-  return {
+  const runtimeEnv = {
     ...inherited,
     PUSHPALS_REPO_ROOT_OVERRIDE: opts.repoRoot,
     PUSHPALS_PROJECT_ROOT_OVERRIDE: opts.repoRoot,
@@ -1604,6 +1694,7 @@ export function buildEmbeddedRuntimeEnv(
       ? { PUSHPALS_DOCKER_BIN_ABSOLUTE: env.PUSHPALS_DOCKER_BIN_ABSOLUTE.trim() }
       : {}),
   };
+  return withWindowsGitSchannelEnv(runtimeEnv, platform) as Record<string, string>;
 }
 
 function parseBooleanFlag(raw: string | undefined): boolean | null {
@@ -1798,13 +1889,64 @@ function readRemoteBuddyAutonomousEngineState(logPath: string): RemoteBuddyAuton
 async function downloadBinaryAsset(tag: string, assetName: string, outPath: string): Promise<void> {
   console.log(`[pushpals] Downloading embedded runtime binary ${assetName} from ${tag}...`);
   const url = `${GITHUB_RELEASE_URL}/${encodeURIComponent(tag)}/${assetName}`;
-  const response = await fetchWithTimeout(url, { headers: GITHUB_HEADERS }, 60_000);
-  if (!response.ok) {
-    throw new Error(`Failed to download ${assetName} from ${tag} (HTTP ${response.status})`);
+  try {
+    const response = await fetchWithTimeout(url, { headers: GITHUB_HEADERS }, 60_000);
+    if (!response.ok) {
+      throw new Error(`Failed to download ${assetName} from ${tag} (HTTP ${response.status})`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    mkdirSync(dirname(outPath), { recursive: true });
+    await Bun.write(outPath, bytes);
+    return;
+  } catch (err) {
+    const fallback = await downloadBinaryAssetWithWindowsCurlFallback(url, outPath, err);
+    if (fallback) return;
+    throw err;
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
+}
+
+async function downloadBinaryAssetWithWindowsCurlFallback(
+  url: string,
+  outPath: string,
+  cause: unknown,
+): Promise<boolean> {
+  if (process.platform !== "win32") return false;
+  const message = String(cause instanceof Error ? cause.message : cause ?? "");
+  if (
+    !/certificate|cert_|unable to verify|self[- ]signed|tls|ssl/i.test(message) &&
+    !/fetch failed/i.test(message)
+  ) {
+    return false;
+  }
+  const tmpPath = `${outPath}.download-${process.pid}-${Date.now()}.tmp`;
   mkdirSync(dirname(outPath), { recursive: true });
-  await Bun.write(outPath, bytes);
+  rmSync(tmpPath, { force: true });
+  console.warn(
+    "[pushpals] Bun could not verify the GitHub release certificate; retrying download with Windows curl certificate handling.",
+  );
+  const result = await runCommandWithEnv(
+    [
+      "curl.exe",
+      "--fail",
+      "--location",
+      "--silent",
+      "--show-error",
+      "--ssl-no-revoke",
+      "--output",
+      tmpPath,
+      url,
+    ],
+    process.cwd(),
+    process.env as Record<string, string | undefined>,
+    120_000,
+  );
+  if (!result.ok || !existsSync(tmpPath)) {
+    rmSync(tmpPath, { force: true });
+    const detail = result.stderr || result.stdout || `exit ${result.exitCode}`;
+    throw new Error(`Windows curl fallback failed while downloading runtime binary: ${detail}`);
+  }
+  renameSync(tmpPath, outPath);
+  return true;
 }
 
 export async function ensureRuntimeBinaries(
