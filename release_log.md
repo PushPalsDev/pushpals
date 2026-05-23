@@ -1,29 +1,27 @@
-# PushPals CLI Release Log
+﻿# PushPals CLI Release Log
 
 ## Release Metadata
 
-- version: `v1.0.96`
-- start_commit: `bd646503dfd6ced4dab1efb3b2867ed2f2818f7d`
-- end_commit: `fe6aec25794ab3ef668e666e7c7ff91994106af8`
-- commits_in_range: `3`
+- version: `v1.0.97`
+- start_commit: `a2b1058ab9aa92f6b22ab2d366927981a9d8c228`
+- end_commit: `a47206756b8fb55f69502cea1b47abb3fa0a3e39`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Preserve Git trust config inside WorkerPal sandbox `HOME` so Docker-backed Codex workers can inspect mounted Linux CI worktrees after sandbox HOME/cache redirection.
-- Retry the OpenAI Codex backend git-repository preflight briefly, with clearer diagnostics for transient worktree visibility/trust failures.
-- Stabilize the WorkerPals Codex policy-violation E2E path by waiting for recycle deterministically and dumping worker/request diagnostics on unexpected payloads.
-- Sync packaged CLI runtime assets so the published sandbox includes the WorkerPal Codex and sandbox HOME fixes.
+- Provision WorkerPal browser validation with a stable Playwright browser cache that is shared across ephemeral job worktrees for the same repo.
+- Add a ValidationGate browser runtime preflight that runs the repo-matching `bunx playwright install chromium` before Playwright-backed web smoke commands.
+- Improve browser-validation diagnostics so missing Playwright browsers are reported as browser-runtime/tooling blockers instead of being hidden behind `SIGTERM` timeout summaries.
+- Kill validation command process trees on timeout so Expo/Metro child processes do not linger after failed browser smoke runs.
+- Sync packaged CLI runtime assets so the published WorkerPal sandbox includes the browser-runtime validation fix.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `python tests/openai_codex_executor_streaming.test.py`
-- `bun test tests/workerpals.sandbox-env.test.ts`
-- `bun test ./tests/integration/workerpals.control-plane.e2e.ts --test-name-pattern "worker reports a codex policy violation"`
-- `bun run test:workerpals:e2e`
-- GitHub Actions CLI E2E on `fe6aec25794ab3ef668e666e7c7ff91994106af8`: Linux Packaged CLI E2E and Linux WorkerPals Control Plane E2E passed (`26330092293`).
+- `bun test tests/workerpals.sandbox-env.test.ts tests/workerpals.validation-command-safety.test.ts`
+- `bunx tsc -p apps/workerpals/tsconfig.json --noEmit`
 
 ## Install
 
