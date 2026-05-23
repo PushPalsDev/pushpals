@@ -2,23 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.0.94`
-- start_commit: `099c52cd6b2faa8e73a979e37d122c75a1b32d5e`
-- end_commit: `78ff960251da085c67ddb7ad4d2b01d6b098939d`
-- commits_in_range: `4`
+- version: `v1.0.95`
+- start_commit: `32567e810b8abc3c7342a0fdb94a0f2af722e988`
+- end_commit: `444394df96c8678647351877891f0145e5d284f3`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Start the first RemoteBuddy autonomy tick shortly after runtime readiness, retry timed-out ideation once with a compact budget-aware prompt, and clear stale dispatch locks more aggressively on startup.
-- Mask repo-local `.codex` sentinels before Codex CLI execution so WorkerPal ChatGPT auth can keep using the host Codex state directory.
-- Treat WorkerPal planning scope metadata as review and planning hints instead of hard write boundaries; PR review remains the enforcement layer for relevance and safety.
-- Avoid staging ignored runtime artifacts such as `outputs`, `workspace`, and `.codex` when WorkerPal creates `task.execute` commits.
+- Harden Windows startup when local Git/Bun certificate verification cannot use the right Windows trust path.
+- Make CLI Git commands and embedded runtime child services inherit `http.sslBackend=schannel` on Windows.
+- Fall back from Bun GitHub release/API fetches to Windows-native paths when certificate verification fails: Git for latest tag resolution and `curl.exe --ssl-no-revoke` for runtime binary downloads.
+- Keep Docker-backed WorkerPal startup moving after certificate fallback; local bundled CLI smoke reached ready state with WorkerPal capacity online.
 
 ## Validation
 
 - `bun run cli:bundle`
+- `bun test tests/cli.runtime-bootstrap.test.ts`
 - `bun run test:root`
 - `git diff --check`
+- Bundled Windows startup smoke: `bun packages/cli/dist/pushpals-cli.js --runtime-root <temp> --runtime-tag v1.0.94 --status-once`
+- Source-checkout Windows startup smoke: `bun scripts/pushpals-cli.ts --status-once`
 
 ## Install
 
