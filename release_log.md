@@ -2,22 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.0.99`
-- start_commit: `6bc8e40c79b5b9564d9572ff299cf044df90bf29`
-- end_commit: `d897046ed9f911ae3cb8279891188fabe6fc5a45`
-- commits_in_range: `1`
+- version: `v1.0.100`
+- start_commit: `250de11af911e745d2e656acff58821f7ab7e427`
+- end_commit: `d0cfda05d56a8e7f6afd85801e5a32b3692faf73`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Harden WorkerPal ValidationGate command execution so browser/e2e commands that exit early while child processes keep stdio open report the real exit code and captured error output instead of looking like a 10-minute timeout.
-- Default WorkerPal sandbox Node startup to IPv4-first DNS resolution and `REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1`, improving Expo and React Native loopback startup behavior in Docker-backed validation.
-- Classify Expo bad-port and loopback permission failures as environment blockers so WorkerPals do not burn all validation auto-revisions trying to edit unrelated application code.
-- Add regression coverage for failed browser launchers that leave inherited pipes open, plus sandbox environment tests for the new Expo-friendly defaults and explicit override preservation.
-- Sync packaged CLI runtime assets so the published WorkerPal sandbox includes the validation-exit and loopback-startup fixes.
+- Stop leaked browser/e2e validation process trees after a captured fatal browser failure goes idle, so WorkerPal jobs preserve the actionable failure instead of burning the full ValidationGate timeout.
+- Recognize Playwright locator failures such as `locator.waitFor: Timeout ... exceeded`, `Call log:`, and `waiting for getByTestId(...)` as browser smoke failures that should fail fast.
+- Keep browser/e2e validation output useful by extracting the specific Playwright, network, and browser launch failure lines into validation digests.
+- Clarify WorkerPal Codex execution guidance so the deterministic ValidationGate owns repo-required `vision.md` validation, while the edit turn prefers focused checks instead of repeatedly running long `web:e2e` smoke commands.
+- Sync packaged CLI runtime and prompt assets so published WorkerPal sandboxes receive the browser-validation watchdog and prompt updates.
 
 ## Validation
 
-- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.sandbox-env.test.ts`
+- `bun test tests/workerpals.validation-command-safety.test.ts`
 - `bunx tsc -p apps/workerpals/tsconfig.json --noEmit`
 - `bun run cli:bundle`
 - `bun run test:root`
