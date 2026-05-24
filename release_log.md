@@ -1,27 +1,27 @@
-﻿# PushPals CLI Release Log
+# PushPals CLI Release Log
 
 ## Release Metadata
 
-- version: `v1.0.98`
-- start_commit: `5594ad8093317d153ae8f50d62f3483e75522548`
-- end_commit: `ba2f5bcdca483221cac64d95a21393bfad3a22bf`
+- version: `v1.0.99`
+- start_commit: `6bc8e40c79b5b9564d9572ff299cf044df90bf29`
+- end_commit: `d897046ed9f911ae3cb8279891188fabe6fc5a45`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Teach WorkerPal ValidationGate to infer Playwright browser targets from repo e2e scripts and command flags instead of assuming every browser smoke uses bundled Chromium.
-- Provision requested Playwright targets such as `msedge`, `chrome`, `firefox`, and `webkit` before running repo browser validation, fixing sandboxes where the app's smoke harness launches a browser channel.
-- Track browser-runtime preflight readiness per browser target so mixed browser commands install only the missing targets.
-- Improve browser preflight logs to name the exact Playwright target(s) being provisioned or failing.
-- Sync packaged CLI runtime assets so the published WorkerPal sandbox includes the browser-target preflight fix.
+- Harden WorkerPal ValidationGate command execution so browser/e2e commands that exit early while child processes keep stdio open report the real exit code and captured error output instead of looking like a 10-minute timeout.
+- Default WorkerPal sandbox Node startup to IPv4-first DNS resolution and `REACT_NATIVE_PACKAGER_HOSTNAME=127.0.0.1`, improving Expo and React Native loopback startup behavior in Docker-backed validation.
+- Classify Expo bad-port and loopback permission failures as environment blockers so WorkerPals do not burn all validation auto-revisions trying to edit unrelated application code.
+- Add regression coverage for failed browser launchers that leave inherited pipes open, plus sandbox environment tests for the new Expo-friendly defaults and explicit override preservation.
+- Sync packaged CLI runtime assets so the published WorkerPal sandbox includes the validation-exit and loopback-startup fixes.
 
 ## Validation
 
+- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.sandbox-env.test.ts`
+- `bunx tsc -p apps/workerpals/tsconfig.json --noEmit`
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests/workerpals.sandbox-env.test.ts tests/workerpals.validation-command-safety.test.ts`
-- `bunx tsc -p apps/workerpals/tsconfig.json --noEmit`
 
 ## Install
 
