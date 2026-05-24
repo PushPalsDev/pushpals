@@ -2,23 +2,20 @@
 
 ## Release Metadata
 
-- version: `v1.0.100`
-- start_commit: `250de11af911e745d2e656acff58821f7ab7e427`
-- end_commit: `d0cfda05d56a8e7f6afd85801e5a32b3692faf73`
-- commits_in_range: `2`
+- version: `v1.1.0`
+- start_commit: `8fd050651899e4fc6276f20fec07cd65c933a167`
+- end_commit: `c5074100aef593a750db9f3322ed5a6c368f838e`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Stop leaked browser/e2e validation process trees after a captured fatal browser failure goes idle, so WorkerPal jobs preserve the actionable failure instead of burning the full ValidationGate timeout.
-- Recognize Playwright locator failures such as `locator.waitFor: Timeout ... exceeded`, `Call log:`, and `waiting for getByTestId(...)` as browser smoke failures that should fail fast.
-- Keep browser/e2e validation output useful by extracting the specific Playwright, network, and browser launch failure lines into validation digests.
-- Clarify WorkerPal Codex execution guidance so the deterministic ValidationGate owns repo-required `vision.md` validation, while the edit turn prefers focused checks instead of repeatedly running long `web:e2e` smoke commands.
-- Sync packaged CLI runtime and prompt assets so published WorkerPal sandboxes receive the browser-validation watchdog and prompt updates.
+- Adopt the release numbering policy that patch releases roll the minor version after `.99`, so future releases move from `vX.Y.99` to `vX.(Y+1).0`.
+- Document the forward-only correction path for already-published patch-above-99 releases: keep the published version intact and cut the next policy-correct minor release.
+- Move `latest` forward to `v1.1.0` after the already-published `v1.0.100` release.
+- Confirm `bun run cli:bundle` produced no additional packaged runtime asset changes for this documentation-only release.
 
 ## Validation
 
-- `bun test tests/workerpals.validation-command-safety.test.ts`
-- `bunx tsc -p apps/workerpals/tsconfig.json --noEmit`
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
