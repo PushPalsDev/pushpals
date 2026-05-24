@@ -647,7 +647,10 @@ async function terminateValidationProcessTree(
   }
 }
 
-function captureValidationStream(stream: ReadableStream<Uint8Array> | null) {
+function captureValidationStream(
+  stream: ReadableStream<Uint8Array> | null,
+  onChunk?: (chunk: string) => void,
+) {
   let text = "";
   let done = false;
   const reader = stream?.getReader();
@@ -657,7 +660,9 @@ function captureValidationStream(stream: ReadableStream<Uint8Array> | null) {
           while (true) {
             const result = await reader.read();
             if (result.done) break;
-            text += Buffer.from(result.value).toString("utf8");
+            const chunk = Buffer.from(result.value).toString("utf8");
+            text += chunk;
+            onChunk?.(chunk);
           }
         } catch {
           // Stream cancellation after process exit is expected when descendants
@@ -689,6 +694,34 @@ function captureValidationStream(stream: ReadableStream<Uint8Array> | null) {
   };
 }
 
+const DEFAULT_BROWSER_VALIDATION_FAILURE_IDLE_MS = 15_000;
+
+function browserValidationFailureIdleMs(env: Record<string, string>): number {
+  const configured = Number(env.PUSHPALS_VALIDATION_FAILURE_IDLE_MS ?? "");
+  if (Number.isFinite(configured) && configured >= 250) {
+    return Math.min(120_000, Math.trunc(configured));
+  }
+  return DEFAULT_BROWSER_VALIDATION_FAILURE_IDLE_MS;
+}
+
+function hasBrowserValidationFailureSignal(output: string): boolean {
+  const text = String(output ?? "");
+  if (!text.trim()) return false;
+  const patterns = [
+    /\bAssertionError\b/i,
+    /\bTimeoutError\b/i,
+    /\bexpect\([^)]*\)\.[a-z0-9_]+\([^)]*\)\s+failed/i,
+    /\bError:\s+expect\(/i,
+    /\bTest timeout of \d+ms exceeded\b/i,
+    /\bbrowserType\.launch:/i,
+    /\bERR_SOCKET_BAD_PORT\b/i,
+    /\blisten\s+EPERM\b/i,
+    /\bEADDRINUSE\b/i,
+    /\berror:\s+script\s+"[^"]+"\s+exited with code\s+\d+/i,
+  ];
+  return patterns.some((pattern) => pattern.test(text));
+}
+
 export async function runValidationArgv(
   repo: string,
   command: string,
@@ -707,26 +740,62 @@ export async function runValidationArgv(
     stderr: "pipe",
     detached: process.platform !== "win32",
   });
-  const stdoutCapture = captureValidationStream(proc.stdout);
-  const stderrCapture = captureValidationStream(proc.stderr);
+  let lastOutputAt = Date.now();
+  const noteOutput = () => {
+    lastOutputAt = Date.now();
+  };
+  const stdoutCapture = captureValidationStream(proc.stdout, noteOutput);
+  const stderrCapture = captureValidationStream(proc.stderr, noteOutput);
   let timedOut = false;
+  let stoppedAfterFailureSignal = false;
   const timeout = Math.max(1_000, timeoutMs);
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  const timeoutPromise = new Promise<"timeout">((resolveTimeout) => {
+  const timeoutPromise = new Promise<{ type: "timeout" }>((resolveTimeout) => {
     timeoutTimer = setTimeout(() => {
       timedOut = true;
-      void terminateValidationProcessTree(proc);
-      resolveTimeout("timeout");
+      resolveTimeout({ type: "timeout" });
     }, timeout);
   });
+
+  let failureSignalTimer: ReturnType<typeof setInterval> | null = null;
+  const failureSignalPromise = isLongRunningBrowserValidationCommand(command)
+    ? new Promise<{ type: "failure-signal" }>((resolveFailureSignal) => {
+        const idleMs = browserValidationFailureIdleMs(env);
+        failureSignalTimer = setInterval(() => {
+          const combinedOutput = `${stdoutCapture.text()}\n${stderrCapture.text()}`;
+          if (
+            hasBrowserValidationFailureSignal(combinedOutput) &&
+            Date.now() - lastOutputAt >= idleMs
+          ) {
+            stoppedAfterFailureSignal = true;
+            resolveFailureSignal({ type: "failure-signal" });
+          }
+        }, 250);
+      })
+    : new Promise<never>(() => {
+        // Non-browser validations should only end on process exit or timeout.
+      });
+
   const exitOrTimeout = await Promise.race([
     proc.exited.then((code) => ({ type: "exit" as const, code })),
     timeoutPromise,
+    failureSignalPromise,
   ]);
   if (timeoutTimer) clearTimeout(timeoutTimer);
-  const exitCode = exitOrTimeout === "timeout" ? 124 : exitOrTimeout.code;
+  if (failureSignalTimer) clearInterval(failureSignalTimer);
 
-  if (!timedOut) {
+  if (timedOut || stoppedAfterFailureSignal) {
+    await terminateValidationProcessTree(proc);
+  }
+
+  const exitCode =
+    exitOrTimeout.type === "timeout"
+      ? 124
+      : exitOrTimeout.type === "failure-signal"
+        ? 1
+        : exitOrTimeout.code;
+
+  if (!timedOut && !stoppedAfterFailureSignal) {
     await Promise.race([
       Promise.all([stdoutCapture.promise, stderrCapture.promise]),
       Bun.sleep(1_000),
@@ -754,6 +823,9 @@ export async function runValidationArgv(
       [
         stderrCapture.text().trim(),
         timedOut ? timeoutMessage : "",
+        stoppedAfterFailureSignal
+          ? `Validation command emitted a browser/e2e failure signal and then produced no output for ${browserValidationFailureIdleMs(env)}ms. PushPals terminated the leaked process tree and preserved the captured failure output for repair.`
+          : "",
       ]
         .filter(Boolean)
         .join("\n"),

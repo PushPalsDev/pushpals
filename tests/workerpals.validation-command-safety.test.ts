@@ -369,6 +369,41 @@ describe("workerpals validation command safety", () => {
     }
   });
 
+  test("terminates idle browser validations after a captured assertion failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-idle-browser-failure-"));
+    const script = [
+      "console.error('Error: expect(locator).toBeVisible() failed after returning from settings');",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const startedAt = Date.now();
+
+    try {
+      const result = await runValidationArgv(
+        root,
+        "bun run web:e2e",
+        [process.execPath, "-e", script],
+        {
+          ...(process.env as Record<string, string>),
+          PUSHPALS_VALIDATION_FAILURE_IDLE_MS: "500",
+        },
+        10_000,
+        {},
+        "validation timed out",
+      );
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "Error: expect(locator).toBeVisible() failed after returning from settings",
+      );
+      expect(result.stderr).toContain("browser/e2e failure signal");
+      expect(result.stderr).not.toContain("validation timed out");
+      expect(result.elapsedMs).toBeLessThan(3_500);
+      expect(Date.now() - startedAt).toBeLessThan(3_500);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("detects repo Playwright browser runtime needs for web smoke commands", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-validation-browser-"));
     const scriptsDir = join(root, "scripts");
