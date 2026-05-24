@@ -2,18 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.0.97`
-- start_commit: `a2b1058ab9aa92f6b22ab2d366927981a9d8c228`
-- end_commit: `a47206756b8fb55f69502cea1b47abb3fa0a3e39`
+- version: `v1.0.98`
+- start_commit: `5594ad8093317d153ae8f50d62f3483e75522548`
+- end_commit: `ba2f5bcdca483221cac64d95a21393bfad3a22bf`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Provision WorkerPal browser validation with a stable Playwright browser cache that is shared across ephemeral job worktrees for the same repo.
-- Add a ValidationGate browser runtime preflight that runs the repo-matching `bunx playwright install chromium` before Playwright-backed web smoke commands.
-- Improve browser-validation diagnostics so missing Playwright browsers are reported as browser-runtime/tooling blockers instead of being hidden behind `SIGTERM` timeout summaries.
-- Kill validation command process trees on timeout so Expo/Metro child processes do not linger after failed browser smoke runs.
-- Sync packaged CLI runtime assets so the published WorkerPal sandbox includes the browser-runtime validation fix.
+- Teach WorkerPal ValidationGate to infer Playwright browser targets from repo e2e scripts and command flags instead of assuming every browser smoke uses bundled Chromium.
+- Provision requested Playwright targets such as `msedge`, `chrome`, `firefox`, and `webkit` before running repo browser validation, fixing sandboxes where the app's smoke harness launches a browser channel.
+- Track browser-runtime preflight readiness per browser target so mixed browser commands install only the missing targets.
+- Improve browser preflight logs to name the exact Playwright target(s) being provisioned or failing.
+- Sync packaged CLI runtime assets so the published WorkerPal sandbox includes the browser-target preflight fix.
 
 ## Validation
 
