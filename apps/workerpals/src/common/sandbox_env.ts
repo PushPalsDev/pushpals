@@ -53,6 +53,12 @@ function ensureSandboxGitConfig(homeDir: string): void {
   }
 }
 
+function withNodeDnsIpv4First(value: string | undefined): string {
+  const existing = (value ?? "").trim();
+  if (/(^|\s)--dns-result-order=/.test(existing)) return existing;
+  return [existing, "--dns-result-order=ipv4first"].filter(Boolean).join(" ");
+}
+
 function resolveOriginalHome(env: Record<string, string>): string {
   return env.HOME || env.USERPROFILE || homedir();
 }
@@ -100,6 +106,8 @@ export function buildWorkerSandboxWritableEnv(
     EXPO_NO_INTERACTIVE: env.EXPO_NO_INTERACTIVE ?? "1",
     CI: env.CI ?? "1",
     BROWSER: env.BROWSER ?? "none",
+    NODE_OPTIONS: withNodeDnsIpv4First(env.NODE_OPTIONS),
+    REACT_NATIVE_PACKAGER_HOSTNAME: env.REACT_NATIVE_PACKAGER_HOSTNAME ?? "127.0.0.1",
     EXPO_DEV_SERVER_PORT: env.EXPO_DEV_SERVER_PORT ?? defaultExpoPort,
     RCT_METRO_PORT: env.RCT_METRO_PORT ?? defaultExpoPort,
     PUSHPALS_VALIDATION_REPO: repo,

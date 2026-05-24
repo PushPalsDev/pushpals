@@ -17,6 +17,7 @@ import {
   playwrightBrowserInstallArgv,
   prepareValidationCommandArgv,
   resolveValidationCommandTimeoutMs,
+  runValidationArgv,
   shouldEnsurePlaywrightBrowserRuntime,
   tokenizeValidationCommandArgv,
 } from "../apps/workerpals/src/execute_job";
@@ -337,6 +338,35 @@ describe("workerpals validation command safety", () => {
         EXPO_DEV_SERVER_PORT: "19444",
       }),
     ).toEqual(["bunx", "playwright", "test"]);
+  });
+
+  test("returns the real command exit when failed browser launchers leave pipes open", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-leaky-pipe-"));
+    const script = [
+      "Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 4000)'], { stdout: 'inherit', stderr: 'inherit' });",
+      "console.error('web:e2e failed before browser assertions');",
+      "process.exit(1);",
+    ].join("\n");
+    const startedAt = Date.now();
+
+    try {
+      const result = await runValidationArgv(
+        root,
+        "bun run web:e2e",
+        [process.execPath, "-e", script],
+        process.env as Record<string, string>,
+        10_000,
+        {},
+        "validation timed out",
+      );
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("web:e2e failed before browser assertions");
+      expect(result.elapsedMs).toBeLessThan(3_500);
+      expect(Date.now() - startedAt).toBeLessThan(3_500);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("detects repo Playwright browser runtime needs for web smoke commands", () => {

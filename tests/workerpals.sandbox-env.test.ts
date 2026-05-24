@@ -28,6 +28,8 @@ describe("workerpals sandbox writable env", () => {
       expect(env.EXPO_NO_INTERACTIVE).toBe("1");
       expect(env.CI).toBe("1");
       expect(env.BROWSER).toBe("none");
+      expect(env.NODE_OPTIONS).toContain("--dns-result-order=ipv4first");
+      expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("127.0.0.1");
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeGreaterThanOrEqual(19006);
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeLessThan(20006);
       expect(env.RCT_METRO_PORT).toBe(env.EXPO_DEV_SERVER_PORT);
@@ -94,6 +96,25 @@ describe("workerpals sandbox writable env", () => {
 
       expect(env.EXPO_DEV_SERVER_PORT).toBe("23001");
       expect(env.RCT_METRO_PORT).toBe("23002");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves explicit Node DNS and Expo hostname overrides", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
+    const repo = join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(repo, {
+        HOME: join(root, "home"),
+        NODE_OPTIONS: "--max-old-space-size=4096 --dns-result-order=verbatim",
+        REACT_NATIVE_PACKAGER_HOSTNAME: "localhost",
+      });
+
+      expect(env.NODE_OPTIONS).toBe("--max-old-space-size=4096 --dns-result-order=verbatim");
+      expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("localhost");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

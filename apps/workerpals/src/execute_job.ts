@@ -647,7 +647,49 @@ async function terminateValidationProcessTree(
   }
 }
 
-async function runValidationArgv(
+function captureValidationStream(stream: ReadableStream<Uint8Array> | null) {
+  let text = "";
+  let done = false;
+  const reader = stream?.getReader();
+  const promise = reader
+    ? (async () => {
+        try {
+          while (true) {
+            const result = await reader.read();
+            if (result.done) break;
+            text += Buffer.from(result.value).toString("utf8");
+          }
+        } catch {
+          // Stream cancellation after process exit is expected when descendants
+          // inherit pipes from failed browser/dev-server launchers.
+        } finally {
+          done = true;
+          try {
+            reader.releaseLock();
+          } catch {
+            // ignore
+          }
+        }
+      })()
+    : Promise.resolve().then(() => {
+        done = true;
+      });
+
+  return {
+    cancel: async () => {
+      try {
+        await reader?.cancel();
+      } catch {
+        // ignore
+      }
+    },
+    isDone: () => done,
+    promise,
+    text: () => text,
+  };
+}
+
+export async function runValidationArgv(
   repo: string,
   command: string,
   argv: string[],
@@ -665,31 +707,52 @@ async function runValidationArgv(
     stderr: "pipe",
     detached: process.platform !== "win32",
   });
+  const stdoutCapture = captureValidationStream(proc.stdout);
+  const stderrCapture = captureValidationStream(proc.stderr);
   let timedOut = false;
-  const timer = setTimeout(
-    () => {
+  const timeout = Math.max(1_000, timeoutMs);
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<"timeout">((resolveTimeout) => {
+    timeoutTimer = setTimeout(() => {
       timedOut = true;
       void terminateValidationProcessTree(proc);
-    },
-    Math.max(1_000, timeoutMs),
-  );
-
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
+      resolveTimeout("timeout");
+    }, timeout);
+  });
+  const exitOrTimeout = await Promise.race([
+    proc.exited.then((code) => ({ type: "exit" as const, code })),
+    timeoutPromise,
   ]);
-  clearTimeout(timer);
+  if (timeoutTimer) clearTimeout(timeoutTimer);
+  const exitCode = exitOrTimeout === "timeout" ? 124 : exitOrTimeout.code;
+
+  if (!timedOut) {
+    await Promise.race([
+      Promise.all([stdoutCapture.promise, stderrCapture.promise]),
+      Bun.sleep(1_000),
+    ]);
+    if (!stdoutCapture.isDone() || !stderrCapture.isDone()) {
+      await terminateValidationProcessTree(proc);
+      await Promise.all([stdoutCapture.cancel(), stderrCapture.cancel()]);
+    }
+  } else {
+    await Promise.all([stdoutCapture.cancel(), stderrCapture.cancel()]);
+  }
+
+  await Promise.race([
+    Promise.all([stdoutCapture.promise, stderrCapture.promise]),
+    Bun.sleep(500),
+  ]);
 
   return {
     step: command,
     command,
     ok: !timedOut && exitCode === 0,
-    exitCode: timedOut ? 124 : exitCode,
-    stdout: compactJobOutput(stdout.trim(), outputPolicy),
+    exitCode,
+    stdout: compactJobOutput(stdoutCapture.text().trim(), outputPolicy),
     stderr: compactJobOutput(
       [
-        stderr.trim(),
+        stderrCapture.text().trim(),
         timedOut ? timeoutMessage : "",
       ]
         .filter(Boolean)
@@ -1242,6 +1305,10 @@ function detectValidationBlocker(runs: ValidationExecutionResult[]): ValidationB
     combined.includes("network access") ||
     combined.includes("connection refused") ||
     combined.includes("getaddrinfo") ||
+    combined.includes("err_socket_bad_port") ||
+    combined.includes("expo exited early") ||
+    combined.includes("eperm") ||
+    combined.includes("operation not permitted") ||
     combined.includes("eacces")
   ) {
     return {
