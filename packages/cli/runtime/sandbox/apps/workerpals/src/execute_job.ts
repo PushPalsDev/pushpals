@@ -883,13 +883,69 @@ export function shouldEnsurePlaywrightBrowserRuntime(repo: string, command: stri
   );
 }
 
-export function playwrightBrowserInstallArgv(): string[] {
-  return ["bunx", "playwright", "install", "chromium"];
+const PLAYWRIGHT_BROWSER_INSTALL_TARGETS = new Set([
+  "chromium",
+  "chrome",
+  "chrome-beta",
+  "chrome-dev",
+  "chrome-canary",
+  "msedge",
+  "msedge-beta",
+  "msedge-dev",
+  "msedge-canary",
+  "firefox",
+  "webkit",
+]);
+
+function addPlaywrightInstallTarget(targets: Set<string>, rawValue: string): void {
+  const value = rawValue.trim().toLowerCase();
+  if (!value) return;
+  const normalized = value === "edge" ? "msedge" : value;
+  if (PLAYWRIGHT_BROWSER_INSTALL_TARGETS.has(normalized)) {
+    targets.add(normalized);
+  }
+}
+
+export function inferPlaywrightBrowserInstallTargets(repo: string, command: string): string[] {
+  const targets = new Set<string>(["chromium"]);
+  const script = resolvePackageScriptForValidationCommand(repo, command);
+  const scriptText = script
+    ? `${script.script}\n${readReferencedValidationScriptText(script.cwd, script.script)}`
+    : "";
+  const text = `${command}\n${scriptText}`;
+
+  for (const match of text.matchAll(/\bchannel\s*:\s*["'`]([^"'`]+)["'`]/gi)) {
+    addPlaywrightInstallTarget(targets, match[1] ?? "");
+  }
+  for (const match of text.matchAll(/\bbrowserName\s*:\s*["'`]([^"'`]+)["'`]/gi)) {
+    addPlaywrightInstallTarget(targets, match[1] ?? "");
+  }
+  for (const match of text.matchAll(/(?:^|\s)(?:--browser|--browser-name|--channel)[=\s]+["'`]?([A-Za-z0-9_-]+)/gi)) {
+    addPlaywrightInstallTarget(targets, match[1] ?? "");
+  }
+  for (const target of PLAYWRIGHT_BROWSER_INSTALL_TARGETS) {
+    const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`\\b${escaped}\\s*\\.\\s*launch\\b`, "i").test(text)) {
+      addPlaywrightInstallTarget(targets, target);
+    }
+  }
+
+  return Array.from(targets).sort((a, b) => {
+    if (a === "chromium") return -1;
+    if (b === "chromium") return 1;
+    return a.localeCompare(b);
+  });
+}
+
+export function playwrightBrowserInstallArgv(targets: string[] = ["chromium"]): string[] {
+  const installTargets = Array.from(new Set(targets.map((target) => target.trim()).filter(Boolean)));
+  return ["bunx", "playwright", "install", ...(installTargets.length > 0 ? installTargets : ["chromium"])];
 }
 
 async function runPlaywrightBrowserRuntimePreflight(
   repo: string,
   command: string,
+  targets: string[],
   timeoutMs: number,
   outputPolicy: Partial<OutputCompactionPolicy>,
 ): Promise<ValidationExecutionResult> {
@@ -898,11 +954,11 @@ async function runPlaywrightBrowserRuntimePreflight(
   return runValidationArgv(
     repo,
     command,
-    playwrightBrowserInstallArgv(),
+    playwrightBrowserInstallArgv(targets),
     env,
     timeout,
     outputPolicy,
-    `Browser runtime preflight timed out after ${timeout}ms while ensuring Playwright Chromium. Captured output is the process output emitted before PushPals terminated the installer process tree.`,
+    `Browser runtime preflight timed out after ${timeout}ms while ensuring Playwright browser target(s): ${targets.join(", ")}. Captured output is the process output emitted before PushPals terminated the installer process tree.`,
   );
 }
 
@@ -1772,7 +1828,7 @@ async function runDeterministicQualityGate(
         )}`,
       );
     }
-    let playwrightBrowserRuntimeReady = false;
+    const playwrightBrowserRuntimeReadyTargets = new Set<string>();
     for (const command of commandsToRun) {
       const commandMissingTools = requirementsForValidationCommand(toolchainPlan, command).filter(
         (requirement) =>
@@ -1801,17 +1857,25 @@ async function runDeterministicQualityGate(
         repo,
         command,
       );
+      const playwrightBrowserTargets = commandNeedsPlaywrightBrowserRuntime
+        ? inferPlaywrightBrowserInstallTargets(repo, command)
+        : [];
+      const missingPlaywrightBrowserTargets = playwrightBrowserTargets.filter(
+        (target) => !playwrightBrowserRuntimeReadyTargets.has(target),
+      );
       let commandBrowserRuntimeEnsured =
-        playwrightBrowserRuntimeReady && commandNeedsPlaywrightBrowserRuntime;
-      if (!playwrightBrowserRuntimeReady && commandNeedsPlaywrightBrowserRuntime) {
+        commandNeedsPlaywrightBrowserRuntime &&
+        missingPlaywrightBrowserTargets.length === 0;
+      if (missingPlaywrightBrowserTargets.length > 0) {
         const browserEnv = buildWorkerSandboxWritableEnv(repo);
         onLog?.(
           "stdout",
-          `[ValidationGate] Browser runtime preflight: ensuring Playwright Chromium for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
+          `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
         );
         const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
           repo,
           command,
+          missingPlaywrightBrowserTargets,
           resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
           outputPolicy,
         );
@@ -1820,7 +1884,7 @@ async function runDeterministicQualityGate(
           validationRuns.push({
             ...browserPreflight,
             stderr: [
-              `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright Chromium in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
+              `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
               browserPreflight.stderr,
             ]
               .filter(Boolean)
@@ -1832,10 +1896,12 @@ async function runDeterministicQualityGate(
           );
           continue;
         }
-        playwrightBrowserRuntimeReady = true;
+        for (const target of missingPlaywrightBrowserTargets) {
+          playwrightBrowserRuntimeReadyTargets.add(target);
+        }
         onLog?.(
           "stdout",
-          `[ValidationGate] Browser runtime preflight passed for "${command}"`,
+          `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`,
         );
         commandBrowserRuntimeEnsured = true;
       }

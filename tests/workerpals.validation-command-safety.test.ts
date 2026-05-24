@@ -9,6 +9,7 @@ import {
   collectQualityGateValidationCommands,
   extractRequiredValidationStepsFromVisionMarkdown,
   extractValidationFailureDigest,
+  inferPlaywrightBrowserInstallTargets,
   inferFallbackValidationCommandsForTestTask,
   isLongRunningBrowserValidationCommand,
   isTestFocusedTask,
@@ -366,9 +367,65 @@ describe("workerpals validation command safety", () => {
       expect(shouldEnsurePlaywrightBrowserRuntime(root, "bun run web:e2e")).toBe(true);
       expect(shouldEnsurePlaywrightBrowserRuntime(root, "bun test")).toBe(false);
       expect(playwrightBrowserInstallArgv()).toEqual(["bunx", "playwright", "install", "chromium"]);
+      expect(inferPlaywrightBrowserInstallTargets(root, "bun run web:e2e")).toEqual([
+        "chromium",
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("infers Playwright channel installs from repo browser smoke scripts", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-browser-channel-"));
+    const scriptsDir = join(root, "scripts");
+    mkdirSync(scriptsDir, { recursive: true });
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify(
+        {
+          scripts: {
+            "web:e2e": "node scripts/test-web-e2e.js",
+          },
+          devDependencies: {
+            playwright: "^1.0.0",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    writeFileSync(
+      join(scriptsDir, "test-web-e2e.js"),
+      [
+        "const { chromium } = require('playwright');",
+        "await chromium.launch({ channel: 'msedge' });",
+      ].join("\n"),
+    );
+
+    try {
+      expect(inferPlaywrightBrowserInstallTargets(root, "bun run web:e2e")).toEqual([
+        "chromium",
+        "msedge",
+      ]);
+      expect(playwrightBrowserInstallArgv(["chromium", "msedge"])).toEqual([
+        "bunx",
+        "playwright",
+        "install",
+        "chromium",
+        "msedge",
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("infers non-default Playwright browsers from direct commands", () => {
+    expect(
+      inferPlaywrightBrowserInstallTargets(
+        process.cwd(),
+        "bunx playwright test --browser=firefox --project=webkit",
+      ),
+    ).toEqual(["chromium", "firefox"]);
   });
 
   test("does not classify ordinary UI work with validation criteria as test-focused", () => {
