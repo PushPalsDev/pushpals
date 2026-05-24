@@ -35,6 +35,22 @@ If `bun run cli:bundle` changes `packages/cli/runtime` or monitor UI assets,
 commit those generated updates before tagging. The published package uses those
 packaged assets.
 
+## Version Numbering
+
+Use normal patch releases until the patch number reaches `99`. After patch `99`,
+roll the minor version and reset the patch to `0`.
+
+Examples:
+
+- `v1.0.98` -> `v1.0.99`
+- `v1.0.99` -> `v1.1.0`
+- `v1.1.99` -> `v1.2.0`
+
+Do not intentionally create patch versions above `.99`. If a patch-above-99
+release already exists, leave it published and cut the next release at the
+policy-correct minor version. For example, after a published `v1.0.100`, the
+next release should be `v1.1.0`, not `v1.0.101`.
+
 ## Prepare Release Notes
 
 Update `release_log.md` before tagging.
