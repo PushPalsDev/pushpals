@@ -2,17 +2,20 @@
 
 ## Release Metadata
 
-- version: `v1.1.0`
-- start_commit: `8fd050651899e4fc6276f20fec07cd65c933a167`
-- end_commit: `c5074100aef593a750db9f3322ed5a6c368f838e`
+- version: `v1.1.1`
+- start_commit: `c15a6e9e9a0fca80a003772801f93e3ac2149e9b`
+- end_commit: `e0ef0245a6fd5dc4a7a1a70a7fd5a2b4ea6b95bb`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Adopt the release numbering policy that patch releases roll the minor version after `.99`, so future releases move from `vX.Y.99` to `vX.(Y+1).0`.
-- Document the forward-only correction path for already-published patch-above-99 releases: keep the published version intact and cut the next policy-correct minor release.
-- Move `latest` forward to `v1.1.0` after the already-published `v1.0.100` release.
-- Confirm `bun run cli:bundle` produced no additional packaged runtime asset changes for this documentation-only release.
+- Improve WorkerPal browser-validation convergence for repo-native `web:e2e` jobs by turning browser failures into focused repair packets with stage, selector, expected UI, prior-failure breadcrumb, and relevant output.
+- Extend the browser-validation retry budget to five targeted repair attempts while keeping other ValidationGate failures on the configured retry budget.
+- Hydrate Docker WorkerPal ephemeral worktrees with repo dependency artifacts such as `node_modules`, so Expo/Playwright smoke checks run against the same installed dependencies as the source checkout.
+- Prevent sandbox artifacts, including linked `node_modules`, from being staged into WorkerPal commits.
+- Treat browser smoke harness scripts as test harnesses without forcing app-test positive/negative assertion-balance rules onto e2e launcher scripts.
+- Add `bun run replay:worker-job` for replaying a specific durable WorkerPal job against a running local PushPals server, making convergence bugs reproducible without running the full app workflow.
+- Confirmed the previously failing SectorCommand replay passed all required validation, including default `bun run web:e2e`, and produced a clean PR without committing `node_modules`.
 
 ## Validation
 
