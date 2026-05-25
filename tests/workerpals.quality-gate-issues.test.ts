@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildBrowserValidationRepairPacket,
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
+  isBrowserValidationInfrastructureDigest,
   shouldReviseRequiredValidationBlocker,
   revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
@@ -161,6 +163,196 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("Cannot find module '../../tests/reactNativeMock'");
   });
 
+  test("builds focused browser validation repair packets with progress breadcrumbs", () => {
+    const previous = new Map<string, string>([
+      [
+        "bun run web:e2e",
+        "Browser validation failed during shell stage: Expected home screen to be visible",
+      ],
+    ]);
+
+    const packet = buildBrowserValidationRepairPacket(
+      [
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr: [
+            "Web end-to-end smoke test failed: Error: Browser validation failed during in-game UI stage: Expected help menu primary action to be visible within 30000ms: locator.waitFor: Timeout 30000ms exceeded.",
+            "Call log:",
+            " - waiting for getByTestId('help-primary-action').last() to be visible",
+          ].join("\n"),
+          elapsedMs: 127_732,
+        },
+      ],
+      previous,
+    );
+
+    expect(packet).toMatchObject({
+      command: "bun run web:e2e",
+      failureKind: "assertion",
+      stage: "in-game UI",
+      expected: "help menu primary action to be visible",
+      selector: "getByTestId('help-primary-action')",
+      previousStage: "shell",
+      previousExpected: "home screen to be visible",
+      progress: "new_failure",
+    });
+    expect(packet?.previousDigest).toContain("shell stage");
+    expect(packet?.output).toContain("help menu primary action");
+  });
+
+  test("extracts browser failure artifacts and exact assertion details for repair guidance", () => {
+    const packet = buildBrowserValidationRepairPacket(
+      [
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr: [
+            "Web end-to-end smoke test failed: Error: Browser validation failed during in-game UI stage: Expected resource allocation control to be visible within 30000ms: locator.waitFor: Timeout 30000ms exceeded.",
+            "Saved screenshot: /repo/outputs/web-e2e/failure-in-game-ui.png",
+            "Saved trace: /repo/outputs/web-e2e/failure-in-game-ui-trace.zip",
+            "Call log:",
+            " - waiting for getByText('Keep (Resource)') to be visible",
+          ].join("\n"),
+          elapsedMs: 127_732,
+        },
+      ],
+      new Map([
+        [
+          "bun run web:e2e",
+          "Browser validation failed during shell stage: Expected home Play action to be visible within 30000ms: locator.waitFor: Timeout 30000ms exceeded. waiting for getByRole('button', { name: 'Play' })",
+        ],
+      ]),
+    );
+
+    expect(packet).toMatchObject({
+      command: "bun run web:e2e",
+      failureKind: "assertion",
+      stage: "in-game UI",
+      expected: "resource allocation control to be visible",
+      selector: "getByText('Keep (Resource)')",
+      previousStage: "shell",
+      previousExpected: "home Play action to be visible",
+      previousSelector: "getByRole('button', { name: 'Play' })",
+      progress: "new_failure",
+    });
+    expect(packet?.artifacts).toEqual([
+      "/repo/outputs/web-e2e/failure-in-game-ui.png",
+      "/repo/outputs/web-e2e/failure-in-game-ui-trace.zip",
+    ]);
+  });
+
+  test("classifies killed browser smoke commands as runtime repair packets", () => {
+    const packet = buildBrowserValidationRepairPacket([
+      {
+        step: "bun run web:e2e",
+        command: "bun run web:e2e",
+        ok: false,
+        exitCode: 124,
+        elapsedMs: 602_015,
+        stdout: "",
+        stderr:
+          'error: script "web:e2e" was terminated by signal SIGTERM (Polite quit request)',
+      },
+    ]);
+
+    expect(packet).toMatchObject({
+      command: "bun run web:e2e",
+      failureKind: "runtime",
+      digest: 'error: script "web:e2e" was terminated by signal SIGTERM (Polite quit request)',
+      output: 'error: script "web:e2e" was terminated by signal SIGTERM (Polite quit request)',
+    });
+  });
+
+  test("does not treat Playwright locator assertion timeouts as infrastructure blockers", () => {
+    expect(
+      isBrowserValidationInfrastructureDigest(
+        "locator.waitFor: Timeout 30000ms exceeded waiting for getByTestId('help-primary-action')",
+      ),
+    ).toBe(false);
+
+    expect(isBrowserValidationInfrastructureDigest("ERR_SOCKET_BAD_PORT at port 65536")).toBe(
+      true,
+    );
+  });
+
+  test("prioritizes browser validation repair guidance over lower-priority gate chatter", () => {
+    const packet = buildBrowserValidationRepairPacket([
+      {
+        step: "bun run web:e2e",
+        command: "bun run web:e2e",
+        ok: false,
+        exitCode: 1,
+        stdout: "",
+        stderr:
+          "Web end-to-end smoke test failed: Error: Browser validation failed during in-game UI stage: Expected help menu primary action to be visible within 30000ms: locator.waitFor: Timeout 30000ms exceeded.",
+        elapsedMs: 127_732,
+      },
+    ]);
+
+    const hint = buildQualityRevisionHint(
+      [
+        "ScopeGate: found changed test files without both positive and negative assertion coverage (expected both).",
+        "ValidationGate: Required vision.md validation failed: bun run web:e2e exited 1.",
+      ],
+      {
+        score: 7,
+        findings: ["Generic code quality could be improved later."],
+        mustFix: ["Rename helper for clarity."],
+        revisionGuidance: "Polish naming.",
+        raw: "{}",
+      },
+      {
+        intent: "code_change",
+        riskLevel: "medium",
+        scope: { readAnywhere: true, writeAllowed: true },
+        acceptanceCriteria: [],
+        validationSteps: ["bun run web:e2e"],
+        requiredValidationSteps: ["bun run web:e2e"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr:
+            "Web end-to-end smoke test failed: Error: Browser validation failed during in-game UI stage: Expected help menu primary action to be visible within 30000ms: locator.waitFor: Timeout 30000ms exceeded.",
+          elapsedMs: 127_732,
+        },
+      ],
+      null,
+      packet,
+    );
+
+    expect(hint).toContain("Primary ValidationGate repair objective:");
+    expect(hint).toContain("- Failure type: browser assertion");
+    expect(hint).toContain("- Stage: in-game UI");
+    expect(hint).toContain("inspect the captured browser output/artifacts");
+    expect(hint).toContain("If the expected text/role/test id is not present in the screenshot");
+    expect(hint).toContain("prefer existing data-testid/accessibility labels/roles");
+    expect(hint).toContain("Do not invent a combined phrase for split text");
+    expect(hint).toContain("preserve stages that already passed");
+    expect(hint).toContain("Do not change browser startup, port selection");
+    expect(hint).toContain("PushPals ValidationGate will rerun \"bun run web:e2e\"");
+    expect(hint).toContain("Suppressed 1 lower-priority ScopeGate/CriticGate note");
+    expect(hint).toContain("CriticGate notes deferred");
+    expect(hint).not.toContain("Critic score: 7.0 / 10");
+    expect(hint).not.toContain("Rename helper for clarity.");
+  });
+
   test("revises required validation repo blockers until the auto-revision budget is exhausted", () => {
     expect(
       shouldReviseRequiredValidationBlocker({
@@ -223,6 +415,39 @@ describe("workerpals quality gate critic issue formatting", () => {
         blocker: null,
       }),
     ).toBe(1);
+  });
+
+  test("extends the retry budget for browser validation convergence", () => {
+    const policy = {
+      maxAutoRevisions: 1,
+      validationMaxAutoRevisions: 3,
+    };
+
+    expect(
+      revisionLimitForQualityGateFailures({
+        policy,
+        qualityIssues: [
+          "ValidationGate: Required vision.md validation failed: bun run web:e2e exited 1",
+        ],
+        requiredValidationFailures: ["bun run web:e2e exited 1"],
+        blocker: null,
+        browserRepairPacket: {
+          command: "bun run web:e2e",
+          failureKind: "assertion",
+          stage: "shell",
+          selector: "getByTestId('home-screen')",
+          expected: "home screen",
+          digest: "Browser validation failed during shell stage",
+          previousDigest: null,
+          previousStage: null,
+          previousSelector: null,
+          previousExpected: null,
+          progress: "first_failure",
+          artifacts: [],
+          output: "Web end-to-end smoke test failed",
+        },
+      }),
+    ).toBe(5);
   });
 
   test("downgrades assertion-balance failures when validation passed and critic score meets threshold", () => {

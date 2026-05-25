@@ -242,6 +242,44 @@ describe("workerpals docker executor internals", () => {
     expect(calls).toEqual(["create", "fresh", "warm", "cleanup"]);
   });
 
+  test("links root dependency artifacts into ephemeral worktrees for browser hydration", async () => {
+    const executor = createExecutor() as unknown as {
+      ensureWorktreeDependencyArtifacts: (
+        containerWorktreePath: string,
+        onLog?: (stream: "stdout" | "stderr", line: string) => void,
+      ) => Promise<void>;
+      runWarmShell: (command: string) => Promise<{
+        ok: boolean;
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+      }>;
+    };
+
+    let capturedCommand = "";
+    const logs: string[] = [];
+    executor.runWarmShell = async (command: string) => {
+      capturedCommand = command;
+      return {
+        ok: true,
+        stdout: " node_modules",
+        stderr: "",
+        exitCode: 0,
+      };
+    };
+
+    await executor.ensureWorktreeDependencyArtifacts(
+      "/repo/.worktrees/job-browser-smoke",
+      (stream, line) => logs.push(`${stream}:${line}`),
+    );
+
+    expect(capturedCommand).toContain('src="/repo/$name"');
+    expect(capturedCommand).toContain("node_modules");
+    expect(capturedCommand).toContain("ln -s");
+    expect(capturedCommand).toContain("/repo/.worktrees/job-browser-smoke/");
+    expect(logs.join("\n")).toContain("Linked worktree dependency artifact(s): node_modules");
+  });
+
   test("parseGitWorktreeListPorcelain extracts detached and prunable flags", () => {
     const parsed = parseGitWorktreeListPorcelain(
       [

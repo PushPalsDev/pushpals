@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  buildSandboxArtifactUnstageCommand,
   buildGitCommitArgs,
   buildStageCommand,
   buildWorkerCommitMessage,
@@ -61,12 +62,14 @@ describe("workerpals commit message generation helpers", () => {
       mkdirSync(join(repo, "workspace", "bash_events"), { recursive: true });
       writeFileSync(join(repo, "outputs", "runtime.db"), "ignored\n");
       writeFileSync(join(repo, "workspace", "bash_events", "event.log"), "ignored\n");
+      writeFileSync(join(repo, "node_modules"), "managed dependency link placeholder\n");
 
       const stageArgs = buildStageCommand("task.execute", {
         planning: { scope: { writeGlobs: ["README.md"] } },
       });
       expect(stageArgs).not.toBeNull();
       await runGit(repo, stageArgs!);
+      await runGit(repo, buildSandboxArtifactUnstageCommand());
 
       const staged = await runGit(repo, ["diff", "--cached", "--name-only"]);
       expect(staged.split(/\r?\n/).filter(Boolean).sort()).toEqual([".gitignore", "README.md"]);

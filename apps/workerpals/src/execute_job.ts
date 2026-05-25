@@ -76,6 +76,24 @@ export interface ValidationBlocker {
   detail: string;
 }
 
+type BrowserValidationFailureKind = "assertion" | "startup" | "runtime" | "network" | "unknown";
+
+export interface BrowserValidationRepairPacket {
+  command: string;
+  failureKind: BrowserValidationFailureKind;
+  stage: string | null;
+  selector: string | null;
+  expected: string | null;
+  digest: string;
+  previousDigest: string | null;
+  previousStage: string | null;
+  previousSelector: string | null;
+  previousExpected: string | null;
+  progress: "first_failure" | "same_failure" | "new_failure";
+  artifacts: string[];
+  output: string;
+}
+
 interface DeterministicQualityResult {
   ok: boolean;
   skipped: boolean;
@@ -120,6 +138,8 @@ export interface QualityGatePolicy {
   criticMinScore: number;
 }
 
+const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 5;
+
 function shouldSoftPassValidationBlocker(
   policy: QualityGatePolicy,
   blocker: ValidationBlocker | null,
@@ -148,14 +168,17 @@ export function revisionLimitForQualityGateFailures(opts: {
   qualityIssues: string[];
   requiredValidationFailures: string[];
   blocker: ValidationBlocker | null;
+  browserRepairPacket?: BrowserValidationRepairPacket | null;
 }): number {
   const hasValidationGateFailure =
     opts.requiredValidationFailures.length > 0 ||
     opts.blocker !== null ||
     opts.qualityIssues.some((issue) => issue.startsWith("ValidationGate:"));
-  return hasValidationGateFailure
-    ? opts.policy.validationMaxAutoRevisions
-    : opts.policy.maxAutoRevisions;
+  if (!hasValidationGateFailure) return opts.policy.maxAutoRevisions;
+  if (opts.browserRepairPacket) {
+    return Math.max(opts.policy.validationMaxAutoRevisions, BROWSER_VALIDATION_MAX_AUTO_REVISIONS);
+  }
+  return opts.policy.validationMaxAutoRevisions;
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -1135,8 +1158,15 @@ export function prepareValidationCommandArgv(
   return [...argv, "--", "--port", port];
 }
 
-function isBrowserValidationInfrastructureDigest(digest: string): boolean {
-  return /\b(ERR_SOCKET_BAD_PORT|EADDRINUSE|ECONNREFUSED|ECONNRESET|ETIMEDOUT|timed out|timeout|port|browser runtime|playwright install|executable doesn't exist)\b/i.test(
+function isBrowserAssertionDigest(digest: string): boolean {
+  return /\b(Web end-to-end smoke test failed|locator\.[a-z0-9_]+:\s+Timeout\s+\d+ms\s+exceeded|page\.[a-z0-9_]+:\s+Timeout\s+\d+ms\s+exceeded|waiting for getBy(?:TestId|Role|Text|Label|Placeholder|Title)\(|Expected .+ to be .+ within \d+ms|AssertionError|Error:\s+expect\()/i.test(
+    digest,
+  );
+}
+
+export function isBrowserValidationInfrastructureDigest(digest: string): boolean {
+  if (isBrowserAssertionDigest(digest)) return false;
+  return /\b(browserType\.launch|ERR_SOCKET_BAD_PORT|EADDRINUSE|ECONNREFUSED|ECONNRESET|ETIMEDOUT|listen\s+EPERM|EPERM|EACCES|freeport|port selection|browser runtime|playwright install|executable doesn't exist|Expo exited early|local port bind|Validation command timed out|terminated by signal)\b/i.test(
     digest,
   );
 }
@@ -1466,7 +1496,7 @@ function parseChangedPathsFromStatus(statusOutput: string): string[] {
   return out;
 }
 
-function isLikelyTestPath(path: string): boolean {
+export function isAssertionCoverageTestPath(path: string): boolean {
   const normalized = path.replace(/\\/g, "/").toLowerCase();
   return (
     normalized.includes("/tests/") ||
@@ -1475,6 +1505,21 @@ function isLikelyTestPath(path: string): boolean {
     /\.test\.[a-z0-9]+$/i.test(normalized) ||
     /\.spec\.[a-z0-9]+$/i.test(normalized)
   );
+}
+
+export function isBrowserSmokeHarnessPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  return (
+    /(^|\/)scripts\/test-[^/]*\.(?:c?js|m?js|ts)$/.test(normalized) ||
+    /(^|\/)scripts\/[^/]*(?:e2e|smoke|playwright|browser)[^/]*\.(?:c?js|m?js|ts)$/.test(
+      normalized,
+    ) ||
+    /(^|\/)(?:playwright|cypress)\.config\.(?:c?js|m?js|ts)$/.test(normalized)
+  );
+}
+
+export function isLikelyTestPath(path: string): boolean {
+  return isAssertionCoverageTestPath(path) || isBrowserSmokeHarnessPath(path);
 }
 
 function extractRunnableValidationCommand(step: string): string | null {
@@ -1580,6 +1625,188 @@ export function extractValidationFailureDigest(run: {
     return `timed out${elapsed}`;
   }
   return "";
+}
+
+function classifyBrowserValidationFailureKindFromText(text: string): BrowserValidationFailureKind {
+  const combined = stripAnsiControlSequences(text);
+  if (
+    /\b(browserType\.launch|Executable doesn't exist|playwright install|Browser runtime preflight failed|Please run the following command to download new browsers|Validation command timed out|terminated by signal|SIGTERM|timed out after \d+ms)\b/i.test(
+      combined,
+    )
+  ) {
+    return "runtime";
+  }
+  if (
+    /\b(ERR_SOCKET_BAD_PORT|EADDRINUSE|listen\s+EPERM|EPERM|EACCES|freeport|port selection|Expo exited early|local port bind|cannot bind|operation not permitted)\b/i.test(
+      combined,
+    )
+  ) {
+    return "startup";
+  }
+  if (/\b(page\.[a-z0-9_]+:\s+net::ERR_[A-Z0-9_]+|ECONNREFUSED|ECONNRESET|ETIMEDOUT)\b/i.test(combined)) {
+    return "network";
+  }
+  if (isBrowserAssertionDigest(combined)) {
+    return "assertion";
+  }
+  return "unknown";
+}
+
+function extractBrowserValidationStage(text: string): string | null {
+  const patterns = [
+    /\bBrowser validation failed during\s+([^:.\r\n]+?)\s+stage\b/i,
+    /\bfailed during\s+([^:.\r\n]+?)\s+stage\b/i,
+    /\b(?:stage|phase)\s*[:=]\s*["'`]?([^"'`.\r\n]+)["'`]?/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const value = match?.[1]?.trim();
+    if (value) return toSingleLine(value, 80);
+  }
+  return null;
+}
+
+function extractBalancedLocatorCall(text: string): string | null {
+  const callPattern = /\b(?:getBy(?:TestId|Role|Text|Label|Placeholder|Title)|locator\.[a-z0-9_]+|page\.[a-z0-9_]+)\(/gi;
+  let match: RegExpExecArray | null;
+  while ((match = callPattern.exec(text)) != null) {
+    let depth = 0;
+    let quote: string | null = null;
+    let escaped = false;
+    for (let index = match.index; index < text.length; index += 1) {
+      const char = text[index] ?? "";
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (char === "'" || char === '"' || char === "`") {
+        quote = char;
+        continue;
+      }
+      if (char === "(") {
+        depth += 1;
+        continue;
+      }
+      if (char === ")") {
+        depth -= 1;
+        if (depth === 0) return toSingleLine(text.slice(match.index, index + 1), 120);
+      }
+      if (depth <= 0 && /\s/.test(char) && index > match.index) break;
+    }
+  }
+  return null;
+}
+
+function extractBrowserValidationSelector(text: string): string | null {
+  const balanced = extractBalancedLocatorCall(text);
+  if (balanced) return balanced;
+  const patterns = [
+    /\bwaiting for\s+(getBy(?:TestId|Role|Text|Label|Placeholder|Title)\([^)\r\n]+\))/i,
+    /\b(locator\.[a-z0-9_]+\([^)\r\n]*\))/i,
+    /\b(page\.[a-z0-9_]+\([^)\r\n]*\))/i,
+    /\b(getBy(?:TestId|Role|Text|Label|Placeholder|Title)\([^)\r\n]+\))/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const value = match?.[1]?.trim();
+    if (value) return toSingleLine(value, 120);
+  }
+  return null;
+}
+
+function extractBrowserValidationExpectedUi(text: string): string | null {
+  const patterns = [
+    /\bExpected\s+([^:.\r\n]+?)\s+within\s+\d+ms\b/i,
+    /\bExpected\s+([^:.\r\n]+?)(?:[:.]|\r?\n)/i,
+    /\bExpected\s+([^:.\r\n]+?)$/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const value = match?.[1]?.trim();
+    if (value) return toSingleLine(value, 140);
+  }
+  return null;
+}
+
+function extractBrowserValidationArtifacts(text: string): string[] {
+  const combined = stripAnsiControlSequences(text);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const addArtifact = (raw: string | undefined) => {
+    const artifact = String(raw ?? "")
+      .trim()
+      .replace(/[),.;:]+$/, "");
+    if (!artifact || seen.has(artifact)) return;
+    seen.add(artifact);
+    out.push(toSingleLine(artifact, 220));
+  };
+  const patterns = [
+    /\b(?:screenshot|snapshot|trace|video|artifact|output|saved|wrote)[^:\r\n]*:\s*(["'`]?)([^"'`\s]+(?:outputs|test-results|playwright-report)[^\s"'`]+(?:\.png|\.jpg|\.jpeg|\.webp|\.zip|\.json|\.txt|\.webm))\1/gi,
+    /((?:\/repo|\/workspace|[A-Za-z]:[\\/])?[^\s"'`]*?(?:outputs|test-results|playwright-report)[\\/][^\s"'`]+(?:\.png|\.jpg|\.jpeg|\.webp|\.zip|\.json|\.txt|\.webm))/gi,
+  ];
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(combined)) != null) {
+      addArtifact(match[2] ?? match[1]);
+      if (out.length >= 4) return out;
+    }
+  }
+  return out;
+}
+
+function summarizeBrowserValidationOutput(text: string): string {
+  const lines = stripAnsiControlSequences(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) =>
+      /\b(Web end-to-end smoke test failed|Browser validation failed|Expected |locator\.|page\.|waiting for getBy|Call log:|ERR_SOCKET_BAD_PORT|EADDRINUSE|EPERM|EACCES|browserType\.launch|Executable doesn't exist|Expo exited early|freeport|net::ERR_|Validation command timed out|terminated by signal|SIGTERM|timed out after \d+ms)\b/i.test(
+        line,
+      ),
+    );
+  return toSingleLine(lines.slice(0, 8).join(" | "), 900);
+}
+
+export function buildBrowserValidationRepairPacket(
+  validationRuns: ValidationExecutionResult[],
+  previousFailureDigests: Map<string, string> = new Map(),
+): BrowserValidationRepairPacket | null {
+  for (const run of validationRuns) {
+    if (run.ok || !isLongRunningBrowserValidationCommand(run.command)) continue;
+    const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+    const digest = extractValidationFailureDigest(run);
+    const failureKind = classifyBrowserValidationFailureKindFromText(`${digest}\n${combined}`);
+    if (failureKind === "unknown") continue;
+    const previousDigest = previousFailureDigests.get(validationCommandKey(run.command)) ?? null;
+    const progress =
+      previousDigest == null
+        ? "first_failure"
+        : previousDigest === digest
+          ? "same_failure"
+          : "new_failure";
+    return {
+      command: run.command,
+      failureKind,
+      stage: extractBrowserValidationStage(combined),
+      selector: extractBrowserValidationSelector(combined),
+      expected: extractBrowserValidationExpectedUi(combined),
+      digest,
+      previousDigest,
+      previousStage: previousDigest ? extractBrowserValidationStage(previousDigest) : null,
+      previousSelector: previousDigest ? extractBrowserValidationSelector(previousDigest) : null,
+      previousExpected: previousDigest ? extractBrowserValidationExpectedUi(previousDigest) : null,
+      progress,
+      artifacts: extractBrowserValidationArtifacts(combined),
+      output: summarizeBrowserValidationOutput(combined) || digest,
+    };
+  }
+  return null;
 }
 
 export function collectRequiredValidationFailures(
@@ -1866,6 +2093,9 @@ async function runDeterministicQualityGate(
       [...changedPaths, ...preparedMergeConflictPaths].filter((path) => isLikelyTestPath(path)),
     ),
   );
+  const changedAssertionCoverageTestPaths = changedTestPaths.filter((path) =>
+    isAssertionCoverageTestPath(path),
+  );
   const issues: string[] = [];
   const scopeIssues: string[] = [];
   const validationIssues: string[] = [];
@@ -1890,8 +2120,8 @@ async function runDeterministicQualityGate(
     }
     if (
       isTestTask &&
-      changedTestPaths.length > 0 &&
-      !hasBalancedPositiveNegativeAssertions(changedTestPaths, repo)
+      changedAssertionCoverageTestPaths.length > 0 &&
+      !hasBalancedPositiveNegativeAssertions(changedAssertionCoverageTestPaths, repo)
     ) {
       addScopeIssue(
         "found changed test files without both positive and negative assertion coverage (expected both).",
@@ -2344,9 +2574,98 @@ export function buildQualityRevisionHint(
   reviewFixContext?: ReviewFixContext | null,
   validationRuns: ValidationExecutionResult[] = [],
   validationBlocker: ValidationBlocker | null = null,
+  browserRepairPacket: BrowserValidationRepairPacket | null = null,
 ): string {
   const lines: string[] = [];
   lines.push("Quality revision required before completion.");
+  const focusedBrowserRepair = Boolean(browserRepairPacket);
+  if (browserRepairPacket) {
+    lines.push("Primary ValidationGate repair objective:");
+    lines.push(`- Command: ${browserRepairPacket.command}`);
+    lines.push(`- Failure type: browser ${browserRepairPacket.failureKind}`);
+    lines.push(
+      "- First action: inspect the captured browser output/artifacts and actual rendered UI before editing; do not guess from component names or intended copy.",
+    );
+    if (browserRepairPacket.stage) lines.push(`- Stage: ${browserRepairPacket.stage}`);
+    if (browserRepairPacket.expected) {
+      lines.push(`- Expected UI: ${browserRepairPacket.expected}`);
+    }
+    if (browserRepairPacket.selector) {
+      lines.push(`- Selector/wait: ${browserRepairPacket.selector}`);
+    }
+    if (browserRepairPacket.artifacts.length > 0) {
+      lines.push("Failure artifacts to inspect:");
+      for (const artifact of browserRepairPacket.artifacts) {
+        lines.push(`- ${artifact}`);
+      }
+    } else {
+      lines.push(
+        "- Failure artifacts: none were captured in command output; if this repo writes screenshots/traces, inspect the latest browser failure artifact before changing selectors.",
+      );
+    }
+    if (browserRepairPacket.digest) {
+      lines.push(`- Current failure: ${browserRepairPacket.digest}`);
+    }
+    if (browserRepairPacket.previousDigest) {
+      const breadcrumb =
+        browserRepairPacket.progress === "same_failure"
+          ? "same failure repeated for this command"
+          : "new failure for this command after the previous revision";
+      lines.push(`- Breadcrumb: ${breadcrumb}; previous failure was ${browserRepairPacket.previousDigest}`);
+      if (
+        browserRepairPacket.previousStage ||
+        browserRepairPacket.previousExpected ||
+        browserRepairPacket.previousSelector
+      ) {
+        lines.push("Previous browser failure detail:");
+        if (browserRepairPacket.previousStage) {
+          lines.push(`- Previous stage: ${browserRepairPacket.previousStage}`);
+        }
+        if (browserRepairPacket.previousExpected) {
+          lines.push(`- Previous expected UI: ${browserRepairPacket.previousExpected}`);
+        }
+        if (browserRepairPacket.previousSelector) {
+          lines.push(`- Previous selector/wait: ${browserRepairPacket.previousSelector}`);
+        }
+      }
+    } else {
+      lines.push("- Breadcrumb: first captured failure for this command in this revision loop");
+    }
+    if (browserRepairPacket.output) {
+      lines.push(`- Relevant output: ${browserRepairPacket.output}`);
+    }
+    if (browserRepairPacket.failureKind === "assertion") {
+      lines.push(
+        "Repair direction: fix this exact visible UI assertion or the app state that should make it true. If the expected text/role/test id is not present in the screenshot, update the smoke assertion to the visible product UI that proves the same stage, or add accessibility metadata to an existing control. Do not add optional navigation or broaden the smoke path. Do not change browser startup, port selection, Playwright installation, or unrelated e2e harness behavior unless the captured failure is reclassified as startup/setup.",
+      );
+      lines.push(
+        "Selector stability rule: prefer existing data-testid/accessibility labels/roles and stage containers over guessed title/body text. If a stage already passed with a stable container such as a home/shell/test-id locator, reuse that signal instead of replacing it with copy checks.",
+      );
+      lines.push(
+        "Text assertion rule: rendered titles may be split across sibling nodes. Do not invent a combined phrase for split text; either assert the individual visible fragments within the stage container or add/reuse a stable test id/accessibility label.",
+      );
+      if (
+        browserRepairPacket.progress === "same_failure" ||
+        (browserRepairPacket.stage &&
+          browserRepairPacket.previousStage &&
+          browserRepairPacket.stage === browserRepairPacket.previousStage)
+      ) {
+        lines.push(
+          "Repeated-stage rule: this browser stage has failed before in the current revision loop, so treat the previous selector/copy assumption as suspect and switch to the most stable rendered locator for that same stage.",
+        );
+      }
+    } else {
+      lines.push(
+        "Repair direction: this is a browser startup/runtime/network failure. Fix only startup/runtime provisioning for this command and do not rewrite app UI assertions unless a later ValidationGate run reaches an assertion stage.",
+      );
+    }
+    lines.push(
+      "Convergence rule: preserve stages that already passed, repair only the current failing browser stage, and stop after one targeted browser confirmation so the next ValidationGate run gets a clean signal.",
+    );
+    lines.push(
+      `Validation rerun rule: PushPals ValidationGate will rerun "${browserRepairPacket.command}" after the patch. During the edit turn, run focused fast checks first; only run the full browser command for one targeted confirmation and stop on the first clear stage failure.`,
+    );
+  }
   if (reviewFixContext) {
     lines.push("Rejected PR retry requirements:");
     if (reviewFixContext.previousReviewScore != null) {
@@ -2373,8 +2692,28 @@ export function buildQualityRevisionHint(
     lines.push("Raise the score above the approval threshold without reopening already accepted behavior.");
   }
   if (issues.length > 0) {
-    lines.push("Deterministic quality issues:");
-    for (const issue of issues) lines.push(`- ${issue}`);
+    const displayedIssues = focusedBrowserRepair
+      ? issues.filter(
+          (issue) =>
+            issue.startsWith("ValidationGate:") ||
+            issue.includes("Required vision.md validation") ||
+            issue.includes("Validation blocker"),
+        )
+      : issues;
+    if (displayedIssues.length > 0) {
+      lines.push(
+        focusedBrowserRepair
+          ? "Deterministic quality issues relevant to this validation repair:"
+          : "Deterministic quality issues:",
+      );
+      for (const issue of displayedIssues) lines.push(`- ${issue}`);
+    }
+    const suppressedCount = issues.length - displayedIssues.length;
+    if (focusedBrowserRepair && suppressedCount > 0) {
+      lines.push(
+        `Suppressed ${suppressedCount} lower-priority ScopeGate/CriticGate note(s) until the browser validation repair passes.`,
+      );
+    }
   }
   if (validationBlocker) {
     lines.push(
@@ -2387,7 +2726,10 @@ export function buildQualityRevisionHint(
   const failedValidationRuns = validationRuns.filter((run) => !run.ok);
   if (failedValidationRuns.length > 0) {
     lines.push("Validation failure diagnostics:");
-    for (const run of failedValidationRuns.slice(0, 5)) {
+    const runsToShow = browserRepairPacket
+      ? failedValidationRuns.filter((run) => run.command === browserRepairPacket.command).slice(0, 1)
+      : failedValidationRuns.slice(0, 5);
+    for (const run of runsToShow) {
       lines.push(`- ${run.command} failed with exit ${run.exitCode} after ${run.elapsedMs}ms.`);
       const output = toSingleLine(
         stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n")),
@@ -2397,13 +2739,39 @@ export function buildQualityRevisionHint(
     }
   }
   if (critic) {
-    lines.push(`Critic score: ${critic.score.toFixed(1)} / 10`);
-    if (critic.mustFix.length > 0) {
+    const deferCriticForBrowserAssertion =
+      focusedBrowserRepair && browserRepairPacket?.failureKind === "assertion";
+    const criticIsSevere =
+      critic.score <= 4 ||
+      [...critic.mustFix, ...critic.findings, critic.revisionGuidance].some((entry) =>
+        /\b(browser|e2e|validation|web smoke|playwright)\b/i.test(entry),
+      );
+    if (deferCriticForBrowserAssertion) {
+      lines.push(
+        `CriticGate notes deferred while repairing the primary browser assertion failure (score ${critic.score.toFixed(1)} / 10).`,
+      );
+    } else if (!focusedBrowserRepair || criticIsSevere) {
+      lines.push(`Critic score: ${critic.score.toFixed(1)} / 10`);
+    }
+    if (
+      !deferCriticForBrowserAssertion &&
+      (!focusedBrowserRepair || criticIsSevere) &&
+      critic.mustFix.length > 0
+    ) {
       lines.push("Critic must-fix findings:");
       for (const issue of critic.mustFix) lines.push(`- ${issue}`);
     }
-    if (critic.revisionGuidance) {
+    if (
+      !deferCriticForBrowserAssertion &&
+      (!focusedBrowserRepair || criticIsSevere) &&
+      critic.revisionGuidance
+    ) {
       lines.push(`Critic revision guidance: ${critic.revisionGuidance}`);
+    }
+    if (focusedBrowserRepair && !criticIsSevere && !deferCriticForBrowserAssertion) {
+      lines.push(
+        `CriticGate notes deferred while repairing the primary browser validation failure (score ${critic.score.toFixed(1)} / 10).`,
+      );
     }
   }
   if (planning.acceptanceCriteria.length > 0) {
@@ -2661,10 +3029,14 @@ export type WorkerGitCommitIdentity = SourceControlCommitIdentity;
 
 export const explicitWorkerCommitIdentityFromEnv = explicitSourceControlCommitIdentityFromEnv;
 
+export function buildSandboxArtifactUnstageCommand(): string[] {
+  return ["reset", "-q", "--", ...SANDBOX_STAGE_ARTIFACT_PATHS];
+}
+
 async function unstageSandboxArtifactPaths(
   repo: string,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return git(repo, ["reset", "-q", "--", ...SANDBOX_STAGE_ARTIFACT_PATHS]);
+  return git(repo, buildSandboxArtifactUnstageCommand());
 }
 
 async function resolveGitConfigValue(repo: string, key: string): Promise<string> {
@@ -4499,7 +4871,7 @@ function hasInvalidRepoPathHint(values: string[]): boolean {
   return values.some((entry) => normalizeStagePath(entry) === null);
 }
 
-const SANDBOX_STAGE_ARTIFACT_PATHS = ["workspace", "outputs", ".codex"];
+export const SANDBOX_STAGE_ARTIFACT_PATHS = ["workspace", "outputs", ".codex", "node_modules"];
 
 function taskExecuteOrigin(params: Record<string, unknown>): "autonomy" | "user" {
   const explicit = String(params.origin ?? "")
@@ -5190,6 +5562,10 @@ export async function executeJob(
         revisionAttempt,
       },
     );
+    const browserRepairPacket = buildBrowserValidationRepairPacket(
+      quality.validationRuns,
+      previousValidationFailureDigests,
+    );
     for (const run of quality.validationRuns) {
       if (run.ok) continue;
       const digest = extractValidationFailureDigest(run);
@@ -5324,8 +5700,15 @@ export async function executeJob(
         ? []
         : quality.requiredValidationFailures,
       blocker: validationOutsideTaskScope ? null : quality.blocker,
+      browserRepairPacket: validationOutsideTaskScope ? null : browserRepairPacket,
     });
-    const issueSummary = issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
+    const issueSummary =
+      browserRepairPacket && !validationOutsideTaskScope
+        ? `ValidationGate browser ${browserRepairPacket.failureKind} repair for ${browserRepairPacket.command}: ${toSingleLine(
+            browserRepairPacket.digest,
+            180,
+          )}`
+        : issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
     if (quality.blocker && !validationOutsideTaskScope) {
       const blockerSummary = `Quality gate blocked by ${quality.blocker.category} issue: ${quality.blocker.detail}`;
       const blockerDiagnostics = truncate(
@@ -5456,6 +5839,7 @@ export async function executeJob(
       reviewFixContext,
       validationOutsideTaskScope ? [] : quality.validationRuns,
       validationOutsideTaskScope ? null : quality.blocker,
+      validationOutsideTaskScope ? null : browserRepairPacket,
     );
     onLog?.(
       "stderr",

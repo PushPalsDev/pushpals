@@ -11,6 +11,9 @@ import {
   extractValidationFailureDigest,
   inferPlaywrightBrowserInstallTargets,
   inferFallbackValidationCommandsForTestTask,
+  isAssertionCoverageTestPath,
+  isBrowserSmokeHarnessPath,
+  isLikelyTestPath,
   isLongRunningBrowserValidationCommand,
   isTestFocusedTask,
   isTestLikeValidationStep,
@@ -75,6 +78,14 @@ describe("workerpals validation command safety", () => {
     expect(isTestLikeValidationStep("bun run build")).toBe(false);
     expect(isTestLikeValidationStep("echo done")).toBe(false);
     expect(isTestLikeValidationStep("Run `node scripts/lint.js`")).toBe(false);
+  });
+
+  test("treats browser smoke scripts as test validation harnesses without assertion coverage requirements", () => {
+    expect(isBrowserSmokeHarnessPath("scripts/test-web-e2e.js")).toBe(true);
+    expect(isBrowserSmokeHarnessPath("scripts/run-browser-smoke.ts")).toBe(true);
+    expect(isLikelyTestPath("scripts/test-web-e2e.js")).toBe(true);
+    expect(isAssertionCoverageTestPath("scripts/test-web-e2e.js")).toBe(false);
+    expect(isAssertionCoverageTestPath("app/__tests__/route.test.ts")).toBe(true);
   });
 
   test("prefers scoped fallback commands before full-suite runs", () => {

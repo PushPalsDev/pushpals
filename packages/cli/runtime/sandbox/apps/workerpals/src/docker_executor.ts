@@ -1120,6 +1120,7 @@ export class DockerExecutor {
       worktreePath,
       onLog,
     );
+    await this.ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog);
 
     const args: string[] = [
       "exec",
@@ -1194,6 +1195,50 @@ export class DockerExecutor {
     });
 
     return result;
+  }
+
+  private async ensureWorktreeDependencyArtifacts(
+    containerWorktreePath: string,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<void> {
+    const worktreePrefix = shellSingleQuote(`${containerWorktreePath}/`);
+    const command = [
+      "set -eu",
+      "linked=\"\"",
+      "for name in node_modules; do",
+      "  src=\"/repo/$name\"",
+      `  dest=${worktreePrefix}$name`,
+      "  if { [ -e \"$src\" ] || [ -L \"$src\" ]; } && [ ! -e \"$dest\" ] && [ ! -L \"$dest\" ]; then",
+      "    ln -s \"$src\" \"$dest\"",
+      "    linked=\"$linked $name\"",
+      "  fi",
+      "done",
+      "printf '%s' \"$linked\"",
+    ].join("\n");
+
+    const result = await this.runWarmShell(command);
+    if (!result.ok) {
+      const detail = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+      const warning = `[DockerExecutor] Worktree dependency artifact linking skipped: ${
+        detail || `exit ${result.exitCode}`
+      }`;
+      console.warn(warning);
+      onLog?.("stderr", warning);
+      return;
+    }
+
+    const linked = result.stdout
+      .trim()
+      .split(/\s+/g)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    if (linked.length === 0) return;
+
+    const note = `[DockerExecutor] Linked worktree dependency artifact(s): ${linked.join(
+      ", ",
+    )}`;
+    console.log(note);
+    onLog?.("stdout", note);
   }
 
   private async waitForWorktreePathInWarmContainer(
