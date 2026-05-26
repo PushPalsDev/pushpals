@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   buildBrowserValidationRepairPacket,
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
   isBrowserValidationInfrastructureDigest,
+  qualityRevisionLoopUpperBound,
   shouldReviseRequiredValidationBlocker,
   revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
@@ -248,6 +252,51 @@ describe("workerpals quality gate critic issue formatting", () => {
     ]);
   });
 
+  test("hydrates browser repair packets from recent e2e artifact logs when command output is generic", () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-browser-artifacts-"));
+    try {
+      const artifactDir = join(repo, "outputs", "web-e2e");
+      mkdirSync(artifactDir, { recursive: true });
+      const screenshotPath = join(artifactDir, "03-settings.png");
+      const logPath = join(artifactDir, "expo-web.log");
+      writeFileSync(screenshotPath, "not a real image");
+      writeFileSync(
+        logPath,
+        [
+          "Verified: settings screen",
+          "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+          "Call log:",
+          " - waiting for getByTestId('settings-home-button').last() to be visible",
+        ].join("\n"),
+      );
+
+      const packet = buildBrowserValidationRepairPacket(
+        [
+          {
+            step: "bun run web:e2e",
+            command: "bun run web:e2e",
+            ok: false,
+            exitCode: 1,
+            stdout: "",
+            stderr:
+              "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+            elapsedMs: 111_031,
+          },
+        ],
+        new Map(),
+        repo,
+      );
+
+      expect(packet?.selector).toBe("getByTestId('settings-home-button')");
+      expect(packet?.artifacts).toContain(screenshotPath);
+      expect(packet?.artifacts).toContain(logPath);
+      expect(packet?.output).toContain("Verified: settings screen");
+      expect(packet?.output).toContain("settings-home-button");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   test("classifies killed browser smoke commands as runtime repair packets", () => {
     const packet = buildBrowserValidationRepairPacket([
       {
@@ -347,6 +396,11 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("preserve stages that already passed");
     expect(hint).toContain("Do not change browser startup, port selection");
     expect(hint).toContain("PushPals ValidationGate will rerun \"bun run web:e2e\"");
+    expect(hint).toContain("Executor sandbox rule:");
+    expect(hint).toContain("treat that as a Codex executor verification limitation");
+    expect(hint).toContain("do not run the full browser command from the Codex executor by default");
+    expect(hint).toContain("fast non-browser checks");
+    expect(hint).toContain("let ValidationGate perform the authoritative browser run");
     expect(hint).toContain("Suppressed 1 lower-priority ScopeGate/CriticGate note");
     expect(hint).toContain("CriticGate notes deferred");
     expect(hint).not.toContain("Critic score: 7.0 / 10");
@@ -447,7 +501,28 @@ describe("workerpals quality gate critic issue formatting", () => {
           output: "Web end-to-end smoke test failed",
         },
       }),
-    ).toBe(5);
+    ).toBe(8);
+  });
+
+  test("keeps the outer revision loop at the configured limit for non-browser work", () => {
+    expect(
+      qualityRevisionLoopUpperBound({
+        maxAutoRevisions: 1,
+        validationMaxAutoRevisions: 3,
+      }),
+    ).toBe(3);
+  });
+
+  test("extends the outer revision loop only for browser validation convergence", () => {
+    expect(
+      qualityRevisionLoopUpperBound(
+        {
+          maxAutoRevisions: 1,
+          validationMaxAutoRevisions: 3,
+        },
+        { browserValidation: true },
+      ),
+    ).toBe(8);
   });
 
   test("downgrades assertion-balance failures when validation passed and critic score meets threshold", () => {

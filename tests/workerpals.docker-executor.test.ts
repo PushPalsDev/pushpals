@@ -4,6 +4,7 @@ import {
   DockerExecutor,
   isEphemeralWorkerWorktreePath,
   parseGitWorktreeListPorcelain,
+  resolveDockerJobTimeoutMs,
 } from "../apps/workerpals/src/docker_executor";
 
 function createExecutor() {
@@ -44,7 +45,7 @@ describe("workerpals docker executor internals", () => {
         stdoutLines: string[],
         stderrLines: string[],
         exitCode: number,
-        context: { timedOutByDocker: boolean; elapsedMs: number },
+        context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
       ) => {
         ok: boolean;
         summary: string;
@@ -54,6 +55,7 @@ describe("workerpals docker executor internals", () => {
     const terminated = executor.parseResult(["partial logs"], [], 143, {
       timedOutByDocker: false,
       elapsedMs: 500_000,
+      timeoutMs: 1_800_000,
     });
     expect(terminated.ok).toBe(false);
     expect(terminated.summary).toContain("terminated (exit 143)");
@@ -62,10 +64,39 @@ describe("workerpals docker executor internals", () => {
     const timedOut = executor.parseResult(["partial logs"], [], 143, {
       timedOutByDocker: true,
       elapsedMs: 1_234_567,
+      timeoutMs: 14_400_000,
     });
     expect(timedOut.ok).toBe(false);
     expect(timedOut.summary).toContain("timed out in Docker executor");
     expect(timedOut.summary).toContain("1234567ms");
+    expect(timedOut.summary).toContain("14400000ms");
+  });
+
+  test("extends Docker timeout for browser-validation repair jobs", () => {
+    const regularTimeout = resolveDockerJobTimeoutMs(1_860_000, {
+      kind: "task.execute",
+      params: {
+        planning: {
+          validationSteps: ["bun test", "bun x tsc --noEmit"],
+          executionBudgetMs: 1_800_000,
+          finalizationBudgetMs: 120_000,
+        },
+      },
+    });
+    expect(regularTimeout).toBe(1_860_000);
+
+    const browserTimeout = resolveDockerJobTimeoutMs(7_260_000, {
+      kind: "task.execute",
+      params: {
+        planning: {
+          validationSteps: ["bun test", "bun run web:e2e"],
+          executionBudgetMs: 1_800_000,
+          finalizationBudgetMs: 120_000,
+        },
+      },
+    });
+    expect(browserTimeout).toBeGreaterThan(7_260_000);
+    expect(browserTimeout).toBeGreaterThanOrEqual(4 * 60 * 60_000);
   });
 
   test("retry matching no longer treats generic timeout words as transient", () => {

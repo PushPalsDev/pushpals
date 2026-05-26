@@ -43,6 +43,10 @@ const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox
 const DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
 const DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60_000;
+const BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS = 8;
+const BROWSER_VALIDATION_JOB_OVERHEAD_MS = 15 * 60_000;
+const BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS = 4 * 60 * 60_000;
+const BROWSER_VALIDATION_JOB_MAX_TIMEOUT_MS = 8 * 60 * 60_000;
 
 function parseClampedInt(value: unknown, defaultValue: number, min: number, max: number): number {
   const parsed =
@@ -235,6 +239,75 @@ export interface Job {
   kind: string;
   params: Record<string, unknown>;
   sessionId: string;
+}
+
+function readPositiveNumber(value: unknown): number | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value, 10)
+        : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
+function maybeRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function collectValidationCommandHints(params: Record<string, unknown>): string[] {
+  const planning = maybeRecord(params.planning);
+  const values: unknown[] = [
+    params.instruction,
+    params.plannerWorkerInstruction,
+    params.validationSteps,
+    params.requiredValidationSteps,
+    planning?.validationSteps,
+    planning?.requiredValidationSteps,
+  ];
+  const commands: string[] = [];
+  for (const value of values) {
+    if (typeof value === "string") {
+      commands.push(value);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      commands.push(...value.filter((entry): entry is string => typeof entry === "string"));
+    }
+  }
+  return commands;
+}
+
+function hasBrowserValidationCommand(job: Pick<Job, "kind" | "params">): boolean {
+  if (job.kind !== "task.execute") return false;
+  return collectValidationCommandHints(job.params).some((command) =>
+    /\b(web:e2e|e2e:web|browser:e2e|smoke:web|web:smoke|browser:smoke|playwright|cypress)\b/i.test(
+      command,
+    ),
+  );
+}
+
+export function resolveDockerJobTimeoutMs(
+  configuredTimeoutMs: number,
+  job: Pick<Job, "kind" | "params">,
+): number {
+  const baseTimeoutMs = Math.max(10_000, Math.floor(configuredTimeoutMs));
+  if (!hasBrowserValidationCommand(job)) return baseTimeoutMs;
+
+  const planning = maybeRecord(job.params.planning);
+  const executionBudgetMs = readPositiveNumber(planning?.executionBudgetMs) ?? 1_800_000;
+  const finalizationBudgetMs = readPositiveNumber(planning?.finalizationBudgetMs) ?? 120_000;
+  const attempts = BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS + 1; // initial attempt plus repairs
+  const estimatedTimeoutMs =
+    attempts * (executionBudgetMs + finalizationBudgetMs + BROWSER_VALIDATION_JOB_OVERHEAD_MS);
+  const boundedTimeoutMs = Math.min(
+    BROWSER_VALIDATION_JOB_MAX_TIMEOUT_MS,
+    Math.max(BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS, estimatedTimeoutMs),
+  );
+  return Math.max(baseTimeoutMs, boundedTimeoutMs);
 }
 
 export class DockerExecutor {
@@ -1141,9 +1214,15 @@ export class DockerExecutor {
       stdout: "pipe",
       stderr: "pipe",
     });
+    const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
+    if (timeoutMs !== this.options.timeoutMs) {
+      const note = `[DockerExecutor] Extended job timeout for browser validation convergence: ${timeoutMs}ms (configured ${this.options.timeoutMs}ms).`;
+      console.log(note);
+      onLog?.("stdout", note);
+    }
 
     const { leadMs: warningLeadMs, delayMs: warningDelayMs } = computeTimeoutWarningWindow(
-      this.options.timeoutMs,
+      timeoutMs,
     );
     const warningTimer = setTimeout(() => {
       const warning = `[DockerExecutor] Job nearing timeout in warm container (${Math.round(
@@ -1172,7 +1251,7 @@ export class DockerExecutor {
       } catch {
         // Ignore kill errors
       }
-    }, this.options.timeoutMs);
+    }, timeoutMs);
 
     // Process streams
     const stdoutLines: string[] = [];
@@ -1192,6 +1271,7 @@ export class DockerExecutor {
     const result = this.parseResult(stdoutLines, stderrLines, exitCode, {
       timedOutByDocker,
       elapsedMs,
+      timeoutMs,
     });
 
     return result;
@@ -1445,7 +1525,7 @@ export class DockerExecutor {
     stdoutLines: string[],
     stderrLines: string[],
     exitCode: number,
-    context: { timedOutByDocker: boolean; elapsedMs: number },
+    context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
   ): DockerJobResult {
     let sawSentinel = false;
     let sentinelParseError = "";
@@ -1487,7 +1567,7 @@ export class DockerExecutor {
     if (context.timedOutByDocker) {
       return {
         ok: false,
-        summary: `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${this.options.timeoutMs}ms; terminated before structured result).`,
+        summary: `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms; terminated before structured result).`,
         stdout,
         stderr,
         exitCode,

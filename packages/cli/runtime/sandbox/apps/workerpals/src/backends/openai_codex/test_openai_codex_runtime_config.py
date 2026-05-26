@@ -295,6 +295,8 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         template = _load_prompt_template("workerpals/openai_codex_task_execute_system_prompt.md")
         self.assertIn("Codex CLI is required infrastructure", template)
         self.assertIn("Use direct commands without shell wrappers", template)
+        self.assertIn("ValidationGate is the authoritative browser runner", template)
+        self.assertIn("Do not run long browser/e2e smoke commands", template)
 
     def test_extracts_usage_counts_from_nested_json_event(self) -> None:
         usage = _extract_usage_counts(

@@ -3,7 +3,15 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
-import { existsSync, lstatSync, readFileSync, renameSync, rmSync, unlinkSync } from "fs";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+} from "fs";
 import { resolve } from "path";
 import {
   buildGitCommitArgs as buildSourceControlGitCommitArgs,
@@ -138,7 +146,41 @@ export interface QualityGatePolicy {
   criticMinScore: number;
 }
 
-const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 5;
+const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 8;
+
+export function qualityRevisionLoopUpperBound(policy: {
+  maxAutoRevisions: number;
+  validationMaxAutoRevisions: number;
+}, opts: {
+  browserValidation?: boolean;
+} = {}): number {
+  return Math.max(
+    policy.maxAutoRevisions,
+    policy.validationMaxAutoRevisions,
+    opts.browserValidation ? BROWSER_VALIDATION_MAX_AUTO_REVISIONS : 0,
+  );
+}
+
+function taskRequestsBrowserValidation(params: Record<string, unknown>): boolean {
+  const candidates: string[] = [];
+  const collect = (value: unknown) => {
+    if (typeof value === "string") {
+      candidates.push(value);
+    } else if (Array.isArray(value)) {
+      for (const item of value) collect(item);
+    }
+  };
+  const planning =
+    params.planning && typeof params.planning === "object"
+      ? (params.planning as Record<string, unknown>)
+      : {};
+  collect(planning.requiredValidationSteps);
+  collect(planning.validationSteps);
+  collect(params.requiredValidationSteps);
+  collect(params.validationSteps);
+  collect(params.instruction);
+  return candidates.some((candidate) => isLongRunningBrowserValidationCommand(candidate));
+}
 
 function shouldSoftPassValidationBlocker(
   policy: QualityGatePolicy,
@@ -1760,13 +1802,102 @@ function extractBrowserValidationArtifacts(text: string): string[] {
   return out;
 }
 
+function collectRecentBrowserValidationFiles(
+  repo: string | undefined,
+  extensions: RegExp,
+  limit = 8,
+): string[] {
+  if (!repo) return [];
+  const roots = ["outputs/web-e2e", "test-results", "playwright-report"]
+    .map((entry) => resolve(repo, entry))
+    .filter((entry) => existsSync(entry));
+  const files: Array<{ path: string; mtimeMs: number }> = [];
+  const visit = (dir: string, depth: number) => {
+    if (depth > 4 || files.length > 2_000) return;
+    let entries: Array<{ name: unknown; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const entryName = String(entry.name);
+      const path = resolve(dir, entryName);
+      if (entry.isDirectory()) {
+        visit(path, depth + 1);
+        continue;
+      }
+      if (!entry.isFile() || !extensions.test(entryName)) continue;
+      try {
+        const stat = lstatSync(path);
+        files.push({ path, mtimeMs: stat.mtimeMs });
+      } catch {
+        // Ignore files that disappear while a validation command is cleaning up.
+      }
+    }
+  };
+  for (const root of roots) visit(root, 0);
+  return files
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, limit)
+    .map((entry) => entry.path);
+}
+
+function collectRecentBrowserValidationArtifacts(repo: string | undefined): string[] {
+  return collectRecentBrowserValidationFiles(
+    repo,
+    /\.(?:png|jpe?g|webp|zip|json|txt|log|webm)$/i,
+    6,
+  ).map((entry) => toSingleLine(entry, 220));
+}
+
+function summarizeRecentBrowserValidationLogs(repo: string | undefined): string {
+  const logFiles = collectRecentBrowserValidationFiles(repo, /\.(?:log|txt)$/i, 3);
+  const summaries: string[] = [];
+  for (const logFile of logFiles) {
+    let content = "";
+    try {
+      content = readFileSync(logFile, "utf8");
+    } catch {
+      continue;
+    }
+    const lines = stripAnsiControlSequences(content)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) =>
+        /\b(Web end-to-end smoke test failed|Browser validation failed|Expected |locator\.|page\.|waiting for |Call log:|Verified:|Saved screenshot|Saved trace|ERR_SOCKET_BAD_PORT|EADDRINUSE|EPERM|EACCES|browserType\.launch|Expo exited early|freeport|net::ERR_|Validation command timed out|terminated by signal|SIGTERM|timed out after \d+ms)/i.test(
+          line,
+        ),
+      );
+    if (lines.length === 0) continue;
+    summaries.push(`${logFile}: ${lines.slice(-18).join(" | ")}`);
+  }
+  return toSingleLine(summaries.join(" | "), 1_400);
+}
+
+function mergeBrowserValidationArtifacts(...sources: Array<string[] | undefined>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const source of sources) {
+    for (const artifact of source ?? []) {
+      const clean = toSingleLine(artifact, 220);
+      if (!clean || seen.has(clean)) continue;
+      seen.add(clean);
+      out.push(clean);
+      if (out.length >= 8) return out;
+    }
+  }
+  return out;
+}
+
 function summarizeBrowserValidationOutput(text: string): string {
   const lines = stripAnsiControlSequences(text)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .filter((line) =>
-      /\b(Web end-to-end smoke test failed|Browser validation failed|Expected |locator\.|page\.|waiting for getBy|Call log:|ERR_SOCKET_BAD_PORT|EADDRINUSE|EPERM|EACCES|browserType\.launch|Executable doesn't exist|Expo exited early|freeport|net::ERR_|Validation command timed out|terminated by signal|SIGTERM|timed out after \d+ms)\b/i.test(
+      /\b(Web end-to-end smoke test failed|Browser validation failed|Expected |locator\.|page\.|waiting for getBy|Call log:|ERR_SOCKET_BAD_PORT|EADDRINUSE|EPERM|EACCES|browserType\.launch|Executable doesn't exist|Expo exited early|freeport|net::ERR_|Validation command timed out|terminated by signal|SIGTERM|timed out after \d+ms)/i.test(
         line,
       ),
     );
@@ -1776,6 +1907,7 @@ function summarizeBrowserValidationOutput(text: string): string {
 export function buildBrowserValidationRepairPacket(
   validationRuns: ValidationExecutionResult[],
   previousFailureDigests: Map<string, string> = new Map(),
+  repo?: string,
 ): BrowserValidationRepairPacket | null {
   for (const run of validationRuns) {
     if (run.ok || !isLongRunningBrowserValidationCommand(run.command)) continue;
@@ -1784,6 +1916,8 @@ export function buildBrowserValidationRepairPacket(
     const failureKind = classifyBrowserValidationFailureKindFromText(`${digest}\n${combined}`);
     if (failureKind === "unknown") continue;
     const previousDigest = previousFailureDigests.get(validationCommandKey(run.command)) ?? null;
+    const recentLogSummary = summarizeRecentBrowserValidationLogs(repo);
+    const enrichedBrowserContext = [combined, recentLogSummary].filter(Boolean).join("\n");
     const progress =
       previousDigest == null
         ? "first_failure"
@@ -1793,17 +1927,25 @@ export function buildBrowserValidationRepairPacket(
     return {
       command: run.command,
       failureKind,
-      stage: extractBrowserValidationStage(combined),
-      selector: extractBrowserValidationSelector(combined),
-      expected: extractBrowserValidationExpectedUi(combined),
+      stage: extractBrowserValidationStage(enrichedBrowserContext),
+      selector: extractBrowserValidationSelector(enrichedBrowserContext),
+      expected: extractBrowserValidationExpectedUi(enrichedBrowserContext),
       digest,
       previousDigest,
       previousStage: previousDigest ? extractBrowserValidationStage(previousDigest) : null,
       previousSelector: previousDigest ? extractBrowserValidationSelector(previousDigest) : null,
       previousExpected: previousDigest ? extractBrowserValidationExpectedUi(previousDigest) : null,
       progress,
-      artifacts: extractBrowserValidationArtifacts(combined),
-      output: summarizeBrowserValidationOutput(combined) || digest,
+      artifacts: mergeBrowserValidationArtifacts(
+        extractBrowserValidationArtifacts(combined),
+        collectRecentBrowserValidationArtifacts(repo),
+      ),
+      output: [
+        summarizeBrowserValidationOutput(combined) || digest,
+        recentLogSummary,
+      ]
+        .filter(Boolean)
+        .join(" | "),
     };
   }
   return null;
@@ -2663,7 +2805,10 @@ export function buildQualityRevisionHint(
       "Convergence rule: preserve stages that already passed, repair only the current failing browser stage, and stop after one targeted browser confirmation so the next ValidationGate run gets a clean signal.",
     );
     lines.push(
-      `Validation rerun rule: PushPals ValidationGate will rerun "${browserRepairPacket.command}" after the patch. During the edit turn, run focused fast checks first; only run the full browser command for one targeted confirmation and stop on the first clear stage failure.`,
+      "Executor sandbox rule: if the full browser command cannot run inside this edit turn because local server binding is denied or Expo/Playwright reports ERR_SOCKET_BAD_PORT, listen EPERM, EACCES, or a local port bind/freeport failure before reaching the app, treat that as a Codex executor verification limitation. Do not change app startup, ports, or browser provisioning for that local-only signal unless the ValidationGate failure above is also a startup/setup failure. Use the captured artifacts plus fast checks, then let ValidationGate perform the authoritative browser run.",
+    );
+    lines.push(
+      `Validation rerun rule: PushPals ValidationGate will rerun "${browserRepairPacket.command}" after the patch. During a focused browser repair turn, run fast non-browser checks and inspect captured artifacts first; do not run the full browser command from the Codex executor by default. Only run the full browser command for one targeted confirmation if artifacts are missing and a quick local bind/startup probe shows the browser server can actually run in this executor. Otherwise stop after fast checks so ValidationGate gets the clean authoritative signal.`,
     );
   }
   if (reviewFixContext) {
@@ -5421,10 +5566,9 @@ export async function executeJob(
   const qualityGatePolicy = deriveQualityGatePolicy(normalizedParams, runtimeConfig);
   const qualityMaxAutoRevisions = qualityGatePolicy.maxAutoRevisions;
   const qualityValidationMaxAutoRevisions = qualityGatePolicy.validationMaxAutoRevisions;
-  const qualityRevisionLoopMax = Math.max(
-    qualityMaxAutoRevisions,
-    qualityValidationMaxAutoRevisions,
-  );
+  const qualityRevisionLoopMax = qualityRevisionLoopUpperBound(qualityGatePolicy, {
+    browserValidation: taskRequestsBrowserValidation(normalizedParams),
+  });
   const qualitySoftPassOnExhausted = qualityGatePolicy.softPassOnExhausted;
   const qualityCriticMinScore = qualityGatePolicy.criticMinScore;
 
@@ -5565,6 +5709,7 @@ export async function executeJob(
     const browserRepairPacket = buildBrowserValidationRepairPacket(
       quality.validationRuns,
       previousValidationFailureDigests,
+      repo,
     );
     for (const run of quality.validationRuns) {
       if (run.ok) continue;
@@ -5722,7 +5867,7 @@ export async function executeJob(
         requiredValidationFailures: quality.requiredValidationFailures,
         blocker: quality.blocker,
         revisionAttempt,
-        maxAutoRevisions: qualityValidationMaxAutoRevisions,
+        maxAutoRevisions: activeMaxAutoRevisions,
         outsideTaskScope: validationOutsideTaskScope,
       });
       if (requiredValidationCanRevise) {
