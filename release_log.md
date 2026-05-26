@@ -2,20 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.1.1`
-- start_commit: `c15a6e9e9a0fca80a003772801f93e3ac2149e9b`
-- end_commit: `e0ef0245a6fd5dc4a7a1a70a7fd5a2b4ea6b95bb`
+- version: `v1.1.2`
+- start_commit: `755dab48ef4fc622754f8ebb920b171588f5e52a`
+- end_commit: `5b13253f36e2d86b496f07f7a5fa59c9b9ba1df8`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Improve WorkerPal browser-validation convergence for repo-native `web:e2e` jobs by turning browser failures into focused repair packets with stage, selector, expected UI, prior-failure breadcrumb, and relevant output.
-- Extend the browser-validation retry budget to five targeted repair attempts while keeping other ValidationGate failures on the configured retry budget.
-- Hydrate Docker WorkerPal ephemeral worktrees with repo dependency artifacts such as `node_modules`, so Expo/Playwright smoke checks run against the same installed dependencies as the source checkout.
-- Prevent sandbox artifacts, including linked `node_modules`, from being staged into WorkerPal commits.
-- Treat browser smoke harness scripts as test harnesses without forcing app-test positive/negative assertion-balance rules onto e2e launcher scripts.
-- Add `bun run replay:worker-job` for replaying a specific durable WorkerPal job against a running local PushPals server, making convergence bugs reproducible without running the full app workflow.
-- Confirmed the previously failing SectorCommand replay passed all required validation, including default `bun run web:e2e`, and produced a clean PR without committing `node_modules`.
+- Extend WorkerPal browser-validation convergence to eight targeted repair attempts while keeping non-browser and merge-conflict jobs on their configured revision limits.
+- Hydrate browser repair guidance from recent e2e/log artifacts, preserving stage, selector, expected UI, prior-failure breadcrumbs, and relevant output when command output is compacted.
+- Extend Docker WorkerPal job timeouts only for browser-validation jobs so the larger repair budget is not killed and restarted mid-convergence.
+- Tighten OpenAI Codex WorkerPal guidance so long browser/e2e validation is delegated to ValidationGate by default, avoiding executor-only port/freeport false signals.
+- Add regression coverage for browser retry scoping, dynamic Docker timeouts, artifact-backed repair packets, and prompt guidance.
 
 ## Validation
 
