@@ -8415,7 +8415,7 @@ function buildExecutionGuidance(plan, targetPaths, requiredValidationSteps = [])
   const lines = [];
   const targets = normalizePathHints(targetPaths.length > 0 ? targetPaths : plan.scope.write_globs ?? []);
   if (targets.length > 0) {
-    lines.push("Target paths / starting points:");
+    lines.push("Suggested starting points:");
     for (const path of targets)
       lines.push(`- ${path}`);
     lines.push("Path handling:");

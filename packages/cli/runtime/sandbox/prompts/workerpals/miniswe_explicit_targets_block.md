@@ -1,2 +1,2 @@
-Target path hints:
+Suggested starting points:
 {{targets_block}}

@@ -454,7 +454,7 @@ function buildExecutionGuidance(
     targetPaths.length > 0 ? targetPaths : (plan.scope.write_globs ?? []),
   );
   if (targets.length > 0) {
-    lines.push("Target paths / starting points:");
+    lines.push("Suggested starting points:");
     for (const path of targets) lines.push(`- ${path}`);
     lines.push("Path handling:");
     lines.push("- Treat all target paths as repo-relative to the current working directory.");

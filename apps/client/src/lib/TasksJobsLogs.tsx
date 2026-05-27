@@ -256,7 +256,13 @@ function extractTrace(job: Job, logs: LogLine[]): TraceEntry[] {
       appendTraceFromText(entries, seen, "request", `Instruction: ${instruction}`, "reasoning");
     }
     if (targetPath) {
-      appendTraceFromText(entries, seen, "request", `Target path: ${targetPath}`, "action");
+      appendTraceFromText(
+        entries,
+        seen,
+        "request",
+        `Suggested starting point: ${targetPath}`,
+        "action",
+      );
     }
   }
 

@@ -351,11 +351,11 @@ def _build_path_handling_message(target_paths: List[str], repo: str) -> str:
         "- The current working directory is the repository root.\n"
         "- Prefer the repo-relative paths for shell commands.\n"
         "- If FileEditor rejects a repo-relative path, retry with the matching absolute path.\n"
-        "- Do not run broad filesystem scans when concrete target paths are listed.\n"
+        "- Start with these concrete paths before broad scans; expand discovery when the behavior lives elsewhere.\n"
         "- These paths are starting points, not hard write boundaries; edit other behavior-owning files when needed and explain why.\n"
-        "Target path hints (repo-relative):\n"
+        "Suggested starting points (repo-relative):\n"
         f"{listed_rel}\n"
-        "Target path hints (absolute):\n"
+        "Suggested starting points (absolute):\n"
         f"{listed_abs}"
     )
 
