@@ -92,12 +92,15 @@ export interface BrowserValidationRepairPacket {
   stage: string | null;
   selector: string | null;
   expected: string | null;
+  failureFocus: string | null;
   digest: string;
   previousDigest: string | null;
   previousStage: string | null;
   previousSelector: string | null;
   previousExpected: string | null;
+  previousFailureFocus: string | null;
   progress: "first_failure" | "same_failure" | "new_failure";
+  needsDiagnosticProbe: boolean;
   artifacts: string[];
   output: string;
 }
@@ -1705,7 +1708,46 @@ function extractBrowserValidationStage(text: string): string | null {
     const value = match?.[1]?.trim();
     if (value) return toSingleLine(value, 80);
   }
+  const verifiedStages = [...text.matchAll(/\bVerified:\s+([^|\r\n]+)/gi)]
+    .map((match) => match[1]?.trim())
+    .filter((entry): entry is string => Boolean(entry));
+  const lastVerifiedStage = verifiedStages.at(-1);
+  if (lastVerifiedStage) return toSingleLine(lastVerifiedStage, 80);
   return null;
+}
+
+function inferBrowserValidationFailureFocus(params: {
+  stage?: string | null;
+  selector?: string | null;
+  expected?: string | null;
+  text?: string | null;
+}): string | null {
+  const combined = stripAnsiControlSequences(
+    [params.stage, params.selector, params.expected, params.text].filter(Boolean).join(" "),
+  ).toLowerCase();
+  if (!combined.trim()) return null;
+
+  const focusRules: Array<[RegExp, string]> = [
+    [/\b(settings|ui[-\s]?size|scale(?:\s+option)?|settings-ui-|large ui option|medium|compact)\b/i, "settings UI size"],
+    [/\b(shop|skin|ship-option|projectile-option)\b/i, "shop navigation"],
+    [/\b(home|shell|home-screen|home-play|play button|landing)\b/i, "home shell"],
+    [/\b(match[-\s]?entry|start match|game-screen|countdown)\b/i, "match entry"],
+    [/\b(in[-\s]?game|game-control|help-menu|planet|deploy|allocation|resource|decoy|attack|defense|tank)\b/i, "in-game UI"],
+  ];
+  for (const [pattern, label] of focusRules) {
+    if (pattern.test(combined)) return label;
+  }
+
+  const stableLocatorMatch = combined.match(/\b(?:getbytestid|data-testid|testid)\(?['"`]?([a-z0-9_-]+)/i);
+  if (stableLocatorMatch?.[1]) return `test id ${stableLocatorMatch[1]}`;
+
+  const compact = combined
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 5)
+    .join(" ");
+  return compact ? toSingleLine(compact, 80) : null;
 }
 
 function extractBalancedLocatorCall(text: string): string | null {
@@ -1918,24 +1960,52 @@ export function buildBrowserValidationRepairPacket(
     const previousDigest = previousFailureDigests.get(validationCommandKey(run.command)) ?? null;
     const recentLogSummary = summarizeRecentBrowserValidationLogs(repo);
     const enrichedBrowserContext = [combined, recentLogSummary].filter(Boolean).join("\n");
+    const stage = extractBrowserValidationStage(enrichedBrowserContext);
+    const selector = extractBrowserValidationSelector(enrichedBrowserContext);
+    const expected = extractBrowserValidationExpectedUi(enrichedBrowserContext);
+    const previousStage = previousDigest ? extractBrowserValidationStage(previousDigest) : null;
+    const previousSelector = previousDigest ? extractBrowserValidationSelector(previousDigest) : null;
+    const previousExpected = previousDigest ? extractBrowserValidationExpectedUi(previousDigest) : null;
+    const failureFocus = inferBrowserValidationFailureFocus({
+      stage,
+      selector,
+      expected,
+      text: enrichedBrowserContext,
+    });
+    const previousFailureFocus = previousDigest
+      ? inferBrowserValidationFailureFocus({
+          stage: previousStage,
+          selector: previousSelector,
+          expected: previousExpected,
+          text: previousDigest,
+        })
+      : null;
     const progress =
       previousDigest == null
         ? "first_failure"
         : previousDigest === digest
           ? "same_failure"
           : "new_failure";
+    const needsDiagnosticProbe =
+      failureKind === "assertion" &&
+      Boolean(previousDigest) &&
+      Boolean(failureFocus) &&
+      failureFocus === previousFailureFocus;
     return {
       command: run.command,
       failureKind,
-      stage: extractBrowserValidationStage(enrichedBrowserContext),
-      selector: extractBrowserValidationSelector(enrichedBrowserContext),
-      expected: extractBrowserValidationExpectedUi(enrichedBrowserContext),
+      stage,
+      selector,
+      expected,
+      failureFocus,
       digest,
       previousDigest,
-      previousStage: previousDigest ? extractBrowserValidationStage(previousDigest) : null,
-      previousSelector: previousDigest ? extractBrowserValidationSelector(previousDigest) : null,
-      previousExpected: previousDigest ? extractBrowserValidationExpectedUi(previousDigest) : null,
+      previousStage,
+      previousSelector,
+      previousExpected,
+      previousFailureFocus,
       progress,
+      needsDiagnosticProbe,
       artifacts: mergeBrowserValidationArtifacts(
         extractBrowserValidationArtifacts(combined),
         collectRecentBrowserValidationArtifacts(repo),
@@ -2729,6 +2799,9 @@ export function buildQualityRevisionHint(
       "- First action: inspect the captured browser output/artifacts and actual rendered UI before editing; do not guess from component names or intended copy.",
     );
     if (browserRepairPacket.stage) lines.push(`- Stage: ${browserRepairPacket.stage}`);
+    if (browserRepairPacket.failureFocus) {
+      lines.push(`- Failure focus: ${browserRepairPacket.failureFocus}`);
+    }
     if (browserRepairPacket.expected) {
       lines.push(`- Expected UI: ${browserRepairPacket.expected}`);
     }
@@ -2773,6 +2846,17 @@ export function buildQualityRevisionHint(
     } else {
       lines.push("- Breadcrumb: first captured failure for this command in this revision loop");
     }
+    if (browserRepairPacket.needsDiagnosticProbe) {
+      lines.push(
+        "- Convergence mode: diagnostic-first repair. This same browser focus failed in the previous revision, so do not guess another selector or rewrite a different stage.",
+      );
+      lines.push(
+        "- Diagnostic requirement: before editing again, inspect or add a tiny temporary diagnostic around the failing stage that records locator counts, visible textContent, role/ARIA attributes, data-testid values, and a nearby DOM snippet for the candidate nodes.",
+      );
+      lines.push(
+        "- React Native Web note: screenshots can show the intended state while Playwright reads a duplicate or stale rendered node. Prefer one unique selected-state test id or a semantic checked attribute on the stable pressable, then assert locator count and visibility.",
+      );
+    }
     if (browserRepairPacket.output) {
       lines.push(`- Relevant output: ${browserRepairPacket.output}`);
     }
@@ -2807,9 +2891,15 @@ export function buildQualityRevisionHint(
     lines.push(
       "Executor sandbox rule: if the full browser command cannot run inside this edit turn because local server binding is denied or Expo/Playwright reports ERR_SOCKET_BAD_PORT, listen EPERM, EACCES, or a local port bind/freeport failure before reaching the app, treat that as a Codex executor verification limitation. Do not change app startup, ports, or browser provisioning for that local-only signal unless the ValidationGate failure above is also a startup/setup failure. Use the captured artifacts plus fast checks, then let ValidationGate perform the authoritative browser run.",
     );
-    lines.push(
-      `Validation rerun rule: PushPals ValidationGate will rerun "${browserRepairPacket.command}" after the patch. During a focused browser repair turn, run fast non-browser checks and inspect captured artifacts first; do not run the full browser command from the Codex executor by default. Only run the full browser command for one targeted confirmation if artifacts are missing and a quick local bind/startup probe shows the browser server can actually run in this executor. Otherwise stop after fast checks so ValidationGate gets the clean authoritative signal.`,
-    );
+    if (browserRepairPacket.needsDiagnosticProbe) {
+      lines.push(
+        `Validation rerun rule: PushPals ValidationGate will rerun "${browserRepairPacket.command}" after the patch, but this is now a repeated browser assertion. If a quick local startup probe shows the browser server can run in this executor, run one targeted "${browserRepairPacket.command}" confirmation after the DOM-backed fix. Do not hand off another unverified selector guess.`,
+      );
+    } else {
+      lines.push(
+        `Validation rerun rule: PushPals ValidationGate will rerun "${browserRepairPacket.command}" after the patch. During a focused browser repair turn, run fast non-browser checks and inspect captured artifacts first; do not run the full browser command from the Codex executor by default. Only run the full browser command for one targeted confirmation if artifacts are missing and a quick local bind/startup probe shows the browser server can actually run in this executor. Otherwise stop after fast checks so ValidationGate gets the clean authoritative signal.`,
+      );
+    }
   }
   if (reviewFixContext) {
     lines.push("Rejected PR retry requirements:");

@@ -297,6 +297,71 @@ describe("workerpals quality gate critic issue formatting", () => {
     }
   });
 
+  test("switches repeated browser assertion failures to diagnostic-first guidance", () => {
+    const previous = new Map<string, string>([
+      [
+        "bun run web:e2e",
+        'Web end-to-end smoke test failed: Error: Expected selected large UI option to include [x], found "Large (Game UI Style)[ ]".',
+      ],
+    ]);
+    const packet = buildBrowserValidationRepairPacket(
+      [
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr: [
+            'Web end-to-end smoke test failed: Error: Expected selected large UI option marker to include "[x]", found "[ ]".',
+            "Verified: settings screen",
+            "Verified: settings UI size section",
+            "Saved screenshot: /repo/outputs/web-e2e/02-settings.png",
+          ].join("\n"),
+          elapsedMs: 133_942,
+        },
+      ],
+      previous,
+    );
+
+    expect(packet).toMatchObject({
+      command: "bun run web:e2e",
+      failureKind: "assertion",
+      stage: "settings UI size section",
+      failureFocus: "settings UI size",
+      previousFailureFocus: "settings UI size",
+      needsDiagnosticProbe: true,
+    });
+
+    const hint = buildQualityRevisionHint(
+      ["ValidationGate: Required vision.md validation failed: bun run web:e2e exited 1."],
+      null,
+      {
+        intent: "code_change",
+        riskLevel: "medium",
+        scope: { readAnywhere: true, writeAllowed: true },
+        acceptanceCriteria: [],
+        validationSteps: ["bun run web:e2e"],
+        requiredValidationSteps: ["bun run web:e2e"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [],
+      null,
+      packet,
+    );
+
+    expect(hint).toContain("Convergence mode: diagnostic-first repair");
+    expect(hint).toContain("do not guess another selector");
+    expect(hint).toContain("locator counts");
+    expect(hint).toContain("nearby DOM snippet");
+    expect(hint).toContain("React Native Web note");
+    expect(hint).toContain("Do not hand off another unverified selector guess.");
+  });
+
   test("classifies killed browser smoke commands as runtime repair packets", () => {
     const packet = buildBrowserValidationRepairPacket([
       {
@@ -491,12 +556,15 @@ describe("workerpals quality gate critic issue formatting", () => {
           stage: "shell",
           selector: "getByTestId('home-screen')",
           expected: "home screen",
+          failureFocus: "home shell",
           digest: "Browser validation failed during shell stage",
           previousDigest: null,
           previousStage: null,
           previousSelector: null,
           previousExpected: null,
+          previousFailureFocus: null,
           progress: "first_failure",
+          needsDiagnosticProbe: false,
           artifacts: [],
           output: "Web end-to-end smoke test failed",
         },
