@@ -2,22 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.1.2`
-- start_commit: `755dab48ef4fc622754f8ebb920b171588f5e52a`
-- end_commit: `5b13253f36e2d86b496f07f7a5fa59c9b9ba1df8`
+- version: `v1.1.3`
+- start_commit: `c807176ae9e14114dd66385e5b6e11cf0baacaf1`
+- end_commit: `f4d971000ec54b12f02baa786ec29780d023d1d4`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Extend WorkerPal browser-validation convergence to eight targeted repair attempts while keeping non-browser and merge-conflict jobs on their configured revision limits.
-- Hydrate browser repair guidance from recent e2e/log artifacts, preserving stage, selector, expected UI, prior-failure breadcrumbs, and relevant output when command output is compacted.
-- Extend Docker WorkerPal job timeouts only for browser-validation jobs so the larger repair budget is not killed and restarted mid-convergence.
-- Tighten OpenAI Codex WorkerPal guidance so long browser/e2e validation is delegated to ValidationGate by default, avoiding executor-only port/freeport false signals.
-- Add regression coverage for browser retry scoping, dynamic Docker timeouts, artifact-backed repair packets, and prompt guidance.
+- Improve WorkerPal browser-validation convergence for repeated Playwright/browser assertion failures by shifting repair guidance toward diagnostic-first investigation after repeated misses.
+- Preserve exact browser failure context while nudging later repair attempts to inspect screenshots, artifacts, DOM state, and current e2e harness behavior before changing assertions again.
+- Keep the expanded browser repair loop scoped to true browser validation failures so normal validation and non-browser quality gates retain their configured retry behavior.
+- Add regression coverage for repeated browser assertion guidance and convergence behavior.
 
 ## Validation
 
 - `bun run cli:bundle`
+- `bun test tests/remotebuddy.task-dedupe.test.ts`
 - `bun run test:root`
 - `git diff --check`
 
