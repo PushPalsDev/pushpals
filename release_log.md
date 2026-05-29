@@ -2,28 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.1.4`
-- start_commit: `d02f95b87ec91bbb13cdb65f2413ad735628178b`
-- end_commit: `37b3765c507d598281ce74c4dc83922f63a6b7fa`
-- commits_in_range: `2`
+- version: `v1.1.5`
+- start_commit: `00cd6e2a1e847dd9fb5c89fed53eee2e51c9ee34`
+- end_commit: `d15c5855e36d4cd52b7ccb829e7227dc1559b0db`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Treat task target paths and write globs as relevance hints rather than hard WorkerPal write boundaries, while preserving review and quality gates as the enforcement layer.
-- Improve browser-validation convergence by recognizing successful browser smoke sentinels and terminating leaked child process trees instead of waiting for a ValidationGate timeout.
-- Route Playwright/browser assertion failures back to WorkerPal as task-scope repair instructions, so workers fix failing smoke behavior instead of treating it as an unrelated repo blocker.
-- Preserve a fully validated patch during post-validation ScopeGate/CriticGate cleanup, avoiding late rewrites that can destabilize a passing browser path.
-- Hand Codex-produced patches to ValidationGate/CriticGate when shell-wrapper command rejections happen after file changes, rather than burning the full executor timeout on recovery retries.
-- Add regression coverage for browser success-sentinel shutdown, browser assertion failure scoping, validation-preserving cleanup guidance, and Codex shell-wrapper convergence.
+- Bound SourceControlManager startup git binary and remote inspection probes so CLI startup cannot hang indefinitely after RemoteBuddy and WorkerPal are already alive.
+- Treat inconclusive SourceControlManager remote inspection as a startup warning and skip SCM startup instead of blocking the whole embedded runtime.
+- Preserve a hard failure only when the configured PushPals branch is conclusively missing from an otherwise reachable remote.
+- Add regression coverage for a stuck SCM remote inspection to prove the startup precheck returns within the configured timeout budget.
 
 ## Validation
 
-- `bun run cli:bundle`
-- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`
-- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
+- `bun test tests/cli.invocation-logging.test.ts tests/cli.runtime-bootstrap.test.ts tests/client.runtime-bootstrap.test.ts tests/shared.client-preflight.test.ts`
 - `bun run test:root`
+- `bun run cli:bundle`
 - `git diff --check`
-- Local replay of SectorCommand job `59cfcfcd-7c17-41a7-950a-a28d24f0d0ef` completed as replay job `6792fd2f-284b-475d-b4b0-005bb3c38ccb`; ValidationGate passed `bun test`, `bun x tsc --noEmit`, `bun run lint`, and `bun run web:e2e`, then opened `https://github.com/PiyushDatta/SectorCommand/pull/53`.
+- Constrained Windows startup smoke from `C:\Users\data_pi\Documents\programming\SectorCommand` with WorkerPal/autonomy disabled and a missing SCM remote reached `Embedded runtime is ready` with `source_control_manager=64ms(skipped_no_remote)` and no lingering PushPals runtime processes.
 
 ## Install
 
