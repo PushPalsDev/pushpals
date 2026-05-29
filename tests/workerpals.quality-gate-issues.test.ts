@@ -167,6 +167,57 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("Cannot find module '../../tests/reactNativeMock'");
   });
 
+  test("freezes the validated patch when requesting post-validation cleanup", () => {
+    const hint = buildQualityRevisionHint(
+      ["Critic score 7.0 is below required threshold 8."],
+      {
+        score: 7,
+        findings: ["Clean up an accidental artifact."],
+        mustFix: ["Remove generated node_modules changes."],
+        revisionGuidance: "Keep the implementation unchanged.",
+        raw: "{}",
+      },
+      {
+        intent: "code_change",
+        riskLevel: "medium",
+        scope: { readAnywhere: true, writeAllowed: true },
+        acceptanceCriteria: [],
+        validationSteps: ["bun test", "bun run web:e2e"],
+        requiredValidationSteps: ["bun test", "bun run web:e2e"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [
+        {
+          step: "bun test",
+          command: "bun test",
+          ok: true,
+          exitCode: 0,
+          stdout: "tests passed",
+          stderr: "",
+          elapsedMs: 120,
+        },
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: true,
+          exitCode: 0,
+          stdout: "Web end-to-end smoke test completed successfully.",
+          stderr: "",
+          elapsedMs: 80_000,
+        },
+      ],
+    );
+
+    expect(hint).toContain("Validation-preserving cleanup mode");
+    expect(hint).toContain("Treat the validated patch and browser path as frozen");
+    expect(hint).toContain("Do not rewrite app behavior, route flow, browser smoke selectors");
+    expect(hint).toContain("Remove generated node_modules changes.");
+  });
+
   test("builds focused browser validation repair packets with progress breadcrumbs", () => {
     const previous = new Map<string, string>([
       [

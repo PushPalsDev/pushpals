@@ -763,6 +763,7 @@ function captureValidationStream(
 }
 
 const DEFAULT_BROWSER_VALIDATION_FAILURE_IDLE_MS = 15_000;
+const DEFAULT_BROWSER_VALIDATION_SUCCESS_IDLE_MS = 1_000;
 
 function browserValidationFailureIdleMs(env: Record<string, string>): number {
   const configured = Number(env.PUSHPALS_VALIDATION_FAILURE_IDLE_MS ?? "");
@@ -770,6 +771,14 @@ function browserValidationFailureIdleMs(env: Record<string, string>): number {
     return Math.min(120_000, Math.trunc(configured));
   }
   return DEFAULT_BROWSER_VALIDATION_FAILURE_IDLE_MS;
+}
+
+function browserValidationSuccessIdleMs(env: Record<string, string>): number {
+  const configured = Number(env.PUSHPALS_VALIDATION_SUCCESS_IDLE_MS ?? "");
+  if (Number.isFinite(configured) && configured >= 250) {
+    return Math.min(120_000, Math.trunc(configured));
+  }
+  return DEFAULT_BROWSER_VALIDATION_SUCCESS_IDLE_MS;
 }
 
 function hasBrowserValidationFailureSignal(output: string): boolean {
@@ -793,6 +802,17 @@ function hasBrowserValidationFailureSignal(output: string): boolean {
     /\blisten\s+EPERM\b/i,
     /\bEADDRINUSE\b/i,
     /\berror:\s+script\s+"[^"]+"\s+exited with code\s+\d+/i,
+  ];
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function hasBrowserValidationSuccessSignal(output: string): boolean {
+  const text = String(output ?? "");
+  if (!text.trim()) return false;
+  const patterns = [
+    /\bWeb end-to-end smoke test completed successfully\./i,
+    /\bWeb smoke test completed successfully\./i,
+    /\bBrowser smoke test completed successfully\./i,
   ];
   return patterns.some((pattern) => pattern.test(text));
 }
@@ -823,6 +843,7 @@ export async function runValidationArgv(
   const stderrCapture = captureValidationStream(proc.stderr, noteOutput);
   let timedOut = false;
   let stoppedAfterFailureSignal = false;
+  let stoppedAfterSuccessSignal = false;
   const timeout = Math.max(1_000, timeoutMs);
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<{ type: "timeout" }>((resolveTimeout) => {
@@ -832,18 +853,27 @@ export async function runValidationArgv(
     }, timeout);
   });
 
-  let failureSignalTimer: ReturnType<typeof setInterval> | null = null;
-  const failureSignalPromise = isLongRunningBrowserValidationCommand(command)
-    ? new Promise<{ type: "failure-signal" }>((resolveFailureSignal) => {
+  let browserSignalTimer: ReturnType<typeof setInterval> | null = null;
+  const browserSignalPromise = isLongRunningBrowserValidationCommand(command)
+    ? new Promise<{ type: "failure-signal" | "success-signal" }>((resolveBrowserSignal) => {
         const idleMs = browserValidationFailureIdleMs(env);
-        failureSignalTimer = setInterval(() => {
+        const successIdleMs = browserValidationSuccessIdleMs(env);
+        browserSignalTimer = setInterval(() => {
           const combinedOutput = `${stdoutCapture.text()}\n${stderrCapture.text()}`;
           if (
             hasBrowserValidationFailureSignal(combinedOutput) &&
             Date.now() - lastOutputAt >= idleMs
           ) {
             stoppedAfterFailureSignal = true;
-            resolveFailureSignal({ type: "failure-signal" });
+            resolveBrowserSignal({ type: "failure-signal" });
+            return;
+          }
+          if (
+            hasBrowserValidationSuccessSignal(combinedOutput) &&
+            Date.now() - lastOutputAt >= successIdleMs
+          ) {
+            stoppedAfterSuccessSignal = true;
+            resolveBrowserSignal({ type: "success-signal" });
           }
         }, 250);
       })
@@ -854,12 +884,12 @@ export async function runValidationArgv(
   const exitOrTimeout = await Promise.race([
     proc.exited.then((code) => ({ type: "exit" as const, code })),
     timeoutPromise,
-    failureSignalPromise,
+    browserSignalPromise,
   ]);
   if (timeoutTimer) clearTimeout(timeoutTimer);
-  if (failureSignalTimer) clearInterval(failureSignalTimer);
+  if (browserSignalTimer) clearInterval(browserSignalTimer);
 
-  if (timedOut || stoppedAfterFailureSignal) {
+  if (timedOut || stoppedAfterFailureSignal || stoppedAfterSuccessSignal) {
     await terminateValidationProcessTree(proc);
   }
 
@@ -868,9 +898,11 @@ export async function runValidationArgv(
       ? 124
       : exitOrTimeout.type === "failure-signal"
         ? 1
+        : exitOrTimeout.type === "success-signal"
+          ? 0
         : exitOrTimeout.code;
 
-  if (!timedOut && !stoppedAfterFailureSignal) {
+  if (!timedOut && !stoppedAfterFailureSignal && !stoppedAfterSuccessSignal) {
     await Promise.race([
       Promise.all([stdoutCapture.promise, stderrCapture.promise]),
       Bun.sleep(1_000),
@@ -1394,6 +1426,15 @@ export function classifyValidationFailureScope(
     .flatMap((run) => [run.stdout, run.stderr])
     .filter(Boolean)
     .join("\n");
+  if (
+    failedRuns.some(
+      (run) =>
+        isLongRunningBrowserValidationCommand(run.command) &&
+        isBrowserAssertionDigest([run.stdout, run.stderr].filter(Boolean).join("\n")),
+    )
+  ) {
+    return "task_scope";
+  }
   const lowerCombined = combined.toLowerCase().replace(/\\/g, "/");
   for (const hint of scopeHints) {
     const normalized = literalScopePrefix(hint);
@@ -2791,6 +2832,19 @@ export function buildQualityRevisionHint(
   const lines: string[] = [];
   lines.push("Quality revision required before completion.");
   const focusedBrowserRepair = Boolean(browserRepairPacket);
+  const validationAlreadyPassed =
+    validationRuns.length > 0 && validationRuns.every((run) => run.ok);
+  if (validationAlreadyPassed && !focusedBrowserRepair) {
+    lines.push(
+      "Validation-preserving cleanup mode: the previous ValidationGate pass succeeded. Treat the validated patch and browser path as frozen; address only the listed ScopeGate/CriticGate cleanup with the smallest possible diff.",
+    );
+    lines.push(
+      "Do not rewrite app behavior, route flow, browser smoke selectors, validation scripts, or unrelated tests unless the listed cleanup explicitly requires that exact change.",
+    );
+    lines.push(
+      "After the cleanup, run fast focused checks if useful and let PushPals ValidationGate rerun the full required validation set.",
+    );
+  }
   if (browserRepairPacket) {
     lines.push("Primary ValidationGate repair objective:");
     lines.push(`- Command: ${browserRepairPacket.command}`);

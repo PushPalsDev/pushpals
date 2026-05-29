@@ -292,6 +292,37 @@ describe("workerpals validation command safety", () => {
     ).toBe("task_scope");
   });
 
+  test("treats browser assertion failures as repairable task-scope validation", () => {
+    const planning = planningFixture({
+      targetPaths: ["app/game.tsx"],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["app/game.tsx"],
+      },
+    }) as any;
+
+    expect(
+      classifyValidationFailureScope(
+        [
+          {
+            step: "bun run web:e2e",
+            command: "bun run web:e2e",
+            ok: false,
+            exitCode: 1,
+            stdout: "Verified: settings screen",
+            stderr:
+              "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n - waiting for getByTestId('home-screen').last() to be visible",
+            elapsedMs: 133_253,
+          },
+        ],
+        planning,
+        ["app/game.tsx"],
+        "app/game.tsx",
+      ),
+    ).toBe("task_scope");
+  });
+
   test("does not treat scope globs as hard sandbox write boundaries", () => {
     const planning = planningFixture({
       scope: {
@@ -410,6 +441,41 @@ describe("workerpals validation command safety", () => {
       );
       expect(result.stderr).toContain("waiting for getByTestId('home-screen')");
       expect(result.stderr).toContain("browser/e2e failure signal");
+      expect(result.stderr).not.toContain("validation timed out");
+      expect(result.elapsedMs).toBeLessThan(3_500);
+      expect(Date.now() - startedAt).toBeLessThan(3_500);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("terminates idle browser validations after a captured success signal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-idle-browser-success-"));
+    const script = [
+      "console.log('Verified: home screen');",
+      "console.log('Verified: return to home from game');",
+      "console.log('Web end-to-end smoke test completed successfully.');",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const startedAt = Date.now();
+
+    try {
+      const result = await runValidationArgv(
+        root,
+        "bun run web:e2e",
+        [process.execPath, "-e", script],
+        {
+          ...(process.env as Record<string, string>),
+          PUSHPALS_VALIDATION_SUCCESS_IDLE_MS: "500",
+        },
+        10_000,
+        {},
+        "validation timed out",
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Web end-to-end smoke test completed successfully.");
       expect(result.stderr).not.toContain("validation timed out");
       expect(result.elapsedMs).toBeLessThan(3_500);
       expect(Date.now() - startedAt).toBeLessThan(3_500);

@@ -450,6 +450,79 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("# wrapper bootstrap test", guidance)
         self.assertNotIn("git diff --output=leak.txt", guidance)
 
+    def test_run_codex_task_hands_changed_worktree_to_gates_after_wrapper_loop(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-changed-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# wrapper changed test\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed wrapper changed repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_wrapper_changed.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "sys.stdin.read()",
+                        "Path('src').mkdir(exist_ok=True)",
+                        "Path('src/change.txt').write_text('changed before wrapper loop\\n', encoding='utf-8')",
+                        "for line in (",
+                        "    'error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess { message: \"Rejected\" }',",
+                        "    'error=exec_command failed for `/bin/bash -lc \\'git status --porcelain\\'`: CreateProcess { message: \"Rejected\" }',",
+                        "    'error=exec_command failed for `/bin/bash -lc \\'sed -n 1,40p README.md\\'`: CreateProcess { message: \"Rejected\" }',",
+                        "):",
+                        "    print(line, file=sys.stderr, flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-wrapper-changed-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "10",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Create a small file and inspect the repo.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("before shell-wrapper command rejections", str(result.get("summary") or ""))
+        self.assertIn("ValidationGate/CriticGate", str(result.get("stdout") or ""))
+        self.assertIn("src/", str(result.get("stdout") or ""))
+        self.assertNotIn("Recovered after Codex attempts", str(result.get("stdout") or ""))
+
     def test_run_codex_task_escalates_wrapper_recovery_and_recovers(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-recovery-") as temp_dir:
             repo = Path(temp_dir) / "repo"

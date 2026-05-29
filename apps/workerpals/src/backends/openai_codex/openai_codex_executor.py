@@ -1432,6 +1432,37 @@ def _merge_usage_records(first: Any, second: Any) -> Dict[str, Any]:
     return merged
 
 
+def _codex_changed_paths(repo: str, baseline_snapshot: List[str]) -> Tuple[List[str], List[str], List[str]]:
+    changed_paths = summarize_git_changes(repo)
+    delta = [p for p in changed_paths if p not in baseline_snapshot]
+    effective = delta if delta else changed_paths
+    return changed_paths, delta, effective
+
+
+def _build_success_stdout(
+    *,
+    effective_paths: List[str],
+    last_message: str,
+    trace_excerpt: str,
+    prefix: str = "",
+) -> str:
+    stdout_parts: List[str] = []
+    if prefix.strip():
+        stdout_parts.append(prefix.strip())
+    if last_message:
+        stdout_parts.append(last_message)
+    elif trace_excerpt:
+        stdout_parts.append(trace_excerpt)
+    if effective_paths:
+        listed = "\n".join(f"- {path}" for path in effective_paths[:40])
+        if len(effective_paths) > 40:
+            listed += "\n- ..."
+        stdout_parts.append(f"Changed files:\n{listed}")
+    if not stdout_parts:
+        stdout_parts.append("No modified files were detected after execution.")
+    return "\n\n".join(stdout_parts)
+
+
 def _augment_supplemental_guidance(supplemental_guidance: List[str]) -> List[str]:
     normalized = [str(item or "").strip() for item in supplemental_guidance if str(item or "").strip()]
     joined = "\n".join(normalized).lower()
@@ -1854,6 +1885,60 @@ def _run_codex_task(
         log_git_status(repo, log)
 
         if command_policy_rejection_loop:
+            _, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+            if effective_paths:
+                policy_signal = _detect_codex_workaround_signal(last_message)
+                if not policy_signal and not last_message.strip():
+                    policy_signal = _detect_codex_workaround_signal(stdout)
+                if policy_signal:
+                    detail = (
+                        "Codex CLI is mandatory in this backend, but worker output suggests a workaround "
+                        f"instead of hard-failing: {policy_signal!r}. "
+                        "Return an explicit failure if Codex auth/execution is unavailable."
+                    )
+                    if last_message:
+                        detail = f"{detail}\nLast assistant message:\n{last_message}"
+                    if trace_excerpt:
+                        detail = f"{detail}\n{trace_excerpt}"
+                    return {
+                        "ok": False,
+                        "summary": "openai_codex policy violation: Codex CLI workaround detected",
+                        "stdout": _truncate(stdout),
+                        "stderr": _truncate(detail),
+                        "exitCode": 5,
+                        "usage": usage,
+                    }
+
+                command_lines = (
+                    "\n".join(f"- {command}" for command in rejected_shell_wrappers[:6])
+                    if rejected_shell_wrappers
+                    else "- (no command details captured)"
+                )
+                log.warning(
+                    "Codex hit a shell-wrapper rejection loop after producing file changes; "
+                    "returning the patch to QualityGate instead of spending another Codex retry."
+                )
+                return {
+                    "ok": True,
+                    "summary": (
+                        "Executed task and modified "
+                        f"{len(effective_paths)} file(s) before shell-wrapper command rejections"
+                    ),
+                    "stdout": _build_success_stdout(
+                        effective_paths=effective_paths,
+                        last_message=last_message,
+                        trace_excerpt=trace_excerpt,
+                        prefix=(
+                            "Codex produced file changes before hitting command-router shell-wrapper "
+                            "rejections. The patch is being handed to ValidationGate/CriticGate for "
+                            f"normal repair instead of restarting Codex.\nRejected commands:\n{command_lines}"
+                        ),
+                    ),
+                    "stderr": "",
+                    "exitCode": 0,
+                    "usage": usage,
+                }
+
             if wrapper_recovery_attempt < _MAX_WRAPPER_RECOVERY_ATTEMPTS:
                 hard_recovery = wrapper_recovery_attempt >= 1
                 recovery_guidance = _build_wrapper_recovery_guidance(
@@ -2018,34 +2103,29 @@ def _run_codex_task(
                 "usage": usage,
             }
 
-        changed_paths = summarize_git_changes(repo)
-        delta = [p for p in changed_paths if p not in baseline_snapshot]
-        effective = delta if delta else changed_paths
-        stdout_parts: List[str] = []
-        if last_message:
-            stdout_parts.append(last_message)
-        elif trace_excerpt:
-            stdout_parts.append(trace_excerpt)
+        _, _, effective = _codex_changed_paths(repo, baseline_snapshot)
         if effective:
-            listed = "\n".join(f"- {path}" for path in effective[:40])
-            if len(effective) > 40:
-                listed += "\n- ..."
-            stdout_parts.append(f"Changed files:\n{listed}")
             return {
                 "ok": True,
                 "summary": f"Executed task and modified {len(effective)} file(s)",
-                "stdout": "\n\n".join(stdout_parts),
+                "stdout": _build_success_stdout(
+                    effective_paths=effective,
+                    last_message=last_message,
+                    trace_excerpt=trace_excerpt,
+                ),
                 "stderr": "",
                 "exitCode": 0,
                 "usage": usage,
             }
 
-        if not stdout_parts:
-            stdout_parts.append("No modified files were detected after execution.")
         return {
             "ok": True,
             "summary": "Executed task via openai_codex (no file changes detected)",
-            "stdout": "\n\n".join(stdout_parts),
+            "stdout": _build_success_stdout(
+                effective_paths=[],
+                last_message=last_message,
+                trace_excerpt=trace_excerpt,
+            ),
             "stderr": "",
             "exitCode": 0,
             "usage": usage,
