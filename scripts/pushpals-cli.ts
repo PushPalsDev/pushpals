@@ -255,6 +255,8 @@ const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
 const DEFAULT_SERVER_BOOT_TIMEOUT_MS = 20_000;
 const DEFAULT_SERVICE_STABILITY_GRACE_MS = 4_000;
+const DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS = 5_000;
+const DEFAULT_STARTUP_GIT_REMOTE_TIMEOUT_MS = 10_000;
 const DEFAULT_EMBEDDED_SERVICE_SUPERVISOR_POLL_MS = 1_000;
 const EMBEDDED_SERVICE_RESTART_MAX_ATTEMPTS = 4;
 const EMBEDDED_SERVICE_RESTART_STABLE_WINDOW_MS = 60_000;
@@ -649,6 +651,51 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function clampPositiveInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
+function resolveStartupGitProbeTimeoutMs(env: Record<string, string | undefined>): number {
+  return clampPositiveInt(
+    parsePositiveInt(
+      env.PUSHPALS_STARTUP_GIT_PROBE_TIMEOUT_MS,
+      DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS,
+    ),
+    1_000,
+    30_000,
+  );
+}
+
+function resolveStartupGitRemoteTimeoutMs(env: Record<string, string | undefined>): number {
+  return clampPositiveInt(
+    parsePositiveInt(
+      env.PUSHPALS_STARTUP_GIT_REMOTE_TIMEOUT_MS,
+      DEFAULT_STARTUP_GIT_REMOTE_TIMEOUT_MS,
+    ),
+    1_000,
+    60_000,
+  );
+}
+
+async function withStartupTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutValue: () => T,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolveTimeout) => {
+        timer = setTimeout(() => resolveTimeout(timeoutValue()), Math.max(1, timeoutMs));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function jsonHtmlBootstrap(value: unknown): string {
   return JSON.stringify(value).replace(/</g, "\\u003c");
 }
@@ -750,16 +797,22 @@ async function runGitWithEnv(
   args: string[],
   cwd: string,
   env: Record<string, string | undefined>,
+  timeoutMs?: number,
 ): Promise<CommandResult> {
-  return await runCommandWithEnv(["git", ...args], cwd, withWindowsGitSchannelEnv(env));
+  return await runCommandWithEnv(["git", ...args], cwd, withWindowsGitSchannelEnv(env), timeoutMs);
 }
 
-async function runGit(args: string[], cwd: string): Promise<CommandResult> {
-  return await runGitWithEnv(args, cwd, {
-    ...(process.env as Record<string, string | undefined>),
-    GIT_TERMINAL_PROMPT: "0",
-    GCM_INTERACTIVE: "Never",
-  });
+async function runGit(args: string[], cwd: string, timeoutMs?: number): Promise<CommandResult> {
+  return await runGitWithEnv(
+    args,
+    cwd,
+    {
+      ...(process.env as Record<string, string | undefined>),
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "Never",
+    },
+    timeoutMs,
+  );
 }
 
 async function resolveCurrentGitRepoRoot(cwd: string): Promise<string | null> {
@@ -1146,7 +1199,7 @@ async function fetchLatestReleaseTag(): Promise<string> {
 }
 
 async function fetchLatestReleaseTagWithGitFallback(cause: unknown): Promise<string | null> {
-  const message = String(cause instanceof Error ? cause.message : cause ?? "");
+  const message = String(cause instanceof Error ? cause.message : (cause ?? ""));
   if (
     process.platform !== "win32" ||
     (!/certificate|cert_|unable to verify|self[- ]signed|tls|ssl/i.test(message) &&
@@ -1281,10 +1334,8 @@ function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
       migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: true }),
     );
   }
-  migrated = migrateEmbeddedRuntimeTomlSection(
-    migrated,
-    "workerpals.openai_codex",
-    (sectionBody) => migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),
+  migrated = migrateEmbeddedRuntimeTomlSection(migrated, "workerpals.openai_codex", (sectionBody) =>
+    migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),
   );
   if (migrated !== original) {
     writeFileSync(localTomlPath, migrated, "utf8");
@@ -1577,7 +1628,9 @@ function createVisionMdFromTemplate(opts: { repoRoot: string; runtimeRoot: strin
       templatePath,
     )}.`,
   );
-  console.log("[pushpals] Edit vision.md with this repo's users, priorities, guardrails, and validation path.");
+  console.log(
+    "[pushpals] Edit vision.md with this repo's users, priorities, guardrails, and validation path.",
+  );
   console.log("[pushpals] Then run `pushpals` again.");
   return 0;
 }
@@ -1784,6 +1837,7 @@ export async function resolveCommandPath(
   command: string,
   cwd: string,
   env: Record<string, string>,
+  timeoutMs = resolveStartupGitProbeTimeoutMs(env),
 ): Promise<string | null> {
   const lookupCommands =
     process.platform === "win32"
@@ -1795,15 +1849,9 @@ export async function resolveCommandPath(
 
   for (const lookup of lookupCommands) {
     try {
-      const proc = Bun.spawn(lookup, {
-        cwd,
-        env,
-        stdout: "pipe",
-        stderr: "ignore",
-      });
-      const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-      if (exitCode !== 0) continue;
-      const resolved = stdout
+      const result = await runCommandWithEnv(lookup, cwd, env, timeoutMs);
+      if (!result.ok) continue;
+      const resolved = result.stdout
         .split(/\r?\n/)
         .map((line) => line.trim())
         .find((line) => line.length > 0);
@@ -1911,7 +1959,7 @@ async function downloadBinaryAssetWithWindowsCurlFallback(
   cause: unknown,
 ): Promise<boolean> {
   if (process.platform !== "win32") return false;
-  const message = String(cause instanceof Error ? cause.message : cause ?? "");
+  const message = String(cause instanceof Error ? cause.message : (cause ?? ""));
   if (
     !/certificate|cert_|unable to verify|self[- ]signed|tls|ssl/i.test(message) &&
     !/fetch failed/i.test(message)
@@ -2352,20 +2400,10 @@ async function canSpawnCommand(
   command: string[],
   cwd: string,
   env: Record<string, string>,
+  timeoutMs = resolveStartupGitProbeTimeoutMs(env),
 ): Promise<boolean> {
-  try {
-    const proc = Bun.spawn(command, {
-      cwd,
-      env,
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    const exitCode = await proc.exited;
-    return exitCode === 0;
-  } catch {
-    return false;
-  }
+  const result = await runCommandWithEnv(command, cwd, env, timeoutMs);
+  return result.ok;
 }
 
 async function canSpawnGitViaWindowsShell(
@@ -2373,23 +2411,18 @@ async function canSpawnGitViaWindowsShell(
   cwd: string,
   env: Record<string, string>,
   platform = process.platform,
+  timeoutMs = resolveStartupGitProbeTimeoutMs(env),
 ): Promise<boolean> {
   if (platform !== "win32") return false;
   const commandLine = commandArgs.map((arg) => quoteWindowsCmdArg(arg)).join(" ");
   for (const shellExecutable of resolveWindowsShellExecutableCandidatesForEnv(env, platform)) {
-    try {
-      const proc = Bun.spawn([shellExecutable, "/d", "/s", "/c", commandLine], {
-        cwd,
-        env,
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      const exitCode = await proc.exited;
-      return exitCode === 0;
-    } catch {
-      // Try the next shell candidate.
-    }
+    const result = await runCommandWithEnv(
+      [shellExecutable, "/d", "/s", "/c", commandLine],
+      cwd,
+      env,
+      timeoutMs,
+    );
+    if (result.ok) return true;
   }
   return false;
 }
@@ -2398,17 +2431,20 @@ async function resolveSourceControlManagerGitProbe(
   cwd: string,
   env: Record<string, string>,
   platform = process.platform,
+  timeoutMs = resolveStartupGitProbeTimeoutMs(env),
 ): Promise<{ ok: boolean; detail: string }> {
   const candidates = resolveRuntimeGitExecutableCandidates(env, platform);
   for (const candidate of candidates) {
-    if (await canSpawnCommand([candidate, "--version"], cwd, env)) {
+    if (await canSpawnCommand([candidate, "--version"], cwd, env, timeoutMs)) {
       return { ok: true, detail: candidate };
     }
   }
 
   if (platform === "win32") {
     for (const candidate of candidates) {
-      if (await canSpawnGitViaWindowsShell([candidate, "--version"], cwd, env, platform)) {
+      if (
+        await canSpawnGitViaWindowsShell([candidate, "--version"], cwd, env, platform, timeoutMs)
+      ) {
         return { ok: true, detail: `${candidate} via shell` };
       }
     }
@@ -2956,8 +2992,8 @@ export async function ensureWorkerpalDockerImageReady(opts: {
     inspectFailureDetail
       ? `[pushpals] WorkerPal sandbox image ${opts.dockerImage} could not be inspected; attempting local rebuild...`
       : existingRuntimeTag
-      ? `[pushpals] WorkerPal sandbox image ${opts.dockerImage} is stale (runtimeTag=${existingRuntimeTag}); rebuilding locally...`
-      : `[pushpals] WorkerPal sandbox image ${opts.dockerImage} is missing; building locally...`,
+        ? `[pushpals] WorkerPal sandbox image ${opts.dockerImage} is stale (runtimeTag=${existingRuntimeTag}); rebuilding locally...`
+        : `[pushpals] WorkerPal sandbox image ${opts.dockerImage} is missing; building locally...`,
   );
   const build = await runCommandWithEnvFn(
     [
@@ -3086,13 +3122,26 @@ export async function precheckSourceControlManagerGitAvailability(opts: {
     applyResolvedGitBinaryToRuntimeEnv(env, preconfiguredGitBinary, platform);
   }
 
-  const remoteStatus = opts.gitRemoteCheckFn
-    ? await opts.gitRemoteCheckFn(opts.repoRoot, opts.remote, env)
-    : opts.repoHasRemoteFn
-      ? (await opts.repoHasRemoteFn(opts.repoRoot, opts.remote))
-        ? { status: "ok", remote: opts.remote }
-        : { status: "missing_remote", remote: opts.remote }
-      : await checkGitRemoteConfigured(opts.repoRoot, opts.remote, env);
+  const remoteTimeoutMs = resolveStartupGitRemoteTimeoutMs(env);
+  const remoteStatus = await withStartupTimeout<GitRemoteCheckResult>(
+    opts.gitRemoteCheckFn
+      ? opts.gitRemoteCheckFn(opts.repoRoot, opts.remote, env)
+      : opts.repoHasRemoteFn
+        ? opts
+            .repoHasRemoteFn(opts.repoRoot, opts.remote)
+            .then((hasRemote) =>
+              hasRemote
+                ? ({ status: "ok", remote: opts.remote } as GitRemoteCheckResult)
+                : ({ status: "missing_remote", remote: opts.remote } as GitRemoteCheckResult),
+            )
+        : checkGitRemoteConfigured(opts.repoRoot, opts.remote, env, remoteTimeoutMs),
+    remoteTimeoutMs,
+    () => ({
+      status: "error",
+      remote: opts.remote,
+      detail: `timed out after ${remoteTimeoutMs}ms`,
+    }),
+  );
   if (remoteStatus.status === "missing_remote") {
     return {
       status: "skipped",
@@ -3245,6 +3294,7 @@ async function checkGitRemoteConfigured(
   repoRoot: string,
   remote: string,
   env?: Record<string, string | undefined>,
+  timeoutMs = resolveStartupGitRemoteTimeoutMs(env ?? process.env),
 ): Promise<GitRemoteCheckResult> {
   const normalizedRemote = String(remote ?? "").trim();
   if (!normalizedRemote) {
@@ -3258,6 +3308,7 @@ async function checkGitRemoteConfigured(
       GIT_TERMINAL_PROMPT: "0",
       GCM_INTERACTIVE: "Never",
     },
+    timeoutMs,
   );
   if (result.ok && result.stdout) {
     return { status: "ok", remote: normalizedRemote };
@@ -3305,7 +3356,11 @@ async function checkPushpalsBranchOnRemote(
   }
 
   const ref = `refs/heads/${normalizedBranch}`;
-  const result = await runGit(["ls-remote", "--heads", normalizedRemote, ref], repoRoot);
+  const result = await runGit(
+    ["ls-remote", "--heads", normalizedRemote, ref],
+    repoRoot,
+    resolveStartupGitRemoteTimeoutMs(process.env),
+  );
   if (!result.ok) {
     const detail = result.stderr || result.stdout || `exit ${result.exitCode}`;
     return {
@@ -3349,10 +3404,13 @@ async function enforcePushpalsRemoteBranchPrecheck(
     );
     return false;
   }
-  console.error(
-    `[pushpals] Precheck failed: could not verify remote branch "${result.remote}/${result.branch}": ${result.detail}`,
+  console.warn(
+    `[pushpals] Precheck warning: could not verify remote branch "${result.remote}/${result.branch}": ${result.detail}`,
   );
-  return false;
+  console.warn(
+    "[pushpals] Precheck warning: continuing startup without SourceControlManager branch verification because the remote check was inconclusive.",
+  );
+  return true;
 }
 
 function isPathEqualOrWithin(parentPath: string, childPath: string): boolean {
@@ -4032,7 +4090,8 @@ async function autoStartRuntimeServices(opts: {
     `[pushpals] service log (source_control_manager)=${serviceLogPaths.source_control_manager}`,
   );
   const serviceManager = new ServiceManager({
-    degradedAction: "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
+    degradedAction:
+      "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
     onEvent: (level, line) => {
       const cliLine = `[pushpals] ${line.replace(/^Managed /, "Embedded ").replace(/^Restarted managed /, "Restarted embedded ")}`;
       if (level === "error") {
@@ -4147,8 +4206,8 @@ async function autoStartRuntimeServices(opts: {
         opts.sessionId,
       ],
       {
-      cwd: remoteBuddySourceFallback.cwd,
-      appendLog: true,
+        cwd: remoteBuddySourceFallback.cwd,
+        appendLog: true,
       },
     );
     return true;
@@ -4214,7 +4273,9 @@ async function autoStartRuntimeServices(opts: {
     const localBuddyPhaseStartedAt = Date.now();
     console.log("[pushpals] Starting embedded LocalBuddy...");
     const localbuddyService = launchService("localbuddy", [runtimeBinaries.localbuddy]);
-    console.log(`[pushpals] localbuddy log: ${localbuddyService.logPath ?? serviceLogPaths.localbuddy}`);
+    console.log(
+      `[pushpals] localbuddy log: ${localbuddyService.logPath ?? serviceLogPaths.localbuddy}`,
+    );
     recordStartupPhase("localbuddy", localBuddyPhaseStartedAt, "started");
   } else {
     recordStartupPhase("localbuddy", Date.now(), "skipped");
@@ -4286,18 +4347,18 @@ async function autoStartRuntimeServices(opts: {
   }
 
   const scmHealthy = await probeSourceControlManager(opts.sourceControlManagerPort);
-  const scmGitProbe = await resolveSourceControlManagerGitProbe(
-    opts.repoRoot,
-    runtimeEnv,
-    process.platform,
-  );
-  const scmRemoteStatus = await checkGitRemoteConfigured(
-    opts.repoRoot,
-    opts.sourceControlManagerRemote,
-    runtimeEnv,
-  );
   if (!scmHealthy) {
     const scmPhaseStartedAt = Date.now();
+    console.log("[pushpals] Checking embedded SourceControlManager git/remote preflight...");
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      "[pushpals] checking embedded source_control_manager git/remote preflight.",
+    );
+    const scmGitProbe = await resolveSourceControlManagerGitProbe(
+      opts.repoRoot,
+      runtimeEnv,
+      process.platform,
+    );
     if (!scmGitProbe.ok) {
       console.warn(
         "[pushpals] Git is not available to embedded SourceControlManager; skipping SCM startup.",
@@ -4307,35 +4368,42 @@ async function autoStartRuntimeServices(opts: {
         `[pushpals] source_control_manager skipped: git is unavailable in embedded runtime env (${scmGitProbe.detail}).`,
       );
       recordStartupPhase("source_control_manager", scmPhaseStartedAt, "skipped_no_git");
-    } else if (scmRemoteStatus.status === "error") {
-      console.warn(
-        `[pushpals] Could not inspect SourceControlManager git remote "${opts.sourceControlManagerRemote}"; skipping SCM startup.`,
-      );
-      appendRuntimeServicesLogLine(
-        runtimeServicesLogPath,
-        `[pushpals] source_control_manager skipped: remote "${opts.sourceControlManagerRemote}" could not be inspected (${scmRemoteStatus.detail}).`,
-      );
-      recordStartupPhase("source_control_manager", scmPhaseStartedAt, "skipped_remote_error");
-    } else if (scmRemoteStatus.status === "ok") {
-      console.log(`[pushpals] Embedded SourceControlManager git=${scmGitProbe.detail}`);
-      console.log("[pushpals] Starting embedded SourceControlManager...");
-      const sourceControlManagerService = launchService("source_control_manager", [
-        runtimeBinaries.sourceControlManager,
-        "--skip-clean-check",
-      ]);
-      console.log(
-        `[pushpals] source_control_manager log: ${sourceControlManagerService.logPath ?? serviceLogPaths.source_control_manager}`,
-      );
-      recordStartupPhase("source_control_manager", scmPhaseStartedAt, "started");
     } else {
-      console.log(
-        `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
+      const scmRemoteStatus = await checkGitRemoteConfigured(
+        opts.repoRoot,
+        opts.sourceControlManagerRemote,
+        runtimeEnv,
       );
-      appendRuntimeServicesLogLine(
-        runtimeServicesLogPath,
-        `[pushpals] source_control_manager skipped: repo has no remote "${opts.sourceControlManagerRemote}".`,
-      );
-      recordStartupPhase("source_control_manager", scmPhaseStartedAt, "skipped_no_remote");
+      if (scmRemoteStatus.status === "error") {
+        console.warn(
+          `[pushpals] Could not inspect SourceControlManager git remote "${opts.sourceControlManagerRemote}"; skipping SCM startup.`,
+        );
+        appendRuntimeServicesLogLine(
+          runtimeServicesLogPath,
+          `[pushpals] source_control_manager skipped: remote "${opts.sourceControlManagerRemote}" could not be inspected (${scmRemoteStatus.detail}).`,
+        );
+        recordStartupPhase("source_control_manager", scmPhaseStartedAt, "skipped_remote_error");
+      } else if (scmRemoteStatus.status === "ok") {
+        console.log(`[pushpals] Embedded SourceControlManager git=${scmGitProbe.detail}`);
+        console.log("[pushpals] Starting embedded SourceControlManager...");
+        const sourceControlManagerService = launchService("source_control_manager", [
+          runtimeBinaries.sourceControlManager,
+          "--skip-clean-check",
+        ]);
+        console.log(
+          `[pushpals] source_control_manager log: ${sourceControlManagerService.logPath ?? serviceLogPaths.source_control_manager}`,
+        );
+        recordStartupPhase("source_control_manager", scmPhaseStartedAt, "started");
+      } else {
+        console.log(
+          `[pushpals] Repo has no git remote "${opts.sourceControlManagerRemote}"; skipping embedded SourceControlManager.`,
+        );
+        appendRuntimeServicesLogLine(
+          runtimeServicesLogPath,
+          `[pushpals] source_control_manager skipped: repo has no remote "${opts.sourceControlManagerRemote}".`,
+        );
+        recordStartupPhase("source_control_manager", scmPhaseStartedAt, "skipped_no_remote");
+      }
     }
   } else {
     recordStartupPhase("source_control_manager", Date.now(), "reused");
@@ -5276,10 +5344,9 @@ async function main(): Promise<void> {
       sessionId,
     });
     if (scmGitPrecheck.status === "failed") {
-      console.error(
-        `[pushpals] Precheck failed: embedded SourceControlManager git command is unavailable (${scmGitPrecheck.detail}).`,
+      console.warn(
+        `[pushpals] Embedded SourceControlManager precheck failed (${scmGitPrecheck.detail}); continuing startup without blocking on SCM.`,
       );
-      process.exit(1);
     }
     workerpalDockerPrecheck = await precheckWorkerpalDockerAvailability({
       repoRoot,

@@ -227,7 +227,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         pollMs: 50,
         maxRestartAttempts: 1,
         computeRestartBackoffMs: () => 50,
-        degradedAction: "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
+        degradedAction:
+          "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
         spawnService: (spec) => {
           spawnCalls += 1;
           return {
@@ -914,6 +915,36 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(result.status).toBe("failed");
     expect(result.detail).toContain('git remote "origin" could not be inspected');
     expect(result.detail).toContain("spawn git failed: ENOENT");
+  });
+
+  test("precheckSourceControlManagerGitAvailability bounds a stuck SCM remote inspection", async () => {
+    const startedAt = Date.now();
+    const result = await precheckSourceControlManagerGitAvailability({
+      repoRoot: "/repo/example",
+      remote: "origin",
+      runtimeRoot: "/runtime/pushpals",
+      preflightUsesEmbeddedRuntime: true,
+      baseEnv: {
+        PATH: "/usr/bin",
+        PUSHPALS_STARTUP_GIT_REMOTE_TIMEOUT_MS: "1000",
+      },
+      gitRemoteCheckFn: () =>
+        new Promise<never>(() => {
+          // Simulates a platform/git helper hang. Startup must not wait forever.
+        }),
+      resolveCommandPathFn: async () => {
+        throw new Error("resolveCommandPath should not run when remote inspection times out");
+      },
+      gitProbeFn: async () => {
+        throw new Error("git probe should not run when remote inspection times out");
+      },
+      platform: "linux",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.detail).toContain('git remote "origin" could not be inspected');
+    expect(result.detail).toContain("timed out after 1000ms");
+    expect(Date.now() - startedAt).toBeLessThan(2_500);
   });
 
   test("precheckSourceControlManagerGitAvailability fails before startup when SCM git probing fails", async () => {
@@ -2045,7 +2076,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
   test("isDockerUnavailableDetail classifies common Docker daemon failures", () => {
     expect(isDockerUnavailableDetail("Cannot connect to the Docker daemon")).toBe(true);
     expect(
-      isDockerUnavailableDetail("failed to connect to the docker API at npipe:////./pipe/docker_engine"),
+      isDockerUnavailableDetail(
+        "failed to connect to the docker API at npipe:////./pipe/docker_engine",
+      ),
     ).toBe(true);
     expect(isDockerUnavailableDetail("Error response from daemon: No such image")).toBe(false);
   });
