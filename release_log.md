@@ -2,24 +2,28 @@
 
 ## Release Metadata
 
-- version: `v1.1.3`
-- start_commit: `c807176ae9e14114dd66385e5b6e11cf0baacaf1`
-- end_commit: `f4d971000ec54b12f02baa786ec29780d023d1d4`
-- commits_in_range: `1`
+- version: `v1.1.4`
+- start_commit: `d02f95b87ec91bbb13cdb65f2413ad735628178b`
+- end_commit: `37b3765c507d598281ce74c4dc83922f63a6b7fa`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Improve WorkerPal browser-validation convergence for repeated Playwright/browser assertion failures by shifting repair guidance toward diagnostic-first investigation after repeated misses.
-- Preserve exact browser failure context while nudging later repair attempts to inspect screenshots, artifacts, DOM state, and current e2e harness behavior before changing assertions again.
-- Keep the expanded browser repair loop scoped to true browser validation failures so normal validation and non-browser quality gates retain their configured retry behavior.
-- Add regression coverage for repeated browser assertion guidance and convergence behavior.
+- Treat task target paths and write globs as relevance hints rather than hard WorkerPal write boundaries, while preserving review and quality gates as the enforcement layer.
+- Improve browser-validation convergence by recognizing successful browser smoke sentinels and terminating leaked child process trees instead of waiting for a ValidationGate timeout.
+- Route Playwright/browser assertion failures back to WorkerPal as task-scope repair instructions, so workers fix failing smoke behavior instead of treating it as an unrelated repo blocker.
+- Preserve a fully validated patch during post-validation ScopeGate/CriticGate cleanup, avoiding late rewrites that can destabilize a passing browser path.
+- Hand Codex-produced patches to ValidationGate/CriticGate when shell-wrapper command rejections happen after file changes, rather than burning the full executor timeout on recovery retries.
+- Add regression coverage for browser success-sentinel shutdown, browser assertion failure scoping, validation-preserving cleanup guidance, and Codex shell-wrapper convergence.
 
 ## Validation
 
 - `bun run cli:bundle`
-- `bun test tests/remotebuddy.task-dedupe.test.ts`
+- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`
+- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
 - `bun run test:root`
 - `git diff --check`
+- Local replay of SectorCommand job `59cfcfcd-7c17-41a7-950a-a28d24f0d0ef` completed as replay job `6792fd2f-284b-475d-b4b0-005bb3c38ccb`; ValidationGate passed `bun test`, `bun x tsc --noEmit`, `bun run lint`, and `bun run web:e2e`, then opened `https://github.com/PiyushDatta/SectorCommand/pull/53`.
 
 ## Install
 
