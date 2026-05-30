@@ -20,6 +20,7 @@ import {
   createSessionEventReplayFilter,
   cleanupLingeringPushPalsGitWorktrees,
   cleanupLingeringWorkerpalWarmContainers,
+  describeWorkerExecutionReadiness,
   buildEmbeddedRuntimeEnv,
   copyTrackedRepoPath,
   buildWorkerpalSandboxPaths,
@@ -35,6 +36,7 @@ import {
   formatWorkerExecutionReadinessLines,
   formatTimestampedCliLine,
   formatSessionEventLine,
+  hasRemoteBuddyRuntimeOutput,
   injectMonitoringHubBootstrap,
   isDockerCleanupTimeoutDetail,
   isDockerUnavailableDetail,
@@ -53,8 +55,10 @@ import {
   resolveWorkerExecutionReadiness,
   resolveCliStatePath,
   resolveCommandPath,
+  runCommandWithEnv,
   repoLooksLikePushPalsSourceCheckout,
   shutdownEmbeddedServiceManagerGracefully,
+  shouldUseRemoteBuddySilentStartupFallback,
   shouldRunEmbeddedRuntimeStartupPrechecks,
   resolvePreferredRuntimeReleaseTag,
   resolveWindowsShellExecutableCandidatesForEnv,
@@ -1162,6 +1166,26 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     } finally {
       Date.now = originalNow;
     }
+  });
+
+  test("startup readiness reports blocked immediately when WorkerPal auto-spawn is disabled", () => {
+    expect(
+      describeWorkerExecutionReadiness({
+        autoSpawnWorkerpals: false,
+        requireDocker: true,
+        dockerPrecheck: {
+          status: "skipped",
+          detail: "WorkerPal auto-spawn is disabled",
+          env: { PATH: process.env.PATH ?? "" },
+        },
+        onlineWorkers: 0,
+        idleWorkers: 0,
+      }),
+    ).toEqual({
+      state: "blocked",
+      detail: "No online WorkerPals are reported and auto-spawn is disabled.",
+      action: "Start a WorkerPals backend manually or enable RemoteBuddy auto-spawn.",
+    });
   });
 
   test("resolveWorkerExecutionReadiness reports blocked when required Docker-backed auto-spawn cannot start", async () => {
@@ -2557,6 +2581,34 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
+  test("ensureRuntimeBinaries retries transient runtime binary download failures", async () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-bin-retry-"));
+    const originalFetch = globalThis.fetch;
+    const requestedAssets: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedAssets.push(url);
+      if (requestedAssets.length === 1) {
+        return new Response("temporary service unavailable", { status: 503 });
+      }
+      return new Response(new Uint8Array([0x50, 0x4b]));
+    }) as typeof fetch;
+
+    try {
+      const binaries = await ensureRuntimeBinaries(runtimeRoot, "v1.2.4");
+
+      expect(requestedAssets).toHaveLength(6);
+      expect(requestedAssets[0]).toBe(requestedAssets[1]);
+      expect(existsSync(binaries.server)).toBe(true);
+      expect(readFileSync(join(dirname(binaries.server), ".runtime-tag"), "utf8")).toBe(
+        "v1.2.4\n",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+
   test("buildOpenMonitoringHubCommand selects the right launcher per platform", () => {
     expect(buildOpenMonitoringHubCommand("http://localhost:8081", "win32")).toEqual([
       "cmd",
@@ -2585,6 +2637,25 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
     expect(buildServiceStopCommand(4321, "linux")).toBeNull();
     expect(buildServiceStopCommand(undefined, "win32")).toBeNull();
+  });
+
+  test("runCommandWithEnv times out without waiting indefinitely on output pipes", async () => {
+    const startedAt = Date.now();
+    const result = await runCommandWithEnv(
+      [
+        process.execPath,
+        "-e",
+        "console.log('started'); setInterval(() => {}, 1000);",
+      ],
+      process.cwd(),
+      process.env as Record<string, string | undefined>,
+      100,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.stdout).toContain("started");
+    expect(result.stderr).toContain("timed out after 100ms");
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
   });
 
   test("resolvePreferredRuntimeReleaseTag prefers the installed CLI package version before GitHub latest", () => {
@@ -2935,6 +3006,51 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       ),
     ).toBe("disabled");
     expect(extractRemoteBuddyAutonomousEngineState("")).toBe("unknown");
+  });
+
+  test("RemoteBuddy silent-startup fallback only triggers for silent Windows standalone startup", () => {
+    const launchOnlyLog =
+      "[pushpals] service=remotebuddy command=C:/runtime/bin/pushpals-runtime-remotebuddy-windows-x64.exe";
+    expect(hasRemoteBuddyRuntimeOutput(launchOnlyLog)).toBe(false);
+    expect(hasRemoteBuddyRuntimeOutput(`${launchOnlyLog}\n[stdout] [RemoteBuddy] booting`)).toBe(
+      true,
+    );
+    expect(
+      shouldUseRemoteBuddySilentStartupFallback({
+        logText: launchOnlyLog,
+        elapsedMs: 20_000,
+        thresholdMs: 10_000,
+        platform: "win32",
+        fallbackAvailable: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldUseRemoteBuddySilentStartupFallback({
+        logText: `${launchOnlyLog}\n[stdout] [RemoteBuddy] Autonomous engine: enabled tick=300000ms`,
+        elapsedMs: 20_000,
+        thresholdMs: 10_000,
+        platform: "win32",
+        fallbackAvailable: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldUseRemoteBuddySilentStartupFallback({
+        logText: launchOnlyLog,
+        elapsedMs: 5_000,
+        thresholdMs: 10_000,
+        platform: "win32",
+        fallbackAvailable: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldUseRemoteBuddySilentStartupFallback({
+        logText: launchOnlyLog,
+        elapsedMs: 20_000,
+        thresholdMs: 10_000,
+        platform: "linux",
+        fallbackAvailable: true,
+      }),
+    ).toBe(false);
   });
 
   test("bundledMonitoringHubNeedsRefresh detects stale exported monitor assets", () => {

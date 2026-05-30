@@ -132,6 +132,11 @@ type CommandResult = {
   stderr: string;
   exitCode: number;
 };
+type ProcessOutputCollector = {
+  done: Promise<string>;
+  snapshot: () => string;
+  cancel: () => void;
+};
 type WorkerpalDockerPrecheckResult =
   | { status: "ok"; detail: string; env: Record<string, string> }
   | { status: "skipped"; detail: string; env: Record<string, string> }
@@ -255,6 +260,11 @@ const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
 const DEFAULT_SERVER_BOOT_TIMEOUT_MS = 20_000;
 const DEFAULT_SERVICE_STABILITY_GRACE_MS = 4_000;
+const DEFAULT_COMMAND_OUTPUT_DRAIN_TIMEOUT_MS = 2_000;
+const DEFAULT_COMMAND_OUTPUT_MAX_CHARS = 512_000;
+const DEFAULT_REMOTEBUDDY_SILENT_STARTUP_FALLBACK_MS = 20_000;
+const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
+const RUNTIME_BINARY_DOWNLOAD_ATTEMPTS = 3;
 const DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_STARTUP_GIT_REMOTE_TIMEOUT_MS = 10_000;
 const DEFAULT_EMBEDDED_SERVICE_SUPERVISOR_POLL_MS = 1_000;
@@ -700,7 +710,116 @@ function jsonHtmlBootstrap(value: unknown): string {
   return JSON.stringify(value).replace(/</g, "\\u003c");
 }
 
-async function runCommandWithEnv(
+function appendBoundedProcessOutput(existing: string, next: string, maxChars: number): string {
+  if (!next) return existing;
+  const combined = `${existing}${next}`;
+  if (combined.length <= maxChars) return combined;
+  return combined.slice(combined.length - maxChars);
+}
+
+function createProcessOutputCollector(
+  stream: ReadableStream<Uint8Array> | null | undefined,
+  maxChars = DEFAULT_COMMAND_OUTPUT_MAX_CHARS,
+): ProcessOutputCollector {
+  if (!stream) {
+    return {
+      done: Promise.resolve(""),
+      snapshot: () => "",
+      cancel: () => {},
+    };
+  }
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  let cancelled = false;
+  let finished = false;
+  const done = (async (): Promise<string> => {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        output = appendBoundedProcessOutput(
+          output,
+          decoder.decode(chunk.value, { stream: true }),
+          maxChars,
+        );
+      }
+      output = appendBoundedProcessOutput(output, decoder.decode(), maxChars);
+    } catch (err) {
+      if (!cancelled) {
+        output = appendBoundedProcessOutput(
+          output,
+          `\n[pushpals] output read failed: ${String(err)}`,
+          maxChars,
+        );
+      }
+    } finally {
+      finished = true;
+      try {
+        reader.releaseLock();
+      } catch {
+        // best-effort stream cleanup only
+      }
+    }
+    return output;
+  })();
+
+  return {
+    done,
+    snapshot: () => output,
+    cancel: () => {
+      if (finished || cancelled) return;
+      cancelled = true;
+      try {
+        void reader.cancel().catch(() => {});
+      } catch {
+        // best-effort stream cleanup only
+      }
+    },
+  };
+}
+
+async function finishProcessOutputCollector(
+  collector: ProcessOutputCollector,
+  timeoutMs = DEFAULT_COMMAND_OUTPUT_DRAIN_TIMEOUT_MS,
+): Promise<string> {
+  const result = await Promise.race([
+    collector.done.then((text) => ({ text, timedOut: false })),
+    Bun.sleep(Math.max(1, timeoutMs)).then(() => ({
+      text: collector.snapshot(),
+      timedOut: true,
+    })),
+  ]);
+  if (result.timedOut) {
+    collector.cancel();
+  }
+  return result.text;
+}
+
+function terminateSpawnedProcessTree(
+  proc: ReturnType<typeof Bun.spawn>,
+  platform = process.platform,
+): void {
+  try {
+    const stopCommand = buildServiceStopCommand(proc.pid, platform);
+    if (stopCommand) {
+      Bun.spawnSync(stopCommand, {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      });
+      return;
+    }
+    proc.kill("SIGKILL");
+  } catch {
+    // best-effort process cleanup only
+  }
+}
+
+export async function runCommandWithEnv(
   command: string[],
   cwd: string,
   env: Record<string, string | undefined>,
@@ -713,33 +832,39 @@ async function runCommandWithEnv(
       stdout: "pipe",
       stderr: "pipe",
     });
+    const stdoutCollector = createProcessOutputCollector(proc.stdout);
+    const stderrCollector = createProcessOutputCollector(proc.stderr);
     let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        try {
-          const stopCommand = buildServiceStopCommand(proc.pid, process.platform);
-          if (stopCommand) {
-            Bun.spawnSync(stopCommand, {
-              stdin: "ignore",
-              stdout: "ignore",
-              stderr: "ignore",
-            });
-          } else {
-            proc.kill("SIGKILL");
-          }
-        } catch {
-          // best-effort timeout termination only
-        }
-      }, timeoutMs);
-    }
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+    const hasTimeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const exitCode = await Promise.race([
       proc.exited,
+      hasTimeout
+        ? new Promise<number>((resolveTimeout) => {
+            timeout = setTimeout(() => {
+              timedOut = true;
+              terminateSpawnedProcessTree(proc);
+              resolveTimeout(-1);
+            }, timeoutMs);
+          })
+        : new Promise<number>(() => {}),
     ]);
-    if (timer) clearTimeout(timer);
+    if (timeout) {
+      clearTimeout(timeout);
+      timeout = null;
+    }
+    if (timedOut) {
+      await Promise.race([
+        proc.exited.catch(() => -1),
+        Bun.sleep(DEFAULT_COMMAND_OUTPUT_DRAIN_TIMEOUT_MS),
+      ]);
+      stdoutCollector.cancel();
+      stderrCollector.cancel();
+    }
+    const [stdout, stderr] = await Promise.all([
+      finishProcessOutputCollector(stdoutCollector),
+      finishProcessOutputCollector(stderrCollector),
+    ]);
     const normalizedStdout = stdout.trim();
     const normalizedStderr = stderr.trim();
     if (timedOut) {
@@ -1907,6 +2032,32 @@ function hasStandaloneBunCrashSignature(text: string): boolean {
   );
 }
 
+export function hasRemoteBuddyRuntimeOutput(logText: string): boolean {
+  return String(logText ?? "")
+    .split(/\r?\n/)
+    .some((line) => /\[(?:stdout|stderr)\]/i.test(line));
+}
+
+export function shouldUseRemoteBuddySilentStartupFallback(opts: {
+  logText: string;
+  elapsedMs: number;
+  thresholdMs?: number;
+  platform?: NodeJS.Platform;
+  fallbackAvailable?: boolean;
+}): boolean {
+  const platform = opts.platform ?? process.platform;
+  const thresholdMs = Math.max(
+    1,
+    opts.thresholdMs ?? DEFAULT_REMOTEBUDDY_SILENT_STARTUP_FALLBACK_MS,
+  );
+  if (platform !== "win32") return false;
+  if (!opts.fallbackAvailable) return false;
+  if (opts.elapsedMs < thresholdMs) return false;
+  const logText = String(opts.logText ?? "");
+  if (hasStandaloneBunCrashSignature(logText)) return false;
+  return !hasRemoteBuddyRuntimeOutput(logText);
+}
+
 export function extractRemoteBuddyAutonomousEngineState(
   logText: string,
 ): RemoteBuddyAutonomousEngineState {
@@ -1937,20 +2088,34 @@ function readRemoteBuddyAutonomousEngineState(logPath: string): RemoteBuddyAuton
 async function downloadBinaryAsset(tag: string, assetName: string, outPath: string): Promise<void> {
   console.log(`[pushpals] Downloading embedded runtime binary ${assetName} from ${tag}...`);
   const url = `${GITHUB_RELEASE_URL}/${encodeURIComponent(tag)}/${assetName}`;
-  try {
-    const response = await fetchWithTimeout(url, { headers: GITHUB_HEADERS }, 60_000);
-    if (!response.ok) {
-      throw new Error(`Failed to download ${assetName} from ${tag} (HTTP ${response.status})`);
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= RUNTIME_BINARY_DOWNLOAD_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(url, { headers: GITHUB_HEADERS }, 60_000);
+      if (!response.ok) {
+        throw new Error(`Failed to download ${assetName} from ${tag} (HTTP ${response.status})`);
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      mkdirSync(dirname(outPath), { recursive: true });
+      await Bun.write(outPath, bytes);
+      return;
+    } catch (err) {
+      try {
+        const fallback = await downloadBinaryAssetWithWindowsCurlFallback(url, outPath, err);
+        if (fallback) return;
+        lastError = err;
+      } catch (fallbackErr) {
+        lastError = fallbackErr;
+      }
+      if (attempt < RUNTIME_BINARY_DOWNLOAD_ATTEMPTS) {
+        console.warn(
+          `[pushpals] Runtime binary download for ${assetName} failed on attempt ${attempt}/${RUNTIME_BINARY_DOWNLOAD_ATTEMPTS}; retrying...`,
+        );
+        await Bun.sleep(1_000 * attempt);
+      }
     }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    mkdirSync(dirname(outPath), { recursive: true });
-    await Bun.write(outPath, bytes);
-    return;
-  } catch (err) {
-    const fallback = await downloadBinaryAssetWithWindowsCurlFallback(url, outPath, err);
-    if (fallback) return;
-    throw err;
   }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "unknown error"));
 }
 
 async function downloadBinaryAssetWithWindowsCurlFallback(
@@ -2077,6 +2242,8 @@ function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
           stdin: "ignore",
           stdout: "ignore",
           stderr: "ignore",
+          timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
+          killSignal: "SIGKILL",
         });
       } else {
         service.proc.kill("SIGKILL");
@@ -2119,6 +2286,11 @@ async function stopRuntimeServicesGracefully(
       resolveGracefulShutdownPriority(a.name as RuntimeServiceName) -
       resolveGracefulShutdownPriority(b.name as RuntimeServiceName),
   );
+  if (process.platform === "win32") {
+    stopRuntimeServices(ordered);
+    await waitForRuntimeServicesExit(ordered, Math.min(1_000, timeoutMs));
+    return;
+  }
   const nonServer = ordered.filter((service) => service.name !== "server");
   const server = ordered.filter((service) => service.name === "server");
 
@@ -4182,18 +4354,35 @@ async function autoStartRuntimeServices(opts: {
         }
       : null;
   let remoteBuddyFallbackActivated = false;
-  const maybeActivateRemoteBuddyWindowsFallback = (): boolean => {
+  const maybeActivateRemoteBuddyWindowsFallback = (
+    reason: "crash" | "silent_startup" = "crash",
+  ): boolean => {
     if (remoteBuddyFallbackActivated || !remoteBuddySourceFallback) return false;
     const tail = readLogTail(serviceLogPaths.remotebuddy, 120);
-    if (!hasStandaloneBunCrashSignature(tail)) return false;
+    if (reason === "crash" && !hasStandaloneBunCrashSignature(tail)) return false;
+    if (
+      reason === "silent_startup" &&
+      !shouldUseRemoteBuddySilentStartupFallback({
+        logText: tail,
+        elapsedMs: Date.now() - remoteBuddyPhaseStartedAt,
+        platform: process.platform,
+        fallbackAvailable: Boolean(remoteBuddySourceFallback),
+      })
+    ) {
+      return false;
+    }
     remoteBuddyFallbackActivated = true;
     lastReportedRemoteBuddyAutonomyState = "unknown";
+    const fallbackReason =
+      reason === "silent_startup"
+        ? "produced no startup output on Windows"
+        : "crashed on Windows";
     console.warn(
-      "[pushpals] Embedded RemoteBuddy standalone binary crashed on Windows; retrying with source fallback under bun.",
+      `[pushpals] Embedded RemoteBuddy standalone binary ${fallbackReason}; retrying with source fallback under bun.`,
     );
     appendRuntimeServicesLogLine(
       runtimeServicesLogPath,
-      "[pushpals] embedded remotebuddy standalone binary crashed on Windows; retrying with source fallback under bun.",
+      `[pushpals] embedded remotebuddy standalone binary ${fallbackReason}; retrying with source fallback under bun.`,
     );
     replaceService(
       "remotebuddy",
@@ -4419,6 +4608,10 @@ async function autoStartRuntimeServices(opts: {
   const optionalServiceExitWarned = new Set<RuntimeServiceName>();
   while (Date.now() < deadline) {
     reportRemoteBuddyAutonomousEngineState();
+    if (maybeActivateRemoteBuddyWindowsFallback("silent_startup")) {
+      await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
+      continue;
+    }
     for (const service of serviceManager.getServices()) {
       if (service.exited) {
         if (service.name === "remotebuddy" && maybeActivateRemoteBuddyWindowsFallback()) {
@@ -5577,12 +5770,18 @@ async function main(): Promise<void> {
     }
     process.exit(1);
   }
-  const workerpalCapacity = await waitForWorkerpalCapacity({
-    serverUrl,
-    timeoutMs: resolveWorkerpalStartupReadinessProbeTimeoutMs(config),
-    ttlMs: config.remotebuddy.workerpalOnlineTtlMs,
-  });
-  if (!workerpalCapacity.ok) {
+  const shouldProbeWorkerpalStartupCapacity = Boolean(config.remotebuddy.autoSpawnWorkerpals);
+  const workerpalCapacity = shouldProbeWorkerpalStartupCapacity
+    ? await waitForWorkerpalCapacity({
+        serverUrl,
+        timeoutMs: resolveWorkerpalStartupReadinessProbeTimeoutMs(config),
+        ttlMs: config.remotebuddy.workerpalOnlineTtlMs,
+      })
+    : {
+        ok: false,
+        detail: "WorkerPal auto-spawn is disabled",
+      };
+  if (shouldProbeWorkerpalStartupCapacity && !workerpalCapacity.ok) {
     console.warn(
       `[pushpals] WorkerPal readiness probe did not find idle capacity yet (${workerpalCapacity.detail}).`,
     );
@@ -5605,6 +5804,16 @@ async function main(): Promise<void> {
         state: "ready",
         detail: workerpalCapacity.detail,
       }
+    : !shouldProbeWorkerpalStartupCapacity
+      ? describeWorkerExecutionReadiness({
+          autoSpawnWorkerpals: false,
+          requireDocker:
+            Boolean(config.remotebuddy.workerpalDocker) &&
+            Boolean(config.remotebuddy.workerpalRequireDocker),
+          dockerPrecheck: workerpalDockerPrecheck,
+          onlineWorkers: 0,
+          idleWorkers: 0,
+        })
     : workerpalDockerPrecheck.status === "failed"
       ? describeWorkerExecutionReadiness({
           autoSpawnWorkerpals: Boolean(config.remotebuddy.autoSpawnWorkerpals),

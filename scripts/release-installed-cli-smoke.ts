@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { delimiter, join, resolve } from "path";
+import { basename, delimiter, join, resolve } from "path";
 
 type SmokeOptions = {
   packageSpec: string;
@@ -19,9 +19,20 @@ type CommandResult = {
   stderr: string;
 };
 
+type ProcessOutputCollector = {
+  done: Promise<string>;
+  snapshot: () => string;
+  cancel: () => void;
+};
+
+const OUTPUT_DRAIN_TIMEOUT_MS = 2_000;
+const OUTPUT_MAX_CHARS = 512_000;
+const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
+const TEMP_CLEANUP_TIMEOUT_MS = 15_000;
+
 function parseArgs(argv: string[]): SmokeOptions {
   let packageSpec = "";
-  let durationMs = 5 * 60_000;
+  let durationMs = 7 * 60_000;
   let repoPath: string | null = null;
   let useRepoDataDir = false;
   let keepTemp = false;
@@ -36,7 +47,7 @@ function parseArgs(argv: string[]): SmokeOptions {
       case "--duration-ms":
         durationMs = Math.max(
           30_000,
-          Number.parseInt(String(argv[++index] ?? "300000"), 10) || 5 * 60_000,
+          Number.parseInt(String(argv[++index] ?? "420000"), 10) || 7 * 60_000,
         );
         break;
       case "--repo-path":
@@ -70,31 +81,109 @@ function parseArgs(argv: string[]): SmokeOptions {
   };
 }
 
-function decodeOutput(data: string | Uint8Array | null | undefined): string {
-  if (typeof data === "string") return data;
-  if (!data) return "";
-  return Buffer.from(data).toString("utf8");
+function appendBoundedOutput(existing: string, next: string): string {
+  if (!next) return existing;
+  const combined = `${existing}${next}`;
+  if (combined.length <= OUTPUT_MAX_CHARS) return combined;
+  return combined.slice(combined.length - OUTPUT_MAX_CHARS);
 }
 
-function runChecked(
+function collectOutput(stream: ReadableStream<Uint8Array> | null | undefined): ProcessOutputCollector {
+  if (!stream) {
+    return {
+      done: Promise.resolve(""),
+      snapshot: () => "",
+      cancel: () => {},
+    };
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  let cancelled = false;
+  let finished = false;
+  const done = (async (): Promise<string> => {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        output = appendBoundedOutput(output, decoder.decode(chunk.value, { stream: true }));
+      }
+      output = appendBoundedOutput(output, decoder.decode());
+    } catch (err) {
+      if (!cancelled) {
+        output = appendBoundedOutput(output, `\n[smoke] output read failed: ${String(err)}`);
+      }
+    } finally {
+      finished = true;
+      try {
+        reader.releaseLock();
+      } catch {
+        // best-effort stream cleanup only
+      }
+    }
+    return output;
+  })();
+
+  return {
+    done,
+    snapshot: () => output,
+    cancel: () => {
+      if (finished || cancelled) return;
+      cancelled = true;
+      try {
+        void reader.cancel().catch(() => {});
+      } catch {
+        // best-effort stream cleanup only
+      }
+    },
+  };
+}
+
+async function finishOutput(collector: ProcessOutputCollector): Promise<string> {
+  const result = await Promise.race([
+    collector.done.then((text) => ({ text, timedOut: false })),
+    Bun.sleep(OUTPUT_DRAIN_TIMEOUT_MS).then(() => ({
+      text: collector.snapshot(),
+      timedOut: true,
+    })),
+  ]);
+  if (result.timedOut) {
+    collector.cancel();
+  }
+  return result.text;
+}
+
+function killProcessTree(proc: ReturnType<typeof Bun.spawn>): void {
+  try {
+    if (process.platform === "win32" && typeof proc.pid === "number" && proc.pid > 0) {
+      Bun.spawnSync(["taskkill", "/PID", String(proc.pid), "/T", "/F"], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      });
+      return;
+    }
+    proc.kill("SIGKILL");
+  } catch {
+    // best-effort timeout cleanup only
+  }
+}
+
+async function runChecked(
   cmd: string[],
   cwd: string,
   env?: Record<string, string | undefined>,
-): { stdout: string; stderr: string } {
-  const proc = Bun.spawnSync(cmd, {
-    cwd,
-    env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const stdout = decodeOutput(proc.stdout);
-  const stderr = decodeOutput(proc.stderr);
-  if (proc.exitCode !== 0) {
+  timeoutMs = 2 * 60_000,
+): Promise<{ stdout: string; stderr: string }> {
+  const result = await runWithTimeout(cmd, cwd, env ?? (process.env as Record<string, string>), timeoutMs);
+  if (result.exitCode !== 0) {
     throw new Error(
-      `Command failed (${proc.exitCode}): ${cmd.join(" ")}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+      `Command failed (${result.exitCode}): ${cmd.join(" ")}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     );
   }
-  return { stdout, stderr };
+  return { stdout: result.stdout, stderr: result.stderr };
 }
 
 async function runWithTimeout(
@@ -110,20 +199,31 @@ async function runWithTimeout(
     stdout: "pipe",
     stderr: "pipe",
   });
-  const stdoutPromise = proc.stdout ? new Response(proc.stdout).text() : Promise.resolve("");
-  const stderrPromise = proc.stderr ? new Response(proc.stderr).text() : Promise.resolve("");
+  const stdoutCollector = collectOutput(proc.stdout);
+  const stderrCollector = collectOutput(proc.stderr);
+  let timeout: ReturnType<typeof setTimeout> | null = null;
   const exitCode = await Promise.race([
     proc.exited,
-    Bun.sleep(timeoutMs).then(() => {
-      try {
-        proc.kill();
-      } catch {
-        // best-effort timeout cleanup only
-      }
-      return -999;
+    new Promise<number>((resolveTimeout) => {
+      timeout = setTimeout(() => {
+        killProcessTree(proc);
+        resolveTimeout(-999);
+      }, timeoutMs);
     }),
   ]);
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+  if (timeout) {
+    clearTimeout(timeout);
+    timeout = null;
+  }
+  if (exitCode === -999) {
+    await Promise.race([proc.exited.catch(() => -999), Bun.sleep(OUTPUT_DRAIN_TIMEOUT_MS)]);
+    stdoutCollector.cancel();
+    stderrCollector.cancel();
+  }
+  const [stdout, stderr] = await Promise.all([
+    finishOutput(stdoutCollector),
+    finishOutput(stderrCollector),
+  ]);
   if (exitCode === -999) {
     throw new Error(
       `Timed out after ${timeoutMs}ms: ${cmd.join(" ")}\n${summarizeTail(`${stdout}\n${stderr}`)}`,
@@ -136,34 +236,34 @@ async function runWithTimeout(
   };
 }
 
-function initializeTempRepo(root: string): string {
+async function initializeTempRepo(root: string): Promise<string> {
   const repoPath = join(root, "repo");
   const remotePath = join(root, "origin.git");
   mkdirSync(repoPath, { recursive: true });
-  runChecked(["git", "init"], repoPath);
-  runChecked(["git", "branch", "-M", "main"], repoPath);
-  runChecked(["git", "config", "user.name", "PushPals Installed Smoke"], repoPath);
-  runChecked(["git", "config", "user.email", "pushpals-installed-smoke@example.com"], repoPath);
+  await runChecked(["git", "init"], repoPath);
+  await runChecked(["git", "branch", "-M", "main"], repoPath);
+  await runChecked(["git", "config", "user.name", "PushPals Installed Smoke"], repoPath);
+  await runChecked(["git", "config", "user.email", "pushpals-installed-smoke@example.com"], repoPath);
   writeFileSync(join(repoPath, "README.md"), "# Installed CLI Smoke\n", "utf8");
   writeFileSync(
     join(repoPath, "vision.md"),
     "# Installed CLI Smoke Vision\n\n> **One sentence:** Validate the published PushPals package cold-starts cleanly.\n",
     "utf8",
   );
-  runChecked(["git", "add", "README.md", "vision.md"], repoPath);
-  runChecked(["git", "commit", "-m", "chore: seed installed CLI smoke repo"], repoPath);
-  runChecked(["git", "init", "--bare", remotePath], root);
-  runChecked(["git", "remote", "add", "origin", remotePath], repoPath);
-  runChecked(["git", "push", "-u", "origin", "main"], repoPath);
-  runChecked(["git", "checkout", "-b", "main_agents"], repoPath);
-  runChecked(["git", "push", "-u", "origin", "main_agents"], repoPath);
-  runChecked(["git", "checkout", "main"], repoPath);
+  await runChecked(["git", "add", "README.md", "vision.md"], repoPath);
+  await runChecked(["git", "commit", "-m", "chore: seed installed CLI smoke repo"], repoPath);
+  await runChecked(["git", "init", "--bare", remotePath], root);
+  await runChecked(["git", "remote", "add", "origin", remotePath], repoPath);
+  await runChecked(["git", "push", "-u", "origin", "main"], repoPath);
+  await runChecked(["git", "checkout", "-b", "main_agents"], repoPath);
+  await runChecked(["git", "push", "-u", "origin", "main_agents"], repoPath);
+  await runChecked(["git", "checkout", "main"], repoPath);
   return repoPath;
 }
 
-function resolveRepoPath(root: string, repoPath: string | null): string {
+async function resolveRepoPath(root: string, repoPath: string | null): Promise<string> {
   if (!repoPath) {
-    return initializeTempRepo(root);
+    return await initializeTempRepo(root);
   }
   if (!existsSync(join(repoPath, ".git"))) {
     throw new Error(`--repo-path is not a git repository: ${repoPath}`);
@@ -229,7 +329,7 @@ async function runBestEffortClear(
       [pushpalsPath, "--clear", "--runtime-root", runtimeRoot],
       repoPath,
       env,
-      2 * 60_000,
+      60_000,
     );
     if (result.exitCode !== 0) {
       console.warn(
@@ -241,11 +341,35 @@ async function runBestEffortClear(
   }
 }
 
-async function removeTreeWithRetries(root: string, attempts = 10, delayMs = 500): Promise<void> {
+function assertSafeSmokeTempRoot(root: string): void {
+  const normalizedRoot = resolve(root);
+  const normalizedTmp = resolve(tmpdir());
+  if (
+    !normalizedRoot.toLowerCase().startsWith(normalizedTmp.toLowerCase()) ||
+    !basename(normalizedRoot).startsWith("pushpals-installed-cli-smoke-")
+  ) {
+    throw new Error(`Refusing to cleanup unexpected temp root: ${root}`);
+  }
+}
+
+async function removeTreeWithRetries(root: string, attempts = 3, delayMs = 500): Promise<void> {
+  assertSafeSmokeTempRoot(root);
+  const cleanupScript =
+    "import { rmSync } from 'fs'; const target = process.argv[1]; if (!target) process.exit(2); rmSync(target, { recursive: true, force: true });";
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      rmSync(root, { recursive: true, force: true });
+      const result = await runWithTimeout(
+        [process.execPath, "-e", cleanupScript, root],
+        tmpdir(),
+        process.env as Record<string, string | undefined>,
+        TEMP_CLEANUP_TIMEOUT_MS,
+      );
+      if (result.exitCode !== 0) {
+        throw new Error(
+          `temp cleanup exited ${result.exitCode}: ${summarizeTail(`${result.stdout}\n${result.stderr}`)}`,
+        );
+      }
       return;
     } catch (error) {
       lastError = error;
@@ -273,15 +397,17 @@ async function main(): Promise<void> {
     | null = null;
 
   try {
-    const repoPath = resolveRepoPath(root, options.repoPath);
+    const repoPath = await resolveRepoPath(root, options.repoPath);
     const installEnv = {
       ...process.env,
       BUN_INSTALL: bunInstallRoot,
     } as Record<string, string>;
 
     console.log(`[installed-cli-smoke] Installing ${options.packageSpec}`);
-    runChecked([process.execPath, "install", "-g", options.packageSpec], root, installEnv);
-    const globalBinDir = runChecked([process.execPath, "pm", "bin", "-g"], root, installEnv).stdout.trim();
+    await runChecked([process.execPath, "install", "-g", options.packageSpec], root, installEnv, 5 * 60_000);
+    const globalBinDir = (
+      await runChecked([process.execPath, "pm", "bin", "-g"], root, installEnv, 30_000)
+    ).stdout.trim();
     if (!globalBinDir) {
       throw new Error("bun pm bin -g returned an empty path.");
     }

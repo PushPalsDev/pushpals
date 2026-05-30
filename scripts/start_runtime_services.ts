@@ -59,6 +59,7 @@ const DEFAULT_SERVICE_MANAGER_MAX_RESTART_ATTEMPTS = 4;
 const DEFAULT_SERVICE_MANAGER_STABLE_WINDOW_MS = 60_000;
 const DEFAULT_SERVICE_MANAGER_BASE_BACKOFF_MS = 2_000;
 const DEFAULT_SERVICE_MANAGER_MAX_BACKOFF_MS = 30_000;
+const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
 
 export function formatEmbeddedRuntimeHealthLines(health: EmbeddedRuntimeHealth | null): string[] {
   if (!health) return [];
@@ -209,6 +210,8 @@ export class ServiceManager {
             stdin: "ignore",
             stdout: "ignore",
             stderr: "ignore",
+            timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
+            killSignal: "SIGKILL",
           });
         } else {
           existing.proc.kill("SIGKILL");
@@ -277,6 +280,8 @@ export class ServiceManager {
             stdin: "ignore",
             stdout: "ignore",
             stderr: "ignore",
+            timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
+            killSignal: "SIGKILL",
           });
         } else {
           service.proc.kill("SIGKILL");
