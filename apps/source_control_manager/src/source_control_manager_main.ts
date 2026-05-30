@@ -568,12 +568,12 @@ async function tick(): Promise<void> {
     }
 
     // ── Process completion ─────────────────────────────────────────────
+    let tempBranch = "";
     try {
       let processedPrUrl: string | null =
         typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0
           ? completion.prUrl.trim()
           : null;
-      let tempBranch = "";
       // 1. Refresh refs before applying completion commit/ref
       console.log(`[${ts()}] Refreshing refs before applying ${completion.branch}...`);
       await gitOps.fetchPrune();

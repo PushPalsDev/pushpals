@@ -753,8 +753,26 @@ function deriveReviewTaskValidationSteps(paths: string[]): string[] {
         /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
     )
     .slice(0, 4)
-    .map((path) => `bun test ${path}`);
+    .map((path) => `bun test ${formatBunTestPathArg(path)}`);
   return targeted.length > 0 ? targeted : ["bun test"];
+}
+
+function formatBunTestPathArg(path: string): string {
+  const normalized = String(path ?? "").replace(/\\/g, "/").trim();
+  if (!normalized) return normalized;
+  const pathArg =
+    normalized.startsWith("./") ||
+    normalized.startsWith("../") ||
+    normalized.startsWith("/") ||
+    /^[A-Za-z]:\//.test(normalized)
+      ? normalized
+      : `./${normalized}`;
+  return quoteValidationCommandArg(pathArg);
+}
+
+function quoteValidationCommandArg(arg: string): string {
+  if (!/[\s"\\]/.test(arg)) return arg;
+  return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 function buildReviewFixPlannerWorkerInstruction(options: {
@@ -776,6 +794,8 @@ function buildReviewFixPlannerWorkerInstruction(options: {
     `- Previous ReviewAgent score: ${options.reviewScore.toFixed(1)} / 10`,
     `- Required approval threshold: ${options.reviewThreshold.toFixed(1)} / 10`,
     `- Minimum score improvement needed: +${Math.max(0, options.reviewThreshold - options.reviewScore).toFixed(1)}`,
+    "- Make at least one concrete repo change that addresses reviewer feedback, or explicitly document why a finding is invalid in a committed code/test/docs update.",
+    "- Do not return an unchanged branch: PushPals refuses unchanged review-fix re-reviews.",
     `- Push target after fixes: ${options.prHeadRef} (update the existing PR branch only).`,
   ];
   if (options.reviewerFindings.length > 0) {
@@ -1665,6 +1685,7 @@ export class ReviewAgent {
             pr_head_ref: String(pr.head?.ref ?? ""),
           }),
           "The branch already exists on the remote. Checkout the branch, make required fixes, and push.",
+          "Review-fix jobs must produce at least one concrete committed change. If a reviewer finding is invalid, make a small code/test/docs update that documents the reason; unchanged branch re-review is refused.",
           `Raise this PR from ${verdict.score.toFixed(1)}/10 to at least ${this.config.passThreshold.toFixed(1)}/10 without reopening already accepted behavior.`,
           `Reviewer score was ${verdict.score.toFixed(1)}/10. Issues: ${issuesSummary}`,
           ...feedbackContext,

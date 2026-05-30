@@ -70,6 +70,13 @@ type GitWorktreeEntry = {
   detached: boolean;
 };
 
+type ResponseBody = ConstructorParameters<typeof Response>[0];
+
+function readSubprocessOutput(output: ResponseBody | number | undefined): Promise<string> {
+  if (!output || typeof output === "number") return Promise.resolve("");
+  return new Response(output).text();
+}
+
 function normalizeFsPathForComparison(value: string): string {
   const resolved = resolve(String(value ?? "").trim())
     .replace(/\\/g, "/")
@@ -243,8 +250,8 @@ async function runViaWindowsCmd(
     }
 
     const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+      readSubprocessOutput(proc.stdout),
+      readSubprocessOutput(proc.stderr),
     ]);
 
     const exitCode = await proc.exited;
@@ -297,7 +304,7 @@ async function expandWindowsGitExecutableCandidates(
             stderr: "ignore",
           });
           const [stdout, exitCode] = await Promise.all([
-            new Response(proc.stdout).text(),
+            readSubprocessOutput(proc.stdout),
             proc.exited,
           ]);
           if (exitCode === 0) {
@@ -377,8 +384,8 @@ export async function runGitCommandCapture(
     }
 
     const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+      readSubprocessOutput(proc.stdout),
+      readSubprocessOutput(proc.stderr),
     ]);
 
     const exitCode = await proc.exited;

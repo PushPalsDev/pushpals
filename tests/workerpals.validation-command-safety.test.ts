@@ -9,6 +9,7 @@ import {
   collectQualityGateValidationCommands,
   extractRequiredValidationStepsFromVisionMarkdown,
   extractValidationFailureDigest,
+  formatBunTestPathArg,
   inferPlaywrightBrowserInstallTargets,
   inferFallbackValidationCommandsForTestTask,
   isAssertionCoverageTestPath,
@@ -60,6 +61,16 @@ describe("workerpals validation command safety", () => {
       "test",
       "tests/localbuddy.request-status.test.ts",
     ]);
+    expect(tokenizeValidationCommandArgv('bun test "./tests/my smoke.test.ts"')).toEqual([
+      "bun",
+      "test",
+      "./tests/my smoke.test.ts",
+    ]);
+    expect(tokenizeValidationCommandArgv('bun test "./tests/quote\\"case.test.ts"')).toEqual([
+      "bun",
+      "test",
+      './tests/quote"case.test.ts',
+    ]);
   });
 
   test("rejects shell control chaining tokens", () => {
@@ -97,9 +108,20 @@ describe("workerpals validation command safety", () => {
     );
 
     expect(commands.length).toBeGreaterThan(0);
-    expect(commands[0]).toContain("tests/localbuddy.request-status.test.ts");
+    expect(commands[0]).toContain("./tests/localbuddy.request-status.test.ts");
     expect(commands).toContain("bun --cwd apps/localbuddy test");
     expect(commands).not.toContain("bun test");
+  });
+
+  test("formats bun test file paths so Bun treats them as paths, not filters", () => {
+    expect(formatBunTestPathArg("app/__tests__/battlefieldReadability.test.tsx")).toBe(
+      "./app/__tests__/battlefieldReadability.test.tsx",
+    );
+    expect(formatBunTestPathArg("tests/my smoke.test.ts")).toBe(
+      '"./tests/my smoke.test.ts"',
+    );
+    expect(formatBunTestPathArg("./tests/example.test.ts")).toBe("./tests/example.test.ts");
+    expect(formatBunTestPathArg("../outside/example.test.ts")).toBe("../outside/example.test.ts");
   });
 
   test("falls back to full-suite command only when no scoped hints exist", () => {
@@ -171,7 +193,7 @@ describe("workerpals validation command safety", () => {
 
     expect(commands.commandsToRun[0]).toBe("bun run test:root");
     expect(commands.fallbackValidationSteps[0]).toContain(
-      "tests/localbuddy.request-status.test.ts",
+      "./tests/localbuddy.request-status.test.ts",
     );
   });
 

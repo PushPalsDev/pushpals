@@ -63,5 +63,6 @@ export const OPENAI_CODEX_BACKEND: DockerBackendSpec = {
     scriptPath: resolve(import.meta.dir, "openai_codex", "openai_codex_executor.py"),
     pythonConfigKey: "openaiCodexPython",
     timeoutConfigKey: "openaiCodexTimeoutMs",
+    capTimeoutToExecutionBudget: false,
   }),
 };

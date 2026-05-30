@@ -635,6 +635,7 @@ export function tokenizeValidationCommandArgv(command: string): string[] | null 
   const out: string[] = [];
   let current = "";
   let quote: "'" | '"' | null = null;
+  let escaped = false;
 
   const pushCurrent = () => {
     if (!current) return;
@@ -643,7 +644,16 @@ export function tokenizeValidationCommandArgv(command: string): string[] | null 
   };
 
   for (const ch of trimmed) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
     if (quote) {
+      if (quote === '"' && ch === "\\") {
+        escaped = true;
+        continue;
+      }
       if (ch === quote) {
         quote = null;
       } else {
@@ -662,6 +672,7 @@ export function tokenizeValidationCommandArgv(command: string): string[] | null 
     }
     current += ch;
   }
+  if (escaped) current += "\\";
   if (quote) return null;
   pushCurrent();
   if (out.length === 0) return null;
@@ -2289,14 +2300,19 @@ export function inferFallbackValidationCommandsForTestTask(
     /\b(pytest|python)\b/.test(lowerInstruction) ||
     changedTestPaths.some((entry) => entry.toLowerCase().endsWith(".py"));
 
+  const bunTestPath = (path: string) => formatBunTestPathArg(path);
   const normalizedTarget = (targetPath ?? "").replace(/\\/g, "/").trim();
   if (normalizedTarget && isLikelyTestPath(normalizedTarget)) {
-    add(pythonSignal ? `pytest ${normalizedTarget}` : `bun test ${normalizedTarget}`);
+    add(pythonSignal ? `pytest ${normalizedTarget}` : `bun test ${bunTestPath(normalizedTarget)}`);
   }
 
   if (changedTestPaths.length > 0) {
-    const focused = changedTestPaths.slice(0, 4).join(" ");
-    add(pythonSignal ? `pytest ${focused}` : `bun test ${focused}`);
+    const focused = changedTestPaths.slice(0, 4);
+    add(
+      pythonSignal
+        ? `pytest ${focused.join(" ")}`
+        : `bun test ${focused.map((entry) => bunTestPath(entry)).join(" ")}`,
+    );
   }
 
   const scopeHints = [
@@ -2322,6 +2338,24 @@ export function inferFallbackValidationCommandsForTestTask(
     add(pythonSignal ? "pytest" : "bun test");
   }
   return candidates.slice(0, 4);
+}
+
+export function formatBunTestPathArg(path: string): string {
+  const normalized = String(path ?? "").replace(/\\/g, "/").trim();
+  if (!normalized) return normalized;
+  const pathArg =
+    normalized.startsWith("./") ||
+    normalized.startsWith("../") ||
+    normalized.startsWith("/") ||
+    /^[A-Za-z]:\//.test(normalized)
+      ? normalized
+      : `./${normalized}`;
+  return quoteValidationCommandArg(pathArg);
+}
+
+function quoteValidationCommandArg(arg: string): string {
+  if (!/[\s"\\]/.test(arg)) return arg;
+  return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 export function isTestFocusedTask(

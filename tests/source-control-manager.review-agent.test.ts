@@ -505,10 +505,14 @@ describe("ReviewAgent", () => {
     expect(createdTaskTags).toEqual(["review-agent", "review-fix"]);
     expect(enqueuedWriteGlobs.length).toBeGreaterThan(0);
     expect(enqueuedTargetPaths).toEqual(["tests/api/review.test.ts"]);
-    expect(enqueuedValidationSteps).toEqual(["bun test tests/api/review.test.ts"]);
+    expect(enqueuedValidationSteps).toEqual(["bun test ./tests/api/review.test.ts"]);
     expect(enqueuedResolutionType).toBe("review_fix");
     expect(enqueuedReviewThreshold).toBe(9.5);
     expect(enqueuedReviewerFindings).toEqual(["Missing negative-path assertions"]);
+    expect(enqueuedPlannerWorkerInstruction).toContain("Do not return an unchanged branch");
+    expect(enqueuedRecentContext).toContain(
+      "Review-fix jobs must produce at least one concrete committed change. If a reviewer finding is invalid, make a small code/test/docs update that documents the reason; unchanged branch re-review is refused.",
+    );
     expect(enqueuedRecentContext).toContain("Recent PR feedback comments:");
     expect(
       enqueuedRecentContext.some(

@@ -65,6 +65,7 @@ async function mustGit(cwd: string, args: string[], label: string): Promise<stri
 
 const skipRebaseSyncTest = await shouldSkipForGitSpawnPermission();
 const runRebaseSyncTest = skipRebaseSyncTest ? test.skip : test;
+const REBASE_SYNC_TEST_TIMEOUT_MS = 15_000;
 
 describe("workerpals rebase sync", () => {
   runRebaseSyncTest(
@@ -174,6 +175,7 @@ describe("workerpals rebase sync", () => {
         rmSync(root, { recursive: true, force: true });
       }
     },
+    REBASE_SYNC_TEST_TIMEOUT_MS,
   );
 
   runRebaseSyncTest(
@@ -248,6 +250,7 @@ describe("workerpals rebase sync", () => {
         rmSync(root, { recursive: true, force: true });
       }
     },
+    REBASE_SYNC_TEST_TIMEOUT_MS,
   );
 
   runRebaseSyncTest(
@@ -325,6 +328,7 @@ describe("workerpals rebase sync", () => {
         rmSync(root, { recursive: true, force: true });
       }
     },
+    REBASE_SYNC_TEST_TIMEOUT_MS,
   );
 
   runRebaseSyncTest(

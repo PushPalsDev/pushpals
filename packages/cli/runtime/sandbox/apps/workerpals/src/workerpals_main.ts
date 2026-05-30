@@ -987,7 +987,11 @@ function failNoChangeReviewFixJob(jobId: string, result: WorkerJobResult): Worke
     ok: false,
     summary:
       `Rejected review-fix job ${jobId} produced no code changes; refusing unchanged branch re-review.`,
-    stderr: [result.stderr, "Apply at least one concrete fix before requesting another review."]
+    stderr: [
+      result.stderr,
+      "Review-fix jobs must make at least one concrete code/test/docs change before requesting another review.",
+      "If the reviewer feedback is invalid, commit a narrow explanatory change that documents the decision; unchanged branch re-review is refused.",
+    ]
       .filter(Boolean)
       .join("\n"),
     exitCode: typeof result.exitCode === "number" ? result.exitCode : 4,

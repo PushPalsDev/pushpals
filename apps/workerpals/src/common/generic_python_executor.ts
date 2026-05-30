@@ -25,6 +25,7 @@ interface GenericPythonExecutorConfig {
   scriptPath: string;
   pythonConfigKey: string;
   timeoutConfigKey: string;
+  capTimeoutToExecutionBudget?: boolean;
 }
 
 function estimateTokensFromText(text: string): number {
@@ -119,6 +120,22 @@ function resolveRuntimeSettings(
   return { pythonBin, timeoutMs };
 }
 
+export function resolveGenericPythonExecutorTimeoutMs(params: {
+  configuredTimeoutMs: number;
+  executionBudgetMs?: number | null;
+  capTimeoutToExecutionBudget?: boolean;
+}): number {
+  const configuredTimeoutMs = Math.max(10_000, Math.floor(params.configuredTimeoutMs));
+  const executionBudgetMs =
+    typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs)
+      ? Math.max(10_000, Math.floor(params.executionBudgetMs))
+      : null;
+  if (executionBudgetMs != null && params.capTimeoutToExecutionBudget !== false) {
+    return Math.min(configuredTimeoutMs, executionBudgetMs);
+  }
+  return configuredTimeoutMs;
+}
+
 export function createGenericPythonExecutor(
   config: GenericPythonExecutorConfig,
 ): BackendTaskExecutor {
@@ -150,10 +167,11 @@ export function createGenericPythonExecutor(
       typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
         ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
         : null;
-    const timeoutMs =
-      executionBudgetMs != null
-        ? Math.min(configuredTimeoutMs, executionBudgetMs)
-        : configuredTimeoutMs;
+    const timeoutMs = resolveGenericPythonExecutorTimeoutMs({
+      configuredTimeoutMs,
+      executionBudgetMs,
+      capTimeoutToExecutionBudget: config.capTimeoutToExecutionBudget,
+    });
     const payloadBase64 = Buffer.from(
       JSON.stringify({
         kind,

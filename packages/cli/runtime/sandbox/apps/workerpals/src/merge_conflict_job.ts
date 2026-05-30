@@ -125,11 +125,31 @@ function isTestPath(path: string): boolean {
   return /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path);
 }
 
+function formatBunTestPathArg(path: string): string {
+  const normalized = String(path ?? "").replace(/\\/g, "/").trim();
+  if (!normalized) return normalized;
+  const pathArg =
+    normalized.startsWith("./") ||
+    normalized.startsWith("../") ||
+    normalized.startsWith("/") ||
+    /^[A-Za-z]:\//.test(normalized)
+      ? normalized
+      : `./${normalized}`;
+  return quoteValidationCommandArg(pathArg);
+}
+
+function quoteValidationCommandArg(arg: string): string {
+  if (!/[\s"\\]/.test(arg)) return arg;
+  return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 function deriveValidationSteps(existing: unknown, conflictPaths: string[]): string[] {
   const preserved = Array.isArray(existing)
     ? existing.map((entry) => String(entry ?? "").trim()).filter(Boolean)
     : [];
-  const targeted = conflictPaths.filter(isTestPath).map((entry) => `bun test ${entry}`);
+  const targeted = conflictPaths
+    .filter(isTestPath)
+    .map((entry) => `bun test ${formatBunTestPathArg(entry)}`);
   const merged = dedupeStrings([...targeted, ...preserved], 8);
   return merged.length > 0 ? merged : ["bun test"];
 }
