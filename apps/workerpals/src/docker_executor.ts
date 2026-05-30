@@ -107,7 +107,12 @@ function dockerBuildFileArg(root: string, dockerfilePath: string): string {
 }
 
 function isMissingDockerImageDetail(detail: string): boolean {
-  return /\b(no such object|no such image|not found)\b/i.test(String(detail ?? ""));
+  const text = String(detail ?? "");
+  return (
+    /\b(no such object|no such image|not found)\b/i.test(text) ||
+    /\bunable to find image\b.*\blocally\b/i.test(text) ||
+    /\bpull access denied\b.*\brepository does not exist\b/i.test(text)
+  );
 }
 
 type ParsedWorktreeRecord = {
@@ -1600,12 +1605,28 @@ export class DockerExecutor {
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<void> {
     const backend = resolveExecutor(this.config);
-    for (let attempt = 1; attempt <= this.warmSetupMaxAttempts; attempt++) {
+    let attempt = 1;
+    let recoveredMissingImage = false;
+    while (attempt <= this.warmSetupMaxAttempts) {
       try {
         await this.ensureWarmContainer();
         await this.ensureBackendWarmup(backend);
         return;
       } catch (err) {
+        if (this.isMissingDockerImageError(err) && !recoveredMissingImage) {
+          recoveredMissingImage = true;
+          const rebuildNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is missing locally; rebuilding before retrying warm container startup.`;
+          console.warn(rebuildNote);
+          onLog?.("stderr", rebuildNote);
+          await this.stopWarmContainer("missing image recovery", true);
+          this.warmedBackends.clear();
+          if (await this.pullImage()) {
+            const retryNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is available again; retrying warm container startup.`;
+            console.log(retryNote);
+            onLog?.("stdout", retryNote);
+            continue;
+          }
+        }
         const retryable = this.isRetryableError(err);
         if (attempt >= this.warmSetupMaxAttempts || !retryable) {
           if (
@@ -1631,6 +1652,7 @@ export class DockerExecutor {
         onLog?.("stderr", note);
         await this.stopWarmContainer("warm setup retry", true);
         await this.sleep(retryInMs);
+        attempt += 1;
       }
     }
   }
@@ -1725,6 +1747,10 @@ export class DockerExecutor {
   private isRetryableError(err: unknown): boolean {
     const text = this.compactError(err).toLowerCase();
     return this.matchesRetryablePattern(text);
+  }
+
+  private isMissingDockerImageError(err: unknown): boolean {
+    return isMissingDockerImageDetail(this.compactError(err));
   }
 
   private isRetryableJobFailure(result: DockerJobResult): boolean {

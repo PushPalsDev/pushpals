@@ -222,6 +222,66 @@ describe("workerpals docker executor internals", () => {
     expect(stopCalls).toBe(1);
   });
 
+  test("ensureWarmRuntimeReady rebuilds when the warm image vanished locally", async () => {
+    const executor = createExecutor() as unknown as {
+      ensureWarmRuntimeReady: (
+        job: {
+          id: string;
+          taskId: string;
+          kind: string;
+          params: Record<string, unknown>;
+          sessionId: string;
+        },
+        onLog?: (stream: "stdout" | "stderr", line: string) => void,
+      ) => Promise<void>;
+      ensureWarmContainer: () => Promise<void>;
+      ensureBackendWarmup: () => Promise<void>;
+      pullImage: () => Promise<boolean>;
+      stopWarmContainer: (reason: string, quiet?: boolean) => Promise<void>;
+      sleep: (ms: number) => Promise<void>;
+    };
+
+    let warmContainerAttempts = 0;
+    let pullCalls = 0;
+    let stopCalls = 0;
+    const logs: string[] = [];
+
+    executor.ensureWarmContainer = async () => {
+      warmContainerAttempts += 1;
+      if (warmContainerAttempts === 1) {
+        throw new Error(
+          "Failed to start warm container (exit 125): Unable to find image 'pushpals-worker-sandbox:latest' locally docker: Error response from daemon: pull access denied for pushpals-worker-sandbox, repository does not exist or may require 'docker login': denied",
+        );
+      }
+    };
+    executor.ensureBackendWarmup = async () => {};
+    executor.pullImage = async () => {
+      pullCalls += 1;
+      return true;
+    };
+    executor.stopWarmContainer = async () => {
+      stopCalls += 1;
+    };
+    executor.sleep = async () => {};
+
+    await executor.ensureWarmRuntimeReady(
+      {
+        id: "job-missing-image",
+        taskId: "task-missing-image",
+        kind: "task.execute",
+        params: {},
+        sessionId: "dev",
+      },
+      (stream, line) => logs.push(`${stream}:${line}`),
+    );
+
+    expect(warmContainerAttempts).toBe(2);
+    expect(pullCalls).toBe(1);
+    expect(stopCalls).toBe(1);
+    expect(logs.join("\n")).toContain("is missing locally");
+    expect(logs.join("\n")).toContain("retrying warm container startup");
+  });
+
   test("openaiCodexAuthMountArgs ignores relative CODEX_HOME overrides that point into the repo", () => {
     const original = process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME;
     process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME = ".codex";
