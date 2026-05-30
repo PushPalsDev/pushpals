@@ -2728,49 +2728,67 @@ async function runDeterministicQualityGate(
   };
 }
 
-async function runTaskCriticReview(
-  repo: string,
-  params: Record<string, unknown>,
-  quality: DeterministicQualityResult,
+type QualityCriticTimeoutBehavior = "skip" | "retry_once" | "block";
+
+function resolveQualityCriticTimeoutMs(runtimeConfig: WorkerpalsRuntimeConfig): number {
+  const value = Number(runtimeConfig.workerpals.qualityCriticTimeoutMs);
+  if (!Number.isFinite(value)) return 90_000;
+  return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
+}
+
+function resolveQualityCriticTimeoutBehavior(
   runtimeConfig: WorkerpalsRuntimeConfig,
-  onLog?: (stream: "stdout" | "stderr", line: string) => void,
-): Promise<CriticReview | null> {
-  const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
-  const model = runtimeConfig.workerpals.llm.model.trim();
-  if (!endpoint || !model) return null;
+): QualityCriticTimeoutBehavior {
+  const value = String(runtimeConfig.workerpals.qualityCriticTimeoutBehavior ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+  if (value === "skip" || value === "retry_once" || value === "block") return value;
+  return "retry_once";
+}
 
-  const changedForDiff = quality.changedPaths.slice(0, 8);
-  let diffText = "";
-  if (changedForDiff.length > 0) {
-    const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
-    diffText = diffResult.ok ? diffResult.stdout : diffResult.stderr;
-  }
-  const qualityCriticMaxDiffChars = (() => {
-    const value = Number(runtimeConfig.workerpals.qualityCriticMaxDiffChars);
-    if (!Number.isFinite(value)) return 16_000;
-    return Math.max(256, Math.min(524_288, Math.floor(value)));
-  })();
-  const qualityCriticMaxValidationOutputChars = (() => {
-    const value = Number(runtimeConfig.workerpals.qualityCriticMaxValidationOutputChars);
-    if (!Number.isFinite(value)) return 8_000;
-    return Math.max(256, Math.min(524_288, Math.floor(value)));
-  })();
-  const qualityCriticTimeoutMs = (() => {
-    const value = Number(runtimeConfig.workerpals.qualityCriticTimeoutMs);
-    if (!Number.isFinite(value)) return 45_000;
-    return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
-  })();
-  diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
-    0,
-    qualityCriticMaxDiffChars,
-  );
+function resolveQualityCriticModel(
+  runtimeConfig: WorkerpalsRuntimeConfig,
+  fallback = "",
+): string {
+  return String(runtimeConfig.workerpals.qualityCriticModel ?? "").trim() || fallback.trim();
+}
 
-  const validationSummary = quality.validationRuns
+function resolveQualityCriticMaxDiffChars(
+  runtimeConfig: WorkerpalsRuntimeConfig,
+  compact = false,
+): number {
+  const value = Number(runtimeConfig.workerpals.qualityCriticMaxDiffChars);
+  const max = Number.isFinite(value) ? value : 16_000;
+  const bounded = Math.max(256, Math.min(524_288, Math.floor(max)));
+  return compact ? Math.min(bounded, 6_000) : bounded;
+}
+
+function resolveQualityCriticMaxValidationOutputChars(
+  runtimeConfig: WorkerpalsRuntimeConfig,
+  compact = false,
+): number {
+  const value = Number(runtimeConfig.workerpals.qualityCriticMaxValidationOutputChars);
+  const max = Number.isFinite(value) ? value : 8_000;
+  const bounded = Math.max(256, Math.min(524_288, Math.floor(max)));
+  return compact ? Math.min(bounded, 2_000) : bounded;
+}
+
+function buildCriticValidationSummary(
+  quality: DeterministicQualityResult,
+  maxValidationOutputChars: number,
+): string {
+  const allPassed =
+    quality.validationRuns.length > 0 && quality.validationRuns.every((run) => run.ok);
+  return quality.validationRuns
     .map((run) => {
-      const output = [run.stdout, run.stderr]
-        .filter(Boolean)
-        .join("\n")
-        .slice(0, qualityCriticMaxValidationOutputChars);
+      const output =
+        allPassed
+          ? ""
+          : [run.stdout, run.stderr]
+              .filter(Boolean)
+              .join("\n")
+              .slice(0, maxValidationOutputChars);
       return [
         `Command: ${run.command}`,
         `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
@@ -2780,6 +2798,38 @@ async function runTaskCriticReview(
         .join("\n");
     })
     .join("\n\n---\n\n");
+}
+
+function criticTimeoutReview(
+  source: "Codex" | "LLM",
+  timeoutMs: number,
+  elapsedMs: number,
+): CriticReview {
+  const summary = `${source} critic timed out after ${elapsedMs}ms (timeout=${timeoutMs}ms).`;
+  return {
+    score: 0,
+    findings: [summary],
+    mustFix: [
+      "CriticGate timeout behavior is set to block; complete the critic review by reducing critic input, choosing a faster critic model, or increasing workerpals.quality_critic_timeout_ms.",
+    ],
+    revisionGuidance:
+      "Do not change product code for this finding unless product code caused the critic prompt explosion. Adjust CriticGate configuration or reduce validation/diff evidence volume.",
+    raw: JSON.stringify({ score: 0, findings: [summary], must_fix: ["CriticGate timed out"] }),
+  };
+}
+
+async function runTaskCriticReview(
+  repo: string,
+  params: Record<string, unknown>,
+  quality: DeterministicQualityResult,
+  runtimeConfig: WorkerpalsRuntimeConfig,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<CriticReview | null> {
+  const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
+  const model = resolveQualityCriticModel(runtimeConfig, runtimeConfig.workerpals.llm.model.trim());
+  if (!endpoint || !model) return null;
+  const qualityCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
 
   const planning = params.planning as TaskExecutePlanning;
   const instruction = String(params.instruction ?? "").trim();
@@ -2797,33 +2847,65 @@ async function runTaskCriticReview(
   const changedPathsText =
     quality.changedPaths.map((entry) => `- ${entry}`).join("\n") || "- (none)";
   const criticSystem = loadPromptTemplate("workerpals/task_quality_critic_system_prompt.md").trim();
-  const criticUser = loadPromptTemplate("workerpals/task_quality_critic_user_prompt.md", {
-    instruction,
-    acceptance_criteria: acceptanceCriteriaText,
-    validation_steps: validationStepsText,
-    changed_paths: changedPathsText,
-    diff_excerpt: diffText || "(empty diff excerpt)",
-    validation_evidence: validationSummary || "(no validation output)",
-  });
 
   const apiKey = runtimeConfig.workerpals.llm.apiKey.trim() || "local";
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const bodyBase = {
-    model,
-    messages: [
-      { role: "system", content: criticSystem },
-      { role: "user", content: criticUser },
-    ],
-    temperature: 0,
-    max_tokens: 700,
+
+  const buildAttemptPayload = async (compact: boolean) => {
+    const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
+    let diffText = "";
+    if (changedForDiff.length > 0) {
+      const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
+      diffText = diffResult.ok ? diffResult.stdout : diffResult.stderr;
+    }
+    diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
+      0,
+      resolveQualityCriticMaxDiffChars(runtimeConfig, compact),
+    );
+    const validationSummary = buildCriticValidationSummary(
+      quality,
+      resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact),
+    );
+    const criticUser = loadPromptTemplate("workerpals/task_quality_critic_user_prompt.md", {
+      instruction,
+      acceptance_criteria: acceptanceCriteriaText,
+      validation_steps: validationStepsText,
+      changed_paths: changedPathsText,
+      diff_excerpt: diffText || "(empty diff excerpt)",
+      validation_evidence: validationSummary || "(no validation output)",
+    });
+    const promptChars = criticSystem.length + criticUser.length;
+    const promptBytes = new TextEncoder().encode(`${criticSystem}\n${criticUser}`).length;
+    return {
+      bodyBase: {
+        model,
+        messages: [
+          { role: "system", content: criticSystem },
+          { role: "user", content: criticUser },
+        ],
+        temperature: 0,
+        max_tokens: compact ? 500 : 700,
+      },
+      promptChars,
+      promptBytes,
+      diffChars: diffText.length,
+      validationChars: validationSummary.length,
+    };
   };
 
-  const runCriticRequest = async (responseFormat: Record<string, unknown> | null) => {
+  const runCriticRequest = async (
+    bodyBase: Record<string, unknown>,
+    responseFormat: Record<string, unknown> | null,
+  ) => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), qualityCriticTimeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, qualityCriticTimeoutMs);
     try {
       const response = await fetch(endpoint, {
         method: "POST",
@@ -2834,14 +2916,29 @@ async function runTaskCriticReview(
         signal: controller.signal,
       });
       const text = await response.text();
-      return { response, text };
+      return { timedOut: false as const, response, text };
+    } catch (err) {
+      if (!timedOut && String((err as { name?: unknown })?.name ?? "") !== "AbortError") {
+        throw err;
+      }
+      return { timedOut: true as const, err };
     } finally {
       clearTimeout(timer);
     }
   };
 
-  try {
-    let request = await runCriticRequest({ type: "json_object" });
+  const runAttempt = async (
+    attempt: number,
+    compact: boolean,
+  ): Promise<{ status: "timeout" } | { status: "done"; review: CriticReview | null }> => {
+    const payload = await buildAttemptPayload(compact);
+    const startedAt = Date.now();
+    onLog?.(
+      "stdout",
+      `[CriticGate] LLM review attempt ${attempt}${compact ? " (compact)" : ""}: model=${model} timeout_ms=${qualityCriticTimeoutMs} behavior=${timeoutBehavior} prompt_chars=${payload.promptChars} prompt_bytes=${payload.promptBytes} diff_chars=${payload.diffChars} validation_chars=${payload.validationChars}`,
+    );
+    let request = await runCriticRequest(payload.bodyBase, { type: "json_object" });
+    if (request.timedOut) return { status: "timeout" };
     if (!request.response.ok && request.response.status === 400) {
       const lowered = request.text.toLowerCase();
       if (lowered.includes("response_format")) {
@@ -2849,7 +2946,8 @@ async function runTaskCriticReview(
           "stdout",
           "[CriticGate] fallback: response_format json_object unsupported; retrying without strict response_format.",
         );
-        request = await runCriticRequest(null);
+        request = await runCriticRequest(payload.bodyBase, null);
+        if (request.timedOut) return { status: "timeout" };
       }
     }
     if (!request.response.ok) {
@@ -2857,12 +2955,12 @@ async function runTaskCriticReview(
         "stderr",
         `[CriticGate] review request failed (${request.response.status}): ${toSingleLine(request.text, 240)}`,
       );
-      return null;
+      return { status: "done", review: null };
     }
 
-    const payload = parseJsonObjectLoose(request.text) ?? JSON.parse(request.text);
-    const choices = Array.isArray((payload as Record<string, unknown>).choices)
-      ? ((payload as Record<string, unknown>).choices as Array<Record<string, unknown>>)
+    const responsePayload = parseJsonObjectLoose(request.text) ?? JSON.parse(request.text);
+    const choices = Array.isArray((responsePayload as Record<string, unknown>).choices)
+      ? ((responsePayload as Record<string, unknown>).choices as Array<Record<string, unknown>>)
       : [];
     const content = String(
       (choices[0]?.message as Record<string, unknown> | undefined)?.content ?? "",
@@ -2876,7 +2974,7 @@ async function runTaskCriticReview(
           220,
         )}`,
       );
-      return null;
+      return { status: "done", review: null };
     }
 
     const scoreRaw = Number(reviewObj.score);
@@ -2890,13 +2988,43 @@ async function runTaskCriticReview(
       .trim()
       .slice(0, 2000);
     const score = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(10, scoreRaw)) : 0;
+    onLog?.(
+      "stdout",
+      `[CriticGate] LLM review completed in ${Date.now() - startedAt}ms (attempt ${attempt}).`,
+    );
     return {
-      score,
-      findings,
-      mustFix,
-      revisionGuidance,
-      raw: compactJobOutput(content, outputPolicyForRuntime(runtimeConfig)),
+      status: "done",
+      review: {
+        score,
+        findings,
+        mustFix,
+        revisionGuidance,
+        raw: compactJobOutput(content, outputPolicyForRuntime(runtimeConfig)),
+      },
     };
+  };
+
+  try {
+    let attempt = await runAttempt(1, false);
+    if (attempt.status === "timeout" && timeoutBehavior === "retry_once") {
+      onLog?.(
+        "stderr",
+        `[CriticGate] LLM review timed out after ${qualityCriticTimeoutMs}ms; retrying once with compact critic input.`,
+      );
+      attempt = await runAttempt(2, true);
+    }
+    if (attempt.status === "timeout") {
+      if (timeoutBehavior === "block") {
+        onLog?.(
+          "stderr",
+          `[CriticGate] LLM review timed out after ${qualityCriticTimeoutMs}ms; blocking because quality_critic_timeout_behavior=block.`,
+        );
+        return criticTimeoutReview("LLM", qualityCriticTimeoutMs, qualityCriticTimeoutMs);
+      }
+      onLog?.("stderr", `[CriticGate] LLM timed out after ${qualityCriticTimeoutMs}ms; skipping.`);
+      return null;
+    }
+    return attempt.review;
   } catch (err) {
     onLog?.(
       "stderr",
@@ -5551,86 +5679,92 @@ async function runCodexCriticReview(
 
   const instruction = String(params.instruction ?? "").trim();
   const planning = params.planning as TaskExecutePlanning;
+  const qualityCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
+  const criticModel = resolveQualityCriticModel(runtimeConfig);
 
-  const changedForDiff = quality.changedPaths.slice(0, 8);
-  let diffText = "";
-  const qualityCriticMaxDiffChars = (() => {
-    const value = Number(runtimeConfig.workerpals.qualityCriticMaxDiffChars);
-    if (!Number.isFinite(value)) return 16_000;
-    return Math.max(256, Math.min(524_288, Math.floor(value)));
-  })();
-  const qualityCriticMaxValidationOutputChars = (() => {
-    const value = Number(runtimeConfig.workerpals.qualityCriticMaxValidationOutputChars);
-    if (!Number.isFinite(value)) return 8_000;
-    return Math.max(256, Math.min(524_288, Math.floor(value)));
-  })();
-  const qualityCriticTimeoutMs = (() => {
-    const value = Number(runtimeConfig.workerpals.qualityCriticTimeoutMs);
-    if (!Number.isFinite(value)) return 45_000;
-    return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
-  })();
-  if (changedForDiff.length > 0) {
-    const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
-    diffText = (diffResult.ok ? diffResult.stdout : diffResult.stderr).slice(
+  const buildCriticInstruction = async (compact: boolean) => {
+    const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
+    let diffText = "";
+    if (changedForDiff.length > 0) {
+      const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
+      diffText = diffResult.ok ? diffResult.stdout : diffResult.stderr;
+    }
+    diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
       0,
-      qualityCriticMaxDiffChars,
+      resolveQualityCriticMaxDiffChars(runtimeConfig, compact),
     );
-  }
-
-  const validationSummary = quality.validationRuns
-    .map((run) => {
-      const output = [run.stdout, run.stderr]
-        .filter(Boolean)
-        .join("\n")
-        .slice(0, qualityCriticMaxValidationOutputChars);
-      return [
-        `Command: ${run.command}`,
-        `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode})`,
-        output,
-      ]
-        .filter(Boolean)
-        .join("\n");
-    })
-    .join("\n---\n");
-
-  const criticInstruction = loadPromptTemplate(
-    "workerpals/codex_quality_critic_instruction_prompt.md",
-    {
-      instruction,
-      acceptance_criteria:
-        planning.acceptanceCriteria.map((c) => `- ${c}`).join("\n") || "- (none)",
-      changed_paths: quality.changedPaths.join(", ") || "(none)",
-      diff_section: diffText ? `Diff:\n${diffText}` : "Diff: (empty - no changes detected)",
-      validation_section: validationSummary
-        ? `Validation:\n${validationSummary}`
-        : "Validation: (none)",
-    },
-  );
+    const validationSummary = buildCriticValidationSummary(
+      quality,
+      resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact),
+    );
+    const criticInstruction = loadPromptTemplate(
+      "workerpals/codex_quality_critic_instruction_prompt.md",
+      {
+        instruction,
+        acceptance_criteria:
+          planning.acceptanceCriteria.map((c) => `- ${c}`).join("\n") || "- (none)",
+        changed_paths: quality.changedPaths.join(", ") || "(none)",
+        diff_section: diffText ? `Diff:\n${diffText}` : "Diff: (empty - no changes detected)",
+        validation_section: validationSummary
+          ? `Validation:\n${validationSummary}`
+          : "Validation: (none)",
+      },
+    );
+    return {
+      criticInstruction,
+      promptChars: criticInstruction.length,
+      promptBytes: new TextEncoder().encode(criticInstruction).length,
+      diffChars: diffText.length,
+      validationChars: validationSummary.length,
+    };
+  };
 
   const tmpOutputPath = `/tmp/pushpals-critic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`;
-  const cmd = [
-    ...codexPrefix,
-    "-c",
-    'model_reasoning_effort="low"',
-    "-a",
-    "never",
-    "exec",
-    "-s",
-    "read-only",
-    "--output-last-message",
-    tmpOutputPath,
-    "-",
-  ];
+  const buildCmd = () => {
+    const cmd = [
+      ...codexPrefix,
+      "-c",
+      'model_reasoning_effort="low"',
+      "-a",
+      "never",
+      "exec",
+      "-s",
+      "read-only",
+      "--color",
+      "never",
+      "--output-last-message",
+      tmpOutputPath,
+    ];
+    if (criticModel) cmd.push("-m", criticModel);
+    cmd.push("-");
+    return cmd;
+  };
 
   const env = buildWorkerSandboxWritableEnv(repo);
   const codexMask = maskRepoLocalCodexFilesForCodexCli(repo, env);
-  try {
-    const proc = Bun.spawn(cmd, {
+
+  const runAttempt = async (
+    attempt: number,
+    compact: boolean,
+  ): Promise<{ status: "timeout" } | { status: "done"; review: CriticReview | null }> => {
+    try {
+      unlinkSync(tmpOutputPath);
+    } catch {
+      /* ignore stale/missing critic output */
+    }
+    const payload = await buildCriticInstruction(compact);
+    const startedAt = Date.now();
+    onLog?.(
+      "stdout",
+      `[CriticGate] Codex review attempt ${attempt}${compact ? " (compact)" : ""}: model=${criticModel || "(codex default)"} timeout_ms=${qualityCriticTimeoutMs} behavior=${timeoutBehavior} prompt_chars=${payload.promptChars} prompt_bytes=${payload.promptBytes} diff_chars=${payload.diffChars} validation_chars=${payload.validationChars}`,
+    );
+    const proc = Bun.spawn(buildCmd(), {
       cwd: repo,
       env,
       stdout: "pipe",
       stderr: "pipe",
-      stdin: new Blob([criticInstruction]),
+      stdin: new Blob([payload.criticInstruction]),
     });
 
     let timedOut = false;
@@ -5647,8 +5781,7 @@ async function runCodexCriticReview(
     clearTimeout(timer);
 
     if (timedOut) {
-      onLog?.("stderr", "[CriticGate] Codex timed out; skipping.");
-      return null;
+      return { status: "timeout" };
     }
     if (exitCode !== 0) {
       const stderrText = await new Response(proc.stderr).text();
@@ -5656,7 +5789,7 @@ async function runCodexCriticReview(
         "stderr",
         `[CriticGate] Codex exited ${exitCode}: ${toSingleLine(stderrText, 220)}`,
       );
-      return null;
+      return { status: "done", review: null };
     }
 
     let lastMessage = "";
@@ -5673,7 +5806,7 @@ async function runCodexCriticReview(
 
     if (!lastMessage) {
       onLog?.("stderr", "[CriticGate] Codex: no output message captured; skipping.");
-      return null;
+      return { status: "done", review: null };
     }
 
     const reviewObj = parseJsonObjectLoose(lastMessage);
@@ -5682,7 +5815,7 @@ async function runCodexCriticReview(
         "stderr",
         `[CriticGate] Codex returned non-JSON: ${toSingleLine(lastMessage, 220)}`,
       );
-      return null;
+      return { status: "done", review: null };
     }
 
     const scoreRaw = Number(reviewObj.score);
@@ -5696,14 +5829,43 @@ async function runCodexCriticReview(
     const revisionGuidance = String(reviewObj.revision_guidance ?? "")
       .trim()
       .slice(0, 2000);
-    onLog?.("stdout", `[CriticGate] Codex score: ${score}/10`);
+    onLog?.(
+      "stdout",
+      `[CriticGate] Codex score: ${score}/10 (${Date.now() - startedAt}ms, attempt ${attempt})`,
+    );
     return {
-      score,
-      findings,
-      mustFix,
-      revisionGuidance,
-      raw: compactJobOutput(lastMessage, outputPolicyForRuntime(runtimeConfig)),
+      status: "done",
+      review: {
+        score,
+        findings,
+        mustFix,
+        revisionGuidance,
+        raw: compactJobOutput(lastMessage, outputPolicyForRuntime(runtimeConfig)),
+      },
     };
+  };
+
+  try {
+    let attempt = await runAttempt(1, false);
+    if (attempt.status === "timeout" && timeoutBehavior === "retry_once") {
+      onLog?.(
+        "stderr",
+        `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; retrying once with compact critic input.`,
+      );
+      attempt = await runAttempt(2, true);
+    }
+    if (attempt.status === "timeout") {
+      if (timeoutBehavior === "block") {
+        onLog?.(
+          "stderr",
+          `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; blocking because quality_critic_timeout_behavior=block.`,
+        );
+        return criticTimeoutReview("Codex", qualityCriticTimeoutMs, qualityCriticTimeoutMs);
+      }
+      onLog?.("stderr", `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; skipping.`);
+      return null;
+    }
+    return attempt.review;
   } catch (err) {
     onLog?.("stderr", `[CriticGate] Codex error: ${toSingleLine(err, 220)} (skipping).`);
     return null;

@@ -743,7 +743,8 @@ var DEFAULT_WORKERPALS_OUTPUT_MAX_CHARS = 192 * 1024;
 var DEFAULT_WORKERPALS_OUTPUT_MAX_LINES = 600;
 var DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES = 120;
 var DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180000;
-var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 45000;
+var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 90000;
+var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR = "retry_once";
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8000;
 var DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
@@ -823,6 +824,13 @@ function asString(value, fallback) {
   if (typeof value === "string" && value.trim())
     return value.trim();
   return fallback;
+}
+function asQualityCriticTimeoutBehavior(value) {
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/-/g, "_");
+  if (normalized === "skip" || normalized === "retry_once" || normalized === "block") {
+    return normalized;
+  }
+  return DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR;
 }
 function asBoolean(value, fallback) {
   if (typeof value === "boolean")
@@ -1118,6 +1126,7 @@ function loadPushPalsConfig(options = {}) {
   const workerOutputMaxHeadLines = Math.max(1, Math.min(workerOutputMaxLines, asInt(parseIntEnv("WORKERPALS_OUTPUT_MAX_HEAD_LINES") ?? workerNode.output_max_head_lines, DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES)));
   const workerQualityValidationStepTimeoutMs = Math.max(1000, asInt(parseIntEnv("WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS") ?? workerNode.quality_validation_step_timeout_ms, DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS));
   const workerQualityCriticTimeoutMs = Math.max(1000, asInt(parseIntEnv("WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS") ?? workerNode.quality_critic_timeout_ms, DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS));
+  const workerQualityCriticTimeoutBehavior = asQualityCriticTimeoutBehavior(process.env.WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR ?? workerNode.quality_critic_timeout_behavior);
   const workerQualitySoftPassOnExhausted = parseBoolEnv("WORKERPALS_QUALITY_SOFT_PASS_ON_EXHAUSTED") ?? asBoolean(workerNode.quality_soft_pass_on_exhausted, true);
   const workerQualityScopeGateEnabled = parseBoolEnv("WORKERPALS_QUALITY_SCOPE_GATE_ENABLED") ?? asBoolean(workerNode.quality_scope_gate_enabled, true);
   const workerQualityValidationGateEnabled = parseBoolEnv("WORKERPALS_QUALITY_VALIDATION_GATE_ENABLED") ?? asBoolean(workerNode.quality_validation_gate_enabled, true);
@@ -1131,6 +1140,7 @@ function loadPushPalsConfig(options = {}) {
       return DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE;
     return Math.max(0, Math.min(10, parsed));
   })();
+  const workerQualityCriticModel = firstNonEmpty(process.env.WORKERPALS_QUALITY_CRITIC_MODEL, asString(workerNode.quality_critic_model, ""), "");
   const workerQualityCriticMaxDiffChars = Math.max(256, Math.min(524288, asInt(parseIntEnv("WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS") ?? workerNode.quality_critic_max_diff_chars, DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS)));
   const workerQualityCriticMaxValidationOutputChars = Math.max(256, Math.min(524288, asInt(parseIntEnv("WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS") ?? workerNode.quality_critic_max_validation_output_chars, DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS)));
   const workerExecutorResultPrefix = (() => {
@@ -1420,8 +1430,10 @@ function loadPushPalsConfig(options = {}) {
       qualityPublishGateEnabled: workerQualityPublishGateEnabled,
       qualityValidationStepTimeoutMs: workerQualityValidationStepTimeoutMs,
       qualityCriticTimeoutMs: workerQualityCriticTimeoutMs,
+      qualityCriticTimeoutBehavior: workerQualityCriticTimeoutBehavior,
       qualitySoftPassOnExhausted: workerQualitySoftPassOnExhausted,
       qualityCriticMinScore: workerQualityCriticMinScore,
+      qualityCriticModel: workerQualityCriticModel,
       qualityCriticMaxDiffChars: workerQualityCriticMaxDiffChars,
       qualityCriticMaxValidationOutputChars: workerQualityCriticMaxValidationOutputChars,
       executorResultPrefix: workerExecutorResultPrefix,

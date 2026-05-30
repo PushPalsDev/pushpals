@@ -20,7 +20,8 @@ const DEFAULT_WORKERPALS_OUTPUT_MAX_CHARS = 192 * 1024;
 const DEFAULT_WORKERPALS_OUTPUT_MAX_LINES = 600;
 const DEFAULT_WORKERPALS_OUTPUT_MAX_HEAD_LINES = 120;
 const DEFAULT_WORKERPALS_QUALITY_VALIDATION_STEP_TIMEOUT_MS = 180_000;
-const DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 45_000;
+const DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS = 90_000;
+const DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR = "retry_once";
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16_000;
 const DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8_000;
 export const DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
@@ -217,8 +218,10 @@ export interface PushPalsConfig {
     qualityPublishGateEnabled: boolean;
     qualityValidationStepTimeoutMs: number;
     qualityCriticTimeoutMs: number;
+    qualityCriticTimeoutBehavior: "skip" | "retry_once" | "block";
     qualitySoftPassOnExhausted: boolean;
     qualityCriticMinScore: number;
+    qualityCriticModel: string;
     qualityCriticMaxDiffChars: number;
     qualityCriticMaxValidationOutputChars: number;
     executorResultPrefix: string;
@@ -363,6 +366,17 @@ function getObject(parent: TomlObject, key: string): TomlObject {
 function asString(value: unknown, fallback: string): string {
   if (typeof value === "string" && value.trim()) return value.trim();
   return fallback;
+}
+
+function asQualityCriticTimeoutBehavior(value: unknown): "skip" | "retry_once" | "block" {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+  if (normalized === "skip" || normalized === "retry_once" || normalized === "block") {
+    return normalized;
+  }
+  return DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR as "skip" | "retry_once" | "block";
 }
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
@@ -1003,6 +1017,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS,
     ),
   );
+  const workerQualityCriticTimeoutBehavior = asQualityCriticTimeoutBehavior(
+    process.env.WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR ??
+      workerNode.quality_critic_timeout_behavior,
+  );
   const workerQualitySoftPassOnExhausted =
     parseBoolEnv("WORKERPALS_QUALITY_SOFT_PASS_ON_EXHAUSTED") ??
     asBoolean(workerNode.quality_soft_pass_on_exhausted, true);
@@ -1032,6 +1050,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     if (!Number.isFinite(parsed)) return DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE;
     return Math.max(0, Math.min(10, parsed));
   })();
+  const workerQualityCriticModel = firstNonEmpty(
+    process.env.WORKERPALS_QUALITY_CRITIC_MODEL,
+    asString(workerNode.quality_critic_model, ""),
+    "",
+  );
   const workerQualityCriticMaxDiffChars = Math.max(
     256,
     Math.min(
@@ -2067,8 +2090,10 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       qualityPublishGateEnabled: workerQualityPublishGateEnabled,
       qualityValidationStepTimeoutMs: workerQualityValidationStepTimeoutMs,
       qualityCriticTimeoutMs: workerQualityCriticTimeoutMs,
+      qualityCriticTimeoutBehavior: workerQualityCriticTimeoutBehavior,
       qualitySoftPassOnExhausted: workerQualitySoftPassOnExhausted,
       qualityCriticMinScore: workerQualityCriticMinScore,
+      qualityCriticModel: workerQualityCriticModel,
       qualityCriticMaxDiffChars: workerQualityCriticMaxDiffChars,
       qualityCriticMaxValidationOutputChars: workerQualityCriticMaxValidationOutputChars,
       executorResultPrefix: workerExecutorResultPrefix,

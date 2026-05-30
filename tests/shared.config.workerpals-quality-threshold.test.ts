@@ -146,7 +146,9 @@ describe("shared config workerpals quality critic threshold parsing", () => {
         "quality_critic_gate_enabled = false",
         "quality_publish_gate_enabled = true",
         "quality_critic_timeout_ms = 55000",
+        'quality_critic_timeout_behavior = "block"',
         "quality_critic_min_score = 8.7",
+        'quality_critic_model = "gpt-5.5-mini"',
         "quality_critic_max_diff_chars = 32000",
         "quality_critic_max_validation_output_chars = 12000",
         'executor_result_prefix = "__CUSTOM_RESULT__ "',
@@ -166,7 +168,9 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       "WORKERPALS_QUALITY_CRITIC_GATE_ENABLED",
       "WORKERPALS_QUALITY_PUBLISH_GATE_ENABLED",
       "WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS",
+      "WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR",
       "WORKERPALS_QUALITY_CRITIC_MIN_SCORE",
+      "WORKERPALS_QUALITY_CRITIC_MODEL",
       "WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS",
       "WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS",
       "WORKERPALS_EXECUTOR_RESULT_PREFIX",
@@ -190,7 +194,9 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       expect(cfg.workerpals.qualityCriticGateEnabled).toBe(false);
       expect(cfg.workerpals.qualityPublishGateEnabled).toBe(true);
       expect(cfg.workerpals.qualityCriticTimeoutMs).toBe(55000);
+      expect(cfg.workerpals.qualityCriticTimeoutBehavior).toBe("block");
       expect(cfg.workerpals.qualityCriticMinScore).toBe(8.7);
+      expect(cfg.workerpals.qualityCriticModel).toBe("gpt-5.5-mini");
       expect(cfg.workerpals.qualityCriticMaxDiffChars).toBe(32000);
       expect(cfg.workerpals.qualityCriticMaxValidationOutputChars).toBe(12000);
       expect(cfg.workerpals.executorResultPrefix).toBe("__CUSTOM_RESULT__ ");
@@ -317,8 +323,10 @@ describe("shared config workerpals quality critic threshold parsing", () => {
         "quality_validation_gate_enabled = true",
         "quality_critic_gate_enabled = true",
         "quality_publish_gate_enabled = true",
-        "quality_critic_timeout_ms = 45000",
+        "quality_critic_timeout_ms = 90000",
+        'quality_critic_timeout_behavior = "retry_once"',
         "quality_critic_min_score = 8.0",
+        'quality_critic_model = ""',
         "quality_critic_max_diff_chars = 16000",
         "quality_critic_max_validation_output_chars = 8000",
         'executor_result_prefix = "__PUSHPALS_OH_RESULT__ "',
@@ -340,7 +348,9 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       WORKERPALS_QUALITY_CRITIC_GATE_ENABLED: "false",
       WORKERPALS_QUALITY_PUBLISH_GATE_ENABLED: "false",
       WORKERPALS_QUALITY_CRITIC_TIMEOUT_MS: "56000",
+      WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR: "skip",
       WORKERPALS_QUALITY_CRITIC_MIN_SCORE: "9.3",
+      WORKERPALS_QUALITY_CRITIC_MODEL: "gpt-5.5-nano",
       WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS: "24000",
       WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS: "11000",
       WORKERPALS_EXECUTOR_RESULT_PREFIX: "__ENV_RESULT__ ",
@@ -364,7 +374,9 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       expect(cfg.workerpals.qualityCriticGateEnabled).toBe(false);
       expect(cfg.workerpals.qualityPublishGateEnabled).toBe(false);
       expect(cfg.workerpals.qualityCriticTimeoutMs).toBe(56000);
+      expect(cfg.workerpals.qualityCriticTimeoutBehavior).toBe("skip");
       expect(cfg.workerpals.qualityCriticMinScore).toBe(9.3);
+      expect(cfg.workerpals.qualityCriticModel).toBe("gpt-5.5-nano");
       expect(cfg.workerpals.qualityCriticMaxDiffChars).toBe(24000);
       expect(cfg.workerpals.qualityCriticMaxValidationOutputChars).toBe(11000);
       expect(cfg.workerpals.executorResultPrefix).toBe("__ENV_RESULT__ ");
