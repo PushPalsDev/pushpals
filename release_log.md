@@ -2,25 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.5`
-- start_commit: `00cd6e2a1e847dd9fb5c89fed53eee2e51c9ee34`
-- end_commit: `d15c5855e36d4cd52b7ccb829e7227dc1559b0db`
-- commits_in_range: `1`
+- version: `v1.1.6`
+- start_commit: `97ec8312cf3161fe757c74542f7201b03a835179`
+- end_commit: `65018ec6e47f31c5e1407f9eb825704748e93bdc`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Bound SourceControlManager startup git binary and remote inspection probes so CLI startup cannot hang indefinitely after RemoteBuddy and WorkerPal are already alive.
-- Treat inconclusive SourceControlManager remote inspection as a startup warning and skip SCM startup instead of blocking the whole embedded runtime.
-- Preserve a hard failure only when the configured PushPals branch is conclusively missing from an otherwise reachable remote.
-- Add regression coverage for a stuck SCM remote inspection to prove the startup precheck returns within the configured timeout budget.
+- Harden Windows CLI startup and shutdown so successful cold starts do not leave Bun waiting on uncancelled timeout timers or unbounded cleanup work.
+- Bound process-output collection and Windows `taskkill` calls so timeout cleanup cannot pin the CLI when child processes or pipes misbehave.
+- Skip the WorkerPal capacity wait when auto-spawn is disabled, reporting the disabled state immediately instead of spending startup time in a misleading warmup probe.
+- Retry transient embedded runtime binary download failures so one flaky GitHub/curl attempt does not fail first-run startup.
+- Preserve browser assertion failure context across WorkerPal repair revisions and bound quality critic execution so passing validation is not delayed by a slow critic.
 
 ## Validation
 
-- `bun test tests/cli.invocation-logging.test.ts tests/cli.runtime-bootstrap.test.ts tests/client.runtime-bootstrap.test.ts tests/shared.client-preflight.test.ts`
-- `bun run test:root`
+- `bun test tests/cli.runtime-bootstrap.test.ts --timeout 20000`
+- `bun run test:cli:integration`
 - `bun run cli:bundle`
 - `git diff --check`
-- Constrained Windows startup smoke from `C:\Users\data_pi\Documents\programming\SectorCommand` with WorkerPal/autonomy disabled and a missing SCM remote reached `Embedded runtime is ready` with `source_control_manager=64ms(skipped_no_remote)` and no lingering PushPals runtime processes.
+- Local installed CLI package smoke from a freshly packed tarball on Windows: `bun scripts/release-installed-cli-smoke.ts --package-spec <local tgz>` completed successfully and returned to the shell in 42s.
 
 ## Install
 
