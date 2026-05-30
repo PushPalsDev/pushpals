@@ -826,6 +826,11 @@ export async function runValidationArgv(
   outputPolicy: Partial<OutputCompactionPolicy>,
   timeoutMessage: string,
 ): Promise<ValidationExecutionResult> {
+  type ValidationWaitResult =
+    | { type: "exit"; code: number }
+    | { type: "timeout" }
+    | { type: "failure-signal" }
+    | { type: "success-signal" };
   const startedAt = Date.now();
   const proc = Bun.spawn(argv, {
     cwd: repo,
@@ -846,7 +851,7 @@ export async function runValidationArgv(
   let stoppedAfterSuccessSignal = false;
   const timeout = Math.max(1_000, timeoutMs);
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  const timeoutPromise = new Promise<{ type: "timeout" }>((resolveTimeout) => {
+  const timeoutPromise = new Promise<ValidationWaitResult>((resolveTimeout) => {
     timeoutTimer = setTimeout(() => {
       timedOut = true;
       resolveTimeout({ type: "timeout" });
@@ -855,7 +860,7 @@ export async function runValidationArgv(
 
   let browserSignalTimer: ReturnType<typeof setInterval> | null = null;
   const browserSignalPromise = isLongRunningBrowserValidationCommand(command)
-    ? new Promise<{ type: "failure-signal" | "success-signal" }>((resolveBrowserSignal) => {
+    ? new Promise<ValidationWaitResult>((resolveBrowserSignal) => {
         const idleMs = browserValidationFailureIdleMs(env);
         const successIdleMs = browserValidationSuccessIdleMs(env);
         browserSignalTimer = setInterval(() => {
@@ -877,11 +882,11 @@ export async function runValidationArgv(
           }
         }, 250);
       })
-    : new Promise<never>(() => {
+    : new Promise<ValidationWaitResult>(() => {
         // Non-browser validations should only end on process exit or timeout.
       });
 
-  const exitOrTimeout = await Promise.race([
+  const exitOrTimeout = await Promise.race<ValidationWaitResult>([
     proc.exited.then((code) => ({ type: "exit" as const, code })),
     timeoutPromise,
     browserSignalPromise,
@@ -1740,9 +1745,9 @@ function classifyBrowserValidationFailureKindFromText(text: string): BrowserVali
 
 function extractBrowserValidationStage(text: string): string | null {
   const patterns = [
-    /\bBrowser validation failed during\s+([^:.\r\n]+?)\s+stage\b/i,
-    /\bfailed during\s+([^:.\r\n]+?)\s+stage\b/i,
-    /\b(?:stage|phase)\s*[:=]\s*["'`]?([^"'`.\r\n]+)["'`]?/i,
+    /\bBrowser validation failed during\s+([^:.\r\n|]+?)\s+stage\b/i,
+    /\bfailed during\s+([^:.\r\n|]+?)\s+stage\b/i,
+    /\b(?:stage|phase)\s*[:=]\s*["'`]?([^"'`.\r\n|]+)["'`]?/i,
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -1755,6 +1760,27 @@ function extractBrowserValidationStage(text: string): string | null {
   const lastVerifiedStage = verifiedStages.at(-1);
   if (lastVerifiedStage) return toSingleLine(lastVerifiedStage, 80);
   return null;
+}
+
+function refineBrowserValidationStage(
+  stage: string | null,
+  selector: string | null,
+  expected: string | null,
+  text: string,
+): string | null {
+  const combined = stripAnsiControlSequences(
+    [stage, selector, expected, text].filter(Boolean).join(" "),
+  ).toLowerCase();
+  if (/\b(game-control-panel|planet control panel|selected planet panel)\b/i.test(combined)) {
+    return "planet control panel";
+  }
+  if (/\bsettings-home-button\b|\breturn to home from settings\b/i.test(combined)) {
+    return "settings return";
+  }
+  if (/\bshop-home-button\b|\breturn to home from shop\b/i.test(combined)) {
+    return "shop return";
+  }
+  return stage;
 }
 
 function inferBrowserValidationFailureFocus(params: {
@@ -1980,11 +2006,58 @@ function summarizeBrowserValidationOutput(text: string): string {
     .map((line) => line.trim())
     .filter(Boolean)
     .filter((line) =>
-      /\b(Web end-to-end smoke test failed|Browser validation failed|Expected |locator\.|page\.|waiting for getBy|Call log:|ERR_SOCKET_BAD_PORT|EADDRINUSE|EPERM|EACCES|browserType\.launch|Executable doesn't exist|Expo exited early|freeport|net::ERR_|Validation command timed out|terminated by signal|SIGTERM|timed out after \d+ms)/i.test(
+      /\b(Web end-to-end smoke test failed|Browser validation failed|Expected |locator\.|page\.|waiting for getBy|Call log:|Verified:|Saved screenshot|Saved trace|ERR_SOCKET_BAD_PORT|EADDRINUSE|EPERM|EACCES|browserType\.launch|Executable doesn't exist|Expo exited early|freeport|net::ERR_|Validation command timed out|terminated by signal|SIGTERM|timed out after \d+ms)/i.test(
         line,
       ),
     );
   return toSingleLine(lines.slice(0, 8).join(" | "), 900);
+}
+
+function lastBrowserVerifiedStage(text: string): string | null {
+  const verifiedStages = [...stripAnsiControlSequences(text).matchAll(/\bVerified:\s+([^|\r\n]+)/gi)]
+    .map((match) => match[1]?.trim())
+    .filter((entry): entry is string => Boolean(entry));
+  const lastVerified = verifiedStages.at(-1);
+  return lastVerified ? toSingleLine(lastVerified, 80) : null;
+}
+
+export function extractValidationFailureRetryDigest(
+  run: {
+    command: string;
+    stdout?: string;
+    stderr?: string;
+    exitCode?: number;
+    elapsedMs?: number;
+  },
+  repo?: string,
+): string {
+  const baseDigest = extractValidationFailureDigest(run);
+  if (!isLongRunningBrowserValidationCommand(run.command)) return baseDigest;
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  const failureKind = classifyBrowserValidationFailureKindFromText(`${baseDigest}\n${combined}`);
+  if (failureKind !== "assertion") return baseDigest;
+
+  const recentLogSummary = summarizeRecentBrowserValidationLogs(repo);
+  const enrichedBrowserContext = [combined, recentLogSummary].filter(Boolean).join("\n");
+  const selector = extractBrowserValidationSelector(enrichedBrowserContext);
+  const expected = extractBrowserValidationExpectedUi(enrichedBrowserContext);
+  const stage = refineBrowserValidationStage(
+    extractBrowserValidationStage(enrichedBrowserContext),
+    selector,
+    expected,
+    enrichedBrowserContext,
+  );
+  const lastVerified = lastBrowserVerifiedStage(enrichedBrowserContext);
+  const output = summarizeBrowserValidationOutput(enrichedBrowserContext);
+  const parts = [
+    baseDigest,
+    stage ? `stage=${stage}` : "",
+    selector ? `selector=${selector}` : "",
+    expected ? `expected=${expected}` : "",
+    lastVerified ? `last verified=${lastVerified}` : "",
+    output && output !== baseDigest ? output : "",
+  ].filter(Boolean);
+  return toSingleLine(parts.join(" | "), 900) || baseDigest;
 }
 
 export function buildBrowserValidationRepairPacket(
@@ -1995,15 +2068,24 @@ export function buildBrowserValidationRepairPacket(
   for (const run of validationRuns) {
     if (run.ok || !isLongRunningBrowserValidationCommand(run.command)) continue;
     const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
-    const digest = extractValidationFailureDigest(run);
-    const failureKind = classifyBrowserValidationFailureKindFromText(`${digest}\n${combined}`);
+    const baseDigest = extractValidationFailureDigest(run);
+    const failureKind = classifyBrowserValidationFailureKindFromText(`${baseDigest}\n${combined}`);
     if (failureKind === "unknown") continue;
+    const digest =
+      failureKind === "assertion"
+        ? extractValidationFailureRetryDigest(run, repo) || baseDigest
+        : baseDigest;
     const previousDigest = previousFailureDigests.get(validationCommandKey(run.command)) ?? null;
     const recentLogSummary = summarizeRecentBrowserValidationLogs(repo);
     const enrichedBrowserContext = [combined, recentLogSummary].filter(Boolean).join("\n");
-    const stage = extractBrowserValidationStage(enrichedBrowserContext);
     const selector = extractBrowserValidationSelector(enrichedBrowserContext);
     const expected = extractBrowserValidationExpectedUi(enrichedBrowserContext);
+    const stage = refineBrowserValidationStage(
+      extractBrowserValidationStage(enrichedBrowserContext),
+      selector,
+      expected,
+      enrichedBrowserContext,
+    );
     const previousStage = previousDigest ? extractBrowserValidationStage(previousDigest) : null;
     const previousSelector = previousDigest ? extractBrowserValidationSelector(previousDigest) : null;
     const previousExpected = previousDigest ? extractBrowserValidationExpectedUi(previousDigest) : null;
@@ -2021,17 +2103,21 @@ export function buildBrowserValidationRepairPacket(
           text: previousDigest,
         })
       : null;
+    const sameFailureSignal =
+      Boolean(previousDigest) &&
+      (previousDigest === digest ||
+        (Boolean(failureFocus) &&
+          failureFocus === previousFailureFocus &&
+          (!selector || !previousSelector || selector === previousSelector)));
     const progress =
       previousDigest == null
         ? "first_failure"
-        : previousDigest === digest
+        : sameFailureSignal
           ? "same_failure"
           : "new_failure";
     const needsDiagnosticProbe =
       failureKind === "assertion" &&
-      Boolean(previousDigest) &&
-      Boolean(failureFocus) &&
-      failureFocus === previousFailureFocus;
+      sameFailureSignal;
     return {
       command: run.command,
       failureKind,
@@ -2905,7 +2991,10 @@ export function buildQualityRevisionHint(
         "- Convergence mode: diagnostic-first repair. This same browser focus failed in the previous revision, so do not guess another selector or rewrite a different stage.",
       );
       lines.push(
-        "- Diagnostic requirement: before editing again, inspect or add a tiny temporary diagnostic around the failing stage that records locator counts, visible textContent, role/ARIA attributes, data-testid values, and a nearby DOM snippet for the candidate nodes.",
+        "- Diagnostic requirement: before editing again, inspect or add a tiny temporary diagnostic around the failing stage that records locator counts, visible textContent, role/ARIA attributes, data-testid values, bounding boxes, and a nearby DOM snippet for the candidate nodes.",
+      );
+      lines.push(
+        "- Artifact freshness rule: only trust screenshots/logs captured after the failing action in the current revision. If the screenshot is stale or stops before the failing locator, capture or print the DOM state instead of reasoning from that image.",
       );
       lines.push(
         "- React Native Web note: screenshots can show the intended state while Playwright reads a duplicate or stale rendered node. Prefer one unique selected-state test id or a semantic checked attribute on the stable pressable, then assert locator count and visibility.",
@@ -2947,7 +3036,7 @@ export function buildQualityRevisionHint(
     );
     if (browserRepairPacket.needsDiagnosticProbe) {
       lines.push(
-        `Validation rerun rule: PushPals ValidationGate will rerun "${browserRepairPacket.command}" after the patch, but this is now a repeated browser assertion. If a quick local startup probe shows the browser server can run in this executor, run one targeted "${browserRepairPacket.command}" confirmation after the DOM-backed fix. Do not hand off another unverified selector guess.`,
+        `Validation rerun rule: PushPals ValidationGate will rerun "${browserRepairPacket.command}" after the patch, but this is now a repeated browser assertion. If a quick local startup probe shows the browser server can run in this executor, run exactly one targeted "${browserRepairPacket.command}" confirmation after the DOM-backed fix. Do not stop after fast checks only. Do not hand off another unverified selector guess.`,
       );
     } else {
       lines.push(
@@ -5857,7 +5946,7 @@ export async function executeJob(
     );
     for (const run of quality.validationRuns) {
       if (run.ok) continue;
-      const digest = extractValidationFailureDigest(run);
+      const digest = extractValidationFailureRetryDigest(run, repo);
       if (digest) previousValidationFailureDigests.set(validationCommandKey(run.command), digest);
     }
     const validationOutsideTaskScope =

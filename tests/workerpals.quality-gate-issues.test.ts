@@ -7,6 +7,7 @@ import {
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
+  extractValidationFailureRetryDigest,
   isBrowserValidationInfrastructureDigest,
   qualityRevisionLoopUpperBound,
   shouldReviseRequiredValidationBlocker,
@@ -348,6 +349,90 @@ describe("workerpals quality gate critic issue formatting", () => {
     }
   });
 
+  test("keeps selector and last verified stage in browser retry digests", () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-browser-retry-digest-"));
+    try {
+      const artifactDir = join(repo, "outputs", "web-e2e");
+      mkdirSync(artifactDir, { recursive: true });
+      writeFileSync(
+        join(artifactDir, "expo-web.log"),
+        [
+          "Verified: game screen",
+          "Verified: owned planet",
+          "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+          "Call log:",
+          " - waiting for getByTestId('game-control-panel') to be visible",
+        ].join("\n"),
+      );
+
+      const digest = extractValidationFailureRetryDigest(
+        {
+          command: "bun run web:e2e",
+          exitCode: 1,
+          stdout: "",
+          stderr:
+            "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+          elapsedMs: 145_252,
+        },
+        repo,
+      );
+
+      expect(digest).toContain("stage=planet control panel");
+      expect(digest).toContain("selector=getByTestId('game-control-panel')");
+      expect(digest).toContain("last verified=owned planet");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("treats repeated generic browser timeouts as same selector failures once logs hydrate them", () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-browser-same-selector-"));
+    try {
+      const artifactDir = join(repo, "outputs", "web-e2e");
+      mkdirSync(artifactDir, { recursive: true });
+      writeFileSync(
+        join(artifactDir, "expo-web.log"),
+        [
+          "Verified: game screen",
+          "Verified: owned planet",
+          "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+          "Call log:",
+          " - waiting for getByTestId('game-control-panel') to be visible",
+        ].join("\n"),
+      );
+
+      const previousDigest =
+        "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded. | stage=planet control panel | selector=getByTestId('game-control-panel') | last verified=owned planet";
+      const packet = buildBrowserValidationRepairPacket(
+        [
+          {
+            step: "bun run web:e2e",
+            command: "bun run web:e2e",
+            ok: false,
+            exitCode: 1,
+            stdout: "",
+            stderr:
+              "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+            elapsedMs: 144_591,
+          },
+        ],
+        new Map([["bun run web:e2e", previousDigest]]),
+        repo,
+      );
+
+      expect(packet).toMatchObject({
+        stage: "planet control panel",
+        selector: "getByTestId('game-control-panel')",
+        previousStage: "planet control panel",
+        previousSelector: "getByTestId('game-control-panel')",
+        progress: "same_failure",
+        needsDiagnosticProbe: true,
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   test("switches repeated browser assertion failures to diagnostic-first guidance", () => {
     const previous = new Map<string, string>([
       [
@@ -408,8 +493,11 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("Convergence mode: diagnostic-first repair");
     expect(hint).toContain("do not guess another selector");
     expect(hint).toContain("locator counts");
+    expect(hint).toContain("bounding boxes");
+    expect(hint).toContain("Artifact freshness rule");
     expect(hint).toContain("nearby DOM snippet");
     expect(hint).toContain("React Native Web note");
+    expect(hint).toContain("Do not stop after fast checks only");
     expect(hint).toContain("Do not hand off another unverified selector guess.");
   });
 
