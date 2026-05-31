@@ -2,26 +2,30 @@
 
 ## Release Metadata
 
-- version: `v1.1.7`
-- start_commit: `5d5d658c498c0b3b50332deb168b5cddde69fee1`
-- end_commit: `521d4d17e31eeed54b8b166417413fd52fde4b54`
-- commits_in_range: `3`
+- version: `v1.1.8`
+- start_commit: `df2fb20c11148e27595fe53759de27d6792e9eda`
+- end_commit: `21e39e1e318d450e62086a0e9da2b573e09bd1c2`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Let OpenAI Codex WorkerPal jobs use the configured backend timeout instead of being capped by the shorter planning execution budget, preventing valid long-running work from being killed at 30 minutes.
-- Harden WorkerPal validation and review-fix recovery paths: safer Bun test path formatting, clearer unchanged-branch review-fix guidance, and a SourceControlManager poll fix for stale `tempBranch` errors.
-- Recover Docker-backed WorkerPal execution when the local `pushpals-worker-sandbox:latest` image disappears while the runtime is already running by rebuilding the local sandbox image before retrying warm startup.
-- Stabilize Windows release validation by waiting out transient `EBUSY` temp-directory cleanup in RemoteBuddy tests instead of failing the full root test suite under load.
+- Harden ReviewAgent convergence so active review-fix jobs no longer suppress needed merge-conflict repair jobs for the same PR head.
+- Resolve autonomy PR feedback through ReviewAgent `sourceJobId` metadata, preserving pattern learning for review-fix and merge-conflict follow-up jobs.
+- Make WorkerPal merge-conflict continuation more resilient by boundedly continuing or skipping empty prepared rebase commits instead of failing as soon as a Git rebase sequencer remains active.
+- Package the WorkerPal sandbox runtime copy with the same merge-conflict continuation behavior for installed CLI users.
 
 ## Validation
 
-- `bun test tests/workerpals.docker-executor.test.ts`
-- `bun x --bun tsc --noEmit -p apps/workerpals/tsconfig.json`
-- `bun run lint` completed with 2 pre-existing client warnings.
 - `bun run cli:bundle`
-- `bun test tests/remotebuddy.session-routing.test.ts tests/remotebuddy.task-dedupe.test.ts`
-- `bun run test:root` completed successfully: 760 pass, 1 skip, 0 fail.
+- `bun test tests/source-control-manager.review-agent.test.ts`
+- `bun test tests/server.autonomy-store.test.ts`
+- `bun test tests/workerpals.merge-conflict-job.test.ts`
+- `bun x --bun tsc --noEmit -p apps/server/tsconfig.json`
+- `bun x --bun tsc --noEmit -p apps/source_control_manager/tsconfig.json`
+- `bun x --bun tsc --noEmit -p apps/workerpals/tsconfig.json`
+- `bun x --bun tsc --noEmit -p packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
+- `bun run lint` completed with 2 pre-existing client warnings.
+- `bun run test:root` completed successfully: 763 pass, 1 skip, 0 fail.
 - `git diff --check`
 
 ## Install
