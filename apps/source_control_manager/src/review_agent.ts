@@ -887,7 +887,12 @@ type ActiveJobLike = {
   params?: string | Record<string, unknown> | null;
 };
 
-function extractReviewFixDedupeKeyFromJob(job: ActiveJobLike): string | null {
+type ActiveReviewJobContext = {
+  dedupeKey: string;
+  resolutionType: "review_fix" | "merge_conflict" | string;
+};
+
+function extractActiveReviewJobContextFromJob(job: ActiveJobLike): ActiveReviewJobContext | null {
   if (String(job.kind ?? "").trim() !== "task.execute") return null;
   const rawParams = job.params;
   let params: Record<string, unknown> = {};
@@ -911,7 +916,13 @@ function extractReviewFixDedupeKeyFromJob(job: ActiveJobLike): string | null {
   const prNumber = Number(reviewAgentRecord.prNumber);
   const prHeadSha = normalizeReviewFixHeadSha(String(reviewAgentRecord.prHeadSha ?? ""));
   if (!Number.isFinite(prNumber) || prNumber <= 0 || !prHeadSha) return null;
-  return reviewFixDedupeKey(Math.floor(prNumber), prHeadSha);
+  const rawResolutionType = String(reviewAgentRecord.resolutionType ?? "")
+    .trim()
+    .toLowerCase();
+  return {
+    dedupeKey: reviewFixDedupeKey(Math.floor(prNumber), prHeadSha),
+    resolutionType: rawResolutionType || "review_fix",
+  };
 }
 
 export class ReviewAgent {
@@ -1176,10 +1187,14 @@ export class ReviewAgent {
       return false;
     }
 
-    const existingReviewJobId = await this.findActiveReviewJobIdForPrHead(pr.number, pr.head.sha);
+    const existingReviewJobId = await this.findActiveReviewJobIdForPrHead(
+      pr.number,
+      pr.head.sha,
+      "merge_conflict",
+    );
     if (existingReviewJobId) {
       this.deps.logInfo(
-        `[${ts()}] [ReviewAgent] PR #${pr.number} already has active review job ${existingReviewJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate merge-conflict enqueue.`,
+        `[${ts()}] [ReviewAgent] PR #${pr.number} already has active merge-conflict job ${existingReviewJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate merge-conflict enqueue.`,
       );
       return true;
     }
@@ -1267,7 +1282,11 @@ export class ReviewAgent {
       return true;
     }
 
-    const existingFixJobId = await this.findActiveReviewJobIdForPrHead(pr.number, pr.head.sha);
+    const existingFixJobId = await this.findActiveReviewJobIdForPrHead(
+      pr.number,
+      pr.head.sha,
+      "review_fix",
+    );
     if (existingFixJobId) {
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} already has active fix job ${existingFixJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate enqueue.`,
@@ -1416,6 +1435,7 @@ export class ReviewAgent {
   private async findActiveReviewJobIdForPrHead(
     prNumber: number,
     headSha: string,
+    resolutionType?: "review_fix" | "merge_conflict",
   ): Promise<string | null> {
     const dedupeKey = reviewFixDedupeKey(prNumber, headSha);
     const headers: Record<string, string> = {};
@@ -1436,8 +1456,9 @@ export class ReviewAgent {
         for (const rawJob of jobs) {
           if (!rawJob || typeof rawJob !== "object" || Array.isArray(rawJob)) continue;
           const job = rawJob as ActiveJobLike;
-          const jobDedupeKey = extractReviewFixDedupeKeyFromJob(job);
-          if (jobDedupeKey !== dedupeKey) continue;
+          const context = extractActiveReviewJobContextFromJob(job);
+          if (!context || context.dedupeKey !== dedupeKey) continue;
+          if (resolutionType && context.resolutionType !== resolutionType) continue;
           const jobId =
             typeof job.id === "string" && job.id.trim().length > 0 ? job.id.trim() : "(unknown)";
           return jobId;

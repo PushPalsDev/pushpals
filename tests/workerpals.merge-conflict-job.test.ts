@@ -440,6 +440,55 @@ describe("workerpals merge-conflict sandbox", () => {
   );
 
   runMergeConflictTest(
+    "resumePreparedMergeConflictRebase skips empty resolved commits and finishes",
+    async () => {
+      const fixture = await createConflictFixture();
+      try {
+        const prepared = await prepareMergeConflictTaskRepo(
+          fixture.sourceRepo,
+          "job-merge-conflict-empty-resolution",
+          fixture.params,
+        );
+        try {
+          writeFileSync(
+            join(prepared.repoPath, fixture.conflictFile),
+            "export const conflict = 'main';\n",
+            "utf8",
+          );
+
+          const forwardedLogs: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+          const resume = await resumePreparedMergeConflictRebase(
+            prepared.repoPath,
+            "task.execute",
+            fixture.params,
+            (stream, line) => forwardedLogs.push({ stream, line }),
+          );
+
+          expect(resume.ok).toBe(true);
+          if (!resume.ok) return;
+          expect(resume.sequencer).toBe(null);
+          expect(
+            forwardedLogs.some((entry) =>
+              entry.line.includes("Auto-continued the prepared rebase"),
+            ),
+          ).toBe(true);
+
+          const status = await mustGit(
+            prepared.repoPath,
+            ["status", "--porcelain"],
+            "inspect working tree after empty resolution skip",
+          );
+          expect(status).toBe("");
+        } finally {
+          prepared.cleanup();
+        }
+      } finally {
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  runMergeConflictTest(
     "executeJob reruns the resolver when auto-continue advances into another conflicted commit",
     async () => {
       const fixture = await createConflictFixture({

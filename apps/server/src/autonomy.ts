@@ -4416,9 +4416,11 @@ export class AutonomyStore {
           }
         | undefined;
 
-    const readContextFromJobRow = (
+    const db = this.db;
+    function readContextFromJobRow(
       whereSql: string,
-      ...args: Array<string>
+      args: Array<string>,
+      visitedJobIds = new Set<string>(),
     ):
       | {
           objectiveId: string | null;
@@ -4426,8 +4428,8 @@ export class AutonomyStore {
           jobId: string | null;
           patternKey: string | null;
         }
-      | undefined => {
-      const row = this.db
+      | undefined {
+      const row = db
         .prepare(
           `SELECT id AS jobId, params AS paramsJson
            FROM jobs
@@ -4442,8 +4444,14 @@ export class AutonomyStore {
           }
         | undefined;
       if (!row) return undefined;
+      const currentJobId = asString(row.jobId);
+      if (currentJobId) visitedJobIds.add(currentJobId);
       const paramsRecord = parseJsonObject(row.paramsJson);
       const autonomyRecord = asObject(paramsRecord.autonomy);
+      const reviewAgentRecord = asObject(paramsRecord.reviewAgent);
+      const sourceJobId = asString(
+        reviewAgentRecord.sourceJobId ?? reviewAgentRecord.source_job_id,
+      );
       const resolvedFromObjective =
         (asString(autonomyRecord.objectiveId ?? paramsRecord.objectiveId ?? paramsRecord.objective_id)
           ? readByObjective(
@@ -4455,28 +4463,40 @@ export class AutonomyStore {
         (asString(paramsRecord.requestId ?? paramsRecord.request_id)
           ? readByRequest(asString(paramsRecord.requestId ?? paramsRecord.request_id))
           : undefined);
+      const resolvedFromSourceJob =
+        sourceJobId && !visitedJobIds.has(sourceJobId)
+          ? (readByJob(sourceJobId) ??
+            readContextFromJobRow("id = ?", [sourceJobId], new Set(visitedJobIds)))
+          : undefined;
       return {
         objectiveId:
           asString(
             autonomyRecord.objectiveId ?? paramsRecord.objectiveId ?? paramsRecord.objective_id,
           ) ||
           asString(resolvedFromObjective?.objectiveId) ||
+          asString(resolvedFromSourceJob?.objectiveId) ||
           null,
         requestId:
           asString(paramsRecord.requestId ?? paramsRecord.request_id) ||
           asString(resolvedFromObjective?.requestId) ||
+          asString(resolvedFromSourceJob?.requestId) ||
           null,
-        jobId: asString(row.jobId) || asString(resolvedFromObjective?.jobId) || null,
+        jobId:
+          currentJobId ||
+          asString(resolvedFromObjective?.jobId) ||
+          asString(resolvedFromSourceJob?.jobId) ||
+          null,
         patternKey:
           asString(autonomyRecord.patternKey ?? paramsRecord.patternKey ?? paramsRecord.pattern_key) ||
           asString(resolvedFromObjective?.patternKey) ||
+          asString(resolvedFromSourceJob?.patternKey) ||
           null,
       };
-    };
+    }
 
-    const readJobById = (id: string) => readContextFromJobRow("id = ?", id);
+    const readJobById = (id: string) => readContextFromJobRow("id = ?", [id]);
     const readJobByPrUrl = (url: string) =>
-      readContextFromJobRow("prUrl = ? OR LOWER(prUrl) = LOWER(?)", url, url);
+      readContextFromJobRow("prUrl = ? OR LOWER(prUrl) = LOWER(?)", [url, url]);
 
     const row =
       (objectiveId ? readByObjective(objectiveId) : undefined) ??

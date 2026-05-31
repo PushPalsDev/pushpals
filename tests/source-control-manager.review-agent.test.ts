@@ -369,6 +369,87 @@ describe("ReviewAgent", () => {
     expect(enqueueCalls).toBe(0);
   });
 
+  test("does not let an active review-fix job suppress merge-conflict repair enqueue", async () => {
+    const pr = makePr({ number: 78, html_url: "https://example.com/pr/78" });
+    let enqueueCalls = 0;
+    let enqueuedResolutionType = "";
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 9.1,
+            summary: "Approved but needs a rebase",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "feat: update app",
+        mergePullRequest: async () => {
+          throw new Error('GitHub API 405: {"message":"Pull Request is not mergeable"}');
+        },
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (url.includes("/jobs?status=pending")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                jobs: [
+                  {
+                    id: "active-review-fix-job",
+                    kind: "task.execute",
+                    params: JSON.stringify({
+                      reviewAgent: {
+                        prNumber: pr.number,
+                        prHeadSha: pr.head.sha,
+                        resolutionType: "review_fix",
+                      },
+                    }),
+                  },
+                ],
+              }),
+              { status: 200 },
+            );
+          }
+          if (url.includes("/jobs?status=claimed")) {
+            return new Response(JSON.stringify({ ok: true, jobs: [] }), { status: 200 });
+          }
+          if (url.endsWith("/jobs/enqueue")) {
+            enqueueCalls += 1;
+            const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            const params =
+              payload.params && typeof payload.params === "object"
+                ? (payload.params as Record<string, unknown>)
+                : {};
+            const reviewAgent =
+              params.reviewAgent && typeof params.reviewAgent === "object"
+                ? (params.reviewAgent as Record<string, unknown>)
+                : {};
+            enqueuedResolutionType = String(reviewAgent.resolutionType ?? "");
+            return new Response(JSON.stringify({ ok: true, jobId: "merge-conflict-job" }), {
+              status: 200,
+            });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        ...silentLogs,
+      },
+    );
+
+    await agent.poll();
+
+    expect(enqueueCalls).toBe(1);
+    expect(enqueuedResolutionType).toBe("merge_conflict");
+  });
+
   test("enqueues fallback instruction when reviewer omits fix_instruction", async () => {
     const pr = makePr({ number: 7, html_url: "https://example.com/pr/7" });
     let enqueuedInstruction = "";

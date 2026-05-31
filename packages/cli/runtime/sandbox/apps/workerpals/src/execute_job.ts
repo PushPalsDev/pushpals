@@ -4478,54 +4478,104 @@ export async function resumePreparedMergeConflictRebase(
     };
   }
 
-  let rebaseContinue = await git(repo, ["-c", "core.editor=true", "rebase", "--continue"]);
-  let continueOutput = combinedGitOutput(rebaseContinue);
-  if (!rebaseContinue.ok && isRebaseEditorPromptOutput(continueOutput)) {
-    rebaseContinue = await git(repo, ["-c", "core.editor=true", "rebase", "--continue"]);
-    continueOutput = combinedGitOutput(rebaseContinue);
-  }
-  if (!rebaseContinue.ok) {
-    const continuingSequencer = await activeGitOperation(repo);
-    if (continuingSequencer === "rebase") {
-      const nextUnresolved = await git(repo, ["diff", "--name-only", "--diff-filter=U"]);
-      if (nextUnresolved.ok) {
-        const nextPaths = parseChangedPathsFromNameOnlyOutput(nextUnresolved.stdout);
-        if (nextPaths.length > 0) {
-          onLog?.(
-            "stdout",
-            `[MergeConflict] Rebase advanced into another conflicted commit with ${nextPaths.length} unresolved file(s); rerunning the resolver on updated sandbox state.`,
-          );
+  const maxContinuationPasses = Math.max(1, MAX_MERGE_CONFLICT_RESOLUTION_PASSES);
+  let lastContinueOutput = "";
+  for (let pass = 1; pass <= maxContinuationPasses; pass += 1) {
+    let rebaseContinue = await git(repo, ["-c", "core.editor=true", "rebase", "--continue"]);
+    let continueOutput = combinedGitOutput(rebaseContinue);
+    if (!rebaseContinue.ok && isRebaseEditorPromptOutput(continueOutput)) {
+      rebaseContinue = await git(repo, ["-c", "core.editor=true", "rebase", "--continue"]);
+      continueOutput = combinedGitOutput(rebaseContinue);
+    }
+    lastContinueOutput = continueOutput;
+
+    if (!rebaseContinue.ok) {
+      if (/no rebase in progress/i.test(continueOutput)) {
+        onLog?.(
+          "stdout",
+          "[MergeConflict] Prepared rebase was already complete after continuation.",
+        );
+        return { ok: true, resumed: true, sequencer: null };
+      }
+      if (/no changes - did you forget to use 'git add'|nothing to commit/i.test(continueOutput)) {
+        const rebaseSkip = await git(repo, ["rebase", "--skip"]);
+        const skipOutput = combinedGitOutput(rebaseSkip);
+        lastContinueOutput = skipOutput || continueOutput;
+        if (!rebaseSkip.ok && !isRebaseConflictOutput(skipOutput)) {
           return {
-            ok: true,
-            resumed: true,
-            sequencer: "rebase",
-            detail: `rebase advanced into another conflicted commit with ${nextPaths.length} unresolved file(s)`,
-            advancedToNextConflict: true,
+            ok: false,
+            error: `Failed to skip empty prepared merge-conflict rebase commit: ${skipOutput}`,
           };
         }
+      } else {
+        const continuingSequencer = await activeGitOperation(repo);
+        if (continuingSequencer === "rebase") {
+          const nextUnresolved = await git(repo, ["diff", "--name-only", "--diff-filter=U"]);
+          if (nextUnresolved.ok) {
+            const nextPaths = parseChangedPathsFromNameOnlyOutput(nextUnresolved.stdout);
+            if (nextPaths.length > 0) {
+              onLog?.(
+                "stdout",
+                `[MergeConflict] Rebase advanced into another conflicted commit with ${nextPaths.length} unresolved file(s); rerunning the resolver on updated sandbox state.`,
+              );
+              return {
+                ok: true,
+                resumed: true,
+                sequencer: "rebase",
+                detail: `rebase advanced into another conflicted commit with ${nextPaths.length} unresolved file(s)`,
+                advancedToNextConflict: true,
+              };
+            }
+          }
+        }
+        return {
+          ok: false,
+          error: `Failed to continue prepared merge-conflict rebase: ${continueOutput}`,
+        };
       }
     }
-    return {
-      ok: false,
-      error: `Failed to continue prepared merge-conflict rebase: ${continueOutput}`,
-    };
-  }
 
-  const remainingSequencer = await activeGitOperation(repo);
-  if (!remainingSequencer) {
+    const remainingSequencer = await activeGitOperation(repo);
+    if (!remainingSequencer) {
+      onLog?.(
+        "stdout",
+        "[MergeConflict] Auto-continued the prepared rebase after the executor returned with no unresolved conflicts.",
+      );
+      return { ok: true, resumed: true, sequencer: null };
+    }
+    if (remainingSequencer !== "rebase") {
+      return { ok: true, resumed: true, sequencer: remainingSequencer };
+    }
+
+    const nextUnresolved = await git(repo, ["diff", "--name-only", "--diff-filter=U"]);
+    if (nextUnresolved.ok) {
+      const nextPaths = parseChangedPathsFromNameOnlyOutput(nextUnresolved.stdout);
+      if (nextPaths.length > 0) {
+        onLog?.(
+          "stdout",
+          `[MergeConflict] Rebase advanced into another conflicted commit with ${nextPaths.length} unresolved file(s); rerunning the resolver on updated sandbox state.`,
+        );
+        return {
+          ok: true,
+          resumed: true,
+          sequencer: "rebase",
+          detail: `rebase advanced into another conflicted commit with ${nextPaths.length} unresolved file(s)`,
+          advancedToNextConflict: true,
+        };
+      }
+    }
+
     onLog?.(
       "stdout",
-      "[MergeConflict] Auto-continued the prepared rebase after the executor returned with no unresolved conflicts.",
+      `[MergeConflict] Rebase still active after continuation pass ${pass}/${maxContinuationPasses}; trying another non-interactive continue.`,
     );
   }
+
   return {
-    ok: true,
-    resumed: true,
-    sequencer: remainingSequencer,
-    detail:
-      remainingSequencer === "rebase"
-        ? "rebase advanced but another continuation step is still required"
-        : undefined,
+    ok: false,
+    error:
+      `Prepared merge-conflict rebase remained active after ${maxContinuationPasses} continuation pass(es).` +
+      (lastContinueOutput ? ` Last output: ${lastContinueOutput}` : ""),
   };
 }
 

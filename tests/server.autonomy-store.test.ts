@@ -1839,6 +1839,61 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("recordPrFeedback resolves review-agent source job context", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-pr-feedback-source-job-");
+    const jobQueue = new JobQueue(dbPath);
+
+    try {
+      const source = jobQueue.enqueue({
+        taskId: "task_autonomy_source_feedback",
+        kind: "task.execute",
+        sessionId: "s1",
+        params: {
+          requestId: "req_autonomy_source_feedback",
+          instruction: "Improve the smoke review path.",
+          autonomy: {
+            origin: "autonomy",
+            objectiveId: "obj_autonomy_source_feedback",
+            patternKey: "web_smoke::review_path",
+          },
+        },
+      });
+      expect(source.ok).toBe(true);
+      expect(typeof source.jobId).toBe("string");
+
+      const reviewFix = jobQueue.enqueue({
+        taskId: "review-fix-pr123-1",
+        kind: "task.execute",
+        sessionId: "s1",
+        params: {
+          instruction: "Fix review feedback for PR #123.",
+          reviewAgent: {
+            prNumber: 123,
+            sourceJobId: source.jobId,
+            resolutionType: "review_fix",
+          },
+        },
+      });
+      expect(reviewFix.ok).toBe(true);
+      expect(typeof reviewFix.jobId).toBe("string");
+
+      const feedback = store.recordPrFeedback({
+        jobId: reviewFix.jobId,
+        prUrl: "https://github.com/example/repo/pull/123",
+        verdict: "approved_unmergeable",
+        summary: "Approved but branch needs conflict resolution.",
+        reviewScore: 8.4,
+        reviewThreshold: 8.1,
+      });
+
+      expect(feedback.ok).toBe(true);
+      expect(feedback.patternKey).toBe("web_smoke::review_path");
+      expect(feedback.objectiveId).toBe("obj_autonomy_source_feedback");
+    } finally {
+      jobQueue.close();
+    }
+  });
+
   test("recordPrFeedback keeps approved_unmergeable feedback non-terminal", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({
