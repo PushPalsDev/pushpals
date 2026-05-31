@@ -2,30 +2,31 @@
 
 ## Release Metadata
 
-- version: `v1.1.8`
-- start_commit: `df2fb20c11148e27595fe53759de27d6792e9eda`
-- end_commit: `21e39e1e318d450e62086a0e9da2b573e09bd1c2`
-- commits_in_range: `1`
+- version: `v1.1.9`
+- start_commit: `873e8d36396ffab2098cc9bcf95406589a36b5fc`
+- end_commit: `7ee46f23577cc138d454dccc082d750befa67693`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Harden ReviewAgent convergence so active review-fix jobs no longer suppress needed merge-conflict repair jobs for the same PR head.
-- Resolve autonomy PR feedback through ReviewAgent `sourceJobId` metadata, preserving pattern learning for review-fix and merge-conflict follow-up jobs.
-- Make WorkerPal merge-conflict continuation more resilient by boundedly continuing or skipping empty prepared rebase commits instead of failing as soon as a Git rebase sequencer remains active.
-- Package the WorkerPal sandbox runtime copy with the same merge-conflict continuation behavior for installed CLI users.
+- Harden autonomy PR feedback ingestion so stale legacy PR feedback is ignored safely instead of breaking the runtime, while still preserving pattern learning for resolvable review contexts.
+- Add startup diagnostics for slow embedded service launches, including clearer Windows binary-scanning guidance when service startup crosses the slow threshold.
+- Add deterministic ReviewAgent PR hygiene gates for obvious low-quality branches before LLM review, including unrelated `.gitignore`/`node_modules` churn, disconnected React Native mocks, deleted coverage, unintegrated helpers, and PushPals-internal concepts leaking into user repos.
+- Add repeated-review finding memory so persistent ReviewAgent findings become hard constraints and non-converging PRs are closed earlier instead of burning review-fix loops.
+- Strengthen WorkerPal pre-publish quality gates and repo-native validation inference so TypeScript/lint checks are inferred for changed repos and unrelated hygiene churn is blocked before publication.
+- Filter autonomy candidates that mention PushPals orchestration concepts while targeting ordinary user-repo app paths, keeping autonomous work focused on repo-native product/test improvements.
+- Package the WorkerPal sandbox runtime copy with the same pre-publish hygiene and validation inference behavior for installed CLI users.
 
 ## Validation
 
 - `bun run cli:bundle`
-- `bun test tests/source-control-manager.review-agent.test.ts`
-- `bun test tests/server.autonomy-store.test.ts`
-- `bun test tests/workerpals.merge-conflict-job.test.ts`
-- `bun x --bun tsc --noEmit -p apps/server/tsconfig.json`
-- `bun x --bun tsc --noEmit -p apps/source_control_manager/tsconfig.json`
-- `bun x --bun tsc --noEmit -p apps/workerpals/tsconfig.json`
-- `bun x --bun tsc --noEmit -p packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
+- `bun test tests/source-control-manager.review-agent.test.ts tests/workerpals.validation-command-safety.test.ts tests/server.autonomy-store.test.ts`
+- `bun x tsc --noEmit --project apps/server/tsconfig.json`
+- `bun x tsc --noEmit --project apps/source_control_manager/tsconfig.json`
+- `bun x tsc --noEmit --project apps/workerpals/tsconfig.json`
+- `bun x tsc --noEmit --project packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
 - `bun run lint` completed with 2 pre-existing client warnings.
-- `bun run test:root` completed successfully: 763 pass, 1 skip, 0 fail.
+- `bun run test:root` completed successfully: 770 pass, 1 skip, 0 fail.
 - `git diff --check`
 
 ## Install
