@@ -2,26 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.6`
-- start_commit: `97ec8312cf3161fe757c74542f7201b03a835179`
-- end_commit: `65018ec6e47f31c5e1407f9eb825704748e93bdc`
+- version: `v1.1.7`
+- start_commit: `5d5d658c498c0b3b50332deb168b5cddde69fee1`
+- end_commit: `521d4d17e31eeed54b8b166417413fd52fde4b54`
 - commits_in_range: `3`
 
 ## Highlights
 
-- Harden Windows CLI startup and shutdown so successful cold starts do not leave Bun waiting on uncancelled timeout timers or unbounded cleanup work.
-- Bound process-output collection and Windows `taskkill` calls so timeout cleanup cannot pin the CLI when child processes or pipes misbehave.
-- Skip the WorkerPal capacity wait when auto-spawn is disabled, reporting the disabled state immediately instead of spending startup time in a misleading warmup probe.
-- Retry transient embedded runtime binary download failures so one flaky GitHub/curl attempt does not fail first-run startup.
-- Preserve browser assertion failure context across WorkerPal repair revisions and bound quality critic execution so passing validation is not delayed by a slow critic.
+- Let OpenAI Codex WorkerPal jobs use the configured backend timeout instead of being capped by the shorter planning execution budget, preventing valid long-running work from being killed at 30 minutes.
+- Harden WorkerPal validation and review-fix recovery paths: safer Bun test path formatting, clearer unchanged-branch review-fix guidance, and a SourceControlManager poll fix for stale `tempBranch` errors.
+- Recover Docker-backed WorkerPal execution when the local `pushpals-worker-sandbox:latest` image disappears while the runtime is already running by rebuilding the local sandbox image before retrying warm startup.
+- Stabilize Windows release validation by waiting out transient `EBUSY` temp-directory cleanup in RemoteBuddy tests instead of failing the full root test suite under load.
 
 ## Validation
 
-- `bun test tests/cli.runtime-bootstrap.test.ts --timeout 20000`
-- `bun run test:cli:integration`
+- `bun test tests/workerpals.docker-executor.test.ts`
+- `bun x --bun tsc --noEmit -p apps/workerpals/tsconfig.json`
+- `bun run lint` completed with 2 pre-existing client warnings.
 - `bun run cli:bundle`
+- `bun test tests/remotebuddy.session-routing.test.ts tests/remotebuddy.task-dedupe.test.ts`
+- `bun run test:root` completed successfully: 760 pass, 1 skip, 0 fail.
 - `git diff --check`
-- Local installed CLI package smoke from a freshly packed tarball on Windows: `bun scripts/release-installed-cli-smoke.ts --package-spec <local tgz>` completed successfully and returned to the shell in 42s.
 
 ## Install
 
