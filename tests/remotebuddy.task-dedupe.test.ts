@@ -39,7 +39,7 @@ afterEach(async () => {
     }
     if (lastError && existsSync(dir)) throw lastError;
   }
-});
+}, { timeout: 20_000 });
 
 function makeTempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "pushpals-remotebuddy-dedupe-"));

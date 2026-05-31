@@ -67,9 +67,9 @@ afterEach(async () => {
     if (!dir) continue;
     await removeDirWithRetry(dir);
   }
-});
+}, { timeout: 20_000 });
 
-async function removeDirWithRetry(dir: string, attempts = 10): Promise<void> {
+async function removeDirWithRetry(dir: string, attempts = 40): Promise<void> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
@@ -77,7 +77,7 @@ async function removeDirWithRetry(dir: string, attempts = 10): Promise<void> {
       return;
     } catch (error) {
       lastError = error;
-      await Bun.sleep(50 * attempt);
+      await Bun.sleep(Math.min(250, 50 * attempt));
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
