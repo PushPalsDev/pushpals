@@ -56,6 +56,7 @@ const MAX_AUTONOMY_FEEDBACK_SUMMARY_CHARS = 500;
 const MAX_ACTIVE_FIX_JOB_SCAN = 500;
 const REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS = 60_000;
 const REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS = 60_000;
+const REPEATED_REVIEW_FINDING_MIN_PRIOR_COMMENTS = 3;
 const PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
@@ -557,6 +558,219 @@ export function buildReviewFeedbackContext(
   return ["Recent PR feedback comments:", ...lines];
 }
 
+const REVIEW_FINDING_THEMES: Array<{
+  key: string;
+  label: string;
+  patterns: RegExp[];
+}> = [
+  {
+    key: "gitignore-node-modules-noise",
+    label: "unrelated .gitignore/node_modules noise",
+    patterns: [/\.gitignore/i, /\bnode_modules\b/i],
+  },
+  {
+    key: "unused-react-native-mock",
+    label: "unused or unrelated React Native mock changes",
+    patterns: [/reactnativemock/i],
+  },
+  {
+    key: "deleted-existing-coverage",
+    label: "deleted or weakened existing test coverage",
+    patterns: [/\b(delet|remov)\w*\b.{0,80}\b(test|coverage|assertion|case)s?\b/i],
+  },
+  {
+    key: "self-referential-tests",
+    label: "self-referential or tautological tests",
+    patterns: [/\b(self[- ]?referential|tautolog|only tests? the helper|duplicates? implementation)\b/i],
+  },
+  {
+    key: "unintegrated-helper",
+    label: "new helper is not integrated into runtime behavior",
+    patterns: [/\b(unintegrated|not integrated|unused helper|dead helper|only referenced by tests?)\b/i],
+  },
+  {
+    key: "hardcoded-diagnostics",
+    label: "hard-coded or hidden diagnostics instead of product behavior",
+    patterns: [/\b(hard[- ]?coded|hidden diagnostics?|static diagnostics?|debug-only)\b/i],
+  },
+  {
+    key: "compile-or-validation-failure",
+    label: "compile, typecheck, lint, or validation failure",
+    patterns: [/\b(typecheck|tsc|lint|compile|validation|test)\b.{0,80}\b(fail|error|broken)\b/i],
+  },
+  {
+    key: "duplicate-or-misplaced-tests",
+    label: "duplicate or misplaced tests",
+    patterns: [/\b(duplicate|misplaced|wrong file|wrong path)\b.{0,80}\b(test|coverage|assertion)s?\b/i],
+  },
+  {
+    key: "pushpals-internal-leak",
+    label: "PushPals-internal/autonomy concepts leaked into the user repo",
+    patterns: [/\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|reviewagent|pushpals)\b/i],
+  },
+];
+
+function reviewFindingThemeKeys(text: string): string[] {
+  const normalized = String(text ?? "").replace(/[_-]+/g, " ");
+  const keys = new Set<string>();
+  for (const theme of REVIEW_FINDING_THEMES) {
+    if (theme.patterns.some((pattern) => pattern.test(normalized))) {
+      keys.add(theme.key);
+    }
+  }
+  return [...keys];
+}
+
+function reviewFindingThemeLabel(key: string): string {
+  return REVIEW_FINDING_THEMES.find((theme) => theme.key === key)?.label ?? key;
+}
+
+export function summarizeRepeatedReviewFindings(args: {
+  currentFindings: string[];
+  previousFeedback: string[];
+  minPriorComments?: number;
+}): { issues: string[]; repeatedThemeKeys: string[]; shouldGiveUp: boolean } {
+  const currentKeys = new Set(
+    args.currentFindings.flatMap((entry) => reviewFindingThemeKeys(String(entry ?? ""))),
+  );
+  if (currentKeys.size === 0) {
+    return { issues: [], repeatedThemeKeys: [], shouldGiveUp: false };
+  }
+
+  const previousCounts = new Map<string, number>();
+  for (const feedback of args.previousFeedback) {
+    const keysInComment = new Set(reviewFindingThemeKeys(feedback));
+    for (const key of keysInComment) {
+      previousCounts.set(key, (previousCounts.get(key) ?? 0) + 1);
+    }
+  }
+
+  const repeatedThemeKeys = [...currentKeys].filter((key) => (previousCounts.get(key) ?? 0) >= 2);
+  const issues = repeatedThemeKeys.map(
+    (key) =>
+      `Repeated unresolved ReviewAgent finding: ${reviewFindingThemeLabel(key)}. The next fix must directly remove this pattern instead of reworking adjacent code.`,
+  );
+  const minPriorComments = Math.max(
+    1,
+    Math.floor(args.minPriorComments ?? REPEATED_REVIEW_FINDING_MIN_PRIOR_COMMENTS),
+  );
+  return {
+    issues,
+    repeatedThemeKeys,
+    shouldGiveUp: issues.length > 0 && args.previousFeedback.length >= minPriorComments,
+  };
+}
+
+function uniqueNonEmptyLines(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const line = collapseWhitespace(String(value ?? ""));
+    if (!line) continue;
+    const key = line.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(line);
+  }
+  return out;
+}
+
+function testDeclarationCounts(diff: string): { added: number; removed: number } {
+  let added = 0;
+  let removed = 0;
+  for (const line of diff.split(/\r?\n/)) {
+    if (/^\+\s*(?:test|it|describe)\s*\(/.test(line)) added += 1;
+    if (/^-\s*(?:test|it|describe)\s*\(/.test(line)) removed += 1;
+  }
+  return { added, removed };
+}
+
+function countDiffTokenOutsideFile(diff: string, token: RegExp, excludedPath: string): number {
+  let currentPath = "";
+  let count = 0;
+  for (const line of diff.split(/\r?\n/)) {
+    if (line.startsWith("diff --git ")) {
+      const parsed = parseDiffGitLinePaths(line);
+      currentPath = normalizeDiffPath(parsed?.bPath ?? parsed?.aPath ?? "") ?? "";
+      continue;
+    }
+    if (currentPath === excludedPath) continue;
+    if (token.test(line)) count += 1;
+  }
+  return count;
+}
+
+export function collectReviewHygieneIssuesFromDiff(diff: string): string[] {
+  const changedPaths = parseChangedPathsFromDiff(diff);
+  const changedPathSet = new Set(changedPaths);
+  const issues: string[] = [];
+
+  if (changedPathSet.has(".gitignore") && /^\+node_modules\s*$/m.test(diff)) {
+    issues.push(
+      "PR adds bare node_modules noise to .gitignore. Keep dependency/cache hygiene out of feature PRs unless the task explicitly changes repo ignore policy.",
+    );
+  }
+
+  if (
+    changedPathSet.has("tests/reactNativeMock.ts") &&
+    countDiffTokenOutsideFile(diff, /reactNativeMock/i, "tests/reactNativeMock.ts") === 0
+  ) {
+    issues.push(
+      "PR adds or changes tests/reactNativeMock.ts without wiring it into a changed test. Remove the unrelated mock or add a focused consumer in the same PR.",
+    );
+  }
+
+  const declarationCounts = testDeclarationCounts(diff);
+  if (declarationCounts.removed >= 3 && declarationCounts.removed > declarationCounts.added) {
+    issues.push(
+      "PR removes multiple existing test declarations without replacing equivalent coverage. Preserve existing coverage unless the task is explicitly a test deletion/refactor.",
+    );
+  }
+
+  const changedTestPaths = changedPaths.filter((path) =>
+    /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
+  );
+  const changedRuntimePaths = changedPaths.filter(
+    (path) =>
+      /\.(?:[cm]?[jt]sx?)$/i.test(path) &&
+      !/(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
+  );
+  if (
+    changedTestPaths.length > 0 &&
+    changedRuntimePaths.length > 0 &&
+    changedRuntimePaths.every((path) => /^utils\//i.test(path)) &&
+    !changedRuntimePaths.some((path) => /(?:index|route|screen|component|store|service)/i.test(path))
+  ) {
+    issues.push(
+      "PR adds utility/helper code with tests but no clear runtime integration point. Integrate the helper into behavior-owning code or keep it as a test fixture.",
+    );
+  }
+
+  if (
+    changedPaths.some((path) => /(^|\/)_layout\.autonomy\.test\.[cm]?[jt]sx?$/i.test(path)) &&
+    /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|reviewagent|pushpals)\b/i.test(diff)
+  ) {
+    issues.push(
+      "Layout autonomy tests contain PushPals-internal orchestration concepts. Keep user-repo review coverage focused on app behavior and route/startup contracts.",
+    );
+  }
+
+  return uniqueNonEmptyLines(issues);
+}
+
+function buildDeterministicReviewHygieneVerdict(
+  issues: string[],
+  passThreshold: number,
+): ReviewVerdict {
+  return {
+    score: Math.max(1, Math.min(6, passThreshold - 1)),
+    summary: "Deterministic PR hygiene gate rejected unrelated or risky changes before LLM review.",
+    issues,
+    fix_instruction:
+      "Remove the hygiene violations first, keep the branch focused on the requested product behavior, preserve existing tests, and rerun the repo-native validation commands.",
+  };
+}
+
 function normalizeDiffPath(value: string): string | null {
   const trimmed = value.trim().replace(/^"+|"+$/g, "");
   if (!trimmed || trimmed === "/dev/null") return null;
@@ -1043,6 +1257,22 @@ export class ReviewAgent {
       return;
     }
 
+    const deterministicHygieneIssues = collectReviewHygieneIssuesFromDiff(diff);
+    if (deterministicHygieneIssues.length > 0) {
+      const verdict = buildDeterministicReviewHygieneVerdict(
+        deterministicHygieneIssues,
+        this.config.passThreshold,
+      );
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} failed deterministic hygiene gate (${deterministicHygieneIssues.length} issue(s)); skipping Codex review.`,
+      );
+      const finalized = await this.rejectPr(pr, verdict, diff);
+      if (finalized) {
+        this.reviewed.set(pr.number, sha);
+      }
+      return;
+    }
+
     const reviewerMd = this.loadReviewerMd();
     const prompt = buildReviewPrompt(reviewerMd, pr, diff, this.config.passThreshold);
 
@@ -1242,7 +1472,35 @@ export class ReviewAgent {
       });
     }
 
-    const rejectionComment = formatRejectionComment(verdict);
+    const repeatedReviewFindings = summarizeRepeatedReviewFindings({
+      currentFindings: [verdict.summary, verdict.fix_instruction, ...verdict.issues],
+      previousFeedback: recentComments.map((comment) => comment.body),
+    });
+    const effectiveVerdict =
+      repeatedReviewFindings.issues.length > 0
+        ? {
+            ...verdict,
+            summary: `${verdict.summary} Persistent unresolved review findings remain.`,
+            issues: uniqueNonEmptyLines([...verdict.issues, ...repeatedReviewFindings.issues]),
+            fix_instruction: uniqueNonEmptyLines([
+              verdict.fix_instruction,
+              ...repeatedReviewFindings.issues,
+            ]).join("\n"),
+          }
+        : verdict;
+    if (repeatedReviewFindings.shouldGiveUp) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} repeated unresolved findings (${repeatedReviewFindings.repeatedThemeKeys.join(", ")}); closing instead of enqueueing another low-signal review-fix job.`,
+      );
+      return await this.giveUpOnRejectedPr(pr, effectiveVerdict, {
+        jobId,
+        sessionId,
+        recentComments,
+        maxPrCommentsBeforeGiveUp,
+      });
+    }
+
+    const rejectionComment = formatRejectionComment(effectiveVerdict);
     try {
       await this.deps.addPullRequestComment({
         token: this.githubToken,
@@ -1258,8 +1516,8 @@ export class ReviewAgent {
     await this.postAutonomyPrFeedback({
       pr,
       verdict: "rejected",
-      verdictSummary: verdict.summary,
-      reviewScore: verdict.score,
+      verdictSummary: effectiveVerdict.summary,
+      reviewScore: effectiveVerdict.score,
       jobId,
       sessionId,
       comments: recentComments,
@@ -1296,7 +1554,7 @@ export class ReviewAgent {
 
     const enqueued = await this.enqueueFixJob(
       pr,
-      verdict,
+      effectiveVerdict,
       sessionId,
       jobId,
       diff,

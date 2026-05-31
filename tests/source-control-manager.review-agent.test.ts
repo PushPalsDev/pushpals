@@ -5,10 +5,12 @@ import {
   buildReviewFeedbackContext,
   buildReviewPrompt,
   buildCodexExecArgs,
+  collectReviewHygieneIssuesFromDiff,
   deriveFixWriteGlobsFromDiff,
   parseReviewVerdict,
   resolveCodexCmd,
   resolveReviewerMdPath,
+  summarizeRepeatedReviewFindings,
   type ReviewAgentConfig,
 } from "../apps/source_control_manager/src/review_agent";
 import type { GitHubPR } from "../apps/source_control_manager/src/github_pr";
@@ -146,6 +148,40 @@ describe("ReviewAgent", () => {
     expect(globs).toContain("tests/**");
     expect(globs).toContain("README.md");
     expect(globs).toContain("apps/local buddy/**");
+  });
+
+  test("flags deterministic PR hygiene issues before reviewer loops", () => {
+    const issues = collectReviewHygieneIssuesFromDiff(
+      [
+        "diff --git a/.gitignore b/.gitignore",
+        "+node_modules",
+        "diff --git a/app/__tests__/_layout.autonomy.test.ts b/app/__tests__/_layout.autonomy.test.ts",
+        "+test('queue_health workerpal diagnostics are visible', () => {})",
+        "diff --git a/utils/queueHealth.ts b/utils/queueHealth.ts",
+        "+export function queueHealth() { return true; }",
+      ].join("\n"),
+    );
+
+    expect(issues.some((issue) => issue.includes(".gitignore"))).toBe(true);
+    expect(issues.some((issue) => issue.includes("PushPals-internal"))).toBe(true);
+    expect(issues.some((issue) => issue.includes("runtime integration"))).toBe(true);
+  });
+
+  test("summarizes repeated review findings as hard constraints", () => {
+    const summary = summarizeRepeatedReviewFindings({
+      currentFindings: [
+        "The new helper is still unintegrated and only referenced by tests.",
+      ],
+      previousFeedback: [
+        "ReviewAgent: helper is not integrated into runtime behavior.",
+        "ReviewAgent: unused helper only referenced by tests.",
+        "ReviewAgent: this revision still has duplicate tests.",
+      ],
+    });
+
+    expect(summary.shouldGiveUp).toBe(true);
+    expect(summary.issues[0]).toContain("Repeated unresolved ReviewAgent finding");
+    expect(summary.repeatedThemeKeys).toContain("unintegrated-helper");
   });
 
   test("poll uses configured PR base branch", async () => {

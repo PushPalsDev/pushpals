@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   classifyValidationFailureScope,
+  collectPrePublishHygieneIssues,
   collectWriteScopeIssuesFromChangedPaths,
   collectRequiredValidationFailures,
   collectQualityGateValidationCommands,
@@ -12,6 +13,7 @@ import {
   formatBunTestPathArg,
   inferPlaywrightBrowserInstallTargets,
   inferFallbackValidationCommandsForTestTask,
+  inferRepoNativeValidationCommands,
   isAssertionCoverageTestPath,
   isBrowserSmokeHarnessPath,
   isLikelyTestPath,
@@ -195,6 +197,62 @@ describe("workerpals validation command safety", () => {
     expect(commands.fallbackValidationSteps[0]).toContain(
       "./tests/localbuddy.request-status.test.ts",
     );
+  });
+
+  test("adds repo-native typecheck and lint commands for TypeScript changes", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-inference-"));
+    try {
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({ scripts: { lint: "eslint ." }, devDependencies: { typescript: "^5" } }),
+      );
+      writeFileSync(join(root, "tsconfig.json"), JSON.stringify({ compilerOptions: {} }));
+
+      expect(inferRepoNativeValidationCommands(root, ["app/game.tsx"])).toEqual([
+        "bun x tsc --noEmit",
+        "bun run lint",
+      ]);
+
+      const commands = collectQualityGateValidationCommands({
+        instruction: "Improve a UI surface",
+        targetPath: "app/game.tsx",
+        planning: planningFixture({ validationSteps: [] }) as any,
+        changedTestPaths: [],
+        isTestTask: false,
+        repo: root,
+        changedPaths: ["app/game.tsx"],
+      });
+      expect(commands.commandsToRun).toEqual(["bun x tsc --noEmit", "bun run lint"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("flags unrelated hygiene churn before publish", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-hygiene-"));
+    try {
+      mkdirSync(join(root, "tests"), { recursive: true });
+      writeFileSync(join(root, "tests", "reactNativeMock.ts"), "export const Animated = {};\n");
+      const issues = collectPrePublishHygieneIssues({
+        repo: root,
+        changedPaths: [".gitignore", "tests/reactNativeMock.ts"],
+        instruction: "Improve home screen readability",
+        targetPath: "app/index.tsx",
+        planning: planningFixture({
+          targetPaths: ["app/index.tsx"],
+          scope: { readAnywhere: true, writeAllowed: true, writeGlobs: ["app/index.tsx"] },
+        }) as any,
+      });
+
+      expect(issues).toContain(
+        "modified .gitignore without task or reviewer guidance requesting ignore-policy changes.",
+      );
+      expect(issues).toContain(
+        "changed tests/reactNativeMock.ts without a changed test importing it or explicit reviewer guidance.",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("extracts repo-native required validation commands from vision markdown", () => {

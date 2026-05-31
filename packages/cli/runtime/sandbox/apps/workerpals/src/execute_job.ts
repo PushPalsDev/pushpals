@@ -2245,11 +2245,14 @@ export function collectQualityGateValidationCommands(params: {
   planning: TaskExecutePlanning;
   changedTestPaths: string[];
   isTestTask: boolean;
+  repo?: string;
+  changedPaths?: string[];
 }): {
   commandsToRun: string[];
   requiredRunnableSteps: string[];
   plannerRunnableSteps: string[];
   fallbackValidationSteps: string[];
+  inferredRepoNativeValidationSteps: string[];
 } {
   const requiredRunnableSteps = runnableValidationCommandsFromSteps(
     params.planning.requiredValidationSteps,
@@ -2266,15 +2269,20 @@ export function collectQualityGateValidationCommands(params: {
           params.changedTestPaths,
         )
       : [];
+  const inferredRepoNativeValidationSteps = params.repo
+    ? inferRepoNativeValidationCommands(params.repo, params.changedPaths ?? [])
+    : [];
   const commandsToRun = dedupeValidationCommands(
     requiredRunnableSteps,
     plannerRunnableSteps.length > 0 ? plannerRunnableSteps : fallbackValidationSteps,
+    inferredRepoNativeValidationSteps,
   ).slice(0, 16);
   return {
     commandsToRun,
     requiredRunnableSteps,
     plannerRunnableSteps,
     fallbackValidationSteps,
+    inferredRepoNativeValidationSteps,
   };
 }
 
@@ -2416,6 +2424,114 @@ function hasBalancedPositiveNegativeAssertions(paths: string[], repo: string): b
   return positiveAssertions > 0 && negativeAssertions > 0;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function changedPathMentionsGuidance(pathPattern: RegExp, guidance: string): boolean {
+  return pathPattern.test(guidance);
+}
+
+export function collectPrePublishHygieneIssues(params: {
+  repo: string;
+  changedPaths: string[];
+  instruction: string;
+  targetPath?: string;
+  planning: TaskExecutePlanning;
+  reviewAgent?: Record<string, unknown> | null;
+}): string[] {
+  const changedPaths = params.changedPaths.map((path) => path.replace(/\\/g, "/"));
+  const changedPathSet = new Set(changedPaths);
+  const guidance = [
+    params.instruction,
+    params.targetPath ?? "",
+    ...(params.planning.targetPaths ?? []),
+    ...(params.planning.scope.writeGlobs ?? []),
+    ...(params.planning.acceptanceCriteria ?? []),
+    ...(params.planning.validationSteps ?? []),
+    ...((params.reviewAgent?.reviewerFindings as string[] | undefined) ?? []),
+  ]
+    .join("\n")
+    .toLowerCase();
+  const issues: string[] = [];
+
+  if (
+    changedPathSet.has(".gitignore") &&
+    !changedPathMentionsGuidance(/\b(gitignore|ignore file|node_modules|dependency cache)\b/i, guidance)
+  ) {
+    issues.push(
+      "modified .gitignore without task or reviewer guidance requesting ignore-policy changes.",
+    );
+  }
+
+  if (changedPathSet.has("tests/reactNativeMock.ts")) {
+    const changedTestPaths = changedPaths.filter((path) => isAssertionCoverageTestPath(path));
+    const hasConsumerInChangedTests = changedTestPaths.some((rel) => {
+      try {
+        return /reactNativeMock/i.test(readFileSync(resolve(params.repo, rel), "utf8"));
+      } catch {
+        return false;
+      }
+    });
+    const explicitlyRequested = changedPathMentionsGuidance(/reactnativemock|react native mock/i, guidance);
+    if (!hasConsumerInChangedTests && !explicitlyRequested) {
+      issues.push(
+        "changed tests/reactNativeMock.ts without a changed test importing it or explicit reviewer guidance.",
+      );
+    }
+  }
+
+  if (changedPaths.some((path) => /(^|\/)node_modules(\/|$)/i.test(path))) {
+    issues.push("attempted to publish node_modules changes; dependency installs must not become PR content.");
+  }
+
+  return Array.from(new Set(issues));
+}
+
+export function inferRepoNativeValidationCommands(repo: string, changedPaths: string[]): string[] {
+  const packageJsonPath = resolve(repo, "package.json");
+  if (!existsSync(packageJsonPath)) return [];
+
+  let packageJson: {
+    scripts?: Record<string, unknown>;
+    dependencies?: Record<string, unknown>;
+    devDependencies?: Record<string, unknown>;
+  } = {};
+  try {
+    packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+  } catch {
+    return [];
+  }
+
+  const scripts = packageJson.scripts ?? {};
+  const dependencies = {
+    ...(packageJson.dependencies ?? {}),
+    ...(packageJson.devDependencies ?? {}),
+  };
+  const normalizedPaths = changedPaths.map((path) => path.replace(/\\/g, "/"));
+  const hasNonDocChange = normalizedPaths.some((path) => !/\.(?:md|mdx|txt)$/i.test(path));
+  const hasTsChange = normalizedPaths.some((path) => /\.[cm]?tsx?$/i.test(path));
+  const commands: string[] = [];
+
+  if (hasTsChange) {
+    if (typeof scripts.typecheck === "string" && scripts.typecheck.trim()) {
+      commands.push("bun run typecheck");
+    } else if (
+      existsSync(resolve(repo, "tsconfig.json")) ||
+      Object.prototype.hasOwnProperty.call(dependencies, "typescript")
+    ) {
+      commands.push("bun x tsc --noEmit");
+    }
+  }
+
+  if (hasNonDocChange && typeof scripts.lint === "string" && scripts.lint.trim()) {
+    commands.push("bun run lint");
+  }
+
+  return dedupeValidationCommands(commands).slice(0, 4);
+}
+
 async function runDeterministicQualityGate(
   repo: string,
   params: Record<string, unknown>,
@@ -2485,6 +2601,16 @@ async function runDeterministicQualityGate(
     if (!statusResult.ok) {
       addScopeIssue("could not evaluate changed paths from git status.");
     }
+    for (const issue of collectPrePublishHygieneIssues({
+      repo,
+      changedPaths,
+      instruction,
+      targetPath,
+      planning,
+      reviewAgent: asRecord(params.reviewAgent ?? params.review_agent),
+    })) {
+      addScopeIssue(issue);
+    }
     for (const issue of collectWriteScopeIssuesFromChangedPaths(changedPaths, planning)) {
       addScopeIssue(issue);
     }
@@ -2525,6 +2651,8 @@ async function runDeterministicQualityGate(
     planning,
     changedTestPaths,
     isTestTask,
+    repo,
+    changedPaths,
   });
   const validationRuns: ValidationExecutionResult[] = [];
   const outputPolicy = outputPolicyForRuntime(runtimeConfig);

@@ -686,6 +686,80 @@ describe("server AutonomyStore policy gates", () => {
     expect(String(result.results?.[0]?.reason ?? "")).toContain("confidence");
   });
 
+  test("blocks PushPals-internal autonomy ideas from user-repo targets", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_meta_leak",
+      repoHealthFlags: {
+        is_worktree_dirty: false,
+        is_merge_in_progress: false,
+      },
+    }).snapshot_id;
+
+    const result = store.evaluateEligibility({
+      runId: "run_meta_leak",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_queue_health_leak",
+          objective_type: "small_refactor",
+          component_area: "app",
+          pattern_key: "queue_health_contract",
+          title: "Add queue_health readability contract",
+          instruction: "Expose WorkerPal queue_health diagnostics in the app layout tests.",
+          target_paths: ["app/__tests__/_layout.autonomy.test.ts"],
+          scope: { read_anywhere: true, write_globs: ["app/**"] },
+          confidence: 0.95,
+        },
+        {
+          candidate_id: "cand_pushpals_runtime",
+          objective_type: "small_refactor",
+          component_area: "apps/workerpals",
+          pattern_key: "workerpal_queue_health_runtime",
+          title: "Add WorkerPal queue health coverage",
+          instruction: "Strengthen WorkerPal queue health tests in PushPals runtime code.",
+          target_paths: ["apps/workerpals/src/execute_job.ts"],
+          scope: { read_anywhere: true, write_globs: ["apps/workerpals/**"] },
+          confidence: 0.95,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.results?.[0]).toMatchObject({
+      candidate_id: "cand_queue_health_leak",
+      ok: false,
+    });
+    expect(String(result.results?.[0]?.reason ?? "")).toContain("PushPals-internal");
+    expect(result.results?.[1]).toMatchObject({
+      candidate_id: "cand_pushpals_runtime",
+      ok: true,
+    });
+
+    const directDecision = store.recordObjectiveDecision({
+      runId: "run_meta_leak",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_queue_health_leak",
+        title: "Add queue_health readability contract",
+        instruction: "Expose WorkerPal queue_health diagnostics in the app layout tests.",
+        objective_type: "small_refactor",
+        component_area: "app",
+        trigger_type: "test_failure",
+        target_paths: ["app/__tests__/_layout.autonomy.test.ts"],
+        scope: { read_anywhere: true, write_globs: ["app/**"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun test"],
+        status: "proposed",
+      },
+    });
+    expect(directDecision.ok).toBe(false);
+    expect(String(directDecision.reason ?? "")).toContain("PushPals-internal");
+  });
+
   test("evaluateEligibility suppresses dispatch when same pattern succeeded within 24h", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({

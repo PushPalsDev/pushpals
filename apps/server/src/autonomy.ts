@@ -536,6 +536,69 @@ function asStringArray(value: unknown): string[] {
   return value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
 }
 
+const PUSHPALS_INTERNAL_CANDIDATE_PATTERNS: RegExp[] = [
+  /\bqueue[_-]?health\b/i,
+  /\bworkerpals?\b/i,
+  /\bremotebuddy\b/i,
+  /\blocalbuddy\b/i,
+  /\bsource[_-]?control[_-]?manager\b/i,
+  /\bsourcecontrolmanager\b/i,
+  /\breview[_-]?agent\b/i,
+  /\breviewagent\b/i,
+  /\bpushpals?\b/i,
+  /\bdispatch locks?\b/i,
+  /\bautonomy diagnostics?\b/i,
+];
+
+const PUSHPALS_OWNED_PATH_PATTERNS: RegExp[] = [
+  /^apps\/(?:workerpals|remotebuddy|localbuddy|source_control_manager|server)\b/i,
+  /^packages\/(?:cli|shared)\b/i,
+  /^prompts\/(?:workerpals|review_agent|remotebuddy|localbuddy)\b/i,
+  /^scripts\/(?:pushpals|sync-cli|build-runtime|release|replay-worker-job)/i,
+  /\bpushpals\b/i,
+  /\bworkerpals\b/i,
+  /\bremotebuddy\b/i,
+  /\bsource_control_manager\b/i,
+];
+
+function pushpalsInternalCandidateReason(record: Record<string, unknown>): string | null {
+  const scope = asObject(record.scope);
+  const targetPaths = [
+    ...asStringArray(record.targetPaths ?? record.target_paths),
+    ...asStringArray(scope.targetPaths ?? scope.target_paths),
+  ];
+  const writeGlobs = asStringArray(scope.writeGlobs ?? scope.write_globs);
+  const ownershipHints = [
+    asString(record.componentArea ?? record.component_area),
+    ...targetPaths,
+    ...writeGlobs,
+  ]
+    .map((entry) => entry.replace(/\\/g, "/").replace(/\/+/g, "/").trim())
+    .filter(Boolean);
+  const targetsPushPalsOwnedArea = ownershipHints.some((entry) =>
+    PUSHPALS_OWNED_PATH_PATTERNS.some((pattern) => pattern.test(entry)),
+  );
+  if (targetsPushPalsOwnedArea) return null;
+
+  const candidateText = [
+    record.title,
+    record.name,
+    record.summary,
+    record.description,
+    record.instruction,
+    record.patternKey ?? record.pattern_key,
+    record.componentArea ?? record.component_area,
+    ...asStringArray(record.acceptanceCriteria ?? record.acceptance_criteria),
+  ]
+    .map((entry) => asString(entry))
+    .join("\n");
+  const leakedTerm = PUSHPALS_INTERNAL_CANDIDATE_PATTERNS.find((pattern) =>
+    pattern.test(candidateText),
+  );
+  if (!leakedTerm) return null;
+  return "candidate appears to target PushPals-internal orchestration concepts in a user repo; generate repo-native product/test work instead";
+}
+
 function uniqueLowercaseTokens(value: unknown, maxItems = 24): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -3835,6 +3898,14 @@ export class AutonomyStore {
       const patternKey = asString(record.patternKey ?? record.pattern_key);
       const componentArea = asComponentArea(record.componentArea ?? record.component_area);
       const confidence = clamp01(asNumber(record.confidence, 0));
+      const pushpalsInternalErr = pushpalsInternalCandidateReason(record);
+      if (pushpalsInternalErr) {
+        return {
+          candidate_id: candidateId,
+          ok: false,
+          reason: pushpalsInternalErr,
+        };
+      }
 
       const perTypeLimit = Math.max(
         0,
@@ -3969,10 +4040,12 @@ export class AutonomyStore {
         expectedValidation,
         allowReadAnywhere: this.config.remotebuddy.autonomy.allowReadAnywhere,
       });
+      const pushpalsInternalErr = pushpalsInternalCandidateReason(record);
       const gateReasons = [
         ...enumErrors,
         ...(scopeValidation.ok ? [] : scopeValidation.errors),
         ...policyErrors,
+        ...(pushpalsInternalErr ? [pushpalsInternalErr] : []),
       ];
       const penalties = normalizePenalties(
         (Array.isArray(record.penalties) ? record.penalties : []).map((entry) => {
@@ -4151,6 +4224,10 @@ export class AutonomyStore {
     });
     if (policyErrors.length > 0) {
       return { ok: false, objectiveId, reason: policyErrors.join("; ") };
+    }
+    const pushpalsInternalErr = pushpalsInternalCandidateReason(objective);
+    if (pushpalsInternalErr) {
+      return { ok: false, objectiveId, reason: pushpalsInternalErr };
     }
 
     const patternKey = makePatternKey(
