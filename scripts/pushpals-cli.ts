@@ -267,6 +267,7 @@ const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
 const RUNTIME_BINARY_DOWNLOAD_ATTEMPTS = 3;
 const DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_STARTUP_GIT_REMOTE_TIMEOUT_MS = 10_000;
+const DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS = 5_000;
 const DEFAULT_EMBEDDED_SERVICE_SUPERVISOR_POLL_MS = 1_000;
 const EMBEDDED_SERVICE_RESTART_MAX_ATTEMPTS = 4;
 const EMBEDDED_SERVICE_RESTART_STABLE_WINDOW_MS = 60_000;
@@ -319,6 +320,24 @@ export function formatRuntimeStartupTimingSummary(input: {
     `[pushpals] startup timing summary: outcome=${input.outcome} ` +
     `total=${Math.max(0, Math.floor(input.totalDurationMs))}ms${detail}` +
     (phaseSummary ? ` ${phaseSummary}` : "")
+  );
+}
+
+export function formatEmbeddedServiceLaunchDelayWarning(input: {
+  serviceName: string;
+  durationMs: number;
+  platform?: NodeJS.Platform | string;
+}): string {
+  const durationMs = Math.max(0, Math.floor(Number(input.durationMs) || 0));
+  const serviceName = String(input.serviceName || "service");
+  const platform = String(input.platform ?? process.platform);
+  const windowsHint =
+    platform === "win32"
+      ? " On Windows, first-run standalone binaries can be delayed while security software scans them."
+      : "";
+  return (
+    `[pushpals] Embedded ${serviceName} process launch took ${durationMs}ms; startup is continuing.` +
+    windowsHint
   );
 }
 
@@ -4326,7 +4345,19 @@ async function autoStartRuntimeServices(opts: {
       appendLog?: boolean;
     },
   ): RuntimeServiceProcess => {
-    return serviceManager.startService(buildManagedServiceSpec(name, command, launchOpts));
+    const launchStartedAt = Date.now();
+    const service = serviceManager.startService(buildManagedServiceSpec(name, command, launchOpts));
+    const launchDurationMs = Date.now() - launchStartedAt;
+    if (launchDurationMs >= DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS) {
+      const warning = formatEmbeddedServiceLaunchDelayWarning({
+        serviceName: name,
+        durationMs: launchDurationMs,
+        platform: process.platform,
+      });
+      console.warn(warning);
+      appendRuntimeServicesLogLine(runtimeServicesLogPath, warning);
+    }
+    return service;
   };
   const replaceService = (
     name: RuntimeServiceName,
@@ -4336,7 +4367,19 @@ async function autoStartRuntimeServices(opts: {
       appendLog?: boolean;
     },
   ): RuntimeServiceProcess => {
-    return serviceManager.replaceService(buildManagedServiceSpec(name, command, launchOpts));
+    const launchStartedAt = Date.now();
+    const service = serviceManager.replaceService(buildManagedServiceSpec(name, command, launchOpts));
+    const launchDurationMs = Date.now() - launchStartedAt;
+    if (launchDurationMs >= DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS) {
+      const warning = formatEmbeddedServiceLaunchDelayWarning({
+        serviceName: name,
+        durationMs: launchDurationMs,
+        platform: process.platform,
+      });
+      console.warn(warning);
+      appendRuntimeServicesLogLine(runtimeServicesLogPath, warning);
+    }
+    return service;
   };
   const sandboxPaths = buildWorkerpalSandboxPaths(runtimeRoot);
   const remoteBuddyFallbackBun =

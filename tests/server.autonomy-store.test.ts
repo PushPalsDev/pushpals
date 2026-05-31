@@ -1894,6 +1894,27 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("recordPrFeedback ignores legacy PR feedback that cannot resolve autonomy context", () => {
+    const store = makeStore();
+
+    const feedback = store.recordPrFeedback({
+      feedbackKey: "review_agent:pr:987:head:legacy:verdict:rejected",
+      prNumber: 987,
+      prUrl: "https://github.com/example/repo/pull/987",
+      verdict: "rejected",
+      summary: "Legacy PR has no source job metadata to map back to autonomy.",
+      reviewScore: 7.2,
+      reviewThreshold: 8.1,
+    });
+
+    expect(feedback.ok).toBe(true);
+    expect(feedback.ignored).toBe(true);
+    expect(feedback.reason).toContain("unable to resolve patternKey");
+
+    const insights = store.listInsights({ limit: 5, feedbackLimit: 5 });
+    expect(insights.recentPrFeedback).toHaveLength(0);
+  });
+
   test("recordPrFeedback keeps approved_unmergeable feedback non-terminal", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({

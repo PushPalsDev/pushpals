@@ -32,6 +32,7 @@ import {
   ensureWorkerpalDockerImageReady,
   extractRemoteBuddyAutonomousEngineState,
   extractRemoteBuddySessionConsumerHealth,
+  formatEmbeddedServiceLaunchDelayWarning,
   formatRuntimeStartupTimingSummary,
   formatWorkerExecutionReadinessLines,
   formatTimestampedCliLine,
@@ -2729,6 +2730,18 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(summary).toBe(
       "[pushpals] startup timing summary: outcome=failed total=20001ms detail=server health timeout server=20000ms(timeout)",
+    );
+  });
+
+  test("formatEmbeddedServiceLaunchDelayWarning explains slow Windows binary launch", () => {
+    expect(
+      formatEmbeddedServiceLaunchDelayWarning({
+        serviceName: "source_control_manager",
+        durationMs: 26670.9,
+        platform: "win32",
+      }),
+    ).toBe(
+      "[pushpals] Embedded source_control_manager process launch took 26670ms; startup is continuing. On Windows, first-run standalone binaries can be delayed while security software scans them.",
     );
   });
 

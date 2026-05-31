@@ -1418,7 +1418,7 @@ export function createRequestHandler() {
 
         const sessionId = compactText(body.sessionId, 128);
         const session = sessionId ? sessionManager.getSession(sessionId) : null;
-        if (session) {
+        if (session && !result.ignored) {
           session.emit({
             protocolVersion: PROTOCOL_VERSION,
             id: randomUUID(),

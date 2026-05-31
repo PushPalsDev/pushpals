@@ -4394,27 +4394,32 @@ export class AutonomyStore {
           }
         | undefined;
 
-    const readByPrUrl = (url: string) =>
-      this.db
-        .prepare(
-          `SELECT o.id AS objectiveId,
-                  o.request_id AS requestId,
-                  o.job_id AS jobId,
-                  o.pattern_key AS patternKey
-           FROM autonomy_objectives o
-           JOIN jobs j ON j.id = o.job_id
-           WHERE j.prUrl = ? OR LOWER(j.prUrl) = LOWER(?)
-           ORDER BY o.updated_at DESC
-           LIMIT 1`,
-        )
-        .get(url, url) as
-        | {
-            objectiveId: string | null;
-            requestId: string | null;
-            jobId: string | null;
-            patternKey: string | null;
-          }
-        | undefined;
+    const readByPrUrl = (url: string) => {
+      try {
+        return this.db
+          .prepare(
+            `SELECT o.id AS objectiveId,
+                    o.request_id AS requestId,
+                    o.job_id AS jobId,
+                    o.pattern_key AS patternKey
+             FROM autonomy_objectives o
+             JOIN jobs j ON j.id = o.job_id
+             WHERE j.prUrl = ? OR LOWER(j.prUrl) = LOWER(?)
+             ORDER BY o.updated_at DESC
+             LIMIT 1`,
+          )
+          .get(url, url) as
+          | {
+              objectiveId: string | null;
+              requestId: string | null;
+              jobId: string | null;
+              patternKey: string | null;
+            }
+          | undefined;
+      } catch {
+        return undefined;
+      }
+    };
 
     const db = this.db;
     function readContextFromJobRow(
@@ -4429,20 +4434,30 @@ export class AutonomyStore {
           patternKey: string | null;
         }
       | undefined {
-      const row = db
-        .prepare(
-          `SELECT id AS jobId, params AS paramsJson
-           FROM jobs
-           WHERE ${whereSql}
-           ORDER BY COALESCE(completedAt, failedAt, updatedAt, createdAt) DESC
-           LIMIT 1`,
-        )
-        .get(...args) as
+      let row:
         | {
             jobId: string | null;
             paramsJson: string | null;
           }
         | undefined;
+      try {
+        row = db
+          .prepare(
+            `SELECT id AS jobId, params AS paramsJson
+             FROM jobs
+             WHERE ${whereSql}
+             ORDER BY COALESCE(completedAt, failedAt, updatedAt, createdAt) DESC
+             LIMIT 1`,
+          )
+          .get(...args) as
+          | {
+              jobId: string | null;
+              paramsJson: string | null;
+            }
+          | undefined;
+      } catch {
+        return undefined;
+      }
       if (!row) return undefined;
       const currentJobId = asString(row.jobId);
       if (currentJobId) visitedJobIds.add(currentJobId);
@@ -4518,6 +4533,7 @@ export class AutonomyStore {
   recordPrFeedback(body: Record<string, unknown>): {
     ok: boolean;
     reason?: string;
+    ignored?: boolean;
     patternKey?: string;
     objectiveId?: string;
     deduped?: boolean;
@@ -4546,7 +4562,8 @@ export class AutonomyStore {
     }
     if (!patternKey) {
       return {
-        ok: false,
+        ok: true,
+        ignored: true,
         reason: "unable to resolve patternKey from objectiveId/requestId/jobId/prUrl",
       };
     }
