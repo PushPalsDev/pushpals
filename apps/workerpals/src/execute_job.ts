@@ -6,11 +6,13 @@
 import {
   existsSync,
   lstatSync,
+  mkdirSync,
   readdirSync,
   readFileSync,
   renameSync,
   rmSync,
   unlinkSync,
+  writeFileSync,
 } from "fs";
 import { resolve } from "path";
 import {
@@ -24,6 +26,7 @@ import {
   matchesGlob,
   normalizeTargetPath,
   requirementsForValidationCommand,
+  resolveGitStateFilePath,
   sanitizeSourceControlIdentityField,
   type SourceControlCommitIdentity,
   type ToolRequirement,
@@ -93,6 +96,8 @@ export interface BrowserValidationRepairPacket {
   selector: string | null;
   expected: string | null;
   failureFocus: string | null;
+  lastVerifiedStage?: string | null;
+  pageUrl?: string | null;
   digest: string;
   previousDigest: string | null;
   previousStage: string | null;
@@ -101,8 +106,30 @@ export interface BrowserValidationRepairPacket {
   previousFailureFocus: string | null;
   progress: "first_failure" | "same_failure" | "new_failure";
   needsDiagnosticProbe: boolean;
+  mustReadArtifactsBeforeEdit?: boolean;
   artifacts: string[];
+  artifactSummaries?: string[];
+  knownFailureHints?: string[];
   output: string;
+}
+
+interface BrowserFailureMemoryEntry {
+  key: string;
+  jobFamily: string;
+  command: string;
+  failureKind: BrowserValidationFailureKind;
+  stage: string | null;
+  selector: string | null;
+  expected: string | null;
+  failureFocus: string | null;
+  digest: string;
+  count: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastVerifiedStage: string | null;
+  pageUrl: string | null;
+  artifactSummaries: string[];
+  suggestedRemedy: string;
 }
 
 interface DeterministicQualityResult {
@@ -324,6 +351,31 @@ export function buildQualityGateRevisionIssues(
     ...buildCriticRevisionIssues(critic, qualityCriticMinScore),
   ];
   return [...new Set(merged)];
+}
+
+function buildDiffBudgetWarning(
+  planning: TaskExecutePlanning,
+  changedPaths: string[],
+  focusedBrowserRepair: boolean,
+): string | null {
+  const meaningfulChangedPaths = changedPaths.filter(
+    (path) => !/(^|\/)(outputs|node_modules|\.worktrees|dist|build|coverage)(\/|$)/i.test(path),
+  );
+  if (meaningfulChangedPaths.length === 0) return null;
+  const explicitBudget = Number(planning.scope.maxFilesToEdit);
+  const hasExplicitBudget = Number.isFinite(explicitBudget) && explicitBudget > 0;
+  const smallTask =
+    focusedBrowserRepair ||
+    (planning.riskLevel !== "high" &&
+      (planning.targetPaths?.length ?? 0) <= 2 &&
+      planning.acceptanceCriteria.length <= 3);
+  const budget = hasExplicitBudget ? Math.floor(explicitBudget) : smallTask ? 5 : 10;
+  if (meaningfulChangedPaths.length <= budget) return null;
+  return `Diff budget warning: this task now changes ${meaningfulChangedPaths.length} file(s), above the ${budget}-file ${
+    hasExplicitBudget ? "planning.scope.maxFilesToEdit" : smallTask ? "small-task" : "default"
+  } budget. Before editing more, remove unrelated churn and keep only behavior-owning files needed for the current repair. Changed files: ${meaningfulChangedPaths
+    .slice(0, 12)
+    .join(", ")}${meaningfulChangedPaths.length > 12 ? ", ..." : ""}`;
 }
 
 const TEST_ASSERTION_BALANCE_ISSUE =
@@ -2032,6 +2084,253 @@ function lastBrowserVerifiedStage(text: string): string | null {
   return lastVerified ? toSingleLine(lastVerified, 80) : null;
 }
 
+function extractBrowserValidationUrl(text: string): string | null {
+  const clean = stripAnsiControlSequences(text);
+  const patterns = [
+    /\b(?:page\s+url|current\s+url|browser\s+url|url)\s*[:=]\s*(https?:\/\/[^\s|"'`<>]+)/i,
+    /\b(?:navigated\s+to|opened|loading)\s+(https?:\/\/[^\s|"'`<>]+)/i,
+    /\b(https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d+\/?[^\s|"'`<>]*)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = clean.match(pattern);
+    const url = match?.[1]?.replace(/[),.;]+$/, "").trim();
+    if (url) return toSingleLine(url, 160);
+  }
+  return null;
+}
+
+function inferBrowserArtifactKind(path: string): string {
+  if (/\.(?:png|jpe?g|webp)$/i.test(path)) return "screenshot";
+  if (/\.zip$/i.test(path)) return "trace";
+  if (/\.webm$/i.test(path)) return "video";
+  if (/\.(?:log|txt)$/i.test(path)) return "log";
+  if (/\.json$/i.test(path)) return "json";
+  return "artifact";
+}
+
+function inferBrowserArtifactStageFromPath(path: string): string | null {
+  const fileName = path.split(/[\\/]/).pop() ?? "";
+  const baseName = fileName.replace(/\.[^.]+$/, "");
+  const candidates = [
+    baseName.match(/^\d+[-_](.+)$/)?.[1],
+    baseName.match(/(?:failure|failed|screenshot|snapshot)[-_](.+)$/i)?.[1],
+  ];
+  const raw = candidates.find((entry) => entry && entry.trim());
+  if (!raw) return null;
+  return toSingleLine(raw.replace(/[-_]+/g, " "), 80);
+}
+
+function summarizeBrowserValidationArtifacts(params: {
+  repo?: string;
+  artifacts: string[];
+  context: string;
+}): string[] {
+  const allArtifacts = mergeBrowserValidationArtifacts(
+    params.artifacts,
+    collectRecentBrowserValidationArtifacts(params.repo),
+  );
+  const out: string[] = [];
+  const contextStage = extractBrowserValidationStage(params.context);
+  const contextSelector = extractBrowserValidationSelector(params.context);
+  const contextUrl = extractBrowserValidationUrl(params.context);
+  const contextLastVerified = lastBrowserVerifiedStage(params.context);
+  for (const artifact of allArtifacts.slice(0, 6)) {
+    const kind = inferBrowserArtifactKind(artifact);
+    let artifactText = "";
+    if (params.repo && !/^(?:\/repo|\/workspace|[A-Za-z]:[\\/])/.test(artifact)) {
+      try {
+        artifactText = readFileSync(resolve(params.repo, artifact), "utf8");
+      } catch {
+        artifactText = "";
+      }
+    } else if (existsSync(artifact) && /\.(?:log|txt|json)$/i.test(artifact)) {
+      try {
+        artifactText = readFileSync(artifact, "utf8");
+      } catch {
+        artifactText = "";
+      }
+    }
+    const artifactContext = artifactText ? stripAnsiControlSequences(artifactText) : "";
+    const stage =
+      inferBrowserArtifactStageFromPath(artifact) ||
+      extractBrowserValidationStage(artifactContext) ||
+      contextStage;
+    const selector = extractBrowserValidationSelector(artifactContext) || contextSelector;
+    const url = extractBrowserValidationUrl(artifactContext) || contextUrl;
+    const lastVerified = lastBrowserVerifiedStage(artifactContext) || contextLastVerified;
+    const detail = [
+      `${artifact} [${kind}]`,
+      stage ? `stage=${stage}` : "",
+      selector ? `selector=${selector}` : "",
+      url ? `url=${url}` : "",
+      lastVerified ? `last_verified=${lastVerified}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    out.push(toSingleLine(detail, 280));
+  }
+  return out;
+}
+
+function browserFailureSuggestedRemedy(packet: BrowserValidationRepairPacket): string {
+  if (packet.failureKind === "assertion") {
+    return [
+      "Read the latest artifact/log/DOM state before editing.",
+      "Preserve already-passing browser stages.",
+      packet.selector
+        ? `Repair or replace the exact failing locator ${packet.selector} with a stable rendered signal for the same UI stage.`
+        : "Repair the exact visible UI assertion or add a stable test id/accessibility label to existing UI.",
+    ].join(" ");
+  }
+  if (packet.failureKind === "startup" || packet.failureKind === "runtime") {
+    return "Treat as browser startup/runtime provisioning; do not rewrite product UI assertions until ValidationGate reaches an assertion stage.";
+  }
+  if (packet.failureKind === "network") {
+    return "Treat as local server/network readiness; add bounded startup diagnostics and avoid changing gameplay/UI behavior.";
+  }
+  return "Inspect captured validation output and repair the current failing stage with the smallest behavior-owning diff.";
+}
+
+function normalizeFailureMemoryToken(value: string | null | undefined): string {
+  return toSingleLine(value ?? "", 120).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+export function buildTaskFailureJobFamily(params: Record<string, unknown>): string {
+  const planning = params.planning && typeof params.planning === "object"
+    ? (params.planning as Partial<TaskExecutePlanning>)
+    : {};
+  const autonomy = params.autonomy && typeof params.autonomy === "object"
+    ? (params.autonomy as Record<string, unknown>)
+    : {};
+  const targetHints = [
+    ...(Array.isArray(planning.targetPaths) ? planning.targetPaths : []),
+    ...(Array.isArray(planning.scope?.writeGlobs) ? planning.scope.writeGlobs : []),
+    ...(Array.isArray(planning.validationSteps) ? planning.validationSteps : []),
+    ...(Array.isArray(planning.requiredValidationSteps) ? planning.requiredValidationSteps : []),
+  ]
+    .map((entry) => normalizeFailureMemoryToken(String(entry)))
+    .filter(Boolean)
+    .slice(0, 8);
+  const area = normalizeFailureMemoryToken(String(autonomy.componentArea ?? autonomy.component_area ?? ""));
+  const intent = normalizeFailureMemoryToken(String(planning.intent ?? ""));
+  return [area, intent, ...targetHints].filter(Boolean).join("|") || "general";
+}
+
+function browserFailureMemoryKey(jobFamily: string, packet: BrowserValidationRepairPacket): string {
+  return [
+    jobFamily,
+    validationCommandKey(packet.command),
+    packet.failureKind,
+    normalizeFailureMemoryToken(packet.failureFocus),
+    normalizeFailureMemoryToken(packet.stage),
+    normalizeFailureMemoryToken(packet.selector),
+    normalizeFailureMemoryToken(packet.expected),
+  ]
+    .filter(Boolean)
+    .join("|");
+}
+
+function resolveFailureMemoryPath(repo: string): string {
+  const rootCandidates = [
+    process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE,
+    process.env.PUSHPALS_REPO_ROOT_OVERRIDE,
+    process.env.PUSHPALS_REPO_PATH,
+    repo,
+  ]
+    .map((entry) => String(entry ?? "").trim())
+    .filter(Boolean);
+  const root = rootCandidates.find((entry) => existsSync(entry)) ?? repo;
+  const gitStatePath = resolveGitStateFilePath(root, "pushpals-worker-failure-memory.json");
+  if (gitStatePath) return gitStatePath;
+  return resolve(root, "outputs", "data", "workerpals-failure-memory.json");
+}
+
+function readBrowserFailureMemory(repo: string): BrowserFailureMemoryEntry[] {
+  const memoryPath = resolveFailureMemoryPath(repo);
+  try {
+    const parsed = JSON.parse(readFileSync(memoryPath, "utf8")) as { entries?: unknown };
+    if (!Array.isArray(parsed.entries)) return [];
+    return parsed.entries
+      .filter((entry): entry is BrowserFailureMemoryEntry => Boolean(entry && typeof entry === "object"))
+      .slice(0, 80);
+  } catch {
+    return [];
+  }
+}
+
+export function knownFailureHintsForPacket(
+  repo: string,
+  jobFamily: string,
+  packet: BrowserValidationRepairPacket,
+): string[] {
+  const entries = readBrowserFailureMemory(repo)
+    .filter((entry) => {
+      if (entry.jobFamily !== jobFamily) return false;
+      if (validationCommandKey(entry.command) !== validationCommandKey(packet.command)) return false;
+      if (entry.failureKind !== packet.failureKind) return false;
+      if (packet.failureFocus && entry.failureFocus && packet.failureFocus !== entry.failureFocus) return false;
+      if (packet.stage && entry.stage && packet.stage !== entry.stage) return false;
+      return true;
+    })
+    .sort((a, b) => b.count - a.count || b.lastSeenAt.localeCompare(a.lastSeenAt))
+    .slice(0, 3);
+  return entries.map((entry) =>
+    toSingleLine(
+      `seen ${entry.count}x before for this repo/job family; last=${entry.lastSeenAt}; focus=${entry.failureFocus ?? entry.stage ?? "unknown"}; remedy=${entry.suggestedRemedy}`,
+      360,
+    ),
+  );
+}
+
+export function recordBrowserFailureMemory(
+  repo: string,
+  jobFamily: string,
+  packet: BrowserValidationRepairPacket,
+): void {
+  const memoryPath = resolveFailureMemoryPath(repo);
+  const now = new Date().toISOString();
+  const entries = readBrowserFailureMemory(repo);
+  const key = browserFailureMemoryKey(jobFamily, packet);
+  const existing = entries.find((entry) => entry.key === key);
+  if (existing) {
+    existing.count += 1;
+    existing.lastSeenAt = now;
+    existing.digest = packet.digest;
+    existing.lastVerifiedStage = packet.lastVerifiedStage ?? null;
+    existing.pageUrl = packet.pageUrl ?? null;
+    existing.artifactSummaries = (packet.artifactSummaries ?? []).slice(0, 6);
+    existing.suggestedRemedy = browserFailureSuggestedRemedy(packet);
+  } else {
+    entries.push({
+      key,
+      jobFamily,
+      command: packet.command,
+      failureKind: packet.failureKind,
+      stage: packet.stage,
+      selector: packet.selector,
+      expected: packet.expected,
+      failureFocus: packet.failureFocus,
+      digest: packet.digest,
+      count: 1,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      lastVerifiedStage: packet.lastVerifiedStage ?? null,
+      pageUrl: packet.pageUrl ?? null,
+      artifactSummaries: (packet.artifactSummaries ?? []).slice(0, 6),
+      suggestedRemedy: browserFailureSuggestedRemedy(packet),
+    });
+  }
+  const next = entries
+    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt))
+    .slice(0, 80);
+  try {
+    mkdirSync(resolve(memoryPath, ".."), { recursive: true });
+    writeFileSync(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}\n`);
+  } catch {
+    // Failure memory is advisory; never fail a worker job because persistence is unavailable.
+  }
+}
+
 export function extractValidationFailureRetryDigest(
   run: {
     command: string;
@@ -2075,6 +2374,7 @@ export function buildBrowserValidationRepairPacket(
   validationRuns: ValidationExecutionResult[],
   previousFailureDigests: Map<string, string> = new Map(),
   repo?: string,
+  knownFailureHints: string[] = [],
 ): BrowserValidationRepairPacket | null {
   for (const run of validationRuns) {
     if (run.ok || !isLongRunningBrowserValidationCommand(run.command)) continue;
@@ -2091,6 +2391,8 @@ export function buildBrowserValidationRepairPacket(
     const enrichedBrowserContext = [combined, recentLogSummary].filter(Boolean).join("\n");
     const selector = extractBrowserValidationSelector(enrichedBrowserContext);
     const expected = extractBrowserValidationExpectedUi(enrichedBrowserContext);
+    const lastVerifiedStage = lastBrowserVerifiedStage(enrichedBrowserContext);
+    const pageUrl = extractBrowserValidationUrl(enrichedBrowserContext);
     const stage = refineBrowserValidationStage(
       extractBrowserValidationStage(enrichedBrowserContext),
       selector,
@@ -2129,6 +2431,15 @@ export function buildBrowserValidationRepairPacket(
     const needsDiagnosticProbe =
       failureKind === "assertion" &&
       sameFailureSignal;
+    const artifacts = mergeBrowserValidationArtifacts(
+      extractBrowserValidationArtifacts(combined),
+      collectRecentBrowserValidationArtifacts(repo),
+    );
+    const artifactSummaries = summarizeBrowserValidationArtifacts({
+      repo,
+      artifacts,
+      context: enrichedBrowserContext,
+    });
     return {
       command: run.command,
       failureKind,
@@ -2136,6 +2447,8 @@ export function buildBrowserValidationRepairPacket(
       selector,
       expected,
       failureFocus,
+      lastVerifiedStage,
+      pageUrl,
       digest,
       previousDigest,
       previousStage,
@@ -2144,10 +2457,10 @@ export function buildBrowserValidationRepairPacket(
       previousFailureFocus,
       progress,
       needsDiagnosticProbe,
-      artifacts: mergeBrowserValidationArtifacts(
-        extractBrowserValidationArtifacts(combined),
-        collectRecentBrowserValidationArtifacts(repo),
-      ),
+      mustReadArtifactsBeforeEdit: failureKind === "assertion",
+      artifacts,
+      artifactSummaries,
+      knownFailureHints: knownFailureHints.slice(0, 3),
       output: [
         summarizeBrowserValidationOutput(combined) || digest,
         recentLogSummary,
@@ -3204,10 +3517,16 @@ export function buildQualityRevisionHint(
   validationRuns: ValidationExecutionResult[] = [],
   validationBlocker: ValidationBlocker | null = null,
   browserRepairPacket: BrowserValidationRepairPacket | null = null,
+  changedPaths: string[] = [],
 ): string {
   const lines: string[] = [];
   lines.push("Quality revision required before completion.");
   const focusedBrowserRepair = Boolean(browserRepairPacket);
+  lines.push(
+    "Worker phase contract: (1) discovering - inspect only the relevant files/artifacts and name the current hypothesis; (2) editing - make the smallest behavior-owning patch; (3) focused validation - run targeted fast checks; (4) full validation - let PushPals ValidationGate own long required checks unless a single local confirmation is explicitly useful; (5) final diff review - verify changed files are necessary and no unrelated churn remains.",
+  );
+  const diffBudgetWarning = buildDiffBudgetWarning(planning, changedPaths, focusedBrowserRepair);
+  if (diffBudgetWarning) lines.push(diffBudgetWarning);
   const validationAlreadyPassed =
     validationRuns.length > 0 && validationRuns.every((run) => run.ok);
   if (validationAlreadyPassed && !focusedBrowserRepair) {
@@ -3232,6 +3551,12 @@ export function buildQualityRevisionHint(
     if (browserRepairPacket.failureFocus) {
       lines.push(`- Failure focus: ${browserRepairPacket.failureFocus}`);
     }
+    if (browserRepairPacket.lastVerifiedStage) {
+      lines.push(`- Last verified browser checkpoint: ${browserRepairPacket.lastVerifiedStage}`);
+    }
+    if (browserRepairPacket.pageUrl) {
+      lines.push(`- Browser URL at failure: ${browserRepairPacket.pageUrl}`);
+    }
     if (browserRepairPacket.expected) {
       lines.push(`- Expected UI: ${browserRepairPacket.expected}`);
     }
@@ -3247,6 +3572,18 @@ export function buildQualityRevisionHint(
       lines.push(
         "- Failure artifacts: none were captured in command output; if this repo writes screenshots/traces, inspect the latest browser failure artifact before changing selectors.",
       );
+    }
+    if ((browserRepairPacket.artifactSummaries ?? []).length > 0) {
+      lines.push("Latest browser artifact summaries:");
+      for (const artifactSummary of browserRepairPacket.artifactSummaries ?? []) {
+        lines.push(`- ${artifactSummary}`);
+      }
+    }
+    if ((browserRepairPacket.knownFailureHints ?? []).length > 0) {
+      lines.push("Known issue/remedy memory for this repo/job family:");
+      for (const hint of browserRepairPacket.knownFailureHints ?? []) {
+        lines.push(`- ${hint}`);
+      }
     }
     if (browserRepairPacket.digest) {
       lines.push(`- Current failure: ${browserRepairPacket.digest}`);
@@ -3275,6 +3612,11 @@ export function buildQualityRevisionHint(
       }
     } else {
       lines.push("- Breadcrumb: first captured failure for this command in this revision loop");
+    }
+    if (browserRepairPacket.mustReadArtifactsBeforeEdit) {
+      lines.push(
+        "- Diagnostic artifact read requirement: before editing, explicitly inspect the listed latest artifact/log/DOM summary for the failing stage. If the artifacts are missing, stale, or stop before the failing locator, add a tiny temporary diagnostic/log for locator counts, visible text, URL, and nearby DOM/test-id state before changing product code or selectors.",
+      );
     }
     if (browserRepairPacket.needsDiagnosticProbe) {
       lines.push(
@@ -3457,7 +3799,7 @@ export function buildQualityRevisionHint(
     for (const step of planning.requiredValidationSteps ?? []) lines.push(`- ${step}`);
   }
   lines.push("Apply a minimal corrective patch, run focused validation, then finish.");
-  return lines.join("\n").slice(0, 6000);
+  return lines.join("\n").slice(0, 8000);
 }
 
 function inferTargetPathFromInstruction(text: string): string | null {
@@ -6214,6 +6556,7 @@ export async function executeJob(
   let revisionAttempt = 0;
   let revisionHint = "";
   const previousValidationFailureDigests = new Map<string, string>();
+  const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   while (revisionAttempt <= qualityRevisionLoopMax) {
     const attemptParams: Record<string, unknown> = { ...normalizedParams };
     if (revisionHint) {
@@ -6313,11 +6656,19 @@ export async function executeJob(
         revisionAttempt,
       },
     );
-    const browserRepairPacket = buildBrowserValidationRepairPacket(
+    let browserRepairPacket = buildBrowserValidationRepairPacket(
       quality.validationRuns,
       previousValidationFailureDigests,
       repo,
     );
+    if (browserRepairPacket) {
+      const knownFailureHints = knownFailureHintsForPacket(repo, failureJobFamily, browserRepairPacket);
+      browserRepairPacket = {
+        ...browserRepairPacket,
+        knownFailureHints,
+      };
+      recordBrowserFailureMemory(repo, failureJobFamily, browserRepairPacket);
+    }
     for (const run of quality.validationRuns) {
       if (run.ok) continue;
       const digest = extractValidationFailureRetryDigest(run, repo);
@@ -6592,6 +6943,7 @@ export async function executeJob(
       validationOutsideTaskScope ? [] : quality.validationRuns,
       validationOutsideTaskScope ? null : quality.blocker,
       validationOutsideTaskScope ? null : browserRepairPacket,
+      quality.changedPaths,
     );
     onLog?.(
       "stderr",

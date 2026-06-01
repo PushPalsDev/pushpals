@@ -299,6 +299,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             guidance = "\n".join(task.supplemental_guidance)
 
             self.assertIn("Task planning contract from PushPals", guidance)
+            self.assertIn("Worker phase contract", guidance)
             self.assertIn("Write globs are relevance hints, not hard limits", guidance)
             self.assertIn("app/__tests__/_layout.autonomy.test.ts", guidance)
             self.assertIn("Home shell startup is assertable", guidance)

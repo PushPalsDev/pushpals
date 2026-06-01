@@ -756,6 +756,18 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
         summary_parts.append(f"priority={priority}")
     if summary_parts:
         lines.append(f"- Planning summary: {', '.join(summary_parts)}")
+    lines.append(
+        "- Worker phase contract: discovering -> editing -> focused validation -> full validation handoff -> final diff review."
+    )
+    lines.append(
+        "  - discovering: inspect relevant files/artifacts and state the current hypothesis before editing."
+    )
+    lines.append("  - editing: make the smallest behavior-owning patch.")
+    lines.append("  - focused validation: run targeted fast checks for the changed surface.")
+    lines.append(
+        "  - full validation: let PushPals ValidationGate own long required/browser checks unless one local confirmation is explicitly useful."
+    )
+    lines.append("  - final diff review: remove unrelated churn before returning.")
 
     scope = planning.get("scope")
     if isinstance(scope, dict):

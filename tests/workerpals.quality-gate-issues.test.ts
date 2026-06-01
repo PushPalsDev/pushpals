@@ -7,9 +7,12 @@ import {
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
+  buildTaskFailureJobFamily,
   extractValidationFailureRetryDigest,
   isBrowserValidationInfrastructureDigest,
+  knownFailureHintsForPacket,
   qualityRevisionLoopUpperBound,
+  recordBrowserFailureMemory,
   shouldReviseRequiredValidationBlocker,
   revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
@@ -255,6 +258,7 @@ describe("workerpals quality gate critic issue formatting", () => {
       previousStage: "shell",
       previousExpected: "home screen to be visible",
       progress: "new_failure",
+      mustReadArtifactsBeforeEdit: true,
     });
     expect(packet?.previousDigest).toContain("shell stage");
     expect(packet?.output).toContain("help menu primary action");
@@ -302,6 +306,7 @@ describe("workerpals quality gate critic issue formatting", () => {
       "/repo/outputs/web-e2e/failure-in-game-ui.png",
       "/repo/outputs/web-e2e/failure-in-game-ui-trace.zip",
     ]);
+    expect(packet?.artifactSummaries?.[0]).toContain("stage=in game ui");
   });
 
   test("hydrates browser repair packets from recent e2e artifact logs when command output is generic", () => {
@@ -340,8 +345,10 @@ describe("workerpals quality gate critic issue formatting", () => {
       );
 
       expect(packet?.selector).toBe("getByTestId('settings-home-button')");
+      expect(packet?.lastVerifiedStage).toBe("settings screen");
       expect(packet?.artifacts).toContain(screenshotPath);
       expect(packet?.artifacts).toContain(logPath);
+      expect(packet?.artifactSummaries?.join("\n")).toContain("selector=getByTestId('settings-home-button')");
       expect(packet?.output).toContain("Verified: settings screen");
       expect(packet?.output).toContain("settings-home-button");
     } finally {
@@ -380,6 +387,54 @@ describe("workerpals quality gate critic issue formatting", () => {
       expect(digest).toContain("stage=planet control panel");
       expect(digest).toContain("selector=getByTestId('game-control-panel')");
       expect(digest).toContain("last verified=owned planet");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("persists known browser failure fingerprints for repo job families", () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-browser-failure-memory-"));
+    try {
+      const params = {
+        planning: {
+          intent: "code_change",
+          riskLevel: "medium",
+          scope: {
+            readAnywhere: true,
+            writeAllowed: true,
+            writeGlobs: ["app/**", "scripts/**"],
+          },
+          targetPaths: ["app/__tests__/_layout.autonomy.test.ts"],
+          acceptanceCriteria: ["web smoke catches shell startup"],
+          validationSteps: ["bun run web:e2e"],
+          requiredValidationSteps: ["bun run web:e2e"],
+          queuePriority: "normal",
+          queueWaitBudgetMs: 90_000,
+          executionBudgetMs: 1_800_000,
+          finalizationBudgetMs: 120_000,
+        },
+      };
+      const packet = buildBrowserValidationRepairPacket([
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr:
+            "Browser validation failed during shell stage: Expected home screen to be visible within 30000ms: locator.waitFor: Timeout 30000ms exceeded. page url: http://127.0.0.1:19006/",
+          elapsedMs: 30_000,
+        },
+      ]);
+      expect(packet).not.toBeNull();
+
+      const jobFamily = buildTaskFailureJobFamily(params);
+      recordBrowserFailureMemory(repo, jobFamily, packet!);
+      recordBrowserFailureMemory(repo, jobFamily, packet!);
+
+      const hints = knownFailureHintsForPacket(repo, jobFamily, packet!);
+      expect(hints.join("\n")).toContain("seen 2x before");
+      expect(hints.join("\n")).toContain("Read the latest artifact/log/DOM state before editing");
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -491,6 +546,8 @@ describe("workerpals quality gate critic issue formatting", () => {
     );
 
     expect(hint).toContain("Convergence mode: diagnostic-first repair");
+    expect(hint).toContain("Worker phase contract");
+    expect(hint).toContain("Diagnostic artifact read requirement");
     expect(hint).toContain("do not guess another selector");
     expect(hint).toContain("locator counts");
     expect(hint).toContain("bounding boxes");
@@ -591,6 +648,8 @@ describe("workerpals quality gate critic issue formatting", () => {
     );
 
     expect(hint).toContain("Primary ValidationGate repair objective:");
+    expect(hint).toContain("Worker phase contract");
+    expect(hint).toContain("Diagnostic artifact read requirement");
     expect(hint).toContain("- Failure type: browser assertion");
     expect(hint).toContain("- Stage: in-game UI");
     expect(hint).toContain("inspect the captured browser output/artifacts");
@@ -609,6 +668,34 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("CriticGate notes deferred");
     expect(hint).not.toContain("Critic score: 7.0 / 10");
     expect(hint).not.toContain("Rename helper for clarity.");
+  });
+
+  test("warns when a small repair drifts beyond the diff budget", () => {
+    const hint = buildQualityRevisionHint(
+      ["ScopeGate: review changed files carefully."],
+      null,
+      {
+        intent: "code_change",
+        riskLevel: "low",
+        scope: { readAnywhere: true, writeAllowed: true, maxFilesToEdit: 2 },
+        targetPaths: ["app/game.tsx"],
+        acceptanceCriteria: ["game control stays visible"],
+        validationSteps: ["bun test"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [],
+      null,
+      null,
+      ["app/game.tsx", "components/GameControlPanel.tsx", "scripts/test-web-e2e.js"],
+    );
+
+    expect(hint).toContain("Diff budget warning");
+    expect(hint).toContain("above the 2-file planning.scope.maxFilesToEdit");
+    expect(hint).toContain("remove unrelated churn");
   });
 
   test("revises required validation repo blockers until the auto-revision budget is exhausted", () => {
