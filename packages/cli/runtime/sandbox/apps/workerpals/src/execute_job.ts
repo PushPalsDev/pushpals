@@ -378,6 +378,87 @@ function buildDiffBudgetWarning(
     .join(", ")}${meaningfulChangedPaths.length > 12 ? ", ..." : ""}`;
 }
 
+function collectPlanningText(planning: TaskExecutePlanning): string {
+  return [
+    planning.intent,
+    planning.riskLevel,
+    ...(planning.targetPaths ?? []),
+    ...(planning.acceptanceCriteria ?? []),
+    ...(planning.validationSteps ?? []),
+    ...(planning.requiredValidationSteps ?? []),
+    ...(planning.discovery?.keywords ?? []),
+    ...(planning.discovery?.likelyDirs ?? []),
+    ...(planning.discovery?.ripgrepQueries ?? []),
+  ]
+    .map((part) => String(part ?? ""))
+    .join("\n")
+    .toLowerCase();
+}
+
+function planningLooksLikeVisualDerivationTask(planning: TaskExecutePlanning): boolean {
+  const text = collectPlanningText(planning);
+  return /\b(visual|readability|battlefield|render(?:ing)?|projectile|planet|ship|ring|danger|threat|ownership|dense action|style|ui surface)\b/i.test(
+    text,
+  );
+}
+
+function buildTestHarnessConvergenceWarning(
+  planning: TaskExecutePlanning,
+  issues: string[],
+  validationRuns: ValidationExecutionResult[],
+): string | null {
+  const combined = [
+    ...issues,
+    ...validationRuns.flatMap((run) => [run.command, run.stdout, run.stderr]),
+  ]
+    .map((part) => String(part ?? ""))
+    .join("\n");
+  const hasMockImportFailure =
+    /\bCannot find module\b|\bdoes not provide an export\b|\bno exported member\b|\bimport error\b|\bundefined is not a function\b/i.test(
+      combined,
+    ) &&
+    /\b(react[- ]native|reactNativeMock|Animated\.View|expo-secure-store|SettingsContext|skin validator|mock|test helper|__mocks__)\b/i.test(
+      combined,
+    );
+  if (!hasMockImportFailure) return null;
+  const visualPrefix = planningLooksLikeVisualDerivationTask(planning)
+    ? " For this visual/rendering task, prefer pure helper/state/style-prop tests over a full React Native surface render."
+    : "";
+  return (
+    "Test harness convergence warning: validation is failing in mock/import setup rather than product behavior." +
+    visualPrefix +
+    " Do not keep expanding broad shared mocks to rescue an over-scoped component render test. If the repo does not already have stable React Native render-test infrastructure for this surface, replace the full-surface regression with smaller deterministic helper/state coverage and one focused assertion on the behavior-owning API."
+  );
+}
+
+function buildBroadSharedMockWarning(
+  planning: TaskExecutePlanning,
+  changedPaths: string[],
+): string | null {
+  const meaningfulChangedPaths = changedPaths.filter(
+    (path) => !/(^|\/)(outputs|node_modules|\.worktrees|dist|build|coverage)(\/|$)/i.test(path),
+  );
+  const broadMockPaths = meaningfulChangedPaths.filter((path) =>
+    /(^|\/)(__mocks__|tests\/.*mock|test.*mock|reactNativeMock|setupTests?|jest\.|vitest\.|mock)(\.|\/|$)/i.test(
+      path,
+    ),
+  );
+  if (broadMockPaths.length === 0) return null;
+  const smallTask =
+    planning.riskLevel !== "high" &&
+    ((planning.targetPaths?.length ?? 0) <= 2 || planning.acceptanceCriteria.length <= 3);
+  if (!smallTask && !planningLooksLikeVisualDerivationTask(planning)) return null;
+  const explicitlyRequested = /mock|test harness|react native test|component render/i.test(
+    collectPlanningText(planning),
+  );
+  if (explicitlyRequested) return null;
+  return `Broad mock warning: this focused task now changes shared mock/test-harness file(s): ${broadMockPaths
+    .slice(0, 6)
+    .join(", ")}${
+    broadMockPaths.length > 6 ? ", ..." : ""
+  }. Before continuing, prefer behavior-owned helper/state tests or existing stable render-test infrastructure; do not add broad React Native mocks for a small visual/control change unless the task explicitly requires harness repair.`;
+}
+
 const TEST_ASSERTION_BALANCE_ISSUE =
   "Changed test files do not show both positive and negative assertion coverage (expected both).";
 
@@ -3527,6 +3608,22 @@ export function buildQualityRevisionHint(
   );
   const diffBudgetWarning = buildDiffBudgetWarning(planning, changedPaths, focusedBrowserRepair);
   if (diffBudgetWarning) lines.push(diffBudgetWarning);
+  const broadSharedMockWarning = buildBroadSharedMockWarning(planning, changedPaths);
+  if (broadSharedMockWarning) lines.push(broadSharedMockWarning);
+  const testHarnessConvergenceWarning = buildTestHarnessConvergenceWarning(
+    planning,
+    issues,
+    validationRuns,
+  );
+  if (testHarnessConvergenceWarning) lines.push(testHarnessConvergenceWarning);
+  if (planningLooksLikeVisualDerivationTask(planning)) {
+    lines.push(
+      "Visual derivation testing rule: prefer pure helper/state/style-prop tests for planet/projectile/ownership/readability cues. Only add a full React Native render regression when this repo already has a stable harness for that exact surface; otherwise keep render-visible behavior covered through the derived inputs that drive it.",
+    );
+  }
+  lines.push(
+    "Phase soft-budget reminder: if discovery, test-harness setup, or validation repair is running long, reduce the approach before spending more time. Small/medium tasks should converge toward a useful patch within roughly 20 minutes.",
+  );
   const validationAlreadyPassed =
     validationRuns.length > 0 && validationRuns.every((run) => run.ok);
   if (validationAlreadyPassed && !focusedBrowserRepair) {

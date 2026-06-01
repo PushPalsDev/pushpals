@@ -2834,11 +2834,12 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
           stream: "stdout",
           seq: 1,
-          line: "[OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2)",
+          phase: "focused validation",
+          line: "[OpenAICodexExecutor] [codex] item.completed | The focused test is green; I’m running TypeScript next.",
         },
       }),
     ).toBe(
-      "[job 12345678] [OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2)",
+      "[job 12345678 phase:focused validation] [codex] The focused test is green; I’m running TypeScript next.",
     );
 
     expect(
@@ -2855,6 +2856,53 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         },
       }),
     ).toBe("[job 12345678 stderr] [ValidationGate] Failed (1000ms, exit 1): bun test");
+  });
+
+  test("formatSessionEventLine suppresses noisy low-level WorkerPal job trace lines", () => {
+    const baseEvent = {
+      id: "evt-job-log",
+      type: "job_log",
+      from: "worker:workerpal-1",
+      ts: new Date().toISOString(),
+      payload: {
+        jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+        stream: "stdout",
+        seq: 1,
+      },
+    };
+
+    for (const line of [
+      "[DockerExecutor] Linked worktree dependency artifact(s): node_modules",
+      "[Openai_codexExecutor] Spawning openai_codex executor (timeout=7200000ms)",
+      "[OpenAICodexExecutor] Codex auth mode: chatgpt (configured=auto)",
+      "[OpenAICodexExecutor] Starting codex exec in /repo/.worktrees/job-123",
+      "[OpenAICodexExecutor] [codex] thread.started",
+      "[OpenAICodexExecutor] [codex] turn.started",
+      "[OpenAICodexExecutor] [codex] item.started",
+      "[OpenAICodexExecutor] [codex] item.completed",
+      "[OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2, idle=27s)",
+      "[OpenAICodexExecutor] [stderr] 2026-06-01 ERROR codex_core::tools::router: error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess",
+      "___RESULT___ {\"ok\":true,\"stdout\":\"huge raw result\"}",
+    ]) {
+      expect(
+        formatSessionEventLine({
+          ...baseEvent,
+          payload: { ...baseEvent.payload, line },
+        }),
+      ).toBeNull();
+    }
+
+    expect(
+      formatSessionEventLine({
+        ...baseEvent,
+        payload: {
+          ...baseEvent.payload,
+          line: "[QualityGate] Quality gate requested revision 2/8: ValidationGate browser assertion repair",
+        },
+      }),
+    ).toBe(
+      "[job 12345678] [QualityGate] Quality gate requested revision 2/8: ValidationGate browser assertion repair",
+    );
   });
 
   test("createSessionEventReplayFilter suppresses replayed status events with the same event id", () => {

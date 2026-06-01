@@ -5277,8 +5277,10 @@ export function formatSessionEventLine(
   if (type === "job_log") {
     const jobId = String(payload.jobId ?? "").slice(0, 8);
     const stream = String(payload.stream ?? "").toLowerCase() === "stderr" ? " stderr" : "";
-    const line = compactCliSessionJobLogLine(String(payload.line ?? "").trim());
-    return line ? `[job ${jobId}${stream}] ${line}` : null;
+    const phase = compactCliSessionJobLogLine(String(payload.phase ?? "").trim());
+    const phaseLabel = phase ? ` phase:${phase}` : "";
+    const line = formatCliSessionJobLogLine(String(payload.line ?? "").trim());
+    return line ? `[job ${jobId}${stream}${phaseLabel}] ${line}` : null;
   }
   if (type === "job_failed") {
     const jobId = String(payload.jobId ?? "").slice(0, 8);
@@ -5332,6 +5334,55 @@ function compactCliSessionJobLogLine(line: string): string {
   const compacted = line.replace(/\s+/g, " ").trim();
   if (compacted.length <= CLI_SESSION_JOB_LOG_MAX_CHARS) return compacted;
   return `${compacted.slice(0, CLI_SESSION_JOB_LOG_MAX_CHARS - 3)}...`;
+}
+
+function formatCliSessionJobLogLine(line: string): string | null {
+  const compacted = compactCliSessionJobLogLine(line);
+  if (!compacted) return null;
+  if (shouldSuppressCliSessionJobLogLine(compacted)) return null;
+
+  const codexItem = compacted.match(
+    /^\[OpenAICodexExecutor\]\s+\[codex\]\s+item\.(?:completed|updated)\s+\|\s+(.+)$/i,
+  );
+  if (codexItem?.[1]) {
+    return `[codex] ${compactCliSessionJobLogLine(codexItem[1])}`;
+  }
+
+  return compacted;
+}
+
+function shouldSuppressCliSessionJobLogLine(line: string): boolean {
+  const text = String(line ?? "").trim();
+  if (!text) return true;
+
+  if (/^(___RESULT___|__PUSHPALS_OH_RESULT__)\b/.test(text)) return true;
+  if (/^\[DockerExecutor\]\s+Linked worktree dependency artifact/i.test(text)) return true;
+
+  if (/^\[Openai_codexExecutor\]\s+Spawning openai_codex executor/i.test(text)) return true;
+  if (
+    /^\[OpenAICodexExecutor\]\s+(?:Planner guidance|Codex auth mode|ChatGPT auth mode|Starting codex exec|codex exec finished|Codex JSON stream captured|Codex stdout captured|No reasoning-like|Reasoning-like event|Usage observed|Temporarily masked repo-local)/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+
+  if (/^\[OpenAICodexExecutor\]\s+codex exec still running\b/i.test(text)) return true;
+  if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+(?:thread|turn)\.started\b/i.test(text)) {
+    return true;
+  }
+  if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+item\.started\b/i.test(text)) return true;
+  if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+item\.completed\s*$/i.test(text)) return true;
+  if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+item\.updated\s*$/i.test(text)) return true;
+  if (
+    /^\[OpenAICodexExecutor\]\s+\[stderr\].*codex_core::tools::router: error=exec_command failed/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function buildSessionEventReplayFingerprint(

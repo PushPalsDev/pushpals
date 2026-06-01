@@ -738,6 +738,72 @@ def _append_list_guidance(lines: List[str], label: str, values: List[str]) -> No
         lines.append(f"  - {value}")
 
 
+def _joined_task_text(params: Dict[str, Any]) -> str:
+    pieces: List[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            pieces.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+
+    collect(params.get("instruction"))
+    collect(params.get("plannerWorkerInstruction"))
+    collect(params.get("qualityRevisionHint"))
+    planning = params.get("planning")
+    if isinstance(planning, dict):
+        collect(planning.get("targetPaths"))
+        collect(planning.get("acceptanceCriteria"))
+        collect(planning.get("validationSteps"))
+        collect(planning.get("requiredValidationSteps"))
+        collect(planning.get("discovery"))
+    return "\n".join(pieces).lower()
+
+
+def _looks_like_visual_derivation_task(params: Dict[str, Any]) -> bool:
+    text = _joined_task_text(params)
+    visual_markers = (
+        "visual",
+        "readability",
+        "battlefield",
+        "render",
+        "rendering",
+        "projectile",
+        "planet",
+        "ship",
+        "ring",
+        "danger",
+        "threat",
+        "ownership",
+        "dense action",
+        "ui surface",
+        "style",
+        "styles",
+    )
+    return any(marker in text for marker in visual_markers)
+
+
+def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
+    lines: List[str] = [
+        "Worker speed/convergence contract from PushPals:",
+        "- Target useful completion in roughly 20 minutes for small or medium repo tasks; optimize for the smallest coherent patch over exhaustive exploration.",
+        "- Phase soft budgets: discovery <= 5m, editing <= 10m, focused validation <= 5m, final diff review <= 2m. If a phase runs long, narrow scope rather than expanding the harness.",
+        "- Test-harness soft budget: if setting up a focused test requires multiple new shared mocks, broad React Native shims, or repeated import fixes, stop building that harness and switch to smaller pure helper/state coverage.",
+    ]
+    if _looks_like_visual_derivation_task(params):
+        lines.extend(
+            [
+                "- Visual/rendering task rule: prefer pure helper/state/style-prop tests for derived visual cues. Use a full React Native/component render regression only if the repo already has a stable harness for that exact surface.",
+                "- Full-surface React Native tests are a last resort for visual derivation work; do not spend the job constructing broad mocks just to assert pixels or nested component trees.",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def _build_planning_guidance(params: Dict[str, Any]) -> str:
     planning = params.get("planning")
     if not isinstance(planning, dict):
@@ -768,6 +834,9 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
         "  - full validation: let PushPals ValidationGate own long required/browser checks unless one local confirmation is explicitly useful."
     )
     lines.append("  - final diff review: remove unrelated churn before returning.")
+    lines.append(
+        "- Phase soft budget: aim for discovery <= 5m, editing <= 10m, focused validation <= 5m, final diff review <= 2m; if test harness setup starts consuming the budget, reduce to simpler helper/state coverage."
+    )
 
     scope = planning.get("scope")
     if isinstance(scope, dict):
@@ -869,6 +938,7 @@ def parse_task_execute_payload(
     quality_revision_hint = str(params.get("qualityRevisionHint") or "").strip()
 
     supplemental_guidance: List[str] = []
+    supplemental_guidance.append(_build_efficiency_guidance(params))
     planning_guidance = _build_planning_guidance(params)
     if planning_guidance:
         supplemental_guidance.append(planning_guidance)

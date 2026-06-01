@@ -698,6 +698,75 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("remove unrelated churn");
   });
 
+  test("steers visual derivation work toward pure helper tests instead of full RN render harnesses", () => {
+    const hint = buildQualityRevisionHint(
+      ["ValidationGate: focused regression failed in test harness setup."],
+      null,
+      {
+        intent: "code_change",
+        riskLevel: "medium",
+        scope: { readAnywhere: true, writeAllowed: true },
+        targetPaths: ["app/game.tsx"],
+        acceptanceCriteria: [
+          "Improve battlefield readability with clearer planet rings and projectile threat cues",
+        ],
+        validationSteps: ["bun test app/__tests__/battlefieldReadability.test.ts"],
+        requiredValidationSteps: ["bun test"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [
+        {
+          step: "bun test app/__tests__/battlefieldReadability.test.tsx",
+          command: "bun test app/__tests__/battlefieldReadability.test.tsx",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr:
+            "Cannot find module '../../tests/reactNativeMock' from components/__tests__/PlanetConquest.test.tsx",
+          elapsedMs: 12_000,
+        },
+      ],
+    );
+
+    expect(hint).toContain("Test harness convergence warning");
+    expect(hint).toContain("prefer pure helper/state/style-prop tests");
+    expect(hint).toContain("Do not keep expanding broad shared mocks");
+    expect(hint).toContain("Visual derivation testing rule");
+    expect(hint).toContain("roughly 20 minutes");
+  });
+
+  test("warns when a small visual task starts changing broad shared mocks", () => {
+    const hint = buildQualityRevisionHint(
+      ["ScopeGate: review changed files carefully."],
+      null,
+      {
+        intent: "code_change",
+        riskLevel: "low",
+        scope: { readAnywhere: true, writeAllowed: true },
+        targetPaths: ["app/game.tsx"],
+        acceptanceCriteria: ["Improve projectile readability"],
+        validationSteps: ["bun test"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [],
+      null,
+      null,
+      ["app/game.tsx", "tests/reactNativeMock.ts", "components/__tests__/PlanetConquest.test.tsx"],
+    );
+
+    expect(hint).toContain("Broad mock warning");
+    expect(hint).toContain("tests/reactNativeMock.ts");
+    expect(hint).toContain("prefer behavior-owned helper/state tests");
+  });
+
   test("revises required validation repo blockers until the auto-revision budget is exhausted", () => {
     expect(
       shouldReviseRequiredValidationBlocker({

@@ -342,6 +342,70 @@ function isNoisyProgressLine(line: string): boolean {
   return /^(📦 Installing \[\d+\/\d+\]|🔍 Resolving\.\.\.|🔒 Saving lockfile\.\.\.)$/.test(line);
 }
 
+type WorkerJobPhase =
+  | "discovering"
+  | "editing"
+  | "test harness repair"
+  | "focused validation"
+  | "full validation"
+  | "final diff review"
+  | "publishing"
+  | "quality revision";
+
+function inferWorkerJobPhaseFromLogLine(line: string): WorkerJobPhase | null {
+  const text = String(line ?? "").trim();
+  if (!text) return null;
+  if (/Quality gate requested revision|Quality revision required|revision guidance/i.test(text)) {
+    return "quality revision";
+  }
+  if (
+    /test harness|React Native package|reactNativeMock|mock helper|mock was missing|expo-secure-store|import error|Cannot find module|does not provide an export|no exported member|Animated\.View|SettingsContext|skin validator/i.test(
+      text,
+    )
+  ) {
+    return "test harness repair";
+  }
+  if (
+    /focused validation|focused checks|targeted test|focused test|new regression|focused regression|fast checks|rerunning .*regression|node --check/i.test(
+      text,
+    )
+  ) {
+    return "focused validation";
+  }
+  if (
+    /ValidationGate|required validation|full .*test suite|whole Bun test|repo-level|bun test\b|bunx? tsc|typecheck|type check|bun run lint|web:e2e|browser smoke/i.test(
+      text,
+    )
+  ) {
+    return "full validation";
+  }
+  if (/creating commit|Publish blocked|publish-blocked|completion ref|enqueueCompletion/i.test(text)) {
+    return "publishing";
+  }
+  if (
+    /final diff|diff review|git diff|git status|whitespace|line-ending|line ending|pruning|remove unrelated|remaining diff|changed files/i.test(
+      text,
+    )
+  ) {
+    return "final diff review";
+  }
+  if (
+    /editing|patch|implemented|adding|fixing|updating|wiring|in place|changes are in place|making .*change|tightening|restore|normalizing/i.test(
+      text,
+    )
+  ) {
+    return "editing";
+  }
+  if (
+    /read|inspect|checking|locating|opening|artifact|screenshot|README|context|discover|search|rg |current checkout|worktree/i.test(
+      text,
+    )
+  ) {
+    return "discovering";
+  }
+  return null;
+}
+
 export function shouldEmitDirectSessionJobEvent(options: {
   ok: boolean;
   statusPersistedToServer: boolean;
@@ -1352,6 +1416,7 @@ async function workerLoop(
           let lastCleanLog = "";
           let lastCleanLogAt = 0;
           let lastForwardedJobLogAt = Date.now();
+          let currentJobPhase: WorkerJobPhase | null = null;
 
           const emitJobLog = job.sessionId
             ? (stream: "stdout" | "stderr", line: string): boolean => {
@@ -1367,6 +1432,7 @@ async function workerLoop(
                 lastCleanLog = cleaned;
                 lastCleanLogAt = now;
                 lastForwardedJobLogAt = now;
+                currentJobPhase = inferWorkerJobPhaseFromLogLine(cleaned) ?? currentJobPhase;
                 const logTs = new Date(now).toISOString();
 
                 const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
@@ -1374,7 +1440,14 @@ async function workerLoop(
                   job.sessionId,
                   {
                     type: "job_log",
-                    payload: { jobId: job.id, stream, seq, line: cleaned, ts: logTs },
+                    payload: {
+                      jobId: job.id,
+                      stream,
+                      seq,
+                      line: cleaned,
+                      ts: logTs,
+                      phase: currentJobPhase,
+                    },
                     from: `worker:${opts.workerId}`,
                   },
                   { droppable: true },
@@ -1409,9 +1482,9 @@ async function workerLoop(
                     "stdout",
                     `[WorkerPals] Job ${job.id} still running after ${formatDurationMs(
                       now - jobClaimedAtMs,
-                    )} (kind=${job.kind}, worker=${opts.workerId}, quiet_for=${formatDurationMs(
-                      quietForMs,
-                    )}).`,
+                    )} (kind=${job.kind}, worker=${opts.workerId}, phase=${
+                      currentJobPhase ?? "unknown"
+                    }, quiet_for=${formatDurationMs(quietForMs)}).`,
                   );
                 }, jobProgressLogEveryMs)
               : null;

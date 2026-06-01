@@ -298,12 +298,50 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             task = parse_task_execute_payload(["executor", encoded], logger=Logger("[test]"))
             guidance = "\n".join(task.supplemental_guidance)
 
+            self.assertIn("Worker speed/convergence contract", guidance)
+            self.assertIn("roughly 20 minutes", guidance)
             self.assertIn("Task planning contract from PushPals", guidance)
             self.assertIn("Worker phase contract", guidance)
             self.assertIn("Write globs are relevance hints, not hard limits", guidance)
             self.assertIn("app/__tests__/_layout.autonomy.test.ts", guidance)
             self.assertIn("Home shell startup is assertable", guidance)
             self.assertIn("bun run web:e2e", guidance)
+
+    def test_parse_payload_prefers_helper_tests_for_visual_derivation_tasks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-visual-guidance-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": "task.execute",
+                "repo": str(repo),
+                "params": {
+                    "instruction": (
+                        "Improve battlefield readability by making planet ownership rings, "
+                        "projectile trails, and danger cues clearer."
+                    ),
+                    "schemaVersion": 2,
+                    "planning": {
+                        "intent": "code_change",
+                        "riskLevel": "medium",
+                        "queuePriority": "normal",
+                        "queueWaitBudgetMs": 90_000,
+                        "executionBudgetMs": 1_800_000,
+                        "finalizationBudgetMs": 120_000,
+                        "scope": {"readAnywhere": True, "writeAllowed": True},
+                        "targetPaths": ["app/game.tsx"],
+                        "acceptanceCriteria": ["Projectile and ownership readability improve"],
+                        "validationSteps": ["bun test app/__tests__/battlefieldReadability.test.ts"],
+                    },
+                },
+            }
+            encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+            task = parse_task_execute_payload(["executor", encoded], logger=Logger("[test]"))
+            guidance = "\n".join(task.supplemental_guidance)
+
+            self.assertIn("Visual/rendering task rule", guidance)
+            self.assertIn("prefer pure helper/state/style-prop tests", guidance)
+            self.assertIn("full React Native/component render regression", guidance)
 
     def test_detects_codex_workaround_signals(self) -> None:
         signal = _detect_codex_workaround_signal(
