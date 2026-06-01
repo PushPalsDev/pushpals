@@ -2601,9 +2601,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(requestedAssets).toHaveLength(6);
       expect(requestedAssets[0]).toBe(requestedAssets[1]);
       expect(existsSync(binaries.server)).toBe(true);
-      expect(readFileSync(join(dirname(binaries.server), ".runtime-tag"), "utf8")).toBe(
-        "v1.2.4\n",
-      );
+      expect(readFileSync(join(dirname(binaries.server), ".runtime-tag"), "utf8")).toBe("v1.2.4\n");
     } finally {
       globalThis.fetch = originalFetch;
       rmSync(runtimeRoot, { recursive: true, force: true });
@@ -2643,11 +2641,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
   test("runCommandWithEnv times out without waiting indefinitely on output pipes", async () => {
     const startedAt = Date.now();
     const result = await runCommandWithEnv(
-      [
-        process.execPath,
-        "-e",
-        "console.log('started'); setInterval(() => {}, 1000);",
-      ],
+      [process.execPath, "-e", "console.log('started'); setInterval(() => {}, 1000);"],
       process.cwd(),
       process.env as Record<string, string | undefined>,
       100,
@@ -2799,6 +2793,68 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         },
       }),
     ).toBeNull();
+  });
+
+  test("formatSessionEventLine surfaces job lifecycle and worker log events", () => {
+    expect(
+      formatSessionEventLine({
+        id: "evt-job-enqueued",
+        type: "job_enqueued",
+        from: "agent:remotebuddy-orchestrator/autonomy",
+        ts: new Date().toISOString(),
+        payload: {
+          jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+          taskId: "task-1",
+          kind: "task.execute",
+          origin: "autonomy",
+        },
+      }),
+    ).toBe("[job 12345678] queued: task.execute");
+
+    expect(
+      formatSessionEventLine({
+        id: "evt-job-claimed",
+        type: "job_claimed",
+        from: "worker:workerpal-1",
+        ts: new Date().toISOString(),
+        payload: {
+          jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+          workerId: "workerpal-1",
+        },
+      }),
+    ).toBe("[job 12345678] claimed by workerpal-1");
+
+    expect(
+      formatSessionEventLine({
+        id: "evt-job-log",
+        type: "job_log",
+        from: "worker:workerpal-1",
+        ts: new Date().toISOString(),
+        payload: {
+          jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+          stream: "stdout",
+          seq: 1,
+          line: "[OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2)",
+        },
+      }),
+    ).toBe(
+      "[job 12345678] [OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2)",
+    );
+
+    expect(
+      formatSessionEventLine({
+        id: "evt-job-stderr",
+        type: "job_log",
+        from: "worker:workerpal-1",
+        ts: new Date().toISOString(),
+        payload: {
+          jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+          stream: "stderr",
+          seq: 1,
+          line: "[ValidationGate] Failed (1000ms, exit 1): bun test",
+        },
+      }),
+    ).toBe("[job 12345678 stderr] [ValidationGate] Failed (1000ms, exit 1): bun test");
   });
 
   test("createSessionEventReplayFilter suppresses replayed status events with the same event id", () => {

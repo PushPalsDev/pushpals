@@ -274,6 +274,7 @@ const EMBEDDED_SERVICE_RESTART_STABLE_WINDOW_MS = 60_000;
 const EMBEDDED_SERVICE_RESTART_BASE_BACKOFF_MS = 2_000;
 const EMBEDDED_SERVICE_RESTART_MAX_BACKOFF_MS = 30_000;
 const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS = 15_000;
+const CLI_SESSION_JOB_LOG_MAX_CHARS = 700;
 const EMBEDDED_RUNTIME_SAFETY_CAP_DISABLE_ENV = "PUSHPALS_DISABLE_EMBEDDED_SAFETY_CAPS";
 const EMBEDDED_RUNTIME_WINDOWS_SAFETY_CAPS: Readonly<Record<string, string>> = {
   REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS: "120000",
@@ -4368,7 +4369,9 @@ async function autoStartRuntimeServices(opts: {
     },
   ): RuntimeServiceProcess => {
     const launchStartedAt = Date.now();
-    const service = serviceManager.replaceService(buildManagedServiceSpec(name, command, launchOpts));
+    const service = serviceManager.replaceService(
+      buildManagedServiceSpec(name, command, launchOpts),
+    );
     const launchDurationMs = Date.now() - launchStartedAt;
     if (launchDurationMs >= DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS) {
       const warning = formatEmbeddedServiceLaunchDelayWarning({
@@ -4417,9 +4420,7 @@ async function autoStartRuntimeServices(opts: {
     remoteBuddyFallbackActivated = true;
     lastReportedRemoteBuddyAutonomyState = "unknown";
     const fallbackReason =
-      reason === "silent_startup"
-        ? "produced no startup output on Windows"
-        : "crashed on Windows";
+      reason === "silent_startup" ? "produced no startup output on Windows" : "crashed on Windows";
     console.warn(
       `[pushpals] Embedded RemoteBuddy standalone binary ${fallbackReason}; retrying with source fallback under bun.`,
     );
@@ -5261,6 +5262,30 @@ export function formatSessionEventLine(
   const from = String(event.from ?? "");
   const payload = event.payload ?? {};
 
+  if (type === "job_enqueued") {
+    const jobId = String(payload.jobId ?? "").slice(0, 8);
+    const kind = String(payload.kind ?? "").trim();
+    const taskId = String(payload.taskId ?? "").slice(0, 8);
+    const detail = kind || (taskId ? `task ${taskId}` : "queued");
+    return `[job ${jobId}] queued: ${detail}`;
+  }
+  if (type === "job_claimed") {
+    const jobId = String(payload.jobId ?? "").slice(0, 8);
+    const workerId = String(payload.workerId ?? "").trim();
+    return `[job ${jobId}] claimed${workerId ? ` by ${workerId}` : ""}`;
+  }
+  if (type === "job_log") {
+    const jobId = String(payload.jobId ?? "").slice(0, 8);
+    const stream = String(payload.stream ?? "").toLowerCase() === "stderr" ? " stderr" : "";
+    const line = compactCliSessionJobLogLine(String(payload.line ?? "").trim());
+    return line ? `[job ${jobId}${stream}] ${line}` : null;
+  }
+  if (type === "job_failed") {
+    const jobId = String(payload.jobId ?? "").slice(0, 8);
+    const message = String(payload.message ?? "").trim();
+    return `[job ${jobId}] failed: ${message || "unknown"}`;
+  }
+
   if (!shouldDisplayInteractiveSessionEvent(event)) return null;
   if (type === "message") return null;
   if (type === "assistant_message") {
@@ -5283,10 +5308,10 @@ export function formatSessionEventLine(
     const summary = String(payload.summary ?? "").trim();
     return `[task ${taskId}] completed${summary ? `: ${summary}` : ""}`;
   }
-  if (type === "job_failed") {
+  if (type === "job_completed") {
     const jobId = String(payload.jobId ?? "").slice(0, 8);
-    const message = String(payload.message ?? "").trim();
-    return `[job ${jobId}] failed: ${message || "unknown"}`;
+    const summary = String(payload.summary ?? "").trim();
+    return `[job ${jobId}] completed${summary ? `: ${summary}` : ""}`;
   }
   if (type === "error") {
     const message = String(payload.message ?? "").trim();
@@ -5301,6 +5326,12 @@ export function formatSessionEventLine(
       : `[status ${source}] ${state || "unknown"}`;
   }
   return null;
+}
+
+function compactCliSessionJobLogLine(line: string): string {
+  const compacted = line.replace(/\s+/g, " ").trim();
+  if (compacted.length <= CLI_SESSION_JOB_LOG_MAX_CHARS) return compacted;
+  return `${compacted.slice(0, CLI_SESSION_JOB_LOG_MAX_CHARS - 3)}...`;
 }
 
 function buildSessionEventReplayFingerprint(
@@ -5857,21 +5888,21 @@ async function main(): Promise<void> {
           onlineWorkers: 0,
           idleWorkers: 0,
         })
-    : workerpalDockerPrecheck.status === "failed"
-      ? describeWorkerExecutionReadiness({
-          autoSpawnWorkerpals: Boolean(config.remotebuddy.autoSpawnWorkerpals),
-          requireDocker:
-            Boolean(config.remotebuddy.workerpalDocker) &&
-            Boolean(config.remotebuddy.workerpalRequireDocker),
-          dockerPrecheck: workerpalDockerPrecheck,
-          onlineWorkers: 0,
-          idleWorkers: 0,
-        })
-      : {
-          state: "warming",
-          detail: workerpalCapacity.detail,
-          action: "Wait for WorkerPal auto-spawn/warmup to finish, then rerun /status.",
-        };
+      : workerpalDockerPrecheck.status === "failed"
+        ? describeWorkerExecutionReadiness({
+            autoSpawnWorkerpals: Boolean(config.remotebuddy.autoSpawnWorkerpals),
+            requireDocker:
+              Boolean(config.remotebuddy.workerpalDocker) &&
+              Boolean(config.remotebuddy.workerpalRequireDocker),
+            dockerPrecheck: workerpalDockerPrecheck,
+            onlineWorkers: 0,
+            idleWorkers: 0,
+          })
+        : {
+            state: "warming",
+            detail: workerpalCapacity.detail,
+            action: "Wait for WorkerPal auto-spawn/warmup to finish, then rerun /status.",
+          };
   const saved = statePath ? readCliState(statePath) : {};
   pushpalsLogPath =
     pushpalsLogPath ||

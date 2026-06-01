@@ -67,6 +67,7 @@ const DEFAULT_LLM_MODEL = "local-model";
 const CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
 const CODEX_UNAVAILABLE_DOCKER_SHUTDOWN_GRACE_MS = 5_000;
 const CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS = 4_000;
+const DEFAULT_JOB_PROGRESS_LOG_EVERY_MS = 60_000;
 const CONFIG = loadPushPalsConfig();
 const LOG = new Logger("WorkerPals");
 
@@ -197,7 +198,12 @@ async function reportToolRunForUnsuccessfulJob(args: {
   if (record.failureClass === "unknown" && record.tool === "shell") return;
 
   try {
-    const response = await postJsonWithTimeout(`${args.opts.server}/tool-runs`, args.headers, record, 5_000);
+    const response = await postJsonWithTimeout(
+      `${args.opts.server}/tool-runs`,
+      args.headers,
+      record,
+      5_000,
+    );
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
       console.warn(
@@ -313,6 +319,13 @@ function formatDurationMs(durationMs: number): string {
   const seconds = totalSeconds % 60;
   if (minutes <= 0) return `${totalSeconds}s`;
   return `${minutes}m ${seconds}s`;
+}
+
+function resolveJobProgressLogEveryMs(): number {
+  const raw = Number.parseInt(process.env.PUSHPALS_WORKERPAL_PROGRESS_LOG_MS ?? "", 10);
+  if (Number.isFinite(raw) && raw === 0) return 0;
+  if (Number.isFinite(raw) && raw >= 10_000) return raw;
+  return DEFAULT_JOB_PROGRESS_LOG_EVERY_MS;
 }
 
 function sanitizeJobLogLine(line: string): string {
@@ -985,8 +998,7 @@ function failNoChangeReviewFixJob(jobId: string, result: WorkerJobResult): Worke
   return {
     ...result,
     ok: false,
-    summary:
-      `Rejected review-fix job ${jobId} produced no code changes; refusing unchanged branch re-review.`,
+    summary: `Rejected review-fix job ${jobId} produced no code changes; refusing unchanged branch re-review.`,
     stderr: [
       result.stderr,
       "Review-fix jobs must make at least one concrete code/test/docs change before requesting another review.",
@@ -1002,9 +1014,7 @@ function taskExecuteOrigin(params: Record<string, unknown> | undefined): "user" 
   if (!params) return "user";
   if (params.origin === "autonomy") return "autonomy";
   const autonomy = params.autonomy;
-  return autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)
-    ? "autonomy"
-    : "user";
+  return autonomy && typeof autonomy === "object" && !Array.isArray(autonomy) ? "autonomy" : "user";
 }
 
 async function enqueueCompletion(
@@ -1109,15 +1119,19 @@ async function failActiveJobOnShutdown(
     runtimeState.currentSessionId &&
     shouldEmitDirectSessionJobEvent({ ok: false, statusPersistedToServer })
   ) {
-    await transport.queueSessionCommand(runtimeState.currentSessionId, {
-      type: "job_failed",
-      payload: {
-        jobId: activeJobId,
-        message,
-        detail,
+    await transport.queueSessionCommand(
+      runtimeState.currentSessionId,
+      {
+        type: "job_failed",
+        payload: {
+          jobId: activeJobId,
+          message,
+          detail,
+        },
+        from: `worker:${opts.workerId}`,
       },
-      from: `worker:${opts.workerId}`,
-    }, { priority: "high" });
+      { priority: "high" },
+    );
   }
 }
 
@@ -1224,10 +1238,7 @@ async function workerLoop(
         const job = data.job;
 
         if (job) {
-          if (
-            dockerExecutor &&
-            dockerExecutor.shouldPrepareMergeConflictJobBeforeExecution(job)
-          ) {
+          if (dockerExecutor && dockerExecutor.shouldPrepareMergeConflictJobBeforeExecution(job)) {
             const deferMs = dockerExecutor.recommendedMergeConflictDeferMs();
             const deferred = await deferClaimedJobForMaintenance(opts, headers, job.id, deferMs);
             if (!deferred.ok) {
@@ -1325,49 +1336,85 @@ async function workerLoop(
           }, heartbeatEveryMs);
 
           if (job.sessionId) {
-            await transport.queueSessionCommand(job.sessionId, {
-              type: "job_claimed",
-              payload: { jobId: job.id, workerId: opts.workerId },
-              from: `worker:${opts.workerId}`,
-            }, { priority: "high" });
+            await transport.queueSessionCommand(
+              job.sessionId,
+              {
+                type: "job_claimed",
+                payload: { jobId: job.id, workerId: opts.workerId },
+                from: `worker:${opts.workerId}`,
+              },
+              { priority: "high" },
+            );
           }
 
           let stdoutSeq = 0;
           let stderrSeq = 0;
           let lastCleanLog = "";
           let lastCleanLogAt = 0;
+          let lastForwardedJobLogAt = Date.now();
 
-          const onLog = job.sessionId
-            ? (stream: "stdout" | "stderr", line: string) => {
+          const emitJobLog = job.sessionId
+            ? (stream: "stdout" | "stderr", line: string): boolean => {
                 const cleaned = sanitizeJobLogLine(line);
-                if (!cleaned) return;
-                // Print executor logs locally only in debug mode.
-                if (LOG.isDebugEnabled()) LOG.debug(`[${stream}] ${cleaned}`);
+                if (!cleaned) return false;
 
                 // Drop high-frequency terminal progress redraw spam; keep meaningful lines.
-                if (isNoisyProgressLine(cleaned)) return;
+                if (isNoisyProgressLine(cleaned)) return false;
 
                 // Collapse very noisy duplicate lines emitted in tight loops.
                 const now = Date.now();
-                if (cleaned === lastCleanLog && now - lastCleanLogAt < 1_000) return;
+                if (cleaned === lastCleanLog && now - lastCleanLogAt < 1_000) return false;
                 lastCleanLog = cleaned;
                 lastCleanLogAt = now;
+                lastForwardedJobLogAt = now;
                 const logTs = new Date(now).toISOString();
 
                 const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
-                void transport.queueSessionCommand(job.sessionId, {
-                  type: "job_log",
-                  payload: { jobId: job.id, stream, seq, line: cleaned, ts: logTs },
-                  from: `worker:${opts.workerId}`,
-                }, { droppable: true });
+                void transport.queueSessionCommand(
+                  job.sessionId,
+                  {
+                    type: "job_log",
+                    payload: { jobId: job.id, stream, seq, line: cleaned, ts: logTs },
+                    from: `worker:${opts.workerId}`,
+                  },
+                  { droppable: true },
+                );
                 void transport.queueJobLog(job.id, {
                   stream,
                   seq,
                   message: cleaned,
                   ts: logTs,
                 });
+                return true;
               }
             : undefined;
+
+          const onLog = emitJobLog
+            ? (stream: "stdout" | "stderr", line: string) => {
+                const cleaned = sanitizeJobLogLine(line);
+                if (LOG.isDebugEnabled() && cleaned) LOG.debug(`[${stream}] ${cleaned}`);
+                emitJobLog(stream, line);
+              }
+            : undefined;
+
+          const jobClaimedAtMs = Date.now();
+          const jobProgressLogEveryMs = resolveJobProgressLogEveryMs();
+          const jobProgressTimer =
+            emitJobLog && jobProgressLogEveryMs > 0
+              ? setInterval(() => {
+                  const now = Date.now();
+                  const quietForMs = Math.max(0, now - lastForwardedJobLogAt);
+                  if (quietForMs < jobProgressLogEveryMs) return;
+                  emitJobLog(
+                    "stdout",
+                    `[WorkerPals] Job ${job.id} still running after ${formatDurationMs(
+                      now - jobClaimedAtMs,
+                    )} (kind=${job.kind}, worker=${opts.workerId}, quiet_for=${formatDurationMs(
+                      quietForMs,
+                    )}).`,
+                  );
+                }, jobProgressLogEveryMs)
+              : null;
 
           let directWorktreePath: string | null = null;
           let executionRepo = opts.repo;
@@ -1611,11 +1658,15 @@ async function workerLoop(
                 durationMs: jobDurationMs,
                 phase: job.kind,
               });
-              const response = await postJsonWithTimeout(`${opts.server}/jobs/${job.id}/fail`, headers, {
-                message: result.summary,
-                detail: redactSensitiveText(result.stderr ?? ""),
-                durationMs: jobDurationMs,
-              });
+              const response = await postJsonWithTimeout(
+                `${opts.server}/jobs/${job.id}/fail`,
+                headers,
+                {
+                  message: result.summary,
+                  detail: redactSensitiveText(result.stderr ?? ""),
+                  durationMs: jobDurationMs,
+                },
+              );
               statusPersistedToServer = response.ok;
               console.log(
                 `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
@@ -1703,6 +1754,7 @@ async function workerLoop(
             }
           } finally {
             clearInterval(busyHeartbeat);
+            if (jobProgressTimer) clearInterval(jobProgressTimer);
             if (recycleWorkerAfterJob) {
               runtimeState.shutdownRequested = true;
               const forceExitTimer = setTimeout(() => {
@@ -1895,7 +1947,9 @@ async function main(): Promise<void> {
           },
         }),
       );
-      await withTimeout(failActiveJobOnShutdown(opts, headers, runtimeState, transport, signalName));
+      await withTimeout(
+        failActiveJobOnShutdown(opts, headers, runtimeState, transport, signalName),
+      );
       await withTimeout(transport.flush());
       if (dockerExecutor) {
         await withTimeout(
