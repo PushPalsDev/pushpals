@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import json
@@ -19,6 +20,7 @@ from executor_base import (
     Logger,
     SettingsResolver,
     config_dir_for_runtime_config,
+    parse_task_execute_payload,
     runtime_config,
 )
 from openai_codex_executor import (
@@ -256,6 +258,51 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Supplemental execution guidance", prompt)
         self.assertIn("Keep assertions strict", prompt)
         self.assertIn("bun test tests/localbuddy.request-status.test.ts", prompt)
+
+    def test_parse_payload_adds_structured_planning_guidance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-planning-guidance-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": "task.execute",
+                "repo": str(repo),
+                "params": {
+                    "instruction": "Improve the game startup smoke path",
+                    "schemaVersion": 2,
+                    "planning": {
+                        "intent": "code_change",
+                        "riskLevel": "medium",
+                        "queuePriority": "normal",
+                        "queueWaitBudgetMs": 90_000,
+                        "executionBudgetMs": 1_800_000,
+                        "finalizationBudgetMs": 120_000,
+                        "scope": {
+                            "readAnywhere": True,
+                            "writeAllowed": True,
+                            "writeGlobs": ["app/**", "scripts/**"],
+                        },
+                        "targetPaths": ["app/__tests__/_layout.autonomy.test.ts"],
+                        "discovery": {
+                            "ripgrepQueries": ['rg "home-screen|web:e2e" app scripts'],
+                            "likelyDirs": ["app", "scripts"],
+                            "keywords": ["home-screen", "web:e2e"],
+                        },
+                        "acceptanceCriteria": ["Home shell startup is assertable"],
+                        "validationSteps": ["bun test", "bun run web:e2e"],
+                        "requiredValidationSteps": ["bun run web:e2e"],
+                    },
+                },
+            }
+            encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+            task = parse_task_execute_payload(["executor", encoded], logger=Logger("[test]"))
+            guidance = "\n".join(task.supplemental_guidance)
+
+            self.assertIn("Task planning contract from PushPals", guidance)
+            self.assertIn("Write globs are relevance hints, not hard limits", guidance)
+            self.assertIn("app/__tests__/_layout.autonomy.test.ts", guidance)
+            self.assertIn("Home shell startup is assertable", guidance)
+            self.assertIn("bun run web:e2e", guidance)
 
     def test_detects_codex_workaround_signals(self) -> None:
         signal = _detect_codex_workaround_signal(

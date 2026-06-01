@@ -717,6 +717,98 @@ def _is_non_actionable_planner_guidance(text: str) -> bool:
     return any(marker in lower for marker in blocked_markers)
 
 
+def _string_list(value: Any, *, limit: int = 12, max_chars: int = 220) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    out: List[str] = []
+    for item in value:
+        text = to_single_line(item, max_chars)
+        if text:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _append_list_guidance(lines: List[str], label: str, values: List[str]) -> None:
+    if not values:
+        return
+    lines.append(f"- {label}:")
+    for value in values:
+        lines.append(f"  - {value}")
+
+
+def _build_planning_guidance(params: Dict[str, Any]) -> str:
+    planning = params.get("planning")
+    if not isinstance(planning, dict):
+        return ""
+
+    lines: List[str] = ["Task planning contract from PushPals:"]
+    intent = to_single_line(planning.get("intent"), 80)
+    risk = to_single_line(planning.get("riskLevel"), 80)
+    priority = to_single_line(planning.get("queuePriority"), 80)
+    summary_parts = []
+    if intent:
+        summary_parts.append(f"intent={intent}")
+    if risk:
+        summary_parts.append(f"risk={risk}")
+    if priority:
+        summary_parts.append(f"priority={priority}")
+    if summary_parts:
+        lines.append(f"- Planning summary: {', '.join(summary_parts)}")
+
+    scope = planning.get("scope")
+    if isinstance(scope, dict):
+        write_allowed = scope.get("writeAllowed")
+        read_anywhere = scope.get("readAnywhere")
+        scope_parts = []
+        if isinstance(read_anywhere, bool):
+            scope_parts.append(f"read_anywhere={str(read_anywhere).lower()}")
+        if isinstance(write_allowed, bool):
+            scope_parts.append(f"write_allowed={str(write_allowed).lower()}")
+        if scope_parts:
+            lines.append(f"- Repo access: {', '.join(scope_parts)}")
+        write_globs = _string_list(scope.get("writeGlobs"), limit=10)
+        if write_globs:
+            lines.append("- Write globs are relevance hints, not hard limits; edit behavior-owning files as needed.")
+            _append_list_guidance(lines, "Write-scope hints", write_globs)
+        forbidden = _string_list(scope.get("forbiddenGlobs"), limit=8)
+        _append_list_guidance(lines, "Forbidden path hints", forbidden)
+
+    _append_list_guidance(lines, "Target path hints", _string_list(planning.get("targetPaths"), limit=12))
+
+    discovery = planning.get("discovery")
+    if isinstance(discovery, dict):
+        _append_list_guidance(
+            lines,
+            "Suggested discovery commands",
+            _string_list(discovery.get("ripgrepQueries"), limit=8),
+        )
+        _append_list_guidance(lines, "Likely directories", _string_list(discovery.get("likelyDirs"), limit=8))
+        _append_list_guidance(lines, "Search keywords", _string_list(discovery.get("keywords"), limit=12))
+
+    _append_list_guidance(
+        lines,
+        "Acceptance criteria",
+        _string_list(planning.get("acceptanceCriteria"), limit=10, max_chars=260),
+    )
+    _append_list_guidance(
+        lines,
+        "Planned validation steps",
+        _string_list(planning.get("validationSteps"), limit=8, max_chars=260),
+    )
+    _append_list_guidance(
+        lines,
+        "Required vision.md validation steps",
+        _string_list(planning.get("requiredValidationSteps"), limit=8, max_chars=260),
+    )
+
+    guidance = "\n".join(lines).strip()
+    if len(guidance) > 4000:
+        guidance = guidance[:4000].rstrip() + "\n- Planning guidance truncated to stay within worker prompt budget."
+    return guidance
+
+
 def parse_task_execute_payload(
     argv: List[str],
     *,
@@ -765,6 +857,9 @@ def parse_task_execute_payload(
     quality_revision_hint = str(params.get("qualityRevisionHint") or "").strip()
 
     supplemental_guidance: List[str] = []
+    planning_guidance = _build_planning_guidance(params)
+    if planning_guidance:
+        supplemental_guidance.append(planning_guidance)
     if planner_instruction and planner_instruction != instruction:
         if _is_non_actionable_planner_guidance(planner_instruction):
             log.info(
