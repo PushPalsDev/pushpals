@@ -5404,7 +5404,6 @@ function shouldSuppressCliSessionJobLogLine(line: string): boolean {
   if (/^(___RESULT___|__PUSHPALS_OH_RESULT__)\b/.test(text)) return true;
   if (/^\[DockerExecutor\]\s+Linked worktree dependency artifact/i.test(text)) return true;
 
-  if (/^\[Openai_codexExecutor\]\s+Spawning openai_codex executor/i.test(text)) return true;
   if (
     /^\[OpenAICodexExecutor\]\s+(?:Planner guidance|Codex auth mode|ChatGPT auth mode|Starting codex exec|codex exec finished|Codex JSON stream captured|Codex stdout captured|No reasoning-like|Reasoning-like event|Usage observed|Temporarily masked repo-local)/i.test(
       text,

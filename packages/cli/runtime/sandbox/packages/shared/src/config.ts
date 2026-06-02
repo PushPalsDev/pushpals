@@ -1619,7 +1619,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         asInt(
           parseIntEnv("REMOTEBUDDY_EXECUTION_BUDGET_BACKGROUND_MS") ??
             remoteNode.execution_budget_background_ms,
-          1_800_000,
+          1_200_000,
         ),
       ),
       finalizationBudgetMs: Math.max(

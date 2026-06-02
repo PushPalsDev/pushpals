@@ -89,7 +89,7 @@ function makeConfig(projectRoot: string): PushPalsConfig {
       workerpalLabels: [],
       executionBudgetInteractiveMs: 600000,
       executionBudgetNormalMs: 1500000,
-      executionBudgetBackgroundMs: 1800000,
+      executionBudgetBackgroundMs: 1200000,
       finalizationBudgetMs: 120000,
       crashRestartEnabled: true,
       crashRestartMaxRestarts: 3,

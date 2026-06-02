@@ -303,7 +303,7 @@ export function resolveDockerJobTimeoutMs(
   if (!hasBrowserValidationCommand(job)) return baseTimeoutMs;
 
   const planning = maybeRecord(job.params.planning);
-  const executionBudgetMs = readPositiveNumber(planning?.executionBudgetMs) ?? 1_800_000;
+  const executionBudgetMs = readPositiveNumber(planning?.executionBudgetMs) ?? 1_200_000;
   const finalizationBudgetMs = readPositiveNumber(planning?.finalizationBudgetMs) ?? 120_000;
   const attempts = BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS + 1; // initial attempt plus repairs
   const estimatedTimeoutMs =

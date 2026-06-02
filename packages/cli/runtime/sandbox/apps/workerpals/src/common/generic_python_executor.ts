@@ -136,6 +136,29 @@ export function resolveGenericPythonExecutorTimeoutMs(params: {
   return configuredTimeoutMs;
 }
 
+function toSnakeConfigKey(key: string): string {
+  return key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+}
+
+function formatGenericPythonExecutorTimeoutDetail(
+  config: GenericPythonExecutorConfig,
+  configuredTimeoutMs: number,
+  executionBudgetMs: number | null,
+  timeoutMs: number,
+): string {
+  const configPath = `workerpals.${toSnakeConfigKey(config.timeoutConfigKey)}`;
+  if (executionBudgetMs == null) {
+    return `${configPath}=${configuredTimeoutMs}ms`;
+  }
+  if (config.capTimeoutToExecutionBudget === false) {
+    return `${configPath}=${configuredTimeoutMs}ms; planning executionBudgetMs=${executionBudgetMs}ms ignored by backend opt-out`;
+  }
+  if (timeoutMs < configuredTimeoutMs) {
+    return `${configPath}=${configuredTimeoutMs}ms capped by planning executionBudgetMs=${executionBudgetMs}ms`;
+  }
+  return `${configPath}=${configuredTimeoutMs}ms within planning executionBudgetMs=${executionBudgetMs}ms`;
+}
+
 export function createGenericPythonExecutor(
   config: GenericPythonExecutorConfig,
 ): BackendTaskExecutor {
@@ -172,6 +195,12 @@ export function createGenericPythonExecutor(
       executionBudgetMs,
       capTimeoutToExecutionBudget: config.capTimeoutToExecutionBudget,
     });
+    const timeoutDetail = formatGenericPythonExecutorTimeoutDetail(
+      config,
+      configuredTimeoutMs,
+      executionBudgetMs,
+      timeoutMs,
+    );
     const payloadBase64 = Buffer.from(
       JSON.stringify({
         kind,
@@ -184,7 +213,7 @@ export function createGenericPythonExecutor(
 
     onLog?.(
       "stdout",
-      `[${backendLabel}Executor] Spawning ${backendName} executor (timeout=${timeoutMs}ms)`,
+      `[${backendLabel}Executor] Spawning ${backendName} executor (timeout=${timeoutMs}ms; ${timeoutDetail})`,
     );
 
     try {
@@ -207,6 +236,7 @@ export function createGenericPythonExecutor(
       });
 
       let timedOut = false;
+      let hardKillTimer: ReturnType<typeof setTimeout> | null = null;
       const timeoutTimer = setTimeout(() => {
         timedOut = true;
         onLog?.(
@@ -214,6 +244,13 @@ export function createGenericPythonExecutor(
           `[${backendLabel}Executor] Timeout reached after ${timeoutMs}ms; terminating process.`,
         );
         proc.kill();
+        hardKillTimer = setTimeout(() => {
+          onLog?.(
+            "stdout",
+            `[${backendLabel}Executor] Process did not exit after graceful timeout termination; forcing kill.`,
+          );
+          proc.kill("SIGKILL");
+        }, 5_000);
       }, timeoutMs);
 
       const progressIntervalMs = 15_000;
@@ -246,6 +283,7 @@ export function createGenericPythonExecutor(
       ]);
 
       clearTimeout(timeoutTimer);
+      if (hardKillTimer) clearTimeout(hardKillTimer);
       clearInterval(progressTimer);
 
       const stdout = rawStdout ?? "";

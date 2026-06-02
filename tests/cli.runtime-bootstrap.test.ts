@@ -2899,7 +2899,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     for (const line of [
       "[DockerExecutor] Linked worktree dependency artifact(s): node_modules",
-      "[Openai_codexExecutor] Spawning openai_codex executor (timeout=7200000ms)",
       "[OpenAICodexExecutor] Codex auth mode: chatgpt (configured=auto)",
       "[OpenAICodexExecutor] Starting codex exec in /repo/.worktrees/job-123",
       "[OpenAICodexExecutor] [codex] thread.started",
@@ -2917,6 +2916,18 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         }),
       ).toBeNull();
     }
+
+    expect(
+      formatSessionEventLine({
+        ...baseEvent,
+        payload: {
+          ...baseEvent.payload,
+          line: "[Openai_codexExecutor] Spawning openai_codex executor (timeout=1200000ms; workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms)",
+        },
+      }),
+    ).toBe(
+      "[job 12345678] [Openai_codexExecutor] Spawning openai_codex executor (timeout=1200000ms; workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms)",
+    );
 
     expect(
       formatSessionEventLine({

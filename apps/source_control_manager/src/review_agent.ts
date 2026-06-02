@@ -1981,7 +1981,7 @@ export class ReviewAgent {
           validationSteps,
           queuePriority: "normal",
           queueWaitBudgetMs: 90_000,
-          executionBudgetMs: 1_800_000,
+          executionBudgetMs: 1_200_000,
           finalizationBudgetMs: 120_000,
           scope: { readAnywhere: true, writeAllowed: true, writeGlobs },
           discovery: {
@@ -2145,7 +2145,7 @@ export class ReviewAgent {
           validationSteps,
           queuePriority: "normal",
           queueWaitBudgetMs: 90_000,
-          executionBudgetMs: 1_800_000,
+          executionBudgetMs: 1_200_000,
           finalizationBudgetMs: 120_000,
           scope: { readAnywhere: true, writeAllowed: true, writeGlobs },
           discovery: {

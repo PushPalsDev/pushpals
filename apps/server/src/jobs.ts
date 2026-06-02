@@ -34,7 +34,7 @@ const JOB_PRIORITY_QUEUE_SLA_MS: Record<JobPriority, number> = {
 const JOB_EXECUTION_BUDGET_MS: Record<JobPriority, number> = {
   interactive: 300_000,
   normal: 900_000,
-  background: 1_800_000,
+  background: 1_200_000,
 };
 const JOB_FINALIZATION_BUDGET_MS_DEFAULT = 120_000;
 const PR_WORKER_ASSIGNMENT_MAX_AGE_MS = 120_000;

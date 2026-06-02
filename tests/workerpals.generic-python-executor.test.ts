@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "fs";
 import { resolveGenericPythonExecutorTimeoutMs } from "../apps/workerpals/src/common/generic_python_executor";
 
 describe("generic python executor timeout resolution", () => {
@@ -11,7 +12,7 @@ describe("generic python executor timeout resolution", () => {
     ).toBe(1_800_000);
   });
 
-  test("lets OpenAI Codex use the configured backend timeout instead of a shorter planning budget", () => {
+  test("still supports an explicit opt-out for bespoke backend wrappers", () => {
     expect(
       resolveGenericPythonExecutorTimeoutMs({
         configuredTimeoutMs: 7_200_000,
@@ -19,5 +20,14 @@ describe("generic python executor timeout resolution", () => {
         capTimeoutToExecutionBudget: false,
       }),
     ).toBe(7_200_000);
+  });
+
+  test("keeps OpenAI Codex under the job planning budget", () => {
+    for (const path of [
+      "apps/workerpals/src/backends/openai_codex_backend.ts",
+      "packages/cli/runtime/sandbox/apps/workerpals/src/backends/openai_codex_backend.ts",
+    ]) {
+      expect(readFileSync(path, "utf8")).not.toContain("capTimeoutToExecutionBudget: false");
+    }
   });
 });
