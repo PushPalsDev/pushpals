@@ -32,6 +32,7 @@ from openai_codex_executor import (
     _resolve_reasoning_effort,
     _build_instruction,
     _collect_disallowed_shell_wrapper_rejections,
+    _codex_changed_paths,
     _detect_codex_workaround_signal,
     _extract_usage_counts,
     _load_prompt_template,
@@ -608,6 +609,45 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("ValidationGate/CriticGate", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertNotIn("Recovered after Codex attempts", str(result.get("stdout") or ""))
+
+    def test_codex_changed_paths_filters_dependency_artifacts_from_publishable_delta(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-delta-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# artifact delta test\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed artifact test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            (repo / "node_modules").mkdir()
+            (repo / "node_modules" / "linked.txt").write_text("artifact\n", encoding="utf-8")
+            (repo / "outputs").mkdir()
+            (repo / "outputs" / "runtime.log").write_text("artifact\n", encoding="utf-8")
+            changed_paths, delta, effective = _codex_changed_paths(str(repo), [])
+
+        self.assertGreaterEqual(len(changed_paths), 2)
+        self.assertGreaterEqual(len(delta), 2)
+        self.assertEqual(effective, [])
 
     def test_run_codex_task_escalates_wrapper_recovery_and_recovers(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-recovery-") as temp_dir:

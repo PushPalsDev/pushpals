@@ -72,7 +72,7 @@ describe("workerpals docker executor internals", () => {
     expect(timedOut.summary).toContain("14400000ms");
   });
 
-  test("extends Docker timeout for browser-validation repair jobs", () => {
+  test("caps Docker timeout for browser-validation repair jobs", () => {
     const regularTimeout = resolveDockerJobTimeoutMs(1_860_000, {
       kind: "task.execute",
       params: {
@@ -95,8 +95,7 @@ describe("workerpals docker executor internals", () => {
         },
       },
     });
-    expect(browserTimeout).toBeGreaterThan(7_260_000);
-    expect(browserTimeout).toBeGreaterThanOrEqual(4 * 60 * 60_000);
+    expect(browserTimeout).toBe(45 * 60_000);
   });
 
   test("retry matching no longer treats generic timeout words as transient", () => {

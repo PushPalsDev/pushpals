@@ -2182,6 +2182,24 @@ async function downloadBinaryAssetWithWindowsCurlFallback(
   return true;
 }
 
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  const workerCount = Math.max(1, Math.min(items.length, Math.floor(concurrency)));
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await worker(items[currentIndex], currentIndex);
+      }
+    }),
+  );
+}
+
 export async function ensureRuntimeBinaries(
   runtimeRoot: string,
   runtimeTag: string,
@@ -2213,13 +2231,19 @@ export async function ensureRuntimeBinaries(
     runtimeBinaries.sourceControlManager,
   ];
   const shouldRefreshAll = installedTag !== runtimeTag;
-  let downloadedCount = 0;
-  for (const binaryPath of requiredAssets) {
-    if (!shouldRefreshAll && existsSync(binaryPath)) continue;
+  const assetsToDownload = requiredAssets.filter(
+    (binaryPath) => shouldRefreshAll || !existsSync(binaryPath),
+  );
+  if (assetsToDownload.length > 1) {
+    console.log(
+      `[pushpals] Downloading ${assetsToDownload.length} runtime binary asset(s) with bounded parallelism...`,
+    );
+  }
+  await runWithConcurrency(assetsToDownload, 3, async (binaryPath) => {
     const assetName = binaryPath.split(/[\\/]/).pop() || "";
     await downloadBinaryAsset(runtimeTag, assetName, binaryPath);
-    downloadedCount++;
-  }
+  });
+  const downloadedCount = assetsToDownload.length;
 
   writeFileSync(tagMarkerPath, `${runtimeTag}\n`, "utf8");
   cleanupLegacyRuntimeBinaryLayouts(runtimeRoot, platformKey, binDir);
@@ -4650,6 +4674,8 @@ async function autoStartRuntimeServices(opts: {
   const deadline = Date.now() + DEFAULT_RUNTIME_BOOT_TIMEOUT_MS;
   const readinessPhaseStartedAt = Date.now();
   const optionalServiceExitWarned = new Set<RuntimeServiceName>();
+  let lastReadinessWaitLogAt = 0;
+  let lastReadinessWaitDetail = "";
   while (Date.now() < deadline) {
     reportRemoteBuddyAutonomousEngineState();
     if (maybeActivateRemoteBuddyWindowsFallback("silent_startup")) {
@@ -4704,6 +4730,27 @@ async function autoStartRuntimeServices(opts: {
 
     const health = localBuddyEnabled ? await probeLocalBuddy(opts.localAgentUrl) : null;
     const remoteBuddyHealth = await probeRemoteBuddySessionConsumer(opts.serverUrl, opts.sessionId);
+    if ((localBuddyEnabled && !health?.ok) || !remoteBuddyHealth.ok) {
+      const localBuddyDetail = localBuddyEnabled
+        ? health?.ok
+          ? "LocalBuddy ready"
+          : "LocalBuddy not ready"
+        : "LocalBuddy skipped";
+      const readinessDetail = `${localBuddyDetail}; ${remoteBuddyHealth.detail}`;
+      const now = Date.now();
+      if (
+        readinessDetail !== lastReadinessWaitDetail ||
+        now - lastReadinessWaitLogAt >= 5_000
+      ) {
+        console.log(`[pushpals] Waiting for embedded runtime readiness: ${readinessDetail}`);
+        appendRuntimeServicesLogLine(
+          runtimeServicesLogPath,
+          `[pushpals] waiting for embedded runtime readiness: ${readinessDetail}`,
+        );
+        lastReadinessWaitDetail = readinessDetail;
+        lastReadinessWaitLogAt = now;
+      }
+    }
     if ((!localBuddyEnabled || health?.ok) && remoteBuddyHealth.ok) {
       reportRemoteBuddyAutonomousEngineState();
       const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;

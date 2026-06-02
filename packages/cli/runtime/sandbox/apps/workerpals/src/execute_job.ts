@@ -176,7 +176,7 @@ export interface QualityGatePolicy {
   criticMinScore: number;
 }
 
-const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 8;
+const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 3;
 
 export function qualityRevisionLoopUpperBound(policy: {
   maxAutoRevisions: number;
@@ -376,6 +376,16 @@ function buildDiffBudgetWarning(
   } budget. Before editing more, remove unrelated churn and keep only behavior-owning files needed for the current repair. Changed files: ${meaningfulChangedPaths
     .slice(0, 12)
     .join(", ")}${meaningfulChangedPaths.length > 12 ? ", ..." : ""}`;
+}
+
+function isNonPublishableArtifactPath(path: string): boolean {
+  return /(^|\/)(outputs|node_modules|\.worktrees|\.codex|dist|build|coverage)(\/|$)/i.test(
+    path.replace(/\\/g, "/"),
+  );
+}
+
+export function publishableChangedPaths(changedPaths: string[]): string[] {
+  return changedPaths.filter((path) => !isNonPublishableArtifactPath(path));
 }
 
 function collectPlanningText(planning: TaskExecutePlanning): string {
@@ -6738,6 +6748,53 @@ export async function executeJob(
       return {
         ok: false,
         summary: "Merge-conflict execution ended without an executor result.",
+        exitCode: 4,
+      };
+    }
+
+    const preQualityStatus = await git(repo, ["status", "--porcelain"]);
+    const preQualityChangedPaths = preQualityStatus.ok
+      ? parseChangedPathsFromStatus(preQualityStatus.stdout)
+      : [];
+    const preQualityPublishablePaths = publishableChangedPaths(preQualityChangedPaths);
+    const executorText = `${result.summary ?? ""}\n${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    const shellWrapperReturn =
+      /shell-wrapper command rejections|command-router shell-wrapper|command policy rejection/i.test(
+        executorText,
+      );
+    if (preQualityChangedPaths.length > 0 && preQualityPublishablePaths.length === 0) {
+      const detail = `Executor changed only non-publishable dependency/runtime artifact path(s): ${preQualityChangedPaths
+        .slice(0, 12)
+        .join(", ")}${preQualityChangedPaths.length > 12 ? ", ..." : ""}.`;
+      onLog?.(
+        "stderr",
+        `[QualityGate] ${detail} Skipping ValidationGate/CriticGate because there is no PR-worthy patch to validate.`,
+      );
+      return {
+        ok: false,
+        summary: "Executor produced no publishable code changes",
+        stdout: result.stdout,
+        stderr: [result.stderr ?? "", detail].filter(Boolean).join("\n"),
+        exitCode: 4,
+      };
+    }
+    if (
+      preQualityPublishablePaths.length === 0 &&
+      (qualityGatePolicy.mode === "review_fix" || shellWrapperReturn)
+    ) {
+      const reason =
+        qualityGatePolicy.mode === "review_fix"
+          ? "Review-fix executor returned without publishable code changes."
+          : "Codex hit shell-wrapper command rejections without leaving a publishable patch.";
+      onLog?.(
+        "stderr",
+        `[QualityGate] ${reason} Skipping ValidationGate/CriticGate and failing fast.`,
+      );
+      return {
+        ok: false,
+        summary: reason,
+        stdout: result.stdout,
+        stderr: [result.stderr ?? "", reason].filter(Boolean).join("\n"),
         exitCode: 4,
       };
     }

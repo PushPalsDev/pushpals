@@ -2599,9 +2599,35 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       const binaries = await ensureRuntimeBinaries(runtimeRoot, "v1.2.4");
 
       expect(requestedAssets).toHaveLength(6);
-      expect(requestedAssets[0]).toBe(requestedAssets[1]);
+      expect(requestedAssets.filter((url) => url === requestedAssets[0])).toHaveLength(2);
       expect(existsSync(binaries.server)).toBe(true);
       expect(readFileSync(join(dirname(binaries.server), ".runtime-tag"), "utf8")).toBe("v1.2.4\n");
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("ensureRuntimeBinaries downloads independent assets with bounded parallelism", async () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-bin-parallel-"));
+    const originalFetch = globalThis.fetch;
+    let activeDownloads = 0;
+    let maxActiveDownloads = 0;
+    globalThis.fetch = (async () => {
+      activeDownloads += 1;
+      maxActiveDownloads = Math.max(maxActiveDownloads, activeDownloads);
+      await Bun.sleep(20);
+      activeDownloads -= 1;
+      return new Response(new Uint8Array([0x50, 0x4b]));
+    }) as typeof fetch;
+
+    try {
+      const binaries = await ensureRuntimeBinaries(runtimeRoot, "v1.2.5");
+
+      expect(existsSync(binaries.server)).toBe(true);
+      expect(existsSync(binaries.sourceControlManager)).toBe(true);
+      expect(maxActiveDownloads).toBeGreaterThan(1);
+      expect(maxActiveDownloads).toBeLessThanOrEqual(3);
     } finally {
       globalThis.fetch = originalFetch;
       rmSync(runtimeRoot, { recursive: true, force: true });

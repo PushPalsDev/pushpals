@@ -1432,10 +1432,15 @@ def _merge_usage_records(first: Any, second: Any) -> Dict[str, Any]:
     return merged
 
 
+def _is_publishable_changed_path(path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/").lower()
+    return not re.search(r"(^|/)(outputs|node_modules|\.worktrees|\.codex|dist|build|coverage)(/|$)", normalized)
+
+
 def _codex_changed_paths(repo: str, baseline_snapshot: List[str]) -> Tuple[List[str], List[str], List[str]]:
     changed_paths = summarize_git_changes(repo)
     delta = [p for p in changed_paths if p not in baseline_snapshot]
-    effective = delta if delta else changed_paths
+    effective = [p for p in (delta if delta else changed_paths) if _is_publishable_changed_path(p)]
     return changed_paths, delta, effective
 
 

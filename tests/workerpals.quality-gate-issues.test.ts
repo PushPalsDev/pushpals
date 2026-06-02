@@ -11,6 +11,7 @@ import {
   extractValidationFailureRetryDigest,
   isBrowserValidationInfrastructureDigest,
   knownFailureHintsForPacket,
+  publishableChangedPaths,
   qualityRevisionLoopUpperBound,
   recordBrowserFailureMemory,
   shouldReviseRequiredValidationBlocker,
@@ -19,6 +20,19 @@ import {
 } from "../apps/workerpals/src/execute_job";
 
 describe("workerpals quality gate critic issue formatting", () => {
+  test("filters dependency and runtime artifacts out of publishable changed paths", () => {
+    expect(
+      publishableChangedPaths([
+        "components/GameControlPanel.tsx",
+        "node_modules/react/index.js",
+        "outputs/data/runtime.log",
+        ".worktrees/job-123/tmp.txt",
+        ".codex/session.json",
+        "tests/playerActionControls.test.ts",
+      ]),
+    ).toEqual(["components/GameControlPanel.tsx", "tests/playerActionControls.test.ts"]);
+  });
+
   test("returns no issues when score is at/above threshold, regardless of must-fix entries", () => {
     const issues = buildCriticRevisionIssues(
       {
@@ -831,7 +845,7 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toBe(1);
   });
 
-  test("extends the retry budget for browser validation convergence", () => {
+  test("keeps browser validation convergence inside the configured validation retry budget", () => {
     const policy = {
       maxAutoRevisions: 1,
       validationMaxAutoRevisions: 3,
@@ -864,7 +878,7 @@ describe("workerpals quality gate critic issue formatting", () => {
           output: "Web end-to-end smoke test failed",
         },
       }),
-    ).toBe(8);
+    ).toBe(3);
   });
 
   test("keeps the outer revision loop at the configured limit for non-browser work", () => {
@@ -876,7 +890,7 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toBe(3);
   });
 
-  test("extends the outer revision loop only for browser validation convergence", () => {
+  test("does not extend the outer revision loop beyond validation retry budget for browser work", () => {
     expect(
       qualityRevisionLoopUpperBound(
         {
@@ -885,7 +899,7 @@ describe("workerpals quality gate critic issue formatting", () => {
         },
         { browserValidation: true },
       ),
-    ).toBe(8);
+    ).toBe(3);
   });
 
   test("downgrades assertion-balance failures when validation passed and critic score meets threshold", () => {

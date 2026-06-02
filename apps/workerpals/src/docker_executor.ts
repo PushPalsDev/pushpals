@@ -43,10 +43,10 @@ const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox
 const DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
 const DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60_000;
-const BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS = 8;
-const BROWSER_VALIDATION_JOB_OVERHEAD_MS = 15 * 60_000;
-const BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS = 4 * 60 * 60_000;
-const BROWSER_VALIDATION_JOB_MAX_TIMEOUT_MS = 8 * 60 * 60_000;
+const BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS = 3;
+const BROWSER_VALIDATION_JOB_OVERHEAD_MS = 5 * 60_000;
+const BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS = 20 * 60_000;
+const BROWSER_VALIDATION_JOB_MAX_TIMEOUT_MS = 45 * 60_000;
 
 function parseClampedInt(value: unknown, defaultValue: number, min: number, max: number): number {
   const parsed =
@@ -312,7 +312,7 @@ export function resolveDockerJobTimeoutMs(
     BROWSER_VALIDATION_JOB_MAX_TIMEOUT_MS,
     Math.max(BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS, estimatedTimeoutMs),
   );
-  return Math.max(baseTimeoutMs, boundedTimeoutMs);
+  return Math.max(Math.min(baseTimeoutMs, boundedTimeoutMs), BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS);
 }
 
 export class DockerExecutor {
@@ -1221,7 +1221,8 @@ export class DockerExecutor {
     });
     const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
     if (timeoutMs !== this.options.timeoutMs) {
-      const note = `[DockerExecutor] Extended job timeout for browser validation convergence: ${timeoutMs}ms (configured ${this.options.timeoutMs}ms).`;
+      const verb = timeoutMs > this.options.timeoutMs ? "Extended" : "Capped";
+      const note = `[DockerExecutor] ${verb} job timeout for browser validation convergence: ${timeoutMs}ms (configured ${this.options.timeoutMs}ms).`;
       console.log(note);
       onLog?.("stdout", note);
     }
@@ -1246,7 +1247,7 @@ export class DockerExecutor {
     const timer = setTimeout(() => {
       timedOutByDocker = true;
       const elapsedMs = Math.max(1, Date.now() - startedAtMs);
-      const timeoutMsg = `[DockerExecutor] Job timeout in warm container after ${elapsedMs}ms (limit ${this.options.timeoutMs}ms): ${this.warmContainerName}`;
+      const timeoutMsg = `[DockerExecutor] Job timeout in warm container after ${elapsedMs}ms (limit ${timeoutMs}ms): ${this.warmContainerName}`;
       console.log(timeoutMsg);
       onLog?.("stderr", timeoutMsg);
       try {
