@@ -515,7 +515,8 @@
             "stream": { "type": "string", "enum": ["stdout", "stderr"] },
             "seq": { "type": "integer", "minimum": 1 },
             "line": { "type": "string" },
-            "ts": { "type": "string" }
+            "ts": { "type": "string" },
+            "phase": { "type": ["string", "null"] }
           },
           "additionalProperties": false
         }

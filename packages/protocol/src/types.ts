@@ -125,6 +125,7 @@ export interface EventTypePayloadMap {
     seq: number;
     line: string;
     ts?: string;
+    phase?: string | null;
   };
 
   /** System heartbeat / status beacon */

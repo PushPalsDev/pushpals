@@ -5363,8 +5363,7 @@ export function formatSessionEventLine(
     return `[job ${jobId}] completed${summary ? `: ${summary}` : ""}`;
   }
   if (type === "error") {
-    const message = String(payload.message ?? "").trim();
-    return `[event error] ${message || "unknown"}`;
+    return null;
   }
   if (type === "status") {
     const state = String(payload.state ?? "").trim();

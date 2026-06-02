@@ -2931,6 +2931,33 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
   });
 
+  test("formatSessionEventLine suppresses raw server error events from interactive output", () => {
+    expect(
+      formatSessionEventLine({
+        id: "evt-validation-error",
+        type: "error",
+        from: "server:events",
+        ts: new Date().toISOString(),
+        payload: {
+          message: "Failed to validate event",
+          detail: "/payload must NOT have additional properties",
+        },
+      }),
+    ).toBeNull();
+
+    expect(
+      formatSessionEventLine({
+        id: "evt-user-error",
+        type: "error",
+        from: "server:events",
+        ts: new Date().toISOString(),
+        payload: {
+          message: "WorkerPal backend unavailable",
+        },
+      }),
+    ).toBeNull();
+  });
+
   test("createSessionEventReplayFilter suppresses replayed status events with the same event id", () => {
     const filter = createSessionEventReplayFilter();
     const event = {

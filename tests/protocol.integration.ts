@@ -596,6 +596,25 @@ test("Event type 'job_log' validates with per-line timestamp", () => {
   return validateEventEnvelope(event).ok === true;
 });
 
+test("Event type 'job_log' validates with current worker phase", () => {
+  const event: EventEnvelope<"job_log"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "job_log",
+    payload: {
+      jobId: randomUUID(),
+      stream: "stdout",
+      seq: 12,
+      line: "[ValidationGate] Running required checks",
+      ts: new Date().toISOString(),
+      phase: "full validation",
+    },
+  };
+  return validateEventEnvelope(event).ok === true;
+});
+
 test("Event type 'job_log' rejects missing seq", () => {
   const event = {
     protocolVersion: PROTOCOL_VERSION,
