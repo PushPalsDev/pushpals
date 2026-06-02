@@ -2,31 +2,33 @@
 
 ## Release Metadata
 
-- version: `v1.1.10`
-- start_commit: `53510e35fd5ef3f2f44f32a01762ee19fe6fd055`
-- end_commit: `8ac9b08a79894ff261edc423fabf56a36cdd40df`
-- commits_in_range: `4`
+- version: `v1.1.11`
+- start_commit: `8219622963c28654ea0f2070397a291e09e6ca96`
+- end_commit: `9a647c50ca35d59a35faf6b6aeb6e33f290c294c`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Stream richer WorkerPal job progress from the embedded CLI, including job enqueue/claim events, periodic log snippets, failure details, and completion summaries so slow jobs no longer look silent.
-- Pass structured WorkerPal planning guidance through the executor so Codex receives explicit acceptance criteria, discovery scope, validation expectations, and relevance-hint semantics before editing.
-- Persist browser-validation failure fingerprints per repo/job family and seed future retries with known issue/remedy context to reduce repeated failed revisions.
-- Include browser artifact summaries directly in retry prompts, including stage, selector, URL, and latest verified checkpoint details.
-- Add a lightweight worker phase contract covering discovery, editing, focused validation, full validation handoff, and final diff review.
-- Require browser assertion repairs to read diagnostic artifacts before editing, and warn workers when small repair tasks start churning too many unrelated files.
-- Package the WorkerPal sandbox runtime copy with the same planning, progress, and convergence guidance behavior for installed CLI users.
+- Reduce WorkerPal browser-validation convergence from the previous long-running multi-hour posture to a bounded human-scale repair window.
+- Cap browser-validation Docker job timeouts at 20-45 minutes and report whether the timeout was capped or extended.
+- Fail fast when review-fix or shell-wrapper runs leave no publishable code diff, instead of spending validation and critic time on empty or artifact-only patches.
+- Filter dependency/runtime artifacts such as `node_modules`, `outputs`, `.worktrees`, and `.codex` out of publishable changed-path detection.
+- Parallelize embedded runtime binary downloads with bounded concurrency while keeping tag marker writes, chmod, and cleanup sequential after successful downloads.
+- Add sparse startup readiness breadcrumbs so delayed runtime startup explains whether it is waiting for LocalBuddy or the RemoteBuddy session consumer.
+- Reduce CLI job-log noise while preserving meaningful WorkerPal phase, validation, quality, and publish progress.
 
 ## Validation
 
 - `bun run cli:bundle`
-- `bun test tests/workerpals.quality-gate-issues.test.ts`
+- `bun run test:root` completed successfully: 778 pass, 1 skip, 0 fail.
+- `git diff --check`
+- `bun test tests/cli.runtime-bootstrap.test.ts --filter ensureRuntimeBinaries`
+- `bun test tests/workerpals.docker-executor.test.ts --filter browser-validation`
+- `bun test tests/workerpals.quality-gate-issues.test.ts --filter "browser validation"`
+- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
 - `bun x tsc --noEmit --project apps/workerpals/tsconfig.json`
 - `bun x tsc --noEmit --project packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
-- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
 - `bun run lint` completed with 2 pre-existing client warnings.
-- `bun run test:root` completed successfully: 773 pass, 1 skip, 0 fail.
-- `git diff --check`
 
 ## Install
 
