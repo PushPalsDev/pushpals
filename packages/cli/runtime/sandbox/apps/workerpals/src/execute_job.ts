@@ -1145,6 +1145,21 @@ export function isLongRunningBrowserValidationCommand(command: string): boolean 
   );
 }
 
+export function isParallelSafeFastValidationCommand(repo: string, command: string): boolean {
+  if (isLongRunningBrowserValidationCommand(command)) return false;
+  if (shouldEnsurePlaywrightBrowserRuntime(repo, command)) return false;
+  const tokens = tokenizeValidationCommandArgv(command);
+  if (!tokens || tokens.length === 0) return false;
+  const lower = tokens.map((token) => token.toLowerCase());
+  if (lower[0] !== "bun") return false;
+  if (lower[1] === "test") return true;
+  if (lower[1] === "x" && lower[2] === "tsc") return true;
+  if (lower[1] === "run" && ["lint", "typecheck", "test", "test:unit"].includes(lower[2] ?? "")) {
+    return true;
+  }
+  return false;
+}
+
 function readPackageJson(repo: string): {
   scripts?: Record<string, unknown>;
   dependencies?: Record<string, unknown>;
@@ -3116,7 +3131,71 @@ async function runDeterministicQualityGate(
       );
     }
     const playwrightBrowserRuntimeReadyTargets = new Set<string>();
-    for (const command of commandsToRun) {
+    for (let commandIndex = 0; commandIndex < commandsToRun.length; ) {
+      const parallelBatch: string[] = [];
+      while (
+        commandIndex + parallelBatch.length < commandsToRun.length &&
+        parallelBatch.length < 3
+      ) {
+        const candidate = commandsToRun[commandIndex + parallelBatch.length];
+        if (!isParallelSafeFastValidationCommand(repo, candidate)) break;
+        parallelBatch.push(candidate);
+      }
+      if (parallelBatch.length > 1) {
+        onLog?.(
+          "stdout",
+          `[ValidationGate] Running fast validation batch in parallel: ${parallelBatch.join(" | ")}`,
+        );
+        const batchRuns = await Promise.all(
+          parallelBatch.map(async (command) => {
+            const commandMissingTools = requirementsForValidationCommand(
+              toolchainPlan,
+              command,
+            ).filter((requirement) =>
+              missingToolRequirements.some((missing) => missing.tool === requirement.tool),
+            );
+            if (commandMissingTools.length > 0) {
+              const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
+                commandMissingTools,
+              )}.`;
+              return {
+                run: {
+                  step: command,
+                  command,
+                  ok: false,
+                  exitCode: 127,
+                  stdout: "",
+                  stderr,
+                  elapsedMs: 1,
+                } satisfies ValidationExecutionResult,
+                stream: "stderr" as const,
+                summary: `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
+              };
+            }
+            const run = await runValidationCommand(
+              repo,
+              command,
+              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+              outputPolicy,
+            );
+            const digest = run.ok ? "" : extractValidationFailureDigest(run);
+            return {
+              run,
+              stream: (run.ok ? "stdout" : "stderr") as "stdout" | "stderr",
+              summary: `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`,
+            };
+          }),
+        );
+        for (const { run, stream, summary } of batchRuns) {
+          validationRuns.push(run);
+          onLog?.(stream, summary);
+        }
+        commandIndex += parallelBatch.length;
+        continue;
+      }
+
+      const command = commandsToRun[commandIndex];
+      commandIndex += 1;
       const commandMissingTools = requirementsForValidationCommand(toolchainPlan, command).filter(
         (requirement) =>
           missingToolRequirements.some((missing) => missing.tool === requirement.tool),
@@ -6665,6 +6744,7 @@ export async function executeJob(
   const previousValidationFailureDigests = new Map<string, string>();
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   while (revisionAttempt <= qualityRevisionLoopMax) {
+    const attemptStartedAt = Date.now();
     const attemptParams: Record<string, unknown> = { ...normalizedParams };
     if (revisionHint) {
       attemptParams.qualityRevisionHint = revisionHint;
@@ -6683,6 +6763,7 @@ export async function executeJob(
     }
     let result: Awaited<ReturnType<typeof runExecutor>> | null = null;
     let mergeConflictPass = 0;
+    let executorElapsedMs = 0;
     while (true) {
       const currentResult = await runExecutor(
         kind,
@@ -6751,6 +6832,7 @@ export async function executeJob(
         exitCode: 4,
       };
     }
+    executorElapsedMs = Date.now() - attemptStartedAt;
 
     const preQualityStatus = await git(repo, ["status", "--porcelain"]);
     const preQualityChangedPaths = preQualityStatus.ok
@@ -6799,6 +6881,7 @@ export async function executeJob(
       };
     }
 
+    const qualityStartedAt = Date.now();
     const quality = await runDeterministicQualityGate(
       repo,
       attemptParams,
@@ -6809,6 +6892,15 @@ export async function executeJob(
         previousFailureDigests: previousValidationFailureDigests,
         revisionAttempt,
       },
+    );
+    const qualityElapsedMs = Date.now() - qualityStartedAt;
+    const validationCommandElapsedMs = quality.validationRuns.reduce(
+      (total, run) => total + Math.max(0, Number(run.elapsedMs) || 0),
+      0,
+    );
+    onLog?.(
+      "stdout",
+      `[JobRunner] Performance summary: attempt=${revisionAttempt}, executor=${executorElapsedMs}ms, quality=${qualityElapsedMs}ms, validation_commands=${quality.validationRuns.length}, validation_command_time=${validationCommandElapsedMs}ms, changed_files=${quality.changedPaths.length}`,
     );
     let browserRepairPacket = buildBrowserValidationRepairPacket(
       quality.validationRuns,

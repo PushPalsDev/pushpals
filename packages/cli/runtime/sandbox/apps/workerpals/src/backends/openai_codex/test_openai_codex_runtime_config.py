@@ -30,6 +30,7 @@ from openai_codex_executor import (
     _build_wrapper_recovery_guidance,
     _run_codex_task,
     _resolve_reasoning_effort,
+    _resolve_task_reasoning_effort,
     _build_instruction,
     _collect_disallowed_shell_wrapper_rejections,
     _codex_changed_paths,
@@ -202,6 +203,24 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         )
         self.assertEqual(_resolve_reasoning_effort(cfg, model="gpt-6-preview"), "xhigh")
 
+    def test_task_reasoning_effort_routes_compact_shell_tasks_to_high(self) -> None:
+        prompt = (
+            "Task planning contract from PushPals:\n"
+            "- Planning summary: intent=code_change, risk=low, priority=normal\n"
+            "- Route-entry/shell task rule: inspect the hinted route wrapper, then patch the owner.\n"
+        )
+
+        self.assertEqual(_resolve_task_reasoning_effort("xhigh", prompt, "gpt-5.5"), "high")
+        self.assertEqual(_resolve_task_reasoning_effort("high", prompt, "gpt-5.5"), "high")
+        self.assertEqual(
+            _resolve_task_reasoning_effort(
+                "xhigh",
+                "Merge-conflict rebase task with risk=low wording in reviewer text.",
+                "gpt-5.5",
+            ),
+            "xhigh",
+        )
+
     def test_runtime_config_prefers_explicit_config_dir_override(self) -> None:
         import executor_base
 
@@ -343,6 +362,43 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             self.assertIn("Visual/rendering task rule", guidance)
             self.assertIn("prefer pure helper/state/style-prop tests", guidance)
             self.assertIn("full React Native/component render regression", guidance)
+
+    def test_parse_payload_adds_route_shell_convergence_guidance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-shell-guidance-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": "task.execute",
+                "repo": str(repo),
+                "params": {
+                    "instruction": (
+                        "Polish the first-entry shell. Start with app/_layout.tsx and "
+                        "app/index.tsx, then tighten the home/settings route-entry affordance."
+                    ),
+                    "schemaVersion": 2,
+                    "planning": {
+                        "intent": "code_change",
+                        "riskLevel": "low",
+                        "queuePriority": "normal",
+                        "queueWaitBudgetMs": 90_000,
+                        "executionBudgetMs": 1_200_000,
+                        "finalizationBudgetMs": 120_000,
+                        "scope": {"readAnywhere": True, "writeAllowed": True},
+                        "targetPaths": ["app/_layout.tsx", "app/index.tsx"],
+                        "acceptanceCriteria": ["Home shell feels coherent with the match UI"],
+                    },
+                },
+            }
+            encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+            task = parse_task_execute_payload(["executor", encoded], logger=Logger("[test]"))
+            guidance = "\n".join(task.supplemental_guidance)
+
+            self.assertIn("Route-entry/shell task rule", guidance)
+            self.assertIn("route is thin", guidance)
+            self.assertIn("Do not keep re-reading navigation topology", guidance)
+            self.assertIn("missing test infrastructure", guidance)
+            self.assertIn("make one small visual/affordance patch", guidance)
 
     def test_detects_codex_workaround_signals(self) -> None:
         signal = _detect_codex_workaround_signal(
@@ -609,6 +665,163 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("ValidationGate/CriticGate", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertNotIn("Recovered after Codex attempts", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_hands_changed_worktree_to_gates_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-timeout-changed-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# timeout changed repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed timeout changed repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_timeout_changed.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "sys.stdin.read()",
+                        "Path('src').mkdir(exist_ok=True)",
+                        "Path('src/timeout-patch.txt').write_text('changed before timeout\\n', encoding='utf-8')",
+                        "if last_message_path:",
+                        "    Path(last_message_path).write_text('Made a small patch before timeout.', encoding='utf-8')",
+                        "print('item.completed | Made a small patch before timeout.', flush=True)",
+                        "time.sleep(5)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-timeout-changed-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Create a small file, then continue thinking too long.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("timed out after modifying", str(result.get("summary") or ""))
+        self.assertIn("partial patch", str(result.get("stdout") or "").lower())
+        self.assertIn("src/", str(result.get("stdout") or ""))
+        self.assertIn("Made a small patch before timeout", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_retries_once_when_no_edit_watchdog_fires(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# no edit watchdog repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed no-edit watchdog repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_no_edit_watchdog.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'No-edit watchdog recovery' in prompt:",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/no-edit-retry.txt').write_text('patched on retry\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched immediately after no-edit recovery.', encoding='utf-8')",
+                        "    print('item.completed | Patched immediately after no-edit recovery.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "print('item.completed | Still inspecting route wrappers.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-no-edit-watchdog-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Polish the first-entry home shell with a compact visual patch.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched immediately after no-edit recovery", str(result.get("stdout") or ""))
+        self.assertIn("src/", str(result.get("stdout") or ""))
 
     def test_codex_changed_paths_filters_dependency_artifacts_from_publishable_delta(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-delta-") as temp_dir:

@@ -2,34 +2,30 @@
 
 ## Release Metadata
 
-- version: `v1.1.12`
-- start_commit: `0c824666d55d87b550b05a0423eda24c300a5078`
-- end_commit: `def7a3135098980e009eecc293b79d47ba4c8fc3`
+- version: `v1.1.13`
+- start_commit: `87b6f9da2788d5790304a2a7b455778336d30c39`
+- end_commit: `57a0a27d2eda9da45f3f4cdb43846075b2aed5f3`
 - commits_in_range: `2`
 
 ## Highlights
 
-- Stop raw server event validation errors from flooding the interactive CLI prompt; low-level server `error` events remain in logs instead of user chat output.
-- Accept WorkerPal `job_log.payload.phase` in the protocol schema so current worker phase events validate cleanly instead of being converted into repeated event errors.
-- Cap OpenAI Codex WorkerPal execution to the job planning budget instead of allowing the inner Codex process to outlive the Docker job timeout.
-- Reduce default background, review-fix, and merge-conflict execution budgets to a 20-minute target while preserving separate finalization and validation budgets.
-- Add timeout provenance to WorkerPal executor logs so traces show whether a timeout came from config or a planning-budget cap.
-- Add a hard-kill fallback after graceful WorkerPal backend timeout termination so stuck child processes do not wait for Docker to kill the whole job.
-- Preserve one concise executor budget line in the CLI while continuing to suppress repetitive Codex internals.
+- Salvage timed-out OpenAI Codex WorkerPal attempts when publishable file changes already exist, handing the patch to validation instead of failing only on SIGTERM.
+- Add a no-edit watchdog for long-running Codex attempts so compact jobs that spend too long in discovery get one patch-first recovery attempt.
+- Route compact low-risk and shell-polish tasks from `xhigh` to `high` reasoning effort for faster convergence without changing heavier task defaults.
+- Add route-entry and shell-polish guidance that steers workers toward behavior-owning files, small style/helper assertions, and away from broad React Native render harnesses.
+- Add discovery and test-harness detour guardrails so small visual tasks switch to narrower coverage when mock/import repair starts consuming the job budget.
+- Run safe fast Bun validation commands in bounded parallel batches while keeping browser/runtime validation sequential.
+- Emit a concise JobRunner performance summary covering executor, quality, validation command time, and changed-file count.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests/cli.runtime-bootstrap.test.ts --filter formatSessionEventLine`
-- `bun test tests/workerpals.generic-python-executor.test.ts`
-- `bun test tests/server.runtime-config-mutations.test.ts`
-- `bun test tests/workerpals.docker-executor.test.ts --filter timeout`
-- `bun x tsc --noEmit --project apps/workerpals/tsconfig.json`
-- `bun x tsc --noEmit --project packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
-- `bun x tsc --noEmit --project apps/server/tsconfig.json`
-- `bun x tsc --noEmit --project apps/source_control_manager/tsconfig.json`
+- `python apps\workerpals\src\backends\openai_codex\test_openai_codex_runtime_config.py`
+- `bun test tests\workerpals.validation-command-safety.test.ts`
+- `bun test tests\workerpals.quality-gate-issues.test.ts`
+- `bun test tests\cli.runtime-bootstrap.test.ts --filter "formatSessionEventLine"`
 
 ## Install
 
@@ -59,3 +55,4 @@ bun install -g @pushpalsdev/cli
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
 - User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --clear` or remove the local override to pick up new packaged defaults.
+- Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
