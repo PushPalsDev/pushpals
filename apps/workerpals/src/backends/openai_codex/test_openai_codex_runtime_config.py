@@ -30,6 +30,7 @@ from openai_codex_executor import (
     _build_wrapper_recovery_guidance,
     _run_codex_task,
     _resolve_reasoning_effort,
+    _resolve_task_reasoning_effort,
     _build_instruction,
     _collect_disallowed_shell_wrapper_rejections,
     _codex_changed_paths,
@@ -201,6 +202,24 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             ),
         )
         self.assertEqual(_resolve_reasoning_effort(cfg, model="gpt-6-preview"), "xhigh")
+
+    def test_task_reasoning_effort_routes_compact_shell_tasks_to_high(self) -> None:
+        prompt = (
+            "Task planning contract from PushPals:\n"
+            "- Planning summary: intent=code_change, risk=low, priority=normal\n"
+            "- Route-entry/shell task rule: inspect the hinted route wrapper, then patch the owner.\n"
+        )
+
+        self.assertEqual(_resolve_task_reasoning_effort("xhigh", prompt, "gpt-5.5"), "high")
+        self.assertEqual(_resolve_task_reasoning_effort("high", prompt, "gpt-5.5"), "high")
+        self.assertEqual(
+            _resolve_task_reasoning_effort(
+                "xhigh",
+                "Merge-conflict rebase task with risk=low wording in reviewer text.",
+                "gpt-5.5",
+            ),
+            "xhigh",
+        )
 
     def test_runtime_config_prefers_explicit_config_dir_override(self) -> None:
         import executor_base
@@ -723,6 +742,86 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("partial patch", str(result.get("stdout") or "").lower())
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertIn("Made a small patch before timeout", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_retries_once_when_no_edit_watchdog_fires(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# no edit watchdog repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed no-edit watchdog repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_no_edit_watchdog.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'No-edit watchdog recovery' in prompt:",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/no-edit-retry.txt').write_text('patched on retry\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched immediately after no-edit recovery.', encoding='utf-8')",
+                        "    print('item.completed | Patched immediately after no-edit recovery.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "print('item.completed | Still inspecting route wrappers.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-no-edit-watchdog-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Polish the first-entry home shell with a compact visual patch.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched immediately after no-edit recovery", str(result.get("stdout") or ""))
+        self.assertIn("src/", str(result.get("stdout") or ""))
 
     def test_codex_changed_paths_filters_dependency_artifacts_from_publishable_delta(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-delta-") as temp_dir:

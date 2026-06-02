@@ -103,6 +103,9 @@ _VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 _MAX_WRAPPER_RECOVERY_ATTEMPTS = 2
 _MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS = 1_200
 _MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS = 5_000
+_MAX_NO_EDIT_RECOVERY_ATTEMPTS = 1
+_DEFAULT_NO_EDIT_WATCHDOG_S = 480
+_SMALL_TASK_NO_EDIT_WATCHDOG_S = 360
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -559,10 +562,97 @@ def _resolve_reasoning_effort(config: OpenAICodexRuntimeConfig, model: str = DEF
     return default_effort
 
 
+def _looks_like_small_task_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    small_markers = (
+        "risk=low",
+        "small scoped",
+        "small or medium repo tasks",
+        "compact",
+        "low-risk",
+        "low risk",
+        "route-entry",
+        "first-entry",
+        "home shell",
+        "startup shell",
+        "shell polish",
+        "visual/affordance",
+    )
+    heavy_markers = (
+        "merge-conflict",
+        "merge conflict",
+        "rebase",
+        "broad refactor",
+        "migration",
+        "security",
+        "architecture",
+        "deep debug",
+    )
+    return any(marker in text for marker in small_markers) and not any(
+        marker in text for marker in heavy_markers
+    )
+
+
+def _resolve_task_reasoning_effort(
+    configured_effort: str,
+    prompt: str,
+    model: str = DEFAULT_CODEX_MODEL,
+) -> str:
+    effort = configured_effort if configured_effort in _VALID_REASONING_EFFORTS else "high"
+    if not _looks_like_small_task_prompt(prompt):
+        return effort
+    if effort == "xhigh":
+        log.info(
+            f"Routing compact task on model {model!r} from reasoning_effort='xhigh' to 'high' for faster convergence."
+        )
+        return "high"
+    return effort
+
+
 def _resolve_progress_log_interval_seconds(config: OpenAICodexRuntimeConfig) -> int:
     interval = to_int(config.progress_log_interval_s, 30)
     # Avoid noisy logs (<30s) and stale logs (>120s).
     return max(30, min(120, interval))
+
+
+def _resolve_no_edit_watchdog_seconds(
+    prompt: str,
+    communicate_timeout_s: Optional[int],
+) -> Optional[int]:
+    if not communicate_timeout_s:
+        return None
+
+    raw = os.environ.get("WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S", "").strip()
+    if raw:
+        if raw == "0":
+            return None
+        parsed = _to_positive_int(raw)
+        if parsed is None:
+            log.info(
+                f"Invalid WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S={raw!r}; using default no-edit watchdog."
+            )
+        else:
+            return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
+
+    if communicate_timeout_s < 600:
+        return None
+
+    default_s = _SMALL_TASK_NO_EDIT_WATCHDOG_S if _looks_like_small_task_prompt(prompt) else _DEFAULT_NO_EDIT_WATCHDOG_S
+    return max(120, min(default_s, max(120, communicate_timeout_s - 60)))
+
+
+def _build_no_edit_recovery_guidance(trace_excerpt: str) -> str:
+    lines = [
+        "No-edit watchdog recovery: the previous Codex attempt spent too much of the execution budget without producing publishable file changes.",
+        "Start from the already inspected context. Do not re-read broad repo topology, route wrappers, or missing test infrastructure unless that is the blocker.",
+        "Within the first response/action, edit the smallest behavior-owning file that satisfies the task. If the hinted file is a thin wrapper, patch the owner you already identified.",
+        "Use existing tests or a narrow helper/style assertion; do not create broad React Native mocks or a new full render harness for a compact shell/visual polish task.",
+        "Run at most one focused fast validation check before final diff review; let PushPals ValidationGate own long required/browser validation.",
+    ]
+    if trace_excerpt:
+        lines.append("Previous Codex event trace excerpt:")
+        lines.append(trace_excerpt)
+    return "\n".join(lines)
 
 
 def _normalize_auth_mode(raw: str) -> str:
@@ -1506,6 +1596,7 @@ def _run_codex_task(
     *,
     wrapper_recovery_attempt: int = 0,
     model_compatibility_recovery_attempt: int = 0,
+    no_edit_recovery_attempt: int = 0,
     model_override: Optional[str] = None,
     baseline_changes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
@@ -1567,10 +1658,14 @@ def _run_codex_task(
     )
     # JSON event output is noisy by default; prefer plain text + output-last-message.
     use_json = runtime_config.json_output
-    reasoning_effort = _resolve_reasoning_effort(runtime_config, model)
     communicate_timeout_s = _resolve_communicate_timeout_seconds(runtime_config)
     effective_supplemental_guidance = _augment_supplemental_guidance(supplemental_guidance)
     prompt = _build_instruction(instruction, effective_supplemental_guidance)
+    reasoning_effort = _resolve_task_reasoning_effort(
+        _resolve_reasoning_effort(runtime_config, model),
+        prompt,
+        model,
+    )
     baseline_snapshot = list(baseline_changes) if baseline_changes is not None else summarize_git_changes(repo)
 
     with tempfile.TemporaryDirectory(prefix="pushpals-codex-") as tmp_dir:
@@ -1793,7 +1888,18 @@ def _run_codex_task(
             )
             next_progress_at = started_at + float(progress_interval_s)
             timed_out = False
+            no_edit_watchdog_fired = False
             command_policy_rejection_loop = False
+            no_edit_watchdog_s = (
+                _resolve_no_edit_watchdog_seconds(prompt, communicate_timeout_s)
+                if no_edit_recovery_attempt < _MAX_NO_EDIT_RECOVERY_ATTEMPTS
+                else None
+            )
+            no_edit_deadline = (
+                started_at + float(no_edit_watchdog_s)
+                if no_edit_watchdog_s is not None
+                else None
+            )
 
             while proc.poll() is None:
                 now = time.monotonic()
@@ -1801,6 +1907,17 @@ def _run_codex_task(
                     timed_out = True
                     _terminate_active_child()
                     break
+
+                if no_edit_deadline is not None and now >= no_edit_deadline:
+                    _, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+                    if not effective_paths:
+                        no_edit_watchdog_fired = True
+                        log.info(
+                            f"No-edit watchdog fired after {int(no_edit_watchdog_s or 0)}s with no publishable file changes; retrying with patch-first guidance."
+                        )
+                        _terminate_active_child()
+                        break
+                    no_edit_deadline = None
 
                 with trace_lock:
                     wrapper_rejections = to_int(wrapper_rejection_state.get("count"), 0)
@@ -1868,6 +1985,34 @@ def _run_codex_task(
                     if any(entry.lower() == lowered for entry in rejected_shell_wrappers):
                         continue
                     rejected_shell_wrappers.append(text)
+
+        if no_edit_watchdog_fired:
+            if no_edit_recovery_attempt < _MAX_NO_EDIT_RECOVERY_ATTEMPTS:
+                retry_guidance = [
+                    *supplemental_guidance,
+                    _build_no_edit_recovery_guidance(trace_excerpt),
+                ]
+                return _run_codex_task(
+                    repo,
+                    instruction,
+                    retry_guidance,
+                    wrapper_recovery_attempt=wrapper_recovery_attempt,
+                    model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
+                    no_edit_recovery_attempt=no_edit_recovery_attempt + 1,
+                    model_override=model_override,
+                    baseline_changes=baseline_snapshot,
+                )
+            detail = "Codex spent too much of the execution budget without producing publishable file changes."
+            if trace_excerpt:
+                detail = f"{detail}\n{trace_excerpt}"
+            return {
+                "ok": False,
+                "summary": "openai_codex made no publishable changes before the no-edit watchdog",
+                "stdout": _truncate(stdout),
+                "stderr": _truncate(f"{detail}\n{stderr}".strip()),
+                "exitCode": 124,
+                "usage": usage,
+            }
 
         if timed_out:
             detail = (
@@ -2003,6 +2148,7 @@ def _run_codex_task(
                         ],
                         wrapper_recovery_attempt=wrapper_recovery_attempt + 1,
                         model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
+                        no_edit_recovery_attempt=no_edit_recovery_attempt,
                         model_override=model_override,
                         baseline_changes=baseline_snapshot,
                     )
@@ -2085,6 +2231,7 @@ def _run_codex_task(
                     effective_supplemental_guidance,
                     wrapper_recovery_attempt=wrapper_recovery_attempt,
                     model_compatibility_recovery_attempt=model_compatibility_recovery_attempt + 1,
+                    no_edit_recovery_attempt=no_edit_recovery_attempt,
                     model_override=LEGACY_CODEX_MODEL_FALLBACK,
                     baseline_changes=baseline_snapshot,
                 )

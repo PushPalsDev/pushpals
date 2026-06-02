@@ -18,6 +18,7 @@ import {
   isBrowserSmokeHarnessPath,
   isLikelyTestPath,
   isLongRunningBrowserValidationCommand,
+  isParallelSafeFastValidationCommand,
   isTestFocusedTask,
   isTestLikeValidationStep,
   playwrightBrowserInstallArgv,
@@ -595,6 +596,40 @@ describe("workerpals validation command safety", () => {
       expect(inferPlaywrightBrowserInstallTargets(root, "bun run web:e2e")).toEqual([
         "chromium",
       ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("classifies only fast non-browser Bun validation as parallel-safe", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-parallel-safe-"));
+    const scriptsDir = join(root, "scripts");
+    mkdirSync(scriptsDir, { recursive: true });
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify(
+        {
+          scripts: {
+            lint: "eslint .",
+            "web:e2e": "node scripts/test-web-e2e.js",
+          },
+          devDependencies: {
+            playwright: "^1.0.0",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    writeFileSync(join(scriptsDir, "test-web-e2e.js"), "require('playwright');\n");
+
+    try {
+      expect(isParallelSafeFastValidationCommand(root, "bun test")).toBe(true);
+      expect(isParallelSafeFastValidationCommand(root, "bun x tsc --noEmit")).toBe(true);
+      expect(isParallelSafeFastValidationCommand(root, "bun run lint")).toBe(true);
+      expect(isParallelSafeFastValidationCommand(root, "bun run web:e2e")).toBe(false);
+      expect(isParallelSafeFastValidationCommand(root, "bun test && bun run lint")).toBe(false);
+      expect(isParallelSafeFastValidationCommand(root, "git status --short")).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -822,9 +822,15 @@ def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
         "- Target useful completion in roughly 20 minutes for small or medium repo tasks; optimize for the smallest coherent patch over exhaustive exploration.",
         "- Phase soft budgets: discovery <= 3m for small scoped tasks and <= 5m otherwise, editing <= 10m, focused validation <= 5m, final diff review <= 2m. If a phase runs long, narrow scope rather than expanding the harness.",
         "- No-edit checkpoint: if you have not made a patch after identifying the behavior-owning file, stop discovering and edit that file now. Do not spend the execution budget proving every adjacent assumption first.",
-        "- Test-harness soft budget: if setting up a focused test requires multiple new shared mocks, broad React Native shims, or repeated import fixes, stop building that harness and switch to smaller pure helper/state coverage.",
+        "- Discovery command budget: for compact tasks, use at most 5-8 targeted read/search commands before editing. If that is not enough, state the blocker and patch the best behavior owner rather than widening discovery.",
     ]
-    if _looks_like_route_shell_task(params):
+    route_shell_task = _looks_like_route_shell_task(params)
+    visual_task = _looks_like_visual_derivation_task(params)
+    if route_shell_task or visual_task:
+        lines.append(
+            "- Test-harness soft budget: if setting up a focused test requires multiple new shared mocks, broad React Native shims, or repeated import fixes, stop building that harness and switch to smaller pure helper/state/style coverage.",
+        )
+    if route_shell_task:
         lines.extend(
             [
                 "- Route-entry/shell task rule: inspect the hinted route wrapper, then move immediately to the behavior-owning shell component when the route is thin. Do not keep re-reading navigation topology once the owner is found.",
@@ -832,7 +838,7 @@ def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
                 "- Shell task deadline: by the first clear owner hypothesis, choose the home/settings/shop/help/game-over surface and patch it; ValidationGate can run long browser checks after your focused validation.",
             ]
         )
-    if _looks_like_visual_derivation_task(params):
+    if visual_task:
         lines.extend(
             [
                 "- Visual/rendering task rule: prefer pure helper/state/style-prop tests for derived visual cues. Use a full React Native/component render regression only if the repo already has a stable harness for that exact surface.",
@@ -847,6 +853,7 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
     if not isinstance(planning, dict):
         return ""
 
+    compact_task = _looks_like_route_shell_task(params) or _looks_like_visual_derivation_task(params)
     lines: List[str] = ["Task planning contract from PushPals:"]
     intent = to_single_line(planning.get("intent"), 80)
     risk = to_single_line(planning.get("riskLevel"), 80)
@@ -894,17 +901,29 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
         forbidden = _string_list(scope.get("forbiddenGlobs"), limit=8)
         _append_list_guidance(lines, "Forbidden path hints", forbidden)
 
-    _append_list_guidance(lines, "Target path hints", _string_list(planning.get("targetPaths"), limit=12))
+    _append_list_guidance(
+        lines,
+        "Target path hints",
+        _string_list(planning.get("targetPaths"), limit=6 if compact_task else 12),
+    )
 
     discovery = planning.get("discovery")
     if isinstance(discovery, dict):
         _append_list_guidance(
             lines,
             "Suggested discovery commands",
-            _string_list(discovery.get("ripgrepQueries"), limit=8),
+            _string_list(discovery.get("ripgrepQueries"), limit=4 if compact_task else 8),
         )
-        _append_list_guidance(lines, "Likely directories", _string_list(discovery.get("likelyDirs"), limit=8))
-        _append_list_guidance(lines, "Search keywords", _string_list(discovery.get("keywords"), limit=12))
+        _append_list_guidance(
+            lines,
+            "Likely directories",
+            _string_list(discovery.get("likelyDirs"), limit=4 if compact_task else 8),
+        )
+        _append_list_guidance(
+            lines,
+            "Search keywords",
+            _string_list(discovery.get("keywords"), limit=8 if compact_task else 12),
+        )
 
     _append_list_guidance(
         lines,
