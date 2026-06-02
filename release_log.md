@@ -1,34 +1,35 @@
-# PushPals CLI Release Log
+﻿# PushPals CLI Release Log
 
 ## Release Metadata
 
-- version: `v1.1.11`
-- start_commit: `8219622963c28654ea0f2070397a291e09e6ca96`
-- end_commit: `9a647c50ca35d59a35faf6b6aeb6e33f290c294c`
+- version: `v1.1.12`
+- start_commit: `0c824666d55d87b550b05a0423eda24c300a5078`
+- end_commit: `def7a3135098980e009eecc293b79d47ba4c8fc3`
 - commits_in_range: `2`
 
 ## Highlights
 
-- Reduce WorkerPal browser-validation convergence from the previous long-running multi-hour posture to a bounded human-scale repair window.
-- Cap browser-validation Docker job timeouts at 20-45 minutes and report whether the timeout was capped or extended.
-- Fail fast when review-fix or shell-wrapper runs leave no publishable code diff, instead of spending validation and critic time on empty or artifact-only patches.
-- Filter dependency/runtime artifacts such as `node_modules`, `outputs`, `.worktrees`, and `.codex` out of publishable changed-path detection.
-- Parallelize embedded runtime binary downloads with bounded concurrency while keeping tag marker writes, chmod, and cleanup sequential after successful downloads.
-- Add sparse startup readiness breadcrumbs so delayed runtime startup explains whether it is waiting for LocalBuddy or the RemoteBuddy session consumer.
-- Reduce CLI job-log noise while preserving meaningful WorkerPal phase, validation, quality, and publish progress.
+- Stop raw server event validation errors from flooding the interactive CLI prompt; low-level server `error` events remain in logs instead of user chat output.
+- Accept WorkerPal `job_log.payload.phase` in the protocol schema so current worker phase events validate cleanly instead of being converted into repeated event errors.
+- Cap OpenAI Codex WorkerPal execution to the job planning budget instead of allowing the inner Codex process to outlive the Docker job timeout.
+- Reduce default background, review-fix, and merge-conflict execution budgets to a 20-minute target while preserving separate finalization and validation budgets.
+- Add timeout provenance to WorkerPal executor logs so traces show whether a timeout came from config or a planning-budget cap.
+- Add a hard-kill fallback after graceful WorkerPal backend timeout termination so stuck child processes do not wait for Docker to kill the whole job.
+- Preserve one concise executor budget line in the CLI while continuing to suppress repetitive Codex internals.
 
 ## Validation
 
 - `bun run cli:bundle`
-- `bun run test:root` completed successfully: 778 pass, 1 skip, 0 fail.
+- `bun run test:root`
 - `git diff --check`
-- `bun test tests/cli.runtime-bootstrap.test.ts --filter ensureRuntimeBinaries`
-- `bun test tests/workerpals.docker-executor.test.ts --filter browser-validation`
-- `bun test tests/workerpals.quality-gate-issues.test.ts --filter "browser validation"`
-- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
+- `bun test tests/cli.runtime-bootstrap.test.ts --filter formatSessionEventLine`
+- `bun test tests/workerpals.generic-python-executor.test.ts`
+- `bun test tests/server.runtime-config-mutations.test.ts`
+- `bun test tests/workerpals.docker-executor.test.ts --filter timeout`
 - `bun x tsc --noEmit --project apps/workerpals/tsconfig.json`
 - `bun x tsc --noEmit --project packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
-- `bun run lint` completed with 2 pre-existing client warnings.
+- `bun x tsc --noEmit --project apps/server/tsconfig.json`
+- `bun x tsc --noEmit --project apps/source_control_manager/tsconfig.json`
 
 ## Install
 
@@ -57,4 +58,4 @@ bun install -g @pushpalsdev/cli
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
-- Native WSL source-tree `cli:bundle` runs can still hang in the Expo monitor export path when building from a Windows-mounted checkout under `/mnt/c/...`; the published CLI package cold-start path is covered separately.
+- User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --clear` or remove the local override to pick up new packaged defaults.
