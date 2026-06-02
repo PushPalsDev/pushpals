@@ -2861,11 +2861,11 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           stream: "stdout",
           seq: 1,
           phase: "focused validation",
-          line: "[OpenAICodexExecutor] [codex] item.completed | The focused test is green; I’m running TypeScript next.",
+          line: "[ValidationGate] Passed (1000ms, exit 0): bun test",
         },
       }),
     ).toBe(
-      "[job 12345678 phase:focused validation] [codex] The focused test is green; I’m running TypeScript next.",
+      "[job 12345678 phase:focused validation] [ValidationGate] Passed (1000ms, exit 0): bun test",
     );
 
     expect(
@@ -2899,12 +2899,20 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     for (const line of [
       "[DockerExecutor] Linked worktree dependency artifact(s): node_modules",
+      "[DockerExecutor] Capped job timeout for browser validation convergence: 2700000ms (configured 7260000ms).",
+      "[JobRunner] Starting job 12345678-aaaa-bbbb-cccc-123456789abc (task.execute)",
+      "[QualityGate] Policy: max_auto_revisions=3, validation_max_auto_revisions=3, soft_pass_on_exhausted=true, critic_min_score=8",
+      "[QualityGate] Gates: scope=on, validation=on, critic=on, publish=on",
+      "[Openai_codexExecutor] Spawning openai_codex executor (timeout=1200000ms; workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms)",
       "[OpenAICodexExecutor] Codex auth mode: chatgpt (configured=auto)",
       "[OpenAICodexExecutor] Starting codex exec in /repo/.worktrees/job-123",
       "[OpenAICodexExecutor] [codex] thread.started",
       "[OpenAICodexExecutor] [codex] turn.started",
       "[OpenAICodexExecutor] [codex] item.started",
       "[OpenAICodexExecutor] [codex] item.completed",
+      "[OpenAICodexExecutor] [codex] item.completed | I will inspect the repo and make a focused patch.",
+      "[OpenAICodexExecutor] Timeout reached after 1200000ms; terminating process.",
+      "[OpenAICodexExecutor] [codex] No reasoning-like events observed in this run.",
       "[OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2, idle=27s)",
       "[OpenAICodexExecutor] [stderr] 2026-06-01 ERROR codex_core::tools::router: error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess",
       "___RESULT___ {\"ok\":true,\"stdout\":\"huge raw result\"}",
@@ -2916,18 +2924,6 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         }),
       ).toBeNull();
     }
-
-    expect(
-      formatSessionEventLine({
-        ...baseEvent,
-        payload: {
-          ...baseEvent.payload,
-          line: "[Openai_codexExecutor] Spawning openai_codex executor (timeout=1200000ms; workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms)",
-        },
-      }),
-    ).toBe(
-      "[job 12345678] [Openai_codexExecutor] Spawning openai_codex executor (timeout=1200000ms; workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms)",
-    );
 
     expect(
       formatSessionEventLine({

@@ -787,13 +787,51 @@ def _looks_like_visual_derivation_task(params: Dict[str, Any]) -> bool:
     return any(marker in text for marker in visual_markers)
 
 
+def _looks_like_route_shell_task(params: Dict[str, Any]) -> bool:
+    text = _joined_task_text(params)
+    shell_markers = (
+        "route-entry",
+        "route entry",
+        "first-entry",
+        "first entry",
+        "startup shell",
+        "home shell",
+        "entry route",
+        "shell/navigation",
+        "app/_layout",
+        "app/index",
+        "homescreen",
+        "home screen",
+        "settingsscreen",
+        "settings screen",
+        "shopscreen",
+        "shop screen",
+        "help",
+        "game-over",
+        "game over",
+        "match-start",
+        "match start",
+        "return affordance",
+    )
+    return any(marker in text for marker in shell_markers)
+
+
 def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
     lines: List[str] = [
         "Worker speed/convergence contract from PushPals:",
         "- Target useful completion in roughly 20 minutes for small or medium repo tasks; optimize for the smallest coherent patch over exhaustive exploration.",
-        "- Phase soft budgets: discovery <= 5m, editing <= 10m, focused validation <= 5m, final diff review <= 2m. If a phase runs long, narrow scope rather than expanding the harness.",
+        "- Phase soft budgets: discovery <= 3m for small scoped tasks and <= 5m otherwise, editing <= 10m, focused validation <= 5m, final diff review <= 2m. If a phase runs long, narrow scope rather than expanding the harness.",
+        "- No-edit checkpoint: if you have not made a patch after identifying the behavior-owning file, stop discovering and edit that file now. Do not spend the execution budget proving every adjacent assumption first.",
         "- Test-harness soft budget: if setting up a focused test requires multiple new shared mocks, broad React Native shims, or repeated import fixes, stop building that harness and switch to smaller pure helper/state coverage.",
     ]
+    if _looks_like_route_shell_task(params):
+        lines.extend(
+            [
+                "- Route-entry/shell task rule: inspect the hinted route wrapper, then move immediately to the behavior-owning shell component when the route is thin. Do not keep re-reading navigation topology once the owner is found.",
+                "- Compact shell polish rule: make one small visual/affordance patch before chasing missing test infrastructure. If a referenced React Native mock or app/__tests__ path is absent, use existing nearby tests or a focused style/helper assertion instead of creating a broad render harness.",
+                "- Shell task deadline: by the first clear owner hypothesis, choose the home/settings/shop/help/game-over surface and patch it; ValidationGate can run long browser checks after your focused validation.",
+            ]
+        )
     if _looks_like_visual_derivation_task(params):
         lines.extend(
             [

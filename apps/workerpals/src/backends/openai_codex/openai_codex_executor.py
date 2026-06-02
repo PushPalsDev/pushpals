@@ -1877,6 +1877,34 @@ def _run_codex_task(
             )
             if trace_excerpt:
                 detail = f"{detail}\n{trace_excerpt}"
+            _, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+            if effective_paths:
+                last_message = _read_text_if_exists(last_message_path)
+                log_git_status(repo, log)
+                prefix = (
+                    "Codex reached the execution timeout after producing publishable file "
+                    "changes. Returning the partial patch to QualityGate/ValidationGate "
+                    "instead of discarding it; any incomplete edit will be caught by the "
+                    "normal gates or revision loop."
+                )
+                return {
+                    "ok": True,
+                    "summary": (
+                        f"openai_codex timed out after modifying {len(effective_paths)} "
+                        "publishable file(s)"
+                    ),
+                    "stdout": _truncate(
+                        _build_success_stdout(
+                            effective_paths=effective_paths,
+                            last_message=last_message,
+                            trace_excerpt=trace_excerpt,
+                            prefix=prefix,
+                        )
+                    ),
+                    "stderr": _truncate(f"{detail}\n{stderr}".strip()),
+                    "exitCode": 0,
+                    "usage": usage,
+                }
             return {
                 "ok": False,
                 "summary": "openai_codex execution timed out",

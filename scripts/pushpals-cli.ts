@@ -5402,10 +5402,19 @@ function shouldSuppressCliSessionJobLogLine(line: string): boolean {
   if (!text) return true;
 
   if (/^(___RESULT___|__PUSHPALS_OH_RESULT__)\b/.test(text)) return true;
-  if (/^\[DockerExecutor\]\s+Linked worktree dependency artifact/i.test(text)) return true;
+  if (
+    /^\[DockerExecutor\]\s+(?:Linked worktree dependency artifact|Capped job timeout|Extended job timeout)/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  if (/^\[JobRunner\]\s+Starting job\b/i.test(text)) return true;
+  if (/^\[QualityGate\]\s+(?:Policy:|Gates:)/i.test(text)) return true;
+  if (/^\[Openai_codexExecutor\]\s+Spawning openai_codex executor/i.test(text)) return true;
 
   if (
-    /^\[OpenAICodexExecutor\]\s+(?:Planner guidance|Codex auth mode|ChatGPT auth mode|Starting codex exec|codex exec finished|Codex JSON stream captured|Codex stdout captured|No reasoning-like|Reasoning-like event|Usage observed|Temporarily masked repo-local)/i.test(
+    /^\[OpenAICodexExecutor\]\s+(?:Planner guidance|Codex auth mode|ChatGPT auth mode|Starting codex exec|codex exec finished|Codex JSON stream captured|Codex stdout captured|No reasoning-like|Reasoning-like event|Usage observed|Temporarily masked repo-local|Timeout reached after|Process did not exit after graceful timeout termination)/i.test(
       text,
     )
   ) {
@@ -5413,12 +5422,20 @@ function shouldSuppressCliSessionJobLogLine(line: string): boolean {
   }
 
   if (/^\[OpenAICodexExecutor\]\s+codex exec still running\b/i.test(text)) return true;
+  if (
+    /^\[OpenAICodexExecutor\]\s+\[codex\]\s+(?:No reasoning-like|Reasoning-like|turn\.failed|turn\.completed|error\s+\|)/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
   if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+(?:thread|turn)\.started\b/i.test(text)) {
     return true;
   }
   if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+item\.started\b/i.test(text)) return true;
-  if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+item\.completed\s*$/i.test(text)) return true;
-  if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+item\.updated\s*$/i.test(text)) return true;
+  if (/^\[OpenAICodexExecutor\]\s+\[codex\]\s+item\.(?:completed|updated)\b/i.test(text)) {
+    return true;
+  }
   if (
     /^\[OpenAICodexExecutor\]\s+\[stderr\].*codex_core::tools::router: error=exec_command failed/i.test(
       text,
