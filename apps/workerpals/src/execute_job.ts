@@ -191,6 +191,34 @@ export function qualityRevisionLoopUpperBound(policy: {
   );
 }
 
+export function qualityRevisionBudgetDecision(opts: {
+  jobElapsedMs: number;
+  executionBudgetMs: number;
+}): {
+  shouldStart: boolean;
+  remainingBudgetMs: number;
+  minimumRevisionBudgetMs: number;
+} {
+  const executionBudgetMs = Number(opts.executionBudgetMs);
+  if (!Number.isFinite(executionBudgetMs) || executionBudgetMs <= 0) {
+    return {
+      shouldStart: true,
+      remainingBudgetMs: Number.POSITIVE_INFINITY,
+      minimumRevisionBudgetMs: 0,
+    };
+  }
+  const elapsedMs = Math.max(0, Number(opts.jobElapsedMs) || 0);
+  const remainingBudgetMs = Math.max(0, Math.floor(executionBudgetMs - elapsedMs));
+  const minimumRevisionBudgetMs = Math.floor(
+    Math.min(executionBudgetMs, Math.max(180_000, Math.min(600_000, executionBudgetMs * 0.35))),
+  );
+  return {
+    shouldStart: remainingBudgetMs >= minimumRevisionBudgetMs,
+    remainingBudgetMs,
+    minimumRevisionBudgetMs,
+  };
+}
+
 function taskRequestsBrowserValidation(params: Record<string, unknown>): boolean {
   const candidates: string[] = [];
   const collect = (value: unknown) => {
@@ -382,6 +410,11 @@ function isNonPublishableArtifactPath(path: string): boolean {
   return /(^|\/)(outputs|node_modules|\.worktrees|\.codex|dist|build|coverage)(\/|$)/i.test(
     path.replace(/\\/g, "/"),
   );
+}
+
+function isNestedNodeModulesChange(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").replace(/^\.?\//, "").replace(/\/+$/, "");
+  return /(^|\/)node_modules\/.+/i.test(normalized);
 }
 
 export function publishableChangedPaths(changedPaths: string[]): string[] {
@@ -2901,7 +2934,7 @@ export function collectPrePublishHygieneIssues(params: {
     }
   }
 
-  if (changedPaths.some((path) => /(^|\/)node_modules(\/|$)/i.test(path))) {
+  if (changedPaths.some((path) => isNestedNodeModulesChange(path))) {
     issues.push("attempted to publish node_modules changes; dependency installs must not become PR content.");
   }
 
@@ -6741,6 +6774,7 @@ export async function executeJob(
 
   let revisionAttempt = 0;
   let revisionHint = "";
+  const jobStartedAt = Date.now();
   const previousValidationFailureDigests = new Map<string, string>();
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   while (revisionAttempt <= qualityRevisionLoopMax) {
@@ -7172,6 +7206,38 @@ export async function executeJob(
         stdout: result.stdout,
         stderr: truncate(
           [result.stderr ?? "", critic ? `Critic raw: ${critic.raw}` : ""]
+            .filter(Boolean)
+            .join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
+        ),
+        exitCode: 4,
+      };
+    }
+
+    const revisionBudget = qualityRevisionBudgetDecision({
+      jobElapsedMs: Date.now() - jobStartedAt,
+      executionBudgetMs,
+    });
+    if (!revisionBudget.shouldStart) {
+      const budgetSummary = `Quality gate needs revision ${
+        revisionAttempt + 1
+      }/${activeMaxAutoRevisions}, but remaining execution budget is ${
+        revisionBudget.remainingBudgetMs
+      }ms (< ${revisionBudget.minimumRevisionBudgetMs}ms); stopping before another worker turn to preserve a structured result: ${toSingleLine(
+        issueSummary,
+        220,
+      )}`;
+      onLog?.("stderr", `[QualityGate] ${budgetSummary}`);
+      return {
+        ok: false,
+        summary: budgetSummary,
+        stdout: result.stdout,
+        stderr: truncate(
+          [
+            result.stderr ?? "",
+            ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
+            critic ? `Critic raw: ${critic.raw}` : "",
+          ]
             .filter(Boolean)
             .join("\n"),
           outputPolicyForRuntime(runtimeConfig),

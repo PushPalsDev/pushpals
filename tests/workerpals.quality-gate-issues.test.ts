@@ -12,6 +12,7 @@ import {
   isBrowserValidationInfrastructureDigest,
   knownFailureHintsForPacket,
   publishableChangedPaths,
+  qualityRevisionBudgetDecision,
   qualityRevisionLoopUpperBound,
   recordBrowserFailureMemory,
   shouldReviseRequiredValidationBlocker,
@@ -31,6 +32,30 @@ describe("workerpals quality gate critic issue formatting", () => {
         "tests/playerActionControls.test.ts",
       ]),
     ).toEqual(["components/GameControlPanel.tsx", "tests/playerActionControls.test.ts"]);
+  });
+
+  test("stops quality revisions when the remaining execution budget is too small", () => {
+    expect(
+      qualityRevisionBudgetDecision({
+        jobElapsedMs: 600_000,
+        executionBudgetMs: 1_200_000,
+      }),
+    ).toEqual({
+      shouldStart: true,
+      remainingBudgetMs: 600_000,
+      minimumRevisionBudgetMs: 420_000,
+    });
+
+    expect(
+      qualityRevisionBudgetDecision({
+        jobElapsedMs: 1_000_000,
+        executionBudgetMs: 1_200_000,
+      }),
+    ).toEqual({
+      shouldStart: false,
+      remainingBudgetMs: 200_000,
+      minimumRevisionBudgetMs: 420_000,
+    });
   });
 
   test("returns no issues when score is at/above threshold, regardless of must-fix entries", () => {

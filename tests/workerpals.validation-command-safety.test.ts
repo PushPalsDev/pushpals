@@ -256,6 +256,50 @@ describe("workerpals validation command safety", () => {
     }
   });
 
+  test("does not treat the managed root node_modules dependency artifact as PR content", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-hygiene-"));
+    try {
+      const issues = collectPrePublishHygieneIssues({
+        repo: root,
+        changedPaths: ["node_modules", "app/index.tsx"],
+        instruction: "Improve home screen readability",
+        targetPath: "app/index.tsx",
+        planning: planningFixture({
+          targetPaths: ["app/index.tsx"],
+          scope: { readAnywhere: true, writeAllowed: true, writeGlobs: ["app/index.tsx"] },
+        }) as any,
+      });
+
+      expect(issues).not.toContain(
+        "attempted to publish node_modules changes; dependency installs must not become PR content.",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("still blocks nested node_modules file churn before publish", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-hygiene-"));
+    try {
+      const issues = collectPrePublishHygieneIssues({
+        repo: root,
+        changedPaths: ["node_modules/react/index.js", "app/index.tsx"],
+        instruction: "Improve home screen readability",
+        targetPath: "app/index.tsx",
+        planning: planningFixture({
+          targetPaths: ["app/index.tsx"],
+          scope: { readAnywhere: true, writeAllowed: true, writeGlobs: ["app/index.tsx"] },
+        }) as any,
+      });
+
+      expect(issues).toContain(
+        "attempted to publish node_modules changes; dependency installs must not become PR content.",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("extracts repo-native required validation commands from vision markdown", () => {
     const markdown = [
       "# Vision",
