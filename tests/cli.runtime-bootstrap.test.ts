@@ -74,6 +74,20 @@ import {
   shouldRestartService,
 } from "../scripts/start_runtime_services.ts";
 
+function withCliJobEventDebug<T>(fn: () => T): T {
+  const previous = process.env.PUSHPALS_CLI_SHOW_JOB_EVENTS;
+  process.env.PUSHPALS_CLI_SHOW_JOB_EVENTS = "1";
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.PUSHPALS_CLI_SHOW_JOB_EVENTS;
+    } else {
+      process.env.PUSHPALS_CLI_SHOW_JOB_EVENTS = previous;
+    }
+  }
+}
+
 function createMonitorAssetFixture(prefix: string) {
   const root = mkdtempSync(join(tmpdir(), prefix));
   const assetRoot = join(root, "monitor-ui");
@@ -2765,7 +2779,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
   });
 
-  test("formatSessionEventLine suppresses repetitive heartbeat status events", () => {
+  test("formatSessionEventLine suppresses status events from interactive output by default", () => {
     expect(
       formatSessionEventLine({
         id: "evt-heartbeat",
@@ -2790,7 +2804,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           detail: "LocalBuddy evaluating request",
         },
       }),
-    ).toBe("[status agent:localbuddy-1] busy - LocalBuddy evaluating request");
+    ).toBeNull();
   });
 
   test("formatSessionEventLine suppresses autonomy-origin worker chatter", () => {
@@ -2819,9 +2833,33 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         },
       }),
     ).toBeNull();
+
+    expect(
+      formatSessionEventLine({
+        id: "evt-startup-assistant",
+        type: "assistant_message",
+        from: "agent:remotebuddy-orchestrator",
+        ts: new Date().toISOString(),
+        payload: {
+          text: "All systems online, feel free to send messages!",
+        },
+      }),
+    ).toBeNull();
+
+    expect(
+      formatSessionEventLine({
+        id: "evt-user-assistant",
+        type: "assistant_message",
+        from: "agent:remotebuddy-orchestrator",
+        ts: new Date().toISOString(),
+        payload: {
+          text: "I found the failing test and patched it.",
+        },
+      }),
+    ).toBe("assistant> I found the failing test and patched it.");
   });
 
-  test("formatSessionEventLine surfaces job lifecycle and worker log events", () => {
+  test("formatSessionEventLine suppresses job lifecycle and worker log events by default", () => {
     expect(
       formatSessionEventLine({
         id: "evt-job-enqueued",
@@ -2835,7 +2873,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           origin: "autonomy",
         },
       }),
-    ).toBe("[job 12345678] queued: task.execute");
+    ).toBeNull();
 
     expect(
       formatSessionEventLine({
@@ -2848,7 +2886,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           workerId: "workerpal-1",
         },
       }),
-    ).toBe("[job 12345678] claimed by workerpal-1");
+    ).toBeNull();
 
     expect(
       formatSessionEventLine({
@@ -2864,9 +2902,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           line: "[ValidationGate] Passed (1000ms, exit 0): bun test",
         },
       }),
-    ).toBe(
-      "[job 12345678 phase:focused validation] [ValidationGate] Passed (1000ms, exit 0): bun test",
-    );
+    ).toBeNull();
 
     expect(
       formatSessionEventLine({
@@ -2881,10 +2917,75 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           line: "[ValidationGate] Failed (1000ms, exit 1): bun test",
         },
       }),
-    ).toBe("[job 12345678 stderr] [ValidationGate] Failed (1000ms, exit 1): bun test");
+    ).toBeNull();
   });
 
-  test("formatSessionEventLine suppresses noisy low-level WorkerPal job trace lines", () => {
+  test("formatSessionEventLine can surface job events when debug output is enabled", () => {
+    withCliJobEventDebug(() => {
+      expect(
+        formatSessionEventLine({
+          id: "evt-job-enqueued",
+          type: "job_enqueued",
+          from: "agent:remotebuddy-orchestrator/autonomy",
+          ts: new Date().toISOString(),
+          payload: {
+            jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+            taskId: "task-1",
+            kind: "task.execute",
+            origin: "autonomy",
+          },
+        }),
+      ).toBe("[job 12345678] queued: task.execute");
+
+      expect(
+        formatSessionEventLine({
+          id: "evt-job-claimed",
+          type: "job_claimed",
+          from: "worker:workerpal-1",
+          ts: new Date().toISOString(),
+          payload: {
+            jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+            workerId: "workerpal-1",
+          },
+        }),
+      ).toBe("[job 12345678] claimed by workerpal-1");
+
+      expect(
+        formatSessionEventLine({
+          id: "evt-job-log",
+          type: "job_log",
+          from: "worker:workerpal-1",
+          ts: new Date().toISOString(),
+          payload: {
+            jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+            stream: "stdout",
+            seq: 1,
+            phase: "focused validation",
+            line: "[ValidationGate] Passed (1000ms, exit 0): bun test",
+          },
+        }),
+      ).toBe(
+        "[job 12345678 phase:focused validation] [ValidationGate] Passed (1000ms, exit 0): bun test",
+      );
+
+      expect(
+        formatSessionEventLine({
+          id: "evt-job-stderr",
+          type: "job_log",
+          from: "worker:workerpal-1",
+          ts: new Date().toISOString(),
+          payload: {
+            jobId: "12345678-aaaa-bbbb-cccc-123456789abc",
+            stream: "stderr",
+            seq: 1,
+            line: "[ValidationGate] Failed (1000ms, exit 1): bun test",
+          },
+        }),
+      ).toBe("[job 12345678 stderr] [ValidationGate] Failed (1000ms, exit 1): bun test");
+    });
+  });
+
+  test("formatSessionEventLine suppresses noisy low-level WorkerPal job trace lines in debug output", () => {
     const baseEvent = {
       id: "evt-job-log",
       type: "job_log",
@@ -2897,48 +2998,50 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       },
     };
 
-    for (const line of [
-      "[DockerExecutor] Linked worktree dependency artifact(s): node_modules",
-      "[DockerExecutor] Capped job timeout for browser validation convergence: 2700000ms (configured 7260000ms).",
-      "[JobRunner] Starting job 12345678-aaaa-bbbb-cccc-123456789abc (task.execute)",
-      "[QualityGate] Policy: max_auto_revisions=3, validation_max_auto_revisions=3, soft_pass_on_exhausted=true, critic_min_score=8",
-      "[QualityGate] Gates: scope=on, validation=on, critic=on, publish=on",
-      "[Openai_codexExecutor] Spawning openai_codex executor (timeout=1200000ms; workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms)",
-      "[Openai_codexExecutor] Timeout reached after 1200000ms; terminating process.",
-      "[Openai_codexExecutor] Process did not exit after graceful timeout termination; forcing kill.",
-      "[Openai_codexExecutor] Still running (30s elapsed); waiting for executor output...",
-      "[OpenAICodexExecutor] Codex auth mode: chatgpt (configured=auto)",
-      "[OpenAICodexExecutor] Starting codex exec in /repo/.worktrees/job-123",
-      "[OpenAICodexExecutor] [codex] thread.started",
-      "[OpenAICodexExecutor] [codex] turn.started",
-      "[OpenAICodexExecutor] [codex] item.started",
-      "[OpenAICodexExecutor] [codex] item.completed",
-      "[OpenAICodexExecutor] [codex] item.completed | I will inspect the repo and make a focused patch.",
-      "[OpenAICodexExecutor] Timeout reached after 1200000ms; terminating process.",
-      "[OpenAICodexExecutor] [codex] No reasoning-like events observed in this run.",
-      "[OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2, idle=27s)",
-      "[OpenAICodexExecutor] [stderr] 2026-06-01 ERROR codex_core::tools::router: error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess",
-      "___RESULT___ {\"ok\":true,\"stdout\":\"huge raw result\"}",
-    ]) {
+    withCliJobEventDebug(() => {
+      for (const line of [
+        "[DockerExecutor] Linked worktree dependency artifact(s): node_modules",
+        "[DockerExecutor] Capped job timeout for browser validation convergence: 2700000ms (configured 7260000ms).",
+        "[JobRunner] Starting job 12345678-aaaa-bbbb-cccc-123456789abc (task.execute)",
+        "[QualityGate] Policy: max_auto_revisions=3, validation_max_auto_revisions=3, soft_pass_on_exhausted=true, critic_min_score=8",
+        "[QualityGate] Gates: scope=on, validation=on, critic=on, publish=on",
+        "[Openai_codexExecutor] Spawning openai_codex executor (timeout=1200000ms; workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms)",
+        "[Openai_codexExecutor] Timeout reached after 1200000ms; terminating process.",
+        "[Openai_codexExecutor] Process did not exit after graceful timeout termination; forcing kill.",
+        "[Openai_codexExecutor] Still running (30s elapsed); waiting for executor output...",
+        "[OpenAICodexExecutor] Codex auth mode: chatgpt (configured=auto)",
+        "[OpenAICodexExecutor] Starting codex exec in /repo/.worktrees/job-123",
+        "[OpenAICodexExecutor] [codex] thread.started",
+        "[OpenAICodexExecutor] [codex] turn.started",
+        "[OpenAICodexExecutor] [codex] item.started",
+        "[OpenAICodexExecutor] [codex] item.completed",
+        "[OpenAICodexExecutor] [codex] item.completed | I will inspect the repo and make a focused patch.",
+        "[OpenAICodexExecutor] Timeout reached after 1200000ms; terminating process.",
+        "[OpenAICodexExecutor] [codex] No reasoning-like events observed in this run.",
+        "[OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2, idle=27s)",
+        "[OpenAICodexExecutor] [stderr] 2026-06-01 ERROR codex_core::tools::router: error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess",
+        "___RESULT___ {\"ok\":true,\"stdout\":\"huge raw result\"}",
+      ]) {
+        expect(
+          formatSessionEventLine({
+            ...baseEvent,
+            payload: { ...baseEvent.payload, line },
+          }),
+        ).toBeNull();
+      }
+
       expect(
         formatSessionEventLine({
           ...baseEvent,
-          payload: { ...baseEvent.payload, line },
+          payload: {
+            ...baseEvent.payload,
+            line: "[QualityGate] Quality gate requested revision 2/8: ValidationGate browser assertion repair",
+          },
         }),
-      ).toBeNull();
-    }
-
-    expect(
-      formatSessionEventLine({
-        ...baseEvent,
-        payload: {
-          ...baseEvent.payload,
-          line: "[QualityGate] Quality gate requested revision 2/8: ValidationGate browser assertion repair",
-        },
-      }),
-    ).toBe(
-      "[job 12345678] [QualityGate] Quality gate requested revision 2/8: ValidationGate browser assertion repair",
-    );
+      ).toBe(
+        "[job 12345678] [QualityGate] Quality gate requested revision 2/8: ValidationGate browser assertion repair",
+      );
+    });
   });
 
   test("formatSessionEventLine suppresses raw server error events from interactive output", () => {

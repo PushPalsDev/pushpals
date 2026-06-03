@@ -204,6 +204,50 @@ function formatGenericPythonExecutorTimeoutDetail(
   return `${configPath}=${configuredTimeoutMs}ms within planning executionBudgetMs=${executionBudgetMs}ms`;
 }
 
+export function normalizeGenericPythonExecutorParsedResultForTimeout(params: {
+  backendName: string;
+  kind: string;
+  timedOut: boolean;
+  timeoutMs: number;
+  timeoutDetail?: string;
+  summary: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}): { summary: string; stdout: string; stderr: string; exitCode: number } {
+  const signalTerminatedCodex =
+    params.timedOut &&
+    params.backendName === "openai_codex" &&
+    /\bopenai_codex interrupted by signal 15\b/i.test(params.summary);
+  if (!signalTerminatedCodex) {
+    return {
+      summary: params.summary,
+      stdout: params.stdout,
+      stderr: params.stderr,
+      exitCode: params.exitCode,
+    };
+  }
+
+  const timeoutDetail = String(params.timeoutDetail ?? "").trim();
+  const cleanedStderr = String(params.stderr ?? "")
+    .replace(/\bopenai_codex interrupted by signal 15\b/gi, "OpenAI Codex exceeded the execution budget")
+    .trim();
+  const stderr = [
+    `OpenAI Codex exceeded the PushPals execution budget before returning a completed result.`,
+    timeoutDetail ? `Timeout detail: ${timeoutDetail}.` : "",
+    cleanedStderr ? `Last stderr:\n${cleanedStderr}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return {
+    summary: `${params.backendName} execution budget expired after ${params.timeoutMs}ms for ${params.kind}`,
+    stdout: params.stdout,
+    stderr,
+    exitCode: 124,
+  };
+}
+
 export function createGenericPythonExecutor(
   config: GenericPythonExecutorConfig,
 ): BackendTaskExecutor {
@@ -390,16 +434,27 @@ export function createGenericPythonExecutor(
         parsed.usage,
         estimateJobTokenUsage(backendName, modelId, params, summary, parsedStdout, parsedStderr),
       );
-
-      return {
-        ok: typeof parsed.ok === "boolean" ? parsed.ok : exitCode === 0,
+      const normalized = normalizeGenericPythonExecutorParsedResultForTimeout({
+        backendName,
+        kind,
+        timedOut,
+        timeoutMs,
+        timeoutDetail,
         summary,
-        stdout: truncate(parsedStdout, outputPolicy),
-        stderr: truncate(parsedStderr, outputPolicy),
+        stdout: parsedStdout,
+        stderr: parsedStderr,
         exitCode:
           typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
             ? parsed.exitCode
             : exitCode,
+      });
+
+      return {
+        ok: typeof parsed.ok === "boolean" ? parsed.ok : exitCode === 0,
+        summary: normalized.summary,
+        stdout: truncate(normalized.stdout, outputPolicy),
+        stderr: truncate(normalized.stderr, outputPolicy),
+        exitCode: normalized.exitCode,
         usage,
       };
     } catch (err) {

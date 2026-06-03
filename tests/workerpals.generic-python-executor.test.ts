@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "fs";
 import {
+  normalizeGenericPythonExecutorParsedResultForTimeout,
   resolveGenericPythonExecutorChildTimeoutEnv,
   resolveGenericPythonExecutorChildTimeoutMs,
   resolveGenericPythonExecutorTimeoutMs,
@@ -81,5 +82,54 @@ describe("generic python executor timeout resolution", () => {
         hostTimeoutMs: 1_200_000,
       }),
     ).toEqual({});
+  });
+
+  test("normalizes host timeout SIGTERM from OpenAI Codex into a budget-expired result", () => {
+    const result = normalizeGenericPythonExecutorParsedResultForTimeout({
+      backendName: "openai_codex",
+      kind: "task.execute",
+      timedOut: true,
+      timeoutMs: 1_320_000,
+      timeoutDetail:
+        "workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms + finalizationBudgetMs=120000ms",
+      summary: "openai_codex interrupted by signal 15",
+      stdout: "partial stdout",
+      stderr: "openai_codex interrupted by signal 15",
+      exitCode: 143,
+    });
+
+    expect(result).toEqual({
+      summary: "openai_codex execution budget expired after 1320000ms for task.execute",
+      stdout: "partial stdout",
+      stderr: [
+        "OpenAI Codex exceeded the PushPals execution budget before returning a completed result.",
+        "Timeout detail: workerpals.openai_codex_timeout_ms=7200000ms capped by planning executionBudgetMs=1200000ms + finalizationBudgetMs=120000ms.",
+        "Last stderr:",
+        "OpenAI Codex exceeded the execution budget",
+      ].join("\n"),
+      exitCode: 124,
+    });
+    expect(result.summary).not.toContain("signal 15");
+    expect(result.stderr).not.toContain("signal 15");
+  });
+
+  test("does not rewrite non-timeout Codex interruptions", () => {
+    expect(
+      normalizeGenericPythonExecutorParsedResultForTimeout({
+        backendName: "openai_codex",
+        kind: "task.execute",
+        timedOut: false,
+        timeoutMs: 1_320_000,
+        summary: "openai_codex interrupted by signal 15",
+        stdout: "",
+        stderr: "",
+        exitCode: 143,
+      }),
+    ).toEqual({
+      summary: "openai_codex interrupted by signal 15",
+      stdout: "",
+      stderr: "",
+      exitCode: 143,
+    });
   });
 });

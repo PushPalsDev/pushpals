@@ -275,6 +275,7 @@ const EMBEDDED_SERVICE_RESTART_BASE_BACKOFF_MS = 2_000;
 const EMBEDDED_SERVICE_RESTART_MAX_BACKOFF_MS = 30_000;
 const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS = 15_000;
 const CLI_SESSION_JOB_LOG_MAX_CHARS = 700;
+const CLI_SESSION_SHOW_JOB_EVENTS_ENV = "PUSHPALS_CLI_SHOW_JOB_EVENTS";
 const EMBEDDED_RUNTIME_SAFETY_CAP_DISABLE_ENV = "PUSHPALS_DISABLE_EMBEDDED_SAFETY_CAPS";
 const EMBEDDED_RUNTIME_WINDOWS_SAFETY_CAPS: Readonly<Record<string, string>> = {
   REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS: "120000",
@@ -301,6 +302,16 @@ export function formatTimestampedCliLine(line: string, at = new Date()): string 
     return text;
   }
   return `[${at.toISOString()}]${text}`;
+}
+
+function isTruthyCliEnvValue(value: unknown): boolean {
+  return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
+}
+
+export function shouldShowCliSessionOperationalEvents(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return isTruthyCliEnvValue(env[CLI_SESSION_SHOW_JOB_EVENTS_ENV]);
 }
 
 export function formatRuntimeStartupTimingSummary(input: {
@@ -5308,8 +5319,10 @@ export function formatSessionEventLine(
   const type = String(event.type ?? "").toLowerCase();
   const from = String(event.from ?? "");
   const payload = event.payload ?? {};
+  const showOperationalEvents = shouldShowCliSessionOperationalEvents();
 
   if (type === "job_enqueued") {
+    if (!showOperationalEvents) return null;
     const jobId = String(payload.jobId ?? "").slice(0, 8);
     const kind = String(payload.kind ?? "").trim();
     const taskId = String(payload.taskId ?? "").slice(0, 8);
@@ -5317,11 +5330,13 @@ export function formatSessionEventLine(
     return `[job ${jobId}] queued: ${detail}`;
   }
   if (type === "job_claimed") {
+    if (!showOperationalEvents) return null;
     const jobId = String(payload.jobId ?? "").slice(0, 8);
     const workerId = String(payload.workerId ?? "").trim();
     return `[job ${jobId}] claimed${workerId ? ` by ${workerId}` : ""}`;
   }
   if (type === "job_log") {
+    if (!showOperationalEvents) return null;
     const jobId = String(payload.jobId ?? "").slice(0, 8);
     const stream = String(payload.stream ?? "").toLowerCase() === "stderr" ? " stderr" : "";
     const phase = compactCliSessionJobLogLine(String(payload.phase ?? "").trim());
@@ -5330,6 +5345,7 @@ export function formatSessionEventLine(
     return line ? `[job ${jobId}${stream}${phaseLabel}] ${line}` : null;
   }
   if (type === "job_failed") {
+    if (!showOperationalEvents) return null;
     const jobId = String(payload.jobId ?? "").slice(0, 8);
     const message = String(payload.message ?? "").trim();
     return `[job ${jobId}] failed: ${message || "unknown"}`;
@@ -5340,24 +5356,29 @@ export function formatSessionEventLine(
   if (type === "assistant_message") {
     const text = String(payload.text ?? "").trim();
     if (!text) return null;
+    if (/^All systems online\b/i.test(text)) return null;
     return `assistant> ${text}`;
   }
   if (type === "task_progress") {
+    if (!showOperationalEvents) return null;
     const taskId = String(payload.taskId ?? "").slice(0, 8);
     const message = String(payload.message ?? "").trim();
     return message ? `[task ${taskId}] ${message}` : null;
   }
   if (type === "task_failed") {
+    if (!showOperationalEvents) return null;
     const taskId = String(payload.taskId ?? "").slice(0, 8);
     const message = String(payload.message ?? "").trim();
     return `[task ${taskId}] failed: ${message || "unknown"}`;
   }
   if (type === "task_completed") {
+    if (!showOperationalEvents) return null;
     const taskId = String(payload.taskId ?? "").slice(0, 8);
     const summary = String(payload.summary ?? "").trim();
     return `[task ${taskId}] completed${summary ? `: ${summary}` : ""}`;
   }
   if (type === "job_completed") {
+    if (!showOperationalEvents) return null;
     const jobId = String(payload.jobId ?? "").slice(0, 8);
     const summary = String(payload.summary ?? "").trim();
     return `[job ${jobId}] completed${summary ? `: ${summary}` : ""}`;
@@ -5366,6 +5387,7 @@ export function formatSessionEventLine(
     return null;
   }
   if (type === "status") {
+    if (!showOperationalEvents) return null;
     const state = String(payload.state ?? "").trim();
     const detail = String(payload.detail ?? "").trim();
     const source = from || String(payload.agentId ?? "status");
