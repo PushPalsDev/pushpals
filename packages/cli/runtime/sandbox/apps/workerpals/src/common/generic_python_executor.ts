@@ -28,6 +28,8 @@ interface GenericPythonExecutorConfig {
   capTimeoutToExecutionBudget?: boolean;
 }
 
+const BACKEND_TIMEOUT_RESULT_GRACE_MS = 30_000;
+
 function estimateTokensFromText(text: string): number {
   return Math.max(0, Math.ceil(String(text ?? "").length / 3));
 }
@@ -123,6 +125,7 @@ function resolveRuntimeSettings(
 export function resolveGenericPythonExecutorTimeoutMs(params: {
   configuredTimeoutMs: number;
   executionBudgetMs?: number | null;
+  finalizationBudgetMs?: number | null;
   capTimeoutToExecutionBudget?: boolean;
 }): number {
   const configuredTimeoutMs = Math.max(10_000, Math.floor(params.configuredTimeoutMs));
@@ -130,10 +133,47 @@ export function resolveGenericPythonExecutorTimeoutMs(params: {
     typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs)
       ? Math.max(10_000, Math.floor(params.executionBudgetMs))
       : null;
+  const finalizationBudgetMs =
+    typeof params.finalizationBudgetMs === "number" && Number.isFinite(params.finalizationBudgetMs)
+      ? Math.max(0, Math.floor(params.finalizationBudgetMs))
+      : 0;
   if (executionBudgetMs != null && params.capTimeoutToExecutionBudget !== false) {
-    return Math.min(configuredTimeoutMs, executionBudgetMs);
+    return Math.min(configuredTimeoutMs, executionBudgetMs + finalizationBudgetMs);
   }
   return configuredTimeoutMs;
+}
+
+export function resolveGenericPythonExecutorChildTimeoutMs(params: {
+  backendName: string;
+  hostTimeoutMs: number;
+  executionBudgetMs?: number | null;
+}): number | null {
+  const hostTimeoutMs = Math.max(10_000, Math.floor(params.hostTimeoutMs));
+  if (params.backendName !== "openai_codex") return null;
+  const executionBudgetMs =
+    typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs)
+      ? Math.max(10_000, Math.floor(params.executionBudgetMs))
+      : null;
+  const childBudgetMs =
+    executionBudgetMs == null ? hostTimeoutMs : Math.min(hostTimeoutMs, executionBudgetMs);
+  const graceMs = Math.min(
+    BACKEND_TIMEOUT_RESULT_GRACE_MS,
+    Math.max(2_000, Math.floor(childBudgetMs / 10)),
+  );
+  return Math.max(1_000, childBudgetMs - graceMs);
+}
+
+export function resolveGenericPythonExecutorChildTimeoutEnv(params: {
+  backendName: string;
+  hostTimeoutMs: number;
+  executionBudgetMs?: number | null;
+}): Record<string, string> {
+  const childTimeoutMs = resolveGenericPythonExecutorChildTimeoutMs(params);
+  if (childTimeoutMs == null) return {};
+  return {
+    WORKERPALS_OPENAI_CODEX_TIMEOUT_MS: String(childTimeoutMs),
+    WORKERPALS_OPENAI_CODEX_TIMEOUT_S: String(Math.max(1, Math.floor(childTimeoutMs / 1000))),
+  };
 }
 
 function toSnakeConfigKey(key: string): string {
@@ -144,6 +184,7 @@ function formatGenericPythonExecutorTimeoutDetail(
   config: GenericPythonExecutorConfig,
   configuredTimeoutMs: number,
   executionBudgetMs: number | null,
+  finalizationBudgetMs: number | null,
   timeoutMs: number,
 ): string {
   const configPath = `workerpals.${toSnakeConfigKey(config.timeoutConfigKey)}`;
@@ -154,7 +195,11 @@ function formatGenericPythonExecutorTimeoutDetail(
     return `${configPath}=${configuredTimeoutMs}ms; planning executionBudgetMs=${executionBudgetMs}ms ignored by backend opt-out`;
   }
   if (timeoutMs < configuredTimeoutMs) {
-    return `${configPath}=${configuredTimeoutMs}ms capped by planning executionBudgetMs=${executionBudgetMs}ms`;
+    const finalizationDetail =
+      finalizationBudgetMs && finalizationBudgetMs > 0
+        ? ` + finalizationBudgetMs=${finalizationBudgetMs}ms`
+        : "";
+    return `${configPath}=${configuredTimeoutMs}ms capped by planning executionBudgetMs=${executionBudgetMs}ms${finalizationDetail}`;
   }
   return `${configPath}=${configuredTimeoutMs}ms within planning executionBudgetMs=${executionBudgetMs}ms`;
 }
@@ -190,15 +235,21 @@ export function createGenericPythonExecutor(
       typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
         ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
         : null;
+    const finalizationBudgetMs =
+      typeof budgets?.finalizationBudgetMs === "number" && Number.isFinite(budgets.finalizationBudgetMs)
+        ? Math.max(0, Math.floor(budgets.finalizationBudgetMs))
+        : null;
     const timeoutMs = resolveGenericPythonExecutorTimeoutMs({
       configuredTimeoutMs,
       executionBudgetMs,
+      finalizationBudgetMs,
       capTimeoutToExecutionBudget: config.capTimeoutToExecutionBudget,
     });
     const timeoutDetail = formatGenericPythonExecutorTimeoutDetail(
       config,
       configuredTimeoutMs,
       executionBudgetMs,
+      finalizationBudgetMs,
       timeoutMs,
     );
     const payloadBase64 = Buffer.from(
@@ -210,6 +261,11 @@ export function createGenericPythonExecutor(
       "utf-8",
     ).toString("base64");
     const args = [pythonBin, scriptPath, payloadBase64];
+    const childTimeoutEnv = resolveGenericPythonExecutorChildTimeoutEnv({
+      backendName,
+      hostTimeoutMs: timeoutMs,
+      executionBudgetMs,
+    });
 
     onLog?.(
       "stdout",
@@ -229,6 +285,7 @@ export function createGenericPythonExecutor(
         stderr: "pipe",
         env: {
           ...buildWorkerSandboxWritableEnv(repo),
+          ...childTimeoutEnv,
           PUSHPALS_REPO_PATH: repo,
           PUSHPALS_ASSIGNED_REPO_ROOT: repo,
           PYTHONIOENCODING: "utf-8",

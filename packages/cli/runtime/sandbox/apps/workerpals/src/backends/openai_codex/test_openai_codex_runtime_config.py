@@ -823,6 +823,69 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Patched immediately after no-edit recovery", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
 
+    def test_run_codex_task_recovery_attempt_is_still_guarded_by_no_edit_watchdog(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-fail-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# no edit watchdog failure repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed no-edit watchdog failure repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_no_edit_watchdog_fail.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "import time",
+                        "",
+                        "sys.stdin.read()",
+                        "print('item.completed | Still inspecting, no patch yet.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-no-edit-watchdog-fail-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Polish the first-entry home shell with a compact visual patch.",
+                    [],
+                )
+
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertIn("no publishable changes", str(result.get("summary") or ""))
+
     def test_codex_changed_paths_filters_dependency_artifacts_from_publishable_delta(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-delta-") as temp_dir:
             repo = Path(temp_dir) / "repo"

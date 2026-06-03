@@ -1892,7 +1892,7 @@ def _run_codex_task(
             command_policy_rejection_loop = False
             no_edit_watchdog_s = (
                 _resolve_no_edit_watchdog_seconds(prompt, communicate_timeout_s)
-                if no_edit_recovery_attempt < _MAX_NO_EDIT_RECOVERY_ATTEMPTS
+                if no_edit_recovery_attempt <= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
                 else None
             )
             no_edit_deadline = (

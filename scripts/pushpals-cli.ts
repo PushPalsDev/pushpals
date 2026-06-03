@@ -5411,7 +5411,13 @@ function shouldSuppressCliSessionJobLogLine(line: string): boolean {
   }
   if (/^\[JobRunner\]\s+Starting job\b/i.test(text)) return true;
   if (/^\[QualityGate\]\s+(?:Policy:|Gates:)/i.test(text)) return true;
-  if (/^\[Openai_codexExecutor\]\s+Spawning openai_codex executor/i.test(text)) return true;
+  if (
+    /^\[(?:Openai_codex|OpenHands|Miniswe)Executor\]\s+(?:Spawning\b|Timeout reached\b|Still running\b|Process did not exit after graceful timeout termination\b)/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
 
   if (
     /^\[OpenAICodexExecutor\]\s+(?:Planner guidance|Codex auth mode|ChatGPT auth mode|Starting codex exec|codex exec finished|Codex JSON stream captured|Codex stdout captured|No reasoning-like|Reasoning-like event|Usage observed|Temporarily masked repo-local|Timeout reached after|Process did not exit after graceful timeout termination)/i.test(
