@@ -100,6 +100,14 @@ function estimateTokensFromText(text: string): number {
   return Math.max(0, Math.ceil(String(text ?? "").length / 3));
 }
 
+function compactWorkerError(error: unknown, maxLength = 220): string {
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  if (!normalized) return "unknown error";
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
 async function postJsonWithTimeout(
   url: string,
   headers: Record<string, string>,
@@ -693,10 +701,17 @@ async function createIsolatedWorktree(
 ): Promise<string> {
   const worktreeRoot = resolve(repo, ".worktrees");
   mkdirSync(worktreeRoot, { recursive: true });
+  const safeJobId = jobId
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(0, 8);
+  const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random()
+    .toString(36)
+    .slice(2, 6)}`;
 
   const worktreePath = resolve(
     worktreeRoot,
-    `host-job-${jobId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    `job-${safeJobId || "host"}-${nonce}`,
   );
 
   const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
@@ -1532,9 +1547,10 @@ async function workerLoop(
                   Number.isFinite(err.cooldownMs) ? err.cooldownMs : 0,
                 );
               }
+              const errorSummary = compactWorkerError(err);
               result = {
                 ok: false,
-                summary: "Job execution failed before completion",
+                summary: `Job execution failed before completion: ${errorSummary}`,
                 stderr: String(err),
                 ...(cooldownAfterJobMs > 0 ? { cooldownMs: cooldownAfterJobMs } : {}),
               };

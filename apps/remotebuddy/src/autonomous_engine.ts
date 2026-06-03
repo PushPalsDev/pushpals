@@ -254,6 +254,9 @@ const PLANNING_SYSTEM_PROMPT = loadPromptTemplate(
 ).trim();
 const IDEATION_TIMEOUT_RECOVERY_INSTRUCTION =
   "Previous ideation timed out before you returned JSON. For this round only, stay within the time budget: prioritize the top 1-3 highest-confidence candidates, keep reasoning brief, avoid exhaustive exploration, and return valid JSON as soon as possible.";
+const IDEATION_NORMAL_MAX_TOKENS = 1_800;
+const IDEATION_RETRY_MAX_TOKENS = 900;
+const IDEATION_NORMAL_MAX_CANDIDATES = 5;
 const STARTUP_FAST_TICK_MAX_ATTEMPTS = 4;
 const STARTUP_FAST_TICK_MAX_DELAY_MS = 15_000;
 const STARTUP_STALE_LOCK_AFTER_MS = 30_000;
@@ -4954,20 +4957,20 @@ export class RemoteBuddyAutonomousEngine {
         compactRetry: boolean,
       ): Parameters<LLMClient["generate"]>[0] => {
         const reduced = compactRetry || Boolean(ideationRecovery);
-        const ideationTopSignals = snapshot.top_signals.slice(0, reduced ? 5 : 16);
-        const ideationStateTraits = snapshot.state_traits.slice(0, reduced ? 6 : 24);
-        const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, reduced ? 4 : 20);
+        const ideationTopSignals = snapshot.top_signals.slice(0, reduced ? 5 : 10);
+        const ideationStateTraits = snapshot.state_traits.slice(0, reduced ? 6 : 12);
+        const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, reduced ? 4 : 8);
         const ideationEngineIdeaPriors = (snapshot.engine_idea_priors ?? []).slice(
           0,
-          reduced ? 4 : 20,
+          reduced ? 4 : 8,
         );
-        const ideationOpenObjectives = snapshot.open_objectives.slice(0, reduced ? 4 : 20);
-        const ideationActiveCooldowns = snapshot.active_cooldowns.slice(0, reduced ? 4 : 20);
-        const ideationRepoTargets = repoTargets.slice(0, reduced ? 4 : repoTargets.length);
+        const ideationOpenObjectives = snapshot.open_objectives.slice(0, reduced ? 4 : 8);
+        const ideationActiveCooldowns = snapshot.active_cooldowns.slice(0, reduced ? 4 : 8);
+        const ideationRepoTargets = repoTargets.slice(0, reduced ? 4 : 8);
         return {
           system: IDEATION_SYSTEM_PROMPT,
           json: true,
-          maxTokens: reduced ? 900 : 2800,
+          maxTokens: reduced ? IDEATION_RETRY_MAX_TOKENS : IDEATION_NORMAL_MAX_TOKENS,
           temperature: 0.2,
           messages: [
             ...(ideationRecovery
@@ -4991,9 +4994,7 @@ export class RemoteBuddyAutonomousEngine {
                     open_objectives: ideationOpenObjectives,
                     active_cooldowns: ideationActiveCooldowns,
                   },
-                  vision: reduced
-                    ? compactVisionContextForIdeationRetry(visionContext)
-                    : visionContext,
+                  vision: compactVisionContextForIdeationRetry(visionContext),
                   repo_targets: ideationRepoTargets.map((target) => ({
                     component_area: target.component_area,
                     target_paths: target.target_paths,
@@ -5001,18 +5002,19 @@ export class RemoteBuddyAutonomousEngine {
                     label: target.label,
                     keywords: target.keywords.slice(0, reduced ? 4 : 8),
                   })),
-                  engine_inspiration: reduced
-                    ? compactEngineInspirationForIdeationRetry(engineInspiration)
-                    : engineInspiration,
+                  engine_inspiration: compactEngineInspirationForIdeationRetry(engineInspiration),
                   limits: {
                     ideation_max_candidates: reduced
                       ? Math.max(1, Math.min(3, this.cfg.ideationMaxCandidates))
-                      : this.cfg.ideationMaxCandidates,
+                      : Math.max(
+                          1,
+                          Math.min(IDEATION_NORMAL_MAX_CANDIDATES, this.cfg.ideationMaxCandidates),
+                        ),
                     min_confidence: this.cfg.minConfidence,
                   },
                 },
                 null,
-                reduced ? 0 : 2,
+                0,
               ),
             },
           ],

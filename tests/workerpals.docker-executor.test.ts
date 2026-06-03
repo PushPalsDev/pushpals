@@ -127,6 +127,41 @@ describe("workerpals docker executor internals", () => {
     ).toBe(true);
   });
 
+  test("worktree names stay short enough for Windows cleanup", () => {
+    const executor = createExecutor() as unknown as {
+      buildEphemeralWorktreeName: (prefix: "job" | "selfcheck", token: string) => string;
+    };
+
+    const jobName = executor.buildEphemeralWorktreeName(
+      "job",
+      "70a6e51e-485e-457c-9c76-07b1ca2b3246",
+    );
+    const selfcheckName = executor.buildEphemeralWorktreeName("selfcheck", "startup");
+
+    expect(jobName).toMatch(/^job-70a6e51e-[a-z0-9]+-[a-z0-9]+$/);
+    expect(jobName.length).toBeLessThanOrEqual(28);
+    expect(selfcheckName).toMatch(/^selfcheck-startup-[a-z0-9]+-[a-z0-9]+$/);
+    expect(selfcheckName.length).toBeLessThanOrEqual(32);
+  });
+
+  test("retry budget guard skips a second attempt after near-timeout execution", () => {
+    const executor = createExecutor() as unknown as {
+      hasBudgetForJobRetry: (
+        attempt: number,
+        attemptElapsedMs: number,
+        timeoutMs: number,
+        onLog?: (stream: "stdout" | "stderr", line: string) => void,
+      ) => boolean;
+    };
+    const logs: string[] = [];
+
+    expect(executor.hasBudgetForJobRetry(1, 2_690_000, 2_700_000, (stream, line) => {
+      logs.push(`${stream}:${line}`);
+    })).toBe(false);
+    expect(logs.join("\n")).toContain("Skipping retry attempt 2");
+    expect(executor.hasBudgetForJobRetry(1, 120_000, 2_700_000)).toBe(true);
+  });
+
   test("imageExists treats inspection timeouts as unavailable instead of hanging", async () => {
     const executor = createExecutor() as unknown as {
       imageExists: () => Promise<boolean>;

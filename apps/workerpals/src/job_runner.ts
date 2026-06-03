@@ -7,6 +7,7 @@
  *
  * Usage (inside container):
  *   bun run job_runner.ts <base64-encoded-job-spec>
+ *   bun run job_runner.ts --spec-stdin
  *
  * The job spec is base64-encoded JSON: { jobId, taskId, kind, params, workerId }
  *
@@ -116,11 +117,19 @@ echo "password=${token}"
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const base64Spec = args[0];
+  const rawSpecArg = args[0];
 
+  if (!rawSpecArg) {
+    // eslint-disable-next-line no-console
+    console.error("Usage: bun run job_runner.ts <base64-encoded-job-spec>|--spec-stdin");
+    process.exit(1);
+  }
+
+  const base64Spec =
+    rawSpecArg === "--spec-stdin" ? (await Bun.stdin.text()).trim() : rawSpecArg;
   if (!base64Spec) {
     // eslint-disable-next-line no-console
-    console.error("Usage: bun run job_runner.ts <base64-encoded-job-spec>");
+    console.error("Job spec was empty");
     process.exit(1);
   }
 

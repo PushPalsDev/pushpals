@@ -4276,6 +4276,9 @@ var IDEATION_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_ideation_s
 var SCORING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_scoring_system_prompt.md").trim();
 var PLANNING_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/autonomy_planning_system_prompt.md").trim();
 var IDEATION_TIMEOUT_RECOVERY_INSTRUCTION = "Previous ideation timed out before you returned JSON. For this round only, stay within the time budget: prioritize the top 1-3 highest-confidence candidates, keep reasoning brief, avoid exhaustive exploration, and return valid JSON as soon as possible.";
+var IDEATION_NORMAL_MAX_TOKENS = 1800;
+var IDEATION_RETRY_MAX_TOKENS = 900;
+var IDEATION_NORMAL_MAX_CANDIDATES = 5;
 var STARTUP_FAST_TICK_MAX_ATTEMPTS = 4;
 var STARTUP_FAST_TICK_MAX_DELAY_MS = 15000;
 var STARTUP_STALE_LOCK_AFTER_MS = 30000;
@@ -7371,17 +7374,17 @@ ${JSON.stringify(input.messages ?? [])}`),
       this.setPhase("ideation");
       const buildIdeationInput = (ideationRecovery2, compactRetry) => {
         const reduced = compactRetry || Boolean(ideationRecovery2);
-        const ideationTopSignals = snapshot.top_signals.slice(0, reduced ? 5 : 16);
-        const ideationStateTraits = snapshot.state_traits.slice(0, reduced ? 6 : 24);
-        const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, reduced ? 4 : 20);
-        const ideationEngineIdeaPriors = (snapshot.engine_idea_priors ?? []).slice(0, reduced ? 4 : 20);
-        const ideationOpenObjectives = snapshot.open_objectives.slice(0, reduced ? 4 : 20);
-        const ideationActiveCooldowns = snapshot.active_cooldowns.slice(0, reduced ? 4 : 20);
-        const ideationRepoTargets = repoTargets.slice(0, reduced ? 4 : repoTargets.length);
+        const ideationTopSignals = snapshot.top_signals.slice(0, reduced ? 5 : 10);
+        const ideationStateTraits = snapshot.state_traits.slice(0, reduced ? 6 : 12);
+        const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, reduced ? 4 : 8);
+        const ideationEngineIdeaPriors = (snapshot.engine_idea_priors ?? []).slice(0, reduced ? 4 : 8);
+        const ideationOpenObjectives = snapshot.open_objectives.slice(0, reduced ? 4 : 8);
+        const ideationActiveCooldowns = snapshot.active_cooldowns.slice(0, reduced ? 4 : 8);
+        const ideationRepoTargets = repoTargets.slice(0, reduced ? 4 : 8);
         return {
           system: IDEATION_SYSTEM_PROMPT,
           json: true,
-          maxTokens: reduced ? 900 : 2800,
+          maxTokens: reduced ? IDEATION_RETRY_MAX_TOKENS : IDEATION_NORMAL_MAX_TOKENS,
           temperature: 0.2,
           messages: [
             ...ideationRecovery2 ? [
@@ -7402,7 +7405,7 @@ ${JSON.stringify(input.messages ?? [])}`),
                   open_objectives: ideationOpenObjectives,
                   active_cooldowns: ideationActiveCooldowns
                 },
-                vision: reduced ? compactVisionContextForIdeationRetry(visionContext) : visionContext,
+                vision: compactVisionContextForIdeationRetry(visionContext),
                 repo_targets: ideationRepoTargets.map((target) => ({
                   component_area: target.component_area,
                   target_paths: target.target_paths,
@@ -7410,12 +7413,12 @@ ${JSON.stringify(input.messages ?? [])}`),
                   label: target.label,
                   keywords: target.keywords.slice(0, reduced ? 4 : 8)
                 })),
-                engine_inspiration: reduced ? compactEngineInspirationForIdeationRetry(engineInspiration) : engineInspiration,
+                engine_inspiration: compactEngineInspirationForIdeationRetry(engineInspiration),
                 limits: {
-                  ideation_max_candidates: reduced ? Math.max(1, Math.min(3, this.cfg.ideationMaxCandidates)) : this.cfg.ideationMaxCandidates,
+                  ideation_max_candidates: reduced ? Math.max(1, Math.min(3, this.cfg.ideationMaxCandidates)) : Math.max(1, Math.min(IDEATION_NORMAL_MAX_CANDIDATES, this.cfg.ideationMaxCandidates)),
                   min_confidence: this.cfg.minConfidence
                 }
-              }, null, reduced ? 0 : 2)
+              }, null, 0)
             }
           ]
         };

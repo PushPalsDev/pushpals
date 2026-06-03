@@ -428,13 +428,20 @@ export class DockerExecutor {
 
       // Step 3: Run Docker container with the worktree mounted
       for (let attempt = 1; attempt <= this.jobRetryMaxAttempts; attempt++) {
+        const attemptStartedAtMs = Date.now();
         try {
           this.logExecutionConfig();
           const result = await this.runInWarmContainer(worktreePath, base64Spec, job, onLog);
           if (result.ok) return result;
 
           const retryableFailure = this.isRetryableJobFailure(result);
-          if (attempt >= this.jobRetryMaxAttempts || !retryableFailure) {
+          const attemptElapsedMs = Math.max(1, Date.now() - attemptStartedAtMs);
+          const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
+          const hasBudgetForRetry =
+            retryableFailure &&
+            attempt < this.jobRetryMaxAttempts &&
+            this.hasBudgetForJobRetry(attempt, attemptElapsedMs, timeoutMs, onLog);
+          if (attempt >= this.jobRetryMaxAttempts || !retryableFailure || !hasBudgetForRetry) {
             if (
               retryableFailure &&
               attempt >= this.jobRetryMaxAttempts &&
@@ -458,7 +465,13 @@ export class DockerExecutor {
           await this.sleep(retryInMs);
         } catch (err) {
           const retryableError = this.isRetryableError(err);
-          if (attempt >= this.jobRetryMaxAttempts || !retryableError) {
+          const attemptElapsedMs = Math.max(1, Date.now() - attemptStartedAtMs);
+          const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
+          const hasBudgetForRetry =
+            retryableError &&
+            attempt < this.jobRetryMaxAttempts &&
+            this.hasBudgetForJobRetry(attempt, attemptElapsedMs, timeoutMs, onLog);
+          if (attempt >= this.jobRetryMaxAttempts || !retryableError || !hasBudgetForRetry) {
             if (
               retryableError &&
               attempt >= this.jobRetryMaxAttempts &&
@@ -1208,17 +1221,28 @@ export class DockerExecutor {
       "bun",
       "run",
       "/workspace/apps/workerpals/src/job_runner.ts",
-      base64Spec,
+      "--spec-stdin",
     ];
 
     console.log(
       `[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary()})`,
     );
 
-    const proc = Bun.spawn([resolveDockerExecutable(), ...args], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const dockerArgv = [resolveDockerExecutable(), ...args];
+    let proc: ReturnType<typeof Bun.spawn>;
+    try {
+      proc = Bun.spawn(dockerArgv, {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    } catch (err) {
+      throw new Error(
+        `failed to spawn warm-container docker exec (${this.warmContainerName}, cwd=${containerWorktreePath}, argv_chars=${dockerArgv.join("\u0000").length}, spec_chars=${base64Spec.length}): ${this.compactError(
+          err,
+        )}`,
+      );
+    }
     const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
     if (timeoutMs !== this.options.timeoutMs) {
       const verb = timeoutMs > this.options.timeoutMs ? "Extended" : "Capped";
@@ -1263,10 +1287,24 @@ export class DockerExecutor {
     const stdoutLines: string[] = [];
     const stderrLines: string[] = [];
 
-    await Promise.all([
-      this.readStream(proc.stdout, "stdout", onLog, stdoutLines),
-      this.readStream(proc.stderr, "stderr", onLog, stderrLines),
-    ]);
+    try {
+      await Promise.all([
+        this.writeJobSpecToStdin(proc, base64Spec),
+        this.readStream(proc.stdout, "stdout", onLog, stdoutLines),
+        this.readStream(proc.stderr, "stderr", onLog, stderrLines),
+      ]);
+    } catch (err) {
+      try {
+        proc.kill();
+      } catch {
+        // Ignore cleanup errors after stream setup failures.
+      }
+      throw new Error(
+        `failed while streaming warm-container job execution (${this.warmContainerName}, spec_chars=${base64Spec.length}): ${this.compactError(
+          err,
+        )}`,
+      );
+    }
 
     clearTimeout(warningTimer);
     clearTimeout(timer);
@@ -1281,6 +1319,28 @@ export class DockerExecutor {
     });
 
     return result;
+  }
+
+  private async writeJobSpecToStdin(
+    proc: ReturnType<typeof Bun.spawn>,
+    base64Spec: string,
+  ): Promise<void> {
+    const stdin = proc.stdin as WritableStream<Uint8Array> | undefined;
+    if (!stdin) {
+      throw new Error("docker exec stdin pipe was not available");
+    }
+    const writer = stdin.getWriter();
+    try {
+      await writer.write(new TextEncoder().encode(base64Spec));
+      await writer.close();
+    } catch (err) {
+      try {
+        await writer.abort(err);
+      } catch {
+        // Ignore abort failures; the original write error is more useful.
+      }
+      throw err;
+    }
   }
 
   private async ensureWorktreeDependencyArtifacts(
@@ -1785,6 +1845,23 @@ export class DockerExecutor {
     return transientPatterns.some((pattern) => pattern.test(text));
   }
 
+  private hasBudgetForJobRetry(
+    attempt: number,
+    attemptElapsedMs: number,
+    timeoutMs: number,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): boolean {
+    if (attempt >= this.jobRetryMaxAttempts) return false;
+    const consumedRatio = timeoutMs > 0 ? attemptElapsedMs / timeoutMs : 1;
+    if (attemptElapsedMs < Math.max(300_000, timeoutMs * 0.8) && consumedRatio < 0.8) return true;
+    const note = `[DockerExecutor] Skipping retry attempt ${
+      attempt + 1
+    }/${this.jobRetryMaxAttempts}: prior attempt consumed ${attemptElapsedMs}ms of ${timeoutMs}ms budget.`;
+    console.warn(note);
+    onLog?.("stderr", note);
+    return false;
+  }
+
   /**
    * Convert Windows path to Docker-compatible path
    * C:\foo\bar → /c/foo/bar
@@ -1839,10 +1916,9 @@ export class DockerExecutor {
   }
 
   private buildEphemeralWorktreeName(prefix: "job" | "selfcheck", token: string): string {
-    const safeWorker = this.sanitizeWorktreeToken(this.options.workerId, 24);
-    const safeToken = this.sanitizeWorktreeToken(token, 40);
-    const nonce = `${Date.now().toString(36)}-${randomUUID().slice(0, 8).toLowerCase()}`;
-    return `${prefix}-${safeToken}-${safeWorker}-${nonce}`;
+    const safeToken = this.sanitizeWorktreeToken(token, prefix === "job" ? 8 : 12);
+    const nonce = `${Date.now().toString(36).slice(-6)}-${randomUUID().slice(0, 6).toLowerCase()}`;
+    return `${prefix}-${safeToken}-${nonce}`;
   }
 
   private sanitizeWorktreeToken(value: string, maxLength: number): string {

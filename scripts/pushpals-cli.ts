@@ -2780,7 +2780,7 @@ function isWorkerpalEphemeralWorktreePath(repoRoot: string, worktreePath: string
   const normalizedPath = normalizeFsPathForComparison(worktreePath);
   if (!normalizedPath.startsWith(expectedPrefix)) return false;
   const leaf = basename(normalizedPath);
-  return /^(job|selfcheck)-.*-workerpal-[a-z0-9._-]+/i.test(leaf);
+  return /^(job|selfcheck)-[a-z0-9][a-z0-9._-]*$/i.test(leaf);
 }
 
 function resolveConfiguredDockerExecutable(

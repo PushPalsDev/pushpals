@@ -973,6 +973,16 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         llmInputs.push(input);
         llmCall += 1;
         if (llmCall === 1) {
+          expect(input.maxTokens).toBe(1800);
+          const initialPayload = JSON.parse(
+            String(
+              ((input.messages as Array<Record<string, unknown>>)?.[0]?.content ?? "") as string,
+            ),
+          ) as Record<string, unknown>;
+          expect(JSON.stringify(initialPayload).length).toBeLessThan(12_000);
+          expect(
+            Number((initialPayload.limits as Record<string, unknown>).ideation_max_candidates),
+          ).toBeLessThanOrEqual(5);
           await Bun.sleep(1_100);
           return {
             text: JSON.stringify({ candidates: [] }),
