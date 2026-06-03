@@ -65,6 +65,7 @@ import {
   resolveWindowsShellExecutableCandidatesForEnv,
   resolveWorkerpalDockerProbe,
   startEmbeddedMonitoringHub,
+  shouldDeferRemoteBuddySessionConsumerReadiness,
   waitForWorkerpalCapacity,
 } from "../scripts/pushpals-cli.ts";
 import {
@@ -3275,6 +3276,53 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ).toMatchObject({
       ok: false,
     });
+  });
+
+  test("shouldDeferRemoteBuddySessionConsumerReadiness only defers a running embedded RemoteBuddy after the startup grace", () => {
+    const base = {
+      localBuddyEnabled: false,
+      remoteBuddyReady: false,
+      remoteBuddyServiceRunning: true,
+      startupGraceMs: 8_000,
+    };
+
+    expect(
+      shouldDeferRemoteBuddySessionConsumerReadiness({
+        ...base,
+        readinessElapsedMs: 7_999,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldDeferRemoteBuddySessionConsumerReadiness({
+        ...base,
+        readinessElapsedMs: 8_000,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldDeferRemoteBuddySessionConsumerReadiness({
+        ...base,
+        localBuddyEnabled: true,
+        readinessElapsedMs: 12_000,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldDeferRemoteBuddySessionConsumerReadiness({
+        ...base,
+        remoteBuddyReady: true,
+        readinessElapsedMs: 12_000,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldDeferRemoteBuddySessionConsumerReadiness({
+        ...base,
+        remoteBuddyServiceRunning: false,
+        readinessElapsedMs: 12_000,
+      }),
+    ).toBe(false);
   });
 
   test("extractRemoteBuddyAutonomousEngineState parses enabled/disabled markers from runtime logs", () => {

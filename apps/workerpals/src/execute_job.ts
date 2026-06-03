@@ -6854,7 +6854,7 @@ export async function executeJob(
       );
       return {
         ok: false,
-        summary: "Executor produced no publishable code changes",
+        summary: `Executor produced no publishable code changes (${detail})`,
         stdout: result.stdout,
         stderr: [result.stderr ?? "", detail].filter(Boolean).join("\n"),
         exitCode: 4,

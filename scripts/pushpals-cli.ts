@@ -260,6 +260,7 @@ const DEFAULT_RUNTIME_BOOT_TIMEOUT_MS = 90_000;
 const DEFAULT_RUNTIME_BOOT_POLL_MS = 1_000;
 const DEFAULT_SERVER_BOOT_TIMEOUT_MS = 20_000;
 const DEFAULT_SERVICE_STABILITY_GRACE_MS = 4_000;
+const DEFAULT_REMOTEBUDDY_CONSUMER_STARTUP_GRACE_MS = 8_000;
 const DEFAULT_COMMAND_OUTPUT_DRAIN_TIMEOUT_MS = 2_000;
 const DEFAULT_COMMAND_OUTPUT_MAX_CHARS = 512_000;
 const DEFAULT_REMOTEBUDDY_SILENT_STARTUP_FALLBACK_MS = 20_000;
@@ -4015,6 +4016,23 @@ export function extractRemoteBuddySessionConsumerHealth(
   };
 }
 
+export function shouldDeferRemoteBuddySessionConsumerReadiness(opts: {
+  localBuddyEnabled: boolean;
+  remoteBuddyReady: boolean;
+  remoteBuddyServiceRunning: boolean;
+  readinessElapsedMs: number;
+  startupGraceMs?: number;
+}): boolean {
+  if (opts.localBuddyEnabled) return false;
+  if (opts.remoteBuddyReady) return false;
+  if (!opts.remoteBuddyServiceRunning) return false;
+  const startupGraceMs = Math.max(
+    0,
+    opts.startupGraceMs ?? DEFAULT_REMOTEBUDDY_CONSUMER_STARTUP_GRACE_MS,
+  );
+  return opts.readinessElapsedMs >= startupGraceMs;
+}
+
 async function probeRemoteBuddySessionConsumer(
   serverUrl: string,
   sessionId: string,
@@ -4687,6 +4705,7 @@ async function autoStartRuntimeServices(opts: {
   const optionalServiceExitWarned = new Set<RuntimeServiceName>();
   let lastReadinessWaitLogAt = 0;
   let lastReadinessWaitDetail = "";
+  let deferredRemoteBuddyConsumerLogged = false;
   while (Date.now() < deadline) {
     reportRemoteBuddyAutonomousEngineState();
     if (maybeActivateRemoteBuddyWindowsFallback("silent_startup")) {
@@ -4741,7 +4760,17 @@ async function autoStartRuntimeServices(opts: {
 
     const health = localBuddyEnabled ? await probeLocalBuddy(opts.localAgentUrl) : null;
     const remoteBuddyHealth = await probeRemoteBuddySessionConsumer(opts.serverUrl, opts.sessionId);
-    if ((localBuddyEnabled && !health?.ok) || !remoteBuddyHealth.ok) {
+    const remoteBuddyServiceRunning = serviceManager
+      .getServices()
+      .some((service) => service.name === "remotebuddy" && !service.exited);
+    const deferRemoteBuddyConsumer = shouldDeferRemoteBuddySessionConsumerReadiness({
+      localBuddyEnabled,
+      remoteBuddyReady: remoteBuddyHealth.ok,
+      remoteBuddyServiceRunning,
+      readinessElapsedMs: Date.now() - readinessPhaseStartedAt,
+    });
+    const remoteBuddyReadyForCli = remoteBuddyHealth.ok || deferRemoteBuddyConsumer;
+    if ((localBuddyEnabled && !health?.ok) || !remoteBuddyReadyForCli) {
       const localBuddyDetail = localBuddyEnabled
         ? health?.ok
           ? "LocalBuddy ready"
@@ -4762,7 +4791,14 @@ async function autoStartRuntimeServices(opts: {
         lastReadinessWaitLogAt = now;
       }
     }
-    if ((!localBuddyEnabled || health?.ok) && remoteBuddyHealth.ok) {
+    if ((!localBuddyEnabled || health?.ok) && remoteBuddyReadyForCli) {
+      if (deferRemoteBuddyConsumer && !deferredRemoteBuddyConsumerLogged) {
+        appendRuntimeServicesLogLine(
+          runtimeServicesLogPath,
+          `[pushpals] continuing startup after ${Date.now() - readinessPhaseStartedAt}ms without a connected RemoteBuddy session consumer; embedded RemoteBuddy is running and the CLI session will connect after startup (${remoteBuddyHealth.detail}).`,
+        );
+        deferredRemoteBuddyConsumerLogged = true;
+      }
       reportRemoteBuddyAutonomousEngineState();
       const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;
       while (Date.now() < stabilityDeadline) {
