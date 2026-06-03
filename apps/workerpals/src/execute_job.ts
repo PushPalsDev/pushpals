@@ -1611,6 +1611,45 @@ function pathMatchesScopeHint(path: string, hint: string): boolean {
   return normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`);
 }
 
+function isValidationScopeTestPathHint(path: string): boolean {
+  const normalized = path.trim().replace(/\\/g, "/").replace(/^\.\/+/, "");
+  return /(^|\/)(__tests__|tests?)(\/|$)|\.(test|spec)\.[cm]?[jt]sx?$/i.test(normalized);
+}
+
+function shouldTreatBrowserAssertionAsTaskScope(
+  planning: TaskExecutePlanning,
+  changedPaths: string[],
+  targetPath?: string,
+): boolean {
+  const pathHints = [
+    targetPath ?? "",
+    ...changedPaths,
+    ...(planning.targetPaths ?? []),
+    ...(planning.scope.writeGlobs ?? []),
+  ]
+    .map((entry) => entry.trim().replace(/\\/g, "/"))
+    .filter(Boolean);
+  const allHintsAreTests =
+    pathHints.length > 0 && pathHints.every((hint) => isValidationScopeTestPathHint(hint));
+  const planningText = collectPlanningText(planning);
+  const explicitlyBrowserValidation =
+    /\b(browser|web:e2e|e2e|playwright|smoke)\b/i.test(planningText);
+  if (allHintsAreTests && !explicitlyBrowserValidation) return false;
+
+  const productPathChanged = changedPaths.some((path) => {
+    const normalized = path.trim().replace(/\\/g, "/").replace(/^\.\/+/, "");
+    return (
+      !isValidationScopeTestPathHint(normalized) &&
+      /^(app|components|screens|styles|utils)\//i.test(normalized)
+    );
+  });
+  if (productPathChanged) return true;
+
+  return /\b(ui|visual|render(?:ing)?|style|screen|route|home|settings|shop|game|battlefield|component|control panel|control-panel)\b/i.test(
+    planningText,
+  );
+}
+
 export function classifyValidationFailureScope(
   runs: ValidationExecutionResult[],
   planning: TaskExecutePlanning,
@@ -1633,12 +1672,14 @@ export function classifyValidationFailureScope(
     .flatMap((run) => [run.stdout, run.stderr])
     .filter(Boolean)
     .join("\n");
+  const hasBrowserAssertionFailure = failedRuns.some(
+    (run) =>
+      isLongRunningBrowserValidationCommand(run.command) &&
+      isBrowserAssertionDigest([run.stdout, run.stderr].filter(Boolean).join("\n")),
+  );
   if (
-    failedRuns.some(
-      (run) =>
-        isLongRunningBrowserValidationCommand(run.command) &&
-        isBrowserAssertionDigest([run.stdout, run.stderr].filter(Boolean).join("\n")),
-    )
+    hasBrowserAssertionFailure &&
+    shouldTreatBrowserAssertionAsTaskScope(planning, changedPaths, targetPath)
   ) {
     return "task_scope";
   }
@@ -1653,7 +1694,9 @@ export function classifyValidationFailureScope(
   const pathTokens = extractPathTokensFromValidationOutput(combined).filter(
     (token) => !/^(node_modules|\.bun|bun|npm|pnpm|yarn)\//i.test(token),
   );
-  if (pathTokens.length === 0) return "none";
+  if (pathTokens.length === 0) {
+    return hasBrowserAssertionFailure ? "outside_task_scope" : "none";
+  }
   if (pathTokens.some((token) => scopeHints.some((hint) => pathMatchesScopeHint(token, hint)))) {
     return "task_scope";
   }

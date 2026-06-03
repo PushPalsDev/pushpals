@@ -417,6 +417,49 @@ describe("workerpals validation command safety", () => {
     ).toBe("task_scope");
   });
 
+  test("does not turn browser assertions into repair instructions for test-only autonomy tasks", () => {
+    const planning = planningFixture({
+      targetPaths: ["app/__tests__/_layout.autonomy.test.ts"],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["app/__tests__/_layout.autonomy.test.ts"],
+      },
+      acceptanceCriteria: ["Add focused autonomy unit coverage."],
+      validationSteps: ["bun test", "bunx tsc --noEmit", "bun run lint"],
+    }) as any;
+
+    expect(
+      classifyValidationFailureScope(
+        [
+          {
+            step: "bun test",
+            command: "bun test",
+            ok: false,
+            exitCode: 1,
+            stdout: "",
+            stderr:
+              "components/__tests__/AnimatedSelectionRing.test.tsx: Cannot find module '../../tests/reactNativeMock'",
+            elapsedMs: 100,
+          },
+          {
+            step: "bun run web:e2e",
+            command: "bun run web:e2e",
+            ok: false,
+            exitCode: 1,
+            stdout: "",
+            stderr:
+              "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded. waiting for getByTestId('home-screen')",
+            elapsedMs: 127_000,
+          },
+        ],
+        planning,
+        ["app/__tests__/_layout.autonomy.test.ts"],
+        "app/__tests__/_layout.autonomy.test.ts",
+      ),
+    ).toBe("outside_task_scope");
+  });
+
   test("treats browser assertion failures as repairable task-scope validation", () => {
     const planning = planningFixture({
       targetPaths: ["app/game.tsx"],
