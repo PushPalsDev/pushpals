@@ -2,29 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.14`
-- start_commit: `5873264a69877f14dcd2e376f86ee0fa4e5727c0`
-- end_commit: `494af87ac2fcfe2751064ac2c29582bb30e38d6d`
+- version: `v1.1.15`
+- start_commit: `c0fad730404f8caf6e900f8b817b02dda0f717dd`
+- end_commit: `a912ac187ba5fa30be336662a1d2f75c00914945`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Fix OpenAI Codex WorkerPal timeout handling so the Python Codex wrapper times out before the TypeScript host kills it, preserving structured timeout salvage.
-- Add host-side finalization grace for Python backend result emission while keeping the Codex child timeout below the execution budget.
-- Keep the no-edit watchdog active on the recovery attempt so repeated no-edit runs fail clearly instead of reaching a SIGTERM cliff.
-- Suppress host-level executor timeout chatter from the interactive CLI stream while preserving final job lifecycle lines.
-- Sync the packaged CLI WorkerPal sandbox so embedded installs receive the same timeout-salvage behavior.
+- Suppress WorkerPal job, task, status, validation, quality, Docker, and Codex session events from the interactive CLI prompt by default so operational chatter stays in logs and the monitor.
+- Keep human assistant replies visible while dropping startup heartbeat messages such as `All systems online`.
+- Add `PUSHPALS_CLI_SHOW_JOB_EVENTS=1` as an explicit debug opt-in for tailing job events from the terminal.
+- Normalize OpenAI Codex host-timeout `SIGTERM` results into `openai_codex execution budget expired` with exit code `124` instead of exposing raw `signal 15` in job summaries.
+- Sync the packaged CLI WorkerPal sandbox so embedded installs receive the same quiet CLI stream and timeout-result normalization.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `python apps\workerpals\src\backends\openai_codex\test_openai_codex_runtime_config.py`
 - `bun test tests\cli.runtime-bootstrap.test.ts --filter "formatSessionEventLine"`
 - `bun test tests\workerpals.generic-python-executor.test.ts`
 - `bun x tsc --noEmit --project apps\workerpals\tsconfig.json`
-- `bun x tsc --noEmit --project packages\cli\runtime\sandbox\apps\workerpals\tsconfig.json`
 
 ## Install
 
