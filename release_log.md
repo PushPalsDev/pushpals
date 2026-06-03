@@ -2,27 +2,29 @@
 
 ## Release Metadata
 
-- version: `v1.1.15`
-- start_commit: `c0fad730404f8caf6e900f8b817b02dda0f717dd`
-- end_commit: `a912ac187ba5fa30be336662a1d2f75c00914945`
-- commits_in_range: `1`
+- version: `v1.1.16`
+- start_commit: `75d33e66d975b77f896895dce0c964a820e9ec2f`
+- end_commit: `1feac159c4c30da5abd6b4b4c06022be0b8a06f0`
+- commits_in_range: `4`
 
 ## Highlights
 
-- Suppress WorkerPal job, task, status, validation, quality, Docker, and Codex session events from the interactive CLI prompt by default so operational chatter stays in logs and the monitor.
-- Keep human assistant replies visible while dropping startup heartbeat messages such as `All systems online`.
-- Add `PUSHPALS_CLI_SHOW_JOB_EVENTS=1` as an explicit debug opt-in for tailing job events from the terminal.
-- Normalize OpenAI Codex host-timeout `SIGTERM` results into `openai_codex execution budget expired` with exit code `124` instead of exposing raw `signal 15` in job summaries.
-- Sync the packaged CLI WorkerPal sandbox so embedded installs receive the same quiet CLI stream and timeout-result normalization.
+- Reduce embedded startup delay by treating a healthy RemoteBuddy service as ready before waiting on a delayed session-consumer heartbeat.
+- Keep repo-owned dependency artifacts out of ScopeGate publish failures so linked `node_modules` state does not poison otherwise scoped WorkerPal changes.
+- Keep browser-test-only failures scoped to browser repair prompts instead of broadening into unrelated validation churn.
+- Send Docker job specs over stdin instead of giant encoded command-line arguments, reducing opaque spawn failures on large jobs.
+- Skip Docker retry attempts when the prior attempt already consumed most of the available timeout budget.
+- Shorten managed WorkerPal worktree names and cleanup matchers to avoid Windows path-length cleanup failures.
+- Compact RemoteBuddy autonomy ideation context so normal queue cycles use smaller prompt payloads before retry fallback is needed.
+- Improve failed job summaries with the compact underlying error instead of a generic pre-completion failure message.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests\cli.runtime-bootstrap.test.ts --filter "formatSessionEventLine"`
-- `bun test tests\workerpals.generic-python-executor.test.ts`
-- `bun x tsc --noEmit --project apps\workerpals\tsconfig.json`
+- `bun test tests\workerpals.docker-executor.test.ts`
+- `bun test tests\remotebuddy.autonomous-engine.tick.test.ts`
 
 ## Install
 
