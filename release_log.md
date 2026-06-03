@@ -2,20 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.1.13`
-- start_commit: `87b6f9da2788d5790304a2a7b455778336d30c39`
-- end_commit: `57a0a27d2eda9da45f3f4cdb43846075b2aed5f3`
-- commits_in_range: `2`
+- version: `v1.1.14`
+- start_commit: `5873264a69877f14dcd2e376f86ee0fa4e5727c0`
+- end_commit: `494af87ac2fcfe2751064ac2c29582bb30e38d6d`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Salvage timed-out OpenAI Codex WorkerPal attempts when publishable file changes already exist, handing the patch to validation instead of failing only on SIGTERM.
-- Add a no-edit watchdog for long-running Codex attempts so compact jobs that spend too long in discovery get one patch-first recovery attempt.
-- Route compact low-risk and shell-polish tasks from `xhigh` to `high` reasoning effort for faster convergence without changing heavier task defaults.
-- Add route-entry and shell-polish guidance that steers workers toward behavior-owning files, small style/helper assertions, and away from broad React Native render harnesses.
-- Add discovery and test-harness detour guardrails so small visual tasks switch to narrower coverage when mock/import repair starts consuming the job budget.
-- Run safe fast Bun validation commands in bounded parallel batches while keeping browser/runtime validation sequential.
-- Emit a concise JobRunner performance summary covering executor, quality, validation command time, and changed-file count.
+- Fix OpenAI Codex WorkerPal timeout handling so the Python Codex wrapper times out before the TypeScript host kills it, preserving structured timeout salvage.
+- Add host-side finalization grace for Python backend result emission while keeping the Codex child timeout below the execution budget.
+- Keep the no-edit watchdog active on the recovery attempt so repeated no-edit runs fail clearly instead of reaching a SIGTERM cliff.
+- Suppress host-level executor timeout chatter from the interactive CLI stream while preserving final job lifecycle lines.
+- Sync the packaged CLI WorkerPal sandbox so embedded installs receive the same timeout-salvage behavior.
 
 ## Validation
 
@@ -23,9 +21,10 @@
 - `bun run test:root`
 - `git diff --check`
 - `python apps\workerpals\src\backends\openai_codex\test_openai_codex_runtime_config.py`
-- `bun test tests\workerpals.validation-command-safety.test.ts`
-- `bun test tests\workerpals.quality-gate-issues.test.ts`
 - `bun test tests\cli.runtime-bootstrap.test.ts --filter "formatSessionEventLine"`
+- `bun test tests\workerpals.generic-python-executor.test.ts`
+- `bun x tsc --noEmit --project apps\workerpals\tsconfig.json`
+- `bun x tsc --noEmit --project packages\cli\runtime\sandbox\apps\workerpals\tsconfig.json`
 
 ## Install
 
