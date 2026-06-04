@@ -128,6 +128,7 @@ export interface PushPalsConfig {
       enabled: boolean;
       killSwitchEnabled: boolean;
       tickIntervalMs: number;
+      startupGraceMs: number;
       heartbeatLogMs: number;
       visionContextMaxChars: number;
       ideationBudgetMs: number;
@@ -1668,6 +1669,14 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
           asInt(
             parseIntEnv("REMOTEBUDDY_AUTONOMY_TICK_INTERVAL_MS") ??
               remoteAutonomyNode.tick_interval_ms,
+            120_000,
+          ),
+        ),
+        startupGraceMs: Math.max(
+          0,
+          asInt(
+            parseIntEnv("REMOTEBUDDY_AUTONOMY_STARTUP_GRACE_MS") ??
+              remoteAutonomyNode.startup_grace_ms,
             120_000,
           ),
         ),

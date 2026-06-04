@@ -688,6 +688,63 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(Number((acquireCalls[0].body as Record<string, unknown>).staleAfterMs)).toBe(5_000);
   });
 
+  test("startup grace delays first autonomy tick so cold-start capacity stays available", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-startup-grace-"));
+    tempDirs.push(root);
+    const calls: FetchCall[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+      if (url.includes("/autonomy/lock/acquire")) {
+        return jsonResponse(409, {
+          ok: false,
+          reason: "dispatch lock held by run_previous until 2099-01-01T00:00:00.000Z",
+        });
+      }
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const cfg = makeConfig();
+    cfg.remotebuddy.autonomy.tickIntervalMs = 10_000;
+    cfg.remotebuddy.autonomy.heartbeatLogMs = 1_000;
+    cfg.remotebuddy.autonomy.startupGraceMs = 80;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_startup_grace",
+      authToken: "tok",
+      repo: root,
+      llm: {
+        async generate() {
+          return {
+            text: JSON.stringify({ candidates: [] }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        },
+      } as any,
+      comm: {
+        async emit() {
+          return true;
+        },
+      } as any,
+      config: cfg,
+    });
+
+    engine.start();
+    await Bun.sleep(35);
+    expect(calls.filter((entry) => entry.url.includes("/autonomy/lock/acquire")).length).toBe(0);
+
+    await Bun.sleep(90);
+    engine.stop();
+
+    expect(calls.filter((entry) => entry.url.includes("/autonomy/lock/acquire")).length).toBe(1);
+  });
+
   test("tick short-circuits when snapshot kill switch is enabled", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnForTest();

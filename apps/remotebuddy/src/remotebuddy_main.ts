@@ -1142,7 +1142,7 @@ export class RemoteBuddyOrchestrator {
       `[RemoteBuddy] Persistent memory: ${this.memoryEnabled ? "on" : "off"} crossSession=${this.memoryIncludeCrossSession ? "on" : "off"} recallItems=${this.memoryMaxRecallItems} recallChars=${this.memoryMaxRecallChars} retentionDays=${this.memoryRetentionDays}`,
     );
     console.log(
-      `[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour} exploreRate=${CONFIG.remotebuddy.autonomy.exploreRate.toFixed(2)} allowDirtyWorktree=${CONFIG.remotebuddy.autonomy.allowDirtyWorktree ? "on" : "off"}`,
+      `[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms startupGrace=${CONFIG.remotebuddy.autonomy.startupGraceMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour} exploreRate=${CONFIG.remotebuddy.autonomy.exploreRate.toFixed(2)} allowDirtyWorktree=${CONFIG.remotebuddy.autonomy.allowDirtyWorktree ? "on" : "off"}`,
     );
     console.log(
       `[RemoteBuddy] Autonomy runtime-config polling: every ${this.autonomyConfigPollMs}ms`,

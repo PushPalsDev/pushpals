@@ -3888,6 +3888,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
   private runtimeEnabled = true;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private startupGraceTimer: ReturnType<typeof setTimeout> | null = null;
   private startupFastTickTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
@@ -3978,8 +3979,11 @@ export class RemoteBuddyAutonomousEngine {
       return;
     }
 
+    const hasScheduledTick = Boolean(
+      this.timer || this.startupGraceTimer || this.startupFastTickTimer,
+    );
     const nextTickInMs =
-      this.timer && this.nextTickAtMs > 0 ? Math.max(0, this.nextTickAtMs - now) : 0;
+      hasScheduledTick && this.nextTickAtMs > 0 ? Math.max(0, this.nextTickAtMs - now) : 0;
     const lastAgeMs = this.lastCompletedAtMs > 0 ? Math.max(0, now - this.lastCompletedAtMs) : -1;
     console.log(
       `[RemoteBuddyAutonomousEngine] heartbeat: status=idle last_outcome=${this.lastOutcome} detail=${this.lastDetail} last_tick_age_ms=${lastAgeMs} next_tick_in_ms=${nextTickInMs}`,
@@ -4032,6 +4036,17 @@ export class RemoteBuddyAutonomousEngine {
       1_000,
       Math.min(STARTUP_FAST_TICK_MAX_DELAY_MS, Math.floor(this.cfg.tickIntervalMs / 10)),
     );
+  }
+
+  private startupGraceMs(): number {
+    return Math.max(0, this.cfg.startupGraceMs ?? 0);
+  }
+
+  private clearStartupGraceTimer(): void {
+    if (this.startupGraceTimer) {
+      clearTimeout(this.startupGraceTimer);
+      this.startupGraceTimer = null;
+    }
   }
 
   private clearStartupFastTickTimer(): void {
@@ -5909,24 +5924,44 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   start(): void {
-    if (!this.runtimeEnabled || this.timer) return;
+    if (!this.runtimeEnabled || this.timer || this.startupGraceTimer) return;
     console.log(
       `[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`,
     );
     this.startupFastTickAttemptsRemaining = STARTUP_FAST_TICK_MAX_ATTEMPTS;
-    this.nextTickAtMs = Date.now();
-    this.timer = setInterval(() => {
-      this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
-      void this.tick();
-    }, this.cfg.tickIntervalMs);
+    const startInterval = () => {
+      if (this.timer) return;
+      this.timer = setInterval(() => {
+        this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+        void this.tick();
+      }, this.cfg.tickIntervalMs);
+    };
+    const firstTickDelayMs = this.startupGraceMs();
+    this.nextTickAtMs = Date.now() + firstTickDelayMs;
     this.heartbeatTimer = setInterval(() => {
       this.logHeartbeat();
     }, this.cfg.heartbeatLogMs);
     this.logHeartbeat();
+    if (firstTickDelayMs > 0) {
+      console.log(
+        `[RemoteBuddyAutonomousEngine] startup autonomy tick delayed by ${firstTickDelayMs}ms to leave cold-start capacity available for user work.`,
+      );
+      this.startupGraceTimer = setTimeout(() => {
+        this.startupGraceTimer = null;
+        if (!this.runtimeEnabled) return;
+        startInterval();
+        this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+        void this.tick();
+      }, firstTickDelayMs);
+      return;
+    }
+    startInterval();
+    this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
     void this.tick();
   }
 
   stop(): void {
+    this.clearStartupGraceTimer();
     this.clearStartupFastTickTimer();
     if (this.timer) {
       clearInterval(this.timer);

@@ -54,6 +54,7 @@ import {
   resolveRuntimeGitExecutableCandidates,
   resolveCliLocalBuddyAutostart,
   resolveWorkerExecutionReadiness,
+  resolveWorkerpalStartupReadinessProbeMaxMs,
   resolveCliStatePath,
   resolveCommandPath,
   runCommandWithEnv,
@@ -1232,6 +1233,20 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         env: {},
       }),
     ).toBe(true);
+  });
+
+  test("WorkerPal startup readiness probe uses a short configurable foreground cap", () => {
+    expect(resolveWorkerpalStartupReadinessProbeMaxMs({})).toBe(5_000);
+    expect(
+      resolveWorkerpalStartupReadinessProbeMaxMs({
+        PUSHPALS_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS: "12000",
+      }),
+    ).toBe(12_000);
+    expect(
+      resolveWorkerpalStartupReadinessProbeMaxMs({
+        PUSHPALS_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS: "250",
+      }),
+    ).toBe(1_000);
   });
 
   test("startup readiness reports blocked immediately when WorkerPal auto-spawn is disabled", () => {

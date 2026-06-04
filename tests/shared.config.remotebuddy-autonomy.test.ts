@@ -42,6 +42,7 @@ describe("shared config remotebuddy autonomy parsing", () => {
       expect(cfg.remotebuddy.autonomy.tickIntervalMs).toBe(120_000);
       expect(cfg.remotebuddy.autonomy.killSwitchEnabled).toBe(false);
       expect(cfg.remotebuddy.autonomy.allowDirtyWorktree).toBe(false);
+      expect(cfg.remotebuddy.autonomy.startupGraceMs).toBe(120_000);
       expect(cfg.remotebuddy.autonomy.heartbeatLogMs).toBe(30_000);
       expect(cfg.remotebuddy.autonomy.visionContextMaxChars).toBe(65_536);
       expect(cfg.remotebuddy.autonomy.exploreRate).toBe(0.3);
@@ -54,6 +55,37 @@ describe("shared config remotebuddy autonomy parsing", () => {
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentChars).toBe(600);
       expect(cfg.remotebuddy.autonomy.prFeedbackSummaryChars).toBe(600);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("REMOTEBUDDY_AUTONOMY_STARTUP_GRACE_MS overrides TOML", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
+    const configDir = join(root, "configs");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, "default.toml"),
+      [
+        'profile = "dev"',
+        "",
+        "[remotebuddy.autonomy]",
+        "enabled = true",
+        "startup_grace_ms = 120000",
+      ].join("\n"),
+      "utf8",
+    );
+    writeFileSync(join(configDir, "local.example.toml"), "", "utf8");
+
+    const key = "REMOTEBUDDY_AUTONOMY_STARTUP_GRACE_MS";
+    const prior = process.env[key];
+    process.env[key] = "45000";
+    try {
+      const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
+      expect(cfg.remotebuddy.autonomy.startupGraceMs).toBe(45_000);
+    } finally {
+      if (prior == null) delete process.env[key];
+      else process.env[key] = prior;
       rmSync(root, { recursive: true, force: true });
     }
   });

@@ -1323,6 +1323,7 @@ function loadPushPalsConfig(options = {}) {
         enabled: parseBoolEnv("REMOTEBUDDY_AUTONOMY_ENABLED") ?? asBoolean(remoteAutonomyNode.enabled, true),
         killSwitchEnabled: parseBoolEnv("REMOTEBUDDY_AUTONOMY_KILL_SWITCH_ENABLED") ?? asBoolean(remoteAutonomyNode.kill_switch_enabled, false),
         tickIntervalMs: Math.max(5000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_TICK_INTERVAL_MS") ?? remoteAutonomyNode.tick_interval_ms, 120000)),
+        startupGraceMs: Math.max(0, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_STARTUP_GRACE_MS") ?? remoteAutonomyNode.startup_grace_ms, 120000)),
         heartbeatLogMs: Math.max(1000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_HEARTBEAT_LOG_MS") ?? remoteAutonomyNode.heartbeat_log_ms, 30000)),
         visionContextMaxChars: Math.max(1000, Math.min(1e6, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_VISION_CONTEXT_MAX_CHARS") ?? remoteAutonomyNode.vision_context_max_chars, 65536))),
         ideationBudgetMs: Math.max(1000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_IDEATION_BUDGET_MS") ?? remoteAutonomyNode.ideation_budget_ms, 20000)),
@@ -6569,6 +6570,7 @@ class RemoteBuddyAutonomousEngine {
   cfg;
   runtimeEnabled = true;
   timer = null;
+  startupGraceTimer = null;
   startupFastTickTimer = null;
   heartbeatTimer = null;
   inFlight = false;
@@ -6641,7 +6643,8 @@ class RemoteBuddyAutonomousEngine {
       console.log(`[RemoteBuddyAutonomousEngine] heartbeat: status=running run=${this.currentRunId} phase=${this.currentPhase} run_elapsed_ms=${runElapsedMs} phase_elapsed_ms=${phaseElapsedMs}`);
       return;
     }
-    const nextTickInMs = this.timer && this.nextTickAtMs > 0 ? Math.max(0, this.nextTickAtMs - now) : 0;
+    const hasScheduledTick = Boolean(this.timer || this.startupGraceTimer || this.startupFastTickTimer);
+    const nextTickInMs = hasScheduledTick && this.nextTickAtMs > 0 ? Math.max(0, this.nextTickAtMs - now) : 0;
     const lastAgeMs = this.lastCompletedAtMs > 0 ? Math.max(0, now - this.lastCompletedAtMs) : -1;
     console.log(`[RemoteBuddyAutonomousEngine] heartbeat: status=idle last_outcome=${this.lastOutcome} detail=${this.lastDetail} last_tick_age_ms=${lastAgeMs} next_tick_in_ms=${nextTickInMs}`);
   }
@@ -6666,6 +6669,15 @@ class RemoteBuddyAutonomousEngine {
   }
   startupFastTickDelayMs() {
     return Math.max(1000, Math.min(STARTUP_FAST_TICK_MAX_DELAY_MS, Math.floor(this.cfg.tickIntervalMs / 10)));
+  }
+  startupGraceMs() {
+    return Math.max(0, this.cfg.startupGraceMs ?? 0);
+  }
+  clearStartupGraceTimer() {
+    if (this.startupGraceTimer) {
+      clearTimeout(this.startupGraceTimer);
+      this.startupGraceTimer = null;
+    }
   }
   clearStartupFastTickTimer() {
     if (this.startupFastTickTimer) {
@@ -8160,22 +8172,42 @@ Scope:
     });
   }
   start() {
-    if (!this.runtimeEnabled || this.timer)
+    if (!this.runtimeEnabled || this.timer || this.startupGraceTimer)
       return;
     console.log(`[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`);
     this.startupFastTickAttemptsRemaining = STARTUP_FAST_TICK_MAX_ATTEMPTS;
-    this.nextTickAtMs = Date.now();
-    this.timer = setInterval(() => {
-      this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
-      this.tick();
-    }, this.cfg.tickIntervalMs);
+    const startInterval = () => {
+      if (this.timer)
+        return;
+      this.timer = setInterval(() => {
+        this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+        this.tick();
+      }, this.cfg.tickIntervalMs);
+    };
+    const firstTickDelayMs = this.startupGraceMs();
+    this.nextTickAtMs = Date.now() + firstTickDelayMs;
     this.heartbeatTimer = setInterval(() => {
       this.logHeartbeat();
     }, this.cfg.heartbeatLogMs);
     this.logHeartbeat();
+    if (firstTickDelayMs > 0) {
+      console.log(`[RemoteBuddyAutonomousEngine] startup autonomy tick delayed by ${firstTickDelayMs}ms to leave cold-start capacity available for user work.`);
+      this.startupGraceTimer = setTimeout(() => {
+        this.startupGraceTimer = null;
+        if (!this.runtimeEnabled)
+          return;
+        startInterval();
+        this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
+        this.tick();
+      }, firstTickDelayMs);
+      return;
+    }
+    startInterval();
+    this.nextTickAtMs = Date.now() + this.cfg.tickIntervalMs;
     this.tick();
   }
   stop() {
+    this.clearStartupGraceTimer();
     this.clearStartupFastTickTimer();
     if (this.timer) {
       clearInterval(this.timer);
@@ -9014,7 +9046,7 @@ class RemoteBuddyOrchestrator {
     console.log(`[RemoteBuddy] Budgets: interactive=${this.executionBudgetInteractiveMs}ms normal=${this.executionBudgetNormalMs}ms background=${this.executionBudgetBackgroundMs}ms finalization=${this.finalizationBudgetMs}ms`);
     console.log(`[RemoteBuddy] Failure log fetch on job failures: ${this.fetchFailureLogsOnJobFailure ? "on" : "off"}`);
     console.log(`[RemoteBuddy] Persistent memory: ${this.memoryEnabled ? "on" : "off"} crossSession=${this.memoryIncludeCrossSession ? "on" : "off"} recallItems=${this.memoryMaxRecallItems} recallChars=${this.memoryMaxRecallChars} retentionDays=${this.memoryRetentionDays}`);
-    console.log(`[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour} exploreRate=${CONFIG.remotebuddy.autonomy.exploreRate.toFixed(2)} allowDirtyWorktree=${CONFIG.remotebuddy.autonomy.allowDirtyWorktree ? "on" : "off"}`);
+    console.log(`[RemoteBuddy] Autonomous engine: ${CONFIG.remotebuddy.autonomy.enabled ? "enabled" : "disabled"} tick=${CONFIG.remotebuddy.autonomy.tickIntervalMs}ms startupGrace=${CONFIG.remotebuddy.autonomy.startupGraceMs}ms maxConcurrentObjectives=${CONFIG.remotebuddy.autonomy.maxConcurrentObjectives} maxDispatchPerHour=${CONFIG.remotebuddy.autonomy.maxDispatchPerHour} exploreRate=${CONFIG.remotebuddy.autonomy.exploreRate.toFixed(2)} allowDirtyWorktree=${CONFIG.remotebuddy.autonomy.allowDirtyWorktree ? "on" : "off"}`);
     console.log(`[RemoteBuddy] Autonomy runtime-config polling: every ${this.autonomyConfigPollMs}ms`);
   }
   async emitStartupStatus() {

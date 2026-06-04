@@ -275,7 +275,9 @@ const EMBEDDED_SERVICE_RESTART_MAX_ATTEMPTS = 4;
 const EMBEDDED_SERVICE_RESTART_STABLE_WINDOW_MS = 60_000;
 const EMBEDDED_SERVICE_RESTART_BASE_BACKOFF_MS = 2_000;
 const EMBEDDED_SERVICE_RESTART_MAX_BACKOFF_MS = 30_000;
-const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS = 15_000;
+const DEFAULT_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS = 5_000;
+const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS_ENV =
+  "PUSHPALS_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS";
 const BLOCKING_WORKERPAL_IMAGE_BUILD_ENV = "PUSHPALS_BLOCKING_WORKERPAL_IMAGE_BUILD";
 const CLI_SESSION_JOB_LOG_MAX_CHARS = 700;
 const CLI_SESSION_SHOW_JOB_EVENTS_ENV = "PUSHPALS_CLI_SHOW_JOB_EVENTS";
@@ -309,6 +311,16 @@ export function formatTimestampedCliLine(line: string, at = new Date()): string 
 
 function isTruthyCliEnvValue(value: unknown): boolean {
   return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
+}
+
+function parseCliIntEnv(
+  name: string,
+  env: Record<string, string | undefined> = process.env,
+): number | null {
+  const raw = env[name];
+  if (raw == null || String(raw).trim() === "") return null;
+  const parsed = Number.parseInt(String(raw), 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 export function shouldShowCliSessionOperationalEvents(
@@ -3506,10 +3518,20 @@ function resolveWorkerpalCapacityTimeoutMs(config: PushPalsConfig): number {
   );
 }
 
+export function resolveWorkerpalStartupReadinessProbeMaxMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const configured = parseCliIntEnv(WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS_ENV, env);
+  return Math.max(
+    1_000,
+    configured ?? DEFAULT_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS,
+  );
+}
+
 function resolveWorkerpalStartupReadinessProbeTimeoutMs(config: PushPalsConfig): number {
   return Math.max(
-    5_000,
-    Math.min(resolveWorkerpalCapacityTimeoutMs(config), WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS),
+    1_000,
+    Math.min(resolveWorkerpalCapacityTimeoutMs(config), resolveWorkerpalStartupReadinessProbeMaxMs()),
   );
 }
 
