@@ -4812,6 +4812,46 @@ var IGNORED_REPO_TARGET_DIRS = new Set([
   "__pycache__",
   "target"
 ]);
+function isPushPalsRepository(repoRoot) {
+  return existsSync4(resolve4(repoRoot, "apps", "remotebuddy", "src", "autonomous_engine.ts")) && existsSync4(resolve4(repoRoot, "apps", "workerpals", "src", "workerpals_main.ts")) && existsSync4(resolve4(repoRoot, "packages", "shared", "src", "autonomy_policy.ts"));
+}
+function isPushPalsInternalUserRepoPath(path) {
+  const normalized = asString2(path).replace(/\\/g, "/").toLowerCase();
+  if (!normalized)
+    return false;
+  return /(^|\/)_layout\.autonomy\.test\.[cm]?[jt]sx?$/.test(normalized);
+}
+function containsPushPalsInternalUserRepoText(text) {
+  return /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|source_control_manager|reviewagent|pushpals)\b/i.test(text);
+}
+function candidateLeaksPushPalsInternals(candidate) {
+  if ([candidate.component_area, ...candidate.target_paths].some((path) => isPushPalsInternalUserRepoPath(path))) {
+    return true;
+  }
+  const publicText = [
+    candidate.title,
+    candidate.problem_statement,
+    candidate.vision_alignment_reason,
+    ...candidate.feature_hypotheses,
+    ...candidate.target_paths
+  ].join(`
+`);
+  return containsPushPalsInternalUserRepoText(publicText);
+}
+function buildRepoNativeFallbackInstruction(candidate) {
+  return [
+    candidate.title,
+    "",
+    candidate.problem_statement,
+    "",
+    "Keep the change scoped to the repo's own product/runtime behavior. Do not add PushPals, WorkerPal, RemoteBuddy, queue-health, or autonomy-internal concepts to user-facing code or tests.",
+    "",
+    "Scope:",
+    `- target_paths: ${candidate.target_paths.join(", ")}`,
+    `- write_globs: ${candidate.scope.write_globs.join(", ")}`
+  ].join(`
+`);
+}
 function pathBasename(path) {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
   const idx = normalized.lastIndexOf("/");
@@ -4890,9 +4930,12 @@ function collectRepoTargetFiles(repoRoot, startRelativePath, maxResults, maxDept
 function discoverRepoTargetProfiles(repoRoot, maxProfiles = 16) {
   const profiles = [];
   const seen = new Set;
+  const allowPushPalsInternalTargets = isPushPalsRepository(repoRoot);
   const add = (targetPath) => {
     const finalPath = normalizeAutonomyComponentArea(targetPath);
     if (!finalPath)
+      return;
+    if (!allowPushPalsInternalTargets && isPushPalsInternalUserRepoPath(finalPath))
       return;
     if (seen.has(finalPath))
       return;
@@ -4959,6 +5002,8 @@ function chooseRepoObjectiveTargetProfile(profiles, objective) {
   let best = null;
   for (const profile of profiles) {
     const label = profile.label.toLowerCase();
+    if (isPushPalsInternalUserRepoPath(label))
+      continue;
     const profileTokens = new Set(profile.keywords);
     let score = 0;
     for (const token of hintTokens) {
@@ -4987,6 +5032,17 @@ function chooseRepoObjectiveTargetProfile(profiles, objective) {
         score += 5;
       if (productSurface)
         score += 1;
+    }
+    if (/\b(web|browser|smoke|e2e|review path|review|navigation|delivery|trust)\b/i.test(objective.title)) {
+      if (/(^|\/)(scripts?|tools?)\/.*(web|browser|smoke|e2e|playwright)/i.test(label)) {
+        score += 8;
+      }
+      if (/\b(app\/(_layout|index)|route|navigation|shell|home|screen)\b/i.test(label)) {
+        score += 4;
+      }
+      if (validationSurface && !/(web|browser|smoke|e2e|playwright)/i.test(label)) {
+        score -= 3;
+      }
     }
     if (categories.has("performance")) {
       if (productSurface || /\b(perf|render|animation|worker|server)\b/i.test(label))
@@ -7479,6 +7535,7 @@ ${JSON.stringify(input.messages ?? [])}`),
       }
       const normalizedCandidates = [];
       const dropReasonCounts = new Map;
+      const allowPushPalsInternalCandidates = isPushPalsRepository(this.autonomyRepo);
       const recordDropReason = (reason) => {
         dropReasonCounts.set(reason, (dropReasonCounts.get(reason) ?? 0) + 1);
       };
@@ -7553,6 +7610,11 @@ ${JSON.stringify(input.messages ?? [])}`),
           candidate.component_area = scopeValidation.componentArea ?? candidate.component_area;
           candidate.target_paths = scopeValidation.normalizedTargetPaths;
           candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
+          if (!allowPushPalsInternalCandidates && candidateLeaksPushPalsInternals(candidate)) {
+            recordDropReason(`${source}_pushpals_internal_leak`);
+            console.warn(`[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: PushPals-internal concepts do not belong in user-repo autonomy work.`);
+            continue;
+          }
           const missingTargetPaths = findMissingRepoTargetPaths(this.autonomyRepo, candidate.target_paths);
           if (missingTargetPaths.length > 0) {
             recordDropReason(`${source}_target_paths_missing_in_repo`);
@@ -7966,13 +8028,17 @@ ${JSON.stringify(input.messages ?? [])}`),
         outcomeDetail = "lock_renew_failed_before_enqueue";
         return;
       }
-      const instruction = canonicalizeInstructionTextForBun(asString2(planningJson.instruction) || `${selected.candidate.title}
+      let instruction = canonicalizeInstructionTextForBun(asString2(planningJson.instruction) || `${selected.candidate.title}
 
 ${selected.candidate.problem_statement}
 
 Scope:
 - target_paths: ${selected.candidate.target_paths.join(", ")}
 - write_globs: ${selected.candidate.scope.write_globs.join(", ")}`);
+      if (!isPushPalsRepository(this.autonomyRepo) && containsPushPalsInternalUserRepoText(instruction)) {
+        console.warn(`[RemoteBuddyAutonomousEngine] replacing autonomy instruction for ${selected.candidate.id}: planner output contained PushPals-internal wording.`);
+        instruction = canonicalizeInstructionTextForBun(buildRepoNativeFallbackInstruction(selected.candidate));
+      }
       this.setPhase("enqueue_request");
       const requestId = await this.enqueueSyntheticRequest(instruction, {
         objectiveId,
@@ -8426,7 +8492,7 @@ function ensureWriteGlobsCoverTargetPaths(targetPaths, writeGlobs) {
   }
   return { normalizedWriteGlobs, uncoveredTargets, addedGlobs };
 }
-function buildExecutionGuidance(plan, targetPaths, requiredValidationSteps = []) {
+function buildExecutionGuidance(plan, targetPaths, requiredValidationSteps = [], repoHintDiagnostics = []) {
   const lines = [];
   const targets = normalizePathHints(targetPaths.length > 0 ? targetPaths : plan.scope.write_globs ?? []);
   if (targets.length > 0) {
@@ -8437,6 +8503,13 @@ function buildExecutionGuidance(plan, targetPaths, requiredValidationSteps = [])
     lines.push("- Treat all target paths as repo-relative to the current working directory.");
     lines.push("- Do not prepend a leading slash to target paths.");
     lines.push("- These paths are relevance hints, not hard write boundaries; edit the behavior-owning files needed for the task and explain any expansion.");
+  }
+  if (repoHintDiagnostics.length > 0) {
+    lines.push("Repo hint preflight:");
+    for (const diagnostic of repoHintDiagnostics.slice(0, 8)) {
+      lines.push(`- ${diagnostic}`);
+    }
+    lines.push("- If a hinted path is absent, treat it as stale guidance unless the user explicitly asked to create that path. Prefer an existing repo-native owner or nearby test.");
   }
   lines.push("Scope:");
   lines.push(`- read_anywhere: ${plan.scope.read_anywhere ? "true" : "false"}`);
@@ -8489,6 +8562,75 @@ function buildExecutionGuidance(plan, targetPaths, requiredValidationSteps = [])
   }
   return lines.join(`
 `).trim();
+}
+function pathHintHasGlob(value) {
+  return /[*?[\]{}]/.test(value);
+}
+function pathHintLooksLikeConcreteFile(value) {
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  const tail = normalized.split("/").pop() ?? normalized;
+  return /\.[A-Za-z0-9][A-Za-z0-9_-]{0,12}$/.test(tail);
+}
+function requestAllowsCreatingMissingPath(value) {
+  return /\b(create|add|new|scaffold|generate|introduce|write)\b.{0,80}\b(file|test|module|component|script|page|route|fixture|helper)\b/i.test(value);
+}
+function shouldTreatMissingTargetAsStale(repoRoot, path, requestText) {
+  const normalized = normalizeTargetPath(path);
+  if (!normalized || normalized === "." || pathHintHasGlob(normalized))
+    return false;
+  if (!pathHintLooksLikeConcreteFile(normalized))
+    return false;
+  if (existsSync5(resolve5(repoRoot, normalized)))
+    return false;
+  if (requestAllowsCreatingMissingPath(requestText))
+    return false;
+  return true;
+}
+function sanitizeRepoNativeTargetHints(params) {
+  const requestText = [
+    params.prompt,
+    params.plan.worker_instruction,
+    params.plan.assistant_message,
+    ...params.plan.acceptance_criteria,
+    ...params.targetPaths
+  ].join(`
+`);
+  const diagnostics = [];
+  const staleHints = [];
+  const targetPaths = params.targetPaths.filter((path) => {
+    const normalized = normalizeTargetPath(path);
+    if (!normalized)
+      return false;
+    if (!shouldTreatMissingTargetAsStale(params.repoRoot, normalized, requestText))
+      return true;
+    staleHints.push(normalized);
+    diagnostics.push(`Path hint "${normalized}" does not exist in this checkout; it was removed as a canonical target and kept only as advisory context.`);
+    return false;
+  });
+  if (staleHints.length > 0) {
+    const staleLower = staleHints.map((path) => path.toLowerCase());
+    params.plan.validation_steps = params.plan.validation_steps.filter((step) => {
+      const lower = step.replace(/\\/g, "/").toLowerCase();
+      return !staleLower.some((path) => lower.includes(path));
+    });
+    params.plan.scope.write_globs = params.plan.scope.write_globs.filter((glob) => {
+      const normalized = normalizeTargetPath(glob);
+      if (!normalized)
+        return false;
+      return !staleLower.includes(normalized.toLowerCase());
+    });
+    if (!params.plan.discovery) {
+      params.plan.discovery = { ripgrep_queries: [] };
+    }
+    const keywords = new Set([...params.plan.discovery.keywords ?? []]);
+    for (const path of staleHints) {
+      const tail = path.split("/").pop();
+      if (tail)
+        keywords.add(tail.replace(/\.[^.]+$/, ""));
+    }
+    params.plan.discovery.keywords = [...keywords].slice(0, 12);
+  }
+  return { targetPaths, diagnostics, staleHints };
 }
 var VALIDATION_COMMAND_PREFIX = /^(git|bun|bunx|npm|npx|pnpm|yarn|node|python|python3|uv|pytest|vitest|jest|tsc|eslint|ruff|mypy|go|cargo|make|docker|pwsh|powershell|sh|bash)\b/i;
 var VALIDATION_GENERIC_SAFE = /^(git\s+status\s+--porcelain|git\s+diff\b)/i;
@@ -9923,7 +10065,17 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       }
       this.pushContext(`[user] ${toSingleLine(prompt, 700)}`, requestSessionId);
       this.pushContext(`[plan] ${toSingleLine(JSON.stringify(plan), 900)}`, requestSessionId);
-      const targetPaths = autonomyMetadata && autonomyMetadata.targetPaths.length > 0 ? autonomyMetadata.targetPaths : plannerTargetPaths(plan, prompt);
+      let targetPaths = autonomyMetadata && autonomyMetadata.targetPaths.length > 0 ? autonomyMetadata.targetPaths : plannerTargetPaths(plan, prompt);
+      const repoHintPreflight = sanitizeRepoNativeTargetHints({
+        repoRoot: this.repo,
+        prompt,
+        plan,
+        targetPaths
+      });
+      targetPaths = repoHintPreflight.targetPaths;
+      if (repoHintPreflight.diagnostics.length > 0) {
+        console.warn(`[RemoteBuddy] Repo hint preflight: ${repoHintPreflight.diagnostics.slice(0, 3).join(" | ")}`);
+      }
       this.rememberPersistentMemory("plan", `intent=${plan.intent} worker=${plan.requires_worker ? "yes" : "no"} lane=${plan.lane} risk=${plan.risk_level} targets=${targetPaths.slice(0, 6).join(",") || "(none)"}`, requestId, requestSessionId);
       const targetPath = targetPaths[0];
       const isAnalysisFromEngine = plan.intent === "analysis" && Boolean(autonomyMetadata);
@@ -9961,8 +10113,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         }
         if (!forceWorker) {
           const missing = [];
-          if (targetPaths.length === 0)
+          if (targetPaths.length === 0 && repoHintPreflight.diagnostics.length === 0) {
             missing.push("target_paths");
+          }
           if (plan.acceptance_criteria.length === 0)
             missing.push("acceptance_criteria");
           if (plan.validation_steps.length === 0)
@@ -9981,7 +10134,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       }
       const canonicalInstruction = prompt.trim();
       const rawPlannerInstruction = sanitizePlannerWorkerInstruction(String(plan.worker_instruction ?? ""), canonicalInstruction);
-      const executionGuidance = buildExecutionGuidance(plan, targetPaths, requiredValidationSteps);
+      const executionGuidance = buildExecutionGuidance(plan, targetPaths, requiredValidationSteps, repoHintPreflight.diagnostics);
       const plannerWorkerInstruction = [rawPlannerInstruction, executionGuidance].filter(Boolean).join(`
 
 `).trim();
@@ -10087,6 +10240,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           } : {},
           acceptanceCriteria: plan.acceptance_criteria,
           validationSteps: plan.validation_steps,
+          ...repoHintPreflight.diagnostics.length > 0 ? { repoHintDiagnostics: repoHintPreflight.diagnostics } : {},
           ...requiredValidationSteps.length > 0 ? { requiredValidationSteps } : {},
           queuePriority: priority,
           queueWaitBudgetMs,

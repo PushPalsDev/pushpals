@@ -32,8 +32,12 @@ from openai_codex_executor import (
     _resolve_reasoning_effort,
     _resolve_task_reasoning_effort,
     _build_instruction,
+    _build_no_edit_recovery_guidance,
+    _build_rollout_recovery_guidance,
     _collect_disallowed_shell_wrapper_rejections,
     _codex_changed_paths,
+    _describe_non_publishable_paths,
+    _detect_offtrack_rollout,
     _detect_codex_workaround_signal,
     _extract_usage_counts,
     _load_prompt_template,
@@ -41,6 +45,8 @@ from openai_codex_executor import (
     _repo_root_for_prompt_loading,
     _restore_repo_local_codex_files,
     _resolve_codex_command_prefix,
+    _resolve_no_edit_watchdog_seconds,
+    _resolve_rollout_watchdog_seconds,
     _unwrap_shell_wrapper_command,
     _usage_from_trace_or_estimate,
 )
@@ -924,6 +930,223 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertGreaterEqual(len(changed_paths), 2)
         self.assertGreaterEqual(len(delta), 2)
         self.assertEqual(effective, [])
+
+    def test_non_publishable_path_summary_names_artifact_only_dirty_paths(self) -> None:
+        changed_paths = [
+            "node_modules/react/index.js",
+            "outputs/data/runtime.log",
+            "src/real-change.ts",
+        ]
+        summary = _describe_non_publishable_paths(changed_paths, ["src/real-change.ts"])
+
+        self.assertIn("node_modules/react/index.js", summary)
+        self.assertIn("outputs/data/runtime.log", summary)
+        self.assertNotIn("src/real-change.ts", summary)
+
+    def test_web_review_tasks_use_faster_no_edit_watchdog(self) -> None:
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
+            watchdog_s = _resolve_no_edit_watchdog_seconds(
+                "Strengthen the repo-native web review path with a compact repo-native patch.",
+                1200,
+            )
+
+        self.assertEqual(watchdog_s, 240)
+
+    def test_no_edit_recovery_guidance_warns_against_artifact_only_progress(self) -> None:
+        guidance = _build_no_edit_recovery_guidance(
+            "item.completed | still inspecting",
+            "node_modules, outputs/data/runtime.log",
+        )
+
+        self.assertIn("node_modules", guidance)
+        self.assertIn("do not invent PushPals/autonomy-specific files", guidance)
+        self.assertIn("Previous Codex event trace excerpt", guidance)
+
+    def test_rollout_watchdog_is_earlier_than_web_review_no_edit_watchdog(self) -> None:
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": ""}, clear=False):
+            no_edit_s = _resolve_no_edit_watchdog_seconds(
+                "Strengthen the repo-native web review path.",
+                1200,
+            )
+            rollout_s = _resolve_rollout_watchdog_seconds(
+                "Strengthen the repo-native web review path.",
+                1200,
+                no_edit_s,
+            )
+
+        self.assertEqual(no_edit_s, 240)
+        self.assertEqual(rollout_s, 180)
+
+    def test_offtrack_rollout_detects_missing_path_and_harness_drift(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | The requested test path is not present in this checkout.",
+                "item.completed | I am checking the React Native test surface before choosing assertion style.",
+            ],
+        }
+
+        self.assertIn("missing hinted files", _detect_offtrack_rollout(trace))
+
+    def test_rollout_recovery_guidance_points_to_repo_native_patch(self) -> None:
+        guidance = _build_rollout_recovery_guidance(
+            "the worker is spending time on missing hinted files",
+            "Codex event trace:\n- missing test path",
+            "node_modules",
+        )
+
+        self.assertIn("Rollout coach recovery", guidance)
+        self.assertIn("stale hint", guidance)
+        self.assertIn("repo-native", guidance)
+        self.assertIn("node_modules", guidance)
+
+    def test_run_codex_task_retries_once_when_rollout_coach_fires(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-coach-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# rollout coach repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed rollout coach repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_rollout_coach.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'Rollout coach recovery' in prompt:",
+                        "    Path('scripts').mkdir(exist_ok=True)",
+                        "    Path('scripts/web-review-path.txt').write_text('repo-native patch\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched after rollout coach guidance.', encoding='utf-8')",
+                        "    print('item.completed | Patched after rollout coach guidance.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "print('item.completed | The requested test path is not present in this checkout.', flush=True)",
+                        "print('item.completed | I am checking the React Native test surface before choosing assertion style.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-rollout-coach-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "700",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "10",
+                "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Strengthen the repo-native web review path.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched after rollout coach guidance", str(result.get("stdout") or ""))
+        self.assertIn("scripts/", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_timeout_reports_artifact_only_changes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-timeout-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# artifact timeout repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed artifact timeout repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_artifact_timeout.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "sys.stdin.read()",
+                        "Path('node_modules').mkdir(exist_ok=True)",
+                        "Path('node_modules/linked.txt').write_text('artifact only\\n', encoding='utf-8')",
+                        "print('item.completed | Touched dependency artifact only.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-artifact-timeout-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "0",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Strengthen the repo-native web review path.",
+                    [],
+                )
+
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertIn("without publishable changes", str(result.get("summary") or ""))
+        self.assertIn("node_modules", str(result.get("stderr") or ""))
 
     def test_run_codex_task_escalates_wrapper_recovery_and_recovers(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-recovery-") as temp_dir:

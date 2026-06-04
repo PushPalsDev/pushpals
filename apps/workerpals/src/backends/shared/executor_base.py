@@ -906,6 +906,15 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
         "Target path hints",
         _string_list(planning.get("targetPaths"), limit=6 if compact_task else 12),
     )
+    _append_list_guidance(
+        lines,
+        "Repo hint preflight diagnostics",
+        _string_list(planning.get("repoHintDiagnostics"), limit=8),
+    )
+    if _string_list(planning.get("repoHintDiagnostics"), limit=1):
+        lines.append(
+            "- If a hinted path is absent, treat it as stale guidance unless the task explicitly asks to create that path; prefer an existing repo-native owner or nearby test."
+        )
 
     discovery = planning.get("discovery")
     if isinstance(discovery, dict):

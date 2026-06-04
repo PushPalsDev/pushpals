@@ -11,13 +11,16 @@ import {
   extractValidationFailureRetryDigest,
   isBrowserValidationInfrastructureDigest,
   knownFailureHintsForPacket,
+  knownValidationRemedyHintsForRuns,
   publishableChangedPaths,
   qualityRevisionBudgetDecision,
   qualityRevisionLoopUpperBound,
   recordBrowserFailureMemory,
+  recordValidationRemedyMemory,
   shouldReviseRequiredValidationBlocker,
   revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
+  workerAttemptRolloutScore,
 } from "../apps/workerpals/src/execute_job";
 
 describe("workerpals quality gate critic issue formatting", () => {
@@ -56,6 +59,61 @@ describe("workerpals quality gate critic issue formatting", () => {
       remainingBudgetMs: 200_000,
       minimumRevisionBudgetMs: 420_000,
     });
+  });
+
+  test("scores worker rollouts by publishable progress, validation, and time", () => {
+    expect(
+      workerAttemptRolloutScore({
+        executorElapsedMs: 600_000,
+        qualityElapsedMs: 60_000,
+        changedPaths: ["src/feature.ts", "tests/feature.test.ts"],
+        validationRuns: [
+          {
+            step: "bun test",
+            command: "bun test",
+            ok: true,
+            exitCode: 0,
+            stdout: "",
+            stderr: "",
+            elapsedMs: 100,
+          },
+        ],
+        qualityIssues: [],
+        criticScore: 8.4,
+      }).score,
+    ).toBeGreaterThan(50);
+
+    const artifactOnly = workerAttemptRolloutScore({
+      executorElapsedMs: 2_000_000,
+      qualityElapsedMs: 10_000,
+      changedPaths: ["node_modules/pkg/index.js"],
+      validationRuns: [],
+      qualityIssues: ["ScopeGate: attempted to publish node_modules changes"],
+      criticScore: null,
+    });
+    expect(artifactOnly.score).toBeLessThan(0);
+    expect(artifactOnly.reasons).toContain("artifact_only_diff");
+  });
+
+  test("persists generic validation remedy hints per repo and job family", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-remedy-memory-"));
+    try {
+      const run = {
+        step: "bun test",
+        command: "bun test",
+        ok: false,
+        exitCode: 1,
+        stdout: "",
+        stderr: "Cannot find module './missing-helper' from 'tests/example.test.ts'",
+        elapsedMs: 42,
+      };
+      recordValidationRemedyMemory(root, "validation|tests", [run]);
+      const hints = knownValidationRemedyHintsForRuns(root, "validation|tests", [run]);
+      expect(hints.join("\n")).toContain("module-resolution");
+      expect(hints.join("\n")).toContain("Fix or avoid the missing import/path");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("returns no issues when score is at/above threshold, regardless of must-fix entries", () => {

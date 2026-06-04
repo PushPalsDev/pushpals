@@ -66,6 +66,7 @@ export interface TaskExecutePlanning {
   acceptanceCriteria: string[];
   validationSteps: string[];
   requiredValidationSteps?: string[];
+  repoHintDiagnostics?: string[];
   queuePriority: TaskExecutePriority;
   queueWaitBudgetMs: number;
   executionBudgetMs: number;
@@ -129,6 +130,18 @@ interface BrowserFailureMemoryEntry {
   lastVerifiedStage: string | null;
   pageUrl: string | null;
   artifactSummaries: string[];
+  suggestedRemedy: string;
+}
+
+interface ValidationRemedyMemoryEntry {
+  key: string;
+  jobFamily: string;
+  command: string;
+  failureClass: string;
+  digest: string;
+  count: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
   suggestedRemedy: string;
 }
 
@@ -216,6 +229,70 @@ export function qualityRevisionBudgetDecision(opts: {
     shouldStart: remainingBudgetMs >= minimumRevisionBudgetMs,
     remainingBudgetMs,
     minimumRevisionBudgetMs,
+  };
+}
+
+export function workerAttemptRolloutScore(params: {
+  executorElapsedMs: number;
+  qualityElapsedMs: number;
+  changedPaths: string[];
+  validationRuns: ValidationExecutionResult[];
+  qualityIssues: string[];
+  criticScore?: number | null;
+}): { score: number; reasons: string[] } {
+  let score = 0;
+  const reasons: string[] = [];
+  const publishable = publishableChangedPaths(params.changedPaths);
+  if (publishable.length > 0) {
+    score += 35;
+    reasons.push("publishable_diff");
+  } else if (params.changedPaths.length > 0) {
+    score -= 35;
+    reasons.push("artifact_only_diff");
+  } else {
+    score -= 20;
+    reasons.push("no_diff");
+  }
+  const passedFast = params.validationRuns.filter(
+    (run) => run.ok && !isLongRunningBrowserValidationCommand(run.command),
+  ).length;
+  const failedFast = params.validationRuns.filter(
+    (run) => !run.ok && !isLongRunningBrowserValidationCommand(run.command),
+  ).length;
+  if (passedFast > 0) {
+    score += Math.min(20, passedFast * 8);
+    reasons.push("fast_validation_passed");
+  }
+  if (failedFast > 0) {
+    score -= Math.min(20, failedFast * 8);
+    reasons.push("fast_validation_failed");
+  }
+  if (params.validationRuns.some((run) => run.ok && isLongRunningBrowserValidationCommand(run.command))) {
+    score += 15;
+    reasons.push("long_validation_passed");
+  }
+  if (params.qualityIssues.length === 0) {
+    score += 20;
+    reasons.push("quality_clean");
+  } else {
+    score -= Math.min(30, params.qualityIssues.length * 6);
+    reasons.push("quality_issues");
+  }
+  if (typeof params.criticScore === "number" && Number.isFinite(params.criticScore)) {
+    score += Math.max(-20, Math.min(20, Math.round((params.criticScore - 8) * 5)));
+    reasons.push("critic_scored");
+  }
+  const totalElapsedMs = Math.max(0, params.executorElapsedMs + params.qualityElapsedMs);
+  if (totalElapsedMs > 1_800_000) {
+    score -= 20;
+    reasons.push("over_30m");
+  } else if (totalElapsedMs <= 1_200_000) {
+    score += 10;
+    reasons.push("under_20m");
+  }
+  return {
+    score: Math.max(-100, Math.min(100, score)),
+    reasons: reasons.slice(0, 8),
   };
 }
 
@@ -429,6 +506,7 @@ function collectPlanningText(planning: TaskExecutePlanning): string {
     ...(planning.acceptanceCriteria ?? []),
     ...(planning.validationSteps ?? []),
     ...(planning.requiredValidationSteps ?? []),
+    ...(planning.repoHintDiagnostics ?? []),
     ...(planning.discovery?.keywords ?? []),
     ...(planning.discovery?.likelyDirs ?? []),
     ...(planning.discovery?.ripgrepQueries ?? []),
@@ -1191,6 +1269,36 @@ export function isParallelSafeFastValidationCommand(repo: string, command: strin
     return true;
   }
   return false;
+}
+
+function isDeterministicFastValidationFailure(run: ValidationExecutionResult): boolean {
+  if (run.ok || run.exitCode === 127 || isLongRunningBrowserValidationCommand(run.command)) {
+    return false;
+  }
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  if (!combined.trim()) return false;
+  return (
+    /\bCannot find module\b|\bmodule not found\b|\bfailed to resolve import\b|\bcould not resolve\b|\bNo such file or directory\b|\bENOENT\b/i.test(
+      combined,
+    ) ||
+    /\bTS\d{4}\b|\btype error\b|\bno exported member\b|\bdoes not exist on type\b|\bis not assignable to\b/i.test(
+      combined,
+    ) ||
+    /\berror:\s+"eslint"\s+exited with code\s+\d+\b/i.test(combined) ||
+    /\bSyntaxError\b|\bReferenceError\b|\bTypeError\b/i.test(combined)
+  );
+}
+
+export function shouldDeferLongValidationAfterFastFailures(
+  command: string,
+  previousRuns: ValidationExecutionResult[],
+): string | null {
+  if (!isLongRunningBrowserValidationCommand(command)) return null;
+  const deterministicFailures = previousRuns.filter(isDeterministicFastValidationFailure);
+  if (deterministicFailures.length === 0) return null;
+  const first = deterministicFailures[0];
+  const digest = extractValidationFailureDigest(first);
+  return `fast validation already failed for "${first.command}"${digest ? ` (${digest})` : ""}`;
 }
 
 function readPackageJson(repo: string): {
@@ -2427,6 +2535,21 @@ function resolveFailureMemoryPath(repo: string): string {
   return resolve(root, "outputs", "data", "workerpals-failure-memory.json");
 }
 
+function resolveRemedyMemoryPath(repo: string): string {
+  const rootCandidates = [
+    process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE,
+    process.env.PUSHPALS_REPO_ROOT_OVERRIDE,
+    process.env.PUSHPALS_REPO_PATH,
+    repo,
+  ]
+    .map((entry) => String(entry ?? "").trim())
+    .filter(Boolean);
+  const root = rootCandidates.find((entry) => existsSync(entry)) ?? repo;
+  const gitStatePath = resolveGitStateFilePath(root, "pushpals-worker-remedy-memory.json");
+  if (gitStatePath) return gitStatePath;
+  return resolve(root, "outputs", "data", "workerpals-remedy-memory.json");
+}
+
 function readBrowserFailureMemory(repo: string): BrowserFailureMemoryEntry[] {
   const memoryPath = resolveFailureMemoryPath(repo);
   try {
@@ -2510,6 +2633,149 @@ export function recordBrowserFailureMemory(
     writeFileSync(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}\n`);
   } catch {
     // Failure memory is advisory; never fail a worker job because persistence is unavailable.
+  }
+}
+
+function classifyValidationFailureForRemedy(run: ValidationExecutionResult): string {
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  if (isLongRunningBrowserValidationCommand(run.command)) return "browser";
+  if (/\bCannot find module\b|\bmodule not found\b|\bfailed to resolve import\b|\bcould not resolve\b/i.test(combined)) {
+    return "module-resolution";
+  }
+  if (/\bTS\d{4}\b|\btype error\b|\bno exported member\b|\bdoes not exist on type\b|\bis not assignable to\b/i.test(combined)) {
+    return "typecheck";
+  }
+  if (/\bESLint\b|\beslint\b|\blint\b/i.test(run.command) || /\berror:\s+"eslint"\s+exited/i.test(combined)) {
+    return "lint";
+  }
+  if (/\bNo such file or directory\b|\bENOENT\b|\bpath does not exist\b/i.test(combined)) {
+    return "missing-path";
+  }
+  if (/\breact[- ]native|mock|__mocks__|setupTests?|jest|vitest|test helper\b/i.test(combined)) {
+    return "test-harness";
+  }
+  return "validation";
+}
+
+function validationRemedyMemoryKey(jobFamily: string, run: ValidationExecutionResult): string {
+  const failureClass = classifyValidationFailureForRemedy(run);
+  const digest = extractValidationFailureRetryDigest(run);
+  return [
+    jobFamily,
+    validationCommandKey(run.command),
+    failureClass,
+    normalizeFailureMemoryToken(digest),
+  ]
+    .filter(Boolean)
+    .join("|");
+}
+
+function validationFailureSuggestedRemedy(run: ValidationExecutionResult): string {
+  const failureClass = classifyValidationFailureForRemedy(run);
+  switch (failureClass) {
+    case "module-resolution":
+      return "Fix or avoid the missing import/path first; do not run long browser validation while module resolution is broken.";
+    case "typecheck":
+      return "Fix TypeScript/type errors before broader validation; prefer the smallest type-safe patch over test-harness expansion.";
+    case "lint":
+      return "Fix lint/static issues before expensive runtime checks; avoid unrelated formatting churn.";
+    case "missing-path":
+      return "Treat absent hinted paths as stale unless the task explicitly asks to create them; switch to an existing repo-native owner.";
+    case "test-harness":
+      return "If failures are in mocks/import setup, reduce to smaller helper/state coverage instead of broad shared mock expansion.";
+    default:
+      return "Repair the first deterministic fast validation failure before running long browser/e2e validation.";
+  }
+}
+
+function readValidationRemedyMemory(repo: string): ValidationRemedyMemoryEntry[] {
+  const memoryPath = resolveRemedyMemoryPath(repo);
+  try {
+    const parsed = JSON.parse(readFileSync(memoryPath, "utf8")) as { entries?: unknown };
+    if (!Array.isArray(parsed.entries)) return [];
+    return parsed.entries
+      .filter((entry): entry is ValidationRemedyMemoryEntry =>
+        Boolean(entry && typeof entry === "object"),
+      )
+      .slice(0, 120);
+  } catch {
+    return [];
+  }
+}
+
+export function knownValidationRemedyHintsForRuns(
+  repo: string,
+  jobFamily: string,
+  runs: ValidationExecutionResult[],
+): string[] {
+  const failed = runs.filter((run) => !run.ok && !isLongRunningBrowserValidationCommand(run.command));
+  if (failed.length === 0) return [];
+  const entries = readValidationRemedyMemory(repo);
+  const hints: string[] = [];
+  for (const run of failed.slice(0, 4)) {
+    const failureClass = classifyValidationFailureForRemedy(run);
+    const commandKey = validationCommandKey(run.command);
+    const matches = entries
+      .filter(
+        (entry) =>
+          entry.jobFamily === jobFamily &&
+          validationCommandKey(entry.command) === commandKey &&
+          entry.failureClass === failureClass,
+      )
+      .sort((a, b) => b.count - a.count || b.lastSeenAt.localeCompare(a.lastSeenAt))
+      .slice(0, 2);
+    for (const entry of matches) {
+      hints.push(
+        toSingleLine(
+          `${entry.command} ${entry.failureClass} seen ${entry.count}x before; last=${entry.lastSeenAt}; remedy=${entry.suggestedRemedy}`,
+          360,
+        ),
+      );
+    }
+  }
+  return Array.from(new Set(hints)).slice(0, 5);
+}
+
+export function recordValidationRemedyMemory(
+  repo: string,
+  jobFamily: string,
+  runs: ValidationExecutionResult[],
+): void {
+  const failed = runs.filter((run) => !run.ok && !isLongRunningBrowserValidationCommand(run.command));
+  if (failed.length === 0) return;
+  const memoryPath = resolveRemedyMemoryPath(repo);
+  const now = new Date().toISOString();
+  const entries = readValidationRemedyMemory(repo);
+  for (const run of failed.slice(0, 6)) {
+    const key = validationRemedyMemoryKey(jobFamily, run);
+    const existing = entries.find((entry) => entry.key === key);
+    if (existing) {
+      existing.count += 1;
+      existing.lastSeenAt = now;
+      existing.digest = extractValidationFailureRetryDigest(run);
+      existing.suggestedRemedy = validationFailureSuggestedRemedy(run);
+    } else {
+      entries.push({
+        key,
+        jobFamily,
+        command: run.command,
+        failureClass: classifyValidationFailureForRemedy(run),
+        digest: extractValidationFailureRetryDigest(run),
+        count: 1,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        suggestedRemedy: validationFailureSuggestedRemedy(run),
+      });
+    }
+  }
+  const next = entries
+    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt))
+    .slice(0, 120);
+  try {
+    mkdirSync(resolve(memoryPath, ".."), { recursive: true });
+    writeFileSync(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}\n`);
+  } catch {
+    // Remedy memory is advisory; never fail a worker job because persistence is unavailable.
   }
 }
 
@@ -3295,6 +3561,26 @@ async function runDeterministicQualityGate(
         );
         continue;
       }
+      const deferredReason = shouldDeferLongValidationAfterFastFailures(command, validationRuns);
+      if (deferredReason) {
+        const stderr =
+          `Skipped long validation command because ${deferredReason}. ` +
+          "Fix the deterministic fast validation blocker first; PushPals will run long browser/e2e validation after the fast layer is clean.";
+        validationRuns.push({
+          step: command,
+          command,
+          ok: false,
+          exitCode: 125,
+          stdout: "",
+          stderr,
+          elapsedMs: 1,
+        });
+        onLog?.(
+          "stderr",
+          `[ValidationGate] Deferred long validation after fast failure: ${command} (${deferredReason})`,
+        );
+        continue;
+      }
       const commandNeedsPlaywrightBrowserRuntime = shouldEnsurePlaywrightBrowserRuntime(
         repo,
         command,
@@ -3764,6 +4050,7 @@ export function buildQualityRevisionHint(
   validationBlocker: ValidationBlocker | null = null,
   browserRepairPacket: BrowserValidationRepairPacket | null = null,
   changedPaths: string[] = [],
+  validationRemedyHints: string[] = [],
 ): string {
   const lines: string[] = [];
   lines.push("Quality revision required before completion.");
@@ -3781,6 +4068,21 @@ export function buildQualityRevisionHint(
     validationRuns,
   );
   if (testHarnessConvergenceWarning) lines.push(testHarnessConvergenceWarning);
+  if ((planning.repoHintDiagnostics ?? []).length > 0) {
+    lines.push("Repo hint diagnostics:");
+    for (const hint of planning.repoHintDiagnostics ?? []) {
+      lines.push(`- ${hint}`);
+    }
+    lines.push(
+      "Hint handling rule: stale or absent path hints are advisory context, not permission to invent repo-specific scaffolding. Prefer an existing behavior owner or existing nearby test.",
+    );
+  }
+  if (validationRemedyHints.length > 0) {
+    lines.push("Known issue/remedy memory for this repo/job family:");
+    for (const hint of validationRemedyHints.slice(0, 5)) {
+      lines.push(`- ${hint}`);
+    }
+  }
   if (planningLooksLikeVisualDerivationTask(planning)) {
     lines.push(
       "Visual derivation testing rule: prefer pure helper/state/style-prop tests for planet/projectile/ownership/readability cues. Only add a full React Native render regression when this repo already has a stable harness for that exact surface; otherwise keep render-visible behavior covered through the derived inputs that drive it.",
@@ -6221,16 +6523,112 @@ export function collectWriteScopeIssuesFromChangedPaths(
   return [];
 }
 
-function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
+function pathHintHasGlob(value: string): boolean {
+  return /[*?[\]{}]/.test(value);
+}
+
+function pathHintLooksLikeConcreteFile(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  const tail = normalized.split("/").pop() ?? normalized;
+  return /\.[A-Za-z0-9][A-Za-z0-9_-]{0,12}$/.test(tail);
+}
+
+function taskTextAllowsCreatingMissingPaths(value: string): boolean {
+  return /\b(create|add|new|scaffold|generate|introduce|write)\b.{0,80}\b(file|test|module|component|script|page|route|fixture|helper)\b/i.test(
+    value,
+  );
+}
+
+function shouldTreatMissingPathHintAsStale(
+  repo: string,
+  path: string,
+  taskText: string,
+): boolean {
+  const normalized = normalizeStagePath(path);
+  if (!normalized || normalized === "." || pathHintHasGlob(normalized)) return false;
+  if (existsSync(resolve(repo, normalized))) return false;
+  if (!pathHintLooksLikeConcreteFile(normalized)) return false;
+  if (taskTextAllowsCreatingMissingPaths(taskText)) return false;
+  return true;
+}
+
+function pathParentExists(repo: string, path: string): boolean {
+  const normalized = normalizeStagePath(path);
+  if (!normalized || normalized === "." || pathHintHasGlob(normalized)) return true;
+  const parts = normalized.split("/");
+  if (parts.length <= 1) return true;
+  return existsSync(resolve(repo, parts.slice(0, -1).join("/")));
+}
+
+function sanitizeStalePathHints(
+  repo: string,
+  values: unknown,
+  taskText: string,
+): { values: string[]; stale: string[]; diagnostics: string[] } {
+  const stale: string[] = [];
+  const diagnostics: string[] = [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of toStringArray(values)) {
+    if (seen.has(raw.toLowerCase())) continue;
+    seen.add(raw.toLowerCase());
+    if (shouldTreatMissingPathHintAsStale(repo, raw, taskText)) {
+      stale.push(raw);
+      diagnostics.push(`Path hint "${raw}" does not exist in this checkout; treat it as stale unless the task explicitly asks to create it.`);
+      continue;
+    }
+    if (!pathParentExists(repo, raw) && !taskTextAllowsCreatingMissingPaths(taskText)) {
+      diagnostics.push(`Path hint "${raw}" has a missing parent directory; verify the existing repo owner before editing.`);
+    }
+    out.push(raw);
+  }
+  return { values: out, stale, diagnostics };
+}
+
+function validationStepMentionsAnyPath(step: string, paths: string[]): boolean {
+  const lower = step.replace(/\\/g, "/").toLowerCase();
+  return paths.some((path) => lower.includes(path.replace(/\\/g, "/").toLowerCase()));
+}
+
+export function sanitizeTaskExecutePlanningPathHints(
+  value: unknown,
+  repo?: string,
+  instruction = "",
+): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   const planning = value as Record<string, unknown>;
   const out: Record<string, unknown> = { ...planning };
+  const taskText = [
+    instruction,
+    planning.intent,
+    ...(isStringArray(planning.targetPaths) ? planning.targetPaths : []),
+    ...(isStringArray(planning.acceptanceCriteria) ? planning.acceptanceCriteria : []),
+    ...(isStringArray(planning.validationSteps) ? planning.validationSteps : []),
+  ]
+    .map((entry) => String(entry ?? ""))
+    .join("\n");
+  const repoDiagnostics: string[] = isStringArray(planning.repoHintDiagnostics)
+    ? toStringArray(planning.repoHintDiagnostics)
+    : [];
+  const staleHints: string[] = [];
+
+  if (repo && isStringArray(planning.targetPaths)) {
+    const sanitized = sanitizeStalePathHints(repo, planning.targetPaths, taskText);
+    out.targetPaths = sanitized.values;
+    staleHints.push(...sanitized.stale);
+    repoDiagnostics.push(...sanitized.diagnostics);
+  }
 
   if (planning.scope && typeof planning.scope === "object" && !Array.isArray(planning.scope)) {
     const scope = planning.scope as Record<string, unknown>;
     const normalizedScope: Record<string, unknown> = { ...scope };
     if (isStringArray(scope.writeGlobs)) {
-      normalizedScope.writeGlobs = toStringArray(scope.writeGlobs);
+      const sanitized = repo
+        ? sanitizeStalePathHints(repo, scope.writeGlobs, taskText)
+        : { values: toStringArray(scope.writeGlobs), stale: [], diagnostics: [] };
+      normalizedScope.writeGlobs = sanitized.values;
+      staleHints.push(...sanitized.stale);
+      repoDiagnostics.push(...sanitized.diagnostics);
     }
     if (isStringArray(scope.forbiddenGlobs)) {
       normalizedScope.forbiddenGlobs = toStringArray(scope.forbiddenGlobs);
@@ -6246,9 +6644,28 @@ function sanitizeTaskExecutePlanningPathHints(value: unknown): unknown {
     const discovery = planning.discovery as Record<string, unknown>;
     const normalizedDiscovery: Record<string, unknown> = { ...discovery };
     if (isStringArray(discovery.likelyDirs)) {
-      normalizedDiscovery.likelyDirs = toStringArray(discovery.likelyDirs);
+      const sanitized = repo
+        ? sanitizeStalePathHints(repo, discovery.likelyDirs, taskText)
+        : { values: toStringArray(discovery.likelyDirs), stale: [], diagnostics: [] };
+      normalizedDiscovery.likelyDirs = sanitized.values;
+      staleHints.push(...sanitized.stale);
+      repoDiagnostics.push(...sanitized.diagnostics);
     }
     out.discovery = normalizedDiscovery;
+  }
+
+  if (staleHints.length > 0 && isStringArray(planning.validationSteps)) {
+    out.validationSteps = toStringArray(planning.validationSteps).filter(
+      (step) => !validationStepMentionsAnyPath(step, staleHints),
+    );
+  }
+  if (staleHints.length > 0 && isStringArray(planning.requiredValidationSteps)) {
+    out.requiredValidationSteps = toStringArray(planning.requiredValidationSteps).filter(
+      (step) => !validationStepMentionsAnyPath(step, staleHints),
+    );
+  }
+  if (repoDiagnostics.length > 0) {
+    out.repoHintDiagnostics = Array.from(new Set(repoDiagnostics)).slice(0, 8);
   }
 
   return out;
@@ -6748,7 +7165,8 @@ export async function executeJob(
       exitCode: 2,
     };
   }
-  const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(params.planning);
+  const instruction = String(params.instruction ?? "").trim();
+  const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(params.planning, repo, instruction);
   const planning = sanitizedPlanning as TaskExecutePlanning;
   if (origin === "autonomy" && toStringArray(planning.scope.writeGlobs ?? []).length === 0) {
     onLog?.(
@@ -6756,8 +7174,16 @@ export async function executeJob(
       "[TaskExecute] Scope suggestion: planning.scope.writeGlobs is empty for autonomy-origin task.",
     );
   }
+  if ((planning.repoHintDiagnostics ?? []).length > 0) {
+    onLog?.(
+      "stdout",
+      `[TaskExecute] Repo hint preflight: ${(planning.repoHintDiagnostics ?? [])
+        .slice(0, 3)
+        .map((entry) => toSingleLine(entry, 180))
+        .join(" | ")}`,
+    );
+  }
 
-  const instruction = String(params.instruction ?? "").trim();
   if (!instruction) {
     return {
       ok: false,
@@ -6979,6 +7405,12 @@ export async function executeJob(
       "stdout",
       `[JobRunner] Performance summary: attempt=${revisionAttempt}, executor=${executorElapsedMs}ms, quality=${qualityElapsedMs}ms, validation_commands=${quality.validationRuns.length}, validation_command_time=${validationCommandElapsedMs}ms, changed_files=${quality.changedPaths.length}`,
     );
+    recordValidationRemedyMemory(repo, failureJobFamily, quality.validationRuns);
+    const validationRemedyHints = knownValidationRemedyHintsForRuns(
+      repo,
+      failureJobFamily,
+      quality.validationRuns,
+    );
     let browserRepairPacket = buildBrowserValidationRepairPacket(
       quality.validationRuns,
       previousValidationFailureDigests,
@@ -7017,6 +7449,18 @@ export async function executeJob(
     if (!qualityGatePolicy.criticGateEnabled) {
       onLog?.("stdout", "[CriticGate] Disabled by workerpals.quality_critic_gate_enabled=false.");
     }
+    const rolloutScore = workerAttemptRolloutScore({
+      executorElapsedMs,
+      qualityElapsedMs,
+      changedPaths: quality.changedPaths,
+      validationRuns: quality.validationRuns,
+      qualityIssues: quality.issues,
+      criticScore: critic?.score,
+    });
+    onLog?.(
+      "stdout",
+      `[JobRunner] Rollout score: score=${rolloutScore.score} reasons=${rolloutScore.reasons.join(",") || "none"}`,
+    );
     const advisoryRelaxedQualityIssues = relaxAdvisoryQualityIssues(
       quality.issues,
       quality.validationRuns,
@@ -7299,6 +7743,7 @@ export async function executeJob(
       validationOutsideTaskScope ? null : quality.blocker,
       validationOutsideTaskScope ? null : browserRepairPacket,
       quality.changedPaths,
+      validationRemedyHints,
     );
     onLog?.(
       "stderr",

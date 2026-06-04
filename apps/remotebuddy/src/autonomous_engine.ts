@@ -1200,6 +1200,66 @@ const IGNORED_REPO_TARGET_DIRS = new Set([
   "target",
 ]);
 
+function isPushPalsRepository(repoRoot: string): boolean {
+  return (
+    existsSync(resolve(repoRoot, "apps", "remotebuddy", "src", "autonomous_engine.ts")) &&
+    existsSync(resolve(repoRoot, "apps", "workerpals", "src", "workerpals_main.ts")) &&
+    existsSync(resolve(repoRoot, "packages", "shared", "src", "autonomy_policy.ts"))
+  );
+}
+
+function isPushPalsInternalUserRepoPath(path: string): boolean {
+  const normalized = asString(path).replace(/\\/g, "/").toLowerCase();
+  if (!normalized) return false;
+  return /(^|\/)_layout\.autonomy\.test\.[cm]?[jt]sx?$/.test(normalized);
+}
+
+function containsPushPalsInternalUserRepoText(text: string): boolean {
+  return /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|source_control_manager|reviewagent|pushpals)\b/i.test(
+    text,
+  );
+}
+
+function candidateLeaksPushPalsInternals(candidate: Pick<
+  AutonomyCandidate,
+  | "title"
+  | "problem_statement"
+  | "vision_alignment_reason"
+  | "feature_hypotheses"
+  | "target_paths"
+  | "component_area"
+>): boolean {
+  if (
+    [candidate.component_area, ...candidate.target_paths].some((path) =>
+      isPushPalsInternalUserRepoPath(path),
+    )
+  ) {
+    return true;
+  }
+  const publicText = [
+    candidate.title,
+    candidate.problem_statement,
+    candidate.vision_alignment_reason,
+    ...candidate.feature_hypotheses,
+    ...candidate.target_paths,
+  ].join("\n");
+  return containsPushPalsInternalUserRepoText(publicText);
+}
+
+function buildRepoNativeFallbackInstruction(candidate: AutonomyCandidate): string {
+  return [
+    candidate.title,
+    "",
+    candidate.problem_statement,
+    "",
+    "Keep the change scoped to the repo's own product/runtime behavior. Do not add PushPals, WorkerPal, RemoteBuddy, queue-health, or autonomy-internal concepts to user-facing code or tests.",
+    "",
+    "Scope:",
+    `- target_paths: ${candidate.target_paths.join(", ")}`,
+    `- write_globs: ${candidate.scope.write_globs.join(", ")}`,
+  ].join("\n");
+}
+
 function pathBasename(path: string): string {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
   const idx = normalized.lastIndexOf("/");
@@ -1289,9 +1349,11 @@ function collectRepoTargetFiles(
 function discoverRepoTargetProfiles(repoRoot: string, maxProfiles = 16): RepoTargetProfile[] {
   const profiles: RepoTargetProfile[] = [];
   const seen = new Set<string>();
+  const allowPushPalsInternalTargets = isPushPalsRepository(repoRoot);
   const add = (targetPath: string | null | undefined): void => {
     const finalPath = normalizeAutonomyComponentArea(targetPath);
     if (!finalPath) return;
+    if (!allowPushPalsInternalTargets && isPushPalsInternalUserRepoPath(finalPath)) return;
     if (seen.has(finalPath)) return;
     seen.add(finalPath);
     profiles.push(buildRepoTargetProfile(finalPath));
@@ -1364,6 +1426,7 @@ function chooseRepoObjectiveTargetProfile(
   let best: { profile: RepoTargetProfile; score: number } | null = null;
   for (const profile of profiles) {
     const label = profile.label.toLowerCase();
+    if (isPushPalsInternalUserRepoPath(label)) continue;
     const profileTokens = new Set(profile.keywords);
     let score = 0;
     for (const token of hintTokens) {
@@ -1396,6 +1459,17 @@ function chooseRepoObjectiveTargetProfile(
     if (categories.has("validation")) {
       if (validationSurface || scriptSurface) score += 5;
       if (productSurface) score += 1;
+    }
+    if (/\b(web|browser|smoke|e2e|review path|review|navigation|delivery|trust)\b/i.test(objective.title)) {
+      if (/(^|\/)(scripts?|tools?)\/.*(web|browser|smoke|e2e|playwright)/i.test(label)) {
+        score += 8;
+      }
+      if (/\b(app\/(_layout|index)|route|navigation|shell|home|screen)\b/i.test(label)) {
+        score += 4;
+      }
+      if (validationSurface && !/(web|browser|smoke|e2e|playwright)/i.test(label)) {
+        score -= 3;
+      }
     }
     if (categories.has("performance")) {
       if (productSurface || /\b(perf|render|animation|worker|server)\b/i.test(label)) score += 4;
@@ -5102,6 +5176,7 @@ export class RemoteBuddyAutonomousEngine {
       }
       const normalizedCandidates: AutonomyCandidate[] = [];
       const dropReasonCounts = new Map<string, number>();
+      const allowPushPalsInternalCandidates = isPushPalsRepository(this.autonomyRepo);
       const recordDropReason = (reason: string): void => {
         dropReasonCounts.set(reason, (dropReasonCounts.get(reason) ?? 0) + 1);
       };
@@ -5196,6 +5271,16 @@ export class RemoteBuddyAutonomousEngine {
             candidate.component_area) as AutonomyComponentArea;
           candidate.target_paths = scopeValidation.normalizedTargetPaths;
           candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
+          if (
+            !allowPushPalsInternalCandidates &&
+            candidateLeaksPushPalsInternals(candidate)
+          ) {
+            recordDropReason(`${source}_pushpals_internal_leak`);
+            console.warn(
+              `[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: PushPals-internal concepts do not belong in user-repo autonomy work.`,
+            );
+            continue;
+          }
           const missingTargetPaths = findMissingRepoTargetPaths(
             this.autonomyRepo,
             candidate.target_paths,
@@ -5665,12 +5750,23 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "lock_renew_failed_before_enqueue";
         return;
       }
-      const instruction = canonicalizeInstructionTextForBun(
+      let instruction = canonicalizeInstructionTextForBun(
         asString(planningJson.instruction) ||
           `${selected.candidate.title}\n\n${selected.candidate.problem_statement}\n\nScope:\n- target_paths: ${selected.candidate.target_paths.join(
             ", ",
           )}\n- write_globs: ${selected.candidate.scope.write_globs.join(", ")}`,
       );
+      if (
+        !isPushPalsRepository(this.autonomyRepo) &&
+        containsPushPalsInternalUserRepoText(instruction)
+      ) {
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] replacing autonomy instruction for ${selected.candidate.id}: planner output contained PushPals-internal wording.`,
+        );
+        instruction = canonicalizeInstructionTextForBun(
+          buildRepoNativeFallbackInstruction(selected.candidate),
+        );
+      }
 
       this.setPhase("enqueue_request");
       const requestId = await this.enqueueSyntheticRequest(instruction, {

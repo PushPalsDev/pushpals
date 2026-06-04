@@ -160,7 +160,7 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
   test("repo vision fallback preserves repo-native priority headings before meta engine work", () => {
     const sectorVision = {
       one_sentence:
-        "SectorCommand is a fast, readable real-time planet conquest game with short high-pressure matches.",
+        "The game is a fast, readable real-time planet conquest experience with short high-pressure matches.",
       key_items: {
         target_users: ["Players who want readable real-time strategy without RTS control burden"],
         priorities: [
@@ -329,6 +329,68 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
     );
     expect(String(candidates[0].problem_statement)).toContain("repo's own product/domain language");
     expect(candidates[0].engine_trial).toBeUndefined();
+  });
+
+  test("repo vision fallback keeps web review work on repo-native web targets", () => {
+    const webVision = {
+      one_sentence: "The app ships a trustworthy browser-playable product shell.",
+      key_items: {
+        target_users: ["Players using the web build"],
+        priorities: ["Make web delivery and navigation trustworthy"],
+        objectives: ["Make the web review path easy to trust"],
+        guardrails: ["Keep user-repo work focused on app behavior"],
+        constraints: ["Browser validation is required for UI-affecting work"],
+        non_goals: ["Do not add PushPals-internal autonomy concepts to the app"],
+        metrics: ["Browser smoke coverage exercises the main shell path"],
+        testing_criteria: ["bun run web:e2e"],
+        risk_policy: ["Low-risk shell validation changes can ship autonomously"],
+        operating_model: ["Workers should use repo-native validation"],
+        governance: ["Review coverage should describe product behavior"],
+      },
+      section_numbers: ["4", "6", "9"],
+    };
+    const repoTargets = [
+      {
+        component_area: "app/__tests__",
+        target_paths: ["app/__tests__/_layout.autonomy.test.ts"],
+        write_globs: ["app/__tests__/_layout.autonomy.test.ts"],
+        label: "app/__tests__/_layout.autonomy.test.ts",
+        keywords: ["app", "tests", "layout", "autonomy"],
+      },
+      {
+        component_area: "scripts",
+        target_paths: ["scripts/test-web-e2e.js"],
+        write_globs: ["scripts/test-web-e2e.js"],
+        label: "scripts/test-web-e2e.js",
+        keywords: ["scripts", "test", "web", "e2e", "browser", "smoke"],
+      },
+      {
+        component_area: "app",
+        target_paths: ["app/_layout.tsx"],
+        write_globs: ["app/_layout.tsx"],
+        label: "app/_layout.tsx",
+        keywords: ["app", "layout", "navigation", "shell"],
+      },
+    ];
+
+    const context = buildEngineInspirationContext({
+      vision: webVision,
+      snapshot,
+      repoTargets,
+    });
+    const candidates = buildRepoVisionFallbackCandidates({
+      engineInspiration: context,
+      snapshotTopSignals: snapshot.top_signals,
+      visionSectionRefs: webVision.section_numbers,
+      repoTargets,
+      maxCandidates: 2,
+    });
+
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(String(candidates[0].title)).toContain("web delivery");
+    expect(candidates[0].target_paths).toEqual(["scripts/test-web-e2e.js"]);
+    expect(candidates[0].expected_validation).toContain("bun run web:e2e");
+    expect(JSON.stringify(candidates)).not.toContain("_layout.autonomy.test");
   });
 
   test("buildEngineInspirationContext merges external inspiration patterns with source attribution", () => {

@@ -104,8 +104,13 @@ _MAX_WRAPPER_RECOVERY_ATTEMPTS = 2
 _MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS = 1_200
 _MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS = 5_000
 _MAX_NO_EDIT_RECOVERY_ATTEMPTS = 1
+_MAX_ROLLOUT_RECOVERY_ATTEMPTS = 1
 _DEFAULT_NO_EDIT_WATCHDOG_S = 480
 _SMALL_TASK_NO_EDIT_WATCHDOG_S = 360
+_WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
+_DEFAULT_ROLLOUT_WATCHDOG_S = 300
+_SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
+_WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -577,6 +582,11 @@ def _looks_like_small_task_prompt(prompt: str) -> bool:
         "startup shell",
         "shell polish",
         "visual/affordance",
+        "repo-native web review",
+        "web review path",
+        "browser smoke",
+        "web delivery",
+        "navigation trustworthy",
     )
     heavy_markers = (
         "merge-conflict",
@@ -637,18 +647,142 @@ def _resolve_no_edit_watchdog_seconds(
     if communicate_timeout_s < 600:
         return None
 
-    default_s = _SMALL_TASK_NO_EDIT_WATCHDOG_S if _looks_like_small_task_prompt(prompt) else _DEFAULT_NO_EDIT_WATCHDOG_S
+    prompt_text = str(prompt or "").lower()
+    if "repo-native web review" in prompt_text or "web review path" in prompt_text:
+        default_s = _WEB_REVIEW_NO_EDIT_WATCHDOG_S
+    else:
+        default_s = (
+            _SMALL_TASK_NO_EDIT_WATCHDOG_S
+            if _looks_like_small_task_prompt(prompt)
+            else _DEFAULT_NO_EDIT_WATCHDOG_S
+        )
     return max(120, min(default_s, max(120, communicate_timeout_s - 60)))
 
 
-def _build_no_edit_recovery_guidance(trace_excerpt: str) -> str:
+def _looks_like_web_review_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    return "repo-native web review" in text or "web review path" in text
+
+
+def _resolve_rollout_watchdog_seconds(
+    prompt: str,
+    communicate_timeout_s: Optional[int],
+    no_edit_watchdog_s: Optional[int],
+) -> Optional[int]:
+    if not communicate_timeout_s or communicate_timeout_s < 600:
+        return None
+
+    raw = os.environ.get("WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S", "").strip()
+    if raw:
+        if raw == "0":
+            return None
+        parsed = _to_positive_int(raw)
+        if parsed is None:
+            log.info(
+                f"Invalid WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S={raw!r}; using default rollout watchdog."
+            )
+        else:
+            return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
+
+    if _looks_like_web_review_prompt(prompt):
+        default_s = _WEB_REVIEW_ROLLOUT_WATCHDOG_S
+    elif _looks_like_small_task_prompt(prompt):
+        default_s = _SMALL_TASK_ROLLOUT_WATCHDOG_S
+    else:
+        default_s = _DEFAULT_ROLLOUT_WATCHDOG_S
+    if no_edit_watchdog_s is not None:
+        default_s = min(default_s, max(90, no_edit_watchdog_s - 60))
+    return max(90, min(default_s, max(90, communicate_timeout_s - 60)))
+
+
+def _describe_non_publishable_paths(changed_paths: List[str], baseline_snapshot: List[str]) -> str:
+    delta = [p for p in changed_paths if p not in baseline_snapshot]
+    inspected = delta if delta else changed_paths
+    non_publishable = [p for p in inspected if not _is_publishable_changed_path(p)]
+    if not non_publishable:
+        return ""
+    listed = ", ".join(non_publishable[:8])
+    if len(non_publishable) > 8:
+        listed += ", ..."
+    return listed
+
+
+def _build_no_edit_recovery_guidance(trace_excerpt: str, artifact_only_paths: str = "") -> str:
     lines = [
         "No-edit watchdog recovery: the previous Codex attempt spent too much of the execution budget without producing publishable file changes.",
         "Start from the already inspected context. Do not re-read broad repo topology, route wrappers, or missing test infrastructure unless that is the blocker.",
+        "Runtime/dependency artifacts such as node_modules, outputs, .worktrees, .codex, dist, build, and coverage do not count as progress.",
         "Within the first response/action, edit the smallest behavior-owning file that satisfies the task. If the hinted file is a thin wrapper, patch the owner you already identified.",
+        "If a hinted test path is absent, do not invent PushPals/autonomy-specific files in the user repo. Add repo-native coverage beside existing tests, or make a tiny behavior/script patch with no new broad harness.",
         "Use existing tests or a narrow helper/style assertion; do not create broad React Native mocks or a new full render harness for a compact shell/visual polish task.",
         "Run at most one focused fast validation check before final diff review; let PushPals ValidationGate own long required/browser validation.",
     ]
+    if artifact_only_paths:
+        lines.append(f"Only non-publishable artifact paths changed so far: {artifact_only_paths}.")
+    if trace_excerpt:
+        lines.append("Previous Codex event trace excerpt:")
+        lines.append(trace_excerpt)
+    return "\n".join(lines)
+
+
+def _trace_summaries_text(trace: Dict[str, Any]) -> str:
+    summaries = trace.get("summaries")
+    if not isinstance(summaries, list):
+        return ""
+    return "\n".join(str(item or "") for item in summaries[-80:]).lower()
+
+
+def _detect_offtrack_rollout(trace: Dict[str, Any], artifact_only_paths: str = "") -> str:
+    text = _trace_summaries_text(trace)
+    if artifact_only_paths:
+        return f"only non-publishable artifact paths changed: {artifact_only_paths}"
+    if not text:
+        return ""
+    checks: List[Tuple[str, re.Pattern[str]]] = [
+        (
+            "the worker is spending time on missing hinted files or absent repo scaffolding",
+            re.compile(
+                r"(not present|not found|no existing|no .* directory|missing .* checkout|not listed in the checkout|checkout is much smaller|hinted .* absent)",
+                re.I,
+            ),
+        ),
+        (
+            "the worker is drifting into broad test-harness or React Native mock repair",
+            re.compile(
+                r"(full[- ]?(surface|render)|test harness repair|react native mock|broad .*mock|shared mock|adding .*mock helper|full component render)",
+                re.I,
+            ),
+        ),
+        (
+            "the worker is about to add PushPals/autonomy internals to a user repo",
+            re.compile(
+                r"(_layout\.autonomy|queue_health|workerpal|remotebuddy|reviewagent|pushpals-internal|no autonomy module)",
+                re.I,
+            ),
+        ),
+    ]
+    for reason, pattern in checks:
+        if pattern.search(text):
+            return reason
+    return ""
+
+
+def _build_rollout_recovery_guidance(
+    reason: str,
+    trace_excerpt: str,
+    artifact_only_paths: str = "",
+) -> str:
+    lines = [
+        "Rollout coach recovery: the previous Codex trajectory looked unlikely to produce a publishable, repo-native patch inside the budget.",
+        f"Detected off-track signal: {reason or 'no publishable progress despite concerning trace signals'}.",
+        "Do not continue the same exploration path. Start from the prior findings and make the smallest publishable edit first.",
+        "If the requested or hinted file/path is absent, treat it as a stale hint: choose an existing repo-native owner or existing test nearby instead of creating PushPals/autonomy-specific scaffolding.",
+        "For web review or shell-validation work, prefer an existing browser/e2e script, route shell, or navigation surface over generic autonomy infrastructure.",
+        "Avoid broad React Native render harnesses and shared mock expansion unless the repo already has that stable infrastructure and the task explicitly asks for it.",
+        "After the first patch, run one focused fast check or stop with a concise final update so ValidationGate can run the expensive suite.",
+    ]
+    if artifact_only_paths:
+        lines.append(f"Only non-publishable artifact paths changed so far: {artifact_only_paths}.")
     if trace_excerpt:
         lines.append("Previous Codex event trace excerpt:")
         lines.append(trace_excerpt)
@@ -1597,6 +1731,7 @@ def _run_codex_task(
     wrapper_recovery_attempt: int = 0,
     model_compatibility_recovery_attempt: int = 0,
     no_edit_recovery_attempt: int = 0,
+    rollout_recovery_attempt: int = 0,
     model_override: Optional[str] = None,
     baseline_changes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
@@ -1889,15 +2024,33 @@ def _run_codex_task(
             next_progress_at = started_at + float(progress_interval_s)
             timed_out = False
             no_edit_watchdog_fired = False
+            no_edit_artifact_only_paths = ""
+            rollout_watchdog_fired = False
+            rollout_watchdog_reason = ""
+            rollout_artifact_only_paths = ""
             command_policy_rejection_loop = False
             no_edit_watchdog_s = (
                 _resolve_no_edit_watchdog_seconds(prompt, communicate_timeout_s)
                 if no_edit_recovery_attempt <= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
                 else None
             )
+            rollout_watchdog_s = (
+                _resolve_rollout_watchdog_seconds(
+                    prompt,
+                    communicate_timeout_s,
+                    no_edit_watchdog_s,
+                )
+                if rollout_recovery_attempt <= _MAX_ROLLOUT_RECOVERY_ATTEMPTS
+                else None
+            )
             no_edit_deadline = (
                 started_at + float(no_edit_watchdog_s)
                 if no_edit_watchdog_s is not None
+                else None
+            )
+            rollout_deadline = (
+                started_at + float(rollout_watchdog_s)
+                if rollout_watchdog_s is not None
                 else None
             )
 
@@ -1909,15 +2062,53 @@ def _run_codex_task(
                     break
 
                 if no_edit_deadline is not None and now >= no_edit_deadline:
-                    _, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+                    changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
                     if not effective_paths:
+                        no_edit_artifact_only_paths = _describe_non_publishable_paths(
+                            changed_paths,
+                            baseline_snapshot,
+                        )
                         no_edit_watchdog_fired = True
+                        artifact_detail = (
+                            f" Artifact-only dirty paths: {no_edit_artifact_only_paths}."
+                            if no_edit_artifact_only_paths
+                            else ""
+                        )
                         log.info(
-                            f"No-edit watchdog fired after {int(no_edit_watchdog_s or 0)}s with no publishable file changes; retrying with patch-first guidance."
+                            f"No-edit watchdog fired after {int(no_edit_watchdog_s or 0)}s with no publishable file changes.{artifact_detail} Retrying with patch-first guidance."
                         )
                         _terminate_active_child()
                         break
                     no_edit_deadline = None
+
+                if rollout_deadline is not None and now >= rollout_deadline:
+                    changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+                    if not effective_paths:
+                        with trace_lock:
+                            live_trace = dict(stdout_trace_state)
+                            summaries = stdout_trace_state.get("summaries")
+                            if isinstance(summaries, list):
+                                live_trace["summaries"] = list(summaries)
+                        rollout_artifact_only_paths = _describe_non_publishable_paths(
+                            changed_paths,
+                            baseline_snapshot,
+                        )
+                        rollout_watchdog_reason = _detect_offtrack_rollout(
+                            live_trace,
+                            rollout_artifact_only_paths,
+                        )
+                        if rollout_watchdog_reason:
+                            rollout_watchdog_fired = True
+                            artifact_detail = (
+                                f" Artifact-only dirty paths: {rollout_artifact_only_paths}."
+                                if rollout_artifact_only_paths
+                                else ""
+                            )
+                            log.info(
+                                f"Rollout coach fired after {int(rollout_watchdog_s or 0)}s: {rollout_watchdog_reason}.{artifact_detail} Retrying with course-correction guidance."
+                            )
+                            _terminate_active_child()
+                            break
 
                 with trace_lock:
                     wrapper_rejections = to_int(wrapper_rejection_state.get("count"), 0)
@@ -1986,11 +2177,50 @@ def _run_codex_task(
                         continue
                     rejected_shell_wrappers.append(text)
 
+        if rollout_watchdog_fired:
+            if rollout_recovery_attempt < _MAX_ROLLOUT_RECOVERY_ATTEMPTS:
+                retry_guidance = [
+                    *supplemental_guidance,
+                    _build_rollout_recovery_guidance(
+                        rollout_watchdog_reason,
+                        trace_excerpt,
+                        rollout_artifact_only_paths,
+                    ),
+                ]
+                return _run_codex_task(
+                    repo,
+                    instruction,
+                    retry_guidance,
+                    wrapper_recovery_attempt=wrapper_recovery_attempt,
+                    model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
+                    no_edit_recovery_attempt=no_edit_recovery_attempt,
+                    rollout_recovery_attempt=rollout_recovery_attempt + 1,
+                    model_override=model_override,
+                    baseline_changes=baseline_snapshot,
+                )
+            detail = (
+                "Codex trajectory remained off-track after rollout coach recovery: "
+                f"{rollout_watchdog_reason or 'no publishable progress'}."
+            )
+            if trace_excerpt:
+                detail = f"{detail}\n{trace_excerpt}"
+            return {
+                "ok": False,
+                "summary": "openai_codex rollout coach could not recover publishable progress",
+                "stdout": _truncate(stdout),
+                "stderr": _truncate(f"{detail}\n{stderr}".strip()),
+                "exitCode": 124,
+                "usage": usage,
+            }
+
         if no_edit_watchdog_fired:
             if no_edit_recovery_attempt < _MAX_NO_EDIT_RECOVERY_ATTEMPTS:
                 retry_guidance = [
                     *supplemental_guidance,
-                    _build_no_edit_recovery_guidance(trace_excerpt),
+                    _build_no_edit_recovery_guidance(
+                        trace_excerpt,
+                        no_edit_artifact_only_paths,
+                    ),
                 ]
                 return _run_codex_task(
                     repo,
@@ -1999,6 +2229,7 @@ def _run_codex_task(
                     wrapper_recovery_attempt=wrapper_recovery_attempt,
                     model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
                     no_edit_recovery_attempt=no_edit_recovery_attempt + 1,
+                    rollout_recovery_attempt=rollout_recovery_attempt,
                     model_override=model_override,
                     baseline_changes=baseline_snapshot,
                 )
@@ -2050,9 +2281,20 @@ def _run_codex_task(
                     "exitCode": 0,
                     "usage": usage,
                 }
+            changed_paths, _, _ = _codex_changed_paths(repo, baseline_snapshot)
+            artifact_only_paths = _describe_non_publishable_paths(changed_paths, baseline_snapshot)
+            if artifact_only_paths:
+                detail = (
+                    f"{detail}\nOnly non-publishable artifact paths changed before timeout: "
+                    f"{artifact_only_paths}."
+                )
             return {
                 "ok": False,
-                "summary": "openai_codex execution timed out",
+                "summary": (
+                    "openai_codex timed out without publishable changes"
+                    if artifact_only_paths
+                    else "openai_codex execution timed out"
+                ),
                 "stdout": _truncate(stdout),
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
@@ -2149,6 +2391,7 @@ def _run_codex_task(
                         wrapper_recovery_attempt=wrapper_recovery_attempt + 1,
                         model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
                         no_edit_recovery_attempt=no_edit_recovery_attempt,
+                        rollout_recovery_attempt=rollout_recovery_attempt,
                         model_override=model_override,
                         baseline_changes=baseline_snapshot,
                     )
@@ -2232,6 +2475,7 @@ def _run_codex_task(
                     wrapper_recovery_attempt=wrapper_recovery_attempt,
                     model_compatibility_recovery_attempt=model_compatibility_recovery_attempt + 1,
                     no_edit_recovery_attempt=no_edit_recovery_attempt,
+                    rollout_recovery_attempt=rollout_recovery_attempt,
                     model_override=LEGACY_CODEX_MODEL_FALLBACK,
                     baseline_changes=baseline_snapshot,
                 )

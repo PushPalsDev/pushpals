@@ -217,6 +217,7 @@ export type TaskExecutePlanning = {
   acceptanceCriteria: string[];
   validationSteps: string[];
   requiredValidationSteps?: string[];
+  repoHintDiagnostics?: string[];
   queuePriority: RequestPriority;
   queueWaitBudgetMs: number;
   executionBudgetMs: number;
@@ -448,6 +449,7 @@ function buildExecutionGuidance(
   plan: PlannerOutput,
   targetPaths: string[],
   requiredValidationSteps: string[] = [],
+  repoHintDiagnostics: string[] = [],
 ): string {
   const lines: string[] = [];
   const targets = normalizePathHints(
@@ -461,6 +463,15 @@ function buildExecutionGuidance(
     lines.push("- Do not prepend a leading slash to target paths.");
     lines.push(
       "- These paths are relevance hints, not hard write boundaries; edit the behavior-owning files needed for the task and explain any expansion.",
+    );
+  }
+  if (repoHintDiagnostics.length > 0) {
+    lines.push("Repo hint preflight:");
+    for (const diagnostic of repoHintDiagnostics.slice(0, 8)) {
+      lines.push(`- ${diagnostic}`);
+    }
+    lines.push(
+      "- If a hinted path is absent, treat it as stale guidance unless the user explicitly asked to create that path. Prefer an existing repo-native owner or nearby test.",
     );
   }
   lines.push("Scope:");
@@ -507,6 +518,80 @@ function buildExecutionGuidance(
     );
   }
   return lines.join("\n").trim();
+}
+
+function pathHintHasGlob(value: string): boolean {
+  return /[*?[\]{}]/.test(value);
+}
+
+function pathHintLooksLikeConcreteFile(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  const tail = normalized.split("/").pop() ?? normalized;
+  return /\.[A-Za-z0-9][A-Za-z0-9_-]{0,12}$/.test(tail);
+}
+
+function requestAllowsCreatingMissingPath(value: string): boolean {
+  return /\b(create|add|new|scaffold|generate|introduce|write)\b.{0,80}\b(file|test|module|component|script|page|route|fixture|helper)\b/i.test(
+    value,
+  );
+}
+
+function shouldTreatMissingTargetAsStale(repoRoot: string, path: string, requestText: string): boolean {
+  const normalized = normalizeTargetPath(path);
+  if (!normalized || normalized === "." || pathHintHasGlob(normalized)) return false;
+  if (!pathHintLooksLikeConcreteFile(normalized)) return false;
+  if (existsSync(resolve(repoRoot, normalized))) return false;
+  if (requestAllowsCreatingMissingPath(requestText)) return false;
+  return true;
+}
+
+function sanitizeRepoNativeTargetHints(params: {
+  repoRoot: string;
+  prompt: string;
+  plan: PlannerOutput;
+  targetPaths: string[];
+}): { targetPaths: string[]; diagnostics: string[]; staleHints: string[] } {
+  const requestText = [
+    params.prompt,
+    params.plan.worker_instruction,
+    params.plan.assistant_message,
+    ...params.plan.acceptance_criteria,
+    ...params.targetPaths,
+  ].join("\n");
+  const diagnostics: string[] = [];
+  const staleHints: string[] = [];
+  const targetPaths = params.targetPaths.filter((path) => {
+    const normalized = normalizeTargetPath(path);
+    if (!normalized) return false;
+    if (!shouldTreatMissingTargetAsStale(params.repoRoot, normalized, requestText)) return true;
+    staleHints.push(normalized);
+    diagnostics.push(
+      `Path hint "${normalized}" does not exist in this checkout; it was removed as a canonical target and kept only as advisory context.`,
+    );
+    return false;
+  });
+  if (staleHints.length > 0) {
+    const staleLower = staleHints.map((path) => path.toLowerCase());
+    params.plan.validation_steps = params.plan.validation_steps.filter((step) => {
+      const lower = step.replace(/\\/g, "/").toLowerCase();
+      return !staleLower.some((path) => lower.includes(path));
+    });
+    params.plan.scope.write_globs = params.plan.scope.write_globs.filter((glob) => {
+      const normalized = normalizeTargetPath(glob);
+      if (!normalized) return false;
+      return !staleLower.includes(normalized.toLowerCase());
+    });
+    if (!params.plan.discovery) {
+      params.plan.discovery = { ripgrep_queries: [] };
+    }
+    const keywords = new Set([...(params.plan.discovery.keywords ?? [])]);
+    for (const path of staleHints) {
+      const tail = path.split("/").pop();
+      if (tail) keywords.add(tail.replace(/\.[^.]+$/, ""));
+    }
+    params.plan.discovery.keywords = [...keywords].slice(0, 12);
+  }
+  return { targetPaths, diagnostics, staleHints };
 }
 
 const VALIDATION_COMMAND_PREFIX =
@@ -2516,10 +2601,24 @@ export class RemoteBuddyOrchestrator {
       }
       this.pushContext(`[user] ${toSingleLine(prompt, 700)}`, requestSessionId);
       this.pushContext(`[plan] ${toSingleLine(JSON.stringify(plan), 900)}`, requestSessionId);
-      const targetPaths =
+      let targetPaths =
         autonomyMetadata && autonomyMetadata.targetPaths.length > 0
           ? autonomyMetadata.targetPaths
           : plannerTargetPaths(plan, prompt);
+      const repoHintPreflight = sanitizeRepoNativeTargetHints({
+        repoRoot: this.repo,
+        prompt,
+        plan,
+        targetPaths,
+      });
+      targetPaths = repoHintPreflight.targetPaths;
+      if (repoHintPreflight.diagnostics.length > 0) {
+        console.warn(
+          `[RemoteBuddy] Repo hint preflight: ${repoHintPreflight.diagnostics
+            .slice(0, 3)
+            .join(" | ")}`,
+        );
+      }
       this.rememberPersistentMemory(
         "plan",
         `intent=${plan.intent} worker=${plan.requires_worker ? "yes" : "no"} lane=${plan.lane} risk=${plan.risk_level} targets=${targetPaths.slice(0, 6).join(",") || "(none)"}`,
@@ -2587,7 +2686,9 @@ export class RemoteBuddyOrchestrator {
         // Keep strictness only for non-forced paths.
         if (!forceWorker) {
           const missing: string[] = [];
-          if (targetPaths.length === 0) missing.push("target_paths");
+          if (targetPaths.length === 0 && repoHintPreflight.diagnostics.length === 0) {
+            missing.push("target_paths");
+          }
           if (plan.acceptance_criteria.length === 0) missing.push("acceptance_criteria");
           if (plan.validation_steps.length === 0) missing.push("validation_steps");
           if (missing.length > 0) {
@@ -2616,7 +2717,12 @@ export class RemoteBuddyOrchestrator {
         String(plan.worker_instruction ?? ""),
         canonicalInstruction,
       );
-      const executionGuidance = buildExecutionGuidance(plan, targetPaths, requiredValidationSteps);
+      const executionGuidance = buildExecutionGuidance(
+        plan,
+        targetPaths,
+        requiredValidationSteps,
+        repoHintPreflight.diagnostics,
+      );
       const plannerWorkerInstruction = [rawPlannerInstruction, executionGuidance]
         .filter(Boolean)
         .join("\n\n")
@@ -2778,6 +2884,9 @@ export class RemoteBuddyOrchestrator {
             : {}),
           acceptanceCriteria: plan.acceptance_criteria,
           validationSteps: plan.validation_steps,
+          ...(repoHintPreflight.diagnostics.length > 0
+            ? { repoHintDiagnostics: repoHintPreflight.diagnostics }
+            : {}),
           ...(requiredValidationSteps.length > 0 ? { requiredValidationSteps } : {}),
           queuePriority: priority,
           queueWaitBudgetMs,

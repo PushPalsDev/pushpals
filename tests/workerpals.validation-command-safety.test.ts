@@ -25,7 +25,9 @@ import {
   prepareValidationCommandArgv,
   resolveValidationCommandTimeoutMs,
   runValidationArgv,
+  sanitizeTaskExecutePlanningPathHints,
   shouldEnsurePlaywrightBrowserRuntime,
+  shouldDeferLongValidationAfterFastFailures,
   tokenizeValidationCommandArgv,
 } from "../apps/workerpals/src/execute_job";
 
@@ -528,6 +530,63 @@ describe("workerpals validation command safety", () => {
     expect(resolveValidationCommandTimeoutMs("bun run web:e2e", 180_000)).toBe(600_000);
     expect(resolveValidationCommandTimeoutMs("bun run lint", 180_000)).toBe(180_000);
     expect(resolveValidationCommandTimeoutMs("bun run web:e2e", 900_000)).toBe(900_000);
+  });
+
+  test("defers long browser validation after deterministic fast failures", () => {
+    const reason = shouldDeferLongValidationAfterFastFailures("bun run web:e2e", [
+      {
+        step: "bun test",
+        command: "bun test",
+        ok: false,
+        exitCode: 1,
+        stdout: "",
+        stderr: "Cannot find module './missing-helper' from 'tests/example.test.ts'",
+        elapsedMs: 50,
+      },
+    ]);
+
+    expect(reason).toContain("fast validation already failed");
+    expect(reason).toContain("bun test");
+    expect(shouldDeferLongValidationAfterFastFailures("bun run lint", [])).toBeNull();
+  });
+
+  test("sanitizes stale existing-file path hints without blocking explicit file creation", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-stale-path-hints-"));
+    try {
+      const planning = planningFixture({
+        targetPaths: ["tests/missing-contract.test.ts", "src/existing.ts"],
+        scope: {
+          readAnywhere: true,
+          writeAllowed: true,
+          writeGlobs: ["tests/missing-contract.test.ts", "src/existing.ts"],
+        },
+        validationSteps: ["bun test ./tests/missing-contract.test.ts", "bun test"],
+      });
+      mkdirSync(join(root, "src"), { recursive: true });
+      writeFileSync(join(root, "src", "existing.ts"), "export const ok = true;\n");
+
+      const sanitized = sanitizeTaskExecutePlanningPathHints(
+        planning,
+        root,
+        "Update the existing validation contract.",
+      ) as ReturnType<typeof planningFixture> & { repoHintDiagnostics?: string[] };
+
+      expect(sanitized.targetPaths).toEqual(["src/existing.ts"]);
+      expect(sanitized.scope.writeGlobs).toEqual(["src/existing.ts"]);
+      expect(sanitized.validationSteps).toEqual(["bun test"]);
+      expect(sanitized.repoHintDiagnostics?.join("\n")).toContain("does not exist");
+
+      const createPlanning = sanitizeTaskExecutePlanningPathHints(
+        planningFixture({
+          targetPaths: ["tests/new-contract.test.ts"],
+        }),
+        root,
+        "Create a new test file for the contract.",
+      ) as ReturnType<typeof planningFixture>;
+      expect(createPlanning.targetPaths).toEqual(["tests/new-contract.test.ts"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("injects the sandbox Expo port into browser script validation commands", () => {
