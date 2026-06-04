@@ -264,6 +264,7 @@ const DEFAULT_REMOTEBUDDY_CONSUMER_STARTUP_GRACE_MS = 8_000;
 const DEFAULT_COMMAND_OUTPUT_DRAIN_TIMEOUT_MS = 2_000;
 const DEFAULT_COMMAND_OUTPUT_MAX_CHARS = 512_000;
 const DEFAULT_REMOTEBUDDY_SILENT_STARTUP_FALLBACK_MS = 20_000;
+const DEFAULT_WORKERPAL_STARTUP_STATUS_FETCH_TIMEOUT_MS = 2_000;
 const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
 const RUNTIME_BINARY_DOWNLOAD_ATTEMPTS = 3;
 const DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS = 5_000;
@@ -275,6 +276,7 @@ const EMBEDDED_SERVICE_RESTART_STABLE_WINDOW_MS = 60_000;
 const EMBEDDED_SERVICE_RESTART_BASE_BACKOFF_MS = 2_000;
 const EMBEDDED_SERVICE_RESTART_MAX_BACKOFF_MS = 30_000;
 const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS = 15_000;
+const BLOCKING_WORKERPAL_IMAGE_BUILD_ENV = "PUSHPALS_BLOCKING_WORKERPAL_IMAGE_BUILD";
 const CLI_SESSION_JOB_LOG_MAX_CHARS = 700;
 const CLI_SESSION_SHOW_JOB_EVENTS_ENV = "PUSHPALS_CLI_SHOW_JOB_EVENTS";
 const EMBEDDED_RUNTIME_SAFETY_CAP_DISABLE_ENV = "PUSHPALS_DISABLE_EMBEDDED_SAFETY_CAPS";
@@ -3511,6 +3513,18 @@ function resolveWorkerpalStartupReadinessProbeTimeoutMs(config: PushPalsConfig):
   );
 }
 
+export function shouldPrepareEmbeddedWorkerpalDockerImageBlocking(opts: {
+  platform?: NodeJS.Platform;
+  env?: Record<string, string | undefined>;
+} = {}): boolean {
+  const env = opts.env ?? process.env;
+  const explicit = String(env[BLOCKING_WORKERPAL_IMAGE_BUILD_ENV] ?? "").trim();
+  if (explicit) return isTruthyCliEnvValue(explicit);
+  // Docker Desktop image builds are the highest-risk foreground startup step on Windows.
+  // Let WorkerPal warmup/build handle the image after the CLI becomes responsive.
+  return (opts.platform ?? process.platform) !== "win32";
+}
+
 export function shouldRunEmbeddedRuntimeStartupPrechecks(opts: {
   serverHealthy: boolean;
   noAutoStart: boolean;
@@ -4069,11 +4083,15 @@ async function probeSourceControlManager(port: number): Promise<boolean> {
   }
 }
 
-async function fetchWorkerStatusRows(serverUrl: string, ttlMs: number): Promise<WorkerStatusRow[]> {
+async function fetchWorkerStatusRows(
+  serverUrl: string,
+  ttlMs: number,
+  timeoutMs = 10_000,
+): Promise<WorkerStatusRow[]> {
   const payload = await fetchJsonWithTimeout<{ ok?: boolean; workers?: WorkerStatusRow[] }>(
     `${serverUrl}/workers?ttlMs=${Math.max(1_000, Math.floor(ttlMs))}`,
     {},
-    10_000,
+    Math.max(250, Math.floor(timeoutMs)),
   );
   if (!payload?.ok || !Array.isArray(payload.workers)) {
     return [];
@@ -4091,9 +4109,11 @@ export async function waitForWorkerpalCapacity(opts: {
   const deadline = Date.now() + Math.max(1_000, opts.timeoutMs);
   let lastObservedOnline = 0;
   while (Date.now() < deadline) {
+    const remainingMs = Math.max(250, deadline - Date.now());
     const workers = await (opts.fetchWorkersFn ?? fetchWorkerStatusRows)(
       opts.serverUrl,
       opts.ttlMs,
+      Math.min(DEFAULT_WORKERPAL_STARTUP_STATUS_FETCH_TIMEOUT_MS, remainingMs),
     );
     const summary = summarizeWorkerStatusRows(workers);
     if (summary.onlineWorkers > 0) {
@@ -5915,7 +5935,14 @@ async function main(): Promise<void> {
     );
     process.exit(1);
   }
-  if (runEmbeddedRuntimeStartupPrechecks && workerpalDockerPrecheck.status !== "failed") {
+  if (
+    runEmbeddedRuntimeStartupPrechecks &&
+    workerpalDockerPrecheck.status !== "failed" &&
+    shouldPrepareEmbeddedWorkerpalDockerImageBlocking({
+      platform: process.platform,
+      env: process.env as Record<string, string | undefined>,
+    })
+  ) {
     const workerpalImagePrecheck = await prepareEmbeddedWorkerpalDockerImageIfNeeded({
       preparedRuntime,
       config,
@@ -5929,6 +5956,10 @@ async function main(): Promise<void> {
     if (workerpalImagePrecheck.runtimeTag) {
       resolvedRuntimeTagForAutoStart = workerpalImagePrecheck.runtimeTag;
     }
+  } else if (runEmbeddedRuntimeStartupPrechecks && workerpalDockerPrecheck.status !== "failed") {
+    console.log(
+      `[pushpals] Skipping blocking WorkerPal sandbox image build during CLI startup; WorkerPal warmup will prepare it in the background. Set ${BLOCKING_WORKERPAL_IMAGE_BUILD_ENV}=1 to force the old foreground behavior.`,
+    );
   }
   let remoteBuddyConsumerHealth: RemoteBuddySessionConsumerHealth = {
     ok: false,

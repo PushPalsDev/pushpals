@@ -66,6 +66,7 @@ import {
   resolveWorkerpalDockerProbe,
   startEmbeddedMonitoringHub,
   shouldDeferRemoteBuddySessionConsumerReadiness,
+  shouldPrepareEmbeddedWorkerpalDockerImageBlocking,
   waitForWorkerpalCapacity,
 } from "../scripts/pushpals-cli.ts";
 import {
@@ -1182,6 +1183,55 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     } finally {
       Date.now = originalNow;
     }
+  });
+
+  test("waitForWorkerpalCapacity bounds each worker-status fetch by the remaining startup budget", async () => {
+    const originalNow = Date.now;
+    const requestedTimeouts: number[] = [];
+    let now = 0;
+    Date.now = () => now;
+    try {
+      const result = await waitForWorkerpalCapacity({
+        serverUrl: "http://127.0.0.1:3001",
+        timeoutMs: 1_000,
+        ttlMs: 15_000,
+        fetchWorkersFn: async (_serverUrl, _ttlMs, timeoutMs) => {
+          requestedTimeouts.push(timeoutMs);
+          return [];
+        },
+        sleepFn: async () => {
+          now += 1_000;
+        },
+      });
+
+      expect(result.ok).toBe(false);
+      expect(requestedTimeouts).toEqual([1_000]);
+      expect(requestedTimeouts.every((value) => value <= 2_000)).toBe(true);
+      expect(requestedTimeouts.every((value) => value >= 250)).toBe(true);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  test("blocking WorkerPal image builds are opt-in during Windows CLI startup", () => {
+    expect(
+      shouldPrepareEmbeddedWorkerpalDockerImageBlocking({
+        platform: "win32",
+        env: {},
+      }),
+    ).toBe(false);
+    expect(
+      shouldPrepareEmbeddedWorkerpalDockerImageBlocking({
+        platform: "win32",
+        env: { PUSHPALS_BLOCKING_WORKERPAL_IMAGE_BUILD: "1" },
+      }),
+    ).toBe(true);
+    expect(
+      shouldPrepareEmbeddedWorkerpalDockerImageBlocking({
+        platform: "linux",
+        env: {},
+      }),
+    ).toBe(true);
   });
 
   test("startup readiness reports blocked immediately when WorkerPal auto-spawn is disabled", () => {
