@@ -1213,16 +1213,7 @@ export class DockerExecutor {
     );
     await this.ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog);
 
-    const args: string[] = [
-      "exec",
-      "-w",
-      containerWorktreePath,
-      this.warmContainerName,
-      "bun",
-      "run",
-      "/workspace/apps/workerpals/src/job_runner.ts",
-      "--spec-stdin",
-    ];
+    const args = this.buildWarmContainerExecArgs(containerWorktreePath);
 
     console.log(
       `[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary()})`,
@@ -1321,26 +1312,62 @@ export class DockerExecutor {
     return result;
   }
 
+  private buildWarmContainerExecArgs(containerWorktreePath: string): string[] {
+    return [
+      "exec",
+      "-i",
+      "-w",
+      containerWorktreePath,
+      this.warmContainerName,
+      "bun",
+      "run",
+      "/workspace/apps/workerpals/src/job_runner.ts",
+      "--spec-stdin",
+    ];
+  }
+
   private async writeJobSpecToStdin(
     proc: ReturnType<typeof Bun.spawn>,
     base64Spec: string,
   ): Promise<void> {
-    const stdin = proc.stdin as WritableStream<Uint8Array> | undefined;
+    const stdin = proc.stdin as
+      | WritableStream<Uint8Array>
+      | {
+          write?: (chunk: Uint8Array | string) => unknown;
+          end?: () => unknown;
+          flush?: () => unknown;
+        }
+      | undefined;
     if (!stdin) {
       throw new Error("docker exec stdin pipe was not available");
     }
-    const writer = stdin.getWriter();
-    try {
-      await writer.write(new TextEncoder().encode(base64Spec));
-      await writer.close();
-    } catch (err) {
+    const bytes = new TextEncoder().encode(base64Spec);
+    if ("getWriter" in stdin && typeof stdin.getWriter === "function") {
+      const writer = stdin.getWriter();
       try {
-        await writer.abort(err);
-      } catch {
-        // Ignore abort failures; the original write error is more useful.
+        await writer.write(bytes);
+        await writer.close();
+      } catch (err) {
+        try {
+          await writer.abort(err);
+        } catch {
+          // Ignore abort failures; the original write error is more useful.
+        }
+        throw err;
       }
-      throw err;
+      return;
     }
+
+    if (typeof stdin.write === "function" && typeof stdin.end === "function") {
+      await stdin.write(bytes);
+      if (typeof stdin.flush === "function") {
+        await stdin.flush();
+      }
+      await stdin.end();
+      return;
+    }
+
+    throw new Error("docker exec stdin pipe does not support write/end or getWriter");
   }
 
   private async ensureWorktreeDependencyArtifacts(

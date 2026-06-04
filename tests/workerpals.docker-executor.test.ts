@@ -162,6 +162,73 @@ describe("workerpals docker executor internals", () => {
     expect(executor.hasBudgetForJobRetry(1, 120_000, 2_700_000)).toBe(true);
   });
 
+  test("writeJobSpecToStdin supports Web WritableStream stdin", async () => {
+    const executor = createExecutor() as unknown as {
+      writeJobSpecToStdin: (proc: { stdin?: WritableStream<Uint8Array> }, spec: string) => Promise<void>;
+    };
+    const chunks: string[] = [];
+    let closed = false;
+    const decoder = new TextDecoder();
+    const stdin = new WritableStream<Uint8Array>({
+      write(chunk) {
+        chunks.push(decoder.decode(chunk));
+      },
+      close() {
+        closed = true;
+      },
+    });
+
+    await executor.writeJobSpecToStdin({ stdin }, "encoded-spec");
+
+    expect(chunks).toEqual(["encoded-spec"]);
+    expect(closed).toBe(true);
+  });
+
+  test("writeJobSpecToStdin supports Bun FileSink-style stdin", async () => {
+    const executor = createExecutor() as unknown as {
+      writeJobSpecToStdin: (
+        proc: {
+          stdin?: {
+            write: (chunk: Uint8Array | string) => void;
+            flush: () => void;
+            end: () => void;
+          };
+        },
+        spec: string,
+      ) => Promise<void>;
+    };
+    const calls: string[] = [];
+    const decoder = new TextDecoder();
+    const stdin = {
+      write(chunk: Uint8Array | string) {
+        calls.push(`write:${typeof chunk === "string" ? chunk : decoder.decode(chunk)}`);
+      },
+      flush() {
+        calls.push("flush");
+      },
+      end() {
+        calls.push("end");
+      },
+    };
+
+    await executor.writeJobSpecToStdin({ stdin }, "encoded-spec");
+
+    expect(calls).toEqual(["write:encoded-spec", "flush", "end"]);
+  });
+
+  test("warm-container docker exec keeps stdin attached for spec streaming", () => {
+    const executor = createExecutor() as unknown as {
+      warmContainerName: string;
+      buildWarmContainerExecArgs: (containerWorktreePath: string) => string[];
+    };
+    executor.warmContainerName = "pushpals-workerpal-test-warm";
+
+    const args = executor.buildWarmContainerExecArgs("/repo/.worktrees/job-abc");
+
+    expect(args.slice(0, 4)).toEqual(["exec", "-i", "-w", "/repo/.worktrees/job-abc"]);
+    expect(args).toContain("--spec-stdin");
+  });
+
   test("imageExists treats inspection timeouts as unavailable instead of hanging", async () => {
     const executor = createExecutor() as unknown as {
       imageExists: () => Promise<boolean>;
