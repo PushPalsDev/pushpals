@@ -2,24 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.1.17`
-- start_commit: `08ac71abf15b95f57209da9cde90923363be8566`
-- end_commit: `e02e2949fece262281ad34d8e385266c4246082c`
+- version: `v1.1.18`
+- start_commit: `9c0f41ee9f323a9bb266f8130773cb2cbf3a2d8a`
+- end_commit: `a117fe7be8594ce4471e80830f76ee90200dbbbf`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Avoid blocking Windows CLI startup on foreground WorkerPal sandbox image builds; WorkerPal warmup prepares the image after the CLI becomes responsive.
-- Add `PUSHPALS_BLOCKING_WORKERPAL_IMAGE_BUILD=1` as an explicit opt-in for the old foreground image-build behavior.
-- Bound WorkerPal startup capacity probes to short two-second status fetches so a slow worker-status endpoint cannot make startup look frozen.
-- Preserve Linux/source-checkout behavior where foreground image preparation remains enabled by default.
+- Fix WorkerPal warm-container execution after the stdin-spec transport change by supporting both Web `WritableStream` and Bun `FileSink` stdin shapes.
+- Keep `docker exec` stdin attached with `-i` so the in-container job runner receives the streamed job spec instead of an empty payload.
+- Sync the packaged CLI sandbox WorkerPal runtime so installed CLI releases receive the same fix.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests\cli.runtime-bootstrap.test.ts --filter "waitForWorkerpalCapacity|blocking WorkerPal image builds"`
+- `bun test tests\workerpals.docker-executor.test.ts`
 
 ## Install
 
