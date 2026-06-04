@@ -2,23 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.18`
-- start_commit: `9c0f41ee9f323a9bb266f8130773cb2cbf3a2d8a`
-- end_commit: `a117fe7be8594ce4471e80830f76ee90200dbbbf`
+- version: `v1.1.19`
+- start_commit: `8c1892210ad5907f8f65ab92e94dc0d292854edb`
+- end_commit: `cf65e23b70377a7c5906c03bb724f3e3f378a4d6`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Fix WorkerPal warm-container execution after the stdin-spec transport change by supporting both Web `WritableStream` and Bun `FileSink` stdin shapes.
-- Keep `docker exec` stdin attached with `-i` so the in-container job runner receives the streamed job spec instead of an empty payload.
-- Sync the packaged CLI sandbox WorkerPal runtime so installed CLI releases receive the same fix.
+- Improve WorkerPal convergence safeguards with generic stale-target hint sanitation before workers chase missing repo paths.
+- Skip long browser/e2e validation when deterministic fast validation already proves the patch cannot publish, so retries focus on the real blocker first.
+- Add repo/job-family validation remedy memory and rollout scoring signals to improve future revision guidance without repo-specific rules.
+- Sync the packaged CLI sandbox WorkerPal and RemoteBuddy runtimes so installed CLI releases receive the same convergence behavior.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests\workerpals.docker-executor.test.ts`
+- `bun test tests\workerpals.validation-command-safety.test.ts`
+- `bun test tests\workerpals.quality-gate-issues.test.ts`
+- `python apps\workerpals\src\backends\openai_codex\test_openai_codex_runtime_config.py`
 
 ## Install
 
