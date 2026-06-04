@@ -2,29 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.16`
-- start_commit: `75d33e66d975b77f896895dce0c964a820e9ec2f`
-- end_commit: `1feac159c4c30da5abd6b4b4c06022be0b8a06f0`
-- commits_in_range: `4`
+- version: `v1.1.17`
+- start_commit: `08ac71abf15b95f57209da9cde90923363be8566`
+- end_commit: `e02e2949fece262281ad34d8e385266c4246082c`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Reduce embedded startup delay by treating a healthy RemoteBuddy service as ready before waiting on a delayed session-consumer heartbeat.
-- Keep repo-owned dependency artifacts out of ScopeGate publish failures so linked `node_modules` state does not poison otherwise scoped WorkerPal changes.
-- Keep browser-test-only failures scoped to browser repair prompts instead of broadening into unrelated validation churn.
-- Send Docker job specs over stdin instead of giant encoded command-line arguments, reducing opaque spawn failures on large jobs.
-- Skip Docker retry attempts when the prior attempt already consumed most of the available timeout budget.
-- Shorten managed WorkerPal worktree names and cleanup matchers to avoid Windows path-length cleanup failures.
-- Compact RemoteBuddy autonomy ideation context so normal queue cycles use smaller prompt payloads before retry fallback is needed.
-- Improve failed job summaries with the compact underlying error instead of a generic pre-completion failure message.
+- Avoid blocking Windows CLI startup on foreground WorkerPal sandbox image builds; WorkerPal warmup prepares the image after the CLI becomes responsive.
+- Add `PUSHPALS_BLOCKING_WORKERPAL_IMAGE_BUILD=1` as an explicit opt-in for the old foreground image-build behavior.
+- Bound WorkerPal startup capacity probes to short two-second status fetches so a slow worker-status endpoint cannot make startup look frozen.
+- Preserve Linux/source-checkout behavior where foreground image preparation remains enabled by default.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests\workerpals.docker-executor.test.ts`
-- `bun test tests\remotebuddy.autonomous-engine.tick.test.ts`
+- `bun test tests\cli.runtime-bootstrap.test.ts --filter "waitForWorkerpalCapacity|blocking WorkerPal image builds"`
 
 ## Install
 
