@@ -2,17 +2,18 @@
 
 ## Release Metadata
 
-- version: `v1.1.20`
-- start_commit: `5bc4702073bab2677b888a742b24818e8028b272`
-- end_commit: `992614ad77155e7c7ebee567b3bc449461996033`
-- commits_in_range: `2`
+- version: `v1.1.21`
+- start_commit: `e49ab68bb0553945a0d6b848595a15775fb8c398`
+- end_commit: `6abbfd7817bb9f648c7c697821756bfe4b4288c6`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Prevent WorkerPal jobs from starting from stale integration-branch checkouts when the configured source base has newer commits, avoiding missing-file validation failures caused by outdated `main_agents` worktrees.
-- Keep custom WorkerPal base refs respected, while safely falling back from stale integration refs to the configured source base for normal jobs.
-- Use cached local source-base refs when a best-effort fetch fails, so Windows Git certificate-store issues do not force workers back onto stale refs.
-- Improve cold-start autonomy and WorkerPal readiness so startup leaves capacity for user work and avoids blocking foreground startup on sandbox image preparation.
+- Reserve explicit validation and repair runway for OpenAI Codex WorkerPal jobs so a primary coding turn cannot consume the whole job budget before deterministic validation can run.
+- Retry browser route/startup smoke failures once when they look like transient runtime or browser-startup issues, while preserving normal assertion failures as real task feedback.
+- Add focused merge-conflict recovery guidance and a bounded retry when a resolver returns with rebase conflict markers still present.
+- Skip low-value second critic retries when compacting barely reduces the prompt, and skip critic entirely for clean default jobs where the primary Codex turn already timed out after producing a validated patch.
+- Bound and bypass LLM commit-message generation for broad diffs so publish finalization falls back quickly to deterministic commit messages instead of burning minutes.
 - Ship the updated WorkerPal runtime and sandbox mirror in the packaged CLI assets.
 
 ## Validation
@@ -20,7 +21,7 @@
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests\workerpals.worktree-base-ref.test.ts tests\workerpals.docker-executor.test.ts`
+- `bun test tests/workerpals.generic-python-executor.test.ts tests/workerpals.quality-gate-issues.test.ts tests/workerpals.merge-conflict-job.test.ts tests/workerpals.commit-message-generation.test.ts`
 
 ## Install
 
