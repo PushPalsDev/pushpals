@@ -34,6 +34,7 @@ import type {
   DockerWarmShellResult,
   DockerWarmStartupContext,
 } from "./backends/types.js";
+import { resolveFreshWorktreeBaseRef } from "./worktree_base_ref.js";
 
 const DEFAULT_OPENHANDS_MODEL = "local-model";
 const DEFAULT_CONFIG = loadPushPalsConfig();
@@ -2106,7 +2107,27 @@ export class DockerExecutor {
       reviewAgent && typeof reviewAgent.resolutionType === "string"
         ? reviewAgent.resolutionType.trim().toLowerCase()
         : "";
-    if (resolutionType !== "merge_conflict") return this.options.baseRef;
+    if (resolutionType !== "merge_conflict") {
+      return resolveFreshWorktreeBaseRef({
+        requestedRef: this.options.baseRef,
+        integrationBranch:
+          this.config.sourceControlManager.mainBranch ||
+          this.config.workerpals.baseRef ||
+          this.options.baseRef,
+        sourceBaseBranch: this.config.sourceControlManager.baseBranch,
+        git: (args) => this.runGitBaseRefCommand(args),
+        log: (level, message) => {
+          const line = `[DockerExecutor] ${message}`;
+          if (level === "warn") {
+            console.warn(line);
+            onLog?.("stderr", line);
+          } else {
+            console.log(line);
+            onLog?.("stdout", line);
+          }
+        },
+      });
+    }
 
     const normalizedHeadRef = normalizeMergeConflictHeadRef(reviewAgent?.prHeadRef);
     if (!normalizedHeadRef) {
@@ -2148,6 +2169,26 @@ export class DockerExecutor {
     console.log(info);
     onLog?.("stdout", info);
     return remoteRef;
+  }
+
+  private async runGitBaseRefCommand(
+    args: string[],
+  ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd: this.options.repo,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    return {
+      ok: exitCode === 0,
+      stdout,
+      stderr,
+    };
   }
 
   /**

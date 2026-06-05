@@ -47,6 +47,7 @@ import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor
 import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
+import { resolveFreshWorktreeBaseRef } from "./worktree_base_ref.js";
 
 type CommitRef = {
   branch: string;
@@ -314,6 +315,8 @@ async function reportWorkerLlmUsage(
 }
 
 function integrationBranchName(): string {
+  const configuredIntegrationBranch = CONFIG.sourceControlManager.mainBranch.trim();
+  if (configuredIntegrationBranch) return configuredIntegrationBranch;
   const configuredBaseRef = CONFIG.workerpals.baseRef.trim();
   if (!configuredBaseRef) return "main_agents";
   return configuredBaseRef.replace(/^origin\//, "").trim() || "main_agents";
@@ -665,33 +668,17 @@ async function runJob(
 }
 
 async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promise<string> {
-  const integrationBranch = integrationBranchName();
-  const integrationRemoteRef = `origin/${integrationBranch}`;
-  const candidates = new Set<string>([
+  return resolveFreshWorktreeBaseRef({
     requestedRef,
-    integrationRemoteRef,
-    integrationBranch,
-    "HEAD",
-  ]);
-  if (requestedRef.startsWith("origin/")) {
-    const branch = requestedRef.slice("origin/".length);
-    const fetchResult = await git(repo, ["fetch", "origin", branch, "--quiet"]);
-    if (!fetchResult.ok) {
-      console.warn(
-        `[WorkerPals] Could not refresh ${requestedRef}; continuing with local refs (${fetchResult.stderr || fetchResult.stdout})`,
-      );
-    }
-    candidates.add(branch);
-  } else if (requestedRef !== "HEAD") {
-    candidates.add(`origin/${requestedRef}`);
-  }
-
-  for (const ref of candidates) {
-    const parsed = await git(repo, ["rev-parse", "--verify", "--quiet", ref]);
-    if (parsed.ok) return ref;
-  }
-
-  return "HEAD";
+    integrationBranch: integrationBranchName(),
+    sourceBaseBranch: CONFIG.sourceControlManager.baseBranch,
+    git: (args) => git(repo, args),
+    log: (level, message) => {
+      const line = `[WorkerPals] ${message}`;
+      if (level === "warn") console.warn(line);
+      else console.log(line);
+    },
+  });
 }
 
 async function createIsolatedWorktree(
