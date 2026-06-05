@@ -2,26 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.1.19`
-- start_commit: `8c1892210ad5907f8f65ab92e94dc0d292854edb`
-- end_commit: `cf65e23b70377a7c5906c03bb724f3e3f378a4d6`
-- commits_in_range: `1`
+- version: `v1.1.20`
+- start_commit: `5bc4702073bab2677b888a742b24818e8028b272`
+- end_commit: `992614ad77155e7c7ebee567b3bc449461996033`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Improve WorkerPal convergence safeguards with generic stale-target hint sanitation before workers chase missing repo paths.
-- Skip long browser/e2e validation when deterministic fast validation already proves the patch cannot publish, so retries focus on the real blocker first.
-- Add repo/job-family validation remedy memory and rollout scoring signals to improve future revision guidance without repo-specific rules.
-- Sync the packaged CLI sandbox WorkerPal and RemoteBuddy runtimes so installed CLI releases receive the same convergence behavior.
+- Prevent WorkerPal jobs from starting from stale integration-branch checkouts when the configured source base has newer commits, avoiding missing-file validation failures caused by outdated `main_agents` worktrees.
+- Keep custom WorkerPal base refs respected, while safely falling back from stale integration refs to the configured source base for normal jobs.
+- Use cached local source-base refs when a best-effort fetch fails, so Windows Git certificate-store issues do not force workers back onto stale refs.
+- Improve cold-start autonomy and WorkerPal readiness so startup leaves capacity for user work and avoids blocking foreground startup on sandbox image preparation.
+- Ship the updated WorkerPal runtime and sandbox mirror in the packaged CLI assets.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests\workerpals.validation-command-safety.test.ts`
-- `bun test tests\workerpals.quality-gate-issues.test.ts`
-- `python apps\workerpals\src\backends\openai_codex\test_openai_codex_runtime_config.py`
+- `bun test tests\workerpals.worktree-base-ref.test.ts tests\workerpals.docker-executor.test.ts`
 
 ## Install
 
