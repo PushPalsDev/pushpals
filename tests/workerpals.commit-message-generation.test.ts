@@ -16,8 +16,10 @@ import {
   isTestLikeValidationStep,
   parseChangedPathsFromNameOnlyOutput,
   redactSensitiveText,
+  resolveCommitMessageGeneratorTimeoutMs,
   sanitizeGeneratedCommitMessage,
   shouldUseCodexCliForExecutor,
+  shouldUseLlmCommitMessageForStagedDiff,
   resolveWorkerCommitIdentity,
 } from "../apps/workerpals/src/execute_job";
 
@@ -92,6 +94,53 @@ describe("workerpals commit message generation helpers", () => {
     expect(prompt).not.toContain("echo hello");
     expect(prompt).toContain("Staged diff (derive subject line and all bullets from this):");
     expect(prompt).toContain("diff --git a/a.ts b/a.ts");
+  });
+
+  test("keeps commit-message generation on a short bounded timeout", () => {
+    expect(
+      resolveCommitMessageGeneratorTimeoutMs({
+        workerpals: {
+          commitMessageTimeoutMs: 120_000,
+          llm: {},
+        },
+      } as never),
+    ).toBe(30_000);
+    expect(
+      resolveCommitMessageGeneratorTimeoutMs({
+        workerpals: {
+          commitMessageTimeoutMs: 100,
+          llm: {},
+        },
+      } as never),
+    ).toBe(3_000);
+    expect(
+      resolveCommitMessageGeneratorTimeoutMs({
+        workerpals: {
+          llm: {},
+        },
+      } as never),
+    ).toBe(15_000);
+  });
+
+  test("skips LLM commit messages for broad staged diffs", () => {
+    expect(
+      shouldUseLlmCommitMessageForStagedDiff({
+        changedPaths: Array.from({ length: 20 }, (_, index) => `src/file-${index}.ts`),
+        diff: "diff --git a/src/file-1.ts b/src/file-1.ts\n",
+      }),
+    ).toBe(true);
+    expect(
+      shouldUseLlmCommitMessageForStagedDiff({
+        changedPaths: Array.from({ length: 21 }, (_, index) => `src/file-${index}.ts`),
+        diff: "diff --git a/src/file-1.ts b/src/file-1.ts\n",
+      }),
+    ).toBe(false);
+    expect(
+      shouldUseLlmCommitMessageForStagedDiff({
+        changedPaths: ["src/file.ts"],
+        diff: "",
+      }),
+    ).toBe(false);
   });
 
   test("includes bun run test:root in validation steps", () => {

@@ -198,6 +198,15 @@ function buildPlannerGuidance(
       "- Use direct commands only while resolving this rebase. Prefer `git diff -- <path>`, `git add <path>`, and `git -c core.editor=true rebase --continue` instead of `/bin/bash -lc`, `sh -lc`, `awk`, or chained shell snippets.",
     );
     lines.push(
+      "- Primary success condition: finish the git rebase and leave no active rebase/merge/cherry-pick state. Do not spend budget polishing, broadening, or refactoring tests beyond what is required to remove conflict markers and keep both sides' intended behavior.",
+    );
+    lines.push(
+      "- Rebase convergence rule: after resolving each conflicted file, run `git diff --name-only --diff-filter=U`. If no unresolved paths remain, stage the resolved files and continue the rebase immediately before doing broader validation.",
+    );
+    lines.push(
+      "- Budget rule: if conflict resolution is running long, choose the smallest side-preserving resolution, stage it, and continue the rebase. A clean rebased branch with focused follow-up validation is better than a richer partial patch left mid-rebase.",
+    );
+    lines.push(
       "- After editing, run `git add <files>` and `git -c core.editor=true rebase --continue` until the rebase completes.",
     );
   }

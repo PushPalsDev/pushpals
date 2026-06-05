@@ -234,6 +234,8 @@ describe("workerpals merge-conflict sandbox", () => {
           expect(prepared.repoPath).not.toBe(fixture.sourceRepo);
           expect(prepared.plannerGuidance).toContain("isolated container-local clone");
           expect(prepared.plannerGuidance).toContain("Use direct commands only while resolving this rebase");
+          expect(prepared.plannerGuidance).toContain("Primary success condition: finish the git rebase");
+          expect(prepared.plannerGuidance).toContain("A clean rebased branch");
           expect(prepared.conflictPaths).toEqual([fixture.conflictFile]);
           const sandboxBranchList = await mustGit(
             prepared.repoPath,
@@ -483,6 +485,93 @@ describe("workerpals merge-conflict sandbox", () => {
           prepared.cleanup();
         }
       } finally {
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  runMergeConflictTest(
+    "executeJob reruns the resolver when conflict markers remain after the first pass",
+    async () => {
+      const fixture = await createConflictFixture();
+      const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
+      let resolutionPasses = 0;
+      const restoreExecutor = installTestBackendExecutor(async (_kind, params, repoPath, _runtime, onLog) => {
+        resolutionPasses += 1;
+        if (resolutionPasses === 2) {
+          writeFileSync(
+            join(repoPath, fixture.conflictFile),
+            "export const conflict = 'resolved-after-focused-retry';\n",
+            "utf8",
+          );
+        } else {
+          expect(String(params.qualityRevisionHint ?? "")).toBe("");
+        }
+        onLog?.("stdout", `[stub] merge-conflict resolver pass ${resolutionPasses}`);
+        return {
+          ok: true,
+          summary: `stub merge-conflict pass ${resolutionPasses}`,
+          stdout: `__stub_stdout_pass_${resolutionPasses}__`,
+          stderr: "",
+          exitCode: 0,
+        };
+      });
+      try {
+        const prepared = await prepareMergeConflictTaskRepo(
+          fixture.sourceRepo,
+          "job-merge-conflict-unresolved-retry",
+          fixture.params,
+        );
+        try {
+          const params = {
+            ...fixture.params,
+            planning: {
+              ...(fixture.params.planning as Record<string, unknown>),
+              validationSteps: ["git status --porcelain"],
+            },
+          };
+          const base = loadPushPalsConfig({ reload: true });
+          const runtimeConfig: WorkerpalsRuntimeConfig = {
+            ...base,
+            workerpals: {
+              ...base.workerpals,
+              executor: TEST_BACKEND,
+              qualityMaxAutoRevisions: 1,
+              qualitySoftPassOnExhausted: true,
+            },
+          };
+          const forwardedLogs: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+
+          const result = await executeJob(
+            "task.execute",
+            params,
+            prepared.repoPath,
+            (stream, line) => forwardedLogs.push({ stream, line }),
+            runtimeConfig,
+          );
+
+          expect(result.ok).toBe(true);
+          expect(resolutionPasses).toBe(2);
+          expect(
+            forwardedLogs.some((entry) =>
+              entry.line.includes("rerunning resolver pass 2 with focused rebase-completion guidance"),
+            ),
+          ).toBe(true);
+
+          const status = await mustGit(
+            prepared.repoPath,
+            ["status", "--porcelain"],
+            "inspect unresolved-retry merge-conflict repo after execution",
+          );
+          expect(status).toBe("");
+          const resolvedFile = readFileSync(join(prepared.repoPath, fixture.conflictFile), "utf8");
+          expect(resolvedFile).toContain("resolved-after-focused-retry");
+        } finally {
+          prepared.cleanup();
+        }
+      } finally {
+        restoreExecutor();
+        restoreSegments();
         rmSync(fixture.root, { recursive: true, force: true });
       }
     },

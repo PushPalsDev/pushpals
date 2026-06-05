@@ -17,7 +17,10 @@ import {
   qualityRevisionLoopUpperBound,
   recordBrowserFailureMemory,
   recordValidationRemedyMemory,
+  shouldSkipCriticAfterExecutorTimeout,
+  shouldRetryCriticTimeoutWithCompact,
   shouldReviseRequiredValidationBlocker,
+  shouldRetryBrowserValidationRunOnce,
   revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
   workerAttemptRolloutScore,
@@ -59,6 +62,67 @@ describe("workerpals quality gate critic issue formatting", () => {
       remainingBudgetMs: 200_000,
       minimumRevisionBudgetMs: 420_000,
     });
+  });
+
+  test("skips low-value compact critic retries after clean validation", () => {
+    expect(
+      shouldRetryCriticTimeoutWithCompact({
+        timeoutBehavior: "retry_once",
+        qualityOk: true,
+        validationPassed: true,
+        initialPromptChars: 8_908,
+        compactPromptChars: 8_560,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldRetryCriticTimeoutWithCompact({
+        timeoutBehavior: "retry_once",
+        qualityOk: true,
+        validationPassed: true,
+        initialPromptChars: 12_000,
+        compactPromptChars: 7_000,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldRetryCriticTimeoutWithCompact({
+        timeoutBehavior: "retry_once",
+        qualityOk: false,
+        validationPassed: false,
+        initialPromptChars: 8_908,
+        compactPromptChars: 8_560,
+      }),
+    ).toBe(true);
+  });
+
+  test("skips critic only for clean default jobs after primary Codex timeout", () => {
+    const base = {
+      executor: "openai_codex",
+      executorText: "openai_codex timed out after modifying 2 publishable file(s)",
+      qualityOk: true,
+      validationPassed: true,
+      qualityIssues: [],
+      changedPaths: ["src/file.ts"],
+    };
+
+    expect(shouldSkipCriticAfterExecutorTimeout({ ...base, policyMode: "default" })).toBe(true);
+    expect(shouldSkipCriticAfterExecutorTimeout({ ...base, policyMode: "review_fix" })).toBe(false);
+    expect(shouldSkipCriticAfterExecutorTimeout({ ...base, policyMode: "merge_conflict" })).toBe(false);
+    expect(
+      shouldSkipCriticAfterExecutorTimeout({
+        ...base,
+        policyMode: "default",
+        validationPassed: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSkipCriticAfterExecutorTimeout({
+        ...base,
+        policyMode: "default",
+        executorText: "openai_codex completed normally",
+      }),
+    ).toBe(false);
   });
 
   test("scores worker rollouts by publishable progress, validation, and time", () => {
@@ -687,6 +751,34 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(isBrowserValidationInfrastructureDigest("ERR_SOCKET_BAD_PORT at port 65536")).toBe(
       true,
     );
+  });
+
+  test("retries route startup browser smoke failures once", () => {
+    expect(
+      shouldRetryBrowserValidationRunOnce({
+        step: "bun run web:e2e",
+        command: "bun run web:e2e",
+        ok: false,
+        exitCode: 1,
+        elapsedMs: 110_633,
+        stdout: "",
+        stderr:
+          "Web end-to-end smoke test failed: Route/startup smoke failure (route/startup) | phase: home route startup | expected: home screen is visible | observed: locator.waitFor: Timeout 30000ms exceeded",
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldRetryBrowserValidationRunOnce({
+        step: "bun run web:e2e",
+        command: "bun run web:e2e",
+        ok: false,
+        exitCode: 1,
+        elapsedMs: 127_732,
+        stdout: "",
+        stderr:
+          "Web end-to-end smoke test failed: Error: Browser validation failed during in-game UI stage: Expected help menu primary action to be visible within 30000ms: locator.waitFor: Timeout 30000ms exceeded.",
+      }),
+    ).toBe(false);
   });
 
   test("prioritizes browser validation repair guidance over lower-priority gate chatter", () => {

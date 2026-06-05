@@ -29,6 +29,9 @@ interface GenericPythonExecutorConfig {
 }
 
 const BACKEND_TIMEOUT_RESULT_GRACE_MS = 30_000;
+const OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS = 180_000;
+const OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS = 600_000;
+const OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS = 600_000;
 
 function estimateTokensFromText(text: string): number {
   return Math.max(0, Math.ceil(String(text ?? "").length / 3));
@@ -143,6 +146,27 @@ export function resolveGenericPythonExecutorTimeoutMs(params: {
   return configuredTimeoutMs;
 }
 
+export function resolveOpenAICodexValidationReserveMs(
+  executionBudgetMs: number | null | undefined,
+): number {
+  if (typeof executionBudgetMs !== "number" || !Number.isFinite(executionBudgetMs)) return 0;
+  const budgetMs = Math.max(10_000, Math.floor(executionBudgetMs));
+  const targetReserveMs = Math.floor(
+    Math.min(
+      budgetMs,
+      Math.max(
+        OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS,
+        Math.min(OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS, budgetMs * 0.35),
+      ),
+    ),
+  );
+  const maxReserveAfterPrimaryTurn = Math.max(
+    0,
+    budgetMs - OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS,
+  );
+  return Math.max(0, Math.min(targetReserveMs, maxReserveAfterPrimaryTurn));
+}
+
 export function resolveGenericPythonExecutorChildTimeoutMs(params: {
   backendName: string;
   hostTimeoutMs: number;
@@ -154,8 +178,11 @@ export function resolveGenericPythonExecutorChildTimeoutMs(params: {
     typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs)
       ? Math.max(10_000, Math.floor(params.executionBudgetMs))
       : null;
+  const validationReserveMs = resolveOpenAICodexValidationReserveMs(executionBudgetMs);
   const childBudgetMs =
-    executionBudgetMs == null ? hostTimeoutMs : Math.min(hostTimeoutMs, executionBudgetMs);
+    executionBudgetMs == null
+      ? hostTimeoutMs
+      : Math.min(hostTimeoutMs, Math.max(1_000, executionBudgetMs - validationReserveMs));
   const graceMs = Math.min(
     BACKEND_TIMEOUT_RESULT_GRACE_MS,
     Math.max(2_000, Math.floor(childBudgetMs / 10)),
@@ -305,15 +332,30 @@ export function createGenericPythonExecutor(
       "utf-8",
     ).toString("base64");
     const args = [pythonBin, scriptPath, payloadBase64];
-    const childTimeoutEnv = resolveGenericPythonExecutorChildTimeoutEnv({
+    const childTimeoutMs = resolveGenericPythonExecutorChildTimeoutMs({
       backendName,
       hostTimeoutMs: timeoutMs,
       executionBudgetMs,
     });
+    const childTimeoutEnv =
+      childTimeoutMs == null
+        ? {}
+        : {
+            WORKERPALS_OPENAI_CODEX_TIMEOUT_MS: String(childTimeoutMs),
+            WORKERPALS_OPENAI_CODEX_TIMEOUT_S: String(
+              Math.max(1, Math.floor(childTimeoutMs / 1000)),
+            ),
+          };
+    const childTimeoutDetail =
+      childTimeoutMs != null
+        ? `; codex_child_timeout=${childTimeoutMs}ms; reserved_validation_budget=${resolveOpenAICodexValidationReserveMs(
+            executionBudgetMs,
+          )}ms`
+        : "";
 
     onLog?.(
       "stdout",
-      `[${backendLabel}Executor] Spawning ${backendName} executor (timeout=${timeoutMs}ms; ${timeoutDetail})`,
+      `[${backendLabel}Executor] Spawning ${backendName} executor (timeout=${timeoutMs}ms; ${timeoutDetail}${childTimeoutDetail})`,
     );
 
     try {

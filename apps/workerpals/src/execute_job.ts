@@ -190,6 +190,7 @@ export interface QualityGatePolicy {
 }
 
 const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 3;
+const CRITIC_COMPACT_RETRY_MIN_REDUCTION_RATIO = 0.25;
 
 export function qualityRevisionLoopUpperBound(policy: {
   maxAutoRevisions: number;
@@ -230,6 +231,37 @@ export function qualityRevisionBudgetDecision(opts: {
     remainingBudgetMs,
     minimumRevisionBudgetMs,
   };
+}
+
+export function shouldRetryCriticTimeoutWithCompact(opts: {
+  timeoutBehavior: string;
+  qualityOk: boolean;
+  validationPassed: boolean;
+  initialPromptChars: number;
+  compactPromptChars: number;
+}): boolean {
+  if (opts.timeoutBehavior !== "retry_once") return false;
+  if (!opts.qualityOk || !opts.validationPassed) return true;
+  const initialPromptChars = Math.max(1, Math.floor(opts.initialPromptChars));
+  const compactPromptChars = Math.max(0, Math.floor(opts.compactPromptChars));
+  const reductionRatio = 1 - compactPromptChars / initialPromptChars;
+  return reductionRatio >= CRITIC_COMPACT_RETRY_MIN_REDUCTION_RATIO;
+}
+
+export function shouldSkipCriticAfterExecutorTimeout(opts: {
+  executor: string;
+  policyMode: string;
+  executorText: string;
+  qualityOk: boolean;
+  validationPassed: boolean;
+  qualityIssues: string[];
+  changedPaths: string[];
+}): boolean {
+  if (opts.executor !== "openai_codex") return false;
+  if (opts.policyMode !== "default") return false;
+  if (!opts.qualityOk || !opts.validationPassed) return false;
+  if (opts.qualityIssues.length > 0 || opts.changedPaths.length === 0) return false;
+  return /\b(openai_codex|codex(?: exec)?)\b[^\r\n]*\btimed out\b/i.test(opts.executorText);
 }
 
 export function workerAttemptRolloutScore(params: {
@@ -879,6 +911,10 @@ function parseJsonObjectLoose(text: string): Record<string, unknown> | null {
 }
 
 const COMMIT_MSG_MAX_DIFF_CHARS = 120_000;
+const COMMIT_MSG_LLM_MAX_CHANGED_PATHS = 20;
+const COMMIT_MSG_GENERATOR_DEFAULT_TIMEOUT_MS = 15_000;
+const COMMIT_MSG_GENERATOR_MIN_TIMEOUT_MS = 3_000;
+const COMMIT_MSG_GENERATOR_MAX_TIMEOUT_MS = 30_000;
 
 const SHELL_CONTROL_TOKENS = new Set(["&&", "||", ";", "|"]);
 
@@ -2094,6 +2130,18 @@ function classifyBrowserValidationFailureKindFromText(text: string): BrowserVali
     return "assertion";
   }
   return "unknown";
+}
+
+export function shouldRetryBrowserValidationRunOnce(run: ValidationExecutionResult): boolean {
+  if (run.ok || !isLongRunningBrowserValidationCommand(run.command)) return false;
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  const digest = extractValidationFailureDigest(run);
+  const failureKind = classifyBrowserValidationFailureKindFromText(`${digest}\n${combined}`);
+  if (failureKind === "runtime" || failureKind === "network") return true;
+  if (failureKind === "startup") return true;
+  return /\b(Route\/startup smoke failure|startup smoke failure|home route startup)\b/i.test(
+    `${digest}\n${combined}`,
+  );
 }
 
 function extractBrowserValidationStage(text: string): string | null {
@@ -3662,12 +3710,34 @@ async function runDeterministicQualityGate(
         continue;
       }
       onLog?.("stdout", `[ValidationGate] Running "${command}"`);
-      const run = await runValidationCommand(
+      let run = await runValidationCommand(
         repo,
         command,
         resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
         outputPolicy,
       );
+      const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
+      if (shouldRetryBrowserValidationRunOnce(run)) {
+        onLog?.(
+          "stderr",
+          `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
+        );
+        const retryRun = await runValidationCommand(
+          repo,
+          command,
+          resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+          outputPolicy,
+        );
+        if (!retryRun.ok && firstDigest) {
+          retryRun.stderr = [
+            `Previous browser validation attempt failed before retry: ${firstDigest}`,
+            retryRun.stderr,
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
+        run = retryRun;
+      }
       validationRuns.push(run);
       const digest = run.ok ? "" : extractValidationFailureDigest(run);
       const runSummary = `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`;
@@ -4768,17 +4838,19 @@ export async function createJobCommit(
       ...toNonEmptyStringArray(jobPlanning?.requiredValidationSteps),
       ...loadRequiredValidationStepsFromVision(repo),
     ];
-    const llmCommitMsg = await generateCommitMessageFromDiff(
-      diff,
-      {
-        instruction: String(job.params?.instruction ?? ""),
-        type: normalizeCommitType(job.kind, job.params),
-        area: inferCommitArea(job.kind, job.params, changedPaths),
-        validationSteps: jobValidationSteps,
-      },
-      repo,
-      runtimeConfig,
-    ).catch(() => null);
+    const llmCommitMsg = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff })
+      ? await generateCommitMessageFromDiff(
+          diff,
+          {
+            instruction: String(job.params?.instruction ?? ""),
+            type: normalizeCommitType(job.kind, job.params),
+            area: inferCommitArea(job.kind, job.params, changedPaths),
+            validationSteps: jobValidationSteps,
+          },
+          repo,
+          runtimeConfig,
+        ).catch(() => null)
+      : null;
     if (!llmCommitMsg) {
       console.warn(
         `[WorkerPals] Commit message generator unavailable for job ${job.id}; using deterministic fallback.`,
@@ -5745,17 +5817,19 @@ async function createMergeConflictJobCommit(
       ...toNonEmptyStringArray(jobPlanning?.requiredValidationSteps),
       ...loadRequiredValidationStepsFromVision(repo),
     ];
-    const llmCommitMsg = await generateCommitMessageFromDiff(
-      diff,
-      {
-        instruction: String(job.params?.instruction ?? ""),
-        type: normalizeCommitType(job.kind, job.params),
-        area: inferCommitArea(job.kind, job.params, changedPaths),
-        validationSteps: jobValidationSteps,
-      },
-      repo,
-      runtimeConfig,
-    ).catch(() => null);
+    const llmCommitMsg = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff })
+      ? await generateCommitMessageFromDiff(
+          diff,
+          {
+            instruction: String(job.params?.instruction ?? ""),
+            type: normalizeCommitType(job.kind, job.params),
+            area: inferCommitArea(job.kind, job.params, changedPaths),
+            validationSteps: jobValidationSteps,
+          },
+          repo,
+          runtimeConfig,
+        ).catch(() => null)
+      : null;
     if (!llmCommitMsg) {
       console.warn(
         `[WorkerPals] Commit message generator unavailable for merge-conflict job ${job.id}; using deterministic fallback.`,
@@ -6206,6 +6280,38 @@ async function generateCommitMessageFromDiff(
   return generateCommitMessageFromDiffViaHttp(prompt, opts, runtimeConfig);
 }
 
+export function resolveCommitMessageGeneratorTimeoutMs(
+  runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
+): number {
+  const workerpalsConfig = runtimeConfig.workerpals as Record<string, unknown>;
+  const llmConfig =
+    workerpalsConfig.llm && typeof workerpalsConfig.llm === "object"
+      ? (workerpalsConfig.llm as Record<string, unknown>)
+      : {};
+  const configuredRaw =
+    workerpalsConfig.commitMessageTimeoutMs ??
+    workerpalsConfig.commit_message_timeout_ms ??
+    llmConfig.commitMessageTimeoutMs ??
+    llmConfig.commit_message_timeout_ms ??
+    Bun.env.WORKERPALS_COMMIT_MESSAGE_TIMEOUT_MS;
+  const configured = Number(configuredRaw);
+  const value = Number.isFinite(configured)
+    ? configured
+    : COMMIT_MSG_GENERATOR_DEFAULT_TIMEOUT_MS;
+  return Math.max(
+    COMMIT_MSG_GENERATOR_MIN_TIMEOUT_MS,
+    Math.min(COMMIT_MSG_GENERATOR_MAX_TIMEOUT_MS, Math.floor(value)),
+  );
+}
+
+export function shouldUseLlmCommitMessageForStagedDiff(params: {
+  changedPaths: string[];
+  diff: string;
+}): boolean {
+  if (!String(params.diff ?? "").trim()) return false;
+  return params.changedPaths.length <= COMMIT_MSG_LLM_MAX_CHANGED_PATHS;
+}
+
 type CommitMessagePrompt = {
   systemPrompt: string;
   userMessage: string;
@@ -6244,11 +6350,7 @@ async function generateCommitMessageFromDiffViaCodex(
   if (!model) return null;
   const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
   if (!codexPrefix) return null;
-  const timeoutMs = (() => {
-    const value = Number(runtimeConfig.workerpals.llm.codexTimeoutMs);
-    if (!Number.isFinite(value)) return 120_000;
-    return Math.max(10_000, Math.min(600_000, Math.floor(value)));
-  })();
+  const timeoutMs = resolveCommitMessageGeneratorTimeoutMs(runtimeConfig);
   const reasoningEffort = normalizeCodexReasoningEffort(
     runtimeConfig.workerpals.llm.reasoningEffort,
     model,
@@ -6338,7 +6440,7 @@ async function generateCommitMessageFromDiffViaHttp(
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
+  const timer = setTimeout(() => controller.abort(), resolveCommitMessageGeneratorTimeoutMs(runtimeConfig));
   try {
     const response = await fetch(endpoint, {
       method: "POST",
@@ -6952,6 +7054,7 @@ async function runCodexCriticReview(
       validationChars: validationSummary.length,
     };
   };
+  type CodexCriticPayload = Awaited<ReturnType<typeof buildCriticInstruction>>;
 
   const tmpOutputPath = `/tmp/pushpals-critic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`;
   const buildCmd = () => {
@@ -6980,13 +7083,17 @@ async function runCodexCriticReview(
   const runAttempt = async (
     attempt: number,
     compact: boolean,
-  ): Promise<{ status: "timeout" } | { status: "done"; review: CriticReview | null }> => {
+    payloadOverride?: CodexCriticPayload,
+  ): Promise<
+    | { status: "timeout"; payload: CodexCriticPayload }
+    | { status: "done"; review: CriticReview | null; payload: CodexCriticPayload }
+  > => {
     try {
       unlinkSync(tmpOutputPath);
     } catch {
       /* ignore stale/missing critic output */
     }
-    const payload = await buildCriticInstruction(compact);
+    const payload = payloadOverride ?? (await buildCriticInstruction(compact));
     const startedAt = Date.now();
     onLog?.(
       "stdout",
@@ -7014,7 +7121,7 @@ async function runCodexCriticReview(
     clearTimeout(timer);
 
     if (timedOut) {
-      return { status: "timeout" };
+      return { status: "timeout", payload };
     }
     if (exitCode !== 0) {
       const stderrText = await new Response(proc.stderr).text();
@@ -7022,7 +7129,7 @@ async function runCodexCriticReview(
         "stderr",
         `[CriticGate] Codex exited ${exitCode}: ${toSingleLine(stderrText, 220)}`,
       );
-      return { status: "done", review: null };
+      return { status: "done", review: null, payload };
     }
 
     let lastMessage = "";
@@ -7039,7 +7146,7 @@ async function runCodexCriticReview(
 
     if (!lastMessage) {
       onLog?.("stderr", "[CriticGate] Codex: no output message captured; skipping.");
-      return { status: "done", review: null };
+      return { status: "done", review: null, payload };
     }
 
     const reviewObj = parseJsonObjectLoose(lastMessage);
@@ -7048,7 +7155,7 @@ async function runCodexCriticReview(
         "stderr",
         `[CriticGate] Codex returned non-JSON: ${toSingleLine(lastMessage, 220)}`,
       );
-      return { status: "done", review: null };
+      return { status: "done", review: null, payload };
     }
 
     const scoreRaw = Number(reviewObj.score);
@@ -7068,6 +7175,7 @@ async function runCodexCriticReview(
     );
     return {
       status: "done",
+      payload,
       review: {
         score,
         findings,
@@ -7081,11 +7189,36 @@ async function runCodexCriticReview(
   try {
     let attempt = await runAttempt(1, false);
     if (attempt.status === "timeout" && timeoutBehavior === "retry_once") {
-      onLog?.(
-        "stderr",
-        `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; retrying once with compact critic input.`,
-      );
-      attempt = await runAttempt(2, true);
+      const compactPayload = await buildCriticInstruction(true);
+      const validationPassed =
+        quality.validationRuns.length > 0 && quality.validationRuns.every((run) => run.ok);
+      if (
+        shouldRetryCriticTimeoutWithCompact({
+          timeoutBehavior,
+          qualityOk: quality.ok,
+          validationPassed,
+          initialPromptChars: attempt.payload.promptChars,
+          compactPromptChars: compactPayload.promptChars,
+        })
+      ) {
+        onLog?.(
+          "stderr",
+          `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; retrying once with compact critic input.`,
+        );
+        attempt = await runAttempt(2, true, compactPayload);
+      } else {
+        const reductionPct = Math.max(
+          0,
+          Math.round(
+            (1 - compactPayload.promptChars / Math.max(1, attempt.payload.promptChars)) * 100,
+          ),
+        );
+        onLog?.(
+          "stderr",
+          `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; compact critic input only reduced prompt by ${reductionPct}% after clean validation; skipping retry.`,
+        );
+        return null;
+      }
     }
     if (attempt.status === "timeout") {
       if (timeoutBehavior === "block") {
@@ -7316,6 +7449,42 @@ export async function executeJob(
         );
         continue;
       }
+      if (sequencer === "rebase" && !resume.resumed) {
+        mergeConflictPass += 1;
+        const budget = qualityRevisionBudgetDecision({
+          jobElapsedMs: Date.now() - attemptStartedAt,
+          executionBudgetMs,
+        });
+        if (mergeConflictPass < MAX_MERGE_CONFLICT_RESOLUTION_PASSES && budget.shouldStart) {
+          const retryDetail =
+            resume.detail ??
+            "the previous resolver pass returned before the prepared rebase completed";
+          const previousHint = String(attemptParams.qualityRevisionHint ?? "").trim();
+          attemptParams.qualityRevisionHint = [
+            previousHint,
+            [
+              `Merge-conflict resolver pass ${mergeConflictPass} left the rebase unfinished: ${retryDetail}.`,
+              "Focus only on completing the active rebase. Inspect unresolved files with `git diff --name-only --diff-filter=U`, remove remaining conflict markers, stage resolved files, and run `git -c core.editor=true rebase --continue` until no rebase remains.",
+              "Do not broaden the patch or run full validation before the rebase is complete.",
+            ].join("\n"),
+          ]
+            .filter(Boolean)
+            .join("\n\n");
+          onLog?.(
+            "stdout",
+            `[MergeConflict] ${retryDetail}; rerunning resolver pass ${
+              mergeConflictPass + 1
+            } with focused rebase-completion guidance.`,
+          );
+          continue;
+        }
+        if (!budget.shouldStart) {
+          onLog?.(
+            "stderr",
+            `[MergeConflict] Not rerunning unfinished rebase resolver: remaining execution budget is ${budget.remainingBudgetMs}ms (< ${budget.minimumRevisionBudgetMs}ms).`,
+          );
+        }
+      }
       const detail =
         `Merge-conflict job returned with git ${sequencer} still in progress. ` +
         `Finish the ${sequencer} before returning control to WorkerPals.`;
@@ -7440,14 +7609,30 @@ export async function executeJob(
           blocker: null,
         }
       : quality;
+    const validationPassed =
+      quality.validationRuns.length > 0 && quality.validationRuns.every((run) => run.ok);
+    const skipCriticAfterExecutorTimeout = shouldSkipCriticAfterExecutorTimeout({
+      executor,
+      policyMode: qualityGatePolicy.mode,
+      executorText,
+      qualityOk: quality.ok,
+      validationPassed,
+      qualityIssues: qualityForCritic.issues,
+      changedPaths: quality.changedPaths,
+    });
     const critic =
-      quality.skipped || !qualityGatePolicy.criticGateEnabled
+      quality.skipped || !qualityGatePolicy.criticGateEnabled || skipCriticAfterExecutorTimeout
         ? null
         : executor === "openai_codex"
           ? await runCodexCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog)
           : await runTaskCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog);
     if (!qualityGatePolicy.criticGateEnabled) {
       onLog?.("stdout", "[CriticGate] Disabled by workerpals.quality_critic_gate_enabled=false.");
+    } else if (skipCriticAfterExecutorTimeout) {
+      onLog?.(
+        "stdout",
+        "[CriticGate] Skipping Codex critic after primary Codex executor timeout because deterministic quality and validation are clean.",
+      );
     }
     const rolloutScore = workerAttemptRolloutScore({
       executorElapsedMs,
