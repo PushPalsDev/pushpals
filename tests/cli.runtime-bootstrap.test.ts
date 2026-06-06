@@ -69,6 +69,7 @@ import {
   shouldDeferRemoteBuddySessionConsumerReadiness,
   shouldPrepareEmbeddedWorkerpalDockerImageBlocking,
   waitForWorkerpalCapacity,
+  waitForRemoteBuddySessionConsumer,
 } from "../scripts/pushpals-cli.ts";
 import {
   ServiceManager,
@@ -3388,6 +3389,72 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         readinessElapsedMs: 12_000,
       }),
     ).toBe(false);
+  });
+
+  test("waitForRemoteBuddySessionConsumer returns once the session consumer attaches", async () => {
+    let now = 0;
+    let attempts = 0;
+    const sleeps: number[] = [];
+
+    const result = await waitForRemoteBuddySessionConsumer({
+      serverUrl: "http://127.0.0.1:3001",
+      sessionId: "dev",
+      timeoutMs: 5_000,
+      pollMs: 1_000,
+      nowFn: () => now,
+      sleepFn: async (ms) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+      probeFn: async (_serverUrl, sessionId) => {
+        attempts += 1;
+        if (attempts < 3) {
+          return {
+            ok: false,
+            detail: `No connected RemoteBuddy session consumer found for session ${sessionId}`,
+          };
+        }
+        return {
+          ok: true,
+          detail: "RemoteBuddy session consumer connected (agent_remotebuddy_orchestrator)",
+          clientId: "agent_remotebuddy_orchestrator",
+          sessionId,
+        };
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(attempts).toBe(3);
+    expect(sleeps).toEqual([1_000, 1_000]);
+  });
+
+  test("waitForRemoteBuddySessionConsumer returns the last failed health after the grace window", async () => {
+    let now = 0;
+    let attempts = 0;
+
+    const result = await waitForRemoteBuddySessionConsumer({
+      serverUrl: "http://127.0.0.1:3001",
+      sessionId: "dev",
+      timeoutMs: 1_500,
+      pollMs: 1_000,
+      nowFn: () => now,
+      sleepFn: async (ms) => {
+        now += ms;
+      },
+      probeFn: async (_serverUrl, sessionId) => {
+        attempts += 1;
+        return {
+          ok: false,
+          detail: `No connected RemoteBuddy session consumer found for session ${sessionId}`,
+        };
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      detail: "No connected RemoteBuddy session consumer found for session dev",
+    });
+    expect(attempts).toBe(3);
   });
 
   test("extractRemoteBuddyAutonomousEngineState parses enabled/disabled markers from runtime logs", () => {

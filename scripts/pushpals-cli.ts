@@ -4091,6 +4091,37 @@ async function probeRemoteBuddySessionConsumer(
   }
 }
 
+export async function waitForRemoteBuddySessionConsumer(opts: {
+  serverUrl: string;
+  sessionId: string;
+  timeoutMs: number;
+  pollMs?: number;
+  probeFn?: typeof probeRemoteBuddySessionConsumer;
+  sleepFn?: typeof Bun.sleep;
+  nowFn?: () => number;
+}): Promise<RemoteBuddySessionConsumerHealth> {
+  const timeoutMs = Math.max(0, opts.timeoutMs);
+  const pollMs = Math.max(50, opts.pollMs ?? DEFAULT_RUNTIME_BOOT_POLL_MS);
+  const nowFn = opts.nowFn ?? Date.now;
+  const deadline = nowFn() + timeoutMs;
+  let lastHealth: RemoteBuddySessionConsumerHealth = {
+    ok: false,
+    detail: `No connected RemoteBuddy session consumer found for session ${opts.sessionId}`,
+  };
+
+  while (true) {
+    lastHealth = await (opts.probeFn ?? probeRemoteBuddySessionConsumer)(
+      opts.serverUrl,
+      opts.sessionId,
+    );
+    if (lastHealth.ok) return lastHealth;
+
+    const remainingMs = deadline - nowFn();
+    if (remainingMs <= 0) return lastHealth;
+    await (opts.sleepFn ?? Bun.sleep)(Math.min(pollMs, remainingMs));
+  }
+}
+
 async function probeSourceControlManager(port: number): Promise<boolean> {
   if (!Number.isFinite(port) || port <= 0) return false;
   try {
@@ -6048,7 +6079,13 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   }
-  remoteBuddyConsumerHealth = await probeRemoteBuddySessionConsumer(serverUrl, activeSessionId);
+  remoteBuddyConsumerHealth = autoStartedServiceManager
+    ? await waitForRemoteBuddySessionConsumer({
+        serverUrl,
+        sessionId: activeSessionId,
+        timeoutMs: DEFAULT_REMOTEBUDDY_CONSUMER_STARTUP_GRACE_MS,
+      })
+    : await probeRemoteBuddySessionConsumer(serverUrl, activeSessionId);
   if (!serverHealthy) {
     console.error(`[pushpals] Server is unavailable at ${serverUrl}.`);
     process.exit(1);
