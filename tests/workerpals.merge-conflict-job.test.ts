@@ -496,7 +496,9 @@ describe("workerpals merge-conflict sandbox", () => {
       const fixture = await createConflictFixture();
       const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
       let resolutionPasses = 0;
-      const restoreExecutor = installTestBackendExecutor(async (_kind, params, repoPath, _runtime, onLog) => {
+      const observedBudgets: Array<{ executionBudgetMs?: number; finalizationBudgetMs?: number }> = [];
+      const restoreExecutor = installTestBackendExecutor(async (_kind, params, repoPath, _runtime, onLog, budgets) => {
+        observedBudgets.push({ ...(budgets ?? {}) });
         resolutionPasses += 1;
         if (resolutionPasses === 2) {
           writeFileSync(
@@ -552,10 +554,16 @@ describe("workerpals merge-conflict sandbox", () => {
 
           expect(result.ok).toBe(true);
           expect(resolutionPasses).toBe(2);
+          expect(observedBudgets[0]?.executionBudgetMs).toBe(1_800_000);
+          expect(observedBudgets[1]?.executionBudgetMs).toBe(300_000);
+          expect(observedBudgets[1]?.finalizationBudgetMs).toBe(60_000);
           expect(
             forwardedLogs.some((entry) =>
               entry.line.includes("rerunning resolver pass 2 with focused rebase-completion guidance"),
             ),
+          ).toBe(true);
+          expect(
+            forwardedLogs.some((entry) => entry.line.includes("capped budget (300000ms execution)")),
           ).toBe(true);
 
           const status = await mustGit(
@@ -651,7 +659,7 @@ describe("workerpals merge-conflict sandbox", () => {
           expect(resolutionPasses).toBe(2);
           expect(
             forwardedLogs.some((entry) =>
-              entry.line.includes("Rebase surfaced another conflicted commit after auto-continue; rerunning resolver pass 2."),
+              entry.line.includes("Rebase surfaced another conflicted commit after auto-continue; rerunning resolver pass 2"),
             ),
           ).toBe(true);
 

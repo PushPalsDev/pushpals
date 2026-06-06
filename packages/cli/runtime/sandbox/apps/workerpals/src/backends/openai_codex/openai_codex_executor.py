@@ -103,6 +103,8 @@ _VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
 _MAX_WRAPPER_RECOVERY_ATTEMPTS = 2
 _MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS = 1_200
 _MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS = 5_000
+_MAX_CREDIBLE_WRAPPER_LOOP_CHANGED_PATHS = 8
+_MAX_CREDIBLE_WRAPPER_LOOP_TOP_LEVELS = 4
 _MAX_NO_EDIT_RECOVERY_ATTEMPTS = 1
 _MAX_ROLLOUT_RECOVERY_ATTEMPTS = 1
 _DEFAULT_NO_EDIT_WATCHDOG_S = 480
@@ -1668,6 +1670,27 @@ def _codex_changed_paths(repo: str, baseline_snapshot: List[str]) -> Tuple[List[
     return changed_paths, delta, effective
 
 
+def _changed_path_top_level(path: str) -> str:
+    normalized = str(path or "").replace("\\", "/").strip("/")
+    if not normalized:
+        return ""
+    parts = [part for part in normalized.split("/") if part]
+    return parts[0] if len(parts) > 1 else "<repo-root>"
+
+
+def _has_credible_shell_wrapper_progress(effective_paths: List[str]) -> bool:
+    if not effective_paths:
+        return False
+    if len(effective_paths) > _MAX_CREDIBLE_WRAPPER_LOOP_CHANGED_PATHS:
+        return False
+    top_levels = {
+        top_level
+        for top_level in (_changed_path_top_level(path) for path in effective_paths)
+        if top_level
+    }
+    return len(top_levels) <= _MAX_CREDIBLE_WRAPPER_LOOP_TOP_LEVELS
+
+
 def _build_success_stdout(
     *,
     effective_paths: List[str],
@@ -2306,6 +2329,7 @@ def _run_codex_task(
 
         if command_policy_rejection_loop:
             _, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+            credible_progress = _has_credible_shell_wrapper_progress(effective_paths)
             if effective_paths:
                 policy_signal = _detect_codex_workaround_signal(last_message)
                 if not policy_signal and not last_message.strip():
@@ -2329,6 +2353,7 @@ def _run_codex_task(
                         "usage": usage,
                     }
 
+            if effective_paths and credible_progress:
                 command_lines = (
                     "\n".join(f"- {command}" for command in rejected_shell_wrappers[:6])
                     if rejected_shell_wrappers
@@ -2358,6 +2383,13 @@ def _run_codex_task(
                     "exitCode": 0,
                     "usage": usage,
                 }
+
+            if effective_paths:
+                log.warning(
+                    "Codex hit a shell-wrapper rejection loop with a broad/noisy changed-path set "
+                    f"({len(effective_paths)} publishable-looking path(s)); retrying before handing "
+                    "the patch to QualityGate."
+                )
 
             if wrapper_recovery_attempt < _MAX_WRAPPER_RECOVERY_ATTEMPTS:
                 hard_recovery = wrapper_recovery_attempt >= 1
@@ -2413,6 +2445,36 @@ def _run_codex_task(
                             ).strip()
                         )
                     return retry_result
+            if effective_paths:
+                command_lines = (
+                    "\n".join(f"- {command}" for command in rejected_shell_wrappers[:6])
+                    if rejected_shell_wrappers
+                    else "- (no command details captured)"
+                )
+                log.warning(
+                    "Codex exhausted shell-wrapper recovery attempts with file changes still present; "
+                    "returning the patch to QualityGate for final assessment."
+                )
+                return {
+                    "ok": True,
+                    "summary": (
+                        "Executed task and modified "
+                        f"{len(effective_paths)} file(s) before shell-wrapper command rejections"
+                    ),
+                    "stdout": _build_success_stdout(
+                        effective_paths=effective_paths,
+                        last_message=last_message,
+                        trace_excerpt=trace_excerpt,
+                        prefix=(
+                            "Codex produced file changes but exhausted command-router shell-wrapper "
+                            "recovery attempts. The patch is being handed to ValidationGate/CriticGate for "
+                            f"normal assessment.\nRejected commands:\n{command_lines}"
+                        ),
+                    ),
+                    "stderr": "",
+                    "exitCode": 0,
+                    "usage": usage,
+                }
             command_lines = (
                 "\n".join(f"- {command}" for command in rejected_shell_wrappers[:6])
                 if rejected_shell_wrappers

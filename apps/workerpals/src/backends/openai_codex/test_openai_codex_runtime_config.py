@@ -40,6 +40,7 @@ from openai_codex_executor import (
     _detect_offtrack_rollout,
     _detect_codex_workaround_signal,
     _extract_usage_counts,
+    _has_credible_shell_wrapper_progress,
     _load_prompt_template,
     _mask_repo_local_codex_files,
     _repo_root_for_prompt_loading,
@@ -671,6 +672,125 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("ValidationGate/CriticGate", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertNotIn("Recovered after Codex attempts", str(result.get("stdout") or ""))
+
+    def test_shell_wrapper_progress_guard_rejects_broad_noisy_path_sets(self) -> None:
+        self.assertTrue(
+            _has_credible_shell_wrapper_progress(
+                [
+                    "src/change.ts",
+                    "src/change.test.ts",
+                    "docs/change.md",
+                ]
+            )
+        )
+        self.assertFalse(
+            _has_credible_shell_wrapper_progress(
+                [f"src/generated-{index}.ts" for index in range(9)]
+            )
+        )
+        self.assertFalse(
+            _has_credible_shell_wrapper_progress(
+                [
+                    "app/main.ts",
+                    "components/card.tsx",
+                    "docs/readme.md",
+                    "scripts/check.ts",
+                    "tests/card.test.ts",
+                ]
+            )
+        )
+
+    def test_run_codex_task_recovers_instead_of_handing_noisy_wrapper_diff_to_gates(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-noisy-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# wrapper noisy test\n", encoding="utf-8")
+            for index in range(9):
+                (repo / f"noisy-{index}.txt").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed wrapper noisy repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_wrapper_noisy.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'Command-router recovery:' in prompt:",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/recovered.txt').write_text('direct recovery\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text(",
+                        "            'Recovered after noisy shell-wrapper path detection using direct commands.',",
+                        "            encoding='utf-8',",
+                        "        )",
+                        "    print('item.completed | Recovered with direct-command guidance.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "for index in range(9):",
+                        "    Path(f'noisy-{index}.txt').write_text('noisy path\\n', encoding='utf-8')",
+                        "for line in (",
+                        "    'error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess { message: \"Rejected\" }',",
+                        "    'error=exec_command failed for `/bin/bash -lc \\'git status --porcelain\\'`: CreateProcess { message: \"Rejected\" }',",
+                        "    'error=exec_command failed for `/bin/bash -lc \\'sed -n 1,40p README.md\\'`: CreateProcess { message: \"Rejected\" }',",
+                        "):",
+                        "    print(line, file=sys.stderr, flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-wrapper-noisy-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "10",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Recover from a shell-wrapper loop after noisy repo changes.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        stdout = str(result.get("stdout") or "")
+        self.assertIn("Recovered after Codex attempts hit command-router shell-wrapper rejections.", stdout)
+        self.assertIn("Recovered after noisy shell-wrapper path detection", stdout)
+        self.assertNotIn("ValidationGate/CriticGate", stdout)
 
     def test_run_codex_task_hands_changed_worktree_to_gates_after_timeout(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-timeout-changed-") as temp_dir:

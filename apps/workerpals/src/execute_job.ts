@@ -233,6 +233,58 @@ export function qualityRevisionBudgetDecision(opts: {
   };
 }
 
+const MERGE_CONFLICT_RETRY_EXECUTION_BUDGET_MS = 300_000;
+const MERGE_CONFLICT_RETRY_FINALIZATION_BUDGET_MS = 60_000;
+const MERGE_CONFLICT_MIN_RETRY_EXECUTION_BUDGET_MS = 120_000;
+
+export function mergeConflictResolverRetryBudgetDecision(opts: {
+  jobElapsedMs: number;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+}): {
+  shouldStart: boolean;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+  remainingTotalBudgetMs: number;
+  minimumExecutionBudgetMs: number;
+} {
+  const configuredExecutionBudgetMs = Number(opts.executionBudgetMs);
+  if (!Number.isFinite(configuredExecutionBudgetMs) || configuredExecutionBudgetMs <= 0) {
+    return {
+      shouldStart: true,
+      executionBudgetMs: MERGE_CONFLICT_RETRY_EXECUTION_BUDGET_MS,
+      finalizationBudgetMs: MERGE_CONFLICT_RETRY_FINALIZATION_BUDGET_MS,
+      remainingTotalBudgetMs: Number.POSITIVE_INFINITY,
+      minimumExecutionBudgetMs: MERGE_CONFLICT_MIN_RETRY_EXECUTION_BUDGET_MS,
+    };
+  }
+
+  const configuredFinalizationBudgetMs = Math.max(0, Number(opts.finalizationBudgetMs) || 0);
+  const elapsedMs = Math.max(0, Number(opts.jobElapsedMs) || 0);
+  const remainingTotalBudgetMs = Math.max(
+    0,
+    Math.floor(configuredExecutionBudgetMs + configuredFinalizationBudgetMs - elapsedMs),
+  );
+  const finalizationBudgetMs = Math.min(
+    MERGE_CONFLICT_RETRY_FINALIZATION_BUDGET_MS,
+    configuredFinalizationBudgetMs,
+    remainingTotalBudgetMs,
+  );
+  const availableExecutionBudgetMs = Math.max(0, remainingTotalBudgetMs - finalizationBudgetMs);
+  const executionBudgetMs = Math.min(
+    MERGE_CONFLICT_RETRY_EXECUTION_BUDGET_MS,
+    Math.floor(availableExecutionBudgetMs),
+  );
+
+  return {
+    shouldStart: executionBudgetMs >= MERGE_CONFLICT_MIN_RETRY_EXECUTION_BUDGET_MS,
+    executionBudgetMs: Math.max(10_000, executionBudgetMs),
+    finalizationBudgetMs,
+    remainingTotalBudgetMs,
+    minimumExecutionBudgetMs: MERGE_CONFLICT_MIN_RETRY_EXECUTION_BUDGET_MS,
+  };
+}
+
 export function shouldRetryCriticTimeoutWithCompact(opts: {
   timeoutBehavior: string;
   qualityOk: boolean;
@@ -7388,7 +7440,7 @@ export async function executeJob(
     }
 
     const executor = resolveExecutor(runtimeConfig);
-    const executeBudgets = { executionBudgetMs, finalizationBudgetMs };
+    const defaultExecuteBudgets = { executionBudgetMs, finalizationBudgetMs };
     const runExecutor = getBackendTaskExecutor(executor);
     if (!runExecutor) {
       return {
@@ -7400,14 +7452,17 @@ export async function executeJob(
     let result: Awaited<ReturnType<typeof runExecutor>> | null = null;
     let mergeConflictPass = 0;
     let executorElapsedMs = 0;
+    let nextMergeConflictExecuteBudgets: typeof defaultExecuteBudgets | null = null;
     while (true) {
+      const currentExecuteBudgets = nextMergeConflictExecuteBudgets ?? defaultExecuteBudgets;
+      nextMergeConflictExecuteBudgets = null;
       const currentResult = await runExecutor(
         kind,
         attemptParams,
         repo,
         runtimeConfig,
         onLog,
-        executeBudgets,
+        currentExecuteBudgets,
       );
       if (!currentResult.ok) return currentResult;
       result = currentResult;
@@ -7441,19 +7496,42 @@ export async function executeJob(
             exitCode: 4,
           };
         }
+        const retryBudget = mergeConflictResolverRetryBudgetDecision({
+          jobElapsedMs: Date.now() - attemptStartedAt,
+          executionBudgetMs,
+          finalizationBudgetMs,
+        });
+        if (!retryBudget.shouldStart) {
+          const detail =
+            "Merge-conflict rebase advanced into another conflicted commit, but remaining job budget " +
+            `is ${retryBudget.remainingTotalBudgetMs}ms (< ${retryBudget.minimumExecutionBudgetMs}ms execution).`;
+          onLog?.("stderr", `[MergeConflict] ${detail}`);
+          return {
+            ok: false,
+            summary: detail,
+            stdout: currentResult.stdout,
+            stderr: [currentResult.stderr ?? "", resume.detail ?? detail].filter(Boolean).join("\n"),
+            exitCode: 4,
+          };
+        }
+        nextMergeConflictExecuteBudgets = {
+          executionBudgetMs: retryBudget.executionBudgetMs,
+          finalizationBudgetMs: retryBudget.finalizationBudgetMs,
+        };
         onLog?.(
           "stdout",
           `[MergeConflict] Rebase surfaced another conflicted commit after auto-continue; rerunning resolver pass ${
             mergeConflictPass + 1
-          }.`,
+          } with a capped completion budget (${retryBudget.executionBudgetMs}ms execution).`,
         );
         continue;
       }
       if (sequencer === "rebase" && !resume.resumed) {
         mergeConflictPass += 1;
-        const budget = qualityRevisionBudgetDecision({
+        const budget = mergeConflictResolverRetryBudgetDecision({
           jobElapsedMs: Date.now() - attemptStartedAt,
           executionBudgetMs,
+          finalizationBudgetMs,
         });
         if (mergeConflictPass < MAX_MERGE_CONFLICT_RESOLUTION_PASSES && budget.shouldStart) {
           const retryDetail =
@@ -7470,18 +7548,22 @@ export async function executeJob(
           ]
             .filter(Boolean)
             .join("\n\n");
+          nextMergeConflictExecuteBudgets = {
+            executionBudgetMs: budget.executionBudgetMs,
+            finalizationBudgetMs: budget.finalizationBudgetMs,
+          };
           onLog?.(
             "stdout",
             `[MergeConflict] ${retryDetail}; rerunning resolver pass ${
               mergeConflictPass + 1
-            } with focused rebase-completion guidance.`,
+            } with focused rebase-completion guidance and capped budget (${budget.executionBudgetMs}ms execution).`,
           );
           continue;
         }
         if (!budget.shouldStart) {
           onLog?.(
             "stderr",
-            `[MergeConflict] Not rerunning unfinished rebase resolver: remaining execution budget is ${budget.remainingBudgetMs}ms (< ${budget.minimumRevisionBudgetMs}ms).`,
+            `[MergeConflict] Not rerunning unfinished rebase resolver: remaining total budget is ${budget.remainingTotalBudgetMs}ms (< ${budget.minimumExecutionBudgetMs}ms execution).`,
           );
         }
       }
