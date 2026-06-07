@@ -1,27 +1,28 @@
-﻿# PushPals CLI Release Log
+# PushPals CLI Release Log
 
 ## Release Metadata
 
-- version: `v1.1.21`
-- start_commit: `e49ab68bb0553945a0d6b848595a15775fb8c398`
-- end_commit: `6abbfd7817bb9f648c7c697821756bfe4b4288c6`
-- commits_in_range: `1`
+- version: `v1.1.23`
+- start_commit: `9293f4e721983e72bf61edd3819c680008847a02`
+- end_commit: `11f1182de1c4f58074043ea69ede35ea0cee88a5`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Reserve explicit validation and repair runway for OpenAI Codex WorkerPal jobs so a primary coding turn cannot consume the whole job budget before deterministic validation can run.
-- Retry browser route/startup smoke failures once when they look like transient runtime or browser-startup issues, while preserving normal assertion failures as real task feedback.
-- Add focused merge-conflict recovery guidance and a bounded retry when a resolver returns with rebase conflict markers still present.
-- Skip low-value second critic retries when compacting barely reduces the prompt, and skip critic entirely for clean default jobs where the primary Codex turn already timed out after producing a validated patch.
-- Bound and bypass LLM commit-message generation for broad diffs so publish finalization falls back quickly to deterministic commit messages instead of burning minutes.
-- Ship the updated WorkerPal runtime and sandbox mirror in the packaged CLI assets.
+- Fix OpenAI Codex WorkerPal dirty-baseline accounting so pre-existing worktree changes are not misclassified as broad worker-created patches.
+- Preserve the safety guard for genuinely broad or noisy small-task edits by counting new paths and same-path edits made after the job starts.
+- Use bounded filesystem fingerprints for baseline paths so the fix does not add expensive per-path Git diff work on Windows.
+- Add regression coverage for dirty baseline timeout handling and same-path baseline mutations.
+- Update the `task.execute` integration harness to allow bounded diagnostics on executor results while still asserting the stable result contract.
+- Ship the updated WorkerPal sandbox mirror in the packaged CLI runtime assets.
 
 ## Validation
 
 - `bun run cli:bundle`
+- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
+- `bun test tests/integration/task.execute.test.ts`
 - `bun run test:root`
 - `git diff --check`
-- `bun test tests/workerpals.generic-python-executor.test.ts tests/workerpals.quality-gate-issues.test.ts tests/workerpals.merge-conflict-job.test.ts tests/workerpals.commit-message-generation.test.ts`
 
 ## Install
 
@@ -48,6 +49,7 @@ bun install -g @pushpalsdev/cli
 ## Known Issues
 
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out.
+- Active runtimes that were started from `v1.1.22` or earlier must be restarted after installing this release before WorkerPal jobs use the dirty-baseline fix.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
 - User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --clear` or remove the local override to pick up new packaged defaults.
