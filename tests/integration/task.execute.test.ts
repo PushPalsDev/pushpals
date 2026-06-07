@@ -191,7 +191,8 @@ describe("task.execute integration harness", () => {
         testRuntimeConfig,
       );
 
-      expect(initialResult).toEqual(stubResult);
+      expect(initialResult).toMatchObject(stubResult);
+      expect(initialResult.diagnostics?.terminal?.summary).toBe(stubResult.summary);
 
       const removed = unregisterBackendTaskExecutor(TEST_BACKEND);
       expect(removed).toBe(true);
