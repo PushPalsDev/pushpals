@@ -8,6 +8,7 @@ that the TypeScript host parses.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from shutil import rmtree, which
@@ -713,9 +714,39 @@ def _resolve_rollout_watchdog_seconds(
     return max(90, min(default_s, max(90, communicate_timeout_s - 60)))
 
 
-def _describe_non_publishable_paths(changed_paths: List[str], baseline_snapshot: List[str]) -> str:
-    delta = [p for p in changed_paths if p not in baseline_snapshot]
-    inspected = delta if delta else changed_paths
+def _baseline_snapshot_paths(baseline_snapshot: Any) -> List[str]:
+    if isinstance(baseline_snapshot, dict):
+        return [str(path) for path in baseline_snapshot.keys()]
+    if isinstance(baseline_snapshot, list):
+        return [str(path) for path in baseline_snapshot]
+    return []
+
+
+def _paths_changed_after_baseline(
+    repo: str,
+    changed_paths: List[str],
+    baseline_snapshot: Any,
+) -> List[str]:
+    baseline_paths = set(_baseline_snapshot_paths(baseline_snapshot))
+    if not baseline_paths:
+        return list(changed_paths)
+
+    delta: List[str] = []
+    baseline_fingerprints = baseline_snapshot if isinstance(baseline_snapshot, dict) else {}
+    for path in changed_paths:
+        if path not in baseline_paths:
+            delta.append(path)
+            continue
+        if baseline_fingerprints:
+            current_fingerprint = _changed_path_fingerprint(repo, path)
+            if current_fingerprint != str(baseline_fingerprints.get(path) or ""):
+                delta.append(path)
+    return delta
+
+
+def _describe_non_publishable_paths(changed_paths: List[str], baseline_snapshot: Any) -> str:
+    baseline_paths = set(_baseline_snapshot_paths(baseline_snapshot))
+    inspected = [p for p in changed_paths if p not in baseline_paths] if baseline_paths else changed_paths
     non_publishable = [p for p in inspected if not _is_publishable_changed_path(p)]
     if not non_publishable:
         return ""
@@ -1686,10 +1717,99 @@ def _is_publishable_changed_path(path: str) -> bool:
     return not re.search(r"(^|/)(outputs|node_modules|\.worktrees|\.codex|dist|build|coverage)(/|$)", normalized)
 
 
-def _codex_changed_paths(repo: str, baseline_snapshot: List[str]) -> Tuple[List[str], List[str], List[str]]:
+def _filesystem_fingerprint(repo: str, raw_path: str) -> str:
+    root = Path(repo)
+    target = (root / raw_path).resolve()
+    try:
+        root_resolved = root.resolve()
+        common = os.path.commonpath([str(root_resolved), str(target)])
+        if common != str(root_resolved):
+            return "outside-repo"
+    except Exception:
+        return "unresolved"
+    digest = hashlib.sha256()
+    if not target.exists():
+        return "missing"
+    if target.is_file():
+        digest.update(b"file\0")
+        try:
+            digest.update(str(target.stat().st_size).encode("utf-8"))
+            with target.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except Exception as exc:
+            digest.update(f"read-error:{type(exc).__name__}:{exc}".encode("utf-8", errors="replace"))
+        return digest.hexdigest()
+    if target.is_dir():
+        digest.update(b"dir\0")
+        files_seen = 0
+        try:
+            for dirpath, dirnames, filenames in os.walk(target):
+                dirnames.sort()
+                filenames.sort()
+                for filename in filenames:
+                    if files_seen >= 128:
+                        digest.update(b"\0truncated")
+                        return digest.hexdigest()
+                    child = Path(dirpath) / filename
+                    try:
+                        rel = child.relative_to(root_resolved).as_posix()
+                    except Exception:
+                        rel = child.name
+                    digest.update(rel.encode("utf-8", errors="replace"))
+                    digest.update(b"\0")
+                    digest.update(str(child.stat().st_size).encode("utf-8"))
+                    digest.update(b"\0")
+                    try:
+                        with child.open("rb") as handle:
+                            digest.update(handle.read(64 * 1024))
+                    except Exception as exc:
+                        digest.update(f"read-error:{type(exc).__name__}:{exc}".encode("utf-8", errors="replace"))
+                    files_seen += 1
+        except Exception as exc:
+            digest.update(f"walk-error:{type(exc).__name__}:{exc}".encode("utf-8", errors="replace"))
+        return digest.hexdigest()
+    return "special"
+
+
+def _changed_path_fingerprint(repo: str, path: str) -> str:
+    normalized = str(path or "").strip()
+    if not normalized:
+        return ""
+    digest = hashlib.sha256()
+    digest.update(normalized.replace("\\", "/").encode("utf-8", errors="replace"))
+    digest.update(b"\0fs\0")
+    digest.update(_filesystem_fingerprint(repo, normalized).encode("utf-8", errors="replace"))
+    return digest.hexdigest()
+
+
+def _capture_git_change_snapshot(repo: str) -> Dict[str, str]:
+    return {path: _changed_path_fingerprint(repo, path) for path in summarize_git_changes(repo)}
+
+
+def _normalize_baseline_snapshot(repo: str, baseline_changes: Any) -> Dict[str, str]:
+    if isinstance(baseline_changes, dict):
+        return {
+            str(path): str(fingerprint)
+            for path, fingerprint in baseline_changes.items()
+            if str(path or "").strip()
+        }
+    if isinstance(baseline_changes, list):
+        return {
+            str(path): _changed_path_fingerprint(repo, str(path))
+            for path in baseline_changes
+            if str(path or "").strip()
+        }
+    return _capture_git_change_snapshot(repo)
+
+
+def _codex_changed_paths(repo: str, baseline_snapshot: Any) -> Tuple[List[str], List[str], List[str]]:
     changed_paths = summarize_git_changes(repo)
-    delta = [p for p in changed_paths if p not in baseline_snapshot]
-    effective = [p for p in (delta if delta else changed_paths) if _is_publishable_changed_path(p)]
+    delta = _paths_changed_after_baseline(repo, changed_paths, baseline_snapshot)
+    effective = [p for p in delta if _is_publishable_changed_path(p)]
     return changed_paths, delta, effective
 
 
@@ -1851,7 +1971,7 @@ def _run_codex_task(
         prompt,
         model,
     )
-    baseline_snapshot = list(baseline_changes) if baseline_changes is not None else summarize_git_changes(repo)
+    baseline_snapshot = _normalize_baseline_snapshot(repo, baseline_changes)
 
     with tempfile.TemporaryDirectory(prefix="pushpals-codex-") as tmp_dir:
         last_message_path = Path(tmp_dir) / "codex-last-message.txt"

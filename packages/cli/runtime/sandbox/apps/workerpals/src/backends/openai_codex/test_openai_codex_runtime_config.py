@@ -36,6 +36,7 @@ from openai_codex_executor import (
     _build_rollout_recovery_guidance,
     _collect_disallowed_shell_wrapper_rejections,
     _codex_changed_paths,
+    _capture_git_change_snapshot,
     _describe_non_publishable_paths,
     _detect_offtrack_rollout,
     _detect_codex_workaround_signal,
@@ -944,6 +945,75 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("too broad/noisy", str(result.get("stderr") or ""))
         self.assertIn("area0", str(result.get("stderr") or ""))
 
+    def test_run_codex_task_timeout_ignores_broad_dirty_baseline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-timeout-dirty-baseline-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# timeout dirty baseline repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed timeout dirty baseline repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            for index in range(5):
+                root = repo / f"area{index}"
+                root.mkdir(exist_ok=True)
+                (root / "changed.txt").write_text("pre-existing dirty change\n", encoding="utf-8")
+
+            stub_path = Path(temp_dir) / "fake_codex_timeout_dirty_baseline.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "import sys",
+                        "import time",
+                        "",
+                        "sys.stdin.read()",
+                        "print('item.completed | Still thinking without changing baseline files.', flush=True)",
+                        "time.sleep(5)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-timeout-dirty-baseline-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "0",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Make a compact scoped patch, then continue thinking too long.",
+                    [],
+                )
+
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertIn("execution timed out", str(result.get("summary") or ""))
+        self.assertNotIn("broad/noisy", str(result.get("summary") or ""))
+        self.assertNotIn("too broad/noisy", str(result.get("stderr") or ""))
+
     def test_run_codex_task_retries_once_when_no_edit_watchdog_fires(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-") as temp_dir:
             repo = Path(temp_dir) / "repo"
@@ -1214,6 +1284,86 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertGreaterEqual(len(changed_paths), 2)
         self.assertGreaterEqual(len(delta), 2)
         self.assertEqual(effective, [])
+
+    def test_codex_changed_paths_ignores_publishable_paths_dirty_at_baseline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-dirty-baseline-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# dirty baseline repo\n", encoding="utf-8")
+            (repo / "src").mkdir()
+            (repo / "src" / "existing.ts").write_text("export const value = 1;\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed dirty baseline repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            (repo / "README.md").write_text("# dirty baseline repo\n\npre-existing edit\n", encoding="utf-8")
+            (repo / "src" / "existing.ts").write_text("export const value = 2;\n", encoding="utf-8")
+            baseline = _capture_git_change_snapshot(str(repo))
+
+            changed_paths, delta, effective = _codex_changed_paths(str(repo), baseline)
+
+        self.assertIn("README.md", changed_paths)
+        self.assertEqual(delta, [])
+        self.assertEqual(effective, [])
+
+    def test_codex_changed_paths_counts_worker_edits_to_dirty_baseline_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-dirty-baseline-mutated-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# dirty baseline mutation repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed dirty baseline mutation repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            (repo / "README.md").write_text("# dirty baseline mutation repo\n\npre-existing edit\n", encoding="utf-8")
+            baseline = _capture_git_change_snapshot(str(repo))
+            (repo / "README.md").write_text(
+                "# dirty baseline mutation repo\n\npre-existing edit\nworker edit\n",
+                encoding="utf-8",
+            )
+
+            _, delta, effective = _codex_changed_paths(str(repo), baseline)
+
+        self.assertEqual(delta, ["README.md"])
+        self.assertEqual(effective, ["README.md"])
 
     def test_non_publishable_path_summary_names_artifact_only_dirty_paths(self) -> None:
         changed_paths = [
