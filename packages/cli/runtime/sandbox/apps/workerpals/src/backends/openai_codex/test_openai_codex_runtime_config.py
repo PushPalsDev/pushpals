@@ -699,6 +699,11 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 ]
             )
         )
+        self.assertFalse(
+            _has_credible_shell_wrapper_progress(
+                [f"area{index}/" for index in range(5)]
+            )
+        )
 
     def test_run_codex_task_recovers_instead_of_handing_noisy_wrapper_diff_to_gates(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-wrapper-noisy-") as temp_dir:
@@ -868,6 +873,76 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("partial patch", str(result.get("stdout") or "").lower())
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertIn("Made a small patch before timeout", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_rejects_broad_timeout_partial_patch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-timeout-noisy-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# timeout noisy repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed timeout noisy repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_timeout_noisy.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "sys.stdin.read()",
+                        "for index in range(5):",
+                        "    root = Path(f'area{index}')",
+                        "    root.mkdir(exist_ok=True)",
+                        "    (root / 'changed.txt').write_text('broad change before timeout\\n', encoding='utf-8')",
+                        "print('item.completed | Touched a broad set of files before timeout.', flush=True)",
+                        "time.sleep(5)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-timeout-noisy-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "0",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Create a broad unfocused patch, then continue thinking too long.",
+                    [],
+                )
+
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertIn("broad/noisy publishable-looking changes", str(result.get("summary") or ""))
+        self.assertIn("too broad/noisy", str(result.get("stderr") or ""))
+        self.assertIn("area0", str(result.get("stderr") or ""))
 
     def test_run_codex_task_retries_once_when_no_edit_watchdog_fires(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-") as temp_dir:
@@ -1200,6 +1275,77 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(result.get("exitCode"), 0)
         self.assertIn("Patched after rollout coach guidance", str(result.get("stdout") or ""))
         self.assertIn("scripts/", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_rollout_coach_fails_fast_on_broad_small_task_changes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-noisy-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# rollout noisy repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed rollout noisy repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_rollout_noisy.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "sys.stdin.read()",
+                        "for index in range(5):",
+                        "    root = Path(f'area{index}')",
+                        "    root.mkdir(exist_ok=True)",
+                        "    (root / 'changed.txt').write_text('broad rollout change\\n', encoding='utf-8')",
+                        "print('item.completed | Made broad edits for a supposedly small task.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-rollout-noisy-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "700",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "10",
+                "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Make a small low-risk repo-native patch.",
+                    [],
+                )
+
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertIn("rollout coach", str(result.get("summary") or ""))
+        self.assertIn("broad/noisy", str(result.get("stderr") or ""))
+        self.assertIn("area0", str(result.get("stderr") or ""))
 
     def test_run_codex_task_timeout_reports_artifact_only_changes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-timeout-") as temp_dir:

@@ -709,6 +709,13 @@ def _describe_non_publishable_paths(changed_paths: List[str], baseline_snapshot:
     return listed
 
 
+def _describe_publishable_paths(paths: List[str]) -> str:
+    listed = ", ".join(paths[:8])
+    if len(paths) > 8:
+        listed = f"{listed}, ..."
+    return listed
+
+
 def _build_no_edit_recovery_guidance(trace_excerpt: str, artifact_only_paths: str = "") -> str:
     lines = [
         "No-edit watchdog recovery: the previous Codex attempt spent too much of the execution budget without producing publishable file changes.",
@@ -1671,11 +1678,15 @@ def _codex_changed_paths(repo: str, baseline_snapshot: List[str]) -> Tuple[List[
 
 
 def _changed_path_top_level(path: str) -> str:
-    normalized = str(path or "").replace("\\", "/").strip("/")
+    raw = str(path or "").replace("\\", "/").strip()
+    is_top_level_directory = raw.endswith("/")
+    normalized = raw.strip("/")
     if not normalized:
         return ""
     parts = [part for part in normalized.split("/") if part]
-    return parts[0] if len(parts) > 1 else "<repo-root>"
+    if len(parts) > 1 or is_top_level_directory:
+        return parts[0]
+    return "<repo-root>"
 
 
 def _has_credible_shell_wrapper_progress(effective_paths: List[str]) -> bool:
@@ -2051,6 +2062,7 @@ def _run_codex_task(
             rollout_watchdog_fired = False
             rollout_watchdog_reason = ""
             rollout_artifact_only_paths = ""
+            rollout_watchdog_retryable = True
             command_policy_rejection_loop = False
             no_edit_watchdog_s = (
                 _resolve_no_edit_watchdog_seconds(prompt, communicate_timeout_s)
@@ -2106,12 +2118,27 @@ def _run_codex_task(
 
                 if rollout_deadline is not None and now >= rollout_deadline:
                     changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
-                    if not effective_paths:
-                        with trace_lock:
-                            live_trace = dict(stdout_trace_state)
-                            summaries = stdout_trace_state.get("summaries")
-                            if isinstance(summaries, list):
-                                live_trace["summaries"] = list(summaries)
+                    with trace_lock:
+                        live_trace = dict(stdout_trace_state)
+                        summaries = stdout_trace_state.get("summaries")
+                        if isinstance(summaries, list):
+                            live_trace["summaries"] = list(summaries)
+                    if effective_paths:
+                        small_or_web_task = (
+                            _looks_like_small_task_prompt(instruction)
+                            or _looks_like_web_review_prompt(instruction)
+                            or _looks_like_small_task_prompt(prompt)
+                            or _looks_like_web_review_prompt(prompt)
+                        )
+                        if small_or_web_task and not _has_credible_shell_wrapper_progress(effective_paths):
+                            rollout_watchdog_reason = (
+                                "publishable-looking changed paths are broad/noisy for a small task: "
+                                f"{_describe_publishable_paths(effective_paths)}"
+                            )
+                            rollout_watchdog_retryable = False
+                        else:
+                            rollout_deadline = None
+                    else:
                         rollout_artifact_only_paths = _describe_non_publishable_paths(
                             changed_paths,
                             baseline_snapshot,
@@ -2120,18 +2147,23 @@ def _run_codex_task(
                             live_trace,
                             rollout_artifact_only_paths,
                         )
-                        if rollout_watchdog_reason:
-                            rollout_watchdog_fired = True
-                            artifact_detail = (
-                                f" Artifact-only dirty paths: {rollout_artifact_only_paths}."
-                                if rollout_artifact_only_paths
-                                else ""
-                            )
-                            log.info(
-                                f"Rollout coach fired after {int(rollout_watchdog_s or 0)}s: {rollout_watchdog_reason}.{artifact_detail} Retrying with course-correction guidance."
-                            )
-                            _terminate_active_child()
-                            break
+                    if rollout_watchdog_reason:
+                        rollout_watchdog_fired = True
+                        artifact_detail = (
+                            f" Artifact-only dirty paths: {rollout_artifact_only_paths}."
+                            if rollout_artifact_only_paths
+                            else ""
+                        )
+                        action = (
+                            "Retrying with course-correction guidance."
+                            if rollout_watchdog_retryable
+                            else "Failing fast instead of retrying on top of a broad/noisy diff."
+                        )
+                        log.info(
+                            f"Rollout coach fired after {int(rollout_watchdog_s or 0)}s: {rollout_watchdog_reason}.{artifact_detail} {action}"
+                        )
+                        _terminate_active_child()
+                        break
 
                 with trace_lock:
                     wrapper_rejections = to_int(wrapper_rejection_state.get("count"), 0)
@@ -2201,7 +2233,7 @@ def _run_codex_task(
                     rejected_shell_wrappers.append(text)
 
         if rollout_watchdog_fired:
-            if rollout_recovery_attempt < _MAX_ROLLOUT_RECOVERY_ATTEMPTS:
+            if rollout_watchdog_retryable and rollout_recovery_attempt < _MAX_ROLLOUT_RECOVERY_ATTEMPTS:
                 retry_guidance = [
                     *supplemental_guidance,
                     _build_rollout_recovery_guidance(
@@ -2222,7 +2254,7 @@ def _run_codex_task(
                     baseline_changes=baseline_snapshot,
                 )
             detail = (
-                "Codex trajectory remained off-track after rollout coach recovery: "
+                "Codex trajectory remained off-track or too broad for safe recovery: "
                 f"{rollout_watchdog_reason or 'no publishable progress'}."
             )
             if trace_excerpt:
@@ -2276,8 +2308,9 @@ def _run_codex_task(
             )
             if trace_excerpt:
                 detail = f"{detail}\n{trace_excerpt}"
-            _, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
-            if effective_paths:
+            changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+            credible_partial_patch = _has_credible_shell_wrapper_progress(effective_paths)
+            if effective_paths and credible_partial_patch:
                 last_message = _read_text_if_exists(last_message_path)
                 log_git_status(repo, log)
                 prefix = (
@@ -2304,7 +2337,27 @@ def _run_codex_task(
                     "exitCode": 0,
                     "usage": usage,
                 }
-            changed_paths, _, _ = _codex_changed_paths(repo, baseline_snapshot)
+            if effective_paths:
+                listed = _describe_publishable_paths(effective_paths)
+                log.warning(
+                    "Codex reached the execution timeout with a broad/noisy changed-path set "
+                    f"({len(effective_paths)} publishable-looking path(s)); refusing to spend "
+                    "additional gate budget on a likely incomplete patch."
+                )
+                detail = (
+                    f"{detail}\nPublishable-looking changed paths at timeout were too broad/noisy "
+                    f"to preserve as a partial patch ({len(effective_paths)} path(s): {listed}). "
+                    "The executor is failing fast so the scheduler can replan instead of running "
+                    "expensive validation on a likely incomplete update."
+                )
+                return {
+                    "ok": False,
+                    "summary": "openai_codex timed out with broad/noisy publishable-looking changes",
+                    "stdout": _truncate(stdout),
+                    "stderr": _truncate(f"{detail}\n{stderr}".strip()),
+                    "exitCode": 124,
+                    "usage": usage,
+                }
             artifact_only_paths = _describe_non_publishable_paths(changed_paths, baseline_snapshot)
             if artifact_only_paths:
                 detail = (
