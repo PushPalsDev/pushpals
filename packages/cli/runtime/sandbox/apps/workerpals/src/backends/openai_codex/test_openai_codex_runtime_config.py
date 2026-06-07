@@ -1087,6 +1087,95 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(result.get("exitCode"), 124)
         self.assertIn("no publishable changes", str(result.get("summary") or ""))
 
+    def test_run_codex_task_no_edit_watchdog_rechecks_transient_publishable_progress(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-recheck-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# no edit recheck repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed no-edit recheck repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_no_edit_recheck.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'No-edit watchdog recovery' in prompt:",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/no-edit-recheck-retry.txt').write_text('patched after recheck\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched after transient no-edit recheck.', encoding='utf-8')",
+                        "    print('item.completed | Patched after transient no-edit recheck.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "Path('src').mkdir(exist_ok=True)",
+                        "transient = Path('src/transient-progress.txt')",
+                        "transient.write_text('temporary progress\\n', encoding='utf-8')",
+                        "print('item.completed | Created transient publishable progress.', flush=True)",
+                        "time.sleep(1.4)",
+                        "transient.unlink()",
+                        "Path('node_modules').mkdir(exist_ok=True)",
+                        "Path('node_modules/linked.txt').write_text('artifact only\\n', encoding='utf-8')",
+                        "print('item.completed | Lost patch while still thinking.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-no-edit-recheck-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_RECHECK_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Polish the first-entry home shell with a compact visual patch.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched after transient no-edit recheck", str(result.get("stdout") or ""))
+        self.assertIn("src/", str(result.get("stdout") or ""))
+
     def test_codex_changed_paths_filters_dependency_artifacts_from_publishable_delta(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-delta-") as temp_dir:
             repo = Path(temp_dir) / "repo"

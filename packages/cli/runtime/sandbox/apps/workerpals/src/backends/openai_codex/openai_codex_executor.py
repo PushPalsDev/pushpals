@@ -110,6 +110,7 @@ _MAX_ROLLOUT_RECOVERY_ATTEMPTS = 1
 _DEFAULT_NO_EDIT_WATCHDOG_S = 480
 _SMALL_TASK_NO_EDIT_WATCHDOG_S = 360
 _WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
+_DEFAULT_NO_EDIT_RECHECK_S = 120
 _DEFAULT_ROLLOUT_WATCHDOG_S = 300
 _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
 _WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
@@ -659,6 +660,21 @@ def _resolve_no_edit_watchdog_seconds(
             else _DEFAULT_NO_EDIT_WATCHDOG_S
         )
     return max(120, min(default_s, max(120, communicate_timeout_s - 60)))
+
+
+def _resolve_no_edit_recheck_seconds(communicate_timeout_s: Optional[int]) -> int:
+    raw = os.environ.get("WORKERPALS_OPENAI_CODEX_NO_EDIT_RECHECK_S", "").strip()
+    if raw:
+        parsed = _to_positive_int(raw)
+        if parsed is None:
+            log.info(
+                f"Invalid WORKERPALS_OPENAI_CODEX_NO_EDIT_RECHECK_S={raw!r}; using default no-edit recheck interval."
+            )
+        else:
+            upper = max(1, (communicate_timeout_s or parsed + 1) - 1)
+            return max(1, min(parsed, upper))
+    upper = max(1, (communicate_timeout_s or _DEFAULT_NO_EDIT_RECHECK_S + 1) - 1)
+    return max(1, min(_DEFAULT_NO_EDIT_RECHECK_S, upper))
 
 
 def _looks_like_web_review_prompt(prompt: str) -> bool:
@@ -2069,6 +2085,7 @@ def _run_codex_task(
                 if no_edit_recovery_attempt <= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
                 else None
             )
+            no_edit_recheck_s = _resolve_no_edit_recheck_seconds(communicate_timeout_s)
             rollout_watchdog_s = (
                 _resolve_rollout_watchdog_seconds(
                     prompt,
@@ -2114,7 +2131,12 @@ def _run_codex_task(
                         )
                         _terminate_active_child()
                         break
-                    no_edit_deadline = None
+                    no_edit_deadline = now + float(no_edit_recheck_s)
+                    log.info(
+                        "No-edit watchdog observed publishable-looking file changes "
+                        f"({_describe_publishable_paths(effective_paths)}); rechecking in "
+                        f"{int(no_edit_recheck_s)}s to ensure the worker keeps durable PR content."
+                    )
 
                 if rollout_deadline is not None and now >= rollout_deadline:
                     changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
